@@ -48,7 +48,26 @@ WPBC uses 1-byte opcodes followed by optional immediate arguments.
 ### 3.5 Terminal Operations
 - `0xFF PROJECT [2 bytes count] [col_index 1..N]`: The final instruction. Discards all unrequested columns from the Arrow batch before returning it over QUIC. If omitted, all columns are returned.
 
-## 4. Execution Example
+## 4. Type System & Safety Bounds
+
+To ensure Wendelon Data Nodes cannot be crashed or OOM'd by malicious or buggy WPBC payloads from DataFusion, strict safety bounds are enforced.
+
+### 4.1 Type System & Mismatches
+WPBC is dynamically typed during interpretation (based on the Arrow schema). 
+- **Type Mismatch:** If an operation is invalid (e.g., comparing an `Int64` column to a `String` literal with `GT`), the interpreter immediately traps. The row evaluates to `false` (discarded).
+- **Extended Types:** The ISA includes push opcodes for advanced Arrow types commonly used in analytics: `PUSH_FLOAT_f64`, `PUSH_TS_ms` (Timestamp milliseconds).
+
+### 4.2 Null Propagation (3VL)
+Wendelon adheres strictly to SQL's Three-Valued Logic (3VL).
+- If any operand to a comparison (`EQ`, `GT`, etc.) is an Arrow Null, the result of the comparison is Null.
+- In WPBC, a Null evaluation at the top of the stack is ultimately treated as `false` for the purpose of row filtering (i.e., the row is discarded), matching standard `WHERE` clause semantics.
+
+### 4.3 Memory and Execution Bounds
+- **Stack Depth Limit:** The stack is a fixed-size pre-allocated array of 64 slots. Pushing beyond 64 items traps the interpreter.
+- **Instruction Limit:** A single WPBC payload cannot exceed 4096 bytes (4 KB).
+- **Execution Fuel:** To prevent infinite loops (if jump instructions are added in V2), the interpreter traps if it executes more than 1024 instructions per row.
+
+## 5. Execution Example
 
 **SQL Query:** `SELECT name, age FROM users WHERE age >= 18 AND status IN ('active', 'pending')`
 

@@ -26,7 +26,7 @@ pub struct HybridTimestamp {
     pub physical_ms: u64,
     /// Monotonic counter; reset to 0 when physical_ms advances
     pub logical: u32,
-    /// Originating node ID; breaks ties for identical (physical, logical) pairs
+    /// Originating node ID (the numeric `id` portion of a `NodeId`); breaks ties for identical (physical, logical) pairs
     pub node_id: u32,
 }
 // static_assert: size_of::<HybridTimestamp>() == 16
@@ -113,7 +113,7 @@ pub struct TransferToken {
 // static_assert: size_of::<TransferToken>() == 128
 
 // ============================================================
-//  FINALIZATION MARKER — 64 bytes, fixed
+//  FINALIZATION MARKER — 88 bytes, fixed
 //
 //  Appended to the Raft log (or broadcast out-of-band) once a
 //  write achieves quorum ack. Drives E_safe advancement.
@@ -173,8 +173,71 @@ pub struct LeaseDescriptor {
     pub min_commit_index: u64,
     /// Ed25519 over fields above; 64 bytes
     pub signature: [u8; 64],
+    /// Pad to 128 bytes
+    pub _pad: [u8; 8],
 }
 // static_assert: size_of::<LeaseDescriptor>() == 128
+// ============================================================
+//  FRAME HEADER — 24 bytes, fixed
+//
+//  The universal envelope for all Wendelon protocol messages.
+// ============================================================
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct FrameHeader {
+    /// Magic bytes: 0x48524654 = "HRFT"
+    pub magic: u32,
+    /// Protocol version; currently 1
+    pub version: u8,
+    /// Message type discriminant (see MsgType)
+    pub msg_type: u8,
+    /// Bitfield: bit0=arrow_compressed, bit1=has_trailing
+    pub flags: u16,
+    /// QUIC stream ID or TCP-mux logical stream
+    pub stream_id: u32,
+    /// Byte length of the metadata section (bytemuck struct)
+    pub meta_len: u32,
+    /// Byte length of the Arrow IPC section (0 = no Arrow payload)
+    pub arrow_len: u32,
+    /// Byte length of trailing bytemuck struct (0 = none)
+    pub trailing_len: u32,
+}
+// static_assert: size_of::<FrameHeader>() == 24
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MsgType(pub u8);
+
+impl MsgType {
+    // data ring
+    pub const WRITE_REQ:       Self = Self(0x01);
+    pub const WRITE_RESP:      Self = Self(0x02);
+    pub const READ_REQ:        Self = Self(0x03);
+    pub const READ_RESP:       Self = Self(0x04);
+    pub const BULK_WRITE_REQ:  Self = Self(0x05);  // Arrow has multiple rows
+    pub const BULK_WRITE_RESP: Self = Self(0x06);
+    pub const STREAM_FIN_REQ:  Self = Self(0x07);  // StreamFinalization subscribe
+    pub const STREAM_FIN_EVT:  Self = Self(0x08);  // FinalizationMarker push
+
+    // control ring
+    pub const TRANSFER_REQ:    Self = Self(0x10);
+    pub const TRANSFER_RESP:   Self = Self(0x11);
+    pub const LEASE_REQ:       Self = Self(0x12);
+    pub const LEASE_RESP:      Self = Self(0x13);
+    pub const EPOCH_ADV_REQ:   Self = Self(0x14);
+    pub const EPOCH_ADV_RESP:  Self = Self(0x15);
+    pub const STATUS_REQ:      Self = Self(0x16);
+    pub const STATUS_RESP:     Self = Self(0x17);
+
+    // raft internal (openraft RaftNetwork)
+    pub const APPEND_ENTRIES_REQ:  Self = Self(0x20);
+    pub const APPEND_ENTRIES_RESP: Self = Self(0x21);
+    pub const INSTALL_SNAPSHOT_REQ:  Self = Self(0x22);
+    pub const INSTALL_SNAPSHOT_RESP: Self = Self(0x23);
+    pub const VOTE_REQ:  Self = Self(0x24);
+    pub const VOTE_RESP: Self = Self(0x25);
+}
+
 2. Request/Response Metadata — bytemuck Structs
 rust
 
@@ -247,6 +310,7 @@ impl WriteStatus {
     pub const PAYLOAD_TOO_LARGE: Self = Self(5);
     pub const LEASE_EXPIRED:     Self = Self(6);
     pub const INTERNAL_ERROR:    Self = Self(7);
+    pub const QUOTA_EXCEEDED:    Self = Self(8);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

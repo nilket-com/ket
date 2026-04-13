@@ -12,7 +12,7 @@ tokio = { version = "1.37", features = ["full"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 openraft = "0.9"
-arrow = { version = "51.0", features = ["ipc_compression"] }
+arrow = { version = "53.0", features = ["ipc_compression"] }
 bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
 io-uring = "0.6"
 dashmap = "5.5"

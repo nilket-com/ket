@@ -32,8 +32,19 @@ The unified ring topology enables significant flexibility:
 - **Dedicated Topology (Production):** Distinct physical nodes are assigned exclusive "control" or "data" roles. The unified ring simply maps them together for addressing, but they operate entirely independently.
 - **Converged Topology (Dev/QA/Starter):** Nodes are assigned both roles. Because they are on a unified ring, routing and discovery logic remains identical, allowing the same codebase to effortlessly run in resource-constrained environments.
 
-## 4. Addressing and Routing
+## 4. Virtual Nodes (Vnodes)
 
-- The `node_id` (typically a hash) places the node uniformly on the unified ring.
-- Routing to the Control Ring involves filtering the unified ring for nodes with the `control` capability.
-- Routing to the Data Ring involves hashing the object key and walking the unified ring to find the next available node(s) with the `data` capability.
+To ensure an even distribution of data and minimize the impact of a single node failure, Wendelon uses Virtual Nodes (Vnodes).
+- **Vnode Count:** By default, each physical Data Node is assigned **256 vnodes**. This can be tuned via cluster configuration, but must be identical across the cluster for fairness.
+- **Assignment:** A vnode's position on the ring is deterministically derived: `VnodePosition = Hash(NodeId || VnodeIndex)`.
+- **Control Ring Exemption:** Control-only nodes do not use vnodes. They occupy exactly one position on the ring (`Hash(NodeId)`).
+
+## 5. Addressing and Routing (The Ring Walk)
+
+The fundamental routing algorithm for the Data Ring relies on traversing the unified ring to find the correct replica nodes for a given key.
+
+1. **Hash the Key:** `KeyHash = Hash(NamespaceID || RawKey)`.
+2. **Binary Search:** The client (or proxying node) performs a binary search on the cached, sorted array of all `ring(E)` positions to find the first position strictly greater than `KeyHash`. This is the **Primary Vnode**.
+3. **The Ring Walk:** To satisfy a Replication Factor (RF) of `N`, the router walks clockwise around the ring starting from the Primary Vnode.
+4. **Physical Distinctness:** The router collects the underlying `NodeId` of each vnode it visits. It skips vnodes that map to a `NodeId` it has already collected, and skips nodes that lack the `data` capability.
+5. **Completion:** The walk stops once exactly `N` distinct physical Data Nodes are collected. The first node collected is the Primary (leaseholder candidate); the remaining `N-1` are Secondary Replicas.
