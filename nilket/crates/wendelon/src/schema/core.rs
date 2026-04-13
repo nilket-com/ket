@@ -374,6 +374,39 @@ pub struct ReadResponseMeta {
 }
 
 // ============================================================
+//  SLAB STORAGE METADATA
+// ============================================================
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct SlabRecordHeader {
+    pub magic: u32,             // 0x534C4142 ("SLAB")
+    pub _pad_align: u32,        // 4 bytes padding for u64 alignment
+    pub key_hash: u64,          // The consistent hash of the key
+    pub hlc: HybridTimestamp,   // 16 bytes: the timestamp of the write
+    pub frame_len: u32,         // Total length of the HRFT frame that follows
+    pub _pad: u32,              // 4 bytes padding to reach 40-byte alignment
+}
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct SlabManifest {
+    pub slab_id: u64,
+    /// 0 = Active (NVMe), 1 = Sealed (NVMe), 2 = Uploading, 3 = Stubbed (S3)
+    pub state: u8,
+    pub _pad: [u8; 7],
+    pub min_hlc: HybridTimestamp, // Timestamp of first write
+    pub max_hlc: HybridTimestamp, // Timestamp of last write
+    pub total_bytes: u64,         // e.g., 1,073,741,824 (1GB)
+    pub chunk_size: u32,          // e.g., 16,777,216 (16MB)
+    /// Heatmap: counter of reads in the last 24h
+    pub temperature: u32,         
+    /// Remote routing info (zeroed if local)
+    pub remote_bucket: [u8; 32],  // e.g., "nilket-cold-tier-1"
+    pub remote_key: [u8; 64],     // e.g., "wendelon/epoch_5/slab_123.wnd"
+}
+
+// ============================================================
 //  ARROW IPC SCHEMAS
 // ============================================================
 
@@ -464,5 +497,6 @@ const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 40);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
+const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
-_of::<RaftEpochEntryFixed>() == 216);
