@@ -1,12 +1,17 @@
+# Moved from plans/raft-core.md
+
+(This file was copied into plans/consensus/raft-core.md during a planned refactor.)
+
+
 # Raft Core — bytemuck + WAL + Snapshot Design
 
-This document specifies the Raft core on-disk and on-wire fixed-size formats (bytemuck), WAL record layout, snapshot format, and recovery invariants for HashRaft. Follow the same conventions as wire.md: all fixed-size metadata are #[repr(C)] Pod + Zeroable; variable-length blobs are Arrow IPC or raw byte payloads as noted.
+This document specifies the Raft core on-disk and on-wire fixed-size formats (bytemuck), WAL record layout, snapshot format, and recovery invariants for HashRaft. Follow the same conventions as plans/schema/schemas.md: all fixed-size metadata are #[repr(C)] Pod + Zeroable; variable-length blobs are Arrow IPC or raw byte payloads as noted.
 
 1. Goals and invariants
 
 - Deterministic layout: every bytemuck struct includes explicit _pad fields and a static_assert comment with expected size.
 - Recovery safety: commit_index, e_safe_index and WAL tail are durable; on restart no monotonic counters regress.
-- Snapshot-install must include serialized idempotency cache checkpoint (see wire.md §10) and last-applied state-machine snapshot digest.
+- Snapshot-install must include serialized idempotency cache checkpoint (see plans/consensus/idempotency_cache.md) and last-applied state-machine snapshot digest.
 - WAL is append-only, CRC32c checksummed per record, and supports atomic fsync per-group.
 
 ---
@@ -92,7 +97,7 @@ pub struct SnapshotHeader {
 Snapshot layout on-disk:
 [ SnapshotHeader ][ state-machine blob (bytes) ][ idempotency cache checkpoint (bytemuck slice) ][ optional Arrow metadata ]
 
-The cache checkpoint is a bytemuck-serialized contiguous slice of entries matching the layout described in wire.md §10 (ClientWriteId + WriteResponseMeta per entry). The snapshot's cache_checkpoint_len names its byte length.
+The cache checkpoint is a bytemuck-serialized contiguous slice of entries matching the layout described in plans/consensus/idempotency_cache.md (ClientWriteId + WriteResponseMeta per entry). The snapshot's cache_checkpoint_len names its byte length.
 
 ---
 
@@ -142,11 +147,11 @@ On startup:
 1. Open WAL tail and replay records sequentially, verifying CRC32C.
 2. Apply LogEntry records to state machine in index order, tracking last_applied, commit_index.
 3. Load persisted e_safe_index (if persisted separately) and ensure e_safe_index <= commit_index. If violation, clamp e_safe_index = min(e_safe_index, commit_index).
-4. Rebuild idempotency cache from snapshot checkpoint and recent WAL records up to configured scan window (see wire.md §10).
+4. Rebuild idempotency cache from snapshot checkpoint and recent WAL records up to configured scan window (see plans/consensus/idempotency_cache.md).
 
 Durability rules:
 - commit_index and e_safe_index are always persisted to WAL as a special Checkpoint record (WAL record_type=3) with body containing both u64 values. This guarantees monotonic recovery.
-- During normal operation, leader fsyncs WAL on quorum durability levels as specified in wire.md.
+- During normal operation, leader fsyncs WAL on quorum durability levels as specified in plans/consensus/idempotency_cache.md.
 
 ---
 
@@ -190,15 +195,15 @@ Guidelines:
 
 9. Cross-references
 
-- See plans/wire.md for Arrow schemas, ClientWriteId cache layout, and FinalizationMarker semantics. This document assumes HybridTimestamp and NodeId are defined in wire.md and referenced via `super::` in Rust examples.
+- See plans/schema/schemas.md for Arrow schemas, ClientWriteId cache layout, and FinalizationMarker semantics. This document assumes HybridTimestamp and NodeId are defined in plans/schema/schemas.md and referenced via `super::` in Rust examples.
 
 ---
 
 Control Ring & Hashing (cross-reference)
 
-The system models a unified control ring: every node (regardless of role) is assigned a NodeId that participates in a single ordered ring topology. This simplifies small topologies used for dev/QA and unifies placement logic across control and data responsibilities. The hashing algorithm and ring parameters are chosen at cluster initialization and recorded in the epoch variable metadata (see plans/wire.md epoch_entry_var_schema meta_keys/meta_values). They are immutable for the cluster lifetime; changing them requires a full cluster rebootstrap.
+The system models a unified control ring: every node (regardless of role) is assigned a NodeId that participates in a single ordered ring topology. This simplifies small topologies used for dev/QA and unifies placement logic across control and data responsibilities. The hashing algorithm and ring parameters are chosen at cluster initialization and recorded in the epoch variable metadata (see plans/schema/hashing.md meta_keys/meta_values). They are immutable for the cluster lifetime; changing them requires a full cluster rebootstrap.
 
-Recommended default: keyed HighwayHash (see plans/wire.md) with a 64-bit ring representation. For public or adversarial environments, a keyed BLAKE3 with 128-bit ring_bits is acceptable if crypto-level guarantees are required.
+Recommended default: keyed HighwayHash with a 64-bit ring representation. For public or adversarial environments, a keyed BLAKE3 with 128-bit ring_bits is acceptable if crypto-level guarantees are required.
 
 ---
 

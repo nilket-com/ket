@@ -1,6 +1,10 @@
+# Moved from plans/hashraft.md
+
+(This file was copied into plans/consensus/hashraft.md during a planned refactor.)
+
 # HashRaft: The Hybrid Consensus Bridge
 
-This document defines the core mechanism of "HashRaft"—the mathematical and operational bridge that fuses a global Control Ring (Raft) with a high-throughput Data Ring (Consistent Hashing). 
+This document defines the core mechanism of "HashRaft"—the mathematical and operational bridge that fuses a global Control Ring (Raft) with a high-throughput Data Ring (Consistent Hashing).
 
 ## 1. The Stellarator Invariant: Zero Data in the Control WAL
 
@@ -9,6 +13,7 @@ The most critical architectural invariant in Wendelon is that **bulk data payloa
 If massive data streams were serialized through a single Raft leader, the system would immediately bottleneck, destroying the scalability of the Data Ring.
 
 ### 1.1 The Bifurcated Write Path
+
 A client write operation is bifurcated into two distinct phases:
 1. **Data Quorum (The Heavy Lift):** The massive data payload is routed directly to the Data Ring. It is replicated to the N nodes responsible for that specific hash range in the current Epoch (`ring(E)`). This uses the zero-copy QUIC transport but does *not* use Raft.
 2. **Control Finalization (The Metadata Sync):** Once Data Quorum is achieved, the primary node for that hash range asynchronously fires a tiny, fixed-size `FinalizationMarker` (88 bytes) to the global Raft Control Ring.
@@ -60,7 +65,7 @@ If two writes hit the same key with identical physical and logical HLC component
 2. Client routes to Data Node holding Lease for R.
 3. Node (Primary) assigns `HLC_W` to the Write.
 4. Primary replicates Arrow/Bytes to replicas for R.
-5. Primary waits for Replica Acks.
+5. Primary waits for Replica Aks.
 6. Primary ACKs to Client (Low Latency).
 7. Primary asynchronously sends `FinalizationMarker(R, HLC_W)` to Control Ring.
 8. Control Ring commits marker via Raft.

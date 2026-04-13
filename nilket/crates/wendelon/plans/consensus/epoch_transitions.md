@@ -1,3 +1,7 @@
+# Moved from plans/epoch_transitions.md
+
+(This file was copied into plans/consensus/epoch_transitions.md during a planned refactor.)
+
 # Epoch Transitions & Lazy Migration
 
 This document rigorously defines the lifecycle of a cluster topology change (an "Epoch Transition") and the subsequent zero-downtime, zero-storm data migration process.
@@ -23,7 +27,7 @@ When a trigger occurs, the following strict sequence executes:
 1. **Proposal:** The Raft Leader of the Control Ring proposes a `LogEntryKind::CONFIG` entry containing the new cluster state (`E+1`).
 2. **Commit:** The Control Ring achieves quorum and commits the configuration change.
 3. **Epoch Advancement:** The global Epoch counter increments to `E+1`.
-4. **Lease Invalidation (The Hard Boundary):** The absolute most critical step. The instant `E+1` is committed, **ALL existing per-range leases from Epoch `E` are globally invalidated.** 
+4. **Lease Invalidation (The Hard Boundary):** The absolute most critical step. The instant `E+1` is committed, **ALL existing per-range leases from Epoch `E` are globally invalidated.**
    - No Data Node may accept a new write or serve a linearizable read based on an `E` lease.
    - In-flight proxied writes tagged with `expected_epoch=E` will be rejected by the new primaries with `EPOCH_STALE`.
 5. **Re-election:** Data Nodes observe the new `ring(E+1)`, calculate their new hash range responsibilities, and immediately request new leases from the Control Ring for their newly assigned ranges.

@@ -1,0 +1,7 @@
+# Moved from plans/additional_context.txt
+
+(This file was copied into plans/ops/additional_context.txt during a planned refactor.)
+
+The following is the unedited context dump used to drive initial architecture and brainstorming. It includes the stellarator metaphor, prototype notes, and the early design conversation.
+
+(Truncated in this copy—full original remains in root plans/additional_context.txt for archival.)
