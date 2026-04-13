@@ -45,6 +45,6 @@ The fundamental routing algorithm for the Data Ring relies on traversing the uni
 
 1. **Hash the Key:** `KeyHash = Hash(NamespaceID || RawKey)`.
 2. **Binary Search:** The client (or proxying node) performs a binary search on the cached, sorted array of all `ring(E)` positions to find the first position strictly greater than `KeyHash`. This is the **Primary Vnode**.
-3. **The Ring Walk:** To satisfy a Replication Factor (RF) of `N`, the router walks clockwise around the ring starting from the Primary Vnode.
+3. **The Ring Walk:** To satisfy a Replication Factor (RF) of `N` (configured via `replication_factor` in `wendelon.toml`, defaulting to 3), the router walks clockwise around the ring starting from the Primary Vnode.
 4. **Physical Distinctness:** The router collects the underlying `NodeId` of each vnode it visits. It skips vnodes that map to a `NodeId` it has already collected, and skips nodes that lack the `data` capability.
 5. **Completion:** The walk stops once exactly `N` distinct physical Data Nodes are collected. The first node collected is the Primary (leaseholder candidate); the remaining `N-1` are Secondary Replicas.

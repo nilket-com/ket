@@ -22,3 +22,8 @@ Triggered by `SIGTERM` or `SIGINT`.
 3. **Raft Step-Down:** If this node is the Raft Leader, it triggers an immediate `TRANSFER_LEADERSHIP_REQ` to a healthy follower.
 4. **Flush Storage:** `fsync` all Active slabs. Ensure the `io_uring` CQE queue is completely drained. Flush the `SlabManifest` updates to the WAL.
 5. **Exit:** Terminate the async runtime.
+
+## 3. Crash Recovery
+
+If a node is terminated ungracefully (e.g., `SIGKILL` or hardware power loss), the in-memory index is lost and the WAL may contain unapplied entries. 
+For detailed recovery invariants and ordering, see `plans/consensus/raft-core.md` section 6 ("Recovery invariants and ordering").

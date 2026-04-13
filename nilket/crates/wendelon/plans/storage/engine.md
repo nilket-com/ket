@@ -42,5 +42,5 @@ To serve point reads quickly without scanning slabs, each Data Node maintains an
 3. If `SlabId` is local (State = Active or Sealed), a pre-allocated page-aligned buffer is dispatched to `io_uring` for an exact `preadv2` at `Offset` for `Length` bytes.
 4. Once the CQE completes, the buffer is handed directly to `quinn` for transmission. (Zero-copy network-to-disk-to-network).
 
-## 5. Startup Recovery
+## 6. Startup Recovery
 On startup, the node reads the `SlabManifest`s. For any Active or Sealed slabs, it sequentially scans the slab headers (which contain the `KeyHash` and `HLC`) to rebuild the in-memory index.

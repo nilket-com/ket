@@ -26,6 +26,8 @@ WPBC uses 1-byte opcodes followed by optional immediate arguments.
 - `0x02 PUSH_INT_i64 [8 bytes literal]`: Pushes a literal 64-bit integer.
 - `0x03 PUSH_STR [2 bytes len] [UTF-8 bytes]`: Pushes a literal string.
 - `0x04 PUSH_BOOL [1 byte (0|1)]`: Pushes a literal boolean.
+- `0x05 PUSH_FLOAT_f64 [8 bytes literal]`: Pushes a literal 64-bit float.
+- `0x06 PUSH_TS_ms [8 bytes literal]`: Pushes a literal timestamp (milliseconds).
 
 ### 3.2 Comparisons (Pops 2, Pushes Boolean)
 - `0x10 EQ`: Equals
