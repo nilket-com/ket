@@ -1,6 +1,28 @@
+[workspace]
+resolver = "2"
+
 [package]
 name = "wendelon"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+publish = false
 
 [dependencies]
+tokio = { version = "1.37", features = ["full"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+openraft = "0.9"
+arrow = { version = "51.0", features = ["ipc_compression"] }
+bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
+io-uring = "0.6"
+dashmap = "5.5"
+highway = "1.1"
+blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rand = "0.8"
+uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1.6"
+thiserror = "1.0"
