@@ -500,6 +500,97 @@ pub struct RaftEpochEntryFixed {
     pub learner_count: u32,
 }
 
+// ============================================================
+//  RAFT LOG ENTRY FIXED — 96 bytes, fixed
+//
+//  Fixed portion of every Raft log record written through the
+//  Control Ring WAL. Followed on disk by a variable payload
+//  (postcard-encoded `Entry<WendelonTypeConfig>` payload bytes
+//  today; Arrow IPC `write_payload_schema` when key/value
+//  mutations start flowing through Raft).
+// ============================================================
+
+/// Log entry kind discriminant (on-wire, fixed-size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct LogEntryKind(pub u8);
+
+impl LogEntryKind {
+    pub const APPEND:           Self = Self(0); // regular mutation / normal entry
+    pub const CONFIG:           Self = Self(1); // epoch or membership change
+    pub const SNAPSHOT_MARKER:  Self = Self(2); // snapshot boundary marker
+}
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct RaftLogEntryFixed {
+    pub kind: LogEntryKind,                   //  1
+    pub _pad1: [u8; 7],                       //  7
+    pub term: u64,                            //  8
+    pub index: u64,                           //  8
+    pub epoch: u64,                           //  8
+    pub leader: NodeId,                       //  8
+    pub entry_hlc: HybridTimestamp,           // 16
+    pub payload_len: u32,                     //  4
+    pub _pad2: [u8; 4],                       //  4
+    /// 32-byte content digest over the payload bytes. Currently
+    /// populated with a truncated blake3 hash; the field name
+    /// retains `sha256` nomenclature for future migration to the
+    /// ADR-specified SHA-256 digest without a layout change.
+    pub payload_hash: [u8; 32],               // 32
+}
+
+// ============================================================
+//  WAL RECORD HEADER — 32 bytes, fixed
+//
+//  Preamble for every Control Ring WAL record. Sits at the
+//  start of each page-aligned append and names the record type,
+//  the total body length, and the Raft coordinates the record
+//  pertains to.
+// ============================================================
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct WALRecordHeader {
+    /// 0 = LogEntry, 1 = SnapshotMarker, 2 = SnapshotInstall, 3 = Checkpoint
+    pub record_type: u8,                      //  1
+    pub _pad1: [u8; 7],                       //  7
+    /// Bytes of body following this header, excluding the trailing CRC.
+    pub body_len: u64,                        //  8
+    /// Raft log index this record pertains to (0 for non-log records).
+    pub log_index: u64,                       //  8
+    /// Raft term at the index above.
+    pub term: u64,                            //  8
+}
+
+// ============================================================
+//  SNAPSHOT HEADER — 80 bytes, fixed
+//
+//  Prefix of every snapshot blob, both on-disk and inside the
+//  in-memory `Cursor<Vec<u8>>` that `WendelonTypeConfig` uses as
+//  its `SnapshotData`. Followed by the postcard-encoded state
+//  machine blob; the optional idempotency-cache checkpoint is
+//  reserved by `cache_checkpoint_len` for future wiring.
+// ============================================================
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct SnapshotHeader {
+    pub last_included_index: u64,             //  8
+    pub last_included_term: u64,              //  8
+    pub last_included_epoch: u64,             //  8
+    pub snapshot_hlc: HybridTimestamp,        // 16
+    /// Content digest over the serialized state-machine blob.
+    /// 32-byte field retained with `sha256` nomenclature for a
+    /// future migration to SHA-256; currently filled with a
+    /// truncated blake3 digest of the same blob.
+    pub state_sha256: [u8; 32],               // 32
+    /// Byte length of the idempotency cache checkpoint that
+    /// follows the state-machine blob. Zero until that path lands.
+    pub cache_checkpoint_len: u32,            //  4
+    pub _pad: [u8; 4],                        //  4
+}
+
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);
 const _: () = assert!(std::mem::size_of::<NodeId>() == 8);
@@ -515,3 +606,7 @@ const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
+const _: () = assert!(std::mem::size_of::<LogEntryKind>() == 1);
+const _: () = assert!(std::mem::size_of::<RaftLogEntryFixed>() == 96);
+const _: () = assert!(std::mem::size_of::<WALRecordHeader>() == 32);
+const _: () = assert!(std::mem::size_of::<SnapshotHeader>() == 80);
