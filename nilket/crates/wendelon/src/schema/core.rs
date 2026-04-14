@@ -218,6 +218,12 @@ impl MsgType {
     // `FinalizationMarker` handoff to Raft.
     pub const REPLICATE_REQ:   Self = Self(0x09);
     pub const REPLICATE_RESP:  Self = Self(0x0A);
+    // Pushdown scan from a Smart Client SDK (ADR 005 + ADR 004).
+    // The client frames a WPBC program over a key-hash range and
+    // streams the filtered Arrow IPC result back on the same bidi
+    // stream. One QUERY_REQ begets exactly one QUERY_RESP.
+    pub const QUERY_REQ:       Self = Self(0x0B);
+    pub const QUERY_RESP:      Self = Self(0x0C);
 
     // control ring
     pub const TRANSFER_REQ:    Self = Self(0x10);
@@ -436,6 +442,64 @@ pub struct ReadResponseMeta {
     pub leader_hint: NodeId,               //  8 bytes
     /// Value length in Arrow payload (0 if not found)
     pub value_len: u32,                    //  4 bytes
+    pub _pad2: [u8; 4],                    //  4 bytes
+}
+
+// ============================================================
+//  QUERY REQUEST METADATA — 56 bytes, fixed
+//
+//  Carries the fixed envelope for a Smart Client pushdown scan
+//  (ADR 005). The WPBC bytecode itself rides in the frame's
+//  trailing section so it does not bloat this POD; the Arrow
+//  section is unused on the request side.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct QueryRequestMeta {
+    /// Causal read-after-write bound. Server waits until its
+    /// observed `e_safe_hlc` for `expected_epoch` >= this, or
+    /// returns `E_SAFE_BEHIND` so the client re-routes.
+    pub min_hlc: HybridTimestamp,          // 16 bytes
+    pub expected_epoch: u64,               //  8 bytes
+    pub consistency: Consistency,          //  1 byte
+    pub _pad: [u8; 7],                     //  7 bytes
+    /// Inclusive lower bound of the key_hash range to scan.
+    pub key_range_start: u64,              //  8 bytes
+    /// Inclusive upper bound.
+    pub key_range_end: u64,                //  8 bytes
+    /// Length of the WPBC bytecode in the trailing section. Zero
+    /// means "no filter, all rows in range".
+    pub bytecode_len: u32,                 //  4 bytes
+    pub _pad2: [u8; 4],                    //  4 bytes
+}
+
+// ============================================================
+//  QUERY RESPONSE METADATA — 56 bytes, fixed
+//
+//  Response envelope for pushdown scans. The filtered Arrow IPC
+//  result rides in the frame's arrow section; `rows` is the row
+//  count after WPBC filter + project and lets the client size its
+//  downstream collection without walking the batch first.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct QueryResponseMeta {
+    /// Reuses [`ReadStatus`] so `NOT_LEADER` / `E_SAFE_BEHIND` /
+    /// `EPOCH_STALE` redirect hints round-trip unchanged.
+    pub status: ReadStatus,                //  1 byte
+    pub _pad1: [u8; 7],                    //  7 bytes
+    /// Highest HLC observed in the returned rows (zero on error
+    /// or empty result).
+    pub value_hlc: HybridTimestamp,        // 16 bytes
+    pub epoch: u64,                        //  8 bytes
+    /// On `NOT_LEADER` / `E_SAFE_BEHIND`: the node the client
+    /// should retry against.
+    pub leader_hint: NodeId,               //  8 bytes
+    /// Row count after filter + project.
+    pub rows: u64,                         //  8 bytes
+    /// Byte length of the Arrow IPC section carrying the result
+    /// batch. Zero if `status != OK`.
+    pub arrow_len: u32,                    //  4 bytes
     pub _pad2: [u8; 4],                    //  4 bytes
 }
 
@@ -662,6 +726,8 @@ const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 64);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 40);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
