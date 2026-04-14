@@ -211,6 +211,13 @@ impl MsgType {
     pub const BULK_WRITE_RESP: Self = Self(0x06);
     pub const STREAM_FIN_REQ:  Self = Self(0x07);  // StreamFinalization subscribe
     pub const STREAM_FIN_EVT:  Self = Self(0x08);  // FinalizationMarker push
+    // Stellarator replica fan-out (ADR 003). The Data Ring front
+    // door uses these to replicate Arrow IPC bytes from the
+    // accepting node to the remaining replica set members in
+    // parallel — quorum acks on REPLICATE_RESP gate the
+    // `FinalizationMarker` handoff to Raft.
+    pub const REPLICATE_REQ:   Self = Self(0x09);
+    pub const REPLICATE_RESP:  Self = Self(0x0A);
 
     // control ring
     pub const TRANSFER_REQ:    Self = Self(0x10);
@@ -318,6 +325,56 @@ pub struct WriteResponseMeta {
     /// 1 if a FinalizationMarker follows this frame; 0 otherwise
     pub has_finalization: u8,              //  1 byte
     pub _pad2: [u8; 7],                    //  7 bytes
+}
+
+// ============================================================
+//  REPLICATE REQUEST METADATA — 64 bytes, fixed
+//
+//  Carried on REPLICATE_REQ frames during Stellarator fan-out
+//  (ADR 003). The accepting node bifurcates: local slab append +
+//  parallel REPLICATE_REQ frames to peers; a quorum of
+//  REPLICATE_RESP acks gates the 88-byte FinalizationMarker on
+//  the Control Ring. Payload bytes ride in the frame's arrow
+//  section exactly as they will land in the slab.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct ReplicaWriteMeta {
+    /// HLC chosen by the accepting (origin) node. Replicas index
+    /// the append under this timestamp so recovery sees a
+    /// consistent cross-node ordering.
+    pub commit_hlc: HybridTimestamp,       // 16 bytes
+    /// Epoch of the originating leader — replicas reject on
+    /// mismatch against their own current epoch.
+    pub epoch: u64,                        //  8 bytes
+    /// HighwayHash of the key bytes. Replicas use this as the
+    /// slab index key rather than re-hashing the Arrow payload.
+    pub key_hash: u64,                     //  8 bytes
+    /// Blake3-256 of the Arrow IPC bytes. Replicas verify the
+    /// payload before ack so corruption surfaces as a failed
+    /// ack rather than a silent divergence.
+    pub payload_hash: [u8; 32],            // 32 bytes
+}
+
+// ============================================================
+//  REPLICATE RESPONSE METADATA — 8 bytes, fixed
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct ReplicaWriteStatus(pub u8);
+
+impl ReplicaWriteStatus {
+    pub const OK:             Self = Self(0);
+    pub const EPOCH_STALE:    Self = Self(1);
+    pub const HASH_MISMATCH:  Self = Self(2);
+    pub const INTERNAL_ERROR: Self = Self(3);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct ReplicaWriteRespMeta {
+    pub status: ReplicaWriteStatus,        //  1 byte
+    pub _pad: [u8; 7],                     //  7 bytes
 }
 
 // ============================================================
@@ -601,6 +658,8 @@ const _: () = assert!(std::mem::size_of::<LeaseDescriptor>() == 128);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
+const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 64);
+const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 40);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);

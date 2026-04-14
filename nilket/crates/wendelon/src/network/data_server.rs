@@ -1,40 +1,49 @@
 //! Data Ring server (ADR 003 — the Stellarator Model).
 //!
 //! [`WendelonDataServer`] implements the [`DataRing`] trait by
-//! bridging the two rings: every client write lands on local NVMe
-//! *first* via [`SlabManager`], and only after the `io_uring`
-//! append completes does a lightweight [`FinalizationMarker`]
-//! enter the Control Ring's Raft log via `raft.client_write(...)`.
+//! bifurcating every client write: the Arrow IPC payload is
+//! replicated directly to the data replica set over HRFT streams
+//! (ADR 004) and only an 88-byte [`FinalizationMarker`] enters the
+//! Raft Control Ring to advance the `E_safe` watermark.
 //!
-//! This keeps the Stellarator invariant honest: Arrow IPC payloads
-//! never cross the Raft log; only finalization metadata does, so
-//! the Control Ring commit cadence is decoupled from the bulk data
-//! rate.
+//! ## Why fan-out lives above the slab
 //!
-//! ## V1 scope (deliberately thin)
+//! The slab is the durability boundary for *one* node; quorum is
+//! the durability boundary for *the write*. The fan-out wraps
+//! [`SlabManager::append`] so the local append and the remote
+//! replica appends both count toward quorum under the same
+//! majority rule. Payload bytes never enter the Raft log — only
+//! the finalization marker does, per the Stellarator invariant.
 //!
-//! * `write` runs at RF=1 — no replica fan-out yet. ADR 004's
-//!   quorum path will splice in above the slab append without
-//!   moving the Raft handoff.
-//! * `read` serves from the local slab index only. Cross-node
-//!   routing and follower forwarding live above this layer.
-//! * `bulk_write` and `stream_finalization` return empty
-//!   receivers — the surface compiles, the wiring lands with the
-//!   subscriber bus.
+//! ## V1 scope
+//!
+//! * Static replica set resolved through [`ReplicaRouter`]. A real
+//!   deployment will feed this from the ADR 002 Unified Hash Ring
+//!   projection off the Raft `ring(E)` snapshot; today we accept
+//!   any `Arc<dyn ReplicaRouter>` so tests can inject a trivial
+//!   in-memory topology.
+//! * Concurrent dials through [`TransportProviderFactory`]. The
+//!   factory already collapses duplicate dials per peer, so we
+//!   spawn one task per remote replica without extra coordination.
+//! * Quorum = `(RF / 2) + 1`. If the local node is in the replica
+//!   set, its slab append counts as one ack.
 //!
 //! ## Idempotency
 //!
 //! A [`DashMap`] keyed on `(client_uuid, sequence_no)` deduplicates
 //! retries. A hit replays the original [`WriteResponseMeta`] with
 //! `status` overwritten to [`WriteStatus::DUPLICATE`] so the client
-//! can tell a fresh success apart from a replay. The TTL and ack
-//! window from ADR 003 §3 are tracked as follow-ups; today the
-//! cache grows monotonically until process restart.
+//! can tell a fresh success apart from a replay.
 
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonStateMachine};
+use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
+use crate::network::factory::TransportProviderFactory;
+use crate::network::pool::BufPool;
+use crate::network::router::DataRingServer;
 use crate::schema::{
-    Consistency, FinalizationMarker, HybridTimestamp, NodeId, ReadRequestMeta, ReadResponseMeta,
-    ReadStatus, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+    Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
+    ReadRequestMeta, ReadResponseMeta, ReadStatus, ReplicaWriteMeta, ReplicaWriteRespMeta,
+    ReplicaWriteStatus, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 };
 use crate::storage::core::StorageEngine;
 use crate::storage::manager::SlabManager;
@@ -49,7 +58,9 @@ use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
+use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
 
 /// HighwayHash seed. Stable for the lifetime of the process —
@@ -65,9 +76,81 @@ const HIGHWAY_KEY: HighwayKey = HighwayKey([
 
 type IdempotencyKey = ([u8; 16], u64);
 
-/// Data Ring front door. Handles the two ADR-critical paths:
-/// disk-first write with Raft-backed finalization, and local
-/// linearizable / serializable / stale reads.
+// ============================================================
+//  REPLICA ROUTER
+// ============================================================
+
+/// Resolves a `key_hash` to the replica set that should store it.
+///
+/// The contract is deliberately narrow: return the ordered list of
+/// `NodeId`s that form the replica set for this key. The ordering
+/// is not consulted by the fan-out (every member must ack), but a
+/// stable ordering helps tracing and topology tooling line up.
+///
+/// A real implementation projects off the Raft `ring(E)` snapshot
+/// and filters for data-capable nodes (ADR 002). The V1 fallback
+/// is [`StaticReplicaRouter`].
+pub trait ReplicaRouter: Send + Sync {
+    /// Members of the replica set for `key_hash`. The order is
+    /// stable for a given topology so traces align; callers must
+    /// not depend on the first entry being the local node.
+    fn replicas(&self, key_hash: u64) -> Vec<NodeId>;
+
+    /// Effective replication factor for this router. Exposed so the
+    /// quorum math is source-of-truthed in one place.
+    fn replication_factor(&self) -> usize;
+}
+
+/// Static ring router. Holds the full node list and an RF; resolves
+/// each key's replica set as `RF` consecutive nodes starting at
+/// `key_hash % nodes.len()`. This is a stand-in for the full ADR 002
+/// projection — good enough for a bring-up where membership is
+/// stable, fine for tests, and will be swapped for a real snapshot
+/// reader once the Unified Hash Ring projection lands.
+pub struct StaticReplicaRouter {
+    nodes: Vec<NodeId>,
+    rf: usize,
+}
+
+impl StaticReplicaRouter {
+    /// Build a router over `nodes` with replication factor `rf`.
+    /// The node list is sorted by numeric id for deterministic
+    /// ordering; duplicate ids are deduplicated.
+    pub fn new(mut nodes: Vec<NodeId>, rf: usize) -> Self {
+        nodes.sort_by_key(|n| n.id);
+        nodes.dedup_by_key(|n| n.id);
+        let rf = rf.max(1);
+        Self { nodes, rf }
+    }
+}
+
+impl ReplicaRouter for StaticReplicaRouter {
+    fn replicas(&self, key_hash: u64) -> Vec<NodeId> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+        let n = self.nodes.len();
+        let take = self.rf.min(n);
+        let start = (key_hash as usize) % n;
+        (0..take)
+            .map(|i| self.nodes[(start + i) % n])
+            .collect()
+    }
+
+    fn replication_factor(&self) -> usize {
+        self.rf.min(self.nodes.len().max(1))
+    }
+}
+
+// ============================================================
+//  SERVER
+// ============================================================
+
+/// Data Ring front door. Owns the local slab, a client to the Raft
+/// Control Ring, and everything needed to run the bifurcated write
+/// path: a [`ReplicaRouter`] to resolve the replica set and a
+/// [`TransportProviderFactory`] to open HRFT streams to remote
+/// replicas.
 pub struct WendelonDataServer {
     slab: Arc<SlabManager>,
     raft: WendelonRaft,
@@ -76,10 +159,23 @@ pub struct WendelonDataServer {
     /// hints the "current epoch" for write-side validation.
     state_machine: WendelonStateMachine,
     /// Local node identity, populated into every response's
-    /// `leader_hint` until we have a cheap async way to pull the
-    /// real current leader from `raft.current_leader()` on the
-    /// hot path.
+    /// `leader_hint` and used to decide whether the local slab
+    /// append counts toward quorum on a given key.
     local_node: NodeId,
+    /// Resolves a `key_hash` to the replica set that should hold
+    /// it. Injected so the projection source (Unified Hash Ring
+    /// snapshot, static dev topology, test mock) is the caller's
+    /// concern, not this file's.
+    router: Arc<dyn ReplicaRouter>,
+    /// Shared connection factory. Caches sessions per `NodeId`,
+    /// negotiates tiers, and collapses duplicate concurrent dials
+    /// so spawning one fan-out task per peer is safe without extra
+    /// locks here.
+    factory: Arc<TransportProviderFactory>,
+    /// Shared buffer pool. Inbound REPLICATE frames draw their
+    /// payload sections from it and the response `meta` buffer is
+    /// encoded into a pooled Vec on the reply path.
+    pool: Arc<BufPool>,
     /// Exactly-once cache. `WriteResponseMeta` is `Copy`, so
     /// lookups are O(1) under DashMap's shard striping.
     idempotency: DashMap<IdempotencyKey, WriteResponseMeta>,
@@ -91,13 +187,168 @@ impl WendelonDataServer {
         raft: WendelonRaft,
         state_machine: WendelonStateMachine,
         local_node: NodeId,
+        router: Arc<dyn ReplicaRouter>,
+        factory: Arc<TransportProviderFactory>,
+        pool: Arc<BufPool>,
     ) -> Self {
         Self {
             slab,
             raft,
             state_machine,
             local_node,
+            router,
+            factory,
+            pool,
             idempotency: DashMap::new(),
+        }
+    }
+
+    /// Fan-out write to a single remote replica. Opens one bidi
+    /// stream, ships the REPLICATE_REQ frame, and awaits the
+    /// REPLICATE_RESP. Every failure — dial, send, protocol,
+    /// negative ack — surfaces as `Err` so the caller can simply
+    /// count `Ok` results as acks.
+    async fn replicate_to_remote(
+        factory: Arc<TransportProviderFactory>,
+        pool: Arc<BufPool>,
+        target: NodeId,
+        meta: ReplicaWriteMeta,
+        arrow_bytes: Arc<Vec<u8>>,
+    ) -> std::io::Result<()> {
+        let conn = factory.get_connection(target).await?;
+        let mut stream = conn.open_bi().await?;
+
+        let meta_bytes = bytemuck::bytes_of(&meta);
+        let header = FrameHeader {
+            magic: HRFT_MAGIC,
+            version: 1,
+            msg_type: MsgType::REPLICATE_REQ.0,
+            flags: 0,
+            stream_id: 0,
+            meta_len: meta_bytes.len() as u32,
+            arrow_len: arrow_bytes.len() as u32,
+            trailing_len: 0,
+        };
+        write_frame(
+            &mut *stream,
+            &header,
+            meta_bytes,
+            Some(arrow_bytes.as_slice()),
+            None,
+        )
+        .await?;
+        stream
+            .finish()
+            .await
+            .map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+        let resp = read_frame(&mut *stream, &pool).await?;
+        if resp.header.msg_type != MsgType::REPLICATE_RESP.0 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "expected REPLICATE_RESP, got msg_type=0x{:02x}",
+                    resp.header.msg_type
+                ),
+            ));
+        }
+        if resp.meta.len() < std::mem::size_of::<ReplicaWriteRespMeta>() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "REPLICATE_RESP meta too small",
+            ));
+        }
+        let ack: &ReplicaWriteRespMeta =
+            bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReplicaWriteRespMeta>()]);
+        if ack.status != ReplicaWriteStatus::OK {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("replica {target:?} rejected write: status={}", ack.status.0),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Handle an inbound REPLICATE_REQ frame: decode the POD
+    /// metadata, verify the payload hash, append to the local
+    /// slab, and build the REPLICATE_RESP frame. Surfaces both
+    /// transient and logical failures via the `status` byte rather
+    /// than tearing down the HRFT stream — the sender's ack count
+    /// is the only signal that matters for quorum.
+    async fn handle_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+        if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "REPLICATE_REQ meta too small",
+            ));
+        }
+        let meta: ReplicaWriteMeta = *bytemuck::from_bytes(
+            &frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()],
+        );
+        let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "REPLICATE_REQ missing arrow payload",
+            )
+        })?;
+
+        let arrow_bytes: &[u8] = &arrow[..];
+        let status = if blake3_32(arrow_bytes) != meta.payload_hash {
+            ReplicaWriteStatus::HASH_MISMATCH
+        } else {
+            match self
+                .slab
+                .append(meta.key_hash, meta.commit_hlc, arrow_bytes)
+                .await
+            {
+                Ok(_) => ReplicaWriteStatus::OK,
+                Err(_) => ReplicaWriteStatus::INTERNAL_ERROR,
+            }
+        };
+
+        let resp = ReplicaWriteRespMeta {
+            status,
+            _pad: [0; 7],
+        };
+        let mut body = self.pool.acquire();
+        body.as_mut_vec()
+            .extend_from_slice(bytemuck::bytes_of(&resp));
+        let header = FrameHeader {
+            magic: HRFT_MAGIC,
+            version: 1,
+            msg_type: MsgType::REPLICATE_RESP.0,
+            flags: 0,
+            stream_id: frame.header.stream_id,
+            meta_len: body.len() as u32,
+            arrow_len: 0,
+            trailing_len: 0,
+        };
+        Ok(HrftFrame {
+            header,
+            meta: body,
+            arrow_payload: None,
+            trailing: None,
+        })
+    }
+}
+
+// ============================================================
+//  DATA RING SERVER (INBOUND DISPATCH)
+// ============================================================
+
+#[async_trait]
+impl DataRingServer for WendelonDataServer {
+    async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+        let msg_type = MsgType(frame.header.msg_type);
+        match msg_type {
+            MsgType::REPLICATE_REQ => self.handle_replicate(frame).await.map(Some),
+            other => Err(Error::new(
+                ErrorKind::Unsupported,
+                format!(
+                    "Data Ring handler has no decoder for msg_type=0x{:02x}",
+                    other.0
+                ),
+            )),
         }
     }
 }
@@ -136,49 +387,115 @@ impl DataRing for WendelonDataServer {
         let key_bytes = extract_first_binary(&payload, "key")?;
         let key_hash = highway_hash(key_bytes);
 
-        // 5. Serialize the RecordBatch back to Arrow IPC — these
-        // bytes are what land in the slab and get returned verbatim
-        // on reads. Storing the whole batch (rather than just the
-        // value) keeps the on-disk record self-describing so future
-        // compaction and cross-tier migration can operate on it
-        // without rehydrating via the SM.
-        let frame_bytes = encode_batch(&payload)?;
+        // 5. Serialize the RecordBatch back to Arrow IPC. These
+        // bytes are what both the local slab and every remote
+        // replica store verbatim — hashing once here means every
+        // ack is computed against the same authoritative blob.
+        let frame_bytes = Arc::new(encode_batch(&payload)?);
+        let payload_hash = blake3_32(frame_bytes.as_slice());
 
         // 6. HLC for this write. The real impl merges `leader_hlc`
         // with `meta.client_hlc` and bumps logical; V1 carries the
-        // client HLC straight through, which is correct for
-        // single-node and good-enough for the first multi-node
-        // bring-up.
+        // client HLC straight through.
         let commit_hlc = meta.client_hlc;
 
-        // 7. Disk append. io_uring CQE for the write completes
-        // before we return here — the storage engine awaits it
-        // internally.
-        let location = self.slab.append(key_hash, commit_hlc, &frame_bytes).await?;
+        // 7. Resolve the replica set. An empty set is a
+        // configuration bug — refuse rather than silently dropping
+        // to a pre-Stellarator single-node append.
+        let replicas = self.router.replicas(key_hash);
+        if replicas.is_empty() {
+            return Ok((
+                error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
+                None,
+            ));
+        }
+        let rf = replicas.len();
+        let quorum = (rf / 2) + 1;
 
-        // 8. Build the finalization marker. `log_index` / `term`
-        // are unknown until Raft places the entry; we submit with
-        // zeros and fill them from the ClientWriteResponse below.
-        // The SM's `apply_request` only reads `epoch` and
-        // `commit_hlc`, so the placeholder zeros are safe.
+        // 8. Local append (if this node is in the replica set) and
+        // concurrent fan-out to the remaining replicas. Each remote
+        // leg runs on its own task so head-of-line blocking on any
+        // single peer only slows *that* leg — the quorum race still
+        // completes as soon as the first majority of acks arrive.
+        let mut acks: usize = 0;
+        let local_is_replica = replicas.iter().any(|n| n.id == self.local_node.id);
+        if local_is_replica {
+            // The io_uring append is the hot path — drive it first
+            // so the local leg is usually the fastest ack.
+            match self
+                .slab
+                .append(key_hash, commit_hlc, frame_bytes.as_slice())
+                .await
+            {
+                Ok(_) => acks += 1,
+                Err(e) => {
+                    // A local durability failure is terminal — we
+                    // cannot finalize a write we could not even put
+                    // on our own NVMe. Propagate rather than falling
+                    // back to a pure remote quorum, which would make
+                    // the local index silently diverge.
+                    return Err(e);
+                }
+            }
+        }
+
+        let replica_meta = ReplicaWriteMeta {
+            commit_hlc,
+            epoch: meta.expected_epoch,
+            key_hash,
+            payload_hash,
+        };
+        let mut join: JoinSet<std::io::Result<()>> = JoinSet::new();
+        for target in replicas.iter().copied() {
+            if target.id == self.local_node.id {
+                continue;
+            }
+            let factory = self.factory.clone();
+            let pool = self.pool.clone();
+            let bytes = frame_bytes.clone();
+            join.spawn(async move {
+                Self::replicate_to_remote(factory, pool, target, replica_meta, bytes).await
+            });
+        }
+
+        // 9. Quorum race. Stop polling as soon as the majority is
+        // in — outstanding tasks keep running to completion so
+        // slower replicas still catch up, but we do not block the
+        // client on them.
+        while acks < quorum {
+            match join.join_next().await {
+                Some(Ok(Ok(()))) => acks += 1,
+                Some(_) => { /* leg failed — keep racing */ }
+                None => break, // no more remote legs in flight
+            }
+        }
+
+        if acks < quorum {
+            return Ok((
+                error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
+                None,
+            ));
+        }
+
+        // 10. Finalization. `log_index` / `term` are unknown until
+        // Raft places the entry; submit with zeros and fill them
+        // from the ClientWriteResponse below. The SM's
+        // `apply_request` only reads `epoch` and `commit_hlc`, so
+        // the placeholder zeros are safe.
         let mut marker = FinalizationMarker {
             log_index: 0,
             term: 0,
             epoch: meta.expected_epoch,
             commit_hlc,
-            payload_hash: blake3_32(&frame_bytes),
+            payload_hash,
             e_safe_index: 0,
             _reserved: 0,
         };
 
-        // 9. Raft handoff — commits the finalization across the
-        // Control Ring. Disk is already durable at this point, so
-        // a transient Raft failure surfaces as INTERNAL_ERROR to
-        // the client but doesn't cost us the stored bytes (they
-        // remain at `location` for the client's next retry).
-        let (status, log_index, term) = match self.raft.client_write(
-            WendelonRequest::Finalize(marker),
-        ).await
+        let (status, log_index, term) = match self
+            .raft
+            .client_write(WendelonRequest::Finalize(marker))
+            .await
         {
             Ok(resp) => (
                 WriteStatus::OK,
@@ -191,7 +508,7 @@ impl DataRing for WendelonDataServer {
         marker.term = term;
         marker.e_safe_index = log_index;
 
-        // 10. Response meta, cached for future idempotent replays.
+        // 11. Response meta, cached for future idempotent replays.
         let response = WriteResponseMeta {
             status,
             _pad1: [0; 7],
@@ -211,10 +528,6 @@ impl DataRing for WendelonDataServer {
         } else {
             None
         };
-        // Unused binding — `payload` itself is no longer needed
-        // past step 7. Letting it drop here releases the Arrow
-        // buffers before the Raft client_write await.
-        let _ = location;
         Ok((response, trailing))
     }
 
@@ -270,10 +583,6 @@ impl DataRing for WendelonDataServer {
             status: ReadStatus::OK,
             _pad1: [0; 7],
             value_hlc: location.hlc,
-            // Per-record log index tracking isn't plumbed into the
-            // slab index yet; surface 0 as a sentinel and fill it
-            // once the Data Ring finalization side plumbs the
-            // committed log_index back into the slab record.
             read_at_index: 0,
             epoch: meta.expected_epoch,
             leader_hint: self.local_node,
@@ -288,10 +597,6 @@ impl DataRing for WendelonDataServer {
         _start_log_index: u64,
         _epoch: u64,
     ) -> std::io::Result<mpsc::Receiver<FinalizationMarker>> {
-        // Subscriber bus lands with the finalization-broadcast task
-        // that tails the SM's apply stream. For now return a closed
-        // channel so callers see a clean EOF instead of the handler
-        // panicking on unwrap.
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
     }
@@ -300,11 +605,6 @@ impl DataRing for WendelonDataServer {
         &self,
         _requests: mpsc::Receiver<(WriteRequestMeta, RecordBatch)>,
     ) -> std::io::Result<mpsc::Receiver<WriteResponseMeta>> {
-        // Batched fast path is deferred — a correct but unpipelined
-        // fallback would drive `write` serially over the receiver,
-        // which defeats the purpose. Return an empty channel with
-        // a TODO so the trait surface stays complete without
-        // silently shipping a slow path.
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
     }
@@ -442,4 +742,52 @@ fn highway_hash(bytes: &[u8]) -> u64 {
 
 fn blake3_32(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+// ============================================================
+//  TESTS
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn n(id: u32) -> NodeId {
+        NodeId { id, _reserved: 0 }
+    }
+
+    #[test]
+    fn static_router_wraps_around_ring() {
+        let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3), n(4)], 3);
+        // start index 3 → {3, 0, 1} = nodes 4, 1, 2
+        let replicas = router.replicas(3);
+        assert_eq!(replicas.len(), 3);
+        assert_eq!(replicas[0], n(4));
+        assert_eq!(replicas[1], n(1));
+        assert_eq!(replicas[2], n(2));
+    }
+
+    #[test]
+    fn static_router_dedups_and_sorts() {
+        let router =
+            StaticReplicaRouter::new(vec![n(3), n(1), n(3), n(2)], 5);
+        // RF clamped to available node count (3).
+        let replicas = router.replicas(0);
+        assert_eq!(replicas.len(), 3);
+        assert_eq!(replicas[0], n(1));
+        assert_eq!(replicas[1], n(2));
+        assert_eq!(replicas[2], n(3));
+    }
+
+    #[test]
+    fn static_router_rf_one_is_single_replica() {
+        let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3)], 1);
+        assert_eq!(router.replicas(0).len(), 1);
+    }
+
+    #[test]
+    fn static_router_empty_node_list_returns_empty() {
+        let router = StaticReplicaRouter::new(vec![], 3);
+        assert!(router.replicas(0).is_empty());
+    }
 }
