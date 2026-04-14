@@ -537,6 +537,17 @@ impl WendelonStateMachine {
     pub async fn state_snapshot(&self) -> SmState {
         self.inner.read().await.state.clone()
     }
+
+    /// Test-only hook to seed the E_safe watermark for an epoch
+    /// without routing a Finalize entry through openraft. Used by
+    /// data-ring tests that want to exercise the LINEARIZABLE
+    /// consistency gate in isolation; production code must never
+    /// poke the SM state directly — all mutations belong to apply.
+    #[cfg(test)]
+    pub async fn seed_e_safe_for_test(&self, epoch: u64, hlc: HybridTimestamp) {
+        let mut guard = self.inner.write().await;
+        guard.state.e_safe_watermarks.insert(epoch, hlc);
+    }
 }
 
 impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {

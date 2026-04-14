@@ -41,13 +41,15 @@ use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::router::DataRingServer;
 use crate::schema::{
-    Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
-    ReadRequestMeta, ReadResponseMeta, ReadStatus, ReplicaWriteMeta, ReplicaWriteRespMeta,
-    ReplicaWriteStatus, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+    wpbc, Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
+    QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+    ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
+    WriteResponseMeta, WriteStatus,
 };
 use crate::storage::core::StorageEngine;
 use crate::storage::manager::SlabManager;
 use arrow::array::{Array, LargeBinaryArray, LargeBinaryBuilder};
+use arrow::compute::concat_batches;
 use arrow::datatypes::Schema;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -269,6 +271,93 @@ impl WendelonDataServer {
         Ok(())
     }
 
+    /// Handle an inbound QUERY_REQ frame (ADR 005 pushdown scan).
+    ///
+    /// 1. Decode the POD `QueryRequestMeta` and fish the WPBC bytes
+    ///    out of the trailing section.
+    /// 2. Enforce the same epoch + consistency gates as the point
+    ///    read path — the scan spans many keys but the freshness
+    ///    guarantee is identical.
+    /// 3. Scan the local `SlabManager` for every `key_hash` in the
+    ///    inclusive `[key_range_start, key_range_end]` window,
+    ///    materialise each record's Arrow batch, run WPBC over it,
+    ///    and collect the non-empty results.
+    /// 4. Concatenate the surviving batches into a single Arrow IPC
+    ///    stream and package it alongside a POD response meta.
+    ///
+    /// Failures surface via the `status` byte (`EPOCH_STALE`,
+    /// `E_SAFE_BEHIND`, `KEY_NOT_FOUND`, `INTERNAL_ERROR`) rather
+    /// than tearing down the HRFT stream — the client inspects the
+    /// meta and decides whether to retry or surface an error.
+    async fn handle_query(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+        if frame.meta.len() < std::mem::size_of::<QueryRequestMeta>() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "QUERY_REQ meta too small",
+            ));
+        }
+        let meta: QueryRequestMeta =
+            *bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
+
+        // Extract the WPBC bytecode. `bytecode_len == 0` is a
+        // legal "no filter, no projection" — skip the trailing
+        // section entirely in that case so a missing trailing is
+        // not a protocol error.
+        let bytecode: &[u8] = if meta.bytecode_len == 0 {
+            &[]
+        } else {
+            let trailing = frame.trailing.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "QUERY_REQ declared bytecode_len > 0 but trailing is absent",
+                )
+            })?;
+            let want = meta.bytecode_len as usize;
+            if trailing.len() < want {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "QUERY_REQ trailing is shorter than declared bytecode_len",
+                ));
+            }
+            &trailing[..want]
+        };
+
+        let (resp_meta, arrow_bytes) = execute_query_plan(
+            &self.slab,
+            &self.state_machine,
+            self.local_node,
+            &meta,
+            bytecode,
+        )
+        .await?;
+
+        let mut body = self.pool.acquire();
+        body.as_mut_vec().extend_from_slice(bytemuck::bytes_of(&resp_meta));
+        let arrow_payload = arrow_bytes.map(|bytes| {
+            let mut buf = self.pool.acquire();
+            buf.as_mut_vec().extend_from_slice(&bytes);
+            buf
+        });
+        let arrow_len = resp_meta.arrow_len;
+
+        let header = FrameHeader {
+            magic: HRFT_MAGIC,
+            version: 1,
+            msg_type: MsgType::QUERY_RESP.0,
+            flags: 0,
+            stream_id: frame.header.stream_id,
+            meta_len: body.len() as u32,
+            arrow_len,
+            trailing_len: 0,
+        };
+        Ok(HrftFrame {
+            header,
+            meta: body,
+            arrow_payload,
+            trailing: None,
+        })
+    }
+
     /// Handle an inbound REPLICATE_REQ frame: decode the POD
     /// metadata, verify the payload hash, append to the local
     /// slab, and build the REPLICATE_RESP frame. Surfaces both
@@ -342,6 +431,7 @@ impl DataRingServer for WendelonDataServer {
         let msg_type = MsgType(frame.header.msg_type);
         match msg_type {
             MsgType::REPLICATE_REQ => self.handle_replicate(frame).await.map(Some),
+            MsgType::QUERY_REQ => self.handle_query(frame).await.map(Some),
             other => Err(Error::new(
                 ErrorKind::Unsupported,
                 format!(
@@ -611,6 +701,136 @@ impl DataRing for WendelonDataServer {
 }
 
 // ============================================================
+//  QUERY EXECUTION — INDEPENDENT OF TRANSPORT
+// ============================================================
+
+/// Execute a [`QueryRequestMeta`] + WPBC program against a local
+/// [`SlabManager`]. Returns the POD response meta plus the
+/// concatenated Arrow IPC bytes when `status == OK`.
+///
+/// Split out from the frame-handler so tests can drive the full
+/// query path without standing up an HRFT server or an openraft
+/// instance — `WendelonDataServer` only needs the meta + bytes pair
+/// to pack the outbound frame.
+pub(crate) async fn execute_query_plan(
+    slab: &SlabManager,
+    state_machine: &WendelonStateMachine,
+    local_node: NodeId,
+    meta: &QueryRequestMeta,
+    bytecode: &[u8],
+) -> std::io::Result<(QueryResponseMeta, Option<Vec<u8>>)> {
+    // 1. Epoch staleness. The authoritative epoch is the highest
+    // one the SM has observed an E_safe advance for; a client
+    // believing in a past epoch gets a redirect so it can refresh
+    // topology rather than fork the read.
+    let sm = state_machine.state_snapshot().await;
+    let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+    if meta.expected_epoch < current_epoch {
+        return Ok((query_error_meta(meta, ReadStatus::EPOCH_STALE, local_node), None));
+    }
+
+    // 2. LINEARIZABLE gate — the scan is only authoritative once
+    // the local SM has observed E_safe at-or-past the client's
+    // min_hlc for the requested epoch.
+    if meta.consistency == Consistency::LINEARIZABLE {
+        let watermark = sm
+            .e_safe_watermarks
+            .get(&meta.expected_epoch)
+            .copied()
+            .unwrap_or(HybridTimestamp {
+                physical_ms: 0,
+                logical: 0,
+                node_id: 0,
+            });
+        if watermark < meta.min_hlc {
+            return Ok((
+                query_error_meta(meta, ReadStatus::E_SAFE_BEHIND, local_node),
+                None,
+            ));
+        }
+    }
+
+    // 3. Compile WPBC once so per-row evaluation skips repeated
+    // decoding when the scan hits many records.
+    // `wpbc::execute` already does this internally per call, but
+    // we mirror the pattern so a follow-up that batches rows can
+    // lift the compile out of the loop without touching semantics.
+    let locations = slab.scan(meta.key_range_start, meta.key_range_end);
+
+    let mut filtered: Vec<RecordBatch> = Vec::new();
+    let mut max_hlc = HybridTimestamp {
+        physical_ms: 0,
+        logical: 0,
+        node_id: 0,
+    };
+    for (_key_hash, location) in locations {
+        let bytes = slab.read(location).await?;
+        let batch = decode_batch(&bytes)?;
+        let result = wpbc::execute(bytecode, &batch)?;
+        if result.num_rows() == 0 {
+            continue;
+        }
+        if location.hlc > max_hlc {
+            max_hlc = location.hlc;
+        }
+        filtered.push(result);
+    }
+
+    // 4. Empty result is a legitimate answer. Clients map
+    // KEY_NOT_FOUND to an empty batch on the receive side, so we
+    // avoid the cost of encoding a zero-row stream.
+    if filtered.is_empty() {
+        return Ok((
+            query_error_meta(meta, ReadStatus::KEY_NOT_FOUND, local_node),
+            None,
+        ));
+    }
+
+    // 5. Concatenate. Every record in a single scan shares the
+    // write-path schema and WPBC applies the same projection to
+    // each, so the post-filter schema is uniform.
+    let schema = filtered[0].schema();
+    let concatenated = concat_batches(&schema, &filtered)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
+    let rows = concatenated.num_rows() as u64;
+    let arrow_bytes = encode_batch(&concatenated)?;
+    let arrow_len = arrow_bytes.len() as u32;
+
+    let resp = QueryResponseMeta {
+        status: ReadStatus::OK,
+        _pad1: [0; 7],
+        value_hlc: max_hlc,
+        epoch: meta.expected_epoch,
+        leader_hint: local_node,
+        rows,
+        arrow_len,
+        _pad2: [0; 4],
+    };
+    Ok((resp, Some(arrow_bytes)))
+}
+
+fn query_error_meta(
+    meta: &QueryRequestMeta,
+    status: ReadStatus,
+    leader_hint: NodeId,
+) -> QueryResponseMeta {
+    QueryResponseMeta {
+        status,
+        _pad1: [0; 7],
+        value_hlc: HybridTimestamp {
+            physical_ms: 0,
+            logical: 0,
+            node_id: 0,
+        },
+        epoch: meta.expected_epoch,
+        leader_hint,
+        rows: 0,
+        arrow_len: 0,
+        _pad2: [0; 4],
+    }
+}
+
+// ============================================================
 //  ERROR RESPONSE HELPERS
 // ============================================================
 
@@ -751,15 +971,89 @@ fn blake3_32(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::wpbc::{OP_AND, OP_GTE, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT};
+    use crate::schema::write_payload_schema;
+    use crate::storage::core::StorageEngine;
+    use crate::storage::io_uring::spawn_io_thread;
+    use crate::storage::manager::SlabManagerConfig;
 
     fn n(id: u32) -> NodeId {
         NodeId { id, _reserved: 0 }
     }
 
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wendelon-data-server-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
+        HybridTimestamp {
+            physical_ms,
+            logical,
+            node_id,
+        }
+    }
+
+    fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
+        let schema = Arc::new(write_payload_schema());
+        let mut keys = LargeBinaryBuilder::new();
+        keys.append_value(key);
+        let mut values = LargeBinaryBuilder::new();
+        values.append_value(value);
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+        )
+        .unwrap()
+    }
+
+    async fn make_manager() -> Arc<SlabManager> {
+        let dir = fresh_dir("query");
+        let io = spawn_io_thread(64).unwrap();
+        Arc::new(
+            SlabManager::open(SlabManagerConfig {
+                dir,
+                max_slab_bytes: 1 << 30,
+                io,
+                l2: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    async fn seed_record(
+        mgr: &SlabManager,
+        key_hash: u64,
+        hlc: HybridTimestamp,
+        key: &[u8],
+        value: &[u8],
+    ) {
+        let batch = kv_batch(key, value);
+        let bytes = encode_batch(&batch).unwrap();
+        mgr.append(key_hash, hlc, &bytes).await.unwrap();
+    }
+
+    fn base_meta() -> QueryRequestMeta {
+        QueryRequestMeta {
+            min_hlc: hlc(0, 0, 0),
+            expected_epoch: 0,
+            consistency: Consistency::SERIALIZABLE,
+            _pad: [0; 7],
+            key_range_start: 0,
+            key_range_end: u64::MAX,
+            bytecode_len: 0,
+            _pad2: [0; 4],
+        }
+    }
+
     #[test]
     fn static_router_wraps_around_ring() {
         let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3), n(4)], 3);
-        // start index 3 → {3, 0, 1} = nodes 4, 1, 2
         let replicas = router.replicas(3);
         assert_eq!(replicas.len(), 3);
         assert_eq!(replicas[0], n(4));
@@ -771,7 +1065,6 @@ mod tests {
     fn static_router_dedups_and_sorts() {
         let router =
             StaticReplicaRouter::new(vec![n(3), n(1), n(3), n(2)], 5);
-        // RF clamped to available node count (3).
         let replicas = router.replicas(0);
         assert_eq!(replicas.len(), 3);
         assert_eq!(replicas[0], n(1));
@@ -790,4 +1083,190 @@ mod tests {
         let router = StaticReplicaRouter::new(vec![], 3);
         assert!(router.replicas(0).is_empty());
     }
+
+    #[tokio::test]
+    async fn scan_collects_entries_in_inclusive_range() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 10, hlc(1, 0, 1), b"k10", b"v10").await;
+        seed_record(&mgr, 50, hlc(2, 0, 1), b"k50", b"v50").await;
+        seed_record(&mgr, 99, hlc(3, 0, 1), b"k99", b"v99").await;
+
+        let hits = mgr.scan(10, 50);
+        let keys: Vec<u64> = hits.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![10, 50]);
+
+        let full = mgr.scan(0, u64::MAX);
+        assert_eq!(full.len(), 3);
+
+        let miss = mgr.scan(60, 90);
+        assert!(miss.is_empty());
+
+        // Inverted range → empty, never panics.
+        let inverted = mgr.scan(100, 5);
+        assert!(inverted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_passthrough_returns_all_rows_in_range() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"v1").await;
+        seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"v2").await;
+        seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"v3").await;
+
+        let sm = WendelonStateMachine::new();
+        let (resp, arrow) =
+            execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::OK);
+        assert_eq!(resp.rows, 3);
+        assert_eq!(resp.value_hlc, hlc(3, 0, 1));
+        let bytes = arrow.expect("OK must carry arrow bytes");
+        let batch = decode_batch(&bytes).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    #[tokio::test]
+    async fn query_range_filters_out_of_window_rows() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 5, hlc(1, 0, 1), b"a", b"va").await;
+        seed_record(&mgr, 42, hlc(2, 0, 1), b"b", b"vb").await;
+        seed_record(&mgr, 100, hlc(3, 0, 1), b"c", b"vc").await;
+
+        let sm = WendelonStateMachine::new();
+        let mut meta = base_meta();
+        meta.key_range_start = 10;
+        meta.key_range_end = 50;
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::OK);
+        assert_eq!(resp.rows, 1);
+    }
+
+    #[tokio::test]
+    async fn query_empty_scan_returns_key_not_found() {
+        let mgr = make_manager().await;
+        let sm = WendelonStateMachine::new();
+        let (resp, arrow) =
+            execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::KEY_NOT_FOUND);
+        assert_eq!(resp.rows, 0);
+        assert_eq!(resp.arrow_len, 0);
+        assert!(arrow.is_none());
+    }
+
+    #[tokio::test]
+    async fn linearizable_gate_fires_when_watermark_behind() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
+        let sm = WendelonStateMachine::new();
+        // Watermark remains at default (0,0,0); client demands (5,0,0).
+        let mut meta = base_meta();
+        meta.consistency = Consistency::LINEARIZABLE;
+        meta.min_hlc = hlc(5, 0, 0);
+        let (resp, arrow) =
+            execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::E_SAFE_BEHIND);
+        assert_eq!(resp.leader_hint, n(1));
+        assert!(arrow.is_none());
+    }
+
+    #[tokio::test]
+    async fn linearizable_gate_passes_once_watermark_catches_up() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
+        let sm = WendelonStateMachine::new();
+        sm.seed_e_safe_for_test(0, hlc(10, 0, 1)).await;
+        let mut meta = base_meta();
+        meta.consistency = Consistency::LINEARIZABLE;
+        meta.min_hlc = hlc(5, 0, 1);
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::OK);
+        assert_eq!(resp.rows, 1);
+    }
+
+    #[tokio::test]
+    async fn epoch_stale_returns_redirect() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
+        let sm = WendelonStateMachine::new();
+        // The SM has advanced to epoch 7; client still thinks we
+        // are on epoch 3 → EPOCH_STALE, not a silent scan.
+        sm.seed_e_safe_for_test(7, hlc(1, 0, 1)).await;
+        let mut meta = base_meta();
+        meta.expected_epoch = 3;
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::EPOCH_STALE);
+        assert_eq!(resp.leader_hint, n(1));
+    }
+
+    #[tokio::test]
+    async fn wpbc_filter_drops_rows_below_threshold() {
+        // Stored records carry an Int64 `age` column so WPBC can
+        // actually compare against a literal — the write-path
+        // schema is LargeBinary and WPBC does not support bytes,
+        // so tests that exercise filter opcodes use their own
+        // schema via direct slab.append.
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let mgr = make_manager().await;
+        for (key_hash, age) in [(1u64, 17i64), (2, 22), (3, 40)] {
+            let ages = Int64Array::from(vec![age]);
+            let batch =
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
+            let bytes = encode_batch(&batch).unwrap();
+            mgr.append(key_hash, hlc(age as u64, 0, 1), &bytes)
+                .await
+                .unwrap();
+        }
+
+        // age >= 18 AND age >= 18 (duplicated to exercise OP_AND)
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_PUSH_COL);
+        bytecode.extend_from_slice(&0u32.to_le_bytes());
+        bytecode.push(OP_PUSH_INT);
+        bytecode.extend_from_slice(&18i64.to_le_bytes());
+        bytecode.push(OP_GTE);
+        bytecode.push(OP_PUSH_COL);
+        bytecode.extend_from_slice(&0u32.to_le_bytes());
+        bytecode.push(OP_PUSH_INT);
+        bytecode.extend_from_slice(&18i64.to_le_bytes());
+        bytecode.push(OP_GTE);
+        bytecode.push(OP_AND);
+
+        let sm = WendelonStateMachine::new();
+        let mut meta = base_meta();
+        meta.bytecode_len = bytecode.len() as u32;
+        let (resp, _) =
+            execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::OK);
+        // Rows 2 (age 22) and 3 (age 40) survive; row 1 (age 17) drops.
+        assert_eq!(resp.rows, 2);
+    }
+
+    #[tokio::test]
+    async fn wpbc_projection_narrows_schema() {
+        let mgr = make_manager().await;
+        seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+        seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+        // PROJECT column 0 (the `key` column) only — WPBC compiles
+        // a terminal PROJECT with no preceding filter, so every row
+        // is kept and only the `key` column survives.
+        let mut bytecode = Vec::new();
+        bytecode.push(OP_PROJECT);
+        bytecode.extend_from_slice(&1u16.to_le_bytes());
+        bytecode.extend_from_slice(&0u32.to_le_bytes());
+
+        let sm = WendelonStateMachine::new();
+        let mut meta = base_meta();
+        meta.bytecode_len = bytecode.len() as u32;
+        let (resp, arrow) =
+            execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode).await.unwrap();
+        assert_eq!(resp.status, ReadStatus::OK);
+        assert_eq!(resp.rows, 2);
+        let batch = decode_batch(&arrow.unwrap()).unwrap();
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "key");
+    }
+
 }

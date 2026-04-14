@@ -307,6 +307,37 @@ impl SlabManager {
             .map(|p| p.clone())
     }
 
+    /// Enumerate every live `(key_hash, RecordLocation)` whose hash
+    /// falls in the inclusive window `[start_hash, end_hash]`. Used
+    /// by the Data Ring query path (ADR 005) to feed the WPBC
+    /// interpreter; the server then reads each location via the
+    /// normal `StorageEngine::read` surface, which transparently
+    /// pivots L1 vs. L2.
+    ///
+    /// The returned pairs are sorted by `key_hash` so the scan is
+    /// deterministic — useful for debugging and for the client's
+    /// pagination cursor, which is keyed on the highest observed
+    /// hash.
+    pub fn scan(&self, start_hash: u64, end_hash: u64) -> Vec<(u64, RecordLocation)> {
+        if start_hash > end_hash {
+            return Vec::new();
+        }
+        let mut out: Vec<(u64, RecordLocation)> = self
+            .key_index
+            .iter()
+            .filter_map(|entry| {
+                let h = *entry.key();
+                if h >= start_hash && h <= end_hash {
+                    Some((h, *entry.value()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by_key(|(h, _)| *h);
+        out
+    }
+
     /// Acquire the slab that should receive the next append,
     /// rotating if the current active slab has crossed the size cap.
     async fn target_for_append(&self) -> std::io::Result<Arc<LocalSlabStore>> {
