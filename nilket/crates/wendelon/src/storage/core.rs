@@ -1,7 +1,6 @@
-use crate::schema::{HybridTimestamp, SlabRecordHeader};
+use crate::schema::HybridTimestamp;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::sync::Arc;
 
 /// A pointer to a record's location on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +53,9 @@ impl LocalSlabStore {
 impl StorageEngine for LocalSlabStore {
     async fn append(
         &self,
-        key_hash: u64,
-        hlc: HybridTimestamp,
-        frame: &[u8],
+        _key_hash: u64,
+        _hlc: HybridTimestamp,
+        _frame: &[u8],
     ) -> std::io::Result<RecordLocation> {
         // Placeholder for io_uring append logic.
         // 1. Wrap frame in SlabRecordHeader.
@@ -65,7 +64,7 @@ impl StorageEngine for LocalSlabStore {
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Not yet implemented"))
     }
 
-    async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
+    async fn read(&self, _location: RecordLocation) -> std::io::Result<Vec<u8>> {
         // Placeholder for io_uring preadv2 logic.
         Err(std::io::Error::new(std::io::ErrorKind::Other, "Not yet implemented"))
     }

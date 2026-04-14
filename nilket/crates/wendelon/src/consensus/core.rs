@@ -1,5 +1,4 @@
 use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId};
-use openraft::RaftTypeConfig;
 use serde::{Deserialize, Serialize};
 
 /// The unified Node ID type used across Wendelon.
@@ -34,8 +33,8 @@ pub enum WendelonResponse {
     LeaseDenied,
 }
 
-/// The Wendelon implementation of the `openraft::RaftTypeConfig` trait.
-/// This trait wires our custom types into the OpenRaft engine.
+// The Wendelon implementation of the `openraft::RaftTypeConfig` trait.
+// This trait wires our custom types into the OpenRaft engine.
 openraft::declare_raft_types!(
     /// The configuration type for the Wendelon Control Ring.
     pub WendelonTypeConfig:

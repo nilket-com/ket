@@ -1,5 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use bytemuck::{Pod, Zeroable};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 // ============================================================
@@ -11,7 +12,7 @@ use std::sync::Arc;
 //  node_id breaks ties deterministically — set to Raft node
 //  ID of the stamp originator.
 // ============================================================
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct HybridTimestamp {
     /// Wall-clock milliseconds since Unix epoch (48 bits used, upper 16 reserved)
@@ -29,7 +30,7 @@ pub struct HybridTimestamp {
 //  (RaftEpochEntry.voters / learners arrow payload).
 //  The wire ID is a pure numeric handle.
 // ============================================================
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct NodeId {
     /// Cluster-unique numeric ID assigned at bootstrap
@@ -93,6 +94,10 @@ pub struct TransferToken {
     pub to_leader: NodeId,
     /// Token invalid after this HLC; recommended TTL: 2× election timeout
     pub expires_at: HybridTimestamp,
+    /// Reserved slot inside the signed payload; zero-filled until
+    /// assigned semantics (e.g. anti-replay nonce). Keeps the signed
+    /// region at a round 56 bytes.
+    pub _signed_reserved: u64,
     // --- 56 bytes above are the signed payload ---
     /// Ed25519 signature over SHA-512(fields above); fixed 64 bytes
     pub signature: [u8; 64],
@@ -112,7 +117,7 @@ pub struct TransferToken {
 //    e_safe_index advances only via leader's commit_index
 //    propagated through AppendEntries.
 // ============================================================
-#[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct FinalizationMarker {
     /// Raft log index of the finalized write
@@ -129,6 +134,9 @@ pub struct FinalizationMarker {
     /// Highest log index safe for reads in this epoch at finalization time
     /// (monotonically non-decreasing within an epoch)
     pub e_safe_index: u64,
+    /// Reserved slot; zero-filled until assigned. Exists so the struct
+    /// lands on the 88-byte size contract asserted below.
+    pub _reserved: u64,
 }
 
 // ============================================================
@@ -143,7 +151,7 @@ pub struct FinalizationMarker {
 //  • Reads require commit_index >= min_commit_index to prevent
 //    stale reads after re-election.
 // ============================================================
-#[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct LeaseDescriptor {
     /// Epoch in which this lease is valid
@@ -157,6 +165,7 @@ pub struct LeaseDescriptor {
     /// Reads must have commit_index >= this to prevent post-election stale reads
     pub min_commit_index: u64,
     /// Ed25519 over fields above; 64 bytes
+    #[serde(with = "serde_bytes")]
     pub signature: [u8; 64],
     /// Pad to 128 bytes
     pub _pad: [u8; 8],
@@ -403,6 +412,7 @@ pub struct SlabManifest {
     pub temperature: u32,         
     /// Remote routing info (zeroed if local)
     pub remote_bucket: [u8; 32],  // e.g., "nilket-cold-tier-1"
+    #[serde(with = "serde_bytes")]
     pub remote_key: [u8; 64],     // e.g., "wendelon/epoch_5/slab_123.wnd"
 }
 
