@@ -1,62 +1,83 @@
+//! HRFT wire frame framing.
+//!
+//! Every Wendelon RPC — Data Ring, Control Ring, Raft internal —
+//! rides one `HrftFrame` per bidi stream. The frame is laid out as:
+//!
+//! ```text
+//!   [24-byte FrameHeader] [meta bytes] [arrow bytes?] [trailing bytes?]
+//! ```
+//!
+//! `FrameHeader` is a `#[repr(C)] + bytemuck::Pod` struct so it is
+//! read and written as raw bytes without any (de)serialization.
+//! The three variable-length sections are pulled off the wire into
+//! [`PooledBuf`]s drawn from a shared [`BufPool`] — steady-state
+//! traffic recycles the same Vec<u8> buffers across every stream.
+
+use crate::network::pool::{BufPool, PooledBuf};
 use crate::schema::FrameHeader;
 use std::io::{Error, ErrorKind};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const HRFT_MAGIC: u32 = 0x48524654; // "HRFT" in ASCII
 
+/// Upper bound on any single payload section. Mirrors the
+/// `max_frame_size` knob in `plans/ops/configuration.md` (5 MiB
+/// default, expressed here per-section since meta + arrow +
+/// trailing can each be up to that cap).
+const MAX_SECTION_BYTES: u32 = 5 * 1024 * 1024;
+
 /// A fully parsed Wendelon wire frame.
-/// For true zero-copy, the metadata and arrow payloads are mapped directly
-/// from the network buffers without deserialization overhead.
+///
+/// All three payload sections are held in [`PooledBuf`]s so they
+/// return to the originating [`BufPool`] when the frame is dropped.
+/// Accessors derive transparently via `Deref<Target = [u8]>`, so
+/// code that used to take `&[u8]` against `&frame.meta` keeps
+/// working without changes.
 #[derive(Debug)]
 pub struct HrftFrame {
     pub header: FrameHeader,
-    pub meta: Vec<u8>,
-    pub arrow_payload: Option<Vec<u8>>,
-    pub trailing: Option<Vec<u8>>,
+    pub meta: PooledBuf,
+    pub arrow_payload: Option<PooledBuf>,
+    pub trailing: Option<PooledBuf>,
 }
 
-/// Reads a complete HRFT frame from an asynchronous stream (e.g., a quinn::RecvStream).
-/// Ensures that the frame adheres to the magic header and bounded sizes.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<HrftFrame> {
+/// Reads a complete HRFT frame from an asynchronous stream (e.g.
+/// `quinn::RecvStream`), drawing payload buffers from `pool`.
+///
+/// The returned frame's `meta`, `arrow_payload`, and `trailing`
+/// sections all live in pooled Vec<u8>s; dropping the frame returns
+/// them for reuse on the next stream.
+pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    pool: &Arc<BufPool>,
+) -> std::io::Result<HrftFrame> {
     let mut header_buf = [0u8; std::mem::size_of::<FrameHeader>()];
-    
-    // 1. Read the 24-byte FrameHeader
     reader.read_exact(&mut header_buf).await?;
-    
-    // 0ns pointer cast to interpret the bytes as a FrameHeader struct
-    let header: &FrameHeader = bytemuck::from_bytes(&header_buf);
-    
-    if header.magic != HRFT_MAGIC {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid HRFT magic bytes"));
-    }
 
-    // Prevent massive allocation attacks
-    if header.meta_len > 1024 * 1024 { // 1 MB limit for metadata
-        return Err(Error::new(ErrorKind::InvalidData, "Metadata payload exceeds safety limit"));
+    let header: &FrameHeader = bytemuck::from_bytes(&header_buf);
+    if header.magic != HRFT_MAGIC {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid HRFT magic bytes"));
     }
-    
-    // 2. Read the Metadata section
-    let mut meta = vec![0u8; header.meta_len as usize];
-    if header.meta_len > 0 {
-        reader.read_exact(&mut meta).await?;
-    }
-    
-    // 3. Read the optional Arrow IPC section
-    let mut arrow_payload = None;
-    if header.arrow_len > 0 {
-        let mut arrow = vec![0u8; header.arrow_len as usize];
-        reader.read_exact(&mut arrow).await?;
-        arrow_payload = Some(arrow);
-    }
-    
-    // 4. Read the optional Trailing section (e.g., WPBC AST or FinalizationMarker)
-    let mut trailing = None;
-    if header.trailing_len > 0 {
-        let mut t = vec![0u8; header.trailing_len as usize];
-        reader.read_exact(&mut t).await?;
-        trailing = Some(t);
-    }
-    
+    check_section_len("meta", header.meta_len)?;
+    check_section_len("arrow", header.arrow_len)?;
+    check_section_len("trailing", header.trailing_len)?;
+
+    let meta = read_section(reader, pool, header.meta_len).await?.expect(
+        "meta section always present (read_section returns Some for any len, \
+         including zero, when the section is required)",
+    );
+    let arrow_payload = if header.arrow_len > 0 {
+        read_section(reader, pool, header.arrow_len).await?
+    } else {
+        None
+    };
+    let trailing = if header.trailing_len > 0 {
+        read_section(reader, pool, header.trailing_len).await?
+    } else {
+        None
+    };
+
     Ok(HrftFrame {
         header: *header,
         meta,
@@ -65,25 +86,55 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result
     })
 }
 
-/// Writes an HRFT frame to an asynchronous stream (e.g., a quinn::SendStream).
-pub async fn write_frame<W: AsyncWrite + Unpin>(
+/// Writes an HRFT frame to an asynchronous stream. Takes borrowed
+/// byte slices so callers can pass `&frame.meta` (derefs) or any
+/// other `AsRef<[u8]>` without owning the buffers.
+pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
     writer: &mut W,
     header: &FrameHeader,
     meta: &[u8],
     arrow_payload: Option<&[u8]>,
     trailing: Option<&[u8]>,
 ) -> std::io::Result<()> {
-    // 0ns cast to write the struct directly to the stream
     writer.write_all(bytemuck::bytes_of(header)).await?;
     writer.write_all(meta).await?;
-    
     if let Some(arrow) = arrow_payload {
         writer.write_all(arrow).await?;
     }
-    
     if let Some(t) = trailing {
         writer.write_all(t).await?;
     }
-    
+    Ok(())
+}
+
+// ============================================================
+//  INTERNAL HELPERS
+// ============================================================
+
+async fn read_section<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+    pool: &Arc<BufPool>,
+    len: u32,
+) -> std::io::Result<Option<PooledBuf>> {
+    let mut buf = pool.acquire();
+    {
+        let vec = buf.as_mut_vec();
+        vec.resize(len as usize, 0);
+        if len > 0 {
+            reader.read_exact(vec.as_mut_slice()).await?;
+        }
+    }
+    Ok(Some(buf))
+}
+
+fn check_section_len(name: &'static str, len: u32) -> std::io::Result<()> {
+    if len > MAX_SECTION_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "HRFT {name} section exceeds {MAX_SECTION_BYTES}-byte safety cap (got {len})"
+            ),
+        ));
+    }
     Ok(())
 }

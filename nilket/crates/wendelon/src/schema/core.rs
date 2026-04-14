@@ -30,7 +30,7 @@ pub struct HybridTimestamp {
 //  (RaftEpochEntry.voters / learners arrow payload).
 //  The wire ID is a pure numeric handle.
 // ============================================================
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct NodeId {
     /// Cluster-unique numeric ID assigned at bootstrap
@@ -394,7 +394,12 @@ pub struct SlabRecordHeader {
     pub key_hash: u64,          // The consistent hash of the key
     pub hlc: HybridTimestamp,   // 16 bytes: the timestamp of the write
     pub frame_len: u32,         // Total length of the HRFT frame that follows
-    pub _pad: u32,              // 4 bytes padding to reach 40-byte alignment
+    /// Integrity checksum over the header prefix (all fields above,
+    /// with `checksum` itself read as zero) concatenated with the
+    /// frame bytes. Recovery and read paths validate this to detect
+    /// torn writes that reach the disk with a valid-looking header
+    /// but a truncated frame.
+    pub checksum: u32,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]

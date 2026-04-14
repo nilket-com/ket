@@ -10,8 +10,10 @@ publish = false
 [dependencies]
 tokio = { version = "1.37", features = ["full"] }
 quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-openraft = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2"
+rustls-pki-types = "1.10"
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 arrow = { version = "53.0", features = ["ipc_compression"] }
 bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
 io-uring = "0.6"
@@ -28,3 +30,4 @@ bytes = "1.6"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
+postcard = { version = "1.0", features = ["alloc", "use-std"] }
