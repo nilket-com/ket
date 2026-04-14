@@ -228,12 +228,12 @@ Sequence (detailed)
 Backpressure and safety
 
 - Leader monitors Raft commit latency and e_safe lag. If commit latency exceeds threshold (default 200 ms), the leader reduces transfer concurrency and lowers per-transfer rates.
-- Transfer operations never block the metadata executor: streaming runs on a separate data-plane worker pool with bounded concurrency and explicit yields to the control-plane executor.
+- Transfer operations never block the metadata executor: streaming runs on a separate data-ring worker pool with bounded concurrency and explicit yields to the control-ring executor.
 
 Executor & I/O isolation
 
-- Control plane: small, high-priority tokio runtime dedicated to Raft heartbeats, RPCs, and metadata processing (2–4 threads recommended).
-- Data plane: separate worker pool for streaming/disks with io_uring-backed file I/O; use bounded task queues and spawn_blocking for synchronous tasks.
+- Control Ring: small, high-priority tokio runtime dedicated to Raft heartbeats, RPCs, and metadata processing (2–4 threads recommended).
+- Data Ring: separate worker pool for streaming/disks with io_uring-backed file I/O; use bounded task queues and spawn_blocking for synchronous tasks.
 - Kernel and NIC tuning: document recommended sysctl, io_uring parameters, and NIC offload settings in bench/config.
 
 Observability

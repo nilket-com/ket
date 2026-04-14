@@ -25,6 +25,6 @@ Notes:
 - get_cluster_status() -> (ClusterStatusResponseMeta, Option<LeaseDescriptor>, RecordBatch)
 
 Notes:
-- ControlPlane operations are rate-limited and run on a separate control port with mTLS.
+- ControlRing operations are rate-limited and run on a separate control port with mTLS.
 - RecordBatch schemas for epoch configs: plans/schema/schemas.md (epoch_entry_var_schema)
 

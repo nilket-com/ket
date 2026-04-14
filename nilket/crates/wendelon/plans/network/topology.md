@@ -15,13 +15,13 @@ By mapping all nodes into the same hash space:
 
 While all nodes exist on the unified ring, their responsibilities are still strictly partitioned into two logical roles:
 
-### The Control Ring (Formerly Control Plane)
+### The Control Ring
 - Handles cluster configuration, node membership, and epoch tracking.
 - Driven by the Raft consensus protocol.
 - Only nodes with the "control" role participate in the Control Ring.
 - Even if a node has both roles, its Control Ring operations execute in an isolated thread pool (executor) to prevent I/O starvation.
 
-### The Data Ring (Formerly Data Plane)
+### The Data Ring
 - Handles bulk read/write data routing and storage.
 - Operates via Consistent Hashing against a fixed, immutable cluster snapshot (`ring(E)`).
 - Queries are routed to nodes based on their position in the Data Ring subset of the unified hash space.

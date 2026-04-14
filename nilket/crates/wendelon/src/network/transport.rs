@@ -33,7 +33,7 @@
 //!   membership-epoch watch instead of returning stale data.
 //! * [`PoolRegistrar`] — the RDMA hook. Tier 0 needs the NIC to pin
 //!   every [`PooledBuf`][crate::network::pool::PooledBuf] the data
-//!   plane will DMA into, and it stores the returned LKey on the
+//!   ring will DMA into, and it stores the returned LKey on the
 //!   buffer itself.
 
 use crate::network::pool::PooledBuf;

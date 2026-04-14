@@ -12,7 +12,7 @@ impl std::fmt::Display for NodeId {
 
 /// The state machine application data (mutations).
 /// In HashRaft, the actual data (Arrow batches) never enters the Raft log (ADR 003).
-/// The Raft log only contains control-plane metadata and Data Ring finalization markers.
+/// The Raft log only contains control-ring metadata and Data Ring finalization markers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WendelonRequest {
     /// A Data Ring quorum has been achieved; advance the E_safe watermark.

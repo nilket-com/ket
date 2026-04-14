@@ -14,5 +14,5 @@ We will map every node, regardless of its role, into a **Single Unified Hash Spa
 - **Uniform Addressing:** A node is always addressed by its position on the ring, making cluster observability and topological reasoning mathematically consistent.
 
 ## Consequences (The "Negatives" / Rejected Ideas)
-- **Rejected Distinct Planes:** We reject maintaining separate data structures for the Control Plane and Data Plane. 
+- **Rejected Distinct Planes:** We reject maintaining separate data structures for the Control Ring and Data Ring.
 - **Routing Overhead:** Routing now requires an extra filtering step (e.g., "find the next 3 nodes on the ring *that have the data capability*"). We accept this minuscule CPU overhead in exchange for topological simplicity.

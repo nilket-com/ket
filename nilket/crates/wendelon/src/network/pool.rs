@@ -96,7 +96,7 @@ impl BufPool {
 /// allocation when a
 /// [`PoolRegistrar`][crate::network::transport::PoolRegistrar]
 /// (Tier 0 / RDMA) has pinned the memory. QUIC callers leave it as
-/// `None`; the data plane reads it directly to post zero-copy work
+/// `None`; the data ring reads it directly to post zero-copy work
 /// requests without a side-table lookup.
 pub struct PooledBuf {
     buf: Vec<u8>,

@@ -52,7 +52,7 @@ pub enum TransportTier {
 1.  **Baseline Handshake:** Node A opens a Tier 1 (QUIC) connection to Node B.
 2.  **Capability Exchange:** Over the Tier 1 stream, Node A and B exchange `TransportTier` support.
 3.  **Upgrade (Optional):** If both support Tier 0 (RDMA), they use the QUIC stream to exchange RDMA Memory Keys (RKeys) and Queue Pair (QP) numbers.
-4.  **Promotion:** The data-plane operations (`DataRing`) switch to using the RDMA fabric for subsequent `HRFT` frames.
+4.  **Promotion:** The data-ring operations (`DataRing`) switch to using the RDMA fabric for subsequent `HRFT` frames.
 
 ## 3. Integrating with `BufPool` (Claude's Foundation)
 

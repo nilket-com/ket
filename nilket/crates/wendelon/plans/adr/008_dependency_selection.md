@@ -22,5 +22,5 @@ Wendelon will standardize on the following core dependency stack:
 - **`bytemuck` + `arrow`:** Strictly enforces the zero-copy deserialization mandate.
 
 ## Consequences (The "Negatives" / Rejected Ideas)
-- **Rejected `tokio-uring` and `glommio`:** We reject the thread-per-core architectures. While they offer slightly higher theoretical peak throughput by eliminating cross-thread synchronization, they make it impossible to give the Raft state machine global priority over all data-plane I/O.
+- **Rejected `tokio-uring` and `glommio`:** We reject the thread-per-core architectures. While they offer slightly higher theoretical peak throughput by eliminating cross-thread synchronization, they make it impossible to give the Raft state machine global priority over all data-ring I/O.
 - **Manual io_uring Management:** Because we are using the low-level `io-uring` crate within `tokio`, we must manually manage the submission (SQ) and completion (CQ) rings, memory lifetimes, and page-aligned buffers. We accept this significant engineering complexity.

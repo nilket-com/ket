@@ -620,7 +620,7 @@ fn apply_request(state: &mut SmState, req: WendelonRequest) -> WendelonResponse 
         WendelonRequest::SchemaUpdate(_bytes) => {
             // Schema registry is not modelled in SmState yet;
             // accepting the write keeps the log replayable and
-            // lets the control-plane feature land incrementally.
+            // lets the control-ring feature land incrementally.
             WendelonResponse::Success
         }
     }

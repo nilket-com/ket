@@ -13,7 +13,7 @@ Wendelon will implement an **Auto-Adaptive Multi-Transport** architecture.
 2.  **Capability Advertising:** Every node will probe its local hardware at boot and advertise its supported transports (e.g., `RDMA_ROCE_V2`, `QUIC_IO_URING`, `TCP_TLS`) via Raft metadata in the `ring(E)` snapshot.
 3.  **Dynamic Negotiation:** 
     - Connections will be established using the highest-priority transport supported by **both** the dialer and the listener.
-    - QUIC will serve as the "Universal Baseline" and the control-plane signaling channel used to negotiate "Elite" upgrades (e.g., exchanging RDMA memory keys).
+    - QUIC will serve as the "Universal Baseline" and the control-ring signaling channel used to negotiate "Elite" upgrades (e.g., exchanging RDMA memory keys).
 4.  **Priority Tiers:**
     - Tier 0: **RDMA/RoCE** (Physical-Elite) - Zero-copy kernel bypass.
     - Tier 1: **QUIC + io_uring + GSO** (Cloud-Elite) - Optimized syscall bypass.

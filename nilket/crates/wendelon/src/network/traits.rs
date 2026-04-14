@@ -7,17 +7,14 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 // ============================================================
-//  CONTROL-PLANE META — placeholder (non-wire) structs.
+//  CONTROL-RING META — placeholder (non-wire) structs.
 //
 //  These types exist so the `ControlRing` trait has a
 //  compilable surface. They are deliberately plain Rust
-//  structs (not bytemuck PODs) because the control-plane
+//  structs (not bytemuck PODs) because the control-ring
 //  wire layout is not yet frozen. When it is, they will be
 //  promoted to `#[repr(C)] Pod + Zeroable` structs in
 //  `src/schema/core.rs` with explicit size assertions.
-//
-//  TODO(schema): promote these into `src/schema/core.rs`
-//  once plans/network/control_plane.md lands.
 // ============================================================
 
 #[derive(Clone, Debug)]
