@@ -40,7 +40,7 @@ evict_threshold_percent = 70
 vnode_count = 256
 # Default replication factor (number of distinct physical nodes per hash range)
 replication_factor = 3
-# The hashing algorithm (e.g., "highwayhash", "blake3"). Used during bootstrap only.
+# The hashing algorithm (e.g., "highwayhash", "blake3", "rapidhash"). Used during bootstrap only.
 hash_algo = "highwayhash"
 # Raft heartbeat interval in milliseconds
 heartbeat_interval_ms = 150
