@@ -42,7 +42,7 @@
 //! `Arc<RwLock<LogStoreInner>>` so `get_log_reader` can hand out
 //! a Self-typed reader that shares the same cache as the writer.
 
-use crate::consensus::{WendelonRequest, WendelonResponse, WendelonTypeConfig};
+use crate::consensus::{TieredSlab, WendelonRequest, WendelonResponse, WendelonTypeConfig};
 use crate::schema::{
     HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, SnapshotHeader,
     WALRecordHeader,
@@ -462,6 +462,24 @@ pub struct SmState {
     /// the highest FinalizationMarker observed in that epoch, so
     /// updates are monotonic within an epoch.
     pub e_safe_watermarks: HashMap<u64, HybridTimestamp>,
+    /// Slabs that have been tiered to L2 by the sweeper (ADR 006).
+    /// Keyed by `slab_id`; every replica must agree on the mapping
+    /// so read-path pivots are deterministic. Observers — the
+    /// local `SlabManager` — are fired out-of-band when an entry
+    /// lands here so they can unlink the L1 file.
+    #[serde(default)]
+    pub tiered_slabs: HashMap<u64, TieredSlab>,
+}
+
+/// Out-of-band observer for [`TieredSlab`] apply events.
+///
+/// Wendelon's `SlabManager` implements this so every node — not
+/// just the sweeper that initiated the Raft commit — learns when
+/// a slab has moved to L2. The observer runs inside the state
+/// machine's apply loop and must therefore be non-blocking.
+#[async_trait::async_trait]
+pub trait TierObserver: Send + Sync {
+    async fn on_slab_tiered(&self, tier: &TieredSlab) -> std::io::Result<()>;
 }
 
 /// Snapshot currently held by the state machine.
@@ -488,13 +506,29 @@ struct SmInner {
 #[derive(Clone, Default)]
 pub struct WendelonStateMachine {
     inner: Arc<RwLock<SmInner>>,
+    /// Optional callback fired every time a [`TieredSlab`] lands
+    /// in the state. The local `SlabManager` installs one so it
+    /// can unlink the L1 file once the cluster has agreed the
+    /// payload lives in L2. `None` is fine for tests or for
+    /// non-data nodes that never hold a `SlabManager`.
+    tier_observer: Option<Arc<dyn TierObserver>>,
 }
 
 impl WendelonStateMachine {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(SmInner::default())),
+            tier_observer: None,
         }
+    }
+
+    /// Install a tier observer. Intended to be called once, at
+    /// bootstrap, before the state machine is handed to openraft.
+    /// Replacing an observer mid-run is not supported — callers
+    /// should reconstruct the SM instead.
+    pub fn with_tier_observer(mut self, observer: Arc<dyn TierObserver>) -> Self {
+        self.tier_observer = Some(observer);
+        self
     }
 
     /// Test / caller inspection hook — return a cloned snapshot
@@ -524,22 +558,50 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
         I::IntoIter: OptionalSend,
     {
         let mut out = Vec::new();
-        let mut guard = self.inner.write().await;
-        for entry in entries {
-            let log_id = entry.log_id;
-            let resp = match entry.payload {
-                EntryPayload::Blank => WendelonResponse::Success,
-                EntryPayload::Normal(req) => apply_request(&mut guard.state, req),
-                EntryPayload::Membership(m) => {
-                    guard.state.last_membership = StoredMembership::new(Some(log_id), m);
-                    WendelonResponse::Success
+        // Tier observer callbacks run after the write lock is
+        // released — they typically hit the filesystem (unlinking
+        // the L1 slab file) and must not block apply progress for
+        // other entries in the batch.
+        let mut pending_tier_events: Vec<TieredSlab> = Vec::new();
+        {
+            let mut guard = self.inner.write().await;
+            for entry in entries {
+                let log_id = entry.log_id;
+                let resp = match entry.payload {
+                    EntryPayload::Blank => WendelonResponse::Success,
+                    EntryPayload::Normal(req) => {
+                        let (resp, tier) = apply_request(&mut guard.state, req);
+                        if let Some(t) = tier {
+                            pending_tier_events.push(t);
+                        }
+                        resp
+                    }
+                    EntryPayload::Membership(m) => {
+                        guard.state.last_membership = StoredMembership::new(Some(log_id), m);
+                        WendelonResponse::Success
+                    }
+                };
+                guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
+                    Some(prev) if prev > log_id => prev,
+                    _ => log_id,
+                });
+                out.push(resp);
+            }
+        }
+        if let Some(observer) = self.tier_observer.as_ref() {
+            for tier in &pending_tier_events {
+                // An observer error is surfaced through logs but
+                // must not tear the state machine down — the SM
+                // has already committed the pivot and followers
+                // must not diverge on a local filesystem hiccup.
+                if let Err(e) = observer.on_slab_tiered(tier).await {
+                    tracing::warn!(
+                        slab_id = tier.slab_id,
+                        error = %e,
+                        "tier observer failed; local L1 cleanup will retry on next sweep"
+                    );
                 }
-            };
-            guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
-                Some(prev) if prev > log_id => prev,
-                _ => log_id,
-            });
-            out.push(resp);
+            }
         }
         Ok(out)
     }
@@ -588,7 +650,16 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 }
 
 /// Fold one committed [`WendelonRequest`] into the SM state.
-fn apply_request(state: &mut SmState, req: WendelonRequest) -> WendelonResponse {
+///
+/// Returns the [`WendelonResponse`] plus an optional `TieredSlab`
+/// so the caller can fire tier observers outside the write lock.
+/// Tier observers do filesystem work (unlinking the L1 file);
+/// keeping them off the lock prevents any cross-node staleness
+/// on a busy apply batch.
+fn apply_request(
+    state: &mut SmState,
+    req: WendelonRequest,
+) -> (WendelonResponse, Option<TieredSlab>) {
     match req {
         WendelonRequest::Finalize(marker) => {
             // E_safe advances monotonically within an epoch —
@@ -602,7 +673,7 @@ fn apply_request(state: &mut SmState, req: WendelonRequest) -> WendelonResponse 
                     }
                 })
                 .or_insert(marker.commit_hlc);
-            WendelonResponse::Success
+            (WendelonResponse::Success, None)
         }
         WendelonRequest::AcquireLease(lease) => {
             let key = lease.holder.id as u64;
@@ -611,17 +682,27 @@ fn apply_request(state: &mut SmState, req: WendelonRequest) -> WendelonResponse 
             // has occurred — a new epoch invalidates all leases.
             if let Some(existing) = state.leases.get(&key) {
                 if existing.lease_expiry > lease.lease_start && existing.epoch >= lease.epoch {
-                    return WendelonResponse::LeaseDenied;
+                    return (WendelonResponse::LeaseDenied, None);
                 }
             }
             state.leases.insert(key, lease);
-            WendelonResponse::Success
+            (WendelonResponse::Success, None)
         }
         WendelonRequest::SchemaUpdate(_bytes) => {
             // Schema registry is not modelled in SmState yet;
             // accepting the write keeps the log replayable and
             // lets the control-ring feature land incrementally.
-            WendelonResponse::Success
+            (WendelonResponse::Success, None)
+        }
+        WendelonRequest::TierSlab(tier) => {
+            // Idempotent: a replay must not fire the observer
+            // twice. The first insert wins; later apply passes
+            // return Success without a pending event.
+            if state.tiered_slabs.contains_key(&tier.slab_id) {
+                return (WendelonResponse::Success, None);
+            }
+            state.tiered_slabs.insert(tier.slab_id, tier.clone());
+            (WendelonResponse::Success, Some(tier))
         }
     }
 }
@@ -701,6 +782,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
         EntryPayload::Normal(WendelonRequest::Finalize(m)) => (LogEntryKind::APPEND, m.epoch),
         EntryPayload::Normal(WendelonRequest::AcquireLease(l)) => (LogEntryKind::APPEND, l.epoch),
         EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
+        EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
         EntryPayload::Membership(_) => (LogEntryKind::CONFIG, 0),
         EntryPayload::Blank => (LogEntryKind::APPEND, 0),
     };

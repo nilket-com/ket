@@ -43,6 +43,7 @@
 use crate::schema::HybridTimestamp;
 use crate::storage::core::{LocalSlabStore, RecordLocation, StorageEngine};
 use crate::storage::io_uring::IoRingHandle;
+use crate::storage::l2::ObjectStore;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::io::{Error, ErrorKind};
@@ -60,6 +61,33 @@ pub struct SlabManagerConfig {
     /// Submission handle for the shared `io_uring` thread. Cloned
     /// into every slab the manager opens.
     pub io: IoRingHandle,
+    /// Optional L2 object store used by the read path when a slab
+    /// has been tiered out of L1. If `None`, the manager refuses
+    /// reads against tiered slabs rather than silently returning
+    /// `NotFound` — a missing L2 handle on a tiered slab is a
+    /// configuration bug, not a miss.
+    pub l2: Option<Arc<dyn ObjectStore>>,
+}
+
+/// Summary of a sealed slab, handed out by
+/// [`SlabManager::list_sealed_slabs`] to the background sweeper.
+/// `size_bytes` is the current write cursor — slabs only ever
+/// shrink by being tiered out, so this is the upper bound on the
+/// payload the sweeper will upload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedSlabInfo {
+    pub slab_id: u64,
+    pub size_bytes: u64,
+}
+
+/// A slab that has been uploaded to L2. The manager tracks this
+/// so subsequent reads pivot to the object store instead of the
+/// now-unlinked L1 file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TieredSlabPointer {
+    pub slab_id: u64,
+    pub l2_uri: String,
+    pub payload_hash: [u8; 32],
 }
 
 /// Multi-slab composition of [`StorageEngine`].
@@ -74,9 +102,17 @@ pub struct SlabManager {
 struct ManagerState {
     active: Arc<LocalSlabStore>,
     /// Sealed slabs keyed by `slab_id`. Read-only from the
-    /// manager's perspective; eligible for tiering once that path
-    /// is implemented.
+    /// manager's perspective and eligible for tiering to L2 via
+    /// the background sweeper. An entry leaves this map only when
+    /// [`SlabManager::apply_tier_slab`] has moved the slab's
+    /// backing from L1 to `tiered`.
     sealed: DashMap<u64, Arc<LocalSlabStore>>,
+    /// Slabs whose payload now lives in L2. Keyed by `slab_id`;
+    /// the value is the URI the read path hands to
+    /// [`ObjectStore::get`]. Entries here shadow any same-id entry
+    /// in `sealed` — the tier pivot removes from `sealed` before
+    /// inserting here.
+    tiered: DashMap<u64, TieredSlabPointer>,
     next_slab_id: u64,
 }
 
@@ -116,6 +152,7 @@ impl SlabManager {
 
         let key_index = DashMap::new();
         let sealed: DashMap<u64, Arc<LocalSlabStore>> = DashMap::new();
+        let tiered: DashMap<u64, TieredSlabPointer> = DashMap::new();
 
         let (active, next_slab_id) = if existing_ids.is_empty() {
             let id: u64 = 0;
@@ -154,6 +191,7 @@ impl SlabManager {
             state: Mutex::new(ManagerState {
                 active,
                 sealed,
+                tiered,
                 next_slab_id,
             }),
             key_index,
@@ -168,6 +206,105 @@ impl SlabManager {
     /// Test / diagnostic accessor: number of sealed slabs.
     pub async fn sealed_count(&self) -> usize {
         self.state.lock().await.sealed.len()
+    }
+
+    /// Test / diagnostic accessor: number of slabs currently
+    /// pivoted to L2.
+    pub async fn tiered_count(&self) -> usize {
+        self.state.lock().await.tiered.len()
+    }
+
+    /// Snapshot of every sealed slab eligible for tiering. The
+    /// sweeper uses this to decide what to ship to L2.
+    /// The active slab is excluded by construction — only slabs
+    /// that have been rotated out are here. Already-tiered slabs
+    /// are excluded too, so calling this repeatedly is idempotent.
+    pub async fn list_sealed_slabs(&self) -> Vec<SealedSlabInfo> {
+        let state = self.state.lock().await;
+        let mut out = Vec::with_capacity(state.sealed.len());
+        for entry in state.sealed.iter() {
+            out.push(SealedSlabInfo {
+                slab_id: *entry.key(),
+                size_bytes: entry.value().write_cursor(),
+            });
+        }
+        out.sort_by_key(|s| s.slab_id);
+        out
+    }
+
+    /// Read every byte of a sealed L1 slab in one shot. Used by
+    /// the sweeper to build the payload it ships to L2 and to
+    /// compute the blake3 over that payload for the TierSlab
+    /// Raft commit.
+    ///
+    /// Returns `NotFound` if the slab is either absent, still
+    /// active, or already tiered — all three are bugs on the
+    /// caller side.
+    pub async fn read_sealed_raw(&self, slab_id: u64) -> std::io::Result<Vec<u8>> {
+        {
+            let state = self.state.lock().await;
+            if !state.sealed.contains_key(&slab_id) {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("slab {slab_id} is not in the sealed set"),
+                ));
+            }
+        }
+        // The L1 file lives at the canonical path; read via the
+        // normal filesystem surface. O_DIRECT alignment is only
+        // relevant for the `io_uring` append / lookup path.
+        let path = slab_path(&self.config.dir, slab_id);
+        std::fs::read(path)
+    }
+
+    /// Move a slab's backing from the sealed L1 set to the tiered
+    /// set. On return:
+    ///
+    /// * The slab is no longer in `sealed` — future
+    ///   [`StorageEngine::read`]s route to L2 via the stored URI.
+    /// * The on-disk `slab_<id>.wnd` file has been unlinked.
+    /// * Any read that grabbed an `Arc<LocalSlabStore>` *before*
+    ///   this call still holds its own reference, so its open fd
+    ///   survives the unlink (Linux semantics) — zero downtime
+    ///   for readers mid-flight.
+    pub async fn apply_tier_slab(
+        &self,
+        pointer: TieredSlabPointer,
+    ) -> std::io::Result<()> {
+        let state = self.state.lock().await;
+        // Idempotent: a replay of the Raft TierSlab entry must not
+        // fail. If we're already tiered, accept the no-op.
+        if state.tiered.contains_key(&pointer.slab_id) {
+            return Ok(());
+        }
+        let _old = state.sealed.remove(&pointer.slab_id);
+        state.tiered.insert(pointer.slab_id, pointer.clone());
+        // Unlink the L1 file. Open fds held by in-flight reads
+        // continue to work; new reads find the entry in `tiered`
+        // and go to L2.
+        let path = slab_path(&self.config.dir, pointer.slab_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Whether a slab has been pivoted to L2. Cheap — only hits
+    /// the tiered DashMap.
+    pub async fn is_tiered(&self, slab_id: u64) -> bool {
+        self.state.lock().await.tiered.contains_key(&slab_id)
+    }
+
+    /// Lookup the L2 pointer for a tiered slab.
+    pub async fn tier_pointer(&self, slab_id: u64) -> Option<TieredSlabPointer> {
+        self.state
+            .lock()
+            .await
+            .tiered
+            .get(&slab_id)
+            .map(|p| p.clone())
     }
 
     /// Acquire the slab that should receive the next append,
@@ -197,14 +334,34 @@ impl SlabManager {
         Ok(next_slab)
     }
 
-    /// Find the slab that backs `location`, whether active or sealed.
-    async fn slab_for(&self, slab_id: u64) -> Option<Arc<LocalSlabStore>> {
+    /// Resolve the authoritative backing for a slab, which may be
+    /// either a local `Arc<LocalSlabStore>` (active / sealed) or
+    /// an L2 pointer (tiered). Tiered wins over sealed so a
+    /// post-pivot read never races back against the soon-to-be-
+    /// unlinked L1 file.
+    async fn resolve_backing(&self, slab_id: u64) -> SlabBacking {
         let state = self.state.lock().await;
-        if state.active.slab_id() == slab_id {
-            return Some(state.active.clone());
+        if let Some(p) = state.tiered.get(&slab_id) {
+            return SlabBacking::L2(p.clone());
         }
-        state.sealed.get(&slab_id).map(|s| s.clone())
+        if state.active.slab_id() == slab_id {
+            return SlabBacking::Local(state.active.clone());
+        }
+        if let Some(s) = state.sealed.get(&slab_id) {
+            return SlabBacking::Local(s.clone());
+        }
+        SlabBacking::Missing
     }
+}
+
+/// Authoritative location for a slab, as observed by the read
+/// path. Keeping it an enum means the "is the file still here?"
+/// question is answered with the same lock acquisition that
+/// resolves the backing.
+enum SlabBacking {
+    Local(Arc<LocalSlabStore>),
+    L2(TieredSlabPointer),
+    Missing,
 }
 
 #[async_trait]
@@ -225,17 +382,68 @@ impl StorageEngine for SlabManager {
     }
 
     async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
-        let slab = self.slab_for(location.slab_id).await.ok_or_else(|| {
-            Error::new(
+        match self.resolve_backing(location.slab_id).await {
+            SlabBacking::Local(slab) => slab.read(location).await,
+            SlabBacking::L2(pointer) => self.read_from_l2(&pointer, location).await,
+            SlabBacking::Missing => Err(Error::new(
                 ErrorKind::NotFound,
                 format!("no slab with id {} under this manager", location.slab_id),
-            )
-        })?;
-        slab.read(location).await
+            )),
+        }
     }
 
     fn lookup(&self, key_hash: u64) -> Option<RecordLocation> {
         self.key_index.get(&key_hash).map(|r| *r)
+    }
+}
+
+impl SlabManager {
+    /// Fetch a single record from L2. V1 downloads the whole slab
+    /// blob and carves out the record range; a follow-up will
+    /// teach [`ObjectStore`] about ranged GETs so only the record
+    /// window crosses the wire.
+    async fn read_from_l2(
+        &self,
+        pointer: &TieredSlabPointer,
+        location: RecordLocation,
+    ) -> std::io::Result<Vec<u8>> {
+        let l2 = self.config.l2.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "slab {} is tiered but no ObjectStore configured on this manager",
+                    pointer.slab_id
+                ),
+            )
+        })?;
+        let blob = l2.get(&pointer.l2_uri).await?;
+        let offset = location.offset as usize;
+        let length = location.length as usize;
+        // The record layout in L2 matches L1 exactly — the sweeper
+        // uploads the raw slab file verbatim. Re-materialise via
+        // the same wire header parsing that `LocalSlabStore::read`
+        // uses.
+        let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
+        if blob.len() < offset + header_size {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "L2 blob shorter than record header",
+            ));
+        }
+        let header: &crate::schema::SlabRecordHeader =
+            bytemuck::from_bytes(&blob[offset..offset + header_size]);
+        let frame_len = header.frame_len as usize;
+        let end = offset
+            .checked_add(header_size)
+            .and_then(|h| h.checked_add(frame_len))
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
+        if end > blob.len() || location.length as usize > length.max(header_size + frame_len) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "L2 record extends past downloaded blob",
+            ));
+        }
+        Ok(blob[offset + header_size..end].to_vec())
     }
 }
 
