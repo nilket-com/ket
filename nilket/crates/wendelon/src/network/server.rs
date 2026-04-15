@@ -78,7 +78,7 @@ use std::sync::Arc;
 /// stream — it does not tear down the whole connection.
 #[async_trait]
 pub trait HrftService: Send + Sync + 'static {
-    async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
 }
 
 // ============================================================
@@ -100,26 +100,26 @@ pub trait HrftService: Send + Sync + 'static {
 /// each accepted queue pair into a `RdmaTransportConnection` and
 /// then delegates to [`handle_connection`] just like this one does.
 pub async fn serve<S: HrftService>(
-    endpoint: Endpoint,
-    service: Arc<S>,
-    pool: Arc<BufPool>,
+	endpoint: Endpoint,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
-    loop {
-        let Some(incoming) = endpoint.accept().await else {
-            // Endpoint has been closed: exit cleanly.
-            return Ok(());
-        };
-        let service = service.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_quic_connection(incoming, service, pool).await {
-                // One bad connection should not kill the server.
-                // A structured logger will go here once the tracing
-                // macros are threaded through.
-                let _ = e;
-            }
-        });
-    }
+	loop {
+		let Some(incoming) = endpoint.accept().await else {
+			// Endpoint has been closed: exit cleanly.
+			return Ok(());
+		};
+		let service = service.clone();
+		let pool = pool.clone();
+		tokio::spawn(async move {
+			if let Err(e) = serve_quic_connection(incoming, service, pool).await {
+				// One bad connection should not kill the server.
+				// A structured logger will go here once the tracing
+				// macros are threaded through.
+				let _ = e;
+			}
+		});
+	}
 }
 
 // ============================================================
@@ -134,24 +134,24 @@ pub async fn serve<S: HrftService>(
 /// when other transports land they each get their own
 /// `serve_<tier>_connection` shim with the same shape.
 async fn serve_quic_connection<S: HrftService>(
-    incoming: quinn::Incoming,
-    service: Arc<S>,
-    pool: Arc<BufPool>,
+	incoming: quinn::Incoming,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
-    let connection = incoming
-        .await
-        .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
-    // Slice 3 will derive this from the validated client cert SAN.
-    // Until then, downstream code that calls `remote_id()` on a
-    // server-side connection sees the zero value and must not key
-    // on it.
-    let placeholder = NodeId {
-        id: 0,
-        _reserved: 0,
-    };
-    let connection: Arc<dyn TransportConnection> =
-        Arc::new(QuicTransportConnection::new(connection, placeholder));
-    handle_connection(connection, service, pool).await
+	let connection = incoming
+		.await
+		.map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
+	// Slice 3 will derive this from the validated client cert SAN.
+	// Until then, downstream code that calls `remote_id()` on a
+	// server-side connection sees the zero value and must not key
+	// on it.
+	let placeholder = NodeId {
+		id: 0,
+		_reserved: 0,
+	};
+	let connection: Arc<dyn TransportConnection> =
+		Arc::new(QuicTransportConnection::new(connection, placeholder));
+	handle_connection(connection, service, pool).await
 }
 
 /// Per-connection accept loop. Spawns one task per inbound bidi
@@ -164,21 +164,21 @@ async fn serve_quic_connection<S: HrftService>(
 /// future logging hook can branch on the kind without touching
 /// quinn's enum.
 async fn handle_connection<S: HrftService>(
-    connection: Arc<dyn TransportConnection>,
-    service: Arc<S>,
-    pool: Arc<BufPool>,
+	connection: Arc<dyn TransportConnection>,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
-    loop {
-        let stream = match connection.accept_bi().await {
-            Ok(s) => s,
-            Err(_) => return Ok(()),
-        };
-        let service = service.clone();
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let _ = handle_stream(stream, service, pool).await;
-        });
-    }
+	loop {
+		let stream = match connection.accept_bi().await {
+			Ok(s) => s,
+			Err(_) => return Ok(()),
+		};
+		let service = service.clone();
+		let pool = pool.clone();
+		tokio::spawn(async move {
+			let _ = handle_stream(stream, service, pool).await;
+		});
+	}
 }
 
 // ============================================================
@@ -186,32 +186,32 @@ async fn handle_connection<S: HrftService>(
 // ============================================================
 
 async fn handle_stream<S: HrftService>(
-    mut stream: Box<dyn TransportStream>,
-    service: Arc<S>,
-    pool: Arc<BufPool>,
+	mut stream: Box<dyn TransportStream>,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
-    let frame = read_frame(&mut *stream, &pool).await?;
+	let frame = read_frame(&mut *stream, &pool).await?;
 
-    match service.handle_frame(frame).await? {
-        Some(resp) => {
-            write_frame(
-                &mut *stream,
-                &resp.header,
-                &resp.meta,
-                resp.arrow_payload.as_deref(),
-                resp.trailing.as_deref(),
-            )
-            .await?;
-            stream.finish().await?;
-        }
-        None => {
-            // Fire-and-forget: close the send side with zero bytes
-            // so the client's `read_to_end` returns promptly.
-            stream.finish().await?;
-        }
-    }
+	match service.handle_frame(frame).await? {
+		Some(resp) => {
+			write_frame(
+				&mut *stream,
+				&resp.header,
+				&resp.meta,
+				resp.arrow_payload.as_deref(),
+				resp.trailing.as_deref(),
+			)
+			.await?;
+			stream.finish().await?;
+		}
+		None => {
+			// Fire-and-forget: close the send side with zero bytes
+			// so the client's `read_to_end` returns promptly.
+			stream.finish().await?;
+		}
+	}
 
-    Ok(())
+	Ok(())
 }
 
 // ============================================================
@@ -227,13 +227,13 @@ pub struct UnroutedService;
 
 #[async_trait]
 impl HrftService for UnroutedService {
-    async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
-        Err(Error::new(
-            ErrorKind::Unsupported,
-            format!(
-                "no HRFT handler installed for msg_type=0x{:02x}",
-                frame.header.msg_type
-            ),
-        ))
-    }
+	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+		Err(Error::new(
+			ErrorKind::Unsupported,
+			format!(
+				"no HRFT handler installed for msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		))
+	}
 }

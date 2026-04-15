@@ -70,44 +70,41 @@ pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
 /// intentionally move-only — wrap it in an `Arc` if you need shared
 /// ownership.
 pub struct TlsMaterial {
-    /// Leaf-first chain up to (but not including) the root.
-    pub cert_chain: Vec<CertificateDer<'static>>,
-    /// PKCS#8 / RSA / SEC1 private key matching the leaf cert.
-    pub key: PrivateKeyDer<'static>,
-    /// Trust anchors used to verify the remote peer (both when we
-    /// are the client and when we are the server).
-    pub ca_roots: Arc<RootCertStore>,
+	/// Leaf-first chain up to (but not including) the root.
+	pub cert_chain: Vec<CertificateDer<'static>>,
+	/// PKCS#8 / RSA / SEC1 private key matching the leaf cert.
+	pub key: PrivateKeyDer<'static>,
+	/// Trust anchors used to verify the remote peer (both when we
+	/// are the client and when we are the server).
+	pub ca_roots: Arc<RootCertStore>,
 }
 
 impl TlsMaterial {
-    /// Load cert chain, private key, and CA bundle from PEM files
-    /// on disk. Convenience for the happy path where an operator
-    /// drops three PEMs into `/etc/wendelon/certs/`; programmatic
-    /// setups (tests, KMS-fetched keys) should construct
-    /// `TlsMaterial` by hand.
-    pub fn load(
-        cert_path: impl AsRef<Path>,
-        key_path: impl AsRef<Path>,
-        ca_path: impl AsRef<Path>,
-    ) -> std::io::Result<Self> {
-        let cert_chain = load_cert_chain(cert_path.as_ref())?;
-        if cert_chain.is_empty() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "no certificates found in {}",
-                    cert_path.as_ref().display()
-                ),
-            ));
-        }
-        let key = load_private_key(key_path.as_ref())?;
-        let ca_roots = load_ca_roots(ca_path.as_ref())?;
-        Ok(Self {
-            cert_chain,
-            key,
-            ca_roots: Arc::new(ca_roots),
-        })
-    }
+	/// Load cert chain, private key, and CA bundle from PEM files
+	/// on disk. Convenience for the happy path where an operator
+	/// drops three PEMs into `/etc/wendelon/certs/`; programmatic
+	/// setups (tests, KMS-fetched keys) should construct
+	/// `TlsMaterial` by hand.
+	pub fn load(
+		cert_path: impl AsRef<Path>,
+		key_path: impl AsRef<Path>,
+		ca_path: impl AsRef<Path>,
+	) -> std::io::Result<Self> {
+		let cert_chain = load_cert_chain(cert_path.as_ref())?;
+		if cert_chain.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("no certificates found in {}", cert_path.as_ref().display()),
+			));
+		}
+		let key = load_private_key(key_path.as_ref())?;
+		let ca_roots = load_ca_roots(ca_path.as_ref())?;
+		Ok(Self {
+			cert_chain,
+			key,
+			ca_roots: Arc::new(ca_roots),
+		})
+	}
 }
 
 // ============================================================
@@ -121,19 +118,19 @@ impl TlsMaterial {
 ///   `material.ca_roots`,
 /// * advertises only [`HRFT_ALPN`].
 pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerConfig> {
-    let verifier = WebPkiClientVerifier::builder(material.ca_roots.clone())
-        .build()
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
+	let verifier = WebPkiClientVerifier::builder(material.ca_roots.clone())
+		.build()
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
 
-    let mut rustls_cfg = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("server cert/key: {e}")))?;
-    rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
+	let mut rustls_cfg = ServerConfig::builder()
+		.with_client_cert_verifier(verifier)
+		.with_single_cert(material.cert_chain.clone(), material.key.clone_key())
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("server cert/key: {e}")))?;
+	rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
 
-    let quic_cfg = QuicServerConfig::try_from(rustls_cfg)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicServerConfig: {e}")))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)))
+	let quic_cfg = QuicServerConfig::try_from(rustls_cfg)
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicServerConfig: {e}")))?;
+	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)))
 }
 
 /// Build a `quinn::ClientConfig` that:
@@ -142,15 +139,15 @@ pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerCon
 /// * presents this node's cert+key as the client identity,
 /// * advertises only [`HRFT_ALPN`].
 pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientConfig> {
-    let mut rustls_cfg = ClientConfig::builder()
-        .with_root_certificates((*material.ca_roots).clone())
-        .with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client cert/key: {e}")))?;
-    rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
+	let mut rustls_cfg = ClientConfig::builder()
+		.with_root_certificates((*material.ca_roots).clone())
+		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client cert/key: {e}")))?;
+	rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
 
-    let quic_cfg = QuicClientConfig::try_from(rustls_cfg)
-        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicClientConfig: {e}")))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic_cfg)))
+	let quic_cfg = QuicClientConfig::try_from(rustls_cfg)
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicClientConfig: {e}")))?;
+	Ok(quinn::ClientConfig::new(Arc::new(quic_cfg)))
 }
 
 // ============================================================
@@ -158,43 +155,43 @@ pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientCon
 // ============================================================
 
 fn open_pem(path: &Path) -> std::io::Result<BufReader<File>> {
-    File::open(path)
-        .map(BufReader::new)
-        .map_err(|e| Error::new(e.kind(), format!("opening {}: {e}", path.display())))
+	File::open(path)
+		.map(BufReader::new)
+		.map_err(|e| Error::new(e.kind(), format!("opening {}: {e}", path.display())))
 }
 
 fn load_cert_chain(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = open_pem(path)?;
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+	let mut reader = open_pem(path)?;
+	rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
 }
 
 fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
-    let mut reader = open_pem(path)?;
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("no private key found in {}", path.display()),
-        )
-    })
+	let mut reader = open_pem(path)?;
+	rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("no private key found in {}", path.display()),
+		)
+	})
 }
 
 fn load_ca_roots(path: &Path) -> std::io::Result<RootCertStore> {
-    let mut reader = open_pem(path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut reader) {
-        let cert = cert?;
-        roots.add(cert).map_err(|e| {
-            Error::new(
-                ErrorKind::InvalidData,
-                format!("adding CA cert from {}: {e}", path.display()),
-            )
-        })?;
-    }
-    if roots.is_empty() {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("no CA certificates found in {}", path.display()),
-        ));
-    }
-    Ok(roots)
+	let mut reader = open_pem(path)?;
+	let mut roots = RootCertStore::empty();
+	for cert in rustls_pemfile::certs(&mut reader) {
+		let cert = cert?;
+		roots.add(cert).map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("adding CA cert from {}: {e}", path.display()),
+			)
+		})?;
+	}
+	if roots.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("no CA certificates found in {}", path.display()),
+		));
+	}
+	Ok(roots)
 }

@@ -45,19 +45,19 @@ use std::sync::Arc;
 /// Handler for Data Ring frames: `msg_type` in `0x01..=0x0F`.
 #[async_trait]
 pub trait DataRingServer: Send + Sync + 'static {
-    async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+	async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
 }
 
 /// Handler for Control Ring frames: `msg_type` in `0x10..=0x1F`.
 #[async_trait]
 pub trait ControlRingServer: Send + Sync + 'static {
-    async fn handle_control_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+	async fn handle_control_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
 }
 
 /// Handler for internal Raft frames: `msg_type` in `0x20..=0x2F`.
 #[async_trait]
 pub trait RaftInternalServer: Send + Sync + 'static {
-    async fn handle_raft_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+	async fn handle_raft_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
 }
 
 // ============================================================
@@ -68,40 +68,40 @@ pub trait RaftInternalServer: Send + Sync + 'static {
 /// stood up with, say, only the Raft internal surface during
 /// bootstrap testing.
 pub struct MsgRouter {
-    data: Option<Arc<dyn DataRingServer>>,
-    control: Option<Arc<dyn ControlRingServer>>,
-    raft: Option<Arc<dyn RaftInternalServer>>,
+	data: Option<Arc<dyn DataRingServer>>,
+	control: Option<Arc<dyn ControlRingServer>>,
+	raft: Option<Arc<dyn RaftInternalServer>>,
 }
 
 impl MsgRouter {
-    pub fn builder() -> MsgRouterBuilder {
-        MsgRouterBuilder::default()
-    }
+	pub fn builder() -> MsgRouterBuilder {
+		MsgRouterBuilder::default()
+	}
 }
 
 #[async_trait]
 impl HrftService for MsgRouter {
-    async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
-        let msg_type = frame.header.msg_type;
-        match msg_type {
-            0x01..=0x0F => match &self.data {
-                Some(h) => h.handle_data_frame(frame).await,
-                None => Err(unhandled("Data Ring", msg_type)),
-            },
-            0x10..=0x1F => match &self.control {
-                Some(h) => h.handle_control_frame(frame).await,
-                None => Err(unhandled("Control Ring", msg_type)),
-            },
-            0x20..=0x2F => match &self.raft {
-                Some(h) => h.handle_raft_frame(frame).await,
-                None => Err(unhandled("Raft internal", msg_type)),
-            },
-            _ => Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("unknown HRFT msg_type=0x{:02x}", msg_type),
-            )),
-        }
-    }
+	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+		let msg_type = frame.header.msg_type;
+		match msg_type {
+			0x01..=0x0F => match &self.data {
+				Some(h) => h.handle_data_frame(frame).await,
+				None => Err(unhandled("Data Ring", msg_type)),
+			},
+			0x10..=0x1F => match &self.control {
+				Some(h) => h.handle_control_frame(frame).await,
+				None => Err(unhandled("Control Ring", msg_type)),
+			},
+			0x20..=0x2F => match &self.raft {
+				Some(h) => h.handle_raft_frame(frame).await,
+				None => Err(unhandled("Raft internal", msg_type)),
+			},
+			_ => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unknown HRFT msg_type=0x{:02x}", msg_type),
+			)),
+		}
+	}
 }
 
 // ============================================================
@@ -112,34 +112,34 @@ impl HrftService for MsgRouter {
 /// `ErrorKind::Unsupported` for any frame that lands on them.
 #[derive(Default)]
 pub struct MsgRouterBuilder {
-    data: Option<Arc<dyn DataRingServer>>,
-    control: Option<Arc<dyn ControlRingServer>>,
-    raft: Option<Arc<dyn RaftInternalServer>>,
+	data: Option<Arc<dyn DataRingServer>>,
+	control: Option<Arc<dyn ControlRingServer>>,
+	raft: Option<Arc<dyn RaftInternalServer>>,
 }
 
 impl MsgRouterBuilder {
-    pub fn with_data_ring(mut self, handler: Arc<dyn DataRingServer>) -> Self {
-        self.data = Some(handler);
-        self
-    }
+	pub fn with_data_ring(mut self, handler: Arc<dyn DataRingServer>) -> Self {
+		self.data = Some(handler);
+		self
+	}
 
-    pub fn with_control_ring(mut self, handler: Arc<dyn ControlRingServer>) -> Self {
-        self.control = Some(handler);
-        self
-    }
+	pub fn with_control_ring(mut self, handler: Arc<dyn ControlRingServer>) -> Self {
+		self.control = Some(handler);
+		self
+	}
 
-    pub fn with_raft_internal(mut self, handler: Arc<dyn RaftInternalServer>) -> Self {
-        self.raft = Some(handler);
-        self
-    }
+	pub fn with_raft_internal(mut self, handler: Arc<dyn RaftInternalServer>) -> Self {
+		self.raft = Some(handler);
+		self
+	}
 
-    pub fn build(self) -> MsgRouter {
-        MsgRouter {
-            data: self.data,
-            control: self.control,
-            raft: self.raft,
-        }
-    }
+	pub fn build(self) -> MsgRouter {
+		MsgRouter {
+			data: self.data,
+			control: self.control,
+			raft: self.raft,
+		}
+	}
 }
 
 // ============================================================
@@ -147,10 +147,8 @@ impl MsgRouterBuilder {
 // ============================================================
 
 fn unhandled(ring: &'static str, msg_type: u8) -> Error {
-    Error::new(
-        ErrorKind::Unsupported,
-        format!(
-            "{ring} handler not installed (msg_type=0x{msg_type:02x})"
-        ),
-    )
+	Error::new(
+		ErrorKind::Unsupported,
+		format!("{ring} handler not installed (msg_type=0x{msg_type:02x})"),
+	)
 }

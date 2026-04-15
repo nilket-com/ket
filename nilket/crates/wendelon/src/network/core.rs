@@ -36,10 +36,10 @@ const MAX_SECTION_BYTES: u32 = 5 * 1024 * 1024;
 /// working without changes.
 #[derive(Debug)]
 pub struct HrftFrame {
-    pub header: FrameHeader,
-    pub meta: PooledBuf,
-    pub arrow_payload: Option<PooledBuf>,
-    pub trailing: Option<PooledBuf>,
+	pub header: FrameHeader,
+	pub meta: PooledBuf,
+	pub arrow_payload: Option<PooledBuf>,
+	pub trailing: Option<PooledBuf>,
 }
 
 /// Reads a complete HRFT frame from an asynchronous stream (e.g.
@@ -49,62 +49,65 @@ pub struct HrftFrame {
 /// sections all live in pooled Vec<u8>s; dropping the frame returns
 /// them for reuse on the next stream.
 pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    pool: &Arc<BufPool>,
+	reader: &mut R,
+	pool: &Arc<BufPool>,
 ) -> std::io::Result<HrftFrame> {
-    let mut header_buf = [0u8; std::mem::size_of::<FrameHeader>()];
-    reader.read_exact(&mut header_buf).await?;
+	let mut header_buf = [0u8; std::mem::size_of::<FrameHeader>()];
+	reader.read_exact(&mut header_buf).await?;
 
-    let header: &FrameHeader = bytemuck::from_bytes(&header_buf);
-    if header.magic != HRFT_MAGIC {
-        return Err(Error::new(ErrorKind::InvalidData, "invalid HRFT magic bytes"));
-    }
-    check_section_len("meta", header.meta_len)?;
-    check_section_len("arrow", header.arrow_len)?;
-    check_section_len("trailing", header.trailing_len)?;
+	let header: &FrameHeader = bytemuck::from_bytes(&header_buf);
+	if header.magic != HRFT_MAGIC {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"invalid HRFT magic bytes",
+		));
+	}
+	check_section_len("meta", header.meta_len)?;
+	check_section_len("arrow", header.arrow_len)?;
+	check_section_len("trailing", header.trailing_len)?;
 
-    let meta = read_section(reader, pool, header.meta_len).await?.expect(
-        "meta section always present (read_section returns Some for any len, \
+	let meta = read_section(reader, pool, header.meta_len).await?.expect(
+		"meta section always present (read_section returns Some for any len, \
          including zero, when the section is required)",
-    );
-    let arrow_payload = if header.arrow_len > 0 {
-        read_section(reader, pool, header.arrow_len).await?
-    } else {
-        None
-    };
-    let trailing = if header.trailing_len > 0 {
-        read_section(reader, pool, header.trailing_len).await?
-    } else {
-        None
-    };
+	);
+	let arrow_payload = if header.arrow_len > 0 {
+		read_section(reader, pool, header.arrow_len).await?
+	} else {
+		None
+	};
+	let trailing = if header.trailing_len > 0 {
+		read_section(reader, pool, header.trailing_len).await?
+	} else {
+		None
+	};
 
-    Ok(HrftFrame {
-        header: *header,
-        meta,
-        arrow_payload,
-        trailing,
-    })
+	Ok(HrftFrame {
+		header: *header,
+		meta,
+		arrow_payload,
+		trailing,
+	})
 }
 
 /// Writes an HRFT frame to an asynchronous stream. Takes borrowed
 /// byte slices so callers can pass `&frame.meta` (derefs) or any
 /// other `AsRef<[u8]>` without owning the buffers.
 pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
-    writer: &mut W,
-    header: &FrameHeader,
-    meta: &[u8],
-    arrow_payload: Option<&[u8]>,
-    trailing: Option<&[u8]>,
+	writer: &mut W,
+	header: &FrameHeader,
+	meta: &[u8],
+	arrow_payload: Option<&[u8]>,
+	trailing: Option<&[u8]>,
 ) -> std::io::Result<()> {
-    writer.write_all(bytemuck::bytes_of(header)).await?;
-    writer.write_all(meta).await?;
-    if let Some(arrow) = arrow_payload {
-        writer.write_all(arrow).await?;
-    }
-    if let Some(t) = trailing {
-        writer.write_all(t).await?;
-    }
-    Ok(())
+	writer.write_all(bytemuck::bytes_of(header)).await?;
+	writer.write_all(meta).await?;
+	if let Some(arrow) = arrow_payload {
+		writer.write_all(arrow).await?;
+	}
+	if let Some(t) = trailing {
+		writer.write_all(t).await?;
+	}
+	Ok(())
 }
 
 // ============================================================
@@ -112,29 +115,27 @@ pub async fn write_frame<W: AsyncWrite + Unpin + ?Sized>(
 // ============================================================
 
 async fn read_section<R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    pool: &Arc<BufPool>,
-    len: u32,
+	reader: &mut R,
+	pool: &Arc<BufPool>,
+	len: u32,
 ) -> std::io::Result<Option<PooledBuf>> {
-    let mut buf = pool.acquire();
-    {
-        let vec = buf.as_mut_vec();
-        vec.resize(len as usize, 0);
-        if len > 0 {
-            reader.read_exact(vec.as_mut_slice()).await?;
-        }
-    }
-    Ok(Some(buf))
+	let mut buf = pool.acquire();
+	{
+		let vec = buf.as_mut_vec();
+		vec.resize(len as usize, 0);
+		if len > 0 {
+			reader.read_exact(vec.as_mut_slice()).await?;
+		}
+	}
+	Ok(Some(buf))
 }
 
 fn check_section_len(name: &'static str, len: u32) -> std::io::Result<()> {
-    if len > MAX_SECTION_BYTES {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            format!(
-                "HRFT {name} section exceeds {MAX_SECTION_BYTES}-byte safety cap (got {len})"
-            ),
-        ));
-    }
-    Ok(())
+	if len > MAX_SECTION_BYTES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("HRFT {name} section exceeds {MAX_SECTION_BYTES}-byte safety cap (got {len})"),
+		));
+	}
+	Ok(())
 }

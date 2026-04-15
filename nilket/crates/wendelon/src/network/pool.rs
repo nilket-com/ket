@@ -36,50 +36,50 @@ use std::sync::{Arc, Mutex, Weak};
 /// Bounded free list of reusable `Vec<u8>` buffers. Safe to share
 /// across tokio tasks via `Arc`.
 pub struct BufPool {
-    bufs: Mutex<Vec<Vec<u8>>>,
-    max_retained: usize,
-    max_cap_bytes: usize,
+	bufs: Mutex<Vec<Vec<u8>>>,
+	max_retained: usize,
+	max_cap_bytes: usize,
 }
 
 impl BufPool {
-    /// Build a pool that keeps at most `max_retained` buffers and
-    /// refuses to retain any individual buffer whose capacity has
-    /// grown past `max_cap_bytes`.
-    pub fn new(max_retained: usize, max_cap_bytes: usize) -> Arc<Self> {
-        Arc::new(Self {
-            bufs: Mutex::new(Vec::with_capacity(max_retained)),
-            max_retained,
-            max_cap_bytes,
-        })
-    }
+	/// Build a pool that keeps at most `max_retained` buffers and
+	/// refuses to retain any individual buffer whose capacity has
+	/// grown past `max_cap_bytes`.
+	pub fn new(max_retained: usize, max_cap_bytes: usize) -> Arc<Self> {
+		Arc::new(Self {
+			bufs: Mutex::new(Vec::with_capacity(max_retained)),
+			max_retained,
+			max_cap_bytes,
+		})
+	}
 
-    /// Acquire a reusable buffer. The returned `PooledBuf` has
-    /// `len() == 0` but may carry non-zero capacity from prior use.
-    pub fn acquire(self: &Arc<Self>) -> PooledBuf {
-        let buf = self.bufs.lock().unwrap().pop().unwrap_or_default();
-        PooledBuf {
-            buf,
-            pool: Some(Arc::downgrade(self)),
-            lkey: None,
-        }
-    }
+	/// Acquire a reusable buffer. The returned `PooledBuf` has
+	/// `len() == 0` but may carry non-zero capacity from prior use.
+	pub fn acquire(self: &Arc<Self>) -> PooledBuf {
+		let buf = self.bufs.lock().unwrap().pop().unwrap_or_default();
+		PooledBuf {
+			buf,
+			pool: Some(Arc::downgrade(self)),
+			lkey: None,
+		}
+	}
 
-    /// Diagnostic: current free-list depth. Exposed for tests and
-    /// future metrics surfaces.
-    pub fn available(&self) -> usize {
-        self.bufs.lock().unwrap().len()
-    }
+	/// Diagnostic: current free-list depth. Exposed for tests and
+	/// future metrics surfaces.
+	pub fn available(&self) -> usize {
+		self.bufs.lock().unwrap().len()
+	}
 
-    fn release(&self, mut buf: Vec<u8>) {
-        if buf.capacity() > self.max_cap_bytes {
-            return;
-        }
-        buf.clear();
-        let mut pool = self.bufs.lock().unwrap();
-        if pool.len() < self.max_retained {
-            pool.push(buf);
-        }
-    }
+	fn release(&self, mut buf: Vec<u8>) {
+		if buf.capacity() > self.max_cap_bytes {
+			return;
+		}
+		buf.clear();
+		let mut pool = self.bufs.lock().unwrap();
+		if pool.len() < self.max_retained {
+			pool.push(buf);
+		}
+	}
 }
 
 /// RAII guard around a `Vec<u8>` drawn from a [`BufPool`]. Dropping
@@ -99,154 +99,154 @@ impl BufPool {
 /// `None`; the data ring reads it directly to post zero-copy work
 /// requests without a side-table lookup.
 pub struct PooledBuf {
-    buf: Vec<u8>,
-    pool: Option<Weak<BufPool>>,
-    lkey: Option<NonZeroU32>,
+	buf: Vec<u8>,
+	pool: Option<Weak<BufPool>>,
+	lkey: Option<NonZeroU32>,
 }
 
 impl PooledBuf {
-    /// A `PooledBuf` detached from any pool. Useful for tests and
-    /// one-off frames where the pooling infrastructure isn't in
-    /// scope; the inner Vec just drops normally.
-    pub fn orphan(buf: Vec<u8>) -> Self {
-        Self {
-            buf,
-            pool: None,
-            lkey: None,
-        }
-    }
+	/// A `PooledBuf` detached from any pool. Useful for tests and
+	/// one-off frames where the pooling infrastructure isn't in
+	/// scope; the inner Vec just drops normally.
+	pub fn orphan(buf: Vec<u8>) -> Self {
+		Self {
+			buf,
+			pool: None,
+			lkey: None,
+		}
+	}
 
-    /// Borrow the inner Vec for writes. Exposed so callers like
-    /// [`crate::network::wire::encode_into`] and `read_frame` can
-    /// resize / append in place.
-    pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
-        &mut self.buf
-    }
+	/// Borrow the inner Vec for writes. Exposed so callers like
+	/// [`crate::network::wire::encode_into`] and `read_frame` can
+	/// resize / append in place.
+	pub fn as_mut_vec(&mut self) -> &mut Vec<u8> {
+		&mut self.buf
+	}
 
-    pub fn as_vec(&self) -> &Vec<u8> {
-        &self.buf
-    }
+	pub fn as_vec(&self) -> &Vec<u8> {
+		&self.buf
+	}
 
-    /// NIC-registered local key for this buffer's allocation, if
-    /// any. Populated by a [`PoolRegistrar`][crate::network::transport::PoolRegistrar].
-    pub fn lkey(&self) -> Option<NonZeroU32> {
-        self.lkey
-    }
+	/// NIC-registered local key for this buffer's allocation, if
+	/// any. Populated by a [`PoolRegistrar`][crate::network::transport::PoolRegistrar].
+	pub fn lkey(&self) -> Option<NonZeroU32> {
+		self.lkey
+	}
 
-    /// Record an LKey returned by a registrar. The caller owns the
-    /// invariant that the key matches the buffer's current backing
-    /// allocation — if the Vec later reallocates, the RDMA path
-    /// must clear or refresh this before the next DMA.
-    pub fn set_lkey(&mut self, lkey: Option<NonZeroU32>) {
-        self.lkey = lkey;
-    }
+	/// Record an LKey returned by a registrar. The caller owns the
+	/// invariant that the key matches the buffer's current backing
+	/// allocation — if the Vec later reallocates, the RDMA path
+	/// must clear or refresh this before the next DMA.
+	pub fn set_lkey(&mut self, lkey: Option<NonZeroU32>) {
+		self.lkey = lkey;
+	}
 }
 
 impl std::fmt::Debug for PooledBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PooledBuf")
-            .field("len", &self.buf.len())
-            .field("cap", &self.buf.capacity())
-            .finish()
-    }
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PooledBuf")
+			.field("len", &self.buf.len())
+			.field("cap", &self.buf.capacity())
+			.finish()
+	}
 }
 
 impl Deref for PooledBuf {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        &self.buf
-    }
+	type Target = [u8];
+	fn deref(&self) -> &[u8] {
+		&self.buf
+	}
 }
 
 impl DerefMut for PooledBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.buf
-    }
+	fn deref_mut(&mut self) -> &mut [u8] {
+		&mut self.buf
+	}
 }
 
 impl AsRef<[u8]> for PooledBuf {
-    fn as_ref(&self) -> &[u8] {
-        &self.buf
-    }
+	fn as_ref(&self) -> &[u8] {
+		&self.buf
+	}
 }
 
 impl Drop for PooledBuf {
-    fn drop(&mut self) {
-        if let Some(weak) = self.pool.take() {
-            if let Some(pool) = weak.upgrade() {
-                let taken = std::mem::take(&mut self.buf);
-                pool.release(taken);
-            }
-        }
-    }
+	fn drop(&mut self) {
+		if let Some(weak) = self.pool.take() {
+			if let Some(pool) = weak.upgrade() {
+				let taken = std::mem::take(&mut self.buf);
+				pool.release(taken);
+			}
+		}
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn drop_returns_buffer_to_pool() {
-        let pool = BufPool::new(4, 1024);
-        assert_eq!(pool.available(), 0);
+	#[test]
+	fn drop_returns_buffer_to_pool() {
+		let pool = BufPool::new(4, 1024);
+		assert_eq!(pool.available(), 0);
 
-        {
-            let mut buf = pool.acquire();
-            buf.as_mut_vec().extend_from_slice(&[1, 2, 3, 4]);
-            assert_eq!(&*buf, &[1, 2, 3, 4]);
-        }
-        assert_eq!(pool.available(), 1, "buffer should return on drop");
+		{
+			let mut buf = pool.acquire();
+			buf.as_mut_vec().extend_from_slice(&[1, 2, 3, 4]);
+			assert_eq!(&*buf, &[1, 2, 3, 4]);
+		}
+		assert_eq!(pool.available(), 1, "buffer should return on drop");
 
-        let reused = pool.acquire();
-        assert!(reused.is_empty(), "reused buffer must be cleared");
-        assert!(
-            reused.as_vec().capacity() >= 4,
-            "reused buffer retains its grown capacity"
-        );
-    }
+		let reused = pool.acquire();
+		assert!(reused.is_empty(), "reused buffer must be cleared");
+		assert!(
+			reused.as_vec().capacity() >= 4,
+			"reused buffer retains its grown capacity"
+		);
+	}
 
-    #[test]
-    fn oversize_buffer_is_not_retained() {
-        let pool = BufPool::new(4, 16);
-        {
-            let mut buf = pool.acquire();
-            buf.as_mut_vec().extend_from_slice(&[0u8; 64]);
-        }
-        assert_eq!(
-            pool.available(),
-            0,
-            "buffer over max_cap_bytes must be dropped, not retained"
-        );
-    }
+	#[test]
+	fn oversize_buffer_is_not_retained() {
+		let pool = BufPool::new(4, 16);
+		{
+			let mut buf = pool.acquire();
+			buf.as_mut_vec().extend_from_slice(&[0u8; 64]);
+		}
+		assert_eq!(
+			pool.available(),
+			0,
+			"buffer over max_cap_bytes must be dropped, not retained"
+		);
+	}
 
-    #[test]
-    fn free_list_length_is_bounded() {
-        let pool = BufPool::new(2, 1024);
-        let b1 = pool.acquire();
-        let b2 = pool.acquire();
-        let b3 = pool.acquire();
-        drop(b1);
-        drop(b2);
-        drop(b3);
-        assert_eq!(pool.available(), 2, "free list is capped at max_retained");
-    }
+	#[test]
+	fn free_list_length_is_bounded() {
+		let pool = BufPool::new(2, 1024);
+		let b1 = pool.acquire();
+		let b2 = pool.acquire();
+		let b3 = pool.acquire();
+		drop(b1);
+		drop(b2);
+		drop(b3);
+		assert_eq!(pool.available(), 2, "free list is capped at max_retained");
+	}
 
-    #[test]
-    fn orphan_has_no_pool_interaction() {
-        let pool = BufPool::new(4, 1024);
-        {
-            let _orphan = PooledBuf::orphan(vec![7; 8]);
-        }
-        assert_eq!(pool.available(), 0);
-    }
+	#[test]
+	fn orphan_has_no_pool_interaction() {
+		let pool = BufPool::new(4, 1024);
+		{
+			let _orphan = PooledBuf::orphan(vec![7; 8]);
+		}
+		assert_eq!(pool.available(), 0);
+	}
 
-    #[test]
-    fn dropping_pool_before_buffer_is_safe() {
-        let pool = BufPool::new(4, 1024);
-        let buf = pool.acquire();
-        drop(pool); // strong count → 0; weak stays live
-        // PooledBuf drop tries to upgrade the weak handle, fails,
-        // and the Vec drops normally. No panic, no leak.
-        drop(buf);
-    }
+	#[test]
+	fn dropping_pool_before_buffer_is_safe() {
+		let pool = BufPool::new(4, 1024);
+		let buf = pool.acquire();
+		drop(pool); // strong count → 0; weak stays live
+			  // PooledBuf drop tries to upgrade the weak handle, fails,
+			  // and the Vec drops normally. No panic, no leak.
+		drop(buf);
+	}
 }

@@ -61,34 +61,34 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TransportTier {
-    /// Tier 0 — RDMA over Converged Ethernet v2. Zero-copy,
-    /// kernel-bypass, requires a RoCE-capable NIC on both ends.
-    RdmaRoceV2 = 0,
-    /// Tier 1 — QUIC on top of `io_uring` + GSO. The universal
-    /// baseline: always available on hosts that can run Wendelon
-    /// at all, and the channel that carries the capability
-    /// handshake even when an upgrade to Tier 0 is about to happen.
-    QuicIoUring = 1,
-    /// Tier 2 — TCP + TLS 1.3. Compatibility fallback for
-    /// environments where QUIC is blocked (middleboxes, some
-    /// corporate egress).
-    TcpTls = 2,
+	/// Tier 0 — RDMA over Converged Ethernet v2. Zero-copy,
+	/// kernel-bypass, requires a RoCE-capable NIC on both ends.
+	RdmaRoceV2 = 0,
+	/// Tier 1 — QUIC on top of `io_uring` + GSO. The universal
+	/// baseline: always available on hosts that can run Wendelon
+	/// at all, and the channel that carries the capability
+	/// handshake even when an upgrade to Tier 0 is about to happen.
+	QuicIoUring = 1,
+	/// Tier 2 — TCP + TLS 1.3. Compatibility fallback for
+	/// environments where QUIC is blocked (middleboxes, some
+	/// corporate egress).
+	TcpTls = 2,
 }
 
 impl TransportTier {
-    /// All tiers in priority order, highest first. Iteration order
-    /// matters — [`TransportTierSet::highest`] walks this to find
-    /// the best tier present in a bitmask.
-    pub const ALL: [TransportTier; 3] = [
-        TransportTier::RdmaRoceV2,
-        TransportTier::QuicIoUring,
-        TransportTier::TcpTls,
-    ];
+	/// All tiers in priority order, highest first. Iteration order
+	/// matters — [`TransportTierSet::highest`] walks this to find
+	/// the best tier present in a bitmask.
+	pub const ALL: [TransportTier; 3] = [
+		TransportTier::RdmaRoceV2,
+		TransportTier::QuicIoUring,
+		TransportTier::TcpTls,
+	];
 
-    #[inline]
-    const fn bit(self) -> u8 {
-        1u8 << (self as u8)
-    }
+	#[inline]
+	const fn bit(self) -> u8 {
+		1u8 << (self as u8)
+	}
 }
 
 /// Compact bitmask of supported tiers. One byte per node, cheap to
@@ -101,43 +101,43 @@ impl TransportTier {
 pub struct TransportTierSet(u8);
 
 impl TransportTierSet {
-    pub const fn empty() -> Self {
-        Self(0)
-    }
+	pub const fn empty() -> Self {
+		Self(0)
+	}
 
-    /// Bitmask-literal constructor for test fixtures and the Raft
-    /// snapshot decoder; round-trips with [`Self::as_u8`].
-    pub const fn from_u8(bits: u8) -> Self {
-        Self(bits)
-    }
+	/// Bitmask-literal constructor for test fixtures and the Raft
+	/// snapshot decoder; round-trips with [`Self::as_u8`].
+	pub const fn from_u8(bits: u8) -> Self {
+		Self(bits)
+	}
 
-    pub const fn as_u8(self) -> u8 {
-        self.0
-    }
+	pub const fn as_u8(self) -> u8 {
+		self.0
+	}
 
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
+	pub const fn is_empty(self) -> bool {
+		self.0 == 0
+	}
 
-    pub fn with(mut self, tier: TransportTier) -> Self {
-        self.0 |= tier.bit();
-        self
-    }
+	pub fn with(mut self, tier: TransportTier) -> Self {
+		self.0 |= tier.bit();
+		self
+	}
 
-    pub fn contains(self, tier: TransportTier) -> bool {
-        self.0 & tier.bit() != 0
-    }
+	pub fn contains(self, tier: TransportTier) -> bool {
+		self.0 & tier.bit() != 0
+	}
 
-    /// Highest-priority tier present in the set, if any.
-    pub fn highest(self) -> Option<TransportTier> {
-        TransportTier::ALL.into_iter().find(|t| self.contains(*t))
-    }
+	/// Highest-priority tier present in the set, if any.
+	pub fn highest(self) -> Option<TransportTier> {
+		TransportTier::ALL.into_iter().find(|t| self.contains(*t))
+	}
 
-    /// Best tier supported by both sides — the negotiated choice
-    /// for a new connection.
-    pub fn best_common(self, other: TransportTierSet) -> Option<TransportTier> {
-        TransportTierSet(self.0 & other.0).highest()
-    }
+	/// Best tier supported by both sides — the negotiated choice
+	/// for a new connection.
+	pub fn best_common(self, other: TransportTierSet) -> Option<TransportTier> {
+		TransportTierSet(self.0 & other.0).highest()
+	}
 }
 
 // ============================================================
@@ -154,14 +154,14 @@ impl TransportTierSet {
 /// are flowing over QUIC, RDMA send queues, or a raw TLS socket.
 #[async_trait]
 pub trait TransportStream: AsyncRead + AsyncWrite + Unpin + Send {
-    /// Unique id within the owning connection. For QUIC this wraps
-    /// the peer-observable `quinn::StreamId`; RDMA providers will
-    /// synthesize a monotonic counter per queue pair.
-    fn stream_id(&self) -> u64;
+	/// Unique id within the owning connection. For QUIC this wraps
+	/// the peer-observable `quinn::StreamId`; RDMA providers will
+	/// synthesize a monotonic counter per queue pair.
+	fn stream_id(&self) -> u64;
 
-    /// Cleanly close the write side of the stream. Reads may
-    /// continue until the peer returns FIN on its direction.
-    async fn finish(&mut self) -> std::io::Result<()>;
+	/// Cleanly close the write side of the stream. Reads may
+	/// continue until the peer returns FIN on its direction.
+	async fn finish(&mut self) -> std::io::Result<()>;
 }
 
 /// One transport session between two nodes. Opaque to the higher
@@ -173,26 +173,26 @@ pub trait TransportStream: AsyncRead + AsyncWrite + Unpin + Send {
 /// trade against pushing an associated type through every call site.
 #[async_trait]
 pub trait TransportConnection: Send + Sync {
-    /// Open a new bidi stream toward the remote peer.
-    async fn open_bi(&self) -> std::io::Result<Box<dyn TransportStream>>;
+	/// Open a new bidi stream toward the remote peer.
+	async fn open_bi(&self) -> std::io::Result<Box<dyn TransportStream>>;
 
-    /// Accept the next bidi stream the peer has opened.
-    async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>>;
+	/// Accept the next bidi stream the peer has opened.
+	async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>>;
 
-    /// Peer identity. Used as the cache key in the factory and as
-    /// the attribution target for `RPCError::RemoteError`.
-    fn remote_id(&self) -> NodeId;
+	/// Peer identity. Used as the cache key in the factory and as
+	/// the attribution target for `RPCError::RemoteError`.
+	fn remote_id(&self) -> NodeId;
 
-    /// Which tier this connection is actually running over. A node
-    /// whose advertised `TransportTierSet` contains Tier 0 may
-    /// still end up with a Tier 1 connection if negotiation fell
-    /// back — the caller reads the real answer from here.
-    fn transport_type(&self) -> TransportTier;
+	/// Which tier this connection is actually running over. A node
+	/// whose advertised `TransportTierSet` contains Tier 0 may
+	/// still end up with a Tier 1 connection if negotiation fell
+	/// back — the caller reads the real answer from here.
+	fn transport_type(&self) -> TransportTier;
 
-    /// Whether the session has terminated (locally or by the peer).
-    /// Cached connections that report `true` should be dropped and
-    /// re-dialed on the next RPC.
-    fn is_closed(&self) -> bool;
+	/// Whether the session has terminated (locally or by the peer).
+	/// Cached connections that report `true` should be dropped and
+	/// re-dialed on the next RPC.
+	fn is_closed(&self) -> bool;
 }
 
 // ============================================================
@@ -209,11 +209,11 @@ pub trait TransportConnection: Send + Sync {
 /// in by hand.
 #[async_trait]
 pub trait TransportProvider: Send + Sync {
-    async fn connect(
-        &self,
-        target: NodeId,
-        address: &str,
-    ) -> std::io::Result<Arc<dyn TransportConnection>>;
+	async fn connect(
+		&self,
+		target: NodeId,
+		address: &str,
+	) -> std::io::Result<Arc<dyn TransportConnection>>;
 }
 
 // ============================================================
@@ -230,26 +230,26 @@ pub trait TransportProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum NodeRole {
-    /// Accepts Data Ring traffic — writes, reads, and pushdown
-    /// queries land here. The Unified Hash Ring walks this role
-    /// when resolving replica sets.
-    Data = 0,
-    /// Raft voting member. Only these nodes accept RPCs from the
-    /// consensus layer; clients never route by this role.
-    Control = 1,
-    /// Terminates L2 traffic (object-store shuffling, cold-tier
-    /// backfill). Reserved so the bit position stays stable even
-    /// before the L2 router lands.
-    L2 = 2,
+	/// Accepts Data Ring traffic — writes, reads, and pushdown
+	/// queries land here. The Unified Hash Ring walks this role
+	/// when resolving replica sets.
+	Data = 0,
+	/// Raft voting member. Only these nodes accept RPCs from the
+	/// consensus layer; clients never route by this role.
+	Control = 1,
+	/// Terminates L2 traffic (object-store shuffling, cold-tier
+	/// backfill). Reserved so the bit position stays stable even
+	/// before the L2 router lands.
+	L2 = 2,
 }
 
 impl NodeRole {
-    pub const ALL: [NodeRole; 3] = [NodeRole::Data, NodeRole::Control, NodeRole::L2];
+	pub const ALL: [NodeRole; 3] = [NodeRole::Data, NodeRole::Control, NodeRole::L2];
 
-    #[inline]
-    const fn bit(self) -> u8 {
-        1u8 << (self as u8)
-    }
+	#[inline]
+	const fn bit(self) -> u8 {
+		1u8 << (self as u8)
+	}
 }
 
 /// Compact bitmask of advertised roles. One byte per node — lives
@@ -260,30 +260,30 @@ impl NodeRole {
 pub struct NodeRoleSet(u8);
 
 impl NodeRoleSet {
-    pub const fn empty() -> Self {
-        Self(0)
-    }
+	pub const fn empty() -> Self {
+		Self(0)
+	}
 
-    pub const fn from_u8(bits: u8) -> Self {
-        Self(bits)
-    }
+	pub const fn from_u8(bits: u8) -> Self {
+		Self(bits)
+	}
 
-    pub const fn as_u8(self) -> u8 {
-        self.0
-    }
+	pub const fn as_u8(self) -> u8 {
+		self.0
+	}
 
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
+	pub const fn is_empty(self) -> bool {
+		self.0 == 0
+	}
 
-    pub fn with(mut self, role: NodeRole) -> Self {
-        self.0 |= role.bit();
-        self
-    }
+	pub fn with(mut self, role: NodeRole) -> Self {
+		self.0 |= role.bit();
+		self
+	}
 
-    pub fn contains(self, role: NodeRole) -> bool {
-        self.0 & role.bit() != 0
-    }
+	pub fn contains(self, role: NodeRole) -> bool {
+		self.0 & role.bit() != 0
+	}
 }
 
 // ============================================================
@@ -303,14 +303,14 @@ impl NodeRoleSet {
 /// for QUIC/TCP; a GID + QPN pair for RDMA).
 #[derive(Debug, Clone)]
 pub struct PeerCapabilities {
-    pub address: String,
-    pub tiers: TransportTierSet,
-    /// Roles the peer accepts traffic for. Routing layers filter
-    /// the Unified Hash Ring (ADR 002) by the role they care
-    /// about — Data for replica placement, Control for Raft RPCs.
-    /// Defaults to an empty set so a peer that elects not to
-    /// serve any role is addressable but unreachable for routing.
-    pub roles: NodeRoleSet,
+	pub address: String,
+	pub tiers: TransportTierSet,
+	/// Roles the peer accepts traffic for. Routing layers filter
+	/// the Unified Hash Ring (ADR 002) by the role they care
+	/// about — Data for replica placement, Control for Raft RPCs.
+	/// Defaults to an empty set so a peer that elects not to
+	/// serve any role is addressable but unreachable for routing.
+	pub roles: NodeRoleSet,
 }
 
 /// Projection of Raft `ring(E)` into the shape the transport
@@ -325,20 +325,20 @@ pub struct PeerCapabilities {
 /// routing decisions.
 #[derive(Debug, Clone)]
 pub struct MembershipEpoch {
-    pub epoch: u64,
-    pub peers: HashMap<NodeId, PeerCapabilities>,
+	pub epoch: u64,
+	pub peers: HashMap<NodeId, PeerCapabilities>,
 }
 
 impl MembershipEpoch {
-    /// Empty seed epoch — the value the consensus layer should
-    /// publish into the watch channel before wiring anything into
-    /// it, so the factory's initial `borrow()` is always valid.
-    pub fn empty() -> Self {
-        Self {
-            epoch: 0,
-            peers: HashMap::new(),
-        }
-    }
+	/// Empty seed epoch — the value the consensus layer should
+	/// publish into the watch channel before wiring anything into
+	/// it, so the factory's initial `borrow()` is always valid.
+	pub fn empty() -> Self {
+		Self {
+			epoch: 0,
+			peers: HashMap::new(),
+		}
+	}
 }
 
 // ============================================================
@@ -355,16 +355,16 @@ impl MembershipEpoch {
 /// simpler in-memory resolver.
 #[async_trait]
 pub trait CapabilityResolver: Send + Sync {
-    /// Full lookup: address + tiers. The factory calls this before
-    /// every fresh dial.
-    async fn resolve(&self, node: NodeId) -> std::io::Result<PeerCapabilities>;
+	/// Full lookup: address + tiers. The factory calls this before
+	/// every fresh dial.
+	async fn resolve(&self, node: NodeId) -> std::io::Result<PeerCapabilities>;
 
-    /// Convenience accessor for callers that only care about
-    /// advertised tiers (e.g. capability-reporting endpoints).
-    /// Defaults to projecting out of [`Self::resolve`].
-    async fn tiers(&self, node: NodeId) -> std::io::Result<TransportTierSet> {
-        Ok(self.resolve(node).await?.tiers)
-    }
+	/// Convenience accessor for callers that only care about
+	/// advertised tiers (e.g. capability-reporting endpoints).
+	/// Defaults to projecting out of [`Self::resolve`].
+	async fn tiers(&self, node: NodeId) -> std::io::Result<TransportTierSet> {
+		Ok(self.resolve(node).await?.tiers)
+	}
 }
 
 /// [`CapabilityResolver`] backed by a `watch::Receiver` on the
@@ -378,29 +378,32 @@ pub trait CapabilityResolver: Send + Sync {
 /// *reacts* to changes; this resolver simply reads the latest
 /// value on demand.
 pub struct EpochCapabilityResolver {
-    rx: watch::Receiver<Arc<MembershipEpoch>>,
+	rx: watch::Receiver<Arc<MembershipEpoch>>,
 }
 
 impl EpochCapabilityResolver {
-    pub fn new(rx: watch::Receiver<Arc<MembershipEpoch>>) -> Self {
-        Self { rx }
-    }
+	pub fn new(rx: watch::Receiver<Arc<MembershipEpoch>>) -> Self {
+		Self { rx }
+	}
 }
 
 #[async_trait]
 impl CapabilityResolver for EpochCapabilityResolver {
-    async fn resolve(&self, node: NodeId) -> std::io::Result<PeerCapabilities> {
-        // `borrow()` hands back a borrow of the Arc; cloning the
-        // inner `PeerCapabilities` is cheaper than holding the
-        // borrow across the caller's next await.
-        let epoch = self.rx.borrow().clone();
-        epoch.peers.get(&node).cloned().ok_or_else(|| {
-            Error::new(
-                ErrorKind::NotFound,
-                format!("peer {node:?} not present in membership epoch {}", epoch.epoch),
-            )
-        })
-    }
+	async fn resolve(&self, node: NodeId) -> std::io::Result<PeerCapabilities> {
+		// `borrow()` hands back a borrow of the Arc; cloning the
+		// inner `PeerCapabilities` is cheaper than holding the
+		// borrow across the caller's next await.
+		let epoch = self.rx.borrow().clone();
+		epoch.peers.get(&node).cloned().ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"peer {node:?} not present in membership epoch {}",
+					epoch.epoch
+				),
+			)
+		})
+	}
 }
 
 // ============================================================
@@ -425,65 +428,65 @@ impl CapabilityResolver for EpochCapabilityResolver {
 /// the LKey remains valid; if the Vec reallocates, the RDMA path
 /// must re-register before the next work request.
 pub trait PoolRegistrar: Send + Sync {
-    /// Pin `buf`'s memory with the fabric and stash the returned
-    /// LKey on the buffer. Returns the key for the caller's
-    /// convenience, or `None` if this transport does not require
-    /// registration.
-    fn register(&self, buf: &mut PooledBuf) -> std::io::Result<Option<NonZeroU32>>;
+	/// Pin `buf`'s memory with the fabric and stash the returned
+	/// LKey on the buffer. Returns the key for the caller's
+	/// convenience, or `None` if this transport does not require
+	/// registration.
+	fn register(&self, buf: &mut PooledBuf) -> std::io::Result<Option<NonZeroU32>>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn tier_bits_are_disjoint() {
-        let set = TransportTierSet::empty()
-            .with(TransportTier::RdmaRoceV2)
-            .with(TransportTier::QuicIoUring)
-            .with(TransportTier::TcpTls);
-        assert_eq!(set.as_u8(), 0b0000_0111);
-    }
+	#[test]
+	fn tier_bits_are_disjoint() {
+		let set = TransportTierSet::empty()
+			.with(TransportTier::RdmaRoceV2)
+			.with(TransportTier::QuicIoUring)
+			.with(TransportTier::TcpTls);
+		assert_eq!(set.as_u8(), 0b0000_0111);
+	}
 
-    #[test]
-    fn highest_prefers_lowest_discriminant() {
-        let set = TransportTierSet::empty()
-            .with(TransportTier::TcpTls)
-            .with(TransportTier::QuicIoUring);
-        assert_eq!(set.highest(), Some(TransportTier::QuicIoUring));
-    }
+	#[test]
+	fn highest_prefers_lowest_discriminant() {
+		let set = TransportTierSet::empty()
+			.with(TransportTier::TcpTls)
+			.with(TransportTier::QuicIoUring);
+		assert_eq!(set.highest(), Some(TransportTier::QuicIoUring));
+	}
 
-    #[test]
-    fn best_common_intersects_and_ranks() {
-        let ours = TransportTierSet::empty()
-            .with(TransportTier::QuicIoUring)
-            .with(TransportTier::TcpTls);
-        let theirs = TransportTierSet::empty()
-            .with(TransportTier::RdmaRoceV2)
-            .with(TransportTier::TcpTls);
-        assert_eq!(ours.best_common(theirs), Some(TransportTier::TcpTls));
-    }
+	#[test]
+	fn best_common_intersects_and_ranks() {
+		let ours = TransportTierSet::empty()
+			.with(TransportTier::QuicIoUring)
+			.with(TransportTier::TcpTls);
+		let theirs = TransportTierSet::empty()
+			.with(TransportTier::RdmaRoceV2)
+			.with(TransportTier::TcpTls);
+		assert_eq!(ours.best_common(theirs), Some(TransportTier::TcpTls));
+	}
 
-    #[test]
-    fn best_common_empty_intersection_is_none() {
-        let ours = TransportTierSet::empty().with(TransportTier::RdmaRoceV2);
-        let theirs = TransportTierSet::empty().with(TransportTier::TcpTls);
-        assert_eq!(ours.best_common(theirs), None);
-    }
+	#[test]
+	fn best_common_empty_intersection_is_none() {
+		let ours = TransportTierSet::empty().with(TransportTier::RdmaRoceV2);
+		let theirs = TransportTierSet::empty().with(TransportTier::TcpTls);
+		assert_eq!(ours.best_common(theirs), None);
+	}
 
-    #[test]
-    fn contains_only_the_tiers_added() {
-        let set = TransportTierSet::empty().with(TransportTier::QuicIoUring);
-        assert!(set.contains(TransportTier::QuicIoUring));
-        assert!(!set.contains(TransportTier::RdmaRoceV2));
-        assert!(!set.contains(TransportTier::TcpTls));
-    }
+	#[test]
+	fn contains_only_the_tiers_added() {
+		let set = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		assert!(set.contains(TransportTier::QuicIoUring));
+		assert!(!set.contains(TransportTier::RdmaRoceV2));
+		assert!(!set.contains(TransportTier::TcpTls));
+	}
 
-    #[test]
-    fn from_u8_round_trips() {
-        let set = TransportTierSet::empty()
-            .with(TransportTier::RdmaRoceV2)
-            .with(TransportTier::TcpTls);
-        assert_eq!(TransportTierSet::from_u8(set.as_u8()), set);
-    }
+	#[test]
+	fn from_u8_round_trips() {
+		let set = TransportTierSet::empty()
+			.with(TransportTier::RdmaRoceV2)
+			.with(TransportTier::TcpTls);
+		assert_eq!(TransportTierSet::from_u8(set.as_u8()), set);
+	}
 }
