@@ -10,10 +10,11 @@
 //!
 //! The slab is the durability boundary for *one* node; quorum is
 //! the durability boundary for *the write*. The fan-out wraps
-//! [`SlabManager::append`] so the local append and the remote
-//! replica appends both count toward quorum under the same
-//! majority rule. Payload bytes never enter the Raft log — only
-//! the finalization marker does, per the Stellarator invariant.
+//! the slab append-plus-flush path so the local replica and the
+//! remote replicas count toward quorum only after their payload
+//! bytes are durably flushed. Payload bytes never enter the Raft
+//! log — only the finalization marker does, per the Stellarator
+//! invariant.
 //!
 //! ## V1 scope
 //!
@@ -26,7 +27,7 @@
 //!   factory already collapses duplicate dials per peer, so we
 //!   spawn one task per remote replica without extra coordination.
 //! * Quorum = `(RF / 2) + 1`. If the local node is in the replica
-//!   set, its slab append counts as one ack.
+//!   set, its append-plus-flush counts as one durable ack.
 //!
 //! ## Idempotency
 //!
@@ -50,8 +51,8 @@ use crate::schema::{
     migration_record_schema, wpbc, Consistency, FinalizationMarker, FrameHeader, HybridTimestamp,
     LeaseDescriptor, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
     MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta,
-    ReadStatus, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
-    WriteResponseMeta, WriteStatus,
+    ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
+    WriteRequestMeta, WriteResponseMeta, WriteStatus,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
 use crate::storage::manager::SlabManager;
@@ -124,11 +125,7 @@ impl MigrationRegistry {
     /// clone and safe to hold across `.await`. Every caller for a
     /// given `(migration_id, key_hash)` observes the same lock, so
     /// at most one pull is in flight per key.
-    pub fn gate(
-        &self,
-        migration_id: u64,
-        key_hash: u64,
-    ) -> Arc<tokio::sync::Mutex<()>> {
+    pub fn gate(&self, migration_id: u64, key_hash: u64) -> Arc<tokio::sync::Mutex<()>> {
         self.inflight
             .entry((migration_id, key_hash))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -247,9 +244,7 @@ impl ReplicaRouter for StaticReplicaRouter {
         let n = self.nodes.len();
         let take = self.rf.min(n);
         let start = (key_hash as usize) % n;
-        (0..take)
-            .map(|i| self.nodes[(start + i) % n])
-            .collect()
+        (0..take).map(|i| self.nodes[(start + i) % n]).collect()
     }
 
     fn replication_factor(&self) -> usize {
@@ -414,7 +409,10 @@ impl WendelonDataServer {
     /// call this — the manager is the sole writer of real leases.
     #[cfg(test)]
     pub fn seed_lease_for_test(&self, lease: LeaseDescriptor) {
-        self.leases.write().expect("lease cache poisoned").push(lease);
+        self.leases
+            .write()
+            .expect("lease cache poisoned")
+            .push(lease);
     }
 
     /// Inspect the lease cache for a valid lease that covers
@@ -543,7 +541,9 @@ impl WendelonDataServer {
         tokio::spawn(async move {
             // Seed immediately so the cache is warm before the gate
             // is flipped on elsewhere in the bootstrap sequence.
-            let _ = self.refresh_leases_once(&ring, clock.as_ref(), ttl_ms).await;
+            let _ = self
+                .refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
+                .await;
             let mut ticker = tokio::time::interval(tick);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -555,7 +555,9 @@ impl WendelonDataServer {
                     }
                     _ = ticker.tick() => {}
                 }
-                let _ = self.refresh_leases_once(&ring, clock.as_ref(), ttl_ms).await;
+                let _ = self
+                    .refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
+                    .await;
             }
         })
     }
@@ -563,15 +565,16 @@ impl WendelonDataServer {
     /// Fan-out write to a single remote replica. Opens one bidi
     /// stream, ships the REPLICATE_REQ frame, and awaits the
     /// REPLICATE_RESP. Every failure — dial, send, protocol,
-    /// negative ack — surfaces as `Err` so the caller can simply
-    /// count `Ok` results as acks.
+    /// negative ack — surfaces as `Err`; successful responses carry
+    /// an explicit acknowledgement level so the caller can count
+    /// only durable acks toward quorum.
     async fn replicate_to_remote(
         factory: Arc<TransportProviderFactory>,
         pool: Arc<BufPool>,
         target: NodeId,
         meta: ReplicaWriteMeta,
         arrow_bytes: Arc<Vec<u8>>,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<ReplicaAckLevel> {
         let conn = factory.get_connection(target).await?;
         let mut stream = conn.open_bi().await?;
 
@@ -623,7 +626,7 @@ impl WendelonDataServer {
                 format!("replica {target:?} rejected write: status={}", ack.status.0),
             ));
         }
-        Ok(())
+        Ok(ack.ack_level)
     }
 
     /// Handle an inbound QUERY_REQ frame (ADR 005 pushdown scan).
@@ -682,7 +685,8 @@ impl WendelonDataServer {
             .await?;
 
         let mut body = self.pool.acquire();
-        body.as_mut_vec().extend_from_slice(bytemuck::bytes_of(&resp_meta));
+        body.as_mut_vec()
+            .extend_from_slice(bytemuck::bytes_of(&resp_meta));
         let arrow_payload = arrow_bytes.map(|bytes| {
             let mut buf = self.pool.acquire();
             buf.as_mut_vec().extend_from_slice(&bytes);
@@ -740,9 +744,8 @@ impl WendelonDataServer {
                 "MIGRATE_REQ meta too small",
             ));
         }
-        let meta: MigrateRequestMeta = *bytemuck::from_bytes(
-            &frame.meta[..std::mem::size_of::<MigrateRequestMeta>()],
-        );
+        let meta: MigrateRequestMeta =
+            *bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<MigrateRequestMeta>()]);
 
         let sm = self.state_machine.state_snapshot().await;
         let (resp_meta, arrow_bytes) = match sm.migrations.get(&meta.migration_id) {
@@ -1176,12 +1179,7 @@ impl WendelonDataServer {
 
         // Gate #1: epoch staleness. The authoritative epoch is the
         // highest one the SM has observed an E_safe advance for.
-        let current_epoch = sm_peek
-            .e_safe_watermarks
-            .keys()
-            .copied()
-            .max()
-            .unwrap_or(0);
+        let current_epoch = sm_peek.e_safe_watermarks.keys().copied().max().unwrap_or(0);
         if meta.expected_epoch < current_epoch {
             return Ok((
                 query_error_meta(meta, ReadStatus::EPOCH_STALE, self.local_node),
@@ -1234,11 +1232,7 @@ impl WendelonDataServer {
                 // rather than downgrading to a possibly-partial
                 // local answer.
                 return Ok((
-                    query_error_meta(
-                        meta,
-                        ReadStatus::MIGRATION_INCOMPLETE,
-                        self.local_node,
-                    ),
+                    query_error_meta(meta, ReadStatus::MIGRATION_INCOMPLETE, self.local_node),
                     None,
                 ));
             }
@@ -1300,9 +1294,8 @@ impl WendelonDataServer {
                 "MIGRATE_RESP meta too small",
             ));
         }
-        let resp_meta: MigrateResponseMeta = *bytemuck::from_bytes(
-            &resp.meta[..std::mem::size_of::<MigrateResponseMeta>()],
-        );
+        let resp_meta: MigrateResponseMeta =
+            *bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<MigrateResponseMeta>()]);
 
         let records = match resp.arrow_payload.as_ref() {
             Some(bytes) if !bytes.is_empty() => decode_migration_records(bytes)?,
@@ -1325,9 +1318,8 @@ impl WendelonDataServer {
                 "REPLICATE_REQ meta too small",
             ));
         }
-        let meta: ReplicaWriteMeta = *bytemuck::from_bytes(
-            &frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()],
-        );
+        let meta: ReplicaWriteMeta =
+            *bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()]);
         // Peer liveness/drift ingestion (ADR 001, ADR 012). The HLC
         // originator in `commit_hlc.node_id` is another Data Ring
         // member, so its physical_ms feeds directly into the
@@ -1347,22 +1339,23 @@ impl WendelonDataServer {
         })?;
 
         let arrow_bytes: &[u8] = &arrow[..];
-        let status = if blake3_32(arrow_bytes) != meta.payload_hash {
-            ReplicaWriteStatus::HASH_MISMATCH
+        let (status, ack_level) = if blake3_32(arrow_bytes) != meta.payload_hash {
+            (ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
         } else {
             match self
                 .slab
-                .append(meta.key_hash, meta.commit_hlc, arrow_bytes)
+                .append_durable(meta.key_hash, meta.commit_hlc, arrow_bytes)
                 .await
             {
-                Ok(_) => ReplicaWriteStatus::OK,
-                Err(_) => ReplicaWriteStatus::INTERNAL_ERROR,
+                Ok(_) => (ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE),
+                Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
             }
         };
 
         let resp = ReplicaWriteRespMeta {
             status,
-            _pad: [0; 7],
+            ack_level,
+            _pad: [0; 6],
         };
         let mut body = self.pool.acquire();
         body.as_mut_vec()
@@ -1418,7 +1411,10 @@ impl DataRing for WendelonDataServer {
     ) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
         // 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
         if meta.proxy_hop >= 2 {
-            return Ok((error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node), None));
+            return Ok((
+                error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
+                None,
+            ));
         }
 
         // 2. Epoch validation. The authoritative current epoch is
@@ -1428,7 +1424,10 @@ impl DataRing for WendelonDataServer {
         let sm = self.state_machine.state_snapshot().await;
         let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
         if meta.expected_epoch < current_epoch {
-            return Ok((error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node), None));
+            return Ok((
+                error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
+                None,
+            ));
         }
 
         // 3. Idempotency fast path.
@@ -1496,22 +1495,24 @@ impl DataRing for WendelonDataServer {
         let rf = replicas.len();
         let quorum = (rf / 2) + 1;
 
-        // 8. Local append (if this node is in the replica set) and
-        // concurrent fan-out to the remaining replicas. Each remote
-        // leg runs on its own task so head-of-line blocking on any
-        // single peer only slows *that* leg — the quorum race still
-        // completes as soon as the first majority of acks arrive.
-        let mut acks: usize = 0;
+        // 8. Local append+flush (if this node is in the replica
+        // set) and concurrent fan-out to the remaining replicas.
+        // Each remote leg runs on its own task so head-of-line
+        // blocking on any single peer only slows *that* leg — the
+        // quorum race still completes as soon as the first majority
+        // of durable acks arrive.
+        let mut durable_acks: usize = 0;
         let local_is_replica = replicas.iter().any(|n| n.id == self.local_node.id);
         if local_is_replica {
-            // The io_uring append is the hot path — drive it first
-            // so the local leg is usually the fastest ack.
+            // Drive the local durable path first so the leader's
+            // own slab is either flushed or the write aborts before
+            // we race any remote finalization condition.
             match self
                 .slab
-                .append(key_hash, commit_hlc, frame_bytes.as_slice())
+                .append_durable(key_hash, commit_hlc, frame_bytes.as_slice())
                 .await
             {
-                Ok(_) => acks += 1,
+                Ok(_) => durable_acks += 1,
                 Err(e) => {
                     // A local durability failure is terminal — we
                     // cannot finalize a write we could not even put
@@ -1529,7 +1530,7 @@ impl DataRing for WendelonDataServer {
             key_hash,
             payload_hash,
         };
-        let mut join: JoinSet<std::io::Result<()>> = JoinSet::new();
+        let mut join: JoinSet<std::io::Result<ReplicaAckLevel>> = JoinSet::new();
         for target in replicas.iter().copied() {
             if target.id == self.local_node.id {
                 continue;
@@ -1546,15 +1547,16 @@ impl DataRing for WendelonDataServer {
         // in — outstanding tasks keep running to completion so
         // slower replicas still catch up, but we do not block the
         // client on them.
-        while acks < quorum {
+        while durable_acks < quorum {
             match join.join_next().await {
-                Some(Ok(Ok(()))) => acks += 1,
+                Some(Ok(Ok(level))) if level == ReplicaAckLevel::DURABLE => durable_acks += 1,
+                Some(Ok(Ok(_))) => { /* append-only/non-durable ack */ }
                 Some(_) => { /* leg failed — keep racing */ }
                 None => break, // no more remote legs in flight
             }
         }
 
-        if acks < quorum {
+        if durable_acks < quorum {
             return Ok((
                 error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
                 None,
@@ -1775,7 +1777,10 @@ pub(crate) async fn execute_query_plan(
     let sm = state_machine.state_snapshot().await;
     let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
     if meta.expected_epoch < current_epoch {
-        return Ok((query_error_meta(meta, ReadStatus::EPOCH_STALE, local_node), None));
+        return Ok((
+            query_error_meta(meta, ReadStatus::EPOCH_STALE, local_node),
+            None,
+        ));
     }
 
     // 2. LINEARIZABLE gate — the scan is only authoritative once
@@ -1804,8 +1809,7 @@ pub(crate) async fn execute_query_plan(
     // `wpbc::execute` already does this internally per call, but
     // we mirror the pattern so a follow-up that batches rows can
     // lift the compile out of the loop without touching semantics.
-    let locations =
-        slab.scan_as_of(meta.key_range_start, meta.key_range_end, meta.as_of_hlc);
+    let locations = slab.scan_as_of(meta.key_range_start, meta.key_range_end, meta.as_of_hlc);
 
     let mut filtered: Vec<RecordBatch> = Vec::new();
     let mut max_hlc = HybridTimestamp {
@@ -1922,9 +1926,7 @@ fn migrate_error_meta(
 /// Arrow IPC stream over [`migration_record_schema`]. `payload_hash`
 /// is computed here — receivers use it to fast-path
 /// `append_migration` idempotency without re-hashing themselves.
-fn encode_migration_records(
-    rows: &[(u64, RecordLocation, Vec<u8>)],
-) -> std::io::Result<Vec<u8>> {
+fn encode_migration_records(rows: &[(u64, RecordLocation, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
     let mut key_hash = UInt64Builder::with_capacity(rows.len());
     let mut hlc_phys = UInt64Builder::with_capacity(rows.len());
     let mut hlc_log = UInt32Builder::with_capacity(rows.len());
@@ -2115,12 +2117,15 @@ fn extract_first_binary<'a>(
     let col = batch
         .column_by_name(column)
         .ok_or_else(|| Error::new(ErrorKind::InvalidData, format!("missing '{column}' column")))?;
-    let arr = col.as_any().downcast_ref::<LargeBinaryArray>().ok_or_else(|| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("'{column}' column is not LargeBinary"),
-        )
-    })?;
+    let arr = col
+        .as_any()
+        .downcast_ref::<LargeBinaryArray>()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("'{column}' column is not LargeBinary"),
+            )
+        })?;
     if arr.is_empty() {
         return Err(Error::new(
             ErrorKind::InvalidData,
@@ -2290,8 +2295,7 @@ mod tests {
 
     #[test]
     fn static_router_dedups_and_sorts() {
-        let router =
-            StaticReplicaRouter::new(vec![n(3), n(1), n(3), n(2)], 5);
+        let router = StaticReplicaRouter::new(vec![n(3), n(1), n(3), n(2)], 5);
         let replicas = router.replicas(0);
         assert_eq!(replicas.len(), 3);
         assert_eq!(replicas[0], n(1));
@@ -2341,8 +2345,9 @@ mod tests {
         seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"v3").await;
 
         let sm = WendelonStateMachine::new();
-        let (resp, arrow) =
-            execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[]).await.unwrap();
+        let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::OK);
         assert_eq!(resp.rows, 3);
         assert_eq!(resp.value_hlc, hlc(3, 0, 1));
@@ -2362,7 +2367,9 @@ mod tests {
         let mut meta = base_meta();
         meta.key_range_start = 10;
         meta.key_range_end = 50;
-        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::OK);
         assert_eq!(resp.rows, 1);
     }
@@ -2371,8 +2378,9 @@ mod tests {
     async fn query_empty_scan_returns_key_not_found() {
         let mgr = make_manager().await;
         let sm = WendelonStateMachine::new();
-        let (resp, arrow) =
-            execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[]).await.unwrap();
+        let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::KEY_NOT_FOUND);
         assert_eq!(resp.rows, 0);
         assert_eq!(resp.arrow_len, 0);
@@ -2388,8 +2396,9 @@ mod tests {
         let mut meta = base_meta();
         meta.consistency = Consistency::LINEARIZABLE;
         meta.min_hlc = hlc(5, 0, 0);
-        let (resp, arrow) =
-            execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::E_SAFE_BEHIND);
         assert_eq!(resp.leader_hint, n(1));
         assert!(arrow.is_none());
@@ -2404,7 +2413,9 @@ mod tests {
         let mut meta = base_meta();
         meta.consistency = Consistency::LINEARIZABLE;
         meta.min_hlc = hlc(5, 0, 1);
-        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::OK);
         assert_eq!(resp.rows, 1);
     }
@@ -2419,7 +2430,9 @@ mod tests {
         sm.seed_e_safe_for_test(7, hlc(1, 0, 1)).await;
         let mut meta = base_meta();
         meta.expected_epoch = 3;
-        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[]).await.unwrap();
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[])
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::EPOCH_STALE);
         assert_eq!(resp.leader_hint, n(1));
     }
@@ -2433,14 +2446,11 @@ mod tests {
         // schema via direct slab.append.
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("age", DataType::Int64, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
         let mgr = make_manager().await;
         for (key_hash, age) in [(1u64, 17i64), (2, 22), (3, 40)] {
             let ages = Int64Array::from(vec![age]);
-            let batch =
-                RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
             let bytes = encode_batch(&batch).unwrap();
             mgr.append(key_hash, hlc(age as u64, 0, 1), &bytes)
                 .await
@@ -2464,8 +2474,9 @@ mod tests {
         let sm = WendelonStateMachine::new();
         let mut meta = base_meta();
         meta.bytecode_len = bytecode.len() as u32;
-        let (resp, _) =
-            execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode).await.unwrap();
+        let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::OK);
         // Rows 2 (age 22) and 3 (age 40) survive; row 1 (age 17) drops.
         assert_eq!(resp.rows, 2);
@@ -2487,8 +2498,9 @@ mod tests {
         let sm = WendelonStateMachine::new();
         let mut meta = base_meta();
         meta.bytecode_len = bytecode.len() as u32;
-        let (resp, arrow) =
-            execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode).await.unwrap();
+        let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+            .await
+            .unwrap();
         assert_eq!(resp.status, ReadStatus::OK);
         assert_eq!(resp.rows, 2);
         let batch = decode_batch(&arrow.unwrap()).unwrap();
@@ -2587,11 +2599,7 @@ mod tests {
         .await
         .unwrap();
         // Force the cache empty so the gate can't find a lease.
-        node.data_server
-            .lease_cache()
-            .write()
-            .unwrap()
-            .clear();
+        node.data_server.lease_cache().write().unwrap().clear();
 
         let (resp, _) = node
             .data_server
@@ -2635,17 +2643,18 @@ mod tests {
         // Seed a lease from a prior epoch — the cache must drop it
         // on the next refresh tick because the current ring epoch
         // is 1, not 99.
-        node.data_server.seed_lease_for_test(crate::schema::LeaseDescriptor {
-            epoch: 99,
-            holder: node.local_node,
-            range_start: 0,
-            range_end: u64::MAX,
-            lease_start: hlc(0, 0, node.local_node.id),
-            lease_expiry: hlc(u64::MAX / 2, 0, node.local_node.id),
-            min_commit_index: 0,
-            signature: [0; 64],
-            _pad: [0; 8],
-        });
+        node.data_server
+            .seed_lease_for_test(crate::schema::LeaseDescriptor {
+                epoch: 99,
+                holder: node.local_node,
+                range_start: 0,
+                range_end: u64::MAX,
+                lease_start: hlc(0, 0, node.local_node.id),
+                lease_expiry: hlc(u64::MAX / 2, 0, node.local_node.id),
+                min_commit_index: 0,
+                signature: [0; 64],
+                _pad: [0; 8],
+            });
         // Give Raft a moment to elect and ring updater to seed.
         for _ in 0..64 {
             tokio::task::yield_now().await;
@@ -2795,8 +2804,7 @@ mod tests {
         let mut cursor_hlc: HybridTimestamp = hlc(0, 0, 0);
         let max_records: usize = 10;
         for _ in 0..15 {
-            let locations =
-                mgr.scan_all_versions_from(key, key, floor, cursor_hash, cursor_hlc);
+            let locations = mgr.scan_all_versions_from(key, key, floor, cursor_hash, cursor_hlc);
             if locations.is_empty() {
                 break;
             }
@@ -2915,7 +2923,11 @@ mod tests {
         let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
         keys.sort();
         keys.dedup();
-        assert_eq!(keys.len(), 100, "merged scan must cover 0..=99 exactly once");
+        assert_eq!(
+            keys.len(),
+            100,
+            "merged scan must cover 0..=99 exactly once"
+        );
         assert_eq!(*keys.first().unwrap(), 0);
         assert_eq!(*keys.last().unwrap(), 99);
     }
@@ -3277,7 +3289,7 @@ mod tests {
     use std::sync::atomic::{AtomicI32, Ordering as LoopbackOrdering};
     use std::task::{Context as TaskContext, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-    use tokio::sync::watch;
+    use tokio::sync::{watch, Mutex as TokioMutex};
 
     /// Registry of per-target HRFT services + fault knobs. The
     /// `LoopbackProvider` and every `LoopbackConnection` share this
@@ -3482,16 +3494,12 @@ mod tests {
         let _ = stream.shutdown().await;
     }
 
-    fn craft_internal_error_response(
-        frame: &HrftFrame,
-        pool: &Arc<BufPool>,
-    ) -> Option<HrftFrame> {
+    fn craft_internal_error_response(frame: &HrftFrame, pool: &Arc<BufPool>) -> Option<HrftFrame> {
         if frame.meta.len() < std::mem::size_of::<MigrateRequestMeta>() {
             return None;
         }
-        let req_meta: MigrateRequestMeta = *bytemuck::from_bytes(
-            &frame.meta[..std::mem::size_of::<MigrateRequestMeta>()],
-        );
+        let req_meta: MigrateRequestMeta =
+            *bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<MigrateRequestMeta>()]);
         let resp_meta = migrate_error_meta(&req_meta, MigrateStatus::INTERNAL_ERROR, ZERO_NODE);
         let mut body = pool.acquire();
         body.as_mut_vec()
@@ -3537,6 +3545,414 @@ mod tests {
                 handlers: self.handlers.clone(),
             }))
         }
+    }
+
+    struct FixedReplicaRouter {
+        routes: StdHashMap<u64, Vec<NodeId>>,
+        default: Vec<NodeId>,
+    }
+
+    impl FixedReplicaRouter {
+        fn new(default: Vec<NodeId>) -> Self {
+            Self {
+                routes: StdHashMap::new(),
+                default,
+            }
+        }
+
+        fn with_route(mut self, key_hash: u64, replicas: Vec<NodeId>) -> Self {
+            self.routes.insert(key_hash, replicas);
+            self
+        }
+    }
+
+    impl ReplicaRouter for FixedReplicaRouter {
+        fn replicas(&self, key_hash: u64) -> Vec<NodeId> {
+            self.routes
+                .get(&key_hash)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone())
+        }
+
+        fn replication_factor(&self) -> usize {
+            self.routes
+                .values()
+                .map(|replicas| replicas.len())
+                .chain(std::iter::once(self.default.len()))
+                .max()
+                .unwrap_or(1)
+        }
+    }
+
+    struct CrashyReplicaState {
+        manager: Arc<SlabManager>,
+        volatile_cutoffs: StdHashMap<u64, u64>,
+    }
+
+    /// Replica harness that appends to a real slab but deliberately
+    /// omits the durability barrier. Tests can then "crash" it by
+    /// truncating every recorded append-only tail and reopening the
+    /// manager from disk, which deterministically models a crash
+    /// between append and flush.
+    struct CrashyReplicaService {
+        dir: std::path::PathBuf,
+        io: crate::storage::io_uring::IoRingHandle,
+        max_slab_bytes: u64,
+        pool: Arc<BufPool>,
+        state: TokioMutex<CrashyReplicaState>,
+    }
+
+    impl CrashyReplicaService {
+        fn open(dir: std::path::PathBuf, pool: Arc<BufPool>) -> Arc<Self> {
+            let io = spawn_io_thread(64).unwrap();
+            let max_slab_bytes = 1 << 30;
+            let manager = Arc::new(
+                SlabManager::open(SlabManagerConfig {
+                    dir: dir.clone(),
+                    max_slab_bytes,
+                    io: io.clone(),
+                    l2: None,
+                })
+                .unwrap(),
+            );
+            Arc::new(Self {
+                dir,
+                io,
+                max_slab_bytes,
+                pool,
+                state: TokioMutex::new(CrashyReplicaState {
+                    manager,
+                    volatile_cutoffs: StdHashMap::new(),
+                }),
+            })
+        }
+
+        async fn manager(&self) -> Arc<SlabManager> {
+            self.state.lock().await.manager.clone()
+        }
+
+        async fn crash_and_recover(&self) {
+            let mut state = self.state.lock().await;
+            for (slab_id, cutoff) in state.volatile_cutoffs.drain() {
+                let path = self.dir.join(format!("slab_{slab_id:016x}.wnd"));
+                if !path.exists() {
+                    continue;
+                }
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_len(cutoff).unwrap();
+            }
+            state.manager = Arc::new(
+                SlabManager::open(SlabManagerConfig {
+                    dir: self.dir.clone(),
+                    max_slab_bytes: self.max_slab_bytes,
+                    io: self.io.clone(),
+                    l2: None,
+                })
+                .unwrap(),
+            );
+        }
+    }
+
+    #[async_trait]
+    impl HrftService for CrashyReplicaService {
+        async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+            if frame.header.msg_type != MsgType::REPLICATE_REQ.0 {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!(
+                        "crashy replica handles REPLICATE_REQ only, got msg_type=0x{:02x}",
+                        frame.header.msg_type
+                    ),
+                ));
+            }
+            if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "REPLICATE_REQ meta too small",
+                ));
+            }
+            let meta: ReplicaWriteMeta =
+                *bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()]);
+            let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "REPLICATE_REQ missing arrow payload",
+                )
+            })?;
+
+            let manager = self.manager().await;
+            let arrow_bytes: &[u8] = &arrow[..];
+            let (status, ack_level, location) = if blake3_32(arrow_bytes) != meta.payload_hash {
+                (
+                    ReplicaWriteStatus::HASH_MISMATCH,
+                    ReplicaAckLevel::NONE,
+                    None,
+                )
+            } else {
+                match manager
+                    .append(meta.key_hash, meta.commit_hlc, arrow_bytes)
+                    .await
+                {
+                    Ok(location) => (
+                        ReplicaWriteStatus::OK,
+                        ReplicaAckLevel::APPEND_ONLY,
+                        Some(location),
+                    ),
+                    Err(_) => (
+                        ReplicaWriteStatus::INTERNAL_ERROR,
+                        ReplicaAckLevel::NONE,
+                        None,
+                    ),
+                }
+            };
+
+            if let Some(location) = location {
+                let mut state = self.state.lock().await;
+                state
+                    .volatile_cutoffs
+                    .entry(location.slab_id)
+                    .and_modify(|cutoff| *cutoff = (*cutoff).min(location.offset))
+                    .or_insert(location.offset);
+            }
+
+            let resp = ReplicaWriteRespMeta {
+                status,
+                ack_level,
+                _pad: [0; 6],
+            };
+            let mut body = self.pool.acquire();
+            body.as_mut_vec()
+                .extend_from_slice(bytemuck::bytes_of(&resp));
+            Ok(Some(HrftFrame {
+                header: FrameHeader {
+                    magic: HRFT_MAGIC,
+                    version: 1,
+                    msg_type: MsgType::REPLICATE_RESP.0,
+                    flags: 0,
+                    stream_id: frame.header.stream_id,
+                    meta_len: body.len() as u32,
+                    arrow_len: 0,
+                    trailing_len: 0,
+                },
+                meta: body,
+                arrow_payload: None,
+                trailing: None,
+            }))
+        }
+    }
+
+    struct DurabilityFixture {
+        leader: Arc<WendelonDataServer>,
+        leader_slab: Arc<SlabManager>,
+        durable_slab: Arc<SlabManager>,
+        crashy: Arc<CrashyReplicaService>,
+        _leader_node: WendelonNode,
+        _durable_node: WendelonNode,
+        _epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+    }
+
+    async fn build_durability_fixture(
+        durable_key_hash: u64,
+        append_only_key_hash: u64,
+    ) -> DurabilityFixture {
+        let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            41,
+            bootstrap_tempdir("durability-leader"),
+            "loopback://41".into(),
+        ))
+        .await
+        .unwrap();
+        let durable_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            42,
+            bootstrap_tempdir("durability-durable"),
+            "loopback://42".into(),
+        ))
+        .await
+        .unwrap();
+
+        let leader_id = leader_node.local_node;
+        let durable_id = durable_node.local_node;
+        let crashy_id = n(43);
+        let pool = leader_node.pool.clone();
+        let handlers = LoopbackHandlers::new(pool.clone());
+        let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
+            handlers: handlers.clone(),
+            tier: TransportTier::QuicIoUring,
+        });
+
+        let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+        let roles = NodeRoleSet::empty().with(NodeRole::Data);
+        let mut peers = StdHashMap::new();
+        peers.insert(
+            leader_id,
+            PeerCapabilities {
+                address: "loopback://41".into(),
+                tiers,
+                roles,
+            },
+        );
+        peers.insert(
+            durable_id,
+            PeerCapabilities {
+                address: "loopback://42".into(),
+                tiers,
+                roles,
+            },
+        );
+        peers.insert(
+            crashy_id,
+            PeerCapabilities {
+                address: "loopback://43".into(),
+                tiers,
+                roles,
+            },
+        );
+        let epoch = MembershipEpoch { epoch: 1, peers };
+        let (epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+        let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+            crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+        );
+
+        let build_factory = || {
+            let mut providers: StdHashMap<TransportTier, Arc<dyn TransportProvider>> =
+                StdHashMap::new();
+            providers.insert(TransportTier::QuicIoUring, loopback_provider.clone());
+            TransportProviderFactory::new(tiers, providers, resolver.clone(), epoch_rx.clone())
+        };
+
+        let router: Arc<dyn ReplicaRouter> = Arc::new(
+            FixedReplicaRouter::new(vec![leader_id, durable_id, crashy_id])
+                .with_route(durable_key_hash, vec![leader_id, durable_id, crashy_id])
+                .with_route(append_only_key_hash, vec![leader_id, crashy_id]),
+        );
+
+        let leader = Arc::new(WendelonDataServer::new(
+            leader_node.slab.clone(),
+            leader_node.raft.clone(),
+            leader_node.state_machine.clone(),
+            leader_id,
+            router.clone(),
+            build_factory(),
+            pool.clone(),
+        ));
+        let durable_replica = Arc::new(WendelonDataServer::new(
+            durable_node.slab.clone(),
+            durable_node.raft.clone(),
+            durable_node.state_machine.clone(),
+            durable_id,
+            router,
+            build_factory(),
+            durable_node.pool.clone(),
+        ));
+        let durable_data_ring: Arc<dyn DataRingServer> = durable_replica;
+        let durable_service: Arc<dyn HrftService> = Arc::new(
+            MsgRouter::builder()
+                .with_data_ring(durable_data_ring)
+                .build(),
+        );
+        let crashy = CrashyReplicaService::open(fresh_dir("crashy-replica"), pool.clone());
+        let crashy_service: Arc<dyn HrftService> = crashy.clone();
+        handlers.register(durable_id, durable_service);
+        handlers.register(crashy_id, crashy_service);
+
+        DurabilityFixture {
+            leader,
+            leader_slab: leader_node.slab.clone(),
+            durable_slab: durable_node.slab.clone(),
+            crashy,
+            _leader_node: leader_node,
+            _durable_node: durable_node,
+            _epoch_tx: epoch_tx,
+        }
+    }
+
+    /// Plan 020 crash-model durability boundary.
+    ///
+    /// One replica intentionally acks `APPEND_ONLY`, then the test
+    /// crashes it by truncating the unflushed tail and reopening the
+    /// slab manager from disk. The leader must ignore that ack for
+    /// quorum durability:
+    ///
+    /// * a write with two real durable replicas (`leader` +
+    ///   `durable`) returns `OK` and still survives after the crashy
+    ///   replica loses its copy.
+    /// * a write with only `leader` durable plus the crashy
+    ///   append-only replica does not return `OK`, and after the
+    ///   simulated crash fewer than quorum copies remain.
+    #[tokio::test]
+    async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
+        let durable_key = b"durable-quorum";
+        let append_only_key = b"append-only";
+        let durable_key_hash = highway_hash(durable_key);
+        let append_only_key_hash = highway_hash(append_only_key);
+        let fx = build_durability_fixture(durable_key_hash, append_only_key_hash).await;
+
+        let durable_value = b"v-durable";
+        let mut durable_meta = simple_write_meta(1);
+        durable_meta.write_id.sequence_no = 101;
+        durable_meta.key_len = durable_key.len() as u32;
+        durable_meta.value_len = durable_value.len() as u32;
+        let (durable_resp, _) = fx
+            .leader
+            .write(durable_meta, kv_batch(durable_key, durable_value))
+            .await
+            .unwrap();
+        assert_eq!(durable_resp.status, WriteStatus::OK);
+
+        fx.crashy.crash_and_recover().await;
+
+        let crashy_after_ok = fx.crashy.manager().await;
+        let durable_survivors = [
+            fx.leader_slab.lookup(durable_key_hash).is_some(),
+            fx.durable_slab.lookup(durable_key_hash).is_some(),
+            crashy_after_ok.lookup(durable_key_hash).is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        assert_eq!(
+            durable_survivors, 2,
+            "only the two durably-acked replicas should retain the successful write"
+        );
+        assert!(
+            !crashy_after_ok.lookup(durable_key_hash).is_some(),
+            "append-only replica must lose its copy across the simulated crash"
+        );
+
+        let append_only_value = b"v-append-only";
+        let mut append_only_meta = simple_write_meta(1);
+        append_only_meta.write_id.sequence_no = 102;
+        append_only_meta.key_len = append_only_key.len() as u32;
+        append_only_meta.value_len = append_only_value.len() as u32;
+        let (append_only_resp, _) = fx
+            .leader
+            .write(
+                append_only_meta,
+                kv_batch(append_only_key, append_only_value),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            append_only_resp.status,
+            WriteStatus::INTERNAL_ERROR,
+            "leader must not treat append-only replica acks as quorum durable"
+        );
+
+        fx.crashy.crash_and_recover().await;
+
+        let crashy_after_fail = fx.crashy.manager().await;
+        let append_only_survivors = [
+            fx.leader_slab.lookup(append_only_key_hash).is_some(),
+            fx.durable_slab.lookup(append_only_key_hash).is_some(),
+            crashy_after_fail.lookup(append_only_key_hash).is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        assert_eq!(
+            append_only_survivors, 1,
+            "without durable quorum, the write must not survive on a quorum after crash recovery"
+        );
     }
 
     /// Three-node drain-all fixture.
@@ -3754,9 +4170,8 @@ mod tests {
         let dest_data_ring: Arc<dyn DataRingServer> = dest_ds.clone();
         let source_a_data_ring: Arc<dyn DataRingServer> = source_a_ds.clone();
         let source_b_data_ring: Arc<dyn DataRingServer> = source_b_ds.clone();
-        let dest_svc: Arc<dyn HrftService> = Arc::new(
-            MsgRouter::builder().with_data_ring(dest_data_ring).build(),
-        );
+        let dest_svc: Arc<dyn HrftService> =
+            Arc::new(MsgRouter::builder().with_data_ring(dest_data_ring).build());
         let source_a_svc: Arc<dyn HrftService> = Arc::new(
             MsgRouter::builder()
                 .with_data_ring(source_a_data_ring)

@@ -105,11 +105,7 @@ pub trait StorageEngine: Send + Sync {
     /// whose `hlc <= as_of_hlc`. A zero-valued `as_of_hlc` is the
     /// sentinel for "no upper bound" and falls through to the same
     /// behaviour as [`Self::lookup`].
-    fn lookup_as_of(
-        &self,
-        key_hash: u64,
-        as_of_hlc: HybridTimestamp,
-    ) -> Option<RecordLocation>;
+    fn lookup_as_of(&self, key_hash: u64, as_of_hlc: HybridTimestamp) -> Option<RecordLocation>;
 }
 
 /// A high-performance storage implementation using io_uring and O_DIRECT.
@@ -205,13 +201,29 @@ impl LocalSlabStore {
     /// `fsync` promotes the batch to durable.
     pub async fn fsync(&self) -> std::io::Result<()> {
         let reply = self.io.submit_fsync(self.fd).await?;
-        let completion = reply.await.map_err(|_| {
-            Error::new(ErrorKind::BrokenPipe, "io_uring reply channel closed")
-        })?;
+        let completion = reply
+            .await
+            .map_err(|_| Error::new(ErrorKind::BrokenPipe, "io_uring reply channel closed"))?;
         if completion.result < 0 {
             return Err(Error::from_raw_os_error(-completion.result));
         }
         Ok(())
+    }
+
+    /// Remove one exact record location from the slab-local index.
+    ///
+    /// This is a best-effort in-memory rollback used when an append
+    /// completed but the caller's required durability barrier failed.
+    pub(crate) fn rollback_index_entry(&self, key_hash: u64, location: RecordLocation) {
+        let should_remove_key = if let Some(mut versions) = self.index.get_mut(&key_hash) {
+            let removed = remove_version_exact(&mut versions, location);
+            removed && versions.is_empty()
+        } else {
+            false
+        };
+        if should_remove_key {
+            self.index.remove(&key_hash);
+        }
     }
 }
 
@@ -354,11 +366,7 @@ impl StorageEngine for LocalSlabStore {
         self.index.get(&key_hash).and_then(|v| v.last().copied())
     }
 
-    fn lookup_as_of(
-        &self,
-        key_hash: u64,
-        as_of_hlc: HybridTimestamp,
-    ) -> Option<RecordLocation> {
+    fn lookup_as_of(&self, key_hash: u64, as_of_hlc: HybridTimestamp) -> Option<RecordLocation> {
         let versions = self.index.get(&key_hash)?;
         newest_version_as_of(versions.value(), as_of_hlc)
     }
@@ -378,6 +386,23 @@ pub(crate) fn insert_version_sorted(versions: &mut Vec<RecordLocation>, loc: Rec
         Err(p) => p,
     };
     versions.insert(pos, loc);
+}
+
+/// Remove one exact location from a per-key version chain.
+///
+/// Returns `true` when an element was removed. Used by the durable
+/// append path to roll back the in-memory index if the post-append
+/// flush fails.
+pub(crate) fn remove_version_exact(
+    versions: &mut Vec<RecordLocation>,
+    loc: RecordLocation,
+) -> bool {
+    if let Some(pos) = versions.iter().position(|stored| *stored == loc) {
+        versions.remove(pos);
+        true
+    } else {
+        false
+    }
 }
 
 /// Shared "AS OF" resolver over an HLC-sorted version chain. The
@@ -608,22 +633,14 @@ mod tests {
 
     #[test]
     fn newest_version_as_of_with_zero_hlc_returns_latest() {
-        let versions = vec![
-            loc(hlc(10, 0), 0),
-            loc(hlc(20, 0), 1),
-            loc(hlc(30, 0), 2),
-        ];
+        let versions = vec![loc(hlc(10, 0), 0), loc(hlc(20, 0), 1), loc(hlc(30, 0), 2)];
         let latest = newest_version_as_of(&versions, hlc(0, 0)).unwrap();
         assert_eq!(latest.offset, 2);
     }
 
     #[test]
     fn newest_version_as_of_returns_version_at_or_before_bound() {
-        let versions = vec![
-            loc(hlc(10, 0), 0),
-            loc(hlc(20, 0), 1),
-            loc(hlc(30, 0), 2),
-        ];
+        let versions = vec![loc(hlc(10, 0), 0), loc(hlc(20, 0), 1), loc(hlc(30, 0), 2)];
         // Bound sits exactly on a version -> that version.
         assert_eq!(
             newest_version_as_of(&versions, hlc(20, 0)).unwrap().offset,

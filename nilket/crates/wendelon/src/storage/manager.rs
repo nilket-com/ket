@@ -42,7 +42,8 @@
 
 use crate::schema::HybridTimestamp;
 use crate::storage::core::{
-    insert_version_sorted, newest_version_as_of, LocalSlabStore, RecordLocation, StorageEngine,
+    insert_version_sorted, newest_version_as_of, remove_version_exact, LocalSlabStore,
+    RecordLocation, StorageEngine,
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
@@ -134,6 +135,57 @@ struct ManagerState {
 }
 
 impl SlabManager {
+    async fn append_on_target(
+        &self,
+        key_hash: u64,
+        hlc: HybridTimestamp,
+        frame: &[u8],
+    ) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
+        let slab = self.target_for_append().await?;
+        let location = slab.append(key_hash, hlc, frame).await?;
+        Ok((slab, location))
+    }
+
+    fn index_appended_location(&self, key_hash: u64, location: RecordLocation) {
+        self.key_index
+            .entry(key_hash)
+            .and_modify(|versions| insert_version_sorted(versions, location))
+            .or_insert_with(|| vec![location]);
+    }
+
+    fn rollback_indexed_location(&self, key_hash: u64, location: RecordLocation) {
+        let should_remove_key = if let Some(mut versions) = self.key_index.get_mut(&key_hash) {
+            let removed = remove_version_exact(&mut versions, location);
+            removed && versions.is_empty()
+        } else {
+            false
+        };
+        if should_remove_key {
+            self.key_index.remove(&key_hash);
+        }
+    }
+
+    /// Append a record and force the destination slab's durability
+    /// barrier before returning. The manager index is published only
+    /// after the `fsync` succeeds, so callers that require durable
+    /// visibility do not leak append-complete-but-unflushed writes
+    /// through the in-memory read path.
+    pub async fn append_durable(
+        &self,
+        key_hash: u64,
+        hlc: HybridTimestamp,
+        frame: &[u8],
+    ) -> std::io::Result<RecordLocation> {
+        let (slab, location) = self.append_on_target(key_hash, hlc, frame).await?;
+        if let Err(err) = slab.fsync().await {
+            slab.rollback_index_entry(key_hash, location);
+            self.rollback_indexed_location(key_hash, location);
+            return Err(err);
+        }
+        self.index_appended_location(key_hash, location);
+        Ok(location)
+    }
+
     /// Open or create a manager rooted at `config.dir`. The
     /// directory must already exist; the manager will not create
     /// it to avoid racing with operator tooling that also manages
@@ -284,10 +336,7 @@ impl SlabManager {
     ///   this call still holds its own reference, so its open fd
     ///   survives the unlink (Linux semantics) — zero downtime
     ///   for readers mid-flight.
-    pub async fn apply_tier_slab(
-        &self,
-        pointer: TieredSlabPointer,
-    ) -> std::io::Result<()> {
+    pub async fn apply_tier_slab(&self, pointer: TieredSlabPointer) -> std::io::Result<()> {
         let state = self.state.lock().await;
         // Idempotent: a replay of the Raft TierSlab entry must not
         // fail. If we're already tiered, accept the no-op.
@@ -588,16 +637,12 @@ impl StorageEngine for SlabManager {
         hlc: HybridTimestamp,
         frame: &[u8],
     ) -> std::io::Result<RecordLocation> {
-        let slab = self.target_for_append().await?;
-        let location = slab.append(key_hash, hlc, frame).await?;
+        let (_slab, location) = self.append_on_target(key_hash, hlc, frame).await?;
         // The per-slab `append` already pushed the new version onto
         // its local chain; mirror it into the manager's
         // authoritative multi-version index so `lookup` /
         // `lookup_as_of` stay O(1) without cross-slab scanning.
-        self.key_index
-            .entry(key_hash)
-            .and_modify(|versions| insert_version_sorted(versions, location))
-            .or_insert_with(|| vec![location]);
+        self.index_appended_location(key_hash, location);
         Ok(location)
     }
 
@@ -618,11 +663,7 @@ impl StorageEngine for SlabManager {
             .and_then(|v| v.last().copied())
     }
 
-    fn lookup_as_of(
-        &self,
-        key_hash: u64,
-        as_of_hlc: HybridTimestamp,
-    ) -> Option<RecordLocation> {
+    fn lookup_as_of(&self, key_hash: u64, as_of_hlc: HybridTimestamp) -> Option<RecordLocation> {
         let versions = self.key_index.get(&key_hash)?;
         newest_version_as_of(versions.value(), as_of_hlc)
     }
@@ -727,10 +768,7 @@ fn discover_slab_ids(dir: &Path) -> std::io::Result<Vec<u64>> {
 /// chain stays sorted globally even when older slabs contain
 /// versions that post-date newer slabs (a legal outcome of leader
 /// changes or cross-slab rewrites).
-fn drain_slab_index(
-    slab: &LocalSlabStore,
-    key_index: &DashMap<u64, Vec<RecordLocation>>,
-) {
+fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<u64, Vec<RecordLocation>>) {
     for entry in slab.index.iter() {
         let key = *entry.key();
         for loc in entry.value().iter() {
@@ -803,18 +841,9 @@ mod tests {
         mgr.append(key, hlc(20), b"v2").await.unwrap();
         mgr.append(key, hlc(30), b"v3").await.unwrap();
 
-        assert_eq!(
-            mgr.lookup_as_of(key, hlc(15)).unwrap().hlc.physical_ms,
-            10
-        );
-        assert_eq!(
-            mgr.lookup_as_of(key, hlc(20)).unwrap().hlc.physical_ms,
-            20
-        );
-        assert_eq!(
-            mgr.lookup_as_of(key, hlc(25)).unwrap().hlc.physical_ms,
-            20
-        );
+        assert_eq!(mgr.lookup_as_of(key, hlc(15)).unwrap().hlc.physical_ms, 10);
+        assert_eq!(mgr.lookup_as_of(key, hlc(20)).unwrap().hlc.physical_ms, 20);
+        assert_eq!(mgr.lookup_as_of(key, hlc(25)).unwrap().hlc.physical_ms, 20);
         // Bound before the first write -> nothing visible yet.
         assert!(mgr.lookup_as_of(key, hlc(5)).is_none());
     }
@@ -851,16 +880,10 @@ mod tests {
         let frame = b"payload-bytes";
         let hash: [u8; 32] = *blake3::hash(frame).as_bytes();
 
-        let first = mgr
-            .append_migration(7, key, ts, hash, frame)
-            .await
-            .unwrap();
+        let first = mgr.append_migration(7, key, ts, hash, frame).await.unwrap();
         assert!(matches!(first, MigrationIngestOutcome::Inserted(_)));
 
-        let second = mgr
-            .append_migration(7, key, ts, hash, frame)
-            .await
-            .unwrap();
+        let second = mgr.append_migration(7, key, ts, hash, frame).await.unwrap();
         assert!(matches!(second, MigrationIngestOutcome::Duplicate(_)));
 
         // Only one version at this (key, hlc) should exist.
