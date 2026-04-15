@@ -217,6 +217,76 @@ pub trait TransportProvider: Send + Sync {
 }
 
 // ============================================================
+//  NODE ROLES
+// ============================================================
+
+/// Cluster role a node advertises. Distinct from the transport
+/// tier — the tier says *how* to talk to a peer, the role says
+/// *what* the peer is willing to do once the stream is open.
+///
+/// The discriminant doubles as the bit position inside
+/// [`NodeRoleSet`] (`1u8 << role as u8`), so adding a new role
+/// is "pick the next free bit and update [`Self::ALL`]."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum NodeRole {
+    /// Accepts Data Ring traffic — writes, reads, and pushdown
+    /// queries land here. The Unified Hash Ring walks this role
+    /// when resolving replica sets.
+    Data = 0,
+    /// Raft voting member. Only these nodes accept RPCs from the
+    /// consensus layer; clients never route by this role.
+    Control = 1,
+    /// Terminates L2 traffic (object-store shuffling, cold-tier
+    /// backfill). Reserved so the bit position stays stable even
+    /// before the L2 router lands.
+    L2 = 2,
+}
+
+impl NodeRole {
+    pub const ALL: [NodeRole; 3] = [NodeRole::Data, NodeRole::Control, NodeRole::L2];
+
+    #[inline]
+    const fn bit(self) -> u8 {
+        1u8 << (self as u8)
+    }
+}
+
+/// Compact bitmask of advertised roles. One byte per node — lives
+/// next to [`TransportTierSet`] on [`PeerCapabilities`] and is
+/// projected out of the Raft `ring(E)` snapshot together with
+/// the tier bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeRoleSet(u8);
+
+impl NodeRoleSet {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn from_u8(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn with(mut self, role: NodeRole) -> Self {
+        self.0 |= role.bit();
+        self
+    }
+
+    pub fn contains(self, role: NodeRole) -> bool {
+        self.0 & role.bit() != 0
+    }
+}
+
+// ============================================================
 //  MEMBERSHIP SNAPSHOT
 // ============================================================
 
@@ -235,6 +305,12 @@ pub trait TransportProvider: Send + Sync {
 pub struct PeerCapabilities {
     pub address: String,
     pub tiers: TransportTierSet,
+    /// Roles the peer accepts traffic for. Routing layers filter
+    /// the Unified Hash Ring (ADR 002) by the role they care
+    /// about — Data for replica placement, Control for Raft RPCs.
+    /// Defaults to an empty set so a peer that elects not to
+    /// serve any role is addressable but unreachable for routing.
+    pub roles: NodeRoleSet,
 }
 
 /// Projection of Raft `ring(E)` into the shape the transport

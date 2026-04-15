@@ -20,12 +20,14 @@
 //! stream; everything else is a successful response carrying an
 //! `Err` inside.
 
-use crate::consensus::{WendelonRaft, WendelonTypeConfig};
+use crate::consensus::monitor::NodeTracker;
+use crate::consensus::{WendelonRaft, WendelonRequest, WendelonTypeConfig};
 use crate::network::core::{HrftFrame, HRFT_MAGIC};
 use crate::network::pool::BufPool;
 use crate::network::router::RaftInternalServer;
 use crate::network::wire;
-use crate::schema::{FrameHeader, MsgType};
+use crate::schema::{FrameHeader, MsgType, NodeId};
+use openraft::EntryPayload;
 use async_trait::async_trait;
 use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{
@@ -45,11 +47,29 @@ use std::sync::Arc;
 pub struct WendelonRaftInternalServer {
     raft: WendelonRaft,
     pool: Arc<BufPool>,
+    /// Optional liveness/drift tracker. When attached, every
+    /// inbound APPEND_ENTRIES_REQ feeds the leader's HLC (pulled
+    /// from any `Finalize` entries it carries) into the tracker —
+    /// so the drift monitor and eviction watchdog pick up
+    /// Raft-layer signal in addition to the data-plane.
+    tracker: Option<Arc<NodeTracker>>,
 }
 
 impl WendelonRaftInternalServer {
     pub fn new(raft: WendelonRaft, pool: Arc<BufPool>) -> Self {
-        Self { raft, pool }
+        Self {
+            raft,
+            pool,
+            tracker: None,
+        }
+    }
+
+    /// Builder-style tracker attachment. See [`Self::tracker`] on
+    /// the equivalent method in `WendelonDataServer` — same story:
+    /// production bootstrap wires it, tests skip it.
+    pub fn with_tracker(mut self, tracker: Arc<NodeTracker>) -> Self {
+        self.tracker = Some(tracker);
+        self
     }
 }
 
@@ -61,6 +81,24 @@ impl RaftInternalServer for WendelonRaftInternalServer {
             MsgType::APPEND_ENTRIES_REQ => {
                 let req: AppendEntriesRequest<WendelonTypeConfig> =
                     wire::decode(&frame.meta)?;
+                // Harvest peer HLCs from any `Finalize` entries
+                // before the request moves into openraft. Every
+                // FinalizationMarker carries the leader's commit
+                // HLC — exactly what the drift monitor wants.
+                if let Some(tracker) = &self.tracker {
+                    for entry in &req.entries {
+                        if let EntryPayload::Normal(
+                            WendelonRequest::Finalize(marker),
+                        ) = &entry.payload
+                        {
+                            let peer = NodeId {
+                                id: marker.commit_hlc.node_id,
+                                _reserved: 0,
+                            };
+                            tracker.record_hlc(peer, marker.commit_hlc);
+                        }
+                    }
+                }
                 let envelope: Result<AppendEntriesResponse<u32>, RaftError<u32>> =
                     self.raft.append_entries(req).await;
                 (

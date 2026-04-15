@@ -40,9 +40,10 @@
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
 use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
-use crate::network::data_server::{ReplicaRouter, StaticReplicaRouter};
+use crate::network::data_server::ReplicaRouter;
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
+use crate::network::ring::{RingRouter, RingState};
 use crate::network::transport::{
     CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, TransportProvider,
     TransportTier, TransportTierSet,
@@ -109,11 +110,11 @@ pub struct WendelonClientConfig {
 pub struct WendelonClient {
     factory: Arc<TransportProviderFactory>,
     pool: Arc<BufPool>,
-    /// Authoritative client-side ring. Swapped in atomically on
-    /// every topology refresh; reads are cheap (`Arc::clone` out
-    /// of a short sync read guard) so query-path access never
-    /// awaits.
-    router: RwLock<Arc<StaticReplicaRouter>>,
+    /// Authoritative client-side ring. `RingRouter` owns its own
+    /// `RwLock<Arc<RingState>>`, so swaps on topology refresh are
+    /// atomic internally — reads are a brief read-guard plus an
+    /// `Arc::clone` and never await.
+    router: Arc<RingRouter>,
     /// Shared ownership of the membership publication. The factory
     /// holds the receiving end; refreshes go through this sender
     /// so connection invalidation fires automatically.
@@ -145,10 +146,10 @@ impl WendelonClient {
         );
 
         let pool = BufPool::new(config.pool_max_retained, config.pool_max_cap_bytes);
-        let router = Arc::new(StaticReplicaRouter::new(
-            node_ids_from_epoch(&seed),
+        let router = Arc::new(RingRouter::new(RingState::build(
+            &seed,
             config.bootstrap.replication_factor as usize,
-        ));
+        )));
         let leader = config
             .bootstrap
             .leader
@@ -158,7 +159,7 @@ impl WendelonClient {
         Arc::new(Self {
             factory,
             pool,
-            router: RwLock::new(router),
+            router,
             topology_tx,
             topology_source: config.topology,
             leader: RwLock::new(leader),
@@ -182,14 +183,13 @@ impl WendelonClient {
     /// update path.
     pub fn apply_snapshot(&self, snapshot: &ClusterStatusWire) {
         let membership = snapshot.to_membership();
-        let ids = node_ids_from_epoch(&membership);
         let rf = snapshot.replication_factor as usize;
-        let new_router = Arc::new(StaticReplicaRouter::new(ids, rf));
 
-        // Hold the write guards briefly and in a fixed order; never
-        // across an await. The watch send is last so any observer
-        // that sees the new epoch also sees the new router.
-        *self.router.write().unwrap() = new_router;
+        // `RingRouter::install` handles its own atomic swap, so the
+        // client no longer needs an outer RwLock around the router.
+        // The watch send is last so any observer that sees the new
+        // epoch also sees the new ring.
+        self.router.install(RingState::build(&membership, rf));
         *self.rf.write().unwrap() = rf;
         *self.leader.write().unwrap() =
             snapshot.leader.map(|id| NodeId { id, _reserved: 0 });
@@ -199,7 +199,7 @@ impl WendelonClient {
     /// Replicas that should own `key_hash`. Returned in the
     /// deterministic order the current router produces.
     pub fn replicas_for(&self, key_hash: u64) -> Vec<NodeId> {
-        self.router.read().unwrap().replicas(key_hash)
+        self.router.replicas(key_hash)
     }
 
     /// Best known leader for the cluster. `None` while the cluster
@@ -453,12 +453,6 @@ enum QueryOutcome {
 //  HELPERS
 // ============================================================
 
-fn node_ids_from_epoch(epoch: &MembershipEpoch) -> Vec<NodeId> {
-    let mut ids: Vec<NodeId> = epoch.peers.keys().copied().collect();
-    ids.sort_by_key(|n| n.id);
-    ids
-}
-
 fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
     let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {e}")))?;
@@ -516,9 +510,15 @@ mod tests {
                     node_id: *id,
                     address: format!("127.0.0.1:{}", 9000 + *id),
                     tier_bits: tier_bits(),
+                    role_bits: role_bits(),
                 })
                 .collect(),
         }
+    }
+
+    fn role_bits() -> u8 {
+        use crate::network::transport::{NodeRole, NodeRoleSet};
+        NodeRoleSet::empty().with(NodeRole::Data).as_u8()
     }
 
     fn test_config(initial: ClusterStatusWire) -> WendelonClientConfig {
@@ -612,6 +612,7 @@ mod tests {
                     node_id: id,
                     address: format!("127.0.0.1:{}", 9000 + id),
                     tier_bits: tier_bits(),
+                    role_bits: role_bits(),
                 })
                 .collect(),
         };

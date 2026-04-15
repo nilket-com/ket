@@ -35,6 +35,7 @@
 //! `status` overwritten to [`WriteStatus::DUPLICATE`] so the client
 //! can tell a fresh success apart from a replay.
 
+use crate::consensus::monitor::NodeTracker;
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonStateMachine};
 use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
 use crate::network::factory::TransportProviderFactory;
@@ -181,6 +182,11 @@ pub struct WendelonDataServer {
     /// Exactly-once cache. `WriteResponseMeta` is `Copy`, so
     /// lookups are O(1) under DashMap's shard striping.
     idempotency: DashMap<IdempotencyKey, WriteResponseMeta>,
+    /// Optional liveness + drift tracker (ADR 001, ADR 012). When
+    /// populated, every inbound peer-to-peer RPC feeds the peer's
+    /// HLC physical component into it so the drift monitor and
+    /// eviction watchdog can see the cluster.
+    tracker: Option<Arc<NodeTracker>>,
 }
 
 impl WendelonDataServer {
@@ -202,7 +208,17 @@ impl WendelonDataServer {
             factory,
             pool,
             idempotency: DashMap::new(),
+            tracker: None,
         }
+    }
+
+    /// Wire a [`NodeTracker`] into the server so every inbound peer
+    /// RPC ingests the peer's HLC. Builder-style so production
+    /// bootstrap can attach the tracker without rewriting every
+    /// call site, and tests stay construction-trivial.
+    pub fn with_tracker(mut self, tracker: Arc<NodeTracker>) -> Self {
+        self.tracker = Some(tracker);
+        self
     }
 
     /// Fan-out write to a single remote replica. Opens one bidi
@@ -374,6 +390,17 @@ impl WendelonDataServer {
         let meta: ReplicaWriteMeta = *bytemuck::from_bytes(
             &frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()],
         );
+        // Peer liveness/drift ingestion (ADR 001, ADR 012). The HLC
+        // originator in `commit_hlc.node_id` is another Data Ring
+        // member, so its physical_ms feeds directly into the
+        // NodeTracker without further validation.
+        if let Some(tracker) = &self.tracker {
+            let peer = NodeId {
+                id: meta.commit_hlc.node_id,
+                _reserved: 0,
+            };
+            tracker.record_hlc(peer, meta.commit_hlc);
+        }
         let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::InvalidData,

@@ -37,7 +37,9 @@
 use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
-use crate::network::transport::{MembershipEpoch, PeerCapabilities, TransportTierSet};
+use crate::network::transport::{
+    MembershipEpoch, NodeRoleSet, PeerCapabilities, TransportTierSet,
+};
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
 use async_trait::async_trait;
@@ -87,6 +89,13 @@ pub struct ClusterPeerWire {
     /// the typed form via `TransportTierSet::from_u8` at consume
     /// time so upgrades to the tier enum do not churn this struct.
     pub tier_bits: u8,
+    /// Raw [`NodeRoleSet`] bitmask (ADR 002). Absent on the wire —
+    /// and defaulted to 0 on deserialize — for backwards
+    /// compatibility with older control-plane endpoints that have
+    /// not been upgraded yet; such peers are effectively invisible
+    /// to the Unified Hash Ring until they re-publish with roles.
+    #[serde(default)]
+    pub role_bits: u8,
 }
 
 impl ClusterStatusWire {
@@ -106,6 +115,7 @@ impl ClusterStatusWire {
                 PeerCapabilities {
                     address: p.address.clone(),
                     tiers: TransportTierSet::from_u8(p.tier_bits),
+                    roles: NodeRoleSet::from_u8(p.role_bits),
                 },
             );
         }
@@ -275,6 +285,7 @@ mod tests {
                     tier_bits: TransportTierSet::empty()
                         .with(TransportTier::QuicIoUring)
                         .as_u8(),
+                    role_bits: NodeRoleSet::empty().with(crate::network::transport::NodeRole::Data).as_u8(),
                 },
                 ClusterPeerWire {
                     node_id: 2,
@@ -283,6 +294,7 @@ mod tests {
                         .with(TransportTier::QuicIoUring)
                         .with(TransportTier::TcpTls)
                         .as_u8(),
+                    role_bits: NodeRoleSet::empty().with(crate::network::transport::NodeRole::Data).as_u8(),
                 },
             ],
         }

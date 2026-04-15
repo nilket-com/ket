@@ -326,6 +326,8 @@ mod tests {
         PeerCapabilities {
             address: addr.into(),
             tiers,
+            roles: crate::network::transport::NodeRoleSet::empty()
+                .with(crate::network::transport::NodeRole::Data),
         }
     }
 
