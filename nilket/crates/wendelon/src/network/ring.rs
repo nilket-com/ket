@@ -185,6 +185,73 @@ impl RingState {
     fn replication_factor(&self) -> usize {
         self.rf.min(self.data_count.max(1))
     }
+
+    /// Epoch this ring state was built from. Consumers — the lease
+    /// manager in particular — need the epoch so proposed lease
+    /// grants carry the correct HLC fencing.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// All inclusive `[start, end]` key_hash ranges for which
+    /// `node` is the *primary* (first data-capable replica). The
+    /// primary is defined as the first entry that
+    /// [`Self::replicas_for`] would return at any key in the range.
+    ///
+    /// Returned ranges are sorted by `start` and collapsed so two
+    /// adjacent vnodes owned by the same primary are merged into a
+    /// single entry. Wraparound is materialised as two ranges — one
+    /// ending at `u64::MAX` and one starting at `0` — so the caller
+    /// can treat each entry as a well-ordered interval.
+    pub fn primary_ranges_for(&self, node: NodeId) -> Vec<(u64, u64)> {
+        if self.positions.is_empty() || self.data_count == 0 {
+            return Vec::new();
+        }
+        // Each vnode at positions[i] owns keys in the half-open
+        // interval (positions[i-1].0, positions[i].0]. We compute
+        // this per slot and ask who the primary is at that slot; if
+        // it matches `node`, we emit the range.
+        let n = self.positions.len();
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        for i in 0..n {
+            let slot_key = self.positions[i].0;
+            let primaries = self.replicas_for(slot_key);
+            let Some(primary) = primaries.first() else {
+                continue;
+            };
+            if primary.id != node.id {
+                continue;
+            }
+            let prev_end = if i == 0 {
+                // Wraparound: keys after the last position and keys
+                // at/below positions[0] both belong to this slot.
+                // Represent as two ranges so each is monotonic.
+                let tail_start = self.positions[n - 1].0.saturating_add(1);
+                if tail_start != 0 {
+                    out.push((tail_start, u64::MAX));
+                }
+                0
+            } else {
+                self.positions[i - 1].0.saturating_add(1)
+            };
+            out.push((prev_end, slot_key));
+        }
+        out.sort_by_key(|(s, _)| *s);
+        // Merge adjacent ranges owned by the same primary — reduces
+        // the number of lease RPCs a node issues on dense rings.
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+        for (s, e) in out {
+            match merged.last_mut() {
+                Some(last) if last.1.saturating_add(1) >= s => {
+                    if e > last.1 {
+                        last.1 = e;
+                    }
+                }
+                _ => merged.push((s, e)),
+            }
+        }
+        merged
+    }
 }
 
 // ============================================================
@@ -224,6 +291,16 @@ impl RingRouter {
     /// refcount and drops the lock.
     pub fn snapshot(&self) -> Arc<RingState> {
         self.state.read().expect("ring state poisoned").clone()
+    }
+
+    /// Convenience delegate for [`RingState::primary_ranges_for`].
+    pub fn primary_ranges_for(&self, node: NodeId) -> Vec<(u64, u64)> {
+        self.snapshot().primary_ranges_for(node)
+    }
+
+    /// Epoch of the currently installed ring state.
+    pub fn current_epoch(&self) -> u64 {
+        self.snapshot().epoch()
     }
 
     /// Spawn a background task that watches `rx` for membership
@@ -455,5 +532,47 @@ mod tests {
         let router = RingRouter::new(RingState::build(&m, 0));
         assert_eq!(router.replication_factor(), 1);
         assert_eq!(router.replicas(0).len(), 1);
+    }
+
+    #[test]
+    fn primary_ranges_cover_whole_space_for_single_data_node() {
+        let m = membership_of(vec![(1, data_caps())]);
+        let state = RingState::build(&m, 1);
+        let ranges = state.primary_ranges_for(n(1));
+        assert!(!ranges.is_empty());
+        // Every u64 must fall inside one of the returned ranges.
+        let covers = |k: u64| ranges.iter().any(|(s, e)| *s <= k && k <= *e);
+        assert!(covers(0));
+        assert!(covers(1));
+        assert!(covers(u64::MAX));
+        assert!(covers(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn primary_ranges_for_non_member_are_empty() {
+        let m = membership_of(vec![(1, data_caps()), (2, data_caps())]);
+        let state = RingState::build(&m, 1);
+        let ranges = state.primary_ranges_for(n(99));
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn primary_ranges_agree_with_replicas_for_sampled_keys() {
+        let m = membership_of(vec![
+            (1, data_caps()),
+            (2, data_caps()),
+            (3, data_caps()),
+        ]);
+        let state = RingState::build(&m, 1);
+        for &node_id in &[1u32, 2, 3] {
+            let ranges = state.primary_ranges_for(n(node_id));
+            for (s, e) in &ranges {
+                // Both endpoints map back to the same node via
+                // `replicas_for` — the ranges really do describe
+                // this node's primary ownership.
+                assert_eq!(state.replicas_for(*s).first().unwrap().id, node_id);
+                assert_eq!(state.replicas_for(*e).first().unwrap().id, node_id);
+            }
+        }
     }
 }

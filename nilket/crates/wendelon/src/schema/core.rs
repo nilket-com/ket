@@ -140,24 +140,37 @@ pub struct FinalizationMarker {
 }
 
 // ============================================================
-//  LEASE DESCRIPTOR — 128 bytes, fixed
+//  LEASE DESCRIPTOR — 144 bytes, fixed
 //
-//  Read leases let the leader serve linearizable reads locally
-//  without a quorum round-trip while the lease is valid.
+//  Per-range leases (ADR 003 / plan 018) fence Stellarator writes
+//  so only one data node accepts traffic for a given key_hash
+//  range within an epoch. The same descriptor backs linearizable
+//  reads: a node may serve `LINEARIZABLE` reads locally while a
+//  valid lease covers the key.
 //
-//  • Granted when a majority confirms via heartbeat.
-//  • Expires at lease_expiry (HLC-based, NOT wall-clock).
-//  • All leases instantly invalidated on epoch bump / step-down.
-//  • Reads require commit_index >= min_commit_index to prevent
-//    stale reads after re-election.
+//  • Granted by the Raft Leader once the entry commits.
+//  • Each lease is scoped to the inclusive `[range_start,
+//    range_end]` key_hash window and the specific epoch named in
+//    `epoch` — a cluster transition to E+1 invalidates every
+//    lease carrying a prior epoch.
+//  • Expires at `lease_expiry` (HLC-based, NOT wall-clock).
+//  • Reads require commit_index >= `min_commit_index` to prevent
+//    stale reads after re-election (kept from the old layout —
+//    the write-path gate ignores it until read-lease semantics
+//    land in a follow-up).
 // ============================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct LeaseDescriptor {
     /// Epoch in which this lease is valid
     pub epoch: u64,
-    /// Node holding the lease (always the current leader)
+    /// Node holding the lease (a data-capable primary)
     pub holder: NodeId,
+    /// Inclusive lower bound of the `key_hash` range this lease
+    /// authorises writes/linearizable-reads for.
+    pub range_start: u64,
+    /// Inclusive upper bound.
+    pub range_end: u64,
     /// HLC when lease was granted
     pub lease_start: HybridTimestamp,
     /// HLC when lease becomes invalid; recommended: heartbeat_interval × 3
@@ -167,8 +180,71 @@ pub struct LeaseDescriptor {
     /// Ed25519 over fields above; 64 bytes
     #[serde(with = "serde_bytes")]
     pub signature: [u8; 64],
-    /// Pad to 128 bytes
+    /// Pad to 144 bytes
     pub _pad: [u8; 8],
+}
+
+// ============================================================
+//  LEASE STATUS — 1 byte, fixed
+//
+//  Wire discriminant for [`AcquireLeaseResponseMeta`]. Values are
+//  stable because the byte rides HRFT frames from Data Nodes to
+//  the Control Ring.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct LeaseStatus(pub u8);
+
+impl LeaseStatus {
+    pub const GRANTED:            Self = Self(0);
+    pub const DENIED_OVERLAP:     Self = Self(1);
+    pub const DENIED_EPOCH_STALE: Self = Self(2);
+    pub const DENIED_NOT_LEADER:  Self = Self(3);
+    pub const INTERNAL_ERROR:     Self = Self(4);
+}
+
+// ============================================================
+//  ACQUIRE LEASE REQUEST METADATA — 56 bytes, fixed
+//
+//  Sent by a Data Node on the Control Ring when it wants to be
+//  fenced as the primary for a key_hash range. The Raft Leader
+//  proposes a `WendelonRequest::AcquireLease` entry on the
+//  requester's behalf; the resolved `LeaseDescriptor` rides back
+//  in a `LEASE_RESP` trailing section on success.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct AcquireLeaseRequestMeta {
+    /// Inclusive lower bound of the `key_hash` range the
+    /// requester wants to own as primary.
+    pub range_start: u64,                 //  8
+    /// Inclusive upper bound.
+    pub range_end: u64,                   //  8
+    /// Requester's believed cluster epoch. The Leader rejects the
+    /// grant with `DENIED_EPOCH_STALE` on mismatch so the caller
+    /// refreshes topology rather than forking.
+    pub epoch: u64,                       //  8
+    /// Identity of the requesting data node.
+    pub holder: NodeId,                   //  8
+    /// HLC stamped at request time; reused as `lease_start` if
+    /// the grant succeeds so the resulting lease's validity
+    /// window is well-defined against the cluster clock.
+    pub requested_hlc: HybridTimestamp,   // 16
+    /// Requested time-to-live in milliseconds. The Leader clamps
+    /// against a server-side ceiling before stamping
+    /// `lease_expiry`.
+    pub ttl_ms: u32,                      //  4
+    pub _pad: u32,                        //  4
+}
+
+// ============================================================
+//  ACQUIRE LEASE RESPONSE METADATA — 8 bytes, fixed
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct AcquireLeaseResponseMeta {
+    pub status: LeaseStatus,              //  1
+    pub _pad: [u8; 7],                    //  7
 }
 
 // ============================================================
@@ -728,7 +804,10 @@ const _: () = assert!(std::mem::size_of::<NodeId>() == 8);
 const _: () = assert!(std::mem::size_of::<ClientWriteId>() == 32);
 const _: () = assert!(std::mem::size_of::<TransferToken>() == 128);
 const _: () = assert!(std::mem::size_of::<FinalizationMarker>() == 88);
-const _: () = assert!(std::mem::size_of::<LeaseDescriptor>() == 128);
+const _: () = assert!(std::mem::size_of::<LeaseDescriptor>() == 144);
+const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
+const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);

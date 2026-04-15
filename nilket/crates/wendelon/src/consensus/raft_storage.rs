@@ -453,10 +453,12 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 pub struct SmState {
     pub last_applied_log_id: Option<LogId<u32>>,
     pub last_membership: StoredMembership<u32, BasicNode>,
-    /// Per-holder active lease. Keyed by `LeaseDescriptor.holder.id`
-    /// — our current leases are per-leader; once per-range lease
-    /// semantics land the key will switch to a range identifier
-    /// without touching the openraft surface.
+    /// Per-range active leases (Plan 018). Keyed by
+    /// `LeaseDescriptor.range_start` so a holder renewing the same
+    /// vnode replaces its prior lease in-place. Overlap detection
+    /// scans every entry on grant — the cluster holds O(vnodes)
+    /// leases, which is small enough that a linear pass is cheaper
+    /// than maintaining a dedicated interval index here.
     pub leases: HashMap<u64, crate::schema::LeaseDescriptor>,
     /// Per-epoch E_safe watermark. Value is the `commit_hlc` of
     /// the highest FinalizationMarker observed in that epoch, so
@@ -687,16 +689,42 @@ fn apply_request(
             (WendelonResponse::Success, None)
         }
         WendelonRequest::AcquireLease(lease) => {
-            let key = lease.holder.id as u64;
-            // Deny if an existing lease for this holder is still
-            // valid at the requested lease_start and no epoch bump
-            // has occurred — a new epoch invalidates all leases.
-            if let Some(existing) = state.leases.get(&key) {
-                if existing.lease_expiry > lease.lease_start && existing.epoch >= lease.epoch {
-                    return (WendelonResponse::LeaseDenied, None);
-                }
+            // Range must be well-formed. A reversed window would
+            // otherwise overlap nothing in the existing map, so a
+            // nonsense grant would succeed silently.
+            if lease.range_end < lease.range_start {
+                return (WendelonResponse::LeaseDenied, None);
             }
-            state.leases.insert(key, lease);
+            // Per-range overlap sweep. Two ranges [a,b] and [c,d]
+            // overlap iff a <= d && c <= b. A live lease in the
+            // *same or newer* epoch blocks the grant unless it
+            // names the exact same window AND the same holder — in
+            // that case the new lease is a renewal that extends the
+            // expiry in place.
+            for existing in state.leases.values() {
+                if existing.lease_expiry <= lease.lease_start {
+                    continue; // already expired at requested start
+                }
+                if existing.epoch < lease.epoch {
+                    continue; // prior-epoch leases are invalid by
+                              // the epoch-bump rule (plan 018)
+                }
+                let overlaps = lease.range_start <= existing.range_end
+                    && existing.range_start <= lease.range_end;
+                if !overlaps {
+                    continue;
+                }
+                let same_range = existing.range_start == lease.range_start
+                    && existing.range_end == lease.range_end;
+                let same_holder = existing.holder.id == lease.holder.id;
+                if same_range && same_holder {
+                    continue; // permissible renewal; falls through
+                              // to the insert below which overwrites
+                              // the prior entry with the new expiry.
+                }
+                return (WendelonResponse::LeaseDenied, None);
+            }
+            state.leases.insert(lease.range_start, lease);
             (WendelonResponse::Success, None)
         }
         WendelonRequest::SchemaUpdate(_bytes) => {
@@ -923,3 +951,152 @@ fn clone_entry(e: &Entry<WendelonTypeConfig>) -> Entry<WendelonTypeConfig> {
 
 #[allow(dead_code)]
 fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
+
+// ============================================================
+//  LEASE APPLY TESTS
+// ============================================================
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use crate::schema::{HybridTimestamp, LeaseDescriptor, NodeId as SchemaNodeId};
+
+    fn hlc(physical_ms: u64) -> HybridTimestamp {
+        HybridTimestamp {
+            physical_ms,
+            logical: 0,
+            node_id: 0,
+        }
+    }
+
+    fn lease(
+        holder_id: u32,
+        epoch: u64,
+        range: (u64, u64),
+        start_ms: u64,
+        expiry_ms: u64,
+    ) -> LeaseDescriptor {
+        LeaseDescriptor {
+            epoch,
+            holder: SchemaNodeId {
+                id: holder_id,
+                _reserved: 0,
+            },
+            range_start: range.0,
+            range_end: range.1,
+            lease_start: hlc(start_ms),
+            lease_expiry: hlc(expiry_ms),
+            min_commit_index: 0,
+            signature: [0; 64],
+            _pad: [0; 8],
+        }
+    }
+
+    #[test]
+    fn first_grant_succeeds_and_lands_in_state() {
+        let mut state = SmState::default();
+        let (resp, tier) =
+            apply_request(&mut state, WendelonRequest::AcquireLease(lease(1, 1, (0, 99), 0, 100)));
+        assert_eq!(resp, WendelonResponse::Success);
+        assert!(tier.is_none());
+        assert_eq!(state.leases.len(), 1);
+        let stored = state.leases.get(&0).expect("keyed by range_start=0");
+        assert_eq!(stored.range_end, 99);
+        assert_eq!(stored.holder.id, 1);
+    }
+
+    #[test]
+    fn reversed_range_is_rejected() {
+        let mut state = SmState::default();
+        let (resp, _) =
+            apply_request(&mut state, WendelonRequest::AcquireLease(lease(1, 1, (50, 10), 0, 100)));
+        assert_eq!(resp, WendelonResponse::LeaseDenied);
+        assert!(state.leases.is_empty());
+    }
+
+    #[test]
+    fn overlapping_valid_lease_from_other_holder_is_denied() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 100), 0, 1000)),
+        );
+        let (resp, _) = apply_request(
+            &mut state,
+            // Different holder, overlapping range, same epoch, lease still live.
+            WendelonRequest::AcquireLease(lease(2, 1, (50, 150), 100, 2000)),
+        );
+        assert_eq!(resp, WendelonResponse::LeaseDenied);
+        // Original lease untouched.
+        let stored = state.leases.get(&0).unwrap();
+        assert_eq!(stored.holder.id, 1);
+    }
+
+    #[test]
+    fn renewal_from_same_holder_same_range_extends_expiry() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 100), 0, 500)),
+        );
+        let (resp, _) = apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 100), 400, 1500)),
+        );
+        assert_eq!(resp, WendelonResponse::Success);
+        let stored = state.leases.get(&0).unwrap();
+        assert_eq!(stored.lease_expiry.physical_ms, 1500);
+    }
+
+    #[test]
+    fn expired_overlapping_lease_does_not_block_new_grant() {
+        let mut state = SmState::default();
+        // First lease expires at 100.
+        apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 100), 0, 100)),
+        );
+        // Second grant asks to start at 150 — the old lease is
+        // already expired, so even though it overlaps the range
+        // and is in the same epoch the grant succeeds.
+        let (resp, _) = apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(2, 1, (0, 100), 150, 500)),
+        );
+        assert_eq!(resp, WendelonResponse::Success);
+        assert_eq!(state.leases.get(&0).unwrap().holder.id, 2);
+    }
+
+    #[test]
+    fn newer_epoch_invalidates_prior_overlap() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 100), 0, 10_000)),
+        );
+        // New epoch — per plan 018 every prior-epoch lease is
+        // invalid on the cluster transition. The grant must succeed
+        // even though the old lease is temporally live.
+        let (resp, _) = apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(2, 2, (0, 100), 500, 5000)),
+        );
+        assert_eq!(resp, WendelonResponse::Success);
+        assert_eq!(state.leases.get(&0).unwrap().epoch, 2);
+    }
+
+    #[test]
+    fn non_overlapping_ranges_coexist() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(1, 1, (0, 99), 0, 1000)),
+        );
+        let (resp, _) = apply_request(
+            &mut state,
+            WendelonRequest::AcquireLease(lease(2, 1, (100, 199), 0, 1000)),
+        );
+        assert_eq!(resp, WendelonResponse::Success);
+        assert_eq!(state.leases.len(), 2);
+    }
+}

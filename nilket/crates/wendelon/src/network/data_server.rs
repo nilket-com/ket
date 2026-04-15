@@ -35,15 +35,17 @@
 //! `status` overwritten to [`WriteStatus::DUPLICATE`] so the client
 //! can tell a fresh success apart from a replay.
 
-use crate::consensus::monitor::NodeTracker;
-use crate::consensus::{WendelonRaft, WendelonRequest, WendelonStateMachine};
+use crate::consensus::monitor::{NodeTracker, PhysicalClock};
+use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse, WendelonStateMachine};
 use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
+use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
+use crate::network::transport::MembershipEpoch;
 use crate::schema::{
-    wpbc, Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
-    QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+    wpbc, Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor, MsgType,
+    NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
     ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
     WriteResponseMeta, WriteStatus,
 };
@@ -59,9 +61,10 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::io::{Cursor, Error, ErrorKind};
-use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::JoinSet;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
@@ -187,6 +190,24 @@ pub struct WendelonDataServer {
     /// HLC physical component into it so the drift monitor and
     /// eviction watchdog can see the cluster.
     tracker: Option<Arc<NodeTracker>>,
+    /// Local snapshot of leases granted to this node (plan 018).
+    /// Every entry is a `LeaseDescriptor` the Raft Leader has
+    /// already committed. The write path and the LINEARIZABLE
+    /// read path consult this list before accepting traffic.
+    ///
+    /// The cache is intentionally a small `Vec` rather than a
+    /// range-indexed structure: a data node holds at most O(vnodes
+    /// / RF) leases, so a linear scan is cheap and overlap-free
+    /// by construction (the state machine rejects overlaps on grant).
+    leases: Arc<RwLock<Vec<LeaseDescriptor>>>,
+    /// When `Some`, every inbound write / LINEARIZABLE read is
+    /// fenced against the lease cache. `None` (the default) leaves
+    /// the gate disabled so existing single-node tests and the
+    /// multi-node bring-up path before a lease manager has spun
+    /// up do not spuriously reject traffic. Production bootstrap
+    /// calls [`Self::with_lease_gate`] to flip this on after the
+    /// lease manager has registered its first grant.
+    lease_gate_enabled: bool,
 }
 
 impl WendelonDataServer {
@@ -209,6 +230,8 @@ impl WendelonDataServer {
             pool,
             idempotency: DashMap::new(),
             tracker: None,
+            leases: Arc::new(RwLock::new(Vec::new())),
+            lease_gate_enabled: false,
         }
     }
 
@@ -219,6 +242,173 @@ impl WendelonDataServer {
     pub fn with_tracker(mut self, tracker: Arc<NodeTracker>) -> Self {
         self.tracker = Some(tracker);
         self
+    }
+
+    /// Enable the per-range lease gate (plan 018). Must be toggled
+    /// after the lease manager has filed its first grant — turning
+    /// it on with an empty cache rejects every write.
+    pub fn with_lease_gate(mut self, enabled: bool) -> Self {
+        self.lease_gate_enabled = enabled;
+        self
+    }
+
+    /// Shared handle to the lease cache. The lease manager writes
+    /// to it; the write/read paths read from it. Exposed so the
+    /// manager task (which lives in a separate module) can take an
+    /// `Arc` without poking at private fields.
+    pub fn lease_cache(&self) -> Arc<RwLock<Vec<LeaseDescriptor>>> {
+        self.leases.clone()
+    }
+
+    /// Test-only hook to seed a lease into the local cache without
+    /// driving the full Raft grant path. Production code must never
+    /// call this — the manager is the sole writer of real leases.
+    #[cfg(test)]
+    pub fn seed_lease_for_test(&self, lease: LeaseDescriptor) {
+        self.leases.write().expect("lease cache poisoned").push(lease);
+    }
+
+    /// Inspect the lease cache for a valid lease that covers
+    /// `key_hash` at `now` in `epoch`. Returns `true` if such a
+    /// lease exists and is held by the local node.
+    fn has_valid_lease(&self, key_hash: u64, epoch: u64, now: HybridTimestamp) -> bool {
+        let guard = self.leases.read().expect("lease cache poisoned");
+        guard.iter().any(|l| {
+            l.holder.id == self.local_node.id
+                && l.epoch == epoch
+                && l.range_start <= key_hash
+                && key_hash <= l.range_end
+                && now < l.lease_expiry
+        })
+    }
+
+    /// Single pass of the lease manager (plan 018):
+    ///
+    ///  1. Read the current ring epoch + the set of primary ranges
+    ///     owned by this node.
+    ///  2. Drop any cached lease whose epoch no longer matches — the
+    ///     cluster may have just transitioned to E+1, which invalidates
+    ///     every prior lease.
+    ///  3. For each owned range, propose a `WendelonRequest::AcquireLease`
+    ///     to the Raft Leader. On a `Success` commit, insert/replace the
+    ///     lease in the local cache. Denials are surfaced as `false` in
+    ///     the returned bool but are not an error — a concurrent holder
+    ///     may legitimately still own the range during a handoff.
+    ///
+    /// Returns the number of ranges the node successfully fenced.
+    pub async fn refresh_leases_once(
+        &self,
+        ring: &RingRouter,
+        clock: &dyn PhysicalClock,
+        ttl_ms: u32,
+    ) -> usize {
+        let snapshot = ring.snapshot();
+        let epoch = snapshot.epoch();
+        let ranges = snapshot.primary_ranges_for(self.local_node);
+
+        {
+            let mut guard = self.leases.write().expect("lease cache poisoned");
+            guard.retain(|l| l.epoch == epoch);
+        }
+
+        let now_ms = clock.now_ms();
+        let now_hlc = HybridTimestamp {
+            physical_ms: now_ms,
+            logical: 0,
+            node_id: self.local_node.id,
+        };
+        let expiry_hlc = HybridTimestamp {
+            physical_ms: now_ms.saturating_add(ttl_ms as u64),
+            logical: 0,
+            node_id: self.local_node.id,
+        };
+
+        let mut granted = 0usize;
+        for (range_start, range_end) in ranges {
+            let lease = LeaseDescriptor {
+                epoch,
+                holder: self.local_node,
+                range_start,
+                range_end,
+                lease_start: now_hlc,
+                lease_expiry: expiry_hlc,
+                min_commit_index: 0,
+                signature: [0; 64],
+                _pad: [0; 8],
+            };
+            let outcome = self
+                .raft
+                .client_write(WendelonRequest::AcquireLease(lease))
+                .await;
+            match outcome {
+                Ok(resp) => match resp.data {
+                    WendelonResponse::Success => {
+                        let mut guard = self.leases.write().expect("lease cache poisoned");
+                        if let Some(slot) = guard
+                            .iter_mut()
+                            .find(|l| l.range_start == range_start && l.range_end == range_end)
+                        {
+                            *slot = lease;
+                        } else {
+                            guard.push(lease);
+                        }
+                        granted += 1;
+                    }
+                    WendelonResponse::LeaseDenied => {
+                        // Another holder (or a stale-epoch request)
+                        // blocks us — skip, keep the old entry if
+                        // any. The next tick retries.
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        range_start,
+                        range_end,
+                        epoch,
+                        error = %e,
+                        "lease manager: client_write failed; will retry next tick"
+                    );
+                }
+            }
+        }
+        granted
+    }
+
+    /// Spawn the lease manager background task. Fires on every
+    /// `epoch_rx.changed()` event and on a steady `tick` cadence so
+    /// a node that missed a watch wake-up (e.g. because its Raft
+    /// client_write errored mid-transfer) still renews before
+    /// `ttl_ms` elapses.
+    ///
+    /// The task terminates when `epoch_rx` is closed (every sender
+    /// dropped). Callers hold the returned [`JoinHandle`] on the
+    /// `NodeHandles` struct so dropping the node aborts the loop.
+    pub fn spawn_lease_manager(
+        self: Arc<Self>,
+        ring: Arc<RingRouter>,
+        clock: Arc<dyn PhysicalClock>,
+        mut epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
+        tick: Duration,
+        ttl_ms: u32,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            // Seed immediately so the cache is warm before the gate
+            // is flipped on elsewhere in the bootstrap sequence.
+            let _ = self.refresh_leases_once(&ring, clock.as_ref(), ttl_ms).await;
+            let mut ticker = tokio::time::interval(tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    changed = epoch_rx.changed() => {
+                        if changed.is_err() {
+                            break; // senders dropped — clean exit
+                        }
+                    }
+                    _ = ticker.tick() => {}
+                }
+                let _ = self.refresh_leases_once(&ring, clock.as_ref(), ttl_ms).await;
+            }
+        })
     }
 
     /// Fan-out write to a single remote replica. Opens one bidi
@@ -504,6 +694,34 @@ impl DataRing for WendelonDataServer {
         let key_bytes = extract_first_binary(&payload, "key")?;
         let key_hash = highway_hash(key_bytes);
 
+        // 4a. Per-range lease gate (plan 018). When enabled, this
+        // node accepts the write only if it holds a valid lease
+        // covering `key_hash` in the client's epoch. A node that is
+        // not the primary for this key returns `NOT_LEADER` so the
+        // Smart Client reroutes; a node that is the primary but
+        // whose lease has lapsed returns `LEASE_EXPIRED` so the
+        // client retries once the manager has renewed.
+        if self.lease_gate_enabled {
+            let is_primary = self
+                .router
+                .replicas(key_hash)
+                .first()
+                .map(|n| n.id == self.local_node.id)
+                .unwrap_or(false);
+            if !is_primary {
+                return Ok((
+                    error_response(&meta, WriteStatus::NOT_LEADER, self.local_node),
+                    None,
+                ));
+            }
+            if !self.has_valid_lease(key_hash, meta.expected_epoch, meta.client_hlc) {
+                return Ok((
+                    error_response(&meta, WriteStatus::LEASE_EXPIRED, self.local_node),
+                    None,
+                ));
+            }
+        }
+
         // 5. Serialize the RecordBatch back to Arrow IPC. These
         // bytes are what both the local slab and every remote
         // replica store verbatim — hashing once here means every
@@ -680,6 +898,33 @@ impl DataRing for WendelonDataServer {
         // 2. Hash the key payload and probe the slab index.
         let key_bytes = extract_first_binary(&key, "key")?;
         let key_hash = highway_hash(key_bytes);
+
+        // 2a. Per-range lease gate for LINEARIZABLE reads (plan 018).
+        // A local point-read is only authoritative while a lease
+        // fences writes for this range to this node — anything
+        // weaker opens a window where a stale follower could serve
+        // a pre-failover value.
+        if self.lease_gate_enabled && meta.consistency == Consistency::LINEARIZABLE {
+            let is_primary = self
+                .router
+                .replicas(key_hash)
+                .first()
+                .map(|n| n.id == self.local_node.id)
+                .unwrap_or(false);
+            if !is_primary {
+                return Ok((
+                    error_read_response(&meta, ReadStatus::NOT_LEADER, self.local_node),
+                    None,
+                ));
+            }
+            if !self.has_valid_lease(key_hash, meta.expected_epoch, meta.min_hlc) {
+                return Ok((
+                    error_read_response(&meta, ReadStatus::LEASE_EXPIRED, self.local_node),
+                    None,
+                ));
+            }
+        }
+
         let Some(location) = self.slab.lookup_as_of(key_hash, meta.as_of_hlc) else {
             return Ok((
                 error_read_response(&meta, ReadStatus::KEY_NOT_FOUND, self.local_node),
@@ -1298,4 +1543,212 @@ mod tests {
         assert_eq!(batch.schema().field(0).name(), "key");
     }
 
+    // ========================================================
+    //  LEASE GATE TESTS (plan 018)
+    //
+    //  These tests drive the Data Ring lease gate end-to-end by
+    //  standing up a single-node cluster via
+    //  `WendelonNode::bootstrap_single_node`. The gate logic is
+    //  exercised against the real `WendelonDataServer` from that
+    //  bootstrap (the node pubs it on the struct).
+    // ========================================================
+
+    use crate::node::{NodeBootstrapConfig, WendelonNode};
+    use crate::schema::{
+        ClientWriteId, Consistency as SchemaConsistency, DurabilityLevel, WriteRequestMeta,
+    };
+
+    fn bootstrap_tempdir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wendelon-lease-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn simple_write_meta(epoch: u64) -> WriteRequestMeta {
+        WriteRequestMeta {
+            write_id: ClientWriteId {
+                client_uuid: [7u8; 16],
+                sequence_no: 1,
+                idempotency_ttl_ms: 60_000,
+                _pad: 0,
+            },
+            client_hlc: hlc(10, 0, 0),
+            expected_epoch: epoch,
+            proxy_hop: 0,
+            durability: DurabilityLevel::QUORUM,
+            await_finalization: 0,
+            _pad1: [0; 5],
+            proxy_source: NodeId {
+                id: 0,
+                _reserved: 0,
+            },
+            key_len: 1,
+            value_len: 1,
+        }
+    }
+
+    fn single_kv_batch() -> RecordBatch {
+        let schema = Arc::new(write_payload_schema());
+        let mut keys = LargeBinaryBuilder::new();
+        keys.append_value(b"k");
+        let mut values = LargeBinaryBuilder::new();
+        values.append_value(b"v");
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+        )
+        .unwrap()
+    }
+
+    fn simple_read_meta(epoch: u64) -> ReadRequestMeta {
+        ReadRequestMeta {
+            min_hlc: hlc(0, 0, 0),
+            expected_epoch: epoch,
+            consistency: SchemaConsistency::LINEARIZABLE,
+            _pad: [0; 3],
+            key_len: 1,
+            _pad2: [0; 8],
+            as_of_hlc: hlc(0, 0, 0),
+        }
+    }
+
+    fn single_key_batch() -> RecordBatch {
+        let schema = Arc::new(crate::schema::read_key_schema());
+        let mut keys = LargeBinaryBuilder::new();
+        keys.append_value(b"k");
+        RecordBatch::try_new(schema, vec![Arc::new(keys.finish())]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_rejected_when_lease_gate_on_and_cache_empty() {
+        let dir = bootstrap_tempdir("empty-cache");
+        let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            11,
+            dir,
+            "127.0.0.1:0".into(),
+        ))
+        .await
+        .unwrap();
+        // Force the cache empty so the gate can't find a lease.
+        node.data_server
+            .lease_cache()
+            .write()
+            .unwrap()
+            .clear();
+
+        let (resp, _) = node
+            .data_server
+            .write(simple_write_meta(1), single_kv_batch())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, WriteStatus::LEASE_EXPIRED);
+        assert_eq!(resp.leader_hint, node.local_node);
+    }
+
+    #[tokio::test]
+    async fn linearizable_read_rejected_when_lease_missing() {
+        let dir = bootstrap_tempdir("lin-read");
+        let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            12,
+            dir,
+            "127.0.0.1:0".into(),
+        ))
+        .await
+        .unwrap();
+        node.data_server.lease_cache().write().unwrap().clear();
+
+        let (resp, _) = node
+            .data_server
+            .read(simple_read_meta(1), single_key_batch())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, ReadStatus::LEASE_EXPIRED);
+    }
+
+    #[tokio::test]
+    async fn refresh_leases_once_clears_stale_epoch_entries() {
+        let dir = bootstrap_tempdir("stale-epoch");
+        let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            13,
+            dir,
+            "127.0.0.1:0".into(),
+        ))
+        .await
+        .unwrap();
+        // Seed a lease from a prior epoch — the cache must drop it
+        // on the next refresh tick because the current ring epoch
+        // is 1, not 99.
+        node.data_server.seed_lease_for_test(crate::schema::LeaseDescriptor {
+            epoch: 99,
+            holder: node.local_node,
+            range_start: 0,
+            range_end: u64::MAX,
+            lease_start: hlc(0, 0, node.local_node.id),
+            lease_expiry: hlc(u64::MAX / 2, 0, node.local_node.id),
+            min_commit_index: 0,
+            signature: [0; 64],
+            _pad: [0; 8],
+        });
+        // Give Raft a moment to elect and ring updater to seed.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if node.raft.current_leader().await == Some(node.local_node.id) {
+                break;
+            }
+        }
+        let granted = node
+            .data_server
+            .refresh_leases_once(&node.ring, &*node.clock, 60_000)
+            .await;
+        // Exactly one primary range on a single-node cluster, so one grant.
+        assert!(granted >= 1);
+        let cache = node.data_server.lease_cache();
+        let entries = cache.read().unwrap().clone();
+        assert!(
+            entries.iter().all(|l| l.epoch == 1),
+            "stale-epoch leases must be evicted; cache={entries:?}"
+        );
+        assert!(entries.iter().any(|l| l.holder.id == node.local_node.id));
+    }
+
+    #[tokio::test]
+    async fn write_accepted_once_lease_manager_has_granted() {
+        let dir = bootstrap_tempdir("accept");
+        let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+            14,
+            dir,
+            "127.0.0.1:0".into(),
+        ))
+        .await
+        .unwrap();
+        // Wait for Raft leadership and drive one explicit refresh
+        // so the cache is guaranteed to be warm before the write
+        // arrives — the spawned manager is on a 1s tick so tests
+        // that race against it would be flaky.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            if node.raft.current_leader().await == Some(node.local_node.id) {
+                break;
+            }
+        }
+        node.data_server
+            .refresh_leases_once(&node.ring, &*node.clock, 60_000)
+            .await;
+
+        let mut meta = simple_write_meta(1);
+        // Push client_hlc into the granted window (the manager used
+        // `clock.now_ms()` for lease_start; any value at-or-after 0
+        // and before expiry is fine).
+        meta.client_hlc = hlc(1, 0, 0);
+        let (resp, _) = node
+            .data_server
+            .write(meta, single_kv_batch())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
+    }
 }

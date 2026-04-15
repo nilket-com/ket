@@ -1,6 +1,7 @@
 use crate::schema::{
-    FinalizationMarker, LeaseDescriptor, NodeId, RaftEpochEntryFixed, ReadRequestMeta,
-    ReadResponseMeta, TransferToken, WriteRequestMeta, WriteResponseMeta,
+    AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FinalizationMarker, LeaseDescriptor, NodeId,
+    RaftEpochEntryFixed, ReadRequestMeta, ReadResponseMeta, TransferToken, WriteRequestMeta,
+    WriteResponseMeta,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -9,12 +10,12 @@ use tokio::sync::mpsc;
 // ============================================================
 //  CONTROL-RING META — placeholder (non-wire) structs.
 //
-//  These types exist so the `ControlRing` trait has a
-//  compilable surface. They are deliberately plain Rust
-//  structs (not bytemuck PODs) because the control-ring
-//  wire layout is not yet frozen. When it is, they will be
-//  promoted to `#[repr(C)] Pod + Zeroable` structs in
-//  `src/schema/core.rs` with explicit size assertions.
+//  `TransferLeadershipRequest/ResponseMeta` and
+//  `ClusterStatusResponseMeta` are still plain-Rust stubs — the
+//  control-ring wire layout for those flows is not yet frozen.
+//  Lease metadata moved to `src/schema/core.rs` as part of
+//  Plan 018 (per-range leases); the POD versions are imported
+//  above and referenced directly by the `ControlRing` trait.
 // ============================================================
 
 #[derive(Clone, Debug)]
@@ -27,20 +28,6 @@ pub struct TransferLeadershipRequestMeta {
 #[derive(Clone, Debug)]
 pub struct TransferLeadershipResponseMeta {
     pub accepted: bool,
-    /// Maps to ReasonCode table (TBD); 0 = granted.
-    pub reason_code: u8,
-}
-
-#[derive(Clone, Debug)]
-pub struct AcquireLeaseRequestMeta {
-    pub range_id: u64,
-    pub holder: NodeId,
-    pub ttl_ms: u32,
-}
-
-#[derive(Clone, Debug)]
-pub struct AcquireLeaseResponseMeta {
-    pub granted: bool,
     /// Maps to ReasonCode table (TBD); 0 = granted.
     pub reason_code: u8,
 }

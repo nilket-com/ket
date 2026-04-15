@@ -111,6 +111,7 @@ pub struct WendelonNode {
     pub state_machine: WendelonStateMachine,
     pub ring: Arc<RingRouter>,
     pub router: Arc<MsgRouter>,
+    pub data_server: Arc<WendelonDataServer>,
     pub pool: Arc<BufPool>,
     pub io: IoRingHandle,
     pub epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
@@ -123,7 +124,16 @@ pub struct NodeHandles {
     pub ring_updater: JoinHandle<()>,
     pub drift_monitor: JoinHandle<()>,
     pub eviction_watchdog: JoinHandle<()>,
+    pub lease_manager: JoinHandle<()>,
 }
+
+/// Time-to-live the lease manager requests on every grant. The
+/// renew interval is a third of this so two consecutive failed
+/// ticks still leave a valid lease in place.
+pub const LEASE_TTL_MS: u32 = 3_000;
+/// Renewal cadence: `LEASE_TTL_MS / 3`.
+pub const LEASE_RENEW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis((LEASE_TTL_MS / 3) as u64);
 
 // ============================================================
 //  BOOTSTRAP
@@ -272,7 +282,9 @@ impl WendelonNode {
 
         // 13. Data Ring + Raft Internal Ring servers. Both observe
         //     inbound HLCs into the shared tracker so the drift
-        //     monitor sees Raft-layer and data-plane signal.
+        //     monitor sees Raft-layer and data-plane signal. The
+        //     lease gate is flipped on after the manager tick has
+        //     had a chance to file its first grant (step 15).
         let data_server = Arc::new(
             WendelonDataServer::new(
                 slab.clone(),
@@ -283,7 +295,8 @@ impl WendelonNode {
                 factory.clone(),
                 pool.clone(),
             )
-            .with_tracker(tracker.clone()),
+            .with_tracker(tracker.clone())
+            .with_lease_gate(true),
         );
         let raft_server = Arc::new(
             WendelonRaftInternalServer::new(raft.clone(), pool.clone())
@@ -294,9 +307,21 @@ impl WendelonNode {
         //     listener hands every inbound frame to.
         let router = Arc::new(
             MsgRouterBuilder::default()
-                .with_data_ring(data_server)
+                .with_data_ring(data_server.clone())
                 .with_raft_internal(raft_server)
                 .build(),
+        );
+
+        // 15. Lease manager (plan 018). Runs in the background,
+        //     renews every LEASE_TTL_MS / 3 and on every ring-epoch
+        //     change, and updates the data server's local cache so
+        //     the write/read gates installed above can admit traffic.
+        let lease_manager = data_server.clone().spawn_lease_manager(
+            ring.clone(),
+            clock.clone(),
+            epoch_rx.clone(),
+            LEASE_RENEW_INTERVAL,
+            LEASE_TTL_MS,
         );
 
         Ok(Self {
@@ -308,6 +333,7 @@ impl WendelonNode {
             state_machine,
             ring,
             router,
+            data_server,
             pool,
             io,
             epoch_tx,
@@ -315,6 +341,7 @@ impl WendelonNode {
                 ring_updater,
                 drift_monitor,
                 eviction_watchdog,
+                lease_manager,
             },
         })
     }
