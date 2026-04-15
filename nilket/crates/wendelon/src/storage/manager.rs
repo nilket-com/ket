@@ -82,6 +82,19 @@ pub struct SealedSlabInfo {
     pub size_bytes: u64,
 }
 
+/// Outcome of a single [`SlabManager::append_migration`] call.
+/// Lets the caller distinguish genuinely new ingests from
+/// idempotent no-ops so it can keep honest progress counters
+/// across racing sweeper and hot-read pulls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationIngestOutcome {
+    /// A new retained version was appended and indexed.
+    Inserted(RecordLocation),
+    /// A matching `(key_hash, hlc)` with identical `payload_hash`
+    /// already existed locally — the ingest was a no-op.
+    Duplicate(RecordLocation),
+}
+
 /// A slab that has been uploaded to L2. The manager tracks this
 /// so subsequent reads pivot to the object store instead of the
 /// now-unlinked L1 file.
@@ -361,6 +374,153 @@ impl SlabManager {
             .collect();
         out.sort_by_key(|(h, _)| *h);
         out
+    }
+
+    /// Every retained version whose `key_hash` falls in the
+    /// inclusive window `[start_hash, end_hash]` and whose `hlc`
+    /// is at or above `migration_hlc_floor` (Plan 019).
+    ///
+    /// Unlike [`Self::scan`] / [`Self::scan_as_of`], this does not
+    /// collapse per-key history — every version ≥ floor is
+    /// returned. Output is sorted first by `key_hash` then by
+    /// ascending `hlc` so the migration RPC can paginate with a
+    /// stable cursor and the destination can append in the same
+    /// order it observed on the source.
+    pub fn scan_all_versions(
+        &self,
+        start_hash: u64,
+        end_hash: u64,
+        migration_hlc_floor: HybridTimestamp,
+    ) -> Vec<(u64, RecordLocation)> {
+        self.scan_all_versions_from(
+            start_hash,
+            end_hash,
+            migration_hlc_floor,
+            0,
+            bytemuck::Zeroable::zeroed(),
+        )
+    }
+
+    /// Version-aware paging variant of [`Self::scan_all_versions`].
+    ///
+    /// Lets `handle_migrate` resume mid-key when a fat key has more
+    /// retained versions than fit in a single page:
+    ///
+    /// * When `(cursor_hash, cursor_hlc)` is `(0, zero)` the scan
+    ///   behaves identically to `scan_all_versions`.
+    /// * Otherwise, for `key_hash == cursor_hash` we emit only
+    ///   versions strictly later than `cursor_hlc` — the prior page
+    ///   already emitted everything at or below it.
+    /// * For `key_hash > cursor_hash` we emit every version at or
+    ///   above the pinned floor, exactly like the non-paged scan.
+    /// * Keys strictly less than `cursor_hash` are skipped: the
+    ///   prior page already drained them.
+    ///
+    /// Output is still sorted `(key_hash ASC, hlc ASC)` so the
+    /// migration RPC can paginate deterministically.
+    pub fn scan_all_versions_from(
+        &self,
+        start_hash: u64,
+        end_hash: u64,
+        migration_hlc_floor: HybridTimestamp,
+        cursor_hash: u64,
+        cursor_hlc: HybridTimestamp,
+    ) -> Vec<(u64, RecordLocation)> {
+        if start_hash > end_hash {
+            return Vec::new();
+        }
+        let cursor_active = cursor_hash != 0 || cursor_hlc != bytemuck::Zeroable::zeroed();
+        let mut out: Vec<(u64, RecordLocation)> = Vec::new();
+        for entry in self.key_index.iter() {
+            let h = *entry.key();
+            if h < start_hash || h > end_hash {
+                continue;
+            }
+            if cursor_active && h < cursor_hash {
+                continue;
+            }
+            for loc in entry.value().iter() {
+                if loc.hlc < migration_hlc_floor {
+                    continue;
+                }
+                if cursor_active && h == cursor_hash && loc.hlc <= cursor_hlc {
+                    continue;
+                }
+                out.push((h, *loc));
+            }
+        }
+        out.sort_by(|(ha, la), (hb, lb)| ha.cmp(hb).then(la.hlc.cmp(&lb.hlc)));
+        out
+    }
+
+    /// Idempotent migration ingest (Plan 019).
+    ///
+    /// Distinct from [`StorageEngine::append`] so the correctness
+    /// boundary for lazy migration lives at a dedicated API rather
+    /// than piggybacking on the hot write path:
+    ///
+    /// * **Fast path** — if a version with the same `(key_hash, hlc)`
+    ///   already exists locally, read its frame, blake3 it, and
+    ///   compare to `payload_hash`. A match is a no-op and returns
+    ///   [`MigrationIngestOutcome::Duplicate`]. A mismatch is a
+    ///   fatal invariant violation: two nodes claim different bytes
+    ///   for the same MVCC slot, which would make MVCC history
+    ///   non-deterministic if silently accepted.
+    /// * **Slow path** — otherwise append the frame through the
+    ///   same slab machinery the hot write path uses and return
+    ///   [`MigrationIngestOutcome::Inserted`].
+    ///
+    /// The `migration_id` argument is currently only used for
+    /// diagnostic framing in the mismatch error — retained so the
+    /// signature stays stable once the migration registry and
+    /// sweeper surfaces wire it through.
+    pub async fn append_migration(
+        &self,
+        migration_id: u64,
+        key_hash: u64,
+        hlc: HybridTimestamp,
+        payload_hash: [u8; 32],
+        frame: &[u8],
+    ) -> std::io::Result<MigrationIngestOutcome> {
+        // Fast-path collision check before touching disk: walk the
+        // key's existing version chain under a short-lived read
+        // guard and look for an exact HLC match. DashMap's read
+        // guard is cheap and the chain is O(versions-per-key),
+        // which is bounded by retention.
+        let existing = self
+            .key_index
+            .get(&key_hash)
+            .and_then(|chain| chain.iter().find(|loc| loc.hlc == hlc).copied());
+
+        if let Some(location) = existing {
+            // Slow path: read the on-disk frame and hash it. If
+            // the incoming payload really is a byte-identical copy
+            // of what we already stored, the migration pull was
+            // a duplicate and can be dropped.
+            let stored = self.read(location).await?;
+            let stored_hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
+            if stored_hash == payload_hash {
+                return Ok(MigrationIngestOutcome::Duplicate(location));
+            }
+            // Different bytes claim the same MVCC slot. Refuse
+            // loudly — accepting either side would make historical
+            // reads depend on which replica answered the pull.
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "append_migration payload_hash mismatch: migration_id={migration_id} \
+                     key_hash={key_hash:#x} hlc={hlc:?} stored_hash={stored_hash:?} \
+                     incoming_hash={payload_hash:?}"
+                ),
+            ));
+        }
+
+        // No prior version at this exact HLC — take the normal
+        // append path. `StorageEngine::append` handles rotation,
+        // disk ack, and folding the new version into the
+        // multi-version index.
+        let location = self.append(key_hash, hlc, frame).await?;
+        Ok(MigrationIngestOutcome::Inserted(location))
     }
 
     /// Acquire the slab that should receive the next append,
@@ -657,6 +817,78 @@ mod tests {
         );
         // Bound before the first write -> nothing visible yet.
         assert!(mgr.lookup_as_of(key, hlc(5)).is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_all_versions_returns_every_retained_version_above_floor() {
+        let mgr = fresh_manager().await;
+        // Two keys, two versions each — one above floor, one below.
+        mgr.append(1, hlc(5), b"a@5").await.unwrap();
+        mgr.append(1, hlc(50), b"a@50").await.unwrap();
+        mgr.append(2, hlc(20), b"b@20").await.unwrap();
+        mgr.append(2, hlc(200), b"b@200").await.unwrap();
+
+        let hits = mgr.scan_all_versions(0, u64::MAX, hlc(10));
+        // Floor at 10 drops (1, hlc=5); the remaining three survive.
+        assert_eq!(hits.len(), 3);
+        // Sorted first by key_hash, then by hlc ascending.
+        assert_eq!(hits[0].0, 1);
+        assert_eq!(hits[0].1.hlc.physical_ms, 50);
+        assert_eq!(hits[1].0, 2);
+        assert_eq!(hits[1].1.hlc.physical_ms, 20);
+        assert_eq!(hits[2].0, 2);
+        assert_eq!(hits[2].1.hlc.physical_ms, 200);
+
+        // Inverted window → empty rather than panic.
+        assert!(mgr.scan_all_versions(10, 5, hlc(0)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_migration_is_idempotent_on_identical_payload() {
+        let mgr = fresh_manager().await;
+        let key: u64 = 42;
+        let ts = hlc(100);
+        let frame = b"payload-bytes";
+        let hash: [u8; 32] = *blake3::hash(frame).as_bytes();
+
+        let first = mgr
+            .append_migration(7, key, ts, hash, frame)
+            .await
+            .unwrap();
+        assert!(matches!(first, MigrationIngestOutcome::Inserted(_)));
+
+        let second = mgr
+            .append_migration(7, key, ts, hash, frame)
+            .await
+            .unwrap();
+        assert!(matches!(second, MigrationIngestOutcome::Duplicate(_)));
+
+        // Only one version at this (key, hlc) should exist.
+        let versions = mgr.scan_all_versions(key, key, hlc(0));
+        assert_eq!(versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn append_migration_rejects_conflicting_payload_for_same_slot() {
+        let mgr = fresh_manager().await;
+        let key: u64 = 99;
+        let ts = hlc(200);
+        let frame_a = b"original";
+        let hash_a: [u8; 32] = *blake3::hash(frame_a).as_bytes();
+        mgr.append_migration(1, key, ts, hash_a, frame_a)
+            .await
+            .unwrap();
+
+        // A peer claims different bytes for the exact same MVCC
+        // slot — the mismatch must fail loudly, not silently
+        // accept either side.
+        let frame_b = b"tampered";
+        let hash_b: [u8; 32] = *blake3::hash(frame_b).as_bytes();
+        let err = mgr
+            .append_migration(1, key, ts, hash_b, frame_b)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

@@ -42,7 +42,10 @@
 //! `Arc<RwLock<LogStoreInner>>` so `get_log_reader` can hand out
 //! a Self-typed reader that shares the same cache as the writer.
 
-use crate::consensus::{TieredSlab, WendelonRequest, WendelonResponse, WendelonTypeConfig};
+use crate::consensus::{
+    MigratedRangeTombstone, MigrationComplete, MigrationLedgerEntry, MigrationState, SeedMigration,
+    TieredSlab, WendelonRequest, WendelonResponse, WendelonTypeConfig,
+};
 use crate::schema::{
     HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, SnapshotHeader,
     WALRecordHeader,
@@ -471,6 +474,21 @@ pub struct SmState {
     /// lands here so they can unlink the L1 file.
     #[serde(default)]
     pub tiered_slabs: HashMap<u64, TieredSlab>,
+    /// Migration Ledger (Plan 019). Keyed by `migration_id` so
+    /// apply-time idempotency and chained-migration reconciliation
+    /// are both O(1). Entries never fall out of the map during
+    /// normal operation — completed migrations are retained as the
+    /// authoritative source-of-truth for future pulls; a dedicated
+    /// GC pass (follow-up work) trims entries once every source
+    /// replica has observed the corresponding tombstone.
+    #[serde(default)]
+    pub migrations: HashMap<u64, MigrationLedgerEntry>,
+    /// Logical "this range moved away" markers (Plan 019). Appended
+    /// on `MigrationComplete` so prior source replicas can fence
+    /// their former range out of future migration-source scans.
+    /// Physical reclaim is deferred to tombstone-aware compaction.
+    #[serde(default)]
+    pub tombstones: Vec<MigratedRangeTombstone>,
 }
 
 /// Out-of-band observer for [`TieredSlab`] apply events.
@@ -549,6 +567,19 @@ impl WendelonStateMachine {
     pub async fn seed_e_safe_for_test(&self, epoch: u64, hlc: HybridTimestamp) {
         let mut guard = self.inner.write().await;
         guard.state.e_safe_watermarks.insert(epoch, hlc);
+    }
+
+    /// Test-only hook to seed a Migration Ledger entry without
+    /// driving a `SeedMigration` through openraft. Lets data-ring
+    /// tests exercise the lazy-migration merge path (Plan 019)
+    /// against a controllable ledger shape.
+    #[cfg(test)]
+    pub async fn seed_migration_for_test(
+        &self,
+        entry: crate::consensus::MigrationLedgerEntry,
+    ) {
+        let mut guard = self.inner.write().await;
+        guard.state.migrations.insert(entry.migration_id, entry);
     }
 }
 
@@ -743,6 +774,123 @@ fn apply_request(
             state.tiered_slabs.insert(tier.slab_id, tier.clone());
             (WendelonResponse::Success, Some(tier))
         }
+        WendelonRequest::SeedMigration(seed) => {
+            apply_seed_migration(state, seed);
+            (WendelonResponse::Success, None)
+        }
+        WendelonRequest::MigrationComplete(done) => {
+            apply_migration_complete(state, done);
+            (WendelonResponse::Success, None)
+        }
+    }
+}
+
+/// Fold a [`SeedMigration`] into the ledger. Idempotent: a replay
+/// with the same `migration_id` is a no-op rather than an error
+/// so the Control Ring can safely retry seeding during an epoch
+/// transition.
+fn apply_seed_migration(state: &mut SmState, seed: SeedMigration) {
+    if state.migrations.contains_key(&seed.entry.migration_id) {
+        return;
+    }
+    state.migrations.insert(seed.entry.migration_id, seed.entry);
+}
+
+/// Apply a [`MigrationComplete`]. Validates the redundant range /
+/// epoch / floor fields against the live ledger entry and — on
+/// match — transitions the entry to `Completed`, installs a
+/// tombstone, and advances any descendant entries that were
+/// sourcing from the superseded physical holder.
+///
+/// A stale `migration_id` or a mismatch on any validated field
+/// silently drops the request. Raft's happy path does not race
+/// here (the leader is the one proposing), but dropping rather
+/// than erroring keeps the state machine deterministic under
+/// replay.
+fn apply_migration_complete(state: &mut SmState, done: MigrationComplete) {
+    let matches = state
+        .migrations
+        .get(&done.migration_id)
+        .map(|e| {
+            e.range_start == done.range_start
+                && e.range_end == done.range_end
+                && e.to_epoch == done.to_epoch
+                && e.migration_hlc_floor == done.migration_hlc_floor
+        })
+        .unwrap_or(false);
+    if !matches {
+        return;
+    }
+
+    {
+        let entry = state
+            .migrations
+            .get_mut(&done.migration_id)
+            .expect("matched above");
+        if entry.state == MigrationState::Completed {
+            return; // idempotent replay
+        }
+        entry.state = MigrationState::Completed;
+        entry.completed_by = Some(done.completed_by);
+        entry.completed_at_hlc = Some(done.completed_at_hlc);
+    }
+
+    state.tombstones.push(MigratedRangeTombstone {
+        migration_id: done.migration_id,
+        range_start: done.range_start,
+        range_end: done.range_end,
+        to_epoch: done.to_epoch,
+        completed_by: done.completed_by,
+        migration_hlc_floor: done.migration_hlc_floor,
+    });
+
+    // Descendant reconciliation under the drain-all rule.
+    //
+    // `pull_migration_range` now requires *every* entry in
+    // `source_replicas` to drain successfully — any failure
+    // surfaces `MIGRATION_INCOMPLETE` to the client. That means
+    // retaining a superseded physical holder in the candidate
+    // list is not a performance hint: if the old holder is later
+    // unreachable, the descendant pull fails even when the new
+    // authoritative source has every byte the chain needs.
+    //
+    // So we split the two cases:
+    //
+    // * **Direct descendant** (`upstream_migration_id ==
+    //   Some(completed_id)`): the predecessor has just published
+    //   its authoritative drain. `completed_by` now owns every
+    //   version the predecessor's source set collectively held,
+    //   so we *replace* `source_replicas` with just
+    //   `[completed_by]` and clear the upstream link. Old
+    //   holders are dropped — the chain is now collapsed onto
+    //   the completed intermediate.
+    //
+    // * **Mere range overlap** (no upstream link): we only have
+    //   a hint that `completed_by` may hold useful bytes, not
+    //   proof that it subsumes the other sources. Keep the
+    //   existing candidates and prepend `completed_by` as a
+    //   preference.
+    let completed_id = done.migration_id;
+    for entry in state.migrations.values_mut() {
+        if entry.migration_id == completed_id {
+            continue;
+        }
+        if entry.state == MigrationState::Completed {
+            continue;
+        }
+        if entry.upstream_migration_id == Some(completed_id) {
+            entry.source_replicas.clear();
+            entry.source_replicas.push(done.completed_by);
+            entry.upstream_migration_id = None;
+            continue;
+        }
+        let overlaps = entry.range_start <= done.range_end
+            && done.range_start <= entry.range_end;
+        if !overlaps {
+            continue;
+        }
+        entry.source_replicas.retain(|n| n.id != done.completed_by.id);
+        entry.source_replicas.insert(0, done.completed_by);
     }
 }
 
@@ -822,6 +970,12 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
         EntryPayload::Normal(WendelonRequest::AcquireLease(l)) => (LogEntryKind::APPEND, l.epoch),
         EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
         EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
+        EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
+            (LogEntryKind::APPEND, s.entry.to_epoch)
+        }
+        EntryPayload::Normal(WendelonRequest::MigrationComplete(d)) => {
+            (LogEntryKind::APPEND, d.to_epoch)
+        }
         EntryPayload::Membership(_) => (LogEntryKind::CONFIG, 0),
         EntryPayload::Blank => (LogEntryKind::APPEND, 0),
     };
@@ -1098,5 +1252,312 @@ mod lease_tests {
         );
         assert_eq!(resp, WendelonResponse::Success);
         assert_eq!(state.leases.len(), 2);
+    }
+}
+
+// ============================================================
+//  MIGRATION LEDGER APPLY TESTS (Plan 019)
+// ============================================================
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::consensus::{
+        MigrationComplete, MigrationLedgerEntry, MigrationState, SeedMigration,
+    };
+    use crate::schema::{HybridTimestamp, NodeId as SchemaNodeId};
+
+    fn hlc(physical_ms: u64) -> HybridTimestamp {
+        HybridTimestamp {
+            physical_ms,
+            logical: 0,
+            node_id: 0,
+        }
+    }
+
+    fn node(id: u32) -> SchemaNodeId {
+        SchemaNodeId {
+            id,
+            _reserved: 0,
+        }
+    }
+
+    fn entry(
+        migration_id: u64,
+        range: (u64, u64),
+        to_epoch: u64,
+        owner: u32,
+        sources: Vec<u32>,
+        upstream: Option<u64>,
+    ) -> MigrationLedgerEntry {
+        MigrationLedgerEntry {
+            migration_id,
+            range_start: range.0,
+            range_end: range.1,
+            from_epoch: to_epoch - 1,
+            to_epoch,
+            logical_owner: node(owner),
+            upstream_migration_id: upstream,
+            source_replicas: sources.into_iter().map(node).collect(),
+            migration_hlc_floor: hlc(1_000),
+            state: MigrationState::Pending,
+            completed_by: None,
+            completed_at_hlc: None,
+        }
+    }
+
+    #[test]
+    fn seed_migration_inserts_ledger_entry() {
+        let mut state = SmState::default();
+        let (resp, _) = apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        assert_eq!(resp, WendelonResponse::Success);
+        let stored = state.migrations.get(&1).unwrap();
+        assert_eq!(stored.state, MigrationState::Pending);
+        assert_eq!(stored.logical_owner.id, 7);
+    }
+
+    #[test]
+    fn seed_migration_is_idempotent_on_replay() {
+        let mut state = SmState::default();
+        let mut e = entry(1, (0, 99), 2, 7, vec![1, 2], None);
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration { entry: e.clone() }),
+        );
+        // Simulate a racey replay with mutated source list; the
+        // second apply must leave the original untouched so the
+        // log is deterministic across replays.
+        e.source_replicas = vec![node(99)];
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration { entry: e }),
+        );
+        assert_eq!(state.migrations.len(), 1);
+        assert_eq!(state.migrations.get(&1).unwrap().source_replicas[0].id, 1);
+    }
+
+    #[test]
+    fn migration_complete_transitions_state_and_installs_tombstone() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(1_000),
+        };
+        let (resp, _) = apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+        assert_eq!(resp, WendelonResponse::Success);
+
+        let stored = state.migrations.get(&1).unwrap();
+        assert_eq!(stored.state, MigrationState::Completed);
+        assert_eq!(stored.completed_by, Some(node(7)));
+        assert_eq!(state.tombstones.len(), 1);
+        assert_eq!(state.tombstones[0].migration_id, 1);
+        assert_eq!(state.tombstones[0].completed_by.id, 7);
+    }
+
+    #[test]
+    fn migration_complete_rejects_mismatched_floor() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(9_999), // wrong
+        };
+        apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+        // Silently dropped — entry still pending, no tombstone.
+        assert_eq!(
+            state.migrations.get(&1).unwrap().state,
+            MigrationState::Pending
+        );
+        assert!(state.tombstones.is_empty());
+    }
+
+    #[test]
+    fn migration_complete_is_idempotent_on_replay() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(1_000),
+        };
+        apply_request(
+            &mut state,
+            WendelonRequest::MigrationComplete(done.clone()),
+        );
+        apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+        // Exactly one tombstone even after the replay.
+        assert_eq!(state.tombstones.len(), 1);
+    }
+
+    #[test]
+    fn migration_complete_advances_descendant_source_replicas() {
+        // A -> B -> C chain: ledger holds two entries with
+        // overlapping ranges; descendant (migration_id=2) points at
+        // the original physical holders until predecessor commits.
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(2, (0, 99), 3, 8, vec![1, 2], Some(1)),
+            }),
+        );
+
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(1_000),
+        };
+        apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+
+        // Descendant now prefers the newly completed holder — the
+        // completed_by node is hoisted to the front of source_replicas
+        // and the upstream pointer clears.
+        let descendant = state.migrations.get(&2).unwrap();
+        assert_eq!(descendant.source_replicas[0].id, 7);
+        assert_eq!(descendant.upstream_migration_id, None);
+        assert_eq!(descendant.state, MigrationState::Pending);
+    }
+
+    /// Regression for Round 3 High #2: a direct descendant
+    /// (`upstream_migration_id == Some(completed_id)`) must drop the
+    /// predecessor's original physical holders entirely, not merely
+    /// prepend `completed_by`. Under the drain-all rule any remaining
+    /// holder still in the list would be required to ack — a down
+    /// original holder would then fail the descendant's pull even
+    /// after `completed_by` drained successfully. Once the predecessor
+    /// publishes its authoritative drain, `completed_by` subsumes
+    /// the predecessor's source set, so the descendant's list is
+    /// collapsed to `[completed_by]`.
+    #[test]
+    fn chained_descendant_drops_superseded_holders_on_complete() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2, 3], None),
+            }),
+        );
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(2, (0, 99), 3, 8, vec![1, 2, 3], Some(1)),
+            }),
+        );
+
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(1_000),
+        };
+        apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+
+        let descendant = state.migrations.get(&2).unwrap();
+        let ids: Vec<u32> = descendant
+            .source_replicas
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![7],
+            "chained descendant must replace source list with [completed_by], \
+             not retain superseded holders under the drain-all rule"
+        );
+        assert_eq!(descendant.upstream_migration_id, None);
+    }
+
+    /// Pure range-overlap (no `upstream_migration_id` link) should
+    /// still prepend `completed_by` while preserving the existing
+    /// holders — we only *hint* at a better source, we do not claim
+    /// it subsumes the overlapping entry's full history.
+    #[test]
+    fn range_overlap_without_upstream_preserves_existing_sources() {
+        let mut state = SmState::default();
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(1, (0, 99), 2, 7, vec![1, 2], None),
+            }),
+        );
+        // Overlapping range, but no upstream link — an independent
+        // migration that happens to share bytes.
+        apply_request(
+            &mut state,
+            WendelonRequest::SeedMigration(SeedMigration {
+                entry: entry(2, (50, 150), 3, 8, vec![3, 4], None),
+            }),
+        );
+
+        let done = MigrationComplete {
+            migration_id: 1,
+            range_start: 0,
+            range_end: 99,
+            to_epoch: 2,
+            completed_by: node(7),
+            completed_at_hlc: hlc(2_000),
+            migration_hlc_floor: hlc(1_000),
+        };
+        apply_request(&mut state, WendelonRequest::MigrationComplete(done));
+
+        let descendant = state.migrations.get(&2).unwrap();
+        let ids: Vec<u32> = descendant
+            .source_replicas
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![7, 3, 4],
+            "overlap-only case must prepend completed_by, not replace"
+        );
     }
 }

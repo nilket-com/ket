@@ -1,4 +1,4 @@
-use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId};
+use crate::schema::{FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId};
 use serde::{Deserialize, Serialize};
 
 /// Payload of a `TierSlab` Raft entry (ADR 006).
@@ -34,6 +34,101 @@ impl std::fmt::Display for NodeId {
     }
 }
 
+/// Lifecycle state of a [`MigrationLedgerEntry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MigrationState {
+    /// Entry seeded; no node has successfully pulled a page yet.
+    Pending,
+    /// The logical owner has started ingesting retained versions
+    /// via `append_migration`. Not durably used today, but
+    /// reserved so a richer progress view can land without a
+    /// schema migration.
+    BackfillInProgress,
+    /// The logical owner has drained the range at the pinned
+    /// floor and committed `MigrationComplete`. The ledger entry
+    /// is now authoritative: future chained migrations source
+    /// from `completed_by` rather than the original replicas.
+    Completed,
+}
+
+/// One row of the Raft-persisted Migration Ledger (Plan 019).
+///
+/// When the Control Ring advances from `ring(E)` to `ring(E+1)`,
+/// every reassigned hash range gets a ledger entry so both the
+/// read-path fallback and the background sweeper converge on the
+/// same lineage. The `migration_hlc_floor` is pinned once at
+/// creation and never slides — source and destination must agree
+/// exactly on which versions belong to the migration set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationLedgerEntry {
+    /// Deterministic identifier derived from (`to_epoch`,
+    /// `range_start`, `range_end`). Survives restarts because it
+    /// is stamped on Raft commit, not minted per process.
+    pub migration_id: u64,
+    pub range_start: u64,
+    pub range_end: u64,
+    /// Epoch the range used to live in.
+    pub from_epoch: u64,
+    /// Epoch the range now logically belongs to.
+    pub to_epoch: u64,
+    /// Current logical owner. Only this node may issue a
+    /// `MIGRATE_REQ` against a peer for this entry.
+    pub logical_owner: NodeId,
+    /// Ancestor migration, if any. Set when a chained migration
+    /// lands before the previous one completed so descendants can
+    /// be reconciled in [`apply_request`].
+    pub upstream_migration_id: Option<u64>,
+    /// Ordered pull candidates. First candidate is the preferred
+    /// source; followers try the rest on `INTERNAL_ERROR`. The
+    /// list is mutable inside the ledger — `MigrationComplete`
+    /// advances descendants to prefer the new physical holder.
+    pub source_replicas: Vec<NodeId>,
+    /// Pinned MVCC cutoff. Migration ingests every version with
+    /// `hlc >= migration_hlc_floor`.
+    pub migration_hlc_floor: HybridTimestamp,
+    pub state: MigrationState,
+    pub completed_by: Option<NodeId>,
+    pub completed_at_hlc: Option<HybridTimestamp>,
+}
+
+/// Proposed by the Control Ring during an epoch transition to
+/// seed one ledger entry per reassigned range. Kept as a thin
+/// value type so future Control Ring work can propose many of
+/// these in a single batch without reshaping `WendelonRequest`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedMigration {
+    pub entry: MigrationLedgerEntry,
+}
+
+/// Proposed by the logical owner once it has drained the ledger
+/// range at the pinned floor. The redundant range / epoch / floor
+/// fields let the state machine reject a stale commit rather than
+/// blindly trusting a replayed `migration_id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationComplete {
+    pub migration_id: u64,
+    pub range_start: u64,
+    pub range_end: u64,
+    pub to_epoch: u64,
+    pub completed_by: NodeId,
+    pub completed_at_hlc: HybridTimestamp,
+    pub migration_hlc_floor: HybridTimestamp,
+}
+
+/// Logical "this range moved away" marker held on prior source
+/// replicas. Fences the range out of future migration-source
+/// scans without requiring an immediate slab rewrite; physical
+/// reclaim happens later during tombstone-aware compaction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigratedRangeTombstone {
+    pub migration_id: u64,
+    pub range_start: u64,
+    pub range_end: u64,
+    pub to_epoch: u64,
+    pub completed_by: NodeId,
+    pub migration_hlc_floor: HybridTimestamp,
+}
+
 /// The state machine application data (mutations).
 /// In HashRaft, the actual data (Arrow batches) never enters the Raft log (ADR 003).
 /// The Raft log only contains control-ring metadata and Data Ring finalization markers.
@@ -51,6 +146,15 @@ pub enum WendelonRequest {
     /// to record the L2 pointer and — via the tier observer — the
     /// local `SlabManager` to pivot reads and unlink the L1 file.
     TierSlab(TieredSlab),
+    /// Seed a Migration Ledger entry for a reassigned range
+    /// (Plan 019). Idempotent: a replay with the same
+    /// `migration_id` is a no-op.
+    SeedMigration(SeedMigration),
+    /// Finish a migration: transitions the ledger entry to
+    /// `Completed`, installs a tombstone on prior source
+    /// replicas, and advances any descendant entries that were
+    /// sourcing from the now-superseded physical holder.
+    MigrationComplete(MigrationComplete),
 }
 
 /// The response returned to the client after a Raft command is committed.

@@ -300,6 +300,14 @@ impl MsgType {
     // stream. One QUERY_REQ begets exactly one QUERY_RESP.
     pub const QUERY_REQ:       Self = Self(0x0B);
     pub const QUERY_RESP:      Self = Self(0x0C);
+    // Peer-only lazy-migration RPCs (ADR 006 + Plan 019). A new
+    // owner pulls retained key versions from a prior physical
+    // holder when a ledger entry names the range `Pending`. The
+    // RPC bypasses lease checks but validates the migration id and
+    // pinned `migration_hlc_floor` against the state machine's
+    // Migration Ledger.
+    pub const MIGRATE_REQ:     Self = Self(0x0D);
+    pub const MIGRATE_RESP:    Self = Self(0x0E);
 
     // control ring
     pub const TRANSFER_REQ:    Self = Self(0x10);
@@ -508,6 +516,12 @@ impl ReadStatus {
     pub const NOT_LEADER:    Self = Self(3);
     pub const LEASE_EXPIRED: Self = Self(4);
     pub const E_SAFE_BEHIND: Self = Self(5); // Follower's e_safe < required; retry leader
+    /// The query path could not complete its lazy-migration fan-out
+    /// (Plan 019). One or more ledger-overlapping source replicas
+    /// were unreachable or returned a non-OK status, so a local
+    /// scan would miss versions only held on those sources. The
+    /// client must retry; the answer is explicitly *not* partial.
+    pub const MIGRATION_INCOMPLETE: Self = Self(6);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -590,6 +604,136 @@ pub struct QueryResponseMeta {
 }
 
 // ============================================================
+//  MIGRATE REQUEST METADATA — 96 bytes, fixed
+//
+//  Lazy-migration pull frame (ADR 006 + Plan 019). The new owner
+//  asks a prior physical holder for retained versions in its
+//  `[range_start, range_end]` window whose `hlc >=
+//  migration_hlc_floor`. The server validates the request against
+//  its state-machine Migration Ledger and returns raw retained
+//  records in an Arrow IPC batch shaped by
+//  [`migration_record_schema`].
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MigrateRequestMeta {
+    pub migration_id: u64,                 //  8
+    /// The destination's belief about the current ownership epoch.
+    /// The server rejects with `STALE_LEDGER` if its own ledger
+    /// entry has advanced past this value.
+    pub expected_to_epoch: u64,            //  8
+    /// Identity of the node pulling the data. Must match the
+    /// ledger's `logical_owner` for this migration.
+    pub requester: NodeId,                 //  8
+    /// Inclusive lower bound of the hash range being pulled.
+    pub range_start: u64,                  //  8
+    /// Inclusive upper bound.
+    pub range_end: u64,                    //  8
+    /// Pinned MVCC cutoff. Every version with `hlc >=
+    /// migration_hlc_floor` is migration-eligible; older versions
+    /// fall outside the ADR 013 retention window and are skipped.
+    /// Must match the floor stored on the server's ledger entry.
+    pub migration_hlc_floor: HybridTimestamp, // 16
+    /// Pagination cursor — key hash the prior page stopped within.
+    /// Zero together with `cursor_hlc` means "start at the range
+    /// floor"; non-zero means the source was in the middle of
+    /// emitting versions for this key when `max_records` /
+    /// `max_bytes` tripped.
+    pub cursor_hash: u64,                  //  8
+    /// HLC of the last version emitted for `cursor_hash` on the
+    /// prior page. Combined with `cursor_hash`, it lets the source
+    /// resume strictly after the last emitted MVCC slot so a fat
+    /// key with more versions than fit in one page is still
+    /// streamed exhaustively.
+    pub cursor_hlc: HybridTimestamp,       // 16
+    /// Server-enforced caps on the response size.
+    pub max_records: u32,                  //  4
+    pub max_bytes: u32,                    //  4
+    /// 0 = PointLookup, 1 = RangePage. Point lookups return every
+    /// retained version of exactly one key; range pages walk the
+    /// inclusive window keyed by `(cursor_hash, cursor_hlc)`.
+    pub kind: MigrateRequestKind,          //  1
+    pub _pad: [u8; 7],                     //  7
+}
+
+/// Request kind discriminant rides inside [`MigrateRequestMeta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MigrateRequestKind(pub u8);
+
+impl MigrateRequestKind {
+    /// Serve every retained version of the single key whose hash
+    /// matches `range_start` (and implicitly `range_end`). Used by
+    /// the read-path fallback for point reads.
+    pub const POINT_LOOKUP: Self = Self(0);
+    /// Serve up to (`max_records`, `max_bytes`) of retained
+    /// versions in the inclusive `[range_start, range_end]` window,
+    /// keyed off `cursor`. Used by the background sweeper.
+    pub const RANGE_PAGE:   Self = Self(1);
+}
+
+// ============================================================
+//  MIGRATE RESPONSE METADATA — 64 bytes, fixed
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MigrateResponseMeta {
+    pub status: MigrateStatus,             //  1
+    /// 1 when the server has more pages beyond
+    /// `(next_cursor_hash, next_cursor_hlc)`; 0 when this response
+    /// exhausted the source for the pinned floor.
+    pub has_more: u8,                      //  1
+    pub _pad0: [u8; 6],                    //  6
+    /// Echo of the request's `migration_id` so the caller can
+    /// correlate responses from fan-out pulls.
+    pub migration_id: u64,                 //  8
+    /// Populated on `REDIRECT` — the node the caller should retry
+    /// against. Zero for every other status.
+    pub source_hint: NodeId,               //  8
+    /// Key hash at which pagination should resume. Zero together
+    /// with `next_cursor_hlc` when `has_more == 0`.
+    pub next_cursor_hash: u64,             //  8
+    /// HLC of the last version emitted on this page for
+    /// `next_cursor_hash`. The follow-up request must skip
+    /// versions at or below this HLC so fat keys stream cleanly.
+    pub next_cursor_hlc: HybridTimestamp,  // 16
+    /// Number of retained versions packed into the response Arrow
+    /// batch. Lets the caller pre-size its ingest loop.
+    pub versions_returned: u64,            //  8
+    /// Byte length of the Arrow IPC section. Redundant with the
+    /// frame header's `arrow_len` but kept for schema symmetry
+    /// with the other response PODs in this module.
+    pub bytes_returned: u32,               //  4
+    pub _pad1: [u8; 4],                    //  4
+}
+
+/// Wire status byte for [`MigrateResponseMeta`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct MigrateStatus(pub u8);
+
+impl MigrateStatus {
+    pub const OK:             Self = Self(0);
+    /// The requester asked for a specific key via `POINT_LOOKUP`
+    /// and the server found no retained versions at or above the
+    /// pinned floor.
+    pub const KEY_NOT_FOUND:  Self = Self(1);
+    /// The server knows a more-current physical holder for this
+    /// range (for example, a chained migration completed on
+    /// another node). `source_hint` names the preferred target.
+    pub const REDIRECT:       Self = Self(2);
+    /// The requester's `expected_to_epoch` or `migration_id` no
+    /// longer matches the server's ledger — the caller must
+    /// refresh from Raft before retrying.
+    pub const STALE_LEDGER:   Self = Self(3);
+    /// The requester is not the named `logical_owner` for the
+    /// ledger entry. MIGRATE is a peer RPC, but the state machine
+    /// still enforces that only the current owner may pull.
+    pub const NOT_AUTHORIZED: Self = Self(4);
+    pub const INTERNAL_ERROR: Self = Self(5);
+}
+
+// ============================================================
 //  SLAB STORAGE METADATA
 // ============================================================
 
@@ -652,6 +796,24 @@ pub fn read_key_schema() -> Schema {
 pub fn read_value_schema() -> Schema {
     Schema::new(vec![
         Field::new("value", DataType::LargeBinary, true),  // null if KEY_NOT_FOUND
+    ])
+}
+
+/// Arrow schema for migration record batches (Plan 019). Each
+/// row is one retained version being streamed from a prior
+/// physical holder to the new logical owner. `frame_bytes` is
+/// the verbatim Arrow IPC payload the holder originally stored
+/// on disk — the receiver re-appends it via
+/// [`SlabManager::append_migration`](crate::storage::manager::SlabManager::append_migration)
+/// without reshaping.
+pub fn migration_record_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("key_hash",         DataType::UInt64, false),
+        Field::new("hlc_physical_ms",  DataType::UInt64, false),
+        Field::new("hlc_logical",      DataType::UInt32, false),
+        Field::new("hlc_node_id",      DataType::UInt32, false),
+        Field::new("payload_hash",     DataType::FixedSizeBinary(32), false),
+        Field::new("frame_bytes",      DataType::LargeBinary, false),
     ])
 }
 
@@ -817,6 +979,10 @@ const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 72);
 const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<MigrateRequestMeta>() == 96);
+const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 64);
+const _: () = assert!(std::mem::size_of::<MigrateRequestKind>() == 1);
+const _: () = assert!(std::mem::size_of::<MigrateStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
