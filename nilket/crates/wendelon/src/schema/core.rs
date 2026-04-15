@@ -384,7 +384,7 @@ pub struct ReplicaWriteRespMeta {
 }
 
 // ============================================================
-//  READ REQUEST METADATA — 40 bytes, fixed
+//  READ REQUEST METADATA — 56 bytes, fixed
 //  Actual key is in the Arrow payload.
 // ============================================================
 
@@ -409,6 +409,11 @@ pub struct ReadRequestMeta {
     /// Key length in Arrow payload (for fast routing)
     pub key_len: u32,                      //  4 bytes
     pub _pad2: [u8; 8],                    //  8 bytes
+    /// Time-travel upper bound (ADR 013). When non-zero, the
+    /// server returns the newest version whose `hlc <= as_of_hlc`
+    /// instead of the latest value. All-zero is the wire sentinel
+    /// for "no upper bound" and preserves the default read path.
+    pub as_of_hlc: HybridTimestamp,        // 16 bytes
 }
 
 // ============================================================
@@ -446,7 +451,7 @@ pub struct ReadResponseMeta {
 }
 
 // ============================================================
-//  QUERY REQUEST METADATA — 56 bytes, fixed
+//  QUERY REQUEST METADATA — 72 bytes, fixed
 //
 //  Carries the fixed envelope for a Smart Client pushdown scan
 //  (ADR 005). The WPBC bytecode itself rides in the frame's
@@ -471,6 +476,11 @@ pub struct QueryRequestMeta {
     /// means "no filter, all rows in range".
     pub bytecode_len: u32,                 //  4 bytes
     pub _pad2: [u8; 4],                    //  4 bytes
+    /// Time-travel upper bound (ADR 013). When non-zero, the scan
+    /// yields the newest version per key whose `hlc <= as_of_hlc`
+    /// and skips keys whose first version is still in the future.
+    /// All-zero is the sentinel for "no upper bound".
+    pub as_of_hlc: HybridTimestamp,        // 16 bytes
 }
 
 // ============================================================
@@ -724,9 +734,9 @@ const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 64);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
-const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 40);
+const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
-const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 72);
 const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);

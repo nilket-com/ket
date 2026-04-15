@@ -27,6 +27,19 @@
 //! offsets never alias, no additional locking is required. The index
 //! ([`DashMap`]) is independently lock-free.
 //!
+//! ## Multi-version index (ADR 013)
+//!
+//! Every key maps to a `Vec<RecordLocation>` sorted ascending by
+//! [`HybridTimestamp`]. A fresh mutation pushes a new version; old
+//! versions stay put so the read path can serve "AS OF" queries by
+//! binary-searching for the newest version whose `hlc <=
+//! as_of_hlc`. `lookup` returns the tail — the latest version — so
+//! present-day reads pay the same O(1) cost they did before the
+//! refactor. Retention is a separate knob: compaction does not drop
+//! versions while ADR 013's `RETENTION_WINDOW` still covers them,
+//! which is enforced by the background sweeper rather than this
+//! file.
+//!
 //! ## What this file does NOT do yet
 //!
 //! * Slab rotation / sealing when the active slab hits a size cap.
@@ -84,13 +97,27 @@ pub trait StorageEngine: Send + Sync {
     async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>>;
 
     /// Looks up a key's location in the in-memory index.
+    /// Returns the latest version, equivalent to
+    /// [`Self::lookup_as_of`] with the sentinel zero HLC.
     fn lookup(&self, key_hash: u64) -> Option<RecordLocation>;
+
+    /// Time-travel lookup (ADR 013). Returns the newest version
+    /// whose `hlc <= as_of_hlc`. A zero-valued `as_of_hlc` is the
+    /// sentinel for "no upper bound" and falls through to the same
+    /// behaviour as [`Self::lookup`].
+    fn lookup_as_of(
+        &self,
+        key_hash: u64,
+        as_of_hlc: HybridTimestamp,
+    ) -> Option<RecordLocation>;
 }
 
 /// A high-performance storage implementation using io_uring and O_DIRECT.
 pub struct LocalSlabStore {
-    /// In-memory index: KeyHash -> Disk Location.
-    pub index: DashMap<u64, RecordLocation>,
+    /// In-memory multi-version index: KeyHash -> versions sorted
+    /// ascending by HLC. The tail is the latest version; older
+    /// entries are retained for time-travel reads (ADR 013).
+    pub index: DashMap<u64, Vec<RecordLocation>>,
 
     /// Identity of the active slab file. Written into every
     /// [`RecordLocation`] so reads can route to the right file once
@@ -255,7 +282,14 @@ impl StorageEngine for LocalSlabStore {
             length: payload_size as u32,
             hlc,
         };
-        self.index.insert(key_hash, location);
+        // DashMap's `entry` API gives us an atomic read-modify-write
+        // on the per-key version chain, so concurrent appends on
+        // different HLCs for the same key cannot interleave their
+        // insertions.
+        self.index
+            .entry(key_hash)
+            .and_modify(|versions| insert_version_sorted(versions, location))
+            .or_insert_with(|| vec![location]);
         Ok(location)
     }
 
@@ -317,8 +351,64 @@ impl StorageEngine for LocalSlabStore {
     }
 
     fn lookup(&self, key_hash: u64) -> Option<RecordLocation> {
-        self.index.get(&key_hash).map(|r| *r)
+        self.index.get(&key_hash).and_then(|v| v.last().copied())
     }
+
+    fn lookup_as_of(
+        &self,
+        key_hash: u64,
+        as_of_hlc: HybridTimestamp,
+    ) -> Option<RecordLocation> {
+        let versions = self.index.get(&key_hash)?;
+        newest_version_as_of(versions.value(), as_of_hlc)
+    }
+}
+
+/// Insert `loc` into a per-key version chain, keeping the vec
+/// sorted ascending by HLC. Used on both the live append path and
+/// by recovery / index-drain helpers; sharing the invariant in one
+/// place means the rest of the file can rely on "tail = latest".
+pub(crate) fn insert_version_sorted(versions: &mut Vec<RecordLocation>, loc: RecordLocation) {
+    // `binary_search_by_key` returns `Err(pos)` when the key is
+    // absent. On exact-HLC collisions we still insert (after the
+    // existing entry) so replays and duplicate writes land
+    // deterministically rather than getting silently deduped.
+    let pos = match versions.binary_search_by_key(&loc.hlc, |l| l.hlc) {
+        Ok(p) => p + 1,
+        Err(p) => p,
+    };
+    versions.insert(pos, loc);
+}
+
+/// Shared "AS OF" resolver over an HLC-sorted version chain. The
+/// zero HLC is the wire sentinel for "no upper bound", so the
+/// common case (no time-travel) returns the tail exactly like
+/// [`StorageEngine::lookup`].
+pub(crate) fn newest_version_as_of(
+    versions: &[RecordLocation],
+    as_of_hlc: HybridTimestamp,
+) -> Option<RecordLocation> {
+    if is_zero_hlc(as_of_hlc) {
+        return versions.last().copied();
+    }
+    // `partition_point` gives the index of the first element with
+    // `hlc > as_of_hlc`. Everything before it satisfies the
+    // predicate, so the last one (index - 1) is the newest
+    // version eligible for this `as_of`.
+    let cutoff = versions.partition_point(|l| l.hlc <= as_of_hlc);
+    if cutoff == 0 {
+        None
+    } else {
+        Some(versions[cutoff - 1])
+    }
+}
+
+/// Zero-HLC sentinel check. Kept as a helper so the meaning reads
+/// the same at every call site instead of open-coding the field
+/// compares.
+#[inline]
+pub(crate) fn is_zero_hlc(hlc: HybridTimestamp) -> bool {
+    hlc.physical_ms == 0 && hlc.logical == 0 && hlc.node_id == 0
 }
 
 /// Round `n` up to the next multiple of [`DIRECT_IO_ALIGN`].
@@ -354,11 +444,11 @@ fn page_round_up(n: usize) -> usize {
 fn recover_slab(
     file: &File,
     slab_id: u64,
-) -> std::io::Result<(DashMap<u64, RecordLocation>, u64)> {
+) -> std::io::Result<(DashMap<u64, Vec<RecordLocation>>, u64)> {
     use std::os::unix::fs::FileExt;
 
     let file_size = file.metadata()?.len();
-    let index = DashMap::new();
+    let index: DashMap<u64, Vec<RecordLocation>> = DashMap::new();
     let header_size = std::mem::size_of::<SlabRecordHeader>();
     // One page is enough for the header probe — every record
     // starts on a page boundary and the header occupies only the
@@ -409,15 +499,16 @@ fn recover_slab(
             break;
         }
 
-        index.insert(
-            header.key_hash,
-            RecordLocation {
-                slab_id,
-                offset: cursor,
-                length: payload_size as u32,
-                hlc: header.hlc,
-            },
-        );
+        let location = RecordLocation {
+            slab_id,
+            offset: cursor,
+            length: payload_size as u32,
+            hlc: header.hlc,
+        };
+        index
+            .entry(header.key_hash)
+            .and_modify(|versions| insert_version_sorted(versions, location))
+            .or_insert_with(|| vec![location]);
         cursor += padded;
     }
 
@@ -465,4 +556,94 @@ fn verify_record_checksum(header: &SlabRecordHeader, frame: &[u8]) -> std::io::R
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hlc(ms: u64, logical: u32) -> HybridTimestamp {
+        HybridTimestamp {
+            physical_ms: ms,
+            logical,
+            node_id: 0,
+        }
+    }
+
+    fn loc(hlc: HybridTimestamp, offset: u64) -> RecordLocation {
+        RecordLocation {
+            slab_id: 0,
+            offset,
+            length: 4096,
+            hlc,
+        }
+    }
+
+    #[test]
+    fn insert_version_sorted_maintains_ascending_hlc_order() {
+        let mut versions = Vec::new();
+        insert_version_sorted(&mut versions, loc(hlc(30, 0), 2));
+        insert_version_sorted(&mut versions, loc(hlc(10, 0), 0));
+        insert_version_sorted(&mut versions, loc(hlc(20, 0), 1));
+        insert_version_sorted(&mut versions, loc(hlc(40, 0), 3));
+
+        let hlcs: Vec<u64> = versions.iter().map(|l| l.hlc.physical_ms).collect();
+        assert_eq!(hlcs, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn insert_version_sorted_keeps_duplicate_hlcs_in_insertion_order() {
+        // Two writes at the identical HLC (replay or cross-leader
+        // race) must both land — the sweeper can resolve them
+        // later, but the index must not silently drop one.
+        let mut versions = Vec::new();
+        insert_version_sorted(&mut versions, loc(hlc(10, 0), 0));
+        insert_version_sorted(&mut versions, loc(hlc(10, 0), 1));
+        insert_version_sorted(&mut versions, loc(hlc(10, 0), 2));
+
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].offset, 0);
+        assert_eq!(versions[2].offset, 2);
+    }
+
+    #[test]
+    fn newest_version_as_of_with_zero_hlc_returns_latest() {
+        let versions = vec![
+            loc(hlc(10, 0), 0),
+            loc(hlc(20, 0), 1),
+            loc(hlc(30, 0), 2),
+        ];
+        let latest = newest_version_as_of(&versions, hlc(0, 0)).unwrap();
+        assert_eq!(latest.offset, 2);
+    }
+
+    #[test]
+    fn newest_version_as_of_returns_version_at_or_before_bound() {
+        let versions = vec![
+            loc(hlc(10, 0), 0),
+            loc(hlc(20, 0), 1),
+            loc(hlc(30, 0), 2),
+        ];
+        // Bound sits exactly on a version -> that version.
+        assert_eq!(
+            newest_version_as_of(&versions, hlc(20, 0)).unwrap().offset,
+            1
+        );
+        // Bound between versions -> the older one.
+        assert_eq!(
+            newest_version_as_of(&versions, hlc(25, 0)).unwrap().offset,
+            1
+        );
+        // Bound past all versions -> the latest.
+        assert_eq!(
+            newest_version_as_of(&versions, hlc(99, 0)).unwrap().offset,
+            2
+        );
+    }
+
+    #[test]
+    fn newest_version_as_of_before_first_version_returns_none() {
+        let versions = vec![loc(hlc(10, 0), 0), loc(hlc(20, 0), 1)];
+        assert!(newest_version_as_of(&versions, hlc(5, 0)).is_none());
+    }
 }

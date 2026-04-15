@@ -41,7 +41,9 @@
 //!   for now; remote upload is ADR 006's problem.
 
 use crate::schema::HybridTimestamp;
-use crate::storage::core::{LocalSlabStore, RecordLocation, StorageEngine};
+use crate::storage::core::{
+    insert_version_sorted, newest_version_as_of, LocalSlabStore, RecordLocation, StorageEngine,
+};
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
 use async_trait::async_trait;
@@ -94,9 +96,11 @@ pub struct TieredSlabPointer {
 pub struct SlabManager {
     config: SlabManagerConfig,
     state: Mutex<ManagerState>,
-    /// Authoritative key → location index, aggregated across all
-    /// active and sealed slabs.
-    key_index: DashMap<u64, RecordLocation>,
+    /// Authoritative key → version chain, aggregated across all
+    /// active and sealed slabs. Per ADR 013 the chain stores every
+    /// version sorted ascending by HLC; the tail is the current
+    /// value and earlier entries back time-travel reads.
+    key_index: DashMap<u64, Vec<RecordLocation>>,
 }
 
 struct ManagerState {
@@ -150,7 +154,7 @@ impl SlabManager {
         let mut existing_ids = discover_slab_ids(&config.dir)?;
         existing_ids.sort_unstable();
 
-        let key_index = DashMap::new();
+        let key_index: DashMap<u64, Vec<RecordLocation>> = DashMap::new();
         let sealed: DashMap<u64, Arc<LocalSlabStore>> = DashMap::new();
         let tiered: DashMap<u64, TieredSlabPointer> = DashMap::new();
 
@@ -317,8 +321,30 @@ impl SlabManager {
     /// The returned pairs are sorted by `key_hash` so the scan is
     /// deterministic — useful for debugging and for the client's
     /// pagination cursor, which is keyed on the highest observed
-    /// hash.
+    /// hash. Every key yields only its latest version; use
+    /// [`Self::scan_as_of`] for time-travel scans.
     pub fn scan(&self, start_hash: u64, end_hash: u64) -> Vec<(u64, RecordLocation)> {
+        self.scan_as_of(
+            start_hash,
+            end_hash,
+            HybridTimestamp {
+                physical_ms: 0,
+                logical: 0,
+                node_id: 0,
+            },
+        )
+    }
+
+    /// Time-travel scan (ADR 013). Behaves like [`Self::scan`] but
+    /// reports the newest version whose `hlc <= as_of_hlc`. A
+    /// zero-valued `as_of_hlc` is the wire sentinel for "no upper
+    /// bound" and falls through to the latest-version scan.
+    pub fn scan_as_of(
+        &self,
+        start_hash: u64,
+        end_hash: u64,
+        as_of_hlc: HybridTimestamp,
+    ) -> Vec<(u64, RecordLocation)> {
         if start_hash > end_hash {
             return Vec::new();
         }
@@ -327,11 +353,10 @@ impl SlabManager {
             .iter()
             .filter_map(|entry| {
                 let h = *entry.key();
-                if h >= start_hash && h <= end_hash {
-                    Some((h, *entry.value()))
-                } else {
-                    None
+                if h < start_hash || h > end_hash {
+                    return None;
                 }
+                newest_version_as_of(entry.value(), as_of_hlc).map(|loc| (h, loc))
             })
             .collect();
         out.sort_by_key(|(h, _)| *h);
@@ -405,10 +430,14 @@ impl StorageEngine for SlabManager {
     ) -> std::io::Result<RecordLocation> {
         let slab = self.target_for_append().await?;
         let location = slab.append(key_hash, hlc, frame).await?;
-        // The per-slab `append` already inserted into its local
-        // index; mirror into the manager's authoritative index so
-        // `lookup` stays O(1) without cross-slab scanning.
-        self.key_index.insert(key_hash, location);
+        // The per-slab `append` already pushed the new version onto
+        // its local chain; mirror it into the manager's
+        // authoritative multi-version index so `lookup` /
+        // `lookup_as_of` stay O(1) without cross-slab scanning.
+        self.key_index
+            .entry(key_hash)
+            .and_modify(|versions| insert_version_sorted(versions, location))
+            .or_insert_with(|| vec![location]);
         Ok(location)
     }
 
@@ -424,7 +453,18 @@ impl StorageEngine for SlabManager {
     }
 
     fn lookup(&self, key_hash: u64) -> Option<RecordLocation> {
-        self.key_index.get(&key_hash).map(|r| *r)
+        self.key_index
+            .get(&key_hash)
+            .and_then(|v| v.last().copied())
+    }
+
+    fn lookup_as_of(
+        &self,
+        key_hash: u64,
+        as_of_hlc: HybridTimestamp,
+    ) -> Option<RecordLocation> {
+        let versions = self.key_index.get(&key_hash)?;
+        newest_version_as_of(versions.value(), as_of_hlc)
     }
 }
 
@@ -516,13 +556,134 @@ fn discover_slab_ids(dir: &Path) -> std::io::Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Copy every entry from a freshly opened slab's local index into
-/// the manager's aggregated index. Called exactly once per slab —
-/// at `open` for the first slab and at rotation for every
-/// subsequent one (where the drain is trivially empty for a fresh
-/// file).
-fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<u64, RecordLocation>) {
+/// Merge every version from a freshly opened slab's local index
+/// into the manager's aggregated multi-version index. Called
+/// exactly once per slab — at `open` for the first slab and at
+/// rotation for every subsequent one (where the drain is trivially
+/// empty for a fresh file).
+///
+/// Per-slab chains are already sorted; we walk them and insert
+/// each version via [`insert_version_sorted`] so the aggregated
+/// chain stays sorted globally even when older slabs contain
+/// versions that post-date newer slabs (a legal outcome of leader
+/// changes or cross-slab rewrites).
+fn drain_slab_index(
+    slab: &LocalSlabStore,
+    key_index: &DashMap<u64, Vec<RecordLocation>>,
+) {
     for entry in slab.index.iter() {
-        key_index.insert(*entry.key(), *entry.value());
+        let key = *entry.key();
+        for loc in entry.value().iter() {
+            key_index
+                .entry(key)
+                .and_modify(|versions| insert_version_sorted(versions, *loc))
+                .or_insert_with(|| vec![*loc]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::io_uring::spawn_io_thread;
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wendelon-manager-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn hlc(ms: u64) -> HybridTimestamp {
+        HybridTimestamp {
+            physical_ms: ms,
+            logical: 0,
+            node_id: 1,
+        }
+    }
+
+    async fn fresh_manager() -> Arc<SlabManager> {
+        let dir = fresh_dir("mv");
+        let io = spawn_io_thread(64).unwrap();
+        Arc::new(
+            SlabManager::open(SlabManagerConfig {
+                dir,
+                // Large enough that no rotation fires during tests;
+                // we want every version in the same active slab so
+                // the test targets the multi-version index
+                // semantics rather than cross-slab drain behaviour.
+                max_slab_bytes: 1024 * 1024,
+                io,
+                l2: None,
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lookup_returns_latest_version_after_multiple_appends() {
+        let mgr = fresh_manager().await;
+        let key: u64 = 42;
+        mgr.append(key, hlc(10), b"v1").await.unwrap();
+        mgr.append(key, hlc(20), b"v2").await.unwrap();
+        mgr.append(key, hlc(30), b"v3").await.unwrap();
+
+        let latest = mgr.lookup(key).expect("key present");
+        assert_eq!(latest.hlc.physical_ms, 30);
+    }
+
+    #[tokio::test]
+    async fn lookup_as_of_returns_historical_version() {
+        let mgr = fresh_manager().await;
+        let key: u64 = 7;
+        mgr.append(key, hlc(10), b"v1").await.unwrap();
+        mgr.append(key, hlc(20), b"v2").await.unwrap();
+        mgr.append(key, hlc(30), b"v3").await.unwrap();
+
+        assert_eq!(
+            mgr.lookup_as_of(key, hlc(15)).unwrap().hlc.physical_ms,
+            10
+        );
+        assert_eq!(
+            mgr.lookup_as_of(key, hlc(20)).unwrap().hlc.physical_ms,
+            20
+        );
+        assert_eq!(
+            mgr.lookup_as_of(key, hlc(25)).unwrap().hlc.physical_ms,
+            20
+        );
+        // Bound before the first write -> nothing visible yet.
+        assert!(mgr.lookup_as_of(key, hlc(5)).is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_as_of_filters_versions_per_key() {
+        let mgr = fresh_manager().await;
+        // Two keys in the same range, each with two versions at
+        // different HLCs.
+        mgr.append(1, hlc(10), b"a@10").await.unwrap();
+        mgr.append(1, hlc(30), b"a@30").await.unwrap();
+        mgr.append(2, hlc(20), b"b@20").await.unwrap();
+        mgr.append(2, hlc(40), b"b@40").await.unwrap();
+
+        // AS OF 25 — should see key=1 at 10 (20 hasn't landed),
+        // key=2 at 20.
+        let at_25 = mgr.scan_as_of(0, u64::MAX, hlc(25));
+        assert_eq!(at_25.len(), 2);
+        assert_eq!(at_25[0].0, 1);
+        assert_eq!(at_25[0].1.hlc.physical_ms, 10);
+        assert_eq!(at_25[1].0, 2);
+        assert_eq!(at_25[1].1.hlc.physical_ms, 20);
+
+        // AS OF 5 — nothing visible yet.
+        assert!(mgr.scan_as_of(0, u64::MAX, hlc(5)).is_empty());
+
+        // Zero sentinel -> latest versions.
+        let latest = mgr.scan(0, u64::MAX);
+        assert_eq!(latest[0].1.hlc.physical_ms, 30);
+        assert_eq!(latest[1].1.hlc.physical_ms, 40);
     }
 }

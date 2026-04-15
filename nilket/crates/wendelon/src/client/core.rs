@@ -282,6 +282,10 @@ impl WendelonClient {
     ///   is deferred.
     /// * `expected_epoch` / `min_hlc` / `consistency` carry the
     ///   client's freshness bound straight through to the server.
+    /// * `as_of_hlc` is the ADR 013 time-travel upper bound. The
+    ///   zero HLC means "no upper bound" — the normal case. Any
+    ///   non-zero value asks the server to return the newest
+    ///   version per key whose `hlc <= as_of_hlc`.
     ///
     /// On `NOT_LEADER` or `E_SAFE_BEHIND` the client refreshes
     /// topology and retries exactly once against the server's
@@ -293,6 +297,7 @@ impl WendelonClient {
         expected_epoch: u64,
         min_hlc: HybridTimestamp,
         consistency: Consistency,
+        as_of_hlc: HybridTimestamp,
     ) -> std::io::Result<QueryResult> {
         let target = self.pick_target(range.start_hash).ok_or_else(|| {
             Error::new(
@@ -309,6 +314,7 @@ impl WendelonClient {
             key_range_end: range.end_hash,
             bytecode_len: wpbc_ast.len() as u32,
             _pad2: [0; 4],
+            as_of_hlc,
         };
 
         match self.query_once(target, &meta, &wpbc_ast).await {

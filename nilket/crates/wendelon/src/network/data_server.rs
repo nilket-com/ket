@@ -680,7 +680,7 @@ impl DataRing for WendelonDataServer {
         // 2. Hash the key payload and probe the slab index.
         let key_bytes = extract_first_binary(&key, "key")?;
         let key_hash = highway_hash(key_bytes);
-        let Some(location) = self.slab.lookup(key_hash) else {
+        let Some(location) = self.slab.lookup_as_of(key_hash, meta.as_of_hlc) else {
             return Ok((
                 error_read_response(&meta, ReadStatus::KEY_NOT_FOUND, self.local_node),
                 None,
@@ -782,7 +782,8 @@ pub(crate) async fn execute_query_plan(
     // `wpbc::execute` already does this internally per call, but
     // we mirror the pattern so a follow-up that batches rows can
     // lift the compile out of the loop without touching semantics.
-    let locations = slab.scan(meta.key_range_start, meta.key_range_end);
+    let locations =
+        slab.scan_as_of(meta.key_range_start, meta.key_range_end, meta.as_of_hlc);
 
     let mut filtered: Vec<RecordBatch> = Vec::new();
     let mut max_hlc = HybridTimestamp {
@@ -1075,6 +1076,7 @@ mod tests {
             key_range_end: u64::MAX,
             bytecode_len: 0,
             _pad2: [0; 4],
+            as_of_hlc: hlc(0, 0, 0),
         }
     }
 
