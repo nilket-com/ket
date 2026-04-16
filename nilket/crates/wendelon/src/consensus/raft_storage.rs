@@ -51,20 +51,21 @@ use crate::schema::{
 	WALRecordHeader,
 };
 use crate::storage::io_uring::{AlignedBuf, IoOp, IoRingHandle, DIRECT_IO_ALIGN};
+use bytemuck::{Pod, Zeroable};
 use openraft::anyerror::AnyError;
 use openraft::storage::{
 	LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftSnapshotBuilder, RaftStateMachine,
 	Snapshot,
 };
 use openraft::{
-	BasicNode, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta, StorageError,
+	BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta, StorageError,
 	StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::Cursor;
+use std::io::{Cursor, Error, ErrorKind};
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -87,6 +88,63 @@ const REC_SNAPSHOT_INSTALL: u8 = 2;
 #[allow(dead_code)]
 const REC_CHECKPOINT: u8 = 3;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryCheckpoint {
+	pub commit_index: u64,
+	pub e_safe_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableBootstrapMode {
+	FreshBootstrap,
+	Recovery,
+}
+
+impl DurableBootstrapMode {
+	fn from_artifacts(found: bool) -> Self {
+		if found {
+			Self::Recovery
+		} else {
+			Self::FreshBootstrap
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+struct WALCheckpointBody {
+	commit_index: u64,
+	e_safe_index: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedSnapshot {
+	held: HeldSnapshot,
+	last_included: Option<LogId<u32>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ArtifactPresence {
+	wal: bool,
+	vote: bool,
+	snapshot: bool,
+}
+
+impl ArtifactPresence {
+	fn any(&self) -> bool {
+		self.wal || self.vote || self.snapshot
+	}
+}
+
+#[derive(Default)]
+struct WALReplay {
+	entries: BTreeMap<u64, Entry<WendelonTypeConfig>>,
+	last_log_id: Option<LogId<u32>>,
+	last_purged: Option<LogId<u32>>,
+	checkpoint: Option<RecoveryCheckpoint>,
+	wal_cursor: u64,
+}
+
 // ============================================================
 //  LOG STORE
 // ============================================================
@@ -107,6 +165,12 @@ struct LogStoreInner {
 	/// Cached vote. Written to `vote_fd` on `save_vote`; surfaced
 	/// verbatim by `read_vote`.
 	vote: Option<Vote<u32>>,
+	/// Snapshot loaded during durable recovery, if present.
+	recovered_snapshot: Option<HeldSnapshot>,
+	/// Recovered checkpoint counters from the WAL.
+	recovery_checkpoint: Option<RecoveryCheckpoint>,
+	/// Whether startup was a true fresh bootstrap or durable recovery.
+	bootstrap_mode: DurableBootstrapMode,
 
 	/// io_uring handle for WAL and vote persistence. `None` in
 	/// the in-memory test mode — append skips the disk path.
@@ -140,8 +204,8 @@ pub struct WendelonLogStore {
 
 impl WendelonLogStore {
 	/// In-memory store with no WAL backing. Intended for
-	/// openraft unit tests and for the current scaffold wiring
-	/// where the disk path has not yet been plumbed at bootstrap.
+	/// openraft unit tests and intentionally ephemeral harnesses.
+	/// Live node bootstrap must use [`Self::open`] instead.
 	pub fn in_memory() -> Self {
 		Self {
 			inner: Arc::new(RwLock::new(LogStoreInner {
@@ -149,6 +213,9 @@ impl WendelonLogStore {
 				last_log_id: None,
 				last_purged: None,
 				vote: None,
+				recovered_snapshot: None,
+				recovery_checkpoint: None,
+				bootstrap_mode: DurableBootstrapMode::FreshBootstrap,
 				io: None,
 				_wal_file: None,
 				wal_fd: None,
@@ -167,21 +234,32 @@ impl WendelonLogStore {
 		Self::in_memory()
 	}
 
-	/// Open (or create) the WAL and vote files and bind them to
-	/// the supplied `io_uring` submission handle. Does not replay
-	/// the WAL yet — recovery is tracked as a follow-up.
+	/// Open (or create) the WAL and vote files, load any snapshot
+	/// artifact, replay the WAL tail, and bind the resulting durable
+	/// handles to the supplied `io_uring` submission handle.
 	pub fn open(
 		wal_path: impl AsRef<Path>,
 		vote_path: impl AsRef<Path>,
+		snapshot_path: impl AsRef<Path>,
 		io: IoRingHandle,
 	) -> std::io::Result<Self> {
+		let wal_path = wal_path.as_ref();
+		let vote_path = vote_path.as_ref();
+		let snapshot_path = snapshot_path.as_ref();
+
+		let artifacts = inspect_artifacts(wal_path, vote_path, snapshot_path)?;
+		let bootstrap_mode = DurableBootstrapMode::from_artifacts(artifacts.any());
+		let vote = load_vote_state(vote_path)?;
+		let snapshot = load_snapshot_artifact(snapshot_path)?;
+		let replay = replay_wal(wal_path, snapshot.as_ref())?;
+
 		let wal_file = OpenOptions::new()
 			.read(true)
 			.write(true)
 			.create(true)
 			.truncate(false)
 			.custom_flags(O_DIRECT)
-			.open(wal_path.as_ref())?;
+			.open(wal_path)?;
 		let wal_fd = wal_file.as_raw_fd();
 
 		let vote_file = OpenOptions::new()
@@ -190,24 +268,47 @@ impl WendelonLogStore {
 			.create(true)
 			.truncate(false)
 			.custom_flags(O_DIRECT)
-			.open(vote_path.as_ref())?;
+			.open(vote_path)?;
 		let vote_fd = vote_file.as_raw_fd();
 
 		Ok(Self {
 			inner: Arc::new(RwLock::new(LogStoreInner {
-				entries: BTreeMap::new(),
-				last_log_id: None,
-				last_purged: None,
-				vote: None,
+				entries: replay.entries,
+				last_log_id: replay.last_log_id,
+				last_purged: replay.last_purged,
+				vote,
+				recovered_snapshot: snapshot.map(|s| s.held),
+				recovery_checkpoint: replay.checkpoint,
+				bootstrap_mode,
 				io: Some(io),
 				_wal_file: Some(wal_file),
 				wal_fd: Some(wal_fd),
-				wal_cursor: 0,
+				wal_cursor: replay.wal_cursor,
 				_vote_file: Some(vote_file),
 				vote_fd: Some(vote_fd),
 			})),
 			wal_gate: Arc::new(Mutex::new(())),
 		})
+	}
+
+	pub async fn bootstrap_mode(&self) -> DurableBootstrapMode {
+		self.inner.read().await.bootstrap_mode
+	}
+
+	pub async fn recovery_checkpoint(&self) -> Option<RecoveryCheckpoint> {
+		self.inner.read().await.recovery_checkpoint
+	}
+
+	pub async fn recovered_state_machine(&self) -> std::io::Result<WendelonStateMachine> {
+		let (snapshot, entries, checkpoint) = {
+			let guard = self.inner.read().await;
+			(
+				guard.recovered_snapshot.clone(),
+				guard.entries.values().map(clone_entry).collect::<Vec<_>>(),
+				guard.recovery_checkpoint,
+			)
+		};
+		WendelonStateMachine::from_recovery(snapshot, entries, checkpoint)
 	}
 }
 
@@ -502,7 +603,7 @@ pub trait TierObserver: Send + Sync {
 }
 
 /// Snapshot currently held by the state machine.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct HeldSnapshot {
 	meta: SnapshotMeta<u32, BasicNode>,
 	data: Vec<u8>,
@@ -539,6 +640,63 @@ impl WendelonStateMachine {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			tier_observer: None,
 		}
+	}
+
+	fn from_recovery(
+		snapshot: Option<HeldSnapshot>,
+		entries: Vec<Entry<WendelonTypeConfig>>,
+		checkpoint: Option<RecoveryCheckpoint>,
+	) -> std::io::Result<Self> {
+		let mut inner = SmInner::default();
+		let snapshot_boundary = if let Some(snapshot) = snapshot.clone() {
+			let (_, state) = decode_snapshot(&snapshot.data).map_err(|e| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("recovery snapshot decode failed: {e}"),
+				)
+			})?;
+			inner.state = state;
+			inner.state.last_applied_log_id = snapshot.meta.last_log_id;
+			inner.state.last_membership = snapshot.meta.last_membership.clone();
+			inner.snapshot = Some(snapshot.clone());
+			inner.snapshot_seq = 1;
+			snapshot.meta.last_log_id.map(|id| id.index)
+		} else {
+			None
+		};
+
+		let apply_upto = if let Some(cp) = checkpoint {
+			if let Some(boundary) = snapshot_boundary {
+				if cp.commit_index < boundary {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"recovery checkpoint commit_index {} is behind snapshot boundary {}",
+							cp.commit_index, boundary
+						),
+					));
+				}
+			}
+			cp.commit_index
+		} else {
+			entries.last().map(|entry| entry.log_id.index).unwrap_or(0)
+		};
+
+		for entry in entries {
+			if entry.log_id.index > apply_upto {
+				break;
+			}
+			apply_entry_to_state(&mut inner.state, &entry);
+			inner.state.last_applied_log_id = Some(match inner.state.last_applied_log_id {
+				Some(prev) if prev > entry.log_id => prev,
+				_ => entry.log_id,
+			});
+		}
+
+		Ok(Self {
+			inner: Arc::new(RwLock::new(inner)),
+			tier_observer: None,
+		})
 	}
 
 	/// Install a tier observer. Intended to be called once, at
@@ -606,25 +764,14 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		{
 			let mut guard = self.inner.write().await;
 			for entry in entries {
-				let log_id = entry.log_id;
-				let resp = match entry.payload {
-					EntryPayload::Blank => WendelonResponse::Success,
-					EntryPayload::Normal(req) => {
-						let (resp, tier) = apply_request(&mut guard.state, req);
-						if let Some(t) = tier {
-							pending_tier_events.push(t);
-						}
-						resp
-					}
-					EntryPayload::Membership(m) => {
-						guard.state.last_membership = StoredMembership::new(Some(log_id), m);
-						WendelonResponse::Success
-					}
-				};
+				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
-					Some(prev) if prev > log_id => prev,
-					_ => log_id,
+					Some(prev) if prev > entry.log_id => prev,
+					_ => entry.log_id,
 				});
+				if let Some(t) = tier {
+					pending_tier_events.push(t);
+				}
 				out.push(resp);
 			}
 		}
@@ -696,6 +843,20 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 /// Tier observers do filesystem work (unlinking the L1 file);
 /// keeping them off the lock prevents any cross-node staleness
 /// on a busy apply batch.
+fn apply_entry_to_state(
+	state: &mut SmState,
+	entry: &Entry<WendelonTypeConfig>,
+) -> (WendelonResponse, Option<TieredSlab>) {
+	match &entry.payload {
+		EntryPayload::Blank => (WendelonResponse::Success, None),
+		EntryPayload::Normal(req) => apply_request(state, req.clone()),
+		EntryPayload::Membership(membership) => {
+			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
+			(WendelonResponse::Success, None)
+		}
+	}
+}
+
 fn apply_request(
 	state: &mut SmState,
 	req: WendelonRequest,
@@ -950,6 +1111,346 @@ impl RaftSnapshotBuilder<WendelonTypeConfig> for WendelonSnapshotBuilder {
 //  WIRE / SERIALIZATION HELPERS
 // ============================================================
 
+fn inspect_artifacts(
+	wal_path: &Path,
+	vote_path: &Path,
+	snapshot_path: &Path,
+) -> std::io::Result<ArtifactPresence> {
+	Ok(ArtifactPresence {
+		wal: artifact_exists(wal_path)?,
+		vote: artifact_exists(vote_path)?,
+		snapshot: artifact_exists(snapshot_path)?,
+	})
+}
+
+fn artifact_exists(path: &Path) -> std::io::Result<bool> {
+	match std::fs::metadata(path) {
+		Ok(meta) => Ok(meta.len() > 0),
+		Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+		Err(err) => Err(err),
+	}
+}
+
+fn load_vote_state(vote_path: &Path) -> std::io::Result<Option<Vote<u32>>> {
+	let bytes = match std::fs::read(vote_path) {
+		Ok(bytes) => bytes,
+		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(err) => return Err(err),
+	};
+	if bytes.is_empty() {
+		return Ok(None);
+	}
+	if bytes.len() < 4 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"vote artifact {} is shorter than its 4-byte length prefix",
+				vote_path.display()
+			),
+		));
+	}
+	let encoded_len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+	if encoded_len == 0 {
+		return Ok(None);
+	}
+	if 4 + encoded_len > bytes.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"vote artifact {} declares {} bytes but file length is {}",
+				vote_path.display(),
+				encoded_len,
+				bytes.len()
+			),
+		));
+	}
+	postcard::from_bytes(&bytes[4..4 + encoded_len]).map(Some).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("vote artifact {} decode failed: {err}", vote_path.display()),
+		)
+	})
+}
+
+fn load_snapshot_artifact(snapshot_path: &Path) -> std::io::Result<Option<LoadedSnapshot>> {
+	let bytes = match std::fs::read(snapshot_path) {
+		Ok(bytes) => bytes,
+		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+		Err(err) => return Err(err),
+	};
+	if bytes.is_empty() {
+		return Ok(None);
+	}
+	let (header, state) = decode_snapshot(&bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("snapshot artifact {} decode failed: {err}", snapshot_path.display()),
+		)
+	})?;
+	let hsize = std::mem::size_of::<SnapshotHeader>();
+	let body = &bytes[hsize..];
+	let actual_hash = blake3_32(body);
+	if actual_hash != header.state_sha256 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"snapshot artifact {} hash mismatch: expected {:02x?}, got {:02x?}",
+				snapshot_path.display(),
+				header.state_sha256,
+				actual_hash
+			),
+		));
+	}
+	let header_last = log_id_from_snapshot_header(&header);
+	if state.last_applied_log_id != header_last {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"snapshot artifact {} last_applied {:?} disagrees with header {:?}",
+				snapshot_path.display(),
+				state.last_applied_log_id,
+				header_last
+			),
+		));
+	}
+	let snapshot_id = format!("recovered-{}", header.last_included_index);
+	Ok(Some(LoadedSnapshot {
+		last_included: header_last,
+		held: HeldSnapshot {
+			meta: SnapshotMeta {
+				last_log_id: header_last,
+				last_membership: state.last_membership.clone(),
+				snapshot_id,
+			},
+			data: bytes,
+		},
+	}))
+}
+
+fn replay_wal(wal_path: &Path, snapshot: Option<&LoadedSnapshot>) -> std::io::Result<WALReplay> {
+	let bytes = match std::fs::read(wal_path) {
+		Ok(bytes) => bytes,
+		Err(err) if err.kind() == ErrorKind::NotFound => return Ok(WALReplay::default()),
+		Err(err) => return Err(err),
+	};
+	if bytes.is_empty() {
+		return Ok(WALReplay {
+			last_purged: snapshot.and_then(|s| s.last_included),
+			..WALReplay::default()
+		});
+	}
+
+	let header_size = std::mem::size_of::<WALRecordHeader>();
+	let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
+	let boundary = snapshot.and_then(|s| s.last_included.map(|id| id.index));
+	let mut replay = WALReplay {
+		last_purged: snapshot.and_then(|s| s.last_included),
+		..WALReplay::default()
+	};
+
+	let mut offset: usize = 0;
+	let mut last_good: usize = 0;
+	while offset < bytes.len() {
+		let remaining = bytes.len() - offset;
+		if remaining < header_size {
+			truncate_wal_tail(wal_path, last_good)?;
+			replay.wal_cursor = last_good as u64;
+			return Ok(replay);
+		}
+
+		let header: WALRecordHeader =
+			*bytemuck::from_bytes(&bytes[offset..offset + header_size]);
+		let total_len = header_size
+			.checked_add(header.body_len as usize)
+			.and_then(|n| n.checked_add(4))
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"wal {} record at offset {} overflows declared length",
+						wal_path.display(),
+						offset
+					),
+				)
+			})?;
+		let padded_len = page_round_up(total_len);
+		if offset + total_len > bytes.len() || offset + padded_len > bytes.len() {
+			truncate_wal_tail(wal_path, last_good)?;
+			replay.wal_cursor = last_good as u64;
+			return Ok(replay);
+		}
+
+		let body_end = offset + header_size + header.body_len as usize;
+		let record_end = body_end + 4;
+		let expected_crc = blake3_prefix_u32(&bytes[offset..body_end]);
+		let actual_crc = u32::from_le_bytes(bytes[body_end..record_end].try_into().unwrap());
+		if expected_crc != actual_crc {
+			if offset + padded_len == bytes.len() {
+				truncate_wal_tail(wal_path, last_good)?;
+				replay.wal_cursor = last_good as u64;
+				return Ok(replay);
+			}
+			return Err(interior_corruption(
+				wal_path,
+				offset,
+				"checksum mismatch".to_string(),
+			));
+		}
+
+		let body = &bytes[offset + header_size..body_end];
+		match header.record_type {
+			REC_LOG_ENTRY => {
+				let entry = decode_log_record(wal_path, offset, &header, body, fixed_size)?;
+				if boundary.map(|idx| entry.log_id.index <= idx).unwrap_or(false) {
+					// Snapshot already subsumes this entry; keep scanning for
+					// corruption and later tail records but do not cache it.
+				} else {
+					if replay.entries.insert(entry.log_id.index, clone_entry(&entry)).is_some() {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"wal {} contains duplicate log index {} during recovery",
+								wal_path.display(),
+								entry.log_id.index
+							),
+						));
+					}
+					replay.last_log_id = Some(match replay.last_log_id {
+						Some(prev) if prev > entry.log_id => prev,
+						_ => entry.log_id,
+					});
+				}
+			}
+			REC_CHECKPOINT => {
+				if body.len() != std::mem::size_of::<WALCheckpointBody>() {
+					return Err(interior_corruption(
+						wal_path,
+						offset,
+						format!("checkpoint body has {} bytes, expected 16", body.len()),
+					));
+				}
+				let mut checkpoint = *bytemuck::from_bytes::<WALCheckpointBody>(body);
+				if checkpoint.e_safe_index > checkpoint.commit_index {
+					checkpoint.e_safe_index = checkpoint.commit_index;
+				}
+				if let Some(boundary) = boundary {
+					if checkpoint.commit_index < boundary {
+						return Err(interior_corruption(
+							wal_path,
+							offset,
+							format!(
+								"checkpoint commit_index {} is behind snapshot boundary {}",
+								checkpoint.commit_index, boundary
+							),
+						));
+					}
+				}
+				replay.checkpoint = Some(RecoveryCheckpoint {
+					commit_index: checkpoint.commit_index,
+					e_safe_index: checkpoint.e_safe_index,
+				});
+			}
+			other => {
+				return Err(interior_corruption(
+					wal_path,
+					offset,
+					format!("unsupported WAL record_type={other}"),
+				));
+			}
+		}
+
+		last_good = offset + padded_len;
+		offset = last_good;
+	}
+
+	replay.wal_cursor = last_good as u64;
+	Ok(replay)
+}
+
+fn decode_log_record(
+	wal_path: &Path,
+	offset: usize,
+	header: &WALRecordHeader,
+	body: &[u8],
+	fixed_size: usize,
+) -> std::io::Result<Entry<WendelonTypeConfig>> {
+	if body.len() < fixed_size {
+		return Err(interior_corruption(
+			wal_path,
+			offset,
+			format!("log record body is shorter than fixed prefix: {}", body.len()),
+		));
+	}
+	let fixed: RaftLogEntryFixed = *bytemuck::from_bytes(&body[..fixed_size]);
+	let payload = &body[fixed_size..];
+	if payload.len() != fixed.payload_len as usize {
+		return Err(interior_corruption(
+			wal_path,
+			offset,
+			format!(
+				"log record payload length mismatch: fixed={} actual={}",
+				fixed.payload_len,
+				payload.len()
+			),
+		));
+	}
+	let payload_hash = blake3_32(payload);
+	if payload_hash != fixed.payload_hash {
+		return Err(interior_corruption(
+			wal_path,
+			offset,
+			"log record payload hash mismatch".to_string(),
+		));
+	}
+	let entry: Entry<WendelonTypeConfig> = postcard::from_bytes(payload).map_err(|err| {
+		interior_corruption(
+			wal_path,
+			offset,
+			format!("log entry postcard decode failed: {err}"),
+		)
+	})?;
+	if entry.log_id.index != fixed.index
+		|| entry.log_id.leader_id.term != fixed.term
+		|| header.log_index != fixed.index
+		|| header.term != fixed.term
+	{
+		return Err(interior_corruption(
+			wal_path,
+			offset,
+			"log record fixed/header coordinates do not match decoded entry".to_string(),
+		));
+	}
+	Ok(entry)
+}
+
+fn truncate_wal_tail(wal_path: &Path, last_good: usize) -> std::io::Result<()> {
+	let file = OpenOptions::new().write(true).open(wal_path)?;
+	file.set_len(last_good as u64)
+}
+
+fn interior_corruption(wal_path: &Path, offset: usize, detail: String) -> Error {
+	Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"wal {} interior corruption at offset {}: {}",
+			wal_path.display(),
+			offset,
+			detail
+		),
+	)
+}
+
+fn log_id_from_snapshot_header(header: &SnapshotHeader) -> Option<LogId<u32>> {
+	if header.last_included_index == 0 && header.last_included_term == 0 {
+		None
+	} else {
+		Some(LogId::new(
+			CommittedLeaderId::new(header.last_included_term, 0),
+			header.last_included_index,
+		))
+	}
+}
+
 /// Build one page-padded WAL record for a single entry:
 /// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][crc32]`
 /// with the tail zero-padded to `DIRECT_IO_ALIGN`.
@@ -1014,6 +1515,37 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	dst[header_size + body_len..header_size + body_len + 4].copy_from_slice(&crc.to_le_bytes());
 	// Remainder is already zero from AlignedBuf::new.
 	Ok(buf)
+}
+
+#[cfg(test)]
+fn serialize_checkpoint_page(
+	commit_index: u64,
+	e_safe_index: u64,
+	log_index: u64,
+	term: u64,
+) -> AlignedBuf {
+	let header_size = std::mem::size_of::<WALRecordHeader>();
+	let body_size = std::mem::size_of::<WALCheckpointBody>();
+	let total = header_size + body_size + 4;
+	let padded = page_round_up(total);
+	let body = WALCheckpointBody {
+		commit_index,
+		e_safe_index,
+	};
+	let header = WALRecordHeader {
+		record_type: REC_CHECKPOINT,
+		_pad1: [0; 7],
+		body_len: body_size as u64,
+		log_index,
+		term,
+	};
+	let mut buf = AlignedBuf::new(padded);
+	let dst = buf.as_mut_slice();
+	dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+	dst[header_size..header_size + body_size].copy_from_slice(bytemuck::bytes_of(&body));
+	let crc = blake3_prefix_u32(&dst[..header_size + body_size]);
+	dst[header_size + body_size..header_size + body_size + 4].copy_from_slice(&crc.to_le_bytes());
+	buf
 }
 
 /// Encode a complete snapshot: `[SnapshotHeader][postcard(SmState)]`.
@@ -1101,6 +1633,266 @@ fn clone_entry(e: &Entry<WendelonTypeConfig>) -> Entry<WendelonTypeConfig> {
 
 #[allow(dead_code)]
 fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
+
+// ============================================================
+//  RECOVERY TESTS
+// ============================================================
+
+#[cfg(test)]
+mod recovery_tests {
+	use super::*;
+	use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId};
+	use openraft::Vote;
+	use std::io::Write;
+	use std::path::PathBuf;
+
+	fn tempdir(tag: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-raft-recovery-{tag}-{}-{}",
+			std::process::id(),
+			uuid::Uuid::new_v4()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	fn artifact_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+		(
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+		)
+	}
+
+	fn log_id(term: u64, index: u64) -> LogId<u32> {
+		LogId::new(CommittedLeaderId::new(term, 0), index)
+	}
+
+	fn lease_entry(index: u64, range_start: u64, range_end: u64, holder: u32) -> Entry<WendelonTypeConfig> {
+		let lease = lease_descriptor(index, range_start, range_end, holder);
+		Entry {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Normal(WendelonRequest::AcquireLease(lease)),
+		}
+	}
+
+	fn lease_descriptor(index: u64, range_start: u64, range_end: u64, holder: u32) -> LeaseDescriptor {
+		LeaseDescriptor {
+			epoch: 1,
+			holder: SchemaNodeId {
+				id: holder,
+				_reserved: 0,
+			},
+			range_start,
+			range_end,
+			lease_start: HybridTimestamp {
+				physical_ms: index,
+				logical: 0,
+				node_id: holder,
+			},
+			lease_expiry: HybridTimestamp {
+				physical_ms: index + 1_000,
+				logical: 0,
+				node_id: holder,
+			},
+			min_commit_index: 0,
+			signature: [0; 64],
+			_pad: [0; 8],
+		}
+	}
+
+	fn finalize_entry(index: u64, physical_ms: u64) -> Entry<WendelonTypeConfig> {
+		Entry {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Normal(WendelonRequest::Finalize(FinalizationMarker {
+				log_index: index,
+				term: 1,
+				epoch: 1,
+				commit_hlc: HybridTimestamp {
+					physical_ms,
+					logical: 0,
+					node_id: 1,
+				},
+				payload_hash: [0; 32],
+				e_safe_index: index,
+				_reserved: 0,
+			})),
+		}
+	}
+
+	fn write_vote_file(path: &Path, vote: Vote<u32>) {
+		let encoded = postcard::to_allocvec(&vote).unwrap();
+		let mut page = vec![0u8; DIRECT_IO_ALIGN];
+		page[..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+		page[4..4 + encoded.len()].copy_from_slice(&encoded);
+		std::fs::write(path, page).unwrap();
+	}
+
+	fn write_snapshot_file(path: &Path, state: &SmState) {
+		std::fs::write(path, encode_snapshot(state).unwrap()).unwrap();
+	}
+
+	fn write_wal_pages(path: &Path, pages: &[AlignedBuf]) {
+		let mut file = OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(true)
+			.open(path)
+			.unwrap();
+		for page in pages {
+			file.write_all(page.as_slice()).unwrap();
+		}
+		file.flush().unwrap();
+	}
+
+	fn open_store(dir: &Path) -> WendelonLogStore {
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let (wal, vote, snapshot) = artifact_paths(dir);
+		WendelonLogStore::open(&wal, &vote, &snapshot, io).unwrap()
+	}
+
+	#[tokio::test]
+	async fn normal_restart_recovers_vote_wal_and_state_machine() {
+		let dir = tempdir("normal");
+		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		let entry = lease_entry(1, 0, 99, 7);
+		write_wal_pages(&wal, &[serialize_entry_page(&entry).unwrap()]);
+
+		let mut store = open_store(&dir);
+		assert_eq!(store.bootstrap_mode().await, DurableBootstrapMode::Recovery);
+		assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new_committed(3, 7)));
+
+		let state = store.get_log_state().await.unwrap();
+		assert_eq!(state.last_purged_log_id, None);
+		assert_eq!(state.last_log_id, Some(log_id(1, 1)));
+
+		let sm = store.recovered_state_machine().await.unwrap();
+		let snapshot = sm.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
+		assert!(snapshot.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn torn_tail_at_eof_is_truncated_to_last_good_record() {
+		let dir = tempdir("torn-tail");
+		let (wal, _vote, _snapshot) = artifact_paths(&dir);
+		let first = serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap();
+		let second = serialize_entry_page(&lease_entry(2, 10, 19, 2)).unwrap();
+
+		let mut file = OpenOptions::new()
+			.create(true)
+			.write(true)
+			.truncate(true)
+			.open(&wal)
+			.unwrap();
+		file.write_all(first.as_slice()).unwrap();
+		file.write_all(&second.as_slice()[..128]).unwrap();
+		file.flush().unwrap();
+
+		let mut store = open_store(&dir);
+		let state = store.get_log_state().await.unwrap();
+		assert_eq!(state.last_log_id, Some(log_id(1, 1)));
+		assert_eq!(std::fs::metadata(&wal).unwrap().len(), first.len() as u64);
+
+		let sm = store.recovered_state_machine().await.unwrap();
+		let snapshot = sm.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
+		assert_eq!(snapshot.leases.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn interior_corruption_fails_startup_loudly() {
+		let dir = tempdir("interior-corruption");
+		let (wal, _vote, _snapshot) = artifact_paths(&dir);
+		let mut first = serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap();
+		let second = serialize_entry_page(&lease_entry(2, 10, 19, 2)).unwrap();
+		first.as_mut_slice()[64] ^= 0x5a;
+		write_wal_pages(&wal, &[first, second]);
+
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let err = match WendelonLogStore::open(&wal, dir.join("vote.wnd"), dir.join("snapshot.wnd"), io) {
+			Ok(_) => panic!("interior corruption must fail startup"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string().contains("interior corruption"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn checkpoint_restart_clamps_e_safe_and_replays_only_committed_prefix() {
+		let dir = tempdir("checkpoint");
+		let (wal, _vote, _snapshot) = artifact_paths(&dir);
+		let first = serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap();
+		let second = serialize_entry_page(&lease_entry(2, 10, 19, 2)).unwrap();
+		let third = serialize_entry_page(&lease_entry(3, 20, 29, 3)).unwrap();
+		let checkpoint = serialize_checkpoint_page(2, 9, 3, 1);
+		write_wal_pages(&wal, &[first, second, third, checkpoint]);
+
+		let mut store = open_store(&dir);
+		assert_eq!(
+			store.recovery_checkpoint().await,
+			Some(RecoveryCheckpoint {
+				commit_index: 2,
+				e_safe_index: 2,
+			})
+		);
+		let state = store.get_log_state().await.unwrap();
+		assert_eq!(state.last_log_id, Some(log_id(1, 3)));
+
+		let sm = store.recovered_state_machine().await.unwrap();
+		let snapshot = sm.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 2)));
+		assert!(snapshot.leases.contains_key(&0));
+		assert!(snapshot.leases.contains_key(&10));
+		assert!(!snapshot.leases.contains_key(&20));
+	}
+
+	#[tokio::test]
+	async fn snapshot_plus_tail_replay_rebuilds_purged_boundary_and_tail_state() {
+		let dir = tempdir("snapshot-tail");
+		let (wal, _vote, snapshot_path) = artifact_paths(&dir);
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id(1, 5));
+		state.leases.insert(0, lease_descriptor(5, 0, 9, 1));
+		write_snapshot_file(&snapshot_path, &state);
+
+		let older = serialize_entry_page(&lease_entry(4, 100, 109, 9)).unwrap();
+		let tail_lease = serialize_entry_page(&lease_entry(6, 10, 19, 2)).unwrap();
+		let tail_finalize = serialize_entry_page(&finalize_entry(7, 777)).unwrap();
+		let checkpoint = serialize_checkpoint_page(7, 7, 7, 1);
+		write_wal_pages(&wal, &[older, tail_lease, tail_finalize, checkpoint]);
+
+		let mut store = open_store(&dir);
+		let state = store.get_log_state().await.unwrap();
+		assert_eq!(state.last_purged_log_id, Some(log_id(1, 5)));
+		assert_eq!(state.last_log_id, Some(log_id(1, 7)));
+
+		let entries = store
+			.try_get_log_entries(0..=u64::MAX)
+			.await
+			.unwrap();
+		let indexes: Vec<u64> = entries.iter().map(|entry| entry.log_id.index).collect();
+		assert_eq!(indexes, vec![6, 7]);
+
+		let sm = store.recovered_state_machine().await.unwrap();
+		let snapshot = sm.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 7)));
+		assert!(snapshot.leases.contains_key(&0));
+		assert!(snapshot.leases.contains_key(&10));
+		assert_eq!(
+			snapshot.e_safe_watermarks.get(&1).copied(),
+			Some(HybridTimestamp {
+				physical_ms: 777,
+				logical: 0,
+				node_id: 1,
+			})
+		);
+	}
+}
 
 // ============================================================
 //  LEASE APPLY TESTS

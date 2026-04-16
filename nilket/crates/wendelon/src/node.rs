@@ -7,10 +7,11 @@
 //! the glue that hands one module's output to the next.
 //!
 //! The genesis pattern here is deliberately minimal: one node, RF=1,
-//! in-memory Raft log, no QUIC endpoint. Multi-node deployments
-//! layer on top by swapping the `NoDialTransportProvider` for a
-//! real [`QuicTransportProvider`] and by joining an existing
-//! cluster instead of calling [`openraft::Raft::initialize`].
+//! durable local Raft artifacts, no QUIC endpoint. Multi-node
+//! deployments layer on top by swapping the
+//! `NoDialTransportProvider` for a real
+//! [`QuicTransportProvider`] and by joining an existing cluster
+//! instead of calling [`openraft::Raft::initialize`].
 //!
 //! ## What this file does NOT own
 //!
@@ -29,7 +30,9 @@ use crate::consensus::monitor::{
 };
 use crate::consensus::raft_network::WendelonRaftNetworkFactory;
 use crate::consensus::raft_server::WendelonRaftInternalServer;
-use crate::consensus::raft_storage::{WendelonLogStore, WendelonStateMachine};
+use crate::consensus::raft_storage::{
+	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
+};
 use crate::consensus::WendelonRaft;
 use crate::network::data_server::WendelonDataServer;
 use crate::network::factory::TransportProviderFactory;
@@ -160,17 +163,17 @@ impl WendelonNode {
 
 		// 3. L1 slab storage.
 		let slab = Arc::new(SlabManager::open(SlabManagerConfig {
-			dir: cfg.data_dir,
+			dir: cfg.data_dir.clone(),
 			max_slab_bytes: cfg.slab_max_bytes,
 			io: io.clone(),
 			l2: None,
 		})?);
 
-		// 4. Raft storage + state machine (in-memory log for V1 —
-		//    WAL-backed `open()` exists but is not yet recovered
-		//    on boot, so we defer plumbing it until Target #9).
-		let log_store = WendelonLogStore::in_memory();
-		let state_machine = WendelonStateMachine::new();
+		// 4. Durable Raft storage + recovered state machine.
+		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
+		let log_store = WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, io.clone())?;
+		let bootstrap_mode = log_store.bootstrap_mode().await;
+		let state_machine = log_store.recovered_state_machine().await?;
 
 		// 5. Seed membership epoch: self-only, advertising Data +
 		//    Control roles and the QUIC tier. Every subsystem that
@@ -234,19 +237,22 @@ impl WendelonNode {
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::new: {e}")))?;
 
-		// 10. Genesis: tell openraft that this node alone is the
-		//     voting set. After this call returns Ok, the node is
-		//     leader and the state machine will accept proposals.
-		let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
-		members.insert(
-			cfg.node_id,
-			BasicNode {
-				addr: cfg.advertise_address.clone(),
-			},
-		);
-		raft.initialize(members)
-			.await
-			.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::initialize: {e}")))?;
+		// 10. Fresh bootstrap initializes a single-node cluster.
+		//     Durable recovery must not silently rebootstrap over
+		//     existing artifacts; it starts from the recovered
+		//     vote/log/snapshot state instead.
+		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
+			let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
+			members.insert(
+				cfg.node_id,
+				BasicNode {
+					addr: cfg.advertise_address.clone(),
+				},
+			);
+			raft.initialize(members)
+				.await
+				.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::initialize: {e}")))?;
+		}
 
 		// 11. Ring router — starts empty, seeded by the first
 		//     `epoch_rx` value the updater task observes before it
@@ -392,6 +398,14 @@ fn seed_single_node_epoch(local: NodeId, address: &str) -> MembershipEpoch {
 	MembershipEpoch { epoch: 1, peers }
 }
 
+fn control_artifact_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+	(
+		data_dir.join("control.wal"),
+		data_dir.join("vote.wnd"),
+		data_dir.join("snapshot.wnd"),
+	)
+}
+
 // ============================================================
 //  RAFT → MONITOR ADAPTERS
 // ============================================================
@@ -489,12 +503,31 @@ mod tests {
 		check_drift_once, sweep_evictions_once, DriftCheck, EvictionDecision, EVICTION_THRESHOLD,
 		MAX_OFFSET_MS,
 	};
+	use crate::consensus::WendelonRequest;
+	use crate::schema::{FinalizationMarker, HybridTimestamp};
+	use std::time::Duration;
 
 	fn tempdir(tag: &str) -> PathBuf {
 		let base =
 			std::env::temp_dir().join(format!("wendelon-bootstrap-{tag}-{}", uuid::Uuid::new_v4()));
 		std::fs::create_dir_all(&base).unwrap();
 		base
+	}
+
+	async fn wait_for_local_leader(node: &WendelonNode) {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for node {} to become leader; current leader = {:?}",
+				node.local_node.id,
+				node.raft.current_leader().await
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
 	}
 
 	#[tokio::test]
@@ -510,16 +543,76 @@ mod tests {
 
 		// Ring has been seeded from the genesis epoch.
 		assert_eq!(node.ring.snapshot().data_capable_nodes(), 1);
-		// Raft reached leader state after `initialize`.
-		// Give the runtime a few yields for the election tick to
-		// settle before sampling.
-		for _ in 0..64 {
-			tokio::task::yield_now().await;
-			if node.raft.current_leader().await == Some(node.local_node.id) {
-				break;
-			}
-		}
+		// Raft reaches leadership asynchronously after initialize.
+		wait_for_local_leader(&node).await;
 		assert_eq!(node.raft.current_leader().await, Some(node.local_node.id));
+	}
+
+	#[tokio::test]
+	async fn single_node_bootstrap_recovers_durable_raft_artifacts() {
+		let dir = tempdir("restart");
+		let cfg = NodeBootstrapConfig::dev(11, dir.clone(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+
+		wait_for_local_leader(&node).await;
+		assert_eq!(node.raft.current_leader().await, Some(node.local_node.id));
+
+		let commit_hlc = HybridTimestamp {
+			physical_ms: 4_242,
+			logical: 0,
+			node_id: node.local_node.id,
+		};
+		node.raft
+			.client_write(WendelonRequest::Finalize(FinalizationMarker {
+				log_index: 2,
+				term: 1,
+				epoch: 99,
+				commit_hlc,
+				payload_hash: [0; 32],
+				e_safe_index: 2,
+				_reserved: 0,
+			}))
+			.await
+			.unwrap();
+		assert_eq!(
+			node.state_machine
+				.state_snapshot()
+				.await
+				.e_safe_watermarks
+				.get(&99)
+				.copied(),
+			Some(commit_hlc)
+		);
+
+		node.handles.ring_updater.abort();
+		node.handles.drift_monitor.abort();
+		node.handles.eviction_watchdog.abort();
+		node.handles.lease_manager.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			11,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		assert_eq!(
+			recovered
+				.state_machine
+				.state_snapshot()
+				.await
+				.e_safe_watermarks
+				.get(&99)
+				.copied(),
+			Some(commit_hlc)
+		);
+
+		recovered.handles.ring_updater.abort();
+		recovered.handles.drift_monitor.abort();
+		recovered.handles.eviction_watchdog.abort();
+		recovered.handles.lease_manager.abort();
 	}
 
 	#[tokio::test]
@@ -588,12 +681,7 @@ mod tests {
 		let advancer = WatchMembershipAdvancer::new(node.epoch_tx.clone());
 		// Wait until Raft reports this node as leader before
 		// sampling — otherwise the sweep short-circuits to NotLeader.
-		for _ in 0..64 {
-			tokio::task::yield_now().await;
-			if leader.is_leader().await {
-				break;
-			}
-		}
+		wait_for_local_leader(&node).await;
 		let current = node.epoch_tx.borrow().clone();
 		let decision = sweep_evictions_once(
 			&node.tracker,
