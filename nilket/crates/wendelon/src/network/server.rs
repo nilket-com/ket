@@ -36,12 +36,11 @@
 //!
 //! ## Per-stream peer identity
 //!
-//! Today the server uses a placeholder [`NodeId`] for every
-//! accepted connection. Slice 3 will extract the real id from the
-//! validated client certificate's SAN before constructing the
-//! `QuicTransportConnection`, at which point peer-aware routing
-//! (per-tenant quotas, audit log) can rely on
-//! [`TransportConnection::remote_id`].
+//! The server extracts the real peer id from the validated client
+//! certificate's canonical DNS SAN before constructing the
+//! `QuicTransportConnection`. Peer-aware routing can therefore rely
+//! on [`TransportConnection::remote_id`] without a second trust
+//! lookup.
 //!
 //! ## What is not here yet
 //!
@@ -55,8 +54,8 @@
 use crate::network::core::{read_frame, write_frame, HrftFrame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
+use crate::network::tls::{verified_peer_node_id, DEFAULT_CLUSTER_DOMAIN};
 use crate::network::transport::{TransportConnection, TransportStream};
-use crate::schema::NodeId;
 use async_trait::async_trait;
 use quinn::Endpoint;
 use std::io::{Error, ErrorKind};
@@ -141,16 +140,9 @@ async fn serve_quic_connection<S: HrftService>(
 	let connection = incoming
 		.await
 		.map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
-	// Slice 3 will derive this from the validated client cert SAN.
-	// Until then, downstream code that calls `remote_id()` on a
-	// server-side connection sees the zero value and must not key
-	// on it.
-	let placeholder = NodeId {
-		id: 0,
-		_reserved: 0,
-	};
+	let remote_id = verified_peer_node_id(&connection, DEFAULT_CLUSTER_DOMAIN)?;
 	let connection: Arc<dyn TransportConnection> =
-		Arc::new(QuicTransportConnection::new(connection, placeholder));
+		Arc::new(QuicTransportConnection::new(connection, remote_id));
 	handle_connection(connection, service, pool).await
 }
 

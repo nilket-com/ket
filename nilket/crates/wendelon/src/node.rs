@@ -34,12 +34,12 @@ use crate::consensus::raft_storage::{
 	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
 use crate::consensus::WendelonRaft;
+use crate::network::control_server::WendelonControlServer;
 use crate::network::data_server::WendelonDataServer;
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
-use crate::network::control_server::WendelonControlServer;
 use crate::network::server::{serve, HrftService};
 use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,

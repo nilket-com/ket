@@ -12,9 +12,7 @@ use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::network::core::{HrftFrame, HRFT_MAGIC};
 use crate::network::pool::BufPool;
 use crate::network::router::ControlRingServer;
-use crate::network::traits::{
-	TransferLeadershipRequestMeta, TransferLeadershipResponseMeta,
-};
+use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::wire;
 use crate::schema::{
 	epoch_entry_var_schema, AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader,
@@ -97,9 +95,8 @@ impl WendelonControlServer {
 				"LEASE_REQ meta too small",
 			));
 		}
-		let req: AcquireLeaseRequestMeta = *bytemuck::from_bytes(
-			&frame.meta[..std::mem::size_of::<AcquireLeaseRequestMeta>()],
-		);
+		let req: AcquireLeaseRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<AcquireLeaseRequestMeta>()]);
 
 		if req.epoch != self.current_epoch() {
 			return self.lease_response(&frame, LeaseStatus::DENIED_EPOCH_STALE, None);
@@ -154,7 +151,8 @@ impl WendelonControlServer {
 				accepted: false,
 				reason_code: CONTROL_REASON_EPOCH_STALE,
 			}
-		} else if req.from_leader.id != self.local_node.id || req.to_leader.id == self.local_node.id {
+		} else if req.from_leader.id != self.local_node.id || req.to_leader.id == self.local_node.id
+		{
 			TransferLeadershipResponseMeta {
 				accepted: false,
 				reason_code: CONTROL_REASON_INVALID_TARGET,

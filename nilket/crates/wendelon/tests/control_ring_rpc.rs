@@ -3,13 +3,9 @@ mod support;
 
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
-use wendelon::network::control_server::{
-	AdvanceEpochResponseWire, CONTROL_REASON_UNSUPPORTED,
-};
+use wendelon::network::control_server::{AdvanceEpochResponseWire, CONTROL_REASON_UNSUPPORTED};
 use wendelon::network::server::HrftService;
-use wendelon::network::traits::{
-	TransferLeadershipRequestMeta, TransferLeadershipResponseMeta,
-};
+use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use wendelon::network::wire;
 use wendelon::schema::{
 	epoch_entry_var_schema, AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp,
@@ -64,8 +60,9 @@ async fn lease_req_commits_through_control_ring_handler() {
 		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
 	assert_eq!(meta.status, LeaseStatus::GRANTED);
 
-	let lease: LeaseDescriptor =
-		*bytemuck::from_bytes(&resp.trailing.as_ref().unwrap()[..std::mem::size_of::<LeaseDescriptor>()]);
+	let lease: LeaseDescriptor = *bytemuck::from_bytes(
+		&resp.trailing.as_ref().unwrap()[..std::mem::size_of::<LeaseDescriptor>()],
+	);
 	assert_eq!(lease.range_start, range_start);
 	assert_eq!(lease.range_end, range_end);
 	assert_eq!(lease.holder, node.local_node);

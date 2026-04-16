@@ -58,8 +58,8 @@ use openraft::storage::{
 	Snapshot,
 };
 use openraft::{
-	BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta, StorageError,
-	StorageIOError, StoredMembership, Vote,
+	BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, OptionalSend, SnapshotMeta,
+	StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1164,12 +1164,14 @@ fn load_vote_state(vote_path: &Path) -> std::io::Result<Option<Vote<u32>>> {
 			),
 		));
 	}
-	postcard::from_bytes(&bytes[4..4 + encoded_len]).map(Some).map_err(|err| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("vote artifact {} decode failed: {err}", vote_path.display()),
-		)
-	})
+	postcard::from_bytes(&bytes[4..4 + encoded_len])
+		.map(Some)
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("vote artifact {} decode failed: {err}", vote_path.display()),
+			)
+		})
 }
 
 fn load_snapshot_artifact(snapshot_path: &Path) -> std::io::Result<Option<LoadedSnapshot>> {
@@ -1184,7 +1186,10 @@ fn load_snapshot_artifact(snapshot_path: &Path) -> std::io::Result<Option<Loaded
 	let (header, state) = decode_snapshot(&bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
-			format!("snapshot artifact {} decode failed: {err}", snapshot_path.display()),
+			format!(
+				"snapshot artifact {} decode failed: {err}",
+				snapshot_path.display()
+			),
 		)
 	})?;
 	let hsize = std::mem::size_of::<SnapshotHeader>();
@@ -1258,8 +1263,7 @@ fn replay_wal(wal_path: &Path, snapshot: Option<&LoadedSnapshot>) -> std::io::Re
 			return Ok(replay);
 		}
 
-		let header: WALRecordHeader =
-			*bytemuck::from_bytes(&bytes[offset..offset + header_size]);
+		let header: WALRecordHeader = *bytemuck::from_bytes(&bytes[offset..offset + header_size]);
 		let total_len = header_size
 			.checked_add(header.body_len as usize)
 			.and_then(|n| n.checked_add(4))
@@ -1301,11 +1305,18 @@ fn replay_wal(wal_path: &Path, snapshot: Option<&LoadedSnapshot>) -> std::io::Re
 		match header.record_type {
 			REC_LOG_ENTRY => {
 				let entry = decode_log_record(wal_path, offset, &header, body, fixed_size)?;
-				if boundary.map(|idx| entry.log_id.index <= idx).unwrap_or(false) {
+				if boundary
+					.map(|idx| entry.log_id.index <= idx)
+					.unwrap_or(false)
+				{
 					// Snapshot already subsumes this entry; keep scanning for
 					// corruption and later tail records but do not cache it.
 				} else {
-					if replay.entries.insert(entry.log_id.index, clone_entry(&entry)).is_some() {
+					if replay
+						.entries
+						.insert(entry.log_id.index, clone_entry(&entry))
+						.is_some()
+					{
 						return Err(Error::new(
 							ErrorKind::InvalidData,
 							format!(
@@ -1378,7 +1389,10 @@ fn decode_log_record(
 		return Err(interior_corruption(
 			wal_path,
 			offset,
-			format!("log record body is shorter than fixed prefix: {}", body.len()),
+			format!(
+				"log record body is shorter than fixed prefix: {}",
+				body.len()
+			),
 		));
 	}
 	let fixed: RaftLogEntryFixed = *bytemuck::from_bytes(&body[..fixed_size]);
@@ -1668,7 +1682,12 @@ mod recovery_tests {
 		LogId::new(CommittedLeaderId::new(term, 0), index)
 	}
 
-	fn lease_entry(index: u64, range_start: u64, range_end: u64, holder: u32) -> Entry<WendelonTypeConfig> {
+	fn lease_entry(
+		index: u64,
+		range_start: u64,
+		range_end: u64,
+		holder: u32,
+	) -> Entry<WendelonTypeConfig> {
 		let lease = lease_descriptor(index, range_start, range_end, holder);
 		Entry {
 			log_id: log_id(1, index),
@@ -1676,7 +1695,12 @@ mod recovery_tests {
 		}
 	}
 
-	fn lease_descriptor(index: u64, range_start: u64, range_end: u64, holder: u32) -> LeaseDescriptor {
+	fn lease_descriptor(
+		index: u64,
+		range_start: u64,
+		range_end: u64,
+		holder: u32,
+	) -> LeaseDescriptor {
 		LeaseDescriptor {
 			epoch: 1,
 			holder: SchemaNodeId {
@@ -1761,7 +1785,10 @@ mod recovery_tests {
 
 		let mut store = open_store(&dir);
 		assert_eq!(store.bootstrap_mode().await, DurableBootstrapMode::Recovery);
-		assert_eq!(store.read_vote().await.unwrap(), Some(Vote::new_committed(3, 7)));
+		assert_eq!(
+			store.read_vote().await.unwrap(),
+			Some(Vote::new_committed(3, 7))
+		);
 
 		let state = store.get_log_state().await.unwrap();
 		assert_eq!(state.last_purged_log_id, None);
@@ -1811,7 +1838,12 @@ mod recovery_tests {
 		write_wal_pages(&wal, &[first, second]);
 
 		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
-		let err = match WendelonLogStore::open(&wal, dir.join("vote.wnd"), dir.join("snapshot.wnd"), io) {
+		let err = match WendelonLogStore::open(
+			&wal,
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+			io,
+		) {
 			Ok(_) => panic!("interior corruption must fail startup"),
 			Err(err) => err,
 		};
@@ -1871,10 +1903,7 @@ mod recovery_tests {
 		assert_eq!(state.last_purged_log_id, Some(log_id(1, 5)));
 		assert_eq!(state.last_log_id, Some(log_id(1, 7)));
 
-		let entries = store
-			.try_get_log_entries(0..=u64::MAX)
-			.await
-			.unwrap();
+		let entries = store.try_get_log_entries(0..=u64::MAX).await.unwrap();
 		let indexes: Vec<u64> = entries.iter().map(|entry| entry.log_id.index).collect();
 		assert_eq!(indexes, vec![6, 7]);
 

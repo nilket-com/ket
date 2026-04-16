@@ -39,10 +39,21 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Wendelon's mTLS posture (see `plans/network/security.md`) binds
 /// every node's `NodeId` to a SAN on its server cert, so the SNI
 /// must be derived from the target id rather than being a fixed
-/// constant. The resolver takes any `Fn(u32) -> String + Send + Sync`
-/// — deployments can wire this to DNS (`format!("node-{id}.{zone}")`)
-/// or to a cluster-membership lookup.
+/// constant. The canonical first-wave template is
+/// `node-<id>.<cluster_domain>`.
 pub type ServerNameResolver = Arc<dyn Fn(u32) -> String + Send + Sync>;
+
+/// Build a resolver that maps a target node id to the canonical
+/// DNS SAN `node-<id>.<cluster_domain>`.
+pub fn canonical_server_name_resolver(cluster_domain: impl Into<String>) -> ServerNameResolver {
+	let cluster_domain = cluster_domain.into();
+	Arc::new(move |node_id| crate::network::tls::canonical_node_dns_name(node_id, &cluster_domain))
+}
+
+/// Convenience resolver for the default first-wave cluster domain.
+pub fn default_server_name_resolver() -> ServerNameResolver {
+	canonical_server_name_resolver(crate::network::tls::DEFAULT_CLUSTER_DOMAIN)
+}
 
 // ============================================================
 //  CONNECTION

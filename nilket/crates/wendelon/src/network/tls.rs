@@ -8,10 +8,11 @@
 //! and each node's `NodeId` binds to a Subject Alternative Name in
 //! the cert.
 //!
-//! This module deals only with the cryptographic shape — cert/key
-//! loading, rustls `ClientConfig` / `ServerConfig` construction,
-//! ALPN negotiation — and leaves policy (cert reloading, SAN → node
-//! id mapping, revocation) to the ops layer that calls it.
+//! This module deals with the cryptographic shape plus the first-wave
+//! node-identity binding contract: cert/key loading, rustls
+//! `ClientConfig` / `ServerConfig` construction, ALPN negotiation,
+//! and extraction of a verified peer `NodeId` from the leaf
+//! certificate's DNS SAN set.
 //!
 //! ## ALPN
 //!
@@ -34,16 +35,14 @@
 //!
 //! * Hot cert reload. Files are read once at [`TlsMaterial::load`].
 //!   Rotations will need an outer supervisor.
-//! * SAN extraction / NodeId verification beyond webpki's standard
-//!   name-matching — a follow-up can add a custom verifier that
-//!   pulls the numeric id out of the subject and cross-checks it
-//!   against the Raft membership.
 //! * Key log / TLS tracing for debugging.
 
+use crate::schema::NodeId;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::any::Any;
 use std::fs::File;
 use std::io::{BufReader, Error, ErrorKind};
 use std::path::Path;
@@ -54,6 +53,10 @@ use std::sync::Arc;
 /// version if we need to bump the wire format without reshuffling
 /// ALPN.
 pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
+pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+
+const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
+const DNS_NAME_TAG: u8 = 0x82;
 
 // ============================================================
 //  MATERIAL
@@ -151,6 +154,100 @@ pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientCon
 }
 
 // ============================================================
+//  NODE-ID BINDING
+// ============================================================
+
+/// Canonical DNS SAN for a Wendelon node certificate.
+///
+/// The first-wave identity contract is rigid:
+/// `node-<id>.<cluster_domain>`.
+pub fn canonical_node_dns_name(node_id: u32, cluster_domain: &str) -> String {
+	format!("node-{node_id}.{cluster_domain}")
+}
+
+/// Convenience for the default first-wave cluster domain.
+pub fn default_node_dns_name(node_id: u32) -> String {
+	canonical_node_dns_name(node_id, DEFAULT_CLUSTER_DOMAIN)
+}
+
+/// Extract the verified peer [`NodeId`] from a `quinn` connection's
+/// rustls peer identity.
+pub fn verified_peer_node_id(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+) -> std::io::Result<NodeId> {
+	let identity = connection.peer_identity().ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer presented no TLS identity",
+		)
+	})?;
+	verified_peer_node_id_from_identity(identity, cluster_domain)
+}
+
+/// Extract the verified peer [`NodeId`] from a rustls peer-identity
+/// box returned by `quinn`.
+pub fn verified_peer_node_id_from_identity(
+	identity: Box<dyn Any>,
+	cluster_domain: &str,
+) -> std::io::Result<NodeId> {
+	let certs = identity
+		.downcast::<Vec<CertificateDer<'static>>>()
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"peer identity is not a rustls certificate chain",
+			)
+		})?;
+	verified_peer_node_id_from_chain(certs.as_slice(), cluster_domain)
+}
+
+/// Parse the leaf certificate in `cert_chain` and recover the peer's
+/// canonical node identity from its DNS SAN set.
+pub fn verified_peer_node_id_from_chain(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+) -> std::io::Result<NodeId> {
+	let leaf = cert_chain
+		.first()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "peer certificate chain is empty"))?;
+	let dns_sans = extract_dns_sans(leaf.as_ref())?;
+	if dns_sans.is_empty() {
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"peer certificate contains no DNS SANs",
+		));
+	}
+
+	let mut parsed: Option<NodeId> = None;
+	for san in dns_sans {
+		let Some(id_text) = canonical_node_id_text(&san, cluster_domain) else {
+			continue;
+		};
+		let id = id_text.parse::<u32>().map_err(|_| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				format!("canonical node SAN {san:?} is not numeric"),
+			)
+		})?;
+		let node_id = NodeId { id, _reserved: 0 };
+		if parsed.replace(node_id).is_some() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"peer certificate contains more than one canonical node SAN",
+			));
+		}
+	}
+
+	parsed.ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			format!("peer certificate contains no canonical node SAN for domain {cluster_domain}"),
+		)
+	})
+}
+
+// ============================================================
 //  PEM LOADING HELPERS
 // ============================================================
 
@@ -194,4 +291,176 @@ fn load_ca_roots(path: &Path) -> std::io::Result<RootCertStore> {
 		));
 	}
 	Ok(roots)
+}
+
+// ============================================================
+//  ASN.1 HELPERS
+// ============================================================
+
+fn canonical_node_id_text<'a>(dns_name: &'a str, cluster_domain: &str) -> Option<&'a str> {
+	let prefix = "node-";
+	let suffix = format!(".{cluster_domain}");
+	if !dns_name.starts_with(prefix) || !dns_name.ends_with(&suffix) {
+		return None;
+	}
+	let end = dns_name.len().checked_sub(suffix.len())?;
+	if end <= prefix.len() {
+		return Some("");
+	}
+	Some(&dns_name[prefix.len()..end])
+}
+
+fn extract_dns_sans(cert_der: &[u8]) -> std::io::Result<Vec<String>> {
+	let mut cert = DerReader::new(cert_der);
+	let certificate = cert.read_tlv(0x30, "certificate")?;
+	let mut certificate = DerReader::new(certificate);
+	let tbs = certificate.read_tlv(0x30, "tbsCertificate")?;
+	let mut tbs = DerReader::new(tbs);
+
+	if tbs.peek_tag() == Some(0xA0) {
+		tbs.read_any_tlv("version")?;
+	}
+	for field in [
+		"serialNumber",
+		"signature",
+		"issuer",
+		"validity",
+		"subject",
+		"subjectPublicKeyInfo",
+	] {
+		tbs.read_any_tlv(field)?;
+	}
+	while matches!(tbs.peek_tag(), Some(0x81 | 0x82 | 0xA1 | 0xA2)) {
+		tbs.read_any_tlv("uniqueId")?;
+	}
+	if tbs.peek_tag() != Some(0xA3) {
+		return Ok(Vec::new());
+	}
+
+	let extensions = tbs.read_tlv(0xA3, "extensions")?;
+	let mut extensions = DerReader::new(extensions);
+	let extensions = extensions.read_tlv(0x30, "extensions sequence")?;
+	let mut extensions = DerReader::new(extensions);
+	let mut dns_sans = Vec::new();
+
+	while !extensions.is_empty() {
+		let extension = extensions.read_tlv(0x30, "extension")?;
+		let mut extension = DerReader::new(extension);
+		let oid = extension.read_tlv(0x06, "extension oid")?;
+		if extension.peek_tag() == Some(0x01) {
+			extension.read_any_tlv("extension critical")?;
+		}
+		let value = extension.read_tlv(0x04, "extension value")?;
+		if oid == SUBJECT_ALT_NAME_OID {
+			let mut san_value = DerReader::new(value);
+			let general_names = san_value.read_tlv(0x30, "subjectAltName")?;
+			let mut general_names = DerReader::new(general_names);
+			while !general_names.is_empty() {
+				let (tag, value) = general_names.read_any_tlv("generalName")?;
+				if tag == DNS_NAME_TAG {
+					let dns_name = std::str::from_utf8(value).map_err(|e| {
+						Error::new(
+							ErrorKind::InvalidData,
+							format!("DNS SAN is not valid UTF-8/IA5: {e}"),
+						)
+					})?;
+					dns_sans.push(dns_name.to_string());
+				}
+			}
+		}
+	}
+
+	Ok(dns_sans)
+}
+
+struct DerReader<'a> {
+	input: &'a [u8],
+	pos: usize,
+}
+
+impl<'a> DerReader<'a> {
+	fn new(input: &'a [u8]) -> Self {
+		Self { input, pos: 0 }
+	}
+
+	fn is_empty(&self) -> bool {
+		self.pos >= self.input.len()
+	}
+
+	fn peek_tag(&self) -> Option<u8> {
+		self.input.get(self.pos).copied()
+	}
+
+	fn read_tlv(&mut self, expected_tag: u8, what: &str) -> std::io::Result<&'a [u8]> {
+		let (tag, value) = self.read_any_tlv(what)?;
+		if tag != expected_tag {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"invalid DER for {what}: expected tag 0x{expected_tag:02x}, got 0x{tag:02x}"
+				),
+			));
+		}
+		Ok(value)
+	}
+
+	fn read_any_tlv(&mut self, what: &str) -> std::io::Result<(u8, &'a [u8])> {
+		if self.is_empty() {
+			return Err(Error::new(
+				ErrorKind::UnexpectedEof,
+				format!("truncated DER while reading {what}"),
+			));
+		}
+		let tag = self.input[self.pos];
+		self.pos += 1;
+		let len = self.read_len(what)?;
+		let end = self.pos.checked_add(len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("DER length overflow while reading {what}"),
+			)
+		})?;
+		if end > self.input.len() {
+			return Err(Error::new(
+				ErrorKind::UnexpectedEof,
+				format!("truncated DER payload while reading {what}"),
+			));
+		}
+		let value = &self.input[self.pos..end];
+		self.pos = end;
+		Ok((tag, value))
+	}
+
+	fn read_len(&mut self, what: &str) -> std::io::Result<usize> {
+		if self.is_empty() {
+			return Err(Error::new(
+				ErrorKind::UnexpectedEof,
+				format!("truncated DER length while reading {what}"),
+			));
+		}
+		let first = self.input[self.pos];
+		self.pos += 1;
+		if first & 0x80 == 0 {
+			return Ok(first as usize);
+		}
+		let width = (first & 0x7F) as usize;
+		if width == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("indefinite DER length is not allowed for {what}"),
+			));
+		}
+		if width > std::mem::size_of::<usize>() || self.pos + width > self.input.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("invalid DER length width for {what}"),
+			));
+		}
+		let mut len = 0usize;
+		for _ in 0..width {
+			len = (len << 8) | self.input[self.pos] as usize;
+			self.pos += 1;
+		}
+		Ok(len)
+	}
 }
