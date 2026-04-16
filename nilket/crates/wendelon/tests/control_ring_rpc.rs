@@ -2,18 +2,23 @@
 mod support;
 
 use arrow::record_batch::RecordBatch;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
-	AdvanceEpochResponseWire, CONTROL_REASON_GRANTED, CONTROL_REASON_UNSUPPORTED,
+	AdvanceEpochResponseWire, CONTROL_REASON_GRANTED, WendelonControlServer,
 };
+use wendelon::network::router::MsgRouterBuilder;
 use wendelon::network::server::HrftService;
 use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
-use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
+use wendelon::network::transport::{
+	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
+};
 use wendelon::network::wire;
+use wendelon::node::{LEASE_TTL_MS, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp, LeaseDescriptor,
-	LeaseStatus, MsgType, NodeId,
+	LeaseStatus, MsgType, NodeId, TransferToken,
 };
 
 fn decode_status_response(
@@ -278,39 +283,96 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 
 #[tokio::test]
 async fn transfer_leadership_req_routes_to_control_handler() {
-	let node = support::bootstrap_node("transfer-rpc", 1).await;
-	support::wait_for_local_leader(&node).await;
+	let leader = support::bootstrap_node("transfer-rpc-leader", 1).await;
+	support::wait_for_local_leader(&leader).await;
+	let target = support::bootstrap_node("transfer-rpc-target", 2).await;
 
-	let service: Arc<dyn HrftService> = node.router.clone();
-	let (factory, pool) = support::loopback_factory(node.local_node, service);
-	let req = TransferLeadershipRequestMeta {
-		source_epoch: node.ring.current_epoch(),
-		from_leader: node.local_node,
-		to_leader: NodeId {
-			id: 99,
-			_reserved: 0,
+	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+	let roles = NodeRoleSet::empty()
+		.with(NodeRole::Control)
+		.with(NodeRole::Data);
+	let mut peers = HashMap::new();
+	peers.insert(
+		leader.local_node,
+		PeerCapabilities {
+			address: "127.0.0.1:0".into(),
+			tiers,
+			roles,
 		},
+	);
+	peers.insert(
+		target.local_node,
+		PeerCapabilities {
+			address: "127.0.0.1:1".into(),
+			tiers,
+			roles,
+		},
+	);
+	let epoch = MembershipEpoch { epoch: 1, peers };
+	let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(Arc::new(epoch));
+
+	let target_service: Arc<dyn HrftService> = target.router.clone();
+	let (forward_factory, pool) = support::loopback_factory(target.local_node, target_service);
+	let leader_service: Arc<dyn HrftService> = Arc::new(
+		MsgRouterBuilder::default()
+			.with_control_ring(Arc::new(WendelonControlServer::new(
+				leader.raft.clone(),
+				leader.state_machine.clone(),
+				leader.local_node,
+				epoch_tx.clone(),
+				epoch_rx.clone(),
+				forward_factory.clone(),
+				leader.pool.clone(),
+				1,
+				LEASE_TTL_MS,
+			)))
+			.build(),
+	);
+	let (factory, _) = support::loopback_factory(leader.local_node, leader_service);
+	let req = TransferLeadershipRequestMeta {
+		source_epoch: 1,
+		from_leader: leader.local_node,
+		to_leader: target.local_node,
+	};
+	let token = TransferToken {
+		source_epoch: 1,
+		target_epoch: 2,
+		from_leader: leader.local_node,
+		to_leader: target.local_node,
+		expires_at: HybridTimestamp {
+			physical_ms: 40_000,
+			logical: 0,
+			node_id: leader.local_node.id,
+		},
+		_signed_reserved: 0,
+		signature: [0; 64],
+		_pad: [0; 8],
 	};
 
 	let resp = support::call_frame(
 		&factory,
 		&pool,
-		node.local_node,
+		leader.local_node,
 		MsgType::TRANSFER_REQ,
 		&wire::encode(&req).unwrap(),
 		None,
-		None,
+		Some(bytemuck::bytes_of(&token)),
 	)
 	.await
 	.unwrap();
 	assert_eq!(resp.header.msg_type, MsgType::TRANSFER_RESP.0);
 
 	let meta: TransferLeadershipResponseMeta = wire::decode(&resp.meta).unwrap();
-	assert!(!meta.accepted);
-	assert_eq!(meta.reason_code, CONTROL_REASON_UNSUPPORTED);
-	assert!(resp.trailing.is_none());
+	assert!(meta.accepted);
+	assert_eq!(meta.reason_code, CONTROL_REASON_GRANTED);
+	assert_eq!(
+		resp.trailing.as_deref().unwrap(),
+		bytemuck::bytes_of(&token)
+	);
+	support::wait_for_local_leader(&target).await;
 
-	support::abort_node(&node);
+	support::abort_node(&leader);
+	support::abort_node(&target);
 }
 
 #[tokio::test]
@@ -350,4 +412,65 @@ async fn advance_epoch_req_routes_to_control_handler() {
 	);
 
 	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn advance_epoch_status_survives_restart() {
+	let dir = support::tempdir("epoch-rpc-restart");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		1,
+		dir.clone(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	support::wait_for_local_leader(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory(node.local_node, service);
+	let arrow = support::encode_batch(&epoch_config_batch()).unwrap();
+	let resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::EPOCH_ADV_REQ,
+		&[],
+		Some(&arrow),
+		None,
+	)
+	.await
+	.unwrap();
+	let meta: AdvanceEpochResponseWire = wire::decode(&resp.meta).unwrap();
+	assert!(meta.accepted);
+
+	support::abort_node(&node);
+	drop(node);
+	tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+	let recovered =
+		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))
+			.await
+			.unwrap();
+	support::wait_for_local_leader(&recovered).await;
+
+	let recovered_service: Arc<dyn HrftService> = recovered.router.clone();
+	let (recovered_factory, recovered_pool) =
+		support::loopback_factory(recovered.local_node, recovered_service);
+	let status_resp = support::call_frame(
+		&recovered_factory,
+		&recovered_pool,
+		recovered.local_node,
+		MsgType::STATUS_REQ,
+		&[],
+		None,
+		None,
+	)
+	.await
+	.unwrap();
+	let (status, _) = decode_status_response(&status_resp);
+	assert_eq!(status.epoch, 2);
+	assert_eq!(status.leader, Some(recovered.local_node.id));
+	assert!(status.peers.iter().any(|peer| peer.node_id == 2));
+
+	support::abort_node(&recovered);
 }

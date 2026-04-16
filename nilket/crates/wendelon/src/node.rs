@@ -305,6 +305,7 @@ impl WendelonNode {
 			local_node,
 			epoch_tx.clone(),
 			epoch_rx.clone(),
+			factory.clone(),
 			pool.clone(),
 			cfg.rf as u32,
 			LEASE_TTL_MS,

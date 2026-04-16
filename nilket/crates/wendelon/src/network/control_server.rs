@@ -12,7 +12,8 @@ use crate::consensus::{
 	AdvanceEpochRecord, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
 	SeedMigration, WendelonRaft, WendelonRequest, WendelonResponse,
 };
-use crate::network::core::{HRFT_MAGIC, HrftFrame};
+use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
+use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
@@ -23,7 +24,7 @@ use crate::network::transport::{
 use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId, epoch_entry_var_schema,
+	LeaseDescriptor, LeaseStatus, MsgType, NodeId, TransferToken, epoch_entry_var_schema,
 };
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -42,6 +43,7 @@ pub const CONTROL_REASON_INVALID_TARGET: u8 = 3;
 pub const CONTROL_REASON_UNSUPPORTED: u8 = 4;
 pub const CONTROL_REASON_INVALID_CONFIG: u8 = 5;
 pub const CONTROL_REASON_INTERNAL_ERROR: u8 = 6;
+pub const CONTROL_REASON_INVALID_TOKEN: u8 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvanceEpochResponseWire {
@@ -56,6 +58,7 @@ pub struct WendelonControlServer {
 	local_node: NodeId,
 	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
+	factory: Arc<TransportProviderFactory>,
 	pool: Arc<BufPool>,
 	replication_factor: u32,
 	lease_ttl_cap_ms: u32,
@@ -69,6 +72,7 @@ impl WendelonControlServer {
 		local_node: NodeId,
 		epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 		epoch_rx: watch::Receiver<Arc<crate::network::transport::MembershipEpoch>>,
+		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
 		replication_factor: u32,
 		lease_ttl_cap_ms: u32,
@@ -79,6 +83,7 @@ impl WendelonControlServer {
 			local_node,
 			epoch_tx,
 			epoch_rx,
+			factory,
 			pool,
 			replication_factor,
 			lease_ttl_cap_ms,
@@ -214,49 +219,93 @@ impl WendelonControlServer {
 	}
 
 	async fn handle_transfer(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TRANSFER_REQ must not carry an Arrow payload",
+			));
+		}
 		let req: TransferLeadershipRequestMeta = wire::decode(&frame.meta)?;
-		let resp = if !self.is_leader().await {
-			TransferLeadershipResponseMeta {
-				accepted: false,
-				reason_code: CONTROL_REASON_NOT_LEADER,
+		let token = match self.decode_transfer_token(&frame) {
+			Ok(token) => token,
+			Err(_) => {
+				return self.transfer_response(
+					&frame,
+					TransferLeadershipResponseMeta {
+						accepted: false,
+						reason_code: CONTROL_REASON_INVALID_TOKEN,
+					},
+					None,
+				);
 			}
-		} else if req.source_epoch != self.current_epoch() {
+		};
+		if self.validate_transfer_request(&req, &token).is_err() {
+			return self.transfer_response(
+				&frame,
+				TransferLeadershipResponseMeta {
+					accepted: false,
+					reason_code: CONTROL_REASON_INVALID_TOKEN,
+				},
+				None,
+			);
+		}
+
+		let resp = if req.source_epoch != self.current_epoch() {
 			TransferLeadershipResponseMeta {
 				accepted: false,
 				reason_code: CONTROL_REASON_EPOCH_STALE,
 			}
-		} else if req.from_leader.id != self.local_node.id || req.to_leader.id == self.local_node.id
+		} else if req.to_leader == self.local_node {
+			match self.accept_transfer_target(&token).await {
+				Ok(()) => TransferLeadershipResponseMeta {
+					accepted: true,
+					reason_code: CONTROL_REASON_GRANTED,
+				},
+				Err(err) if err.kind() == ErrorKind::NotConnected => {
+					TransferLeadershipResponseMeta {
+						accepted: false,
+						reason_code: CONTROL_REASON_NOT_LEADER,
+					}
+				}
+				Err(_) => TransferLeadershipResponseMeta {
+					accepted: false,
+					reason_code: CONTROL_REASON_INTERNAL_ERROR,
+				},
+			}
+		} else if !self.is_leader().await {
+			TransferLeadershipResponseMeta {
+				accepted: false,
+				reason_code: CONTROL_REASON_NOT_LEADER,
+			}
+		} else if req.from_leader != self.local_node
+			|| req.to_leader == self.local_node
+			|| !self.transfer_target_known(&req.to_leader)
 		{
 			TransferLeadershipResponseMeta {
 				accepted: false,
 				reason_code: CONTROL_REASON_INVALID_TARGET,
 			}
 		} else {
-			// The routed server surface exists now; the actual transfer-token
-			// workflow lands in later workstream slices. Reject explicitly
-			// instead of letting the RPC fall into the router void.
-			TransferLeadershipResponseMeta {
-				accepted: false,
-				reason_code: CONTROL_REASON_UNSUPPORTED,
+			match self.forward_transfer_request(&frame, &req, &token).await {
+				Ok(resp) => resp,
+				Err(err) if err.kind() == ErrorKind::NotConnected => {
+					TransferLeadershipResponseMeta {
+						accepted: false,
+						reason_code: CONTROL_REASON_NOT_LEADER,
+					}
+				}
+				Err(err) if err.kind() == ErrorKind::NotFound => TransferLeadershipResponseMeta {
+					accepted: false,
+					reason_code: CONTROL_REASON_INVALID_TARGET,
+				},
+				Err(_) => TransferLeadershipResponseMeta {
+					accepted: false,
+					reason_code: CONTROL_REASON_INTERNAL_ERROR,
+				},
 			}
 		};
-
-		let meta = wire::encode_into(&self.pool, &resp)?;
-		Ok(HrftFrame {
-			header: FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::TRANSFER_RESP.0,
-				flags: 0,
-				stream_id: frame.header.stream_id,
-				meta_len: meta.len() as u32,
-				arrow_len: 0,
-				trailing_len: 0,
-			},
-			meta,
-			arrow_payload: None,
-			trailing: None,
-		})
+		let accepted = resp.accepted;
+		self.transfer_response(&frame, resp, accepted.then_some(&token))
 	}
 
 	async fn handle_advance_epoch(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
@@ -518,6 +567,159 @@ impl WendelonControlServer {
 			arrow_payload: None,
 			trailing,
 		})
+	}
+
+	fn transfer_response(
+		&self,
+		frame: &HrftFrame,
+		resp: TransferLeadershipResponseMeta,
+		token: Option<&TransferToken>,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, &resp)?;
+		let trailing = token.map(|token| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec()
+				.extend_from_slice(bytemuck::bytes_of(token));
+			buf
+		});
+		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TRANSFER_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len,
+			},
+			meta,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
+	fn decode_transfer_token(&self, frame: &HrftFrame) -> std::io::Result<TransferToken> {
+		let bytes = frame.trailing.as_deref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TRANSFER_REQ missing TransferToken trailing payload",
+			)
+		})?;
+		if bytes.len() != std::mem::size_of::<TransferToken>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"TRANSFER_REQ TransferToken size mismatch: got {}, expected {}",
+					bytes.len(),
+					std::mem::size_of::<TransferToken>()
+				),
+			));
+		}
+		Ok(*bytemuck::from_bytes(bytes))
+	}
+
+	fn validate_transfer_request(
+		&self,
+		req: &TransferLeadershipRequestMeta,
+		token: &TransferToken,
+	) -> std::io::Result<()> {
+		if req.source_epoch == 0
+			|| req.from_leader.id == 0
+			|| req.to_leader.id == 0
+			|| req.from_leader == req.to_leader
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"invalid transfer request identity fields",
+			));
+		}
+		if token.source_epoch != req.source_epoch
+			|| token.from_leader != req.from_leader
+			|| token.to_leader != req.to_leader
+			|| token.target_epoch != token.source_epoch.saturating_add(1)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"transfer token does not match request metadata",
+			));
+		}
+		Ok(())
+	}
+
+	fn transfer_target_known(&self, target: &NodeId) -> bool {
+		self.epoch_rx
+			.borrow()
+			.peers
+			.get(target)
+			.map(|caps| caps.roles.contains(NodeRole::Control))
+			.unwrap_or(false)
+	}
+
+	async fn forward_transfer_request(
+		&self,
+		frame: &HrftFrame,
+		req: &TransferLeadershipRequestMeta,
+		token: &TransferToken,
+	) -> std::io::Result<TransferLeadershipResponseMeta> {
+		let conn = self.factory.get_connection(req.to_leader).await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = wire::encode(req)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TRANSFER_REQ.0,
+			flags: 0,
+			stream_id: frame.header.stream_id,
+			meta_len: meta.len() as u32,
+			arrow_len: 0,
+			trailing_len: std::mem::size_of::<TransferToken>() as u32,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			&meta,
+			None,
+			Some(bytemuck::bytes_of(token)),
+		)
+		.await?;
+		stream.finish().await?;
+		let resp = read_frame(&mut *stream, &self.pool).await?;
+		if resp.header.msg_type != MsgType::TRANSFER_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"transfer target returned wrong msg_type=0x{:02x}",
+					resp.header.msg_type
+				),
+			));
+		}
+		wire::decode(&resp.meta)
+	}
+
+	async fn accept_transfer_target(&self, token: &TransferToken) -> std::io::Result<()> {
+		self.raft
+			.trigger()
+			.elect()
+			.await
+			.map_err(|err| Error::new(ErrorKind::Other, format!("trigger_elect failed: {err}")))?;
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		loop {
+			if self.raft.current_leader().await == Some(self.local_node.id) {
+				return Ok(());
+			}
+			if tokio::time::Instant::now() >= deadline {
+				return Err(Error::new(
+					ErrorKind::TimedOut,
+					format!(
+						"target node {} did not become leader for transfer from {} in epoch {}",
+						self.local_node.id, token.from_leader.id, token.source_epoch
+					),
+				));
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
 	}
 }
 
