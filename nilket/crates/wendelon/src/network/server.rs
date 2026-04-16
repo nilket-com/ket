@@ -59,6 +59,7 @@ use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
 use crate::network::tls::{DEFAULT_CLUSTER_DOMAIN, verified_peer_node_id};
 use crate::network::transport::{TransportConnection, TransportStream};
+use crate::schema::NodeId;
 use async_trait::async_trait;
 use quinn::Endpoint;
 use std::io::{Error, ErrorKind};
@@ -80,7 +81,11 @@ use std::sync::Arc;
 /// stream — it does not tear down the whole connection.
 #[async_trait]
 pub trait HrftService: Send + Sync + 'static {
-	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+	async fn handle_frame(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>>;
 
 	/// Per-stream entry point. The default implementation keeps the
 	/// unary "one frame in, at most one frame out" behavior; routers
@@ -89,10 +94,11 @@ pub trait HrftService: Send + Sync + 'static {
 		&self,
 		mut stream: Box<dyn TransportStream>,
 		pool: Arc<BufPool>,
+		remote: NodeId,
 	) -> std::io::Result<()> {
 		let frame = read_frame(&mut *stream, &pool).await?;
 
-		match self.handle_frame(frame).await? {
+		match self.handle_frame(remote, frame).await? {
 			Some(resp) => {
 				write_frame(
 					&mut *stream,
@@ -193,6 +199,7 @@ async fn handle_connection<S: HrftService>(
 	service: Arc<S>,
 	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
+	let remote = connection.remote_id();
 	loop {
 		let stream = match connection.accept_bi().await {
 			Ok(s) => s,
@@ -200,8 +207,9 @@ async fn handle_connection<S: HrftService>(
 		};
 		let service = service.clone();
 		let pool = pool.clone();
+		let remote = remote;
 		tokio::spawn(async move {
-			let _ = handle_stream(stream, service, pool).await;
+			let _ = handle_stream(stream, service, pool, remote).await;
 		});
 	}
 }
@@ -214,8 +222,9 @@ async fn handle_stream<S: HrftService>(
 	stream: Box<dyn TransportStream>,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
+	remote: NodeId,
 ) -> std::io::Result<()> {
-	service.handle_stream(stream, pool).await
+	service.handle_stream(stream, pool, remote).await
 }
 
 // ============================================================
@@ -231,7 +240,11 @@ pub struct UnroutedService;
 
 #[async_trait]
 impl HrftService for UnroutedService {
-	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+	async fn handle_frame(
+		&self,
+		_remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
 		Err(Error::new(
 			ErrorKind::Unsupported,
 			format!(

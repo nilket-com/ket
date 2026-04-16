@@ -10,6 +10,7 @@ pub mod router;
 pub mod server;
 pub mod tls;
 pub mod traits;
+pub mod transfer_signing;
 pub mod transport;
 pub mod wire;
 
@@ -25,5 +26,6 @@ pub use router::*;
 pub use server::*;
 pub use tls::*;
 pub use traits::*;
+pub use transfer_signing::*;
 pub use transport::*;
 pub use wire::*;

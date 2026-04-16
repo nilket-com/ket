@@ -75,7 +75,11 @@ impl WendelonRaftInternalServer {
 
 #[async_trait]
 impl RaftInternalServer for WendelonRaftInternalServer {
-	async fn handle_raft_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+	async fn handle_raft_frame(
+		&self,
+		_remote: crate::schema::NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		let (resp_type, body) = match msg_type {
 			MsgType::APPEND_ENTRIES_REQ => {

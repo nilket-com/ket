@@ -19,6 +19,7 @@ use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
+use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
 };
@@ -64,6 +65,7 @@ pub struct WendelonControlServer {
 	replication_factor: u32,
 	lease_ttl_cap_ms: u32,
 	lease_authority: Arc<LeaseAuthority>,
+	transfer_authority: Arc<TransferAuthority>,
 	reconcile_lock: Mutex<()>,
 }
 
@@ -90,12 +92,18 @@ impl WendelonControlServer {
 			replication_factor,
 			lease_ttl_cap_ms,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
+			transfer_authority: Arc::new(TransferAuthority::dev_single_node(local_node)),
 			reconcile_lock: Mutex::new(()),
 		}
 	}
 
 	pub fn with_lease_authority(mut self, authority: Arc<LeaseAuthority>) -> Self {
 		self.lease_authority = authority;
+		self
+	}
+
+	pub fn with_transfer_authority(mut self, authority: Arc<TransferAuthority>) -> Self {
+		self.transfer_authority = authority;
 		self
 	}
 
@@ -226,7 +234,11 @@ impl WendelonControlServer {
 		self.lease_response(&frame, status, None)
 	}
 
-	async fn handle_transfer(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_transfer(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		if frame.arrow_payload.is_some() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -247,7 +259,11 @@ impl WendelonControlServer {
 				);
 			}
 		};
-		if self.validate_transfer_request(&req, &token).is_err() {
+		if self
+			.validate_transfer_request(&req, &token, remote)
+			.await
+			.is_err()
+		{
 			return self.transfer_response(
 				&frame,
 				TransferLeadershipResponseMeta {
@@ -628,10 +644,11 @@ impl WendelonControlServer {
 		Ok(*bytemuck::from_bytes(bytes))
 	}
 
-	fn validate_transfer_request(
+	async fn validate_transfer_request(
 		&self,
 		req: &TransferLeadershipRequestMeta,
 		token: &TransferToken,
+		remote: NodeId,
 	) -> std::io::Result<()> {
 		if req.source_epoch == 0
 			|| req.from_leader.id == 0
@@ -653,6 +670,40 @@ impl WendelonControlServer {
 				"transfer token does not match request metadata",
 			));
 		}
+		let now_ms = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_millis() as u64)
+			.unwrap_or(0);
+		if now_ms >= token.expires_at.physical_ms {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"transfer token has expired",
+			));
+		}
+		if token.source_epoch != self.current_epoch() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"transfer token epoch is stale",
+			));
+		}
+		if self.local_node == token.to_leader && remote != token.from_leader {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"transfer token was not forwarded by leader {}",
+					token.from_leader.id
+				),
+			));
+		}
+		if self.local_node == token.from_leader
+			&& self.raft.current_leader().await != Some(token.from_leader.id)
+		{
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"transfer token issuer is not the current leader",
+			));
+		}
+		self.transfer_authority.verify_token(token)?;
 		Ok(())
 	}
 
@@ -733,12 +784,16 @@ impl WendelonControlServer {
 
 #[async_trait]
 impl ControlRingServer for WendelonControlServer {
-	async fn handle_control_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+	async fn handle_control_frame(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		let resp = match msg_type {
 			MsgType::STATUS_REQ => self.handle_status(frame).await?,
 			MsgType::LEASE_REQ => self.handle_lease(frame).await?,
-			MsgType::TRANSFER_REQ => self.handle_transfer(frame).await?,
+			MsgType::TRANSFER_REQ => self.handle_transfer(remote, frame).await?,
 			MsgType::EPOCH_ADV_REQ => self.handle_advance_epoch(frame).await?,
 			_ => {
 				return Err(Error::new(

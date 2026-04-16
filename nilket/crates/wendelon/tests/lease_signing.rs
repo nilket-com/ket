@@ -6,7 +6,10 @@ use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use wendelon::network::traits::DataRing;
-use wendelon::network::{LeaseAuthority, dev_lease_signing_secret, lease_verifying_key_bytes};
+use wendelon::network::{
+	LeaseAuthority, dev_lease_signing_secret, dev_transfer_signing_secret,
+	lease_verifying_key_bytes, transfer_verifying_key_bytes,
+};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	ClientWriteId, HybridTimestamp, LeaseDescriptor, WriteRequestMeta, WriteStatus,
@@ -65,6 +68,12 @@ fn bootstrap_cfg(
 ) -> NodeBootstrapConfig {
 	let mut trusted_lease_signers = BTreeMap::new();
 	trusted_lease_signers.insert(node_id, trusted_key);
+	let transfer_signing_secret = dev_transfer_signing_secret(node_id);
+	let mut trusted_transfer_signers = BTreeMap::new();
+	trusted_transfer_signers.insert(
+		node_id,
+		transfer_verifying_key_bytes(transfer_signing_secret),
+	);
 	NodeBootstrapConfig {
 		node_id,
 		data_dir: support::tempdir(tag),
@@ -74,6 +83,8 @@ fn bootstrap_cfg(
 		advertise_address: "127.0.0.1:0".into(),
 		lease_signing_secret: secret,
 		trusted_lease_signers,
+		transfer_signing_secret,
+		trusted_transfer_signers,
 	}
 }
 

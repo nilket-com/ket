@@ -130,6 +130,7 @@ struct FailingMigrateService {
 impl HrftService for FailingMigrateService {
 	async fn handle_frame(
 		&self,
+		remote: wendelon::schema::NodeId,
 		frame: wendelon::network::core::HrftFrame,
 	) -> std::io::Result<Option<wendelon::network::core::HrftFrame>> {
 		if frame.header.msg_type == MsgType::MIGRATE_REQ.0
@@ -140,7 +141,7 @@ impl HrftService for FailingMigrateService {
 				"injected migrate source failure",
 			));
 		}
-		self.inner.handle_frame(frame).await
+		self.inner.handle_frame(remote, frame).await
 	}
 }
 

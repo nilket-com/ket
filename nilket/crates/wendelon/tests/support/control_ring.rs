@@ -24,6 +24,11 @@ use wendelon::network::transport::{
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{FrameHeader, MsgType, NodeId};
 
+const ZERO_NODE: NodeId = NodeId {
+	id: 0,
+	_reserved: 0,
+};
+
 pub fn tempdir(tag: &str) -> PathBuf {
 	let base = std::env::temp_dir().join(format!(
 		"wendelon-control-ring-{tag}-{}",
@@ -73,10 +78,28 @@ pub fn loopback_factory(
 	remote: NodeId,
 	service: Arc<dyn HrftService>,
 ) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
-	loopback_factory_many(vec![(remote, service)])
+	loopback_factory_from(ZERO_NODE, remote, service)
 }
 
+#[allow(dead_code)]
+pub fn loopback_factory_from(
+	local: NodeId,
+	remote: NodeId,
+	service: Arc<dyn HrftService>,
+) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
+	loopback_factory_many_from(local, vec![(remote, service)])
+}
+
+#[allow(dead_code)]
 pub fn loopback_factory_many(
+	services: Vec<(NodeId, Arc<dyn HrftService>)>,
+) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
+	loopback_factory_many_from(ZERO_NODE, services)
+}
+
+#[allow(dead_code)]
+pub fn loopback_factory_many_from(
+	local: NodeId,
 	services: Vec<(NodeId, Arc<dyn HrftService>)>,
 ) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
 	let pool = BufPool::new(64, 1024 * 1024);
@@ -105,6 +128,7 @@ pub fn loopback_factory_many(
 	providers.insert(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
+			local,
 			services: service_map,
 			pool: pool.clone(),
 			tier: TransportTier::QuicIoUring,
@@ -152,6 +176,7 @@ pub fn loopback_client_config_many_with_topology(
 	providers.insert(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
+			local: ZERO_NODE,
 			services: service_map,
 			pool: BufPool::new(64, 1024 * 1024),
 			tier: TransportTier::QuicIoUring,
@@ -354,6 +379,7 @@ impl TransportStream for DuplexTransportStream {
 }
 
 struct LoopbackConnection {
+	local: NodeId,
 	remote: NodeId,
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
@@ -366,7 +392,8 @@ impl TransportConnection for LoopbackConnection {
 		let (client_side, server_side) = tokio::io::duplex(64 * 1024);
 		let service = self.service.clone();
 		let pool = self.pool.clone();
-		tokio::spawn(serve_stream(server_side, service, pool));
+		let local = self.local;
+		tokio::spawn(serve_stream(server_side, service, pool, local));
 		Ok(Box::new(DuplexTransportStream { inner: client_side }))
 	}
 
@@ -388,6 +415,7 @@ impl TransportConnection for LoopbackConnection {
 }
 
 struct LoopbackProvider {
+	local: NodeId,
 	services: HashMap<NodeId, Arc<dyn HrftService>>,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
@@ -407,6 +435,7 @@ impl TransportProvider for LoopbackProvider {
 			)
 		})?;
 		Ok(Arc::new(LoopbackConnection {
+			local: self.local,
 			remote: target,
 			service,
 			pool: self.pool.clone(),
@@ -415,8 +444,17 @@ impl TransportProvider for LoopbackProvider {
 	}
 }
 
-async fn serve_stream(stream: DuplexStream, service: Arc<dyn HrftService>, pool: Arc<BufPool>) {
+async fn serve_stream(
+	stream: DuplexStream,
+	service: Arc<dyn HrftService>,
+	pool: Arc<BufPool>,
+	remote: NodeId,
+) {
 	let _ = service
-		.handle_stream(Box::new(DuplexTransportStream { inner: stream }), pool)
+		.handle_stream(
+			Box::new(DuplexTransportStream { inner: stream }),
+			pool,
+			remote,
+		)
 		.await;
 }

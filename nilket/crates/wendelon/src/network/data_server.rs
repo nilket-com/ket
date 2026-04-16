@@ -2140,7 +2140,11 @@ impl WendelonDataServer {
 
 #[async_trait]
 impl DataRingServer for WendelonDataServer {
-	async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+	async fn handle_data_frame(
+		&self,
+		_remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		match msg_type {
 			MsgType::WRITE_REQ => self.handle_write(frame).await.map(Some),
@@ -2160,6 +2164,7 @@ impl DataRingServer for WendelonDataServer {
 
 	async fn handle_data_stream(
 		&self,
+		_remote: NodeId,
 		first_header: FrameHeader,
 		stream: Box<dyn TransportStream>,
 		_pool: Arc<BufPool>,
@@ -3654,11 +3659,16 @@ mod tests {
 				signature: [0; 64],
 			});
 		// Give Raft a moment to elect and ring updater to seed.
-		for _ in 0..64 {
-			tokio::task::yield_now().await;
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
 			if node.raft.current_leader().await == Some(node.local_node.id) {
 				break;
 			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
 		let granted = node
 			.data_server
@@ -3689,11 +3699,16 @@ mod tests {
 		// so the cache is guaranteed to be warm before the write
 		// arrives — the spawned manager is on a 1s tick so tests
 		// that race against it would be flaky.
-		for _ in 0..64 {
-			tokio::task::yield_now().await;
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
 			if node.raft.current_leader().await == Some(node.local_node.id) {
 				break;
 			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
 		node.data_server
 			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
@@ -4477,7 +4492,7 @@ mod tests {
 			Some(s) => s,
 			None => return,
 		};
-		let response = match svc.handle_frame(frame).await {
+		let response = match svc.handle_frame(ZERO_NODE, frame).await {
 			Ok(Some(r)) => r,
 			_ => return,
 		};
@@ -4653,7 +4668,11 @@ mod tests {
 
 	#[async_trait]
 	impl HrftService for CrashyReplicaService {
-		async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+		async fn handle_frame(
+			&self,
+			_remote: NodeId,
+			frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
 			if frame.header.msg_type != MsgType::REPLICATE_REQ.0 {
 				return Err(Error::new(
 					ErrorKind::Unsupported,

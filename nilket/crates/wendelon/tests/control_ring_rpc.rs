@@ -4,6 +4,7 @@ mod support;
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
 	AdvanceEpochResponseWire, CONTROL_REASON_GRANTED, WendelonControlServer,
@@ -15,6 +16,9 @@ use wendelon::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
 };
 use wendelon::network::wire;
+use wendelon::network::{
+	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
+};
 use wendelon::node::{LEASE_TTL_MS, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp, LeaseDescriptor,
@@ -283,9 +287,33 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 
 #[tokio::test]
 async fn transfer_leadership_req_routes_to_control_handler() {
-	let leader = support::bootstrap_node("transfer-rpc-leader", 1).await;
+	let leader_secret = dev_transfer_signing_secret(1);
+	let target_secret = dev_transfer_signing_secret(2);
+	let leader_vk = transfer_verifying_key_bytes(leader_secret);
+	let target_vk = transfer_verifying_key_bytes(target_secret);
+	let mut leader_cfg = NodeBootstrapConfig::dev(
+		1,
+		support::tempdir("transfer-rpc-leader"),
+		"127.0.0.1:0".into(),
+	);
+	leader_cfg
+		.trusted_transfer_signers
+		.extend([(1, leader_vk), (2, target_vk)]);
+	let leader = WendelonNode::bootstrap_single_node(leader_cfg)
+		.await
+		.unwrap();
 	support::wait_for_local_leader(&leader).await;
-	let target = support::bootstrap_node("transfer-rpc-target", 2).await;
+	let mut target_cfg = NodeBootstrapConfig::dev(
+		2,
+		support::tempdir("transfer-rpc-target"),
+		"127.0.0.1:1".into(),
+	);
+	target_cfg
+		.trusted_transfer_signers
+		.extend([(1, leader_vk), (2, target_vk)]);
+	let target = WendelonNode::bootstrap_single_node(target_cfg)
+		.await
+		.unwrap();
 
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let roles = NodeRoleSet::empty()
@@ -312,7 +340,8 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 	let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(Arc::new(epoch));
 
 	let target_service: Arc<dyn HrftService> = target.router.clone();
-	let (forward_factory, pool) = support::loopback_factory(target.local_node, target_service);
+	let (forward_factory, pool) =
+		support::loopback_factory_from(leader.local_node, target.local_node, target_service);
 	let leader_service: Arc<dyn HrftService> = Arc::new(
 		MsgRouterBuilder::default()
 			.with_control_ring(Arc::new(WendelonControlServer::new(
@@ -334,20 +363,31 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 		from_leader: leader.local_node,
 		to_leader: target.local_node,
 	};
-	let token = TransferToken {
+	let expires_at = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_millis() as u64)
+		.unwrap_or(0)
+		.saturating_add(60_000);
+	let token = TransferAuthority::from_secret_bytes(leader.local_node, leader_secret, &{
+		let mut trusted = std::collections::BTreeMap::new();
+		trusted.insert(leader.local_node.id, leader_vk);
+		trusted
+	})
+	.unwrap()
+	.sign_token(TransferToken {
 		source_epoch: 1,
 		target_epoch: 2,
 		from_leader: leader.local_node,
 		to_leader: target.local_node,
 		expires_at: HybridTimestamp {
-			physical_ms: 40_000,
+			physical_ms: expires_at,
 			logical: 0,
 			node_id: leader.local_node.id,
 		},
 		_signed_reserved: 0,
 		signature: [0; 64],
 		_pad: [0; 8],
-	};
+	});
 
 	let resp = support::call_frame(
 		&factory,

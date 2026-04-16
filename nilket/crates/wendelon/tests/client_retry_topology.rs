@@ -205,7 +205,11 @@ impl RedirectingService {
 
 #[async_trait]
 impl HrftService for RedirectingService {
-	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
+	async fn handle_frame(
+		&self,
+		_remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
 		self.calls.fetch_add(1, Ordering::SeqCst);
 		match MsgType(frame.header.msg_type) {
 			MsgType::WRITE_REQ => {

@@ -47,6 +47,9 @@ use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
 use crate::network::server::{HrftService, serve};
+use crate::network::transfer_signing::{
+	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
+};
 use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
 	TransportProvider, TransportTier, TransportTierSet,
@@ -95,6 +98,12 @@ pub struct NodeBootstrapConfig {
 	/// Raft `NodeId.id`. Data-ring lease gates reject descriptors
 	/// from issuers not present here.
 	pub trusted_lease_signers: BTreeMap<u32, [u8; 32]>,
+	/// Ed25519 secret key used when this node signs a
+	/// [`TransferToken`] as the current leader.
+	pub transfer_signing_secret: [u8; 32],
+	/// Trusted Ed25519 verifying keys for transfer-token issuers,
+	/// keyed by Raft `NodeId.id`.
+	pub trusted_transfer_signers: BTreeMap<u32, [u8; 32]>,
 }
 
 impl NodeBootstrapConfig {
@@ -104,6 +113,12 @@ impl NodeBootstrapConfig {
 		let lease_signing_secret = dev_lease_signing_secret(node_id);
 		let mut trusted_lease_signers = BTreeMap::new();
 		trusted_lease_signers.insert(node_id, lease_verifying_key_bytes(lease_signing_secret));
+		let transfer_signing_secret = dev_transfer_signing_secret(node_id);
+		let mut trusted_transfer_signers = BTreeMap::new();
+		trusted_transfer_signers.insert(
+			node_id,
+			transfer_verifying_key_bytes(transfer_signing_secret),
+		);
 		Self {
 			node_id,
 			data_dir,
@@ -113,6 +128,8 @@ impl NodeBootstrapConfig {
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,
+			transfer_signing_secret,
+			trusted_transfer_signers,
 		}
 	}
 }
@@ -180,6 +197,11 @@ impl WendelonNode {
 			local_node,
 			cfg.lease_signing_secret,
 			&cfg.trusted_lease_signers,
+		)?);
+		let transfer_authority = Arc::new(TransferAuthority::from_secret_bytes(
+			local_node,
+			cfg.transfer_signing_secret,
+			&cfg.trusted_transfer_signers,
 		)?);
 
 		// 1. Shared buffer pool (HRFT frames + postcard bodies).
@@ -336,7 +358,8 @@ impl WendelonNode {
 				cfg.rf as u32,
 				LEASE_TTL_MS,
 			)
-			.with_lease_authority(lease_authority.clone()),
+			.with_lease_authority(lease_authority.clone())
+			.with_transfer_authority(transfer_authority.clone()),
 		);
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
@@ -433,17 +456,19 @@ async fn serve_dyn(
 	impl HrftService for DynService {
 		async fn handle_frame(
 			&self,
+			remote: crate::schema::NodeId,
 			frame: crate::network::core::HrftFrame,
 		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
-			self.0.handle_frame(frame).await
+			self.0.handle_frame(remote, frame).await
 		}
 
 		async fn handle_stream(
 			&self,
 			stream: Box<dyn crate::network::transport::TransportStream>,
 			pool: Arc<BufPool>,
+			remote: crate::schema::NodeId,
 		) -> std::io::Result<()> {
-			self.0.handle_stream(stream, pool).await
+			self.0.handle_stream(stream, pool, remote).await
 		}
 	}
 	serve(endpoint, Arc::new(DynService(service)), pool).await
@@ -813,7 +838,17 @@ mod tests {
 			arrow_payload: None,
 			trailing: None,
 		};
-		let err = node.router.handle_frame(frame).await.unwrap_err();
+		let err = node
+			.router
+			.handle_frame(
+				crate::schema::NodeId {
+					id: 0,
+					_reserved: 0,
+				},
+				frame,
+			)
+			.await
+			.unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidData);
 	}
 }
