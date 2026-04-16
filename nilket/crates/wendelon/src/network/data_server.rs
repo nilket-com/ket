@@ -41,18 +41,18 @@ use crate::consensus::{
 	MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest, WendelonResponse,
 	WendelonStateMachine,
 };
-use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
+use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
 use crate::network::transport::MembershipEpoch;
 use crate::schema::{
-	migration_record_schema, wpbc, Consistency, FinalizationMarker, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
-	MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta,
-	ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor,
+	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, migration_record_schema, wpbc,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
 use crate::storage::manager::SlabManager;
@@ -1109,14 +1109,14 @@ impl WendelonDataServer {
 					_pad: [0; 7],
 				};
 				let (resp, records) = self.migrate_request(*source, &req).await.map_err(|e| {
-                    Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "migration pull: transport error from source {:?} for migration {}: {e}",
-                            source, entry.migration_id,
-                        ),
-                    )
-                })?;
+					Error::new(
+						ErrorKind::Other,
+						format!(
+							"migration pull: transport error from source {:?} for migration {}: {e}",
+							source, entry.migration_id,
+						),
+					)
+				})?;
 				if resp.status != MigrateStatus::OK {
 					return Err(Error::new(
 						ErrorKind::Other,
@@ -3209,10 +3209,10 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(
-            resp.status,
-            ReadStatus::EPOCH_STALE,
-            "gate must fire before any pull; otherwise an unreachable source would mask this as MIGRATION_INCOMPLETE"
-        );
+			resp.status,
+			ReadStatus::EPOCH_STALE,
+			"gate must fire before any pull; otherwise an unreachable source would mask this as MIGRATION_INCOMPLETE"
+		);
 	}
 
 	#[tokio::test]
@@ -3289,7 +3289,7 @@ mod tests {
 	use std::sync::atomic::{AtomicI32, Ordering as LoopbackOrdering};
 	use std::task::{Context as TaskContext, Poll};
 	use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-	use tokio::sync::{watch, Mutex as TokioMutex};
+	use tokio::sync::{Mutex as TokioMutex, watch};
 
 	/// Registry of per-target HRFT services + fault knobs. The
 	/// `LoopbackProvider` and every `LoopbackConnection` share this

@@ -53,11 +53,12 @@
 //!   `ForwardToLeader` hints and fatal-shutdown signals propagate.
 
 use crate::consensus::WendelonTypeConfig;
-use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
+use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::transport::{TransportConnection, TransportProvider};
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
+use openraft::BasicNode;
 use openraft::error::{
 	InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
 };
@@ -66,9 +67,8 @@ use openraft::raft::{
 	AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
 	VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 

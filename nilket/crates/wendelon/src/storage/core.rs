@@ -53,7 +53,7 @@
 //! [`append`]: LocalSlabStore::append
 
 use crate::schema::{HybridTimestamp, SlabRecordHeader};
-use crate::storage::io_uring::{AlignedBuf, IoOp, IoRingHandle, DIRECT_IO_ALIGN};
+use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoOp, IoRingHandle};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::fs::{File, OpenOptions};

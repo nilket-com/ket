@@ -43,14 +43,15 @@
 //! a Self-typed reader that shares the same cache as the writer.
 
 use crate::consensus::{
-	MigratedRangeTombstone, MigrationComplete, MigrationLedgerEntry, MigrationState, SeedMigration,
-	TieredSlab, WendelonRequest, WendelonResponse, WendelonTypeConfig,
+	AdvanceEpochRecord, EpochConfig, MigratedRangeTombstone, MigrationComplete,
+	MigrationLedgerEntry, MigrationState, SeedMigration, TieredSlab, WendelonRequest,
+	WendelonResponse, WendelonTypeConfig,
 };
 use crate::schema::{
 	HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, SnapshotHeader,
 	WALRecordHeader,
 };
-use crate::storage::io_uring::{AlignedBuf, IoOp, IoRingHandle, DIRECT_IO_ALIGN};
+use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoOp, IoRingHandle};
 use bytemuck::{Pod, Zeroable};
 use openraft::anyerror::AnyError;
 use openraft::storage::{
@@ -556,6 +557,12 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 pub struct SmState {
 	pub last_applied_log_id: Option<LogId<u32>>,
 	pub last_membership: StoredMembership<u32, BasicNode>,
+	/// Durable control-plane epoch history. The latest committed
+	/// entry may be ahead of the externally visible watch epoch
+	/// while auto-seeding is still reconciling the Migration
+	/// Ledger after the config commit.
+	#[serde(default)]
+	pub epoch_history: BTreeMap<u64, EpochConfig>,
 	/// Per-range active leases (Plan 018). Keyed by
 	/// `LeaseDescriptor.range_start` so a holder renewing the same
 	/// vnode replaces its prior lease in-place. Overlap detection
@@ -895,7 +902,7 @@ fn apply_request(
 				}
 				if existing.epoch < lease.epoch {
 					continue; // prior-epoch leases are invalid by
-					 // the epoch-bump rule (plan 018)
+					// the epoch-bump rule (plan 018)
 				}
 				let overlaps = lease.range_start <= existing.range_end
 					&& existing.range_start <= lease.range_end;
@@ -907,12 +914,16 @@ fn apply_request(
 				let same_holder = existing.holder.id == lease.holder.id;
 				if same_range && same_holder {
 					continue; // permissible renewal; falls through
-					 // to the insert below which overwrites
-					 // the prior entry with the new expiry.
+					// to the insert below which overwrites
+					// the prior entry with the new expiry.
 				}
 				return (WendelonResponse::LeaseDenied, None);
 			}
 			state.leases.insert(lease.range_start, lease);
+			(WendelonResponse::Success, None)
+		}
+		WendelonRequest::AdvanceEpoch(record) => {
+			apply_advance_epoch(state, record);
 			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::SchemaUpdate(_bytes) => {
@@ -940,6 +951,17 @@ fn apply_request(
 			(WendelonResponse::Success, None)
 		}
 	}
+}
+
+fn apply_advance_epoch(state: &mut SmState, record: AdvanceEpochRecord) {
+	state
+		.epoch_history
+		.entry(record.from.epoch)
+		.or_insert(record.from);
+	state
+		.epoch_history
+		.entry(record.to.epoch)
+		.or_insert(record.to);
 }
 
 /// Fold a [`SeedMigration`] into the ledger. Idempotent: a replay
@@ -1480,6 +1502,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	let (kind, epoch) = match &entry.payload {
 		EntryPayload::Normal(WendelonRequest::Finalize(m)) => (LogEntryKind::APPEND, m.epoch),
 		EntryPayload::Normal(WendelonRequest::AcquireLease(l)) => (LogEntryKind::APPEND, l.epoch),
+		EntryPayload::Normal(WendelonRequest::AdvanceEpoch(r)) => {
+			(LogEntryKind::CONFIG, r.to.epoch)
+		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {

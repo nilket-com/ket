@@ -689,7 +689,7 @@ mod tests {
 		tracker.record(nid(2), 9_990); // receipt at 10_000
 		clock.set(20_000);
 		tracker.record(nid(3), 19_990); // receipt at 20_000
-								  // threshold = 5s → 2 is stale (receipt 10s old), 3 is fresh
+		// threshold = 5s → 2 is stale (receipt 10s old), 3 is fresh
 		clock.set(20_500);
 		let stale = tracker.stale_peers(Duration::from_secs(5), 20_500);
 		assert_eq!(stale, vec![nid(2)]);

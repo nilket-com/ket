@@ -42,8 +42,8 @@
 
 use crate::schema::HybridTimestamp;
 use crate::storage::core::{
-	insert_version_sorted, newest_version_as_of, remove_version_exact, LocalSlabStore,
-	RecordLocation, StorageEngine,
+	LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted, newest_version_as_of,
+	remove_version_exact,
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;

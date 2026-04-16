@@ -2,7 +2,7 @@ use rustls::pki_types::CertificateDer;
 use std::io::Cursor;
 use wendelon::network::quic_transport::canonical_server_name_resolver;
 use wendelon::network::tls::{
-	canonical_node_dns_name, verified_peer_node_id_from_chain, DEFAULT_CLUSTER_DOMAIN,
+	DEFAULT_CLUSTER_DOMAIN, canonical_node_dns_name, verified_peer_node_id_from_chain,
 };
 use wendelon::schema::NodeId;
 

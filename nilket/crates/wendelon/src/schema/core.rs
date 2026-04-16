@@ -289,11 +289,11 @@ impl MsgType {
 	pub const BULK_WRITE_RESP: Self = Self(0x06);
 	pub const STREAM_FIN_REQ: Self = Self(0x07); // StreamFinalization subscribe
 	pub const STREAM_FIN_EVT: Self = Self(0x08); // FinalizationMarker push
-											  // Stellarator replica fan-out (ADR 003). The Data Ring front
-											  // door uses these to replicate Arrow IPC bytes from the
-											  // accepting node to the remaining replica set members in
-											  // parallel — quorum acks on REPLICATE_RESP gate the
-											  // `FinalizationMarker` handoff to Raft.
+	// Stellarator replica fan-out (ADR 003). The Data Ring front
+	// door uses these to replicate Arrow IPC bytes from the
+	// accepting node to the remaining replica set members in
+	// parallel — quorum acks on REPLICATE_RESP gate the
+	// `FinalizationMarker` handoff to Raft.
 	pub const REPLICATE_REQ: Self = Self(0x09);
 	pub const REPLICATE_RESP: Self = Self(0x0A);
 	// Pushdown scan from a Smart Client SDK (ADR 005 + ADR 004).

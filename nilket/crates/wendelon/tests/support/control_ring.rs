@@ -1,3 +1,6 @@
+use arrow::array::{ArrayRef, ListBuilder, StringBuilder, UInt32Builder};
+use arrow::datatypes::{DataType, Field};
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
@@ -7,7 +10,7 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::watch;
-use wendelon::network::core::{read_frame, write_frame, HrftFrame, HRFT_MAGIC};
+use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::server::HrftService;
@@ -47,6 +50,7 @@ pub fn abort_node(node: &WendelonNode) {
 	node.handles.drift_monitor.abort();
 	node.handles.eviction_watchdog.abort();
 	node.handles.lease_manager.abort();
+	node.handles.epoch_reconciler.abort();
 }
 
 pub async fn bootstrap_node(tag: &str, node_id: u32) -> WendelonNode {
@@ -137,6 +141,92 @@ pub fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> std::io::Result
 			.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("finish batch: {e}")))?;
 	}
 	Ok(buf)
+}
+
+#[allow(dead_code)]
+pub fn epoch_config_batch(
+	peers: &[(u32, &str, u8, u8)],
+	voters: &[u32],
+	learners: &[u32],
+) -> RecordBatch {
+	let mut addresses = HashMap::new();
+	for (id, address, _, _) in peers {
+		addresses.insert(*id, *address);
+	}
+
+	let voter_addresses: Vec<&str> = voters
+		.iter()
+		.map(|id| *addresses.get(id).expect("voter address missing"))
+		.collect();
+	let learner_addresses: Vec<&str> = learners
+		.iter()
+		.map(|id| *addresses.get(id).expect("learner address missing"))
+		.collect();
+
+	let mut meta_keys = Vec::new();
+	let mut meta_values = Vec::new();
+	for (id, _, tier_bits, role_bits) in peers {
+		meta_keys.push(format!("node.{id}.tier_bits"));
+		meta_values.push(tier_bits.to_string());
+		meta_keys.push(format!("node.{id}.role_bits"));
+		meta_values.push(role_bits.to_string());
+	}
+
+	let columns: Vec<ArrayRef> = vec![
+		Arc::new(list_u32(voters)),
+		Arc::new(list_utf8(&voter_addresses)),
+		Arc::new(list_u32(learners)),
+		Arc::new(list_utf8(&learner_addresses)),
+		Arc::new(list_utf8_owned(&meta_keys)),
+		Arc::new(list_utf8_owned(&meta_values)),
+	];
+	RecordBatch::try_new(
+		Arc::new(wendelon::schema::epoch_entry_var_schema()),
+		columns,
+	)
+	.unwrap()
+}
+
+#[allow(dead_code)]
+fn list_u32(values: &[u32]) -> arrow::array::ListArray {
+	let mut builder = ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+		"item",
+		DataType::UInt32,
+		false,
+	));
+	for value in values {
+		builder.values().append_value(*value);
+	}
+	builder.append(true);
+	builder.finish()
+}
+
+#[allow(dead_code)]
+fn list_utf8(values: &[&str]) -> arrow::array::ListArray {
+	let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Field::new(
+		"item",
+		DataType::Utf8,
+		false,
+	));
+	for value in values {
+		builder.values().append_value(*value);
+	}
+	builder.append(true);
+	builder.finish()
+}
+
+#[allow(dead_code)]
+fn list_utf8_owned(values: &[String]) -> arrow::array::ListArray {
+	let mut builder = ListBuilder::new(StringBuilder::new()).with_field(Field::new(
+		"item",
+		DataType::Utf8,
+		false,
+	));
+	for value in values {
+		builder.values().append_value(value);
+	}
+	builder.append(true);
+	builder.finish()
 }
 
 struct DuplexTransportStream {

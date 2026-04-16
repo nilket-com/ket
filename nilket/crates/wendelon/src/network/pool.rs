@@ -245,8 +245,8 @@ mod tests {
 		let pool = BufPool::new(4, 1024);
 		let buf = pool.acquire();
 		drop(pool); // strong count → 0; weak stays live
-			  // PooledBuf drop tries to upgrade the weak handle, fails,
-			  // and the Vec drops normally. No panic, no leak.
+		// PooledBuf drop tries to upgrade the weak handle, fails,
+		// and the Vec drops normally. No panic, no leak.
 		drop(buf);
 	}
 }

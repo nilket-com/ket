@@ -23,30 +23,30 @@
 //!   background join handle so the owner can await or abort them;
 //!   the eviction + drift watchdogs run forever by design.
 
+use crate::consensus::WendelonRaft;
 use crate::consensus::monitor::{
-	spawn_drift_monitor, spawn_eviction_watchdog, AbortHandle, LeaderStatus, MembershipAdvancer,
-	NodeTracker, PhysicalClock, ProcessAbort, SystemClock, DRIFT_CHECK_INTERVAL,
-	EVICTION_CHECK_INTERVAL,
+	AbortHandle, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL, LeaderStatus, MembershipAdvancer,
+	NodeTracker, PhysicalClock, ProcessAbort, SystemClock, spawn_drift_monitor,
+	spawn_eviction_watchdog,
 };
 use crate::consensus::raft_network::WendelonRaftNetworkFactory;
 use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
 	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
-use crate::consensus::WendelonRaft;
-use crate::network::control_server::WendelonControlServer;
+use crate::network::control_server::{WendelonControlServer, select_bootstrap_epoch};
 use crate::network::data_server::WendelonDataServer;
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
-use crate::network::server::{serve, HrftService};
+use crate::network::server::{HrftService, serve};
 use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
 	TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::schema::NodeId;
-use crate::storage::io_uring::{spawn_io_thread, IoRingHandle};
+use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -129,6 +129,7 @@ pub struct NodeHandles {
 	pub drift_monitor: JoinHandle<()>,
 	pub eviction_watchdog: JoinHandle<()>,
 	pub lease_manager: JoinHandle<()>,
+	pub epoch_reconciler: JoinHandle<()>,
 }
 
 /// Time-to-live the lease manager requests on every grant. The
@@ -176,11 +177,14 @@ impl WendelonNode {
 		let bootstrap_mode = log_store.bootstrap_mode().await;
 		let state_machine = log_store.recovered_state_machine().await?;
 
-		// 5. Seed membership epoch: self-only, advertising Data +
-		//    Control roles and the QUIC tier. Every subsystem that
-		//    reacts to membership (ring router, factory invalidator,
-		//    capability resolver) subscribes to this watch.
-		let seed_epoch = seed_single_node_epoch(local_node, &cfg.advertise_address);
+		// 5. Seed membership epoch from durable history if present;
+		//    otherwise fall back to the single-node genesis epoch.
+		//    If recovery finds a committed-but-unseeded transition,
+		//    `select_bootstrap_epoch` holds visibility at the prior
+		//    epoch until the reconciler finishes auto-seeding.
+		let fallback_epoch = seed_single_node_epoch(local_node, &cfg.advertise_address);
+		let recovered_state = state_machine.state_snapshot().await;
+		let seed_epoch = select_bootstrap_epoch(&recovered_state, &fallback_epoch, cfg.rf)?;
 		let (epoch_tx, epoch_rx) = watch::channel(Arc::new(seed_epoch));
 
 		// 6. Liveness tracker shared by the data-plane, the Raft
@@ -261,26 +265,13 @@ impl WendelonNode {
 		let ring = Arc::new(RingRouter::empty());
 		let ring_updater = ring.clone().spawn_updater(epoch_rx.clone(), cfg.rf);
 
-		// 12. Drift monitor + eviction watchdog.
+		// 12. Drift monitor.
 		let abort: Arc<dyn AbortHandle> = Arc::new(ProcessAbort);
 		let drift_monitor = spawn_drift_monitor(
 			tracker.clone(),
 			clock.clone(),
 			abort.clone(),
 			DRIFT_CHECK_INTERVAL,
-		);
-		let leader: Arc<dyn LeaderStatus> =
-			Arc::new(RaftLeaderStatus::new(raft.clone(), local_node));
-		let advancer: Arc<dyn MembershipAdvancer> =
-			Arc::new(WatchMembershipAdvancer::new(epoch_tx.clone()));
-		let eviction_watchdog = spawn_eviction_watchdog(
-			tracker.clone(),
-			clock.clone(),
-			leader,
-			advancer,
-			epoch_rx.clone(),
-			cfg.rf,
-			EVICTION_CHECK_INTERVAL,
 		);
 
 		// 13. Data Ring + Raft Internal Ring servers. Both observe
@@ -307,14 +298,35 @@ impl WendelonNode {
 		);
 		let control_server = Arc::new(WendelonControlServer::new(
 			raft.clone(),
+			state_machine.clone(),
 			local_node,
+			epoch_tx.clone(),
 			epoch_rx.clone(),
 			pool.clone(),
 			cfg.rf as u32,
 			LEASE_TTL_MS,
 		));
+		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
-		// 14. Ring-aware dispatch — the single `HrftService` the QUIC
+		// 14. Eviction watchdog. Route leader-driven epoch changes
+		//     back through the same Control Ring compound workflow
+		//     the external RPC uses so migration auto-seeding stays
+		//     attached to every transition source.
+		let leader: Arc<dyn LeaderStatus> =
+			Arc::new(RaftLeaderStatus::new(raft.clone(), local_node));
+		let advancer: Arc<dyn MembershipAdvancer> =
+			Arc::new(ControlPlaneMembershipAdvancer::new(control_server.clone()));
+		let eviction_watchdog = spawn_eviction_watchdog(
+			tracker.clone(),
+			clock.clone(),
+			leader,
+			advancer,
+			epoch_rx.clone(),
+			cfg.rf,
+			EVICTION_CHECK_INTERVAL,
+		);
+
+		// 15. Ring-aware dispatch — the single `HrftService` the QUIC
 		//     listener hands every inbound frame to.
 		let router = Arc::new(
 			MsgRouterBuilder::default()
@@ -324,7 +336,7 @@ impl WendelonNode {
 				.build(),
 		);
 
-		// 15. Lease manager (plan 018). Runs in the background,
+		// 16. Lease manager (plan 018). Runs in the background,
 		//     renews every LEASE_TTL_MS / 3 and on every ring-epoch
 		//     change, and updates the data server's local cache so
 		//     the write/read gates installed above can admit traffic.
@@ -354,6 +366,7 @@ impl WendelonNode {
 				drift_monitor,
 				eviction_watchdog,
 				lease_manager,
+				epoch_reconciler,
 			},
 		})
 	}
@@ -447,6 +460,23 @@ impl LeaderStatus for RaftLeaderStatus {
 	}
 }
 
+pub struct ControlPlaneMembershipAdvancer {
+	control: Arc<WendelonControlServer>,
+}
+
+impl ControlPlaneMembershipAdvancer {
+	pub fn new(control: Arc<WendelonControlServer>) -> Self {
+		Self { control }
+	}
+}
+
+#[async_trait]
+impl MembershipAdvancer for ControlPlaneMembershipAdvancer {
+	async fn advance_epoch(&self, next: MembershipEpoch) -> std::io::Result<()> {
+		self.control.advance_membership_epoch(next).await
+	}
+}
+
 /// Single-node advancer: publishes the new epoch into the local
 /// watch channel without going through Raft. Real multi-node
 /// deployments will replace this with a Control Ring client that
@@ -509,11 +539,11 @@ impl TransportProvider for NoDialTransportProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::consensus::monitor::{
-		check_drift_once, sweep_evictions_once, DriftCheck, EvictionDecision, EVICTION_THRESHOLD,
-		MAX_OFFSET_MS,
-	};
 	use crate::consensus::WendelonRequest;
+	use crate::consensus::monitor::{
+		DriftCheck, EVICTION_THRESHOLD, EvictionDecision, MAX_OFFSET_MS, check_drift_once,
+		sweep_evictions_once,
+	};
 	use crate::schema::{FinalizationMarker, HybridTimestamp};
 	use std::time::Duration;
 

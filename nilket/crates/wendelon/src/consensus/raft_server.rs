@@ -22,18 +22,18 @@
 
 use crate::consensus::monitor::NodeTracker;
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonTypeConfig};
-use crate::network::core::{HrftFrame, HRFT_MAGIC};
+use crate::network::core::{HRFT_MAGIC, HrftFrame};
 use crate::network::pool::BufPool;
 use crate::network::router::RaftInternalServer;
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
 use async_trait::async_trait;
+use openraft::EntryPayload;
 use openraft::error::{InstallSnapshotError, RaftError};
 use openraft::raft::{
 	AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
 	VoteRequest, VoteResponse,
 };
-use openraft::EntryPayload;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 

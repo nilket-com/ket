@@ -59,7 +59,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 /// Knobs for the background sweeper. Defaults aim for "runs on a
 /// laptop without destroying your write throughput" — production

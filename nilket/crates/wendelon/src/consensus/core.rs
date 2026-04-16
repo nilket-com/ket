@@ -1,5 +1,6 @@
 use crate::schema::{FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Payload of a `TierSlab` Raft entry (ADR 006).
 ///
@@ -115,6 +116,34 @@ pub struct MigrationComplete {
 	pub migration_hlc_floor: HybridTimestamp,
 }
 
+/// Durable peer description for a committed epoch config.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochPeer {
+	pub node_id: NodeId,
+	pub address: String,
+	pub tier_bits: u8,
+	pub role_bits: u8,
+}
+
+/// Durable projection of a committed `ring(E)` membership snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochConfig {
+	pub epoch: u64,
+	pub peers: BTreeMap<u32, EpochPeer>,
+}
+
+/// Committed control-plane transition from `ring(E)` to `ring(E+1)`.
+///
+/// The Control Ring persists both sides of the boundary first, then
+/// computes and commits deterministic migration seeds afterward. That
+/// lets a later leader reconstruct the exact expected seed batch if
+/// the original leader fails mid-transition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceEpochRecord {
+	pub from: EpochConfig,
+	pub to: EpochConfig,
+}
+
 /// Logical "this range moved away" marker held on prior source
 /// replicas. Fences the range out of future migration-source
 /// scans without requiring an immediate slab rewrite; physical
@@ -138,6 +167,9 @@ pub enum WendelonRequest {
 	Finalize(FinalizationMarker),
 	/// Grant a Per-Range Lease to a Data Node.
 	AcquireLease(LeaseDescriptor),
+	/// Commit the next epoch/ring config before auto-seeding the
+	/// Migration Ledger for the reassigned ranges.
+	AdvanceEpoch(AdvanceEpochRecord),
 	/// A namespace creation or schema registry update.
 	#[serde(with = "serde_bytes")]
 	SchemaUpdate(Vec<u8>),

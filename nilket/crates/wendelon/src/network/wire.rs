@@ -43,8 +43,8 @@
 //! via `Error::source()`.
 
 use crate::network::pool::{BufPool, PooledBuf};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 

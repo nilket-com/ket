@@ -3,17 +3,34 @@ mod support;
 
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
-use wendelon::network::control_server::{AdvanceEpochResponseWire, CONTROL_REASON_UNSUPPORTED};
+use wendelon::network::control_server::{
+	AdvanceEpochResponseWire, CONTROL_REASON_GRANTED, CONTROL_REASON_UNSUPPORTED,
+};
 use wendelon::network::server::HrftService;
 use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
+use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::network::wire;
 use wendelon::schema::{
-	epoch_entry_var_schema, AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId,
+	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp, LeaseDescriptor,
+	LeaseStatus, MsgType, NodeId,
 };
 
 fn epoch_config_batch() -> RecordBatch {
-	RecordBatch::new_empty(Arc::new(epoch_entry_var_schema()))
+	let tier_bits = TransportTierSet::empty()
+		.with(TransportTier::QuicIoUring)
+		.as_u8();
+	let role_bits = NodeRoleSet::empty()
+		.with(NodeRole::Data)
+		.with(NodeRole::Control)
+		.as_u8();
+	support::epoch_config_batch(
+		&[
+			(1, "127.0.0.1:0", tier_bits, role_bits),
+			(2, "127.0.0.1:1", tier_bits, role_bits),
+		],
+		&[1],
+		&[2],
+	)
 }
 
 #[tokio::test]
@@ -134,8 +151,17 @@ async fn advance_epoch_req_routes_to_control_handler() {
 	assert_eq!(resp.header.msg_type, MsgType::EPOCH_ADV_RESP.0);
 
 	let meta: AdvanceEpochResponseWire = wire::decode(&resp.meta).unwrap();
-	assert!(!meta.accepted);
-	assert_eq!(meta.reason_code, CONTROL_REASON_UNSUPPORTED);
+	assert!(meta.accepted);
+	assert_eq!(meta.reason_code, CONTROL_REASON_GRANTED);
+	assert_eq!(node.epoch_tx.borrow().epoch, 2);
+	assert!(
+		!node
+			.state_machine
+			.state_snapshot()
+			.await
+			.migrations
+			.is_empty()
+	);
 
 	support::abort_node(&node);
 }

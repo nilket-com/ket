@@ -39,7 +39,7 @@
 //! hinted node before surfacing the error.
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
-use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
+use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::ReplicaRouter;
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;

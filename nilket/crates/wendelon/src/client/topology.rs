@@ -34,7 +34,7 @@
 //! epoch with the authoritative snapshot, and every subsequent
 //! refresh just updates it in place.
 
-use crate::network::core::{read_frame, write_frame, HRFT_MAGIC};
+use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::transport::{MembershipEpoch, NodeRoleSet, PeerCapabilities, TransportTierSet};

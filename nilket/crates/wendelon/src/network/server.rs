@@ -51,10 +51,10 @@
 //! * Graceful shutdown coordination — today the serve loop only
 //!   exits when the endpoint itself is closed externally.
 
-use crate::network::core::{read_frame, write_frame, HrftFrame};
+use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
-use crate::network::tls::{verified_peer_node_id, DEFAULT_CLUSTER_DOMAIN};
+use crate::network::tls::{DEFAULT_CLUSTER_DOMAIN, verified_peer_node_id};
 use crate::network::transport::{TransportConnection, TransportStream};
 use async_trait::async_trait;
 use quinn::Endpoint;

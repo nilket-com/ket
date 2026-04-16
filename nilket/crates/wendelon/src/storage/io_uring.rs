@@ -17,7 +17,7 @@
 //! indexing, or recovery; those belong to a higher layer that uses
 //! this driver as its backing.
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{IoUring, opcode, types};
 use std::alloc::{self, Layout};
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;

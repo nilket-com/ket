@@ -86,6 +86,14 @@ pub struct RingState {
 	epoch: u64,
 }
 
+/// Stable contiguous hash interval with a fixed ordered replica set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicaSegment {
+	pub start: u64,
+	pub end: u64,
+	pub replicas: Vec<NodeId>,
+}
+
 impl RingState {
 	/// Build a ring from a membership snapshot. Runs in O(N·V·log(N·V))
 	/// where N is the node count and V is [`VNODES_PER_NODE`];
@@ -184,6 +192,40 @@ impl RingState {
 
 	fn replication_factor(&self) -> usize {
 		self.rf.min(self.data_count.max(1))
+	}
+
+	/// Contiguous `[start, end]` intervals for which the ordered
+	/// replica set is stable. These segments form the deterministic
+	/// diff unit for epoch-transition migration seeding.
+	pub fn replica_segments(&self) -> Vec<ReplicaSegment> {
+		if self.positions.is_empty() || self.data_count == 0 {
+			return Vec::new();
+		}
+
+		let mut out: Vec<ReplicaSegment> = Vec::new();
+		for i in 0..self.positions.len() {
+			let replicas = self.replicas_for(self.positions[i].0);
+			if replicas.is_empty() {
+				continue;
+			}
+			let start = if i == 0 {
+				0
+			} else {
+				self.positions[i - 1].0.saturating_add(1)
+			};
+			let end = self.positions[i].0;
+			push_or_merge_segment(&mut out, start, end, replicas);
+		}
+
+		let wrap_start = self.positions[self.positions.len() - 1].0.saturating_add(1);
+		if wrap_start != 0 {
+			let replicas = self.replicas_for(self.positions[0].0);
+			if !replicas.is_empty() {
+				push_or_merge_segment(&mut out, wrap_start, u64::MAX, replicas);
+			}
+		}
+
+		out
 	}
 
 	/// Epoch this ring state was built from. Consumers — the lease
@@ -354,6 +396,31 @@ fn vnode_hash(node: NodeId, vnode_idx: u64) -> u64 {
 	hasher.append(&node.id.to_le_bytes());
 	hasher.append(&vnode_idx.to_le_bytes());
 	hasher.finalize64()
+}
+
+fn push_or_merge_segment(
+	out: &mut Vec<ReplicaSegment>,
+	start: u64,
+	end: u64,
+	replicas: Vec<NodeId>,
+) {
+	if end < start {
+		return;
+	}
+	match out.last_mut() {
+		Some(last)
+			if last.end != u64::MAX
+				&& last.end.saturating_add(1) == start
+				&& last.replicas == replicas =>
+		{
+			last.end = end;
+		}
+		_ => out.push(ReplicaSegment {
+			start,
+			end,
+			replicas,
+		}),
+	}
 }
 
 // ============================================================
