@@ -75,16 +75,9 @@ fn decode_single_value(frame: &[u8]) -> Vec<u8> {
 }
 
 async fn bootstrap_custom_node(tag: &str, node_id: u32, slab_max_bytes: u64) -> WendelonNode {
-	WendelonNode::bootstrap_single_node(NodeBootstrapConfig {
-		node_id,
-		data_dir: support::tempdir(tag),
-		slab_max_bytes,
-		rf: 1,
-		io_depth: 64,
-		advertise_address: "127.0.0.1:0".into(),
-	})
-	.await
-	.unwrap()
+	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = slab_max_bytes;
+	WendelonNode::bootstrap_single_node(cfg).await.unwrap()
 }
 
 async fn seed_source(

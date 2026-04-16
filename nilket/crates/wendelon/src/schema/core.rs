@@ -184,6 +184,10 @@ pub struct StreamFinalizationRequestMeta {
 //    stale reads after re-election (kept from the old layout —
 //    the write-path gate ignores it until read-lease semantics
 //    land in a follow-up).
+//  • `issuer` is the Control Ring leader that signed the grant.
+//    Replicas verify both the Ed25519 signature and that the
+//    issuer is still the current Raft leader before trusting the
+//    descriptor at the data-ring gate.
 // ============================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
@@ -203,11 +207,11 @@ pub struct LeaseDescriptor {
 	pub lease_expiry: HybridTimestamp,
 	/// Reads must have commit_index >= this to prevent post-election stale reads
 	pub min_commit_index: u64,
+	/// Control-ring leader that signed this lease.
+	pub issuer: NodeId,
 	/// Ed25519 over fields above; 64 bytes
 	#[serde(with = "serde_bytes")]
 	pub signature: [u8; 64],
-	/// Pad to 144 bytes
-	pub _pad: [u8; 8],
 }
 
 // ============================================================
@@ -227,6 +231,7 @@ impl LeaseStatus {
 	pub const DENIED_EPOCH_STALE: Self = Self(2);
 	pub const DENIED_NOT_LEADER: Self = Self(3);
 	pub const INTERNAL_ERROR: Self = Self(4);
+	pub const DENIED_INVALID_SIGNATURE: Self = Self(5);
 }
 
 // ============================================================
@@ -442,8 +447,9 @@ impl WriteStatus {
 	pub const PROXY_LIMIT: Self = Self(4); // proxy_hop > 2
 	pub const PAYLOAD_TOO_LARGE: Self = Self(5);
 	pub const LEASE_EXPIRED: Self = Self(6);
-	pub const INTERNAL_ERROR: Self = Self(7);
-	pub const QUOTA_EXCEEDED: Self = Self(8);
+	pub const INVALID_LEASE_SIGNATURE: Self = Self(7);
+	pub const INTERNAL_ERROR: Self = Self(8);
+	pub const QUOTA_EXCEEDED: Self = Self(9);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -589,13 +595,14 @@ impl ReadStatus {
 	pub const EPOCH_STALE: Self = Self(2);
 	pub const NOT_LEADER: Self = Self(3);
 	pub const LEASE_EXPIRED: Self = Self(4);
-	pub const E_SAFE_BEHIND: Self = Self(5); // Follower's e_safe < required; retry leader
+	pub const INVALID_LEASE_SIGNATURE: Self = Self(5);
+	pub const E_SAFE_BEHIND: Self = Self(6); // Follower's e_safe < required; retry leader
 	/// The query path could not complete its lazy-migration fan-out
 	/// (Plan 019). One or more ledger-overlapping source replicas
 	/// were unreachable or returned a non-OK status, so a local
 	/// scan would miss versions only held on those sources. The
 	/// client must retry; the answer is explicitly *not* partial.
-	pub const MIGRATION_INCOMPLETE: Self = Self(6);
+	pub const MIGRATION_INCOMPLETE: Self = Self(7);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

@@ -1825,8 +1825,11 @@ mod recovery_tests {
 				node_id: holder,
 			},
 			min_commit_index: 0,
+			issuer: SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
 			signature: [0; 64],
-			_pad: [0; 8],
 		}
 	}
 
@@ -2067,8 +2070,11 @@ mod lease_tests {
 			lease_start: hlc(start_ms),
 			lease_expiry: hlc(expiry_ms),
 			min_commit_index: 0,
+			issuer: SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
 			signature: [0; 64],
-			_pad: [0; 8],
 		}
 	}
 

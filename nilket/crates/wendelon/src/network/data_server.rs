@@ -46,16 +46,18 @@ use crate::network::core::{
 	HRFT_MAGIC, read_frame, read_frame_from_header, read_frame_header, write_frame,
 };
 use crate::network::factory::TransportProviderFactory;
+use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
 use crate::network::transport::MembershipEpoch;
 use crate::network::transport::TransportStream;
 use crate::schema::{
-	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
-	MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta,
-	ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
+	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, Consistency, FRAME_FLAG_STREAM_END,
+	FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor, LeaseStatus,
+	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
 	StreamFinalizationRequestMeta, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	migration_record_schema, read_key_schema, wpbc, write_payload_schema,
 };
@@ -326,6 +328,8 @@ pub struct WendelonDataServer {
 	/// calls [`Self::with_lease_gate`] to flip this on after the
 	/// lease manager has registered its first grant.
 	lease_gate_enabled: bool,
+	/// Local lease signing key plus trusted issuer verifier set.
+	lease_authority: Arc<LeaseAuthority>,
 	/// Transient dedup for concurrent migration pulls (Plan 019).
 	/// Correctness still lives inside
 	/// [`SlabManager::append_migration`]; this is an optimization
@@ -359,6 +363,19 @@ pub const MIGRATION_SWEEP_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 /// foreground reads/writes or the tier sweeper for disk/network.
 pub const MIGRATION_SWEEP_MAX_PER_PASS: usize = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseGateResult {
+	Valid,
+	Missing,
+	InvalidSignature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseAcquireOutcome {
+	Granted(LeaseDescriptor),
+	Denied(LeaseStatus),
+}
+
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
 		Self {
@@ -376,6 +393,7 @@ impl Clone for WendelonDataServer {
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
 			lease_gate_enabled: self.lease_gate_enabled,
+			lease_authority: self.lease_authority.clone(),
 			migration_registry: self.migration_registry.clone(),
 			page_max_records: self.page_max_records.clone(),
 			page_max_bytes: self.page_max_bytes.clone(),
@@ -414,6 +432,7 @@ impl WendelonDataServer {
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
 			lease_gate_enabled: false,
+			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			migration_registry: Arc::new(MigrationRegistry::new()),
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
@@ -450,6 +469,11 @@ impl WendelonDataServer {
 	/// it on with an empty cache rejects every write.
 	pub fn with_lease_gate(mut self, enabled: bool) -> Self {
 		self.lease_gate_enabled = enabled;
+		self
+	}
+
+	pub fn with_lease_authority(mut self, authority: Arc<LeaseAuthority>) -> Self {
+		self.lease_authority = authority;
 		self
 	}
 
@@ -490,6 +514,28 @@ impl WendelonDataServer {
 		merged
 	}
 
+	fn make_signed_lease(
+		&self,
+		epoch: u64,
+		holder: NodeId,
+		range_start: u64,
+		range_end: u64,
+		lease_start: HybridTimestamp,
+		lease_expiry: HybridTimestamp,
+	) -> LeaseDescriptor {
+		self.lease_authority.sign_lease(LeaseDescriptor {
+			epoch,
+			holder,
+			range_start,
+			range_end,
+			lease_start,
+			lease_expiry,
+			min_commit_index: 0,
+			issuer: self.local_node,
+			signature: [0; 64],
+		})
+	}
+
 	/// Test-only hook to seed a lease into the local cache without
 	/// driving the full Raft grant path. Production code must never
 	/// call this — the manager is the sole writer of real leases.
@@ -501,18 +547,108 @@ impl WendelonDataServer {
 			.push(lease);
 	}
 
-	/// Inspect the lease cache for a valid lease that covers
-	/// `key_hash` at `now` in `epoch`. Returns `true` if such a
-	/// lease exists and is held by the local node.
-	fn has_valid_lease(&self, key_hash: u64, epoch: u64, now: HybridTimestamp) -> bool {
-		let guard = self.leases.read().expect("lease cache poisoned");
-		guard.iter().any(|l| {
-			l.holder.id == self.local_node.id
-				&& l.epoch == epoch
-				&& l.range_start <= key_hash
-				&& key_hash <= l.range_end
-				&& now < l.lease_expiry
-		})
+	async fn lease_gate_result(
+		&self,
+		key_hash: u64,
+		epoch: u64,
+		now: HybridTimestamp,
+	) -> LeaseGateResult {
+		let lease = {
+			let guard = self.leases.read().expect("lease cache poisoned");
+			guard
+				.iter()
+				.find(|l| {
+					l.holder.id == self.local_node.id
+						&& l.epoch == epoch
+						&& l.range_start <= key_hash
+						&& key_hash <= l.range_end
+						&& now < l.lease_expiry
+				})
+				.copied()
+		};
+
+		let Some(lease) = lease else {
+			return LeaseGateResult::Missing;
+		};
+
+		let Some(current_leader) = self.raft.current_leader().await else {
+			return LeaseGateResult::Missing;
+		};
+		if lease.issuer.id != current_leader {
+			return LeaseGateResult::InvalidSignature;
+		}
+		match self.lease_authority.verify_lease(&lease) {
+			Ok(()) => LeaseGateResult::Valid,
+			Err(_) => LeaseGateResult::InvalidSignature,
+		}
+	}
+
+	fn cache_granted_lease(&self, lease: LeaseDescriptor) {
+		let mut guard = self.leases.write().expect("lease cache poisoned");
+		if let Some(slot) = guard
+			.iter_mut()
+			.find(|l| l.range_start == lease.range_start && l.range_end == lease.range_end)
+		{
+			*slot = lease;
+		} else {
+			guard.push(lease);
+		}
+	}
+
+	async fn request_remote_lease(
+		&self,
+		leader: NodeId,
+		req: AcquireLeaseRequestMeta,
+	) -> std::io::Result<LeaseAcquireOutcome> {
+		let conn = self.factory.get_connection(leader).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::LEASE_REQ.0,
+			flags: 0,
+			stream_id: stream.stream_id() as u32,
+			meta_len: std::mem::size_of::<AcquireLeaseRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&req), None, None).await?;
+		stream.finish().await?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::LEASE_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected LEASE_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			));
+		}
+		if frame.meta.len() < std::mem::size_of::<AcquireLeaseResponseMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LEASE_RESP meta too small",
+			));
+		}
+		let resp: AcquireLeaseResponseMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
+		if resp.status != LeaseStatus::GRANTED {
+			return Ok(LeaseAcquireOutcome::Denied(resp.status));
+		}
+		let trailing = frame.trailing.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"LEASE_RESP granted without trailing LeaseDescriptor",
+			)
+		})?;
+		if trailing.len() < std::mem::size_of::<LeaseDescriptor>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LEASE_RESP trailing too small for LeaseDescriptor",
+			));
+		}
+		let lease = *bytemuck::from_bytes(&trailing[..std::mem::size_of::<LeaseDescriptor>()]);
+		Ok(LeaseAcquireOutcome::Granted(lease))
 	}
 
 	/// Single pass of the lease manager (plan 018):
@@ -555,44 +691,77 @@ impl WendelonDataServer {
 			logical: 0,
 			node_id: self.local_node.id,
 		};
+		let current_leader = self.raft.current_leader().await;
 
 		let mut granted = 0usize;
 		for (range_start, range_end) in ranges {
-			let lease = LeaseDescriptor {
-				epoch,
-				holder: self.local_node,
+			let request = AcquireLeaseRequestMeta {
 				range_start,
 				range_end,
-				lease_start: now_hlc,
-				lease_expiry: expiry_hlc,
-				min_commit_index: 0,
-				signature: [0; 64],
-				_pad: [0; 8],
+				epoch,
+				holder: self.local_node,
+				requested_hlc: now_hlc,
+				ttl_ms,
+				_pad: 0,
 			};
-			let outcome = self
-				.raft
-				.client_write(WendelonRequest::AcquireLease(lease))
-				.await;
-			match outcome {
-				Ok(resp) => match resp.data {
-					WendelonResponse::Success => {
-						let mut guard = self.leases.write().expect("lease cache poisoned");
-						if let Some(slot) = guard
-							.iter_mut()
-							.find(|l| l.range_start == range_start && l.range_end == range_end)
-						{
-							*slot = lease;
-						} else {
-							guard.push(lease);
+			let outcome = if current_leader == Some(self.local_node.id) {
+				let lease = self.make_signed_lease(
+					epoch,
+					self.local_node,
+					range_start,
+					range_end,
+					now_hlc,
+					expiry_hlc,
+				);
+				match self
+					.raft
+					.client_write(WendelonRequest::AcquireLease(lease))
+					.await
+				{
+					Ok(resp) => match resp.data {
+						WendelonResponse::Success => Ok(LeaseAcquireOutcome::Granted(lease)),
+						WendelonResponse::LeaseDenied => {
+							Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
 						}
+					},
+					Err(err) => Err(Error::new(
+						ErrorKind::Other,
+						format!("lease manager: local AcquireLease commit failed: {err}"),
+					)),
+				}
+			} else if let Some(leader_id) = current_leader {
+				self.request_remote_lease(
+					NodeId {
+						id: leader_id,
+						_reserved: 0,
+					},
+					request,
+				)
+				.await
+			} else {
+				continue;
+			};
+			match outcome {
+				Ok(LeaseAcquireOutcome::Granted(lease)) => {
+					if Some(lease.issuer.id) == current_leader
+						&& self.lease_authority.verify_lease(&lease).is_ok()
+					{
+						self.cache_granted_lease(lease);
 						granted += 1;
+					} else {
+						tracing::warn!(
+							range_start,
+							range_end,
+							epoch,
+							"lease manager: leader returned an invalidly signed lease"
+						);
 					}
-					WendelonResponse::LeaseDenied => {
-						// Another holder (or a stale-epoch request)
-						// blocks us — skip, keep the old entry if
-						// any. The next tick retries.
-					}
-				},
+				}
+				Ok(LeaseAcquireOutcome::Denied(_status)) => {
+					// Another holder (or a stale-epoch request)
+					// blocks us — skip, keep the old entry if any.
+					// The next tick retries.
+				}
 				Err(e) => {
 					tracing::warn!(
 						range_start,
@@ -2073,11 +2242,27 @@ impl DataRing for WendelonDataServer {
 					None,
 				));
 			}
-			if !self.has_valid_lease(key_hash, meta.expected_epoch, meta.client_hlc) {
-				return Ok((
-					error_response(&meta, WriteStatus::LEASE_EXPIRED, self.local_node),
-					None,
-				));
+			match self
+				.lease_gate_result(key_hash, meta.expected_epoch, meta.client_hlc)
+				.await
+			{
+				LeaseGateResult::Valid => {}
+				LeaseGateResult::Missing => {
+					return Ok((
+						error_response(&meta, WriteStatus::LEASE_EXPIRED, self.local_node),
+						None,
+					));
+				}
+				LeaseGateResult::InvalidSignature => {
+					return Ok((
+						error_response(
+							&meta,
+							WriteStatus::INVALID_LEASE_SIGNATURE,
+							self.local_node,
+						),
+						None,
+					));
+				}
 			}
 		}
 
@@ -2287,11 +2472,27 @@ impl DataRing for WendelonDataServer {
 					None,
 				));
 			}
-			if !self.has_valid_lease(key_hash, meta.expected_epoch, meta.min_hlc) {
-				return Ok((
-					error_read_response(&meta, ReadStatus::LEASE_EXPIRED, self.local_node),
-					None,
-				));
+			match self
+				.lease_gate_result(key_hash, meta.expected_epoch, meta.min_hlc)
+				.await
+			{
+				LeaseGateResult::Valid => {}
+				LeaseGateResult::Missing => {
+					return Ok((
+						error_read_response(&meta, ReadStatus::LEASE_EXPIRED, self.local_node),
+						None,
+					));
+				}
+				LeaseGateResult::InvalidSignature => {
+					return Ok((
+						error_read_response(
+							&meta,
+							ReadStatus::INVALID_LEASE_SIGNATURE,
+							self.local_node,
+						),
+						None,
+					));
+				}
 			}
 		}
 
@@ -3449,8 +3650,8 @@ mod tests {
 				lease_start: hlc(0, 0, node.local_node.id),
 				lease_expiry: hlc(u64::MAX / 2, 0, node.local_node.id),
 				min_commit_index: 0,
+				issuer: node.local_node,
 				signature: [0; 64],
-				_pad: [0; 8],
 			});
 		// Give Raft a moment to elect and ring updater to seed.
 		for _ in 0..64 {

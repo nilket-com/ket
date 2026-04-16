@@ -14,6 +14,7 @@ use crate::consensus::{
 };
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
+use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
@@ -62,6 +63,7 @@ pub struct WendelonControlServer {
 	pool: Arc<BufPool>,
 	replication_factor: u32,
 	lease_ttl_cap_ms: u32,
+	lease_authority: Arc<LeaseAuthority>,
 	reconcile_lock: Mutex<()>,
 }
 
@@ -87,8 +89,14 @@ impl WendelonControlServer {
 			pool,
 			replication_factor,
 			lease_ttl_cap_ms,
+			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			reconcile_lock: Mutex::new(()),
 		}
+	}
+
+	pub fn with_lease_authority(mut self, authority: Arc<LeaseAuthority>) -> Self {
+		self.lease_authority = authority;
+		self
 	}
 
 	pub async fn advance_membership_epoch(&self, next: MembershipEpoch) -> std::io::Result<()> {
@@ -185,7 +193,7 @@ impl WendelonControlServer {
 		}
 
 		let ttl_ms = req.ttl_ms.clamp(1, self.lease_ttl_cap_ms);
-		let lease = LeaseDescriptor {
+		let lease = self.lease_authority.sign_lease(LeaseDescriptor {
 			epoch: req.epoch,
 			holder: req.holder,
 			range_start: req.range_start,
@@ -198,8 +206,8 @@ impl WendelonControlServer {
 			},
 			min_commit_index: 0,
 			signature: [0; 64],
-			_pad: [0; 8],
-		};
+			issuer: self.local_node,
+		});
 
 		let status = match self
 			.raft

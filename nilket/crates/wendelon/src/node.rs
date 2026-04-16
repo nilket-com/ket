@@ -40,6 +40,9 @@ use crate::network::data_server::{
 	WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
+use crate::network::lease_signing::{
+	LeaseAuthority, dev_lease_signing_secret, lease_verifying_key_bytes,
+};
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
@@ -85,12 +88,22 @@ pub struct NodeBootstrapConfig {
 	/// `host:port` this node publishes into the membership epoch —
 	/// peers dial here when we advertise a transport tier.
 	pub advertise_address: String,
+	/// Ed25519 secret key used when this node is the control-ring
+	/// leader and signs a `LeaseDescriptor`.
+	pub lease_signing_secret: [u8; 32],
+	/// Trusted Ed25519 verifying keys for lease issuers, keyed by
+	/// Raft `NodeId.id`. Data-ring lease gates reject descriptors
+	/// from issuers not present here.
+	pub trusted_lease_signers: BTreeMap<u32, [u8; 32]>,
 }
 
 impl NodeBootstrapConfig {
 	/// Convenience for tests and dev deploys: tempdir-style data
 	/// dir, RF=1, modest io_uring depth, loopback address.
 	pub fn dev(node_id: u32, data_dir: PathBuf, advertise_address: String) -> Self {
+		let lease_signing_secret = dev_lease_signing_secret(node_id);
+		let mut trusted_lease_signers = BTreeMap::new();
+		trusted_lease_signers.insert(node_id, lease_verifying_key_bytes(lease_signing_secret));
 		Self {
 			node_id,
 			data_dir,
@@ -98,6 +111,8 @@ impl NodeBootstrapConfig {
 			rf: 1,
 			io_depth: 64,
 			advertise_address,
+			lease_signing_secret,
+			trusted_lease_signers,
 		}
 	}
 }
@@ -161,6 +176,11 @@ impl WendelonNode {
 			id: cfg.node_id,
 			_reserved: 0,
 		};
+		let lease_authority = Arc::new(LeaseAuthority::from_secret_bytes(
+			local_node,
+			cfg.lease_signing_secret,
+			&cfg.trusted_lease_signers,
+		)?);
 
 		// 1. Shared buffer pool (HRFT frames + postcard bodies).
 		let pool = BufPool::new(256, 1024 * 1024);
@@ -296,6 +316,7 @@ impl WendelonNode {
 				factory.clone(),
 				pool.clone(),
 			)
+			.with_lease_authority(lease_authority.clone())
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true),
 		);
@@ -303,17 +324,20 @@ impl WendelonNode {
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone())
 				.with_tracker(tracker.clone()),
 		);
-		let control_server = Arc::new(WendelonControlServer::new(
-			raft.clone(),
-			state_machine.clone(),
-			local_node,
-			epoch_tx.clone(),
-			epoch_rx.clone(),
-			factory.clone(),
-			pool.clone(),
-			cfg.rf as u32,
-			LEASE_TTL_MS,
-		));
+		let control_server = Arc::new(
+			WendelonControlServer::new(
+				raft.clone(),
+				state_machine.clone(),
+				local_node,
+				epoch_tx.clone(),
+				epoch_rx.clone(),
+				factory.clone(),
+				pool.clone(),
+				cfg.rf as u32,
+				LEASE_TTL_MS,
+			)
+			.with_lease_authority(lease_authority.clone()),
+		);
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
 		// 14. Eviction watchdog. Route leader-driven epoch changes
