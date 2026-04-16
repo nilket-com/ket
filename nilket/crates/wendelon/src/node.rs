@@ -319,7 +319,7 @@ impl WendelonNode {
 		let leader: Arc<dyn LeaderStatus> =
 			Arc::new(RaftLeaderStatus::new(raft.clone(), local_node));
 		let advancer: Arc<dyn MembershipAdvancer> =
-			Arc::new(ControlPlaneMembershipAdvancer::new(control_server.clone()));
+			Arc::new(ControlRingMembershipAdvancer::new(control_server.clone()));
 		let eviction_watchdog = spawn_eviction_watchdog(
 			tracker.clone(),
 			clock.clone(),
@@ -473,48 +473,23 @@ impl LeaderStatus for RaftLeaderStatus {
 	}
 }
 
-pub struct ControlPlaneMembershipAdvancer {
+/// Production membership advancer: routes watchdog-triggered epoch
+/// changes through the committed Control Ring workflow rather than
+/// mutating the local watch channel directly.
+pub struct ControlRingMembershipAdvancer {
 	control: Arc<WendelonControlServer>,
 }
 
-impl ControlPlaneMembershipAdvancer {
+impl ControlRingMembershipAdvancer {
 	pub fn new(control: Arc<WendelonControlServer>) -> Self {
 		Self { control }
 	}
 }
 
 #[async_trait]
-impl MembershipAdvancer for ControlPlaneMembershipAdvancer {
+impl MembershipAdvancer for ControlRingMembershipAdvancer {
 	async fn advance_epoch(&self, next: MembershipEpoch) -> std::io::Result<()> {
 		self.control.advance_membership_epoch(next).await
-	}
-}
-
-/// Single-node advancer: publishes the new epoch into the local
-/// watch channel without going through Raft. Real multi-node
-/// deployments will replace this with a Control Ring client that
-/// proposes a `SchemaUpdate` (or dedicated membership) entry.
-///
-/// The reason this stub is safe for V1: at RF=1 the eviction
-/// watchdog can only ever propose dropping *peers*, and the local
-/// node always keeps itself. Any epoch it commits here trivially
-/// preserves the single-node voting set.
-pub struct WatchMembershipAdvancer {
-	tx: watch::Sender<Arc<MembershipEpoch>>,
-}
-
-impl WatchMembershipAdvancer {
-	pub fn new(tx: watch::Sender<Arc<MembershipEpoch>>) -> Self {
-		Self { tx }
-	}
-}
-
-#[async_trait]
-impl MembershipAdvancer for WatchMembershipAdvancer {
-	async fn advance_epoch(&self, next: MembershipEpoch) -> std::io::Result<()> {
-		self.tx
-			.send(Arc::new(next))
-			.map_err(|_| Error::new(ErrorKind::BrokenPipe, "epoch watch receiver closed"))
 	}
 }
 
@@ -727,11 +702,36 @@ mod tests {
 		.await
 		.unwrap();
 
-		// The eviction advancer is the watch sender; observing the
-		// watchdog through `sweep_evictions_once` directly lets us
-		// pin the decision without waiting 30s for its ticker.
+		// Exercise the real control-ring-backed advancer directly
+		// without waiting for the watchdog's 30s ticker.
 		let leader = RaftLeaderStatus::new(node.raft.clone(), node.local_node);
-		let advancer = WatchMembershipAdvancer::new(node.epoch_tx.clone());
+		let epoch_rx = node.epoch_tx.subscribe();
+		let resolver = Arc::new(crate::network::transport::EpochCapabilityResolver::new(
+			epoch_rx.clone(),
+		));
+		let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+		providers.insert(
+			TransportTier::QuicIoUring,
+			Arc::new(NoDialTransportProvider),
+		);
+		let factory = TransportProviderFactory::new(
+			TransportTierSet::empty().with(TransportTier::QuicIoUring),
+			providers,
+			resolver,
+			epoch_rx.clone(),
+		);
+		let control_server = Arc::new(WendelonControlServer::new(
+			node.raft.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.epoch_tx.clone(),
+			epoch_rx,
+			factory,
+			node.pool.clone(),
+			1,
+			LEASE_TTL_MS,
+		));
+		let advancer = ControlRingMembershipAdvancer::new(control_server);
 		// Wait until Raft reports this node as leader before
 		// sampling — otherwise the sweep short-circuits to NotLeader.
 		wait_for_local_leader(&node).await;

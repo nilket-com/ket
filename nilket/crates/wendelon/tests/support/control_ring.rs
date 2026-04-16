@@ -56,6 +56,7 @@ pub fn abort_node(node: &WendelonNode) {
 	node.handles.epoch_reconciler.abort();
 }
 
+#[allow(dead_code)]
 pub async fn bootstrap_node(tag: &str, node_id: u32) -> WendelonNode {
 	WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		node_id,

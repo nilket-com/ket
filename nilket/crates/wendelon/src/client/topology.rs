@@ -13,7 +13,7 @@
 //!    a bidi stream on a bootstrap peer via the shared
 //!    [`TransportProviderFactory`], sends an empty `STATUS_REQ`
 //!    frame, and decodes the postcard-encoded
-//!    [`ClusterStatusWire`] reply. Any richer trailing control-plane
+//!    [`ClusterStatusWire`] reply. Any richer trailing control-ring
 //!    payload (such as lease metadata) is ignored here so topology
 //!    refresh stays compatible with the stable status meta path.
 //!
