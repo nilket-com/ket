@@ -12,7 +12,7 @@ Wendelon uses Hybrid Logical Clocks (HLCs) to establish causality, order writes 
 Wendelon will enforce a **Bounded Clock Drift** model with a strict **Fail-Fast** mandate.
 
 1. **Maximum Clock Offset:** The cluster operates under a configured maximum offset tolerance (e.g., `MAX_OFFSET_MS = 500`).
-2. **Median Cluster Time:** Nodes will continually calculate the median physical time of the cluster by piggybacking timestamps on existing `APPEND_ENTRIES` heartbeats and data-plane RPCs.
+2. **Median Cluster Time:** Nodes will continually calculate the median physical time of the cluster by piggybacking timestamps on existing `APPEND_ENTRIES` heartbeats and data-ring RPCs.
 3. **Autonomous Suicide:** If a node determines that its local physical clock differs from the cluster median by more than `MAX_OFFSET_MS`, it **MUST** immediately terminate its own process (`std::process::abort()`).
 
 ## Rationale

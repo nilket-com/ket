@@ -7,7 +7,7 @@ Source roadmap: `plans/gap/codex_execution_20260415.md`
 
 This document decomposes Workstream B into implementation-ready packets.
 
-Workstream B exists to make control-plane behavior externally reachable instead
+Workstream B exists to make control-ring behavior externally reachable instead
 of effectively in-process only.
 
 ## Workstream Objective
@@ -22,9 +22,9 @@ of effectively in-process only.
 
 ## Exit Criteria
 
-- control-plane RPCs are served over a real external path
+- control-ring RPCs are served over a real external path
 - topology/status retrieval no longer speaks into an unimplemented server void
-- membership-affecting actions commit through real control-plane flows
+- membership-affecting actions commit through real control-ring flows
 
 ## Ordering
 
@@ -52,7 +52,7 @@ Exact files/modules expected to change:
 - `tests/control_ring_status.rs`
 
 Explicit invariants that must become true:
-- control-plane frames are routed independently of the current data-ring-only dispatch
+- control-ring frames are routed independently of the current data-ring-only dispatch
 - `ControlRingTopologySource` succeeds against a live server
 - status requests and responses use a stable wire path rather than test-only or in-process shortcuts
 
@@ -92,9 +92,9 @@ Exact files/modules expected to change:
 - `tests/control_ring_rpc.rs`
 
 Explicit invariants that must become true:
-- remote callers can acquire leases through a committed control-plane path
+- remote callers can acquire leases through a committed control-ring path
 - cluster status is externally retrievable with the expected topology/lease payload
-- server-side control-plane handling does not bypass Raft for state-changing actions
+- server-side control-ring handling does not bypass Raft for state-changing actions
 
 Explicit non-goals:
 - signed leases
@@ -157,7 +157,7 @@ What assessment gap or milestone item it closes:
 ### B.4 Membership advancement via committed control actions
 
 Objective:
-- replace the current watch-only membership shortcut with a committed control-plane action path
+- replace the current watch-only membership shortcut with a committed control-ring action path
 
 Size:
 - `M`

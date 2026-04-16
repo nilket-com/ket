@@ -17,7 +17,7 @@ gaps in subsystems that already have substantial groundwork in code.
 ## Entry Criteria
 
 - Workstream B is materially complete
-- Workstream C has data-plane reachability in place
+- Workstream C has data-ring reachability in place
 - `plans/024_epoch_transition_autoseed.md` exists and is accepted
 
 ## Exit Criteria
@@ -107,7 +107,7 @@ Explicit non-goals:
 
 Dependencies:
 - D.1
-- Workstream C base data-plane reachability
+- Workstream C base data-ring reachability
 
 Tests that must pass or be added:
 - add `tests/migration_sweeper.rs`

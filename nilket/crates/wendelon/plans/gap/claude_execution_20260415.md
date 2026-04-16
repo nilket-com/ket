@@ -35,8 +35,8 @@ Seven workstreams, preceded by a short alignment phase. Workstream **A**
 ```
 A0. Alignment (mini-plans + drift dispositions)  ─▶  all workstreams
 A.  Correctness foundations                      ─┬─▶  everything else
-B.  Control-plane surface                        ─┼─▶  D, E
-C.  Data-plane ingress                           ─┤
+B.  Control-ring surface                        ─┼─▶  D, E
+C.  Data-ring ingress                           ─┤
 D.  Migration automation                         ─┘
 E.  Security / authenticity                      (depends on B)
 F.  Storage & tiering                            (parallel to B/C/D)
@@ -78,7 +78,7 @@ Feeds B.1. Must settle:
   + `ACQUIRE_LEASE_REQ` in slice 1).
 - Whether one HRFT listener handles both rings or two.
 - Authorization model for `advance_epoch` and `transfer_leadership`.
-- Idempotency for control-plane calls.
+- Idempotency for control-ring calls.
 
 Artifact: `plans/022_control_ring_server.md`.
 
@@ -184,7 +184,7 @@ before any external durability / recovery claim.
 
 ---
 
-## Workstream B — Control-plane surface
+## Workstream B — Control-ring surface
 
 Blocks 013 / 017 / 018 / 019 pieces. The client is already speaking
 `STATUS_REQ` into the void; this wires up the listener.
@@ -206,7 +206,7 @@ Blocks 013 / 017 / 018 / 019 pieces. The client is already speaking
      Raft.
 - **Test gate:** `tests/control_ring_rpc.rs` — smoke-test each RPC against
   a single-node cluster; add a two-node test for `acquire_lease` racing.
-- **Dependencies:** A.2 (control-plane calls must survive restart).
+- **Dependencies:** A.2 (control-ring calls must survive restart).
 
 ### B.2 `WatchMembershipAdvancer` → Raft-proposed membership change  [M]
 
@@ -223,12 +223,12 @@ Blocks 013 / 017 / 018 / 019 pieces. The client is already speaking
   force a membership change; heal, assert it rejoins. Drift one node's
   HLC past threshold, assert the cluster evicts it via a committed
   `ChangeMembership`.
-- **Dependencies:** B.1 (needs a real control-plane RPC to propose from
+- **Dependencies:** B.1 (needs a real control-ring RPC to propose from
   an external caller), A.2.
 
 ---
 
-## Workstream C — Data-plane ingress
+## Workstream C — Data-ring ingress
 
 The DataRing trait methods exist; they're just not reachable from the wire.
 
@@ -301,7 +301,7 @@ The state-machine side is done; this closes the automation loop.
 - **Test gate:** `tests/epoch_transition_seed.rs` — advance an epoch that
   reassigns 10 ranges; assert 10 ledger entries exist. Replay the same
   entry; assert no duplicate.
-- **Dependencies:** B.1 (the trigger is a control-plane RPC) or it can be
+- **Dependencies:** B.1 (the trigger is a control-ring RPC) or it can be
   driven purely from the state-machine apply path, which is simpler. Pick
   the latter in the design doc.
 
@@ -539,7 +539,7 @@ simultaneously. (Framing credit: Codex.)
 - The published durability and recovery guarantees in `plans/` are true
   in code. Specifically: acknowledged writes survive `RF/2 + 1` replica
   crashes; a restarted node rehydrates committed state from the WAL.
-- Control-plane and data-plane behaviors are reachable over the wire
+- Control-ring and data-ring behaviors are reachable over the wire
   from a separate process, not only through in-process test shortcuts.
 - The client drives the system over those wire surfaces using the same
   retry, topology, and migration semantics a real operator would see.

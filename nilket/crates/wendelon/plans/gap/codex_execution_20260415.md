@@ -126,7 +126,7 @@ Why this needs a mini-plan:
 
 - The ledger logic is already substantial.
 - The remaining gap is mostly orchestration, but it touches epoch advancement
-  and control-plane ownership.
+  and control-ring ownership.
 
 The mini-plan should settle:
 
@@ -156,20 +156,20 @@ Why first:
 ### Workstream B — Reachable Control Plane
 
 Goal:
-- make control-plane behavior externally reachable over a real server surface
+- make control-ring behavior externally reachable over a real server surface
 
 Primary gaps:
 - server-side `ControlRing` implementation
 - status/lease/leadership/epoch RPC reachability
-- membership advancement through committed control-plane actions
+- membership advancement through committed control-ring actions
 
 Why second:
-- several other features are blocked on a real control plane
+- several other features are blocked on a real control ring
 
 ### Workstream C — Reachable Data Plane And Client Surface
 
 Goal:
-- expose the implemented data-plane behavior on the wire and make the client
+- expose the implemented data-ring behavior on the wire and make the client
   capable of using it
 
 Primary gaps:
@@ -197,7 +197,7 @@ Primary gaps:
 
 Why fourth:
 - the foundation is already there
-- this work is most valuable once control-plane and data-plane reachability exist
+- this work is most valuable once control-ring and data-ring reachability exist
 
 ### Workstream E — Bootstrap And Operations
 
@@ -213,7 +213,7 @@ Primary gaps:
 
 Why fifth:
 - some ops work can happen in parallel, but cluster bootstrap should follow
-  correctness and control-plane truth
+  correctness and control-ring truth
 
 ## Parallelism Notes
 
@@ -226,7 +226,7 @@ After M1:
 
 - M2 and early observability/lifecycle work can proceed in parallel
 - M3 can begin once the core durability contract is settled, even if some
-  control-plane work is still in flight
+  control-ring work is still in flight
 - the config and identity-material slice of M6 may be pulled forward if
   Workstream D needs signing keys before the rest of the ops baseline lands
 - M5 should wait until M2 through M4 are substantially in place
@@ -286,7 +286,7 @@ Required tests:
 ### M2 — Stand Up The Control Ring
 
 Objective:
-- make control-plane actions externally reachable
+- make control-ring actions externally reachable
 
 Scope:
 - implement server-side `ControlRing`
@@ -301,7 +301,7 @@ Dependencies:
 - M1 is strongly preferred first, though parts of this can start earlier
 
 Definition of done:
-- control-plane RPCs are no longer in-process only
+- control-ring RPCs are no longer in-process only
 - topology/status retrieval works against a real server
 - epoch and lease workflows have an externally reachable path
 
@@ -340,7 +340,7 @@ Required tests:
 ### M4 — Complete The Client And Query Surface
 
 Objective:
-- make the client consistent with the exposed data and control plane
+- make the client consistent with the exposed data and control ring
 
 Scope:
 - add client write/read/bulk APIs
@@ -353,7 +353,7 @@ Dependencies:
 - M2 and M3
 
 Definition of done:
-- the client can use the wire-reachable data plane without hidden in-process
+- the client can use the wire-reachable data ring without hidden in-process
   assumptions
 - topology handling and retry behavior match the expected distributed model
 - query results no longer assume single-frame responses only
@@ -378,8 +378,8 @@ Scope:
 - teach the client to treat `MIGRATION_INCOMPLETE` as a real retry case
 
 Dependencies:
-- M2 control plane
-- M3 data-plane reachability
+- M2 control ring
+- M3 data-ring reachability
 - M4 client improvements
 - M0 mini-plan for migration auto-seeding
 
@@ -463,7 +463,7 @@ the first execution wave should be:
 1. M0 mini-plans
 2. M1 correctness foundation
 3. M2 control ring
-4. M3 HRFT data-plane ingress
+4. M3 HRFT data-ring ingress
 5. M4 client completion
 6. M5 migration and lease closure
 
@@ -517,7 +517,7 @@ The gap-closure program should be considered complete when all of the following
 are true:
 
 - the strongest guarantees claimed in `plans/` are also true in code
-- control-plane and data-plane behaviors are externally reachable over the wire
+- control-ring and data-ring behaviors are externally reachable over the wire
 - client behavior matches the distributed protocol rather than a single-process
   approximation
 - migration, leases, and tiering no longer depend on manual or placeholder paths

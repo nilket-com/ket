@@ -49,7 +49,7 @@ ledger creation one coherent workflow.
    any other state-machine apply path.
 
 2. **Visible completion point**
-   `advance_epoch` is a compound control-plane operation:
+   `advance_epoch` is a compound control-ring operation:
    - commit epoch/config change
    - diff `ring(E)` against `ring(E+1)`
    - submit the deterministic `SeedMigration` batch

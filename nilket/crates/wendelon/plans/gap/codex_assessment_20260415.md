@@ -90,7 +90,7 @@ This is the single clearest structural gap.
 `src/network/traits.rs` still treats control-ring metadata as provisional, and I
 did not find a concrete `ControlRingServer` implementation. `src/node.rs` wires
 the message router around the data ring and raft internals, but not around a full
-control-plane service.
+control-ring service.
 
 This is especially visible because the client side already expects part of that
 surface: `src/client/topology.rs` has a production `ControlRingTopologySource`
@@ -102,8 +102,8 @@ Impact:
 - lease-control workflows are incomplete
 - epoch and leadership orchestration expected by the plans is not fully exposed
 
-The plans assume a stronger control-plane surface than the code currently exports.
-In practice, most of this control-plane behavior is still effectively in-process
+The plans assume a stronger control-ring surface than the code currently exports.
+In practice, most of this control-ring behavior is still effectively in-process
 today rather than reachable through a real server-side control-ring RPC surface.
 
 ### 2. Data-ring wire ingress is narrower than the protocol docs
@@ -250,7 +250,7 @@ The hash-ring code currently uses fixed keys/constants where the plans imply tha
 epoch metadata should drive those parameters.
 
 This matters because the implementation is not yet sourcing ring identity from the
-same control-plane state the plans describe. It works as a V1 simplification, but
+same control-ring state the plans describe. It works as a V1 simplification, but
 it is still a divergence from the intended architecture.
 
 Claude also surfaced a concrete parameter drift worth reconciling: the code uses
@@ -320,7 +320,7 @@ architecture externally true.
 
 In practical terms, the highest-value gap categories are:
 
-1. control-plane RPC completion
+1. control-ring RPC completion
 2. full client-visible data-ring ingress
 3. durable write semantics
 4. real recovery on restart

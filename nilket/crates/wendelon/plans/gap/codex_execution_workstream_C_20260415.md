@@ -24,7 +24,7 @@ make the client capable of using it without in-process shortcuts.
 
 - `WRITE_REQ`, `READ_REQ`, and `BULK_WRITE_REQ` are reachable over HRFT
 - `stream_finalization` is real, not a stub
-- the client can use the wire-reachable data plane with explicit retry and topology behavior
+- the client can use the wire-reachable data ring with explicit retry and topology behavior
 
 ## Ordering
 
@@ -73,7 +73,7 @@ What mini-plan, if any, governs the change:
 - none
 
 What assessment gap or milestone item it closes:
-- M3 base data-plane reachability
+- M3 base data-ring reachability
 - gap: `handle_data_frame` currently routes only replicate, query, and migrate
 
 ### C.2 `BULK_WRITE_REQ` ingress and leader-side HLC merge
@@ -158,7 +158,7 @@ What assessment gap or milestone item it closes:
 ### C.4 Client write/read/bulk APIs
 
 Objective:
-- give the client first-class APIs for the wire-reachable data plane
+- give the client first-class APIs for the wire-reachable data ring
 
 Size:
 - `M`
@@ -190,7 +190,7 @@ What mini-plan, if any, governs the change:
 - none
 
 What assessment gap or milestone item it closes:
-- M4 client data-plane surface
+- M4 client data-ring surface
 - gap: client currently lacks comparable write/read/bulk APIs
 
 ### C.5 Topology refresh and retry policy upgrade
@@ -209,7 +209,7 @@ Exact files/modules expected to change:
 Explicit invariants that must become true:
 - retry policy is stronger than a one-shot redirect on `NOT_LEADER` and `E_SAFE_BEHIND`
 - topology refresh behavior is explicit and testable
-- client behavior remains compatible with the control-plane status truth from Workstream B
+- client behavior remains compatible with the control-ring status truth from Workstream B
 
 Explicit non-goals:
 - mandatory push subscription if the team keeps pull-plus-refresh as the accepted model

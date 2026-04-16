@@ -106,7 +106,7 @@ Explicit non-goals:
 
 Dependencies:
 - E.1
-- Workstream B control-plane reachability
+- Workstream B control-ring reachability
 
 Tests that must pass or be added:
 - add `tests/multinode_bootstrap.rs`
@@ -138,7 +138,7 @@ Exact files/modules expected to change:
 Explicit invariants that must become true:
 - the runtime exposes a scrapeable metrics surface
 - key correctness and migration counters can be observed
-- metrics additions do not change control-plane or data-plane semantics
+- metrics additions do not change control-ring or data-ring semantics
 
 Explicit non-goals:
 - dashboard authoring
