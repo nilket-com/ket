@@ -5,6 +5,7 @@ use crate::schema::{
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 // ============================================================
@@ -18,21 +19,21 @@ use tokio::sync::mpsc;
 //  above and referenced directly by the `ControlRing` trait.
 // ============================================================
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferLeadershipRequestMeta {
 	pub source_epoch: u64,
 	pub from_leader: NodeId,
 	pub to_leader: NodeId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferLeadershipResponseMeta {
 	pub accepted: bool,
 	/// Maps to ReasonCode table (TBD); 0 = granted.
 	pub reason_code: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterStatusResponseMeta {
 	pub current_epoch: u64,
 	pub leader: NodeId,

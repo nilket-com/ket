@@ -1,4 +1,5 @@
 pub mod core;
+pub mod control_server;
 pub mod data_server;
 pub mod factory;
 pub mod pool;
@@ -12,6 +13,7 @@ pub mod transport;
 pub mod wire;
 
 pub use core::*;
+pub use control_server::*;
 pub use data_server::*;
 pub use factory::*;
 pub use pool::*;

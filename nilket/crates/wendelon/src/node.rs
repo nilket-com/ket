@@ -39,6 +39,7 @@ use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
+use crate::network::control_server::WendelonControlServer;
 use crate::network::server::{serve, HrftService};
 use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
@@ -304,12 +305,21 @@ impl WendelonNode {
 			WendelonRaftInternalServer::new(raft.clone(), pool.clone())
 				.with_tracker(tracker.clone()),
 		);
+		let control_server = Arc::new(WendelonControlServer::new(
+			raft.clone(),
+			local_node,
+			epoch_rx.clone(),
+			pool.clone(),
+			cfg.rf as u32,
+			LEASE_TTL_MS,
+		));
 
 		// 14. Ring-aware dispatch — the single `HrftService` the QUIC
 		//     listener hands every inbound frame to.
 		let router = Arc::new(
 			MsgRouterBuilder::default()
 				.with_data_ring(data_server.clone())
+				.with_control_ring(control_server)
 				.with_raft_internal(raft_server)
 				.build(),
 		);
