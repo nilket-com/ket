@@ -38,7 +38,15 @@ That promise is only useful if migration is also correct. The implementation mus
 
 ## Implementation
 1. **Seed a Raft Migration Ledger During Epoch Transitions**
-   When the Control Ring advances from `ring(E)` to `ring(E+1)`, derive every reassigned vnode / hash range and persist a `MigrationLedgerEntry` in the `WendelonStateMachine`.
+   When the Control Ring advances from `ring(E)` to `ring(E+1)`, the leader treats the transition as a compound operation:
+   - commit the epoch/config change
+   - diff `ring(E)` against `ring(E+1)`
+   - persist one deterministic `MigrationLedgerEntry` per reassigned contiguous hash range
+   - wait for that seed batch to commit before making `E+1` externally visible
+
+   The seed batch must be deterministic and idempotent so a retry or post-failover reconciliation produces the same logical migration set rather than duplicating it.
+
+   Each entry should include at least:
    Each entry should include at least:
    - `migration_id`
    - `range_start`, `range_end`
@@ -61,7 +69,8 @@ That promise is only useful if migration is also correct. The implementation mus
    }
 
    struct MigrationLedgerEntry {
-       // Deterministic identifier, e.g. highway64(to_epoch, range_start, range_end).
+       // Deterministic identifier derived from
+       // blake3(to_epoch || range_start || range_end), truncated to u64.
        migration_id: u64,
        range_start: u64,
        range_end: u64,
