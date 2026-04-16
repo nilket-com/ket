@@ -12,7 +12,7 @@ This document specifies the Raft core on-disk and on-wire fixed-size formats (by
 - Deterministic layout: every bytemuck struct includes explicit _pad fields and a static_assert comment with expected size.
 - Recovery safety: commit_index, e_safe_index and WAL tail are durable; on restart no monotonic counters regress.
 - Snapshot-install must include serialized idempotency cache checkpoint (see plans/consensus/idempotency_cache.md) and last-applied state-machine snapshot digest.
-- WAL is append-only, CRC32c checksummed per record, and supports atomic fsync per-group.
+- WAL is append-only, blake3-prefix checksummed per record, and supports atomic fsync per-group.
 
 ---
 
@@ -104,7 +104,7 @@ The cache checkpoint is a bytemuck-serialized contiguous slice of entries matchi
 4. WAL record format (on-disk append record)
 
 Each WAL record is encoded as:
-[ WALRecordHeader (32 bytes) ][ body bytes (payload_len) ][ CRC32C (4 bytes) ]
+[ WALRecordHeader (32 bytes) ][ body bytes (payload_len) ][ blake3-prefix checksum (4 bytes) ]
 
 rust
 
@@ -129,7 +129,7 @@ pub struct WALRecordHeader {
 
 Notes:
 - body_len = size of payload immediately following header. For LogEntry records this is sizeof(RaftLogEntryFixed) + payload_len.
-- Each record ends with a 4-byte CRC32C covering header+body. Append procedure: write(header|body|crc), fsync group. Writers must ensure atomic append ordering.
+- Each record ends with a 4-byte blake3-prefix checksum covering header+body. Append procedure: write(header|body|checksum), fsync group. Writers must ensure atomic append ordering.
 
 ---
 
@@ -144,7 +144,7 @@ Notes:
 6. Recovery invariants and ordering
 
 On startup:
-1. Open WAL tail and replay records sequentially, verifying CRC32C.
+1. Open WAL tail and replay records sequentially, verifying the blake3-prefix checksum.
 2. Apply LogEntry records to state machine in index order, tracking last_applied, commit_index.
 3. Load persisted e_safe_index (if persisted separately) and ensure e_safe_index <= commit_index. If violation, clamp e_safe_index = min(e_safe_index, commit_index).
 4. Rebuild idempotency cache from snapshot checkpoint and recent WAL records up to configured scan window (see plans/consensus/idempotency_cache.md).
@@ -186,10 +186,10 @@ Guidelines:
 
 8. Tests & verification
 
-- Fuzz the RaftLogEntryFixed parsing via bytemuck::cast_ref against random byte arrays; ensure crc checks catch corruption.
+- Fuzz the RaftLogEntryFixed parsing via bytemuck::cast_ref against random byte arrays; ensure blake3-prefix checks catch corruption.
 - Snapshot round-trip: take snapshot, write to disk, load into a fresh node and verify state_sha256 and cache checkpoint rehydrates idempotency cache.
 - WAL replay window: simulate leadership transfer and ensure new leader rebuilds idempotency cache by scanning last N entries.
-- Crash-recovery: simulate partial WAL writes (truncated tail), verify CRC detection and safe truncation to last good record.
+- Crash-recovery: simulate partial WAL writes (truncated tail), verify blake3-prefix checksum detection and safe truncation to last good record.
 
 ---
 
@@ -219,7 +219,7 @@ Sequence (detailed)
 
 - Commit epoch: leader appends RaftEpochEntry (config + transfer_plan) and waits for commit.
 - Dual-accept: once committed, both old and new owners accept requests for affected ranges tagged with the new epoch. Servers validate epoch and return committed epoch in responses when they observe mismatch.
-- Incremental streaming: sources stream data to targets in fixed-size chunks (default chunk_size = 256 KiB). Each chunk includes a checksum (CRC32C or optional SHA-256) and a monotonically increasing cursor.
+- Incremental streaming: sources stream data to targets in fixed-size chunks (default chunk_size = 256 KiB). Each chunk includes a blake3 checksum (typically a blake3-prefix checksum for compact framing) and a monotonically increasing cursor.
   - Per-chunk ACKs let the source advance cursors; in-flight windows bounded per-transfer.
   - Rate-limiting (token-bucket) applies per-transfer and globally; defaults: 100 MB/s per transfer, adjustable via cluster metadata.
 - Durable resume: transfer cursors and last-ACK are persisted locally (WAL or lightweight on-disk cursor file) so interrupted transfers can resume without re-streaming already-acked chunks.

@@ -1308,9 +1308,9 @@ fn replay_wal(wal_path: &Path, snapshot: Option<&LoadedSnapshot>) -> std::io::Re
 
 		let body_end = offset + header_size + header.body_len as usize;
 		let record_end = body_end + 4;
-		let expected_crc = blake3_prefix_u32(&bytes[offset..body_end]);
-		let actual_crc = u32::from_le_bytes(bytes[body_end..record_end].try_into().unwrap());
-		if expected_crc != actual_crc {
+		let expected_checksum = blake3_prefix_u32(&bytes[offset..body_end]);
+		let actual_checksum = u32::from_le_bytes(bytes[body_end..record_end].try_into().unwrap());
+		if expected_checksum != actual_checksum {
 			if offset + padded_len == bytes.len() {
 				truncate_wal_tail(wal_path, last_good)?;
 				replay.wal_cursor = last_good as u64;
@@ -1488,7 +1488,7 @@ fn log_id_from_snapshot_header(header: &SnapshotHeader) -> Option<LogId<u32>> {
 }
 
 /// Build one page-padded WAL record for a single entry:
-/// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][crc32]`
+/// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][blake3-prefix checksum]`
 /// with the tail zero-padded to `DIRECT_IO_ALIGN`.
 fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf, AnyError> {
 	let encoded = postcard::to_allocvec(entry).map_err(|e| AnyError::new(&e))?;
@@ -1550,8 +1550,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 	dst[header_size..header_size + fixed_size].copy_from_slice(bytemuck::bytes_of(&fixed));
 	dst[header_size + fixed_size..header_size + fixed_size + payload_len].copy_from_slice(&encoded);
-	let crc = blake3_prefix_u32(&dst[..header_size + body_len]);
-	dst[header_size + body_len..header_size + body_len + 4].copy_from_slice(&crc.to_le_bytes());
+	let checksum = blake3_prefix_u32(&dst[..header_size + body_len]);
+	dst[header_size + body_len..header_size + body_len + 4]
+		.copy_from_slice(&checksum.to_le_bytes());
 	// Remainder is already zero from AlignedBuf::new.
 	Ok(buf)
 }
@@ -1582,8 +1583,9 @@ fn serialize_checkpoint_page(
 	let dst = buf.as_mut_slice();
 	dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 	dst[header_size..header_size + body_size].copy_from_slice(bytemuck::bytes_of(&body));
-	let crc = blake3_prefix_u32(&dst[..header_size + body_size]);
-	dst[header_size + body_size..header_size + body_size + 4].copy_from_slice(&crc.to_le_bytes());
+	let checksum = blake3_prefix_u32(&dst[..header_size + body_size]);
+	dst[header_size + body_size..header_size + body_size + 4]
+		.copy_from_slice(&checksum.to_le_bytes());
 	buf
 }
 
@@ -1876,6 +1878,10 @@ mod recovery_tests {
 		assert!(
 			err.to_string().contains("interior corruption"),
 			"unexpected error: {err}"
+		);
+		assert!(
+			err.to_string().contains("checksum mismatch"),
+			"expected blake3-prefix checksum verification failure, got: {err}"
 		);
 	}
 

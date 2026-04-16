@@ -458,12 +458,10 @@ fn page_round_up(n: usize) -> usize {
 //    not match, we have reached either the end of valid data or a
 //    torn write; stop and report the cursor.
 //
-//  This trusts magic + frame_len on disk. A torn record whose
-//  header was flushed but whose frame was not will leak an entry
-//  into the index. That is acceptable for the scaffold: the real
-//  durability barrier (ADR 009 group-commit fsync) will make this
-//  impossible once it lands, and at that point a CRC over the
-//  header+frame will replace the plain magic check.
+//  Recovery trusts magic + frame_len only long enough to size the
+//  read. The real integrity decision is the current blake3-prefix
+//  checksum over (header-with-zero-checksum || frame), which stops
+//  the scan at the first torn or corrupted trailing record.
 // ============================================================
 
 fn recover_slab(
@@ -545,12 +543,12 @@ fn recover_slab(
 //
 //  Torn-write detector. Defined as the first 4 bytes of a blake3
 //  hash over (header-with-zero-checksum || frame-bytes), taken as
-//  little-endian u32. Picked over a CRC32 because blake3 is
-//  already a project dependency — avoiding a new crate beats the
-//  marginal CPU cost of the stronger hash for a durability aid
-//  that is not on the truly hottest path. If benchmarks ever show
-//  this dominating append latency, swap in `crc32fast` here and
-//  leave every other call site untouched.
+//  little-endian u32. Chosen because blake3 is already a project
+//  dependency — avoiding a new crate beats the marginal CPU cost
+//  of the stronger hash for a durability aid that is not on the
+//  truly hottest path. If benchmarks ever show
+//  this dominating append latency, the checksum primitive can be
+//  swapped here without changing the rest of the read/write path.
 // ============================================================
 
 fn compute_checksum(bytes_header_then_frame: &[u8]) -> u32 {
