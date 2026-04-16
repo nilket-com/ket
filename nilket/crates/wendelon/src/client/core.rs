@@ -33,10 +33,11 @@
 //!
 //! ## Redirect handling
 //!
-//! A data node that returns `NOT_LEADER` or `E_SAFE_BEHIND` carries
-//! a `leader_hint` the client should redirect to. The query path
-//! triggers a topology refresh and retries exactly once against the
-//! hinted node before surfacing the error.
+//! A data node that returns `NOT_LEADER`, `EPOCH_STALE`, or
+//! `E_SAFE_BEHIND` carries a `leader_hint` the client can use to
+//! recover. The client runs a bounded refresh-and-retry loop so it
+//! can re-target requests after leadership changes or stale views
+//! without forcing callers to hand-roll redirect logic.
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
@@ -51,7 +52,8 @@ use crate::network::transport::{
 use crate::schema::{
 	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	WriteRequestMeta, WriteResponseMeta, read_key_schema, read_value_schema, write_payload_schema,
+	WriteRequestMeta, WriteResponseMeta, WriteStatus, read_key_schema, read_value_schema,
+	write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
@@ -61,6 +63,7 @@ use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// Stable key-hash seed shared with the Data Ring.
@@ -70,6 +73,14 @@ const HIGHWAY_KEY: HighwayKey = HighwayKey([
 	0x4441_5441_5249_4e47,
 	0x5354_454c_4c41_524f,
 ]);
+
+/// Maximum number of client attempts for a single logical data
+/// operation before surfacing the last non-success status.
+pub const DATA_RETRY_BUDGET: usize = 3;
+
+/// Small pause before retrying after `E_SAFE_BEHIND` so a follower
+/// or newly-elected leader has a chance to advance freshness.
+pub const E_SAFE_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 // ============================================================
 //  CONFIG
@@ -184,9 +195,7 @@ impl WendelonClient {
 	/// repeatedly — the underlying source decides whether work is
 	/// actually performed.
 	pub async fn refresh_topology(&self) -> std::io::Result<()> {
-		let snapshot = self.topology_source.fetch().await?;
-		self.apply_snapshot(&snapshot);
-		Ok(())
+		self.refresh_topology_with_candidates(&[]).await
 	}
 
 	/// Apply a pre-fetched snapshot. Exposed so tests can drive the
@@ -273,6 +282,12 @@ pub struct ReadResult {
 	pub value: Option<RecordBatch>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetryDirective {
+	preferred_target: Option<NodeId>,
+	backoff: Option<Duration>,
+}
+
 impl WendelonClient {
 	/// Issue one `WRITE_REQ` over HRFT and return the server's
 	/// explicit wire response, including any redirect or durability
@@ -280,10 +295,21 @@ impl WendelonClient {
 	pub async fn write(&self, request: WriteRequest) -> std::io::Result<WriteResult> {
 		validate_write_request_batch(&request.meta, &request.payload)?;
 		let key_hash = key_hash_from_batch(&request.payload, "key")?;
-		let target = self.target_for_key_hash(key_hash)?;
-		let result = self.write_once(target, &request).await?;
-		self.observe_write_response(&result.response);
-		Ok(result)
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_key_hash(key_hash)?);
+			let result = self.write_once(target, &request).await?;
+			self.observe_write_response(&result.response);
+			let Some(retry) = retry_write_response(&result.response) else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(key_hash), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
 	}
 
 	/// Issue one `READ_REQ` over HRFT and surface the exact
@@ -292,10 +318,21 @@ impl WendelonClient {
 	pub async fn read(&self, request: ReadRequest) -> std::io::Result<ReadResult> {
 		validate_read_request_batch(&request.meta, &request.key)?;
 		let key_hash = key_hash_from_batch(&request.key, "key")?;
-		let target = self.target_for_key_hash(key_hash)?;
-		let result = self.read_once(target, &request).await?;
-		self.observe_read_response(&result.response);
-		Ok(result)
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_key_hash(key_hash)?);
+			let result = self.read_once(target, &request).await?;
+			self.observe_read_response(&result.response);
+			let Some(retry) = retry_read_response(&result.response) else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(key_hash), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
 	}
 
 	/// Issue grouped `BULK_WRITE_REQ` streams over HRFT. Requests are
@@ -329,9 +366,25 @@ impl WendelonClient {
 		}
 
 		let mut results: Vec<Option<WriteResult>> = vec![None; total_requests];
+		let mut originals: Vec<Option<WriteRequest>> = vec![None; total_requests];
 		for (target, items) in groups {
+			for (index, request) in &items {
+				originals[*index] = Some(request.clone());
+			}
 			for (index, result) in self.bulk_write_group(target, items).await? {
-				results[index] = Some(result);
+				if retry_write_response(&result.response).is_some() {
+					let retried = self
+						.write(originals[index].as_ref().cloned().ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								"bulk retry missing original request payload",
+							)
+						})?)
+						.await?;
+					results[index] = Some(retried);
+				} else {
+					results[index] = Some(result);
+				}
 			}
 		}
 
@@ -479,6 +532,55 @@ impl WendelonClient {
 			*self.leader.write().unwrap() = Some(response.leader_hint);
 		}
 	}
+
+	async fn refresh_topology_with_candidates(&self, candidates: &[NodeId]) -> std::io::Result<()> {
+		let snapshot = self
+			.topology_source
+			.fetch_from_candidates(candidates)
+			.await?;
+		self.apply_snapshot(&snapshot);
+		Ok(())
+	}
+
+	async fn prepare_retry(
+		&self,
+		key_hash: Option<u64>,
+		retry: RetryDirective,
+	) -> std::io::Result<()> {
+		let candidates = self.retry_candidates(key_hash, retry.preferred_target);
+		if let Err(err) = self.refresh_topology_with_candidates(&candidates).await {
+			if retry.preferred_target.is_none() {
+				return Err(err);
+			}
+		}
+		if let Some(backoff) = retry.backoff {
+			tokio::time::sleep(backoff).await;
+		}
+		Ok(())
+	}
+
+	fn retry_candidates(&self, key_hash: Option<u64>, preferred: Option<NodeId>) -> Vec<NodeId> {
+		let mut candidates = Vec::new();
+		let mut push = |node: Option<NodeId>| {
+			if let Some(node) = node {
+				if node.id != 0
+					&& !candidates
+						.iter()
+						.any(|existing: &NodeId| existing.id == node.id)
+				{
+					candidates.push(node);
+				}
+			}
+		};
+		push(preferred);
+		push(self.leader());
+		if let Some(key_hash) = key_hash {
+			for replica in self.replicas_for(key_hash) {
+				push(Some(replica));
+			}
+		}
+		candidates
+	}
 }
 
 // ============================================================
@@ -538,9 +640,9 @@ impl WendelonClient {
 	///   non-zero value asks the server to return the newest
 	///   version per key whose `hlc <= as_of_hlc`.
 	///
-	/// On `NOT_LEADER` or `E_SAFE_BEHIND` the client refreshes
-	/// topology and retries exactly once against the server's
-	/// `leader_hint`. Any other error surface is terminal.
+	/// On `NOT_LEADER`, `EPOCH_STALE`, or `E_SAFE_BEHIND` the client
+	/// performs a bounded refresh-and-retry loop rather than a
+	/// single-shot redirect. Any other error surface is terminal.
 	pub async fn query(
 		&self,
 		wpbc_ast: Vec<u8>,
@@ -550,12 +652,6 @@ impl WendelonClient {
 		consistency: Consistency,
 		as_of_hlc: HybridTimestamp,
 	) -> std::io::Result<QueryResult> {
-		let target = self.pick_target(range.start_hash).ok_or_else(|| {
-			Error::new(
-				ErrorKind::NotFound,
-				"no replica available for the requested key range",
-			)
-		})?;
 		let meta = QueryRequestMeta {
 			min_hlc,
 			expected_epoch,
@@ -568,13 +664,24 @@ impl WendelonClient {
 			as_of_hlc,
 		};
 
-		match self.query_once(target, &meta, &wpbc_ast).await {
-			Ok(QueryOutcome::Ok(result)) => Ok(result),
-			Ok(QueryOutcome::Redirect(hint)) => {
-				self.query_with_redirect(hint, &meta, &wpbc_ast).await
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_key_hash(range.start_hash)?);
+			match self.query_once(target, &meta, &wpbc_ast).await? {
+				QueryOutcome::Ok(result) => return Ok(result),
+				QueryOutcome::Redirect(retry) => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(Error::new(
+							ErrorKind::NotConnected,
+							"Wendelon query retry budget exhausted",
+						));
+					}
+					self.prepare_retry(Some(range.start_hash), retry).await?;
+					preferred_target = retry.preferred_target;
+				}
 			}
-			Err(e) => Err(e),
 		}
+		unreachable!("bounded retry loop must return within budget")
 	}
 
 	/// First-pass dispatch target: the head of the replica set for
@@ -593,26 +700,6 @@ impl WendelonClient {
 			}
 		}
 		Some(replicas[0])
-	}
-
-	async fn query_with_redirect(
-		&self,
-		hint: NodeId,
-		meta: &QueryRequestMeta,
-		wpbc: &[u8],
-	) -> std::io::Result<QueryResult> {
-		// A redirect hint is a sign the topology we routed against
-		// is stale. Refresh before retrying so subsequent queries
-		// already see the new leader; a failed refresh is not
-		// terminal — the hint itself is enough to dial.
-		let _ = self.refresh_topology().await;
-		match self.query_once(hint, meta, wpbc).await? {
-			QueryOutcome::Ok(result) => Ok(result),
-			QueryOutcome::Redirect(_) => Err(Error::new(
-				ErrorKind::NotConnected,
-				"Wendelon query still redirecting after refresh",
-			)),
-		}
 	}
 
 	async fn query_once(
@@ -677,9 +764,16 @@ impl WendelonClient {
 					rows: ack.rows,
 				}))
 			}
-			s if s == ReadStatus::NOT_LEADER || s == ReadStatus::E_SAFE_BEHIND => {
-				Ok(QueryOutcome::Redirect(ack.leader_hint))
+			s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => {
+				Ok(QueryOutcome::Redirect(RetryDirective {
+					preferred_target: nonzero_node_id(ack.leader_hint),
+					backoff: None,
+				}))
 			}
+			s if s == ReadStatus::E_SAFE_BEHIND => Ok(QueryOutcome::Redirect(RetryDirective {
+				preferred_target: nonzero_node_id(ack.leader_hint),
+				backoff: Some(E_SAFE_RETRY_BACKOFF),
+			})),
 			s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(QueryResult {
 				// No rows is a legitimate answer — return an empty
 				// batch shaped however the server said (here: we
@@ -701,12 +795,42 @@ impl WendelonClient {
 #[derive(Debug)]
 enum QueryOutcome {
 	Ok(QueryResult),
-	Redirect(NodeId),
+	Redirect(RetryDirective),
 }
 
 // ============================================================
 //  HELPERS
 // ============================================================
+
+fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> {
+	match response.status {
+		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => {
+			Some(RetryDirective {
+				preferred_target: nonzero_node_id(response.leader_hint),
+				backoff: None,
+			})
+		}
+		_ => None,
+	}
+}
+
+fn retry_read_response(response: &ReadResponseMeta) -> Option<RetryDirective> {
+	match response.status {
+		s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => Some(RetryDirective {
+			preferred_target: nonzero_node_id(response.leader_hint),
+			backoff: None,
+		}),
+		s if s == ReadStatus::E_SAFE_BEHIND => Some(RetryDirective {
+			preferred_target: nonzero_node_id(response.leader_hint),
+			backoff: Some(E_SAFE_RETRY_BACKOFF),
+		}),
+		_ => None,
+	}
+}
+
+fn nonzero_node_id(node: NodeId) -> Option<NodeId> {
+	(node.id != 0).then_some(node)
+}
 
 fn decode_write_response_frame(
 	frame: crate::network::core::HrftFrame,

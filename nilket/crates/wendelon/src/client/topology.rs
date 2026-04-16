@@ -139,6 +139,16 @@ impl ClusterStatusWire {
 #[async_trait]
 pub trait TopologySource: Send + Sync {
 	async fn fetch(&self) -> std::io::Result<ClusterStatusWire>;
+
+	/// Fetch a snapshot, preferring the supplied peers when the
+	/// source implementation can use them. The default keeps the
+	/// existing pull model and ignores the hints.
+	async fn fetch_from_candidates(
+		&self,
+		_candidates: &[NodeId],
+	) -> std::io::Result<ClusterStatusWire> {
+		self.fetch().await
+	}
 }
 
 // ============================================================
@@ -249,14 +259,34 @@ impl ControlRingTopologySource {
 		}
 		wire::decode::<ClusterStatusWire>(&resp.meta)
 	}
+
+	fn candidate_order(&self, preferred: &[NodeId]) -> Vec<NodeId> {
+		let mut ordered = Vec::with_capacity(preferred.len() + self.bootstrap.len());
+		for node in preferred.iter().chain(self.bootstrap.iter()) {
+			if !ordered
+				.iter()
+				.any(|existing: &NodeId| existing.id == node.id)
+			{
+				ordered.push(*node);
+			}
+		}
+		ordered
+	}
 }
 
 #[async_trait]
 impl TopologySource for ControlRingTopologySource {
 	async fn fetch(&self) -> std::io::Result<ClusterStatusWire> {
+		self.fetch_from_candidates(&[]).await
+	}
+
+	async fn fetch_from_candidates(
+		&self,
+		candidates: &[NodeId],
+	) -> std::io::Result<ClusterStatusWire> {
 		let mut last_err: Option<Error> = None;
-		for peer in &self.bootstrap {
-			match self.fetch_from(*peer).await {
+		for peer in self.candidate_order(candidates) {
+			match self.fetch_from(peer).await {
 				Ok(snapshot) => return Ok(snapshot),
 				Err(e) => last_err = Some(e),
 			}

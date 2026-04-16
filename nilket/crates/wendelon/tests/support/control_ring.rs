@@ -67,24 +67,35 @@ pub async fn bootstrap_node(tag: &str, node_id: u32) -> WendelonNode {
 	.unwrap()
 }
 
+#[allow(dead_code)]
 pub fn loopback_factory(
 	remote: NodeId,
 	service: Arc<dyn HrftService>,
+) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
+	loopback_factory_many(vec![(remote, service)])
+}
+
+pub fn loopback_factory_many(
+	services: Vec<(NodeId, Arc<dyn HrftService>)>,
 ) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
 	let pool = BufPool::new(64, 1024 * 1024);
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 
 	let mut peers = HashMap::new();
-	peers.insert(
-		remote,
-		PeerCapabilities {
-			address: "loopback://control".into(),
-			tiers,
-			roles: NodeRoleSet::empty()
-				.with(NodeRole::Control)
-				.with(NodeRole::Data),
-		},
-	);
+	let mut service_map = HashMap::new();
+	for (remote, service) in services {
+		peers.insert(
+			remote,
+			PeerCapabilities {
+				address: format!("loopback://node-{}", remote.id),
+				tiers,
+				roles: NodeRoleSet::empty()
+					.with(NodeRole::Control)
+					.with(NodeRole::Data),
+			},
+		);
+		service_map.insert(remote, service);
+	}
 	let epoch = MembershipEpoch { epoch: 1, peers };
 	let (_tx, rx) = watch::channel(Arc::new(epoch));
 	let resolver = Arc::new(EpochCapabilityResolver::new(rx.clone()));
@@ -93,8 +104,7 @@ pub fn loopback_factory(
 	providers.insert(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
-			remote,
-			service,
+			services: service_map,
 			pool: pool.clone(),
 			tier: TransportTier::QuicIoUring,
 		}),
@@ -110,28 +120,38 @@ pub fn loopback_client_config(
 	service: Arc<dyn HrftService>,
 	bootstrap: ClusterStatusWire,
 ) -> WendelonClientConfig {
-	loopback_client_config_with_topology(
-		remote,
-		service,
+	loopback_client_config_many_with_topology(
 		bootstrap.clone(),
 		Arc::new(StaticTopologySource::new(bootstrap)),
+		vec![(remote, service)],
 	)
 }
 
 #[allow(dead_code)]
-pub fn loopback_client_config_with_topology(
-	remote: NodeId,
-	service: Arc<dyn HrftService>,
+pub fn loopback_client_config_many(
+	bootstrap: ClusterStatusWire,
+	services: Vec<(NodeId, Arc<dyn HrftService>)>,
+) -> WendelonClientConfig {
+	loopback_client_config_many_with_topology(
+		bootstrap.clone(),
+		Arc::new(StaticTopologySource::new(bootstrap)),
+		services,
+	)
+}
+
+#[allow(dead_code)]
+pub fn loopback_client_config_many_with_topology(
 	bootstrap: ClusterStatusWire,
 	topology: Arc<dyn TopologySource>,
+	services: Vec<(NodeId, Arc<dyn HrftService>)>,
 ) -> WendelonClientConfig {
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+	let service_map: HashMap<NodeId, Arc<dyn HrftService>> = services.into_iter().collect();
 	providers.insert(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
-			remote,
-			service,
+			services: service_map,
 			pool: BufPool::new(64, 1024 * 1024),
 			tier: TransportTier::QuicIoUring,
 		}),
@@ -144,6 +164,16 @@ pub fn loopback_client_config_with_topology(
 		pool_max_retained: 64,
 		pool_max_cap_bytes: 1024 * 1024,
 	}
+}
+
+#[allow(dead_code)]
+pub fn loopback_client_config_with_topology(
+	remote: NodeId,
+	service: Arc<dyn HrftService>,
+	bootstrap: ClusterStatusWire,
+	topology: Arc<dyn TopologySource>,
+) -> WendelonClientConfig {
+	loopback_client_config_many_with_topology(bootstrap, topology, vec![(remote, service)])
 }
 
 #[allow(dead_code)]
@@ -357,8 +387,7 @@ impl TransportConnection for LoopbackConnection {
 }
 
 struct LoopbackProvider {
-	remote: NodeId,
-	service: Arc<dyn HrftService>,
+	services: HashMap<NodeId, Arc<dyn HrftService>>,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
 }
@@ -370,15 +399,15 @@ impl TransportProvider for LoopbackProvider {
 		target: NodeId,
 		_address: &str,
 	) -> std::io::Result<Arc<dyn TransportConnection>> {
-		if target.id != self.remote.id {
-			return Err(Error::new(
+		let service = self.services.get(&target).cloned().ok_or_else(|| {
+			Error::new(
 				ErrorKind::NotFound,
 				format!("unknown loopback target {}", target.id),
-			));
-		}
+			)
+		})?;
 		Ok(Arc::new(LoopbackConnection {
-			remote: self.remote,
-			service: self.service.clone(),
+			remote: target,
+			service,
 			pool: self.pool.clone(),
 			tier: self.tier,
 		}))
