@@ -143,6 +143,7 @@ impl HrftService for MsgRouter {
 		let header = read_frame_header(&mut *stream).await?;
 		if header.msg_type == MsgType::BULK_WRITE_REQ.0
 			|| header.msg_type == MsgType::STREAM_FIN_REQ.0
+			|| header.msg_type == MsgType::QUERY_REQ.0
 		{
 			return match &self.data {
 				Some(h) => h.handle_data_stream(header, stream, pool).await,

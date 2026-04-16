@@ -299,6 +299,12 @@ pub struct FrameHeader {
 	pub trailing_len: u32,
 }
 
+/// Generic HRFT flag: the current frame is the terminal item in a
+/// multi-frame response stream. Query streaming uses this on the
+/// last `QUERY_RESP` frame so the client can stop without relying
+/// on transport EOF as a framing signal.
+pub const FRAME_FLAG_STREAM_END: u16 = 1 << 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]
 pub struct MsgType(pub u8);
@@ -326,8 +332,8 @@ impl MsgType {
 	pub const REPLICATE_RESP: Self = Self(0x0A);
 	// Pushdown scan from a Smart Client SDK (ADR 005 + ADR 004).
 	// The client frames a WPBC program over a key-hash range and
-	// streams the filtered Arrow IPC result back on the same bidi
-	// stream. One QUERY_REQ begets exactly one QUERY_RESP.
+	// the server streams one or more QUERY_RESP frames carrying the
+	// filtered Arrow IPC result back on the same bidi stream.
 	pub const QUERY_REQ: Self = Self(0x0B);
 	pub const QUERY_RESP: Self = Self(0x0C);
 	// Peer-only lazy-migration RPCs (ADR 006 + Plan 019). A new
@@ -665,8 +671,9 @@ pub struct QueryResponseMeta {
 	pub leader_hint: NodeId, //  8 bytes
 	/// Row count after filter + project.
 	pub rows: u64, //  8 bytes
-	/// Byte length of the Arrow IPC section carrying the result
-	/// batch. Zero if `status != OK`.
+	/// Byte length of the Arrow IPC section on the *first*
+	/// `QUERY_RESP` frame. Continuation frames carry their Arrow
+	/// length in the enclosing [`FrameHeader`].
 	pub arrow_len: u32, //  4 bytes
 	pub _pad2: [u8; 4], //  4 bytes
 }

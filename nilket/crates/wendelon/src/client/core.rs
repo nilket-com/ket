@@ -46,12 +46,12 @@ use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::{RingRouter, RingState};
 use crate::network::transport::{
-	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, TransportProvider, TransportTier,
-	TransportTierSet,
+	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, TransportProvider,
+	TransportStream, TransportTier, TransportTierSet,
 };
 use crate::schema::{
-	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType,
+	NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	WriteRequestMeta, WriteResponseMeta, WriteStatus, read_key_schema, read_value_schema,
 	write_payload_schema,
 };
@@ -614,14 +614,89 @@ impl KeyRange {
 	}
 }
 
-/// One filtered-and-projected result batch plus the HLC frontier
-/// the server observed while producing it.
-#[derive(Clone, Debug)]
-pub struct QueryResult {
-	pub batch: RecordBatch,
+/// Streaming query cursor over one or more `QUERY_RESP` frames.
+///
+/// The first response frame carries the authoritative query meta;
+/// subsequent frames carry additional Arrow IPC batches until a
+/// frame arrives with [`FRAME_FLAG_STREAM_END`].
+pub struct StreamingQueryResult {
 	pub value_hlc: HybridTimestamp,
 	pub epoch: u64,
 	pub rows: u64,
+	pending_batch: Option<RecordBatch>,
+	stream: Option<Box<dyn TransportStream>>,
+	pool: Arc<BufPool>,
+}
+
+impl std::fmt::Debug for StreamingQueryResult {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("StreamingQueryResult")
+			.field("value_hlc", &self.value_hlc)
+			.field("epoch", &self.epoch)
+			.field("rows", &self.rows)
+			.field("has_pending_batch", &self.pending_batch.is_some())
+			.field("stream_open", &self.stream.is_some())
+			.finish()
+	}
+}
+
+impl StreamingQueryResult {
+	pub async fn next_batch(&mut self) -> std::io::Result<Option<RecordBatch>> {
+		if let Some(batch) = self.pending_batch.take() {
+			return Ok(Some(batch));
+		}
+		let Some(stream) = self.stream.as_mut() else {
+			return Ok(None);
+		};
+
+		let frame = read_frame(&mut **stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::QUERY_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected QUERY_RESP continuation, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			));
+		}
+		if !frame.meta.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"QUERY_RESP continuation must not carry response meta",
+			));
+		}
+		if frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"QUERY_RESP continuation must not carry trailing bytes",
+			));
+		}
+
+		let is_end = (frame.header.flags & FRAME_FLAG_STREAM_END) != 0;
+		let batch = match frame.arrow_payload.as_ref() {
+			Some(arrow) => Some(decode_batch(&arrow[..])?),
+			None if is_end => None,
+			None => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"QUERY_RESP continuation missing Arrow payload",
+				));
+			}
+		};
+
+		if is_end {
+			self.stream = None;
+		}
+		Ok(batch)
+	}
+
+	pub async fn collect_all(mut self) -> std::io::Result<Vec<RecordBatch>> {
+		let mut batches = Vec::new();
+		while let Some(batch) = self.next_batch().await? {
+			batches.push(batch);
+		}
+		Ok(batches)
+	}
 }
 
 impl WendelonClient {
@@ -651,7 +726,7 @@ impl WendelonClient {
 		min_hlc: HybridTimestamp,
 		consistency: Consistency,
 		as_of_hlc: HybridTimestamp,
-	) -> std::io::Result<QueryResult> {
+	) -> std::io::Result<StreamingQueryResult> {
 		let meta = QueryRequestMeta {
 			min_hlc,
 			expected_epoch,
@@ -745,11 +820,27 @@ impl WendelonClient {
 				"QUERY_RESP meta too small",
 			));
 		}
+		if resp.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"QUERY_RESP must not carry trailing bytes",
+			));
+		}
 		let ack: &QueryResponseMeta =
 			bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		let is_end = (resp.header.flags & FRAME_FLAG_STREAM_END) != 0;
 
 		match ack.status {
 			s if s == ReadStatus::OK => {
+				if resp.header.arrow_len != ack.arrow_len {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"QUERY_RESP first-frame arrow_len mismatch: meta={} header={}",
+							ack.arrow_len, resp.header.arrow_len
+						),
+					));
+				}
 				let arrow = resp.arrow_payload.as_ref().ok_or_else(|| {
 					Error::new(
 						ErrorKind::InvalidData,
@@ -757,11 +848,13 @@ impl WendelonClient {
 					)
 				})?;
 				let batch = decode_batch(&arrow[..])?;
-				Ok(QueryOutcome::Ok(QueryResult {
-					batch,
+				Ok(QueryOutcome::Ok(StreamingQueryResult {
 					value_hlc: ack.value_hlc,
 					epoch: ack.epoch,
 					rows: ack.rows,
+					pending_batch: Some(batch),
+					stream: if is_end { None } else { Some(stream) },
+					pool: self.pool.clone(),
 				}))
 			}
 			s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => {
@@ -774,15 +867,13 @@ impl WendelonClient {
 				preferred_target: nonzero_node_id(ack.leader_hint),
 				backoff: Some(E_SAFE_RETRY_BACKOFF),
 			})),
-			s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(QueryResult {
-				// No rows is a legitimate answer — return an empty
-				// batch shaped however the server said (here: we
-				// have no schema to build, so surface an error so
-				// the caller can decide).
-				batch: empty_batch()?,
+			s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(StreamingQueryResult {
 				value_hlc: ack.value_hlc,
 				epoch: ack.epoch,
 				rows: 0,
+				pending_batch: None,
+				stream: None,
+				pool: self.pool.clone(),
 			})),
 			other => Err(Error::new(
 				ErrorKind::Other,
@@ -794,7 +885,7 @@ impl WendelonClient {
 
 #[derive(Debug)]
 enum QueryOutcome {
-	Ok(QueryResult),
+	Ok(StreamingQueryResult),
 	Redirect(RetryDirective),
 }
 
@@ -1081,20 +1172,6 @@ fn highway_hash(bytes: &[u8]) -> u64 {
 	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
 	hasher.append(bytes);
 	hasher.finalize64()
-}
-
-/// Zero-column placeholder used when the server returns
-/// `KEY_NOT_FOUND` without an Arrow payload. The caller's
-/// downstream stages should treat `rows == 0` as the authoritative
-/// signal rather than introspect the batch shape.
-fn empty_batch() -> std::io::Result<RecordBatch> {
-	let schema = Arc::new(arrow::datatypes::Schema::empty());
-	RecordBatch::try_new_with_options(
-		schema,
-		vec![],
-		&arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(0)),
-	)
-	.map_err(|e| Error::new(ErrorKind::InvalidData, format!("empty batch: {e}")))
 }
 
 // ============================================================

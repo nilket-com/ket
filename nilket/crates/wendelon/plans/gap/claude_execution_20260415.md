@@ -33,10 +33,10 @@ Seven workstreams, preceded by a short alignment phase. Workstream **A**
 **B**. **G** is continuous and runs alongside everything.
 
 ```
-A0. Alignment (mini-plans + drift dispositions)  ─▶  all workstreams
+A0. Alignment (mini-plans + drift dispositions)    ─▶  all workstreams
 A.  Correctness foundations                      ─┬─▶  everything else
-B.  Control-ring surface                        ─┼─▶  D, E
-C.  Data-ring ingress                           ─┤
+B.  Control-ring surface                         ─┼─▶  D, E
+C.  Data-ring ingress                            ─┤
 D.  Migration automation                         ─┘
 E.  Security / authenticity                      (depends on B)
 F.  Storage & tiering                            (parallel to B/C/D)
