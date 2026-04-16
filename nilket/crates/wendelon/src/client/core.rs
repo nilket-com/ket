@@ -49,15 +49,27 @@ use crate::network::transport::{
 	TransportTierSet,
 };
 use crate::schema::{
-	Consistency, FrameHeader, HybridTimestamp, MsgType, NodeId, QueryRequestMeta,
-	QueryResponseMeta, ReadStatus,
+	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType, NodeId,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	WriteRequestMeta, WriteResponseMeta, read_key_schema, read_value_schema, write_payload_schema,
 };
+use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
+
+/// Stable key-hash seed shared with the Data Ring.
+const HIGHWAY_KEY: HighwayKey = HighwayKey([
+	0x5745_4e44_454c_4f4e,
+	0x4841_5348_4b45_5901,
+	0x4441_5441_5249_4e47,
+	0x5354_454c_4c41_524f,
+]);
 
 // ============================================================
 //  CONFIG
@@ -226,6 +238,246 @@ impl WendelonClient {
 	/// sections. Exposed for the same reason as [`Self::factory`].
 	pub fn pool(&self) -> &Arc<BufPool> {
 		&self.pool
+	}
+}
+
+// ============================================================
+//  DATA API
+// ============================================================
+
+/// Client-visible unary write request for the Data Ring wire API.
+#[derive(Clone, Debug)]
+pub struct WriteRequest {
+	pub meta: WriteRequestMeta,
+	pub payload: RecordBatch,
+}
+
+/// Result of a unary or bulk write item.
+#[derive(Clone, Debug)]
+pub struct WriteResult {
+	pub response: WriteResponseMeta,
+	pub finalization: Option<FinalizationMarker>,
+}
+
+/// Client-visible point read request for the Data Ring wire API.
+#[derive(Clone, Debug)]
+pub struct ReadRequest {
+	pub meta: ReadRequestMeta,
+	pub key: RecordBatch,
+}
+
+/// Result of a point read.
+#[derive(Clone, Debug)]
+pub struct ReadResult {
+	pub response: ReadResponseMeta,
+	pub value: Option<RecordBatch>,
+}
+
+impl WendelonClient {
+	/// Issue one `WRITE_REQ` over HRFT and return the server's
+	/// explicit wire response, including any redirect or durability
+	/// status.
+	pub async fn write(&self, request: WriteRequest) -> std::io::Result<WriteResult> {
+		validate_write_request_batch(&request.meta, &request.payload)?;
+		let key_hash = key_hash_from_batch(&request.payload, "key")?;
+		let target = self.target_for_key_hash(key_hash)?;
+		let result = self.write_once(target, &request).await?;
+		self.observe_write_response(&result.response);
+		Ok(result)
+	}
+
+	/// Issue one `READ_REQ` over HRFT and surface the exact
+	/// `ReadStatus` the server returned. Successful reads carry the
+	/// Arrow value batch in `ReadResult.value`.
+	pub async fn read(&self, request: ReadRequest) -> std::io::Result<ReadResult> {
+		validate_read_request_batch(&request.meta, &request.key)?;
+		let key_hash = key_hash_from_batch(&request.key, "key")?;
+		let target = self.target_for_key_hash(key_hash)?;
+		let result = self.read_once(target, &request).await?;
+		self.observe_read_response(&result.response);
+		Ok(result)
+	}
+
+	/// Issue grouped `BULK_WRITE_REQ` streams over HRFT. Requests are
+	/// partitioned by routed destination so each target sees one bulk
+	/// stream carrying only the items it should own. Results preserve
+	/// input order.
+	pub async fn bulk_write(
+		&self,
+		requests: Vec<WriteRequest>,
+	) -> std::io::Result<Vec<WriteResult>> {
+		if requests.is_empty() {
+			return Ok(Vec::new());
+		}
+
+		let total_requests = requests.len();
+		let mut groups: Vec<(NodeId, Vec<(usize, WriteRequest)>)> = Vec::new();
+		let mut group_index: HashMap<NodeId, usize> = HashMap::new();
+		for (index, request) in requests.into_iter().enumerate() {
+			validate_write_request_batch(&request.meta, &request.payload)?;
+			let key_hash = key_hash_from_batch(&request.payload, "key")?;
+			let target = self.target_for_key_hash(key_hash)?;
+			let slot = if let Some(existing) = group_index.get(&target).copied() {
+				existing
+			} else {
+				let next = groups.len();
+				group_index.insert(target, next);
+				groups.push((target, Vec::new()));
+				next
+			};
+			groups[slot].1.push((index, request));
+		}
+
+		let mut results: Vec<Option<WriteResult>> = vec![None; total_requests];
+		for (target, items) in groups {
+			for (index, result) in self.bulk_write_group(target, items).await? {
+				results[index] = Some(result);
+			}
+		}
+
+		results
+			.into_iter()
+			.map(|item| {
+				item.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"bulk write completed without a response for one or more items",
+					)
+				})
+			})
+			.collect()
+	}
+
+	fn target_for_key_hash(&self, key_hash: u64) -> std::io::Result<NodeId> {
+		self.pick_target(key_hash).ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				"no replica available for the requested key range",
+			)
+		})
+	}
+
+	async fn write_once(
+		&self,
+		target: NodeId,
+		request: &WriteRequest,
+	) -> std::io::Result<WriteResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let arrow = encode_batch(&request.payload)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::WRITE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<WriteRequestMeta>() as u32,
+			arrow_len: arrow.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			Some(&arrow),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_write_response_frame(frame, MsgType::WRITE_RESP)
+	}
+
+	async fn read_once(
+		&self,
+		target: NodeId,
+		request: &ReadRequest,
+	) -> std::io::Result<ReadResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let arrow = encode_batch(&request.key)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::READ_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<ReadRequestMeta>() as u32,
+			arrow_len: arrow.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			Some(&arrow),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_read_response_frame(frame)
+	}
+
+	async fn bulk_write_group(
+		&self,
+		target: NodeId,
+		requests: Vec<(usize, WriteRequest)>,
+	) -> std::io::Result<Vec<(usize, WriteResult)>> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		for (_, request) in &requests {
+			let arrow = encode_batch(&request.payload)?;
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::BULK_WRITE_REQ.0,
+				flags: 0,
+				stream_id: 0,
+				meta_len: std::mem::size_of::<WriteRequestMeta>() as u32,
+				arrow_len: arrow.len() as u32,
+				trailing_len: 0,
+			};
+			write_frame(
+				&mut *stream,
+				&header,
+				bytemuck::bytes_of(&request.meta),
+				Some(&arrow),
+				None,
+			)
+			.await?;
+		}
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+		let mut results = Vec::with_capacity(requests.len());
+		for (index, _) in requests {
+			let frame = read_frame(&mut *stream, &self.pool).await?;
+			let result = decode_write_response_frame(frame, MsgType::BULK_WRITE_RESP)?;
+			self.observe_write_response(&result.response);
+			results.push((index, result));
+		}
+		Ok(results)
+	}
+
+	fn observe_write_response(&self, response: &WriteResponseMeta) {
+		if response.leader_hint.id != 0 {
+			*self.leader.write().unwrap() = Some(response.leader_hint);
+		}
+	}
+
+	fn observe_read_response(&self, response: &ReadResponseMeta) {
+		if response.leader_hint.id != 0 {
+			*self.leader.write().unwrap() = Some(response.leader_hint);
+		}
 	}
 }
 
@@ -456,6 +708,118 @@ enum QueryOutcome {
 //  HELPERS
 // ============================================================
 
+fn decode_write_response_frame(
+	frame: crate::network::core::HrftFrame,
+	expected: MsgType,
+) -> std::io::Result<WriteResult> {
+	if frame.header.msg_type != expected.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected msg_type=0x{:02x}, got msg_type=0x{:02x}",
+				expected.0, frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<WriteResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"WRITE_RESP meta too small",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"WRITE_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: WriteResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteResponseMeta>()]);
+	let finalization = match response.has_finalization {
+		0 => {
+			if frame.trailing.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"WRITE_RESP trailing marker present but has_finalization=0",
+				));
+			}
+			None
+		}
+		1 => {
+			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"WRITE_RESP missing FinalizationMarker payload",
+				)
+			})?;
+			if trailing.len() < std::mem::size_of::<FinalizationMarker>() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"WRITE_RESP FinalizationMarker payload too small",
+				));
+			}
+			Some(*bytemuck::from_bytes(
+				&trailing[..std::mem::size_of::<FinalizationMarker>()],
+			))
+		}
+		other => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("WRITE_RESP invalid has_finalization value {other}"),
+			));
+		}
+	};
+	Ok(WriteResult {
+		response,
+		finalization,
+	})
+}
+
+fn decode_read_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<ReadResult> {
+	if frame.header.msg_type != MsgType::READ_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected READ_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<ReadResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"READ_RESP meta too small",
+		));
+	}
+	if frame.trailing.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"READ_RESP must not carry trailing bytes",
+		));
+	}
+	let response: ReadResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReadResponseMeta>()]);
+	let value = if response.status == ReadStatus::OK {
+		let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(ErrorKind::InvalidData, "READ_RESP OK missing Arrow payload")
+		})?;
+		let batch = decode_batch(&arrow[..])?;
+		validate_read_value_batch(&response, &batch)?;
+		Some(batch)
+	} else {
+		if frame.arrow_payload.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"READ_RESP error status must not carry an Arrow payload",
+			));
+		}
+		None
+	};
+	Ok(ReadResult { response, value })
+}
+
 fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
 		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {e}")))?;
@@ -470,6 +834,129 @@ fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 			"arrow stream contained no record batch",
 		)),
 	}
+}
+
+fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
+	let mut buf = Vec::new();
+	{
+		let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream init: {e}")))?;
+		writer
+			.write(batch)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream write: {e}")))?;
+		writer
+			.finish()
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream finish: {e}")))?;
+	}
+	Ok(buf)
+}
+
+fn validate_write_request_batch(
+	meta: &WriteRequestMeta,
+	batch: &RecordBatch,
+) -> std::io::Result<()> {
+	if batch.schema().as_ref() != &write_payload_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"WRITE_REQ Arrow payload schema mismatch",
+		));
+	}
+	let key_len = extract_first_binary(batch, "key")?.len() as u32;
+	if key_len != meta.key_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"WRITE_REQ key_len mismatch: meta={} actual={}",
+				meta.key_len, key_len
+			),
+		));
+	}
+	let value_len = extract_first_binary(batch, "value")?.len() as u32;
+	if value_len != meta.value_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"WRITE_REQ value_len mismatch: meta={} actual={}",
+				meta.value_len, value_len
+			),
+		));
+	}
+	Ok(())
+}
+
+fn validate_read_request_batch(meta: &ReadRequestMeta, batch: &RecordBatch) -> std::io::Result<()> {
+	if batch.schema().as_ref() != &read_key_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"READ_REQ Arrow payload schema mismatch",
+		));
+	}
+	let key_len = extract_first_binary(batch, "key")?.len() as u32;
+	if key_len != meta.key_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"READ_REQ key_len mismatch: meta={} actual={}",
+				meta.key_len, key_len
+			),
+		));
+	}
+	Ok(())
+}
+
+fn validate_read_value_batch(meta: &ReadResponseMeta, batch: &RecordBatch) -> std::io::Result<()> {
+	if batch.schema().as_ref() != &read_value_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"READ_RESP Arrow payload schema mismatch",
+		));
+	}
+	let value_len = extract_first_binary(batch, "value")?.len() as u32;
+	if value_len != meta.value_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"READ_RESP value_len mismatch: meta={} actual={}",
+				meta.value_len, value_len
+			),
+		));
+	}
+	Ok(())
+}
+
+fn extract_first_binary<'a>(
+	batch: &'a RecordBatch,
+	column: &'static str,
+) -> std::io::Result<&'a [u8]> {
+	let col = batch
+		.column_by_name(column)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, format!("missing '{column}' column")))?;
+	let arr = col
+		.as_any()
+		.downcast_ref::<LargeBinaryArray>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("'{column}' column is not LargeBinary"),
+			)
+		})?;
+	if arr.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("'{column}' column is empty"),
+		));
+	}
+	Ok(arr.value(0))
+}
+
+fn key_hash_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<u64> {
+	Ok(highway_hash(extract_first_binary(batch, column)?))
+}
+
+fn highway_hash(bytes: &[u8]) -> u64 {
+	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
+	hasher.append(bytes);
+	hasher.finalize64()
 }
 
 /// Zero-column placeholder used when the server returns
