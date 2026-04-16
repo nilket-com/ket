@@ -131,6 +131,12 @@ impl WendelonControlServer {
 	}
 
 	async fn handle_status(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if !frame.meta.is_empty() || frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"STATUS_REQ must not carry meta, arrow, or trailing payloads",
+			));
+		}
 		let snapshot = self.cluster_status_wire().await;
 		let meta = wire::encode_into(&self.pool, &snapshot)?;
 		Ok(HrftFrame {

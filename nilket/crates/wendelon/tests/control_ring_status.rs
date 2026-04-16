@@ -2,7 +2,9 @@
 mod support;
 
 use std::sync::Arc;
-use wendelon::client::topology::{ControlRingTopologySource, TopologySource};
+use wendelon::client::{
+	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, TopologySource, WendelonClient,
+};
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 
@@ -32,6 +34,52 @@ async fn status_req_returns_live_cluster_status_wire() {
 			.with(NodeRole::Data)
 			.with(NodeRole::Control)
 	);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn wendelon_client_refreshes_topology_from_live_control_ring() {
+	let node = support::bootstrap_node("status-client-refresh", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory(node.local_node, service.clone());
+	let source: Arc<dyn TopologySource> = Arc::new(ControlRingTopologySource::new(
+		factory,
+		pool,
+		vec![node.local_node],
+	));
+
+	let bootstrap = ClusterStatusWire {
+		epoch: 0,
+		leader: None,
+		replication_factor: 1,
+		peers: vec![ClusterPeerWire {
+			node_id: node.local_node.id,
+			address: "loopback://bootstrap".into(),
+			tier_bits: TransportTierSet::empty()
+				.with(TransportTier::QuicIoUring)
+				.as_u8(),
+			role_bits: NodeRoleSet::empty()
+				.with(NodeRole::Data)
+				.with(NodeRole::Control)
+				.as_u8(),
+		}],
+	};
+
+	let client = WendelonClient::new(support::loopback_client_config_with_topology(
+		node.local_node,
+		service,
+		bootstrap,
+		source,
+	));
+
+	assert_eq!(client.leader(), None);
+	client.refresh_topology().await.unwrap();
+	assert_eq!(client.leader(), Some(node.local_node));
+	assert_eq!(client.replication_factor(), 1);
+	assert_eq!(client.replicas_for(0), vec![node.local_node]);
 
 	support::abort_node(&node);
 }

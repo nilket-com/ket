@@ -239,6 +239,12 @@ impl ControlRingTopologySource {
 				),
 			));
 		}
+		if resp.arrow_payload.is_some() || resp.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"STATUS_RESP must not carry arrow or trailing payloads",
+			));
+		}
 		wire::decode::<ClusterStatusWire>(&resp.meta)
 	}
 }

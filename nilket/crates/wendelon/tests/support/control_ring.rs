@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::watch;
-use wendelon::client::{ClusterStatusWire, StaticTopologySource, WendelonClientConfig};
+use wendelon::client::{
+	ClusterStatusWire, StaticTopologySource, TopologySource, WendelonClientConfig,
+};
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
@@ -107,6 +109,21 @@ pub fn loopback_client_config(
 	service: Arc<dyn HrftService>,
 	bootstrap: ClusterStatusWire,
 ) -> WendelonClientConfig {
+	loopback_client_config_with_topology(
+		remote,
+		service,
+		bootstrap.clone(),
+		Arc::new(StaticTopologySource::new(bootstrap)),
+	)
+}
+
+#[allow(dead_code)]
+pub fn loopback_client_config_with_topology(
+	remote: NodeId,
+	service: Arc<dyn HrftService>,
+	bootstrap: ClusterStatusWire,
+	topology: Arc<dyn TopologySource>,
+) -> WendelonClientConfig {
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 	providers.insert(
@@ -121,8 +138,8 @@ pub fn loopback_client_config(
 	WendelonClientConfig {
 		local_tiers: tiers,
 		providers,
-		bootstrap: bootstrap.clone(),
-		topology: Arc::new(StaticTopologySource::new(bootstrap)),
+		bootstrap,
+		topology,
 		pool_max_retained: 64,
 		pool_max_cap_bytes: 1024 * 1024,
 	}
