@@ -39,8 +39,8 @@
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
-	MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest, WendelonResponse,
-	WendelonStateMachine,
+	MigrationComplete, MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest,
+	WendelonResponse, WendelonStateMachine,
 };
 use crate::network::core::{
 	HRFT_MAGIC, read_frame, read_frame_from_header, read_frame_header, write_frame,
@@ -350,6 +350,14 @@ pub const DEFAULT_PAGE_MAX_RECORDS: u32 = 1024;
 pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
 /// Per-subscriber queue depth for committed finalization markers.
 pub const STREAM_FINALIZATION_BUFFER: usize = 128;
+/// Default wake cadence for the background migration sweeper.
+pub const MIGRATION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+/// Retry delay after a migration sweep pass fails for one entry.
+pub const MIGRATION_SWEEP_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
+/// Background migration is intentionally conservative: one
+/// migration range per pass keeps the sweeper from competing with
+/// foreground reads/writes or the tier sweeper for disk/network.
+pub const MIGRATION_SWEEP_MAX_PER_PASS: usize = 1;
 
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
@@ -636,6 +644,123 @@ impl WendelonDataServer {
 				let _ = self
 					.refresh_leases_once(&ring, clock.as_ref(), ttl_ms)
 					.await;
+			}
+		})
+	}
+
+	async fn pending_owned_migrations(&self) -> Vec<MigrationLedgerEntry> {
+		let mut entries: Vec<_> = self
+			.state_machine
+			.state_snapshot()
+			.await
+			.migrations
+			.values()
+			.filter(|entry| {
+				entry.logical_owner.id == self.local_node.id
+					&& entry.state != MigrationState::Completed
+			})
+			.cloned()
+			.collect();
+		entries.sort_by_key(|entry| (entry.to_epoch, entry.range_start, entry.range_end));
+		entries
+	}
+
+	async fn drive_migration_to_completion(
+		&self,
+		entry: &MigrationLedgerEntry,
+	) -> std::io::Result<()> {
+		self.pull_migration_range(entry, entry.range_start, entry.range_end)
+			.await?;
+		// The sweeper is the convergence path that declares a
+		// migration complete. Flush every local slab before proposing
+		// `MigrationComplete` so partially durable backfill never
+		// becomes authoritative in the ledger.
+		self.slab.fsync_all_local_slabs().await?;
+
+		let completed_at_hlc = self.merge_commit_hlc(HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		});
+		self.raft
+			.client_write(WendelonRequest::MigrationComplete(MigrationComplete {
+				migration_id: entry.migration_id,
+				range_start: entry.range_start,
+				range_end: entry.range_end,
+				to_epoch: entry.to_epoch,
+				completed_by: self.local_node,
+				completed_at_hlc,
+				migration_hlc_floor: entry.migration_hlc_floor,
+			}))
+			.await
+			.map_err(|err| {
+				Error::new(
+					ErrorKind::Other,
+					format!("migration complete commit failed: {err}"),
+				)
+			})?;
+		Ok(())
+	}
+
+	/// Spawn the background migration sweeper.
+	///
+	/// Every node runs this loop, but only entries whose
+	/// `logical_owner` is the local node are eligible. The sweeper is
+	/// intentionally conservative: it processes at most
+	/// `max_migrations_per_pass` entries per tick and backs off a
+	/// failed entry before retrying so foreground traffic and the L2
+	/// tier sweeper retain priority on network and disk.
+	pub fn spawn_migration_sweeper(
+		self: Arc<Self>,
+		tick: Duration,
+		failure_backoff: Duration,
+		max_migrations_per_pass: usize,
+	) -> JoinHandle<()> {
+		let budget = max_migrations_per_pass.max(1);
+		tokio::spawn(async move {
+			let mut ticker = tokio::time::interval(tick);
+			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			let mut backoff_until = std::collections::HashMap::<u64, tokio::time::Instant>::new();
+
+			// Seed immediately so a recovered node starts converging
+			// pending migrations without waiting for the first tick.
+			loop {
+				let now = tokio::time::Instant::now();
+				let pending = self.pending_owned_migrations().await;
+				let mut processed = 0usize;
+				for entry in pending {
+					if processed >= budget {
+						break;
+					}
+					if backoff_until
+						.get(&entry.migration_id)
+						.is_some_and(|deadline| *deadline > now)
+					{
+						continue;
+					}
+
+					match self.drive_migration_to_completion(&entry).await {
+						Ok(()) => {
+							backoff_until.remove(&entry.migration_id);
+							processed += 1;
+						}
+						Err(err) => {
+							backoff_until.insert(
+								entry.migration_id,
+								tokio::time::Instant::now() + failure_backoff,
+							);
+							tracing::warn!(
+								migration_id = entry.migration_id,
+								range_start = entry.range_start,
+								range_end = entry.range_end,
+								error = %err,
+								"migration sweeper pass failed; will retry after backoff"
+							);
+						}
+					}
+				}
+
+				ticker.tick().await;
 			}
 		})
 	}
@@ -1461,8 +1586,10 @@ impl WendelonDataServer {
 	/// error or non-OK `MigrateStatus`), the union is by definition
 	/// incomplete — the caller must convert this into a visible
 	/// non-OK status to the client rather than silently degrading.
-	/// The method returns `Err(io::Error)` in that case; transient
-	/// retries are the client's job, not ours.
+	/// The method still advances to later `source_replicas` so a
+	/// healthy fallback can contribute bytes in the same pass, but it
+	/// returns `Err(io::Error)` at the end if any source failed;
+	/// transient retries are the caller's job, not ours.
 	async fn pull_migration_range(
 		&self,
 		entry: &MigrationLedgerEntry,
@@ -1477,6 +1604,7 @@ impl WendelonDataServer {
 		let page_max_bytes = self.page_max_bytes.load(Ordering::Relaxed);
 
 		let mut touched_any_source = false;
+		let mut saw_source_failure = false;
 		for source in &entry.source_replicas {
 			if source.id == self.local_node.id {
 				continue;
@@ -1499,23 +1627,32 @@ impl WendelonDataServer {
 					kind: MigrateRequestKind::RANGE_PAGE,
 					_pad: [0; 7],
 				};
-				let (resp, records) = self.migrate_request(*source, &req).await.map_err(|e| {
-					Error::new(
-						ErrorKind::Other,
-						format!(
-							"migration pull: transport error from source {:?} for migration {}: {e}",
-							source, entry.migration_id,
-						),
-					)
-				})?;
+				let (resp, records) = match self.migrate_request(*source, &req).await {
+					Ok(ok) => ok,
+					Err(err) => {
+						saw_source_failure = true;
+						tracing::warn!(
+							migration_id = entry.migration_id,
+							range_start,
+							range_end,
+							source = source.id,
+							error = %err,
+							"migration pull source transport failed; trying next candidate"
+						);
+						break;
+					}
+				};
 				if resp.status != MigrateStatus::OK {
-					return Err(Error::new(
-						ErrorKind::Other,
-						format!(
-							"migration pull: source {:?} returned status {} for migration {}",
-							source, resp.status.0, entry.migration_id,
-						),
-					));
+					saw_source_failure = true;
+					tracing::warn!(
+						migration_id = entry.migration_id,
+						range_start,
+						range_end,
+						source = source.id,
+						status = resp.status.0,
+						"migration pull source returned non-OK status; trying next candidate"
+					);
+					break;
 				}
 				for record in &records {
 					self.slab
@@ -1545,6 +1682,15 @@ impl WendelonDataServer {
 				format!(
 					"migration pull: no non-local source_replicas for migration {}",
 					entry.migration_id,
+				),
+			));
+		}
+		if saw_source_failure {
+			return Err(Error::new(
+				ErrorKind::Other,
+				format!(
+					"migration pull incomplete for migration {}: one or more sources failed",
+					entry.migration_id
 				),
 			));
 		}

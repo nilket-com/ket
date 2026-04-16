@@ -54,6 +54,7 @@ pub fn abort_node(node: &WendelonNode) {
 	node.handles.eviction_watchdog.abort();
 	node.handles.lease_manager.abort();
 	node.handles.epoch_reconciler.abort();
+	node.handles.migration_sweeper.abort();
 }
 
 #[allow(dead_code)]

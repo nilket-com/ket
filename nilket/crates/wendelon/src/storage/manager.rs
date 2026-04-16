@@ -186,6 +186,33 @@ impl SlabManager {
 		Ok(location)
 	}
 
+	/// Durability barrier across every local L1 slab currently
+	/// referenced by the manager.
+	///
+	/// Used by the migration sweeper before proposing
+	/// `MigrationComplete`: the pull path may have appended records
+	/// across the active slab and any newly sealed slabs created by
+	/// rotation, so the sweeper needs a manager-wide barrier rather
+	/// than a single-slab `fsync`.
+	pub async fn fsync_all_local_slabs(&self) -> std::io::Result<()> {
+		let (active, sealed) = {
+			let state = self.state.lock().await;
+			let active = state.active.clone();
+			let sealed = state
+				.sealed
+				.iter()
+				.map(|entry| entry.value().clone())
+				.collect::<Vec<_>>();
+			(active, sealed)
+		};
+
+		active.fsync().await?;
+		for slab in sealed {
+			slab.fsync().await?;
+		}
+		Ok(())
+	}
+
 	/// Open or create a manager rooted at `config.dir`. The
 	/// directory must already exist; the manager will not create
 	/// it to avoid racing with operator tooling that also manages

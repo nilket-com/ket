@@ -35,7 +35,10 @@ use crate::consensus::raft_storage::{
 	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
 use crate::network::control_server::{WendelonControlServer, select_bootstrap_epoch};
-use crate::network::data_server::WendelonDataServer;
+use crate::network::data_server::{
+	MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS,
+	WendelonDataServer,
+};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
@@ -131,6 +134,7 @@ pub struct NodeHandles {
 	pub eviction_watchdog: JoinHandle<()>,
 	pub lease_manager: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
+	pub migration_sweeper: JoinHandle<()>,
 }
 
 /// Time-to-live the lease manager requests on every grant. The
@@ -351,6 +355,11 @@ impl WendelonNode {
 			LEASE_RENEW_INTERVAL,
 			LEASE_TTL_MS,
 		);
+		let migration_sweeper = data_server.clone().spawn_migration_sweeper(
+			MIGRATION_SWEEP_INTERVAL,
+			MIGRATION_SWEEP_FAILURE_BACKOFF,
+			MIGRATION_SWEEP_MAX_PER_PASS,
+		);
 
 		Ok(Self {
 			local_node,
@@ -372,6 +381,7 @@ impl WendelonNode {
 				eviction_watchdog,
 				lease_manager,
 				epoch_reconciler,
+				migration_sweeper,
 			},
 		})
 	}
@@ -616,6 +626,8 @@ mod tests {
 		node.handles.drift_monitor.abort();
 		node.handles.eviction_watchdog.abort();
 		node.handles.lease_manager.abort();
+		node.handles.epoch_reconciler.abort();
+		node.handles.migration_sweeper.abort();
 		drop(node);
 		tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -641,6 +653,8 @@ mod tests {
 		recovered.handles.drift_monitor.abort();
 		recovered.handles.eviction_watchdog.abort();
 		recovered.handles.lease_manager.abort();
+		recovered.handles.epoch_reconciler.abort();
+		recovered.handles.migration_sweeper.abort();
 	}
 
 	#[tokio::test]
