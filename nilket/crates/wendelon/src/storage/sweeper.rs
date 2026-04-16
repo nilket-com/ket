@@ -225,6 +225,9 @@ impl SlabSweeper {
 				}
 			}
 		}
+		let reclaim = self.reclaim_tombstoned_ranges_once(1).await?;
+		report.reclaimed_slabs = reclaim.compacted_slabs;
+		report.reclaimed_bytes = reclaim.reclaimed_bytes;
 		Ok(report)
 	}
 
@@ -303,6 +306,16 @@ impl SlabSweeper {
 		})
 	}
 
+	async fn reclaim_tombstoned_ranges_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<crate::storage::manager::TombstoneCompactionReport> {
+		let state = self.state_machine.state_snapshot().await;
+		self.slab
+			.reclaim_tombstoned_ranges(&state.tombstones, max_slabs)
+			.await
+	}
+
 	/// Token-bucket rate limiter. For V1 we keep it simple —
 	/// every upload blocks long enough to respect
 	/// `max_upload_bytes_per_sec`. The bucket has no burst credit
@@ -357,6 +370,8 @@ pub struct SweepReport {
 	pub failed: usize,
 	pub skipped_too_small: usize,
 	pub skipped_already_tiered: usize,
+	pub reclaimed_slabs: usize,
+	pub reclaimed_bytes: u64,
 }
 
 // ============================================================

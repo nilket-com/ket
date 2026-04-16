@@ -13,7 +13,7 @@ use std::sync::Arc;
 //  ID of the stamp originator.
 // ============================================================
 #[derive(
-	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable, Serialize, Deserialize,
+	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
 )]
 #[repr(C)]
 pub struct HybridTimestamp {

@@ -702,6 +702,16 @@ impl WendelonDataServer {
 		Ok(())
 	}
 
+	async fn reclaim_tombstoned_ranges_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<crate::storage::manager::TombstoneCompactionReport> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		self.slab
+			.reclaim_tombstoned_ranges(&snapshot.tombstones, max_slabs)
+			.await
+	}
+
 	/// Spawn the background migration sweeper.
 	///
 	/// Every node runs this loop, but only entries whose
@@ -758,6 +768,13 @@ impl WendelonDataServer {
 							);
 						}
 					}
+				}
+
+				if let Err(err) = self.reclaim_tombstoned_ranges_once(1).await {
+					tracing::warn!(
+						error = %err,
+						"migration sweeper reclaim pass failed; will retry on next tick"
+					);
 				}
 
 				ticker.tick().await;

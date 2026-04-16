@@ -40,6 +40,7 @@
 //! * S3 tier handoff: the `sealed` map is as far as records travel
 //!   for now; remote upload is ADR 006's problem.
 
+use crate::consensus::MigratedRangeTombstone;
 use crate::schema::HybridTimestamp;
 use crate::storage::core::{
 	LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted, newest_version_as_of,
@@ -106,6 +107,13 @@ pub struct TieredSlabPointer {
 	pub payload_hash: [u8; 32],
 }
 
+/// Outcome of one tombstone-aware reclaim pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TombstoneCompactionReport {
+	pub compacted_slabs: usize,
+	pub reclaimed_bytes: u64,
+}
+
 /// Multi-slab composition of [`StorageEngine`].
 pub struct SlabManager {
 	config: SlabManagerConfig,
@@ -115,6 +123,11 @@ pub struct SlabManager {
 	/// version sorted ascending by HLC; the tail is the current
 	/// value and earlier entries back time-travel reads.
 	key_index: DashMap<u64, Vec<RecordLocation>>,
+	/// Best-effort compatibility map for in-flight readers that
+	/// raced a compaction rewrite. New lookups pivot to the fresh
+	/// location through `key_index`; a stale snapshot of the prior
+	/// location follows this chain to the replacement slab.
+	relocated_reads: DashMap<RecordLocation, RecordLocation>,
 }
 
 struct ManagerState {
@@ -291,6 +304,7 @@ impl SlabManager {
 				next_slab_id,
 			}),
 			key_index,
+			relocated_reads: DashMap::new(),
 		})
 	}
 
@@ -326,6 +340,20 @@ impl SlabManager {
 		}
 		out.sort_by_key(|s| s.slab_id);
 		out
+	}
+
+	/// Total bytes currently retained in local L1 slabs.
+	///
+	/// Counts the active slab plus every sealed slab that still
+	/// lives on local disk. Tiered slabs are excluded because their
+	/// authoritative bytes already moved to L2.
+	pub async fn local_l1_bytes(&self) -> u64 {
+		let state = self.state.lock().await;
+		let mut total = state.active.write_cursor();
+		for entry in state.sealed.iter() {
+			total = total.saturating_add(entry.value().write_cursor());
+		}
+		total
 	}
 
 	/// Read every byte of a sealed L1 slab in one shot. Used by
@@ -644,6 +672,57 @@ impl SlabManager {
 		}
 		SlabBacking::Missing
 	}
+
+	fn relocate_read_location(&self, mut location: RecordLocation) -> RecordLocation {
+		for _ in 0..8 {
+			let Some(next) = self.relocated_reads.get(&location).map(|entry| *entry) else {
+				return location;
+			};
+			if next == location {
+				return location;
+			}
+			location = next;
+		}
+		location
+	}
+
+	pub async fn reclaim_tombstoned_ranges(
+		&self,
+		tombstones: &[MigratedRangeTombstone],
+		max_slabs: usize,
+	) -> std::io::Result<TombstoneCompactionReport> {
+		if tombstones.is_empty() || max_slabs == 0 {
+			return Ok(TombstoneCompactionReport::default());
+		}
+
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+
+		let mut report = TombstoneCompactionReport::default();
+		for (slab_id, slab) in sealed {
+			if report.compacted_slabs >= max_slabs {
+				break;
+			}
+			if let Some(outcome) = self
+				.compact_one_sealed_slab(slab_id, slab, tombstones)
+				.await?
+			{
+				report.compacted_slabs += 1;
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		Ok(report)
+	}
 }
 
 /// Authoritative location for a slab, as observed by the read
@@ -674,6 +753,7 @@ impl StorageEngine for SlabManager {
 	}
 
 	async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
+		let location = self.relocate_read_location(location);
 		match self.resolve_backing(location.slab_id).await {
 			SlabBacking::Local(slab) => slab.read(location).await,
 			SlabBacking::L2(pointer) => self.read_from_l2(&pointer, location).await,
@@ -697,6 +777,150 @@ impl StorageEngine for SlabManager {
 }
 
 impl SlabManager {
+	async fn reserve_slab_id(&self) -> u64 {
+		let mut state = self.state.lock().await;
+		let next_id = state.next_slab_id;
+		state.next_slab_id = state.next_slab_id.saturating_add(1);
+		next_id
+	}
+
+	async fn compact_one_sealed_slab(
+		&self,
+		slab_id: u64,
+		slab: Arc<LocalSlabStore>,
+		tombstones: &[MigratedRangeTombstone],
+	) -> std::io::Result<Option<CompactionOutcome>> {
+		let mut records: Vec<CompactionRecord> = slab
+			.index
+			.iter()
+			.flat_map(|entry| {
+				let key_hash = *entry.key();
+				entry
+					.value()
+					.iter()
+					.map(move |loc| CompactionRecord {
+						key_hash,
+						old_location: *loc,
+						reclaim: tombstones.iter().any(|tombstone| {
+							key_hash >= tombstone.range_start
+								&& key_hash <= tombstone.range_end
+								&& loc.hlc >= tombstone.migration_hlc_floor
+						}),
+					})
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		records.sort_by_key(|record| record.old_location.offset);
+
+		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
+			return Ok(None);
+		}
+
+		let old_bytes = slab.write_cursor();
+		let survivors = records.iter().filter(|record| !record.reclaim).count();
+		if survivors == 0 {
+			self.finish_compaction_without_replacement(slab_id, &records)
+				.await?;
+			return Ok(Some(CompactionOutcome {
+				reclaimed_bytes: old_bytes,
+			}));
+		}
+
+		let replacement_id = self.reserve_slab_id().await;
+		let replacement_path = slab_path(&self.config.dir, replacement_id);
+		let replacement = Arc::new(LocalSlabStore::open(
+			&replacement_path,
+			replacement_id,
+			self.config.io.clone(),
+		)?);
+		let mut relocations = Vec::with_capacity(survivors);
+		for record in records.iter().filter(|record| !record.reclaim) {
+			let frame = slab.read(record.old_location).await?;
+			let new_location = replacement
+				.append(record.key_hash, record.old_location.hlc, &frame)
+				.await?;
+			relocations.push(RelocatedRecord {
+				key_hash: record.key_hash,
+				old_location: record.old_location,
+				new_location,
+			});
+		}
+		replacement.fsync().await?;
+		let new_bytes = replacement.write_cursor();
+
+		if !self
+			.finish_compaction_with_replacement(
+				slab_id,
+				replacement_id,
+				replacement.clone(),
+				&records,
+				&relocations,
+			)
+			.await?
+		{
+			let path = slab_path(&self.config.dir, replacement_id);
+			let _ = std::fs::remove_file(path);
+			return Ok(None);
+		}
+
+		let old_path = slab_path(&self.config.dir, slab_id);
+		match std::fs::remove_file(&old_path) {
+			Ok(()) => {}
+			Err(err) if err.kind() == ErrorKind::NotFound => {}
+			Err(err) => return Err(err),
+		}
+
+		Ok(Some(CompactionOutcome {
+			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
+		}))
+	}
+
+	async fn finish_compaction_without_replacement(
+		&self,
+		slab_id: u64,
+		records: &[CompactionRecord],
+	) -> std::io::Result<()> {
+		let state = self.state.lock().await;
+		if state.sealed.remove(&slab_id).is_none() {
+			return Ok(());
+		}
+		for record in records {
+			self.rollback_indexed_location(record.key_hash, record.old_location);
+		}
+		let old_path = slab_path(&self.config.dir, slab_id);
+		match std::fs::remove_file(&old_path) {
+			Ok(()) => {}
+			Err(err) if err.kind() == ErrorKind::NotFound => {}
+			Err(err) => return Err(err),
+		}
+		Ok(())
+	}
+
+	async fn finish_compaction_with_replacement(
+		&self,
+		old_slab_id: u64,
+		new_slab_id: u64,
+		replacement: Arc<LocalSlabStore>,
+		records: &[CompactionRecord],
+		relocations: &[RelocatedRecord],
+	) -> std::io::Result<bool> {
+		let state = self.state.lock().await;
+		if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
+			return Ok(false);
+		}
+		state.sealed.remove(&old_slab_id);
+		state.sealed.insert(new_slab_id, replacement);
+		for record in records {
+			self.rollback_indexed_location(record.key_hash, record.old_location);
+		}
+		for relocation in relocations {
+			self.index_appended_location(relocation.key_hash, relocation.new_location);
+			self.relocated_reads
+				.insert(relocation.old_location, relocation.new_location);
+		}
+		Ok(true)
+	}
+
 	/// Fetch a single record from L2. V1 downloads the whole slab
 	/// blob and carves out the record range; a follow-up will
 	/// teach [`ObjectStore`] about ranged GETs so only the record
@@ -744,6 +968,25 @@ impl SlabManager {
 		}
 		Ok(blob[offset + header_size..end].to_vec())
 	}
+}
+
+#[derive(Clone, Copy)]
+struct CompactionRecord {
+	key_hash: u64,
+	old_location: RecordLocation,
+	reclaim: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RelocatedRecord {
+	key_hash: u64,
+	old_location: RecordLocation,
+	new_location: RecordLocation,
+}
+
+#[derive(Clone, Copy)]
+struct CompactionOutcome {
+	reclaimed_bytes: u64,
 }
 
 // ============================================================

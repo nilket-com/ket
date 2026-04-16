@@ -147,7 +147,9 @@ pub struct AdvanceEpochRecord {
 /// Logical "this range moved away" marker held on prior source
 /// replicas. Fences the range out of future migration-source
 /// scans without requiring an immediate slab rewrite; physical
-/// reclaim happens later during tombstone-aware compaction.
+/// reclaim happens later during tombstone-aware compaction. The
+/// compactor may drop local records in `[range_start, range_end]`
+/// whose `hlc >= migration_hlc_floor`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigratedRangeTombstone {
 	pub migration_id: u64,

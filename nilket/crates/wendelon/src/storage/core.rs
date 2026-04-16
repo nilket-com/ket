@@ -72,7 +72,7 @@ const O_DIRECT: i32 = 0o0040000;
 const SLAB_RECORD_MAGIC: u32 = 0x534C4142;
 
 /// A pointer to a record's location on disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecordLocation {
 	pub slab_id: u64,
 	pub offset: u64,
