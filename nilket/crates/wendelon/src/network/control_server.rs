@@ -139,6 +139,12 @@ impl WendelonControlServer {
 		}
 		let snapshot = self.cluster_status_wire().await;
 		let meta = wire::encode_into(&self.pool, &snapshot)?;
+		let leases = self.cluster_status_leases().await;
+		let trailing = if leases.is_empty() {
+			None
+		} else {
+			Some(wire::encode_into(&self.pool, &leases)?)
+		};
 		Ok(HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
@@ -148,11 +154,11 @@ impl WendelonControlServer {
 				stream_id: frame.header.stream_id,
 				meta_len: meta.len() as u32,
 				arrow_len: 0,
-				trailing_len: 0,
+				trailing_len: trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0),
 			},
 			meta,
 			arrow_payload: None,
-			trailing: None,
+			trailing,
 		})
 	}
 
@@ -448,6 +454,19 @@ impl WendelonControlServer {
 			replication_factor: self.replication_factor,
 			peers,
 		}
+	}
+
+	async fn cluster_status_leases(&self) -> Vec<LeaseDescriptor> {
+		let mut leases: Vec<LeaseDescriptor> = self
+			.state_machine
+			.state_snapshot()
+			.await
+			.leases
+			.values()
+			.copied()
+			.collect();
+		leases.sort_by_key(|lease| (lease.range_start, lease.range_end, lease.holder.id));
+		leases
 	}
 
 	fn current_epoch(&self) -> u64 {

@@ -13,7 +13,9 @@
 //!    a bidi stream on a bootstrap peer via the shared
 //!    [`TransportProviderFactory`], sends an empty `STATUS_REQ`
 //!    frame, and decodes the postcard-encoded
-//!    [`ClusterStatusWire`] reply.
+//!    [`ClusterStatusWire`] reply. Any richer trailing control-plane
+//!    payload (such as lease metadata) is ignored here so topology
+//!    refresh stays compatible with the stable status meta path.
 //!
 //! ## Why a dedicated wire struct
 //!
@@ -239,10 +241,10 @@ impl ControlRingTopologySource {
 				),
 			));
 		}
-		if resp.arrow_payload.is_some() || resp.trailing.is_some() {
+		if resp.arrow_payload.is_some() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
-				"STATUS_RESP must not carry arrow or trailing payloads",
+				"STATUS_RESP must not carry an Arrow payload",
 			));
 		}
 		wire::decode::<ClusterStatusWire>(&resp.meta)
