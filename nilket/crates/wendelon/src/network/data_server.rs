@@ -37,6 +37,7 @@
 //! can tell a fresh success apart from a replay.
 
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
+use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
 	MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest, WendelonResponse,
 	WendelonStateMachine,
@@ -54,9 +55,9 @@ use crate::schema::{
 	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor,
 	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, migration_record_schema, read_key_schema, wpbc,
-	write_payload_schema,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
+	StreamFinalizationRequestMeta, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	migration_record_schema, read_key_schema, wpbc, write_payload_schema,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
 use crate::storage::manager::SlabManager;
@@ -268,6 +269,7 @@ impl ReplicaRouter for StaticReplicaRouter {
 pub struct WendelonDataServer {
 	slab: Arc<SlabManager>,
 	raft: WendelonRaft,
+	log_store: WendelonLogStore,
 	/// Shared SM handle. Needed so `read` can consult the E_safe
 	/// watermark for the epoch the client is asking against; also
 	/// hints the "current epoch" for write-side validation.
@@ -346,12 +348,15 @@ pub struct WendelonDataServer {
 pub const DEFAULT_PAGE_MAX_RECORDS: u32 = 1024;
 /// Default max arrow bytes per `RANGE_PAGE` response.
 pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
+/// Per-subscriber queue depth for committed finalization markers.
+pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
 		Self {
 			slab: self.slab.clone(),
 			raft: self.raft.clone(),
+			log_store: self.log_store.clone(),
 			state_machine: self.state_machine.clone(),
 			local_node: self.local_node,
 			clock: self.clock.clone(),
@@ -374,6 +379,7 @@ impl WendelonDataServer {
 	pub fn new(
 		slab: Arc<SlabManager>,
 		raft: WendelonRaft,
+		log_store: WendelonLogStore,
 		state_machine: WendelonStateMachine,
 		local_node: NodeId,
 		clock: Arc<dyn PhysicalClock>,
@@ -384,6 +390,7 @@ impl WendelonDataServer {
 		Self {
 			slab,
 			raft,
+			log_store,
 			state_machine,
 			local_node,
 			clock,
@@ -841,6 +848,63 @@ impl WendelonDataServer {
 			arrow_payload: None,
 			trailing,
 		}
+	}
+
+	fn decode_stream_finalization_request(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<StreamFinalizationRequestMeta> {
+		if frame.meta.len() < std::mem::size_of::<StreamFinalizationRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"STREAM_FIN_REQ meta too small",
+			));
+		}
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"STREAM_FIN_REQ must not carry arrow or trailing payloads",
+			));
+		}
+		Ok(*bytemuck::from_bytes(
+			&frame.meta[..std::mem::size_of::<StreamFinalizationRequestMeta>()],
+		))
+	}
+
+	async fn handle_stream_finalization_stream(
+		&self,
+		first_header: FrameHeader,
+		mut stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
+		let request = self.decode_stream_finalization_request(&frame)?;
+		let mut rx = self
+			.stream_finalization(request.start_log_index, request.epoch)
+			.await?;
+
+		while let Some(marker) = rx.recv().await {
+			let header = FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::STREAM_FIN_EVT.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: std::mem::size_of::<FinalizationMarker>() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			};
+			write_frame(
+				&mut *stream,
+				&header,
+				bytemuck::bytes_of(&marker),
+				None,
+				None,
+			)
+			.await?;
+		}
+
+		stream.finish().await?;
+		Ok(())
 	}
 
 	async fn handle_bulk_stream(
@@ -1668,6 +1732,10 @@ impl DataRingServer for WendelonDataServer {
 	) -> std::io::Result<()> {
 		match MsgType(first_header.msg_type) {
 			MsgType::BULK_WRITE_REQ => self.handle_bulk_stream(first_header, stream).await,
+			MsgType::STREAM_FIN_REQ => {
+				self.handle_stream_finalization_stream(first_header, stream)
+					.await
+			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
 				format!(
@@ -2020,10 +2088,79 @@ impl DataRing for WendelonDataServer {
 
 	async fn stream_finalization(
 		&self,
-		_start_log_index: u64,
-		_epoch: u64,
+		start_log_index: u64,
+		epoch: u64,
 	) -> std::io::Result<mpsc::Receiver<FinalizationMarker>> {
-		let (_tx, rx) = mpsc::channel(1);
+		let mut live = self.state_machine.subscribe_finalizations();
+		let applied_upto = self
+			.state_machine
+			.last_applied_log_index()
+			.await
+			.unwrap_or(start_log_index);
+		let replay = self
+			.log_store
+			.finalization_markers_after(start_log_index, applied_upto, epoch)
+			.await?;
+		let current_epoch = self
+			.state_machine
+			.state_snapshot()
+			.await
+			.e_safe_watermarks
+			.keys()
+			.copied()
+			.max()
+			.unwrap_or(0);
+		let (tx, rx) = mpsc::channel(STREAM_FINALIZATION_BUFFER);
+		tokio::spawn(async move {
+			let mut last_sent = start_log_index;
+			for marker in replay {
+				if marker.log_index <= last_sent {
+					continue;
+				}
+				if tx.try_send(marker).is_err() {
+					tracing::info!(
+						start_log_index,
+						epoch,
+						"stream_finalization subscriber dropped during replay backlog"
+					);
+					return;
+				}
+				last_sent = marker.log_index;
+			}
+
+			if epoch < current_epoch {
+				return;
+			}
+
+			loop {
+				match live.recv().await {
+					Ok(marker) if marker.epoch == epoch && marker.log_index > last_sent => {
+						if tx.try_send(marker).is_err() {
+							tracing::info!(
+								start_log_index,
+								epoch,
+								last_sent,
+								"stream_finalization subscriber dropped after backlog overflow"
+							);
+							break;
+						}
+						last_sent = marker.log_index;
+					}
+					Ok(_) => {}
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+						tracing::info!(
+							start_log_index,
+							epoch,
+							last_sent,
+							skipped,
+							"stream_finalization subscriber lagged and must reconnect"
+						);
+						break;
+					}
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+				}
+			}
+		});
 		Ok(rx)
 	}
 
@@ -4179,6 +4316,7 @@ mod tests {
 		let leader = Arc::new(WendelonDataServer::new(
 			leader_node.slab.clone(),
 			leader_node.raft.clone(),
+			leader_node.log_store.clone(),
 			leader_node.state_machine.clone(),
 			leader_id,
 			leader_node.clock.clone(),
@@ -4189,6 +4327,7 @@ mod tests {
 		let durable_replica = Arc::new(WendelonDataServer::new(
 			durable_node.slab.clone(),
 			durable_node.raft.clone(),
+			durable_node.log_store.clone(),
 			durable_node.state_machine.clone(),
 			durable_id,
 			durable_node.clock.clone(),
@@ -4488,6 +4627,7 @@ mod tests {
 		let dest_ds = Arc::new(WendelonDataServer::new(
 			dest_node.slab.clone(),
 			dest_node.raft.clone(),
+			dest_node.log_store.clone(),
 			dest_node.state_machine.clone(),
 			dest_id,
 			dest_node.clock.clone(),
@@ -4498,6 +4638,7 @@ mod tests {
 		let source_a_ds = Arc::new(WendelonDataServer::new(
 			source_a_node.slab.clone(),
 			source_a_node.raft.clone(),
+			source_a_node.log_store.clone(),
 			source_a_node.state_machine.clone(),
 			source_a_id,
 			source_a_node.clock.clone(),
@@ -4508,6 +4649,7 @@ mod tests {
 		let source_b_ds = Arc::new(WendelonDataServer::new(
 			source_b_node.slab.clone(),
 			source_b_node.raft.clone(),
+			source_b_node.log_store.clone(),
 			source_b_node.state_machine.clone(),
 			source_b_id,
 			source_b_node.clock.clone(),

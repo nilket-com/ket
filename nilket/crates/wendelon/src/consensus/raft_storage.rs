@@ -48,8 +48,8 @@ use crate::consensus::{
 	WendelonResponse, WendelonTypeConfig,
 };
 use crate::schema::{
-	HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, SnapshotHeader,
-	WALRecordHeader,
+	FinalizationMarker, HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed,
+	SnapshotHeader, WALRecordHeader,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoOp, IoRingHandle};
 use bytemuck::{Pod, Zeroable};
@@ -72,7 +72,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 
 /// Linux `O_DIRECT`. Repeated here rather than pulling `libc` in
 /// for a single constant — same value / same justification as in
@@ -88,6 +88,7 @@ const REC_SNAPSHOT_MARKER: u8 = 1;
 const REC_SNAPSHOT_INSTALL: u8 = 2;
 #[allow(dead_code)]
 const REC_CHECKPOINT: u8 = 3;
+const FINALIZATION_BROADCAST_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryCheckpoint {
@@ -310,6 +311,38 @@ impl WendelonLogStore {
 			)
 		};
 		WendelonStateMachine::from_recovery(snapshot, entries, checkpoint)
+	}
+
+	pub async fn finalization_markers_after(
+		&self,
+		start_log_index: u64,
+		end_log_index: u64,
+		epoch: u64,
+	) -> std::io::Result<Vec<FinalizationMarker>> {
+		if start_log_index >= end_log_index {
+			return Ok(Vec::new());
+		}
+
+		let guard = self.inner.read().await;
+		if let Some(last_purged) = guard.last_purged {
+			if start_log_index < last_purged.index {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"requested finalization floor {} predates retained log prefix {}",
+						start_log_index, last_purged.index
+					),
+				));
+			}
+		}
+
+		let markers = guard
+			.entries
+			.range((start_log_index.saturating_add(1))..=end_log_index)
+			.filter_map(|(_, entry)| canonical_finalization_marker(entry))
+			.filter(|marker| marker.epoch == epoch)
+			.collect();
+		Ok(markers)
 	}
 }
 
@@ -630,7 +663,7 @@ struct SmInner {
 /// lives behind an `Arc<RwLock<_>>` so the snapshot builder can
 /// take a read lock for a consistent view without blocking apply
 /// traffic longer than the postcard encode takes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WendelonStateMachine {
 	inner: Arc<RwLock<SmInner>>,
 	/// Optional callback fired every time a [`TieredSlab`] lands
@@ -639,13 +672,17 @@ pub struct WendelonStateMachine {
 	/// payload lives in L2. `None` is fine for tests or for
 	/// non-data nodes that never hold a `SlabManager`.
 	tier_observer: Option<Arc<dyn TierObserver>>,
+	/// Non-blocking live feed of committed finalization markers.
+	finalization_events: broadcast::Sender<FinalizationMarker>,
 }
 
 impl WendelonStateMachine {
 	pub fn new() -> Self {
+		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			tier_observer: None,
+			finalization_events,
 		}
 	}
 
@@ -654,6 +691,7 @@ impl WendelonStateMachine {
 		entries: Vec<Entry<WendelonTypeConfig>>,
 		checkpoint: Option<RecoveryCheckpoint>,
 	) -> std::io::Result<Self> {
+		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		let mut inner = SmInner::default();
 		let snapshot_boundary = if let Some(snapshot) = snapshot.clone() {
 			let (_, state) = decode_snapshot(&snapshot.data).map_err(|e| {
@@ -703,6 +741,7 @@ impl WendelonStateMachine {
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
 			tier_observer: None,
+			finalization_events,
 		})
 	}
 
@@ -715,11 +754,24 @@ impl WendelonStateMachine {
 		self
 	}
 
+	pub fn subscribe_finalizations(&self) -> broadcast::Receiver<FinalizationMarker> {
+		self.finalization_events.subscribe()
+	}
+
 	/// Test / caller inspection hook — return a cloned snapshot
 	/// of the applied state without driving a full snapshot
 	/// build round-trip.
 	pub async fn state_snapshot(&self) -> SmState {
 		self.inner.read().await.state.clone()
+	}
+
+	pub async fn last_applied_log_index(&self) -> Option<u64> {
+		self.inner
+			.read()
+			.await
+			.state
+			.last_applied_log_id
+			.map(|id| id.index)
 	}
 
 	/// Test-only hook to seed the E_safe watermark for an epoch
@@ -741,6 +793,12 @@ impl WendelonStateMachine {
 	pub async fn seed_migration_for_test(&self, entry: crate::consensus::MigrationLedgerEntry) {
 		let mut guard = self.inner.write().await;
 		guard.state.migrations.insert(entry.migration_id, entry);
+	}
+}
+
+impl Default for WendelonStateMachine {
+	fn default() -> Self {
+		Self::new()
 	}
 }
 
@@ -768,6 +826,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		// the L1 slab file) and must not block apply progress for
 		// other entries in the batch.
 		let mut pending_tier_events: Vec<TieredSlab> = Vec::new();
+		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
 		{
 			let mut guard = self.inner.write().await;
 			for entry in entries {
@@ -778,6 +837,9 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				});
 				if let Some(t) = tier {
 					pending_tier_events.push(t);
+				}
+				if let Some(marker) = canonical_finalization_marker(&entry) {
+					pending_finalizations.push(marker);
 				}
 				out.push(resp);
 			}
@@ -796,6 +858,9 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					);
 				}
 			}
+		}
+		for marker in pending_finalizations {
+			let _ = self.finalization_events.send(marker);
 		}
 		Ok(out)
 	}
@@ -861,6 +926,19 @@ fn apply_entry_to_state(
 			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
 			(WendelonResponse::Success, None)
 		}
+	}
+}
+
+fn canonical_finalization_marker(entry: &Entry<WendelonTypeConfig>) -> Option<FinalizationMarker> {
+	match &entry.payload {
+		EntryPayload::Normal(WendelonRequest::Finalize(marker)) => {
+			let mut marker = *marker;
+			marker.log_index = entry.log_id.index;
+			marker.term = entry.log_id.leader_id.term;
+			marker.e_safe_index = entry.log_id.index;
+			Some(marker)
+		}
+		_ => None,
 	}
 }
 

@@ -112,6 +112,7 @@ pub struct WendelonNode {
 	pub tracker: Arc<NodeTracker>,
 	pub clock: Arc<dyn PhysicalClock>,
 	pub raft: WendelonRaft,
+	pub log_store: WendelonLogStore,
 	pub state_machine: WendelonStateMachine,
 	pub ring: Arc<RingRouter>,
 	pub router: Arc<MsgRouter>,
@@ -236,7 +237,7 @@ impl WendelonNode {
 			cfg.node_id,
 			raft_config,
 			raft_network,
-			log_store,
+			log_store.clone(),
 			state_machine.clone(),
 		)
 		.await
@@ -283,6 +284,7 @@ impl WendelonNode {
 			WendelonDataServer::new(
 				slab.clone(),
 				raft.clone(),
+				log_store.clone(),
 				state_machine.clone(),
 				local_node,
 				clock.clone(),
@@ -355,6 +357,7 @@ impl WendelonNode {
 			tracker,
 			clock,
 			raft,
+			log_store,
 			state_machine,
 			ring,
 			router,

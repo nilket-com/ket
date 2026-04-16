@@ -141,7 +141,9 @@ impl HrftService for MsgRouter {
 		pool: Arc<BufPool>,
 	) -> std::io::Result<()> {
 		let header = read_frame_header(&mut *stream).await?;
-		if header.msg_type == MsgType::BULK_WRITE_REQ.0 {
+		if header.msg_type == MsgType::BULK_WRITE_REQ.0
+			|| header.msg_type == MsgType::STREAM_FIN_REQ.0
+		{
 			return match &self.data {
 				Some(h) => h.handle_data_stream(header, stream, pool).await,
 				None => Err(unhandled("Data Ring", header.msg_type)),

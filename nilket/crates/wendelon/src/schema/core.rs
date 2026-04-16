@@ -142,6 +142,30 @@ pub struct FinalizationMarker {
 }
 
 // ============================================================
+//  STREAM-FINALIZATION REQUEST — 16 bytes, fixed
+//
+//  Opens a long-lived HRFT bidi stream. The client sends exactly
+//  one `STREAM_FIN_REQ` carrying this meta, then the server pushes
+//  `STREAM_FIN_EVT` frames whose meta section is a
+//  [`FinalizationMarker`].
+//
+//  Resume semantics:
+//    `start_log_index` is an exclusive floor. Reconnect with the
+//    last fully received `FinalizationMarker.log_index` to resume
+//    without duplicates.
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct StreamFinalizationRequestMeta {
+	/// Exclusive replay floor. The first eligible marker has
+	/// `log_index > start_log_index`.
+	pub start_log_index: u64,
+	/// HashRaft epoch to subscribe within. Replay and live push
+	/// are both filtered to this epoch.
+	pub epoch: u64,
+}
+
+// ============================================================
 //  LEASE DESCRIPTOR — 144 bytes, fixed
 //
 //  Per-range leases (ADR 003 / plan 018) fence Stellarator writes
@@ -1020,6 +1044,7 @@ const _: () = assert!(std::mem::size_of::<NodeId>() == 8);
 const _: () = assert!(std::mem::size_of::<ClientWriteId>() == 32);
 const _: () = assert!(std::mem::size_of::<TransferToken>() == 128);
 const _: () = assert!(std::mem::size_of::<FinalizationMarker>() == 88);
+const _: () = assert!(std::mem::size_of::<StreamFinalizationRequestMeta>() == 16);
 const _: () = assert!(std::mem::size_of::<LeaseDescriptor>() == 144);
 const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
