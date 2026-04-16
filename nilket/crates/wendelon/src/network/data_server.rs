@@ -52,7 +52,8 @@ use crate::schema::{
 	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, migration_record_schema, wpbc,
+	WriteResponseMeta, WriteStatus, migration_record_schema, read_key_schema, wpbc,
+	write_payload_schema,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
 use crate::storage::manager::SlabManager;
@@ -707,6 +708,111 @@ impl WendelonDataServer {
 		Ok(HrftFrame {
 			header,
 			meta: body,
+			arrow_payload,
+			trailing: None,
+		})
+	}
+
+	async fn handle_write(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<WriteRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"WRITE_REQ meta too small",
+			));
+		}
+		let meta: WriteRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
+		let payload_bytes = frame
+			.arrow_payload
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "WRITE_REQ missing Arrow payload"))?;
+		let payload = decode_batch(payload_bytes)?;
+		validate_write_request_batch(&meta, &payload)?;
+
+		let (resp, trailing) = match self.write(meta, payload).await {
+			Ok(ok) => ok,
+			Err(_) => (
+				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
+				None,
+			),
+		};
+
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		let trailing = trailing.map(|marker| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec()
+				.extend_from_slice(bytemuck::bytes_of(&marker));
+			buf
+		});
+		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
+
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::WRITE_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		})
+	}
+
+	async fn handle_read(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<ReadRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"READ_REQ meta too small",
+			));
+		}
+		let meta: ReadRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReadRequestMeta>()]);
+		let key_bytes = frame
+			.arrow_payload
+			.as_ref()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "READ_REQ missing Arrow payload"))?;
+		let key = decode_batch(key_bytes)?;
+		validate_read_request_batch(&meta, &key)?;
+
+		let (resp, value_batch) = self.read(meta, key).await?;
+		let arrow_payload = value_batch.map(|batch| {
+			let bytes = encode_batch(&batch)?;
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(&bytes);
+			Ok::<_, std::io::Error>(buf)
+		});
+		let arrow_payload = match arrow_payload.transpose()? {
+			Some(buf) => Some(buf),
+			None => None,
+		};
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_payload
+					.as_ref()
+					.map(|buf| buf.len() as u32)
+					.unwrap_or(0),
+				trailing_len: 0,
+			},
+			meta: meta_buf,
 			arrow_payload,
 			trailing: None,
 		})
@@ -1388,6 +1494,8 @@ impl DataRingServer for WendelonDataServer {
 	async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		match msg_type {
+			MsgType::WRITE_REQ => self.handle_write(frame).await.map(Some),
+			MsgType::READ_REQ => self.handle_read(frame).await.map(Some),
 			MsgType::REPLICATE_REQ => self.handle_replicate(frame).await.map(Some),
 			MsgType::QUERY_REQ => self.handle_query(frame).await.map(Some),
 			MsgType::MIGRATE_REQ => self.handle_migrate(frame).await.map(Some),
@@ -1622,13 +1730,21 @@ impl DataRing for WendelonDataServer {
 		meta: ReadRequestMeta,
 		key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)> {
+		let sm = self.state_machine.state_snapshot().await;
+		let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+		if meta.expected_epoch < current_epoch {
+			return Ok((
+				error_read_response(&meta, ReadStatus::EPOCH_STALE, self.local_node),
+				None,
+			));
+		}
+
 		// 1. Consistency gate. LINEARIZABLE requires the local SM
 		// to have observed an E_safe advancement in this epoch at
 		// or beyond the client's min_hlc. SERIALIZABLE and STALE
 		// skip the gate — the former trusts the leader's commit
 		// frontier, the latter explicitly accepts stale data.
 		if meta.consistency == Consistency::LINEARIZABLE {
-			let sm = self.state_machine.state_snapshot().await;
 			let watermark = sm
 				.e_safe_watermarks
 				.get(&meta.expected_epoch)
@@ -2100,6 +2216,59 @@ fn error_read_response(
 		value_len: 0,
 		_pad2: [0; 4],
 	}
+}
+
+fn validate_write_request_batch(
+	meta: &WriteRequestMeta,
+	batch: &RecordBatch,
+) -> std::io::Result<()> {
+	if batch.schema().as_ref() != &write_payload_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"WRITE_REQ Arrow payload schema mismatch",
+		));
+	}
+	let key_len = extract_first_binary(batch, "key")?.len() as u32;
+	if key_len != meta.key_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"WRITE_REQ key_len mismatch: meta={} actual={}",
+				meta.key_len, key_len
+			),
+		));
+	}
+	let value_len = extract_first_binary(batch, "value")?.len() as u32;
+	if value_len != meta.value_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"WRITE_REQ value_len mismatch: meta={} actual={}",
+				meta.value_len, value_len
+			),
+		));
+	}
+	Ok(())
+}
+
+fn validate_read_request_batch(meta: &ReadRequestMeta, batch: &RecordBatch) -> std::io::Result<()> {
+	if batch.schema().as_ref() != &read_key_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"READ_REQ Arrow payload schema mismatch",
+		));
+	}
+	let key_len = extract_first_binary(batch, "key")?.len() as u32;
+	if key_len != meta.key_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"READ_REQ key_len mismatch: meta={} actual={}",
+				meta.key_len, key_len
+			),
+		));
+	}
+	Ok(())
 }
 
 // ============================================================
