@@ -51,7 +51,7 @@ pub struct WendelonRaftInternalServer {
 	/// inbound APPEND_ENTRIES_REQ feeds the leader's HLC (pulled
 	/// from any `Finalize` entries it carries) into the tracker —
 	/// so the drift monitor and eviction watchdog pick up
-	/// Raft-layer signal in addition to the data-plane.
+	/// Raft-layer signal in addition to the data-ring.
 	tracker: Option<Arc<NodeTracker>>,
 }
 

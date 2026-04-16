@@ -2,7 +2,7 @@
 //!
 //! This module hangs off the existing HRFT listener and
 //! [`MsgRouter`](crate::network::router::MsgRouter) demux rather than
-//! introducing a separate control-plane bind. It assumes callers are
+//! introducing a separate control-ring bind. It assumes callers are
 //! already cluster-internal and mTLS-authenticated at the transport
 //! layer; the handler here focuses on routing, wire compatibility, and
 //! leader-aware Control Ring behavior.

@@ -185,7 +185,7 @@ impl NodeTracker {
 	}
 
 	/// Convenience: extract the physical component of an [`HLC`] and
-	/// record it. The data-plane carries HLCs on every RPC, so this
+	/// record it. The data-ring carries HLCs on every RPC, so this
 	/// is the common ingestion path.
 	///
 	/// [`HLC`]: crate::schema::HybridTimestamp

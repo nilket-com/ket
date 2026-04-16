@@ -289,7 +289,7 @@ impl TransportConnection for LoopbackConnection {
 		let (client_side, server_side) = tokio::io::duplex(64 * 1024);
 		let service = self.service.clone();
 		let pool = self.pool.clone();
-		tokio::spawn(serve_one_frame(server_side, service, pool));
+		tokio::spawn(serve_stream(server_side, service, pool));
 		Ok(Box::new(DuplexTransportStream { inner: client_side }))
 	}
 
@@ -339,28 +339,8 @@ impl TransportProvider for LoopbackProvider {
 	}
 }
 
-async fn serve_one_frame(
-	mut stream: DuplexStream,
-	service: Arc<dyn HrftService>,
-	pool: Arc<BufPool>,
-) {
-	use tokio::io::AsyncWriteExt;
-
-	let frame = match read_frame(&mut stream, &pool).await {
-		Ok(frame) => frame,
-		Err(_) => return,
-	};
-	let response = match service.handle_frame(frame).await {
-		Ok(Some(frame)) => frame,
-		_ => return,
-	};
-	let _ = write_frame(
-		&mut stream,
-		&response.header,
-		&response.meta,
-		response.arrow_payload.as_deref(),
-		response.trailing.as_deref(),
-	)
-	.await;
-	let _ = stream.shutdown().await;
+async fn serve_stream(stream: DuplexStream, service: Arc<dyn HrftService>, pool: Arc<BufPool>) {
+	let _ = service
+		.handle_stream(Box::new(DuplexTransportStream { inner: stream }), pool)
+		.await;
 }

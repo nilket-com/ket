@@ -132,7 +132,7 @@ pub struct EpochConfig {
 	pub peers: BTreeMap<u32, EpochPeer>,
 }
 
-/// Committed control-plane transition from `ring(E)` to `ring(E+1)`.
+/// Committed control-ring transition from `ring(E)` to `ring(E+1)`.
 ///
 /// The Control Ring persists both sides of the boundary first, then
 /// computes and commits deterministic migration seeds afterward. That

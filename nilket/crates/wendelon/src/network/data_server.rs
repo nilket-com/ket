@@ -41,12 +41,15 @@ use crate::consensus::{
 	MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest, WendelonResponse,
 	WendelonStateMachine,
 };
-use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
+use crate::network::core::{
+	HRFT_MAGIC, read_frame, read_frame_from_header, read_frame_header, write_frame,
+};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
 use crate::network::transport::MembershipEpoch;
+use crate::network::transport::TransportStream;
 use crate::schema::{
 	Consistency, FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor,
 	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
@@ -70,7 +73,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::io::{Cursor, Error, ErrorKind};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -273,6 +276,9 @@ pub struct WendelonDataServer {
 	/// `leader_hint` and used to decide whether the local slab
 	/// append counts toward quorum on a given key.
 	local_node: NodeId,
+	/// Local physical clock used to merge client HLCs into the
+	/// leader's authoritative commit timestamp.
+	clock: Arc<dyn PhysicalClock>,
 	/// Resolves a `key_hash` to the replica set that should hold
 	/// it. Injected so the projection source (Unified Hash Ring
 	/// snapshot, static dev topology, test mock) is the caller's
@@ -289,7 +295,12 @@ pub struct WendelonDataServer {
 	pool: Arc<BufPool>,
 	/// Exactly-once cache. `WriteResponseMeta` is `Copy`, so
 	/// lookups are O(1) under DashMap's shard striping.
-	idempotency: DashMap<IdempotencyKey, WriteResponseMeta>,
+	idempotency: Arc<DashMap<IdempotencyKey, WriteResponseMeta>>,
+	/// Last HLC the leader assigned to a committed-or-inflight write.
+	/// Protects `max(local_hlc, client_hlc) + 1` across concurrent
+	/// write paths so bulk streams and unary writes share one
+	/// monotonic authority.
+	last_commit_hlc: Arc<Mutex<HybridTimestamp>>,
 	/// Optional liveness + drift tracker (ADR 001, ADR 012). When
 	/// populated, every inbound peer-to-peer RPC feeds the peer's
 	/// HLC physical component into it so the drift monitor and
@@ -324,10 +335,10 @@ pub struct WendelonDataServer {
 	/// regression can be exercised without seeding thousands of
 	/// records per source. `AtomicU32` so the test-only setter
 	/// can tune it after the server is wrapped in `Arc`.
-	page_max_records: std::sync::atomic::AtomicU32,
+	page_max_records: Arc<std::sync::atomic::AtomicU32>,
 	/// Max arrow payload bytes per `RANGE_PAGE` pull. Same rationale
 	/// as `page_max_records`.
-	page_max_bytes: std::sync::atomic::AtomicU32,
+	page_max_bytes: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Default max records a single `RANGE_PAGE` response can emit
@@ -336,12 +347,36 @@ pub const DEFAULT_PAGE_MAX_RECORDS: u32 = 1024;
 /// Default max arrow bytes per `RANGE_PAGE` response.
 pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
 
+impl Clone for WendelonDataServer {
+	fn clone(&self) -> Self {
+		Self {
+			slab: self.slab.clone(),
+			raft: self.raft.clone(),
+			state_machine: self.state_machine.clone(),
+			local_node: self.local_node,
+			clock: self.clock.clone(),
+			router: self.router.clone(),
+			factory: self.factory.clone(),
+			pool: self.pool.clone(),
+			idempotency: self.idempotency.clone(),
+			last_commit_hlc: self.last_commit_hlc.clone(),
+			tracker: self.tracker.clone(),
+			leases: self.leases.clone(),
+			lease_gate_enabled: self.lease_gate_enabled,
+			migration_registry: self.migration_registry.clone(),
+			page_max_records: self.page_max_records.clone(),
+			page_max_bytes: self.page_max_bytes.clone(),
+		}
+	}
+}
+
 impl WendelonDataServer {
 	pub fn new(
 		slab: Arc<SlabManager>,
 		raft: WendelonRaft,
 		state_machine: WendelonStateMachine,
 		local_node: NodeId,
+		clock: Arc<dyn PhysicalClock>,
 		router: Arc<dyn ReplicaRouter>,
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
@@ -351,16 +386,22 @@ impl WendelonDataServer {
 			raft,
 			state_machine,
 			local_node,
+			clock,
 			router,
 			factory,
 			pool,
-			idempotency: DashMap::new(),
+			idempotency: Arc::new(DashMap::new()),
+			last_commit_hlc: Arc::new(Mutex::new(HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: local_node.id,
+			})),
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
 			lease_gate_enabled: false,
 			migration_registry: Arc::new(MigrationRegistry::new()),
-			page_max_records: std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS),
-			page_max_bytes: std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES),
+			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
+			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
 		}
 	}
 
@@ -403,6 +444,35 @@ impl WendelonDataServer {
 	/// `Arc` without poking at private fields.
 	pub fn lease_cache(&self) -> Arc<RwLock<Vec<LeaseDescriptor>>> {
 		self.leases.clone()
+	}
+
+	fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
+		let now_hlc = HybridTimestamp {
+			physical_ms: self.clock.now_ms(),
+			logical: 0,
+			node_id: self.local_node.id,
+		};
+		let mut guard = self
+			.last_commit_hlc
+			.lock()
+			.expect("last_commit_hlc mutex poisoned");
+		let leader_hlc = (*guard).max(now_hlc);
+		let base = leader_hlc.max(client_hlc);
+		let merged = if base.logical == u32::MAX {
+			HybridTimestamp {
+				physical_ms: base.physical_ms.saturating_add(1),
+				logical: 0,
+				node_id: self.local_node.id,
+			}
+		} else {
+			HybridTimestamp {
+				physical_ms: base.physical_ms,
+				logical: base.logical + 1,
+				node_id: self.local_node.id,
+			}
+		};
+		*guard = merged;
+		merged
 	}
 
 	/// Test-only hook to seed a lease into the local cache without
@@ -713,30 +783,37 @@ impl WendelonDataServer {
 		})
 	}
 
-	async fn handle_write(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	fn decode_write_request_frame(
+		&self,
+		frame: &HrftFrame,
+		label: &'static str,
+	) -> std::io::Result<(WriteRequestMeta, RecordBatch)> {
 		if frame.meta.len() < std::mem::size_of::<WriteRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
-				"WRITE_REQ meta too small",
+				format!("{label} meta too small"),
 			));
 		}
 		let meta: WriteRequestMeta =
 			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
-		let payload_bytes = frame
-			.arrow_payload
-			.as_ref()
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "WRITE_REQ missing Arrow payload"))?;
+		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("{label} missing Arrow payload"),
+			)
+		})?;
 		let payload = decode_batch(payload_bytes)?;
 		validate_write_request_batch(&meta, &payload)?;
+		Ok((meta, payload))
+	}
 
-		let (resp, trailing) = match self.write(meta, payload).await {
-			Ok(ok) => ok,
-			Err(_) => (
-				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
-				None,
-			),
-		};
-
+	fn build_write_response_frame(
+		&self,
+		msg_type: MsgType,
+		stream_id: u32,
+		resp: WriteResponseMeta,
+		trailing: Option<FinalizationMarker>,
+	) -> HrftFrame {
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
 			.as_mut_vec()
@@ -749,13 +826,13 @@ impl WendelonDataServer {
 		});
 		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
 
-		Ok(HrftFrame {
+		HrftFrame {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
 				version: 1,
-				msg_type: MsgType::WRITE_RESP.0,
+				msg_type: msg_type.0,
 				flags: 0,
-				stream_id: frame.header.stream_id,
+				stream_id,
 				meta_len: meta_buf.len() as u32,
 				arrow_len: 0,
 				trailing_len,
@@ -763,7 +840,81 @@ impl WendelonDataServer {
 			meta: meta_buf,
 			arrow_payload: None,
 			trailing,
-		})
+		}
+	}
+
+	async fn handle_bulk_stream(
+		&self,
+		first_header: FrameHeader,
+		mut stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		let mut next_header = Some(first_header);
+		loop {
+			let header = if let Some(header) = next_header.take() {
+				header
+			} else {
+				match read_frame_header(&mut *stream).await {
+					Ok(header) => header,
+					Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
+					Err(e) => return Err(e),
+				}
+			};
+
+			if header.msg_type != MsgType::BULK_WRITE_REQ.0 {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"BULK_WRITE stream expected BULK_WRITE_REQ item, got msg_type=0x{:02x}",
+						header.msg_type
+					),
+				));
+			}
+
+			let frame = read_frame_from_header(&mut *stream, &self.pool, header).await?;
+			let (meta, payload) = self.decode_write_request_frame(&frame, "BULK_WRITE_REQ")?;
+			let (resp, trailing) = match self.write(meta, payload).await {
+				Ok(ok) => ok,
+				Err(_) => (
+					error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
+					None,
+				),
+			};
+			let response = self.build_write_response_frame(
+				MsgType::BULK_WRITE_RESP,
+				frame.header.stream_id,
+				resp,
+				trailing,
+			);
+			write_frame(
+				&mut *stream,
+				&response.header,
+				&response.meta,
+				response.arrow_payload.as_deref(),
+				response.trailing.as_deref(),
+			)
+			.await?;
+		}
+
+		stream.finish().await?;
+		Ok(())
+	}
+
+	async fn handle_write(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		let (meta, payload) = self.decode_write_request_frame(&frame, "WRITE_REQ")?;
+
+		let (resp, trailing) = match self.write(meta, payload).await {
+			Ok(ok) => ok,
+			Err(_) => (
+				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
+				None,
+			),
+		};
+		Ok(self.build_write_response_frame(
+			MsgType::WRITE_RESP,
+			frame.header.stream_id,
+			resp,
+			trailing,
+		))
 	}
 
 	async fn handle_read(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
@@ -1508,6 +1659,24 @@ impl DataRingServer for WendelonDataServer {
 			)),
 		}
 	}
+
+	async fn handle_data_stream(
+		&self,
+		first_header: FrameHeader,
+		stream: Box<dyn TransportStream>,
+		_pool: Arc<BufPool>,
+	) -> std::io::Result<()> {
+		match MsgType(first_header.msg_type) {
+			MsgType::BULK_WRITE_REQ => self.handle_bulk_stream(first_header, stream).await,
+			other => Err(Error::new(
+				ErrorKind::Unsupported,
+				format!(
+					"Data Ring stream handler has no decoder for msg_type=0x{:02x}",
+					other.0
+				),
+			)),
+		}
+	}
 }
 
 #[async_trait]
@@ -1585,10 +1754,10 @@ impl DataRing for WendelonDataServer {
 		let frame_bytes = Arc::new(encode_batch(&payload)?);
 		let payload_hash = blake3_32(frame_bytes.as_slice());
 
-		// 6. HLC for this write. The real impl merges `leader_hlc`
-		// with `meta.client_hlc` and bumps logical; V1 carries the
-		// client HLC straight through.
-		let commit_hlc = meta.client_hlc;
+		// 6. HLC for this write. The leader is authoritative: it
+		// merges the client's timestamp with its own monotonic HLC
+		// view and stamps `max(leader_hlc, client_hlc) + 1`.
+		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
 
 		// 7. Resolve the replica set. An empty set is a
 		// configuration bug — refuse rather than silently dropping
@@ -1860,9 +2029,21 @@ impl DataRing for WendelonDataServer {
 
 	async fn bulk_write(
 		&self,
-		_requests: mpsc::Receiver<(WriteRequestMeta, RecordBatch)>,
+		mut requests: mpsc::Receiver<(WriteRequestMeta, RecordBatch)>,
 	) -> std::io::Result<mpsc::Receiver<WriteResponseMeta>> {
-		let (_tx, rx) = mpsc::channel(1);
+		let server = self.clone();
+		let (tx, rx) = mpsc::channel(16);
+		tokio::spawn(async move {
+			while let Some((meta, payload)) = requests.recv().await {
+				let response = match server.write(meta, payload).await {
+					Ok((resp, _)) => resp,
+					Err(_) => error_response(&meta, WriteStatus::INTERNAL_ERROR, server.local_node),
+				};
+				if tx.send(response).await.is_err() {
+					break;
+				}
+			}
+		});
 		Ok(rx)
 	}
 }
@@ -4000,6 +4181,7 @@ mod tests {
 			leader_node.raft.clone(),
 			leader_node.state_machine.clone(),
 			leader_id,
+			leader_node.clock.clone(),
 			router.clone(),
 			build_factory(),
 			pool.clone(),
@@ -4009,6 +4191,7 @@ mod tests {
 			durable_node.raft.clone(),
 			durable_node.state_machine.clone(),
 			durable_id,
+			durable_node.clock.clone(),
 			router,
 			build_factory(),
 			durable_node.pool.clone(),
@@ -4307,6 +4490,7 @@ mod tests {
 			dest_node.raft.clone(),
 			dest_node.state_machine.clone(),
 			dest_id,
+			dest_node.clock.clone(),
 			router.clone(),
 			dest_factory,
 			pool.clone(),
@@ -4316,6 +4500,7 @@ mod tests {
 			source_a_node.raft.clone(),
 			source_a_node.state_machine.clone(),
 			source_a_id,
+			source_a_node.clock.clone(),
 			router.clone(),
 			source_a_factory,
 			source_a_node.pool.clone(),
@@ -4325,6 +4510,7 @@ mod tests {
 			source_b_node.raft.clone(),
 			source_b_node.state_machine.clone(),
 			source_b_id,
+			source_b_node.clock.clone(),
 			router,
 			source_b_factory,
 			source_b_node.pool.clone(),

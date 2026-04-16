@@ -89,7 +89,7 @@ pub struct ClusterPeerWire {
 	pub tier_bits: u8,
 	/// Raw [`NodeRoleSet`] bitmask (ADR 002). Absent on the wire —
 	/// and defaulted to 0 on deserialize — for backwards
-	/// compatibility with older control-plane endpoints that have
+	/// compatibility with older control-ring endpoints that have
 	/// not been upgraded yet; such peers are effectively invisible
 	/// to the Unified Hash Ring until they re-publish with roles.
 	#[serde(default)]

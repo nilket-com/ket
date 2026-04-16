@@ -18,21 +18,24 @@
 //!    the resulting `quinn::Connection` in a
 //!    [`QuicTransportConnection`], and hands it to
 //!    [`handle_connection`] as `Arc<dyn TransportConnection>`.
-//! 3. [`handle_connection`] drains `accept_bi()` calls. Each bidi
-//!    stream is one logical RPC: client sends one [`HrftFrame`],
-//!    server replies with zero or one frame.
-//! 4. The frame is parsed with [`read_frame`] and routed through
-//!    [`HrftService::handle_frame`]. If the service returns a
-//!    response frame, [`write_frame`] sends it, then the stream's
-//!    `finish` cleanly signals end-of-response.
+//! 3. [`handle_connection`] drains `accept_bi()` calls. Most bidi
+//!    streams are one logical RPC: client sends one [`HrftFrame`],
+//!    server replies with zero or one frame. Bulk client-streaming
+//!    RPCs override this via [`HrftService::handle_stream`] and
+//!    exchange multiple frames on the same stream.
+//! 4. Unary streams are parsed with [`read_frame`] and routed
+//!    through [`HrftService::handle_frame`]. If the service
+//!    returns a response frame, [`write_frame`] sends it, then
+//!    the stream's `finish` cleanly signals end-of-response.
 //!
-//! ## Why one frame per stream
+//! ## Why one frame per stream by default
 //!
 //! QUIC bidi streams are cheap; a new stream per RPC gives free
 //! per-request isolation (one slow handler does not block others)
 //! and avoids needing an application-level correlation id. Bulk
-//! streams that carry many frames (e.g. `STREAM_FIN_EVT`
-//! subscriptions) will get their own dedicated stream kind later.
+//! streams that carry many frames (for example
+//! `BULK_WRITE_REQ`) opt into a dedicated handler without forcing
+//! the rest of the protocol off the simpler unary path.
 //!
 //! ## Per-stream peer identity
 //!
@@ -78,6 +81,36 @@ use std::sync::Arc;
 #[async_trait]
 pub trait HrftService: Send + Sync + 'static {
 	async fn handle_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+
+	/// Per-stream entry point. The default implementation keeps the
+	/// unary "one frame in, at most one frame out" behavior; routers
+	/// can override it for client-streaming RPCs such as bulk write.
+	async fn handle_stream(
+		&self,
+		mut stream: Box<dyn TransportStream>,
+		pool: Arc<BufPool>,
+	) -> std::io::Result<()> {
+		let frame = read_frame(&mut *stream, &pool).await?;
+
+		match self.handle_frame(frame).await? {
+			Some(resp) => {
+				write_frame(
+					&mut *stream,
+					&resp.header,
+					&resp.meta,
+					resp.arrow_payload.as_deref(),
+					resp.trailing.as_deref(),
+				)
+				.await?;
+				stream.finish().await?;
+			}
+			None => {
+				stream.finish().await?;
+			}
+		}
+
+		Ok(())
+	}
 }
 
 // ============================================================
@@ -178,32 +211,11 @@ async fn handle_connection<S: HrftService>(
 // ============================================================
 
 async fn handle_stream<S: HrftService>(
-	mut stream: Box<dyn TransportStream>,
+	stream: Box<dyn TransportStream>,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
 ) -> std::io::Result<()> {
-	let frame = read_frame(&mut *stream, &pool).await?;
-
-	match service.handle_frame(frame).await? {
-		Some(resp) => {
-			write_frame(
-				&mut *stream,
-				&resp.header,
-				&resp.meta,
-				resp.arrow_payload.as_deref(),
-				resp.trailing.as_deref(),
-			)
-			.await?;
-			stream.finish().await?;
-		}
-		None => {
-			// Fire-and-forget: close the send side with zero bytes
-			// so the client's `read_to_end` returns promptly.
-			stream.finish().await?;
-		}
-	}
-
-	Ok(())
+	service.handle_stream(stream, pool).await
 }
 
 // ============================================================

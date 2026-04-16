@@ -285,7 +285,11 @@ impl MsgType {
 	pub const WRITE_RESP: Self = Self(0x02);
 	pub const READ_REQ: Self = Self(0x03);
 	pub const READ_RESP: Self = Self(0x04);
-	pub const BULK_WRITE_REQ: Self = Self(0x05); // Arrow has multiple rows
+	// Client-streaming bulk write. One bidi stream carries many
+	// `BULK_WRITE_REQ` item frames, each with the same fixed
+	// `WriteRequestMeta` + Arrow payload shape as `WRITE_REQ`.
+	// The server replies with one `BULK_WRITE_RESP` per item.
+	pub const BULK_WRITE_REQ: Self = Self(0x05);
 	pub const BULK_WRITE_RESP: Self = Self(0x06);
 	pub const STREAM_FIN_REQ: Self = Self(0x07); // StreamFinalization subscribe
 	pub const STREAM_FIN_EVT: Self = Self(0x08); // FinalizationMarker push

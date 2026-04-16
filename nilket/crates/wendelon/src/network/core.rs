@@ -52,6 +52,19 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
 	reader: &mut R,
 	pool: &Arc<BufPool>,
 ) -> std::io::Result<HrftFrame> {
+	let header = read_frame_header(reader).await?;
+	read_frame_from_header(reader, pool, header).await
+}
+
+/// Reads and validates just the fixed-size HRFT header.
+///
+/// Callers that need to decide how to consume the rest of the
+/// stream (for example, bulk client-streaming RPCs) can peek the
+/// message type first and then hand the validated header to
+/// [`read_frame_from_header`] to finish the frame.
+pub async fn read_frame_header<R: AsyncRead + Unpin + ?Sized>(
+	reader: &mut R,
+) -> std::io::Result<FrameHeader> {
 	let mut header_buf = [0u8; std::mem::size_of::<FrameHeader>()];
 	reader.read_exact(&mut header_buf).await?;
 
@@ -65,7 +78,16 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
 	check_section_len("meta", header.meta_len)?;
 	check_section_len("arrow", header.arrow_len)?;
 	check_section_len("trailing", header.trailing_len)?;
+	Ok(*header)
+}
 
+/// Reads the variable-size frame sections after `header` has
+/// already been validated by [`read_frame_header`].
+pub async fn read_frame_from_header<R: AsyncRead + Unpin + ?Sized>(
+	reader: &mut R,
+	pool: &Arc<BufPool>,
+	header: FrameHeader,
+) -> std::io::Result<HrftFrame> {
 	let meta = read_section(reader, pool, header.meta_len).await?.expect(
 		"meta section always present (read_section returns Some for any len, \
          including zero, when the section is required)",
@@ -82,7 +104,7 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(
 	};
 
 	Ok(HrftFrame {
-		header: *header,
+		header,
 		meta,
 		arrow_payload,
 		trailing,

@@ -147,7 +147,7 @@ impl RingState {
 	}
 
 	/// Replica set resolution. See [`ReplicaRouter::replicas`] for
-	/// the contract — this is the data-plane implementation.
+	/// the contract — this is the data-ring implementation.
 	fn replicas_for(&self, key_hash: u64) -> Vec<NodeId> {
 		if self.positions.is_empty() || self.data_count == 0 {
 			return Vec::new();

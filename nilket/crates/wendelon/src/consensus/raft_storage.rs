@@ -557,7 +557,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 pub struct SmState {
 	pub last_applied_log_id: Option<LogId<u32>>,
 	pub last_membership: StoredMembership<u32, BasicNode>,
-	/// Durable control-plane epoch history. The latest committed
+	/// Durable control-ring epoch history. The latest committed
 	/// entry may be ahead of the externally visible watch epoch
 	/// while auto-seeding is still reconciling the Migration
 	/// Ledger after the config commit.

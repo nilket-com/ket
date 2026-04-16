@@ -32,8 +32,11 @@
 //! right metadata struct. Making the trait per-RPC would push that
 //! decode into the router and defeat the isolation.
 
-use crate::network::core::HrftFrame;
+use crate::network::core::{HrftFrame, read_frame_from_header, read_frame_header, write_frame};
+use crate::network::pool::BufPool;
 use crate::network::server::HrftService;
+use crate::network::transport::TransportStream;
+use crate::schema::{FrameHeader, MsgType};
 use async_trait::async_trait;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -46,6 +49,35 @@ use std::sync::Arc;
 #[async_trait]
 pub trait DataRingServer: Send + Sync + 'static {
 	async fn handle_data_frame(&self, frame: HrftFrame) -> std::io::Result<Option<HrftFrame>>;
+
+	/// Optional client-streaming entry point. The default keeps the
+	/// unary "read one frame, write at most one frame" behavior so
+	/// implementors only need to override it for true streaming RPCs.
+	async fn handle_data_stream(
+		&self,
+		first_header: FrameHeader,
+		mut stream: Box<dyn TransportStream>,
+		pool: Arc<BufPool>,
+	) -> std::io::Result<()> {
+		let frame = read_frame_from_header(&mut *stream, &pool, first_header).await?;
+		match self.handle_data_frame(frame).await? {
+			Some(resp) => {
+				write_frame(
+					&mut *stream,
+					&resp.header,
+					&resp.meta,
+					resp.arrow_payload.as_deref(),
+					resp.trailing.as_deref(),
+				)
+				.await?;
+				stream.finish().await?;
+			}
+			None => {
+				stream.finish().await?;
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Handler for Control Ring frames: `msg_type` in `0x10..=0x1F`.
@@ -101,6 +133,39 @@ impl HrftService for MsgRouter {
 				format!("unknown HRFT msg_type=0x{:02x}", msg_type),
 			)),
 		}
+	}
+
+	async fn handle_stream(
+		&self,
+		mut stream: Box<dyn TransportStream>,
+		pool: Arc<BufPool>,
+	) -> std::io::Result<()> {
+		let header = read_frame_header(&mut *stream).await?;
+		if header.msg_type == MsgType::BULK_WRITE_REQ.0 {
+			return match &self.data {
+				Some(h) => h.handle_data_stream(header, stream, pool).await,
+				None => Err(unhandled("Data Ring", header.msg_type)),
+			};
+		}
+
+		let frame = read_frame_from_header(&mut *stream, &pool, header).await?;
+		match self.handle_frame(frame).await? {
+			Some(resp) => {
+				write_frame(
+					&mut *stream,
+					&resp.header,
+					&resp.meta,
+					resp.arrow_payload.as_deref(),
+					resp.trailing.as_deref(),
+				)
+				.await?;
+				stream.finish().await?;
+			}
+			None => {
+				stream.finish().await?;
+			}
+		}
+		Ok(())
 	}
 }
 

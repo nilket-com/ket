@@ -187,7 +187,7 @@ impl WendelonNode {
 		let seed_epoch = select_bootstrap_epoch(&recovered_state, &fallback_epoch, cfg.rf)?;
 		let (epoch_tx, epoch_rx) = watch::channel(Arc::new(seed_epoch));
 
-		// 6. Liveness tracker shared by the data-plane, the Raft
+		// 6. Liveness tracker shared by the data-ring, the Raft
 		//    internal server, the drift monitor, and the eviction
 		//    watchdog.
 		let clock: Arc<dyn PhysicalClock> = Arc::new(SystemClock);
@@ -276,7 +276,7 @@ impl WendelonNode {
 
 		// 13. Data Ring + Raft Internal Ring servers. Both observe
 		//     inbound HLCs into the shared tracker so the drift
-		//     monitor sees Raft-layer and data-plane signal. The
+		//     monitor sees Raft-layer and data-ring signal. The
 		//     lease gate is flipped on after the manager tick has
 		//     had a chance to file its first grant (step 15).
 		let data_server = Arc::new(
@@ -285,6 +285,7 @@ impl WendelonNode {
 				raft.clone(),
 				state_machine.clone(),
 				local_node,
+				clock.clone(),
 				ring.clone(),
 				factory.clone(),
 				pool.clone(),
@@ -397,6 +398,14 @@ async fn serve_dyn(
 			frame: crate::network::core::HrftFrame,
 		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
 			self.0.handle_frame(frame).await
+		}
+
+		async fn handle_stream(
+			&self,
+			stream: Box<dyn crate::network::transport::TransportStream>,
+			pool: Arc<BufPool>,
+		) -> std::io::Result<()> {
+			self.0.handle_stream(stream, pool).await
 		}
 	}
 	serve(endpoint, Arc::new(DynService(service)), pool).await
