@@ -697,9 +697,17 @@ impl WendelonNode {
 	}
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
-		self.lifecycle.begin_drain();
-		self.lifecycle.wait_for_quiescence().await;
-		self.handles.shutdown().await
+		let lifecycle = self.lifecycle;
+		let handles = self.handles;
+		lifecycle.begin_drain();
+		// Stop internal maintenance loops before waiting for
+		// quiescence. Otherwise a background lease renewal or
+		// migration commit can keep generating in-flight Control
+		// Ring work while shutdown is waiting for the surface to
+		// drain, especially after a peer has already left.
+		handles.abort();
+		lifecycle.wait_for_quiescence().await;
+		handles.shutdown().await
 	}
 }
 

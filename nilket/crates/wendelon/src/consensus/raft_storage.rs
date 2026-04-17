@@ -70,7 +70,7 @@ use std::io::{Cursor, Error, ErrorKind};
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
@@ -89,6 +89,7 @@ const REC_SNAPSHOT_INSTALL: u8 = 2;
 #[allow(dead_code)]
 const REC_CHECKPOINT: u8 = 3;
 const FINALIZATION_BROADCAST_CAPACITY: usize = 1024;
+const CONTROL_RING_BACKUP_FORMAT_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryCheckpoint {
@@ -110,6 +111,38 @@ impl DurableBootstrapMode {
 			Self::FreshBootstrap
 		}
 	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRingBackupManifest {
+	pub format_version: u16,
+	pub last_applied_log_id: Option<LogId<u32>>,
+	pub voter_ids: Vec<u32>,
+	pub lease_count: u64,
+	pub tiered_slab_count: u64,
+	pub migration_count: u64,
+	pub wal_bytes: u64,
+	pub vote_bytes: u64,
+	pub snapshot_bytes: u64,
+	pub state_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRingBackupImage {
+	pub manifest: ControlRingBackupManifest,
+	#[serde(with = "serde_bytes")]
+	pub wal: Vec<u8>,
+	#[serde(with = "serde_bytes")]
+	pub vote: Vec<u8>,
+	#[serde(with = "serde_bytes")]
+	pub snapshot: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ControlArtifactPaths {
+	wal: PathBuf,
+	vote: PathBuf,
+	snapshot: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -167,6 +200,9 @@ struct LogStoreInner {
 	/// Cached vote. Written to `vote_fd` on `save_vote`; surfaced
 	/// verbatim by `read_vote`.
 	vote: Option<Vote<u32>>,
+	/// Filesystem paths for the durable Control Ring artifacts.
+	/// Absent for the in-memory test store.
+	artifact_paths: Option<ControlArtifactPaths>,
 	/// Snapshot loaded during durable recovery, if present.
 	recovered_snapshot: Option<HeldSnapshot>,
 	/// Recovered checkpoint counters from the WAL.
@@ -215,6 +251,7 @@ impl WendelonLogStore {
 				last_log_id: None,
 				last_purged: None,
 				vote: None,
+				artifact_paths: None,
 				recovered_snapshot: None,
 				recovery_checkpoint: None,
 				bootstrap_mode: DurableBootstrapMode::FreshBootstrap,
@@ -248,6 +285,11 @@ impl WendelonLogStore {
 		let wal_path = wal_path.as_ref();
 		let vote_path = vote_path.as_ref();
 		let snapshot_path = snapshot_path.as_ref();
+		let artifact_paths = ControlArtifactPaths {
+			wal: wal_path.to_path_buf(),
+			vote: vote_path.to_path_buf(),
+			snapshot: snapshot_path.to_path_buf(),
+		};
 
 		let artifacts = inspect_artifacts(wal_path, vote_path, snapshot_path)?;
 		let bootstrap_mode = DurableBootstrapMode::from_artifacts(artifacts.any());
@@ -279,6 +321,7 @@ impl WendelonLogStore {
 				last_log_id: replay.last_log_id,
 				last_purged: replay.last_purged,
 				vote,
+				artifact_paths: Some(artifact_paths),
 				recovered_snapshot: snapshot.map(|s| s.held),
 				recovery_checkpoint: replay.checkpoint,
 				bootstrap_mode,
@@ -311,6 +354,91 @@ impl WendelonLogStore {
 			)
 		};
 		WendelonStateMachine::from_recovery(snapshot, entries, checkpoint)
+	}
+
+	pub async fn export_backup(
+		&self,
+		state_machine: &WendelonStateMachine,
+	) -> std::io::Result<ControlRingBackupImage> {
+		let artifact_paths = self
+			.inner
+			.read()
+			.await
+			.artifact_paths
+			.clone()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::Unsupported,
+					"cannot export a backup from the in-memory Control Ring store",
+				)
+			})?;
+		let wal = read_optional_artifact(&artifact_paths.wal)?;
+		let vote = read_optional_artifact(&artifact_paths.vote)?;
+		let snapshot = read_optional_artifact(&artifact_paths.snapshot)?;
+		if wal.is_empty() && snapshot.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"backup requires at least one Control Ring recovery artifact",
+			));
+		}
+
+		let state = state_machine.state_snapshot().await;
+		let encoded_state = encode_snapshot(&state)
+			.map_err(|err| Error::other(format!("encode backup state snapshot: {err}")))?;
+		let mut voter_ids: Vec<u32> = state.last_membership.voter_ids().collect();
+		voter_ids.sort_unstable();
+
+		Ok(ControlRingBackupImage {
+			manifest: ControlRingBackupManifest {
+				format_version: CONTROL_RING_BACKUP_FORMAT_VERSION,
+				last_applied_log_id: state.last_applied_log_id,
+				voter_ids,
+				lease_count: state.leases.len() as u64,
+				tiered_slab_count: state.tiered_slabs.len() as u64,
+				migration_count: state.migrations.len() as u64,
+				wal_bytes: wal.len() as u64,
+				vote_bytes: vote.len() as u64,
+				snapshot_bytes: snapshot.len() as u64,
+				state_hash: blake3_32(&encoded_state),
+			},
+			wal,
+			vote,
+			snapshot,
+		})
+	}
+
+	pub fn restore_backup(
+		backup: &ControlRingBackupImage,
+		target_dir: impl AsRef<Path>,
+	) -> std::io::Result<()> {
+		let target_dir = target_dir.as_ref();
+		if !target_dir.is_dir() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"Control Ring restore target directory does not exist: {}",
+					target_dir.display()
+				),
+			));
+		}
+		if backup.wal.is_empty() && backup.snapshot.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"backup image does not contain any Control Ring recovery artifact",
+			));
+		}
+
+		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(target_dir);
+		ensure_artifact_absent(&wal_path)?;
+		ensure_artifact_absent(&vote_path)?;
+		ensure_artifact_absent(&snapshot_path)?;
+
+		std::fs::write(&wal_path, &backup.wal)?;
+		std::fs::write(&vote_path, &backup.vote)?;
+		if !backup.snapshot.is_empty() {
+			std::fs::write(&snapshot_path, &backup.snapshot)?;
+		}
+		Ok(())
 	}
 
 	pub async fn finalization_markers_after(
@@ -1330,6 +1458,32 @@ fn load_snapshot_artifact(snapshot_path: &Path) -> std::io::Result<Option<Loaded
 			data: bytes,
 		},
 	}))
+}
+
+fn control_artifact_paths(data_dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+	(
+		data_dir.join("control.wal"),
+		data_dir.join("vote.wnd"),
+		data_dir.join("snapshot.wnd"),
+	)
+}
+
+fn ensure_artifact_absent(path: &Path) -> std::io::Result<()> {
+	if path.exists() {
+		return Err(Error::new(
+			ErrorKind::AlreadyExists,
+			format!("restore target already contains {}", path.display()),
+		));
+	}
+	Ok(())
+}
+
+fn read_optional_artifact(path: &Path) -> std::io::Result<Vec<u8>> {
+	match std::fs::read(path) {
+		Ok(bytes) => Ok(bytes),
+		Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+		Err(err) => Err(err),
+	}
 }
 
 fn replay_wal(wal_path: &Path, snapshot: Option<&LoadedSnapshot>) -> std::io::Result<WALReplay> {

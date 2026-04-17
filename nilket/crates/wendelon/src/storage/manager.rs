@@ -51,6 +51,7 @@ use crate::storage::l2::ObjectStore;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+
+const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
@@ -138,11 +141,35 @@ pub enum MigrationIngestOutcome {
 /// A slab that has been uploaded to L2. The manager tracks this
 /// so subsequent reads pivot to the object store instead of the
 /// now-unlinked L1 file.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TieredSlabPointer {
 	pub slab_id: u64,
 	pub l2_uri: String,
 	pub payload_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalSlabBackup {
+	pub slab_id: u64,
+	#[serde(with = "serde_bytes")]
+	pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBackupManifest {
+	pub format_version: u16,
+	pub active_slab_id: u64,
+	pub next_slab_id: u64,
+	pub sealed_slab_ids: Vec<u64>,
+	pub local_slab_bytes: u64,
+	pub tiered_slabs: Vec<TieredSlabPointer>,
+	pub omitted_rehydrated_slabs: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBackupImage {
+	pub manifest: StorageBackupManifest,
+	pub local_slabs: Vec<LocalSlabBackup>,
 }
 
 /// Outcome of one tombstone-aware reclaim pass.
@@ -472,6 +499,126 @@ impl SlabManager {
 		// relevant for the `io_uring` append / lookup path.
 		let path = slab_path(&self.config.dir, slab_id);
 		std::fs::read(path)
+	}
+
+	/// Export the authoritative local slab set as a backup image.
+	///
+	/// The image includes the active slab and every sealed slab.
+	/// Rehydrated cache copies are intentionally excluded because
+	/// L2 remains authoritative for those slabs; the manifest
+	/// records them as omitted assumptions instead.
+	pub async fn export_backup(&self) -> std::io::Result<StorageBackupImage> {
+		self.fsync_all_local_slabs().await?;
+
+		let (active_slab_id, next_slab_id, sealed_slab_ids, tiered_slabs, omitted) = {
+			let state = self.state.lock().await;
+			let mut sealed_slab_ids = state
+				.sealed
+				.iter()
+				.map(|entry| *entry.key())
+				.collect::<Vec<_>>();
+			let mut tiered_slabs = state
+				.tiered
+				.iter()
+				.map(|entry| entry.value().clone())
+				.collect::<Vec<_>>();
+			let mut omitted = state
+				.rehydrated
+				.iter()
+				.map(|entry| *entry.key())
+				.collect::<Vec<_>>();
+			sealed_slab_ids.sort_unstable();
+			tiered_slabs.sort_by_key(|pointer| pointer.slab_id);
+			omitted.sort_unstable();
+			(
+				state.active.slab_id(),
+				state.next_slab_id,
+				sealed_slab_ids,
+				tiered_slabs,
+				omitted,
+			)
+		};
+
+		let mut local_slab_ids = Vec::with_capacity(1 + sealed_slab_ids.len());
+		local_slab_ids.push(active_slab_id);
+		local_slab_ids.extend(sealed_slab_ids.iter().copied());
+		local_slab_ids.sort_unstable();
+
+		let mut local_slab_bytes = 0_u64;
+		let mut local_slabs = Vec::with_capacity(local_slab_ids.len());
+		for slab_id in local_slab_ids {
+			let bytes = std::fs::read(slab_path(&self.config.dir, slab_id))?;
+			local_slab_bytes = local_slab_bytes.saturating_add(bytes.len() as u64);
+			local_slabs.push(LocalSlabBackup { slab_id, bytes });
+		}
+
+		Ok(StorageBackupImage {
+			manifest: StorageBackupManifest {
+				format_version: STORAGE_BACKUP_FORMAT_VERSION,
+				active_slab_id,
+				next_slab_id,
+				sealed_slab_ids,
+				local_slab_bytes,
+				tiered_slabs,
+				omitted_rehydrated_slabs: omitted,
+			},
+			local_slabs,
+		})
+	}
+
+	/// Restore a backup image into an empty slab directory.
+	///
+	/// The caller is responsible for opening a new [`SlabManager`]
+	/// against the target after the files have been materialized.
+	pub fn restore_backup(
+		backup: &StorageBackupImage,
+		dir: impl AsRef<Path>,
+	) -> std::io::Result<()> {
+		let dir = dir.as_ref();
+		if !dir.is_dir() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!("storage restore target does not exist: {}", dir.display()),
+			));
+		}
+		if !discover_slab_ids(dir)?.is_empty() {
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("storage restore target is not empty: {}", dir.display()),
+			));
+		}
+
+		let mut seen = HashSet::new();
+		for slab in &backup.local_slabs {
+			if !seen.insert(slab.slab_id) {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!("backup contains duplicate slab {}", slab.slab_id),
+				));
+			}
+			std::fs::write(slab_path(dir, slab.slab_id), &slab.bytes)?;
+		}
+		if !seen.contains(&backup.manifest.active_slab_id) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"backup active_slab_id {} is missing from the local slab set",
+					backup.manifest.active_slab_id
+				),
+			));
+		}
+		for pointer in &backup.manifest.tiered_slabs {
+			if seen.contains(&pointer.slab_id) {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"backup slab {} is marked tiered and local at the same time",
+						pointer.slab_id
+					),
+				));
+			}
+		}
+		Ok(())
 	}
 
 	/// Move a slab's backing from the sealed L1 set to the tiered

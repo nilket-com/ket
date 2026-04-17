@@ -1,15 +1,53 @@
-# Backup, DR, and Legal Hold
+# Backup And DR
 
-While Wendelon achieves durability via replication and Tiered Storage, enterprise environments require explicit Disaster Recovery mechanisms.
+## Baseline Unit
 
-## 1. L2 as the Ultimate Backup
-- Because cold data naturally migrates to L2 (Object Storage) via the Background Sweeper, S3/GCS effectively acts as a continuous, native backup.
-- **Cross-Region Replication:** Bucket-level replication (e.g., AWS CRR) handles catastrophic regional failures without Wendelon's active involvement.
+The baseline backup unit is a full node image rooted at one data directory:
 
-## 2. Raft WAL Shipping
-- The Control Ring's WAL (containing epoch transitions, namespaces, and schema registries) must be periodically shipped to L2.
-- In a total cluster wipe, a new cluster can bootstrap by replaying the Raft WAL from L2, recovering the exact `ring(E)` mapping pointing to the data slabs already residing in L2.
+- Control Ring artifacts: `control.wal`, `vote.wnd`, `snapshot.wnd` when present
+- local Data Ring slab files: active and sealed `slab_<id>.wnd`
+- a manifest that records the recovered Control Ring position, local slab ids,
+  and any tiered-slab assumptions
 
-## 3. Legal Hold & Immutable Slabs
-- For compliance, operators can flag specific namespaces with a "Legal Hold".
-- Slabs belonging to these namespaces are marked as `Immutable` in their `SlabManifest`. The Background Sweeper is forbidden from applying `E_safe` compaction (Garbage Collection) to these slabs, ensuring every historical version of a key is retained indefinitely.
+This is the minimum credible unit because backing up only the Control Ring log
+or only the slab files yields a partial image.
+
+## Restore Target
+
+Restore targets a fresh directory for a replacement node that keeps the same
+logical identity and signing material as the backed-up node.
+
+The baseline restore flow is:
+
+1. provision an empty target directory
+2. write the backed-up Control Ring artifacts into that directory
+3. restore the backed-up local slab files
+4. start the node with the normal bootstrap path
+
+## Remote-Tier Assumptions
+
+Tiered slabs are treated as external durability in the baseline:
+
+- the authoritative pointer lives in the Control Ring state
+- the backup manifest records those pointers explicitly
+- the backup does not inline remote-tier payload bodies
+
+Operators therefore still need durable object-store policy outside Wendelon
+for tiered data, including cross-region replication if the deployment requires
+it.
+
+## Recovery Checks
+
+After restore, operators should verify:
+
+- the node boots in recovery mode rather than fresh bootstrap mode
+- the recovered Control Ring membership and epoch history are present
+- local reads against backed-up slab data succeed
+- new writes and new Control Ring commits also succeed
+
+## Deferred
+
+- scheduled export and retention management
+- multi-node cluster replacement choreography
+- remote-tier payload validation during restore
+- legal-hold specific backup policy
