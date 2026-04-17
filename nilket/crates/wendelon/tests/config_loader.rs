@@ -4,7 +4,7 @@ use wendelon::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
 };
-use wendelon::node::WendelonNode;
+use wendelon::node::{ClusterBootstrapConfig, WendelonNode};
 
 fn fresh_dir(tag: &str) -> PathBuf {
 	let dir = std::env::temp_dir().join(format!(
@@ -148,6 +148,62 @@ transfer_signing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef01234
 		err.to_string().contains("lease_signing_secret"),
 		"unexpected error: {err}"
 	);
+}
+
+#[test]
+fn loads_join_cluster_configuration() {
+	let root = fresh_dir("join-config");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+
+	let node_id = 21u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "loopback://node-{node_id}"
+
+[cluster]
+mode = "join"
+
+[[cluster.seed_nodes]]
+node_id = 1
+address = "loopback://node-1"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	match cfg.cluster {
+		ClusterBootstrapConfig::Join { seeds } => {
+			assert_eq!(seeds.len(), 1);
+			assert_eq!(seeds[0].node_id, 1);
+			assert_eq!(seeds[0].address, "loopback://node-1");
+		}
+		other => panic!("expected join cluster config, got {other:?}"),
+	}
 }
 
 #[tokio::test]

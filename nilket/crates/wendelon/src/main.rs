@@ -1,6 +1,6 @@
-//! Wendelon single-node daemon entry point.
+//! Wendelon daemon entry point.
 //!
-//! CLI wrapper around [`wendelon::node::WendelonNode::bootstrap_single_node`]
+//! CLI wrapper around [`wendelon::node::WendelonNode::bootstrap`]
 //! driven by a `wendelon.toml` file.
 //!
 //! ## Usage
@@ -55,17 +55,14 @@ async fn main() -> ExitCode {
 			return ExitCode::from(2);
 		}
 	};
-	let node = match WendelonNode::bootstrap_single_node(cfg).await {
+	let node = match WendelonNode::bootstrap(cfg).await {
 		Ok(n) => n,
 		Err(e) => {
 			eprintln!("bootstrap failed: {e}");
 			return ExitCode::from(1);
 		}
 	};
-	eprintln!(
-		"wendelon: bootstrapped node {} as single-node leader",
-		node.local_node.id
-	);
+	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
 
 	// Block until the process is signalled. The watchdogs and ring
 	// updater are held by `node.handles` and abort on drop.

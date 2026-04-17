@@ -10,7 +10,7 @@ use wendelon::network::{
 	LeaseAuthority, dev_lease_signing_secret, dev_transfer_signing_secret,
 	lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
-use wendelon::node::{NodeBootstrapConfig, WendelonNode};
+use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	ClientWriteId, HybridTimestamp, LeaseDescriptor, WriteRequestMeta, WriteStatus,
 	write_payload_schema,
@@ -85,6 +85,7 @@ fn bootstrap_cfg(
 		trusted_lease_signers,
 		transfer_signing_secret,
 		trusted_transfer_signers,
+		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
 	}
 }

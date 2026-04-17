@@ -34,7 +34,10 @@ use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
 	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
-use crate::network::control_server::{WendelonControlServer, select_bootstrap_epoch};
+use crate::network::control_server::{
+	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer, select_bootstrap_epoch,
+};
+use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
 	MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS,
 	WendelonDataServer,
@@ -54,7 +57,8 @@ use crate::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
 	TransportProvider, TransportTier, TransportTierSet,
 };
-use crate::schema::NodeId;
+use crate::network::wire;
+use crate::schema::{FrameHeader, MsgType, NodeId};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
@@ -71,9 +75,22 @@ use tokio::task::JoinHandle;
 //  CONFIG
 // ============================================================
 
-/// Caller-supplied parameters for [`WendelonNode::bootstrap_single_node`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedNodeConfig {
+	pub node_id: u32,
+	pub address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterBootstrapConfig {
+	Bootstrap,
+	Join { seeds: Vec<SeedNodeConfig> },
+}
+
+/// Caller-supplied parameters for [`WendelonNode::bootstrap`].
 /// Loaded from TOML in production (`plans/ops/configuration.md`) or
 /// constructed programmatically in tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeBootstrapConfig {
 	/// Numeric node id — also the openraft peer id. Must be unique
 	/// across the cluster; single-node genesis picks any u32.
@@ -105,6 +122,8 @@ pub struct NodeBootstrapConfig {
 	/// Trusted Ed25519 verifying keys for transfer-token issuers,
 	/// keyed by Raft `NodeId.id`.
 	pub trusted_transfer_signers: BTreeMap<u32, [u8; 32]>,
+	/// Fresh-cluster bootstrap or explicit join semantics.
+	pub cluster: ClusterBootstrapConfig,
 	/// Optional L2 backend for sealed-slab tiering.
 	pub l2: Option<ObjectStoreConfig>,
 }
@@ -133,6 +152,7 @@ impl NodeBootstrapConfig {
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
+			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
 		}
 	}
@@ -195,6 +215,37 @@ impl NodeBootstrapConfig {
 				),
 			));
 		}
+		match &self.cluster {
+			ClusterBootstrapConfig::Bootstrap => {}
+			ClusterBootstrapConfig::Join { seeds } => {
+				if seeds.is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"cluster.join requires at least one seed node",
+					));
+				}
+				for seed in seeds {
+					if seed.node_id == 0 {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"cluster.join seed node_id must be greater than zero",
+						));
+					}
+					if seed.node_id == self.node_id {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"cluster.join seed list must not contain this node_id",
+						));
+					}
+					if seed.address.trim().is_empty() {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"cluster.join seed address must not be empty",
+						));
+					}
+				}
+			}
+		}
 		Ok(())
 	}
 }
@@ -247,13 +298,38 @@ pub const LEASE_RENEW_INTERVAL: std::time::Duration =
 // ============================================================
 
 impl WendelonNode {
-	/// Build every subsystem for a single-node Raft cluster and
-	/// call [`openraft::Raft::initialize`] to elect this node leader.
-	///
-	/// Must run inside a tokio runtime — the
-	/// [`TransportProviderFactory`] and every watchdog spawn
-	/// immediately.
-	pub async fn bootstrap_single_node(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+	/// Build every subsystem using the config-selected bootstrap
+	/// mode. A fresh node either initializes a one-node Control
+	/// Ring or publishes itself and explicitly joins an existing
+	/// ring through its seed list. Durable recovery skips the
+	/// fresh-cluster step and restarts from the recovered Raft
+	/// artifacts.
+	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		if matches!(cfg.cluster, ClusterBootstrapConfig::Join { .. }) {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"cluster.join requires a real outbound transport; use bootstrap_with_provider until transport endpoint wiring is attached",
+			));
+		}
+		Self::bootstrap_with_provider(cfg, Arc::new(NoDialTransportProvider)).await
+	}
+
+	/// Compatibility wrapper kept for older tests that want the
+	/// original one-node bootstrap semantics regardless of the
+	/// config's cluster mode.
+	pub async fn bootstrap_single_node(mut cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		cfg.cluster = ClusterBootstrapConfig::Bootstrap;
+		Self::bootstrap(cfg).await
+	}
+
+	/// Build every subsystem using the supplied outbound transport.
+	/// In tests this is an in-process loopback provider; production
+	/// callers can hand in a real QUIC transport once endpoint and
+	/// TLS setup are wired.
+	pub async fn bootstrap_with_provider(
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let local_node = NodeId {
 			id: cfg.node_id,
@@ -308,29 +384,23 @@ impl WendelonNode {
 		let clock: Arc<dyn PhysicalClock> = Arc::new(SystemClock);
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
 
-		// 7. Transport factory — empty provider map for the
-		//    single-node bootstrap path (never dials a peer at
-		//    RF=1). A no-op provider stands in so the factory has
-		//    something to negotiate against if a stray dial ever
-		//    slipped through.
+		// 7. Transport factory — today every node advertises the
+		//    QUIC tier shape, but the concrete dialer is supplied by
+		//    the caller so tests can use a real in-process transport
+		//    while production code plugs in QUIC later.
 		let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
-		providers.insert(
-			TransportTier::QuicIoUring,
-			Arc::new(NoDialTransportProvider),
-		);
+		providers.insert(TransportTier::QuicIoUring, provider.clone());
 		let resolver = Arc::new(crate::network::transport::EpochCapabilityResolver::new(
 			epoch_rx.clone(),
 		));
-		let local_tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let local_tiers = advertised_tiers();
 		let factory =
 			TransportProviderFactory::new(local_tiers, providers, resolver, epoch_rx.clone());
 
-		// 8. Raft network factory — uses the no-dial provider; a
-		//    single-node cluster never spawns peer RPCs.
-		let raft_network = WendelonRaftNetworkFactory::new(
-			Arc::new(NoDialTransportProvider) as Arc<dyn TransportProvider>,
-			pool.clone(),
-		);
+		// 8. Raft network factory — uses the same provider so
+		//    leader-side membership changes can immediately dial a
+		//    joining node's freshly-published Raft service.
+		let raft_network = WendelonRaftNetworkFactory::new(provider.clone(), pool.clone());
 
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
@@ -357,30 +427,13 @@ impl WendelonNode {
 		.await
 		.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::new: {e}")))?;
 
-		// 10. Fresh bootstrap initializes a single-node cluster.
-		//     Durable recovery must not silently rebootstrap over
-		//     existing artifacts; it starts from the recovered
-		//     vote/log/snapshot state instead.
-		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
-			let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
-			members.insert(
-				cfg.node_id,
-				BasicNode {
-					addr: cfg.advertise_address.clone(),
-				},
-			);
-			raft.initialize(members)
-				.await
-				.map_err(|e| Error::new(ErrorKind::Other, format!("Raft::initialize: {e}")))?;
-		}
-
-		// 11. Ring router — starts empty, seeded by the first
+		// 10. Ring router — starts empty, seeded by the first
 		//     `epoch_rx` value the updater task observes before it
 		//     begins blocking on `changed()`.
 		let ring = Arc::new(RingRouter::empty());
 		let ring_updater = ring.clone().spawn_updater(epoch_rx.clone(), cfg.rf);
 
-		// 12. Drift monitor.
+		// 11. Drift monitor.
 		let abort: Arc<dyn AbortHandle> = Arc::new(ProcessAbort);
 		let drift_monitor = spawn_drift_monitor(
 			tracker.clone(),
@@ -389,11 +442,11 @@ impl WendelonNode {
 			DRIFT_CHECK_INTERVAL,
 		);
 
-		// 13. Data Ring + Raft Internal Ring servers. Both observe
+		// 12. Data Ring + Raft Internal Ring servers. Both observe
 		//     inbound HLCs into the shared tracker so the drift
 		//     monitor sees Raft-layer and data-ring signal. The
-		//     lease gate is flipped on after the manager tick has
-		//     had a chance to file its first grant (step 15).
+		//     lease gate is flipped on only after bootstrap/join has
+		//     completed and the background lease manager starts.
 		let data_server = Arc::new(
 			WendelonDataServer::new(
 				slab.clone(),
@@ -429,9 +482,55 @@ impl WendelonNode {
 			.with_lease_authority(lease_authority.clone())
 			.with_transfer_authority(transfer_authority.clone()),
 		);
+
+		// 13. Ring-aware dispatch — the single `HrftService` the QUIC
+		//     listener hands every inbound frame to.
+		let router = Arc::new(
+			MsgRouterBuilder::default()
+				.with_data_ring(data_server.clone())
+				.with_control_ring(control_server.clone())
+				.with_raft_internal(raft_server)
+				.build(),
+		);
+		let published_router: Arc<dyn HrftService> = router.clone();
+		provider.publish_local(local_node, &cfg.advertise_address, published_router)?;
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
-		// 14. Eviction watchdog. Route leader-driven epoch changes
+		// 14. Fresh nodes either initialize a one-node cluster or
+		//     join an existing leader through the explicit Control
+		//     Ring join path. Durable recovery skips this step.
+		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
+			match &cfg.cluster {
+				ClusterBootstrapConfig::Bootstrap => {
+					let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
+					members.insert(
+						cfg.node_id,
+						BasicNode {
+							addr: cfg.advertise_address.clone(),
+						},
+					);
+					raft.initialize(members).await.map_err(|e| {
+						Error::new(ErrorKind::Other, format!("Raft::initialize: {e}"))
+					})?;
+					wait_for_local_leader(&raft, local_node).await?;
+				}
+				ClusterBootstrapConfig::Join { seeds } => {
+					request_join_via_seeds(
+						local_node,
+						&cfg.advertise_address,
+						local_tiers,
+						advertised_roles(),
+						provider.clone(),
+						pool.clone(),
+						seeds,
+					)
+					.await?;
+					wait_for_join_visibility(epoch_rx.clone()).await?;
+				}
+			}
+		}
+
+		// 15. Eviction watchdog. Route leader-driven epoch changes
 		//     back through the same Control Ring compound workflow
 		//     the external RPC uses so migration auto-seeding stays
 		//     attached to every transition source.
@@ -447,16 +546,6 @@ impl WendelonNode {
 			epoch_rx.clone(),
 			cfg.rf,
 			EVICTION_CHECK_INTERVAL,
-		);
-
-		// 15. Ring-aware dispatch — the single `HrftService` the QUIC
-		//     listener hands every inbound frame to.
-		let router = Arc::new(
-			MsgRouterBuilder::default()
-				.with_data_ring(data_server.clone())
-				.with_control_ring(control_server)
-				.with_raft_internal(raft_server)
-				.build(),
 		);
 
 		// 16. Lease manager (plan 018). Runs in the background,
@@ -552,13 +641,21 @@ fn seed_single_node_epoch(local: NodeId, address: &str) -> MembershipEpoch {
 		local,
 		PeerCapabilities {
 			address: address.to_string(),
-			tiers: TransportTierSet::empty().with(TransportTier::QuicIoUring),
-			roles: NodeRoleSet::empty()
-				.with(NodeRole::Data)
-				.with(NodeRole::Control),
+			tiers: advertised_tiers(),
+			roles: advertised_roles(),
 		},
 	);
 	MembershipEpoch { epoch: 1, peers }
+}
+
+fn advertised_tiers() -> TransportTierSet {
+	TransportTierSet::empty().with(TransportTier::QuicIoUring)
+}
+
+fn advertised_roles() -> NodeRoleSet {
+	NodeRoleSet::empty()
+		.with(NodeRole::Data)
+		.with(NodeRole::Control)
 }
 
 fn control_artifact_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
@@ -567,6 +664,145 @@ fn control_artifact_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf, Path
 		data_dir.join("vote.wnd"),
 		data_dir.join("snapshot.wnd"),
 	)
+}
+
+async fn wait_for_local_leader(raft: &WendelonRaft, local_node: NodeId) -> std::io::Result<()> {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	loop {
+		if raft.current_leader().await == Some(local_node.id) {
+			return Ok(());
+		}
+		if tokio::time::Instant::now() >= deadline {
+			return Err(Error::new(
+				ErrorKind::TimedOut,
+				format!(
+					"timed out waiting for node {} to become leader",
+					local_node.id
+				),
+			));
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
+}
+
+async fn wait_for_join_visibility(
+	mut epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
+) -> std::io::Result<()> {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	loop {
+		if epoch_rx.borrow().peers.len() > 1 {
+			return Ok(());
+		}
+		if tokio::time::Instant::now() >= deadline {
+			return Err(Error::new(
+				ErrorKind::TimedOut,
+				"timed out waiting for joined membership visibility",
+			));
+		}
+		let _ =
+			tokio::time::timeout(std::time::Duration::from_millis(100), epoch_rx.changed()).await;
+	}
+}
+
+async fn request_join_via_seeds(
+	local_node: NodeId,
+	advertise_address: &str,
+	local_tiers: TransportTierSet,
+	local_roles: NodeRoleSet,
+	provider: Arc<dyn TransportProvider>,
+	pool: Arc<BufPool>,
+	seeds: &[SeedNodeConfig],
+) -> std::io::Result<()> {
+	let req = JoinClusterRequestWire {
+		node_id: local_node.id,
+		advertise_address: advertise_address.to_string(),
+		tier_bits: local_tiers.as_u8(),
+		role_bits: local_roles.as_u8(),
+	};
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	let mut last_err: Option<Error> = None;
+
+	loop {
+		for seed in seeds {
+			match send_join_request(
+				&provider,
+				&pool,
+				NodeId {
+					id: seed.node_id,
+					_reserved: 0,
+				},
+				&seed.address,
+				&req,
+			)
+			.await
+			{
+				Ok(resp) if resp.accepted => return Ok(()),
+				Ok(resp) => {
+					last_err = Some(Error::new(
+						match resp.reason_code {
+							crate::network::control_server::CONTROL_REASON_NOT_LEADER => {
+								ErrorKind::NotConnected
+							}
+							crate::network::control_server::CONTROL_REASON_INVALID_CONFIG => {
+								ErrorKind::InvalidInput
+							}
+							_ => ErrorKind::Other,
+						},
+						format!(
+							"join rejected by seed {} (reason_code={}, leader_hint={:?})",
+							seed.node_id, resp.reason_code, resp.leader_hint
+						),
+					));
+				}
+				Err(err) => last_err = Some(err),
+			}
+		}
+
+		if tokio::time::Instant::now() >= deadline {
+			return Err(last_err.unwrap_or_else(|| {
+				Error::new(
+					ErrorKind::TimedOut,
+					"timed out waiting for any seed to accept join",
+				)
+			}));
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+}
+
+async fn send_join_request(
+	provider: &Arc<dyn TransportProvider>,
+	pool: &Arc<BufPool>,
+	target: NodeId,
+	address: &str,
+	req: &JoinClusterRequestWire,
+) -> std::io::Result<JoinClusterResponseWire> {
+	let conn = provider.connect(target, address).await?;
+	let mut stream = conn.open_bi().await?;
+	let meta = wire::encode(req)?;
+	let header = FrameHeader {
+		magic: HRFT_MAGIC,
+		version: 1,
+		msg_type: MsgType::JOIN_REQ.0,
+		flags: 0,
+		stream_id: 0,
+		meta_len: meta.len() as u32,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	write_frame(&mut *stream, &header, &meta, None, None).await?;
+	stream.finish().await?;
+	let resp = read_frame(&mut *stream, pool).await?;
+	if resp.header.msg_type != MsgType::JOIN_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"seed {} returned wrong msg_type=0x{:02x}",
+				target.id, resp.header.msg_type
+			),
+		));
+	}
+	wire::decode(&resp.meta)
 }
 
 // ============================================================

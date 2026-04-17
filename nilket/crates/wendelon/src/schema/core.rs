@@ -359,6 +359,8 @@ impl MsgType {
 	pub const EPOCH_ADV_RESP: Self = Self(0x15);
 	pub const STATUS_REQ: Self = Self(0x16);
 	pub const STATUS_RESP: Self = Self(0x17);
+	pub const JOIN_REQ: Self = Self(0x18);
+	pub const JOIN_RESP: Self = Self(0x19);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);

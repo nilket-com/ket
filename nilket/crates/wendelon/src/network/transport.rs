@@ -37,6 +37,7 @@
 //!   buffer itself.
 
 use crate::network::pool::PooledBuf;
+use crate::network::server::HrftService;
 use crate::schema::NodeId;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -214,6 +215,21 @@ pub trait TransportProvider: Send + Sync {
 		target: NodeId,
 		address: &str,
 	) -> std::io::Result<Arc<dyn TransportConnection>>;
+
+	/// Optional publish hook used by bootstrap code that needs to
+	/// make its freshly-built HRFT service discoverable before a
+	/// peer dials back for Raft replication or a forwarded Control
+	/// Ring request. Real socket-based providers can ignore this;
+	/// in-process test providers use it to populate a shared
+	/// registry.
+	fn publish_local(
+		&self,
+		_node_id: NodeId,
+		_address: &str,
+		_service: Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		Ok(())
+	}
 }
 
 // ============================================================

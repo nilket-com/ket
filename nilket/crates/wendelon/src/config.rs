@@ -2,7 +2,7 @@ use crate::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
 };
-use crate::node::NodeBootstrapConfig;
+use crate::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -73,6 +73,8 @@ struct RawConfig {
 	identity: RawIdentityConfig,
 	#[serde(default)]
 	tuning: RawTuningConfig,
+	#[serde(default)]
+	cluster: RawClusterConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +113,37 @@ struct RawIdentityConfig {
 	trusted_lease_signers: BTreeMap<String, String>,
 	transfer_signing_secret: String,
 	trusted_transfer_signers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawClusterConfig {
+	#[serde(default)]
+	mode: RawClusterMode,
+	#[serde(default)]
+	seed_nodes: Vec<RawSeedNode>,
+}
+
+impl Default for RawClusterConfig {
+	fn default() -> Self {
+		Self {
+			mode: RawClusterMode::Bootstrap,
+			seed_nodes: Vec::new(),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RawClusterMode {
+	#[default]
+	Bootstrap,
+	Join,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSeedNode {
+	node_id: u32,
+	address: String,
 }
 
 impl RawConfig {
@@ -167,6 +200,20 @@ impl RawConfig {
 			"identity.trusted_transfer_signers",
 			&self.identity.trusted_transfer_signers,
 		)?;
+		let cluster = match self.cluster.mode {
+			RawClusterMode::Bootstrap => ClusterBootstrapConfig::Bootstrap,
+			RawClusterMode::Join => ClusterBootstrapConfig::Join {
+				seeds: self
+					.cluster
+					.seed_nodes
+					.into_iter()
+					.map(|seed| SeedNodeConfig {
+						node_id: seed.node_id,
+						address: seed.address,
+					})
+					.collect(),
+			},
+		};
 
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
@@ -179,6 +226,7 @@ impl RawConfig {
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
+			cluster,
 			l2: None,
 		};
 		cfg.validate()?;

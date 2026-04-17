@@ -31,8 +31,9 @@ use crate::schema::{
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
+use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +50,21 @@ pub const CONTROL_REASON_INVALID_TOKEN: u8 = 7;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvanceEpochResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinClusterRequestWire {
+	pub node_id: u32,
+	pub advertise_address: String,
+	pub tier_bits: u8,
+	pub role_bits: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinClusterResponseWire {
 	pub accepted: bool,
 	pub reason_code: u8,
 	pub leader_hint: Option<u32>,
@@ -138,9 +154,6 @@ impl WendelonControlServer {
 			let mut ticker = tokio::time::interval(Duration::from_millis(50));
 			loop {
 				ticker.tick().await;
-				if !self.is_leader().await {
-					continue;
-				}
 				let _ = self.reconcile_pending_epoch().await;
 			}
 		})
@@ -414,6 +427,59 @@ impl WendelonControlServer {
 		})
 	}
 
+	async fn handle_join(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"JOIN_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let req: JoinClusterRequestWire = wire::decode(&frame.meta)?;
+		let resp = match self.validate_join_request(&req) {
+			Err(_) => JoinClusterResponseWire {
+				accepted: false,
+				reason_code: CONTROL_REASON_INVALID_CONFIG,
+				leader_hint: self.leader_hint().await,
+			},
+			Ok(()) if self.is_leader().await => match self.accept_join(&req).await {
+				Ok(()) => JoinClusterResponseWire {
+					accepted: true,
+					reason_code: CONTROL_REASON_GRANTED,
+					leader_hint: Some(self.local_node.id),
+				},
+				Err(err) if err.kind() == ErrorKind::InvalidInput => JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_INVALID_CONFIG,
+					leader_hint: Some(self.local_node.id),
+				},
+				Err(err) if err.kind() == ErrorKind::NotConnected => JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_NOT_LEADER,
+					leader_hint: self.leader_hint().await,
+				},
+				Err(_) => JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_INTERNAL_ERROR,
+					leader_hint: self.leader_hint().await,
+				},
+			},
+			Ok(()) => match self.forward_join_request(&frame, &req).await {
+				Ok(resp) => resp,
+				Err(err) if err.kind() == ErrorKind::NotConnected => JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_NOT_LEADER,
+					leader_hint: self.leader_hint().await,
+				},
+				Err(_) => JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_INTERNAL_ERROR,
+					leader_hint: self.leader_hint().await,
+				},
+			},
+		};
+		self.join_response(&frame, resp)
+	}
+
 	async fn commit_epoch_transition_locked(
 		&self,
 		from: &MembershipEpoch,
@@ -456,20 +522,24 @@ impl WendelonControlServer {
 
 	async fn reconcile_pending_epoch_locked(&self) -> std::io::Result<()> {
 		let snapshot = self.state_machine.state_snapshot().await;
-		let Some((&latest_epoch, latest_cfg)) = snapshot.epoch_history.iter().next_back() else {
+		let Some((&latest_epoch, _)) = snapshot.epoch_history.iter().next_back() else {
 			return Ok(());
 		};
 		let visible = self.epoch_rx.borrow().clone();
 		if latest_epoch <= visible.epoch {
 			return Ok(());
 		}
+		let next_epoch = visible.epoch.saturating_add(1);
+		let Some(next_cfg) = snapshot.epoch_history.get(&next_epoch) else {
+			return Ok(());
+		};
 
 		let previous_cfg = snapshot
 			.epoch_history
 			.get(&visible.epoch)
 			.cloned()
 			.unwrap_or_else(|| epoch_config_from_membership(&visible));
-		let target = membership_from_epoch_config(latest_cfg);
+		let target = membership_from_epoch_config(next_cfg);
 		let expected = build_seed_batch(
 			&membership_from_epoch_config(&previous_cfg),
 			&target,
@@ -479,24 +549,26 @@ impl WendelonControlServer {
 		let missing = missing_seed_batch(&expected, &snapshot.migrations)?;
 		drop(snapshot);
 
-		for seed in missing {
+		if !missing.is_empty() {
 			if !self.is_leader().await {
 				return Err(not_leader_error(self.leader_hint().await));
 			}
-			match self
-				.raft
-				.client_write(WendelonRequest::SeedMigration(seed))
-				.await
-			{
-				Ok(_) => {}
-				Err(_err) if !self.is_leader().await => {
-					return Err(not_leader_error(self.leader_hint().await));
-				}
-				Err(err) => {
-					return Err(Error::new(
-						ErrorKind::Other,
-						format!("seed migration commit failed: {err}"),
-					));
+			for seed in missing {
+				match self
+					.raft
+					.client_write(WendelonRequest::SeedMigration(seed))
+					.await
+				{
+					Ok(_) => {}
+					Err(_err) if !self.is_leader().await => {
+						return Err(not_leader_error(self.leader_hint().await));
+					}
+					Err(err) => {
+						return Err(Error::new(
+							ErrorKind::Other,
+							format!("seed migration commit failed: {err}"),
+						));
+					}
 				}
 			}
 		}
@@ -621,6 +693,29 @@ impl WendelonControlServer {
 			meta,
 			arrow_payload: None,
 			trailing,
+		})
+	}
+
+	fn join_response(
+		&self,
+		frame: &HrftFrame,
+		resp: JoinClusterResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, &resp)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::JOIN_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
 		})
 	}
 
@@ -757,6 +852,149 @@ impl WendelonControlServer {
 		wire::decode(&resp.meta)
 	}
 
+	fn validate_join_request(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
+		if req.node_id == 0 || req.node_id == self.local_node.id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"join request must target a non-zero remote node id",
+			));
+		}
+		if req.advertise_address.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"join request advertise_address must not be empty",
+			));
+		}
+		let tiers = TransportTierSet::from_u8(req.tier_bits);
+		if tiers.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"join request must advertise at least one transport tier",
+			));
+		}
+		let roles = NodeRoleSet::from_u8(req.role_bits);
+		if !roles.contains(NodeRole::Control) || !roles.contains(NodeRole::Data) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"join request must advertise Control Ring and Data Ring roles",
+			));
+		}
+		Ok(())
+	}
+
+	async fn accept_join(&self, req: &JoinClusterRequestWire) -> std::io::Result<()> {
+		let joining = NodeId {
+			id: req.node_id,
+			_reserved: 0,
+		};
+		let joining_caps = PeerCapabilities {
+			address: req.advertise_address.clone(),
+			tiers: TransportTierSet::from_u8(req.tier_bits),
+			roles: NodeRoleSet::from_u8(req.role_bits),
+		};
+		let joining_node = BasicNode {
+			addr: req.advertise_address.clone(),
+		};
+
+		match self.raft.add_learner(req.node_id, joining_node, true).await {
+			Ok(_) => {}
+			Err(_err) if !self.is_leader().await => {
+				return Err(not_leader_error(self.leader_hint().await));
+			}
+			Err(err) => {
+				return Err(Error::new(
+					ErrorKind::Other,
+					format!("add_learner failed: {err}"),
+				));
+			}
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let mut desired_voters: BTreeSet<u32> = snapshot.last_membership.voter_ids().collect();
+		if desired_voters.is_empty() {
+			desired_voters.insert(self.local_node.id);
+		}
+		let promote_to_voter = desired_voters.insert(req.node_id);
+		drop(snapshot);
+
+		if promote_to_voter {
+			match self.raft.change_membership(desired_voters, true).await {
+				Ok(_) => {}
+				Err(_err) if !self.is_leader().await => {
+					return Err(not_leader_error(self.leader_hint().await));
+				}
+				Err(err) => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						format!("change_membership failed: {err}"),
+					));
+				}
+			}
+		}
+
+		let visible = self.epoch_rx.borrow().clone();
+		let needs_epoch_advance = match visible.peers.get(&joining) {
+			Some(existing) => {
+				existing.address != joining_caps.address
+					|| existing.tiers.as_u8() != joining_caps.tiers.as_u8()
+					|| existing.roles.as_u8() != joining_caps.roles.as_u8()
+			}
+			None => true,
+		};
+		if needs_epoch_advance {
+			let mut next = visible.as_ref().clone();
+			next.epoch = next.epoch.saturating_add(1);
+			next.peers.insert(joining, joining_caps);
+			self.advance_membership_epoch(next).await?;
+		}
+
+		Ok(())
+	}
+
+	async fn forward_join_request(
+		&self,
+		frame: &HrftFrame,
+		req: &JoinClusterRequestWire,
+	) -> std::io::Result<JoinClusterResponseWire> {
+		let leader_id = self
+			.leader_hint()
+			.await
+			.filter(|leader_id| *leader_id != self.local_node.id)
+			.ok_or_else(|| not_leader_error(None))?;
+		let conn = self
+			.factory
+			.get_connection(NodeId {
+				id: leader_id,
+				_reserved: 0,
+			})
+			.await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = wire::encode(req)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::JOIN_REQ.0,
+			flags: 0,
+			stream_id: frame.header.stream_id,
+			meta_len: meta.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &meta, None, None).await?;
+		stream.finish().await?;
+		let resp = read_frame(&mut *stream, &self.pool).await?;
+		if resp.header.msg_type != MsgType::JOIN_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"join target returned wrong msg_type=0x{:02x}",
+					resp.header.msg_type
+				),
+			));
+		}
+		wire::decode(&resp.meta)
+	}
+
 	async fn accept_transfer_target(&self, token: &TransferToken) -> std::io::Result<()> {
 		self.raft
 			.trigger()
@@ -795,6 +1033,7 @@ impl ControlRingServer for WendelonControlServer {
 			MsgType::LEASE_REQ => self.handle_lease(frame).await?,
 			MsgType::TRANSFER_REQ => self.handle_transfer(remote, frame).await?,
 			MsgType::EPOCH_ADV_REQ => self.handle_advance_epoch(frame).await?,
+			MsgType::JOIN_REQ => self.handle_join(frame).await?,
 			_ => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,

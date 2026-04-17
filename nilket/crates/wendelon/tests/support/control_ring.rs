@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::watch;
@@ -29,6 +29,45 @@ const ZERO_NODE: NodeId = NodeId {
 	_reserved: 0,
 };
 
+#[derive(Default)]
+pub struct LoopbackRegistry {
+	services: Mutex<HashMap<NodeId, PublishedLoopbackService>>,
+}
+
+struct PublishedLoopbackService {
+	service: Arc<dyn HrftService>,
+}
+
+impl LoopbackRegistry {
+	fn publish(&self, node_id: NodeId, address: &str, service: Arc<dyn HrftService>) {
+		let _ = address;
+		self.services
+			.lock()
+			.unwrap()
+			.insert(node_id, PublishedLoopbackService { service });
+	}
+
+	fn resolve(
+		&self,
+		target: NodeId,
+		expected_address: &str,
+	) -> std::io::Result<Arc<dyn HrftService>> {
+		let guard = self.services.lock().unwrap();
+		let published = guard.get(&target).ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!("unknown loopback target {}", target.id),
+			)
+		})?;
+		let _ = expected_address;
+		Ok(published.service.clone())
+	}
+
+	fn contains(&self, target: NodeId, _expected_address: &str) -> bool {
+		self.services.lock().unwrap().contains_key(&target)
+	}
+}
+
 pub fn tempdir(tag: &str) -> PathBuf {
 	let base = std::env::temp_dir().join(format!(
 		"wendelon-control-ring-{tag}-{}",
@@ -38,6 +77,7 @@ pub fn tempdir(tag: &str) -> PathBuf {
 	base
 }
 
+#[allow(dead_code)]
 pub async fn wait_for_local_leader(node: &WendelonNode) {
 	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 	loop {
@@ -74,6 +114,24 @@ pub async fn bootstrap_node(tag: &str, node_id: u32) -> WendelonNode {
 }
 
 #[allow(dead_code)]
+pub fn shared_loopback_registry() -> Arc<LoopbackRegistry> {
+	Arc::new(LoopbackRegistry::default())
+}
+
+#[allow(dead_code)]
+pub fn loopback_provider(
+	local: NodeId,
+	registry: Arc<LoopbackRegistry>,
+) -> Arc<dyn TransportProvider> {
+	Arc::new(LoopbackProvider {
+		local,
+		registry,
+		pool: BufPool::new(64, 1024 * 1024),
+		tier: TransportTier::QuicIoUring,
+	})
+}
+
+#[allow(dead_code)]
 pub fn loopback_factory(
 	remote: NodeId,
 	service: Arc<dyn HrftService>,
@@ -104,21 +162,22 @@ pub fn loopback_factory_many_from(
 ) -> (Arc<TransportProviderFactory>, Arc<BufPool>) {
 	let pool = BufPool::new(64, 1024 * 1024);
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+	let registry = shared_loopback_registry();
 
 	let mut peers = HashMap::new();
-	let mut service_map = HashMap::new();
 	for (remote, service) in services {
+		let address = format!("loopback://node-{}", remote.id);
 		peers.insert(
 			remote,
 			PeerCapabilities {
-				address: format!("loopback://node-{}", remote.id),
+				address: address.clone(),
 				tiers,
 				roles: NodeRoleSet::empty()
 					.with(NodeRole::Control)
 					.with(NodeRole::Data),
 			},
 		);
-		service_map.insert(remote, service);
+		registry.publish(remote, &address, service);
 	}
 	let epoch = MembershipEpoch { epoch: 1, peers };
 	let (_tx, rx) = watch::channel(Arc::new(epoch));
@@ -129,7 +188,7 @@ pub fn loopback_factory_many_from(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
 			local,
-			services: service_map,
+			registry,
 			pool: pool.clone(),
 			tier: TransportTier::QuicIoUring,
 		}),
@@ -172,12 +231,16 @@ pub fn loopback_client_config_many_with_topology(
 ) -> WendelonClientConfig {
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
-	let service_map: HashMap<NodeId, Arc<dyn HrftService>> = services.into_iter().collect();
+	let registry = shared_loopback_registry();
+	for (remote, service) in services {
+		let address = format!("loopback://node-{}", remote.id);
+		registry.publish(remote, &address, service);
+	}
 	providers.insert(
 		TransportTier::QuicIoUring,
 		Arc::new(LoopbackProvider {
 			local: ZERO_NODE,
-			services: service_map,
+			registry,
 			pool: BufPool::new(64, 1024 * 1024),
 			tier: TransportTier::QuicIoUring,
 		}),
@@ -381,7 +444,8 @@ impl TransportStream for DuplexTransportStream {
 struct LoopbackConnection {
 	local: NodeId,
 	remote: NodeId,
-	service: Arc<dyn HrftService>,
+	registry: Arc<LoopbackRegistry>,
+	address: String,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
 }
@@ -389,8 +453,8 @@ struct LoopbackConnection {
 #[async_trait]
 impl TransportConnection for LoopbackConnection {
 	async fn open_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
+		let service = self.registry.resolve(self.remote, &self.address)?;
 		let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-		let service = self.service.clone();
 		let pool = self.pool.clone();
 		let local = self.local;
 		tokio::spawn(serve_stream(server_side, service, pool, local));
@@ -410,13 +474,13 @@ impl TransportConnection for LoopbackConnection {
 	}
 
 	fn is_closed(&self) -> bool {
-		false
+		!self.registry.contains(self.remote, &self.address)
 	}
 }
 
 struct LoopbackProvider {
 	local: NodeId,
-	services: HashMap<NodeId, Arc<dyn HrftService>>,
+	registry: Arc<LoopbackRegistry>,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
 }
@@ -426,21 +490,27 @@ impl TransportProvider for LoopbackProvider {
 	async fn connect(
 		&self,
 		target: NodeId,
-		_address: &str,
+		address: &str,
 	) -> std::io::Result<Arc<dyn TransportConnection>> {
-		let service = self.services.get(&target).cloned().ok_or_else(|| {
-			Error::new(
-				ErrorKind::NotFound,
-				format!("unknown loopback target {}", target.id),
-			)
-		})?;
+		self.registry.resolve(target, address)?;
 		Ok(Arc::new(LoopbackConnection {
 			local: self.local,
 			remote: target,
-			service,
+			registry: self.registry.clone(),
+			address: address.to_string(),
 			pool: self.pool.clone(),
 			tier: self.tier,
 		}))
+	}
+
+	fn publish_local(
+		&self,
+		node_id: NodeId,
+		address: &str,
+		service: Arc<dyn HrftService>,
+	) -> std::io::Result<()> {
+		self.registry.publish(node_id, address, service);
+		Ok(())
 	}
 }
 
