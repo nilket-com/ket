@@ -56,6 +56,7 @@ use crate::network::transport::{
 };
 use crate::schema::NodeId;
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
+use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -104,6 +105,8 @@ pub struct NodeBootstrapConfig {
 	/// Trusted Ed25519 verifying keys for transfer-token issuers,
 	/// keyed by Raft `NodeId.id`.
 	pub trusted_transfer_signers: BTreeMap<u32, [u8; 32]>,
+	/// Optional L2 backend for sealed-slab tiering.
+	pub l2: Option<ObjectStoreConfig>,
 }
 
 impl NodeBootstrapConfig {
@@ -130,6 +133,7 @@ impl NodeBootstrapConfig {
 			trusted_lease_signers,
 			transfer_signing_secret,
 			trusted_transfer_signers,
+			l2: None,
 		}
 	}
 }
@@ -211,11 +215,12 @@ impl WendelonNode {
 		let io = spawn_io_thread(cfg.io_depth)?;
 
 		// 3. L1 slab storage.
+		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
 		let slab = Arc::new(SlabManager::open(SlabManagerConfig {
 			dir: cfg.data_dir.clone(),
 			max_slab_bytes: cfg.slab_max_bytes,
 			io: io.clone(),
-			l2: None,
+			l2,
 		})?);
 
 		// 4. Durable Raft storage + recovered state machine.

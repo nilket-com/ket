@@ -8,30 +8,31 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tokio = { version = "1.37", features = ["full"] }
+arrow = { version = "58.1.0", features = ["ipc_compression"] }
+async-trait = "0.1"
+blake3 = "1.5"
+bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
+bytes = "1.6"
+dashmap = "6.1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+highway = "1.1"
+io-uring = "0.7.11"
+opendal = { version = "0.55", features = ["services-s3"] }
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
+postcard = { version = "1.0", features = ["alloc", "use-std"] }
 quinn = "0.11"
+rand = "0.10.1"
+rapidhash = "4.4.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 rustls-pki-types = "1.10"
-openraft = { version = "0.9", features = ["storage-v2", "serde"] }
-arrow = { version = "58.1.0", features = ["ipc_compression"] }
-bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
-io-uring = "0.7.11"
-dashmap = "6.1.0"
-highway = "1.1"
-blake3 = "1.5"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
-rand = "0.10.1"
-uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
-async-trait = "0.1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-bytes = "1.6"
-thiserror = "2.0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11.19"
-postcard = { version = "1.0", features = ["alloc", "use-std"] }
-rapidhash = "4.4.1"
+thiserror = "2.0.18"
+tokio = { version = "1.37", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 
 [profile.release]
 opt-level = 3

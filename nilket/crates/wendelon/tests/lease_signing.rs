@@ -85,6 +85,7 @@ fn bootstrap_cfg(
 		trusted_lease_signers,
 		transfer_signing_secret,
 		trusted_transfer_signers,
+		l2: None,
 	}
 }
 
