@@ -5,6 +5,13 @@
 
 Every answer aims at the correct long-run shape, not the cheapest next step. Where pragmatism and perfection diverge, I pick perfection. Questions I cannot answer with conviction are marked *Unresolved*.
 
+**Revision log (post-teammate review):**
+- Round 1: §6 authorization now adopts dual Node-CA / Operator-CA trust roots and a four-role pilot scope (adding `break_glass_admin`). §6 FIPS reframed as full 140-3 certification endpoint with module-only as interim. §9 persistent local index switched from custom to redb. §10 pilot requirement flipped from "defer MT" to "tenant-aware schema from day one, single tenant enabled."
+- Round 2: §4 pending-upload model refined to explicit Raft-authoritative-lifecycle / local-execution-ledger split after Codex flagged that multipart UploadIds and temp-file paths are provider-local artifacts that don't belong in replicated state.
+- Round 3: §5 cipher fallback reconciled — two earlier statements disagreed on what happens when aws-lc-rs lacks GCM-SIV. Now a single decision tree: GCM-SIV preferred, XChaCha20-Poly1305 as the preferred fallback, plain GCM (with structural nonces + published collision analysis) only when a FIPS build is required *and* SIV is unavailable. Responds to Gemini's fragility concern. §4 multipart clarified to distinguish multipart *trigger* from *part size* (8–16 MiB) — the trigger alignment with `slab_max_bytes` was correct; the part size was previously unspecified.
+
+Other positions held. Gemini's issues (PMEM/CXL durability, WebAssembly-delivered CLI, discarding openraft) were reviewed and not adopted — rationale in [claude_issues_20260417.md](/home/me/work/wendelon/plans/gap/claude_issues_20260417.md).
+
 ---
 
 ## 1. Integration Gate & Bring-Up
@@ -76,13 +83,24 @@ Land the full trait redesign in one coordinated change: `get`, `get_range`, `put
 Footer-embedded record offset index. Slab layout: `[magic | version_header | record_0 | record_1 | ... | record_n | offset_index | footer_checksum | index_pointer]`. The reader issues one small range-GET for the tail (64 KiB) to read the pointer + footer + index, then one targeted range-GET for the record. One S3 object per slab. This is the Parquet/ORC model and is the proven answer. Sidecar manifests double object count and introduce consistency puzzles; S3 user metadata is tightly size-limited.
 
 ### Pending-upload recovery model
-Raft-managed state, not a local journal. The upload lifecycle (`Pending → Uploaded → Committed → LocalPurged`) is modeled as explicit state machine transitions in the Raft log. Recovery follows Raft invariants — one source of truth. A local journal invents a second recovery story that must be reconciled with Raft; two sources of truth is zero sources of truth.
+Raft is authoritative for the *lifecycle* (`Pending → Uploaded → Committed → LocalPurged`); a bounded, non-authoritative local ledger holds *execution-local* artifacts that have no meaning elsewhere. Split:
+
+- **Raft-managed (authoritative):** slab_id, target tier, wrapped DEK reference, state transition timestamps, committing leader's node_id. Every node agrees on this.
+- **Local ledger (node-local, derivable):** the S3 multipart UploadId, temp-file path under the staging directory, part-number → ETag mapping, local retry counters, last-attempt timestamp. These are returned by the provider on `CreateMultipartUpload` and have no meaning on any other node.
+
+Recovery rule: on restart, the node replays its local ledger to resume or abort in-flight multipart uploads; it then reconciles against the Raft-committed lifecycle state to decide whether to complete or abort. If the local ledger is missing (disk swapped, node rebuilt), the node falls back to an S3 `ListMultipartUploads` call filtered by its own upload prefix — slower, but authoritative. This preserves "Raft is the only durable lifecycle authority" while not bloating replicated state with provider-specific execution artifacts.
+
+Revised after teammate review — the earlier "pure Raft" framing underspecified restart-time cleanup of provider-owned transient state.
 
 ### Orphan cleanup authority
 Leader-only. Destructive operations require the freshest state, which only the leader has authoritatively. The reconciler pages the bucket's LIST output, joins against `tiered_slabs` from the committed state machine, and deletes objects not present in state. Rate-limited, with a configurable max-deletes-per-minute. Followers never delete remote objects.
 
 ### Multipart threshold
-Align with `slab_max_bytes`. If slabs are 64 MiB, multipart kicks in at 64 MiB. Provider-default thresholds are noise; our own slab sizing is the authoritative configuration.
+Two distinct knobs, both explicit:
+- **Trigger threshold** (when to switch from single-PUT to multipart): align with `slab_max_bytes`. If slabs are 64 MiB, multipart kicks in at 64 MiB. Provider-default thresholds are noise; our own slab sizing is the authoritative configuration.
+- **Part size** (size of each multipart chunk): 8 MiB default, tunable up to 16 MiB. A failed 128 MiB retry over a congested egress path wastes time and bandwidth; 8–16 MiB is the provider-sweet-spot range where retry cost is bounded and throughput still saturates. Minimum part size is provider-floored (S3 is 5 MiB except for the last part); we clamp to the provider floor.
+
+Previously conflated trigger and part size. Split after Gemini's review.
 
 ### Remote reclaim scope
 Full lifecycle in this workstream: migration cleanup, retention expiry, tombstone reclamation, orphan GC. Defer only archival tiering (Glacier-class, cross-region replication, lifecycle policies managed by the provider). Tiering without deletion is a cost bomb and violates data-retention contracts.
@@ -92,7 +110,14 @@ Full lifecycle in this workstream: migration cleanup, retention expiry, tombston
 ## 5. Encryption, Key Management, and L2 Crypto
 
 ### Standard cipher
-AES-256-GCM-SIV. Plain AES-GCM has a 96-bit nonce and nonce-misuse is catastrophic; at billions-of-records scale the collision analysis is nontrivial. GCM-SIV is misuse-resistant — nonce reuse degrades to a distinguisher rather than a key recovery. On AES-NI hardware GCM-SIV is 2–3× faster than XChaCha20-Poly1305. XChaCha20 is an acceptable fallback if aws-lc-rs FIPS does not yet ship GCM-SIV at implementation time (confirm during ADR).
+AES-256-GCM-SIV. Plain AES-GCM has a 96-bit nonce and nonce-misuse is catastrophic; at billions-of-records scale the collision analysis is nontrivial. GCM-SIV is misuse-resistant — nonce reuse degrades to a distinguisher rather than a key recovery. On AES-NI hardware GCM-SIV is 2–3× faster than XChaCha20-Poly1305.
+
+Fallback decision tree (responds to Gemini's nonce-fragility concern):
+1. GCM-SIV available in the selected backend → use GCM-SIV.
+2. Non-FIPS build, SIV unavailable → XChaCha20-Poly1305. 192-bit nonce gives random-nonce safety without structural-nonce gymnastics.
+3. FIPS build *and* SIV unavailable → AES-256-GCM with structurally derived nonces (`slab_id || chunk_index`), and the ADR must publish the collision analysis and the DEK rotation cadence that keeps the per-key record count below the safe bound. This is the only path where plain GCM is acceptable, and only because XChaCha20-Poly1305 is not FIPS-approved.
+
+Hand-rolled crypto is never in any branch.
 
 ### Encryption granularity
 Per-slab DEK with intra-slab 64 KiB chunked encryption. Each slab gets its own DEK on creation. Within the slab, plaintext is split into fixed 64 KiB chunks and each chunk is encrypted independently with a deterministic nonce (`slab_id || chunk_index`). This gives: (a) range-GET decryption without decrypting the whole slab; (b) bounded nonce space per DEK; (c) clean rotation story — a new slab picks a new DEK. Per-record is too much nonce management; per-whole-slab prevents range reads.
@@ -107,7 +132,7 @@ Client-side envelope encryption only. SSE-KMS surrenders trust to the cloud prov
 15-minute TTL, LRU eviction under memory pressure, zeroize-on-drop (`zeroize` crate with `ZeroizeOnDrop`). Cache size bounded by the global memory budget (see §9). On any explicit key-rotation event, the affected entries are invalidated immediately.
 
 ### FIPS compatibility
-aws-lc-rs is the FIPS backend. Verify at ADR time that it ships AES-256-GCM-SIV; if not, fall back to AES-256-GCM with record-id-derived counter nonces and publish the nonce-collision analysis in the ADR. Never hand-roll crypto.
+aws-lc-rs is the FIPS backend. Verify at ADR time that it ships AES-256-GCM-SIV; apply the cipher decision tree above (§5 Standard cipher) based on that verification. Never hand-roll crypto primitives; only the mode-of-use and nonce derivation live in our code.
 
 ### Migration scope
 In scope. A background re-encryption sweeper reads plaintext slabs, encrypts via the normal slab-creation path, and retires the old slab through the existing compaction machinery. Ships alongside the tiering work because the interaction matters — plaintext slabs promoted to L2 must be encrypted on write, not after. Without a migration story, operators enable encryption only on new clusters, which is useless for existing deployments.
@@ -117,15 +142,18 @@ In scope. A background re-encryption sweeper reads plaintext slabs, encrypts via
 ## 6. Authorization, Audit, and Compliance
 
 ### Authorization mechanism
-Certificate OID extension encoding role and scopes. The extension carries a CBOR (not JSON — binary framing matters in X.509) payload: `{"role": "operator", "scopes": [...], "tenant_id": "...", "key_id": "..."}`. mTLS authenticates; the OID payload authorizes; one credential root. Separate CAs double cert management without adding authority beyond role-switching, which the OID already handles. Tokens introduce a new credential type with its own rotation and bearer-token risk. Cert-embedded claims are atomic, revocable (via CRL/OCSP or short-lived certs), and aligned with the existing mTLS trust model.
+Cert-embedded claims via a CBOR-encoded OID extension, carried by mTLS identities issued from *two* trust roots: a Node CA (issues `data_node` and `read_only_observer` certs) and an Operator CA (issues `operator` certs, with an additional `break_glass_admin` role for incident recovery). mTLS authenticates; the OID payload authorizes; role-level revocation is a CA-level action and is therefore cheap and atomic. The OID payload itself carries `{"role": ..., "scopes": [...], "tenant_id": ..., "key_id": ...}`. Tokens are rejected as a primary primitive — bearer-token risk, independent rotation lifecycle, and no cryptographic binding to the transport session.
+
+Two trust roots (not one OID-only, not N CAs per role) is the minimum that gives clean operator/node separation without cert-management blowup. Revoking all operator authority in an incident is a single CA-level action; revoking role-by-role inside one CA is a CRL hunt.
 
 ### Pilot authorization scope
-Three roles: `data_node`, `operator`, `read_only_observer`.
+Deny-by-default on every mutating RPC plus four roles at pilot:
 - `data_node`: replicate, vote, serve client reads/writes. No admin RPCs.
-- `operator`: all of `data_node` plus membership changes, epoch advances, lease grants, transfer leadership, drain, backup/restore.
+- `operator`: all of `data_node` plus membership changes, epoch advances, lease grants, transfer leadership, drain, backup/restore, tenant-admin.
 - `read_only_observer`: read-only access to cluster status, metrics, audit tail. No state-mutating RPCs.
+- `break_glass_admin`: unrestricted, Operator-CA-issued, short-lived (max 1h), every action audited with an explicit break-glass marker. For incident recovery only.
 
-This triad covers every enterprise deployment I have seen; extra roles are added later via the same OID mechanism without a protocol break.
+Every admin action is attributable to exactly one cert-bound principal in the audit stream. Extra roles are added later via the same OID/CA mechanism without a protocol break.
 
 ### Audit sink model
 Structured event stream abstraction from day one. `AuditSink` trait with three initial implementations: `LocalNdjson` (default), `Syslog` (Unix socket), and `Kafka` (behind feature flag for SIEM-shipping deployments). The trait makes call sites sink-agnostic; adding new sinks is zero-churn. Shipping only a local file first forces every later integration to touch every call site.
@@ -134,7 +162,7 @@ Structured event stream abstraction from day one. `AuditSink` trait with three i
 Hash chain from day one. Each record carries `prev_hash = blake3(previous_record_canonical_bytes)`. The chain head is exposed via a dedicated control RPC so auditors can snapshot the head and detect gaps or rewrites. On every Raft-committed audit event, the hash chain extends. Non-negotiable for regulated-industry compliance; cheap to implement upfront and expensive to retrofit.
 
 ### FIPS target
-Use of a FIPS-validated crypto module is the deliverable for this workstream. Full FIPS 140-3 certification of the Wendelon binary is tracked as a separate multi-month lab program. The code must be FIPS-ready (aws-lc-rs backend, no non-validated primitives, no unused crypto code paths in the FIPS build) so certification is unblocked when the program starts.
+The perfection endpoint is full FIPS 140-3 certification for the supported binary/deployment profile — module-only linkage is an interim milestone, not the finish line. Near-term deliverable: aws-lc-rs backend, no non-validated primitives in the FIPS build, no dead crypto paths in the FIPS binary, a documented cryptographic module boundary, and an entropy-source statement. These are the preconditions for the CMVP program; the certification timeline runs in parallel as a separate lab engagement.
 
 ### Rate limiting identity
 Per authenticated identity (node_id/tenant_id from cert) for authenticated connections; per source IP for pre-auth traffic (handshake failures, malformed frames). Composition: a connection first hits per-IP counters; once mTLS succeeds, it graduates to per-identity counters. Cert identity is authoritative — per-IP alone fails when legitimate traffic is NATed and doesn't help against authenticated adversaries; per-identity alone can't defend the handshake.
@@ -201,7 +229,7 @@ Explicit fsync at consensus-ack boundaries. Do not trust PLP NVMe. Reasons: (a) 
 Adaptive window with a floor and ceiling. Floor 200µs (low load — prioritize latency). Ceiling 2ms (p99 cap). Between them, window scales with current inflight-write rate so the coalescer expands naturally under load and collapses naturally when idle. Exact formula tuned by benchmarks, but the shape is fixed: `window = clamp(inflight × per_write_cost, 200µs, 2ms)`.
 
 ### Persistent local index
-Custom, purpose-built format, checkpointed atomically alongside WAL fsync. The index is small and domain-specific — pulling in redb or sled adds a dependency, a storage format we don't own, and a tuning surface we don't need. A purpose-built format matches our encryption story, our alignment story, and our recovery story. Fallback to full-scan on index corruption (loud logs, metric alert).
+redb. Changed position after review: the "don't roll your own persistence" principle applies even for index state. redb has a clean ACID story, a small API surface, and active maintenance — which is exactly the trust profile we want for a correctness-critical file. Integration points: index writes are batched with WAL group-commit boundaries so a crashed process sees a consistent `(wal_position, index_version)` pair on restart. Encryption sits above redb via a pre-write encryption layer. Fallback to full-scan remains the corruption-recovery path. Custom format considered and rejected — the domain-specificity win is not worth owning an on-disk format's decade of tail bugs.
 
 ### Repair automation
 Automatic repair from healthy replicas. When the scrubber finds corruption and at least one replica's bytes match a quorum-agreed checksum, the corrupt copy is overwritten automatically. Manual escalation only if no healthy source exists. Rate-limited, I/O-bounded, cryptographically verified before any destructive write. Manual repair in a distributed system is an SRE-hours tax nobody pays.
@@ -225,7 +253,7 @@ All three are pilot blockers because each can OOM the node under modest enterpri
 ## 10. Multi-Tenancy and Tenant-Aware Policy
 
 ### Pilot requirement
-Defer multi-tenancy to post-pilot. Multi-tenancy is a cross-cutting design whose right shape is informed by real-world feedback from the single-tenant pilot. Shipping MT before pilot risks burning the design budget on the wrong abstraction.
+Tenant-aware architecture from day one, even if the first pilot exercises exactly one tenant. Changed position after review: retrofitting multi-tenancy into a shipped architecture is how storage products acquire permanent scar tissue — tenant identity must participate in every durable schema decision (keyspace, ring placement, encryption context, audit record), and it cannot be added later without migrating every artifact. What *is* deferred to post-pilot: advanced tenant *features* (per-tenant topology knobs, quota-based billing, suspend/resume flows, cross-tenant copy). Core tenant-awareness — `tenant_id` threaded through schema, identity, encryption context, and audit — is pilot-mandatory. The default tenant for the single-tenant pilot is still a tenant; the data structures never lose the field.
 
 ### Namespace model
 Separate keyspace per tenant, not shared keyspace with prefixes. Independent compaction, independent ring placement, independent encryption keys, clean offboarding (drop the keyspace, the encryption key, and move on). Prefix sharing couples tenants operationally — one tenant's compaction or hot-key pressure leaks into another's performance envelope, which is exactly what tenant isolation must prevent.
