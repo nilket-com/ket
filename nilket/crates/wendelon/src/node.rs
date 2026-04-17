@@ -59,7 +59,7 @@ use crate::network::transport::{
 	TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
-use crate::schema::{FrameHeader, MsgType, NodeId};
+use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
@@ -127,6 +127,9 @@ pub struct NodeBootstrapConfig {
 	pub cluster: ClusterBootstrapConfig,
 	/// Optional L2 backend for sealed-slab tiering.
 	pub l2: Option<ObjectStoreConfig>,
+	/// Rolling-upgrade compatibility window advertised by this
+	/// node during join and reconnect flows.
+	pub protocol: ProtocolVersionWindow,
 }
 
 impl NodeBootstrapConfig {
@@ -155,7 +158,13 @@ impl NodeBootstrapConfig {
 			trusted_transfer_signers,
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
+			protocol: ProtocolVersionWindow::default(),
 		}
+	}
+
+	pub fn with_protocol_window(mut self, current: u16, min_compatible: u16) -> Self {
+		self.protocol = ProtocolVersionWindow::new(current, min_compatible);
+		self
 	}
 
 	pub fn validate(&self) -> std::io::Result<()> {
@@ -247,6 +256,7 @@ impl NodeBootstrapConfig {
 				}
 			}
 		}
+		wire::validate_protocol_window(self.protocol)?;
 		Ok(())
 	}
 }
@@ -273,6 +283,7 @@ pub struct WendelonNode {
 	pub pool: Arc<BufPool>,
 	pub io: IoRingHandle,
 	pub epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	pub protocol: ProtocolVersionWindow,
 	pub lifecycle: ServerLifecycle,
 	pub handles: NodeHandles,
 }
@@ -540,6 +551,7 @@ impl WendelonNode {
 				cfg.rf as u32,
 				LEASE_TTL_MS,
 			)
+			.with_protocol_window(cfg.protocol)
 			.with_lease_authority(lease_authority.clone())
 			.with_transfer_authority(transfer_authority.clone()),
 		);
@@ -583,6 +595,7 @@ impl WendelonNode {
 						&cfg.advertise_address,
 						local_tiers,
 						advertised_roles(),
+						cfg.protocol,
 						provider.clone(),
 						pool.clone(),
 						seeds,
@@ -643,6 +656,7 @@ impl WendelonNode {
 			pool,
 			io,
 			epoch_tx,
+			protocol: cfg.protocol,
 			lifecycle,
 			handles: NodeHandles {
 				ring_updater,
@@ -799,6 +813,7 @@ async fn request_join_via_seeds(
 	advertise_address: &str,
 	local_tiers: TransportTierSet,
 	local_roles: NodeRoleSet,
+	local_protocol: ProtocolVersionWindow,
 	provider: Arc<dyn TransportProvider>,
 	pool: Arc<BufPool>,
 	seeds: &[SeedNodeConfig],
@@ -808,6 +823,7 @@ async fn request_join_via_seeds(
 		advertise_address: advertise_address.to_string(),
 		tier_bits: local_tiers.as_u8(),
 		role_bits: local_roles.as_u8(),
+		protocol: local_protocol,
 	};
 	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 	let mut last_err: Option<Error> = None;
@@ -826,12 +842,28 @@ async fn request_join_via_seeds(
 			)
 			.await
 			{
-				Ok(resp) if resp.accepted => return Ok(()),
+				Ok(resp) if resp.accepted => {
+					let expected = wire::negotiate_protocol(local_protocol, resp.local_protocol)?;
+					let negotiated_protocol = resp.negotiated_protocol.unwrap_or(expected);
+					if negotiated_protocol != expected {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"join accepted by seed {} with mismatched negotiated protocol {}; expected {}",
+								seed.node_id, negotiated_protocol, expected
+							),
+						));
+					}
+					return Ok(());
+				}
 				Ok(resp) => {
 					last_err = Some(Error::new(
 						match resp.reason_code {
 							crate::network::control_server::CONTROL_REASON_NOT_LEADER => {
 								ErrorKind::NotConnected
+							}
+							crate::network::control_server::CONTROL_REASON_INCOMPATIBLE_VERSION => {
+								ErrorKind::Unsupported
 							}
 							crate::network::control_server::CONTROL_REASON_INVALID_CONFIG => {
 								ErrorKind::InvalidInput
@@ -839,8 +871,12 @@ async fn request_join_via_seeds(
 							_ => ErrorKind::Other,
 						},
 						format!(
-							"join rejected by seed {} (reason_code={}, leader_hint={:?})",
-							seed.node_id, resp.reason_code, resp.leader_hint
+							"join rejected by seed {} (reason_code={}, leader_hint={:?}, local_protocol={}, negotiated_protocol={:?})",
+							seed.node_id,
+							resp.reason_code,
+							resp.leader_hint,
+							resp.local_protocol,
+							resp.negotiated_protocol
 						),
 					));
 				}
@@ -872,7 +908,7 @@ async fn send_join_request(
 	let meta = wire::encode(req)?;
 	let header = FrameHeader {
 		magic: HRFT_MAGIC,
-		version: 1,
+		version: crate::schema::HRFT_ENVELOPE_VERSION,
 		msg_type: MsgType::JOIN_REQ.0,
 		flags: 0,
 		stream_id: 0,

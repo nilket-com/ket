@@ -216,6 +216,7 @@ async fn send_join_request(
 			.with(wendelon::network::transport::NodeRole::Control)
 			.with(wendelon::network::transport::NodeRole::Data)
 			.as_u8(),
+		protocol: wendelon::schema::ProtocolVersionWindow::default(),
 	};
 	let meta = wire::encode(&req).unwrap();
 	let header = FrameHeader {

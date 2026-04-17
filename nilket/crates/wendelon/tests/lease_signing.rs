@@ -87,6 +87,7 @@ fn bootstrap_cfg(
 		trusted_transfer_signers,
 		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
+		protocol: wendelon::schema::ProtocolVersionWindow::default(),
 	}
 }
 

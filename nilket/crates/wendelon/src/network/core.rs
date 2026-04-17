@@ -14,6 +14,7 @@
 //! traffic recycles the same Vec<u8> buffers across every stream.
 
 use crate::network::pool::{BufPool, PooledBuf};
+use crate::network::wire;
 use crate::schema::FrameHeader;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -75,6 +76,7 @@ pub async fn read_frame_header<R: AsyncRead + Unpin + ?Sized>(
 			"invalid HRFT magic bytes",
 		));
 	}
+	wire::validate_frame_version(header.version)?;
 	check_section_len("meta", header.meta_len)?;
 	check_section_len("arrow", header.arrow_len)?;
 	check_section_len("trailing", header.trailing_len)?;

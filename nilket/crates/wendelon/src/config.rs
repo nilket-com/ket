@@ -3,6 +3,7 @@ use crate::network::{
 	transfer_verifying_key_bytes,
 };
 use crate::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig};
+use crate::schema::ProtocolVersionWindow;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -228,6 +229,7 @@ impl RawConfig {
 			trusted_transfer_signers,
 			cluster,
 			l2: None,
+			protocol: ProtocolVersionWindow::default(),
 		};
 		cfg.validate()?;
 		Ok(cfg)

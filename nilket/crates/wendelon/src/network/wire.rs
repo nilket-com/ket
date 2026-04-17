@@ -43,6 +43,7 @@
 //! via `Error::source()`.
 
 use crate::network::pool::{BufPool, PooledBuf};
+use crate::schema::{HRFT_ENVELOPE_VERSION, ProtocolVersionWindow};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::io::{Error, ErrorKind};
@@ -83,6 +84,63 @@ pub fn encode_into<T: Serialize + ?Sized>(
 /// hot path ever needs it.
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> std::io::Result<T> {
 	postcard::from_bytes(bytes).map_err(wire_err_read)
+}
+
+/// Validate the fixed HRFT envelope version carried in
+/// `FrameHeader.version`.
+pub fn validate_frame_version(version: u8) -> std::io::Result<()> {
+	if version == HRFT_ENVELOPE_VERSION {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"unsupported HRFT envelope version {version}; local expects {}",
+			HRFT_ENVELOPE_VERSION
+		),
+	))
+}
+
+/// Validate a rolling-upgrade protocol window before it is used for
+/// negotiation.
+pub fn validate_protocol_window(window: ProtocolVersionWindow) -> std::io::Result<()> {
+	if window.current == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"protocol current version must be greater than zero",
+		));
+	}
+	if window.min_compatible == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"protocol min_compatible must be greater than zero",
+		));
+	}
+	if window.min_compatible > window.current {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("invalid protocol window {window}: min_compatible must not exceed current"),
+		));
+	}
+	Ok(())
+}
+
+/// Negotiate the highest mutually-supported protocol version.
+pub fn negotiate_protocol(
+	local: ProtocolVersionWindow,
+	remote: ProtocolVersionWindow,
+) -> std::io::Result<u16> {
+	validate_protocol_window(local)?;
+	validate_protocol_window(remote)?;
+	let low = local.min_compatible.max(remote.min_compatible);
+	let high = local.current.min(remote.current);
+	if low > high {
+		return Err(Error::new(
+			ErrorKind::Unsupported,
+			format!("incompatible protocol windows: local {local}, remote {remote}"),
+		));
+	}
+	Ok(high)
 }
 
 // ============================================================

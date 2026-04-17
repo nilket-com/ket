@@ -1,6 +1,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
 
 // ============================================================
@@ -279,6 +280,64 @@ pub struct AcquireLeaseResponseMeta {
 }
 
 // ============================================================
+//  ROLLING-UPGRADE VERSION WINDOW
+// ============================================================
+
+/// Fixed HRFT envelope version carried in [`FrameHeader.version`].
+///
+/// This is the framing contract, not the rolling-upgrade skew
+/// window. A peer sending any other envelope version is rejected
+/// before payload decode.
+pub const HRFT_ENVELOPE_VERSION: u8 = 1;
+
+/// Current cluster protocol version advertised by this build.
+///
+/// Rolling upgrades negotiate inside the compatibility window
+/// rather than requiring an exact match on this number.
+pub const CLUSTER_PROTOCOL_VERSION: u16 = 1;
+
+/// Oldest cluster protocol version this build still supports.
+pub const MIN_COMPATIBLE_CLUSTER_PROTOCOL_VERSION: u16 = 1;
+
+/// Rolling-upgrade compatibility window for one node.
+///
+/// The node supports every protocol version in the inclusive
+/// interval `[min_compatible, current]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct ProtocolVersionWindow {
+	pub current: u16,
+	pub min_compatible: u16,
+}
+
+impl ProtocolVersionWindow {
+	pub const fn new(current: u16, min_compatible: u16) -> Self {
+		Self {
+			current,
+			min_compatible,
+		}
+	}
+
+	pub const fn exact(version: u16) -> Self {
+		Self::new(version, version)
+	}
+}
+
+impl Default for ProtocolVersionWindow {
+	fn default() -> Self {
+		Self::new(
+			CLUSTER_PROTOCOL_VERSION,
+			MIN_COMPATIBLE_CLUSTER_PROTOCOL_VERSION,
+		)
+	}
+}
+
+impl fmt::Display for ProtocolVersionWindow {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "{}..={}", self.min_compatible, self.current)
+	}
+}
+
+// ============================================================
 //  FRAME HEADER — 24 bytes, fixed
 //
 //  The universal envelope for all Wendelon protocol messages.
@@ -288,7 +347,7 @@ pub struct AcquireLeaseResponseMeta {
 pub struct FrameHeader {
 	/// Magic bytes: 0x48524654 = "HRFT"
 	pub magic: u32,
-	/// Protocol version; currently 1
+	/// HRFT envelope version; currently [`HRFT_ENVELOPE_VERSION`]
 	pub version: u8,
 	/// Message type discriminant (see MsgType)
 	pub msg_type: u8,

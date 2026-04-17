@@ -26,7 +26,8 @@ use crate::network::transport::{
 use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId, TransferToken, epoch_entry_var_schema,
+	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, TransferToken,
+	epoch_entry_var_schema,
 };
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -47,6 +48,7 @@ pub const CONTROL_REASON_UNSUPPORTED: u8 = 4;
 pub const CONTROL_REASON_INVALID_CONFIG: u8 = 5;
 pub const CONTROL_REASON_INTERNAL_ERROR: u8 = 6;
 pub const CONTROL_REASON_INVALID_TOKEN: u8 = 7;
+pub const CONTROL_REASON_INCOMPATIBLE_VERSION: u8 = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvanceEpochResponseWire {
@@ -61,6 +63,8 @@ pub struct JoinClusterRequestWire {
 	pub advertise_address: String,
 	pub tier_bits: u8,
 	pub role_bits: u8,
+	#[serde(default)]
+	pub protocol: ProtocolVersionWindow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +72,10 @@ pub struct JoinClusterResponseWire {
 	pub accepted: bool,
 	pub reason_code: u8,
 	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub local_protocol: ProtocolVersionWindow,
+	#[serde(default)]
+	pub negotiated_protocol: Option<u16>,
 }
 
 pub struct WendelonControlServer {
@@ -82,6 +90,7 @@ pub struct WendelonControlServer {
 	lease_ttl_cap_ms: u32,
 	lease_authority: Arc<LeaseAuthority>,
 	transfer_authority: Arc<TransferAuthority>,
+	protocol: ProtocolVersionWindow,
 	reconcile_lock: Mutex<()>,
 }
 
@@ -109,6 +118,7 @@ impl WendelonControlServer {
 			lease_ttl_cap_ms,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			transfer_authority: Arc::new(TransferAuthority::dev_single_node(local_node)),
+			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
 		}
 	}
@@ -120,6 +130,11 @@ impl WendelonControlServer {
 
 	pub fn with_transfer_authority(mut self, authority: Arc<TransferAuthority>) -> Self {
 		self.transfer_authority = authority;
+		self
+	}
+
+	pub fn with_protocol_window(mut self, protocol: ProtocolVersionWindow) -> Self {
+		self.protocol = protocol;
 		self
 	}
 
@@ -440,40 +455,76 @@ impl WendelonControlServer {
 				accepted: false,
 				reason_code: CONTROL_REASON_INVALID_CONFIG,
 				leader_hint: self.leader_hint().await,
+				local_protocol: self.protocol,
+				negotiated_protocol: None,
 			},
-			Ok(()) if self.is_leader().await => match self.accept_join(&req).await {
-				Ok(()) => JoinClusterResponseWire {
-					accepted: true,
-					reason_code: CONTROL_REASON_GRANTED,
-					leader_hint: Some(self.local_node.id),
-				},
-				Err(err) if err.kind() == ErrorKind::InvalidInput => JoinClusterResponseWire {
-					accepted: false,
-					reason_code: CONTROL_REASON_INVALID_CONFIG,
-					leader_hint: Some(self.local_node.id),
-				},
-				Err(err) if err.kind() == ErrorKind::NotConnected => JoinClusterResponseWire {
-					accepted: false,
-					reason_code: CONTROL_REASON_NOT_LEADER,
-					leader_hint: self.leader_hint().await,
-				},
-				Err(_) => JoinClusterResponseWire {
-					accepted: false,
-					reason_code: CONTROL_REASON_INTERNAL_ERROR,
-					leader_hint: self.leader_hint().await,
-				},
-			},
+			Ok(()) if self.is_leader().await => {
+				match wire::negotiate_protocol(self.protocol, req.protocol) {
+					Ok(negotiated_protocol) => match self.accept_join(&req).await {
+						Ok(()) => JoinClusterResponseWire {
+							accepted: true,
+							reason_code: CONTROL_REASON_GRANTED,
+							leader_hint: Some(self.local_node.id),
+							local_protocol: self.protocol,
+							negotiated_protocol: Some(negotiated_protocol),
+						},
+						Err(err) if err.kind() == ErrorKind::InvalidInput => {
+							JoinClusterResponseWire {
+								accepted: false,
+								reason_code: CONTROL_REASON_INVALID_CONFIG,
+								leader_hint: Some(self.local_node.id),
+								local_protocol: self.protocol,
+								negotiated_protocol: None,
+							}
+						}
+						Err(err) if err.kind() == ErrorKind::NotConnected => {
+							JoinClusterResponseWire {
+								accepted: false,
+								reason_code: CONTROL_REASON_NOT_LEADER,
+								leader_hint: self.leader_hint().await,
+								local_protocol: self.protocol,
+								negotiated_protocol: None,
+							}
+						}
+						Err(_) => JoinClusterResponseWire {
+							accepted: false,
+							reason_code: CONTROL_REASON_INTERNAL_ERROR,
+							leader_hint: self.leader_hint().await,
+							local_protocol: self.protocol,
+							negotiated_protocol: None,
+						},
+					},
+					Err(_err) if _err.kind() == ErrorKind::Unsupported => JoinClusterResponseWire {
+						accepted: false,
+						reason_code: CONTROL_REASON_INCOMPATIBLE_VERSION,
+						leader_hint: Some(self.local_node.id),
+						local_protocol: self.protocol,
+						negotiated_protocol: None,
+					},
+					Err(_) => JoinClusterResponseWire {
+						accepted: false,
+						reason_code: CONTROL_REASON_INVALID_CONFIG,
+						leader_hint: Some(self.local_node.id),
+						local_protocol: self.protocol,
+						negotiated_protocol: None,
+					},
+				}
+			}
 			Ok(()) => match self.forward_join_request(&frame, &req).await {
 				Ok(resp) => resp,
 				Err(err) if err.kind() == ErrorKind::NotConnected => JoinClusterResponseWire {
 					accepted: false,
 					reason_code: CONTROL_REASON_NOT_LEADER,
 					leader_hint: self.leader_hint().await,
+					local_protocol: self.protocol,
+					negotiated_protocol: None,
 				},
 				Err(_) => JoinClusterResponseWire {
 					accepted: false,
 					reason_code: CONTROL_REASON_INTERNAL_ERROR,
 					leader_hint: self.leader_hint().await,
+					local_protocol: self.protocol,
+					negotiated_protocol: None,
 				},
 			},
 		};
@@ -879,6 +930,7 @@ impl WendelonControlServer {
 				"join request must advertise Control Ring and Data Ring roles",
 			));
 		}
+		wire::validate_protocol_window(req.protocol)?;
 		Ok(())
 	}
 
@@ -972,7 +1024,7 @@ impl WendelonControlServer {
 		let meta = wire::encode(req)?;
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
-			version: 1,
+			version: crate::schema::HRFT_ENVELOPE_VERSION,
 			msg_type: MsgType::JOIN_REQ.0,
 			flags: 0,
 			stream_id: frame.header.stream_id,
