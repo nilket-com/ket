@@ -339,6 +339,7 @@ async fn build_manager_with_sealed_slabs(
 			max_slab_bytes: 1,
 			io,
 			l2,
+			rehydration: wendelon::storage::RehydrationPolicy::default(),
 		})
 		.unwrap(),
 	);

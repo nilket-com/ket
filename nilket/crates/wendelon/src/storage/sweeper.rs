@@ -228,6 +228,9 @@ impl SlabSweeper {
 		let reclaim = self.reclaim_tombstoned_ranges_once(1).await?;
 		report.reclaimed_slabs = reclaim.compacted_slabs;
 		report.reclaimed_bytes = reclaim.reclaimed_bytes;
+		let rehydrated = self.reclaim_rehydrated_slabs_once().await?;
+		report.rehydrated_reclaimed = rehydrated.reclaimed;
+		report.skipped_rehydration_guard = rehydrated.skipped_guard;
 		Ok(report)
 	}
 
@@ -316,6 +319,21 @@ impl SlabSweeper {
 			.await
 	}
 
+	async fn reclaim_rehydrated_slabs_once(&self) -> std::io::Result<RehydrationSweepReport> {
+		let mut report = RehydrationSweepReport::default();
+		let now = Instant::now();
+		for candidate in self.slab.list_rehydrated_slabs().await {
+			if candidate.keep_local_until > now {
+				report.skipped_guard += 1;
+				continue;
+			}
+			if self.slab.drop_rehydrated_slab(candidate.slab_id).await? {
+				report.reclaimed += 1;
+			}
+		}
+		Ok(report)
+	}
+
 	/// Token-bucket rate limiter. For V1 we keep it simple —
 	/// every upload blocks long enough to respect
 	/// `max_upload_bytes_per_sec`. The bucket has no burst credit
@@ -370,8 +388,16 @@ pub struct SweepReport {
 	pub failed: usize,
 	pub skipped_too_small: usize,
 	pub skipped_already_tiered: usize,
+	pub skipped_rehydration_guard: usize,
+	pub rehydrated_reclaimed: usize,
 	pub reclaimed_slabs: usize,
 	pub reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RehydrationSweepReport {
+	reclaimed: usize,
+	skipped_guard: usize,
 }
 
 // ============================================================
@@ -481,6 +507,7 @@ mod tests {
 				max_slab_bytes: 1,
 				io,
 				l2,
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			})
 			.unwrap(),
 		);

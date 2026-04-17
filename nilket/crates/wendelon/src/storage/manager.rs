@@ -49,11 +49,15 @@ use crate::storage::core::{
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
-use std::io::{Error, ErrorKind};
+use std::collections::{HashMap, HashSet};
+use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
@@ -71,6 +75,29 @@ pub struct SlabManagerConfig {
 	/// `NotFound` — a missing L2 handle on a tiered slab is a
 	/// configuration bug, not a miss.
 	pub l2: Option<Arc<dyn ObjectStore>>,
+	/// Policy for promoting hot tiered slabs back into local L1
+	/// storage.
+	pub rehydration: RehydrationPolicy,
+}
+
+/// Policy that governs L2 -> L1 slab rehydration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RehydrationPolicy {
+	/// Number of L2-served reads a slab must accumulate before the
+	/// manager restores a local copy. `0` disables rehydration.
+	pub promote_after_l2_reads: u32,
+	/// Minimum amount of time a rehydrated local copy must remain
+	/// resident before the sweeper may reclaim it again.
+	pub min_local_residency: Duration,
+}
+
+impl Default for RehydrationPolicy {
+	fn default() -> Self {
+		Self {
+			promote_after_l2_reads: 3,
+			min_local_residency: Duration::from_secs(60),
+		}
+	}
 }
 
 /// Summary of a sealed slab, handed out by
@@ -82,6 +109,17 @@ pub struct SlabManagerConfig {
 pub struct SealedSlabInfo {
 	pub slab_id: u64,
 	pub size_bytes: u64,
+}
+
+/// Summary of a locally rehydrated slab. The authoritative tier
+/// metadata still points at L2; this struct only describes the
+/// temporary L1 cache copy and the cooldown that protects it from
+/// immediate reclamation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RehydratedSlabInfo {
+	pub slab_id: u64,
+	pub size_bytes: u64,
+	pub keep_local_until: Instant,
 }
 
 /// Outcome of a single [`SlabManager::append_migration`] call.
@@ -130,6 +168,12 @@ pub struct SlabManager {
 	relocated_reads: DashMap<RecordLocation, RecordLocation>,
 }
 
+#[derive(Clone)]
+struct RehydratedSlabState {
+	slab: Arc<LocalSlabStore>,
+	keep_local_until: Instant,
+}
+
 struct ManagerState {
 	active: Arc<LocalSlabStore>,
 	/// Sealed slabs keyed by `slab_id`. Read-only from the
@@ -140,10 +184,21 @@ struct ManagerState {
 	sealed: DashMap<u64, Arc<LocalSlabStore>>,
 	/// Slabs whose payload now lives in L2. Keyed by `slab_id`;
 	/// the value is the URI the read path hands to
-	/// [`ObjectStore::get`]. Entries here shadow any same-id entry
-	/// in `sealed` — the tier pivot removes from `sealed` before
-	/// inserting here.
+	/// [`ObjectStore::get`]. Ordinary tiering removes the slab from
+	/// `sealed` before inserting here; a later rehydration may add
+	/// a separate local cache copy in `rehydrated` while L2 stays
+	/// authoritative.
 	tiered: DashMap<u64, TieredSlabPointer>,
+	/// Local L1 cache copies of slabs whose authoritative bytes
+	/// still live in L2. Kept outside `sealed` so compaction and
+	/// ordinary L1 -> L2 demotion never mistake a cache copy for a
+	/// new authoritative slab.
+	rehydrated: DashMap<u64, RehydratedSlabState>,
+	/// Consecutive reads that had to fetch a slab from L2.
+	hot_read_counts: HashMap<u64, u32>,
+	/// Slabs currently being restored from L2 to L1. Guards the
+	/// hot-read path against duplicate local installs.
+	rehydrating: HashSet<u64>,
 	next_slab_id: u64,
 }
 
@@ -208,7 +263,7 @@ impl SlabManager {
 	/// rotation, so the sweeper needs a manager-wide barrier rather
 	/// than a single-slab `fsync`.
 	pub async fn fsync_all_local_slabs(&self) -> std::io::Result<()> {
-		let (active, sealed) = {
+		let (active, sealed, rehydrated) = {
 			let state = self.state.lock().await;
 			let active = state.active.clone();
 			let sealed = state
@@ -216,11 +271,19 @@ impl SlabManager {
 				.iter()
 				.map(|entry| entry.value().clone())
 				.collect::<Vec<_>>();
-			(active, sealed)
+			let rehydrated = state
+				.rehydrated
+				.iter()
+				.map(|entry| entry.value().slab.clone())
+				.collect::<Vec<_>>();
+			(active, sealed, rehydrated)
 		};
 
 		active.fsync().await?;
 		for slab in sealed {
+			slab.fsync().await?;
+		}
+		for slab in rehydrated {
 			slab.fsync().await?;
 		}
 		Ok(())
@@ -262,6 +325,7 @@ impl SlabManager {
 		let key_index: DashMap<u64, Vec<RecordLocation>> = DashMap::new();
 		let sealed: DashMap<u64, Arc<LocalSlabStore>> = DashMap::new();
 		let tiered: DashMap<u64, TieredSlabPointer> = DashMap::new();
+		let rehydrated: DashMap<u64, RehydratedSlabState> = DashMap::new();
 
 		let (active, next_slab_id) = if existing_ids.is_empty() {
 			let id: u64 = 0;
@@ -301,6 +365,9 @@ impl SlabManager {
 				active,
 				sealed,
 				tiered,
+				rehydrated,
+				hot_read_counts: HashMap::new(),
+				rehydrating: HashSet::new(),
 				next_slab_id,
 			}),
 			key_index,
@@ -324,6 +391,12 @@ impl SlabManager {
 		self.state.lock().await.tiered.len()
 	}
 
+	/// Test / diagnostic accessor: number of rehydrated local L1
+	/// cache copies currently resident.
+	pub async fn rehydrated_count(&self) -> usize {
+		self.state.lock().await.rehydrated.len()
+	}
+
 	/// Snapshot of every sealed slab eligible for tiering. The
 	/// sweeper uses this to decide what to ship to L2.
 	/// The active slab is excluded by construction — only slabs
@@ -342,6 +415,23 @@ impl SlabManager {
 		out
 	}
 
+	/// Snapshot of every tiered slab that currently also has a
+	/// local rehydrated L1 copy. Used by the sweeper to apply the
+	/// residency cooldown before reclaiming those cache copies.
+	pub async fn list_rehydrated_slabs(&self) -> Vec<RehydratedSlabInfo> {
+		let state = self.state.lock().await;
+		let mut out = Vec::with_capacity(state.rehydrated.len());
+		for entry in state.rehydrated.iter() {
+			out.push(RehydratedSlabInfo {
+				slab_id: *entry.key(),
+				size_bytes: entry.value().slab.write_cursor(),
+				keep_local_until: entry.value().keep_local_until,
+			});
+		}
+		out.sort_by_key(|s| s.slab_id);
+		out
+	}
+
 	/// Total bytes currently retained in local L1 slabs.
 	///
 	/// Counts the active slab plus every sealed slab that still
@@ -352,6 +442,9 @@ impl SlabManager {
 		let mut total = state.active.write_cursor();
 		for entry in state.sealed.iter() {
 			total = total.saturating_add(entry.value().write_cursor());
+		}
+		for entry in state.rehydrated.iter() {
+			total = total.saturating_add(entry.value().slab.write_cursor());
 		}
 		total
 	}
@@ -392,14 +485,17 @@ impl SlabManager {
 	///   survives the unlink (Linux semantics) — zero downtime
 	///   for readers mid-flight.
 	pub async fn apply_tier_slab(&self, pointer: TieredSlabPointer) -> std::io::Result<()> {
-		let state = self.state.lock().await;
+		let mut state = self.state.lock().await;
 		// Idempotent: a replay of the Raft TierSlab entry must not
 		// fail. If we're already tiered, accept the no-op.
 		if state.tiered.contains_key(&pointer.slab_id) {
 			return Ok(());
 		}
 		let _old = state.sealed.remove(&pointer.slab_id);
+		let _old = state.rehydrated.remove(&pointer.slab_id);
 		state.tiered.insert(pointer.slab_id, pointer.clone());
+		state.hot_read_counts.remove(&pointer.slab_id);
+		state.rehydrating.remove(&pointer.slab_id);
 		// Unlink the L1 file. Open fds held by in-flight reads
 		// continue to work; new reads find the entry in `tiered`
 		// and go to L2.
@@ -418,6 +514,12 @@ impl SlabManager {
 		self.state.lock().await.tiered.contains_key(&slab_id)
 	}
 
+	/// Whether a tiered slab currently also has a rehydrated local
+	/// copy in L1.
+	pub async fn is_rehydrated(&self, slab_id: u64) -> bool {
+		self.state.lock().await.rehydrated.contains_key(&slab_id)
+	}
+
 	/// Lookup the L2 pointer for a tiered slab.
 	pub async fn tier_pointer(&self, slab_id: u64) -> Option<TieredSlabPointer> {
 		self.state
@@ -426,6 +528,29 @@ impl SlabManager {
 			.tiered
 			.get(&slab_id)
 			.map(|p| p.clone())
+	}
+
+	/// Best-effort reclaim of one rehydrated local cache copy. The
+	/// authoritative L2 pointer remains intact; only the temporary
+	/// L1 file is removed.
+	pub async fn drop_rehydrated_slab(&self, slab_id: u64) -> std::io::Result<bool> {
+		let removed = {
+			let state = self.state.lock().await;
+			if state.rehydrating.contains(&slab_id) {
+				return Ok(false);
+			}
+			state.rehydrated.remove(&slab_id).map(|(_, state)| state)
+		};
+		let Some(_state) = removed else {
+			return Ok(false);
+		};
+		let path = slab_path(&self.config.dir, slab_id);
+		match std::fs::remove_file(&path) {
+			Ok(()) => {}
+			Err(err) if err.kind() == ErrorKind::NotFound => {}
+			Err(err) => return Err(err),
+		}
+		Ok(true)
 	}
 
 	/// Enumerate every live `(key_hash, RecordLocation)` whose hash
@@ -661,14 +786,17 @@ impl SlabManager {
 	/// unlinked L1 file.
 	async fn resolve_backing(&self, slab_id: u64) -> SlabBacking {
 		let state = self.state.lock().await;
-		if let Some(p) = state.tiered.get(&slab_id) {
-			return SlabBacking::L2(p.clone());
-		}
 		if state.active.slab_id() == slab_id {
 			return SlabBacking::Local(state.active.clone());
 		}
 		if let Some(s) = state.sealed.get(&slab_id) {
 			return SlabBacking::Local(s.clone());
+		}
+		if let Some(s) = state.rehydrated.get(&slab_id) {
+			return SlabBacking::Local(s.slab.clone());
+		}
+		if let Some(p) = state.tiered.get(&slab_id) {
+			return SlabBacking::L2(p.clone());
 		}
 		SlabBacking::Missing
 	}
@@ -921,10 +1049,9 @@ impl SlabManager {
 		Ok(true)
 	}
 
-	/// Fetch a single record from L2. V1 downloads the whole slab
-	/// blob and carves out the record range; a follow-up will
-	/// teach [`ObjectStore`] about ranged GETs so only the record
-	/// window crosses the wire.
+	/// Fetch a single record from L2, then decide whether that L2
+	/// read was hot enough to justify rehydrating the whole slab
+	/// back into local L1 storage.
 	async fn read_from_l2(
 		&self,
 		pointer: &TieredSlabPointer,
@@ -939,34 +1066,97 @@ impl SlabManager {
 				),
 			)
 		})?;
-		let blob = l2.get(&pointer.l2_uri).await?;
-		let offset = location.offset as usize;
-		let length = location.length as usize;
-		// The record layout in L2 matches L1 exactly — the sweeper
-		// uploads the raw slab file verbatim. Re-materialise via
-		// the same wire header parsing that `LocalSlabStore::read`
-		// uses.
-		let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
-		if blob.len() < offset + header_size {
-			return Err(Error::new(
-				ErrorKind::UnexpectedEof,
-				"L2 blob shorter than record header",
-			));
+		let blob = l2.get_bytes(&pointer.l2_uri).await?;
+		validate_tiered_blob(pointer, blob.as_ref())?;
+		let frame = extract_record_from_blob(blob.as_ref(), location)?;
+		if self.note_l2_read(pointer.slab_id).await {
+			if let Err(err) = self
+				.rehydrate_tiered_slab(pointer.clone(), blob.clone())
+				.await
+			{
+				tracing::warn!(
+					slab_id = pointer.slab_id,
+					error = %err,
+					"rehydration failed; continuing to serve slab from L2"
+				);
+			}
 		}
-		let header: &crate::schema::SlabRecordHeader =
-			bytemuck::from_bytes(&blob[offset..offset + header_size]);
-		let frame_len = header.frame_len as usize;
-		let end = offset
-			.checked_add(header_size)
-			.and_then(|h| h.checked_add(frame_len))
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
-		if end > blob.len() || location.length as usize > length.max(header_size + frame_len) {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"L2 record extends past downloaded blob",
-			));
+		Ok(frame)
+	}
+
+	async fn note_l2_read(&self, slab_id: u64) -> bool {
+		let promote_after = self.config.rehydration.promote_after_l2_reads;
+		if promote_after == 0 {
+			return false;
 		}
-		Ok(blob[offset + header_size..end].to_vec())
+		let mut state = self.state.lock().await;
+		if state.rehydrated.contains_key(&slab_id) || state.rehydrating.contains(&slab_id) {
+			return false;
+		}
+		let hits = state.hot_read_counts.entry(slab_id).or_insert(0);
+		*hits = hits.saturating_add(1);
+		if *hits < promote_after {
+			return false;
+		}
+		state.rehydrating.insert(slab_id);
+		true
+	}
+
+	async fn rehydrate_tiered_slab(
+		&self,
+		pointer: TieredSlabPointer,
+		blob: Bytes,
+	) -> std::io::Result<()> {
+		let result = self.install_rehydrated_local_copy(pointer.slab_id, blob.as_ref());
+		let mut state = self.state.lock().await;
+		state.rehydrating.remove(&pointer.slab_id);
+		match result {
+			Ok(installed) => {
+				state.hot_read_counts.remove(&pointer.slab_id);
+				state.rehydrated.insert(pointer.slab_id, installed);
+				Ok(())
+			}
+			Err(err) => {
+				let retry_floor = self
+					.config
+					.rehydration
+					.promote_after_l2_reads
+					.saturating_sub(1);
+				if retry_floor == 0 {
+					state.hot_read_counts.remove(&pointer.slab_id);
+				} else {
+					state.hot_read_counts.insert(pointer.slab_id, retry_floor);
+				}
+				Err(err)
+			}
+		}
+	}
+
+	fn install_rehydrated_local_copy(
+		&self,
+		slab_id: u64,
+		blob: &[u8],
+	) -> std::io::Result<RehydratedSlabState> {
+		let path = slab_path(&self.config.dir, slab_id);
+		let tmp_path = rehydrate_tmp_path(&self.config.dir, slab_id);
+		match std::fs::remove_file(&tmp_path) {
+			Ok(()) => {}
+			Err(err) if err.kind() == ErrorKind::NotFound => {}
+			Err(err) => return Err(err),
+		}
+		let mut tmp = std::fs::File::create(&tmp_path)?;
+		tmp.write_all(blob)?;
+		tmp.sync_all()?;
+		std::fs::rename(&tmp_path, &path)?;
+		let slab = Arc::new(LocalSlabStore::open(
+			&path,
+			slab_id,
+			self.config.io.clone(),
+		)?);
+		Ok(RehydratedSlabState {
+			slab,
+			keep_local_until: Instant::now() + self.config.rehydration.min_local_residency,
+		})
 	}
 }
 
@@ -993,8 +1183,54 @@ struct CompactionOutcome {
 //  HELPERS
 // ============================================================
 
+fn validate_tiered_blob(pointer: &TieredSlabPointer, blob: &[u8]) -> std::io::Result<()> {
+	let actual = *blake3::hash(blob).as_bytes();
+	if actual != pointer.payload_hash {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"L2 payload hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+				pointer.slab_id,
+				&pointer.payload_hash[..4],
+				&actual[..4],
+			),
+		));
+	}
+	Ok(())
+}
+
+fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::Result<Vec<u8>> {
+	let offset = location.offset as usize;
+	let length = location.length as usize;
+	let header_size = std::mem::size_of::<crate::schema::SlabRecordHeader>();
+	if blob.len() < offset + header_size {
+		return Err(Error::new(
+			ErrorKind::UnexpectedEof,
+			"L2 blob shorter than record header",
+		));
+	}
+	let header: &crate::schema::SlabRecordHeader =
+		bytemuck::from_bytes(&blob[offset..offset + header_size]);
+	let frame_len = header.frame_len as usize;
+	let end = offset
+		.checked_add(header_size)
+		.and_then(|h| h.checked_add(frame_len))
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_len overflows usize"))?;
+	if end > blob.len() || header_size + frame_len > length {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"L2 record extends past downloaded blob",
+		));
+	}
+	Ok(blob[offset + header_size..end].to_vec())
+}
+
 fn slab_path(dir: &Path, slab_id: u64) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd", slab_id))
+}
+
+fn rehydrate_tmp_path(dir: &Path, slab_id: u64) -> PathBuf {
+	dir.join(format!("slab_{:016x}.wnd.rehydrate.tmp", slab_id))
 }
 
 /// Parse a filename of the form `slab_<16-hex>.wnd` into a slab id.
@@ -1086,6 +1322,7 @@ mod tests {
 				max_slab_bytes: 1024 * 1024,
 				io,
 				l2: None,
+				rehydration: RehydrationPolicy::default(),
 			})
 			.unwrap(),
 		)

@@ -3255,6 +3255,7 @@ mod tests {
 				max_slab_bytes: 1 << 30,
 				io,
 				l2: None,
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			})
 			.unwrap(),
 		)
@@ -4625,6 +4626,7 @@ mod tests {
 					max_slab_bytes,
 					io: io.clone(),
 					l2: None,
+					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				})
 				.unwrap(),
 			);
@@ -4660,6 +4662,7 @@ mod tests {
 					max_slab_bytes: self.max_slab_bytes,
 					io: self.io.clone(),
 					l2: None,
+					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				})
 				.unwrap(),
 			);

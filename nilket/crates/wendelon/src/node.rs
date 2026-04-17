@@ -221,6 +221,7 @@ impl WendelonNode {
 			max_slab_bytes: cfg.slab_max_bytes,
 			io: io.clone(),
 			l2,
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 		})?);
 
 		// 4. Durable Raft storage + recovered state machine.

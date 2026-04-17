@@ -36,6 +36,7 @@
 //! loudly rather than silently sliding into "some other file".
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use opendal::layers::RetryLayer;
 use opendal::services::S3;
 use opendal::{ErrorKind as OpendalErrorKind, Operator};
@@ -59,10 +60,18 @@ pub trait ObjectStore: Send + Sync {
 	/// hash is the durability oracle.
 	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String>;
 
+	/// Fetch the full object previously uploaded to `uri` as shared
+	/// bytes so callers can cheaply fan the payload out to both the
+	/// hot-read path and a rehydration install without cloning a
+	/// second slab-sized buffer.
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes>;
+
 	/// Fetch the full object previously uploaded to `uri`. The
 	/// sweeper uses this for its post-upload hash verification;
 	/// the read path uses it for L1-evicted lookups.
-	async fn get(&self, uri: &str) -> std::io::Result<Vec<u8>>;
+	async fn get(&self, uri: &str) -> std::io::Result<Vec<u8>> {
+		Ok(self.get_bytes(uri).await?.to_vec())
+	}
 
 	/// Remove the object previously uploaded to `uri`. Not on the
 	/// V1 sweeper's hot path (the L1 unlink is the primary GC
@@ -305,14 +314,14 @@ impl ObjectStore for RemoteObjectStore {
 		Ok(self.uri_for_key(key))
 	}
 
-	async fn get(&self, uri: &str) -> std::io::Result<Vec<u8>> {
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
 		let key = self.key_from_uri(uri)?;
 		let buffer = self
 			.operator
 			.read(&key)
 			.await
 			.map_err(|err| opendal_error("remote object get failed", err))?;
-		Ok(buffer.to_vec())
+		Ok(Bytes::from(buffer.to_vec()))
 	}
 
 	async fn delete(&self, uri: &str) -> std::io::Result<()> {
@@ -397,9 +406,9 @@ impl ObjectStore for LocalFsObjectStore {
 		Ok(format!("file://{}", canonical.display()))
 	}
 
-	async fn get(&self, uri: &str) -> std::io::Result<Vec<u8>> {
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
 		let path = self.resolve(uri)?;
-		fs::read(path)
+		Ok(Bytes::from(fs::read(path)?))
 	}
 
 	async fn delete(&self, uri: &str) -> std::io::Result<()> {
