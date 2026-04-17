@@ -83,9 +83,16 @@ async fn main() -> ExitCode {
 	};
 	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
 
-	// Block until the process is signalled. The watchdogs and ring
-	// updater are held by `node.handles` and abort on drop.
 	tokio::signal::ctrl_c().await.ok();
-	eprintln!("wendelon: shutting down");
+	eprintln!("wendelon: draining");
+	if let Err(e) = node.shutdown().await {
+		eprintln!("shutdown failed: {e}");
+		return ExitCode::from(1);
+	}
+	if let Some(metrics) = _metrics {
+		metrics.task.abort();
+		let _ = metrics.task.await;
+	}
+	eprintln!("wendelon: shutdown complete");
 	ExitCode::SUCCESS
 }

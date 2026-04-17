@@ -19,9 +19,10 @@
 //!   optional `quinn::Endpoint` in via [`WendelonNode::attach_quic`].
 //! * CLI parsing / config file loading — `src/main.rs` handles that
 //!   and hands [`NodeBootstrapConfig`] in fully populated.
-//! * Graceful shutdown — the returned [`NodeHandles`] holds every
-//!   background join handle so the owner can await or abort them;
-//!   the eviction + drift watchdogs run forever by design.
+//! * Graceful shutdown orchestration beyond the node's explicit
+//!   drain hooks. Background maintenance loops are still separate
+//!   tasks; [`WendelonNode::shutdown`] aborts and joins them once
+//!   request drain has completed.
 
 use crate::consensus::WendelonRaft;
 use crate::consensus::monitor::{
@@ -49,7 +50,7 @@ use crate::network::lease_signing::{
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
-use crate::network::server::{HrftService, serve};
+use crate::network::server::{HrftService, LifecycleService, ServerLifecycle, serve};
 use crate::network::transfer_signing::{
 	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
 };
@@ -267,10 +268,12 @@ pub struct WendelonNode {
 	pub state_machine: WendelonStateMachine,
 	pub ring: Arc<RingRouter>,
 	pub router: Arc<MsgRouter>,
+	pub service: Arc<dyn HrftService>,
 	pub data_server: Arc<WendelonDataServer>,
 	pub pool: Arc<BufPool>,
 	pub io: IoRingHandle,
 	pub epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	pub lifecycle: ServerLifecycle,
 	pub handles: NodeHandles,
 }
 
@@ -283,6 +286,64 @@ pub struct NodeHandles {
 	pub lease_manager: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
+}
+
+impl NodeHandles {
+	pub fn abort(&self) {
+		self.ring_updater.abort();
+		self.drift_monitor.abort();
+		self.eviction_watchdog.abort();
+		self.lease_manager.abort();
+		self.epoch_reconciler.abort();
+		self.migration_sweeper.abort();
+	}
+
+	pub async fn shutdown(self) -> std::io::Result<()> {
+		self.abort();
+		await_background_task(self.ring_updater, "ring updater").await?;
+		await_background_task(self.drift_monitor, "drift monitor").await?;
+		await_background_task(self.eviction_watchdog, "eviction watchdog").await?;
+		await_background_task(self.lease_manager, "lease manager").await?;
+		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
+		await_background_task(self.migration_sweeper, "migration sweeper").await?;
+		Ok(())
+	}
+}
+
+async fn await_background_task(handle: JoinHandle<()>, label: &str) -> std::io::Result<()> {
+	match handle.await {
+		Ok(()) => Ok(()),
+		Err(err) if err.is_cancelled() => Ok(()),
+		Err(err) => Err(Error::new(
+			ErrorKind::Other,
+			format!("{label} task failed during shutdown: {err}"),
+		)),
+	}
+}
+
+pub struct QuicServerHandle {
+	endpoint: quinn::Endpoint,
+	lifecycle: ServerLifecycle,
+	task: JoinHandle<std::io::Result<()>>,
+}
+
+impl QuicServerHandle {
+	pub fn begin_drain(&self) {
+		self.endpoint.set_server_config(None);
+		self.lifecycle.begin_drain();
+	}
+
+	pub async fn shutdown(self) -> std::io::Result<()> {
+		self.begin_drain();
+		let result = self.task.await.map_err(|err| {
+			Error::new(
+				ErrorKind::Other,
+				format!("QUIC server task failed during shutdown: {err}"),
+			)
+		})?;
+		self.endpoint.wait_idle().await;
+		result
+	}
 }
 
 /// Time-to-live the lease manager requests on every grant. The
@@ -492,8 +553,10 @@ impl WendelonNode {
 				.with_raft_internal(raft_server)
 				.build(),
 		);
-		let published_router: Arc<dyn HrftService> = router.clone();
-		provider.publish_local(local_node, &cfg.advertise_address, published_router)?;
+		let lifecycle = ServerLifecycle::new();
+		let service: Arc<dyn HrftService> =
+			Arc::new(LifecycleService::new(router.clone(), lifecycle.clone()));
+		provider.publish_local(local_node, &cfg.advertise_address, service.clone())?;
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
 		// 14. Fresh nodes either initialize a one-node cluster or
@@ -575,10 +638,12 @@ impl WendelonNode {
 			state_machine,
 			ring,
 			router,
+			service,
 			data_server,
 			pool,
 			io,
 			epoch_tx,
+			lifecycle,
 			handles: NodeHandles {
 				ring_updater,
 				drift_monitor,
@@ -593,10 +658,34 @@ impl WendelonNode {
 	/// Spawn the QUIC accept loop against an already-bound
 	/// `quinn::Endpoint`. Kept separate from bootstrap so tests can
 	/// exercise the in-process surface without binding a socket.
-	pub fn serve_quic(&self, endpoint: quinn::Endpoint) -> JoinHandle<std::io::Result<()>> {
-		let svc: Arc<dyn HrftService> = self.router.clone();
+	pub fn serve_quic(&self, endpoint: quinn::Endpoint) -> QuicServerHandle {
+		let svc = self.service.clone();
 		let pool = self.pool.clone();
-		tokio::spawn(async move { serve_dyn(endpoint, svc, pool).await })
+		let task_endpoint = endpoint.clone();
+		let lifecycle = self.lifecycle.clone();
+		let task = tokio::spawn({
+			let lifecycle = lifecycle.clone();
+			async move { serve_dyn(task_endpoint, svc, pool, lifecycle).await }
+		});
+		QuicServerHandle {
+			endpoint,
+			lifecycle,
+			task,
+		}
+	}
+
+	pub fn begin_drain(&self) {
+		self.lifecycle.begin_drain();
+	}
+
+	pub async fn wait_for_drain(&self) {
+		self.lifecycle.wait_for_quiescence().await;
+	}
+
+	pub async fn shutdown(self) -> std::io::Result<()> {
+		self.lifecycle.begin_drain();
+		self.lifecycle.wait_for_quiescence().await;
+		self.handles.shutdown().await
 	}
 }
 
@@ -607,6 +696,7 @@ async fn serve_dyn(
 	endpoint: quinn::Endpoint,
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -628,7 +718,7 @@ async fn serve_dyn(
 			self.0.handle_stream(stream, pool, remote).await
 		}
 	}
-	serve(endpoint, Arc::new(DynService(service)), pool).await
+	serve(endpoint, Arc::new(DynService(service)), pool, lifecycle).await
 }
 
 // ============================================================

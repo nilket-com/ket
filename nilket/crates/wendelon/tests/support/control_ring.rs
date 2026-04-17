@@ -93,6 +93,7 @@ pub async fn wait_for_local_leader(node: &WendelonNode) {
 	}
 }
 
+#[allow(dead_code)]
 pub fn abort_node(node: &WendelonNode) {
 	node.handles.ring_updater.abort();
 	node.handles.drift_monitor.abort();

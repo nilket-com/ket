@@ -51,8 +51,6 @@
 //!   [`crate::schema::MsgType::STREAM_FIN_EVT`] push).
 //! * 0-RTT or datagram paths.
 //! * Backpressure / per-tenant quotas.
-//! * Graceful shutdown coordination — today the serve loop only
-//!   exits when the endpoint itself is closed externally.
 
 use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
@@ -64,6 +62,188 @@ use async_trait::async_trait;
 use quinn::Endpoint;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::sync::watch;
+
+// ============================================================
+//  LIFECYCLE
+// ============================================================
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LifecycleState {
+	draining: bool,
+	in_flight: usize,
+}
+
+struct LifecycleInner {
+	state: Mutex<LifecycleState>,
+	tx: watch::Sender<LifecycleState>,
+}
+
+/// Shared request-lifecycle gate for a published HRFT surface.
+///
+/// `begin_drain()` flips the surface into a "no new work" mode.
+/// Existing requests keep running until their guards drop; callers
+/// awaiting [`wait_for_quiescence`](Self::wait_for_quiescence)
+/// observe completion only after every in-flight guard has drained.
+#[derive(Clone)]
+pub struct ServerLifecycle {
+	inner: Arc<LifecycleInner>,
+}
+
+impl Default for ServerLifecycle {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl ServerLifecycle {
+	pub fn new() -> Self {
+		let initial = LifecycleState::default();
+		let (tx, _rx) = watch::channel(initial);
+		Self {
+			inner: Arc::new(LifecycleInner {
+				state: Mutex::new(initial),
+				tx,
+			}),
+		}
+	}
+
+	pub fn begin_drain(&self) {
+		self.update_state(|state| state.draining = true);
+	}
+
+	pub fn is_draining(&self) -> bool {
+		self.snapshot().draining
+	}
+
+	pub fn in_flight(&self) -> usize {
+		self.snapshot().in_flight
+	}
+
+	fn subscribe(&self) -> watch::Receiver<LifecycleState> {
+		self.inner.tx.subscribe()
+	}
+
+	pub async fn wait_for_quiescence(&self) {
+		let mut rx = self.subscribe();
+		loop {
+			let state = *rx.borrow();
+			if state.in_flight == 0 {
+				return;
+			}
+			if rx.changed().await.is_err() {
+				return;
+			}
+		}
+	}
+
+	fn track_work(&self) -> LifecycleGuard {
+		self.update_state(|state| state.in_flight += 1);
+		LifecycleGuard {
+			lifecycle: self.clone(),
+		}
+	}
+
+	fn try_track_request(&self) -> std::io::Result<LifecycleGuard> {
+		let mut guard = self
+			.inner
+			.state
+			.lock()
+			.expect("server lifecycle state poisoned");
+		if guard.draining {
+			return Err(draining_error());
+		}
+		guard.in_flight += 1;
+		let snapshot = *guard;
+		drop(guard);
+		let _ = self.inner.tx.send_replace(snapshot);
+		Ok(LifecycleGuard {
+			lifecycle: self.clone(),
+		})
+	}
+
+	fn finish_work(&self) {
+		self.update_state(|state| {
+			state.in_flight = state.in_flight.saturating_sub(1);
+		});
+	}
+
+	fn snapshot(&self) -> LifecycleState {
+		*self
+			.inner
+			.state
+			.lock()
+			.expect("server lifecycle state poisoned")
+	}
+
+	fn update_state(&self, mutator: impl FnOnce(&mut LifecycleState)) {
+		let mut guard = self
+			.inner
+			.state
+			.lock()
+			.expect("server lifecycle state poisoned");
+		mutator(&mut guard);
+		let snapshot = *guard;
+		drop(guard);
+		let _ = self.inner.tx.send_replace(snapshot);
+	}
+}
+
+struct LifecycleGuard {
+	lifecycle: ServerLifecycle,
+}
+
+impl Drop for LifecycleGuard {
+	fn drop(&mut self) {
+		self.lifecycle.finish_work();
+	}
+}
+
+fn draining_error() -> std::io::Error {
+	Error::new(
+		ErrorKind::ConnectionAborted,
+		"server is draining; refusing new work",
+	)
+}
+
+/// Drain-aware wrapper around any [`HrftService`].
+///
+/// This is the node-facing gate: published services and loopback
+/// harnesses can reject new requests through the same lifecycle
+/// object even when they do not pass through the QUIC listener.
+pub struct LifecycleService {
+	inner: Arc<dyn HrftService>,
+	lifecycle: ServerLifecycle,
+}
+
+impl LifecycleService {
+	pub fn new(inner: Arc<dyn HrftService>, lifecycle: ServerLifecycle) -> Self {
+		Self { inner, lifecycle }
+	}
+}
+
+#[async_trait]
+impl HrftService for LifecycleService {
+	async fn handle_frame(
+		&self,
+		remote: NodeId,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
+		let _guard = self.lifecycle.try_track_request()?;
+		self.inner.handle_frame(remote, frame).await
+	}
+
+	async fn handle_stream(
+		&self,
+		stream: Box<dyn TransportStream>,
+		pool: Arc<BufPool>,
+		remote: NodeId,
+	) -> std::io::Result<()> {
+		let _guard = self.lifecycle.try_track_request()?;
+		self.inner.handle_stream(stream, pool, remote).await
+	}
+}
 
 // ============================================================
 //  SERVICE TRAIT
@@ -141,23 +321,41 @@ pub async fn serve<S: HrftService>(
 	endpoint: Endpoint,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
 ) -> std::io::Result<()> {
+	let mut drain_rx = lifecycle.subscribe();
 	loop {
-		let Some(incoming) = endpoint.accept().await else {
-			// Endpoint has been closed: exit cleanly.
-			return Ok(());
-		};
-		let service = service.clone();
-		let pool = pool.clone();
-		tokio::spawn(async move {
-			if let Err(e) = serve_quic_connection(incoming, service, pool).await {
-				// One bad connection should not kill the server.
-				// A structured logger will go here once the tracing
-				// macros are threaded through.
-				let _ = e;
+		if drain_rx.borrow().draining {
+			break;
+		}
+		tokio::select! {
+			changed = drain_rx.changed() => {
+				if changed.is_err() || drain_rx.borrow().draining {
+					break;
+				}
 			}
-		});
+			incoming = endpoint.accept() => {
+				let Some(incoming) = incoming else {
+					break;
+				};
+				let service = service.clone();
+				let pool = pool.clone();
+				let lifecycle = lifecycle.clone();
+				let _connection_guard = lifecycle.track_work();
+				tokio::spawn(async move {
+					let _connection_guard = _connection_guard;
+					if let Err(e) = serve_quic_connection(incoming, service, pool, lifecycle).await {
+						// One bad connection should not kill the server.
+						// A structured logger will go here once the tracing
+						// macros are threaded through.
+						let _ = e;
+					}
+				});
+			}
+		}
 	}
+	lifecycle.wait_for_quiescence().await;
+	Ok(())
 }
 
 // ============================================================
@@ -175,6 +373,7 @@ async fn serve_quic_connection<S: HrftService>(
 	incoming: quinn::Incoming,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
 ) -> std::io::Result<()> {
 	let connection = incoming
 		.await
@@ -182,7 +381,7 @@ async fn serve_quic_connection<S: HrftService>(
 	let remote_id = verified_peer_node_id(&connection, DEFAULT_CLUSTER_DOMAIN)?;
 	let connection: Arc<dyn TransportConnection> =
 		Arc::new(QuicTransportConnection::new(connection, remote_id));
-	handle_connection(connection, service, pool).await
+	handle_connection(connection, service, pool, lifecycle).await
 }
 
 /// Per-connection accept loop. Spawns one task per inbound bidi
@@ -198,19 +397,35 @@ async fn handle_connection<S: HrftService>(
 	connection: Arc<dyn TransportConnection>,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
 ) -> std::io::Result<()> {
 	let remote = connection.remote_id();
+	let mut drain_rx = lifecycle.subscribe();
 	loop {
-		let stream = match connection.accept_bi().await {
-			Ok(s) => s,
-			Err(_) => return Ok(()),
-		};
-		let service = service.clone();
-		let pool = pool.clone();
-		let remote = remote;
-		tokio::spawn(async move {
-			let _ = handle_stream(stream, service, pool, remote).await;
-		});
+		if drain_rx.borrow().draining {
+			return Ok(());
+		}
+		tokio::select! {
+			changed = drain_rx.changed() => {
+				if changed.is_err() || drain_rx.borrow().draining {
+					return Ok(());
+				}
+			}
+			stream = connection.accept_bi() => {
+				let stream = match stream {
+					Ok(s) => s,
+					Err(_) => return Ok(()),
+				};
+				let service = service.clone();
+				let pool = pool.clone();
+				let remote = remote;
+				let _stream_guard = lifecycle.track_work();
+				tokio::spawn(async move {
+					let _stream_guard = _stream_guard;
+					let _ = handle_stream(stream, service, pool, remote).await;
+				});
+			}
+		}
 	}
 }
 
