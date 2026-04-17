@@ -81,6 +81,10 @@ pub const DATA_RETRY_BUDGET: usize = 3;
 /// Small pause before retrying after `E_SAFE_BEHIND` so a follower
 /// or newly-elected leader has a chance to advance freshness.
 pub const E_SAFE_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+/// Small pause before retrying after `MIGRATION_INCOMPLETE` so the
+/// destination owner's background migration sweeper can pull the
+/// missing range data and commit completion.
+pub const MIGRATION_RETRY_BACKOFF: Duration = Duration::from_millis(75);
 
 // ============================================================
 //  CONFIG
@@ -286,6 +290,50 @@ pub struct ReadResult {
 struct RetryDirective {
 	preferred_target: Option<NodeId>,
 	backoff: Option<Duration>,
+	refresh_topology: bool,
+	migration_incomplete: bool,
+}
+
+impl RetryDirective {
+	fn redirect(preferred_target: Option<NodeId>) -> Self {
+		Self {
+			preferred_target,
+			backoff: None,
+			refresh_topology: true,
+			migration_incomplete: false,
+		}
+	}
+
+	fn e_safe(preferred_target: Option<NodeId>) -> Self {
+		Self {
+			preferred_target,
+			backoff: Some(E_SAFE_RETRY_BACKOFF),
+			refresh_topology: true,
+			migration_incomplete: false,
+		}
+	}
+
+	fn migration_incomplete() -> Self {
+		Self {
+			preferred_target: None,
+			backoff: Some(MIGRATION_RETRY_BACKOFF),
+			refresh_topology: false,
+			migration_incomplete: true,
+		}
+	}
+
+	fn exhausted_query_error(self) -> Error {
+		if self.migration_incomplete {
+			return Error::new(
+				ErrorKind::WouldBlock,
+				"Wendelon query failed: migration incomplete after retry budget exhausted",
+			);
+		}
+		Error::new(
+			ErrorKind::NotConnected,
+			"Wendelon query retry budget exhausted",
+		)
+	}
 }
 
 impl WendelonClient {
@@ -547,10 +595,12 @@ impl WendelonClient {
 		key_hash: Option<u64>,
 		retry: RetryDirective,
 	) -> std::io::Result<()> {
-		let candidates = self.retry_candidates(key_hash, retry.preferred_target);
-		if let Err(err) = self.refresh_topology_with_candidates(&candidates).await {
-			if retry.preferred_target.is_none() {
-				return Err(err);
+		if retry.refresh_topology {
+			let candidates = self.retry_candidates(key_hash, retry.preferred_target);
+			if let Err(err) = self.refresh_topology_with_candidates(&candidates).await {
+				if retry.preferred_target.is_none() {
+					return Err(err);
+				}
 			}
 		}
 		if let Some(backoff) = retry.backoff {
@@ -715,9 +765,10 @@ impl WendelonClient {
 	///   non-zero value asks the server to return the newest
 	///   version per key whose `hlc <= as_of_hlc`.
 	///
-	/// On `NOT_LEADER`, `EPOCH_STALE`, or `E_SAFE_BEHIND` the client
-	/// performs a bounded refresh-and-retry loop rather than a
-	/// single-shot redirect. Any other error surface is terminal.
+	/// On `NOT_LEADER`, `EPOCH_STALE`, `E_SAFE_BEHIND`, or
+	/// `MIGRATION_INCOMPLETE` the client performs a bounded retry
+	/// loop rather than a single-shot failure. Any other error
+	/// surface is terminal.
 	pub async fn query(
 		&self,
 		wpbc_ast: Vec<u8>,
@@ -746,10 +797,7 @@ impl WendelonClient {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
-						return Err(Error::new(
-							ErrorKind::NotConnected,
-							"Wendelon query retry budget exhausted",
-						));
+						return Err(retry.exhausted_query_error());
 					}
 					self.prepare_retry(Some(range.start_hash), retry).await?;
 					preferred_target = retry.preferred_target;
@@ -829,6 +877,7 @@ impl WendelonClient {
 		let ack: &QueryResponseMeta =
 			bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
 		let is_end = (resp.header.flags & FRAME_FLAG_STREAM_END) != 0;
+		let retry = retry_read_status(ack.status, ack.leader_hint);
 
 		match ack.status {
 			s if s == ReadStatus::OK => {
@@ -857,16 +906,7 @@ impl WendelonClient {
 					pool: self.pool.clone(),
 				}))
 			}
-			s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => {
-				Ok(QueryOutcome::Redirect(RetryDirective {
-					preferred_target: nonzero_node_id(ack.leader_hint),
-					backoff: None,
-				}))
-			}
-			s if s == ReadStatus::E_SAFE_BEHIND => Ok(QueryOutcome::Redirect(RetryDirective {
-				preferred_target: nonzero_node_id(ack.leader_hint),
-				backoff: Some(E_SAFE_RETRY_BACKOFF),
-			})),
+			_ if retry.is_some() => Ok(QueryOutcome::Redirect(retry.expect("retry checked above"))),
 			s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(StreamingQueryResult {
 				value_hlc: ack.value_hlc,
 				epoch: ack.epoch,
@@ -895,26 +935,26 @@ enum QueryOutcome {
 
 fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> {
 	match response.status {
-		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => {
-			Some(RetryDirective {
-				preferred_target: nonzero_node_id(response.leader_hint),
-				backoff: None,
-			})
-		}
+		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => Some(
+			RetryDirective::redirect(nonzero_node_id(response.leader_hint)),
+		),
 		_ => None,
 	}
 }
 
 fn retry_read_response(response: &ReadResponseMeta) -> Option<RetryDirective> {
-	match response.status {
-		s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => Some(RetryDirective {
-			preferred_target: nonzero_node_id(response.leader_hint),
-			backoff: None,
-		}),
-		s if s == ReadStatus::E_SAFE_BEHIND => Some(RetryDirective {
-			preferred_target: nonzero_node_id(response.leader_hint),
-			backoff: Some(E_SAFE_RETRY_BACKOFF),
-		}),
+	retry_read_status(response.status, response.leader_hint)
+}
+
+fn retry_read_status(status: ReadStatus, leader_hint: NodeId) -> Option<RetryDirective> {
+	match status {
+		s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => {
+			Some(RetryDirective::redirect(nonzero_node_id(leader_hint)))
+		}
+		s if s == ReadStatus::E_SAFE_BEHIND => {
+			Some(RetryDirective::e_safe(nonzero_node_id(leader_hint)))
+		}
+		s if s == ReadStatus::MIGRATION_INCOMPLETE => Some(RetryDirective::migration_incomplete()),
 		_ => None,
 	}
 }
