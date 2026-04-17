@@ -42,6 +42,7 @@ use crate::consensus::{
 	MigrationComplete, MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest,
 	WendelonResponse, WendelonStateMachine,
 };
+use crate::metrics::global as metrics;
 use crate::network::core::{
 	HRFT_MAGIC, read_frame, read_frame_from_header, read_frame_header, write_frame,
 };
@@ -593,6 +594,9 @@ impl WendelonDataServer {
 		} else {
 			guard.push(lease);
 		}
+		metrics()
+			.data_ring_lease_cache_entries
+			.set(guard.len() as u64);
 	}
 
 	async fn request_remote_lease(
@@ -671,6 +675,7 @@ impl WendelonDataServer {
 		clock: &dyn PhysicalClock,
 		ttl_ms: u32,
 	) -> usize {
+		metrics().data_ring_lease_refresh_passes_total.inc();
 		let snapshot = ring.snapshot();
 		let epoch = snapshot.epoch();
 		let ranges = snapshot.primary_ranges_for(self.local_node);
@@ -678,6 +683,9 @@ impl WendelonDataServer {
 		{
 			let mut guard = self.leases.write().expect("lease cache poisoned");
 			guard.retain(|l| l.epoch == epoch);
+			metrics()
+				.data_ring_lease_cache_entries
+				.set(guard.len() as u64);
 		}
 
 		let now_ms = clock.now_ms();
@@ -748,6 +756,7 @@ impl WendelonDataServer {
 					{
 						self.cache_granted_lease(lease);
 						granted += 1;
+						metrics().data_ring_lease_grants_total.inc();
 					} else {
 						tracing::warn!(
 							range_start,
@@ -758,11 +767,13 @@ impl WendelonDataServer {
 					}
 				}
 				Ok(LeaseAcquireOutcome::Denied(_status)) => {
+					metrics().data_ring_lease_denials_total.inc();
 					// Another holder (or a stale-epoch request)
 					// blocks us — skip, keep the old entry if any.
 					// The next tick retries.
 				}
 				Err(e) => {
+					metrics().data_ring_lease_errors_total.inc();
 					tracing::warn!(
 						range_start,
 						range_end,
@@ -1025,6 +1036,7 @@ impl WendelonDataServer {
 	/// tests and any remaining unary callers working by packaging the
 	/// entire response into one terminal frame.
 	async fn handle_query(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
 
 		let (resp_meta, arrow_bytes) = self
@@ -1229,6 +1241,7 @@ impl WendelonDataServer {
 		first_header: FrameHeader,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
+		metrics().data_ring_query_requests_total.inc();
 		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
 		let plan = self
@@ -1440,6 +1453,7 @@ impl WendelonDataServer {
 	/// `max_records` / `max_bytes`, and set `next_cursor` for
 	/// pagination.
 	async fn handle_migrate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		metrics().data_ring_migrate_requests_total.inc();
 		if frame.meta.len() < std::mem::size_of::<MigrateRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -2194,6 +2208,7 @@ impl DataRing for WendelonDataServer {
 		meta: WriteRequestMeta,
 		payload: RecordBatch,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		metrics().data_ring_write_requests_total.inc();
 		// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
 		if meta.proxy_hop >= 2 {
 			return Ok((
@@ -2423,6 +2438,7 @@ impl DataRing for WendelonDataServer {
 		meta: ReadRequestMeta,
 		key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)> {
+		metrics().data_ring_read_requests_total.inc();
 		let sm = self.state_machine.state_snapshot().await;
 		let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
 		if meta.expected_epoch < current_epoch {

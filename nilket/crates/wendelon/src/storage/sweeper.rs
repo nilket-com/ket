@@ -52,6 +52,7 @@
 //! slab even though the sweeper itself runs everywhere.
 
 use crate::consensus::{TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine};
+use crate::metrics::global as metrics;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{SealedSlabInfo, SlabManager, TieredSlabPointer};
 use async_trait::async_trait;
@@ -200,6 +201,7 @@ impl SlabSweeper {
 	/// [`Self::run`] so tests can step through the sweeper
 	/// without racing a tokio interval.
 	pub async fn sweep_once(&self) -> std::io::Result<SweepReport> {
+		metrics().storage_tiering_passes_total.inc();
 		let mut report = SweepReport::default();
 		let candidates = self.slab.list_sealed_slabs().await;
 		for candidate in candidates {
@@ -231,6 +233,30 @@ impl SlabSweeper {
 		let rehydrated = self.reclaim_rehydrated_slabs_once().await?;
 		report.rehydrated_reclaimed = rehydrated.reclaimed;
 		report.skipped_rehydration_guard = rehydrated.skipped_guard;
+		metrics()
+			.storage_tiered_slabs_total
+			.add(report.tiered as u64);
+		metrics()
+			.storage_tiering_failures_total
+			.add(report.failed as u64);
+		metrics()
+			.storage_tiering_skipped_small_total
+			.add(report.skipped_too_small as u64);
+		metrics()
+			.storage_tiering_skipped_already_tiered_total
+			.add(report.skipped_already_tiered as u64);
+		metrics()
+			.storage_rehydration_guard_skips_total
+			.add(report.skipped_rehydration_guard as u64);
+		metrics()
+			.storage_rehydrated_reclaims_total
+			.add(report.rehydrated_reclaimed as u64);
+		metrics()
+			.storage_migration_reclaimed_slabs_total
+			.add(report.reclaimed_slabs as u64);
+		metrics()
+			.storage_migration_reclaimed_bytes_total
+			.add(report.reclaimed_bytes);
 		Ok(report)
 	}
 
@@ -372,6 +398,7 @@ impl SlabSweeper {
 				_ = self.wakeup.notified() => {},
 			}
 			if let Err(e) = self.sweep_once().await {
+				metrics().storage_tiering_pass_errors_total.inc();
 				tracing::warn!(error = %e, "sweeper pass returned error");
 			}
 			next_deadline = Instant::now() + self.config.scan_interval;

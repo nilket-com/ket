@@ -26,6 +26,7 @@
 //! trait object so unit tests can drive the full state machine
 //! without a real process, real Raft, or real transport.
 
+use crate::metrics::global as metrics;
 use crate::network::transport::MembershipEpoch;
 use crate::schema::{HybridTimestamp, NodeId};
 use async_trait::async_trait;
@@ -182,6 +183,7 @@ impl NodeTracker {
 				local_receipt_ms: now,
 			},
 		);
+		metrics().liveness_tracked_peers.set(self.seen.len() as u64);
 	}
 
 	/// Convenience: extract the physical component of an [`HLC`] and
@@ -218,6 +220,7 @@ impl NodeTracker {
 	/// again next cycle before its epoch catches up.
 	pub fn forget(&self, peer: NodeId) {
 		self.seen.remove(&peer);
+		metrics().liveness_tracked_peers.set(self.seen.len() as u64);
 	}
 
 	/// Peers whose last receipt is older than `threshold` relative
@@ -292,8 +295,10 @@ pub fn check_drift_once(
 	abort: &dyn AbortHandle,
 	max_offset_ms: u64,
 ) -> DriftCheck {
+	metrics().clock_drift_checks_total.inc();
 	let now = clock.now_ms();
 	let Some(median) = tracker.median_cluster_ms(now) else {
+		metrics().clock_drift_insufficient_samples_total.inc();
 		return DriftCheck::InsufficientSamples;
 	};
 	let offset = if now >= median {
@@ -301,6 +306,7 @@ pub fn check_drift_once(
 	} else {
 		median - now
 	};
+	metrics().clock_drift_offset_ms.set(offset);
 	if offset > max_offset_ms {
 		abort.abort(&format!(
 			"clock drift {offset}ms > {max_offset_ms}ms (local={now}, median={median})"
@@ -383,11 +389,13 @@ pub async fn sweep_evictions_once(
 	rf: usize,
 	threshold: Duration,
 ) -> EvictionDecision {
+	metrics().eviction_sweeps_total.inc();
 	if !leader.is_leader().await {
 		return EvictionDecision::NotLeader;
 	}
 	let now = clock.now_ms();
 	let stale = tracker.stale_peers(threshold, now);
+	metrics().liveness_stale_peers.set(stale.len() as u64);
 	if stale.is_empty() {
 		return EvictionDecision::AllHealthy;
 	}
@@ -413,6 +421,7 @@ pub async fn sweep_evictions_once(
 	// observability.
 	let floor = quorum_floor(rf);
 	if survivors.len() < floor {
+		metrics().eviction_refused_quorum_total.inc();
 		return EvictionDecision::RefusedForQuorum { candidates: stale };
 	}
 
@@ -438,15 +447,19 @@ pub async fn sweep_evictions_once(
 			for id in &dropped {
 				tracker.forget(*id);
 			}
+			metrics().evictions_total.add(dropped.len() as u64);
 			EvictionDecision::Evicted {
 				dropped,
 				epoch: next_epoch,
 			}
 		}
-		Err(e) => EvictionDecision::AdvancerFailed {
-			dropped,
-			error: e.to_string(),
-		},
+		Err(e) => {
+			metrics().eviction_advancer_failures_total.inc();
+			EvictionDecision::AdvancerFailed {
+				dropped,
+				error: e.to_string(),
+			}
+		}
 	}
 }
 

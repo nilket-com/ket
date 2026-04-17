@@ -16,7 +16,10 @@
 
 use std::process::ExitCode;
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
+use wendelon::metrics::exporter;
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
+
+const DEFAULT_METRICS_BIND_ADDRESS: &str = "127.0.0.1:9900";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -53,6 +56,22 @@ async fn main() -> ExitCode {
 		Err(e) => {
 			eprintln!("failed to load {}: {e}", args[1]);
 			return ExitCode::from(2);
+		}
+	};
+	let metrics_bind = std::env::var("WENDELON_METRICS_BIND")
+		.unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDRESS.to_string());
+	let _metrics = if metrics_bind.eq_ignore_ascii_case("off") || metrics_bind.trim().is_empty() {
+		None
+	} else {
+		match exporter::spawn(&metrics_bind).await {
+			Ok(handle) => {
+				eprintln!("wendelon: metrics listening on {}", handle.local_addr);
+				Some(handle)
+			}
+			Err(e) => {
+				eprintln!("failed to start metrics exporter on {metrics_bind}: {e}");
+				return ExitCode::from(1);
+			}
 		}
 	};
 	let node = match WendelonNode::bootstrap(cfg).await {
