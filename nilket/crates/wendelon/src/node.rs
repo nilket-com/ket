@@ -136,6 +136,67 @@ impl NodeBootstrapConfig {
 			l2: None,
 		}
 	}
+
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.node_id == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"node_id must be greater than zero",
+			));
+		}
+		if !self.data_dir.is_dir() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"data_dir is not an existing directory: {}",
+					self.data_dir.display()
+				),
+			));
+		}
+		if self.slab_max_bytes == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"slab_max_bytes must be greater than zero",
+			));
+		}
+		if self.rf == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"rf must be greater than zero",
+			));
+		}
+		if self.io_depth == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"io_depth must be greater than zero",
+			));
+		}
+		if self.advertise_address.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"advertise_address must not be empty",
+			));
+		}
+		if !self.trusted_lease_signers.contains_key(&self.node_id) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"trusted_lease_signers must contain this node's verifying key ({})",
+					self.node_id
+				),
+			));
+		}
+		if !self.trusted_transfer_signers.contains_key(&self.node_id) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"trusted_transfer_signers must contain this node's verifying key ({})",
+					self.node_id
+				),
+			));
+		}
+		Ok(())
+	}
 }
 
 // ============================================================
@@ -193,6 +254,7 @@ impl WendelonNode {
 	/// [`TransportProviderFactory`] and every watchdog spawn
 	/// immediately.
 	pub async fn bootstrap_single_node(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		cfg.validate()?;
 		let local_node = NodeId {
 			id: cfg.node_id,
 			_reserved: 0,

@@ -1,0 +1,34 @@
+# Example Wendelon single-node bootstrap config.
+#
+# The checked-in file is a template. The binary can render concrete
+# starter values from it with:
+#
+#   wendelon --print-example-config
+#   wendelon --write-example-config ./wendelon.toml
+#
+# The generated config uses dev-derived signing material for
+# `node_id = 1`. That is suitable for local bring-up only. Replace
+# the identity section for any non-development deployment.
+
+[node]
+node_id = {{NODE_ID}}
+advertise_address = "{{ADVERTISE_ADDRESS}}"
+
+[storage]
+# Resolved relative to the config file location.
+data_dir = "{{DATA_DIR}}"
+slab_max_bytes = {{SLAB_MAX_BYTES}}
+
+[tuning]
+rf = {{RF}}
+io_depth = {{IO_DEPTH}}
+
+[identity]
+lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"
+transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
+
+[identity.trusted_lease_signers]
+"{{NODE_ID}}" = "{{LEASE_VERIFYING_KEY}}"
+
+[identity.trusted_transfer_signers]
+"{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"

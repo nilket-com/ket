@@ -1,47 +1,60 @@
 //! Wendelon single-node daemon entry point.
 //!
-//! Minimal CLI wrapper around [`wendelon::node::WendelonNode::bootstrap_single_node`].
-//! Production deployments will grow this into a TOML config loader
-//! (see `plans/ops/configuration.md`); the current implementation
-//! takes arguments straight off the command line so the binary is
-//! useful for local smoke-testing without any filesystem state
-//! beyond a writable data directory.
+//! CLI wrapper around [`wendelon::node::WendelonNode::bootstrap_single_node`]
+//! driven by a `wendelon.toml` file.
 //!
 //! ## Usage
 //!
 //! ```text
-//!   wendelon <node_id> <data_dir> <advertise_addr>
+//!   wendelon <path/to/wendelon.toml>
+//!   wendelon --print-example-config
+//!   wendelon --write-example-config <path/to/wendelon.toml>
 //! ```
 //!
-//! All three arguments are required; any parse failure prints a
-//! usage line and exits non-zero.
+//! The config path is required for normal startup; the helper flags
+//! print or write a starter config instead.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
+use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 
 #[tokio::main]
 async fn main() -> ExitCode {
 	let args: Vec<String> = std::env::args().collect();
-	if args.len() != 4 {
-		eprintln!("usage: {} <node_id> <data_dir> <advertise_addr>", args[0]);
-		return ExitCode::from(2);
+	match args.as_slice() {
+		[_bin, flag] if flag == "--print-example-config" => {
+			print!("{}", render_example_config());
+			return ExitCode::SUCCESS;
+		}
+		[_bin, flag, path] if flag == "--write-example-config" => {
+			match write_example_config(path) {
+				Ok(()) => {
+					eprintln!("wendelon: wrote starter config to {path}");
+					return ExitCode::SUCCESS;
+				}
+				Err(e) => {
+					eprintln!("failed to write starter config to {path}: {e}");
+					return ExitCode::from(2);
+				}
+			}
+		}
+		[_bin, _config_path] => {}
+		_ => {
+			eprintln!(
+				"usage:\n  {} <path/to/wendelon.toml>\n  {} --print-example-config\n  {} --write-example-config <path/to/wendelon.toml>",
+				args[0], args[0], args[0]
+			);
+			return ExitCode::from(2);
+		}
 	}
-	let node_id: u32 = match args[1].parse() {
-		Ok(v) => v,
+
+	let cfg: NodeBootstrapConfig = match load_node_bootstrap_config(&args[1]) {
+		Ok(cfg) => cfg,
 		Err(e) => {
-			eprintln!("node_id must be u32: {e}");
+			eprintln!("failed to load {}: {e}", args[1]);
 			return ExitCode::from(2);
 		}
 	};
-	let data_dir = PathBuf::from(&args[2]);
-	if !data_dir.is_dir() {
-		eprintln!("data_dir {:?} is not an existing directory", data_dir);
-		return ExitCode::from(2);
-	}
-	let advertise = args[3].clone();
-
-	let cfg = NodeBootstrapConfig::dev(node_id, data_dir, advertise);
 	let node = match WendelonNode::bootstrap_single_node(cfg).await {
 		Ok(n) => n,
 		Err(e) => {

@@ -1,0 +1,225 @@
+use std::path::{Path, PathBuf};
+use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
+use wendelon::network::{
+	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
+	transfer_verifying_key_bytes,
+};
+use wendelon::node::WendelonNode;
+
+fn fresh_dir(tag: &str) -> PathBuf {
+	let dir = std::env::temp_dir().join(format!(
+		"wendelon-config-loader-{tag}-{}-{}",
+		std::process::id(),
+		uuid::Uuid::new_v4()
+	));
+	std::fs::create_dir_all(&dir).unwrap();
+	dir
+}
+
+fn hex(bytes: [u8; 32]) -> String {
+	let mut out = String::with_capacity(64);
+	for byte in bytes {
+		use std::fmt::Write as _;
+		write!(&mut out, "{byte:02x}").unwrap();
+	}
+	out
+}
+
+fn write_config(dir: &Path, body: &str) -> PathBuf {
+	let path = dir.join("wendelon.toml");
+	std::fs::write(&path, body).unwrap();
+	path
+}
+
+#[test]
+fn loads_valid_wendelon_toml() {
+	let root = fresh_dir("valid");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+
+	let node_id = 7u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4701"
+
+[storage]
+data_dir = "data"
+slab_max_bytes = 123456
+
+[tuning]
+rf = 3
+io_depth = 128
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.node_id, node_id);
+	assert_eq!(cfg.data_dir, data_dir);
+	assert_eq!(cfg.slab_max_bytes, 123456);
+	assert_eq!(cfg.rf, 3);
+	assert_eq!(cfg.io_depth, 128);
+	assert_eq!(cfg.advertise_address, "127.0.0.1:4701");
+	assert_eq!(cfg.lease_signing_secret, lease_secret);
+	assert_eq!(
+		cfg.trusted_lease_signers.get(&node_id).copied(),
+		Some(lease_verifying_key_bytes(lease_secret))
+	);
+	assert_eq!(cfg.transfer_signing_secret, transfer_secret);
+	assert_eq!(
+		cfg.trusted_transfer_signers.get(&node_id).copied(),
+		Some(transfer_verifying_key_bytes(transfer_secret))
+	);
+	assert!(cfg.l2.is_none());
+}
+
+#[test]
+fn rejects_missing_required_configuration() {
+	let root = fresh_dir("missing");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let config_path = write_config(
+		&root,
+		r#"
+[node]
+node_id = 9
+advertise_address = "127.0.0.1:4702"
+
+[storage]
+data_dir = "data"
+"#,
+	);
+
+	let err = load_node_bootstrap_config(&config_path).err().unwrap();
+	assert!(
+		err.to_string().contains("identity"),
+		"unexpected error: {err}"
+	);
+}
+
+#[test]
+fn rejects_invalid_key_material() {
+	let root = fresh_dir("invalid");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let config_path = write_config(
+		&root,
+		r#"
+[node]
+node_id = 11
+advertise_address = "127.0.0.1:4703"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "not-hex"
+transfer_signing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[identity.trusted_lease_signers]
+"11" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+[identity.trusted_transfer_signers]
+"11" = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+"#,
+	);
+
+	let err = load_node_bootstrap_config(&config_path).err().unwrap();
+	assert!(
+		err.to_string().contains("lease_signing_secret"),
+		"unexpected error: {err}"
+	);
+}
+
+#[tokio::test]
+async fn loaded_config_bootstraps_single_node() {
+	let root = fresh_dir("bootstrap");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+
+	let node_id = 13u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:0"
+
+[storage]
+data_dir = "{data_dir}"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			data_dir = data_dir.display(),
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	assert_eq!(node.local_node.id, node_id);
+	node.handles.ring_updater.abort();
+	node.handles.drift_monitor.abort();
+	node.handles.eviction_watchdog.abort();
+	node.handles.lease_manager.abort();
+	node.handles.epoch_reconciler.abort();
+	node.handles.migration_sweeper.abort();
+}
+
+#[test]
+fn rendered_example_config_loads_after_writing() {
+	let root = fresh_dir("rendered-example");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	let config_path = root.join("wendelon.toml");
+	std::fs::write(&config_path, render_example_config()).unwrap();
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.node_id, 1);
+	assert_eq!(cfg.data_dir, data_dir);
+	assert_eq!(cfg.advertise_address, "127.0.0.1:7001");
+}
+
+#[test]
+fn write_example_config_refuses_to_overwrite() {
+	let root = fresh_dir("write-example");
+	let config_path = root.join("wendelon.toml");
+
+	write_example_config(&config_path).unwrap();
+	let err = write_example_config(&config_path).err().unwrap();
+	assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+}
