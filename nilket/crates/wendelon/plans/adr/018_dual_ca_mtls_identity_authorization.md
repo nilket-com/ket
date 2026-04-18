@@ -12,8 +12,6 @@ Forces in play:
 - Revoking an operator's authority in an incident must be fast and atomic. A role-by-role revocation within a shared CA becomes a CRL hunt; a whole-CA revocation is one action.
 - Four distinct principals appear in the pilot operational model: data nodes replicating and voting, operators running incident response, observers pulling metrics and audit tails, and break-glass administrators recovering from incidents.
 
-Derived from `plans/gap/claude_answers_20260417.md` §6.
-
 ## Decision
 
 1. **Two trust roots.** The cluster maintains two independent certificate authorities:
@@ -97,4 +95,3 @@ Derived from `plans/gap/claude_answers_20260417.md` §6.
 - ADR 025: Audit Event Model and Tamper-Evident Hash Chain (planned — consumes the break-glass marker)
 - `plans/network/security.md`
 - `plans/ops/multi_tenancy.md` (§2 superseded by ADR 021)
-- `plans/gap/claude_answers_20260417.md` §6

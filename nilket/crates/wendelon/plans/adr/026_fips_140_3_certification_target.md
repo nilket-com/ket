@@ -19,8 +19,6 @@ Forces in play:
 - Heterogeneous deployments exist: some customers want the FIPS binary, others do not want the added dependency weight. The architecture must support both from one codebase without permanent feature-flag maintenance.
 - The cryptographic module boundary — what is "inside" the FIPS module vs. "outside" — determines what the CMVP certificate covers. Getting this boundary wrong means either over-scoping (certifying more code than necessary) or under-scoping (certifying too little and failing a customer audit).
 
-Derived from `plans/gap/claude_answers_20260417.md` §5 (FIPS compatibility) and §6 (FIPS target).
-
 ## Decision
 
 1. **Full FIPS 140-3 certification is the finish line, not module linkage.** The perfection endpoint is a CMVP certificate for a named binary/deployment profile — the "Wendelon FIPS Build" — not a claim of "we use aws-lc-rs." Module-only linkage is an interim milestone on the way to full certification, explicitly not the end state.
@@ -115,5 +113,4 @@ All items must be closed before this ADR moves from Proposed to Accepted.
 - ADR 019: Cipher Selection and FIPS Posture (primitive selection; aws-lc-rs backend)
 - ADR 020: L2 Envelope Encryption and DEK Lifecycle (key hierarchy under validated primitives)
 - ADR 025: Audit Event Model (amended: chain primitive is build-profile-dependent)
-- `plans/gap/claude_answers_20260417.md` §5 (FIPS compatibility), §6 (FIPS target)
 - `plans/ops/upgrades.md` — documented FIPS upgrade procedure

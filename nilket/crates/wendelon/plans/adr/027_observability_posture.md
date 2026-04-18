@@ -15,8 +15,6 @@ Forces in play:
 - An operator who cannot trace a slow request across QUIC RPCs cannot operate the cluster. Context propagation across the transport is not optional depth — it is a minimum-viable property.
 - Metrics exposure is a security surface. Unauthenticated metrics leak cluster-internal state (node count, leader identity, per-tenant byte counts, key IDs if not filtered) that helps an adversary plan an attack. Authentication on metrics is not over-engineering.
 
-Derived from `plans/gap/claude_answers_20260417.md` §7.
-
 ## Decision
 
 1. **OTLP is the only trace export protocol.** Traces are exported over OTLP (gRPC preferred; HTTP/protobuf supported as a configuration option). No native Jaeger, no Zipkin, no vendor-specific protocols. Deployments that need to terminate traces in a Jaeger or vendor backend run the OpenTelemetry Collector in front of their backend — the Collector is the protocol-translation layer, not the Wendelon binary.
@@ -119,5 +117,4 @@ Derived from `plans/gap/claude_answers_20260417.md` §7.
 - ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (metrics scrape auth, `/ready` auth)
 - ADR 025: Audit Event Model (parallel stream; not merged into observability)
 - ADR 026: FIPS 140-3 Certification Target (FIPS-visibility metrics open item)
-- `plans/gap/claude_answers_20260417.md` §7
-- `plans/ops/observability.md` (to be rewritten post-acceptance)
+- `plans/ops/observability.md`

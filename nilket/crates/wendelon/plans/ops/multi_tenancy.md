@@ -268,4 +268,3 @@ The orchestration mechanism (cluster-bootstrap RPC vs. well-known state-machine 
 - [ADR 020 — L2 Envelope Encryption and DEK Lifecycle](../adr/020_l2_envelope_encryption_and_dek_lifecycle.md)
 - [ADR 021 — Tenant-Aware Architecture from Day One](../adr/021_tenant_aware_architecture_day_one.md)
 - `plans/ops/lifecycle.md` — default-tenant bootstrap mechanism
-- `plans/gap/claude_answers_20260417.md` §10

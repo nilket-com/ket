@@ -36,7 +36,7 @@ All L2 I/O goes through the canonical `ObjectStore` trait frozen in [ADR 022 §8
 - `list_parts(key, upload_id, continuation)` — enumerate accepted parts for an in-progress upload (ADR 023 §4 ledger reconciliation).
 - `abort_multipart(key, upload_id)` — free-function abort by id (ADR 024 Track A); equivalent to `MultipartUpload::abort` on a live handle.
 
-Production implementations target AWS S3, GCS, and Azure Blob. The test substrate is [rustfs (ADR 014)](../adr/014_rustfs_test_backend.md); deterministic fault injection uses the mocked `ObjectStore` from [ADR 028](../adr/028_deterministic_simulator_asyncfileops.md) (planned).
+Production implementations target AWS S3, GCS, and Azure Blob. The test substrate is [rustfs (ADR 014)](../adr/014_rustfs_test_backend.md); deterministic fault injection uses the mocked `ObjectStore` from [ADR 028](../adr/028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned).
 
 L1 (NVMe) I/O goes through the `AsyncFileOps` abstraction (ADR 028 planned) wrapping io_uring + `O_DIRECT` (ADR 009). The slab's byte layout is identical on L1 and L2 — L1 writes the slab; the L2 uploader streams the same bytes as one object.
 
@@ -258,4 +258,4 @@ Changes to these belong in ADR supersession or amendment, not in this operationa
 - [ADR 022 — L2 Slab Format and Footer-Indexed Range Reads](../adr/022_l2_slab_format_footer_indexed_range_reads.md)
 - [ADR 023 — L2 Upload Lifecycle](../adr/023_l2_upload_lifecycle.md)
 - [ADR 024 — L2 Orphan Cleanup and Remote Reclaim](../adr/024_l2_orphan_cleanup_remote_reclaim.md)
-- [ADR 028 — Deterministic Simulator and AsyncFileOps](../adr/028_deterministic_simulator_asyncfileops.md) (planned)
+- [ADR 028 — Deterministic Simulator and AsyncFileOps](../adr/028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned)

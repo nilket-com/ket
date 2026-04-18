@@ -20,8 +20,6 @@ Forces in play:
 - **Rate limits are not optional.** A provider rate-limits DELETE (S3: 3500 DELETEs/second per prefix); exceeding the limit produces 503s and cascading retry storms. A naive delete-all-orphans sweep can take a well-loaded provider into throttling within seconds.
 - **Archival tiers have different delete semantics.** Glacier-class storage has minimum-storage-duration charges that make early deletion a cost anti-pattern. Archival-tier reclamation policy is a different problem from hot-tier reclamation.
 
-Derived from `plans/gap/claude_answers_20260417.md` §4 (orphan cleanup authority, remote reclaim scope).
-
 ## Decision
 
 1. **Leader-only reclaim authority.** Only the Raft leader evaluates reclamation candidates and issues deletes. Followers never issue DELETE or `AbortMultipartUpload` against the provider. The leader election mechanism (ADR 007 / `openraft`) is the gate: a node that loses leadership stops reclaiming mid-batch, and the new leader picks up the reclaim scan from scratch on its own cadence. Reclaim state is not checkpointed across leaders — the scan is idempotent and restartable, which is cheaper than a distributed cursor.
@@ -100,4 +98,3 @@ All items below must be closed before this ADR moves from Proposed to Accepted.
 - ADR 025: Audit Event Model (planned — every reclamation event emits an audit record)
 - `plans/ops/storage_tiering.md` (Sweeper policies updated to reference this four-track reclaim)
 - `plans/ops/archival_retention.md` (to be authored post-pilot, covers the archival-tier reclamation gap)
-- `plans/gap/claude_answers_20260417.md` §4

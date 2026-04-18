@@ -12,8 +12,6 @@ Forces in play:
 - Snapshot install and build must work for state machines in the tens of gigabytes from day one; whole-buffer designs will OOM the node.
 - Compaction behavior must compose cleanly with per-segment encryption key rotation (see ADR 020).
 
-Derived from `plans/gap/claude_answers_20260417.md` §3.
-
 ## Decision
 
 1. **Segmented WAL.** The WAL is a sequence of fixed-size segment files. Default segment size is 128 MiB. Each segment is named by its starting log index. Segments are append-only; once closed, they are immutable until deletion.
@@ -68,4 +66,3 @@ All three items below are benchmark-bound and must be closed before this ADR mov
 ## References
 - ADR 007: Raft Implementation Strategy (extends)
 - `plans/consensus/raft-core.md`
-- `plans/gap/claude_answers_20260417.md` §3

@@ -64,5 +64,3 @@ not coupled to RustFS; only the test harness depends on it.
 ## Related
 - ADR 006 (Tiered Storage and Lazy Migration) — defines the `ObjectStore`
   trait this decision tests.
-- `plans/gap/claude_execution_20260415.md` item F.2 — execution plan entry
-  that this ADR supports.

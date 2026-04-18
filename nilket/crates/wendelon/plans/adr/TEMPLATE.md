@@ -9,8 +9,6 @@
 ## Context
 [What is the problem or force that triggered this decision? Describe the technical, business, or operational context.]
 
-[**Recommended, when applicable:** cite the source of convergence on a single line, e.g., "Derived from `plans/gap/<answer-file>.md` §N."]
-
 ## Decision
 [What is the specific, actionable decision we are making? Be clear and assertive.]
 

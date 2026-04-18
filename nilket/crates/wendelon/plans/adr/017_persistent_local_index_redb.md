@@ -12,8 +12,6 @@ The design choice is the backing store. Candidates considered:
 - **Custom on-disk format** — hand-rolled bytemuck-style persistent structure aligned with Wendelon's other POD layouts.
 - **Periodic checkpoint files** — no continuous durability; index rebuilt from WAL replay on restart.
 
-Derived from `plans/gap/claude_answers_20260417.md` §9.
-
 ## Decision
 
 1. **redb is the persistent local index.** All node-local persistent indexes that require point-query access and transactional semantics live in redb tables.
@@ -55,4 +53,3 @@ Derived from `plans/gap/claude_answers_20260417.md` §9.
 - ADR 015: Segmented WAL and Snapshot Lifecycle
 - ADR 016: Durability Model — Explicit fsync Group Commit
 - ADR 020: L2 Envelope Encryption (planned)
-- `plans/gap/claude_answers_20260417.md` §9

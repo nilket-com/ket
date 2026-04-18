@@ -12,8 +12,6 @@ Wendelon must provide a precise durability contract: when an RPC acknowledges a 
 
 ADR 007 (openraft) declared that Wendelon owns durability. This ADR specifies how.
 
-Derived from `plans/gap/claude_answers_20260417.md` §9.
-
 ## Decision
 
 1. **Explicit `fsync`/`fdatasync` at consensus-ack boundaries.** Every Raft log write that produces an ack to the proposer has its containing WAL segment `fdatasync`ed before the ack is sent. `fdatasync` is sufficient for in-place appends to segment files of known size; `fsync` is used on paths where metadata must also be durable (segment creation, rotation, truncation).
@@ -59,4 +57,3 @@ Benchmark-bound; must be closed before this ADR moves from Proposed to Accepted.
 - ADR 007: Raft Implementation Strategy
 - ADR 015: Segmented WAL and Snapshot Lifecycle (fsync granularity)
 - ADR 009: io_uring Threading Model (fsync queue placement)
-- `plans/gap/claude_answers_20260417.md` §9

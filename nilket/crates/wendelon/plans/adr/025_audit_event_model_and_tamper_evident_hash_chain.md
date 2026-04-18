@@ -13,8 +13,6 @@ Forces in play:
 - The chain primitives must come from ADR 019 (blake3 for the chain hash; signature primitives for the periodic signed root). Rolling a bespoke hash construction for audit is unnecessary and dangerous.
 - Retrofitting tamper evidence is expensive — every existing audit record becomes un-chained, which is indistinguishable from tampering. Day-one hash chain is cheap; day-two hash chain is an operator-facing migration.
 
-Derived from `plans/gap/claude_answers_20260417.md` §6 (audit sink, audit tamper).
-
 ## Decision
 
 1. **Canonical structured audit event schema from day one.** Every audit record is a typed structured event with a fixed field set. Free-form "log messages" are not audit records.
@@ -113,4 +111,3 @@ Derived from `plans/gap/claude_answers_20260417.md` §6 (audit sink, audit tampe
 - ADR 021: Tenant-Aware Architecture from Day One (`TenantAdmin` mutations always emit audit records)
 - ADR 026: FIPS 140-3 Certification Target (planned — audit signature primitives ride the same module boundary)
 - ADR 027: Observability Posture (planned — audit is not observability; trace/metric/audit are three distinct streams)
-- `plans/gap/claude_answers_20260417.md` §6 (audit sink, audit tamper)

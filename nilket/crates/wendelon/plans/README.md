@@ -5,10 +5,13 @@ This directory contains planning documents for the repository, organized into to
 ## Top-level layout
 - `README.md`: This file — index and conventions for the `plans/` directory.
 - `TEMPLATE.md`: Template for creating new plan documents.
-- `consensus/`: Raft, WAL, snapshot, epoch transition docs (maps to src/consensus/)
-- `network/`: Transport, RPC traits, wire protocol, and write flow (maps to src/network/)
-- `schema/`: Bytemuck POD layouts and Arrow IPC schemas (maps to src/schema/)
-- `ops/`: Benchmarks, operational artifacts, archives (bench/ maps to ops/)
+- `implementation_roadmap.md`: 10-workstream bridge from accepted ADRs to execution.
+- `adr/`: Architecture Decision Records (numbered 001..N).
+- `impl/`: Workstream docs (`W1_*.md` .. `W10_*.md`) per the implementation roadmap.
+- `consensus/`: Raft, WAL, snapshot, epoch transition docs (maps to src/consensus/).
+- `network/`: Transport, RPC traits, wire protocol, and write flow (maps to src/network/).
+- `schema/`: Bytemuck POD layouts and Arrow IPC schemas (maps to src/schema/).
+- `ops/`: Operational playbooks (observability, testing, storage tiering, durability, etc.).
 
 ## Naming Conventions
 - Use lowercase, hyphen-separated names for plan files (e.g., `user-authentication.md`).

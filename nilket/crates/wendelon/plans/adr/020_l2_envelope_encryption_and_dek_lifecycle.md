@@ -13,8 +13,6 @@ Forces in play:
 - **Cloud-provider SSE-KMS is a trust-model fork.** Enabling SSE-KMS means the cloud provider sees plaintext-equivalent access via its KMS. That surrenders the confidentiality posture Wendelon is otherwise designed around.
 - **Plaintext data exists in legacy deployments.** Enabling encryption on a cluster that has plaintext slabs requires a migration story — otherwise operators run in permanent mixed-mode, which is nobody's idea of a "perfection" endpoint.
 
-Derived from `plans/gap/claude_answers_20260417.md` §5 and §4.
-
 ## Decision
 
 1. **Client-side envelope encryption is the only trust model.** Wendelon encrypts payloads above the object-store boundary; the cloud sees only ciphertext and wrapped DEKs. SSE-KMS is not shipped, not even as an operator-toggle compliance overlay. The configuration surface has exactly one encryption mode: client-side envelope.
@@ -107,4 +105,3 @@ All items gate ADR 020 acceptance.
 - ADR 019: Cipher Selection and FIPS Posture (cipher + nonce encoding)
 - ADR 021: Tenant-Aware Architecture from Day One (planned — consumes Tenant KEK per tenant)
 - ADR 022: L2 Slab Format and Footer-Indexed Range Reads (planned — slab-format footer integration)
-- `plans/gap/claude_answers_20260417.md` §5 (encryption) and §4 (L2)

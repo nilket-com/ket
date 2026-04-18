@@ -13,8 +13,6 @@ Forces in play:
 - **FIPS 140-3 posture** is a target for regulated-industry deployments (see ADR 026, planned). The chosen primitive must be implementable via a validated cryptographic module. aws-lc-rs is the planned backend; its coverage of GCM-SIV at implementation time is the key external variable.
 - Hand-rolled crypto primitives are never on the table. Only the mode-of-use and nonce derivation live in Wendelon code; the primitive itself always comes from a validated library.
 
-Derived from `plans/gap/claude_answers_20260417.md` §5.
-
 ## Decision
 
 **AES-256-GCM-SIV is the preferred cipher.** When GCM-SIV is unavailable in the selected cryptographic backend, Wendelon falls back to AES-256-GCM with an injective structural nonce encoding and a per-DEK data bound.
@@ -100,4 +98,3 @@ All items below gate ADR 019 acceptance and must be closed before Proposed → A
 - ADR 020: L2 Envelope Encryption and DEK Lifecycle (planned — primary consumer)
 - ADR 025: Audit Event Model (planned — audit signatures use this ADR's primitives)
 - ADR 026: FIPS 140-3 Certification Target — §2a forces the plain-GCM branch under the FIPS build profile
-- `plans/gap/claude_answers_20260417.md` §5

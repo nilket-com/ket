@@ -13,8 +13,6 @@ Forces in play:
 - **ADR 014** already names `rustfs` as the test substrate for the object-store path. The new trait shape must be the canonical surface that `rustfs` implements, not a parallel interface.
 - **Breaking the `ObjectStore` trait repeatedly** is how call sites acquire migration scar tissue. The trait is small and its consumers are few; one coordinated break lands the full capability surface at once.
 
-Derived from `plans/gap/claude_answers_20260417.md` §4.
-
 ## Decision
 
 1. **One slab, one object, one addressable byte layout.** A slab is a single, contiguous, content-addressed byte sequence persisted identically on L1 (NVMe) and on L2 (object store). No sidecar manifests, no provider-metadata indexes, no multi-object splits. L1 writes the slab; the L2 uploader streams the same bytes as one object; the L2 reader reads back the same bytes via range-GETs.
@@ -290,4 +288,3 @@ All items below must be closed before this ADR moves from Proposed to Accepted.
 - ADR 024: L2 Orphan Cleanup (paged LIST joins against the `tiered_slabs` state recording these slabs)
 - ADR 028: Deterministic Simulator (mocked `ObjectStore` implements the trait defined here)
 - `plans/ops/storage_tiering.md` (rewritten to reference this ADR's frozen layout)
-- `plans/gap/claude_answers_20260417.md` §4

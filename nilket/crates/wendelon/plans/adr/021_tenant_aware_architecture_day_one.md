@@ -13,8 +13,6 @@ Forces in play:
 - Pilot concurrency is one tenant enabled, but every durable structure must still carry the field. A "default tenant" is still a tenant; the schema never loses the column.
 - Quota enforcement has a race problem: data-path-only caches let a concurrent burst defeat the quota; state-machine-only pushes every ingress through consensus. Neither position on its own is acceptable.
 
-Derived from `plans/gap/claude_answers_20260417.md` §10.
-
 ## Decision
 
 1. **Per-tenant first-class keyspaces.** Each tenant owns an independent *logical* keyspace — independent key-to-node placement inputs, independent compaction queues, independent encryption context, independent lifecycle, independent quota accounting. Keyspaces are not prefixes on a shared ring.
@@ -127,7 +125,4 @@ All items below must be closed before this ADR moves from Proposed to Accepted.
 - ADR 019: Cipher Selection and FIPS Posture (crypto primitives for tenant-bound AAD)
 - ADR 020: L2 Envelope Encryption and DEK Lifecycle (Tenant KEK consumer)
 - ADR 025: Audit Event Model (planned — tenant-lifecycle audit records)
-- `plans/ops/multi_tenancy.md` (§1 and §2 superseded by this ADR; rewrite pending as Wave 3 exit criterion)
-- `plans/gap/claude_answers_20260417.md` §10
-uperseded by this ADR; rewrite complete)
-- `plans/gap/claude_answers_20260417.md` §10
+- `plans/ops/multi_tenancy.md` (§1 and §2 superseded by this ADR)

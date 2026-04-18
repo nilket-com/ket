@@ -13,8 +13,6 @@ Forces in play:
 - **Part size is a tuning knob, not a fixed constant.** Providers floor it (S3: 5 MiB except for the last part); network conditions cap it (a 128 MiB retry over a saturated egress link is pure waste); the chosen size lives in a 8-16 MiB window that every major provider accepts and that retries gracefully.
 - **ADR 021 §4's quota enforcement depends on commit-time accounting.** The transition from `Uploaded` to `Committed` is where the `(tenant_id → total_bytes)` Raft counter increments. Getting the transition semantics wrong re-opens the quota race.
 
-Derived from `plans/gap/claude_answers_20260417.md` §4 (pending-upload recovery model, multipart threshold).
-
 ## Decision
 
 1. **Lifecycle state machine (Raft-authoritative).** Each slab bound for L2 progresses through a small, totally ordered state set recorded in the Raft state machine. The state is one field on the `tiered_slabs` record keyed by `slab_id`:
@@ -120,4 +118,3 @@ All items below must be closed before this ADR moves from Proposed to Accepted.
 - ADR 024: L2 Orphan Cleanup and Remote Reclaim (sweeps aborted/orphaned multipart state left by this lifecycle)
 - ADR 025: Audit Event Model (planned — every lifecycle transition emits an audit record)
 - `plans/ops/storage_tiering.md` (Sweeper state machine updated to reference this lifecycle)
-- `plans/gap/claude_answers_20260417.md` §4

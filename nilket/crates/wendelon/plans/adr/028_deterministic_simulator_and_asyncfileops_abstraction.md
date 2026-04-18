@@ -16,8 +16,6 @@ Forces in play:
 - **Correctness checkers have different cost profiles.** Elle (Jepsen's linearizability successor) gives real per-history analysis at non-trivial per-op cost; monotonic-counter checking is cheap and catches a broad class of violations at near-zero cost. Running both on different scopes is strictly better than running one on all scopes.
 - **rustfs is already the S3 test backend (ADR 014).** A mocked `ObjectStore` in the simulator is not a replacement for rustfs in the integration-test harness; they serve different levels of the test pyramid and both have reasons to exist.
 
-Derived from `plans/gap/claude_answers_20260417.md` §8.
-
 ## Decision
 
 1. **Dual test harness, both permanent.** Wendelon ships with two correctness harnesses that run concurrently throughout the product's lifetime:
@@ -148,5 +146,4 @@ All items below are scoped at ADR level; acceptance requires prototype work to c
 - ADR 016: Durability Model (simulator exercises fsync and group-commit coalescing)
 - ADR 017: Persistent Local Index on redb (simulator exercises WAL-replay-forward recovery)
 - ADR 022: L2 Slab Format (planned — simulator's mock `ObjectStore` exercises it)
-- `plans/gap/claude_answers_20260417.md` §8
-- `plans/ops/testing.md` (to be rewritten post-acceptance)
+- `plans/ops/testing.md`
