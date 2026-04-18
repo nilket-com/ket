@@ -53,13 +53,13 @@ Derived from `plans/gap/claude_answers_20260417.md` §5 and §4.
 
 5. **Encryption sits *above* `AlignedBuf`.** Plaintext is encrypted into a ciphertext buffer of exact size (`plaintext_len + 16B tag` per 64 KiB chunk = 65552 B per chunk). Nonces are derived from chunk ordinal and not stored per chunk. The ciphertext stream is then padded to the next 4 KiB boundary for O_DIRECT. Padding overhead is <0.1% on slab-sized writes. Placing encryption below the alignment layer corrupts page-alignment invariants and defeats the purpose of `AlignedBuf`.
 
-6. **Slab-format encryption header.** Each slab's footer carries:
+6. **Slab-format encryption header.** Each slab's footer carries the encryption-relevant fields listed below; the bit-exact layout (offsets, widths, magic bytes, footer length, tail anchor) is frozen in [ADR 022 §5](022_l2_slab_format_footer_indexed_range_reads.md).
    - `slab_format_version` (u32)
    - `cipher_id` (u8, identifies which branch of ADR 019's decision tree was used)
    - `wrapped_slab_dek` (bytes, DEK wrapped by Tenant KEK)
    - `tenant_kek_id` (bytes, identifies which Tenant KEK was used so rotation is addressable)
    - `chunk_count` (u32)
-   - Slab-level authenticator over the whole footer, using the Slab DEK.
+   - **Slab-surface authenticator.** A 32-byte HMAC-SHA-256 over the non-ciphertext slab surface — specifically `magic_head || slab_header || offset_index || footer[0..192] || footer[224..256] || footer_length || index_length || magic_tail` — **keyed by the Tenant KEK identified by `tenant_kek_id`**. The ciphertext chunks are authenticated by their per-chunk AEAD tags (Decision §2) and are deliberately excluded from the HMAC; the HMAC field itself is excluded from its own coverage for circularity. The authenticator is verified **before** `wrapped_slab_dek` is unwrapped; a tampered footer or offset index is rejected without ever exposing the Slab DEK. HMAC-keyed by the Tenant KEK — not the Slab DEK — is load-bearing: the Slab DEK lives inside the footer in wrapped form, so keying its own authenticator on it is circular. See ADR 022 §5 for the byte ranges and rotation behavior under Tenant KEK versioning.
 
 7. **Background plaintext-to-ciphertext migration sweeper.** A low-priority sweeper identifies plaintext slabs, re-reads them, encrypts via the standard slab-creation path (fresh DEK, chunked encryption), and retires the plaintext copy through the existing compaction machinery. Rate-limited; pausable by operator; auditable. Ships with the L2 encryption landing — a plaintext-slab cluster should be able to enable encryption and eventually reach full-ciphertext steady state without manual intervention.
 
@@ -98,7 +98,7 @@ All items gate ADR 020 acceptance.
 - **KMS backend abstraction.** The Root KEK lives in "the KMS," but the specific integration surface (AWS KMS, GCP KMS, Azure Key Vault, PKCS#11 HSM) is not fixed here. *Resolves via:* a separate KMS-integration design note before ADR acceptance; this ADR names the abstract operations (`wrap(key, kek_id)`, `unwrap(wrapped, kek_id)`, `rotate(kek_id)`) and leaves provider-specifics to the integration.
 - **Tenant KEK rotation cadence and orchestration.** Who initiates rotation (operator-only? scheduled?), how in-flight reads against the old KEK are handled, and whether rotation re-wraps every Slab DEK or just marks the old KEK for retirement. *Resolves via:* a rotation design note before acceptance.
 - **Migration sweeper throughput and ordering.** At what rate the sweeper should run, and whether it should prioritize hot slabs or cold slabs or tenant-ordered, is operationally important but benchmark-resolvable. *Resolves via:* a sweeper benchmark against a representative plaintext dataset, measured throughput and compute-cost per slab, before acceptance.
-- **Footer format freeze.** The slab-format encryption header fields are specified above at the field-set level but not bit-exact. The AEAD AAD is now bit-exact (see Decision §2); the footer layout itself remains to be frozen. *Resolves via:* freeze in the ADR 022 (L2 slab format) draft; cite the frozen layout here at acceptance time.
+- **Footer format freeze.** ~~The slab-format encryption header fields are specified above at the field-set level but not bit-exact.~~ **Resolved by [ADR 022 §5](022_l2_slab_format_footer_indexed_range_reads.md).** The 256-byte footer is frozen bit-exact: field offsets, widths, magic_head / magic_tail, the 16-byte tail anchor, and the HMAC coverage range (`magic_head || slab_header || offset_index || footer[0..192] || footer[224..256] || footer_length || index_length || magic_tail`, keyed by the Tenant KEK identified by `tenant_kek_id`). This ADR's Decision §6 lists the encryption-relevant fields; ADR 022 §5 is the authoritative byte layout.
 
 ## References
 - ADR 009: io_uring Threading Model (`AlignedBuf` alignment context)
