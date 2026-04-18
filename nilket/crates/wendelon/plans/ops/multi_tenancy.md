@@ -62,7 +62,7 @@ RPCs that do not address a single tenant (cluster-status, membership changes) om
 
 ### 2.3 Role → Operation Matrix (Tenant Surface)
 
-| Role | Data-plane reads/writes | Cluster status / metrics / audit tail | `TenantAdmin` reads | `TenantAdmin` mutations |
+| Role | Data-Ring reads/writes | Cluster status / metrics / audit tail | `TenantAdmin` reads | `TenantAdmin` mutations |
 |------|--------------------------|-----------------------|---------------------|--------------------------|
 | `data_node` (tenant-scoped) | own tenant only | — | — | — |
 | `data_node` (cross-tenant, `tenant_id = null`) | any tenant (replication/membership) | — | — | — |
@@ -70,7 +70,7 @@ RPCs that do not address a single tenant (cluster-status, membership changes) om
 | `read_only_observer` | — | yes (ADR 018 §3) | metadata-only (ADR 021 §5) | — |
 | `break_glass_admin` | any tenant | yes | any tenant | any tenant (audit-tagged) |
 
-`read_only_observer` is deliberately scoped to operational visibility — cluster status, metrics, audit tail, and tenant *metadata*. It has no data-plane read access and cannot read tenant secrets or payloads. The role exists for monitoring and compliance-evidence collection, not for data inspection.
+`read_only_observer` is deliberately scoped to operational visibility — cluster status, metrics, audit tail, and tenant *metadata*. It has no Data-Ring read access and cannot read tenant secrets or payloads. The role exists for monitoring and compliance-evidence collection, not for data inspection.
 
 Bearer tokens are not a primary credential anywhere in the stack.
 
@@ -176,7 +176,7 @@ All operations take `target_tenant_id` as an explicit argument (see §2.1). All 
 
 ### 4.3 Cache Invalidation on State Transitions
 
-- `suspend_tenant` → control-plane message invalidates the data-path admission cache for that tenant on every replica.
+- `suspend_tenant` → Control-Ring message invalidates the data-path admission cache for that tenant on every replica.
 - `resume_tenant` → same channel; cache entries rebuilt on next admission.
 - `delete_tenant` → invalidates admission cache, drains the Tenant KEK cache (ADR 020), and initiates keyspace reclamation through the L2 compaction machinery (ADR 024 planned).
 
@@ -243,7 +243,7 @@ Sizing recommendations for specific KMS providers live with the KMS-integration 
 
 The single-tenant pilot provisions a concrete default tenant on first boot. The default tenant is a real record in the Raft state machine with a real Tenant KEK, a real OID claim on the default client certificate, and a real quota counter. Code paths never take a "no tenant" branch; schema never stores a null `tenant_id`.
 
-The orchestration mechanism (cluster-bootstrap RPC vs. well-known state-machine migration vs. operator-issued `create_tenant`) is tracked as an open item in [`plans/ops/lifecycle.md`](lifecycle.md). The architectural invariant here is that the default tenant exists as a real record before any data-plane RPC is served — not how it gets there.
+The orchestration mechanism (cluster-bootstrap RPC vs. well-known state-machine migration vs. operator-issued `create_tenant`) is tracked as an open item in [`plans/ops/lifecycle.md`](lifecycle.md). The architectural invariant here is that the default tenant exists as a real record before any Data-Ring RPC is served — not how it gets there.
 
 ---
 

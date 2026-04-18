@@ -8,7 +8,7 @@ Wendelon must decide how a node proves who it is, how an operator proves who the
 
 Forces in play:
 - The existing `plans/ops/multi_tenancy.md` draft carried a JWT-based RBAC model. Bearer tokens have an independent rotation lifecycle, are not cryptographically bound to the transport session, and expand the attack surface across every RPC that accepts them. ADR 021 supersedes this model; ADR 018 is its identity foundation.
-- mTLS is already required by the data-plane transport (ADR 004, ADR 011). Every connection already terminates a client certificate. Reusing that primitive for authorization avoids a second credential type.
+- mTLS is already required by the Data-Ring transport (ADR 004, ADR 011). Every connection already terminates a client certificate. Reusing that primitive for authorization avoids a second credential type.
 - Revoking an operator's authority in an incident must be fast and atomic. A role-by-role revocation within a shared CA becomes a CRL hunt; a whole-CA revocation is one action.
 - Four distinct principals appear in the pilot operational model: data nodes replicating and voting, operators running incident response, observers pulling metrics and audit tails, and break-glass administrators recovering from incidents.
 
@@ -61,7 +61,7 @@ Forces in play:
 
 ## Rationale
 
-- **Two CAs is the minimum that gives incident-time atomicity.** One CA requires revoking operators role-by-role; three or more CAs multiply key ceremonies without buying separation. The data-plane path and the administrative path are the two axes that matter, so two CAs is the right cardinality.
+- **Two CAs is the minimum that gives incident-time atomicity.** One CA requires revoking operators role-by-role; three or more CAs multiply key ceremonies without buying separation. The Data-Ring path and the administrative path are the two axes that matter, so two CAs is the right cardinality.
 - **OID claims beat session tokens on binding strength.** A CBOR payload inside the certificate is signed by the CA at issuance; the mTLS handshake cryptographically binds the connection to the certificate. Tampering requires compromising the CA, not just stealing a token. Tokens also introduce a lifecycle problem (rotation, revocation, storage) that certificates already solve.
 - **Critical extension semantics prevent silent downgrade.** Marking the OID critical means a client that doesn't understand the extension must reject the certificate instead of accepting it unclaimed. This protects against older clients being tricked into accepting unverified roles.
 - **Four roles map cleanly to pilot operational reality.** Fewer merges responsibilities that should be separable (e.g., the operator and the node); more invents distinctions the pilot doesn't exercise. Adding roles later uses the same OID/CA mechanism without a protocol break.

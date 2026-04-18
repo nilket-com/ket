@@ -9,7 +9,7 @@ End of W2, three nodes can stand up, handshake over QUIC, assert mTLS identity, 
 ## 1. ADRs consumed
 
 - **ADR 004 (Zero-Copy Transport).** `quinn`-based QUIC transport with zero-copy ingress/egress; framing is the W1/W2 boundary.
-- **ADR 010 (Serialization Tiers).** Wire formats split by tier: bytemuck POD for hot paths, `serde` for control-plane, schema evolution rules.
+- **ADR 010 (Serialization Tiers).** Wire formats split by tier: bytemuck POD for hot paths, `serde` for Control-Ring, schema evolution rules.
 - **ADR 011 (Auto-Adaptive Transport).** Transport selection (QUIC / fallback) is auto-adaptive per-peer with health-signal feedback.
 - **ADR 012 (Bounded Clock Drift HLC).** Hybrid logical clock with bounded physical-clock drift; out-of-bound drift is a recovery event, not a silent monotonicity violation.
 - **ADR 018 (Dual-CA mTLS Identity and OID-Bound Authorization).** Two trust roots (DATA CA, OPS CA); SAN → node_id binding; OID-bound role claims; break-glass marker.
@@ -17,7 +17,7 @@ End of W2, three nodes can stand up, handshake over QUIC, assert mTLS identity, 
 ## 2. Deliverables
 
 1. **QUIC transport stack** (quinn), bench-verified zero-copy for hot-path reads, with full mTLS client-auth on every connection.
-2. **Serialization layer** — POD hot path and `serde` control-plane with schema-version gates tied to wire-format evolution.
+2. **Serialization layer** — POD hot path and `serde` Control-Ring with schema-version gates tied to wire-format evolution.
 3. **Auto-adaptive transport switch** with peer health signals feeding back into selection.
 4. **HLC driver** with a configurable drift bound, emitting a `clock_drift_exceeded` event when exceeded; downstream consumers (Raft, audit) subscribe.
 5. **Dual-CA identity.** SAN template codified; node_id ↔ SAN binding enforced on every accept and connect; OPS-CA-signed cert presentation enables break-glass marker on audit records.
@@ -26,7 +26,7 @@ End of W2, three nodes can stand up, handshake over QUIC, assert mTLS identity, 
 ## 3. Acceptance criteria (ADR-referential)
 
 - (ADR 004) Zero-copy for inbound slab range-read is measurable: no per-byte allocation in the hot path, confirmed by allocator-counter test.
-- (ADR 010) Schema evolution: a node running wire-format version N+1 inter-operates with version N on control-plane messages for one rolling-upgrade window. Data-plane messages are not cross-version.
+- (ADR 010) Schema evolution: a node running wire-format version N+1 inter-operates with version N on Control-Ring messages for one rolling-upgrade window. Data-Ring messages are not cross-version.
 - (ADR 011) Transport fallback triggers within the SLO window documented in ADR 011 when QUIC is unreachable.
 - (ADR 012) The HLC never emits a timestamp that moves backwards on the same node; drift-exceeded events are audited (ADR 025 emission).
 - (ADR 018) A cert signed by DATA CA cannot invoke any OPS-CA-gated operation, and vice versa, enforced at the authorization layer and verified by a negative-auth test matrix.

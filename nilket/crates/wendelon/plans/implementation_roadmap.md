@@ -49,8 +49,8 @@ Effort bands: S ≈ 2-4 eng-weeks, M ≈ 4-8 eng-weeks, L ≈ 8-16 eng-weeks. Th
 ```
 
 Hot paths:
-- **W1 → W4 → W7** (storage seam → envelope encryption → L2) is the longest critical-path chain for the data-plane.
-- **W1 → W2 → W3 → W5** is the critical path for control-plane tenant admin.
+- **W1 → W4 → W7** (storage seam → envelope encryption → L2) is the longest critical-path chain for the Data-Ring.
+- **W1 → W2 → W3 → W5** is the critical path for Control-Ring tenant admin.
 - **W9** can start after W5 (needs tenant events to audit) and runs in parallel with W6/W7/W8.
 - **W10** is the closeout — its acceptance is the pilot cut criterion.
 
@@ -76,7 +76,7 @@ Land the `AsyncFileOps` trait over the existing `IoRingHandle`/MPSC/dedicated-th
 Zero-copy QUIC transport (ADR 004), auto-adaptive transport switching (ADR 011), serialization-tier wire formats (ADR 010), bounded-clock-drift HLC (ADR 012), dual-CA mTLS identity with OID-bound authorization (ADR 018). At the end of this stream the cluster can stand up three nodes, handshake, and assert who is who.
 
 ### W3 — Consensus & Ring
-Unified hash ring with epoch transitions (ADR 002). `openraft` integration with Raft state machine surface for subsequent streams' commits (ADR 007). By the end of W3 a tenant-less control plane can commit and apply cluster-config changes.
+Unified hash ring with epoch transitions (ADR 002). `openraft` integration with Raft state machine surface for subsequent streams' commits (ADR 007). By the end of W3 a tenant-less Control-Ring can commit and apply cluster-config changes.
 
 ### W4 — Crypto & Envelope Encryption
 aws-lc-rs backend with ADR 019's two-branch cipher decision tree (SIV or injective-nonce GCM). Three-level DEK/KEK hierarchy + rotation (ADR 020). Nonce injectivity and per-DEK data-bound tests ship with acceptance.

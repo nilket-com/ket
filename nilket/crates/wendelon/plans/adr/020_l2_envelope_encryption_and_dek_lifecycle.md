@@ -46,7 +46,7 @@ Forces in play:
 4. **DEK and KEK caching: time-bounded, zeroize-on-drop, memory-budgeted.**
    - **Tenant KEK cache:** unwrapped Tenant KEKs live in locked memory pages (`mlock`), protected by `ZeroizeOnDrop`, with a 15-minute idle TTL and a 60-minute absolute TTL. LRU eviction under memory pressure governed by the admission-control memory budget.
    - **Slab DEK cache:** unwrapped Slab DEKs live similarly, with a 15-minute idle TTL. Cache size bounded (default 10,000 entries, tunable) — at 80 bytes per entry that's under 1 MiB for the LRU cache itself.
-   - **Explicit invalidation:** any key-rotation event or tenant-suspend operation invalidates affected cache entries immediately via a control-plane message.
+   - **Explicit invalidation:** any key-rotation event or tenant-suspend operation invalidates affected cache entries immediately via a Control-Ring message.
    - **No disk caching.** Unwrapped keys never touch disk or network except in a controlled key-escrow flow (out of scope for this ADR).
 
 5. **Encryption sits *above* `AlignedBuf`.** Plaintext is encrypted into a ciphertext buffer of exact size (`plaintext_len + 16B tag` per 64 KiB chunk = 65552 B per chunk). Nonces are derived from chunk ordinal and not stored per chunk. The ciphertext stream is then padded to the next 4 KiB boundary for O_DIRECT. Padding overhead is <0.1% on slab-sized writes. Placing encryption below the alignment layer corrupts page-alignment invariants and defeats the purpose of `AlignedBuf`.

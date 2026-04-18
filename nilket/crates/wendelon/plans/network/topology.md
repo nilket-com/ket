@@ -1,6 +1,6 @@
 # Wendelon Topology: The Unified Ring
 
-This document outlines the topology of the Wendelon cluster. The fundamental architectural shift from distinct "planes" to a unified hash space topology brings conceptual simplicity while preserving the logical separation of control and data responsibilities.
+This document outlines the topology of the Wendelon cluster. The fundamental architectural shift from distinct "rings" to a unified hash space topology brings conceptual simplicity while preserving the logical separation of control and data responsibilities.
 
 ## 1. Unified Hash Space
 

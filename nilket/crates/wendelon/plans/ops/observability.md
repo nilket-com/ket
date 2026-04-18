@@ -230,7 +230,7 @@ SLOs are commitments measured against the metric catalog above. The pilot ships 
 
 | SLO | Target | Metric basis | Measurement window | Status |
 |-----|--------|--------------|---------------------|--------|
-| Availability (data-plane reads + writes) | 99.9% | `rpc_requests_total{operation=~"read\|write",outcome!="error"}` / total | 30d rolling | TARGET (unvalidated) |
+| Availability (Data-Ring reads + writes) | 99.9% | `rpc_requests_total{operation=~"read\|write",outcome!="error"}` / total | 30d rolling | TARGET (unvalidated) |
 | L1 read p99 (storage-side) | ≤ 10 ms | `l1_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
 | L2 read p99 (storage-side) | ≤ 150 ms | `l2_range_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
 | Read RPC p99 (client-observed, both tiers) | ≤ 150 ms | `rpc_latency_seconds{operation="read"}` p99 | 5m rolling | TARGET (unvalidated) |

@@ -24,7 +24,7 @@ ADR 007 (openraft) declared that Wendelon owns durability. This ADR specifies ho
    - Shape: `window = clamp(inflight_writes × per_write_cost_estimate, 200µs, 2ms)`.
    Under low load the window collapses to the floor — single-writer latency is bounded. Under high load the window expands toward the ceiling — throughput scales with coalescing.
 
-4. **Immediate flush on administrative barriers.** Membership changes, epoch transitions, lease commits, backup-barrier commits, and any admin-initiated "flush now" control RPC bypass the group-commit window and fsync immediately. Administrative operations must have bounded latency regardless of data-plane load.
+4. **Immediate flush on administrative barriers.** Membership changes, epoch transitions, lease commits, backup-barrier commits, and any admin-initiated "flush now" control RPC bypass the group-commit window and fsync immediately. Administrative operations must have bounded latency regardless of Data-Ring load.
 
 5. **No PLP assumptions anywhere in the durability contract.** The durability story is the same on PLP NVMe, non-PLP NVMe, SAS SSDs, and rotational media. Hardware that is faster benefits from reduced fsync latency; hardware that is slower pays the cost; no path to correctness relies on a drive's PLP capacitor.
 

@@ -1,17 +1,25 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
-	let entries = fs::read_dir(dir).expect("read_dir should succeed");
-	for entry in entries {
-		let entry = entry.expect("directory entry should load");
-		let path = entry.path();
-		if path.is_dir() {
-			collect_mod_rs_files(&path, files);
-		} else if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
-			files.push(path);
+fn walk_dir(dir: &Path, callback: &mut impl FnMut(&Path)) {
+	if let Ok(entries) = fs::read_dir(dir) {
+		for entry in entries.flatten() {
+			let path = entry.path();
+			if path.is_dir() {
+				walk_dir(&path, callback);
+			} else {
+				callback(&path);
+			}
 		}
 	}
+}
+
+fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
+	walk_dir(dir, &mut |path| {
+		if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
+			files.push(path.to_path_buf());
+		}
+	});
 }
 
 fn strip_line_comment(line: &str) -> &str {
@@ -120,5 +128,30 @@ fn test_mod_rs_files_are_manifests_only() {
 		violations.is_empty(),
 		"mod.rs files must be manifests only:\n{}",
 		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_forbidden_word_count() {
+	let forbidden_word = "plane";
+	let max_allowed = 2;
+	let mut total_occurrences = 0;
+
+	let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+	walk_dir(&src_dir, &mut |path| {
+		if path.extension().map_or(false, |ext| ext == "rs") {
+			if let Ok(content) = fs::read_to_string(path) {
+				total_occurrences += content.matches(forbidden_word).count();
+			}
+		}
+	});
+
+	assert!(
+		total_occurrences <= max_allowed,
+		"The word '{}' appeared {} times, which exceeds the limit of {}.",
+		forbidden_word,
+		total_occurrences,
+		max_allowed
 	);
 }
