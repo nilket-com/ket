@@ -9,6 +9,8 @@
 ## Context
 [What is the problem or force that triggered this decision? Describe the technical, business, or operational context.]
 
+[**Recommended, when applicable:** cite the source of convergence on a single line, e.g., "Derived from `plans/gap/<answer-file>.md` §N."]
+
 ## Decision
 [What is the specific, actionable decision we are making? Be clear and assertive.]
 
@@ -17,3 +19,6 @@
 
 ## Consequences (The "Negatives")
 [What does this decision cost us? What are the edge cases, maintenance burdens, or technical debt we are explicitly accepting? This is crucial for documenting why a seemingly "bad" idea was rejected or what trade-offs we swallowed.]
+
+## Open Questions (Optional)
+[Known unknowns that this ADR explicitly defers to measurement or later work. Distinct from Consequences: these are items to be closed by benchmark or prototype, not accepted trade-offs. Omit the section when there are none.]
