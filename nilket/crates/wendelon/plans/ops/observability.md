@@ -1,22 +1,349 @@
-# Observability & SLOs
+# Observability
 
-Wendelon must be highly transparent to operators to diagnose network partitions, Raft bottlenecks, and storage tiering issues.
+Operator-facing telemetry for Wendelon. **Not** the same thing as audit — audit is for security/compliance reviewers and lives under ADR 025; observability is for operators diagnosing the running cluster. Three streams, three postures:
 
-## 1. Tracing
-- **OpenTelemetry:** Every request flowing through the system carries a W3C trace context.
-- **Spans:** Key spans include `quic_stream_accept`, `raft_propose`, `io_uring_write`, and `background_sweeper_upload`.
+| Stream | ADR | Purpose | Security posture | Retention |
+|--------|-----|---------|------------------|-----------|
+| Traces | 027 | Per-request causal path across nodes | mTLS on export; sampled in prod | Exporter-backend-defined |
+| Metrics | 027 | Aggregate timeseries for SLOs and alerting | mTLS on scrape; operator-only | Prometheus-backend-defined |
+| Audit | 025 | Attributable record of admin/auth actions | Local chain always-on; off-box via `Syslog`/`Kafka` | ≥ 90d default, tunable |
 
-## 2. Metrics (Prometheus)
-Key gauges and histograms:
-- `raft_commit_latency_ms`: Time to achieve quorum.
-- `data_ring_write_latency_ms`: Client-observed write latency.
-- `e_safe_lag_ms`: Delta between wall clock and the global `E_safe` watermark.
-- `slab_tiering_bytes`: Volume of data residing in L0, L1, and L2.
-- `proxy_hop_count`: Rate of proxied writes (indicates ring churn or client stale routing).
+This document operationalizes ADR 027. Anything architectural goes in the ADR; this document covers **what an operator configures, runs, and alerts on**.
 
-## 3. Service Level Objectives (SLOs)
-Wendelon targets the following strict SLOs for a healthy cluster:
-- **Availability:** 99.99% uptime for Data Ring reads/writes.
-- **Latency (L1 Read):** p99 < 10ms for local NVMe reads.
-- **Latency (L2 Read):** p99 < 150ms for S3/Object storage reads.
-- **Durability:** 99.999999999% (11 nines) via L2 object storage replication.
+---
+
+## 1. Listener topology
+
+Per ADR 027 §5, Wendelon exposes observability and lifecycle endpoints on **three distinct listeners** because TLS client-auth is decided at handshake time, not per path.
+
+| Port (default) | Endpoint | TLS posture | Roles that may connect | Consumer |
+|----------------|----------|-------------|------------------------|----------|
+| `:7431` | `/health` | Plain TCP, no client auth | anyone with L4 reach | k8s liveness, LB health |
+| `:7432` | `/ready` | mTLS required | `operator`, `read_only_observer`, `data_node` | k8s readiness (through mesh/sidecar), `wendelon-ctl status` |
+| `:7433` | `/metrics` | mTLS required | `operator`, `read_only_observer` | Prometheus-compatible scrapers |
+
+Rules:
+- Ports must be distinct. A deployment may firewall `:7432` and `:7433` to cluster-internal network ranges; `:7431` is typically the only externally reachable listener of the three.
+- `/health` returns only `200 OK` with body `ok` (process alive) or `503` (process not alive). It carries **no cluster state** — an unauthenticated prober cannot learn whether the cluster is healthy.
+- `/ready` returns structured JSON. Current field set:
+  ```json
+  {
+    "node_id": "n-04",
+    "epoch": 1842,
+    "leader_id": "n-01",
+    "cluster_members": ["n-01","n-02","n-03","n-04","n-05"],
+    "drain_state": "none | draining | drained",
+    "audit_materialization_lag_entries": 0,
+    "degraded_reason": null
+  }
+  ```
+  `degraded_reason` is a typed enum (`AuditLagExceeded`, `WalFsyncElevated`, `L2UploadBacklog`, ...). A node marks itself not-fully-ready whenever `degraded_reason` is non-null or `audit_materialization_lag_entries > 0` (ADR 025 §7).
+- `/metrics` serves OpenMetrics text on mTLS. `data_node` certs **cannot** scrape; only `operator` and `read_only_observer`.
+
+### Opening the listeners in config
+
+```toml
+[observability.listeners]
+health  = "0.0.0.0:7431"
+ready   = "0.0.0.0:7432"   # or cluster-internal CIDR
+metrics = "0.0.0.0:7433"   # or cluster-internal CIDR
+```
+
+All three listener sockets must bind successfully at startup; a bind failure is a **startup error**, not a degraded-mode operation.
+
+---
+
+## 2. Traces
+
+### Protocol
+
+- OTLP only (gRPC preferred; HTTP/protobuf supported).
+- No Jaeger-native, no Zipkin-native. Operators using those backends run the **OpenTelemetry Collector** as a translation layer.
+
+### Configuration
+
+```toml
+[observability.traces]
+endpoint         = "https://otel-collector.internal:4317"
+protocol         = "grpc"                       # or "http/protobuf"
+sampling_rate    = 0.01                          # 1% default in prod; 1.0 in dev
+client_cert_path = "/etc/wendelon/obs-client.crt"
+client_key_path  = "/etc/wendelon/obs-client.key"
+ca_bundle_path   = "/etc/wendelon/obs-ca.crt"
+max_queue_size   = 8192
+export_timeout_s = 30
+```
+
+Client cert may be signed by the Node CA (self-hosted observability backends) or by a dedicated observability CA (SaaS vendors). See ADR 027 Open Questions for the decision framework; default is Node-CA reuse in-cluster.
+
+### Span taxonomy (curated top-level spans)
+
+Per ADR 027 §3:
+
+- `quic.stream.accept`
+- `rpc.dispatch.{operation}` (operation drawn from the closed RPC enum)
+- `raft.propose`
+- `raft.apply`
+- `storage.l1.write`
+- `storage.l2.put_slab`
+- `l2.sweeper.upload`
+- `audit.emit`
+
+Call sites within these spans may create nested spans freely. Adding a new top-level span is a cross-cutting change that requires updating this list and ADR 027.
+
+### Context propagation
+
+W3C `traceparent` / `tracestate` is carried in a dedicated QUIC frame header on the first stream of each RPC. Extraction on ingress and injection on egress are framework-level; call sites do not touch the headers. A forgotten-propagation bug surfaces at framework tests, not at operators.
+
+### Tail-based sampling recipe (Collector pipeline)
+
+There are two operating modes; pick one based on what the deployment actually needs. **The distinction matters because head-sampled-out traces are gone — the Collector cannot recover what Wendelon never exported.**
+
+**Mode A — Cheap default, forward the full 1% head-sampled stream.** Keep `sampling_rate = 0.01` on the Wendelon side. Every head-sampled trace is forwarded to the trace backend without further filtering. No tail-sampler is needed: at 1% of traffic the volume is already small, and decimating the 1% stream further would only lose signal that survived head sampling.
+
+```yaml
+processors:
+  batch:                # batching only; no tail-sampling processor
+    timeout: 2s
+    send_batch_size: 1024
+```
+
+Trade-off: export bandwidth stays at ~1% of original traffic. 99% of error and slow traces in the original stream are lost at the head before the Collector ever sees them. This mode is appropriate when the deployment tolerates statistical visibility on errors and slowness — fine for developer environments, probably not for production incident forensics.
+
+If an operator on Mode A wants to preserve errors/slow traces at production fidelity while still paying a cheap default-traffic bill, that is Mode B's problem to solve, not a tail-sampler applied to the 1% stream.
+
+**Mode B — Full capture of errors and slow traces.** Set `sampling_rate = 1.0` on the Wendelon side. Every trace is exported to the Collector, which applies the tail-sampler to decide what to forward to the trace backend:
+
+```yaml
+processors:
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 500000
+    expected_new_traces_per_sec: 50000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: { status_codes: [ERROR] }
+      - name: keep-slow
+        type: latency
+        latency: { threshold_ms: 500 }
+      - name: baseline-sample
+        type: probabilistic
+        probabilistic: { sampling_percentage: 1 }
+```
+
+Trade-off: Wendelon → Collector bandwidth is 100x higher than Mode A, and the Collector must be provisioned to handle the full trace rate. In exchange, **every** error trace and **every** slow trace in the traffic reaches the trace backend; only the boring fast-and-successful traces are decimated. This is the correct mode when incident forensics on production traffic is a requirement.
+
+**The two modes cannot be combined.** Head sampling is fire-and-forget: whatever Wendelon drops at the head is not visible to the Collector at all. There is no Mode-C that "tail-samples errors from the dropped 99%" — that stream does not leave the process. Mode A is "forward the 1% head stream as-is"; Mode B is "export 100%, tail-sample at the Collector." Pick one per deployment.
+
+---
+
+## 3. Metrics
+
+### Subscriber composition
+
+The `tracing-subscriber` stack is composed **once** at startup (ADR 027 §2):
+
+1. `EnvFilter` (module-level log filter, reloadable via authenticated admin RPC).
+2. `fmt` layer — JSON in prod, human-readable in dev (build flag).
+3. OTLP exporter layer.
+4. Metrics bridge layer (derives histograms from span durations).
+
+Layer order is fixed in code and asserted by integration test. Runtime layer hot-swap is not supported; only `EnvFilter`'s filter string is reloadable.
+
+### Cardinality discipline (load-bearing)
+
+Per ADR 027 §7: **high-cardinality dimensions are not metric labels.** `tenant_id`, `slab_id`, `key_id`, full cert subjects, raw key IDs — none of these are Prometheus labels. They appear in trace attributes and (where appropriate) in audit events.
+
+Per-tenant detail is exposed via `/tenant-usage` (operator-authenticated, paginated) on the metrics listener. Use traces for per-tenant per-request questions; use `/tenant-usage` for per-tenant aggregate questions. Do not ask for per-tenant metric labels.
+
+Operational effect: a tenant-growth event from 1k → 1M tenants does not blow up the Prometheus backend.
+
+### Default metric catalog
+
+The pilot ships with this metric set. Every metric is OpenMetrics-compatible and unit-suffixed.
+
+#### Raft
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `raft_propose_latency_seconds` | histogram | none | Time from propose → append |
+| `raft_commit_latency_seconds` | histogram | none | Time from propose → quorum commit |
+| `raft_log_lag_entries` | gauge | none | This-node lag behind leader |
+| `raft_current_leader` | gauge | `leader_id` | Leader identity (single-series-per-leader-transition) |
+| `raft_membership_epoch` | gauge | none | Current membership epoch |
+
+#### Transport
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `quic_active_streams` | gauge | none | Open QUIC streams |
+| `quic_handshake_failures_total` | counter | `reason` (enum) | Auth / TLS failures |
+| `rpc_requests_total` | counter | `operation`, `outcome` | Per-op request counts (operation is closed enum, bounded) |
+| `rpc_latency_seconds` | histogram | `operation` | Per-op latency (operation bounded by closed enum) |
+
+#### Storage
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `wal_fsync_latency_seconds` | histogram | none | fsync tail |
+| `storage_tier_bytes` | gauge | `tier` (`l1`, `l2`, `staging`) | Bytes per tier |
+| `slab_compaction_backlog_bytes` | gauge | none | Pending-compaction pressure |
+| `group_commit_window_seconds` | histogram | none | Group-commit coalescing latency (ADR 016) |
+| `l1_read_latency_seconds` | histogram | none | Storage-side read latency for L1-served requests (paired with `l2_range_read_latency_seconds`) |
+
+#### L2
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `l2_upload_latency_seconds` | histogram | none | Slab upload latency |
+| `l2_range_read_latency_seconds` | histogram | none | Slab range-read latency |
+| `l2_orphan_reclaim_bytes_total` | counter | none | Orphan-slab reclaim volume |
+
+#### Crypto / Identity
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `kms_unwrap_latency_seconds` | histogram | none | KMS unwrap call latency |
+| `tenant_kek_cache_hit_total` | counter | `outcome` (`hit`, `miss`) | KEK cache effectiveness |
+| `cert_expiry_seconds` | gauge | `role` | Time-to-expiry for loaded certs |
+
+#### Audit materialization (ADR 025 §5)
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `audit_materialization_lag_entries` | gauge | none | Per-node local-chain lag behind Raft log (state-machine authority events) |
+| `audit_emit_total` | counter | `authority` (`raftlog`, `nodelocal`), `outcome` | Emission volume, split by authority |
+| `audit_sink_failure_total` | counter | `sink` (`local`, `syslog`, `kafka`), `reason` | Per-sink failure counts |
+
+#### Process
+Standard process metrics (CPU, RSS, FDs, threads). Emitted by the process-metrics crate; cardinality is bounded and well-known.
+
+### Aggregate per-tenant metrics (low-cardinality only)
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `tenant_count_active` | gauge | none | Active tenants on this node |
+| `tenant_count_suspended` | gauge | none | Suspended tenants on this node |
+| `tenant_count_deleting` | gauge | none | Tenants mid-delete |
+
+Per-tenant *byte counts, request rates, quota utilization* are served from `/tenant-usage` with pagination — not from `/metrics` — precisely to keep the Prometheus label space finite.
+
+---
+
+## 4. Service Level Objectives (SLOs)
+
+SLOs are commitments measured against the metric catalog above. The pilot ships with **targets** — numbers we intend the chaos and simulator harnesses (ADR 028) to validate before moving from `proposed` to `accepted`. Numbers marked `TARGET (unvalidated)` are aspirational until a soak run confirms them.
+
+| SLO | Target | Metric basis | Measurement window | Status |
+|-----|--------|--------------|---------------------|--------|
+| Availability (data-plane reads + writes) | 99.9% | `rpc_requests_total{operation=~"read\|write",outcome!="error"}` / total | 30d rolling | TARGET (unvalidated) |
+| L1 read p99 (storage-side) | ≤ 10 ms | `l1_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| L2 read p99 (storage-side) | ≤ 150 ms | `l2_range_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| Read RPC p99 (client-observed, both tiers) | ≤ 150 ms | `rpc_latency_seconds{operation="read"}` p99 | 5m rolling | TARGET (unvalidated) |
+| Raft commit p99 | ≤ 50 ms | `raft_commit_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| WAL fsync p99 | ≤ 5 ms | `wal_fsync_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| Audit materialization lag | ≤ 100 entries steady-state | `audit_materialization_lag_entries` | instantaneous | TARGET (unvalidated) |
+
+Note on tier attribution: `rpc_latency_seconds` is labeled by `operation` only, never by tier — the tier a read ends up served from is an internal execution detail and often a mixture per-request (L1 miss falls through to L2). Tier-specific SLOs therefore measure the **storage-side** latency (`l1_read_latency_seconds`, `l2_range_read_latency_seconds`), and the client-observed SLO is the unified RPC-layer metric.
+
+**Durability** is not an availability-style SLO; it is a design property of the replication + L2 model. The "11 nines" figure is a marketing-shaped number that depends on assumptions about object-store replication, scrub cadence, and correlated-failure rate that this project has not yet modeled. The pilot does not claim a specific durability figure; see `plans/ops/testing.md` and the chaos-harness soak results for what is actually validated.
+
+Downgrading a target from TARGET to COMMITTED requires: (a) a weekly soak under `plans/ops/testing.md` coverage ladder that hits the target on at least 4 consecutive weeks; (b) a dashboard and alert rule that would fire before breach.
+
+---
+
+## 5. Alerts (seed set)
+
+Operators run these out of the box. Each alert is named after the metric it fires on; all thresholds are tunable via cluster config.
+
+### 5.1 Required recording rules
+
+Histogram-derived quantiles are **not** precomputed series — `foo_seconds{p=0.99}` is shorthand that does not exist in Prometheus. The alert expressions below depend on a small set of recording rules that must be loaded in the Prometheus server. Ship these with the default alerting bundle:
+
+```yaml
+groups:
+  - name: wendelon_recording_rules
+    interval: 30s
+    rules:
+      - record: job:raft_commit_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(raft_commit_latency_seconds_bucket[5m])))
+      - record: job:wal_fsync_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wal_fsync_latency_seconds_bucket[5m])))
+      - record: job:l2_upload_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(l2_upload_latency_seconds_bucket[5m])))
+      - record: job:l1_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(l1_read_latency_seconds_bucket[5m])))
+      - record: job:l2_range_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(l2_range_read_latency_seconds_bucket[5m])))
+      - record: job:rpc_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(rpc_latency_seconds_bucket{operation="read"}[5m])))
+```
+
+The `job:` naming prefix follows the Prometheus convention for aggregated-across-instances recording rules. SLO dashboards in §4 and alerts in §5.2 both reference these precomputed series.
+
+### 5.2 Alert rules
+
+| Alert | Condition | Severity | Notes |
+|-------|-----------|----------|-------|
+| `RaftNoLeader` | `absent(raft_current_leader)` for 60s | page | Cluster unwritable |
+| `RaftCommitLatencyHigh` | `job:raft_commit_latency_seconds:p99_5m > 0.1` for 10m | page | Likely quorum trouble or slow fsync |
+| `WalFsyncLatencyHigh` | `job:wal_fsync_latency_seconds:p99_5m > 0.02` for 10m | page | Disk pressure or failing NVMe |
+| `AuditMaterializationLagRising` | `audit_materialization_lag_entries > 1000` for 5m | page | Local chain can't keep up with Raft; degraded `/ready` |
+| `AuditSinkFailing` | `rate(audit_sink_failure_total{sink="local"}[5m]) > 0` | page | Local-chain writes failing — NodeLocal events fail-closed |
+| `L2UploadBacklogGrowing` | `job:l2_upload_latency_seconds:p99_5m > 2 and storage_tier_bytes{tier="staging"} > 1e10` for 10m | warn | L2 sweeper falling behind |
+| `CertExpiringSoon` | `cert_expiry_seconds < 7*86400` | warn (30d), page (7d) | Rotate before expiry |
+| `TenantKekCacheThrashing` | `rate(tenant_kek_cache_hit_total{outcome="miss"}[5m]) / rate(tenant_kek_cache_hit_total[5m]) > 0.5` for 10m | warn | Cache undersized; KMS cost spike |
+| `QuicHandshakeFailureSpike` | `rate(quic_handshake_failures_total[5m]) > 1` | warn | Per-second rate > 1; possible auth churn or misconfigured client |
+
+`AuditMaterializationLagRising` and `AuditSinkFailing` are **required paging alerts** for compliance deployments (the audit fail-closed posture for NodeLocal events means these conditions can reject auth operations).
+
+Operators running these alerts without the recording rules in §5.1 must substitute the raw `histogram_quantile(0.99, sum by (job, le) (rate(<metric>_bucket[5m])))` expression inline — the result is equivalent but harder to read in alert routing.
+
+---
+
+## 6. Runbook pointers
+
+For each alert above, operators need a runbook. The runbook catalog lives at `plans/ops/runbooks/` (pending creation; one runbook per paging alert at minimum). Minimum runbook shape:
+
+1. What the alert means in plain language.
+2. First-look metrics and traces (links to specific dashboards/queries).
+3. Diagnostic decision tree: "if X, check Y; if Y, check Z."
+4. Mitigation actions, ranked by reversibility.
+5. Escalation criteria.
+
+---
+
+## 7. FIPS-build visibility
+
+The FIPS build profile (ADR 026) exposes these additional signals:
+
+- `fips_module_self_test_total{outcome}` — counter of self-test invocations and outcomes.
+- `fips_module_version_info{version}` — gauge always `1`, with a version label sourced from the pinned aws-lc-rs build. (Low-cardinality: one label value per build.)
+- `/ready` adds a `fips_mode` boolean field and a `fips_self_test_last_ts` field when built with the FIPS profile.
+
+Non-FIPS builds do not emit these signals.
+
+**Mixed-profile clusters are not a supported steady state.** Per ADR 026 Consequences, a cluster where some nodes run the FIPS build and others run the default build is an unsupported topology — crypto backends differ, and audit chain hashes are incompatible (blake3 vs. SHA-256). The supported operation is "every node on the same build profile."
+
+The `fips_mode` field in `/ready` and the `fips_module_version_info` metric exist specifically to make the **unsupported states visible**, not to legitimize them:
+
+- **During a profile upgrade** (e.g., migrating a cluster from `default` to `fips` by rolling-restarting each node): the operator can see, live, which nodes have converted and which have not. Once the roll completes, every node reports the same `fips_mode`; until then, the cluster is in the documented transient mixed state.
+- **As a misconfiguration detector:** if `fips_mode` is not uniform across the cluster after an upgrade has supposedly completed, something went wrong — the mixed state is a bug, and the signal exists to surface it.
+
+These signals are diagnostic, not a license to run a mixed fleet as a target state. Operators needing FIPS coverage run a fully-FIPS cluster; operators not needing it run a fully-default cluster. The upgrade window is bounded by `plans/ops/upgrades.md`.
+
+Exact field definitions close with ADR 026 acceptance; this section will be tightened when ADR 026 moves to Accepted.
+
+---
+
+## 8. What is explicitly not observability
+
+- **Audit.** Audit events are ADR 025's concern. The audit stream has different durability semantics (fail-closed for NodeLocal, materialization-lag for RaftLog) and different retention (≥ 90 days default). Do not route audit events through the trace or metric pipelines.
+- **Debug logs.** Debug logging is operator-mode-only and is not part of the telemetry SLA. `EnvFilter` controls it; `tracing` events at `debug!` and `trace!` are dropped in production builds unless explicitly enabled.
+- **Per-tenant business analytics.** `/metrics` does not carry per-tenant labels. Per-tenant business metrics are downstream of this system, not inside it.
+
+---
+
+## References
+
+- ADR 027: Observability Posture — OTLP, Tracing Stack, Health/Metrics Split
+- ADR 025: Audit Event Model and Tamper-Evident Hash Chain (separate stream)
+- ADR 026: FIPS 140-3 Certification Target (FIPS-build visibility additions)
+- ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (role-gating on `/ready` and `/metrics`)
+- ADR 028: Deterministic Simulator and `AsyncFileOps` Abstraction (SLO validation harness)
+- `plans/ops/testing.md` — coverage ladder and soak schedule that validate SLO targets
+- `plans/ops/runbooks/` — per-alert runbook catalog (pending)

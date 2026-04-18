@@ -39,6 +39,8 @@ This encoding is **injective by construction**: distinct `chunk_index` values un
 
 **Earlier drafts included a third branch (XChaCha20-Poly1305) as a non-FIPS fallback.** That branch existed to avoid structural-nonce engineering via XChaCha's 192-bit random nonce. With the injective encoding adopted above, the structural-nonce property is a construction guarantee, not a discipline problem — so the motivation for XChaCha disappears. Retiring it also removes a third code path and its non-trivial provider question (see Consequences for context). The decision tree is two branches.
 
+**FIPS build profile override.** The decision tree above is for the default build profile. AES-256-GCM-SIV (RFC 8452) is an IETF construction and is *not* on the NIST SP 800-38 approved-mode list; CAVP covers GCM/GMAC/XPN but not GCM-SIV. Under the `fips` build profile (ADR 026 §2a), the first branch of the tree is compiled out and the plain-GCM branch with injective nonces is the only active cipher path. All acceptance-bar invariants below (per-DEK data bound, injective-nonce test, per-slab DEK invariant, reserved version byte) apply unchanged under the FIPS profile — they were designed for the fallback branch and carry over cleanly. Cipher selection is therefore a compile-time property of the build profile, not a runtime toggle. See ADR 026 §2a for the detailed justification and §3 for the no-runtime-toggle rule.
+
 **Acceptance bar for the plain-GCM branch:**
 
 1. **Per-DEK data bound.** NIST SP 800-38D limits AES-GCM under a single key to roughly `2^36` bytes (64 GiB) of protected data. Wendelon enforces this structurally rather than probabilistically: `slab_max_bytes` in the cluster config has a hard compile-time ceiling of `2^35` bytes (32 GiB), giving a 2× safety margin against the NIST limit. Because ADR 020 scopes DEKs per-slab, the per-DEK ciphertext volume cannot exceed `slab_max_bytes`, which in turn cannot exceed `2^35` bytes. A 64 MiB default slab is four orders of magnitude under this bound; the ADR-level invariant is the ceiling, not the default.
@@ -48,15 +50,17 @@ This encoding is **injective by construction**: distinct `chunk_index` values un
 
 If any acceptance-bar invariant cannot be honored in the pinned backend, plain-GCM encryption is unavailable and the feature blocks rather than ships. There is no third "hope it works" branch.
 
-**aws-lc-rs is the FIPS cryptographic backend.** At ADR acceptance time, aws-lc-rs's AES-256-GCM-SIV availability is verified against the library version pinned in the repo. The verification result is recorded in this ADR as a single line under Open Questions, and that line becomes the trigger for whether the FIPS branch of the decision tree is exercised or not.
+**aws-lc-rs is the cryptographic backend for both build profiles.** At ADR acceptance time, aws-lc-rs's AES-256-GCM-SIV availability is verified against the library version pinned in the repo. The verification result is recorded in this ADR as a single line under Open Questions, and that line becomes the trigger for whether the *default* build's SIV branch is the hot path or whether the plain-GCM fallback branch is the hot path in the default build as well. In the **FIPS build profile**, the SIV branch is unconditionally compiled out (per ADR 026 §2a) — the availability check is relevant only to the default-profile decision tree.
 
 **No hand-rolled crypto primitives.** Wendelon code may own: cipher selection, nonce derivation, AAD binding, key wrapping construction, and DEK rotation policy. Wendelon code never owns: the block cipher itself, the AEAD mode, the hash function, the KDF, or any other primitive.
 
-**Provider assignment per cipher:**
-| Cipher | FIPS build | Non-FIPS build |
-|--------|-----------|----------------|
-| AES-256-GCM-SIV | `aws-lc-rs` (when coverage confirmed) | `aws-lc-rs` |
-| AES-256-GCM (SIV-unavailable fallback) | `aws-lc-rs` | `aws-lc-rs` |
+**Provider assignment per cipher and build profile:**
+| Cipher | FIPS build | Default (non-FIPS) build |
+|--------|-----------|--------------------------|
+| AES-256-GCM-SIV | **compiled out** (not FIPS-approved; see ADR 026 §2a) | `aws-lc-rs` (when coverage confirmed) |
+| AES-256-GCM (injective-nonce branch) | `aws-lc-rs` — **sole active cipher path** | `aws-lc-rs` (used when SIV coverage is absent) |
+
+The FIPS column is not "SIV when available" — SIV is structurally excluded from the FIPS build regardless of library coverage, because AES-256-GCM-SIV is not on the NIST SP 800-38 approved-mode list (IETF RFC 8452, not CAVP-covered). Cipher selection is therefore a compile-time property of the build profile, not a runtime toggle (ADR 026 §3).
 
 The current transport stack uses `rustls` with `ring`; `ring` remains the transport TLS provider unchanged. The *symmetric encryption* for at-rest payloads (L2 slabs, WAL, redb values) uses `aws-lc-rs` exclusively, which exposes AES-256-GCM and AES-256-GCM-SIV in its high-level Rust API and is the same provider family targeted for FIPS builds. Using one provider for all at-rest crypto keeps the validation surface and test matrix single-tracked.
 
@@ -66,7 +70,7 @@ The current transport stack uses `rustls` with `ring`; `ring` remains the transp
 - **Injective structural-nonce plain GCM is a principled fallback, not a compromise.** An earlier draft treated structural-nonce GCM as fragile — correct for the *probabilistic* HKDF-truncate formulation that a Codex review flagged, not correct for an *injective* encoding whose uniqueness is a construction guarantee. Under ADR 020's per-slab DEK invariant, a chunk-ordinal nonce has no reuse path; safety becomes a matter of the data-volume bound, which is enforced by the `slab_max_bytes` ceiling, not a matter of collision probability.
 - **Two branches beat three.** The prior three-branch design included XChaCha20-Poly1305 as a non-FIPS fallback specifically to avoid structural-nonce engineering via its 192-bit random nonce. With injective nonces now the standard, that motivation evaporates. Dropping XChaCha20 removes a third cipher path, eliminates a provider question (the pinned `ring` and `aws-lc-rs` versions do not expose XChaCha20-Poly1305 at the high-level Rust API the rest of Wendelon uses), and gives one slab format regardless of build configuration. Cipher agility remains available via the `cipher_id` footer field if we ever want to add XChaCha20 back through a future ADR.
 - **aws-lc-rs is the right FIPS backend.** It is actively maintained by AWS, has a live FIPS 140-3 submission path, and integrates cleanly with Rust. Ring (the historical default) has no FIPS story. Building our own FIPS module is not on the table (see ADR 026 for the rationale on certification targets).
-- **The ADR-time verification pattern is load-bearing.** Whether we exercise the FIPS fallback branch depends on a property of an external library at a specific version. We pin that version and verify at acceptance, rather than writing a decision tree that depends on an unmeasured property of the world.
+- **The ADR-time verification pattern is load-bearing (default build only).** Whether the default build exercises the SIV branch or the plain-GCM fallback depends on a property of an external library at a specific version (aws-lc-rs's GCM-SIV coverage at the pinned version). We pin that version and verify at acceptance, rather than writing a decision tree that depends on an unmeasured property of the world. This verification does *not* apply to the FIPS build: under the FIPS profile the decision tree collapses to plain GCM unconditionally (ADR 026 §2a), so SIV coverage is irrelevant there.
 
 ## Consequences (The "Negatives")
 
@@ -95,5 +99,5 @@ All items below gate ADR 019 acceptance and must be closed before Proposed → A
 - ADR 017: Persistent Local Index on redb (values encrypted under this ADR's cipher)
 - ADR 020: L2 Envelope Encryption and DEK Lifecycle (planned — primary consumer)
 - ADR 025: Audit Event Model (planned — audit signatures use this ADR's primitives)
-- ADR 026: FIPS 140-3 Certification Target (planned — FIPS gating consumer)
+- ADR 026: FIPS 140-3 Certification Target — §2a forces the plain-GCM branch under the FIPS build profile
 - `plans/gap/claude_answers_20260417.md` §5
