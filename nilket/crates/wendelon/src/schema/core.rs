@@ -1,3 +1,4 @@
+use super::units::{Identity, TenantId};
 use arrow::datatypes::{DataType, Field, Schema};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
@@ -112,7 +113,9 @@ pub struct TransferToken {
 //  FINALIZATION MARKER — 88 bytes, fixed
 //
 //  Appended to the Raft log (or broadcast out-of-band) once a
-//  write achieves quorum ack. Drives E_safe advancement.
+//  write achieves its currently-implemented durability boundary.
+//  Drives E_safe advancement and records the requested durability
+//  class in the durable control-plane history.
 //
 //  E_safe enforcement:
 //    Followers MUST NOT serve reads for keys whose most recent
@@ -137,9 +140,12 @@ pub struct FinalizationMarker {
 	/// Highest log index safe for reads in this epoch at finalization time
 	/// (monotonically non-decreasing within an epoch)
 	pub e_safe_index: u64,
-	/// Reserved slot; zero-filled until assigned. Exists so the struct
-	/// lands on the 88-byte size contract asserted below.
-	pub _reserved: u64,
+	/// Requested client durability class that produced this marker.
+	/// The data path may still execute more conservatively than this
+	/// value implies until W6 lands the weaker ack semantics, but the
+	/// requested class is durable and observable from W1 onward.
+	pub durability: DurabilityLevel,
+	pub _pad: [u8; 7],
 }
 
 // ============================================================
@@ -170,14 +176,14 @@ pub struct StreamFinalizationRequestMeta {
 //  LEASE DESCRIPTOR — 144 bytes, fixed
 //
 //  Per-range leases (ADR 003 / plan 018) fence Stellarator writes
-//  so only one data node accepts traffic for a given key_hash
+//  so only one data node accepts traffic for a given locality
 //  range within an epoch. The same descriptor backs linearizable
 //  reads: a node may serve `LINEARIZABLE` reads locally while a
 //  valid lease covers the key.
 //
 //  • Granted by the Raft Leader once the entry commits.
 //  • Each lease is scoped to the inclusive `[range_start,
-//    range_end]` key_hash window and the specific epoch named in
+//    range_end]` locality window and the specific epoch named in
 //    `epoch` — a cluster transition to E+1 invalidates every
 //    lease carrying a prior epoch.
 //  • Expires at `lease_expiry` (HLC-based, NOT wall-clock).
@@ -197,7 +203,7 @@ pub struct LeaseDescriptor {
 	pub epoch: u64,
 	/// Node holding the lease (a data-capable primary)
 	pub holder: NodeId,
-	/// Inclusive lower bound of the `key_hash` range this lease
+	/// Inclusive lower bound of the locality range this lease
 	/// authorises writes/linearizable-reads for.
 	pub range_start: u64,
 	/// Inclusive upper bound.
@@ -239,7 +245,7 @@ impl LeaseStatus {
 //  ACQUIRE LEASE REQUEST METADATA — 56 bytes, fixed
 //
 //  Sent by a Data Node on the Control Ring when it wants to be
-//  fenced as the primary for a key_hash range. The Raft Leader
+//  fenced as the primary for a locality range. The Raft Leader
 //  proposes a `WendelonRequest::AcquireLease` entry on the
 //  requester's behalf; the resolved `LeaseDescriptor` rides back
 //  in a `LEASE_RESP` trailing section on success.
@@ -247,7 +253,7 @@ impl LeaseStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct AcquireLeaseRequestMeta {
-	/// Inclusive lower bound of the `key_hash` range the
+	/// Inclusive lower bound of the locality range the
 	/// requester wants to own as primary.
 	pub range_start: u64, //  8
 	/// Inclusive upper bound.
@@ -431,7 +437,7 @@ impl MsgType {
 }
 
 // ============================================================
-//  WRITE REQUEST METADATA — 80 bytes, fixed
+//  WRITE REQUEST METADATA — 88 bytes, fixed
 //
 //  This is the header only. The actual key and value are
 //  carried in an Arrow IPC payload appended after this
@@ -446,12 +452,14 @@ impl MsgType {
 
 /// Durability level for client writes.
 ///
-/// M1 freezes `QUORUM` to mean "payload bytes durably flushed on a
-/// quorum of replicas" before the leader finalizes the write in
-/// Raft. `LEADER` and `NONE` remain accepted for API stability, but
-/// the implementation intentionally stays conservative until a later
-/// plan widens their latency/guarantee contract explicitly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+/// `QUORUM` is the fully implemented contract today: payload bytes
+/// are durably flushed on a quorum of replicas before the leader
+/// finalizes the write in Raft. `LEADER` and `NONE` are accepted on
+/// the wire and now persist through the Control Ring marker for
+/// auditability, but the server still routes them through the same
+/// conservative quorum-durable execution until W6 widens their
+/// end-to-end ack semantics explicitly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct DurabilityLevel(pub u8);
 
@@ -477,6 +485,10 @@ pub struct WriteRequestMeta {
 	pub client_hlc: HybridTimestamp, // 16 bytes
 	/// Client's believed epoch; leader rejects with EPOCH_STALE on mismatch
 	pub expected_epoch: u64, //  8 bytes
+	/// Tenant the write targets. Single-tenant pilot nodes still
+	/// populate this explicitly so the durable schema never takes a
+	/// "no tenant" branch.
+	pub tenant_id: TenantId, //  8 bytes
 	/// 0 = direct to leader; incremented by each proxy; max 2
 	pub proxy_hop: u8, //  1 byte
 	/// Durability level: 0=QUORUM, 1=LEADER, 2=NONE
@@ -534,7 +546,7 @@ pub struct WriteResponseMeta {
 }
 
 // ============================================================
-//  REPLICATE REQUEST METADATA — 64 bytes, fixed
+//  REPLICATE REQUEST METADATA — 96 bytes, fixed
 //
 //  Carried on REPLICATE_REQ frames during Stellarator fan-out
 //  (ADR 003). The accepting node bifurcates: local slab append +
@@ -553,9 +565,12 @@ pub struct ReplicaWriteMeta {
 	/// Epoch of the originating leader — replicas reject on
 	/// mismatch against their own current epoch.
 	pub epoch: u64, //  8 bytes
-	/// HighwayHash of the key bytes. Replicas use this as the
-	/// slab index key rather than re-hashing the Arrow payload.
-	pub key_hash: u64, //  8 bytes
+	/// Tenant the replicated record belongs to.
+	pub tenant_id: TenantId, //  8 bytes
+	/// Stable 256-bit record identity computed from the key bytes.
+	/// Replicas persist this directly rather than re-hashing the
+	/// Arrow payload.
+	pub key_identity: Identity, // 32 bytes
 	/// Blake3-256 of the Arrow IPC bytes. Replicas verify the
 	/// payload before ack so corruption surfaces as a failed
 	/// ack rather than a silent divergence.
@@ -628,12 +643,14 @@ impl Consistency {
 pub struct ReadRequestMeta {
 	/// Optional: block until commit_hlc >= this (causal read-after-write)
 	pub min_hlc: HybridTimestamp, // 16 bytes
-	pub expected_epoch: u64,      //  8 bytes
+	pub expected_epoch: u64, //  8 bytes
+	/// Tenant the read targets.
+	pub tenant_id: TenantId, //  8 bytes
 	pub consistency: Consistency, //  1 byte
-	pub _pad: [u8; 3],            //  3 bytes
+	pub _pad: [u8; 3],       //  3 bytes
 	/// Key length in Arrow payload (for fast routing)
 	pub key_len: u32, //  4 bytes
-	pub _pad2: [u8; 8],           //  8 bytes
+	pub _pad2: [u8; 8],      //  8 bytes reserved
 	/// Time-travel upper bound (ADR 013). When non-zero, the
 	/// server returns the newest version whose `hlc <= as_of_hlc`
 	/// instead of the latest value. All-zero is the wire sentinel
@@ -683,7 +700,7 @@ pub struct ReadResponseMeta {
 }
 
 // ============================================================
-//  QUERY REQUEST METADATA — 72 bytes, fixed
+//  QUERY REQUEST METADATA — 80 bytes, fixed
 //
 //  Carries the fixed envelope for a Smart Client pushdown scan
 //  (ADR 005). The WPBC bytecode itself rides in the frame's
@@ -697,17 +714,19 @@ pub struct QueryRequestMeta {
 	/// observed `e_safe_hlc` for `expected_epoch` >= this, or
 	/// returns `E_SAFE_BEHIND` so the client re-routes.
 	pub min_hlc: HybridTimestamp, // 16 bytes
-	pub expected_epoch: u64,      //  8 bytes
+	pub expected_epoch: u64, //  8 bytes
+	/// Tenant whose keyspace should be scanned.
+	pub tenant_id: TenantId, //  8 bytes
 	pub consistency: Consistency, //  1 byte
-	pub _pad: [u8; 7],            //  7 bytes
-	/// Inclusive lower bound of the key_hash range to scan.
-	pub key_range_start: u64, //  8 bytes
+	pub _pad: [u8; 7],       //  7 bytes
+	/// Inclusive lower bound of the locality range to scan.
+	pub locality_range_start: u64, //  8 bytes
 	/// Inclusive upper bound.
-	pub key_range_end: u64, //  8 bytes
+	pub locality_range_end: u64, //  8 bytes
 	/// Length of the WPBC bytecode in the trailing section. Zero
 	/// means "no filter, all rows in range".
 	pub bytecode_len: u32, //  4 bytes
-	pub _pad2: [u8; 4],           //  4 bytes
+	pub _pad2: [u8; 4],      //  4 bytes
 	/// Time-travel upper bound (ADR 013). When non-zero, the scan
 	/// yields the newest version per key whose `hlc <= as_of_hlc`
 	/// and skips keys whose first version is still in the future.
@@ -747,7 +766,7 @@ pub struct QueryResponseMeta {
 }
 
 // ============================================================
-//  MIGRATE REQUEST METADATA — 96 bytes, fixed
+//  MIGRATE REQUEST METADATA — 160 bytes, fixed
 //
 //  Lazy-migration pull frame (ADR 006 + Plan 019). The new owner
 //  asks a prior physical holder for retained versions in its
@@ -768,25 +787,33 @@ pub struct MigrateRequestMeta {
 	/// Identity of the node pulling the data. Must match the
 	/// ledger's `logical_owner` for this migration.
 	pub requester: NodeId, //  8
-	/// Inclusive lower bound of the hash range being pulled.
+	/// Tenant targeted by a `POINT_LOOKUP`. `RANGE_PAGE` ignores
+	/// this and streams every tenant resident in the locality
+	/// window.
+	pub tenant_id: TenantId, //  8
+	/// Inclusive lower bound of the locality range being pulled.
 	pub range_start: u64, //  8
 	/// Inclusive upper bound.
 	pub range_end: u64, //  8
+	/// Exact record identity requested for `POINT_LOOKUP`. Zero for
+	/// `RANGE_PAGE`, where the server walks the full locality
+	/// window instead.
+	pub key_identity: Identity, // 32
 	/// Pinned MVCC cutoff. Every version with `hlc >=
 	/// migration_hlc_floor` is migration-eligible; older versions
 	/// fall outside the ADR 013 retention window and are skipped.
 	/// Must match the floor stored on the server's ledger entry.
 	pub migration_hlc_floor: HybridTimestamp, // 16
-	/// Pagination cursor — key hash the prior page stopped within.
-	/// Zero together with `cursor_hlc` means "start at the range
-	/// floor"; non-zero means the source was in the middle of
-	/// emitting versions for this key when `max_records` /
-	/// `max_bytes` tripped.
-	pub cursor_hash: u64, //  8
-	/// HLC of the last version emitted for `cursor_hash` on the
-	/// prior page. Combined with `cursor_hash`, it lets the source
-	/// resume strictly after the last emitted MVCC slot so a fat
-	/// key with more versions than fit in one page is still
+	/// Pagination cursor — the exact record identity the prior page
+	/// stopped within. Zero together with `cursor_hlc` means "start
+	/// at the range floor"; non-zero means the source was in the
+	/// middle of emitting versions for this identity when
+	/// `max_records` / `max_bytes` tripped.
+	pub cursor_identity: Identity, // 32
+	/// HLC of the last version emitted for `cursor_identity` on the
+	/// prior page. Combined with `cursor_identity`, it lets the
+	/// source resume strictly after the last emitted MVCC slot so a
+	/// fat key with more versions than fit in one page is still
 	/// streamed exhaustively.
 	pub cursor_hlc: HybridTimestamp, // 16
 	/// Server-enforced caps on the response size.
@@ -794,7 +821,7 @@ pub struct MigrateRequestMeta {
 	pub max_bytes: u32,    //  4
 	/// 0 = PointLookup, 1 = RangePage. Point lookups return every
 	/// retained version of exactly one key; range pages walk the
-	/// inclusive window keyed by `(cursor_hash, cursor_hlc)`.
+	/// inclusive window keyed by `(cursor_identity, cursor_hlc)`.
 	pub kind: MigrateRequestKind, //  1
 	pub _pad: [u8; 7],     //  7
 }
@@ -805,7 +832,8 @@ pub struct MigrateRequestMeta {
 pub struct MigrateRequestKind(pub u8);
 
 impl MigrateRequestKind {
-	/// Serve every retained version of the single key whose hash
+	/// Serve every retained version of the single key whose tenant +
+	/// locality
 	/// matches `range_start` (and implicitly `range_end`). Used by
 	/// the read-path fallback for point reads.
 	pub const POINT_LOOKUP: Self = Self(0);
@@ -823,7 +851,7 @@ impl MigrateRequestKind {
 pub struct MigrateResponseMeta {
 	pub status: MigrateStatus, //  1
 	/// 1 when the server has more pages beyond
-	/// `(next_cursor_hash, next_cursor_hlc)`; 0 when this response
+	/// `(next_cursor_identity, next_cursor_hlc)`; 0 when this response
 	/// exhausted the source for the pinned floor.
 	pub has_more: u8, //  1
 	pub _pad0: [u8; 6],        //  6
@@ -833,11 +861,11 @@ pub struct MigrateResponseMeta {
 	/// Populated on `REDIRECT` — the node the caller should retry
 	/// against. Zero for every other status.
 	pub source_hint: NodeId, //  8
-	/// Key hash at which pagination should resume. Zero together
+	/// Identity at which pagination should resume. Zero together
 	/// with `next_cursor_hlc` when `has_more == 0`.
-	pub next_cursor_hash: u64, //  8
+	pub next_cursor_identity: Identity, // 32
 	/// HLC of the last version emitted on this page for
-	/// `next_cursor_hash`. The follow-up request must skip
+	/// `next_cursor_identity`. The follow-up request must skip
 	/// versions at or below this HLC so fat keys stream cleanly.
 	pub next_cursor_hlc: HybridTimestamp, // 16
 	/// Number of retained versions packed into the response Arrow
@@ -883,11 +911,12 @@ impl MigrateStatus {
 #[derive(Clone, Copy, Debug, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct SlabRecordHeader {
-	pub magic: u32,           // 0x534C4142 ("SLAB")
-	pub _pad_align: u32,      // 4 bytes padding for u64 alignment
-	pub key_hash: u64,        // The consistent hash of the key
-	pub hlc: HybridTimestamp, // 16 bytes: the timestamp of the write
-	pub frame_len: u32,       // Total length of the HRFT frame that follows
+	pub magic: u32,             // 0x534C4142 ("SLAB")
+	pub _pad_align: u32,        // 4 bytes padding for u64 alignment
+	pub tenant_id: TenantId,    // durable tenant scope for this record
+	pub key_identity: Identity, // The stable 256-bit identity of the key
+	pub hlc: HybridTimestamp,   // 16 bytes: the timestamp of the write
+	pub frame_len: u32,         // Total length of the HRFT frame that follows
 	/// Integrity checksum over the header prefix (all fields above,
 	/// with `checksum` itself read as zero) concatenated with the
 	/// frame bytes. Recovery and read paths validate this to detect
@@ -949,7 +978,8 @@ pub fn read_value_schema() -> Schema {
 /// without reshaping.
 pub fn migration_record_schema() -> Schema {
 	Schema::new(vec![
-		Field::new("key_hash", DataType::UInt64, false),
+		Field::new("tenant_id", DataType::UInt64, false),
+		Field::new("key_identity", DataType::FixedSizeBinary(32), false),
 		Field::new("hlc_physical_ms", DataType::UInt64, false),
 		Field::new("hlc_logical", DataType::UInt32, false),
 		Field::new("hlc_node_id", DataType::UInt32, false),
@@ -1089,8 +1119,8 @@ pub struct WALRecordHeader {
 //  SNAPSHOT HEADER — 80 bytes, fixed
 //
 //  Prefix of every snapshot blob, both on-disk and inside the
-//  in-memory `Cursor<Vec<u8>>` that `WendelonTypeConfig` uses as
-//  its `SnapshotData`. Followed by the postcard-encoded state
+//  file-backed `SnapshotData` stream that `WendelonTypeConfig`
+//  exposes to OpenRaft. Followed by the postcard-encoded state
 //  machine blob; the optional idempotency-cache checkpoint is
 //  reserved by `cache_checkpoint_len` for future wiring.
 // ============================================================
@@ -1125,20 +1155,20 @@ const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
-const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 80);
+const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 88);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
-const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 64);
+const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReplicaAckLevel>() == 1);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
-const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 56);
+const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 64);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
-const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 72);
+const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);
-const _: () = assert!(std::mem::size_of::<MigrateRequestMeta>() == 96);
-const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 64);
+const _: () = assert!(std::mem::size_of::<MigrateRequestMeta>() == 160);
+const _: () = assert!(std::mem::size_of::<MigrateResponseMeta>() == 88);
 const _: () = assert!(std::mem::size_of::<MigrateRequestKind>() == 1);
 const _: () = assert!(std::mem::size_of::<MigrateStatus>() == 1);
-const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 40);
+const _: () = assert!(std::mem::size_of::<SlabRecordHeader>() == 72);
 const _: () = assert!(std::mem::size_of::<SlabManifest>() == 160);
 const _: () = assert!(std::mem::size_of::<RaftEpochEntryFixed>() == 216);
 const _: () = assert!(std::mem::size_of::<LogEntryKind>() == 1);

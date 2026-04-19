@@ -13,7 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
 	TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
 };
-use wendelon::schema::HybridTimestamp;
+use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
 	ManagerTierObserver, ObjectStore, RemoteObjectStore, RemoteObjectStoreConfig, SlabManager,
 	SlabManagerConfig, SlabSweeper, SweepReport, SweeperConfig, TierCommitter, spawn_io_thread,
@@ -35,6 +35,16 @@ fn hlc() -> HybridTimestamp {
 		logical: 0,
 		node_id: 1,
 	}
+}
+
+fn id(locality: u64) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality.to_le_bytes());
+	Identity::new(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
 }
 
 fn compat_config(endpoint: String, root: &str) -> RemoteObjectStoreConfig {
@@ -340,12 +350,23 @@ async fn build_manager_with_sealed_slabs(
 			io,
 			l2,
 			rehydration: wendelon::storage::RehydrationPolicy::default(),
+			group_commit: wendelon::storage::GroupCommitConfig::default(),
 		})
+		.await
 		.unwrap(),
 	);
-	manager.append(1, hlc(), b"hello-1").await.unwrap();
-	manager.append(2, hlc(), b"hello-2").await.unwrap();
-	manager.append(3, hlc(), b"hello-3").await.unwrap();
+	manager
+		.append(tenant(), id(1), hlc(), b"hello-1")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(2), hlc(), b"hello-2")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(3), hlc(), b"hello-3")
+		.await
+		.unwrap();
 	(manager, dir)
 }
 

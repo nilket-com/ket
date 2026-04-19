@@ -39,12 +39,11 @@
 
 use crate::schema::NodeId;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::any::Any;
-use std::fs::File;
-use std::io::{BufReader, Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -247,36 +246,50 @@ pub fn verified_peer_node_id_from_chain(
 	})
 }
 
-// ============================================================
-//  PEM LOADING HELPERS
-// ============================================================
-
-fn open_pem(path: &Path) -> std::io::Result<BufReader<File>> {
-	File::open(path)
-		.map(BufReader::new)
-		.map_err(|e| Error::new(e.kind(), format!("opening {}: {e}", path.display())))
-}
-
 fn load_cert_chain(path: &Path) -> std::io::Result<Vec<CertificateDer<'static>>> {
-	let mut reader = open_pem(path)?;
-	rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+	let certs = CertificateDer::pem_file_iter(path)
+		.map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("reading {}: {e}", path.display()),
+			)
+		})?
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("reading {}: {e}", path.display()),
+			)
+		})?;
+	Ok(certs)
 }
 
 fn load_private_key(path: &Path) -> std::io::Result<PrivateKeyDer<'static>> {
-	let mut reader = open_pem(path)?;
-	rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
+	PrivateKeyDer::from_pem_file(path).map_err(|e| {
 		Error::new(
 			ErrorKind::InvalidData,
-			format!("no private key found in {}", path.display()),
+			format!("reading {}: {e}", path.display()),
 		)
 	})
 }
 
 fn load_ca_roots(path: &Path) -> std::io::Result<RootCertStore> {
-	let mut reader = open_pem(path)?;
+	let certs = CertificateDer::pem_file_iter(path)
+		.map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("reading {}: {e}", path.display()),
+			)
+		})?
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("reading {}: {e}", path.display()),
+			)
+		})?;
 	let mut roots = RootCertStore::empty();
-	for cert in rustls_pemfile::certs(&mut reader) {
-		let cert = cert?;
+	for cert in certs {
 		roots.add(cert).map_err(|e| {
 			Error::new(
 				ErrorKind::InvalidData,

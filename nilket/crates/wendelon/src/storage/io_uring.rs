@@ -111,10 +111,7 @@ impl Drop for AlignedBuf {
 pub enum IoOp {
 	Write,
 	Read,
-	/// Issue an `fsync(2)` on the fd. The attached buffer is
-	/// ignored by the kernel and simply echoed back in the
-	/// [`IoCompletion`] — callers typically submit a tiny
-	/// placeholder via [`IoRingHandle::submit_fsync`].
+	/// Issue an `fsync(2)` on the fd.
 	///
 	/// Ordering caveat (from the io_uring manpage): fsync CQEs are
 	/// not ordered against in-flight write CQEs. Callers wanting a
@@ -122,6 +119,11 @@ pub enum IoOp {
 	/// before submitting the fsync — which is the pattern
 	/// [`crate::storage::core::LocalSlabStore::fsync`] follows.
 	Fsync,
+	/// Issue an `fdatasync(2)` on the fd. The completion ordering
+	/// caveat is identical to [`IoOp::Fsync`]; callers must await
+	/// prior write completions before using it as a durability
+	/// barrier.
+	Fdatasync,
 }
 
 /// One I/O submission unit. The buffer is retained by the I/O
@@ -129,7 +131,7 @@ pub enum IoOp {
 pub struct IoRequest {
 	pub op: IoOp,
 	pub fd: RawFd,
-	pub buf: AlignedBuf,
+	pub buf: Option<AlignedBuf>,
 	pub offset: u64,
 	pub reply: oneshot::Sender<IoCompletion>,
 }
@@ -137,7 +139,8 @@ pub struct IoRequest {
 /// Result handed back to the waiting tokio task.
 pub struct IoCompletion {
 	/// The buffer originally submitted, returned for reuse.
-	pub buf: AlignedBuf,
+	/// `None` for sync-only requests.
+	pub buf: Option<AlignedBuf>,
 	/// Kernel return value: bytes transferred if >= 0, negative errno otherwise.
 	pub result: i32,
 }
@@ -167,7 +170,7 @@ impl IoRingHandle {
 		let req = IoRequest {
 			op,
 			fd,
-			buf,
+			buf: Some(buf),
 			offset,
 			reply: reply_tx,
 		};
@@ -177,10 +180,6 @@ impl IoRingHandle {
 		Ok(reply_rx)
 	}
 
-	/// Submit an `fsync(2)` against `fd`. The request carries a
-	/// one-page placeholder buffer (the kernel does not touch it)
-	/// so the common [`submit`] path can remain buffer-oriented.
-	///
 	/// See [`IoOp::Fsync`] for the ordering caveat — callers must
 	/// have already awaited every prior write completion on `fd`
 	/// for this fsync to be a meaningful durability barrier.
@@ -190,8 +189,34 @@ impl IoRingHandle {
 		&self,
 		fd: RawFd,
 	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
-		let buf = AlignedBuf::new(DIRECT_IO_ALIGN);
-		self.submit(IoOp::Fsync, fd, buf, 0).await
+		self.submit_sync(IoOp::Fsync, fd).await
+	}
+
+	/// Submit an `fdatasync(2)` against `fd`.
+	pub async fn submit_fdatasync(
+		&self,
+		fd: RawFd,
+	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		self.submit_sync(IoOp::Fdatasync, fd).await
+	}
+
+	async fn submit_sync(
+		&self,
+		op: IoOp,
+		fd: RawFd,
+	) -> std::io::Result<oneshot::Receiver<IoCompletion>> {
+		let (reply_tx, reply_rx) = oneshot::channel();
+		let req = IoRequest {
+			op,
+			fd,
+			buf: None,
+			offset: 0,
+			reply: reply_tx,
+		};
+		self.tx.send(req).await.map_err(|_| {
+			std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring thread is gone")
+		})?;
+		Ok(reply_rx)
 	}
 }
 
@@ -234,7 +259,8 @@ pub fn spawn_io_thread(depth: u32) -> std::io::Result<IoRingHandle> {
 // ============================================================
 fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
 	let mut cookie: u64 = 1;
-	let mut in_flight: HashMap<u64, (AlignedBuf, oneshot::Sender<IoCompletion>)> = HashMap::new();
+	let mut in_flight: HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)> =
+		HashMap::new();
 
 	loop {
 		// 1. Block when idle. Shutdown signalled by channel close.
@@ -294,7 +320,7 @@ fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
 fn push_request(
 	ring: &mut IoUring,
 	cookie: &mut u64,
-	in_flight: &mut HashMap<u64, (AlignedBuf, oneshot::Sender<IoCompletion>)>,
+	in_flight: &mut HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)>,
 	req: IoRequest,
 ) {
 	let id = *cookie;
@@ -308,22 +334,30 @@ fn push_request(
 		reply,
 	} = req;
 
-	// Raw pointer + length are copied out before `buf` is moved
-	// into the pending map. The kernel will read/write that
-	// memory while the AlignedBuf lives inside `in_flight`.
-	let ptr = buf.ptr;
-	let len = buf.len as u32;
-
 	let entry = match op {
-		IoOp::Write => opcode::Write::new(types::Fd(fd), ptr as *const _, len)
-			.offset(offset)
-			.build()
-			.user_data(id),
-		IoOp::Read => opcode::Read::new(types::Fd(fd), ptr, len)
-			.offset(offset)
-			.build()
-			.user_data(id),
+		IoOp::Write => {
+			let buf_ref = buf
+				.as_ref()
+				.expect("io_uring write requests must carry an aligned buffer");
+			opcode::Write::new(types::Fd(fd), buf_ref.ptr as *const _, buf_ref.len as u32)
+				.offset(offset)
+				.build()
+				.user_data(id)
+		}
+		IoOp::Read => {
+			let buf_ref = buf
+				.as_ref()
+				.expect("io_uring read requests must carry an aligned buffer");
+			opcode::Read::new(types::Fd(fd), buf_ref.ptr, buf_ref.len as u32)
+				.offset(offset)
+				.build()
+				.user_data(id)
+		}
 		IoOp::Fsync => opcode::Fsync::new(types::Fd(fd)).build().user_data(id),
+		IoOp::Fdatasync => opcode::Fsync::new(types::Fd(fd))
+			.flags(types::FsyncFlags::DATASYNC)
+			.build()
+			.user_data(id),
 	};
 
 	in_flight.insert(id, (buf, reply));
@@ -339,7 +373,7 @@ fn push_request(
 
 /// Send an error result to every pending oneshot, dropping their buffers.
 fn drain_with_error(
-	in_flight: &mut HashMap<u64, (AlignedBuf, oneshot::Sender<IoCompletion>)>,
+	in_flight: &mut HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)>,
 	err: &std::io::Error,
 ) {
 	// EIO on Linux; used as a generic fallback when the std::io::Error

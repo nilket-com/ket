@@ -203,7 +203,7 @@ Control Ring & Hashing (cross-reference)
 
 The system models a unified control ring: every node (regardless of role) is assigned a NodeId that participates in a single ordered ring topology. This simplifies small topologies used for dev/QA and unifies placement logic across control and data responsibilities. The hashing algorithm and ring parameters are chosen at cluster initialization and recorded in the epoch variable metadata (see plans/schema/hashing.md meta_keys/meta_values). They are immutable for the cluster lifetime; changing them requires a full cluster rebootstrap.
 
-Recommended default: keyed HighwayHash with a 64-bit ring representation. For public or adversarial environments, a keyed BLAKE3 with 128-bit ring_bits is acceptable if crypto-level guarantees are required.
+Recommended default: BLAKE3-derived locality hashing with a 64-bit ring representation.
 
 ---
 

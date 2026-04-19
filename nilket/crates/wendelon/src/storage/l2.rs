@@ -35,11 +35,13 @@
 //! deployment that relocates the L2 root sees the bad paths fail
 //! loudly rather than silently sliding into "some other file".
 
+use crate::storage::{AsyncFileOps, BlockingFileOps, OpenFlags, write_file};
 use async_trait::async_trait;
 use bytes::Bytes;
 use opendal::layers::RetryLayer;
 use opendal::services::S3;
 use opendal::{ErrorKind as OpendalErrorKind, Operator};
+#[cfg(test)]
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
@@ -345,6 +347,7 @@ impl ObjectStore for RemoteObjectStore {
 /// expected to be a latency-critical path.
 pub struct LocalFsObjectStore {
 	root: PathBuf,
+	file_ops: Arc<dyn AsyncFileOps>,
 }
 
 impl LocalFsObjectStore {
@@ -352,6 +355,13 @@ impl LocalFsObjectStore {
 	/// we refuse to create it so the caller keeps control over
 	/// permissions, mount layout, and any cleanup policy.
 	pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+		Self::new_with_file_ops(root, Arc::new(BlockingFileOps))
+	}
+
+	pub fn new_with_file_ops(
+		root: impl Into<PathBuf>,
+		file_ops: Arc<dyn AsyncFileOps>,
+	) -> std::io::Result<Self> {
 		let root = root.into();
 		if !root.is_dir() {
 			return Err(Error::new(
@@ -362,7 +372,7 @@ impl LocalFsObjectStore {
 				),
 			));
 		}
-		Ok(Self { root })
+		Ok(Self { root, file_ops })
 	}
 
 	/// Translate a "file://" URI back into a path, pinned under
@@ -385,6 +395,16 @@ impl LocalFsObjectStore {
 		}
 		Ok(canonical)
 	}
+
+	async fn fsync_parent_dir(&self, path: &Path) -> std::io::Result<()> {
+		let parent = path.parent().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("path has no parent directory: {}", path.display()),
+			)
+		})?;
+		self.file_ops.fsync_dir(parent).await
+	}
 }
 
 #[async_trait]
@@ -393,27 +413,40 @@ impl ObjectStore for LocalFsObjectStore {
 		validate_object_key(key)?;
 		let final_path = self.root.join(key);
 		if let Some(parent) = final_path.parent() {
-			fs::create_dir_all(parent)?;
+			self.file_ops.create_dir_all(parent).await?;
 		}
 		// Atomic rename: write to `<final>.tmp`, then rename. A
 		// concurrent reader will either see the previous object
 		// (if any) or the new one — never a partial upload.
 		let mut tmp_path = final_path.clone();
 		tmp_path.as_mut_os_string().push(".tmp");
-		fs::write(&tmp_path, bytes)?;
-		fs::rename(&tmp_path, &final_path)?;
+		write_file(
+			self.file_ops.as_ref(),
+			&tmp_path,
+			OpenFlags {
+				write: true,
+				create: true,
+				truncate: true,
+				..Default::default()
+			},
+			bytes,
+		)
+		.await?;
+		self.file_ops.rename(&tmp_path, &final_path).await?;
+		self.fsync_parent_dir(&final_path).await?;
 		let canonical = final_path.canonicalize()?;
 		Ok(format!("file://{}", canonical.display()))
 	}
 
 	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
 		let path = self.resolve(uri)?;
-		Ok(Bytes::from(fs::read(path)?))
+		Ok(Bytes::from(self.file_ops.read_all(&path).await?))
 	}
 
 	async fn delete(&self, uri: &str) -> std::io::Result<()> {
 		let path = self.resolve(uri)?;
-		fs::remove_file(path)
+		self.file_ops.unlink(&path).await?;
+		self.fsync_parent_dir(&path).await
 	}
 }
 

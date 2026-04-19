@@ -210,7 +210,7 @@ openraft::declare_raft_types!(
 		NodeId = u32,
 		Node = openraft::BasicNode,
 		Entry = openraft::Entry<WendelonTypeConfig>,
-		SnapshotData = std::io::Cursor<Vec<u8>>,
+		SnapshotData = crate::consensus::raft_storage::SnapshotDataFile,
 		AsyncRuntime = openraft::TokioRuntime,
 );
 

@@ -41,19 +41,23 @@
 //!   for now; remote upload is ADR 006's problem.
 
 use crate::consensus::MigratedRangeTombstone;
-use crate::schema::HybridTimestamp;
+use crate::schema::{HybridTimestamp, Identity, Locality, TenantId};
 use crate::storage::core::{
-	LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted, newest_version_as_of,
-	remove_version_exact,
+	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
+	newest_version_as_of, recover_slab_entries_from_blob, remove_version_exact,
+};
+use crate::storage::index::{
+	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow, persistent_index_path,
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
+use crate::storage::{AsyncFileOps, BlockingFileOps, IoUringFileOps, OpenFlags, write_file};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{Error, ErrorKind, Write};
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +65,8 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
+
+type TenantKey = (TenantId, Identity);
 
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
@@ -81,6 +87,8 @@ pub struct SlabManagerConfig {
 	/// Policy for promoting hot tiered slabs back into local L1
 	/// storage.
 	pub rehydration: RehydrationPolicy,
+	/// ADR 016 data-path group-commit tuning.
+	pub group_commit: GroupCommitConfig,
 }
 
 /// Policy that governs L2 -> L1 slab rehydration.
@@ -133,7 +141,8 @@ pub struct RehydratedSlabInfo {
 pub enum MigrationIngestOutcome {
 	/// A new retained version was appended and indexed.
 	Inserted(RecordLocation),
-	/// A matching `(key_hash, hlc)` with identical `payload_hash`
+	/// A matching `(key_identity, hlc)` with identical
+	/// `payload_hash`
 	/// already existed locally — the ingest was a no-op.
 	Duplicate(RecordLocation),
 }
@@ -182,17 +191,26 @@ pub struct TombstoneCompactionReport {
 /// Multi-slab composition of [`StorageEngine`].
 pub struct SlabManager {
 	config: SlabManagerConfig,
+	file_ops: Arc<dyn AsyncFileOps>,
 	state: Mutex<ManagerState>,
 	/// Authoritative key → version chain, aggregated across all
 	/// active and sealed slabs. Per ADR 013 the chain stores every
 	/// version sorted ascending by HLC; the tail is the current
 	/// value and earlier entries back time-travel reads.
-	key_index: DashMap<u64, Vec<RecordLocation>>,
+	key_index: DashMap<TenantKey, Vec<RecordLocation>>,
 	/// Best-effort compatibility map for in-flight readers that
 	/// raced a compaction rewrite. New lookups pivot to the fresh
 	/// location through `key_index`; a stale snapshot of the prior
 	/// location follows this chain to the replacement slab.
 	relocated_reads: DashMap<RecordLocation, RecordLocation>,
+	/// Persistent restart index for the local slab set.
+	///
+	/// Ordinary record rows remain authoritative in slab bytes plus
+	/// the in-memory `key_index`; if redb drifts, we rebuild it from
+	/// those sources. Tiered-slab pointers come from the Control Ring
+	/// state machine, and their redb transactions also stamp the
+	/// highest applied control-log index we have mirrored so far.
+	persistent_index: Option<Arc<PersistentLocalIndex>>,
 }
 
 #[derive(Clone)]
@@ -232,52 +250,76 @@ struct ManagerState {
 impl SlabManager {
 	async fn append_on_target(
 		&self,
-		key_hash: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<(Arc<LocalSlabStore>, RecordLocation)> {
 		let slab = self.target_for_append().await?;
-		let location = slab.append(key_hash, hlc, frame).await?;
+		let location = slab.append(tenant_id, key_identity, hlc, frame).await?;
 		Ok((slab, location))
 	}
 
-	fn index_appended_location(&self, key_hash: u64, location: RecordLocation) {
+	fn index_appended_location(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
 		self.key_index
-			.entry(key_hash)
+			.entry((tenant_id, key_identity))
 			.and_modify(|versions| insert_version_sorted(versions, location))
 			.or_insert_with(|| vec![location]);
 	}
 
-	fn rollback_indexed_location(&self, key_hash: u64, location: RecordLocation) {
-		let should_remove_key = if let Some(mut versions) = self.key_index.get_mut(&key_hash) {
+	fn rollback_indexed_location(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
+		let key = (tenant_id, key_identity);
+		let should_remove_key = if let Some(mut versions) = self.key_index.get_mut(&key) {
 			let removed = remove_version_exact(&mut versions, location);
 			removed && versions.is_empty()
 		} else {
 			false
 		};
 		if should_remove_key {
-			self.key_index.remove(&key_hash);
+			self.key_index.remove(&key);
 		}
 	}
 
 	/// Append a record and force the destination slab's durability
 	/// barrier before returning. The manager index is published only
-	/// after the `fsync` succeeds, so callers that require durable
-	/// visibility do not leak append-complete-but-unflushed writes
-	/// through the in-memory read path.
+	/// after the coalesced `fdatasync` succeeds, so callers that
+	/// require durable visibility do not leak
+	/// append-complete-but-unflushed writes through the in-memory
+	/// read path.
 	pub async fn append_durable(
 		&self,
-		key_hash: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let (slab, location) = self.append_on_target(key_hash, hlc, frame).await?;
-		if let Err(err) = slab.fsync().await {
-			slab.rollback_index_entry(key_hash, location);
-			self.rollback_indexed_location(key_hash, location);
+		let (slab, location) = self
+			.append_on_target(tenant_id, key_identity, hlc, frame)
+			.await?;
+		if let Err(err) = slab.wait_durable_commit().await {
+			slab.rollback_index_entry(tenant_id, key_identity, location);
+			self.rollback_indexed_location(tenant_id, key_identity, location);
 			return Err(err);
 		}
-		self.index_appended_location(key_hash, location);
+		if let Err(err) = self
+			.persist_record_row_strict(tenant_id, key_identity, location)
+			.await
+		{
+			slab.rollback_index_entry(tenant_id, key_identity, location);
+			self.rollback_indexed_location(tenant_id, key_identity, location);
+			return Err(err);
+		}
+		self.index_appended_location(tenant_id, key_identity, location);
 		Ok(location)
 	}
 
@@ -335,7 +377,7 @@ impl SlabManager {
 	/// aggregated `key_index`. Last-write-wins across slabs, ordered
 	/// by slab id — so a rewrite that landed in a newer slab
 	/// shadows the stale copy in an older one.
-	pub fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
+	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
 		if !config.dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -346,21 +388,26 @@ impl SlabManager {
 			));
 		}
 
-		let mut existing_ids = discover_slab_ids(&config.dir)?;
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::new(config.io.clone()));
+		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
 		existing_ids.sort_unstable();
 
-		let key_index: DashMap<u64, Vec<RecordLocation>> = DashMap::new();
+		let key_index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
 		let sealed: DashMap<u64, Arc<LocalSlabStore>> = DashMap::new();
 		let tiered: DashMap<u64, TieredSlabPointer> = DashMap::new();
 		let rehydrated: DashMap<u64, RehydratedSlabState> = DashMap::new();
 
 		let (active, next_slab_id) = if existing_ids.is_empty() {
 			let id: u64 = 0;
-			let slab = Arc::new(LocalSlabStore::open(
-				slab_path(&config.dir, id),
-				id,
-				config.io.clone(),
-			)?);
+			let slab = Arc::new(
+				LocalSlabStore::open(
+					slab_path(&config.dir, id),
+					id,
+					file_ops.clone(),
+					config.group_commit.clone(),
+				)
+				.await?,
+			);
 			drain_slab_index(&slab, &key_index);
 			(slab, id + 1)
 		} else {
@@ -369,25 +416,69 @@ impl SlabManager {
 			// id order so later writes shadow earlier ones.
 			let (&active_id, sealed_ids) = existing_ids.split_last().expect("non-empty");
 			for &id in sealed_ids {
-				let slab = Arc::new(LocalSlabStore::open(
-					slab_path(&config.dir, id),
-					id,
-					config.io.clone(),
-				)?);
+				let slab = Arc::new(
+					LocalSlabStore::open(
+						slab_path(&config.dir, id),
+						id,
+						file_ops.clone(),
+						config.group_commit.clone(),
+					)
+					.await?,
+				);
 				drain_slab_index(&slab, &key_index);
 				sealed.insert(id, slab);
 			}
-			let active = Arc::new(LocalSlabStore::open(
-				slab_path(&config.dir, active_id),
-				active_id,
-				config.io.clone(),
-			)?);
+			let active = Arc::new(
+				LocalSlabStore::open(
+					slab_path(&config.dir, active_id),
+					active_id,
+					file_ops.clone(),
+					config.group_commit.clone(),
+				)
+				.await?,
+			);
 			drain_slab_index(&active, &key_index);
 			(active, active_id + 1)
 		};
 
-		Ok(Self {
+		let persistent_index =
+			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
+				Ok(index) => Some(Arc::new(index)),
+				Err(err) => {
+					tracing::warn!(
+						error = %err,
+						dir = %config.dir.display(),
+						"failed to open redb storage index; continuing with in-memory recovery"
+					);
+					None
+				}
+			};
+		if let Some(index) = &persistent_index {
+			match index.load_snapshot().await {
+				Ok(snapshot) => {
+					for pointer in snapshot.tiered_slabs {
+						tiered.insert(pointer.slab_id, pointer);
+					}
+					for row in snapshot.tiered_records {
+						key_index
+							.entry((row.tenant_id, row.key_identity))
+							.and_modify(|versions| insert_version_sorted(versions, row.location))
+							.or_insert_with(|| vec![row.location]);
+					}
+				}
+				Err(err) => {
+					tracing::warn!(
+						error = %err,
+						dir = %config.dir.display(),
+						"failed to load tiered rows from redb; local slab scan remains authoritative"
+					);
+				}
+			}
+		}
+
+		let manager = Self {
 			config,
+			file_ops,
 			state: Mutex::new(ManagerState {
 				active,
 				sealed,
@@ -399,7 +490,10 @@ impl SlabManager {
 			}),
 			key_index,
 			relocated_reads: DashMap::new(),
-		})
+			persistent_index,
+		};
+		manager.rebuild_persistent_index().await;
+		Ok(manager)
 	}
 
 	/// Test / diagnostic accessor: current active slab id.
@@ -494,11 +588,8 @@ impl SlabManager {
 				));
 			}
 		}
-		// The L1 file lives at the canonical path; read via the
-		// normal filesystem surface. O_DIRECT alignment is only
-		// relevant for the `io_uring` append / lookup path.
 		let path = slab_path(&self.config.dir, slab_id);
-		std::fs::read(path)
+		self.file_ops.read_all(&path).await
 	}
 
 	/// Export the authoritative local slab set as a backup image.
@@ -547,7 +638,8 @@ impl SlabManager {
 		let mut local_slab_bytes = 0_u64;
 		let mut local_slabs = Vec::with_capacity(local_slab_ids.len());
 		for slab_id in local_slab_ids {
-			let bytes = std::fs::read(slab_path(&self.config.dir, slab_id))?;
+			let path = slab_path(&self.config.dir, slab_id);
+			let bytes = self.file_ops.read_all(&path).await?;
 			local_slab_bytes = local_slab_bytes.saturating_add(bytes.len() as u64);
 			local_slabs.push(LocalSlabBackup { slab_id, bytes });
 		}
@@ -570,7 +662,7 @@ impl SlabManager {
 	///
 	/// The caller is responsible for opening a new [`SlabManager`]
 	/// against the target after the files have been materialized.
-	pub fn restore_backup(
+	pub async fn restore_backup(
 		backup: &StorageBackupImage,
 		dir: impl AsRef<Path>,
 	) -> std::io::Result<()> {
@@ -581,7 +673,8 @@ impl SlabManager {
 				format!("storage restore target does not exist: {}", dir.display()),
 			));
 		}
-		if !discover_slab_ids(dir)?.is_empty() {
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(BlockingFileOps);
+		if !discover_slab_ids(file_ops.as_ref(), dir).await?.is_empty() {
 			return Err(Error::new(
 				ErrorKind::AlreadyExists,
 				format!("storage restore target is not empty: {}", dir.display()),
@@ -596,7 +689,19 @@ impl SlabManager {
 					format!("backup contains duplicate slab {}", slab.slab_id),
 				));
 			}
-			std::fs::write(slab_path(dir, slab.slab_id), &slab.bytes)?;
+			let path = slab_path(dir, slab.slab_id);
+			write_file(
+				file_ops.as_ref(),
+				&path,
+				OpenFlags {
+					write: true,
+					create_new: true,
+					..Default::default()
+				},
+				&slab.bytes,
+			)
+			.await?;
+			fsync_parent_dir(file_ops.as_ref(), &path).await?;
 		}
 		if !seen.contains(&backup.manifest.active_slab_id) {
 			return Err(Error::new(
@@ -632,27 +737,48 @@ impl SlabManager {
 	///   survives the unlink (Linux semantics) — zero downtime
 	///   for readers mid-flight.
 	pub async fn apply_tier_slab(&self, pointer: TieredSlabPointer) -> std::io::Result<()> {
-		let mut state = self.state.lock().await;
-		// Idempotent: a replay of the Raft TierSlab entry must not
-		// fail. If we're already tiered, accept the no-op.
-		if state.tiered.contains_key(&pointer.slab_id) {
-			return Ok(());
+		self.apply_tier_slab_committed(pointer, None).await
+	}
+
+	pub async fn apply_tier_slab_committed(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
+			.await?;
+		{
+			let mut state = self.state.lock().await;
+			let _old = state.sealed.remove(&pointer.slab_id);
+			let _old = state.rehydrated.remove(&pointer.slab_id);
+			state.tiered.insert(pointer.slab_id, pointer.clone());
+			state.hot_read_counts.remove(&pointer.slab_id);
+			state.rehydrating.remove(&pointer.slab_id);
 		}
-		let _old = state.sealed.remove(&pointer.slab_id);
-		let _old = state.rehydrated.remove(&pointer.slab_id);
-		state.tiered.insert(pointer.slab_id, pointer.clone());
-		state.hot_read_counts.remove(&pointer.slab_id);
-		state.rehydrating.remove(&pointer.slab_id);
+
 		// Unlink the L1 file. Open fds held by in-flight reads
 		// continue to work; new reads find the entry in `tiered`
 		// and go to L2.
 		let path = slab_path(&self.config.dir, pointer.slab_id);
-		match std::fs::remove_file(&path) {
-			Ok(()) => {}
-			Err(e) if e.kind() == ErrorKind::NotFound => {}
-			Err(e) => return Err(e),
-		}
+		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		Ok(())
+	}
+
+	/// Converge one recovered tiered slab into local state.
+	///
+	/// When the redb mirror is unavailable or missing rows, the
+	/// manager rebuilds the per-record index directly from the
+	/// authoritative L2 blob before installing the tier pointer.
+	pub async fn reconcile_tiered_slab(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		if !self.has_rows_for_slab(pointer.slab_id) {
+			self.recover_tiered_rows_from_l2(&pointer).await?;
+		}
+		self.apply_tier_slab_committed(pointer, last_control_log_index)
+			.await
 	}
 
 	/// Whether a slab has been pivoted to L2. Cheap — only hits
@@ -692,30 +818,33 @@ impl SlabManager {
 			return Ok(false);
 		};
 		let path = slab_path(&self.config.dir, slab_id);
-		match std::fs::remove_file(&path) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::NotFound => {}
-			Err(err) => return Err(err),
-		}
+		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		Ok(true)
 	}
 
-	/// Enumerate every live `(key_hash, RecordLocation)` whose hash
-	/// falls in the inclusive window `[start_hash, end_hash]`. Used
+	/// Enumerate every live `(key_identity, RecordLocation)` whose
+	/// locality falls in the inclusive window
+	/// `[start_locality, end_locality]`. Used
 	/// by the Data Ring query path (ADR 005) to feed the WPBC
 	/// interpreter; the server then reads each location via the
 	/// normal `StorageEngine::read` surface, which transparently
 	/// pivots L1 vs. L2.
 	///
-	/// The returned pairs are sorted by `key_hash` so the scan is
-	/// deterministic — useful for debugging and for the client's
-	/// pagination cursor, which is keyed on the highest observed
-	/// hash. Every key yields only its latest version; use
+	/// The returned pairs are sorted by `(locality, identity)` so
+	/// the scan is deterministic even when multiple identities
+	/// project into the same routing bucket. Every key yields only
+	/// its latest version; use
 	/// [`Self::scan_as_of`] for time-travel scans.
-	pub fn scan(&self, start_hash: u64, end_hash: u64) -> Vec<(u64, RecordLocation)> {
+	pub fn scan(
+		&self,
+		tenant_id: TenantId,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
+	) -> Vec<(u64, RecordLocation)> {
 		self.scan_as_of(
-			start_hash,
-			end_hash,
+			tenant_id,
+			start_locality,
+			end_locality,
 			HybridTimestamp {
 				physical_ms: 0,
 				logical: 0,
@@ -730,49 +859,60 @@ impl SlabManager {
 	/// bound" and falls through to the latest-version scan.
 	pub fn scan_as_of(
 		&self,
-		start_hash: u64,
-		end_hash: u64,
+		tenant_id: TenantId,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
 	) -> Vec<(u64, RecordLocation)> {
-		if start_hash > end_hash {
+		let start_locality = start_locality.into();
+		let end_locality = end_locality.into();
+		if start_locality > end_locality {
 			return Vec::new();
 		}
-		let mut out: Vec<(u64, RecordLocation)> = self
+		let mut out: Vec<(Locality, Identity, RecordLocation)> = self
 			.key_index
 			.iter()
 			.filter_map(|entry| {
-				let h = *entry.key();
-				if h < start_hash || h > end_hash {
+				let (record_tenant_id, key_identity) = *entry.key();
+				if record_tenant_id != tenant_id {
 					return None;
 				}
-				newest_version_as_of(entry.value(), as_of_hlc).map(|loc| (h, loc))
+				let locality = Locality::from(key_identity);
+				if locality < start_locality || locality > end_locality {
+					return None;
+				}
+				newest_version_as_of(entry.value(), as_of_hlc)
+					.map(|loc| (locality, key_identity, loc))
 			})
 			.collect();
-		out.sort_by_key(|(h, _)| *h);
-		out
+		out.sort_by_key(|(locality, key_identity, _)| (*locality, *key_identity));
+		out.into_iter()
+			.map(|(locality, _key_identity, loc)| (locality.get(), loc))
+			.collect()
 	}
 
-	/// Every retained version whose `key_hash` falls in the
-	/// inclusive window `[start_hash, end_hash]` and whose `hlc`
-	/// is at or above `migration_hlc_floor` (Plan 019).
+	/// Every retained version whose identity projects into the
+	/// inclusive locality window `[start_locality, end_locality]`
+	/// and whose `hlc` is at or above `migration_hlc_floor`
+	/// (Plan 019).
 	///
 	/// Unlike [`Self::scan`] / [`Self::scan_as_of`], this does not
 	/// collapse per-key history — every version ≥ floor is
-	/// returned. Output is sorted first by `key_hash` then by
-	/// ascending `hlc` so the migration RPC can paginate with a
-	/// stable cursor and the destination can append in the same
-	/// order it observed on the source.
+	/// returned. Output is sorted by `(locality, identity, hlc)` so
+	/// the migration RPC can paginate with a stable cursor and the
+	/// destination can append in the same order it observed on the
+	/// source.
 	pub fn scan_all_versions(
 		&self,
-		start_hash: u64,
-		end_hash: u64,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
 		migration_hlc_floor: HybridTimestamp,
-	) -> Vec<(u64, RecordLocation)> {
+	) -> Vec<(TenantId, Identity, RecordLocation)> {
 		self.scan_all_versions_from(
-			start_hash,
-			end_hash,
+			start_locality,
+			end_locality,
 			migration_hlc_floor,
-			0,
+			Identity::ZERO,
 			bytemuck::Zeroable::zeroed(),
 		)
 	}
@@ -782,50 +922,58 @@ impl SlabManager {
 	/// Lets `handle_migrate` resume mid-key when a fat key has more
 	/// retained versions than fit in a single page:
 	///
-	/// * When `(cursor_hash, cursor_hlc)` is `(0, zero)` the scan
+	/// * When `(cursor_identity, cursor_hlc)` is `(zero, zero)` the
+	///   scan
 	///   behaves identically to `scan_all_versions`.
-	/// * Otherwise, for `key_hash == cursor_hash` we emit only
-	///   versions strictly later than `cursor_hlc` — the prior page
-	///   already emitted everything at or below it.
-	/// * For `key_hash > cursor_hash` we emit every version at or
-	///   above the pinned floor, exactly like the non-paged scan.
-	/// * Keys strictly less than `cursor_hash` are skipped: the
-	///   prior page already drained them.
+	/// * Otherwise we resume strictly after the last emitted
+	///   `(locality, identity, hlc)` tuple.
 	///
-	/// Output is still sorted `(key_hash ASC, hlc ASC)` so the
-	/// migration RPC can paginate deterministically.
+	/// Output is still sorted `(locality ASC, identity ASC, hlc ASC)`
+	/// so the migration RPC can paginate deterministically.
 	pub fn scan_all_versions_from(
 		&self,
-		start_hash: u64,
-		end_hash: u64,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
 		migration_hlc_floor: HybridTimestamp,
-		cursor_hash: u64,
+		cursor_identity: Identity,
 		cursor_hlc: HybridTimestamp,
-	) -> Vec<(u64, RecordLocation)> {
-		if start_hash > end_hash {
+	) -> Vec<(TenantId, Identity, RecordLocation)> {
+		let start_locality = start_locality.into();
+		let end_locality = end_locality.into();
+		if start_locality > end_locality {
 			return Vec::new();
 		}
-		let cursor_active = cursor_hash != 0 || cursor_hlc != bytemuck::Zeroable::zeroed();
-		let mut out: Vec<(u64, RecordLocation)> = Vec::new();
+		let cursor_active =
+			cursor_identity != Identity::ZERO || cursor_hlc != bytemuck::Zeroable::zeroed();
+		let cursor_locality = Locality::from(cursor_identity);
+		let mut out: Vec<(TenantId, Identity, RecordLocation)> = Vec::new();
 		for entry in self.key_index.iter() {
-			let h = *entry.key();
-			if h < start_hash || h > end_hash {
-				continue;
-			}
-			if cursor_active && h < cursor_hash {
+			let (tenant_id, key_identity) = *entry.key();
+			let locality = Locality::from(key_identity);
+			if locality < start_locality || locality > end_locality {
 				continue;
 			}
 			for loc in entry.value().iter() {
 				if loc.hlc < migration_hlc_floor {
 					continue;
 				}
-				if cursor_active && h == cursor_hash && loc.hlc <= cursor_hlc {
+				if cursor_active
+					&& (locality, key_identity, loc.hlc)
+						<= (cursor_locality, cursor_identity, cursor_hlc)
+				{
 					continue;
 				}
-				out.push((h, *loc));
+				out.push((tenant_id, key_identity, *loc));
 			}
 		}
-		out.sort_by(|(ha, la), (hb, lb)| ha.cmp(hb).then(la.hlc.cmp(&lb.hlc)));
+		out.sort_by(|(tenant_a, ida, la), (tenant_b, idb, lb)| {
+			(Locality::from(*ida), *tenant_a, *ida, la.hlc).cmp(&(
+				Locality::from(*idb),
+				*tenant_b,
+				*idb,
+				lb.hlc,
+			))
+		});
 		out
 	}
 
@@ -835,7 +983,8 @@ impl SlabManager {
 	/// boundary for lazy migration lives at a dedicated API rather
 	/// than piggybacking on the hot write path:
 	///
-	/// * **Fast path** — if a version with the same `(key_hash, hlc)`
+	/// * **Fast path** — if a version with the same
+	///   `(key_identity, hlc)`
 	///   already exists locally, read its frame, blake3 it, and
 	///   compare to `payload_hash`. A match is a no-op and returns
 	///   [`MigrationIngestOutcome::Duplicate`]. A mismatch is a
@@ -853,7 +1002,8 @@ impl SlabManager {
 	pub async fn append_migration(
 		&self,
 		migration_id: u64,
-		key_hash: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
 		hlc: HybridTimestamp,
 		payload_hash: [u8; 32],
 		frame: &[u8],
@@ -865,7 +1015,7 @@ impl SlabManager {
 		// which is bounded by retention.
 		let existing = self
 			.key_index
-			.get(&key_hash)
+			.get(&(tenant_id, key_identity))
 			.and_then(|chain| chain.iter().find(|loc| loc.hlc == hlc).copied());
 
 		if let Some(location) = existing {
@@ -885,7 +1035,7 @@ impl SlabManager {
 				ErrorKind::InvalidData,
 				format!(
 					"append_migration payload_hash mismatch: migration_id={migration_id} \
-                     key_hash={key_hash:#x} hlc={hlc:?} stored_hash={stored_hash:?} \
+                     key_identity={key_identity} hlc={hlc:?} stored_hash={stored_hash:?} \
                      incoming_hash={payload_hash:?}"
 				),
 			));
@@ -895,7 +1045,7 @@ impl SlabManager {
 		// append path. `StorageEngine::append` handles rotation,
 		// disk ack, and folding the new version into the
 		// multi-version index.
-		let location = self.append(key_hash, hlc, frame).await?;
+		let location = self.append(tenant_id, key_identity, hlc, frame).await?;
 		Ok(MigrationIngestOutcome::Inserted(location))
 	}
 
@@ -913,11 +1063,15 @@ impl SlabManager {
 		// exactly one rotation.
 		let next_id = state.next_slab_id;
 		let next_path = slab_path(&self.config.dir, next_id);
-		let next_slab = Arc::new(LocalSlabStore::open(
-			&next_path,
-			next_id,
-			self.config.io.clone(),
-		)?);
+		let next_slab = Arc::new(
+			LocalSlabStore::open(
+				&next_path,
+				next_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
 
 		let sealed_slab = std::mem::replace(&mut state.active, next_slab.clone());
 		state.sealed.insert(sealed_slab.slab_id(), sealed_slab);
@@ -1014,16 +1168,21 @@ enum SlabBacking {
 impl StorageEngine for SlabManager {
 	async fn append(
 		&self,
-		key_hash: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let (_slab, location) = self.append_on_target(key_hash, hlc, frame).await?;
+		let (_slab, location) = self
+			.append_on_target(tenant_id, key_identity, hlc, frame)
+			.await?;
 		// The per-slab `append` already pushed the new version onto
 		// its local chain; mirror it into the manager's
 		// authoritative multi-version index so `lookup` /
 		// `lookup_as_of` stay O(1) without cross-slab scanning.
-		self.index_appended_location(key_hash, location);
+		self.index_appended_location(tenant_id, key_identity, location);
+		self.persist_record_row(tenant_id, key_identity, location)
+			.await;
 		Ok(location)
 	}
 
@@ -1039,19 +1198,308 @@ impl StorageEngine for SlabManager {
 		}
 	}
 
-	fn lookup(&self, key_hash: u64) -> Option<RecordLocation> {
+	fn lookup(&self, tenant_id: TenantId, key_identity: Identity) -> Option<RecordLocation> {
 		self.key_index
-			.get(&key_hash)
+			.get(&(tenant_id, key_identity))
 			.and_then(|v| v.last().copied())
 	}
 
-	fn lookup_as_of(&self, key_hash: u64, as_of_hlc: HybridTimestamp) -> Option<RecordLocation> {
-		let versions = self.key_index.get(&key_hash)?;
+	fn lookup_as_of(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		as_of_hlc: HybridTimestamp,
+	) -> Option<RecordLocation> {
+		let versions = self.key_index.get(&(tenant_id, key_identity))?;
 		newest_version_as_of(versions.value(), as_of_hlc)
 	}
 }
 
 impl SlabManager {
+	fn persistent_record_rows_snapshot(&self) -> Vec<PersistentRecordRow> {
+		let mut rows = Vec::new();
+		for entry in self.key_index.iter() {
+			let (tenant_id, key_identity) = *entry.key();
+			for location in entry.value().iter() {
+				rows.push(PersistentRecordRow {
+					tenant_id,
+					key_identity,
+					location: *location,
+				});
+			}
+		}
+		rows.sort_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+			)
+		});
+		rows
+	}
+
+	fn has_rows_for_slab(&self, slab_id: u64) -> bool {
+		self.key_index.iter().any(|entry| {
+			entry
+				.value()
+				.iter()
+				.any(|location| location.slab_id == slab_id)
+		})
+	}
+
+	async fn tiered_pointers_snapshot(&self) -> Vec<TieredSlabPointer> {
+		let state = self.state.lock().await;
+		let mut tiered = state
+			.tiered
+			.iter()
+			.map(|entry| entry.value().clone())
+			.collect::<Vec<_>>();
+		tiered.sort_by_key(|pointer| pointer.slab_id);
+		tiered
+	}
+
+	async fn rebuild_persistent_index(&self) {
+		let Some(index) = &self.persistent_index else {
+			return;
+		};
+		let rows = self.persistent_record_rows_snapshot();
+		let tiered = self.tiered_pointers_snapshot().await;
+		if let Err(err) = index.rebuild(rows, tiered, None).await {
+			tracing::warn!(
+				error = %err,
+				dir = %self.config.dir.display(),
+				"failed to rebuild redb storage index snapshot"
+			);
+		}
+	}
+
+	async fn mirror_persistent_update(
+		&self,
+		update: PersistentIndexUpdate,
+		operation: &'static str,
+	) {
+		let Some(index) = &self.persistent_index else {
+			return;
+		};
+		if let Err(err) = index.apply(update.clone()).await {
+			tracing::warn!(
+				error = %err,
+				dir = %self.config.dir.display(),
+				operation,
+				"redb delta update failed; rebuilding from authoritative storage state"
+			);
+			let rows = self.persistent_record_rows_snapshot();
+			let tiered = self.tiered_pointers_snapshot().await;
+			if let Err(rebuild_err) = index
+				.rebuild(rows, tiered, update.last_control_log_index)
+				.await
+			{
+				tracing::warn!(
+					error = %rebuild_err,
+					dir = %self.config.dir.display(),
+					operation,
+					"failed to rebuild redb storage index snapshot"
+				);
+			}
+		}
+	}
+
+	async fn persist_record_row(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
+		let Some(index) = &self.persistent_index else {
+			return;
+		};
+		let row = PersistentRecordRow {
+			tenant_id,
+			key_identity,
+			location,
+		};
+		if let Err(err) = index.upsert_record(row).await {
+			tracing::warn!(
+				error = %err,
+				slab_id = location.slab_id,
+				offset = location.offset,
+				tenant_id = tenant_id.get(),
+				"failed to persist slab record into redb"
+			);
+		}
+	}
+
+	async fn persist_record_row_strict(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) -> std::io::Result<()> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(());
+		};
+		let row = PersistentRecordRow {
+			tenant_id,
+			key_identity,
+			location,
+		};
+		if let Err(err) = index.upsert_record(row).await {
+			tracing::warn!(
+				error = %err,
+				slab_id = location.slab_id,
+				offset = location.offset,
+				tenant_id = tenant_id.get(),
+				"redb upsert failed on durable append; rebuilding snapshot before retry"
+			);
+			let mut rows = self.persistent_record_rows_snapshot();
+			rows.push(row);
+			rows.sort_by_key(|row| {
+				(
+					row.location.slab_id,
+					row.tenant_id,
+					row.key_identity,
+					row.location.hlc,
+					row.location.offset,
+				)
+			});
+			let tiered = self.tiered_pointers_snapshot().await;
+			index.rebuild(rows, tiered, None).await?;
+		}
+		Ok(())
+	}
+
+	async fn delete_persistent_records(&self, records: &[CompactionRecord]) {
+		let rows = records
+			.iter()
+			.map(|record| PersistentRecordRow {
+				tenant_id: record.tenant_id,
+				key_identity: record.key_identity,
+				location: record.old_location,
+			})
+			.collect::<Vec<_>>();
+		self.mirror_persistent_update(
+			PersistentIndexUpdate {
+				delete_records: rows,
+				..Default::default()
+			},
+			"compaction-delete",
+		)
+		.await;
+	}
+
+	async fn replace_persistent_records(
+		&self,
+		removed: &[CompactionRecord],
+		inserted: &[RelocatedRecord],
+	) {
+		let removed_rows = removed
+			.iter()
+			.map(|record| PersistentRecordRow {
+				tenant_id: record.tenant_id,
+				key_identity: record.key_identity,
+				location: record.old_location,
+			})
+			.collect::<Vec<_>>();
+		let inserted_rows = inserted
+			.iter()
+			.map(|record| PersistentRecordRow {
+				tenant_id: record.tenant_id,
+				key_identity: record.key_identity,
+				location: record.new_location,
+			})
+			.collect::<Vec<_>>();
+		self.mirror_persistent_update(
+			PersistentIndexUpdate {
+				delete_records: removed_rows,
+				put_records: inserted_rows,
+				..Default::default()
+			},
+			"compaction-replace",
+		)
+		.await;
+	}
+
+	async fn persist_tiered_pointer_strict(
+		&self,
+		pointer: TieredSlabPointer,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(());
+		};
+		if let Err(err) = index
+			.upsert_tiered_slab(pointer.clone(), last_control_log_index)
+			.await
+		{
+			tracing::warn!(
+				error = %err,
+				slab_id = pointer.slab_id,
+				"redb tier-pointer upsert failed; rebuilding snapshot before retry"
+			);
+			let rows = self.persistent_record_rows_snapshot();
+			let mut tiered = self.tiered_pointers_snapshot().await;
+			if let Some(existing) = tiered
+				.iter_mut()
+				.find(|entry| entry.slab_id == pointer.slab_id)
+			{
+				*existing = pointer.clone();
+			} else {
+				tiered.push(pointer.clone());
+				tiered.sort_by_key(|entry| entry.slab_id);
+			}
+			index.rebuild(rows, tiered, last_control_log_index).await?;
+		}
+		Ok(())
+	}
+
+	async fn recover_tiered_rows_from_l2(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<()> {
+		let l2 = self.config.l2.clone().ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"cannot recover tiered slab {} without an L2 object store",
+					pointer.slab_id
+				),
+			)
+		})?;
+		let blob = l2.get(&pointer.l2_uri).await?;
+		validate_tiered_blob(pointer, &blob)?;
+		let recovered_rows = recover_slab_entries_from_blob(&blob, pointer.slab_id)?
+			.into_iter()
+			.map(|(tenant_id, key_identity, location)| PersistentRecordRow {
+				tenant_id,
+				key_identity,
+				location,
+			})
+			.collect::<Vec<_>>();
+		for row in &recovered_rows {
+			self.key_index
+				.entry((row.tenant_id, row.key_identity))
+				.and_modify(|versions| {
+					if !versions.contains(&row.location) {
+						insert_version_sorted(versions, row.location);
+					}
+				})
+				.or_insert_with(|| vec![row.location]);
+		}
+		if !recovered_rows.is_empty() {
+			self.mirror_persistent_update(
+				PersistentIndexUpdate {
+					put_records: recovered_rows,
+					..Default::default()
+				},
+				"tiered-row-recovery",
+			)
+			.await;
+		}
+		Ok(())
+	}
+
 	async fn reserve_slab_id(&self) -> u64 {
 		let mut state = self.state.lock().await;
 		let next_id = state.next_slab_id;
@@ -1069,16 +1517,18 @@ impl SlabManager {
 			.index
 			.iter()
 			.flat_map(|entry| {
-				let key_hash = *entry.key();
+				let (tenant_id, key_identity) = *entry.key();
+				let locality = Locality::from(key_identity);
 				entry
 					.value()
 					.iter()
 					.map(move |loc| CompactionRecord {
-						key_hash,
+						tenant_id,
+						key_identity,
 						old_location: *loc,
 						reclaim: tombstones.iter().any(|tombstone| {
-							key_hash >= tombstone.range_start
-								&& key_hash <= tombstone.range_end
+							locality.get() >= tombstone.range_start
+								&& locality.get() <= tombstone.range_end
 								&& loc.hlc >= tombstone.migration_hlc_floor
 						}),
 					})
@@ -1103,19 +1553,29 @@ impl SlabManager {
 
 		let replacement_id = self.reserve_slab_id().await;
 		let replacement_path = slab_path(&self.config.dir, replacement_id);
-		let replacement = Arc::new(LocalSlabStore::open(
-			&replacement_path,
-			replacement_id,
-			self.config.io.clone(),
-		)?);
+		let replacement = Arc::new(
+			LocalSlabStore::open(
+				&replacement_path,
+				replacement_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
 		let mut relocations = Vec::with_capacity(survivors);
 		for record in records.iter().filter(|record| !record.reclaim) {
 			let frame = slab.read(record.old_location).await?;
 			let new_location = replacement
-				.append(record.key_hash, record.old_location.hlc, &frame)
+				.append(
+					record.tenant_id,
+					record.key_identity,
+					record.old_location.hlc,
+					&frame,
+				)
 				.await?;
 			relocations.push(RelocatedRecord {
-				key_hash: record.key_hash,
+				tenant_id: record.tenant_id,
+				key_identity: record.key_identity,
 				old_location: record.old_location,
 				new_location,
 			});
@@ -1134,16 +1594,12 @@ impl SlabManager {
 			.await?
 		{
 			let path = slab_path(&self.config.dir, replacement_id);
-			let _ = std::fs::remove_file(path);
+			let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
 			return Ok(None);
 		}
 
 		let old_path = slab_path(&self.config.dir, slab_id);
-		match std::fs::remove_file(&old_path) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::NotFound => {}
-			Err(err) => return Err(err),
-		}
+		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
 
 		Ok(Some(CompactionOutcome {
 			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
@@ -1155,19 +1611,23 @@ impl SlabManager {
 		slab_id: u64,
 		records: &[CompactionRecord],
 	) -> std::io::Result<()> {
-		let state = self.state.lock().await;
-		if state.sealed.remove(&slab_id).is_none() {
+		let removed = {
+			let state = self.state.lock().await;
+			state.sealed.remove(&slab_id).is_some()
+		};
+		if !removed {
 			return Ok(());
 		}
 		for record in records {
-			self.rollback_indexed_location(record.key_hash, record.old_location);
+			self.rollback_indexed_location(
+				record.tenant_id,
+				record.key_identity,
+				record.old_location,
+			);
 		}
+		self.delete_persistent_records(records).await;
 		let old_path = slab_path(&self.config.dir, slab_id);
-		match std::fs::remove_file(&old_path) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::NotFound => {}
-			Err(err) => return Err(err),
-		}
+		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
 		Ok(())
 	}
 
@@ -1186,13 +1646,23 @@ impl SlabManager {
 		state.sealed.remove(&old_slab_id);
 		state.sealed.insert(new_slab_id, replacement);
 		for record in records {
-			self.rollback_indexed_location(record.key_hash, record.old_location);
+			self.rollback_indexed_location(
+				record.tenant_id,
+				record.key_identity,
+				record.old_location,
+			);
 		}
 		for relocation in relocations {
-			self.index_appended_location(relocation.key_hash, relocation.new_location);
+			self.index_appended_location(
+				relocation.tenant_id,
+				relocation.key_identity,
+				relocation.new_location,
+			);
 			self.relocated_reads
 				.insert(relocation.old_location, relocation.new_location);
 		}
+		drop(state);
+		self.replace_persistent_records(records, relocations).await;
 		Ok(true)
 	}
 
@@ -1254,7 +1724,9 @@ impl SlabManager {
 		pointer: TieredSlabPointer,
 		blob: Bytes,
 	) -> std::io::Result<()> {
-		let result = self.install_rehydrated_local_copy(pointer.slab_id, blob.as_ref());
+		let result = self
+			.install_rehydrated_local_copy(pointer.slab_id, blob.as_ref())
+			.await;
 		let mut state = self.state.lock().await;
 		state.rehydrating.remove(&pointer.slab_id);
 		match result {
@@ -1279,27 +1751,41 @@ impl SlabManager {
 		}
 	}
 
-	fn install_rehydrated_local_copy(
+	async fn install_rehydrated_local_copy(
 		&self,
 		slab_id: u64,
 		blob: &[u8],
 	) -> std::io::Result<RehydratedSlabState> {
 		let path = slab_path(&self.config.dir, slab_id);
 		let tmp_path = rehydrate_tmp_path(&self.config.dir, slab_id);
-		match std::fs::remove_file(&tmp_path) {
-			Ok(()) => {}
-			Err(err) if err.kind() == ErrorKind::NotFound => {}
-			Err(err) => return Err(err),
-		}
-		let mut tmp = std::fs::File::create(&tmp_path)?;
-		tmp.write_all(blob)?;
-		tmp.sync_all()?;
-		std::fs::rename(&tmp_path, &path)?;
-		let slab = Arc::new(LocalSlabStore::open(
-			&path,
-			slab_id,
-			self.config.io.clone(),
-		)?);
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		self.file_ops.write_all(&tmp_path, blob).await?;
+		let tmp = self
+			.file_ops
+			.open(
+				&tmp_path,
+				OpenFlags {
+					read: true,
+					write: true,
+					create: false,
+					create_new: false,
+					truncate: false,
+					direct: false,
+				},
+			)
+			.await?;
+		self.file_ops.fsync(&tmp).await?;
+		self.file_ops.rename(&tmp_path, &path).await?;
+		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+		let slab = Arc::new(
+			LocalSlabStore::open(
+				&path,
+				slab_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
 		Ok(RehydratedSlabState {
 			slab,
 			keep_local_until: Instant::now() + self.config.rehydration.min_local_residency,
@@ -1309,14 +1795,16 @@ impl SlabManager {
 
 #[derive(Clone, Copy)]
 struct CompactionRecord {
-	key_hash: u64,
+	tenant_id: TenantId,
+	key_identity: Identity,
 	old_location: RecordLocation,
 	reclaim: bool,
 }
 
 #[derive(Clone, Copy)]
 struct RelocatedRecord {
-	key_hash: u64,
+	tenant_id: TenantId,
+	key_identity: Identity,
 	old_location: RecordLocation,
 	new_location: RecordLocation,
 }
@@ -1380,6 +1868,27 @@ fn rehydrate_tmp_path(dir: &Path, slab_id: u64) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.rehydrate.tmp", slab_id))
 }
 
+async fn fsync_parent_dir(file_ops: &dyn AsyncFileOps, path: &Path) -> std::io::Result<()> {
+	let parent = path.parent().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("path has no parent directory: {}", path.display()),
+		)
+	})?;
+	file_ops.fsync_dir(parent).await
+}
+
+async fn unlink_local_file(file_ops: &dyn AsyncFileOps, path: &Path) -> std::io::Result<()> {
+	match file_ops.unlink(path).await {
+		Ok(()) => {
+			fsync_parent_dir(file_ops, path).await?;
+			Ok(())
+		}
+		Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+		Err(err) => Err(err),
+	}
+}
+
 /// Parse a filename of the form `slab_<16-hex>.wnd` into a slab id.
 /// Returns `None` for anything that does not match so the scan can
 /// silently skip unrelated files — operators may reasonably drop
@@ -1394,14 +1903,13 @@ fn parse_slab_filename(name: &str) -> Option<u64> {
 
 /// Enumerate every `slab_<hex>.wnd` file in `dir` and return their
 /// ids. Non-matching entries are ignored; I/O errors propagate.
-fn discover_slab_ids(dir: &Path) -> std::io::Result<Vec<u64>> {
+async fn discover_slab_ids(file_ops: &dyn AsyncFileOps, dir: &Path) -> std::io::Result<Vec<u64>> {
 	let mut ids = Vec::new();
-	for entry in std::fs::read_dir(dir)? {
-		let entry = entry?;
-		if !entry.file_type()?.is_file() {
+	for entry in file_ops.read_dir(dir).await? {
+		if !entry.is_file {
 			continue;
 		}
-		if let Some(name) = entry.file_name().to_str() {
+		if let Some(name) = entry.file_name.to_str() {
 			if let Some(id) = parse_slab_filename(name) {
 				ids.push(id);
 			}
@@ -1421,12 +1929,12 @@ fn discover_slab_ids(dir: &Path) -> std::io::Result<Vec<u64>> {
 /// chain stays sorted globally even when older slabs contain
 /// versions that post-date newer slabs (a legal outcome of leader
 /// changes or cross-slab rewrites).
-fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<u64, Vec<RecordLocation>>) {
+fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<RecordLocation>>) {
 	for entry in slab.index.iter() {
-		let key = *entry.key();
+		let tenant_key = *entry.key();
 		for loc in entry.value().iter() {
 			key_index
-				.entry(key)
+				.entry(tenant_key)
 				.and_modify(|versions| insert_version_sorted(versions, *loc))
 				.or_insert_with(|| vec![*loc]);
 		}
@@ -1436,7 +1944,9 @@ fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<u64, Vec<RecordLo
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::schema::NodeId;
 	use crate::storage::io_uring::spawn_io_thread;
+	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 
 	fn fresh_dir(tag: &str) -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!(
@@ -1456,7 +1966,21 @@ mod tests {
 		}
 	}
 
+	fn id(n: u64) -> Identity {
+		let mut bytes = [0u8; 32];
+		bytes[..8].copy_from_slice(&n.to_le_bytes());
+		Identity::new(bytes)
+	}
+
+	fn tenant() -> TenantId {
+		TenantId::ZERO
+	}
+
 	async fn fresh_manager() -> Arc<SlabManager> {
+		fresh_manager_with_group_commit(GroupCommitConfig::default()).await
+	}
+
+	async fn fresh_manager_with_group_commit(group_commit: GroupCommitConfig) -> Arc<SlabManager> {
 		let dir = fresh_dir("mv");
 		let io = spawn_io_thread(64).unwrap();
 		Arc::new(
@@ -1470,89 +1994,147 @@ mod tests {
 				io,
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
+				group_commit,
 			})
+			.await
 			.unwrap(),
 		)
+	}
+
+	async fn force_seal_active(manager: &Arc<SlabManager>) -> u64 {
+		let mut state = manager.state.lock().await;
+		let sealed = state.active.clone();
+		let sealed_id = sealed.slab_id();
+		let next_id = state.next_slab_id;
+		let next = Arc::new(
+			LocalSlabStore::open(
+				slab_path(&manager.config.dir, next_id),
+				next_id,
+				manager.file_ops.clone(),
+				manager.config.group_commit.clone(),
+			)
+			.await
+			.unwrap(),
+		);
+		state.active = next;
+		state.sealed.insert(sealed_id, sealed);
+		state.next_slab_id = next_id + 1;
+		sealed_id
 	}
 
 	#[tokio::test]
 	async fn lookup_returns_latest_version_after_multiple_appends() {
 		let mgr = fresh_manager().await;
-		let key: u64 = 42;
-		mgr.append(key, hlc(10), b"v1").await.unwrap();
-		mgr.append(key, hlc(20), b"v2").await.unwrap();
-		mgr.append(key, hlc(30), b"v3").await.unwrap();
+		let key = id(42);
+		mgr.append(tenant(), key, hlc(10), b"v1").await.unwrap();
+		mgr.append(tenant(), key, hlc(20), b"v2").await.unwrap();
+		mgr.append(tenant(), key, hlc(30), b"v3").await.unwrap();
 
-		let latest = mgr.lookup(key).expect("key present");
+		let latest = mgr.lookup(tenant(), key).expect("key present");
 		assert_eq!(latest.hlc.physical_ms, 30);
 	}
 
 	#[tokio::test]
 	async fn lookup_as_of_returns_historical_version() {
 		let mgr = fresh_manager().await;
-		let key: u64 = 7;
-		mgr.append(key, hlc(10), b"v1").await.unwrap();
-		mgr.append(key, hlc(20), b"v2").await.unwrap();
-		mgr.append(key, hlc(30), b"v3").await.unwrap();
+		let key = id(7);
+		mgr.append(tenant(), key, hlc(10), b"v1").await.unwrap();
+		mgr.append(tenant(), key, hlc(20), b"v2").await.unwrap();
+		mgr.append(tenant(), key, hlc(30), b"v3").await.unwrap();
 
-		assert_eq!(mgr.lookup_as_of(key, hlc(15)).unwrap().hlc.physical_ms, 10);
-		assert_eq!(mgr.lookup_as_of(key, hlc(20)).unwrap().hlc.physical_ms, 20);
-		assert_eq!(mgr.lookup_as_of(key, hlc(25)).unwrap().hlc.physical_ms, 20);
+		assert_eq!(
+			mgr.lookup_as_of(tenant(), key, hlc(15))
+				.unwrap()
+				.hlc
+				.physical_ms,
+			10
+		);
+		assert_eq!(
+			mgr.lookup_as_of(tenant(), key, hlc(20))
+				.unwrap()
+				.hlc
+				.physical_ms,
+			20
+		);
+		assert_eq!(
+			mgr.lookup_as_of(tenant(), key, hlc(25))
+				.unwrap()
+				.hlc
+				.physical_ms,
+			20
+		);
 		// Bound before the first write -> nothing visible yet.
-		assert!(mgr.lookup_as_of(key, hlc(5)).is_none());
+		assert!(mgr.lookup_as_of(tenant(), key, hlc(5)).is_none());
 	}
 
 	#[tokio::test]
 	async fn scan_all_versions_returns_every_retained_version_above_floor() {
 		let mgr = fresh_manager().await;
 		// Two keys, two versions each — one above floor, one below.
-		mgr.append(1, hlc(5), b"a@5").await.unwrap();
-		mgr.append(1, hlc(50), b"a@50").await.unwrap();
-		mgr.append(2, hlc(20), b"b@20").await.unwrap();
-		mgr.append(2, hlc(200), b"b@200").await.unwrap();
+		let key_a = id(1);
+		let key_b = id(2);
+		mgr.append(tenant(), key_a, hlc(5), b"a@5").await.unwrap();
+		mgr.append(tenant(), key_a, hlc(50), b"a@50").await.unwrap();
+		mgr.append(tenant(), key_b, hlc(20), b"b@20").await.unwrap();
+		mgr.append(tenant(), key_b, hlc(200), b"b@200")
+			.await
+			.unwrap();
 
-		let hits = mgr.scan_all_versions(0, u64::MAX, hlc(10));
+		let hits = mgr.scan_all_versions(Locality::ZERO, Locality::MAX, hlc(10));
 		// Floor at 10 drops (1, hlc=5); the remaining three survive.
 		assert_eq!(hits.len(), 3);
-		// Sorted first by key_hash, then by hlc ascending.
-		assert_eq!(hits[0].0, 1);
-		assert_eq!(hits[0].1.hlc.physical_ms, 50);
-		assert_eq!(hits[1].0, 2);
-		assert_eq!(hits[1].1.hlc.physical_ms, 20);
-		assert_eq!(hits[2].0, 2);
-		assert_eq!(hits[2].1.hlc.physical_ms, 200);
+		// Sorted first by locality/identity, then by hlc ascending.
+		assert_eq!(hits[0].0, tenant());
+		assert_eq!(hits[0].1, key_a);
+		assert_eq!(hits[0].2.hlc.physical_ms, 50);
+		assert_eq!(hits[1].0, tenant());
+		assert_eq!(hits[1].1, key_b);
+		assert_eq!(hits[1].2.hlc.physical_ms, 20);
+		assert_eq!(hits[2].0, tenant());
+		assert_eq!(hits[2].1, key_b);
+		assert_eq!(hits[2].2.hlc.physical_ms, 200);
 
 		// Inverted window → empty rather than panic.
-		assert!(mgr.scan_all_versions(10, 5, hlc(0)).is_empty());
+		assert!(
+			mgr.scan_all_versions(Locality::new(10), Locality::new(5), hlc(0))
+				.is_empty()
+		);
 	}
 
 	#[tokio::test]
 	async fn append_migration_is_idempotent_on_identical_payload() {
 		let mgr = fresh_manager().await;
-		let key: u64 = 42;
+		let key = id(42);
 		let ts = hlc(100);
 		let frame = b"payload-bytes";
 		let hash: [u8; 32] = *blake3::hash(frame).as_bytes();
 
-		let first = mgr.append_migration(7, key, ts, hash, frame).await.unwrap();
+		let first = mgr
+			.append_migration(7, tenant(), key, ts, hash, frame)
+			.await
+			.unwrap();
 		assert!(matches!(first, MigrationIngestOutcome::Inserted(_)));
 
-		let second = mgr.append_migration(7, key, ts, hash, frame).await.unwrap();
+		let second = mgr
+			.append_migration(7, tenant(), key, ts, hash, frame)
+			.await
+			.unwrap();
 		assert!(matches!(second, MigrationIngestOutcome::Duplicate(_)));
 
 		// Only one version at this (key, hlc) should exist.
-		let versions = mgr.scan_all_versions(key, key, hlc(0));
+		let locality = Locality::from(key);
+		let versions = mgr.scan_all_versions(locality, locality, hlc(0));
 		assert_eq!(versions.len(), 1);
 	}
 
 	#[tokio::test]
 	async fn append_migration_rejects_conflicting_payload_for_same_slot() {
 		let mgr = fresh_manager().await;
-		let key: u64 = 99;
+		let key = id(99);
 		let ts = hlc(200);
 		let frame_a = b"original";
 		let hash_a: [u8; 32] = *blake3::hash(frame_a).as_bytes();
-		mgr.append_migration(1, key, ts, hash_a, frame_a)
+		mgr.append_migration(1, tenant(), key, ts, hash_a, frame_a)
 			.await
 			.unwrap();
 
@@ -1562,7 +2144,7 @@ mod tests {
 		let frame_b = b"tampered";
 		let hash_b: [u8; 32] = *blake3::hash(frame_b).as_bytes();
 		let err = mgr
-			.append_migration(1, key, ts, hash_b, frame_b)
+			.append_migration(1, tenant(), key, ts, hash_b, frame_b)
 			.await
 			.unwrap_err();
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -1573,26 +2155,229 @@ mod tests {
 		let mgr = fresh_manager().await;
 		// Two keys in the same range, each with two versions at
 		// different HLCs.
-		mgr.append(1, hlc(10), b"a@10").await.unwrap();
-		mgr.append(1, hlc(30), b"a@30").await.unwrap();
-		mgr.append(2, hlc(20), b"b@20").await.unwrap();
-		mgr.append(2, hlc(40), b"b@40").await.unwrap();
+		let key_a = id(1);
+		let key_b = id(2);
+		mgr.append(tenant(), key_a, hlc(10), b"a@10").await.unwrap();
+		mgr.append(tenant(), key_a, hlc(30), b"a@30").await.unwrap();
+		mgr.append(tenant(), key_b, hlc(20), b"b@20").await.unwrap();
+		mgr.append(tenant(), key_b, hlc(40), b"b@40").await.unwrap();
 
 		// AS OF 25 — should see key=1 at 10 (20 hasn't landed),
 		// key=2 at 20.
-		let at_25 = mgr.scan_as_of(0, u64::MAX, hlc(25));
+		let at_25 = mgr.scan_as_of(tenant(), Locality::ZERO, Locality::MAX, hlc(25));
 		assert_eq!(at_25.len(), 2);
-		assert_eq!(at_25[0].0, 1);
+		assert_eq!(at_25[0].0, Locality::from(key_a).get());
 		assert_eq!(at_25[0].1.hlc.physical_ms, 10);
-		assert_eq!(at_25[1].0, 2);
+		assert_eq!(at_25[1].0, Locality::from(key_b).get());
 		assert_eq!(at_25[1].1.hlc.physical_ms, 20);
 
 		// AS OF 5 — nothing visible yet.
-		assert!(mgr.scan_as_of(0, u64::MAX, hlc(5)).is_empty());
+		assert!(
+			mgr.scan_as_of(tenant(), Locality::ZERO, Locality::MAX, hlc(5))
+				.is_empty()
+		);
 
 		// Zero sentinel -> latest versions.
-		let latest = mgr.scan(0, u64::MAX);
+		let latest = mgr.scan(tenant(), Locality::ZERO, Locality::MAX);
 		assert_eq!(latest[0].1.hlc.physical_ms, 30);
 		assert_eq!(latest[1].1.hlc.physical_ms, 40);
+	}
+
+	#[tokio::test]
+	async fn append_durable_coalesces_concurrent_fdatasyncs() {
+		let mgr = fresh_manager_with_group_commit(GroupCommitConfig {
+			floor: Duration::from_millis(20),
+			ceiling: Duration::from_millis(20),
+			per_write_cost_estimate: Duration::from_millis(20),
+		})
+		.await;
+
+		let first = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move {
+				mgr.append_durable(tenant(), id(0x11), hlc(10), b"first")
+					.await
+					.unwrap();
+			})
+		};
+		tokio::time::sleep(Duration::from_millis(1)).await;
+		let second = {
+			let mgr = mgr.clone();
+			tokio::spawn(async move {
+				mgr.append_durable(tenant(), id(0x22), hlc(20), b"second")
+					.await
+					.unwrap();
+			})
+		};
+		first.await.unwrap();
+		second.await.unwrap();
+
+		let fdatasync_calls = {
+			let state = mgr.state.lock().await;
+			state.active.fdatasync_call_count()
+		};
+		assert_eq!(fdatasync_calls, 1);
+	}
+
+	#[tokio::test]
+	async fn reopen_restores_tiered_rows_from_redb() {
+		let l1_dir = fresh_dir("tiered-reopen-l1");
+		let l2_dir = fresh_dir("tiered-reopen-l2");
+		let io = spawn_io_thread(64).unwrap();
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+
+		let manager = SlabManager::open(SlabManagerConfig {
+			dir: l1_dir.clone(),
+			max_slab_bytes: 1,
+			io: io.clone(),
+			l2: Some(l2.clone()),
+			rehydration: RehydrationPolicy::default(),
+			group_commit: GroupCommitConfig::default(),
+		})
+		.await
+		.unwrap();
+
+		let tiered_key = id(0x44);
+		let other_key = id(0x99);
+		let tiered_bytes = b"tiered-row".to_vec();
+		manager
+			.append(tenant(), tiered_key, hlc(10), &tiered_bytes)
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), other_key, hlc(20), b"active-row")
+			.await
+			.unwrap();
+
+		let sealed = manager.list_sealed_slabs().await;
+		assert_eq!(sealed.len(), 1, "expected one sealed slab after rotation");
+		let sealed_id = sealed[0].slab_id;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let payload_hash = *blake3::hash(&raw).as_bytes();
+		let uri = l2
+			.put(&format!("sealed/slab_{sealed_id:016x}.wnd"), &raw)
+			.await
+			.unwrap();
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: sealed_id,
+				l2_uri: uri,
+				payload_hash,
+			})
+			.await
+			.unwrap();
+		assert!(manager.is_tiered(sealed_id).await);
+		assert!(
+			!slab_path(&l1_dir, sealed_id).exists(),
+			"tiered slab should be unlinked from L1"
+		);
+
+		drop(manager);
+
+		let reopened = SlabManager::open(SlabManagerConfig {
+			dir: l1_dir,
+			max_slab_bytes: 1,
+			io,
+			l2: Some(l2),
+			rehydration: RehydrationPolicy::default(),
+			group_commit: GroupCommitConfig::default(),
+		})
+		.await
+		.unwrap();
+		assert!(reopened.is_tiered(sealed_id).await);
+
+		let location = reopened
+			.lookup(tenant(), tiered_key)
+			.expect("tiered key should survive reopen");
+		assert_eq!(location.slab_id, sealed_id);
+		assert_eq!(reopened.read(location).await.unwrap(), tiered_bytes);
+	}
+
+	#[tokio::test]
+	async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
+		let dir = fresh_dir("compaction-redb");
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: dir.clone(),
+				max_slab_bytes: 1024 * 1024,
+				io: io.clone(),
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let removed_key = id(0x1010);
+		let survivor_key = id(0x2020);
+		manager
+			.append_durable(tenant(), removed_key, hlc(10), b"drop-me")
+			.await
+			.unwrap();
+		manager
+			.append_durable(tenant(), survivor_key, hlc(20), b"keep-me")
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		manager
+			.append_durable(tenant(), id(0x3030), hlc(30), b"active-row")
+			.await
+			.unwrap();
+
+		let target = Locality::from(removed_key).get();
+		let report = manager
+			.reclaim_tombstoned_ranges(
+				&[MigratedRangeTombstone {
+					migration_id: 1,
+					range_start: target,
+					range_end: target,
+					to_epoch: 2,
+					completed_by: NodeId {
+						id: 7,
+						_reserved: 0,
+					},
+					migration_hlc_floor: hlc(0),
+				}],
+				1,
+			)
+			.await
+			.unwrap();
+		assert_eq!(report.compacted_slabs, 1);
+		assert!(
+			manager.lookup(tenant(), removed_key).is_none(),
+			"reclaimed key should disappear from the in-memory index"
+		);
+
+		let survivor = manager
+			.lookup(tenant(), survivor_key)
+			.expect("survivor should remain indexed");
+		assert_ne!(
+			survivor.slab_id, sealed_id,
+			"compaction should relocate the survivor into a replacement slab"
+		);
+		assert_eq!(manager.read(survivor).await.unwrap(), b"keep-me");
+
+		drop(manager);
+
+		let reopened = SlabManager::open(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1024 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			group_commit: GroupCommitConfig::default(),
+		})
+		.await
+		.unwrap();
+		assert!(
+			reopened.lookup(tenant(), removed_key).is_none(),
+			"reclaimed key should stay absent after reopen"
+		);
+		let survivor = reopened
+			.lookup(tenant(), survivor_key)
+			.expect("survivor should still be indexed after reopen");
+		assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
 	}
 }

@@ -266,7 +266,7 @@ impl SlabSweeper {
 		// loudly if the slab has been rotated away or already
 		// tiered — either is a sign the caller's info went stale,
 		// and re-listing on the next pass will converge.
-		let blob = self.slab.read_sealed_raw(info.slab_id).await?;
+		let blob: Vec<u8> = self.slab.read_sealed_raw(info.slab_id).await?;
 		let expected_hash = *blake3::hash(&blob).as_bytes();
 
 		// Phase 2: upload to L2, applying the rate limit.
@@ -449,13 +449,20 @@ impl ManagerTierObserver {
 
 #[async_trait]
 impl TierObserver for ManagerTierObserver {
-	async fn on_slab_tiered(&self, tier: &TieredSlab) -> std::io::Result<()> {
+	async fn on_slab_tiered(
+		&self,
+		tier: &TieredSlab,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
 		self.slab
-			.apply_tier_slab(TieredSlabPointer {
-				slab_id: tier.slab_id,
-				l2_uri: tier.l2_uri.clone(),
-				payload_hash: tier.payload_hash,
-			})
+			.apply_tier_slab_committed(
+				TieredSlabPointer {
+					slab_id: tier.slab_id,
+					l2_uri: tier.l2_uri.clone(),
+					payload_hash: tier.payload_hash,
+				},
+				Some(applied_log_index),
+			)
 			.await
 	}
 }
@@ -498,7 +505,7 @@ mod tests {
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
-			self.observer.on_slab_tiered(&tier).await?;
+			self.observer.on_slab_tiered(&tier, 0).await?;
 			Ok(())
 		}
 	}
@@ -521,6 +528,16 @@ mod tests {
 		}
 	}
 
+	fn id(locality: u64) -> crate::schema::Identity {
+		let mut bytes = [0u8; 32];
+		bytes[..8].copy_from_slice(&locality.to_le_bytes());
+		crate::schema::Identity::new(bytes)
+	}
+
+	fn tenant() -> crate::schema::TenantId {
+		crate::schema::TenantId::ZERO
+	}
+
 	async fn build_manager_with_sealed_slabs(
 		l2: Option<Arc<dyn ObjectStore>>,
 	) -> (Arc<SlabManager>, std::path::PathBuf) {
@@ -535,14 +552,25 @@ mod tests {
 				io,
 				l2,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
 			})
+			.await
 			.unwrap(),
 		);
 		// Each append rotates because the write_cursor crosses
 		// `max_slab_bytes` on the first record.
-		manager.append(1, hlc(), b"hello-1").await.unwrap();
-		manager.append(2, hlc(), b"hello-2").await.unwrap();
-		manager.append(3, hlc(), b"hello-3").await.unwrap();
+		manager
+			.append(tenant(), id(1), hlc(), b"hello-1")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), id(2), hlc(), b"hello-2")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), id(3), hlc(), b"hello-3")
+			.await
+			.unwrap();
 		(manager, dir)
 	}
 
@@ -601,7 +629,7 @@ mod tests {
 
 		// Record the location of key=1 before sweeping so we can
 		// verify the read path pivots without a re-lookup.
-		let loc1 = manager.lookup(1).expect("key present");
+		let loc1 = manager.lookup(tenant(), id(1)).expect("key present");
 		let original = manager.read(loc1).await.expect("pre-tier read ok");
 
 		let sm = WendelonStateMachine::new();

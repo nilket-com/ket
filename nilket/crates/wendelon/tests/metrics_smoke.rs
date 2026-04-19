@@ -12,8 +12,8 @@ use wendelon::metrics::exporter;
 use wendelon::network::traits::DataRing;
 use wendelon::node::LEASE_TTL_MS;
 use wendelon::schema::{
-	ClientWriteId, Consistency, FinalizationMarker, HybridTimestamp, ReadRequestMeta, ReadStatus,
-	WriteRequestMeta, WriteStatus, read_key_schema, write_payload_schema,
+	ClientWriteId, Consistency, FinalizationMarker, HybridTimestamp, Identity, ReadRequestMeta,
+	ReadStatus, TenantId, WriteRequestMeta, WriteStatus, read_key_schema, write_payload_schema,
 };
 use wendelon::storage::core::StorageEngine;
 use wendelon::storage::io_uring::spawn_io_thread;
@@ -27,6 +27,16 @@ fn hlc(physical_ms: u64, node_id: u32) -> HybridTimestamp {
 		logical: 0,
 		node_id,
 	}
+}
+
+fn id(locality: u64) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality.to_le_bytes());
+	Identity::new(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
 }
 
 fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
@@ -59,6 +69,7 @@ fn write_meta(node_id: u32, key: &[u8], value: &[u8]) -> WriteRequestMeta {
 		},
 		client_hlc: hlc(10, node_id),
 		expected_epoch: 1,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: wendelon::schema::DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -76,6 +87,7 @@ fn read_meta(node_id: u32, key: &[u8]) -> ReadRequestMeta {
 	ReadRequestMeta {
 		min_hlc: hlc(0, node_id),
 		expected_epoch: 1,
+		tenant_id: tenant(),
 		consistency: Consistency::LINEARIZABLE,
 		_pad: [0; 3],
 		key_len: key.len() as u32,
@@ -142,7 +154,7 @@ struct DirectApplyCommitter {
 #[async_trait]
 impl TierCommitter for DirectApplyCommitter {
 	async fn commit_tier_slab(&self, tier: wendelon::consensus::TieredSlab) -> std::io::Result<()> {
-		self.observer.on_slab_tiered(&tier).await
+		self.observer.on_slab_tiered(&tier, 0).await
 	}
 }
 
@@ -162,12 +174,23 @@ async fn build_manager_with_sealed_slabs(
 			io,
 			l2: Some(l2),
 			rehydration: wendelon::storage::manager::RehydrationPolicy::default(),
+			group_commit: wendelon::storage::GroupCommitConfig::default(),
 		})
+		.await
 		.unwrap(),
 	);
-	manager.append(1, hlc(1, 1), b"hello-1").await.unwrap();
-	manager.append(2, hlc(2, 1), b"hello-2").await.unwrap();
-	manager.append(3, hlc(3, 1), b"hello-3").await.unwrap();
+	manager
+		.append(tenant(), id(1), hlc(1, 1), b"hello-1")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(2), hlc(2, 1), b"hello-2")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(3), hlc(3, 1), b"hello-3")
+		.await
+		.unwrap();
 
 	let sm = WendelonStateMachine::new();
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));

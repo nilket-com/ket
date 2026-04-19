@@ -220,6 +220,7 @@ impl RawConfig {
 			node_id: self.node.node_id,
 			data_dir,
 			slab_max_bytes: self.storage.slab_max_bytes,
+			group_commit: crate::storage::GroupCommitConfig::default(),
 			rf: self.tuning.rf,
 			io_depth: self.tuning.io_depth,
 			advertise_address,

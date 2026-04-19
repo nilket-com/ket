@@ -11,9 +11,13 @@ use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::server::HrftService;
 use wendelon::schema::{
 	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, MsgType, NodeId,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, WriteRequestMeta, WriteResponseMeta,
+	ReadRequestMeta, ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, WriteResponseMeta,
 	WriteStatus, read_key_schema, write_payload_schema,
 };
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -33,6 +37,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 		},
 		client_hlc: hlc(1, 0, 77),
 		expected_epoch: epoch,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -50,6 +55,7 @@ fn read_meta(expected_epoch: u64, key: &[u8], min_hlc: HybridTimestamp) -> ReadR
 	ReadRequestMeta {
 		min_hlc,
 		expected_epoch,
+		tenant_id: tenant(),
 		consistency: Consistency::LINEARIZABLE,
 		_pad: [0; 3],
 		key_len: key.len() as u32,

@@ -11,12 +11,13 @@
 //! per-role rings is load-bearing: a single small cluster where
 //! every node wears both hats reuses the same data structure as a
 //! dedicated deployment where roles are disjoint. The CPU cost is
-//! the two-line predicate in [`RingState::replicas_for`].
+//! the two-line predicate in [`RingState::replicas_for_locality`].
 //!
 //! ## Virtual nodes
 //!
 //! Each physical node is inserted [`VNODES_PER_NODE`] times at
-//! positions derived from `highway(node_id, vnode_index)`. Vnodes
+//! positions derived from a stable BLAKE3-based vnode hash.
+//! Vnodes
 //! smooth load skew when node counts are small and collapse back
 //! to the same `NodeId` in the replica set via explicit dedup on
 //! the walk, so a single key still maps to `RF` *distinct* nodes.
@@ -33,8 +34,7 @@
 
 use crate::network::data_server::ReplicaRouter;
 use crate::network::transport::{MembershipEpoch, NodeRole, NodeRoleSet};
-use crate::schema::NodeId;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
+use crate::schema::{Locality, NodeId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
@@ -45,16 +45,13 @@ use tokio::sync::watch;
 /// at 64000 positions (≈1 MiB), trivial to binary-search.
 pub const VNODES_PER_NODE: usize = 64;
 
-/// Stable HighwayHash seed used when placing a node id onto the
-/// ring. Distinct from the key-hashing seed so node placement and
-/// key routing do not accidentally correlate when both pass
-/// through the same hasher.
-const RING_HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5245_4E44_454C_4F4E,
-	0x5249_4E47_5649_4E44,
-	0x4841_5348_5345_4544,
-	0x554E_4946_4945_4441,
-]);
+/// Stable BLAKE3 key used when placing node ids onto the ring.
+///
+/// This keeps vnode placement deterministic while letting W1 drop
+/// the legacy non-BLAKE3 vnode hash implementation entirely. Record `Identity` hashing remains
+/// a separate helper; vnode placement only consumes the first
+/// 64 bits of this domain-separated digest.
+const RING_BLAKE3_KEY: [u8; 32] = *b"wendelon-ring-vnode-hash-key-v1!";
 
 // ============================================================
 //  RING STATE
@@ -146,20 +143,20 @@ impl RingState {
 		self.data_count
 	}
 
-	/// Replica set resolution. See [`ReplicaRouter::replicas`] for
+	/// Replica set resolution. See [`ReplicaRouter::replicas_for_locality`] for
 	/// the contract — this is the data-ring implementation.
-	fn replicas_for(&self, key_hash: u64) -> Vec<NodeId> {
+	fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
 		if self.positions.is_empty() || self.data_count == 0 {
 			return Vec::new();
 		}
 		let want = self.rf.min(self.data_count);
 		let mut out: Vec<NodeId> = Vec::with_capacity(want);
 
-		// Binary search for the first position >= key_hash. Clockwise
+		// Binary search for the first position >= locality. Clockwise
 		// walk means we start at that index and wrap around the end.
 		let start = self
 			.positions
-			.binary_search_by(|(h, _)| h.cmp(&key_hash))
+			.binary_search_by(|(h, _)| h.cmp(&locality.get()))
 			.unwrap_or_else(|ins| ins);
 
 		let n = self.positions.len();
@@ -204,7 +201,7 @@ impl RingState {
 
 		let mut out: Vec<ReplicaSegment> = Vec::new();
 		for i in 0..self.positions.len() {
-			let replicas = self.replicas_for(self.positions[i].0);
+			let replicas = self.replicas_for_locality(Locality::new(self.positions[i].0));
 			if replicas.is_empty() {
 				continue;
 			}
@@ -219,7 +216,7 @@ impl RingState {
 
 		let wrap_start = self.positions[self.positions.len() - 1].0.saturating_add(1);
 		if wrap_start != 0 {
-			let replicas = self.replicas_for(self.positions[0].0);
+			let replicas = self.replicas_for_locality(Locality::new(self.positions[0].0));
 			if !replicas.is_empty() {
 				push_or_merge_segment(&mut out, wrap_start, u64::MAX, replicas);
 			}
@@ -235,10 +232,11 @@ impl RingState {
 		self.epoch
 	}
 
-	/// All inclusive `[start, end]` key_hash ranges for which
+	/// All inclusive `[start, end]` locality ranges for which
 	/// `node` is the *primary* (first data-capable replica). The
 	/// primary is defined as the first entry that
-	/// [`Self::replicas_for`] would return at any key in the range.
+	/// [`Self::replicas_for_locality`] would return at any point in
+	/// the range.
 	///
 	/// Returned ranges are sorted by `start` and collapsed so two
 	/// adjacent vnodes owned by the same primary are merged into a
@@ -256,8 +254,8 @@ impl RingState {
 		let n = self.positions.len();
 		let mut out: Vec<(u64, u64)> = Vec::new();
 		for i in 0..n {
-			let slot_key = self.positions[i].0;
-			let primaries = self.replicas_for(slot_key);
+			let slot_locality = Locality::new(self.positions[i].0);
+			let primaries = self.replicas_for_locality(slot_locality);
 			let Some(primary) = primaries.first() else {
 				continue;
 			};
@@ -276,7 +274,7 @@ impl RingState {
 			} else {
 				self.positions[i - 1].0.saturating_add(1)
 			};
-			out.push((prev_end, slot_key));
+			out.push((prev_end, slot_locality.get()));
 		}
 		out.sort_by_key(|(s, _)| *s);
 		// Merge adjacent ranges owned by the same primary — reduces
@@ -340,6 +338,11 @@ impl RingRouter {
 		self.snapshot().primary_ranges_for(node)
 	}
 
+	/// Convenience delegate for [`RingState::replicas_for_locality`].
+	pub fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
+		self.snapshot().replicas_for_locality(locality)
+	}
+
 	/// Epoch of the currently installed ring state.
 	pub fn current_epoch(&self) -> u64 {
 		self.snapshot().epoch()
@@ -359,8 +362,8 @@ impl RingRouter {
 		rf: usize,
 	) -> tokio::task::JoinHandle<()> {
 		// Apply the current snapshot synchronously so readers that
-		// call `replicas` before the task runs see the seed epoch
-		// instead of the default-empty ring.
+		// call `replicas_for_locality` before the task runs see the
+		// seed epoch instead of the default-empty ring.
 		{
 			let membership = rx.borrow().clone();
 			self.install(RingState::build(&membership, rf));
@@ -375,8 +378,8 @@ impl RingRouter {
 }
 
 impl ReplicaRouter for RingRouter {
-	fn replicas(&self, key_hash: u64) -> Vec<NodeId> {
-		self.snapshot().replicas_for(key_hash)
+	fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
+		self.snapshot().replicas_for_locality(locality)
 	}
 
 	fn replication_factor(&self) -> usize {
@@ -392,10 +395,13 @@ impl ReplicaRouter for RingRouter {
 /// node in the cluster so `node A` and `node B` agree on where
 /// `node C`'s vnodes land.
 fn vnode_hash(node: NodeId, vnode_idx: u64) -> u64 {
-	let mut hasher = HighwayHasher::new(RING_HIGHWAY_KEY);
-	hasher.append(&node.id.to_le_bytes());
-	hasher.append(&vnode_idx.to_le_bytes());
-	hasher.finalize64()
+	let mut hasher = blake3::Hasher::new_keyed(&RING_BLAKE3_KEY);
+	hasher.update(&node.id.to_le_bytes());
+	hasher.update(&vnode_idx.to_le_bytes());
+	let digest = hasher.finalize();
+	let mut bytes = [0u8; 8];
+	bytes.copy_from_slice(&digest.as_bytes()[..8]);
+	u64::from_le_bytes(bytes)
 }
 
 fn push_or_merge_segment(
@@ -468,8 +474,8 @@ mod tests {
 	#[test]
 	fn empty_ring_returns_no_replicas() {
 		let router = RingRouter::new(RingState::empty());
-		assert!(router.replicas(0).is_empty());
-		assert!(router.replicas(u64::MAX).is_empty());
+		assert!(router.replicas_for_locality(Locality::ZERO).is_empty());
+		assert!(router.replicas_for_locality(Locality::MAX).is_empty());
 		assert_eq!(router.replication_factor(), 1);
 	}
 
@@ -483,7 +489,7 @@ mod tests {
 			(5, data_caps()),
 		]);
 		let router = RingRouter::new(RingState::build(&m, 3));
-		let replicas = router.replicas(0xDEAD_BEEF_CAFE_0001);
+		let replicas = router.replicas_for_locality(Locality::new(0xDEAD_BEEF_CAFE_0001));
 		assert_eq!(replicas.len(), 3);
 		// Distinct node ids across the replica set — the vnode
 		// dedup must collapse repeated walks to the same physical.
@@ -499,7 +505,7 @@ mod tests {
 		// via wraparound.
 		let m = membership_of(vec![(1, data_caps()), (2, data_caps())]);
 		let router = RingRouter::new(RingState::build(&m, 2));
-		let replicas = router.replicas(u64::MAX);
+		let replicas = router.replicas_for_locality(Locality::MAX);
 		assert_eq!(replicas.len(), 2);
 	}
 
@@ -513,7 +519,7 @@ mod tests {
 			(3, control_only_caps()),
 		]);
 		let router = RingRouter::new(RingState::build(&m, 3));
-		let replicas = router.replicas(42);
+		let replicas = router.replicas_for_locality(Locality::new(42));
 		assert_eq!(replicas.len(), 1);
 		assert_eq!(replicas[0], n(2));
 		assert_eq!(router.replication_factor(), 1);
@@ -524,7 +530,7 @@ mod tests {
 		// Ring walk must terminate even though RF=5 > data_count=2.
 		let m = membership_of(vec![(1, data_caps()), (2, data_caps())]);
 		let router = RingRouter::new(RingState::build(&m, 5));
-		let replicas = router.replicas(7);
+		let replicas = router.replicas_for_locality(Locality::new(7));
 		assert_eq!(replicas.len(), 2);
 	}
 
@@ -534,8 +540,8 @@ mod tests {
 		// same (ordered) replica set every call.
 		let m = membership_of(vec![(1, data_caps()), (2, data_caps()), (3, data_caps())]);
 		let router = RingRouter::new(RingState::build(&m, 3));
-		let a = router.replicas(0xABCD_1234);
-		let b = router.replicas(0xABCD_1234);
+		let a = router.replicas_for_locality(Locality::new(0xABCD_1234));
+		let b = router.replicas_for_locality(Locality::new(0xABCD_1234));
 		assert_eq!(a, b);
 	}
 
@@ -543,7 +549,7 @@ mod tests {
 	fn install_swaps_ring_atomically() {
 		let m1 = membership_of(vec![(1, data_caps())]);
 		let router = RingRouter::new(RingState::build(&m1, 1));
-		assert_eq!(router.replicas(0).len(), 1);
+		assert_eq!(router.replicas_for_locality(Locality::ZERO).len(), 1);
 
 		let m2 = membership_of(vec![
 			(10, data_caps()),
@@ -551,7 +557,7 @@ mod tests {
 			(12, data_caps()),
 		]);
 		router.install(RingState::build(&m2, 3));
-		let replicas = router.replicas(0);
+		let replicas = router.replicas_for_locality(Locality::ZERO);
 		assert_eq!(replicas.len(), 3);
 		for r in &replicas {
 			assert!([10, 11, 12].contains(&r.id));
@@ -566,7 +572,7 @@ mod tests {
 		let handle = router.clone().spawn_updater(rx, 2);
 
 		// Seed ring was empty, so no replicas yet.
-		assert!(router.replicas(0).is_empty());
+		assert!(router.replicas_for_locality(Locality::ZERO).is_empty());
 
 		// Publish a fresh epoch with two data nodes — the task
 		// observes the change and installs the new ring.
@@ -575,11 +581,11 @@ mod tests {
 		// Yield so the updater can drain the change.
 		for _ in 0..32 {
 			tokio::task::yield_now().await;
-			if !router.replicas(0).is_empty() {
+			if !router.replicas_for_locality(Locality::ZERO).is_empty() {
 				break;
 			}
 		}
-		assert_eq!(router.replicas(0).len(), 2);
+		assert_eq!(router.replicas_for_locality(Locality::ZERO).len(), 2);
 
 		// Dropping the sender terminates the updater cleanly.
 		drop(tx);
@@ -591,7 +597,7 @@ mod tests {
 		let m = membership_of(vec![(1, data_caps())]);
 		let router = RingRouter::new(RingState::build(&m, 0));
 		assert_eq!(router.replication_factor(), 1);
-		assert_eq!(router.replicas(0).len(), 1);
+		assert_eq!(router.replicas_for_locality(Locality::ZERO).len(), 1);
 	}
 
 	#[test]
@@ -624,10 +630,25 @@ mod tests {
 			let ranges = state.primary_ranges_for(n(node_id));
 			for (s, e) in &ranges {
 				// Both endpoints map back to the same node via
-				// `replicas_for` — the ranges really do describe
+				// `replicas_for_locality` — the ranges really do
+				// describe
 				// this node's primary ownership.
-				assert_eq!(state.replicas_for(*s).first().unwrap().id, node_id);
-				assert_eq!(state.replicas_for(*e).first().unwrap().id, node_id);
+				assert_eq!(
+					state
+						.replicas_for_locality(Locality::new(*s))
+						.first()
+						.unwrap()
+						.id,
+					node_id
+				);
+				assert_eq!(
+					state
+						.replicas_for_locality(Locality::new(*e))
+						.first()
+						.unwrap()
+						.id,
+					node_id
+				);
 			}
 		}
 	}

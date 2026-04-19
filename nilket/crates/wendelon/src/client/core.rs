@@ -8,7 +8,7 @@
 //!    projection of the Unified Hash Ring (ADR 002) — the
 //!    bootstrap topology plus whatever the Control Ring's status
 //!    RPC said last — so it can dial the exact replica that owns
-//!    a given `key_hash` without a proxy hop.
+//!    a given routing locality without a proxy hop.
 //! 2. **Zero-copy querying.** Pushdown scans ship a WPBC program
 //!    (ADR 005) in a custom HRFT frame (ADR 004) straight to a
 //!    data node; the server evaluates the program against its
@@ -41,7 +41,6 @@
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
-use crate::network::data_server::ReplicaRouter;
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::{RingRouter, RingState};
@@ -50,29 +49,20 @@ use crate::network::transport::{
 	TransportStream, TransportTier, TransportTierSet,
 };
 use crate::schema::{
-	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType,
-	NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	WriteRequestMeta, WriteResponseMeta, WriteStatus, read_key_schema, read_value_schema,
-	write_payload_schema,
+	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
+	Locality, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	read_key_schema, read_value_schema, write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::watch;
-
-/// Stable key-hash seed shared with the Data Ring.
-const HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5745_4e44_454c_4f4e,
-	0x4841_5348_4b45_5901,
-	0x4441_5441_5249_4e47,
-	0x5354_454c_4c41_524f,
-]);
 
 /// Maximum number of client attempts for a single logical data
 /// operation before surfacing the last non-success status.
@@ -220,10 +210,10 @@ impl WendelonClient {
 		let _ = self.topology_tx.send(Arc::new(membership));
 	}
 
-	/// Replicas that should own `key_hash`. Returned in the
+	/// Replicas that should own `locality`. Returned in the
 	/// deterministic order the current router produces.
-	pub fn replicas_for(&self, key_hash: u64) -> Vec<NodeId> {
-		self.router.replicas(key_hash)
+	pub fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
+		self.router.replicas_for_locality(locality)
 	}
 
 	/// Best known leader for the cluster. `None` while the cluster
@@ -342,10 +332,10 @@ impl WendelonClient {
 	/// status.
 	pub async fn write(&self, request: WriteRequest) -> std::io::Result<WriteResult> {
 		validate_write_request_batch(&request.meta, &request.payload)?;
-		let key_hash = key_hash_from_batch(&request.payload, "key")?;
+		let key_locality = key_locality_from_batch(&request.payload, "key")?;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
-			let target = preferred_target.unwrap_or(self.target_for_key_hash(key_hash)?);
+			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
 			let result = self.write_once(target, &request).await?;
 			self.observe_write_response(&result.response);
 			let Some(retry) = retry_write_response(&result.response) else {
@@ -354,7 +344,7 @@ impl WendelonClient {
 			if attempt + 1 == DATA_RETRY_BUDGET {
 				return Ok(result);
 			}
-			self.prepare_retry(Some(key_hash), retry).await?;
+			self.prepare_retry(Some(key_locality), retry).await?;
 			preferred_target = retry.preferred_target;
 		}
 		unreachable!("bounded retry loop must return within budget")
@@ -365,10 +355,10 @@ impl WendelonClient {
 	/// Arrow value batch in `ReadResult.value`.
 	pub async fn read(&self, request: ReadRequest) -> std::io::Result<ReadResult> {
 		validate_read_request_batch(&request.meta, &request.key)?;
-		let key_hash = key_hash_from_batch(&request.key, "key")?;
+		let key_locality = key_locality_from_batch(&request.key, "key")?;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
-			let target = preferred_target.unwrap_or(self.target_for_key_hash(key_hash)?);
+			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
 			let result = self.read_once(target, &request).await?;
 			self.observe_read_response(&result.response);
 			let Some(retry) = retry_read_response(&result.response) else {
@@ -377,7 +367,7 @@ impl WendelonClient {
 			if attempt + 1 == DATA_RETRY_BUDGET {
 				return Ok(result);
 			}
-			self.prepare_retry(Some(key_hash), retry).await?;
+			self.prepare_retry(Some(key_locality), retry).await?;
 			preferred_target = retry.preferred_target;
 		}
 		unreachable!("bounded retry loop must return within budget")
@@ -400,8 +390,8 @@ impl WendelonClient {
 		let mut group_index: HashMap<NodeId, usize> = HashMap::new();
 		for (index, request) in requests.into_iter().enumerate() {
 			validate_write_request_batch(&request.meta, &request.payload)?;
-			let key_hash = key_hash_from_batch(&request.payload, "key")?;
-			let target = self.target_for_key_hash(key_hash)?;
+			let key_locality = key_locality_from_batch(&request.payload, "key")?;
+			let target = self.target_for_locality(key_locality)?;
 			let slot = if let Some(existing) = group_index.get(&target).copied() {
 				existing
 			} else {
@@ -449,8 +439,8 @@ impl WendelonClient {
 			.collect()
 	}
 
-	fn target_for_key_hash(&self, key_hash: u64) -> std::io::Result<NodeId> {
-		self.pick_target(key_hash).ok_or_else(|| {
+	fn target_for_locality(&self, locality: Locality) -> std::io::Result<NodeId> {
+		self.pick_target(locality).ok_or_else(|| {
 			Error::new(
 				ErrorKind::NotFound,
 				"no replica available for the requested key range",
@@ -592,11 +582,11 @@ impl WendelonClient {
 
 	async fn prepare_retry(
 		&self,
-		key_hash: Option<u64>,
+		locality: Option<Locality>,
 		retry: RetryDirective,
 	) -> std::io::Result<()> {
 		if retry.refresh_topology {
-			let candidates = self.retry_candidates(key_hash, retry.preferred_target);
+			let candidates = self.retry_candidates(locality, retry.preferred_target);
 			if let Err(err) = self.refresh_topology_with_candidates(&candidates).await {
 				if retry.preferred_target.is_none() {
 					return Err(err);
@@ -609,7 +599,11 @@ impl WendelonClient {
 		Ok(())
 	}
 
-	fn retry_candidates(&self, key_hash: Option<u64>, preferred: Option<NodeId>) -> Vec<NodeId> {
+	fn retry_candidates(
+		&self,
+		locality: Option<Locality>,
+		preferred: Option<NodeId>,
+	) -> Vec<NodeId> {
 		let mut candidates = Vec::new();
 		let mut push = |node: Option<NodeId>| {
 			if let Some(node) = node {
@@ -624,8 +618,8 @@ impl WendelonClient {
 		};
 		push(preferred);
 		push(self.leader());
-		if let Some(key_hash) = key_hash {
-			for replica in self.replicas_for(key_hash) {
+		if let Some(locality) = locality {
+			for replica in self.replicas_for_locality(locality) {
 				push(Some(replica));
 			}
 		}
@@ -637,32 +631,35 @@ impl WendelonClient {
 //  QUERY API
 // ============================================================
 
-/// Inclusive key-hash range for a pushdown scan.
+/// Inclusive routing-locality range for a pushdown scan.
 ///
-/// Wendelon routes keys by `HighwayHash(key_bytes)`; the client
-/// compiles its user-facing range into hash bounds at call time.
-/// `start == end` collapses to a single-key point scan.
+/// Wendelon routes records by the 64-bit `Locality` projection of
+/// their 256-bit `Identity`. `start == end` collapses to a single
+/// locality bucket / point scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyRange {
-	pub start_hash: u64,
-	pub end_hash: u64,
+pub struct QueryLocalityRange {
+	pub start_locality: Locality,
+	pub end_locality: Locality,
 }
 
-impl KeyRange {
-	pub fn point(key_hash: u64) -> Self {
+impl QueryLocalityRange {
+	pub fn point(locality: impl Into<Locality>) -> Self {
+		let locality = locality.into();
 		Self {
-			start_hash: key_hash,
-			end_hash: key_hash,
+			start_locality: locality,
+			end_locality: locality,
 		}
 	}
 
 	pub fn full() -> Self {
 		Self {
-			start_hash: 0,
-			end_hash: u64::MAX,
+			start_locality: Locality::ZERO,
+			end_locality: Locality::MAX,
 		}
 	}
 }
+
+pub type KeyRange = QueryLocalityRange;
 
 /// Streaming query cursor over one or more `QUERY_RESP` frames.
 ///
@@ -750,14 +747,15 @@ impl StreamingQueryResult {
 }
 
 impl WendelonClient {
-	/// Push a WPBC program to the replica that owns `range.start_hash`
+	/// Push a WPBC program to the replica that owns
+	/// `range.start_locality`
 	/// and stream the filtered Arrow IPC result back.
 	///
 	/// * `wpbc_ast` — raw WPBC bytecode. Empty is legal and means
 	///   "no filter, no projection".
-	/// * `range` — inclusive key-hash window. V1 targets the
-	///   owner of `start_hash`; a true cross-replica scan fan-out
-	///   is deferred.
+	/// * `range` — inclusive locality window. V1 targets the owner
+	///   of `start_locality`; a true cross-replica scan fan-out is
+	///   deferred.
 	/// * `expected_epoch` / `min_hlc` / `consistency` carry the
 	///   client's freshness bound straight through to the server.
 	/// * `as_of_hlc` is the ADR 013 time-travel upper bound. The
@@ -771,8 +769,9 @@ impl WendelonClient {
 	/// surface is terminal.
 	pub async fn query(
 		&self,
+		tenant_id: TenantId,
 		wpbc_ast: Vec<u8>,
-		range: KeyRange,
+		range: QueryLocalityRange,
 		expected_epoch: u64,
 		min_hlc: HybridTimestamp,
 		consistency: Consistency,
@@ -781,10 +780,11 @@ impl WendelonClient {
 		let meta = QueryRequestMeta {
 			min_hlc,
 			expected_epoch,
+			tenant_id,
 			consistency,
 			_pad: [0; 7],
-			key_range_start: range.start_hash,
-			key_range_end: range.end_hash,
+			locality_range_start: range.start_locality.get(),
+			locality_range_end: range.end_locality.get(),
 			bytecode_len: wpbc_ast.len() as u32,
 			_pad2: [0; 4],
 			as_of_hlc,
@@ -792,14 +792,16 @@ impl WendelonClient {
 
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
-			let target = preferred_target.unwrap_or(self.target_for_key_hash(range.start_hash)?);
+			let target =
+				preferred_target.unwrap_or(self.target_for_locality(range.start_locality)?);
 			match self.query_once(target, &meta, &wpbc_ast).await? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
 						return Err(retry.exhausted_query_error());
 					}
-					self.prepare_retry(Some(range.start_hash), retry).await?;
+					self.prepare_retry(Some(range.start_locality), retry)
+						.await?;
 					preferred_target = retry.preferred_target;
 				}
 			}
@@ -808,12 +810,12 @@ impl WendelonClient {
 	}
 
 	/// First-pass dispatch target: the head of the replica set for
-	/// `key_hash`, preferring the local leader when the leader is
+	/// `locality`, preferring the local leader when the leader is
 	/// actually a replica for that range. Returns `None` when the
 	/// router has no nodes — callers surface that as a clean
 	/// `NotFound` so the topology can be re-probed.
-	fn pick_target(&self, key_hash: u64) -> Option<NodeId> {
-		let replicas = self.replicas_for(key_hash);
+	fn pick_target(&self, locality: Locality) -> Option<NodeId> {
+		let replicas = self.replicas_for_locality(locality);
 		if replicas.is_empty() {
 			return None;
 		}
@@ -1204,14 +1206,12 @@ fn extract_first_binary<'a>(
 	Ok(arr.value(0))
 }
 
-fn key_hash_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<u64> {
-	Ok(highway_hash(extract_first_binary(batch, column)?))
+fn key_identity_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<Identity> {
+	Ok(Identity::blake3(extract_first_binary(batch, column)?))
 }
 
-fn highway_hash(bytes: &[u8]) -> u64 {
-	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
-	hasher.append(bytes);
-	hasher.finalize64()
+fn key_locality_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<Locality> {
+	Ok(Locality::from(key_identity_from_batch(batch, column)?))
 }
 
 // ============================================================
@@ -1267,7 +1267,7 @@ mod tests {
 	async fn bootstrap_populates_router_and_leader() {
 		let snap = snapshot(5, Some(2), &[1, 2, 3]);
 		let client = WendelonClient::new(test_config(snap));
-		let replicas = client.replicas_for(0);
+		let replicas = client.replicas_for_locality(Locality::ZERO);
 		assert_eq!(replicas.len(), 3);
 		assert_eq!(
 			client.leader(),
@@ -1299,7 +1299,7 @@ mod tests {
 
 		client.refresh_topology().await.unwrap();
 
-		let replicas = client.replicas_for(0);
+		let replicas = client.replicas_for_locality(Locality::ZERO);
 		// With 4 nodes and RF=3 we always see 3 distinct replicas;
 		// the important invariant is that node 4 is now reachable.
 		let ids: Vec<u32> = replicas.iter().map(|n| n.id).collect();
@@ -1320,9 +1320,10 @@ mod tests {
 		// Exhaust hashes until we find one whose replica set
 		// contains node 2; then assert pick_target chose node 2.
 		for h in 0u64..32 {
-			let replicas = client.replicas_for(h);
+			let locality = Locality::new(h);
+			let replicas = client.replicas_for_locality(locality);
 			if replicas.iter().any(|n| n.id == 2) {
-				let picked = client.pick_target(h).unwrap();
+				let picked = client.pick_target(locality).unwrap();
 				assert_eq!(picked.id, 2);
 				return;
 			}
@@ -1350,16 +1351,16 @@ mod tests {
 		client.apply_snapshot(&replacement);
 		assert_eq!(client.replication_factor(), 5);
 		assert_eq!(client.leader(), None);
-		assert_eq!(client.replicas_for(0).len(), 5);
+		assert_eq!(client.replicas_for_locality(Locality::ZERO).len(), 5);
 	}
 
 	#[test]
 	fn key_range_helpers() {
 		let p = KeyRange::point(42);
-		assert_eq!(p.start_hash, 42);
-		assert_eq!(p.end_hash, 42);
+		assert_eq!(p.start_locality, Locality::new(42));
+		assert_eq!(p.end_locality, Locality::new(42));
 		let f = KeyRange::full();
-		assert_eq!(f.start_hash, 0);
-		assert_eq!(f.end_hash, u64::MAX);
+		assert_eq!(f.start_locality, Locality::ZERO);
+		assert_eq!(f.end_locality, Locality::MAX);
 	}
 }

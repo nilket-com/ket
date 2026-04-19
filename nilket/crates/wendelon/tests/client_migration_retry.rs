@@ -18,8 +18,13 @@ use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, Transpo
 use wendelon::schema::{
 	ClientWriteId, Consistency, DurabilityLevel, FRAME_FLAG_STREAM_END, FrameHeader,
 	HybridTimestamp, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, WriteRequestMeta, read_key_schema, write_payload_schema,
+	ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, read_key_schema,
+	write_payload_schema,
 };
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -69,6 +74,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 		},
 		client_hlc: hlc(5_000 + sequence_no, 0, 77),
 		expected_epoch: epoch,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -91,6 +97,7 @@ fn read_meta(
 	ReadRequestMeta {
 		min_hlc,
 		expected_epoch,
+		tenant_id: tenant(),
 		consistency,
 		_pad: [0; 3],
 		key_len: key.len() as u32,
@@ -373,6 +380,7 @@ async fn client_retries_query_after_migration_incomplete() {
 	let start = tokio::time::Instant::now();
 	let batches = client
 		.query(
+			tenant(),
 			Vec::new(),
 			KeyRange::full(),
 			1,
@@ -427,6 +435,7 @@ async fn client_reports_query_migration_incomplete_after_retry_budget() {
 	let start = tokio::time::Instant::now();
 	let err = client
 		.query(
+			tenant(),
 			Vec::new(),
 			KeyRange::full(),
 			1,

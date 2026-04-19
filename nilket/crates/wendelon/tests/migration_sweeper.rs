@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use wendelon::consensus::{MigrationLedgerEntry, MigrationState, SeedMigration, WendelonRequest};
 use wendelon::network::data_server::WendelonDataServer;
 use wendelon::network::server::HrftService;
-use wendelon::schema::{HybridTimestamp, MsgType, NodeId, write_payload_schema};
+use wendelon::schema::{
+	HybridTimestamp, Identity, MsgType, NodeId, TenantId, write_payload_schema,
+};
 use wendelon::storage::core::StorageEngine;
 use wendelon::storage::manager::SlabManager;
 
@@ -35,10 +37,22 @@ fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
 	.unwrap()
 }
 
-async fn seed_source(slab: &SlabManager, key_hash: u64, ts: HybridTimestamp, value: &[u8]) {
-	let batch = kv_batch(&key_hash.to_le_bytes(), value);
+fn id(locality: u64) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality.to_le_bytes());
+	Identity::new(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
+
+async fn seed_source(slab: &SlabManager, locality: u64, ts: HybridTimestamp, value: &[u8]) {
+	let batch = kv_batch(&locality.to_le_bytes(), value);
 	let bytes = support::encode_batch(&batch).unwrap();
-	slab.append(key_hash, ts, &bytes).await.unwrap();
+	slab.append(tenant(), id(locality), ts, &bytes)
+		.await
+		.unwrap();
 }
 
 fn ledger_entry(
@@ -102,7 +116,7 @@ async fn wait_for_key_count(
 	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 	loop {
 		let mut keys: Vec<u64> = slab
-			.scan_as_of(range_start, range_end, as_of)
+			.scan_as_of(tenant(), range_start, range_end, as_of)
 			.into_iter()
 			.map(|(key, _)| key)
 			.collect();

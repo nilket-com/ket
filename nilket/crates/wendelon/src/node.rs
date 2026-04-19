@@ -33,7 +33,7 @@ use crate::consensus::monitor::{
 use crate::consensus::raft_network::WendelonRaftNetworkFactory;
 use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
-	DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
+	CheckpointCoordinator, DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
 use crate::network::control_server::{
 	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer, select_bootstrap_epoch,
@@ -60,6 +60,8 @@ use crate::network::transport::{
 };
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow};
+use crate::storage::GroupCommitConfig;
+use crate::storage::ManagerTierObserver;
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{SlabManager, SlabManagerConfig};
@@ -102,6 +104,8 @@ pub struct NodeBootstrapConfig {
 	pub data_dir: PathBuf,
 	/// Seal threshold in bytes; rolls the active slab once exceeded.
 	pub slab_max_bytes: u64,
+	/// ADR 016 coalescing window for data-path durable writes.
+	pub group_commit: GroupCommitConfig,
 	/// Replication factor published into the ring. Single-node
 	/// deployments run at RF=1; production minimum is 3.
 	pub rf: usize,
@@ -149,6 +153,7 @@ impl NodeBootstrapConfig {
 			node_id,
 			data_dir,
 			slab_max_bytes: 64 * 1024 * 1024,
+			group_commit: GroupCommitConfig::default(),
 			rf: 1,
 			io_depth: 64,
 			advertise_address,
@@ -187,6 +192,24 @@ impl NodeBootstrapConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"slab_max_bytes must be greater than zero",
+			));
+		}
+		if self.group_commit.floor.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"group_commit.floor must be greater than zero",
+			));
+		}
+		if self.group_commit.per_write_cost_estimate.is_zero() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"group_commit.per_write_cost_estimate must be greater than zero",
+			));
+		}
+		if self.group_commit.ceiling < self.group_commit.floor {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"group_commit.ceiling must be greater than or equal to group_commit.floor",
 			));
 		}
 		if self.rf == 0 {
@@ -297,6 +320,7 @@ pub struct NodeHandles {
 	pub lease_manager: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
+	pub checkpoint_emitter: JoinHandle<()>,
 }
 
 impl NodeHandles {
@@ -307,6 +331,7 @@ impl NodeHandles {
 		self.lease_manager.abort();
 		self.epoch_reconciler.abort();
 		self.migration_sweeper.abort();
+		self.checkpoint_emitter.abort();
 	}
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
@@ -317,6 +342,7 @@ impl NodeHandles {
 		await_background_task(self.lease_manager, "lease manager").await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
+		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
 	}
 }
@@ -426,19 +452,31 @@ impl WendelonNode {
 
 		// 3. L1 slab storage.
 		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
-		let slab = Arc::new(SlabManager::open(SlabManagerConfig {
-			dir: cfg.data_dir.clone(),
-			max_slab_bytes: cfg.slab_max_bytes,
-			io: io.clone(),
-			l2,
-			rehydration: crate::storage::manager::RehydrationPolicy::default(),
-		})?);
+		let slab: Arc<SlabManager> = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: cfg.data_dir.clone(),
+				max_slab_bytes: cfg.slab_max_bytes,
+				io: io.clone(),
+				l2,
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: cfg.group_commit.clone(),
+			})
+			.await?,
+		);
 
 		// 4. Durable Raft storage + recovered state machine.
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
-		let log_store = WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, io.clone())?;
+		let log_store =
+			WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, io.clone()).await?;
 		let bootstrap_mode = log_store.bootstrap_mode().await;
-		let state_machine = log_store.recovered_state_machine().await?;
+		let checkpoint_coordinator = CheckpointCoordinator::new(log_store.clone());
+		let tier_observer = Arc::new(ManagerTierObserver::new(slab.clone()));
+		let state_machine = log_store
+			.recovered_state_machine()
+			.await?
+			.with_tier_observer(tier_observer)
+			.with_checkpoint_observer(checkpoint_coordinator.clone());
+		let checkpoint_emitter = checkpoint_coordinator.spawn();
 
 		// 5. Seed membership epoch from durable history if present;
 		//    otherwise fall back to the single-node genesis epoch.
@@ -447,6 +485,24 @@ impl WendelonNode {
 		//    epoch until the reconciler finishes auto-seeding.
 		let fallback_epoch = seed_single_node_epoch(local_node, &cfg.advertise_address);
 		let recovered_state = state_machine.state_snapshot().await;
+		let mut recovered_tiers = recovered_state
+			.tiered_slabs
+			.values()
+			.cloned()
+			.collect::<Vec<_>>();
+		let recovered_log_index = recovered_state.last_applied_log_id.map(|id| id.index);
+		recovered_tiers.sort_by_key(|tier| tier.slab_id);
+		for tier in recovered_tiers {
+			slab.reconcile_tiered_slab(
+				crate::storage::TieredSlabPointer {
+					slab_id: tier.slab_id,
+					l2_uri: tier.l2_uri,
+					payload_hash: tier.payload_hash,
+				},
+				recovered_log_index,
+			)
+			.await?;
+		}
 		let seed_epoch = select_bootstrap_epoch(&recovered_state, &fallback_epoch, cfg.rf)?;
 		let (epoch_tx, epoch_rx) = watch::channel(Arc::new(seed_epoch));
 
@@ -665,6 +721,7 @@ impl WendelonNode {
 				lease_manager,
 				epoch_reconciler,
 				migration_sweeper,
+				checkpoint_emitter,
 			},
 		})
 	}
@@ -1024,12 +1081,14 @@ impl TransportProvider for NoDialTransportProvider {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::consensus::TieredSlab;
 	use crate::consensus::WendelonRequest;
 	use crate::consensus::monitor::{
 		DriftCheck, EVICTION_THRESHOLD, EvictionDecision, MAX_OFFSET_MS, check_drift_once,
 		sweep_evictions_once,
 	};
-	use crate::schema::{FinalizationMarker, HybridTimestamp};
+	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, TenantId};
+	use crate::storage::StorageEngine;
 	use std::time::Duration;
 
 	fn tempdir(tag: &str) -> PathBuf {
@@ -1095,7 +1154,8 @@ mod tests {
 				commit_hlc,
 				payload_hash: [0; 32],
 				e_safe_index: 2,
-				_reserved: 0,
+				durability: crate::schema::DurabilityLevel::QUORUM,
+				_pad: [0; 7],
 			}))
 			.await
 			.unwrap();
@@ -1115,6 +1175,7 @@ mod tests {
 		node.handles.lease_manager.abort();
 		node.handles.epoch_reconciler.abort();
 		node.handles.migration_sweeper.abort();
+		node.handles.checkpoint_emitter.abort();
 		drop(node);
 		tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -1142,6 +1203,112 @@ mod tests {
 		recovered.handles.lease_manager.abort();
 		recovered.handles.epoch_reconciler.abort();
 		recovered.handles.migration_sweeper.abort();
+		recovered.handles.checkpoint_emitter.abort();
+	}
+
+	#[tokio::test]
+	async fn single_node_bootstrap_reconciles_tiered_slabs_from_recovered_state() {
+		let dir = tempdir("restart-tiered");
+		let l2_dir = tempdir("restart-tiered-l2");
+		let mut cfg = NodeBootstrapConfig::dev(12, dir.clone(), "127.0.0.1:0".into());
+		cfg.slab_max_bytes = 1;
+		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
+			root: l2_dir.clone(),
+		});
+		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+
+		wait_for_local_leader(&node).await;
+
+		let tenant_id = TenantId::ZERO;
+		let tiered_key = Identity::blake3(b"tiered-row");
+		let active_key = Identity::blake3(b"active-row");
+		let tiered_bytes = b"tiered-row".to_vec();
+		node.slab
+			.append(
+				tenant_id,
+				tiered_key,
+				HybridTimestamp {
+					physical_ms: 10,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				&tiered_bytes,
+			)
+			.await
+			.unwrap();
+		node.slab
+			.append(
+				tenant_id,
+				active_key,
+				HybridTimestamp {
+					physical_ms: 20,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"active-row",
+			)
+			.await
+			.unwrap();
+		node.slab.fsync_all_local_slabs().await.unwrap();
+
+		let sealed = node.slab.list_sealed_slabs().await;
+		assert_eq!(sealed.len(), 1, "expected one sealed slab after rotation");
+		let sealed_id = sealed[0].slab_id;
+		let raw = node.slab.read_sealed_raw(sealed_id).await.unwrap();
+		let payload_hash = *blake3::hash(&raw).as_bytes();
+		let l2_uri = l2
+			.put(&format!("sealed/slab_{sealed_id:016x}.wnd"), &raw)
+			.await
+			.unwrap();
+
+		node.raft
+			.client_write(WendelonRequest::TierSlab(TieredSlab {
+				slab_id: sealed_id,
+				l2_uri,
+				payload_hash,
+			}))
+			.await
+			.unwrap();
+		assert!(node.slab.is_tiered(sealed_id).await);
+		assert!(
+			!dir.join(format!("slab_{sealed_id:016x}.wnd")).exists(),
+			"tiered slab should be unlinked from L1 after apply"
+		);
+
+		node.handles.ring_updater.abort();
+		node.handles.drift_monitor.abort();
+		node.handles.eviction_watchdog.abort();
+		node.handles.lease_manager.abort();
+		node.handles.epoch_reconciler.abort();
+		node.handles.migration_sweeper.abort();
+		node.handles.checkpoint_emitter.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let redb_path = dir.join("storage_index.redb");
+		if redb_path.exists() {
+			std::fs::remove_file(&redb_path).unwrap();
+		}
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		assert!(recovered.slab.is_tiered(sealed_id).await);
+		let location = recovered
+			.slab
+			.lookup(tenant_id, tiered_key)
+			.expect("tiered key should be restored from recovered state");
+		assert_eq!(location.slab_id, sealed_id);
+		assert_eq!(recovered.slab.read(location).await.unwrap(), tiered_bytes);
+
+		recovered.handles.ring_updater.abort();
+		recovered.handles.drift_monitor.abort();
+		recovered.handles.eviction_watchdog.abort();
+		recovered.handles.lease_manager.abort();
+		recovered.handles.epoch_reconciler.abort();
+		recovered.handles.migration_sweeper.abort();
+		recovered.handles.checkpoint_emitter.abort();
 	}
 
 	#[tokio::test]

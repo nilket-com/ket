@@ -1,0 +1,58 @@
+name: Rust CI
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rust-ci.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'ci/**'
+      - 'plans/**'
+      - 'src/**'
+      - 'tests/**'
+  pull_request:
+    paths:
+      - '.github/workflows/rust-ci.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'ci/**'
+      - 'plans/**'
+      - 'src/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ensure strace is present
+        run: sudo apt-get update && sudo apt-get install -y strace
+      - name: cargo check
+        run: cargo check
+      - name: Recovery tests
+        run: cargo test recovery_tests
+      - name: Bootstrap tests
+        run: cargo test single_node_bootstrap
+      - name: Backup/restore tests
+        run: cargo test --test backup_restore
+      - name: W1 grep sweeps
+        run: bash ci/check_w1_foundation_grep.sh
+      - name: W1 strace metadata sync check
+        run: bash ci/check_w1_wal_metadata_sync_strace.sh
+
+  dependency-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny
+        run: cargo deny --workspace --all-features check bans sources advisories

@@ -1,7 +1,7 @@
 //! Topology snapshot sourcing for the Smart Client SDK.
 //!
 //! The client keeps a local view of the Unified Hash Ring (ADR 002)
-//! so it can dial the right replicas for a given `key_hash` without
+//! so it can dial the right replicas for a given locality without
 //! bouncing every request through a proxy node. This module owns
 //! the two halves of that picture:
 //!

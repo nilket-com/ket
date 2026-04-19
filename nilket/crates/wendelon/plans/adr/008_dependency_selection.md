@@ -14,7 +14,7 @@ Wendelon will standardize on the following core dependency stack:
 - **Data Serialization:** `arrow` (IPC/RecordBatch) + `bytemuck` (Zero-copy PODs).
 - **Storage I/O:** `io-uring` (the low-level crate, *not* `tokio-uring`).
 - **Concurrent State:** `dashmap` (for the Idempotency Cache and Lease tracking).
-- **Hashing:** `highway` (Default ring hashing), `blake3` (Cryptographic alternative), + `rapidhash` (Extremely fast, non-cryptographic).
+- **Hashing:** `blake3` (Record identity and default vnode/locality hashing).
 - **Cryptography:** `ed25519-dalek` (for Transfer Tokens and Leases).
 
 ## Rationale

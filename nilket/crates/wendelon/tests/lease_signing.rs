@@ -12,9 +12,13 @@ use wendelon::network::{
 };
 use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	ClientWriteId, HybridTimestamp, LeaseDescriptor, WriteRequestMeta, WriteStatus,
+	ClientWriteId, HybridTimestamp, LeaseDescriptor, TenantId, WriteRequestMeta, WriteStatus,
 	write_payload_schema,
 };
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -47,6 +51,7 @@ fn write_meta(node_id: u32) -> WriteRequestMeta {
 		},
 		client_hlc: hlc(1, 0, node_id),
 		expected_epoch: 1,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: wendelon::schema::DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -78,6 +83,7 @@ fn bootstrap_cfg(
 		node_id,
 		data_dir: support::tempdir(tag),
 		slab_max_bytes: 64 * 1024 * 1024,
+		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		rf: 1,
 		io_depth: 64,
 		advertise_address: "127.0.0.1:0".into(),

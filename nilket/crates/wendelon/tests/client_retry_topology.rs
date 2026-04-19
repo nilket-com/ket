@@ -4,7 +4,6 @@ mod support;
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::io::{Error, ErrorKind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,17 +17,14 @@ use wendelon::network::ring::{RingRouter, RingState};
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::schema::{
-	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, MsgType, NodeId,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, WriteRequestMeta, WriteResponseMeta,
-	WriteStatus, read_key_schema, write_payload_schema,
+	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, Identity, Locality,
+	MsgType, NodeId, ReadRequestMeta, ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, read_key_schema, write_payload_schema,
 };
 
-const HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5745_4e44_454c_4f4e,
-	0x4841_5348_4b45_5901,
-	0x4441_5441_5249_4e47,
-	0x5354_454c_4c41_524f,
-]);
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -78,6 +74,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 		},
 		client_hlc: hlc(1_000 + sequence_no, 0, 55),
 		expected_epoch: epoch,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -100,6 +97,7 @@ fn read_meta(
 	ReadRequestMeta {
 		min_hlc,
 		expected_epoch,
+		tenant_id: tenant(),
 		consistency,
 		_pad: [0; 3],
 		key_len: key.len() as u32,
@@ -146,10 +144,8 @@ async fn refresh_leases(node: &wendelon::node::WendelonNode) {
 		.await;
 }
 
-fn highway_hash(bytes: &[u8]) -> u64 {
-	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
-	hasher.append(bytes);
-	hasher.finalize64()
+fn key_locality(bytes: &[u8]) -> u64 {
+	Locality::from(Identity::blake3(bytes)).get()
 }
 
 fn find_key_for_primary(snapshot: &ClusterStatusWire, target: NodeId) -> Vec<u8> {
@@ -161,7 +157,7 @@ fn find_key_for_primary(snapshot: &ClusterStatusWire, target: NodeId) -> Vec<u8>
 	assert!(!ranges.is_empty(), "target node has no primary ranges");
 	for i in 0..200_000u64 {
 		let candidate = format!("retry-key-{i}");
-		let hash = highway_hash(candidate.as_bytes());
+		let hash = key_locality(candidate.as_bytes());
 		if ranges
 			.iter()
 			.any(|(start, end)| *start <= hash && hash <= *end)

@@ -7,6 +7,7 @@ use wendelon::client::{
 };
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
+use wendelon::schema::Locality;
 
 #[tokio::test]
 async fn status_req_returns_live_cluster_status_wire() {
@@ -79,7 +80,10 @@ async fn wendelon_client_refreshes_topology_from_live_control_ring() {
 	client.refresh_topology().await.unwrap();
 	assert_eq!(client.leader(), Some(node.local_node));
 	assert_eq!(client.replication_factor(), 1);
-	assert_eq!(client.replicas_for(0), vec![node.local_node]);
+	assert_eq!(
+		client.replicas_for_locality(Locality::ZERO),
+		vec![node.local_node]
+	);
 
 	support::abort_node(&node);
 }

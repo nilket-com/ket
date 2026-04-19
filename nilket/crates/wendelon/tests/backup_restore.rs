@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use wendelon::consensus::{WendelonLogStore, WendelonRequest};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
-use wendelon::schema::{FinalizationMarker, HybridTimestamp};
+use wendelon::schema::{DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{SlabManager, StorageEngine};
 
 fn tempdir(tag: &str) -> PathBuf {
@@ -43,8 +43,19 @@ fn finalize_marker(epoch: u64, physical_ms: u64, node_id: u32) -> FinalizationMa
 		},
 		payload_hash: [0; 32],
 		e_safe_index: 0,
-		_reserved: 0,
+		durability: DurabilityLevel::QUORUM,
+		_pad: [0; 7],
 	}
+}
+
+fn id(locality: u64) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality.to_le_bytes());
+	Identity::new(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
 }
 
 #[tokio::test]
@@ -59,11 +70,12 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 	.unwrap();
 	wait_for_local_leader(&node).await;
 
-	let key_hash = 0x41_u64;
+	let key_locality = 0x41_u64;
 	let frame = b"backup-me".to_vec();
 	node.slab
 		.append_durable(
-			key_hash,
+			tenant(),
+			id(key_locality),
 			HybridTimestamp {
 				physical_ms: 10,
 				logical: 0,
@@ -117,7 +129,7 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 	.unwrap();
 	wait_for_local_leader(&source).await;
 
-	let key_hash = 0x52_u64;
+	let key_locality = 0x52_u64;
 	let first_hlc = HybridTimestamp {
 		physical_ms: 100,
 		logical: 0,
@@ -132,12 +144,12 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 	let second_frame = b"restored-beta".to_vec();
 	source
 		.slab
-		.append_durable(key_hash, first_hlc, &first_frame)
+		.append_durable(tenant(), id(key_locality), first_hlc, &first_frame)
 		.await
 		.unwrap();
 	source
 		.slab
-		.append_durable(key_hash + 1, second_hlc, &second_frame)
+		.append_durable(tenant(), id(key_locality + 1), second_hlc, &second_frame)
 		.await
 		.unwrap();
 	let marker = finalize_marker(88, 9_900, source.local_node.id);
@@ -161,8 +173,12 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
 	let restore_dir = tempdir("restore");
-	WendelonLogStore::restore_backup(&control, &restore_dir).unwrap();
-	SlabManager::restore_backup(&storage, &restore_dir).unwrap();
+	WendelonLogStore::restore_backup(&control, &restore_dir)
+		.await
+		.unwrap();
+	SlabManager::restore_backup(&storage, &restore_dir)
+		.await
+		.unwrap();
 
 	let restored = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		52,
@@ -179,12 +195,15 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 		Some(marker.commit_hlc)
 	);
 
-	let restored_location = restored.slab.lookup(key_hash).unwrap();
+	let restored_location = restored.slab.lookup(tenant(), id(key_locality)).unwrap();
 	assert_eq!(
 		restored.slab.read(restored_location).await.unwrap(),
 		first_frame
 	);
-	let restored_second = restored.slab.lookup(key_hash + 1).unwrap();
+	let restored_second = restored
+		.slab
+		.lookup(tenant(), id(key_locality + 1))
+		.unwrap();
 	assert_eq!(
 		restored.slab.read(restored_second).await.unwrap(),
 		second_frame
@@ -194,7 +213,8 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 	let post_restore_location = restored
 		.slab
 		.append_durable(
-			key_hash + 2,
+			tenant(),
+			id(key_locality + 2),
 			HybridTimestamp {
 				physical_ms: 300,
 				logical: 0,

@@ -28,7 +28,7 @@ The storage seam, durability model, and simulator-replayable WAL/index that ever
 ## 3. Acceptance criteria (ADR-referential)
 
 - (ADR 015) Snapshot install for state machines up to 10 GiB does not OOM the node — streaming install with bounded memory, confirmed by an integration test.
-- (ADR 015) Compaction boundary aligns with per-segment DEK rotation; no re-keying occurs across segment boundaries mid-compaction.
+- (ADR 015) Segment lifecycle preserves the future per-segment DEK rotation contract: compaction/truncation never rewrite bytes across segment boundaries, so W4 can bind one DEK per segment without mid-compaction re-keying.
 - (ADR 016) Every Raft log write that produces an ack has its containing WAL segment `fdatasync`ed before ack is sent. Property test enforces ack ≥ fdatasync-return in every trace.
 - (ADR 016) `fsync` is called on segment creation, rotation, truncation — verified by a `strace`-driven test in CI.
 - (ADR 017) redb table schemas are stable across one rolling upgrade (forward/backward compatible reads); schema-change procedure documented in `plans/ops/upgrades.md`.
@@ -39,7 +39,7 @@ The storage seam, durability model, and simulator-replayable WAL/index that ever
 
 - Simulator productionization (turmoil-style network, determinism checkers). **W10.**
 - Mocked `ObjectStore` for L2 fault injection. **W10.**
-- WAL encryption at rest (the per-segment DEK consumer). **W4.**
+- WAL encryption at rest (the per-segment DEK consumer and key material). **W4.** W1 closes only the segment-boundary contract that W4 consumes.
 - Tenant-aware durability accounting (per-tenant byte counters). **W5.**
 
 ## 5. Open items

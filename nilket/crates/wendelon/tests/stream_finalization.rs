@@ -12,9 +12,13 @@ use wendelon::network::server::HrftService;
 use wendelon::network::traits::DataRing;
 use wendelon::schema::{
 	ClientWriteId, DurabilityLevel, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType,
-	NodeId, StreamFinalizationRequestMeta, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	write_payload_schema,
+	NodeId, StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
+	WriteStatus, write_payload_schema,
 };
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -34,6 +38,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 		},
 		client_hlc: hlc(10 + sequence_no, 0, 1),
 		expected_epoch: epoch,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,

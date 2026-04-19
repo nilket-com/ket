@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wendelon::consensus::{TierObserver, TieredSlab, WendelonStateMachine};
-use wendelon::schema::HybridTimestamp;
+use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
 	LocalFsObjectStore, ManagerTierObserver, ObjectStore, RehydrationPolicy, SlabManager,
 	SlabManagerConfig, SlabSweeper, StorageEngine, SweeperConfig, TierCommitter, spawn_io_thread,
@@ -27,6 +27,16 @@ fn hlc() -> HybridTimestamp {
 	}
 }
 
+fn id(locality: u64) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality.to_le_bytes());
+	Identity::new(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
+
 struct DirectApplyCommitter {
 	observer: Arc<dyn TierObserver>,
 }
@@ -34,7 +44,7 @@ struct DirectApplyCommitter {
 #[async_trait]
 impl TierCommitter for DirectApplyCommitter {
 	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
-		self.observer.on_slab_tiered(&tier).await
+		self.observer.on_slab_tiered(&tier, 0).await
 	}
 }
 
@@ -59,15 +69,26 @@ async fn build_tiered_manager(
 			io,
 			l2: Some(l2.clone()),
 			rehydration,
+			group_commit: wendelon::storage::GroupCommitConfig::default(),
 		})
+		.await
 		.unwrap(),
 	);
 
-	manager.append(1, hlc(), b"hello-1").await.unwrap();
-	manager.append(2, hlc(), b"hello-2").await.unwrap();
-	manager.append(3, hlc(), b"hello-3").await.unwrap();
+	manager
+		.append(tenant(), id(1), hlc(), b"hello-1")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(2), hlc(), b"hello-2")
+		.await
+		.unwrap();
+	manager
+		.append(tenant(), id(3), hlc(), b"hello-3")
+		.await
+		.unwrap();
 
-	let location = manager.lookup(1).expect("key present");
+	let location = manager.lookup(tenant(), id(1)).expect("key present");
 	let original = manager.read(location).await.expect("pre-tier read ok");
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));

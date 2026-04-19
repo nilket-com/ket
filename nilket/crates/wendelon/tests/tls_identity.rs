@@ -1,5 +1,4 @@
-use rustls::pki_types::CertificateDer;
-use std::io::Cursor;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use wendelon::network::quic_transport::canonical_server_name_resolver;
 use wendelon::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_node_dns_name, verified_peer_node_id_from_chain,
@@ -110,7 +109,7 @@ UrnHkx9cSjgeHb3F+Efc+w==
 "#;
 
 fn certs_from_pem(pem: &str) -> Vec<CertificateDer<'static>> {
-	rustls_pemfile::certs(&mut Cursor::new(pem.as_bytes()))
+	CertificateDer::pem_slice_iter(pem.as_bytes())
 		.collect::<Result<Vec<_>, _>>()
 		.unwrap()
 }

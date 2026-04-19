@@ -55,11 +55,11 @@ use crate::network::transport::MembershipEpoch;
 use crate::network::transport::TransportStream;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, Consistency, FRAME_FLAG_STREAM_END,
-	FinalizationMarker, FrameHeader, HybridTimestamp, LeaseDescriptor, LeaseStatus,
-	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	FinalizationMarker, FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus,
+	Locality, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
+	NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	StreamFinalizationRequestMeta, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	migration_record_schema, read_key_schema, wpbc, write_payload_schema,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
@@ -75,7 +75,6 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -84,17 +83,6 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
-
-/// HighwayHash seed. Stable for the lifetime of the process —
-/// a real deployment derives this from the ring seed recorded in
-/// `RaftEpochEntry` metadata so every node hashes keys the same
-/// way; for V1 we pick a fixed constant and document the bind.
-const HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5745_4e44_454c_4f4e,
-	0x4841_5348_4b45_5901,
-	0x4441_5441_5249_4e47,
-	0x5354_454c_4c41_524f,
-]);
 
 type IdempotencyKey = ([u8; 16], u64);
 
@@ -105,12 +93,12 @@ type IdempotencyKey = ([u8; 16], u64);
 /// Transient dedup for concurrent migration pulls (Plan 019 goal #5).
 ///
 /// When a hot read races the background sweeper on the same
-/// `(migration_id, key_hash)`, both paths might otherwise issue
+/// `(migration_id, key_identity)`, both paths might otherwise issue
 /// a `MIGRATE_REQ` and hand the same record to
 /// [`SlabManager::append_migration`] twice. `append_migration`
 /// is already idempotent — that is the correctness boundary —
 /// but serializing pulls here avoids the duplicate RPC round-trip
-/// and the duplicate `(key_hash, hlc)` scan that would follow.
+/// and the duplicate `(key_identity, hlc)` scan that would follow.
 ///
 /// The registry hands out one `Arc<tokio::sync::Mutex<()>>` per
 /// inflight key. Callers take the lock, re-check the local index,
@@ -119,7 +107,7 @@ type IdempotencyKey = ([u8; 16], u64);
 /// can synchronise on the same key without a secondary refresh.
 #[derive(Default)]
 pub struct MigrationRegistry {
-	inflight: DashMap<(u64, u64), Arc<tokio::sync::Mutex<()>>>,
+	inflight: DashMap<(u64, TenantId, Identity), Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl MigrationRegistry {
@@ -131,16 +119,21 @@ impl MigrationRegistry {
 
 	/// Obtain the per-key gate. The returned `Arc` is cheap to
 	/// clone and safe to hold across `.await`. Every caller for a
-	/// given `(migration_id, key_hash)` observes the same lock, so
+	/// given `(migration_id, key_identity)` observes the same lock, so
 	/// at most one pull is in flight per key.
-	pub fn gate(&self, migration_id: u64, key_hash: u64) -> Arc<tokio::sync::Mutex<()>> {
+	pub fn gate(
+		&self,
+		migration_id: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> Arc<tokio::sync::Mutex<()>> {
 		self.inflight
-			.entry((migration_id, key_hash))
+			.entry((migration_id, tenant_id, key_identity))
 			.or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
 			.clone()
 	}
 
-	/// Drop the registry slot for `(migration_id, key_hash)`. Called
+	/// Drop the registry slot for `(migration_id, key_identity)`. Called
 	/// by `try_migrate_point_read` once the pull has run to
 	/// completion so the map's DRAM footprint caps at
 	/// `O(concurrent_requests)` rather than growing with every key
@@ -149,8 +142,9 @@ impl MigrationRegistry {
 	/// boundary — a racer that arrives after removal simply mints
 	/// a fresh mutex, re-checks the local index (now a hit), and
 	/// skips the pull.
-	pub fn remove(&self, migration_id: u64, key_hash: u64) {
-		self.inflight.remove(&(migration_id, key_hash));
+	pub fn remove(&self, migration_id: u64, tenant_id: TenantId, key_identity: Identity) {
+		self.inflight
+			.remove(&(migration_id, tenant_id, key_identity));
 	}
 }
 
@@ -161,12 +155,14 @@ impl MigrationRegistry {
 struct RegistryScopeGuard<'a> {
 	registry: &'a MigrationRegistry,
 	migration_id: u64,
-	key_hash: u64,
+	tenant_id: TenantId,
+	key_identity: Identity,
 }
 
 impl Drop for RegistryScopeGuard<'_> {
 	fn drop(&mut self) {
-		self.registry.remove(self.migration_id, self.key_hash);
+		self.registry
+			.remove(self.migration_id, self.tenant_id, self.key_identity);
 	}
 }
 
@@ -200,7 +196,7 @@ enum PointReadOutcome {
 //  REPLICA ROUTER
 // ============================================================
 
-/// Resolves a `key_hash` to the replica set that should store it.
+/// Resolves a routing locality to the replica set that should store it.
 ///
 /// The contract is deliberately narrow: return the ordered list of
 /// `NodeId`s that form the replica set for this key. The ordering
@@ -211,10 +207,10 @@ enum PointReadOutcome {
 /// and filters for data-capable nodes (ADR 002). The V1 fallback
 /// is [`StaticReplicaRouter`].
 pub trait ReplicaRouter: Send + Sync {
-	/// Members of the replica set for `key_hash`. The order is
+	/// Members of the replica set for `locality`. The order is
 	/// stable for a given topology so traces align; callers must
 	/// not depend on the first entry being the local node.
-	fn replicas(&self, key_hash: u64) -> Vec<NodeId>;
+	fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId>;
 
 	/// Effective replication factor for this router. Exposed so the
 	/// quorum math is source-of-truthed in one place.
@@ -222,8 +218,9 @@ pub trait ReplicaRouter: Send + Sync {
 }
 
 /// Static ring router. Holds the full node list and an RF; resolves
-/// each key's replica set as `RF` consecutive nodes starting at
-/// `key_hash % nodes.len()`. This is a stand-in for the full ADR 002
+/// each locality bucket's replica set as `RF` consecutive nodes
+/// starting at `locality % nodes.len()`. This is a stand-in for the
+/// full ADR 002
 /// projection — good enough for a bring-up where membership is
 /// stable, fine for tests, and will be swapped for a real snapshot
 /// reader once the Unified Hash Ring projection lands.
@@ -245,13 +242,13 @@ impl StaticReplicaRouter {
 }
 
 impl ReplicaRouter for StaticReplicaRouter {
-	fn replicas(&self, key_hash: u64) -> Vec<NodeId> {
+	fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
 		if self.nodes.is_empty() {
 			return Vec::new();
 		}
 		let n = self.nodes.len();
 		let take = self.rf.min(n);
-		let start = (key_hash as usize) % n;
+		let start = (locality.get() as usize) % n;
 		(0..take).map(|i| self.nodes[(start + i) % n]).collect()
 	}
 
@@ -284,7 +281,7 @@ pub struct WendelonDataServer {
 	/// Local physical clock used to merge client HLCs into the
 	/// leader's authoritative commit timestamp.
 	clock: Arc<dyn PhysicalClock>,
-	/// Resolves a `key_hash` to the replica set that should hold
+	/// Resolves a routing locality to the replica set that should hold
 	/// it. Injected so the projection source (Unified Hash Ring
 	/// snapshot, static dev topology, test mock) is the caller's
 	/// concern, not this file's.
@@ -550,7 +547,7 @@ impl WendelonDataServer {
 
 	async fn lease_gate_result(
 		&self,
-		key_hash: u64,
+		locality: Locality,
 		epoch: u64,
 		now: HybridTimestamp,
 	) -> LeaseGateResult {
@@ -561,8 +558,8 @@ impl WendelonDataServer {
 				.find(|l| {
 					l.holder.id == self.local_node.id
 						&& l.epoch == epoch
-						&& l.range_start <= key_hash
-						&& key_hash <= l.range_end
+						&& l.range_start <= locality.get()
+						&& locality.get() <= l.range_end
 						&& now < l.lease_expiry
 				})
 				.copied()
@@ -1539,17 +1536,24 @@ impl WendelonDataServer {
 		// window; range pages walk the full ledger window keyed by
 		// `(cursor_hash, cursor_hlc)` so fat keys with more retained
 		// versions than fit in one page still stream exhaustively.
-		let mut locations: Vec<(u64, RecordLocation)> = match meta.kind {
-			MigrateRequestKind::POINT_LOOKUP => self.slab.scan_all_versions(
-				meta.range_start,
-				meta.range_start,
-				entry.migration_hlc_floor,
-			),
+		let mut locations: Vec<(TenantId, Identity, RecordLocation)> = match meta.kind {
+			MigrateRequestKind::POINT_LOOKUP => self
+				.slab
+				.scan_all_versions(
+					Locality::new(meta.range_start),
+					Locality::new(meta.range_start),
+					entry.migration_hlc_floor,
+				)
+				.into_iter()
+				.filter(|(tenant_id, key_identity, _)| {
+					*tenant_id == meta.tenant_id && *key_identity == meta.key_identity
+				})
+				.collect(),
 			MigrateRequestKind::RANGE_PAGE => self.slab.scan_all_versions_from(
-				meta.range_start,
-				meta.range_end,
+				Locality::new(meta.range_start),
+				Locality::new(meta.range_end),
 				entry.migration_hlc_floor,
-				meta.cursor_hash,
+				meta.cursor_identity,
 				meta.cursor_hlc,
 			),
 			_ => {
@@ -1567,9 +1571,9 @@ impl WendelonDataServer {
 			));
 		}
 
-		// Paging caps. Records are sorted (key_hash, hlc ASC), so
-		// truncating at the caps yields a deterministic boundary.
-		// `(next_cursor_hash, next_cursor_hlc)` names the last
+		// Paging caps. Records are sorted `(locality, identity, hlc ASC)`,
+		// so truncating at the caps yields a deterministic boundary.
+		// `(next_cursor_identity, next_cursor_hlc)` names the last
 		// emitted MVCC slot so the follow-up resumes strictly after
 		// it — including mid-key for fat keys.
 		let max_records = if meta.max_records == 0 {
@@ -1584,32 +1588,32 @@ impl WendelonDataServer {
 		};
 
 		let total_locations = locations.len();
-		let mut rows: Vec<(u64, RecordLocation, Vec<u8>)> = Vec::new();
+		let mut rows: Vec<(TenantId, Identity, RecordLocation, Vec<u8>)> = Vec::new();
 		let mut packed_bytes: usize = 0;
-		let mut last_key: u64 = 0;
+		let mut last_key = (TenantId::ZERO, Identity::ZERO);
 		let mut last_hlc: HybridTimestamp = bytemuck::Zeroable::zeroed();
 		let mut truncated = false;
-		for (key_hash, loc) in locations.drain(..) {
+		for (tenant_id, key_identity, loc) in locations.drain(..) {
 			if rows.len() >= max_records {
 				truncated = true;
 				break;
 			}
-			let frame = self.slab.read(loc).await?;
+			let frame: Vec<u8> = self.slab.read(loc).await?;
 			if packed_bytes.saturating_add(frame.len()) > max_bytes && !rows.is_empty() {
 				truncated = true;
 				break;
 			}
 			packed_bytes = packed_bytes.saturating_add(frame.len());
-			last_key = key_hash;
+			last_key = (tenant_id, key_identity);
 			last_hlc = loc.hlc;
-			rows.push((key_hash, loc, frame));
+			rows.push((tenant_id, key_identity, loc, frame));
 		}
 		let emitted_all = rows.len() == total_locations;
 		let has_more = meta.kind == MigrateRequestKind::RANGE_PAGE && truncated && !emitted_all;
-		let (next_cursor_hash, next_cursor_hlc) = if has_more {
-			(last_key, last_hlc)
+		let (next_cursor_identity, next_cursor_hlc) = if has_more {
+			(last_key.1, last_hlc)
 		} else {
-			(0u64, bytemuck::Zeroable::zeroed())
+			(Identity::ZERO, bytemuck::Zeroable::zeroed())
 		};
 
 		let arrow_bytes = encode_migration_records(&rows)?;
@@ -1622,7 +1626,7 @@ impl WendelonDataServer {
 			_pad0: [0; 6],
 			migration_id: meta.migration_id,
 			source_hint: ZERO_NODE,
-			next_cursor_hash,
+			next_cursor_identity,
 			next_cursor_hlc,
 			versions_returned,
 			bytes_returned,
@@ -1636,7 +1640,7 @@ impl WendelonDataServer {
 	/// Called when [`SlabManager::lookup_as_of`] returns `None` on
 	/// a node that is the current logical owner of the key's
 	/// range. Consults the ledger for a pending migration
-	/// covering `key_hash`, gates concurrent pulls through the
+	/// covering `key_identity`, gates concurrent pulls through the
 	/// [`MigrationRegistry`], re-checks the local index after the
 	/// gate releases, and — on a still-miss — issues a
 	/// `POINT_LOOKUP` `MIGRATE_REQ` to the ledger's preferred
@@ -1650,15 +1654,21 @@ impl WendelonDataServer {
 	/// the read. I/O errors on the local slab surface as `Err`.
 	async fn try_migrate_point_read(
 		&self,
-		key_hash: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
 		as_of_hlc: HybridTimestamp,
 	) -> std::io::Result<PointReadOutcome> {
+		let key_locality = Locality::from(key_identity).get();
 		let sm = self.state_machine.state_snapshot().await;
-		let Some(entry) = pending_owned_entry(&sm.migrations, key_hash, self.local_node) else {
+		let Some(entry) =
+			pending_owned_entry(&sm.migrations, Locality::new(key_locality), self.local_node)
+		else {
 			return Ok(PointReadOutcome::AuthoritativeMiss);
 		};
 
-		let gate = self.migration_registry.gate(entry.migration_id, key_hash);
+		let gate = self
+			.migration_registry
+			.gate(entry.migration_id, tenant_id, key_identity);
 		// Registry cleanup guard — drops AFTER `_guard` releases the
 		// mutex, so the inflight slot is freed only once the pull has
 		// fully completed. A racer that arrives after removal mints a
@@ -1667,14 +1677,15 @@ impl WendelonDataServer {
 		let _scope = RegistryScopeGuard {
 			registry: &self.migration_registry,
 			migration_id: entry.migration_id,
-			key_hash,
+			tenant_id,
+			key_identity,
 		};
 		let _guard = gate.lock().await;
 
 		// Another task may have filled this key while we waited
 		// on the gate. If so, skip the RPC entirely — the fast
 		// path is the only ack the caller needed.
-		if let Some(location) = self.slab.lookup_as_of(key_hash, as_of_hlc) {
+		if let Some(location) = self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc) {
 			let bytes = self.slab.read(location).await?;
 			return Ok(PointReadOutcome::Hit(location, bytes));
 		}
@@ -1701,10 +1712,12 @@ impl WendelonDataServer {
 			migration_id: entry.migration_id,
 			expected_to_epoch: entry.to_epoch,
 			requester: self.local_node,
-			range_start: key_hash,
-			range_end: key_hash,
+			tenant_id,
+			range_start: key_locality,
+			range_end: key_locality,
+			key_identity,
 			migration_hlc_floor: entry.migration_hlc_floor,
-			cursor_hash: 0,
+			cursor_identity: Identity::ZERO,
 			cursor_hlc: bytemuck::Zeroable::zeroed(),
 			max_records: 0,
 			max_bytes: 0,
@@ -1723,14 +1736,17 @@ impl WendelonDataServer {
 						self.slab
 							.append_migration(
 								entry.migration_id,
-								record.key_hash,
+								record.tenant_id,
+								record.key_identity,
 								record.hlc,
 								record.payload_hash,
 								&record.frame_bytes,
 							)
 							.await?;
 					}
-					if let Some(location) = self.slab.lookup_as_of(key_hash, as_of_hlc) {
+					if let Some(location) =
+						self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)
+					{
 						let bytes = self.slab.read(location).await?;
 						return Ok(PointReadOutcome::Hit(location, bytes));
 					}
@@ -1780,7 +1796,7 @@ impl WendelonDataServer {
 	/// every entry in `source_replicas`, pages each until its own
 	/// `has_more == 0`, and unions their contributions through
 	/// [`SlabManager::append_migration`] (idempotent on matching
-	/// `(key_hash, hlc, payload_hash)`).
+	/// `(key_identity, hlc, payload_hash)`).
 	///
 	/// **Failure surface.** If any source fails mid-drain (transport
 	/// error or non-OK `MigrateStatus`), the union is by definition
@@ -1810,17 +1826,19 @@ impl WendelonDataServer {
 				continue;
 			}
 			touched_any_source = true;
-			let mut cursor_hash: u64 = 0;
+			let mut cursor_identity = Identity::ZERO;
 			let mut cursor_hlc: HybridTimestamp = bytemuck::Zeroable::zeroed();
 			loop {
 				let req = MigrateRequestMeta {
 					migration_id: entry.migration_id,
 					expected_to_epoch: entry.to_epoch,
 					requester: self.local_node,
+					tenant_id: TenantId::ZERO,
 					range_start,
 					range_end,
+					key_identity: Identity::ZERO,
 					migration_hlc_floor: entry.migration_hlc_floor,
-					cursor_hash,
+					cursor_identity,
 					cursor_hlc,
 					max_records: page_max_records,
 					max_bytes: page_max_bytes,
@@ -1858,7 +1876,8 @@ impl WendelonDataServer {
 					self.slab
 						.append_migration(
 							entry.migration_id,
-							record.key_hash,
+							record.tenant_id,
+							record.key_identity,
 							record.hlc,
 							record.payload_hash,
 							&record.frame_bytes,
@@ -1868,7 +1887,7 @@ impl WendelonDataServer {
 				if resp.has_more == 0 {
 					break;
 				}
-				cursor_hash = resp.next_cursor_hash;
+				cursor_identity = resp.next_cursor_identity;
 				cursor_hlc = resp.next_cursor_hlc;
 			}
 		}
@@ -1980,16 +1999,16 @@ impl WendelonDataServer {
 			.filter(|e| {
 				e.logical_owner.id == self.local_node.id
 					&& e.state != MigrationState::Completed
-					&& e.range_start <= meta.key_range_end
-					&& e.range_end >= meta.key_range_start
+					&& e.range_start <= meta.locality_range_end
+					&& e.range_end >= meta.locality_range_start
 			})
 			.cloned()
 			.collect();
 		drop(sm_peek);
 
 		for entry in &pending {
-			let rs = entry.range_start.max(meta.key_range_start);
-			let re = entry.range_end.min(meta.key_range_end);
+			let rs = entry.range_start.max(meta.locality_range_start);
+			let re = entry.range_end.min(meta.locality_range_end);
 			if let Err(_e) = self.pull_migration_range(entry, rs, re).await {
 				// Any failure in the fan-out means the local slab
 				// is *not* an authoritative view of the query
@@ -2113,7 +2132,12 @@ impl WendelonDataServer {
 		} else {
 			match self
 				.slab
-				.append_durable(meta.key_hash, meta.commit_hlc, arrow_bytes)
+				.append_durable(
+					meta.tenant_id,
+					meta.key_identity,
+					meta.commit_hlc,
+					arrow_bytes,
+				)
 				.await
 			{
 				Ok(_) => (ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE),
@@ -2240,11 +2264,12 @@ impl DataRing for WendelonDataServer {
 
 		// 4. Pull the key out of the Arrow payload and hash it.
 		let key_bytes = extract_first_binary(&payload, "key")?;
-		let key_hash = highway_hash(key_bytes);
+		let key_identity = Identity::blake3(key_bytes);
+		let key_locality = Locality::from(key_identity).get();
 
 		// 4a. Per-range lease gate (plan 018). When enabled, this
 		// node accepts the write only if it holds a valid lease
-		// covering `key_hash` in the client's epoch. A node that is
+		// covering `key_locality` in the client's epoch. A node that is
 		// not the primary for this key returns `NOT_LEADER` so the
 		// Smart Client reroutes; a node that is the primary but
 		// whose lease has lapsed returns `LEASE_EXPIRED` so the
@@ -2252,7 +2277,7 @@ impl DataRing for WendelonDataServer {
 		if self.lease_gate_enabled {
 			let is_primary = self
 				.router
-				.replicas(key_hash)
+				.replicas_for_locality(Locality::new(key_locality))
 				.first()
 				.map(|n| n.id == self.local_node.id)
 				.unwrap_or(false);
@@ -2263,7 +2288,11 @@ impl DataRing for WendelonDataServer {
 				));
 			}
 			match self
-				.lease_gate_result(key_hash, meta.expected_epoch, meta.client_hlc)
+				.lease_gate_result(
+					Locality::new(key_locality),
+					meta.expected_epoch,
+					meta.client_hlc,
+				)
 				.await
 			{
 				LeaseGateResult::Valid => {}
@@ -2301,7 +2330,9 @@ impl DataRing for WendelonDataServer {
 		// 7. Resolve the replica set. An empty set is a
 		// configuration bug — refuse rather than silently dropping
 		// to a pre-Stellarator single-node append.
-		let replicas = self.router.replicas(key_hash);
+		let replicas = self
+			.router
+			.replicas_for_locality(Locality::new(key_locality));
 		if replicas.is_empty() {
 			return Ok((
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
@@ -2325,7 +2356,12 @@ impl DataRing for WendelonDataServer {
 			// we race any remote finalization condition.
 			match self
 				.slab
-				.append_durable(key_hash, commit_hlc, frame_bytes.as_slice())
+				.append_durable(
+					meta.tenant_id,
+					key_identity,
+					commit_hlc,
+					frame_bytes.as_slice(),
+				)
 				.await
 			{
 				Ok(_) => durable_acks += 1,
@@ -2343,7 +2379,8 @@ impl DataRing for WendelonDataServer {
 		let replica_meta = ReplicaWriteMeta {
 			commit_hlc,
 			epoch: meta.expected_epoch,
-			key_hash,
+			tenant_id: meta.tenant_id,
+			key_identity,
 			payload_hash,
 		};
 		let mut join: JoinSet<std::io::Result<ReplicaAckLevel>> = JoinSet::new();
@@ -2391,7 +2428,8 @@ impl DataRing for WendelonDataServer {
 			commit_hlc,
 			payload_hash,
 			e_safe_index: 0,
-			_reserved: 0,
+			durability: meta.durability,
+			_pad: [0; 7],
 		};
 
 		let (status, log_index, term) = match self
@@ -2473,7 +2511,8 @@ impl DataRing for WendelonDataServer {
 
 		// 2. Hash the key payload and probe the slab index.
 		let key_bytes = extract_first_binary(&key, "key")?;
-		let key_hash = highway_hash(key_bytes);
+		let key_identity = Identity::blake3(key_bytes);
+		let key_locality = Locality::from(key_identity).get();
 
 		// 2a. Per-range lease gate for LINEARIZABLE reads (plan 018).
 		// A local point-read is only authoritative while a lease
@@ -2483,7 +2522,7 @@ impl DataRing for WendelonDataServer {
 		if self.lease_gate_enabled && meta.consistency == Consistency::LINEARIZABLE {
 			let is_primary = self
 				.router
-				.replicas(key_hash)
+				.replicas_for_locality(Locality::new(key_locality))
 				.first()
 				.map(|n| n.id == self.local_node.id)
 				.unwrap_or(false);
@@ -2494,7 +2533,11 @@ impl DataRing for WendelonDataServer {
 				));
 			}
 			match self
-				.lease_gate_result(key_hash, meta.expected_epoch, meta.min_hlc)
+				.lease_gate_result(
+					Locality::new(key_locality),
+					meta.expected_epoch,
+					meta.min_hlc,
+				)
 				.await
 			{
 				LeaseGateResult::Valid => {}
@@ -2517,41 +2560,49 @@ impl DataRing for WendelonDataServer {
 			}
 		}
 
-		let (location, bytes) = match self.slab.lookup_as_of(key_hash, meta.as_of_hlc) {
-			Some(loc) => {
-				let bytes = self.slab.read(loc).await?;
-				(loc, bytes)
-			}
-			None => {
-				// Plan 019 read-path fallback: a local miss on a
-				// range we now logically own means the bytes may
-				// still live on a prior physical holder. The
-				// ledger tells us whether to pull or to surface
-				// the miss.
-				match self
-					.try_migrate_point_read(key_hash, meta.as_of_hlc)
-					.await?
-				{
-					PointReadOutcome::Hit(loc, bytes) => (loc, bytes),
-					PointReadOutcome::AuthoritativeMiss => {
-						return Ok((
-							error_read_response(&meta, ReadStatus::KEY_NOT_FOUND, self.local_node),
-							None,
-						));
-					}
-					PointReadOutcome::Incomplete => {
-						return Ok((
-							error_read_response(
-								&meta,
-								ReadStatus::MIGRATION_INCOMPLETE,
-								self.local_node,
-							),
-							None,
-						));
+		let (location, bytes) =
+			match self
+				.slab
+				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)
+			{
+				Some(loc) => {
+					let bytes = self.slab.read(loc).await?;
+					(loc, bytes)
+				}
+				None => {
+					// Plan 019 read-path fallback: a local miss on a
+					// range we now logically own means the bytes may
+					// still live on a prior physical holder. The
+					// ledger tells us whether to pull or to surface
+					// the miss.
+					match self
+						.try_migrate_point_read(meta.tenant_id, key_identity, meta.as_of_hlc)
+						.await?
+					{
+						PointReadOutcome::Hit(loc, bytes) => (loc, bytes),
+						PointReadOutcome::AuthoritativeMiss => {
+							return Ok((
+								error_read_response(
+									&meta,
+									ReadStatus::KEY_NOT_FOUND,
+									self.local_node,
+								),
+								None,
+							));
+						}
+						PointReadOutcome::Incomplete => {
+							return Ok((
+								error_read_response(
+									&meta,
+									ReadStatus::MIGRATION_INCOMPLETE,
+									self.local_node,
+								),
+								None,
+							));
+						}
 					}
 				}
-			}
-		};
+			};
 
 		// 3. Re-materialise the stored Arrow bytes into a
 		// RecordBatch. We then project out just the `value`
@@ -2737,7 +2788,12 @@ async fn plan_query_execution(
 	// `wpbc::execute` already does this internally per call, but
 	// we mirror the pattern so a follow-up that batches rows can
 	// lift the compile out of the loop without touching semantics.
-	let scanned = slab.scan_as_of(meta.key_range_start, meta.key_range_end, meta.as_of_hlc);
+	let scanned = slab.scan_as_of(
+		meta.tenant_id,
+		Locality::new(meta.locality_range_start),
+		Locality::new(meta.locality_range_end),
+		meta.as_of_hlc,
+	);
 	let mut included = Vec::new();
 	let mut rows = 0u64;
 	let mut max_hlc = HybridTimestamp {
@@ -2745,7 +2801,7 @@ async fn plan_query_execution(
 		logical: 0,
 		node_id: 0,
 	};
-	for (_key_hash, location) in scanned {
+	for (_key_identity, location) in scanned {
 		let result = materialize_query_batch(slab, location, bytecode).await?;
 		if result.num_rows() == 0 {
 			continue;
@@ -2787,7 +2843,7 @@ async fn materialize_query_batch(
 	location: RecordLocation,
 	bytecode: &[u8],
 ) -> std::io::Result<RecordBatch> {
-	let bytes = slab.read(location).await?;
+	let bytes: Vec<u8> = slab.read(location).await?;
 	let batch = decode_batch(&bytes)?;
 	wpbc::execute(bytecode, &batch)
 }
@@ -2841,18 +2897,19 @@ const ZERO_NODE: NodeId = NodeId {
 /// One decoded row out of the migration Arrow IPC body.
 #[derive(Clone, Debug)]
 struct MigrationRecord {
-	key_hash: u64,
+	tenant_id: TenantId,
+	key_identity: Identity,
 	hlc: HybridTimestamp,
 	payload_hash: [u8; 32],
 	frame_bytes: Vec<u8>,
 }
 
-/// Find a ledger entry pending on the local node whose hash
-/// range contains `key_hash`. Returns a clone so the caller can
+/// Find a ledger entry pending on the local node whose locality
+/// range contains `locality`. Returns a clone so the caller can
 /// drop the `SmState` snapshot without extending its borrow.
 fn pending_owned_entry(
 	migrations: &std::collections::HashMap<u64, MigrationLedgerEntry>,
-	key_hash: u64,
+	locality: Locality,
 	local_node: NodeId,
 ) -> Option<MigrationLedgerEntry> {
 	migrations
@@ -2860,8 +2917,8 @@ fn pending_owned_entry(
 		.find(|entry| {
 			entry.logical_owner.id == local_node.id
 				&& entry.state != MigrationState::Completed
-				&& entry.range_start <= key_hash
-				&& key_hash <= entry.range_end
+				&& entry.range_start <= locality.get()
+				&& locality.get() <= entry.range_end
 		})
 		.cloned()
 }
@@ -2880,7 +2937,7 @@ fn migrate_error_meta(
 		_pad0: [0; 6],
 		migration_id: req.migration_id,
 		source_hint,
-		next_cursor_hash: 0,
+		next_cursor_identity: Identity::ZERO,
 		next_cursor_hlc: bytemuck::Zeroable::zeroed(),
 		versions_returned: 0,
 		bytes_returned: 0,
@@ -2888,20 +2945,26 @@ fn migrate_error_meta(
 	}
 }
 
-/// Pack `(key_hash, RecordLocation, frame_bytes)` rows into an
+/// Pack `(key_identity, RecordLocation, frame_bytes)` rows into an
 /// Arrow IPC stream over [`migration_record_schema`]. `payload_hash`
 /// is computed here — receivers use it to fast-path
 /// `append_migration` idempotency without re-hashing themselves.
-fn encode_migration_records(rows: &[(u64, RecordLocation, Vec<u8>)]) -> std::io::Result<Vec<u8>> {
-	let mut key_hash = UInt64Builder::with_capacity(rows.len());
+fn encode_migration_records(
+	rows: &[(TenantId, Identity, RecordLocation, Vec<u8>)],
+) -> std::io::Result<Vec<u8>> {
+	let mut tenant_id = UInt64Builder::with_capacity(rows.len());
+	let mut key_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 	let mut hlc_phys = UInt64Builder::with_capacity(rows.len());
 	let mut hlc_log = UInt32Builder::with_capacity(rows.len());
 	let mut hlc_node = UInt32Builder::with_capacity(rows.len());
 	let mut payload = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 	let mut frame = LargeBinaryBuilder::new();
 
-	for (k, loc, bytes) in rows {
-		key_hash.append_value(*k);
+	for (row_tenant_id, identity, loc, bytes) in rows {
+		tenant_id.append_value(row_tenant_id.get());
+		key_identity
+			.append_value(identity.as_bytes())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("identity append: {e}")))?;
 		hlc_phys.append_value(loc.hlc.physical_ms);
 		hlc_log.append_value(loc.hlc.logical);
 		hlc_node.append_value(loc.hlc.node_id);
@@ -2916,7 +2979,8 @@ fn encode_migration_records(rows: &[(u64, RecordLocation, Vec<u8>)]) -> std::io:
 	let batch = RecordBatch::try_new(
 		schema.clone(),
 		vec![
-			Arc::new(key_hash.finish()),
+			Arc::new(tenant_id.finish()),
+			Arc::new(key_identity.finish()),
 			Arc::new(hlc_phys.finish()),
 			Arc::new(hlc_log.finish()),
 			Arc::new(hlc_node.finish()),
@@ -2950,38 +3014,49 @@ fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord
 	while let Some(batch) = reader.next() {
 		let batch = batch
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("migrate stream read: {e}")))?;
-		let key_col: &UInt64Array = batch
+		let tenant_col: &UInt64Array = batch
 			.column(0)
 			.as_any()
 			.downcast_ref()
-			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "key_hash col type"))?;
-		let phys_col: &UInt64Array = batch
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "tenant_id col type"))?;
+		let key_col: &FixedSizeBinaryArray = batch
 			.column(1)
+			.as_any()
+			.downcast_ref()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "key_identity col type"))?;
+		let phys_col: &UInt64Array = batch
+			.column(2)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_physical_ms col type"))?;
 		let log_col: &UInt32Array = batch
-			.column(2)
+			.column(3)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_logical col type"))?;
 		let node_col: &UInt32Array = batch
-			.column(3)
+			.column(4)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_node_id col type"))?;
 		let hash_col: &FixedSizeBinaryArray = batch
-			.column(4)
+			.column(5)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "payload_hash col type"))?;
 		let frame_col: &LargeBinaryArray = batch
-			.column(5)
+			.column(6)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_bytes col type"))?;
 
 		for i in 0..batch.num_rows() {
+			let identity_slice = key_col.value(i);
+			if identity_slice.len() != 32 {
+				return Err(Error::new(ErrorKind::InvalidData, "key_identity width"));
+			}
+			let mut key_identity = [0u8; 32];
+			key_identity.copy_from_slice(identity_slice);
 			let hash_slice = hash_col.value(i);
 			if hash_slice.len() != 32 {
 				return Err(Error::new(ErrorKind::InvalidData, "payload_hash width"));
@@ -2989,7 +3064,8 @@ fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord
 			let mut payload_hash = [0u8; 32];
 			payload_hash.copy_from_slice(hash_slice);
 			out.push(MigrationRecord {
-				key_hash: key_col.value(i),
+				tenant_id: TenantId::new(tenant_col.value(i)),
+				key_identity: Identity::new(key_identity),
 				hlc: HybridTimestamp {
 					physical_ms: phys_col.value(i),
 					logical: log_col.value(i),
@@ -3204,10 +3280,9 @@ fn build_value_batch(value: &[u8]) -> std::io::Result<RecordBatch> {
 		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("build value batch: {e}")))
 }
 
-fn highway_hash(bytes: &[u8]) -> u64 {
-	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
-	hasher.append(bytes);
-	hasher.finalize64()
+#[cfg(test)]
+fn key_locality(bytes: &[u8]) -> u64 {
+	Locality::from(Identity::blake3(bytes)).get()
 }
 
 fn blake3_32(bytes: &[u8]) -> [u8; 32] {
@@ -3262,6 +3337,16 @@ mod tests {
 		.unwrap()
 	}
 
+	fn id(locality: u64) -> Identity {
+		let mut bytes = [0u8; 32];
+		bytes[..8].copy_from_slice(&locality.to_le_bytes());
+		Identity::new(bytes)
+	}
+
+	fn tenant() -> TenantId {
+		TenantId::ZERO
+	}
+
 	async fn make_manager() -> Arc<SlabManager> {
 		let dir = fresh_dir("query");
 		let io = spawn_io_thread(64).unwrap();
@@ -3272,31 +3357,36 @@ mod tests {
 				io,
 				l2: None,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
 			})
+			.await
 			.unwrap(),
 		)
 	}
 
 	async fn seed_record(
 		mgr: &SlabManager,
-		key_hash: u64,
+		locality: u64,
 		hlc: HybridTimestamp,
 		key: &[u8],
 		value: &[u8],
 	) {
 		let batch = kv_batch(key, value);
 		let bytes = encode_batch(&batch).unwrap();
-		mgr.append(key_hash, hlc, &bytes).await.unwrap();
+		mgr.append(tenant(), id(locality), hlc, &bytes)
+			.await
+			.unwrap();
 	}
 
 	fn base_meta() -> QueryRequestMeta {
 		QueryRequestMeta {
 			min_hlc: hlc(0, 0, 0),
 			expected_epoch: 0,
+			tenant_id: tenant(),
 			consistency: Consistency::SERIALIZABLE,
 			_pad: [0; 7],
-			key_range_start: 0,
-			key_range_end: u64::MAX,
+			locality_range_start: 0,
+			locality_range_end: u64::MAX,
 			bytecode_len: 0,
 			_pad2: [0; 4],
 			as_of_hlc: hlc(0, 0, 0),
@@ -3306,7 +3396,7 @@ mod tests {
 	#[test]
 	fn static_router_wraps_around_ring() {
 		let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3), n(4)], 3);
-		let replicas = router.replicas(3);
+		let replicas = router.replicas_for_locality(Locality::new(3));
 		assert_eq!(replicas.len(), 3);
 		assert_eq!(replicas[0], n(4));
 		assert_eq!(replicas[1], n(1));
@@ -3316,7 +3406,7 @@ mod tests {
 	#[test]
 	fn static_router_dedups_and_sorts() {
 		let router = StaticReplicaRouter::new(vec![n(3), n(1), n(3), n(2)], 5);
-		let replicas = router.replicas(0);
+		let replicas = router.replicas_for_locality(Locality::ZERO);
 		assert_eq!(replicas.len(), 3);
 		assert_eq!(replicas[0], n(1));
 		assert_eq!(replicas[1], n(2));
@@ -3326,13 +3416,13 @@ mod tests {
 	#[test]
 	fn static_router_rf_one_is_single_replica() {
 		let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3)], 1);
-		assert_eq!(router.replicas(0).len(), 1);
+		assert_eq!(router.replicas_for_locality(Locality::ZERO).len(), 1);
 	}
 
 	#[test]
 	fn static_router_empty_node_list_returns_empty() {
 		let router = StaticReplicaRouter::new(vec![], 3);
-		assert!(router.replicas(0).is_empty());
+		assert!(router.replicas_for_locality(Locality::ZERO).is_empty());
 	}
 
 	#[tokio::test]
@@ -3342,18 +3432,18 @@ mod tests {
 		seed_record(&mgr, 50, hlc(2, 0, 1), b"k50", b"v50").await;
 		seed_record(&mgr, 99, hlc(3, 0, 1), b"k99", b"v99").await;
 
-		let hits = mgr.scan(10, 50);
+		let hits = mgr.scan(tenant(), 10, 50);
 		let keys: Vec<u64> = hits.iter().map(|(k, _)| *k).collect();
 		assert_eq!(keys, vec![10, 50]);
 
-		let full = mgr.scan(0, u64::MAX);
+		let full = mgr.scan(tenant(), 0, u64::MAX);
 		assert_eq!(full.len(), 3);
 
-		let miss = mgr.scan(60, 90);
+		let miss = mgr.scan(tenant(), 60, 90);
 		assert!(miss.is_empty());
 
 		// Inverted range → empty, never panics.
-		let inverted = mgr.scan(100, 5);
+		let inverted = mgr.scan(tenant(), 100, 5);
 		assert!(inverted.is_empty());
 	}
 
@@ -3385,8 +3475,8 @@ mod tests {
 
 		let sm = WendelonStateMachine::new();
 		let mut meta = base_meta();
-		meta.key_range_start = 10;
-		meta.key_range_end = 50;
+		meta.locality_range_start = 10;
+		meta.locality_range_end = 50;
 		let (resp, _) = execute_query_plan(&mgr, &sm, n(1), &meta, &[])
 			.await
 			.unwrap();
@@ -3468,11 +3558,11 @@ mod tests {
 		use arrow::datatypes::{DataType, Field, Schema};
 		let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
 		let mgr = make_manager().await;
-		for (key_hash, age) in [(1u64, 17i64), (2, 22), (3, 40)] {
+		for (locality, age) in [(1u64, 17i64), (2, 22), (3, 40)] {
 			let ages = Int64Array::from(vec![age]);
 			let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
 			let bytes = encode_batch(&batch).unwrap();
-			mgr.append(key_hash, hlc(age as u64, 0, 1), &bytes)
+			mgr.append(tenant(), id(locality), hlc(age as u64, 0, 1), &bytes)
 				.await
 				.unwrap();
 		}
@@ -3563,6 +3653,7 @@ mod tests {
 			},
 			client_hlc: hlc(10, 0, 0),
 			expected_epoch: epoch,
+			tenant_id: tenant(),
 			proxy_hop: 0,
 			durability: DurabilityLevel::QUORUM,
 			await_finalization: 0,
@@ -3593,6 +3684,7 @@ mod tests {
 		ReadRequestMeta {
 			min_hlc: hlc(0, 0, 0),
 			expected_epoch: epoch,
+			tenant_id: tenant(),
 			consistency: SchemaConsistency::LINEARIZABLE,
 			_pad: [0; 3],
 			key_len: 1,
@@ -3744,6 +3836,50 @@ mod tests {
 		assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
 	}
 
+	#[tokio::test]
+	async fn finalization_marker_preserves_requested_durability_class() {
+		let dir = bootstrap_tempdir("durability-marker");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			15,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+		meta.durability = DurabilityLevel::LEADER;
+
+		let (resp, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!(
+			trailing
+				.expect("await_finalization should return a marker")
+				.durability,
+			DurabilityLevel::LEADER
+		);
+	}
+
 	// ========================================================
 	//  MIGRATION HELPERS (plan 019)
 	// ========================================================
@@ -3772,11 +3908,11 @@ mod tests {
 		migrations.insert(1, entry);
 
 		// In-range, owned: hit.
-		assert!(pending_owned_entry(&migrations, 150, local).is_some());
+		assert!(pending_owned_entry(&migrations, Locality::new(150), local).is_some());
 		// In-range, owned by someone else: miss.
-		assert!(pending_owned_entry(&migrations, 150, n(9)).is_none());
+		assert!(pending_owned_entry(&migrations, Locality::new(150), n(9)).is_none());
 		// Out of range: miss.
-		assert!(pending_owned_entry(&migrations, 50, local).is_none());
+		assert!(pending_owned_entry(&migrations, Locality::new(50), local).is_none());
 	}
 
 	#[test]
@@ -3805,7 +3941,7 @@ mod tests {
 		// Completed entries are not pull candidates — the caller
 		// must treat the local miss as a real not-found rather
 		// than re-issuing a MIGRATE_REQ against a drained source.
-		assert!(pending_owned_entry(&migrations, 50, local).is_none());
+		assert!(pending_owned_entry(&migrations, Locality::new(50), local).is_none());
 	}
 
 	/// Multi-Page Fat Key (Plan 019 adjustment #2).
@@ -3830,25 +3966,26 @@ mod tests {
 		// `(next_cursor_hash, next_cursor_hlc)` as the last row's
 		// `(key, hlc)`, loop until `has_more == 0`.
 		let mut collected: Vec<HybridTimestamp> = Vec::new();
-		let mut cursor_hash: u64 = 0;
+		let mut cursor_identity = Identity::ZERO;
 		let mut cursor_hlc: HybridTimestamp = hlc(0, 0, 0);
 		let max_records: usize = 10;
 		for _ in 0..15 {
-			let locations = mgr.scan_all_versions_from(key, key, floor, cursor_hash, cursor_hlc);
+			let locations =
+				mgr.scan_all_versions_from(key, key, floor, cursor_identity, cursor_hlc);
 			if locations.is_empty() {
 				break;
 			}
 			let take = locations.len().min(max_records);
-			for (h, loc) in locations.iter().take(take) {
-				assert_eq!(*h, key);
+			for (_tenant_id, h, loc) in locations.iter().take(take) {
+				assert_eq!(*h, id(key));
 				collected.push(loc.hlc);
 			}
 			let truncated = locations.len() > max_records;
 			if !truncated {
 				break;
 			}
-			let (last_h, last_loc) = locations[take - 1];
-			cursor_hash = last_h;
+			let (_last_tenant_id, last_h, last_loc) = locations[take - 1];
+			cursor_identity = last_h;
 			cursor_hlc = last_loc.hlc;
 		}
 
@@ -3896,15 +4033,16 @@ mod tests {
 		// the same `append_migration` path the real loop uses.
 		let hits = source_full.scan_all_versions(key, key, floor);
 		assert_eq!(hits.len(), 1);
-		let (h, loc) = hits[0];
+		let (tenant_id, h, loc) = hits[0];
+		assert_eq!(tenant_id, tenant());
 		let frame = source_full.read(loc).await.unwrap();
 		let payload_hash = *blake3::hash(&frame).as_bytes();
 		destination
-			.append_migration(1, h, loc.hlc, payload_hash, &frame)
+			.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 			.await
 			.unwrap();
 
-		let found = destination.lookup_as_of(key, v);
+		let found = destination.lookup_as_of(tenant(), id(key), v);
 		assert!(
 			found.is_some(),
 			"destination must resolve the key after falling through to a populated source"
@@ -3938,18 +4076,18 @@ mod tests {
 		// destination, mimicking `pull_migration_range` without the
 		// network. Every record goes through `append_migration`, the
 		// idempotent ingest boundary — so a rerun would be a no-op.
-		let pulled = source.scan_all_versions_from(0, 99, floor, 0, floor);
-		for (h, loc) in pulled {
+		let pulled = source.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
+		for (tenant_id, h, loc) in pulled {
 			let frame = source.read(loc).await.unwrap();
 			let payload_hash = *blake3::hash(&frame).as_bytes();
 			destination
-				.append_migration(1, h, loc.hlc, payload_hash, &frame)
+				.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 				.await
 				.unwrap();
 		}
 
 		// A window scan on the destination now sees the union.
-		let merged = destination.scan_as_of(0, 99, v);
+		let merged = destination.scan_as_of(tenant(), 0, 99, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		keys.dedup();
@@ -3993,18 +4131,18 @@ mod tests {
 		// Simulate pull_migration_range's drain-all behavior: walk
 		// *every* candidate in source_replicas, not just the first.
 		for src in [&source_a, &source_b] {
-			let rows = src.scan_all_versions_from(0, 99, floor, 0, floor);
-			for (h, loc) in rows {
+			let rows = src.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
+			for (tenant_id, h, loc) in rows {
 				let frame = src.read(loc).await.unwrap();
 				let payload_hash = *blake3::hash(&frame).as_bytes();
 				destination
-					.append_migration(1, h, loc.hlc, payload_hash, &frame)
+					.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 					.await
 					.unwrap();
 			}
 		}
 
-		let merged = destination.scan_as_of(0, 99, v);
+		let merged = destination.scan_as_of(tenant(), 0, 99, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		keys.dedup();
@@ -4090,14 +4228,14 @@ mod tests {
 		};
 		let payload_newer = *blake3::hash(&frame_newer).as_bytes();
 		destination
-			.append_migration(1, key, newer, payload_newer, &frame_newer)
+			.append_migration(1, tenant(), id(key), newer, payload_newer, &frame_newer)
 			.await
 			.unwrap();
 
 		// Client wants a version ≤ older.physical_ms; newer-only
 		// ingest cannot satisfy the read.
 		assert!(
-			destination.lookup_as_of(key, older).is_none(),
+			destination.lookup_as_of(tenant(), id(key), older).is_none(),
 			"newer-only ingest must not be treated as authoritative for older as_of"
 		);
 
@@ -4109,11 +4247,11 @@ mod tests {
 		};
 		let payload_older = *blake3::hash(&frame_older).as_bytes();
 		destination
-			.append_migration(1, key, older, payload_older, &frame_older)
+			.append_migration(1, tenant(), id(key), older, payload_older, &frame_older)
 			.await
 			.unwrap();
 		assert!(
-			destination.lookup_as_of(key, older).is_some(),
+			destination.lookup_as_of(tenant(), id(key), older).is_some(),
 			"after ingesting from a second source, the as_of read resolves"
 		);
 	}
@@ -4248,12 +4386,13 @@ mod tests {
 	#[tokio::test]
 	async fn migration_record_roundtrip_preserves_every_field() {
 		// Encode → decode must round-trip every column so the
-		// receiver's `append_migration` gets the same (key_hash,
+		// receiver's `append_migration` gets the same (key_identity,
 		// hlc, payload_hash, frame_bytes) tuple the sender read
 		// off disk.
 		let rows = vec![
 			(
-				7u64,
+				tenant(),
+				id(7),
 				crate::storage::core::RecordLocation {
 					slab_id: 0,
 					offset: 0,
@@ -4263,7 +4402,8 @@ mod tests {
 				b"frame-one".to_vec(),
 			),
 			(
-				42u64,
+				tenant(),
+				id(42),
 				crate::storage::core::RecordLocation {
 					slab_id: 0,
 					offset: 0,
@@ -4276,14 +4416,14 @@ mod tests {
 		let bytes = encode_migration_records(&rows).unwrap();
 		let decoded = decode_migration_records(&bytes).unwrap();
 		assert_eq!(decoded.len(), 2);
-		assert_eq!(decoded[0].key_hash, 7);
+		assert_eq!(decoded[0].key_identity, id(7));
 		assert_eq!(decoded[0].hlc, hlc(10, 2, 3));
 		assert_eq!(decoded[0].frame_bytes, b"frame-one");
 		assert_eq!(
 			decoded[0].payload_hash,
 			*blake3::hash(b"frame-one").as_bytes()
 		);
-		assert_eq!(decoded[1].key_hash, 42);
+		assert_eq!(decoded[1].key_identity, id(42));
 		assert_eq!(decoded[1].frame_bytes, b"frame-two");
 	}
 
@@ -4578,7 +4718,7 @@ mod tests {
 	}
 
 	struct FixedReplicaRouter {
-		routes: StdHashMap<u64, Vec<NodeId>>,
+		routes: StdHashMap<Locality, Vec<NodeId>>,
 		default: Vec<NodeId>,
 	}
 
@@ -4590,16 +4730,16 @@ mod tests {
 			}
 		}
 
-		fn with_route(mut self, key_hash: u64, replicas: Vec<NodeId>) -> Self {
-			self.routes.insert(key_hash, replicas);
+		fn with_route(mut self, locality: Locality, replicas: Vec<NodeId>) -> Self {
+			self.routes.insert(locality, replicas);
 			self
 		}
 	}
 
 	impl ReplicaRouter for FixedReplicaRouter {
-		fn replicas(&self, key_hash: u64) -> Vec<NodeId> {
+		fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
 			self.routes
-				.get(&key_hash)
+				.get(&locality)
 				.cloned()
 				.unwrap_or_else(|| self.default.clone())
 		}
@@ -4633,7 +4773,7 @@ mod tests {
 	}
 
 	impl CrashyReplicaService {
-		fn open(dir: std::path::PathBuf, pool: Arc<BufPool>) -> Arc<Self> {
+		async fn open(dir: std::path::PathBuf, pool: Arc<BufPool>) -> Arc<Self> {
 			let io = spawn_io_thread(64).unwrap();
 			let max_slab_bytes = 1 << 30;
 			let manager = Arc::new(
@@ -4643,7 +4783,9 @@ mod tests {
 					io: io.clone(),
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
+					group_commit: crate::storage::GroupCommitConfig::default(),
 				})
+				.await
 				.unwrap(),
 			);
 			Arc::new(Self {
@@ -4679,7 +4821,9 @@ mod tests {
 					io: self.io.clone(),
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
+					group_commit: crate::storage::GroupCommitConfig::default(),
 				})
+				.await
 				.unwrap(),
 			);
 		}
@@ -4726,7 +4870,12 @@ mod tests {
 				)
 			} else {
 				match manager
-					.append(meta.key_hash, meta.commit_hlc, arrow_bytes)
+					.append(
+						meta.tenant_id,
+						meta.key_identity,
+						meta.commit_hlc,
+						arrow_bytes,
+					)
 					.await
 				{
 					Ok(location) => (
@@ -4788,8 +4937,8 @@ mod tests {
 	}
 
 	async fn build_durability_fixture(
-		durable_key_hash: u64,
-		append_only_key_hash: u64,
+		durable_key_locality: u64,
+		append_only_key_locality: u64,
 	) -> DurabilityFixture {
 		let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			41,
@@ -4858,8 +5007,14 @@ mod tests {
 
 		let router: Arc<dyn ReplicaRouter> = Arc::new(
 			FixedReplicaRouter::new(vec![leader_id, durable_id, crashy_id])
-				.with_route(durable_key_hash, vec![leader_id, durable_id, crashy_id])
-				.with_route(append_only_key_hash, vec![leader_id, crashy_id]),
+				.with_route(
+					Locality::new(durable_key_locality),
+					vec![leader_id, durable_id, crashy_id],
+				)
+				.with_route(
+					Locality::new(append_only_key_locality),
+					vec![leader_id, crashy_id],
+				),
 		);
 
 		let leader = Arc::new(WendelonDataServer::new(
@@ -4890,7 +5045,7 @@ mod tests {
 				.with_data_ring(durable_data_ring)
 				.build(),
 		);
-		let crashy = CrashyReplicaService::open(fresh_dir("crashy-replica"), pool.clone());
+		let crashy = CrashyReplicaService::open(fresh_dir("crashy-replica"), pool.clone()).await;
 		let crashy_service: Arc<dyn HrftService> = crashy.clone();
 		handlers.register(durable_id, durable_service);
 		handlers.register(crashy_id, crashy_service);
@@ -4923,9 +5078,11 @@ mod tests {
 	async fn write_counts_only_durable_quorum_acks_across_replica_crash_boundary() {
 		let durable_key = b"durable-quorum";
 		let append_only_key = b"append-only";
-		let durable_key_hash = highway_hash(durable_key);
-		let append_only_key_hash = highway_hash(append_only_key);
-		let fx = build_durability_fixture(durable_key_hash, append_only_key_hash).await;
+		let durable_key_locality = key_locality(durable_key);
+		let append_only_key_locality = key_locality(append_only_key);
+		let durable_key_identity = Identity::blake3(durable_key);
+		let append_only_key_identity = Identity::blake3(append_only_key);
+		let fx = build_durability_fixture(durable_key_locality, append_only_key_locality).await;
 
 		let durable_value = b"v-durable";
 		let mut durable_meta = simple_write_meta(1);
@@ -4943,9 +5100,15 @@ mod tests {
 
 		let crashy_after_ok = fx.crashy.manager().await;
 		let durable_survivors = [
-			fx.leader_slab.lookup(durable_key_hash).is_some(),
-			fx.durable_slab.lookup(durable_key_hash).is_some(),
-			crashy_after_ok.lookup(durable_key_hash).is_some(),
+			fx.leader_slab
+				.lookup(tenant(), durable_key_identity)
+				.is_some(),
+			fx.durable_slab
+				.lookup(tenant(), durable_key_identity)
+				.is_some(),
+			crashy_after_ok
+				.lookup(tenant(), durable_key_identity)
+				.is_some(),
 		]
 		.into_iter()
 		.filter(|present| *present)
@@ -4955,7 +5118,9 @@ mod tests {
 			"only the two durably-acked replicas should retain the successful write"
 		);
 		assert!(
-			!crashy_after_ok.lookup(durable_key_hash).is_some(),
+			!crashy_after_ok
+				.lookup(tenant(), durable_key_identity)
+				.is_some(),
 			"append-only replica must lose its copy across the simulated crash"
 		);
 
@@ -4982,9 +5147,15 @@ mod tests {
 
 		let crashy_after_fail = fx.crashy.manager().await;
 		let append_only_survivors = [
-			fx.leader_slab.lookup(append_only_key_hash).is_some(),
-			fx.durable_slab.lookup(append_only_key_hash).is_some(),
-			crashy_after_fail.lookup(append_only_key_hash).is_some(),
+			fx.leader_slab
+				.lookup(tenant(), append_only_key_identity)
+				.is_some(),
+			fx.durable_slab
+				.lookup(tenant(), append_only_key_identity)
+				.is_some(),
+			crashy_after_fail
+				.lookup(tenant(), append_only_key_identity)
+				.is_some(),
 		]
 		.into_iter()
 		.filter(|present| *present)
@@ -5249,10 +5420,12 @@ mod tests {
 	/// source's slab. Bypasses the write path — we only need the
 	/// bytes on disk so the source's `handle_migrate` can scan
 	/// them.
-	async fn seed_source(slab: &SlabManager, key_hash: u64, hlc_v: HybridTimestamp, value: &[u8]) {
-		let batch = kv_batch(&key_hash.to_le_bytes(), value);
+	async fn seed_source(slab: &SlabManager, locality: u64, hlc_v: HybridTimestamp, value: &[u8]) {
+		let batch = kv_batch(&locality.to_le_bytes(), value);
 		let bytes = encode_batch(&batch).unwrap();
-		slab.append(key_hash, hlc_v, &bytes).await.unwrap();
+		slab.append(tenant(), id(locality), hlc_v, &bytes)
+			.await
+			.unwrap();
 	}
 
 	/// Regression for drain-all union over HRFT.
@@ -5281,7 +5454,7 @@ mod tests {
 			.await
 			.expect("drain-all must succeed when both sources are reachable");
 
-		let merged = fx.dest.slab.scan_as_of(0, 99, v);
+		let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		keys.dedup();
@@ -5291,7 +5464,7 @@ mod tests {
 	}
 
 	/// Regression for idempotent union: overlapping sources
-	/// re-emit the same `(key_hash, hlc, payload_hash)` tuples;
+	/// re-emit the same `(key_identity, hlc, payload_hash)` tuples;
 	/// `append_migration` must discard the duplicate after the
 	/// first source ingested it. Proves the correctness boundary
 	/// holds when the wire delivers overlapping rows.
@@ -5314,7 +5487,7 @@ mod tests {
 			.await
 			.expect("drain-all with overlap must succeed");
 
-		let merged = fx.dest.slab.scan_as_of(0, 99, v);
+		let merged = fx.dest.slab.scan_as_of(tenant(), 0, 99, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		keys.dedup();
@@ -5366,7 +5539,7 @@ mod tests {
 			.await
 			.expect("paged drain must succeed");
 
-		let merged = fx.dest.slab.scan_as_of(0, 24, v);
+		let merged = fx.dest.slab.scan_as_of(tenant(), 0, 24, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		keys.dedup();
@@ -5479,7 +5652,7 @@ mod tests {
 			.await
 			.expect("self must be skipped; pull succeeds via source_a");
 
-		let merged = fx.dest.slab.scan_as_of(0, 4, v);
+		let merged = fx.dest.slab.scan_as_of(tenant(), 0, 4, v);
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		assert_eq!(keys, vec![0, 1, 2, 3, 4]);

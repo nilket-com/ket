@@ -3,7 +3,6 @@ mod support;
 
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::sync::Arc;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, KeyRange, WendelonClient, WriteRequest,
@@ -11,16 +10,13 @@ use wendelon::client::{
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::schema::{
-	ClientWriteId, Consistency, DurabilityLevel, HybridTimestamp, NodeId, WriteRequestMeta,
-	write_payload_schema,
+	ClientWriteId, Consistency, DurabilityLevel, HybridTimestamp, Identity, Locality, NodeId,
+	TenantId, WriteRequestMeta, write_payload_schema,
 };
 
-const HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5745_4e44_454c_4f4e,
-	0x4841_5348_4b45_5901,
-	0x4441_5441_5249_4e47,
-	0x5354_454c_4c41_524f,
-]);
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -70,6 +66,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 		},
 		client_hlc: hlc(10_000 + sequence_no, 0, 44),
 		expected_epoch: epoch,
+		tenant_id: tenant(),
 		proxy_hop: 0,
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,
@@ -113,10 +110,8 @@ fn extract_single_kv(batch: &RecordBatch) -> (Vec<u8>, Vec<u8>) {
 	(keys.value(0).to_vec(), values.value(0).to_vec())
 }
 
-fn highway_hash(bytes: &[u8]) -> u64 {
-	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
-	hasher.append(bytes);
-	hasher.finalize64()
+fn key_locality(bytes: &[u8]) -> u64 {
+	Locality::from(Identity::blake3(bytes)).get()
 }
 
 async fn refresh_leases(node: &wendelon::node::WendelonNode) {
@@ -156,6 +151,7 @@ async fn client_query_streams_multiple_batches_and_terminates() {
 
 	let mut query = client
 		.query(
+			tenant(),
 			Vec::new(),
 			KeyRange::full(),
 			1,
@@ -180,7 +176,7 @@ async fn client_query_streams_multiple_batches_and_terminates() {
 	assert!(query.next_batch().await.unwrap().is_none());
 
 	let mut expected = rows.clone();
-	expected.sort_by_key(|(key, _)| highway_hash(key));
+	expected.sort_by_key(|(key, _)| key_locality(key));
 	assert_eq!(streamed, expected);
 
 	support::abort_node(&node);
@@ -199,6 +195,7 @@ async fn client_query_empty_result_terminates_cleanly() {
 
 	let mut query = client
 		.query(
+			tenant(),
 			Vec::new(),
 			KeyRange::full(),
 			1,

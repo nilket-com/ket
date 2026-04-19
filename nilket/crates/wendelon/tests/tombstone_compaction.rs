@@ -3,7 +3,6 @@ mod support;
 
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
-use highway::{HighwayHash, HighwayHasher, Key as HighwayKey};
 use std::sync::Arc;
 use std::time::Duration;
 use wendelon::consensus::{
@@ -14,17 +13,10 @@ use wendelon::network::server::HrftService;
 use wendelon::network::traits::DataRing;
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	Consistency, HybridTimestamp, NodeId, ReadRequestMeta, ReadStatus, read_key_schema,
-	write_payload_schema,
+	Consistency, HybridTimestamp, Identity, Locality, NodeId, ReadRequestMeta, ReadStatus,
+	TenantId, read_key_schema, write_payload_schema,
 };
 use wendelon::storage::core::StorageEngine;
-
-const HIGHWAY_KEY: HighwayKey = HighwayKey([
-	0x5745_4e44_454c_4f4e,
-	0x4841_5348_4b45_5901,
-	0x4441_5441_5249_4e47,
-	0x5354_454c_4c41_524f,
-]);
 
 fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	HybridTimestamp {
@@ -34,10 +26,16 @@ fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	}
 }
 
-fn highway_hash(bytes: &[u8]) -> u64 {
-	let mut hasher = HighwayHasher::new(HIGHWAY_KEY);
-	hasher.append(bytes);
-	hasher.finalize64()
+fn key_locality(bytes: &[u8]) -> u64 {
+	Locality::from(Identity::blake3(bytes)).get()
+}
+
+fn key_identity(bytes: &[u8]) -> Identity {
+	Identity::blake3(bytes)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
 }
 
 fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
@@ -88,7 +86,9 @@ async fn seed_source(
 ) {
 	let batch = kv_batch(key, value);
 	let bytes = support::encode_batch(&batch).unwrap();
-	slab.append(highway_hash(key), ts, &bytes).await.unwrap();
+	slab.append(tenant(), key_identity(key), ts, &bytes)
+		.await
+		.unwrap();
 }
 
 fn ledger_entry(
@@ -163,6 +163,7 @@ fn stale_read_meta(as_of_hlc: HybridTimestamp, key: &[u8]) -> ReadRequestMeta {
 	ReadRequestMeta {
 		min_hlc: hlc(0, 0, 0),
 		expected_epoch: 0,
+		tenant_id: tenant(),
 		consistency: Consistency::STALE,
 		_pad: [0; 3],
 		key_len: key.len() as u32,
@@ -196,7 +197,7 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 	);
 	let before_bytes = source.slab.local_l1_bytes().await;
 
-	let moved_hash = highway_hash(moved_key);
+	let moved_hash = key_locality(moved_key);
 	let entry = ledger_entry(
 		9_001,
 		dest.local_node,
@@ -238,10 +239,13 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		let after_bytes = source.slab.local_l1_bytes().await;
-		let moved_missing = source.slab.lookup_as_of(moved_hash, moved_ts).is_none();
+		let moved_missing = source
+			.slab
+			.lookup_as_of(tenant(), key_identity(moved_key), moved_ts)
+			.is_none();
 		let kept_present = source
 			.slab
-			.lookup_as_of(highway_hash(kept_key), keep_ts)
+			.lookup_as_of(tenant(), key_identity(kept_key), keep_ts)
 			.is_some();
 		if after_bytes < before_bytes && moved_missing && kept_present {
 			break;
@@ -255,7 +259,7 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 
 	let kept_loc = source
 		.slab
-		.lookup_as_of(highway_hash(kept_key), keep_ts)
+		.lookup_as_of(tenant(), key_identity(kept_key), keep_ts)
 		.expect("kept key retained");
 	let kept_bytes = source.slab.read(kept_loc).await.unwrap();
 	assert_eq!(decode_single_value(&kept_bytes), b"kept-value");
@@ -293,13 +297,13 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 		"precondition: history slab sealed"
 	);
 
-	let key_hash = highway_hash(migrated_key);
+	let key_locality = key_locality(migrated_key);
 	let entry = ledger_entry(
 		9_002,
 		dest.local_node,
 		vec![source.local_node],
-		key_hash,
-		key_hash,
+		key_locality,
+		key_locality,
 		hlc(0, 0, 0),
 	);
 	seed_migration(&source, entry.clone()).await;
@@ -335,7 +339,11 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
-		if source.slab.lookup_as_of(key_hash, newer).is_none() {
+		if source
+			.slab
+			.lookup_as_of(tenant(), key_identity(migrated_key), newer)
+			.is_none()
+		{
 			break;
 		}
 		assert!(
