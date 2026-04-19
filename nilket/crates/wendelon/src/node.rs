@@ -7,16 +7,17 @@
 //! the glue that hands one module's output to the next.
 //!
 //! The genesis pattern here is deliberately minimal: one node, RF=1,
-//! durable local Raft artifacts, no QUIC endpoint. Multi-node
-//! deployments layer on top by swapping the
-//! `NoDialTransportProvider` for a real
-//! [`QuicTransportProvider`] and by joining an existing cluster
-//! instead of calling [`openraft::Raft::initialize`].
+//! durable local Raft artifacts, and the same transport abstractions
+//! the multi-node path uses. When `[transport.tls]` is configured,
+//! bootstrap binds a real QUIC endpoint plus the TCP+TLS fallback
+//! listener, advertises both tiers, and routes outbound dials through
+//! the shared transport factory; otherwise tests and single-node dev
+//! flows can still supply an in-process provider.
 //!
 //! ## What this file does NOT own
 //!
-//! * TLS material — callers construct [`TlsMaterial`] and pass an
-//!   optional `quinn::Endpoint` in via [`WendelonNode::attach_quic`].
+//! * TLS material lifetime beyond initial endpoint construction —
+//!   hot cert rotation still needs an outer supervisor.
 //! * CLI parsing / config file loading — `src/main.rs` handles that
 //!   and hands [`NodeBootstrapConfig`] in fully populated.
 //! * Graceful shutdown orchestration beyond the node's explicit
@@ -24,16 +25,22 @@
 //!   tasks; [`WendelonNode::shutdown`] aborts and joins them once
 //!   request drain has completed.
 
+use crate::audit::{AuditClockDriftSubscriber, AuditSink, LocalAuditSink};
 use crate::consensus::WendelonRaft;
+use crate::consensus::hlc::HybridLogicalClockDriver;
 use crate::consensus::monitor::{
-	AbortHandle, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL, LeaderStatus, MembershipAdvancer,
-	NodeTracker, PhysicalClock, ProcessAbort, SystemClock, spawn_drift_monitor,
+	AbortHandle, ClockDriftEvent, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL,
+	FanoutClockDriftSubscriber, LeaderStatus, MembershipAdvancer, NodeTracker, PhysicalClock,
+	ProcessAbort, SystemClock, WatchClockDriftSubscriber, spawn_drift_monitor_with_subscriber,
 	spawn_eviction_watchdog,
 };
 use crate::consensus::raft_network::WendelonRaftNetworkFactory;
 use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
 	CheckpointCoordinator, DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
+};
+use crate::metrics::observability::{
+	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
 };
 use crate::network::control_server::{
 	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer, select_bootstrap_epoch,
@@ -48,9 +55,16 @@ use crate::network::lease_signing::{
 	LeaseAuthority, dev_lease_signing_secret, lease_verifying_key_bytes,
 };
 use crate::network::pool::BufPool;
+use crate::network::quic_transport::{
+	QuicTransportProvider, canonical_server_name_resolver, endpoint_from_tls,
+};
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
-use crate::network::server::{HrftService, LifecycleService, ServerLifecycle, serve};
+use crate::network::server::{
+	HrftService, LifecycleService, ServerLifecycle, serve, serve_tcp_tls,
+};
+use crate::network::tcp_tls_transport::TcpTlsTransportProvider;
+use crate::network::tls::{TlsMaterial, rustls_client_config, rustls_server_config};
 use crate::network::transfer_signing::{
 	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
 };
@@ -69,10 +83,13 @@ use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 // ============================================================
 //  CONFIG
@@ -88,6 +105,20 @@ pub struct SeedNodeConfig {
 pub enum ClusterBootstrapConfig {
 	Bootstrap,
 	Join { seeds: Vec<SeedNodeConfig> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportTlsConfig {
+	pub cert_path: PathBuf,
+	pub key_path: PathBuf,
+	pub node_ca_path: PathBuf,
+	pub operator_ca_path: PathBuf,
+	pub cluster_domain: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservabilityConfig {
+	pub listeners: ListenerAddresses,
 }
 
 /// Caller-supplied parameters for [`WendelonNode::bootstrap`].
@@ -134,6 +165,14 @@ pub struct NodeBootstrapConfig {
 	/// Rolling-upgrade compatibility window advertised by this
 	/// node during join and reconnect flows.
 	pub protocol: ProtocolVersionWindow,
+	/// Optional transport TLS material used by concrete socket-based
+	/// providers and observability listeners.
+	pub transport_tls: Option<TransportTlsConfig>,
+	/// Maximum tolerated drift between the local physical clock and
+	/// the cluster median before the node aborts.
+	pub drift_max_offset_ms: u64,
+	/// Optional three-listener observability topology.
+	pub observability: Option<ObservabilityConfig>,
 }
 
 impl NodeBootstrapConfig {
@@ -164,6 +203,9 @@ impl NodeBootstrapConfig {
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
 			protocol: ProtocolVersionWindow::default(),
+			transport_tls: None,
+			drift_max_offset_ms: crate::consensus::monitor::MAX_OFFSET_MS,
+			observability: None,
 		}
 	}
 
@@ -279,6 +321,62 @@ impl NodeBootstrapConfig {
 				}
 			}
 		}
+		if let Some(tls) = &self.transport_tls {
+			if tls.cluster_domain.trim().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"transport_tls.cluster_domain must not be empty",
+				));
+			}
+			for (field, path) in [
+				("transport_tls.cert_path", &tls.cert_path),
+				("transport_tls.key_path", &tls.key_path),
+				("transport_tls.node_ca_path", &tls.node_ca_path),
+				("transport_tls.operator_ca_path", &tls.operator_ca_path),
+			] {
+				if !path.is_file() {
+					return Err(Error::new(
+						ErrorKind::NotFound,
+						format!("{field} is not an existing file: {}", path.display()),
+					));
+				}
+			}
+		}
+		if self.drift_max_offset_ms == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"drift_max_offset_ms must be greater than zero",
+			));
+		}
+		if let Some(obs) = &self.observability {
+			if self.transport_tls.is_none() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"observability requires transport_tls for the mTLS ready and metrics listeners",
+				));
+			}
+			for (field, value) in [
+				(
+					"observability.listeners.health",
+					obs.listeners.health.as_str(),
+				),
+				(
+					"observability.listeners.ready",
+					obs.listeners.ready.as_str(),
+				),
+				(
+					"observability.listeners.metrics",
+					obs.listeners.metrics.as_str(),
+				),
+			] {
+				if value.trim().is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!("{field} must not be empty"),
+					));
+				}
+			}
+		}
 		wire::validate_protocol_window(self.protocol)?;
 		Ok(())
 	}
@@ -296,6 +394,7 @@ pub struct WendelonNode {
 	pub slab: Arc<SlabManager>,
 	pub tracker: Arc<NodeTracker>,
 	pub clock: Arc<dyn PhysicalClock>,
+	pub hlc: Arc<HybridLogicalClockDriver>,
 	pub raft: WendelonRaft,
 	pub log_store: WendelonLogStore,
 	pub state_machine: WendelonStateMachine,
@@ -308,6 +407,9 @@ pub struct WendelonNode {
 	pub epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	pub protocol: ProtocolVersionWindow,
 	pub lifecycle: ServerLifecycle,
+	pub audit_sink: Arc<dyn AuditSink>,
+	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
+	transport_servers: Vec<NodeTransportServer>,
 	pub handles: NodeHandles,
 }
 
@@ -378,9 +480,64 @@ impl QuicServerHandle {
 				format!("QUIC server task failed during shutdown: {err}"),
 			)
 		})?;
+		self.endpoint.close(0u32.into(), b"shutdown");
 		self.endpoint.wait_idle().await;
 		result
 	}
+}
+
+pub struct TcpTlsServerHandle {
+	lifecycle: ServerLifecycle,
+	task: JoinHandle<std::io::Result<()>>,
+}
+
+impl TcpTlsServerHandle {
+	pub fn begin_drain(&self) {
+		self.lifecycle.begin_drain();
+	}
+
+	pub async fn shutdown(self) -> std::io::Result<()> {
+		self.begin_drain();
+		self.task.await.map_err(|err| {
+			Error::new(
+				ErrorKind::Other,
+				format!("TCP+TLS server task failed during shutdown: {err}"),
+			)
+		})?
+	}
+}
+
+enum NodeTransportServer {
+	Quic(QuicServerHandle),
+	TcpTls(TcpTlsServerHandle),
+}
+
+impl NodeTransportServer {
+	fn begin_drain(&self) {
+		match self {
+			Self::Quic(handle) => handle.begin_drain(),
+			Self::TcpTls(handle) => handle.begin_drain(),
+		}
+	}
+
+	async fn shutdown(self) -> std::io::Result<()> {
+		match self {
+			Self::Quic(handle) => handle.shutdown().await,
+			Self::TcpTls(handle) => handle.shutdown().await,
+		}
+	}
+}
+
+enum BootstrapListener {
+	Quic {
+		endpoint: quinn::Endpoint,
+		cluster_domain: String,
+	},
+	TcpTls {
+		listener: TcpListener,
+		acceptor: TlsAcceptor,
+		cluster_domain: String,
+	},
 }
 
 /// Time-to-live the lease manager requests on every grant. The
@@ -403,10 +560,53 @@ impl WendelonNode {
 	/// fresh-cluster step and restarts from the recovered Raft
 	/// artifacts.
 	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		if let Some(tls) = cfg.transport_tls.clone() {
+			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
+			let bind_addr = resolve_socket_addr(&cfg.advertise_address)?;
+			let cluster_domain = tls.cluster_domain.clone();
+			let server_name = canonical_server_name_resolver(&cluster_domain);
+			let quic_endpoint = endpoint_from_tls(&material, bind_addr)?;
+			let tcp_listener = TcpListener::bind(&cfg.advertise_address).await?;
+			let tcp_acceptor = TlsAcceptor::from(Arc::new(rustls_server_config(&material)?));
+			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+			providers.insert(
+				TransportTier::QuicIoUring,
+				Arc::new(QuicTransportProvider::with_cluster_domain(
+					Arc::new(quic_endpoint.clone()),
+					server_name.clone(),
+					&cluster_domain,
+				)),
+			);
+			providers.insert(
+				TransportTier::TcpTls,
+				Arc::new(TcpTlsTransportProvider::with_cluster_domain(
+					rustls_client_config(&material)?,
+					server_name,
+					&cluster_domain,
+				)),
+			);
+			return Self::bootstrap_with_transport_stack(
+				cfg,
+				socket_transport_tiers(),
+				providers,
+				vec![
+					BootstrapListener::Quic {
+						endpoint: quic_endpoint,
+						cluster_domain: cluster_domain.clone(),
+					},
+					BootstrapListener::TcpTls {
+						listener: tcp_listener,
+						acceptor: tcp_acceptor,
+						cluster_domain,
+					},
+				],
+			)
+			.await;
+		}
 		if matches!(cfg.cluster, ClusterBootstrapConfig::Join { .. }) {
 			return Err(Error::new(
 				ErrorKind::Unsupported,
-				"cluster.join requires a real outbound transport; use bootstrap_with_provider until transport endpoint wiring is attached",
+				"cluster.join requires transport_tls or a caller-supplied real transport provider",
 			));
 		}
 		Self::bootstrap_with_provider(cfg, Arc::new(NoDialTransportProvider)).await
@@ -427,6 +627,49 @@ impl WendelonNode {
 	pub async fn bootstrap_with_provider(
 		cfg: NodeBootstrapConfig,
 		provider: Arc<dyn TransportProvider>,
+	) -> std::io::Result<Self> {
+		Self::bootstrap_with_provider_at_tier(cfg, provider, TransportTier::QuicIoUring).await
+	}
+
+	pub async fn bootstrap_with_provider_at_tier(
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+		provider_tier: TransportTier,
+	) -> std::io::Result<Self> {
+		let startup_listeners = if provider_tier == TransportTier::TcpTls {
+			let tls = cfg.transport_tls.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"TcpTls bootstrap requires transport_tls so the inbound listener can start before join",
+				)
+			})?;
+			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
+			let listener = TcpListener::bind(&cfg.advertise_address).await?;
+			let acceptor = TlsAcceptor::from(Arc::new(rustls_server_config(&material)?));
+			vec![BootstrapListener::TcpTls {
+				listener,
+				acceptor,
+				cluster_domain: tls.cluster_domain.clone(),
+			}]
+		} else {
+			Vec::new()
+		};
+		let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+		providers.insert(provider_tier, provider);
+		Self::bootstrap_with_transport_stack(
+			cfg,
+			transport_tiers_for_provider(provider_tier),
+			providers,
+			startup_listeners,
+		)
+		.await
+	}
+
+	async fn bootstrap_with_transport_stack(
+		cfg: NodeBootstrapConfig,
+		local_tiers: TransportTierSet,
+		providers: HashMap<TransportTier, Arc<dyn TransportProvider>>,
+		startup_listeners: Vec<BootstrapListener>,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let local_node = NodeId {
@@ -483,7 +726,8 @@ impl WendelonNode {
 		//    If recovery finds a committed-but-unseeded transition,
 		//    `select_bootstrap_epoch` holds visibility at the prior
 		//    epoch until the reconciler finishes auto-seeding.
-		let fallback_epoch = seed_single_node_epoch(local_node, &cfg.advertise_address);
+		let fallback_epoch =
+			seed_single_node_epoch(local_node, &cfg.advertise_address, local_tiers);
 		let recovered_state = state_machine.state_snapshot().await;
 		let mut recovered_tiers = recovered_state
 			.tiered_slabs
@@ -510,25 +754,28 @@ impl WendelonNode {
 		//    internal server, the drift monitor, and the eviction
 		//    watchdog.
 		let clock: Arc<dyn PhysicalClock> = Arc::new(SystemClock);
+		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
+		let audit_sink: Arc<dyn AuditSink> =
+			Arc::new(LocalAuditSink::open(cfg.data_dir.join("audit.ndjson"))?);
+		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);
 
-		// 7. Transport factory — today every node advertises the
-		//    QUIC tier shape, but the concrete dialer is supplied by
-		//    the caller so tests can use a real in-process transport
-		//    while production code plugs in QUIC later.
-		let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
-		providers.insert(TransportTier::QuicIoUring, provider.clone());
+		// 7. Transport factory — tests can still swap in loopback
+		//    providers, while the production bootstrap path binds a
+		//    real QUIC endpoint and installs its provider above.
+		let publish_providers = providers.values().cloned().collect::<Vec<_>>();
 		let resolver = Arc::new(crate::network::transport::EpochCapabilityResolver::new(
 			epoch_rx.clone(),
 		));
-		let local_tiers = advertised_tiers();
 		let factory =
 			TransportProviderFactory::new(local_tiers, providers, resolver, epoch_rx.clone());
+		let dial_provider: Arc<dyn TransportProvider> = factory.clone();
 
-		// 8. Raft network factory — uses the same provider so
-		//    leader-side membership changes can immediately dial a
-		//    joining node's freshly-published Raft service.
-		let raft_network = WendelonRaftNetworkFactory::new(provider.clone(), pool.clone());
+		// 8. Raft network factory — uses the same shared
+		//    tier-negotiating dialer as the rest of the node, so
+		//    consensus traffic participates in the same QUIC/TCP
+		//    fallback behavior as join and data/control RPCs.
+		let raft_network = WendelonRaftNetworkFactory::new(dial_provider.clone(), pool.clone());
 
 		// 9. openraft engine. `validate()` pins heartbeat / election
 		//    timeouts against `Config`'s sanity checks.
@@ -563,11 +810,17 @@ impl WendelonNode {
 
 		// 11. Drift monitor.
 		let abort: Arc<dyn AbortHandle> = Arc::new(ProcessAbort);
-		let drift_monitor = spawn_drift_monitor(
+		let drift_subscriber = Arc::new(FanoutClockDriftSubscriber::new(vec![
+			Arc::new(WatchClockDriftSubscriber::new(clock_drift_tx)),
+			Arc::new(AuditClockDriftSubscriber::new(audit_sink.clone())),
+		]));
+		let drift_monitor = spawn_drift_monitor_with_subscriber(
 			tracker.clone(),
 			clock.clone(),
 			abort.clone(),
+			drift_subscriber,
 			DRIFT_CHECK_INTERVAL,
+			cfg.drift_max_offset_ms,
 		);
 
 		// 12. Data Ring + Raft Internal Ring servers. Both observe
@@ -587,6 +840,7 @@ impl WendelonNode {
 				factory.clone(),
 				pool.clone(),
 			)
+			.with_hlc(hlc.clone())
 			.with_lease_authority(lease_authority.clone())
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true),
@@ -624,7 +878,36 @@ impl WendelonNode {
 		let lifecycle = ServerLifecycle::new();
 		let service: Arc<dyn HrftService> =
 			Arc::new(LifecycleService::new(router.clone(), lifecycle.clone()));
-		provider.publish_local(local_node, &cfg.advertise_address, service.clone())?;
+		for provider in publish_providers {
+			provider.publish_local(local_node, &cfg.advertise_address, service.clone())?;
+		}
+		let transport_servers = startup_listeners
+			.into_iter()
+			.map(|listener| match listener {
+				BootstrapListener::Quic {
+					endpoint,
+					cluster_domain,
+				} => NodeTransportServer::Quic(spawn_quic_server(
+					endpoint,
+					service.clone(),
+					pool.clone(),
+					lifecycle.clone(),
+					cluster_domain,
+				)),
+				BootstrapListener::TcpTls {
+					listener,
+					acceptor,
+					cluster_domain,
+				} => NodeTransportServer::TcpTls(spawn_tcp_tls_server(
+					listener,
+					acceptor,
+					service.clone(),
+					pool.clone(),
+					lifecycle.clone(),
+					cluster_domain,
+				)),
+			})
+			.collect::<Vec<_>>();
 		let epoch_reconciler = control_server.clone().spawn_epoch_reconciler();
 
 		// 14. Fresh nodes either initialize a one-node cluster or
@@ -652,7 +935,7 @@ impl WendelonNode {
 						local_tiers,
 						advertised_roles(),
 						cfg.protocol,
-						provider.clone(),
+						dial_provider.clone(),
 						pool.clone(),
 						seeds,
 					)
@@ -702,6 +985,7 @@ impl WendelonNode {
 			slab,
 			tracker,
 			clock,
+			hlc,
 			raft,
 			log_store,
 			state_machine,
@@ -714,6 +998,9 @@ impl WendelonNode {
 			epoch_tx,
 			protocol: cfg.protocol,
 			lifecycle,
+			audit_sink,
+			clock_drift_events: clock_drift_rx,
+			transport_servers,
 			handles: NodeHandles {
 				ring_updater,
 				drift_monitor,
@@ -726,27 +1013,51 @@ impl WendelonNode {
 		})
 	}
 
+	pub fn subscribe_clock_drift(&self) -> watch::Receiver<Option<ClockDriftEvent>> {
+		self.clock_drift_events.clone()
+	}
+
 	/// Spawn the QUIC accept loop against an already-bound
 	/// `quinn::Endpoint`. Kept separate from bootstrap so tests can
 	/// exercise the in-process surface without binding a socket.
-	pub fn serve_quic(&self, endpoint: quinn::Endpoint) -> QuicServerHandle {
+	pub fn serve_quic(
+		&self,
+		endpoint: quinn::Endpoint,
+		cluster_domain: impl Into<String>,
+	) -> QuicServerHandle {
+		spawn_quic_server(
+			endpoint,
+			self.service.clone(),
+			self.pool.clone(),
+			self.lifecycle.clone(),
+			cluster_domain.into(),
+		)
+	}
+
+	pub fn serve_tcp_tls(
+		&self,
+		listener: TcpListener,
+		acceptor: TlsAcceptor,
+		cluster_domain: impl Into<String>,
+	) -> TcpTlsServerHandle {
 		let svc = self.service.clone();
 		let pool = self.pool.clone();
-		let task_endpoint = endpoint.clone();
 		let lifecycle = self.lifecycle.clone();
+		let cluster_domain = cluster_domain.into();
 		let task = tokio::spawn({
 			let lifecycle = lifecycle.clone();
-			async move { serve_dyn(task_endpoint, svc, pool, lifecycle).await }
+			async move {
+				serve_dyn_tcp_tls(listener, acceptor, svc, pool, lifecycle, cluster_domain).await
+			}
 		});
-		QuicServerHandle {
-			endpoint,
-			lifecycle,
-			task,
-		}
+		TcpTlsServerHandle { lifecycle, task }
 	}
 
 	pub fn begin_drain(&self) {
 		self.lifecycle.begin_drain();
+		for server in &self.transport_servers {
+			server.begin_drain();
+		}
 	}
 
 	pub async fn wait_for_drain(&self) {
@@ -755,8 +1066,12 @@ impl WendelonNode {
 
 	pub async fn shutdown(self) -> std::io::Result<()> {
 		let lifecycle = self.lifecycle;
+		let transport_servers = self.transport_servers;
 		let handles = self.handles;
 		lifecycle.begin_drain();
+		for server in &transport_servers {
+			server.begin_drain();
+		}
 		// Stop internal maintenance loops before waiting for
 		// quiescence. Otherwise a background lease renewal or
 		// migration commit can keep generating in-flight Control
@@ -764,7 +1079,54 @@ impl WendelonNode {
 		// drain, especially after a peer has already left.
 		handles.abort();
 		lifecycle.wait_for_quiescence().await;
+		for server in transport_servers {
+			server.shutdown().await?;
+		}
 		handles.shutdown().await
+	}
+
+	pub fn readiness_reporter(&self) -> NodeReadinessView {
+		NodeReadinessView {
+			local_node: self.local_node,
+			epoch_tx: self.epoch_tx.clone(),
+			raft: self.raft.clone(),
+			lifecycle: self.lifecycle.clone(),
+		}
+	}
+}
+
+#[derive(Clone)]
+pub struct NodeReadinessView {
+	local_node: NodeId,
+	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	raft: WendelonRaft,
+	lifecycle: ServerLifecycle,
+}
+
+#[async_trait]
+impl ReadinessReporter for NodeReadinessView {
+	async fn snapshot(&self) -> ReadinessSnapshot {
+		let epoch = self.epoch_tx.borrow().clone();
+		let mut members = epoch.peers.keys().map(|node| node.id).collect::<Vec<_>>();
+		members.sort_unstable();
+		let drain_state = if self.lifecycle.is_draining() {
+			if self.lifecycle.in_flight() == 0 {
+				DrainState::Drained
+			} else {
+				DrainState::Draining
+			}
+		} else {
+			DrainState::None
+		};
+		ReadinessSnapshot {
+			node_id: self.local_node.id,
+			epoch: epoch.epoch,
+			leader_id: self.raft.current_leader().await,
+			cluster_members: members,
+			drain_state,
+			audit_materialization_lag_entries: 0,
+			degraded_reason: None,
+		}
 	}
 }
 
@@ -776,6 +1138,7 @@ async fn serve_dyn(
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	cluster_domain: String,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -797,28 +1160,121 @@ async fn serve_dyn(
 			self.0.handle_stream(stream, pool, remote).await
 		}
 	}
-	serve(endpoint, Arc::new(DynService(service)), pool, lifecycle).await
+	serve(
+		endpoint,
+		Arc::new(DynService(service)),
+		pool,
+		lifecycle,
+		cluster_domain,
+	)
+	.await
+}
+
+async fn serve_dyn_tcp_tls(
+	listener: TcpListener,
+	acceptor: TlsAcceptor,
+	service: Arc<dyn HrftService>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	cluster_domain: String,
+) -> std::io::Result<()> {
+	struct DynService(Arc<dyn HrftService>);
+	#[async_trait]
+	impl HrftService for DynService {
+		async fn handle_frame(
+			&self,
+			remote: crate::schema::NodeId,
+			frame: crate::network::core::HrftFrame,
+		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
+			self.0.handle_frame(remote, frame).await
+		}
+
+		async fn handle_stream(
+			&self,
+			stream: Box<dyn crate::network::transport::TransportStream>,
+			pool: Arc<BufPool>,
+			remote: crate::schema::NodeId,
+		) -> std::io::Result<()> {
+			self.0.handle_stream(stream, pool, remote).await
+		}
+	}
+
+	serve_tcp_tls(
+		listener,
+		acceptor,
+		Arc::new(DynService(service)),
+		pool,
+		lifecycle,
+		cluster_domain,
+	)
+	.await
+}
+
+fn spawn_quic_server(
+	endpoint: quinn::Endpoint,
+	service: Arc<dyn HrftService>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	cluster_domain: String,
+) -> QuicServerHandle {
+	let task_endpoint = endpoint.clone();
+	let task = tokio::spawn({
+		let lifecycle = lifecycle.clone();
+		async move { serve_dyn(task_endpoint, service, pool, lifecycle, cluster_domain).await }
+	});
+	QuicServerHandle {
+		endpoint,
+		lifecycle,
+		task,
+	}
+}
+
+fn spawn_tcp_tls_server(
+	listener: TcpListener,
+	acceptor: TlsAcceptor,
+	service: Arc<dyn HrftService>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	cluster_domain: String,
+) -> TcpTlsServerHandle {
+	let task = tokio::spawn({
+		let lifecycle = lifecycle.clone();
+		async move {
+			serve_dyn_tcp_tls(listener, acceptor, service, pool, lifecycle, cluster_domain).await
+		}
+	});
+	TcpTlsServerHandle { lifecycle, task }
 }
 
 // ============================================================
 //  HELPERS
 // ============================================================
 
-fn seed_single_node_epoch(local: NodeId, address: &str) -> MembershipEpoch {
+fn seed_single_node_epoch(
+	local: NodeId,
+	address: &str,
+	tiers: TransportTierSet,
+) -> MembershipEpoch {
 	let mut peers = HashMap::new();
 	peers.insert(
 		local,
 		PeerCapabilities {
 			address: address.to_string(),
-			tiers: advertised_tiers(),
+			tiers,
 			roles: advertised_roles(),
 		},
 	);
 	MembershipEpoch { epoch: 1, peers }
 }
 
-fn advertised_tiers() -> TransportTierSet {
-	TransportTierSet::empty().with(TransportTier::QuicIoUring)
+fn transport_tiers_for_provider(provider_tier: TransportTier) -> TransportTierSet {
+	TransportTierSet::empty().with(provider_tier)
+}
+
+fn socket_transport_tiers() -> TransportTierSet {
+	TransportTierSet::empty()
+		.with(TransportTier::QuicIoUring)
+		.with(TransportTier::TcpTls)
 }
 
 fn advertised_roles() -> NodeRoleSet {
@@ -833,6 +1289,21 @@ fn control_artifact_paths(data_dir: &std::path::Path) -> (PathBuf, PathBuf, Path
 		data_dir.join("vote.wnd"),
 		data_dir.join("snapshot.wnd"),
 	)
+}
+
+fn resolve_socket_addr(address: &str) -> std::io::Result<SocketAddr> {
+	let mut addrs = address.to_socket_addrs().map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("advertise_address {address:?} is not a resolvable socket address: {err}"),
+		)
+	})?;
+	addrs.next().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("advertise_address {address:?} resolved to no socket addresses"),
+		)
+	})
 }
 
 async fn wait_for_local_leader(raft: &WendelonRaft, local_node: NodeId) -> std::io::Result<()> {
@@ -1130,6 +1601,25 @@ mod tests {
 		// Raft reaches leadership asynchronously after initialize.
 		wait_for_local_leader(&node).await;
 		assert_eq!(node.raft.current_leader().await, Some(node.local_node.id));
+	}
+
+	#[tokio::test]
+	async fn tcp_tls_bootstrap_requires_transport_tls_material() {
+		let result = WendelonNode::bootstrap_with_provider_at_tier(
+			NodeBootstrapConfig::dev(9, tempdir("tcp-tls-missing"), "127.0.0.1:0".into()),
+			Arc::new(NoDialTransportProvider),
+			TransportTier::TcpTls,
+		)
+		.await;
+		let err = match result {
+			Ok(_) => panic!("expected TcpTls bootstrap without transport TLS to fail"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
+		assert!(
+			err.to_string()
+				.contains("TcpTls bootstrap requires transport_tls")
+		);
 	}
 
 	#[tokio::test]

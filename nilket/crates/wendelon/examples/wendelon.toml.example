@@ -35,3 +35,27 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 
 [identity.trusted_transfer_signers]
 "{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"
+
+# Optional inter-node mTLS transport. When configured, Wendelon binds
+# the real QUIC transport stack (`quinn`) plus the TCP+TLS fallback
+# listener, advertises both tiers, and uses this identity for both
+# inbound accepts and outbound dials. Required for multi-node joins
+# outside the in-process loopback harness.
+#
+# [transport.tls]
+# cert_path = "certs/node.crt"
+# key_path = "certs/node.key"
+# node_ca_path = "certs/node-ca.crt"
+# operator_ca_path = "certs/ops-ca.crt"
+# cluster_domain = "cluster.local"
+#
+# [time]
+# drift_max_offset_ms = 500
+#
+# Optional observability listener topology. `/ready` and `/metrics`
+# are mTLS-gated and therefore require `[transport.tls]`.
+#
+# [observability.listeners]
+# health = "0.0.0.0:7431"
+# ready = "0.0.0.0:7432"
+# metrics = "0.0.0.0:7433"

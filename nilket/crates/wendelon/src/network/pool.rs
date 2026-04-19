@@ -56,7 +56,30 @@ impl BufPool {
 	/// Acquire a reusable buffer. The returned `PooledBuf` has
 	/// `len() == 0` but may carry non-zero capacity from prior use.
 	pub fn acquire(self: &Arc<Self>) -> PooledBuf {
-		let buf = self.bufs.lock().unwrap().pop().unwrap_or_default();
+		self.acquire_at_least(0)
+	}
+
+	/// Acquire a reusable buffer whose capacity is at least
+	/// `min_capacity` when the free list can satisfy that request.
+	///
+	/// The selection is capacity-aware rather than pure LIFO so the
+	/// framing hot path can reuse a "best fit" buffer for each frame
+	/// section and avoid a resize allocation after warmup.
+	pub fn acquire_at_least(self: &Arc<Self>, min_capacity: usize) -> PooledBuf {
+		let buf = {
+			let mut pool = self.bufs.lock().unwrap();
+			let best_fit = pool
+				.iter()
+				.enumerate()
+				.filter(|(_, buf)| buf.capacity() >= min_capacity)
+				.min_by_key(|(_, buf)| buf.capacity())
+				.map(|(idx, _)| idx);
+			match best_fit {
+				Some(idx) => pool.swap_remove(idx),
+				None if min_capacity == 0 => pool.pop().unwrap_or_default(),
+				None => Vec::with_capacity(min_capacity),
+			}
+		};
 		PooledBuf {
 			buf,
 			pool: Some(Arc::downgrade(self)),
@@ -248,5 +271,46 @@ mod tests {
 		// PooledBuf drop tries to upgrade the weak handle, fails,
 		// and the Vec drops normally. No panic, no leak.
 		drop(buf);
+	}
+
+	#[test]
+	fn acquire_at_least_prefers_best_fit_capacity() {
+		let pool = BufPool::new(4, 4096);
+		let mut small = pool.acquire();
+		small.as_mut_vec().resize(256, 0);
+		let small_cap = small.as_vec().capacity();
+		let mut medium = pool.acquire();
+		medium.as_mut_vec().resize(1024, 0);
+		let medium_cap = medium.as_vec().capacity();
+		let mut large = pool.acquire();
+		large.as_mut_vec().resize(2048, 0);
+		let large_cap = large.as_vec().capacity();
+		drop(small);
+		drop(medium);
+		drop(large);
+
+		let mut remaining = vec![small_cap, medium_cap, large_cap];
+		let expected_medium = remaining
+			.iter()
+			.copied()
+			.filter(|cap| *cap >= 700)
+			.min()
+			.unwrap();
+		let medium = pool.acquire_at_least(700);
+		assert_eq!(medium.as_vec().capacity(), expected_medium);
+		let medium_pos = remaining
+			.iter()
+			.position(|cap| *cap == expected_medium)
+			.unwrap();
+		remaining.remove(medium_pos);
+
+		let expected_small = remaining
+			.iter()
+			.copied()
+			.filter(|cap| *cap >= 128)
+			.min()
+			.unwrap();
+		let small = pool.acquire_at_least(128);
+		assert_eq!(small.as_vec().capacity(), expected_small);
 	}
 }

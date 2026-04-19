@@ -45,6 +45,7 @@ pub struct MetricsRegistry {
 	pub liveness_stale_peers: Gauge,
 	pub clock_drift_checks_total: Counter,
 	pub clock_drift_insufficient_samples_total: Counter,
+	pub clock_drift_exceeded_total: Counter,
 	pub clock_drift_offset_ms: Gauge,
 	pub eviction_sweeps_total: Counter,
 	pub eviction_refused_quorum_total: Counter,
@@ -105,6 +106,12 @@ impl MetricsRegistry {
 			"wendelon_clock_drift_insufficient_samples_total",
 			"Clock drift checks skipped because the cluster lacked enough samples.",
 			self.clock_drift_insufficient_samples_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_clock_drift_exceeded_total",
+			"Clock drift checks that exceeded the allowed bound.",
+			self.clock_drift_exceeded_total.get(),
 		);
 		render_gauge(
 			&mut out,

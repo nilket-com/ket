@@ -10,8 +10,10 @@
 //! `FrameHeader` is a `#[repr(C)] + bytemuck::Pod` struct so it is
 //! read and written as raw bytes without any (de)serialization.
 //! The three variable-length sections are pulled off the wire into
-//! [`PooledBuf`]s drawn from a shared [`BufPool`] — steady-state
-//! traffic recycles the same Vec<u8> buffers across every stream.
+//! [`PooledBuf`]s drawn from a shared [`BufPool`]. That gives the
+//! framing layer allocation-minimal steady-state reads after warmup;
+//! it is not strict zero-copy because the transport still copies
+//! bytes into those pooled `Vec<u8>` buffers.
 
 use crate::network::pool::{BufPool, PooledBuf};
 use crate::network::wire;
@@ -143,12 +145,16 @@ async fn read_section<R: AsyncRead + Unpin + ?Sized>(
 	pool: &Arc<BufPool>,
 	len: u32,
 ) -> std::io::Result<Option<PooledBuf>> {
-	let mut buf = pool.acquire();
+	let mut buf = pool.acquire_at_least(len as usize);
 	{
 		let vec = buf.as_mut_vec();
-		vec.resize(len as usize, 0);
+		vec.clear();
 		if len > 0 {
-			reader.read_exact(vec.as_mut_slice()).await?;
+			vec.reserve(len as usize);
+			let n = (&mut *reader).take(len as u64).read_to_end(vec).await?;
+			if n != len as usize {
+				return Err(Error::new(ErrorKind::UnexpectedEof, "early eof"));
+			}
 		}
 	}
 	Ok(Some(buf))

@@ -2,7 +2,10 @@ use crate::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
 };
-use crate::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig};
+use crate::node::{
+	ClusterBootstrapConfig, NodeBootstrapConfig, ObservabilityConfig, SeedNodeConfig,
+	TransportTlsConfig,
+};
 use crate::schema::ProtocolVersionWindow;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -75,7 +78,13 @@ struct RawConfig {
 	#[serde(default)]
 	tuning: RawTuningConfig,
 	#[serde(default)]
+	time: RawTimeConfig,
+	#[serde(default)]
 	cluster: RawClusterConfig,
+	#[serde(default)]
+	transport: RawTransportConfig,
+	#[serde(default)]
+	observability: RawObservabilityConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +113,20 @@ impl Default for RawTuningConfig {
 		Self {
 			rf: default_rf(),
 			io_depth: default_io_depth(),
+		}
+	}
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTimeConfig {
+	#[serde(default = "default_drift_max_offset_ms")]
+	drift_max_offset_ms: u64,
+}
+
+impl Default for RawTimeConfig {
+	fn default() -> Self {
+		Self {
+			drift_max_offset_ms: default_drift_max_offset_ms(),
 		}
 	}
 }
@@ -145,6 +168,35 @@ enum RawClusterMode {
 struct RawSeedNode {
 	node_id: u32,
 	address: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTransportConfig {
+	#[serde(default)]
+	tls: Option<RawTransportTlsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTransportTlsConfig {
+	cert_path: PathBuf,
+	key_path: PathBuf,
+	node_ca_path: PathBuf,
+	operator_ca_path: PathBuf,
+	#[serde(default = "default_cluster_domain")]
+	cluster_domain: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawObservabilityConfig {
+	#[serde(default)]
+	listeners: Option<RawObservabilityListeners>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawObservabilityListeners {
+	health: String,
+	ready: String,
+	metrics: String,
 }
 
 impl RawConfig {
@@ -215,6 +267,23 @@ impl RawConfig {
 					.collect(),
 			},
 		};
+		let transport_tls = self.transport.tls.map(|tls| TransportTlsConfig {
+			cert_path: absolutize_from_config_dir(source_path, &tls.cert_path),
+			key_path: absolutize_from_config_dir(source_path, &tls.key_path),
+			node_ca_path: absolutize_from_config_dir(source_path, &tls.node_ca_path),
+			operator_ca_path: absolutize_from_config_dir(source_path, &tls.operator_ca_path),
+			cluster_domain: tls.cluster_domain,
+		});
+		let observability = self
+			.observability
+			.listeners
+			.map(|listeners| ObservabilityConfig {
+				listeners: crate::metrics::observability::ListenerAddresses {
+					health: listeners.health,
+					ready: listeners.ready,
+					metrics: listeners.metrics,
+				},
+			});
 
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
@@ -231,6 +300,9 @@ impl RawConfig {
 			cluster,
 			l2: None,
 			protocol: ProtocolVersionWindow::default(),
+			transport_tls,
+			drift_max_offset_ms: self.time.drift_max_offset_ms,
+			observability,
 		};
 		cfg.validate()?;
 		Ok(cfg)
@@ -318,4 +390,12 @@ const fn default_rf() -> usize {
 
 const fn default_io_depth() -> u32 {
 	64
+}
+
+fn default_cluster_domain() -> String {
+	crate::network::DEFAULT_CLUSTER_DOMAIN.to_string()
+}
+
+const fn default_drift_max_offset_ms() -> u64 {
+	crate::consensus::monitor::MAX_OFFSET_MS
 }

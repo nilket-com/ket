@@ -18,6 +18,10 @@
 //!   [`TransportConnection`] demands, so call sites see a single
 //!   stream shape regardless of fabric.
 
+use crate::network::tls::{
+	ActorIdentity, DEFAULT_CLUSTER_DOMAIN, TlsMaterial, client_config, server_config,
+	verified_transport_peer,
+};
 use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportStream, TransportTier,
 };
@@ -69,11 +73,16 @@ pub struct QuicTransportConnection {
 	/// client certificate SAN). Exposed via
 	/// [`TransportConnection::remote_id`].
 	remote_id: NodeId,
+	actor_identity: ActorIdentity,
 }
 
 impl QuicTransportConnection {
-	pub fn new(inner: quinn::Connection, remote_id: NodeId) -> Self {
-		Self { inner, remote_id }
+	pub fn new(inner: quinn::Connection, remote_id: NodeId, actor_identity: ActorIdentity) -> Self {
+		Self {
+			inner,
+			remote_id,
+			actor_identity,
+		}
 	}
 
 	/// Access the underlying `quinn::Connection`. Intended for the
@@ -99,6 +108,10 @@ impl TransportConnection for QuicTransportConnection {
 
 	fn remote_id(&self) -> NodeId {
 		self.remote_id
+	}
+
+	fn actor_identity(&self) -> &ActorIdentity {
+		&self.actor_identity
 	}
 
 	fn transport_type(&self) -> TransportTier {
@@ -136,15 +149,40 @@ fn map_conn_err(e: quinn::ConnectionError) -> Error {
 pub struct QuicTransportProvider {
 	endpoint: Arc<quinn::Endpoint>,
 	server_name: ServerNameResolver,
+	cluster_domain: String,
 }
 
 impl QuicTransportProvider {
 	pub fn new(endpoint: Arc<quinn::Endpoint>, server_name: ServerNameResolver) -> Self {
+		Self::with_cluster_domain(endpoint, server_name, DEFAULT_CLUSTER_DOMAIN)
+	}
+
+	pub fn with_cluster_domain(
+		endpoint: Arc<quinn::Endpoint>,
+		server_name: ServerNameResolver,
+		cluster_domain: impl Into<String>,
+	) -> Self {
 		Self {
 			endpoint,
 			server_name,
+			cluster_domain: cluster_domain.into(),
 		}
 	}
+}
+
+/// Bind a `quinn::Endpoint` with Wendelon's transport mTLS posture:
+///
+/// * the endpoint presents `material` as both its server and client
+///   identity,
+/// * inbound peers must present a cert chaining to the trusted CA,
+/// * outbound dials always use client-auth as well.
+pub fn endpoint_from_tls(
+	material: &TlsMaterial,
+	bind_addr: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+	let mut endpoint = quinn::Endpoint::server(server_config(material)?, bind_addr)?;
+	endpoint.set_default_client_config(client_config(material)?);
+	Ok(endpoint)
 }
 
 #[async_trait]
@@ -168,7 +206,21 @@ impl TransportProvider for QuicTransportProvider {
 		let conn = connecting
 			.await
 			.map_err(|e| Error::new(ErrorKind::ConnectionRefused, e))?;
-		Ok(Arc::new(QuicTransportConnection::new(conn, target)))
+		let peer = verified_transport_peer(&conn, &self.cluster_domain)?;
+		if peer.node_id != target {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"peer SAN bound to node {} but dial target was {}",
+					peer.node_id.id, target.id
+				),
+			));
+		}
+		Ok(Arc::new(QuicTransportConnection::new(
+			conn,
+			peer.node_id,
+			peer.actor_identity,
+		)))
 	}
 }
 

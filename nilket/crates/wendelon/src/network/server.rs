@@ -55,7 +55,8 @@
 use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
-use crate::network::tls::{DEFAULT_CLUSTER_DOMAIN, verified_peer_node_id};
+use crate::network::tcp_tls_transport::InboundTcpTlsConnection;
+use crate::network::tls::{verified_transport_peer, verified_transport_peer_from_chain};
 use crate::network::transport::{TransportConnection, TransportStream};
 use crate::schema::NodeId;
 use async_trait::async_trait;
@@ -63,7 +64,9 @@ use quinn::Endpoint;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
 
 // ============================================================
 //  LIFECYCLE
@@ -322,7 +325,9 @@ pub async fn serve<S: HrftService>(
 	service: Arc<S>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	cluster_domain: impl Into<String>,
 ) -> std::io::Result<()> {
+	let cluster_domain = cluster_domain.into();
 	let mut drain_rx = lifecycle.subscribe();
 	loop {
 		if drain_rx.borrow().draining {
@@ -341,13 +346,69 @@ pub async fn serve<S: HrftService>(
 				let service = service.clone();
 				let pool = pool.clone();
 				let lifecycle = lifecycle.clone();
+				let cluster_domain = cluster_domain.clone();
 				let _connection_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _connection_guard = _connection_guard;
-					if let Err(e) = serve_quic_connection(incoming, service, pool, lifecycle).await {
+					if let Err(e) =
+						serve_quic_connection(incoming, service, pool, lifecycle, cluster_domain)
+							.await
+					{
 						// One bad connection should not kill the server.
 						// A structured logger will go here once the tracing
 						// macros are threaded through.
+						let _ = e;
+					}
+				});
+			}
+		}
+	}
+	lifecycle.wait_for_quiescence().await;
+	Ok(())
+}
+
+pub async fn serve_tcp_tls<S: HrftService>(
+	listener: TcpListener,
+	acceptor: TlsAcceptor,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	cluster_domain: impl Into<String>,
+) -> std::io::Result<()> {
+	let cluster_domain = cluster_domain.into();
+	let mut drain_rx = lifecycle.subscribe();
+	loop {
+		if drain_rx.borrow().draining {
+			break;
+		}
+		tokio::select! {
+			changed = drain_rx.changed() => {
+				if changed.is_err() || drain_rx.borrow().draining {
+					break;
+				}
+			}
+			accepted = listener.accept() => {
+				let Ok((stream, _peer)) = accepted else {
+					break;
+				};
+				let acceptor = acceptor.clone();
+				let service = service.clone();
+				let pool = pool.clone();
+				let lifecycle = lifecycle.clone();
+				let cluster_domain = cluster_domain.clone();
+				let _connection_guard = lifecycle.track_work();
+				tokio::spawn(async move {
+					let _connection_guard = _connection_guard;
+					if let Err(e) = serve_tcp_tls_connection(
+						stream,
+						acceptor,
+						service,
+						pool,
+						lifecycle,
+						cluster_domain,
+					)
+					.await
+					{
 						let _ = e;
 					}
 				});
@@ -374,13 +435,44 @@ async fn serve_quic_connection<S: HrftService>(
 	service: Arc<S>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	cluster_domain: String,
 ) -> std::io::Result<()> {
 	let connection = incoming
 		.await
 		.map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
-	let remote_id = verified_peer_node_id(&connection, DEFAULT_CLUSTER_DOMAIN)?;
-	let connection: Arc<dyn TransportConnection> =
-		Arc::new(QuicTransportConnection::new(connection, remote_id));
+	let peer = verified_transport_peer(&connection, &cluster_domain)?;
+	let connection: Arc<dyn TransportConnection> = Arc::new(QuicTransportConnection::new(
+		connection,
+		peer.node_id,
+		peer.actor_identity,
+	));
+	handle_connection(connection, service, pool, lifecycle).await
+}
+
+async fn serve_tcp_tls_connection<S: HrftService>(
+	stream: TcpStream,
+	acceptor: TlsAcceptor,
+	service: Arc<S>,
+	pool: Arc<BufPool>,
+	lifecycle: ServerLifecycle,
+	cluster_domain: String,
+) -> std::io::Result<()> {
+	let stream = acceptor
+		.accept(stream)
+		.await
+		.map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
+	let certs = stream.get_ref().1.peer_certificates().ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer presented no TLS identity",
+		)
+	})?;
+	let peer = verified_transport_peer_from_chain(certs, &cluster_domain)?;
+	let connection: Arc<dyn TransportConnection> = Arc::new(InboundTcpTlsConnection::new(
+		peer.node_id,
+		peer.actor_identity,
+		stream,
+	));
 	handle_connection(connection, service, pool, lifecycle).await
 }
 

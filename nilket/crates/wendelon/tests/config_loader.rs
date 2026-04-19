@@ -92,6 +92,7 @@ transfer_signing_secret = "{transfer_secret}"
 		Some(transfer_verifying_key_bytes(transfer_secret))
 	);
 	assert!(cfg.l2.is_none());
+	assert_eq!(cfg.drift_max_offset_ms, wendelon::consensus::MAX_OFFSET_MS);
 }
 
 #[test]
@@ -204,6 +205,128 @@ transfer_signing_secret = "{transfer_secret}"
 		}
 		other => panic!("expected join cluster config, got {other:?}"),
 	}
+}
+
+#[test]
+fn loads_transport_tls_and_observability_configuration() {
+	let root = fresh_dir("transport-observability");
+	let data_dir = root.join("data");
+	let pki_dir = root.join("pki");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	std::fs::create_dir_all(&pki_dir).unwrap();
+	for name in ["node.crt", "node.key", "ca.crt", "ops_ca.crt"] {
+		std::fs::write(pki_dir.join(name), "test").unwrap();
+	}
+
+	let node_id = 31u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4704"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[time]
+drift_max_offset_ms = 750
+
+[transport.tls]
+cert_path = "pki/node.crt"
+key_path = "pki/node.key"
+node_ca_path = "pki/ca.crt"
+operator_ca_path = "pki/ops_ca.crt"
+
+[observability.listeners]
+health = "127.0.0.1:7431"
+ready = "127.0.0.1:7432"
+metrics = "127.0.0.1:7433"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let tls = cfg.transport_tls.as_ref().expect("transport TLS config");
+	assert_eq!(tls.cert_path, pki_dir.join("node.crt"));
+	assert_eq!(tls.key_path, pki_dir.join("node.key"));
+	assert_eq!(tls.node_ca_path, pki_dir.join("ca.crt"));
+	assert_eq!(tls.operator_ca_path, pki_dir.join("ops_ca.crt"));
+	assert_eq!(tls.cluster_domain, "cluster.local");
+	assert_eq!(cfg.drift_max_offset_ms, 750);
+	let observability = cfg.observability.as_ref().expect("observability config");
+	assert_eq!(observability.listeners.health, "127.0.0.1:7431");
+	assert_eq!(observability.listeners.ready, "127.0.0.1:7432");
+	assert_eq!(observability.listeners.metrics, "127.0.0.1:7433");
+}
+
+#[test]
+fn rejects_observability_without_transport_tls() {
+	let root = fresh_dir("obs-without-transport");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+
+	let node_id = 32u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4705"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[observability.listeners]
+health = "127.0.0.1:7431"
+ready = "127.0.0.1:7432"
+metrics = "127.0.0.1:7433"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).err().unwrap();
+	assert!(
+		err.to_string()
+			.contains("observability requires transport_tls"),
+		"unexpected error: {err}"
+	);
 }
 
 #[tokio::test]

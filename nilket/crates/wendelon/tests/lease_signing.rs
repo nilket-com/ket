@@ -94,6 +94,9 @@ fn bootstrap_cfg(
 		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),
+		transport_tls: None,
+		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
+		observability: None,
 	}
 }
 

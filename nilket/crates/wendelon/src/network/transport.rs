@@ -38,6 +38,7 @@
 
 use crate::network::pool::PooledBuf;
 use crate::network::server::HrftService;
+use crate::network::tls::ActorIdentity;
 use crate::schema::NodeId;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -183,6 +184,11 @@ pub trait TransportConnection: Send + Sync {
 	/// Peer identity. Used as the cache key in the factory and as
 	/// the attribution target for `RPCError::RemoteError`.
 	fn remote_id(&self) -> NodeId;
+
+	/// Verified actor identity derived from the mTLS peer cert (or
+	/// a loopback equivalent in tests). Distinct from record
+	/// `Identity` in the schema layer.
+	fn actor_identity(&self) -> &ActorIdentity;
 
 	/// Which tier this connection is actually running over. A node
 	/// whose advertised `TransportTierSet` contains Tier 0 may

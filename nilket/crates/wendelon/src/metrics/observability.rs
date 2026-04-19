@@ -1,0 +1,445 @@
+use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
+use crate::metrics::global;
+use crate::network::tls::{
+	ActorPermission, ActorTrustRoots, authorize_actor,
+	verified_peer_actor_identity_from_chain_with_trust_roots,
+};
+use crate::schema::NodeId;
+use async_trait::async_trait;
+use std::io::{Error, ErrorKind};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+
+pub const HEALTH_PATH: &str = "/health";
+pub const READY_PATH: &str = "/ready";
+pub const METRICS_PATH: &str = "/metrics";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerAddresses {
+	pub health: String,
+	pub ready: String,
+	pub metrics: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainState {
+	None,
+	Draining,
+	Drained,
+}
+
+impl DrainState {
+	fn as_json(self) -> &'static str {
+		match self {
+			Self::None => "none",
+			Self::Draining => "draining",
+			Self::Drained => "drained",
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadinessSnapshot {
+	pub node_id: u32,
+	pub epoch: u64,
+	pub leader_id: Option<u32>,
+	pub cluster_members: Vec<u32>,
+	pub drain_state: DrainState,
+	pub audit_materialization_lag_entries: u64,
+	pub degraded_reason: Option<String>,
+}
+
+#[async_trait]
+pub trait ReadinessReporter: Send + Sync {
+	async fn snapshot(&self) -> ReadinessSnapshot;
+}
+
+pub struct ListenerHandle {
+	pub local_addr: SocketAddr,
+	pub task: JoinHandle<()>,
+}
+
+pub struct ObservabilityHandles {
+	pub health: ListenerHandle,
+	pub ready: ListenerHandle,
+	pub metrics: ListenerHandle,
+}
+
+pub async fn spawn(
+	addresses: ListenerAddresses,
+	acceptor: TlsAcceptor,
+	reporter: Arc<dyn ReadinessReporter>,
+	local_node_id: u32,
+	cluster_domain: impl Into<String>,
+	trust_roots: Arc<ActorTrustRoots>,
+	audit_sink: Arc<dyn AuditSink>,
+) -> std::io::Result<ObservabilityHandles> {
+	let cluster_domain = cluster_domain.into();
+	let health_listener = TcpListener::bind(&addresses.health).await?;
+	let ready_listener = TcpListener::bind(&addresses.ready).await?;
+	let metrics_listener = TcpListener::bind(&addresses.metrics).await?;
+	let health = spawn_health(health_listener).await?;
+	let ready = spawn_ready(
+		ready_listener,
+		acceptor.clone(),
+		reporter,
+		local_node_id,
+		cluster_domain.clone(),
+		trust_roots.clone(),
+		audit_sink.clone(),
+	)
+	.await?;
+	let metrics = spawn_metrics(
+		metrics_listener,
+		acceptor,
+		local_node_id,
+		cluster_domain,
+		trust_roots,
+		audit_sink,
+	)
+	.await?;
+	Ok(ObservabilityHandles {
+		health,
+		ready,
+		metrics,
+	})
+}
+
+pub async fn spawn_health(listener: TcpListener) -> std::io::Result<ListenerHandle> {
+	let local_addr = listener.local_addr()?;
+	let task = tokio::spawn(async move {
+		loop {
+			let Ok((stream, _peer)) = listener.accept().await else {
+				return;
+			};
+			tokio::spawn(async move {
+				let _ = handle_health_connection(stream).await;
+			});
+		}
+	});
+	Ok(ListenerHandle { local_addr, task })
+}
+
+pub async fn spawn_ready(
+	listener: TcpListener,
+	acceptor: TlsAcceptor,
+	reporter: Arc<dyn ReadinessReporter>,
+	local_node_id: u32,
+	cluster_domain: impl Into<String>,
+	trust_roots: Arc<ActorTrustRoots>,
+	audit_sink: Arc<dyn AuditSink>,
+) -> std::io::Result<ListenerHandle> {
+	let cluster_domain = cluster_domain.into();
+	let local_addr = listener.local_addr()?;
+	let task = tokio::spawn(async move {
+		loop {
+			let Ok((stream, _peer)) = listener.accept().await else {
+				return;
+			};
+			let acceptor = acceptor.clone();
+			let reporter = reporter.clone();
+			let cluster_domain = cluster_domain.clone();
+			let trust_roots = trust_roots.clone();
+			let audit_sink = audit_sink.clone();
+			tokio::spawn(async move {
+				let _ = handle_ready_connection(
+					stream,
+					acceptor,
+					reporter,
+					local_node_id,
+					&cluster_domain,
+					&trust_roots,
+					&*audit_sink,
+				)
+				.await;
+			});
+		}
+	});
+	Ok(ListenerHandle { local_addr, task })
+}
+
+pub async fn spawn_metrics(
+	listener: TcpListener,
+	acceptor: TlsAcceptor,
+	local_node_id: u32,
+	cluster_domain: impl Into<String>,
+	trust_roots: Arc<ActorTrustRoots>,
+	audit_sink: Arc<dyn AuditSink>,
+) -> std::io::Result<ListenerHandle> {
+	let cluster_domain = cluster_domain.into();
+	let local_addr = listener.local_addr()?;
+	let task = tokio::spawn(async move {
+		loop {
+			let Ok((stream, _peer)) = listener.accept().await else {
+				return;
+			};
+			let acceptor = acceptor.clone();
+			let cluster_domain = cluster_domain.clone();
+			let trust_roots = trust_roots.clone();
+			let audit_sink = audit_sink.clone();
+			tokio::spawn(async move {
+				let _ = handle_metrics_connection(
+					stream,
+					acceptor,
+					local_node_id,
+					&cluster_domain,
+					&trust_roots,
+					&*audit_sink,
+				)
+				.await;
+			});
+		}
+	});
+	Ok(ListenerHandle { local_addr, task })
+}
+
+async fn handle_health_connection(mut stream: TcpStream) -> std::io::Result<()> {
+	let req = read_request(&mut stream).await?;
+	match parse_request_line(&req)? {
+		("GET", HEALTH_PATH) => {
+			write_response(&mut stream, "200 OK", "text/plain; charset=utf-8", "ok\n").await
+		}
+		_ => {
+			write_response(
+				&mut stream,
+				"404 Not Found",
+				"text/plain; charset=utf-8",
+				"not found\n",
+			)
+			.await
+		}
+	}
+}
+
+async fn handle_ready_connection(
+	stream: TcpStream,
+	acceptor: TlsAcceptor,
+	reporter: Arc<dyn ReadinessReporter>,
+	local_node_id: u32,
+	cluster_domain: &str,
+	trust_roots: &ActorTrustRoots,
+	audit_sink: &dyn AuditSink,
+) -> std::io::Result<()> {
+	let (mut stream, actor) = accept_tls(
+		stream,
+		acceptor,
+		cluster_domain,
+		trust_roots,
+		ActorPermission::ObservabilityReady,
+	)
+	.await?;
+	let req = read_request(&mut stream).await?;
+	match parse_request_line(&req)? {
+		("GET", READY_PATH) => {
+			let snapshot = reporter.snapshot().await;
+			emit_observability_audit(
+				audit_sink,
+				local_node_id,
+				&actor,
+				"observability.ready",
+				"served /ready snapshot",
+			)?;
+			write_response(
+				&mut stream,
+				"200 OK",
+				"application/json; charset=utf-8",
+				&snapshot.to_json(),
+			)
+			.await
+		}
+		_ => {
+			write_response(
+				&mut stream,
+				"404 Not Found",
+				"text/plain; charset=utf-8",
+				"not found\n",
+			)
+			.await
+		}
+	}
+}
+
+async fn handle_metrics_connection(
+	stream: TcpStream,
+	acceptor: TlsAcceptor,
+	local_node_id: u32,
+	cluster_domain: &str,
+	trust_roots: &ActorTrustRoots,
+	audit_sink: &dyn AuditSink,
+) -> std::io::Result<()> {
+	let (mut stream, actor) = accept_tls(
+		stream,
+		acceptor,
+		cluster_domain,
+		trust_roots,
+		ActorPermission::ObservabilityMetrics,
+	)
+	.await?;
+	let req = read_request(&mut stream).await?;
+	match parse_request_line(&req)? {
+		("GET", METRICS_PATH) => {
+			global().metrics_scrapes_total.inc();
+			let body = global().render_prometheus();
+			emit_observability_audit(
+				audit_sink,
+				local_node_id,
+				&actor,
+				"observability.metrics",
+				"served /metrics scrape",
+			)?;
+			write_response(
+				&mut stream,
+				"200 OK",
+				"text/plain; version=0.0.4; charset=utf-8",
+				&body,
+			)
+			.await
+		}
+		_ => {
+			write_response(
+				&mut stream,
+				"404 Not Found",
+				"text/plain; charset=utf-8",
+				"not found\n",
+			)
+			.await
+		}
+	}
+}
+
+async fn accept_tls(
+	stream: TcpStream,
+	acceptor: TlsAcceptor,
+	cluster_domain: &str,
+	trust_roots: &ActorTrustRoots,
+	permission: ActorPermission,
+) -> std::io::Result<(
+	tokio_rustls::server::TlsStream<TcpStream>,
+	crate::network::tls::ActorIdentity,
+)> {
+	let stream = acceptor
+		.accept(stream)
+		.await
+		.map_err(|e| Error::new(ErrorKind::PermissionDenied, e))?;
+	let certs = stream.get_ref().1.peer_certificates().ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer presented no TLS identity",
+		)
+	})?;
+	let actor = verified_peer_actor_identity_from_chain_with_trust_roots(
+		certs,
+		cluster_domain,
+		Some(trust_roots),
+	)?;
+	authorize_actor(&actor, permission)?;
+	Ok((stream, actor))
+}
+
+fn emit_observability_audit(
+	sink: &dyn AuditSink,
+	node_id: u32,
+	actor: &crate::network::tls::ActorIdentity,
+	event_type: &str,
+	message: &str,
+) -> std::io::Result<()> {
+	sink.emit(
+		AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			event_type,
+			NodeId {
+				id: node_id,
+				_reserved: 0,
+			},
+			message,
+		)
+		.with_actor(actor),
+	)
+}
+
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<String> {
+	// Intentionally tiny probe parser: one read, no header folding,
+	// no request-body support, and not a general RFC-compliant HTTP parser.
+	let mut buf = [0u8; 4096];
+	let n = stream.read(&mut buf).await?;
+	if n == 0 {
+		return Err(Error::new(ErrorKind::UnexpectedEof, "empty HTTP request"));
+	}
+	std::str::from_utf8(&buf[..n])
+		.map(|s| s.to_string())
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("invalid HTTP request: {err}"),
+			)
+		})
+}
+
+fn parse_request_line(req: &str) -> std::io::Result<(&str, &str)> {
+	let first_line = req.lines().next().unwrap_or_default();
+	let mut parts = first_line.split_whitespace();
+	let method = parts.next().unwrap_or_default();
+	let path = parts.next().unwrap_or_default();
+	if method.is_empty() || path.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"malformed HTTP request line",
+		));
+	}
+	Ok((method, path))
+}
+
+async fn write_response<S: AsyncWrite + Unpin>(
+	stream: &mut S,
+	status: &str,
+	content_type: &str,
+	body: &str,
+) -> std::io::Result<()> {
+	let resp = format!(
+		"HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+		body.len()
+	);
+	stream.write_all(resp.as_bytes()).await?;
+	stream.flush().await
+}
+
+impl ReadinessSnapshot {
+	pub fn to_json(&self) -> String {
+		let mut cluster_members = self.cluster_members.clone();
+		cluster_members.sort_unstable();
+		let members = cluster_members
+			.into_iter()
+			.map(display_node_id)
+			.map(|id| format!("\"{id}\""))
+			.collect::<Vec<_>>()
+			.join(",");
+		let leader = self
+			.leader_id
+			.map(display_node_id)
+			.map(|id| format!("\"{id}\""))
+			.unwrap_or_else(|| "null".to_string());
+		let degraded = self
+			.degraded_reason
+			.as_ref()
+			.map(|reason| format!("\"{reason}\""))
+			.unwrap_or_else(|| "null".to_string());
+		format!(
+			"{{\"node_id\":\"{}\",\"epoch\":{},\"leader_id\":{},\"cluster_members\":[{}],\"drain_state\":\"{}\",\"audit_materialization_lag_entries\":{},\"degraded_reason\":{}}}",
+			display_node_id(self.node_id),
+			self.epoch,
+			leader,
+			members,
+			self.drain_state.as_json(),
+			self.audit_materialization_lag_entries,
+			degraded,
+		)
+	}
+}
+
+fn display_node_id(node_id: u32) -> String {
+	format!("n-{node_id:02}")
+}

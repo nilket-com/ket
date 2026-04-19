@@ -39,13 +39,13 @@
 
 use crate::schema::NodeId;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::any::Any;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 /// Single ALPN token advertised on every HRFT QUIC connection.
 /// Short, versionless; the framing header already carries a protocol
@@ -55,7 +55,204 @@ pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
+// Placeholder PEN-backed OID until the production assignment lands.
+// TODO(pilot): replace this placeholder with the assigned production PEN.
+const ACTOR_CLAIMS_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xB2, 0x03, 0x01, 0x01];
 const DNS_NAME_TAG: u8 = 0x82;
+static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
+
+// ============================================================
+//  ACTOR IDENTITY
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorTrustDomain {
+	Data,
+	Ops,
+}
+
+impl std::fmt::Display for ActorTrustDomain {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Data => f.write_str("data"),
+			Self::Ops => f.write_str("ops"),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActorRole {
+	DataNode,
+	Operator,
+	ReadOnlyObserver,
+	BreakGlassAdmin,
+}
+
+impl ActorRole {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::DataNode => "data_node",
+			Self::Operator => "operator",
+			Self::ReadOnlyObserver => "read_only_observer",
+			Self::BreakGlassAdmin => "break_glass_admin",
+		}
+	}
+
+	pub fn trust_domain(self) -> ActorTrustDomain {
+		match self {
+			Self::DataNode | Self::ReadOnlyObserver => ActorTrustDomain::Data,
+			Self::Operator | Self::BreakGlassAdmin => ActorTrustDomain::Ops,
+		}
+	}
+
+	pub fn break_glass(self) -> bool {
+		matches!(self, Self::BreakGlassAdmin)
+	}
+
+	fn parse(raw: &str) -> std::io::Result<Self> {
+		match raw {
+			"data_node" => Ok(Self::DataNode),
+			"operator" => Ok(Self::Operator),
+			"read_only_observer" => Ok(Self::ReadOnlyObserver),
+			"break_glass_admin" => Ok(Self::BreakGlassAdmin),
+			other => Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!("unrecognized actor role {other:?}"),
+			)),
+		}
+	}
+}
+
+impl std::fmt::Display for ActorRole {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorIdentity {
+	pub role: ActorRole,
+	pub trust_domain: ActorTrustDomain,
+	pub node_id: Option<NodeId>,
+	pub tenant_id: Option<String>,
+	pub scopes: Vec<String>,
+	pub key_id: Vec<u8>,
+	pub break_glass: bool,
+}
+
+#[derive(Clone)]
+pub struct ActorTrustRoots {
+	pub data_roots: Arc<RootCertStore>,
+	pub ops_roots: Arc<RootCertStore>,
+}
+
+impl ActorTrustRoots {
+	pub fn load(
+		data_ca_path: impl AsRef<Path>,
+		ops_ca_path: impl AsRef<Path>,
+	) -> std::io::Result<Self> {
+		let data_roots = Arc::new(load_ca_roots(data_ca_path.as_ref())?);
+		let ops_roots = Arc::new(load_ca_roots(ops_ca_path.as_ref())?);
+		Ok(Self {
+			data_roots,
+			ops_roots,
+		})
+	}
+
+	pub fn combined_roots(&self) -> Arc<RootCertStore> {
+		let mut roots = (*self.data_roots).clone();
+		roots.extend(self.ops_roots.roots.iter().cloned());
+		Arc::new(roots)
+	}
+}
+
+impl ActorIdentity {
+	pub fn new(
+		role: ActorRole,
+		node_id: Option<NodeId>,
+		tenant_id: Option<String>,
+		scopes: Vec<String>,
+		key_id: Vec<u8>,
+	) -> std::io::Result<Self> {
+		if key_id.is_empty() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"actor certificate key_id must not be empty",
+			));
+		}
+		if matches!(role, ActorRole::DataNode) && node_id.is_none() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"data_node certificate must carry a canonical node SAN",
+			));
+		}
+		Ok(Self {
+			role,
+			trust_domain: role.trust_domain(),
+			node_id,
+			tenant_id,
+			scopes,
+			key_id,
+			break_glass: role.break_glass(),
+		})
+	}
+
+	pub fn data_node(node_id: NodeId) -> Self {
+		Self {
+			role: ActorRole::DataNode,
+			trust_domain: ActorTrustDomain::Data,
+			node_id: Some(node_id),
+			tenant_id: None,
+			scopes: vec!["cluster".to_string()],
+			key_id: node_id.id.to_le_bytes().to_vec(),
+			break_glass: false,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorPermission {
+	InterNodeTransport,
+	OpsControl,
+	ObservabilityReady,
+	ObservabilityMetrics,
+}
+
+pub fn authorize_actor(actor: &ActorIdentity, permission: ActorPermission) -> std::io::Result<()> {
+	let allowed = match permission {
+		ActorPermission::InterNodeTransport => matches!(actor.role, ActorRole::DataNode),
+		ActorPermission::OpsControl => {
+			matches!(actor.role, ActorRole::Operator | ActorRole::BreakGlassAdmin)
+		}
+		ActorPermission::ObservabilityReady => matches!(
+			actor.role,
+			ActorRole::DataNode
+				| ActorRole::Operator
+				| ActorRole::ReadOnlyObserver
+				| ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::ObservabilityMetrics => matches!(
+			actor.role,
+			ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
+		),
+	};
+	if allowed {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::PermissionDenied,
+		format!(
+			"actor role {} is not allowed for {permission:?}",
+			actor.role
+		),
+	))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedTransportPeer {
+	pub node_id: NodeId,
+	pub actor_identity: ActorIdentity,
+}
 
 // ============================================================
 //  MATERIAL
@@ -113,14 +310,24 @@ impl TlsMaterial {
 //  QUIC / RUSTLS CONFIG BUILDERS
 // ============================================================
 
-/// Build a `quinn::ServerConfig` that:
-///
-/// * presents this node's cert+key to incoming peers,
-/// * requires every client to present a cert chaining to
-///   `material.ca_roots`,
-/// * advertises only [`HRFT_ALPN`].
-pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerConfig> {
-	let verifier = WebPkiClientVerifier::builder(material.ca_roots.clone())
+pub fn rustls_server_config(material: &TlsMaterial) -> std::io::Result<ServerConfig> {
+	rustls_server_config_with_alpn(material, vec![HRFT_ALPN.to_vec()])
+}
+
+pub fn rustls_server_config_with_alpn(
+	material: &TlsMaterial,
+	alpn_protocols: Vec<Vec<u8>>,
+) -> std::io::Result<ServerConfig> {
+	rustls_server_config_with_peer_roots(material, material.ca_roots.clone(), alpn_protocols)
+}
+
+pub fn rustls_server_config_with_peer_roots(
+	material: &TlsMaterial,
+	peer_roots: Arc<RootCertStore>,
+	alpn_protocols: Vec<Vec<u8>>,
+) -> std::io::Result<ServerConfig> {
+	install_rustls_provider();
+	let verifier = WebPkiClientVerifier::builder(peer_roots)
 		.build()
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
 
@@ -128,8 +335,41 @@ pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerCon
 		.with_client_cert_verifier(verifier)
 		.with_single_cert(material.cert_chain.clone(), material.key.clone_key())
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("server cert/key: {e}")))?;
-	rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
+	rustls_cfg.alpn_protocols = alpn_protocols;
+	Ok(rustls_cfg)
+}
 
+pub fn rustls_client_config(material: &TlsMaterial) -> std::io::Result<ClientConfig> {
+	rustls_client_config_with_alpn(material, vec![HRFT_ALPN.to_vec()])
+}
+
+pub fn rustls_client_config_with_alpn(
+	material: &TlsMaterial,
+	alpn_protocols: Vec<Vec<u8>>,
+) -> std::io::Result<ClientConfig> {
+	install_rustls_provider();
+	let mut rustls_cfg = ClientConfig::builder()
+		.with_root_certificates((*material.ca_roots).clone())
+		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client cert/key: {e}")))?;
+	rustls_cfg.alpn_protocols = alpn_protocols;
+	Ok(rustls_cfg)
+}
+
+fn install_rustls_provider() {
+	INSTALL_RUSTLS_PROVIDER.call_once(|| {
+		let _ = rustls::crypto::ring::default_provider().install_default();
+	});
+}
+
+/// Build a `quinn::ServerConfig` that:
+///
+/// * presents this node's cert+key to incoming peers,
+/// * requires every client to present a cert chaining to
+///   `material.ca_roots`,
+/// * advertises only [`HRFT_ALPN`].
+pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerConfig> {
+	let rustls_cfg = rustls_server_config(material)?;
 	let quic_cfg = QuicServerConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicServerConfig: {e}")))?;
 	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)))
@@ -141,12 +381,7 @@ pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerCon
 /// * presents this node's cert+key as the client identity,
 /// * advertises only [`HRFT_ALPN`].
 pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientConfig> {
-	let mut rustls_cfg = ClientConfig::builder()
-		.with_root_certificates((*material.ca_roots).clone())
-		.with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client cert/key: {e}")))?;
-	rustls_cfg.alpn_protocols = vec![HRFT_ALPN.to_vec()];
-
+	let rustls_cfg = rustls_client_config(material)?;
 	let quic_cfg = QuicClientConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicClientConfig: {e}")))?;
 	Ok(quinn::ClientConfig::new(Arc::new(quic_cfg)))
@@ -201,6 +436,126 @@ pub fn verified_peer_node_id_from_identity(
 	verified_peer_node_id_from_chain(certs.as_slice(), cluster_domain)
 }
 
+/// Extract and validate the peer's actor identity from the leaf
+/// certificate. Unlike [`verified_peer_node_id_from_chain`], this
+/// accepts certs that do not carry a canonical node SAN (operators,
+/// observers) and instead requires the W2 actor-claims extension.
+pub fn verified_peer_actor_identity(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+) -> std::io::Result<ActorIdentity> {
+	let identity = connection.peer_identity().ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer presented no TLS identity",
+		)
+	})?;
+	verified_peer_actor_identity_from_identity(identity, cluster_domain)
+}
+
+pub fn verified_peer_actor_identity_from_identity(
+	identity: Box<dyn Any>,
+	cluster_domain: &str,
+) -> std::io::Result<ActorIdentity> {
+	let certs = identity
+		.downcast::<Vec<CertificateDer<'static>>>()
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"peer identity is not a rustls certificate chain",
+			)
+		})?;
+	verified_peer_actor_identity_from_chain(certs.as_slice(), cluster_domain)
+}
+
+pub fn verified_peer_actor_identity_from_chain(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_from_chain_with_trust_roots(cert_chain, cluster_domain, None)
+}
+
+pub fn verified_peer_actor_identity_from_chain_with_trust_roots(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+	trust_roots: Option<&ActorTrustRoots>,
+) -> std::io::Result<ActorIdentity> {
+	let leaf = cert_chain
+		.first()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "peer certificate chain is empty"))?;
+	let node_id = extract_optional_peer_node_id(leaf.as_ref(), cluster_domain)?;
+	let claims = extract_actor_claims(leaf.as_ref())?;
+	if let Some(trust_roots) = trust_roots {
+		let actual_domain = detect_actor_trust_domain(cert_chain, trust_roots)?;
+		let expected_domain = claims.role.trust_domain();
+		if actual_domain != expected_domain {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"actor role {} must chain to the {expected_domain} CA, but the certificate chained to the {actual_domain} CA",
+					claims.role
+				),
+			));
+		}
+	}
+	ActorIdentity::new(
+		claims.role,
+		node_id,
+		claims.tenant_id,
+		claims.scopes,
+		claims.key_id,
+	)
+}
+
+/// Transport-facing identity verifier. Inter-node QUIC requires a
+/// `data_node` actor and a canonical SAN bound to the remote
+/// `NodeId`.
+pub fn verified_transport_peer(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+) -> std::io::Result<VerifiedTransportPeer> {
+	let identity = connection.peer_identity().ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer presented no TLS identity",
+		)
+	})?;
+	verified_transport_peer_from_identity(identity, cluster_domain)
+}
+
+pub fn verified_transport_peer_from_identity(
+	identity: Box<dyn Any>,
+	cluster_domain: &str,
+) -> std::io::Result<VerifiedTransportPeer> {
+	let certs = identity
+		.downcast::<Vec<CertificateDer<'static>>>()
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"peer identity is not a rustls certificate chain",
+			)
+		})?;
+	verified_transport_peer_from_chain(certs.as_slice(), cluster_domain)
+}
+
+pub fn verified_transport_peer_from_chain(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+) -> std::io::Result<VerifiedTransportPeer> {
+	let actor_identity = verified_peer_actor_identity_from_chain(cert_chain, cluster_domain)?;
+	authorize_actor(&actor_identity, ActorPermission::InterNodeTransport)?;
+	let node_id = actor_identity.node_id.ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"inter-node transport certificate is missing a canonical node SAN",
+		)
+	})?;
+	Ok(VerifiedTransportPeer {
+		node_id,
+		actor_identity,
+	})
+}
+
 /// Parse the leaf certificate in `cert_chain` and recover the peer's
 /// canonical node identity from its DNS SAN set.
 pub fn verified_peer_node_id_from_chain(
@@ -217,28 +572,7 @@ pub fn verified_peer_node_id_from_chain(
 			"peer certificate contains no DNS SANs",
 		));
 	}
-
-	let mut parsed: Option<NodeId> = None;
-	for san in dns_sans {
-		let Some(id_text) = canonical_node_id_text(&san, cluster_domain) else {
-			continue;
-		};
-		let id = id_text.parse::<u32>().map_err(|_| {
-			Error::new(
-				ErrorKind::PermissionDenied,
-				format!("canonical node SAN {san:?} is not numeric"),
-			)
-		})?;
-		let node_id = NodeId { id, _reserved: 0 };
-		if parsed.replace(node_id).is_some() {
-			return Err(Error::new(
-				ErrorKind::PermissionDenied,
-				"peer certificate contains more than one canonical node SAN",
-			));
-		}
-	}
-
-	parsed.ok_or_else(|| {
+	extract_optional_peer_node_id(leaf.as_ref(), cluster_domain)?.ok_or_else(|| {
 		Error::new(
 			ErrorKind::PermissionDenied,
 			format!("peer certificate contains no canonical node SAN for domain {cluster_domain}"),
@@ -306,9 +640,87 @@ fn load_ca_roots(path: &Path) -> std::io::Result<RootCertStore> {
 	Ok(roots)
 }
 
+fn detect_actor_trust_domain(
+	cert_chain: &[CertificateDer<'_>],
+	trust_roots: &ActorTrustRoots,
+) -> std::io::Result<ActorTrustDomain> {
+	let data_ok = verify_chain_against_roots(cert_chain, trust_roots.data_roots.clone())?;
+	let ops_ok = verify_chain_against_roots(cert_chain, trust_roots.ops_roots.clone())?;
+	match (data_ok, ops_ok) {
+		(true, false) => Ok(ActorTrustDomain::Data),
+		(false, true) => Ok(ActorTrustDomain::Ops),
+		(true, true) => Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"peer certificate chains to both the data and ops trust roots",
+		)),
+		(false, false) => Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"peer certificate does not chain to a configured trust root",
+		)),
+	}
+}
+
+fn verify_chain_against_roots(
+	cert_chain: &[CertificateDer<'_>],
+	roots: Arc<RootCertStore>,
+) -> std::io::Result<bool> {
+	install_rustls_provider();
+	let verifier = WebPkiClientVerifier::builder(roots)
+		.build()
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("client verifier: {e}")))?;
+	let Some((end_entity, intermediates)) = cert_chain.split_first() else {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"peer certificate chain is empty",
+		));
+	};
+	Ok(verifier
+		.verify_client_cert(end_entity, intermediates, UnixTime::now())
+		.is_ok())
+}
+
+#[derive(Debug)]
+struct EncodedActorClaims {
+	role: ActorRole,
+	scopes: Vec<String>,
+	tenant_id: Option<String>,
+	key_id: Vec<u8>,
+}
+
 // ============================================================
 //  ASN.1 HELPERS
 // ============================================================
+
+fn extract_optional_peer_node_id(
+	cert_der: &[u8],
+	cluster_domain: &str,
+) -> std::io::Result<Option<NodeId>> {
+	let dns_sans = extract_dns_sans(cert_der)?;
+	if dns_sans.is_empty() {
+		return Ok(None);
+	}
+
+	let mut parsed: Option<NodeId> = None;
+	for san in dns_sans {
+		let Some(id_text) = canonical_node_id_text(&san, cluster_domain) else {
+			continue;
+		};
+		let id = id_text.parse::<u32>().map_err(|_| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				format!("canonical node SAN {san:?} is not numeric"),
+			)
+		})?;
+		let node_id = NodeId { id, _reserved: 0 };
+		if parsed.replace(node_id).is_some() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"peer certificate contains more than one canonical node SAN",
+			));
+		}
+	}
+	Ok(parsed)
+}
 
 fn canonical_node_id_text<'a>(dns_name: &'a str, cluster_domain: &str) -> Option<&'a str> {
 	let prefix = "node-";
@@ -384,6 +796,143 @@ fn extract_dns_sans(cert_der: &[u8]) -> std::io::Result<Vec<String>> {
 	}
 
 	Ok(dns_sans)
+}
+
+fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<EncodedActorClaims> {
+	let mut cert = DerReader::new(cert_der);
+	let certificate = cert.read_tlv(0x30, "certificate")?;
+	let mut certificate = DerReader::new(certificate);
+	let tbs = certificate.read_tlv(0x30, "tbsCertificate")?;
+	let mut tbs = DerReader::new(tbs);
+
+	if tbs.peek_tag() == Some(0xA0) {
+		tbs.read_any_tlv("version")?;
+	}
+	for field in [
+		"serialNumber",
+		"signature",
+		"issuer",
+		"validity",
+		"subject",
+		"subjectPublicKeyInfo",
+	] {
+		tbs.read_any_tlv(field)?;
+	}
+	while matches!(tbs.peek_tag(), Some(0x81 | 0x82 | 0xA1 | 0xA2)) {
+		tbs.read_any_tlv("uniqueId")?;
+	}
+	if tbs.peek_tag() != Some(0xA3) {
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"peer certificate is missing the actor-claims extension",
+		));
+	}
+
+	let extensions = tbs.read_tlv(0xA3, "extensions")?;
+	let mut extensions = DerReader::new(extensions);
+	let extensions = extensions.read_tlv(0x30, "extensions sequence")?;
+	let mut extensions = DerReader::new(extensions);
+	let mut claims: Option<EncodedActorClaims> = None;
+
+	while !extensions.is_empty() {
+		let extension = extensions.read_tlv(0x30, "extension")?;
+		let mut extension = DerReader::new(extension);
+		let oid = extension.read_tlv(0x06, "extension oid")?;
+		let _critical = if extension.peek_tag() == Some(0x01) {
+			let critical = extension.read_tlv(0x01, "extension critical")?;
+			match critical {
+				[0x00] => false,
+				[0xFF] => true,
+				_ => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"extension critical flag is not valid DER BOOLEAN",
+					));
+				}
+			}
+		} else {
+			false
+		};
+		let value = extension.read_tlv(0x04, "extension value")?;
+		if oid != ACTOR_CLAIMS_OID {
+			continue;
+		}
+		if claims.is_some() {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"peer certificate contains more than one actor-claims extension",
+			));
+		}
+		claims = Some(parse_actor_claims_cbor(value)?);
+	}
+
+	claims.ok_or_else(|| {
+		Error::new(
+			ErrorKind::PermissionDenied,
+			"peer certificate is missing the actor-claims extension",
+		)
+	})
+}
+
+fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> {
+	let mut reader = CborReader::new(bytes);
+	let field_count = reader.read_len_for_major(5, "actor claims map")?;
+	let mut role: Option<ActorRole> = None;
+	let mut scopes: Option<Vec<String>> = None;
+	let mut tenant_id: Option<Option<String>> = None;
+	let mut key_id: Option<Vec<u8>> = None;
+
+	for _ in 0..field_count {
+		let key = reader.read_text("actor-claims key")?;
+		match key.as_str() {
+			"role" => {
+				let role_text = reader.read_text("actor role")?;
+				role = Some(ActorRole::parse(&role_text)?);
+			}
+			"scopes" => {
+				let scope_count = reader.read_len_for_major(4, "actor scopes")?;
+				let mut parsed = Vec::with_capacity(scope_count);
+				for _ in 0..scope_count {
+					parsed.push(reader.read_text("actor scope")?);
+				}
+				scopes = Some(parsed);
+			}
+			"tenant_id" => {
+				tenant_id = Some(if reader.peek_simple_null() {
+					reader.read_null("tenant_id")?;
+					None
+				} else {
+					Some(reader.read_text("tenant_id")?)
+				});
+			}
+			"key_id" => {
+				key_id = Some(reader.read_bytes("key_id")?);
+			}
+			_ => reader.skip_value()?,
+		}
+	}
+	if !reader.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"actor-claims extension contains trailing CBOR bytes",
+		));
+	}
+	Ok(EncodedActorClaims {
+		role: role.ok_or_else(|| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				"actor-claims extension is missing role",
+			)
+		})?,
+		scopes: scopes.unwrap_or_default(),
+		tenant_id: tenant_id.unwrap_or(None),
+		key_id: key_id.ok_or_else(|| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				"actor-claims extension is missing key_id",
+			)
+		})?,
+	})
 }
 
 struct DerReader<'a> {
@@ -475,5 +1024,174 @@ impl<'a> DerReader<'a> {
 			self.pos += 1;
 		}
 		Ok(len)
+	}
+}
+
+struct CborReader<'a> {
+	input: &'a [u8],
+	pos: usize,
+}
+
+impl<'a> CborReader<'a> {
+	fn new(input: &'a [u8]) -> Self {
+		Self { input, pos: 0 }
+	}
+
+	fn is_empty(&self) -> bool {
+		self.pos >= self.input.len()
+	}
+
+	fn peek_simple_null(&self) -> bool {
+		matches!(self.input.get(self.pos), Some(0xF6))
+	}
+
+	fn read_text(&mut self, what: &str) -> std::io::Result<String> {
+		let len = self.read_len_for_major(3, what)?;
+		let end = self.checked_end(len, what)?;
+		let text = std::str::from_utf8(&self.input[self.pos..end]).map_err(|e| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("invalid UTF-8 while reading {what}: {e}"),
+			)
+		})?;
+		self.pos = end;
+		Ok(text.to_string())
+	}
+
+	fn read_bytes(&mut self, what: &str) -> std::io::Result<Vec<u8>> {
+		let len = self.read_len_for_major(2, what)?;
+		let end = self.checked_end(len, what)?;
+		let bytes = self.input[self.pos..end].to_vec();
+		self.pos = end;
+		Ok(bytes)
+	}
+
+	fn read_null(&mut self, what: &str) -> std::io::Result<()> {
+		let byte = self.read_u8(what)?;
+		if byte != 0xF6 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("expected CBOR null for {what}, got 0x{byte:02x}"),
+			));
+		}
+		Ok(())
+	}
+
+	fn skip_value(&mut self) -> std::io::Result<()> {
+		let byte = self.read_u8("CBOR value")?;
+		let major = byte >> 5;
+		let additional = byte & 0x1F;
+		match major {
+			0 | 1 => {
+				let _ = self.read_additional(additional, "CBOR integer")?;
+				Ok(())
+			}
+			2 | 3 => {
+				let len = self.read_additional(additional, "CBOR string")?;
+				self.pos = self.checked_end(len, "CBOR string")?;
+				Ok(())
+			}
+			4 => {
+				let len = self.read_additional(additional, "CBOR array")?;
+				for _ in 0..len {
+					self.skip_value()?;
+				}
+				Ok(())
+			}
+			5 => {
+				let len = self.read_additional(additional, "CBOR map")?;
+				for _ in 0..len {
+					self.skip_value()?;
+					self.skip_value()?;
+				}
+				Ok(())
+			}
+			7 if additional == 22 || additional == 20 || additional == 21 => Ok(()),
+			_ => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unsupported CBOR major type {major}"),
+			)),
+		}
+	}
+
+	fn read_len_for_major(&mut self, expected_major: u8, what: &str) -> std::io::Result<usize> {
+		let byte = self.read_u8(what)?;
+		let major = byte >> 5;
+		let additional = byte & 0x1F;
+		if major != expected_major {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"unexpected CBOR major type for {what}: expected {expected_major}, got {major}"
+				),
+			));
+		}
+		self.read_additional(additional, what)
+	}
+
+	fn read_additional(&mut self, additional: u8, what: &str) -> std::io::Result<usize> {
+		match additional {
+			n @ 0..=23 => Ok(n as usize),
+			24 => Ok(self.read_u8(what)? as usize),
+			25 => {
+				let end = self.checked_end(2, what)?;
+				let value = u16::from_be_bytes(self.input[self.pos..end].try_into().unwrap());
+				self.pos = end;
+				Ok(value as usize)
+			}
+			26 => {
+				let end = self.checked_end(4, what)?;
+				let value = u32::from_be_bytes(self.input[self.pos..end].try_into().unwrap());
+				self.pos = end;
+				Ok(value as usize)
+			}
+			27 => {
+				let end = self.checked_end(8, what)?;
+				let value = u64::from_be_bytes(self.input[self.pos..end].try_into().unwrap());
+				self.pos = end;
+				usize::try_from(value).map_err(|_| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("CBOR length overflow while reading {what}"),
+					)
+				})
+			}
+			31 => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("indefinite-length CBOR is not allowed for {what}"),
+			)),
+			_ => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unsupported CBOR additional info {additional} for {what}"),
+			)),
+		}
+	}
+
+	fn read_u8(&mut self, what: &str) -> std::io::Result<u8> {
+		if self.is_empty() {
+			return Err(Error::new(
+				ErrorKind::UnexpectedEof,
+				format!("truncated CBOR while reading {what}"),
+			));
+		}
+		let byte = self.input[self.pos];
+		self.pos += 1;
+		Ok(byte)
+	}
+
+	fn checked_end(&self, len: usize, what: &str) -> std::io::Result<usize> {
+		let end = self.pos.checked_add(len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("CBOR length overflow while reading {what}"),
+			)
+		})?;
+		if end > self.input.len() {
+			return Err(Error::new(
+				ErrorKind::UnexpectedEof,
+				format!("truncated CBOR payload while reading {what}"),
+			));
+		}
+		Ok(end)
 	}
 }

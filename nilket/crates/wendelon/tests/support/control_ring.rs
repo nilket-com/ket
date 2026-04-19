@@ -17,6 +17,7 @@ use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::server::HrftService;
+use wendelon::network::tls::ActorIdentity;
 use wendelon::network::transport::{
 	EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities,
 	TransportConnection, TransportProvider, TransportStream, TransportTier, TransportTierSet,
@@ -449,6 +450,7 @@ struct LoopbackConnection {
 	address: String,
 	pool: Arc<BufPool>,
 	tier: TransportTier,
+	actor: ActorIdentity,
 }
 
 #[async_trait]
@@ -468,6 +470,10 @@ impl TransportConnection for LoopbackConnection {
 
 	fn remote_id(&self) -> NodeId {
 		self.remote
+	}
+
+	fn actor_identity(&self) -> &ActorIdentity {
+		&self.actor
 	}
 
 	fn transport_type(&self) -> TransportTier {
@@ -501,6 +507,7 @@ impl TransportProvider for LoopbackProvider {
 			address: address.to_string(),
 			pool: self.pool.clone(),
 			tier: self.tier,
+			actor: ActorIdentity::data_node(target),
 		}))
 	}
 

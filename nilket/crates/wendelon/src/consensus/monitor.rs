@@ -111,6 +111,59 @@ impl AbortHandle for ProcessAbort {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockDriftEvent {
+	pub local_node: NodeId,
+	pub local_physical_ms: u64,
+	pub cluster_median_ms: u64,
+	pub offset_ms: u64,
+	pub max_offset_ms: u64,
+}
+
+pub trait ClockDriftSubscriber: Send + Sync {
+	fn on_drift_exceeded(&self, event: &ClockDriftEvent);
+}
+
+pub struct NoopClockDriftSubscriber;
+
+impl ClockDriftSubscriber for NoopClockDriftSubscriber {
+	fn on_drift_exceeded(&self, _event: &ClockDriftEvent) {}
+}
+
+pub struct FanoutClockDriftSubscriber {
+	subscribers: Vec<Arc<dyn ClockDriftSubscriber>>,
+}
+
+impl FanoutClockDriftSubscriber {
+	pub fn new(subscribers: Vec<Arc<dyn ClockDriftSubscriber>>) -> Self {
+		Self { subscribers }
+	}
+}
+
+impl ClockDriftSubscriber for FanoutClockDriftSubscriber {
+	fn on_drift_exceeded(&self, event: &ClockDriftEvent) {
+		for subscriber in &self.subscribers {
+			subscriber.on_drift_exceeded(event);
+		}
+	}
+}
+
+pub struct WatchClockDriftSubscriber {
+	tx: watch::Sender<Option<ClockDriftEvent>>,
+}
+
+impl WatchClockDriftSubscriber {
+	pub fn new(tx: watch::Sender<Option<ClockDriftEvent>>) -> Self {
+		Self { tx }
+	}
+}
+
+impl ClockDriftSubscriber for WatchClockDriftSubscriber {
+	fn on_drift_exceeded(&self, event: &ClockDriftEvent) {
+		let _ = self.tx.send_replace(Some(event.clone()));
+	}
+}
+
 /// Signals whether the local node is currently the Raft leader. The
 /// eviction watchdog uses this to cheaply skip the expensive
 /// membership sweep on followers.
@@ -295,6 +348,22 @@ pub fn check_drift_once(
 	abort: &dyn AbortHandle,
 	max_offset_ms: u64,
 ) -> DriftCheck {
+	check_drift_once_with_subscriber(
+		tracker,
+		clock,
+		abort,
+		&NoopClockDriftSubscriber,
+		max_offset_ms,
+	)
+}
+
+pub fn check_drift_once_with_subscriber(
+	tracker: &NodeTracker,
+	clock: &dyn PhysicalClock,
+	abort: &dyn AbortHandle,
+	subscriber: &dyn ClockDriftSubscriber,
+	max_offset_ms: u64,
+) -> DriftCheck {
 	metrics().clock_drift_checks_total.inc();
 	let now = clock.now_ms();
 	let Some(median) = tracker.median_cluster_ms(now) else {
@@ -308,8 +377,18 @@ pub fn check_drift_once(
 	};
 	metrics().clock_drift_offset_ms.set(offset);
 	if offset > max_offset_ms {
+		let event = ClockDriftEvent {
+			local_node: tracker.local_node(),
+			local_physical_ms: now,
+			cluster_median_ms: median,
+			offset_ms: offset,
+			max_offset_ms,
+		};
+		metrics().clock_drift_exceeded_total.inc();
+		subscriber.on_drift_exceeded(&event);
 		abort.abort(&format!(
-			"clock drift {offset}ms > {max_offset_ms}ms (local={now}, median={median})"
+			"clock drift {offset}ms > {max_offset_ms}ms (node={}, local={now}, median={median})",
+			tracker.local_node().id,
 		));
 	}
 	DriftCheck::Within { offset_ms: offset }
@@ -332,6 +411,34 @@ pub fn spawn_drift_monitor(
 	abort: Arc<dyn AbortHandle>,
 	interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
+	spawn_drift_monitor_with_bound(tracker, clock, abort, interval, MAX_OFFSET_MS)
+}
+
+pub fn spawn_drift_monitor_with_bound(
+	tracker: Arc<NodeTracker>,
+	clock: Arc<dyn PhysicalClock>,
+	abort: Arc<dyn AbortHandle>,
+	interval: Duration,
+	max_offset_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+	spawn_drift_monitor_with_subscriber(
+		tracker,
+		clock,
+		abort,
+		Arc::new(NoopClockDriftSubscriber),
+		interval,
+		max_offset_ms,
+	)
+}
+
+pub fn spawn_drift_monitor_with_subscriber(
+	tracker: Arc<NodeTracker>,
+	clock: Arc<dyn PhysicalClock>,
+	abort: Arc<dyn AbortHandle>,
+	subscriber: Arc<dyn ClockDriftSubscriber>,
+	interval: Duration,
+	max_offset_ms: u64,
+) -> tokio::task::JoinHandle<()> {
 	tokio::spawn(async move {
 		let mut ticker = tokio::time::interval(interval);
 		// `Skip` means a long pause does not snowball into a burst
@@ -339,7 +446,13 @@ pub fn spawn_drift_monitor(
 		ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 		loop {
 			ticker.tick().await;
-			let _ = check_drift_once(&tracker, &*clock, &*abort, MAX_OFFSET_MS);
+			let _ = check_drift_once_with_subscriber(
+				&tracker,
+				&*clock,
+				&*abort,
+				&*subscriber,
+				max_offset_ms,
+			);
 		}
 	})
 }
@@ -560,6 +673,38 @@ impl AbortHandle for RecordingAbort {
 	}
 }
 
+#[cfg(test)]
+pub struct RecordingDriftSubscriber {
+	events: Mutex<Vec<ClockDriftEvent>>,
+}
+
+#[cfg(test)]
+impl RecordingDriftSubscriber {
+	pub fn new() -> Self {
+		Self {
+			events: Mutex::new(Vec::new()),
+		}
+	}
+
+	pub fn events(&self) -> Vec<ClockDriftEvent> {
+		self.events.lock().unwrap().clone()
+	}
+}
+
+#[cfg(test)]
+impl Default for RecordingDriftSubscriber {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[cfg(test)]
+impl ClockDriftSubscriber for RecordingDriftSubscriber {
+	fn on_drift_exceeded(&self, event: &ClockDriftEvent) {
+		self.events.lock().unwrap().push(event.clone());
+	}
+}
+
 /// Recording leader hook. Flip with `set_leader`.
 #[cfg(test)]
 pub struct FakeLeader(Mutex<bool>);
@@ -749,11 +894,19 @@ mod tests {
 		tracker.record(nid(2), 999);
 		tracker.record(nid(3), 1_001);
 		let abort = RecordingAbort::new();
-		match check_drift_once(&tracker, &*clock, &abort, MAX_OFFSET_MS) {
+		let subscriber = RecordingDriftSubscriber::new();
+		match check_drift_once_with_subscriber(
+			&tracker,
+			&*clock,
+			&abort,
+			&subscriber,
+			MAX_OFFSET_MS,
+		) {
 			DriftCheck::Within { offset_ms } => assert!(offset_ms <= 2),
 			other => panic!("expected Within, got {other:?}"),
 		}
 		assert!(abort.reasons().is_empty());
+		assert!(subscriber.events().is_empty());
 	}
 
 	#[test]
@@ -763,15 +916,17 @@ mod tests {
 		// Only one peer — below DRIFT_MIN_SAMPLES.
 		tracker.record(nid(2), 1_000);
 		let abort = RecordingAbort::new();
+		let subscriber = RecordingDriftSubscriber::new();
 		assert_eq!(
-			check_drift_once(&tracker, &*clock, &abort, MAX_OFFSET_MS),
+			check_drift_once_with_subscriber(&tracker, &*clock, &abort, &subscriber, MAX_OFFSET_MS,),
 			DriftCheck::InsufficientSamples
 		);
 		assert!(abort.reasons().is_empty());
+		assert!(subscriber.events().is_empty());
 	}
 
 	#[test]
-	fn drift_beyond_bound_invokes_abort() {
+	fn drift_beyond_bound_reports_event_before_abort() {
 		// RecordingAbort panics after recording, so we catch the
 		// unwind and inspect the stored reason.
 		let clock = Arc::new(FakeClock::new(10_000));
@@ -781,11 +936,19 @@ mod tests {
 		tracker.record(nid(2), 9_000);
 		tracker.record(nid(3), 9_000);
 		let abort = Arc::new(RecordingAbort::new());
+		let subscriber = Arc::new(RecordingDriftSubscriber::new());
 		let abort_for_check = abort.clone();
+		let subscriber_for_check = subscriber.clone();
 		let tracker_ref = &tracker;
 		let clock_ref: &dyn PhysicalClock = &*clock;
 		let result = std::panic::catch_unwind(AssertUnwindSafe(move || {
-			check_drift_once(tracker_ref, clock_ref, &*abort_for_check, MAX_OFFSET_MS)
+			check_drift_once_with_subscriber(
+				tracker_ref,
+				clock_ref,
+				&*abort_for_check,
+				&*subscriber_for_check,
+				MAX_OFFSET_MS,
+			)
 		}));
 		assert!(result.is_err(), "expected RecordingAbort panic");
 		let reasons = abort.reasons();
@@ -795,6 +958,13 @@ mod tests {
 			"unexpected abort reason: {}",
 			reasons[0]
 		);
+		let events = subscriber.events();
+		assert_eq!(events.len(), 1);
+		assert_eq!(events[0].local_node, nid(1));
+		assert_eq!(events[0].local_physical_ms, 10_000);
+		assert_eq!(events[0].cluster_median_ms, 9_000);
+		assert_eq!(events[0].offset_ms, 1_000);
+		assert_eq!(events[0].max_offset_ms, MAX_OFFSET_MS);
 	}
 
 	// -------------- eviction watchdog ----

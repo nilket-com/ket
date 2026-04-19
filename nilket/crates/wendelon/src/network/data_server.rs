@@ -39,8 +39,8 @@
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
-	MigrationComplete, MigrationLedgerEntry, MigrationState, WendelonRaft, WendelonRequest,
-	WendelonResponse, WendelonStateMachine,
+	HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry, MigrationState,
+	WendelonRaft, WendelonRequest, WendelonResponse, WendelonStateMachine,
 };
 use crate::metrics::global as metrics;
 use crate::network::core::{
@@ -76,7 +76,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::io::{Cursor, Error, ErrorKind};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -298,11 +298,9 @@ pub struct WendelonDataServer {
 	/// Exactly-once cache. `WriteResponseMeta` is `Copy`, so
 	/// lookups are O(1) under DashMap's shard striping.
 	idempotency: Arc<DashMap<IdempotencyKey, WriteResponseMeta>>,
-	/// Last HLC the leader assigned to a committed-or-inflight write.
-	/// Protects `max(local_hlc, client_hlc) + 1` across concurrent
-	/// write paths so bulk streams and unary writes share one
-	/// monotonic authority.
-	last_commit_hlc: Arc<Mutex<HybridTimestamp>>,
+	/// Shared node-wide HLC driver. The leader merges client HLCs
+	/// into this monotonic authority before stamping writes.
+	hlc: Arc<HybridLogicalClockDriver>,
 	/// Optional liveness + drift tracker (ADR 001, ADR 012). When
 	/// populated, every inbound peer-to-peer RPC feeds the peer's
 	/// HLC physical component into it so the drift monitor and
@@ -387,7 +385,7 @@ impl Clone for WendelonDataServer {
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
 			idempotency: self.idempotency.clone(),
-			last_commit_hlc: self.last_commit_hlc.clone(),
+			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
 			lease_gate_enabled: self.lease_gate_enabled,
@@ -411,6 +409,7 @@ impl WendelonDataServer {
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
 	) -> Self {
+		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		Self {
 			slab,
 			raft,
@@ -422,11 +421,7 @@ impl WendelonDataServer {
 			factory,
 			pool,
 			idempotency: Arc::new(DashMap::new()),
-			last_commit_hlc: Arc::new(Mutex::new(HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: local_node.id,
-			})),
+			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
 			lease_gate_enabled: false,
@@ -475,6 +470,11 @@ impl WendelonDataServer {
 		self
 	}
 
+	pub fn with_hlc(mut self, hlc: Arc<HybridLogicalClockDriver>) -> Self {
+		self.hlc = hlc;
+		self
+	}
+
 	/// Shared handle to the lease cache. The lease manager writes
 	/// to it; the write/read paths read from it. Exposed so the
 	/// manager task (which lives in a separate module) can take an
@@ -484,32 +484,7 @@ impl WendelonDataServer {
 	}
 
 	fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
-		let now_hlc = HybridTimestamp {
-			physical_ms: self.clock.now_ms(),
-			logical: 0,
-			node_id: self.local_node.id,
-		};
-		let mut guard = self
-			.last_commit_hlc
-			.lock()
-			.expect("last_commit_hlc mutex poisoned");
-		let leader_hlc = (*guard).max(now_hlc);
-		let base = leader_hlc.max(client_hlc);
-		let merged = if base.logical == u32::MAX {
-			HybridTimestamp {
-				physical_ms: base.physical_ms.saturating_add(1),
-				logical: 0,
-				node_id: self.local_node.id,
-			}
-		} else {
-			HybridTimestamp {
-				physical_ms: base.physical_ms,
-				logical: base.logical + 1,
-				node_id: self.local_node.id,
-			}
-		};
-		*guard = merged;
-		merged
+		self.hlc.merge(client_hlc)
 	}
 
 	fn make_signed_lease(
@@ -4448,6 +4423,7 @@ mod tests {
 	use crate::consensus::{MigrationLedgerEntry, MigrationState};
 	use crate::network::router::MsgRouter;
 	use crate::network::server::HrftService;
+	use crate::network::tls::ActorIdentity;
 	use crate::network::transport::{
 		MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
 		TransportProvider, TransportStream, TransportTier, TransportTierSet,
@@ -4574,6 +4550,7 @@ mod tests {
 		remote: NodeId,
 		tier: TransportTier,
 		handlers: Arc<LoopbackHandlers>,
+		actor: ActorIdentity,
 	}
 
 	#[async_trait]
@@ -4590,6 +4567,9 @@ mod tests {
 		}
 		fn remote_id(&self) -> NodeId {
 			self.remote
+		}
+		fn actor_identity(&self) -> &ActorIdentity {
+			&self.actor
 		}
 		fn transport_type(&self) -> TransportTier {
 			self.tier
@@ -4713,6 +4693,7 @@ mod tests {
 				remote: target,
 				tier: self.tier,
 				handlers: self.handlers.clone(),
+				actor: ActorIdentity::data_node(target),
 			}))
 		}
 	}

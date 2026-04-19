@@ -15,11 +15,12 @@
 //! print or write a starter config instead.
 
 use std::process::ExitCode;
+use std::sync::Arc;
+use tokio_rustls::TlsAcceptor;
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
-use wendelon::metrics::exporter;
+use wendelon::metrics::observability::{self, ObservabilityHandles};
+use wendelon::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_peer_roots};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
-
-const DEFAULT_METRICS_BIND_ADDRESS: &str = "127.0.0.1:9900";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -58,22 +59,8 @@ async fn main() -> ExitCode {
 			return ExitCode::from(2);
 		}
 	};
-	let metrics_bind = std::env::var("WENDELON_METRICS_BIND")
-		.unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDRESS.to_string());
-	let _metrics = if metrics_bind.eq_ignore_ascii_case("off") || metrics_bind.trim().is_empty() {
-		None
-	} else {
-		match exporter::spawn(&metrics_bind).await {
-			Ok(handle) => {
-				eprintln!("wendelon: metrics listening on {}", handle.local_addr);
-				Some(handle)
-			}
-			Err(e) => {
-				eprintln!("failed to start metrics exporter on {metrics_bind}: {e}");
-				return ExitCode::from(1);
-			}
-		}
-	};
+	let transport_tls = cfg.transport_tls.clone();
+	let observability_cfg = cfg.observability.clone();
 	let node = match WendelonNode::bootstrap(cfg).await {
 		Ok(n) => n,
 		Err(e) => {
@@ -83,16 +70,102 @@ async fn main() -> ExitCode {
 	};
 	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
 
+	let observability = match (transport_tls.as_ref(), observability_cfg) {
+		(Some(tls), Some(obs)) => {
+			let material = match TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)
+			{
+				Ok(material) => material,
+				Err(e) => {
+					eprintln!("failed to load observability TLS material: {e}");
+					return ExitCode::from(2);
+				}
+			};
+			let trust_roots = match ActorTrustRoots::load(&tls.node_ca_path, &tls.operator_ca_path)
+			{
+				Ok(roots) => Arc::new(roots),
+				Err(e) => {
+					eprintln!("failed to load observability trust roots: {e}");
+					return ExitCode::from(2);
+				}
+			};
+			let server_config = match rustls_server_config_with_peer_roots(
+				&material,
+				trust_roots.combined_roots(),
+				Vec::new(),
+			) {
+				Ok(material) => material,
+				Err(e) => {
+					eprintln!("failed to build observability TLS server config: {e}");
+					return ExitCode::from(2);
+				}
+			};
+			let reporter = Arc::new(node.readiness_reporter());
+			match observability::spawn(
+				obs.listeners,
+				TlsAcceptor::from(Arc::new(server_config)),
+				reporter,
+				node.local_node.id,
+				&tls.cluster_domain,
+				trust_roots,
+				node.audit_sink.clone(),
+			)
+			.await
+			{
+				Ok(handles) => {
+					eprintln!(
+						"wendelon: health listening on {}",
+						handles.health.local_addr
+					);
+					eprintln!("wendelon: ready listening on {}", handles.ready.local_addr);
+					eprintln!(
+						"wendelon: metrics listening on {}",
+						handles.metrics.local_addr
+					);
+					Some(handles)
+				}
+				Err(e) => {
+					eprintln!("failed to start observability listeners: {e}");
+					return ExitCode::from(1);
+				}
+			}
+		}
+		_ => None,
+	};
+
 	tokio::signal::ctrl_c().await.ok();
 	eprintln!("wendelon: draining");
 	if let Err(e) = node.shutdown().await {
 		eprintln!("shutdown failed: {e}");
 		return ExitCode::from(1);
 	}
-	if let Some(metrics) = _metrics {
-		metrics.task.abort();
-		let _ = metrics.task.await;
+	if let Some(handles) = observability {
+		if let Err(e) = shutdown_observability(handles).await {
+			eprintln!("observability shutdown failed: {e}");
+			return ExitCode::from(1);
+		}
 	}
 	eprintln!("wendelon: shutdown complete");
 	ExitCode::SUCCESS
+}
+
+async fn shutdown_observability(handles: ObservabilityHandles) -> std::io::Result<()> {
+	for handle in [&handles.health, &handles.ready, &handles.metrics] {
+		handle.task.abort();
+	}
+	for (label, task) in [
+		("health listener", handles.health.task),
+		("ready listener", handles.ready.task),
+		("metrics listener", handles.metrics.task),
+	] {
+		match task.await {
+			Ok(()) => {}
+			Err(err) if err.is_cancelled() => {}
+			Err(err) => {
+				return Err(std::io::Error::other(format!(
+					"{label} failed during shutdown: {err}",
+				)));
+			}
+		}
+	}
+	Ok(())
 }
