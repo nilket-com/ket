@@ -48,6 +48,11 @@ impl LoopbackRegistry {
 			.insert(node_id, PublishedLoopbackService { service });
 	}
 
+	#[allow(dead_code)]
+	pub fn unpublish(&self, node_id: NodeId) {
+		self.services.lock().unwrap().remove(&node_id);
+	}
+
 	fn resolve(
 		&self,
 		target: NodeId,

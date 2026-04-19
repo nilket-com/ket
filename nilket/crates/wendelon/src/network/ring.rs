@@ -34,7 +34,7 @@
 
 use crate::network::data_server::ReplicaRouter;
 use crate::network::transport::{MembershipEpoch, NodeRole, NodeRoleSet};
-use crate::schema::{Locality, NodeId};
+use crate::schema::{Identity, Locality, NodeId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
@@ -185,6 +185,19 @@ impl RingState {
 			out.push(node);
 		}
 		out
+	}
+
+	/// Primary owner for a routing locality. This is the first
+	/// data-capable replica the ring walk would return for the key.
+	pub fn owner_of_locality(&self, locality: Locality) -> Option<NodeId> {
+		self.replicas_for_locality(locality).into_iter().next()
+	}
+
+	/// Primary owner for a record identity. This intentionally
+	/// projects through [`Locality::from`] so owner selection remains
+	/// a pure function of `Locality`, matching ADR 029.
+	pub fn owner_of_identity(&self, identity: Identity) -> Option<NodeId> {
+		self.owner_of_locality(Locality::from(identity))
 	}
 
 	fn replication_factor(&self) -> usize {
@@ -341,6 +354,16 @@ impl RingRouter {
 	/// Convenience delegate for [`RingState::replicas_for_locality`].
 	pub fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
 		self.snapshot().replicas_for_locality(locality)
+	}
+
+	/// Convenience delegate for [`RingState::owner_of_locality`].
+	pub fn owner_of_locality(&self, locality: Locality) -> Option<NodeId> {
+		self.snapshot().owner_of_locality(locality)
+	}
+
+	/// Convenience delegate for [`RingState::owner_of_identity`].
+	pub fn owner_of_identity(&self, identity: Identity) -> Option<NodeId> {
+		self.snapshot().owner_of_identity(identity)
 	}
 
 	/// Epoch of the currently installed ring state.
@@ -650,6 +673,20 @@ mod tests {
 					node_id
 				);
 			}
+		}
+	}
+
+	#[test]
+	fn identity_owner_projection_is_pure_function_of_locality() {
+		let m = membership_of(vec![(1, data_caps()), (2, data_caps()), (3, data_caps())]);
+		let state = RingState::build(&m, 1);
+		for i in 0..1024u64 {
+			let identity = Identity::blake3(&i.to_le_bytes());
+			let locality = Locality::from(identity);
+			assert_eq!(
+				state.owner_of_identity(identity),
+				state.owner_of_locality(locality)
+			);
 		}
 	}
 }

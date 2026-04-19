@@ -1,4 +1,6 @@
-use crate::schema::{FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId};
+use crate::schema::{
+	FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -169,6 +171,8 @@ pub enum WendelonRequest {
 	Finalize(FinalizationMarker),
 	/// Grant a Per-Range Lease to a Data Node.
 	AcquireLease(LeaseDescriptor),
+	/// Release a previously granted Per-Range Lease.
+	ReleaseLease(ReleaseLeaseRequestMeta),
 	/// Commit the next epoch/ring config before auto-seeding the
 	/// Migration Ledger for the reassigned ranges.
 	AdvanceEpoch(AdvanceEpochRecord),

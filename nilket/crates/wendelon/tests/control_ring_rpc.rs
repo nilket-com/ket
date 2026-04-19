@@ -3,6 +3,7 @@ mod support;
 
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
@@ -22,7 +23,7 @@ use wendelon::network::{
 use wendelon::node::{LEASE_TTL_MS, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp, LeaseDescriptor,
-	LeaseStatus, MsgType, NodeId, TransferToken,
+	LeaseStatus, MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TransferToken,
 };
 
 fn decode_status_response(
@@ -35,6 +36,26 @@ fn decode_status_response(
 		.map(|bytes| wire::decode::<Vec<LeaseDescriptor>>(bytes).unwrap())
 		.unwrap_or_default();
 	(status, leases)
+}
+
+fn read_audit_log(path: &Path) -> String {
+	std::fs::read_to_string(path).unwrap_or_default()
+}
+
+async fn wait_for_audit_event(path: &Path, event_type: &str) -> String {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+	let needle = format!("\"event_type\":\"{event_type}\"");
+	loop {
+		let audit = read_audit_log(path);
+		if audit.contains(&needle) {
+			return audit;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for audit event {event_type}; current log: {audit}"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
 }
 
 fn epoch_config_batch() -> RecordBatch {
@@ -61,7 +82,7 @@ async fn lease_req_commits_through_control_ring_handler() {
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
-	let (factory, pool) = support::loopback_factory(node.local_node, service);
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
 	let (range_start, range_end) = node
 		.ring
 		.primary_ranges_for(node.local_node)
@@ -113,12 +134,12 @@ async fn lease_req_commits_through_control_ring_handler() {
 }
 
 #[tokio::test]
-async fn overlapping_remote_lease_requests_race_through_committed_path() {
-	let node = support::bootstrap_node("lease-rpc-race", 1).await;
+async fn lease_req_rejects_invalid_target_before_commit() {
+	let node = support::bootstrap_node("lease-rpc-invalid-target", 1).await;
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
-	let (factory, pool) = support::loopback_factory(node.local_node, service);
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
 	let (range_start, range_end) = node
 		.ring
 		.primary_ranges_for(node.local_node)
@@ -126,20 +147,7 @@ async fn overlapping_remote_lease_requests_race_through_committed_path() {
 		.next()
 		.unwrap();
 
-	let req_a = AcquireLeaseRequestMeta {
-		range_start,
-		range_end,
-		epoch: node.ring.current_epoch(),
-		holder: node.local_node,
-		requested_hlc: HybridTimestamp {
-			physical_ms: 20_000,
-			logical: 0,
-			node_id: node.local_node.id,
-		},
-		ttl_ms: 250,
-		_pad: 0,
-	};
-	let req_b = AcquireLeaseRequestMeta {
+	let req = AcquireLeaseRequestMeta {
 		range_start,
 		range_end,
 		epoch: node.ring.current_epoch(),
@@ -155,67 +163,71 @@ async fn overlapping_remote_lease_requests_race_through_committed_path() {
 		ttl_ms: 250,
 		_pad: 0,
 	};
+	let resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::LEASE_REQ,
+		bytemuck::bytes_of(&req),
+		None,
+		None,
+	)
+	.await
+	.unwrap();
 
-	let (resp_a, resp_b) = tokio::join!(
-		support::call_frame(
-			&factory,
-			&pool,
-			node.local_node,
-			MsgType::LEASE_REQ,
-			bytemuck::bytes_of(&req_a),
-			None,
-			None,
-		),
-		support::call_frame(
-			&factory,
-			&pool,
-			node.local_node,
-			MsgType::LEASE_REQ,
-			bytemuck::bytes_of(&req_b),
-			None,
-			None,
-		),
-	);
-	let resp_a = resp_a.unwrap();
-	let resp_b = resp_b.unwrap();
-
-	let meta_a: AcquireLeaseResponseMeta =
-		*bytemuck::from_bytes(&resp_a.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
-	let meta_b: AcquireLeaseResponseMeta =
-		*bytemuck::from_bytes(&resp_b.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
-
-	let statuses = [meta_a.status, meta_b.status];
-	assert_eq!(
-		statuses
-			.iter()
-			.filter(|status| **status == LeaseStatus::GRANTED)
-			.count(),
-		1
-	);
-	assert_eq!(
-		statuses
-			.iter()
-			.filter(|status| **status == LeaseStatus::DENIED_OVERLAP)
-			.count(),
-		1
-	);
-
-	let winner = if meta_a.status == LeaseStatus::GRANTED {
-		req_a.holder
-	} else {
-		req_b.holder
-	};
-	let loser = if winner.id == req_a.holder.id {
-		&resp_b
-	} else {
-		&resp_a
-	};
-	assert!(loser.trailing.is_none());
-
+	let meta: AcquireLeaseResponseMeta =
+		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
+	assert_eq!(meta.status, LeaseStatus::DENIED_INVALID_TARGET);
+	assert!(resp.trailing.is_none());
 	let snapshot = node.state_machine.state_snapshot().await;
-	let committed = snapshot.leases.get(&range_start).unwrap();
-	assert_eq!(committed.holder, winner);
-	assert_eq!(committed.range_end, range_end);
+	assert!(snapshot.leases.is_empty());
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn lease_req_rejects_non_canonical_range_for_owner() {
+	let node = support::bootstrap_node("lease-rpc-non-canonical", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
+	let (range_start, range_end) = node
+		.ring
+		.primary_ranges_for(node.local_node)
+		.into_iter()
+		.next()
+		.unwrap();
+	let req = AcquireLeaseRequestMeta {
+		range_start: range_start.saturating_add(1),
+		range_end,
+		epoch: node.ring.current_epoch(),
+		holder: node.local_node,
+		requested_hlc: HybridTimestamp {
+			physical_ms: 25_000,
+			logical: 0,
+			node_id: node.local_node.id,
+		},
+		ttl_ms: 250,
+		_pad: 0,
+	};
+
+	let resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::LEASE_REQ,
+		bytemuck::bytes_of(&req),
+		None,
+		None,
+	)
+	.await
+	.unwrap();
+	let meta: AcquireLeaseResponseMeta =
+		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
+	assert_eq!(meta.status, LeaseStatus::DENIED_INVALID_TARGET);
+	assert!(resp.trailing.is_none());
+	assert!(node.state_machine.state_snapshot().await.leases.is_empty());
 
 	support::abort_node(&node);
 }
@@ -226,7 +238,7 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 	support::wait_for_local_leader(&node).await;
 
 	let service: Arc<dyn HrftService> = node.router.clone();
-	let (factory, pool) = support::loopback_factory(node.local_node, service);
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
 	let (range_start, range_end) = node
 		.ring
 		.primary_ranges_for(node.local_node)
@@ -281,6 +293,78 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 	assert_eq!(leases[0].holder, node.local_node);
 	assert_eq!(leases[0].range_start, range_start);
 	assert_eq!(leases[0].range_end, range_end);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn lease_release_req_removes_committed_lease() {
+	let node = support::bootstrap_node("lease-release-rpc", 1).await;
+	support::wait_for_local_leader(&node).await;
+	node.handles.lease_manager.abort();
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);
+	let (range_start, range_end) = node
+		.ring
+		.primary_ranges_for(node.local_node)
+		.into_iter()
+		.next()
+		.unwrap();
+	let acquire = AcquireLeaseRequestMeta {
+		range_start,
+		range_end,
+		epoch: node.ring.current_epoch(),
+		holder: node.local_node,
+		requested_hlc: HybridTimestamp {
+			physical_ms: 35_000,
+			logical: 0,
+			node_id: node.local_node.id,
+		},
+		ttl_ms: 250,
+		_pad: 0,
+	};
+
+	let acquire_resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::LEASE_REQ,
+		bytemuck::bytes_of(&acquire),
+		None,
+		None,
+	)
+	.await
+	.unwrap();
+	let acquire_meta: AcquireLeaseResponseMeta = *bytemuck::from_bytes(
+		&acquire_resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()],
+	);
+	assert_eq!(acquire_meta.status, LeaseStatus::GRANTED);
+
+	let release = ReleaseLeaseRequestMeta {
+		range_start,
+		range_end,
+		epoch: node.ring.current_epoch(),
+		holder: node.local_node,
+	};
+	let release_resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::LEASE_RELEASE_REQ,
+		bytemuck::bytes_of(&release),
+		None,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(release_resp.header.msg_type, MsgType::LEASE_RELEASE_RESP.0);
+	let release_meta: ReleaseLeaseResponseMeta = *bytemuck::from_bytes(
+		&release_resp.meta[..std::mem::size_of::<ReleaseLeaseResponseMeta>()],
+	);
+	assert_eq!(release_meta.status, LeaseStatus::GRANTED);
+	assert!(release_resp.trailing.is_none());
+	assert!(node.state_machine.state_snapshot().await.leases.is_empty());
 
 	support::abort_node(&node);
 }
@@ -513,4 +597,67 @@ async fn advance_epoch_status_survives_restart() {
 	assert!(status.peers.iter().any(|peer| peer.node_id == 2));
 
 	support::abort_node(&recovered);
+}
+
+#[tokio::test]
+async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
+	let dir = support::tempdir("epoch-rpc-audit");
+	let audit_path = dir.join("audit.ndjson");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		1,
+		dir.clone(),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	support::wait_for_local_leader(&node).await;
+
+	let service: Arc<dyn HrftService> = node.router.clone();
+	let (factory, pool) = support::loopback_factory(node.local_node, service);
+	let arrow = support::encode_batch(&epoch_config_batch()).unwrap();
+	let resp = support::call_frame(
+		&factory,
+		&pool,
+		node.local_node,
+		MsgType::EPOCH_ADV_REQ,
+		&[],
+		Some(&arrow),
+		None,
+	)
+	.await
+	.unwrap();
+	let meta: AdvanceEpochResponseWire = wire::decode(&resp.meta).unwrap();
+	assert!(meta.accepted);
+
+	let audit = wait_for_audit_event(&audit_path, "control_ring.epoch_advanced").await;
+	assert!(audit.contains("\"authority\":\"raft_log\""));
+	assert!(audit.contains("raft_log_index="));
+	assert!(audit.contains("from_epoch=1 to_epoch=2"));
+	assert!(audit.contains("to_peers=[1,2]"));
+	assert_eq!(
+		audit
+			.matches("\"event_type\":\"control_ring.epoch_advanced\"")
+			.count(),
+		1
+	);
+
+	node.handles.abort();
+	drop(node);
+	tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+	let recovered =
+		WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(1, dir, "127.0.0.1:0".into()))
+			.await
+			.unwrap();
+	support::wait_for_local_leader(&recovered).await;
+
+	let recovered_audit = read_audit_log(&audit_path);
+	assert_eq!(
+		recovered_audit
+			.matches("\"event_type\":\"control_ring.epoch_advanced\"")
+			.count(),
+		1
+	);
+
+	recovered.handles.abort();
 }

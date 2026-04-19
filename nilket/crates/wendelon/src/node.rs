@@ -758,6 +758,7 @@ impl WendelonNode {
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
 		let audit_sink: Arc<dyn AuditSink> =
 			Arc::new(LocalAuditSink::open(cfg.data_dir.join("audit.ndjson"))?);
+		let state_machine = state_machine.with_audit_materializer(local_node, audit_sink.clone());
 		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);
 
 		// 7. Transport factory — tests can still swap in loopback

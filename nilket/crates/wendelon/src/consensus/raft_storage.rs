@@ -46,6 +46,7 @@
 //! `Arc<RwLock<LogStoreInner>>` so `get_log_reader` can hand out
 //! a Self-typed reader that shares the same cache as the writer.
 
+use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
 use crate::consensus::{
 	AdvanceEpochRecord, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, SeedMigration, TieredSlab, WendelonRequest,
@@ -243,6 +244,24 @@ struct DiscoveredWalSegment {
 	path: PathBuf,
 	start_index: u64,
 	legacy: bool,
+}
+
+#[derive(Clone)]
+struct RaftAuditMaterializer {
+	local_node: SchemaNodeId,
+	sink: Arc<dyn AuditSink>,
+}
+
+impl RaftAuditMaterializer {
+	fn emit(&self, event: AuditEvent) {
+		if let Err(err) = self.sink.emit(event.clone()) {
+			tracing::warn!(
+				event_type = %event.event_type,
+				error = %err,
+				"raft audit materialization failed; authoritative record remains in the committed log"
+			);
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -1781,6 +1800,8 @@ pub struct WendelonStateMachine {
 	/// Optional callback fired when committed apply progress should
 	/// be checkpointed into the WAL.
 	checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
+	/// Optional materializer for Raft-authority audit events.
+	audit_materializer: Option<RaftAuditMaterializer>,
 	/// Non-blocking live feed of committed finalization markers.
 	finalization_events: broadcast::Sender<FinalizationMarker>,
 }
@@ -1793,6 +1814,7 @@ impl WendelonStateMachine {
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			tier_observer: None,
 			checkpoint_observer: None,
+			audit_materializer: None,
 			finalization_events,
 		}
 	}
@@ -1849,6 +1871,7 @@ impl WendelonStateMachine {
 			snapshot_runtime,
 			tier_observer: None,
 			checkpoint_observer: None,
+			audit_materializer: None,
 			finalization_events,
 		})
 	}
@@ -1864,6 +1887,15 @@ impl WendelonStateMachine {
 
 	pub fn with_checkpoint_observer(mut self, observer: Arc<dyn CheckpointObserver>) -> Self {
 		self.checkpoint_observer = Some(observer);
+		self
+	}
+
+	pub fn with_audit_materializer(
+		mut self,
+		local_node: SchemaNodeId,
+		sink: Arc<dyn AuditSink>,
+	) -> Self {
+		self.audit_materializer = Some(RaftAuditMaterializer { local_node, sink });
 		self
 	}
 
@@ -1943,6 +1975,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		// released — they typically hit the filesystem (unlinking
 		// the L1 slab file) and must not block apply progress for
 		// other entries in the batch.
+		let mut pending_audit_events: Vec<AuditEvent> = Vec::new();
 		let mut pending_tier_events: Vec<(TieredSlab, u64)> = Vec::new();
 		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
 		let pending_checkpoint = {
@@ -1956,6 +1989,11 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				if let Some(t) = tier {
 					pending_tier_events.push((t, entry.log_id.index));
 				}
+				if let Some(materializer) = self.audit_materializer.as_ref() {
+					if let Some(event) = raft_audit_event(materializer.local_node, &entry) {
+						pending_audit_events.push(event);
+					}
+				}
 				if let Some(marker) = canonical_finalization_marker(&entry) {
 					pending_finalizations.push(marker);
 				}
@@ -1963,6 +2001,11 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			}
 			checkpoint_observation_from_state(&guard.state, false)
 		};
+		if let Some(materializer) = self.audit_materializer.as_ref() {
+			for event in pending_audit_events {
+				materializer.emit(event);
+			}
+		}
 		if let Some(observer) = self.tier_observer.as_ref() {
 			for (tier, applied_log_index) in &pending_tier_events {
 				// An observer error is surfaced through logs but
@@ -2187,6 +2230,44 @@ fn apply_entry_to_state(
 	}
 }
 
+fn raft_audit_event(
+	local_node: SchemaNodeId,
+	entry: &Entry<WendelonTypeConfig>,
+) -> Option<AuditEvent> {
+	let EntryPayload::Normal(req) = &entry.payload else {
+		return None;
+	};
+	match req {
+		WendelonRequest::AdvanceEpoch(record) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"control_ring.epoch_advanced",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} from_epoch={} to_epoch={} from_peers=[{}] to_peers=[{}]",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				record.from.epoch,
+				record.to.epoch,
+				format_epoch_peer_ids(&record.from),
+				format_epoch_peer_ids(&record.to),
+			),
+		)),
+		_ => None,
+	}
+}
+
+fn format_epoch_peer_ids(config: &EpochConfig) -> String {
+	let mut out = String::new();
+	for (idx, node_id) in config.peers.keys().enumerate() {
+		if idx > 0 {
+			out.push(',');
+		}
+		use std::fmt::Write as _;
+		write!(&mut out, "{node_id}").expect("writing to string cannot fail");
+	}
+	out
+}
+
 fn canonical_finalization_marker(entry: &Entry<WendelonTypeConfig>) -> Option<FinalizationMarker> {
 	match &entry.payload {
 		EntryPayload::Normal(WendelonRequest::Finalize(marker)) => {
@@ -2276,6 +2357,18 @@ fn apply_request(
 			state.leases.insert(lease.range_start, lease);
 			(WendelonResponse::Success, None)
 		}
+		WendelonRequest::ReleaseLease(release) => match state.leases.get(&release.range_start) {
+			Some(existing)
+				if existing.range_end == release.range_end
+					&& existing.epoch == release.epoch
+					&& existing.holder == release.holder =>
+			{
+				state.leases.remove(&release.range_start);
+				(WendelonResponse::Success, None)
+			}
+			Some(_) => (WendelonResponse::LeaseDenied, None),
+			None => (WendelonResponse::Success, None),
+		},
 		WendelonRequest::AdvanceEpoch(record) => {
 			apply_advance_epoch(state, record);
 			(WendelonResponse::Success, None)
@@ -3210,6 +3303,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	let (kind, epoch) = match &entry.payload {
 		EntryPayload::Normal(WendelonRequest::Finalize(m)) => (LogEntryKind::APPEND, m.epoch),
 		EntryPayload::Normal(WendelonRequest::AcquireLease(l)) => (LogEntryKind::APPEND, l.epoch),
+		EntryPayload::Normal(WendelonRequest::ReleaseLease(l)) => (LogEntryKind::APPEND, l.epoch),
 		EntryPayload::Normal(WendelonRequest::AdvanceEpoch(r)) => {
 			(LogEntryKind::CONFIG, r.to.epoch)
 		}
@@ -4582,7 +4676,9 @@ mod recovery_tests {
 #[cfg(test)]
 mod lease_tests {
 	use super::*;
-	use crate::schema::{HybridTimestamp, LeaseDescriptor, NodeId as SchemaNodeId};
+	use crate::schema::{
+		HybridTimestamp, LeaseDescriptor, NodeId as SchemaNodeId, ReleaseLeaseRequestMeta,
+	};
 
 	fn hlc(physical_ms: u64) -> HybridTimestamp {
 		HybridTimestamp {
@@ -4615,6 +4711,18 @@ mod lease_tests {
 				_reserved: 0,
 			},
 			signature: [0; 64],
+		}
+	}
+
+	fn release(holder_id: u32, epoch: u64, range: (u64, u64)) -> ReleaseLeaseRequestMeta {
+		ReleaseLeaseRequestMeta {
+			range_start: range.0,
+			range_end: range.1,
+			epoch,
+			holder: SchemaNodeId {
+				id: holder_id,
+				_reserved: 0,
+			},
 		}
 	}
 
@@ -4728,6 +4836,47 @@ mod lease_tests {
 		);
 		assert_eq!(resp, WendelonResponse::Success);
 		assert_eq!(state.leases.len(), 2);
+	}
+
+	#[test]
+	fn matching_release_removes_live_lease() {
+		let mut state = SmState::default();
+		apply_request(
+			&mut state,
+			WendelonRequest::AcquireLease(lease(1, 1, (0, 99), 0, 1_000)),
+		);
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::ReleaseLease(release(1, 1, (0, 99))),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		assert!(state.leases.is_empty());
+	}
+
+	#[test]
+	fn release_is_idempotent_when_lease_already_absent() {
+		let mut state = SmState::default();
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::ReleaseLease(release(1, 1, (0, 99))),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		assert!(state.leases.is_empty());
+	}
+
+	#[test]
+	fn release_for_other_holders_lease_is_denied() {
+		let mut state = SmState::default();
+		apply_request(
+			&mut state,
+			WendelonRequest::AcquireLease(lease(1, 1, (0, 99), 0, 1_000)),
+		);
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::ReleaseLease(release(2, 1, (0, 99))),
+		);
+		assert_eq!(resp, WendelonResponse::LeaseDenied);
+		assert_eq!(state.leases.get(&0).unwrap().holder.id, 1);
 	}
 }
 

@@ -26,8 +26,8 @@ use crate::network::transport::{
 use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, TransferToken,
-	epoch_entry_var_schema,
+	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, ReleaseLeaseRequestMeta,
+	ReleaseLeaseResponseMeta, TransferToken, epoch_entry_var_schema,
 };
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -211,7 +211,7 @@ impl WendelonControlServer {
 		})
 	}
 
-	async fn handle_lease(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_lease(&self, remote: NodeId, frame: HrftFrame) -> std::io::Result<HrftFrame> {
 		if frame.meta.len() < std::mem::size_of::<AcquireLeaseRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -226,6 +226,13 @@ impl WendelonControlServer {
 		}
 		if !self.is_leader().await {
 			return self.lease_response(&frame, LeaseStatus::DENIED_NOT_LEADER, None);
+		}
+		if self
+			.validate_acquire_lease_target(remote, &req)
+			.await
+			.is_err()
+		{
+			return self.lease_response(&frame, LeaseStatus::DENIED_INVALID_TARGET, None);
 		}
 
 		let ttl_ms = req.ttl_ms.clamp(1, self.lease_ttl_cap_ms);
@@ -260,6 +267,41 @@ impl WendelonControlServer {
 			Err(_) => LeaseStatus::INTERNAL_ERROR,
 		};
 		self.lease_response(&frame, status, None)
+	}
+
+	async fn handle_release(&self, remote: NodeId, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<ReleaseLeaseRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"LEASE_RELEASE_REQ meta too small",
+			));
+		}
+		let req: ReleaseLeaseRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReleaseLeaseRequestMeta>()]);
+
+		if req.epoch != self.current_epoch() {
+			return self.release_response(&frame, LeaseStatus::DENIED_EPOCH_STALE);
+		}
+		if !self.is_leader().await {
+			return self.release_response(&frame, LeaseStatus::DENIED_NOT_LEADER);
+		}
+		if remote != req.holder {
+			return self.release_response(&frame, LeaseStatus::DENIED_INVALID_TARGET);
+		}
+
+		let status = match self
+			.raft
+			.client_write(WendelonRequest::ReleaseLease(req))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => LeaseStatus::GRANTED,
+				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_INVALID_TARGET,
+			},
+			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
+			Err(_) => LeaseStatus::INTERNAL_ERROR,
+		};
+		self.release_response(&frame, status)
 	}
 
 	async fn handle_transfer(
@@ -716,6 +758,75 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn release_response(
+		&self,
+		frame: &HrftFrame,
+		status: LeaseStatus,
+	) -> std::io::Result<HrftFrame> {
+		let meta = ReleaseLeaseResponseMeta {
+			status,
+			_pad: [0; 7],
+		};
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::LEASE_RELEASE_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	async fn validate_acquire_lease_target(
+		&self,
+		remote: NodeId,
+		req: &AcquireLeaseRequestMeta,
+	) -> std::io::Result<()> {
+		if remote != req.holder {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"lease holder {} does not match remote caller {}",
+					req.holder.id, remote.id
+				),
+			));
+		}
+		if req.range_end < req.range_start {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"lease range_end must be greater than or equal to range_start",
+			));
+		}
+		let membership = self.epoch_rx.borrow().clone();
+		let ring = RingState::build(&membership, self.replication_factor as usize);
+		let canonical = ring
+			.primary_ranges_for(req.holder)
+			.into_iter()
+			.any(|(start, end)| start == req.range_start && end == req.range_end);
+		if canonical {
+			Ok(())
+		} else {
+			Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"lease range [{}, {}] is not a canonical primary range for holder {} in epoch {}",
+					req.range_start, req.range_end, req.holder.id, req.epoch
+				),
+			))
+		}
+	}
+
 	fn transfer_response(
 		&self,
 		frame: &HrftFrame,
@@ -1082,7 +1193,8 @@ impl ControlRingServer for WendelonControlServer {
 		let msg_type = MsgType(frame.header.msg_type);
 		let resp = match msg_type {
 			MsgType::STATUS_REQ => self.handle_status(frame).await?,
-			MsgType::LEASE_REQ => self.handle_lease(frame).await?,
+			MsgType::LEASE_REQ => self.handle_lease(remote, frame).await?,
+			MsgType::LEASE_RELEASE_REQ => self.handle_release(remote, frame).await?,
 			MsgType::TRANSFER_REQ => self.handle_transfer(remote, frame).await?,
 			MsgType::EPOCH_ADV_REQ => self.handle_advance_epoch(frame).await?,
 			MsgType::JOIN_REQ => self.handle_join(frame).await?,

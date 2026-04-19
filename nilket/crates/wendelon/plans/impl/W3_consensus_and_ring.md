@@ -17,7 +17,7 @@ End of W3, a tenant-less Control-Ring can commit and apply cluster-config change
 1. **`openraft` integration** over W1's WAL/redb storage. Raft log-entry → state-machine-apply path is the sole mutation surface.
 2. **Unified hash ring** with explicit epoch transitions and autoseed on cold-start (folded from `024_epoch_transition_autoseed.md`). Ring state is Raft-replicated.
 3. **Per-range leases** — leader-per-range ownership model with lease renewal and handoff (folded from `018_per_range_leases.md`). Leases are time-bounded and tied to the HLC from W2.
-4. **Control-Ring RPC surface** — `status`, `lease_acquire`, `lease_release`, `epoch_advance`, membership ops (folded from `022_control_ring_server.md`). Every RPC authenticated via W2's dual-CA.
+4. **Control-Ring RPC surface** — `status`, `lease_acquire`, `lease_release`, `epoch_advance`, membership ops (folded from `022_control_ring_server.md`). In the current implementation this is a cluster-internal peer-node surface riding W2's inter-node mTLS; operator / break-glass identities remain outside this RPC plane.
 5. **Cluster config mutations** committed through Raft, applied deterministically on every node.
 
 ## 3. Acceptance criteria (ADR-referential)
@@ -26,7 +26,7 @@ End of W3, a tenant-less Control-Ring can commit and apply cluster-config change
 - (ADR 002) Vnode count is bounded; ring-rebalance cost is bounded per epoch transition.
 - (ADR 007) Raft log durability is owned by Wendelon (W1's durability contract); `openraft`'s internal storage trait is implemented over W1.
 - (ADR 007) Leader election converges within the SLO documented in `plans/consensus/raft-core.md`.
-- Control-Ring RPCs reject unauthenticated callers; OPS-CA callers cannot invoke DATA-CA-gated Control-Ring ops (ADR 018 cross-check).
+- Control-Ring RPCs reject unauthenticated callers; non-data-node transport identities are rejected at the transport boundary before Control-Ring dispatch. Operator / OPS-CA flows remain outside this peer-node surface (ADR 018 cross-check).
 - Autoseed on empty-cluster cold start produces a deterministic initial ring; two nodes cold-starting the same config reach the same ring state.
 
 ## 4. Explicit non-goals
@@ -34,7 +34,7 @@ End of W3, a tenant-less Control-Ring can commit and apply cluster-config change
 - Tenant-aware state machine (TenantAdmin ops, per-tenant quota accounting). **W5.**
 - Write-path bifurcation against the Raft state machine. **W6.**
 - L2 ring integration (slab placement, rehydration). **W7.**
-- Audit emission on Raft commit. **W9** (but the hook lands in W3 with a stub sink).
+- Full ADR 025 audit chain work. **W9** (W3 now materializes `RaftLog` audit events for committed epoch transitions, but signed roots, catch-up/lag accounting, and the broader audit schema still land in W9).
 
 ## 5. Open items
 

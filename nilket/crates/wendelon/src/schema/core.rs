@@ -239,6 +239,7 @@ impl LeaseStatus {
 	pub const DENIED_NOT_LEADER: Self = Self(3);
 	pub const INTERNAL_ERROR: Self = Self(4);
 	pub const DENIED_INVALID_SIGNATURE: Self = Self(5);
+	pub const DENIED_INVALID_TARGET: Self = Self(6);
 }
 
 // ============================================================
@@ -283,6 +284,29 @@ pub struct AcquireLeaseRequestMeta {
 pub struct AcquireLeaseResponseMeta {
 	pub status: LeaseStatus, //  1
 	pub _pad: [u8; 7],       //  7
+}
+
+// ============================================================
+//  RELEASE LEASE REQUEST / RESPONSE METADATA
+// ============================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct ReleaseLeaseRequestMeta {
+	/// Inclusive lower bound of the locality range to release.
+	pub range_start: u64, // 8
+	/// Inclusive upper bound.
+	pub range_end: u64, // 8
+	/// Epoch the caller believes the lease belongs to.
+	pub epoch: u64, // 8
+	/// Holder asking to release the lease.
+	pub holder: NodeId, // 8
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[repr(C)]
+pub struct ReleaseLeaseResponseMeta {
+	pub status: LeaseStatus, // 1
+	pub _pad: [u8; 7],       // 7
 }
 
 // ============================================================
@@ -426,6 +450,8 @@ impl MsgType {
 	pub const STATUS_RESP: Self = Self(0x17);
 	pub const JOIN_REQ: Self = Self(0x18);
 	pub const JOIN_RESP: Self = Self(0x19);
+	pub const LEASE_RELEASE_REQ: Self = Self(0x1A);
+	pub const LEASE_RELEASE_RESP: Self = Self(0x1B);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);

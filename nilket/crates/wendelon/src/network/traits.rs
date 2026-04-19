@@ -1,7 +1,7 @@
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FinalizationMarker, LeaseDescriptor, NodeId,
-	RaftEpochEntryFixed, ReadRequestMeta, ReadResponseMeta, TransferToken, WriteRequestMeta,
-	WriteResponseMeta,
+	RaftEpochEntryFixed, ReadRequestMeta, ReadResponseMeta, ReleaseLeaseRequestMeta,
+	ReleaseLeaseResponseMeta, TransferToken, WriteRequestMeta, WriteResponseMeta,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -90,9 +90,9 @@ pub trait DataRing: Send + Sync {
 // ============================================================
 //  CONTROL RING — leadership, leases, epochs, status.
 //
-//  Runs on a separate mTLS-gated port and is rate-limited.
-//  Callers are cluster administrators or cooperating peer
-//  nodes; never application clients.
+//  Runs on the cluster-internal inter-node mTLS surface and is
+//  rate-limited. Callers are cooperating peer nodes; never
+//  application clients.
 //
 //  `advance_epoch` accepts the new cluster config as an Arrow
 //  RecordBatch (epoch_entry_var_schema) and returns the
@@ -115,6 +115,11 @@ pub trait ControlRing: Send + Sync {
 		&self,
 		req: AcquireLeaseRequestMeta,
 	) -> std::io::Result<(AcquireLeaseResponseMeta, Option<LeaseDescriptor>)>;
+
+	async fn release_lease(
+		&self,
+		req: ReleaseLeaseRequestMeta,
+	) -> std::io::Result<ReleaseLeaseResponseMeta>;
 
 	async fn advance_epoch(
 		&self,
