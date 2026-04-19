@@ -10,6 +10,7 @@ End of W3, a tenant-less Control-Ring can commit and apply cluster-config change
 
 - **ADR 002 (Unified Hash Ring).** Single ring with bounded vnode count; epoch transitions are first-class events (not incremental membership diffs).
 - **ADR 007 (Raft Implementation Strategy).** `openraft`-based integration with Wendelon owning durability (W1). State-machine surface is the extension point for later workstreams.
+- **ADR 029 (Identity vs Locality).** W3 is the workstream where the invariants I-1, I-3, I-5 are enforced at the topology layer: the ring keyspace is exactly `Locality` (u64), and the Raft state machine keys records by `Identity` (32 bytes).
 
 ## 2. Deliverables
 
@@ -53,3 +54,11 @@ End of W3, a tenant-less Control-Ring can commit and apply cluster-config change
 - **W3.b (M):** Unified ring + epoch transitions + autoseed.
 - **W3.c (S):** Control-Ring RPC + per-range leases.
 
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **Ring math is `Locality`-only.** Vnode hashing, owner selection, epoch-transition range math, and lease ownership all key on `Locality`. No Raft-replicated ring structure carries `Identity`; per-record Identity appears in the *payloads* the ring routes, not in the ring's own bookkeeping (invariant I-3).
+- **Raft state machine keys `Identity`.** State-machine mutations that touch records (idempotency, applied-Identity tracking, tombstone placement) carry `Identity`. Raft log entry encoding: `(Locality, Identity, payload)` where Locality is the routing hint and Identity is the storage key. Verifying that ring ownership (via Locality) matches the applying node on apply is a state-machine invariant.
+- **Epoch transitions operate on `LocalityRange`.** Ownership handoff between epochs is framed as transferring a `LocalityRange` from old owner to new. `LocalityRange` already exists in `src/schema/units.rs`.
+- **Routing collisions are tolerated.** Per invariant I-5, two distinct Identities projecting to the same Locality land on the same node. Raft state machine handles this by keying the per-record state by full `Identity`, so the shared Locality is invisible at the state-machine layer — only the ring sees it.
+- **Autoseed determinism.** Initial ring seed keys `Locality` space uniformly across vnodes; no Identity bits enter ring seeding.
+- **Acceptance addition.** Property test: for any ring snapshot and any `Identity`, `owner_of(Locality::from(identity)) == owner_of_locality(Locality::from(identity))` holds — i.e., owner selection is a pure function of Locality.

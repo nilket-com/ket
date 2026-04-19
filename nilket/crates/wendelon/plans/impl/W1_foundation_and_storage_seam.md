@@ -14,6 +14,7 @@ The storage seam, durability model, and simulator-replayable WAL/index that ever
 - **ADR 016 (Durability Model — Explicit fsync Group Commit).** `fdatasync` at Raft-ack boundaries; `fsync` on metadata paths; bounded coalescing window.
 - **ADR 017 (Persistent Local Index on redb).** All node-local persistent indexes live in redb tables; WAL-replay-forward rebuild on restart is authoritative.
 - **ADR 028 (foundation only).** Extract `AsyncFileOps` trait with data-path ops (translate to `IoRequest`) and namespace ops (`spawn_blocking` + `std::fs`/`nix`). Full simulator productionization is W10's responsibility.
+- **ADR 029 (Identity vs Locality).** W1 is where `Identity` (`[u8; 32]`, BLAKE3) and `Locality` (`u64`, first-8-bytes projection) land in the persistent surface. Every WAL record, redb table key, and slab header that previously used a `u64` key-hash is reshaped here; downstream workstreams inherit the shape.
 
 ## 2. Deliverables
 
@@ -58,3 +59,15 @@ The storage seam, durability model, and simulator-replayable WAL/index that ever
 - **W1.a (S):** `AsyncFileOps` trait extraction + call-site sweep.
 - **W1.b (M):** WAL segment lifecycle + durability contract + redb index.
 - **W1.c (S):** crash-recovery matrix + dependency pin + acceptance bar.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+W1 owns the primary Identity/Locality surface; every other workstream inherits from W1's shape.
+
+- **Schema.** `SlabRecordHeader.key_hash: u64` → `SlabRecordHeader.key_identity: Identity` (32 bytes). `RecordLocation.key_hash: u64` → `RecordLocation.key_identity: Identity`. The routing-relevant projection, where stored alongside, is `Locality`, never a raw `u64`.
+- **Indices.** `DashMap<u64, Vec<RecordLocation>>` → `DashMap<Identity, Vec<RecordLocation>>`. redb persistent-index table keys are `Identity` bytes, not `u64`. Any secondary index keyed on ring position is `Locality`.
+- **Hash helper.** `fn highway_hash(&[u8]) -> u64` is retired. Replaced by `fn blake3_identity(&[u8]) -> Identity`. Call sites at `src/network/data_server.rs`, `src/client/core.rs`, and the test fixtures migrate in lock-step. The `highway` crate drops from the ADR 008 dependency pin; `blake3` is added.
+- **Read-path verification.** Invariant I-2: neither `WendelonDataServer::read` nor `client::core::read` returns a record without byte-exact `Identity` match against the request. An integration test asserts that a forged/mismatched Identity read returns a structured error rather than silently returning data.
+- **Crash replay matrix.** Torn-tail, torn-mid-segment, and partial-commit scenarios all target 32-byte Identity boundaries; the matrix expands to cover partial-Identity truncation explicitly (not just partial-value).
+- **Dependency pin (ADR 008).** Added: `blake3`. Removed: `highway`.
+- **Acceptance addition.** A `cargo-deny` / grep sweep asserts no remaining `highway_hash` symbol outside archived history, and no bare `u64` key-hash field survives in any persistent struct.

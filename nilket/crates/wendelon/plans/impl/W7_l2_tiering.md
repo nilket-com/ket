@@ -13,6 +13,7 @@ End of W7, slabs land on NVMe, get lazily uploaded to L2 under the envelope-encr
 - **ADR 022 (L2 Slab Format and Footer-Indexed Range Reads).** Slab byte layout is identical on L1 and L2; footer indexes slabs for range-read pushdown.
 - **ADR 023 (L2 Upload Lifecycle).** `Uploading → Uploaded → Committed` state machine; multipart threshold; commit-time tenant-quota accounting.
 - **ADR 024 (L2 Orphan Cleanup and Remote Reclaim).** Four reclaim tracks (A: orphan multipart; B: orphan slab; C: tenant-delete; D: archival-tier) with leader-only reclaim authority and rate-limited DELETEs.
+- **ADR 029 (Identity vs Locality).** ADR 022's 128-bit key-prefix index in the L2 slab footer is reclassified as a compact `Locality`-class projection of the 256-bit record `Identity`; linear-scan collision handling at read time then compares full `Identity` bytes to resolve the (now-rarer) collision branch.
 
 ## 2. Deliverables
 
@@ -58,3 +59,15 @@ End of W7, slabs land on NVMe, get lazily uploaded to L2 under the envelope-encr
 - **W7.a (M):** `ObjectStore` trait + rustfs backend + slab format.
 - **W7.b (M):** Upload lifecycle + sweeper + rehydration.
 - **W7.c (M):** Four reclaim tracks + leader-only authority.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **Slab footer index (ADR 022).** The footer's 128-bit (`blake3(key)[0..16]`) index is reframed as a projection of the 256-bit `Identity`; retained at 128 bits for footer compactness. Naming: `locator` (current) or a dedicated `IdentityPrefix` newtype in `src/schema/units.rs` — close at W7 kickoff. The footer *must* store enough of the Identity to permit byte-exact verification at read time; options:
+  - **(a)** Store full 32-byte Identity per index entry (footer grows; simplest).
+  - **(b)** Store 16-byte prefix in the index + full Identity inline with the record body, verified on read (current ADR 022 shape, adjusted).
+  - Default to (b); (a) is a fallback if (b)'s reader cost is measured as material.
+- **Byte-identical L1/L2 slab bodies.** The slab body carries the full 32-byte `Identity` per record header; same bytes on disk as on L2 object. ADR 022's "byte-identical across tiers" invariant holds.
+- **Routing of rehydration.** L2 rehydration request carries `Identity` (what to fetch) + `Locality` (which node should cache it); no ambiguity about which projection is in play.
+- **Reclaim tracks.** Track C (tenant-delete) benefits directly from W5's tenant-scoped Identity construction: every `Identity` in the tenant's key space is reachable and no cross-tenant orphan looks like a deletion candidate.
+- **Range reads under pushdown.** WPBC range filters from W8 pass a `LocalityRange` (for primary routing) plus a `FixedSizeBinary(32)` match predicate on Identity (for intra-slab filtering). The footer index delivers candidate records by Locality prefix; the read path verifies by Identity before returning.
+- **Object-store key layout.** L2 object keys may embed `tenant_id/{slab_id}` (already ADR 024 shape) and are unaffected by the Identity pivot; Identity lives inside the slab body and footer, never in the object-store key.

@@ -13,6 +13,7 @@ End of W2, three nodes can stand up, handshake over QUIC, assert mTLS identity, 
 - **ADR 011 (Auto-Adaptive Transport).** Transport selection (QUIC / fallback) is auto-adaptive per-peer with health-signal feedback.
 - **ADR 012 (Bounded Clock Drift HLC).** Hybrid logical clock with bounded physical-clock drift; out-of-bound drift is a recovery event, not a silent monotonicity violation.
 - **ADR 018 (Dual-CA mTLS Identity and OID-Bound Authorization).** Two trust roots (DATA CA, OPS CA); SAN → node_id binding; OID-bound role claims; break-glass marker.
+- **ADR 029 (Identity vs Locality).** Record-level `Identity` is a wire-format citizen. HRFT hot-path frames carry `Identity` (32 bytes) in the key slot; routing headers carry `Locality` (8 bytes). Note: the word "identity" in ADR 018 refers to *peer* / *actor* identity (mTLS-derived) and is unrelated to record `Identity` from ADR 029 — both names are load-bearing and do not merge.
 
 ## 2. Deliverables
 
@@ -56,3 +57,11 @@ End of W2, three nodes can stand up, handshake over QUIC, assert mTLS identity, 
 - **W2.a (M):** QUIC transport + serialization tiers.
 - **W2.b (M):** Dual-CA mTLS + listener topology.
 - **W2.c (S):** HLC + auto-adaptive transport.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **HRFT frame reshape.** `ReadRequestMeta` and `WriteRequestMeta` gain a 32-byte `key_identity` field where they previously carried a `u64 key_hash`. A `Locality` field is added where the frame needs to declare the routing target independent of the payload's Identity (e.g., replication fanout). Net wire growth per request header: +24 bytes for Identity, +0–8 bytes for explicit Locality depending on frame.
+- **POD hot-path tier (ADR 010).** `bytemuck::Pod` holds for both `Identity` and `Locality` by construction (`#[repr(transparent)]` in `src/schema/units.rs`). Zero-copy guarantees from ADR 004 are preserved.
+- **Schema evolution gate.** Crossing into 32-byte Identity is a wire-format break for the Data-Ring tier. This is acceptable per ADR 010's "Data-Ring messages are not cross-version" rule. The Control-Ring tier inherits the same break when it references records by Identity; no rolling-upgrade compatibility window is required since this lands before pilot.
+- **Actor vs record identity — terminology guard.** Wendelon now uses "identity" for two orthogonal concepts: ADR 018 peer identity (mTLS certificate subject / SAN → node_id) and ADR 029 record Identity (BLAKE3-256 hash). Every docstring, comment, and log message that names "identity" must disambiguate; type signatures carry the distinction (`ActorIdentity` vs `Identity`). Rename `Identity` at the schema layer if naming collision in code proves painful in practice — close before W2 acceptance.
+- **Open item added.** Whether `ActorIdentity` should itself become a newtype distinct from the current representation, or whether the existing peer-identity type is acceptable given the disambiguation guard. Closes during W2 phasing.

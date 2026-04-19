@@ -10,6 +10,7 @@ W10 is the MVP-cut closeout. It ships the second build profile (FIPS), productio
 
 - **ADR 026 (FIPS 140-3 Certification Target).** Two build profiles (default, FIPS); compile-out of non-validated primitives; FIPS-only CMVP module boundary; mixed-fleet is diagnostic-only per `plans/ops/observability.md` §7.
 - **ADR 028 (beyond foundation).** Simulator network layer (turmoil-style), mocked `ObjectStore`, Elle + monotonic correctness checkers, coverage ladder (10k / 1M / 100M) wired to CI, chaos harness on a kernel-capable runner, seed registry with retention policy.
+- **ADR 029 (Identity vs Locality).** Record `Identity` remains format-stable BLAKE3-256 across build profiles; W10 documents and verifies that this helper stays outside the FIPS module boundary while the audit chain hash and CMVP-bound crypto paths are parameterized per profile.
 
 ## 2. Deliverables
 
@@ -64,3 +65,15 @@ W10 is the MVP-cut closeout. It ships the second build profile (FIPS), productio
 - **W10.b (M):** simulator network layer + mocked `ObjectStore` + checkers.
 - **W10.c (S):** coverage ladder + CI wiring + seed registry.
 - **W10.d (S):** chaos harness + rolling-upgrade + backup/restore scenarios.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **Record Identity is not profile-parameterized.** Record `Identity` remains BLAKE3-256 under the W5-chosen tenant-scoping formulation in both default and FIPS builds. This keeps `Identity` and `Locality` stable across rolling profile changes and avoids a silent data-format fork between builds.
+- **Module-boundary rule.** The FIPS build documents record-identity hashing as outside the validated module boundary, matching ADR 026's existing treatment of content-addressed hashes. W10 verifies the split explicitly: audit-chain hashing and CMVP-bound crypto paths use approved primitives; record-identity hashing is isolated and labeled as out-of-scope for certification.
+- **FIPS-profile symbol check expansion.** ADR 026's post-link sweep adds two Identity-related checks: (a) no BLAKE3 references in the audit-chain or CMVP-bound crypto paths, (b) any remaining BLAKE3 reference is confined to record-identity / content-addressing helpers explicitly documented as outside the validated boundary.
+- **Simulator coverage for Identity/Locality invariants.** Every workstream's simulator-tier acceptance picks up the Identity/Locality invariants added in W1-W9 addenda:
+  - Invariant I-2 (storage returns a record only on byte-exact Identity match) runs under the full chaos matrix.
+  - Invariant I-5 (routing collisions are harmless) has a dedicated scenario: a synthetic workload engineers colliding Localities (trivial under 64-bit) and asserts that storage retrieval remains byte-correct.
+- **Rolling-profile-change scenario.** A chaos scenario rolls a 3-node cluster from default to FIPS while taking continuous writes; invariants to assert: (a) the same `(tenant_id, key_bytes)` produces the same `Identity` and `Locality` before and after the roll, (b) reads and overwrites across the boundary continue to resolve to the same record coordinates, (c) the audit chain alone changes hash algorithm at the boundary and replays correctly with `hash_algorithm_tag` at the chain head.
+- **Backup/restore invariants.** Backup/restore preserves record `Identity` bytes verbatim across profile changes. A restored node continues to address historical records by the same Identity/Locality coordinates regardless of the binary's build profile.
+- **Open item added.** If a future certification target forbids shipping any BLAKE3 code in the binary at all, that is not a build-toggle detail; it re-opens ADR 029 as a deliberate data-format migration ADR.

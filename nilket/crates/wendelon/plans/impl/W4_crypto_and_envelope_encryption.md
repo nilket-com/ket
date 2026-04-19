@@ -10,6 +10,7 @@ End of W4, all L2 bytes and all at-rest keyed state can be encrypted under the t
 
 - **ADR 019 (Cipher Selection and FIPS Posture).** `aws-lc-rs` backend; default profile uses AES-256-GCM-SIV when available and injective-nonce AES-256-GCM otherwise. FIPS profile is plain-GCM only (SIV compiled out per ADR 026 §2a). Uniform nonce strategy across both branches: `version(u32be) || chunk_index(u64be)`.
 - **ADR 020 (L2 Envelope Encryption and DEK Lifecycle).** Three-tier hierarchy Root KEK → Tenant KEK → **per-slab DEK**, with 64 KiB intra-slab chunked encryption and a 48-byte fixed-layout AAD. Client-side envelope only, no SSE-KMS.
+- **ADR 029 (Identity vs Locality).** Consumed as a structural constraint: the AAD and nonce schemes must not acquire dependencies on record `Identity`, which would introduce per-record AAD variance. Slab-scoped addressing (SlabId, chunk_index) is unaffected.
 
 ## 2. Deliverables
 
@@ -59,3 +60,12 @@ End of W4, all L2 bytes and all at-rest keyed state can be encrypted under the t
 - **W4.a (S):** `aws-lc-rs` + cipher selection + chunk-ordinal nonce encoder.
 - **W4.b (M):** Three-tier hierarchy + AAD layout + slab footer encryption header + slab-surface HMAC.
 - **W4.c (S):** Rotation procedure + plaintext-to-ciphertext sweeper + operational docs.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **AAD layout is unchanged.** The 48-byte AAD (`tenant_id(16) || slab_id(16) || chunk_index(u64be,8) || slab_format_version(u32be,4) || cipher_id(u8,1) || reserved(3)`) does not gain Identity bytes. Identity lives in the plaintext slab body as a per-record header field, not in the AAD — keeping AAD a function of slab topology, not record content.
+- **Nonce scheme is unchanged.** `nonce = version(u32be) || chunk_index(u64be)` stays chunk-ordinal. Invariant I-3 is upheld: Identity is a storage-layer concern, not a crypto-layer concern.
+- **FIPS build profile boundary.** Record `Identity` remains BLAKE3-256 across build profiles. Under the FIPS profile (ADR 026, productionized in W10), that helper stays outside the validated module boundary, matching ADR 026's existing treatment of content-addressed hashes. The slab crypto format does not gain an `identity_algorithm_tag`, and no profile-driven re-identification sweep is introduced by W4.
+- **Slab DEK wrap-path does not leak Identity.** `wrapped_slab_dek` is addressed by `SlabId`, not by record `Identity`. Slab-surface HMAC keyed by Tenant KEK is slab-scoped; adding any Identity-derived bytes would silently break the rotation contract. Enforced by a negative test.
+- **Plaintext-to-ciphertext sweeper.** Sweeper reads plaintext slab body, re-encrypts, retires plaintext. Because Identity lives in the plaintext slab body (not in AAD), sweeper has no Identity-touching responsibility and this invariant should be documented as a sweeper non-concern.
+- **Open item added.** Document the module-boundary split explicitly: record-identity hashing remains outside the CMVP scope, while the slab AEAD / KEK / HMAC machinery stays inside. W10.a owns the wording and verification.

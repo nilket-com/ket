@@ -11,6 +11,7 @@ End of W9, every auditable event is emitted to the canonical schema, linked into
 - **ADR 001 (Autonomous Healing Boundary).** The cluster's autonomous-action scope: what the system may do without operator input (rebalancing, rehydration, DEK rotation, orphan cleanup), and what requires an operator (tenant delete confirm, break-glass, cross-CA promotion).
 - **ADR 025 (Audit Event Model and Tamper-Evident Hash Chain).** Canonical schema, `AuditSink` trait, per-node hash chain, periodic signed-root rollup, two-authority model (RaftLog vs NodeLocal), materialization-lag semantics.
 - **ADR 027 (Observability Posture).** Three-listener topology (Health / Readiness / Metrics), OTLP trace + metric catalog, recording rules, alerts, authenticated scrape.
+- **ADR 029 (Identity vs Locality).** Audit records reference individual records by `Identity`, not by the deprecated `u64 key_hash`. The audit chain's own tamper-evidence primitive (`blake3` / `sha256` under FIPS) is a *chain* hash and is orthogonal to record `Identity`; both primitives are parameterized by build profile along matching lines.
 
 ## 2. Deliverables
 
@@ -58,3 +59,12 @@ End of W9, every auditable event is emitted to the canonical schema, linked into
 - **W9.b (M):** per-node chain + signed root + materialization lag.
 - **W9.c (M):** three-listener topology + metric catalog + recording rules + alerts.
 - **W9.d (S):** governance-boundary surface + autonomous-action inventory.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **Canonical audit schema.** The record-reference field on every record-mutation event is `Identity` (32 bytes) encoded as `FixedSizeBinary(32)` in the Arrow representation. Any existing schema draft that named `key_hash: u64` retypes to `identity: Identity`; a separate `locality: Locality` field is *optional* and included only where the event is about routing/placement (e.g., ring epoch transitions) rather than record identity.
+- **Two primitives, kept distinct.** The audit chain hash (ADR 025 §3, parameterized `blake3` default / SHA-256 FIPS per W10.a) is independent of the record `Identity` primitive. Record Identity stays BLAKE3-256 across build profiles; the two primitives are intentionally decoupled even if they share the same default-profile algorithm.
+- **Authority discriminator.** `authority = RaftLog | NodeLocal` is unaffected by Identity. `RaftLog`-authority events carry record `Identity` (state-machine mutations); `NodeLocal`-authority events (e.g., per-node autonomous actions, clock-drift-exceeded) may or may not reference an Identity depending on event kind.
+- **Chain replay under profile change.** A cluster migrated from default profile to FIPS profile has a chain prefix under BLAKE3 and a chain suffix under SHA-256; the `hash_algorithm_tag` per chain-head entry makes the boundary explicit and verifiable (ADR 025 §3). Record `Identity` bytes do **not** change on profile change, so record references, storage lookups, and routing projections remain stable across the boundary.
+- **Metrics catalog.** Per-record-level Identity never appears in a metric (too high cardinality); per-tenant and per-slab cardinality is retained. `locality_bucket` as a low-cardinality (e.g., top-n-bits) label is a possible observability dimension — deferred to W9 phasing.
+- **Acceptance addition.** Chain replay test covers: (a) default-profile-only stream, (b) FIPS-profile-only stream, (c) mixed stream with profile change mid-chain — each replays correctly modulo the declared `hash_algorithm_tag`.

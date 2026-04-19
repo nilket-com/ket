@@ -9,6 +9,7 @@ End of W5, every RPC carries an authenticated `actor_identity` and an authentica
 ## 1. ADRs consumed
 
 - **ADR 021 (Tenant-Aware Architecture from Day One).** Every durable structure carries a `tenant_id`; dispatcher pairs `actor_identity` × `target_tenant_id`; two-layer quota (data-path soft-reject + Raft authoritative accounting + reconciliation sweep); tenant lifecycle state machine.
+- **ADR 029 (Identity vs Locality).** Consumed as a construction constraint: tenant isolation must be a property of the Identity-production path, not an afterthought. W5 resolves how `tenant_id` enters the hash input that produces per-record `Identity` so that two tenants with the same key bytes yield different Identities.
 
 ## 2. Deliverables
 
@@ -50,3 +51,15 @@ End of W5, every RPC carries an authenticated `actor_identity` and an authentica
 - **W5.a (S):** tenant_id schema propagation.
 - **W5.b (M):** dispatcher pairing + TenantAdmin Raft ops.
 - **W5.c (S):** two-layer quota + reconciliation.
+
+## 8. Identity/Locality impact (ADR 029 addendum)
+
+- **Tenant-scoped Identity construction.** `Identity` is produced from `(tenant_id, key_bytes)`, not from `key_bytes` alone, under a single BLAKE3-256 formulation used in every build profile. Two candidate API expressions remain acceptable:
+  - **(a) Plain-input prefix.** `Identity = blake3(tenant_domain || tenant_id_bytes || key_bytes)`. Simple and explicit.
+  - **(b) Keyed mode.** `Identity = blake3_keyed(tenant_derived_key, key_bytes)`. Equivalent trust model when the derived key comes only from public tenant identity; the advantage is domain separation by API construction, not secrecy.
+  - Decision locked before W5.a implementation begins, but the result must be byte-for-byte stable across build profiles for the same logical key. Closes the ADR 029 Open Question "Tenant routing projection."
+- **Locality inherits tenant scoping by consequence.** Same tenant produces scoped Locality distribution; cross-tenant Locality collisions are still "fat buckets" (invariant I-5) and still land on the same node, but no two tenants ever produce the same *Identity* for the same key.
+- **Tenant-delete and Identity garbage.** `tenant_delete` (ADR 021 §5) must reclaim every durable structure keyed to the tenant's Identity space. Because Identity is tenant-scoped by construction, no record from another tenant ever aliases into the deletion set — the reclaim sweep can iterate by `tenant_id` and know every reachable Identity is in scope.
+- **Dispatcher pairing receives Identity indirectly.** `(actor_identity, target_tenant_id)` remains the pairing key at the dispatcher. Record `Identity` appears in the *request* the dispatcher forwards, not in the pairing rule itself. Terminology guard from W2's addendum applies.
+- **Quota accounting is unaffected.** Two-layer quota (ADR 021 §4) counts bytes, not records, and carries neither Identity nor Locality in its state.
+- **Open item added.** Whether W5 ships formulation (a) or (b), and whether a future cluster-secret salt is needed to harden locality-hotspot abuse. The salt question is separate from tenant namespace separation because `tenant_id` is public.
