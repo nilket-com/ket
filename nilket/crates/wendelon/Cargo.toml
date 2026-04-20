@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+members = ["crates/wendelon-client"]
 
 [package]
 name = "wendelon"
@@ -41,6 +42,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+wendelon-client = { path = "crates/wendelon-client" }
 
 [profile.release]
 opt-level = 3

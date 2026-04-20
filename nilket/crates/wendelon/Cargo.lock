@@ -3660,7 +3660,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wendelon-client",
  "zeroize",
+]
+
+[[package]]
+name = "wendelon-client"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+ "wendelon",
 ]
 
 [[package]]

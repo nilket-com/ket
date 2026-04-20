@@ -175,17 +175,20 @@ async fn seeded_migration_drains_without_client_reads() {
 		(source_a.local_node, source_a_service),
 		(source_b.local_node, source_b_service),
 	]);
-	let dest_server = Arc::new(WendelonDataServer::new(
-		dest.slab.clone(),
-		dest.raft.clone(),
-		dest.log_store.clone(),
-		dest.state_machine.clone(),
-		dest.local_node,
-		dest.clock.clone(),
-		dest.ring.clone(),
-		factory,
-		dest.pool.clone(),
-	));
+	let dest_server = Arc::new(
+		WendelonDataServer::new(
+			dest.slab.clone(),
+			dest.raft.clone(),
+			dest.log_store.clone(),
+			dest.state_machine.clone(),
+			dest.local_node,
+			dest.clock.clone(),
+			dest.ring.clone(),
+			factory,
+			dest.pool.clone(),
+		)
+		.unwrap(),
+	);
 
 	let ts = hlc(10, 0, 1);
 	for key in 0..50u64 {
@@ -243,17 +246,20 @@ async fn migration_sweeper_fails_over_to_next_source_and_retries_after_backoff()
 		(source_a.local_node, source_a_service),
 		(source_b.local_node, source_b_service),
 	]);
-	let dest_server = Arc::new(WendelonDataServer::new(
-		dest.slab.clone(),
-		dest.raft.clone(),
-		dest.log_store.clone(),
-		dest.state_machine.clone(),
-		dest.local_node,
-		dest.clock.clone(),
-		dest.ring.clone(),
-		factory,
-		dest.pool.clone(),
-	));
+	let dest_server = Arc::new(
+		WendelonDataServer::new(
+			dest.slab.clone(),
+			dest.raft.clone(),
+			dest.log_store.clone(),
+			dest.state_machine.clone(),
+			dest.local_node,
+			dest.clock.clone(),
+			dest.ring.clone(),
+			factory,
+			dest.pool.clone(),
+		)
+		.unwrap(),
+	);
 
 	let ts = hlc(20, 0, 1);
 	for key in 0..20u64 {

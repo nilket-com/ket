@@ -10,9 +10,9 @@ use std::sync::Arc;
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::server::HrftService;
 use wendelon::schema::{
-	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, MsgType, NodeId,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, WriteResponseMeta,
-	WriteStatus, read_key_schema, write_payload_schema,
+	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, Identity, MsgType,
+	NodeId, ReadRequestMeta, ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, read_key_schema, write_payload_schema,
 };
 
 fn tenant() -> TenantId {
@@ -46,6 +46,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		value_len: value.len() as u32,
 	}
@@ -58,6 +59,7 @@ fn read_meta(expected_epoch: u64, key: &[u8], min_hlc: HybridTimestamp) -> ReadR
 		tenant_id: tenant(),
 		consistency: Consistency::LINEARIZABLE,
 		_pad: [0; 3],
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		_pad2: [0; 8],
 		as_of_hlc: hlc(0, 0, 0),

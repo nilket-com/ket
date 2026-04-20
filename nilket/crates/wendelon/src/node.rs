@@ -49,7 +49,8 @@ use crate::network::control_server::{
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
 	DEFAULT_TENANT_CACHE_REFRESH_INTERVAL, MIGRATION_SWEEP_FAILURE_BACKOFF,
-	MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS, WendelonDataServer,
+	MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS, PENDING_FINALIZATION_RETRY_INTERVAL,
+	WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::{
@@ -451,6 +452,7 @@ pub struct NodeHandles {
 	pub drift_monitor: JoinHandle<()>,
 	pub eviction_watchdog: JoinHandle<()>,
 	pub lease_manager: JoinHandle<()>,
+	pub pending_finalization_reconciler: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
@@ -464,6 +466,7 @@ impl NodeHandles {
 		self.drift_monitor.abort();
 		self.eviction_watchdog.abort();
 		self.lease_manager.abort();
+		self.pending_finalization_reconciler.abort();
 		self.epoch_reconciler.abort();
 		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
@@ -477,6 +480,11 @@ impl NodeHandles {
 		await_background_task(self.drift_monitor, "drift monitor").await?;
 		await_background_task(self.eviction_watchdog, "eviction watchdog").await?;
 		await_background_task(self.lease_manager, "lease manager").await?;
+		await_background_task(
+			self.pending_finalization_reconciler,
+			"pending finalization reconciler",
+		)
+		.await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
@@ -993,6 +1001,7 @@ impl WendelonNode {
 				factory.clone(),
 				pool.clone(),
 			)
+			.map_err(|err| Error::other(format!("DataServer::new: {err}")))?
 			.with_hlc(hlc.clone())
 			.with_lease_authority(lease_authority.clone())
 			.with_tracker(tracker.clone())
@@ -1176,6 +1185,9 @@ impl WendelonNode {
 			LEASE_RENEW_INTERVAL,
 			LEASE_TTL_MS,
 		);
+		let pending_finalization_reconciler = data_server
+			.clone()
+			.spawn_pending_finalization_reconciler(PENDING_FINALIZATION_RETRY_INTERVAL);
 		let migration_sweeper = data_server.clone().spawn_migration_sweeper(
 			MIGRATION_SWEEP_INTERVAL,
 			MIGRATION_SWEEP_FAILURE_BACKOFF,
@@ -1209,6 +1221,7 @@ impl WendelonNode {
 				drift_monitor,
 				eviction_watchdog,
 				lease_manager,
+				pending_finalization_reconciler,
 				epoch_reconciler,
 				tenant_policy_reconciler,
 				migration_sweeper,
@@ -2076,6 +2089,7 @@ mod tests {
 						_pad: [0; 7],
 					},
 					tenant_id: TenantId::ZERO,
+					key_identity: Identity::blake3_tenant(TenantId::ZERO, b"startup-finalize"),
 					charged_bytes: 0,
 				},
 			))

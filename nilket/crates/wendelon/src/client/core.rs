@@ -144,6 +144,8 @@ pub struct WendelonClient {
 	leader: RwLock<Option<NodeId>>,
 	/// Cached replication factor from the latest topology fetch.
 	rf: RwLock<usize>,
+	/// Cached epoch from the latest topology fetch.
+	epoch: RwLock<u64>,
 }
 
 impl WendelonClient {
@@ -172,6 +174,7 @@ impl WendelonClient {
 			.leader
 			.map(|id| NodeId { id, _reserved: 0 });
 		let rf = config.bootstrap.replication_factor as usize;
+		let epoch = config.bootstrap.epoch;
 
 		Arc::new(Self {
 			factory,
@@ -181,6 +184,7 @@ impl WendelonClient {
 			topology_source: config.topology,
 			leader: RwLock::new(leader),
 			rf: RwLock::new(rf),
+			epoch: RwLock::new(epoch),
 		})
 	}
 
@@ -206,6 +210,7 @@ impl WendelonClient {
 		// epoch also sees the new ring.
 		self.router.install(RingState::build(&membership, rf));
 		*self.rf.write().unwrap() = rf;
+		*self.epoch.write().unwrap() = snapshot.epoch;
 		*self.leader.write().unwrap() = snapshot.leader.map(|id| NodeId { id, _reserved: 0 });
 		let _ = self.topology_tx.send(Arc::new(membership));
 	}
@@ -227,6 +232,11 @@ impl WendelonClient {
 	/// snapshot.
 	pub fn replication_factor(&self) -> usize {
 		*self.rf.read().unwrap()
+	}
+
+	/// Current epoch from the latest applied topology snapshot.
+	pub fn epoch(&self) -> u64 {
+		*self.epoch.read().unwrap()
 	}
 
 	/// Access to the shared connection factory. Exposed so
@@ -332,8 +342,7 @@ impl WendelonClient {
 	/// status.
 	pub async fn write(&self, request: WriteRequest) -> std::io::Result<WriteResult> {
 		validate_write_request_batch(&request.meta, &request.payload)?;
-		let key_locality =
-			key_locality_from_batch(&request.payload, "key", request.meta.tenant_id)?;
+		let key_locality = Locality::from(request.meta.key_identity);
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
@@ -356,7 +365,7 @@ impl WendelonClient {
 	/// Arrow value batch in `ReadResult.value`.
 	pub async fn read(&self, request: ReadRequest) -> std::io::Result<ReadResult> {
 		validate_read_request_batch(&request.meta, &request.key)?;
-		let key_locality = key_locality_from_batch(&request.key, "key", request.meta.tenant_id)?;
+		let key_locality = Locality::from(request.meta.key_identity);
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
@@ -391,8 +400,7 @@ impl WendelonClient {
 		let mut group_index: HashMap<NodeId, usize> = HashMap::new();
 		for (index, request) in requests.into_iter().enumerate() {
 			validate_write_request_batch(&request.meta, &request.payload)?;
-			let key_locality =
-				key_locality_from_batch(&request.payload, "key", request.meta.tenant_id)?;
+			let key_locality = Locality::from(request.meta.key_identity);
 			let target = self.target_for_locality(key_locality)?;
 			let slot = if let Some(existing) = group_index.get(&target).copied() {
 				existing
@@ -1130,6 +1138,11 @@ fn validate_write_request_batch(
 			),
 		));
 	}
+	validate_key_identity(
+		meta.tenant_id,
+		meta.key_identity,
+		extract_first_binary(batch, "key")?,
+	)?;
 	let value_len = extract_first_binary(batch, "value")?.len() as u32;
 	if value_len != meta.value_len {
 		return Err(Error::new(
@@ -1160,7 +1173,30 @@ fn validate_read_request_batch(meta: &ReadRequestMeta, batch: &RecordBatch) -> s
 			),
 		));
 	}
+	validate_key_identity(
+		meta.tenant_id,
+		meta.key_identity,
+		extract_first_binary(batch, "key")?,
+	)?;
 	Ok(())
+}
+
+fn validate_key_identity(
+	tenant_id: TenantId,
+	expected: Identity,
+	key_bytes: &[u8],
+) -> std::io::Result<()> {
+	let computed = Identity::blake3_tenant(tenant_id, key_bytes);
+	if expected == computed {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"key_identity mismatch: meta={} computed={}",
+			expected, computed
+		),
+	))
 }
 
 fn validate_read_value_batch(meta: &ReadResponseMeta, batch: &RecordBatch) -> std::io::Result<()> {
@@ -1206,27 +1242,6 @@ fn extract_first_binary<'a>(
 		));
 	}
 	Ok(arr.value(0))
-}
-
-fn key_identity_from_batch(
-	batch: &RecordBatch,
-	column: &'static str,
-	tenant_id: TenantId,
-) -> std::io::Result<Identity> {
-	Ok(Identity::blake3_tenant(
-		tenant_id,
-		extract_first_binary(batch, column)?,
-	))
-}
-
-fn key_locality_from_batch(
-	batch: &RecordBatch,
-	column: &'static str,
-	tenant_id: TenantId,
-) -> std::io::Result<Locality> {
-	Ok(Locality::from(key_identity_from_batch(
-		batch, column, tenant_id,
-	)?))
 }
 
 // ============================================================

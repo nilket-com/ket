@@ -12,8 +12,8 @@ use wendelon::network::{
 };
 use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	ClientWriteId, HybridTimestamp, LeaseDescriptor, TenantId, WriteRequestMeta, WriteStatus,
-	write_payload_schema,
+	ClientWriteId, HybridTimestamp, Identity, LeaseDescriptor, TenantId, WriteRequestMeta,
+	WriteStatus, write_payload_schema,
 };
 
 fn tenant() -> TenantId {
@@ -60,6 +60,7 @@ fn write_meta(node_id: u32) -> WriteRequestMeta {
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), b"k"),
 		key_len: 1,
 		value_len: 1,
 	}

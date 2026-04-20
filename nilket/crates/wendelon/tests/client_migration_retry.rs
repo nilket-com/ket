@@ -17,8 +17,8 @@ use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::schema::{
 	ClientWriteId, Consistency, DurabilityLevel, FRAME_FLAG_STREAM_END, FrameHeader,
-	HybridTimestamp, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, read_key_schema,
+	HybridTimestamp, Identity, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta,
+	ReadRequestMeta, ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, read_key_schema,
 	write_payload_schema,
 };
 
@@ -83,6 +83,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		value_len: value.len() as u32,
 	}
@@ -100,6 +101,7 @@ fn read_meta(
 		tenant_id: tenant(),
 		consistency,
 		_pad: [0; 3],
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		_pad2: [0; 8],
 		as_of_hlc: hlc(0, 0, 0),

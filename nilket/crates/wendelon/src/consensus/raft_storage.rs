@@ -49,13 +49,14 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
-	MigrationLedgerEntry, MigrationState, SeedMigration, TenantLifecycleState, TenantRecord,
-	TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
+	MigrationLedgerEntry, MigrationState, SeedMigration, TenantFinalization, TenantLifecycleState,
+	TenantRecord, TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse,
+	WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed,
-	SlabId, SnapshotHeader, WALRecordHeader,
+	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
+	RaftLogEntryFixed, SlabId, SnapshotHeader, WALRecordHeader,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
@@ -780,6 +781,31 @@ impl WendelonLogStore {
 			.filter(|marker| marker.epoch == epoch)
 			.collect();
 		Ok(markers)
+	}
+
+	pub async fn find_applied_finalization(
+		&self,
+		expected: &TenantFinalization,
+		applied_upto: u64,
+	) -> std::io::Result<Option<FinalizationMarker>> {
+		if applied_upto == 0 {
+			return Ok(None);
+		}
+
+		let guard = self.inner.read().await;
+		let marker = guard
+			.entries
+			.range(..=applied_upto)
+			.rev()
+			.find_map(|(_, entry)| match &entry.payload {
+				EntryPayload::Normal(WendelonRequest::Finalize(finalization))
+					if finalization_matches(finalization, expected) =>
+				{
+					canonical_finalization_marker(entry)
+				}
+				_ => None,
+			});
+		Ok(marker)
 	}
 }
 
@@ -2310,11 +2336,32 @@ fn raft_audit_event(
 		// Non-tenant-admin mutations emit on success only; the apply-layer
 		// can reject for transient state-machine reasons and an error
 		// record per replay would flood the audit log.
+		WendelonRequest::Finalize(_) if is_err => None,
 		WendelonRequest::AdvanceEpoch(_) | WendelonRequest::InstallTenantKekVersion(_)
 			if is_err =>
 		{
 			None
 		}
+		WendelonRequest::Finalize(finalization) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				"data.write_finalized",
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} locality={} durability={} charged_bytes={} commit_hlc={:?} payload_hash={}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					finalization.tenant_id.get(),
+					Locality::from(finalization.key_identity).get(),
+					finalization.marker.durability.0,
+					finalization.charged_bytes,
+					finalization.marker.commit_hlc,
+					format_bytes_hex(&finalization.marker.payload_hash),
+				),
+			)
+			.with_tenant(finalization.tenant_id)
+			.with_record_identity(finalization.key_identity),
+		),
 		WendelonRequest::AdvanceEpoch(record) => Some(AuditEvent::new(
 			AuditAuthority::RaftLog,
 			"control_ring.epoch_advanced",
@@ -2432,6 +2479,15 @@ fn format_epoch_peer_ids(config: &EpochConfig) -> String {
 	out
 }
 
+fn format_bytes_hex(bytes: &[u8]) -> String {
+	let mut out = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		use std::fmt::Write as _;
+		write!(&mut out, "{byte:02x}").expect("writing to string cannot fail");
+	}
+	out
+}
+
 fn canonical_finalization_marker(entry: &Entry<WendelonTypeConfig>) -> Option<FinalizationMarker> {
 	match &entry.payload {
 		EntryPayload::Normal(WendelonRequest::Finalize(finalization)) => {
@@ -2443,6 +2499,16 @@ fn canonical_finalization_marker(entry: &Entry<WendelonTypeConfig>) -> Option<Fi
 		}
 		_ => None,
 	}
+}
+
+fn finalization_matches(left: &TenantFinalization, right: &TenantFinalization) -> bool {
+	left.tenant_id == right.tenant_id
+		&& left.key_identity == right.key_identity
+		&& left.charged_bytes == right.charged_bytes
+		&& left.marker.epoch == right.marker.epoch
+		&& left.marker.commit_hlc == right.marker.commit_hlc
+		&& left.marker.payload_hash == right.marker.payload_hash
+		&& left.marker.durability == right.marker.durability
 }
 
 fn checkpoint_observation_from_state(
@@ -4091,6 +4157,7 @@ mod recovery_tests {
 						_pad: [0; 7],
 					},
 					tenant_id: TenantId::ZERO,
+					key_identity: crate::schema::Identity::ZERO,
 					charged_bytes: 0,
 				},
 			)),

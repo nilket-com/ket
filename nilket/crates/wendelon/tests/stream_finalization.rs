@@ -11,8 +11,8 @@ use wendelon::network::data_server::STREAM_FINALIZATION_BUFFER;
 use wendelon::network::server::HrftService;
 use wendelon::network::traits::DataRing;
 use wendelon::schema::{
-	ClientWriteId, DurabilityLevel, FinalizationMarker, FrameHeader, HybridTimestamp, MsgType,
-	NodeId, StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
+	ClientWriteId, DurabilityLevel, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
+	MsgType, NodeId, StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
 	WriteStatus, write_payload_schema,
 };
 
@@ -47,6 +47,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		value_len: value.len() as u32,
 	}

@@ -57,7 +57,7 @@ pub struct NodeId {
 //      all seq < current_seq - ack_window).
 //    • Server clamps ttl to [1_000, 300_000] ms.
 // ============================================================
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct ClientWriteId {
 	/// 16-byte UUIDv4; immutable per client session
@@ -465,7 +465,7 @@ impl MsgType {
 }
 
 // ============================================================
-//  WRITE REQUEST METADATA — 88 bytes, fixed
+//  WRITE REQUEST METADATA — 120 bytes, fixed
 //
 //  This is the header only. The actual key and value are
 //  carried in an Arrow IPC payload appended after this
@@ -526,6 +526,10 @@ pub struct WriteRequestMeta {
 	pub _pad1: [u8; 5], //  5 bytes alignment
 	/// Set by proxy follower for response routing; zeroed on direct writes
 	pub proxy_source: NodeId, //  8 bytes
+	/// Stable 256-bit record identity computed from `(tenant_id, key)`.
+	/// The server verifies this against the Arrow payload before the
+	/// write crosses the bifurcation boundary.
+	pub key_identity: Identity, // 32 bytes
 	/// Key length in the Arrow payload (for fast routing without Arrow parse)
 	pub key_len: u32, //  4 bytes
 	/// Value length in the Arrow payload
@@ -656,7 +660,7 @@ pub struct ReplicaWriteRespMeta {
 }
 
 // ============================================================
-//  READ REQUEST METADATA — 56 bytes, fixed
+//  READ REQUEST METADATA — 96 bytes, fixed
 //  Actual key is in the Arrow payload.
 // ============================================================
 
@@ -680,6 +684,10 @@ pub struct ReadRequestMeta {
 	pub tenant_id: TenantId, //  8 bytes
 	pub consistency: Consistency, //  1 byte
 	pub _pad: [u8; 3],       //  3 bytes
+	/// Stable 256-bit record identity computed from `(tenant_id, key)`.
+	/// The server uses this directly for storage lookup and may verify it
+	/// against the optional Arrow key payload when present.
+	pub key_identity: Identity, // 32 bytes
 	/// Key length in Arrow payload (for fast routing)
 	pub key_len: u32, //  4 bytes
 	pub _pad2: [u8; 8],      //  8 bytes reserved
@@ -1189,12 +1197,12 @@ const _: () = assert!(std::mem::size_of::<LeaseStatus>() == 1);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseRequestMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
-const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 88);
+const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 120);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReplicaAckLevel>() == 1);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
-const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 64);
+const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 80);
 const _: () = assert!(std::mem::size_of::<QueryResponseMeta>() == 56);

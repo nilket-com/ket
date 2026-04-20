@@ -513,6 +513,10 @@ impl SlabManager {
 		self.state.lock().await.active.slab_id()
 	}
 
+	pub fn data_dir(&self) -> &Path {
+		&self.config.dir
+	}
+
 	/// Test / diagnostic accessor: number of sealed slabs.
 	pub async fn sealed_count(&self) -> usize {
 		self.state.lock().await.sealed.len()

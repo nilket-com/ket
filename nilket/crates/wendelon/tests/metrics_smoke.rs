@@ -83,6 +83,7 @@ fn write_meta(node_id: u32, key: &[u8], value: &[u8]) -> WriteRequestMeta {
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		value_len: value.len() as u32,
 	}
@@ -95,6 +96,7 @@ fn read_meta(node_id: u32, key: &[u8]) -> ReadRequestMeta {
 		tenant_id: tenant(),
 		consistency: Consistency::LINEARIZABLE,
 		_pad: [0; 3],
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		_pad2: [0; 8],
 		as_of_hlc: hlc(0, 0),

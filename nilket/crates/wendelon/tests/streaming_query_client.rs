@@ -75,6 +75,7 @@ fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRe
 			id: 0,
 			_reserved: 0,
 		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		value_len: value.len() as u32,
 	}

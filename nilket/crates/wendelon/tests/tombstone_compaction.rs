@@ -166,6 +166,7 @@ fn stale_read_meta(as_of_hlc: HybridTimestamp, key: &[u8]) -> ReadRequestMeta {
 		tenant_id: tenant(),
 		consistency: Consistency::STALE,
 		_pad: [0; 3],
+		key_identity: Identity::blake3_tenant(tenant(), key),
 		key_len: key.len() as u32,
 		_pad2: [0; 8],
 		as_of_hlc,
@@ -217,17 +218,20 @@ async fn background_reclaim_rewrites_mixed_slab_and_preserves_live_versions() {
 	let source_service: Arc<dyn HrftService> = source.router.clone();
 	let (factory, _pool) =
 		support::loopback_factory_many(vec![(source.local_node, source_service)]);
-	let dest_server = Arc::new(WendelonDataServer::new(
-		dest.slab.clone(),
-		dest.raft.clone(),
-		dest.log_store.clone(),
-		dest.state_machine.clone(),
-		dest.local_node,
-		dest.clock.clone(),
-		dest.ring.clone(),
-		factory,
-		dest.pool.clone(),
-	));
+	let dest_server = Arc::new(
+		WendelonDataServer::new(
+			dest.slab.clone(),
+			dest.raft.clone(),
+			dest.log_store.clone(),
+			dest.state_machine.clone(),
+			dest.local_node,
+			dest.clock.clone(),
+			dest.ring.clone(),
+			factory,
+			dest.pool.clone(),
+		)
+		.unwrap(),
+	);
 	let dest_sweeper = dest_server.clone().spawn_migration_sweeper(
 		Duration::from_millis(20),
 		Duration::from_millis(40),
@@ -317,17 +321,20 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 	let source_service: Arc<dyn HrftService> = source.router.clone();
 	let (factory, _pool) =
 		support::loopback_factory_many(vec![(source.local_node, source_service)]);
-	let dest_server = Arc::new(WendelonDataServer::new(
-		dest.slab.clone(),
-		dest.raft.clone(),
-		dest.log_store.clone(),
-		dest.state_machine.clone(),
-		dest.local_node,
-		dest.clock.clone(),
-		dest.ring.clone(),
-		factory,
-		dest.pool.clone(),
-	));
+	let dest_server = Arc::new(
+		WendelonDataServer::new(
+			dest.slab.clone(),
+			dest.raft.clone(),
+			dest.log_store.clone(),
+			dest.state_machine.clone(),
+			dest.local_node,
+			dest.clock.clone(),
+			dest.ring.clone(),
+			factory,
+			dest.pool.clone(),
+		)
+		.unwrap(),
+	);
 	let dest_sweeper = dest_server.clone().spawn_migration_sweeper(
 		Duration::from_millis(20),
 		Duration::from_millis(40),

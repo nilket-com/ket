@@ -1,7 +1,7 @@
 use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta, SlabId,
-	TenantId,
+	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
+	ReleaseLeaseRequestMeta, SlabId, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -229,6 +229,7 @@ pub struct TenantRecord {
 pub struct TenantFinalization {
 	pub marker: FinalizationMarker,
 	pub tenant_id: TenantId,
+	pub key_identity: Identity,
 	pub charged_bytes: u64,
 }
 

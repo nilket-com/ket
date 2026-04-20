@@ -32,20 +32,26 @@
 //! ## Idempotency
 //!
 //! A [`DashMap`] keyed on `(client_uuid, sequence_no)` deduplicates
-//! retries. A hit replays the original [`WriteResponseMeta`] with
-//! `status` overwritten to [`WriteStatus::DUPLICATE`] so the client
-//! can tell a fresh success apart from a replay.
+//! retries. Committed writes replay as [`WriteStatus::DUPLICATE`];
+//! if the data branch reached quorum but the control branch is still
+//! pending, the cache points at the persisted recovery record
+//! instead of re-running the write from scratch.
 
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
 	HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry, MigrationState,
-	TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse, WendelonStateMachine,
+	TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse,
+	WendelonStateMachine,
 };
 use crate::metrics::global as metrics;
 use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
+use crate::network::pending_finalizations::{
+	PendingFinalizationId, PendingFinalizationRecord, PendingFinalizationStore,
+	pending_finalizations_path,
+};
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
@@ -79,7 +85,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::network::core::HrftFrame;
@@ -95,6 +101,28 @@ enum DataOperation {
 	Replicate,
 	Migrate,
 	StreamFinalization,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedWriteOutcome {
+	response: WriteResponseMeta,
+	finalization: Option<FinalizationMarker>,
+	pending_finalization_id: Option<PendingFinalizationId>,
+}
+
+#[derive(Clone, Debug)]
+struct BifurcatedWrite {
+	key_identity: Identity,
+	locality: Locality,
+	frame_bytes: Arc<Vec<u8>>,
+	payload_hash: [u8; 32],
+	charged_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PendingFinalizationResolution {
+	CommittedNow(FinalizationMarker),
+	ObservedApplied(FinalizationMarker),
 }
 
 // ============================================================
@@ -363,9 +391,17 @@ pub struct WendelonDataServer {
 	/// payload sections from it and the response `meta` buffer is
 	/// encoded into a pooled Vec on the reply path.
 	pool: Arc<BufPool>,
-	/// Exactly-once cache. `WriteResponseMeta` is `Copy`, so
-	/// lookups are O(1) under DashMap's shard striping.
-	idempotency: Arc<DashMap<IdempotencyKey, WriteResponseMeta>>,
+	/// Exactly-once cache. The cached value includes any committed
+	/// finalization marker so duplicate retries can replay the same
+	/// durability receipt the original caller observed.
+	idempotency: Arc<DashMap<IdempotencyKey, CachedWriteOutcome>>,
+	/// Durable local intent log for writes that passed the data
+	/// quorum but still need their control-branch finalization
+	/// committed through Raft.
+	pending_finalizations: Arc<PendingFinalizationStore>,
+	/// Nudges the background reconciler to retry a pending
+	/// finalization without waiting for the next periodic tick.
+	pending_finalization_wakeup: Arc<Notify>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
 	hlc: Arc<HybridLogicalClockDriver>,
@@ -432,6 +468,10 @@ pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 pub const MIGRATION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Retry delay after a migration sweep pass fails for one entry.
 pub const MIGRATION_SWEEP_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
+/// Retry cadence for ADR 003 control-branch recovery. Kept short
+/// because a pending row is already quorum-durable in the slabs;
+/// the remaining work is only the Raft metadata commit.
+pub const PENDING_FINALIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 /// Background migration is intentionally conservative: one
 /// migration range per pass keeps the sweeper from competing with
 /// foreground reads/writes or the tier sweeper for disk/network.
@@ -463,6 +503,8 @@ impl Clone for WendelonDataServer {
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
 			idempotency: self.idempotency.clone(),
+			pending_finalizations: self.pending_finalizations.clone(),
+			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
@@ -489,9 +531,11 @@ impl WendelonDataServer {
 		router: Arc<dyn ReplicaRouter>,
 		factory: Arc<TransportProviderFactory>,
 		pool: Arc<BufPool>,
-	) -> Self {
+	) -> std::io::Result<Self> {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
-		Self {
+		let pending_finalizations =
+			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
+		Ok(Self {
 			slab,
 			raft,
 			log_store,
@@ -502,6 +546,8 @@ impl WendelonDataServer {
 			factory,
 			pool,
 			idempotency: Arc::new(DashMap::new()),
+			pending_finalizations,
+			pending_finalization_wakeup: Arc::new(Notify::new()),
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
@@ -513,7 +559,7 @@ impl WendelonDataServer {
 			tenant_cache_refresh_interval: DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
-		}
+		})
 	}
 
 	/// Test-only override for the `RANGE_PAGE` paging caps.
@@ -719,6 +765,224 @@ impl WendelonDataServer {
 			((policy.mean_write_size_bytes.saturating_mul(7)).saturating_add(charged_bytes)) / 8
 		}
 		.max(1);
+	}
+
+	fn idempotency_key_for(write_id: crate::schema::ClientWriteId) -> IdempotencyKey {
+		(write_id.client_uuid, write_id.sequence_no)
+	}
+
+	fn pending_finalization_record(
+		&self,
+		meta: &WriteRequestMeta,
+		bifurcated: &BifurcatedWrite,
+		commit_hlc: HybridTimestamp,
+	) -> PendingFinalizationRecord {
+		PendingFinalizationRecord::new(
+			meta.write_id,
+			meta.await_finalization != 0,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: meta.expected_epoch,
+					commit_hlc,
+					payload_hash: bifurcated.payload_hash,
+					e_safe_index: 0,
+					durability: meta.durability,
+					_pad: [0; 7],
+				},
+				tenant_id: meta.tenant_id,
+				key_identity: bifurcated.key_identity,
+				charged_bytes: bifurcated.charged_bytes,
+			},
+		)
+	}
+
+	fn pending_error_response(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+		epoch: u64,
+		commit_hlc: HybridTimestamp,
+	) -> WriteResponseMeta {
+		WriteResponseMeta {
+			status: WriteStatus::INTERNAL_ERROR,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch,
+			commit_hlc,
+			leader_hint: self.local_node,
+			echoed_write_id: write_id,
+			has_finalization: 0,
+			_pad2: [0; 7],
+		}
+	}
+
+	fn committed_response_for(
+		&self,
+		record: &PendingFinalizationRecord,
+		marker: FinalizationMarker,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		let response = WriteResponseMeta {
+			status: WriteStatus::OK,
+			_pad1: [0; 7],
+			log_index: marker.log_index,
+			term: marker.term,
+			epoch: marker.epoch,
+			commit_hlc: marker.commit_hlc,
+			leader_hint: self.local_node,
+			echoed_write_id: record.write_id,
+			has_finalization: if record.await_finalization { 1 } else { 0 },
+			_pad2: [0; 7],
+		};
+		let trailing = if record.await_finalization {
+			Some(marker)
+		} else {
+			None
+		};
+		(response, trailing)
+	}
+
+	async fn find_applied_pending_finalization(
+		&self,
+		record: &PendingFinalizationRecord,
+	) -> std::io::Result<Option<FinalizationMarker>> {
+		let Some(applied_upto) = self.state_machine.last_applied_log_index().await else {
+			return Ok(None);
+		};
+		self.log_store
+			.find_applied_finalization(&record.finalization, applied_upto)
+			.await
+	}
+
+	async fn resolve_pending_finalization(
+		&self,
+		record: &PendingFinalizationRecord,
+	) -> std::io::Result<PendingFinalizationResolution> {
+		if let Some(marker) = self.find_applied_pending_finalization(record).await? {
+			return Ok(PendingFinalizationResolution::ObservedApplied(marker));
+		}
+
+		if self.raft.current_leader().await != Some(self.local_node.id) {
+			return Err(Error::new(
+				ErrorKind::WouldBlock,
+				"pending finalization is waiting for local leadership",
+			));
+		}
+
+		match self
+			.raft
+			.client_write(WendelonRequest::Finalize(record.finalization.clone()))
+			.await
+		{
+			Ok(resp) => {
+				let mut marker = record.finalization.marker;
+				marker.log_index = resp.log_id.index;
+				marker.term = resp.log_id.leader_id.term;
+				marker.e_safe_index = resp.log_id.index;
+				Ok(PendingFinalizationResolution::CommittedNow(marker))
+			}
+			Err(err) => {
+				if let Some(marker) = self.find_applied_pending_finalization(record).await? {
+					return Ok(PendingFinalizationResolution::ObservedApplied(marker));
+				}
+				Err(Error::other(format!("finalize commit failed: {err}")))
+			}
+		}
+	}
+
+	async fn complete_pending_finalization(
+		&self,
+		record: &PendingFinalizationRecord,
+		resolution: PendingFinalizationResolution,
+	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		let marker = match resolution {
+			PendingFinalizationResolution::CommittedNow(marker) => {
+				self.note_committed_write(
+					record.finalization.tenant_id,
+					record.finalization.charged_bytes,
+				);
+				marker
+			}
+			PendingFinalizationResolution::ObservedApplied(marker) => marker,
+		};
+		if let Err(err) = self.pending_finalizations.remove(record.id).await {
+			tracing::warn!(
+				pending_id = %format_bytes_hex(record.id.as_bytes()),
+				error = %err,
+				"failed to remove reconciled pending finalization"
+			);
+		}
+		let (response, trailing) = self.committed_response_for(record, marker);
+		self.idempotency.insert(
+			Self::idempotency_key_for(record.write_id),
+			CachedWriteOutcome {
+				response,
+				finalization: trailing,
+				pending_finalization_id: None,
+			},
+		);
+		Ok((response, trailing))
+	}
+
+	async fn reconcile_pending_finalizations_once(&self) -> std::io::Result<usize> {
+		let mut records = self.pending_finalizations.load_all().await?;
+		records.sort_by_key(|record| {
+			(
+				record.finalization.marker.epoch,
+				record.finalization.marker.commit_hlc.physical_ms,
+				record.finalization.marker.commit_hlc.logical,
+				record.finalization.marker.commit_hlc.node_id,
+			)
+		});
+
+		let mut reconciled = 0usize;
+		for record in records {
+			match self.resolve_pending_finalization(&record).await {
+				Ok(resolution) => {
+					self.complete_pending_finalization(&record, resolution)
+						.await?;
+					reconciled += 1;
+				}
+				Err(err) if err.kind() == ErrorKind::WouldBlock => {
+					continue;
+				}
+				Err(err) => {
+					tracing::warn!(
+						pending_id = %format_bytes_hex(record.id.as_bytes()),
+						error = %err,
+						"pending finalization replay failed; will retry"
+					);
+				}
+			}
+		}
+		Ok(reconciled)
+	}
+
+	pub fn spawn_pending_finalization_reconciler(
+		self: Arc<Self>,
+		tick: Duration,
+	) -> JoinHandle<()> {
+		tokio::spawn(async move {
+			let mut ticker = tokio::time::interval(tick);
+			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			loop {
+				let _ = self.reconcile_pending_finalizations_once().await;
+				tokio::select! {
+					_ = ticker.tick() => {}
+					_ = self.pending_finalization_wakeup.notified() => {}
+				}
+			}
+		})
+	}
+
+	#[cfg(test)]
+	pub async fn pending_finalization_count_for_test(&self) -> usize {
+		self.pending_finalizations
+			.load_all()
+			.await
+			.expect("pending finalizations should load")
+			.len()
 	}
 
 	fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
@@ -2812,17 +3076,29 @@ impl DataRing for WendelonDataServer {
 		}
 
 		// 3. Idempotency fast path.
-		let key = (meta.write_id.client_uuid, meta.write_id.sequence_no);
-		if let Some(cached) = self.idempotency.get(&key) {
-			let mut resp = *cached.value();
+		let key = Self::idempotency_key_for(meta.write_id);
+		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
+			if let Some(pending_id) = cached.pending_finalization_id {
+				if let Some(record) = self.pending_finalizations.get(pending_id).await? {
+					if let Ok(resolution) = self.resolve_pending_finalization(&record).await {
+						let (mut response, trailing) = self
+							.complete_pending_finalization(&record, resolution)
+							.await?;
+						response.status = WriteStatus::DUPLICATE;
+						return Ok((response, trailing));
+					}
+				}
+				return Ok((cached.response, cached.finalization));
+			}
+			let mut resp = cached.response;
 			resp.status = WriteStatus::DUPLICATE;
-			return Ok((resp, None));
+			return Ok((resp, cached.finalization));
 		}
 
-		// 4. Pull the key out of the Arrow payload and hash it.
-		let key_bytes = extract_first_binary(&payload, "key")?;
-		let key_identity = Identity::blake3_tenant(meta.tenant_id, key_bytes);
-		let key_locality = Locality::from(key_identity).get();
+		// 4. Cross the ADR 003 bifurcation boundary exactly once.
+		// The returned bundle becomes the single source of truth for
+		// both the data branch and the control branch.
+		let bifurcated = bifurcate_client_write(&meta, &payload)?;
 
 		// 4a. Per-range lease gate (plan 018). When enabled, this
 		// node accepts the write only if it holds a valid lease
@@ -2834,7 +3110,7 @@ impl DataRing for WendelonDataServer {
 		if self.lease_gate_enabled {
 			let is_primary = self
 				.router
-				.replicas_for_locality(Locality::new(key_locality))
+				.replicas_for_locality(bifurcated.locality)
 				.first()
 				.map(|n| n.id == self.local_node.id)
 				.unwrap_or(false);
@@ -2845,11 +3121,7 @@ impl DataRing for WendelonDataServer {
 				));
 			}
 			match self
-				.lease_gate_result(
-					Locality::new(key_locality),
-					meta.expected_epoch,
-					meta.client_hlc,
-				)
+				.lease_gate_result(bifurcated.locality, meta.expected_epoch, meta.client_hlc)
 				.await
 			{
 				LeaseGateResult::Valid => {}
@@ -2872,14 +3144,8 @@ impl DataRing for WendelonDataServer {
 			}
 		}
 
-		// 5. Serialize the RecordBatch back to Arrow IPC. These
-		// bytes are what both the local slab and every remote
-		// replica store verbatim — hashing once here means every
-		// ack is computed against the same authoritative blob.
-		let frame_bytes = Arc::new(encode_batch(&payload)?);
-		let payload_hash = blake3_32(frame_bytes.as_slice());
 		let _quota_reservation = match self
-			.enforce_write_policy(meta.tenant_id, frame_bytes.len() as u64)
+			.enforce_write_policy(meta.tenant_id, bifurcated.charged_bytes)
 			.await
 		{
 			Ok(reservation) => reservation,
@@ -2894,9 +3160,7 @@ impl DataRing for WendelonDataServer {
 		// 7. Resolve the replica set. An empty set is a
 		// configuration bug — refuse rather than silently dropping
 		// to a pre-Stellarator single-node append.
-		let replicas = self
-			.router
-			.replicas_for_locality(Locality::new(key_locality));
+		let replicas = self.router.replicas_for_locality(bifurcated.locality);
 		if replicas.is_empty() {
 			return Ok((
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
@@ -2922,9 +3186,9 @@ impl DataRing for WendelonDataServer {
 				.slab
 				.append_durable(
 					meta.tenant_id,
-					key_identity,
+					bifurcated.key_identity,
 					commit_hlc,
-					frame_bytes.as_slice(),
+					bifurcated.frame_bytes.as_slice(),
 				)
 				.await
 			{
@@ -2944,8 +3208,8 @@ impl DataRing for WendelonDataServer {
 			commit_hlc,
 			epoch: meta.expected_epoch,
 			tenant_id: meta.tenant_id,
-			key_identity,
-			payload_hash,
+			key_identity: bifurcated.key_identity,
+			payload_hash: bifurcated.payload_hash,
 		};
 		let mut join: JoinSet<std::io::Result<ReplicaAckLevel>> = JoinSet::new();
 		for target in replicas.iter().copied() {
@@ -2954,7 +3218,7 @@ impl DataRing for WendelonDataServer {
 			}
 			let factory = self.factory.clone();
 			let pool = self.pool.clone();
-			let bytes = frame_bytes.clone();
+			let bytes = bifurcated.frame_bytes.clone();
 			join.spawn(async move {
 				Self::replicate_to_remote(factory, pool, target, replica_meta, bytes).await
 			});
@@ -2980,74 +3244,56 @@ impl DataRing for WendelonDataServer {
 			));
 		}
 
-		// 10. Finalization. `log_index` / `term` are unknown until
-		// Raft places the entry; submit with zeros and fill them
-		// from the ClientWriteResponse below. The SM's
-		// `apply_request` only reads `epoch` and `commit_hlc`, so
-		// the placeholder zeros are safe.
-		let mut marker = FinalizationMarker {
-			log_index: 0,
-			term: 0,
-			epoch: meta.expected_epoch,
-			commit_hlc,
-			payload_hash,
-			e_safe_index: 0,
-			durability: meta.durability,
-			_pad: [0; 7],
+		// 10. Finalization. Before we touch the Control Ring, persist a
+		// local recovery intent so "data quorum durable, control branch
+		// failed" survives restart and can be replayed without redoing
+		// the data branch.
+		let pending = self.pending_finalization_record(&meta, &bifurcated, commit_hlc);
+		let pending_persisted = match self.pending_finalizations.upsert(pending.clone()).await {
+			Ok(()) => true,
+			Err(err) => {
+				tracing::warn!(
+					pending_id = %format_bytes_hex(pending.id.as_bytes()),
+					error = %err,
+					"failed to persist pending finalization; continuing without restart recovery"
+				);
+				false
+			}
 		};
 
-		let (status, log_index, term) = match self
-			.raft
-			.client_write(WendelonRequest::Finalize(
-				crate::consensus::TenantFinalization {
-					marker,
-					tenant_id: meta.tenant_id,
-					charged_bytes: frame_bytes.len() as u64,
-				},
-			))
-			.await
-		{
-			Ok(resp) => (
-				WriteStatus::OK,
-				resp.log_id.index,
-				resp.log_id.leader_id.term,
-			),
-			Err(_) => (WriteStatus::INTERNAL_ERROR, 0, 0),
-		};
-		marker.log_index = log_index;
-		marker.term = term;
-		marker.e_safe_index = log_index;
-
-		// 11. Response meta, cached for future idempotent replays.
-		let response = WriteResponseMeta {
-			status,
-			_pad1: [0; 7],
-			log_index,
-			term,
-			epoch: meta.expected_epoch,
-			commit_hlc,
-			leader_hint: self.local_node,
-			echoed_write_id: meta.write_id,
-			has_finalization: if meta.await_finalization != 0 { 1 } else { 0 },
-			_pad2: [0; 7],
-		};
-		if status == WriteStatus::OK {
-			self.note_committed_write(meta.tenant_id, frame_bytes.len() as u64);
+		match self.resolve_pending_finalization(&pending).await {
+			Ok(resolution) => {
+				self.complete_pending_finalization(&pending, resolution)
+					.await
+			}
+			Err(err) => {
+				tracing::warn!(
+					pending_id = %format_bytes_hex(pending.id.as_bytes()),
+					error = %err,
+					"finalization commit failed after the data branch reached durable quorum"
+				);
+				let response =
+					self.pending_error_response(meta.write_id, meta.expected_epoch, commit_hlc);
+				if pending_persisted {
+					self.idempotency.insert(
+						key,
+						CachedWriteOutcome {
+							response,
+							finalization: None,
+							pending_finalization_id: Some(pending.id),
+						},
+					);
+					self.pending_finalization_wakeup.notify_one();
+				}
+				Ok((response, None))
+			}
 		}
-		self.idempotency.insert(key, response);
-
-		let trailing = if meta.await_finalization != 0 && status == WriteStatus::OK {
-			Some(marker)
-		} else {
-			None
-		};
-		Ok((response, trailing))
 	}
 
 	async fn read(
 		&self,
 		meta: ReadRequestMeta,
-		key: RecordBatch,
+		_key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)> {
 		metrics().data_ring_read_requests_total.inc();
 		let sm = self.state_machine.state_snapshot().await;
@@ -3085,9 +3331,10 @@ impl DataRing for WendelonDataServer {
 			}
 		}
 
-		// 2. Hash the key payload and probe the slab index.
-		let key_bytes = extract_first_binary(&key, "key")?;
-		let key_identity = Identity::blake3_tenant(meta.tenant_id, key_bytes);
+		// 2. Probe the slab index using the ingress-validated Identity.
+		// The Arrow key batch is still validated at the frame boundary
+		// even though the hot read path no longer needs to re-parse it.
+		let key_identity = meta.key_identity;
 		let key_locality = Locality::from(key_identity).get();
 
 		// 2a. Per-range lease gate for LINEARIZABLE reads (plan 018).
@@ -3740,6 +3987,11 @@ fn validate_write_request_batch(
 			),
 		));
 	}
+	validate_key_identity(
+		meta.tenant_id,
+		meta.key_identity,
+		extract_first_binary(batch, "key")?,
+	)?;
 	let value_len = extract_first_binary(batch, "value")?.len() as u32;
 	if value_len != meta.value_len {
 		return Err(Error::new(
@@ -3770,12 +4022,54 @@ fn validate_read_request_batch(meta: &ReadRequestMeta, batch: &RecordBatch) -> s
 			),
 		));
 	}
+	validate_key_identity(
+		meta.tenant_id,
+		meta.key_identity,
+		extract_first_binary(batch, "key")?,
+	)?;
 	Ok(())
+}
+
+fn validate_key_identity(
+	tenant_id: TenantId,
+	expected: Identity,
+	key_bytes: &[u8],
+) -> std::io::Result<()> {
+	let computed = Identity::blake3_tenant(tenant_id, key_bytes);
+	if expected == computed {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"key_identity mismatch: meta={} computed={}",
+			expected, computed
+		),
+	))
 }
 
 // ============================================================
 //  ARROW / HASH HELPERS
 // ============================================================
+
+fn bifurcate_client_write(
+	meta: &WriteRequestMeta,
+	batch: &RecordBatch,
+) -> std::io::Result<BifurcatedWrite> {
+	let key_bytes = extract_first_binary(batch, "key")?;
+	// Re-validate at the bifurcation boundary so every future caller
+	// that reaches this helper inherits the tamper check even if the
+	// ingress-side batch validator changes.
+	validate_key_identity(meta.tenant_id, meta.key_identity, key_bytes)?;
+	let frame_bytes = Arc::new(encode_batch(batch)?);
+	Ok(BifurcatedWrite {
+		key_identity: meta.key_identity,
+		locality: Locality::from(meta.key_identity),
+		payload_hash: blake3_32(frame_bytes.as_slice()),
+		charged_bytes: frame_bytes.len() as u64,
+		frame_bytes,
+	})
+}
 
 /// Read the first value of a named `LargeBinary` column from a
 /// single-row RecordBatch. Both `write_payload_schema` and
@@ -3867,6 +4161,15 @@ fn key_locality(bytes: &[u8]) -> u64 {
 
 fn blake3_32(bytes: &[u8]) -> [u8; 32] {
 	*blake3::hash(bytes).as_bytes()
+}
+
+fn format_bytes_hex(bytes: &[u8]) -> String {
+	let mut out = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		use std::fmt::Write as _;
+		write!(&mut out, "{byte:02x}").expect("writing to string cannot fail");
+	}
+	out
 }
 
 // ============================================================
@@ -4250,6 +4553,7 @@ mod tests {
 				id: 0,
 				_reserved: 0,
 			},
+			key_identity: Identity::blake3_tenant(tenant(), b"k"),
 			key_len: 1,
 			value_len: 1,
 		}
@@ -4275,6 +4579,7 @@ mod tests {
 			tenant_id: tenant(),
 			consistency: SchemaConsistency::LINEARIZABLE,
 			_pad: [0; 3],
+			key_identity: Identity::blake3_tenant(tenant(), b"k"),
 			key_len: 1,
 			_pad2: [0; 8],
 			as_of_hlc: hlc(0, 0, 0),
@@ -4477,6 +4782,194 @@ mod tests {
 				.durability,
 			DurabilityLevel::LEADER
 		);
+	}
+
+	#[test]
+	fn bifurcation_rejects_tampered_key_identity() {
+		let mut meta = simple_write_meta(1);
+		meta.key_identity = Identity::blake3_tenant(tenant(), b"wrong-key");
+		let err = bifurcate_client_write(&meta, &single_kv_batch()).unwrap_err();
+		assert!(err.to_string().contains("key_identity mismatch"));
+	}
+
+	#[tokio::test]
+	async fn duplicate_write_replays_finalization_marker_and_emits_one_audit_record() {
+		let dir = bootstrap_tempdir("duplicate-finalization");
+		let audit_path = dir.join("audit.ndjson");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			16,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		let first = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		let duplicate = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+
+		assert_eq!(first.0.status, WriteStatus::OK, "got resp={:?}", first.0);
+		assert_eq!(
+			duplicate.0.status,
+			WriteStatus::DUPLICATE,
+			"got resp={:?}",
+			duplicate.0
+		);
+		assert_eq!(first.1, duplicate.1);
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+			if audit
+				.matches("\"event_type\":\"data.write_finalized\"")
+				.count() == 1
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for write audit; current log: {}",
+				audit
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+
+	#[tokio::test]
+	async fn pending_finalization_replays_after_restart_when_control_branch_failed() {
+		let dir = bootstrap_tempdir("pending-finalization-restart");
+		let audit_path = dir.join("audit.ndjson");
+		let cfg = NodeBootstrapConfig::dev(17, dir.clone(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		node.raft.shutdown().await.unwrap();
+
+		let (resp, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(
+			resp.status,
+			WriteStatus::INTERNAL_ERROR,
+			"got resp={resp:?}"
+		);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			1
+		);
+		assert!(
+			node.slab.lookup(tenant(), meta.key_identity).is_some(),
+			"data branch must stay durable locally across the control-branch failure"
+		);
+
+		node.handles.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+		loop {
+			if recovered.raft.current_leader().await == Some(recovered.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for recovered leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		recovered
+			.data_server
+			.refresh_leases_once(&recovered.ring, &*recovered.clock, 60_000)
+			.await;
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+		loop {
+			let (read_resp, batch) = recovered
+				.data_server
+				.read(simple_read_meta(1), single_key_batch())
+				.await
+				.unwrap();
+			if recovered
+				.data_server
+				.pending_finalization_count_for_test()
+				.await == 0 && read_resp.status == ReadStatus::OK
+				&& batch.is_some()
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for pending finalization replay; read_resp={read_resp:?}"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+			if audit
+				.matches("\"event_type\":\"data.write_finalized\"")
+				.count() == 1
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for replayed write audit; current log: {}",
+				audit
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		recovered.handles.abort();
 	}
 
 	// ========================================================
@@ -5633,28 +6126,34 @@ mod tests {
 				),
 		);
 
-		let leader = Arc::new(WendelonDataServer::new(
-			leader_node.slab.clone(),
-			leader_node.raft.clone(),
-			leader_node.log_store.clone(),
-			leader_node.state_machine.clone(),
-			leader_id,
-			leader_node.clock.clone(),
-			router.clone(),
-			build_factory(),
-			pool.clone(),
-		));
-		let durable_replica = Arc::new(WendelonDataServer::new(
-			durable_node.slab.clone(),
-			durable_node.raft.clone(),
-			durable_node.log_store.clone(),
-			durable_node.state_machine.clone(),
-			durable_id,
-			durable_node.clock.clone(),
-			router,
-			build_factory(),
-			durable_node.pool.clone(),
-		));
+		let leader = Arc::new(
+			WendelonDataServer::new(
+				leader_node.slab.clone(),
+				leader_node.raft.clone(),
+				leader_node.log_store.clone(),
+				leader_node.state_machine.clone(),
+				leader_id,
+				leader_node.clock.clone(),
+				router.clone(),
+				build_factory(),
+				pool.clone(),
+			)
+			.unwrap(),
+		);
+		let durable_replica = Arc::new(
+			WendelonDataServer::new(
+				durable_node.slab.clone(),
+				durable_node.raft.clone(),
+				durable_node.log_store.clone(),
+				durable_node.state_machine.clone(),
+				durable_id,
+				durable_node.clock.clone(),
+				router,
+				build_factory(),
+				durable_node.pool.clone(),
+			)
+			.unwrap(),
+		);
 		let durable_data_ring: Arc<dyn DataRingServer> = durable_replica;
 		let durable_service: Arc<dyn HrftService> = Arc::new(
 			MsgRouter::builder()
@@ -5703,6 +6202,7 @@ mod tests {
 		let durable_value = b"v-durable";
 		let mut durable_meta = simple_write_meta(1);
 		durable_meta.write_id.sequence_no = 101;
+		durable_meta.key_identity = durable_key_identity;
 		durable_meta.key_len = durable_key.len() as u32;
 		durable_meta.value_len = durable_value.len() as u32;
 		let (durable_resp, _) = fx
@@ -5743,6 +6243,7 @@ mod tests {
 		let append_only_value = b"v-append-only";
 		let mut append_only_meta = simple_write_meta(1);
 		append_only_meta.write_id.sequence_no = 102;
+		append_only_meta.key_identity = append_only_key_identity;
 		append_only_meta.key_len = append_only_key.len() as u32;
 		append_only_meta.value_len = append_only_value.len() as u32;
 		let (append_only_resp, _) = fx
@@ -5960,39 +6461,48 @@ mod tests {
 			vec![dest_id, source_a_id, source_b_id],
 			1,
 		));
-		let dest_ds = Arc::new(WendelonDataServer::new(
-			dest_node.slab.clone(),
-			dest_node.raft.clone(),
-			dest_node.log_store.clone(),
-			dest_node.state_machine.clone(),
-			dest_id,
-			dest_node.clock.clone(),
-			router.clone(),
-			dest_factory,
-			pool.clone(),
-		));
-		let source_a_ds = Arc::new(WendelonDataServer::new(
-			source_a_node.slab.clone(),
-			source_a_node.raft.clone(),
-			source_a_node.log_store.clone(),
-			source_a_node.state_machine.clone(),
-			source_a_id,
-			source_a_node.clock.clone(),
-			router.clone(),
-			source_a_factory,
-			source_a_node.pool.clone(),
-		));
-		let source_b_ds = Arc::new(WendelonDataServer::new(
-			source_b_node.slab.clone(),
-			source_b_node.raft.clone(),
-			source_b_node.log_store.clone(),
-			source_b_node.state_machine.clone(),
-			source_b_id,
-			source_b_node.clock.clone(),
-			router,
-			source_b_factory,
-			source_b_node.pool.clone(),
-		));
+		let dest_ds = Arc::new(
+			WendelonDataServer::new(
+				dest_node.slab.clone(),
+				dest_node.raft.clone(),
+				dest_node.log_store.clone(),
+				dest_node.state_machine.clone(),
+				dest_id,
+				dest_node.clock.clone(),
+				router.clone(),
+				dest_factory,
+				pool.clone(),
+			)
+			.unwrap(),
+		);
+		let source_a_ds = Arc::new(
+			WendelonDataServer::new(
+				source_a_node.slab.clone(),
+				source_a_node.raft.clone(),
+				source_a_node.log_store.clone(),
+				source_a_node.state_machine.clone(),
+				source_a_id,
+				source_a_node.clock.clone(),
+				router.clone(),
+				source_a_factory,
+				source_a_node.pool.clone(),
+			)
+			.unwrap(),
+		);
+		let source_b_ds = Arc::new(
+			WendelonDataServer::new(
+				source_b_node.slab.clone(),
+				source_b_node.raft.clone(),
+				source_b_node.log_store.clone(),
+				source_b_node.state_machine.clone(),
+				source_b_id,
+				source_b_node.clock.clone(),
+				router,
+				source_b_factory,
+				source_b_node.pool.clone(),
+			)
+			.unwrap(),
+		);
 
 		// 6. Wrap each DataServer behind MsgRouter so the
 		//    harness hits the full dispatch path

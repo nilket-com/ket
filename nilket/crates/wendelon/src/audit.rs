@@ -1,6 +1,6 @@
 use crate::consensus::monitor::{ClockDriftEvent, ClockDriftSubscriber};
 use crate::network::tls::{ActorIdentity, ActorRole, ActorTrustDomain};
-use crate::schema::NodeId;
+use crate::schema::{Identity, NodeId, TenantId};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +26,8 @@ pub struct AuditEvent {
 	pub authority: AuditAuthority,
 	pub event_type: String,
 	pub node_id: NodeId,
+	pub tenant_id: Option<TenantId>,
+	pub record_identity: Option<Identity>,
 	pub actor_role: Option<ActorRole>,
 	pub actor_trust_domain: Option<ActorTrustDomain>,
 	pub actor_key_id: Option<Vec<u8>>,
@@ -44,6 +46,8 @@ impl AuditEvent {
 			authority,
 			event_type: event_type.into(),
 			node_id,
+			tenant_id: None,
+			record_identity: None,
 			actor_role: None,
 			actor_trust_domain: None,
 			actor_key_id: None,
@@ -60,7 +64,26 @@ impl AuditEvent {
 		self
 	}
 
+	pub fn with_tenant(mut self, tenant_id: TenantId) -> Self {
+		self.tenant_id = Some(tenant_id);
+		self
+	}
+
+	pub fn with_record_identity(mut self, record_identity: Identity) -> Self {
+		self.record_identity = Some(record_identity);
+		self
+	}
+
 	pub fn to_json_line(&self) -> String {
+		let tenant_id = self
+			.tenant_id
+			.map(|tenant_id| tenant_id.get().to_string())
+			.unwrap_or_else(|| "null".to_string());
+		let record_identity = self
+			.record_identity
+			.as_ref()
+			.map(|identity| format!("\"{}\"", hex_string(identity.as_bytes())))
+			.unwrap_or_else(|| "null".to_string());
 		let actor_role = self
 			.actor_role
 			.map(|role| format!("\"{}\"", role.as_str()))
@@ -75,10 +98,12 @@ impl AuditEvent {
 			.map(|key_id| format!("\"{}\"", hex_string(key_id)))
 			.unwrap_or_else(|| "null".to_string());
 		format!(
-			"{{\"authority\":\"{}\",\"event_type\":\"{}\",\"node_id\":\"n-{:02}\",\"actor_role\":{},\"actor_trust_domain\":{},\"actor_key_id\":{},\"break_glass\":{},\"message\":\"{}\"}}\n",
+			"{{\"authority\":\"{}\",\"event_type\":\"{}\",\"node_id\":\"n-{:02}\",\"tenant_id\":{},\"record_identity\":{},\"actor_role\":{},\"actor_trust_domain\":{},\"actor_key_id\":{},\"break_glass\":{},\"message\":\"{}\"}}\n",
 			self.authority.as_str(),
 			escape_json(&self.event_type),
 			self.node_id.id,
+			tenant_id,
+			record_identity,
 			actor_role,
 			actor_trust_domain,
 			actor_key_id,

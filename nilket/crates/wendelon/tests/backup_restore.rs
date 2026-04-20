@@ -58,6 +58,7 @@ fn tenant_finalization(
 	TenantFinalization {
 		marker,
 		tenant_id,
+		key_identity: id(1),
 		charged_bytes,
 	}
 }
