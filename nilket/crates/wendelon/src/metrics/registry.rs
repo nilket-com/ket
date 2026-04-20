@@ -72,6 +72,8 @@ pub struct MetricsRegistry {
 	pub storage_rehydrated_reclaims_total: Counter,
 	pub storage_migration_reclaimed_slabs_total: Counter,
 	pub storage_migration_reclaimed_bytes_total: Counter,
+
+	pub crypto_decrypt_audit_emit_failures_total: Counter,
 }
 
 impl MetricsRegistry {
@@ -256,6 +258,12 @@ impl MetricsRegistry {
 			"wendelon_storage_migration_reclaimed_bytes_total",
 			"Bytes reclaimed from tombstoned slabs after migration completion.",
 			self.storage_migration_reclaimed_bytes_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_crypto_decrypt_audit_emit_failures_total",
+			"crypto.decrypt_rejected audit events that the sink refused to durably persist.",
+			self.crypto_decrypt_audit_emit_failures_total.get(),
 		);
 		out
 	}

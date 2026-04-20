@@ -703,6 +703,12 @@ impl WendelonDataServer {
 						WendelonResponse::LeaseDenied => {
 							Ok(LeaseAcquireOutcome::Denied(LeaseStatus::DENIED_OVERLAP))
 						}
+						WendelonResponse::Error(message) => Err(Error::new(
+							ErrorKind::Other,
+							format!(
+								"lease manager: state machine rejected AcquireLease: {message}"
+							),
+						)),
 					},
 					Err(err) => Err(Error::new(
 						ErrorKind::Other,
@@ -3271,6 +3277,7 @@ fn blake3_32(bytes: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::CryptoManager;
 	use crate::schema::wpbc::{OP_AND, OP_GTE, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT};
 	use crate::schema::write_payload_schema;
 	use crate::storage::core::StorageEngine;
@@ -3322,6 +3329,12 @@ mod tests {
 		TenantId::ZERO
 	}
 
+	fn test_crypto() -> Arc<CryptoManager> {
+		let crypto = Arc::new(CryptoManager::new_dev());
+		crypto.install_local_only_for_tests(tenant()).unwrap();
+		crypto
+	}
+
 	async fn make_manager() -> Arc<SlabManager> {
 		let dir = fresh_dir("query");
 		let io = spawn_io_thread(64).unwrap();
@@ -3333,6 +3346,7 @@ mod tests {
 				l2: None,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
 			})
 			.await
 			.unwrap(),
@@ -3605,7 +3619,7 @@ mod tests {
 
 	use crate::node::{NodeBootstrapConfig, WendelonNode};
 	use crate::schema::{
-		ClientWriteId, Consistency as SchemaConsistency, DurabilityLevel, WriteRequestMeta,
+		ClientWriteId, Consistency as SchemaConsistency, DurabilityLevel, SlabId, WriteRequestMeta,
 	};
 
 	fn bootstrap_tempdir(tag: &str) -> std::path::PathBuf {
@@ -4369,7 +4383,7 @@ mod tests {
 				tenant(),
 				id(7),
 				crate::storage::core::RecordLocation {
-					slab_id: 0,
+					slab_id: SlabId::ZERO,
 					offset: 0,
 					length: 0,
 					hlc: hlc(10, 2, 3),
@@ -4380,7 +4394,7 @@ mod tests {
 				tenant(),
 				id(42),
 				crate::storage::core::RecordLocation {
-					slab_id: 0,
+					slab_id: SlabId::ZERO,
 					offset: 0,
 					length: 0,
 					hlc: hlc(20, 5, 3),
@@ -4737,7 +4751,7 @@ mod tests {
 
 	struct CrashyReplicaState {
 		manager: Arc<SlabManager>,
-		volatile_cutoffs: StdHashMap<u64, u64>,
+		volatile_cutoffs: StdHashMap<SlabId, u64>,
 	}
 
 	/// Replica harness that appends to a real slab but deliberately
@@ -4765,6 +4779,7 @@ mod tests {
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
+					crypto: test_crypto(),
 				})
 				.await
 				.unwrap(),
@@ -4803,6 +4818,7 @@ mod tests {
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
+					crypto: test_crypto(),
 				})
 				.await
 				.unwrap(),

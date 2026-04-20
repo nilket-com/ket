@@ -13,6 +13,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
 	TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
 };
+use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
 	ManagerTierObserver, ObjectStore, RemoteObjectStore, RemoteObjectStoreConfig, SlabManager,
@@ -45,6 +46,10 @@ fn id(locality: u64) -> Identity {
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
+}
+
+fn test_crypto() -> Arc<CryptoManager> {
+	Arc::new(test_support::seeded_dev_crypto_manager(tenant()).unwrap())
 }
 
 fn compat_config(endpoint: String, root: &str) -> RemoteObjectStoreConfig {
@@ -351,6 +356,7 @@ async fn build_manager_with_sealed_slabs(
 			l2,
 			rehydration: wendelon::storage::RehydrationPolicy::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap(),
@@ -424,6 +430,7 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "sealed/".into(),
+			max_plaintext_rewrites_per_pass: 1,
 		},
 	);
 

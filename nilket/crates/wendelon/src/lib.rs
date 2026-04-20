@@ -2,6 +2,7 @@ pub mod audit;
 pub mod client;
 pub mod config;
 pub mod consensus;
+pub mod crypto;
 pub mod metrics;
 pub mod network;
 pub mod node;

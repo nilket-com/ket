@@ -36,6 +36,17 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 [identity.trusted_transfer_signers]
 "{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"
 
+# Optional W4 root-KEK bootstrap selector. `dev-insecure` is the
+# current dev/test placeholder. It persists a local plaintext Root
+# KEK at `<data_dir>/.wendelon/dev-root-kek.bin` so restarted dev
+# nodes can still unwrap prior Tenant KEKs, and is not suitable for
+# a production custody boundary.
+#
+# [crypto]
+# root_kek_provider = "dev-insecure"
+# tenant_kek_cache_max_entries = 2048
+# slab_dek_cache_max_entries = 10000
+
 # Optional inter-node mTLS transport. When configured, Wendelon binds
 # the real QUIC transport stack (`quinn`) plus the TCP+TLS fallback
 # listener, advertises both tiers, and uses this identity for both

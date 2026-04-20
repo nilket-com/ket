@@ -7,6 +7,11 @@
 //! only after the local state machine has applied the commit —
 //! returns so the L1 file can be unlinked.
 //!
+//! The same task also rewrites legacy plaintext L2 objects into
+//! W4 envelope-encrypted form. Those rewrites are bounded per pass
+//! so an operator can pause or throttle the migration independently
+//! of fresh tier uploads.
+//!
 //! ## Two-phase garbage collection
 //!
 //! The strict invariant is: **the L1 slab file must remain
@@ -38,8 +43,12 @@
 //!    slabs. Too-small values starve the write path on a busy
 //!    cluster; the default of 5s is a compromise.
 //!  * `max_upload_bytes_per_sec`: a token bucket applied to the
-//!    L2 upload so the sweeper never saturates the NIC. The
-//!    bucket is refilled on a 100ms tick.
+//!    L2 upload so the sweeper never saturates the NIC. In W4
+//!    this caps PUT traffic only; rewrite-path GET bandwidth is
+//!    not throttled. The bucket is refilled on a 100ms tick.
+//!  * `max_plaintext_rewrites_per_pass`: how many legacy plaintext
+//!    L2 slabs are re-encrypted per scan. Setting it to 0 pauses
+//!    the migration without disabling fresh tier uploads.
 //!
 //! ## Leader-only uploads
 //!
@@ -53,6 +62,7 @@
 
 use crate::consensus::{TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine};
 use crate::metrics::global as metrics;
+use crate::schema::SlabId;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{SealedSlabInfo, SlabManager, TieredSlabPointer};
 use async_trait::async_trait;
@@ -76,13 +86,17 @@ pub struct SweeperConfig {
 	/// not shipped off NVMe.
 	pub min_slab_bytes: u64,
 	/// Upload rate limit in bytes per second. `None` disables the
-	/// limiter. Applied per sweeper instance, not per slab.
+	/// limiter. Applied per sweeper instance, not per slab, and in
+	/// W4 it throttles PUT traffic only.
 	pub max_upload_bytes_per_sec: Option<u64>,
 	/// Object-key prefix. URIs returned by the object store are
 	/// `<prefix>slab_<hex>.wnd`; operators may set this to a
 	/// namespace / cluster identifier so multiple Wendelon
 	/// deployments can share a bucket.
 	pub key_prefix: String,
+	/// Maximum number of legacy plaintext L2 slabs to rewrite into
+	/// ciphertext during one scan. `0` pauses the rewrite path.
+	pub max_plaintext_rewrites_per_pass: usize,
 }
 
 impl Default for SweeperConfig {
@@ -92,6 +106,7 @@ impl Default for SweeperConfig {
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: String::new(),
+			max_plaintext_rewrites_per_pass: 1,
 		}
 	}
 }
@@ -219,7 +234,7 @@ impl SlabSweeper {
 				Ok(()) => report.tiered += 1,
 				Err(e) => {
 					tracing::warn!(
-						slab_id = candidate.slab_id,
+						slab_id = candidate.slab_id.get(),
 						error = %e,
 						"sweeper pass failed on slab; will retry on next scan"
 					);
@@ -227,6 +242,13 @@ impl SlabSweeper {
 				}
 			}
 		}
+		let rewritten = self
+			.rewrite_plaintext_tiered_slabs_once(self.config.max_plaintext_rewrites_per_pass)
+			.await?;
+		report.rewritten_plaintext_tiered = rewritten.rewritten;
+		report.skipped_already_encrypted_tiered = rewritten.skipped_already_encrypted;
+		report.plaintext_rewrite_failures = rewritten.failed;
+		report.failed += rewritten.failed;
 		let reclaim = self.reclaim_tombstoned_ranges_once(1).await?;
 		report.reclaimed_slabs = reclaim.compacted_slabs;
 		report.reclaimed_bytes = reclaim.reclaimed_bytes;
@@ -266,13 +288,16 @@ impl SlabSweeper {
 		// loudly if the slab has been rotated away or already
 		// tiered — either is a sign the caller's info went stale,
 		// and re-listing on the next pass will converge.
-		let blob: Vec<u8> = self.slab.read_sealed_raw(info.slab_id).await?;
-		let expected_hash = *blake3::hash(&blob).as_bytes();
+		let plaintext: Vec<u8> = self.slab.read_sealed_raw(info.slab_id).await?;
+		let encrypted = self
+			.slab
+			.encrypt_tiered_object_blob(info.slab_id, &plaintext)?;
+		let expected_hash = *blake3::hash(&encrypted.bytes).as_bytes();
 
 		// Phase 2: upload to L2, applying the rate limit.
-		self.rate_limit_upload(blob.len()).await;
+		self.rate_limit_upload(encrypted.bytes.len()).await;
 		let key = format!("{}slab_{:016x}.wnd", self.config.key_prefix, info.slab_id);
-		let l2_uri = self.object_store.put(&key, &blob).await?;
+		let l2_uri = self.object_store.put(&key, &encrypted.bytes).await?;
 
 		// Phase 3: round-trip verification. A mismatch here means
 		// the object store acked a write but returned a different
@@ -306,6 +331,7 @@ impl SlabSweeper {
 			slab_id: info.slab_id,
 			l2_uri,
 			payload_hash: expected_hash,
+			is_encrypted: true,
 		};
 		self.raft.commit_tier_slab(tier).await?;
 
@@ -322,16 +348,147 @@ impl SlabSweeper {
 		Ok(())
 	}
 
+	async fn rewrite_plaintext_tiered_slabs_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<PlaintextRewriteReport> {
+		let mut report = PlaintextRewriteReport::default();
+		if max_slabs == 0 {
+			return Ok(report);
+		}
+		for pointer in self.slab.list_tiered_slabs().await {
+			if report.rewritten >= max_slabs {
+				break;
+			}
+			// Steady-state short-circuit: a previous successful
+			// rewrite (or fresh-encrypt tiering) stamped
+			// `is_encrypted = true` on the SM pointer. Skip without
+			// the GET so the rewrite sweeper costs O(0) once the
+			// fleet is fully ciphertext.
+			if pointer.is_encrypted {
+				report.skipped_already_encrypted += 1;
+				continue;
+			}
+			match self.rewrite_one_plaintext_tiered_slab(&pointer).await {
+				Ok(PlaintextRewriteOutcome::AlreadyEncrypted) => {
+					report.skipped_already_encrypted += 1;
+				}
+				Ok(PlaintextRewriteOutcome::Rewritten) => {
+					report.rewritten += 1;
+				}
+				Err(error) => {
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"plaintext L2 rewrite failed; will retry on next scan"
+					);
+					report.failed += 1;
+				}
+			}
+		}
+		Ok(report)
+	}
+
+	async fn rewrite_one_plaintext_tiered_slab(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<PlaintextRewriteOutcome> {
+		let blob = self.object_store.get_bytes(&pointer.l2_uri).await?;
+		let actual_hash = *blake3::hash(blob.as_ref()).as_bytes();
+		if actual_hash != pointer.payload_hash {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"L2 payload hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+					pointer.slab_id,
+					&pointer.payload_hash[..4],
+					&actual_hash[..4],
+				),
+			));
+		}
+		if self
+			.slab
+			.encrypted_tiered_footer_summary(blob.as_ref())?
+			.is_some()
+		{
+			return Ok(PlaintextRewriteOutcome::AlreadyEncrypted);
+		}
+
+		let encrypted = self
+			.slab
+			.encrypt_tiered_object_blob(pointer.slab_id, blob.as_ref())?;
+		let expected_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		// Per-attempt suffix so a leader-handoff retry never races
+		// the same key as an earlier in-flight upload. The earlier
+		// attempt either committed (we never reach this branch on a
+		// committed slab — `is_encrypted` short-circuits in
+		// `rewrite_one_plaintext_tiered_slab`) or failed and was
+		// best-effort deleted; either way, a fresh key keeps the two
+		// attempts independent.
+		let key = self.rewritten_key(pointer.slab_id);
+		self.rate_limit_upload(encrypted.bytes.len()).await;
+		let new_uri = self.object_store.put(&key, &encrypted.bytes).await?;
+		let fetched = self.object_store.get(&new_uri).await?;
+		let fetched_hash = *blake3::hash(&fetched).as_bytes();
+		if fetched_hash != expected_hash {
+			let _ = self.object_store.delete(&new_uri).await;
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"rewritten ciphertext hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+					pointer.slab_id,
+					&expected_hash[..4],
+					&fetched_hash[..4],
+				),
+			));
+		}
+
+		let tier = TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: new_uri.clone(),
+			payload_hash: expected_hash,
+			is_encrypted: true,
+		};
+		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+			let _ = self.object_store.delete(&new_uri).await;
+			return Err(error);
+		}
+
+		if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
+			self.slab.apply_tier_slab(pointer).await?;
+		}
+
+		if pointer.l2_uri != new_uri {
+			if let Err(error) = self.object_store.delete(&pointer.l2_uri).await {
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					l2_uri = %pointer.l2_uri,
+					error = %error,
+					"ciphertext rewrite committed but legacy plaintext object cleanup failed"
+				);
+			}
+		}
+		tracing::info!(
+			slab_id = pointer.slab_id.get(),
+			old_l2_uri = %pointer.l2_uri,
+			new_l2_uri = %new_uri,
+			"rewrote plaintext L2 slab into ciphertext envelope"
+		);
+		Ok(PlaintextRewriteOutcome::Rewritten)
+	}
+
 	/// Pull the state machine's authoritative tier pointer for a
 	/// slab (post-apply). Returns `None` if for some reason the
 	/// apply didn't land — which we treat as a terminal failure
 	/// upstream.
-	async fn sm_tier_pointer(&self, slab_id: u64) -> Option<TieredSlabPointer> {
+	async fn sm_tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
 		let state = self.state_machine.state_snapshot().await;
 		state.tiered_slabs.get(&slab_id).map(|t| TieredSlabPointer {
 			slab_id: t.slab_id,
 			l2_uri: t.l2_uri.clone(),
 			payload_hash: t.payload_hash,
+			is_encrypted: t.is_encrypted,
 		})
 	}
 
@@ -360,12 +517,16 @@ impl SlabSweeper {
 		Ok(report)
 	}
 
-	/// Token-bucket rate limiter. For V1 we keep it simple —
-	/// every upload blocks long enough to respect
-	/// `max_upload_bytes_per_sec`. The bucket has no burst credit
-	/// because the sweeper is explicitly a background job; if you
-	/// want fast backfill, raise the cap rather than widening the
-	/// bucket.
+	/// Per-upload pacing tied to `max_upload_bytes_per_sec`.
+	///
+	/// Each upload sleeps for `bytes / cap` seconds so the sweeper's
+	/// average outbound rate stays at or below the configured cap.
+	/// There is deliberately no clamp to `scan_interval` here: a
+	/// 32 GiB slab at a 100 MiB/s cap should sleep for the full ~5
+	/// minutes the cap implies, not bypass the limit by clamping to
+	/// one scan interval. Operators who want larger slabs to upload
+	/// faster should raise `max_upload_bytes_per_sec`, not rely on
+	/// the sweeper to silently exceed it.
 	async fn rate_limit_upload(&self, bytes: usize) {
 		let Some(cap) = self.config.max_upload_bytes_per_sec else {
 			return;
@@ -374,13 +535,18 @@ impl SlabSweeper {
 			return;
 		}
 		let millis = ((bytes as u128) * 1000) / (cap as u128).max(1);
-		// Clamp: a single massive slab should still respect the
-		// scan cadence — no point sleeping for an hour on a
-		// single upload, operators would rather see progress.
-		let capped = millis.min(self.config.scan_interval.as_millis());
-		if capped > 0 {
-			sleep(Duration::from_millis(capped as u64)).await;
+		if millis > 0 {
+			sleep(Duration::from_millis(millis.min(u64::MAX as u128) as u64)).await;
 		}
+	}
+
+	fn rewritten_key(&self, slab_id: SlabId) -> String {
+		format!(
+			"{}crypto/slab_{:016x}_{}.wnd",
+			self.config.key_prefix,
+			slab_id,
+			uuid::Uuid::new_v4().simple()
+		)
 	}
 
 	/// Background loop shape: sleep until the next scan deadline
@@ -415,10 +581,26 @@ pub struct SweepReport {
 	pub failed: usize,
 	pub skipped_too_small: usize,
 	pub skipped_already_tiered: usize,
+	pub rewritten_plaintext_tiered: usize,
+	pub skipped_already_encrypted_tiered: usize,
+	pub plaintext_rewrite_failures: usize,
 	pub skipped_rehydration_guard: usize,
 	pub rehydrated_reclaimed: usize,
 	pub reclaimed_slabs: usize,
 	pub reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlaintextRewriteReport {
+	rewritten: usize,
+	skipped_already_encrypted: usize,
+	failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaintextRewriteOutcome {
+	AlreadyEncrypted,
+	Rewritten,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -460,6 +642,7 @@ impl TierObserver for ManagerTierObserver {
 					slab_id: tier.slab_id,
 					l2_uri: tier.l2_uri.clone(),
 					payload_hash: tier.payload_hash,
+					is_encrypted: tier.is_encrypted,
 				},
 				Some(applied_log_index),
 			)
@@ -474,6 +657,7 @@ impl TierObserver for ManagerTierObserver {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::CryptoManager;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::LocalFsObjectStore;
 	use crate::storage::manager::SlabManagerConfig;
@@ -538,6 +722,12 @@ mod tests {
 		crate::schema::TenantId::ZERO
 	}
 
+	fn test_crypto() -> Arc<CryptoManager> {
+		let crypto = Arc::new(CryptoManager::new_dev());
+		crypto.install_local_only_for_tests(tenant()).unwrap();
+		crypto
+	}
+
 	async fn build_manager_with_sealed_slabs(
 		l2: Option<Arc<dyn ObjectStore>>,
 	) -> (Arc<SlabManager>, std::path::PathBuf) {
@@ -553,6 +743,7 @@ mod tests {
 				l2,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
 			})
 			.await
 			.unwrap(),
@@ -601,6 +792,7 @@ mod tests {
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
 			},
 		);
 
@@ -646,6 +838,7 @@ mod tests {
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
+				max_plaintext_rewrites_per_pass: 1,
 			},
 		);
 		sweeper.sweep_once().await.unwrap();
@@ -678,6 +871,7 @@ mod tests {
 				min_slab_bytes: u64::MAX,
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
+				max_plaintext_rewrites_per_pass: 1,
 			},
 		);
 		let report = sweeper.sweep_once().await.unwrap();
@@ -709,6 +903,7 @@ mod tests {
 				min_slab_bytes: 0,
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
+				max_plaintext_rewrites_per_pass: 1,
 			},
 		);
 		let report = sweeper.sweep_once().await.unwrap();
@@ -734,11 +929,84 @@ mod tests {
 			slab_id: info.slab_id,
 			l2_uri: "file:///dev/null".into(),
 			payload_hash: [0; 32],
+			is_encrypted: false,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
 		// contains the slab.
 		manager.apply_tier_slab(ptr).await.unwrap();
 		assert!(manager.is_tiered(info.slab_id).await);
+	}
+
+	#[tokio::test]
+	async fn sweeper_rewrites_plaintext_tiered_slabs_to_ciphertext() {
+		use crate::storage::core::StorageEngine;
+
+		let l2_root = fresh_dir("l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
+		let loc = manager.lookup(tenant(), id(1)).expect("key present");
+		let raw = manager.read_sealed_raw(loc.slab_id).await.unwrap();
+		let old_hash = *blake3::hash(&raw).as_bytes();
+		let old_uri = l2
+			.put(&format!("legacy/slab_{:016x}.wnd", loc.slab_id), &raw)
+			.await
+			.unwrap();
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: loc.slab_id,
+				l2_uri: old_uri.clone(),
+				payload_hash: old_hash,
+				is_encrypted: false,
+			})
+			.await
+			.unwrap();
+		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
+
+		let sm = WendelonStateMachine::new();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		);
+
+		let first = sweeper.sweep_once().await.unwrap();
+		assert_eq!(first.rewritten_plaintext_tiered, 1);
+		assert_eq!(first.plaintext_rewrite_failures, 0);
+
+		let new_pointer = manager.tier_pointer(loc.slab_id).await.unwrap();
+		assert_ne!(new_pointer.l2_uri, old_uri);
+		let new_blob = l2.get(&new_pointer.l2_uri).await.unwrap();
+		let footer = manager
+			.encrypted_tiered_footer_summary(&new_blob)
+			.unwrap()
+			.expect("rewritten object must be encrypted");
+		assert_eq!(footer.slab_id, loc.slab_id);
+		assert!(
+			!new_blob
+				.windows(b"hello-1".len())
+				.any(|window| window == b"hello-1"),
+			"ciphertext object leaked plaintext payload"
+		);
+		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
+		assert!(
+			l2.get(&old_uri).await.is_err(),
+			"legacy plaintext object should be deleted after rewrite"
+		);
+
+		let second = sweeper.sweep_once().await.unwrap();
+		assert_eq!(second.rewritten_plaintext_tiered, 0);
+		assert!(second.skipped_already_encrypted_tiered >= 1);
 	}
 }

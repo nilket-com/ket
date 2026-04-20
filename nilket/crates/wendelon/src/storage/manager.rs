@@ -41,7 +41,8 @@
 //!   for now; remote upload is ADR 006's problem.
 
 use crate::consensus::MigratedRangeTombstone;
-use crate::schema::{HybridTimestamp, Identity, Locality, TenantId};
+use crate::crypto::{CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary};
+use crate::schema::{HybridTimestamp, Identity, Locality, SlabId, TenantId};
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
 	newest_version_as_of, recover_slab_entries_from_blob, remove_version_exact,
@@ -89,6 +90,8 @@ pub struct SlabManagerConfig {
 	pub rehydration: RehydrationPolicy,
 	/// ADR 016 data-path group-commit tuning.
 	pub group_commit: GroupCommitConfig,
+	/// W4 slab envelope-encryption service used for L2 object bytes.
+	pub crypto: Arc<CryptoManager>,
 }
 
 /// Policy that governs L2 -> L1 slab rehydration.
@@ -118,7 +121,7 @@ impl Default for RehydrationPolicy {
 /// payload the sweeper will upload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealedSlabInfo {
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	pub size_bytes: u64,
 }
 
@@ -128,7 +131,7 @@ pub struct SealedSlabInfo {
 /// immediate reclamation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RehydratedSlabInfo {
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	pub size_bytes: u64,
 	pub keep_local_until: Instant,
 }
@@ -152,14 +155,23 @@ pub enum MigrationIngestOutcome {
 /// now-unlinked L1 file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TieredSlabPointer {
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	pub l2_uri: String,
 	pub payload_hash: [u8; 32],
+	/// `true` when the L2 object at `l2_uri` carries the W4 envelope
+	/// footer. Lets the plaintext-rewrite sweeper short-circuit
+	/// without GET-ing the object on every pass once steady state is
+	/// reached. Trailing field for postcard upgrade compat: pre-W4
+	/// pointers default to `false`, which is the safe (and accurate)
+	/// classification — the sweeper will GET them once and stamp the
+	/// truth back through `commit_tier_slab`.
+	#[serde(default)]
+	pub is_encrypted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalSlabBackup {
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	#[serde(with = "serde_bytes")]
 	pub bytes: Vec<u8>,
 }
@@ -167,12 +179,12 @@ pub struct LocalSlabBackup {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageBackupManifest {
 	pub format_version: u16,
-	pub active_slab_id: u64,
-	pub next_slab_id: u64,
-	pub sealed_slab_ids: Vec<u64>,
+	pub active_slab_id: SlabId,
+	pub next_slab_id: SlabId,
+	pub sealed_slab_ids: Vec<SlabId>,
 	pub local_slab_bytes: u64,
 	pub tiered_slabs: Vec<TieredSlabPointer>,
-	pub omitted_rehydrated_slabs: Vec<u64>,
+	pub omitted_rehydrated_slabs: Vec<SlabId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,25 +238,25 @@ struct ManagerState {
 	/// the background sweeper. An entry leaves this map only when
 	/// [`SlabManager::apply_tier_slab`] has moved the slab's
 	/// backing from L1 to `tiered`.
-	sealed: DashMap<u64, Arc<LocalSlabStore>>,
+	sealed: DashMap<SlabId, Arc<LocalSlabStore>>,
 	/// Slabs whose payload now lives in L2. Keyed by `slab_id`;
 	/// the value is the URI the read path hands to
 	/// [`ObjectStore::get`]. Ordinary tiering removes the slab from
 	/// `sealed` before inserting here; a later rehydration may add
 	/// a separate local cache copy in `rehydrated` while L2 stays
 	/// authoritative.
-	tiered: DashMap<u64, TieredSlabPointer>,
+	tiered: DashMap<SlabId, TieredSlabPointer>,
 	/// Local L1 cache copies of slabs whose authoritative bytes
 	/// still live in L2. Kept outside `sealed` so compaction and
 	/// ordinary L1 -> L2 demotion never mistake a cache copy for a
 	/// new authoritative slab.
-	rehydrated: DashMap<u64, RehydratedSlabState>,
+	rehydrated: DashMap<SlabId, RehydratedSlabState>,
 	/// Consecutive reads that had to fetch a slab from L2.
-	hot_read_counts: HashMap<u64, u32>,
+	hot_read_counts: HashMap<SlabId, u32>,
 	/// Slabs currently being restored from L2 to L1. Guards the
 	/// hot-read path against duplicate local installs.
-	rehydrating: HashSet<u64>,
-	next_slab_id: u64,
+	rehydrating: HashSet<SlabId>,
+	next_slab_id: SlabId,
 }
 
 impl SlabManager {
@@ -393,12 +405,12 @@ impl SlabManager {
 		existing_ids.sort_unstable();
 
 		let key_index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
-		let sealed: DashMap<u64, Arc<LocalSlabStore>> = DashMap::new();
-		let tiered: DashMap<u64, TieredSlabPointer> = DashMap::new();
-		let rehydrated: DashMap<u64, RehydratedSlabState> = DashMap::new();
+		let sealed: DashMap<SlabId, Arc<LocalSlabStore>> = DashMap::new();
+		let tiered: DashMap<SlabId, TieredSlabPointer> = DashMap::new();
+		let rehydrated: DashMap<SlabId, RehydratedSlabState> = DashMap::new();
 
 		let (active, next_slab_id) = if existing_ids.is_empty() {
-			let id: u64 = 0;
+			let id = SlabId::ZERO;
 			let slab = Arc::new(
 				LocalSlabStore::open(
 					slab_path(&config.dir, id),
@@ -409,7 +421,7 @@ impl SlabManager {
 				.await?,
 			);
 			drain_slab_index(&slab, &key_index);
-			(slab, id + 1)
+			(slab, id.saturating_add(1))
 		} else {
 			// Split: everything except the max becomes sealed, the
 			// max becomes active. Drain into key_index in ascending
@@ -438,7 +450,7 @@ impl SlabManager {
 				.await?,
 			);
 			drain_slab_index(&active, &key_index);
-			(active, active_id + 1)
+			(active, active_id.saturating_add(1))
 		};
 
 		let persistent_index =
@@ -497,7 +509,7 @@ impl SlabManager {
 	}
 
 	/// Test / diagnostic accessor: current active slab id.
-	pub async fn active_slab_id(&self) -> u64 {
+	pub async fn active_slab_id(&self) -> SlabId {
 		self.state.lock().await.active.slab_id()
 	}
 
@@ -578,7 +590,7 @@ impl SlabManager {
 	/// Returns `NotFound` if the slab is either absent, still
 	/// active, or already tiered — all three are bugs on the
 	/// caller side.
-	pub async fn read_sealed_raw(&self, slab_id: u64) -> std::io::Result<Vec<u8>> {
+	pub async fn read_sealed_raw(&self, slab_id: SlabId) -> std::io::Result<Vec<u8>> {
 		{
 			let state = self.state.lock().await;
 			if !state.sealed.contains_key(&slab_id) {
@@ -590,6 +602,32 @@ impl SlabManager {
 		}
 		let path = slab_path(&self.config.dir, slab_id);
 		self.file_ops.read_all(&path).await
+	}
+
+	/// Envelope-encrypt a sealed slab for L2 upload. The current
+	/// W4 implementation requires the slab to contain records from
+	/// exactly one tenant so the footer/AAD stay slab-scoped; the
+	/// single-tenant pilot satisfies that invariant, and W5 lifts
+	/// the remaining write-path plumbing for multi-tenant slab sets.
+	pub fn encrypt_tiered_object_blob(
+		&self,
+		slab_id: SlabId,
+		plaintext_blob: &[u8],
+	) -> std::io::Result<EncryptedTieredSlab> {
+		let tenant_id = single_tenant_id_from_plain_slab(plaintext_blob, slab_id)?;
+		self.config
+			.crypto
+			.encrypt_tiered_slab(slab_id, tenant_id, plaintext_blob)
+	}
+
+	/// Detect whether a tiered object already carries the W4
+	/// envelope footer. Callers use this to distinguish legacy
+	/// plaintext L2 objects from ciphertext ones during migration.
+	pub fn encrypted_tiered_footer_summary(
+		&self,
+		blob: &[u8],
+	) -> std::io::Result<Option<FooterSummary>> {
+		self.config.crypto.encrypted_footer_summary(blob)
 	}
 
 	/// Export the authoritative local slab set as a backup image.
@@ -783,18 +821,18 @@ impl SlabManager {
 
 	/// Whether a slab has been pivoted to L2. Cheap — only hits
 	/// the tiered DashMap.
-	pub async fn is_tiered(&self, slab_id: u64) -> bool {
+	pub async fn is_tiered(&self, slab_id: SlabId) -> bool {
 		self.state.lock().await.tiered.contains_key(&slab_id)
 	}
 
 	/// Whether a tiered slab currently also has a rehydrated local
 	/// copy in L1.
-	pub async fn is_rehydrated(&self, slab_id: u64) -> bool {
+	pub async fn is_rehydrated(&self, slab_id: SlabId) -> bool {
 		self.state.lock().await.rehydrated.contains_key(&slab_id)
 	}
 
 	/// Lookup the L2 pointer for a tiered slab.
-	pub async fn tier_pointer(&self, slab_id: u64) -> Option<TieredSlabPointer> {
+	pub async fn tier_pointer(&self, slab_id: SlabId) -> Option<TieredSlabPointer> {
 		self.state
 			.lock()
 			.await
@@ -803,10 +841,26 @@ impl SlabManager {
 			.map(|p| p.clone())
 	}
 
+	/// Enumerate the current tiered-slab pointers held in local
+	/// runtime state. The returned list is sorted by slab id so
+	/// background sweeps behave deterministically.
+	pub async fn list_tiered_slabs(&self) -> Vec<TieredSlabPointer> {
+		let mut pointers = self
+			.state
+			.lock()
+			.await
+			.tiered
+			.iter()
+			.map(|entry| entry.value().clone())
+			.collect::<Vec<_>>();
+		pointers.sort_by_key(|pointer| pointer.slab_id);
+		pointers
+	}
+
 	/// Best-effort reclaim of one rehydrated local cache copy. The
 	/// authoritative L2 pointer remains intact; only the temporary
 	/// L1 file is removed.
-	pub async fn drop_rehydrated_slab(&self, slab_id: u64) -> std::io::Result<bool> {
+	pub async fn drop_rehydrated_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
 		let removed = {
 			let state = self.state.lock().await;
 			if state.rehydrating.contains(&slab_id) {
@@ -1075,7 +1129,7 @@ impl SlabManager {
 
 		let sealed_slab = std::mem::replace(&mut state.active, next_slab.clone());
 		state.sealed.insert(sealed_slab.slab_id(), sealed_slab);
-		state.next_slab_id = next_id + 1;
+		state.next_slab_id = next_id.saturating_add(1);
 
 		Ok(next_slab)
 	}
@@ -1085,7 +1139,7 @@ impl SlabManager {
 	/// an L2 pointer (tiered). Tiered wins over sealed so a
 	/// post-pivot read never races back against the soon-to-be-
 	/// unlinked L1 file.
-	async fn resolve_backing(&self, slab_id: u64) -> SlabBacking {
+	async fn resolve_backing(&self, slab_id: SlabId) -> SlabBacking {
 		let state = self.state.lock().await;
 		if state.active.slab_id() == slab_id {
 			return SlabBacking::Local(state.active.clone());
@@ -1240,7 +1294,7 @@ impl SlabManager {
 		rows
 	}
 
-	fn has_rows_for_slab(&self, slab_id: u64) -> bool {
+	fn has_rows_for_slab(&self, slab_id: SlabId) -> bool {
 		self.key_index.iter().any(|entry| {
 			entry
 				.value()
@@ -1323,7 +1377,7 @@ impl SlabManager {
 		if let Err(err) = index.upsert_record(row).await {
 			tracing::warn!(
 				error = %err,
-				slab_id = location.slab_id,
+				slab_id = location.slab_id.get(),
 				offset = location.offset,
 				tenant_id = tenant_id.get(),
 				"failed to persist slab record into redb"
@@ -1348,7 +1402,7 @@ impl SlabManager {
 		if let Err(err) = index.upsert_record(row).await {
 			tracing::warn!(
 				error = %err,
-				slab_id = location.slab_id,
+				slab_id = location.slab_id.get(),
 				offset = location.offset,
 				tenant_id = tenant_id.get(),
 				"redb upsert failed on durable append; rebuilding snapshot before retry"
@@ -1435,7 +1489,7 @@ impl SlabManager {
 		{
 			tracing::warn!(
 				error = %err,
-				slab_id = pointer.slab_id,
+				slab_id = pointer.slab_id.get(),
 				"redb tier-pointer upsert failed; rebuilding snapshot before retry"
 			);
 			let rows = self.persistent_record_rows_snapshot();
@@ -1469,7 +1523,8 @@ impl SlabManager {
 		})?;
 		let blob = l2.get(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, &blob)?;
-		let recovered_rows = recover_slab_entries_from_blob(&blob, pointer.slab_id)?
+		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob)?;
+		let recovered_rows = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
 			.map(|(tenant_id, key_identity, location)| PersistentRecordRow {
 				tenant_id,
@@ -1500,7 +1555,7 @@ impl SlabManager {
 		Ok(())
 	}
 
-	async fn reserve_slab_id(&self) -> u64 {
+	async fn reserve_slab_id(&self) -> SlabId {
 		let mut state = self.state.lock().await;
 		let next_id = state.next_slab_id;
 		state.next_slab_id = state.next_slab_id.saturating_add(1);
@@ -1509,7 +1564,7 @@ impl SlabManager {
 
 	async fn compact_one_sealed_slab(
 		&self,
-		slab_id: u64,
+		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		tombstones: &[MigratedRangeTombstone],
 	) -> std::io::Result<Option<CompactionOutcome>> {
@@ -1608,7 +1663,7 @@ impl SlabManager {
 
 	async fn finish_compaction_without_replacement(
 		&self,
-		slab_id: u64,
+		slab_id: SlabId,
 		records: &[CompactionRecord],
 	) -> std::io::Result<()> {
 		let removed = {
@@ -1633,8 +1688,8 @@ impl SlabManager {
 
 	async fn finish_compaction_with_replacement(
 		&self,
-		old_slab_id: u64,
-		new_slab_id: u64,
+		old_slab_id: SlabId,
+		new_slab_id: SlabId,
 		replacement: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
@@ -1685,14 +1740,15 @@ impl SlabManager {
 		})?;
 		let blob = l2.get_bytes(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, blob.as_ref())?;
-		let frame = extract_record_from_blob(blob.as_ref(), location)?;
+		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob.as_ref())?;
+		let frame = extract_record_from_blob(&plaintext, location)?;
 		if self.note_l2_read(pointer.slab_id).await {
 			if let Err(err) = self
-				.rehydrate_tiered_slab(pointer.clone(), blob.clone())
+				.rehydrate_tiered_slab(pointer.clone(), bytes::Bytes::from(plaintext))
 				.await
 			{
 				tracing::warn!(
-					slab_id = pointer.slab_id,
+					slab_id = pointer.slab_id.get(),
 					error = %err,
 					"rehydration failed; continuing to serve slab from L2"
 				);
@@ -1701,7 +1757,7 @@ impl SlabManager {
 		Ok(frame)
 	}
 
-	async fn note_l2_read(&self, slab_id: u64) -> bool {
+	async fn note_l2_read(&self, slab_id: SlabId) -> bool {
 		let promote_after = self.config.rehydration.promote_after_l2_reads;
 		if promote_after == 0 {
 			return false;
@@ -1753,7 +1809,7 @@ impl SlabManager {
 
 	async fn install_rehydrated_local_copy(
 		&self,
-		slab_id: u64,
+		slab_id: SlabId,
 		blob: &[u8],
 	) -> std::io::Result<RehydratedSlabState> {
 		let path = slab_path(&self.config.dir, slab_id);
@@ -1834,6 +1890,44 @@ fn validate_tiered_blob(pointer: &TieredSlabPointer, blob: &[u8]) -> std::io::Re
 	Ok(())
 }
 
+fn decode_tiered_blob(
+	crypto: &CryptoManager,
+	pointer: &TieredSlabPointer,
+	blob: &[u8],
+) -> std::io::Result<Vec<u8>> {
+	match crypto.encrypted_footer_summary(blob)? {
+		Some(FooterSummary {
+			slab_id, tenant_id, ..
+		}) => {
+			if slab_id != pointer.slab_id {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"encrypted tiered slab footer references slab {} but metadata expects {}",
+						slab_id, pointer.slab_id
+					),
+				));
+			}
+			let DecryptedTieredSlab { plaintext, .. } =
+				crypto.decrypt_tiered_slab(pointer.slab_id, blob)?;
+			let payload_tenant_id = single_tenant_id_from_plain_slab(&plaintext, pointer.slab_id)?;
+			if payload_tenant_id != tenant_id {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"encrypted tiered slab footer tenant {} does not match payload tenant {} for slab {}",
+						tenant_id.get(),
+						payload_tenant_id.get(),
+						pointer.slab_id,
+					),
+				));
+			}
+			Ok(plaintext)
+		}
+		None => Ok(blob.to_vec()),
+	}
+}
+
 fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::Result<Vec<u8>> {
 	let offset = location.offset as usize;
 	let length = location.length as usize;
@@ -1860,11 +1954,38 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 	Ok(blob[offset + header_size..end].to_vec())
 }
 
-fn slab_path(dir: &Path, slab_id: u64) -> PathBuf {
+fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
+	let mut entries = recover_slab_entries_from_blob(blob, slab_id)?.into_iter();
+	let Some((tenant_id, _, _)) = entries.next() else {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"sealed slab {} does not contain any committed records; W4 tiered encryption requires non-empty single-tenant slabs",
+				slab_id
+			),
+		));
+	};
+	for (other_tenant_id, _, _) in entries {
+		if other_tenant_id != tenant_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"sealed slab {} contains multiple tenants ({} and {}); W4 tiered encryption requires single-tenant slabs until W5 lands tenant-scoped active slabs",
+					slab_id,
+					tenant_id.get(),
+					other_tenant_id.get(),
+				),
+			));
+		}
+	}
+	Ok(tenant_id)
+}
+
+fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd", slab_id))
 }
 
-fn rehydrate_tmp_path(dir: &Path, slab_id: u64) -> PathBuf {
+fn rehydrate_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.rehydrate.tmp", slab_id))
 }
 
@@ -1893,17 +2014,20 @@ async fn unlink_local_file(file_ops: &dyn AsyncFileOps, path: &Path) -> std::io:
 /// Returns `None` for anything that does not match so the scan can
 /// silently skip unrelated files — operators may reasonably drop
 /// things like `.DS_Store` or log files into the directory.
-fn parse_slab_filename(name: &str) -> Option<u64> {
+fn parse_slab_filename(name: &str) -> Option<SlabId> {
 	let rest = name.strip_prefix("slab_")?.strip_suffix(".wnd")?;
 	if rest.len() != 16 {
 		return None;
 	}
-	u64::from_str_radix(rest, 16).ok()
+	u64::from_str_radix(rest, 16).ok().map(SlabId::new)
 }
 
 /// Enumerate every `slab_<hex>.wnd` file in `dir` and return their
 /// ids. Non-matching entries are ignored; I/O errors propagate.
-async fn discover_slab_ids(file_ops: &dyn AsyncFileOps, dir: &Path) -> std::io::Result<Vec<u64>> {
+async fn discover_slab_ids(
+	file_ops: &dyn AsyncFileOps,
+	dir: &Path,
+) -> std::io::Result<Vec<SlabId>> {
 	let mut ids = Vec::new();
 	for entry in file_ops.read_dir(dir).await? {
 		if !entry.is_file {
@@ -1944,6 +2068,7 @@ fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<Re
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::crypto::CryptoManager;
 	use crate::schema::NodeId;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
@@ -1976,6 +2101,12 @@ mod tests {
 		TenantId::ZERO
 	}
 
+	fn test_crypto() -> Arc<CryptoManager> {
+		let crypto = Arc::new(CryptoManager::new_dev());
+		crypto.install_local_only_for_tests(tenant()).unwrap();
+		crypto
+	}
+
 	async fn fresh_manager() -> Arc<SlabManager> {
 		fresh_manager_with_group_commit(GroupCommitConfig::default()).await
 	}
@@ -1995,13 +2126,14 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				group_commit,
+				crypto: test_crypto(),
 			})
 			.await
 			.unwrap(),
 		)
 	}
 
-	async fn force_seal_active(manager: &Arc<SlabManager>) -> u64 {
+	async fn force_seal_active(manager: &Arc<SlabManager>) -> SlabId {
 		let mut state = manager.state.lock().await;
 		let sealed = state.active.clone();
 		let sealed_id = sealed.slab_id();
@@ -2018,7 +2150,7 @@ mod tests {
 		);
 		state.active = next;
 		state.sealed.insert(sealed_id, sealed);
-		state.next_slab_id = next_id + 1;
+		state.next_slab_id = next_id.saturating_add(1);
 		sealed_id
 	}
 
@@ -2032,6 +2164,56 @@ mod tests {
 
 		let latest = mgr.lookup(tenant(), key).expect("key present");
 		assert_eq!(latest.hlc.physical_ms, 30);
+	}
+
+	#[tokio::test]
+	async fn encrypt_tiered_object_blob_rejects_empty_plain_slab() {
+		let mgr = fresh_manager().await;
+		let err = mgr
+			.encrypt_tiered_object_blob(SlabId::new(77), &[])
+			.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
+		assert!(
+			err.to_string()
+				.contains("does not contain any committed records"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn decode_tiered_blob_rejects_footer_tenant_mismatch_with_payload_tenant() {
+		let mgr = fresh_manager().await;
+		let key = id(0xfeed);
+		mgr.append(tenant(), key, hlc(10), b"tenant-bound payload")
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let plaintext = mgr.read_sealed_raw(slab_id).await.unwrap();
+
+		let mismatched_tenant = TenantId::new(17);
+		mgr.config
+			.crypto
+			.install_local_only_for_tests(mismatched_tenant)
+			.unwrap();
+		let encrypted = mgr
+			.config
+			.crypto
+			.encrypt_tiered_slab(slab_id, mismatched_tenant, &plaintext)
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: format!("memory://tiered/{slab_id:016x}"),
+			payload_hash: *blake3::hash(&encrypted.bytes).as_bytes(),
+			is_encrypted: true,
+		};
+
+		let err =
+			decode_tiered_blob(mgr.config.crypto.as_ref(), &pointer, &encrypted.bytes).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string().contains("footer tenant"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[tokio::test]
@@ -2233,6 +2415,7 @@ mod tests {
 			l2: Some(l2.clone()),
 			rehydration: RehydrationPolicy::default(),
 			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap();
@@ -2263,6 +2446,7 @@ mod tests {
 				slab_id: sealed_id,
 				l2_uri: uri,
 				payload_hash,
+				is_encrypted: true,
 			})
 			.await
 			.unwrap();
@@ -2281,6 +2465,7 @@ mod tests {
 			l2: Some(l2),
 			rehydration: RehydrationPolicy::default(),
 			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap();
@@ -2305,6 +2490,7 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
 			})
 			.await
 			.unwrap(),
@@ -2368,6 +2554,7 @@ mod tests {
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
 			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap();

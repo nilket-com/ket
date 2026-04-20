@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use wendelon::consensus::{TierObserver, WendelonStateMachine};
+use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::metrics::exporter;
 use wendelon::network::traits::DataRing;
 use wendelon::node::LEASE_TTL_MS;
@@ -37,6 +38,10 @@ fn id(locality: u64) -> Identity {
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
+}
+
+fn test_crypto() -> Arc<CryptoManager> {
+	Arc::new(test_support::seeded_dev_crypto_manager(tenant()).unwrap())
 }
 
 fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
@@ -175,6 +180,7 @@ async fn build_manager_with_sealed_slabs(
 			l2: Some(l2),
 			rehydration: wendelon::storage::manager::RehydrationPolicy::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap(),
@@ -247,6 +253,7 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: "metrics/".into(),
+			max_plaintext_rewrites_per_pass: 1,
 		},
 	);
 	let report = sweeper.sweep_once().await.unwrap();

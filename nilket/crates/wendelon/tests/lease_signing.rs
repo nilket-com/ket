@@ -93,6 +93,8 @@ fn bootstrap_cfg(
 		trusted_transfer_signers,
 		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
+		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
+		crypto_cache: wendelon::crypto::CryptoCacheConfig::default(),
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),
 		transport_tls: None,
 		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,

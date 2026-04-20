@@ -47,6 +47,17 @@ jobs:
       - name: W1 strace metadata sync check
         run: bash ci/check_w1_wal_metadata_sync_strace.sh
 
+  fips-symbol-sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ensure clang and binutils are present
+        run: sudo apt-get update && sudo apt-get install -y clang binutils
+      - name: W4 FIPS symbol sweep
+        run: bash ci/check_w4_fips_symbol_sweep.sh
+
   dependency-policy:
     runs-on: ubuntu-latest
     steps:

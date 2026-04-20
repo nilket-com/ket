@@ -1,4 +1,4 @@
-use crate::schema::{HybridTimestamp, Identity, TenantId};
+use crate::schema::{HybridTimestamp, Identity, SlabId, TenantId};
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -9,13 +9,24 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const RECORDS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slab_records_v1");
-const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v1");
+/// V1 layout: `payload_hash[32] || l2_uri_utf8`. Pre-W4 — no
+/// `is_encrypted` byte. Read-only; one-shot migrated into V2 the
+/// first time a process opens an index that still has V1 rows.
+const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v1");
+/// V2 layout: `payload_hash[32] || flags_byte || l2_uri_utf8`. The
+/// flags byte is bit 0 = `is_encrypted`. Higher bits reserved as
+/// zero so a future flag (e.g., compression) can land without
+/// another table bump.
+const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v2");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 
 const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
 const RECORD_VALUE_LEN: usize = 4;
 const TIERED_POINTER_HASH_LEN: usize = 32;
+const TIERED_POINTER_FLAGS_LEN: usize = 1;
+const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
+const TIERED_FLAG_IS_ENCRYPTED: u8 = 0b0000_0001;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -36,7 +47,7 @@ pub(crate) struct PersistentIndexUpdate {
 	pub put_records: Vec<PersistentRecordRow>,
 	pub delete_records: Vec<PersistentRecordRow>,
 	pub put_tiered_slabs: Vec<TieredSlabPointer>,
-	pub delete_tiered_slab_ids: Vec<u64>,
+	pub delete_tiered_slab_ids: Vec<SlabId>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -64,6 +75,40 @@ impl PersistentLocalIndex {
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			}
+			// One-shot v1 → v2 migration. Every v1 row becomes a v2
+			// row with `is_encrypted = false`; the rewrite sweeper
+			// will then GET, encrypt, and stamp the truth back. v1
+			// is left in place but unused — operators can drop it
+			// in a later release once every cluster has cycled.
+			let mut migrated_keys: Vec<u64> = Vec::new();
+			{
+				let v1 = write_txn
+					.open_table(TIERED_SLABS_TABLE_V1)
+					.map_err(redb_to_io)?;
+				let mut v2 = write_txn
+					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?;
+				for entry in v1.iter().map_err(redb_to_io)? {
+					let (slab_id_key, value) = entry.map_err(redb_to_io)?;
+					let slab_id = SlabId::new(slab_id_key.value());
+					if v2.get(&slab_id.get()).map_err(redb_to_io)?.is_some() {
+						continue;
+					}
+					let pointer = decode_tiered_pointer_v1(slab_id, value.value())?;
+					let encoded = encode_tiered_pointer(&pointer);
+					v2.insert(&slab_id.get(), encoded.as_slice())
+						.map_err(redb_to_io)?;
+					migrated_keys.push(slab_id.get());
+				}
+			}
+			if !migrated_keys.is_empty() {
+				let mut v1 = write_txn
+					.open_table(TIERED_SLABS_TABLE_V1)
+					.map_err(redb_to_io)?;
+				for key in migrated_keys {
+					let _ = v1.remove(&key).map_err(redb_to_io)?;
+				}
+			}
 			write_txn.commit().map_err(redb_to_io)
 		})
 		.await?;
@@ -84,7 +129,7 @@ impl PersistentLocalIndex {
 			let mut tiered_ids = HashSet::new();
 			for entry in tiered_table.iter().map_err(redb_to_io)? {
 				let (slab_id, value) = entry.map_err(redb_to_io)?;
-				let pointer = decode_tiered_pointer(slab_id.value(), value.value())?;
+				let pointer = decode_tiered_pointer(SlabId::new(slab_id.value()), value.value())?;
 				tiered_ids.insert(pointer.slab_id);
 				tiered_slabs.push(pointer);
 			}
@@ -142,7 +187,7 @@ impl PersistentLocalIndex {
 				for pointer in tiered_slabs {
 					let value = encode_tiered_pointer(&pointer);
 					table
-						.insert(&pointer.slab_id, value.as_slice())
+						.insert(&pointer.slab_id.get(), value.as_slice())
 						.map_err(redb_to_io)?;
 				}
 			}
@@ -180,12 +225,12 @@ impl PersistentLocalIndex {
 					.open_table(TIERED_SLABS_TABLE)
 					.map_err(redb_to_io)?;
 				for slab_id in update.delete_tiered_slab_ids {
-					let _ = table.remove(&slab_id).map_err(redb_to_io)?;
+					let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
 				}
 				for pointer in update.put_tiered_slabs {
 					let value = encode_tiered_pointer(&pointer);
 					table
-						.insert(&pointer.slab_id, value.as_slice())
+						.insert(&pointer.slab_id.get(), value.as_slice())
 						.map_err(redb_to_io)?;
 				}
 			}
@@ -260,7 +305,7 @@ fn encode_record_key(row: PersistentRecordRow) -> [u8; RECORD_KEY_LEN] {
 	cursor += 4;
 	bytes[cursor..cursor + 4].copy_from_slice(&row.location.hlc.node_id.to_le_bytes());
 	cursor += 4;
-	bytes[cursor..cursor + 8].copy_from_slice(&row.location.slab_id.to_le_bytes());
+	bytes[cursor..cursor + 8].copy_from_slice(&row.location.slab_id.get().to_le_bytes());
 	cursor += 8;
 	bytes[cursor..cursor + 8].copy_from_slice(&row.location.offset.to_le_bytes());
 	bytes
@@ -304,7 +349,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		tenant_id,
 		key_identity,
 		location: RecordLocation {
-			slab_id,
+			slab_id: SlabId::new(slab_id),
 			offset,
 			length,
 			hlc: HybridTimestamp {
@@ -317,25 +362,32 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 }
 
 fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
-	let mut bytes = Vec::with_capacity(TIERED_POINTER_HASH_LEN + pointer.l2_uri.len());
+	let mut bytes = Vec::with_capacity(TIERED_POINTER_PREFIX_LEN + pointer.l2_uri.len());
 	bytes.extend_from_slice(&pointer.payload_hash);
+	let mut flags = 0u8;
+	if pointer.is_encrypted {
+		flags |= TIERED_FLAG_IS_ENCRYPTED;
+	}
+	bytes.push(flags);
 	bytes.extend_from_slice(pointer.l2_uri.as_bytes());
 	bytes
 }
 
-fn decode_tiered_pointer(slab_id: u64, value: &[u8]) -> std::io::Result<TieredSlabPointer> {
-	if value.len() < TIERED_POINTER_HASH_LEN {
+fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<TieredSlabPointer> {
+	if value.len() < TIERED_POINTER_PREFIX_LEN {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"tiered slab value too short: expected at least {TIERED_POINTER_HASH_LEN}, got {}",
+				"tiered slab value too short: expected at least {TIERED_POINTER_PREFIX_LEN}, got {}",
 				value.len()
 			),
 		));
 	}
 	let mut payload_hash = [0u8; TIERED_POINTER_HASH_LEN];
 	payload_hash.copy_from_slice(&value[..TIERED_POINTER_HASH_LEN]);
-	let l2_uri = std::str::from_utf8(&value[TIERED_POINTER_HASH_LEN..])
+	let flags = value[TIERED_POINTER_HASH_LEN];
+	let is_encrypted = (flags & TIERED_FLAG_IS_ENCRYPTED) != 0;
+	let l2_uri = std::str::from_utf8(&value[TIERED_POINTER_PREFIX_LEN..])
 		.map_err(|err| {
 			Error::new(
 				ErrorKind::InvalidData,
@@ -347,6 +399,41 @@ fn decode_tiered_pointer(slab_id: u64, value: &[u8]) -> std::io::Result<TieredSl
 		slab_id,
 		l2_uri,
 		payload_hash,
+		is_encrypted,
+	})
+}
+
+/// Decode a v1 (pre-W4) tiered pointer record. v1 lacked the
+/// `flags_byte`, so any pointer recovered from v1 defaults to
+/// `is_encrypted = false`. The plaintext-rewrite sweeper will
+/// GET each one, encrypt it, and stamp `is_encrypted = true`
+/// back through the v2 table on the next pass — converging on the
+/// steady-state short-circuit.
+fn decode_tiered_pointer_v1(slab_id: SlabId, value: &[u8]) -> std::io::Result<TieredSlabPointer> {
+	if value.len() < TIERED_POINTER_HASH_LEN {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"v1 tiered slab value too short: expected at least {TIERED_POINTER_HASH_LEN}, got {}",
+				value.len()
+			),
+		));
+	}
+	let mut payload_hash = [0u8; TIERED_POINTER_HASH_LEN];
+	payload_hash.copy_from_slice(&value[..TIERED_POINTER_HASH_LEN]);
+	let l2_uri = std::str::from_utf8(&value[TIERED_POINTER_HASH_LEN..])
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("v1 tiered slab URI is not utf8: {err}"),
+			)
+		})?
+		.to_string();
+	Ok(TieredSlabPointer {
+		slab_id,
+		l2_uri,
+		payload_hash,
+		is_encrypted: false,
 	})
 }
 
@@ -403,7 +490,7 @@ mod tests {
 			tenant_id: TenantId::new(7),
 			key_identity: Identity::blake3(b"row-key"),
 			location: RecordLocation {
-				slab_id: 9,
+				slab_id: SlabId::new(9),
 				offset: 128,
 				length: 4096,
 				hlc: HybridTimestamp {
@@ -427,13 +514,25 @@ mod tests {
 	#[test]
 	fn tiered_pointer_roundtrip_preserves_every_field() {
 		let pointer = TieredSlabPointer {
-			slab_id: 3,
+			slab_id: SlabId::new(3),
 			l2_uri: "file:///tmp/example".into(),
 			payload_hash: [0xAB; 32],
+			is_encrypted: true,
 		};
 		let encoded = encode_tiered_pointer(&pointer);
 		let decoded = decode_tiered_pointer(pointer.slab_id, &encoded).unwrap();
 		assert_eq!(decoded, pointer);
+	}
+
+	#[test]
+	fn tiered_pointer_v1_decode_defaults_to_plaintext() {
+		let mut v1 = Vec::new();
+		v1.extend_from_slice(&[0xCD; 32]);
+		v1.extend_from_slice(b"file:///tmp/legacy");
+		let decoded = decode_tiered_pointer_v1(SlabId::new(7), &v1).unwrap();
+		assert!(!decoded.is_encrypted);
+		assert_eq!(decoded.payload_hash, [0xCD; 32]);
+		assert_eq!(decoded.l2_uri, "file:///tmp/legacy");
 	}
 
 	#[tokio::test]
@@ -442,13 +541,14 @@ mod tests {
 			.await
 			.unwrap();
 		let tiered_pointer = TieredSlabPointer {
-			slab_id: 41,
+			slab_id: SlabId::new(41),
 			l2_uri: "file:///tmp/tiered".into(),
 			payload_hash: [0x11; 32],
+			is_encrypted: true,
 		};
 		let local_row = PersistentRecordRow {
 			location: RecordLocation {
-				slab_id: 7,
+				slab_id: SlabId::new(7),
 				..row().location
 			},
 			..row()
@@ -480,9 +580,10 @@ mod tests {
 			.await
 			.unwrap();
 		let pointer = TieredSlabPointer {
-			slab_id: 9,
+			slab_id: SlabId::new(9),
 			l2_uri: "file:///tmp/tiered-watermark".into(),
 			payload_hash: [0x22; 32],
+			is_encrypted: true,
 		};
 
 		index

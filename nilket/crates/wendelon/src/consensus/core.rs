@@ -1,5 +1,6 @@
+use crate::crypto::InstallTenantKekVersion;
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta,
+	FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta, SlabId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,7 +16,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TieredSlab {
 	/// Identity of the slab that has been promoted to L2.
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	/// Opaque URI the L2 [`ObjectStore`] hands back from `put`.
 	/// Treated as an opaque string by the state machine — only
 	/// the read path interprets it.
@@ -26,6 +27,15 @@ pub struct TieredSlab {
 	/// path to detect bit-rot between L2 fetches and the sweeper's
 	/// original upload.
 	pub payload_hash: [u8; 32],
+	/// `true` when the L2 object at `l2_uri` carries the W4 envelope
+	/// footer. Lets the plaintext-rewrite sweeper short-circuit
+	/// without a GET on every pass once steady state is reached.
+	/// Trailing field with `#[serde(default)]` so pre-W4 Raft entries
+	/// deserialize as `false` (the safe, accurate classification —
+	/// the rewrite sweeper will GET and stamp the truth back through
+	/// a fresh `TierSlab` commit on the next pass).
+	#[serde(default)]
+	pub is_encrypted: bool,
 }
 
 /// The unified Node ID type used across Wendelon.
@@ -193,6 +203,13 @@ pub enum WendelonRequest {
 	/// replicas, and advances any descendant entries that were
 	/// sourcing from the now-superseded physical holder.
 	MigrationComplete(MigrationComplete),
+	/// Install a fresh Tenant KEK version and mark it active for
+	/// subsequent slab DEK wraps. Historical versions remain in the
+	/// state machine so pre-rotation slabs keep decrypting.
+	///
+	/// Keep this durable variant at the end of the enum so postcard
+	/// discriminants for pre-W4 variants remain upgrade-compatible.
+	InstallTenantKekVersion(InstallTenantKekVersion),
 }
 
 /// The response returned to the client after a Raft command is committed.
@@ -202,6 +219,9 @@ pub enum WendelonResponse {
 	Success,
 	/// The lease was denied because another node currently holds a valid lease.
 	LeaseDenied,
+	/// The command reached the state machine but was rejected by
+	/// semantic validation (for example a duplicate KEK id).
+	Error(String),
 }
 
 // The Wendelon implementation of the `openraft::RaftTypeConfig` trait.

@@ -52,9 +52,10 @@ use crate::consensus::{
 	MigrationLedgerEntry, MigrationState, SeedMigration, TieredSlab, WendelonRequest,
 	WendelonResponse, WendelonTypeConfig,
 };
+use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed,
-	SnapshotHeader, WALRecordHeader,
+	SlabId, SnapshotHeader, WALRecordHeader,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
@@ -1359,7 +1360,7 @@ pub struct SmState {
 	/// local `SlabManager` — are fired out-of-band when an entry
 	/// lands here so they can unlink the L1 file.
 	#[serde(default)]
-	pub tiered_slabs: HashMap<u64, TieredSlab>,
+	pub tiered_slabs: HashMap<SlabId, TieredSlab>,
 	/// Migration Ledger (Plan 019). Keyed by `migration_id` so
 	/// apply-time idempotency and chained-migration reconciliation
 	/// are both O(1). Entries never fall out of the map during
@@ -1375,6 +1376,36 @@ pub struct SmState {
 	/// Physical reclaim is deferred to tombstone-aware compaction.
 	#[serde(default)]
 	pub tombstones: Vec<MigratedRangeTombstone>,
+	/// Wrapped Tenant KEKs keyed by tenant. Historical versions are
+	/// retained so pre-rotation slabs keep decrypting while new slabs
+	/// wrap under the current active KEK version.
+	///
+	/// Keep this durable field at the end of the struct. Pre-W4
+	/// snapshots are decoded through an explicit legacy fallback;
+	/// keeping new fields trailing avoids mid-struct postcard
+	/// reorder hazards in future upgrades.
+	#[serde(default)]
+	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
+}
+
+/// Durable postcard compatibility mirror for snapshots produced
+/// before W4 appended `tenant_keysets` to [`SmState`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LegacySnapshotCompatState {
+	last_applied_log_id: Option<LogId<u32>>,
+	last_membership: StoredMembership<u32, BasicNode>,
+	#[serde(default)]
+	epoch_history: BTreeMap<u64, EpochConfig>,
+	leases: HashMap<u64, crate::schema::LeaseDescriptor>,
+	e_safe_watermarks: HashMap<u64, HybridTimestamp>,
+	#[serde(default)]
+	last_e_safe_index: u64,
+	#[serde(default)]
+	tiered_slabs: HashMap<SlabId, TieredSlab>,
+	#[serde(default)]
+	migrations: HashMap<u64, MigrationLedgerEntry>,
+	#[serde(default)]
+	tombstones: Vec<MigratedRangeTombstone>,
 }
 
 /// Out-of-band observer for [`TieredSlab`] apply events.
@@ -1389,6 +1420,20 @@ pub trait TierObserver: Send + Sync {
 		&self,
 		tier: &TieredSlab,
 		applied_log_index: u64,
+	) -> std::io::Result<()>;
+}
+
+#[async_trait::async_trait]
+pub trait TenantKekObserver: Send + Sync {
+	async fn on_tenant_kek_rotated(
+		&self,
+		rotation: &InstallTenantKekVersion,
+		applied_log_index: u64,
+	) -> std::io::Result<()>;
+
+	async fn sync_tenant_keysets(
+		&self,
+		snapshot: &HashMap<crate::schema::TenantId, TenantKeyset>,
 	) -> std::io::Result<()>;
 }
 
@@ -1747,32 +1792,6 @@ impl<W: Write> Write for HashingWriter<W> {
 	}
 }
 
-struct HashingReader<R> {
-	inner: R,
-	hasher: blake3::Hasher,
-}
-
-impl<R> HashingReader<R> {
-	fn new(inner: R) -> Self {
-		Self {
-			inner,
-			hasher: blake3::Hasher::new(),
-		}
-	}
-
-	fn finalize(self) -> (R, [u8; 32]) {
-		(self.inner, *self.hasher.finalize().as_bytes())
-	}
-}
-
-impl<R: Read> Read for HashingReader<R> {
-	fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		let read = self.inner.read(buf)?;
-		self.hasher.update(&buf[..read]);
-		Ok(read)
-	}
-}
-
 #[derive(Default)]
 struct SmInner {
 	state: SmState,
@@ -1797,6 +1816,9 @@ pub struct WendelonStateMachine {
 	/// payload lives in L2. `None` is fine for tests or for
 	/// non-data nodes that never hold a `SlabManager`.
 	tier_observer: Option<Arc<dyn TierObserver>>,
+	/// Optional callback fired when a Tenant KEK rotation lands in
+	/// the replicated state so local unwrap caches can converge.
+	tenant_kek_observer: Option<Arc<dyn TenantKekObserver>>,
 	/// Optional callback fired when committed apply progress should
 	/// be checkpointed into the WAL.
 	checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
@@ -1813,6 +1835,7 @@ impl WendelonStateMachine {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			tier_observer: None,
+			tenant_kek_observer: None,
 			checkpoint_observer: None,
 			audit_materializer: None,
 			finalization_events,
@@ -1870,6 +1893,7 @@ impl WendelonStateMachine {
 			inner: Arc::new(RwLock::new(inner)),
 			snapshot_runtime,
 			tier_observer: None,
+			tenant_kek_observer: None,
 			checkpoint_observer: None,
 			audit_materializer: None,
 			finalization_events,
@@ -1882,6 +1906,11 @@ impl WendelonStateMachine {
 	/// should reconstruct the SM instead.
 	pub fn with_tier_observer(mut self, observer: Arc<dyn TierObserver>) -> Self {
 		self.tier_observer = Some(observer);
+		self
+	}
+
+	pub fn with_tenant_kek_observer(mut self, observer: Arc<dyn TenantKekObserver>) -> Self {
+		self.tenant_kek_observer = Some(observer);
 		self
 	}
 
@@ -1977,11 +2006,22 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		// other entries in the batch.
 		let mut pending_audit_events: Vec<AuditEvent> = Vec::new();
 		let mut pending_tier_events: Vec<(TieredSlab, u64)> = Vec::new();
+		let mut pending_tenant_kek_events: Vec<(InstallTenantKekVersion, u64)> = Vec::new();
+		let mut pending_tenant_kek_snapshot: Option<
+			HashMap<crate::schema::TenantId, TenantKeyset>,
+		> = None;
 		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			for entry in entries {
+				let tenant_kek_rotation = match &entry.payload {
+					EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(rotation)) => {
+						Some(rotation.clone())
+					}
+					_ => None,
+				};
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
+				let tenant_kek_rotation_applied = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
 					Some(prev) if prev > entry.log_id => prev,
 					_ => entry.log_id,
@@ -1989,9 +2029,24 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				if let Some(t) = tier {
 					pending_tier_events.push((t, entry.log_id.index));
 				}
+				if let Some(rotation) = tenant_kek_rotation {
+					if tenant_kek_rotation_applied {
+						pending_tenant_kek_events.push((rotation, entry.log_id.index));
+						pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
+					}
+				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
-					if let Some(event) = raft_audit_event(materializer.local_node, &entry) {
-						pending_audit_events.push(event);
+					let emit_audit = !matches!(
+						(&entry.payload, &resp),
+						(
+							EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(_)),
+							WendelonResponse::Error(_)
+						)
+					);
+					if emit_audit {
+						if let Some(event) = raft_audit_event(materializer.local_node, &entry) {
+							pending_audit_events.push(event);
+						}
 					}
 				}
 				if let Some(marker) = canonical_finalization_marker(&entry) {
@@ -2014,9 +2069,33 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				// must not diverge on a local filesystem hiccup.
 				if let Err(e) = observer.on_slab_tiered(tier, *applied_log_index).await {
 					tracing::warn!(
-						slab_id = tier.slab_id,
+						slab_id = tier.slab_id.get(),
 						error = %e,
 						"tier observer failed; local L1 cleanup will retry on next sweep"
+					);
+				}
+			}
+		}
+		if let Some(observer) = self.tenant_kek_observer.as_ref() {
+			for (rotation, applied_log_index) in &pending_tenant_kek_events {
+				if let Err(err) = observer
+					.on_tenant_kek_rotated(rotation, *applied_log_index)
+					.await
+				{
+					tracing::warn!(
+						tenant_id = rotation.tenant_id.get(),
+						tenant_kek_id = rotation.tenant_kek_id.get(),
+						error = %err,
+						"tenant KEK observer incremental apply failed; reconciling from committed keyset snapshot"
+					);
+				}
+			}
+			if let Some(snapshot) = pending_tenant_kek_snapshot.as_ref() {
+				if let Err(err) = observer.sync_tenant_keysets(snapshot).await {
+					tracing::warn!(
+						tenants = snapshot.len(),
+						error = %err,
+						"tenant KEK observer snapshot sync failed; local crypto caches may remain stale until the next rotation or restart"
 					);
 				}
 			}
@@ -2252,6 +2331,18 @@ fn raft_audit_event(
 				format_epoch_peer_ids(&record.to),
 			),
 		)),
+		WendelonRequest::InstallTenantKekVersion(rotation) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"crypto.tenant_kek_rotated",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} tenant_kek_id={}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				rotation.tenant_id.get(),
+				rotation.tenant_kek_id,
+			),
+		)),
 		_ => None,
 	}
 }
@@ -2380,14 +2471,43 @@ fn apply_request(
 			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::TierSlab(tier) => {
-			// Idempotent: a replay must not fire the observer
-			// twice. The first insert wins; later apply passes
-			// return Success without a pending event.
-			if state.tiered_slabs.contains_key(&tier.slab_id) {
-				return (WendelonResponse::Success, None);
+			// Idempotent replays keep the existing mapping; pointer
+			// refreshes (for re-encryption or URI/hash repair) update
+			// the record in place and still notify the tier
+			// observer so runtime readers pick up the new pointer.
+			if let Some(existing) = state.tiered_slabs.get(&tier.slab_id) {
+				if existing == &tier {
+					return (WendelonResponse::Success, None);
+				}
+				state.tiered_slabs.insert(tier.slab_id, tier.clone());
+				return (WendelonResponse::Success, Some(tier));
 			}
 			state.tiered_slabs.insert(tier.slab_id, tier.clone());
 			(WendelonResponse::Success, Some(tier))
+		}
+		WendelonRequest::InstallTenantKekVersion(rotation) => {
+			let keyset = state.tenant_keysets.entry(rotation.tenant_id).or_default();
+			match keyset.keys.entry(rotation.tenant_kek_id) {
+				std::collections::btree_map::Entry::Occupied(existing) => {
+					if existing.get().wrapped_key != rotation.wrapped_tenant_kek {
+						return (
+							WendelonResponse::Error(format!(
+								"tenant {} tenant_kek_id {} already exists with different wrapped key bytes",
+								rotation.tenant_id.get(),
+								rotation.tenant_kek_id
+							)),
+							None,
+						);
+					}
+				}
+				std::collections::btree_map::Entry::Vacant(slot) => {
+					slot.insert(crate::crypto::WrappedTenantKek {
+						wrapped_key: rotation.wrapped_tenant_kek,
+					});
+				}
+			}
+			keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
+			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::SeedMigration(seed) => {
 			apply_seed_migration(state, seed);
@@ -3309,6 +3429,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(_)) => {
+			(LogEntryKind::APPEND, 0)
+		}
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
 			(LogEntryKind::APPEND, s.entry.to_epoch)
 		}
@@ -3533,25 +3656,50 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 			header.cache_checkpoint_len
 		));
 	}
-	let mut scratch = [0u8; 8 * 1024];
-	let reader = HashingReader::new(reader);
-	let (state, (reader, _scratch)) = postcard::from_io((reader, scratch.as_mut_slice()))
-		.map_err(|err| format!("snapshot postcard decode: {err}"))?;
-	let (mut reader, actual_hash) = reader.finalize();
+	let mut body = Vec::new();
+	reader
+		.read_to_end(&mut body)
+		.map_err(|err| format!("snapshot body read: {err}"))?;
+	let actual_hash = blake3_32(&body);
 	if actual_hash != header.state_sha256 {
 		return Err(format!(
 			"snapshot body hash mismatch: expected {:02x?}, got {:02x?}",
 			header.state_sha256, actual_hash
 		));
 	}
-	let mut trailing = [0u8; 1];
-	let trailing_len = reader
-		.read(&mut trailing)
-		.map_err(|err| format!("snapshot trailing-byte read: {err}"))?;
-	if trailing_len != 0 {
-		return Err("snapshot has unexpected trailing bytes".into());
-	}
+	let state = decode_snapshot_state_bytes(&body)?;
 	Ok((header, state))
+}
+
+fn decode_snapshot_state_bytes(body: &[u8]) -> Result<SmState, String> {
+	match postcard::take_from_bytes::<SmState>(body) {
+		Ok((state, [])) => Ok(state),
+		Ok((_state, trailing)) => Err(format!(
+			"snapshot has unexpected trailing bytes: {}",
+			trailing.len()
+		)),
+		Err(current_err) => match postcard::take_from_bytes::<LegacySnapshotCompatState>(body) {
+			Ok((legacy, [])) => Ok(SmState {
+				last_applied_log_id: legacy.last_applied_log_id,
+				last_membership: legacy.last_membership,
+				epoch_history: legacy.epoch_history,
+				leases: legacy.leases,
+				e_safe_watermarks: legacy.e_safe_watermarks,
+				last_e_safe_index: legacy.last_e_safe_index,
+				tiered_slabs: legacy.tiered_slabs,
+				migrations: legacy.migrations,
+				tombstones: legacy.tombstones,
+				tenant_keysets: HashMap::new(),
+			}),
+			Ok((_legacy, trailing)) => Err(format!(
+				"snapshot has unexpected trailing bytes after legacy decode: {}",
+				trailing.len()
+			)),
+			Err(legacy_err) => Err(format!(
+				"snapshot postcard decode failed for current schema ({current_err}) and legacy pre-W4 schema ({legacy_err})"
+			)),
+		},
+	}
 }
 
 async fn spawn_blocking_snapshot_io<T, F>(f: F) -> std::io::Result<T>
@@ -3614,19 +3762,66 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 mod recovery_tests {
 	use super::*;
-	use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId};
+	use crate::schema::{
+		FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId, ReleaseLeaseRequestMeta,
+		TenantId,
+	};
 	use crate::storage::{
 		AlignedBuf, AsyncFileOps, BlockingFileOps, DirectoryEntry, FaultAction, FaultOp,
 		FaultyFileOps, FileHandle, InjectedFault, OpenFlags,
 	};
 	use openraft::Vote;
 	use openraft::storage::{RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
+	use serde::{Deserialize, Serialize};
+	use std::collections::{BTreeMap, HashMap};
 	use std::fs::OpenOptions;
 	use std::io::Write;
 	use std::path::PathBuf;
 	use std::sync::{Arc, Mutex};
 	use std::time::Duration;
 	use tokio::sync::Notify;
+
+	#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+	pub enum LegacyWendelonRequest {
+		Finalize(FinalizationMarker),
+		AcquireLease(LeaseDescriptor),
+		ReleaseLease(ReleaseLeaseRequestMeta),
+		AdvanceEpoch(AdvanceEpochRecord),
+		#[serde(with = "serde_bytes")]
+		SchemaUpdate(Vec<u8>),
+		TierSlab(TieredSlab),
+		SeedMigration(SeedMigration),
+		MigrationComplete(MigrationComplete),
+	}
+
+	openraft::declare_raft_types!(
+		pub LegacyCompatTypeConfig:
+			D = LegacyWendelonRequest,
+			R = WendelonResponse,
+			NodeId = u32,
+			Node = openraft::BasicNode,
+			Entry = openraft::Entry<LegacyCompatTypeConfig>,
+			SnapshotData = SnapshotDataFile,
+			AsyncRuntime = openraft::TokioRuntime,
+	);
+
+	#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+	pub struct LegacySmState {
+		last_applied_log_id: Option<LogId<u32>>,
+		last_membership: StoredMembership<u32, BasicNode>,
+		#[serde(default)]
+		epoch_history: BTreeMap<u64, EpochConfig>,
+		leases: HashMap<u64, crate::schema::LeaseDescriptor>,
+		e_safe_watermarks: HashMap<u64, HybridTimestamp>,
+		#[serde(default)]
+		last_e_safe_index: u64,
+		#[serde(default)]
+		tiered_slabs: HashMap<SlabId, TieredSlab>,
+		#[serde(default)]
+		migrations: HashMap<u64, MigrationLedgerEntry>,
+		#[serde(default)]
+		tombstones: Vec<MigratedRangeTombstone>,
+	}
 
 	fn tempdir(tag: &str) -> PathBuf {
 		let dir = std::env::temp_dir().join(format!(
@@ -3714,6 +3909,56 @@ mod recovery_tests {
 				_pad: [0; 7],
 			})),
 		}
+	}
+
+	fn legacy_seed_migration_entry(
+		index: u64,
+		seed: SeedMigration,
+	) -> Entry<LegacyCompatTypeConfig> {
+		Entry {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Normal(LegacyWendelonRequest::SeedMigration(seed)),
+		}
+	}
+
+	fn encode_legacy_entry_record(
+		entry: &Entry<LegacyCompatTypeConfig>,
+	) -> (WALRecordHeader, Vec<u8>) {
+		let payload = postcard::to_allocvec(entry).unwrap();
+		let seed = match &entry.payload {
+			EntryPayload::Normal(LegacyWendelonRequest::SeedMigration(seed)) => seed,
+			other => panic!("unexpected legacy entry payload for compat test: {other:?}"),
+		};
+		let fixed = RaftLogEntryFixed {
+			kind: LogEntryKind::APPEND,
+			_pad1: [0; 7],
+			term: entry.log_id.leader_id.term,
+			index: entry.log_id.index,
+			epoch: seed.entry.to_epoch,
+			leader: SchemaNodeId {
+				id: entry.log_id.leader_id.node_id,
+				_reserved: 0,
+			},
+			entry_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: entry.log_id.leader_id.node_id,
+			},
+			payload_len: payload.len() as u32,
+			_pad2: [0; 4],
+			payload_hash: blake3_32(&payload),
+		};
+		let header = WALRecordHeader {
+			record_type: REC_LOG_ENTRY,
+			_pad1: [0; 7],
+			body_len: (std::mem::size_of::<RaftLogEntryFixed>() + payload.len()) as u64,
+			log_index: entry.log_id.index,
+			term: entry.log_id.leader_id.term,
+		};
+		let mut body = Vec::with_capacity(std::mem::size_of::<RaftLogEntryFixed>() + payload.len());
+		body.extend_from_slice(bytemuck::bytes_of(&fixed));
+		body.extend_from_slice(&payload);
+		(header, body)
 	}
 
 	fn write_vote_file(path: &Path, vote: Vote<u32>) {
@@ -3998,6 +4243,160 @@ mod recovery_tests {
 		assert_eq!(snapshot.leases.len(), 1);
 	}
 
+	#[test]
+	fn decode_log_record_accepts_legacy_seed_migration_variant_order() {
+		let seed = SeedMigration {
+			entry: MigrationLedgerEntry {
+				migration_id: 77,
+				range_start: 10,
+				range_end: 19,
+				from_epoch: 1,
+				to_epoch: 2,
+				logical_owner: SchemaNodeId {
+					id: 3,
+					_reserved: 0,
+				},
+				upstream_migration_id: Some(41),
+				source_replicas: vec![
+					SchemaNodeId {
+						id: 7,
+						_reserved: 0,
+					},
+					SchemaNodeId {
+						id: 8,
+						_reserved: 0,
+					},
+				],
+				migration_hlc_floor: HybridTimestamp {
+					physical_ms: 111,
+					logical: 0,
+					node_id: 3,
+				},
+				state: MigrationState::Pending,
+				completed_by: None,
+				completed_at_hlc: None,
+			},
+		};
+		let legacy = legacy_seed_migration_entry(7, seed.clone());
+		let (header, body) = encode_legacy_entry_record(&legacy);
+
+		let decoded = decode_log_record(
+			Path::new("legacy-pre-w4-seed-migration.wal"),
+			0,
+			&header,
+			&body,
+			std::mem::size_of::<RaftLogEntryFixed>(),
+		)
+		.unwrap();
+
+		assert_eq!(decoded.log_id, legacy.log_id);
+		match decoded.payload {
+			EntryPayload::Normal(WendelonRequest::SeedMigration(decoded_seed)) => {
+				assert_eq!(decoded_seed, seed);
+			}
+			other => panic!("legacy SeedMigration decoded as wrong variant: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn decode_snapshot_reader_accepts_legacy_pre_w4_sm_state_order() {
+		let migration = MigrationLedgerEntry {
+			migration_id: 88,
+			range_start: 20,
+			range_end: 29,
+			from_epoch: 1,
+			to_epoch: 2,
+			logical_owner: SchemaNodeId {
+				id: 4,
+				_reserved: 0,
+			},
+			upstream_migration_id: Some(55),
+			source_replicas: vec![SchemaNodeId {
+				id: 6,
+				_reserved: 0,
+			}],
+			migration_hlc_floor: HybridTimestamp {
+				physical_ms: 222,
+				logical: 0,
+				node_id: 4,
+			},
+			state: MigrationState::Pending,
+			completed_by: None,
+			completed_at_hlc: None,
+		};
+		let tombstone = MigratedRangeTombstone {
+			migration_id: migration.migration_id,
+			range_start: migration.range_start,
+			range_end: migration.range_end,
+			to_epoch: migration.to_epoch,
+			completed_by: SchemaNodeId {
+				id: 9,
+				_reserved: 0,
+			},
+			migration_hlc_floor: HybridTimestamp {
+				physical_ms: 333,
+				logical: 0,
+				node_id: 9,
+			},
+		};
+		let tier = TieredSlab {
+			slab_id: SlabId::new(44),
+			l2_uri: "memory://legacy-tiered-44".into(),
+			payload_hash: [0x5a; 32],
+			is_encrypted: false,
+		};
+		let legacy = LegacySmState {
+			last_applied_log_id: Some(log_id(3, 12)),
+			last_membership: SmState::default().last_membership,
+			epoch_history: BTreeMap::from([(
+				2,
+				EpochConfig {
+					epoch: 2,
+					peers: BTreeMap::new(),
+				},
+			)]),
+			leases: HashMap::new(),
+			e_safe_watermarks: HashMap::new(),
+			last_e_safe_index: 12,
+			tiered_slabs: HashMap::from([(tier.slab_id, tier.clone())]),
+			migrations: HashMap::from([(migration.migration_id, migration.clone())]),
+			tombstones: vec![tombstone.clone()],
+		};
+		let body = postcard::to_allocvec(&legacy).unwrap();
+		let header = SnapshotHeader {
+			last_included_index: 12,
+			last_included_term: 3,
+			last_included_epoch: 0,
+			snapshot_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			state_sha256: blake3_32(&body),
+			cache_checkpoint_len: 0,
+			_pad: [0; 4],
+		};
+		let mut encoded = Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + body.len());
+		encoded.extend_from_slice(bytemuck::bytes_of(&header));
+		encoded.extend_from_slice(&body);
+
+		let (_decoded_header, state) =
+			decode_snapshot_reader(std::io::Cursor::new(encoded)).unwrap();
+
+		assert_eq!(state.last_applied_log_id, legacy.last_applied_log_id);
+		assert_eq!(state.last_e_safe_index, legacy.last_e_safe_index);
+		assert_eq!(state.tiered_slabs.get(&tier.slab_id), Some(&tier));
+		assert_eq!(
+			state.migrations.get(&migration.migration_id),
+			Some(&migration)
+		);
+		assert_eq!(state.tombstones.as_slice(), &[tombstone]);
+		assert!(
+			state.tenant_keysets.is_empty(),
+			"legacy pre-W4 snapshot must default tenant_keysets empty"
+		);
+	}
+
 	#[tokio::test]
 	async fn interior_corruption_fails_startup_loudly() {
 		let dir = tempdir("interior-corruption");
@@ -4162,6 +4561,144 @@ mod recovery_tests {
 		let state = reopened_sm.state_snapshot().await;
 		assert_eq!(state.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(state.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn tenant_keysets_survive_snapshot_reopen_and_presnapshot_slabs_still_decrypt() {
+		let dir = tempdir("snapshot-tenant-keysets");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		let crypto = crate::crypto::test_support::persistent_dev_crypto_manager(&dir).unwrap();
+
+		let first = crypto.prepare_rotation(TenantId::ZERO).unwrap();
+		crypto.apply_rotation(&first).unwrap();
+		let encrypted = crypto
+			.encrypt_tiered_slab(SlabId::new(42), TenantId::ZERO, b"before-snapshot")
+			.unwrap();
+		let second = crypto.prepare_rotation(TenantId::ZERO).unwrap();
+
+		append_and_apply(
+			&mut store,
+			&mut sm,
+			Entry {
+				log_id: log_id(1, 1),
+				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
+					first.clone(),
+				)),
+			},
+		)
+		.await;
+		append_and_apply(
+			&mut store,
+			&mut sm,
+			Entry {
+				log_id: log_id(1, 2),
+				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
+					second.clone(),
+				)),
+			},
+		)
+		.await;
+
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut sm,
+			)
+			.await;
+		builder.build_snapshot().await.unwrap();
+
+		let reopened = open_store(&dir).await;
+		let reopened_sm = reopened.recovered_state_machine().await.unwrap();
+		let state = reopened_sm.state_snapshot().await;
+		let keyset = state
+			.tenant_keysets
+			.get(&TenantId::ZERO)
+			.expect("tenant keyset must survive snapshot reopen");
+		assert_eq!(keyset.active_tenant_kek_id, Some(second.tenant_kek_id));
+		assert_eq!(keyset.keys.len(), 2);
+		assert!(keyset.keys.contains_key(&first.tenant_kek_id));
+		assert!(keyset.keys.contains_key(&second.tenant_kek_id));
+
+		let recovered_crypto =
+			crate::crypto::test_support::persistent_dev_crypto_manager(&dir).unwrap();
+		recovered_crypto
+			.replace_keysets_from_authoritative_snapshot(&state.tenant_keysets)
+			.unwrap();
+		let decrypted = recovered_crypto
+			.decrypt_tiered_slab(SlabId::new(42), &encrypted.bytes)
+			.unwrap();
+		assert_eq!(decrypted.plaintext, b"before-snapshot");
+		assert_eq!(decrypted.tenant_kek_id, first.tenant_kek_id);
+	}
+
+	#[derive(Default)]
+	struct FlakyTenantKekObserver {
+		rotations: Mutex<Vec<(TenantId, crate::schema::TenantKekId)>>,
+		synced: Mutex<Option<HashMap<TenantId, TenantKeyset>>>,
+	}
+
+	#[async_trait::async_trait]
+	impl TenantKekObserver for FlakyTenantKekObserver {
+		async fn on_tenant_kek_rotated(
+			&self,
+			rotation: &InstallTenantKekVersion,
+			_applied_log_index: u64,
+		) -> std::io::Result<()> {
+			self.rotations
+				.lock()
+				.unwrap()
+				.push((rotation.tenant_id, rotation.tenant_kek_id));
+			Err(Error::other("injected tenant KEK observer failure"))
+		}
+
+		async fn sync_tenant_keysets(
+			&self,
+			snapshot: &HashMap<TenantId, TenantKeyset>,
+		) -> std::io::Result<()> {
+			*self.synced.lock().unwrap() = Some(snapshot.clone());
+			Ok(())
+		}
+	}
+
+	#[tokio::test]
+	async fn tenant_kek_observer_failure_reconciles_from_snapshot_sync() {
+		let dir = tempdir("tenant-kek-observer-sync");
+		let observer = Arc::new(FlakyTenantKekObserver::default());
+		let mut store = open_store(&dir).await;
+		let mut sm = store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.with_tenant_kek_observer(observer.clone());
+		let crypto = crate::crypto::CryptoManager::new_dev();
+		let rotation = crypto.prepare_rotation(TenantId::ZERO).unwrap();
+
+		append_and_apply(
+			&mut store,
+			&mut sm,
+			Entry {
+				log_id: log_id(1, 1),
+				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
+					rotation.clone(),
+				)),
+			},
+		)
+		.await;
+
+		assert_eq!(
+			observer.rotations.lock().unwrap().as_slice(),
+			&[(TenantId::ZERO, rotation.tenant_kek_id)]
+		);
+		let synced = observer
+			.synced
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("snapshot sync must run after observer failure");
+		assert_eq!(
+			synced.get(&TenantId::ZERO).unwrap().active_tenant_kek_id,
+			Some(rotation.tenant_kek_id)
+		);
 	}
 
 	#[tokio::test]
@@ -5169,6 +5706,55 @@ mod migration_tests {
 			ids,
 			vec![7, 3, 4],
 			"overlap-only case must prepend completed_by, not replace"
+		);
+	}
+}
+
+#[cfg(test)]
+mod tenant_kek_tests {
+	use super::*;
+	use crate::schema::{TenantId, TenantKekId};
+
+	#[test]
+	fn rotate_tenant_kek_rejects_conflicting_duplicate_ids() {
+		let mut state = SmState::default();
+		let first = InstallTenantKekVersion {
+			tenant_id: TenantId::ZERO,
+			tenant_kek_id: TenantKekId::try_from(7).unwrap(),
+			wrapped_tenant_kek: vec![1; 40],
+		};
+		let second = InstallTenantKekVersion {
+			tenant_id: TenantId::ZERO,
+			tenant_kek_id: TenantKekId::try_from(7).unwrap(),
+			wrapped_tenant_kek: vec![2; 40],
+		};
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::InstallTenantKekVersion(first.clone()),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+
+		let (resp, _) = apply_request(&mut state, WendelonRequest::InstallTenantKekVersion(second));
+		match resp {
+			WendelonResponse::Error(message) => {
+				assert!(message.contains("tenant_kek_id 7"));
+			}
+			other => panic!("expected duplicate tenant KEK id rejection, got {other:?}"),
+		}
+
+		let keyset = state.tenant_keysets.get(&TenantId::ZERO).unwrap();
+		assert_eq!(
+			keyset.active_tenant_kek_id,
+			Some(TenantKekId::try_from(7).unwrap())
+		);
+		assert_eq!(
+			keyset
+				.keys
+				.get(&TenantKekId::try_from(7).unwrap())
+				.unwrap()
+				.wrapped_key,
+			first.wrapped_tenant_kek
 		);
 	}
 }

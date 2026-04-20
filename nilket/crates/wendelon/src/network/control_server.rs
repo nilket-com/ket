@@ -262,6 +262,7 @@ impl WendelonControlServer {
 					return self.lease_response(&frame, LeaseStatus::GRANTED, Some(&lease));
 				}
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_OVERLAP,
+				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
 			Err(_) => LeaseStatus::INTERNAL_ERROR,
@@ -297,6 +298,7 @@ impl WendelonControlServer {
 			Ok(resp) => match resp.data {
 				WendelonResponse::Success => LeaseStatus::GRANTED,
 				WendelonResponse::LeaseDenied => LeaseStatus::DENIED_INVALID_TARGET,
+				WendelonResponse::Error(_) => LeaseStatus::INTERNAL_ERROR,
 			},
 			Err(_) if !self.is_leader().await => LeaseStatus::DENIED_NOT_LEADER,
 			Err(_) => LeaseStatus::INTERNAL_ERROR,

@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU64;
 
 /// Defines a newtype wrapper for a primitive, implementing common traits and
 /// ensuring type safety across the Unified Ring.
@@ -38,6 +39,18 @@ macro_rules! impl_unit {
 		impl fmt::Display for $name {
 			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 				self.0.fmt(f)
+			}
+		}
+
+		impl fmt::LowerHex for $name {
+			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+				fmt::LowerHex::fmt(&self.0, f)
+			}
+		}
+
+		impl fmt::UpperHex for $name {
+			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+				fmt::UpperHex::fmt(&self.0, f)
 			}
 		}
 
@@ -211,6 +224,60 @@ impl_unit!(SlabId, u64);
 impl_unit!(LogIndex, u64);
 impl_unit!(Epoch, u64);
 impl_unit!(TenantId, u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct TenantKekId(NonZeroU64);
+
+impl TenantKekId {
+	pub const fn new(value: NonZeroU64) -> Self {
+		Self(value)
+	}
+
+	pub const fn try_new(value: u64) -> Option<Self> {
+		match NonZeroU64::new(value) {
+			Some(value) => Some(Self(value)),
+			None => None,
+		}
+	}
+
+	pub const fn get(self) -> u64 {
+		self.0.get()
+	}
+}
+
+impl fmt::Display for TenantKekId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		self.get().fmt(f)
+	}
+}
+
+impl fmt::LowerHex for TenantKekId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::LowerHex::fmt(&self.get(), f)
+	}
+}
+
+impl fmt::UpperHex for TenantKekId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		fmt::UpperHex::fmt(&self.get(), f)
+	}
+}
+
+impl TryFrom<u64> for TenantKekId {
+	type Error = &'static str;
+
+	fn try_from(value: u64) -> Result<Self, Self::Error> {
+		Self::try_new(value).ok_or("tenant KEK id must be non-zero")
+	}
+}
+
+impl From<TenantKekId> for u64 {
+	fn from(value: TenantKekId) -> Self {
+		value.get()
+	}
+}
 
 impl_unit!(
 	/// Raft term. Monotonically non-decreasing across leader elections.

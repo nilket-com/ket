@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 use wendelon::consensus::{WendelonLogStore, WendelonRequest};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
-use wendelon::schema::{DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, TenantId};
+use wendelon::schema::{
+	DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, SlabId, TenantId,
+};
 use wendelon::storage::{SlabManager, StorageEngine};
 
 fn tempdir(tag: &str) -> PathBuf {
@@ -108,7 +110,7 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 	assert!(control.manifest.wal_bytes > 0);
 	assert!(control.manifest.state_hash.iter().any(|byte| *byte != 0));
 	assert_eq!(storage.manifest.format_version, 1);
-	assert_eq!(storage.manifest.active_slab_id, 0);
+	assert_eq!(storage.manifest.active_slab_id, SlabId::ZERO);
 	assert!(!storage.local_slabs.is_empty());
 	assert!(storage.manifest.local_slab_bytes >= frame.len() as u64);
 	assert!(storage.manifest.tiered_slabs.is_empty());

@@ -39,6 +39,7 @@ use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
 	CheckpointCoordinator, DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
+use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
 use crate::metrics::observability::{
 	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
 };
@@ -73,7 +74,7 @@ use crate::network::transport::{
 	TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
-use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow};
+use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
 use crate::storage::GroupCommitConfig;
 use crate::storage::ManagerTierObserver;
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
@@ -162,6 +163,10 @@ pub struct NodeBootstrapConfig {
 	pub cluster: ClusterBootstrapConfig,
 	/// Optional L2 backend for sealed-slab tiering.
 	pub l2: Option<ObjectStoreConfig>,
+	/// Root KEK provider used to wrap and unwrap tenant KEKs.
+	pub root_kek_provider: RootKekProviderConfig,
+	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
+	pub crypto_cache: CryptoCacheConfig,
 	/// Rolling-upgrade compatibility window advertised by this
 	/// node during join and reconnect flows.
 	pub protocol: ProtocolVersionWindow,
@@ -202,6 +207,8 @@ impl NodeBootstrapConfig {
 			trusted_transfer_signers,
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
+			root_kek_provider: RootKekProviderConfig::DevInsecure,
+			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls: None,
 			drift_max_offset_ms: crate::consensus::monitor::MAX_OFFSET_MS,
@@ -236,6 +243,24 @@ impl NodeBootstrapConfig {
 				"slab_max_bytes must be greater than zero",
 			));
 		}
+		if self.slab_max_bytes > crate::crypto::SLAB_MAX_BYTES_HARD_CEILING {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"slab_max_bytes={} exceeds the W4 hard ceiling of {} bytes",
+					self.slab_max_bytes,
+					crate::crypto::SLAB_MAX_BYTES_HARD_CEILING
+				),
+			));
+		}
+		#[cfg(feature = "fips")]
+		if matches!(self.root_kek_provider, RootKekProviderConfig::DevInsecure) {
+			return Err(Error::new(
+				ErrorKind::Unsupported,
+				"crypto.root_kek_provider=dev-insecure is disabled in fips builds",
+			));
+		}
+		self.crypto_cache.validate()?;
 		if self.group_commit.floor.is_zero() {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -392,6 +417,7 @@ impl NodeBootstrapConfig {
 pub struct WendelonNode {
 	pub local_node: NodeId,
 	pub slab: Arc<SlabManager>,
+	pub crypto: Arc<CryptoManager>,
 	pub tracker: Arc<NodeTracker>,
 	pub clock: Arc<dyn PhysicalClock>,
 	pub hlc: Arc<HybridLogicalClockDriver>,
@@ -422,6 +448,7 @@ pub struct NodeHandles {
 	pub lease_manager: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
+	pub tenant_kek_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
 }
 
@@ -433,6 +460,7 @@ impl NodeHandles {
 		self.lease_manager.abort();
 		self.epoch_reconciler.abort();
 		self.migration_sweeper.abort();
+		self.tenant_kek_seeder.abort();
 		self.checkpoint_emitter.abort();
 	}
 
@@ -444,6 +472,7 @@ impl NodeHandles {
 		await_background_task(self.lease_manager, "lease manager").await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
+		await_background_task(self.tenant_kek_seeder, "tenant KEK seeder").await?;
 		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
 	}
@@ -620,6 +649,20 @@ impl WendelonNode {
 		Self::bootstrap(cfg).await
 	}
 
+	pub async fn rotate_tenant_kek(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
+		let rotation = self.crypto.prepare_rotation(tenant_id)?;
+		let tenant_kek_id = rotation.tenant_kek_id;
+		commit_install_tenant_kek_version(&self.raft, rotation, "rotate_tenant_kek").await?;
+		let local_active = self.crypto.active_tenant_kek_id(tenant_id)?;
+		if local_active != tenant_kek_id {
+			return Err(Error::other(format!(
+				"rotate_tenant_kek: committed tenant_kek_id {} but local crypto active_tenant_kek_id is {}",
+				tenant_kek_id, local_active
+			)));
+		}
+		Ok(tenant_kek_id)
+	}
+
 	/// Build every subsystem using the supplied outbound transport.
 	/// In tests this is an in-process loopback provider; production
 	/// callers can hand in a real QUIC transport once endpoint and
@@ -695,6 +738,10 @@ impl WendelonNode {
 
 		// 3. L1 slab storage.
 		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
+		let crypto = Arc::new(CryptoManager::new_with_cache_config(
+			cfg.root_kek_provider.build(&cfg.data_dir)?,
+			cfg.crypto_cache,
+		));
 		let slab: Arc<SlabManager> = Arc::new(
 			SlabManager::open(SlabManagerConfig {
 				dir: cfg.data_dir.clone(),
@@ -703,6 +750,7 @@ impl WendelonNode {
 				l2,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				group_commit: cfg.group_commit.clone(),
+				crypto: crypto.clone(),
 			})
 			.await?,
 		);
@@ -718,6 +766,7 @@ impl WendelonNode {
 			.recovered_state_machine()
 			.await?
 			.with_tier_observer(tier_observer)
+			.with_tenant_kek_observer(crypto.clone())
 			.with_checkpoint_observer(checkpoint_coordinator.clone());
 		let checkpoint_emitter = checkpoint_coordinator.spawn();
 
@@ -729,6 +778,9 @@ impl WendelonNode {
 		let fallback_epoch =
 			seed_single_node_epoch(local_node, &cfg.advertise_address, local_tiers);
 		let recovered_state = state_machine.state_snapshot().await;
+		// Safe because Raft has not been constructed yet, so no tenant-KEK
+		// observer callback can race this authoritative bootstrap snapshot.
+		crypto.replace_keysets_from_authoritative_snapshot(&recovered_state.tenant_keysets)?;
 		let mut recovered_tiers = recovered_state
 			.tiered_slabs
 			.values()
@@ -742,6 +794,7 @@ impl WendelonNode {
 					slab_id: tier.slab_id,
 					l2_uri: tier.l2_uri,
 					payload_hash: tier.payload_hash,
+					is_encrypted: tier.is_encrypted,
 				},
 				recovered_log_index,
 			)
@@ -758,6 +811,25 @@ impl WendelonNode {
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
 		let audit_sink: Arc<dyn AuditSink> =
 			Arc::new(LocalAuditSink::open(cfg.data_dir.join("audit.ndjson"))?);
+		crypto.attach_audit_sink(local_node, audit_sink.clone())?;
+		audit_sink.emit(crate::audit::AuditEvent::new(
+			crate::audit::AuditAuthority::NodeLocal,
+			"crypto.startup",
+			local_node,
+			format!(
+				"selected_cipher={} cipher_detection_method={} root_kek_provider={} fips={} build_profile={} mlock={}",
+				crypto.selected_cipher_label(),
+				crypto.selected_cipher_detection_method(),
+				crypto.root_kek_provider_label(),
+				cfg!(feature = "fips"),
+				if cfg!(debug_assertions) {
+					"debug"
+				} else {
+					"release"
+				},
+				crypto.mlock_status_label(),
+			),
+		))?;
 		let state_machine = state_machine.with_audit_materializer(local_node, audit_sink.clone());
 		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);
 
@@ -945,6 +1017,41 @@ impl WendelonNode {
 				}
 			}
 		}
+		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap
+			&& matches!(cfg.cluster, ClusterBootstrapConfig::Bootstrap)
+		{
+			match seed_default_tenant_kek_if_missing(
+				&raft,
+				&state_machine,
+				crypto.as_ref(),
+				local_node,
+			)
+			.await?
+			{
+				DefaultTenantKekSeedState::Complete => {}
+				DefaultTenantKekSeedState::Retry => {
+					return Err(Error::new(
+						ErrorKind::Other,
+						"lost local leadership while seeding the default tenant KEK during fresh bootstrap",
+					));
+				}
+			}
+		}
+		let tenant_kek_seeder = if state_machine
+			.state_snapshot()
+			.await
+			.tenant_keysets
+			.contains_key(&TenantId::ZERO)
+		{
+			tokio::spawn(async {})
+		} else {
+			spawn_default_tenant_kek_seeder(
+				raft.clone(),
+				state_machine.clone(),
+				crypto.clone(),
+				local_node,
+			)
+		};
 
 		// 15. Eviction watchdog. Route leader-driven epoch changes
 		//     back through the same Control Ring compound workflow
@@ -984,6 +1091,7 @@ impl WendelonNode {
 		Ok(Self {
 			local_node,
 			slab,
+			crypto,
 			tracker,
 			clock,
 			hlc,
@@ -1009,6 +1117,7 @@ impl WendelonNode {
 				lease_manager,
 				epoch_reconciler,
 				migration_sweeper,
+				tenant_kek_seeder,
 				checkpoint_emitter,
 			},
 		})
@@ -1326,6 +1435,96 @@ async fn wait_for_local_leader(raft: &WendelonRaft, local_node: NodeId) -> std::
 	}
 }
 
+async fn commit_install_tenant_kek_version(
+	raft: &WendelonRaft,
+	rotation: crate::crypto::InstallTenantKekVersion,
+	context: &str,
+) -> std::io::Result<()> {
+	let response = raft
+		.client_write(crate::consensus::WendelonRequest::InstallTenantKekVersion(
+			rotation,
+		))
+		.await
+		.map_err(|err| Error::new(ErrorKind::Other, format!("{context}: {err}")))?;
+	match response.data {
+		crate::consensus::WendelonResponse::Success => Ok(()),
+		crate::consensus::WendelonResponse::Error(message) => Err(Error::new(
+			ErrorKind::AlreadyExists,
+			format!("{context}: {message}"),
+		)),
+		crate::consensus::WendelonResponse::LeaseDenied => Err(Error::other(format!(
+			"{context}: unexpected LeaseDenied response from InstallTenantKekVersion"
+		))),
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultTenantKekSeedState {
+	Complete,
+	Retry,
+}
+
+async fn seed_default_tenant_kek_if_missing(
+	raft: &WendelonRaft,
+	state_machine: &WendelonStateMachine,
+	crypto: &CryptoManager,
+	local_node: NodeId,
+) -> std::io::Result<DefaultTenantKekSeedState> {
+	if state_machine
+		.state_snapshot()
+		.await
+		.tenant_keysets
+		.contains_key(&TenantId::ZERO)
+	{
+		return Ok(DefaultTenantKekSeedState::Complete);
+	}
+	if raft.current_leader().await != Some(local_node.id) {
+		return Ok(DefaultTenantKekSeedState::Retry);
+	}
+	let rotation = crypto.prepare_rotation(TenantId::ZERO)?;
+	match commit_install_tenant_kek_version(raft, rotation, "failed to seed default tenant KEK")
+		.await
+	{
+		Ok(()) => Ok(DefaultTenantKekSeedState::Complete),
+		Err(err) if raft.current_leader().await != Some(local_node.id) => {
+			let _ = err;
+			Ok(DefaultTenantKekSeedState::Retry)
+		}
+		Err(err) => Err(err),
+	}
+}
+
+fn spawn_default_tenant_kek_seeder(
+	raft: WendelonRaft,
+	state_machine: WendelonStateMachine,
+	crypto: Arc<CryptoManager>,
+	local_node: NodeId,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		loop {
+			match seed_default_tenant_kek_if_missing(
+				&raft,
+				&state_machine,
+				crypto.as_ref(),
+				local_node,
+			)
+			.await
+			{
+				Ok(DefaultTenantKekSeedState::Complete) => return,
+				Ok(DefaultTenantKekSeedState::Retry) => {}
+				Err(err) => {
+					tracing::warn!(
+						node_id = local_node.id,
+						error = %err,
+						"default tenant KEK seeding is still pending"
+					);
+				}
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+	})
+}
+
 async fn wait_for_join_visibility(
 	mut epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
 ) -> std::io::Result<()> {
@@ -1559,8 +1758,9 @@ mod tests {
 		DriftCheck, EVICTION_THRESHOLD, EvictionDecision, MAX_OFFSET_MS, check_drift_once,
 		sweep_evictions_once,
 	};
-	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, TenantId};
-	use crate::storage::StorageEngine;
+	use crate::consensus::raft_storage::SmState;
+	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, SnapshotHeader, TenantId};
+	use crate::storage::{RaftCommitter, SlabSweeper, StorageEngine, SweeperConfig};
 	use std::time::Duration;
 
 	fn tempdir(tag: &str) -> PathBuf {
@@ -1586,6 +1786,67 @@ mod tests {
 		}
 	}
 
+	async fn wait_for_default_tenant_kek(node: &WendelonNode) {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node
+				.state_machine
+				.state_snapshot()
+				.await
+				.tenant_keysets
+				.contains_key(&TenantId::ZERO)
+			{
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for default tenant KEK to be provisioned"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+
+	fn control_artifact_paths_for_test(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+		(
+			dir.join("control.wal"),
+			dir.join("vote.wnd"),
+			dir.join("snapshot.wnd"),
+		)
+	}
+
+	fn write_snapshot_artifact(path: &std::path::Path, state: &SmState) {
+		let mut snapshot_state = state.clone();
+		if let Some(log_id) = snapshot_state.last_applied_log_id.as_mut() {
+			*log_id = openraft::LogId::new(
+				openraft::CommittedLeaderId::new(log_id.leader_id.term, 0),
+				log_id.index,
+			);
+		}
+		let body = postcard::to_allocvec(&snapshot_state).unwrap();
+		let last_applied = snapshot_state.last_applied_log_id;
+		let header = SnapshotHeader {
+			last_included_index: last_applied.map(|id| id.index).unwrap_or(0),
+			last_included_term: last_applied.map(|id| id.leader_id.term).unwrap_or(0),
+			last_included_epoch: 0,
+			snapshot_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			state_sha256: *blake3::hash(&body).as_bytes(),
+			cache_checkpoint_len: 0,
+			_pad: [0; 4],
+		};
+		let mut out = Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + body.len());
+		out.extend_from_slice(bytemuck::bytes_of(&header));
+		out.extend_from_slice(&body);
+		std::fs::write(path, out).unwrap();
+	}
+
+	fn read_audit_log(dir: &std::path::Path) -> String {
+		std::fs::read_to_string(dir.join("audit.ndjson")).unwrap()
+	}
+
 	#[tokio::test]
 	async fn single_node_bootstrap_assembles_every_subsystem() {
 		let dir = tempdir("assemble");
@@ -1602,6 +1863,34 @@ mod tests {
 		// Raft reaches leadership asynchronously after initialize.
 		wait_for_local_leader(&node).await;
 		assert_eq!(node.raft.current_leader().await, Some(node.local_node.id));
+	}
+
+	#[tokio::test]
+	async fn bootstrap_emits_crypto_startup_audit_and_seeds_default_tenant_kek() {
+		let dir = tempdir("crypto-startup");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			13,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
+		let snapshot = node.state_machine.state_snapshot().await;
+		assert!(
+			snapshot.tenant_keysets.contains_key(&TenantId::ZERO),
+			"default tenant KEK must be seeded during bootstrap"
+		);
+		let audit = read_audit_log(&dir);
+		assert!(audit.contains("\"event_type\":\"crypto.startup\""));
+		assert!(audit.contains(node.crypto.selected_cipher_label()));
+		assert!(audit.contains(node.crypto.selected_cipher_detection_method()));
+		assert!(audit.contains(node.crypto.root_kek_provider_label()));
+		assert!(audit.contains("fips=false"));
+		assert!(audit.contains("build_profile=debug"));
+		assert!(audit.contains("mlock="));
 	}
 
 	#[tokio::test]
@@ -1660,13 +1949,7 @@ mod tests {
 			Some(commit_hlc)
 		);
 
-		node.handles.ring_updater.abort();
-		node.handles.drift_monitor.abort();
-		node.handles.eviction_watchdog.abort();
-		node.handles.lease_manager.abort();
-		node.handles.epoch_reconciler.abort();
-		node.handles.migration_sweeper.abort();
-		node.handles.checkpoint_emitter.abort();
+		node.handles.abort();
 		drop(node);
 		tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -1687,14 +1970,48 @@ mod tests {
 				.copied(),
 			Some(commit_hlc)
 		);
+		wait_for_default_tenant_kek(&recovered).await;
 
-		recovered.handles.ring_updater.abort();
-		recovered.handles.drift_monitor.abort();
-		recovered.handles.eviction_watchdog.abort();
-		recovered.handles.lease_manager.abort();
-		recovered.handles.epoch_reconciler.abort();
-		recovered.handles.migration_sweeper.abort();
-		recovered.handles.checkpoint_emitter.abort();
+		recovered.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn recovery_upgrade_seeds_default_tenant_kek_when_snapshot_predates_w4() {
+		let dir = tempdir("upgrade-seeds-default-tenant-kek");
+		let cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+
+		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
+		let mut upgraded_snapshot = node.state_machine.state_snapshot().await;
+		upgraded_snapshot.tenant_keysets.clear();
+
+		node.handles.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let (wal_path, _vote_path, snapshot_path) = control_artifact_paths_for_test(&dir);
+		if wal_path.exists() {
+			std::fs::remove_file(&wal_path).unwrap();
+		}
+		write_snapshot_artifact(&snapshot_path, &upgraded_snapshot);
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		wait_for_local_leader(&recovered).await;
+		wait_for_default_tenant_kek(&recovered).await;
+		assert!(
+			recovered
+				.state_machine
+				.state_snapshot()
+				.await
+				.tenant_keysets
+				.contains_key(&TenantId::ZERO),
+			"default tenant KEK must be auto-seeded for recovered pre-W4 state"
+		);
+
+		recovered.handles.abort();
 	}
 
 	#[tokio::test]
@@ -1760,6 +2077,7 @@ mod tests {
 				slab_id: sealed_id,
 				l2_uri,
 				payload_hash,
+				is_encrypted: true,
 			}))
 			.await
 			.unwrap();
@@ -1769,13 +2087,7 @@ mod tests {
 			"tiered slab should be unlinked from L1 after apply"
 		);
 
-		node.handles.ring_updater.abort();
-		node.handles.drift_monitor.abort();
-		node.handles.eviction_watchdog.abort();
-		node.handles.lease_manager.abort();
-		node.handles.epoch_reconciler.abort();
-		node.handles.migration_sweeper.abort();
-		node.handles.checkpoint_emitter.abort();
+		node.handles.abort();
 		drop(node);
 		tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -1793,13 +2105,127 @@ mod tests {
 		assert_eq!(location.slab_id, sealed_id);
 		assert_eq!(recovered.slab.read(location).await.unwrap(), tiered_bytes);
 
-		recovered.handles.ring_updater.abort();
-		recovered.handles.drift_monitor.abort();
-		recovered.handles.eviction_watchdog.abort();
-		recovered.handles.lease_manager.abort();
-		recovered.handles.epoch_reconciler.abort();
-		recovered.handles.migration_sweeper.abort();
-		recovered.handles.checkpoint_emitter.abort();
+		recovered.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn tenant_kek_rotation_is_raft_committed_and_old_l2_slabs_remain_readable() {
+		let dir = tempdir("tenant-kek-rotation");
+		let l2_dir = tempdir("tenant-kek-rotation-l2");
+		let mut cfg = NodeBootstrapConfig::dev(14, dir.clone(), "127.0.0.1:0".into());
+		cfg.slab_max_bytes = 1;
+		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
+			root: l2_dir.clone(),
+		});
+		let object_store = cfg.l2.as_ref().unwrap().build().unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		wait_for_local_leader(&node).await;
+
+		let old_key = Identity::blake3(b"pre-rotation-tiered");
+		let filler_key = Identity::blake3(b"rotation-filler");
+		let old_loc = node
+			.slab
+			.append(
+				TenantId::ZERO,
+				old_key,
+				HybridTimestamp {
+					physical_ms: 1,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"before-rotation",
+			)
+			.await
+			.unwrap();
+		let filler_loc = node
+			.slab
+			.append(
+				TenantId::ZERO,
+				filler_key,
+				HybridTimestamp {
+					physical_ms: 2,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"seal-slab-zero",
+			)
+			.await
+			.unwrap();
+
+		let sweeper = SlabSweeper::new(
+			node.slab.clone(),
+			object_store.clone(),
+			Arc::new(RaftCommitter::new(node.raft.clone())),
+			node.state_machine.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "sealed/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		);
+		let first_report = sweeper.sweep_once().await.unwrap();
+		assert!(first_report.tiered >= 1);
+		assert!(node.slab.is_tiered(old_loc.slab_id).await);
+
+		let old_pointer = node.slab.tier_pointer(old_loc.slab_id).await.unwrap();
+		let old_blob = object_store.get(&old_pointer.l2_uri).await.unwrap();
+		let old_footer = node
+			.crypto
+			.encrypted_footer_summary(&old_blob)
+			.unwrap()
+			.expect("tiered object must be envelope-encrypted");
+		assert!(
+			!old_blob
+				.windows(b"before-rotation".len())
+				.any(|w| w == b"before-rotation")
+		);
+		assert_eq!(node.slab.read(old_loc).await.unwrap(), b"before-rotation");
+
+		let rotated_kek_id = node.rotate_tenant_kek(TenantId::ZERO).await.unwrap();
+		let rotated_snapshot = node.state_machine.state_snapshot().await;
+		assert_eq!(
+			rotated_snapshot
+				.tenant_keysets
+				.get(&TenantId::ZERO)
+				.unwrap()
+				.active_tenant_kek_id,
+			Some(rotated_kek_id)
+		);
+		assert_eq!(
+			node.crypto.active_tenant_kek_id(TenantId::ZERO).unwrap(),
+			rotated_kek_id
+		);
+
+		let _ = node
+			.slab
+			.append(
+				TenantId::ZERO,
+				Identity::blake3(b"post-rotation-write"),
+				HybridTimestamp {
+					physical_ms: 3,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"after-rotation",
+			)
+			.await
+			.unwrap();
+		let second_report = sweeper.sweep_once().await.unwrap();
+		assert!(second_report.tiered >= 1);
+		assert!(node.slab.is_tiered(filler_loc.slab_id).await);
+
+		let new_pointer = node.slab.tier_pointer(filler_loc.slab_id).await.unwrap();
+		let new_blob = object_store.get(&new_pointer.l2_uri).await.unwrap();
+		let new_footer = node
+			.crypto
+			.encrypted_footer_summary(&new_blob)
+			.unwrap()
+			.expect("post-rotation tiered object must be envelope-encrypted");
+		assert_ne!(old_footer.tenant_kek_id, new_footer.tenant_kek_id);
+		assert_eq!(new_footer.tenant_kek_id, rotated_kek_id);
+		assert_eq!(node.slab.read(old_loc).await.unwrap(), b"before-rotation");
 	}
 
 	#[tokio::test]

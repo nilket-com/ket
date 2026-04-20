@@ -52,7 +52,7 @@
 //!
 //! [`append`]: LocalSlabStore::append
 
-use crate::schema::{HybridTimestamp, Identity, SlabRecordHeader, TenantId};
+use crate::schema::{HybridTimestamp, Identity, SlabId, SlabRecordHeader, TenantId};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
 use async_trait::async_trait;
@@ -71,7 +71,7 @@ const SLAB_RECORD_MAGIC: u32 = 0x534C4142;
 /// A pointer to a record's location on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecordLocation {
-	pub slab_id: u64,
+	pub slab_id: SlabId,
 	pub offset: u64,
 	pub length: u32,
 	pub hlc: HybridTimestamp,
@@ -174,7 +174,7 @@ pub struct LocalSlabStore {
 	/// Identity of the active slab file. Written into every
 	/// [`RecordLocation`] so reads can route to the right file once
 	/// multiple slabs are live.
-	slab_id: u64,
+	slab_id: SlabId,
 
 	/// Owning handle to the slab file.
 	file: FileHandle,
@@ -205,7 +205,7 @@ impl LocalSlabStore {
 	/// uses [`AlignedBuf`] and rounds up to a page boundary.
 	pub async fn open(
 		path: impl AsRef<Path>,
-		slab_id: u64,
+		slab_id: SlabId,
 		file_ops: Arc<dyn AsyncFileOps>,
 		group_commit: GroupCommitConfig,
 	) -> std::io::Result<Self> {
@@ -250,7 +250,7 @@ impl LocalSlabStore {
 	/// to route reads after rotation.
 	///
 	/// [`SlabManager`]: crate::storage::manager::SlabManager
-	pub fn slab_id(&self) -> u64 {
+	pub fn slab_id(&self) -> SlabId {
 		self.slab_id
 	}
 
@@ -615,7 +615,7 @@ fn page_round_up(n: usize) -> usize {
 
 fn recover_slab(
 	file: &FileHandle,
-	slab_id: u64,
+	slab_id: SlabId,
 ) -> std::io::Result<(DashMap<TenantKey, Vec<RecordLocation>>, u64)> {
 	use std::os::unix::fs::FileExt;
 
@@ -690,7 +690,7 @@ fn recover_slab(
 
 pub(crate) fn recover_slab_entries_from_blob(
 	blob: &[u8],
-	slab_id: u64,
+	slab_id: SlabId,
 ) -> std::io::Result<Vec<(TenantId, Identity, RecordLocation)>> {
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
@@ -800,7 +800,7 @@ mod tests {
 
 	fn loc(hlc: HybridTimestamp, offset: u64) -> RecordLocation {
 		RecordLocation {
-			slab_id: 0,
+			slab_id: SlabId::ZERO,
 			offset,
 			length: 4096,
 			hlc,
@@ -1011,7 +1011,7 @@ mod tests {
 		let store = Arc::new(
 			LocalSlabStore::open(
 				dir.join("slab_0000000000000000.wnd"),
-				0,
+				SlabId::ZERO,
 				file_ops.clone(),
 				GroupCommitConfig {
 					floor: Duration::ZERO,

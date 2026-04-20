@@ -48,6 +48,37 @@ End of W4, all L2 bytes and all at-rest keyed state can be encrypted under the t
 - **ADR 019 Open Question — SIV availability in `aws-lc-rs`.** Verify at W4 kickoff; if SIV lands in `aws-lc-rs` after W4, close by running the default-build cipher-selection test suite end-to-end.
 - **ADR 020 Open Question — key escrow.** Explicitly out of scope for pilot; closed by a documented "no-escrow" posture in `plans/ops/key_rotation.md`.
 
+## 5.1 Implementation Notes
+
+- **FIPS post-link verification must use a release artifact.** Debug-profile symbol sweeps are not load-bearing for ADR 019 because unoptimized static linking can retain unreferenced AWS-LC objects and produce false positives.
+- **Release-profile symbol sweeps need stripping disabled.** The project's normal release profile sets `strip = true`, so the verification command uses `CARGO_PROFILE_RELEASE_STRIP=none` to keep the release binary inspectable.
+- **Toolchain sensitivity observed during W4 verification.** On this workspace, `cargo build --release --no-default-features --features fips --bin wendelon` under the default host C toolchain failed inside `aws-lc-fips-sys` during the FIPS delocation step. The same release build succeeded when forced to Clang with `CC=clang CXX=clang++`.
+- **Verified W4 acceptance path.** The working ADR 019 verification sequence was:
+  `CC=clang CXX=clang++ CARGO_PROFILE_RELEASE_STRIP=none cargo build --release --no-default-features --features fips --bin wendelon`
+  followed by
+  `nm target/release/wendelon | rg -i 'aesgcmsiv|AESIV|GCM_SIV'`
+  and
+  `strings target/release/wendelon | rg -i 'aes.?gcm.?siv|AESIV'`.
+  On the resulting release binary, both checks returned zero matches.
+- **Root KEK bootstrap boundary is now explicit.** `NodeBootstrapConfig` carries a `root_kek_provider` selector, startup audit records include the chosen provider, and the runtime no longer hardcodes the dev root KEK path in `WendelonNode::bootstrap`.
+- **The dev placeholder provider no longer bakes its Root KEK into the binary.** `dev-insecure` now creates a per-data-dir local Root KEK file at `<data_dir>/.wendelon/dev-root-kek.bin`, which keeps dev restarts readable while remaining explicitly outside the production custody model.
+- **Recovered pre-W4 clusters now self-heal into W4 state.** If a recovered state machine snapshot/log predates `tenant_keysets`, the local leader seeds the default tenant KEK automatically instead of requiring an operator-side bootstrap workaround.
+- **Committed Tenant KEK rotations converge by snapshot, not just edge-triggered callbacks.** The Raft apply path still fires per-rotation observer callbacks, but now follows them with a full committed `tenant_keysets` sync so a transient observer failure cannot leave a node's local crypto state permanently stale.
+- **Conflicting `tenant_kek_id` reuse is rejected.** The rotation path now mints non-zero ids that are unused for the target tenant, and the Raft state machine rejects a conflicting duplicate id instead of silently overwriting historical wrapped KEK bytes.
+- **The W4 rotation seam is still in-process only.** `WendelonNode::rotate_tenant_kek(...)` is the primitive, but W4 does not yet lift that into a standalone CLI/admin RPC surface.
+- **W4's at-rest boundary is L2, not every plaintext landing zone.** L2 tier objects and wrapped keys are encrypted; local L1 slab files, rehydration cache files, and decrypted plaintext buffers remain plaintext in this workstream.
+- **The rewrite bandwidth cap is upload-only.** `max_upload_bytes_per_sec` limits sweeper PUT traffic; rewrite-path L2 GET traffic remains unthrottled in W4.
+- **`InstallTenantKekVersion` follows the existing epoch-0 retention bucket.** It shares the same WAL-retention semantics as other epoch-agnostic control entries such as `TierSlab`.
+- **Tier-pointer refreshes are part of the W4 rewrite contract.** Re-encryption and URI/hash repair can commit a second `TierSlab` entry for an existing `slab_id`; the Raft state machine updates the pointer in place and deliberately re-fires the tier observer so runtime readers pick up the new L2 object.
+- **Nonce ladder seam is explicit.** The per-PR unit test keeps the 100k sampled-space check in-tree, and the weekly 100M run now has a dedicated explicit harness via `ci/check_w4_nonce_ladder.sh` plus the scheduled `.github/workflows/crypto-weekly.yml` workflow.
+- **FIPS symbol verification is now automated.** The manual ADR 019 sweep remains documented for operators, and CI now enforces the same release-build `nm`/`strings` contract via `ci/check_w4_fips_symbol_sweep.sh`.
+- **Node-local crypto audits use the same sink path as Raft-materialized audits.** `crypto.startup` and `crypto.decrypt_rejected` are emitted directly because they are not committed-log events, but they still flow through the shared `AuditSink` used by the Raft audit materializer.
+- **Sweeper steady-state short-circuit.** Each `TieredSlab` / `TieredSlabPointer` now carries an `is_encrypted` flag. The plaintext-rewrite sweeper skips already-encrypted pointers without a GET, so once a fleet has fully migrated, the rewrite pass costs O(0) per scan. The redb-backed local index bumped its tiered-slabs schema from `tiered_slabs_v1` → `tiered_slabs_v2` (`payload_hash[32] || flags_byte || l2_uri_utf8`); a one-shot v1→v2 migration runs on `PersistentLocalIndex::open` and stamps `is_encrypted = false` on legacy rows, which the sweeper will then GET-and-rewrite once before the short-circuit takes hold.
+- **Decrypt-audit emit failure is loud and metered.** `crypto.decrypt_rejected` audit emit failures now log at `tracing::error!` level and bump `wendelon_crypto_decrypt_audit_emit_failures_total`. The audit sink refusing a decrypt-rejection record is a security-relevant signal, not a no-op.
+- **Per-attempt rewrite key.** The plaintext-to-ciphertext rewrite path appends a UUID v4 suffix to each L2 PUT key (`crypto/slab_<id>_<uuid>.wnd`). A leader-handoff retry never reuses the same key as an earlier in-flight upload, so two concurrent rewrite attempts cannot stomp each other's object-store state.
+- **Upload-rate cap is unclamped to scan interval.** `rate_limit_upload` no longer clamps the per-upload sleep to `scan_interval`. A large slab at a tight cap sleeps for the full `bytes / cap` duration, so the sweeper's average outbound rate stays at or below the configured cap rather than silently exceeding it for one-scan bursts.
+- **Nonce ladder is structurally sampled, not a tautology.** `assert_nonce_encoding_matches_contract` now drives chunk-index inputs through a Knuth-period u64 LCG plus boundary inputs (`0`, `1`, `u64::MAX`, `1<<32`, `1<<63`, alternating-bit), and asserts per-sample identity round-trip. A bounded-cap HashSet (`NONCE_LADDER_HASHSET_CAP = 1_000_000`) catches collisions in the sampled subspace without growing memory linearly with the 100M weekly run.
+
 ## 6. Test harness tier
 
 - **Unit:** chunk-ordinal nonce encoder; AAD fixed-width layout; DEK-wrap/unwrap round-trip; slab-surface HMAC.

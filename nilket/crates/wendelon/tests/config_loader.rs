@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
+use wendelon::crypto::{
+	DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
+	SLAB_MAX_BYTES_HARD_CEILING,
+};
 use wendelon::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
@@ -93,6 +97,108 @@ transfer_signing_secret = "{transfer_secret}"
 	);
 	assert!(cfg.l2.is_none());
 	assert_eq!(cfg.drift_max_offset_ms, wendelon::consensus::MAX_OFFSET_MS);
+	assert_eq!(
+		cfg.crypto_cache.tenant_kek_cache_max_entries,
+		DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES
+	);
+	assert_eq!(
+		cfg.crypto_cache.slab_dek_cache_max_entries,
+		DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES
+	);
+}
+
+#[test]
+fn loads_crypto_cache_tuning() {
+	let root = fresh_dir("crypto-cache-tuning");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 41u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4711"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[crypto]
+tenant_kek_cache_max_entries = 17
+slab_dek_cache_max_entries = 91
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.crypto_cache.tenant_kek_cache_max_entries, 17);
+	assert_eq!(cfg.crypto_cache.slab_dek_cache_max_entries, 91);
+}
+
+#[test]
+fn rejects_zero_crypto_cache_tuning() {
+	let root = fresh_dir("crypto-cache-zero");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 42u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4712"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[crypto]
+tenant_kek_cache_max_entries = 0
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("crypto.tenant_kek_cache_max_entries must be greater than zero"),
+		"unexpected error: {err}"
+	);
 }
 
 #[test]
@@ -147,6 +253,53 @@ transfer_signing_secret = "0123456789abcdef0123456789abcdef0123456789abcdef01234
 	let err = load_node_bootstrap_config(&config_path).err().unwrap();
 	assert!(
 		err.to_string().contains("lease_signing_secret"),
+		"unexpected error: {err}"
+	);
+}
+
+#[test]
+fn rejects_slab_max_bytes_above_w4_ceiling() {
+	let root = fresh_dir("slab-ceiling");
+	let data_dir = root.join("data");
+	std::fs::create_dir_all(&data_dir).unwrap();
+
+	let node_id = 12u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4704"
+
+[storage]
+data_dir = "data"
+slab_max_bytes = {too_large}
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			too_large = SLAB_MAX_BYTES_HARD_CEILING + 1,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string().contains("hard ceiling"),
 		"unexpected error: {err}"
 	);
 }

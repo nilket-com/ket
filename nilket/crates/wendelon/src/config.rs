@@ -1,3 +1,7 @@
+use crate::crypto::{
+	CryptoCacheConfig, DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
+	RootKekProviderConfig, SLAB_MAX_BYTES_HARD_CEILING,
+};
 use crate::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
@@ -82,6 +86,8 @@ struct RawConfig {
 	#[serde(default)]
 	cluster: RawClusterConfig,
 	#[serde(default)]
+	crypto: RawCryptoConfig,
+	#[serde(default)]
 	transport: RawTransportConfig,
 	#[serde(default)]
 	observability: RawObservabilityConfig,
@@ -145,6 +151,26 @@ struct RawClusterConfig {
 	mode: RawClusterMode,
 	#[serde(default)]
 	seed_nodes: Vec<RawSeedNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCryptoConfig {
+	#[serde(default)]
+	root_kek_provider: RootKekProviderConfig,
+	#[serde(default = "default_tenant_kek_cache_max_entries")]
+	tenant_kek_cache_max_entries: usize,
+	#[serde(default = "default_slab_dek_cache_max_entries")]
+	slab_dek_cache_max_entries: usize,
+}
+
+impl Default for RawCryptoConfig {
+	fn default() -> Self {
+		Self {
+			root_kek_provider: RootKekProviderConfig::default(),
+			tenant_kek_cache_max_entries: default_tenant_kek_cache_max_entries(),
+			slab_dek_cache_max_entries: default_slab_dek_cache_max_entries(),
+		}
+	}
 }
 
 impl Default for RawClusterConfig {
@@ -224,6 +250,15 @@ impl RawConfig {
 				"storage.slab_max_bytes must be greater than zero",
 			));
 		}
+		if self.storage.slab_max_bytes > SLAB_MAX_BYTES_HARD_CEILING {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"storage.slab_max_bytes={} exceeds the W4 hard ceiling of {} bytes",
+					self.storage.slab_max_bytes, SLAB_MAX_BYTES_HARD_CEILING
+				),
+			));
+		}
 		if self.tuning.rf == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -299,6 +334,11 @@ impl RawConfig {
 			trusted_transfer_signers,
 			cluster,
 			l2: None,
+			root_kek_provider: self.crypto.root_kek_provider,
+			crypto_cache: CryptoCacheConfig {
+				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,
+				slab_dek_cache_max_entries: self.crypto.slab_dek_cache_max_entries,
+			},
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls,
 			drift_max_offset_ms: self.time.drift_max_offset_ms,
@@ -307,6 +347,14 @@ impl RawConfig {
 		cfg.validate()?;
 		Ok(cfg)
 	}
+}
+
+fn default_tenant_kek_cache_max_entries() -> usize {
+	DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES
+}
+
+fn default_slab_dek_cache_max_entries() -> usize {
+	DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES
 }
 
 fn absolutize_from_config_dir(config_path: &Path, value: &Path) -> PathBuf {

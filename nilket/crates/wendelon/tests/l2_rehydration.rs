@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use wendelon::consensus::{TierObserver, TieredSlab, WendelonStateMachine};
+use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
 	LocalFsObjectStore, ManagerTierObserver, ObjectStore, RehydrationPolicy, SlabManager,
@@ -35,6 +36,10 @@ fn id(locality: u64) -> Identity {
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
+}
+
+fn test_crypto() -> Arc<CryptoManager> {
+	Arc::new(test_support::seeded_dev_crypto_manager(tenant()).unwrap())
 }
 
 struct DirectApplyCommitter {
@@ -70,6 +75,7 @@ async fn build_tiered_manager(
 			l2: Some(l2.clone()),
 			rehydration,
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
+			crypto: test_crypto(),
 		})
 		.await
 		.unwrap(),
@@ -103,6 +109,7 @@ async fn build_tiered_manager(
 			min_slab_bytes: 0,
 			max_upload_bytes_per_sec: None,
 			key_prefix: String::new(),
+			max_plaintext_rewrites_per_pass: 1,
 		},
 	);
 	let report = sweeper.sweep_once().await.unwrap();
