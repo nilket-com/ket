@@ -332,7 +332,8 @@ impl WendelonClient {
 	/// status.
 	pub async fn write(&self, request: WriteRequest) -> std::io::Result<WriteResult> {
 		validate_write_request_batch(&request.meta, &request.payload)?;
-		let key_locality = key_locality_from_batch(&request.payload, "key")?;
+		let key_locality =
+			key_locality_from_batch(&request.payload, "key", request.meta.tenant_id)?;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
@@ -355,7 +356,7 @@ impl WendelonClient {
 	/// Arrow value batch in `ReadResult.value`.
 	pub async fn read(&self, request: ReadRequest) -> std::io::Result<ReadResult> {
 		validate_read_request_batch(&request.meta, &request.key)?;
-		let key_locality = key_locality_from_batch(&request.key, "key")?;
+		let key_locality = key_locality_from_batch(&request.key, "key", request.meta.tenant_id)?;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
@@ -390,7 +391,8 @@ impl WendelonClient {
 		let mut group_index: HashMap<NodeId, usize> = HashMap::new();
 		for (index, request) in requests.into_iter().enumerate() {
 			validate_write_request_batch(&request.meta, &request.payload)?;
-			let key_locality = key_locality_from_batch(&request.payload, "key")?;
+			let key_locality =
+				key_locality_from_batch(&request.payload, "key", request.meta.tenant_id)?;
 			let target = self.target_for_locality(key_locality)?;
 			let slot = if let Some(existing) = group_index.get(&target).copied() {
 				existing
@@ -1206,12 +1208,25 @@ fn extract_first_binary<'a>(
 	Ok(arr.value(0))
 }
 
-fn key_identity_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<Identity> {
-	Ok(Identity::blake3(extract_first_binary(batch, column)?))
+fn key_identity_from_batch(
+	batch: &RecordBatch,
+	column: &'static str,
+	tenant_id: TenantId,
+) -> std::io::Result<Identity> {
+	Ok(Identity::blake3_tenant(
+		tenant_id,
+		extract_first_binary(batch, column)?,
+	))
 }
 
-fn key_locality_from_batch(batch: &RecordBatch, column: &'static str) -> std::io::Result<Locality> {
-	Ok(Locality::from(key_identity_from_batch(batch, column)?))
+fn key_locality_from_batch(
+	batch: &RecordBatch,
+	column: &'static str,
+	tenant_id: TenantId,
+) -> std::io::Result<Locality> {
+	Ok(Locality::from(key_identity_from_batch(
+		batch, column, tenant_id,
+	)?))
 }
 
 // ============================================================

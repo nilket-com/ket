@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
-	AdvanceEpochResponseWire, CONTROL_REASON_GRANTED, WendelonControlServer,
+	AdvanceEpochResponseWire, CONTROL_REASON_AUTHORIZATION_FAILED, CONTROL_REASON_GRANTED,
+	TenantAdminRequestWire, TenantAdminResponseWire, WendelonControlServer,
 };
 use wendelon::network::router::MsgRouterBuilder;
-use wendelon::network::server::HrftService;
+use wendelon::network::server::{HrftService, RequestContext};
+use wendelon::network::tls::{ActorIdentity, ActorRole};
 use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use wendelon::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
@@ -23,8 +25,53 @@ use wendelon::network::{
 use wendelon::node::{LEASE_TTL_MS, NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, HybridTimestamp, LeaseDescriptor,
-	LeaseStatus, MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TransferToken,
+	LeaseStatus, MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TenantId,
+	TransferToken,
 };
+
+fn actor(role: ActorRole, tenant_id: Option<&str>) -> ActorIdentity {
+	ActorIdentity::new(
+		role,
+		None,
+		tenant_id.map(str::to_string),
+		vec!["cluster".to_string()],
+		vec![1, 2, 3, 4],
+	)
+	.unwrap()
+}
+
+fn context(actor: ActorIdentity, remote: NodeId) -> RequestContext {
+	RequestContext { remote, actor }
+}
+
+fn tenant_admin_frame(
+	node: &WendelonNode,
+	stream_id: u32,
+	request: &TenantAdminRequestWire,
+) -> wendelon::network::core::HrftFrame {
+	let meta = wire::encode_into(&node.pool, request).unwrap();
+	wendelon::network::core::HrftFrame {
+		header: wendelon::schema::FrameHeader {
+			magic: wendelon::network::core::HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TENANT_ADMIN_REQ.0,
+			flags: 0,
+			stream_id,
+			meta_len: meta.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		},
+		meta,
+		arrow_payload: None,
+		trailing: None,
+	}
+}
+
+fn decode_tenant_admin_response(
+	resp: &wendelon::network::core::HrftFrame,
+) -> TenantAdminResponseWire {
+	wire::decode(&resp.meta).unwrap()
+}
 
 fn decode_status_response(
 	resp: &wendelon::network::core::HrftFrame,
@@ -431,6 +478,7 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 			.with_control_ring(Arc::new(WendelonControlServer::new(
 				leader.raft.clone(),
 				leader.state_machine.clone(),
+				leader.crypto.clone(),
 				leader.local_node,
 				epoch_tx.clone(),
 				epoch_rx.clone(),
@@ -660,4 +708,101 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 	);
 
 	recovered.handles.abort();
+}
+
+#[tokio::test]
+async fn tenant_admin_create_and_list_flow_commits_through_control_ring() {
+	let node = support::bootstrap_node("tenant-admin-create", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let create_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				1,
+				&TenantAdminRequestWire::Create {
+					target_tenant_id: TenantId::new(7),
+					quota_bytes: 4_096,
+					replication_factor: 1,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let create_meta = decode_tenant_admin_response(&create_resp);
+	assert!(create_meta.accepted);
+	assert_eq!(create_meta.reason_code, CONTROL_REASON_GRANTED);
+	assert_eq!(create_meta.tenant.unwrap().tenant_id, TenantId::new(7));
+
+	let snapshot = node.state_machine.state_snapshot().await;
+	assert!(snapshot.tenants.contains_key(&TenantId::new(7)));
+
+	let list_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ReadOnlyObserver, None), node.local_node),
+			tenant_admin_frame(&node, 2, &TenantAdminRequestWire::List),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let list_meta = decode_tenant_admin_response(&list_resp);
+	assert!(list_meta.accepted);
+	assert!(
+		list_meta
+			.tenants
+			.iter()
+			.any(|tenant| tenant.tenant_id == TenantId::new(7))
+	);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
+	let node = support::bootstrap_node("tenant-admin-authz", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let observer_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ReadOnlyObserver, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				1,
+				&TenantAdminRequestWire::Suspend {
+					target_tenant_id: TenantId::ZERO,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let observer_meta = decode_tenant_admin_response(&observer_resp);
+	assert!(!observer_meta.accepted);
+	assert_eq!(
+		observer_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	let tenant_scoped_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, Some("7")), node.local_node),
+			tenant_admin_frame(&node, 2, &TenantAdminRequestWire::List),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let tenant_scoped_meta = decode_tenant_admin_response(&tenant_scoped_resp);
+	assert!(!tenant_scoped_meta.accepted);
+	assert_eq!(
+		tenant_scoped_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	support::abort_node(&node);
 }

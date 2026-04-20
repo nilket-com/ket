@@ -9,15 +9,19 @@
 
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
-	AdvanceEpochRecord, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
-	SeedMigration, WendelonRaft, WendelonRequest, WendelonResponse,
+	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
+	SeedMigration, TenantLifecycleState, TenantRecord, UpdateTenantQuota, WendelonRaft,
+	WendelonRequest, WendelonResponse,
 };
+use crate::crypto::CryptoManager;
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
+use crate::network::server::RequestContext;
+use crate::network::tls::ActorRole;
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
@@ -27,7 +31,7 @@ use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, ReleaseLeaseRequestMeta,
-	ReleaseLeaseResponseMeta, TransferToken, epoch_entry_var_schema,
+	ReleaseLeaseResponseMeta, TenantId, TransferToken, epoch_entry_var_schema,
 };
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -49,6 +53,18 @@ pub const CONTROL_REASON_INVALID_CONFIG: u8 = 5;
 pub const CONTROL_REASON_INTERNAL_ERROR: u8 = 6;
 pub const CONTROL_REASON_INVALID_TOKEN: u8 = 7;
 pub const CONTROL_REASON_INCOMPATIBLE_VERSION: u8 = 8;
+pub const CONTROL_REASON_AUTHORIZATION_FAILED: u8 = 9;
+pub const CONTROL_REASON_NOT_FOUND: u8 = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlOperation {
+	Status,
+	Lease,
+	LeaseRelease,
+	Transfer,
+	AdvanceEpoch,
+	Join,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvanceEpochResponseWire {
@@ -78,9 +94,58 @@ pub struct JoinClusterResponseWire {
 	pub negotiated_protocol: Option<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TenantAdminRequestWire {
+	Create {
+		target_tenant_id: TenantId,
+		quota_bytes: u64,
+		replication_factor: u32,
+	},
+	UpdateQuota {
+		target_tenant_id: TenantId,
+		quota_bytes: u64,
+	},
+	Suspend {
+		target_tenant_id: TenantId,
+	},
+	Resume {
+		target_tenant_id: TenantId,
+	},
+	Delete {
+		target_tenant_id: TenantId,
+	},
+	Get {
+		target_tenant_id: TenantId,
+	},
+	List,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAdminTenantWire {
+	pub tenant_id: TenantId,
+	pub quota_bytes: u64,
+	pub used_bytes: u64,
+	pub replication_factor: u32,
+	pub state: TenantLifecycleState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAdminResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub tenant: Option<TenantAdminTenantWire>,
+	#[serde(default)]
+	pub tenants: Vec<TenantAdminTenantWire>,
+	#[serde(default)]
+	pub message: Option<String>,
+}
+
 pub struct WendelonControlServer {
 	raft: WendelonRaft,
 	state_machine: crate::consensus::raft_storage::WendelonStateMachine,
+	crypto: Arc<CryptoManager>,
 	local_node: NodeId,
 	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	epoch_rx: watch::Receiver<Arc<MembershipEpoch>>,
@@ -98,6 +163,7 @@ impl WendelonControlServer {
 	pub fn new(
 		raft: WendelonRaft,
 		state_machine: crate::consensus::raft_storage::WendelonStateMachine,
+		crypto: Arc<CryptoManager>,
 		local_node: NodeId,
 		epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 		epoch_rx: watch::Receiver<Arc<crate::network::transport::MembershipEpoch>>,
@@ -109,6 +175,7 @@ impl WendelonControlServer {
 		Self {
 			raft,
 			state_machine,
+			crypto,
 			local_node,
 			epoch_tx,
 			epoch_rx,
@@ -136,6 +203,385 @@ impl WendelonControlServer {
 	pub fn with_protocol_window(mut self, protocol: ProtocolVersionWindow) -> Self {
 		self.protocol = protocol;
 		self
+	}
+
+	fn authorize_control_operation(
+		&self,
+		context: &RequestContext,
+		op: ControlOperation,
+	) -> std::io::Result<()> {
+		let allowed = match op {
+			ControlOperation::Status => matches!(
+				context.actor.role,
+				ActorRole::DataNode
+					| ActorRole::Operator
+					| ActorRole::ReadOnlyObserver
+					| ActorRole::BreakGlassAdmin
+			),
+			ControlOperation::Lease
+			| ControlOperation::LeaseRelease
+			| ControlOperation::Transfer
+			| ControlOperation::AdvanceEpoch
+			| ControlOperation::Join => matches!(
+				context.actor.role,
+				ActorRole::DataNode | ActorRole::Operator | ActorRole::BreakGlassAdmin
+			),
+		};
+		if allowed {
+			return Ok(());
+		}
+		Err(Error::new(
+			ErrorKind::PermissionDenied,
+			format!(
+				"actor role {} is not allowed for {:?}",
+				context.actor.role, op
+			),
+		))
+	}
+
+	fn build_tenant_admin_frame(
+		&self,
+		stream_id: u32,
+		resp: &TenantAdminResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, resp)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TENANT_ADMIN_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	fn tenant_admin_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		message: impl Into<String>,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_tenant_admin_frame(
+			frame.header.stream_id,
+			&TenantAdminResponseWire {
+				accepted: false,
+				reason_code,
+				leader_hint: leader_hint.map(|node| node.id),
+				tenant: None,
+				tenants: Vec::new(),
+				message: Some(message.into()),
+			},
+		)
+	}
+
+	fn tenant_admin_tenant_wire(record: &TenantRecord) -> TenantAdminTenantWire {
+		TenantAdminTenantWire {
+			tenant_id: record.tenant_id,
+			quota_bytes: record.quota_bytes,
+			used_bytes: record.used_bytes,
+			replication_factor: record.replication_factor,
+			state: record.state,
+		}
+	}
+
+	fn build_create_tenant_request(
+		&self,
+		snapshot: &crate::consensus::raft_storage::SmState,
+		tenant_id: TenantId,
+		quota_bytes: u64,
+		replication_factor: u32,
+	) -> std::io::Result<CreateTenant> {
+		if snapshot.tenants.contains_key(&tenant_id) {
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("tenant {} already exists", tenant_id.get()),
+			));
+		}
+		if let Some(keyset) = snapshot.tenant_keysets.get(&tenant_id) {
+			keyset.active_tenant_kek_id.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"tenant {} keyset exists but has no active tenant_kek_id",
+						tenant_id.get()
+					),
+				)
+			})?;
+			return Ok(CreateTenant {
+				tenant_id,
+				quota_bytes,
+				replication_factor,
+				tenant_keyset: keyset.clone(),
+			});
+		}
+		let rotation = self.crypto.prepare_rotation(tenant_id)?;
+		let mut tenant_keyset = crate::crypto::TenantKeyset::default();
+		tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
+		tenant_keyset.keys.insert(
+			rotation.tenant_kek_id,
+			crate::crypto::WrappedTenantKek {
+				wrapped_key: rotation.wrapped_tenant_kek,
+			},
+		);
+		Ok(CreateTenant {
+			tenant_id,
+			quota_bytes,
+			replication_factor,
+			tenant_keyset,
+		})
+	}
+
+	fn tenant_admin_error_reason(message: &str) -> u8 {
+		if message.contains("does not exist") {
+			CONTROL_REASON_NOT_FOUND
+		} else if message.contains("already exists") {
+			CONTROL_REASON_INVALID_TARGET
+		} else {
+			CONTROL_REASON_INVALID_CONFIG
+		}
+	}
+
+	async fn tenant_admin_success_for_target(
+		&self,
+		stream_id: u32,
+		target_tenant_id: TenantId,
+	) -> std::io::Result<HrftFrame> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		let tenant = snapshot
+			.tenants
+			.get(&target_tenant_id)
+			.map(Self::tenant_admin_tenant_wire);
+		self.build_tenant_admin_frame(
+			stream_id,
+			&TenantAdminResponseWire {
+				accepted: true,
+				reason_code: CONTROL_REASON_GRANTED,
+				leader_hint: Some(self.local_node.id),
+				tenant,
+				tenants: Vec::new(),
+				message: None,
+			},
+		)
+	}
+
+	async fn submit_tenant_admin_mutation(
+		&self,
+		frame: &HrftFrame,
+		request: WendelonRequest,
+		target_tenant_id: TenantId,
+	) -> std::io::Result<HrftFrame> {
+		match self.raft.client_write(request).await {
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => {
+					self.tenant_admin_success_for_target(frame.header.stream_id, target_tenant_id)
+						.await
+				}
+				WendelonResponse::Error(message) => self.tenant_admin_rejection(
+					frame,
+					Self::tenant_admin_error_reason(&message),
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from tenant mutation",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
+		}
+	}
+
+	async fn handle_tenant_admin(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TENANT_ADMIN_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let request: TenantAdminRequestWire = wire::decode(&frame.meta)?;
+		let claimed_tenant = context.actor.claimed_tenant_id()?;
+		if claimed_tenant.is_some() {
+			return self.tenant_admin_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				"tenant-scoped principals may not use TenantAdmin",
+				None,
+			);
+		}
+
+		let is_read = matches!(
+			request,
+			TenantAdminRequestWire::Get { .. } | TenantAdminRequestWire::List
+		);
+		let allowed = if is_read {
+			matches!(
+				context.actor.role,
+				ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
+			)
+		} else {
+			matches!(
+				context.actor.role,
+				ActorRole::Operator | ActorRole::BreakGlassAdmin
+			)
+		};
+		if !allowed {
+			return self.tenant_admin_rejection(
+				&frame,
+				CONTROL_REASON_AUTHORIZATION_FAILED,
+				format!(
+					"actor role {} is not allowed for TenantAdmin",
+					context.actor.role
+				),
+				None,
+			);
+		}
+
+		if !self.is_leader().await {
+			return self.tenant_admin_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				"tenant admin requests must be sent to the current leader",
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		match request {
+			TenantAdminRequestWire::Create {
+				target_tenant_id,
+				quota_bytes,
+				replication_factor,
+			} => {
+				let snapshot = self.state_machine.state_snapshot().await;
+				let create = match self.build_create_tenant_request(
+					&snapshot,
+					target_tenant_id,
+					quota_bytes,
+					replication_factor,
+				) {
+					Ok(create) => create,
+					Err(err) => {
+						let message = err.to_string();
+						let reason = Self::tenant_admin_error_reason(&message);
+						return self.tenant_admin_rejection(&frame, reason, message, None);
+					}
+				};
+				self.submit_tenant_admin_mutation(
+					&frame,
+					WendelonRequest::CreateTenant(create),
+					target_tenant_id,
+				)
+				.await
+			}
+			TenantAdminRequestWire::UpdateQuota {
+				target_tenant_id,
+				quota_bytes,
+			} => {
+				self.submit_tenant_admin_mutation(
+					&frame,
+					WendelonRequest::UpdateTenantQuota(UpdateTenantQuota {
+						tenant_id: target_tenant_id,
+						quota_bytes,
+					}),
+					target_tenant_id,
+				)
+				.await
+			}
+			TenantAdminRequestWire::Suspend { target_tenant_id } => {
+				self.submit_tenant_admin_mutation(
+					&frame,
+					WendelonRequest::SuspendTenant(target_tenant_id),
+					target_tenant_id,
+				)
+				.await
+			}
+			TenantAdminRequestWire::Resume { target_tenant_id } => {
+				self.submit_tenant_admin_mutation(
+					&frame,
+					WendelonRequest::ResumeTenant(target_tenant_id),
+					target_tenant_id,
+				)
+				.await
+			}
+			TenantAdminRequestWire::Delete { target_tenant_id } => {
+				self.submit_tenant_admin_mutation(
+					&frame,
+					WendelonRequest::DeleteTenant(target_tenant_id),
+					target_tenant_id,
+				)
+				.await
+			}
+			TenantAdminRequestWire::Get { target_tenant_id } => {
+				let snapshot = self.state_machine.state_snapshot().await;
+				let Some(record) = snapshot.tenants.get(&target_tenant_id) else {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_NOT_FOUND,
+						format!("tenant {} does not exist", target_tenant_id.get()),
+						None,
+					);
+				};
+				self.build_tenant_admin_frame(
+					frame.header.stream_id,
+					&TenantAdminResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						tenant: Some(Self::tenant_admin_tenant_wire(record)),
+						tenants: Vec::new(),
+						message: None,
+					},
+				)
+			}
+			TenantAdminRequestWire::List => {
+				let snapshot = self.state_machine.state_snapshot().await;
+				let mut tenants = snapshot
+					.tenants
+					.values()
+					.map(Self::tenant_admin_tenant_wire)
+					.collect::<Vec<_>>();
+				tenants.sort_by_key(|tenant| tenant.tenant_id);
+				self.build_tenant_admin_frame(
+					frame.header.stream_id,
+					&TenantAdminResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						tenant: None,
+						tenants,
+						message: None,
+					},
+				)
+			}
+		}
 	}
 
 	pub async fn advance_membership_epoch(&self, next: MembershipEpoch) -> std::io::Result<()> {
@@ -1189,17 +1635,36 @@ impl WendelonControlServer {
 impl ControlRingServer for WendelonControlServer {
 	async fn handle_control_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		let resp = match msg_type {
-			MsgType::STATUS_REQ => self.handle_status(frame).await?,
-			MsgType::LEASE_REQ => self.handle_lease(remote, frame).await?,
-			MsgType::LEASE_RELEASE_REQ => self.handle_release(remote, frame).await?,
-			MsgType::TRANSFER_REQ => self.handle_transfer(remote, frame).await?,
-			MsgType::EPOCH_ADV_REQ => self.handle_advance_epoch(frame).await?,
-			MsgType::JOIN_REQ => self.handle_join(frame).await?,
+			MsgType::STATUS_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Status)?;
+				self.handle_status(frame).await?
+			}
+			MsgType::LEASE_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Lease)?;
+				self.handle_lease(context.remote, frame).await?
+			}
+			MsgType::LEASE_RELEASE_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::LeaseRelease)?;
+				self.handle_release(context.remote, frame).await?
+			}
+			MsgType::TRANSFER_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Transfer)?;
+				self.handle_transfer(context.remote, frame).await?
+			}
+			MsgType::EPOCH_ADV_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::AdvanceEpoch)?;
+				self.handle_advance_epoch(frame).await?
+			}
+			MsgType::JOIN_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::Join)?;
+				self.handle_join(frame).await?
+			}
+			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,

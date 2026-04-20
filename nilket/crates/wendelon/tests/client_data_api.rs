@@ -187,7 +187,7 @@ async fn advance_to_two_node_epoch(
 }
 
 fn key_locality(bytes: &[u8]) -> u64 {
-	Locality::from(Identity::blake3(bytes)).get()
+	Locality::from(Identity::blake3_tenant(tenant(), bytes)).get()
 }
 
 fn find_key_for_primary(ring: &wendelon::network::ring::RingRouter, target: NodeId) -> Vec<u8> {

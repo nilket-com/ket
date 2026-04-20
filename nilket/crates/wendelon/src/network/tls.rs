@@ -37,7 +37,7 @@
 //!   Rotations will need an outer supervisor.
 //! * Key log / TLS tracing for debugging.
 
-use crate::schema::NodeId;
+use crate::schema::{NodeId, TenantId};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
@@ -206,6 +206,22 @@ impl ActorIdentity {
 			scopes: vec!["cluster".to_string()],
 			key_id: node_id.id.to_le_bytes().to_vec(),
 			break_glass: false,
+		}
+	}
+
+	pub fn claimed_tenant_id(&self) -> std::io::Result<Option<TenantId>> {
+		match self.tenant_id.as_deref() {
+			None => Ok(None),
+			Some(raw) => raw
+				.parse::<u64>()
+				.map(TenantId::new)
+				.map(Some)
+				.map_err(|_| {
+					Error::new(
+						ErrorKind::PermissionDenied,
+						format!("actor tenant_id claim {raw:?} is not a valid u64"),
+					)
+				}),
 		}
 	}
 }

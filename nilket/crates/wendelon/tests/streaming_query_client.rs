@@ -111,7 +111,7 @@ fn extract_single_kv(batch: &RecordBatch) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn key_locality(bytes: &[u8]) -> u64 {
-	Locality::from(Identity::blake3(bytes)).get()
+	Locality::from(Identity::blake3_tenant(tenant(), bytes)).get()
 }
 
 async fn refresh_leases(node: &wendelon::node::WendelonNode) {

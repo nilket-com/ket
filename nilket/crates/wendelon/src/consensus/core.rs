@@ -1,6 +1,7 @@
-use crate::crypto::InstallTenantKekVersion;
+use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, LeaseDescriptor, NodeId, ReleaseLeaseRequestMeta, SlabId,
+	TenantId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -172,13 +173,86 @@ pub struct MigratedRangeTombstone {
 	pub migration_hlc_floor: HybridTimestamp,
 }
 
+/// Tenant lifecycle tracked by the authoritative state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TenantLifecycleState {
+	/// Reserved for a future multi-step provisioning flow. The W5
+	/// create path commits directly to `Active`.
+	Creating,
+	Active,
+	Suspended,
+	Deleting,
+	Deleted,
+}
+
+impl TenantLifecycleState {
+	pub fn allows_writes(self) -> bool {
+		matches!(self, Self::Active)
+	}
+
+	pub fn allows_reads(self) -> bool {
+		matches!(self, Self::Active | Self::Suspended)
+	}
+
+	pub fn can_transition_to(self, next: Self) -> bool {
+		matches!(
+			(self, next),
+			(Self::Creating, Self::Active)
+				| (Self::Active, Self::Suspended)
+				| (Self::Active, Self::Deleting)
+				| (Self::Active, Self::Deleted)
+				| (Self::Suspended, Self::Active)
+				| (Self::Suspended, Self::Deleting)
+				| (Self::Suspended, Self::Deleted)
+				| (Self::Deleting, Self::Deleted)
+		)
+	}
+}
+
+/// Authoritative tenant metadata replicated through Raft.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantRecord {
+	pub tenant_id: TenantId,
+	pub state: TenantLifecycleState,
+	pub quota_bytes: u64,
+	pub used_bytes: u64,
+	/// Stored now so per-tenant topology work can reuse the same
+	/// authoritative tenant record once replication-factor routing lands.
+	pub replication_factor: u32,
+}
+
+/// Raft-persisted form of a finalized write. The streamable
+/// [`FinalizationMarker`] remains the client-facing control-plane
+/// receipt; the replicated wrapper adds the tenant binding and the
+/// authoritative byte charge for quota accounting.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantFinalization {
+	pub marker: FinalizationMarker,
+	pub tenant_id: TenantId,
+	pub charged_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateTenant {
+	pub tenant_id: TenantId,
+	pub quota_bytes: u64,
+	pub replication_factor: u32,
+	pub tenant_keyset: TenantKeyset,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateTenantQuota {
+	pub tenant_id: TenantId,
+	pub quota_bytes: u64,
+}
+
 /// The state machine application data (mutations).
 /// In HashRaft, the actual data (Arrow batches) never enters the Raft log (ADR 003).
 /// The Raft log only contains control-ring metadata and Data Ring finalization markers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WendelonRequest {
 	/// A Data Ring quorum has been achieved; advance the E_safe watermark.
-	Finalize(FinalizationMarker),
+	Finalize(TenantFinalization),
 	/// Grant a Per-Range Lease to a Data Node.
 	AcquireLease(LeaseDescriptor),
 	/// Release a previously granted Per-Range Lease.
@@ -203,6 +277,20 @@ pub enum WendelonRequest {
 	/// replicas, and advances any descendant entries that were
 	/// sourcing from the now-superseded physical holder.
 	MigrationComplete(MigrationComplete),
+	/// Provision a tenant record plus its initial Tenant KEK in one
+	/// Raft commit so bootstrap and operator-driven tenant creation
+	/// exercise the same state-machine path.
+	CreateTenant(CreateTenant),
+	/// Update the authoritative storage quota for a tenant.
+	UpdateTenantQuota(UpdateTenantQuota),
+	/// Reject future writes while leaving reads available.
+	SuspendTenant(TenantId),
+	/// Re-open writes after a prior suspension.
+	ResumeTenant(TenantId),
+	/// Begin or complete tenant deletion. Empty tenants move
+	/// directly to `Deleted`; non-empty tenants park in `Deleting`
+	/// until later cleanup drives them to zero usage.
+	DeleteTenant(TenantId),
 	/// Install a fresh Tenant KEK version and mark it active for
 	/// subsequent slab DEK wraps. Historical versions remain in the
 	/// state machine so pre-rotation slabs keep decrypting.

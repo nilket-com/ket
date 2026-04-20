@@ -96,6 +96,7 @@ async fn build_transfer_fixture() -> (
 			.with_control_ring(Arc::new(WendelonControlServer::new(
 				leader.raft.clone(),
 				leader.state_machine.clone(),
+				leader.crypto.clone(),
 				leader.local_node,
 				epoch_tx,
 				epoch_rx,

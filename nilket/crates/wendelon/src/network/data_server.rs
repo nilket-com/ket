@@ -40,17 +40,17 @@ use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
 	HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry, MigrationState,
-	WendelonRaft, WendelonRequest, WendelonResponse, WendelonStateMachine,
+	TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse, WendelonStateMachine,
 };
 use crate::metrics::global as metrics;
-use crate::network::core::{
-	HRFT_MAGIC, read_frame, read_frame_from_header, read_frame_header, write_frame,
-};
+use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pool::BufPool;
 use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
+use crate::network::server::RequestContext;
+use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::MembershipEpoch;
 use crate::network::transport::TransportStream;
 use crate::schema::{
@@ -75,9 +75,10 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -85,6 +86,16 @@ use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
 
 type IdempotencyKey = ([u8; 16], u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataOperation {
+	Write,
+	Read,
+	Query,
+	Replicate,
+	Migrate,
+	StreamFinalization,
+}
 
 // ============================================================
 //  MIGRATION REGISTRY (Plan 019)
@@ -190,6 +201,63 @@ enum PointReadOutcome {
 	Hit(RecordLocation, Vec<u8>),
 	AuthoritativeMiss,
 	Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CachedTenantPolicy {
+	state: TenantLifecycleState,
+	quota_bytes: u64,
+	used_bytes: u64,
+	replication_factor: u32,
+	mean_write_size_bytes: u64,
+}
+
+impl Default for CachedTenantPolicy {
+	fn default() -> Self {
+		Self {
+			state: TenantLifecycleState::Creating,
+			quota_bytes: 0,
+			used_bytes: 0,
+			replication_factor: 0,
+			mean_write_size_bytes: 1,
+		}
+	}
+}
+
+#[derive(Debug, Default)]
+struct TenantPolicyCacheState {
+	policies: HashMap<TenantId, CachedTenantPolicy>,
+	last_refresh: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct TenantInflight {
+	count: u32,
+	bytes: u64,
+}
+
+struct TenantWriteReservation {
+	inflight: Arc<DashMap<TenantId, TenantInflight>>,
+	tenant_id: TenantId,
+	bytes: u64,
+	active: bool,
+}
+
+impl Drop for TenantWriteReservation {
+	fn drop(&mut self) {
+		if !self.active {
+			return;
+		}
+		let Some(mut entry) = self.inflight.get_mut(&self.tenant_id) else {
+			return;
+		};
+		entry.count = entry.count.saturating_sub(1);
+		entry.bytes = entry.bytes.saturating_sub(self.bytes);
+		if entry.count == 0 && entry.bytes == 0 {
+			drop(entry);
+			self.inflight.remove(&self.tenant_id);
+		}
+	}
 }
 
 // ============================================================
@@ -332,6 +400,14 @@ pub struct WendelonDataServer {
 	/// that keeps racing hot reads and sweeper passes from issuing
 	/// duplicate `MIGRATE_REQ` round-trips.
 	migration_registry: Arc<MigrationRegistry>,
+	/// Reconciled copy of the authoritative tenant table. Reads and
+	/// writes consult this cache on the fast path; a background sweep
+	/// refreshes it from the state machine.
+	tenant_policy_cache: Arc<RwLock<TenantPolicyCacheState>>,
+	/// In-flight write reservations per tenant. This keeps quota
+	/// overshoot bounded between reconciliation passes.
+	tenant_inflight: Arc<DashMap<TenantId, TenantInflight>>,
+	tenant_cache_refresh_interval: Duration,
 	/// Max records per `RANGE_PAGE` pull. Defaults to
 	/// [`DEFAULT_PAGE_MAX_RECORDS`]; tests shrink it so a paging
 	/// regression can be exercised without seeding thousands of
@@ -348,6 +424,8 @@ pub struct WendelonDataServer {
 pub const DEFAULT_PAGE_MAX_RECORDS: u32 = 1024;
 /// Default max arrow bytes per `RANGE_PAGE` response.
 pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
+pub const DEFAULT_TENANT_MAX_INFLIGHT_WRITES: u32 = 8;
+pub const DEFAULT_TENANT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 /// Per-subscriber queue depth for committed finalization markers.
 pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 /// Default wake cadence for the background migration sweeper.
@@ -391,6 +469,9 @@ impl Clone for WendelonDataServer {
 			lease_gate_enabled: self.lease_gate_enabled,
 			lease_authority: self.lease_authority.clone(),
 			migration_registry: self.migration_registry.clone(),
+			tenant_policy_cache: self.tenant_policy_cache.clone(),
+			tenant_inflight: self.tenant_inflight.clone(),
+			tenant_cache_refresh_interval: self.tenant_cache_refresh_interval,
 			page_max_records: self.page_max_records.clone(),
 			page_max_bytes: self.page_max_bytes.clone(),
 		}
@@ -427,6 +508,9 @@ impl WendelonDataServer {
 			lease_gate_enabled: false,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			migration_registry: Arc::new(MigrationRegistry::new()),
+			tenant_policy_cache: Arc::new(RwLock::new(TenantPolicyCacheState::default())),
+			tenant_inflight: Arc::new(DashMap::new()),
+			tenant_cache_refresh_interval: DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
 		}
@@ -475,12 +559,166 @@ impl WendelonDataServer {
 		self
 	}
 
+	pub async fn sync_tenant_policy_cache_once(&self) -> usize {
+		let snapshot = self.state_machine.state_snapshot().await;
+		let mut guard = self
+			.tenant_policy_cache
+			.write()
+			.expect("tenant policy cache poisoned");
+		let mut next = HashMap::with_capacity(snapshot.tenants.len());
+		for (tenant_id, record) in snapshot.tenants {
+			let mean_write_size_bytes = guard
+				.policies
+				.get(&tenant_id)
+				.map(|cached| cached.mean_write_size_bytes)
+				.unwrap_or(1)
+				.max(1);
+			next.insert(
+				tenant_id,
+				CachedTenantPolicy {
+					state: record.state,
+					quota_bytes: record.quota_bytes,
+					used_bytes: record.used_bytes,
+					replication_factor: record.replication_factor,
+					mean_write_size_bytes,
+				},
+			);
+		}
+		guard.policies = next;
+		guard.last_refresh = Some(Instant::now());
+		guard.policies.len()
+	}
+
+	pub fn spawn_tenant_policy_reconciler(self: Arc<Self>, tick: Duration) -> JoinHandle<()> {
+		tokio::spawn(async move {
+			let _ = self.sync_tenant_policy_cache_once().await;
+			let mut ticker = tokio::time::interval(tick);
+			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			loop {
+				ticker.tick().await;
+				let _ = self.sync_tenant_policy_cache_once().await;
+			}
+		})
+	}
+
 	/// Shared handle to the lease cache. The lease manager writes
 	/// to it; the write/read paths read from it. Exposed so the
 	/// manager task (which lives in a separate module) can take an
 	/// `Arc` without poking at private fields.
 	pub fn lease_cache(&self) -> Arc<RwLock<Vec<LeaseDescriptor>>> {
 		self.leases.clone()
+	}
+
+	async fn ensure_tenant_policy_fresh(&self) {
+		let refresh_needed = {
+			let guard = self
+				.tenant_policy_cache
+				.read()
+				.expect("tenant policy cache poisoned");
+			guard
+				.last_refresh
+				.is_none_or(|last| last.elapsed() >= self.tenant_cache_refresh_interval)
+		};
+		if refresh_needed {
+			let _ = self.sync_tenant_policy_cache_once().await;
+		}
+	}
+
+	async fn cached_tenant_policy(&self, tenant_id: TenantId) -> Option<CachedTenantPolicy> {
+		self.ensure_tenant_policy_fresh().await;
+		self.tenant_policy_cache
+			.read()
+			.expect("tenant policy cache poisoned")
+			.policies
+			.get(&tenant_id)
+			.copied()
+	}
+
+	async fn enforce_write_policy(
+		&self,
+		tenant_id: TenantId,
+		estimated_bytes: u64,
+	) -> Result<TenantWriteReservation, WriteStatus> {
+		let Some(policy) = self.cached_tenant_policy(tenant_id).await else {
+			return Err(WriteStatus::TENANT_UNAVAILABLE);
+		};
+		match policy.state {
+			TenantLifecycleState::Active => {}
+			TenantLifecycleState::Suspended => return Err(WriteStatus::TENANT_SUSPENDED),
+			TenantLifecycleState::Creating
+			| TenantLifecycleState::Deleting
+			| TenantLifecycleState::Deleted => return Err(WriteStatus::TENANT_UNAVAILABLE),
+		}
+		if policy.used_bytes >= policy.quota_bytes {
+			return Err(WriteStatus::QUOTA_EXCEEDED);
+		}
+
+		let inflight = self
+			.tenant_inflight
+			.get(&tenant_id)
+			.map(|entry| *entry.value())
+			.unwrap_or_default();
+		if inflight.count >= DEFAULT_TENANT_MAX_INFLIGHT_WRITES {
+			return Err(WriteStatus::QUOTA_EXCEEDED);
+		}
+		let mean_write_size = policy.mean_write_size_bytes.max(estimated_bytes).max(1);
+		let overshoot_budget =
+			(DEFAULT_TENANT_MAX_INFLIGHT_WRITES as u64).saturating_mul(mean_write_size);
+		let projected = policy
+			.used_bytes
+			.saturating_add(inflight.bytes)
+			.saturating_add(estimated_bytes);
+		if projected > policy.quota_bytes.saturating_add(overshoot_budget) {
+			return Err(WriteStatus::QUOTA_EXCEEDED);
+		}
+
+		self.tenant_inflight
+			.entry(tenant_id)
+			.and_modify(|entry| {
+				entry.count = entry.count.saturating_add(1);
+				entry.bytes = entry.bytes.saturating_add(estimated_bytes);
+			})
+			.or_insert(TenantInflight {
+				count: 1,
+				bytes: estimated_bytes,
+			});
+		Ok(TenantWriteReservation {
+			inflight: self.tenant_inflight.clone(),
+			tenant_id,
+			bytes: estimated_bytes,
+			active: true,
+		})
+	}
+
+	async fn enforce_read_policy(&self, tenant_id: TenantId) -> Result<(), ReadStatus> {
+		let Some(policy) = self.cached_tenant_policy(tenant_id).await else {
+			return Err(ReadStatus::TENANT_UNAVAILABLE);
+		};
+		if policy.state.allows_reads() {
+			return Ok(());
+		}
+		Err(ReadStatus::TENANT_UNAVAILABLE)
+	}
+
+	fn note_committed_write(&self, tenant_id: TenantId, charged_bytes: u64) {
+		let mut guard = self
+			.tenant_policy_cache
+			.write()
+			.expect("tenant policy cache poisoned");
+		let Some(policy) = guard.policies.get_mut(&tenant_id) else {
+			return;
+		};
+		// Conservatively anticipate the next reconciler sweep so a
+		// freshly-committed local write tightens quota admission
+		// immediately instead of waiting for the authoritative cache
+		// refresh.
+		policy.used_bytes = policy.used_bytes.saturating_add(charged_bytes);
+		policy.mean_write_size_bytes = if policy.mean_write_size_bytes == 0 {
+			charged_bytes.max(1)
+		} else {
+			((policy.mean_write_size_bytes.saturating_mul(7)).saturating_add(charged_bytes)) / 8
+		}
+		.max(1);
 	}
 
 	fn merge_commit_hlc(&self, client_hlc: HybridTimestamp) -> HybridTimestamp {
@@ -1157,6 +1395,159 @@ impl WendelonDataServer {
 		}
 	}
 
+	fn authorize_actor_for_data(
+		&self,
+		actor: &ActorIdentity,
+		target_tenant: Option<TenantId>,
+		op: DataOperation,
+	) -> std::io::Result<()> {
+		if let Some(claimed_tenant) = actor.claimed_tenant_id()? {
+			if target_tenant.is_none() {
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					format!(
+						"actor tenant {} is not allowed to access cross-tenant {:?}",
+						claimed_tenant.get(),
+						op
+					),
+				));
+			}
+			if target_tenant
+				.map(|target_tenant| target_tenant != claimed_tenant)
+				.unwrap_or(false)
+			{
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					format!(
+						"actor tenant {} is not allowed to target tenant {}",
+						claimed_tenant.get(),
+						target_tenant.unwrap().get()
+					),
+				));
+			}
+		}
+
+		let allowed = match op {
+			DataOperation::Write
+			| DataOperation::Read
+			| DataOperation::Query
+			| DataOperation::StreamFinalization => matches!(
+				actor.role,
+				ActorRole::DataNode | ActorRole::Operator | ActorRole::BreakGlassAdmin
+			),
+			DataOperation::Replicate | DataOperation::Migrate => {
+				matches!(actor.role, ActorRole::DataNode)
+			}
+		};
+		if allowed {
+			return Ok(());
+		}
+
+		Err(Error::new(
+			ErrorKind::PermissionDenied,
+			format!("actor role {} is not allowed for {:?}", actor.role, op),
+		))
+	}
+
+	fn unauthorized_write_frame(
+		&self,
+		msg_type: MsgType,
+		stream_id: u32,
+		meta: &WriteRequestMeta,
+	) -> HrftFrame {
+		self.build_write_response_frame(
+			msg_type,
+			stream_id,
+			error_response(meta, WriteStatus::AUTHORIZATION_FAILED, self.local_node),
+			None,
+		)
+	}
+
+	fn unauthorized_read_frame(&self, stream_id: u32, meta: &ReadRequestMeta) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&error_read_response(
+				meta,
+				ReadStatus::AUTHORIZATION_FAILED,
+				self.local_node,
+			)));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	fn unauthorized_query_frame(&self, stream_id: u32, meta: &QueryRequestMeta) -> HrftFrame {
+		self.build_query_response_frame(
+			stream_id,
+			query_error_meta(meta, ReadStatus::AUTHORIZATION_FAILED, self.local_node),
+			None,
+			FRAME_FLAG_STREAM_END,
+		)
+	}
+
+	fn unauthorized_replicate_frame(&self, stream_id: u32) -> HrftFrame {
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&ReplicaWriteRespMeta {
+				status: ReplicaWriteStatus::NOT_AUTHORIZED,
+				ack_level: ReplicaAckLevel::NONE,
+				_pad: [0; 6],
+			}));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::REPLICATE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	fn unauthorized_migrate_frame(&self, stream_id: u32, meta: &MigrateRequestMeta) -> HrftFrame {
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&migrate_error_meta(
+				meta,
+				MigrateStatus::NOT_AUTHORIZED,
+				ZERO_NODE,
+			)));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::MIGRATE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
 	fn decode_stream_finalization_request(
 		&self,
 		frame: &HrftFrame,
@@ -1180,10 +1571,9 @@ impl WendelonDataServer {
 
 	async fn handle_stream_finalization_stream(
 		&self,
-		first_header: FrameHeader,
+		frame: HrftFrame,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
-		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
 		let request = self.decode_stream_finalization_request(&frame)?;
 		let mut rx = self
 			.stream_finalization(request.start_log_index, request.epoch)
@@ -1216,11 +1606,10 @@ impl WendelonDataServer {
 
 	async fn handle_query_stream(
 		&self,
-		first_header: FrameHeader,
+		frame: HrftFrame,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
 		metrics().data_ring_query_requests_total.inc();
-		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
 		let plan = self
 			.prepare_query_execution_plan_with_migration(&meta, &bytecode)
@@ -1281,32 +1670,31 @@ impl WendelonDataServer {
 
 	async fn handle_bulk_stream(
 		&self,
-		first_header: FrameHeader,
+		first_frame: HrftFrame,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
-		let mut next_header = Some(first_header);
+		let mut next_frame = Some(first_frame);
 		loop {
-			let header = if let Some(header) = next_header.take() {
-				header
+			let frame = if let Some(frame) = next_frame.take() {
+				frame
 			} else {
-				match read_frame_header(&mut *stream).await {
-					Ok(header) => header,
+				match read_frame(&mut *stream, &self.pool).await {
+					Ok(frame) => frame,
 					Err(e) if e.kind() == ErrorKind::UnexpectedEof => break,
 					Err(e) => return Err(e),
 				}
 			};
 
-			if header.msg_type != MsgType::BULK_WRITE_REQ.0 {
+			if frame.header.msg_type != MsgType::BULK_WRITE_REQ.0 {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					format!(
 						"BULK_WRITE stream expected BULK_WRITE_REQ item, got msg_type=0x{:02x}",
-						header.msg_type
+						frame.header.msg_type
 					),
 				));
 			}
 
-			let frame = read_frame_from_header(&mut *stream, &self.pool, header).await?;
 			let (meta, payload) = self.decode_write_request_frame(&frame, "BULK_WRITE_REQ")?;
 			let (resp, trailing) = match self.write(meta, payload).await {
 				Ok(ok) => ok,
@@ -1951,6 +2339,12 @@ impl WendelonDataServer {
 				locations: Vec::new(),
 			});
 		}
+		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
+			return Ok(QueryExecutionPlan {
+				response: query_error_meta(meta, status, self.local_node),
+				locations: Vec::new(),
+			});
+		}
 
 		// Gate #2: LINEARIZABLE watermark. The scan (and any
 		// migration fan-out it would trigger) is only authoritative
@@ -2161,16 +2555,128 @@ impl WendelonDataServer {
 impl DataRingServer for WendelonDataServer {
 	async fn handle_data_frame(
 		&self,
-		_remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		match msg_type {
-			MsgType::WRITE_REQ => self.handle_write(frame).await.map(Some),
-			MsgType::READ_REQ => self.handle_read(frame).await.map(Some),
-			MsgType::REPLICATE_REQ => self.handle_replicate(frame).await.map(Some),
-			MsgType::QUERY_REQ => self.handle_query(frame).await.map(Some),
-			MsgType::MIGRATE_REQ => self.handle_migrate(frame).await.map(Some),
+			MsgType::WRITE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<WriteRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"WRITE_REQ meta too small",
+					));
+				}
+				let meta: WriteRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Write,
+					)
+					.is_err()
+				{
+					return Ok(Some(self.unauthorized_write_frame(
+						MsgType::WRITE_RESP,
+						frame.header.stream_id,
+						&meta,
+					)));
+				}
+				self.handle_write(frame).await.map(Some)
+			}
+			MsgType::READ_REQ => {
+				if frame.meta.len() < std::mem::size_of::<ReadRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"READ_REQ meta too small",
+					));
+				}
+				let meta: ReadRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReadRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Read,
+					)
+					.is_err()
+				{
+					return Ok(Some(
+						self.unauthorized_read_frame(frame.header.stream_id, &meta),
+					));
+				}
+				self.handle_read(frame).await.map(Some)
+			}
+			MsgType::REPLICATE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"REPLICATE_REQ meta too small",
+					));
+				}
+				let meta: ReplicaWriteMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReplicaWriteMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Replicate,
+					)
+					.is_err()
+				{
+					return Ok(Some(
+						self.unauthorized_replicate_frame(frame.header.stream_id),
+					));
+				}
+				self.handle_replicate(frame).await.map(Some)
+			}
+			MsgType::QUERY_REQ => {
+				if frame.meta.len() < std::mem::size_of::<QueryRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"QUERY_REQ meta too small",
+					));
+				}
+				let meta: QueryRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Query,
+					)
+					.is_err()
+				{
+					return Ok(Some(
+						self.unauthorized_query_frame(frame.header.stream_id, &meta),
+					));
+				}
+				self.handle_query(frame).await.map(Some)
+			}
+			MsgType::MIGRATE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<MigrateRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"MIGRATE_REQ meta too small",
+					));
+				}
+				let meta: MigrateRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<MigrateRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Migrate,
+					)
+					.is_err()
+				{
+					return Ok(Some(
+						self.unauthorized_migrate_frame(frame.header.stream_id, &meta),
+					));
+				}
+				self.handle_migrate(frame).await.map(Some)
+			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
 				format!(
@@ -2183,17 +2689,87 @@ impl DataRingServer for WendelonDataServer {
 
 	async fn handle_data_stream(
 		&self,
-		_remote: NodeId,
+		context: RequestContext,
 		first_header: FrameHeader,
-		stream: Box<dyn TransportStream>,
+		mut stream: Box<dyn TransportStream>,
 		_pool: Arc<BufPool>,
 	) -> std::io::Result<()> {
+		let frame = read_frame_from_header(&mut *stream, &self.pool, first_header).await?;
 		match MsgType(first_header.msg_type) {
-			MsgType::BULK_WRITE_REQ => self.handle_bulk_stream(first_header, stream).await,
-			MsgType::QUERY_REQ => self.handle_query_stream(first_header, stream).await,
+			MsgType::BULK_WRITE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<WriteRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"BULK_WRITE_REQ meta too small",
+					));
+				}
+				let meta: WriteRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Write,
+					)
+					.is_err()
+				{
+					let response = self.unauthorized_write_frame(
+						MsgType::BULK_WRITE_RESP,
+						frame.header.stream_id,
+						&meta,
+					);
+					write_frame(
+						&mut *stream,
+						&response.header,
+						&response.meta,
+						None,
+						response.trailing.as_deref(),
+					)
+					.await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				self.handle_bulk_stream(frame, stream).await
+			}
+			MsgType::QUERY_REQ => {
+				if frame.meta.len() < std::mem::size_of::<QueryRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"QUERY_REQ meta too small",
+					));
+				}
+				let meta: QueryRequestMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Query,
+					)
+					.is_err()
+				{
+					let response = self.unauthorized_query_frame(frame.header.stream_id, &meta);
+					write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				self.handle_query_stream(frame, stream).await
+			}
 			MsgType::STREAM_FIN_REQ => {
-				self.handle_stream_finalization_stream(first_header, stream)
-					.await
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						None,
+						DataOperation::StreamFinalization,
+					)
+					.is_err()
+				{
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"actor is not allowed to open STREAM_FIN_REQ",
+					));
+				}
+				self.handle_stream_finalization_stream(frame, stream).await
 			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
@@ -2245,7 +2821,7 @@ impl DataRing for WendelonDataServer {
 
 		// 4. Pull the key out of the Arrow payload and hash it.
 		let key_bytes = extract_first_binary(&payload, "key")?;
-		let key_identity = Identity::blake3(key_bytes);
+		let key_identity = Identity::blake3_tenant(meta.tenant_id, key_bytes);
 		let key_locality = Locality::from(key_identity).get();
 
 		// 4a. Per-range lease gate (plan 018). When enabled, this
@@ -2302,6 +2878,13 @@ impl DataRing for WendelonDataServer {
 		// ack is computed against the same authoritative blob.
 		let frame_bytes = Arc::new(encode_batch(&payload)?);
 		let payload_hash = blake3_32(frame_bytes.as_slice());
+		let _quota_reservation = match self
+			.enforce_write_policy(meta.tenant_id, frame_bytes.len() as u64)
+			.await
+		{
+			Ok(reservation) => reservation,
+			Err(status) => return Ok((error_response(&meta, status, self.local_node), None)),
+		};
 
 		// 6. HLC for this write. The leader is authoritative: it
 		// merges the client's timestamp with its own monotonic HLC
@@ -2415,7 +2998,13 @@ impl DataRing for WendelonDataServer {
 
 		let (status, log_index, term) = match self
 			.raft
-			.client_write(WendelonRequest::Finalize(marker))
+			.client_write(WendelonRequest::Finalize(
+				crate::consensus::TenantFinalization {
+					marker,
+					tenant_id: meta.tenant_id,
+					charged_bytes: frame_bytes.len() as u64,
+				},
+			))
 			.await
 		{
 			Ok(resp) => (
@@ -2442,6 +3031,9 @@ impl DataRing for WendelonDataServer {
 			has_finalization: if meta.await_finalization != 0 { 1 } else { 0 },
 			_pad2: [0; 7],
 		};
+		if status == WriteStatus::OK {
+			self.note_committed_write(meta.tenant_id, frame_bytes.len() as u64);
+		}
 		self.idempotency.insert(key, response);
 
 		let trailing = if meta.await_finalization != 0 && status == WriteStatus::OK {
@@ -2465,6 +3057,9 @@ impl DataRing for WendelonDataServer {
 				error_read_response(&meta, ReadStatus::EPOCH_STALE, self.local_node),
 				None,
 			));
+		}
+		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
+			return Ok((error_read_response(&meta, status, self.local_node), None));
 		}
 
 		// 1. Consistency gate. LINEARIZABLE requires the local SM
@@ -2492,7 +3087,7 @@ impl DataRing for WendelonDataServer {
 
 		// 2. Hash the key payload and probe the slab index.
 		let key_bytes = extract_first_binary(&key, "key")?;
-		let key_identity = Identity::blake3(key_bytes);
+		let key_identity = Identity::blake3_tenant(meta.tenant_id, key_bytes);
 		let key_locality = Locality::from(key_identity).get();
 
 		// 2a. Per-range lease gate for LINEARIZABLE reads (plan 018).
@@ -3263,7 +3858,11 @@ fn build_value_batch(value: &[u8]) -> std::io::Result<RecordBatch> {
 
 #[cfg(test)]
 fn key_locality(bytes: &[u8]) -> u64 {
-	Locality::from(Identity::blake3(bytes)).get()
+	Locality::from(Identity::blake3_tenant(
+		crate::schema::TenantId::ZERO,
+		bytes,
+	))
+	.get()
 }
 
 fn blake3_32(bytes: &[u8]) -> [u8; 32] {
@@ -3687,6 +4286,17 @@ mod tests {
 		let mut keys = LargeBinaryBuilder::new();
 		keys.append_value(b"k");
 		RecordBatch::try_new(schema, vec![Arc::new(keys.finish())]).unwrap()
+	}
+
+	fn actor(role: ActorRole, tenant_id: Option<&str>) -> ActorIdentity {
+		ActorIdentity::new(
+			role,
+			None,
+			tenant_id.map(str::to_string),
+			vec!["cluster".to_string()],
+			vec![1, 2, 3, 4],
+		)
+		.unwrap()
 	}
 
 	#[tokio::test]
@@ -4643,7 +5253,16 @@ mod tests {
 			Some(s) => s,
 			None => return,
 		};
-		let response = match svc.handle_frame(ZERO_NODE, frame).await {
+		let response = match svc
+			.handle_frame(
+				RequestContext {
+					remote: ZERO_NODE,
+					actor: ActorIdentity::data_node(ZERO_NODE),
+				},
+				frame,
+			)
+			.await
+		{
 			Ok(Some(r)) => r,
 			_ => return,
 		};
@@ -4830,7 +5449,7 @@ mod tests {
 	impl HrftService for CrashyReplicaService {
 		async fn handle_frame(
 			&self,
-			_remote: NodeId,
+			_context: RequestContext,
 			frame: HrftFrame,
 		) -> std::io::Result<Option<HrftFrame>> {
 			if frame.header.msg_type != MsgType::REPLICATE_REQ.0 {
@@ -5077,8 +5696,8 @@ mod tests {
 		let append_only_key = b"append-only";
 		let durable_key_locality = key_locality(durable_key);
 		let append_only_key_locality = key_locality(append_only_key);
-		let durable_key_identity = Identity::blake3(durable_key);
-		let append_only_key_identity = Identity::blake3(append_only_key);
+		let durable_key_identity = Identity::blake3_tenant(tenant(), durable_key);
+		let append_only_key_identity = Identity::blake3_tenant(tenant(), append_only_key);
 		let fx = build_durability_fixture(durable_key_locality, append_only_key_locality).await;
 
 		let durable_value = b"v-durable";
@@ -5653,5 +6272,164 @@ mod tests {
 		let mut keys: Vec<u64> = merged.iter().map(|(k, _)| *k).collect();
 		keys.sort();
 		assert_eq!(keys, vec![0, 1, 2, 3, 4]);
+	}
+
+	#[tokio::test]
+	async fn dispatcher_rejects_cross_tenant_write_before_handler() {
+		let dir = bootstrap_tempdir("auth-write");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			21,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let mut meta = simple_write_meta(1);
+		meta.tenant_id = TenantId::new(9);
+		let payload = encode_batch(&single_kv_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::WRITE_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, Some("7")),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: WriteResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<WriteResponseMeta>()]);
+		assert_eq!(meta.status, WriteStatus::AUTHORIZATION_FAILED);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_rejects_read_only_observer_data_read() {
+		let dir = bootstrap_tempdir("auth-read");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			22,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let meta = simple_read_meta(1);
+		let key = encode_batch(&single_key_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&key);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::ReadOnlyObserver, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: ReadResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::AUTHORIZATION_FAILED);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_rejects_tenant_scoped_actor_opening_finalization_stream() {
+		use tokio::io::AsyncWriteExt;
+
+		let dir = bootstrap_tempdir("auth-stream-fin");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			23,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let request = StreamFinalizationRequestMeta {
+			start_log_index: 0,
+			epoch: 1,
+		};
+		let first_header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::STREAM_FIN_REQ.0,
+			flags: 0,
+			stream_id: 1,
+			meta_len: std::mem::size_of::<StreamFinalizationRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		let (mut client_side, server_side) = tokio::io::duplex(1024);
+		client_side
+			.write_all(bytemuck::bytes_of(&request))
+			.await
+			.unwrap();
+		client_side.shutdown().await.unwrap();
+
+		let err = DataRingServer::handle_data_stream(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, Some("7")),
+			},
+			first_header,
+			Box::new(DuplexTransportStream { inner: server_side }),
+			node.pool.clone(),
+		)
+		.await
+		.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+		assert!(err.to_string().contains("STREAM_FIN_REQ"));
+
+		node.handles.abort();
 	}
 }

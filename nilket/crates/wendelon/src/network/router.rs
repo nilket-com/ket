@@ -34,9 +34,9 @@
 
 use crate::network::core::{HrftFrame, read_frame_from_header, read_frame_header, write_frame};
 use crate::network::pool::BufPool;
-use crate::network::server::HrftService;
+use crate::network::server::{HrftService, RequestContext};
 use crate::network::transport::TransportStream;
-use crate::schema::{FrameHeader, MsgType, NodeId};
+use crate::schema::{FrameHeader, MsgType};
 use async_trait::async_trait;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -50,7 +50,7 @@ use std::sync::Arc;
 pub trait DataRingServer: Send + Sync + 'static {
 	async fn handle_data_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>>;
 
@@ -59,13 +59,13 @@ pub trait DataRingServer: Send + Sync + 'static {
 	/// implementors only need to override it for true streaming RPCs.
 	async fn handle_data_stream(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		first_header: FrameHeader,
 		mut stream: Box<dyn TransportStream>,
 		pool: Arc<BufPool>,
 	) -> std::io::Result<()> {
 		let frame = read_frame_from_header(&mut *stream, &pool, first_header).await?;
-		match self.handle_data_frame(remote, frame).await? {
+		match self.handle_data_frame(context, frame).await? {
 			Some(resp) => {
 				write_frame(
 					&mut *stream,
@@ -90,7 +90,7 @@ pub trait DataRingServer: Send + Sync + 'static {
 pub trait ControlRingServer: Send + Sync + 'static {
 	async fn handle_control_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>>;
 }
@@ -100,7 +100,7 @@ pub trait ControlRingServer: Send + Sync + 'static {
 pub trait RaftInternalServer: Send + Sync + 'static {
 	async fn handle_raft_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>>;
 }
@@ -128,21 +128,21 @@ impl MsgRouter {
 impl HrftService for MsgRouter {
 	async fn handle_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = frame.header.msg_type;
 		match msg_type {
 			0x01..=0x0F => match &self.data {
-				Some(h) => h.handle_data_frame(remote, frame).await,
+				Some(h) => h.handle_data_frame(context, frame).await,
 				None => Err(unhandled("Data Ring", msg_type)),
 			},
 			0x10..=0x1F => match &self.control {
-				Some(h) => h.handle_control_frame(remote, frame).await,
+				Some(h) => h.handle_control_frame(context, frame).await,
 				None => Err(unhandled("Control Ring", msg_type)),
 			},
 			0x20..=0x2F => match &self.raft {
-				Some(h) => h.handle_raft_frame(remote, frame).await,
+				Some(h) => h.handle_raft_frame(context, frame).await,
 				None => Err(unhandled("Raft internal", msg_type)),
 			},
 			_ => Err(Error::new(
@@ -156,7 +156,7 @@ impl HrftService for MsgRouter {
 		&self,
 		mut stream: Box<dyn TransportStream>,
 		pool: Arc<BufPool>,
-		remote: NodeId,
+		context: RequestContext,
 	) -> std::io::Result<()> {
 		let header = read_frame_header(&mut *stream).await?;
 		if header.msg_type == MsgType::BULK_WRITE_REQ.0
@@ -164,13 +164,13 @@ impl HrftService for MsgRouter {
 			|| header.msg_type == MsgType::QUERY_REQ.0
 		{
 			return match &self.data {
-				Some(h) => h.handle_data_stream(remote, header, stream, pool).await,
+				Some(h) => h.handle_data_stream(context, header, stream, pool).await,
 				None => Err(unhandled("Data Ring", header.msg_type)),
 			};
 		}
 
 		let frame = read_frame_from_header(&mut *stream, &pool, header).await?;
-		match self.handle_frame(remote, frame).await? {
+		match self.handle_frame(context, frame).await? {
 			Some(resp) => {
 				write_frame(
 					&mut *stream,

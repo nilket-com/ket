@@ -48,9 +48,9 @@
 
 use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
 use crate::consensus::{
-	AdvanceEpochRecord, EpochConfig, MigratedRangeTombstone, MigrationComplete,
-	MigrationLedgerEntry, MigrationState, SeedMigration, TieredSlab, WendelonRequest,
-	WendelonResponse, WendelonTypeConfig,
+	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
+	MigrationLedgerEntry, MigrationState, SeedMigration, TenantLifecycleState, TenantRecord,
+	TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
 use crate::schema::{
@@ -1376,6 +1376,11 @@ pub struct SmState {
 	/// Physical reclaim is deferred to tombstone-aware compaction.
 	#[serde(default)]
 	pub tombstones: Vec<MigratedRangeTombstone>,
+	/// Authoritative tenant metadata: lifecycle state, quota, and
+	/// accounted bytes. This is the replicated source of truth the
+	/// data-path cache periodically reconciles from.
+	#[serde(default)]
+	pub tenants: HashMap<crate::schema::TenantId, TenantRecord>,
 	/// Wrapped Tenant KEKs keyed by tenant. Historical versions are
 	/// retained so pre-rotation slabs keep decrypting while new slabs
 	/// wrap under the current active KEK version.
@@ -1386,26 +1391,6 @@ pub struct SmState {
 	/// reorder hazards in future upgrades.
 	#[serde(default)]
 	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
-}
-
-/// Durable postcard compatibility mirror for snapshots produced
-/// before W4 appended `tenant_keysets` to [`SmState`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct LegacySnapshotCompatState {
-	last_applied_log_id: Option<LogId<u32>>,
-	last_membership: StoredMembership<u32, BasicNode>,
-	#[serde(default)]
-	epoch_history: BTreeMap<u64, EpochConfig>,
-	leases: HashMap<u64, crate::schema::LeaseDescriptor>,
-	e_safe_watermarks: HashMap<u64, HybridTimestamp>,
-	#[serde(default)]
-	last_e_safe_index: u64,
-	#[serde(default)]
-	tiered_slabs: HashMap<SlabId, TieredSlab>,
-	#[serde(default)]
-	migrations: HashMap<u64, MigrationLedgerEntry>,
-	#[serde(default)]
-	tombstones: Vec<MigratedRangeTombstone>,
 }
 
 /// Out-of-band observer for [`TieredSlab`] apply events.
@@ -2020,8 +2005,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					}
 					_ => None,
 				};
+				let is_create_tenant = matches!(
+					&entry.payload,
+					EntryPayload::Normal(WendelonRequest::CreateTenant(_))
+				);
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
-				let tenant_kek_rotation_applied = matches!(&resp, WendelonResponse::Success);
+				let applied_successfully = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
 					Some(prev) if prev > entry.log_id => prev,
 					_ => entry.log_id,
@@ -2030,23 +2019,21 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					pending_tier_events.push((t, entry.log_id.index));
 				}
 				if let Some(rotation) = tenant_kek_rotation {
-					if tenant_kek_rotation_applied {
+					if applied_successfully {
 						pending_tenant_kek_events.push((rotation, entry.log_id.index));
 						pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
 					}
 				}
+				// CreateTenant installs the initial tenant keyset directly in
+				// the state machine without a separate InstallTenantKekVersion
+				// entry. The local CryptoManager still needs to learn about
+				// the new keys, so reconcile from the committed snapshot.
+				if is_create_tenant && applied_successfully {
+					pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
+				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
-					let emit_audit = !matches!(
-						(&entry.payload, &resp),
-						(
-							EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(_)),
-							WendelonResponse::Error(_)
-						)
-					);
-					if emit_audit {
-						if let Some(event) = raft_audit_event(materializer.local_node, &entry) {
-							pending_audit_events.push(event);
-						}
+					if let Some(event) = raft_audit_event(materializer.local_node, &entry, &resp) {
+						pending_audit_events.push(event);
 					}
 				}
 				if let Some(marker) = canonical_finalization_marker(&entry) {
@@ -2312,11 +2299,22 @@ fn apply_entry_to_state(
 fn raft_audit_event(
 	local_node: SchemaNodeId,
 	entry: &Entry<WendelonTypeConfig>,
+	resp: &WendelonResponse,
 ) -> Option<AuditEvent> {
 	let EntryPayload::Normal(req) = &entry.payload else {
 		return None;
 	};
+	let is_err = matches!(resp, WendelonResponse::Error(_));
+	let outcome = audit_outcome_field(resp);
 	match req {
+		// Non-tenant-admin mutations emit on success only; the apply-layer
+		// can reject for transient state-machine reasons and an error
+		// record per replay would flood the audit log.
+		WendelonRequest::AdvanceEpoch(_) | WendelonRequest::InstallTenantKekVersion(_)
+			if is_err =>
+		{
+			None
+		}
 		WendelonRequest::AdvanceEpoch(record) => Some(AuditEvent::new(
 			AuditAuthority::RaftLog,
 			"control_ring.epoch_advanced",
@@ -2343,7 +2341,82 @@ fn raft_audit_event(
 				rotation.tenant_kek_id,
 			),
 		)),
+		// Tenant admin ops are attempt-audited per ADR 021 §5: every
+		// mutation — including rejected ones — emits a record so the
+		// audit stream can be reconciled against the tenant FSM.
+		WendelonRequest::CreateTenant(create) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"tenant.created",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} replication_factor={} tenant_kek_id={} {outcome}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				create.tenant_id.get(),
+				create.quota_bytes,
+				create.replication_factor,
+				create
+					.tenant_keyset
+					.active_tenant_kek_id
+					.map(|id| id.get())
+					.unwrap_or(0),
+			),
+		)),
+		WendelonRequest::UpdateTenantQuota(update) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"tenant.quota_updated",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} {outcome}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				update.tenant_id.get(),
+				update.quota_bytes,
+			),
+		)),
+		WendelonRequest::SuspendTenant(tenant_id) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"tenant.suspended",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				tenant_id.get(),
+			),
+		)),
+		WendelonRequest::ResumeTenant(tenant_id) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"tenant.resumed",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				tenant_id.get(),
+			),
+		)),
+		WendelonRequest::DeleteTenant(tenant_id) => Some(AuditEvent::new(
+			AuditAuthority::RaftLog,
+			"tenant.delete_requested",
+			local_node,
+			format!(
+				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
+				entry.log_id.index,
+				entry.log_id.leader_id.term,
+				tenant_id.get(),
+			),
+		)),
 		_ => None,
+	}
+}
+
+fn audit_outcome_field(resp: &WendelonResponse) -> String {
+	match resp {
+		WendelonResponse::Error(message) => {
+			format!("outcome=error reason={:?}", message)
+		}
+		_ => "outcome=success".to_string(),
 	}
 }
 
@@ -2361,8 +2434,8 @@ fn format_epoch_peer_ids(config: &EpochConfig) -> String {
 
 fn canonical_finalization_marker(entry: &Entry<WendelonTypeConfig>) -> Option<FinalizationMarker> {
 	match &entry.payload {
-		EntryPayload::Normal(WendelonRequest::Finalize(marker)) => {
-			let mut marker = *marker;
+		EntryPayload::Normal(WendelonRequest::Finalize(finalization)) => {
+			let mut marker = finalization.marker;
 			marker.log_index = entry.log_id.index;
 			marker.term = entry.log_id.leader_id.term;
 			marker.e_safe_index = entry.log_id.index;
@@ -2392,20 +2465,31 @@ fn apply_request(
 	req: WendelonRequest,
 ) -> (WendelonResponse, Option<TieredSlab>) {
 	match req {
-		WendelonRequest::Finalize(marker) => {
+		WendelonRequest::Finalize(finalization) => {
 			// E_safe advances monotonically within an epoch —
 			// keep the later HLC.
 			state
 				.e_safe_watermarks
-				.entry(marker.epoch)
+				.entry(finalization.marker.epoch)
 				.and_modify(|hlc| {
-					if marker.commit_hlc > *hlc {
-						*hlc = marker.commit_hlc;
+					if finalization.marker.commit_hlc > *hlc {
+						*hlc = finalization.marker.commit_hlc;
 					}
 				})
-				.or_insert(marker.commit_hlc);
-			if marker.e_safe_index > state.last_e_safe_index {
-				state.last_e_safe_index = marker.e_safe_index;
+				.or_insert(finalization.marker.commit_hlc);
+			if finalization.marker.e_safe_index > state.last_e_safe_index {
+				state.last_e_safe_index = finalization.marker.e_safe_index;
+			}
+			if let Some(tenant) = state.tenants.get_mut(&finalization.tenant_id) {
+				// Only charge accounting while the tenant is accepting
+				// writes. A Finalize that lands after Suspend/Delete
+				// should not inflate used_bytes further — the data-layer
+				// already rejects new admissions in those states; this
+				// is defense in depth for in-flight writes.
+				if tenant.state.allows_writes() {
+					tenant.used_bytes =
+						tenant.used_bytes.saturating_add(finalization.charged_bytes);
+				}
 			}
 			(WendelonResponse::Success, None)
 		}
@@ -2485,7 +2569,38 @@ fn apply_request(
 			state.tiered_slabs.insert(tier.slab_id, tier.clone());
 			(WendelonResponse::Success, Some(tier))
 		}
+		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
+		WendelonRequest::UpdateTenantQuota(update) => {
+			(apply_update_tenant_quota(state, update), None)
+		}
+		WendelonRequest::SuspendTenant(tenant_id) => (
+			apply_tenant_state_transition(state, tenant_id, TenantLifecycleState::Suspended),
+			None,
+		),
+		WendelonRequest::ResumeTenant(tenant_id) => (
+			apply_tenant_state_transition(state, tenant_id, TenantLifecycleState::Active),
+			None,
+		),
+		WendelonRequest::DeleteTenant(tenant_id) => (apply_delete_tenant(state, tenant_id), None),
 		WendelonRequest::InstallTenantKekVersion(rotation) => {
+			let Some(tenant) = state.tenants.get(&rotation.tenant_id) else {
+				return (
+					WendelonResponse::Error(format!(
+						"tenant {} does not exist",
+						rotation.tenant_id.get()
+					)),
+					None,
+				);
+			};
+			if tenant.state == TenantLifecycleState::Deleted {
+				return (
+					WendelonResponse::Error(format!(
+						"tenant {} is deleted",
+						rotation.tenant_id.get()
+					)),
+					None,
+				);
+			}
 			let keyset = state.tenant_keysets.entry(rotation.tenant_id).or_default();
 			match keyset.keys.entry(rotation.tenant_kek_id) {
 				std::collections::btree_map::Entry::Occupied(existing) => {
@@ -2518,6 +2633,130 @@ fn apply_request(
 			(WendelonResponse::Success, None)
 		}
 	}
+}
+
+fn apply_create_tenant(state: &mut SmState, create: CreateTenant) -> WendelonResponse {
+	if create.replication_factor == 0 {
+		return WendelonResponse::Error(format!(
+			"tenant {} replication_factor must be greater than zero",
+			create.tenant_id.get()
+		));
+	}
+	if state.tenants.contains_key(&create.tenant_id) {
+		return WendelonResponse::Error(format!(
+			"tenant {} already exists",
+			create.tenant_id.get()
+		));
+	}
+
+	let record = TenantRecord {
+		tenant_id: create.tenant_id,
+		state: TenantLifecycleState::Active,
+		quota_bytes: create.quota_bytes,
+		used_bytes: 0,
+		replication_factor: create.replication_factor,
+	};
+	let Some(active_tenant_kek_id) = create.tenant_keyset.active_tenant_kek_id else {
+		return WendelonResponse::Error(format!(
+			"tenant {} create request is missing an active tenant_kek_id",
+			create.tenant_id.get()
+		));
+	};
+	if !create
+		.tenant_keyset
+		.keys
+		.contains_key(&active_tenant_kek_id)
+	{
+		return WendelonResponse::Error(format!(
+			"tenant {} active tenant_kek_id {} is missing wrapped key bytes",
+			create.tenant_id.get(),
+			active_tenant_kek_id.get()
+		));
+	}
+	state.tenants.insert(create.tenant_id, record);
+	let keyset = state.tenant_keysets.entry(create.tenant_id).or_default();
+	for (tenant_kek_id, wrapped) in create.tenant_keyset.keys {
+		if let Some(existing) = keyset.keys.get(&tenant_kek_id) {
+			if existing != &wrapped {
+				return WendelonResponse::Error(format!(
+					"tenant {} tenant_kek_id {} has conflicting wrapped key bytes",
+					create.tenant_id.get(),
+					tenant_kek_id.get()
+				));
+			}
+		}
+		keyset.keys.insert(tenant_kek_id, wrapped);
+	}
+	keyset.active_tenant_kek_id = Some(active_tenant_kek_id);
+	WendelonResponse::Success
+}
+
+fn apply_update_tenant_quota(state: &mut SmState, update: UpdateTenantQuota) -> WendelonResponse {
+	let Some(record) = state.tenants.get_mut(&update.tenant_id) else {
+		return WendelonResponse::Error(format!(
+			"tenant {} does not exist",
+			update.tenant_id.get()
+		));
+	};
+	if record.state == TenantLifecycleState::Deleted {
+		return WendelonResponse::Error(format!("tenant {} is deleted", update.tenant_id.get()));
+	}
+	record.quota_bytes = update.quota_bytes;
+	WendelonResponse::Success
+}
+
+fn apply_tenant_state_transition(
+	state: &mut SmState,
+	tenant_id: crate::schema::TenantId,
+	next: TenantLifecycleState,
+) -> WendelonResponse {
+	let Some(record) = state.tenants.get_mut(&tenant_id) else {
+		return WendelonResponse::Error(format!("tenant {} does not exist", tenant_id.get()));
+	};
+	if record.state == next {
+		return WendelonResponse::Success;
+	}
+	if !record.state.can_transition_to(next) {
+		return WendelonResponse::Error(format!(
+			"tenant {} cannot transition from {:?} to {:?}",
+			tenant_id.get(),
+			record.state,
+			next
+		));
+	}
+	record.state = next;
+	WendelonResponse::Success
+}
+
+fn apply_delete_tenant(
+	state: &mut SmState,
+	tenant_id: crate::schema::TenantId,
+) -> WendelonResponse {
+	let Some(record) = state.tenants.get_mut(&tenant_id) else {
+		return WendelonResponse::Error(format!("tenant {} does not exist", tenant_id.get()));
+	};
+	if record.state == TenantLifecycleState::Deleted {
+		return WendelonResponse::Success;
+	}
+	let next = if record.used_bytes == 0 {
+		TenantLifecycleState::Deleted
+	} else {
+		TenantLifecycleState::Deleting
+	};
+	if record.state != next && !record.state.can_transition_to(next) {
+		return WendelonResponse::Error(format!(
+			"tenant {} cannot transition from {:?} to {:?}",
+			tenant_id.get(),
+			record.state,
+			next
+		));
+	}
+	record.state = next;
+	if next == TenantLifecycleState::Deleted {
+		record.quota_bytes = 0;
+		state.tenant_keysets.remove(&tenant_id);
+	}
+	WendelonResponse::Success
 }
 
 fn apply_advance_epoch(state: &mut SmState, record: AdvanceEpochRecord) {
@@ -3421,7 +3660,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 	let padded = page_round_up(total);
 
 	let (kind, epoch) = match &entry.payload {
-		EntryPayload::Normal(WendelonRequest::Finalize(m)) => (LogEntryKind::APPEND, m.epoch),
+		EntryPayload::Normal(WendelonRequest::Finalize(m)) => {
+			(LogEntryKind::APPEND, m.marker.epoch)
+		}
 		EntryPayload::Normal(WendelonRequest::AcquireLease(l)) => (LogEntryKind::APPEND, l.epoch),
 		EntryPayload::Normal(WendelonRequest::ReleaseLease(l)) => (LogEntryKind::APPEND, l.epoch),
 		EntryPayload::Normal(WendelonRequest::AdvanceEpoch(r)) => {
@@ -3429,6 +3670,11 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::ResumeTenant(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::DeleteTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
@@ -3678,27 +3924,7 @@ fn decode_snapshot_state_bytes(body: &[u8]) -> Result<SmState, String> {
 			"snapshot has unexpected trailing bytes: {}",
 			trailing.len()
 		)),
-		Err(current_err) => match postcard::take_from_bytes::<LegacySnapshotCompatState>(body) {
-			Ok((legacy, [])) => Ok(SmState {
-				last_applied_log_id: legacy.last_applied_log_id,
-				last_membership: legacy.last_membership,
-				epoch_history: legacy.epoch_history,
-				leases: legacy.leases,
-				e_safe_watermarks: legacy.e_safe_watermarks,
-				last_e_safe_index: legacy.last_e_safe_index,
-				tiered_slabs: legacy.tiered_slabs,
-				migrations: legacy.migrations,
-				tombstones: legacy.tombstones,
-				tenant_keysets: HashMap::new(),
-			}),
-			Ok((_legacy, trailing)) => Err(format!(
-				"snapshot has unexpected trailing bytes after legacy decode: {}",
-				trailing.len()
-			)),
-			Err(legacy_err) => Err(format!(
-				"snapshot postcard decode failed for current schema ({current_err}) and legacy pre-W4 schema ({legacy_err})"
-			)),
-		},
+		Err(err) => Err(format!("snapshot postcard decode failed: {err}")),
 	}
 }
 
@@ -3762,66 +3988,20 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 mod recovery_tests {
 	use super::*;
-	use crate::schema::{
-		FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId, ReleaseLeaseRequestMeta,
-		TenantId,
-	};
+	use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId, TenantId};
 	use crate::storage::{
 		AlignedBuf, AsyncFileOps, BlockingFileOps, DirectoryEntry, FaultAction, FaultOp,
 		FaultyFileOps, FileHandle, InjectedFault, OpenFlags,
 	};
 	use openraft::Vote;
 	use openraft::storage::{RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
-	use serde::{Deserialize, Serialize};
-	use std::collections::{BTreeMap, HashMap};
+	use std::collections::HashMap;
 	use std::fs::OpenOptions;
 	use std::io::Write;
 	use std::path::PathBuf;
 	use std::sync::{Arc, Mutex};
 	use std::time::Duration;
 	use tokio::sync::Notify;
-
-	#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-	pub enum LegacyWendelonRequest {
-		Finalize(FinalizationMarker),
-		AcquireLease(LeaseDescriptor),
-		ReleaseLease(ReleaseLeaseRequestMeta),
-		AdvanceEpoch(AdvanceEpochRecord),
-		#[serde(with = "serde_bytes")]
-		SchemaUpdate(Vec<u8>),
-		TierSlab(TieredSlab),
-		SeedMigration(SeedMigration),
-		MigrationComplete(MigrationComplete),
-	}
-
-	openraft::declare_raft_types!(
-		pub LegacyCompatTypeConfig:
-			D = LegacyWendelonRequest,
-			R = WendelonResponse,
-			NodeId = u32,
-			Node = openraft::BasicNode,
-			Entry = openraft::Entry<LegacyCompatTypeConfig>,
-			SnapshotData = SnapshotDataFile,
-			AsyncRuntime = openraft::TokioRuntime,
-	);
-
-	#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-	pub struct LegacySmState {
-		last_applied_log_id: Option<LogId<u32>>,
-		last_membership: StoredMembership<u32, BasicNode>,
-		#[serde(default)]
-		epoch_history: BTreeMap<u64, EpochConfig>,
-		leases: HashMap<u64, crate::schema::LeaseDescriptor>,
-		e_safe_watermarks: HashMap<u64, HybridTimestamp>,
-		#[serde(default)]
-		last_e_safe_index: u64,
-		#[serde(default)]
-		tiered_slabs: HashMap<SlabId, TieredSlab>,
-		#[serde(default)]
-		migrations: HashMap<u64, MigrationLedgerEntry>,
-		#[serde(default)]
-		tombstones: Vec<MigratedRangeTombstone>,
-	}
 
 	fn tempdir(tag: &str) -> PathBuf {
 		let dir = std::env::temp_dir().join(format!(
@@ -3894,71 +4074,27 @@ mod recovery_tests {
 	fn finalize_entry(index: u64, physical_ms: u64) -> Entry<WendelonTypeConfig> {
 		Entry {
 			log_id: log_id(1, index),
-			payload: EntryPayload::Normal(WendelonRequest::Finalize(FinalizationMarker {
-				log_index: index,
-				term: 1,
-				epoch: 1,
-				commit_hlc: HybridTimestamp {
-					physical_ms,
-					logical: 0,
-					node_id: 1,
+			payload: EntryPayload::Normal(WendelonRequest::Finalize(
+				crate::consensus::TenantFinalization {
+					marker: FinalizationMarker {
+						log_index: index,
+						term: 1,
+						epoch: 1,
+						commit_hlc: HybridTimestamp {
+							physical_ms,
+							logical: 0,
+							node_id: 1,
+						},
+						payload_hash: [0; 32],
+						e_safe_index: index,
+						durability: crate::schema::DurabilityLevel::QUORUM,
+						_pad: [0; 7],
+					},
+					tenant_id: TenantId::ZERO,
+					charged_bytes: 0,
 				},
-				payload_hash: [0; 32],
-				e_safe_index: index,
-				durability: crate::schema::DurabilityLevel::QUORUM,
-				_pad: [0; 7],
-			})),
+			)),
 		}
-	}
-
-	fn legacy_seed_migration_entry(
-		index: u64,
-		seed: SeedMigration,
-	) -> Entry<LegacyCompatTypeConfig> {
-		Entry {
-			log_id: log_id(1, index),
-			payload: EntryPayload::Normal(LegacyWendelonRequest::SeedMigration(seed)),
-		}
-	}
-
-	fn encode_legacy_entry_record(
-		entry: &Entry<LegacyCompatTypeConfig>,
-	) -> (WALRecordHeader, Vec<u8>) {
-		let payload = postcard::to_allocvec(entry).unwrap();
-		let seed = match &entry.payload {
-			EntryPayload::Normal(LegacyWendelonRequest::SeedMigration(seed)) => seed,
-			other => panic!("unexpected legacy entry payload for compat test: {other:?}"),
-		};
-		let fixed = RaftLogEntryFixed {
-			kind: LogEntryKind::APPEND,
-			_pad1: [0; 7],
-			term: entry.log_id.leader_id.term,
-			index: entry.log_id.index,
-			epoch: seed.entry.to_epoch,
-			leader: SchemaNodeId {
-				id: entry.log_id.leader_id.node_id,
-				_reserved: 0,
-			},
-			entry_hlc: HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: entry.log_id.leader_id.node_id,
-			},
-			payload_len: payload.len() as u32,
-			_pad2: [0; 4],
-			payload_hash: blake3_32(&payload),
-		};
-		let header = WALRecordHeader {
-			record_type: REC_LOG_ENTRY,
-			_pad1: [0; 7],
-			body_len: (std::mem::size_of::<RaftLogEntryFixed>() + payload.len()) as u64,
-			log_index: entry.log_id.index,
-			term: entry.log_id.leader_id.term,
-		};
-		let mut body = Vec::with_capacity(std::mem::size_of::<RaftLogEntryFixed>() + payload.len());
-		body.extend_from_slice(bytemuck::bytes_of(&fixed));
-		body.extend_from_slice(&payload);
-		(header, body)
 	}
 
 	fn write_vote_file(path: &Path, vote: Vote<u32>) {
@@ -4168,6 +4304,26 @@ mod recovery_tests {
 			.unwrap();
 	}
 
+	fn create_tenant_for_rotation(
+		tenant_id: TenantId,
+		rotation: &InstallTenantKekVersion,
+	) -> CreateTenant {
+		let mut tenant_keyset = crate::crypto::TenantKeyset::default();
+		tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
+		tenant_keyset.keys.insert(
+			rotation.tenant_kek_id,
+			crate::crypto::WrappedTenantKek {
+				wrapped_key: rotation.wrapped_tenant_kek.clone(),
+			},
+		);
+		CreateTenant {
+			tenant_id,
+			quota_bytes: u64::MAX,
+			replication_factor: 1,
+			tenant_keyset,
+		}
+	}
+
 	fn named_segment_paths(dir: &Path) -> Vec<PathBuf> {
 		let mut out = std::fs::read_dir(dir)
 			.unwrap()
@@ -4241,160 +4397,6 @@ mod recovery_tests {
 		let snapshot = sm.state_snapshot().await;
 		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
 		assert_eq!(snapshot.leases.len(), 1);
-	}
-
-	#[test]
-	fn decode_log_record_accepts_legacy_seed_migration_variant_order() {
-		let seed = SeedMigration {
-			entry: MigrationLedgerEntry {
-				migration_id: 77,
-				range_start: 10,
-				range_end: 19,
-				from_epoch: 1,
-				to_epoch: 2,
-				logical_owner: SchemaNodeId {
-					id: 3,
-					_reserved: 0,
-				},
-				upstream_migration_id: Some(41),
-				source_replicas: vec![
-					SchemaNodeId {
-						id: 7,
-						_reserved: 0,
-					},
-					SchemaNodeId {
-						id: 8,
-						_reserved: 0,
-					},
-				],
-				migration_hlc_floor: HybridTimestamp {
-					physical_ms: 111,
-					logical: 0,
-					node_id: 3,
-				},
-				state: MigrationState::Pending,
-				completed_by: None,
-				completed_at_hlc: None,
-			},
-		};
-		let legacy = legacy_seed_migration_entry(7, seed.clone());
-		let (header, body) = encode_legacy_entry_record(&legacy);
-
-		let decoded = decode_log_record(
-			Path::new("legacy-pre-w4-seed-migration.wal"),
-			0,
-			&header,
-			&body,
-			std::mem::size_of::<RaftLogEntryFixed>(),
-		)
-		.unwrap();
-
-		assert_eq!(decoded.log_id, legacy.log_id);
-		match decoded.payload {
-			EntryPayload::Normal(WendelonRequest::SeedMigration(decoded_seed)) => {
-				assert_eq!(decoded_seed, seed);
-			}
-			other => panic!("legacy SeedMigration decoded as wrong variant: {other:?}"),
-		}
-	}
-
-	#[test]
-	fn decode_snapshot_reader_accepts_legacy_pre_w4_sm_state_order() {
-		let migration = MigrationLedgerEntry {
-			migration_id: 88,
-			range_start: 20,
-			range_end: 29,
-			from_epoch: 1,
-			to_epoch: 2,
-			logical_owner: SchemaNodeId {
-				id: 4,
-				_reserved: 0,
-			},
-			upstream_migration_id: Some(55),
-			source_replicas: vec![SchemaNodeId {
-				id: 6,
-				_reserved: 0,
-			}],
-			migration_hlc_floor: HybridTimestamp {
-				physical_ms: 222,
-				logical: 0,
-				node_id: 4,
-			},
-			state: MigrationState::Pending,
-			completed_by: None,
-			completed_at_hlc: None,
-		};
-		let tombstone = MigratedRangeTombstone {
-			migration_id: migration.migration_id,
-			range_start: migration.range_start,
-			range_end: migration.range_end,
-			to_epoch: migration.to_epoch,
-			completed_by: SchemaNodeId {
-				id: 9,
-				_reserved: 0,
-			},
-			migration_hlc_floor: HybridTimestamp {
-				physical_ms: 333,
-				logical: 0,
-				node_id: 9,
-			},
-		};
-		let tier = TieredSlab {
-			slab_id: SlabId::new(44),
-			l2_uri: "memory://legacy-tiered-44".into(),
-			payload_hash: [0x5a; 32],
-			is_encrypted: false,
-		};
-		let legacy = LegacySmState {
-			last_applied_log_id: Some(log_id(3, 12)),
-			last_membership: SmState::default().last_membership,
-			epoch_history: BTreeMap::from([(
-				2,
-				EpochConfig {
-					epoch: 2,
-					peers: BTreeMap::new(),
-				},
-			)]),
-			leases: HashMap::new(),
-			e_safe_watermarks: HashMap::new(),
-			last_e_safe_index: 12,
-			tiered_slabs: HashMap::from([(tier.slab_id, tier.clone())]),
-			migrations: HashMap::from([(migration.migration_id, migration.clone())]),
-			tombstones: vec![tombstone.clone()],
-		};
-		let body = postcard::to_allocvec(&legacy).unwrap();
-		let header = SnapshotHeader {
-			last_included_index: 12,
-			last_included_term: 3,
-			last_included_epoch: 0,
-			snapshot_hlc: HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: 0,
-			},
-			state_sha256: blake3_32(&body),
-			cache_checkpoint_len: 0,
-			_pad: [0; 4],
-		};
-		let mut encoded = Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + body.len());
-		encoded.extend_from_slice(bytemuck::bytes_of(&header));
-		encoded.extend_from_slice(&body);
-
-		let (_decoded_header, state) =
-			decode_snapshot_reader(std::io::Cursor::new(encoded)).unwrap();
-
-		assert_eq!(state.last_applied_log_id, legacy.last_applied_log_id);
-		assert_eq!(state.last_e_safe_index, legacy.last_e_safe_index);
-		assert_eq!(state.tiered_slabs.get(&tier.slab_id), Some(&tier));
-		assert_eq!(
-			state.migrations.get(&migration.migration_id),
-			Some(&migration)
-		);
-		assert_eq!(state.tombstones.as_slice(), &[tombstone]);
-		assert!(
-			state.tenant_keysets.is_empty(),
-			"legacy pre-W4 snapshot must default tenant_keysets empty"
-		);
 	}
 
 	#[tokio::test]
@@ -4582,8 +4584,8 @@ mod recovery_tests {
 			&mut sm,
 			Entry {
 				log_id: log_id(1, 1),
-				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
-					first.clone(),
+				payload: EntryPayload::Normal(WendelonRequest::CreateTenant(
+					create_tenant_for_rotation(TenantId::ZERO, &first),
 				)),
 			},
 		)
@@ -4671,6 +4673,7 @@ mod recovery_tests {
 			.unwrap()
 			.with_tenant_kek_observer(observer.clone());
 		let crypto = crate::crypto::CryptoManager::new_dev();
+		let seed = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 		let rotation = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 
 		append_and_apply(
@@ -4678,6 +4681,17 @@ mod recovery_tests {
 			&mut sm,
 			Entry {
 				log_id: log_id(1, 1),
+				payload: EntryPayload::Normal(WendelonRequest::CreateTenant(
+					create_tenant_for_rotation(TenantId::ZERO, &seed),
+				)),
+			},
+		)
+		.await;
+		append_and_apply(
+			&mut store,
+			&mut sm,
+			Entry {
+				log_id: log_id(1, 2),
 				payload: EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(
 					rotation.clone(),
 				)),
@@ -5713,11 +5727,26 @@ mod migration_tests {
 #[cfg(test)]
 mod tenant_kek_tests {
 	use super::*;
+	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::schema::{TenantId, TenantKekId};
+
+	fn seed_active_tenant(state: &mut SmState, tenant_id: TenantId) {
+		state.tenants.insert(
+			tenant_id,
+			TenantRecord {
+				tenant_id,
+				state: TenantLifecycleState::Active,
+				quota_bytes: u64::MAX,
+				used_bytes: 0,
+				replication_factor: 3,
+			},
+		);
+	}
 
 	#[test]
 	fn rotate_tenant_kek_rejects_conflicting_duplicate_ids() {
 		let mut state = SmState::default();
+		seed_active_tenant(&mut state, TenantId::ZERO);
 		let first = InstallTenantKekVersion {
 			tenant_id: TenantId::ZERO,
 			tenant_kek_id: TenantKekId::try_from(7).unwrap(),
@@ -5756,5 +5785,48 @@ mod tenant_kek_tests {
 				.wrapped_key,
 			first.wrapped_tenant_kek
 		);
+	}
+
+	#[test]
+	fn create_tenant_preserves_preexisting_historical_keyset_versions() {
+		let tenant_id = TenantId::ZERO;
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let historical = WrappedTenantKek {
+			wrapped_key: vec![1; 40],
+		};
+		let active = WrappedTenantKek {
+			wrapped_key: vec![2; 40],
+		};
+
+		let mut state = SmState::default();
+		let mut existing_keyset = TenantKeyset::default();
+		existing_keyset.active_tenant_kek_id = Some(active_id);
+		existing_keyset
+			.keys
+			.insert(historical_id, historical.clone());
+		existing_keyset.keys.insert(active_id, active.clone());
+		state.tenant_keysets.insert(tenant_id, existing_keyset);
+
+		let mut request_keyset = TenantKeyset::default();
+		request_keyset.active_tenant_kek_id = Some(active_id);
+		request_keyset.keys.insert(active_id, active.clone());
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::CreateTenant(CreateTenant {
+				tenant_id,
+				quota_bytes: 1024,
+				replication_factor: 3,
+				tenant_keyset: request_keyset,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+
+		let keyset = state.tenant_keysets.get(&tenant_id).unwrap();
+		assert_eq!(keyset.active_tenant_kek_id, Some(active_id));
+		assert_eq!(keyset.keys.len(), 2);
+		assert_eq!(keyset.keys.get(&historical_id), Some(&historical));
+		assert_eq!(keyset.keys.get(&active_id), Some(&active));
 	}
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
-use wendelon::consensus::{WendelonLogStore, WendelonRequest};
+use wendelon::consensus::{TenantFinalization, WendelonLogStore, WendelonRequest};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, SlabId, TenantId,
@@ -50,6 +50,18 @@ fn finalize_marker(epoch: u64, physical_ms: u64, node_id: u32) -> FinalizationMa
 	}
 }
 
+fn tenant_finalization(
+	tenant_id: TenantId,
+	charged_bytes: u64,
+	marker: FinalizationMarker,
+) -> TenantFinalization {
+	TenantFinalization {
+		marker,
+		tenant_id,
+		charged_bytes,
+	}
+}
+
 fn id(locality: u64) -> Identity {
 	let mut bytes = [0u8; 32];
 	bytes[..8].copy_from_slice(&locality.to_le_bytes());
@@ -88,10 +100,10 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 		.await
 		.unwrap();
 	node.raft
-		.client_write(WendelonRequest::Finalize(finalize_marker(
-			77,
-			4_200,
-			node.local_node.id,
+		.client_write(WendelonRequest::Finalize(tenant_finalization(
+			tenant(),
+			frame.len() as u64,
+			finalize_marker(77, 4_200, node.local_node.id),
 		)))
 		.await
 		.unwrap();
@@ -157,7 +169,11 @@ async fn restored_backup_bootstraps_and_serves_recovered_state() {
 	let marker = finalize_marker(88, 9_900, source.local_node.id);
 	source
 		.raft
-		.client_write(WendelonRequest::Finalize(marker))
+		.client_write(WendelonRequest::Finalize(tenant_finalization(
+			tenant(),
+			(first_frame.len() + second_frame.len()) as u64,
+			marker,
+		)))
 		.await
 		.unwrap();
 

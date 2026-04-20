@@ -26,7 +26,6 @@
 //!   request drain has completed.
 
 use crate::audit::{AuditClockDriftSubscriber, AuditSink, LocalAuditSink};
-use crate::consensus::WendelonRaft;
 use crate::consensus::hlc::HybridLogicalClockDriver;
 use crate::consensus::monitor::{
 	AbortHandle, ClockDriftEvent, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL,
@@ -39,6 +38,7 @@ use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
 	CheckpointCoordinator, DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
 };
+use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
 use crate::metrics::observability::{
 	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
@@ -48,8 +48,8 @@ use crate::network::control_server::{
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
-	MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS,
-	WendelonDataServer,
+	DEFAULT_TENANT_CACHE_REFRESH_INTERVAL, MIGRATION_SWEEP_FAILURE_BACKOFF,
+	MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS, WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::{
@@ -91,6 +91,11 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
+
+// The bootstrap/default tenant stays unbounded in W5 so dev and
+// single-tenant clusters exercise the same tenant create/quota code path
+// without tripping an arbitrary cap before operators set a real quota.
+const DEFAULT_TENANT_QUOTA_BYTES: u64 = u64::MAX;
 
 // ============================================================
 //  CONFIG
@@ -447,8 +452,9 @@ pub struct NodeHandles {
 	pub eviction_watchdog: JoinHandle<()>,
 	pub lease_manager: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
+	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
-	pub tenant_kek_seeder: JoinHandle<()>,
+	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
 }
 
@@ -459,8 +465,9 @@ impl NodeHandles {
 		self.eviction_watchdog.abort();
 		self.lease_manager.abort();
 		self.epoch_reconciler.abort();
+		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
-		self.tenant_kek_seeder.abort();
+		self.default_tenant_seeder.abort();
 		self.checkpoint_emitter.abort();
 	}
 
@@ -471,8 +478,9 @@ impl NodeHandles {
 		await_background_task(self.eviction_watchdog, "eviction watchdog").await?;
 		await_background_task(self.lease_manager, "lease manager").await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
+		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
-		await_background_task(self.tenant_kek_seeder, "tenant KEK seeder").await?;
+		await_background_task(self.default_tenant_seeder, "default tenant seeder").await?;
 		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
 	}
@@ -650,6 +658,18 @@ impl WendelonNode {
 	}
 
 	pub async fn rotate_tenant_kek(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
+		if !self
+			.state_machine
+			.state_snapshot()
+			.await
+			.tenants
+			.contains_key(&tenant_id)
+		{
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!("tenant {} does not exist", tenant_id.get()),
+			));
+		}
 		let rotation = self.crypto.prepare_rotation(tenant_id)?;
 		let tenant_kek_id = rotation.tenant_kek_id;
 		commit_install_tenant_kek_version(&self.raft, rotation, "rotate_tenant_kek").await?;
@@ -661,6 +681,66 @@ impl WendelonNode {
 			)));
 		}
 		Ok(tenant_kek_id)
+	}
+
+	pub async fn create_tenant(
+		&self,
+		tenant_id: TenantId,
+		quota_bytes: u64,
+		replication_factor: u32,
+	) -> std::io::Result<()> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		let request = build_create_tenant_request(
+			&snapshot,
+			self.crypto.as_ref(),
+			tenant_id,
+			quota_bytes,
+			replication_factor,
+		)?;
+		commit_create_tenant(&self.raft, request, "create_tenant").await
+	}
+
+	pub async fn update_tenant_quota(
+		&self,
+		tenant_id: TenantId,
+		quota_bytes: u64,
+	) -> std::io::Result<()> {
+		commit_tenant_request(
+			&self.raft,
+			WendelonRequest::UpdateTenantQuota(crate::consensus::UpdateTenantQuota {
+				tenant_id,
+				quota_bytes,
+			}),
+			"update_tenant_quota",
+		)
+		.await
+	}
+
+	pub async fn suspend_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
+		commit_tenant_request(
+			&self.raft,
+			WendelonRequest::SuspendTenant(tenant_id),
+			"suspend_tenant",
+		)
+		.await
+	}
+
+	pub async fn resume_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
+		commit_tenant_request(
+			&self.raft,
+			WendelonRequest::ResumeTenant(tenant_id),
+			"resume_tenant",
+		)
+		.await
+	}
+
+	pub async fn delete_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
+		commit_tenant_request(
+			&self.raft,
+			WendelonRequest::DeleteTenant(tenant_id),
+			"delete_tenant",
+		)
+		.await
 	}
 
 	/// Build every subsystem using the supplied outbound transport.
@@ -926,6 +1006,7 @@ impl WendelonNode {
 			WendelonControlServer::new(
 				raft.clone(),
 				state_machine.clone(),
+				crypto.clone(),
 				local_node,
 				epoch_tx.clone(),
 				epoch_rx.clone(),
@@ -1025,6 +1106,7 @@ impl WendelonNode {
 				&state_machine,
 				crypto.as_ref(),
 				local_node,
+				cfg.rf as u32,
 			)
 			.await?
 			{
@@ -1032,26 +1114,38 @@ impl WendelonNode {
 				DefaultTenantKekSeedState::Retry => {
 					return Err(Error::new(
 						ErrorKind::Other,
-						"lost local leadership while seeding the default tenant KEK during fresh bootstrap",
+						"lost local leadership while seeding the default tenant during fresh bootstrap",
 					));
 				}
 			}
 		}
-		let tenant_kek_seeder = if state_machine
+		let default_tenant_seeder = if state_machine
 			.state_snapshot()
 			.await
-			.tenant_keysets
+			.tenants
 			.contains_key(&TenantId::ZERO)
 		{
 			tokio::spawn(async {})
 		} else {
-			spawn_default_tenant_kek_seeder(
+			spawn_default_tenant_seeder(
 				raft.clone(),
 				state_machine.clone(),
 				crypto.clone(),
 				local_node,
+				cfg.rf as u32,
 			)
 		};
+
+		// Prime the tenant policy cache from the freshly seeded state
+		// machine before spawning the periodic reconciler. Otherwise
+		// the reconciler's first tick could race ahead of the seed,
+		// stamp `last_refresh` on an empty snapshot, and starve the
+		// next `ensure_tenant_policy_fresh` call of a real refresh for
+		// a full tick interval.
+		let _ = data_server.sync_tenant_policy_cache_once().await;
+		let tenant_policy_reconciler = data_server
+			.clone()
+			.spawn_tenant_policy_reconciler(DEFAULT_TENANT_CACHE_REFRESH_INTERVAL);
 
 		// 15. Eviction watchdog. Route leader-driven epoch changes
 		//     back through the same Control Ring compound workflow
@@ -1116,8 +1210,9 @@ impl WendelonNode {
 				eviction_watchdog,
 				lease_manager,
 				epoch_reconciler,
+				tenant_policy_reconciler,
 				migration_sweeper,
-				tenant_kek_seeder,
+				default_tenant_seeder,
 				checkpoint_emitter,
 			},
 		})
@@ -1255,19 +1350,19 @@ async fn serve_dyn(
 	impl HrftService for DynService {
 		async fn handle_frame(
 			&self,
-			remote: crate::schema::NodeId,
+			context: crate::network::server::RequestContext,
 			frame: crate::network::core::HrftFrame,
 		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
-			self.0.handle_frame(remote, frame).await
+			self.0.handle_frame(context, frame).await
 		}
 
 		async fn handle_stream(
 			&self,
 			stream: Box<dyn crate::network::transport::TransportStream>,
 			pool: Arc<BufPool>,
-			remote: crate::schema::NodeId,
+			context: crate::network::server::RequestContext,
 		) -> std::io::Result<()> {
-			self.0.handle_stream(stream, pool, remote).await
+			self.0.handle_stream(stream, pool, context).await
 		}
 	}
 	serve(
@@ -1293,19 +1388,19 @@ async fn serve_dyn_tcp_tls(
 	impl HrftService for DynService {
 		async fn handle_frame(
 			&self,
-			remote: crate::schema::NodeId,
+			context: crate::network::server::RequestContext,
 			frame: crate::network::core::HrftFrame,
 		) -> std::io::Result<Option<crate::network::core::HrftFrame>> {
-			self.0.handle_frame(remote, frame).await
+			self.0.handle_frame(context, frame).await
 		}
 
 		async fn handle_stream(
 			&self,
 			stream: Box<dyn crate::network::transport::TransportStream>,
 			pool: Arc<BufPool>,
-			remote: crate::schema::NodeId,
+			context: crate::network::server::RequestContext,
 		) -> std::io::Result<()> {
-			self.0.handle_stream(stream, pool, remote).await
+			self.0.handle_stream(stream, pool, context).await
 		}
 	}
 
@@ -1458,10 +1553,86 @@ async fn commit_install_tenant_kek_version(
 	}
 }
 
+async fn commit_tenant_request(
+	raft: &WendelonRaft,
+	request: WendelonRequest,
+	context: &str,
+) -> std::io::Result<()> {
+	let response = raft
+		.client_write(request)
+		.await
+		.map_err(|err| Error::new(ErrorKind::Other, format!("{context}: {err}")))?;
+	match response.data {
+		WendelonResponse::Success => Ok(()),
+		WendelonResponse::Error(message) => Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("{context}: {message}"),
+		)),
+		WendelonResponse::LeaseDenied => Err(Error::other(format!(
+			"{context}: unexpected LeaseDenied response"
+		))),
+	}
+}
+
+async fn commit_create_tenant(
+	raft: &WendelonRaft,
+	request: crate::consensus::CreateTenant,
+	context: &str,
+) -> std::io::Result<()> {
+	commit_tenant_request(raft, WendelonRequest::CreateTenant(request), context).await
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DefaultTenantKekSeedState {
 	Complete,
 	Retry,
+}
+
+fn build_create_tenant_request(
+	snapshot: &crate::consensus::raft_storage::SmState,
+	crypto: &CryptoManager,
+	tenant_id: TenantId,
+	quota_bytes: u64,
+	replication_factor: u32,
+) -> std::io::Result<crate::consensus::CreateTenant> {
+	if snapshot.tenants.contains_key(&tenant_id) {
+		return Err(Error::new(
+			ErrorKind::AlreadyExists,
+			format!("tenant {} already exists", tenant_id.get()),
+		));
+	}
+	if let Some(keyset) = snapshot.tenant_keysets.get(&tenant_id) {
+		keyset.active_tenant_kek_id.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"tenant {} keyset exists but has no active tenant_kek_id",
+					tenant_id.get()
+				),
+			)
+		})?;
+		return Ok(crate::consensus::CreateTenant {
+			tenant_id,
+			quota_bytes,
+			replication_factor,
+			tenant_keyset: keyset.clone(),
+		});
+	}
+	let rotation = crypto.prepare_rotation(tenant_id)?;
+	let mut tenant_keyset = crate::crypto::TenantKeyset::default();
+	tenant_keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
+	tenant_keyset.keys.insert(
+		rotation.tenant_kek_id,
+		crate::crypto::WrappedTenantKek {
+			wrapped_key: rotation.wrapped_tenant_kek,
+		},
+	);
+	Ok(crate::consensus::CreateTenant {
+		tenant_id,
+		quota_bytes,
+		replication_factor,
+		tenant_keyset,
+	})
 }
 
 async fn seed_default_tenant_kek_if_missing(
@@ -1469,22 +1640,23 @@ async fn seed_default_tenant_kek_if_missing(
 	state_machine: &WendelonStateMachine,
 	crypto: &CryptoManager,
 	local_node: NodeId,
+	replication_factor: u32,
 ) -> std::io::Result<DefaultTenantKekSeedState> {
-	if state_machine
-		.state_snapshot()
-		.await
-		.tenant_keysets
-		.contains_key(&TenantId::ZERO)
-	{
+	let snapshot = state_machine.state_snapshot().await;
+	if snapshot.tenants.contains_key(&TenantId::ZERO) {
 		return Ok(DefaultTenantKekSeedState::Complete);
 	}
 	if raft.current_leader().await != Some(local_node.id) {
 		return Ok(DefaultTenantKekSeedState::Retry);
 	}
-	let rotation = crypto.prepare_rotation(TenantId::ZERO)?;
-	match commit_install_tenant_kek_version(raft, rotation, "failed to seed default tenant KEK")
-		.await
-	{
+	let create = build_create_tenant_request(
+		&snapshot,
+		crypto,
+		TenantId::ZERO,
+		DEFAULT_TENANT_QUOTA_BYTES,
+		replication_factor,
+	)?;
+	match commit_create_tenant(raft, create, "failed to seed default tenant").await {
 		Ok(()) => Ok(DefaultTenantKekSeedState::Complete),
 		Err(err) if raft.current_leader().await != Some(local_node.id) => {
 			let _ = err;
@@ -1494,11 +1666,12 @@ async fn seed_default_tenant_kek_if_missing(
 	}
 }
 
-fn spawn_default_tenant_kek_seeder(
+fn spawn_default_tenant_seeder(
 	raft: WendelonRaft,
 	state_machine: WendelonStateMachine,
 	crypto: Arc<CryptoManager>,
 	local_node: NodeId,
+	replication_factor: u32,
 ) -> JoinHandle<()> {
 	tokio::spawn(async move {
 		loop {
@@ -1507,6 +1680,7 @@ fn spawn_default_tenant_kek_seeder(
 				&state_machine,
 				crypto.as_ref(),
 				local_node,
+				replication_factor,
 			)
 			.await
 			{
@@ -1516,7 +1690,7 @@ fn spawn_default_tenant_kek_seeder(
 					tracing::warn!(
 						node_id = local_node.id,
 						error = %err,
-						"default tenant KEK seeding is still pending"
+						"default tenant provisioning is still pending"
 					);
 				}
 			}
@@ -1758,8 +1932,7 @@ mod tests {
 		DriftCheck, EVICTION_THRESHOLD, EvictionDecision, MAX_OFFSET_MS, check_drift_once,
 		sweep_evictions_once,
 	};
-	use crate::consensus::raft_storage::SmState;
-	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, SnapshotHeader, TenantId};
+	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, TenantId};
 	use crate::storage::{RaftCommitter, SlabSweeper, StorageEngine, SweeperConfig};
 	use std::time::Duration;
 
@@ -1800,47 +1973,10 @@ mod tests {
 			}
 			assert!(
 				tokio::time::Instant::now() < deadline,
-				"timed out waiting for default tenant KEK to be provisioned"
+				"timed out waiting for default tenant to be provisioned"
 			);
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
-	}
-
-	fn control_artifact_paths_for_test(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
-		(
-			dir.join("control.wal"),
-			dir.join("vote.wnd"),
-			dir.join("snapshot.wnd"),
-		)
-	}
-
-	fn write_snapshot_artifact(path: &std::path::Path, state: &SmState) {
-		let mut snapshot_state = state.clone();
-		if let Some(log_id) = snapshot_state.last_applied_log_id.as_mut() {
-			*log_id = openraft::LogId::new(
-				openraft::CommittedLeaderId::new(log_id.leader_id.term, 0),
-				log_id.index,
-			);
-		}
-		let body = postcard::to_allocvec(&snapshot_state).unwrap();
-		let last_applied = snapshot_state.last_applied_log_id;
-		let header = SnapshotHeader {
-			last_included_index: last_applied.map(|id| id.index).unwrap_or(0),
-			last_included_term: last_applied.map(|id| id.leader_id.term).unwrap_or(0),
-			last_included_epoch: 0,
-			snapshot_hlc: HybridTimestamp {
-				physical_ms: 0,
-				logical: 0,
-				node_id: 0,
-			},
-			state_sha256: *blake3::hash(&body).as_bytes(),
-			cache_checkpoint_len: 0,
-			_pad: [0; 4],
-		};
-		let mut out = Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + body.len());
-		out.extend_from_slice(bytemuck::bytes_of(&header));
-		out.extend_from_slice(&body);
-		std::fs::write(path, out).unwrap();
 	}
 
 	fn read_audit_log(dir: &std::path::Path) -> String {
@@ -1881,7 +2017,7 @@ mod tests {
 		let snapshot = node.state_machine.state_snapshot().await;
 		assert!(
 			snapshot.tenant_keysets.contains_key(&TenantId::ZERO),
-			"default tenant KEK must be seeded during bootstrap"
+			"default tenant must be provisioned during bootstrap"
 		);
 		let audit = read_audit_log(&dir);
 		assert!(audit.contains("\"event_type\":\"crypto.startup\""));
@@ -1927,16 +2063,22 @@ mod tests {
 			node_id: node.local_node.id,
 		};
 		node.raft
-			.client_write(WendelonRequest::Finalize(FinalizationMarker {
-				log_index: 2,
-				term: 1,
-				epoch: 99,
-				commit_hlc,
-				payload_hash: [0; 32],
-				e_safe_index: 2,
-				durability: crate::schema::DurabilityLevel::QUORUM,
-				_pad: [0; 7],
-			}))
+			.client_write(WendelonRequest::Finalize(
+				crate::consensus::TenantFinalization {
+					marker: FinalizationMarker {
+						log_index: 2,
+						term: 1,
+						epoch: 99,
+						commit_hlc,
+						payload_hash: [0; 32],
+						e_safe_index: 2,
+						durability: crate::schema::DurabilityLevel::QUORUM,
+						_pad: [0; 7],
+					},
+					tenant_id: TenantId::ZERO,
+					charged_bytes: 0,
+				},
+			))
 			.await
 			.unwrap();
 		assert_eq!(
@@ -1971,45 +2113,6 @@ mod tests {
 			Some(commit_hlc)
 		);
 		wait_for_default_tenant_kek(&recovered).await;
-
-		recovered.handles.abort();
-	}
-
-	#[tokio::test]
-	async fn recovery_upgrade_seeds_default_tenant_kek_when_snapshot_predates_w4() {
-		let dir = tempdir("upgrade-seeds-default-tenant-kek");
-		let cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
-		let node = WendelonNode::bootstrap_single_node(cfg.clone())
-			.await
-			.unwrap();
-
-		wait_for_local_leader(&node).await;
-		wait_for_default_tenant_kek(&node).await;
-		let mut upgraded_snapshot = node.state_machine.state_snapshot().await;
-		upgraded_snapshot.tenant_keysets.clear();
-
-		node.handles.abort();
-		drop(node);
-		tokio::time::sleep(Duration::from_millis(25)).await;
-
-		let (wal_path, _vote_path, snapshot_path) = control_artifact_paths_for_test(&dir);
-		if wal_path.exists() {
-			std::fs::remove_file(&wal_path).unwrap();
-		}
-		write_snapshot_artifact(&snapshot_path, &upgraded_snapshot);
-
-		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
-		wait_for_local_leader(&recovered).await;
-		wait_for_default_tenant_kek(&recovered).await;
-		assert!(
-			recovered
-				.state_machine
-				.state_snapshot()
-				.await
-				.tenant_keysets
-				.contains_key(&TenantId::ZERO),
-			"default tenant KEK must be auto-seeded for recovered pre-W4 state"
-		);
 
 		recovered.handles.abort();
 	}
@@ -2308,6 +2411,7 @@ mod tests {
 		let control_server = Arc::new(WendelonControlServer::new(
 			node.raft.clone(),
 			node.state_machine.clone(),
+			node.crypto.clone(),
 			node.local_node,
 			node.epoch_tx.clone(),
 			epoch_rx,
@@ -2363,9 +2467,15 @@ mod tests {
 		let err = node
 			.router
 			.handle_frame(
-				crate::schema::NodeId {
-					id: 0,
-					_reserved: 0,
+				crate::network::server::RequestContext {
+					remote: crate::schema::NodeId {
+						id: 0,
+						_reserved: 0,
+					},
+					actor: crate::network::tls::ActorIdentity::data_node(crate::schema::NodeId {
+						id: 0,
+						_reserved: 0,
+					}),
 				},
 				frame,
 			)

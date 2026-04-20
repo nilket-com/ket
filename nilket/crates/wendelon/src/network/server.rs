@@ -56,6 +56,7 @@ use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
 use crate::network::tcp_tls_transport::InboundTcpTlsConnection;
+use crate::network::tls::ActorIdentity;
 use crate::network::tls::{verified_transport_peer, verified_transport_peer_from_chain};
 use crate::network::transport::{TransportConnection, TransportStream};
 use crate::schema::NodeId;
@@ -71,6 +72,12 @@ use tokio_rustls::TlsAcceptor;
 // ============================================================
 //  LIFECYCLE
 // ============================================================
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestContext {
+	pub remote: NodeId,
+	pub actor: ActorIdentity,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LifecycleState {
@@ -230,21 +237,21 @@ impl LifecycleService {
 impl HrftService for LifecycleService {
 	async fn handle_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let _guard = self.lifecycle.try_track_request()?;
-		self.inner.handle_frame(remote, frame).await
+		self.inner.handle_frame(context, frame).await
 	}
 
 	async fn handle_stream(
 		&self,
 		stream: Box<dyn TransportStream>,
 		pool: Arc<BufPool>,
-		remote: NodeId,
+		context: RequestContext,
 	) -> std::io::Result<()> {
 		let _guard = self.lifecycle.try_track_request()?;
-		self.inner.handle_stream(stream, pool, remote).await
+		self.inner.handle_stream(stream, pool, context).await
 	}
 }
 
@@ -266,7 +273,7 @@ impl HrftService for LifecycleService {
 pub trait HrftService: Send + Sync + 'static {
 	async fn handle_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>>;
 
@@ -277,11 +284,11 @@ pub trait HrftService: Send + Sync + 'static {
 		&self,
 		mut stream: Box<dyn TransportStream>,
 		pool: Arc<BufPool>,
-		remote: NodeId,
+		context: RequestContext,
 	) -> std::io::Result<()> {
 		let frame = read_frame(&mut *stream, &pool).await?;
 
-		match self.handle_frame(remote, frame).await? {
+		match self.handle_frame(context, frame).await? {
 			Some(resp) => {
 				write_frame(
 					&mut *stream,
@@ -491,7 +498,10 @@ async fn handle_connection<S: HrftService>(
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
 ) -> std::io::Result<()> {
-	let remote = connection.remote_id();
+	let context = RequestContext {
+		remote: connection.remote_id(),
+		actor: connection.actor_identity().clone(),
+	};
 	let mut drain_rx = lifecycle.subscribe();
 	loop {
 		if drain_rx.borrow().draining {
@@ -510,11 +520,11 @@ async fn handle_connection<S: HrftService>(
 				};
 				let service = service.clone();
 				let pool = pool.clone();
-				let remote = remote;
+				let context = context.clone();
 				let _stream_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _stream_guard = _stream_guard;
-					let _ = handle_stream(stream, service, pool, remote).await;
+					let _ = handle_stream(stream, service, pool, context).await;
 				});
 			}
 		}
@@ -529,9 +539,9 @@ async fn handle_stream<S: HrftService>(
 	stream: Box<dyn TransportStream>,
 	service: Arc<S>,
 	pool: Arc<BufPool>,
-	remote: NodeId,
+	context: RequestContext,
 ) -> std::io::Result<()> {
-	service.handle_stream(stream, pool, remote).await
+	service.handle_stream(stream, pool, context).await
 }
 
 // ============================================================
@@ -549,7 +559,7 @@ pub struct UnroutedService;
 impl HrftService for UnroutedService {
 	async fn handle_frame(
 		&self,
-		_remote: NodeId,
+		_context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		Err(Error::new(

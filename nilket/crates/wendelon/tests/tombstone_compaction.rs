@@ -26,16 +26,16 @@ fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
 	}
 }
 
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
+
 fn key_locality(bytes: &[u8]) -> u64 {
-	Locality::from(Identity::blake3(bytes)).get()
+	Locality::from(Identity::blake3_tenant(tenant(), bytes)).get()
 }
 
 fn key_identity(bytes: &[u8]) -> Identity {
-	Identity::blake3(bytes)
-}
-
-fn tenant() -> TenantId {
-	TenantId::ZERO
+	Identity::blake3_tenant(tenant(), bytes)
 }
 
 fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {

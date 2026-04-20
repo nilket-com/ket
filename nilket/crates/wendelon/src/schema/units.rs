@@ -128,6 +128,20 @@ impl Identity {
 		Self(*blake3::hash(bytes).as_bytes())
 	}
 
+	/// Compute the tenant-scoped BLAKE3-256 Identity of a key.
+	///
+	/// The public tenant id is part of the stable record namespace, so
+	/// the same raw key bytes in two tenants never alias to the same
+	/// durable identity.
+	pub fn blake3_tenant(tenant_id: TenantId, bytes: &[u8]) -> Self {
+		const DOMAIN: &[u8] = b"wendelon.identity.tenant.v1";
+		let mut hasher = blake3::Hasher::new();
+		hasher.update(DOMAIN);
+		hasher.update(&tenant_id.get().to_le_bytes());
+		hasher.update(bytes);
+		Self(*hasher.finalize().as_bytes())
+	}
+
 	/// Tenant-scoped keyed BLAKE3-256 Identity.
 	///
 	/// The exact tenant-domain-separation formulation is locked in by W5.

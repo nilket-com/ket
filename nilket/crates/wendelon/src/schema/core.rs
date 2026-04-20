@@ -452,6 +452,8 @@ impl MsgType {
 	pub const JOIN_RESP: Self = Self(0x19);
 	pub const LEASE_RELEASE_REQ: Self = Self(0x1A);
 	pub const LEASE_RELEASE_RESP: Self = Self(0x1B);
+	pub const TENANT_ADMIN_REQ: Self = Self(0x1C);
+	pub const TENANT_ADMIN_RESP: Self = Self(0x1D);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -549,6 +551,9 @@ impl WriteStatus {
 	pub const INVALID_LEASE_SIGNATURE: Self = Self(7);
 	pub const INTERNAL_ERROR: Self = Self(8);
 	pub const QUOTA_EXCEEDED: Self = Self(9);
+	pub const TENANT_SUSPENDED: Self = Self(10);
+	pub const TENANT_UNAVAILABLE: Self = Self(11);
+	pub const AUTHORIZATION_FAILED: Self = Self(12);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -615,6 +620,7 @@ impl ReplicaWriteStatus {
 	pub const EPOCH_STALE: Self = Self(1);
 	pub const HASH_MISMATCH: Self = Self(2);
 	pub const INTERNAL_ERROR: Self = Self(3);
+	pub const NOT_AUTHORIZED: Self = Self(4);
 }
 
 /// Explicit acknowledgement strength carried back from a replica.
@@ -707,6 +713,8 @@ impl ReadStatus {
 	/// scan would miss versions only held on those sources. The
 	/// client must retry; the answer is explicitly *not* partial.
 	pub const MIGRATION_INCOMPLETE: Self = Self(7);
+	pub const TENANT_UNAVAILABLE: Self = Self(8);
+	pub const AUTHORIZATION_FAILED: Self = Self(9);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

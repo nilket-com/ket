@@ -25,6 +25,7 @@ use crate::consensus::{WendelonRaft, WendelonRequest, WendelonTypeConfig};
 use crate::network::core::{HRFT_MAGIC, HrftFrame};
 use crate::network::pool::BufPool;
 use crate::network::router::RaftInternalServer;
+use crate::network::server::RequestContext;
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
 use async_trait::async_trait;
@@ -77,7 +78,7 @@ impl WendelonRaftInternalServer {
 impl RaftInternalServer for WendelonRaftInternalServer {
 	async fn handle_raft_frame(
 		&self,
-		_remote: crate::schema::NodeId,
+		_context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
@@ -90,14 +91,14 @@ impl RaftInternalServer for WendelonRaftInternalServer {
 				// HLC — exactly what the drift monitor wants.
 				if let Some(tracker) = &self.tracker {
 					for entry in &req.entries {
-						if let EntryPayload::Normal(WendelonRequest::Finalize(marker)) =
+						if let EntryPayload::Normal(WendelonRequest::Finalize(finalization)) =
 							&entry.payload
 						{
 							let peer = NodeId {
-								id: marker.commit_hlc.node_id,
+								id: finalization.marker.commit_hlc.node_id,
 								_reserved: 0,
 							};
-							tracker.record_hlc(peer, marker.commit_hlc);
+							tracker.record_hlc(peer, finalization.marker.commit_hlc);
 						}
 					}
 				}

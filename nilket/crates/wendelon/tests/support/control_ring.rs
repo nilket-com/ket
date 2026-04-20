@@ -16,7 +16,7 @@ use wendelon::client::{
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
-use wendelon::network::server::HrftService;
+use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::tls::ActorIdentity;
 use wendelon::network::transport::{
 	EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities,
@@ -101,12 +101,7 @@ pub async fn wait_for_local_leader(node: &WendelonNode) {
 
 #[allow(dead_code)]
 pub fn abort_node(node: &WendelonNode) {
-	node.handles.ring_updater.abort();
-	node.handles.drift_monitor.abort();
-	node.handles.eviction_watchdog.abort();
-	node.handles.lease_manager.abort();
-	node.handles.epoch_reconciler.abort();
-	node.handles.migration_sweeper.abort();
+	node.handles.abort();
 }
 
 #[allow(dead_code)]
@@ -512,7 +507,7 @@ impl TransportProvider for LoopbackProvider {
 			address: address.to_string(),
 			pool: self.pool.clone(),
 			tier: self.tier,
-			actor: ActorIdentity::data_node(target),
+			actor: ActorIdentity::data_node(self.local),
 		}))
 	}
 
@@ -537,7 +532,10 @@ async fn serve_stream(
 		.handle_stream(
 			Box::new(DuplexTransportStream { inner: stream }),
 			pool,
-			remote,
+			RequestContext {
+				remote,
+				actor: ActorIdentity::data_node(remote),
+			},
 		)
 		.await;
 }

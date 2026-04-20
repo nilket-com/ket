@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wendelon::consensus::{MigrationLedgerEntry, MigrationState, SeedMigration, WendelonRequest};
 use wendelon::network::data_server::WendelonDataServer;
-use wendelon::network::server::HrftService;
+use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::schema::{
 	HybridTimestamp, Identity, MsgType, NodeId, TenantId, write_payload_schema,
 };
@@ -144,7 +144,7 @@ struct FailingMigrateService {
 impl HrftService for FailingMigrateService {
 	async fn handle_frame(
 		&self,
-		remote: wendelon::schema::NodeId,
+		context: RequestContext,
 		frame: wendelon::network::core::HrftFrame,
 	) -> std::io::Result<Option<wendelon::network::core::HrftFrame>> {
 		if frame.header.msg_type == MsgType::MIGRATE_REQ.0
@@ -155,7 +155,7 @@ impl HrftService for FailingMigrateService {
 				"injected migrate source failure",
 			));
 		}
-		self.inner.handle_frame(remote, frame).await
+		self.inner.handle_frame(context, frame).await
 	}
 }
 

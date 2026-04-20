@@ -14,7 +14,7 @@ use wendelon::client::{
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame};
 use wendelon::network::pool::PooledBuf;
 use wendelon::network::ring::{RingRouter, RingState};
-use wendelon::network::server::HrftService;
+use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::schema::{
 	ClientWriteId, Consistency, DurabilityLevel, FrameHeader, HybridTimestamp, Identity, Locality,
@@ -145,7 +145,7 @@ async fn refresh_leases(node: &wendelon::node::WendelonNode) {
 }
 
 fn key_locality(bytes: &[u8]) -> u64 {
-	Locality::from(Identity::blake3(bytes)).get()
+	Locality::from(Identity::blake3_tenant(tenant(), bytes)).get()
 }
 
 fn find_key_for_primary(snapshot: &ClusterStatusWire, target: NodeId) -> Vec<u8> {
@@ -203,7 +203,7 @@ impl RedirectingService {
 impl HrftService for RedirectingService {
 	async fn handle_frame(
 		&self,
-		_remote: NodeId,
+		_context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		self.calls.fetch_add(1, Ordering::SeqCst);

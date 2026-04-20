@@ -66,6 +66,7 @@ fn build_control_server(
 		Arc::new(WendelonControlServer::new(
 			node.raft.clone(),
 			node.state_machine.clone(),
+			node.crypto.clone(),
 			local_node,
 			epoch_tx.clone(),
 			epoch_rx,

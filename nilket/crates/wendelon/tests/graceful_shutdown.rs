@@ -8,7 +8,8 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use wendelon::network::core::HrftFrame;
 use wendelon::network::pool::PooledBuf;
-use wendelon::network::server::{HrftService, LifecycleService, ServerLifecycle};
+use wendelon::network::server::{HrftService, LifecycleService, RequestContext, ServerLifecycle};
+use wendelon::network::tls::ActorIdentity;
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{FrameHeader, MsgType, NodeId};
 
@@ -27,6 +28,13 @@ fn status_request(stream_id: u32) -> HrftFrame {
 		meta: PooledBuf::orphan(Vec::new()),
 		arrow_payload: None,
 		trailing: None,
+	}
+}
+
+fn context(remote: NodeId) -> RequestContext {
+	RequestContext {
+		remote,
+		actor: ActorIdentity::data_node(remote),
 	}
 }
 
@@ -57,7 +65,7 @@ async fn node_rejects_new_requests_after_drain_begins() {
 	};
 	let resp = node
 		.service
-		.handle_frame(remote, status_request(1))
+		.handle_frame(context(remote), status_request(1))
 		.await
 		.unwrap()
 		.unwrap();
@@ -66,7 +74,7 @@ async fn node_rejects_new_requests_after_drain_begins() {
 	node.begin_drain();
 	let err = node
 		.service
-		.handle_frame(remote, status_request(2))
+		.handle_frame(context(remote), status_request(2))
 		.await
 		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::ConnectionAborted);
@@ -83,7 +91,7 @@ struct BlockingService {
 impl HrftService for BlockingService {
 	async fn handle_frame(
 		&self,
-		_remote: NodeId,
+		_context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		self.started.notify_waiters();
@@ -126,13 +134,17 @@ async fn drain_waits_for_in_flight_request_to_complete() {
 	let started_wait = started.notified();
 	let in_flight = {
 		let service = service.clone();
-		tokio::spawn(async move { service.handle_frame(remote, status_request(9)).await })
+		tokio::spawn(async move {
+			service
+				.handle_frame(context(remote), status_request(9))
+				.await
+		})
 	};
 	started_wait.await;
 
 	lifecycle.begin_drain();
 	let err = service
-		.handle_frame(remote, status_request(10))
+		.handle_frame(context(remote), status_request(10))
 		.await
 		.unwrap_err();
 	assert_eq!(err.kind(), ErrorKind::ConnectionAborted);

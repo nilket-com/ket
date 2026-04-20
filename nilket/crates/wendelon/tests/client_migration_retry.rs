@@ -13,7 +13,7 @@ use wendelon::client::{
 };
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame};
 use wendelon::network::pool::PooledBuf;
-use wendelon::network::server::HrftService;
+use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::transport::{NodeRole, NodeRoleSet, TransportTier, TransportTierSet};
 use wendelon::schema::{
 	ClientWriteId, Consistency, DurabilityLevel, FRAME_FLAG_STREAM_END, FrameHeader,
@@ -254,7 +254,7 @@ impl FlakyMigrationService {
 impl HrftService for FlakyMigrationService {
 	async fn handle_frame(
 		&self,
-		remote: NodeId,
+		context: RequestContext,
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		match MsgType(frame.header.msg_type) {
@@ -277,7 +277,7 @@ impl HrftService for FlakyMigrationService {
 			}
 			_ => {}
 		}
-		self.inner.handle_frame(remote, frame).await
+		self.inner.handle_frame(context, frame).await
 	}
 }
 
