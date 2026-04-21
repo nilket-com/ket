@@ -1,8 +1,11 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use wendelon::crypto::{CryptoManager, SLAB_ENCRYPTION_CHUNK_BYTES, test_support};
-use wendelon::schema::{SlabId, TenantId};
+use wendelon::crypto::{
+	CryptoManager, EncryptedTieredSlab, SLAB_ENCRYPTION_CHUNK_BYTES, TieredOffsetIndexEntry,
+	TieredSlabObjectMetadata, test_support,
+};
+use wendelon::schema::{IdentityPrefix, SlabId, TenantId};
 
 struct BenchCase {
 	label: &'static str,
@@ -15,6 +18,32 @@ struct BenchMeasurement {
 	mode: &'static str,
 	elapsed: Duration,
 	iterations: usize,
+}
+
+fn encrypt_bench_tiered_slab(
+	crypto: &CryptoManager,
+	slab_id: SlabId,
+	plaintext: &[u8],
+) -> std::io::Result<EncryptedTieredSlab> {
+	crypto.encrypt_tiered_slab_object(
+		slab_id,
+		&TieredSlabObjectMetadata {
+			tenant_id: TenantId::ZERO,
+			created_hlc: 0,
+			offset_index: vec![TieredOffsetIndexEntry {
+				key_locator: IdentityPrefix::ZERO,
+				byte_offset: 0,
+				byte_length: u32::try_from(plaintext.len()).map_err(|_| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"benchmark slab too large",
+					)
+				})?,
+				flags: 0,
+			}],
+		},
+		plaintext,
+	)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,8 +97,7 @@ fn bench_encrypt(
 	let mut elapsed = Duration::ZERO;
 	for _ in 0..case.iterations {
 		let started = Instant::now();
-		let encrypted =
-			crypto.encrypt_tiered_slab(case.slab_id, TenantId::ZERO, black_box(plaintext))?;
+		let encrypted = encrypt_bench_tiered_slab(crypto, case.slab_id, black_box(plaintext))?;
 		elapsed += started.elapsed();
 		black_box(encrypted.bytes.len());
 	}
@@ -85,7 +113,7 @@ fn bench_decrypt_warm_cache(
 	case: &BenchCase,
 	plaintext: &[u8],
 ) -> std::io::Result<BenchMeasurement> {
-	let encrypted = crypto.encrypt_tiered_slab(case.slab_id, TenantId::ZERO, plaintext)?;
+	let encrypted = encrypt_bench_tiered_slab(crypto, case.slab_id, plaintext)?;
 	let warmed = crypto.decrypt_tiered_slab(case.slab_id, &encrypted.bytes)?;
 	if warmed.plaintext != plaintext {
 		return Err(std::io::Error::other(

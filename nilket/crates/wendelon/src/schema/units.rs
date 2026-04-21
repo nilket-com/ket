@@ -155,6 +155,84 @@ impl Identity {
 	}
 }
 
+#[derive(
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Hash,
+	Default,
+	Pod,
+	Zeroable,
+	Serialize,
+	Deserialize,
+)]
+#[repr(transparent)]
+pub struct IdentityPrefix([u8; 16]);
+
+impl IdentityPrefix {
+	pub const ZERO: Self = Self([0; 16]);
+
+	pub const fn new(bytes: [u8; 16]) -> Self {
+		Self(bytes)
+	}
+
+	pub const fn as_bytes(&self) -> &[u8; 16] {
+		&self.0
+	}
+
+	pub const fn into_bytes(self) -> [u8; 16] {
+		self.0
+	}
+}
+
+impl fmt::Debug for IdentityPrefix {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "IdentityPrefix(0x")?;
+		for byte in self.as_bytes() {
+			write!(f, "{:02x}", byte)?;
+		}
+		write!(f, ")")
+	}
+}
+
+impl fmt::Display for IdentityPrefix {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		for byte in &self.as_bytes()[..8] {
+			write!(f, "{:02x}", byte)?;
+		}
+		write!(f, "...")
+	}
+}
+
+impl From<[u8; 16]> for IdentityPrefix {
+	fn from(value: [u8; 16]) -> Self {
+		Self(value)
+	}
+}
+
+impl From<IdentityPrefix> for [u8; 16] {
+	fn from(value: IdentityPrefix) -> Self {
+		value.0
+	}
+}
+
+impl From<Identity> for IdentityPrefix {
+	fn from(value: Identity) -> Self {
+		let mut bytes = [0_u8; 16];
+		bytes.copy_from_slice(&value.as_bytes()[..16]);
+		Self(bytes)
+	}
+}
+
+impl From<&Identity> for IdentityPrefix {
+	fn from(value: &Identity) -> Self {
+		(*value).into()
+	}
+}
+
 // The "Address" of a record on the Ring. A 64-bit projection of the
 // Identity used for routing and placement. A collision here is
 // merely a "fat bucket" on the ring, not a data loss event.

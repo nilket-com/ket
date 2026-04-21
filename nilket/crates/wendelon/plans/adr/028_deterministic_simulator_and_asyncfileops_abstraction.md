@@ -14,7 +14,7 @@ Forces in play:
 - **MadSim's io_uring story is weak.** `madsim` is a compelling Tokio-native simulator for networked systems, but its storage-side reach does not cover Wendelon's io_uring path. Pairing a turmoil-style network simulator with a **custom storage simulator** is the pragmatic shape.
 - **`tokio-uring` is not in the codebase.** Earlier drafts of this ADR framed the production storage path around `tokio-uring`; the accepted architecture (ADR 009) uses the low-level `io-uring` crate behind a dedicated per-device thread with MPSC handoff. The simulator seam is designed against the *actual* submission shape: replace the `IoRingHandle` (or a trait that abstracts over it) rather than replace a Tokio-uring runtime.
 - **Correctness checkers have different cost profiles.** Elle (Jepsen's linearizability successor) gives real per-history analysis at non-trivial per-op cost; monotonic-counter checking is cheap and catches a broad class of violations at near-zero cost. Running both on different scopes is strictly better than running one on all scopes.
-- **rustfs is already the S3 test backend (ADR 014).** A mocked `ObjectStore` in the simulator is not a replacement for rustfs in the integration-test harness; they serve different levels of the test pyramid and both have reasons to exist.
+- **rustfs is already the OpenDAL compatibility test backend (ADR 014).** A mocked `ObjectStore` in the simulator is not a replacement for rustfs in the integration-test harness; they serve different levels of the test pyramid and both have reasons to exist.
 
 ## Decision
 
@@ -110,7 +110,7 @@ Forces in play:
 - **Elle + monotonic counter is the right cost/coverage split.** Elle is expensive and narrow; monotonic is cheap and broad. Running only Elle caps the operation count we can verify; running only monotonic misses a class of ordering bugs. Both, scoped correctly, give the best returns.
 - **Coverage targets by time horizon prevent regressions.** Without a nightly/weekly soak, the simulator becomes dormant — the investment is only realized when it runs on new code. The 10k/1M/100M ladder scales effort to calendar time: quick on PR, deep overnight, exhaustive weekly.
 - **Seed-reproducibility turns every failure into a permanent regression.** The practice of freezing failing seeds is the mechanism that accumulates coverage over time. A bug found once and regressed once is a cost; a bug found once and pinned as a seed is an asset.
-- **rustfs + mocked ObjectStore both exist because they answer different questions.** rustfs answers "does our S3 client drive a real S3 service correctly?" The mock answers "does our L2 path survive specific fault sequences on a deterministic substrate?" Swapping either for the other loses a property that the other cannot give.
+- **rustfs + mocked ObjectStore both exist because they answer different questions.** rustfs answers "does our OpenDAL remote path drive a real compatibility service correctly?" The mock answers "does our L2 path survive specific fault sequences on a deterministic substrate?" Swapping either for the other loses a property that the other cannot give.
 
 ## Consequences (The "Negatives")
 
@@ -123,7 +123,7 @@ Forces in play:
 - **Rejected alternatives explicitly:**
   - *Custom deterministic harness built directly around `quinn` internals* — rejected; coupling to `quinn` internals breaks on every `quinn` upgrade.
   - *`madsim` for the full stack* — rejected; storage-side coverage is insufficient for Wendelon's io_uring path.
-  - *LocalStack as authoritative S3 test backend* — rejected at ADR 014 time (license/language mismatch); rustfs retained; mock-in-simulator is additive.
+  - *LocalStack as authoritative compatibility test backend* — rejected at ADR 014 time (license/language mismatch); rustfs retained; mock-in-simulator is additive.
   - *Monotonic-counter-only correctness checking* — rejected; misses ordering bugs that only Elle-style linearizability analysis surfaces.
   - *Single-harness shipping (chaos now, simulator post-pilot, or vice versa)* — rejected; each finds bug classes the other misses, and deferring either extends the window in which those bugs ship.
   - *Continuous simulator runs in CI (rather than per-PR scenario count caps)* — rejected; unbounded CI runtime is not a PR-gate contract.
@@ -141,7 +141,7 @@ All items below are scoped at ADR level; acceptance requires prototype work to c
 ## References
 - ADR 007: Raft Implementation Strategy (`openraft` — consumes the simulator's network layer)
 - ADR 009: io_uring Threading Model (the `IoRingHandle` + dedicated-thread + MPSC + oneshot-reply model this ADR abstracts; `AsyncFileOps` extraction lands against it)
-- ADR 014: RustFS as the S3 Test Backend (retained alongside mocked `ObjectStore`)
+- ADR 014: RustFS as the OpenDAL Compatibility Test Backend (retained alongside mocked `ObjectStore`)
 - ADR 015: Segmented WAL and Snapshot Lifecycle (simulator exercises segment rotation, directory fsync, snapshot install)
 - ADR 016: Durability Model (simulator exercises fsync and group-commit coalescing)
 - ADR 017: Persistent Local Index on redb (simulator exercises WAL-replay-forward recovery)

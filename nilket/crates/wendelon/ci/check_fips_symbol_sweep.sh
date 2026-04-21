@@ -2,17 +2,17 @@
 set -euo pipefail
 
 if ! command -v clang >/dev/null 2>&1; then
-  echo "clang is required for the W4 FIPS symbol sweep" >&2
+  echo "clang is required for the FIPS symbol sweep" >&2
   exit 1
 fi
 
 if ! command -v nm >/dev/null 2>&1; then
-  echo "nm is required for the W4 FIPS symbol sweep" >&2
+  echo "nm is required for the FIPS symbol sweep" >&2
   exit 1
 fi
 
 if ! command -v strings >/dev/null 2>&1; then
-  echo "strings is required for the W4 FIPS symbol sweep" >&2
+  echo "strings is required for the FIPS symbol sweep" >&2
   exit 1
 fi
 
@@ -37,4 +37,4 @@ if strings "${binary}" | rg -i 'aes.?gcm.?siv|AESIV'; then
   exit 1
 fi
 
-echo "W4 FIPS symbol sweep passed"
+echo "FIPS symbol sweep passed"

@@ -41,8 +41,13 @@
 //!   for now; remote upload is ADR 006's problem.
 
 use crate::consensus::MigratedRangeTombstone;
-use crate::crypto::{CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary};
-use crate::schema::{HybridTimestamp, Identity, Locality, SlabId, TenantId};
+use crate::crypto::{
+	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredOffsetIndexEntry,
+	TieredSlabObjectMetadata,
+};
+use crate::schema::{
+	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
+};
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
 	newest_version_as_of, recover_slab_entries_from_blob, remove_version_exact,
@@ -69,6 +74,9 @@ const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
 type TenantKey = (TenantId, Identity);
 
+const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
+const MIN_L2_TAIL_READ_WINDOW_BYTES: u64 = 256 + 16;
+
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
 	/// Directory that will hold `slab_<id>.wnd` files.
@@ -90,7 +98,7 @@ pub struct SlabManagerConfig {
 	pub rehydration: RehydrationPolicy,
 	/// ADR 016 data-path group-commit tuning.
 	pub group_commit: GroupCommitConfig,
-	/// W4 slab envelope-encryption service used for L2 object bytes.
+	/// ADR 022 slab-object encryption service used for L2 object bytes.
 	pub crypto: Arc<CryptoManager>,
 }
 
@@ -103,6 +111,11 @@ pub struct RehydrationPolicy {
 	/// Minimum amount of time a rehydrated local copy must remain
 	/// resident before the sweeper may reclaim it again.
 	pub min_local_residency: Duration,
+	/// Tail window fetched before a cold L2 point read plans the
+	/// ciphertext span. Must be large enough to contain the ADR 022
+	/// fixed footer plus tail anchor; larger values reduce follow-up
+	/// index range GETs for dense slabs.
+	pub tail_read_window_bytes: u64,
 }
 
 impl Default for RehydrationPolicy {
@@ -110,7 +123,22 @@ impl Default for RehydrationPolicy {
 		Self {
 			promote_after_l2_reads: 3,
 			min_local_residency: Duration::from_secs(60),
+			tail_read_window_bytes: DEFAULT_L2_TAIL_READ_WINDOW_BYTES,
 		}
+	}
+}
+
+impl RehydrationPolicy {
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.tail_read_window_bytes < MIN_L2_TAIL_READ_WINDOW_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"rehydration.tail_read_window_bytes must be at least {MIN_L2_TAIL_READ_WINDOW_BYTES} bytes"
+				),
+			));
+		}
+		Ok(())
 	}
 }
 
@@ -158,13 +186,13 @@ pub struct TieredSlabPointer {
 	pub slab_id: SlabId,
 	pub l2_uri: String,
 	pub payload_hash: [u8; 32],
-	/// `true` when the L2 object at `l2_uri` carries the W4 envelope
-	/// footer. Lets the plaintext-rewrite sweeper short-circuit
-	/// without GET-ing the object on every pass once steady state is
-	/// reached. Trailing field for postcard upgrade compat: pre-W4
-	/// pointers default to `false`, which is the safe (and accurate)
-	/// classification — the sweeper will GET them once and stamp the
-	/// truth back through `commit_tier_slab`.
+	/// `true` when the L2 object at `l2_uri` already carries an
+	/// encrypted tiered-slab footer. Lets the plaintext-rewrite
+	/// sweeper short-circuit without GET-ing the object on every pass
+	/// once steady state is reached. Trailing field for postcard
+	/// upgrade compat: older pointers default to `false`, which is the
+	/// safe (and accurate) classification — the sweeper will GET them
+	/// once and stamp the truth back through `commit_tier_slab`.
 	#[serde(default)]
 	pub is_encrypted: bool,
 }
@@ -390,6 +418,7 @@ impl SlabManager {
 	/// by slab id — so a rewrite that landed in a newer slab
 	/// shadows the stale copy in an older one.
 	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
+		config.rehydration.validate()?;
 		if !config.dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -608,25 +637,23 @@ impl SlabManager {
 		self.file_ops.read_all(&path).await
 	}
 
-	/// Envelope-encrypt a sealed slab for L2 upload. The current
-	/// W4 implementation requires the slab to contain records from
-	/// exactly one tenant so the footer/AAD stay slab-scoped; the
-	/// single-tenant pilot satisfies that invariant, and W5 lifts
-	/// the remaining write-path plumbing for multi-tenant slab sets.
+	/// Encode a sealed slab into the ADR 022 L2 object layout.
+	/// The current write path still assumes every sealed slab is
+	/// single-tenant, so the footer and per-chunk AAD stay slab-scoped.
 	pub fn encrypt_tiered_object_blob(
 		&self,
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let tenant_id = single_tenant_id_from_plain_slab(plaintext_blob, slab_id)?;
+		let metadata = build_tiered_object_metadata(plaintext_blob, slab_id)?;
 		self.config
 			.crypto
-			.encrypt_tiered_slab(slab_id, tenant_id, plaintext_blob)
+			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
 	}
 
-	/// Detect whether a tiered object already carries the W4
-	/// envelope footer. Callers use this to distinguish legacy
-	/// plaintext L2 objects from ciphertext ones during migration.
+	/// Detect whether a tiered object already carries an encrypted
+	/// footer. Callers use this to distinguish legacy plaintext L2
+	/// objects from ciphertext ones during migration.
 	pub fn encrypted_tiered_footer_summary(
 		&self,
 		blob: &[u8],
@@ -1742,15 +1769,32 @@ impl SlabManager {
 				),
 			)
 		})?;
-		let blob = l2.get_bytes(&pointer.l2_uri).await?;
-		validate_tiered_blob(pointer, blob.as_ref())?;
-		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob.as_ref())?;
-		let frame = extract_record_from_blob(&plaintext, location)?;
+		let mut plaintext_for_rehydration = None;
+		let frame = if pointer.is_encrypted {
+			self.read_encrypted_record_from_l2(l2.as_ref(), pointer, location)
+				.await?
+		} else {
+			let plaintext = self
+				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
+				.await?;
+			let frame = extract_record_from_blob(&plaintext, location)?;
+			plaintext_for_rehydration = Some(plaintext);
+			frame
+		};
 		if self.note_l2_read(pointer.slab_id).await {
-			if let Err(err) = self
-				.rehydrate_tiered_slab(pointer.clone(), bytes::Bytes::from(plaintext))
-				.await
-			{
+			let rehydrate_result = async {
+				let plaintext = match plaintext_for_rehydration.take() {
+					Some(plaintext) => plaintext,
+					None => {
+						self.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
+							.await?
+					}
+				};
+				self.rehydrate_tiered_slab(pointer.clone(), bytes::Bytes::from(plaintext))
+					.await
+			}
+			.await;
+			if let Err(err) = rehydrate_result {
 				tracing::warn!(
 					slab_id = pointer.slab_id.get(),
 					error = %err,
@@ -1759,6 +1803,84 @@ impl SlabManager {
 			}
 		}
 		Ok(frame)
+	}
+
+	async fn fetch_full_tiered_plaintext(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<Vec<u8>> {
+		let blob = l2.get_bytes(&pointer.l2_uri).await?;
+		validate_tiered_blob(pointer, blob.as_ref())?;
+		decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob.as_ref())
+	}
+
+	async fn read_encrypted_record_from_l2(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+	) -> std::io::Result<Vec<u8>> {
+		let metadata = l2.head(&pointer.l2_uri).await?;
+		let tail_start = metadata
+			.size_bytes
+			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
+		let tail_window = l2
+			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
+			.await?;
+		let plaintext_start = usize::try_from(location.offset).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("record offset {} does not fit into usize", location.offset),
+			)
+		})?;
+		let plaintext_end_u64 = location
+			.offset
+			.checked_add(location.length as u64)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"record range overflows u64 for slab {} at offset {}",
+						pointer.slab_id, location.offset,
+					),
+				)
+			})?;
+		let plaintext_end = usize::try_from(plaintext_end_u64).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("record end {} does not fit into usize", plaintext_end_u64),
+			)
+		})?;
+		let additional_metadata_range = self.config.crypto.additional_tiered_metadata_range(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+		)?;
+		let additional_metadata = match additional_metadata_range {
+			Some(range) => Some(l2.get_range(&pointer.l2_uri, range).await?),
+			None => None,
+		};
+		let plan = self.config.crypto.plan_tiered_range_read(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+			additional_metadata.as_deref(),
+			plaintext_start..plaintext_end,
+		)?;
+		let footer = plan.footer();
+		let ciphertext = l2
+			.get_range(&pointer.l2_uri, plan.ciphertext_range_in_object())
+			.await?;
+		let record_bytes = plan.decrypt(ciphertext.as_ref())?;
+		validate_tiered_record_header_tenant(&record_bytes, footer.tenant_id, pointer.slab_id)?;
+		extract_record_from_blob(
+			&record_bytes,
+			RecordLocation {
+				offset: 0,
+				..location
+			},
+		)
 	}
 
 	async fn note_l2_read(&self, slab_id: SlabId) -> bool {
@@ -1932,6 +2054,33 @@ fn decode_tiered_blob(
 	}
 }
 
+fn validate_tiered_record_header_tenant(
+	blob: &[u8],
+	expected_tenant_id: TenantId,
+	slab_id: SlabId,
+) -> std::io::Result<()> {
+	let header_size = std::mem::size_of::<SlabRecordHeader>();
+	if blob.len() < header_size {
+		return Err(Error::new(
+			ErrorKind::UnexpectedEof,
+			"L2 record range shorter than record header",
+		));
+	}
+	let header = bytemuck::pod_read_unaligned::<SlabRecordHeader>(&blob[..header_size]);
+	if header.tenant_id != expected_tenant_id {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"encrypted tiered slab footer tenant {} does not match record header tenant {} for slab {}",
+				expected_tenant_id.get(),
+				header.tenant_id.get(),
+				slab_id,
+			),
+		));
+	}
+	Ok(())
+}
+
 fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::Result<Vec<u8>> {
 	let offset = location.offset as usize;
 	let length = location.length as usize;
@@ -1942,8 +2091,9 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 			"L2 blob shorter than record header",
 		));
 	}
-	let header: &crate::schema::SlabRecordHeader =
-		bytemuck::from_bytes(&blob[offset..offset + header_size]);
+	let header = bytemuck::pod_read_unaligned::<crate::schema::SlabRecordHeader>(
+		&blob[offset..offset + header_size],
+	);
 	let frame_len = header.frame_len as usize;
 	let end = offset
 		.checked_add(header_size)
@@ -1958,31 +2108,49 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 	Ok(blob[offset + header_size..end].to_vec())
 }
 
-fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
-	let mut entries = recover_slab_entries_from_blob(blob, slab_id)?.into_iter();
-	let Some((tenant_id, _, _)) = entries.next() else {
+fn build_tiered_object_metadata(
+	blob: &[u8],
+	slab_id: SlabId,
+) -> std::io::Result<TieredSlabObjectMetadata> {
+	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+	let Some((tenant_id, _, first_location)) = entries.first().copied() else {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
 			format!(
-				"sealed slab {} does not contain any committed records; W4 tiered encryption requires non-empty single-tenant slabs",
+				"sealed slab {} does not contain any committed records; tiered encryption requires non-empty single-tenant slabs",
 				slab_id
 			),
 		));
 	};
-	for (other_tenant_id, _, _) in entries {
+	let mut offset_index = Vec::with_capacity(entries.len());
+	for (other_tenant_id, key_identity, location) in entries {
 		if other_tenant_id != tenant_id {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				format!(
-					"sealed slab {} contains multiple tenants ({} and {}); W4 tiered encryption requires single-tenant slabs until W5 lands tenant-scoped active slabs",
+					"sealed slab {} contains multiple tenants ({} and {}); tiered encryption requires single-tenant slabs until W5 lands tenant-scoped active slabs",
 					slab_id,
 					tenant_id.get(),
 					other_tenant_id.get(),
 				),
 			));
 		}
+		offset_index.push(TieredOffsetIndexEntry {
+			key_locator: IdentityPrefix::from(key_identity),
+			byte_offset: location.offset,
+			byte_length: location.length,
+			flags: 0,
+		});
 	}
-	Ok(tenant_id)
+	Ok(TieredSlabObjectMetadata {
+		tenant_id,
+		created_hlc: first_location.hlc.physical_ms,
+		offset_index,
+	})
+}
+
+fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
+	Ok(build_tiered_object_metadata(blob, slab_id)?.tenant_id)
 }
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {
@@ -2171,6 +2339,24 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn encrypt_tiered_object_blob_uses_adr022_layout() {
+		let mgr = fresh_manager().await;
+		mgr.append(tenant(), id(0x1234), hlc(10), b"adr022-row")
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let plaintext = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &plaintext).unwrap();
+		assert!(encrypted.bytes.starts_with(b"WENDSLAB"));
+		let footer = mgr
+			.encrypted_tiered_footer_summary(&encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer expected");
+		assert_eq!(footer.slab_id, slab_id);
+		assert_eq!(footer.tenant_id, tenant());
+	}
+
+	#[tokio::test]
 	async fn encrypt_tiered_object_blob_rejects_empty_plain_slab() {
 		let mgr = fresh_manager().await;
 		let err = mgr
@@ -2202,7 +2388,20 @@ mod tests {
 		let encrypted = mgr
 			.config
 			.crypto
-			.encrypt_tiered_slab(slab_id, mismatched_tenant, &plaintext)
+			.encrypt_tiered_slab_object(
+				slab_id,
+				&TieredSlabObjectMetadata {
+					tenant_id: mismatched_tenant,
+					created_hlc: 10,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: plaintext.len().try_into().unwrap(),
+						flags: 0,
+					}],
+				},
+				&plaintext,
+			)
 			.unwrap();
 		let pointer = TieredSlabPointer {
 			slab_id,
@@ -2411,6 +2610,7 @@ mod tests {
 		let l2_dir = fresh_dir("tiered-reopen-l2");
 		let io = spawn_io_thread(64).unwrap();
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let crypto = test_crypto();
 
 		let manager = SlabManager::open(SlabManagerConfig {
 			dir: l1_dir.clone(),
@@ -2419,7 +2619,7 @@ mod tests {
 			l2: Some(l2.clone()),
 			rehydration: RehydrationPolicy::default(),
 			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
+			crypto: crypto.clone(),
 		})
 		.await
 		.unwrap();
@@ -2440,9 +2640,13 @@ mod tests {
 		assert_eq!(sealed.len(), 1, "expected one sealed slab after rotation");
 		let sealed_id = sealed[0].slab_id;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
-		let payload_hash = *blake3::hash(&raw).as_bytes();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
 		let uri = l2
-			.put(&format!("sealed/slab_{sealed_id:016x}.wnd"), &raw)
+			.put(
+				&format!("sealed/slab_{sealed_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
 			.await
 			.unwrap();
 		manager
@@ -2469,7 +2673,7 @@ mod tests {
 			l2: Some(l2),
 			rehydration: RehydrationPolicy::default(),
 			group_commit: GroupCommitConfig::default(),
-			crypto: test_crypto(),
+			crypto: crypto.clone(),
 		})
 		.await
 		.unwrap();

@@ -16,8 +16,9 @@ use wendelon::consensus::{
 use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
-	ManagerTierObserver, ObjectStore, RemoteObjectStore, RemoteObjectStoreConfig, SlabManager,
-	SlabManagerConfig, SlabSweeper, SweepReport, SweeperConfig, TierCommitter, spawn_io_thread,
+	ManagerTierObserver, ObjectStore, RemoteObjectStore, RemoteObjectStoreConfig,
+	RemoteObjectStoreProvider, S3CompatibleProviderConfig, SlabManager, SlabManagerConfig,
+	SlabSweeper, SweepReport, SweeperConfig, TierCommitter, spawn_io_thread,
 };
 
 fn fresh_dir(tag: &str) -> PathBuf {
@@ -55,14 +56,16 @@ fn test_crypto() -> Arc<CryptoManager> {
 fn compat_config(endpoint: String, root: &str) -> RemoteObjectStoreConfig {
 	RemoteObjectStoreConfig {
 		bucket: "wendelon-tier".into(),
-		endpoint,
-		region: "us-east-1".into(),
 		root: root.into(),
-		access_key_id: Some("test-access-key".into()),
-		secret_access_key: Some("test-secret-key".into()),
-		session_token: None,
-		allow_anonymous: false,
-		virtual_host_style: false,
+		provider: RemoteObjectStoreProvider::S3Compatible(S3CompatibleProviderConfig {
+			endpoint,
+			region: "us-east-1".into(),
+			access_key_id: Some("test-access-key".into()),
+			secret_access_key: Some("test-secret-key".into()),
+			session_token: None,
+			allow_anonymous: false,
+			virtual_host_style: false,
+		}),
 	}
 }
 
@@ -158,6 +161,126 @@ struct ParsedRequest {
 	path: String,
 	headers: HashMap<String, String>,
 	body: Vec<u8>,
+}
+
+fn parse_request_target(target: &str) -> (String, HashMap<String, String>) {
+	let (path, query) = target.split_once('?').unwrap_or((target, ""));
+	let mut params = HashMap::new();
+	for pair in query.split('&') {
+		if pair.is_empty() {
+			continue;
+		}
+		let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+		params.insert(percent_decode(name), percent_decode(value));
+	}
+	(path.trim_matches('/').to_string(), params)
+}
+
+fn percent_decode(value: &str) -> String {
+	let bytes = value.as_bytes();
+	let mut decoded = Vec::with_capacity(bytes.len());
+	let mut idx = 0;
+	while idx < bytes.len() {
+		match bytes[idx] {
+			b'%' if idx + 2 < bytes.len() => {
+				let hex = &value[idx + 1..idx + 3];
+				if let Ok(byte) = u8::from_str_radix(hex, 16) {
+					decoded.push(byte);
+					idx += 3;
+					continue;
+				}
+				decoded.push(bytes[idx]);
+				idx += 1;
+			}
+			b'+' => {
+				decoded.push(b' ');
+				idx += 1;
+			}
+			other => {
+				decoded.push(other);
+				idx += 1;
+			}
+		}
+	}
+	String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn parse_range_header(header: &str, len: usize) -> std::io::Result<(usize, usize)> {
+	let raw = header.strip_prefix("bytes=").ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("unsupported range header: {header}"),
+		)
+	})?;
+	let (start, end) = raw.split_once('-').ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("malformed range header: {header}"),
+		)
+	})?;
+	if start.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("suffix ranges are not supported by the test server: {header}"),
+		));
+	}
+	let start = start.parse::<usize>().map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("invalid range start in {header}: {err}"),
+		)
+	})?;
+	let end_inclusive = if end.is_empty() {
+		len.saturating_sub(1)
+	} else {
+		end.parse::<usize>().map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("invalid range end in {header}: {err}"),
+			)
+		})?
+	};
+	if start > end_inclusive {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("invalid descending range header: {header}"),
+		));
+	}
+	if start >= len {
+		return Ok((len, len));
+	}
+	Ok((start, end_inclusive.saturating_add(1).min(len)))
+}
+
+fn list_objects_v2_xml(bucket: &str, prefix: &str, objects: &HashMap<String, Vec<u8>>) -> Vec<u8> {
+	let bucket_prefix = format!("{bucket}/");
+	let mut entries = objects
+		.iter()
+		.filter_map(|(path, bytes)| {
+			let key = path.strip_prefix(&bucket_prefix)?;
+			if !key.starts_with(prefix) {
+				return None;
+			}
+			Some((key.to_string(), bytes.len()))
+		})
+		.collect::<Vec<_>>();
+	entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+	let mut body = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+	body.push_str(r#"<ListBucketResult>"#);
+	body.push_str(&format!("<Name>{bucket}</Name>"));
+	body.push_str(&format!("<Prefix>{prefix}</Prefix>"));
+	body.push_str(&format!("<KeyCount>{}</KeyCount>", entries.len()));
+	body.push_str("<MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>");
+	for (key, size) in entries {
+		body.push_str("<Contents>");
+		body.push_str(&format!("<Key>{key}</Key>"));
+		body.push_str("<LastModified>2026-01-01T00:00:00.000Z</LastModified>");
+		body.push_str(&format!("<Size>{size}</Size>"));
+		body.push_str("</Contents>");
+	}
+	body.push_str("</ListBucketResult>");
+	body.into_bytes()
 }
 
 async fn read_request(
@@ -260,7 +383,12 @@ async fn write_response(
 	body: &[u8],
 ) -> std::io::Result<()> {
 	let mut response = format!("HTTP/1.1 {status}\r\n");
-	response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+	if !headers
+		.iter()
+		.any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+	{
+		response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+	}
 	response.push_str("Connection: close\r\n");
 	for (name, value) in headers {
 		response.push_str(name);
@@ -278,13 +406,7 @@ async fn handle_request(
 	state: FakeCompatStoreState,
 	req: ParsedRequest,
 ) -> std::io::Result<()> {
-	let path = req
-		.path
-		.split('?')
-		.next()
-		.unwrap_or_default()
-		.trim_start_matches('/')
-		.to_string();
+	let (path, query) = parse_request_target(&req.path);
 
 	match req.method.as_str() {
 		"PUT" => {
@@ -312,23 +434,66 @@ async fn handle_request(
 			state.objects.lock().await.insert(path, req.body);
 			write_response(stream, "200 OK", &[], &[]).await
 		}
+		"GET" if query.get("list-type").map(String::as_str) == Some("2") => {
+			let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+			let body = {
+				let objects = state.objects.lock().await;
+				list_objects_v2_xml(&path, prefix, &objects)
+			};
+			write_response(
+				stream,
+				"200 OK",
+				&[("Content-Type", "application/xml".into())],
+				&body,
+			)
+			.await
+		}
 		"GET" => {
 			let objects = state.objects.lock().await;
 			if let Some(bytes) = objects.get(&path) {
-				write_response(
-					stream,
-					"200 OK",
-					&[("Content-Type", "application/octet-stream".into())],
-					bytes,
-				)
-				.await
+				if let Some(range_header) = req.headers.get("range") {
+					let (start, end) = parse_range_header(range_header, bytes.len())?;
+					let body = &bytes[start..end];
+					let headers = vec![
+						("Content-Type", "application/octet-stream".into()),
+						("Accept-Ranges", "bytes".into()),
+						(
+							"Content-Range",
+							if start == end {
+								format!("bytes */{}", bytes.len())
+							} else {
+								format!("bytes {start}-{}/{}", end - 1, bytes.len())
+							},
+						),
+					];
+					write_response(stream, "206 Partial Content", &headers, body).await
+				} else {
+					write_response(
+						stream,
+						"200 OK",
+						&[("Content-Type", "application/octet-stream".into())],
+						bytes,
+					)
+					.await
+				}
 			} else {
 				write_response(stream, "404 Not Found", &[], &[]).await
 			}
 		}
 		"HEAD" => {
-			if path == "wendelon-tier" || state.objects.lock().await.contains_key(&path) {
+			if path == "wendelon-tier" {
 				write_response(stream, "200 OK", &[], &[]).await
+			} else if let Some(bytes) = state.objects.lock().await.get(&path).cloned() {
+				write_response(
+					stream,
+					"200 OK",
+					&[
+						("Content-Length", bytes.len().to_string()),
+						("Accept-Ranges", "bytes".into()),
+					],
+					&[],
+				)
+				.await
 			} else {
 				write_response(stream, "404 Not Found", &[], &[]).await
 			}
@@ -386,13 +551,49 @@ async fn remote_object_store_round_trips_put_get_delete() {
 		.put("sealed/slab_0001.wnd", b"hello remote tier")
 		.await
 		.unwrap();
-	assert_eq!(uri, "s3://wendelon-tier/cluster-a/sealed/slab_0001.wnd");
+	assert_eq!(uri, "l2://wendelon-tier/cluster-a/sealed/slab_0001.wnd");
 
 	let bytes = store.get(&uri).await.unwrap();
 	assert_eq!(bytes, b"hello remote tier");
 
 	store.delete(&uri).await.unwrap();
 	assert!(store.get(&uri).await.is_err());
+}
+
+#[tokio::test]
+async fn remote_object_store_supports_head_range_and_recursive_list() {
+	let server = FakeCompatStoreServer::start().await;
+	let store =
+		RemoteObjectStore::new(compat_config(server.endpoint.clone(), "cluster-a")).unwrap();
+
+	let uri = store
+		.put("sealed/slab_0001.wnd", b"abcdefghij")
+		.await
+		.unwrap();
+	store
+		.put("sealed/nested/slab_0002.wnd", b"klmnop")
+		.await
+		.unwrap();
+	store.put("archive/slab_0003.wnd", b"zzz").await.unwrap();
+
+	let meta = store.head(&uri).await.unwrap();
+	assert_eq!(meta.key, "sealed/slab_0001.wnd");
+	assert_eq!(meta.uri, uri);
+	assert_eq!(meta.size_bytes, 10);
+
+	let slice = store.get_range(&meta.uri, 2..7).await.unwrap();
+	assert_eq!(slice.as_ref(), b"cdefg");
+
+	let listed = store.list("sealed/").await.unwrap();
+	assert_eq!(
+		listed
+			.iter()
+			.map(|entry| entry.key.as_str())
+			.collect::<Vec<_>>(),
+		vec!["sealed/nested/slab_0002.wnd", "sealed/slab_0001.wnd"]
+	);
+	assert_eq!(listed[0].size_bytes, 6);
+	assert_eq!(listed[1].size_bytes, 10);
 }
 
 #[tokio::test]
@@ -404,7 +605,7 @@ async fn remote_object_store_retries_transient_put_failures() {
 	let store = RemoteObjectStore::new(compat_config(server.endpoint.clone(), "retry")).unwrap();
 	let uri = store.put("slab_retry.wnd", b"retry me").await.unwrap();
 
-	assert_eq!(uri, "s3://wendelon-tier/retry/slab_retry.wnd");
+	assert_eq!(uri, "l2://wendelon-tier/retry/slab_retry.wnd");
 	assert_eq!(server.state.put_attempts(object_path).await, 2);
 }
 
@@ -446,7 +647,7 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 		assert!(
 			tiered
 				.l2_uri
-				.starts_with("s3://wendelon-tier/tiered/sealed/slab_"),
+				.starts_with("l2://wendelon-tier/tiered/sealed/slab_"),
 			"unexpected tier URI: {}",
 			tiered.l2_uri
 		);

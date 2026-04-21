@@ -28,13 +28,13 @@ pub struct TieredSlab {
 	/// path to detect bit-rot between L2 fetches and the sweeper's
 	/// original upload.
 	pub payload_hash: [u8; 32],
-	/// `true` when the L2 object at `l2_uri` carries the W4 envelope
-	/// footer. Lets the plaintext-rewrite sweeper short-circuit
-	/// without a GET on every pass once steady state is reached.
-	/// Trailing field with `#[serde(default)]` so pre-W4 Raft entries
-	/// deserialize as `false` (the safe, accurate classification —
-	/// the rewrite sweeper will GET and stamp the truth back through
-	/// a fresh `TierSlab` commit on the next pass).
+	/// `true` when the L2 object at `l2_uri` already carries an
+	/// encrypted tiered-slab footer. Lets the plaintext-rewrite
+	/// sweeper short-circuit without a GET on every pass once steady
+	/// state is reached. Trailing field with `#[serde(default)]` so
+	/// older Raft entries deserialize as `false` (the safe, accurate
+	/// classification — the rewrite sweeper will GET and stamp the
+	/// truth back through a fresh `TierSlab` commit on the next pass).
 	#[serde(default)]
 	pub is_encrypted: bool,
 }
@@ -297,7 +297,7 @@ pub enum WendelonRequest {
 	/// state machine so pre-rotation slabs keep decrypting.
 	///
 	/// Keep this durable variant at the end of the enum so postcard
-	/// discriminants for pre-W4 variants remain upgrade-compatible.
+	/// discriminants for older variants remain upgrade-compatible.
 	InstallTenantKekVersion(InstallTenantKekVersion),
 }
 

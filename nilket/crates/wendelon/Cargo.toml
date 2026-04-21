@@ -24,7 +24,7 @@ dashmap = "6.1.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 io-uring = "0.7.11"
 libc = "0.2"
-opendal = { version = "0.55", features = ["services-s3"] }
+opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
 quinn = "0.11"

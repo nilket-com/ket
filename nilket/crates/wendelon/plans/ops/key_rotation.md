@@ -82,7 +82,7 @@ Operational notes:
 - The normal release profile strips symbols, so the verification pass must override that with `CARGO_PROFILE_RELEASE_STRIP=none`.
 - On this workspace, the release FIPS build was toolchain-sensitive: the default host C toolchain failed inside `aws-lc-fips-sys` during the FIPS delocation step, while the same build succeeded with `CC=clang CXX=clang++`.
 - The verified W4 release artifact produced zero matches for the `nm` and `strings` checks above.
-- CI now enforces the same contract through `ci/check_w4_fips_symbol_sweep.sh` in the `fips-symbol-sweep` job.
+- CI now enforces the same contract through `ci/check_fips_symbol_sweep.sh` in the `fips-symbol-sweep` job.
 
 ## Plaintext-to-Ciphertext Rewrite
 

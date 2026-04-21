@@ -8,7 +8,8 @@
 //! returns so the L1 file can be unlinked.
 //!
 //! The same task also rewrites legacy plaintext L2 objects into
-//! W4 envelope-encrypted form. Those rewrites are bounded per pass
+//! the ADR 022 encrypted object layout. Those rewrites are bounded
+//! per pass
 //! so an operator can pause or throttle the migration independently
 //! of fresh tier uploads.
 //!
@@ -43,8 +44,8 @@
 //!    slabs. Too-small values starve the write path on a busy
 //!    cluster; the default of 5s is a compromise.
 //!  * `max_upload_bytes_per_sec`: a token bucket applied to the
-//!    L2 upload so the sweeper never saturates the NIC. In W4
-//!    this caps PUT traffic only; rewrite-path GET bandwidth is
+//!    L2 upload so the sweeper never saturates the NIC. This caps
+//!    PUT traffic only; rewrite-path GET bandwidth is
 //!    not throttled. The bucket is refilled on a 100ms tick.
 //!  * `max_plaintext_rewrites_per_pass`: how many legacy plaintext
 //!    L2 slabs are re-encrypted per scan. Setting it to 0 pauses
@@ -76,7 +77,7 @@ use tokio::time::{Instant, sleep};
 /// laptop without destroying your write throughput" — production
 /// deployments will want to set `max_upload_bytes_per_sec` from
 /// the NIC capacity and the per-node upload budget.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SweeperConfig {
 	/// How often the sweeper checks for new sealed slabs.
 	pub scan_interval: Duration,
@@ -86,8 +87,8 @@ pub struct SweeperConfig {
 	/// not shipped off NVMe.
 	pub min_slab_bytes: u64,
 	/// Upload rate limit in bytes per second. `None` disables the
-	/// limiter. Applied per sweeper instance, not per slab, and in
-	/// W4 it throttles PUT traffic only.
+	/// limiter. Applied per sweeper instance, not per slab, and it
+	/// throttles PUT traffic only.
 	pub max_upload_bytes_per_sec: Option<u64>,
 	/// Object-key prefix. URIs returned by the object store are
 	/// `<prefix>slab_<hex>.wnd`; operators may set this to a
@@ -473,7 +474,7 @@ impl SlabSweeper {
 			slab_id = pointer.slab_id.get(),
 			old_l2_uri = %pointer.l2_uri,
 			new_l2_uri = %new_uri,
-			"rewrote plaintext L2 slab into ciphertext envelope"
+			"rewrote plaintext L2 slab into ADR 022 ciphertext"
 		);
 		Ok(PlaintextRewriteOutcome::Rewritten)
 	}

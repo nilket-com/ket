@@ -94,6 +94,8 @@ fn bootstrap_cfg(
 		trusted_transfer_signers,
 		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
+		tiering: wendelon::storage::SweeperConfig::default(),
+		rehydration: wendelon::storage::RehydrationPolicy::default(),
 		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
 		crypto_cache: wendelon::crypto::CryptoCacheConfig::default(),
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),

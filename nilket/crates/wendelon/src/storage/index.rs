@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 const RECORDS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slab_records_v1");
-/// V1 layout: `payload_hash[32] || l2_uri_utf8`. Pre-W4 — no
+/// V1 layout: `payload_hash[32] || l2_uri_utf8`. Older rows had no
 /// `is_encrypted` byte. Read-only; one-shot migrated into V2 the
 /// first time a process opens an index that still has V1 rows.
 const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v1");
@@ -403,7 +403,7 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	})
 }
 
-/// Decode a v1 (pre-W4) tiered pointer record. v1 lacked the
+/// Decode a v1 tiered pointer record. v1 lacked the
 /// `flags_byte`, so any pointer recovered from v1 defaults to
 /// `is_encrypted = false`. The plaintext-rewrite sweeper will
 /// GET each one, encrypt it, and stamp `is_encrypted = true`

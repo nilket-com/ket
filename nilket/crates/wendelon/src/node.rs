@@ -76,11 +76,12 @@ use crate::network::transport::{
 };
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
-use crate::storage::GroupCommitConfig;
-use crate::storage::ManagerTierObserver;
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::l2::ObjectStoreConfig;
-use crate::storage::manager::{SlabManager, SlabManagerConfig};
+use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
+use crate::storage::{
+	GroupCommitConfig, ManagerTierObserver, RaftCommitter, SlabSweeper, SweeperConfig,
+};
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
 use std::collections::{BTreeMap, HashMap};
@@ -169,6 +170,12 @@ pub struct NodeBootstrapConfig {
 	pub cluster: ClusterBootstrapConfig,
 	/// Optional L2 backend for sealed-slab tiering.
 	pub l2: Option<ObjectStoreConfig>,
+	/// Background sweeper policy for L1 -> L2 migration and
+	/// local-cache reclaim. Used only when `l2` is configured.
+	pub tiering: SweeperConfig,
+	/// Policy governing when hot L2 slabs are promoted back into
+	/// local L1 storage.
+	pub rehydration: RehydrationPolicy,
 	/// Root KEK provider used to wrap and unwrap tenant KEKs.
 	pub root_kek_provider: RootKekProviderConfig,
 	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
@@ -213,6 +220,8 @@ impl NodeBootstrapConfig {
 			trusted_transfer_signers,
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
+			tiering: SweeperConfig::default(),
+			rehydration: RehydrationPolicy::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
@@ -253,7 +262,7 @@ impl NodeBootstrapConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				format!(
-					"slab_max_bytes={} exceeds the W4 hard ceiling of {} bytes",
+					"slab_max_bytes={} exceeds the hard ceiling of {} bytes",
 					self.slab_max_bytes,
 					crate::crypto::SLAB_MAX_BYTES_HARD_CEILING
 				),
@@ -320,6 +329,16 @@ impl NodeBootstrapConfig {
 					self.node_id
 				),
 			));
+		}
+		self.rehydration.validate()?;
+		if let Some(l2) = &self.l2 {
+			l2.build()?;
+			if self.tiering.scan_interval.is_zero() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"tiering.scan_interval must be greater than zero when l2 is configured",
+				));
+			}
 		}
 		match &self.cluster {
 			ClusterBootstrapConfig::Bootstrap => {}
@@ -456,6 +475,7 @@ pub struct NodeHandles {
 	pub epoch_reconciler: JoinHandle<()>,
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
+	pub tiering_sweeper: Option<JoinHandle<()>>,
 	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
 }
@@ -470,6 +490,9 @@ impl NodeHandles {
 		self.epoch_reconciler.abort();
 		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
+		if let Some(handle) = &self.tiering_sweeper {
+			handle.abort();
+		}
 		self.default_tenant_seeder.abort();
 		self.checkpoint_emitter.abort();
 	}
@@ -488,6 +511,9 @@ impl NodeHandles {
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
+		if let Some(handle) = self.tiering_sweeper {
+			await_background_task(handle, "tiering sweeper").await?;
+		}
 		await_background_task(self.default_tenant_seeder, "default tenant seeder").await?;
 		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
@@ -826,6 +852,7 @@ impl WendelonNode {
 
 		// 3. L1 slab storage.
 		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
+		let l2_for_sweeper = l2.clone();
 		let crypto = Arc::new(CryptoManager::new_with_cache_config(
 			cfg.root_kek_provider.build(&cfg.data_dir)?,
 			cfg.crypto_cache,
@@ -836,7 +863,7 @@ impl WendelonNode {
 				max_slab_bytes: cfg.slab_max_bytes,
 				io: io.clone(),
 				l2,
-				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				rehydration: cfg.rehydration.clone(),
 				group_commit: cfg.group_commit.clone(),
 				crypto: crypto.clone(),
 			})
@@ -1193,6 +1220,16 @@ impl WendelonNode {
 			MIGRATION_SWEEP_FAILURE_BACKOFF,
 			MIGRATION_SWEEP_MAX_PER_PASS,
 		);
+		let tiering_sweeper = l2_for_sweeper.map(|object_store| {
+			SlabSweeper::new(
+				slab.clone(),
+				object_store,
+				Arc::new(RaftCommitter::new(raft.clone())),
+				state_machine.clone(),
+				cfg.tiering.clone(),
+			)
+			.spawn()
+		});
 
 		Ok(Self {
 			local_node,
@@ -1225,6 +1262,7 @@ impl WendelonNode {
 				epoch_reconciler,
 				tenant_policy_reconciler,
 				migration_sweeper,
+				tiering_sweeper,
 				default_tenant_seeder,
 				checkpoint_emitter,
 			},
@@ -1992,6 +2030,20 @@ mod tests {
 		}
 	}
 
+	async fn wait_for_tiered_slab(node: &WendelonNode, slab_id: crate::schema::SlabId) {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.slab.is_tiered(slab_id).await {
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for slab {slab_id} to tier"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+
 	fn read_audit_log(dir: &std::path::Path) -> String {
 		std::fs::read_to_string(dir.join("audit.ndjson")).unwrap()
 	}
@@ -2183,9 +2235,16 @@ mod tests {
 		assert_eq!(sealed.len(), 1, "expected one sealed slab after rotation");
 		let sealed_id = sealed[0].slab_id;
 		let raw = node.slab.read_sealed_raw(sealed_id).await.unwrap();
-		let payload_hash = *blake3::hash(&raw).as_bytes();
+		let encrypted = node
+			.slab
+			.encrypt_tiered_object_blob(sealed_id, &raw)
+			.unwrap();
+		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
 		let l2_uri = l2
-			.put(&format!("sealed/slab_{sealed_id:016x}.wnd"), &raw)
+			.put(
+				&format!("sealed/slab_{sealed_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
 			.await
 			.unwrap();
 
@@ -2343,6 +2402,70 @@ mod tests {
 		assert_ne!(old_footer.tenant_kek_id, new_footer.tenant_kek_id);
 		assert_eq!(new_footer.tenant_kek_id, rotated_kek_id);
 		assert_eq!(node.slab.read(old_loc).await.unwrap(), b"before-rotation");
+	}
+
+	#[tokio::test]
+	async fn single_node_bootstrap_starts_background_tiering_when_l2_is_configured() {
+		let dir = tempdir("background-tiering");
+		let l2_dir = tempdir("background-tiering-l2");
+		let mut cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
+		cfg.slab_max_bytes = 1;
+		cfg.l2 = Some(ObjectStoreConfig::LocalFs { root: l2_dir });
+		cfg.tiering.scan_interval = Duration::from_millis(20);
+		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+
+		wait_for_local_leader(&node).await;
+
+		let tenant_id = TenantId::ZERO;
+		let tiered_key = Identity::blake3(b"background-tiered");
+		node.slab
+			.append(
+				tenant_id,
+				tiered_key,
+				HybridTimestamp {
+					physical_ms: 1,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"background-tiered",
+			)
+			.await
+			.unwrap();
+		node.slab
+			.append(
+				tenant_id,
+				Identity::blake3(b"background-tiered-filler"),
+				HybridTimestamp {
+					physical_ms: 2,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"seal-slab-zero",
+			)
+			.await
+			.unwrap();
+
+		let location = node
+			.slab
+			.lookup(tenant_id, tiered_key)
+			.expect("tiered key should remain indexed");
+		wait_for_tiered_slab(&node, location.slab_id).await;
+
+		assert_eq!(
+			node.slab.read(location).await.unwrap(),
+			b"background-tiered"
+		);
+		let pointer = node
+			.slab
+			.tier_pointer(location.slab_id)
+			.await
+			.expect("tier pointer should exist after background sweep");
+		assert!(pointer.l2_uri.starts_with("file://"));
+		assert!(
+			!dir.join(format!("slab_{:016x}.wnd", location.slab_id))
+				.exists(),
+			"tiered slab should be unlinked from local L1 after the background sweep"
+		);
 	}
 
 	#[tokio::test]

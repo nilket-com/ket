@@ -254,7 +254,7 @@ impl RawConfig {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				format!(
-					"storage.slab_max_bytes={} exceeds the W4 hard ceiling of {} bytes",
+					"storage.slab_max_bytes={} exceeds the hard ceiling of {} bytes",
 					self.storage.slab_max_bytes, SLAB_MAX_BYTES_HARD_CEILING
 				),
 			));
@@ -334,6 +334,8 @@ impl RawConfig {
 			trusted_transfer_signers,
 			cluster,
 			l2: None,
+			tiering: crate::storage::SweeperConfig::default(),
+			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			root_kek_provider: self.crypto.root_kek_provider,
 			crypto_cache: CryptoCacheConfig {
 				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,

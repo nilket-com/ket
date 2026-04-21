@@ -1411,10 +1411,10 @@ pub struct SmState {
 	/// retained so pre-rotation slabs keep decrypting while new slabs
 	/// wrap under the current active KEK version.
 	///
-	/// Keep this durable field at the end of the struct. Pre-W4
-	/// snapshots are decoded through an explicit legacy fallback;
-	/// keeping new fields trailing avoids mid-struct postcard
-	/// reorder hazards in future upgrades.
+	/// Keep this durable field at the end of the struct so older
+	/// snapshots can keep defaulting it cleanly; keeping new fields
+	/// trailing avoids mid-struct postcard reorder hazards in future
+	/// upgrades.
 	#[serde(default)]
 	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
 }
@@ -4642,7 +4642,20 @@ mod recovery_tests {
 		let first = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 		crypto.apply_rotation(&first).unwrap();
 		let encrypted = crypto
-			.encrypt_tiered_slab(SlabId::new(42), TenantId::ZERO, b"before-snapshot")
+			.encrypt_tiered_slab_object(
+				SlabId::new(42),
+				&crate::crypto::TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 0,
+					offset_index: vec![crate::crypto::TieredOffsetIndexEntry {
+						key_locator: crate::schema::IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: u32::try_from(b"before-snapshot".len()).unwrap(),
+						flags: 0,
+					}],
+				},
+				b"before-snapshot",
+			)
 			.unwrap();
 		let second = crypto.prepare_rotation(TenantId::ZERO).unwrap();
 

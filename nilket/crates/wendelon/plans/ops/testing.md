@@ -36,7 +36,7 @@ No golden-file snapshot tests for dynamic state — they are brittle and hide re
 
 Integration tests exercise cross-module wiring on real dependencies that do not require a kernel-capable runner:
 
-- **rustfs (ADR 014)** — the S3-compatible test backend. Drives real HTTP, real multipart, real ranged GETs. Every L2-touching test path uses rustfs.
+- **rustfs (ADR 014)** — one OpenDAL compatibility backend used in current pilot coverage. Drives real HTTP, real multipart, real ranged GETs. The production abstraction remains provider-neutral and is expected to stay portable across additional providers.
 - **redb** — the real persistent-index backing (ADR 017). Tests exercise WAL-replay-forward against real files.
 - **Localhost loop for QUIC framing** — real `quinn` connection pairs within a single process. Useful for RPC-framing tests that don't need a network simulator.
 - **Real `io_uring` on the CI runner** — the production `IoRingHandle` is exercised by integration tests that run on Linux runners. Non-Linux developer environments run the `SimFileOps` implementation (see §4.1).
@@ -87,7 +87,7 @@ A mocked `ObjectStore` implementation services L2 operations in the simulator:
 - Eventual-consistency window modeling: `LIST` sees `PUT`s at configurable delay; `DELETE`s have configurable propagation.
 - Partial-multipart failures: parts 1-3 succeed, part 4 returns 500, configurable retry behavior.
 
-The mock is **additive** to rustfs (ADR 014); it does not replace rustfs in the integration harness. rustfs answers "does the client drive a real S3 service correctly?"; the mock answers "does the L2 path survive specific fault sequences on a deterministic substrate?"
+The mock is **additive** to rustfs (ADR 014); it does not replace rustfs in the integration harness. rustfs answers "does the OpenDAL remote path drive a real compatibility service correctly?"; the mock answers "does the L2 path survive specific fault sequences on a deterministic substrate?"
 
 ### 4.5 Correctness checkers
 
@@ -234,7 +234,7 @@ If a bug class has a single cell, losing that harness loses that coverage. That 
 
 - **Production traffic replay.** The pilot does not replay production traffic in CI. The chaos harness workloads are synthetic but representative; replay-based testing is a future project with its own ADR.
 - **Formal methods (TLA+, Coq).** The simulator is the executable model. A TLA+ model of Raft is a useful reading exercise; it is not a blocking deliverable and does not replace seed-reproducible simulation.
-- **LocalStack or S3-mock-as-integration-backend.** Rejected at ADR 014; rustfs is the integration S3; the simulator's mock `ObjectStore` is additive.
+- **LocalStack or a singular S3-mock-as-integration-backend.** Rejected at ADR 014; rustfs is the pilot integration backend, and the simulator's mock `ObjectStore` is additive rather than architectural.
 - **"Smoke tests only" on merge-to-main.** Every PR runs the full per-PR tier; `main` is not a relaxed gate.
 
 ---
@@ -243,7 +243,7 @@ If a bug class has a single cell, losing that harness loses that coverage. That 
 
 - ADR 028: Deterministic Simulator and `AsyncFileOps` Abstraction (harness architecture)
 - ADR 009: io_uring Threading Model (`IoRingHandle` + dedicated-thread model the simulator seam abstracts)
-- ADR 014: RustFS as the S3 Test Backend (integration-layer S3)
+- ADR 014: RustFS as the OpenDAL Compatibility Test Backend (integration-layer compatibility backend)
 - ADR 016: Durability Model (fsync semantics the simulator and chaos harnesses validate)
 - ADR 017: Persistent Local Index on redb (WAL replay-forward under simulator)
 - ADR 027: Observability Posture (metrics that validate SLOs, including `audit_materialization_lag_entries`)

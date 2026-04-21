@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W4 invariant: KEK material lives in mlock'd memory only. No
+# Crypto invariant: KEK material lives in mlock'd memory only. No
 # branch is allowed to introduce a code path that writes a wrapped
 # DEK, raw KEK, or unwrapped key to local disk — the slab-DEK
 # rewrap is always Raft-committed and the L1/L2 footers carry only
@@ -8,7 +8,7 @@
 # This script is a coarse static guard. It greps the source tree
 # for suspicious file-write call patterns colocated with key
 # material identifiers. False positives must be silenced by giving
-# the offending line a `// w4-no-disk-cache-ok: <reason>` comment
+# the offending line a `// crypto-no-disk-cache-ok: <reason>` comment
 # explaining why the write is safe (e.g., test fixtures that mint
 # a synthetic non-secret).
 set -euo pipefail
@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if ! command -v rg >/dev/null 2>&1; then
-  echo "ripgrep (rg) is required for the W4 disk-cache key sweep" >&2
+  echo "ripgrep (rg) is required for the crypto disk-cache key sweep" >&2
   exit 1
 fi
 
@@ -47,7 +47,7 @@ found_any=0
 while IFS= read -r file; do
   # Find lines that mention a key identifier AND a write surface
   # within +/- 8 lines of each other. -U so multiline ranges are
-  # considered. The `w4-no-disk-cache-ok` escape hatch suppresses
+  # considered. The `crypto-no-disk-cache-ok` escape hatch suppresses
   # acknowledged exceptions.
   matches="$(rg -nU --no-heading \
       -e "($ident_pattern)" \
@@ -68,7 +68,7 @@ while IFS= read -r file; do
         hit_line="${hit%%:*}"
         # honor the per-line escape hatch
         if sed -n "${hit_line}p" "${file}" \
-             | rg -q 'w4-no-disk-cache-ok'; then
+             | rg -q 'crypto-no-disk-cache-ok'; then
           continue
         fi
         echo "POSSIBLE on-disk KEK material write:"
@@ -82,10 +82,10 @@ done < <(rg -l --no-heading -e "($ident_pattern)" src tests 2>/dev/null || true)
 
 if [[ "${found_any}" -ne 0 ]]; then
   echo
-  echo "W4 disk-cache key sweep FAILED — see above. Either remove the" >&2
-  echo "write or add a // w4-no-disk-cache-ok: <reason> trailing comment" >&2
+  echo "Crypto disk-cache key sweep FAILED — see above. Either remove the" >&2
+  echo "write or add a // crypto-no-disk-cache-ok: <reason> trailing comment" >&2
   echo "on the write line, with a justification a reviewer can audit." >&2
   exit 1
 fi
 
-echo "W4 disk-cache key sweep passed"
+echo "Crypto disk-cache key sweep passed"
