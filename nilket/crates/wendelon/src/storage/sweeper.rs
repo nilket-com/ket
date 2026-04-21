@@ -61,11 +61,18 @@
 //! commit. The upload cost is therefore paid exactly once per
 //! slab even though the sweeper itself runs everywhere.
 
-use crate::consensus::{TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine};
+use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAuditSink};
+use crate::consensus::monitor::{PhysicalClock, SystemClock};
+use crate::consensus::{
+	RetireTieredSlab, TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine,
+};
 use crate::metrics::global as metrics;
-use crate::schema::SlabId;
+use crate::schema::{HybridTimestamp, NodeId, SlabId};
+use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
-use crate::storage::manager::{SealedSlabInfo, SlabManager, TieredSlabPointer};
+use crate::storage::manager::{
+	PreparedTieredRetentionRewrite, SealedSlabInfo, SlabManager, TieredSlabPointer,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -112,6 +119,8 @@ impl Default for SweeperConfig {
 	}
 }
 
+const RETENTION_TIERED_REWRITE_MAX_PER_PASS: usize = 1;
+
 /// The sweeper task and everything it needs to do its job.
 ///
 /// Cloneable — internally every long-lived piece is an `Arc`, so
@@ -124,6 +133,10 @@ pub struct SlabSweeper {
 	raft: Arc<dyn TierCommitter>,
 	state_machine: WendelonStateMachine,
 	config: SweeperConfig,
+	mvcc_retention_policy: MvccRetentionPolicy,
+	clock: Arc<dyn PhysicalClock>,
+	local_node: NodeId,
+	audit_sink: Arc<dyn AuditSink>,
 	/// Fires to nudge the sweeper to scan immediately instead of
 	/// waiting for the next interval. Used by tests and by the
 	/// slab rotation path to hand-off a freshly-sealed slab.
@@ -144,6 +157,10 @@ pub trait TierCommitter: Send + Sync {
 	/// sweeper should skip this slab and try again on the next
 	/// scan — the L1 file stays put.
 	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()>;
+
+	/// Submit a RetireTieredSlab entry. Returns `Ok(())` only after
+	/// the local state machine has applied the retirement.
+	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()>;
 }
 
 /// Production [`TierCommitter`] backed by an openraft [`WendelonRaft`].
@@ -179,6 +196,22 @@ impl TierCommitter for RaftCommitter {
 			)),
 		}
 	}
+
+	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+		match self
+			.raft
+			.client_write(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+				slab_id,
+			}))
+			.await
+		{
+			Ok(_) => Ok(()),
+			Err(e) => Err(std::io::Error::new(
+				std::io::ErrorKind::Other,
+				format!("RetireTieredSlab commit failed: {e}"),
+			)),
+		}
+	}
 }
 
 impl SlabSweeper {
@@ -195,8 +228,36 @@ impl SlabSweeper {
 			raft,
 			state_machine,
 			config,
+			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
+			clock: Arc::new(SystemClock),
+			local_node: NodeId {
+				id: 0,
+				_reserved: 0,
+			},
+			audit_sink: Arc::new(NoopAuditSink),
 			wakeup: Arc::new(Notify::new()),
 		}
+	}
+
+	pub fn with_mvcc_retention_policy(mut self, retention_policy: MvccRetentionPolicy) -> Self {
+		self.mvcc_retention_policy = retention_policy;
+		self
+	}
+
+	pub fn with_mvcc_retention_window(mut self, retention_window: Option<Duration>) -> Self {
+		self.mvcc_retention_policy = MvccRetentionPolicy::from_optional_window(retention_window);
+		self
+	}
+
+	pub fn with_clock(mut self, clock: Arc<dyn PhysicalClock>) -> Self {
+		self.clock = clock;
+		self
+	}
+
+	pub fn with_audit_sink(mut self, local_node: NodeId, audit_sink: Arc<dyn AuditSink>) -> Self {
+		self.local_node = local_node;
+		self.audit_sink = audit_sink;
+		self
 	}
 
 	/// Prod the sweeper to scan right now, skipping the remaining
@@ -219,6 +280,8 @@ impl SlabSweeper {
 	pub async fn sweep_once(&self) -> std::io::Result<SweepReport> {
 		metrics().storage_tiering_passes_total.inc();
 		let mut report = SweepReport::default();
+		let reconcile = self.reconcile_tiered_runtime_state_once().await?;
+		report.failed += reconcile.failed;
 		let candidates = self.slab.list_sealed_slabs().await;
 		for candidate in candidates {
 			if candidate.size_bytes < self.config.min_slab_bytes {
@@ -250,6 +313,14 @@ impl SlabSweeper {
 		report.skipped_already_encrypted_tiered = rewritten.skipped_already_encrypted;
 		report.plaintext_rewrite_failures = rewritten.failed;
 		report.failed += rewritten.failed;
+		let retention_rewrites = self
+			.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
+			.await?;
+		report.retention_rewritten_tiered = retention_rewrites.rewritten;
+		report.retention_pruned_versions = retention_rewrites.pruned_versions;
+		report.retention_reclaimed_bytes = retention_rewrites.reclaimed_bytes;
+		report.retention_rewrite_failures = retention_rewrites.failed;
+		report.failed += retention_rewrites.failed;
 		let reclaim = self.reclaim_tombstoned_ranges_once(1).await?;
 		report.reclaimed_slabs = reclaim.compacted_slabs;
 		report.reclaimed_bytes = reclaim.reclaimed_bytes;
@@ -298,7 +369,11 @@ impl SlabSweeper {
 		// Phase 2: upload to L2, applying the rate limit.
 		self.rate_limit_upload(encrypted.bytes.len()).await;
 		let key = format!("{}slab_{:016x}.wnd", self.config.key_prefix, info.slab_id);
+		let upload_started = tokio::time::Instant::now();
 		let l2_uri = self.object_store.put(&key, &encrypted.bytes).await?;
+		metrics()
+			.l2_upload_latency_seconds
+			.observe_duration(upload_started.elapsed());
 
 		// Phase 3: round-trip verification. A mismatch here means
 		// the object store acked a write but returned a different
@@ -330,11 +405,15 @@ impl SlabSweeper {
 		// keep their open fd (Linux unlink semantics).
 		let tier = TieredSlab {
 			slab_id: info.slab_id,
-			l2_uri,
+			l2_uri: l2_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
 		};
-		self.raft.commit_tier_slab(tier).await?;
+		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
+				.await;
+			return Err(error);
+		}
 
 		// Defensive: if the SM has an observer wired in, apply is
 		// already done. If it does not (e.g., a test wiring), the
@@ -433,7 +512,7 @@ impl SlabSweeper {
 		let fetched = self.object_store.get(&new_uri).await?;
 		let fetched_hash = *blake3::hash(&fetched).as_bytes();
 		if fetched_hash != expected_hash {
-			let _ = self.object_store.delete(&new_uri).await;
+			let _ = self.delete_object_if_present(&new_uri).await;
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
 				format!(
@@ -452,7 +531,8 @@ impl SlabSweeper {
 			is_encrypted: true,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
-			let _ = self.object_store.delete(&new_uri).await;
+			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
+				.await;
 			return Err(error);
 		}
 
@@ -461,14 +541,18 @@ impl SlabSweeper {
 		}
 
 		if pointer.l2_uri != new_uri {
-			if let Err(error) = self.object_store.delete(&pointer.l2_uri).await {
+			if let Err(error) = self.delete_object_if_present(&pointer.l2_uri).await {
 				tracing::warn!(
 					slab_id = pointer.slab_id.get(),
 					l2_uri = %pointer.l2_uri,
 					error = %error,
 					"ciphertext rewrite committed but legacy plaintext object cleanup failed"
 				);
+			} else {
+				self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
 			}
+		} else {
+			self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
 		}
 		tracing::info!(
 			slab_id = pointer.slab_id.get(),
@@ -477,6 +561,234 @@ impl SlabSweeper {
 			"rewrote plaintext L2 slab into ADR 022 ciphertext"
 		);
 		Ok(PlaintextRewriteOutcome::Rewritten)
+	}
+
+	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
+		let window = self.mvcc_retention_policy.window()?;
+		let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+		Some(HybridTimestamp {
+			physical_ms: self.clock.now_ms().saturating_sub(window_ms),
+			logical: 0,
+			node_id: 0,
+		})
+	}
+
+	async fn rewrite_tiered_slabs_for_retention_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<TieredRetentionRewriteReport> {
+		let mut report = TieredRetentionRewriteReport::default();
+		let Some(retention_floor) = self.mvcc_retention_floor_hlc() else {
+			return Ok(report);
+		};
+		if max_slabs == 0 {
+			return Ok(report);
+		}
+		for pointer in self.slab.list_tiered_slabs().await {
+			if report.rewritten >= max_slabs {
+				break;
+			}
+			match self
+				.rewrite_one_tiered_slab_for_retention(&pointer, retention_floor)
+				.await
+			{
+				Ok(Some(outcome)) => {
+					report.rewritten += 1;
+					report.pruned_versions += outcome.pruned_versions;
+					report.reclaimed_bytes += outcome.reclaimed_bytes;
+				}
+				Ok(None) => {}
+				Err(error) => {
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"tiered MVCC retention rewrite failed; will retry on next scan"
+					);
+					report.failed += 1;
+				}
+			}
+		}
+		Ok(report)
+	}
+
+	async fn rewrite_one_tiered_slab_for_retention(
+		&self,
+		pointer: &TieredSlabPointer,
+		retention_floor: HybridTimestamp,
+	) -> std::io::Result<Option<PreparedTieredRetentionOutcome>> {
+		let Some(prepared) = self
+			.slab
+			.prepare_tiered_retention_rewrite(pointer, retention_floor)
+			.await?
+		else {
+			return Ok(None);
+		};
+		match prepared {
+			PreparedTieredRetentionRewrite::Rewrite {
+				slab_id,
+				old_l2_uri,
+				encrypted_bytes,
+				payload_hash,
+				pruned_versions,
+				reclaimed_bytes,
+			} => {
+				let key = self.retention_rewritten_key(slab_id);
+				self.rate_limit_upload(encrypted_bytes.len()).await;
+				let new_uri = self.object_store.put(&key, &encrypted_bytes).await?;
+				let fetched = self.object_store.get(&new_uri).await?;
+				let fetched_hash = *blake3::hash(&fetched).as_bytes();
+				if fetched_hash != payload_hash {
+					let _ = self.delete_object_if_present(&new_uri).await;
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						format!(
+							"retention rewrite hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+							slab_id,
+							&payload_hash[..4],
+							&fetched_hash[..4],
+						),
+					));
+				}
+
+				let tier = TieredSlab {
+					slab_id,
+					l2_uri: new_uri.clone(),
+					payload_hash,
+					is_encrypted: true,
+				};
+				if let Err(error) = self.raft.commit_tier_slab(tier).await {
+					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
+						.await;
+					return Err(error);
+				}
+
+				if let Some(pointer) = self.sm_tier_pointer(slab_id).await {
+					self.slab.apply_tier_slab(pointer).await?;
+				}
+				if old_l2_uri != new_uri {
+					if let Err(error) = self.delete_object_if_present(&old_l2_uri).await {
+						tracing::warn!(
+							slab_id = slab_id.get(),
+							l2_uri = %old_l2_uri,
+							error = %error,
+							"tiered retention rewrite committed but old object cleanup failed"
+						);
+					} else {
+						self.slab.clear_retired_tiered_cleanup(slab_id);
+					}
+				} else {
+					self.slab.clear_retired_tiered_cleanup(slab_id);
+				}
+				tracing::info!(
+					slab_id = slab_id.get(),
+					old_l2_uri = %old_l2_uri,
+					new_l2_uri = %new_uri,
+					pruned_versions,
+					reclaimed_bytes,
+					"rewrote tiered slab for MVCC retention"
+				);
+				self.emit_retention_pruned_audit(
+					slab_id,
+					retention_floor,
+					pruned_versions,
+					reclaimed_bytes,
+					&old_l2_uri,
+					Some(&new_uri),
+					"rewrite",
+				);
+				Ok(Some(PreparedTieredRetentionOutcome {
+					pruned_versions,
+					reclaimed_bytes,
+				}))
+			}
+			PreparedTieredRetentionRewrite::Retire {
+				slab_id,
+				old_l2_uri,
+				pruned_versions,
+				reclaimed_bytes,
+			} => {
+				self.raft.retire_tiered_slab(slab_id).await?;
+				self.slab.retire_tiered_slab(slab_id).await?;
+				if let Err(error) = self.delete_object_if_present(&old_l2_uri).await {
+					tracing::warn!(
+						slab_id = slab_id.get(),
+						l2_uri = %old_l2_uri,
+						error = %error,
+						"tiered retention retirement committed but old object cleanup failed"
+					);
+				} else {
+					self.slab.clear_retired_tiered_cleanup(slab_id);
+				}
+				tracing::info!(
+					slab_id = slab_id.get(),
+					old_l2_uri = %old_l2_uri,
+					pruned_versions,
+					reclaimed_bytes,
+					"retired fully-pruned tiered slab for MVCC retention"
+				);
+				self.emit_retention_pruned_audit(
+					slab_id,
+					retention_floor,
+					pruned_versions,
+					reclaimed_bytes,
+					&old_l2_uri,
+					None,
+					"retire",
+				);
+				Ok(Some(PreparedTieredRetentionOutcome {
+					pruned_versions,
+					reclaimed_bytes,
+				}))
+			}
+		}
+	}
+
+	fn emit_retention_pruned_audit(
+		&self,
+		slab_id: SlabId,
+		retention_floor: HybridTimestamp,
+		pruned_versions: usize,
+		reclaimed_bytes: u64,
+		old_l2_uri: &str,
+		new_l2_uri: Option<&str>,
+		rewrite_action: &'static str,
+	) {
+		let mut message = format!(
+			"retention_floor_ms={} slab_id={} rewrite_action={} pruned_versions={} reclaimed_bytes={} old_l2_uri={}",
+			retention_floor.physical_ms,
+			slab_id.get(),
+			rewrite_action,
+			pruned_versions,
+			reclaimed_bytes,
+			old_l2_uri,
+		);
+		if let Some(new_l2_uri) = new_l2_uri {
+			message.push_str(" new_l2_uri=");
+			message.push_str(new_l2_uri);
+		}
+		let mut audit = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::MvccSnapshotPruned,
+			self.local_node,
+			message,
+		)
+		.with_parameter("retention_floor_ms", retention_floor.physical_ms)
+		.with_parameter("slab_id", slab_id.get())
+		.with_parameter("rewrite_action", rewrite_action)
+		.with_parameter("pruned_versions", pruned_versions as u64)
+		.with_parameter("reclaimed_bytes", reclaimed_bytes)
+		.with_parameter("old_l2_uri", old_l2_uri);
+		if let Some(new_l2_uri) = new_l2_uri {
+			audit = audit.with_parameter("new_l2_uri", new_l2_uri);
+		}
+		if let Err(err) = self.audit_sink.emit(audit) {
+			tracing::warn!(
+				slab_id = slab_id.get(),
+				error = %err,
+				"tiered MVCC retention prune audit emission failed"
+			);
+		}
 	}
 
 	/// Pull the state machine's authoritative tier pointer for a
@@ -491,6 +803,151 @@ impl SlabSweeper {
 			payload_hash: t.payload_hash,
 			is_encrypted: t.is_encrypted,
 		})
+	}
+
+	async fn sm_tier_pointers(&self) -> Vec<TieredSlabPointer> {
+		let state = self.state_machine.state_snapshot().await;
+		let mut pointers = state
+			.tiered_slabs
+			.values()
+			.map(|tier| TieredSlabPointer {
+				slab_id: tier.slab_id,
+				l2_uri: tier.l2_uri.clone(),
+				payload_hash: tier.payload_hash,
+				is_encrypted: tier.is_encrypted,
+			})
+			.collect::<Vec<_>>();
+		pointers.sort_by_key(|pointer| pointer.slab_id);
+		pointers
+	}
+
+	async fn delete_object_if_present(&self, uri: &str) -> std::io::Result<()> {
+		match self.object_store.delete(uri).await {
+			Ok(()) => Ok(()),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+			Err(error) => Err(error),
+		}
+	}
+
+	async fn cleanup_uploaded_object_after_failed_commit(&self, slab_id: SlabId, new_uri: &str) {
+		if self
+			.sm_tier_pointer(slab_id)
+			.await
+			.is_some_and(|pointer| pointer.l2_uri == new_uri)
+		{
+			tracing::warn!(
+				slab_id = slab_id.get(),
+				l2_uri = %new_uri,
+				"tier commit returned error after state machine already pointed at uploaded object; preserving object"
+			);
+			return;
+		}
+		if let Err(error) = self.delete_object_if_present(new_uri).await {
+			tracing::warn!(
+				slab_id = slab_id.get(),
+				l2_uri = %new_uri,
+				error = %error,
+				"failed to clean up uncommitted uploaded tiered object"
+			);
+		}
+	}
+
+	async fn reconcile_tiered_runtime_state_once(
+		&self,
+	) -> std::io::Result<TieredStateReconcileReport> {
+		let mut report = TieredStateReconcileReport::default();
+		let authoritative = self.sm_tier_pointers().await;
+		let authoritative_by_slab = authoritative
+			.iter()
+			.map(|pointer| (pointer.slab_id, pointer.clone()))
+			.collect::<std::collections::HashMap<_, _>>();
+		let local = self.slab.list_tiered_slabs().await;
+		let local_by_slab = local
+			.iter()
+			.map(|pointer| (pointer.slab_id, pointer.clone()))
+			.collect::<std::collections::HashMap<_, _>>();
+
+		for pointer in authoritative {
+			if local_by_slab.get(&pointer.slab_id) == Some(&pointer) {
+				continue;
+			}
+			match self.slab.reconcile_tiered_slab(pointer.clone(), None).await {
+				Ok(()) => report.reconciled += 1,
+				Err(error) => {
+					report.failed += 1;
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"failed to reconcile local tier state from committed state machine pointer"
+					);
+				}
+			}
+		}
+
+		for pointer in local {
+			if authoritative_by_slab.contains_key(&pointer.slab_id) {
+				continue;
+			}
+			match self.slab.retire_tiered_slab(pointer.slab_id).await {
+				Ok(changed) => {
+					if changed {
+						report.reconciled += 1;
+					}
+				}
+				Err(error) => {
+					report.failed += 1;
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"failed to retire local tier pointer absent from committed state machine"
+					);
+					continue;
+				}
+			}
+			if let Err(error) = self.delete_object_if_present(&pointer.l2_uri).await {
+				report.failed += 1;
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					l2_uri = %pointer.l2_uri,
+					error = %error,
+					"failed to delete retired L2 object during committed-state reconciliation"
+				);
+				continue;
+			}
+			self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
+		}
+
+		for pointer in self.slab.list_retired_tiered_cleanup_candidates().await {
+			if let Err(error) = self
+				.slab
+				.retry_retired_tiered_local_cleanup(pointer.slab_id)
+				.await
+			{
+				report.failed += 1;
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					error = %error,
+					"failed to retry retired local slab cleanup"
+				);
+				continue;
+			}
+			if let Err(error) = self.delete_object_if_present(&pointer.l2_uri).await {
+				report.failed += 1;
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					l2_uri = %pointer.l2_uri,
+					error = %error,
+					"failed to retry retired tiered object cleanup"
+				);
+				continue;
+			}
+			self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
+			report.reconciled += 1;
+		}
+
+		Ok(report)
 	}
 
 	async fn reclaim_tombstoned_ranges_once(
@@ -550,6 +1007,15 @@ impl SlabSweeper {
 		)
 	}
 
+	fn retention_rewritten_key(&self, slab_id: SlabId) -> String {
+		format!(
+			"{}retention/slab_{:016x}_{}.wnd",
+			self.config.key_prefix,
+			slab_id,
+			uuid::Uuid::new_v4().simple()
+		)
+	}
+
 	/// Background loop shape: sleep until the next scan deadline
 	/// *or* a wakeup signal, then run one `sweep_once`. Shutdown
 	/// happens by dropping every clone of `self.wakeup` (the
@@ -585,6 +1051,10 @@ pub struct SweepReport {
 	pub rewritten_plaintext_tiered: usize,
 	pub skipped_already_encrypted_tiered: usize,
 	pub plaintext_rewrite_failures: usize,
+	pub retention_rewritten_tiered: usize,
+	pub retention_pruned_versions: usize,
+	pub retention_reclaimed_bytes: u64,
+	pub retention_rewrite_failures: usize,
 	pub skipped_rehydration_guard: usize,
 	pub rehydrated_reclaimed: usize,
 	pub reclaimed_slabs: usize,
@@ -596,6 +1066,26 @@ struct PlaintextRewriteReport {
 	rewritten: usize,
 	skipped_already_encrypted: usize,
 	failed: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TieredStateReconcileReport {
+	reconciled: usize,
+	failed: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TieredRetentionRewriteReport {
+	rewritten: usize,
+	pruned_versions: usize,
+	reclaimed_bytes: u64,
+	failed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedTieredRetentionOutcome {
+	pruned_versions: usize,
+	reclaimed_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -649,6 +1139,17 @@ impl TierObserver for ManagerTierObserver {
 			)
 			.await
 	}
+
+	async fn on_slab_retired(
+		&self,
+		slab_id: SlabId,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.slab
+			.retire_tiered_slab_committed(slab_id, Some(applied_log_index))
+			.await
+			.map(|_| ())
+	}
 }
 
 // ============================================================
@@ -658,10 +1159,13 @@ impl TierObserver for ManagerTierObserver {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::audit::InMemoryAuditSink;
+	use crate::consensus::monitor::PhysicalClock;
 	use crate::crypto::CryptoManager;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::LocalFsObjectStore;
 	use crate::storage::manager::SlabManagerConfig;
+	use std::time::{SystemTime, UNIX_EPOCH};
 	use tokio::sync::Mutex as AsyncMutex;
 
 	/// Test-only committer that skips openraft entirely. Records
@@ -669,17 +1173,37 @@ mod tests {
 	/// path still fires.
 	struct DirectApplyCommitter {
 		observer: Arc<dyn TierObserver>,
+		state_machine: Option<WendelonStateMachine>,
 		/// When `Some`, every call to `commit_tier_slab` returns
 		/// an error cloned from this template. Models a persistent
 		/// "leader unreachable" scenario.
 		persistent_err: AsyncMutex<Option<std::io::ErrorKind>>,
+		/// When `Some`, the next `commit_tier_slab` first seeds the
+		/// state machine with the committed pointer and then returns
+		/// an error. Models an ambiguous post-commit timeout.
+		commit_applied_err: AsyncMutex<Option<std::io::ErrorKind>>,
 	}
 
 	impl DirectApplyCommitter {
-		fn ok(_sm: WendelonStateMachine, observer: Arc<dyn TierObserver>) -> Self {
+		fn ok(sm: WendelonStateMachine, observer: Arc<dyn TierObserver>) -> Self {
 			Self {
 				observer,
+				state_machine: Some(sm),
 				persistent_err: AsyncMutex::new(None),
+				commit_applied_err: AsyncMutex::new(None),
+			}
+		}
+
+		fn commit_applied_then_err(
+			sm: WendelonStateMachine,
+			observer: Arc<dyn TierObserver>,
+			kind: std::io::ErrorKind,
+		) -> Self {
+			Self {
+				observer,
+				state_machine: Some(sm),
+				persistent_err: AsyncMutex::new(None),
+				commit_applied_err: AsyncMutex::new(Some(kind)),
 			}
 		}
 	}
@@ -690,8 +1214,41 @@ mod tests {
 			if let Some(kind) = *self.persistent_err.lock().await {
 				return Err(std::io::Error::new(kind, "simulated commit failure"));
 			}
+			if let Some(kind) = self.commit_applied_err.lock().await.take() {
+				if let Some(sm) = &self.state_machine {
+					sm.seed_tiered_slab_for_test(tier).await;
+				}
+				return Err(std::io::Error::new(
+					kind,
+					"simulated post-commit ambiguous failure",
+				));
+			}
+			if let Some(sm) = &self.state_machine {
+				sm.seed_tiered_slab_for_test(tier.clone()).await;
+			}
 			self.observer.on_slab_tiered(&tier, 0).await?;
 			Ok(())
+		}
+
+		async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()> {
+			if let Some(kind) = *self.persistent_err.lock().await {
+				return Err(std::io::Error::new(kind, "simulated commit failure"));
+			}
+			if let Some(sm) = &self.state_machine {
+				sm.retire_tiered_slab_for_test(slab_id).await;
+			}
+			self.observer.on_slab_retired(slab_id, 0).await?;
+			Ok(())
+		}
+	}
+
+	struct FixedClock {
+		now_ms: u64,
+	}
+
+	impl PhysicalClock for FixedClock {
+		fn now_ms(&self) -> u64 {
+			self.now_ms
 		}
 	}
 
@@ -705,9 +1262,27 @@ mod tests {
 		dir
 	}
 
+	async fn seed_state_machine_pointer(sm: &WendelonStateMachine, pointer: &TieredSlabPointer) {
+		sm.seed_tiered_slab_for_test(TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: pointer.l2_uri.clone(),
+			payload_hash: pointer.payload_hash,
+			is_encrypted: pointer.is_encrypted,
+		})
+		.await;
+	}
+
 	fn hlc() -> crate::schema::HybridTimestamp {
 		crate::schema::HybridTimestamp {
 			physical_ms: 1,
+			logical: 0,
+			node_id: 1,
+		}
+	}
+
+	fn hlc_at(physical_ms: u64) -> crate::schema::HybridTimestamp {
+		crate::schema::HybridTimestamp {
+			physical_ms,
 			logical: 0,
 			node_id: 1,
 		}
@@ -721,6 +1296,10 @@ mod tests {
 
 	fn tenant() -> crate::schema::TenantId {
 		crate::schema::TenantId::ZERO
+	}
+
+	fn node_id(id: u32) -> crate::schema::NodeId {
+		crate::schema::NodeId { id, _reserved: 0 }
 	}
 
 	fn test_crypto() -> Arc<CryptoManager> {
@@ -953,18 +1532,17 @@ mod tests {
 			.put(&format!("legacy/slab_{:016x}.wnd", loc.slab_id), &raw)
 			.await
 			.unwrap();
-		manager
-			.apply_tier_slab(TieredSlabPointer {
-				slab_id: loc.slab_id,
-				l2_uri: old_uri.clone(),
-				payload_hash: old_hash,
-				is_encrypted: false,
-			})
-			.await
-			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: loc.slab_id,
+			l2_uri: old_uri.clone(),
+			payload_hash: old_hash,
+			is_encrypted: false,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
 
 		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
 		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
 		let committer: Arc<dyn TierCommitter> =
 			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
@@ -1009,5 +1587,579 @@ mod tests {
 		let second = sweeper.sweep_once().await.unwrap();
 		assert_eq!(second.rewritten_plaintext_tiered, 0);
 		assert!(second.skipped_already_encrypted_tiered >= 1);
+	}
+
+	#[tokio::test]
+	async fn sweeper_rewrites_tiered_slabs_for_mvcc_retention() {
+		use crate::storage::core::StorageEngine;
+
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir("retention-l1");
+		let l2_root = fresh_dir("retention-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(9);
+		let older = hlc_at(now_ms.saturating_sub(50_000));
+		let anchor = hlc_at(now_ms.saturating_sub(20_000));
+		let latest = hlc_at(now_ms.saturating_sub(5_000));
+		manager
+			.append(tenant(), key, older, b"v-old")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), key, anchor, b"v-anchor")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), key, latest, b"v-latest")
+			.await
+			.unwrap();
+		let pre_rewrite_anchor = manager
+			.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(12_000)))
+			.expect("anchor retained before rewrite");
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: old_uri.clone(),
+			payload_hash: old_hash,
+			is_encrypted: true,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let audit_sink = Arc::new(InMemoryAuditSink::new());
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_audit_sink(node_id(1), audit_sink.clone())
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.retention_rewritten_tiered, 1);
+		assert_eq!(report.retention_pruned_versions, 1);
+		assert!(report.retention_reclaimed_bytes > 0);
+
+		let new_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_ne!(new_pointer.l2_uri, old_uri);
+		assert!(
+			l2.get(&old_uri).await.is_err(),
+			"old tiered object should be deleted after retention rewrite"
+		);
+
+		let retained_anchor = manager
+			.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(12_000)))
+			.expect("retained-window anchor should remain");
+		assert_eq!(manager.read(retained_anchor).await.unwrap(), b"v-anchor");
+		assert_eq!(
+			manager.read(pre_rewrite_anchor).await.unwrap(),
+			b"v-anchor",
+			"stale pre-rewrite locations should relocate to the rewritten object"
+		);
+		assert!(
+			manager
+				.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(30_000)))
+				.is_none(),
+			"versions older than the retention floor should disappear from the tiered index"
+		);
+		let retained_latest = manager.lookup(tenant(), key).expect("latest survives");
+		assert_eq!(manager.read(retained_latest).await.unwrap(), b"v-latest");
+		let events = audit_sink.events();
+		assert_eq!(events.len(), 1);
+		assert_eq!(events[0].event_type, "mvcc.snapshot_pruned");
+		assert!(events[0].message.contains("rewrite_action=rewrite"));
+		assert!(events[0].message.contains("pruned_versions=1"));
+	}
+
+	#[tokio::test]
+	async fn sweeper_retires_fully_pruned_tiered_slabs_for_mvcc_retention() {
+		use crate::storage::core::StorageEngine;
+
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir("retention-retire-l1");
+		let l2_root = fresh_dir("retention-retire-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(17);
+		let older = hlc_at(now_ms.saturating_sub(50_000));
+		let anchor = hlc_at(now_ms.saturating_sub(20_000));
+		let latest = hlc_at(now_ms.saturating_sub(5_000));
+		let older_loc = manager
+			.append(tenant(), key, older, b"v-old")
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		assert_eq!(older_loc.slab_id, sealed_id);
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: old_uri.clone(),
+			payload_hash: old_hash,
+			is_encrypted: true,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
+		manager
+			.append(tenant(), key, anchor, b"v-anchor")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), key, latest, b"v-latest")
+			.await
+			.unwrap();
+
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let audit_sink = Arc::new(InMemoryAuditSink::new());
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_audit_sink(node_id(1), audit_sink.clone())
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.retention_rewritten_tiered, 1);
+		assert_eq!(report.retention_pruned_versions, 1);
+		assert!(report.retention_reclaimed_bytes > 0);
+		assert!(
+			manager.tier_pointer(sealed_id).await.is_none(),
+			"fully pruned slab should retire its tier pointer"
+		);
+		assert!(
+			l2.get(&old_uri).await.is_err(),
+			"retired tiered object should be deleted after retention retirement"
+		);
+
+		let retained_anchor = manager
+			.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(12_000)))
+			.expect("retained-window anchor should remain");
+		assert_eq!(manager.read(retained_anchor).await.unwrap(), b"v-anchor");
+		assert!(
+			manager
+				.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(30_000)))
+				.is_none(),
+			"fully pruned slab should disappear from historical lookups"
+		);
+		let retained_latest = manager.lookup(tenant(), key).expect("latest survives");
+		assert_eq!(manager.read(retained_latest).await.unwrap(), b"v-latest");
+		assert!(
+			manager.read(older_loc).await.is_err(),
+			"retired slab should not keep serving stale pre-retention locations"
+		);
+		let events = audit_sink.events();
+		assert_eq!(events.len(), 1);
+		assert_eq!(events[0].event_type, "mvcc.snapshot_pruned");
+		assert!(events[0].message.contains("rewrite_action=retire"));
+		assert!(events[0].message.contains("pruned_versions=1"));
+	}
+
+	#[tokio::test]
+	async fn sweeper_retention_rewrite_preserves_relocated_reads_for_duplicate_hlcs() {
+		use crate::storage::core::StorageEngine;
+
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir("retention-duplicate-hlc-l1");
+		let l2_root = fresh_dir("retention-duplicate-hlc-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(27);
+		let duplicate_hlc = hlc_at(now_ms.saturating_sub(50_000));
+		let latest = hlc_at(now_ms.saturating_sub(5_000));
+		manager
+			.append(tenant(), key, duplicate_hlc, b"v-old-a")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), key, duplicate_hlc, b"v-old-b")
+			.await
+			.unwrap();
+		manager
+			.append(tenant(), key, latest, b"v-latest")
+			.await
+			.unwrap();
+		let pre_rewrite_anchor = manager
+			.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(10_000)))
+			.expect("latest duplicate before floor should be retained");
+		assert_eq!(
+			manager.read(pre_rewrite_anchor).await.unwrap(),
+			b"v-old-b",
+			"lookup_as_of should prefer the later duplicate at the same HLC"
+		);
+
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: old_uri,
+			payload_hash: old_hash,
+			is_encrypted: true,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.retention_rewritten_tiered, 1);
+		assert_eq!(report.retention_pruned_versions, 1);
+
+		let retained_anchor = manager
+			.lookup_as_of(tenant(), key, hlc_at(now_ms.saturating_sub(10_000)))
+			.expect("retained duplicate should remain visible");
+		assert_eq!(manager.read(retained_anchor).await.unwrap(), b"v-old-b");
+		assert_eq!(
+			manager.read(pre_rewrite_anchor).await.unwrap(),
+			b"v-old-b",
+			"stale duplicate-HLC location should relocate to the surviving rewritten row"
+		);
+	}
+
+	#[tokio::test]
+	async fn sweeper_preserves_uploaded_rewrite_object_when_commit_result_is_ambiguous() {
+		use crate::storage::core::StorageEngine;
+
+		let now_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap()
+			.as_millis() as u64;
+		let l1_dir = fresh_dir("retention-ambiguous-commit-l1");
+		let l2_root = fresh_dir("retention-ambiguous-commit-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(33);
+		manager
+			.append(
+				tenant(),
+				key,
+				hlc_at(now_ms.saturating_sub(50_000)),
+				b"v-old",
+			)
+			.await
+			.unwrap();
+		manager
+			.append(
+				tenant(),
+				key,
+				hlc_at(now_ms.saturating_sub(20_000)),
+				b"v-anchor",
+			)
+			.await
+			.unwrap();
+		manager
+			.append(
+				tenant(),
+				key,
+				hlc_at(now_ms.saturating_sub(5_000)),
+				b"v-latest",
+			)
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: old_uri.clone(),
+			payload_hash: old_hash,
+			is_encrypted: true,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let ambiguous_committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::commit_applied_then_err(
+				sm.clone(),
+				observer.clone(),
+				std::io::ErrorKind::TimedOut,
+			));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			ambiguous_committer,
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.retention_rewrite_failures, 1);
+		let committed_uri = sm
+			.state_snapshot()
+			.await
+			.tiered_slabs
+			.get(&sealed_id)
+			.expect("state machine should still commit the rewritten pointer")
+			.l2_uri
+			.clone();
+		assert_ne!(committed_uri, old_uri);
+		assert!(
+			l2.get(&committed_uri).await.is_ok(),
+			"ambiguous commit errors must not delete the object the state machine committed"
+		);
+		assert_eq!(
+			manager
+				.tier_pointer(sealed_id)
+				.await
+				.expect("local manager still points at the pre-reconcile URI")
+				.l2_uri,
+			old_uri
+		);
+
+		let converging_sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer)),
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		)
+		.with_clock(Arc::new(FixedClock { now_ms }))
+		.with_mvcc_retention_window(Some(Duration::from_secs(15)));
+		let report = converging_sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.retention_rewrite_failures, 0);
+		assert_eq!(
+			manager
+				.tier_pointer(sealed_id)
+				.await
+				.expect("next sweep should reconcile local state to the committed pointer")
+				.l2_uri,
+			committed_uri
+		);
+	}
+
+	#[tokio::test]
+	async fn sweeper_retries_pending_retired_cleanup_candidates() {
+		use crate::storage::core::StorageEngine;
+
+		let l1_dir = fresh_dir("retired-cleanup-retry-l1");
+		let l2_root = fresh_dir("retired-cleanup-retry-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(41);
+		manager
+			.append(tenant(), key, hlc_at(10), b"v-old")
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: sealed_id,
+				l2_uri: old_uri.clone(),
+				payload_hash,
+				is_encrypted: true,
+			})
+			.await
+			.unwrap();
+		assert!(
+			manager
+				.retire_tiered_slab_committed(sealed_id, None)
+				.await
+				.unwrap()
+		);
+		assert!(
+			manager.tier_pointer(sealed_id).await.is_none(),
+			"local manager already removed the tier pointer"
+		);
+		assert_eq!(
+			manager.list_retired_tiered_cleanup_candidates().await.len(),
+			1
+		);
+		assert!(
+			l2.get(&old_uri).await.is_ok(),
+			"pending cleanup candidate should still have its old L2 object before retry"
+		);
+
+		let sm = WendelonStateMachine::new();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer)),
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+			},
+		);
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.failed, 0);
+		assert!(
+			manager
+				.list_retired_tiered_cleanup_candidates()
+				.await
+				.is_empty(),
+			"next sweep should drain the pending retired cleanup marker"
+		);
+		assert!(
+			l2.get(&old_uri).await.is_err(),
+			"cleanup retry should delete the stale retired L2 object"
+		);
 	}
 }

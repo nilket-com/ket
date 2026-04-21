@@ -4,7 +4,7 @@ mod support;
 use arrow::array::{LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wendelon::consensus::{
 	MigrationComplete, MigrationLedgerEntry, MigrationState, SeedMigration, WendelonRequest,
 };
@@ -76,6 +76,40 @@ async fn bootstrap_custom_node(tag: &str, node_id: u32, slab_max_bytes: u64) -> 
 	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
 	cfg.slab_max_bytes = slab_max_bytes;
 	WendelonNode::bootstrap_single_node(cfg).await.unwrap()
+}
+
+async fn bootstrap_retention_node(
+	tag: &str,
+	node_id: u32,
+	slab_max_bytes: u64,
+	retention_window: Duration,
+) -> WendelonNode {
+	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = slab_max_bytes;
+	cfg.mvcc_retention_policy =
+		wendelon::storage::MvccRetentionPolicy::FixedWindow(retention_window);
+	WendelonNode::bootstrap_single_node(cfg).await.unwrap()
+}
+
+async fn bootstrap_retention_tiered_node(
+	tag: &str,
+	node_id: u32,
+	slab_max_bytes: u64,
+	retention_window: Duration,
+) -> (WendelonNode, std::path::PathBuf) {
+	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+	cfg.slab_max_bytes = slab_max_bytes;
+	cfg.mvcc_retention_policy =
+		wendelon::storage::MvccRetentionPolicy::FixedWindow(retention_window);
+	let l2_dir = support::tempdir(&format!("{tag}-l2"));
+	cfg.l2 = Some(wendelon::storage::ObjectStoreConfig::LocalFs {
+		root: l2_dir.clone(),
+	});
+	cfg.tiering.scan_interval = Duration::from_millis(20);
+	(
+		WendelonNode::bootstrap_single_node(cfg).await.unwrap(),
+		l2_dir,
+	)
 }
 
 async fn seed_source(
@@ -400,4 +434,222 @@ async fn historical_reads_succeed_from_new_owner_after_source_reclaim() {
 	source_sweeper.abort();
 	support::abort_node(&source);
 	support::abort_node(&dest);
+}
+
+#[tokio::test]
+async fn mvcc_retention_pruning_is_audit_logged_and_preserves_retained_window_reads() {
+	let node = bootstrap_retention_node(
+		"mvcc-retention-prune",
+		93,
+		8 * 1024,
+		Duration::from_secs(15),
+	)
+	.await;
+	support::wait_for_local_leader(&node).await;
+	node.handles.migration_sweeper.abort();
+
+	let audit_path = node.slab.data_dir().join("audit.ndjson");
+	let now_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let key = b"retention-key";
+	let oldest = hlc(now_ms.saturating_sub(50_000), 0, 1);
+	let anchor = hlc(now_ms.saturating_sub(20_000), 0, 1);
+	let latest = hlc(now_ms.saturating_sub(5_000), 0, 1);
+	seed_source(&node.slab, key, oldest, b"oldest-value").await;
+	seed_source(&node.slab, key, anchor, b"anchor-value").await;
+	seed_source(&node.slab, key, latest, b"latest-value").await;
+	let rotate_value = vec![b'x'; 16 * 1024];
+	seed_source(&node.slab, b"rotate-key", latest, &rotate_value).await;
+	assert_eq!(
+		node.slab.sealed_count().await,
+		1,
+		"precondition: history slab sealed"
+	);
+
+	let sweeper = node.data_server.clone().spawn_migration_sweeper(
+		Duration::from_millis(20),
+		Duration::from_millis(40),
+		1,
+	);
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+		if node
+			.slab
+			.lookup_as_of(tenant(), key_identity(key), oldest)
+			.is_none()
+			&& audit.contains("\"event_type\":\"mvcc.snapshot_pruned\"")
+		{
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for MVCC retention pruning"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+
+	let retained_as_of = hlc(now_ms.saturating_sub(12_000), 0, 1);
+	let (retained_resp, retained_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(retained_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(retained_resp.status, ReadStatus::OK);
+	assert_eq!(
+		decode_single_value(&support::encode_batch(&retained_batch.unwrap()).unwrap()),
+		b"anchor-value"
+	);
+
+	let pruned_as_of = hlc(now_ms.saturating_sub(30_000), 0, 1);
+	let (pruned_resp, pruned_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(pruned_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(pruned_resp.status, ReadStatus::RETENTION_EXPIRED);
+	assert!(pruned_batch.is_none());
+
+	let audit = std::fs::read_to_string(&audit_path).unwrap();
+	assert!(audit.contains("\"event_type\":\"mvcc.snapshot_pruned\""));
+	assert!(audit.contains("pruned_versions=1"));
+
+	sweeper.abort();
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn mvcc_retention_fully_pruned_tiered_slab_retires_end_to_end() {
+	let (node, l2_dir) = bootstrap_retention_tiered_node(
+		"mvcc-retention-retire-e2e",
+		94,
+		8 * 1024,
+		Duration::from_secs(15),
+	)
+	.await;
+	support::wait_for_local_leader(&node).await;
+	node.handles.migration_sweeper.abort();
+	if let Some(handle) = &node.handles.tiering_sweeper {
+		handle.abort();
+	}
+
+	let audit_path = node.slab.data_dir().join("audit.ndjson");
+	let now_ms = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64;
+	let key = b"retire-key";
+	let oldest = hlc(now_ms.saturating_sub(50_000), 0, 1);
+	let anchor = hlc(now_ms.saturating_sub(20_000), 0, 1);
+	let latest = hlc(now_ms.saturating_sub(5_000), 0, 1);
+
+	let oldest_value = vec![b'x'; 16 * 1024];
+	let oldest_bytes = support::encode_batch(&kv_batch(key, &oldest_value)).unwrap();
+	let oldest_loc = node
+		.slab
+		.append(tenant(), key_identity(key), oldest, &oldest_bytes)
+		.await
+		.unwrap();
+	let retired_slab_id = oldest_loc.slab_id;
+	let anchor_bytes = support::encode_batch(&kv_batch(key, b"anchor-value")).unwrap();
+	let anchor_loc = node
+		.slab
+		.append(tenant(), key_identity(key), anchor, &anchor_bytes)
+		.await
+		.unwrap();
+	assert_ne!(
+		anchor_loc.slab_id, retired_slab_id,
+		"anchor version must land in a fresh slab so the old slab is fully prunable"
+	);
+	assert_eq!(
+		node.slab.sealed_count().await,
+		1,
+		"old history slab should be sealed before tier retirement runs"
+	);
+	seed_source(&node.slab, key, latest, b"latest-value").await;
+
+	let object_store: Arc<dyn wendelon::storage::ObjectStore> =
+		Arc::new(wendelon::storage::LocalFsObjectStore::new(&l2_dir).unwrap());
+	let sweeper = wendelon::storage::SlabSweeper::new(
+		node.slab.clone(),
+		object_store,
+		Arc::new(wendelon::storage::RaftCommitter::new(node.raft.clone())),
+		node.state_machine.clone(),
+		wendelon::storage::SweeperConfig::default(),
+	)
+	.with_clock(node.clock.clone())
+	.with_audit_sink(node.local_node, node.audit_sink.clone())
+	.with_mvcc_retention_policy(wendelon::storage::MvccRetentionPolicy::FixedWindow(
+		Duration::from_secs(15),
+	));
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		let report = sweeper.sweep_once().await.unwrap();
+		let snapshot = node.state_machine.state_snapshot().await;
+		let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
+		let retired_in_sm = !snapshot.tiered_slabs.contains_key(&retired_slab_id);
+		let retired_locally = node.slab.tier_pointer(retired_slab_id).await.is_none();
+		if retired_in_sm
+			&& retired_locally
+			&& node
+				.slab
+				.lookup_as_of(tenant(), key_identity(key), oldest)
+				.is_none()
+			&& node.slab.read(oldest_loc).await.is_err()
+			&& audit.contains("\"event_type\":\"mvcc.snapshot_pruned\"")
+			&& audit.contains("rewrite_action=retire")
+		{
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for fully-pruned tier retirement: report={report:?} \
+			 retired_in_sm={retired_in_sm} retired_locally={retired_locally} \
+			 tiered_in_sm={} retained_lookup={} stale_read_err={} audit_retire={}",
+			snapshot.tiered_slabs.contains_key(&retired_slab_id),
+			node.slab
+				.lookup_as_of(tenant(), key_identity(key), oldest)
+				.is_none(),
+			node.slab.read(oldest_loc).await.is_err(),
+			audit.contains("rewrite_action=retire"),
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+
+	let retained_as_of = hlc(now_ms.saturating_sub(12_000), 0, 1);
+	let (retained_resp, retained_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(retained_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(retained_resp.status, ReadStatus::OK);
+	assert_eq!(
+		decode_single_value(&support::encode_batch(&retained_batch.unwrap()).unwrap()),
+		b"anchor-value"
+	);
+
+	let pruned_as_of = hlc(now_ms.saturating_sub(30_000), 0, 1);
+	let (pruned_resp, pruned_batch) = DataRing::read(
+		&*node.data_server,
+		stale_read_meta(pruned_as_of, key),
+		key_batch(key),
+	)
+	.await
+	.unwrap();
+	assert_eq!(pruned_resp.status, ReadStatus::RETENTION_EXPIRED);
+	assert!(pruned_batch.is_none());
+
+	let audit = std::fs::read_to_string(&audit_path).unwrap();
+	assert!(audit.contains("\"event_type\":\"mvcc.snapshot_pruned\""));
+	assert!(audit.contains("rewrite_action=retire"));
+	support::abort_node(&node);
 }

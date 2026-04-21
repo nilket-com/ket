@@ -1,4 +1,5 @@
-use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
+use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, AuditSink};
+use crate::metrics::global as metrics;
 use crate::schema::{IdentityPrefix, NodeId, SlabId, TenantId, TenantKekId};
 use async_trait::async_trait;
 #[cfg(all(feature = "fips", feature = "non-fips"))]
@@ -905,6 +906,7 @@ impl CryptoManager {
 		{
 			let mut cache = self.lock_tenant_kek_cache()?;
 			if let Some(key) = cache.get(&(tenant_id, tenant_kek_id)) {
+				metrics().tenant_kek_cache_hits_total.inc();
 				return Ok(key);
 			}
 		}
@@ -978,9 +980,11 @@ impl CryptoManager {
 		{
 			let mut cache = self.lock_tenant_kek_cache()?;
 			if let Some(key) = cache.get(&(tenant_id, tenant_kek_id)) {
+				metrics().tenant_kek_cache_hits_total.inc();
 				return Ok(key);
 			}
 		}
+		metrics().tenant_kek_cache_misses_total.inc();
 
 		let unwrapped = self.root_kek.unwrap_tenant_kek(&wrapped.wrapped_key)?;
 		let locked = Arc::new(LockedKeyMaterial::new(unwrapped)?);
@@ -1082,12 +1086,25 @@ impl CryptoManager {
 				stage, expected_slab_id, error
 			),
 		};
-		if let Err(emit_error) = context.sink.emit(AuditEvent::new(
+		let mut audit = AuditEvent::new(
 			AuditAuthority::NodeLocal,
-			"crypto.decrypt_rejected",
+			AuditOperation::CryptoDecryptRejected,
 			context.node_id,
 			message,
-		)) {
+		)
+		.with_outcome(AuditOutcome::Error)
+		.with_parameter("failure_stage", stage)
+		.with_parameter("expected_slab_id", expected_slab_id.get())
+		.with_parameter("error", error.to_string());
+		if let Some(footer) = footer {
+			audit = audit
+				.with_parameter("footer_slab_id", footer.slab_id.get())
+				.with_parameter("tenant_id", footer.tenant_id.get())
+				.with_parameter("tenant_kek_id", footer.tenant_kek_id.get())
+				.with_parameter("cipher_id", footer.cipher_id.to_wire() as u64)
+				.with_parameter("chunk_count", footer.chunk_count as u64);
+		}
+		if let Err(emit_error) = context.sink.emit(audit) {
 			// Decrypt rejections are the forensic signal for a tampered slab.
 			// A sink-write failure (full disk, fs remounted ro, fsync error)
 			// drops a security event that ADR 025 expects to be durable, so

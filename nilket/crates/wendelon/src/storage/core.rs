@@ -53,6 +53,7 @@
 //! [`append`]: LocalSlabStore::append
 
 use crate::schema::{HybridTimestamp, Identity, SlabId, SlabRecordHeader, TenantId};
+use crate::metrics::global as metrics;
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
 use async_trait::async_trait;
@@ -322,10 +323,11 @@ impl LocalSlabStore {
 						.config
 						.window_for_pending(state.pending.len())
 				};
-				let elapsed = batch_started.elapsed();
-				if elapsed >= target {
-					break;
-				}
+			let elapsed = batch_started.elapsed();
+			if elapsed >= target {
+				metrics().group_commit_window_seconds.observe_duration(elapsed);
+				break;
+			}
 				tokio::time::sleep(target - elapsed).await;
 			}
 

@@ -12,6 +12,7 @@ publish = false
 default = ["non-fips"]
 non-fips = ["aws-lc-rs/non-fips"]
 fips = ["aws-lc-rs/fips"]
+audit-kafka = ["dep:rdkafka"]
 
 [dependencies]
 arrow = { version = "58.1.0", features = ["ipc_compression"] }
@@ -29,10 +30,12 @@ openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
 quinn = "0.11"
 rand = "0.10.1"
+rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl"], optional = true }
 redb = "4.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.10"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_bytes = "0.11.19"
 thiserror = "2.0.18"
 tokio = { version = "1.37", features = ["full"] }

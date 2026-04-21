@@ -53,6 +53,7 @@
 //! * Backpressure / per-tenant quotas.
 
 use crate::network::core::{HrftFrame, read_frame, write_frame};
+use crate::metrics::global as metrics;
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
 use crate::network::tcp_tls_transport::InboundTcpTlsConnection;
@@ -446,8 +447,17 @@ async fn serve_quic_connection<S: HrftService>(
 ) -> std::io::Result<()> {
 	let connection = incoming
 		.await
-		.map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
-	let peer = verified_transport_peer(&connection, &cluster_domain)?;
+		.map_err(|e| {
+			metrics().quic_handshake_failures_transport_total.inc();
+			Error::new(ErrorKind::ConnectionAborted, e)
+		})?;
+	let peer = verified_transport_peer(&connection, &cluster_domain).map_err(|err| {
+		match err.kind() {
+			ErrorKind::PermissionDenied => metrics().quic_handshake_failures_authorization_total.inc(),
+			_ => metrics().quic_handshake_failures_identity_total.inc(),
+		}
+		err
+	})?;
 	let connection: Arc<dyn TransportConnection> = Arc::new(QuicTransportConnection::new(
 		connection,
 		peer.node_id,

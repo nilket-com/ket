@@ -1,0 +1,12 @@
+groups:
+  - name: wendelon_recording_rules
+    interval: 30s
+    rules:
+      - record: job:wendelon_group_commit_window_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_group_commit_window_seconds_bucket[5m])))
+      - record: job:wendelon_l1_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l1_read_latency_seconds_bucket[5m])))
+      - record: job:wendelon_l2_range_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l2_range_read_latency_seconds_bucket[5m])))
+      - record: job:wendelon_l2_upload_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l2_upload_latency_seconds_bucket[5m])))

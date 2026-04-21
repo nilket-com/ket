@@ -11,7 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use wendelon::consensus::{
-	TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine, WendelonTypeConfig,
+	RetireTieredSlab, TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine,
+	WendelonTypeConfig,
 };
 use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
@@ -98,6 +99,24 @@ impl TierCommitter for AppliedStateMachineCommitter {
 		)
 		.await
 		.map_err(|err| Error::other(format!("test tier commit failed: {err}")))?;
+		Ok(())
+	}
+
+	async fn retire_tiered_slab(&self, slab_id: wendelon::schema::SlabId) -> std::io::Result<()> {
+		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
+		let entry = Entry::<WendelonTypeConfig> {
+			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+			payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+				slab_id,
+			})),
+		};
+		let mut sm = self.sm.lock().await;
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			&mut *sm,
+			vec![entry],
+		)
+		.await
+		.map_err(|err| Error::other(format!("test retire commit failed: {err}")))?;
 		Ok(())
 	}
 }

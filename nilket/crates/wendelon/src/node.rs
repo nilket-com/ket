@@ -25,7 +25,11 @@
 //!   tasks; [`WendelonNode::shutdown`] aborts and joins them once
 //!   request drain has completed.
 
-use crate::audit::{AuditClockDriftSubscriber, AuditSink, LocalAuditSink};
+use crate::audit::{
+	AuditAuthority, AuditClockDriftSubscriber, AuditEvent, AuditMaterializationTracker,
+	AuditOperation, AuditRootSigner, AuditSink, AuditSinksConfig,
+	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, build_audit_sink, spawn_signed_chain_root_rollup,
+};
 use crate::consensus::hlc::HybridLogicalClockDriver;
 use crate::consensus::monitor::{
 	AbortHandle, ClockDriftEvent, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL,
@@ -80,7 +84,8 @@ use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
-	GroupCommitConfig, ManagerTierObserver, RaftCommitter, SlabSweeper, SweeperConfig,
+	GroupCommitConfig, ManagerTierObserver, MvccRetentionPolicy, RaftCommitter, SlabSweeper,
+	SweeperConfig,
 };
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -89,6 +94,7 @@ use std::io::{Error, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -189,9 +195,18 @@ pub struct NodeBootstrapConfig {
 	/// Maximum tolerated drift between the local physical clock and
 	/// the cluster median before the node aborts.
 	pub drift_max_offset_ms: u64,
+	/// ADR 013 MVCC history retention policy.
+	pub mvcc_retention_policy: MvccRetentionPolicy,
 	/// Optional three-listener observability topology.
 	pub observability: Option<ObservabilityConfig>,
+	/// Optional additive audit shipping sinks; the local NDJSON chain
+	/// remains mandatory and is always enabled.
+	pub audit: AuditSinksConfig,
 }
+
+pub const DEFAULT_MVCC_RETENTION_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_MVCC_RETENTION_POLICY: MvccRetentionPolicy =
+	MvccRetentionPolicy::FixedWindow(DEFAULT_MVCC_RETENTION_WINDOW);
 
 impl NodeBootstrapConfig {
 	/// Convenience for tests and dev deploys: tempdir-style data
@@ -227,7 +242,12 @@ impl NodeBootstrapConfig {
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls: None,
 			drift_max_offset_ms: crate::consensus::monitor::MAX_OFFSET_MS,
+			// Dev/test helpers seed synthetic HLCs (1, 2, 3, …),
+			// so keep retention disabled unless a caller opts in
+			// explicitly.
+			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
 			observability: None,
+			audit: AuditSinksConfig::default(),
 		}
 	}
 
@@ -340,6 +360,7 @@ impl NodeBootstrapConfig {
 				));
 			}
 		}
+		self.mvcc_retention_policy.validate()?;
 		match &self.cluster {
 			ClusterBootstrapConfig::Bootstrap => {}
 			ClusterBootstrapConfig::Join { seeds } => {
@@ -427,6 +448,35 @@ impl NodeBootstrapConfig {
 				}
 			}
 		}
+		if let Some(syslog) = &self.audit.syslog {
+			if syslog.socket_path.as_os_str().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"audit.syslog.socket_path must not be empty",
+				));
+			}
+		}
+		if let Some(kafka) = &self.audit.kafka {
+			if kafka.brokers.trim().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"audit.kafka.brokers must not be empty",
+				));
+			}
+			if kafka.topic.trim().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"audit.kafka.topic must not be empty",
+				));
+			}
+			#[cfg(not(feature = "audit-kafka"))]
+			{
+				return Err(Error::new(
+					ErrorKind::Unsupported,
+					"audit.kafka requires the audit-kafka cargo feature",
+				));
+			}
+		}
 		wire::validate_protocol_window(self.protocol)?;
 		Ok(())
 	}
@@ -459,6 +509,7 @@ pub struct WendelonNode {
 	pub protocol: ProtocolVersionWindow,
 	pub lifecycle: ServerLifecycle,
 	pub audit_sink: Arc<dyn AuditSink>,
+	pub audit_materialization: Arc<AuditMaterializationTracker>,
 	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
 	transport_servers: Vec<NodeTransportServer>,
 	pub handles: NodeHandles,
@@ -476,6 +527,7 @@ pub struct NodeHandles {
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
 	pub tiering_sweeper: Option<JoinHandle<()>>,
+	pub audit_chain_root_rollup: JoinHandle<()>,
 	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
 }
@@ -493,6 +545,7 @@ impl NodeHandles {
 		if let Some(handle) = &self.tiering_sweeper {
 			handle.abort();
 		}
+		self.audit_chain_root_rollup.abort();
 		self.default_tenant_seeder.abort();
 		self.checkpoint_emitter.abort();
 	}
@@ -514,6 +567,7 @@ impl NodeHandles {
 		if let Some(handle) = self.tiering_sweeper {
 			await_background_task(handle, "tiering sweeper").await?;
 		}
+		await_background_task(self.audit_chain_root_rollup, "audit chain root rollup").await?;
 		await_background_task(self.default_tenant_seeder, "default tenant seeder").await?;
 		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
@@ -924,28 +978,56 @@ impl WendelonNode {
 		let clock: Arc<dyn PhysicalClock> = Arc::new(SystemClock);
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
-		let audit_sink: Arc<dyn AuditSink> =
-			Arc::new(LocalAuditSink::open(cfg.data_dir.join("audit.ndjson"))?);
+		let audit_materialization = Arc::new(AuditMaterializationTracker::new());
+		let audit_sink = build_audit_sink(cfg.data_dir.join("audit.ndjson"), &cfg.audit)?;
 		crypto.attach_audit_sink(local_node, audit_sink.clone())?;
-		audit_sink.emit(crate::audit::AuditEvent::new(
-			crate::audit::AuditAuthority::NodeLocal,
-			"crypto.startup",
-			local_node,
-			format!(
-				"selected_cipher={} cipher_detection_method={} root_kek_provider={} fips={} build_profile={} mlock={}",
-				crypto.selected_cipher_label(),
+		audit_sink.emit(
+			AuditEvent::new(
+				AuditAuthority::NodeLocal,
+				AuditOperation::CryptoStartup,
+				local_node,
+				format!(
+					"selected_cipher={} cipher_detection_method={} root_kek_provider={} fips={} build_profile={} mlock={}",
+					crypto.selected_cipher_label(),
+					crypto.selected_cipher_detection_method(),
+					crypto.root_kek_provider_label(),
+					cfg!(feature = "fips"),
+					if cfg!(debug_assertions) {
+						"debug"
+					} else {
+						"release"
+					},
+					crypto.mlock_status_label(),
+				),
+			)
+			.with_parameter("selected_cipher", crypto.selected_cipher_label())
+			.with_parameter(
+				"cipher_detection_method",
 				crypto.selected_cipher_detection_method(),
-				crypto.root_kek_provider_label(),
-				cfg!(feature = "fips"),
+			)
+			.with_parameter("root_kek_provider", crypto.root_kek_provider_label())
+			.with_parameter("fips", cfg!(feature = "fips"))
+			.with_parameter(
+				"build_profile",
 				if cfg!(debug_assertions) {
 					"debug"
 				} else {
 					"release"
 				},
-				crypto.mlock_status_label(),
-			),
-		))?;
-		let state_machine = state_machine.with_audit_materializer(local_node, audit_sink.clone());
+			)
+			.with_parameter("mlock", crypto.mlock_status_label()),
+		)?;
+		let state_machine = state_machine.with_audit_materializer(
+			local_node,
+			audit_sink.clone(),
+			audit_materialization.clone(),
+		);
+		let audit_chain_root_rollup = spawn_signed_chain_root_rollup(
+			audit_sink.clone(),
+			local_node,
+			AuditRootSigner::from_seed(cfg.transfer_signing_secret),
+			DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL,
+		);
 		let (clock_drift_tx, clock_drift_rx) = watch::channel(None);
 
 		// 7. Transport factory — tests can still swap in loopback
@@ -1030,7 +1112,9 @@ impl WendelonNode {
 			)
 			.map_err(|err| Error::other(format!("DataServer::new: {err}")))?
 			.with_hlc(hlc.clone())
+			.with_audit_sink(audit_sink.clone())
 			.with_lease_authority(lease_authority.clone())
+			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
 			.with_tracker(tracker.clone())
 			.with_lease_gate(true),
 		);
@@ -1228,6 +1312,9 @@ impl WendelonNode {
 				state_machine.clone(),
 				cfg.tiering.clone(),
 			)
+			.with_clock(clock.clone())
+			.with_audit_sink(local_node, audit_sink.clone())
+			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
 			.spawn()
 		});
 
@@ -1251,6 +1338,7 @@ impl WendelonNode {
 			protocol: cfg.protocol,
 			lifecycle,
 			audit_sink,
+			audit_materialization,
 			clock_drift_events: clock_drift_rx,
 			transport_servers,
 			handles: NodeHandles {
@@ -1263,6 +1351,7 @@ impl WendelonNode {
 				tenant_policy_reconciler,
 				migration_sweeper,
 				tiering_sweeper,
+				audit_chain_root_rollup,
 				default_tenant_seeder,
 				checkpoint_emitter,
 			},
@@ -1347,6 +1436,7 @@ impl WendelonNode {
 			epoch_tx: self.epoch_tx.clone(),
 			raft: self.raft.clone(),
 			lifecycle: self.lifecycle.clone(),
+			audit_materialization: self.audit_materialization.clone(),
 		}
 	}
 }
@@ -1357,6 +1447,7 @@ pub struct NodeReadinessView {
 	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	raft: WendelonRaft,
 	lifecycle: ServerLifecycle,
+	audit_materialization: Arc<AuditMaterializationTracker>,
 }
 
 #[async_trait]
@@ -1374,14 +1465,19 @@ impl ReadinessReporter for NodeReadinessView {
 		} else {
 			DrainState::None
 		};
+		let audit_materialization_lag_entries = self.audit_materialization.lag_entries();
 		ReadinessSnapshot {
 			node_id: self.local_node.id,
 			epoch: epoch.epoch,
 			leader_id: self.raft.current_leader().await,
 			cluster_members: members,
 			drain_state,
-			audit_materialization_lag_entries: 0,
-			degraded_reason: None,
+			audit_materialization_lag_entries,
+			degraded_reason: if audit_materialization_lag_entries > 0 {
+				Some("AuditMaterializationLag".to_string())
+			} else {
+				None
+			},
 		}
 	}
 }

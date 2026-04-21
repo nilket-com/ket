@@ -62,6 +62,9 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 #
 # [time]
 # drift_max_offset_ms = 500
+# mvcc_retention_window_secs = 604800
+# Set to `0` to disable MVCC snapshot pruning. Internally this maps to
+# the bootstrap retention policy's `Disabled` / `FixedWindow` modes.
 #
 # Optional observability listener topology. `/ready` and `/metrics`
 # are mTLS-gated and therefore require `[transport.tls]`.
@@ -70,3 +73,15 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 # health = "0.0.0.0:7431"
 # ready = "0.0.0.0:7432"
 # metrics = "0.0.0.0:7433"
+#
+# Optional additive audit shipping sinks. The local NDJSON audit chain
+# at `<data_dir>/audit.ndjson` stays enabled even when these are
+# configured.
+#
+# [audit.syslog]
+# socket_path = "/run/systemd/journal/syslog"
+#
+# [audit.kafka]
+# brokers = "kafka-1.internal:9092,kafka-2.internal:9092"
+# topic = "wendelon.audit"
+# client_id = "wendelon-node-01"

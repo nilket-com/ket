@@ -98,6 +98,12 @@ transfer_signing_secret = "{transfer_secret}"
 	assert!(cfg.l2.is_none());
 	assert_eq!(cfg.drift_max_offset_ms, wendelon::consensus::MAX_OFFSET_MS);
 	assert_eq!(
+		cfg.mvcc_retention_policy,
+		wendelon::storage::MvccRetentionPolicy::FixedWindow(
+			wendelon::node::DEFAULT_MVCC_RETENTION_WINDOW
+		)
+	);
+	assert_eq!(
 		cfg.crypto_cache.tenant_kek_cache_max_entries,
 		DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES
 	);
@@ -365,11 +371,15 @@ fn loads_transport_tls_and_observability_configuration() {
 	let root = fresh_dir("transport-observability");
 	let data_dir = root.join("data");
 	let pki_dir = root.join("pki");
+	let syslog_dir = root.join("run");
 	std::fs::create_dir_all(&data_dir).unwrap();
 	std::fs::create_dir_all(&pki_dir).unwrap();
+	std::fs::create_dir_all(&syslog_dir).unwrap();
 	for name in ["node.crt", "node.key", "ca.crt", "ops_ca.crt"] {
 		std::fs::write(pki_dir.join(name), "test").unwrap();
 	}
+	let syslog_socket = syslog_dir.join("syslog.sock");
+	std::fs::write(&syslog_socket, "").unwrap();
 
 	let node_id = 31u32;
 	let lease_secret = dev_lease_signing_secret(node_id);
@@ -397,6 +407,7 @@ transfer_signing_secret = "{transfer_secret}"
 
 [time]
 drift_max_offset_ms = 750
+mvcc_retention_window_secs = 30
 
 [transport.tls]
 cert_path = "pki/node.crt"
@@ -408,6 +419,9 @@ operator_ca_path = "pki/ops_ca.crt"
 health = "127.0.0.1:7431"
 ready = "127.0.0.1:7432"
 metrics = "127.0.0.1:7433"
+
+[audit.syslog]
+socket_path = "run/syslog.sock"
 "#,
 			node_id = node_id,
 			lease_secret = hex(lease_secret),
@@ -425,10 +439,66 @@ metrics = "127.0.0.1:7433"
 	assert_eq!(tls.operator_ca_path, pki_dir.join("ops_ca.crt"));
 	assert_eq!(tls.cluster_domain, "cluster.local");
 	assert_eq!(cfg.drift_max_offset_ms, 750);
+	assert_eq!(
+		cfg.mvcc_retention_policy,
+		wendelon::storage::MvccRetentionPolicy::FixedWindow(std::time::Duration::from_secs(30))
+	);
 	let observability = cfg.observability.as_ref().expect("observability config");
 	assert_eq!(observability.listeners.health, "127.0.0.1:7431");
 	assert_eq!(observability.listeners.ready, "127.0.0.1:7432");
 	assert_eq!(observability.listeners.metrics, "127.0.0.1:7433");
+	assert_eq!(
+		cfg.audit.syslog.as_ref().unwrap().socket_path,
+		syslog_socket
+	);
+	assert!(cfg.audit.kafka.is_none());
+}
+
+#[test]
+fn zero_mvcc_retention_window_disables_pruning() {
+	let root = fresh_dir("mvcc-retention-disabled");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 33u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4705"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[time]
+mvcc_retention_window_secs = 0
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(
+		cfg.mvcc_retention_policy,
+		wendelon::storage::MvccRetentionPolicy::Disabled
+	);
 }
 
 #[test]
@@ -480,6 +550,105 @@ metrics = "127.0.0.1:7433"
 			.contains("observability requires transport_tls"),
 		"unexpected error: {err}"
 	);
+}
+
+#[cfg(not(feature = "audit-kafka"))]
+#[test]
+fn rejects_kafka_audit_sink_without_feature() {
+	let root = fresh_dir("audit-kafka-disabled");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 34u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4706"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[audit.kafka]
+brokers = "kafka-1.internal:9092"
+topic = "wendelon.audit"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("audit.kafka requires the audit-kafka cargo feature"),
+		"unexpected error: {err}"
+	);
+}
+
+#[cfg(feature = "audit-kafka")]
+#[test]
+fn loads_kafka_audit_sink_with_feature() {
+	let root = fresh_dir("audit-kafka-enabled");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 34u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4706"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[audit.kafka]
+brokers = "kafka-1.internal:9092"
+topic = "wendelon.audit"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let kafka = cfg.audit.kafka.expect("kafka config should be loaded");
+	assert_eq!(kafka.brokers, "kafka-1.internal:9092");
+	assert_eq!(kafka.topic, "wendelon.audit");
+	assert_eq!(kafka.client_id, None);
 }
 
 #[tokio::test]

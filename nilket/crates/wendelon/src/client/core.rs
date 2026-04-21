@@ -927,10 +927,7 @@ impl WendelonClient {
 				stream: None,
 				pool: self.pool.clone(),
 			})),
-			other => Err(Error::new(
-				ErrorKind::Other,
-				format!("Wendelon query failed: status={}", other.0),
-			)),
+			other => Err(query_failure_error(other)),
 		}
 	}
 }
@@ -968,6 +965,26 @@ fn retry_read_status(status: ReadStatus, leader_hint: NodeId) -> Option<RetryDir
 		}
 		s if s == ReadStatus::MIGRATION_INCOMPLETE => Some(RetryDirective::migration_incomplete()),
 		_ => None,
+	}
+}
+
+fn query_failure_error(status: ReadStatus) -> Error {
+	match status {
+		s if s == ReadStatus::RETENTION_EXPIRED => {
+			Error::new(ErrorKind::Other, "Wendelon query failed: RETENTION_EXPIRED")
+		}
+		s if s == ReadStatus::QUERY_INVALID_PROGRAM => Error::new(
+			ErrorKind::InvalidInput,
+			"Wendelon query failed: QUERY_INVALID_PROGRAM",
+		),
+		s if s == ReadStatus::QUERY_BUDGET_EXCEEDED => Error::new(
+			ErrorKind::Other,
+			"Wendelon query failed: QUERY_BUDGET_EXCEEDED",
+		),
+		other => Error::new(
+			ErrorKind::Other,
+			format!("Wendelon query failed: status={}", other.0),
+		),
 	}
 }
 
@@ -1340,6 +1357,40 @@ mod tests {
 				id: 4,
 				_reserved: 0
 			})
+		);
+	}
+
+	#[test]
+	fn retry_read_status_keeps_terminal_query_failures_non_retryable() {
+		let zero = NodeId {
+			id: 0,
+			_reserved: 0,
+		};
+		assert!(retry_read_status(ReadStatus::QUERY_INVALID_PROGRAM, zero).is_none());
+		assert!(retry_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED, zero).is_none());
+		assert!(retry_read_status(ReadStatus::RETENTION_EXPIRED, zero).is_none());
+	}
+
+	#[test]
+	fn query_failure_error_messages_name_terminal_query_statuses() {
+		assert_eq!(
+			query_failure_error(ReadStatus::QUERY_INVALID_PROGRAM).to_string(),
+			"Wendelon query failed: QUERY_INVALID_PROGRAM"
+		);
+		assert_eq!(
+			query_failure_error(ReadStatus::QUERY_BUDGET_EXCEEDED).to_string(),
+			"Wendelon query failed: QUERY_BUDGET_EXCEEDED"
+		);
+		assert_eq!(
+			query_failure_error(ReadStatus::RETENTION_EXPIRED).to_string(),
+			"Wendelon query failed: RETENTION_EXPIRED"
+		);
+		assert_eq!(
+			query_failure_error(ReadStatus::TENANT_UNAVAILABLE).to_string(),
+			format!(
+				"Wendelon query failed: status={}",
+				ReadStatus::TENANT_UNAVAILABLE.0
+			)
 		);
 	}
 

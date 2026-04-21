@@ -1,4 +1,4 @@
-use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
+use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink};
 use crate::metrics::global;
 use crate::network::tls::{
 	ActorPermission, ActorTrustRoots, authorize_actor,
@@ -86,7 +86,7 @@ pub async fn spawn(
 	let ready = spawn_ready(
 		ready_listener,
 		acceptor.clone(),
-		reporter,
+		reporter.clone(),
 		local_node_id,
 		cluster_domain.clone(),
 		trust_roots.clone(),
@@ -96,6 +96,7 @@ pub async fn spawn(
 	let metrics = spawn_metrics(
 		metrics_listener,
 		acceptor,
+		reporter,
 		local_node_id,
 		cluster_domain,
 		trust_roots,
@@ -165,6 +166,7 @@ pub async fn spawn_ready(
 pub async fn spawn_metrics(
 	listener: TcpListener,
 	acceptor: TlsAcceptor,
+	reporter: Arc<dyn ReadinessReporter>,
 	local_node_id: u32,
 	cluster_domain: impl Into<String>,
 	trust_roots: Arc<ActorTrustRoots>,
@@ -178,6 +180,7 @@ pub async fn spawn_metrics(
 				return;
 			};
 			let acceptor = acceptor.clone();
+			let reporter = reporter.clone();
 			let cluster_domain = cluster_domain.clone();
 			let trust_roots = trust_roots.clone();
 			let audit_sink = audit_sink.clone();
@@ -185,6 +188,7 @@ pub async fn spawn_metrics(
 				let _ = handle_metrics_connection(
 					stream,
 					acceptor,
+					reporter,
 					local_node_id,
 					&cluster_domain,
 					&trust_roots,
@@ -240,7 +244,7 @@ async fn handle_ready_connection(
 				audit_sink,
 				local_node_id,
 				&actor,
-				"observability.ready",
+				AuditOperation::ObservabilityReady,
 				"served /ready snapshot",
 			)?;
 			write_response(
@@ -266,6 +270,7 @@ async fn handle_ready_connection(
 async fn handle_metrics_connection(
 	stream: TcpStream,
 	acceptor: TlsAcceptor,
+	reporter: Arc<dyn ReadinessReporter>,
 	local_node_id: u32,
 	cluster_domain: &str,
 	trust_roots: &ActorTrustRoots,
@@ -282,13 +287,15 @@ async fn handle_metrics_connection(
 	let req = read_request(&mut stream).await?;
 	match parse_request_line(&req)? {
 		("GET", METRICS_PATH) => {
+			let snapshot = reporter.snapshot().await;
+			global().set_raft_observability_state(snapshot.epoch, snapshot.leader_id);
 			global().metrics_scrapes_total.inc();
 			let body = global().render_prometheus();
 			emit_observability_audit(
 				audit_sink,
 				local_node_id,
 				&actor,
-				"observability.metrics",
+				AuditOperation::ObservabilityMetrics,
 				"served /metrics scrape",
 			)?;
 			write_response(
@@ -344,13 +351,13 @@ fn emit_observability_audit(
 	sink: &dyn AuditSink,
 	node_id: u32,
 	actor: &crate::network::tls::ActorIdentity,
-	event_type: &str,
+	operation: AuditOperation,
 	message: &str,
 ) -> std::io::Result<()> {
 	sink.emit(
 		AuditEvent::new(
 			AuditAuthority::NodeLocal,
-			event_type,
+			operation,
 			NodeId {
 				id: node_id,
 				_reserved: 0,

@@ -14,9 +14,9 @@ End of W8, a client can submit a WPBC (whole-program bytecode) query and have it
 
 ## 2. Deliverables
 
-1. **WPBC interpreter or JIT** (per ADR 005's decision) loaded into the server and exercised against slab-local data through a bounded opcode surface.
+1. **WPBC interpreter** (per ADR 005) loaded into the server and exercised against slab-local data through a bounded opcode surface.
 2. **Resource budget** per-query (CPU, memory, wall time) enforced at the interpreter boundary; over-budget queries are terminated with a structured error.
-3. **MVCC snapshot storage** integrated with W1's WAL and W7's slab format. Snapshot retention follows ADR 013's budget.
+3. **MVCC snapshot storage** integrated with W1's WAL and W7's slab format. Snapshot retention follows ADR 013's budget. The retention cutoff is derived from the node's local wall clock, with cross-node skew bounded by ADR 012's drift guard rather than a replicated cluster-wide cutoff.
 4. **Time-travel query surface** exposed through the SDK (W6) and routed to a specific snapshot.
 5. **Fuzz harness** for the WPBC opcode surface — every opcode has fuzz inputs; crashes are build-breakers.
 
@@ -25,8 +25,8 @@ End of W8, a client can submit a WPBC (whole-program bytecode) query and have it
 - (ADR 005) A WPBC program cannot escape its resource budget. Verified by an adversarial-program test suite that attempts to consume unbounded memory, fork, or exceed wall-time.
 - (ADR 005) WPBC can pushdown to L2 slab footer (W7) without pulling the full slab — the range-read contract holds under pushdown.
 - (ADR 013) A time-travel read at a retained snapshot returns the data as-of-snapshot, not as-of-now. Property test confirms no read-your-writes leakage into time-travel.
-- (ADR 013) Snapshot pruning respects retention budget; pruned snapshots are audit-logged (ADR 025 emission).
-- Fuzz surface runs to the W10 coverage ladder (10k / 1M / 100M) without crash.
+- (ADR 013) Snapshot pruning respects retention budget; pruned snapshots are audit-logged (ADR 025 emission). The retention envelope is wall-clock-based and therefore inherits ADR 012's bounded drift tolerance.
+- Fuzz surface runs through the staged coverage ladder without crash: 10k smoke in CI, 1M weekly via the W8 ladder wiring, and 100M deferred to W10's dedicated soak tier.
 
 ## 4. Explicit non-goals
 
@@ -36,15 +36,14 @@ End of W8, a client can submit a WPBC (whole-program bytecode) query and have it
 
 ## 5. Open items
 
-- **ADR 005 Open Question — interpreter vs. JIT choice.** Close at W8 kickoff.
-- **ADR 013 Open Question — default snapshot retention.** Land a default and tune against pilot workload.
+- None for W8 acceptance. The interpreter path is the accepted ADR 005 decision, the default retention window is fixed at 7 days (with explicit disable), and the 100M fuzz tier remains deferred to W10's soak schedule.
 
 ## 6. Test harness tier
 
 - **Unit:** WPBC opcode semantics; MVCC snapshot accessor.
 - **Property:** budget enforcement; time-travel ≠ read-your-writes.
 - **Integration:** SDK → cluster query with slab pushdown.
-- **Fuzz:** WPBC opcode surface, wired into W10's coverage ladder.
+- **Fuzz:** WPBC opcode surface, with 10k smoke in CI, 1M weekly via W8 ladder wiring, and 100M deferred to W10.
 
 ## 7. Phasing (internal)
 

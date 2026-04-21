@@ -1,6 +1,9 @@
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use wendelon::network::quic_transport::canonical_server_name_resolver;
 use wendelon::network::tls::{
@@ -186,12 +189,18 @@ fn certs_from_pem(pem: &str) -> Vec<CertificateDer<'static>> {
 		.unwrap()
 }
 
+fn fixture_pki_root() -> &'static PathBuf {
+	static ROOT: OnceLock<PathBuf> = OnceLock::new();
+	ROOT.get_or_init(|| {
+		let root =
+			std::env::temp_dir().join(format!("wendelon-tls-identity-{}", uuid::Uuid::new_v4()));
+		tls_pki::write_test_pki(&root);
+		root
+	})
+}
+
 fn certs_from_fixture(name: &str) -> Vec<CertificateDer<'static>> {
-	let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("tests")
-		.join("support")
-		.join("pki")
-		.join(name);
+	let path = fixture_pki_root().join(name);
 	CertificateDer::pem_file_iter(&path)
 		.unwrap()
 		.collect::<Result<Vec<_>, _>>()
@@ -199,10 +208,7 @@ fn certs_from_fixture(name: &str) -> Vec<CertificateDer<'static>> {
 }
 
 fn trust_roots() -> ActorTrustRoots {
-	let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("tests")
-		.join("support")
-		.join("pki");
+	let root = fixture_pki_root();
 	ActorTrustRoots::load(root.join("ca.crt"), root.join("ops_ca.crt")).unwrap()
 }
 

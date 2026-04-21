@@ -1,6 +1,15 @@
 use std::fmt::Write as _;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+const GROUP_COMMIT_WINDOW_BUCKETS: &[f64] =
+	&[0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05];
+const LOCAL_READ_LATENCY_BUCKETS: &[f64] =
+	&[0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1];
+const L2_RANGE_READ_LATENCY_BUCKETS: &[f64] =
+	&[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0];
+const L2_UPLOAD_LATENCY_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -37,9 +46,69 @@ impl Gauge {
 	}
 }
 
+pub struct Histogram {
+	bounds: &'static [f64],
+	state: Mutex<HistogramState>,
+}
+
 #[derive(Default)]
+struct HistogramState {
+	bucket_counts: Vec<u64>,
+	sum: f64,
+	count: u64,
+}
+
+pub struct HistogramSnapshot<'a> {
+	bounds: &'a [f64],
+	bucket_counts: Vec<u64>,
+	sum: f64,
+	count: u64,
+}
+
+impl Histogram {
+	pub fn new(bounds: &'static [f64]) -> Self {
+		Self {
+			bounds,
+			state: Mutex::new(HistogramState {
+				bucket_counts: vec![0; bounds.len() + 1],
+				sum: 0.0,
+				count: 0,
+			}),
+		}
+	}
+
+	pub fn observe_seconds(&self, value: f64) {
+		let mut state = self.state.lock().expect("histogram mutex poisoned");
+		state.count += 1;
+		state.sum += value;
+		let index = self
+			.bounds
+			.iter()
+			.position(|bound| value <= *bound)
+			.unwrap_or(self.bounds.len());
+		state.bucket_counts[index] += 1;
+	}
+
+	pub fn observe_duration(&self, duration: Duration) {
+		self.observe_seconds(duration.as_secs_f64());
+	}
+
+	pub fn snapshot(&self) -> HistogramSnapshot<'_> {
+		let state = self.state.lock().expect("histogram mutex poisoned");
+		HistogramSnapshot {
+			bounds: self.bounds,
+			bucket_counts: state.bucket_counts.clone(),
+			sum: state.sum,
+			count: state.count,
+		}
+	}
+}
+
 pub struct MetricsRegistry {
 	pub metrics_scrapes_total: Counter,
+
+	pub raft_membership_epoch: Gauge,
+	raft_current_leader_id: Mutex<Option<String>>,
 
 	pub liveness_tracked_peers: Gauge,
 	pub liveness_stale_peers: Gauge,
@@ -52,6 +121,10 @@ pub struct MetricsRegistry {
 	pub evictions_total: Counter,
 	pub eviction_advancer_failures_total: Counter,
 
+	pub quic_handshake_failures_transport_total: Counter,
+	pub quic_handshake_failures_identity_total: Counter,
+	pub quic_handshake_failures_authorization_total: Counter,
+
 	pub data_ring_write_requests_total: Counter,
 	pub data_ring_read_requests_total: Counter,
 	pub data_ring_query_requests_total: Counter,
@@ -61,6 +134,11 @@ pub struct MetricsRegistry {
 	pub data_ring_lease_denials_total: Counter,
 	pub data_ring_lease_errors_total: Counter,
 	pub data_ring_lease_cache_entries: Gauge,
+
+	pub group_commit_window_seconds: Histogram,
+	pub l1_read_latency_seconds: Histogram,
+	pub l2_upload_latency_seconds: Histogram,
+	pub l2_range_read_latency_seconds: Histogram,
 
 	pub storage_tiering_passes_total: Counter,
 	pub storage_tiering_pass_errors_total: Counter,
@@ -73,18 +151,124 @@ pub struct MetricsRegistry {
 	pub storage_migration_reclaimed_slabs_total: Counter,
 	pub storage_migration_reclaimed_bytes_total: Counter,
 
+	pub tenant_kek_cache_hits_total: Counter,
+	pub tenant_kek_cache_misses_total: Counter,
+
+	pub audit_materialization_lag_entries: Gauge,
+	pub audit_emit_node_local_total: Counter,
+	pub audit_emit_raft_log_total: Counter,
+	pub audit_sink_failures_local_total: Counter,
+	pub audit_sink_failures_syslog_total: Counter,
+	pub audit_sink_failures_kafka_total: Counter,
+
 	pub crypto_decrypt_audit_emit_failures_total: Counter,
 }
 
+impl Default for MetricsRegistry {
+	fn default() -> Self {
+		Self {
+			metrics_scrapes_total: Counter::default(),
+
+			raft_membership_epoch: Gauge::default(),
+			raft_current_leader_id: Mutex::new(None),
+
+			liveness_tracked_peers: Gauge::default(),
+			liveness_stale_peers: Gauge::default(),
+			clock_drift_checks_total: Counter::default(),
+			clock_drift_insufficient_samples_total: Counter::default(),
+			clock_drift_exceeded_total: Counter::default(),
+			clock_drift_offset_ms: Gauge::default(),
+			eviction_sweeps_total: Counter::default(),
+			eviction_refused_quorum_total: Counter::default(),
+			evictions_total: Counter::default(),
+			eviction_advancer_failures_total: Counter::default(),
+
+			quic_handshake_failures_transport_total: Counter::default(),
+			quic_handshake_failures_identity_total: Counter::default(),
+			quic_handshake_failures_authorization_total: Counter::default(),
+
+			data_ring_write_requests_total: Counter::default(),
+			data_ring_read_requests_total: Counter::default(),
+			data_ring_query_requests_total: Counter::default(),
+			data_ring_migrate_requests_total: Counter::default(),
+			data_ring_lease_refresh_passes_total: Counter::default(),
+			data_ring_lease_grants_total: Counter::default(),
+			data_ring_lease_denials_total: Counter::default(),
+			data_ring_lease_errors_total: Counter::default(),
+			data_ring_lease_cache_entries: Gauge::default(),
+
+			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS),
+			l1_read_latency_seconds: Histogram::new(LOCAL_READ_LATENCY_BUCKETS),
+			l2_upload_latency_seconds: Histogram::new(L2_UPLOAD_LATENCY_BUCKETS),
+			l2_range_read_latency_seconds: Histogram::new(L2_RANGE_READ_LATENCY_BUCKETS),
+
+			storage_tiering_passes_total: Counter::default(),
+			storage_tiering_pass_errors_total: Counter::default(),
+			storage_tiered_slabs_total: Counter::default(),
+			storage_tiering_failures_total: Counter::default(),
+			storage_tiering_skipped_small_total: Counter::default(),
+			storage_tiering_skipped_already_tiered_total: Counter::default(),
+			storage_rehydration_guard_skips_total: Counter::default(),
+			storage_rehydrated_reclaims_total: Counter::default(),
+			storage_migration_reclaimed_slabs_total: Counter::default(),
+			storage_migration_reclaimed_bytes_total: Counter::default(),
+
+			tenant_kek_cache_hits_total: Counter::default(),
+			tenant_kek_cache_misses_total: Counter::default(),
+
+			audit_materialization_lag_entries: Gauge::default(),
+			audit_emit_node_local_total: Counter::default(),
+			audit_emit_raft_log_total: Counter::default(),
+			audit_sink_failures_local_total: Counter::default(),
+			audit_sink_failures_syslog_total: Counter::default(),
+			audit_sink_failures_kafka_total: Counter::default(),
+
+			crypto_decrypt_audit_emit_failures_total: Counter::default(),
+		}
+	}
+}
+
 impl MetricsRegistry {
+	pub fn set_raft_observability_state(&self, epoch: u64, leader_id: Option<u32>) {
+		self.raft_membership_epoch.set(epoch);
+		*self
+			.raft_current_leader_id
+			.lock()
+			.expect("raft leader gauge mutex poisoned") = leader_id.map(|id| format!("n-{id:02}"));
+	}
+
 	pub fn render_prometheus(&self) -> String {
-		let mut out = String::with_capacity(4096);
+		let mut out = String::with_capacity(8192);
 		render_counter(
 			&mut out,
 			"wendelon_metrics_scrapes_total",
 			"Total successful metrics scrapes.",
 			self.metrics_scrapes_total.get(),
 		);
+		render_gauge(
+			&mut out,
+			"wendelon_raft_membership_epoch",
+			"Current applied Control Ring membership epoch.",
+			self.raft_membership_epoch.get(),
+		);
+		render_gauge_family_header(
+			&mut out,
+			"wendelon_raft_current_leader",
+			"Current Control Ring leader for this node's latest snapshot.",
+		);
+		if let Some(leader_id) = self
+			.raft_current_leader_id
+			.lock()
+			.expect("raft leader gauge mutex poisoned")
+			.clone()
+		{
+			render_gauge_with_labels(
+				&mut out,
+				"wendelon_raft_current_leader",
+				&[("leader_id", leader_id.as_str())],
+				1,
+			);
+		}
 		render_gauge(
 			&mut out,
 			"wendelon_liveness_tracked_peers",
@@ -145,6 +329,29 @@ impl MetricsRegistry {
 			"Eviction proposals that failed to advance the Control Ring membership.",
 			self.eviction_advancer_failures_total.get(),
 		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_quic_handshake_failures_total",
+			"QUIC handshakes that failed before an authenticated transport session was established.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_quic_handshake_failures_total",
+			&[("reason", "transport")],
+			self.quic_handshake_failures_transport_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_quic_handshake_failures_total",
+			&[("reason", "identity")],
+			self.quic_handshake_failures_identity_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_quic_handshake_failures_total",
+			&[("reason", "authorization")],
+			self.quic_handshake_failures_authorization_total.get(),
+		);
 		render_counter(
 			&mut out,
 			"wendelon_data_ring_write_requests_total",
@@ -198,6 +405,30 @@ impl MetricsRegistry {
 			"wendelon_data_ring_lease_cache_entries",
 			"Lease descriptors currently cached by the local Data Ring.",
 			self.data_ring_lease_cache_entries.get(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_group_commit_window_seconds",
+			"Time writes spent coalescing in the group-commit window before fdatasync.",
+			&self.group_commit_window_seconds.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_l1_read_latency_seconds",
+			"Storage-side latency for reads served from local L1 slabs.",
+			&self.l1_read_latency_seconds.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_l2_upload_latency_seconds",
+			"Latency for uploading a tiered slab object into L2 storage.",
+			&self.l2_upload_latency_seconds.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_l2_range_read_latency_seconds",
+			"Storage-side latency for reads served from tiered L2 slabs.",
+			&self.l2_range_read_latency_seconds.snapshot(),
 		);
 		render_counter(
 			&mut out,
@@ -259,6 +490,69 @@ impl MetricsRegistry {
 			"Bytes reclaimed from tombstoned slabs after migration completion.",
 			self.storage_migration_reclaimed_bytes_total.get(),
 		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_tenant_kek_cache_hit_total",
+			"Tenant KEK cache lookups by outcome.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_tenant_kek_cache_hit_total",
+			&[("outcome", "hit")],
+			self.tenant_kek_cache_hits_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_tenant_kek_cache_hit_total",
+			&[("outcome", "miss")],
+			self.tenant_kek_cache_misses_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_audit_materialization_lag_entries",
+			"Per-node local audit-chain lag behind Raft-authority audit materialization.",
+			self.audit_materialization_lag_entries.get(),
+		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_audit_emit_total",
+			"Audit records durably materialized into the local chain.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_emit_total",
+			&[("authority", "node_local"), ("outcome", "ok")],
+			self.audit_emit_node_local_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_emit_total",
+			&[("authority", "raft_log"), ("outcome", "ok")],
+			self.audit_emit_raft_log_total.get(),
+		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
+			"Audit sink failures while attempting to ship or persist audit records.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
+			&[("sink", "local"), ("reason", "emit_error")],
+			self.audit_sink_failures_local_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
+			&[("sink", "syslog"), ("reason", "emit_error")],
+			self.audit_sink_failures_syslog_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
+			&[("sink", "kafka"), ("reason", "emit_error")],
+			self.audit_sink_failures_kafka_total.get(),
+		);
 		render_counter(
 			&mut out,
 			"wendelon_crypto_decrypt_audit_emit_failures_total",
@@ -279,4 +573,64 @@ fn render_gauge(out: &mut String, name: &str, help: &str, value: u64) {
 	let _ = writeln!(out, "# HELP {name} {help}");
 	let _ = writeln!(out, "# TYPE {name} gauge");
 	let _ = writeln!(out, "{name} {value}");
+}
+
+fn render_counter_family_header(out: &mut String, name: &str, help: &str) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} counter");
+}
+
+fn render_gauge_family_header(out: &mut String, name: &str, help: &str) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} gauge");
+}
+
+fn render_counter_with_labels(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+	let _ = writeln!(out, "{name}{{{}}} {value}", render_labels(labels));
+}
+
+fn render_gauge_with_labels(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+	let _ = writeln!(out, "{name}{{{}}} {value}", render_labels(labels));
+}
+
+fn render_histogram(
+	out: &mut String,
+	name: &str,
+	help: &str,
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} histogram");
+	let mut cumulative = 0u64;
+	for (idx, bound) in snapshot.bounds.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(
+			out,
+			"{name}_bucket{{le=\"{}\"}} {cumulative}",
+			render_float(bound)
+		);
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds.len()];
+	let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+	let _ = writeln!(out, "{name}_sum {}", snapshot.sum);
+	let _ = writeln!(out, "{name}_count {}", snapshot.count);
+}
+
+fn render_labels(labels: &[(&str, &str)]) -> String {
+	let mut rendered = String::new();
+	for (idx, (key, value)) in labels.iter().enumerate() {
+		if idx > 0 {
+			rendered.push(',');
+		}
+		let _ = write!(rendered, "{key}=\"{value}\"");
+	}
+	rendered
+}
+
+fn render_float(value: f64) -> String {
+	if value.fract() == 0.0 {
+		format!("{value:.0}")
+	} else {
+		value.to_string()
+	}
 }

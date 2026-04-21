@@ -1,0 +1,67 @@
+groups:
+  - name: wendelon_alerts
+    interval: 30s
+    rules:
+      - alert: RaftNoLeader
+        expr: absent(wendelon_raft_current_leader)
+        for: 60s
+        labels:
+          severity: page
+        annotations:
+          summary: Wendelon control ring has no elected leader.
+      - alert: GroupCommitWindowHigh
+        expr: job:wendelon_group_commit_window_seconds:p99_5m > 0.01
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: Wendelon group-commit p99 is above the target threshold.
+      - alert: L1ReadLatencyHigh
+        expr: job:wendelon_l1_read_latency_seconds:p99_5m > 0.01
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: Wendelon local L1 read p99 is above the target threshold.
+      - alert: L2RangeReadLatencyHigh
+        expr: job:wendelon_l2_range_read_latency_seconds:p99_5m > 0.15
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: Wendelon tiered L2 read p99 is above the target threshold.
+      - alert: AuditMaterializationLagRising
+        expr: wendelon_audit_materialization_lag_entries > 1000
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Local audit materialization is behind authoritative Raft events.
+      - alert: AuditSinkFailing
+        expr: rate(wendelon_audit_sink_failure_total{sink="local"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: The local audit sink is failing to durably append records.
+      - alert: L2UploadLatencyHigh
+        expr: job:wendelon_l2_upload_latency_seconds:p99_5m > 2
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: L2 sweeper upload latency is above the accepted threshold.
+      - alert: TenantKekCacheThrashing
+        expr: sum(rate(wendelon_tenant_kek_cache_hit_total{outcome="miss"}[5m])) / sum(rate(wendelon_tenant_kek_cache_hit_total[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: Tenant KEK cache miss rate is above the accepted threshold.
+      - alert: QuicHandshakeFailureSpike
+        expr: sum(rate(wendelon_quic_handshake_failures_total[5m])) > 1
+        for: 10m
+        labels:
+          severity: warn
+        annotations:
+          summary: QUIC handshake failures are spiking above the steady-state baseline.

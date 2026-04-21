@@ -163,6 +163,10 @@ impl TierCommitter for DirectApplyCommitter {
 	async fn commit_tier_slab(&self, tier: wendelon::consensus::TieredSlab) -> std::io::Result<()> {
 		self.observer.on_slab_tiered(&tier, 0).await
 	}
+
+	async fn retire_tiered_slab(&self, slab_id: wendelon::schema::SlabId) -> std::io::Result<()> {
+		self.observer.on_slab_retired(slab_id, 0).await
+	}
 }
 
 async fn build_manager_with_sealed_slabs(
@@ -267,6 +271,11 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_data_ring_read_requests_total"));
 	assert!(body.contains("wendelon_storage_tiered_slabs_total"));
 	assert!(body.contains("wendelon_storage_migration_reclaimed_slabs_total"));
+	assert!(body.contains("wendelon_audit_materialization_lag_entries"));
+	assert!(body.contains("wendelon_audit_emit_total{authority=\"node_local\",outcome=\"ok\"}"));
+	assert!(body.contains("wendelon_group_commit_window_seconds_bucket"));
+	assert!(body.contains("wendelon_l1_read_latency_seconds_bucket"));
+	assert!(body.contains("wendelon_l2_upload_latency_seconds_bucket"));
 	assert!(metric_value(&body, "wendelon_metrics_scrapes_total") >= 1);
 	assert!(metric_value(&body, "wendelon_data_ring_write_requests_total") >= 1);
 	assert!(metric_value(&body, "wendelon_data_ring_read_requests_total") >= 1);

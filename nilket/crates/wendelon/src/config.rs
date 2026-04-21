@@ -1,3 +1,4 @@
+use crate::audit::{AuditSinksConfig, KafkaAuditConfig, SyslogAuditConfig};
 use crate::crypto::{
 	CryptoCacheConfig, DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
 	RootKekProviderConfig, SLAB_MAX_BYTES_HARD_CEILING,
@@ -7,15 +8,17 @@ use crate::network::{
 	transfer_verifying_key_bytes,
 };
 use crate::node::{
-	ClusterBootstrapConfig, NodeBootstrapConfig, ObservabilityConfig, SeedNodeConfig,
-	TransportTlsConfig,
+	ClusterBootstrapConfig, DEFAULT_MVCC_RETENTION_WINDOW, NodeBootstrapConfig,
+	ObservabilityConfig, SeedNodeConfig, TransportTlsConfig,
 };
 use crate::schema::ProtocolVersionWindow;
+use crate::storage::MvccRetentionPolicy;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const EXAMPLE_CONFIG_TEMPLATE: &[u8] = include_bytes!("../examples/wendelon.toml.example");
 const EXAMPLE_NODE_ID: u32 = 1;
@@ -91,6 +94,8 @@ struct RawConfig {
 	transport: RawTransportConfig,
 	#[serde(default)]
 	observability: RawObservabilityConfig,
+	#[serde(default)]
+	audit: RawAuditConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,12 +132,15 @@ impl Default for RawTuningConfig {
 struct RawTimeConfig {
 	#[serde(default = "default_drift_max_offset_ms")]
 	drift_max_offset_ms: u64,
+	#[serde(default = "default_mvcc_retention_window_secs")]
+	mvcc_retention_window_secs: u64,
 }
 
 impl Default for RawTimeConfig {
 	fn default() -> Self {
 		Self {
 			drift_max_offset_ms: default_drift_max_offset_ms(),
+			mvcc_retention_window_secs: default_mvcc_retention_window_secs(),
 		}
 	}
 }
@@ -223,6 +231,26 @@ struct RawObservabilityListeners {
 	health: String,
 	ready: String,
 	metrics: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAuditConfig {
+	#[serde(default)]
+	syslog: Option<RawAuditSyslogConfig>,
+	#[serde(default)]
+	kafka: Option<RawAuditKafkaConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAuditSyslogConfig {
+	socket_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAuditKafkaConfig {
+	brokers: String,
+	topic: String,
+	client_id: Option<String>,
 }
 
 impl RawConfig {
@@ -319,6 +347,16 @@ impl RawConfig {
 					metrics: listeners.metrics,
 				},
 			});
+		let audit = AuditSinksConfig {
+			syslog: self.audit.syslog.map(|syslog| SyslogAuditConfig {
+				socket_path: absolutize_from_config_dir(source_path, &syslog.socket_path),
+			}),
+			kafka: self.audit.kafka.map(|kafka| KafkaAuditConfig {
+				brokers: kafka.brokers,
+				topic: kafka.topic,
+				client_id: kafka.client_id,
+			}),
+		};
 
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
@@ -344,7 +382,12 @@ impl RawConfig {
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls,
 			drift_max_offset_ms: self.time.drift_max_offset_ms,
+			mvcc_retention_policy: match self.time.mvcc_retention_window_secs {
+				0 => MvccRetentionPolicy::Disabled,
+				secs => MvccRetentionPolicy::FixedWindow(Duration::from_secs(secs)),
+			},
 			observability,
+			audit,
 		};
 		cfg.validate()?;
 		Ok(cfg)
@@ -448,4 +491,8 @@ fn default_cluster_domain() -> String {
 
 const fn default_drift_max_offset_ms() -> u64 {
 	crate::consensus::monitor::MAX_OFFSET_MS
+}
+
+const fn default_mvcc_retention_window_secs() -> u64 {
+	DEFAULT_MVCC_RETENTION_WINDOW.as_secs()
 }

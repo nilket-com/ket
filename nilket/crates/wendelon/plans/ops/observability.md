@@ -10,6 +10,8 @@ Operator-facing telemetry for Wendelon. **Not** the same thing as audit — audi
 
 This document operationalizes ADR 027. Anything architectural goes in the ADR; this document covers **what an operator configures, runs, and alerts on**.
 
+The current workspace implements the three-listener posture, the Prometheus/OpenMetrics exporter, the recording rules, and the alert bundle described below. OTLP trace export remains planned and is not yet wired in this pilot codebase.
+
 ---
 
 ## 1. Listener topology
@@ -155,72 +157,72 @@ Layer order is fixed in code and asserted by integration test. Runtime layer hot
 
 Per ADR 027 §7: **high-cardinality dimensions are not metric labels.** `tenant_id`, `slab_id`, `key_id`, full cert subjects, raw key IDs — none of these are Prometheus labels. They appear in trace attributes and (where appropriate) in audit events.
 
-Per-tenant detail is exposed via `/tenant-usage` (operator-authenticated, paginated) on the metrics listener. Use traces for per-tenant per-request questions; use `/tenant-usage` for per-tenant aggregate questions. Do not ask for per-tenant metric labels.
+Per-tenant detail is intentionally absent from the current `/metrics` surface. Use traces for per-request debugging; a dedicated operator-facing per-tenant usage endpoint remains planned rather than emitted as Prometheus labels.
 
 Operational effect: a tenant-growth event from 1k → 1M tenants does not blow up the Prometheus backend.
 
 ### Default metric catalog
 
-The pilot ships with this metric set. Every metric is OpenMetrics-compatible and unit-suffixed.
+The pilot ships with the following Prometheus/OpenMetrics surface. Metric names below are listed exactly as exported, including the `wendelon_` prefix.
 
-#### Raft
+#### Raft / Control Ring
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|
-| `raft_propose_latency_seconds` | histogram | none | Time from propose → append |
-| `raft_commit_latency_seconds` | histogram | none | Time from propose → quorum commit |
-| `raft_log_lag_entries` | gauge | none | This-node lag behind leader |
-| `raft_current_leader` | gauge | `leader_id` | Leader identity (single-series-per-leader-transition) |
-| `raft_membership_epoch` | gauge | none | Current membership epoch |
+| `wendelon_raft_current_leader` | gauge | `leader_id` | Present only while a leader exists; the no-leader alert keys off absence |
+| `wendelon_raft_membership_epoch` | gauge | none | Current applied membership epoch |
+| `wendelon_liveness_tracked_peers` | gauge | none | Peers currently tracked by the liveness monitor |
+| `wendelon_liveness_stale_peers` | gauge | none | Peers currently considered stale |
+| `wendelon_clock_drift_checks_total` | counter | none | Clock-drift checks executed |
+| `wendelon_clock_drift_insufficient_samples_total` | counter | none | Clock-drift checks skipped for insufficient samples |
+| `wendelon_clock_drift_exceeded_total` | counter | none | Drift checks that breached the configured bound |
+| `wendelon_clock_drift_offset_ms` | gauge | none | Last observed absolute drift offset |
+| `wendelon_eviction_sweeps_total` | counter | none | Eviction watchdog passes |
+| `wendelon_eviction_refused_quorum_total` | counter | none | Evictions refused to preserve quorum |
+| `wendelon_evictions_total` | counter | none | Peers evicted from the ring |
+| `wendelon_eviction_advancer_failures_total` | counter | none | Membership-advance attempts that failed |
 
-#### Transport
+#### Transport / Data Ring
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|
-| `quic_active_streams` | gauge | none | Open QUIC streams |
-| `quic_handshake_failures_total` | counter | `reason` (enum) | Auth / TLS failures |
-| `rpc_requests_total` | counter | `operation`, `outcome` | Per-op request counts (operation is closed enum, bounded) |
-| `rpc_latency_seconds` | histogram | `operation` | Per-op latency (operation bounded by closed enum) |
+| `wendelon_quic_handshake_failures_total` | counter | `reason` (`transport`, `identity`, `authorization`) | QUIC handshakes that failed before an authenticated session came up |
+| `wendelon_data_ring_write_requests_total` | counter | none | Data Ring writes handled |
+| `wendelon_data_ring_read_requests_total` | counter | none | Data Ring reads handled |
+| `wendelon_data_ring_query_requests_total` | counter | none | Query requests handled |
+| `wendelon_data_ring_migrate_requests_total` | counter | none | Migration RPCs handled |
+| `wendelon_data_ring_lease_refresh_passes_total` | counter | none | Lease-manager passes |
+| `wendelon_data_ring_lease_grants_total` | counter | none | Lease grants accepted |
+| `wendelon_data_ring_lease_denials_total` | counter | none | Lease refresh denials |
+| `wendelon_data_ring_lease_errors_total` | counter | none | Lease refresh failures |
+| `wendelon_data_ring_lease_cache_entries` | gauge | none | Cached lease descriptors |
 
-#### Storage
+#### Storage / L2
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|
-| `wal_fsync_latency_seconds` | histogram | none | fsync tail |
-| `storage_tier_bytes` | gauge | `tier` (`l1`, `l2`, `staging`) | Bytes per tier |
-| `slab_compaction_backlog_bytes` | gauge | none | Pending-compaction pressure |
-| `group_commit_window_seconds` | histogram | none | Group-commit coalescing latency (ADR 016) |
-| `l1_read_latency_seconds` | histogram | none | Storage-side read latency for L1-served requests (paired with `l2_range_read_latency_seconds`) |
+| `wendelon_group_commit_window_seconds` | histogram | none | Group-commit coalescing latency before `fdatasync` |
+| `wendelon_l1_read_latency_seconds` | histogram | none | Storage-side latency for L1-served reads |
+| `wendelon_l2_range_read_latency_seconds` | histogram | none | Storage-side latency for reads served from tiered L2 slabs |
+| `wendelon_l2_upload_latency_seconds` | histogram | none | Time to upload a tiered slab object to L2 |
+| `wendelon_storage_tiering_passes_total` | counter | none | Tiering sweeper passes |
+| `wendelon_storage_tiering_pass_errors_total` | counter | none | Sweeper passes that returned an error |
+| `wendelon_storage_tiered_slabs_total` | counter | none | Slabs tiered from L1 into L2 |
+| `wendelon_storage_tiering_failures_total` | counter | none | Per-slab tiering failures |
+| `wendelon_storage_tiering_skipped_small_total` | counter | none | Slabs skipped for being below the size threshold |
+| `wendelon_storage_tiering_skipped_already_tiered_total` | counter | none | Slabs skipped because the state machine had already pivoted them |
+| `wendelon_storage_rehydration_guard_skips_total` | counter | none | Rehydrated slabs retained in L1 by the thrash guard |
+| `wendelon_storage_rehydrated_reclaims_total` | counter | none | Rehydrated slabs reclaimed after cooling |
+| `wendelon_storage_migration_reclaimed_slabs_total` | counter | none | Tombstoned slabs reclaimed after migration |
+| `wendelon_storage_migration_reclaimed_bytes_total` | counter | none | Bytes reclaimed after migration |
 
-#### L2
+#### Crypto / Audit
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|
-| `l2_upload_latency_seconds` | histogram | none | Slab upload latency |
-| `l2_range_read_latency_seconds` | histogram | none | Slab range-read latency |
-| `l2_orphan_reclaim_bytes_total` | counter | none | Orphan-slab reclaim volume |
+| `wendelon_tenant_kek_cache_hit_total` | counter | `outcome` (`hit`, `miss`) | Tenant KEK cache effectiveness |
+| `wendelon_audit_materialization_lag_entries` | gauge | none | Per-node local-chain lag behind authoritative Raft events |
+| `wendelon_audit_emit_total` | counter | `authority`, `outcome` | Audit emission volume by authority |
+| `wendelon_audit_sink_failure_total` | counter | `sink`, `reason` | Audit sink failures by sink |
+| `wendelon_crypto_decrypt_audit_emit_failures_total` | counter | none | `crypto.decrypt_rejected` audit events that failed to persist |
 
-#### Crypto / Identity
-| Metric | Type | Labels | Use |
-|--------|------|--------|-----|
-| `kms_unwrap_latency_seconds` | histogram | none | KMS unwrap call latency |
-| `tenant_kek_cache_hit_total` | counter | `outcome` (`hit`, `miss`) | KEK cache effectiveness |
-| `cert_expiry_seconds` | gauge | `role` | Time-to-expiry for loaded certs |
-
-#### Audit materialization (ADR 025 §5)
-| Metric | Type | Labels | Use |
-|--------|------|--------|-----|
-| `audit_materialization_lag_entries` | gauge | none | Per-node local-chain lag behind Raft log (state-machine authority events) |
-| `audit_emit_total` | counter | `authority` (`raftlog`, `nodelocal`), `outcome` | Emission volume, split by authority |
-| `audit_sink_failure_total` | counter | `sink` (`local`, `syslog`, `kafka`), `reason` | Per-sink failure counts |
-
-#### Process
-Standard process metrics (CPU, RSS, FDs, threads). Emitted by the process-metrics crate; cardinality is bounded and well-known.
-
-### Aggregate per-tenant metrics (low-cardinality only)
-| Metric | Type | Labels | Use |
-|--------|------|--------|-----|
-| `tenant_count_active` | gauge | none | Active tenants on this node |
-| `tenant_count_suspended` | gauge | none | Suspended tenants on this node |
-| `tenant_count_deleting` | gauge | none | Tenants mid-delete |
-
-Per-tenant *byte counts, request rates, quota utilization* are served from `/tenant-usage` with pagination — not from `/metrics` — precisely to keep the Prometheus label space finite.
+Per-tenant Prometheus labels remain explicitly out of scope for the pilot to keep backend cardinality finite.
 
 ---
 
@@ -230,15 +232,11 @@ SLOs are commitments measured against the metric catalog above. The pilot ships 
 
 | SLO | Target | Metric basis | Measurement window | Status |
 |-----|--------|--------------|---------------------|--------|
-| Availability (Data-Ring reads + writes) | 99.9% | `rpc_requests_total{operation=~"read\|write",outcome!="error"}` / total | 30d rolling | TARGET (unvalidated) |
-| L1 read p99 (storage-side) | ≤ 10 ms | `l1_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
-| L2 read p99 (storage-side) | ≤ 150 ms | `l2_range_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
-| Read RPC p99 (client-observed, both tiers) | ≤ 150 ms | `rpc_latency_seconds{operation="read"}` p99 | 5m rolling | TARGET (unvalidated) |
-| Raft commit p99 | ≤ 50 ms | `raft_commit_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
-| WAL fsync p99 | ≤ 5 ms | `wal_fsync_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
-| Audit materialization lag | ≤ 100 entries steady-state | `audit_materialization_lag_entries` | instantaneous | TARGET (unvalidated) |
-
-Note on tier attribution: `rpc_latency_seconds` is labeled by `operation` only, never by tier — the tier a read ends up served from is an internal execution detail and often a mixture per-request (L1 miss falls through to L2). Tier-specific SLOs therefore measure the **storage-side** latency (`l1_read_latency_seconds`, `l2_range_read_latency_seconds`), and the client-observed SLO is the unified RPC-layer metric.
+| Group-commit p99 | ≤ 10 ms | `wendelon_group_commit_window_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| L1 read p99 (storage-side) | ≤ 10 ms | `wendelon_l1_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| L2 read p99 (storage-side) | ≤ 150 ms | `wendelon_l2_range_read_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| L2 upload p99 | ≤ 2 s | `wendelon_l2_upload_latency_seconds` p99 | 5m rolling | TARGET (unvalidated) |
+| Audit materialization lag | ≤ 100 entries steady-state | `wendelon_audit_materialization_lag_entries` | instantaneous | TARGET (unvalidated) |
 
 **Durability** is not an availability-style SLO; it is a design property of the replication + L2 model. The "11 nines" figure is a marketing-shaped number that depends on assumptions about object-store replication, scrub cadence, and correlated-failure rate that this project has not yet modeled. The pilot does not claim a specific durability figure; see `plans/ops/testing.md` and the chaos-harness soak results for what is actually validated.
 
@@ -259,18 +257,14 @@ groups:
   - name: wendelon_recording_rules
     interval: 30s
     rules:
-      - record: job:raft_commit_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(raft_commit_latency_seconds_bucket[5m])))
-      - record: job:wal_fsync_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(wal_fsync_latency_seconds_bucket[5m])))
-      - record: job:l2_upload_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(l2_upload_latency_seconds_bucket[5m])))
-      - record: job:l1_read_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(l1_read_latency_seconds_bucket[5m])))
-      - record: job:l2_range_read_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(l2_range_read_latency_seconds_bucket[5m])))
-      - record: job:rpc_read_latency_seconds:p99_5m
-        expr: histogram_quantile(0.99, sum by (job, le) (rate(rpc_latency_seconds_bucket{operation="read"}[5m])))
+      - record: job:wendelon_group_commit_window_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_group_commit_window_seconds_bucket[5m])))
+      - record: job:wendelon_l1_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l1_read_latency_seconds_bucket[5m])))
+      - record: job:wendelon_l2_range_read_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l2_range_read_latency_seconds_bucket[5m])))
+      - record: job:wendelon_l2_upload_latency_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (job, le) (rate(wendelon_l2_upload_latency_seconds_bucket[5m])))
 ```
 
 The `job:` naming prefix follows the Prometheus convention for aggregated-across-instances recording rules. SLO dashboards in §4 and alerts in §5.2 both reference these precomputed series.
@@ -279,15 +273,15 @@ The `job:` naming prefix follows the Prometheus convention for aggregated-across
 
 | Alert | Condition | Severity | Notes |
 |-------|-----------|----------|-------|
-| `RaftNoLeader` | `absent(raft_current_leader)` for 60s | page | Cluster unwritable |
-| `RaftCommitLatencyHigh` | `job:raft_commit_latency_seconds:p99_5m > 0.1` for 10m | page | Likely quorum trouble or slow fsync |
-| `WalFsyncLatencyHigh` | `job:wal_fsync_latency_seconds:p99_5m > 0.02` for 10m | page | Disk pressure or failing NVMe |
-| `AuditMaterializationLagRising` | `audit_materialization_lag_entries > 1000` for 5m | page | Local chain can't keep up with Raft; degraded `/ready` |
-| `AuditSinkFailing` | `rate(audit_sink_failure_total{sink="local"}[5m]) > 0` | page | Local-chain writes failing — NodeLocal events fail-closed |
-| `L2UploadBacklogGrowing` | `job:l2_upload_latency_seconds:p99_5m > 2 and storage_tier_bytes{tier="staging"} > 1e10` for 10m | warn | L2 sweeper falling behind |
-| `CertExpiringSoon` | `cert_expiry_seconds < 7*86400` | warn (30d), page (7d) | Rotate before expiry |
-| `TenantKekCacheThrashing` | `rate(tenant_kek_cache_hit_total{outcome="miss"}[5m]) / rate(tenant_kek_cache_hit_total[5m]) > 0.5` for 10m | warn | Cache undersized; KMS cost spike |
-| `QuicHandshakeFailureSpike` | `rate(quic_handshake_failures_total[5m]) > 1` | warn | Per-second rate > 1; possible auth churn or misconfigured client |
+| `RaftNoLeader` | `absent(wendelon_raft_current_leader)` for 60s | page | Cluster unwritable |
+| `GroupCommitWindowHigh` | `job:wendelon_group_commit_window_seconds:p99_5m > 0.01` for 10m | page | The local durable path is accumulating queueing latency |
+| `L1ReadLatencyHigh` | `job:wendelon_l1_read_latency_seconds:p99_5m > 0.01` for 10m | warn | Local slab reads are above the target band |
+| `L2RangeReadLatencyHigh` | `job:wendelon_l2_range_read_latency_seconds:p99_5m > 0.15` for 10m | warn | Tiered reads are above the target band |
+| `L2UploadLatencyHigh` | `job:wendelon_l2_upload_latency_seconds:p99_5m > 2` for 10m | warn | The sweeper is taking too long to push slabs into L2 |
+| `AuditMaterializationLagRising` | `wendelon_audit_materialization_lag_entries > 1000` for 5m | page | Local chain can't keep up with Raft; degraded `/ready` |
+| `AuditSinkFailing` | `rate(wendelon_audit_sink_failure_total{sink="local"}[5m]) > 0` | page | Local-chain writes failing — NodeLocal events fail-closed |
+| `TenantKekCacheThrashing` | `sum(rate(wendelon_tenant_kek_cache_hit_total{outcome="miss"}[5m])) / sum(rate(wendelon_tenant_kek_cache_hit_total[5m])) > 0.5` for 10m | warn | Cache undersized; KMS cost spike |
+| `QuicHandshakeFailureSpike` | `sum(rate(wendelon_quic_handshake_failures_total[5m])) > 1` for 10m | warn | Per-second handshake failure rate is above the steady-state baseline |
 
 `AuditMaterializationLagRising` and `AuditSinkFailing` are **required paging alerts** for compliance deployments (the audit fail-closed posture for NodeLocal events means these conditions can reject auth operations).
 

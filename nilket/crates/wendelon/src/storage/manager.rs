@@ -45,6 +45,7 @@ use crate::crypto::{
 	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredOffsetIndexEntry,
 	TieredSlabObjectMetadata,
 };
+use crate::metrics::global as metrics;
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
 };
@@ -62,10 +63,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -73,9 +74,11 @@ use tokio::time::Instant;
 const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
 type TenantKey = (TenantId, Identity);
+type TenantLocalityMembers = BTreeMap<TenantId, BTreeSet<(Locality, Identity)>>;
 
 const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
 const MIN_L2_TAIL_READ_WINDOW_BYTES: u64 = 256 + 16;
+const IDENTITY_MAX: Identity = Identity::new([0xFF; 32]);
 
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
@@ -228,6 +231,31 @@ pub struct TombstoneCompactionReport {
 	pub reclaimed_bytes: u64,
 }
 
+/// Outcome of one ADR 013 retention-pruning pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetentionPruningReport {
+	pub compacted_slabs: usize,
+	pub pruned_versions: usize,
+	pub reclaimed_bytes: u64,
+}
+
+pub(crate) enum PreparedTieredRetentionRewrite {
+	Rewrite {
+		slab_id: SlabId,
+		old_l2_uri: String,
+		encrypted_bytes: Vec<u8>,
+		payload_hash: [u8; 32],
+		pruned_versions: usize,
+		reclaimed_bytes: u64,
+	},
+	Retire {
+		slab_id: SlabId,
+		old_l2_uri: String,
+		pruned_versions: usize,
+		reclaimed_bytes: u64,
+	},
+}
+
 /// Multi-slab composition of [`StorageEngine`].
 pub struct SlabManager {
 	config: SlabManagerConfig,
@@ -238,6 +266,13 @@ pub struct SlabManager {
 	/// version sorted ascending by HLC; the tail is the current
 	/// value and earlier entries back time-travel reads.
 	key_index: DashMap<TenantKey, Vec<RecordLocation>>,
+	/// Tenant-scoped locality membership index for range scans.
+	///
+	/// Query planning and migration scans use this ordered set to
+	/// jump directly to the identities whose projected locality falls
+	/// inside the requested window, instead of filtering every key in
+	/// the tenant-wide `key_index`.
+	locality_index: RwLock<TenantLocalityMembers>,
 	/// Best-effort compatibility map for in-flight readers that
 	/// raced a compaction rewrite. New lookups pivot to the fresh
 	/// location through `key_index`; a stale snapshot of the prior
@@ -251,6 +286,20 @@ pub struct SlabManager {
 	/// state machine, and their redb transactions also stamp the
 	/// highest applied control-log index we have mirrored so far.
 	persistent_index: Option<Arc<PersistentLocalIndex>>,
+	/// Retired tier pointers that still need local cleanup retried.
+	///
+	/// A tier-retirement apply may succeed in the state machine but
+	/// fail locally before unlinking the slab file or before a caller
+	/// deletes the old L2 object. The sweeper reconciles this set
+	/// against the committed SM view on the next pass.
+	retired_tiered_cleanup: DashMap<SlabId, TieredSlabPointer>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TieredRowRefreshPlan {
+	old_rows: Vec<PersistentRecordRow>,
+	new_rows: Vec<PersistentRecordRow>,
+	relocated_reads: Vec<(RecordLocation, RecordLocation)>,
 }
 
 #[derive(Clone)]
@@ -310,6 +359,7 @@ impl SlabManager {
 			.entry((tenant_id, key_identity))
 			.and_modify(|versions| insert_version_sorted(versions, location))
 			.or_insert_with(|| vec![location]);
+		self.insert_locality_membership(tenant_id, key_identity);
 	}
 
 	fn rollback_indexed_location(
@@ -327,6 +377,32 @@ impl SlabManager {
 		};
 		if should_remove_key {
 			self.key_index.remove(&key);
+			self.remove_locality_membership(tenant_id, key_identity);
+		}
+	}
+
+	fn insert_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
+		self.locality_index
+			.write()
+			.expect("locality index lock poisoned")
+			.entry(tenant_id)
+			.or_default()
+			.insert((Locality::from(key_identity), key_identity));
+	}
+
+	fn remove_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
+		let mut locality_index = self
+			.locality_index
+			.write()
+			.expect("locality index lock poisoned");
+		let should_remove_tenant = if let Some(members) = locality_index.get_mut(&tenant_id) {
+			members.remove(&(Locality::from(key_identity), key_identity));
+			members.is_empty()
+		} else {
+			false
+		};
+		if should_remove_tenant {
+			locality_index.remove(&tenant_id);
 		}
 	}
 
@@ -430,6 +506,7 @@ impl SlabManager {
 		}
 
 		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::new(config.io.clone()));
+		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
 		existing_ids.sort_unstable();
 
@@ -516,6 +593,7 @@ impl SlabManager {
 				}
 			}
 		}
+		let locality_index = build_locality_index(&key_index);
 
 		let manager = Self {
 			config,
@@ -530,8 +608,10 @@ impl SlabManager {
 				next_slab_id,
 			}),
 			key_index,
+			locality_index: RwLock::new(locality_index),
 			relocated_reads: DashMap::new(),
 			persistent_index,
+			retired_tiered_cleanup: DashMap::new(),
 		};
 		manager.rebuild_persistent_index().await;
 		Ok(manager)
@@ -540,6 +620,32 @@ impl SlabManager {
 	/// Test / diagnostic accessor: current active slab id.
 	pub async fn active_slab_id(&self) -> SlabId {
 		self.state.lock().await.active.slab_id()
+	}
+
+	#[cfg(test)]
+	pub async fn force_seal_active_for_test(&self) -> SlabId {
+		let mut state = self.state.lock().await;
+		let sealed = state.active.clone();
+		sealed
+			.fsync()
+			.await
+			.expect("force_seal_active_for_test should fsync sealed slab");
+		let sealed_id = sealed.slab_id();
+		let next_id = state.next_slab_id;
+		let next = Arc::new(
+			LocalSlabStore::open(
+				slab_path(&self.config.dir, next_id),
+				next_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await
+			.expect("force_seal_active_for_test should open next slab"),
+		);
+		state.active = next;
+		state.sealed.insert(sealed_id, sealed);
+		state.next_slab_id = next_id.saturating_add(1);
+		sealed_id
 	}
 
 	pub fn data_dir(&self) -> &Path {
@@ -814,8 +920,38 @@ impl SlabManager {
 		pointer: TieredSlabPointer,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
+		// This path is intentionally idempotent for the same pointer. The
+		// sweeper may fall back to calling it after Raft apply has already
+		// fired the tier observer, so a second application of an identical
+		// pointer must not rebuild row state or mutate relocated reads again.
+		let old_pointer = {
+			let state = self.state.lock().await;
+			state
+				.tiered
+				.get(&pointer.slab_id)
+				.map(|entry| entry.value().clone())
+		};
+		let refresh_plan = if old_pointer.as_ref().is_some_and(|old| old != &pointer)
+			|| !self.has_rows_for_slab(pointer.slab_id)
+		{
+			Some(self.build_tiered_row_refresh_plan_from_l2(&pointer).await?)
+		} else {
+			None
+		};
+		#[cfg(debug_assertions)]
+		if old_pointer.as_ref().is_some_and(|old| old == &pointer) {
+			debug_assert!(
+				refresh_plan.is_none(),
+				"identical tier pointer replay must remain a no-op; the sweeper may reapply after the observer already committed local state"
+			);
+		}
 		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
 			.await?;
+		if let Some(plan) = &refresh_plan {
+			for (old_location, new_location) in &plan.relocated_reads {
+				self.relocated_reads.insert(*old_location, *new_location);
+			}
+		}
 		{
 			let mut state = self.state.lock().await;
 			let _old = state.sealed.remove(&pointer.slab_id);
@@ -824,6 +960,10 @@ impl SlabManager {
 			state.hot_read_counts.remove(&pointer.slab_id);
 			state.rehydrating.remove(&pointer.slab_id);
 		}
+		self.retired_tiered_cleanup.remove(&pointer.slab_id);
+		if let Some(plan) = refresh_plan {
+			self.apply_tiered_row_refresh_plan(plan).await;
+		}
 
 		// Unlink the L1 file. Open fds held by in-flight reads
 		// continue to work; new reads find the entry in `tiered`
@@ -831,6 +971,54 @@ impl SlabManager {
 		let path = slab_path(&self.config.dir, pointer.slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		Ok(())
+	}
+
+	pub async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
+		self.retire_tiered_slab_committed(slab_id, None).await
+	}
+
+	pub async fn retire_tiered_slab_committed(
+		&self,
+		slab_id: SlabId,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<bool> {
+		let rows = self.record_rows_for_slab(slab_id);
+		let retired_pointer = {
+			let state = self.state.lock().await;
+			state
+				.tiered
+				.get(&slab_id)
+				.map(|entry| entry.value().clone())
+		};
+		let should_remove = {
+			let state = self.state.lock().await;
+			retired_pointer.is_some() || state.rehydrated.contains_key(&slab_id) || !rows.is_empty()
+		};
+		if !should_remove {
+			return Ok(false);
+		}
+		if let Some(pointer) = retired_pointer.clone() {
+			self.retired_tiered_cleanup.insert(slab_id, pointer);
+		}
+		self.delete_tiered_slab_strict(slab_id, last_control_log_index)
+			.await?;
+		{
+			let mut state = self.state.lock().await;
+			let _old = state.sealed.remove(&slab_id);
+			let _old = state.rehydrated.remove(&slab_id);
+			let _old = state.tiered.remove(&slab_id);
+			state.hot_read_counts.remove(&slab_id);
+			state.rehydrating.remove(&slab_id);
+		}
+		for row in &rows {
+			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+		}
+		self.relocated_reads.retain(|old_location, new_location| {
+			old_location.slab_id != slab_id && new_location.slab_id != slab_id
+		});
+		let path = slab_path(&self.config.dir, slab_id);
+		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		Ok(true)
 	}
 
 	/// Converge one recovered tiered slab into local state.
@@ -843,9 +1031,6 @@ impl SlabManager {
 		pointer: TieredSlabPointer,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
-		if !self.has_rows_for_slab(pointer.slab_id) {
-			self.recover_tiered_rows_from_l2(&pointer).await?;
-		}
 		self.apply_tier_slab_committed(pointer, last_control_log_index)
 			.await
 	}
@@ -886,6 +1071,29 @@ impl SlabManager {
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
 		pointers
+	}
+
+	/// Tier retirements that committed in the SM but still need
+	/// best-effort local cleanup retried.
+	pub async fn list_retired_tiered_cleanup_candidates(&self) -> Vec<TieredSlabPointer> {
+		let mut pointers = self
+			.retired_tiered_cleanup
+			.iter()
+			.map(|entry| entry.value().clone())
+			.collect::<Vec<_>>();
+		pointers.sort_by_key(|pointer| pointer.slab_id);
+		pointers
+	}
+
+	/// Retry only the local-file cleanup for a retired tiered slab.
+	pub async fn retry_retired_tiered_local_cleanup(&self, slab_id: SlabId) -> std::io::Result<()> {
+		let path = slab_path(&self.config.dir, slab_id);
+		unlink_local_file(self.file_ops.as_ref(), &path).await
+	}
+
+	/// Mark one retired tiered slab cleanup candidate complete.
+	pub fn clear_retired_tiered_cleanup(&self, slab_id: SlabId) {
+		self.retired_tiered_cleanup.remove(&slab_id);
 	}
 
 	/// Best-effort reclaim of one rehydrated local cache copy. The
@@ -949,31 +1157,41 @@ impl SlabManager {
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
 	) -> Vec<(u64, RecordLocation)> {
+		self.scan_as_of_with_identity(tenant_id, start_locality, end_locality, as_of_hlc)
+			.into_iter()
+			.map(|(key_identity, loc)| (Locality::from(key_identity).get(), loc))
+			.collect()
+	}
+
+	/// Variant of [`Self::scan_as_of`] that preserves the full
+	/// authoritative [`Identity`] for each retained version. Query
+	/// planning uses this when WPBC needs to evaluate typed
+	/// identity/locality predicates against record metadata rather
+	/// than the decoded Arrow payload alone.
+	pub fn scan_as_of_with_identity(
+		&self,
+		tenant_id: TenantId,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
+		as_of_hlc: HybridTimestamp,
+	) -> Vec<(Identity, RecordLocation)> {
 		let start_locality = start_locality.into();
 		let end_locality = end_locality.into();
 		if start_locality > end_locality {
 			return Vec::new();
 		}
-		let mut out: Vec<(Locality, Identity, RecordLocation)> = self
-			.key_index
-			.iter()
-			.filter_map(|entry| {
-				let (record_tenant_id, key_identity) = *entry.key();
-				if record_tenant_id != tenant_id {
-					return None;
-				}
-				let locality = Locality::from(key_identity);
-				if locality < start_locality || locality > end_locality {
-					return None;
-				}
-				newest_version_as_of(entry.value(), as_of_hlc)
-					.map(|loc| (locality, key_identity, loc))
-			})
-			.collect();
-		out.sort_by_key(|(locality, key_identity, _)| (*locality, *key_identity));
-		out.into_iter()
-			.map(|(locality, _key_identity, loc)| (locality.get(), loc))
-			.collect()
+		let candidates =
+			self.locality_candidates_for_tenant(tenant_id, start_locality, end_locality);
+		let mut out = Vec::with_capacity(candidates.len());
+		for (_locality, key_identity) in candidates {
+			let Some(versions) = self.key_index.get(&(tenant_id, key_identity)) else {
+				continue;
+			};
+			if let Some(location) = newest_version_as_of(versions.value(), as_of_hlc) {
+				out.push((key_identity, location));
+			}
+		}
+		out
 	}
 
 	/// Every retained version whose identity projects into the
@@ -1032,13 +1250,13 @@ impl SlabManager {
 			cursor_identity != Identity::ZERO || cursor_hlc != bytemuck::Zeroable::zeroed();
 		let cursor_locality = Locality::from(cursor_identity);
 		let mut out: Vec<(TenantId, Identity, RecordLocation)> = Vec::new();
-		for entry in self.key_index.iter() {
-			let (tenant_id, key_identity) = *entry.key();
-			let locality = Locality::from(key_identity);
-			if locality < start_locality || locality > end_locality {
+		for (tenant_id, locality, key_identity) in
+			self.locality_candidates_for_all_tenants(start_locality, end_locality)
+		{
+			let Some(versions) = self.key_index.get(&(tenant_id, key_identity)) else {
 				continue;
-			}
-			for loc in entry.value().iter() {
+			};
+			for loc in versions.value().iter() {
 				if loc.hlc < migration_hlc_floor {
 					continue;
 				}
@@ -1237,6 +1455,47 @@ impl SlabManager {
 		}
 		Ok(report)
 	}
+
+	pub async fn prune_versions_older_than(
+		&self,
+		retention_floor: HybridTimestamp,
+		max_slabs: usize,
+	) -> std::io::Result<RetentionPruningReport> {
+		if max_slabs == 0 {
+			return Ok(RetentionPruningReport::default());
+		}
+
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+
+		let mut report = RetentionPruningReport::default();
+		for (slab_id, slab) in sealed {
+			if report.compacted_slabs >= max_slabs {
+				break;
+			}
+			if let Some(outcome) = self
+				.prune_one_sealed_slab(slab_id, slab, retention_floor)
+				.await?
+			{
+				report.compacted_slabs += 1;
+				report.pruned_versions = report
+					.pruned_versions
+					.saturating_add(outcome.reclaimed_records);
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		Ok(report)
+	}
 }
 
 /// Authoritative location for a slab, as observed by the read
@@ -1274,8 +1533,20 @@ impl StorageEngine for SlabManager {
 	async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
 		let location = self.relocate_read_location(location);
 		match self.resolve_backing(location.slab_id).await {
-			SlabBacking::Local(slab) => slab.read(location).await,
-			SlabBacking::L2(pointer) => self.read_from_l2(&pointer, location).await,
+			SlabBacking::Local(slab) => {
+				let started = Instant::now();
+				let result = slab.read(location).await;
+				metrics().l1_read_latency_seconds.observe_duration(started.elapsed());
+				result
+			}
+			SlabBacking::L2(pointer) => {
+				let started = Instant::now();
+				let result = self.read_from_l2(&pointer, location).await;
+				metrics()
+					.l2_range_read_latency_seconds
+					.observe_duration(started.elapsed());
+				result
+			}
 			SlabBacking::Missing => Err(Error::new(
 				ErrorKind::NotFound,
 				format!("no slab with id {} under this manager", location.slab_id),
@@ -1301,6 +1572,45 @@ impl StorageEngine for SlabManager {
 }
 
 impl SlabManager {
+	fn locality_candidates_for_tenant(
+		&self,
+		tenant_id: TenantId,
+		start_locality: Locality,
+		end_locality: Locality,
+	) -> Vec<(Locality, Identity)> {
+		self.locality_index
+			.read()
+			.expect("locality index lock poisoned")
+			.get(&tenant_id)
+			.map(|members| {
+				members
+					.range((start_locality, Identity::ZERO)..=(end_locality, IDENTITY_MAX))
+					.copied()
+					.collect()
+			})
+			.unwrap_or_default()
+	}
+
+	fn locality_candidates_for_all_tenants(
+		&self,
+		start_locality: Locality,
+		end_locality: Locality,
+	) -> Vec<(TenantId, Locality, Identity)> {
+		let locality_index = self
+			.locality_index
+			.read()
+			.expect("locality index lock poisoned");
+		let mut out = Vec::new();
+		for (tenant_id, members) in locality_index.iter() {
+			out.extend(
+				members
+					.range((start_locality, Identity::ZERO)..=(end_locality, IDENTITY_MAX))
+					.map(|(locality, key_identity)| (*tenant_id, *locality, *key_identity)),
+			);
+		}
+		out
+	}
+
 	fn persistent_record_rows_snapshot(&self) -> Vec<PersistentRecordRow> {
 		let mut rows = Vec::new();
 		for entry in self.key_index.iter() {
@@ -1539,10 +1849,51 @@ impl SlabManager {
 		Ok(())
 	}
 
-	async fn recover_tiered_rows_from_l2(
+	async fn delete_tiered_slab_strict(
+		&self,
+		slab_id: SlabId,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(());
+		};
+		let mut rows = self.persistent_record_rows_snapshot();
+		rows.retain(|row| row.location.slab_id != slab_id);
+		let mut tiered = self.tiered_pointers_snapshot().await;
+		tiered.retain(|entry| entry.slab_id != slab_id);
+		index.rebuild(rows, tiered, last_control_log_index).await
+	}
+
+	fn record_rows_for_slab(&self, slab_id: SlabId) -> Vec<PersistentRecordRow> {
+		let mut rows = Vec::new();
+		for entry in self.key_index.iter() {
+			let (tenant_id, key_identity) = *entry.key();
+			for location in entry.value().iter() {
+				if location.slab_id == slab_id {
+					rows.push(PersistentRecordRow {
+						tenant_id,
+						key_identity,
+						location: *location,
+					});
+				}
+			}
+		}
+		rows.sort_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+			)
+		});
+		rows
+	}
+
+	async fn tiered_plaintext_from_l2(
 		&self,
 		pointer: &TieredSlabPointer,
-	) -> std::io::Result<()> {
+	) -> std::io::Result<Vec<u8>> {
 		let l2 = self.config.l2.clone().ok_or_else(|| {
 			Error::new(
 				ErrorKind::NotFound,
@@ -1554,16 +1905,80 @@ impl SlabManager {
 		})?;
 		let blob = l2.get(&pointer.l2_uri).await?;
 		validate_tiered_blob(pointer, &blob)?;
-		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob)?;
-		let recovered_rows = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
+		decode_tiered_blob(self.config.crypto.as_ref(), pointer, &blob)
+	}
+
+	async fn load_tiered_rows_from_l2(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<Vec<PersistentRecordRow>> {
+		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
+		Ok(recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
 			.map(|(tenant_id, key_identity, location)| PersistentRecordRow {
 				tenant_id,
 				key_identity,
 				location,
 			})
-			.collect::<Vec<_>>();
-		for row in &recovered_rows {
+			.collect::<Vec<_>>())
+	}
+
+	async fn build_tiered_row_refresh_plan_from_l2(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<TieredRowRefreshPlan> {
+		let new_rows = self.load_tiered_rows_from_l2(pointer).await?;
+		let old_rows = self.record_rows_for_slab(pointer.slab_id);
+		let mut old_by_slot = HashMap::with_capacity(old_rows.len());
+		for row in &old_rows {
+			old_by_slot
+				.entry((row.tenant_id, row.key_identity, row.location.hlc))
+				.or_insert_with(Vec::new)
+				.push(row.location);
+		}
+		let mut new_by_slot = HashMap::with_capacity(new_rows.len());
+		for row in &new_rows {
+			new_by_slot
+				.entry((row.tenant_id, row.key_identity, row.location.hlc))
+				.or_insert_with(Vec::new)
+				.push(row.location);
+		}
+		let mut relocated_reads = Vec::new();
+		for (slot, old_locations) in old_by_slot {
+			let Some(new_locations) = new_by_slot.remove(&slot) else {
+				continue;
+			};
+			// Retention rewrites preserve surviving rows in append/offset order but
+			// may prune a prefix of older duplicates that share the same HLC. Align
+			// from the tail so the newest duplicate survives the relocation map.
+			let mut slot_relocations = old_locations
+				.into_iter()
+				.rev()
+				.zip(new_locations.into_iter().rev())
+				.filter_map(|(old_location, new_location)| {
+					(old_location != new_location).then_some((old_location, new_location))
+				})
+				.collect::<Vec<_>>();
+			slot_relocations.reverse();
+			relocated_reads.extend(slot_relocations);
+		}
+		relocated_reads
+			.sort_by_key(|(old_location, _)| (old_location.slab_id, old_location.offset));
+		Ok(TieredRowRefreshPlan {
+			old_rows,
+			new_rows,
+			relocated_reads,
+		})
+	}
+
+	async fn apply_tiered_row_refresh_plan(&self, plan: TieredRowRefreshPlan) {
+		if plan.old_rows == plan.new_rows {
+			return;
+		}
+		for row in &plan.old_rows {
+			self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+		}
+		for row in &plan.new_rows {
 			self.key_index
 				.entry((row.tenant_id, row.key_identity))
 				.and_modify(|versions| {
@@ -1572,18 +1987,108 @@ impl SlabManager {
 					}
 				})
 				.or_insert_with(|| vec![row.location]);
+			self.insert_locality_membership(row.tenant_id, row.key_identity);
 		}
-		if !recovered_rows.is_empty() {
-			self.mirror_persistent_update(
-				PersistentIndexUpdate {
-					put_records: recovered_rows,
-					..Default::default()
-				},
-				"tiered-row-recovery",
-			)
-			.await;
+		self.mirror_persistent_update(
+			PersistentIndexUpdate {
+				delete_records: plan.old_rows,
+				put_records: plan.new_rows,
+				..Default::default()
+			},
+			"tiered-row-refresh",
+		)
+		.await;
+	}
+
+	pub(crate) async fn prepare_tiered_retention_rewrite(
+		&self,
+		pointer: &TieredSlabPointer,
+		retention_floor: HybridTimestamp,
+	) -> std::io::Result<Option<PreparedTieredRetentionRewrite>> {
+		let old_blob = self
+			.config
+			.l2
+			.clone()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"cannot rewrite tiered slab {} without an L2 object store",
+						pointer.slab_id
+					),
+				)
+			})?
+			.get(&pointer.l2_uri)
+			.await?;
+		validate_tiered_blob(pointer, &old_blob)?;
+		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, &old_blob)?;
+		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
+			.into_iter()
+			.map(|(tenant_id, key_identity, old_location)| CompactionRecord {
+				tenant_id,
+				key_identity,
+				old_location,
+				reclaim: self.is_retention_prunable(
+					tenant_id,
+					key_identity,
+					old_location,
+					retention_floor,
+				),
+			})
+			.collect::<Vec<_>>();
+		records.sort_by_key(|record| record.old_location.offset);
+		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
+		let survivors = records.iter().filter(|record| !record.reclaim).count();
+		if pruned_versions == 0 {
+			return Ok(None);
 		}
-		Ok(())
+		if survivors == 0 {
+			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
+				slab_id: pointer.slab_id,
+				old_l2_uri: pointer.l2_uri.clone(),
+				pruned_versions,
+				reclaimed_bytes: old_blob.len() as u64,
+			}));
+		}
+
+		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let rewrite_result = async {
+			let rewritten = Arc::new(
+				LocalSlabStore::open(
+					&tmp_path,
+					pointer.slab_id,
+					self.file_ops.clone(),
+					self.config.group_commit.clone(),
+				)
+				.await?,
+			);
+			for record in records.iter().filter(|record| !record.reclaim) {
+				let frame = extract_record_from_blob(&plaintext, record.old_location)?;
+				rewritten
+					.append(
+						record.tenant_id,
+						record.key_identity,
+						record.old_location.hlc,
+						&frame,
+					)
+					.await?;
+			}
+			rewritten.fsync().await?;
+			self.file_ops.read_all(&tmp_path).await
+		}
+		.await;
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let rewritten_plaintext = rewrite_result?;
+		let encrypted = self.encrypt_tiered_object_blob(pointer.slab_id, &rewritten_plaintext)?;
+		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
+			slab_id: pointer.slab_id,
+			old_l2_uri: pointer.l2_uri.clone(),
+			payload_hash: *blake3::hash(&encrypted.bytes).as_bytes(),
+			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
+			pruned_versions,
+			encrypted_bytes: encrypted.bytes,
+		}))
 	}
 
 	async fn reserve_slab_id(&self) -> SlabId {
@@ -1623,17 +2128,82 @@ impl SlabManager {
 			.collect();
 		records.sort_by_key(|record| record.old_location.offset);
 
+		self.compact_sealed_slab_records(slab_id, slab, &records)
+			.await
+	}
+
+	async fn prune_one_sealed_slab(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		retention_floor: HybridTimestamp,
+	) -> std::io::Result<Option<CompactionOutcome>> {
+		let mut records: Vec<CompactionRecord> = slab
+			.index
+			.iter()
+			.flat_map(|entry| {
+				let (tenant_id, key_identity) = *entry.key();
+				entry
+					.value()
+					.iter()
+					.map(move |loc| CompactionRecord {
+						tenant_id,
+						key_identity,
+						old_location: *loc,
+						reclaim: self.is_retention_prunable(
+							tenant_id,
+							key_identity,
+							*loc,
+							retention_floor,
+						),
+					})
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		records.sort_by_key(|record| record.old_location.offset);
+
+		self.compact_sealed_slab_records(slab_id, slab, &records)
+			.await
+	}
+
+	fn is_retention_prunable(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+		retention_floor: HybridTimestamp,
+	) -> bool {
+		let Some(versions) = self.key_index.get(&(tenant_id, key_identity)) else {
+			return false;
+		};
+		let older_versions = versions.partition_point(|stored| stored.hlc < retention_floor);
+		let prune_prefix_len = older_versions.saturating_sub(1);
+		prune_prefix_len > 0
+			&& versions
+				.iter()
+				.take(prune_prefix_len)
+				.any(|stored| *stored == location)
+	}
+
+	async fn compact_sealed_slab_records(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		records: &[CompactionRecord],
+	) -> std::io::Result<Option<CompactionOutcome>> {
 		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
 			return Ok(None);
 		}
 
 		let old_bytes = slab.write_cursor();
+		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
 		if survivors == 0 {
 			self.finish_compaction_without_replacement(slab_id, &records)
 				.await?;
 			return Ok(Some(CompactionOutcome {
 				reclaimed_bytes: old_bytes,
+				reclaimed_records,
 			}));
 		}
 
@@ -1689,6 +2259,7 @@ impl SlabManager {
 
 		Ok(Some(CompactionOutcome {
 			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
+			reclaimed_records,
 		}))
 	}
 
@@ -1994,6 +2565,7 @@ struct RelocatedRecord {
 #[derive(Clone, Copy)]
 struct CompactionOutcome {
 	reclaimed_bytes: u64,
+	reclaimed_records: usize,
 }
 
 // ============================================================
@@ -2161,6 +2733,48 @@ fn rehydrate_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.rehydrate.tmp", slab_id))
 }
 
+fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
+	dir.join(format!("slab_{:016x}.wnd.retention.tmp", slab_id))
+}
+
+fn parse_retention_rewrite_tmp_filename(name: &str) -> Option<SlabId> {
+	let rest = name
+		.strip_prefix("slab_")?
+		.strip_suffix(".wnd.retention.tmp")?;
+	if rest.len() != 16 {
+		return None;
+	}
+	u64::from_str_radix(rest, 16).ok().map(SlabId::new)
+}
+
+async fn cleanup_retention_rewrite_tmp_files(
+	file_ops: &dyn AsyncFileOps,
+	dir: &Path,
+) -> std::io::Result<()> {
+	let mut removed = 0usize;
+	for entry in file_ops.read_dir(dir).await? {
+		if !entry.is_file {
+			continue;
+		}
+		let Some(name) = entry.file_name.to_str() else {
+			continue;
+		};
+		if parse_retention_rewrite_tmp_filename(name).is_none() {
+			continue;
+		}
+		unlink_local_file(file_ops, &dir.join(name)).await?;
+		removed = removed.saturating_add(1);
+	}
+	if removed > 0 {
+		tracing::warn!(
+			dir = %dir.display(),
+			removed_tmp_files = removed,
+			"removed stale tiered retention rewrite temp files during open"
+		);
+	}
+	Ok(())
+}
+
 async fn fsync_parent_dir(file_ops: &dyn AsyncFileOps, path: &Path) -> std::io::Result<()> {
 	let parent = path.parent().ok_or_else(|| {
 		Error::new(
@@ -2237,6 +2851,20 @@ fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<Re
 	}
 }
 
+fn build_locality_index(
+	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
+) -> TenantLocalityMembers {
+	let mut locality_index = TenantLocalityMembers::new();
+	for entry in key_index.iter() {
+		let (tenant_id, key_identity) = *entry.key();
+		locality_index
+			.entry(tenant_id)
+			.or_default()
+			.insert((Locality::from(key_identity), key_identity));
+	}
+	locality_index
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -2308,6 +2936,7 @@ mod tests {
 	async fn force_seal_active(manager: &Arc<SlabManager>) -> SlabId {
 		let mut state = manager.state.lock().await;
 		let sealed = state.active.clone();
+		sealed.fsync().await.unwrap();
 		let sealed_id = sealed.slab_id();
 		let next_id = state.next_slab_id;
 		let next = Arc::new(
@@ -2569,6 +3198,31 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn scan_as_of_scopes_locality_membership_per_tenant() {
+		let mgr = fresh_manager().await;
+		let shared_identity = id(0x55);
+		let locality = Locality::from(shared_identity);
+		let other_tenant = TenantId::new(7);
+
+		mgr.append(tenant(), shared_identity, hlc(10), b"tenant-a")
+			.await
+			.unwrap();
+		mgr.append(other_tenant, shared_identity, hlc(20), b"tenant-b")
+			.await
+			.unwrap();
+
+		let primary = mgr.scan_as_of(tenant(), locality, locality, hlc(30));
+		assert_eq!(primary.len(), 1);
+		assert_eq!(primary[0].0, locality.get());
+		assert_eq!(primary[0].1.hlc.physical_ms, 10);
+
+		let secondary = mgr.scan_as_of(other_tenant, locality, locality, hlc(30));
+		assert_eq!(secondary.len(), 1);
+		assert_eq!(secondary[0].0, locality.get());
+		assert_eq!(secondary[0].1.hlc.physical_ms, 20);
+	}
+
+	#[tokio::test]
 	async fn append_durable_coalesces_concurrent_fdatasyncs() {
 		let mgr = fresh_manager_with_group_commit(GroupCommitConfig {
 			floor: Duration::from_millis(20),
@@ -2687,6 +3341,27 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn cleanup_retention_rewrite_tmp_files_removes_stale_plaintext() {
+		let dir = fresh_dir("retention-tmp-cleanup");
+		let tmp_path = retention_rewrite_tmp_path(&dir, SlabId::new(0x77));
+		std::fs::write(&tmp_path, b"plaintext-leak").unwrap();
+		assert!(
+			tmp_path.exists(),
+			"fixture temp file should exist before open"
+		);
+
+		let file_ops = BlockingFileOps;
+		cleanup_retention_rewrite_tmp_files(&file_ops, &dir)
+			.await
+			.unwrap();
+
+		assert!(
+			!tmp_path.exists(),
+			"startup cleanup should remove stale plaintext retention temp files"
+		);
+	}
+
+	#[tokio::test]
 	async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		let dir = fresh_dir("compaction-redb");
 		let io = spawn_io_thread(64).unwrap();
@@ -2774,5 +3449,76 @@ mod tests {
 			.lookup(tenant(), survivor_key)
 			.expect("survivor should still be indexed after reopen");
 		assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
+	}
+
+	#[tokio::test]
+	async fn retention_pruning_keeps_latest_version_before_floor() {
+		let manager = fresh_manager().await;
+		let key = id(0x4040);
+		manager
+			.append_durable(tenant(), key, hlc(10), b"v10")
+			.await
+			.unwrap();
+		manager
+			.append_durable(tenant(), key, hlc(20), b"v20")
+			.await
+			.unwrap();
+		manager
+			.append_durable(tenant(), key, hlc(30), b"v30")
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		assert_eq!(manager.sealed_count().await, 1);
+
+		let report = manager.prune_versions_older_than(hlc(25), 1).await.unwrap();
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert!(report.reclaimed_bytes > 0);
+
+		let as_of_25 = manager
+			.lookup_as_of(tenant(), key, hlc(25))
+			.expect("anchor version retained");
+		assert_ne!(as_of_25.slab_id, sealed_id);
+		assert_eq!(as_of_25.hlc.physical_ms, 20);
+		assert_eq!(manager.read(as_of_25).await.unwrap(), b"v20");
+
+		let latest = manager.lookup(tenant(), key).expect("latest retained");
+		assert_eq!(latest.hlc.physical_ms, 30);
+		assert_eq!(manager.read(latest).await.unwrap(), b"v30");
+
+		assert!(
+			manager.lookup_as_of(tenant(), key, hlc(15)).is_none(),
+			"versions older than the retained window should be pruned"
+		);
+	}
+
+	#[tokio::test]
+	async fn retention_pruning_keeps_latest_when_all_versions_precede_floor() {
+		let manager = fresh_manager().await;
+		let key = id(0x5050);
+		manager
+			.append_durable(tenant(), key, hlc(10), b"v10")
+			.await
+			.unwrap();
+		manager
+			.append_durable(tenant(), key, hlc(20), b"v20")
+			.await
+			.unwrap();
+		force_seal_active(&manager).await;
+
+		let report = manager
+			.prune_versions_older_than(hlc(100), 1)
+			.await
+			.unwrap();
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+
+		let latest = manager.lookup(tenant(), key).expect("latest retained");
+		assert_eq!(latest.hlc.physical_ms, 20);
+		assert_eq!(manager.read(latest).await.unwrap(), b"v20");
+		assert!(
+			manager.lookup_as_of(tenant(), key, hlc(15)).is_none(),
+			"earlier history should be removed once the full chain is outside retention"
+		);
 	}
 }

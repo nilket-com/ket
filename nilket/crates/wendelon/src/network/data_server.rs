@@ -37,6 +37,7 @@
 //! pending, the cache points at the persisted recovery record
 //! instead of re-running the write from scratch.
 
+use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAuditSink};
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
@@ -68,7 +69,8 @@ use crate::schema::{
 	StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	migration_record_schema, read_key_schema, wpbc, write_payload_schema,
 };
-use crate::storage::core::{RecordLocation, StorageEngine};
+use crate::storage::MvccRetentionPolicy;
+use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
 use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
@@ -377,6 +379,11 @@ pub struct WendelonDataServer {
 	/// Local physical clock used to merge client HLCs into the
 	/// leader's authoritative commit timestamp.
 	clock: Arc<dyn PhysicalClock>,
+	/// Audit sink used for node-local background events such as
+	/// ADR 013 snapshot pruning.
+	audit_sink: Arc<dyn AuditSink>,
+	/// ADR 013 retention policy for MVCC history.
+	mvcc_retention_policy: MvccRetentionPolicy,
 	/// Resolves a routing locality to the replica set that should hold
 	/// it. Injected so the projection source (Unified Hash Ring
 	/// snapshot, static dev topology, test mock) is the caller's
@@ -499,6 +506,8 @@ impl Clone for WendelonDataServer {
 			state_machine: self.state_machine.clone(),
 			local_node: self.local_node,
 			clock: self.clock.clone(),
+			audit_sink: self.audit_sink.clone(),
+			mvcc_retention_policy: self.mvcc_retention_policy,
 			router: self.router.clone(),
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
@@ -542,6 +551,8 @@ impl WendelonDataServer {
 			state_machine,
 			local_node,
 			clock,
+			audit_sink: Arc::new(NoopAuditSink),
+			mvcc_retention_policy: MvccRetentionPolicy::Disabled,
 			router,
 			factory,
 			pool,
@@ -603,6 +614,73 @@ impl WendelonDataServer {
 	pub fn with_hlc(mut self, hlc: Arc<HybridLogicalClockDriver>) -> Self {
 		self.hlc = hlc;
 		self
+	}
+
+	pub fn with_audit_sink(mut self, audit_sink: Arc<dyn AuditSink>) -> Self {
+		self.audit_sink = audit_sink;
+		self
+	}
+
+	pub fn with_mvcc_retention_policy(mut self, retention_policy: MvccRetentionPolicy) -> Self {
+		self.mvcc_retention_policy = retention_policy;
+		self
+	}
+
+	pub fn with_mvcc_retention_window(mut self, retention_window: Option<Duration>) -> Self {
+		self.mvcc_retention_policy = MvccRetentionPolicy::from_optional_window(retention_window);
+		self
+	}
+
+	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
+		let window = self.mvcc_retention_policy.window()?;
+		let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+		Some(HybridTimestamp {
+			physical_ms: self.clock.now_ms().saturating_sub(window_ms),
+			logical: 0,
+			node_id: 0,
+		})
+	}
+
+	fn snapshot_request_outside_retention(&self, as_of_hlc: HybridTimestamp) -> bool {
+		snapshot_request_outside_retention(as_of_hlc, self.mvcc_retention_floor_hlc())
+	}
+
+	async fn reclaim_mvcc_retention_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<crate::storage::manager::RetentionPruningReport> {
+		let Some(retention_floor) = self.mvcc_retention_floor_hlc() else {
+			return Ok(crate::storage::manager::RetentionPruningReport::default());
+		};
+		let report = self
+			.slab
+			.prune_versions_older_than(retention_floor, max_slabs)
+			.await?;
+		if report.pruned_versions > 0 {
+			let audit = AuditEvent::new(
+				AuditAuthority::NodeLocal,
+				AuditOperation::MvccSnapshotPruned,
+				self.local_node,
+				format!(
+					"retention_floor_ms={} compacted_slabs={} pruned_versions={} reclaimed_bytes={}",
+					retention_floor.physical_ms,
+					report.compacted_slabs,
+					report.pruned_versions,
+					report.reclaimed_bytes,
+				),
+			)
+			.with_parameter("retention_floor_ms", retention_floor.physical_ms)
+			.with_parameter("compacted_slabs", report.compacted_slabs as u64)
+			.with_parameter("pruned_versions", report.pruned_versions as u64)
+			.with_parameter("reclaimed_bytes", report.reclaimed_bytes);
+			if let Err(err) = self.audit_sink.emit(audit) {
+				tracing::warn!(
+					error = %err,
+					"mvcc retention prune audit emission failed"
+				);
+			}
+		}
+		Ok(report)
 	}
 
 	pub async fn sync_tenant_policy_cache_once(&self) -> usize {
@@ -1436,6 +1514,12 @@ impl WendelonDataServer {
 						"migration sweeper reclaim pass failed; will retry on next tick"
 					);
 				}
+				if let Err(err) = self.reclaim_mvcc_retention_once(1).await {
+					tracing::warn!(
+						error = %err,
+						"migration sweeper MVCC retention pass failed; will retry on next tick"
+					);
+				}
 
 				ticker.tick().await;
 			}
@@ -1879,7 +1963,7 @@ impl WendelonDataServer {
 			.prepare_query_execution_plan_with_migration(&meta, &bytecode)
 			.await?;
 
-		if plan.response.status != ReadStatus::OK || plan.locations.is_empty() {
+		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 			let response = self.build_query_response_frame(
 				frame.header.stream_id,
 				plan.response,
@@ -1891,15 +1975,31 @@ impl WendelonDataServer {
 			return Ok(());
 		}
 
-		for (index, location) in plan.locations.iter().copied().enumerate() {
-			let batch = materialize_query_batch(&self.slab, location, &bytecode).await?;
-			let arrow = encode_batch(&batch)?;
-			let is_last = index + 1 == plan.locations.len();
+		let QueryExecutionPlan {
+			response,
+			batches,
+			deadline,
+		} = plan;
+		let Some(encoded_batches) = encode_query_stream_batches_with_deadline(batches, deadline)?
+		else {
+			let response = self.build_query_response_frame(
+				frame.header.stream_id,
+				query_error_meta(&meta, ReadStatus::QUERY_BUDGET_EXCEEDED, self.local_node),
+				None,
+				FRAME_FLAG_STREAM_END,
+			);
+			write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
+			stream.finish().await?;
+			return Ok(());
+		};
+		let batch_count = encoded_batches.len();
+		for (index, arrow) in encoded_batches.into_iter().enumerate() {
+			let is_last = index + 1 == batch_count;
 			let flags = if is_last { FRAME_FLAG_STREAM_END } else { 0 };
 			if index == 0 {
 				let response = QueryResponseMeta {
 					arrow_len: arrow.len() as u32,
-					..plan.response
+					..response
 				};
 				let meta_bytes = bytemuck::bytes_of(&response);
 				let header = FrameHeader {
@@ -2567,22 +2667,20 @@ impl WendelonDataServer {
 		let plan = self
 			.prepare_query_execution_plan_with_migration(meta, bytecode)
 			.await?;
-		if plan.response.status != ReadStatus::OK || plan.locations.is_empty() {
+		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 			return Ok((plan.response, None));
 		}
 
-		let mut filtered = Vec::with_capacity(plan.locations.len());
-		for location in plan.locations {
-			filtered.push(materialize_query_batch(&self.slab, location, bytecode).await?);
-		}
-
-		let schema = filtered[0].schema();
-		let concatenated = concat_batches(&schema, &filtered)
+		let QueryExecutionPlan {
+			response, batches, ..
+		} = plan;
+		let schema = batches[0].schema();
+		let concatenated = concat_batches(&schema, &batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
 		let arrow_bytes = encode_batch(&concatenated)?;
 		let response = QueryResponseMeta {
 			arrow_len: arrow_bytes.len() as u32,
-			..plan.response
+			..response
 		};
 		Ok((response, Some(arrow_bytes)))
 	}
@@ -2598,16 +2696,14 @@ impl WendelonDataServer {
 		// highest one the SM has observed an E_safe advance for.
 		let current_epoch = sm_peek.e_safe_watermarks.keys().copied().max().unwrap_or(0);
 		if meta.expected_epoch < current_epoch {
-			return Ok(QueryExecutionPlan {
-				response: query_error_meta(meta, ReadStatus::EPOCH_STALE, self.local_node),
-				locations: Vec::new(),
-			});
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::EPOCH_STALE,
+				self.local_node,
+			));
 		}
 		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
-			return Ok(QueryExecutionPlan {
-				response: query_error_meta(meta, status, self.local_node),
-				locations: Vec::new(),
-			});
+			return Ok(query_plan_error(meta, status, self.local_node));
 		}
 
 		// Gate #2: LINEARIZABLE watermark. The scan (and any
@@ -2625,11 +2721,19 @@ impl WendelonDataServer {
 					node_id: 0,
 				});
 			if watermark < meta.min_hlc {
-				return Ok(QueryExecutionPlan {
-					response: query_error_meta(meta, ReadStatus::E_SAFE_BEHIND, self.local_node),
-					locations: Vec::new(),
-				});
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::E_SAFE_BEHIND,
+					self.local_node,
+				));
 			}
+		}
+		if self.snapshot_request_outside_retention(meta.as_of_hlc) {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::RETENTION_EXPIRED,
+				self.local_node,
+			));
 		}
 
 		let pending: Vec<MigrationLedgerEntry> = sm_peek
@@ -2654,23 +2758,22 @@ impl WendelonDataServer {
 				// window. Surface it explicitly so clients retry
 				// rather than downgrading to a possibly-partial
 				// local answer.
-				return Ok(QueryExecutionPlan {
-					response: query_error_meta(
-						meta,
-						ReadStatus::MIGRATION_INCOMPLETE,
-						self.local_node,
-					),
-					locations: Vec::new(),
-				});
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::MIGRATION_INCOMPLETE,
+					self.local_node,
+				));
 			}
 		}
 
-		plan_query_execution(
+		plan_query_execution_with_budget_and_retention_floor(
 			&self.slab,
 			&self.state_machine,
 			self.local_node,
 			meta,
 			bytecode,
+			QueryExecutionBudget::default(),
+			self.mvcc_retention_floor_hlc(),
 		)
 		.await
 	}
@@ -3383,6 +3486,13 @@ impl DataRing for WendelonDataServer {
 			}
 		}
 
+		if self.snapshot_request_outside_retention(meta.as_of_hlc) {
+			return Ok((
+				error_read_response(&meta, ReadStatus::RETENTION_EXPIRED, self.local_node),
+				None,
+			));
+		}
+
 		let (location, bytes) =
 			match self
 				.slab
@@ -3554,23 +3664,68 @@ impl DataRing for WendelonDataServer {
 #[derive(Clone, Debug)]
 struct QueryExecutionPlan {
 	response: QueryResponseMeta,
-	locations: Vec<RecordLocation>,
+	batches: Vec<RecordBatch>,
+	deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueryRecordLocation {
+	identity: Identity,
+	locality: Locality,
+	location: RecordLocation,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueryExecutionBudget {
+	max_locations: usize,
+	max_rows: u64,
+	max_wall_time: Duration,
+}
+
+impl Default for QueryExecutionBudget {
+	fn default() -> Self {
+		Self {
+			max_locations: 4_096,
+			max_rows: 65_536,
+			max_wall_time: Duration::from_millis(250),
+		}
+	}
+}
+
+#[derive(Debug)]
+enum QueryBatchMaterializationError {
+	Io(std::io::Error),
+	InvalidProgram,
+	BudgetExceeded,
+}
+
+fn snapshot_request_outside_retention(
+	as_of_hlc: HybridTimestamp,
+	retention_floor: Option<HybridTimestamp>,
+) -> bool {
+	retention_floor.is_some_and(|floor| !is_zero_hlc(as_of_hlc) && as_of_hlc < floor)
+}
+
+fn query_deadline_exceeded(deadline: Instant) -> bool {
+	Instant::now() > deadline
 }
 
 /// Plan a [`QueryRequestMeta`] + WPBC program against a local
 /// [`SlabManager`] without concatenating the full result set.
 ///
-/// The returned plan contains the stable set of slab locations to
-/// revisit during response streaming plus the final response meta
-/// fields that are independent of Arrow framing. The caller is free
-/// to stream each location's filtered batch separately or to
-/// concatenate them for unary compatibility.
-async fn plan_query_execution(
+/// The returned plan caches the filtered batches discovered during
+/// planning plus the final response meta fields that are independent
+/// of Arrow framing. Streaming and unary callers can then reuse the
+/// same decoded / filtered batches instead of re-reading each slab
+/// location a second time.
+async fn plan_query_execution_with_budget_and_retention_floor(
 	slab: &SlabManager,
 	state_machine: &WendelonStateMachine,
 	local_node: NodeId,
 	meta: &QueryRequestMeta,
 	bytecode: &[u8],
+	budget: QueryExecutionBudget,
+	retention_floor: Option<HybridTimestamp>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	// 1. Epoch staleness. The authoritative epoch is the highest
 	// one the SM has observed an E_safe advance for; a client
@@ -3579,10 +3734,7 @@ async fn plan_query_execution(
 	let sm = state_machine.state_snapshot().await;
 	let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
 	if meta.expected_epoch < current_epoch {
-		return Ok(QueryExecutionPlan {
-			response: query_error_meta(meta, ReadStatus::EPOCH_STALE, local_node),
-			locations: Vec::new(),
-		});
+		return Ok(query_plan_error(meta, ReadStatus::EPOCH_STALE, local_node));
 	}
 
 	// 2. LINEARIZABLE gate — the scan is only authoritative once
@@ -3599,11 +3751,20 @@ async fn plan_query_execution(
 				node_id: 0,
 			});
 		if watermark < meta.min_hlc {
-			return Ok(QueryExecutionPlan {
-				response: query_error_meta(meta, ReadStatus::E_SAFE_BEHIND, local_node),
-				locations: Vec::new(),
-			});
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::E_SAFE_BEHIND,
+				local_node,
+			));
 		}
+	}
+
+	if snapshot_request_outside_retention(meta.as_of_hlc, retention_floor) {
+		return Ok(query_plan_error(
+			meta,
+			ReadStatus::RETENTION_EXPIRED,
+			local_node,
+		));
 	}
 
 	// 3. Compile WPBC once so per-row evaluation skips repeated
@@ -3611,39 +3772,109 @@ async fn plan_query_execution(
 	// `wpbc::execute` already does this internally per call, but
 	// we mirror the pattern so a follow-up that batches rows can
 	// lift the compile out of the loop without touching semantics.
-	let scanned = slab.scan_as_of(
+	let program = match wpbc::Program::compile(bytecode) {
+		Ok(program) => program,
+		Err(_) => {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_INVALID_PROGRAM,
+				local_node,
+			));
+		}
+	};
+	let scanned = slab.scan_as_of_with_identity(
 		meta.tenant_id,
 		Locality::new(meta.locality_range_start),
 		Locality::new(meta.locality_range_end),
 		meta.as_of_hlc,
 	);
-	let mut included = Vec::new();
+	let mut batches = Vec::new();
 	let mut rows = 0u64;
+	let mut scanned_locations = 0usize;
+	let started_at = Instant::now();
+	let deadline = started_at + budget.max_wall_time;
 	let mut max_hlc = HybridTimestamp {
 		physical_ms: 0,
 		logical: 0,
 		node_id: 0,
 	};
-	for (_key_identity, location) in scanned {
-		let result = materialize_query_batch(slab, location, bytecode).await?;
+	for (key_identity, location) in scanned {
+		if started_at.elapsed() > budget.max_wall_time {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		// Wall-time is enforced between locations, not in the middle of one.
+		// We pair that with a hard per-location row cap during batch
+		// materialization so one oversized slab cannot burn unbounded WPBC
+		// row-eval time before the next deadline check. If future opcodes grow
+		// into unbounded aggregates/joins, revisit this bound.
+		scanned_locations = scanned_locations.saturating_add(1);
+		if scanned_locations > budget.max_locations {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		let query_record = QueryRecordLocation {
+			identity: key_identity,
+			locality: Locality::from(key_identity),
+			location,
+		};
+		let result = match materialize_query_batch_with_program(
+			slab,
+			query_record,
+			&program,
+			budget.max_rows,
+		)
+		.await
+		{
+			Ok(result) => result,
+			Err(QueryBatchMaterializationError::Io(err)) => return Err(err),
+			Err(QueryBatchMaterializationError::InvalidProgram) => {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					local_node,
+				));
+			}
+			Err(QueryBatchMaterializationError::BudgetExceeded) => {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+		};
 		if result.num_rows() == 0 {
 			continue;
 		}
-		if location.hlc > max_hlc {
-			max_hlc = location.hlc;
+		if query_record.location.hlc > max_hlc {
+			max_hlc = query_record.location.hlc;
 		}
-		rows += result.num_rows() as u64;
-		included.push(location);
+		rows = rows.saturating_add(result.num_rows() as u64);
+		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		batches.push(result);
 	}
 
 	// 4. Empty result is a legitimate answer. Clients map
 	// KEY_NOT_FOUND to an empty batch on the receive side, so we
 	// avoid the cost of encoding a zero-row stream.
-	if included.is_empty() {
-		return Ok(QueryExecutionPlan {
-			response: query_error_meta(meta, ReadStatus::KEY_NOT_FOUND, local_node),
-			locations: Vec::new(),
-		});
+	if batches.is_empty() {
+		return Ok(query_plan_error(
+			meta,
+			ReadStatus::KEY_NOT_FOUND,
+			local_node,
+		));
 	}
 
 	Ok(QueryExecutionPlan {
@@ -3657,18 +3888,57 @@ async fn plan_query_execution(
 			arrow_len: 0,
 			_pad2: [0; 4],
 		},
-		locations: included,
+		batches,
+		deadline,
 	})
 }
 
-async fn materialize_query_batch(
+fn encode_query_stream_batches_with_deadline(
+	batches: Vec<RecordBatch>,
+	deadline: Instant,
+) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+	// Preserve the query protocol's all-or-nothing status model by
+	// finishing Arrow serialization before the first QUERY_RESP frame.
+	// Once the first frame is on the wire, continuations have no
+	// status surface for QUERY_BUDGET_EXCEEDED.
+	let mut encoded = Vec::with_capacity(batches.len());
+	for batch in batches {
+		if query_deadline_exceeded(deadline) {
+			return Ok(None);
+		}
+		let arrow = encode_batch(&batch)?;
+		if query_deadline_exceeded(deadline) {
+			return Ok(None);
+		}
+		encoded.push(arrow);
+	}
+	Ok(Some(encoded))
+}
+
+async fn materialize_query_batch_with_program(
 	slab: &SlabManager,
-	location: RecordLocation,
-	bytecode: &[u8],
-) -> std::io::Result<RecordBatch> {
-	let bytes: Vec<u8> = slab.read(location).await?;
-	let batch = decode_batch(&bytes)?;
-	wpbc::execute(bytecode, &batch)
+	record: QueryRecordLocation,
+	program: &wpbc::Program,
+	max_rows_per_location: u64,
+) -> Result<RecordBatch, QueryBatchMaterializationError> {
+	let bytes: Vec<u8> = slab
+		.read(record.location)
+		.await
+		.map_err(QueryBatchMaterializationError::Io)?;
+	let batch = decode_batch(&bytes).map_err(QueryBatchMaterializationError::Io)?;
+	let max_rows_per_location = usize::try_from(max_rows_per_location).unwrap_or(usize::MAX);
+	if batch.num_rows() > max_rows_per_location {
+		return Err(QueryBatchMaterializationError::BudgetExceeded);
+	}
+	wpbc::execute_program_with_context(
+		program,
+		&batch,
+		Some(wpbc::ExecutionContext {
+			identity: record.identity,
+			locality: record.locality,
+		}),
+	)
+	.map_err(|_| QueryBatchMaterializationError::InvalidProgram)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3687,18 +3957,44 @@ pub(crate) async fn execute_query_plan(
 	meta: &QueryRequestMeta,
 	bytecode: &[u8],
 ) -> std::io::Result<(QueryResponseMeta, Option<Vec<u8>>)> {
-	let plan = plan_query_execution(slab, state_machine, local_node, meta, bytecode).await?;
-	if plan.response.status != ReadStatus::OK || plan.locations.is_empty() {
+	execute_query_plan_with_budget_and_retention_floor(
+		slab,
+		state_machine,
+		local_node,
+		meta,
+		bytecode,
+		QueryExecutionBudget::default(),
+		None,
+	)
+	.await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn execute_query_plan_with_budget_and_retention_floor(
+	slab: &SlabManager,
+	state_machine: &WendelonStateMachine,
+	local_node: NodeId,
+	meta: &QueryRequestMeta,
+	bytecode: &[u8],
+	budget: QueryExecutionBudget,
+	retention_floor: Option<HybridTimestamp>,
+) -> std::io::Result<(QueryResponseMeta, Option<Vec<u8>>)> {
+	let plan = plan_query_execution_with_budget_and_retention_floor(
+		slab,
+		state_machine,
+		local_node,
+		meta,
+		bytecode,
+		budget,
+		retention_floor,
+	)
+	.await?;
+	if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 		return Ok((plan.response, None));
 	}
 
-	let mut filtered = Vec::with_capacity(plan.locations.len());
-	for location in plan.locations {
-		filtered.push(materialize_query_batch(slab, location, bytecode).await?);
-	}
-
-	let schema = filtered[0].schema();
-	let concatenated = concat_batches(&schema, &filtered)
+	let schema = plan.batches[0].schema();
+	let concatenated = concat_batches(&schema, &plan.batches)
 		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
 	let arrow_bytes = encode_batch(&concatenated)?;
 	let response = QueryResponseMeta {
@@ -3706,6 +4002,18 @@ pub(crate) async fn execute_query_plan(
 		..plan.response
 	};
 	Ok((response, Some(arrow_bytes)))
+}
+
+fn query_plan_error(
+	meta: &QueryRequestMeta,
+	status: ReadStatus,
+	local_node: NodeId,
+) -> QueryExecutionPlan {
+	QueryExecutionPlan {
+		response: query_error_meta(meta, status, local_node),
+		batches: Vec::new(),
+		deadline: Instant::now(),
+	}
 }
 
 /// Sentinel zero-valued [`NodeId`]. [`NodeId`] doesn't implement
@@ -4180,7 +4488,11 @@ fn format_bytes_hex(bytes: &[u8]) -> String {
 mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
-	use crate::schema::wpbc::{OP_AND, OP_GTE, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT};
+	use crate::schema::wpbc::{
+		OP_AND, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_PROJECT,
+		OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_RANGE_LOCALITY,
+		OP_ROUTE_BY_LOCALITY,
+	};
 	use crate::schema::write_payload_schema;
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
@@ -4214,6 +4526,21 @@ mod tests {
 		keys.append_value(key);
 		let mut values = LargeBinaryBuilder::new();
 		values.append_value(value);
+		RecordBatch::try_new(
+			schema,
+			vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+		)
+		.unwrap()
+	}
+
+	fn wide_kv_batch(row_count: usize) -> RecordBatch {
+		let schema = Arc::new(write_payload_schema());
+		let mut keys = LargeBinaryBuilder::new();
+		let mut values = LargeBinaryBuilder::new();
+		for row in 0..row_count {
+			keys.append_value(format!("k{row}").as_bytes());
+			values.append_value(format!("v{row}").as_bytes());
+		}
 		RecordBatch::try_new(
 			schema,
 			vec![Arc::new(keys.finish()), Arc::new(values.finish())],
@@ -4389,6 +4716,30 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn query_as_of_older_than_retention_window_returns_retention_expired() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(90, 0, 1), b"a", b"va").await;
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(50, 0, 1);
+		let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+			&mgr,
+			&sm,
+			n(1),
+			&meta,
+			&[],
+			QueryExecutionBudget::default(),
+			Some(hlc(80, 0, 1)),
+		)
+		.await
+		.unwrap();
+		assert_eq!(resp.status, ReadStatus::RETENTION_EXPIRED);
+		assert_eq!(resp.rows, 0);
+		assert!(arrow.is_none());
+	}
+
+	#[tokio::test]
 	async fn linearizable_gate_fires_when_watermark_behind() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"k", b"v").await;
@@ -4507,6 +4858,202 @@ mod tests {
 		let batch = decode_batch(&arrow.unwrap()).unwrap();
 		assert_eq!(batch.num_columns(), 1);
 		assert_eq!(batch.schema().field(0).name(), "key");
+	}
+
+	#[tokio::test]
+	async fn typed_identity_wpbc_filters_by_record_identity() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_LOAD_IDENTITY);
+		bytecode.push(OP_PUSH_IDENTITY);
+		bytecode.extend_from_slice(id(2).as_bytes());
+		bytecode.push(OP_EQ_IDENTITY);
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.bytecode_len = bytecode.len() as u32;
+		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+			.await
+			.unwrap();
+		assert_eq!(resp.status, ReadStatus::OK);
+		assert_eq!(resp.rows, 1);
+		let batch = decode_batch(&arrow.unwrap()).unwrap();
+		assert_eq!(extract_first_binary(&batch, "key").unwrap(), b"b");
+	}
+
+	#[tokio::test]
+	async fn typed_locality_wpbc_filters_by_routing_projection() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+		seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"vc").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_ROUTE_BY_LOCALITY);
+		bytecode.push(OP_PUSH_LOCALITY);
+		bytecode.extend_from_slice(&2_u64.to_le_bytes());
+		bytecode.push(OP_PUSH_LOCALITY);
+		bytecode.extend_from_slice(&2_u64.to_le_bytes());
+		bytecode.push(OP_RANGE_LOCALITY);
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.bytecode_len = bytecode.len() as u32;
+		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+			.await
+			.unwrap();
+		assert_eq!(resp.status, ReadStatus::OK);
+		assert_eq!(resp.rows, 1);
+		let batch = decode_batch(&arrow.unwrap()).unwrap();
+		assert_eq!(extract_first_binary(&batch, "key").unwrap(), b"b");
+	}
+
+	#[tokio::test]
+	async fn typed_identity_range_wpbc_uses_byte_exact_bounds() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+		seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"vc").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_LOAD_IDENTITY);
+		bytecode.push(OP_PUSH_IDENTITY);
+		bytecode.extend_from_slice(id(2).as_bytes());
+		bytecode.push(OP_PUSH_IDENTITY);
+		bytecode.extend_from_slice(id(3).as_bytes());
+		bytecode.push(OP_HASH_RANGE_IDENTITY);
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.bytecode_len = bytecode.len() as u32;
+		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+			.await
+			.unwrap();
+		assert_eq!(resp.status, ReadStatus::OK);
+		assert_eq!(resp.rows, 2);
+		let batch = decode_batch(&arrow.unwrap()).unwrap();
+		assert_eq!(batch.num_rows(), 2);
+	}
+
+	#[tokio::test]
+	async fn invalid_wpbc_returns_structured_query_status() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.bytecode_len = 1;
+		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &[0x7F])
+			.await
+			.unwrap();
+		assert_eq!(resp.status, ReadStatus::QUERY_INVALID_PROGRAM);
+		assert_eq!(resp.rows, 0);
+		assert_eq!(resp.arrow_len, 0);
+		assert!(arrow.is_none());
+	}
+
+	#[tokio::test]
+	async fn query_budget_exceeded_returns_structured_status() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+
+		let sm = WendelonStateMachine::new();
+		let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+			&mgr,
+			&sm,
+			n(1),
+			&base_meta(),
+			&[],
+			QueryExecutionBudget {
+				max_locations: 1,
+				max_rows: 10,
+				max_wall_time: Duration::from_secs(1),
+			},
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(resp.status, ReadStatus::QUERY_BUDGET_EXCEEDED);
+		assert_eq!(resp.rows, 0);
+		assert_eq!(resp.arrow_len, 0);
+		assert!(arrow.is_none());
+	}
+
+	#[tokio::test]
+	async fn query_budget_counts_scanned_locations_even_when_filter_rejects_rows() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
+		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_LOAD_IDENTITY);
+		bytecode.push(OP_PUSH_IDENTITY);
+		bytecode.extend_from_slice(id(99).as_bytes());
+		bytecode.push(OP_EQ_IDENTITY);
+
+		let sm = WendelonStateMachine::new();
+		let mut meta = base_meta();
+		meta.bytecode_len = bytecode.len() as u32;
+		let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+			&mgr,
+			&sm,
+			n(1),
+			&meta,
+			&bytecode,
+			QueryExecutionBudget {
+				max_locations: 1,
+				max_rows: 10,
+				max_wall_time: Duration::from_secs(1),
+			},
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(resp.status, ReadStatus::QUERY_BUDGET_EXCEEDED);
+		assert_eq!(resp.rows, 0);
+		assert!(arrow.is_none());
+	}
+
+	#[tokio::test]
+	async fn query_budget_exceeded_when_single_location_batch_exceeds_row_cap() {
+		let mgr = make_manager().await;
+		let bytes = encode_batch(&wide_kv_batch(11)).unwrap();
+		mgr.append(tenant(), id(1), hlc(1, 0, 1), &bytes)
+			.await
+			.unwrap();
+
+		let sm = WendelonStateMachine::new();
+		let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+			&mgr,
+			&sm,
+			n(1),
+			&base_meta(),
+			&[],
+			QueryExecutionBudget {
+				max_locations: 10,
+				max_rows: 10,
+				max_wall_time: Duration::from_secs(1),
+			},
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(resp.status, ReadStatus::QUERY_BUDGET_EXCEEDED);
+		assert_eq!(resp.rows, 0);
+		assert_eq!(resp.arrow_len, 0);
+		assert!(arrow.is_none());
+	}
+
+	#[test]
+	fn stream_preflight_encode_respects_deadline() {
+		let expired = Instant::now() - Duration::from_millis(1);
+		let encoded =
+			encode_query_stream_batches_with_deadline(vec![single_kv_batch()], expired).unwrap();
+		assert!(encoded.is_none());
 	}
 
 	// ========================================================

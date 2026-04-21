@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use uuid::Uuid;
+use wendelon::audit::AuditSinksConfig;
 use wendelon::network::{
 	ActorRole, BufPool, EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet,
 	PeerCapabilities, QuicTransportProvider, TcpTlsTransportProvider, TlsMaterial,
@@ -109,7 +110,9 @@ fn bootstrap_cfg(
 			cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
 		}),
 		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
+		mvcc_retention_policy: wendelon::storage::MvccRetentionPolicy::Disabled,
 		observability: None,
+		audit: AuditSinksConfig::default(),
 	}
 }
 

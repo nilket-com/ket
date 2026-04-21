@@ -5,6 +5,7 @@ use arrow::array::LargeBinaryBuilder;
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use wendelon::audit::AuditSinksConfig;
 use wendelon::network::traits::DataRing;
 use wendelon::network::{
 	LeaseAuthority, dev_lease_signing_secret, dev_transfer_signing_secret,
@@ -101,7 +102,9 @@ fn bootstrap_cfg(
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),
 		transport_tls: None,
 		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
+		mvcc_retention_policy: wendelon::storage::MvccRetentionPolicy::Disabled,
 		observability: None,
+		audit: AuditSinksConfig::default(),
 	}
 }
 

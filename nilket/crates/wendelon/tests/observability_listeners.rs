@@ -128,6 +128,14 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 		metrics.contains("wendelon_metrics_scrapes_total"),
 		"unexpected metrics body: {metrics}"
 	);
+	assert!(
+		metrics.contains("wendelon_raft_membership_epoch 42"),
+		"unexpected metrics body: {metrics}"
+	);
+	assert!(
+		metrics.contains("wendelon_raft_current_leader{leader_id=\"n-01\"} 1"),
+		"unexpected metrics body: {metrics}"
+	);
 
 	let denied = request_mtls(
 		handles.metrics.local_addr,

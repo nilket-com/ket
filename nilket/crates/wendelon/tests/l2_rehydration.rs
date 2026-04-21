@@ -1,9 +1,15 @@
 use async_trait::async_trait;
+use openraft::storage::RaftStateMachine;
+use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
-use wendelon::consensus::{TierObserver, TieredSlab, WendelonStateMachine};
+use tokio::sync::Mutex as AsyncMutex;
+use wendelon::consensus::{
+	RetireTieredSlab, TierObserver, TieredSlab, WendelonRequest, WendelonStateMachine,
+	WendelonTypeConfig,
+};
 use wendelon::crypto::{CryptoManager, test_support};
 use wendelon::schema::{HybridTimestamp, Identity, TenantId};
 use wendelon::storage::{
@@ -112,12 +118,54 @@ impl ObjectStore for CountingObjectStore {
 
 struct DirectApplyCommitter {
 	observer: Arc<dyn TierObserver>,
+	sm: Arc<AsyncMutex<WendelonStateMachine>>,
+	next_index: AtomicU64,
+}
+
+impl DirectApplyCommitter {
+	fn new(observer: Arc<dyn TierObserver>, state_machine: WendelonStateMachine) -> Self {
+		Self {
+			observer,
+			sm: Arc::new(AsyncMutex::new(state_machine)),
+			next_index: AtomicU64::new(1),
+		}
+	}
 }
 
 #[async_trait]
 impl TierCommitter for DirectApplyCommitter {
 	async fn commit_tier_slab(&self, tier: TieredSlab) -> std::io::Result<()> {
+		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
+		let entry = Entry::<WendelonTypeConfig> {
+			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+			payload: EntryPayload::Normal(WendelonRequest::TierSlab(tier.clone())),
+		};
+		let mut sm = self.sm.lock().await;
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			&mut *sm,
+			vec![entry],
+		)
+		.await
+		.map_err(|err| std::io::Error::other(format!("test tier commit failed: {err}")))?;
 		self.observer.on_slab_tiered(&tier, 0).await
+	}
+
+	async fn retire_tiered_slab(&self, slab_id: wendelon::schema::SlabId) -> std::io::Result<()> {
+		let index = self.next_index.fetch_add(1, Ordering::Relaxed);
+		let entry = Entry::<WendelonTypeConfig> {
+			log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+			payload: EntryPayload::Normal(WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+				slab_id,
+			})),
+		};
+		let mut sm = self.sm.lock().await;
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			&mut *sm,
+			vec![entry],
+		)
+		.await
+		.map_err(|err| std::io::Error::other(format!("test retire commit failed: {err}")))?;
+		self.observer.on_slab_retired(slab_id, 0).await
 	}
 }
 
@@ -168,12 +216,14 @@ async fn build_tiered_manager(
 	let original = manager.read(location).await.expect("pre-tier read ok");
 
 	let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
-	let committer: Arc<dyn TierCommitter> = Arc::new(DirectApplyCommitter { observer });
+	let state_machine = WendelonStateMachine::new();
+	let committer: Arc<dyn TierCommitter> =
+		Arc::new(DirectApplyCommitter::new(observer, state_machine.clone()));
 	let sweeper = SlabSweeper::new(
 		manager.clone(),
 		l2_store.clone(),
 		committer,
-		WendelonStateMachine::new(),
+		state_machine,
 		SweeperConfig {
 			scan_interval: Duration::from_millis(10),
 			min_slab_bytes: 0,

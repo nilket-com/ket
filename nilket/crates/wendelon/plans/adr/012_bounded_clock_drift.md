@@ -18,6 +18,7 @@ Wendelon will enforce a **Bounded Clock Drift** model with a strict **Fail-Fast*
 ## Rationale
 - **Correctness Over Availability:** A node with a severely drifted clock is a hazard to data integrity. We refuse to serve incorrect data or permanently poison the cluster's HLC timeline. 
 - **Synergy with Autonomous Healing:** If a node crashes itself, the Unified Hash Ring instantaneously routes around it, and the Autonomous Eviction watchdog (ADR 001) will safely evict it from the topology after the heartbeat threshold expires. Crashing is the safest possible action.
+- **Makes soft wall-clock policy acceptable:** Time-windowed behaviors that are intentionally defined against physical time (for example MVCC retention windows) can safely use local wall clock so long as they inherit this bounded-drift envelope. Exact cluster-wide cutoffs remain a separate problem and should use replicated state rather than median sampling.
 
 ## Consequences (The "Negatives" / Rejected Ideas)
 - **Operational Requirement:** Infrastructure operators *must* run robust time synchronization (NTP, Chrony, PTP) on all Wendelon machines. We will not attempt to implement complex time-sync algorithms inside the database itself.

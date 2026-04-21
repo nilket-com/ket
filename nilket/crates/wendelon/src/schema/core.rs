@@ -700,7 +700,7 @@ pub struct ReadRequestMeta {
 
 // ============================================================
 //  READ RESPONSE METADATA — 56 bytes, fixed
-//  Value is in the Arrow payload (omitted when KEY_NOT_FOUND).
+//  Value is in the Arrow payload only when status == OK.
 // ============================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
@@ -723,6 +723,17 @@ impl ReadStatus {
 	pub const MIGRATION_INCOMPLETE: Self = Self(7);
 	pub const TENANT_UNAVAILABLE: Self = Self(8);
 	pub const AUTHORIZATION_FAILED: Self = Self(9);
+	/// The query's WPBC program failed validation or referenced an
+	/// unsupported column shape. The caller must fix the program;
+	/// retrying unchanged bytes will not succeed.
+	pub const QUERY_INVALID_PROGRAM: Self = Self(10);
+	/// The server terminated the query after it exceeded its bounded
+	/// execution envelope (rows, slabs, or wall time).
+	pub const QUERY_BUDGET_EXCEEDED: Self = Self(11);
+	/// The caller requested a snapshot older than the node's MVCC
+	/// retention floor. Retrying the same `as_of_hlc` is not useful
+	/// unless retention policy changes.
+	pub const RETENTION_EXPIRED: Self = Self(12);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -1007,7 +1018,7 @@ pub fn read_key_schema() -> Schema {
 /// Arrow schema for read response payloads.
 pub fn read_value_schema() -> Schema {
 	Schema::new(vec![
-		Field::new("value", DataType::LargeBinary, true), // null if KEY_NOT_FOUND
+		Field::new("value", DataType::LargeBinary, true), // null unless status == OK
 	])
 }
 

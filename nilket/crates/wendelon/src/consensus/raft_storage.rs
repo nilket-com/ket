@@ -46,7 +46,10 @@
 //! `Arc<RwLock<LogStoreInner>>` so `get_log_reader` can hand out
 //! a Self-typed reader that shares the same cache as the writer.
 
-use crate::audit::{AuditAuthority, AuditEvent, AuditSink};
+use crate::audit::{
+	AuditAuthority, AuditEvent, AuditMaterializationTracker, AuditOperation, AuditOutcome,
+	AuditSink,
+};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, SeedMigration, TenantFinalization, TenantLifecycleState,
@@ -252,17 +255,21 @@ struct DiscoveredWalSegment {
 struct RaftAuditMaterializer {
 	local_node: SchemaNodeId,
 	sink: Arc<dyn AuditSink>,
+	tracker: Arc<AuditMaterializationTracker>,
 }
 
 impl RaftAuditMaterializer {
-	fn emit(&self, event: AuditEvent) {
+	fn emit(&self, event: AuditEvent) -> bool {
 		if let Err(err) = self.sink.emit(event.clone()) {
 			tracing::warn!(
-				event_type = %event.event_type,
+				event_type = %event.operation.as_str(),
 				error = %err,
 				"raft audit materialization failed; authoritative record remains in the committed log"
 			);
+			return false;
 		}
+		self.tracker.note_materialized();
+		true
 	}
 }
 
@@ -1432,6 +1439,15 @@ pub trait TierObserver: Send + Sync {
 		tier: &TieredSlab,
 		applied_log_index: u64,
 	) -> std::io::Result<()>;
+
+	async fn on_slab_retired(
+		&self,
+		slab_id: SlabId,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		let _ = (slab_id, applied_log_index);
+		Ok(())
+	}
 }
 
 #[async_trait::async_trait]
@@ -1934,8 +1950,13 @@ impl WendelonStateMachine {
 		mut self,
 		local_node: SchemaNodeId,
 		sink: Arc<dyn AuditSink>,
+		tracker: Arc<AuditMaterializationTracker>,
 	) -> Self {
-		self.audit_materializer = Some(RaftAuditMaterializer { local_node, sink });
+		self.audit_materializer = Some(RaftAuditMaterializer {
+			local_node,
+			sink,
+			tracker,
+		});
 		self
 	}
 
@@ -1984,6 +2005,18 @@ impl WendelonStateMachine {
 		let mut guard = self.inner.write().await;
 		guard.state.migrations.insert(entry.migration_id, entry);
 	}
+
+	#[cfg(test)]
+	pub async fn seed_tiered_slab_for_test(&self, tier: crate::consensus::TieredSlab) {
+		let mut guard = self.inner.write().await;
+		guard.state.tiered_slabs.insert(tier.slab_id, tier);
+	}
+
+	#[cfg(test)]
+	pub async fn retire_tiered_slab_for_test(&self, slab_id: SlabId) {
+		let mut guard = self.inner.write().await;
+		guard.state.tiered_slabs.remove(&slab_id);
+	}
 }
 
 impl Default for WendelonStateMachine {
@@ -2016,7 +2049,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		// the L1 slab file) and must not block apply progress for
 		// other entries in the batch.
 		let mut pending_audit_events: Vec<AuditEvent> = Vec::new();
-		let mut pending_tier_events: Vec<(TieredSlab, u64)> = Vec::new();
+		let mut pending_tier_events: Vec<(TierObserverEvent, u64)> = Vec::new();
 		let mut pending_tenant_kek_events: Vec<(InstallTenantKekVersion, u64)> = Vec::new();
 		let mut pending_tenant_kek_snapshot: Option<
 			HashMap<crate::schema::TenantId, TenantKeyset>,
@@ -2059,6 +2092,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
 					if let Some(event) = raft_audit_event(materializer.local_node, &entry, &resp) {
+						materializer.tracker.note_authoritative_event();
 						pending_audit_events.push(event);
 					}
 				}
@@ -2071,20 +2105,30 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		};
 		if let Some(materializer) = self.audit_materializer.as_ref() {
 			for event in pending_audit_events {
-				materializer.emit(event);
+				let _ = materializer.emit(event);
 			}
 		}
 		if let Some(observer) = self.tier_observer.as_ref() {
-			for (tier, applied_log_index) in &pending_tier_events {
+			for (event, applied_log_index) in &pending_tier_events {
 				// An observer error is surfaced through logs but
 				// must not tear the state machine down — the SM
 				// has already committed the pivot and followers
 				// must not diverge on a local filesystem hiccup.
-				if let Err(e) = observer.on_slab_tiered(tier, *applied_log_index).await {
+				let result = match event {
+					TierObserverEvent::Tiered(tier) => observer
+						.on_slab_tiered(tier, *applied_log_index)
+						.await
+						.map_err(|error| (tier.slab_id, error)),
+					TierObserverEvent::Retired(slab_id) => observer
+						.on_slab_retired(*slab_id, *applied_log_index)
+						.await
+						.map_err(|error| (*slab_id, error)),
+				};
+				if let Err((slab_id, error)) = result {
 					tracing::warn!(
-						slab_id = tier.slab_id.get(),
-						error = %e,
-						"tier observer failed; local L1 cleanup will retry on next sweep"
+						slab_id = slab_id.get(),
+						error = %error,
+						"tier observer failed; sweeper reconcile will retry local tier cleanup"
 					);
 				}
 			}
@@ -2301,17 +2345,23 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TierObserverEvent {
+	Tiered(TieredSlab),
+	Retired(SlabId),
+}
+
 /// Fold one committed [`WendelonRequest`] into the SM state.
 ///
-/// Returns the [`WendelonResponse`] plus an optional `TieredSlab`
-/// so the caller can fire tier observers outside the write lock.
-/// Tier observers do filesystem work (unlinking the L1 file);
-/// keeping them off the lock prevents any cross-node staleness
-/// on a busy apply batch.
+/// Returns the [`WendelonResponse`] plus an optional tier-state
+/// change so the caller can fire tier observers outside the write
+/// lock. Tier observers do filesystem work (unlinking the L1 file);
+/// keeping them off the lock prevents any cross-node staleness on a
+/// busy apply batch.
 fn apply_entry_to_state(
 	state: &mut SmState,
 	entry: &Entry<WendelonTypeConfig>,
-) -> (WendelonResponse, Option<TieredSlab>) {
+) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match &entry.payload {
 		EntryPayload::Blank => (WendelonResponse::Success, None),
 		EntryPayload::Normal(req) => apply_request(state, req.clone()),
@@ -2331,7 +2381,7 @@ fn raft_audit_event(
 		return None;
 	};
 	let is_err = matches!(resp, WendelonResponse::Error(_));
-	let outcome = audit_outcome_field(resp);
+	let outcome = audit_outcome(resp);
 	match req {
 		// Non-tenant-admin mutations emit on success only; the apply-layer
 		// can reject for transient state-machine reasons and an error
@@ -2345,7 +2395,7 @@ fn raft_audit_event(
 		WendelonRequest::Finalize(finalization) => Some(
 			AuditEvent::new(
 				AuditAuthority::RaftLog,
-				"data.write_finalized",
+				AuditOperation::DataWriteFinalized,
 				local_node,
 				format!(
 					"raft_log_index={} raft_term={} tenant_id={} locality={} durability={} charged_bytes={} commit_hlc={:?} payload_hash={}",
@@ -2359,111 +2409,208 @@ fn raft_audit_event(
 					format_bytes_hex(&finalization.marker.payload_hash),
 				),
 			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", finalization.tenant_id.get())
+			.with_parameter("locality", Locality::from(finalization.key_identity).get())
+			.with_parameter("durability", finalization.marker.durability.0 as u64)
+			.with_parameter("charged_bytes", finalization.charged_bytes)
+			.with_parameter(
+				"commit_hlc",
+				format!("{:?}", finalization.marker.commit_hlc),
+			)
+			.with_parameter(
+				"payload_hash",
+				format_bytes_hex(&finalization.marker.payload_hash),
+			)
 			.with_tenant(finalization.tenant_id)
 			.with_record_identity(finalization.key_identity),
 		),
-		WendelonRequest::AdvanceEpoch(record) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"control_ring.epoch_advanced",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} from_epoch={} to_epoch={} from_peers=[{}] to_peers=[{}]",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				record.from.epoch,
-				record.to.epoch,
-				format_epoch_peer_ids(&record.from),
-				format_epoch_peer_ids(&record.to),
-			),
-		)),
-		WendelonRequest::InstallTenantKekVersion(rotation) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"crypto.tenant_kek_rotated",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} tenant_kek_id={}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				rotation.tenant_id.get(),
-				rotation.tenant_kek_id,
-			),
-		)),
+		WendelonRequest::TierSlab(_) | WendelonRequest::RetireTieredSlab(_) => None,
+		WendelonRequest::AdvanceEpoch(record) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::ControlRingEpochAdvanced,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} from_epoch={} to_epoch={} from_peers=[{}] to_peers=[{}]",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					record.from.epoch,
+					record.to.epoch,
+					format_epoch_peer_ids(&record.from),
+					format_epoch_peer_ids(&record.to),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("from_epoch", record.from.epoch)
+			.with_parameter("to_epoch", record.to.epoch)
+			.with_parameter("from_peers", format_epoch_peer_ids(&record.from))
+			.with_parameter("to_peers", format_epoch_peer_ids(&record.to)),
+		),
+		WendelonRequest::InstallTenantKekVersion(rotation) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::CryptoTenantKekRotated,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} tenant_kek_id={}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					rotation.tenant_id.get(),
+					rotation.tenant_kek_id.get(),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", rotation.tenant_id.get())
+			.with_parameter("tenant_kek_id", rotation.tenant_kek_id.get()),
+		),
 		// Tenant admin ops are attempt-audited per ADR 021 §5: every
 		// mutation — including rejected ones — emits a record so the
 		// audit stream can be reconciled against the tenant FSM.
-		WendelonRequest::CreateTenant(create) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"tenant.created",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} replication_factor={} tenant_kek_id={} {outcome}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				create.tenant_id.get(),
-				create.quota_bytes,
-				create.replication_factor,
+		WendelonRequest::CreateTenant(create) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::TenantCreated,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} replication_factor={} tenant_kek_id={} {}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					create.tenant_id.get(),
+					create.quota_bytes,
+					create.replication_factor,
+					create
+						.tenant_keyset
+						.active_tenant_kek_id
+						.map(|id| id.get())
+						.unwrap_or(0),
+					audit_outcome_message(resp),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", create.tenant_id.get())
+			.with_parameter("quota_bytes", create.quota_bytes)
+			.with_parameter("replication_factor", create.replication_factor as u64)
+			.with_parameter(
+				"tenant_kek_id",
 				create
 					.tenant_keyset
 					.active_tenant_kek_id
 					.map(|id| id.get())
 					.unwrap_or(0),
-			),
-		)),
-		WendelonRequest::UpdateTenantQuota(update) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"tenant.quota_updated",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} {outcome}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				update.tenant_id.get(),
-				update.quota_bytes,
-			),
-		)),
-		WendelonRequest::SuspendTenant(tenant_id) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"tenant.suspended",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				tenant_id.get(),
-			),
-		)),
-		WendelonRequest::ResumeTenant(tenant_id) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"tenant.resumed",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				tenant_id.get(),
-			),
-		)),
-		WendelonRequest::DeleteTenant(tenant_id) => Some(AuditEvent::new(
-			AuditAuthority::RaftLog,
-			"tenant.delete_requested",
-			local_node,
-			format!(
-				"raft_log_index={} raft_term={} tenant_id={} {outcome}",
-				entry.log_id.index,
-				entry.log_id.leader_id.term,
-				tenant_id.get(),
-			),
-		)),
+			)
+			.with_parameters(audit_outcome_parameters(resp)),
+		),
+		WendelonRequest::UpdateTenantQuota(update) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::TenantQuotaUpdated,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} quota_bytes={} {}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					update.tenant_id.get(),
+					update.quota_bytes,
+					audit_outcome_message(resp),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", update.tenant_id.get())
+			.with_parameter("quota_bytes", update.quota_bytes)
+			.with_parameters(audit_outcome_parameters(resp)),
+		),
+		WendelonRequest::SuspendTenant(tenant_id) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::TenantSuspended,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} {}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					tenant_id.get(),
+					audit_outcome_message(resp),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", tenant_id.get())
+			.with_parameters(audit_outcome_parameters(resp)),
+		),
+		WendelonRequest::ResumeTenant(tenant_id) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::TenantResumed,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} {}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					tenant_id.get(),
+					audit_outcome_message(resp),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", tenant_id.get())
+			.with_parameters(audit_outcome_parameters(resp)),
+		),
+		WendelonRequest::DeleteTenant(tenant_id) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::TenantDeleteRequested,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} {}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					tenant_id.get(),
+					audit_outcome_message(resp),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", tenant_id.get())
+			.with_parameters(audit_outcome_parameters(resp)),
+		),
 		_ => None,
 	}
 }
 
-fn audit_outcome_field(resp: &WendelonResponse) -> String {
+fn audit_outcome(resp: &WendelonResponse) -> AuditOutcome {
+	match resp {
+		WendelonResponse::Error(_) => AuditOutcome::Error,
+		_ => AuditOutcome::Allowed,
+	}
+}
+
+fn audit_outcome_message(resp: &WendelonResponse) -> String {
+	match resp {
+		WendelonResponse::Error(message) => format!("outcome=error reason={message:?}"),
+		_ => "outcome=success".to_string(),
+	}
+}
+
+fn audit_outcome_parameters(resp: &WendelonResponse) -> Vec<(&'static str, serde_json::Value)> {
 	match resp {
 		WendelonResponse::Error(message) => {
-			format!("outcome=error reason={:?}", message)
+			vec![("reason", serde_json::Value::String(format!("{message:?}")))]
 		}
-		_ => "outcome=success".to_string(),
+		_ => Vec::new(),
 	}
 }
 
@@ -2529,7 +2676,7 @@ fn checkpoint_observation_from_state(
 fn apply_request(
 	state: &mut SmState,
 	req: WendelonRequest,
-) -> (WendelonResponse, Option<TieredSlab>) {
+) -> (WendelonResponse, Option<TierObserverEvent>) {
 	match req {
 		WendelonRequest::Finalize(finalization) => {
 			// E_safe advances monotonically within an epoch —
@@ -2630,10 +2777,25 @@ fn apply_request(
 					return (WendelonResponse::Success, None);
 				}
 				state.tiered_slabs.insert(tier.slab_id, tier.clone());
-				return (WendelonResponse::Success, Some(tier));
+				return (
+					WendelonResponse::Success,
+					Some(TierObserverEvent::Tiered(tier)),
+				);
 			}
 			state.tiered_slabs.insert(tier.slab_id, tier.clone());
-			(WendelonResponse::Success, Some(tier))
+			(
+				WendelonResponse::Success,
+				Some(TierObserverEvent::Tiered(tier)),
+			)
+		}
+		WendelonRequest::RetireTieredSlab(retire) => {
+			if state.tiered_slabs.remove(&retire.slab_id).is_some() {
+				return (
+					WendelonResponse::Success,
+					Some(TierObserverEvent::Retired(retire.slab_id)),
+				);
+			}
+			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
 		WendelonRequest::UpdateTenantQuota(update) => {
@@ -3736,6 +3898,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -5801,6 +5964,44 @@ mod migration_tests {
 			vec![7, 3, 4],
 			"overlap-only case must prepend completed_by, not replace"
 		);
+	}
+}
+
+#[cfg(test)]
+mod tiered_slab_tests {
+	use super::*;
+	use crate::consensus::RetireTieredSlab;
+
+	#[test]
+	fn retire_tiered_slab_removes_pointer_and_is_idempotent() {
+		let mut state = SmState::default();
+		let slab_id = SlabId::new(7);
+		let tier = TieredSlab {
+			slab_id,
+			l2_uri: "memory://tier/slab_0000000000000007.wnd".into(),
+			payload_hash: [0xAB; 32],
+			is_encrypted: true,
+		};
+
+		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(event, Some(TierObserverEvent::Tiered(tier.clone())));
+		assert_eq!(state.tiered_slabs.get(&slab_id), Some(&tier));
+
+		let (resp, event) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(event, Some(TierObserverEvent::Retired(slab_id)));
+		assert!(!state.tiered_slabs.contains_key(&slab_id));
+
+		let (resp, event) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(event, None);
 	}
 }
 

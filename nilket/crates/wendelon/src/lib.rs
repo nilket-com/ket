@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod governance;
 pub mod metrics;
 pub mod network;
 pub mod node;

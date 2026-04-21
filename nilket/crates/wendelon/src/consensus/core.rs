@@ -39,6 +39,17 @@ pub struct TieredSlab {
 	pub is_encrypted: bool,
 }
 
+/// Payload of a `RetireTieredSlab` Raft entry.
+///
+/// Committed when a previously-tiered slab no longer has any live
+/// rows after MVCC retention pruning. Every replica removes the
+/// pointer from replicated state and the local `SlabManager`
+/// observes the apply to drop any cached rows / rehydrated copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireTieredSlab {
+	pub slab_id: SlabId,
+}
+
 /// The unified Node ID type used across Wendelon.
 /// OpenRaft requires the `NodeId` type to implement various standard traits,
 /// so we wrap our `bytemuck` struct in a newtype or implement them directly.
@@ -269,6 +280,9 @@ pub enum WendelonRequest {
 	/// to record the L2 pointer and — via the tier observer — the
 	/// local `SlabManager` to pivot reads and unlink the L1 file.
 	TierSlab(TieredSlab),
+	/// A previously-tiered slab has become fully reclaimable and its
+	/// L2 pointer should be removed from replicated state.
+	RetireTieredSlab(RetireTieredSlab),
 	/// Seed a Migration Ledger entry for a reassigned range
 	/// (Plan 019). Idempotent: a replay with the same
 	/// `migration_id` is a no-op.

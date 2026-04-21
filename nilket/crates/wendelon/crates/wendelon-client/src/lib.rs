@@ -28,6 +28,7 @@ use wendelon::schema::{
 	ReadStatus, TenantId, WriteRequestMeta, WriteStatus, read_key_schema, write_payload_schema,
 };
 
+pub use wendelon::client::{QueryLocalityRange, StreamingQueryResult};
 pub use wendelon::schema::{Consistency as ReadConsistency, DurabilityLevel as DurabilityClass};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +102,25 @@ impl Default for ReadOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryOptions {
+	pub range: QueryLocalityRange,
+	pub consistency: ReadConsistency,
+	pub min_hlc: Option<HybridTimestamp>,
+	pub as_of_hlc: Option<HybridTimestamp>,
+}
+
+impl Default for QueryOptions {
+	fn default() -> Self {
+		Self {
+			range: QueryLocalityRange::full(),
+			consistency: ReadConsistency::LINEARIZABLE,
+			min_hlc: None,
+			as_of_hlc: None,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteReceipt {
 	pub identity: Identity,
 	pub duplicate: bool,
@@ -118,6 +138,14 @@ pub struct ReadValue {
 	pub epoch: u64,
 	pub value_hlc: HybridTimestamp,
 	pub value: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct QueryResult {
+	pub epoch: u64,
+	pub value_hlc: HybridTimestamp,
+	pub rows: u64,
+	pub batches: Vec<RecordBatch>,
 }
 
 #[derive(Debug, Error)]
@@ -320,6 +348,45 @@ impl Client {
 			s if s == ReadStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
 			status => Err(ClientError::ReadFailed { status }),
 		}
+	}
+
+	pub async fn query_stream(
+		&self,
+		tenant_id: TenantId,
+		wpbc: Vec<u8>,
+		options: QueryOptions,
+	) -> Result<StreamingQueryResult, ClientError> {
+		Ok(self
+			.inner
+			.query(
+				tenant_id,
+				wpbc,
+				options.range,
+				self.inner.epoch(),
+				options.min_hlc.unwrap_or_else(zero_hlc),
+				options.consistency,
+				options.as_of_hlc.unwrap_or_else(zero_hlc),
+			)
+			.await?)
+	}
+
+	pub async fn query(
+		&self,
+		tenant_id: TenantId,
+		wpbc: Vec<u8>,
+		options: QueryOptions,
+	) -> Result<QueryResult, ClientError> {
+		let stream = self.query_stream(tenant_id, wpbc, options).await?;
+		let epoch = stream.epoch;
+		let value_hlc = stream.value_hlc;
+		let rows = stream.rows;
+		let batches = stream.collect_all().await?;
+		Ok(QueryResult {
+			epoch,
+			value_hlc,
+			rows,
+			batches,
+		})
 	}
 }
 
