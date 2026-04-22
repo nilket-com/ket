@@ -59,16 +59,17 @@ use crate::network::ring::RingRouter;
 use crate::network::router::DataRingServer;
 use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
-use crate::network::transport::MembershipEpoch;
-use crate::network::transport::TransportStream;
+use crate::network::transport::{MembershipEpoch, NodeRole, TransportStream};
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, Consistency, FRAME_FLAG_STREAM_END,
 	FinalizationMarker, FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus,
 	Locality, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
-	NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	StreamFinalizationRequestMeta, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	migration_record_schema, read_key_schema, wpbc, write_payload_schema,
+	NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
+	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
+	ReplicaWriteStatus, StreamFinalizationRequestMeta, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, migration_record_schema, read_key_schema, wpbc,
+	write_payload_schema,
 };
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
@@ -87,10 +88,13 @@ use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 
 use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
@@ -104,14 +108,107 @@ enum DataOperation {
 	Query,
 	Replicate,
 	Migrate,
+	PendingWitnessPull,
 	StreamFinalization,
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum WriteOutcome {
+	DataBranchPending,
+	DurableQuorumReached,
+	FinalizationCommitted {
+		response: WriteResponseMeta,
+		trailing: Option<FinalizationMarker>,
+	},
+	FinalizationRecoverablePending {
+		response: WriteResponseMeta,
+		pending_finalization_id: PendingFinalizationId,
+	},
+	FinalizationTerminalFailure {
+		response: WriteResponseMeta,
+	},
+}
+
+impl WriteOutcome {
+	fn is_cacheable(self) -> bool {
+		matches!(
+			self,
+			Self::FinalizationCommitted { .. }
+				| Self::FinalizationRecoverablePending { .. }
+				| Self::FinalizationTerminalFailure { .. }
+		)
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
 struct CachedWriteOutcome {
-	response: WriteResponseMeta,
-	finalization: Option<FinalizationMarker>,
-	pending_finalization_id: Option<PendingFinalizationId>,
+	outcome: WriteOutcome,
+}
+
+impl CachedWriteOutcome {
+	fn new(outcome: WriteOutcome) -> Self {
+		debug_assert!(
+			outcome.is_cacheable(),
+			"non-cacheable write outcome inserted into idempotency cache"
+		);
+		Self { outcome }
+	}
+
+	fn outcome(self) -> WriteOutcome {
+		self.outcome
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DurableQuorumTracker {
+	required_durable_acks: usize,
+	durable_acks: usize,
+	leader_local_durable: bool,
+}
+
+impl DurableQuorumTracker {
+	fn new(required_durable_acks: usize, leader_local_required: bool) -> Self {
+		Self {
+			required_durable_acks,
+			durable_acks: 0,
+			leader_local_durable: !leader_local_required,
+		}
+	}
+
+	fn note_local_durable(&mut self) {
+		debug_assert!(
+			!self.leader_local_durable,
+			"leader-local durable leg counted more than once"
+		);
+		self.leader_local_durable = true;
+		self.durable_acks += 1;
+	}
+
+	fn note_remote_ack(&mut self, level: ReplicaAckLevel) {
+		if level == ReplicaAckLevel::DURABLE {
+			self.durable_acks += 1;
+		}
+	}
+
+	#[cfg(test)]
+	fn durable_ack_count(&self) -> usize {
+		self.durable_acks
+	}
+
+	fn quorum_reached(&self) -> bool {
+		self.durable_acks >= self.required_durable_acks
+	}
+
+	fn is_satisfied(&self) -> bool {
+		self.quorum_reached() && self.leader_local_durable
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrphanWitnessRecoveryStamp {
+	term: u64,
+	epoch: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -445,6 +542,22 @@ pub struct WendelonDataServer {
 	/// Nudges the background reconciler to retry a pending
 	/// finalization without waiting for the next periodic tick.
 	pending_finalization_wakeup: Arc<Notify>,
+	/// Highest `(term, membership_epoch)` pair for which this
+	/// leader has completed its orphan-witness recovery sweep.
+	orphan_witness_recovery_stamp: Arc<RwLock<Option<OrphanWitnessRecoveryStamp>>>,
+	/// Serializes the once-per-term recovery sweep so the
+	/// first concurrent writes after an election do not all issue
+	/// the same peer pull RPCs.
+	orphan_witness_recovery_lock: Arc<tokio::sync::Mutex<()>>,
+	/// Once tripped, this node stops trusting its local durability
+	/// substrate enough to accept fresh writes.
+	local_persistence_distrust_reason: Arc<RwLock<Option<String>>>,
+	/// On-disk latch for the local durability distrust fence.
+	/// Bootstrap restores the node in degraded mode while this
+	/// marker is present.
+	local_persistence_distrust_path: PathBuf,
+	#[cfg(test)]
+	fail_next_local_durable_append: Arc<StdMutex<Option<(ErrorKind, String)>>>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
 	hlc: Arc<HybridLogicalClockDriver>,
@@ -515,6 +628,8 @@ pub const MIGRATION_SWEEP_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 /// because a pending row is already quorum-durable in the slabs;
 /// the remaining work is only the Raft metadata commit.
 pub const PENDING_FINALIZATION_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const LOCAL_PERSISTENCE_DISTRUST_REASON: &str = "LocalPersistenceDistrust";
+const LOCAL_PERSISTENCE_DISTRUST_FILE: &str = "local_persistence_distrust.flag";
 /// Background migration is intentionally conservative: one
 /// migration range per pass keeps the sweeper from competing with
 /// foreground reads/writes or the tier sweeper for disk/network.
@@ -531,6 +646,10 @@ enum LeaseGateResult {
 enum LeaseAcquireOutcome {
 	Granted(LeaseDescriptor),
 	Denied(LeaseStatus),
+}
+
+fn local_persistence_distrust_path(dir: &std::path::Path) -> PathBuf {
+	dir.join(LOCAL_PERSISTENCE_DISTRUST_FILE)
 }
 
 impl Clone for WendelonDataServer {
@@ -551,6 +670,12 @@ impl Clone for WendelonDataServer {
 			pending_finalizations: self.pending_finalizations.clone(),
 			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
+			orphan_witness_recovery_stamp: self.orphan_witness_recovery_stamp.clone(),
+			orphan_witness_recovery_lock: self.orphan_witness_recovery_lock.clone(),
+			local_persistence_distrust_reason: self.local_persistence_distrust_reason.clone(),
+			local_persistence_distrust_path: self.local_persistence_distrust_path.clone(),
+			#[cfg(test)]
+			fail_next_local_durable_append: self.fail_next_local_durable_append.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
@@ -567,6 +692,13 @@ impl Clone for WendelonDataServer {
 }
 
 impl WendelonDataServer {
+	fn apply_local_persistence_runtime_fence(&self) {
+		let runtime = self.raft.runtime_config();
+		runtime.heartbeat(false);
+		runtime.elect(false);
+		runtime.tick(false);
+	}
+
 	pub fn new(
 		slab: Arc<SlabManager>,
 		raft: WendelonRaft,
@@ -581,7 +713,13 @@ impl WendelonDataServer {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let pending_finalizations =
 			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
-		Ok(Self {
+		let local_persistence_distrust_path = local_persistence_distrust_path(slab.data_dir());
+		let local_persistence_distrust_reason = if local_persistence_distrust_path.exists() {
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON.to_string())
+		} else {
+			None
+		};
+		let server = Self {
 			slab,
 			raft,
 			log_store,
@@ -597,6 +735,14 @@ impl WendelonDataServer {
 			pending_finalizations,
 			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
+			orphan_witness_recovery_stamp: Arc::new(RwLock::new(None)),
+			orphan_witness_recovery_lock: Arc::new(tokio::sync::Mutex::new(())),
+			local_persistence_distrust_reason: Arc::new(RwLock::new(
+				local_persistence_distrust_reason,
+			)),
+			local_persistence_distrust_path,
+			#[cfg(test)]
+			fail_next_local_durable_append: Arc::new(StdMutex::new(None)),
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
@@ -608,7 +754,16 @@ impl WendelonDataServer {
 			tenant_cache_refresh_interval: DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
-		})
+		};
+		if server.degraded_reason().is_some() {
+			tracing::error!(
+				node_id = server.local_node.id,
+				path = %server.local_persistence_distrust_path.display(),
+				"restoring persisted local-persistence distrust fence at bootstrap"
+			);
+			server.apply_local_persistence_runtime_fence();
+		}
+		Ok(server)
 	}
 
 	/// Test-only override for the `RANGE_PAGE` paging caps.
@@ -667,6 +822,109 @@ impl WendelonDataServer {
 	pub fn with_mvcc_retention_window(mut self, retention_window: Option<Duration>) -> Self {
 		self.mvcc_retention_policy = MvccRetentionPolicy::from_optional_window(retention_window);
 		self
+	}
+
+	pub fn degraded_reason(&self) -> Option<String> {
+		self.local_persistence_distrust_reason
+			.read()
+			.expect("local persistence distrust lock poisoned")
+			.clone()
+	}
+
+	async fn persist_local_persistence_distrust_marker(
+		&self,
+		detail: String,
+	) -> std::io::Result<()> {
+		let path = self.local_persistence_distrust_path.clone();
+		spawn_blocking(move || std::fs::write(path, detail))
+			.await
+			.map_err(|err| {
+				Error::other(format!(
+					"local persistence distrust marker task failed: {err}"
+				))
+			})?
+	}
+
+	async fn trip_local_persistence_distrust(&self, detail: impl Into<String>) {
+		let detail = detail.into();
+		let tripped = {
+			let mut guard = self
+				.local_persistence_distrust_reason
+				.write()
+				.expect("local persistence distrust lock poisoned");
+			if guard.is_some() {
+				false
+			} else {
+				*guard = Some(LOCAL_PERSISTENCE_DISTRUST_REASON.to_string());
+				true
+			}
+		};
+		if !tripped {
+			return;
+		}
+
+		tracing::error!(
+			node_id = self.local_node.id,
+			detail = %detail,
+			"fencing data writes after local persistence distrust"
+		);
+
+		if let Err(err) = self
+			.persist_local_persistence_distrust_marker(detail.clone())
+			.await
+		{
+			tracing::error!(
+				node_id = self.local_node.id,
+				path = %self.local_persistence_distrust_path.display(),
+				error = %err,
+				"failed to persist local-persistence distrust marker"
+			);
+		}
+
+		self.apply_local_persistence_runtime_fence();
+		if let Err(err) = self.raft.shutdown().await {
+			tracing::error!(
+				node_id = self.local_node.id,
+				error = %err,
+				"failed to shut down raft participation after local persistence distrust"
+			);
+		}
+	}
+
+	async fn fenced_write_response(
+		&self,
+		meta: &WriteRequestMeta,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		let leader_hint = self
+			.raft
+			.current_leader()
+			.await
+			.map(|id| NodeId { id, _reserved: 0 })
+			.unwrap_or(self.local_node);
+		let status = if leader_hint.id != self.local_node.id {
+			WriteStatus::NOT_LEADER
+		} else {
+			WriteStatus::INTERNAL_ERROR
+		};
+		(error_response(meta, status, leader_hint), None)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fail_next_local_durable_append_for_test(
+		&self,
+		kind: ErrorKind,
+		message: impl Into<String>,
+	) {
+		*self
+			.fail_next_local_durable_append
+			.lock()
+			.expect("local durable append failpoint poisoned") = Some((kind, message.into()));
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn trip_local_persistence_distrust_for_test(&self) {
+		self.trip_local_persistence_distrust("test-only local persistence distrust")
+			.await;
 	}
 
 	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
@@ -916,7 +1174,53 @@ impl WendelonDataServer {
 		)
 	}
 
-	fn pending_error_response(
+	fn pending_finalization_record_from_replica_meta(
+		&self,
+		meta: &ReplicaWriteMeta,
+	) -> PendingFinalizationRecord {
+		PendingFinalizationRecord::new(
+			meta.write_id,
+			meta.await_finalization != 0,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: meta.epoch,
+					commit_hlc: meta.commit_hlc,
+					payload_hash: meta.payload_hash,
+					e_safe_index: 0,
+					durability: meta.durability,
+					_pad: [0; 7],
+				},
+				tenant_id: meta.tenant_id,
+				key_identity: meta.key_identity,
+				charged_bytes: meta.charged_bytes,
+			},
+		)
+	}
+
+	fn recoverable_pending_response(
+		&self,
+		write_id: crate::schema::ClientWriteId,
+		epoch: u64,
+		commit_hlc: HybridTimestamp,
+	) -> WriteResponseMeta {
+		WriteResponseMeta {
+			status: WriteStatus::FINALIZATION_PENDING,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch,
+			commit_hlc,
+			leader_hint: self.local_node,
+			echoed_write_id: write_id,
+			has_finalization: 0,
+			_pad2: [0; 7],
+		}
+	}
+
+	#[cfg(test)]
+	fn terminal_failure_response_for_test(
 		&self,
 		write_id: crate::schema::ClientWriteId,
 		epoch: u64,
@@ -1024,6 +1328,12 @@ impl WendelonDataServer {
 			}
 			PendingFinalizationResolution::ObservedApplied(marker) => marker,
 		};
+		let (response, trailing) = self.committed_response_for(record, marker);
+		let outcome = WriteOutcome::FinalizationCommitted { response, trailing };
+		self.idempotency.insert(
+			Self::idempotency_key_for(record.write_id),
+			CachedWriteOutcome::new(outcome),
+		);
 		if let Err(err) = self.pending_finalizations.remove(record.id).await {
 			tracing::warn!(
 				pending_id = %format_bytes_hex(record.id.as_bytes()),
@@ -1031,16 +1341,154 @@ impl WendelonDataServer {
 				"failed to remove reconciled pending finalization"
 			);
 		}
-		let (response, trailing) = self.committed_response_for(record, marker);
-		self.idempotency.insert(
-			Self::idempotency_key_for(record.write_id),
-			CachedWriteOutcome {
-				response,
-				finalization: trailing,
-				pending_finalization_id: None,
-			},
-		);
 		Ok((response, trailing))
+	}
+
+	fn recoverable_pending_outcome_for_record(
+		&self,
+		record: &PendingFinalizationRecord,
+	) -> WriteOutcome {
+		WriteOutcome::FinalizationRecoverablePending {
+			response: self.recoverable_pending_response(
+				record.write_id,
+				record.finalization.marker.epoch,
+				record.finalization.marker.commit_hlc,
+			),
+			pending_finalization_id: record.id,
+		}
+	}
+
+	fn duplicate_response_for_outcome(
+		&self,
+		outcome: WriteOutcome,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		match outcome {
+			WriteOutcome::FinalizationCommitted {
+				mut response,
+				trailing,
+			} => {
+				response.status = WriteStatus::DUPLICATE;
+				(response, trailing)
+			}
+			WriteOutcome::FinalizationTerminalFailure { mut response } => {
+				response.status = WriteStatus::DUPLICATE;
+				(response, None)
+			}
+			WriteOutcome::FinalizationRecoverablePending { response, .. } => (response, None),
+			WriteOutcome::DataBranchPending | WriteOutcome::DurableQuorumReached => {
+				debug_assert!(
+					false,
+					"non-terminal write outcome must not be replayed to duplicate callers"
+				);
+				(
+					WriteResponseMeta {
+						status: WriteStatus::INTERNAL_ERROR,
+						_pad1: [0; 7],
+						log_index: 0,
+						term: 0,
+						epoch: 0,
+						commit_hlc: bytemuck::Zeroable::zeroed(),
+						leader_hint: self.local_node,
+						echoed_write_id: bytemuck::Zeroable::zeroed(),
+						has_finalization: 0,
+						_pad2: [0; 7],
+					},
+					None,
+				)
+			}
+		}
+	}
+
+	fn redirected_pending_response(
+		&self,
+		mut response: WriteResponseMeta,
+		leader_hint: NodeId,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		response.status = WriteStatus::NOT_LEADER;
+		response.leader_hint = leader_hint;
+		(response, None)
+	}
+
+	async fn try_reconcile_pending_record_once(
+		&self,
+		record: &PendingFinalizationRecord,
+	) -> std::io::Result<Option<(WriteResponseMeta, Option<FinalizationMarker>)>> {
+		let Some(_claim) = self.try_claim_pending_finalization(record.id) else {
+			return Ok(None);
+		};
+		match self.resolve_pending_finalization(record).await {
+			Ok(resolution) => self
+				.complete_pending_finalization(record, resolution)
+				.await
+				.map(Some),
+			Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+			Err(err) => Err(err),
+		}
+	}
+
+	async fn replay_write_outcome(
+		&self,
+		outcome: WriteOutcome,
+	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		if let WriteOutcome::FinalizationRecoverablePending {
+			response,
+			pending_finalization_id,
+		} = outcome
+		{
+			if let Some(record) = self
+				.pending_finalizations
+				.get(pending_finalization_id)
+				.await?
+			{
+				if let Some(leader_hint) = self
+					.raft
+					.current_leader()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 })
+				{
+					if leader_hint.id != self.local_node.id {
+						return Ok(self.redirected_pending_response(response, leader_hint));
+					}
+				}
+				match self.try_reconcile_pending_record_once(&record).await {
+					Ok(Some((mut committed_response, trailing))) => {
+						committed_response.status = WriteStatus::DUPLICATE;
+						return Ok((committed_response, trailing));
+					}
+					Ok(None) => {}
+					Err(err) => {
+						tracing::warn!(
+							pending_id = %format_bytes_hex(record.id.as_bytes()),
+							error = %err,
+							"duplicate replay failed to reconcile pending finalization; returning retryable pending status"
+						);
+						if let Some(leader_hint) = self
+							.raft
+							.current_leader()
+							.await
+							.map(|id| NodeId { id, _reserved: 0 })
+						{
+							if leader_hint.id != self.local_node.id {
+								return Ok(self.redirected_pending_response(response, leader_hint));
+							}
+						}
+					}
+				}
+			} else if let Some(cached) = self
+				.idempotency
+				.get(&Self::idempotency_key_for(response.echoed_write_id))
+				.map(|entry| *entry.value())
+			{
+				match cached.outcome() {
+					WriteOutcome::FinalizationRecoverablePending {
+						pending_finalization_id: cached_id,
+						..
+					} if cached_id == pending_finalization_id => {}
+					newer_outcome => return Ok(self.duplicate_response_for_outcome(newer_outcome)),
+				}
+			}
+		}
+		Ok(self.duplicate_response_for_outcome(outcome))
 	}
 
 	fn try_claim_pending_finalization(
@@ -1051,6 +1499,16 @@ impl WendelonDataServer {
 	}
 
 	async fn reconcile_pending_finalizations_once(&self) -> std::io::Result<usize> {
+		if let Err(err) = self
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await
+		{
+			tracing::warn!(
+				node_id = self.local_node.id,
+				error = %err,
+				"orphan-witness recovery sweep failed before pending-finalization reconciliation"
+			);
+		}
 		let mut records = self.pending_finalizations.load_all().await?;
 		records.sort_by_key(|record| {
 			(
@@ -1063,18 +1521,11 @@ impl WendelonDataServer {
 
 		let mut reconciled = 0usize;
 		for record in records {
-			let Some(_claim) = self.try_claim_pending_finalization(record.id) else {
-				continue;
-			};
-			match self.resolve_pending_finalization(&record).await {
-				Ok(resolution) => {
-					self.complete_pending_finalization(&record, resolution)
-						.await?;
+			match self.try_reconcile_pending_record_once(&record).await {
+				Ok(Some((_response, _trailing))) => {
 					reconciled += 1;
 				}
-				Err(err) if err.kind() == ErrorKind::WouldBlock => {
-					continue;
-				}
+				Ok(None) => continue,
 				Err(err) => {
 					tracing::warn!(
 						pending_id = %format_bytes_hex(record.id.as_bytes()),
@@ -1182,7 +1633,18 @@ impl WendelonDataServer {
 		}
 		match self.lease_authority.verify_lease(&lease) {
 			Ok(()) => LeaseGateResult::Valid,
-			Err(_) => LeaseGateResult::InvalidSignature,
+			Err(err) => {
+				tracing::error!(
+					holder = lease.holder.id,
+					issuer = lease.issuer.id,
+					epoch = lease.epoch,
+					range_start = lease.range_start,
+					range_end = lease.range_end,
+					error = %err,
+					"lease signature verification failed at data-ring gate"
+				);
+				LeaseGateResult::InvalidSignature
+			}
 		}
 	}
 
@@ -1255,6 +1717,137 @@ impl WendelonDataServer {
 		}
 		let lease = *bytemuck::from_bytes(&trailing[..std::mem::size_of::<LeaseDescriptor>()]);
 		Ok(LeaseAcquireOutcome::Granted(lease))
+	}
+
+	async fn pull_pending_witnesses_from_peer(
+		&self,
+		peer: NodeId,
+		request_epoch: u64,
+	) -> std::io::Result<Vec<PendingFinalizationRecord>> {
+		let conn = self.factory.get_connection(peer).await?;
+		let mut stream = conn.open_bi().await?;
+		let req = PendingWitnessPullRequestMeta {
+			requester: self.local_node,
+			request_epoch,
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::PENDING_WITNESS_REQ.0,
+			flags: 0,
+			stream_id: stream.stream_id() as u32,
+			meta_len: std::mem::size_of::<PendingWitnessPullRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&req), None, None).await?;
+		stream.finish().await?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::PENDING_WITNESS_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected PENDING_WITNESS_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			));
+		}
+		if frame.meta.len() < std::mem::size_of::<PendingWitnessPullResponseMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"PENDING_WITNESS_RESP meta too small",
+			));
+		}
+		let resp: PendingWitnessPullResponseMeta = *bytemuck::from_bytes(
+			&frame.meta[..std::mem::size_of::<PendingWitnessPullResponseMeta>()],
+		);
+		if resp.status != PendingWitnessPullStatus::OK {
+			return Err(Error::other(format!(
+				"peer {peer:?} failed orphan-witness pull with status={}",
+				resp.status.0
+			)));
+		}
+		match frame.arrow_payload.as_ref() {
+			Some(bytes) if !bytes.is_empty() => decode_pending_witness_records(bytes),
+			_ if resp.witness_count == 0 => Ok(Vec::new()),
+			_ => Err(Error::new(
+				ErrorKind::InvalidData,
+				"PENDING_WITNESS_RESP missing witness payload",
+			)),
+		}
+	}
+
+	async fn import_pending_witnesses_from_peer(
+		&self,
+		peer: NodeId,
+		request_epoch: u64,
+	) -> std::io::Result<usize> {
+		let records = self
+			.pull_pending_witnesses_from_peer(peer, request_epoch)
+			.await?;
+		let mut imported = 0usize;
+		for record in records {
+			if self.pending_finalizations.get(record.id).await?.is_none() {
+				self.pending_finalizations.upsert(record).await?;
+				imported += 1;
+			}
+		}
+		Ok(imported)
+	}
+
+	fn current_orphan_witness_recovery_stamp(&self) -> Option<OrphanWitnessRecoveryStamp> {
+		let metrics = self.raft.metrics();
+		let borrowed = metrics.borrow();
+		if borrowed.current_leader != Some(self.local_node.id) {
+			return None;
+		}
+		Some(OrphanWitnessRecoveryStamp {
+			term: borrowed.current_term,
+			epoch: self.factory.membership_snapshot().epoch,
+		})
+	}
+
+	async fn ensure_orphan_witnesses_recovered_for_leadership(&self) -> std::io::Result<()> {
+		let Some(target) = self.current_orphan_witness_recovery_stamp() else {
+			return Ok(());
+		};
+
+		if *self
+			.orphan_witness_recovery_stamp
+			.read()
+			.expect("orphan witness recovery stamp poisoned")
+			== Some(target)
+		{
+			return Ok(());
+		}
+
+		let _guard = self.orphan_witness_recovery_lock.lock().await;
+		let Some(target) = self.current_orphan_witness_recovery_stamp() else {
+			return Ok(());
+		};
+		if *self
+			.orphan_witness_recovery_stamp
+			.read()
+			.expect("orphan witness recovery stamp poisoned")
+			== Some(target)
+		{
+			return Ok(());
+		}
+
+		let membership = self.factory.membership_snapshot();
+		for (peer, caps) in &membership.peers {
+			if peer.id == self.local_node.id || !caps.roles.contains(NodeRole::Data) {
+				continue;
+			}
+			self.import_pending_witnesses_from_peer(*peer, target.epoch)
+				.await?;
+		}
+
+		*self
+			.orphan_witness_recovery_stamp
+			.write()
+			.expect("orphan witness recovery stamp poisoned") = Some(target);
+		Ok(())
 	}
 
 	/// Single pass of the lease manager (plan 018):
@@ -1833,7 +2426,9 @@ impl WendelonDataServer {
 				actor.role,
 				ActorRole::DataNode | ActorRole::Operator | ActorRole::BreakGlassAdmin
 			),
-			DataOperation::Replicate | DataOperation::Migrate => {
+			DataOperation::Replicate
+			| DataOperation::Migrate
+			| DataOperation::PendingWitnessPull => {
 				matches!(actor.role, ActorRole::DataNode)
 			}
 		};
@@ -2301,6 +2896,76 @@ impl WendelonDataServer {
 		};
 		Ok(HrftFrame {
 			header,
+			meta: body,
+			arrow_payload,
+			trailing: None,
+		})
+	}
+
+	async fn handle_pending_witness_pull(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<PendingWitnessPullRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"PENDING_WITNESS_REQ meta too small",
+			));
+		}
+		let req: PendingWitnessPullRequestMeta = *bytemuck::from_bytes(
+			&frame.meta[..std::mem::size_of::<PendingWitnessPullRequestMeta>()],
+		);
+		let (resp_meta, payload) = if self.degraded_reason().is_some() {
+			(
+				PendingWitnessPullResponseMeta {
+					status: PendingWitnessPullStatus::INTERNAL_ERROR,
+					_pad1: [0; 7],
+					witness_count: 0,
+				},
+				None,
+			)
+		} else {
+			let records = self.pending_finalizations.load_all().await?;
+			let payload = if records.is_empty() {
+				None
+			} else {
+				Some(encode_pending_witness_records(&records)?)
+			};
+			tracing::debug!(
+				requester = ?req.requester,
+				request_epoch = req.request_epoch,
+				witness_count = records.len(),
+				"serving orphan-witness pull"
+			);
+			(
+				PendingWitnessPullResponseMeta {
+					status: PendingWitnessPullStatus::OK,
+					_pad1: [0; 7],
+					witness_count: records.len() as u64,
+				},
+				payload,
+			)
+		};
+
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp_meta));
+		let arrow_payload = payload.map(|bytes| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec().extend_from_slice(&bytes);
+			buf
+		});
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::PENDING_WITNESS_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: arrow_payload
+					.as_ref()
+					.map(|buf| buf.len() as u32)
+					.unwrap_or(0),
+				trailing_len: 0,
+			},
 			meta: body,
 			arrow_payload,
 			trailing: None,
@@ -2919,7 +3584,9 @@ impl WendelonDataServer {
 		})?;
 
 		let arrow_bytes: &[u8] = &arrow[..];
-		let (status, ack_level) = if payload_digest(arrow_bytes) != meta.payload_hash {
+		let (status, ack_level) = if self.degraded_reason().is_some() {
+			(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+		} else if payload_digest(arrow_bytes) != meta.payload_hash {
 			(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
 		} else {
 			match self
@@ -2932,7 +3599,25 @@ impl WendelonDataServer {
 				)
 				.await
 			{
-				Ok(_) => (ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE),
+				Ok(_) => {
+					let pending = self.pending_finalization_record_from_replica_meta(&meta);
+					match self.pending_finalizations.upsert(pending).await {
+						Ok(()) => (ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE),
+						Err(err) => {
+							tracing::error!(
+								write_id = ?meta.write_id,
+								tenant_id = meta.tenant_id.get(),
+								error = %err,
+								"replica failed to persist pending-finalization witness after durable append"
+							);
+							self.trip_local_persistence_distrust(format!(
+								"replica pending finalization witness persistence failed after durable append: {err}"
+							))
+							.await;
+							(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+						}
+					}
+				}
 				Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
 			}
 		};
@@ -3094,6 +3779,28 @@ impl DataRingServer for WendelonDataServer {
 				}
 				self.handle_migrate(frame).await.map(Some)
 			}
+			MsgType::PENDING_WITNESS_REQ => {
+				if frame.meta.len() < std::mem::size_of::<PendingWitnessPullRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"PENDING_WITNESS_REQ meta too small",
+					));
+				}
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						None,
+						DataOperation::PendingWitnessPull,
+					)
+					.is_err()
+				{
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"pending witness pull requires data-node identity",
+					));
+				}
+				self.handle_pending_witness_pull(frame).await.map(Some)
+			}
 			other => Err(Error::new(
 				ErrorKind::Unsupported,
 				format!(
@@ -3231,50 +3938,77 @@ impl DataRing for WendelonDataServer {
 		// 3. Idempotency fast path.
 		let key = Self::idempotency_key_for(meta.write_id);
 		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-			if let Some(pending_id) = cached.pending_finalization_id {
-				if let Some(record) = self.pending_finalizations.get(pending_id).await? {
-					if let Some(_claim) = self.try_claim_pending_finalization(record.id) {
-						if let Ok(resolution) = self.resolve_pending_finalization(&record).await {
-							let (mut response, trailing) = self
-								.complete_pending_finalization(&record, resolution)
-								.await?;
-							response.status = WriteStatus::DUPLICATE;
-							return Ok((response, trailing));
-						}
-					}
-				}
-				return Ok((cached.response, cached.finalization));
-			}
-			let mut resp = cached.response;
-			resp.status = WriteStatus::DUPLICATE;
-			return Ok((resp, cached.finalization));
+			return self.replay_write_outcome(cached.outcome()).await;
 		}
 
+		if self.degraded_reason().is_some() {
+			return Ok(self.fenced_write_response(&meta).await);
+		}
+
+		// 3a. Decode the payload before cache-miss admission so we can
+		// make non-primary redirect decisions without forcing a fresh
+		// leader to complete orphan-witness recovery for a range this
+		// node does not own.
+		//
+		// This is still pre-bifurcation bookkeeping: no durable write
+		// work has started yet.
+		//
 		// 4. Cross the ADR 003 bifurcation boundary exactly once.
 		// The returned bundle becomes the single source of truth for
 		// both the data branch and the control branch.
 		let bifurcated = bifurcate_client_write(&meta, &payload)?;
 
-		// 4a. Per-range lease gate (plan 018). When enabled, this
-		// node accepts the write only if it holds a valid lease
-		// covering `key_locality` in the client's epoch. A node that is
-		// not the primary for this key returns `NOT_LEADER` so the
-		// Smart Client reroutes; a node that is the primary but
-		// whose lease has lapsed returns `LEASE_EXPIRED` so the
-		// client retries once the manager has renewed.
-		if self.lease_gate_enabled {
-			let is_primary = self
-				.router
+		// 4a. Non-primary redirect must happen before the fresh-leader
+		// orphan-witness sweep. A node that does not own this range
+		// should return `NOT_LEADER` cheaply rather than failing on a
+		// peer-sweep precondition that is only relevant to primary-owned
+		// replay and write admission.
+		let lease_gate_is_primary = if self.lease_gate_enabled {
+			self.router
 				.replicas_for_locality(bifurcated.locality)
 				.first()
 				.map(|n| n.id == self.local_node.id)
-				.unwrap_or(false);
-			if !is_primary {
-				return Ok((
-					error_response(&meta, WriteStatus::NOT_LEADER, self.local_node),
-					None,
-				));
-			}
+				.unwrap_or(false)
+		} else {
+			false
+		};
+		if self.lease_gate_enabled && !lease_gate_is_primary {
+			return Ok((
+				error_response(&meta, WriteStatus::NOT_LEADER, self.local_node),
+				None,
+			));
+		}
+
+		// Fresh leaders block cache-miss admission until orphan-witness
+		// recovery for the current `(term, membership_epoch)` is
+		// complete. Cached outcomes are already authoritative for this
+		// node; the barrier exists to close the duplicate-retry window
+		// before consulting durable pending witnesses or admitting a
+		// fresh primary-owned write across the bifurcation boundary.
+		self.ensure_orphan_witnesses_recovered_for_leadership()
+			.await?;
+
+		// 4b. Restart-safe pending replay path. A recovered server
+		// starts with an empty idempotency cache, so consult the
+		// durable pending-intent store before crossing the
+		// bifurcation boundary again.
+		if let Some(record) = self
+			.pending_finalizations
+			.find_by_write_id(meta.write_id)
+			.await?
+		{
+			let outcome = self.recoverable_pending_outcome_for_record(&record);
+			self.idempotency
+				.insert(key, CachedWriteOutcome::new(outcome));
+			return self.replay_write_outcome(outcome).await;
+		}
+
+		// 4c. Per-range lease gate (plan 018). When enabled, this
+		// node accepts the write only if it holds a valid lease
+		// covering `key_locality` in the client's epoch. Primary-owner
+		// routing was decided above; this branch now answers only the
+		// lease-validity question.
+		if self.lease_gate_enabled {
 			match self
 				.lease_gate_result(bifurcated.locality, meta.expected_epoch, meta.client_hlc)
 				.await
@@ -3324,47 +4058,51 @@ impl DataRing for WendelonDataServer {
 		}
 		let rf = replicas.len();
 		let quorum = (rf / 2) + 1;
-
-		// 8. Local append+flush (if this node is in the replica
-		// set) and concurrent fan-out to the remaining replicas.
-		// Each remote leg runs on its own task so head-of-line
-		// blocking on any single peer only slows *that* leg — the
-		// quorum race still completes as soon as the first majority
-		// of durable acks arrive.
-		let mut durable_acks: usize = 0;
 		let local_is_replica = replicas.iter().any(|n| n.id == self.local_node.id);
-		if local_is_replica {
-			// Drive the local durable path first so the leader's
-			// own slab is either flushed or the write aborts before
-			// we race any remote finalization condition.
-			match self
-				.slab
-				.append_durable(
-					meta.tenant_id,
-					bifurcated.key_identity,
-					commit_hlc,
-					bifurcated.frame_bytes.as_slice(),
-				)
-				.await
-			{
-				Ok(_) => durable_acks += 1,
-				Err(e) => {
-					// A local durability failure is terminal — we
-					// cannot finalize a write we could not even put
-					// on our own NVMe. Propagate rather than falling
-					// back to a pure remote quorum, which would make
-					// the local index silently diverge.
-					return Err(e);
-				}
-			}
-		}
+		let mut quorum_tracker = DurableQuorumTracker::new(quorum, local_is_replica);
 
+		// 8. Start the leader-local durable append (if this node is
+		// in the replica set) and remote fan-out concurrently. Each
+		// remote leg runs on its own task so head-of-line blocking
+		// on any single peer only slows *that* leg; the local append
+		// is just another quorum leg racing in parallel.
+		let mut local_durable_task: Option<JoinHandle<std::io::Result<RecordLocation>>> =
+			if local_is_replica {
+				let slab = self.slab.clone();
+				let bytes = bifurcated.frame_bytes.clone();
+				let tenant_id = meta.tenant_id;
+				let key_identity = bifurcated.key_identity;
+				#[cfg(test)]
+				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
+				Some(tokio::spawn(async move {
+					#[cfg(test)]
+					if let Some((kind, message)) = fail_next_local_durable_append
+						.lock()
+						.expect("local durable append failpoint poisoned")
+						.take()
+					{
+						return Err(Error::new(
+							kind,
+							format!("injected local durable append failure: {message}"),
+						));
+					}
+					slab.append_durable(tenant_id, key_identity, commit_hlc, bytes.as_slice())
+						.await
+				}))
+			} else {
+				None
+			};
 		let replica_meta = ReplicaWriteMeta {
 			commit_hlc,
+			write_id: meta.write_id,
 			epoch: meta.expected_epoch,
 			tenant_id: meta.tenant_id,
+			charged_bytes: bifurcated.charged_bytes,
 			key_identity: bifurcated.key_identity,
 			payload_hash: bifurcated.payload_hash,
+			durability: meta.durability,
+			await_finalization: meta.await_finalization,
+			_pad: [0; 6],
 		};
 		let mut join: JoinSet<std::io::Result<ReplicaAckLevel>> = JoinSet::new();
 		for target in replicas.iter().copied() {
@@ -3379,20 +4117,51 @@ impl DataRing for WendelonDataServer {
 			});
 		}
 
-		// 9. Quorum race. Stop polling as soon as the majority is
-		// in — outstanding tasks keep running to completion so
-		// slower replicas still catch up, but we do not block the
-		// client on them.
-		while durable_acks < quorum {
-			match join.join_next().await {
-				Some(Ok(Ok(level))) if level == ReplicaAckLevel::DURABLE => durable_acks += 1,
-				Some(Ok(Ok(_))) => { /* append-only/non-durable ack */ }
-				Some(_) => { /* leg failed — keep racing */ }
-				None => break, // no more remote legs in flight
+		// 9. Quorum race. Stop once the centralized tracker says the
+		// quorum is satisfied. When the leader is itself a replica,
+		// pure-remote durable quorum is explicitly insufficient until
+		// the leader-local durable leg succeeds too.
+		while !quorum_tracker.is_satisfied() {
+			tokio::select! {
+				local = async {
+					match local_durable_task.as_mut() {
+						Some(task) => Some(task.await),
+						None => None,
+					}
+				}, if local_durable_task.is_some() => {
+					match local.expect("local durable task is guarded by is_some()") {
+						Ok(Ok(_location)) => {
+							quorum_tracker.note_local_durable();
+						}
+						Ok(Err(err)) => {
+							self.trip_local_persistence_distrust(format!(
+								"local durable append returned error: {err}"
+							))
+							.await;
+							return Ok(self.fenced_write_response(&meta).await);
+						}
+						Err(err) => {
+							self.trip_local_persistence_distrust(format!(
+								"local durable append task failed: {err}"
+							))
+							.await;
+							return Ok(self.fenced_write_response(&meta).await);
+						}
+					}
+					local_durable_task = None;
+				}
+				remote = join.join_next(), if !join.is_empty() => {
+					match remote {
+						Some(Ok(Ok(level))) => quorum_tracker.note_remote_ack(level),
+						Some(_) => { /* leg failed — keep racing */ }
+						None => {}
+					}
+				}
+				else => break,
 			}
 		}
 
-		if durable_acks < quorum {
+		if !quorum_tracker.is_satisfied() {
 			return Ok((
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
@@ -3409,17 +4178,41 @@ impl DataRing for WendelonDataServer {
 			.ok_or_else(|| {
 				Error::other("pending finalization for this write is already being processed")
 			})?;
-		let pending_persisted = match self.pending_finalizations.upsert(pending.clone()).await {
-			Ok(()) => true,
-			Err(err) => {
-				tracing::warn!(
-					pending_id = %format_bytes_hex(pending.id.as_bytes()),
-					error = %err,
-					"failed to persist pending finalization; continuing without restart recovery"
-				);
-				false
+		if let Err(err) = self.pending_finalizations.upsert(pending.clone()).await {
+			tracing::error!(
+				pending_id = %format_bytes_hex(pending.id.as_bytes()),
+				write_id = ?meta.write_id,
+				tenant_id = meta.tenant_id.get(),
+				error = %err,
+				"failed to persist pending finalization; attempting immediate finalization before fencing node"
+			);
+			match self.resolve_pending_finalization(&pending).await {
+				Ok(resolution) => {
+					let committed = self
+						.complete_pending_finalization(&pending, resolution)
+						.await;
+					self.trip_local_persistence_distrust(format!(
+						"pending finalization intent persistence failed after durable quorum: {err}"
+					))
+					.await;
+					return committed;
+				}
+				Err(finalize_err) => {
+					tracing::error!(
+						pending_id = %format_bytes_hex(pending.id.as_bytes()),
+						write_id = ?meta.write_id,
+						tenant_id = meta.tenant_id.get(),
+						error = %finalize_err,
+						"immediate finalization also failed after pending intent persistence failure; fencing node"
+					);
+					self.trip_local_persistence_distrust(format!(
+						"pending finalization intent persistence failed after durable quorum: {err}; immediate finalization failed: {finalize_err}"
+					))
+					.await;
+					return Ok(self.fenced_write_response(&meta).await);
+				}
 			}
-		};
+		}
 
 		match self.resolve_pending_finalization(&pending).await {
 			Ok(resolution) => {
@@ -3432,19 +4225,19 @@ impl DataRing for WendelonDataServer {
 					error = %err,
 					"finalization commit failed after the data branch reached durable quorum"
 				);
-				let response =
-					self.pending_error_response(meta.write_id, meta.expected_epoch, commit_hlc);
-				if pending_persisted {
-					self.idempotency.insert(
-						key,
-						CachedWriteOutcome {
-							response,
-							finalization: None,
-							pending_finalization_id: Some(pending.id),
-						},
-					);
-					self.pending_finalization_wakeup.notify_one();
-				}
+				let response = self.recoverable_pending_response(
+					meta.write_id,
+					meta.expected_epoch,
+					commit_hlc,
+				);
+				self.idempotency.insert(
+					key,
+					CachedWriteOutcome::new(WriteOutcome::FinalizationRecoverablePending {
+						response,
+						pending_finalization_id: pending.id,
+					}),
+				);
+				self.pending_finalization_wakeup.notify_one();
 				Ok((response, None))
 			}
 		}
@@ -4267,6 +5060,22 @@ fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord
 	Ok(out)
 }
 
+fn encode_pending_witness_records(
+	records: &[PendingFinalizationRecord],
+) -> std::io::Result<Vec<u8>> {
+	postcard::to_stdvec(records)
+		.map_err(|err| Error::other(format!("encode pending witness records: {err}")))
+}
+
+fn decode_pending_witness_records(bytes: &[u8]) -> std::io::Result<Vec<PendingFinalizationRecord>> {
+	postcard::from_bytes(bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("decode pending witness records: {err}"),
+		)
+	})
+}
+
 fn query_error_meta(
 	meta: &QueryRequestMeta,
 	status: ReadStatus,
@@ -4661,6 +5470,131 @@ mod tests {
 		let crypto = Arc::new(CryptoManager::new_dev());
 		crypto.install_local_only_for_tests(tenant()).unwrap();
 		crypto
+	}
+
+	struct OrphanWitnessFixture {
+		leader_node: WendelonNode,
+		follower_node: WendelonNode,
+		leader: Arc<WendelonDataServer>,
+		follower: Arc<WendelonDataServer>,
+		epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
+	}
+
+	async fn build_orphan_witness_fixture(tag: &str) -> OrphanWitnessFixture {
+		let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			26,
+			bootstrap_tempdir(&format!("{tag}-leader")),
+			"loopback://26".into(),
+		))
+		.await
+		.unwrap();
+		let follower_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			27,
+			bootstrap_tempdir(&format!("{tag}-follower")),
+			"loopback://27".into(),
+		))
+		.await
+		.unwrap();
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if leader_node.raft.current_leader().await == Some(leader_node.local_node.id)
+				&& follower_node.raft.current_leader().await == Some(follower_node.local_node.id)
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leaders"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		let pool = leader_node.pool.clone();
+		let handlers = LoopbackHandlers::new(pool.clone());
+		let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
+			handlers: handlers.clone(),
+			tier: TransportTier::QuicIoUring,
+		});
+		let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = StdHashMap::new();
+		peers.insert(
+			leader_node.local_node,
+			PeerCapabilities {
+				address: "loopback://26".into(),
+				tiers,
+				roles,
+			},
+		);
+		peers.insert(
+			follower_node.local_node,
+			PeerCapabilities {
+				address: "loopback://27".into(),
+				tiers,
+				roles,
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 2, peers };
+		let (epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let build_factory = || {
+			let mut providers: StdHashMap<TransportTier, Arc<dyn TransportProvider>> =
+				StdHashMap::new();
+			providers.insert(TransportTier::QuicIoUring, loopback_provider.clone());
+			TransportProviderFactory::new(tiers, providers, resolver.clone(), epoch_rx.clone())
+		};
+		let router: Arc<dyn ReplicaRouter> = Arc::new(FixedReplicaRouter::new(vec![
+			leader_node.local_node,
+			follower_node.local_node,
+		]));
+
+		let leader = Arc::new(
+			WendelonDataServer::new(
+				leader_node.slab.clone(),
+				leader_node.raft.clone(),
+				leader_node.log_store.clone(),
+				leader_node.state_machine.clone(),
+				leader_node.local_node,
+				leader_node.clock.clone(),
+				router.clone(),
+				build_factory(),
+				pool.clone(),
+			)
+			.unwrap(),
+		);
+		let follower = Arc::new(
+			WendelonDataServer::new(
+				follower_node.slab.clone(),
+				follower_node.raft.clone(),
+				follower_node.log_store.clone(),
+				follower_node.state_machine.clone(),
+				follower_node.local_node,
+				follower_node.clock.clone(),
+				router,
+				build_factory(),
+				follower_node.pool.clone(),
+			)
+			.unwrap(),
+		);
+
+		let follower_data_ring: Arc<dyn DataRingServer> = follower.clone();
+		let follower_service: Arc<dyn HrftService> = Arc::new(
+			MsgRouter::builder()
+				.with_data_ring(follower_data_ring)
+				.build(),
+		);
+		handlers.register(follower_node.local_node, follower_service);
+
+		OrphanWitnessFixture {
+			leader_node,
+			follower_node,
+			leader,
+			follower,
+			epoch_tx,
+		}
 	}
 
 	async fn make_manager() -> Arc<SlabManager> {
@@ -5438,6 +6372,35 @@ mod tests {
 		assert!(err.to_string().contains("key_identity mismatch"));
 	}
 
+	#[test]
+	fn durable_quorum_tracker_requires_local_leg_when_leader_is_replica() {
+		let mut tracker = DurableQuorumTracker::new(2, true);
+		tracker.note_remote_ack(ReplicaAckLevel::DURABLE);
+		tracker.note_remote_ack(ReplicaAckLevel::DURABLE);
+		assert_eq!(tracker.durable_ack_count(), 2);
+		assert!(tracker.quorum_reached());
+		assert!(
+			!tracker.is_satisfied(),
+			"pure-remote quorum must not satisfy the write when the leader is a replica"
+		);
+
+		tracker.note_local_durable();
+		assert!(tracker.is_satisfied());
+	}
+
+	#[test]
+	fn durable_quorum_tracker_allows_remote_quorum_when_local_leg_not_required() {
+		let mut tracker = DurableQuorumTracker::new(2, false);
+		tracker.note_remote_ack(ReplicaAckLevel::APPEND_ONLY);
+		tracker.note_remote_ack(ReplicaAckLevel::DURABLE);
+		assert_eq!(tracker.durable_ack_count(), 1);
+		assert!(!tracker.is_satisfied());
+
+		tracker.note_remote_ack(ReplicaAckLevel::DURABLE);
+		assert_eq!(tracker.durable_ack_count(), 2);
+		assert!(tracker.is_satisfied());
+	}
+
 	#[tokio::test]
 	async fn duplicate_write_replays_finalization_marker_and_emits_one_audit_record() {
 		let dir = bootstrap_tempdir("duplicate-finalization");
@@ -5507,6 +6470,191 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn duplicate_write_replays_terminal_failure_without_recovery() {
+		let dir = bootstrap_tempdir("duplicate-terminal-failure");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			18,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+		let terminal = node.data_server.terminal_failure_response_for_test(
+			meta.write_id,
+			meta.expected_epoch,
+			hlc(2, 0, 0),
+		);
+		node.data_server.idempotency.insert(
+			WendelonDataServer::idempotency_key_for(meta.write_id),
+			CachedWriteOutcome::new(WriteOutcome::FinalizationTerminalFailure {
+				response: terminal,
+			}),
+		);
+
+		let (duplicate, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+
+		assert_eq!(
+			duplicate.status,
+			WriteStatus::DUPLICATE,
+			"got resp={duplicate:?}"
+		);
+		assert_eq!(duplicate.commit_hlc, terminal.commit_hlc);
+		assert_eq!(duplicate.echoed_write_id, terminal.echoed_write_id);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn duplicate_write_stays_retryable_while_finalization_is_pending() {
+		let dir = bootstrap_tempdir("duplicate-recoverable-pending");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			19,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		node.raft.shutdown().await.unwrap();
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		let (first, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(first.status, WriteStatus::FINALIZATION_PENDING);
+		assert!(trailing.is_none());
+
+		let (duplicate, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(duplicate.status, WriteStatus::FINALIZATION_PENDING);
+		assert_eq!(duplicate.commit_hlc, first.commit_hlc);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			1
+		);
+	}
+
+	#[tokio::test]
+	async fn duplicate_write_replays_persisted_pending_intent_after_cache_loss() {
+		let dir = bootstrap_tempdir("duplicate-persisted-pending");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			21,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		node.raft.shutdown().await.unwrap();
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		let before_bytes = node.slab.local_l1_bytes().await;
+		let (first, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(first.status, WriteStatus::FINALIZATION_PENDING);
+		assert!(trailing.is_none());
+		let after_first_bytes = node.slab.local_l1_bytes().await;
+		assert!(
+			after_first_bytes > before_bytes,
+			"first write must durably append local bytes before finalization stalls"
+		);
+
+		// Intentionally reuse the shut-down raft handle here: the
+		// invariant under test is that a cache-loss replay must not
+		// re-append the payload bytes, even when reconciliation falls
+		// back to the retryable pending status.
+		let replay_server = WendelonDataServer::new(
+			node.slab.clone(),
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			node.data_server.router.clone(),
+			node.data_server.factory.clone(),
+			node.pool.clone(),
+		)
+		.unwrap();
+
+		let (duplicate, trailing) = replay_server.write(meta, single_kv_batch()).await.unwrap();
+		assert_eq!(duplicate.status, WriteStatus::FINALIZATION_PENDING);
+		assert_eq!(duplicate.commit_hlc, first.commit_hlc);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.slab.local_l1_bytes().await,
+			after_first_bytes,
+			"duplicate replay after cache loss must not append the payload again"
+		);
+		assert_eq!(replay_server.pending_finalization_count_for_test().await, 1);
+	}
+
+	#[tokio::test]
 	async fn pending_finalization_replays_after_restart_when_control_branch_failed() {
 		let dir = bootstrap_tempdir("pending-finalization-restart");
 		let audit_path = dir.join("audit.ndjson");
@@ -5542,7 +6690,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			resp.status,
-			WriteStatus::INTERNAL_ERROR,
+			WriteStatus::FINALIZATION_PENDING,
 			"got resp={resp:?}"
 		);
 		assert!(trailing.is_none());
@@ -5616,6 +6764,371 @@ mod tests {
 		}
 
 		recovered.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn leader_recovers_orphan_witnesses_from_peer_before_reconciliation() {
+		let fx = build_orphan_witness_fixture("orphan-witness").await;
+
+		let record = PendingFinalizationRecord::new(
+			crate::schema::ClientWriteId {
+				client_uuid: [0x5A; 16],
+				sequence_no: 77,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			true,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: 1,
+					commit_hlc: hlc(100, 0, fx.leader_node.local_node.id),
+					payload_hash: [0xCD; 32],
+					e_safe_index: 0,
+					durability: DurabilityLevel::QUORUM,
+					_pad: [0; 7],
+				},
+				tenant_id: tenant(),
+				key_identity: id(9001),
+				charged_bytes: 512,
+			},
+		);
+		fx.follower
+			.pending_finalizations
+			.upsert(record.clone())
+			.await
+			.unwrap();
+
+		let current_term = fx.leader.raft.metrics().borrow().current_term;
+		assert!(
+			current_term > 0,
+			"single-node leader must have entered a positive Raft term"
+		);
+		*fx.leader
+			.orphan_witness_recovery_stamp
+			.write()
+			.expect("orphan witness recovery stamp poisoned") = Some(OrphanWitnessRecoveryStamp {
+			term: current_term - 1,
+			epoch: 2,
+		});
+
+		assert_eq!(fx.leader.pending_finalization_count_for_test().await, 0);
+		fx.leader
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await
+			.unwrap();
+		assert_eq!(fx.leader.pending_finalization_count_for_test().await, 1);
+
+		let reconciled = fx
+			.leader
+			.reconcile_pending_finalizations_once()
+			.await
+			.unwrap();
+		assert_eq!(reconciled, 1);
+		assert_eq!(fx.leader.pending_finalization_count_for_test().await, 0);
+
+		let applied_upto = fx
+			.leader
+			.state_machine
+			.last_applied_log_index()
+			.await
+			.expect("finalization must advance the log");
+		let marker = fx
+			.leader
+			.log_store
+			.find_applied_finalization(&record.finalization, applied_upto)
+			.await
+			.unwrap();
+		assert!(
+			marker.is_some(),
+			"leader must finalize the imported orphan witness"
+		);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn fresh_leader_recovers_peer_witness_before_duplicate_write_replays() {
+		let fx = build_orphan_witness_fixture("orphan-witness-duplicate").await;
+		let mut meta = simple_write_meta(1);
+		meta.write_id.sequence_no = 88;
+		meta.await_finalization = 1;
+		let batch = single_kv_batch();
+		let bifurcated = bifurcate_client_write(&meta, &batch).unwrap();
+		let record = PendingFinalizationRecord::new(
+			meta.write_id,
+			true,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: meta.expected_epoch,
+					commit_hlc: hlc(200, 0, fx.leader_node.local_node.id),
+					payload_hash: bifurcated.payload_hash,
+					e_safe_index: 0,
+					durability: meta.durability,
+					_pad: [0; 7],
+				},
+				tenant_id: meta.tenant_id,
+				key_identity: meta.key_identity,
+				charged_bytes: bifurcated.charged_bytes,
+			},
+		);
+		fx.follower
+			.pending_finalizations
+			.upsert(record)
+			.await
+			.unwrap();
+
+		let before_bytes = fx.leader_node.slab.local_l1_bytes().await;
+		let (response, trailing) = fx.leader.write(meta, batch).await.unwrap();
+		assert_eq!(
+			response.status,
+			WriteStatus::DUPLICATE,
+			"got resp={response:?}"
+		);
+		assert_eq!(
+			fx.leader_node.slab.local_l1_bytes().await,
+			before_bytes,
+			"fresh-leader recovery must import the peer witness before re-appending payload bytes"
+		);
+		assert!(trailing.is_some());
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn cached_duplicate_replays_without_orphan_witness_sweep() {
+		let fx = build_orphan_witness_fixture("orphan-witness-cache-bypass").await;
+		let mut meta = simple_write_meta(1);
+		meta.await_finalization = 1;
+		let batch = single_kv_batch();
+
+		let (first, first_trailing) = fx.leader.write(meta, batch.clone()).await.unwrap();
+		assert_eq!(first.status, WriteStatus::OK, "got resp={first:?}");
+
+		let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = fx.epoch_tx.borrow().as_ref().peers.clone();
+		peers.insert(
+			n(99),
+			PeerCapabilities {
+				address: "loopback://99".into(),
+				tiers,
+				roles,
+			},
+		);
+		fx.epoch_tx
+			.send(Arc::new(MembershipEpoch { epoch: 3, peers }))
+			.unwrap();
+
+		let (duplicate, trailing) = fx.leader.write(meta, batch).await.unwrap();
+		assert_eq!(
+			duplicate.status,
+			WriteStatus::DUPLICATE,
+			"cached duplicate replay must not be blocked by an unreachable sweep peer"
+		);
+		assert_eq!(trailing, first_trailing);
+
+		fx.leader_node.handles.abort();
+		fx.follower_node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn write_commits_and_fences_when_pending_intent_persistence_fails() {
+		let dir = bootstrap_tempdir("pending-intent-upsert-fail");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			20,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		node.data_server
+			.pending_finalizations
+			.fail_next_upsert_for_test("injected-by-b2");
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		let (resp, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+
+		assert_eq!(resp.status, WriteStatus::OK, "got resp={resp:?}");
+		assert!(trailing.is_some());
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			0
+		);
+		assert!(
+			node.slab.lookup(tenant(), meta.key_identity).is_some(),
+			"data branch must remain durable even though finalization intent persistence failed"
+		);
+		assert_eq!(
+			node.data_server.degraded_reason().as_deref(),
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+		);
+
+		let (duplicate, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(duplicate.status, WriteStatus::DUPLICATE);
+		assert!(trailing.is_some());
+	}
+
+	#[tokio::test]
+	async fn write_fences_when_pending_intent_persistence_and_immediate_finalization_fail() {
+		let dir = bootstrap_tempdir("pending-intent-upsert-and-finalize-fail");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			25,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		node.data_server
+			.pending_finalizations
+			.fail_next_upsert_for_test("injected-by-b2");
+		node.raft.shutdown().await.unwrap();
+
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(1, 0, 0);
+		meta.await_finalization = 1;
+
+		let (resp, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(
+			resp.status,
+			WriteStatus::INTERNAL_ERROR,
+			"got resp={resp:?}"
+		);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.degraded_reason().as_deref(),
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+		);
+		assert_eq!(
+			node.data_server.pending_finalization_count_for_test().await,
+			0
+		);
+		assert!(
+			node.slab.lookup(tenant(), meta.key_identity).is_some(),
+			"data branch must remain durable even though finalization cannot be recovered on this node"
+		);
+
+		let (duplicate, trailing) = node
+			.data_server
+			.write(meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(duplicate.status, WriteStatus::INTERNAL_ERROR);
+		assert!(trailing.is_none());
+	}
+
+	#[tokio::test]
+	async fn local_persistence_failure_fences_future_writes() {
+		let dir = bootstrap_tempdir("local-persistence-fence");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			22,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		node.data_server
+			.fail_next_local_durable_append_for_test(ErrorKind::PermissionDenied, "b6-fence");
+
+		let mut first_meta = simple_write_meta(1);
+		first_meta.client_hlc = hlc(1, 0, 0);
+		let before_first = node.slab.local_l1_bytes().await;
+		let (first, trailing) = node
+			.data_server
+			.write(first_meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(first.status, WriteStatus::INTERNAL_ERROR);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.degraded_reason().as_deref(),
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+		);
+		assert_eq!(
+			node.slab.local_l1_bytes().await,
+			before_first,
+			"failed leader-local durable append must not publish bytes locally"
+		);
+
+		let mut second_meta = simple_write_meta(1);
+		second_meta.write_id.sequence_no = 2;
+		second_meta.client_hlc = hlc(2, 0, 0);
+		let before_second = node.slab.local_l1_bytes().await;
+		let (second, trailing) = node
+			.data_server
+			.write(second_meta, single_kv_batch())
+			.await
+			.unwrap();
+		assert_eq!(second.status, WriteStatus::INTERNAL_ERROR);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.slab.local_l1_bytes().await,
+			before_second,
+			"fenced node must reject later writes before attempting another local append"
+		);
 	}
 
 	// ========================================================
@@ -6588,6 +8101,31 @@ mod tests {
 			_context: RequestContext,
 			frame: HrftFrame,
 		) -> std::io::Result<Option<HrftFrame>> {
+			if frame.header.msg_type == MsgType::PENDING_WITNESS_REQ.0 {
+				let resp = PendingWitnessPullResponseMeta {
+					status: PendingWitnessPullStatus::OK,
+					_pad1: [0; 7],
+					witness_count: 0,
+				};
+				let mut body = self.pool.acquire();
+				body.as_mut_vec()
+					.extend_from_slice(bytemuck::bytes_of(&resp));
+				return Ok(Some(HrftFrame {
+					header: FrameHeader {
+						magic: HRFT_MAGIC,
+						version: 1,
+						msg_type: MsgType::PENDING_WITNESS_RESP.0,
+						flags: 0,
+						stream_id: frame.header.stream_id,
+						meta_len: body.len() as u32,
+						arrow_len: 0,
+						trailing_len: 0,
+					},
+					meta: body,
+					arrow_payload: None,
+					trailing: None,
+				}));
+			}
 			if frame.header.msg_type != MsgType::REPLICATE_REQ.0 {
 				return Err(Error::new(
 					ErrorKind::Unsupported,

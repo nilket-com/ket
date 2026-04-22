@@ -1387,7 +1387,7 @@ impl WendelonNode {
 			.spawn()
 		});
 
-		Ok(Self {
+		let node = Self {
 			local_node,
 			slab,
 			crypto,
@@ -1424,7 +1424,21 @@ impl WendelonNode {
 				default_tenant_seeder,
 				checkpoint_emitter,
 			},
-		})
+		};
+		if node.data_server.degraded_reason().is_some() {
+			tracing::error!(
+				node_id = node.local_node.id,
+				"bootstrapped with persisted local-persistence distrust fence; shutting down raft participation"
+			);
+			if let Err(err) = node.raft.shutdown().await {
+				tracing::error!(
+					node_id = node.local_node.id,
+					error = %err,
+					"failed to shut down raft participation for persisted distrust fence"
+				);
+			}
+		}
+		Ok(node)
 	}
 
 	pub fn subscribe_clock_drift(&self) -> watch::Receiver<Option<ClockDriftEvent>> {
@@ -1504,6 +1518,7 @@ impl WendelonNode {
 			local_node: self.local_node,
 			epoch_tx: self.epoch_tx.clone(),
 			raft: self.raft.clone(),
+			data_server: self.data_server.clone(),
 			lifecycle: self.lifecycle.clone(),
 			audit_materialization: self.audit_materialization.clone(),
 		}
@@ -1515,6 +1530,7 @@ pub struct NodeReadinessView {
 	local_node: NodeId,
 	epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	raft: WendelonRaft,
+	data_server: Arc<WendelonDataServer>,
 	lifecycle: ServerLifecycle,
 	audit_materialization: Arc<AuditMaterializationTracker>,
 }
@@ -1536,6 +1552,9 @@ impl ReadinessReporter for NodeReadinessView {
 		};
 		let audit_materialization_lag_entries = self.audit_materialization.lag_entries();
 		let fips_build_state = build_info::current_fips_build_state();
+		let degraded_reason = self.data_server.degraded_reason().or_else(|| {
+			(audit_materialization_lag_entries > 0).then(|| "AuditLagExceeded".to_string())
+		});
 		ReadinessSnapshot {
 			node_id: self.local_node.id,
 			epoch: epoch.epoch,
@@ -1543,11 +1562,7 @@ impl ReadinessReporter for NodeReadinessView {
 			cluster_members: members,
 			drain_state,
 			audit_materialization_lag_entries,
-			degraded_reason: if audit_materialization_lag_entries > 0 {
-				Some("AuditLagExceeded".to_string())
-			} else {
-				None
-			},
+			degraded_reason,
 			fips_mode: fips_build_state.fips_mode,
 			fips_self_test_last_ts: fips_build_state.self_test_last_ts,
 		}
@@ -2336,6 +2351,81 @@ mod tests {
 		);
 		assert_eq!(node.audit_materialization.lag_entries(), 0);
 		node.shutdown().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn readiness_reporter_surfaces_local_persistence_distrust() {
+		let dir = tempdir("readiness-local-persistence-distrust");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			24,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		wait_for_local_leader(&node).await;
+		node.data_server
+			.trip_local_persistence_distrust_for_test()
+			.await;
+
+		let snapshot = node.readiness_reporter().snapshot().await;
+		assert!(!snapshot.is_ready());
+		assert_eq!(
+			snapshot.degraded_reason.as_deref(),
+			Some("LocalPersistenceDistrust")
+		);
+
+		node.shutdown().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn bootstrap_restores_local_persistence_distrust_fence() {
+		let dir = tempdir("restart-local-persistence-distrust");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			26,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		wait_for_local_leader(&node).await;
+		node.data_server
+			.trip_local_persistence_distrust_for_test()
+			.await;
+
+		node.handles.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let recovered = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			26,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let snapshot = recovered.readiness_reporter().snapshot().await;
+		assert!(!snapshot.is_ready());
+		assert_eq!(
+			snapshot.degraded_reason.as_deref(),
+			Some("LocalPersistenceDistrust")
+		);
+		// B6 persists the distrust fence and restores degraded
+		// readiness across restart. Clean Raft abdication is still
+		// a separate follow-up; this test only locks the degraded
+		// readiness contract.
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		let later = recovered.readiness_reporter().snapshot().await;
+		assert!(!later.is_ready());
+		assert_eq!(
+			later.degraded_reason.as_deref(),
+			Some("LocalPersistenceDistrust")
+		);
+
+		recovered.handles.abort();
 	}
 
 	#[tokio::test]

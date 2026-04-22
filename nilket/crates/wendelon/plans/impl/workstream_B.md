@@ -145,11 +145,18 @@ Implement the local-persistence distrust path:
 
 ## Artifacts
 
-- write-outcome transition table
-- fault-injection report
-- replay/idempotency design note
-- benchmark delta for write-path latency
-- degraded/fenced-leader operator notes
+- write-outcome transition table: `plans/impl/workstream_B_transition_table.md`
+- fault-injection report: `plans/impl/workstream_B_fault_injection_report.md`
+- replay/idempotency design note: `plans/impl/workstream_B_replay_idempotency_note.md`
+- benchmark delta for write-path latency: pending
+- degraded/fenced-leader operator notes: `plans/impl/workstream_B_operator_notes.md`
+
+## Current Closure Status
+
+- Code-semantic closure: complete
+- Local B artifacts: transition table, fault-injection report, replay note, and operator note are now on disk
+- Still open: benchmark delta for write-path latency
+- Still open: corresponding Workstream `D` metrics, traces, chaos, and simulator evidence
 
 ## Deferred Follow-Ons
 

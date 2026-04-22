@@ -133,6 +133,10 @@ impl HrftService for MsgRouter {
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = frame.header.msg_type;
 		match msg_type {
+			x if x == MsgType::PENDING_WITNESS_REQ.0 => match &self.data {
+				Some(h) => h.handle_data_frame(context, frame).await,
+				None => Err(unhandled("Data Ring", msg_type)),
+			},
 			0x01..=0x0F => match &self.data {
 				Some(h) => h.handle_data_frame(context, frame).await,
 				None => Err(unhandled("Data Ring", msg_type)),

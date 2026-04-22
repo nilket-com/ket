@@ -10,6 +10,9 @@ use tokio::sync::Mutex;
 
 const PENDING_FINALIZATIONS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_v1");
+const PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("pending_finalizations_by_write_id_v1");
+const WRITE_ID_KEY_LEN: usize = std::mem::size_of::<ClientWriteId>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PendingFinalizationId([u8; 32]);
@@ -27,6 +30,21 @@ impl PendingFinalizationId {
 
 	pub fn as_bytes(&self) -> &[u8; 32] {
 		&self.0
+	}
+
+	fn from_slice(bytes: &[u8]) -> std::io::Result<Self> {
+		if bytes.len() != 32 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"pending finalization id width mismatch: expected=32 actual={}",
+					bytes.len()
+				),
+			));
+		}
+		let mut out = [0u8; 32];
+		out.copy_from_slice(bytes);
+		Ok(Self(out))
 	}
 }
 
@@ -56,6 +74,8 @@ impl PendingFinalizationRecord {
 pub struct PendingFinalizationStore {
 	db: Arc<Database>,
 	write_lock: Mutex<()>,
+	#[cfg(test)]
+	fail_next_upsert: StdMutex<Option<String>>,
 }
 
 impl PendingFinalizationStore {
@@ -77,10 +97,37 @@ impl PendingFinalizationStore {
 				.open_table(PENDING_FINALIZATIONS_TABLE)
 				.map_err(redb_to_io)?;
 		}
+		{
+			let _table = write_txn
+				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+				.map_err(redb_to_io)?;
+		}
+		{
+			let primary = write_txn
+				.open_table(PENDING_FINALIZATIONS_TABLE)
+				.map_err(redb_to_io)?;
+			let mut by_write_id = write_txn
+				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+				.map_err(redb_to_io)?;
+			// Self-heal existing databases and guarantee the
+			// secondary index matches the authoritative primary
+			// table on every open.
+			by_write_id.retain(|_, _| false).map_err(redb_to_io)?;
+			for entry in primary.iter().map_err(redb_to_io)? {
+				let (_key, value) = entry.map_err(redb_to_io)?;
+				let record = decode_pending_finalization_record(value.value())?;
+				let write_key = encode_write_id_key(record.write_id);
+				by_write_id
+					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
+					.map_err(redb_to_io)?;
+			}
+		}
 		write_txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
 			db,
 			write_lock: Mutex::new(()),
+			#[cfg(test)]
+			fail_next_upsert: StdMutex::new(None),
 		});
 		pending_store_registry()
 			.lock()
@@ -124,12 +171,43 @@ impl PendingFinalizationStore {
 			let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
 				return Ok(None);
 			};
-			let record = postcard::from_bytes(value.value()).map_err(|err| {
-				Error::new(
+			let record = decode_pending_finalization_record(value.value())?;
+			Ok(Some(record))
+		})
+		.await
+	}
+
+	pub async fn find_by_write_id(
+		&self,
+		write_id: ClientWriteId,
+	) -> std::io::Result<Option<PendingFinalizationRecord>> {
+		let db = self.db.clone();
+		spawn_blocking_io(move || {
+			let read_txn = db.begin_read().map_err(redb_to_io)?;
+			let by_write_id = read_txn
+				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+				.map_err(redb_to_io)?;
+			let primary = read_txn
+				.open_table(PENDING_FINALIZATIONS_TABLE)
+				.map_err(redb_to_io)?;
+			let write_key = encode_write_id_key(write_id);
+			let Some(id_bytes) = by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? else {
+				return Ok(None);
+			};
+			let pending_id = PendingFinalizationId::from_slice(id_bytes.value())?;
+			let Some(value) = primary
+				.get(&pending_id.as_bytes()[..])
+				.map_err(redb_to_io)?
+			else {
+				return Ok(None);
+			};
+			let record = decode_pending_finalization_record(value.value())?;
+			if record.write_id != write_id {
+				return Err(Error::new(
 					ErrorKind::InvalidData,
-					format!("decode pending finalization: {err}"),
-				)
-			})?;
+					"pending-finalization secondary index returned a mismatched write_id",
+				));
+			}
 			Ok(Some(record))
 		})
 		.await
@@ -137,6 +215,17 @@ impl PendingFinalizationStore {
 
 	pub async fn upsert(&self, record: PendingFinalizationRecord) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
+		#[cfg(test)]
+		if let Some(message) = self
+			.fail_next_upsert
+			.lock()
+			.expect("pending finalization failpoint poisoned")
+			.take()
+		{
+			return Err(Error::other(format!(
+				"injected pending finalization upsert failure: {message}"
+			)));
+		}
 		let db = self.db.clone();
 		spawn_blocking_io(move || {
 			let encoded = postcard::to_stdvec(&record)
@@ -148,6 +237,13 @@ impl PendingFinalizationStore {
 					.map_err(redb_to_io)?;
 				table
 					.insert(&record.id.as_bytes()[..], encoded.as_slice())
+					.map_err(redb_to_io)?;
+				let mut by_write_id = write_txn
+					.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+					.map_err(redb_to_io)?;
+				let write_key = encode_write_id_key(record.write_id);
+				by_write_id
+					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
 					.map_err(redb_to_io)?;
 			}
 			write_txn.commit().map_err(redb_to_io)
@@ -164,11 +260,61 @@ impl PendingFinalizationStore {
 				let mut table = write_txn
 					.open_table(PENDING_FINALIZATIONS_TABLE)
 					.map_err(redb_to_io)?;
+				let removed_record = match table.get(&id.as_bytes()[..]).map_err(redb_to_io)? {
+					Some(value) => Some(decode_pending_finalization_record(value.value())?),
+					None => None,
+				};
 				let _ = table.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
+				let replacement_id = if let Some(record) = removed_record.as_ref() {
+					let mut replacement = None;
+					for entry in table.iter().map_err(redb_to_io)? {
+						let (_key, value) = entry.map_err(redb_to_io)?;
+						let candidate = decode_pending_finalization_record(value.value())?;
+						if candidate.write_id == record.write_id {
+							replacement = Some(candidate.id);
+							break;
+						}
+					}
+					replacement
+				} else {
+					None
+				};
+				if let Some(record) = removed_record {
+					let mut by_write_id = write_txn
+						.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+						.map_err(redb_to_io)?;
+					let write_key = encode_write_id_key(record.write_id);
+					let indexed_id =
+						match by_write_id.get(write_key.as_slice()).map_err(redb_to_io)? {
+							Some(value) => Some(PendingFinalizationId::from_slice(value.value())?),
+							None => None,
+						};
+					if let Some(indexed_id) = indexed_id {
+						if indexed_id == record.id {
+							if let Some(replacement_id) = replacement_id {
+								by_write_id
+									.insert(write_key.as_slice(), &replacement_id.as_bytes()[..])
+									.map_err(redb_to_io)?;
+							} else {
+								let _ = by_write_id
+									.remove(write_key.as_slice())
+									.map_err(redb_to_io)?;
+							}
+						}
+					}
+				}
 			}
 			write_txn.commit().map_err(redb_to_io)
 		})
 		.await
+	}
+
+	#[cfg(test)]
+	pub(crate) fn fail_next_upsert_for_test(&self, message: impl Into<String>) {
+		*self
+			.fail_next_upsert
+			.lock()
+			.expect("pending finalization failpoint poisoned") = Some(message.into());
 	}
 }
 
@@ -189,6 +335,21 @@ where
 
 fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {
 	Error::other(format!("redb error: {err}"))
+}
+
+fn decode_pending_finalization_record(bytes: &[u8]) -> std::io::Result<PendingFinalizationRecord> {
+	postcard::from_bytes(bytes).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("decode pending finalization: {err}"),
+		)
+	})
+}
+
+fn encode_write_id_key(write_id: ClientWriteId) -> [u8; WRITE_ID_KEY_LEN] {
+	let mut out = [0u8; WRITE_ID_KEY_LEN];
+	out.copy_from_slice(bytemuck::bytes_of(&write_id));
+	out
 }
 
 fn pending_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<PendingFinalizationStore>>> {
@@ -250,8 +411,86 @@ mod tests {
 		let record = record();
 		store.upsert(record.clone()).await.unwrap();
 		assert_eq!(store.get(record.id).await.unwrap(), Some(record.clone()));
+		assert_eq!(
+			store.find_by_write_id(record.write_id).await.unwrap(),
+			Some(record.clone())
+		);
 		assert_eq!(store.load_all().await.unwrap(), vec![record.clone()]);
 		store.remove(record.id).await.unwrap();
 		assert!(store.get(record.id).await.unwrap().is_none());
+		assert!(
+			store
+				.find_by_write_id(record.write_id)
+				.await
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn open_rebuilds_write_id_index_for_legacy_rows() {
+		let path = temp_path("legacy-rebuild");
+		let record = record();
+		let db = redb::Database::create(path.clone()).unwrap();
+		let write_txn = db.begin_write().unwrap();
+		{
+			let mut primary = write_txn.open_table(PENDING_FINALIZATIONS_TABLE).unwrap();
+			let encoded = postcard::to_stdvec(&record).unwrap();
+			primary
+				.insert(&record.id.as_bytes()[..], encoded.as_slice())
+				.unwrap();
+		}
+		write_txn.commit().unwrap();
+		drop(db);
+
+		let store = PendingFinalizationStore::open(path).unwrap();
+		assert_eq!(
+			store.find_by_write_id(record.write_id).await.unwrap(),
+			Some(record)
+		);
+	}
+
+	#[tokio::test]
+	async fn remove_repoints_write_id_index_when_alternate_record_remains() {
+		let store = PendingFinalizationStore::open(temp_path("remove-repoint")).unwrap();
+		let first = record();
+		let second = PendingFinalizationRecord::new(
+			first.write_id,
+			true,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: 10,
+					commit_hlc: HybridTimestamp {
+						physical_ms: 456,
+						logical: 5,
+						node_id: 9,
+					},
+					payload_hash: [0xCD; 32],
+					e_safe_index: 0,
+					durability: DurabilityLevel::QUORUM,
+					_pad: [0; 7],
+				},
+				tenant_id: TenantId::new(11),
+				key_identity: Identity::blake3_tenant(TenantId::new(11), b"pending-key"),
+				charged_bytes: 16_384,
+			},
+		);
+
+		store.upsert(first.clone()).await.unwrap();
+		store.upsert(second.clone()).await.unwrap();
+		assert_eq!(
+			store.find_by_write_id(first.write_id).await.unwrap(),
+			Some(second.clone()),
+			"newest record stays discoverable while both rows exist"
+		);
+
+		store.remove(second.id).await.unwrap();
+		assert_eq!(
+			store.find_by_write_id(first.write_id).await.unwrap(),
+			Some(first),
+			"removing the indexed row must fall back to an older row with the same write_id"
+		);
 	}
 }

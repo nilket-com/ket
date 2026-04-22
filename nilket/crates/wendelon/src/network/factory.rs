@@ -88,6 +88,14 @@ pub struct TransportProviderFactory {
 	/// shared with anything else that wants to know who's in the
 	/// ring.
 	resolver: Arc<dyn CapabilityResolver>,
+	/// Latest published membership snapshot. This is a temporary
+	/// convenience seam for callers that already depend on the
+	/// factory and need a read-only view of membership without
+	/// threading a second watch channel through their constructors.
+	/// If another subsystem grows the same need, promote this to a
+	/// dedicated membership-view service instead of expanding the
+	/// factory's responsibilities further.
+	membership_rx: watch::Receiver<Arc<MembershipEpoch>>,
 
 	/// Per-`NodeId` live-connection cache.
 	///
@@ -153,6 +161,7 @@ impl TransportProviderFactory {
 			local_tiers,
 			providers,
 			resolver,
+			membership_rx: epoch_rx.clone(),
 			connections: Mutex::new(HashMap::new()),
 			policy,
 			health: Mutex::new(HashMap::new()),
@@ -205,6 +214,13 @@ impl TransportProviderFactory {
 	/// Diagnostic: how many cached sessions the factory holds.
 	pub fn cached_connection_count(&self) -> usize {
 		self.connections.lock().unwrap().len()
+	}
+
+	/// Read-only view of the latest membership snapshot the factory
+	/// is routing against. Convenience accessor, not a stable
+	/// cross-subsystem contract.
+	pub fn membership_snapshot(&self) -> Arc<MembershipEpoch> {
+		self.membership_rx.borrow().clone()
 	}
 
 	fn candidate_tiers(

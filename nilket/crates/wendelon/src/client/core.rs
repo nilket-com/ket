@@ -75,6 +75,12 @@ pub const E_SAFE_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 /// destination owner's background migration sweeper can pull the
 /// missing range data and commit completion.
 pub const MIGRATION_RETRY_BACKOFF: Duration = Duration::from_millis(75);
+/// Small pause before retrying a write whose payload is already
+/// durable but whose Control Ring finalization has not yet
+/// committed.
+pub const FINALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(40);
+/// Small pause before retrying a topology/lease readiness miss.
+pub const LEASE_REFRESH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 // ============================================================
 //  CONFIG
@@ -319,6 +325,24 @@ impl RetryDirective {
 			backoff: Some(MIGRATION_RETRY_BACKOFF),
 			refresh_topology: false,
 			migration_incomplete: true,
+		}
+	}
+
+	fn finalization_pending(preferred_target: Option<NodeId>) -> Self {
+		Self {
+			preferred_target,
+			backoff: Some(FINALIZATION_RETRY_BACKOFF),
+			refresh_topology: true,
+			migration_incomplete: false,
+		}
+	}
+
+	fn lease_refresh(preferred_target: Option<NodeId>) -> Self {
+		Self {
+			preferred_target,
+			backoff: Some(LEASE_REFRESH_RETRY_BACKOFF),
+			refresh_topology: true,
+			migration_incomplete: false,
 		}
 	}
 
@@ -947,6 +971,12 @@ fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> 
 		s if s == WriteStatus::NOT_LEADER || s == WriteStatus::EPOCH_STALE => Some(
 			RetryDirective::redirect(nonzero_node_id(response.leader_hint)),
 		),
+		s if s == WriteStatus::LEASE_EXPIRED || s == WriteStatus::INVALID_LEASE_SIGNATURE => Some(
+			RetryDirective::lease_refresh(nonzero_node_id(response.leader_hint)),
+		),
+		s if s == WriteStatus::FINALIZATION_PENDING => Some(RetryDirective::finalization_pending(
+			nonzero_node_id(response.leader_hint),
+		)),
 		_ => None,
 	}
 }
@@ -959,6 +989,9 @@ fn retry_read_status(status: ReadStatus, leader_hint: NodeId) -> Option<RetryDir
 	match status {
 		s if s == ReadStatus::NOT_LEADER || s == ReadStatus::EPOCH_STALE => {
 			Some(RetryDirective::redirect(nonzero_node_id(leader_hint)))
+		}
+		s if s == ReadStatus::LEASE_EXPIRED || s == ReadStatus::INVALID_LEASE_SIGNATURE => {
+			Some(RetryDirective::lease_refresh(nonzero_node_id(leader_hint)))
 		}
 		s if s == ReadStatus::E_SAFE_BEHIND => {
 			Some(RetryDirective::e_safe(nonzero_node_id(leader_hint)))
@@ -1270,6 +1303,7 @@ mod tests {
 	use super::*;
 	use crate::client::topology::{ClusterPeerWire, StaticTopologySource};
 	use crate::network::transport::TransportTier;
+	use crate::schema::ClientWriteId;
 
 	fn tier_bits() -> u8 {
 		TransportTierSet::empty()
@@ -1369,6 +1403,96 @@ mod tests {
 		assert!(retry_read_status(ReadStatus::QUERY_INVALID_PROGRAM, zero).is_none());
 		assert!(retry_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED, zero).is_none());
 		assert!(retry_read_status(ReadStatus::RETENTION_EXPIRED, zero).is_none());
+	}
+
+	#[test]
+	fn retry_write_status_treats_finalization_pending_as_retryable() {
+		let leader = NodeId {
+			id: 7,
+			_reserved: 0,
+		};
+		let response = WriteResponseMeta {
+			status: WriteStatus::FINALIZATION_PENDING,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch: 11,
+			commit_hlc: HybridTimestamp {
+				physical_ms: 123,
+				logical: 4,
+				node_id: 7,
+			},
+			leader_hint: leader,
+			echoed_write_id: ClientWriteId {
+				client_uuid: [0xAB; 16],
+				sequence_no: 9,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			has_finalization: 0,
+			_pad2: [0; 7],
+		};
+
+		let retry = retry_write_response(&response).expect("status must be retryable");
+		assert_eq!(retry.preferred_target, Some(leader));
+		assert_eq!(retry.backoff, Some(FINALIZATION_RETRY_BACKOFF));
+		assert!(retry.refresh_topology);
+	}
+
+	#[test]
+	fn retry_write_status_treats_lease_gate_failures_as_retryable() {
+		let leader = NodeId {
+			id: 7,
+			_reserved: 0,
+		};
+		for status in [
+			WriteStatus::LEASE_EXPIRED,
+			WriteStatus::INVALID_LEASE_SIGNATURE,
+		] {
+			let response = WriteResponseMeta {
+				status,
+				_pad1: [0; 7],
+				log_index: 0,
+				term: 0,
+				epoch: 11,
+				commit_hlc: HybridTimestamp {
+					physical_ms: 123,
+					logical: 4,
+					node_id: 7,
+				},
+				leader_hint: leader,
+				echoed_write_id: ClientWriteId {
+					client_uuid: [0xAB; 16],
+					sequence_no: 9,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				has_finalization: 0,
+				_pad2: [0; 7],
+			};
+
+			let retry = retry_write_response(&response).expect("status must be retryable");
+			assert_eq!(retry.preferred_target, Some(leader));
+			assert_eq!(retry.backoff, Some(LEASE_REFRESH_RETRY_BACKOFF));
+			assert!(retry.refresh_topology);
+		}
+	}
+
+	#[test]
+	fn retry_read_status_treats_lease_gate_failures_as_retryable() {
+		let leader = NodeId {
+			id: 7,
+			_reserved: 0,
+		};
+		for status in [
+			ReadStatus::LEASE_EXPIRED,
+			ReadStatus::INVALID_LEASE_SIGNATURE,
+		] {
+			let retry = retry_read_status(status, leader).expect("status must be retryable");
+			assert_eq!(retry.preferred_target, Some(leader));
+			assert_eq!(retry.backoff, Some(LEASE_REFRESH_RETRY_BACKOFF));
+			assert!(retry.refresh_topology);
+		}
 	}
 
 	#[test]

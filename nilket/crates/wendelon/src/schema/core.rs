@@ -454,6 +454,12 @@ impl MsgType {
 	// Migration Ledger.
 	pub const MIGRATE_REQ: Self = Self(0x0D);
 	pub const MIGRATE_RESP: Self = Self(0x0E);
+	// Peer-only orphan-witness recovery RPCs. A newly elected
+	// leader pulls unresolved pending-finalization witnesses from
+	// data peers before it starts admitting fresh writes in the new
+	// epoch, so duplicate retries converge instead of re-appending.
+	pub const PENDING_WITNESS_REQ: Self = Self(0x26);
+	pub const PENDING_WITNESS_RESP: Self = Self(0x27);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);
@@ -576,6 +582,12 @@ impl WriteStatus {
 	pub const TENANT_SUSPENDED: Self = Self(10);
 	pub const TENANT_UNAVAILABLE: Self = Self(11);
 	pub const AUTHORIZATION_FAILED: Self = Self(12);
+	/// The data branch is already durable and the leader durably
+	/// recorded pending-finalization intent, but the Control Ring
+	/// finalization has not committed yet. Retrying the same write
+	/// id is safe and should either reconcile the write to a
+	/// committed result or return this same status again.
+	pub const FINALIZATION_PENDING: Self = Self(13);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -615,11 +627,18 @@ pub struct ReplicaWriteMeta {
 	/// the append under this timestamp so recovery sees a
 	/// consistent cross-node ordering.
 	pub commit_hlc: HybridTimestamp, // 16 bytes
+	/// Original client idempotency key. Replicas persist this with
+	/// the pending-finalization witness so a later leader can
+	/// reconcile the write without seeing the original caller
+	/// again.
+	pub write_id: ClientWriteId, // 32 bytes
 	/// Epoch of the originating leader — replicas reject on
 	/// mismatch against their own current epoch.
 	pub epoch: u64, //  8 bytes
 	/// Tenant the replicated record belongs to.
 	pub tenant_id: TenantId, //  8 bytes
+	/// Authoritative quota charge computed by the accepting node.
+	pub charged_bytes: u64, //  8 bytes
 	/// Stable 256-bit record identity computed from the key bytes.
 	/// Replicas persist this directly rather than re-hashing the
 	/// Arrow payload.
@@ -628,6 +647,13 @@ pub struct ReplicaWriteMeta {
 	/// payload before ack so corruption surfaces as a failed
 	/// ack rather than a silent divergence.
 	pub payload_hash: [u8; 32], // 32 bytes
+	/// Durability class echoed into the eventual finalization marker.
+	pub durability: DurabilityLevel, //  1 byte
+	/// Mirrors the caller's receipt preference so duplicate replay
+	/// on a later leader can preserve the original trailing-marker
+	/// contract.
+	pub await_finalization: u8, //  1 byte
+	pub _pad: [u8; 6], //  6 bytes
 }
 
 // ============================================================
@@ -675,6 +701,44 @@ pub struct ReplicaWriteRespMeta {
 	/// Leaders may count only `DURABLE` toward quorum.
 	pub ack_level: ReplicaAckLevel, //  1 byte
 	pub _pad: [u8; 6],              //  6 bytes
+}
+
+// ============================================================
+//  PENDING-WITNESS PULL METADATA — 16 bytes request, 16 bytes response
+// ============================================================
+
+/// Request a peer's unresolved pending-finalization witnesses.
+///
+/// Used only during post-election recovery: a newly elected
+/// leader pulls orphan witnesses from data peers before it starts
+/// treating the new epoch as write-ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct PendingWitnessPullRequestMeta {
+	/// Node performing the recovery sweep.
+	pub requester: NodeId, //  8 bytes
+	/// Membership epoch the requester believes it is recovering
+	/// for. Carried for tracing and future tightening; v1 peers
+	/// serve unresolved witnesses regardless of the epoch value.
+	pub request_epoch: u64, //  8 bytes
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct PendingWitnessPullStatus(pub u8);
+
+impl PendingWitnessPullStatus {
+	pub const OK: Self = Self(0);
+	pub const INTERNAL_ERROR: Self = Self(1);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct PendingWitnessPullResponseMeta {
+	pub status: PendingWitnessPullStatus, //  1 byte
+	pub _pad1: [u8; 7],                   //  7 bytes
+	/// Number of witnesses encoded in the payload.
+	pub witness_count: u64, //  8 bytes
 }
 
 // ============================================================
@@ -1228,9 +1292,12 @@ const _: () = assert!(std::mem::size_of::<AcquireLeaseResponseMeta>() == 8);
 const _: () = assert!(std::mem::size_of::<FrameHeader>() == 24);
 const _: () = assert!(std::mem::size_of::<WriteRequestMeta>() == 120);
 const _: () = assert!(std::mem::size_of::<WriteResponseMeta>() == 96);
-const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 96);
+const _: () = assert!(std::mem::size_of::<ReplicaWriteMeta>() == 144);
 const _: () = assert!(std::mem::size_of::<ReplicaAckLevel>() == 1);
 const _: () = assert!(std::mem::size_of::<ReplicaWriteRespMeta>() == 8);
+const _: () = assert!(std::mem::size_of::<PendingWitnessPullRequestMeta>() == 16);
+const _: () = assert!(std::mem::size_of::<PendingWitnessPullStatus>() == 1);
+const _: () = assert!(std::mem::size_of::<PendingWitnessPullResponseMeta>() == 16);
 const _: () = assert!(std::mem::size_of::<ReadRequestMeta>() == 96);
 const _: () = assert!(std::mem::size_of::<ReadResponseMeta>() == 56);
 const _: () = assert!(std::mem::size_of::<QueryRequestMeta>() == 80);
