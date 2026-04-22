@@ -26,6 +26,7 @@
 //! trait object so unit tests can drive the full state machine
 //! without a real process, real Raft, or real transport.
 
+use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
 use crate::network::transport::MembershipEpoch;
 use crate::schema::{HybridTimestamp, NodeId};
@@ -386,6 +387,7 @@ pub fn check_drift_once_with_subscriber(
 		};
 		metrics().clock_drift_exceeded_total.inc();
 		subscriber.on_drift_exceeded(&event);
+		let _permit = authorize_autonomous_action(AutonomousActionSurface::ClockDriftAbort);
 		abort.abort(&format!(
 			"clock drift {offset}ms > {max_offset_ms}ms (node={}, local={now}, median={median})",
 			tracker.local_node().id,
@@ -555,6 +557,7 @@ pub async fn sweep_evictions_once(
 		epoch: next_epoch,
 		peers: survivors,
 	};
+	let _permit = authorize_autonomous_action(AutonomousActionSurface::ControlRingPeerEviction);
 	match advancer.advance_epoch(next).await {
 		Ok(()) => {
 			for id in &dropped {

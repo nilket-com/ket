@@ -335,6 +335,7 @@ fn break_glass_identity_is_marked_when_signed_by_ops_ca() {
 	.unwrap();
 	assert_eq!(actor.role, ActorRole::BreakGlassAdmin);
 	assert_eq!(actor.trust_domain, ActorTrustDomain::Ops);
+	assert_eq!(actor.cert_subject.as_deref(), Some("CN=break-glass"));
 	assert!(actor.break_glass);
 }
 

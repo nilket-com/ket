@@ -7,6 +7,7 @@
 //! layer; the handler here focuses on routing, wire compatibility, and
 //! leader-aware Control Ring behavior.
 
+use crate::audit::{AuditChainHead, AuditSink};
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
@@ -14,6 +15,7 @@ use crate::consensus::{
 	WendelonRequest, WendelonResponse,
 };
 use crate::crypto::CryptoManager;
+use crate::governance::{OperatorGatedAction, require_operator_signal};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
@@ -59,6 +61,7 @@ pub const CONTROL_REASON_NOT_FOUND: u8 = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ControlOperation {
 	Status,
+	AuditChainHead,
 	Lease,
 	LeaseRelease,
 	Transfer,
@@ -92,6 +95,12 @@ pub struct JoinClusterResponseWire {
 	pub local_protocol: ProtocolVersionWindow,
 	#[serde(default)]
 	pub negotiated_protocol: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditChainHeadResponseWire {
+	#[serde(default)]
+	pub head: Option<AuditChainHead>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +162,7 @@ pub struct WendelonControlServer {
 	pool: Arc<BufPool>,
 	replication_factor: u32,
 	lease_ttl_cap_ms: u32,
+	audit_sink: Arc<dyn AuditSink>,
 	lease_authority: Arc<LeaseAuthority>,
 	transfer_authority: Arc<TransferAuthority>,
 	protocol: ProtocolVersionWindow,
@@ -171,6 +181,7 @@ impl WendelonControlServer {
 		pool: Arc<BufPool>,
 		replication_factor: u32,
 		lease_ttl_cap_ms: u32,
+		audit_sink: Arc<dyn AuditSink>,
 	) -> Self {
 		Self {
 			raft,
@@ -183,11 +194,17 @@ impl WendelonControlServer {
 			pool,
 			replication_factor,
 			lease_ttl_cap_ms,
+			audit_sink,
 			lease_authority: Arc::new(LeaseAuthority::dev_single_node(local_node)),
 			transfer_authority: Arc::new(TransferAuthority::dev_single_node(local_node)),
 			protocol: ProtocolVersionWindow::default(),
 			reconcile_lock: Mutex::new(()),
 		}
+	}
+
+	pub fn with_audit_sink(mut self, audit_sink: Arc<dyn AuditSink>) -> Self {
+		self.audit_sink = audit_sink;
+		self
 	}
 
 	pub fn with_lease_authority(mut self, authority: Arc<LeaseAuthority>) -> Self {
@@ -217,6 +234,10 @@ impl WendelonControlServer {
 					| ActorRole::Operator
 					| ActorRole::ReadOnlyObserver
 					| ActorRole::BreakGlassAdmin
+			),
+			ControlOperation::AuditChainHead => matches!(
+				context.actor.role,
+				ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
 			),
 			ControlOperation::Lease
 			| ControlOperation::LeaseRelease
@@ -532,6 +553,17 @@ impl WendelonControlServer {
 				.await
 			}
 			TenantAdminRequestWire::Delete { target_tenant_id } => {
+				if let Err(error) = require_operator_signal(
+					&context.actor,
+					OperatorGatedAction::TenantDeleteConfirm,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
 				self.submit_tenant_admin_mutation(
 					&frame,
 					WendelonRequest::DeleteTenant(target_tenant_id),
@@ -654,6 +686,36 @@ impl WendelonControlServer {
 			meta,
 			arrow_payload: None,
 			trailing,
+		})
+	}
+
+	async fn handle_audit_chain_head(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if !frame.meta.is_empty() || frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"AUDIT_CHAIN_HEAD_REQ must not carry meta, arrow, or trailing payloads",
+			));
+		}
+		let meta = wire::encode_into(
+			&self.pool,
+			&AuditChainHeadResponseWire {
+				head: self.audit_sink.chain_head()?,
+			},
+		)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::AUDIT_CHAIN_HEAD_RESP.0,
+				flags: 0,
+				stream_id: frame.header.stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
 		})
 	}
 
@@ -1643,6 +1705,10 @@ impl ControlRingServer for WendelonControlServer {
 			MsgType::STATUS_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Status)?;
 				self.handle_status(frame).await?
+			}
+			MsgType::AUDIT_CHAIN_HEAD_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::AuditChainHead)?;
+				self.handle_audit_chain_head(frame).await?
 			}
 			MsgType::LEASE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Lease)?;

@@ -47,6 +47,7 @@ use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
 use crate::metrics::observability::{
 	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
 };
+use crate::metrics::telemetry::{TraceExportConfig, TraceExportProtocol};
 use crate::network::control_server::{
 	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer, select_bootstrap_epoch,
 };
@@ -132,7 +133,8 @@ pub struct TransportTlsConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservabilityConfig {
-	pub listeners: ListenerAddresses,
+	pub listeners: Option<ListenerAddresses>,
+	pub traces: Option<TraceExportConfig>,
 }
 
 /// Caller-supplied parameters for [`WendelonNode::bootstrap`].
@@ -420,31 +422,94 @@ impl NodeBootstrapConfig {
 			));
 		}
 		if let Some(obs) = &self.observability {
-			if self.transport_tls.is_none() {
-				return Err(Error::new(
-					ErrorKind::InvalidInput,
-					"observability requires transport_tls for the mTLS ready and metrics listeners",
-				));
-			}
-			for (field, value) in [
-				(
-					"observability.listeners.health",
-					obs.listeners.health.as_str(),
-				),
-				(
-					"observability.listeners.ready",
-					obs.listeners.ready.as_str(),
-				),
-				(
-					"observability.listeners.metrics",
-					obs.listeners.metrics.as_str(),
-				),
-			] {
-				if value.trim().is_empty() {
+			if let Some(listeners) = &obs.listeners {
+				if self.transport_tls.is_none() {
 					return Err(Error::new(
 						ErrorKind::InvalidInput,
-						format!("{field} must not be empty"),
+						"observability requires transport_tls for the mTLS ready and metrics listeners",
 					));
+				}
+				for (field, value) in [
+					("observability.listeners.health", listeners.health.as_str()),
+					("observability.listeners.ready", listeners.ready.as_str()),
+					(
+						"observability.listeners.metrics",
+						listeners.metrics.as_str(),
+					),
+				] {
+					if value.trim().is_empty() {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							format!("{field} must not be empty"),
+						));
+					}
+				}
+			}
+			if let Some(traces) = &obs.traces {
+				if traces.endpoint.trim().is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"observability.traces.endpoint must not be empty",
+					));
+				}
+				if !traces.validates_sampling_rate() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"observability.traces.sampling_rate must be between 0.0 and 1.0 inclusive",
+					));
+				}
+				if traces.max_queue_size == 0 {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"observability.traces.max_queue_size must be greater than zero",
+					));
+				}
+				if traces.export_timeout.is_zero() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"observability.traces.export_timeout_s must be greater than zero",
+					));
+				}
+				for (field, path) in [
+					(
+						"observability.traces.client_cert_path",
+						&traces.client_cert_path,
+					),
+					(
+						"observability.traces.client_key_path",
+						&traces.client_key_path,
+					),
+					(
+						"observability.traces.ca_bundle_path",
+						&traces.ca_bundle_path,
+					),
+				] {
+					if !path.is_file() {
+						return Err(Error::new(
+							ErrorKind::NotFound,
+							format!("{field} is not an existing file: {}", path.display()),
+						));
+					}
+				}
+				match traces.protocol {
+					TraceExportProtocol::Grpc => {
+						#[cfg(not(feature = "otlp-grpc"))]
+						{
+							return Err(Error::new(
+								ErrorKind::Unsupported,
+								"observability.traces.protocol=grpc requires the otlp-grpc cargo feature",
+							));
+						}
+					}
+					TraceExportProtocol::HttpProtobuf => {
+						#[cfg(not(feature = "otlp-http"))]
+						{
+							return Err(Error::new(
+								ErrorKind::Unsupported,
+								"observability.traces.protocol=http/protobuf requires the otlp-http cargo feature",
+							));
+						}
+					}
 				}
 			}
 		}
@@ -1134,6 +1199,7 @@ impl WendelonNode {
 				pool.clone(),
 				cfg.rf as u32,
 				LEASE_TTL_MS,
+				audit_sink.clone(),
 			)
 			.with_protocol_window(cfg.protocol)
 			.with_lease_authority(lease_authority.clone())
@@ -1474,7 +1540,7 @@ impl ReadinessReporter for NodeReadinessView {
 			drain_state,
 			audit_materialization_lag_entries,
 			degraded_reason: if audit_materialization_lag_entries > 0 {
-				Some("AuditMaterializationLag".to_string())
+				Some("AuditLagExceeded".to_string())
 			} else {
 				None
 			},
@@ -2079,8 +2145,11 @@ mod tests {
 		DriftCheck, EVICTION_THRESHOLD, EvictionDecision, MAX_OFFSET_MS, check_drift_once,
 		sweep_evictions_once,
 	};
+	use crate::metrics::observability::ReadinessReporter;
 	use crate::schema::{FinalizationMarker, HybridTimestamp, Identity, TenantId};
 	use crate::storage::{RaftCommitter, SlabSweeper, StorageEngine, SweeperConfig};
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicBool, Ordering};
 	use std::time::Duration;
 
 	fn tempdir(tag: &str) -> PathBuf {
@@ -2188,6 +2257,75 @@ mod tests {
 		assert!(audit.contains("fips=false"));
 		assert!(audit.contains("build_profile=debug"));
 		assert!(audit.contains("mlock="));
+	}
+
+	#[tokio::test]
+	async fn readiness_reporter_does_not_flap_during_successful_raft_audit_materialization() {
+		let dir = tempdir("readiness-no-flap");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			23,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		wait_for_local_leader(&node).await;
+		let reporter = node.readiness_reporter();
+		let stop = Arc::new(AtomicBool::new(false));
+		let flapped = Arc::new(AtomicBool::new(false));
+		let poll_stop = stop.clone();
+		let poll_flapped = flapped.clone();
+		let poller = tokio::spawn(async move {
+			while !poll_stop.load(Ordering::Relaxed) {
+				let snapshot = reporter.snapshot().await;
+				if !snapshot.is_ready() {
+					poll_flapped.store(true, Ordering::Relaxed);
+					return;
+				}
+				tokio::task::yield_now().await;
+			}
+		});
+
+		for seq in 0..64u64 {
+			let commit_hlc = HybridTimestamp {
+				physical_ms: 10_000 + seq,
+				logical: 0,
+				node_id: node.local_node.id,
+			};
+			node.raft
+				.client_write(WendelonRequest::Finalize(
+					crate::consensus::TenantFinalization {
+						marker: FinalizationMarker {
+							log_index: seq + 2,
+							term: 1,
+							epoch: 99,
+							commit_hlc,
+							payload_hash: [seq as u8; 32],
+							e_safe_index: seq + 2,
+							durability: crate::schema::DurabilityLevel::QUORUM,
+							_pad: [0; 7],
+						},
+						tenant_id: TenantId::ZERO,
+						key_identity: Identity::blake3_tenant(
+							TenantId::ZERO,
+							format!("ready-audit-{seq}").as_bytes(),
+						),
+						charged_bytes: seq,
+					},
+				))
+				.await
+				.unwrap();
+		}
+
+		stop.store(true, Ordering::Relaxed);
+		poller.await.unwrap();
+		assert!(
+			!flapped.load(Ordering::Relaxed),
+			"readiness reporter unexpectedly degraded during healthy audit materialization"
+		);
+		assert_eq!(node.audit_materialization.lag_entries(), 0);
+		node.shutdown().await.unwrap();
 	}
 
 	#[tokio::test]
@@ -2652,6 +2790,7 @@ mod tests {
 			node.pool.clone(),
 			1,
 			LEASE_TTL_MS,
+			node.audit_sink.clone(),
 		));
 		let advancer = ControlRingMembershipAdvancer::new(control_server);
 		// Wait until Raft reports this node as leader before

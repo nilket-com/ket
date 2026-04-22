@@ -104,6 +104,7 @@ async fn build_transfer_fixture() -> (
 				leader.pool.clone(),
 				1,
 				LEASE_TTL_MS,
+				leader.audit_sink.clone(),
 			)))
 			.build(),
 	);

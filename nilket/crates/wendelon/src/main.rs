@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
 use wendelon::metrics::observability::{self, ObservabilityHandles};
+use wendelon::metrics::telemetry;
 use wendelon::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_peer_roots};
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 
@@ -61,6 +62,18 @@ async fn main() -> ExitCode {
 	};
 	let transport_tls = cfg.transport_tls.clone();
 	let observability_cfg = cfg.observability.clone();
+	let telemetry = match telemetry::install_global(
+		observability_cfg
+			.as_ref()
+			.and_then(|observability| observability.traces.as_ref()),
+		cfg.node_id,
+	) {
+		Ok(handle) => handle,
+		Err(e) => {
+			eprintln!("failed to initialize tracing subscriber: {e}");
+			return ExitCode::from(2);
+		}
+	};
 	let node = match WendelonNode::bootstrap(cfg).await {
 		Ok(n) => n,
 		Err(e) => {
@@ -70,8 +83,13 @@ async fn main() -> ExitCode {
 	};
 	eprintln!("wendelon: bootstrapped node {}", node.local_node.id);
 
-	let observability = match (transport_tls.as_ref(), observability_cfg) {
-		(Some(tls), Some(obs)) => {
+	let observability = match (
+		transport_tls.as_ref(),
+		observability_cfg
+			.as_ref()
+			.and_then(|obs| obs.listeners.clone()),
+	) {
+		(Some(tls), Some(listeners)) => {
 			let material = match TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)
 			{
 				Ok(material) => material,
@@ -101,7 +119,7 @@ async fn main() -> ExitCode {
 			};
 			let reporter = Arc::new(node.readiness_reporter());
 			match observability::spawn(
-				obs.listeners,
+				listeners,
 				TlsAcceptor::from(Arc::new(server_config)),
 				reporter,
 				node.local_node.id,
@@ -143,6 +161,10 @@ async fn main() -> ExitCode {
 			eprintln!("observability shutdown failed: {e}");
 			return ExitCode::from(1);
 		}
+	}
+	if let Err(e) = telemetry.shutdown().await {
+		eprintln!("telemetry shutdown failed: {e}");
+		return ExitCode::from(1);
 	}
 	eprintln!("wendelon: shutdown complete");
 	ExitCode::SUCCESS

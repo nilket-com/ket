@@ -74,9 +74,24 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 # ready = "0.0.0.0:7432"
 # metrics = "0.0.0.0:7433"
 #
+# Optional OTLP trace export. Both transports are feature-gated and
+# implemented in pure Rust without any protobuf or gRPC codegen:
+# `otlp-http` enables `http/protobuf`, `otlp-grpc` enables gRPC.
+#
+# [observability.traces]
+# endpoint = "https://otel-collector.internal:4317"
+# protocol = "grpc"                              # or "http/protobuf"
+# sampling_rate = 0.01
+# client_cert_path = "certs/obs-client.crt"
+# client_key_path = "certs/obs-client.key"
+# ca_bundle_path = "certs/obs-ca.crt"
+# max_queue_size = 8192
+# export_timeout_s = 30
+#
 # Optional additive audit shipping sinks. The local NDJSON audit chain
 # at `<data_dir>/audit.ndjson` stays enabled even when these are
-# configured.
+# configured; sink shapes and archive guidance are documented in
+# `plans/ops/audit.md`.
 #
 # [audit.syslog]
 # socket_path = "/run/systemd/journal/syslog"

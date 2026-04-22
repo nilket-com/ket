@@ -51,3 +51,6 @@ wendelon --write-example-config ./wendelon.toml
 - The generated starter config uses dev-derived key material for local bring-up.
   Operators should replace that identity material before any non-development
   deployment.
+- Audit sink posture is asymmetric by design: `<data_dir>/audit.ndjson` is the
+  authoritative local chain, while `Syslog` and `Kafka` are additive shipping
+  sinks. See `plans/ops/audit.md` for operator-facing sink schema details.

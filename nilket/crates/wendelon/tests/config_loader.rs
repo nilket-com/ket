@@ -444,14 +444,283 @@ socket_path = "run/syslog.sock"
 		wendelon::storage::MvccRetentionPolicy::FixedWindow(std::time::Duration::from_secs(30))
 	);
 	let observability = cfg.observability.as_ref().expect("observability config");
-	assert_eq!(observability.listeners.health, "127.0.0.1:7431");
-	assert_eq!(observability.listeners.ready, "127.0.0.1:7432");
-	assert_eq!(observability.listeners.metrics, "127.0.0.1:7433");
+	let listeners = observability
+		.listeners
+		.as_ref()
+		.expect("observability listeners");
+	assert_eq!(listeners.health, "127.0.0.1:7431");
+	assert_eq!(listeners.ready, "127.0.0.1:7432");
+	assert_eq!(listeners.metrics, "127.0.0.1:7433");
+	assert!(observability.traces.is_none());
 	assert_eq!(
 		cfg.audit.syslog.as_ref().unwrap().socket_path,
 		syslog_socket
 	);
 	assert!(cfg.audit.kafka.is_none());
+}
+
+#[cfg(not(feature = "otlp-http"))]
+#[test]
+fn rejects_http_protobuf_trace_export_without_feature() {
+	let root = fresh_dir("otlp-http-disabled");
+	let data_dir = root.join("data");
+	let pki_dir = root.join("pki");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	std::fs::create_dir_all(&pki_dir).unwrap();
+	for name in ["client.crt", "client.key", "ca.crt"] {
+		std::fs::write(pki_dir.join(name), "test").unwrap();
+	}
+
+	let node_id = 35u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4707"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[observability.traces]
+endpoint = "https://otel-collector.internal:4318"
+protocol = "http/protobuf"
+client_cert_path = "pki/client.crt"
+client_key_path = "pki/client.key"
+ca_bundle_path = "pki/ca.crt"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("requires the otlp-http cargo feature"),
+		"unexpected error: {err}"
+	);
+}
+
+#[cfg(feature = "otlp-http")]
+#[test]
+fn loads_http_protobuf_trace_export_with_feature() {
+	let root = fresh_dir("otlp-http-enabled");
+	let data_dir = root.join("data");
+	let pki_dir = root.join("pki");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	std::fs::create_dir_all(&pki_dir).unwrap();
+	for name in ["client.crt", "client.key", "ca.crt"] {
+		std::fs::write(pki_dir.join(name), "test").unwrap();
+	}
+
+	let node_id = 35u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4707"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[observability.traces]
+endpoint = "https://otel-collector.internal:4318"
+protocol = "http/protobuf"
+sampling_rate = 0.25
+client_cert_path = "pki/client.crt"
+client_key_path = "pki/client.key"
+ca_bundle_path = "pki/ca.crt"
+max_queue_size = 1024
+export_timeout_s = 11
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let traces = cfg
+		.observability
+		.as_ref()
+		.and_then(|observability| observability.traces.as_ref())
+		.expect("trace export config");
+	assert_eq!(traces.endpoint, "https://otel-collector.internal:4318");
+	assert_eq!(
+		traces.protocol,
+		wendelon::metrics::telemetry::TraceExportProtocol::HttpProtobuf
+	);
+	assert_eq!(traces.sampling_rate_per_million, 250_000);
+	assert_eq!(traces.client_cert_path, pki_dir.join("client.crt"));
+	assert_eq!(traces.client_key_path, pki_dir.join("client.key"));
+	assert_eq!(traces.ca_bundle_path, pki_dir.join("ca.crt"));
+	assert_eq!(traces.max_queue_size, 1024);
+	assert_eq!(traces.export_timeout.as_secs(), 11);
+}
+
+#[cfg(not(feature = "otlp-grpc"))]
+#[test]
+fn rejects_grpc_trace_export_without_feature() {
+	let root = fresh_dir("otlp-grpc");
+	let data_dir = root.join("data");
+	let pki_dir = root.join("pki");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	std::fs::create_dir_all(&pki_dir).unwrap();
+	for name in ["client.crt", "client.key", "ca.crt"] {
+		std::fs::write(pki_dir.join(name), "test").unwrap();
+	}
+
+	let node_id = 36u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4708"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[observability.traces]
+endpoint = "https://otel-collector.internal:4317"
+protocol = "grpc"
+client_cert_path = "pki/client.crt"
+client_key_path = "pki/client.key"
+ca_bundle_path = "pki/ca.crt"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("requires the otlp-grpc cargo feature"),
+		"unexpected error: {err}"
+	);
+}
+
+#[cfg(feature = "otlp-grpc")]
+#[test]
+fn loads_grpc_trace_export_with_feature() {
+	let root = fresh_dir("otlp-grpc-enabled");
+	let data_dir = root.join("data");
+	let pki_dir = root.join("pki");
+	std::fs::create_dir_all(&data_dir).unwrap();
+	std::fs::create_dir_all(&pki_dir).unwrap();
+	for name in ["client.crt", "client.key", "ca.crt"] {
+		std::fs::write(pki_dir.join(name), "test").unwrap();
+	}
+
+	let node_id = 36u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4708"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[observability.traces]
+endpoint = "https://otel-collector.internal:4317"
+protocol = "grpc"
+sampling_rate = 0.5
+client_cert_path = "pki/client.crt"
+client_key_path = "pki/client.key"
+ca_bundle_path = "pki/ca.crt"
+max_queue_size = 256
+export_timeout_s = 9
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let traces = cfg
+		.observability
+		.as_ref()
+		.and_then(|observability| observability.traces.as_ref())
+		.expect("trace export config");
+	assert_eq!(traces.endpoint, "https://otel-collector.internal:4317");
+	assert_eq!(
+		traces.protocol,
+		wendelon::metrics::telemetry::TraceExportProtocol::Grpc
+	);
+	assert_eq!(traces.sampling_rate_per_million, 500_000);
+	assert_eq!(traces.client_cert_path, pki_dir.join("client.crt"));
+	assert_eq!(traces.client_key_path, pki_dir.join("client.key"));
+	assert_eq!(traces.ca_bundle_path, pki_dir.join("ca.crt"));
+	assert_eq!(traces.max_queue_size, 256);
+	assert_eq!(traces.export_timeout.as_secs(), 9);
 }
 
 #[test]

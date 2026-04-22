@@ -66,6 +66,7 @@ use crate::consensus::monitor::{PhysicalClock, SystemClock};
 use crate::consensus::{
 	RetireTieredSlab, TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine,
 };
+use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
 use crate::schema::{HybridTimestamp, NodeId, SlabId};
 use crate::storage::MvccRetentionPolicy;
@@ -356,6 +357,7 @@ impl SlabSweeper {
 
 	/// Drive a single slab through the full two-phase pipeline.
 	async fn tier_one_slab(&self, info: &SealedSlabInfo) -> std::io::Result<()> {
+		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2TieringUpload);
 		// Phase 1: snapshot L1 bytes. `read_sealed_raw` fails
 		// loudly if the slab has been rotated away or already
 		// tiered — either is a sign the caller's info went stale,
@@ -617,6 +619,7 @@ impl SlabSweeper {
 		pointer: &TieredSlabPointer,
 		retention_floor: HybridTimestamp,
 	) -> std::io::Result<Option<PreparedTieredRetentionOutcome>> {
+		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2RetentionRewrite);
 		let Some(prepared) = self
 			.slab
 			.prepare_tiered_retention_rewrite(pointer, retention_floor)
@@ -954,6 +957,8 @@ impl SlabSweeper {
 		&self,
 		max_slabs: usize,
 	) -> std::io::Result<crate::storage::manager::TombstoneCompactionReport> {
+		let _permit =
+			authorize_autonomous_action(AutonomousActionSurface::MigrationTombstoneReclaim);
 		let state = self.state_machine.state_snapshot().await;
 		self.slab
 			.reclaim_tombstoned_ranges(&state.tombstones, max_slabs)
@@ -961,6 +966,7 @@ impl SlabSweeper {
 	}
 
 	async fn reclaim_rehydrated_slabs_once(&self) -> std::io::Result<RehydrationSweepReport> {
+		let _permit = authorize_autonomous_action(AutonomousActionSurface::L1RehydratedSlabReclaim);
 		let mut report = RehydrationSweepReport::default();
 		let now = Instant::now();
 		for candidate in self.slab.list_rehydrated_slabs().await {
@@ -1703,7 +1709,7 @@ mod tests {
 		assert_eq!(manager.read(retained_latest).await.unwrap(), b"v-latest");
 		let events = audit_sink.events();
 		assert_eq!(events.len(), 1);
-		assert_eq!(events[0].event_type, "mvcc.snapshot_pruned");
+		assert_eq!(events[0].event_type(), "mvcc.snapshot_pruned");
 		assert!(events[0].message.contains("rewrite_action=rewrite"));
 		assert!(events[0].message.contains("pruned_versions=1"));
 	}
@@ -1820,7 +1826,7 @@ mod tests {
 		);
 		let events = audit_sink.events();
 		assert_eq!(events.len(), 1);
-		assert_eq!(events[0].event_type, "mvcc.snapshot_pruned");
+		assert_eq!(events[0].event_type(), "mvcc.snapshot_pruned");
 		assert!(events[0].message.contains("rewrite_action=retire"));
 		assert!(events[0].message.contains("pruned_versions=1"));
 	}

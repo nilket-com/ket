@@ -133,6 +133,7 @@ impl std::fmt::Display for ActorRole {
 pub struct ActorIdentity {
 	pub role: ActorRole,
 	pub trust_domain: ActorTrustDomain,
+	pub cert_subject: Option<String>,
 	pub node_id: Option<NodeId>,
 	pub tenant_id: Option<String>,
 	pub scopes: Vec<String>,
@@ -189,6 +190,7 @@ impl ActorIdentity {
 		Ok(Self {
 			role,
 			trust_domain: role.trust_domain(),
+			cert_subject: None,
 			node_id,
 			tenant_id,
 			scopes,
@@ -201,12 +203,18 @@ impl ActorIdentity {
 		Self {
 			role: ActorRole::DataNode,
 			trust_domain: ActorTrustDomain::Data,
+			cert_subject: None,
 			node_id: Some(node_id),
 			tenant_id: None,
 			scopes: vec!["cluster".to_string()],
 			key_id: node_id.id.to_le_bytes().to_vec(),
 			break_glass: false,
 		}
+	}
+
+	pub fn with_cert_subject(mut self, cert_subject: Option<String>) -> Self {
+		self.cert_subject = cert_subject;
+		self
 	}
 
 	pub fn claimed_tenant_id(&self) -> std::io::Result<Option<TenantId>> {
@@ -521,6 +529,7 @@ pub fn verified_peer_actor_identity_from_chain_with_trust_roots(
 		claims.scopes,
 		claims.key_id,
 	)
+	.map(|identity| identity.with_cert_subject(extract_cert_subject(leaf.as_ref()).ok()))
 }
 
 /// Transport-facing identity verifier. Inter-node QUIC requires a
@@ -812,6 +821,99 @@ fn extract_dns_sans(cert_der: &[u8]) -> std::io::Result<Vec<String>> {
 	}
 
 	Ok(dns_sans)
+}
+
+fn extract_cert_subject(cert_der: &[u8]) -> std::io::Result<String> {
+	let mut cert = DerReader::new(cert_der);
+	let certificate = cert.read_tlv(0x30, "certificate")?;
+	let mut certificate = DerReader::new(certificate);
+	let tbs = certificate.read_tlv(0x30, "tbsCertificate")?;
+	let mut tbs = DerReader::new(tbs);
+
+	if tbs.peek_tag() == Some(0xA0) {
+		tbs.read_any_tlv("version")?;
+	}
+	for field in ["serialNumber", "signature", "issuer", "validity"] {
+		tbs.read_any_tlv(field)?;
+	}
+	let subject = tbs.read_tlv(0x30, "subject")?;
+	format_subject(subject)
+}
+
+fn format_subject(subject_der: &[u8]) -> std::io::Result<String> {
+	let mut subject = DerReader::new(subject_der);
+	let mut rdns = Vec::new();
+	while !subject.is_empty() {
+		let rdn = subject.read_tlv(0x31, "relative distinguished name")?;
+		let mut rdn = DerReader::new(rdn);
+		let mut attributes = Vec::new();
+		while !rdn.is_empty() {
+			let attribute = rdn.read_tlv(0x30, "attribute type and value")?;
+			let mut attribute = DerReader::new(attribute);
+			let oid = attribute.read_tlv(0x06, "subject attribute oid")?;
+			let (tag, value) = attribute.read_any_tlv("subject attribute value")?;
+			let key = subject_attribute_name(oid);
+			let value = decode_subject_attribute_value(tag, value)?;
+			attributes.push(format!("{key}={value}"));
+		}
+		if !attributes.is_empty() {
+			rdns.push(attributes.join("+"));
+		}
+	}
+	if rdns.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"peer certificate subject is empty",
+		));
+	}
+	Ok(rdns.join(","))
+}
+
+fn subject_attribute_name(oid: &[u8]) -> &'static str {
+	match oid {
+		[0x55, 0x04, 0x03] => "CN",
+		[0x55, 0x04, 0x06] => "C",
+		[0x55, 0x04, 0x07] => "L",
+		[0x55, 0x04, 0x08] => "ST",
+		[0x55, 0x04, 0x0A] => "O",
+		[0x55, 0x04, 0x0B] => "OU",
+		[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x01] => "emailAddress",
+		_ => "OID",
+	}
+}
+
+fn decode_subject_attribute_value(tag: u8, value: &[u8]) -> std::io::Result<String> {
+	match tag {
+		0x0C | 0x13 | 0x14 | 0x16 => {
+			std::str::from_utf8(value)
+				.map(str::to_string)
+				.map_err(|err| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("certificate subject is not valid UTF-8: {err}"),
+					)
+				})
+		}
+		0x1E => {
+			if value.len() % 2 != 0 {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"certificate BMPString subject has odd byte length",
+				));
+			}
+			let code_units = value
+				.chunks_exact(2)
+				.map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+				.collect::<Vec<_>>();
+			String::from_utf16(&code_units).map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("certificate subject BMPString is invalid UTF-16: {err}"),
+				)
+			})
+		}
+		_ => Ok(format!("#{}", crate::audit::hex_string(value))),
+	}
 }
 
 fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<EncodedActorClaims> {

@@ -25,6 +25,10 @@ pub struct TestPkiPaths {
 }
 
 pub fn write_test_pki(dir: &Path) -> TestPkiPaths {
+	write_test_pki_with_server_dns(dir, &format!("node-1.{CLUSTER_DOMAIN}"))
+}
+
+pub fn write_test_pki_with_server_dns(dir: &Path, server_dns_name: &str) -> TestPkiPaths {
 	std::fs::create_dir_all(dir).unwrap();
 	let paths = TestPkiPaths {
 		ca_cert: dir.join("ca.crt"),
@@ -52,7 +56,7 @@ pub fn write_test_pki(dir: &Path) -> TestPkiPaths {
 		LeafSpec {
 			common_name: "node-1",
 			role: "data_node",
-			node_dns_name: Some(format!("node-1.{CLUSTER_DOMAIN}")),
+			node_dns_name: Some(server_dns_name.to_string()),
 			key_id: 1u32.to_le_bytes().to_vec(),
 			scopes: vec!["cluster"],
 			cert_path: &paths.server_cert,

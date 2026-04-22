@@ -8,9 +8,9 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rdkafka::config::ClientConfig;
 #[cfg(feature = "audit-kafka")]
 use rdkafka::producer::{BaseRecord, DefaultProducerContext, ThreadedProducer};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Write};
 #[cfg(unix)]
@@ -29,6 +29,7 @@ const ULID_TIME_MASK: u128 = (1u128 << 48) - 1;
 const ULID_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 pub const DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL: std::time::Duration =
 	std::time::Duration::from_secs(60);
+const COMPOSITE_AUDIT_PENDING_FAILURE_CAP: usize = 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuditSinksConfig {
@@ -209,23 +210,22 @@ pub struct AuditActor {
 impl AuditActor {
 	pub fn from_actor_identity(actor: &ActorIdentity) -> Self {
 		Self {
-			cert_subject: None,
+			cert_subject: actor.cert_subject.clone(),
 			role: actor.role.as_str().to_string(),
 			trust_domain: actor.trust_domain.to_string(),
 			key_id: hex_string(&actor.key_id),
 			actor_tenant_id: actor.tenant_id.clone(),
-			node_id: actor.node_id.map(format_node_id),
+			node_id: actor.node_id.map(NodeId::format_wire),
 			break_glass: actor.break_glass,
 			scopes: actor.scopes.clone(),
 		}
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AuditEvent {
 	pub authority: AuditAuthority,
 	pub operation: AuditOperation,
-	pub event_type: String,
 	pub node_id: NodeId,
 	pub tenant_id: Option<TenantId>,
 	pub record_identity: Option<Identity>,
@@ -246,7 +246,6 @@ impl AuditEvent {
 		Self {
 			authority,
 			operation,
-			event_type: operation.as_str().to_string(),
 			node_id,
 			tenant_id: None,
 			record_identity: None,
@@ -308,6 +307,31 @@ impl AuditEvent {
 			.map(|actor| actor.break_glass)
 			.unwrap_or(false)
 	}
+
+	pub fn event_type(&self) -> &'static str {
+		self.operation.as_str()
+	}
+}
+
+impl Serialize for AuditEvent {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		let mut event = serializer.serialize_struct("AuditEvent", 11)?;
+		event.serialize_field("authority", &self.authority)?;
+		event.serialize_field("operation", &self.operation)?;
+		event.serialize_field("event_type", self.event_type())?;
+		event.serialize_field("node_id", &self.node_id)?;
+		event.serialize_field("tenant_id", &self.tenant_id)?;
+		event.serialize_field("record_identity", &self.record_identity)?;
+		event.serialize_field("actor", &self.actor)?;
+		event.serialize_field("outcome", &self.outcome)?;
+		event.serialize_field("raft_log_index", &self.raft_log_index)?;
+		event.serialize_field("message", &self.message)?;
+		event.serialize_field("parameters", &self.parameters)?;
+		event.end()
+	}
 }
 
 pub trait AuditSink: Send + Sync {
@@ -330,7 +354,7 @@ impl AuditSink for NoopAuditSink {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditChainHead {
 	pub sequence_number: u64,
 	pub record_hash: String,
@@ -341,7 +365,7 @@ impl AuditChainHead {
 	fn payload_bytes(&self, node_id: NodeId) -> Vec<u8> {
 		format!(
 			"{}|{}|{}|{}",
-			format_node_id(node_id),
+			node_id.format_wire(),
 			self.sequence_number,
 			self.record_hash,
 			self.hash_algorithm_tag,
@@ -352,6 +376,7 @@ impl AuditChainHead {
 
 #[derive(Default)]
 pub struct AuditMaterializationTracker {
+	in_flight_entries: AtomicU64,
 	lag_entries: AtomicU64,
 }
 
@@ -361,14 +386,18 @@ impl AuditMaterializationTracker {
 	}
 
 	pub fn note_authoritative_event(&self) {
-		let lag = self.lag_entries.fetch_add(1, Ordering::Relaxed) + 1;
-		metrics().audit_materialization_lag_entries.set(lag);
+		self.in_flight_entries.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn note_materialized(&self) {
+		self.decrement_in_flight();
+	}
+
+	pub fn note_materialization_failed(&self) {
+		self.decrement_in_flight();
 		let mut current = self.lag_entries.load(Ordering::Relaxed);
 		loop {
-			let next = current.saturating_sub(1);
+			let next = current.saturating_add(1);
 			match self.lag_entries.compare_exchange(
 				current,
 				next,
@@ -386,6 +415,27 @@ impl AuditMaterializationTracker {
 
 	pub fn lag_entries(&self) -> u64 {
 		self.lag_entries.load(Ordering::Relaxed)
+	}
+
+	#[cfg(test)]
+	pub fn in_flight_entries(&self) -> u64 {
+		self.in_flight_entries.load(Ordering::Relaxed)
+	}
+
+	fn decrement_in_flight(&self) {
+		let mut current = self.in_flight_entries.load(Ordering::Relaxed);
+		loop {
+			let next = current.saturating_sub(1);
+			match self.in_flight_entries.compare_exchange(
+				current,
+				next,
+				Ordering::Relaxed,
+				Ordering::Relaxed,
+			) {
+				Ok(_) => return,
+				Err(observed) => current = observed,
+			}
+		}
 	}
 }
 
@@ -448,7 +498,7 @@ impl AuditSink for LocalAuditSink {
 			metrics().audit_sink_failures_local_total.inc();
 			return Err(err);
 		}
-		if let Err(err) = state.file.flush() {
+		if let Err(err) = state.file.sync_data() {
 			metrics().audit_sink_failures_local_total.inc();
 			return Err(err);
 		}
@@ -482,20 +532,138 @@ impl AuditSink for LocalAuditSink {
 
 pub struct CompositeAuditSink {
 	local: Arc<dyn AuditSink>,
-	additional: Vec<Arc<dyn AuditSink>>,
+	additional: Vec<NamedAuditSink>,
+	pending_failures: Mutex<VecDeque<PendingAuditSinkFailure>>,
+	pending_failure_cap: usize,
+}
+
+struct NamedAuditSink {
+	name: String,
+	sink: Arc<dyn AuditSink>,
+}
+
+impl NamedAuditSink {
+	fn new(name: impl Into<String>, sink: Arc<dyn AuditSink>) -> Self {
+		Self {
+			name: name.into(),
+			sink,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+struct PendingAuditSinkFailure {
+	node_id: NodeId,
+	sink: String,
+	error: String,
+	failed_event_type: String,
+	failed_authority: AuditAuthority,
+}
+
+impl PendingAuditSinkFailure {
+	fn into_event(self) -> AuditEvent {
+		AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::AuditSinkFailure,
+			self.node_id,
+			format!(
+				"sink={} failed_event_type={} failed_authority={} error={}",
+				self.sink,
+				self.failed_event_type,
+				self.failed_authority.as_str(),
+				self.error,
+			),
+		)
+		.with_outcome(AuditOutcome::Error)
+		.with_parameter("sink", self.sink)
+		.with_parameter("error", self.error)
+		.with_parameter("failed_event_type", self.failed_event_type)
+		.with_parameter("failed_authority", self.failed_authority.as_str())
+	}
 }
 
 impl CompositeAuditSink {
-	pub fn new(local: Arc<dyn AuditSink>, additional: Vec<Arc<dyn AuditSink>>) -> Self {
-		Self { local, additional }
+	fn new(local: Arc<dyn AuditSink>, additional: Vec<NamedAuditSink>) -> Self {
+		Self::new_with_pending_failure_cap(local, additional, COMPOSITE_AUDIT_PENDING_FAILURE_CAP)
+	}
+
+	fn new_with_pending_failure_cap(
+		local: Arc<dyn AuditSink>,
+		additional: Vec<NamedAuditSink>,
+		pending_failure_cap: usize,
+	) -> Self {
+		Self {
+			local,
+			additional,
+			pending_failures: Mutex::new(VecDeque::new()),
+			pending_failure_cap: pending_failure_cap.max(1),
+		}
+	}
+
+	fn flush_pending_failures(&self) {
+		let mut pending = self
+			.pending_failures
+			.lock()
+			.expect("pending audit failure mutex poisoned");
+		let mut retained = VecDeque::new();
+		while let Some(failure) = pending.pop_front() {
+			if self.local.emit(failure.clone().into_event()).is_err() {
+				retained.push_back(failure);
+				retained.extend(pending.drain(..));
+				*pending = retained;
+				return;
+			}
+		}
+	}
+
+	fn note_additional_failure(&self, sink_name: &str, event: &AuditEvent, error: &Error) {
+		let mut pending = self
+			.pending_failures
+			.lock()
+			.expect("pending audit failure mutex poisoned");
+		if pending.len() >= self.pending_failure_cap {
+			if let Some(dropped) = pending.pop_front() {
+				note_pending_failure_queue_drop(&dropped.sink);
+			}
+		}
+		pending.push_back(PendingAuditSinkFailure {
+			node_id: event.node_id,
+			sink: sink_name.to_string(),
+			error: error.to_string(),
+			failed_event_type: event.event_type().to_string(),
+			failed_authority: event.authority,
+		});
+	}
+
+	#[cfg(test)]
+	fn pending_failure_count(&self) -> usize {
+		self.pending_failures
+			.lock()
+			.expect("pending audit failure mutex poisoned")
+			.len()
+	}
+}
+
+fn note_pending_failure_queue_drop(sink_name: &str) {
+	match sink_name {
+		"syslog" => metrics()
+			.audit_sink_failures_syslog_queue_dropped_total
+			.inc(),
+		"kafka" => metrics()
+			.audit_sink_failures_kafka_queue_dropped_total
+			.inc(),
+		_ => {}
 	}
 }
 
 impl AuditSink for CompositeAuditSink {
 	fn emit(&self, event: AuditEvent) -> std::io::Result<()> {
 		self.local.emit(event.clone())?;
+		self.flush_pending_failures();
 		for sink in &self.additional {
-			let _ = sink.emit(event.clone());
+			if let Err(error) = sink.sink.emit(event.clone()) {
+				self.note_additional_failure(&sink.name, &event, &error);
+			}
 		}
 		Ok(())
 	}
@@ -514,12 +682,15 @@ pub fn build_audit_sink(
 	config: &AuditSinksConfig,
 ) -> std::io::Result<Arc<dyn AuditSink>> {
 	let local: Arc<dyn AuditSink> = Arc::new(LocalAuditSink::open(local_path)?);
-	let mut additional: Vec<Arc<dyn AuditSink>> = Vec::new();
+	let mut additional: Vec<NamedAuditSink> = Vec::new();
 
 	if let Some(syslog) = &config.syslog {
 		#[cfg(unix)]
 		{
-			additional.push(Arc::new(SyslogAuditSink::connect(&syslog.socket_path)?));
+			additional.push(NamedAuditSink::new(
+				"syslog",
+				Arc::new(SyslogAuditSink::connect(&syslog.socket_path)?),
+			));
 		}
 		#[cfg(not(unix))]
 		{
@@ -533,7 +704,10 @@ pub fn build_audit_sink(
 	if let Some(kafka) = &config.kafka {
 		#[cfg(feature = "audit-kafka")]
 		{
-			additional.push(Arc::new(kafka_audit_sink_from_config(kafka)?));
+			additional.push(NamedAuditSink::new(
+				"kafka",
+				Arc::new(kafka_audit_sink_from_config(kafka)?),
+			));
 		}
 		#[cfg(not(feature = "audit-kafka"))]
 		{
@@ -741,7 +915,7 @@ impl AuditRootSigner {
 		let payload = signed_root_payload_bytes(node_id, head);
 		let signature = self.signing_key.sign(&payload);
 		SignedAuditChainRoot {
-			node_id: format_node_id(node_id),
+			node_id: node_id.format_wire(),
 			sequence_number: head.sequence_number,
 			chain_head_hash: head.record_hash.clone(),
 			hash_algorithm_tag: head.hash_algorithm_tag.clone(),
@@ -815,7 +989,7 @@ pub fn verify_signed_chain_root(root: &SignedAuditChainRoot) -> std::io::Result<
 			),
 		));
 	}
-	let node_id = parse_formatted_node_id(&root.node_id)?;
+	let node_id = NodeId::parse_wire(&root.node_id)?;
 	let head = AuditChainHead {
 		sequence_number: root.sequence_number,
 		record_hash: root.chain_head_hash.clone(),
@@ -955,10 +1129,15 @@ struct CanonicalAuditRecord {
 	authority: AuditAuthority,
 	outcome: AuditOutcome,
 	operation: AuditOperation,
+	event_type: String,
 	node_id: String,
 	tenant_id: Option<u64>,
 	record_identity: Option<String>,
 	actor: Option<AuditActor>,
+	actor_role: Option<String>,
+	actor_trust_domain: Option<String>,
+	actor_key_id: Option<String>,
+	break_glass: bool,
 	raft_log_index: Option<u64>,
 	message: String,
 	parameters: BTreeMap<String, Value>,
@@ -966,6 +1145,14 @@ struct CanonicalAuditRecord {
 
 impl CanonicalAuditRecord {
 	fn from_event(event: &AuditEvent, sequence_number: u64, prev_hash: &[u8; 32]) -> Self {
+		let actor_role = event.actor.as_ref().map(|actor| actor.role.clone());
+		let actor_trust_domain = event.actor.as_ref().map(|actor| actor.trust_domain.clone());
+		let actor_key_id = event.actor.as_ref().map(|actor| actor.key_id.clone());
+		let break_glass = event
+			.actor
+			.as_ref()
+			.map(|actor| actor.break_glass)
+			.unwrap_or(false);
 		Self {
 			event_id: monotonic_ulid(),
 			timestamp_ns: current_time_ns(),
@@ -976,13 +1163,18 @@ impl CanonicalAuditRecord {
 			authority: event.authority,
 			outcome: event.outcome,
 			operation: event.operation,
-			node_id: format_node_id(event.node_id),
+			event_type: event.event_type().to_string(),
+			node_id: event.node_id.format_wire(),
 			tenant_id: event.tenant_id.map(|tenant_id| tenant_id.get()),
 			record_identity: event
 				.record_identity
 				.as_ref()
 				.map(|identity| hex_string(identity.as_bytes())),
 			actor: event.actor.clone(),
+			actor_role,
+			actor_trust_domain,
+			actor_key_id,
+			break_glass,
 			raft_log_index: event.raft_log_index,
 			message: event.message.clone(),
 			parameters: event.parameters.clone(),
@@ -1018,17 +1210,6 @@ struct PersistedAuditRecord {
 
 impl PersistedAuditRecord {
 	fn from_canonical(canonical: CanonicalAuditRecord, record_hash: &[u8; 32]) -> Self {
-		let actor_role = canonical.actor.as_ref().map(|actor| actor.role.clone());
-		let actor_trust_domain = canonical
-			.actor
-			.as_ref()
-			.map(|actor| actor.trust_domain.clone());
-		let actor_key_id = canonical.actor.as_ref().map(|actor| actor.key_id.clone());
-		let break_glass = canonical
-			.actor
-			.as_ref()
-			.map(|actor| actor.break_glass)
-			.unwrap_or(false);
 		Self {
 			event_id: canonical.event_id,
 			timestamp_ns: canonical.timestamp_ns,
@@ -1040,15 +1221,15 @@ impl PersistedAuditRecord {
 			authority: canonical.authority,
 			outcome: canonical.outcome,
 			operation: canonical.operation,
-			event_type: canonical.operation.as_str().to_string(),
+			event_type: canonical.event_type,
 			node_id: canonical.node_id,
 			tenant_id: canonical.tenant_id,
 			record_identity: canonical.record_identity,
 			actor: canonical.actor,
-			actor_role,
-			actor_trust_domain,
-			actor_key_id,
-			break_glass,
+			actor_role: canonical.actor_role,
+			actor_trust_domain: canonical.actor_trust_domain,
+			actor_key_id: canonical.actor_key_id,
+			break_glass: canonical.break_glass,
 			raft_log_index: canonical.raft_log_index,
 			message: canonical.message,
 			parameters: canonical.parameters,
@@ -1056,9 +1237,7 @@ impl PersistedAuditRecord {
 	}
 
 	fn genesis_hash(&self) -> [u8; 32] {
-		genesis_hash(
-			parse_formatted_node_id(&self.node_id).expect("persisted node_id must be valid"),
-		)
+		genesis_hash(NodeId::parse_wire(&self.node_id).expect("persisted node_id must be valid"))
 	}
 
 	fn to_canonical(&self) -> CanonicalAuditRecord {
@@ -1072,10 +1251,15 @@ impl PersistedAuditRecord {
 			authority: self.authority,
 			outcome: self.outcome,
 			operation: self.operation,
+			event_type: self.event_type.clone(),
 			node_id: self.node_id.clone(),
 			tenant_id: self.tenant_id,
 			record_identity: self.record_identity.clone(),
 			actor: self.actor.clone(),
+			actor_role: self.actor_role.clone(),
+			actor_trust_domain: self.actor_trust_domain.clone(),
+			actor_key_id: self.actor_key_id.clone(),
+			break_glass: self.break_glass,
 			raft_log_index: self.raft_log_index,
 			message: self.message.clone(),
 			parameters: self.parameters.clone(),
@@ -1098,11 +1282,14 @@ fn monotonic_ulid() -> String {
 		.unwrap_or(0);
 	let state = STATE.get_or_init(|| Mutex::new((0, 0)));
 	let mut guard = state.lock().expect("ulid state mutex poisoned");
-	let time_ms = guard.0.max(now_ms);
+	let mut time_ms = guard.0.max(now_ms);
 	let random = if time_ms > guard.0 {
 		rand::random::<u128>() & ULID_RANDOM_MASK
+	} else if guard.1 == ULID_RANDOM_MASK {
+		time_ms = time_ms.saturating_add(1);
+		0
 	} else {
-		(guard.1 + 1) & ULID_RANDOM_MASK
+		guard.1 + 1
 	};
 	guard.0 = time_ms;
 	guard.1 = random;
@@ -1155,21 +1342,7 @@ fn genesis_hash(node_id: NodeId) -> [u8; 32] {
 	chain_hash(&bytes)
 }
 
-fn format_node_id(node_id: NodeId) -> String {
-	format!("n-{:02}", node_id.id)
-}
-
-fn parse_formatted_node_id(raw: &str) -> std::io::Result<NodeId> {
-	let raw = raw
-		.strip_prefix("n-")
-		.ok_or_else(|| Error::new(ErrorKind::InvalidData, format!("invalid node_id {raw:?}")))?;
-	let id = raw
-		.parse::<u32>()
-		.map_err(|_| Error::new(ErrorKind::InvalidData, format!("invalid node_id {raw:?}")))?;
-	Ok(NodeId { id, _reserved: 0 })
-}
-
-fn hex_string(bytes: &[u8]) -> String {
+pub(crate) fn hex_string(bytes: &[u8]) -> String {
 	let mut out = String::with_capacity(bytes.len() * 2);
 	for byte in bytes {
 		use std::fmt::Write as _;
@@ -1314,6 +1487,45 @@ mod tests {
 	}
 
 	#[test]
+	fn replay_audit_chain_detects_tamper_in_denormalized_fields() {
+		let path = fresh_audit_path("tamper-denormalized");
+		let sink = LocalAuditSink::open(&path).unwrap();
+		let actor = crate::network::tls::ActorIdentity {
+			role: crate::network::tls::ActorRole::BreakGlassAdmin,
+			trust_domain: crate::network::tls::ActorTrustDomain::Ops,
+			cert_subject: None,
+			node_id: None,
+			tenant_id: None,
+			scopes: vec!["cluster".to_string()],
+			key_id: vec![1, 2, 3, 4],
+			break_glass: true,
+		};
+		sink.emit(
+			AuditEvent::new(
+				AuditAuthority::NodeLocal,
+				AuditOperation::ObservabilityMetrics,
+				node(9),
+				"served /metrics scrape",
+			)
+			.with_actor(&actor),
+		)
+		.unwrap();
+
+		let text = std::fs::read_to_string(&path).unwrap();
+		let mut record: serde_json::Value =
+			serde_json::from_str(text.lines().next().unwrap()).unwrap();
+		record["break_glass"] = serde_json::Value::Bool(false);
+		std::fs::write(
+			&path,
+			format!("{}\n", serde_json::to_string(&record).unwrap()),
+		)
+		.unwrap();
+
+		let err = replay_audit_chain(&path).unwrap_err();
+		assert!(err.to_string().contains("record_hash mismatch"));
+	}
+
+	#[test]
 	fn signed_chain_root_is_emitted_and_verifiable() {
 		let path = fresh_audit_path("signed-root");
 		let sink = LocalAuditSink::open(&path).unwrap();
@@ -1337,14 +1549,138 @@ mod tests {
 	}
 
 	#[test]
-	fn audit_materialization_tracker_tracks_lag_entries() {
+	fn audit_materialization_tracker_only_counts_persistent_lag_entries() {
 		let tracker = AuditMaterializationTracker::new();
 		assert_eq!(tracker.lag_entries(), 0);
 		tracker.note_authoritative_event();
-		tracker.note_authoritative_event();
-		assert_eq!(tracker.lag_entries(), 2);
+		assert_eq!(tracker.in_flight_entries(), 1);
+		assert_eq!(tracker.lag_entries(), 0);
 		tracker.note_materialized();
+		assert_eq!(tracker.in_flight_entries(), 0);
+		assert_eq!(tracker.lag_entries(), 0);
+		tracker.note_authoritative_event();
+		tracker.note_materialization_failed();
 		assert_eq!(tracker.lag_entries(), 1);
+		assert_eq!(tracker.in_flight_entries(), 0);
+	}
+
+	#[test]
+	fn composite_sink_audits_additional_sink_failure_on_next_success() {
+		struct FlakySink {
+			remaining_failures: Mutex<usize>,
+		}
+
+		impl FlakySink {
+			fn new(remaining_failures: usize) -> Self {
+				Self {
+					remaining_failures: Mutex::new(remaining_failures),
+				}
+			}
+		}
+
+		impl AuditSink for FlakySink {
+			fn emit(&self, _event: AuditEvent) -> std::io::Result<()> {
+				let mut remaining = self.remaining_failures.lock().unwrap();
+				if *remaining > 0 {
+					*remaining -= 1;
+					return Err(Error::other("simulated syslog failure"));
+				}
+				Ok(())
+			}
+		}
+
+		let path = fresh_audit_path("composite-failure-audit");
+		let local: Arc<dyn AuditSink> = Arc::new(LocalAuditSink::open(&path).unwrap());
+		let composite = CompositeAuditSink::new(
+			local,
+			vec![NamedAuditSink::new("syslog", Arc::new(FlakySink::new(1)))],
+		);
+
+		composite
+			.emit(AuditEvent::new(
+				AuditAuthority::NodeLocal,
+				AuditOperation::CryptoStartup,
+				node(14),
+				"selected_cipher=aes256-gcm",
+			))
+			.unwrap();
+		let first = std::fs::read_to_string(&path).unwrap();
+		assert_eq!(
+			first
+				.matches("\"event_type\":\"audit.sink_failure\"")
+				.count(),
+			0
+		);
+
+		composite
+			.emit(AuditEvent::new(
+				AuditAuthority::NodeLocal,
+				AuditOperation::ObservabilityMetrics,
+				node(14),
+				"served /metrics scrape",
+			))
+			.unwrap();
+
+		let text = std::fs::read_to_string(&path).unwrap();
+		assert_eq!(
+			text.matches("\"event_type\":\"audit.sink_failure\"")
+				.count(),
+			1
+		);
+		assert!(text.contains("\"sink\":\"syslog\""));
+		assert!(text.contains("\"failed_event_type\":\"crypto.startup\""));
+		assert!(text.contains("\"failed_authority\":\"node_local\""));
+		assert!(text.contains("simulated syslog failure"));
+	}
+
+	#[test]
+	fn composite_sink_caps_pending_failure_queue_and_counts_drops() {
+		struct RejectFailureEventLocalSink;
+
+		impl AuditSink for RejectFailureEventLocalSink {
+			fn emit(&self, event: AuditEvent) -> std::io::Result<()> {
+				if event.operation == AuditOperation::AuditSinkFailure {
+					return Err(Error::other("simulated local sink failure"));
+				}
+				Ok(())
+			}
+		}
+
+		struct AlwaysFailSink;
+
+		impl AuditSink for AlwaysFailSink {
+			fn emit(&self, _event: AuditEvent) -> std::io::Result<()> {
+				Err(Error::other("simulated syslog failure"))
+			}
+		}
+
+		let before = metrics()
+			.audit_sink_failures_syslog_queue_dropped_total
+			.get();
+		let composite = CompositeAuditSink::new_with_pending_failure_cap(
+			Arc::new(RejectFailureEventLocalSink),
+			vec![NamedAuditSink::new("syslog", Arc::new(AlwaysFailSink))],
+			2,
+		);
+
+		for idx in 0..4 {
+			composite
+				.emit(AuditEvent::new(
+					AuditAuthority::NodeLocal,
+					AuditOperation::CryptoStartup,
+					node(15),
+					format!("event-{idx}"),
+				))
+				.unwrap();
+		}
+
+		assert_eq!(composite.pending_failure_count(), 2);
+		assert_eq!(
+			metrics()
+				.audit_sink_failures_syslog_queue_dropped_total
+				.get() - before,
+			2
+		);
 	}
 
 	#[cfg(feature = "audit-kafka")]

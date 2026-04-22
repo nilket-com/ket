@@ -247,6 +247,73 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 	shutdown(handles).await;
 }
 
+#[tokio::test]
+async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
+	let root = fresh_dir("ready-degraded");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let audit_path = root.join("audit.ndjson");
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let trust_roots = Arc::new(ActorTrustRoots::load(&pki.ca_cert, &pki.ops_ca_cert).unwrap());
+	let audit_sink: Arc<dyn AuditSink> = Arc::new(LocalAuditSink::open(&audit_path).unwrap());
+	let acceptor = TlsAcceptor::from(Arc::new(
+		rustls_server_config_with_peer_roots(
+			&server_material,
+			trust_roots.combined_roots(),
+			Vec::new(),
+		)
+		.unwrap(),
+	));
+	let handles = observability::spawn(
+		ListenerAddresses {
+			health: "127.0.0.1:0".into(),
+			ready: "127.0.0.1:0".into(),
+			metrics: "127.0.0.1:0".into(),
+		},
+		acceptor,
+		Arc::new(FixedReporter {
+			snapshot: ReadinessSnapshot {
+				node_id: 1,
+				epoch: 42,
+				leader_id: Some(1),
+				cluster_members: vec![1, 2, 3],
+				drain_state: DrainState::None,
+				audit_materialization_lag_entries: 2,
+				degraded_reason: Some("AuditLagExceeded".to_string()),
+			},
+		}),
+		1,
+		tls_pki::CLUSTER_DOMAIN,
+		trust_roots,
+		audit_sink,
+	)
+	.await
+	.unwrap();
+
+	let ready = request_mtls(
+		handles.ready.local_addr,
+		"/ready",
+		&pki.data_client_cert,
+		&pki.data_client_key,
+		&pki.ca_cert,
+	)
+	.await;
+	assert!(
+		ready.starts_with("HTTP/1.1 503 Service Unavailable"),
+		"unexpected degraded ready response: {ready}"
+	);
+	assert!(
+		ready.contains("\"audit_materialization_lag_entries\":2"),
+		"unexpected degraded ready body: {ready}"
+	);
+	assert!(
+		ready.contains("\"degraded_reason\":\"AuditLagExceeded\""),
+		"unexpected degraded ready body: {ready}"
+	);
+
+	shutdown(handles).await;
+}
+
 async fn request_health(addr: std::net::SocketAddr) -> String {
 	let mut stream = TcpStream::connect(addr).await.unwrap();
 	stream

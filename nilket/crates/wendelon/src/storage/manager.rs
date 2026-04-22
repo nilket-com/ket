@@ -1536,7 +1536,9 @@ impl StorageEngine for SlabManager {
 			SlabBacking::Local(slab) => {
 				let started = Instant::now();
 				let result = slab.read(location).await;
-				metrics().l1_read_latency_seconds.observe_duration(started.elapsed());
+				metrics()
+					.l1_read_latency_seconds
+					.observe_duration(started.elapsed());
 				result
 			}
 			SlabBacking::L2(pointer) => {

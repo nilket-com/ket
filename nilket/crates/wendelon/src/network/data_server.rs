@@ -45,6 +45,7 @@ use crate::consensus::{
 	TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse,
 	WendelonStateMachine,
 };
+use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
 use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -83,6 +84,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry as DashEntry;
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::{Arc, RwLock};
@@ -125,6 +127,37 @@ struct BifurcatedWrite {
 enum PendingFinalizationResolution {
 	CommittedNow(FinalizationMarker),
 	ObservedApplied(FinalizationMarker),
+}
+
+#[derive(Clone, Default)]
+struct PendingFinalizationClaims {
+	inflight: Arc<DashMap<PendingFinalizationId, ()>>,
+}
+
+impl PendingFinalizationClaims {
+	fn try_claim(&self, id: PendingFinalizationId) -> Option<PendingFinalizationClaim> {
+		match self.inflight.entry(id) {
+			DashEntry::Occupied(_) => None,
+			DashEntry::Vacant(entry) => {
+				entry.insert(());
+				Some(PendingFinalizationClaim {
+					inflight: self.inflight.clone(),
+					id,
+				})
+			}
+		}
+	}
+}
+
+struct PendingFinalizationClaim {
+	inflight: Arc<DashMap<PendingFinalizationId, ()>>,
+	id: PendingFinalizationId,
+}
+
+impl Drop for PendingFinalizationClaim {
+	fn drop(&mut self) {
+		self.inflight.remove(&self.id);
+	}
 }
 
 // ============================================================
@@ -406,6 +439,9 @@ pub struct WendelonDataServer {
 	/// quorum but still need their control-branch finalization
 	/// committed through Raft.
 	pending_finalizations: Arc<PendingFinalizationStore>,
+	/// In-memory claim set that ensures only one task at a time can
+	/// drive a given persisted pending finalization through Raft.
+	pending_finalization_claims: PendingFinalizationClaims,
 	/// Nudges the background reconciler to retry a pending
 	/// finalization without waiting for the next periodic tick.
 	pending_finalization_wakeup: Arc<Notify>,
@@ -513,6 +549,7 @@ impl Clone for WendelonDataServer {
 			pool: self.pool.clone(),
 			idempotency: self.idempotency.clone(),
 			pending_finalizations: self.pending_finalizations.clone(),
+			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
@@ -558,6 +595,7 @@ impl WendelonDataServer {
 			pool,
 			idempotency: Arc::new(DashMap::new()),
 			pending_finalizations,
+			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
 			hlc,
 			tracker: None,
@@ -657,6 +695,8 @@ impl WendelonDataServer {
 			.prune_versions_older_than(retention_floor, max_slabs)
 			.await?;
 		if report.pruned_versions > 0 {
+			let _permit =
+				authorize_autonomous_action(AutonomousActionSurface::L1MvccRetentionPrune);
 			let audit = AuditEvent::new(
 				AuditAuthority::NodeLocal,
 				AuditOperation::MvccSnapshotPruned,
@@ -1003,6 +1043,13 @@ impl WendelonDataServer {
 		Ok((response, trailing))
 	}
 
+	fn try_claim_pending_finalization(
+		&self,
+		id: PendingFinalizationId,
+	) -> Option<PendingFinalizationClaim> {
+		self.pending_finalization_claims.try_claim(id)
+	}
+
 	async fn reconcile_pending_finalizations_once(&self) -> std::io::Result<usize> {
 		let mut records = self.pending_finalizations.load_all().await?;
 		records.sort_by_key(|record| {
@@ -1016,6 +1063,9 @@ impl WendelonDataServer {
 
 		let mut reconciled = 0usize;
 		for record in records {
+			let Some(_claim) = self.try_claim_pending_finalization(record.id) else {
+				continue;
+			};
 			match self.resolve_pending_finalization(&record).await {
 				Ok(resolution) => {
 					self.complete_pending_finalization(&record, resolution)
@@ -3183,12 +3233,14 @@ impl DataRing for WendelonDataServer {
 		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 			if let Some(pending_id) = cached.pending_finalization_id {
 				if let Some(record) = self.pending_finalizations.get(pending_id).await? {
-					if let Ok(resolution) = self.resolve_pending_finalization(&record).await {
-						let (mut response, trailing) = self
-							.complete_pending_finalization(&record, resolution)
-							.await?;
-						response.status = WriteStatus::DUPLICATE;
-						return Ok((response, trailing));
+					if let Some(_claim) = self.try_claim_pending_finalization(record.id) {
+						if let Ok(resolution) = self.resolve_pending_finalization(&record).await {
+							let (mut response, trailing) = self
+								.complete_pending_finalization(&record, resolution)
+								.await?;
+							response.status = WriteStatus::DUPLICATE;
+							return Ok((response, trailing));
+						}
 					}
 				}
 				return Ok((cached.response, cached.finalization));
@@ -3352,6 +3404,11 @@ impl DataRing for WendelonDataServer {
 		// failed" survives restart and can be replayed without redoing
 		// the data branch.
 		let pending = self.pending_finalization_record(&meta, &bifurcated, commit_hlc);
+		let _pending_claim = self
+			.try_claim_pending_finalization(pending.id)
+			.ok_or_else(|| {
+				Error::other("pending finalization for this write is already being processed")
+			})?;
 		let pending_persisted = match self.pending_finalizations.upsert(pending.clone()).await {
 			Ok(()) => true,
 			Err(err) => {
@@ -4510,6 +4567,48 @@ mod tests {
 		));
 		std::fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	#[test]
+	fn pending_finalization_claims_are_exclusive_until_drop() {
+		let claims = PendingFinalizationClaims::default();
+		let write_id = crate::schema::ClientWriteId {
+			client_uuid: [9; 16],
+			sequence_no: 42,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		};
+		let finalization = TenantFinalization {
+			marker: FinalizationMarker {
+				log_index: 0,
+				term: 0,
+				epoch: 1,
+				commit_hlc: HybridTimestamp {
+					physical_ms: 123,
+					logical: 4,
+					node_id: 1,
+				},
+				payload_hash: [0xAB; 32],
+				e_safe_index: 0,
+				durability: DurabilityLevel::QUORUM,
+				_pad: [0; 7],
+			},
+			tenant_id: TenantId::ZERO,
+			key_identity: Identity::blake3_tenant(TenantId::ZERO, b"claim-key"),
+			charged_bytes: 128,
+		};
+		let id = PendingFinalizationId::for_record(write_id, &finalization);
+
+		let first = claims.try_claim(id).expect("first claim should succeed");
+		assert!(
+			claims.try_claim(id).is_none(),
+			"the same pending finalization must not be processed twice concurrently"
+		);
+		drop(first);
+		assert!(
+			claims.try_claim(id).is_some(),
+			"dropping the active claim should release the pending finalization"
+		);
 	}
 
 	fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {

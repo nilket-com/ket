@@ -249,7 +249,7 @@ async fn handle_ready_connection(
 			)?;
 			write_response(
 				&mut stream,
-				"200 OK",
+				snapshot.http_status(),
 				"application/json; charset=utf-8",
 				&snapshot.to_json(),
 			)
@@ -415,6 +415,18 @@ async fn write_response<S: AsyncWrite + Unpin>(
 }
 
 impl ReadinessSnapshot {
+	pub fn is_ready(&self) -> bool {
+		self.degraded_reason.is_none() && self.audit_materialization_lag_entries == 0
+	}
+
+	pub fn http_status(&self) -> &'static str {
+		if self.is_ready() {
+			"200 OK"
+		} else {
+			"503 Service Unavailable"
+		}
+	}
+
 	pub fn to_json(&self) -> String {
 		let mut cluster_members = self.cluster_members.clone();
 		cluster_members.sort_unstable();

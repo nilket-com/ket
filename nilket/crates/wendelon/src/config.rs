@@ -3,6 +3,9 @@ use crate::crypto::{
 	CryptoCacheConfig, DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
 	RootKekProviderConfig, SLAB_MAX_BYTES_HARD_CEILING,
 };
+use crate::metrics::telemetry::{
+	TRACE_SAMPLING_RATE_DENOMINATOR, TraceExportConfig, TraceExportProtocol,
+};
 use crate::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
 	transfer_verifying_key_bytes,
@@ -224,6 +227,8 @@ struct RawTransportTlsConfig {
 struct RawObservabilityConfig {
 	#[serde(default)]
 	listeners: Option<RawObservabilityListeners>,
+	#[serde(default)]
+	traces: Option<RawObservabilityTraceConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,6 +236,31 @@ struct RawObservabilityListeners {
 	health: String,
 	ready: String,
 	metrics: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawObservabilityTraceConfig {
+	endpoint: String,
+	#[serde(default)]
+	protocol: RawObservabilityTraceProtocol,
+	#[serde(default = "default_trace_sampling_rate")]
+	sampling_rate: f64,
+	client_cert_path: PathBuf,
+	client_key_path: PathBuf,
+	ca_bundle_path: PathBuf,
+	#[serde(default = "default_trace_max_queue_size")]
+	max_queue_size: usize,
+	#[serde(default = "default_trace_export_timeout_s")]
+	export_timeout_s: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+enum RawObservabilityTraceProtocol {
+	#[default]
+	#[serde(rename = "http/protobuf")]
+	HttpProtobuf,
+	#[serde(rename = "grpc")]
+	Grpc,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -337,16 +367,7 @@ impl RawConfig {
 			operator_ca_path: absolutize_from_config_dir(source_path, &tls.operator_ca_path),
 			cluster_domain: tls.cluster_domain,
 		});
-		let observability = self
-			.observability
-			.listeners
-			.map(|listeners| ObservabilityConfig {
-				listeners: crate::metrics::observability::ListenerAddresses {
-					health: listeners.health,
-					ready: listeners.ready,
-					metrics: listeners.metrics,
-				},
-			});
+		let observability = self.observability.into_runtime_config(source_path)?;
 		let audit = AuditSinksConfig {
 			syslog: self.audit.syslog.map(|syslog| SyslogAuditConfig {
 				socket_path: absolutize_from_config_dir(source_path, &syslog.socket_path),
@@ -394,12 +415,76 @@ impl RawConfig {
 	}
 }
 
+impl RawObservabilityConfig {
+	fn into_runtime_config(
+		self,
+		source_path: &Path,
+	) -> std::io::Result<Option<ObservabilityConfig>> {
+		let listeners =
+			self.listeners.map(
+				|listeners| crate::metrics::observability::ListenerAddresses {
+					health: listeners.health,
+					ready: listeners.ready,
+					metrics: listeners.metrics,
+				},
+			);
+		let traces = match self.traces {
+			Some(traces) => Some(TraceExportConfig {
+				endpoint: traces.endpoint,
+				protocol: match traces.protocol {
+					RawObservabilityTraceProtocol::HttpProtobuf => {
+						TraceExportProtocol::HttpProtobuf
+					}
+					RawObservabilityTraceProtocol::Grpc => TraceExportProtocol::Grpc,
+				},
+				sampling_rate_per_million: parse_trace_sampling_rate(
+					"observability.traces.sampling_rate",
+					traces.sampling_rate,
+				)?,
+				client_cert_path: absolutize_from_config_dir(source_path, &traces.client_cert_path),
+				client_key_path: absolutize_from_config_dir(source_path, &traces.client_key_path),
+				ca_bundle_path: absolutize_from_config_dir(source_path, &traces.ca_bundle_path),
+				max_queue_size: traces.max_queue_size,
+				export_timeout: Duration::from_secs(traces.export_timeout_s),
+			}),
+			None => None,
+		};
+		if listeners.is_none() && traces.is_none() {
+			return Ok(None);
+		}
+		Ok(Some(ObservabilityConfig { listeners, traces }))
+	}
+}
+
 fn default_tenant_kek_cache_max_entries() -> usize {
 	DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES
 }
 
 fn default_slab_dek_cache_max_entries() -> usize {
 	DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES
+}
+
+fn default_trace_sampling_rate() -> f64 {
+	0.01
+}
+
+fn default_trace_max_queue_size() -> usize {
+	8192
+}
+
+fn default_trace_export_timeout_s() -> u64 {
+	30
+}
+
+fn parse_trace_sampling_rate(field: &str, value: f64) -> std::io::Result<u32> {
+	if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("{field} must be between 0.0 and 1.0 inclusive"),
+		));
+	}
+	let scaled = (value * TRACE_SAMPLING_RATE_DENOMINATOR as f64).round();
+	Ok(scaled.clamp(0.0, TRACE_SAMPLING_RATE_DENOMINATOR as f64) as u32)
 }
 
 fn absolutize_from_config_dir(config_path: &Path, value: &Path) -> PathBuf {

@@ -3,13 +3,14 @@ mod support;
 
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
-	AdvanceEpochResponseWire, CONTROL_REASON_AUTHORIZATION_FAILED, CONTROL_REASON_GRANTED,
-	TenantAdminRequestWire, TenantAdminResponseWire, WendelonControlServer,
+	AdvanceEpochResponseWire, AuditChainHeadResponseWire, CONTROL_REASON_AUTHORIZATION_FAILED,
+	CONTROL_REASON_GRANTED, TenantAdminRequestWire, TenantAdminResponseWire, WendelonControlServer,
 };
 use wendelon::network::router::MsgRouterBuilder;
 use wendelon::network::server::{HrftService, RequestContext};
@@ -83,6 +84,30 @@ fn decode_status_response(
 		.map(|bytes| wire::decode::<Vec<LeaseDescriptor>>(bytes).unwrap())
 		.unwrap_or_default();
 	(status, leases)
+}
+
+fn audit_chain_head_frame(stream_id: u32) -> wendelon::network::core::HrftFrame {
+	wendelon::network::core::HrftFrame {
+		header: wendelon::schema::FrameHeader {
+			magic: wendelon::network::core::HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::AUDIT_CHAIN_HEAD_REQ.0,
+			flags: 0,
+			stream_id,
+			meta_len: 0,
+			arrow_len: 0,
+			trailing_len: 0,
+		},
+		meta: wendelon::network::pool::BufPool::new(1, 16).acquire(),
+		arrow_payload: None,
+		trailing: None,
+	}
+}
+
+fn decode_audit_chain_head_response(
+	resp: &wendelon::network::core::HrftFrame,
+) -> AuditChainHeadResponseWire {
+	wire::decode(&resp.meta).unwrap()
 }
 
 fn read_audit_log(path: &Path) -> String {
@@ -345,6 +370,63 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 }
 
 #[tokio::test]
+async fn audit_chain_head_req_returns_local_head_for_operator_and_observer() {
+	let node = support::bootstrap_node("audit-chain-head-rpc", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let operator_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			audit_chain_head_frame(1),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		operator_resp.header.msg_type,
+		MsgType::AUDIT_CHAIN_HEAD_RESP.0
+	);
+	assert!(operator_resp.arrow_payload.is_none());
+	assert!(operator_resp.trailing.is_none());
+	let operator_meta = decode_audit_chain_head_response(&operator_resp);
+	let expected = node.audit_sink.chain_head().unwrap();
+	assert_eq!(operator_meta.head, expected);
+
+	let observer_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ReadOnlyObserver, None), node.local_node),
+			audit_chain_head_frame(2),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let observer_meta = decode_audit_chain_head_response(&observer_resp);
+	assert_eq!(observer_meta.head, expected);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn audit_chain_head_req_rejects_data_node_actor() {
+	let node = support::bootstrap_node("audit-chain-head-authz", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let err = node
+		.router
+		.handle_frame(
+			context(ActorIdentity::data_node(node.local_node), node.local_node),
+			audit_chain_head_frame(1),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
 async fn lease_release_req_removes_committed_lease() {
 	let node = support::bootstrap_node("lease-release-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
@@ -486,6 +568,7 @@ async fn transfer_leadership_req_routes_to_control_handler() {
 				leader.pool.clone(),
 				1,
 				LEASE_TTL_MS,
+				leader.audit_sink.clone(),
 			)))
 			.build(),
 	);

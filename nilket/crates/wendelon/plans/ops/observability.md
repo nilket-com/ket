@@ -1,6 +1,6 @@
 # Observability
 
-Operator-facing telemetry for Wendelon. **Not** the same thing as audit — audit is for security/compliance reviewers and lives under ADR 025; observability is for operators diagnosing the running cluster. Three streams, three postures:
+Operator-facing telemetry for Wendelon. **Not** the same thing as audit — audit is for security/compliance reviewers and is operationalized in [Audit](./audit.md) on top of ADR 025; observability is for operators diagnosing the running cluster. Three streams, three postures:
 
 | Stream | ADR | Purpose | Security posture | Retention |
 |--------|-----|---------|------------------|-----------|
@@ -10,7 +10,7 @@ Operator-facing telemetry for Wendelon. **Not** the same thing as audit — audi
 
 This document operationalizes ADR 027. Anything architectural goes in the ADR; this document covers **what an operator configures, runs, and alerts on**.
 
-The current workspace implements the three-listener posture, the Prometheus/OpenMetrics exporter, the recording rules, and the alert bundle described below. OTLP trace export remains planned and is not yet wired in this pilot codebase.
+The current workspace implements the three-listener posture, the Prometheus/OpenMetrics exporter, the recording rules, the alert bundle described below, and OTLP trace export over both `http/protobuf` and gRPC. Both transports are implemented in pure Rust and remain feature-gated so the default build stays free of optional exporter code.
 
 ---
 
@@ -59,7 +59,7 @@ All three listener sockets must bind successfully at startup; a bind failure is 
 
 ### Protocol
 
-- OTLP only (gRPC preferred; HTTP/protobuf supported).
+- OTLP only. The current pilot implementation ships both `http/protobuf` and gRPC as optional pure-Rust transports; neither is compiled into the default build unless its cargo feature is enabled.
 - No Jaeger-native, no Zipkin-native. Operators using those backends run the **OpenTelemetry Collector** as a translation layer.
 
 ### Configuration
@@ -326,7 +326,7 @@ Exact field definitions close with ADR 026 acceptance; this section will be tigh
 
 ## 8. What is explicitly not observability
 
-- **Audit.** Audit events are ADR 025's concern. The audit stream has different durability semantics (fail-closed for NodeLocal, materialization-lag for RaftLog) and different retention (≥ 90 days default). Do not route audit events through the trace or metric pipelines.
+- **Audit.** Audit events are ADR 025's concern. The audit stream has different durability semantics (fail-closed for NodeLocal, materialization-lag for RaftLog) and different retention (≥ 90 days default). Sink-shape differences and archive guidance live in [Audit](./audit.md). Do not route audit events through the trace or metric pipelines.
 - **Debug logs.** Debug logging is operator-mode-only and is not part of the telemetry SLA. `EnvFilter` controls it; `tracing` events at `debug!` and `trace!` are dropped in production builds unless explicitly enabled.
 - **Per-tenant business analytics.** `/metrics` does not carry per-tenant labels. Per-tenant business metrics are downstream of this system, not inside it.
 
@@ -336,6 +336,7 @@ Exact field definitions close with ADR 026 acceptance; this section will be tigh
 
 - ADR 027: Observability Posture — OTLP, Tracing Stack, Health/Metrics Split
 - ADR 025: Audit Event Model and Tamper-Evident Hash Chain (separate stream)
+- `plans/ops/audit.md` — operator-facing audit sink shapes and archive guidance
 - ADR 026: FIPS 140-3 Certification Target (FIPS-build visibility additions)
 - ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (role-gating on `/ready` and `/metrics`)
 - ADR 028: Deterministic Simulator and `AsyncFileOps` Abstraction (SLO validation harness)

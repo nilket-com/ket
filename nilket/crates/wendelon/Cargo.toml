@@ -13,6 +13,8 @@ default = ["non-fips"]
 non-fips = ["aws-lc-rs/non-fips"]
 fips = ["aws-lc-rs/fips"]
 audit-kafka = ["dep:rdkafka"]
+otlp-http = ["dep:reqwest"]
+otlp-grpc = ["dep:h2", "dep:http"]
 
 [dependencies]
 arrow = { version = "58.1.0", features = ["ipc_compression"] }
@@ -23,6 +25,8 @@ bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
 bytes = "1.6"
 dashmap = "6.1.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
 io-uring = "0.7.11"
 libc = "0.2"
 opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
@@ -32,6 +36,7 @@ quinn = "0.11"
 rand = "0.10.1"
 rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl"], optional = true }
 redb = "4.0.0"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.10"
 serde = { version = "1.0", features = ["derive"] }

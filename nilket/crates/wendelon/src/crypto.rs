@@ -3098,7 +3098,7 @@ mod tests {
 		let events = audit.events();
 		let event = events
 			.iter()
-			.find(|event| event.event_type == "crypto.decrypt_rejected")
+			.find(|event| event.event_type() == "crypto.decrypt_rejected")
 			.expect("decrypt rejection should emit audit event");
 		assert_eq!(event.node_id.id, 42);
 		assert!(event.message.contains("failure_stage=hmac"));

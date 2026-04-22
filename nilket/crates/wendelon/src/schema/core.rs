@@ -3,6 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 // ============================================================
@@ -41,6 +42,21 @@ pub struct NodeId {
 	pub id: u32,
 	/// Reserved for future use (e.g., generation counter). Must be 0.
 	pub _reserved: u32,
+}
+
+impl NodeId {
+	pub fn format_wire(self) -> String {
+		format!("n-{:02}", self.id)
+	}
+
+	pub fn parse_wire(raw: &str) -> std::io::Result<Self> {
+		let id = raw
+			.strip_prefix("n-")
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, format!("invalid node_id {raw:?}")))?
+			.parse::<u32>()
+			.map_err(|_| Error::new(ErrorKind::InvalidData, format!("invalid node_id {raw:?}")))?;
+		Ok(Self { id, _reserved: 0 })
+	}
 }
 
 // ============================================================
@@ -454,6 +470,8 @@ impl MsgType {
 	pub const LEASE_RELEASE_RESP: Self = Self(0x1B);
 	pub const TENANT_ADMIN_REQ: Self = Self(0x1C);
 	pub const TENANT_ADMIN_RESP: Self = Self(0x1D);
+	pub const AUDIT_CHAIN_HEAD_REQ: Self = Self(0x1E);
+	pub const AUDIT_CHAIN_HEAD_RESP: Self = Self(0x1F);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -1228,3 +1246,24 @@ const _: () = assert!(std::mem::size_of::<LogEntryKind>() == 1);
 const _: () = assert!(std::mem::size_of::<RaftLogEntryFixed>() == 96);
 const _: () = assert!(std::mem::size_of::<WALRecordHeader>() == 32);
 const _: () = assert!(std::mem::size_of::<SnapshotHeader>() == 80);
+
+#[cfg(test)]
+mod tests {
+	use super::NodeId;
+
+	#[test]
+	fn node_id_wire_text_round_trips() {
+		let node_id = NodeId {
+			id: 123,
+			_reserved: 0,
+		};
+		assert_eq!(node_id.format_wire(), "n-123");
+		assert_eq!(NodeId::parse_wire("n-123").unwrap(), node_id);
+	}
+
+	#[test]
+	fn node_id_parse_wire_rejects_invalid_text() {
+		assert!(NodeId::parse_wire("123").is_err());
+		assert!(NodeId::parse_wire("n-abc").is_err());
+	}
+}

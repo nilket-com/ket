@@ -261,6 +261,7 @@ struct RaftAuditMaterializer {
 impl RaftAuditMaterializer {
 	fn emit(&self, event: AuditEvent) -> bool {
 		if let Err(err) = self.sink.emit(event.clone()) {
+			self.tracker.note_materialization_failed();
 			tracing::warn!(
 				event_type = %event.operation.as_str(),
 				error = %err,

@@ -74,6 +74,7 @@ fn build_control_server(
 			node.pool.clone(),
 			replication_factor,
 			LEASE_TTL_MS,
+			node.audit_sink.clone(),
 		)),
 		epoch_tx,
 	)
