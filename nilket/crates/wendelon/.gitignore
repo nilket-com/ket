@@ -2,3 +2,5 @@
 .claude
 .codex
 .git
+__pycache__/
+*.pyc

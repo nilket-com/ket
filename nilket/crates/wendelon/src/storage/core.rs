@@ -738,22 +738,17 @@ pub(crate) fn recover_slab_entries_from_blob(
 // ============================================================
 //  CHECKSUM
 //
-//  Torn-write detector. Defined as the first 4 bytes of a blake3
+//  Torn-write detector. Defined as the first 4 bytes of a SHA-256
 //  hash over (header-with-zero-checksum || frame-bytes), taken as
-//  little-endian u32. Chosen because blake3 is already a project
-//  dependency — avoiding a new crate beats the marginal CPU cost
-//  of the stronger hash for a durability aid that is not on the
-//  truly hottest path. If benchmarks ever show
+//  little-endian u32. Chosen to keep the checksum on the approved
+//  hash family while preserving the existing on-disk field width
+//  and torn-write semantics. If benchmarks ever show
 //  this dominating append latency, the checksum primitive can be
 //  swapped here without changing the rest of the read/write path.
 // ============================================================
 
 fn compute_checksum(bytes_header_then_frame: &[u8]) -> u32 {
-	let hash = blake3::hash(bytes_header_then_frame);
-	let bytes: [u8; 4] = hash.as_bytes()[..4]
-		.try_into()
-		.expect("blake3 output is 32 bytes");
-	u32::from_le_bytes(bytes)
+	crate::hash::sha256::prefix_u32(bytes_header_then_frame)
 }
 
 fn clone_io_result(result: &std::io::Result<()>) -> std::io::Result<()> {
@@ -770,7 +765,7 @@ fn verify_record_checksum(header: &SlabRecordHeader, frame: &[u8]) -> std::io::R
 
 	// Fold header + frame into one contiguous slice for hashing.
 	// The extra copy is fine for scaffold grade; a streaming
-	// blake3::Hasher with two `update` calls would eliminate it.
+	// SHA-256 helper with two `update` calls would eliminate it.
 	let mut buf = Vec::with_capacity(header_bytes.len() + frame.len());
 	buf.extend_from_slice(header_bytes);
 	buf.extend_from_slice(frame);

@@ -99,8 +99,7 @@ fn deterministic_migration_id(to_epoch: u64, range_start: u64, range_end: u64) -
 	input[..8].copy_from_slice(&to_epoch.to_le_bytes());
 	input[8..16].copy_from_slice(&range_start.to_le_bytes());
 	input[16..24].copy_from_slice(&range_end.to_le_bytes());
-	let hash = blake3::hash(&input);
-	u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"))
+	wendelon::hash::sha256::prefix_u64(&input)
 }
 
 async fn advance_epoch_via_rpc(

@@ -77,7 +77,7 @@ impl TransferAuthority {
 }
 
 pub fn dev_transfer_signing_secret(node_id: u32) -> [u8; 32] {
-	*blake3::hash(format!("wendelon-dev-transfer-signing-key-{node_id}").as_bytes()).as_bytes()
+	crate::hash::sha256::digest(format!("wendelon-dev-transfer-signing-key-{node_id}").as_bytes())
 }
 
 pub fn transfer_verifying_key_bytes(secret: [u8; 32]) -> [u8; 32] {

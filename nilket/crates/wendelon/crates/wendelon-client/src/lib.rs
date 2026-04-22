@@ -1,3 +1,6 @@
+#[cfg(all(feature = "fips", feature = "non-fips"))]
+compile_error!("features `fips` and `non-fips` are mutually exclusive");
+
 use arrow::array::{Array, LargeBinaryArray, LargeBinaryBuilder};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;

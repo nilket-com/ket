@@ -1,14 +1,10 @@
 use arrow::array::{ArrayRef, ListBuilder, StringBuilder, UInt32Builder};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+use std::sync::Arc;
 use tokio::sync::watch;
 use wendelon::client::{
 	ClusterStatusWire, StaticTopologySource, TopologySource, WendelonClientConfig,
@@ -16,63 +12,21 @@ use wendelon::client::{
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
-use wendelon::network::server::{HrftService, RequestContext};
-use wendelon::network::tls::ActorIdentity;
+use wendelon::network::server::HrftService;
 use wendelon::network::transport::{
 	EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities,
-	TransportConnection, TransportProvider, TransportStream, TransportTier, TransportTierSet,
+	TransportProvider, TransportTier, TransportTierSet,
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{FrameHeader, MsgType, NodeId};
+use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
 
 const ZERO_NODE: NodeId = NodeId {
 	id: 0,
 	_reserved: 0,
 };
 
-#[derive(Default)]
-pub struct LoopbackRegistry {
-	services: Mutex<HashMap<NodeId, PublishedLoopbackService>>,
-}
-
-struct PublishedLoopbackService {
-	service: Arc<dyn HrftService>,
-}
-
-impl LoopbackRegistry {
-	fn publish(&self, node_id: NodeId, address: &str, service: Arc<dyn HrftService>) {
-		let _ = address;
-		self.services
-			.lock()
-			.unwrap()
-			.insert(node_id, PublishedLoopbackService { service });
-	}
-
-	#[allow(dead_code)]
-	pub fn unpublish(&self, node_id: NodeId) {
-		self.services.lock().unwrap().remove(&node_id);
-	}
-
-	fn resolve(
-		&self,
-		target: NodeId,
-		expected_address: &str,
-	) -> std::io::Result<Arc<dyn HrftService>> {
-		let guard = self.services.lock().unwrap();
-		let published = guard.get(&target).ok_or_else(|| {
-			Error::new(
-				ErrorKind::NotFound,
-				format!("unknown loopback target {}", target.id),
-			)
-		})?;
-		let _ = expected_address;
-		Ok(published.service.clone())
-	}
-
-	fn contains(&self, target: NodeId, _expected_address: &str) -> bool {
-		self.services.lock().unwrap().contains_key(&target)
-	}
-}
+pub type LoopbackRegistry = SimulatedTransportNetwork;
 
 pub fn tempdir(tag: &str) -> PathBuf {
 	let base = std::env::temp_dir().join(format!(
@@ -125,12 +79,12 @@ pub fn loopback_provider(
 	local: NodeId,
 	registry: Arc<LoopbackRegistry>,
 ) -> Arc<dyn TransportProvider> {
-	Arc::new(LoopbackProvider {
+	Arc::new(SimulatedTransportProvider::new(
 		local,
 		registry,
-		pool: BufPool::new(64, 1024 * 1024),
-		tier: TransportTier::QuicIoUring,
-	})
+		BufPool::new(64, 1024 * 1024),
+		TransportTier::QuicIoUring,
+	))
 }
 
 #[allow(dead_code)]
@@ -188,12 +142,12 @@ pub fn loopback_factory_many_from(
 	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 	providers.insert(
 		TransportTier::QuicIoUring,
-		Arc::new(LoopbackProvider {
+		Arc::new(SimulatedTransportProvider::new(
 			local,
 			registry,
-			pool: pool.clone(),
-			tier: TransportTier::QuicIoUring,
-		}),
+			pool.clone(),
+			TransportTier::QuicIoUring,
+		)),
 	);
 
 	let factory = TransportProviderFactory::new(tiers, providers, resolver, rx);
@@ -231,21 +185,33 @@ pub fn loopback_client_config_many_with_topology(
 	topology: Arc<dyn TopologySource>,
 	services: Vec<(NodeId, Arc<dyn HrftService>)>,
 ) -> WendelonClientConfig {
+	let services = services
+		.into_iter()
+		.map(|(remote, service)| (remote, format!("loopback://node-{}", remote.id), service))
+		.collect();
+	loopback_client_config_published_many_with_topology(bootstrap, topology, services)
+}
+
+#[allow(dead_code)]
+pub fn loopback_client_config_published_many_with_topology(
+	bootstrap: ClusterStatusWire,
+	topology: Arc<dyn TopologySource>,
+	services: Vec<(NodeId, String, Arc<dyn HrftService>)>,
+) -> WendelonClientConfig {
 	let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
 	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 	let registry = shared_loopback_registry();
-	for (remote, service) in services {
-		let address = format!("loopback://node-{}", remote.id);
+	for (remote, address, service) in services {
 		registry.publish(remote, &address, service);
 	}
 	providers.insert(
 		TransportTier::QuicIoUring,
-		Arc::new(LoopbackProvider {
-			local: ZERO_NODE,
+		Arc::new(SimulatedTransportProvider::new(
+			ZERO_NODE,
 			registry,
-			pool: BufPool::new(64, 1024 * 1024),
-			tier: TransportTier::QuicIoUring,
-		}),
+			BufPool::new(64, 1024 * 1024),
+			TransportTier::QuicIoUring,
+		)),
 	);
 	WendelonClientConfig {
 		local_tiers: tiers,
@@ -394,148 +360,4 @@ fn list_utf8_owned(values: &[String]) -> arrow::array::ListArray {
 	}
 	builder.append(true);
 	builder.finish()
-}
-
-struct DuplexTransportStream {
-	inner: DuplexStream,
-}
-
-impl AsyncRead for DuplexTransportStream {
-	fn poll_read(
-		mut self: Pin<&mut Self>,
-		cx: &mut TaskContext<'_>,
-		buf: &mut ReadBuf<'_>,
-	) -> Poll<std::io::Result<()>> {
-		Pin::new(&mut self.inner).poll_read(cx, buf)
-	}
-}
-
-impl AsyncWrite for DuplexTransportStream {
-	fn poll_write(
-		mut self: Pin<&mut Self>,
-		cx: &mut TaskContext<'_>,
-		buf: &[u8],
-	) -> Poll<std::io::Result<usize>> {
-		Pin::new(&mut self.inner).poll_write(cx, buf)
-	}
-
-	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-		Pin::new(&mut self.inner).poll_flush(cx)
-	}
-
-	fn poll_shutdown(
-		mut self: Pin<&mut Self>,
-		cx: &mut TaskContext<'_>,
-	) -> Poll<std::io::Result<()>> {
-		Pin::new(&mut self.inner).poll_shutdown(cx)
-	}
-}
-
-#[async_trait]
-impl TransportStream for DuplexTransportStream {
-	fn stream_id(&self) -> u64 {
-		0
-	}
-
-	async fn finish(&mut self) -> std::io::Result<()> {
-		use tokio::io::AsyncWriteExt;
-		self.inner.shutdown().await
-	}
-}
-
-struct LoopbackConnection {
-	local: NodeId,
-	remote: NodeId,
-	registry: Arc<LoopbackRegistry>,
-	address: String,
-	pool: Arc<BufPool>,
-	tier: TransportTier,
-	actor: ActorIdentity,
-}
-
-#[async_trait]
-impl TransportConnection for LoopbackConnection {
-	async fn open_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
-		let service = self.registry.resolve(self.remote, &self.address)?;
-		let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-		let pool = self.pool.clone();
-		let local = self.local;
-		tokio::spawn(serve_stream(server_side, service, pool, local));
-		Ok(Box::new(DuplexTransportStream { inner: client_side }))
-	}
-
-	async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
-		unreachable!("loopback connection does not accept server-initiated streams")
-	}
-
-	fn remote_id(&self) -> NodeId {
-		self.remote
-	}
-
-	fn actor_identity(&self) -> &ActorIdentity {
-		&self.actor
-	}
-
-	fn transport_type(&self) -> TransportTier {
-		self.tier
-	}
-
-	fn is_closed(&self) -> bool {
-		!self.registry.contains(self.remote, &self.address)
-	}
-}
-
-struct LoopbackProvider {
-	local: NodeId,
-	registry: Arc<LoopbackRegistry>,
-	pool: Arc<BufPool>,
-	tier: TransportTier,
-}
-
-#[async_trait]
-impl TransportProvider for LoopbackProvider {
-	async fn connect(
-		&self,
-		target: NodeId,
-		address: &str,
-	) -> std::io::Result<Arc<dyn TransportConnection>> {
-		self.registry.resolve(target, address)?;
-		Ok(Arc::new(LoopbackConnection {
-			local: self.local,
-			remote: target,
-			registry: self.registry.clone(),
-			address: address.to_string(),
-			pool: self.pool.clone(),
-			tier: self.tier,
-			actor: ActorIdentity::data_node(self.local),
-		}))
-	}
-
-	fn publish_local(
-		&self,
-		node_id: NodeId,
-		address: &str,
-		service: Arc<dyn HrftService>,
-	) -> std::io::Result<()> {
-		self.registry.publish(node_id, address, service);
-		Ok(())
-	}
-}
-
-async fn serve_stream(
-	stream: DuplexStream,
-	service: Arc<dyn HrftService>,
-	pool: Arc<BufPool>,
-	remote: NodeId,
-) {
-	let _ = service
-		.handle_stream(
-			Box::new(DuplexTransportStream { inner: stream }),
-			pool,
-			RequestContext {
-				remote,
-				actor: ActorIdentity::data_node(remote),
-			},
-		)
-		.await;
 }

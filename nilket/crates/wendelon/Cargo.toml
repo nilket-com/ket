@@ -52,7 +52,7 @@ uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
-wendelon-client = { path = "crates/wendelon-client" }
+wendelon-client = { path = "crates/wendelon-client", default-features = false }
 
 [profile.release]
 opt-level = 3

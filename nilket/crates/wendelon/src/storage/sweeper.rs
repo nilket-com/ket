@@ -366,7 +366,7 @@ impl SlabSweeper {
 		let encrypted = self
 			.slab
 			.encrypt_tiered_object_blob(info.slab_id, &plaintext)?;
-		let expected_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
 
 		// Phase 2: upload to L2, applying the rate limit.
 		self.rate_limit_upload(encrypted.bytes.len()).await;
@@ -382,7 +382,7 @@ impl SlabSweeper {
 		// blob — we refuse to pivot on corrupt data. The L1 file
 		// is still intact; the sweeper will retry next pass.
 		let fetched = self.object_store.get(&l2_uri).await?;
-		let fetched_hash = *blake3::hash(&fetched).as_bytes();
+		let fetched_hash = crate::hash::content::digest(&fetched);
 		if fetched_hash != expected_hash {
 			// Best-effort cleanup of the bad object. Ignoring the
 			// error here is intentional: we already know the
@@ -477,7 +477,7 @@ impl SlabSweeper {
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<PlaintextRewriteOutcome> {
 		let blob = self.object_store.get_bytes(&pointer.l2_uri).await?;
-		let actual_hash = *blake3::hash(blob.as_ref()).as_bytes();
+		let actual_hash = crate::hash::content::digest(blob.as_ref());
 		if actual_hash != pointer.payload_hash {
 			return Err(std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
@@ -500,7 +500,7 @@ impl SlabSweeper {
 		let encrypted = self
 			.slab
 			.encrypt_tiered_object_blob(pointer.slab_id, blob.as_ref())?;
-		let expected_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
 		// Per-attempt suffix so a leader-handoff retry never races
 		// the same key as an earlier in-flight upload. The earlier
 		// attempt either committed (we never reach this branch on a
@@ -512,7 +512,7 @@ impl SlabSweeper {
 		self.rate_limit_upload(encrypted.bytes.len()).await;
 		let new_uri = self.object_store.put(&key, &encrypted.bytes).await?;
 		let fetched = self.object_store.get(&new_uri).await?;
-		let fetched_hash = *blake3::hash(&fetched).as_bytes();
+		let fetched_hash = crate::hash::content::digest(&fetched);
 		if fetched_hash != expected_hash {
 			let _ = self.delete_object_if_present(&new_uri).await;
 			return Err(std::io::Error::new(
@@ -640,7 +640,7 @@ impl SlabSweeper {
 				self.rate_limit_upload(encrypted_bytes.len()).await;
 				let new_uri = self.object_store.put(&key, &encrypted_bytes).await?;
 				let fetched = self.object_store.get(&new_uri).await?;
-				let fetched_hash = *blake3::hash(&fetched).as_bytes();
+				let fetched_hash = crate::hash::content::digest(&fetched);
 				if fetched_hash != payload_hash {
 					let _ = self.delete_object_if_present(&new_uri).await;
 					return Err(std::io::Error::new(
@@ -1533,7 +1533,7 @@ mod tests {
 		let (manager, _l1_dir) = build_manager_with_sealed_slabs(Some(l2.clone())).await;
 		let loc = manager.lookup(tenant(), id(1)).expect("key present");
 		let raw = manager.read_sealed_raw(loc.slab_id).await.unwrap();
-		let old_hash = *blake3::hash(&raw).as_bytes();
+		let old_hash = crate::hash::content::digest(&raw);
 		let old_uri = l2
 			.put(&format!("legacy/slab_{:016x}.wnd", loc.slab_id), &raw)
 			.await
@@ -1642,7 +1642,7 @@ mod tests {
 		let sealed_id = manager.force_seal_active_for_test().await;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_hash = crate::hash::content::digest(&encrypted.bytes);
 		let old_uri = l2
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await
@@ -1751,7 +1751,7 @@ mod tests {
 		assert_eq!(older_loc.slab_id, sealed_id);
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_hash = crate::hash::content::digest(&encrypted.bytes);
 		let old_uri = l2
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await
@@ -1883,7 +1883,7 @@ mod tests {
 		let sealed_id = manager.force_seal_active_for_test().await;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_hash = crate::hash::content::digest(&encrypted.bytes);
 		let old_uri = l2
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await
@@ -1988,7 +1988,7 @@ mod tests {
 		let sealed_id = manager.force_seal_active_for_test().await;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let old_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let old_hash = crate::hash::content::digest(&encrypted.bytes);
 		let old_uri = l2
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await
@@ -2106,7 +2106,7 @@ mod tests {
 		let sealed_id = manager.force_seal_active_for_test().await;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
 		let old_uri = l2
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await

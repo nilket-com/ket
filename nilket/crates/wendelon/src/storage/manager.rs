@@ -1327,7 +1327,7 @@ impl SlabManager {
 			// of what we already stored, the migration pull was
 			// a duplicate and can be dropped.
 			let stored = self.read(location).await?;
-			let stored_hash: [u8; 32] = *blake3::hash(&stored).as_bytes();
+			let stored_hash = crate::hash::content::digest(&stored);
 			if stored_hash == payload_hash {
 				return Ok(MigrationIngestOutcome::Duplicate(location));
 			}
@@ -2086,7 +2086,7 @@ impl SlabManager {
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
-			payload_hash: *blake3::hash(&encrypted.bytes).as_bytes(),
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
 			encrypted_bytes: encrypted.bytes,
@@ -2575,7 +2575,7 @@ struct CompactionOutcome {
 // ============================================================
 
 fn validate_tiered_blob(pointer: &TieredSlabPointer, blob: &[u8]) -> std::io::Result<()> {
-	let actual = *blake3::hash(blob).as_bytes();
+	let actual = crate::hash::content::digest(blob);
 	if actual != pointer.payload_hash {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -3037,7 +3037,7 @@ mod tests {
 		let pointer = TieredSlabPointer {
 			slab_id,
 			l2_uri: format!("memory://tiered/{slab_id:016x}"),
-			payload_hash: *blake3::hash(&encrypted.bytes).as_bytes(),
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			is_encrypted: true,
 		};
 
@@ -3123,7 +3123,7 @@ mod tests {
 		let key = id(42);
 		let ts = hlc(100);
 		let frame = b"payload-bytes";
-		let hash: [u8; 32] = *blake3::hash(frame).as_bytes();
+		let hash = crate::hash::content::digest(frame);
 
 		let first = mgr
 			.append_migration(7, tenant(), key, ts, hash, frame)
@@ -3149,7 +3149,7 @@ mod tests {
 		let key = id(99);
 		let ts = hlc(200);
 		let frame_a = b"original";
-		let hash_a: [u8; 32] = *blake3::hash(frame_a).as_bytes();
+		let hash_a = crate::hash::content::digest(frame_a);
 		mgr.append_migration(1, tenant(), key, ts, hash_a, frame_a)
 			.await
 			.unwrap();
@@ -3158,7 +3158,7 @@ mod tests {
 		// slot — the mismatch must fail loudly, not silently
 		// accept either side.
 		let frame_b = b"tampered";
-		let hash_b: [u8; 32] = *blake3::hash(frame_b).as_bytes();
+		let hash_b = crate::hash::content::digest(frame_b);
 		let err = mgr
 			.append_migration(1, tenant(), key, ts, hash_b, frame_b)
 			.await
@@ -3297,7 +3297,7 @@ mod tests {
 		let sealed_id = sealed[0].slab_id;
 		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
 		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
-		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
 		let uri = l2
 			.put(
 				&format!("sealed/slab_{sealed_id:016x}.wnd"),

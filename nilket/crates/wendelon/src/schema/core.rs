@@ -1156,10 +1156,10 @@ pub struct RaftLogEntryFixed {
 	pub entry_hlc: HybridTimestamp, // 16
 	pub payload_len: u32,           //  4
 	pub _pad2: [u8; 4],             //  4
-	/// 32-byte content digest over the payload bytes. Currently
-	/// populated with a truncated blake3 hash; the field name
-	/// retains `sha256` nomenclature for future migration to the
-	/// ADR-specified SHA-256 digest without a layout change.
+	/// 32-byte content digest over the payload bytes.
+	/// Stored with the active Control Ring profile hash while
+	/// keeping the field name stable for on-disk/on-wire
+	/// compatibility.
 	pub payload_hash: [u8; 32], // 32
 }
 
@@ -1204,9 +1204,9 @@ pub struct SnapshotHeader {
 	pub last_included_epoch: u64,      //  8
 	pub snapshot_hlc: HybridTimestamp, // 16
 	/// Content digest over the serialized state-machine blob.
-	/// 32-byte field retained with `sha256` nomenclature for a
-	/// future migration to SHA-256; currently filled with a
-	/// truncated blake3 digest of the same blob.
+	/// Stored with the active Control Ring profile hash while
+	/// keeping the field name stable for on-disk/on-wire
+	/// compatibility.
 	pub state_sha256: [u8; 32], // 32
 	/// Byte length of the idempotency cache checkpoint that
 	/// follows the state-machine blob. Zero until that path lands.

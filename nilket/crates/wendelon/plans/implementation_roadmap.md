@@ -97,7 +97,7 @@ Server-side WPBC pushdown execution (ADR 005). Time-travel queries with MVCC (AD
 Canonical audit schema + AuditSink trait + per-node hash chain + signed-root rollup + two-authority model + materialization-lag semantics (ADR 025). Three-listener observability with OTLP, metric catalog, recording rules, alerts (ADR 027). Autonomous-healing governance boundary (ADR 001) — what the cluster may act on without operator input.
 
 ### W10 — FIPS Profile + Simulator/Chaos Productionization
-Two build profiles with compile-out of non-validated primitives (ADR 026). Audit chain hash primitive parameterized by build profile. Simulator network layer (turmoil-style) and `ObjectStore` mock (ADR 028 §3-5). Elle + monotonic correctness checkers (ADR 028 §6). Coverage ladder (10k / 1M / 100M) wired to CI (ADR 028 §7). Chaos harness scenarios on a kernel-capable runner (ADR 028 §8). Seed registry with retention policy (per `plans/ops/testing.md` §7).
+Two build profiles with compile-out of non-validated primitives (ADR 026). Audit chain hash primitive parameterized by build profile. Simulator network layer (turmoil-style) and `ObjectStore` mock (ADR 028 §3-5). Elle + monotonic correctness checkers (ADR 028 §6). Coverage ladder (10k / 1M / 100M) wired to CI (ADR 028 §7). Current chaos smoke slice plus rolling-upgrade / backup-restore scenarios, with the kernel-backed disk-full / clock-skew catalog explicitly deferred (ADR 028 §8). Seed registry with retention policy and a scheduled advisory report (per `plans/ops/testing.md` §7).
 
 ## 4. What this outline does NOT cover
 

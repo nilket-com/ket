@@ -94,9 +94,9 @@ The mock is **additive** to rustfs (ADR 014); it does not replace rustfs in the 
 Every generated history runs under two checkers (ADR 028 §6):
 
 - **Monotonic-counter checker** — runs against every history. Cheap (one pass), catches durability breaks, lost writes, torn-state bugs. Always on.
-- **Elle (Jepsen's linearizability successor)** — runs against a **focused** operation set: read/write against a small keyspace. Per-history cost is non-trivial (polynomial in history length); scoped to short histories.
+- **Elle (Jepsen's linearizability successor)** — runs against a **focused** operation set: read/write against a small keyspace. Per-history cost is non-trivial (polynomial in history length); scoped to short histories. The Rust simulator emits history artifacts; Elle runs out-of-process against those artifacts rather than as a Cargo dependency.
 
-The two are additive. Monotonic gives breadth; Elle gives per-history linearizability verdicts when it fires. Running only one loses a bug class the other catches.
+The two are additive. Monotonic gives breadth; Elle gives per-history linearizability verdicts when it fires. Running only one loses a bug class the other catches. The current Rust-side bounded register checker is the default CI gate over those focused histories; Elle remains the stronger out-of-process follow-on when a runner is provisioned for a lane.
 
 ---
 
@@ -114,24 +114,28 @@ The chaos harness exercises the **production binary**, not the simulator (ADR 02
 
 ### 5.2 Scenario shape
 
-Chaos scenarios are scripted in Rust under `tests/chaos/`. Every scenario uses the `wendelon-ctl` CLI for cluster manipulation so the operator surface is itself tested. Each scenario is single-invocation (set up → drive → assert → tear down), not a continuously running loop.
+Chaos scenarios are scripted in Rust under `tests/chaos/`. The target end-state uses the `wendelon-ctl` CLI for cluster manipulation so the operator surface is itself tested. The current executable catalog is a pre-kernel smoke slice over the in-process transport harness; each scenario is still single-invocation (set up → drive → assert → tear down), not a continuously running loop.
 
-Minimum seed scenarios at pilot:
+Current executable smoke catalog:
 
 - **`leader_partition_and_rejoin`** — partition the leader from the majority; verify a new leader elects; rejoin the old leader; verify state convergence and no split-brain commits.
-- **`rolling_kill`** — SIGKILL each node in sequence, wait for cluster re-stabilization, repeat. Asserts durability across the full membership.
+- **`rolling_kill`** — kill each node in sequence, wait for cluster re-stabilization, repeat. Asserts durability across the full membership.
+- **`packet_drop_single_stream`** — inject a one-shot simulated transport failure on one replication stream; verify quorum progress and follower catch-up on the next control write. This is the smoke-slice approximation of the packet-loss bug class, not the deferred kernel-backed `packet_drop` / `packet_reorder` coverage.
+
+Deferred kernel-backed catalog:
+
 - **`disk_full_on_leader`** — inject `ENOSPC` on the leader's WAL device; verify the leader yields and cluster continues.
-- **`slow_disk_node`** — cgroup-throttle one node's NVMe to 10 MB/s; verify the cluster does not wedge waiting on the slow node.
-- **`tls_rotation_rolling`** — rotate every node's Node CA-signed cert without downtime; verify no connection resets observed by clients.
-- **`l2_rate_limited`** — throttle rustfs to 1 MB/s; verify the L2 staging backlog drains and the tier-bytes metric stays sane.
+- **`clock_skew_on_replica`** — skew one node past the drift guard; verify the node aborts and the cluster stays available.
+- **`packet_drop`** — exercise actual kernel-backed loss semantics rather than the current one-shot stream-reset approximation.
+- **`packet_reorder`** — exercise true out-of-order delivery rather than the current one-shot stream-drop approximation.
 
 Scenarios are added over time. Every chaos-found bug gets a scenario pinned under its issue number.
 
 ### 5.3 Runner hosting
 
-Chaos requires kernel capabilities (mount namespaces, `nftables`, cgroup control) that container CI typically does not grant. The chaos runner is a self-hosted Linux VM (or a cloud VM pool), not a generic GitHub Actions container.
+The smoke slice runs on standard CI. Kernel-backed scenarios require capabilities (mount namespaces, `nftables`, cgroup control) that container CI typically does not grant, so the kernel-capable runner stays reserved for the deferred disk-full / clock-skew catalog.
 
-The specific hosting choice is operator-side; ADR 028 Open Questions tracks this as a procurement decision, not an architecture one.
+The specific hosting choice is operator-side; ADR 028 Open Questions tracks the kernel-runner procurement decision, not the smoke-slice CI lane.
 
 ---
 
@@ -149,6 +153,18 @@ The per-PR tier is a **hard wall-clock gate**: 10 minutes is the contract; growi
 
 Every tier prints seeds for every failure. Every failing seed becomes a frozen scenario in the seed registry.
 
+Current wiring:
+
+- **Per-PR gate** — `ci/check_simulator_ladder.sh 10000`, run from `.github/workflows/rust-ci.yml`.
+- **Chaos smoke gate** — `ci/check_chaos_harness.sh`, run from `.github/workflows/rust-ci.yml` with the harness's pinned default seed.
+- **Nightly ladder** — `ci/check_simulator_ladder.sh 1000000`, run from `.github/workflows/simulator-nightly.yml`.
+- **Nightly chaos smoke** — `ci/check_chaos_harness.sh`, run from `.github/workflows/simulator-nightly.yml`.
+- **Weekly ladder** — `ci/check_simulator_ladder.sh 100000000`, run from `.github/workflows/simulator-weekly.yml`.
+- **Kernel-capable manual lane** — `ci/check_chaos_harness.sh`, run from `.github/workflows/chaos-nightly.yml` via `workflow_dispatch` with `WENDELON_CHAOS_REQUIRE=1` until the first kernel-backed chaos scenarios land.
+- The ladder script validates the simulator seed registry, replays frozen simulator seeds, then runs the configured mixed-scenario budget with a printed seed.
+- When `WENDELON_SIM_HISTORY_DIR` is set, the ladder treats it as a history-artifact root and emits focused register-history artifacts for external Elle consumers beneath it. If `WENDELON_ELLE_RUNNER` is set, `ci/run_elle_handoff.sh` invokes that external runner against the emitted artifacts without adding JVM/Clojure dependencies to Cargo. The scheduled W10 lanes do not provision those env vars yet, so they block on the Rust-side checker and reserve Elle for explicitly configured follow-on lanes.
+- The chaos script validates and replays frozen chaos seeds via `tests/chaos.rs`, then runs the rolling-restart and backup/restore scenario tests.
+
 ---
 
 ## 7. Seed registry
@@ -163,6 +179,31 @@ Reproduce: cargo test --test chaos -- --seed 7f3a2b9c...
 
 The seed, the scenario name, and the failing assertion go into a new issue. When the bug is fixed, the PR that fixes it includes a new frozen seed in `tests/chaos/seeds/{issue_number}.seed` (or `tests/sim/seeds/{issue_number}.seed` for simulator). The seed's scenario name is the issue number. CI runs every frozen seed on every subsequent run.
 
+Simulator seed files are TOML and currently use this shape:
+
+```toml
+issue = 1234
+scenario = "coverage_ladder"
+seed = 424242
+ops = 10000
+introduced_at = "2026-04-21"
+notes = "Short note describing the regression."
+```
+
+The filename stem must match `issue` exactly; malformed seed files fail CI before the ladder runs.
+
+Chaos seed files are also TOML and use this shape:
+
+```toml
+issue = 1234
+scenario = "leader_partition_and_rejoin"
+seed = 424242
+introduced_at = "2026-04-21"
+notes = "Short note describing the regression."
+```
+
+The current chaos catalog is intentionally small: `leader_partition_and_rejoin`, `rolling_kill`, and `packet_drop_single_stream` live in `tests/chaos.rs`, while the rolling-restart and backup/restore scenarios run in their dedicated integration tests and are invoked from `ci/check_chaos_harness.sh`.
+
 ### 7.2 Retention policy
 
 Frozen seeds are forever by default, with a managed retirement path:
@@ -173,6 +214,15 @@ Frozen seeds are forever by default, with a managed retirement path:
   3. A human (the reviewing engineer on the retirement PR) asserts the underlying invariant is still enforced in the current code.
 - Retirement is an explicit PR. It deletes the seed file and adds a one-line entry to `tests/seeds/RETIRED.md` with the issue number, retirement date, and reviewer.
 - No automated retirement. The cost of a stale seed is cheap; the cost of retiring a still-meaningful seed is a silently lost regression fixture.
+
+### 7.3 Advisory report
+
+The weekly `seed-retention-advisory.yml` workflow renders a markdown report listing frozen seeds and whether they currently satisfy the retirement bar:
+
+- issue closed for at least 90 days
+- at least 1000 consecutive successful relevant workflow runs since the seed was introduced
+
+The workflow uploads the report as an artifact and, when the repository variable `SEED_RETENTION_TRACKING_ISSUE` is configured, refreshes a tracking-issue comment with the same markdown. The report is advisory only; deleting a seed still requires an explicit PR and an entry in `tests/seeds/RETIRED.md`.
 
 ---
 

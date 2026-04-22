@@ -35,7 +35,7 @@
 //! [ WALRecordHeader (32B) ]
 //! [ RaftLogEntryFixed (96B) ]
 //! [ postcard-encoded openraft Entry<WendelonTypeConfig> ]
-//! [ 4-byte blake3-prefix checksum ]
+//! [ 4-byte profile-hash-prefix checksum ]
 //! [ zero pad to next DIRECT_IO_ALIGN boundary ]
 //! ```
 //!
@@ -91,6 +91,11 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
+
+#[cfg(not(feature = "fips"))]
+use crate::hash::blake3 as control_artifact_hash;
+#[cfg(feature = "fips")]
+use crate::hash::sha256 as control_artifact_hash;
 
 /// WAL `record_type` discriminants — mirrored from
 /// `plans/consensus/raft-core.md` §4.
@@ -683,7 +688,7 @@ impl WendelonLogStore {
 				wal_bytes: wal.len() as u64,
 				vote_bytes: vote.len() as u64,
 				snapshot_bytes: snapshot.len() as u64,
-				state_hash: blake3_32(&encoded_state),
+				state_hash: control_artifact_digest_32(&encoded_state),
 			},
 			wal,
 			vote,
@@ -1792,19 +1797,19 @@ impl AsyncSeek for SnapshotDataFile {
 
 struct HashingWriter<W> {
 	inner: W,
-	hasher: blake3::Hasher,
+	hasher: control_artifact_hash::Context,
 }
 
 impl<W> HashingWriter<W> {
 	fn new(inner: W) -> Self {
 		Self {
 			inner,
-			hasher: blake3::Hasher::new(),
+			hasher: control_artifact_hash::Context::new(),
 		}
 	}
 
 	fn finalize(self) -> (W, [u8; 32]) {
-		(self.inner, *self.hasher.finalize().as_bytes())
+		(self.inner, self.hasher.finish())
 	}
 }
 
@@ -3638,9 +3643,8 @@ async fn replay_wal_segment(
 
 		let body_end = offset + header_size + header.body_len as usize;
 		let record_end = body_end + 4;
-		let expected_checksum = blake3_prefix_u32(&bytes[offset..body_end]);
 		let actual_checksum = u32::from_le_bytes(bytes[body_end..record_end].try_into().unwrap());
-		if expected_checksum != actual_checksum {
+		if !matches_artifact_checksum_u32(&bytes[offset..body_end], actual_checksum) {
 			if allow_torn_tail && offset + padded_len == bytes.len() {
 				replay.last_segment_needs_truncate = true;
 				break;
@@ -3824,8 +3828,7 @@ fn decode_log_record(
 			),
 		));
 	}
-	let payload_hash = blake3_32(payload);
-	if payload_hash != fixed.payload_hash {
+	if !matches_artifact_digest_32(payload, &fixed.payload_hash) {
 		return Err(interior_corruption(
 			wal_path,
 			offset,
@@ -3877,7 +3880,7 @@ fn log_id_from_snapshot_header(header: &SnapshotHeader) -> Option<LogId<u32>> {
 }
 
 /// Build one page-padded WAL record for a single entry:
-/// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][blake3-prefix checksum]`
+/// `[WALRecordHeader][RaftLogEntryFixed][postcard(entry)][profile-hash-prefix checksum]`
 /// with the tail zero-padded to `DIRECT_IO_ALIGN`.
 fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf, AnyError> {
 	let payload_len =
@@ -3959,10 +3962,10 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		)));
 	}
 	let mut fixed = fixed;
-	fixed.payload_hash = blake3_32(payload);
+	fixed.payload_hash = control_artifact_digest_32(payload);
 	dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 	dst[header_size..header_size + fixed_size].copy_from_slice(bytemuck::bytes_of(&fixed));
-	let checksum = blake3_prefix_u32(&dst[..header_size + body_len]);
+	let checksum = control_artifact_checksum_u32(&dst[..header_size + body_len]);
 	dst[header_size + body_len..header_size + body_len + 4]
 		.copy_from_slice(&checksum.to_le_bytes());
 	// Remainder is already zero from AlignedBuf::new.
@@ -3994,7 +3997,7 @@ fn serialize_checkpoint_page(
 	let dst = buf.as_mut_slice();
 	dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
 	dst[header_size..header_size + body_size].copy_from_slice(bytemuck::bytes_of(&body));
-	let checksum = blake3_prefix_u32(&dst[..header_size + body_size]);
+	let checksum = control_artifact_checksum_u32(&dst[..header_size + body_size]);
 	dst[header_size + body_size..header_size + body_size + 4]
 		.copy_from_slice(&checksum.to_le_bytes());
 	buf
@@ -4005,7 +4008,7 @@ fn encode_snapshot(state: &SmState) -> Result<Vec<u8>, AnyError> {
 	let body = postcard::to_allocvec(state).map_err(|e| AnyError::new(&e))?;
 	let header = snapshot_header_template(state);
 	let header = SnapshotHeader {
-		state_sha256: blake3_32(&body),
+		state_sha256: control_artifact_digest_32(&body),
 		..header
 	};
 	let mut out = Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + body.len());
@@ -4136,11 +4139,12 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 	reader
 		.read_to_end(&mut body)
 		.map_err(|err| format!("snapshot body read: {err}"))?;
-	let actual_hash = blake3_32(&body);
-	if actual_hash != header.state_sha256 {
+	let blake3_hash = crate::hash::blake3::digest(&body);
+	let sha256_hash = crate::hash::sha256::digest(&body);
+	if header.state_sha256 != blake3_hash && header.state_sha256 != sha256_hash {
 		return Err(format!(
-			"snapshot body hash mismatch: expected {:02x?}, got {:02x?}",
-			header.state_sha256, actual_hash
+			"snapshot body hash mismatch: expected {:02x?}, got blake3 {:02x?} or sha256 {:02x?}",
+			header.state_sha256, blake3_hash, sha256_hash
 		));
 	}
 	let state = decode_snapshot_state_bytes(&body)?;
@@ -4173,16 +4177,22 @@ fn page_round_up(n: usize) -> usize {
 	(n + DIRECT_IO_ALIGN - 1) & !(DIRECT_IO_ALIGN - 1)
 }
 
-fn blake3_32(bytes: &[u8]) -> [u8; 32] {
-	*blake3::hash(bytes).as_bytes()
+fn control_artifact_digest_32(bytes: &[u8]) -> [u8; 32] {
+	control_artifact_hash::digest(bytes)
 }
 
-fn blake3_prefix_u32(bytes: &[u8]) -> u32 {
-	let hash = blake3::hash(bytes);
-	let prefix: [u8; 4] = hash.as_bytes()[..4]
-		.try_into()
-		.expect("blake3 output is 32 bytes");
-	u32::from_le_bytes(prefix)
+fn control_artifact_checksum_u32(bytes: &[u8]) -> u32 {
+	control_artifact_hash::prefix_u32(bytes)
+}
+
+fn matches_artifact_digest_32(bytes: &[u8], expected: &[u8; 32]) -> bool {
+	crate::hash::blake3::digest(bytes) == *expected
+		|| crate::hash::sha256::digest(bytes) == *expected
+}
+
+fn matches_artifact_checksum_u32(bytes: &[u8], expected: u32) -> bool {
+	crate::hash::blake3::prefix_u32(bytes) == expected
+		|| crate::hash::sha256::prefix_u32(bytes) == expected
 }
 
 /// `BTreeMap::range` needs owned `Bound<u64>`s.
@@ -4232,6 +4242,28 @@ mod recovery_tests {
 	use std::sync::{Arc, Mutex};
 	use std::time::Duration;
 	use tokio::sync::Notify;
+
+	#[derive(Clone, Copy)]
+	enum TestArtifactHashFormat {
+		Blake3,
+		Sha256,
+	}
+
+	impl TestArtifactHashFormat {
+		fn digest(self, bytes: &[u8]) -> [u8; 32] {
+			match self {
+				Self::Blake3 => crate::hash::blake3::digest(bytes),
+				Self::Sha256 => crate::hash::sha256::digest(bytes),
+			}
+		}
+
+		fn checksum_u32(self, bytes: &[u8]) -> u32 {
+			match self {
+				Self::Blake3 => crate::hash::blake3::prefix_u32(bytes),
+				Self::Sha256 => crate::hash::sha256::prefix_u32(bytes),
+			}
+		}
+	}
 
 	fn tempdir(tag: &str) -> PathBuf {
 		let dir = std::env::temp_dir().join(format!(
@@ -4340,6 +4372,15 @@ mod recovery_tests {
 		std::fs::write(path, encode_snapshot(state).unwrap()).unwrap();
 	}
 
+	fn write_snapshot_file_with_hash(path: &Path, state: &SmState, format: TestArtifactHashFormat) {
+		let mut bytes = encode_snapshot(state).unwrap();
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
+		header.state_sha256 = format.digest(&bytes[header_len..]);
+		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+		std::fs::write(path, bytes).unwrap();
+	}
+
 	fn write_wal_pages(path: &Path, pages: &[AlignedBuf]) {
 		let mut file = OpenOptions::new()
 			.create(true)
@@ -4351,6 +4392,46 @@ mod recovery_tests {
 			file.write_all(page.as_slice()).unwrap();
 		}
 		file.flush().unwrap();
+	}
+
+	fn serialize_entry_page_with_hash(
+		entry: &Entry<WendelonTypeConfig>,
+		format: TestArtifactHashFormat,
+	) -> Result<AlignedBuf, AnyError> {
+		let mut page = serialize_entry_page(entry)?;
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
+		let header: WALRecordHeader =
+			*bytemuck::from_bytes::<WALRecordHeader>(&page.as_slice()[..header_size]);
+		let body_end = header_size + header.body_len as usize;
+		let payload_start = header_size + fixed_size;
+		let payload = &page.as_slice()[payload_start..body_end];
+		let mut fixed = *bytemuck::from_bytes::<RaftLogEntryFixed>(
+			&page.as_slice()[header_size..payload_start],
+		);
+		fixed.payload_hash = format.digest(payload);
+		let dst = page.as_mut_slice();
+		dst[header_size..payload_start].copy_from_slice(bytemuck::bytes_of(&fixed));
+		let checksum = format.checksum_u32(&dst[..body_end]);
+		dst[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+		Ok(page)
+	}
+
+	fn serialize_checkpoint_page_with_hash(
+		commit_index: u64,
+		e_safe_index: u64,
+		log_index: u64,
+		term: u64,
+		format: TestArtifactHashFormat,
+	) -> AlignedBuf {
+		let mut page = serialize_checkpoint_page(commit_index, e_safe_index, log_index, term);
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let header: WALRecordHeader =
+			*bytemuck::from_bytes::<WALRecordHeader>(&page.as_slice()[..header_size]);
+		let body_end = header_size + header.body_len as usize;
+		let checksum = format.checksum_u32(&page.as_slice()[..body_end]);
+		page.as_mut_slice()[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+		page
 	}
 
 	async fn open_store(dir: &Path) -> WendelonLogStore {
@@ -4654,8 +4735,58 @@ mod recovery_tests {
 		);
 		assert!(
 			err.to_string().contains("checksum mismatch"),
-			"expected blake3-prefix checksum verification failure, got: {err}"
+			"expected Control Ring checksum verification failure, got: {err}"
 		);
+	}
+
+	#[tokio::test]
+	async fn restart_recovers_blake3_and_sha256_wal_artifacts() {
+		for (tag, format) in [
+			("dual-read-wal-blake3", TestArtifactHashFormat::Blake3),
+			("dual-read-wal-sha256", TestArtifactHashFormat::Sha256),
+		] {
+			let dir = tempdir(tag);
+			let (wal, vote, _snapshot) = artifact_paths(&dir);
+			write_vote_file(&vote, Vote::new_committed(3, 7));
+			write_wal_pages(
+				&wal,
+				&[
+					serialize_entry_page_with_hash(&lease_entry(1, 0, 9, 1), format).unwrap(),
+					serialize_entry_page_with_hash(&lease_entry(2, 10, 19, 2), format).unwrap(),
+					serialize_checkpoint_page_with_hash(2, 2, 2, 1, format),
+				],
+			);
+
+			let mut store = open_store(&dir).await;
+			let state = store.get_log_state().await.unwrap();
+			assert_eq!(state.last_log_id, Some(log_id(1, 2)));
+			let sm = store.recovered_state_machine().await.unwrap();
+			let snapshot = sm.state_snapshot().await;
+			assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 2)));
+			assert!(snapshot.leases.contains_key(&0));
+			assert!(snapshot.leases.contains_key(&10));
+		}
+	}
+
+	#[tokio::test]
+	async fn restart_recovers_blake3_and_sha256_snapshot_artifacts() {
+		for (tag, format) in [
+			("dual-read-snapshot-blake3", TestArtifactHashFormat::Blake3),
+			("dual-read-snapshot-sha256", TestArtifactHashFormat::Sha256),
+		] {
+			let dir = tempdir(tag);
+			let (_wal, _vote, snapshot_path) = artifact_paths(&dir);
+			let mut state = SmState::default();
+			state.last_applied_log_id = Some(log_id(1, 5));
+			state.leases.insert(0, lease_descriptor(5, 0, 9, 1));
+			write_snapshot_file_with_hash(&snapshot_path, &state, format);
+
+			let store = open_store(&dir).await;
+			let recovered = store.recovered_state_machine().await.unwrap();
+			let snapshot = recovered.state_snapshot().await;
+			assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 5)));
+			assert!(snapshot.leases.contains_key(&0));
+		}
 	}
 
 	#[tokio::test]

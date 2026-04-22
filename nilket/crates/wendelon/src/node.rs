@@ -30,6 +30,7 @@ use crate::audit::{
 	AuditOperation, AuditRootSigner, AuditSink, AuditSinksConfig,
 	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, build_audit_sink, spawn_signed_chain_root_rollup,
 };
+use crate::build_info;
 use crate::consensus::hlc::HybridLogicalClockDriver;
 use crate::consensus::monitor::{
 	AbortHandle, ClockDriftEvent, DRIFT_CHECK_INTERVAL, EVICTION_CHECK_INTERVAL,
@@ -1044,6 +1045,17 @@ impl WendelonNode {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let tracker = Arc::new(NodeTracker::new(local_node, clock.clone()));
 		let audit_materialization = Arc::new(AuditMaterializationTracker::new());
+		let fips_build_state = match build_info::initialize_fips_runtime() {
+			Ok(state) => {
+				if state.fips_mode {
+					crate::metrics::global()
+						.fips_module_self_test_ok_total
+						.inc();
+				}
+				state
+			}
+			Err(err) => return Err(err),
+		};
 		let audit_sink = build_audit_sink(cfg.data_dir.join("audit.ndjson"), &cfg.audit)?;
 		crypto.attach_audit_sink(local_node, audit_sink.clone())?;
 		audit_sink.emit(
@@ -1052,16 +1064,13 @@ impl WendelonNode {
 				AuditOperation::CryptoStartup,
 				local_node,
 				format!(
-					"selected_cipher={} cipher_detection_method={} root_kek_provider={} fips={} build_profile={} mlock={}",
+					"selected_cipher={} cipher_detection_method={} root_kek_provider={} fips={} crypto_profile={} build_profile={} mlock={}",
 					crypto.selected_cipher_label(),
 					crypto.selected_cipher_detection_method(),
 					crypto.root_kek_provider_label(),
-					cfg!(feature = "fips"),
-					if cfg!(debug_assertions) {
-						"debug"
-					} else {
-						"release"
-					},
+					fips_build_state.fips_mode,
+					build_info::crypto_profile(),
+					build_info::build_mode(),
 					crypto.mlock_status_label(),
 				),
 			)
@@ -1071,15 +1080,9 @@ impl WendelonNode {
 				crypto.selected_cipher_detection_method(),
 			)
 			.with_parameter("root_kek_provider", crypto.root_kek_provider_label())
-			.with_parameter("fips", cfg!(feature = "fips"))
-			.with_parameter(
-				"build_profile",
-				if cfg!(debug_assertions) {
-					"debug"
-				} else {
-					"release"
-				},
-			)
+			.with_parameter("fips", fips_build_state.fips_mode)
+			.with_parameter("crypto_profile", build_info::crypto_profile())
+			.with_parameter("build_profile", build_info::build_mode())
 			.with_parameter("mlock", crypto.mlock_status_label()),
 		)?;
 		let state_machine = state_machine.with_audit_materializer(
@@ -1532,6 +1535,7 @@ impl ReadinessReporter for NodeReadinessView {
 			DrainState::None
 		};
 		let audit_materialization_lag_entries = self.audit_materialization.lag_entries();
+		let fips_build_state = build_info::current_fips_build_state();
 		ReadinessSnapshot {
 			node_id: self.local_node.id,
 			epoch: epoch.epoch,
@@ -1544,6 +1548,8 @@ impl ReadinessReporter for NodeReadinessView {
 			} else {
 				None
 			},
+			fips_mode: fips_build_state.fips_mode,
+			fips_self_test_last_ts: fips_build_state.self_test_last_ts,
 		}
 	}
 }
@@ -2254,7 +2260,11 @@ mod tests {
 		assert!(audit.contains(node.crypto.selected_cipher_label()));
 		assert!(audit.contains(node.crypto.selected_cipher_detection_method()));
 		assert!(audit.contains(node.crypto.root_kek_provider_label()));
-		assert!(audit.contains("fips=false"));
+		assert!(audit.contains(&format!("fips={}", cfg!(feature = "fips"))));
+		assert!(audit.contains(&format!(
+			"crypto_profile={}",
+			crate::build_info::crypto_profile()
+		)));
 		assert!(audit.contains("build_profile=debug"));
 		assert!(audit.contains("mlock="));
 	}
@@ -2473,7 +2483,7 @@ mod tests {
 			.slab
 			.encrypt_tiered_object_blob(sealed_id, &raw)
 			.unwrap();
-		let payload_hash = *blake3::hash(&encrypted.bytes).as_bytes();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
 		let l2_uri = l2
 			.put(
 				&format!("sealed/slab_{sealed_id:016x}.wnd"),

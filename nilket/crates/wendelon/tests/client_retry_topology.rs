@@ -352,11 +352,24 @@ async fn client_retries_write_after_redirect_with_control_ring_refresh() {
 		topology_pool,
 		vec![node.local_node],
 	));
-	let client = WendelonClient::new(support::loopback_client_config_many_with_topology(
-		stale_snapshot,
-		topology,
-		services,
-	));
+	let client = WendelonClient::new(
+		support::loopback_client_config_published_many_with_topology(
+			stale_snapshot,
+			topology,
+			vec![
+				(
+					node.local_node,
+					"127.0.0.1:0".to_string(),
+					node.router.clone() as Arc<dyn HrftService>,
+				),
+				(
+					redirect_node,
+					"loopback://node-2".to_string(),
+					redirect_service.clone() as Arc<dyn HrftService>,
+				),
+			],
+		),
+	);
 
 	let write = client
 		.write(WriteRequest {
@@ -435,11 +448,24 @@ async fn client_refreshes_and_retries_read_after_e_safe_behind() {
 		topology_pool,
 		vec![node.local_node],
 	));
-	let client = WendelonClient::new(support::loopback_client_config_many_with_topology(
-		stale_snapshot,
-		topology,
-		services,
-	));
+	let client = WendelonClient::new(
+		support::loopback_client_config_published_many_with_topology(
+			stale_snapshot,
+			topology,
+			vec![
+				(
+					node.local_node,
+					"127.0.0.1:0".to_string(),
+					node.router.clone() as Arc<dyn HrftService>,
+				),
+				(
+					redirect_node,
+					"loopback://node-2".to_string(),
+					redirect_service.clone() as Arc<dyn HrftService>,
+				),
+			],
+		),
+	);
 
 	let start = tokio::time::Instant::now();
 	let read = client

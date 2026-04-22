@@ -1,11 +1,14 @@
 pub mod audit;
+pub mod build_info;
 pub mod client;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
 pub mod governance;
+pub mod hash;
 pub mod metrics;
 pub mod network;
 pub mod node;
 pub mod schema;
+pub mod simulator;
 pub mod storage;

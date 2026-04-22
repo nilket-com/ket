@@ -168,6 +168,7 @@ pub struct MetricsRegistry {
 	pub audit_sink_failures_kafka_total: Counter,
 	pub audit_sink_failures_kafka_queue_dropped_total: Counter,
 	pub otlp_spans_dropped_total: Counter,
+	pub fips_module_self_test_ok_total: Counter,
 
 	pub crypto_decrypt_audit_emit_failures_total: Counter,
 }
@@ -233,6 +234,7 @@ impl Default for MetricsRegistry {
 			audit_sink_failures_kafka_total: Counter::default(),
 			audit_sink_failures_kafka_queue_dropped_total: Counter::default(),
 			otlp_spans_dropped_total: Counter::default(),
+			fips_module_self_test_ok_total: Counter::default(),
 
 			crypto_decrypt_audit_emit_failures_total: Counter::default(),
 		}
@@ -582,6 +584,31 @@ impl MetricsRegistry {
 			"Spans dropped by the OTLP exporter before they could be enqueued for export.",
 			self.otlp_spans_dropped_total.get(),
 		);
+		#[cfg(feature = "fips")]
+		{
+			render_counter_family_header(
+				&mut out,
+				"wendelon_fips_module_self_test_total",
+				"FIPS module self-test invocations by outcome.",
+			);
+			render_counter_with_labels(
+				&mut out,
+				"wendelon_fips_module_self_test_total",
+				&[("outcome", "ok")],
+				self.fips_module_self_test_ok_total.get(),
+			);
+			render_gauge_family_header(
+				&mut out,
+				"wendelon_fips_module_version_info",
+				"FIPS module version derived from the pinned aws-lc-rs build.",
+			);
+			render_gauge_with_labels(
+				&mut out,
+				"wendelon_fips_module_version_info",
+				&[("version", crate::build_info::aws_lc_rs_version())],
+				1,
+			);
+		}
 		render_counter(
 			&mut out,
 			"wendelon_crypto_decrypt_audit_emit_failures_total",

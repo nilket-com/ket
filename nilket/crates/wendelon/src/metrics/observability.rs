@@ -6,6 +6,7 @@ use crate::network::tls::{
 };
 use crate::schema::NodeId;
 use async_trait::async_trait;
+use serde_json::{Map, Value};
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,6 +52,8 @@ pub struct ReadinessSnapshot {
 	pub drain_state: DrainState,
 	pub audit_materialization_lag_entries: u64,
 	pub degraded_reason: Option<String>,
+	pub fips_mode: bool,
+	pub fips_self_test_last_ts: Option<u64>,
 }
 
 #[async_trait]
@@ -430,32 +433,56 @@ impl ReadinessSnapshot {
 	pub fn to_json(&self) -> String {
 		let mut cluster_members = self.cluster_members.clone();
 		cluster_members.sort_unstable();
-		let members = cluster_members
-			.into_iter()
-			.map(display_node_id)
-			.map(|id| format!("\"{id}\""))
-			.collect::<Vec<_>>()
-			.join(",");
-		let leader = self
-			.leader_id
-			.map(display_node_id)
-			.map(|id| format!("\"{id}\""))
-			.unwrap_or_else(|| "null".to_string());
-		let degraded = self
-			.degraded_reason
-			.as_ref()
-			.map(|reason| format!("\"{reason}\""))
-			.unwrap_or_else(|| "null".to_string());
-		format!(
-			"{{\"node_id\":\"{}\",\"epoch\":{},\"leader_id\":{},\"cluster_members\":[{}],\"drain_state\":\"{}\",\"audit_materialization_lag_entries\":{},\"degraded_reason\":{}}}",
-			display_node_id(self.node_id),
-			self.epoch,
-			leader,
-			members,
-			self.drain_state.as_json(),
-			self.audit_materialization_lag_entries,
-			degraded,
-		)
+		let mut body = Map::new();
+		body.insert(
+			"node_id".into(),
+			Value::String(display_node_id(self.node_id)),
+		);
+		body.insert("epoch".into(), Value::from(self.epoch));
+		body.insert(
+			"leader_id".into(),
+			self.leader_id
+				.map(display_node_id)
+				.map(Value::String)
+				.unwrap_or(Value::Null),
+		);
+		body.insert(
+			"cluster_members".into(),
+			Value::Array(
+				cluster_members
+					.into_iter()
+					.map(display_node_id)
+					.map(Value::String)
+					.collect(),
+			),
+		);
+		body.insert(
+			"drain_state".into(),
+			Value::String(self.drain_state.as_json().to_string()),
+		);
+		body.insert(
+			"audit_materialization_lag_entries".into(),
+			Value::from(self.audit_materialization_lag_entries),
+		);
+		body.insert(
+			"degraded_reason".into(),
+			self.degraded_reason
+				.as_ref()
+				.cloned()
+				.map(Value::String)
+				.unwrap_or(Value::Null),
+		);
+		#[cfg(feature = "fips")]
+		{
+			body.insert("fips_mode".into(), Value::Bool(self.fips_mode));
+			body.insert(
+				"fips_self_test_last_ts".into(),
+				self.fips_self_test_last_ts
+					.map(Value::from)
+					.unwrap_or(Value::Null),
+			);
+		}
+		Value::Object(body).to_string()
 	}
 }
 

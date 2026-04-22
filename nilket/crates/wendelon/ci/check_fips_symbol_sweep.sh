@@ -37,4 +37,10 @@ if strings "${binary}" | rg -i 'aes.?gcm.?siv|AESIV'; then
   exit 1
 fi
 
+echo "Sweeping ${binary} for non-FIPS audit hash tags"
+if strings "${binary}" | rg -F 'blake3-256'; then
+  echo "unexpected non-FIPS audit hash tag found in ${binary}" >&2
+  exit 1
+fi
+
 echo "FIPS symbol sweep passed"

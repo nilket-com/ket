@@ -16,13 +16,13 @@ pub struct PendingFinalizationId([u8; 32]);
 
 impl PendingFinalizationId {
 	pub fn for_record(write_id: ClientWriteId, finalization: &TenantFinalization) -> Self {
-		let mut hasher = blake3::Hasher::new();
-		hasher.update(bytemuck::bytes_of(&write_id));
-		hasher.update(bytemuck::bytes_of(&finalization.tenant_id));
-		hasher.update(finalization.key_identity.as_bytes());
-		hasher.update(bytemuck::bytes_of(&finalization.marker));
-		hasher.update(&finalization.charged_bytes.to_le_bytes());
-		Self(*hasher.finalize().as_bytes())
+		Self(crate::hash::sha256::digest_many(&[
+			bytemuck::bytes_of(&write_id),
+			bytemuck::bytes_of(&finalization.tenant_id),
+			finalization.key_identity.as_bytes(),
+			bytemuck::bytes_of(&finalization.marker),
+			&finalization.charged_bytes.to_le_bytes(),
+		]))
 	}
 
 	pub fn as_bytes(&self) -> &[u8; 32] {

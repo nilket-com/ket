@@ -32,7 +32,38 @@ window. The rules below are the operator contract for Workstream E.5.
 - Unsupported envelope versions fail immediately on frame read before payload
   decode.
 
-## 4. Rollback Rules
+## 4. Crypto-Profile Rolling Restart
+
+The `default` and `fips` crypto profiles are a supported **rolling-restart
+operation**, not a supported mixed-fleet steady state.
+
+The required procedure is:
+
+1. Pick one target profile for the whole cluster: `default` or `fips`.
+2. Restart one node at a time onto the target profile. Do not batch-restart
+   quorum peers. Prefer follower nodes first and restart the current leader
+   last unless an explicit incident forces a different order.
+3. For each node: put it into drain, wait for `/ready` to report the expected
+   drain state, restart it onto the target profile, then wait for `/ready` to
+   return the steady-state readiness signal before moving to the next node.
+4. During the roll, scrape `/ready` on every node:
+   - FIPS-profile nodes report `fips_mode=true` and `fips_self_test_last_ts`.
+   - Default-profile nodes omit the FIPS-only fields.
+5. During the same window, scrape `fips_module_version_info{version}` from the
+   nodes that have already moved to the FIPS profile.
+6. Treat any post-roll non-uniformity as a misconfiguration. The ready
+   condition after the maintenance window is:
+   - either every node exposes `fips_mode=true`
+   - or no node exposes the FIPS-only signals because the whole cluster is back
+     on `default`
+7. Downstream audit tooling must accept the declared `hash_algorithm_tag`
+   during the roll window. The canonical record format is stable; only the
+   chain hash primitive changes across the profile boundary.
+
+There is no supported in-place hot toggle. Changing crypto profile means
+restarting the node onto a different build.
+
+## 5. Rollback Rules
 
 - Supported rollback window is one protocol step.
 - During an `N` to `N+1` rollout, a restarted node may be rolled back from `N+1`
@@ -42,13 +73,13 @@ window. The rules below are the operator contract for Workstream E.5.
 - Do not activate new cluster-wide features until every node has converged on
   the newer protocol window.
 
-## 5. Feature Gates
+## 6. Feature Gates
 
 - New architectural features remain behind Raft feature flags.
 - Activation happens only after every node in the Control Ring has converged on
   a binary that supports the feature.
 
-## 6. Storage Migrations
+## 7. Storage Migrations
 
 - If a catastrophic change is required to the local NVMe slab layout, Wendelon
   uses the lazy-migration path.
@@ -56,7 +87,7 @@ window. The rules below are the operator contract for Workstream E.5.
   the normal background storage machinery rather than requiring an offline export
   step.
 
-## 7. redb And Local Schema Procedure
+## 8. redb And Local Schema Procedure
 
 The redb file is a local acceleration structure, not an independent source of
 truth. Upgrades follow these rules:
@@ -84,7 +115,7 @@ The required procedure for a local-schema change is:
 If redb fails to open or the schema marker is corrupt, the node must fail over
 to rebuild from authoritative state rather than attempting an in-place repair.
 
-## 8. Schema-Change Checklist
+## 9. Schema-Change Checklist
 
 Every rolling-upgrade PR that changes local persistent state must include:
 

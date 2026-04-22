@@ -40,12 +40,13 @@ use bytes::Bytes;
 use opendal::layers::RetryLayer;
 use opendal::services::{B2, Gcs, S3};
 use opendal::{ErrorKind as OpendalErrorKind, Operator};
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Metadata about an object stored in L2.
@@ -805,6 +806,315 @@ impl ObjectStore for LocalFsObjectStore {
 	}
 }
 
+/// Operation names for [`MockObjectStore`] fault injection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MockObjectStoreOp {
+	Put,
+	Head,
+	GetRange,
+	GetBytes,
+	List,
+	Delete,
+}
+
+/// Per-operation latency configuration for [`MockObjectStore`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MockObjectStoreLatency {
+	pub put: Duration,
+	pub head: Duration,
+	pub get_range: Duration,
+	pub get_bytes: Duration,
+	pub list: Duration,
+	pub delete: Duration,
+}
+
+impl MockObjectStoreLatency {
+	fn for_op(self, op: MockObjectStoreOp) -> Duration {
+		match op {
+			MockObjectStoreOp::Put => self.put,
+			MockObjectStoreOp::Head => self.head,
+			MockObjectStoreOp::GetRange => self.get_range,
+			MockObjectStoreOp::GetBytes => self.get_bytes,
+			MockObjectStoreOp::List => self.list,
+			MockObjectStoreOp::Delete => self.delete,
+		}
+	}
+}
+
+/// Fault action for [`MockObjectStore`] operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MockObjectStoreFaultAction {
+	Error { kind: ErrorKind, message: String },
+}
+
+/// One-shot or delayed fault injected into [`MockObjectStore`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InjectedMockObjectStoreFault {
+	op: MockObjectStoreOp,
+	key: Option<String>,
+	remaining_matches: usize,
+	action: MockObjectStoreFaultAction,
+}
+
+impl InjectedMockObjectStoreFault {
+	pub fn on(op: MockObjectStoreOp, action: MockObjectStoreFaultAction) -> Self {
+		Self {
+			op,
+			key: None,
+			remaining_matches: 0,
+			action,
+		}
+	}
+
+	pub fn for_key(mut self, key: impl Into<String>) -> Self {
+		self.key = Some(key.into());
+		self
+	}
+
+	pub fn after_matches(mut self, remaining_matches: usize) -> Self {
+		self.remaining_matches = remaining_matches;
+		self
+	}
+
+	fn matches(&self, op: MockObjectStoreOp, target: &str) -> bool {
+		self.op == op && self.key.as_ref().map(|key| key == target).unwrap_or(true)
+	}
+}
+
+/// Deterministic configuration for [`MockObjectStore`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MockObjectStoreConfig {
+	pub latency: MockObjectStoreLatency,
+	/// Number of `list` calls a `put` remains invisible for.
+	pub list_visibility_delay: u64,
+	/// Number of `list` calls a `delete` remains visible for.
+	pub delete_visibility_delay: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MockCatalogEntry {
+	size_bytes: u64,
+	visible_after_list_epoch: u64,
+	hidden_after_list_epoch: Option<u64>,
+}
+
+#[derive(Default)]
+struct MockObjectStoreState {
+	objects: BTreeMap<String, Bytes>,
+	catalog: BTreeMap<String, MockCatalogEntry>,
+	faults: VecDeque<InjectedMockObjectStoreFault>,
+	list_epoch: u64,
+}
+
+/// In-memory [`ObjectStore`] for deterministic simulator and harness use.
+///
+/// `get`/`head` are strongly consistent. `list` can lag behind `put` and
+/// `delete` according to the configured visibility delays.
+pub struct MockObjectStore {
+	config: MockObjectStoreConfig,
+	state: Mutex<MockObjectStoreState>,
+}
+
+impl MockObjectStore {
+	pub fn new(config: MockObjectStoreConfig) -> Self {
+		Self {
+			config,
+			state: Mutex::new(MockObjectStoreState::default()),
+		}
+	}
+
+	pub fn inject(&self, fault: InjectedMockObjectStoreFault) {
+		self.state.lock().unwrap().faults.push_back(fault);
+	}
+
+	fn uri_for_key(&self, key: &str) -> String {
+		format!("mock://store/{key}")
+	}
+
+	fn key_from_uri(&self, uri: &str) -> std::io::Result<String> {
+		let key = uri.strip_prefix("mock://store/").ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("MockObjectStore only speaks mock://store URIs, got: {uri}"),
+			)
+		})?;
+		validate_object_key(key)?;
+		Ok(key.to_string())
+	}
+
+	async fn apply_latency(&self, op: MockObjectStoreOp) {
+		let delay = self.config.latency.for_op(op);
+		if !delay.is_zero() {
+			tokio::time::sleep(delay).await;
+		}
+	}
+
+	fn maybe_fail(&self, op: MockObjectStoreOp, target: &str) -> std::io::Result<()> {
+		let mut state = self.state.lock().unwrap();
+		let Some(idx) = state
+			.faults
+			.iter()
+			.position(|fault| fault.matches(op, target))
+		else {
+			return Ok(());
+		};
+		let fault = state.faults.get_mut(idx).unwrap();
+		if fault.remaining_matches > 0 {
+			fault.remaining_matches -= 1;
+			return Ok(());
+		}
+		match state.faults.remove(idx).unwrap().action {
+			MockObjectStoreFaultAction::Error { kind, message } => Err(Error::new(kind, message)),
+		}
+	}
+
+	fn not_found(kind: &str, target: &str) -> Error {
+		Error::new(ErrorKind::NotFound, format!("{kind} not found: {target}"))
+	}
+}
+
+impl Default for MockObjectStore {
+	fn default() -> Self {
+		Self::new(MockObjectStoreConfig::default())
+	}
+}
+
+#[async_trait]
+impl ObjectStore for MockObjectStore {
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		validate_object_key(key)?;
+		self.apply_latency(MockObjectStoreOp::Put).await;
+		self.maybe_fail(MockObjectStoreOp::Put, key)?;
+		let mut state = self.state.lock().unwrap();
+		let visible_after_list_epoch = state
+			.list_epoch
+			.saturating_add(self.config.list_visibility_delay)
+			.saturating_add(1);
+		state
+			.objects
+			.insert(key.to_string(), Bytes::copy_from_slice(bytes));
+		state.catalog.insert(
+			key.to_string(),
+			MockCatalogEntry {
+				size_bytes: bytes.len() as u64,
+				visible_after_list_epoch,
+				hidden_after_list_epoch: None,
+			},
+		);
+		Ok(self.uri_for_key(key))
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<ObjectMetadata> {
+		let key = self.key_from_uri(uri)?;
+		self.apply_latency(MockObjectStoreOp::Head).await;
+		self.maybe_fail(MockObjectStoreOp::Head, &key)?;
+		let state = self.state.lock().unwrap();
+		let bytes = state
+			.objects
+			.get(&key)
+			.ok_or_else(|| Self::not_found("object", &key))?;
+		Ok(ObjectMetadata {
+			key: key.clone(),
+			uri: self.uri_for_key(&key),
+			size_bytes: bytes.len() as u64,
+		})
+	}
+
+	async fn get_range(&self, uri: &str, range: Range<u64>) -> std::io::Result<Bytes> {
+		let key = self.key_from_uri(uri)?;
+		let len = checked_range_len(&range)?;
+		if len == 0 {
+			return Ok(Bytes::new());
+		}
+		self.apply_latency(MockObjectStoreOp::GetRange).await;
+		self.maybe_fail(MockObjectStoreOp::GetRange, &key)?;
+		let state = self.state.lock().unwrap();
+		let bytes = state
+			.objects
+			.get(&key)
+			.ok_or_else(|| Self::not_found("object", &key))?;
+		if range.end > bytes.len() as u64 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"byte range {}..{} exceeds object size {}",
+					range.start,
+					range.end,
+					bytes.len()
+				),
+			));
+		}
+		Ok(bytes.slice(range.start as usize..range.end as usize))
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		let key = self.key_from_uri(uri)?;
+		self.apply_latency(MockObjectStoreOp::GetBytes).await;
+		self.maybe_fail(MockObjectStoreOp::GetBytes, &key)?;
+		let state = self.state.lock().unwrap();
+		state
+			.objects
+			.get(&key)
+			.cloned()
+			.ok_or_else(|| Self::not_found("object", &key))
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<ObjectMetadata>> {
+		validate_object_prefix(prefix)?;
+		self.apply_latency(MockObjectStoreOp::List).await;
+		self.maybe_fail(MockObjectStoreOp::List, prefix)?;
+		let mut state = self.state.lock().unwrap();
+		// Visibility delay is measured in successful `list` calls;
+		// injected list faults do not advance the epoch.
+		state.list_epoch = state.list_epoch.saturating_add(1);
+		let list_epoch = state.list_epoch;
+		let mut objects = state
+			.catalog
+			.iter()
+			.filter_map(|(key, entry)| {
+				if !key.starts_with(prefix) {
+					return None;
+				}
+				if list_epoch < entry.visible_after_list_epoch {
+					return None;
+				}
+				if entry
+					.hidden_after_list_epoch
+					.map(|hidden_after| list_epoch >= hidden_after)
+					.unwrap_or(false)
+				{
+					return None;
+				}
+				Some(ObjectMetadata {
+					key: key.clone(),
+					uri: self.uri_for_key(key),
+					size_bytes: entry.size_bytes,
+				})
+			})
+			.collect::<Vec<_>>();
+		objects.sort_by(|left, right| left.key.cmp(&right.key));
+		Ok(objects)
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		let key = self.key_from_uri(uri)?;
+		self.apply_latency(MockObjectStoreOp::Delete).await;
+		self.maybe_fail(MockObjectStoreOp::Delete, &key)?;
+		let mut state = self.state.lock().unwrap();
+		if state.objects.remove(&key).is_none() {
+			return Err(Self::not_found("object", &key));
+		}
+		let hidden_after_list_epoch = state
+			.list_epoch
+			.saturating_add(self.config.delete_visibility_delay)
+			.saturating_add(1);
+		if let Some(entry) = state.catalog.get_mut(&key) {
+			entry.hidden_after_list_epoch = Some(hidden_after_list_epoch);
+		}
+		Ok(())
+	}
+}
+
 // ============================================================
 //  TESTS
 // ============================================================
@@ -919,5 +1229,64 @@ mod tests {
 		fs::write(&outside, b"nope").unwrap();
 		let uri = format!("file://{}", outside.canonicalize().unwrap().display());
 		assert!(store.get(&uri).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn mock_store_round_trips_and_lists_with_visibility_delay() {
+		let store = MockObjectStore::new(MockObjectStoreConfig {
+			list_visibility_delay: 1,
+			delete_visibility_delay: 1,
+			..Default::default()
+		});
+
+		let uri = store.put("sealed/slab_0001.wnd", b"hello").await.unwrap();
+		assert_eq!(store.get(&uri).await.unwrap(), b"hello");
+		assert_eq!(store.head(&uri).await.unwrap().size_bytes, 5);
+
+		assert!(
+			store.list("sealed/").await.unwrap().is_empty(),
+			"first list should still miss the delayed put"
+		);
+		assert_eq!(store.list("sealed/").await.unwrap().len(), 1);
+
+		store.delete(&uri).await.unwrap();
+		assert_eq!(
+			store.get(&uri).await.unwrap_err().kind(),
+			ErrorKind::NotFound
+		);
+		assert_eq!(store.list("sealed/").await.unwrap().len(), 1);
+		assert!(
+			store.list("sealed/").await.unwrap().is_empty(),
+			"delete visibility delay should eventually expire"
+		);
+	}
+
+	#[tokio::test]
+	async fn mock_store_injected_fault_applies_once() {
+		let store = MockObjectStore::default();
+		let uri = store.put("faulty.wnd", b"abc").await.unwrap();
+		store.inject(
+			InjectedMockObjectStoreFault::on(
+				MockObjectStoreOp::GetBytes,
+				MockObjectStoreFaultAction::Error {
+					kind: ErrorKind::TimedOut,
+					message: "simulated get timeout".into(),
+				},
+			)
+			.for_key("faulty.wnd"),
+		);
+
+		let err = store.get(&uri).await.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::TimedOut);
+		assert_eq!(store.get(&uri).await.unwrap(), b"abc");
+	}
+
+	#[tokio::test]
+	async fn mock_store_range_reads_validate_bounds() {
+		let store = MockObjectStore::default();
+		let uri = store.put("slice.wnd", b"abcdefghij").await.unwrap();
+		assert_eq!(store.get_range(&uri, 2..6).await.unwrap().as_ref(), b"cdef");
+		let err = store.get_range(&uri, 2..16).await.unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
 	}
 }

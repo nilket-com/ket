@@ -305,9 +305,10 @@ For each alert above, operators need a runbook. The runbook catalog lives at `pl
 
 The FIPS build profile (ADR 026) exposes these additional signals:
 
-- `fips_module_self_test_total{outcome}` — counter of self-test invocations and outcomes.
+- `fips_module_self_test_total{outcome="ok"}` — counter of successful bootstrap-time FIPS self-test checks. Wendelon increments it during node bootstrap when it verifies the aws-lc-rs module is running in FIPS mode. A failed bootstrap self-test aborts startup before `/metrics` is available, so operators see that case via the startup error path rather than a scrape.
 - `fips_module_version_info{version}` — gauge always `1`, with a version label sourced from the pinned aws-lc-rs build. (Low-cardinality: one label value per build.)
 - `/ready` adds a `fips_mode` boolean field and a `fips_self_test_last_ts` field when built with the FIPS profile.
+  `fips_self_test_last_ts` is a Unix-seconds timestamp for the successful bootstrap-time self-test check.
 
 Non-FIPS builds do not emit these signals.
 
@@ -320,7 +321,7 @@ The `fips_mode` field in `/ready` and the `fips_module_version_info` metric exis
 
 These signals are diagnostic, not a license to run a mixed fleet as a target state. Operators needing FIPS coverage run a fully-FIPS cluster; operators not needing it run a fully-default cluster. The upgrade window is bounded by `plans/ops/upgrades.md`.
 
-Exact field definitions close with ADR 026 acceptance; this section will be tightened when ADR 026 moves to Accepted.
+The implemented metric and field names above are the operator contract for W10.
 
 ---
 

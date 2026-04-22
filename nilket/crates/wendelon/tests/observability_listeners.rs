@@ -74,6 +74,8 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 				drain_state: DrainState::None,
 				audit_materialization_lag_entries: 0,
 				degraded_reason: None,
+				fips_mode: cfg!(feature = "fips"),
+				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
 			},
 		}),
 		1,
@@ -111,6 +113,21 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 		ready.contains("\"cluster_members\":[\"n-01\",\"n-02\",\"n-03\"]"),
 		"unexpected ready body: {ready}"
 	);
+	if cfg!(feature = "fips") {
+		assert!(
+			ready.contains("\"fips_mode\":true"),
+			"unexpected ready body: {ready}"
+		);
+		assert!(
+			ready.contains("\"fips_self_test_last_ts\":1700000000"),
+			"unexpected ready body: {ready}"
+		);
+	} else {
+		assert!(
+			!ready.contains("\"fips_mode\""),
+			"unexpected ready body: {ready}"
+		);
+	}
 
 	let metrics = request_mtls(
 		handles.metrics.local_addr,
@@ -136,6 +153,16 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 		metrics.contains("wendelon_raft_current_leader{leader_id=\"n-01\"} 1"),
 		"unexpected metrics body: {metrics}"
 	);
+	if cfg!(feature = "fips") {
+		assert!(
+			metrics.contains("wendelon_fips_module_version_info{version=\""),
+			"unexpected metrics body: {metrics}"
+		);
+		assert!(
+			metrics.contains("wendelon_fips_module_self_test_total{outcome=\"ok\"}"),
+			"unexpected metrics body: {metrics}"
+		);
+	}
 
 	let denied = request_mtls(
 		handles.metrics.local_addr,
@@ -189,6 +216,8 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 				drain_state: DrainState::None,
 				audit_materialization_lag_entries: 0,
 				degraded_reason: None,
+				fips_mode: cfg!(feature = "fips"),
+				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
 			},
 		}),
 		1,
@@ -280,6 +309,8 @@ async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 				drain_state: DrainState::None,
 				audit_materialization_lag_entries: 2,
 				degraded_reason: Some("AuditLagExceeded".to_string()),
+				fips_mode: cfg!(feature = "fips"),
+				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
 			},
 		}),
 		1,
@@ -310,6 +341,12 @@ async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 		ready.contains("\"degraded_reason\":\"AuditLagExceeded\""),
 		"unexpected degraded ready body: {ready}"
 	);
+	if cfg!(feature = "fips") {
+		assert!(
+			ready.contains("\"fips_mode\":true"),
+			"unexpected degraded ready body: {ready}"
+		);
+	}
 
 	shutdown(handles).await;
 }

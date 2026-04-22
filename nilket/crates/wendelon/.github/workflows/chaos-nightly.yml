@@ -1,0 +1,18 @@
+name: Chaos Kernel Manual
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chaos-kernel-manual:
+    runs-on: [self-hosted, linux, x64, kernel-capable]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Chaos kernel harness
+        run: WENDELON_CHAOS_REQUIRE=1 bash ci/check_chaos_harness.sh

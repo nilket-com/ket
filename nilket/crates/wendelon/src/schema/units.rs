@@ -125,7 +125,7 @@ impl Identity {
 	/// profile keeps this helper outside the validated module boundary
 	/// rather than changing the on-disk/on-wire coordinate.
 	pub fn blake3(bytes: &[u8]) -> Self {
-		Self(*blake3::hash(bytes).as_bytes())
+		Self(crate::hash::identity::digest(bytes))
 	}
 
 	/// Compute the tenant-scoped BLAKE3-256 Identity of a key.
@@ -134,12 +134,7 @@ impl Identity {
 	/// the same raw key bytes in two tenants never alias to the same
 	/// durable identity.
 	pub fn blake3_tenant(tenant_id: TenantId, bytes: &[u8]) -> Self {
-		const DOMAIN: &[u8] = b"wendelon.identity.tenant.v1";
-		let mut hasher = blake3::Hasher::new();
-		hasher.update(DOMAIN);
-		hasher.update(&tenant_id.get().to_le_bytes());
-		hasher.update(bytes);
-		Self(*hasher.finalize().as_bytes())
+		Self(crate::hash::identity::tenant_scoped(tenant_id.get(), bytes))
 	}
 
 	/// Tenant-scoped keyed BLAKE3-256 Identity.
@@ -149,9 +144,7 @@ impl Identity {
 	/// abuse resistance against engineered locality hotspots requires a
 	/// separate secret-salt decision.
 	pub fn blake3_keyed(key: &[u8; 32], bytes: &[u8]) -> Self {
-		let mut hasher = blake3::Hasher::new_keyed(key);
-		hasher.update(bytes);
-		Self(*hasher.finalize().as_bytes())
+		Self(crate::hash::identity::keyed(key, bytes))
 	}
 }
 

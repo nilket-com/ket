@@ -2919,7 +2919,7 @@ impl WendelonDataServer {
 		})?;
 
 		let arrow_bytes: &[u8] = &arrow[..];
-		let (status, ack_level) = if blake3_32(arrow_bytes) != meta.payload_hash {
+		let (status, ack_level) = if payload_digest(arrow_bytes) != meta.payload_hash {
 			(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
 		} else {
 			match self
@@ -4156,7 +4156,7 @@ fn encode_migration_records(
 		hlc_phys.append_value(loc.hlc.physical_ms);
 		hlc_log.append_value(loc.hlc.logical);
 		hlc_node.append_value(loc.hlc.node_id);
-		let hash: [u8; 32] = *blake3::hash(bytes).as_bytes();
+		let hash = crate::hash::content::digest(bytes);
 		payload
 			.append_value(hash)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("fsb append: {e}")))?;
@@ -4430,7 +4430,7 @@ fn bifurcate_client_write(
 	Ok(BifurcatedWrite {
 		key_identity: meta.key_identity,
 		locality: Locality::from(meta.key_identity),
-		payload_hash: blake3_32(frame_bytes.as_slice()),
+		payload_hash: payload_digest(frame_bytes.as_slice()),
 		charged_bytes: frame_bytes.len() as u64,
 		frame_bytes,
 	})
@@ -4524,8 +4524,8 @@ fn key_locality(bytes: &[u8]) -> u64 {
 	.get()
 }
 
-fn blake3_32(bytes: &[u8]) -> [u8; 32] {
-	*blake3::hash(bytes).as_bytes()
+fn payload_digest(bytes: &[u8]) -> [u8; 32] {
+	crate::hash::content::digest(bytes)
 }
 
 fn format_bytes_hex(bytes: &[u8]) -> String {
@@ -5774,7 +5774,7 @@ mod tests {
 		let (tenant_id, h, loc) = hits[0];
 		assert_eq!(tenant_id, tenant());
 		let frame = source_full.read(loc).await.unwrap();
-		let payload_hash = *blake3::hash(&frame).as_bytes();
+		let payload_hash = payload_digest(&frame);
 		destination
 			.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 			.await
@@ -5817,7 +5817,7 @@ mod tests {
 		let pulled = source.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
 		for (tenant_id, h, loc) in pulled {
 			let frame = source.read(loc).await.unwrap();
-			let payload_hash = *blake3::hash(&frame).as_bytes();
+			let payload_hash = payload_digest(&frame);
 			destination
 				.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 				.await
@@ -5872,7 +5872,7 @@ mod tests {
 			let rows = src.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
 			for (tenant_id, h, loc) in rows {
 				let frame = src.read(loc).await.unwrap();
-				let payload_hash = *blake3::hash(&frame).as_bytes();
+				let payload_hash = payload_digest(&frame);
 				destination
 					.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
 					.await
@@ -5964,7 +5964,7 @@ mod tests {
 			let batch = kv_batch(b"k", b"v-new");
 			encode_batch(&batch).unwrap()
 		};
-		let payload_newer = *blake3::hash(&frame_newer).as_bytes();
+		let payload_newer = payload_digest(&frame_newer);
 		destination
 			.append_migration(1, tenant(), id(key), newer, payload_newer, &frame_newer)
 			.await
@@ -5983,7 +5983,7 @@ mod tests {
 			let batch = kv_batch(b"k", b"v-old");
 			encode_batch(&batch).unwrap()
 		};
-		let payload_older = *blake3::hash(&frame_older).as_bytes();
+		let payload_older = payload_digest(&frame_older);
 		destination
 			.append_migration(1, tenant(), id(key), older, payload_older, &frame_older)
 			.await
@@ -6157,10 +6157,7 @@ mod tests {
 		assert_eq!(decoded[0].key_identity, id(7));
 		assert_eq!(decoded[0].hlc, hlc(10, 2, 3));
 		assert_eq!(decoded[0].frame_bytes, b"frame-one");
-		assert_eq!(
-			decoded[0].payload_hash,
-			*blake3::hash(b"frame-one").as_bytes()
-		);
+		assert_eq!(decoded[0].payload_hash, payload_digest(b"frame-one"));
 		assert_eq!(decoded[1].key_identity, id(42));
 		assert_eq!(decoded[1].frame_bytes, b"frame-two");
 	}
@@ -6617,7 +6614,8 @@ mod tests {
 
 			let manager = self.manager().await;
 			let arrow_bytes: &[u8] = &arrow[..];
-			let (status, ack_level, location) = if blake3_32(arrow_bytes) != meta.payload_hash {
+			let (status, ack_level, location) = if payload_digest(arrow_bytes) != meta.payload_hash
+			{
 				(
 					ReplicaWriteStatus::HASH_MISMATCH,
 					ReplicaAckLevel::NONE,

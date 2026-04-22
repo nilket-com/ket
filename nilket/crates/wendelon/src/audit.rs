@@ -2,6 +2,7 @@ use crate::consensus::monitor::{ClockDriftEvent, ClockDriftSubscriber};
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorIdentity;
 use crate::schema::{Identity, NodeId, TenantId};
+#[cfg(feature = "fips")]
 use aws_lc_rs::digest::{SHA256, digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 #[cfg(feature = "audit-kafka")]
@@ -1316,23 +1317,27 @@ fn signed_root_payload_bytes(node_id: NodeId, head: &AuditChainHead) -> Vec<u8> 
 	bytes
 }
 
+#[cfg(feature = "fips")]
 fn chain_hash_algorithm_tag() -> &'static str {
-	if cfg!(feature = "fips") {
-		"sha256"
-	} else {
-		"blake3-256"
-	}
+	"sha256"
 }
 
+#[cfg(not(feature = "fips"))]
+fn chain_hash_algorithm_tag() -> &'static str {
+	"blake3-256"
+}
+
+#[cfg(feature = "fips")]
 fn chain_hash(bytes: &[u8]) -> [u8; 32] {
-	if cfg!(feature = "fips") {
-		let digest = digest(&SHA256, bytes);
-		let mut out = [0u8; 32];
-		out.copy_from_slice(digest.as_ref());
-		out
-	} else {
-		*blake3::hash(bytes).as_bytes()
-	}
+	let digest = digest(&SHA256, bytes);
+	let mut out = [0u8; 32];
+	out.copy_from_slice(digest.as_ref());
+	out
+}
+
+#[cfg(not(feature = "fips"))]
+fn chain_hash(bytes: &[u8]) -> [u8; 32] {
+	crate::hash::blake3::digest(bytes)
 }
 
 fn genesis_hash(node_id: NodeId) -> [u8; 32] {
