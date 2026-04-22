@@ -16,6 +16,23 @@ to a credible external pilot bar with bounded operator intervention, defensible 
 
 This plan assumes the target is a customer-facing design-partner pilot, not full GA.
 
+## Hardware Strategy
+
+Wendelon should treat hardware in two layers from the beginning:
+
+- **Commodity default**: cheap VPS and modest single-node or small-cluster deployments are the default operating profile and the baseline cost target.
+- **Premium supported**: higher-end NVMe, multi-device, high-core-count hardware is a supported deployment profile on day 1.
+
+The important distinction is:
+
+- day-1 support means Wendelon must run correctly on better hardware without architectural rewrites
+- day-2 work means tuning, topology-aware worker placement, and benchmark-backed saturation claims on that hardware
+
+The program must therefore avoid two failure modes:
+
+- building only for cheap hardware and discovering later that the runtime shape does not scale onto better machines
+- advertising premium-hardware performance claims before the storage and transport paths are actually ready
+
 ## Target Exit State
 
 At the end of this program, the following must be true:
@@ -83,6 +100,9 @@ Deliverables:
   - Raft commit latency under concurrent slab write load
   - write-path latency through `src/network/data_server.rs`
   - read-path admission latency
+- deployment validation on:
+  - one commodity profile
+  - one premium multi-device/NVMe profile
 - fault-injection harness for:
   - crash after data quorum, before finalization
   - local pending-intent persistence failure
@@ -103,6 +123,7 @@ Deliverables:
 Exit criteria:
 
 - baseline numbers are captured and checked into the repo or CI artifacts
+- both the commodity and premium support profiles have at least one validated deployment path
 - every phase below has an owning engineer and branch plan
 - no Phase 1 workstream starts with unresolved critical-path semantics
 
@@ -228,6 +249,7 @@ Required changes:
   - dedicated slab `io_uring` workers
   - per-device slab worker mapping where hardware topology exists
 - introduce explicit config for WAL vs slab queue depth and worker assignment
+- ensure multi-device and higher-core-count systems are supportable through explicit configuration even before automatic topology tuning is complete
 - remove `spawn_blocking` from steady-state durability hot paths where feasible
 - isolate remaining blocking metadata operations so they cannot interfere with WAL latency
 - remove scaffold-grade copies in checksum/hashing paths where straightforward
@@ -252,6 +274,7 @@ Exit criteria:
 
 - WAL and slab paths do not share a single `io_uring` worker
 - steady-state write durability no longer depends on `spawn_blocking`
+- premium hardware can be deployed with explicit config and correct behavior even if full saturation tuning is still pending
 - benchmark shows materially lower coupling between slab load and Raft latency
 
 ### Workstream 5: QUIC Admission Control And Transport Truth-Up

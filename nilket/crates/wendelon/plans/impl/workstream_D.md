@@ -1,0 +1,153 @@
+# Workstream D: Observability, Validation, And SLO Evidence
+
+Date: 2026-04-22
+Author Role: Lead Architect
+Roadmap Source: `plans/impl/roadmap.md`
+Execution Source: `plans/gap/execution_20260422.md` `WS3`
+
+## Objective
+
+Turn correctness and scale claims into measured, repeatable evidence that an operator can actually use.
+
+## Why Now
+
+This workstream must run in parallel with `B` and `C`, not after them.
+
+If instrumentation, chaos, and simulator coverage arrive later:
+
+- regressions hide in the gap
+- benchmark deltas become folklore
+- the team promotes SLO language without proof
+
+## ADR Anchors
+
+- ADR `027`
+- ADR `025`
+- ADR `028`
+
+## Scope
+
+- metric catalog and ownership
+- trace coverage for critical paths
+- chaos matrix expansion
+- deterministic simulator ladder expansion
+- linearizability/property coverage
+- soak evidence and SLO promotion rules
+
+## Out Of Scope
+
+- landing the underlying runtime fixes themselves
+- custody/provider implementation
+- operator replacement automation
+- full compliance packaging
+
+## Dependencies
+
+- `B` and `C` for the surfaces being instrumented and stress-tested
+- `A` for scorecard and artifact discipline
+- `G` for audit/trace correlation shape
+
+## Entry Criteria
+
+- metric naming conventions are fixed enough to avoid churn
+- the critical-path spans and failure scenarios are enumerated
+- scorecard rows exist for the evidence this workstream will produce
+
+## Implementation Slices
+
+### D1. Metric Catalog And Owners
+
+Create a metric catalog with:
+
+- metric name
+- semantic definition
+- code owner
+- alert/dashboard owner
+- milestone where it becomes required
+
+If a metric is not owned, it is not real.
+
+### D2. Critical-Path Instrumentation
+
+Add metrics and spans for:
+
+- write branch split
+- quorum acquisition
+- pending-finalization backlog and replay
+- WAL append and flush
+- `io_uring` queue depth and errors
+- connection and stream counts
+- rejection and backpressure events
+- migration-read proxying
+
+### D3. Chaos Matrix Expansion
+
+Expand from smoke to adversarial combinations:
+
+- partition plus restart
+- crash between durable quorum and finalization
+- overloaded listener plus retry traffic
+- follower loss during active write load
+- audit sink distress where local events are fail-closed
+
+### D4. Simulator Ladder
+
+Add deterministic scenarios for:
+
+- replay ordering
+- apply-order races
+- recovery after interrupted finalization
+- lazy-migration pressure
+- quota and authorization boundary behavior
+
+### D5. Linearizability And Property Checks
+
+Promote a minimum property suite for:
+
+- no stranded quorum-durable writes
+- no silent loss of finalizable work
+- replay reaches a legal terminal state
+- bounded overload rejection instead of unbounded fan-out
+
+### D6. Soak And SLO Evidence
+
+Define the mixed-load soak shape and do not promote `TARGET` to `COMMITTED` until it has passed.
+
+The mixed-load shape should include:
+
+- writes
+- reads
+- failover churn
+- background migration or compaction pressure
+
+## Tests And Benchmarks
+
+- metric emission tests for required series
+- trace propagation tests across critical spans
+- chaos runs with preserved seeds and result summaries
+- simulator runs with saved seeds and failure reproduction notes
+- linearizability/property-test jobs
+- soak report with fixed workload definition and duration
+
+## Exit Criteria
+
+- required metric families exist and are documented
+- critical-path traces tell an operator where time and rejection happened
+- the minimum failure-property suite passes
+- chaos and simulator ladders cover the failure modes the program claims to handle
+- SLO promotion is backed by soak evidence rather than aspiration
+
+## Artifacts
+
+- metric catalog
+- dashboard and alert inventory
+- trace-span inventory
+- chaos matrix and seed registry
+- simulator scenario registry
+- soak report and SLO evidence package
+
+## Deferred Follow-Ons
+
+- richer tail-based sampling guidance
+- tenant-specific or workload-class-specific SLO variants
+- more advanced failure-injection tooling once the core ladder stabilizes

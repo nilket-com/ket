@@ -1,7 +1,7 @@
 # ADR 027: Observability Posture — OTLP, Tracing Stack, Health/Metrics Split
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 Operators running Wendelon in production must be able to diagnose a slow request across nodes, correlate a quorum stall with a specific Raft proposal, spot a tiering hot-spot before it becomes an outage, and scrape authenticated metrics into their existing monitoring stack. The earlier `plans/ops/observability.md` draft named OpenTelemetry and Prometheus at a high level without pinning protocols, stack composition, endpoint security, or listener topology. This ADR closes those gaps.
@@ -104,16 +104,16 @@ Forces in play:
   - *Deferring distributed tracing to post-pilot* — rejected; operators cannot diagnose the cluster without it.
   - *Runtime-reconfigurable subscriber stack* — rejected for composition-order correctness; `EnvFilter` reload covers the one legitimate runtime case.
 
-## Open Questions
+## Acceptance Closures
 
-- **Dedicated observability CA vs. Node CA reuse for OTLP export.** The metrics and trace export destinations are outside the cluster's trust boundary in some deployments (SaaS observability vendors). Whether to extend the Node CA to sign OTLP client certs, or to provision a separate observability CA, is an operator deployment choice with security implications. *Resolves via:* a follow-up security note; default is Node-CA reuse for self-hosted observability, documented-caveat for SaaS export.
-- **Sampling policy interaction with audit.** Sampled-out traces still corresponded to real RPCs that may have produced audit records. The audit record contains no trace context by design (audit is a separate stream). Whether to carry the sampled-in trace ID into the audit record for correlation is a schema question for ADR 025. *Resolves via:* a one-line ADR 025 schema addendum (an optional `trace_id` field on audit records).
-- **Metrics for FIPS build profile.** The FIPS build profile's entropy state, self-test results, and module version are observability-worthy. Whether these are exposed as metrics, as `/ready` fields, or only in logs needs a concrete decision. *Resolves via:* a follow-up note paired with ADR 026 acceptance.
-- **Tail-based sampling pipeline documentation.** Operators wanting to keep all error traces need a documented Collector pipeline. Not an ADR-level decision, but a documentation deliverable that should land with pilot GA. *Resolves via:* `plans/ops/observability.md` section (not a separate ADR).
+- **Dedicated observability CA vs. Node CA reuse for OTLP export.** Node CA reuse is the default for self-hosted observability. Deployments exporting to a separate external trust boundary may use dedicated exporter credentials without changing the rest of this ADR.
+- **Sampling policy interaction with audit.** Audit records may carry an optional `trace_id` for correlation when one exists, but audit remains authoritative independently of tracing.
+- **Metrics for FIPS build profile.** FIPS-specific readiness and self-test state must be exposed at least through `/ready` and logs. Additional metrics are allowed but not required for acceptance of this ADR.
+- **Tail-based sampling pipeline documentation.** This remains a required documentation deliverable, not an architectural blocker.
 
 ## References
 - ADR 004: Zero-copy Transport (QUIC context propagation surface)
-- ADR 011: Auto Adaptive Transport (same)
+- ADR 011: Transport Support Strategy (QUIC First, Multi-Transport Later)
 - ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (metrics scrape auth, `/ready` auth)
 - ADR 025: Audit Event Model (parallel stream; not merged into observability)
 - ADR 026: FIPS 140-3 Certification Target (FIPS-visibility metrics open item)

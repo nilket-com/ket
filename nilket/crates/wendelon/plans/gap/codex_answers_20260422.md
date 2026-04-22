@@ -4,6 +4,8 @@ Date: 2026-04-22
 Author Role: Lead Architect
 Source: `plans/gap/questions_20260422.md`
 
+Revision Note: updated after re-reading the refreshed `claude_issues_20260422.md`, `codex_issues_20260422.md`, and `gemini_issues_20260422.md`, then revised again under an explicit baseline assumption that Wendelon must run on commodity hardware with no HSM requirement, remain operable by a solo founder, and still support better hardware on day 1 even if full tuning and saturation work lands later. Under that assumption, software-backed `local-sealed` custody is the default, `cloud-kms` is an optional hardening tier, `pkcs11/hsm` is an enterprise tier rather than a baseline dependency, and the default admin model must support audited single-operator control.
+
 ## Framing
 
 These answers are intended to drive design-lock entries and workstream execution. They are opinionated on purpose.
@@ -14,6 +16,16 @@ Rules I used while answering:
 - prefer solutions that reduce ambiguity at Gate 3 and Gate 4
 - optimize for operability and correctness over elegance
 - where a question spans multiple workstreams, answer it once and keep the other sections consistent
+
+Baseline deployment assumption for this revision:
+
+- default product target is commodity self-hosted or cheap-VPS infrastructure
+- better hardware such as multi-NVMe and higher-core-count servers must be supportable on day 1 even if topology-aware tuning and saturation claims come later
+- no HSM is required for the default deployment path
+- default key custody is `local-sealed`: key material encrypted on disk and unlocked by operator passphrase or platform secret injection
+- default operations model must work for one operator; multi-party approval is a future hardening layer, not a baseline requirement
+- `cloud-kms` and `pkcs11/hsm` remain optional hardening tiers, not mandatory cost floor
+- regulated and FIPS answers apply only to the hardened profile, not to the low-cost baseline SKU
 
 ## Workstream A — Governance, ADR Closure, and Calendar Dependencies
 ### Source: `claude_workstream_A_20260422.md`
@@ -30,10 +42,10 @@ No explicit open question was preserved in the aggregate under this heading.
    Answer: use a mixed `2 executive + 2 engineering/security + 1 external trustee/legal` model. All-employee custody is too insular; all-executive custody is too operationally weak.
 
 3. **Is BYOK required for Phase 1 or Phase 2?**
-   Answer: BYOK is not required for the first customer-facing pilot at Gate 3. It becomes a Gate 4 requirement for regulated Fortune 500 pilots.
+   Answer: BYOK is not required for Phase 1 and it is not part of the cheap-VPS baseline. The default product should run with Wendelon-managed software-backed keys. If we later pursue a separate regulated or enterprise hardening profile, BYOK can become a requirement for that profile's Gate 4, but it must not be treated as a universal product dependency.
 
 4. **Physical HSM vendor for lab testing**
-   Answer: default to Thales Luna for the first physical HSM validation target. It is the most procurement-realistic and least likely to surprise us on PKCS#11 mechanism coverage.
+   Answer: if and only if we pursue a physical-HSM hardening tier, default to Thales Luna for the first validation target. It is the most procurement-realistic and least likely to surprise us on PKCS#11 mechanism coverage. It is not a baseline blocker for the cheap-VPS product.
 
 5. **Cryptoperiod for Tenant KEKs**
    Answer: default to `365 days`, permit explicit override to `730 days` for customers with a documented policy exception. One year is the right forcing function.
@@ -48,20 +60,20 @@ No explicit open question was preserved in the aggregate under this heading.
    Answer: share the scanning/scheduling framework, keep the state machines separate. Shared mechanics, separate business logic.
 
 9. **Memory-dump attack surface beyond zeroization**
-   Answer: `mlock + zeroize + bounded lifetime` is enough for the regulated pilot. Do not add `mprotect`/lazy-unlock in this phase; it is too intrusive for the current runtime and not the highest-risk gap.
+   Answer: `mlock + zeroize + bounded lifetime` is enough for the cheap-VPS baseline and the first hardened profile. Do not add `mprotect`/lazy-unlock in this phase; it is too intrusive for the current runtime and not the highest-risk gap. The docs must state the real boundary plainly: software-backed custody protects disk theft and backup leakage, not hostile-host compromise.
 
 10. **BYOK cross-KMS replication for DR ownership**
    Answer: the customer owns KMS presence in every DR region they expect to restore into. Wendelon should not replicate customer key material on their behalf.
 
 11. **Primary-plan vs fallback-plan for provider shipping**
-   Answer: hybrid plan. AWS KMS must be production-ready for Gate 3. GCP KMS and Azure Key Vault must be ready by Gate 4. PKCS#11 can trail to Gate 5 unless a design partner requires it sooner.
+   Answer: primary plan is `local-sealed` first. That provider must be production-ready for Gate 3 because it is the only path consistent with cheap-VPS deployment. `cloud-kms` should ship as an optional hardening tier, starting with AWS only if a real customer needs it. GCP KMS, Azure Key Vault, and PKCS#11 are customer-driven follow-ons, not baseline commitments.
 
 12. **Evidence criterion for "plaintext buffers adequately zeroized"**
    Answer: the minimum acceptable evidence is:
    - static coverage proof that all plaintext slab buffers go through the zeroizing type
    - deterministic runtime memory-pattern test in a controlled harness after drop/release
    - dedicated io_uring completion-path test proving zero before reuse/unmap
-   Do not rely on a generic whole-process memory grep as the primary proof. If a lab later wants more, we add more, but this is enough for internal signoff and should be confirmed at lab kickoff.
+   Do not rely on a generic whole-process memory grep as the primary proof. If a lab later wants more, we add more, but this is enough for internal signoff and should be confirmed at CMVP lab kickoff.
 
 ## Workstream C — Identity, RBAC, and Authorization
 ### Source: `claude_workstream_C_20260422.md`
@@ -70,7 +82,7 @@ No explicit open question was preserved in the aggregate under this heading.
    Answer: `3` nodes by default. Offer `5` as a regulated-SKU deployment option, not the default.
 
 2. **Signing HSM per-node or shared**
-   Answer: shared HSM cluster by default. Per-node HSMs create too much key-replication and ceremony complexity for v1.
+   Answer: neither is the default, because the baseline product should not require an HSM at all. The default cert-service and key-custody path should be software-backed and locally sealed. If an enterprise hardening tier later adds HSM support, prefer a shared HSM cluster over per-node HSM for v1.
 
 3. **Is `compliance_auditor` a customer role or vendor role?**
    Answer: customer role by default. Vendor-held auditor access must be customer-issued, explicit, and exceptional, not built into the role model as a standing entitlement.
@@ -97,7 +109,7 @@ No explicit open question was preserved in the aggregate under this heading.
    Answer: use `ECDSA-P256` for both builds. The consistency is worth more than the Ed25519 speed win here.
 
 10. **Should the cert-service manage tenant certs too?**
-   Answer: not as a general tenant CA in v1. It should manage node, operator, and short-lived query/session credentials. A broader tenant-cert model needs a Phase 2 ADR extension.
+   Answer: not as a general tenant CA in v1. The intended v1 scope is node, operator, observer, break-glass, and short-lived query/session credentials. It should not become a general tenant-application long-lived CA. A broader tenant-cert model needs a Phase 2 ADR 018 extension; do not let query-session issuance silently turn into a universal tenant CA without that ratification.
 
 11. **Query-session cert revocation at IdP logout**
    Answer: use short lifetime as the primary control. Explicit logout-triggered revocation is best-effort, not a correctness dependency.
@@ -186,13 +198,13 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_C_20260422.md`
 
 1. **Is per-device worker mapping mandatory for Gate 2?**
-   Answer: no. WAL/slab separation is mandatory for Gate 2. Per-device mapping is a later scale optimization unless the target hardware/customer demands it.
+   Answer: automated per-device worker mapping is not mandatory for Gate 2. WAL/slab separation is mandatory for Gate 2. The day-1 requirement is that better hardware must still be supportable through explicit configuration and correct behavior on multi-device systems. The later optimization is automatic topology-aware mapping and benchmark-backed saturation, not basic support.
 
 2. **Reject early or queue and shed later?**
    Answer: both. Reject early on global pre-auth saturation, then use bounded authenticated queues with shedding for post-auth fairness.
 
 3. **How much platform-specific topology discovery do we own?**
-   Answer: minimal Linux-focused discovery plus explicit config overrides. Do not build a full hardware-inventory subsystem.
+   Answer: minimal Linux-focused discovery plus explicit config overrides. Do not build a full hardware-inventory subsystem. The important bar is that premium hardware is deployable and configurable on day 1; sophisticated automatic tuning can come later.
 
 4. **Which live-path aborts are truly invariant failures, and who signs off?**
    Answer: only memory-safety-adjacent impossible states and post-validation internal invariants. Sign-off required from the runtime lead and architecture owner; security lead joins for auth/crypto paths.
@@ -201,7 +213,7 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_D_20260422.md`
 
 1. **Jepsen or narrower in-house checker first?**
-   Answer: narrower in-house checker first for speed, Jepsen before regulated pilot for external credibility.
+   Answer: narrower in-house checker first for speed, Jepsen before regulated pilot for external credibility. The minimum Jepsen catalog should cover committed-write linearizability, failover during active writes, membership-change safety, and recovery/snapshot correctness.
 
 2. **Exact soak duration and load shape before `COMMITTED` SLO**
    Answer: minimum of four consecutive weekly soaks, each with at least `24 hours` at representative mixed load, plus one `72-hour` release-candidate soak. Representative load means roughly `60/40` read/write, `80%` of target peak throughput, and injected failover/restart churn during each run.
@@ -216,13 +228,13 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_E_20260422.md`
 
 1. **Is one cloud KMS provider enough for Gate 3?**
-   Answer: yes for Gate 3, no for Gate 4. AWS-only is acceptable only if the first design partner is on AWS and we are explicit about that limitation.
+   Answer: no cloud KMS provider is required for Gate 3 if the target product is cheap VPS. Gate 3 requires a production-ready `local-sealed` provider. If we add a cloud hardening tier, one provider is enough initially and should be chosen based on the first real customer rather than declared as universal scope.
 
 2. **Do we need PKCS#11 before regulated pilot?**
-   Answer: no, not categorically. We need a documented plan and interface by Gate 4, and implementation if a target customer requires on-prem/HSM posture.
+   Answer: no. PKCS#11 is an enterprise option, not a baseline requirement. We need a clean provider interface and a documented future path, but implementation should stay customer-driven and must not block the cheap-VPS product.
 
 3. **What evidence proves plaintext buffers are adequately zeroized?**
-   Answer: static path coverage + deterministic runtime memory-pattern tests in a controlled harness + io_uring reuse/unmap tests. That is the internal bar.
+   Answer: static path coverage + deterministic runtime memory-pattern tests in a controlled harness + io_uring reuse/unmap tests. That is the internal bar, and the final sufficiency call belongs to the CMVP lab rather than to internal preference.
 
 4. **How do we version and audit escrow ceremonies?**
    Answer: treat ceremonies as versioned operational artifacts with signed minutes, participant list, canary-unwrap proof, and explicit supersession records.
@@ -234,19 +246,26 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_F_20260422.md`
 
 1. **Which operations absolutely require dual-auth?**
-   Answer: tenant deletion, key retirement/destruction, all break-glass issuance, and quorum/durability-affecting membership changes.
+   Answer: for the cheap-VPS baseline operated by one founder, none of these can require a second human by default. The baseline must support audited single-operator execution for tenant deletion, key retirement/destruction, break-glass issuance, and quorum/durability-affecting membership changes. The important design rule is that the approval surface must be explicit and versioned so a hardened profile can later layer multi-party approval onto the same operations without redesigning the control plane.
 
 2. **Should break-glass issuance itself require dual-auth?**
-   Answer: yes, always. Scope only changes whether we later add stricter approval for `full`; it does not change the baseline rule that no single principal may mint a break-glass cert alone.
+   Answer: not in the founder-stage baseline. A solo operator must be able to issue a break-glass credential alone, but the action must be heavily constrained and fully audited. The baseline rule should be:
+   - single-operator issuance is allowed
+   - short TTL is mandatory
+   - scope must be explicit
+   - reason string is mandatory
+   - `break_glass=true` audit markers are mandatory
+   - the credential must be read-only unless an explicitly stronger scope is selected
+   For the later hardened profile, dual-auth should become available as a policy layer and should be required for destructive or wide-scope break-glass operations.
 
 3. **What revocation distribution model is simplest while meeting fail-closed posture?**
    Answer: state-machine-distributed CRL data if we can keep implementation disciplined. It minimizes external dependencies.
 
 4. **How far must IdP integration go before the first regulated pilot?**
-   Answer: enough to prove the authoritative mapping and revocation model with at least one major IdP and one generic SAML path. Do not try to solve every IdP before Gate 4.
+   Answer: enough to prove the authoritative mapping and revocation model with at least one major IdP and one generic SAML path. Do not try to solve every IdP before Gate 4; a second first-class IdP should be customer-driven rather than unconditional scope.
 
 5. **Does the cert-rotation service need its own consensus substrate?**
-   Answer: do not introduce a second consensus technology. Reuse `openraft` or the cluster's existing trust-state replication model for CA/CRL state, and keep the cert service state machine narrow. A second independent control plane is the wrong trade here.
+   Answer: do not introduce a second consensus technology. Reuse `openraft` or the cluster's existing trust-state replication model for CA/CRL state, and keep the cert service state machine narrow. A second independent control plane is the wrong trade here. If the `openraft` prototype proves to be the wrong fit or misses its delivery gate, the fallback should be an explicitly time-bounded single-writer leader-election design backed by an external consistency primitive such as a KMS/Dynamo-style conditional lock, not an ad hoc HA scheme.
 
 ## Workstream G: Audit, Evidence, And Retention
 ### Source: `codex_workstream_G_20260422.md`
@@ -270,16 +289,16 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_H_20260422.md`
 
 1. **Is the first-party Kubernetes Operator mandatory for Gate 3?**
-   Answer: not strictly, but the fallback must be a tightly specified and validated automation contract. For any shared serious pilot, the operator is the right answer.
+   Answer: not strictly, but the fallback must be a tightly specified and validated automation contract. For any shared serious pilot, the operator is the right answer, but Gate 3 should not be blocked on polish if the restore and replacement workflow is already scripted, validated, and rehearseable. For Kubernetes-based regulated pilots, the bar should rise to the first-party operator or a proven equivalent that meets the same MTTR target.
 
 2. **Do we require cluster-wide restore tooling before customer-facing pilot?**
-   Answer: yes, at least enough to execute a documented cluster-scoped restore. Manual node-image folklore is not enough.
+   Answer: yes, at least enough to execute a documented cluster-scoped restore with scripted validation. Manual node-image folklore is not enough. Gate 3 can tolerate a rehearsed cluster-scoped runbook; regulated pilots should expect more automation.
 
 3. **Is PITR a Gate 4 or Gate 5 requirement?**
    Answer: Gate 5 by default.
 
 4. **Who owns ongoing runbook quality once features hand off to operations?**
-   Answer: operations owns currency; feature owners own technical correctness until formal handoff. Both signatures are required on critical runbook updates.
+   Answer: operations owns currency; feature owners own technical correctness until formal handoff. Both signatures are required on critical runbook updates, and the critical runbooks should be exercised on a quarterly review cadence rather than left as static documents.
 
 5. **Must the backup manifest live in storage physically separate from the live L2 tier?**
    Answer: yes for regulated pilots. Separate failure domains are mandatory there.
@@ -288,16 +307,16 @@ No explicit open question was preserved in the aggregate under this heading. The
 ### Source: `codex_workstream_I_20260422.md`
 
 1. **Which team owns the authoritative SSO/SAML to storage-auth mapping?**
-   Answer: the Toron team owns the front-door identity translation, Wendelon owns the storage enforcement contract. The mapping contract is jointly versioned.
+   Answer: the Toron team owns the front-door identity translation, Wendelon owns the storage enforcement contract. The mapping contract is jointly versioned. Operationally, the Wendelon Identity/Auth side should own the contract-test harness that Toron must pass, while Toron owns the client-side implementation.
 
 2. **How much of JDBC/ODBC compatibility must be proven before regulated pilot?**
-   Answer: prove the officially supported drivers/endpoints for the pilot, document the rest as unsupported or roadmap. Do not claim generic compatibility.
+   Answer: prove the officially supported drivers/endpoints for the pilot, document the rest as unsupported or roadmap. Do not claim generic compatibility, and name the supported matrix explicitly in customer-facing pilot collateral.
 
 3. **Are reference ingest patterns enough for Gate 4?**
-   Answer: yes, if they are tested end to end. One maintained connector is desirable but not mandatory.
+   Answer: yes, if they are tested end to end. One maintained connector is desirable but not mandatory unless a named pilot ingestion path depends on it. Architecture should define the technical minimum; Product/GTM should own the published promise set once the first pilot ingestion path is known.
 
 4. **Minimum trace context that must survive the Toron to Wendelon hop**
-   Answer: W3C trace id, span/parent relationship, tenant identity, and request classification metadata sufficient for audit/latency attribution.
+   Answer: W3C trace id, span/parent relationship, tenant identity, and request classification metadata sufficient for audit/latency attribution. A stable query-session identifier should also survive as custom baggage so Toron and Wendelon can correlate request-level traces to the same short-lived session.
 
 5. **Concrete SAML-to-short-lived-storage-credential exchange for Gate 4, or mock-IdP proof enough?**
    Answer: Gate 4 requires the real exchange for at least one supported identity path. Mock-IdP alone is not enough.
@@ -315,7 +334,7 @@ No explicit open question was preserved in the aggregate under this heading. The
    Answer: regulated pilot requires signed artifacts plus a documented SLSA path, effectively L2-ish posture. Regulated GA should target SLSA L3.
 
 4. **Which compliance artifacts are mandatory for the first regulated pilot?**
-   Answer: pilot evidence packet, SBOM, signing verification guidance, FIPS posture statement, and security architecture/control mapping summary. The fuller compliance pack can mature toward GA.
+   Answer: for the hardened regulated profile, the minimum bundle is pilot evidence packet, SBOM, signing verification guidance, FIPS posture statement, and security architecture/control mapping summary. That bundle does not apply to the cheap-VPS baseline SKU. The fuller compliance pack can mature toward GA; sector/framework overlays such as PCI, HIPAA, or NIST 800-53 should be customer- or sector-driven unless explicitly contracted.
 
 5. **What platform set do we certify first?**
    Answer: Linux `x86_64` and `aarch64` only. Explicitly out of scope initially: Windows, macOS, and non-Linux server platforms.
@@ -330,7 +349,7 @@ No explicit open question was preserved in the aggregate under this heading. The
    Answer: the `wendelon-operator` is strictly for the Wendelon storage tier. Do not make it responsible for Toron compute nodes.
 
 3. **Cross-Region Active Replication vs cold restore**
-   Answer: cold restore alone is too weak for a serious regulated target with a four-hour RTO. We need asynchronous cross-region replication or a warm standby posture by the regulated pilot/GA horizon.
+   Answer: cold restore alone is too weak for a serious regulated target with a four-hour RTO. We need asynchronous cross-region replication or a warm standby posture by the regulated pilot/GA horizon. If we temporarily ship any cold-restore-only posture for smaller clusters, publish an explicit size-bounded RTO table and do not claim a flat four-hour recovery target across customers. Any such exception should be documented as a contract appendix with maximum cluster size, maximum data volume, target RTO/RPO, and explicit customer signoff. Compliance should own drafting that appendix before Gate 4 collateral ships. The async-replication workstream should have a single owner before Phase 1 Week 2, with tenant-aware L2 replication and an explicit regulated-tenant RPO target as the minimum deliverable.
 
 ## Wendelon Workstream B: Toron Compute Tier & Ecosystem Integration (WS8)
 ### Source: `gemini_workstream_B_20260422.md`
@@ -339,10 +358,10 @@ No explicit open question was preserved in the aggregate under this heading. The
    Answer: do not allow arbitrary WASM-style compute pushdown in the first regulated pilot. Use a constrained, versioned compute AST or vetted operator set. Execution runs under the query/session identity and is admission-controlled by Wendelon.
 
 2. **Quota Visibility**
-   Answer: Toron should surface storage quota as a first-class query error condition. Wendelon remains the source of truth and should return structured quota-violation codes plus remaining-quota metadata when cheap enough; Toron may cache snapshots for UX, but it must propagate storage-authored quota outcomes.
+   Answer: Toron should surface storage quota as a first-class query error condition. Wendelon remains the source of truth and should return structured quota-violation codes on failures and quota-consumption metadata in response trailers on successful requests when cheap enough; Toron may cache snapshots for UX, but it must propagate storage-authored quota outcomes.
 
 3. **Schema Evolution**
-   Answer: Toron owns schema intent; Wendelon owns durable schema state. `ALTER TABLE` must become a versioned proposal serialized through Wendelon's Raft state, not an out-of-band side effect. Wendelon does not need to understand full SQL semantics, but it does need to durably sequence schema-version transitions.
+   Answer: Toron owns schema intent; Wendelon owns durable schema state. `ALTER TABLE` must become a versioned proposal serialized through Wendelon's Raft state, not an out-of-band side effect. Wendelon does not need to understand full SQL semantics, but it does need to durably sequence schema-version transitions. The `SchemaUpdate` wire format should be frozen jointly by Toron and Wendelon before dependent implementation work proceeds.
 
 ## Wendelon Workstream C: Transport, Admission Control & Runtime Stability (WS2)
 ### Source: `gemini_workstream_C_20260422.md`
@@ -351,7 +370,7 @@ No explicit open question was preserved in the aggregate under this heading. The
    Answer: retract for the pilot. Do not spend immediate schedule on GSO/GRO + io_uring QUIC integration unless benchmarking later proves it is the next gating issue.
 
 2. **Buffer Pooling**
-   Answer: do not rewrite immediately. Measure contention after the bigger runtime refactors land; shard only if the data says it matters.
+   Answer: do not rewrite immediately. Measure contention after the bigger runtime refactors land, but pre-stage the sharded/thread-local design in parallel so it can land immediately if the post-split benchmark confirms the expected contention.
 
 3. **Connection Fairness before auth**
    Answer: enforce coarse IP/global token buckets pre-auth, then shift to tenant fairness post-auth. Pre-auth tenant fairness is impossible by definition.
@@ -375,7 +394,7 @@ No explicit open question was preserved in the aggregate under this heading. The
    Answer: no unbounded per-tenant labels in default exported metrics. Use sampled logs, debug endpoints, or top-N views for tenant-specific detail.
 
 2. **Linearizability Harness**
-   Answer: build the narrower in-house checker first, then run Jepsen before the regulated pilot bar. The two are complementary, not mutually exclusive.
+   Answer: build the narrower in-house checker first, then run Jepsen before the regulated pilot bar. The two are complementary, not mutually exclusive. Jepsen must at minimum exercise committed-write linearizability, failover under load, membership changes, and recovery after restart/snapshot.
 
 3. **Trace Sampling**
    Answer: tail-based sampling in the collector:

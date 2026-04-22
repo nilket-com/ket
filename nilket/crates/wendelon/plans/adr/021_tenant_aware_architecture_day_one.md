@@ -1,7 +1,7 @@
 # ADR 021: Tenant-Aware Architecture from Day One
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 Wendelon will back platforms (Polariton/Baryon) that host many disparate organizations. An earlier operational position was to defer multi-tenancy until post-pilot and run the pilot single-tenant. Review rounds reversed that position: retrofitting multi-tenancy into a shipped storage architecture is how storage products acquire permanent scar tissue. `tenant_id` participates in every durable schema decision — keyspace, ring placement, encryption context, audit record. A field that is durable in on-disk artifacts cannot be retrofitted without a full-fleet migration.
@@ -109,14 +109,14 @@ Forces in play:
   - *External-Control-Ring-only tenant management* — rejected; forces a specific deployment topology and surrenders tenant state to a system outside the consensus boundary.
   - *One Tenant KEK shared across tenants ("cluster KEK")* — rejected in ADR 020 for different reasons; noted here because some deployments ask for it to reduce KMS cost. Cost-reduction belongs in the cache and batch-by-tenant structure, not in a weakened key hierarchy.
 
-## Open Questions
+## Acceptance Closures
 
-All items below must be closed before this ADR moves from Proposed to Accepted.
+The following questions were closed as part of acceptance:
 
-- **Cross-tenant copy and cross-tenant reads.** Whether any RPC accepts a principal authenticated as tenant A and operates on data owned by tenant B, and under what role. The default answer is "no" and there is no such RPC in the pilot surface. Whether a privileged `operator` RPC can ever cross tenants (e.g., for data migration) is deferred. *Resolves via:* a follow-up scope note before acceptance, either confirming no-cross-tenant-anywhere or defining the narrow privileged RPC and its audit surface. Nothing in Wave 3 implementation depends on this answer.
-- **Quota units and schema.** *Resolved:* the storage quota unit is **stored ciphertext bytes per logical replica** (slab payload ciphertext + per-chunk AEAD tags + slab footer, sourced from the slab manifest at commit, not multiplied by replication factor). See `plans/ops/multi_tenancy.md` §3.0 for the full definition, inclusions, and exclusions. Bandwidth and request-rate quotas remain outside this ADR's scope; they compose through the rate-limiter (ADR 018 §4).
-- **Default-tenant bootstrap mechanism.** Whether the default tenant is provisioned by the cluster-bootstrap RPC, by a well-known migration in the state machine, or by an operator-issued `create_tenant` during first-boot is an orchestration question. *Resolves via:* a follow-up note in `plans/ops/lifecycle.md` before acceptance; the ADR-level invariant is that the default tenant exists as a real record, not how it gets there.
-- **`plans/ops/multi_tenancy.md` rewrite.** *Resolved:* The rewrite is complete with explicit supersession markers for the JWT/RBAC and shared-ring models.
+- **Cross-tenant copy and cross-tenant reads.** Not part of the pilot surface. No RPC in the accepted day-one surface allows a principal authenticated as tenant A to read or mutate tenant B's data. Any future privileged cross-tenant migration RPC requires a separate ADR amendment or follow-up ADR because it would widen both the authorization and audit surfaces.
+- **Quota units and schema.** The storage quota unit is **stored ciphertext bytes per logical replica** (slab payload ciphertext + per-chunk AEAD tags + slab footer, sourced from the slab manifest at commit, not multiplied by replication factor). Bandwidth and request-rate quotas remain outside this ADR's scope and compose through the rate limiter.
+- **Default-tenant bootstrap mechanism.** The default tenant is provisioned by cluster bootstrap as a real Raft-committed tenant record. A single-tenant deployment therefore still exercises the tenant-aware state machine and never takes a "null tenant" code path.
+- **`plans/ops/multi_tenancy.md` rewrite.** The rewrite is complete and the prior shared-ring/JWT assumptions are explicitly superseded by this ADR.
 
 ## References
 - ADR 002: Unified Hash Ring Topology (per-tenant keyspaces compose onto the same unified ring)

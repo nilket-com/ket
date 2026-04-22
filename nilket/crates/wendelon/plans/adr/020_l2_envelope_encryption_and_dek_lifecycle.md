@@ -38,10 +38,10 @@ Forces in play:
    - `slab_max_bytes` has a hard compile-time ceiling of `2^35 bytes` (32 GiB) to stay within a 2× safety margin of the AES-GCM per-key data limit (`2^36` bytes per NIST SP 800-38D). This ceiling is load-bearing for ADR 019's plain-GCM branch and is enforced at config-load time, not merely documented.
 
 3. **Three-tier key hierarchy: Root KEK → Tenant KEK → Slab DEK.**
-   - **Root KEK** lives in the cloud KMS (AWS KMS, GCP KMS, Azure Key Vault, or on-prem HSM via PKCS#11). Wendelon never sees the Root KEK in plaintext. All Root-KEK operations (wrap, unwrap) are remote calls to the KMS.
+   - **Root KEK** is provided through the production custody provider stack defined by ADR 031. That provider may be `local-sealed`, `cloud-kms`, or `pkcs11/hsm`, but the encryption hierarchy in this ADR is unchanged by which provider backs the Root KEK.
    - **Tenant KEK** is wrapped by the Root KEK and stored (in wrapped form) in the Raft state machine. One Tenant KEK per tenant. Key rotation of a Tenant KEK is a Raft-committed operation.
    - **Slab DEK** is wrapped by the Tenant KEK and stored (in wrapped form) in the slab's metadata footer alongside the slab's encrypted payload. One Slab DEK per slab.
-   - A read requires: unwrap Slab DEK using Tenant KEK (cheap, local), then decrypt chunks. A cold read requires: unwrap Tenant KEK using Root KEK (one KMS call), then unwrap Slab DEK (local), then decrypt.
+   - A read requires: unwrap Slab DEK using Tenant KEK (cheap, local), then decrypt chunks. A cold read requires: unwrap Tenant KEK using the configured Root KEK provider, then unwrap Slab DEK (local), then decrypt.
 
 4. **DEK and KEK caching: time-bounded, zeroize-on-drop, memory-budgeted.**
    - **Tenant KEK cache:** unwrapped Tenant KEKs live in locked memory pages (`mlock`), protected by `ZeroizeOnDrop`, with a 15-minute idle TTL and a 60-minute absolute TTL. LRU eviction under memory pressure governed by the admission-control memory budget.
@@ -93,7 +93,7 @@ Forces in play:
 
 All items gate ADR 020 acceptance.
 
-- **KMS backend abstraction.** The Root KEK lives in "the KMS," but the specific integration surface (AWS KMS, GCP KMS, Azure Key Vault, PKCS#11 HSM) is not fixed here. *Resolves via:* a separate KMS-integration design note before ADR acceptance; this ADR names the abstract operations (`wrap(key, kek_id)`, `unwrap(wrapped, kek_id)`, `rotate(kek_id)`) and leaves provider-specifics to the integration.
+- **Root KEK provider abstraction.** *Resolved by ADR 031.* This ADR consumes the provider abstraction but does not own it.
 - **Tenant KEK rotation cadence and orchestration.** Who initiates rotation (operator-only? scheduled?), how in-flight reads against the old KEK are handled, and whether rotation re-wraps every Slab DEK or just marks the old KEK for retirement. *Resolves via:* a rotation design note before acceptance.
 - **Migration sweeper throughput and ordering.** At what rate the sweeper should run, and whether it should prioritize hot slabs or cold slabs or tenant-ordered, is operationally important but benchmark-resolvable. *Resolves via:* a sweeper benchmark against a representative plaintext dataset, measured throughput and compute-cost per slab, before acceptance.
 - **Footer format freeze.** ~~The slab-format encryption header fields are specified above at the field-set level but not bit-exact.~~ **Resolved by [ADR 022 §5](022_l2_slab_format_footer_indexed_range_reads.md).** The 256-byte footer is frozen bit-exact: field offsets, widths, magic_head / magic_tail, the 16-byte tail anchor, and the HMAC coverage range (`magic_head || slab_header || offset_index || footer[0..192] || footer[224..256] || footer_length || index_length || magic_tail`, keyed by the Tenant KEK identified by `tenant_kek_id`). This ADR's Decision §6 lists the encryption-relevant fields; ADR 022 §5 is the authoritative byte layout.
@@ -103,5 +103,6 @@ All items gate ADR 020 acceptance.
 - ADR 017: Persistent Local Index on redb (values encrypted under this hierarchy when tenant-scoped)
 - ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (`tenant_id` source)
 - ADR 019: Cipher Selection and FIPS Posture (cipher + nonce encoding)
-- ADR 021: Tenant-Aware Architecture from Day One (planned — consumes Tenant KEK per tenant)
+- ADR 021: Tenant-Aware Architecture from Day One (consumes Tenant KEK per tenant)
+- ADR 031: Production Key Custody Provider Stack (Root KEK provider surface)
 - ADR 022: L2 Slab Format and Footer-Indexed Range Reads (planned — slab-format footer integration)

@@ -1,30 +1,72 @@
-# ADR 011: Auto-Adaptive Multi-Transport Architecture
+# ADR 011: Transport Support Strategy (QUIC First, Multi-Transport Later)
 
 ## Status
-Accepted
+Accepted (amended 2026-04-22)
 
 ## Context
-Wendelon aims for "Elite" performance. Traditional database networking (TCP/gRPC) is insufficient for 100Gbps+ datacenter fabrics where RDMA/RoCE provide zero-copy, zero-CPU data transfer. However, RDMA is hardware-dependent and unavailable in standard cloud environments or for external clients. QUIC (via `quinn`) provides a superior "Cloud-Elite" baseline (TLS 1.3, multiplexing, congestion control) but cannot match RDMA's raw latency and throughput on bare metal.
+Wendelon wants a transport story that can grow from commodity deployments to very high-end hardware. The original version of this ADR expressed that ambition as an auto-adaptive multi-transport architecture with RDMA, QUIC plus `io_uring`, and TCP/TLS fallback.
+
+The planning and code-review cycle made two facts obvious:
+
+- the real day-1 implementation is QUIC-based, not multi-transport
+- leaving the ADR in an aspirational state encourages the codebase and docs to over-claim what exists
+
+The correct architectural move is not to abandon future transport extensibility. It is to separate:
+
+- the **supported day-1 transport**
+- the **required overload and admission behavior**
+- the **future extension point for additional transports**
 
 ## Decision
-Wendelon will implement an **Auto-Adaptive Multi-Transport** architecture. 
 
-1.  **Transport Abstraction:** The network layer will be refactored into a `TransportProvider` trait. The `DataRing` and `ControlRing` services will operate over this abstraction rather than being hard-coded to QUIC.
-2.  **Capability Advertising:** Every node will probe its local hardware at boot and advertise its supported transports (e.g., `RDMA_ROCE_V2`, `QUIC_IO_URING`, `TCP_TLS`) via Raft metadata in the `ring(E)` snapshot.
-3.  **Dynamic Negotiation:** 
-    - Connections will be established using the highest-priority transport supported by **both** the dialer and the listener.
-    - QUIC will serve as the "Universal Baseline" and the control-ring signaling channel used to negotiate "Elite" upgrades (e.g., exchanging RDMA memory keys).
-4.  **Priority Tiers:**
-    - Tier 0: **RDMA/RoCE** (Physical-Elite) - Zero-copy kernel bypass.
-    - Tier 1: **QUIC + io_uring + GSO** (Cloud-Elite) - Optimized syscall bypass.
-    - Tier 2: **TCP + TLS 1.3** (Normie Fallback) - Guaranteed compatibility.
+Wendelon's supported transport strategy is **QUIC first**.
+
+1. **QUIC is the supported day-1 transport for both commodity and premium hardware profiles.**
+   The baseline transport is `quinn` over QUIC with mTLS and the existing framing model.
+
+2. **The transport layer keeps an abstraction seam, but no adaptive transport claim is made until more than one real transport exists.**
+   Wendelon may preserve an internal `TransportProvider`-style boundary so additional transports can be added later, but:
+   - transport negotiation
+   - capability advertising
+   - RDMA upgrades
+   - transport-tier fallback claims
+
+   are not part of the supported architecture until they are actually implemented.
+
+3. **Day-1 transport support includes bounded admission control.**
+   The supported QUIC path must provide:
+   - max total connections
+   - max connections per peer/IP
+   - max streams per connection
+   - bounded task fan-out
+   - post-auth fairness and backpressure
+
+4. **Transport claims must be truth-matched to implementation.**
+   If a tuning path such as `io_uring` integration, GSO, or future premium-fabric transport is not implemented and benchmarked, it is not part of the supported transport claim.
+
+5. **Future transport work remains allowed but explicitly staged.**
+   Additional transports such as RDMA or a more specialized premium-hardware path may be added later if and only if they arrive with:
+   - a real implementation
+   - real benchmarks
+   - real failure-mode coverage
+   - an honest support contract
 
 ## Rationale
-- **Absolute Eliteness:** Enables Wendelon to saturate local NVMe/NIC throughput on bare-metal clusters without CPU overhead.
-- **Universal Portability:** "Just works" on developer laptops, standard cloud instances, and high-end datacenter fabrics without code changes or configuration flags.
-- **Smart Clients:** Downstream consumers (Baryon/Polariton) inherit this adaptivity, automatically using the fastest available path based on their location relative to the Data Nodes.
+
+- **QUIC is the real universal transport today.** It works across commodity VPS, modest bare metal, and better hardware without introducing a matrix of half-built transport promises.
+- **Support is more valuable than aspiration.** A truthful QUIC-first contract is better than a fictional auto-adaptive transport stack.
+- **Admission control is part of transport correctness.** A transport that accepts unbounded streams or task fan-out is not merely untuned; it is operationally unsafe.
+- **Future extensibility still matters.** Preserving a clean internal boundary now keeps the premium-hardware path open later without forcing Wendelon to pretend that path already exists.
 
 ## Consequences (The "Negatives")
-- **Refactoring Overhead:** Requires moving current network logic into a provider-factory pattern.
-- **Complexity:** Managing multiple transport implementations (e.g., `ibverbs` for RDMA alongside `quinn` for QUIC) increases the testing and maintenance surface.
-- **Leaky Abstractions:** RDMA's memory-registration model differs fundamentally from QUIC's stream model; the `TransportProvider` must be carefully designed to allow zero-copy buffer passing without regressing to the lowest common denominator.
+
+- **The transport story is less glamorous in the short term.** Accepted because architectural honesty matters more than vision-language in the ADRs.
+- **Premium-hardware transports are explicitly deferred.** Accepted because "supported later" is better than "implied now."
+- **Internal abstraction may precede external capability.** Accepted because a narrow internal seam is cheap insurance against later rewrites.
+- **Rejected alternative: advertise adaptive multi-transport now and fill it in later.** Rejected because it creates documentation debt and misleads future implementation work.
+- **Rejected alternative: collapse everything to a transport-specific codebase with no abstraction seam.** Rejected because it would make later premium-hardware support more expensive than it needs to be.
+
+## References
+- ADR 004: Zero-Copy Custom Transport (Rejecting gRPC/Protobuf)
+- ADR 008: Dependency Selection and Async Runtime Model
+- ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization

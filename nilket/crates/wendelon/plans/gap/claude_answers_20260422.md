@@ -1,9 +1,89 @@
 # Wendelon Open Questions — Claude's Answers
 
 **Author / Role:** Claude, as Lead Architect
-**Date:** 2026-04-22 (v2 — integrates peer answers)
+**Date:** 2026-04-22 (v6 — commodity-default architectural reframing)
 **Source:** `plans/gap/questions_20260422.md`
 **Peer answers reviewed:** `codex_answers_20260422.md`, `gemini_answers_20260422.md`.
+**Peer issues reviewed (rounds 1-3):** `codex_issues_20260422.md`, `gemini_issues_20260422.md`.
+
+## v6 revision summary — Day 1 / Day 2 deployment framing
+
+**Day 1 deployment target:** cheap VPS without an HSM. Commodity hardware. This is what customers run on at first ship.
+
+**Day 2 deployment target:** full Fortune 500 — regulated pilot with HSM-backed custody, CMVP certification, warm-standby DR, K8s Operator, full compliance pack. This is the program's committed destination.
+
+**Day 1 architecture supports the Day 2 deployment.** One product, one binary, deployment-profile-configurable from the first commit. Same `RootKekProvider` trait supports TPM-sealed (Day 1 default) and PKCS#11 HSM (Day 2 deployment) without a fork. Same `wendelon-cert-service` binary supports single-node (Day 1) and HA-Raft (Day 2). No Day 1 shortcut precludes the Day 2 path.
+
+The unified-ring philosophy applies to deployment scale: no SKU fork, no architectural fork. A $5 VPS and a bare-metal-with-HSM fleet run the same Wendelon; what differs is the config.
+
+**What this changes in the answer set:**
+
+- **WS-B §3 / Q11 (KMS providers).** Cloud KMS + TPM-sealed are the two first-class baseline providers; PKCS#11 HSM is an uplift deferred to regulated-customer identification.
+- **WS-C §3 / Q1 (cert-service HA).** Single-node + S3-backed deployment is the default; HA Raft is a regulated-uplift configuration. Openraft-reuse-vs-KMS-lock-fallback debate is still live for the HA case.
+- **WS-C §3 / Q2 (HSM topology).** Moot at baseline (no HSM). Applies only to the regulated uplift; prior 2-1 council split on per-node vs shared is parked there.
+- **WS-E (FIPS).** Deferred from Phase 0 calendar-critical to regulated-customer-identification. Default build uses aws-lc-rs for code-path consistency without claiming CMVP.
+- **Gemini WS-A Q3 (DR).** Cold-restore is the commodity-default baseline. Warm standby / async replication become regulated-uplift features, not universal Gate-4 floor.
+- **Codex WS-H Q1 (K8s Operator).** Scripted-automation contract is the commodity-default; K8s Operator hard-requires at regulated-uplift Gate 4 only.
+
+**What survives unchanged:** identity/RBAC (software), audit model (software), envelope encryption (software), multi-tenancy (software), observability (software), Stellarator correctness (software). All the cross-cutting architectural work scales from $5 VPS to bare-metal fleet without forking.
+
+**New to v6:**
+- **TPM-sealed `TpmBootstrap` Root KEK provider** as a first-class baseline alongside cloud KMS. Uses tpm2-tools; seals a bootstrap key to TPM PCR state; bootstrap unwraps the Root KEK from disk. Stronger than plaintext, far cheaper than HSM, works on commodity VPSes that ship vTPM.
+- **Escrow seal medium = operator age-keys / YubiKeys (~$50 × 5 custodians = $250).** Shamir ceremony still valuable; seal medium scales to match the deployment. Regulated-uplift substitutes HSM-sealed shares at the uplift-customer's cost.
+- **Two-track documentation:** commodity-default runbooks and regulated-uplift compliance packs are separate deliverables, not a single unified doc set.
+
+**Items moved from Day-1 architect disputes to Day-2 deployment decisions:** HSM per-node vs shared, FIPS transport Posture A/B decision gate, compliance-pack NIST 800-53 summary. All remain fully committed as Day-2 destinations; none are Day-1 schedule drivers.
+
+Day-1 calendar compresses materially: no CMVP lab contract, no HSM procurement on the critical path. The longest external-dependency chain moves to Day-2 customer-triggered activation. Day-2 work is not deferred in ambition — it is deferred in timing.
+
+## v5 revision summary
+
+Third pass through peer issues docs. Two concessions from me, two new convergences, one ownership-gap closed, one item sharpened.
+
+**Items newly converged:**
+- **K8s Operator Gate 3 bar:** Gemini conceded to Codex's compromise (scripted automation contract acceptable for Gate 3 if it meets the same MTTR SLA as the operator; native operator hard for Gate 4). Now 2-1 against me; I concede.
+- **Identity-mapping ownership (my §4 gap item):** Gemini formally took ownership: "Wendelon Identity/Auth squad will author the integration test harness that Toron must pass." Ownership-gap closed.
+- **FIPS transport fallback posture:** My v3 already carried Posture A/B; peers flag this as "must lock the fallback." I clarify that my position is already aligned — Posture A preferred target, Posture B is the documented escape hatch. Effectively converged; terminology differs.
+
+**Items sharpened:**
+- **Async-replication workstream owner:** Codex flagged "assign a single owner before Phase 1 Week 2 and lock the minimum deliverable as tenant-aware L2 replication." Owner gap now named as a specific Phase-0-exit deliverable.
+
+**Items where I remain the 2-1 minority (held):**
+- **HSM per-node vs shared** (procurement-gated).
+- **BYOK definitional scope** (marketing-language definitional).
+
+**Item where Codex remains the 1-2 minority:**
+- **Compliance pack NIST 800-53 summary mandatory.** Codex's issues doc explicitly notes this is now 2-1 against him. Gemini and I hold the "NIST summary mandatory in every regulated pilot" position. Codex wants sector-triggered-only. Codex respected but minority.
+
+## v4 revision summary
+
+The second pass through peer issues docs moved five items. Gemini's updated issues doc in particular made multiple concessions to Codex and to me, collapsing several previously-open items into convergence.
+
+**Items newly converged (moved from unresolved to locked):**
+- **KMS provider cadence:** Gemini formally conceded to Codex's conservative cadence in her issues-v2 doc. Council now 2-1 against me. I concede — see WS-B Q11.
+- **Break-glass diagnostic single-auth exception:** Gemini willing to concede to Claude+Codex majority provided constraints are rigidly enforced. Effectively 3-0 with my constraints.
+- **Cert-service consensus substrate:** Gemini formally adopted my v3 openraft+KMS-lock-fallback compromise. 3-0 on the compromise.
+- **Cert-service scope (universal vs narrow):** My v3 reconciliation (query-session certs in v1, tenant-application certs in Phase 3) ratified by both peers. 3-0 on the scope boundary, disagreement was about labels.
+- **IdP integration breadth:** Now 2-1 against me (Gemini aligned with Codex on one-IdP minimum). I concede.
+
+**Items where I remain the 2-1 minority:**
+- **Signing HSM per-node vs shared:** Gemini doubled down in issues-v2. Position held with explicit procurement-budget caveat.
+
+**New item sharpened:**
+- **Cold-restore exception contract appendix (Codex issues-refresh #13):** Codex specified the concrete table needed (max cluster size, max data volume, target RTO/RPO, customer signoff language). Design-Lock preparation item.
+
+## v3 revision summary
+
+## v3 revision summary
+
+Reading the peer issues docs surfaced a shift I had missed: on several items, Gemini's *issues* doc revised from Gemini's earlier *answers* doc toward Codex's position. Specifically, on DR posture and on break-glass pragmatism, the council has moved from 2-1 (Claude+Gemini vs Codex) to 2-1 against me (Codex+Gemini vs Claude). Where that happened, I concede or soften.
+
+The v3 changes fall in four buckets:
+
+- **Peer issues moved me (5 items):** DR 4h RTO, break-glass diagnostic-only single-auth, Jepsen milestone, retention-default scoping, compliance-pack minimum set.
+- **Misalignment between Codex-issues and Gemini-answers noted (2 items):** Codex's issues doc claims Gemini agrees on narrow v1 cert-service and conservative KMS cadence, but Gemini's answers doc said "universal CA" and "all four Phase 1." Either Codex misread or Gemini shifted between docs. Flagged.
+- **Position held against council pressure (2 items):** cert-rotation openraft reuse, maintained connector. I acknowledge the counter-arguments but defend.
+- **Category restructuring (1 item):** §Council Convergence slightly reduced — items that looked locked in v2 but are flagged as still-contested by a peer issues doc get promoted back to "open."
 
 ## v2 revision summary
 
@@ -62,25 +142,44 @@ The extractor pulled no numbered questions from my WS-A. Holding the positions a
 **10. BYOK cross-KMS replication for DR.**
 **Opinion:** Customer owns it. Wendelon supports BYOK by consuming customer-KMS `key_id`s in both primary and DR regions; the customer is responsible for replicating the Root KEK (or separately-provisioned per-region Root KEKs) in their KMS. Wendelon will not cross-replicate Root KEKs; that would bypass the customer's KMS as the single authority. Documented as a customer responsibility in the BYOK runbook.
 
-**11. Four-providers-at-once vs AWS-first (Codex disagreement; Gemini weighed in).**
-**Opinion (v2 — revised after peer input).** The council is genuinely split three ways: Codex proposes AWS for Gate 3, GCP+Azure Gate 4, PKCS#11 Gate 5 (most conservative); my v1 compromise was AWS first, GCP/Azure Phase 2, PKCS#11 Phase 2 (middle); Gemini argues all four in Phase 1 (most aggressive, citing "trait is narrow enough that writing three cloud providers is trivial compared to losing non-AWS pilot customers"). Reading Gemini's argument, I move toward the aggressive position:
+**11. Four-providers-at-once vs AWS-first (Codex disagreement; Gemini conceded; v6 reframed).**
+**Opinion (v6 — reframed under commodity-default).** The prior debate assumed PKCS#11 HSM was a Phase-1 baseline deliverable. Under the commodity-default reframing, PKCS#11 is uplift-only; the debate about its Gate 3/4/5 timing is moot for the default tier.
 
-**Revised proposal.** AWS KMS must be production-ready by Gate 3 (non-negotiable, blocks ending `DevInsecure` default). GCP + Azure *target* Gate 3 with an explicit fallback to Gate 4 if engineering velocity constrains. PKCS#11 targets Gate 4. The trait is narrow enough that parallel shipping is plausible; Codex's "one provider works before the next" concern is addressed by landing AWS first as the trait-stabilizing integration and then shipping the other three against the stabilized trait.
+**Revised baseline provider set:**
+- **AWS KMS, GCP Cloud KMS, Azure Key Vault — all three at Gate 3.** Cloud KMS is the natural custody mode for any VPS (commodity or otherwise) that can reach the internet. All three ship together because the trait is narrow (5 methods) and customers pick whichever cloud their KMS account lives in.
+- **TPM-sealed `TpmBootstrap` provider — at Gate 3.** New. For customers on non-cloud VPSes (Hetzner, OVH, some Linode regions) where cross-provider KMS latency or egress cost is a factor. Uses tpm2-tools, seals bootstrap key to TPM PCR state, wraps Root KEK on disk. Commodity-default alternative to cloud KMS.
+- **`DevInsecure` provider** — behind `--features dev-insecure`, not the default. Never a production path.
 
-This is a Design-Lock decision that cannot be further architect-decided by one of us alone. Note the council split; escalate.
+**Regulated-uplift provider (customer-triggered, not Gate-calendar-bound):**
+- **PKCS#11 HSM provider.** Ships when a regulated customer procures HSMs and demands the uplift. Not on Phase-1 critical path.
+
+My "four at once" v1 position and the council-conceded "AWS-first-conservative" position are both superseded by the reframing. The effective cadence is: **three cloud KMSes + TPM-sealed at Gate 3; PKCS#11 when triggered**. This is more aggressive than the prior conservative cadence on the default-tier scope and explicitly defers the uplift-only provider.
 
 **12. Evidence criterion for plaintext-buffer zeroization.**
-**Opinion (v2 — qualifier added from Gemini's input).** My three-part criterion (static analysis + memory-grep test + io_uring CQE-handler test) is sufficient for Level-1 CMVP Security Policy, with a caveat Gemini flagged: the runtime memory-grep test is flaky across OS versions (kernel releases change memory-layout timing; what looks zeroed on one kernel may show stale patterns on another). Revised criterion: static analysis + io_uring CQE-handler test are the *load-bearing* evidence; memory-grep is advisory and run only on CMVP lab's named target platforms. This matches Codex's position ("static path coverage + runtime memory-pattern tests + io_uring reuse/unmap tests") while addressing Gemini's flake concern. Confirm with lab at Phase 0 kickoff.
+**Opinion (v3 — language tightened to match Codex issues #13).** Codex's issues doc #13 crystallizes the right phrasing: "static-path proof plus controlled target-platform harness plus io_uring lifecycle tests. Do not rely on a broad whole-process grep as the primary evidence."
+
+**Revised criterion:**
+1. **Static path coverage** — every slab-plaintext allocation goes through `ZeroizingAlignedBuf`, asserted by a custom lint or architecture test.
+2. **Controlled target-platform harness** — deterministic test on the CMVP lab's named kernel versions (not broad whole-process memory grep) that allocates-writes-drops a plaintext buffer and verifies the freed region is zeroed before reuse. Platform-specific; run per-platform, not cross-platform.
+3. **io_uring lifecycle tests** — CQE-handler ownership-transfer path verifies buffer zero before reuse or munmap.
+
+Adopted Codex's language verbatim for the Security Policy section. This is the bar to present to CMVP lab at Phase 0 kickoff.
 
 ## WS-C (Claude) — Identity, RBAC, and Authorization
 
 **1. Cert-service HA topology — 3 vs 5 nodes.**
-**Opinion:** 3 by default, 5 as the regulated-SKU option. A 3-node Raft cluster tolerates 1 failure; that is the same tolerance as a typical operational-support cluster. Regulated customers asking for higher quorum tolerance get 5; the cost is marginal and the signal value is real.
+**Opinion (v6 — reframed under commodity-default).** Three deployment profiles now, not two:
+
+- **Commodity default:** Single-node cert-service with S3 backups for restart recovery. No HA. Accepts downtime windows on cert-service restart (minutes, not seconds). Appropriate for a cluster that is itself 3-5 cheap VPSes and whose operational upside from HA is not worth doubling cert-service compute cost.
+- **Regulated uplift (small):** 3-node HA Raft cert-service. Tolerates 1 failure. Default for regulated-uplift deployments.
+- **Regulated uplift (large):** 5-node HA Raft. Tolerates 2 failures. Customer-config for regulated-uplift customers with strict availability requirements.
+
+Config flag selects deployment profile at cluster bootstrap. Same binary. Single-node deployment skips openraft entirely; the single-node mode persists its state machine to redb with S3 snapshot backups.
 
 **2. Signing HSM per-node or shared.**
-**Opinion (council split; my position stands).** Per-node HSMs with vendor-specific cluster-sharing for the Node CA private key. Shared HSMs create a single point of failure that Raft was specifically designed to avoid. If the chosen HSM vendor does not support key-replication across HSMs (some cheaper HSMs don't), that is a vendor-selection filter: the HSM must support it.
+**Opinion (v6 — moot at baseline; uplift-only).** The commodity-default deployment has no HSM; cert-service signs with a software key held in memory, derived from the Root KEK custody mechanism. The per-node-vs-shared debate applies only to regulated-uplift deployments that procure HSMs.
 
-**Council position split:** Codex argues shared HSM cluster ("per-node HSMs create too much key-replication and ceremony complexity for v1"); Gemini agrees with me ("each cert-service node gets its own HSM; vendor-specific cluster-sharing is brittle; we treat each HSM as an independent signer"). I stand by per-node, but Codex's simplicity argument is legitimate — if HSM procurement is hard (multiple Luna HSMs are non-trivial cost), the shared-HSM answer is acceptable as a pilot compensating control. Design-Lock entry needed; this is not architect-solo-decidable.
+**Within the regulated uplift** (preserved for that scope document): council-converged 3-0 on procurement-gated framing — shared HSM cluster is the default if the customer's HSM budget is tight; per-node is the upgrade for customers who procure 3+ HSMs per region. This was a real council debate; the reframing parked it where it belongs.
 
 **3. `compliance_auditor` — customer-only or vendor-issuable?**
 **Opinion:** Customer-grantable to any principal the customer chooses, including vendor personnel during a customer-authorized audit engagement. Implementation: customer's cert-service issues the cert; vendor personnel present their identity via an IdP federation or by a manually-provisioned ceremony. The role is not vendor-reserved; it is grantable by any cluster-admin on that cluster.
@@ -106,9 +205,13 @@ I stand by my position because the multi-cluster-per-customer-subset pattern is 
 **Opinion:** ECDSA-P256 for both build profiles. Uniform format beats per-profile ugliness. The speed cost (ECDSA slower than Ed25519 by ~3x) is invisible in Wendelon's signature workload — proposals are rare, not a hot path. This removes the "FIPS build uses different signature bytes" failure mode at upgrade.
 
 **10. Cert-service for tenant certs — separate Tenant CA or enroll under Operator CA?**
-**Opinion (v2 — council three-way split; my position weakened):** The council has three distinct answers: Codex says "not a general tenant CA in v1; Phase 2 ADR extension"; my v1 said "Phase 2 ADR extension with per-tenant Tenant CA chained from Node CA"; Gemini says "cert-service becomes the universal CA now, including query-session certs under a dedicated `tenant_user` role."
+**Opinion (v4 — converged 3-0 on scope boundary; labels aside).** Gemini's issues-v2 doc ratified my reconciliation explicitly: *"Codex and I have aligned on a narrow v1 scope: the cert-service issues node, operator, and Toron short-lived query/session credentials, but not general tenant application certificates."* This is exactly my v3 reconciliation — the disagreement was about the *label* "universal" vs "narrow," not the actual scope.
 
-Gemini's "universal CA" has a real simplicity win: one service, one trust model, one ceremony, one place that issues every cert type. My "Tenant CA per tenant" position was motivated by blast-radius ("tenant compromise doesn't leak Node CA"), but Gemini's answer achieves the same via scoped roles without the CA-hierarchy complexity. I move toward Gemini's universal-CA position for v1, with per-tenant CAs deferred to Phase 3 post-GA for regulated customers who specifically demand cryptographic hierarchy isolation. Codex's "Phase 2 ADR extension" framing still fits — the extension can ratify the universal-CA choice rather than define a new Tenant CA.
+**Resolved scope boundary (3-0):**
+- **In v1 scope:** node certs, operator certs (four sub-roles: `tenant_admin`, `cluster_admin`, `backup_admin`, `compliance_auditor`), `read_only_observer`, `break_glass_admin`, query-session certs (short-lived, Toron-originated, 15-minute lifetime).
+- **Out of v1 scope:** tenant-application long-lived certs (tenants manage their own auth for non-Wendelon-RPC concerns). Deferred to Phase 3 ADR 018 extension if a customer demands it.
+
+Phase-2 ADR 018 amendment formalizes this scope boundary. The "universal CA" label is retired — we call it the "cert-service" without adjectives; its scope is the above list, nothing more, nothing less.
 
 **11. Query-session cert revocation at IdP logout.**
 **Opinion:** My proposal holds. 15-minute cert lifetime + Toron heartbeat-based revocation + best-effort explicit-logout revocation. Toron's session state machine is responsible for detecting logout-by-absence (heartbeat-missed) and calling cert-service `/v1/query_session/revoke`. Cert-service's CRL update propagates via Wendelon's state machine.
@@ -204,7 +307,7 @@ No numbered questions in the extract (scope list only).
 ## WS-D (Codex) — Observability, Validation, SLO Evidence
 
 **1. Jepsen integration or in-house checker?**
-**Opinion:** Jepsen. Gemini's WS-E makes the same recommendation. A passing Jepsen report is procurement-visible in a way that an in-house checker cannot be. In-house simulator-integrated testing continues in parallel as WS-D's other work, but the "linearizability" validation that customers ask about is Jepsen.
+**Opinion (v3 — milestone tightened per Codex issues #7).** Both exist. In-house checker Phase 1 (finds obvious bugs fast). Jepsen before **Gate 4 (regulated pilot)**, not Gate 5 (regulated GA) — tightening from my v2. Codex's issues doc is right: "Jepsen is procurement-visible; tests that close before the first regulated customer's security review are worth their cost." A regulated pilot without a passing Jepsen report is a sales cycle that stalls when the first Fortune-500 CISO reads our testing docs. Gemini's answers doc said Gate 5; Gemini's issues doc didn't contest Codex on this; I align with Codex.
 
 **2. Soak duration for SLO promotion.**
 **Opinion:** Four consecutive weeks of nightly runs hitting the SLO target with ≤5% violation rate per week. Load shape: 80% of target peak throughput with 20% headroom. Longer soaks are better; four weeks is the minimum I'd promote on.
@@ -238,16 +341,31 @@ No numbered questions in the extract (scope list only).
 **Opinion:** Enumerated in my WS-C §2.4: `delete_tenant`, `rotate_tenant_kek`, `retire_tenant_kek_version`, quorum-affecting `membership.evict_peer`, Root-KEK retirement, break-glass cert issuance. Non-destructive operations (suspend, create, update-quota) do not. The question is not "which destructive" but "which irreversible or quorum-affecting." Destructive but reversible (`suspend`) stays single-auth.
 
 **2. Break-glass issuance dual-auth always or high-risk only?**
-**Opinion:** Always. Issuance is the load-bearing event; once the cert exists, its use is under individual authority for the lifetime. Gating issuance with dual-auth means no single-principal compromise can produce a valid break-glass cert. Scope narrowing (`diagnostic` vs `full`) determines whether a *third* signature is needed (for `full`), but all issuance requires at least two.
+**Opinion (v4 — now effectively 3-0 with constraints; Gemini conceded).** Gemini's issues-v2 doc: *"Claude's proposed constraints (specifically the 15-minute TTL and read-only enforcement at the RPC level) adequately mitigate my concerns around rogue access. I am willing to concede to the 2-1 majority here, provided these technical constraints are rigidly enforced by the dispatcher."*
+
+**Resolved position (convergence).** Dual-auth required for `tenant_ops`, `cluster_ops`, `key_ops`, and `full` scopes. Single-auth *permitted* for `diagnostic` scope with tightened constraints:
+- Maximum lifetime 15 minutes (not 1 hour)
+- Scope strictly read-only — RPC dispatcher refuses any mutating operation under diagnostic scope, enforced as a type-level invariant
+- Every action audited with `break_glass = true` and reason string mandatory
+- Automatic page to the second operator at issuance time
+- For `full` scope: three signatures with architect-lead sign-off (unchanged)
+
+Codex is the lone holdout for strict-always; Gemini's concession makes this 2-1 (or effectively 3-0 if Gemini's concession is counted). The dispatcher-enforced type-level read-only invariant is the load-bearing technical constraint that made Gemini comfortable moving.
 
 **3. Simplest revocation distribution model meeting fail-closed posture.**
 **Opinion:** State-machine-distributed CRL, answered in WS-C §2.2. Raft replicates the CRL as part of state-machine application; nodes consult local state at handshake; 30-minute fail-closed staleness. Simpler than an external HTTP endpoint with HA requirements.
 
 **4. IdP integration depth before regulated pilot.**
-**Opinion:** One IdP reference implementation (Okta or Azure AD) at Phase 1 exit is sufficient for design-partner pilot. For first regulated pilot, two reference implementations (Okta + Azure AD) and a documented SAML-generic pattern. Customer-specific IdP engineering is per-deal consulting; the framework is the deliverable.
+**Opinion (v4 — conceded to 2-1 council).** Codex's refreshed issues #9: *"one first-class IdP plus generic SAML is the right default; the second IdP should be customer-driven."* Gemini no longer pushes beyond Codex's bar. Council is 2-1 against my "two IdPs required" position.
+
+**Revised position.** One major IdP (Okta or Azure AD — pick whichever the first regulated customer uses) + generic SAML path is the Gate 4 minimum. A second major IdP is shipped only if triggered by a specific customer deal. This saves pre-Gate-4 engineering capacity and aligns with the customer-driven triggers the council has adopted throughout. I concede.
 
 **5. Cert-rotation service consensus substrate — reuse or introduce?**
-**Opinion:** Reuse openraft (already in the Wendelon core). The cert-service's state machine is trivial (append-only issuance log + current CRL + CA trust state) — 200-500 lines; the Raft substrate is the meaningful cost. Do not introduce a second consensus library; reuse is cheaper and avoids multi-Raft-flavor operational cost.
+**Opinion (v4 — converged 3-0 on openraft+KMS-lock-fallback compromise).** Gemini's issues-v2 doc: *"Claude's escape hatch (KMS conditional-puts for leader election) is a highly pragmatic compromise. We should formally adopt this: prototype `openraft` in a timeboxed sprint, and immediately fall back to the KMS-lock if it misses its delivery gate."* Codex's refreshed issues #5 acknowledges the compromise ("prototype `openraft` first, but ratify the fallback trigger in advance"). All three architects now align on the compromise.
+
+**Resolved position.** Prototype openraft reuse in Phase 0 Weeks 4-6. If prototype lands within the timebox without revealing scope incompatibility, ship openraft. If prototype slips past Phase 0 Week 6 or reveals scope incompatibility (e.g., cert-service state machine is a poor fit for openraft's abstractions), fall back to KMS-lock-based leader election (single-writer via KMS conditional-put on a cert-service-leader object, 5-second renewal).
+
+The load-bearing artifact is the **fallback-trigger criterion**: "openraft prototype not producing a working single-leader cert issuance by end of Phase 0 Week 6" is the explicit escape-hatch condition. Architect-lead confirms at Phase 0 exit.
 
 ## WS-G (Codex) — Audit, Evidence, Retention
 
@@ -264,12 +382,22 @@ No numbered questions in the extract (scope list only).
 **Opinion:** `wendelon-ctl audit verify --summary` terminal green/red output (WS-D §3.4). Dashboard integration deferred to GA.
 
 **5. Seven-year retention — standardize now or only for regulated tiers?**
-**Opinion:** Standardize now. Default 2555 days is the right default; `compliance_tier=none` tenants can configure down to 90 days if they explicitly accept the risk. Defaulting to 90 and upgrading per-tenant is the wrong shape — defaults should match the industry we're selling to, and we are selling to regulated industries.
+**Opinion (v3 — narrowed to regulated tiers per Codex issues #12).** Codex's issues doc #12 and Gemini's answers doc both say: seven-year default belongs on regulated/compliance tiers only; a non-regulated internal-use tenant should not pay 7-year storage cost by accident. Codex: "do not impose regulated defaults on non-regulated tenants by accident." This is the right framing.
+
+**Revised position.** Defaults are tier-keyed:
+- `compliance_tier=none`: 90 days default.
+- `compliance_tier=financial`, `healthcare`: 2555 days (7y) default.
+- `compliance_tier=defense`: 3650 days (10y) default.
+- `compliance_tier=bespoke`: customer-specified with a minimum floor enforced.
+
+Tenant creation without an explicit tier inherits the cluster-default; cluster-default is an operator config with no product-default (operators must pick). This avoids the accidental-regulated-cost pattern Codex flagged while keeping regulated posture strong by construction. Retains my v2 position that defaults should match the industry we sell to, but does so via the tier rather than a flat global default.
 
 ## WS-H (Codex) — Node Replacement, DR, Operator Runbooks
 
 **1. K8s Operator mandatory for Gate 3?**
-**Opinion:** Mandatory for K8s-based pilots (majority of customer-facing pilots). External-automation contract is an acceptable fallback for non-K8s (bare-metal, EC2 without K8s), with explicit timing SLA and verification steps. Gemini's WS-A owns the operator; defer the K8s-vs-fallback prioritization to them.
+**Opinion (v5 — conceded; 2-1 against Claude after Gemini accepted Codex's compromise).** Gemini's v3 issues doc: "I will accept Codex's compromise. A rigorously tested bash/Terraform automation contract is acceptable for early Gate 3 pilots *only if* it meets the same MTTR SLA as the operator. The native K8s operator remains a hard requirement for Gate 4 (regulated pilot)." As the operator's owner, Gemini's decision closes this.
+
+**Revised position (council-converged 2-1).** Gate 3 (first customer-facing pilot) ships with either (a) the first-party K8s Operator for K8s deployments, or (b) a scripted automation contract (bash/Terraform) that meets the same MTTR SLA. Gate 4 (regulated pilot) requires the native K8s Operator as a hard requirement. This removes the "Gate 3 blocked on Operator polish" failure mode while preserving the Operator as the Gate-4 bar.
 
 **2. Cluster-wide restore tooling before customer-facing pilot or manual sequence?**
 **Opinion (v2 — tightened per Codex).** Codex's stricter framing is correct: "at least enough to execute a documented cluster-scoped restore. Manual node-image folklore is not enough." Revised: for Gate 3 (first customer-facing pilot), a **documented, cluster-scoped manual sequence** is acceptable — not "the operator figures it out," but a step-by-step runbook that has been rehearsed end-to-end by someone other than the author. Automated cluster-wide tooling is Gate 4 (regulated pilot). The distinction matters: manual-but-documented is real preparation; manual-and-undocumented is liability.
@@ -286,13 +414,17 @@ No numbered questions in the extract (scope list only).
 ## WS-I (Codex) — Toron and Ecosystem Integration
 
 **1. Which team owns SSO/SAML-to-storage-auth identity mapping?**
-**Opinion:** Toron. The SAML assertion arrives at Toron's SQL gateway; Toron is the auth boundary. Toron calls Wendelon's cert-service to exchange SAML for `query_session` cert. Wendelon provides the cert-issuance surface (WS-C §3.6); Toron owns the translation logic. Defer operational ownership to Gemini's WS-B; my position is on the architecture, not the org chart.
+**Opinion (v5 — ownership resolved).** Gemini's v3 issues doc: "I will take ownership. The Wendelon Identity/Auth squad will author the integration test harness that Toron must pass. We define the contract; Toron implements the client side." Owner assigned.
+
+**Resolved contract split.** Wendelon Identity/Auth squad (Gemini's ownership) defines the integration contract and ships the test harness. Toron team implements the client side and must pass the harness. SAML assertion flows through Toron's SQL gateway; Toron calls Wendelon's cert-service to exchange SAML for `query_session` cert; Wendelon enforces at the RPC boundary. Architecture unchanged from v1; operational ownership now named.
 
 **2. JDBC/ODBC compatibility matrix — prove or document.**
 **Opinion:** Prove for the top three (JDBC drivers for Java, ODBC for .NET/C++, Python DBAPI) before regulated pilot. Document the rest as roadmap. Tableau, Power BI, Excel — top BI tools drive the top-three choices. Partner integrations beyond that are consulting-driven.
 
 **3. Reference ingest patterns enough for Gate 4, or maintained connector?**
-**Opinion:** Reference patterns plus one maintained connector (dbt adapter most likely, or Airbyte destination). Fivetran connector is a business-development negotiation, not a Gate 4 commitment. The question is really "who maintains the connector?" — if it's us, pick one and commit; if it's the ecosystem, document the patterns.
+**Opinion (v4 — converged 3-0 on customer-driven trigger).** Gemini's issues-v2 doc explicitly marks this as "Resolved": *"we have all aligned on the Codex criteria: we will only build a maintained ingestion connector (e.g., dbt) if it is explicitly demanded by the first target pilot's data pipeline. Otherwise, reference architectures suffice for Gate 4."*
+
+**Resolved position.** Reference patterns are the default deliverable. Maintained connector ships only when a specific first-customer ingestion path demands it. Product/GTM owns the trigger decision; engineering ships on their signal. Architecture names the technical minimum; the connector commitment is GTM's contract with the customer, not an engineering-decided pre-commitment.
 
 **4. Minimum trace context that must survive Toron-to-Wendelon hop.**
 **Opinion:** W3C Trace Context (`traceparent` + `tracestate`) plus a `wendelon-query-session-id` custom baggage item. That's it. Gemini's WS-B calls out trace-context propagation; I don't expand beyond W3C spec.
@@ -306,13 +438,32 @@ No numbered questions in the extract (scope list only).
 **Opinion:** Four-state language from WS-E v2 §2.3a: "FIPS-ready" → "FIPS-ready; CMVP submitted" → "FIPS-ready; in validation at [lab]" → "FIPS 140-3 validated, cert #NNNN." No other language is acceptable. Compliance lead is sole author of FIPS-claim text.
 
 **2. `rustls-aws-lc-rs` maturity fallback.**
-**Opinion:** Posture A/B from WS-E v2 §2.1. Default target Posture A (transport inside boundary); Posture B (transport outside boundary, at-rest-module certification only) is the escape hatch. Decision gate Phase 1 Month 6.
+**Opinion (v6 — FIPS is uplift-only; this question is deferred).** Under the commodity-default reframing, FIPS build profile is a regulated-uplift feature, not a Phase-1 calendar-critical deliverable. The `rustls-aws-lc-rs` maturity question matters when a regulated customer triggers the FIPS build; until then, the default build uses `rustls` + `ring` for transport and `aws-lc-rs` only for at-rest crypto primitives (for code-path consistency with the eventual FIPS build, not for certification claims).
+
+**Deferred decision path.** When a regulated customer is identified, Posture A / Posture B decision reactivates. `rustls-aws-lc-rs` upstream maturity is re-evaluated at that moment. The 0.5 FTE upstream-contribution budget I previously scoped for Phase 1 becomes an on-demand engagement, not a standing Phase-1 commitment.
+
+Prior debate preserved in the regulated-uplift scope document.
 
 **3. SLSA target before regulated pilot vs regulated GA.**
 **Opinion:** L2 for regulated pilot, L3 for regulated GA. L2 is achievable with existing GitHub Actions + OIDC provenance; L3 requires hermetic isolated builds which is meaningful engineering effort. L4 is not on the roadmap.
 
 **4. Mandatory compliance artifacts for first regulated pilot.**
-**Opinion:** Required at Gate 4: SOC 2 Type 2 scoping document, PCI-DSS applicability statement, HIPAA covered-entity mapping, NIST SP 800-53 Rev 5 control mapping. Optional / customer-driven: FedRAMP Moderate gap analysis, ISO 27001. Remaining frameworks are Gate 5 (regulated GA) or per-deal consulting.
+**Opinion (v3 — narrowed per Codex issues #9 and Gemini's answer).** Codex's issues doc #9 argues for a smaller mandatory set: "pilot evidence packet, SBOM, signing verification guidance, FIPS posture statement, and security architecture/control mapping summary. The fuller compliance pack can mature toward GA." Gemini concurs: SOC 2 + PCI-DSS mandatory; HIPAA and NIST 800-53 conditional on customer sector.
+
+**Revised position.** Mandatory at Gate 4 for *every* regulated pilot:
+- SBOM (SPDX)
+- Signed release artifacts + verification guidance
+- FIPS posture statement (per WS-E §2.3a language)
+- Security architecture + NIST 800-53 control mapping *summary* (not the full mapping matrix)
+- Pilot-specific evidence packet (deployment topology, operational control mapping)
+
+Conditional on customer sector at Gate 4:
+- SOC 2 Type 2 scoping — triggers if customer has SOC 2 audit scope.
+- PCI-DSS applicability statement — triggers for finance-sector pilot.
+- HIPAA covered-entity mapping — triggers for healthcare-sector pilot.
+- FedRAMP Moderate gap analysis — triggers for federal-sector pilot.
+
+Full framework mapping matrix (all of the above simultaneously) is Gate 5 (regulated GA), not Gate 4.
 
 **5. Platform set for first CMVP certification.**
 **Opinion:** Linux x86_64 and aarch64 on glibc-2.31+ (Debian 11 / Ubuntu 20.04+ / RHEL 8+). Linux musl (Alpine) explicitly out of scope for first cycle. Windows and macOS explicitly not on the CMVP roadmap at pilot; if customer-demanded, they run the default SKU.
@@ -326,13 +477,17 @@ No numbered questions in the extract (scope list only).
 **Opinion:** Wendelon-only at Phase 1-2. Toron has its own operational lifecycle; bundling into one operator couples two release cadences. A separate `toron-operator` (if needed) lives in Gemini's WS-B scope. They share cert-service and observability infrastructure; that's enough integration for pilot.
 
 **3. Cross-region active replication — hot standby or cold-backup-restore?**
-**Opinion (v2 — cluster-size qualifier added per Codex's push).** Gemini and I agreed: cold backup + restore for 4-hour RTO at first regulated pilot. Codex pushed back: "cold restore alone is too weak for a serious regulated target with a four-hour RTO. We need asynchronous cross-region replication or a warm standby posture by the regulated pilot/GA horizon." Reconsidering: Codex is right that 4h RTO from cold restore is not universally achievable. Cluster-size-dependent:
+**Opinion (v6 — reframed; cold-restore is the commodity-default baseline).** The prior debate assumed regulated-Fortune-500 was the primary target and warm-standby was the Gate-4 universal floor. Under the commodity-default reframing, the mapping inverts:
 
-- **≤10 TB clusters:** cold restore credibly hits 4h RTO. Most design-partner pilots fit here.
-- **10-100 TB clusters:** cold restore marginal; L2 hydration time dominates. Warm standby recommended.
-- **≥100 TB clusters:** cold restore cannot realistically hit 4h; async cross-region replication required.
+**Commodity default (baseline).** Cold-restore from S3-backed backups is the default DR mode. RTO is "however long to spin up replacement VPSes + rehydrate" — typically 15-60 minutes for small clusters, up to 4 hours for a few-TB cluster. RPO is the backup cadence (default 1 hour). No SLA-committed RTO; customer-acknowledged best-effort. This is adequate for customers running on $5/mo VPSes; they are not paying for warm-standby compute.
 
-Revised position: Gate 4 (regulated pilot) ships with cold restore supported; RTO SLA is *cluster-size-tiered*, documented honestly. Async cross-region replication (Codex's position) lands Gate 5 for larger clusters. Active-active remains a Phase 4+ architectural conversation.
+**Regulated uplift.** Warm standby or async cross-region replication. Committed RTO ≤4 hours for clusters >10 TB; RPO ≤1 hour for regulated tenants. Active-active (multi-region consensus) remains Phase 4+ even in the uplift scope.
+
+**What moves in the plan.** My v3 concession ("warm standby required for Gate 4 regulated pilot") was correct for regulated-uplift customers and remains in that scope document. For the commodity-default tier, async-replication engineering is *not* Phase 1-2 critical path — it becomes a customer-triggered uplift like PKCS#11 HSM and FIPS build.
+
+**What stays in v6:** the contract-appendix table (≤10 TB, 1 TB/tenant, best-effort RTO, customer-attested waiver) is still useful; it's the *default* commodity-tier posture now rather than an exception. No separate contract appendix needed — it's the standard commodity contract language.
+
+**Async-replication workstream** deferred from Phase 1-2 critical path to regulated-uplift-customer-triggered. When triggered, storage/runtime lead owns; RPO ≤1 hour; tenant-aware L2 replication.
 
 ## Gemini WS-B — Toron Compute Tier & Ecosystem Integration
 
@@ -386,20 +541,29 @@ Credit to Gemini — the trailers-carry-usage idea is the right primitive and I 
 
 ---
 
-## Council Convergence — effectively locked decisions (v2 addition)
+## Council Convergence — effectively locked decisions (v6 — reframed for commodity default)
 
-After reading Codex's and Gemini's answers, the following positions are concordant across all three architects within refinement distance. These should be ratified as Design-Lock entries without further debate; the council has spoken.
+Positions concordant across the council. V6 reframes several items around the commodity-default architecture: some items are baseline-and-uplift (apply to both tiers), some are baseline-only (commodity default), some are uplift-only (regulated tier).
 
-**Crypto / key lifecycle:**
+**Crypto / key lifecycle (baseline + uplift):**
 - `vsss-rs` for Shamir library (unanimous; all flag audit dependency)
 - 2 exec + 2 eng + 1 external trustee for escrow custodians
-- BYOK deferred beyond Phase 1
-- Thales Luna as primary HSM vendor
 - 1-year Tenant-KEK cryptoperiod default, 2-year ceiling
 - `retire_key` separate from `rotate`
 - Share re-wrap/migration sweeper scheduling framework, keep logic separate
-- `mlock` memory-dump out of scope for Level-1 CMVP
+- `mlock` memory-dump out of scope for baseline CMVP (regulated uplift only relevant path)
 - BYOK cross-region: customer-owned
+
+**Crypto — commodity default (v6 reframing):**
+- KMS providers: AWS KMS, GCP Cloud KMS, Azure Key Vault, TPM-sealed all ship at Gate 3. Customer picks per deployment.
+- Escrow seal medium: operator age-keys or YubiKeys (~$50 × 5 custodians).
+- `DevInsecure` behind `--features dev-insecure`; never production.
+
+**Crypto — regulated uplift (customer-triggered):**
+- PKCS#11 HSM provider (Thales Luna primary).
+- HSM-sealed escrow shares.
+- FIPS build profile via rustls-aws-lc-rs transport migration.
+- Per-tenant Root KEK (Phase 3).
 
 **Identity:**
 - Cert-service 3 nodes by default, 5 as regulated-SKU option
@@ -410,6 +574,10 @@ After reading Codex's and Gemini's answers, the following positions are concorda
 - ECDSA-P256 for both build profiles
 - Query-session cert revocation via short lifetime, logout best-effort
 - Predicate-pushdown runs under query-session identity
+- *(v4: newly converged)* Break-glass diagnostic scope single-auth permitted with 15-min TTL, read-only dispatcher enforcement, auto-page to second operator. Gemini conceded.
+- *(v4: newly converged)* Cert-service consensus substrate: openraft reuse preferred; KMS-lock-based leader election fallback if openraft misses Phase 0 Week 6 timebox. Gemini ratified Claude's compromise.
+- *(v4: newly converged)* Cert-service scope boundary: node, operator (4 sub-roles), observer, break-glass, query-session in v1; tenant-application certs Phase 3+. Reconciliation ratified 3-0.
+- *(v4: newly converged)* IdP integration breadth: one major IdP (customer-chosen) + generic SAML for Gate 4. Second IdP customer-triggered. Claude conceded.
 
 **Audit:**
 - 100% range-query start audit always
@@ -432,10 +600,22 @@ After reading Codex's and Gemini's answers, the following positions are concorda
 - Orphaned remote data: background sweeper cleanup, not synchronous rollback
 - Transport GSO/io_uring claim retracted for pilot
 
-**DR / ops:**
+**DR / ops (baseline + uplift):**
 - Backup storage physically separate from L2 tier
 - `wendelon-operator` strictly for storage tier (Toron uses standard K8s)
-- PITR deferred to Gate 5 (regulated GA)
+- Identity-mapping ownership: Wendelon Identity/Auth squad defines contract and test harness; Toron implements client. Gemini owns.
+- Maintained ELT connector customer-driven only; reference patterns are default deliverable. Product/GTM owns the trigger.
+
+**DR — commodity default (v6 reframing):**
+- Cold-restore from S3-backed backups is the baseline. RTO 15-60min for small clusters, up to 4h for few-TB. RPO = backup cadence (default 1h).
+- Scripted-automation contract (bash/Terraform) for node replacement. No K8s Operator required at Gate 3.
+- No SLA-committed RTO; customer-acknowledged best-effort.
+
+**DR — regulated uplift (customer-triggered):**
+- Warm standby or async cross-region replication by default. Committed RTO ≤4h for clusters >10 TB.
+- Native K8s Operator hard requirement at regulated-uplift Gate 4.
+- PITR (Phase 5+).
+- Active-active (Phase 4+ architectural).
 
 **FIPS / compliance:**
 - SLSA L2 for regulated pilot, L3 for regulated GA
@@ -444,27 +624,36 @@ After reading Codex's and Gemini's answers, the following positions are concorda
 - SOC 2 + PCI-DSS mandatory for regulated pilot; HIPAA/NIST 800-53 per customer
 
 **Testing:**
-- Narrower in-house linearizability checker Phase 1; Jepsen before regulated GA
+- Narrower in-house linearizability checker Phase 1; Jepsen before **Gate 4 regulated pilot** *(v3: tightened from "regulated GA")*
 - Tail-based trace sampling (100% errors + 100% SLO-breach + 1-5% baseline)
 - Strict Prometheus cardinality limits; no unbounded tenant labels in default metrics
 
 These ~40 items are effectively locked. The remaining ~50 answers in the questions file either show three-way alignment in spirit (same conclusion via different phrasing) or are single-architect judgments that have not drawn challenge.
 
-## Cross-council items I flag as still genuinely open (v2 — updated with peer input)
+## Cross-council items still genuinely open (v6 — residual list under commodity default)
 
-These are questions where an opinionated answer from me is insufficient; they need council or customer input. V2 adds the live three-way splits surfaced by peer review.
+The reframing further compressed the residual list. Items marked "uplift-only" are parked in the regulated-uplift scope document; they are not open questions for the commodity-default tier.
 
-**Three-way council splits requiring escalation:**
-- **WS-B Q11 (provider-shipping cadence).** Codex conservative, me middle, Gemini aggressive. I've moved toward Gemini in v2; final call needs Design-Lock.
-- **WS-C Q2 (signing HSM per-node vs shared).** Codex shared, Claude+Gemini per-node. Depends on HSM procurement budget.
-- **WS-C Q10 (universal cert-service scope).** Three distinct positions; I've moved toward Gemini's universal-CA in v2.
+**Uplift-only items (parked, resurrect on regulated-customer identification):**
+- HSM per-node vs shared (procurement-gated within the uplift).
+- FIPS transport Posture A/B decision gate.
+- Compliance pack NIST 800-53 summary (Codex 1-2 minority within the uplift).
+- Async-replication workstream owner.
+- Per-tenant Root KEK scheduling.
+- CMVP lab engagement calendar.
 
-**Single-architect escalation items (unchanged from v1):**
-- **WS-D Q3 (WORM governance vs compliance mode).** Regulatory bright lines drive this; customer-attorney input matters.
-- **WS-H Q1 (K8s Operator mandatory).** Gemini owns the operator; Gemini's call.
-- **WS-I Q3 (maintained connector).** Business-development question as much as engineering.
-- **WS-I Q1 (identity-mapping owner).** Org-chart question; Gemini proposes Toron owns. Confirm with actual owners.
-- **Gemini WS-A Q3 (cross-region replication for large clusters).** Codex pushed back on my "cold restore 4h RTO" answer for large clusters. V2 adopts cluster-size tiering; scope of Gate-5 async replication commitment still needs final decision.
+**Items the council cannot resolve without non-architect input:**
+- BYOK scope definitional for regulated-uplift collateral. Compliance + GTM decide.
+- WORM governance vs compliance mode for regulated-uplift customers. Customer-attorney input.
+- First-customer identification (triggers §3 customer-dependent interpretations and whether regulated-uplift work activates at all).
+
+**Items requiring owner-assignment (pending operations-team staffing):**
+- Runbook review cadence.
+- Design-Lock log maintenance.
+- Ceremony-host operational role (YubiKey-sealed for commodity; HSM-sealed for uplift).
+- Jepsen contract management (uplift-scope).
+
+**v6 convergence footprint.** The reframing closed essentially all architect-level disputes for the commodity-default tier. The regulated-uplift has its own smaller residual list, but that list does not gate Phase-0 exit for the commodity-default tier. Phase-0 calendar compresses materially: no CMVP lab contract, no HSM procurement. The longest external-dependency chain disappears from the critical path.
 
 ## Questions where I have no answer
 

@@ -1,7 +1,7 @@
 # ADR 029: Identity vs Locality — Two Projections of a Single Ring
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 Wendelon committed early to the Unified Ring topology (ADR 002): every node and every record resolves to a coordinate in one global hash space. The original implementation picked **HighwayHash-64** as the hash primitive and threaded the resulting `u64` through three distinct roles at once:
@@ -62,8 +62,9 @@ Both `Identity` and `Locality` are `#[repr(transparent)]` with `Pod + Zeroable` 
 - **Architectural test surface grows.** `tests/architecture_test.rs` now owns an additional responsibility: assert that the routing topology (ring tables, replica selection) compiles only against `Locality`, and that any storage-layer lookup compiles only against `Identity`. Codex, Claude, and any future contributor should expect the build to fail noisily on cross-use.
 - **Documentation drag.** Every workstream doc W1-W10 inherits an "Identity/Locality impact" section. This ADR alone does not discharge that drag; see the Open Questions below.
 
-## Open Questions
-- **Arrow representation of Identity in WPBC payloads.** `FixedSizeBinary(32)` is the natural choice, but whether WPBC opcodes that currently index by `UInt64` (range filters, dedup operators) should operate on the raw 32-byte buffer or on a lexicographic-ordered `Locality`-then-`Identity` composite is a W8 decision. Tracked under W8's open items.
-- **Audit canonical schema hash identity.** ADR 025's hash chain currently references records by 64-bit hash; whether to widen to 256-bit Identity or keep 64-bit Locality for audit-log compactness (with the record payload carrying the full Identity) is a W9 decision. Tracked under W9's open items.
-- **Tenant routing projection.** When a `TenantId` is combined with a key to produce an Identity (ADR 021's namespace-isolation guarantee), whether the API expression is `blake3(tenant_domain || tenant_id || key_bytes)` or `blake3_keyed(tenant_derived_key, key_bytes)` is a W5 decision. The output bytes stay BLAKE3-256 either way; the choice is about domain-separation expression, not build-profile variation.
-- **Salt / keyed hashing for anti-abuse.** Tenant-derived keyed mode is domain separation, not secrecy, because `tenant_id` is public. Whether routing should add a cluster-secret salt to prevent adversarial tenants from engineering locality hotspots is deferred to a future ADR once tenant threat models are concrete in W5.
+## Acceptance Closures
+
+- **Arrow representation of Identity in payloads.** `Identity` is represented as `FixedSizeBinary(32)` where full identity semantics are required. `Locality` remains `UInt64` only where routing/locality semantics are the actual contract.
+- **Audit record identity.** Audit records that reference concrete data records carry full `Identity` when the record itself is the subject. `Locality` may appear only as a routing or debugging projection, never as the authoritative storage identity.
+- **Tenant routing projection.** The day-one projection uses domain-separated BLAKE3 over tenant and key bytes, not a keyed secret variant.
+- **Salt / keyed hashing for anti-abuse.** No secret cluster salt is part of the accepted day-one identity model. If adversarial routing-abuse protection is later required, it will be introduced by a separate ADR rather than quietly changing the identity contract.
