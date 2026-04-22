@@ -10,10 +10,10 @@ The Raft Write-Ahead Log (WAL) in the L1 tier is the absolute source of truth fo
 *   **The Mechanism:** Instead of clients polling for updates (`WHERE updated_at > X`), a client opens a QUIC stream and subscribes directly to a specific `Locality`'s Raft log.
 *   **The Advantage:** As the consensus leader commits a new entry to the state machine, it simultaneously writes the bytes directly to the subscriber's network socket. This provides zero-polling CDC where the latency from "Write Committed" to "Event Received" is strictly bounded by the network RTT.
 
-## 2. "Pushdown Triggers" via WPBC (Wasm)
+## 2. "Pushdown Triggers" via WPBC (Rune-Targeted Bytecode)
 Traditional synchronous database triggers are notorious for eating CPU on the primary node and bottlenecking the ingest path.
-*   **The Mechanism:** We leverage the existing **WPBC (Wendelon Pushdown Bytecode)** engine, which already safely executes Wasm on storage nodes. Users can upload a Wasm module and bind it to a `tenant_id` or specific `Locality`.
-*   **The Advantage:** When a write arrives, the storage node executes the Wasm module locally. Because Wasm is strictly sandboxed and time-bound, it can safely enforce complex validation rules, enrich data (e.g., parsing a User-Agent string), or normalize records inline, without risking the stability of the core database process.
+*   **The Mechanism:** We leverage the existing **WPBC (Wendelon Pushdown Bytecode)** engine. WPBC is its own distinct, vectorized bytecode, but its primary high-level language target is **Rune (`rune-rs`)**. Users can write complex, expressive trigger logic in Rune, which Toron compiles into WPBC and binds to a `tenant_id` or specific `Locality`.
+*   **The Advantage:** When a write arrives, the storage node executes the WPBC module locally. Because WPBC is a strictly constrained execution environment, it can safely enforce validation rules, enrich data, or normalize records inline. We completely avoid the 4GB memory limits of Wasm, while giving data engineers the full expressive power of Rune (a dynamic Rust-like language) to script the database's internal behavior natively.
 
 ## 3. Continuous / Streaming Queries over QUIC
 Because Wendelon uses QUIC (via `quinn`), maintaining thousands of cheap, multiplexed streams is trivial.

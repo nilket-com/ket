@@ -32,3 +32,26 @@ At the end of the bytecode execution, the stack will contain exactly one item: a
 
 ## Conclusion
 WPBC doesn't need to become a complex distributed execution engine like Spark. By simply upgrading its internal evaluation model from a Scalar Stack to a Vectorized Stack, it can become the ultimate, SIMD-accelerated "bouncer" for the Data Ring, dropping rows at memory-bandwidth speeds before they ever touch the network.
+
+---
+
+## Part 2: The L2 Core Strategy (Serverless Pushdown)
+
+If WPBC is a clean, serialized AST of vectorized operations, it doesn't just run on Wendelon's L1 NVMe nodes. It is the foundational mechanism for querying the **L2 Cold Storage tier (S3)**.
+
+When Toron queries years of historical data, downloading terabytes of Arrow IPC files from S3 to a Wendelon node just to filter out 99% of the rows is a massive waste of network egress and CPU time. Wendelon's explicit architecture is to push the compute to the storage.
+
+### 1. S3 Select Translation (The Simple Filter)
+For basic predicates (e.g., `age > 18` or `tenant_id = 5`), Wendelon transpiles the WPBC bytecode on the fly into an **S3 Select** SQL query. AWS S3 executes the filter directly on their proprietary storage arrays and only returns the matching bytes over the network to the Wendelon node. This is a day-one architectural requirement, not an afterthought.
+
+### 2. S3 Object Lambda / Serverless Functions (The Complex Filter)
+For more complex pushdowns—like Vector Distance metrics, JSON parsing, or custom UDFs—S3 Select isn't expressive enough.
+
+This is where the defining Toron analogy comes into play: **Rune:Toron :: Scala:Spark.** Rune (`rune-rs`) is the primary language target for data engineering, and SQL is merely the secondary compatibility surface. Toron compiles Rune scripts into our strict, vectorized WPBC AST. 
+
+Wendelon's deployment model includes deploying a pre-compiled native Rust runtime as an AWS Lambda function (via S3 Object Lambda) or a Cloudflare Worker in the same region as the L2 bucket. 
+
+When Toron executes a complex Rune aggregate script, Wendelon routes the compiled WPBC bytecode to the Lambda/Worker. The serverless function fetches the S3 object over the cloud provider's internal multi-terabit backbone, runs the vectorized operations against the Arrow columns, and streams *only the heavily reduced result set* back to the Wendelon node. We bypass the Wasm 4GB memory limit trap entirely because the workers execute native Rust interpreting WPBC on raw Arrow memory boundaries.
+
+### The Impact
+By serializing compute intent (WPBC) instead of just pulling bytes, Wendelon turns dumb S3 storage into a massive, infinitely scalable, serverless compute grid. It gives a single developer running Wendelon on a $5 VPS the ability to execute petabyte-scale queries by hijacking the cloud provider's internal infrastructure to do the heavy lifting, completely neutralizing Databricks' primary architectural advantage.
