@@ -99,7 +99,8 @@ data_dir = "data"
 
 [tuning]
 rf = {rf}
-io_depth = 64
+wal_io_depth = 64
+slab_io_depth = 64
 
 [identity]
 lease_signing_secret = "{lease_secret}"

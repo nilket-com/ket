@@ -7,8 +7,8 @@ use crate::metrics::telemetry::{
 	TRACE_SAMPLING_RATE_DENOMINATOR, TraceExportConfig, TraceExportProtocol,
 };
 use crate::network::{
-	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
-	transfer_verifying_key_bytes,
+	ServerAdmissionConfig, dev_lease_signing_secret, dev_transfer_signing_secret,
+	lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
 use crate::node::{
 	ClusterBootstrapConfig, DEFAULT_MVCC_RETENTION_WINDOW, NodeBootstrapConfig,
@@ -57,7 +57,8 @@ pub fn render_example_config() -> String {
 		.replace("{{DATA_DIR}}", EXAMPLE_DATA_DIR)
 		.replace("{{SLAB_MAX_BYTES}}", &default_slab_max_bytes().to_string())
 		.replace("{{RF}}", &default_rf().to_string())
-		.replace("{{IO_DEPTH}}", &default_io_depth().to_string())
+		.replace("{{WAL_IO_DEPTH}}", &default_io_depth().to_string())
+		.replace("{{SLAB_IO_DEPTH}}", &default_io_depth().to_string())
 		.replace("{{LEASE_SIGNING_SECRET}}", &hex_string(lease_secret))
 		.replace(
 			"{{LEASE_VERIFYING_KEY}}",
@@ -118,15 +119,30 @@ struct RawStorageConfig {
 struct RawTuningConfig {
 	#[serde(default = "default_rf")]
 	rf: usize,
-	#[serde(default = "default_io_depth")]
-	io_depth: u32,
+	#[serde(default)]
+	wal_io_depth: Option<u32>,
+	#[serde(default)]
+	slab_io_depth: Option<u32>,
+	#[serde(default)]
+	max_inbound_connections: Option<usize>,
+	#[serde(default)]
+	max_inbound_connections_per_ip: Option<usize>,
+	#[serde(default)]
+	max_inbound_streams_per_connection: Option<usize>,
+	#[serde(default)]
+	max_concurrent_stream_tasks: Option<usize>,
 }
 
 impl Default for RawTuningConfig {
 	fn default() -> Self {
 		Self {
 			rf: default_rf(),
-			io_depth: default_io_depth(),
+			wal_io_depth: None,
+			slab_io_depth: None,
+			max_inbound_connections: None,
+			max_inbound_connections_per_ip: None,
+			max_inbound_streams_per_connection: None,
+			max_concurrent_stream_tasks: None,
 		}
 	}
 }
@@ -323,12 +339,43 @@ impl RawConfig {
 				"tuning.rf must be greater than zero",
 			));
 		}
-		if self.tuning.io_depth == 0 {
+		let wal_io_depth = self.tuning.wal_io_depth.unwrap_or(default_io_depth());
+		let slab_io_depth = self.tuning.slab_io_depth.unwrap_or(default_io_depth());
+		if self.tuning.wal_io_depth == Some(0)
+			|| (self.tuning.wal_io_depth.is_none() && wal_io_depth == 0)
+		{
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
-				"tuning.io_depth must be greater than zero",
+				"tuning.wal_io_depth must be greater than zero",
 			));
 		}
+		if self.tuning.slab_io_depth == Some(0)
+			|| (self.tuning.slab_io_depth.is_none() && slab_io_depth == 0)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"tuning.slab_io_depth must be greater than zero",
+			));
+		}
+		let transport_admission = ServerAdmissionConfig {
+			max_inbound_connections: self
+				.tuning
+				.max_inbound_connections
+				.unwrap_or(default_max_inbound_connections()),
+			max_inbound_connections_per_ip: self
+				.tuning
+				.max_inbound_connections_per_ip
+				.unwrap_or(default_max_inbound_connections_per_ip()),
+			max_inbound_streams_per_connection: self
+				.tuning
+				.max_inbound_streams_per_connection
+				.unwrap_or(default_max_inbound_streams_per_connection()),
+			max_concurrent_stream_tasks: self
+				.tuning
+				.max_concurrent_stream_tasks
+				.unwrap_or(default_max_concurrent_stream_tasks()),
+		};
+		transport_admission.validate()?;
 
 		let lease_signing_secret = parse_key_material(
 			"identity.lease_signing_secret",
@@ -385,7 +432,8 @@ impl RawConfig {
 			slab_max_bytes: self.storage.slab_max_bytes,
 			group_commit: crate::storage::GroupCommitConfig::default(),
 			rf: self.tuning.rf,
-			io_depth: self.tuning.io_depth,
+			wal_io_depth,
+			slab_io_depth,
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,
@@ -402,6 +450,7 @@ impl RawConfig {
 			},
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls,
+			transport_admission,
 			drift_max_offset_ms: self.time.drift_max_offset_ms,
 			mvcc_retention_policy: match self.time.mvcc_retention_window_secs {
 				0 => MvccRetentionPolicy::Disabled,
@@ -568,6 +617,22 @@ const fn default_rf() -> usize {
 
 const fn default_io_depth() -> u32 {
 	64
+}
+
+fn default_max_inbound_connections() -> usize {
+	ServerAdmissionConfig::default().max_inbound_connections
+}
+
+fn default_max_inbound_connections_per_ip() -> usize {
+	ServerAdmissionConfig::default().max_inbound_connections_per_ip
+}
+
+fn default_max_inbound_streams_per_connection() -> usize {
+	ServerAdmissionConfig::default().max_inbound_streams_per_connection
+}
+
+fn default_max_concurrent_stream_tasks() -> usize {
+	ServerAdmissionConfig::default().max_concurrent_stream_tasks
 }
 
 fn default_cluster_domain() -> String {

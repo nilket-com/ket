@@ -1,17 +1,17 @@
-//! Transport abstraction for the Auto-Adaptive Multi-Transport
-//! architecture (ADR 011).
+//! Transport abstraction for ADR 011's QUIC-first support strategy.
 //!
-//! Wendelon runs on fabrics that range from a developer laptop
-//! (TCP + TLS) to a datacenter RoCEv2 deployment (RDMA kernel
-//! bypass). Every pair of nodes negotiates the highest-priority
-//! transport they both support at connection time, and the rest of
-//! the system — `DataRing`, `ControlRing`, `WendelonRaftNetwork` —
-//! talks to whatever wire was chosen through the traits below.
+//! The supported transport today is QUIC. This module keeps the
+//! rest of the system — `DataRing`, `ControlRing`,
+//! `WendelonRaftNetwork` — independent of the concrete wire by
+//! routing everything through the traits below. Additional tiers
+//! remain as internal compatibility or extension seams, not as a
+//! blanket claim that Wendelon already ships adaptive multi-
+//! transport negotiation across all listed fabrics.
 //!
 //! ## What lives here
 //!
-//! * [`TransportTier`] — the finite ranked enum of transports we
-//!   will ever negotiate over, with the numeric value doubling as
+//! * [`TransportTier`] — the finite ranked enum of transport slots
+//!   the factory understands, with the numeric value doubling as
 //!   the bit position inside a [`TransportTierSet`].
 //! * [`TransportTierSet`] — compact `u8` bitmask of a node's
 //!   supported tiers. Rides in the Raft `ring(E)` snapshot so the
@@ -31,10 +31,11 @@
 //!   factory look up a target node's advertised tiers before
 //!   dialing. Kept async so future impls can await a
 //!   membership-epoch watch instead of returning stale data.
-//! * [`PoolRegistrar`] — the RDMA hook. Tier 0 needs the NIC to pin
-//!   every [`PooledBuf`][crate::network::pool::PooledBuf] the data
-//!   ring will DMA into, and it stores the returned LKey on the
-//!   buffer itself.
+//! * [`PoolRegistrar`] — the premium-fabric hook. If a future RDMA
+//!   path lands, it will need the NIC to pin every
+//!   [`PooledBuf`][crate::network::pool::PooledBuf] the data ring
+//!   DMA path touches and store the returned LKey on the buffer
+//!   itself.
 
 use crate::network::pool::PooledBuf;
 use crate::network::server::HrftService;
@@ -63,17 +64,14 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum TransportTier {
-	/// Tier 0 — RDMA over Converged Ethernet v2. Zero-copy,
-	/// kernel-bypass, requires a RoCE-capable NIC on both ends.
+	/// Tier 0 — reserved premium-fabric slot for a future RDMA
+	/// provider. Not part of the current support contract.
 	RdmaRoceV2 = 0,
-	/// Tier 1 — QUIC on top of `io_uring` + GSO. The universal
-	/// baseline: always available on hosts that can run Wendelon
-	/// at all, and the channel that carries the capability
-	/// handshake even when an upgrade to Tier 0 is about to happen.
+	/// Tier 1 — QUIC. This is the supported day-one transport.
 	QuicIoUring = 1,
-	/// Tier 2 — TCP + TLS 1.3. Compatibility fallback for
-	/// environments where QUIC is blocked (middleboxes, some
-	/// corporate egress).
+	/// Tier 2 — TCP + TLS 1.3 compatibility path. It exists as an
+	/// internal seam and optional fallback, not as the primary
+	/// support claim for day-one deployments.
 	TcpTls = 2,
 }
 
@@ -96,9 +94,9 @@ impl TransportTier {
 /// Compact bitmask of supported tiers. One byte per node, cheap to
 /// include in the `ring(E)` Raft snapshot.
 ///
-/// The `best_common` method implements the negotiation rule from
-/// ADR 011: pick the highest-priority tier that appears on both
-/// sides of a would-be connection.
+/// The `best_common` method picks the highest-priority tier that
+/// appears on both sides of a would-be connection. In the current
+/// support posture that normally resolves to QUIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TransportTierSet(u8);
 
@@ -153,17 +151,25 @@ impl TransportTierSet {
 /// [`read_frame`][crate::network::core::read_frame] and
 /// [`write_frame`][crate::network::core::write_frame] — operate on
 /// `&mut dyn TransportStream` without knowing whether the bytes
-/// are flowing over QUIC, RDMA send queues, or a raw TLS socket.
+/// are flowing over QUIC or another provider behind the same seam.
 #[async_trait]
 pub trait TransportStream: AsyncRead + AsyncWrite + Unpin + Send {
 	/// Unique id within the owning connection. For QUIC this wraps
-	/// the peer-observable `quinn::StreamId`; RDMA providers will
-	/// synthesize a monotonic counter per queue pair.
+	/// the peer-observable `quinn::StreamId`; other providers may
+	/// synthesize their own monotonic counter.
 	fn stream_id(&self) -> u64;
 
 	/// Cleanly close the write side of the stream. Reads may
 	/// continue until the peer returns FIN on its direction.
 	async fn finish(&mut self) -> std::io::Result<()>;
+
+	/// Reject the stream promptly so the peer observes admission
+	/// failure without waiting for a read timeout. Providers with
+	/// explicit reset primitives should override this; the default
+	/// fallback just finishes the write side.
+	async fn reject(&mut self) -> std::io::Result<()> {
+		self.finish().await
+	}
 }
 
 /// One transport session between two nodes. Opaque to the higher

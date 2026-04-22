@@ -1,3 +1,4 @@
+use crate::metrics::global as metrics;
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoOp, IoRingHandle};
 use async_trait::async_trait;
 use std::ffi::OsString;
@@ -6,8 +7,10 @@ use std::io::{Error, ErrorKind};
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Linux `O_DIRECT` flag. Shared across production storage paths so
 /// callers can request direct I/O without reaching into `libc`.
@@ -108,11 +111,29 @@ pub trait AsyncFileOps: Send + Sync {
 #[derive(Clone)]
 pub struct IoUringFileOps {
 	io: IoRingHandle,
+	blocking: Option<BlockingIoExecutor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockingIoClass {
+	WalMetadata,
+	SlabMetadata,
 }
 
 impl IoUringFileOps {
 	pub fn new(io: IoRingHandle) -> Self {
-		Self { io }
+		Self { io, blocking: None }
+	}
+
+	pub fn with_isolated_blocking(
+		io: IoRingHandle,
+		thread_name: impl Into<String>,
+		class: BlockingIoClass,
+	) -> std::io::Result<Self> {
+		Ok(Self {
+			io,
+			blocking: Some(BlockingIoExecutor::spawn(thread_name, class)?),
+		})
 	}
 
 	async fn submit_sync(&self, handle: &FileHandle, op: IoOp) -> std::io::Result<()> {
@@ -134,13 +155,25 @@ impl IoUringFileOps {
 		}
 		Ok(())
 	}
+
+	async fn run_blocking<T, F>(&self, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		if let Some(blocking) = &self.blocking {
+			blocking.run(f).await
+		} else {
+			spawn_blocking_io(f).await
+		}
+	}
 }
 
 #[async_trait]
 impl AsyncFileOps for IoUringFileOps {
 	async fn open(&self, path: &Path, flags: OpenFlags) -> std::io::Result<FileHandle> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut options = std::fs::OpenOptions::new();
 			options
 				.read(flags.read)
@@ -163,7 +196,7 @@ impl AsyncFileOps for IoUringFileOps {
 		len: usize,
 	) -> std::io::Result<Vec<u8>> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut buf = vec![0u8; len];
 			let read = file.read_at(&mut buf, offset)?;
 			buf.truncate(read);
@@ -179,7 +212,8 @@ impl AsyncFileOps for IoUringFileOps {
 		bytes: Vec<u8>,
 	) -> std::io::Result<usize> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.write_at(&bytes, offset)).await
+		self.run_blocking(move || file.write_at(&bytes, offset))
+			.await
 	}
 
 	async fn read_at(
@@ -198,12 +232,10 @@ impl AsyncFileOps for IoUringFileOps {
 		if completion.result < 0 {
 			return Err(Error::from_raw_os_error(-completion.result));
 		}
-		Ok((
-			completion.result as usize,
-			completion
-				.buf
-				.expect("io_uring read completion must return its aligned buffer"),
-		))
+		let buf = completion.buf.ok_or_else(|| {
+			Error::other("io_uring read completion missing aligned buffer payload")
+		})?;
+		Ok((completion.result as usize, buf))
 	}
 
 	async fn write_at(
@@ -222,12 +254,10 @@ impl AsyncFileOps for IoUringFileOps {
 		if completion.result < 0 {
 			return Err(Error::from_raw_os_error(-completion.result));
 		}
-		Ok((
-			completion.result as usize,
-			completion
-				.buf
-				.expect("io_uring write completion must return its aligned buffer"),
-		))
+		let buf = completion.buf.ok_or_else(|| {
+			Error::other("io_uring write completion missing aligned buffer payload")
+		})?;
+		Ok((completion.result as usize, buf))
 	}
 
 	async fn fsync(&self, handle: &FileHandle) -> std::io::Result<()> {
@@ -240,18 +270,18 @@ impl AsyncFileOps for IoUringFileOps {
 
 	async fn read_all(&self, path: &Path) -> std::io::Result<Vec<u8>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::read(path)).await
+		self.run_blocking(move || std::fs::read(path)).await
 	}
 
 	async fn write_all(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 		let path = path.to_path_buf();
 		let bytes = bytes.to_vec();
-		spawn_blocking_io(move || std::fs::write(path, bytes)).await
+		self.run_blocking(move || std::fs::write(path, bytes)).await
 	}
 
 	async fn file_len(&self, path: &Path) -> std::io::Result<Option<u64>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || match std::fs::metadata(path) {
+		self.run_blocking(move || match std::fs::metadata(path) {
 			Ok(meta) => Ok(Some(meta.len())),
 			Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
 			Err(err) => Err(err),
@@ -261,17 +291,18 @@ impl AsyncFileOps for IoUringFileOps {
 
 	async fn set_len(&self, handle: &FileHandle, len: u64) -> std::io::Result<()> {
 		let file = handle.try_clone()?;
-		spawn_blocking_io(move || file.set_len(len)).await
+		self.run_blocking(move || file.set_len(len)).await
 	}
 
 	async fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::create_dir_all(path)).await
+		self.run_blocking(move || std::fs::create_dir_all(path))
+			.await
 	}
 
 	async fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirectoryEntry>> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let mut entries = Vec::new();
 			for entry in std::fs::read_dir(path)? {
 				let entry = entry?;
@@ -287,7 +318,7 @@ impl AsyncFileOps for IoUringFileOps {
 
 	async fn fsync_dir(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || {
+		self.run_blocking(move || {
 			let dir = File::open(path)?;
 			dir.sync_all()
 		})
@@ -297,12 +328,12 @@ impl AsyncFileOps for IoUringFileOps {
 	async fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
 		let from = from.to_path_buf();
 		let to = to.to_path_buf();
-		spawn_blocking_io(move || std::fs::rename(from, to)).await
+		self.run_blocking(move || std::fs::rename(from, to)).await
 	}
 
 	async fn unlink(&self, path: &Path) -> std::io::Result<()> {
 		let path = path.to_path_buf();
-		spawn_blocking_io(move || std::fs::remove_file(path)).await
+		self.run_blocking(move || std::fs::remove_file(path)).await
 	}
 }
 
@@ -523,6 +554,86 @@ where
 	tokio::task::spawn_blocking(f)
 		.await
 		.map_err(|err| Error::other(format!("blocking file op task failed: {err}")))?
+}
+
+type BlockingTask = Box<dyn FnOnce() + Send + 'static>;
+
+const ISOLATED_BLOCKING_IO_QUEUE_DEPTH: usize = 1024;
+const ISOLATED_BLOCKING_IO_WORKERS: usize = 4;
+
+#[derive(Clone)]
+struct BlockingIoExecutor {
+	tx: tokio::sync::mpsc::Sender<BlockingTask>,
+	class: BlockingIoClass,
+	queued_tasks: Arc<AtomicU64>,
+}
+
+impl BlockingIoExecutor {
+	fn spawn(thread_name: impl Into<String>, class: BlockingIoClass) -> std::io::Result<Self> {
+		let thread_name = thread_name.into();
+		let (tx, rx) = tokio::sync::mpsc::channel(ISOLATED_BLOCKING_IO_QUEUE_DEPTH);
+		let queued_tasks = Arc::new(AtomicU64::new(0));
+		let rx = Arc::new(std::sync::Mutex::new(rx));
+		for worker_idx in 0..ISOLATED_BLOCKING_IO_WORKERS {
+			let worker_name = format!("{thread_name}-{worker_idx}");
+			let rx = rx.clone();
+			let queued_tasks = queued_tasks.clone();
+			std::thread::Builder::new()
+				.name(worker_name.clone())
+				.spawn(move || {
+					loop {
+						let task = {
+							let mut guard = rx.lock().unwrap();
+							guard.blocking_recv()
+						};
+						let Some(task) = task else {
+							break;
+						};
+						let depth = queued_tasks.fetch_sub(1, Ordering::Relaxed) - 1;
+						update_blocking_io_queue_depth(class, depth);
+						let _ = catch_unwind(AssertUnwindSafe(task));
+					}
+				})
+				.map_err(|err| {
+					Error::other(format!(
+						"failed to spawn isolated blocking io thread {worker_name}: {err}"
+					))
+				})?;
+		}
+		update_blocking_io_queue_depth(class, 0);
+		Ok(Self {
+			tx,
+			class,
+			queued_tasks,
+		})
+	}
+
+	async fn run<T, F>(&self, f: F) -> std::io::Result<T>
+	where
+		T: Send + 'static,
+		F: FnOnce() -> std::io::Result<T> + Send + 'static,
+	{
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		let task: BlockingTask = Box::new(move || {
+			let _ = tx.send(f());
+		});
+		let depth = self.queued_tasks.fetch_add(1, Ordering::Relaxed) + 1;
+		update_blocking_io_queue_depth(self.class, depth);
+		self.tx.send(task).await.map_err(|_| {
+			let depth = self.queued_tasks.fetch_sub(1, Ordering::Relaxed) - 1;
+			update_blocking_io_queue_depth(self.class, depth);
+			Error::other("isolated blocking io thread stopped before accepting file op")
+		})?;
+		rx.await
+			.map_err(|_| Error::other("isolated blocking io task was cancelled"))?
+	}
+}
+
+fn update_blocking_io_queue_depth(class: BlockingIoClass, depth: u64) {
+	match class {
+		BlockingIoClass::WalMetadata => metrics().storage_wal_blocking_queue_depth.set(depth),
+		BlockingIoClass::SlabMetadata => metrics().storage_slab_blocking_queue_depth.set(depth),
+	}
 }
 
 #[cfg(test)]
@@ -975,4 +1086,54 @@ fn snapshot_durable_tree(
 		return Ok(());
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{BlockingIoClass, BlockingIoExecutor, ISOLATED_BLOCKING_IO_WORKERS};
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::{Arc, Barrier};
+	use std::time::Duration;
+
+	#[tokio::test]
+	async fn isolated_blocking_executor_runs_tasks_in_parallel() {
+		let executor = BlockingIoExecutor::spawn(
+			"wendelon-test-isolated-blocking",
+			BlockingIoClass::SlabMetadata,
+		)
+		.unwrap();
+		let barrier = Arc::new(Barrier::new(ISOLATED_BLOCKING_IO_WORKERS));
+		let active = Arc::new(AtomicUsize::new(0));
+		let max_active = Arc::new(AtomicUsize::new(0));
+		let mut tasks = Vec::new();
+		for _ in 0..ISOLATED_BLOCKING_IO_WORKERS {
+			let executor = executor.clone();
+			let barrier = barrier.clone();
+			let active = active.clone();
+			let max_active = max_active.clone();
+			tasks.push(tokio::spawn(async move {
+				executor
+					.run(move || {
+						let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+						max_active.fetch_max(now, Ordering::SeqCst);
+						barrier.wait();
+						active.fetch_sub(1, Ordering::SeqCst);
+						Ok::<_, std::io::Error>(())
+					})
+					.await
+					.unwrap();
+			}));
+		}
+		tokio::time::timeout(Duration::from_secs(1), async {
+			for task in tasks {
+				task.await.unwrap();
+			}
+		})
+		.await
+		.unwrap();
+		assert_eq!(
+			max_active.load(Ordering::SeqCst),
+			ISOLATED_BLOCKING_IO_WORKERS
+		);
+	}
 }

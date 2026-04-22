@@ -1,12 +1,13 @@
-//! mTLS config construction for the HRFT QUIC transport.
+//! mTLS config construction for the primary HRFT transport path.
 //!
-//! All inter-node traffic — Data Ring, Control Ring, and Raft
-//! internal — terminates on a single QUIC endpoint bound to either
-//! `control_bind` or `data_bind` (see `plans/ops/configuration.md`).
-//! Per `plans/network/security.md`, every connection is mTLS 1.3:
-//! both sides present X.509 certificates issued by the cluster PKI,
-//! and each node's `NodeId` binds to a Subject Alternative Name in
-//! the cert.
+//! On the supported day-one path, inter-node traffic — Data Ring,
+//! Control Ring, and Raft internal — terminates on a QUIC endpoint.
+//! The same certificate material may also be reused by explicit
+//! compatibility listeners, but this module exists first to secure
+//! the QUIC path. Per `plans/network/security.md`, every connection
+//! is mTLS 1.3: both sides present X.509 certificates issued by the
+//! cluster PKI, and each node's `NodeId` binds to a Subject
+//! Alternative Name in the cert.
 //!
 //! This module deals with the cryptographic shape plus the first-wave
 //! node-identity binding contract: cert/key loading, rustls

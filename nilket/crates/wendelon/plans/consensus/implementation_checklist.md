@@ -14,14 +14,13 @@ P1	DataRing::write impl over QUIC	FrameHeader, WriteRequestMeta, Arrow schemas, 
 P1	DataRing::read impl with E_safe check	ReadRequestMeta, LeaseDescriptor	Med	Three consistency levels; lease check on LINEARIZABLE path.
 P1	E_safe tracking + monotonic advancement	FinalizationMarker	High	Must never regress on restart; persist to WAL alongside commit_index.
 P1	FinalizationMarker emission on quorum ack	Raft commit callback	Med	Exactly-once per committed entry; bytemuck cast to trailing frame bytes.
-P1	quinn QUIC endpoint setup	FrameHeader	Med	Separate endpoints for data (:4001) and control (:4002). 0-RTT enabled.
+P1	quinn QUIC endpoint setup	FrameHeader	Med	QUIC is the real day-one transport. Listener topology and 0-RTT posture must match the actual implementation, not aspirational endpoint splits.
 P2	DataRing::stream_finalization	FinalizationMarker, QUIC streams	Med	Backpressure via bounded mpsc; drop slowest after 10s.
 P2	TransferToken creation + Ed25519 verification	ed25519-dalek	Med	Atomic with epoch bump; verify canonical encoding of signed region.
 P2	LeaseDescriptor grant/renewal	Heartbeat protocol, HLC	Med	Lease clock is HLC-based, not wall-clock. Immediate invalidation on epoch bump.
 P2	ControlRing::transfer_leadership	TransferToken, RaftEpochEntry	Med	Drain in-flight writes before step-down.
 P2	RaftEpochEntryFixed + Arrow var payload	epoch_entry_var_schema	Med	Hash-chain (prev_epoch_hash) computed at commit time.
 P3	DataRing::bulk_write bidi-streaming	DataRing::write	Low	Multi-row Arrow batches; can reuse unary path initially.
-P3	TCP+TLS fallback transport	FrameHeader	Low	Length-prefixed framing; stream_id mux. For environments where QUIC is blocked.
+P3	TCP+TLS compatibility transport	FrameHeader	Low	Optional compatibility path only. Not the primary day-one transport claim.
 P3	ControlRing::get_cluster_status	All state	Low	Observability endpoint; non-critical path.
-
 

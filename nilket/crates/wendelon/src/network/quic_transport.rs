@@ -1,18 +1,20 @@
-//! Tier 1 (`QuicIoUring`) provider for the Auto-Adaptive Transport
-//! traits in [`crate::network::transport`].
+//! QUIC transport provider for the traits in
+//! [`crate::network::transport`].
 //!
 //! This is a thin wrapper over `quinn` that keeps higher layers
 //! from depending on `quinn::{Connection, SendStream, RecvStream}`
-//! directly. The goals are:
+//! directly. This is the supported day-one transport path. The
+//! goals are:
 //!
 //! * **No behavioral change** vs. the pre-refactor call sites. The
 //!   QUIC wrapper simply delegates: `open_bi` / `accept_bi` forward
 //!   to `quinn::Connection`'s identically-named methods, and the
 //!   combined stream implements [`AsyncRead`] / [`AsyncWrite`] by
 //!   pinning and polling the recv / send halves respectively.
-//! * **Room for RDMA.** [`QuicTransportConnection::transport_type`]
-//!   returns [`TransportTier::QuicIoUring`]; when Tier 0 lands, the
-//!   factory can swap this out without any changes above the trait.
+//! * **Extension seam, not overclaim.**
+//!   [`QuicTransportConnection::transport_type`] returns
+//!   [`TransportTier::QuicIoUring`], and the surrounding seam keeps
+//!   future transports possible without implying they already ship.
 //! * **Dyn-object yield.** All public methods return the trait
 //!   object forms (`Box<dyn TransportStream>`) that
 //!   [`TransportConnection`] demands, so call sites see a single
@@ -270,6 +272,12 @@ impl TransportStream for QuicTransportStream {
 		self.send
 			.finish()
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))
+	}
+
+	async fn reject(&mut self) -> std::io::Result<()> {
+		let _ = self.send.reset(0u32.into());
+		let _ = self.recv.stop(0u32.into());
+		Ok(())
 	}
 }
 

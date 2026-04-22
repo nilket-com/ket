@@ -1,6 +1,13 @@
-# Refactoring Plan: Auto-Adaptive Multi-Transport (ADR 011)
+# Refactoring Plan: Additional Transport Work Beyond QUIC
 
-This document outlines the structural changes required to move from a QUIC-only transport to the Auto-Adaptive Multi-Transport architecture. 
+> Status note (2026-04-22): Wendelon's supported day-one transport
+> strategy is QUIC first. This document is a future-facing refactor
+> sketch for additional transport work and should not be read as a
+> statement of the current production transport contract.
+
+This document outlines structural changes that would be required to
+extend the current QUIC-first transport implementation with
+additional transport providers later.
 
 ## 1. Core Abstractions (`src/network/transport.rs`)
 

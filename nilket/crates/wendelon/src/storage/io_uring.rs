@@ -1,8 +1,9 @@
 //! Dedicated `io_uring` submission thread (ADR 008 / ADR 009).
 //!
 //! One instance of [`IoRingHandle`] maps one-to-one to a single OS
-//! thread and a single `io_uring::IoUring` instance. In production
-//! Wendelon spawns one such pair per physical NVMe device.
+//! thread and a single `io_uring::IoUring` instance. Wendelon can
+//! then compose those handles into separate durability-class workers
+//! such as a dedicated WAL ring and one or more slab rings.
 //!
 //! Threading model:
 //!  * `tokio` tasks submit [`IoRequest`]s over an MPSC channel.
@@ -227,12 +228,22 @@ impl IoRingHandle {
 /// Spawn a dedicated OS thread owning a fresh `io_uring` with
 /// `depth` SQ entries. The returned handle feeds that thread.
 pub fn spawn_io_thread(depth: u32) -> std::io::Result<IoRingHandle> {
+	spawn_io_thread_named(depth, "wendelon-io-uring")
+}
+
+/// Spawn a dedicated OS thread owning a fresh `io_uring` with
+/// `depth` SQ entries and a caller-supplied thread name.
+pub fn spawn_io_thread_named(
+	depth: u32,
+	thread_name: impl Into<String>,
+) -> std::io::Result<IoRingHandle> {
 	let ring = IoUring::new(depth)?;
 	// Channel capacity: 2× depth gives slack for bursty submitters
 	// without unbounded memory growth.
 	let (tx, rx) = mpsc::channel::<IoRequest>((depth as usize).saturating_mul(2).max(1));
+	let thread_name = thread_name.into();
 	thread::Builder::new()
-		.name("wendelon-io-uring".into())
+		.name(thread_name)
 		.spawn(move || io_thread_loop(ring, rx))?;
 	Ok(IoRingHandle { tx })
 }

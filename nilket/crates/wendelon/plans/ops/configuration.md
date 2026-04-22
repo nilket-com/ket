@@ -19,7 +19,12 @@ slab_max_bytes = 67108864
 
 [tuning]
 rf = 1
-io_depth = 64
+wal_io_depth = 64
+slab_io_depth = 64
+max_inbound_connections = 1024
+max_inbound_connections_per_ip = 64
+max_inbound_streams_per_connection = 64
+max_concurrent_stream_tasks = 4096
 
 [identity]
 lease_signing_secret = "<64 hex chars>"
@@ -38,8 +43,12 @@ transfer_signing_secret = "<64 hex chars>"
   directory containing the TOML file.
 - The trusted signer maps must contain an entry for `node_id`, or bootstrap
   validation fails.
-- `slab_max_bytes`, `rf`, and `io_depth` default to `67108864`, `1`, and `64`
-  respectively when omitted.
+- `slab_max_bytes`, `rf`, `wal_io_depth`, and `slab_io_depth` default to
+  `67108864`, `1`, `64`, and `64` respectively when omitted.
+- Transport admission defaults to `1024` total inbound connections, `64`
+  inbound connections per peer IP, `64` streams per connection, and `4096`
+  concurrent stream-handler tasks when the corresponding `[tuning]` fields are
+  omitted.
 - The current binary can generate a starter file from the checked-in example
   template:
 

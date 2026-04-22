@@ -588,6 +588,10 @@ impl WriteStatus {
 	/// id is safe and should either reconcile the write to a
 	/// committed result or return this same status again.
 	pub const FINALIZATION_PENDING: Self = Self(13);
+	/// The request was rejected by bounded post-auth admission
+	/// control before the data path began durable work. Retrying
+	/// after a short backoff is allowed.
+	pub const BACKPRESSURED: Self = Self(14);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -816,6 +820,10 @@ impl ReadStatus {
 	/// retention floor. Retrying the same `as_of_hlc` is not useful
 	/// unless retention policy changes.
 	pub const RETENTION_EXPIRED: Self = Self(12);
+	/// The request was rejected by bounded post-auth admission
+	/// control before the read or query work began. Retrying after
+	/// a short backoff is allowed.
+	pub const BACKPRESSURED: Self = Self(13);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

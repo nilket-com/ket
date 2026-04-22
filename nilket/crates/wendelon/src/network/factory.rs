@@ -1,5 +1,5 @@
-//! Per-`NodeId` connection factory and tier-negotiation front door
-//! for the Auto-Adaptive Multi-Transport architecture (ADR 011).
+//! Per-`NodeId` connection factory and transport-selection front
+//! door for ADR 011's QUIC-first support strategy.
 //!
 //! Slice 2 left connection caching inside `WendelonRaftNetwork` —
 //! one Raft peer, one cached session, redial on
@@ -9,6 +9,12 @@
 //! fabric: every subsystem can't keep its own per-peer cache.
 //!
 //! This module centralises that job.
+//!
+//! QUIC is the supported transport today. The factory still owns
+//! provider dispatch and capability-aware selection so the codebase
+//! keeps a clean seam for optional compatibility paths or future
+//! premium-hardware transports, but that seam is not itself a
+//! promise that Wendelon already ships an adaptive transport stack.
 //!
 //! ## Responsibilities
 //!

@@ -8,11 +8,12 @@
 //!
 //! The genesis pattern here is deliberately minimal: one node, RF=1,
 //! durable local Raft artifacts, and the same transport abstractions
-//! the multi-node path uses. When `[transport.tls]` is configured,
-//! bootstrap binds a real QUIC endpoint plus the TCP+TLS fallback
-//! listener, advertises both tiers, and routes outbound dials through
-//! the shared transport factory; otherwise tests and single-node dev
-//! flows can still supply an in-process provider.
+//! the multi-node path uses. QUIC is the primary supported transport.
+//! When `[transport.tls]` is configured, bootstrap binds the real
+//! QUIC endpoint and may also wire optional compatibility listeners
+//! and providers through the shared transport factory; otherwise
+//! tests and single-node dev flows can still supply an in-process
+//! provider.
 //!
 //! ## What this file does NOT own
 //!
@@ -69,7 +70,8 @@ use crate::network::quic_transport::{
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
 use crate::network::server::{
-	HrftService, LifecycleService, ServerLifecycle, serve, serve_tcp_tls,
+	HrftService, LifecycleService, ServerAdmissionConfig, ServerLifecycle,
+	serve_tcp_tls_with_admission, serve_with_admission,
 };
 use crate::network::tcp_tls_transport::TcpTlsTransportProvider;
 use crate::network::tls::{TlsMaterial, rustls_client_config, rustls_server_config};
@@ -82,7 +84,7 @@ use crate::network::transport::{
 };
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
-use crate::storage::io_uring::{IoRingHandle, spawn_io_thread};
+use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
@@ -157,8 +159,10 @@ pub struct NodeBootstrapConfig {
 	/// Replication factor published into the ring. Single-node
 	/// deployments run at RF=1; production minimum is 3.
 	pub rf: usize,
-	/// Depth of the shared `io_uring` submission queue.
-	pub io_depth: u32,
+	/// Depth of the dedicated Raft WAL `io_uring` submission queue.
+	pub wal_io_depth: u32,
+	/// Depth of the dedicated slab-storage `io_uring` submission queue.
+	pub slab_io_depth: u32,
 	/// `host:port` this node publishes into the membership epoch —
 	/// peers dial here when we advertise a transport tier.
 	pub advertise_address: String,
@@ -195,6 +199,8 @@ pub struct NodeBootstrapConfig {
 	/// Optional transport TLS material used by concrete socket-based
 	/// providers and observability listeners.
 	pub transport_tls: Option<TransportTlsConfig>,
+	/// Listener-level admission bounds for inbound transport work.
+	pub transport_admission: ServerAdmissionConfig,
 	/// Maximum tolerated drift between the local physical clock and
 	/// the cluster median before the node aborts.
 	pub drift_max_offset_ms: u64,
@@ -213,7 +219,7 @@ pub const DEFAULT_MVCC_RETENTION_POLICY: MvccRetentionPolicy =
 
 impl NodeBootstrapConfig {
 	/// Convenience for tests and dev deploys: tempdir-style data
-	/// dir, RF=1, modest io_uring depth, loopback address.
+	/// dir, RF=1, modest WAL/slab `io_uring` depth, loopback address.
 	pub fn dev(node_id: u32, data_dir: PathBuf, advertise_address: String) -> Self {
 		let lease_signing_secret = dev_lease_signing_secret(node_id);
 		let mut trusted_lease_signers = BTreeMap::new();
@@ -230,7 +236,8 @@ impl NodeBootstrapConfig {
 			slab_max_bytes: 64 * 1024 * 1024,
 			group_commit: GroupCommitConfig::default(),
 			rf: 1,
-			io_depth: 64,
+			wal_io_depth: 64,
+			slab_io_depth: 64,
 			advertise_address,
 			lease_signing_secret,
 			trusted_lease_signers,
@@ -244,6 +251,7 @@ impl NodeBootstrapConfig {
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
 			transport_tls: None,
+			transport_admission: ServerAdmissionConfig::default(),
 			drift_max_offset_ms: crate::consensus::monitor::MAX_OFFSET_MS,
 			// Dev/test helpers seed synthetic HLCs (1, 2, 3, …),
 			// so keep retention disabled unless a caller opts in
@@ -323,10 +331,16 @@ impl NodeBootstrapConfig {
 				"rf must be greater than zero",
 			));
 		}
-		if self.io_depth == 0 {
+		if self.wal_io_depth == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
-				"io_depth must be greater than zero",
+				"wal_io_depth must be greater than zero",
+			));
+		}
+		if self.slab_io_depth == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"slab_io_depth must be greater than zero",
 			));
 		}
 		if self.advertise_address.trim().is_empty() {
@@ -335,6 +349,7 @@ impl NodeBootstrapConfig {
 				"advertise_address must not be empty",
 			));
 		}
+		self.transport_admission.validate()?;
 		if !self.trusted_lease_signers.contains_key(&self.node_id) {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -570,10 +585,12 @@ pub struct WendelonNode {
 	pub service: Arc<dyn HrftService>,
 	pub data_server: Arc<WendelonDataServer>,
 	pub pool: Arc<BufPool>,
-	pub io: IoRingHandle,
+	pub slab_io: IoRingHandle,
+	pub wal_io: IoRingHandle,
 	pub epoch_tx: watch::Sender<Arc<MembershipEpoch>>,
 	pub protocol: ProtocolVersionWindow,
 	pub lifecycle: ServerLifecycle,
+	pub transport_admission: ServerAdmissionConfig,
 	pub audit_sink: Arc<dyn AuditSink>,
 	pub audit_materialization: Arc<AuditMaterializationTracker>,
 	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
@@ -967,8 +984,9 @@ impl WendelonNode {
 		// 1. Shared buffer pool (HRFT frames + postcard bodies).
 		let pool = BufPool::new(256, 1024 * 1024);
 
-		// 2. io_uring thread for slab + WAL I/O.
-		let io = spawn_io_thread(cfg.io_depth)?;
+		// 2. Dedicated `io_uring` workers for the two durability classes.
+		let slab_io = spawn_io_thread_named(cfg.slab_io_depth, "wendelon-io-uring-slab")?;
+		let wal_io = spawn_io_thread_named(cfg.wal_io_depth, "wendelon-io-uring-wal")?;
 
 		// 3. L1 slab storage.
 		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;
@@ -981,7 +999,7 @@ impl WendelonNode {
 			SlabManager::open(SlabManagerConfig {
 				dir: cfg.data_dir.clone(),
 				max_slab_bytes: cfg.slab_max_bytes,
-				io: io.clone(),
+				io: slab_io.clone(),
 				l2,
 				rehydration: cfg.rehydration.clone(),
 				group_commit: cfg.group_commit.clone(),
@@ -993,7 +1011,7 @@ impl WendelonNode {
 		// 4. Durable Raft storage + recovered state machine.
 		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
 		let log_store =
-			WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, io.clone()).await?;
+			WendelonLogStore::open(&wal_path, &vote_path, &snapshot_path, wal_io.clone()).await?;
 		let bootstrap_mode = log_store.bootstrap_mode().await;
 		let checkpoint_coordinator = CheckpointCoordinator::new(log_store.clone());
 		let tier_observer = Arc::new(ManagerTierObserver::new(slab.clone()));
@@ -1235,6 +1253,7 @@ impl WendelonNode {
 					service.clone(),
 					pool.clone(),
 					lifecycle.clone(),
+					cfg.transport_admission.clone(),
 					cluster_domain,
 				)),
 				BootstrapListener::TcpTls {
@@ -1247,6 +1266,7 @@ impl WendelonNode {
 					service.clone(),
 					pool.clone(),
 					lifecycle.clone(),
+					cfg.transport_admission.clone(),
 					cluster_domain,
 				)),
 			})
@@ -1402,10 +1422,12 @@ impl WendelonNode {
 			service,
 			data_server,
 			pool,
-			io,
+			slab_io,
+			wal_io,
 			epoch_tx,
 			protocol: cfg.protocol,
 			lifecycle,
+			transport_admission: cfg.transport_admission.clone(),
 			audit_sink,
 			audit_materialization,
 			clock_drift_events: clock_drift_rx,
@@ -1458,6 +1480,7 @@ impl WendelonNode {
 			self.service.clone(),
 			self.pool.clone(),
 			self.lifecycle.clone(),
+			self.transport_admission.clone(),
 			cluster_domain.into(),
 		)
 	}
@@ -1471,11 +1494,21 @@ impl WendelonNode {
 		let svc = self.service.clone();
 		let pool = self.pool.clone();
 		let lifecycle = self.lifecycle.clone();
+		let admission = self.transport_admission.clone();
 		let cluster_domain = cluster_domain.into();
 		let task = tokio::spawn({
 			let lifecycle = lifecycle.clone();
 			async move {
-				serve_dyn_tcp_tls(listener, acceptor, svc, pool, lifecycle, cluster_domain).await
+				serve_dyn_tcp_tls(
+					listener,
+					acceptor,
+					svc,
+					pool,
+					lifecycle,
+					admission,
+					cluster_domain,
+				)
+				.await
 			}
 		});
 		TcpTlsServerHandle { lifecycle, task }
@@ -1577,6 +1610,7 @@ async fn serve_dyn(
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
@@ -1599,11 +1633,12 @@ async fn serve_dyn(
 			self.0.handle_stream(stream, pool, context).await
 		}
 	}
-	serve(
+	serve_with_admission(
 		endpoint,
 		Arc::new(DynService(service)),
 		pool,
 		lifecycle,
+		admission,
 		cluster_domain,
 	)
 	.await
@@ -1615,6 +1650,7 @@ async fn serve_dyn_tcp_tls(
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
@@ -1638,12 +1674,13 @@ async fn serve_dyn_tcp_tls(
 		}
 	}
 
-	serve_tcp_tls(
+	serve_tcp_tls_with_admission(
 		listener,
 		acceptor,
 		Arc::new(DynService(service)),
 		pool,
 		lifecycle,
+		admission,
 		cluster_domain,
 	)
 	.await
@@ -1654,12 +1691,23 @@ fn spawn_quic_server(
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 ) -> QuicServerHandle {
 	let task_endpoint = endpoint.clone();
 	let task = tokio::spawn({
 		let lifecycle = lifecycle.clone();
-		async move { serve_dyn(task_endpoint, service, pool, lifecycle, cluster_domain).await }
+		async move {
+			serve_dyn(
+				task_endpoint,
+				service,
+				pool,
+				lifecycle,
+				admission,
+				cluster_domain,
+			)
+			.await
+		}
 	});
 	QuicServerHandle {
 		endpoint,
@@ -1674,12 +1722,22 @@ fn spawn_tcp_tls_server(
 	service: Arc<dyn HrftService>,
 	pool: Arc<BufPool>,
 	lifecycle: ServerLifecycle,
+	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 ) -> TcpTlsServerHandle {
 	let task = tokio::spawn({
 		let lifecycle = lifecycle.clone();
 		async move {
-			serve_dyn_tcp_tls(listener, acceptor, service, pool, lifecycle, cluster_domain).await
+			serve_dyn_tcp_tls(
+				listener,
+				acceptor,
+				service,
+				pool,
+				lifecycle,
+				admission,
+				cluster_domain,
+			)
+			.await
 		}
 	});
 	TcpTlsServerHandle { lifecycle, task }

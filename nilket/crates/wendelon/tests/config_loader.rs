@@ -58,7 +58,8 @@ slab_max_bytes = 123456
 
 [tuning]
 rf = 3
-io_depth = 128
+wal_io_depth = 128
+slab_io_depth = 128
 
 [identity]
 lease_signing_secret = "{lease_secret}"
@@ -83,7 +84,8 @@ transfer_signing_secret = "{transfer_secret}"
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.slab_max_bytes, 123456);
 	assert_eq!(cfg.rf, 3);
-	assert_eq!(cfg.io_depth, 128);
+	assert_eq!(cfg.wal_io_depth, 128);
+	assert_eq!(cfg.slab_io_depth, 128);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:4701");
 	assert_eq!(cfg.lease_signing_secret, lease_secret);
 	assert_eq!(
@@ -111,6 +113,105 @@ transfer_signing_secret = "{transfer_secret}"
 		cfg.crypto_cache.slab_dek_cache_max_entries,
 		DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES
 	);
+}
+
+#[test]
+fn loads_split_io_depth_tuning() {
+	let root = fresh_dir("split-io-depth");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 43u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4713"
+
+[storage]
+data_dir = "data"
+
+[tuning]
+wal_io_depth = 32
+slab_io_depth = 256
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.wal_io_depth, 32);
+	assert_eq!(cfg.slab_io_depth, 256);
+}
+
+#[test]
+fn loads_transport_admission_tuning() {
+	let root = fresh_dir("transport-admission");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 44u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4714"
+
+[storage]
+data_dir = "data"
+
+[tuning]
+max_inbound_connections = 12
+max_inbound_connections_per_ip = 3
+max_inbound_streams_per_connection = 7
+max_concurrent_stream_tasks = 33
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.transport_admission.max_inbound_connections, 12);
+	assert_eq!(cfg.transport_admission.max_inbound_connections_per_ip, 3);
+	assert_eq!(
+		cfg.transport_admission.max_inbound_streams_per_connection,
+		7
+	);
+	assert_eq!(cfg.transport_admission.max_concurrent_stream_tasks, 33);
 }
 
 #[test]

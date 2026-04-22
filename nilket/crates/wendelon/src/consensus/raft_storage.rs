@@ -88,7 +88,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -404,11 +404,16 @@ impl WendelonLogStore {
 		snapshot_path: impl AsRef<Path>,
 		io: IoRingHandle,
 	) -> std::io::Result<Self> {
+		let file_ops = Arc::new(IoUringFileOps::with_isolated_blocking(
+			io,
+			"wendelon-fs-meta-wal",
+			crate::storage::BlockingIoClass::WalMetadata,
+		)?);
 		Self::open_with_file_ops_and_options(
 			wal_path,
 			vote_path,
 			snapshot_path,
-			Arc::new(IoUringFileOps::new(io)),
+			file_ops,
 			WalOptions::default(),
 		)
 		.await
@@ -1432,6 +1437,28 @@ pub struct SmState {
 	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmissionSnapshot {
+	pub current_epoch: u64,
+	pub e_safe_watermarks: Arc<HashMap<u64, HybridTimestamp>>,
+}
+
+fn admission_snapshot_from_state(state: &SmState) -> Arc<AdmissionSnapshot> {
+	Arc::new(AdmissionSnapshot {
+		current_epoch: state.e_safe_watermarks.keys().copied().max().unwrap_or(0),
+		e_safe_watermarks: Arc::new(state.e_safe_watermarks.clone()),
+	})
+}
+
+fn admission_snapshot_changed(
+	current: &AdmissionSnapshot,
+	state: &SmState,
+	current_epoch: u64,
+) -> bool {
+	current.current_epoch != current_epoch
+		|| current.e_safe_watermarks.as_ref() != &state.e_safe_watermarks
+}
+
 /// Out-of-band observer for [`TieredSlab`] apply events.
 ///
 /// Wendelon's `SlabManager` implements this so every node — not
@@ -1544,8 +1571,8 @@ impl SnapshotRuntime {
 /// This path is intentionally bounded-memory and correctness-first,
 /// not a hot `io_uring`/`O_DIRECT` fast path: under
 /// [`crate::storage::IoUringFileOps`], the plain read/write methods
-/// used here run through `spawn_blocking_io` over cloned file
-/// handles rather than the submission queue.
+/// used here run through the file-op blocking executor over cloned
+/// file handles rather than the submission queue.
 pub struct SnapshotDataFile {
 	path: PathBuf,
 	file_ops: Arc<dyn AsyncFileOps>,
@@ -1843,6 +1870,7 @@ struct SmInner {
 pub struct WendelonStateMachine {
 	inner: Arc<RwLock<SmInner>>,
 	snapshot_runtime: SnapshotRuntime,
+	admission_snapshot: watch::Sender<Arc<AdmissionSnapshot>>,
 	/// Optional callback fired every time a [`TieredSlab`] lands
 	/// in the state. The local `SlabManager` installs one so it
 	/// can unlink the L1 file once the cluster has agreed the
@@ -1863,10 +1891,13 @@ pub struct WendelonStateMachine {
 
 impl WendelonStateMachine {
 	pub fn new() -> Self {
+		let (admission_snapshot, _) =
+			watch::channel(admission_snapshot_from_state(&SmState::default()));
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
+			admission_snapshot,
 			tier_observer: None,
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
@@ -1922,9 +1953,11 @@ impl WendelonStateMachine {
 			});
 		}
 
+		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
 			snapshot_runtime,
+			admission_snapshot,
 			tier_observer: None,
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
@@ -1970,6 +2003,26 @@ impl WendelonStateMachine {
 		self.finalization_events.subscribe()
 	}
 
+	pub fn subscribe_admission_snapshot(&self) -> watch::Receiver<Arc<AdmissionSnapshot>> {
+		self.admission_snapshot.subscribe()
+	}
+
+	pub fn current_admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
+		self.admission_snapshot.borrow().clone()
+	}
+
+	fn publish_admission_snapshot_if_changed(&self, state: &SmState) {
+		let current_epoch = state.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+		let should_publish = {
+			let current = self.admission_snapshot.borrow();
+			admission_snapshot_changed(&current, state, current_epoch)
+		};
+		if should_publish {
+			self.admission_snapshot
+				.send_replace(admission_snapshot_from_state(state));
+		}
+	}
+
 	/// Test / caller inspection hook — return a cloned snapshot
 	/// of the applied state without driving a full snapshot
 	/// build round-trip.
@@ -2000,6 +2053,7 @@ impl WendelonStateMachine {
 	pub async fn seed_e_safe_for_test(&self, epoch: u64, hlc: HybridTimestamp) {
 		let mut guard = self.inner.write().await;
 		guard.state.e_safe_watermarks.insert(epoch, hlc);
+		self.publish_admission_snapshot_if_changed(&guard.state);
 	}
 
 	/// Test-only hook to seed a Migration Ledger entry without
@@ -2107,8 +2161,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 				out.push(resp);
 			}
+			// Publish under the apply lock so watch observers cannot
+			// observe snapshots out of order relative to apply order.
+			self.publish_admission_snapshot_if_changed(&guard.state);
 			checkpoint_observation_from_state(&guard.state, false)
 		};
+		let pending_checkpoint = pending_checkpoint;
 		if let Some(materializer) = self.audit_materializer.as_ref() {
 			for event in pending_audit_events {
 				let _ = materializer.emit(event);
@@ -2309,8 +2367,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				meta: meta.clone(),
 				path: self.snapshot_runtime.paths.current.clone(),
 			});
+			// Publish under the state lock so install-snapshot updates
+			// stay monotonic for admission-snapshot observers.
+			self.publish_admission_snapshot_if_changed(&guard.state);
 			checkpoint_observation_from_state(&guard.state, true)
 		};
+		let pending_checkpoint = pending_checkpoint;
 		if let (Some(observer), Some(observation)) =
 			(self.checkpoint_observer.as_ref(), pending_checkpoint)
 		{
@@ -4334,6 +4396,14 @@ mod recovery_tests {
 	}
 
 	fn finalize_entry(index: u64, physical_ms: u64) -> Entry<WendelonTypeConfig> {
+		finalize_entry_for_epoch(index, 1, physical_ms)
+	}
+
+	fn finalize_entry_for_epoch(
+		index: u64,
+		epoch: u64,
+		physical_ms: u64,
+	) -> Entry<WendelonTypeConfig> {
 		Entry {
 			log_id: log_id(1, index),
 			payload: EntryPayload::Normal(WendelonRequest::Finalize(
@@ -4341,7 +4411,7 @@ mod recovery_tests {
 					marker: FinalizationMarker {
 						log_index: index,
 						term: 1,
-						epoch: 1,
+						epoch,
 						commit_hlc: HybridTimestamp {
 							physical_ms,
 							logical: 0,
@@ -4925,6 +4995,85 @@ mod recovery_tests {
 		let state = reopened_sm.state_snapshot().await;
 		assert_eq!(state.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(state.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn admission_snapshot_watch_remains_monotonic_across_apply_and_snapshot_install() {
+		let target_dir = tempdir("admission-snapshot-monotonic-target");
+		let mut target_store = open_store(&target_dir).await;
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		let mut snapshots = target_sm.subscribe_admission_snapshot();
+
+		append_and_apply(&mut target_store, &mut target_sm, finalize_entry(1, 111)).await;
+		snapshots.changed().await.unwrap();
+		let after_apply = snapshots.borrow().clone();
+		assert_eq!(after_apply.current_epoch, 1);
+		assert_eq!(
+			after_apply.e_safe_watermarks.get(&1).copied(),
+			Some(HybridTimestamp {
+				physical_ms: 111,
+				logical: 0,
+				node_id: 1,
+			})
+		);
+
+		let source_dir = tempdir("admission-snapshot-monotonic-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		append_and_apply(&mut source_store, &mut source_sm, finalize_entry(1, 111)).await;
+		append_and_apply(
+			&mut source_store,
+			&mut source_sm,
+			finalize_entry_for_epoch(2, 2, 222),
+		)
+		.await;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let meta = built.meta.clone();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+		snapshots.changed().await.unwrap();
+		let after_install = snapshots.borrow().clone();
+		assert!(after_install.current_epoch >= after_apply.current_epoch);
+		for (epoch, watermark) in after_apply.e_safe_watermarks.iter() {
+			if let Some(next) = after_install.e_safe_watermarks.get(epoch) {
+				assert!(next >= watermark);
+			}
+		}
+		assert_eq!(
+			after_install.e_safe_watermarks.get(&2).copied(),
+			Some(HybridTimestamp {
+				physical_ms: 222,
+				logical: 0,
+				node_id: 1,
+			})
+		);
+	}
+
+	#[tokio::test]
+	async fn admission_snapshot_watch_does_not_wake_for_unrelated_apply() {
+		let dir = tempdir("admission-snapshot-noop");
+		let mut store = open_store(&dir).await;
+		let mut sm = store.recovered_state_machine().await.unwrap();
+		let mut snapshots = sm.subscribe_admission_snapshot();
+
+		append_and_apply(&mut store, &mut sm, lease_entry(1, 0, 9, 7)).await;
+
+		let changed =
+			tokio::time::timeout(std::time::Duration::from_millis(50), snapshots.changed()).await;
+		assert!(
+			changed.is_err(),
+			"lease-only apply should not publish a new admission snapshot"
+		);
 	}
 
 	#[tokio::test]

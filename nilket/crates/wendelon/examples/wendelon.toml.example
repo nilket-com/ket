@@ -24,7 +24,8 @@ slab_max_bytes = {{SLAB_MAX_BYTES}}
 
 [tuning]
 rf = {{RF}}
-io_depth = {{IO_DEPTH}}
+wal_io_depth = {{WAL_IO_DEPTH}}
+slab_io_depth = {{SLAB_IO_DEPTH}}
 
 [identity]
 lease_signing_secret = "{{LEASE_SIGNING_SECRET}}"

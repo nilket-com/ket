@@ -69,3 +69,7 @@ harness = false
 [[bench]]
 name = "slab_crypto"
 harness = false
+
+[[bench]]
+name = "io_topology"
+harness = false

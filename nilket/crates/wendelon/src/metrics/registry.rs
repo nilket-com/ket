@@ -129,6 +129,12 @@ pub struct MetricsRegistry {
 	pub quic_handshake_failures_transport_total: Counter,
 	pub quic_handshake_failures_identity_total: Counter,
 	pub quic_handshake_failures_authorization_total: Counter,
+	pub transport_admission_rejections_connection_limit_total: Counter,
+	pub transport_admission_rejections_connection_per_ip_limit_total: Counter,
+	pub transport_admission_rejections_stream_limit_total: Counter,
+	pub transport_admission_rejections_task_limit_total: Counter,
+	pub transport_active_connections: Gauge,
+	pub transport_active_stream_handlers: Gauge,
 
 	pub data_ring_write_requests_total: Counter,
 	pub data_ring_read_requests_total: Counter,
@@ -139,6 +145,10 @@ pub struct MetricsRegistry {
 	pub data_ring_lease_denials_total: Counter,
 	pub data_ring_lease_errors_total: Counter,
 	pub data_ring_lease_cache_entries: Gauge,
+	pub data_ring_backpressure_rejections_tenant_total: Counter,
+	pub data_ring_backpressure_rejections_actor_total: Counter,
+	pub data_ring_backpressure_active_tenant_requests: Gauge,
+	pub data_ring_backpressure_active_actor_requests: Gauge,
 
 	pub group_commit_window_seconds: Histogram,
 	pub l1_read_latency_seconds: Histogram,
@@ -151,6 +161,8 @@ pub struct MetricsRegistry {
 	pub storage_tiering_failures_total: Counter,
 	pub storage_tiering_skipped_small_total: Counter,
 	pub storage_tiering_skipped_already_tiered_total: Counter,
+	pub storage_wal_blocking_queue_depth: Gauge,
+	pub storage_slab_blocking_queue_depth: Gauge,
 	pub storage_rehydration_guard_skips_total: Counter,
 	pub storage_rehydrated_reclaims_total: Counter,
 	pub storage_migration_reclaimed_slabs_total: Counter,
@@ -195,6 +207,12 @@ impl Default for MetricsRegistry {
 			quic_handshake_failures_transport_total: Counter::default(),
 			quic_handshake_failures_identity_total: Counter::default(),
 			quic_handshake_failures_authorization_total: Counter::default(),
+			transport_admission_rejections_connection_limit_total: Counter::default(),
+			transport_admission_rejections_connection_per_ip_limit_total: Counter::default(),
+			transport_admission_rejections_stream_limit_total: Counter::default(),
+			transport_admission_rejections_task_limit_total: Counter::default(),
+			transport_active_connections: Gauge::default(),
+			transport_active_stream_handlers: Gauge::default(),
 
 			data_ring_write_requests_total: Counter::default(),
 			data_ring_read_requests_total: Counter::default(),
@@ -205,6 +223,10 @@ impl Default for MetricsRegistry {
 			data_ring_lease_denials_total: Counter::default(),
 			data_ring_lease_errors_total: Counter::default(),
 			data_ring_lease_cache_entries: Gauge::default(),
+			data_ring_backpressure_rejections_tenant_total: Counter::default(),
+			data_ring_backpressure_rejections_actor_total: Counter::default(),
+			data_ring_backpressure_active_tenant_requests: Gauge::default(),
+			data_ring_backpressure_active_actor_requests: Gauge::default(),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			l1_read_latency_seconds: Histogram::new(LOCAL_READ_LATENCY_BUCKETS_MICROS),
@@ -217,6 +239,8 @@ impl Default for MetricsRegistry {
 			storage_tiering_failures_total: Counter::default(),
 			storage_tiering_skipped_small_total: Counter::default(),
 			storage_tiering_skipped_already_tiered_total: Counter::default(),
+			storage_wal_blocking_queue_depth: Gauge::default(),
+			storage_slab_blocking_queue_depth: Gauge::default(),
 			storage_rehydration_guard_skips_total: Counter::default(),
 			storage_rehydrated_reclaims_total: Counter::default(),
 			storage_migration_reclaimed_slabs_total: Counter::default(),
@@ -365,6 +389,49 @@ impl MetricsRegistry {
 			&[("reason", "authorization")],
 			self.quic_handshake_failures_authorization_total.get(),
 		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_transport_admission_rejections_total",
+			"Inbound transport requests rejected by server-side admission control before handler execution.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_transport_admission_rejections_total",
+			&[("reason", "connection_limit")],
+			self.transport_admission_rejections_connection_limit_total
+				.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_transport_admission_rejections_total",
+			&[("reason", "connection_per_ip_limit")],
+			self.transport_admission_rejections_connection_per_ip_limit_total
+				.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_transport_admission_rejections_total",
+			&[("reason", "stream_limit")],
+			self.transport_admission_rejections_stream_limit_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_transport_admission_rejections_total",
+			&[("reason", "task_limit")],
+			self.transport_admission_rejections_task_limit_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_transport_active_connections",
+			"Inbound transport connections currently admitted by the server listener.",
+			self.transport_active_connections.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_transport_active_stream_handlers",
+			"Inbound stream handler tasks currently admitted by the transport server.",
+			self.transport_active_stream_handlers.get(),
+		);
 		render_counter(
 			&mut out,
 			"wendelon_data_ring_write_requests_total",
@@ -418,6 +485,35 @@ impl MetricsRegistry {
 			"wendelon_data_ring_lease_cache_entries",
 			"Lease descriptors currently cached by the local Data Ring.",
 			self.data_ring_lease_cache_entries.get(),
+		);
+		render_counter_family_header(
+			&mut out,
+			"wendelon_data_ring_backpressure_rejections_total",
+			"Post-auth Data Ring requests rejected by bounded per-principal admission control.",
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_data_ring_backpressure_rejections_total",
+			&[("scope", "tenant")],
+			self.data_ring_backpressure_rejections_tenant_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_data_ring_backpressure_rejections_total",
+			&[("scope", "actor")],
+			self.data_ring_backpressure_rejections_actor_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_data_ring_backpressure_active_tenant_requests",
+			"Tenant-scoped Data Ring requests currently admitted by post-auth backpressure control.",
+			self.data_ring_backpressure_active_tenant_requests.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_data_ring_backpressure_active_actor_requests",
+			"Actor-scoped Data Ring requests currently admitted by post-auth backpressure control.",
+			self.data_ring_backpressure_active_actor_requests.get(),
 		);
 		render_histogram(
 			&mut out,
@@ -478,6 +574,18 @@ impl MetricsRegistry {
 			"wendelon_storage_tiering_skipped_already_tiered_total",
 			"Sealed slabs skipped because the tier pivot was already applied.",
 			self.storage_tiering_skipped_already_tiered_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_wal_blocking_queue_depth",
+			"Queued WAL/control metadata file operations waiting on the isolated blocking executor.",
+			self.storage_wal_blocking_queue_depth.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_slab_blocking_queue_depth",
+			"Queued slab metadata file operations waiting on the isolated blocking executor.",
+			self.storage_slab_blocking_queue_depth.get(),
 		);
 		render_counter(
 			&mut out,

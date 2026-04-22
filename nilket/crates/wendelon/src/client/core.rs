@@ -81,6 +81,8 @@ pub const MIGRATION_RETRY_BACKOFF: Duration = Duration::from_millis(75);
 pub const FINALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(40);
 /// Small pause before retrying a topology/lease readiness miss.
 pub const LEASE_REFRESH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+/// Small pause before retrying a bounded post-auth admission miss.
+pub const BACKPRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
 
 // ============================================================
 //  CONFIG
@@ -342,6 +344,15 @@ impl RetryDirective {
 			preferred_target,
 			backoff: Some(LEASE_REFRESH_RETRY_BACKOFF),
 			refresh_topology: true,
+			migration_incomplete: false,
+		}
+	}
+
+	fn backpressure(preferred_target: Option<NodeId>) -> Self {
+		Self {
+			preferred_target,
+			backoff: Some(BACKPRESSURE_RETRY_BACKOFF),
+			refresh_topology: false,
 			migration_incomplete: false,
 		}
 	}
@@ -977,6 +988,9 @@ fn retry_write_response(response: &WriteResponseMeta) -> Option<RetryDirective> 
 		s if s == WriteStatus::FINALIZATION_PENDING => Some(RetryDirective::finalization_pending(
 			nonzero_node_id(response.leader_hint),
 		)),
+		s if s == WriteStatus::BACKPRESSURED => Some(RetryDirective::backpressure(
+			nonzero_node_id(response.leader_hint),
+		)),
 		_ => None,
 	}
 }
@@ -995,6 +1009,9 @@ fn retry_read_status(status: ReadStatus, leader_hint: NodeId) -> Option<RetryDir
 		}
 		s if s == ReadStatus::E_SAFE_BEHIND => {
 			Some(RetryDirective::e_safe(nonzero_node_id(leader_hint)))
+		}
+		s if s == ReadStatus::BACKPRESSURED => {
+			Some(RetryDirective::backpressure(nonzero_node_id(leader_hint)))
 		}
 		s if s == ReadStatus::MIGRATION_INCOMPLETE => Some(RetryDirective::migration_incomplete()),
 		_ => None,
@@ -1479,6 +1496,39 @@ mod tests {
 	}
 
 	#[test]
+	fn retry_write_status_treats_backpressure_as_retryable_without_refresh() {
+		let response = WriteResponseMeta {
+			status: WriteStatus::BACKPRESSURED,
+			_pad1: [0; 7],
+			log_index: 0,
+			term: 0,
+			epoch: 11,
+			commit_hlc: HybridTimestamp {
+				physical_ms: 123,
+				logical: 4,
+				node_id: 7,
+			},
+			leader_hint: NodeId {
+				id: 0,
+				_reserved: 0,
+			},
+			echoed_write_id: ClientWriteId {
+				client_uuid: [0xAB; 16],
+				sequence_no: 9,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			has_finalization: 0,
+			_pad2: [0; 7],
+		};
+
+		let retry = retry_write_response(&response).expect("status must be retryable");
+		assert_eq!(retry.preferred_target, None);
+		assert_eq!(retry.backoff, Some(BACKPRESSURE_RETRY_BACKOFF));
+		assert!(!retry.refresh_topology);
+	}
+
+	#[test]
 	fn retry_read_status_treats_lease_gate_failures_as_retryable() {
 		let leader = NodeId {
 			id: 7,
@@ -1493,6 +1543,19 @@ mod tests {
 			assert_eq!(retry.backoff, Some(LEASE_REFRESH_RETRY_BACKOFF));
 			assert!(retry.refresh_topology);
 		}
+	}
+
+	#[test]
+	fn retry_read_status_treats_backpressure_as_retryable_without_refresh() {
+		let zero = NodeId {
+			id: 0,
+			_reserved: 0,
+		};
+		let retry =
+			retry_read_status(ReadStatus::BACKPRESSURED, zero).expect("status must be retryable");
+		assert_eq!(retry.preferred_target, None);
+		assert_eq!(retry.backoff, Some(BACKPRESSURE_RETRY_BACKOFF));
+		assert!(!retry.refresh_topology);
 	}
 
 	#[test]

@@ -58,7 +58,9 @@ use crate::storage::index::{
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
-use crate::storage::{AsyncFileOps, BlockingFileOps, IoUringFileOps, OpenFlags, write_file};
+use crate::storage::{
+	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, OpenFlags, write_file,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -80,6 +82,32 @@ const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
 const MIN_L2_TAIL_READ_WINDOW_BYTES: u64 = 256 + 16;
 const IDENTITY_MAX: Identity = Identity::new([0xFF; 32]);
 
+fn recover_rwlock_read<'a, T>(
+	lock: &'a RwLock<T>,
+	name: &'static str,
+) -> std::sync::RwLockReadGuard<'a, T> {
+	match lock.read() {
+		Ok(guard) => guard,
+		Err(poisoned) => {
+			tracing::error!(lock = name, "recovering poisoned rwlock read guard");
+			poisoned.into_inner()
+		}
+	}
+}
+
+fn recover_rwlock_write<'a, T>(
+	lock: &'a RwLock<T>,
+	name: &'static str,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+	match lock.write() {
+		Ok(guard) => guard,
+		Err(poisoned) => {
+			tracing::error!(lock = name, "recovering poisoned rwlock write guard");
+			poisoned.into_inner()
+		}
+	}
+}
+
 /// Construction parameters for [`SlabManager`].
 pub struct SlabManagerConfig {
 	/// Directory that will hold `slab_<id>.wnd` files.
@@ -87,8 +115,8 @@ pub struct SlabManagerConfig {
 	/// Size threshold at which the active slab is sealed and a new
 	/// one is opened. Measured against [`LocalSlabStore::write_cursor`].
 	pub max_slab_bytes: u64,
-	/// Submission handle for the shared `io_uring` thread. Cloned
-	/// into every slab the manager opens.
+	/// Submission handle for the dedicated slab-storage `io_uring`
+	/// worker. Cloned into every slab the manager opens.
 	pub io: IoRingHandle,
 	/// Optional L2 object store used by the read path when a slab
 	/// has been tiered out of L1. If `None`, the manager refuses
@@ -382,19 +410,14 @@ impl SlabManager {
 	}
 
 	fn insert_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
-		self.locality_index
-			.write()
-			.expect("locality index lock poisoned")
+		recover_rwlock_write(&self.locality_index, "locality_index")
 			.entry(tenant_id)
 			.or_default()
 			.insert((Locality::from(key_identity), key_identity));
 	}
 
 	fn remove_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
-		let mut locality_index = self
-			.locality_index
-			.write()
-			.expect("locality index lock poisoned");
+		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
 		let should_remove_tenant = if let Some(members) = locality_index.get_mut(&tenant_id) {
 			members.remove(&(Locality::from(key_identity), key_identity));
 			members.is_empty()
@@ -505,7 +528,11 @@ impl SlabManager {
 			));
 		}
 
-		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::new(config.io.clone()));
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::with_isolated_blocking(
+			config.io.clone(),
+			"wendelon-fs-meta-slab",
+			BlockingIoClass::SlabMetadata,
+		)?);
 		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
 		existing_ids.sort_unstable();
@@ -1580,9 +1607,7 @@ impl SlabManager {
 		start_locality: Locality,
 		end_locality: Locality,
 	) -> Vec<(Locality, Identity)> {
-		self.locality_index
-			.read()
-			.expect("locality index lock poisoned")
+		recover_rwlock_read(&self.locality_index, "locality_index")
 			.get(&tenant_id)
 			.map(|members| {
 				members
@@ -1598,10 +1623,7 @@ impl SlabManager {
 		start_locality: Locality,
 		end_locality: Locality,
 	) -> Vec<(TenantId, Locality, Identity)> {
-		let locality_index = self
-			.locality_index
-			.read()
-			.expect("locality index lock poisoned");
+		let locality_index = recover_rwlock_read(&self.locality_index, "locality_index");
 		let mut out = Vec::new();
 		for (tenant_id, members) in locality_index.iter() {
 			out.extend(
@@ -2955,6 +2977,28 @@ mod tests {
 		state.sealed.insert(sealed_id, sealed);
 		state.next_slab_id = next_id.saturating_add(1);
 		sealed_id
+	}
+
+	#[tokio::test]
+	async fn locality_candidates_recover_after_index_lock_poison() {
+		let manager = fresh_manager().await;
+		let key = id(0x4242);
+		let locality = Locality::from(key);
+		manager
+			.append_durable(tenant(), key, hlc(10), b"v1")
+			.await
+			.unwrap();
+
+		let locality_index = &manager.locality_index;
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+			let _guard = locality_index.write().unwrap();
+			panic!("poison locality index");
+		}));
+
+		assert_eq!(
+			manager.locality_candidates_for_tenant(tenant(), locality, locality),
+			vec![(locality, key)]
+		);
 	}
 
 	#[tokio::test]

@@ -1,10 +1,10 @@
-//! Tier 2 (`TcpTls`) transport provider.
+//! Optional TCP+TLS compatibility transport provider.
 //!
-//! The fallback path uses one TLS 1.3 TCP socket per logical HRFT
-//! stream. That is deliberately less ambitious than QUIC's
-//! multiplexed session model, but it preserves the higher-level
-//! transport abstraction and gives ADR 011 a concrete compatibility
-//! tier today.
+//! This path uses one TLS 1.3 TCP socket per logical HRFT stream.
+//! It is deliberately less ambitious than QUIC's multiplexed
+//! session model and is not the primary transport support claim.
+//! Its job is to preserve the transport seam and provide an
+//! explicit compatibility path where operators choose to wire it.
 
 use crate::network::quic_transport::ServerNameResolver;
 use crate::network::tls::{

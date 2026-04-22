@@ -12,10 +12,11 @@ use uuid::Uuid;
 use wendelon::audit::AuditSinksConfig;
 use wendelon::network::{
 	ActorRole, BufPool, EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet,
-	PeerCapabilities, QuicTransportProvider, TcpTlsTransportProvider, TlsMaterial,
-	TransportConnection, TransportProvider, TransportProviderFactory, TransportTier,
-	TransportTierSet, canonical_node_dns_name, canonical_server_name_resolver, endpoint_from_tls,
-	read_frame, rustls_client_config, verified_transport_peer, write_frame,
+	PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
+	TcpTlsTransportProvider, TlsMaterial, TransportConnection, TransportProvider,
+	TransportProviderFactory, TransportTier, TransportTierSet, UnroutedService,
+	canonical_node_dns_name, canonical_server_name_resolver, endpoint_from_tls, read_frame,
+	rustls_client_config, serve_with_admission, verified_transport_peer, write_frame,
 };
 use wendelon::node::{
 	ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, TransportTlsConfig, WendelonNode,
@@ -89,7 +90,8 @@ fn bootstrap_cfg(
 		slab_max_bytes: 64 * 1024 * 1024,
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		rf,
-		io_depth: 64,
+		wal_io_depth: 64,
+		slab_io_depth: 64,
 		advertise_address,
 		lease_signing_secret,
 		trusted_lease_signers,
@@ -109,6 +111,7 @@ fn bootstrap_cfg(
 			operator_ca_path: operator_ca_path.to_path_buf(),
 			cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
 		}),
+		transport_admission: wendelon::network::ServerAdmissionConfig::default(),
 		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
 		mvcc_retention_policy: wendelon::storage::MvccRetentionPolicy::Disabled,
 		observability: None,
@@ -218,6 +221,66 @@ async fn quic_provider_dials_and_verifies_peer_identity() {
 
 	client_endpoint.close(0u32.into(), b"done");
 	server_endpoint.close(0u32.into(), b"done");
+	client_endpoint.wait_idle().await;
+	server_endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn quic_accept_loop_refuses_connections_over_limit() {
+	let root = fresh_dir("accept-loop-connection-limit");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let client_material =
+		TlsMaterial::load(&pki.data_client_cert, &pki.data_client_key, &pki.ca_cert).unwrap();
+	let server_endpoint =
+		endpoint_from_tls(&server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let client_endpoint =
+		endpoint_from_tls(&client_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let server_addr = server_endpoint.local_addr().unwrap();
+	let lifecycle = ServerLifecycle::new();
+	let server = tokio::spawn({
+		let server_endpoint = server_endpoint.clone();
+		let lifecycle = lifecycle.clone();
+		async move {
+			serve_with_admission(
+				server_endpoint,
+				Arc::new(UnroutedService),
+				BufPool::new(8, 1024),
+				lifecycle,
+				ServerAdmissionConfig {
+					max_inbound_connections: 1,
+					max_inbound_connections_per_ip: 4,
+					max_inbound_streams_per_connection: 8,
+					max_concurrent_stream_tasks: 16,
+				},
+				tls_pki::CLUSTER_DOMAIN,
+			)
+			.await
+			.unwrap();
+		}
+	});
+
+	let server_name = canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN);
+	let first = client_endpoint
+		.connect(server_addr, &server_name)
+		.unwrap()
+		.await
+		.unwrap();
+	let second = client_endpoint
+		.connect(server_addr, &server_name)
+		.unwrap()
+		.await;
+	assert!(
+		second.is_err(),
+		"second connection should be refused once the listener-level connection cap is full"
+	);
+
+	first.close(0u32.into(), b"done");
+	lifecycle.begin_drain();
+	client_endpoint.close(0u32.into(), b"done");
+	server_endpoint.close(0u32.into(), b"done");
+	server.await.unwrap();
 	client_endpoint.wait_idle().await;
 	server_endpoint.wait_idle().await;
 }

@@ -41,9 +41,9 @@ use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAu
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
-	HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry, MigrationState,
-	TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse,
-	WendelonStateMachine,
+	AdmissionSnapshot, HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry,
+	MigrationState, TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest,
+	WendelonResponse, WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
@@ -91,6 +91,7 @@ use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
@@ -420,6 +421,108 @@ impl Drop for TenantWriteReservation {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataRequestBackpressureConfig {
+	pub max_tenant_concurrent_requests: u32,
+	pub max_actor_concurrent_requests: u32,
+}
+
+impl Default for DataRequestBackpressureConfig {
+	fn default() -> Self {
+		Self {
+			max_tenant_concurrent_requests: 16,
+			max_actor_concurrent_requests: 8,
+		}
+	}
+}
+
+impl DataRequestBackpressureConfig {
+	pub fn validate(&self) -> std::io::Result<()> {
+		if self.max_tenant_concurrent_requests == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"data_request_backpressure.max_tenant_concurrent_requests must be greater than zero",
+			));
+		}
+		if self.max_actor_concurrent_requests == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"data_request_backpressure.max_actor_concurrent_requests must be greater than zero",
+			));
+		}
+		Ok(())
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ActorRequestKey {
+	role: ActorRole,
+	key_id: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackpressureScope {
+	Tenant,
+	Actor,
+}
+
+struct TenantRequestReservation {
+	inflight: Arc<DashMap<TenantId, u32>>,
+	active_requests: Arc<AtomicU64>,
+	tenant_id: TenantId,
+	active: bool,
+}
+
+impl Drop for TenantRequestReservation {
+	fn drop(&mut self) {
+		if !self.active {
+			return;
+		}
+		if let Some(mut entry) = self.inflight.get_mut(&self.tenant_id) {
+			*entry = entry.saturating_sub(1);
+			if *entry == 0 {
+				drop(entry);
+				self.inflight.remove(&self.tenant_id);
+			}
+		}
+		let next = self.active_requests.fetch_sub(1, Ordering::Relaxed) - 1;
+		metrics()
+			.data_ring_backpressure_active_tenant_requests
+			.set(next);
+	}
+}
+
+struct ActorRequestReservation {
+	inflight: Arc<DashMap<ActorRequestKey, u32>>,
+	active_requests: Arc<AtomicU64>,
+	key: ActorRequestKey,
+	active: bool,
+}
+
+impl Drop for ActorRequestReservation {
+	fn drop(&mut self) {
+		if !self.active {
+			return;
+		}
+		if let Some(mut entry) = self.inflight.get_mut(&self.key) {
+			*entry = entry.saturating_sub(1);
+			if *entry == 0 {
+				drop(entry);
+				self.inflight.remove(&self.key);
+			}
+		}
+		let next = self.active_requests.fetch_sub(1, Ordering::Relaxed) - 1;
+		metrics()
+			.data_ring_backpressure_active_actor_requests
+			.set(next);
+	}
+}
+
+struct DataRequestAdmission {
+	_tenant: Option<TenantRequestReservation>,
+	_actor: Option<ActorRequestReservation>,
+}
+
 // ============================================================
 //  REPLICA ROUTER
 // ============================================================
@@ -502,6 +605,9 @@ pub struct WendelonDataServer {
 	/// watermark for the epoch the client is asking against; also
 	/// hints the "current epoch" for write-side validation.
 	state_machine: WendelonStateMachine,
+	/// Hot-path admission view published from the state machine so
+	/// request gating does not clone the full `SmState`.
+	admission_snapshot_rx: watch::Receiver<Arc<AdmissionSnapshot>>,
 	/// Local node identity, populated into every response's
 	/// `leader_hint` and used to decide whether the local slab
 	/// append counts toward quorum on a given key.
@@ -599,6 +705,15 @@ pub struct WendelonDataServer {
 	/// In-flight write reservations per tenant. This keeps quota
 	/// overshoot bounded between reconciliation passes.
 	tenant_inflight: Arc<DashMap<TenantId, TenantInflight>>,
+	/// Hard per-tenant request admission after authentication.
+	tenant_request_inflight: Arc<DashMap<TenantId, u32>>,
+	/// Hard per-actor request admission for cross-tenant or
+	/// operator-style traffic.
+	actor_request_inflight: Arc<DashMap<ActorRequestKey, u32>>,
+	max_tenant_concurrent_requests: Arc<AtomicU32>,
+	max_actor_concurrent_requests: Arc<AtomicU32>,
+	active_tenant_requests: Arc<AtomicU64>,
+	active_actor_requests: Arc<AtomicU64>,
 	tenant_cache_refresh_interval: Duration,
 	/// Max records per `RANGE_PAGE` pull. Defaults to
 	/// [`DEFAULT_PAGE_MAX_RECORDS`]; tests shrink it so a paging
@@ -652,6 +767,32 @@ fn local_persistence_distrust_path(dir: &std::path::Path) -> PathBuf {
 	dir.join(LOCAL_PERSISTENCE_DISTRUST_FILE)
 }
 
+fn recover_rwlock_read<'a, T>(
+	lock: &'a RwLock<T>,
+	name: &'static str,
+) -> std::sync::RwLockReadGuard<'a, T> {
+	match lock.read() {
+		Ok(guard) => guard,
+		Err(poisoned) => {
+			tracing::error!(lock = name, "recovering poisoned rwlock read guard");
+			poisoned.into_inner()
+		}
+	}
+}
+
+fn recover_rwlock_write<'a, T>(
+	lock: &'a RwLock<T>,
+	name: &'static str,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+	match lock.write() {
+		Ok(guard) => guard,
+		Err(poisoned) => {
+			tracing::error!(lock = name, "recovering poisoned rwlock write guard");
+			poisoned.into_inner()
+		}
+	}
+}
+
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
 		Self {
@@ -659,6 +800,7 @@ impl Clone for WendelonDataServer {
 			raft: self.raft.clone(),
 			log_store: self.log_store.clone(),
 			state_machine: self.state_machine.clone(),
+			admission_snapshot_rx: self.admission_snapshot_rx.clone(),
 			local_node: self.local_node,
 			clock: self.clock.clone(),
 			audit_sink: self.audit_sink.clone(),
@@ -684,6 +826,12 @@ impl Clone for WendelonDataServer {
 			migration_registry: self.migration_registry.clone(),
 			tenant_policy_cache: self.tenant_policy_cache.clone(),
 			tenant_inflight: self.tenant_inflight.clone(),
+			tenant_request_inflight: self.tenant_request_inflight.clone(),
+			actor_request_inflight: self.actor_request_inflight.clone(),
+			max_tenant_concurrent_requests: self.max_tenant_concurrent_requests.clone(),
+			max_actor_concurrent_requests: self.max_actor_concurrent_requests.clone(),
+			active_tenant_requests: self.active_tenant_requests.clone(),
+			active_actor_requests: self.active_actor_requests.clone(),
 			tenant_cache_refresh_interval: self.tenant_cache_refresh_interval,
 			page_max_records: self.page_max_records.clone(),
 			page_max_bytes: self.page_max_bytes.clone(),
@@ -692,6 +840,10 @@ impl Clone for WendelonDataServer {
 }
 
 impl WendelonDataServer {
+	fn admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
+		self.admission_snapshot_rx.borrow().clone()
+	}
+
 	fn apply_local_persistence_runtime_fence(&self) {
 		let runtime = self.raft.runtime_config();
 		runtime.heartbeat(false);
@@ -713,6 +865,7 @@ impl WendelonDataServer {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let pending_finalizations =
 			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
+		let admission_snapshot_rx = state_machine.subscribe_admission_snapshot();
 		let local_persistence_distrust_path = local_persistence_distrust_path(slab.data_dir());
 		let local_persistence_distrust_reason = if local_persistence_distrust_path.exists() {
 			Some(LOCAL_PERSISTENCE_DISTRUST_REASON.to_string())
@@ -724,6 +877,7 @@ impl WendelonDataServer {
 			raft,
 			log_store,
 			state_machine,
+			admission_snapshot_rx,
 			local_node,
 			clock,
 			audit_sink: Arc::new(NoopAuditSink),
@@ -751,6 +905,16 @@ impl WendelonDataServer {
 			migration_registry: Arc::new(MigrationRegistry::new()),
 			tenant_policy_cache: Arc::new(RwLock::new(TenantPolicyCacheState::default())),
 			tenant_inflight: Arc::new(DashMap::new()),
+			tenant_request_inflight: Arc::new(DashMap::new()),
+			actor_request_inflight: Arc::new(DashMap::new()),
+			max_tenant_concurrent_requests: Arc::new(AtomicU32::new(
+				DataRequestBackpressureConfig::default().max_tenant_concurrent_requests,
+			)),
+			max_actor_concurrent_requests: Arc::new(AtomicU32::new(
+				DataRequestBackpressureConfig::default().max_actor_concurrent_requests,
+			)),
+			active_tenant_requests: Arc::new(AtomicU64::new(0)),
+			active_actor_requests: Arc::new(AtomicU64::new(0)),
 			tenant_cache_refresh_interval: DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
@@ -824,11 +988,34 @@ impl WendelonDataServer {
 		self
 	}
 
+	pub fn with_request_backpressure(
+		self,
+		config: DataRequestBackpressureConfig,
+	) -> std::io::Result<Self> {
+		config.validate()?;
+		self.max_tenant_concurrent_requests
+			.store(config.max_tenant_concurrent_requests, Ordering::Relaxed);
+		self.max_actor_concurrent_requests
+			.store(config.max_actor_concurrent_requests, Ordering::Relaxed);
+		Ok(self)
+	}
+
+	#[cfg(test)]
+	pub fn set_request_backpressure_limits_for_test(&self, tenant_max: u32, actor_max: u32) {
+		assert!(tenant_max > 0);
+		assert!(actor_max > 0);
+		self.max_tenant_concurrent_requests
+			.store(tenant_max, Ordering::Relaxed);
+		self.max_actor_concurrent_requests
+			.store(actor_max, Ordering::Relaxed);
+	}
+
 	pub fn degraded_reason(&self) -> Option<String> {
-		self.local_persistence_distrust_reason
-			.read()
-			.expect("local persistence distrust lock poisoned")
-			.clone()
+		recover_rwlock_read(
+			&self.local_persistence_distrust_reason,
+			"local_persistence_distrust_reason",
+		)
+		.clone()
 	}
 
 	async fn persist_local_persistence_distrust_marker(
@@ -848,10 +1035,10 @@ impl WendelonDataServer {
 	async fn trip_local_persistence_distrust(&self, detail: impl Into<String>) {
 		let detail = detail.into();
 		let tripped = {
-			let mut guard = self
-				.local_persistence_distrust_reason
-				.write()
-				.expect("local persistence distrust lock poisoned");
+			let mut guard = recover_rwlock_write(
+				&self.local_persistence_distrust_reason,
+				"local_persistence_distrust_reason",
+			);
 			if guard.is_some() {
 				false
 			} else {
@@ -983,10 +1170,7 @@ impl WendelonDataServer {
 
 	pub async fn sync_tenant_policy_cache_once(&self) -> usize {
 		let snapshot = self.state_machine.state_snapshot().await;
-		let mut guard = self
-			.tenant_policy_cache
-			.write()
-			.expect("tenant policy cache poisoned");
+		let mut guard = recover_rwlock_write(&self.tenant_policy_cache, "tenant_policy_cache");
 		let mut next = HashMap::with_capacity(snapshot.tenants.len());
 		for (tenant_id, record) in snapshot.tenants {
 			let mean_write_size_bytes = guard
@@ -1033,10 +1217,7 @@ impl WendelonDataServer {
 
 	async fn ensure_tenant_policy_fresh(&self) {
 		let refresh_needed = {
-			let guard = self
-				.tenant_policy_cache
-				.read()
-				.expect("tenant policy cache poisoned");
+			let guard = recover_rwlock_read(&self.tenant_policy_cache, "tenant_policy_cache");
 			guard
 				.last_refresh
 				.is_none_or(|last| last.elapsed() >= self.tenant_cache_refresh_interval)
@@ -1048,9 +1229,7 @@ impl WendelonDataServer {
 
 	async fn cached_tenant_policy(&self, tenant_id: TenantId) -> Option<CachedTenantPolicy> {
 		self.ensure_tenant_policy_fresh().await;
-		self.tenant_policy_cache
-			.read()
-			.expect("tenant policy cache poisoned")
+		recover_rwlock_read(&self.tenant_policy_cache, "tenant_policy_cache")
 			.policies
 			.get(&tenant_id)
 			.copied()
@@ -1123,10 +1302,7 @@ impl WendelonDataServer {
 	}
 
 	fn note_committed_write(&self, tenant_id: TenantId, charged_bytes: u64) {
-		let mut guard = self
-			.tenant_policy_cache
-			.write()
-			.expect("tenant policy cache poisoned");
+		let mut guard = recover_rwlock_write(&self.tenant_policy_cache, "tenant_policy_cache");
 		let Some(policy) = guard.policies.get_mut(&tenant_id) else {
 			return;
 		};
@@ -1595,10 +1771,7 @@ impl WendelonDataServer {
 	/// call this — the manager is the sole writer of real leases.
 	#[cfg(test)]
 	pub fn seed_lease_for_test(&self, lease: LeaseDescriptor) {
-		self.leases
-			.write()
-			.expect("lease cache poisoned")
-			.push(lease);
+		recover_rwlock_write(&self.leases, "lease_cache").push(lease);
 	}
 
 	async fn lease_gate_result(
@@ -1608,7 +1781,7 @@ impl WendelonDataServer {
 		now: HybridTimestamp,
 	) -> LeaseGateResult {
 		let lease = {
-			let guard = self.leases.read().expect("lease cache poisoned");
+			let guard = recover_rwlock_read(&self.leases, "lease_cache");
 			guard
 				.iter()
 				.find(|l| {
@@ -1649,7 +1822,7 @@ impl WendelonDataServer {
 	}
 
 	fn cache_granted_lease(&self, lease: LeaseDescriptor) {
-		let mut guard = self.leases.write().expect("lease cache poisoned");
+		let mut guard = recover_rwlock_write(&self.leases, "lease_cache");
 		if let Some(slot) = guard
 			.iter_mut()
 			.find(|l| l.range_start == lease.range_start && l.range_end == lease.range_end)
@@ -1812,11 +1985,10 @@ impl WendelonDataServer {
 			return Ok(());
 		};
 
-		if *self
-			.orphan_witness_recovery_stamp
-			.read()
-			.expect("orphan witness recovery stamp poisoned")
-			== Some(target)
+		if *recover_rwlock_read(
+			&self.orphan_witness_recovery_stamp,
+			"orphan_witness_recovery_stamp",
+		) == Some(target)
 		{
 			return Ok(());
 		}
@@ -1825,11 +1997,10 @@ impl WendelonDataServer {
 		let Some(target) = self.current_orphan_witness_recovery_stamp() else {
 			return Ok(());
 		};
-		if *self
-			.orphan_witness_recovery_stamp
-			.read()
-			.expect("orphan witness recovery stamp poisoned")
-			== Some(target)
+		if *recover_rwlock_read(
+			&self.orphan_witness_recovery_stamp,
+			"orphan_witness_recovery_stamp",
+		) == Some(target)
 		{
 			return Ok(());
 		}
@@ -1843,10 +2014,10 @@ impl WendelonDataServer {
 				.await?;
 		}
 
-		*self
-			.orphan_witness_recovery_stamp
-			.write()
-			.expect("orphan witness recovery stamp poisoned") = Some(target);
+		*recover_rwlock_write(
+			&self.orphan_witness_recovery_stamp,
+			"orphan_witness_recovery_stamp",
+		) = Some(target);
 		Ok(())
 	}
 
@@ -1876,7 +2047,7 @@ impl WendelonDataServer {
 		let ranges = snapshot.primary_ranges_for(self.local_node);
 
 		{
-			let mut guard = self.leases.write().expect("lease cache poisoned");
+			let mut guard = recover_rwlock_write(&self.leases, "lease_cache");
 			guard.retain(|l| l.epoch == epoch);
 			metrics()
 				.data_ring_lease_cache_entries
@@ -2456,6 +2627,20 @@ impl WendelonDataServer {
 		)
 	}
 
+	fn backpressured_write_frame(
+		&self,
+		msg_type: MsgType,
+		stream_id: u32,
+		meta: &WriteRequestMeta,
+	) -> HrftFrame {
+		self.build_write_response_frame(
+			msg_type,
+			stream_id,
+			error_response(meta, WriteStatus::BACKPRESSURED, self.local_node),
+			None,
+		)
+	}
+
 	fn unauthorized_read_frame(&self, stream_id: u32, meta: &ReadRequestMeta) -> HrftFrame {
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
@@ -2482,6 +2667,32 @@ impl WendelonDataServer {
 		}
 	}
 
+	fn backpressured_read_frame(&self, stream_id: u32, meta: &ReadRequestMeta) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&error_read_response(
+				meta,
+				ReadStatus::BACKPRESSURED,
+				self.local_node,
+			)));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
 	fn unauthorized_query_frame(&self, stream_id: u32, meta: &QueryRequestMeta) -> HrftFrame {
 		self.build_query_response_frame(
 			stream_id,
@@ -2489,6 +2700,142 @@ impl WendelonDataServer {
 			None,
 			FRAME_FLAG_STREAM_END,
 		)
+	}
+
+	fn backpressured_query_frame(&self, stream_id: u32, meta: &QueryRequestMeta) -> HrftFrame {
+		self.build_query_response_frame(
+			stream_id,
+			query_error_meta(meta, ReadStatus::BACKPRESSURED, self.local_node),
+			None,
+			FRAME_FLAG_STREAM_END,
+		)
+	}
+
+	fn record_backpressure_rejection(&self, scope: BackpressureScope) {
+		match scope {
+			BackpressureScope::Tenant => metrics()
+				.data_ring_backpressure_rejections_tenant_total
+				.inc(),
+			BackpressureScope::Actor => metrics()
+				.data_ring_backpressure_rejections_actor_total
+				.inc(),
+		}
+	}
+
+	fn try_admit_tenant_request(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<TenantRequestReservation, BackpressureScope> {
+		let max = self.max_tenant_concurrent_requests.load(Ordering::Relaxed);
+		match self.tenant_request_inflight.entry(tenant_id) {
+			DashEntry::Occupied(mut entry) => {
+				if *entry.get() >= max {
+					drop(entry);
+					self.record_backpressure_rejection(BackpressureScope::Tenant);
+					return Err(BackpressureScope::Tenant);
+				}
+				let next = entry.get().saturating_add(1);
+				*entry.get_mut() = next;
+			}
+			DashEntry::Vacant(entry) => {
+				if max == 0 {
+					self.record_backpressure_rejection(BackpressureScope::Tenant);
+					return Err(BackpressureScope::Tenant);
+				}
+				entry.insert(1);
+			}
+		}
+		let next = self.active_tenant_requests.fetch_add(1, Ordering::Relaxed) + 1;
+		metrics()
+			.data_ring_backpressure_active_tenant_requests
+			.set(next);
+		Ok(TenantRequestReservation {
+			inflight: self.tenant_request_inflight.clone(),
+			active_requests: self.active_tenant_requests.clone(),
+			tenant_id,
+			active: true,
+		})
+	}
+
+	fn try_admit_actor_request(
+		&self,
+		actor: &ActorIdentity,
+	) -> Result<ActorRequestReservation, BackpressureScope> {
+		let key = ActorRequestKey {
+			role: actor.role,
+			key_id: actor.key_id.clone(),
+		};
+		let max = self.max_actor_concurrent_requests.load(Ordering::Relaxed);
+		match self.actor_request_inflight.entry(key.clone()) {
+			DashEntry::Occupied(mut entry) => {
+				if *entry.get() >= max {
+					drop(entry);
+					self.record_backpressure_rejection(BackpressureScope::Actor);
+					return Err(BackpressureScope::Actor);
+				}
+				let next = entry.get().saturating_add(1);
+				*entry.get_mut() = next;
+			}
+			DashEntry::Vacant(entry) => {
+				if max == 0 {
+					self.record_backpressure_rejection(BackpressureScope::Actor);
+					return Err(BackpressureScope::Actor);
+				}
+				entry.insert(1);
+			}
+		}
+		let next = self.active_actor_requests.fetch_add(1, Ordering::Relaxed) + 1;
+		metrics()
+			.data_ring_backpressure_active_actor_requests
+			.set(next);
+		Ok(ActorRequestReservation {
+			inflight: self.actor_request_inflight.clone(),
+			active_requests: self.active_actor_requests.clone(),
+			key,
+			active: true,
+		})
+	}
+
+	fn try_admit_data_request(
+		&self,
+		actor: &ActorIdentity,
+		target_tenant: Option<TenantId>,
+		op: DataOperation,
+	) -> std::io::Result<Result<DataRequestAdmission, BackpressureScope>> {
+		let claimed_tenant = actor.claimed_tenant_id()?;
+		let tenant_reservation = match op {
+			DataOperation::Write | DataOperation::Read | DataOperation::Query => {
+				if let Some(tenant_id) = target_tenant {
+					match self.try_admit_tenant_request(tenant_id) {
+						Ok(reservation) => Some(reservation),
+						Err(scope) => return Ok(Err(scope)),
+					}
+				} else {
+					None
+				}
+			}
+			_ => None,
+		};
+		let actor_reservation = match op {
+			DataOperation::Write
+			| DataOperation::Read
+			| DataOperation::Query
+			| DataOperation::StreamFinalization => {
+				if claimed_tenant.is_none() {
+					match self.try_admit_actor_request(actor) {
+						Ok(reservation) => Some(reservation),
+						Err(scope) => return Ok(Err(scope)),
+					}
+				} else {
+					None
+				}
+			}
+			_ => None,
+		};
+		Ok(Ok(DataRequestAdmission {
+			_tenant: tenant_reservation,
+			_actor: actor_reservation,
+		}))
 	}
 
 	fn unauthorized_replicate_frame(&self, stream_id: u32) -> HrftFrame {
@@ -3405,11 +3752,11 @@ impl WendelonDataServer {
 		meta: &QueryRequestMeta,
 		bytecode: &[u8],
 	) -> std::io::Result<QueryExecutionPlan> {
-		let sm_peek = self.state_machine.state_snapshot().await;
+		let admission = self.admission_snapshot();
 
 		// Gate #1: epoch staleness. The authoritative epoch is the
 		// highest one the SM has observed an E_safe advance for.
-		let current_epoch = sm_peek.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+		let current_epoch = admission.current_epoch;
 		if meta.expected_epoch < current_epoch {
 			return Ok(query_plan_error(
 				meta,
@@ -3426,7 +3773,7 @@ impl WendelonDataServer {
 		// once the local SM has observed E_safe at-or-past the
 		// client's `min_hlc` for the requested epoch.
 		if meta.consistency == Consistency::LINEARIZABLE {
-			let watermark = sm_peek
+			let watermark = admission
 				.e_safe_watermarks
 				.get(&meta.expected_epoch)
 				.copied()
@@ -3451,6 +3798,7 @@ impl WendelonDataServer {
 			));
 		}
 
+		let sm_peek = self.state_machine.state_snapshot().await;
 		let pending: Vec<MigrationLedgerEntry> = sm_peek
 			.migrations
 			.values()
@@ -3685,6 +4033,20 @@ impl DataRingServer for WendelonDataServer {
 						&meta,
 					)));
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						return Ok(Some(self.backpressured_write_frame(
+							MsgType::WRITE_RESP,
+							frame.header.stream_id,
+							&meta,
+						)));
+					}
+				};
 				self.handle_write(frame).await.map(Some)
 			}
 			MsgType::READ_REQ => {
@@ -3708,6 +4070,18 @@ impl DataRingServer for WendelonDataServer {
 						self.unauthorized_read_frame(frame.header.stream_id, &meta),
 					));
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Read,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						return Ok(Some(
+							self.backpressured_read_frame(frame.header.stream_id, &meta),
+						));
+					}
+				};
 				self.handle_read(frame).await.map(Some)
 			}
 			MsgType::REPLICATE_REQ => {
@@ -3754,6 +4128,18 @@ impl DataRingServer for WendelonDataServer {
 						self.unauthorized_query_frame(frame.header.stream_id, &meta),
 					));
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						return Ok(Some(
+							self.backpressured_query_frame(frame.header.stream_id, &meta),
+						));
+					}
+				};
 				self.handle_query(frame).await.map(Some)
 			}
 			MsgType::MIGRATE_REQ => {
@@ -3853,6 +4239,30 @@ impl DataRingServer for WendelonDataServer {
 					stream.finish().await?;
 					return Ok(());
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						let response = self.backpressured_write_frame(
+							MsgType::BULK_WRITE_RESP,
+							frame.header.stream_id,
+							&meta,
+						);
+						write_frame(
+							&mut *stream,
+							&response.header,
+							&response.meta,
+							None,
+							response.trailing.as_deref(),
+						)
+						.await?;
+						stream.finish().await?;
+						return Ok(());
+					}
+				};
 				self.handle_bulk_stream(frame, stream).await
 			}
 			MsgType::QUERY_REQ => {
@@ -3877,6 +4287,27 @@ impl DataRingServer for WendelonDataServer {
 					stream.finish().await?;
 					return Ok(());
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						let response =
+							self.backpressured_query_frame(frame.header.stream_id, &meta);
+						write_frame(
+							&mut *stream,
+							&response.header,
+							&response.meta,
+							None,
+							response.trailing.as_deref(),
+						)
+						.await?;
+						stream.finish().await?;
+						return Ok(());
+					}
+				};
 				self.handle_query_stream(frame, stream).await
 			}
 			MsgType::STREAM_FIN_REQ => {
@@ -3893,6 +4324,19 @@ impl DataRingServer for WendelonDataServer {
 						"actor is not allowed to open STREAM_FIN_REQ",
 					));
 				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					None,
+					DataOperation::StreamFinalization,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						return Err(Error::new(
+							ErrorKind::WouldBlock,
+							"data stream finalization request backpressured",
+						));
+					}
+				};
 				self.handle_stream_finalization_stream(frame, stream).await
 			}
 			other => Err(Error::new(
@@ -3926,8 +4370,8 @@ impl DataRing for WendelonDataServer {
 		// the highest epoch the SM has seen an E_safe advancement
 		// for; a client that believes in an older epoch gets a
 		// redirect, not a silent accept.
-		let sm = self.state_machine.state_snapshot().await;
-		let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+		let admission = self.admission_snapshot();
+		let current_epoch = admission.current_epoch;
 		if meta.expected_epoch < current_epoch {
 			return Ok((
 				error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
@@ -4129,24 +4573,25 @@ impl DataRing for WendelonDataServer {
 						None => None,
 					}
 				}, if local_durable_task.is_some() => {
-					match local.expect("local durable task is guarded by is_some()") {
-						Ok(Ok(_location)) => {
+					match local {
+						Some(Ok(Ok(_location))) => {
 							quorum_tracker.note_local_durable();
 						}
-						Ok(Err(err)) => {
+						Some(Ok(Err(err))) => {
 							self.trip_local_persistence_distrust(format!(
 								"local durable append returned error: {err}"
 							))
 							.await;
 							return Ok(self.fenced_write_response(&meta).await);
 						}
-						Err(err) => {
+						Some(Err(err)) => {
 							self.trip_local_persistence_distrust(format!(
 								"local durable append task failed: {err}"
 							))
 							.await;
 							return Ok(self.fenced_write_response(&meta).await);
 						}
+						None => continue,
 					}
 					local_durable_task = None;
 				}
@@ -4249,8 +4694,8 @@ impl DataRing for WendelonDataServer {
 		_key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)> {
 		metrics().data_ring_read_requests_total.inc();
-		let sm = self.state_machine.state_snapshot().await;
-		let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+		let admission = self.admission_snapshot();
+		let current_epoch = admission.current_epoch;
 		if meta.expected_epoch < current_epoch {
 			return Ok((
 				error_read_response(&meta, ReadStatus::EPOCH_STALE, self.local_node),
@@ -4267,7 +4712,7 @@ impl DataRing for WendelonDataServer {
 		// skip the gate — the former trusts the leader's commit
 		// frontier, the latter explicitly accepts stale data.
 		if meta.consistency == Consistency::LINEARIZABLE {
-			let watermark = sm
+			let watermark = admission
 				.e_safe_watermarks
 				.get(&meta.expected_epoch)
 				.copied()
@@ -4581,8 +5026,8 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 	// one the SM has observed an E_safe advance for; a client
 	// believing in a past epoch gets a redirect so it can refresh
 	// topology rather than fork the read.
-	let sm = state_machine.state_snapshot().await;
-	let current_epoch = sm.e_safe_watermarks.keys().copied().max().unwrap_or(0);
+	let admission = state_machine.current_admission_snapshot();
+	let current_epoch = admission.current_epoch;
 	if meta.expected_epoch < current_epoch {
 		return Ok(query_plan_error(meta, ReadStatus::EPOCH_STALE, local_node));
 	}
@@ -4591,7 +5036,7 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 	// the local SM has observed E_safe at-or-past the client's
 	// min_hlc for the requested epoch.
 	if meta.consistency == Consistency::LINEARIZABLE {
-		let watermark = sm
+		let watermark = admission
 			.e_safe_watermarks
 			.get(&meta.expected_epoch)
 			.copied()
@@ -5341,7 +5786,7 @@ fn format_bytes_hex(bytes: &[u8]) -> String {
 	let mut out = String::with_capacity(bytes.len() * 2);
 	for byte in bytes {
 		use std::fmt::Write as _;
-		write!(&mut out, "{byte:02x}").expect("writing to string cannot fail");
+		let _ = write!(&mut out, "{byte:02x}");
 	}
 	out
 }
@@ -5363,6 +5808,7 @@ mod tests {
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::manager::SlabManagerConfig;
+	use std::panic::AssertUnwindSafe;
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -9121,6 +9567,271 @@ mod tests {
 		.unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::PermissionDenied);
 		assert!(err.to_string().contains("STREAM_FIN_REQ"));
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_backpressures_write_when_tenant_limit_is_saturated() {
+		let dir = bootstrap_tempdir("bp-write-tenant");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			24,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		node.data_server
+			.set_request_backpressure_limits_for_test(1, 1);
+
+		let tenant_actor = actor(ActorRole::Operator, Some("0"));
+		let _guard = node
+			.data_server
+			.try_admit_data_request(&tenant_actor, Some(tenant()), DataOperation::Write)
+			.unwrap()
+			.unwrap();
+
+		let before = metrics()
+			.data_ring_backpressure_rejections_tenant_total
+			.get();
+		let meta = simple_write_meta(1);
+		let payload = encode_batch(&single_kv_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::WRITE_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: tenant_actor,
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: WriteResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<WriteResponseMeta>()]);
+		assert_eq!(meta.status, WriteStatus::BACKPRESSURED);
+		assert_eq!(
+			metrics()
+				.data_ring_backpressure_rejections_tenant_total
+				.get(),
+			before + 1
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_backpressures_cross_tenant_read_when_actor_limit_is_saturated() {
+		let dir = bootstrap_tempdir("bp-read-actor");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			25,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		node.data_server
+			.set_request_backpressure_limits_for_test(8, 1);
+
+		let operator = actor(ActorRole::Operator, None);
+		let _guard = node
+			.data_server
+			.try_admit_data_request(&operator, Some(tenant()), DataOperation::Read)
+			.unwrap()
+			.unwrap();
+
+		let before = metrics()
+			.data_ring_backpressure_rejections_actor_total
+			.get();
+		let mut meta = simple_read_meta(1);
+		meta.tenant_id = TenantId::new(9);
+		meta.key_identity = Identity::blake3_tenant(meta.tenant_id, b"k");
+		let key = encode_batch(&single_key_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&key);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: operator,
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: ReadResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::BACKPRESSURED);
+		assert_eq!(
+			metrics()
+				.data_ring_backpressure_rejections_actor_total
+				.get(),
+			before + 1
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn query_stream_backpressure_response_marks_stream_end() {
+		use tokio::io::AsyncWriteExt;
+
+		let dir = bootstrap_tempdir("bp-query-stream-end");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			26,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		node.data_server
+			.set_request_backpressure_limits_for_test(1, 1);
+
+		let tenant_actor = actor(ActorRole::Operator, Some("0"));
+		let _guard = node
+			.data_server
+			.try_admit_data_request(&tenant_actor, Some(tenant()), DataOperation::Query)
+			.unwrap()
+			.unwrap();
+
+		let meta = base_meta();
+		let first_header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::QUERY_REQ.0,
+			flags: 0,
+			stream_id: 7,
+			meta_len: std::mem::size_of::<QueryRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		let (mut client_side, server_side) = tokio::io::duplex(1024);
+		client_side
+			.write_all(bytemuck::bytes_of(&meta))
+			.await
+			.unwrap();
+		client_side.shutdown().await.unwrap();
+
+		DataRingServer::handle_data_stream(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: tenant_actor,
+			},
+			first_header,
+			Box::new(DuplexTransportStream { inner: server_side }),
+			node.pool.clone(),
+		)
+		.await
+		.unwrap();
+
+		let response = read_frame(&mut client_side, &node.pool).await.unwrap();
+		assert_ne!(response.header.flags & FRAME_FLAG_STREAM_END, 0);
+		let meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::BACKPRESSURED);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn cached_tenant_policy_recovers_after_cache_lock_poison() {
+		let dir = bootstrap_tempdir("tenant-policy-poison");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			27,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let cache = node.data_server.tenant_policy_cache.clone();
+		let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+			let _guard = cache.write().unwrap();
+			panic!("poison tenant policy cache");
+		}));
+
+		let _ = node.data_server.cached_tenant_policy(TenantId::ZERO).await;
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn lease_gate_recovers_after_cache_lock_poison() {
+		let dir = bootstrap_tempdir("lease-cache-poison");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			28,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let lease = node.data_server.make_signed_lease(
+			1,
+			node.local_node,
+			0,
+			100,
+			hlc(10, 0, node.local_node.id),
+			hlc(10_000, 0, node.local_node.id),
+		);
+		node.data_server.cache_granted_lease(lease);
+
+		let leases = node.data_server.leases.clone();
+		let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+			let _guard = leases.write().unwrap();
+			panic!("poison lease cache");
+		}));
+
+		assert_eq!(
+			node.data_server
+				.lease_gate_result(Locality::ZERO, 1, hlc(11, 0, node.local_node.id))
+				.await,
+			LeaseGateResult::Valid
+		);
 
 		node.handles.abort();
 	}
