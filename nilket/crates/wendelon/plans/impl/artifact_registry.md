@@ -54,6 +54,13 @@ State vocabulary:
 | E zeroization evidence note | `E` | `plans/impl/workstream_E_zeroization_note.md` | `M3` | `present` | E7 covers deterministic key scrub tests plus the exact crypto/plaintext buffer boundaries that are actually zeroized today |
 | E PKCS#11 seam note | `E` | `plans/impl/workstream_E_pkcs11_seam.md` | `M3` | `present` | E8 lands the stable HSM-facing config/provider seam while keeping the runtime status explicitly unsupported |
 | E rotation runbook | `E` | `plans/ops/key_rotation.md` | `M3` | `present` | E5 documents the operator-facing tenant-KEK rotation path and post-commit convergence contract |
+| F role matrix | `F` | `plans/impl/workstream_F_role_matrix.md` | `M3` | `present` | F1 lands the four-way serious operator split in code while keeping legacy `operator` as a compatibility alias |
+| F claim/OID note | `F` | `plans/impl/workstream_F_claim_oid_note.md` | `M3` | `present` | F2 freezes the placeholder actor-claims OID and the exact four-key CBOR payload shape used in certificates |
+| F cert-service deployment note | `F` | `plans/impl/workstream_F_cert_service_deployment_note.md` | `M3` | `present` | F3 lands the narrow issuance-policy baseline for node, operator, observer, break-glass, and `query_session` certificates without turning Wendelon into a general tenant CA |
+| F revocation behavior note | `F` | `plans/impl/workstream_F_revocation_behavior_note.md` | `M3` | `present` | F4 lands replicated actor-key revocation through the Control Ring and enforces it on transport plus observability admission |
+| F destructive-auth note | `F` | `plans/impl/workstream_F_destructive_auth_note.md` | `M3` | `present` | F5 makes routine, stronger-authorization, and break-glass-only admin actions explicit in code without forcing dual-auth into the default profile |
+| F break-glass operational guide | `F` | `plans/impl/workstream_F_break_glass_operational_guide.md` | `M3` | `present` | F6 hardens break-glass issuance and runtime use with a fixed scope taxonomy, mandatory incident metadata, and a dedicated issuance audit event |
+| F operator onboarding contract | `F` | `plans/impl/workstream_F_operator_onboarding_contract.md` | `M3` | `present` | F7 freezes the enterprise onboarding boundary: upstream IdP authenticates the human, Wendelon-owned issuance maps to local roles and short-lived certs, and `query_session` remains a separate Workstream I concern |
 
 ## Registry Rules
 

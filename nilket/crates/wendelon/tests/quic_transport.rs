@@ -480,6 +480,7 @@ async fn quic_accept_loop_refuses_connections_over_limit() {
 					max_concurrent_stream_tasks: 16,
 				},
 				tls_pki::CLUSTER_DOMAIN,
+				None,
 			)
 			.await
 			.unwrap();
@@ -565,6 +566,7 @@ async fn listener_overload_sheds_excess_handshakes_while_retry_redirect_succeeds
 					max_concurrent_stream_tasks: 16,
 				},
 				tls_pki::CLUSTER_DOMAIN,
+				None,
 			)
 			.await
 			.unwrap();
@@ -587,6 +589,7 @@ async fn listener_overload_sheds_excess_handshakes_while_retry_redirect_succeeds
 					max_concurrent_stream_tasks: 16,
 				},
 				tls_pki::CLUSTER_DOMAIN,
+				None,
 			)
 			.await
 			.unwrap();

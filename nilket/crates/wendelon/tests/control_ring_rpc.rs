@@ -10,11 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use wendelon::client::ClusterStatusWire;
 use wendelon::network::control_server::{
 	AdvanceEpochResponseWire, AuditChainHeadResponseWire, CONTROL_REASON_AUTHORIZATION_FAILED,
-	CONTROL_REASON_GRANTED, TenantAdminRequestWire, TenantAdminResponseWire, WendelonControlServer,
+	CONTROL_REASON_GRANTED, RevocationAdminRequestWire, RevocationAdminResponseWire,
+	TenantAdminRequestWire, TenantAdminResponseWire, WendelonControlServer,
 };
 use wendelon::network::router::MsgRouterBuilder;
 use wendelon::network::server::{HrftService, RequestContext};
-use wendelon::network::tls::{ActorIdentity, ActorRole};
+use wendelon::network::tls::{ActorIdentity, ActorRole, ActorTrustDomain, BreakGlassScope};
 use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use wendelon::network::transport::{
 	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
@@ -37,6 +38,17 @@ fn actor(role: ActorRole, tenant_id: Option<&str>) -> ActorIdentity {
 		tenant_id.map(str::to_string),
 		vec!["cluster".to_string()],
 		vec![1, 2, 3, 4],
+	)
+	.unwrap()
+}
+
+fn break_glass_actor(scope: BreakGlassScope) -> ActorIdentity {
+	ActorIdentity::new(
+		ActorRole::BreakGlassAdmin,
+		None,
+		None,
+		vec![scope.as_str().to_string()],
+		vec![4, 3, 2, 1],
 	)
 	.unwrap()
 }
@@ -74,6 +86,35 @@ fn decode_tenant_admin_response(
 	wire::decode(&resp.meta).unwrap()
 }
 
+fn revocation_admin_frame(
+	node: &WendelonNode,
+	stream_id: u32,
+	request: &RevocationAdminRequestWire,
+) -> wendelon::network::core::HrftFrame {
+	let meta = wire::encode_into(&node.pool, request).unwrap();
+	wendelon::network::core::HrftFrame {
+		header: wendelon::schema::FrameHeader {
+			magic: wendelon::network::core::HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::REVOCATION_ADMIN_REQ.0,
+			flags: 0,
+			stream_id,
+			meta_len: meta.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		},
+		meta,
+		arrow_payload: None,
+		trailing: None,
+	}
+}
+
+fn decode_revocation_admin_response(
+	resp: &wendelon::network::core::HrftFrame,
+) -> RevocationAdminResponseWire {
+	wire::decode(&resp.meta).unwrap()
+}
+
 fn decode_status_response(
 	resp: &wendelon::network::core::HrftFrame,
 ) -> (ClusterStatusWire, Vec<LeaseDescriptor>) {
@@ -104,10 +145,53 @@ fn audit_chain_head_frame(stream_id: u32) -> wendelon::network::core::HrftFrame 
 	}
 }
 
+fn status_frame(stream_id: u32) -> wendelon::network::core::HrftFrame {
+	wendelon::network::core::HrftFrame {
+		header: wendelon::schema::FrameHeader {
+			magic: wendelon::network::core::HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::STATUS_REQ.0,
+			flags: 0,
+			stream_id,
+			meta_len: 0,
+			arrow_len: 0,
+			trailing_len: 0,
+		},
+		meta: wendelon::network::pool::BufPool::new(1, 16).acquire(),
+		arrow_payload: None,
+		trailing: None,
+	}
+}
+
 fn decode_audit_chain_head_response(
 	resp: &wendelon::network::core::HrftFrame,
 ) -> AuditChainHeadResponseWire {
 	wire::decode(&resp.meta).unwrap()
+}
+
+fn advance_epoch_frame(
+	node: &WendelonNode,
+	stream_id: u32,
+	batch: &RecordBatch,
+) -> wendelon::network::core::HrftFrame {
+	let arrow = support::encode_batch(batch).unwrap();
+	let mut arrow_payload = node.pool.acquire();
+	arrow_payload.as_mut_vec().extend_from_slice(&arrow);
+	wendelon::network::core::HrftFrame {
+		header: wendelon::schema::FrameHeader {
+			magic: wendelon::network::core::HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::EPOCH_ADV_REQ.0,
+			flags: 0,
+			stream_id,
+			meta_len: 0,
+			arrow_len: arrow_payload.len() as u32,
+			trailing_len: 0,
+		},
+		meta: node.pool.acquire(),
+		arrow_payload: Some(arrow_payload),
+		trailing: None,
+	}
 }
 
 fn read_audit_log(path: &Path) -> String {
@@ -366,11 +450,25 @@ async fn status_req_includes_topology_and_committed_lease_metadata() {
 	assert_eq!(leases[0].range_start, range_start);
 	assert_eq!(leases[0].range_end, range_end);
 
+	let cluster_admin_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ClusterAdmin, None), node.local_node),
+			status_frame(2),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let (cluster_admin_status, cluster_admin_leases) = decode_status_response(&cluster_admin_resp);
+	assert_eq!(cluster_admin_status.epoch, status.epoch);
+	assert_eq!(cluster_admin_status.leader, status.leader);
+	assert_eq!(cluster_admin_leases, leases);
+
 	support::abort_node(&node);
 }
 
 #[tokio::test]
-async fn audit_chain_head_req_returns_local_head_for_operator_and_observer() {
+async fn audit_chain_head_req_returns_local_head_for_operator_auditor_and_observer() {
 	let node = support::bootstrap_node("audit-chain-head-rpc", 1).await;
 	support::wait_for_local_leader(&node).await;
 
@@ -404,6 +502,18 @@ async fn audit_chain_head_req_returns_local_head_for_operator_and_observer() {
 		.unwrap();
 	let observer_meta = decode_audit_chain_head_response(&observer_resp);
 	assert_eq!(observer_meta.head, expected);
+
+	let auditor_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ComplianceAuditor, None), node.local_node),
+			audit_chain_head_frame(3),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let auditor_meta = decode_audit_chain_head_response(&auditor_resp);
+	assert_eq!(auditor_meta.head, expected);
 
 	support::abort_node(&node);
 }
@@ -801,7 +911,7 @@ async fn tenant_admin_create_and_list_flow_commits_through_control_ring() {
 	let create_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				1,
@@ -852,7 +962,7 @@ async fn tenant_admin_rotate_tenant_kek_commits_and_returns_new_active_version()
 	let create_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				1,
@@ -876,7 +986,7 @@ async fn tenant_admin_rotate_tenant_kek_commits_and_returns_new_active_version()
 	let rotate_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::BackupAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				2,
@@ -935,7 +1045,7 @@ async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
 	let create_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				1,
@@ -959,7 +1069,7 @@ async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
 	let rotate_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::BackupAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				2,
@@ -983,7 +1093,7 @@ async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
 	let retire_resp = node
 		.router
 		.handle_frame(
-			context(actor(ActorRole::Operator, None), node.local_node),
+			context(actor(ActorRole::BackupAdmin, None), node.local_node),
 			tenant_admin_frame(
 				&node,
 				3,
@@ -1029,6 +1139,103 @@ async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
 }
 
 #[tokio::test]
+async fn tenant_delete_requires_break_glass_certificate() {
+	let node = support::bootstrap_node("tenant-admin-delete-break-glass", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let create_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				1,
+				&TenantAdminRequestWire::Create {
+					target_tenant_id: TenantId::new(7),
+					quota_bytes: 4_096,
+					replication_factor: 1,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(decode_tenant_admin_response(&create_resp).accepted);
+
+	let denied_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				2,
+				&TenantAdminRequestWire::Delete {
+					target_tenant_id: TenantId::new(7),
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let denied_meta = decode_tenant_admin_response(&denied_resp);
+	assert!(!denied_meta.accepted);
+	assert_eq!(denied_meta.reason_code, CONTROL_REASON_AUTHORIZATION_FAILED);
+
+	let narrow_scope_resp = node
+		.router
+		.handle_frame(
+			context(
+				break_glass_actor(BreakGlassScope::Diagnostic),
+				node.local_node,
+			),
+			tenant_admin_frame(
+				&node,
+				3,
+				&TenantAdminRequestWire::Delete {
+					target_tenant_id: TenantId::new(7),
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let narrow_scope_meta = decode_tenant_admin_response(&narrow_scope_resp);
+	assert!(!narrow_scope_meta.accepted);
+	assert_eq!(
+		narrow_scope_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	let delete_resp = node
+		.router
+		.handle_frame(
+			context(break_glass_actor(BreakGlassScope::Full), node.local_node),
+			tenant_admin_frame(
+				&node,
+				4,
+				&TenantAdminRequestWire::Delete {
+					target_tenant_id: TenantId::new(7),
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let delete_meta = decode_tenant_admin_response(&delete_resp);
+	assert!(delete_meta.accepted);
+	let snapshot = node.state_machine.state_snapshot().await;
+	let tenant = snapshot.tenants.get(&TenantId::new(7)).unwrap();
+	assert_eq!(
+		tenant.state,
+		wendelon::consensus::TenantLifecycleState::Deleted
+	);
+	assert_eq!(tenant.quota_bytes, 0);
+	assert!(!snapshot.tenant_keysets.contains_key(&TenantId::new(7)));
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
 async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
 	let node = support::bootstrap_node("tenant-admin-authz", 1).await;
 	support::wait_for_local_leader(&node).await;
@@ -1065,6 +1272,184 @@ async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
 		.unwrap()
 		.unwrap();
 	let tenant_scoped_meta = decode_tenant_admin_response(&tenant_scoped_resp);
+	assert!(!tenant_scoped_meta.accepted);
+	assert_eq!(
+		tenant_scoped_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	let cluster_admin_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ClusterAdmin, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				3,
+				&TenantAdminRequestWire::Suspend {
+					target_tenant_id: TenantId::ZERO,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let cluster_admin_meta = decode_tenant_admin_response(&cluster_admin_resp);
+	assert!(!cluster_admin_meta.accepted);
+	assert_eq!(
+		cluster_admin_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	let tenant_admin_rotate_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				4,
+				&TenantAdminRequestWire::RotateTenantKek {
+					target_tenant_id: TenantId::ZERO,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let tenant_admin_rotate_meta = decode_tenant_admin_response(&tenant_admin_rotate_resp);
+	assert!(!tenant_admin_rotate_meta.accepted);
+	assert_eq!(
+		tenant_admin_rotate_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn advance_epoch_rejects_tenant_scoped_operator() {
+	let node = support::bootstrap_node("epoch-rpc-tenant-scoped-authz", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, Some("7")), node.local_node),
+			advance_epoch_frame(&node, 1, &epoch_config_batch()),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let meta: AdvanceEpochResponseWire = wire::decode(&resp.meta).unwrap();
+	assert!(!meta.accepted);
+	assert_eq!(meta.reason_code, CONTROL_REASON_AUTHORIZATION_FAILED);
+	assert_eq!(node.epoch_tx.borrow().epoch, 1);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn revocation_admin_commits_and_lists_replicated_revocations() {
+	let node = support::bootstrap_node("revocation-admin", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let revoke_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ClusterAdmin, None), node.local_node),
+			revocation_admin_frame(
+				&node,
+				1,
+				&RevocationAdminRequestWire::Revoke {
+					trust_domain: ActorTrustDomain::Ops,
+					key_id: vec![9, 9, 9, 9],
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let revoke_meta = decode_revocation_admin_response(&revoke_resp);
+	assert!(revoke_meta.accepted);
+	assert_eq!(revoke_meta.reason_code, CONTROL_REASON_GRANTED);
+	assert!(revoke_meta.entries.iter().any(
+		|entry| entry.trust_domain == ActorTrustDomain::Ops && entry.key_id == vec![9, 9, 9, 9]
+	));
+
+	let snapshot = node.state_machine.state_snapshot().await;
+	assert!(
+		snapshot
+			.revoked_actor_keys
+			.iter()
+			.any(|(entry, _)| entry.trust_domain == ActorTrustDomain::Ops
+				&& entry.key_id == vec![9, 9, 9, 9])
+	);
+
+	let list_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::ClusterAdmin, None), node.local_node),
+			revocation_admin_frame(&node, 2, &RevocationAdminRequestWire::List),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let list_meta = decode_revocation_admin_response(&list_resp);
+	assert!(list_meta.accepted);
+	assert!(list_meta.entries.iter().any(
+		|entry| entry.trust_domain == ActorTrustDomain::Ops && entry.key_id == vec![9, 9, 9, 9]
+	));
+
+	let denied_err = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::TenantAdmin, None), node.local_node),
+			revocation_admin_frame(&node, 3, &RevocationAdminRequestWire::List),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(denied_err.kind(), ErrorKind::PermissionDenied);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn revocation_admin_rejects_non_ops_and_tenant_scoped_callers() {
+	let node = support::bootstrap_node("revocation-admin-authz", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let data_node_resp = node
+		.router
+		.handle_frame(
+			context(ActorIdentity::data_node(node.local_node), node.local_node),
+			revocation_admin_frame(&node, 1, &RevocationAdminRequestWire::List),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let data_node_meta = decode_revocation_admin_response(&data_node_resp);
+	assert!(!data_node_meta.accepted);
+	assert_eq!(
+		data_node_meta.reason_code,
+		CONTROL_REASON_AUTHORIZATION_FAILED
+	);
+
+	let tenant_scoped_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, Some("7")), node.local_node),
+			revocation_admin_frame(
+				&node,
+				2,
+				&RevocationAdminRequestWire::Revoke {
+					trust_domain: ActorTrustDomain::Ops,
+					key_id: vec![1, 2, 3, 4],
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let tenant_scoped_meta = decode_revocation_admin_response(&tenant_scoped_resp);
 	assert!(!tenant_scoped_meta.accepted);
 	assert_eq!(
 		tenant_scoped_meta.reason_code,

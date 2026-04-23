@@ -1,16 +1,19 @@
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use rustls::pki_types::{CertificateDer, pem::PemObject};
+use wendelon::consensus::{RevokeActorKey, raft_storage::RevocationSnapshot};
 use wendelon::network::quic_transport::canonical_server_name_resolver;
 use wendelon::network::tls::{
-	ActorIdentity, ActorPermission, ActorRole, ActorTrustDomain, ActorTrustRoots,
+	ActorIdentity, ActorPermission, ActorRole, ActorTrustDomain, ActorTrustRoots, BreakGlassScope,
 	DEFAULT_CLUSTER_DOMAIN, authorize_actor, canonical_node_dns_name,
-	verified_peer_actor_identity_from_chain_with_trust_roots, verified_peer_node_id_from_chain,
-	verified_transport_peer_from_chain,
+	verified_peer_actor_identity_from_chain_with_trust_roots,
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations,
+	verified_peer_node_id_from_chain, verified_transport_peer_from_chain,
 };
 use wendelon::schema::NodeId;
 
@@ -353,6 +356,38 @@ fn authorization_matrix_enforces_ops_and_observability_boundaries() {
 		vec![9, 8, 7, 6],
 	)
 	.unwrap();
+	let tenant_admin = ActorIdentity::new(
+		ActorRole::TenantAdmin,
+		None,
+		None,
+		vec!["cluster".into()],
+		vec![5, 4, 3, 2],
+	)
+	.unwrap();
+	let cluster_admin = ActorIdentity::new(
+		ActorRole::ClusterAdmin,
+		None,
+		None,
+		vec!["cluster".into()],
+		vec![2, 3, 4, 5],
+	)
+	.unwrap();
+	let backup_admin = ActorIdentity::new(
+		ActorRole::BackupAdmin,
+		None,
+		None,
+		vec!["cluster".into()],
+		vec![7, 7, 7, 7],
+	)
+	.unwrap();
+	let compliance_auditor = ActorIdentity::new(
+		ActorRole::ComplianceAuditor,
+		None,
+		None,
+		vec!["cluster".into()],
+		vec![8, 8, 8, 8],
+	)
+	.unwrap();
 	let observer = ActorIdentity::new(
 		ActorRole::ReadOnlyObserver,
 		None,
@@ -367,8 +402,83 @@ fn authorization_matrix_enforces_ops_and_observability_boundaries() {
 	assert!(authorize_actor(&data_node, ActorPermission::ObservabilityMetrics).is_err());
 	assert!(authorize_actor(&data_node, ActorPermission::OpsControl).is_err());
 	assert!(authorize_actor(&operator, ActorPermission::OpsControl).is_ok());
+	assert!(authorize_actor(&tenant_admin, ActorPermission::TenantAdminMutation).is_ok());
+	assert!(authorize_actor(&tenant_admin, ActorPermission::TenantKekAdmin).is_err());
+	assert!(authorize_actor(&cluster_admin, ActorPermission::ClusterControl).is_ok());
+	assert!(authorize_actor(&cluster_admin, ActorPermission::TenantAdminMutation).is_err());
+	assert!(authorize_actor(&backup_admin, ActorPermission::TenantKekAdmin).is_ok());
+	assert!(authorize_actor(&backup_admin, ActorPermission::ClusterControl).is_err());
+	assert!(authorize_actor(&compliance_auditor, ActorPermission::AuditRead).is_ok());
+	assert!(authorize_actor(&compliance_auditor, ActorPermission::OpsControl).is_err());
 	assert!(authorize_actor(&operator, ActorPermission::ObservabilityMetrics).is_ok());
 	assert!(authorize_actor(&operator, ActorPermission::InterNodeTransport).is_err());
 	assert!(authorize_actor(&observer, ActorPermission::ObservabilityMetrics).is_ok());
 	assert!(authorize_actor(&observer, ActorPermission::OpsControl).is_err());
+}
+
+#[test]
+fn break_glass_scope_matrix_is_enforced() {
+	let diagnostic = ActorIdentity::new(
+		ActorRole::BreakGlassAdmin,
+		None,
+		None,
+		vec![BreakGlassScope::Diagnostic.as_str().to_string()],
+		vec![1, 2, 3, 4],
+	)
+	.unwrap();
+	let key_ops = ActorIdentity::new(
+		ActorRole::BreakGlassAdmin,
+		None,
+		None,
+		vec![BreakGlassScope::KeyOps.as_str().to_string()],
+		vec![5, 6, 7, 8],
+	)
+	.unwrap();
+	let full = ActorIdentity::new(
+		ActorRole::BreakGlassAdmin,
+		None,
+		None,
+		vec![BreakGlassScope::Full.as_str().to_string()],
+		vec![9, 9, 9, 9],
+	)
+	.unwrap();
+
+	assert!(authorize_actor(&diagnostic, ActorPermission::ObservabilityMetrics).is_ok());
+	assert!(authorize_actor(&diagnostic, ActorPermission::AuditRead).is_ok());
+	assert!(authorize_actor(&diagnostic, ActorPermission::TenantAdminMutation).is_err());
+	assert!(authorize_actor(&diagnostic, ActorPermission::ClusterControl).is_err());
+
+	assert!(authorize_actor(&key_ops, ActorPermission::TenantKekAdmin).is_ok());
+	assert!(authorize_actor(&key_ops, ActorPermission::ObservabilityMetrics).is_err());
+	assert!(authorize_actor(&key_ops, ActorPermission::ClusterControl).is_err());
+
+	assert!(authorize_actor(&full, ActorPermission::ObservabilityMetrics).is_ok());
+	assert!(authorize_actor(&full, ActorPermission::TenantAdminMutation).is_ok());
+	assert!(authorize_actor(&full, ActorPermission::TenantKekAdmin).is_ok());
+	assert!(authorize_actor(&full, ActorPermission::ClusterControl).is_ok());
+}
+
+#[test]
+fn revoked_actor_key_ids_are_rejected_by_identity_verifier() {
+	let certs = certs_from_fixture("operator.crt");
+	let roots = trust_roots();
+	let mut revoked = BTreeMap::new();
+	let revoked_key = RevokeActorKey {
+		trust_domain: ActorTrustDomain::Ops,
+		key_id: vec![5, 6, 7, 8],
+		revoked_at_ms: 1,
+	};
+	revoked.insert(revoked_key.key(), revoked_key.revoked_at_ms);
+	let snapshot = RevocationSnapshot {
+		revoked_actor_keys: Arc::new(revoked),
+	};
+	let err = verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+		&certs,
+		DEFAULT_CLUSTER_DOMAIN,
+		Some(&roots),
+		Some(&snapshot),
+	)
+	.unwrap_err();
+	assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+	assert!(err.to_string().contains("revoked"));
 }

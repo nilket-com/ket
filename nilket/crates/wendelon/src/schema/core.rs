@@ -478,6 +478,8 @@ impl MsgType {
 	pub const TENANT_ADMIN_RESP: Self = Self(0x1D);
 	pub const AUDIT_CHAIN_HEAD_REQ: Self = Self(0x1E);
 	pub const AUDIT_CHAIN_HEAD_RESP: Self = Self(0x1F);
+	pub const REVOCATION_ADMIN_REQ: Self = Self(0x30);
+	pub const REVOCATION_ADMIN_RESP: Self = Self(0x31);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);

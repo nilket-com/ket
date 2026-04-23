@@ -1,8 +1,9 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink};
+use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::metrics::global;
 use crate::network::tls::{
 	ActorPermission, ActorTrustRoots, authorize_actor,
-	verified_peer_actor_identity_from_chain_with_trust_roots,
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations,
 };
 use crate::schema::NodeId;
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
@@ -80,6 +82,7 @@ pub async fn spawn(
 	cluster_domain: impl Into<String>,
 	trust_roots: Arc<ActorTrustRoots>,
 	audit_sink: Arc<dyn AuditSink>,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<ObservabilityHandles> {
 	let cluster_domain = cluster_domain.into();
 	let health_listener = TcpListener::bind(&addresses.health).await?;
@@ -94,6 +97,7 @@ pub async fn spawn(
 		cluster_domain.clone(),
 		trust_roots.clone(),
 		audit_sink.clone(),
+		revocations.clone(),
 	)
 	.await?;
 	let metrics = spawn_metrics(
@@ -104,6 +108,7 @@ pub async fn spawn(
 		cluster_domain,
 		trust_roots,
 		audit_sink,
+		revocations,
 	)
 	.await?;
 	Ok(ObservabilityHandles {
@@ -136,6 +141,7 @@ pub async fn spawn_ready(
 	cluster_domain: impl Into<String>,
 	trust_roots: Arc<ActorTrustRoots>,
 	audit_sink: Arc<dyn AuditSink>,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<ListenerHandle> {
 	let cluster_domain = cluster_domain.into();
 	let local_addr = listener.local_addr()?;
@@ -149,6 +155,7 @@ pub async fn spawn_ready(
 			let cluster_domain = cluster_domain.clone();
 			let trust_roots = trust_roots.clone();
 			let audit_sink = audit_sink.clone();
+			let revocations = revocations.clone();
 			tokio::spawn(async move {
 				let _ = handle_ready_connection(
 					stream,
@@ -158,6 +165,7 @@ pub async fn spawn_ready(
 					&cluster_domain,
 					&trust_roots,
 					&*audit_sink,
+					revocations.as_ref(),
 				)
 				.await;
 			});
@@ -174,6 +182,7 @@ pub async fn spawn_metrics(
 	cluster_domain: impl Into<String>,
 	trust_roots: Arc<ActorTrustRoots>,
 	audit_sink: Arc<dyn AuditSink>,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<ListenerHandle> {
 	let cluster_domain = cluster_domain.into();
 	let local_addr = listener.local_addr()?;
@@ -187,6 +196,7 @@ pub async fn spawn_metrics(
 			let cluster_domain = cluster_domain.clone();
 			let trust_roots = trust_roots.clone();
 			let audit_sink = audit_sink.clone();
+			let revocations = revocations.clone();
 			tokio::spawn(async move {
 				let _ = handle_metrics_connection(
 					stream,
@@ -196,6 +206,7 @@ pub async fn spawn_metrics(
 					&cluster_domain,
 					&trust_roots,
 					&*audit_sink,
+					revocations.as_ref(),
 				)
 				.await;
 			});
@@ -230,6 +241,7 @@ async fn handle_ready_connection(
 	cluster_domain: &str,
 	trust_roots: &ActorTrustRoots,
 	audit_sink: &dyn AuditSink,
+	revocations: Option<&watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	let (mut stream, actor) = accept_tls(
 		stream,
@@ -237,6 +249,7 @@ async fn handle_ready_connection(
 		cluster_domain,
 		trust_roots,
 		ActorPermission::ObservabilityReady,
+		revocations,
 	)
 	.await?;
 	let req = read_request(&mut stream).await?;
@@ -278,6 +291,7 @@ async fn handle_metrics_connection(
 	cluster_domain: &str,
 	trust_roots: &ActorTrustRoots,
 	audit_sink: &dyn AuditSink,
+	revocations: Option<&watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	let (mut stream, actor) = accept_tls(
 		stream,
@@ -285,6 +299,7 @@ async fn handle_metrics_connection(
 		cluster_domain,
 		trust_roots,
 		ActorPermission::ObservabilityMetrics,
+		revocations,
 	)
 	.await?;
 	let req = read_request(&mut stream).await?;
@@ -327,6 +342,7 @@ async fn accept_tls(
 	cluster_domain: &str,
 	trust_roots: &ActorTrustRoots,
 	permission: ActorPermission,
+	revocations: Option<&watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<(
 	tokio_rustls::server::TlsStream<TcpStream>,
 	crate::network::tls::ActorIdentity,
@@ -341,10 +357,11 @@ async fn accept_tls(
 			"peer presented no TLS identity",
 		)
 	})?;
-	let actor = verified_peer_actor_identity_from_chain_with_trust_roots(
+	let actor = verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
 		certs,
 		cluster_domain,
 		Some(trust_roots),
+		revocations.map(|rx| rx.borrow().clone()).as_deref(),
 	)?;
 	authorize_actor(&actor, permission)?;
 	Ok((stream, actor))

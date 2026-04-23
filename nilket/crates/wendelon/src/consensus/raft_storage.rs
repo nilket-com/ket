@@ -52,12 +52,13 @@ use crate::audit::{
 };
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
-	MigrationLedgerEntry, MigrationState, SeedMigration, TenantFinalization, TenantLifecycleState,
-	TenantRecord, TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse,
-	WendelonTypeConfig,
+	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
+	TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab, UpdateTenantQuota,
+	WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::metrics::global as metrics;
+use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
 	RaftLogEntryFixed, SlabId, SnapshotHeader, TenantId, TenantKekId, WALRecordHeader,
@@ -1503,6 +1504,12 @@ pub struct SmState {
 	/// upgrades.
 	#[serde(default)]
 	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
+	/// Replicated actor-certificate denylist keyed by trust domain and
+	/// stable claim `key_id`. Transport and observability admission use
+	/// this set directly so revocation does not depend on external CRL
+	/// fetch timing.
+	#[serde(default)]
+	pub revoked_actor_keys: BTreeMap<RevokedActorKeyId, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1577,10 +1584,30 @@ pub struct AdmissionSnapshot {
 	pub e_safe_watermarks: Arc<HashMap<u64, HybridTimestamp>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevocationSnapshot {
+	pub revoked_actor_keys: Arc<BTreeMap<RevokedActorKeyId, u64>>,
+}
+
+impl RevocationSnapshot {
+	pub fn contains(&self, trust_domain: ActorTrustDomain, key_id: &[u8]) -> bool {
+		self.revoked_actor_keys.contains_key(&RevokedActorKeyId {
+			trust_domain,
+			key_id: key_id.to_vec(),
+		})
+	}
+}
+
 fn admission_snapshot_from_state(state: &SmState) -> Arc<AdmissionSnapshot> {
 	Arc::new(AdmissionSnapshot {
 		current_epoch: state.e_safe_watermarks.keys().copied().max().unwrap_or(0),
 		e_safe_watermarks: Arc::new(state.e_safe_watermarks.clone()),
+	})
+}
+
+fn revocation_snapshot_from_state(state: &SmState) -> Arc<RevocationSnapshot> {
+	Arc::new(RevocationSnapshot {
+		revoked_actor_keys: Arc::new(state.revoked_actor_keys.clone()),
 	})
 }
 
@@ -1591,6 +1618,18 @@ fn admission_snapshot_changed(
 ) -> bool {
 	current.current_epoch != current_epoch
 		|| current.e_safe_watermarks.as_ref() != &state.e_safe_watermarks
+}
+
+fn revocation_snapshot_changed(current: &RevocationSnapshot, state: &SmState) -> bool {
+	current.revoked_actor_keys.as_ref() != &state.revoked_actor_keys
+}
+
+const REVOKED_ACTOR_KEY_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn prune_expired_revoked_actor_keys(state: &mut SmState, prune_before_ms: u64) {
+	state
+		.revoked_actor_keys
+		.retain(|_, revoked_at_ms| *revoked_at_ms == 0 || *revoked_at_ms >= prune_before_ms);
 }
 
 /// Out-of-band observer for [`TieredSlab`] apply events.
@@ -2005,6 +2044,8 @@ pub struct WendelonStateMachine {
 	inner: Arc<RwLock<SmInner>>,
 	snapshot_runtime: SnapshotRuntime,
 	admission_snapshot: watch::Sender<Arc<AdmissionSnapshot>>,
+	revocation_snapshot: watch::Sender<Arc<RevocationSnapshot>>,
+	external_revocation_snapshot: Option<watch::Sender<Arc<RevocationSnapshot>>>,
 	/// Optional callback fired every time a [`TieredSlab`] lands
 	/// in the state. The local `SlabManager` installs one so it
 	/// can unlink the L1 file once the cluster has agreed the
@@ -2027,11 +2068,15 @@ impl WendelonStateMachine {
 	pub fn new() -> Self {
 		let (admission_snapshot, _) =
 			watch::channel(admission_snapshot_from_state(&SmState::default()));
+		let (revocation_snapshot, _) =
+			watch::channel(revocation_snapshot_from_state(&SmState::default()));
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			admission_snapshot,
+			revocation_snapshot,
+			external_revocation_snapshot: None,
 			tier_observer: None,
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
@@ -2088,10 +2133,13 @@ impl WendelonStateMachine {
 		}
 
 		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
+		let revocation_snapshot = watch::channel(revocation_snapshot_from_state(&inner.state)).0;
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
 			snapshot_runtime,
 			admission_snapshot,
+			revocation_snapshot,
+			external_revocation_snapshot: None,
 			tier_observer: None,
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
@@ -2116,6 +2164,15 @@ impl WendelonStateMachine {
 
 	pub fn with_checkpoint_observer(mut self, observer: Arc<dyn CheckpointObserver>) -> Self {
 		self.checkpoint_observer = Some(observer);
+		self
+	}
+
+	pub fn with_external_revocation_snapshot(
+		mut self,
+		sender: watch::Sender<Arc<RevocationSnapshot>>,
+	) -> Self {
+		let _ = sender.send_replace(self.current_revocation_snapshot());
+		self.external_revocation_snapshot = Some(sender);
 		self
 	}
 
@@ -2145,6 +2202,14 @@ impl WendelonStateMachine {
 		self.admission_snapshot.borrow().clone()
 	}
 
+	pub fn subscribe_revocation_snapshot(&self) -> watch::Receiver<Arc<RevocationSnapshot>> {
+		self.revocation_snapshot.subscribe()
+	}
+
+	pub fn current_revocation_snapshot(&self) -> Arc<RevocationSnapshot> {
+		self.revocation_snapshot.borrow().clone()
+	}
+
 	fn publish_admission_snapshot_if_changed(&self, state: &SmState) {
 		let current_epoch = state.e_safe_watermarks.keys().copied().max().unwrap_or(0);
 		let should_publish = {
@@ -2155,6 +2220,25 @@ impl WendelonStateMachine {
 			self.admission_snapshot
 				.send_replace(admission_snapshot_from_state(state));
 		}
+	}
+
+	fn publish_revocation_snapshot_if_changed(&self, state: &SmState) {
+		let should_publish = {
+			let current = self.revocation_snapshot.borrow();
+			revocation_snapshot_changed(&current, state)
+		};
+		if should_publish {
+			let snapshot = revocation_snapshot_from_state(state);
+			self.revocation_snapshot.send_replace(snapshot.clone());
+			if let Some(external) = &self.external_revocation_snapshot {
+				external.send_replace(snapshot);
+			}
+		}
+	}
+
+	fn publish_live_snapshots_if_changed(&self, state: &SmState) {
+		self.publish_admission_snapshot_if_changed(state);
+		self.publish_revocation_snapshot_if_changed(state);
 	}
 
 	/// Test / caller inspection hook — return a cloned snapshot
@@ -2187,7 +2271,7 @@ impl WendelonStateMachine {
 	pub async fn seed_e_safe_for_test(&self, epoch: u64, hlc: HybridTimestamp) {
 		let mut guard = self.inner.write().await;
 		guard.state.e_safe_watermarks.insert(epoch, hlc);
-		self.publish_admission_snapshot_if_changed(&guard.state);
+		self.publish_live_snapshots_if_changed(&guard.state);
 	}
 
 	/// Test-only hook to seed a Migration Ledger entry without
@@ -2305,7 +2389,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			}
 			// Publish under the apply lock so watch observers cannot
 			// observe snapshots out of order relative to apply order.
-			self.publish_admission_snapshot_if_changed(&guard.state);
+			self.publish_live_snapshots_if_changed(&guard.state);
 			checkpoint_observation_from_state(&guard.state, false)
 		};
 		let pending_checkpoint = pending_checkpoint;
@@ -2511,7 +2595,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			});
 			// Publish under the state lock so install-snapshot updates
 			// stay monotonic for admission-snapshot observers.
-			self.publish_admission_snapshot_if_changed(&guard.state);
+			self.publish_live_snapshots_if_changed(&guard.state);
 			checkpoint_observation_from_state(&guard.state, true)
 		};
 		let pending_checkpoint = pending_checkpoint;
@@ -2600,6 +2684,7 @@ fn raft_audit_event(
 		WendelonRequest::AdvanceEpoch(_)
 			| WendelonRequest::InstallTenantKekVersion(_)
 			| WendelonRequest::RetireTenantKekVersion(_)
+			| WendelonRequest::RevokeActorKey(_)
 			if is_err =>
 		{
 			None
@@ -2700,6 +2785,25 @@ fn raft_audit_event(
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", retirement.tenant_id.get())
 			.with_parameter("tenant_kek_id", retirement.tenant_kek_id.get()),
+		),
+		WendelonRequest::RevokeActorKey(revocation) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::IdentityActorKeyRevoked,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} trust_domain={} key_id={}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					revocation.trust_domain,
+					format_bytes_hex(&revocation.key_id),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("trust_domain", revocation.trust_domain.to_string())
+			.with_parameter("key_id", format_bytes_hex(&revocation.key_id)),
 		),
 		// Tenant admin ops are attempt-audited per ADR 021 §5: every
 		// mutation — including rejected ones — emits a record so the
@@ -3086,6 +3190,9 @@ fn apply_request(
 		WendelonRequest::RetireTenantKekVersion(retirement) => {
 			(apply_retire_tenant_kek_version(state, retirement), None)
 		}
+		WendelonRequest::RevokeActorKey(revocation) => {
+			(apply_revoke_actor_key(state, revocation), None)
+		}
 		WendelonRequest::SeedMigration(seed) => {
 			apply_seed_migration(state, seed);
 			(WendelonResponse::Success, None)
@@ -3303,6 +3410,25 @@ fn apply_retire_tenant_kek_version(
 		));
 	};
 	keyset.keys.remove(&retirement.tenant_kek_id);
+	WendelonResponse::Success
+}
+
+fn apply_revoke_actor_key(state: &mut SmState, revocation: RevokeActorKey) -> WendelonResponse {
+	if revocation.key_id.is_empty() {
+		return WendelonResponse::Error("actor certificate key_id must not be empty".to_string());
+	}
+	if revocation.revoked_at_ms == 0 {
+		return WendelonResponse::Error(
+			"actor certificate revocation timestamp must be non-zero".to_string(),
+		);
+	}
+	let prune_before_ms = revocation
+		.revoked_at_ms
+		.saturating_sub(REVOKED_ACTOR_KEY_RETENTION_MS);
+	prune_expired_revoked_actor_keys(state, prune_before_ms);
+	state
+		.revoked_actor_keys
+		.insert(revocation.key(), revocation.revoked_at_ms);
 	WendelonResponse::Success
 }
 
@@ -4244,6 +4370,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		EntryPayload::Normal(WendelonRequest::RetireTenantKekVersion(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
+		EntryPayload::Normal(WendelonRequest::RevokeActorKey(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
 			(LogEntryKind::APPEND, s.entry.to_epoch)
 		}
@@ -5390,6 +5517,79 @@ mod recovery_tests {
 		assert!(
 			changed.is_err(),
 			"lease-only apply should not publish a new admission snapshot"
+		);
+	}
+
+	#[tokio::test]
+	async fn revocation_snapshot_watch_updates_on_revoke_actor_key() {
+		let mut sm = WendelonStateMachine::new();
+		let mut snapshots = sm.subscribe_revocation_snapshot();
+		let revocation = RevokeActorKey {
+			trust_domain: ActorTrustDomain::Ops,
+			key_id: vec![1, 2, 3, 4],
+			revoked_at_ms: 1,
+		};
+		assert!(
+			!snapshots
+				.borrow()
+				.contains(revocation.trust_domain, &revocation.key_id,)
+		);
+
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			&mut sm,
+			[Entry {
+				log_id: log_id(1, 1),
+				payload: EntryPayload::Normal(WendelonRequest::RevokeActorKey(revocation.clone())),
+			}],
+		)
+		.await
+		.unwrap();
+
+		snapshots.changed().await.unwrap();
+		let snapshot = snapshots.borrow().clone();
+		assert!(snapshot.contains(revocation.trust_domain, &revocation.key_id));
+		let state = sm.state_snapshot().await;
+		assert_eq!(
+			state.revoked_actor_keys.get(&revocation.key()).copied(),
+			Some(revocation.revoked_at_ms)
+		);
+	}
+
+	#[tokio::test]
+	async fn revoke_actor_key_prunes_expired_entries_on_new_revoke() {
+		let mut sm = WendelonStateMachine::new();
+		let old = RevokeActorKey {
+			trust_domain: ActorTrustDomain::Ops,
+			key_id: vec![1, 2, 3, 4],
+			revoked_at_ms: 1,
+		};
+		let fresh = RevokeActorKey {
+			trust_domain: ActorTrustDomain::Ops,
+			key_id: vec![5, 6, 7, 8],
+			revoked_at_ms: REVOKED_ACTOR_KEY_RETENTION_MS + 2,
+		};
+
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(
+			&mut sm,
+			[
+				Entry {
+					log_id: log_id(1, 1),
+					payload: EntryPayload::Normal(WendelonRequest::RevokeActorKey(old.clone())),
+				},
+				Entry {
+					log_id: log_id(1, 2),
+					payload: EntryPayload::Normal(WendelonRequest::RevokeActorKey(fresh.clone())),
+				},
+			],
+		)
+		.await
+		.unwrap();
+
+		let state = sm.state_snapshot().await;
+		assert!(!state.revoked_actor_keys.contains_key(&old.key()));
+		assert_eq!(
+			state.revoked_actor_keys.get(&fresh.key()).copied(),
+			Some(fresh.revoked_at_ms)
 		);
 	}
 

@@ -42,7 +42,8 @@ use crate::consensus::monitor::{
 use crate::consensus::raft_network::WendelonRaftNetworkFactory;
 use crate::consensus::raft_server::WendelonRaftInternalServer;
 use crate::consensus::raft_storage::{
-	CheckpointCoordinator, DurableBootstrapMode, WendelonLogStore, WendelonStateMachine,
+	CheckpointCoordinator, DurableBootstrapMode, RevocationSnapshot, WendelonLogStore,
+	WendelonStateMachine,
 };
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
@@ -770,6 +771,7 @@ impl WendelonNode {
 	/// fresh-cluster step and restarts from the recovered Raft
 	/// artifacts.
 	pub async fn bootstrap(cfg: NodeBootstrapConfig) -> std::io::Result<Self> {
+		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		if let Some(tls) = cfg.transport_tls.clone() {
 			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
 			let bind_addr = resolve_socket_addr(&cfg.advertise_address)?;
@@ -781,19 +783,25 @@ impl WendelonNode {
 			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 			providers.insert(
 				TransportTier::QuicIoUring,
-				Arc::new(QuicTransportProvider::with_cluster_domain(
-					Arc::new(quic_endpoint.clone()),
-					server_name.clone(),
-					&cluster_domain,
-				)),
+				Arc::new(
+					QuicTransportProvider::with_cluster_domain(
+						Arc::new(quic_endpoint.clone()),
+						server_name.clone(),
+						&cluster_domain,
+					)
+					.with_revocations(revocation_tx.subscribe()),
+				),
 			);
 			providers.insert(
 				TransportTier::TcpTls,
-				Arc::new(TcpTlsTransportProvider::with_cluster_domain(
-					rustls_client_config(&material)?,
-					server_name,
-					&cluster_domain,
-				)),
+				Arc::new(
+					TcpTlsTransportProvider::with_cluster_domain(
+						rustls_client_config(&material)?,
+						server_name,
+						&cluster_domain,
+					)
+					.with_revocations(revocation_tx.subscribe()),
+				),
 			);
 			return Self::bootstrap_with_transport_stack(
 				cfg,
@@ -810,6 +818,7 @@ impl WendelonNode {
 						cluster_domain,
 					},
 				],
+				revocation_tx,
 			)
 			.await;
 		}
@@ -932,6 +941,7 @@ impl WendelonNode {
 		provider: Arc<dyn TransportProvider>,
 		provider_tier: TransportTier,
 	) -> std::io::Result<Self> {
+		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		let startup_listeners = if provider_tier == TransportTier::TcpTls {
 			let tls = cfg.transport_tls.as_ref().ok_or_else(|| {
 				Error::new(
@@ -957,6 +967,7 @@ impl WendelonNode {
 			transport_tiers_for_provider(provider_tier),
 			providers,
 			startup_listeners,
+			revocation_tx,
 		)
 		.await
 	}
@@ -966,6 +977,7 @@ impl WendelonNode {
 		local_tiers: TransportTierSet,
 		providers: HashMap<TransportTier, Arc<dyn TransportProvider>>,
 		startup_listeners: Vec<BootstrapListener>,
+		revocation_tx: watch::Sender<Arc<RevocationSnapshot>>,
 	) -> std::io::Result<Self> {
 		cfg.validate()?;
 		let local_node = NodeId {
@@ -1035,7 +1047,8 @@ impl WendelonNode {
 			.await?
 			.with_tier_observer(tier_observer)
 			.with_tenant_kek_observer(crypto.clone())
-			.with_checkpoint_observer(checkpoint_coordinator.clone());
+			.with_checkpoint_observer(checkpoint_coordinator.clone())
+			.with_external_revocation_snapshot(revocation_tx.clone());
 		let checkpoint_emitter = checkpoint_coordinator.spawn();
 
 		// 5. Seed membership epoch from durable history if present;
@@ -1272,6 +1285,7 @@ impl WendelonNode {
 					lifecycle.clone(),
 					cfg.transport_admission.clone(),
 					cluster_domain,
+					revocation_tx.subscribe(),
 				)),
 				BootstrapListener::TcpTls {
 					listener,
@@ -1285,6 +1299,7 @@ impl WendelonNode {
 					lifecycle.clone(),
 					cfg.transport_admission.clone(),
 					cluster_domain,
+					revocation_tx.subscribe(),
 				)),
 			})
 			.collect::<Vec<_>>();
@@ -1499,6 +1514,7 @@ impl WendelonNode {
 			self.lifecycle.clone(),
 			self.transport_admission.clone(),
 			cluster_domain.into(),
+			self.state_machine.subscribe_revocation_snapshot(),
 		)
 	}
 
@@ -1513,6 +1529,7 @@ impl WendelonNode {
 		let lifecycle = self.lifecycle.clone();
 		let admission = self.transport_admission.clone();
 		let cluster_domain = cluster_domain.into();
+		let revocations = self.state_machine.subscribe_revocation_snapshot();
 		let task = tokio::spawn({
 			let lifecycle = lifecycle.clone();
 			async move {
@@ -1524,6 +1541,7 @@ impl WendelonNode {
 					lifecycle,
 					admission,
 					cluster_domain,
+					Some(revocations),
 				)
 				.await
 			}
@@ -1629,6 +1647,7 @@ async fn serve_dyn(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -1657,6 +1676,7 @@ async fn serve_dyn(
 		lifecycle,
 		admission,
 		cluster_domain,
+		revocations,
 	)
 	.await
 }
@@ -1669,6 +1689,7 @@ async fn serve_dyn_tcp_tls(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -1699,6 +1720,7 @@ async fn serve_dyn_tcp_tls(
 		lifecycle,
 		admission,
 		cluster_domain,
+		revocations,
 	)
 	.await
 }
@@ -1710,6 +1732,7 @@ fn spawn_quic_server(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
+	revocations: watch::Receiver<Arc<RevocationSnapshot>>,
 ) -> QuicServerHandle {
 	let task_endpoint = endpoint.clone();
 	let task = tokio::spawn({
@@ -1722,6 +1745,7 @@ fn spawn_quic_server(
 				lifecycle,
 				admission,
 				cluster_domain,
+				Some(revocations),
 			)
 			.await
 		}
@@ -1741,6 +1765,7 @@ fn spawn_tcp_tls_server(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
+	revocations: watch::Receiver<Arc<RevocationSnapshot>>,
 ) -> TcpTlsServerHandle {
 	let task = tokio::spawn({
 		let lifecycle = lifecycle.clone();
@@ -1753,6 +1778,7 @@ fn spawn_tcp_tls_server(
 				lifecycle,
 				admission,
 				cluster_domain,
+				Some(revocations),
 			)
 			.await
 		}

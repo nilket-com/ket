@@ -2,22 +2,25 @@
 mod tls_pki;
 
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use uuid::Uuid;
 use wendelon::audit::{AuditEvent, AuditSink, LocalAuditSink};
+use wendelon::consensus::{RevokeActorKey, raft_storage::RevocationSnapshot};
 use wendelon::metrics::observability::{
 	self, DrainState, ListenerAddresses, ObservabilityHandles, ReadinessReporter, ReadinessSnapshot,
 };
 use wendelon::network::{
-	ActorTrustRoots, TlsMaterial, canonical_node_dns_name, rustls_client_config_with_alpn,
-	rustls_server_config_with_peer_roots,
+	ActorTrustDomain, ActorTrustRoots, TlsMaterial, canonical_node_dns_name,
+	rustls_client_config_with_alpn, rustls_server_config_with_peer_roots,
 };
 
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -83,6 +86,7 @@ async fn listeners_enforce_health_ready_and_metrics_posture() {
 		tls_pki::CLUSTER_DOMAIN,
 		trust_roots,
 		audit_sink,
+		None,
 	)
 	.await
 	.unwrap();
@@ -225,6 +229,7 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 		tls_pki::CLUSTER_DOMAIN,
 		trust_roots,
 		audit_sink,
+		None,
 	)
 	.await
 	.unwrap();
@@ -278,6 +283,79 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 }
 
 #[tokio::test]
+async fn observability_rejects_revoked_operator_certificate() {
+	let root = fresh_dir("revoked-operator");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let audit_path = root.join("audit.ndjson");
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let trust_roots = Arc::new(ActorTrustRoots::load(&pki.ca_cert, &pki.ops_ca_cert).unwrap());
+	let audit_sink: Arc<dyn AuditSink> = Arc::new(LocalAuditSink::open(&audit_path).unwrap());
+	let acceptor = TlsAcceptor::from(Arc::new(
+		rustls_server_config_with_peer_roots(
+			&server_material,
+			trust_roots.combined_roots(),
+			Vec::new(),
+		)
+		.unwrap(),
+	));
+	let mut revoked = BTreeMap::new();
+	let revoked_key = RevokeActorKey {
+		trust_domain: ActorTrustDomain::Ops,
+		key_id: vec![5, 6, 7, 8],
+		revoked_at_ms: 1,
+	};
+	revoked.insert(revoked_key.key(), revoked_key.revoked_at_ms);
+	let (revocation_tx, revocation_rx) = watch::channel(Arc::new(RevocationSnapshot {
+		revoked_actor_keys: Arc::new(revoked),
+	}));
+	let handles = observability::spawn(
+		ListenerAddresses {
+			health: "127.0.0.1:0".into(),
+			ready: "127.0.0.1:0".into(),
+			metrics: "127.0.0.1:0".into(),
+		},
+		acceptor,
+		Arc::new(FixedReporter {
+			snapshot: ReadinessSnapshot {
+				node_id: 1,
+				epoch: 42,
+				leader_id: Some(1),
+				cluster_members: vec![1, 2, 3],
+				drain_state: DrainState::None,
+				audit_materialization_lag_entries: 0,
+				degraded_reason: None,
+				fips_mode: cfg!(feature = "fips"),
+				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+			},
+		}),
+		1,
+		tls_pki::CLUSTER_DOMAIN,
+		trust_roots,
+		audit_sink,
+		Some(revocation_rx),
+	)
+	.await
+	.unwrap();
+	drop(revocation_tx);
+
+	let denied = request_mtls(
+		handles.metrics.local_addr,
+		"/metrics",
+		&pki.operator_cert,
+		&pki.operator_key,
+		&pki.ca_cert,
+	)
+	.await;
+	assert!(
+		denied.is_empty() || !denied.starts_with("HTTP/1.1 200 OK"),
+		"revoked operator certificate unexpectedly scraped metrics: {denied}"
+	);
+
+	shutdown(handles).await;
+}
+
+#[tokio::test]
 async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 	let root = fresh_dir("ready-degraded");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
@@ -318,6 +396,7 @@ async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 		tls_pki::CLUSTER_DOMAIN,
 		trust_roots,
 		audit_sink,
+		None,
 	)
 	.await
 	.unwrap();
@@ -400,6 +479,7 @@ async fn observability_metrics_fail_closed_when_local_audit_sink_rejects() {
 		tls_pki::CLUSTER_DOMAIN,
 		trust_roots,
 		audit_sink,
+		None,
 	)
 	.await
 	.unwrap();

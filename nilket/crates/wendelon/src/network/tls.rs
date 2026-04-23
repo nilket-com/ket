@@ -38,11 +38,13 @@
 //!   Rotations will need an outer supervisor.
 //! * Key log / TLS tracing for debugging.
 
+use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::schema::{NodeId, TenantId};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime, pem::PemObject};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
@@ -54,11 +56,17 @@ use std::sync::{Arc, Once};
 /// ALPN.
 pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
 pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+pub const ACTOR_CLAIMS_OID_DOTTED: &str = "1.3.6.1.4.1.55555.1.1";
 
 const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
 // Placeholder PEN-backed OID until the production assignment lands.
 // TODO(pilot): replace this placeholder with the assigned production PEN.
 const ACTOR_CLAIMS_OID: &[u8] = &[0x2B, 0x06, 0x01, 0x04, 0x01, 0x83, 0xB2, 0x03, 0x01, 0x01];
+const ACTOR_CLAIMS_V1_FIELD_COUNT: usize = 4;
+const ACTOR_CLAIMS_ROLE_FIELD: &str = "role";
+const ACTOR_CLAIMS_SCOPES_FIELD: &str = "scopes";
+const ACTOR_CLAIMS_TENANT_ID_FIELD: &str = "tenant_id";
+const ACTOR_CLAIMS_KEY_ID_FIELD: &str = "key_id";
 const DNS_NAME_TAG: u8 = 0x82;
 static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
 
@@ -66,7 +74,7 @@ static INSTALL_RUSTLS_PROVIDER: Once = Once::new();
 //  ACTOR IDENTITY
 // ============================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ActorTrustDomain {
 	Data,
 	Ops,
@@ -85,8 +93,13 @@ impl std::fmt::Display for ActorTrustDomain {
 pub enum ActorRole {
 	DataNode,
 	Operator,
+	TenantAdmin,
+	ClusterAdmin,
+	BackupAdmin,
+	ComplianceAuditor,
 	ReadOnlyObserver,
 	BreakGlassAdmin,
+	QuerySession,
 }
 
 impl ActorRole {
@@ -94,15 +107,25 @@ impl ActorRole {
 		match self {
 			Self::DataNode => "data_node",
 			Self::Operator => "operator",
+			Self::TenantAdmin => "tenant_admin",
+			Self::ClusterAdmin => "cluster_admin",
+			Self::BackupAdmin => "backup_admin",
+			Self::ComplianceAuditor => "compliance_auditor",
 			Self::ReadOnlyObserver => "read_only_observer",
 			Self::BreakGlassAdmin => "break_glass_admin",
+			Self::QuerySession => "query_session",
 		}
 	}
 
 	pub fn trust_domain(self) -> ActorTrustDomain {
 		match self {
-			Self::DataNode | Self::ReadOnlyObserver => ActorTrustDomain::Data,
-			Self::Operator | Self::BreakGlassAdmin => ActorTrustDomain::Ops,
+			Self::DataNode | Self::ReadOnlyObserver | Self::QuerySession => ActorTrustDomain::Data,
+			Self::Operator
+			| Self::TenantAdmin
+			| Self::ClusterAdmin
+			| Self::BackupAdmin
+			| Self::ComplianceAuditor
+			| Self::BreakGlassAdmin => ActorTrustDomain::Ops,
 		}
 	}
 
@@ -114,8 +137,13 @@ impl ActorRole {
 		match raw {
 			"data_node" => Ok(Self::DataNode),
 			"operator" => Ok(Self::Operator),
+			"tenant_admin" => Ok(Self::TenantAdmin),
+			"cluster_admin" => Ok(Self::ClusterAdmin),
+			"backup_admin" => Ok(Self::BackupAdmin),
+			"compliance_auditor" => Ok(Self::ComplianceAuditor),
 			"read_only_observer" => Ok(Self::ReadOnlyObserver),
 			"break_glass_admin" => Ok(Self::BreakGlassAdmin),
+			"query_session" => Ok(Self::QuerySession),
 			other => Err(Error::new(
 				ErrorKind::PermissionDenied,
 				format!("unrecognized actor role {other:?}"),
@@ -239,29 +267,188 @@ impl ActorIdentity {
 pub enum ActorPermission {
 	InterNodeTransport,
 	OpsControl,
+	ControlStatus,
+	ClusterControl,
+	TenantAdminRead,
+	TenantAdminMutation,
+	TenantKekAdmin,
+	AuditRead,
 	ObservabilityReady,
 	ObservabilityMetrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BreakGlassScope {
+	Diagnostic,
+	TenantOps,
+	KeyOps,
+	ClusterOps,
+	Full,
+}
+
+impl BreakGlassScope {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Diagnostic => "diagnostic",
+			Self::TenantOps => "tenant_ops",
+			Self::KeyOps => "key_ops",
+			Self::ClusterOps => "cluster_ops",
+			Self::Full => "full",
+		}
+	}
+
+	pub fn parse(raw: &str) -> Option<Self> {
+		match raw {
+			"diagnostic" => Some(Self::Diagnostic),
+			"tenant_ops" => Some(Self::TenantOps),
+			"key_ops" => Some(Self::KeyOps),
+			"cluster_ops" => Some(Self::ClusterOps),
+			"full" => Some(Self::Full),
+			_ => None,
+		}
+	}
+}
+
+impl std::fmt::Display for BreakGlassScope {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
+pub fn authorize_break_glass_scope(
+	actor: &ActorIdentity,
+	allowed: &[BreakGlassScope],
+	context: &str,
+) -> std::io::Result<()> {
+	if !actor.break_glass {
+		return Ok(());
+	}
+	let has_allowed = actor
+		.scopes
+		.iter()
+		.filter_map(|scope| BreakGlassScope::parse(scope))
+		.any(|scope| scope == BreakGlassScope::Full || allowed.contains(&scope));
+	if has_allowed {
+		return Ok(());
+	}
+	let allowed_list = allowed
+		.iter()
+		.map(|scope| scope.as_str())
+		.collect::<Vec<_>>()
+		.join(", ");
+	Err(Error::new(
+		ErrorKind::PermissionDenied,
+		format!(
+			"break-glass actor scopes {:?} do not authorize {context}; allowed scopes: {allowed_list}",
+			actor.scopes
+		),
+	))
 }
 
 pub fn authorize_actor(actor: &ActorIdentity, permission: ActorPermission) -> std::io::Result<()> {
 	let allowed = match permission {
 		ActorPermission::InterNodeTransport => matches!(actor.role, ActorRole::DataNode),
-		ActorPermission::OpsControl => {
-			matches!(actor.role, ActorRole::Operator | ActorRole::BreakGlassAdmin)
-		}
+		ActorPermission::OpsControl => matches!(
+			actor.role,
+			ActorRole::Operator
+				| ActorRole::TenantAdmin
+				| ActorRole::ClusterAdmin
+				| ActorRole::BackupAdmin
+				| ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::ControlStatus => matches!(
+			actor.role,
+			ActorRole::DataNode
+				| ActorRole::Operator
+				| ActorRole::ClusterAdmin
+				| ActorRole::BackupAdmin
+				| ActorRole::ComplianceAuditor
+				| ActorRole::ReadOnlyObserver
+				| ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::ClusterControl => matches!(
+			actor.role,
+			ActorRole::DataNode
+				| ActorRole::Operator
+				| ActorRole::ClusterAdmin
+				| ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::TenantAdminRead => matches!(
+			actor.role,
+			ActorRole::Operator
+				| ActorRole::TenantAdmin
+				| ActorRole::BackupAdmin
+				| ActorRole::ReadOnlyObserver
+				| ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::TenantAdminMutation => matches!(
+			actor.role,
+			ActorRole::Operator | ActorRole::TenantAdmin | ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::TenantKekAdmin => matches!(
+			actor.role,
+			ActorRole::Operator | ActorRole::BackupAdmin | ActorRole::BreakGlassAdmin
+		),
+		ActorPermission::AuditRead => matches!(
+			actor.role,
+			ActorRole::Operator
+				| ActorRole::ComplianceAuditor
+				| ActorRole::ReadOnlyObserver
+				| ActorRole::BreakGlassAdmin
+		),
 		ActorPermission::ObservabilityReady => matches!(
 			actor.role,
 			ActorRole::DataNode
 				| ActorRole::Operator
+				| ActorRole::TenantAdmin
+				| ActorRole::ClusterAdmin
+				| ActorRole::BackupAdmin
+				| ActorRole::ComplianceAuditor
 				| ActorRole::ReadOnlyObserver
 				| ActorRole::BreakGlassAdmin
 		),
 		ActorPermission::ObservabilityMetrics => matches!(
 			actor.role,
-			ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
+			ActorRole::Operator
+				| ActorRole::TenantAdmin
+				| ActorRole::ClusterAdmin
+				| ActorRole::BackupAdmin
+				| ActorRole::ComplianceAuditor
+				| ActorRole::ReadOnlyObserver
+				| ActorRole::BreakGlassAdmin
 		),
 	};
 	if allowed {
+		match permission {
+			ActorPermission::ControlStatus
+			| ActorPermission::AuditRead
+			| ActorPermission::ObservabilityReady
+			| ActorPermission::ObservabilityMetrics => authorize_break_glass_scope(
+				actor,
+				&[BreakGlassScope::Diagnostic],
+				&format!("{permission:?}"),
+			)?,
+			ActorPermission::TenantAdminRead | ActorPermission::TenantAdminMutation => {
+				authorize_break_glass_scope(
+					actor,
+					&[BreakGlassScope::TenantOps],
+					&format!("{permission:?}"),
+				)?
+			}
+			ActorPermission::TenantKekAdmin => authorize_break_glass_scope(
+				actor,
+				&[BreakGlassScope::KeyOps],
+				&format!("{permission:?}"),
+			)?,
+			ActorPermission::ClusterControl | ActorPermission::OpsControl => {
+				authorize_break_glass_scope(
+					actor,
+					&[BreakGlassScope::ClusterOps],
+					&format!("{permission:?}"),
+				)?
+			}
+			ActorPermission::InterNodeTransport => {}
+		}
 		return Ok(());
 	}
 	Err(Error::new(
@@ -469,18 +656,38 @@ pub fn verified_peer_actor_identity(
 	connection: &quinn::Connection,
 	cluster_domain: &str,
 ) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_with_revocations(connection, cluster_domain, None)
+}
+
+pub fn verified_peer_actor_identity_with_revocations(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
+) -> std::io::Result<ActorIdentity> {
 	let identity = connection.peer_identity().ok_or_else(|| {
 		Error::new(
 			ErrorKind::PermissionDenied,
 			"peer presented no TLS identity",
 		)
 	})?;
-	verified_peer_actor_identity_from_identity(identity, cluster_domain)
+	verified_peer_actor_identity_from_identity_with_revocations(
+		identity,
+		cluster_domain,
+		revocations,
+	)
 }
 
 pub fn verified_peer_actor_identity_from_identity(
 	identity: Box<dyn Any>,
 	cluster_domain: &str,
+) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_from_identity_with_revocations(identity, cluster_domain, None)
+}
+
+pub fn verified_peer_actor_identity_from_identity_with_revocations(
+	identity: Box<dyn Any>,
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
 ) -> std::io::Result<ActorIdentity> {
 	let certs = identity
 		.downcast::<Vec<CertificateDer<'static>>>()
@@ -490,20 +697,56 @@ pub fn verified_peer_actor_identity_from_identity(
 				"peer identity is not a rustls certificate chain",
 			)
 		})?;
-	verified_peer_actor_identity_from_chain(certs.as_slice(), cluster_domain)
+	verified_peer_actor_identity_from_chain_with_revocations(
+		certs.as_slice(),
+		cluster_domain,
+		revocations,
+	)
 }
 
 pub fn verified_peer_actor_identity_from_chain(
 	cert_chain: &[CertificateDer<'_>],
 	cluster_domain: &str,
 ) -> std::io::Result<ActorIdentity> {
-	verified_peer_actor_identity_from_chain_with_trust_roots(cert_chain, cluster_domain, None)
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+		cert_chain,
+		cluster_domain,
+		None,
+		None,
+	)
+}
+
+pub fn verified_peer_actor_identity_from_chain_with_revocations(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
+) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+		cert_chain,
+		cluster_domain,
+		None,
+		revocations,
+	)
 }
 
 pub fn verified_peer_actor_identity_from_chain_with_trust_roots(
 	cert_chain: &[CertificateDer<'_>],
 	cluster_domain: &str,
 	trust_roots: Option<&ActorTrustRoots>,
+) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+		cert_chain,
+		cluster_domain,
+		trust_roots,
+		None,
+	)
+}
+
+pub fn verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+	trust_roots: Option<&ActorTrustRoots>,
+	revocations: Option<&RevocationSnapshot>,
 ) -> std::io::Result<ActorIdentity> {
 	let leaf = cert_chain
 		.first()
@@ -523,14 +766,23 @@ pub fn verified_peer_actor_identity_from_chain_with_trust_roots(
 			));
 		}
 	}
-	ActorIdentity::new(
+	let identity = ActorIdentity::new(
 		claims.role,
 		node_id,
 		claims.tenant_id,
 		claims.scopes,
 		claims.key_id,
-	)
-	.map(|identity| identity.with_cert_subject(extract_cert_subject(leaf.as_ref()).ok()))
+	)?
+	.with_cert_subject(extract_cert_subject(leaf.as_ref()).ok());
+	if let Some(revocations) = revocations {
+		if revocations.contains(identity.trust_domain, &identity.key_id) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"actor certificate key_id is revoked",
+			));
+		}
+	}
+	Ok(identity)
 }
 
 /// Transport-facing identity verifier. Inter-node QUIC requires a
@@ -540,18 +792,34 @@ pub fn verified_transport_peer(
 	connection: &quinn::Connection,
 	cluster_domain: &str,
 ) -> std::io::Result<VerifiedTransportPeer> {
+	verified_transport_peer_with_revocations(connection, cluster_domain, None)
+}
+
+pub fn verified_transport_peer_with_revocations(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
+) -> std::io::Result<VerifiedTransportPeer> {
 	let identity = connection.peer_identity().ok_or_else(|| {
 		Error::new(
 			ErrorKind::PermissionDenied,
 			"peer presented no TLS identity",
 		)
 	})?;
-	verified_transport_peer_from_identity(identity, cluster_domain)
+	verified_transport_peer_from_identity_with_revocations(identity, cluster_domain, revocations)
 }
 
 pub fn verified_transport_peer_from_identity(
 	identity: Box<dyn Any>,
 	cluster_domain: &str,
+) -> std::io::Result<VerifiedTransportPeer> {
+	verified_transport_peer_from_identity_with_revocations(identity, cluster_domain, None)
+}
+
+pub fn verified_transport_peer_from_identity_with_revocations(
+	identity: Box<dyn Any>,
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
 ) -> std::io::Result<VerifiedTransportPeer> {
 	let certs = identity
 		.downcast::<Vec<CertificateDer<'static>>>()
@@ -561,14 +829,30 @@ pub fn verified_transport_peer_from_identity(
 				"peer identity is not a rustls certificate chain",
 			)
 		})?;
-	verified_transport_peer_from_chain(certs.as_slice(), cluster_domain)
+	verified_transport_peer_from_chain_with_revocations(
+		certs.as_slice(),
+		cluster_domain,
+		revocations,
+	)
 }
 
 pub fn verified_transport_peer_from_chain(
 	cert_chain: &[CertificateDer<'_>],
 	cluster_domain: &str,
 ) -> std::io::Result<VerifiedTransportPeer> {
-	let actor_identity = verified_peer_actor_identity_from_chain(cert_chain, cluster_domain)?;
+	verified_transport_peer_from_chain_with_revocations(cert_chain, cluster_domain, None)
+}
+
+pub fn verified_transport_peer_from_chain_with_revocations(
+	cert_chain: &[CertificateDer<'_>],
+	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
+) -> std::io::Result<VerifiedTransportPeer> {
+	let actor_identity = verified_peer_actor_identity_from_chain_with_revocations(
+		cert_chain,
+		cluster_domain,
+		revocations,
+	)?;
 	authorize_actor(&actor_identity, ActorPermission::InterNodeTransport)?;
 	let node_id = actor_identity.node_id.ok_or_else(|| {
 		Error::new(
@@ -705,12 +989,74 @@ fn verify_chain_against_roots(
 		.is_ok())
 }
 
-#[derive(Debug)]
-struct EncodedActorClaims {
+/// Frozen pilot-era actor-claims payload.
+///
+/// The extension is a versionless CBOR map with exactly four keys:
+/// `role`, `scopes`, `tenant_id`, and `key_id`. Cluster-wide actors
+/// still carry `tenant_id`, but encode it as `null` rather than omitting
+/// the field. This keeps the external claim surface stable without
+/// forcing cert-fixture churn for a new version field.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ActorClaimsV1 {
+	pub(crate) role: ActorRole,
+	pub(crate) scopes: Vec<String>,
+	pub(crate) tenant_id: Option<String>,
+	pub(crate) key_id: Vec<u8>,
+}
+
+pub(crate) fn encode_actor_claims_cbor_v1(
 	role: ActorRole,
-	scopes: Vec<String>,
-	tenant_id: Option<String>,
-	key_id: Vec<u8>,
+	scopes: &[String],
+	tenant_id: Option<&str>,
+	key_id: &[u8],
+) -> Vec<u8> {
+	let mut out = Vec::new();
+	cbor_write_len(&mut out, 5, ACTOR_CLAIMS_V1_FIELD_COUNT);
+
+	cbor_write_text(&mut out, ACTOR_CLAIMS_ROLE_FIELD);
+	cbor_write_text(&mut out, role.as_str());
+
+	cbor_write_text(&mut out, ACTOR_CLAIMS_SCOPES_FIELD);
+	cbor_write_len(&mut out, 4, scopes.len());
+	for scope in scopes {
+		cbor_write_text(&mut out, scope);
+	}
+
+	cbor_write_text(&mut out, ACTOR_CLAIMS_TENANT_ID_FIELD);
+	match tenant_id {
+		Some(tenant_id) => cbor_write_text(&mut out, tenant_id),
+		None => out.push(0xF6),
+	}
+
+	cbor_write_text(&mut out, ACTOR_CLAIMS_KEY_ID_FIELD);
+	cbor_write_bytes(&mut out, key_id);
+
+	out
+}
+
+fn cbor_write_text(out: &mut Vec<u8>, text: &str) {
+	cbor_write_len(out, 3, text.len());
+	out.extend_from_slice(text.as_bytes());
+}
+
+fn cbor_write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+	cbor_write_len(out, 2, bytes.len());
+	out.extend_from_slice(bytes);
+}
+
+fn cbor_write_len(out: &mut Vec<u8>, major: u8, len: usize) {
+	match len {
+		0..=23 => out.push((major << 5) | (len as u8)),
+		24..=0xFF => {
+			out.push((major << 5) | 24);
+			out.push(len as u8);
+		}
+		0x100..=0xFFFF => {
+			out.push((major << 5) | 25);
+			out.extend_from_slice(&(len as u16).to_be_bytes());
+		}
+		_ => panic!("actor claims encoder does not support length {len}"),
+	}
 }
 
 // ============================================================
@@ -917,7 +1263,7 @@ fn decode_subject_attribute_value(tag: u8, value: &[u8]) -> std::io::Result<Stri
 	}
 }
 
-fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<EncodedActorClaims> {
+fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<ActorClaimsV1> {
 	let mut cert = DerReader::new(cert_der);
 	let certificate = cert.read_tlv(0x30, "certificate")?;
 	let mut certificate = DerReader::new(certificate);
@@ -951,7 +1297,7 @@ fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<EncodedActorClaims> 
 	let mut extensions = DerReader::new(extensions);
 	let extensions = extensions.read_tlv(0x30, "extensions sequence")?;
 	let mut extensions = DerReader::new(extensions);
-	let mut claims: Option<EncodedActorClaims> = None;
+	let mut claims: Option<ActorClaimsV1> = None;
 
 	while !extensions.is_empty() {
 		let extension = extensions.read_tlv(0x30, "extension")?;
@@ -993,9 +1339,17 @@ fn extract_actor_claims(cert_der: &[u8]) -> std::io::Result<EncodedActorClaims> 
 	})
 }
 
-fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> {
+pub(crate) fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<ActorClaimsV1> {
 	let mut reader = CborReader::new(bytes);
 	let field_count = reader.read_len_for_major(5, "actor claims map")?;
+	if field_count != ACTOR_CLAIMS_V1_FIELD_COUNT {
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			format!(
+				"actor-claims extension must contain exactly {ACTOR_CLAIMS_V1_FIELD_COUNT} fields"
+			),
+		));
+	}
 	let mut role: Option<ActorRole> = None;
 	let mut scopes: Option<Vec<String>> = None;
 	let mut tenant_id: Option<Option<String>> = None;
@@ -1004,11 +1358,23 @@ fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> 
 	for _ in 0..field_count {
 		let key = reader.read_text("actor-claims key")?;
 		match key.as_str() {
-			"role" => {
+			ACTOR_CLAIMS_ROLE_FIELD => {
+				if role.is_some() {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"actor-claims extension contains duplicate role",
+					));
+				}
 				let role_text = reader.read_text("actor role")?;
 				role = Some(ActorRole::parse(&role_text)?);
 			}
-			"scopes" => {
+			ACTOR_CLAIMS_SCOPES_FIELD => {
+				if scopes.is_some() {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"actor-claims extension contains duplicate scopes",
+					));
+				}
 				let scope_count = reader.read_len_for_major(4, "actor scopes")?;
 				let mut parsed = Vec::with_capacity(scope_count);
 				for _ in 0..scope_count {
@@ -1016,7 +1382,13 @@ fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> 
 				}
 				scopes = Some(parsed);
 			}
-			"tenant_id" => {
+			ACTOR_CLAIMS_TENANT_ID_FIELD => {
+				if tenant_id.is_some() {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"actor-claims extension contains duplicate tenant_id",
+					));
+				}
 				tenant_id = Some(if reader.peek_simple_null() {
 					reader.read_null("tenant_id")?;
 					None
@@ -1024,10 +1396,21 @@ fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> 
 					Some(reader.read_text("tenant_id")?)
 				});
 			}
-			"key_id" => {
+			ACTOR_CLAIMS_KEY_ID_FIELD => {
+				if key_id.is_some() {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"actor-claims extension contains duplicate key_id",
+					));
+				}
 				key_id = Some(reader.read_bytes("key_id")?);
 			}
-			_ => reader.skip_value()?,
+			other => {
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					format!("actor-claims extension contains unknown field {other:?}"),
+				));
+			}
 		}
 	}
 	if !reader.is_empty() {
@@ -1036,22 +1419,39 @@ fn parse_actor_claims_cbor(bytes: &[u8]) -> std::io::Result<EncodedActorClaims> 
 			"actor-claims extension contains trailing CBOR bytes",
 		));
 	}
-	Ok(EncodedActorClaims {
+	let claims = ActorClaimsV1 {
 		role: role.ok_or_else(|| {
 			Error::new(
 				ErrorKind::PermissionDenied,
 				"actor-claims extension is missing role",
 			)
 		})?,
-		scopes: scopes.unwrap_or_default(),
-		tenant_id: tenant_id.unwrap_or(None),
+		scopes: scopes.ok_or_else(|| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				"actor-claims extension is missing scopes",
+			)
+		})?,
+		tenant_id: tenant_id.ok_or_else(|| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				"actor-claims extension is missing tenant_id",
+			)
+		})?,
 		key_id: key_id.ok_or_else(|| {
 			Error::new(
 				ErrorKind::PermissionDenied,
 				"actor-claims extension is missing key_id",
 			)
 		})?,
-	})
+	};
+	if claims.key_id.is_empty() {
+		return Err(Error::new(
+			ErrorKind::PermissionDenied,
+			"actor-claims extension key_id must not be empty",
+		));
+	}
+	Ok(claims)
 }
 
 struct DerReader<'a> {
@@ -1196,43 +1596,6 @@ impl<'a> CborReader<'a> {
 		Ok(())
 	}
 
-	fn skip_value(&mut self) -> std::io::Result<()> {
-		let byte = self.read_u8("CBOR value")?;
-		let major = byte >> 5;
-		let additional = byte & 0x1F;
-		match major {
-			0 | 1 => {
-				let _ = self.read_additional(additional, "CBOR integer")?;
-				Ok(())
-			}
-			2 | 3 => {
-				let len = self.read_additional(additional, "CBOR string")?;
-				self.pos = self.checked_end(len, "CBOR string")?;
-				Ok(())
-			}
-			4 => {
-				let len = self.read_additional(additional, "CBOR array")?;
-				for _ in 0..len {
-					self.skip_value()?;
-				}
-				Ok(())
-			}
-			5 => {
-				let len = self.read_additional(additional, "CBOR map")?;
-				for _ in 0..len {
-					self.skip_value()?;
-					self.skip_value()?;
-				}
-				Ok(())
-			}
-			7 if additional == 22 || additional == 20 || additional == 21 => Ok(()),
-			_ => Err(Error::new(
-				ErrorKind::InvalidData,
-				format!("unsupported CBOR major type {major}"),
-			)),
-		}
-	}
-
 	fn read_len_for_major(&mut self, expected_major: u8, what: &str) -> std::io::Result<usize> {
 		let byte = self.read_u8(what)?;
 		let major = byte >> 5;
@@ -1312,5 +1675,192 @@ impl<'a> CborReader<'a> {
 			));
 		}
 		Ok(end)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{
+		ACTOR_CLAIMS_KEY_ID_FIELD, ACTOR_CLAIMS_ROLE_FIELD, ACTOR_CLAIMS_SCOPES_FIELD,
+		ACTOR_CLAIMS_TENANT_ID_FIELD, ActorClaimsV1, ActorRole, parse_actor_claims_cbor,
+	};
+
+	#[test]
+	fn actor_claims_v1_accepts_cluster_wide_shape() {
+		let claims = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("cluster_admin")),
+				(
+					ACTOR_CLAIMS_SCOPES_FIELD,
+					cbor_array([cbor_text("cluster"), cbor_text("ops")]),
+				),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_null()),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([0xAA, 0xBB, 0xCC])),
+			])
+			.as_slice(),
+		)
+		.unwrap();
+		assert_eq!(
+			claims,
+			ActorClaimsV1 {
+				role: ActorRole::ClusterAdmin,
+				scopes: vec!["cluster".to_string(), "ops".to_string()],
+				tenant_id: None,
+				key_id: vec![0xAA, 0xBB, 0xCC],
+			}
+		);
+	}
+
+	#[test]
+	fn actor_claims_v1_accepts_tenant_bound_shape() {
+		let claims = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("backup_admin")),
+				(ACTOR_CLAIMS_SCOPES_FIELD, cbor_array([cbor_text("tenant")])),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_text("42")),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([1, 2, 3, 4])),
+			])
+			.as_slice(),
+		)
+		.unwrap();
+		assert_eq!(
+			claims,
+			ActorClaimsV1 {
+				role: ActorRole::BackupAdmin,
+				scopes: vec!["tenant".to_string()],
+				tenant_id: Some("42".to_string()),
+				key_id: vec![1, 2, 3, 4],
+			}
+		);
+	}
+
+	#[test]
+	fn actor_claims_v1_rejects_missing_scopes() {
+		let err = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("tenant_admin")),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_text("7")),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([7, 7, 7])),
+			])
+			.as_slice(),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("exactly 4 fields"));
+	}
+
+	#[test]
+	fn actor_claims_v1_rejects_missing_tenant_id() {
+		let err = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("tenant_admin")),
+				(ACTOR_CLAIMS_SCOPES_FIELD, cbor_array([cbor_text("tenant")])),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([7, 7, 7])),
+			])
+			.as_slice(),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("exactly 4 fields"));
+	}
+
+	#[test]
+	fn actor_claims_v1_rejects_unknown_field() {
+		let err = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("tenant_admin")),
+				(ACTOR_CLAIMS_SCOPES_FIELD, cbor_array([cbor_text("tenant")])),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_text("7")),
+				("version", cbor_text("v1")),
+			])
+			.as_slice(),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("unknown field"));
+	}
+
+	#[test]
+	fn actor_claims_v1_rejects_duplicate_field() {
+		let err = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("tenant_admin")),
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("cluster_admin")),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_text("7")),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([7, 7, 7])),
+			])
+			.as_slice(),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("duplicate role"));
+	}
+
+	#[test]
+	fn actor_claims_v1_rejects_empty_key_id() {
+		let err = parse_actor_claims_cbor(
+			actor_claims_cbor([
+				(ACTOR_CLAIMS_ROLE_FIELD, cbor_text("tenant_admin")),
+				(ACTOR_CLAIMS_SCOPES_FIELD, cbor_array([cbor_text("tenant")])),
+				(ACTOR_CLAIMS_TENANT_ID_FIELD, cbor_text("7")),
+				(ACTOR_CLAIMS_KEY_ID_FIELD, cbor_bytes([])),
+			])
+			.as_slice(),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("key_id must not be empty"));
+	}
+
+	fn actor_claims_cbor<const N: usize>(fields: [(&str, Vec<u8>); N]) -> Vec<u8> {
+		let mut out = Vec::new();
+		cbor_write_len(&mut out, 5, fields.len());
+		for (key, value) in fields {
+			cbor_write_text(&mut out, key);
+			out.extend_from_slice(&value);
+		}
+		out
+	}
+
+	fn cbor_array<const N: usize>(items: [Vec<u8>; N]) -> Vec<u8> {
+		let mut out = Vec::new();
+		cbor_write_len(&mut out, 4, items.len());
+		for item in items {
+			out.extend_from_slice(&item);
+		}
+		out
+	}
+
+	fn cbor_text(text: &str) -> Vec<u8> {
+		let mut out = Vec::new();
+		cbor_write_len(&mut out, 3, text.len());
+		out.extend_from_slice(text.as_bytes());
+		out
+	}
+
+	fn cbor_bytes<const N: usize>(bytes: [u8; N]) -> Vec<u8> {
+		let mut out = Vec::new();
+		cbor_write_len(&mut out, 2, bytes.len());
+		out.extend_from_slice(&bytes);
+		out
+	}
+
+	fn cbor_null() -> Vec<u8> {
+		vec![0xF6]
+	}
+
+	fn cbor_write_text(out: &mut Vec<u8>, text: &str) {
+		cbor_write_len(out, 3, text.len());
+		out.extend_from_slice(text.as_bytes());
+	}
+
+	fn cbor_write_len(out: &mut Vec<u8>, major: u8, len: usize) {
+		match len {
+			0..=23 => out.push((major << 5) | (len as u8)),
+			24..=0xFF => {
+				out.push((major << 5) | 24);
+				out.push(len as u8);
+			}
+			0x100..=0xFFFF => {
+				out.push((major << 5) | 25);
+				out.extend_from_slice(&(len as u16).to_be_bytes());
+			}
+			_ => panic!("test helper does not support CBOR length {len}"),
+		}
 	}
 }

@@ -69,6 +69,9 @@ Replace the broad operator role with the minimum serious model:
 
 The split should be enforced at the dispatcher boundary, not buried inside handlers.
 
+Status: complete.
+Artifact: `plans/impl/workstream_F_role_matrix.md`
+
 ### F2. OID And Claim Freeze
 
 Freeze the cert extension payload shape:
@@ -79,6 +82,9 @@ Freeze the cert extension payload shape:
 - key identity
 
 Once this shape is frozen, external-facing drift stops.
+
+Status: complete.
+Artifact: `plans/impl/workstream_F_claim_oid_note.md`
 
 ### F3. Cert-Service Baseline
 
@@ -92,9 +98,15 @@ Implement the narrow cert-service scope only:
 
 This is not a general tenant-application CA.
 
+Status: complete.
+Artifact: `plans/impl/workstream_F_cert_service_deployment_note.md`
+
 ### F4. Revocation Distribution
 
 Land revocation distribution through replicated control state so nodes do not depend on a best-effort external refresh path for correctness.
+
+Status: complete.
+Artifact: `plans/impl/workstream_F_revocation_behavior_note.md`
 
 ### F5. Destructive-Operation Authorization
 
@@ -105,6 +117,9 @@ The code path should be explicit about:
 - what is routine admin
 - what requires stronger approval
 - what is break-glass only
+
+Status: complete.
+Artifact: `plans/impl/workstream_F_destructive_auth_note.md`
 
 ### F6. Break-Glass Path
 
@@ -117,6 +132,9 @@ Implement the exceptional path as:
 
 Break-glass is allowed, but it should feel expensive and loud.
 
+Status: complete.
+Artifact: `plans/impl/workstream_F_break_glass_operational_guide.md`
+
 ### F7. Operator Onboarding Contract
 
 Document the minimal mapping contract for future enterprise operator onboarding:
@@ -124,6 +142,9 @@ Document the minimal mapping contract for future enterprise operator onboarding:
 - where external identity maps into Wendelon roles
 - where local cert issuance begins
 - what is out of scope for the first pilot
+
+Status: complete.
+Artifact: `plans/impl/workstream_F_operator_onboarding_contract.md`
 
 ## Tests And Benchmarks
 
@@ -148,7 +169,9 @@ Document the minimal mapping contract for future enterprise operator onboarding:
 - cert-claim/OID note
 - cert-service deployment note
 - revocation behavior note
+- destructive-auth note
 - break-glass operational guide
+- operator onboarding contract
 
 ## Deferred Follow-Ons
 

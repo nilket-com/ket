@@ -1868,6 +1868,38 @@ async fn run_quota_authorization_boundary_scenario(
 			vec![9, 8, 7, 6],
 		)
 		.unwrap();
+		let tenant_admin = ActorIdentity::new(
+			ActorRole::TenantAdmin,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![1, 2, 3, 4],
+		)
+		.unwrap();
+		let cluster_admin = ActorIdentity::new(
+			ActorRole::ClusterAdmin,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![4, 3, 2, 1],
+		)
+		.unwrap();
+		let backup_admin = ActorIdentity::new(
+			ActorRole::BackupAdmin,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![5, 5, 5, 5],
+		)
+		.unwrap();
+		let compliance_auditor = ActorIdentity::new(
+			ActorRole::ComplianceAuditor,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![6, 6, 6, 6],
+		)
+		.unwrap();
 		let observer = ActorIdentity::new(
 			ActorRole::ReadOnlyObserver,
 			None,
@@ -1881,6 +1913,14 @@ async fn run_quota_authorization_boundary_scenario(
 			|| authorize_actor(&data_node, ActorPermission::ObservabilityMetrics).is_ok()
 			|| authorize_actor(&data_node, ActorPermission::OpsControl).is_ok()
 			|| authorize_actor(&operator, ActorPermission::OpsControl).is_err()
+			|| authorize_actor(&tenant_admin, ActorPermission::TenantAdminMutation).is_err()
+			|| authorize_actor(&tenant_admin, ActorPermission::TenantKekAdmin).is_ok()
+			|| authorize_actor(&cluster_admin, ActorPermission::ClusterControl).is_err()
+			|| authorize_actor(&cluster_admin, ActorPermission::TenantAdminMutation).is_ok()
+			|| authorize_actor(&backup_admin, ActorPermission::TenantKekAdmin).is_err()
+			|| authorize_actor(&backup_admin, ActorPermission::ClusterControl).is_ok()
+			|| authorize_actor(&compliance_auditor, ActorPermission::AuditRead).is_err()
+			|| authorize_actor(&compliance_auditor, ActorPermission::OpsControl).is_ok()
 			|| authorize_actor(&operator, ActorPermission::ObservabilityMetrics).is_err()
 			|| authorize_actor(&operator, ActorPermission::InterNodeTransport).is_ok()
 			|| authorize_actor(&observer, ActorPermission::ObservabilityMetrics).is_err()

@@ -20,9 +20,10 @@
 //!   [`TransportConnection`] demands, so call sites see a single
 //!   stream shape regardless of fabric.
 
+use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::network::tls::{
 	ActorIdentity, DEFAULT_CLUSTER_DOMAIN, TlsMaterial, client_config, server_config,
-	verified_transport_peer,
+	verified_transport_peer_with_revocations,
 };
 use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportStream, TransportTier,
@@ -35,6 +36,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::watch;
 
 // ============================================================
 //  TLS NAME RESOLUTION
@@ -152,6 +154,7 @@ pub struct QuicTransportProvider {
 	endpoint: Arc<quinn::Endpoint>,
 	server_name: ServerNameResolver,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 }
 
 impl QuicTransportProvider {
@@ -168,7 +171,16 @@ impl QuicTransportProvider {
 			endpoint,
 			server_name,
 			cluster_domain: cluster_domain.into(),
+			revocations: None,
 		}
+	}
+
+	pub fn with_revocations(
+		mut self,
+		revocations: watch::Receiver<Arc<RevocationSnapshot>>,
+	) -> Self {
+		self.revocations = Some(revocations);
+		self
 	}
 }
 
@@ -208,7 +220,14 @@ impl TransportProvider for QuicTransportProvider {
 		let conn = connecting
 			.await
 			.map_err(|e| Error::new(ErrorKind::ConnectionRefused, e))?;
-		let peer = verified_transport_peer(&conn, &self.cluster_domain)?;
+		let peer = verified_transport_peer_with_revocations(
+			&conn,
+			&self.cluster_domain,
+			self.revocations
+				.as_ref()
+				.map(|rx| rx.borrow().clone())
+				.as_deref(),
+		)?;
 		if peer.node_id != target {
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,

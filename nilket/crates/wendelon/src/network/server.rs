@@ -52,13 +52,16 @@
 //! * 0-RTT or datagram paths.
 //! * Backpressure / per-tenant quotas.
 
+use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::metrics::global as metrics;
 use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
 use crate::network::tcp_tls_transport::InboundTcpTlsConnection;
 use crate::network::tls::ActorIdentity;
-use crate::network::tls::{verified_transport_peer, verified_transport_peer_from_chain};
+use crate::network::tls::{
+	verified_transport_peer_from_chain_with_revocations, verified_transport_peer_with_revocations,
+};
 use crate::network::transport::{TransportConnection, TransportStream};
 use crate::schema::NodeId;
 use async_trait::async_trait;
@@ -555,6 +558,7 @@ pub async fn serve<S: HrftService>(
 		lifecycle,
 		ServerAdmissionConfig::default(),
 		cluster_domain,
+		None,
 	)
 	.await
 }
@@ -566,6 +570,7 @@ pub async fn serve_with_admission<S: HrftService>(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: impl Into<String>,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	admission.validate()?;
 	let cluster_domain = cluster_domain.into();
@@ -598,6 +603,7 @@ pub async fn serve_with_admission<S: HrftService>(
 				let lifecycle = lifecycle.clone();
 				let admission = admission.clone();
 				let cluster_domain = cluster_domain.clone();
+				let revocations = revocations.clone();
 				let _connection_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _connection_guard = _connection_guard;
@@ -611,6 +617,7 @@ pub async fn serve_with_admission<S: HrftService>(
 							admission,
 							_connection_admission,
 							cluster_domain,
+							revocations,
 						)
 							.await
 					{
@@ -643,6 +650,7 @@ pub async fn serve_tcp_tls<S: HrftService>(
 		lifecycle,
 		ServerAdmissionConfig::default(),
 		cluster_domain,
+		None,
 	)
 	.await
 }
@@ -655,6 +663,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 	lifecycle: ServerLifecycle,
 	admission: ServerAdmissionConfig,
 	cluster_domain: impl Into<String>,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	admission.validate()?;
 	let cluster_domain = cluster_domain.into();
@@ -688,6 +697,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 				let lifecycle = lifecycle.clone();
 				let admission = admission.clone();
 				let cluster_domain = cluster_domain.clone();
+				let revocations = revocations.clone();
 				let _connection_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _connection_guard = _connection_guard;
@@ -701,6 +711,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 						admission,
 						_connection_admission,
 						cluster_domain,
+						revocations,
 					)
 					.await
 					{
@@ -733,12 +744,21 @@ async fn serve_quic_connection<S: HrftService>(
 	admission: AdmissionController,
 	connection_admission: ConnectionAdmissionGuard,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	let connection = incoming.await.map_err(|e| {
 		metrics().quic_handshake_failures_transport_total.inc();
 		Error::new(ErrorKind::ConnectionAborted, e)
 	})?;
-	let peer = verified_transport_peer(&connection, &cluster_domain).map_err(|err| {
+	let peer = verified_transport_peer_with_revocations(
+		&connection,
+		&cluster_domain,
+		revocations
+			.as_ref()
+			.map(|rx| rx.borrow().clone())
+			.as_deref(),
+	)
+	.map_err(|err| {
 		match err.kind() {
 			ErrorKind::PermissionDenied => {
 				metrics().quic_handshake_failures_authorization_total.inc()
@@ -772,6 +792,7 @@ async fn serve_tcp_tls_connection<S: HrftService>(
 	admission: AdmissionController,
 	connection_admission: ConnectionAdmissionGuard,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 ) -> std::io::Result<()> {
 	let stream = acceptor
 		.accept(stream)
@@ -783,7 +804,14 @@ async fn serve_tcp_tls_connection<S: HrftService>(
 			"peer presented no TLS identity",
 		)
 	})?;
-	let peer = verified_transport_peer_from_chain(certs, &cluster_domain)?;
+	let peer = verified_transport_peer_from_chain_with_revocations(
+		certs,
+		&cluster_domain,
+		revocations
+			.as_ref()
+			.map(|rx| rx.borrow().clone())
+			.as_deref(),
+	)?;
 	let connection: Arc<dyn TransportConnection> = Arc::new(InboundTcpTlsConnection::new(
 		peer.node_id,
 		peer.actor_identity,

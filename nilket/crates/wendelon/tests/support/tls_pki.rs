@@ -2,9 +2,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use wendelon::network::tls::ACTOR_CLAIMS_OID_DOTTED;
 
 pub const CLUSTER_DOMAIN: &str = "cluster.local";
-const ACTOR_CLAIMS_OID: &str = "1.3.6.1.4.1.55555.1.1";
 const CERT_VALIDITY_DAYS: &str = "30";
 
 pub struct TestPkiPaths {
@@ -103,7 +103,7 @@ pub fn write_test_pki_with_server_dns(dir: &Path, server_dns_name: &str) -> Test
 			role: "break_glass_admin",
 			node_dns_name: None,
 			key_id: vec![9, 10, 11, 12],
-			scopes: vec!["cluster"],
+			scopes: vec!["diagnostic"],
 			cert_path: &paths.break_glass_cert,
 			key_path: &paths.break_glass_key,
 			ca_cert_path: &paths.ops_ca_cert,
@@ -196,7 +196,7 @@ subjectKeyIdentifier=hash\n\
 authorityKeyIdentifier=keyid,issuer\n",
 	);
 	ext.push_str(&format!(
-		"{ACTOR_CLAIMS_OID}=DER:{}\n",
+		"{ACTOR_CLAIMS_OID_DOTTED}=DER:{}\n",
 		to_openssl_hex(&actor_claims)
 	));
 	if let Some(node_dns_name) = &spec.node_dns_name {

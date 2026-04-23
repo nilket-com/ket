@@ -6,10 +6,16 @@
 //! independent subsystems keyed off `msg_type`:
 //!
 //! ```text
-//!   0x01..=0x0F  →  Data Ring  (writes, reads, bulk, stream-fin)
-//!   0x10..=0x1F  →  Control Ring (transfer, lease, epoch, status)
-//!   0x20..=0x2F  →  Raft internal (AppendEntries, Vote, Snapshot)
+//!   0x01..=0x0F  →  Data Ring
+//!   0x10..=0x1F  →  Control Ring core RPCs
+//!   0x20..=0x2F  →  Raft internal
+//!   0x30..=0x3F  →  Control/admin extensions
 //! ```
+//!
+//! The router uses an explicit dispatch table rather than trusting
+//! arithmetic ranges blindly. Most families are range-grouped, but
+//! peer-only and admin extensions are matched by exact `MsgType`
+//! first so future additions do not collide silently.
 //!
 //! Each subsystem implements a narrow trait ([`DataRingServer`],
 //! [`ControlRingServer`], [`RaftInternalServer`]) and is plugged
@@ -85,7 +91,8 @@ pub trait DataRingServer: Send + Sync + 'static {
 	}
 }
 
-/// Handler for Control Ring frames: `msg_type` in `0x10..=0x1F`.
+/// Handler for Control Ring frames routed by the explicit control/admin
+/// dispatch table.
 #[async_trait]
 pub trait ControlRingServer: Send + Sync + 'static {
 	async fn handle_control_frame(
@@ -95,7 +102,8 @@ pub trait ControlRingServer: Send + Sync + 'static {
 	) -> std::io::Result<Option<HrftFrame>>;
 }
 
-/// Handler for internal Raft frames: `msg_type` in `0x20..=0x2F`.
+/// Handler for internal Raft frames: current `msg_type` allocation
+/// `0x20..=0x2F`.
 #[async_trait]
 pub trait RaftInternalServer: Send + Sync + 'static {
 	async fn handle_raft_frame(
@@ -142,6 +150,10 @@ impl HrftService for MsgRouter {
 				None => Err(unhandled("Data Ring", msg_type)),
 			},
 			0x10..=0x1F => match &self.control {
+				Some(h) => h.handle_control_frame(context, frame).await,
+				None => Err(unhandled("Control Ring", msg_type)),
+			},
+			x if x == MsgType::REVOCATION_ADMIN_REQ.0 => match &self.control {
 				Some(h) => h.handle_control_frame(context, frame).await,
 				None => Err(unhandled("Control Ring", msg_type)),
 			},

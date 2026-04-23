@@ -6,10 +6,11 @@
 //! Its job is to preserve the transport seam and provide an
 //! explicit compatibility path where operators choose to wire it.
 
+use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::network::quic_transport::ServerNameResolver;
 use crate::network::tls::{
 	ActorIdentity, DEFAULT_CLUSTER_DOMAIN, VerifiedTransportPeer,
-	verified_transport_peer_from_chain,
+	verified_transport_peer_from_chain_with_revocations,
 };
 use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportStream, TransportTier,
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
@@ -119,6 +121,7 @@ pub struct TcpTlsTransportConnection {
 	connector: TlsConnector,
 	server_name: String,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 	pending: Mutex<Option<TcpTlsTransportStream>>,
 	next_stream_id: AtomicU64,
 	closed: AtomicBool,
@@ -134,6 +137,7 @@ impl TcpTlsTransportConnection {
 		connector: TlsConnector,
 		server_name: String,
 		cluster_domain: String,
+		revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 		pending: TcpTlsTransportStream,
 	) -> Self {
 		Self {
@@ -143,6 +147,7 @@ impl TcpTlsTransportConnection {
 			connector,
 			server_name,
 			cluster_domain,
+			revocations,
 			pending: Mutex::new(Some(pending)),
 			next_stream_id: AtomicU64::new(1),
 			closed: AtomicBool::new(false),
@@ -168,7 +173,14 @@ impl TcpTlsTransportConnection {
 			.connect(server_name, tcp)
 			.await
 			.map_err(|e| Error::new(ErrorKind::ConnectionRefused, e))?;
-		let peer = peer_from_client_stream(&tls, &self.cluster_domain)?;
+		let peer = peer_from_client_stream(
+			&tls,
+			&self.cluster_domain,
+			self.revocations
+				.as_ref()
+				.map(|rx| rx.borrow().clone())
+				.as_deref(),
+		)?;
 		if peer.node_id != self.remote_id {
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,
@@ -287,6 +299,7 @@ pub struct TcpTlsTransportProvider {
 	connector: TlsConnector,
 	server_name: ServerNameResolver,
 	cluster_domain: String,
+	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
 }
 
 impl TcpTlsTransportProvider {
@@ -303,7 +316,16 @@ impl TcpTlsTransportProvider {
 			connector: TlsConnector::from(Arc::new(client_config)),
 			server_name,
 			cluster_domain: cluster_domain.into(),
+			revocations: None,
 		}
+	}
+
+	pub fn with_revocations(
+		mut self,
+		revocations: watch::Receiver<Arc<RevocationSnapshot>>,
+	) -> Self {
+		self.revocations = Some(revocations);
+		self
 	}
 }
 
@@ -333,7 +355,14 @@ impl TransportProvider for TcpTlsTransportProvider {
 			.connect(tls_server_name, tcp)
 			.await
 			.map_err(|e| Error::new(ErrorKind::ConnectionRefused, e))?;
-		let peer = peer_from_client_stream(&tls, &self.cluster_domain)?;
+		let peer = peer_from_client_stream(
+			&tls,
+			&self.cluster_domain,
+			self.revocations
+				.as_ref()
+				.map(|rx| rx.borrow().clone())
+				.as_deref(),
+		)?;
 		if peer.node_id != target {
 			return Err(Error::new(
 				ErrorKind::PermissionDenied,
@@ -350,6 +379,7 @@ impl TransportProvider for TcpTlsTransportProvider {
 			self.connector.clone(),
 			server_name,
 			self.cluster_domain.clone(),
+			self.revocations.clone(),
 			TcpTlsTransportStream::client(tls, 0),
 		)))
 	}
@@ -358,6 +388,7 @@ impl TransportProvider for TcpTlsTransportProvider {
 fn peer_from_client_stream(
 	stream: &ClientTlsStream<TcpStream>,
 	cluster_domain: &str,
+	revocations: Option<&RevocationSnapshot>,
 ) -> std::io::Result<VerifiedTransportPeer> {
 	let certs = stream.get_ref().1.peer_certificates().ok_or_else(|| {
 		Error::new(
@@ -365,5 +396,5 @@ fn peer_from_client_stream(
 			"peer presented no TLS identity",
 		)
 	})?;
-	verified_transport_peer_from_chain(certs, cluster_domain)
+	verified_transport_peer_from_chain_with_revocations(certs, cluster_domain, revocations)
 }

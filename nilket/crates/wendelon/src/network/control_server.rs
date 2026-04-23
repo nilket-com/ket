@@ -11,11 +11,11 @@ use crate::audit::{AuditChainHead, AuditSink};
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
-	SeedMigration, TenantLifecycleState, TenantRecord, UpdateTenantQuota, WendelonRaft,
-	WendelonRequest, WendelonResponse,
+	RevokeActorKey, SeedMigration, TenantLifecycleState, TenantRecord, UpdateTenantQuota,
+	WendelonRaft, WendelonRequest, WendelonResponse,
 };
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
-use crate::governance::{OperatorGatedAction, require_operator_signal};
+use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
@@ -23,7 +23,7 @@ use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
 use crate::network::server::RequestContext;
-use crate::network::tls::ActorRole;
+use crate::network::tls::{ActorPermission, ActorTrustDomain, authorize_actor};
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, watch};
 
 pub const CONTROL_REASON_GRANTED: u8 = 0;
@@ -62,6 +62,7 @@ pub const CONTROL_REASON_NOT_FOUND: u8 = 10;
 enum ControlOperation {
 	Status,
 	AuditChainHead,
+	RevocationAdmin,
 	Lease,
 	LeaseRelease,
 	Transfer,
@@ -173,6 +174,34 @@ pub struct TenantAdminResponseWire {
 	pub message: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevocationAdminRequestWire {
+	Revoke {
+		trust_domain: ActorTrustDomain,
+		#[serde(with = "serde_bytes")]
+		key_id: Vec<u8>,
+	},
+	List,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedActorKeyWire {
+	pub trust_domain: ActorTrustDomain,
+	#[serde(with = "serde_bytes")]
+	pub key_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationAdminResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub entries: Vec<RevokedActorKeyWire>,
+	#[serde(default)]
+	pub message: Option<String>,
+}
+
 pub struct WendelonControlServer {
 	raft: WendelonRaft,
 	state_machine: crate::consensus::raft_storage::WendelonStateMachine,
@@ -249,37 +278,26 @@ impl WendelonControlServer {
 		context: &RequestContext,
 		op: ControlOperation,
 	) -> std::io::Result<()> {
-		let allowed = match op {
-			ControlOperation::Status => matches!(
-				context.actor.role,
-				ActorRole::DataNode
-					| ActorRole::Operator
-					| ActorRole::ReadOnlyObserver
-					| ActorRole::BreakGlassAdmin
-			),
-			ControlOperation::AuditChainHead => matches!(
-				context.actor.role,
-				ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
-			),
+		// This is the coarse ring-level gate. Action-specific
+		// overlays like tenant-scope rejection, human-only admin
+		// restrictions, and break-glass-only destructive paths are
+		// enforced later by `require_administrative_action(...)`.
+		let permission = match op {
+			ControlOperation::Status => ActorPermission::ControlStatus,
+			ControlOperation::AuditChainHead => ActorPermission::AuditRead,
+			ControlOperation::RevocationAdmin => ActorPermission::ClusterControl,
 			ControlOperation::Lease
 			| ControlOperation::LeaseRelease
 			| ControlOperation::Transfer
 			| ControlOperation::AdvanceEpoch
-			| ControlOperation::Join => matches!(
-				context.actor.role,
-				ActorRole::DataNode | ActorRole::Operator | ActorRole::BreakGlassAdmin
-			),
+			| ControlOperation::Join => ActorPermission::ClusterControl,
 		};
-		if allowed {
-			return Ok(());
-		}
-		Err(Error::new(
-			ErrorKind::PermissionDenied,
-			format!(
-				"actor role {} is not allowed for {:?}",
-				context.actor.role, op
-			),
-		))
+		authorize_actor(&context.actor, permission).map_err(|error| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				format!("{op:?} authorization failed: {error}"),
+			)
+		})
 	}
 
 	fn build_tenant_admin_frame(
@@ -293,6 +311,29 @@ impl WendelonControlServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: MsgType::TENANT_ADMIN_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	fn build_revocation_admin_frame(
+		&self,
+		stream_id: u32,
+		resp: &RevocationAdminResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, resp)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::REVOCATION_ADMIN_RESP.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta.len() as u32,
@@ -321,6 +362,52 @@ impl WendelonControlServer {
 				tenant: None,
 				tenants: Vec::new(),
 				message: Some(message.into()),
+			},
+		)
+	}
+
+	fn revocation_admin_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		message: impl Into<String>,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_revocation_admin_frame(
+			frame.header.stream_id,
+			&RevocationAdminResponseWire {
+				accepted: false,
+				reason_code,
+				leader_hint: leader_hint.map(|node| node.id),
+				entries: Vec::new(),
+				message: Some(message.into()),
+			},
+		)
+	}
+
+	fn revoked_actor_keys_wire(
+		snapshot: &crate::consensus::raft_storage::SmState,
+	) -> Vec<RevokedActorKeyWire> {
+		snapshot
+			.revoked_actor_keys
+			.iter()
+			.map(|(entry, _)| RevokedActorKeyWire {
+				trust_domain: entry.trust_domain,
+				key_id: entry.key_id.clone(),
+			})
+			.collect()
+	}
+
+	async fn revocation_admin_success_frame(&self, stream_id: u32) -> std::io::Result<HrftFrame> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		self.build_revocation_admin_frame(
+			stream_id,
+			&RevocationAdminResponseWire {
+				accepted: true,
+				reason_code: CONTROL_REASON_GRANTED,
+				leader_hint: Some(self.local_node.id),
+				entries: Self::revoked_actor_keys_wire(&snapshot),
+				message: None,
 			},
 		)
 	}
@@ -448,6 +535,128 @@ impl WendelonControlServer {
 				message: None,
 			},
 		)
+	}
+
+	async fn submit_revocation_mutation(
+		&self,
+		frame: &HrftFrame,
+		revocation: RevokeActorKey,
+	) -> std::io::Result<HrftFrame> {
+		match self
+			.raft
+			.client_write(WendelonRequest::RevokeActorKey(revocation))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => {
+					self.revocation_admin_success_frame(frame.header.stream_id)
+						.await
+				}
+				WendelonResponse::Error(message) => self.revocation_admin_rejection(
+					frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.revocation_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from revocation mutation",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.revocation_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.revocation_admin_rejection(
+				frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
+		}
+	}
+
+	async fn handle_revocation_admin(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"REVOCATION_ADMIN_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let request: RevocationAdminRequestWire = wire::decode(&frame.meta)?;
+		if !self.is_leader().await {
+			return self.revocation_admin_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				"revocation admin requests must be sent to the current leader",
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+		match request {
+			RevocationAdminRequestWire::Revoke {
+				trust_domain,
+				key_id,
+			} => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::RevokeActorKey,
+				) {
+					return self.revocation_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				if key_id.is_empty() {
+					return self.revocation_admin_rejection(
+						&frame,
+						CONTROL_REASON_INVALID_CONFIG,
+						"actor certificate key_id must not be empty",
+						None,
+					);
+				}
+				self.submit_revocation_mutation(
+					&frame,
+					RevokeActorKey {
+						trust_domain,
+						key_id,
+						revoked_at_ms: SystemTime::now()
+							.duration_since(UNIX_EPOCH)
+							.unwrap_or_default()
+							.as_millis() as u64,
+					},
+				)
+				.await
+			}
+			RevocationAdminRequestWire::List => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::RevocationList,
+				) {
+					return self.revocation_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.revocation_admin_success_frame(frame.header.stream_id)
+					.await
+			}
+		}
 	}
 
 	async fn submit_tenant_admin_mutation(
@@ -697,23 +906,11 @@ impl WendelonControlServer {
 				None,
 			);
 		}
-
-		let is_read = matches!(
+		if matches!(
 			request,
 			TenantAdminRequestWire::Get { .. } | TenantAdminRequestWire::List
-		);
-		let allowed = if is_read {
-			matches!(
-				context.actor.role,
-				ActorRole::Operator | ActorRole::ReadOnlyObserver | ActorRole::BreakGlassAdmin
-			)
-		} else {
-			matches!(
-				context.actor.role,
-				ActorRole::Operator | ActorRole::BreakGlassAdmin
-			)
-		};
-		if !allowed {
+		) && authorize_actor(&context.actor, ActorPermission::TenantAdminRead).is_err()
+		{
 			return self.tenant_admin_rejection(
 				&frame,
 				CONTROL_REASON_AUTHORIZATION_FAILED,
@@ -742,6 +939,17 @@ impl WendelonControlServer {
 				quota_bytes,
 				replication_factor,
 			} => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::TenantCreate,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
 				let snapshot = self.state_machine.state_snapshot().await;
 				let create = match self.build_create_tenant_request(
 					&snapshot,
@@ -767,6 +975,17 @@ impl WendelonControlServer {
 				target_tenant_id,
 				quota_bytes,
 			} => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::TenantUpdateQuota,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
 				self.submit_tenant_admin_mutation(
 					&frame,
 					WendelonRequest::UpdateTenantQuota(UpdateTenantQuota {
@@ -778,6 +997,17 @@ impl WendelonControlServer {
 				.await
 			}
 			TenantAdminRequestWire::Suspend { target_tenant_id } => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::TenantSuspend,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
 				self.submit_tenant_admin_mutation(
 					&frame,
 					WendelonRequest::SuspendTenant(target_tenant_id),
@@ -786,6 +1016,17 @@ impl WendelonControlServer {
 				.await
 			}
 			TenantAdminRequestWire::Resume { target_tenant_id } => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::TenantResume,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
 				self.submit_tenant_admin_mutation(
 					&frame,
 					WendelonRequest::ResumeTenant(target_tenant_id),
@@ -794,9 +1035,9 @@ impl WendelonControlServer {
 				.await
 			}
 			TenantAdminRequestWire::Delete { target_tenant_id } => {
-				if let Err(error) = require_operator_signal(
+				if let Err(error) = require_administrative_action(
 					&context.actor,
-					OperatorGatedAction::TenantDeleteConfirm,
+					AdministrativeAction::TenantDelete,
 				) {
 					return self.tenant_admin_rejection(
 						&frame,
@@ -813,9 +1054,9 @@ impl WendelonControlServer {
 				.await
 			}
 			TenantAdminRequestWire::RotateTenantKek { target_tenant_id } => {
-				if let Err(error) = require_operator_signal(
+				if let Err(error) = require_administrative_action(
 					&context.actor,
-					OperatorGatedAction::TenantKekRotateConfirm,
+					AdministrativeAction::TenantKekRotate,
 				) {
 					return self.tenant_admin_rejection(
 						&frame,
@@ -831,9 +1072,9 @@ impl WendelonControlServer {
 				target_tenant_id,
 				tenant_kek_id,
 			} => {
-				if let Err(error) = require_operator_signal(
+				if let Err(error) = require_administrative_action(
 					&context.actor,
-					OperatorGatedAction::TenantKekRetireConfirm,
+					AdministrativeAction::TenantKekRetire,
 				) {
 					return self.tenant_admin_rejection(
 						&frame,
@@ -1090,6 +1331,7 @@ impl WendelonControlServer {
 
 	async fn handle_transfer(
 		&self,
+		context: &RequestContext,
 		remote: NodeId,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
@@ -1098,6 +1340,18 @@ impl WendelonControlServer {
 				ErrorKind::InvalidData,
 				"TRANSFER_REQ must not carry an Arrow payload",
 			));
+		}
+		if let Err(_error) =
+			require_administrative_action(&context.actor, AdministrativeAction::TransferLeadership)
+		{
+			return self.transfer_response(
+				&frame,
+				TransferLeadershipResponseMeta {
+					accepted: false,
+					reason_code: CONTROL_REASON_AUTHORIZATION_FAILED,
+				},
+				None,
+			);
 		}
 		let req: TransferLeadershipRequestMeta = wire::decode(&frame.meta)?;
 		let token = match self.decode_transfer_token(&frame) {
@@ -1186,9 +1440,21 @@ impl WendelonControlServer {
 		self.transfer_response(&frame, resp, accepted.then_some(&token))
 	}
 
-	async fn handle_advance_epoch(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_advance_epoch(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		let leader_hint = self.leader_hint().await;
-		let resp = if !self.is_leader().await {
+		let resp = if let Err(_error) =
+			require_administrative_action(&context.actor, AdministrativeAction::AdvanceEpoch)
+		{
+			AdvanceEpochResponseWire {
+				accepted: false,
+				reason_code: CONTROL_REASON_AUTHORIZATION_FAILED,
+				leader_hint: None,
+			}
+		} else if !self.is_leader().await {
 			AdvanceEpochResponseWire {
 				accepted: false,
 				reason_code: CONTROL_REASON_NOT_LEADER,
@@ -1268,7 +1534,11 @@ impl WendelonControlServer {
 		})
 	}
 
-	async fn handle_join(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_join(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -1276,33 +1546,82 @@ impl WendelonControlServer {
 			));
 		}
 		let req: JoinClusterRequestWire = wire::decode(&frame.meta)?;
-		let resp = match self.validate_join_request(&req) {
-			Err(_) => JoinClusterResponseWire {
-				accepted: false,
-				reason_code: CONTROL_REASON_INVALID_CONFIG,
-				leader_hint: self.leader_hint().await,
-				local_protocol: self.protocol,
-				negotiated_protocol: None,
-			},
-			Ok(()) if self.is_leader().await => {
-				match wire::negotiate_protocol(self.protocol, req.protocol) {
-					Ok(negotiated_protocol) => match self.accept_join(&req).await {
-						Ok(()) => JoinClusterResponseWire {
-							accepted: true,
-							reason_code: CONTROL_REASON_GRANTED,
-							leader_hint: Some(self.local_node.id),
-							local_protocol: self.protocol,
-							negotiated_protocol: Some(negotiated_protocol),
-						},
-						Err(err) if err.kind() == ErrorKind::InvalidInput => {
-							JoinClusterResponseWire {
+		let resp =
+			if require_administrative_action(&context.actor, AdministrativeAction::JoinCluster)
+				.is_err()
+			{
+				JoinClusterResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_AUTHORIZATION_FAILED,
+					leader_hint: None,
+					local_protocol: self.protocol,
+					negotiated_protocol: None,
+				}
+			} else {
+				match self.validate_join_request(&req) {
+					Err(_) => JoinClusterResponseWire {
+						accepted: false,
+						reason_code: CONTROL_REASON_INVALID_CONFIG,
+						leader_hint: self.leader_hint().await,
+						local_protocol: self.protocol,
+						negotiated_protocol: None,
+					},
+					Ok(()) if self.is_leader().await => {
+						match wire::negotiate_protocol(self.protocol, req.protocol) {
+							Ok(negotiated_protocol) => match self.accept_join(&req).await {
+								Ok(()) => JoinClusterResponseWire {
+									accepted: true,
+									reason_code: CONTROL_REASON_GRANTED,
+									leader_hint: Some(self.local_node.id),
+									local_protocol: self.protocol,
+									negotiated_protocol: Some(negotiated_protocol),
+								},
+								Err(err) if err.kind() == ErrorKind::InvalidInput => {
+									JoinClusterResponseWire {
+										accepted: false,
+										reason_code: CONTROL_REASON_INVALID_CONFIG,
+										leader_hint: Some(self.local_node.id),
+										local_protocol: self.protocol,
+										negotiated_protocol: None,
+									}
+								}
+								Err(err) if err.kind() == ErrorKind::NotConnected => {
+									JoinClusterResponseWire {
+										accepted: false,
+										reason_code: CONTROL_REASON_NOT_LEADER,
+										leader_hint: self.leader_hint().await,
+										local_protocol: self.protocol,
+										negotiated_protocol: None,
+									}
+								}
+								Err(_) => JoinClusterResponseWire {
+									accepted: false,
+									reason_code: CONTROL_REASON_INTERNAL_ERROR,
+									leader_hint: self.leader_hint().await,
+									local_protocol: self.protocol,
+									negotiated_protocol: None,
+								},
+							},
+							Err(_err) if _err.kind() == ErrorKind::Unsupported => {
+								JoinClusterResponseWire {
+									accepted: false,
+									reason_code: CONTROL_REASON_INCOMPATIBLE_VERSION,
+									leader_hint: Some(self.local_node.id),
+									local_protocol: self.protocol,
+									negotiated_protocol: None,
+								}
+							}
+							Err(_) => JoinClusterResponseWire {
 								accepted: false,
 								reason_code: CONTROL_REASON_INVALID_CONFIG,
 								leader_hint: Some(self.local_node.id),
 								local_protocol: self.protocol,
 								negotiated_protocol: None,
-							}
+							},
 						}
+					}
+					Ok(()) => match self.forward_join_request(&frame, &req).await {
+						Ok(resp) => resp,
 						Err(err) if err.kind() == ErrorKind::NotConnected => {
 							JoinClusterResponseWire {
 								accepted: false,
@@ -1320,40 +1639,8 @@ impl WendelonControlServer {
 							negotiated_protocol: None,
 						},
 					},
-					Err(_err) if _err.kind() == ErrorKind::Unsupported => JoinClusterResponseWire {
-						accepted: false,
-						reason_code: CONTROL_REASON_INCOMPATIBLE_VERSION,
-						leader_hint: Some(self.local_node.id),
-						local_protocol: self.protocol,
-						negotiated_protocol: None,
-					},
-					Err(_) => JoinClusterResponseWire {
-						accepted: false,
-						reason_code: CONTROL_REASON_INVALID_CONFIG,
-						leader_hint: Some(self.local_node.id),
-						local_protocol: self.protocol,
-						negotiated_protocol: None,
-					},
 				}
-			}
-			Ok(()) => match self.forward_join_request(&frame, &req).await {
-				Ok(resp) => resp,
-				Err(err) if err.kind() == ErrorKind::NotConnected => JoinClusterResponseWire {
-					accepted: false,
-					reason_code: CONTROL_REASON_NOT_LEADER,
-					leader_hint: self.leader_hint().await,
-					local_protocol: self.protocol,
-					negotiated_protocol: None,
-				},
-				Err(_) => JoinClusterResponseWire {
-					accepted: false,
-					reason_code: CONTROL_REASON_INTERNAL_ERROR,
-					leader_hint: self.leader_hint().await,
-					local_protocol: self.protocol,
-					negotiated_protocol: None,
-				},
-			},
-		};
+			};
 		self.join_response(&frame, resp)
 	}
 
@@ -1984,6 +2271,10 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::AuditChainHead)?;
 				self.handle_audit_chain_head(frame).await?
 			}
+			MsgType::REVOCATION_ADMIN_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::RevocationAdmin)?;
+				self.handle_revocation_admin(&context, frame).await?
+			}
 			MsgType::LEASE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Lease)?;
 				self.handle_lease(context.remote, frame).await?
@@ -1994,15 +2285,16 @@ impl ControlRingServer for WendelonControlServer {
 			}
 			MsgType::TRANSFER_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Transfer)?;
-				self.handle_transfer(context.remote, frame).await?
+				self.handle_transfer(&context, context.remote, frame)
+					.await?
 			}
 			MsgType::EPOCH_ADV_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::AdvanceEpoch)?;
-				self.handle_advance_epoch(frame).await?
+				self.handle_advance_epoch(&context, frame).await?
 			}
 			MsgType::JOIN_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Join)?;
-				self.handle_join(frame).await?
+				self.handle_join(&context, frame).await?
 			}
 			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {

@@ -1,4 +1,5 @@
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
+use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
 	ReleaseLeaseRequestMeta, SlabId, TenantId, TenantKekId,
@@ -270,6 +271,31 @@ pub struct UpdateTenantQuota {
 	pub quota_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RevokedActorKeyId {
+	pub trust_domain: ActorTrustDomain,
+	#[serde(with = "serde_bytes")]
+	pub key_id: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeActorKey {
+	pub trust_domain: ActorTrustDomain,
+	#[serde(with = "serde_bytes")]
+	pub key_id: Vec<u8>,
+	#[serde(default)]
+	pub revoked_at_ms: u64,
+}
+
+impl RevokeActorKey {
+	pub fn key(&self) -> RevokedActorKeyId {
+		RevokedActorKeyId {
+			trust_domain: self.trust_domain,
+			key_id: self.key_id.clone(),
+		}
+	}
+}
+
 /// The state machine application data (mutations).
 /// In HashRaft, the actual data (Arrow batches) never enters the Raft log (ADR 003).
 /// The Raft log only contains control-ring metadata and Data Ring finalization markers.
@@ -330,6 +356,10 @@ pub enum WendelonRequest {
 	/// replicated tiered-slab accounting proves no encrypted slab still
 	/// references it.
 	RetireTenantKekVersion(RetireTenantKekVersion),
+	/// Revoke an actor certificate key_id within a trust domain. The
+	/// denylist is replicated so transport and observability admission
+	/// do not depend on best-effort local refresh.
+	RevokeActorKey(RevokeActorKey),
 }
 
 /// The response returned to the client after a Raft command is committed.

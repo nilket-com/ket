@@ -126,6 +126,7 @@ async fn main() -> ExitCode {
 				&tls.cluster_domain,
 				trust_roots,
 				node.audit_sink.clone(),
+				Some(node.state_machine.subscribe_revocation_snapshot()),
 			)
 			.await
 			{
