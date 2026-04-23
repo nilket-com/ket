@@ -291,7 +291,20 @@ Operators running these alerts without the recording rules in §5.1 must substit
 
 ## 6. Runbook pointers
 
-For each alert above, operators need a runbook. The runbook catalog lives at `plans/ops/runbooks/` (pending creation; one runbook per paging alert at minimum). Minimum runbook shape:
+For each alert above, operators need a runbook. The current runbook catalog
+lives at `plans/ops/runbooks/`.
+
+Current high-signal mappings:
+
+- `AuditMaterializationLagRising` and `AuditSinkFailing`
+  - `plans/ops/runbooks/audit_sink_archive_distress.md`
+- persisted finalization distress outside the default alert table
+  - `plans/ops/runbooks/pending_finalization_backlog_distress.md`
+- recovery workflows
+  - `plans/ops/runbooks/cluster_restore.md`
+  - `plans/ops/runbooks/node_replacement.md`
+
+Minimum runbook shape:
 
 1. What the alert means in plain language.
 2. First-look metrics and traces (links to specific dashboards/queries).
@@ -342,4 +355,4 @@ The implemented metric and field names above are the operator contract for W10.
 - ADR 018: Dual-CA mTLS Identity and OID-Bound Authorization (role-gating on `/ready` and `/metrics`)
 - ADR 028: Deterministic Simulator and `AsyncFileOps` Abstraction (SLO validation harness)
 - `plans/ops/testing.md` — coverage ladder and soak schedule that validate SLO targets
-- `plans/ops/runbooks/` — per-alert runbook catalog (pending)
+- `plans/ops/runbooks/` — per-alert and recovery runbook catalog

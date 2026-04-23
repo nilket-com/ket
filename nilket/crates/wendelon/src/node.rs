@@ -31,6 +31,7 @@ use crate::audit::{
 	AuditOperation, AuditRootSigner, AuditSink, AuditSinksConfig,
 	DEFAULT_CHAIN_ROOT_ROLLUP_INTERVAL, build_audit_sink, spawn_signed_chain_root_rollup,
 };
+use crate::backup::{ClusterBackupImage, ClusterNodeBackupImage};
 use crate::build_info;
 use crate::consensus::hlc::HybridLogicalClockDriver;
 use crate::consensus::monitor::{
@@ -45,7 +46,7 @@ use crate::consensus::raft_storage::{
 	CheckpointCoordinator, DurableBootstrapMode, RevocationSnapshot, WendelonLogStore,
 	WendelonStateMachine,
 };
-use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse};
+use crate::consensus::{AdvanceEpochRecord, WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
 use crate::metrics::IoUringClass;
 use crate::metrics::observability::{
@@ -53,7 +54,8 @@ use crate::metrics::observability::{
 };
 use crate::metrics::telemetry::{TraceExportConfig, TraceExportProtocol};
 use crate::network::control_server::{
-	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer, select_bootstrap_epoch,
+	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer,
+	epoch_config_from_membership, membership_from_epoch_config, select_bootstrap_epoch,
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
@@ -95,7 +97,7 @@ use crate::storage::{
 };
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Error, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -596,6 +598,7 @@ pub struct WendelonNode {
 	pub transport_admission: ServerAdmissionConfig,
 	pub audit_sink: Arc<dyn AuditSink>,
 	pub audit_materialization: Arc<AuditMaterializationTracker>,
+	restore_validation: watch::Receiver<RestoreValidationStatus>,
 	clock_drift_events: watch::Receiver<Option<ClockDriftEvent>>,
 	transport_servers: Vec<NodeTransportServer>,
 	pub handles: NodeHandles,
@@ -613,6 +616,7 @@ pub struct NodeHandles {
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
 	pub tiering_sweeper: Option<JoinHandle<()>>,
+	pub restore_validation: Option<JoinHandle<()>>,
 	pub audit_chain_root_rollup: JoinHandle<()>,
 	pub default_tenant_seeder: JoinHandle<()>,
 	pub checkpoint_emitter: JoinHandle<()>,
@@ -629,6 +633,9 @@ impl NodeHandles {
 		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
 		if let Some(handle) = &self.tiering_sweeper {
+			handle.abort();
+		}
+		if let Some(handle) = &self.restore_validation {
 			handle.abort();
 		}
 		self.audit_chain_root_rollup.abort();
@@ -653,10 +660,30 @@ impl NodeHandles {
 		if let Some(handle) = self.tiering_sweeper {
 			await_background_task(handle, "tiering sweeper").await?;
 		}
+		if let Some(handle) = self.restore_validation {
+			await_background_task(handle, "restore validation").await?;
+		}
 		await_background_task(self.audit_chain_root_rollup, "audit chain root rollup").await?;
 		await_background_task(self.default_tenant_seeder, "default tenant seeder").await?;
 		await_background_task(self.checkpoint_emitter, "checkpoint emitter").await?;
 		Ok(())
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RestoreValidationStatus {
+	Complete,
+	Pending,
+	Failed(String),
+}
+
+impl RestoreValidationStatus {
+	fn degraded_reason(&self) -> Option<String> {
+		match self {
+			Self::Complete => None,
+			Self::Pending => Some("RestoreValidationPending".to_string()),
+			Self::Failed(reason) => Some(reason.clone()),
+		}
 	}
 }
 
@@ -839,6 +866,131 @@ impl WendelonNode {
 		Self::bootstrap(cfg).await
 	}
 
+	pub async fn restore_from_cluster_backup(
+		backup: &ClusterBackupImage,
+		cfg: NodeBootstrapConfig,
+	) -> std::io::Result<Self> {
+		Self::restore_cluster_backup_artifacts(backup, &cfg).await?;
+		// Preserve the caller's cluster mode so the same restore helper can
+		// support both standalone recovery bootstrap and same-identity
+		// replacement into a live cluster.
+		Self::bootstrap(cfg).await
+	}
+
+	pub async fn restore_from_cluster_backup_with_provider(
+		backup: &ClusterBackupImage,
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+	) -> std::io::Result<Self> {
+		Self::restore_cluster_backup_artifacts(backup, &cfg).await?;
+		Self::bootstrap_with_provider(cfg, provider).await
+	}
+
+	pub async fn restore_replacement_from_cluster_backup(
+		backup: &ClusterBackupImage,
+		source_node_id: u32,
+		cfg: NodeBootstrapConfig,
+	) -> std::io::Result<Self> {
+		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg).await?;
+		Self::bootstrap(cfg).await
+	}
+
+	pub async fn restore_replacement_from_cluster_backup_with_provider(
+		backup: &ClusterBackupImage,
+		source_node_id: u32,
+		cfg: NodeBootstrapConfig,
+		provider: Arc<dyn TransportProvider>,
+	) -> std::io::Result<Self> {
+		Self::prepare_replacement_from_cluster_backup(backup, source_node_id, &cfg).await?;
+		Self::bootstrap_with_provider(cfg, provider).await
+	}
+
+	async fn restore_cluster_backup_artifacts(
+		backup: &ClusterBackupImage,
+		cfg: &NodeBootstrapConfig,
+	) -> std::io::Result<()> {
+		std::fs::create_dir_all(&cfg.data_dir)?;
+		backup.validate_integrity()?;
+		let node_backup = backup
+			.nodes
+			.iter()
+			.find(|node| node.node_id == cfg.node_id)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"cluster backup does not contain a node storage artifact for node {}",
+						cfg.node_id
+					),
+				)
+			})?;
+		WendelonLogStore::restore_backup(&backup.control, &cfg.data_dir).await?;
+		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir).await?;
+		Ok(())
+	}
+
+	async fn prepare_replacement_from_cluster_backup(
+		backup: &ClusterBackupImage,
+		source_node_id: u32,
+		cfg: &NodeBootstrapConfig,
+	) -> std::io::Result<()> {
+		if !matches!(cfg.cluster, ClusterBootstrapConfig::Join { .. }) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement restore requires cluster.join so the node can reattach to a live cluster",
+			));
+		}
+		if cfg.node_id == source_node_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement restore requires a fresh node_id distinct from the failed node",
+			));
+		}
+		std::fs::create_dir_all(&cfg.data_dir)?;
+		let (wal_path, vote_path, snapshot_path) = control_artifact_paths(&cfg.data_dir);
+		for path in [&wal_path, &vote_path, &snapshot_path] {
+			if path.exists() {
+				return Err(Error::new(
+					ErrorKind::AlreadyExists,
+					format!(
+						"replacement restore target must not contain existing Control Ring artifacts: {}",
+						path.display()
+					),
+				));
+			}
+		}
+		backup.validate_integrity()?;
+		let node_backup = backup
+			.nodes
+			.iter()
+			.find(|node| node.node_id == source_node_id)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"cluster backup does not contain a node storage artifact for node {}",
+						source_node_id
+					),
+				)
+			})?;
+		SlabManager::restore_backup(&node_backup.storage, &cfg.data_dir).await?;
+		Ok(())
+	}
+
+	pub async fn export_cluster_backup(&self) -> std::io::Result<ClusterBackupImage> {
+		let control = self.log_store.export_backup(&self.state_machine).await?;
+		let state = self.state_machine.state_snapshot().await;
+		let storage = self.slab.export_backup().await?;
+		ClusterBackupImage::assemble(
+			control,
+			&state,
+			vec![ClusterNodeBackupImage {
+				node_id: self.local_node.id,
+				storage,
+			}],
+		)
+	}
+
 	pub async fn rotate_tenant_kek(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
 		if !self
 			.state_machine
@@ -896,6 +1048,79 @@ impl WendelonNode {
 			"update_tenant_quota",
 		)
 		.await
+	}
+
+	pub async fn remove_member_for_replacement(&self, removed_node_id: u32) -> std::io::Result<()> {
+		if removed_node_id == 0 || removed_node_id == self.local_node.id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement removal must target a non-local non-zero node id",
+			));
+		}
+		if self.raft.current_leader().await != Some(self.local_node.id) {
+			return Err(Error::new(
+				ErrorKind::NotConnected,
+				"remove_member_for_replacement must be called on the current leader",
+			));
+		}
+
+		let snapshot = self.state_machine.state_snapshot().await;
+		let current_epoch_cfg = snapshot
+			.epoch_history
+			.iter()
+			.next_back()
+			.map(|(_, cfg)| cfg.clone())
+			.ok_or_else(|| {
+				Error::other("replacement removal requires committed membership epoch history")
+			})?;
+		let mut next_membership = membership_from_epoch_config(&current_epoch_cfg);
+		let removed_node = NodeId {
+			id: removed_node_id,
+			_reserved: 0,
+		};
+		let removed_from_epoch = next_membership.peers.remove(&removed_node).is_some();
+
+		let mut desired_voters: BTreeSet<u32> = snapshot.last_membership.voter_ids().collect();
+		let removed_from_voters = desired_voters.remove(&removed_node_id);
+		drop(snapshot);
+
+		if !removed_from_epoch && !removed_from_voters {
+			return Ok(());
+		}
+		if desired_voters.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"replacement removal would leave the cluster without any voters",
+			));
+		}
+
+		if removed_from_voters {
+			self.raft
+				.change_membership(desired_voters, true)
+				.await
+				.map_err(|err| {
+					Error::other(format!(
+						"remove_member_for_replacement change_membership failed: {err}"
+					))
+				})?;
+		}
+
+		if removed_from_epoch {
+			next_membership.epoch = current_epoch_cfg.epoch.saturating_add(1);
+			self.raft
+				.client_write(WendelonRequest::AdvanceEpoch(AdvanceEpochRecord {
+					from: current_epoch_cfg,
+					to: epoch_config_from_membership(&next_membership),
+				}))
+				.await
+				.map_err(|err| {
+					Error::other(format!(
+						"remove_member_for_replacement advance_epoch failed: {err}"
+					))
+				})?;
+		}
+
+		Ok(())
 	}
 
 	pub async fn suspend_tenant(&self, tenant_id: TenantId) -> std::io::Result<()> {
@@ -1059,6 +1284,14 @@ impl WendelonNode {
 		let fallback_epoch =
 			seed_single_node_epoch(local_node, &cfg.advertise_address, local_tiers);
 		let recovered_state = state_machine.state_snapshot().await;
+		let requires_restore_validation = bootstrap_mode == DurableBootstrapMode::Recovery
+			&& !recovered_state.tiered_slabs.is_empty();
+		let (restore_validation_tx, restore_validation_rx) =
+			watch::channel(if requires_restore_validation {
+				RestoreValidationStatus::Pending
+			} else {
+				RestoreValidationStatus::Complete
+			});
 		// Safe because Raft has not been constructed yet, so no tenant-KEK
 		// observer callback can race this authoritative bootstrap snapshot.
 		crypto.replace_keysets_from_authoritative_snapshot(&recovered_state.tenant_keysets)?;
@@ -1307,10 +1540,14 @@ impl WendelonNode {
 
 		// 14. Fresh nodes either initialize a one-node cluster or
 		//     join an existing leader through the explicit Control
-		//     Ring join path. Durable recovery skips this step.
-		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
-			match &cfg.cluster {
-				ClusterBootstrapConfig::Bootstrap => {
+		//     Ring join path. Recovery-mode nodes rely on their
+		//     durable Raft membership/log state instead of replaying
+		//     a synthetic join RPC on restart; reissuing join after
+		//     recovery can perturb follower replication ordering and
+		//     trip OpenRaft's follower-log-reversion guard.
+		match &cfg.cluster {
+			ClusterBootstrapConfig::Bootstrap => {
+				if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
 					let mut members: BTreeMap<u32, BasicNode> = BTreeMap::new();
 					members.insert(
 						cfg.node_id,
@@ -1323,7 +1560,9 @@ impl WendelonNode {
 					})?;
 					wait_for_local_leader(&raft, local_node).await?;
 				}
-				ClusterBootstrapConfig::Join { seeds } => {
+			}
+			ClusterBootstrapConfig::Join { seeds } => {
+				if bootstrap_mode == DurableBootstrapMode::FreshBootstrap {
 					request_join_via_seeds(
 						local_node,
 						&cfg.advertise_address,
@@ -1438,6 +1677,24 @@ impl WendelonNode {
 			.with_mvcc_retention_policy(cfg.mvcc_retention_policy)
 			.spawn()
 		});
+		let restore_validation = if requires_restore_validation {
+			let slab = slab.clone();
+			Some(tokio::spawn(async move {
+				match slab.validate_tiered_references().await {
+					Ok(()) => {
+						let _ = restore_validation_tx.send(RestoreValidationStatus::Complete);
+					}
+					Err(err) => {
+						tracing::error!(error = %err, "restore tier validation failed");
+						let _ = restore_validation_tx.send(RestoreValidationStatus::Failed(
+							format!("RestoreValidationFailed: {err}"),
+						));
+					}
+				}
+			}))
+		} else {
+			None
+		};
 
 		let node = Self {
 			local_node,
@@ -1462,6 +1719,7 @@ impl WendelonNode {
 			transport_admission: cfg.transport_admission.clone(),
 			audit_sink,
 			audit_materialization,
+			restore_validation: restore_validation_rx,
 			clock_drift_events: clock_drift_rx,
 			transport_servers,
 			handles: NodeHandles {
@@ -1474,6 +1732,7 @@ impl WendelonNode {
 				tenant_policy_reconciler,
 				migration_sweeper,
 				tiering_sweeper,
+				restore_validation,
 				audit_chain_root_rollup,
 				default_tenant_seeder,
 				checkpoint_emitter,
@@ -1589,6 +1848,7 @@ impl WendelonNode {
 			data_server: self.data_server.clone(),
 			lifecycle: self.lifecycle.clone(),
 			audit_materialization: self.audit_materialization.clone(),
+			restore_validation: self.restore_validation.clone(),
 		}
 	}
 }
@@ -1601,6 +1861,7 @@ pub struct NodeReadinessView {
 	data_server: Arc<WendelonDataServer>,
 	lifecycle: ServerLifecycle,
 	audit_materialization: Arc<AuditMaterializationTracker>,
+	restore_validation: watch::Receiver<RestoreValidationStatus>,
 }
 
 #[async_trait]
@@ -1620,9 +1881,13 @@ impl ReadinessReporter for NodeReadinessView {
 		};
 		let audit_materialization_lag_entries = self.audit_materialization.lag_entries();
 		let fips_build_state = build_info::current_fips_build_state();
-		let degraded_reason = self.data_server.degraded_reason().or_else(|| {
-			(audit_materialization_lag_entries > 0).then(|| "AuditLagExceeded".to_string())
-		});
+		let degraded_reason = self
+			.data_server
+			.degraded_reason()
+			.or_else(|| self.restore_validation.borrow().degraded_reason())
+			.or_else(|| {
+				(audit_materialization_lag_entries > 0).then(|| "AuditLagExceeded".to_string())
+			});
 		ReadinessSnapshot {
 			node_id: self.local_node.id,
 			epoch: epoch.epoch,
@@ -2317,6 +2582,22 @@ mod tests {
 		}
 	}
 
+	async fn wait_for_ready(node: &WendelonNode) {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.readiness_reporter().snapshot().await.is_ready() {
+				return;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for node {} to become ready; snapshot = {:?}",
+				node.local_node.id,
+				node.readiness_reporter().snapshot().await
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}
+
 	async fn wait_for_tiered_slab(node: &WendelonNode, slab_id: crate::schema::SlabId) {
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 		loop {
@@ -2710,6 +2991,7 @@ mod tests {
 		}
 
 		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		wait_for_ready(&recovered).await;
 		assert!(recovered.slab.is_tiered(sealed_id).await);
 		let location = recovered
 			.slab
@@ -2717,6 +2999,123 @@ mod tests {
 			.expect("tiered key should be restored from recovered state");
 		assert_eq!(location.slab_id, sealed_id);
 		assert_eq!(recovered.slab.read(location).await.unwrap(), tiered_bytes);
+
+		recovered.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn recovery_blocks_readiness_when_tiered_reference_validation_fails() {
+		let dir = tempdir("restart-tiered-missing-l2");
+		let l2_dir = tempdir("restart-tiered-missing-l2-store");
+		let mut cfg = NodeBootstrapConfig::dev(15, dir.clone(), "127.0.0.1:0".into());
+		cfg.slab_max_bytes = 1;
+		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
+			root: l2_dir.clone(),
+		});
+		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
+		let node = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.unwrap();
+
+		wait_for_local_leader(&node).await;
+
+		let tenant_id = TenantId::ZERO;
+		let tiered_key = Identity::blake3(b"missing-tiered-row");
+		let active_key = Identity::blake3(b"missing-tiered-active-row");
+		node.slab
+			.append(
+				tenant_id,
+				tiered_key,
+				HybridTimestamp {
+					physical_ms: 10,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"tiered-row",
+			)
+			.await
+			.unwrap();
+		node.slab
+			.append(
+				tenant_id,
+				active_key,
+				HybridTimestamp {
+					physical_ms: 20,
+					logical: 0,
+					node_id: node.local_node.id,
+				},
+				b"active-row",
+			)
+			.await
+			.unwrap();
+		node.slab.fsync_all_local_slabs().await.unwrap();
+
+		let sealed_id = node.slab.list_sealed_slabs().await[0].slab_id;
+		let raw = node.slab.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = node
+			.slab
+			.encrypt_tiered_object_blob(sealed_id, &raw)
+			.unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let l2_uri = l2
+			.put(
+				&format!("sealed/slab_{sealed_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+
+		node.raft
+			.client_write(WendelonRequest::TierSlab(TieredSlab {
+				slab_id: sealed_id,
+				l2_uri: l2_uri.clone(),
+				payload_hash,
+				is_encrypted: true,
+				tenant_id: Some(tenant_id),
+				tenant_kek_id: Some(encrypted.tenant_kek_id),
+			}))
+			.await
+			.unwrap();
+
+		l2.delete(&l2_uri).await.unwrap();
+
+		node.handles.abort();
+		drop(node);
+		tokio::time::sleep(Duration::from_millis(25)).await;
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			let snapshot = recovered.readiness_reporter().snapshot().await;
+			if let Some(reason) = snapshot.degraded_reason.as_deref() {
+				if reason == "RestoreValidationPending" {
+					assert!(
+						!snapshot.is_ready(),
+						"restore validation must block readiness while validation is pending"
+					);
+					assert!(
+						tokio::time::Instant::now() < deadline,
+						"timed out waiting for restore validation failure"
+					);
+					tokio::time::sleep(Duration::from_millis(20)).await;
+					continue;
+				}
+				assert!(
+					reason.starts_with("RestoreValidationFailed:"),
+					"unexpected degraded reason: {reason}"
+				);
+				assert!(
+					!snapshot.is_ready(),
+					"restore validation failure must keep readiness blocked"
+				);
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for restore validation failure"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
 
 		recovered.handles.abort();
 	}

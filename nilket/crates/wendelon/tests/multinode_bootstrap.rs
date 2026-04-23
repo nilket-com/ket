@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use wendelon::config::load_node_bootstrap_config;
+use wendelon::metrics::observability::ReadinessReporter;
 use wendelon::network::control_server::{
 	CONTROL_REASON_GRANTED, JoinClusterRequestWire, JoinClusterResponseWire,
 };
@@ -21,7 +22,7 @@ use wendelon::network::{
 use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, WendelonNode};
 use wendelon::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp, LeaseStatus,
-	MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
+	MsgType, NodeId, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TenantId,
 };
 
 fn fresh_dir(tag: &str) -> PathBuf {
@@ -224,6 +225,43 @@ async fn wait_for_voters(node: &WendelonNode, expected: &[u32]) {
 			"timed out waiting for voters {:?}; got {:?}",
 			expected,
 			voters
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
+}
+
+async fn wait_for_ready(node: &WendelonNode) {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	loop {
+		let snapshot = node.readiness_reporter().snapshot().await;
+		if snapshot.is_ready() {
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for readiness; snapshot={snapshot:?}",
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
+}
+
+async fn wait_for_tenant_quota(node: &WendelonNode, tenant_id: TenantId, quota_bytes: u64) {
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	loop {
+		let snapshot = node.state_machine.state_snapshot().await;
+		let actual = snapshot
+			.tenants
+			.get(&tenant_id)
+			.map(|tenant| tenant.quota_bytes);
+		if actual == Some(quota_bytes) {
+			return;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for tenant {} quota {}; got {:?}",
+			tenant_id.get(),
+			quota_bytes,
+			actual,
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 	}
@@ -598,6 +636,113 @@ async fn explicit_join_is_idempotent_and_recovery_rejoins_cleanly() {
 	assert_eq!(node1.ring.current_epoch(), epoch_before);
 
 	support::abort_node(&node2_restarted);
+	support::abort_node(&node1);
+}
+
+#[tokio::test]
+async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
+	let trusted = [1u32, 2, 3, 4];
+	let node1_addr = "loopback://replacement-node-1".to_string();
+	let node2_addr = "loopback://replacement-node-2".to_string();
+	let node3_addr = "loopback://replacement-node-3".to_string();
+	let node4_addr = "loopback://replacement-node-4".to_string();
+
+	let node1_cfg = trusted_cfg("replacement-node1", 1, &node1_addr, 3, &trusted, &[]);
+	let node2_cfg = trusted_cfg(
+		"replacement-node2",
+		2,
+		&node2_addr,
+		3,
+		&trusted,
+		&[(1, node1_addr.as_str())],
+	);
+	let node3_cfg = trusted_cfg(
+		"replacement-node3",
+		3,
+		&node3_addr,
+		3,
+		&trusted,
+		&[(1, node1_addr.as_str())],
+	);
+
+	let registry = support::shared_loopback_registry();
+	let node1 =
+		WendelonNode::bootstrap_with_provider(node1_cfg.clone(), provider_for(1, registry.clone()))
+			.await
+			.unwrap();
+	let node2 =
+		WendelonNode::bootstrap_with_provider(node2_cfg.clone(), provider_for(2, registry.clone()))
+			.await
+			.unwrap();
+	let node3 =
+		WendelonNode::bootstrap_with_provider(node3_cfg.clone(), provider_for(3, registry.clone()))
+			.await
+			.unwrap();
+
+	wait_for_cluster(&node1, 3, 3).await;
+	wait_for_cluster(&node2, 3, 3).await;
+	wait_for_cluster(&node3, 3, 3).await;
+	wait_for_voters(&node1, &[1, 2, 3]).await;
+	wait_for_ready(&node3).await;
+
+	let baseline_quota = 128 * 1024 * 1024;
+	node1
+		.update_tenant_quota(TenantId::ZERO, baseline_quota)
+		.await
+		.unwrap();
+	wait_for_tenant_quota(&node1, TenantId::ZERO, baseline_quota).await;
+	wait_for_tenant_quota(&node2, TenantId::ZERO, baseline_quota).await;
+	wait_for_tenant_quota(&node3, TenantId::ZERO, baseline_quota).await;
+
+	let backup = node3.export_cluster_backup().await.unwrap();
+
+	support::abort_node(&node3);
+	drop(node3);
+
+	let epoch_before_replacement = node1.ring.current_epoch();
+	node1.remove_member_for_replacement(3).await.unwrap();
+
+	wait_for_cluster(&node1, epoch_before_replacement + 1, 2).await;
+	wait_for_cluster(&node2, epoch_before_replacement + 1, 2).await;
+	wait_for_voters(&node1, &[1, 2]).await;
+
+	let replacement_cfg = trusted_cfg(
+		"replacement-node4-restored",
+		4,
+		&node4_addr,
+		3,
+		&trusted,
+		&[(1, node1_addr.as_str())],
+	);
+	let restored = WendelonNode::restore_replacement_from_cluster_backup_with_provider(
+		&backup,
+		3,
+		replacement_cfg,
+		provider_for(4, registry.clone()),
+	)
+	.await
+	.unwrap();
+
+	wait_for_cluster(&node1, epoch_before_replacement + 2, 3).await;
+	wait_for_cluster(&node2, epoch_before_replacement + 2, 3).await;
+	wait_for_cluster(&restored, epoch_before_replacement + 2, 3).await;
+	wait_for_leader(&restored, 1).await;
+	wait_for_voters(&node1, &[1, 2, 4]).await;
+	wait_for_voters(&restored, &[1, 2, 4]).await;
+	wait_for_tenant_quota(&restored, TenantId::ZERO, baseline_quota).await;
+	wait_for_ready(&restored).await;
+
+	let post_replacement_quota = baseline_quota * 2;
+	node1
+		.update_tenant_quota(TenantId::ZERO, post_replacement_quota)
+		.await
+		.unwrap();
+	wait_for_tenant_quota(&node1, TenantId::ZERO, post_replacement_quota).await;
+	wait_for_tenant_quota(&node2, TenantId::ZERO, post_replacement_quota).await;
+	wait_for_tenant_quota(&restored, TenantId::ZERO, post_replacement_quota).await;
+
+	support::abort_node(&restored);
+	support::abort_node(&node2);
 	support::abort_node(&node1);
 }
 

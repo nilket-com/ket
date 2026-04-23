@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod backup;
 pub mod build_info;
 pub mod client;
 pub mod config;

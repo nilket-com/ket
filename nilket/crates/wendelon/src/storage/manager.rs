@@ -1121,6 +1121,44 @@ impl SlabManager {
 		pointers
 	}
 
+	/// Restore-time validation pass for replicated tier pointers.
+	///
+	/// Confirms that every committed tier reference is resolvable
+	/// through the configured L2 store before the node advertises
+	/// ready. This is intentionally lighter than a full object hash
+	/// re-read: H2 only needs to prove the referenced objects exist
+	/// and are reachable from the restore environment.
+	pub async fn validate_tiered_references(&self) -> std::io::Result<()> {
+		let pointers = self.list_tiered_slabs().await;
+		if pointers.is_empty() {
+			return Ok(());
+		}
+		let l2 = self.config.l2.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"restore validation requires an L2 object store when tiered slab references are present",
+			)
+		})?;
+		for pointer in &pointers {
+			let metadata = l2.head(&pointer.l2_uri).await.map_err(|err| {
+				Error::other(format!(
+					"restore validation failed for tiered slab {} at {}: {err}",
+					pointer.slab_id, pointer.l2_uri
+				))
+			})?;
+			if metadata.size_bytes == 0 {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"restore validation found zero-length tiered slab {} at {}",
+						pointer.slab_id, pointer.l2_uri
+					),
+				));
+			}
+		}
+		Ok(())
+	}
+
 	/// Tier retirements that committed in the SM but still need
 	/// best-effort local cleanup retried.
 	pub async fn list_retired_tiered_cleanup_candidates(&self) -> Vec<TieredSlabPointer> {

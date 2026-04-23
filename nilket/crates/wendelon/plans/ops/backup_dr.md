@@ -24,6 +24,31 @@ The baseline restore flow is:
 3. restore the backed-up local slab files
 4. start the node with the normal bootstrap path
 
+## Replacement
+
+For a live cluster, the supported path is:
+
+1. remove the failed member identity from the live cluster
+2. provision a fresh replacement host or directory
+3. assign the replacement a fresh node identity
+4. optionally restore the failed node's latest storage backup into that target
+5. start the replacement with `cluster.mode = "join"` pointing at surviving
+   seeds
+6. wait for `/ready`
+7. verify the replacement has caught up with state committed after the backup
+   cut before declaring the replacement complete
+
+For the early pilot profile, the external automation contract is the executable
+harness at `scripts/recovery/run_node_replacement_contract.sh`. It does not
+perform provisioning or admin RPCs by itself; it enforces the required step
+ordering, deadlines, and verification hooks around whatever site-local tooling
+executes those actions.
+
+For the later larger-scale or regulated profile, the intended Wendelon-owned
+operator remains storage-tier-only. It may absorb the replacement / restore
+workflow orchestration above, but it does not expand into general application
+or identity-platform ownership.
+
 ## Remote-Tier Assumptions
 
 Tiered slabs are treated as external durability in the baseline:
@@ -45,9 +70,21 @@ After restore, operators should verify:
 - local reads against backed-up slab data succeed
 - new writes and new Control Ring commits also succeed
 
+## Runbooks
+
+The current operator-facing recovery catalog is:
+
+- `plans/ops/runbooks/cluster_restore.md`
+- `plans/ops/runbooks/node_replacement.md`
+
+The deeper implementation notes remain:
+
+- `plans/impl/workstream_H_restore_runbook.md`
+- `plans/impl/workstream_H_node_replacement_runbook.md`
+
 ## Deferred
 
 - scheduled export and retention management
-- multi-node cluster replacement choreography
 - remote-tier payload validation during restore
+- automated failed-member detection and external replacement triggering
 - legal-hold specific backup policy

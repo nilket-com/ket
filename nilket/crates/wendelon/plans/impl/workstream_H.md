@@ -71,6 +71,12 @@ Define and implement the backup artifact model:
 
 Per-node anecdotal snapshots are not sufficient.
 
+Current status:
+
+- artifact model implemented in `src/backup.rs`
+- current canonical note: `plans/impl/workstream_H_backup_manifest_spec.md`
+- single-node convenience export seam wired through `WendelonNode::export_cluster_backup()`
+
 ### H2. Restore Choreography
 
 Implement the supported restore sequence:
@@ -79,6 +85,12 @@ Implement the supported restore sequence:
 - reattach or revalidate storage state
 - validate remote-tier references
 - block ready-state until validation passes
+
+Current status:
+
+- restore helper implemented via `WendelonNode::restore_from_cluster_backup(...)`
+- readiness now stays degraded during restore validation and on tier-reference validation failure
+- current canonical note: `plans/impl/workstream_H_restore_runbook.md`
 
 ### H3. Node-Replacement Contract
 
@@ -89,6 +101,19 @@ Define the supported replacement flow:
 - bootstrap identity
 - join cluster
 - verify catch-up and restored durability posture
+
+Current status:
+
+- node-replacement runbook written around explicit remove-and-replace semantics
+- leader-side `remove_member_for_replacement(...)` helper implemented for
+  dropping the failed member from Raft membership and the visible epoch before
+  replacement
+- replacement helper implemented via
+  `restore_replacement_from_cluster_backup(...)` for seeding a fresh replacement
+  identity from the failed node's storage backup
+- multinode replacement proof added for remove-member, replacement join, and
+  post-replacement catch-up
+- current canonical note: `plans/impl/workstream_H_node_replacement_runbook.md`
 
 ### H4. Fallback Automation Path
 
@@ -101,6 +126,15 @@ That contract must still define:
 - required inputs
 - success verification
 
+Current status:
+
+- executable fallback harness added at
+  `scripts/recovery/run_node_replacement_contract.sh`
+- canonical note written at
+  `plans/impl/workstream_H_fallback_automation_contract.md`
+- contract now freezes trigger source, required inputs, timeout budget, and
+  success verification for external replacement automation
+
 ### H5. First-Party Operator Direction
 
 Preserve the path to a first-party operator for the regulated or larger-scale profile.
@@ -110,6 +144,15 @@ This slice should specify:
 - storage-tier-only scope
 - replacement ownership
 - restore/drill integration points
+
+Current status:
+
+- first-party operator direction note written at
+  `plans/impl/workstream_H_first_party_operator_direction.md`
+- scope is now frozen as storage-tier-only orchestration around the existing
+  H2/H3/H4 contracts, not a generic platform controller
+- replacement ownership and drill integration points are explicitly assigned so
+  later operator work must compose with existing Wendelon authority surfaces
 
 ### H6. Runbooks And Drills
 
@@ -121,6 +164,14 @@ Write and rehearse runbooks for:
 - cluster restore
 
 The drill standard is non-author execution, not author reassurance.
+
+Current status:
+
+- operator-facing runbook catalog created at `plans/ops/runbooks/`
+- canonical drill artifact created at
+  `plans/impl/workstream_H_drill_report.md`
+- the code/doc side of H6 is now present, but the non-author drill gate is
+  still pending real execution evidence
 
 ## Tests And Benchmarks
 
@@ -145,6 +196,7 @@ The drill standard is non-author execution, not author reassurance.
 - backup manifest spec
 - restore runbook
 - node-replacement runbook
+- runbook catalog
 - drill report
 - operator or fallback automation contract note
 

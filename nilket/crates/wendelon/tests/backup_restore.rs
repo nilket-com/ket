@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 use wendelon::audit::replay_audit_chain;
 use wendelon::consensus::raft_storage::DurableBootstrapMode;
-use wendelon::consensus::{TenantFinalization, WendelonLogStore, WendelonRequest};
-use wendelon::node::{NodeBootstrapConfig, WendelonNode};
+use wendelon::consensus::{TenantFinalization, WendelonRequest};
+use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, WendelonNode};
 use wendelon::schema::{
 	DurabilityLevel, FinalizationMarker, HybridTimestamp, Identity, SlabId, TenantId,
 };
-use wendelon::storage::{SlabManager, StorageEngine};
+use wendelon::storage::StorageEngine;
 
 fn tempdir(tag: &str) -> PathBuf {
 	let dir = std::env::temp_dir().join(format!(
@@ -133,22 +133,108 @@ async fn backup_generation_exports_control_and_storage_artifacts() {
 	node.handles.abort();
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
-	let control = node
-		.log_store
-		.export_backup(&node.state_machine)
-		.await
-		.unwrap();
-	let storage = node.slab.export_backup().await.unwrap();
+	let backup = node.export_cluster_backup().await.unwrap();
+	let state = node.state_machine.state_snapshot().await;
 
-	assert_eq!(control.manifest.format_version, 1);
-	assert!(control.manifest.wal_bytes > 0);
-	assert!(control.manifest.state_hash.iter().any(|byte| *byte != 0));
-	assert_eq!(storage.manifest.format_version, 1);
-	assert_eq!(storage.manifest.active_slab_id, SlabId::ZERO);
-	assert!(!storage.local_slabs.is_empty());
-	assert!(storage.manifest.local_slab_bytes >= frame.len() as u64);
-	assert!(storage.manifest.tiered_slabs.is_empty());
-	assert!(storage.manifest.omitted_rehydrated_slabs.is_empty());
+	assert_eq!(backup.manifest.format_version, 1);
+	assert_eq!(
+		backup.manifest.consistent_cut.last_applied_log_id,
+		backup.control.manifest.last_applied_log_id
+	);
+	assert_eq!(
+		backup.manifest.consistent_cut.last_e_safe_index,
+		state.last_e_safe_index
+	);
+	assert_eq!(
+		backup.manifest.consistent_cut.control_state_hash,
+		backup.control.manifest.state_hash
+	);
+	assert_eq!(backup.manifest.nodes.len(), 1);
+	assert_eq!(backup.manifest.nodes[0].node_id, node.local_node.id);
+	assert_eq!(backup.manifest.nodes[0].active_slab_id, SlabId::ZERO);
+	assert!(!backup.nodes[0].storage.local_slabs.is_empty());
+	assert!(
+		backup.manifest.nodes[0].local_copy_slab_bytes >= frame.len() as u64,
+		"cluster backup manifest should surface the copied local slab bytes"
+	);
+	assert!(backup.manifest.nodes[0].tiered_references.is_empty());
+	assert!(backup.manifest.nodes[0].omitted_rehydrated_slabs.is_empty());
+	backup.validate_integrity().unwrap();
+
+	drop(node);
+}
+
+#[tokio::test]
+async fn backup_manifest_detects_tampered_embedded_storage_artifact() {
+	let dir = tempdir("integrity");
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(42, dir, "127.0.0.1:0".into()))
+		.await
+	{
+		Ok(node) => node,
+		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+			eprintln!(
+				"skipping backup_manifest_detects_tampered_embedded_storage_artifact in this environment: {err}"
+			);
+			return;
+		}
+		Err(err) => panic!("backup generation bootstrap failed: {err}"),
+	};
+	wait_for_local_leader(&node).await;
+
+	let mut backup = node.export_cluster_backup().await.unwrap();
+	backup.nodes[0].storage.local_slabs[0].bytes.push(0xFF);
+	let err = backup.validate_integrity().unwrap_err();
+	assert!(err.to_string().contains("storage image hash mismatch"));
+
+	drop(node);
+}
+
+#[tokio::test]
+async fn backup_manifest_detects_tampered_control_image() {
+	let dir = tempdir("integrity-control");
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(43, dir, "127.0.0.1:0".into()))
+		.await
+	{
+		Ok(node) => node,
+		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+			eprintln!(
+				"skipping backup_manifest_detects_tampered_control_image in this environment: {err}"
+			);
+			return;
+		}
+		Err(err) => panic!("backup generation bootstrap failed: {err}"),
+	};
+	wait_for_local_leader(&node).await;
+
+	let mut backup = node.export_cluster_backup().await.unwrap();
+	backup.control.wal.push(0xAB);
+	let err = backup.validate_integrity().unwrap_err();
+	assert!(err.to_string().contains("control image hash mismatch"));
+
+	drop(node);
+}
+
+#[tokio::test]
+async fn backup_manifest_detects_voter_id_mismatch() {
+	let dir = tempdir("integrity-voters");
+	let node = match bootstrap_single_node(NodeBootstrapConfig::dev(44, dir, "127.0.0.1:0".into()))
+		.await
+	{
+		Ok(node) => node,
+		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+			eprintln!(
+				"skipping backup_manifest_detects_voter_id_mismatch in this environment: {err}"
+			);
+			return;
+		}
+		Err(err) => panic!("backup generation bootstrap failed: {err}"),
+	};
+	wait_for_local_leader(&node).await;
+
+	let mut backup = node.export_cluster_backup().await.unwrap();
+	backup.manifest.consistent_cut.voter_ids.push(999);
+	let err = backup.validate_integrity().unwrap_err();
+	assert!(err.to_string().contains("voter_ids"));
 
 	drop(node);
 }
@@ -214,29 +300,16 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	source.handles.abort();
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
-	let control = source
-		.log_store
-		.export_backup(&source.state_machine)
-		.await
-		.unwrap();
-	let storage = source.slab.export_backup().await.unwrap();
+	let control = source.export_cluster_backup().await.unwrap();
 
 	drop(source);
 	tokio::time::sleep(Duration::from_millis(25)).await;
 
 	let restore_dir = tempdir("restore");
-	WendelonLogStore::restore_backup(&control, &restore_dir)
-		.await
-		.unwrap();
-	SlabManager::restore_backup(&storage, &restore_dir)
-		.await
-		.unwrap();
-
-	let restored = bootstrap_single_node(NodeBootstrapConfig::dev(
-		52,
-		restore_dir,
-		"127.0.0.1:0".into(),
-	))
+	let restored = WendelonNode::restore_from_cluster_backup(
+		&control,
+		NodeBootstrapConfig::dev(52, restore_dir, "127.0.0.1:0".into()),
+	)
 	.await
 	.unwrap();
 	wait_for_local_leader(&restored).await;
@@ -301,4 +374,48 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	);
 
 	restored.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn replacement_restore_rejects_reusing_failed_node_id() {
+	let dir = tempdir("replacement-same-node-id");
+	let source = match bootstrap_single_node(NodeBootstrapConfig::dev(
+		62,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	{
+		Ok(node) => node,
+		Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+			eprintln!(
+				"skipping replacement_restore_rejects_reusing_failed_node_id in this environment: {err}"
+			);
+			return;
+		}
+		Err(err) => panic!("source bootstrap failed: {err}"),
+	};
+	wait_for_local_leader(&source).await;
+
+	let backup = source.export_cluster_backup().await.unwrap();
+	let replacement_dir = tempdir("replacement-same-node-id-target");
+	let mut cfg = NodeBootstrapConfig::dev(62, replacement_dir, "127.0.0.1:0".into());
+	cfg.cluster = ClusterBootstrapConfig::Join {
+		seeds: vec![SeedNodeConfig {
+			node_id: 1,
+			address: "127.0.0.1:1".into(),
+		}],
+	};
+
+	let err = match WendelonNode::restore_replacement_from_cluster_backup(&backup, 62, cfg).await {
+		Ok(_) => panic!("replacement restore should reject reusing the failed node id"),
+		Err(err) => err,
+	};
+	assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+	assert!(
+		err.to_string()
+			.contains("fresh node_id distinct from the failed node")
+	);
+
+	source.shutdown().await.unwrap();
 }
