@@ -7,6 +7,7 @@ pub mod consensus;
 pub mod crypto;
 pub mod governance;
 pub mod hash;
+pub mod integration;
 pub mod metrics;
 pub mod network;
 pub mod node;

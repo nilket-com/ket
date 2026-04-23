@@ -32,6 +32,14 @@ use wendelon::schema::{
 };
 
 pub use wendelon::client::{QueryLocalityRange, StreamingQueryResult};
+pub use wendelon::integration::compute::{
+	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
+	ComputeTraceContextV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+	SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+	StorageQuotaMetadataV1, StorageStatusKind, decode_schema_update_envelope_v1,
+	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
+	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
+};
 pub use wendelon::schema::{Consistency as ReadConsistency, DurabilityLevel as DurabilityClass};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +175,21 @@ pub enum ClientError {
 	WriteFailed { status: WriteStatus },
 	#[error("read failed with status {status:?}")]
 	ReadFailed { status: ReadStatus },
+}
+
+impl ClientError {
+	pub fn storage_status_kind(&self) -> StorageStatusKind {
+		match self {
+			Self::Io(_) => StorageStatusKind::TerminalStorageError,
+			Self::QuotaExceeded { .. } => StorageStatusKind::QuotaExceeded,
+			Self::TenantSuspended { .. } | Self::TenantUnavailable { .. } => {
+				StorageStatusKind::TenantUnavailable
+			}
+			Self::AuthorizationFailed => StorageStatusKind::AuthorizationFailed,
+			Self::WriteFailed { status } => map_write_status_for_compute(*status),
+			Self::ReadFailed { status } => map_read_status_for_compute(*status),
+		}
+	}
 }
 
 pub struct Client {

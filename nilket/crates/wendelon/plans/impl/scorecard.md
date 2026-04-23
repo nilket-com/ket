@@ -83,7 +83,7 @@ Status vocabulary:
 | `M2 Scale & Survive` | D soak spec | `done` | `D` | `plans/impl/workstream_D_soak_spec.md` | D6 workload shape and promotion rule are fixed |
 | `M2 Scale & Survive` | D soak report | `partial` | `D` | `plans/impl/workstream_D_soak_report.md` | Template is present; authoritative measured run is still pending |
 | `M3 Customer Pilot Ready` | Audit/trace correlation inventory | `open` | `D` + `G` | reserved in `plans/impl/artifact_registry.md` | Depends on D2 and G |
-| `M4 Regulated Pilot Authorization` | Toron boundary contract | `open` | `I` + `F` + `G` + `D` | reserved in `plans/impl/artifact_registry.md` | Needs versioned boundary doc and identity/schema/quota/trace/audit contract tests |
+| `M4 Regulated Pilot Authorization` | Generic compute/storage boundary for Toron | `done` | `I` + `F` + `G` + `D` | `plans/impl/workstream_I_boundary_contract.md`, `plans/impl/workstream_I_contract_test_inventory.md` | Wendelon-side boundary and mock compute-client tests are live; `../toron` has not implemented the contract yet |
 | `M4 Regulated Pilot Authorization` | Hostile-failure evidence package | `open` | `D` | reserved in `plans/impl/artifact_registry.md` | Depends on D3-D6 |
 | `M5 Regulated GA` | CMVP status and evidence package | `open` | `J` + `A` | reserved in `plans/impl/artifact_registry.md` | Depends on external CMVP/lab tracker and J crypto-boundary artifacts |
 | `M5 Regulated GA` | SBOM and signed release artifacts | `open` | `J` | reserved in `plans/impl/artifact_registry.md` | Release artifact evidence path is reserved; implementation not started |

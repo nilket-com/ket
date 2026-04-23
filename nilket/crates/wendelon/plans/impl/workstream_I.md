@@ -30,7 +30,7 @@ and both systems pay the cost later.
 
 ## Scope
 
-- Toron/Wendelon boundary contract
+- generic compute/Wendelon boundary contract, with Toron as the first intended consumer
 - `query_session` identity handoff
 - schema intent versus durable schema sequencing
 - quota and error semantics
@@ -70,6 +70,8 @@ Write the boundary contract in implementation terms:
 - what metadata returns to compute
 - what the versioning rules are
 
+The Wendelon API vocabulary should remain generic compute-client language rather than Toron-specific names.
+
 ### I2. `query_session` Handoff
 
 Implement the short-lived storage-facing identity bridge for user-originated query activity.
@@ -85,7 +87,7 @@ This should be:
 
 Freeze the shape of the durable schema envelope between compute intent and storage sequencing.
 
-Toron may originate intent. Wendelon owns durable ordering.
+Compute clients, including Toron, may originate intent. Wendelon owns durable ordering.
 
 ### I4. Quota And Error Semantics
 
@@ -93,7 +95,7 @@ Define and implement:
 
 - structured quota-failure codes
 - success-path quota metadata where cheap enough
-- what Toron is allowed to cache versus what must be propagated as storage truth
+- what a compute client is allowed to cache versus what must be propagated as storage truth
 
 ### I5. Trace And Audit Correlation
 
@@ -124,16 +126,17 @@ This is a reference layer, not a full connector product line.
 
 ## Tests And Benchmarks
 
+- `tests/compute_integration_contract.rs`
 - contract tests for `query_session` issuance and use
 - schema-transition tests across the boundary
 - quota-failure propagation tests
 - trace-context continuity tests
 - audit attribution tests
-- end-to-end integration tests with a mock Toron harness
+- end-to-end integration tests with a mock compute-client harness
 
 ## Exit Criteria
 
-- the Toron/Wendelon boundary is versioned and documented
+- the compute/Wendelon boundary is versioned and documented with Toron as the first intended consumer
 - `query_session` handoff is real and tested
 - schema ownership no longer depends on informal agreement
 - quota, trace, and audit semantics survive the boundary coherently
@@ -141,11 +144,13 @@ This is a reference layer, not a full connector product line.
 
 ## Artifacts
 
-- Toron/Wendelon boundary spec
-- integration runbook
-- contract-test inventory
-- driver and identity-mapping note
-- schema-envelope note
+- compute/Wendelon boundary spec: `plans/impl/workstream_I_boundary_contract.md`
+- integration runbook: `plans/impl/workstream_I_integration_runbook.md`
+- contract-test inventory: `plans/impl/workstream_I_contract_test_inventory.md`
+- driver and identity-mapping note: `plans/impl/workstream_I_driver_identity_mapping_note.md`
+- schema-envelope note: `plans/impl/workstream_I_schema_envelope_note.md`
+- Wendelon code surface: `src/integration/compute.rs`
+- Wendelon client surface: `crates/wendelon-client/src/lib.rs`
 
 ## Deferred Follow-Ons
 
