@@ -1,4 +1,8 @@
-use crate::audit::{AuditSinksConfig, KafkaAuditConfig, SyslogAuditConfig};
+use crate::audit::{
+	ArchiveAuditConfig, AuditArchiveLockMode, AuditSinksConfig,
+	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES, KafkaAuditConfig, KafkaAuditPayloadMode,
+	SyslogAuditConfig,
+};
 use crate::crypto::{
 	CryptoCacheConfig, DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
 	RootKekProviderConfig, SLAB_MAX_BYTES_HARD_CEILING,
@@ -282,9 +286,31 @@ enum RawObservabilityTraceProtocol {
 #[derive(Debug, Default, Deserialize)]
 struct RawAuditConfig {
 	#[serde(default)]
+	archive: Option<RawAuditArchiveConfig>,
+	#[serde(default)]
 	syslog: Option<RawAuditSyslogConfig>,
 	#[serde(default)]
 	kafka: Option<RawAuditKafkaConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAuditArchiveConfig {
+	directory: PathBuf,
+	#[serde(default = "default_audit_archive_max_segment_bytes")]
+	max_segment_bytes: u64,
+	#[serde(default)]
+	lock_mode: RawAuditArchiveLockMode,
+	#[serde(default)]
+	retain_days: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawAuditArchiveLockMode {
+	#[default]
+	None,
+	Governance,
+	Compliance,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,7 +322,17 @@ struct RawAuditSyslogConfig {
 struct RawAuditKafkaConfig {
 	brokers: String,
 	topic: String,
+	#[serde(default)]
+	payload_mode: RawKafkaAuditPayloadMode,
 	client_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawKafkaAuditPayloadMode {
+	#[default]
+	Distribution,
+	Canonical,
 }
 
 impl RawConfig {
@@ -419,12 +455,26 @@ impl RawConfig {
 			.absolutize_from_config_dir(source_path);
 		let observability = self.observability.into_runtime_config(source_path)?;
 		let audit = AuditSinksConfig {
+			archive: self.audit.archive.map(|archive| ArchiveAuditConfig {
+				directory: absolutize_from_config_dir(source_path, &archive.directory),
+				max_segment_bytes: archive.max_segment_bytes,
+				lock_mode: match archive.lock_mode {
+					RawAuditArchiveLockMode::None => AuditArchiveLockMode::None,
+					RawAuditArchiveLockMode::Governance => AuditArchiveLockMode::Governance,
+					RawAuditArchiveLockMode::Compliance => AuditArchiveLockMode::Compliance,
+				},
+				retain_days: archive.retain_days,
+			}),
 			syslog: self.audit.syslog.map(|syslog| SyslogAuditConfig {
 				socket_path: absolutize_from_config_dir(source_path, &syslog.socket_path),
 			}),
 			kafka: self.audit.kafka.map(|kafka| KafkaAuditConfig {
 				brokers: kafka.brokers,
 				topic: kafka.topic,
+				payload_mode: match kafka.payload_mode {
+					RawKafkaAuditPayloadMode::Distribution => KafkaAuditPayloadMode::Distribution,
+					RawKafkaAuditPayloadMode::Canonical => KafkaAuditPayloadMode::Canonical,
+				},
 				client_id: kafka.client_id,
 			}),
 		};
@@ -648,4 +698,8 @@ const fn default_drift_max_offset_ms() -> u64 {
 
 const fn default_mvcc_retention_window_secs() -> u64 {
 	DEFAULT_MVCC_RETENTION_WINDOW.as_secs()
+}
+
+const fn default_audit_archive_max_segment_bytes() -> u64 {
+	DEFAULT_AUDIT_ARCHIVE_MAX_SEGMENT_BYTES
 }

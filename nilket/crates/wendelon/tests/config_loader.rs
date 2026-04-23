@@ -749,7 +749,63 @@ socket_path = "run/syslog.sock"
 		cfg.audit.syslog.as_ref().unwrap().socket_path,
 		syslog_socket
 	);
+	assert!(cfg.audit.archive.is_none());
 	assert!(cfg.audit.kafka.is_none());
+}
+
+#[test]
+fn loads_archive_audit_sink_config() {
+	let root = fresh_dir("audit-archive");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	std::fs::create_dir_all(root.join("remote-archive")).unwrap();
+
+	let node_id = 37u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4709"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[audit.archive]
+directory = "remote-archive"
+max_segment_bytes = 1048576
+lock_mode = "governance"
+retain_days = 2555
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let archive = cfg.audit.archive.expect("archive config should be loaded");
+	assert_eq!(archive.directory, root.join("remote-archive"));
+	assert_eq!(archive.max_segment_bytes, 1_048_576);
+	assert_eq!(
+		archive.lock_mode,
+		wendelon::audit::AuditArchiveLockMode::Governance
+	);
+	assert_eq!(archive.retain_days, Some(2555));
 }
 
 #[cfg(not(feature = "otlp-http"))]
@@ -1211,6 +1267,63 @@ topic = "wendelon.audit"
 	assert_eq!(kafka.brokers, "kafka-1.internal:9092");
 	assert_eq!(kafka.topic, "wendelon.audit");
 	assert_eq!(kafka.client_id, None);
+	assert_eq!(
+		kafka.payload_mode,
+		wendelon::audit::KafkaAuditPayloadMode::Distribution
+	);
+}
+
+#[cfg(feature = "audit-kafka")]
+#[test]
+fn loads_kafka_canonical_audit_sink_with_feature() {
+	let root = fresh_dir("audit-kafka-canonical-enabled");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 38u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4710"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[audit.kafka]
+brokers = "kafka-1.internal:9092"
+topic = "wendelon.audit"
+payload_mode = "canonical"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	let kafka = cfg.audit.kafka.expect("kafka config should be loaded");
+	assert_eq!(kafka.brokers, "kafka-1.internal:9092");
+	assert_eq!(kafka.topic, "wendelon.audit");
+	assert_eq!(
+		kafka.payload_mode,
+		wendelon::audit::KafkaAuditPayloadMode::Canonical
+	);
 }
 
 #[tokio::test]

@@ -594,6 +594,27 @@ impl WriteStatus {
 	/// control before the data path began durable work. Retrying
 	/// after a short backoff is allowed.
 	pub const BACKPRESSURED: Self = Self(14);
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::OK => "ok",
+			Self::EPOCH_STALE => "epoch_stale",
+			Self::NOT_LEADER => "not_leader",
+			Self::DUPLICATE => "duplicate",
+			Self::PROXY_LIMIT => "proxy_limit",
+			Self::PAYLOAD_TOO_LARGE => "payload_too_large",
+			Self::LEASE_EXPIRED => "lease_expired",
+			Self::INVALID_LEASE_SIGNATURE => "invalid_lease_signature",
+			Self::INTERNAL_ERROR => "internal_error",
+			Self::QUOTA_EXCEEDED => "quota_exceeded",
+			Self::TENANT_SUSPENDED => "tenant_suspended",
+			Self::TENANT_UNAVAILABLE => "tenant_unavailable",
+			Self::AUTHORIZATION_FAILED => "authorization_failed",
+			Self::FINALIZATION_PENDING => "finalization_pending",
+			Self::BACKPRESSURED => "backpressured",
+			_ => "unknown",
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -826,6 +847,26 @@ impl ReadStatus {
 	/// control before the read or query work began. Retrying after
 	/// a short backoff is allowed.
 	pub const BACKPRESSURED: Self = Self(13);
+
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::OK => "ok",
+			Self::KEY_NOT_FOUND => "key_not_found",
+			Self::EPOCH_STALE => "epoch_stale",
+			Self::NOT_LEADER => "not_leader",
+			Self::LEASE_EXPIRED => "lease_expired",
+			Self::INVALID_LEASE_SIGNATURE => "invalid_lease_signature",
+			Self::E_SAFE_BEHIND => "e_safe_behind",
+			Self::MIGRATION_INCOMPLETE => "migration_incomplete",
+			Self::TENANT_UNAVAILABLE => "tenant_unavailable",
+			Self::AUTHORIZATION_FAILED => "authorization_failed",
+			Self::QUERY_INVALID_PROGRAM => "query_invalid_program",
+			Self::QUERY_BUDGET_EXCEEDED => "query_budget_exceeded",
+			Self::RETENTION_EXPIRED => "retention_expired",
+			Self::BACKPRESSURED => "backpressured",
+			_ => "unknown",
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

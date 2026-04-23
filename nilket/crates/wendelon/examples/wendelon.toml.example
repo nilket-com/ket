@@ -103,10 +103,17 @@ slab_dek_cache_max_entries = 10000
 # configured; sink shapes and archive guidance are documented in
 # `plans/ops/audit.md`.
 #
+# [audit.archive]
+# directory = "/mnt/worm/wendelon-audit/node-01"
+# max_segment_bytes = 8388608
+# lock_mode = "governance"   # "none", "governance", or "compliance"
+# retain_days = 2555
+#
 # [audit.syslog]
 # socket_path = "/run/systemd/journal/syslog"
 #
 # [audit.kafka]
 # brokers = "kafka-1.internal:9092,kafka-2.internal:9092"
 # topic = "wendelon.audit"
+# payload_mode = "distribution"   # or "canonical" for persisted chain records
 # client_id = "wendelon-node-01"

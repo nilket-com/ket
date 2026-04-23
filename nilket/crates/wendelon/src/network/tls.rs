@@ -277,6 +277,23 @@ pub enum ActorPermission {
 	ObservabilityMetrics,
 }
 
+impl ActorPermission {
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::InterNodeTransport => "inter_node_transport",
+			Self::OpsControl => "ops_control",
+			Self::ControlStatus => "control_status",
+			Self::ClusterControl => "cluster_control",
+			Self::TenantAdminRead => "tenant_admin_read",
+			Self::TenantAdminMutation => "tenant_admin_mutation",
+			Self::TenantKekAdmin => "tenant_kek_admin",
+			Self::AuditRead => "audit_read",
+			Self::ObservabilityReady => "observability_ready",
+			Self::ObservabilityMetrics => "observability_metrics",
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BreakGlassScope {
 	Diagnostic,

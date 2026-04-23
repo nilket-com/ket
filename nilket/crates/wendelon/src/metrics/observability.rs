@@ -1,4 +1,7 @@
-use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink};
+use crate::audit::{
+	AuditAuthority, AuditEvent, AuditOperation, AuditSchema, AuditSink, LocalSecuritySchema,
+	LocalSecurityStage, LocalSecuritySurface,
+};
 use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::metrics::global;
 use crate::network::tls::{
@@ -250,6 +253,9 @@ async fn handle_ready_connection(
 		trust_roots,
 		ActorPermission::ObservabilityReady,
 		revocations,
+		audit_sink,
+		local_node_id,
+		READY_PATH,
 	)
 	.await?;
 	let req = read_request(&mut stream).await?;
@@ -300,6 +306,9 @@ async fn handle_metrics_connection(
 		trust_roots,
 		ActorPermission::ObservabilityMetrics,
 		revocations,
+		audit_sink,
+		local_node_id,
+		METRICS_PATH,
 	)
 	.await?;
 	let req = read_request(&mut stream).await?;
@@ -343,15 +352,35 @@ async fn accept_tls(
 	trust_roots: &ActorTrustRoots,
 	permission: ActorPermission,
 	revocations: Option<&watch::Receiver<Arc<RevocationSnapshot>>>,
+	audit_sink: &dyn AuditSink,
+	local_node_id: u32,
+	path: &'static str,
 ) -> std::io::Result<(
 	tokio_rustls::server::TlsStream<TcpStream>,
 	crate::network::tls::ActorIdentity,
 )> {
-	let stream = acceptor
-		.accept(stream)
-		.await
-		.map_err(|e| Error::new(ErrorKind::PermissionDenied, e))?;
+	let stream = acceptor.accept(stream).await.map_err(|e| {
+		emit_local_security_failure_audit(
+			audit_sink,
+			local_node_id,
+			path,
+			permission,
+			LocalSecurityStage::TlsHandshake,
+			e.to_string(),
+			None,
+		);
+		Error::new(ErrorKind::PermissionDenied, e)
+	})?;
 	let certs = stream.get_ref().1.peer_certificates().ok_or_else(|| {
+		emit_local_security_failure_audit(
+			audit_sink,
+			local_node_id,
+			path,
+			permission,
+			LocalSecurityStage::PeerIdentity,
+			"peer presented no TLS identity".to_string(),
+			None,
+		);
 		Error::new(
 			ErrorKind::PermissionDenied,
 			"peer presented no TLS identity",
@@ -362,8 +391,31 @@ async fn accept_tls(
 		cluster_domain,
 		Some(trust_roots),
 		revocations.map(|rx| rx.borrow().clone()).as_deref(),
-	)?;
-	authorize_actor(&actor, permission)?;
+	)
+	.map_err(|err| {
+		emit_local_security_failure_audit(
+			audit_sink,
+			local_node_id,
+			path,
+			permission,
+			LocalSecurityStage::PeerIdentity,
+			err.to_string(),
+			None,
+		);
+		err
+	})?;
+	authorize_actor(&actor, permission).map_err(|err| {
+		emit_local_security_failure_audit(
+			audit_sink,
+			local_node_id,
+			path,
+			permission,
+			LocalSecurityStage::Authorization,
+			err.to_string(),
+			Some(&actor),
+		);
+		err
+	})?;
 	Ok((stream, actor))
 }
 
@@ -386,6 +438,51 @@ fn emit_observability_audit(
 		)
 		.with_actor(actor),
 	)
+}
+
+fn emit_local_security_failure_audit(
+	sink: &dyn AuditSink,
+	node_id: u32,
+	path: &'static str,
+	permission: ActorPermission,
+	stage: LocalSecurityStage,
+	failure_reason: String,
+	actor: Option<&crate::network::tls::ActorIdentity>,
+) {
+	let operation = match stage {
+		LocalSecurityStage::Authorization => AuditOperation::IdentityAuthorizationDenied,
+		LocalSecurityStage::TlsHandshake | LocalSecurityStage::PeerIdentity => {
+			AuditOperation::IdentityHandshakeDenied
+		}
+	};
+	let mut event = AuditEvent::new(
+		AuditAuthority::NodeLocal,
+		operation,
+		NodeId {
+			id: node_id,
+			_reserved: 0,
+		},
+		format!(
+			"denied observability access for {} at {}: {}",
+			permission.as_str(),
+			path,
+			failure_reason
+		),
+	)
+	.with_outcome(crate::audit::AuditOutcome::Denied)
+	.with_schema(AuditSchema::LocalSecurity(LocalSecuritySchema {
+		surface: LocalSecuritySurface::Observability,
+		stage,
+		path: Some(path.to_string()),
+		required_permission: Some(permission.as_str().to_string()),
+		failure_reason: Some(failure_reason),
+	}));
+	if let Some(actor) = actor {
+		event = event
+			.with_actor(actor)
+			.with_outcome(crate::audit::AuditOutcome::Denied);
+	}
+	let _ = sink.emit(event);
 }
 
 async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<String> {

@@ -7,6 +7,7 @@
 //!
 //! ```text
 //!   wendelon <path/to/wendelon.toml>
+//!   wendelon audit verify <path/to/audit.ndjson>
 //!   wendelon --print-example-config
 //!   wendelon --write-example-config <path/to/wendelon.toml>
 //! ```
@@ -17,6 +18,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
+use wendelon::audit::verify_local_audit_evidence;
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
 use wendelon::metrics::observability::{self, ObservabilityHandles};
 use wendelon::metrics::telemetry;
@@ -30,6 +32,29 @@ async fn main() -> ExitCode {
 		[_bin, flag] if flag == "--print-example-config" => {
 			print!("{}", render_example_config());
 			return ExitCode::SUCCESS;
+		}
+		[_bin, cmd, subcmd, audit_path] if cmd == "audit" && subcmd == "verify" => {
+			return match verify_local_audit_evidence(audit_path) {
+				Ok(report) => match serde_json::to_string_pretty(&report) {
+					Ok(json) => {
+						print!("{json}");
+						print!("\n");
+						if report.ok() {
+							ExitCode::SUCCESS
+						} else {
+							ExitCode::from(1)
+						}
+					}
+					Err(err) => {
+						eprintln!("failed to serialize audit verification report: {err}");
+						ExitCode::from(2)
+					}
+				},
+				Err(err) => {
+					eprintln!("audit verify failed for {audit_path}: {err}");
+					ExitCode::from(2)
+				}
+			};
 		}
 		[_bin, flag, path] if flag == "--write-example-config" => {
 			match write_example_config(path) {
@@ -46,8 +71,8 @@ async fn main() -> ExitCode {
 		[_bin, _config_path] => {}
 		_ => {
 			eprintln!(
-				"usage:\n  {} <path/to/wendelon.toml>\n  {} --print-example-config\n  {} --write-example-config <path/to/wendelon.toml>",
-				args[0], args[0], args[0]
+				"usage:\n  {} <path/to/wendelon.toml>\n  {} audit verify <path/to/audit.ndjson>\n  {} --print-example-config\n  {} --write-example-config <path/to/wendelon.toml>",
+				args[0], args[0], args[0], args[0]
 			);
 			return ExitCode::from(2);
 		}

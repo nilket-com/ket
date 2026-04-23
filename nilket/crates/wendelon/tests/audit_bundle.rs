@@ -7,7 +7,10 @@ fn audit_ops_doc_describes_sink_schema_asymmetry() {
 	assert!(audit.contains("AuditEvent"));
 	assert!(audit.contains("RFC 5424"));
 	assert!(audit.contains("Local NDJSON"));
+	assert!(audit.contains("Archive mirror"));
 	assert!(audit.contains("Kafka"));
+	assert!(audit.contains("payload_mode"));
+	assert!(audit.contains("authority_model"));
 	assert!(audit.contains("Syslog"));
 	assert!(audit.contains("audit.ndjson"));
 }

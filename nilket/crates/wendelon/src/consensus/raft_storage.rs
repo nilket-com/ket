@@ -47,8 +47,9 @@
 //! a Self-typed reader that shares the same cache as the writer.
 
 use crate::audit::{
-	AuditAuthority, AuditEvent, AuditMaterializationTracker, AuditOperation, AuditOutcome,
-	AuditSink,
+	AdministrativeControlAction, AdministrativeControlSchema, AuditAuthority, AuditEvent,
+	AuditMaterializationTracker, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
+	DataAccessKind, DataAccessPhase, DataAccessSchema,
 };
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
@@ -267,6 +268,10 @@ struct RaftAuditMaterializer {
 
 impl RaftAuditMaterializer {
 	fn emit(&self, event: AuditEvent) -> bool {
+		// Raft-authoritative audit evidence lives in the committed log.
+		// Emission to the local NDJSON chain is a required materialization
+		// step for serious deployments, but a materialization failure does
+		// not erase the already-committed authoritative record.
 		if let Err(err) = self.sink.emit(event.clone()) {
 			self.tracker.note_materialization_failed();
 			tracing::warn!(
@@ -2721,6 +2726,18 @@ fn raft_audit_event(
 				"payload_hash",
 				format_bytes_hex(&finalization.marker.payload_hash),
 			)
+			.with_schema(AuditSchema::DataAccess {
+				access_kind: DataAccessKind::Write,
+				phase: DataAccessPhase::Finalized,
+				detail: DataAccessSchema {
+					locality: Some(Locality::from(finalization.key_identity).get()),
+					locality_end: None,
+					durability: Some(finalization.marker.durability.0 as u64),
+					charged_bytes: Some(finalization.charged_bytes),
+					returned_bytes: None,
+					result_count: Some(1),
+				},
+			})
 			.with_tenant(finalization.tenant_id)
 			.with_record_identity(finalization.key_identity),
 		),
@@ -2746,7 +2763,15 @@ fn raft_audit_event(
 			.with_parameter("from_epoch", record.from.epoch)
 			.with_parameter("to_epoch", record.to.epoch)
 			.with_parameter("from_peers", format_epoch_peer_ids(&record.from))
-			.with_parameter("to_peers", format_epoch_peer_ids(&record.to)),
+			.with_parameter("to_peers", format_epoch_peer_ids(&record.to))
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::AdvanceEpoch,
+				detail: AdministrativeControlSchema {
+					from_epoch: Some(record.from.epoch),
+					to_epoch: Some(record.to.epoch),
+					..AdministrativeControlSchema::default()
+				},
+			}),
 		),
 		WendelonRequest::InstallTenantKekVersion(rotation) => Some(
 			AuditEvent::new(
@@ -2765,7 +2790,15 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", rotation.tenant_id.get())
-			.with_parameter("tenant_kek_id", rotation.tenant_kek_id.get()),
+			.with_parameter("tenant_kek_id", rotation.tenant_kek_id.get())
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantKekRotate,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(rotation.tenant_id.get()),
+					target_tenant_kek_id: Some(rotation.tenant_kek_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			}),
 		),
 		WendelonRequest::RetireTenantKekVersion(retirement) => Some(
 			AuditEvent::new(
@@ -2784,7 +2817,15 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", retirement.tenant_id.get())
-			.with_parameter("tenant_kek_id", retirement.tenant_kek_id.get()),
+			.with_parameter("tenant_kek_id", retirement.tenant_kek_id.get())
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantKekRetire,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(retirement.tenant_id.get()),
+					target_tenant_kek_id: Some(retirement.tenant_kek_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			}),
 		),
 		WendelonRequest::RevokeActorKey(revocation) => Some(
 			AuditEvent::new(
@@ -2803,7 +2844,15 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("trust_domain", revocation.trust_domain.to_string())
-			.with_parameter("key_id", format_bytes_hex(&revocation.key_id)),
+			.with_parameter("key_id", format_bytes_hex(&revocation.key_id))
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::ActorKeyRevoke,
+				detail: AdministrativeControlSchema {
+					target_trust_domain: Some(revocation.trust_domain.to_string()),
+					target_key_id: Some(format_bytes_hex(&revocation.key_id)),
+					..AdministrativeControlSchema::default()
+				},
+			}),
 		),
 		// Tenant admin ops are attempt-audited per ADR 021 §5: every
 		// mutation — including rejected ones — emits a record so the
@@ -2842,6 +2891,17 @@ fn raft_audit_event(
 					.map(|id| id.get())
 					.unwrap_or(0),
 			)
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantCreate,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(create.tenant_id.get()),
+					target_tenant_kek_id: create
+						.tenant_keyset
+						.active_tenant_kek_id
+						.map(|id| id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
 		WendelonRequest::UpdateTenantQuota(update) => Some(
@@ -2863,6 +2923,13 @@ fn raft_audit_event(
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", update.tenant_id.get())
 			.with_parameter("quota_bytes", update.quota_bytes)
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantQuotaUpdate,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(update.tenant_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
 		WendelonRequest::SuspendTenant(tenant_id) => Some(
@@ -2882,6 +2949,13 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", tenant_id.get())
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantSuspend,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(tenant_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
 		WendelonRequest::ResumeTenant(tenant_id) => Some(
@@ -2901,6 +2975,13 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", tenant_id.get())
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantResume,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(tenant_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
 		WendelonRequest::DeleteTenant(tenant_id) => Some(
@@ -2920,6 +3001,13 @@ fn raft_audit_event(
 			.with_raft_log_index(entry.log_id.index)
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", tenant_id.get())
+			.with_schema(AuditSchema::AdministrativeControl {
+				action: AdministrativeControlAction::TenantDeleteRequest,
+				detail: AdministrativeControlSchema {
+					target_tenant_id: Some(tenant_id.get()),
+					..AdministrativeControlSchema::default()
+				},
+			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
 		_ => None,

@@ -597,10 +597,15 @@ pub struct MetricsRegistry {
 	pub audit_emit_node_local_total: Counter,
 	pub audit_emit_raft_log_total: Counter,
 	pub audit_sink_failures_local_total: Counter,
+	pub audit_sink_failures_archive_total: Counter,
+	pub audit_sink_failures_archive_queue_dropped_total: Counter,
 	pub audit_sink_failures_syslog_total: Counter,
 	pub audit_sink_failures_syslog_queue_dropped_total: Counter,
 	pub audit_sink_failures_kafka_total: Counter,
 	pub audit_sink_failures_kafka_queue_dropped_total: Counter,
+	pub audit_archive_pending_records: Gauge,
+	pub audit_archived_segments_total: Counter,
+	pub audit_archived_bytes_total: Counter,
 	pub otlp_spans_dropped_total: Counter,
 	pub fips_module_self_test_ok_total: Counter,
 
@@ -693,10 +698,15 @@ impl Default for MetricsRegistry {
 			audit_emit_node_local_total: Counter::default(),
 			audit_emit_raft_log_total: Counter::default(),
 			audit_sink_failures_local_total: Counter::default(),
+			audit_sink_failures_archive_total: Counter::default(),
+			audit_sink_failures_archive_queue_dropped_total: Counter::default(),
 			audit_sink_failures_syslog_total: Counter::default(),
 			audit_sink_failures_syslog_queue_dropped_total: Counter::default(),
 			audit_sink_failures_kafka_total: Counter::default(),
 			audit_sink_failures_kafka_queue_dropped_total: Counter::default(),
+			audit_archive_pending_records: Gauge::default(),
+			audit_archived_segments_total: Counter::default(),
+			audit_archived_bytes_total: Counter::default(),
 			otlp_spans_dropped_total: Counter::default(),
 			fips_module_self_test_ok_total: Counter::default(),
 
@@ -1214,6 +1224,18 @@ impl MetricsRegistry {
 		render_counter_with_labels(
 			&mut out,
 			"wendelon_audit_sink_failure_total",
+			&[("sink", "archive"), ("reason", "emit_error")],
+			self.audit_sink_failures_archive_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
+			&[("sink", "archive"), ("reason", "queue_drop")],
+			self.audit_sink_failures_archive_queue_dropped_total.get(),
+		);
+		render_counter_with_labels(
+			&mut out,
+			"wendelon_audit_sink_failure_total",
 			&[("sink", "syslog"), ("reason", "emit_error")],
 			self.audit_sink_failures_syslog_total.get(),
 		);
@@ -1234,6 +1256,24 @@ impl MetricsRegistry {
 			"wendelon_audit_sink_failure_total",
 			&[("sink", "kafka"), ("reason", "queue_drop")],
 			self.audit_sink_failures_kafka_queue_dropped_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_audit_archive_pending_records",
+			"Audit records queued locally for archive mirroring after archive sink failures.",
+			self.audit_archive_pending_records.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_audit_archived_segments_total",
+			"Immutable audit archive segments finalized by the local archive mirror.",
+			self.audit_archived_segments_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_audit_archived_bytes_total",
+			"Bytes finalized into immutable audit archive segments.",
+			self.audit_archived_bytes_total.get(),
 		);
 		render_counter(
 			&mut out,

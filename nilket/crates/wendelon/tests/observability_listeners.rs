@@ -278,6 +278,9 @@ async fn observability_rejects_wrong_ca_domains_and_marks_break_glass_audit() {
 	assert!(audit.contains("\"actor_role\":\"break_glass_admin\""));
 	assert!(audit.contains("\"actor_trust_domain\":\"ops\""));
 	assert!(audit.contains("\"break_glass\":true"));
+	assert!(audit.contains("\"event_type\":\"identity.handshake_denied\""));
+	assert!(audit.contains("\"type\":\"local_security\""));
+	assert!(audit.contains("\"path\":\"/metrics\""));
 
 	shutdown(handles).await;
 }

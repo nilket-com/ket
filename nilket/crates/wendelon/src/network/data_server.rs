@@ -37,7 +37,10 @@
 //! pending, the cache points at the persisted recovery record
 //! instead of re-running the write from scratch.
 
-use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAuditSink};
+use crate::audit::{
+	AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, AuditSchema, AuditSink,
+	DataAccessKind, DataAccessPhase, DataAccessSchema, NoopAuditSink,
+};
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::WendelonLogStore;
 use crate::consensus::{
@@ -86,6 +89,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
@@ -861,6 +865,288 @@ impl WendelonDataServer {
 	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
 		metrics().observe_write_outcome(response.status);
 		(response, trailing)
+	}
+
+	fn emit_data_access_audit(
+		&self,
+		actor: &ActorIdentity,
+		tenant_id: TenantId,
+		record_identity: Option<Identity>,
+		operation: AuditOperation,
+		access_kind: DataAccessKind,
+		phase: DataAccessPhase,
+		detail: DataAccessSchema,
+		outcome: Option<AuditOutcome>,
+		message: impl Into<String>,
+		parameters: Vec<(&'static str, serde_json::Value)>,
+	) -> std::io::Result<()> {
+		let mut event = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			operation,
+			self.local_node,
+			message,
+		)
+		.with_actor(actor)
+		.with_tenant(tenant_id)
+		.with_schema(AuditSchema::DataAccess {
+			access_kind,
+			phase,
+			detail,
+		})
+		.with_parameters(parameters);
+		if let Some(record_identity) = record_identity {
+			event = event.with_record_identity(record_identity);
+		}
+		if let Some(outcome) = outcome {
+			event = event.with_outcome(outcome);
+		}
+		self.audit_sink
+			.emit(event)
+			.map_err(|err| Error::other(format!("data access audit emit failed: {err}")))
+	}
+
+	fn emit_write_requested_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &WriteRequestMeta,
+		charged_bytes: u64,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			Some(meta.key_identity),
+			AuditOperation::DataWrite,
+			DataAccessKind::Write,
+			DataAccessPhase::Requested,
+			DataAccessSchema {
+				locality: Some(Locality::from(meta.key_identity).get()),
+				locality_end: None,
+				durability: Some(meta.durability.0 as u64),
+				charged_bytes: Some(charged_bytes),
+				returned_bytes: None,
+				result_count: None,
+			},
+			None,
+			"requested data write",
+			vec![
+				("expected_epoch", json!(meta.expected_epoch)),
+				("write_sequence", json!(meta.write_id.sequence_no)),
+				("await_finalization", json!(meta.await_finalization != 0)),
+			],
+		)
+	}
+
+	fn emit_write_completion_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &WriteRequestMeta,
+		response: &WriteResponseMeta,
+		charged_bytes: u64,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			Some(meta.key_identity),
+			AuditOperation::DataWrite,
+			DataAccessKind::Write,
+			DataAccessPhase::Completed,
+			DataAccessSchema {
+				locality: Some(Locality::from(meta.key_identity).get()),
+				locality_end: None,
+				durability: Some(meta.durability.0 as u64),
+				charged_bytes: Some(charged_bytes),
+				returned_bytes: None,
+				result_count: Some(1),
+			},
+			completed_write_audit_outcome(response.status),
+			"completed data write request",
+			vec![
+				("status", json!(response.status.as_str())),
+				("log_index", json!(response.log_index)),
+				("term", json!(response.term)),
+				("has_finalization", json!(response.has_finalization != 0)),
+				(
+					"commit_hlc_physical_ms",
+					json!(response.commit_hlc.physical_ms),
+				),
+				("commit_hlc_logical", json!(response.commit_hlc.logical)),
+				("commit_hlc_node_id", json!(response.commit_hlc.node_id)),
+			],
+		)
+	}
+
+	fn emit_write_denied_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &WriteRequestMeta,
+		status: WriteStatus,
+		reason: impl Into<String>,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			Some(meta.key_identity),
+			AuditOperation::DataWrite,
+			DataAccessKind::Write,
+			DataAccessPhase::Denied,
+			DataAccessSchema {
+				locality: Some(Locality::from(meta.key_identity).get()),
+				locality_end: None,
+				durability: Some(meta.durability.0 as u64),
+				charged_bytes: None,
+				returned_bytes: None,
+				result_count: None,
+			},
+			Some(AuditOutcome::Denied),
+			"denied data write request before execution",
+			vec![
+				("status", json!(status.as_str())),
+				("reason", json!(reason.into())),
+			],
+		)
+	}
+
+	fn emit_read_completion_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &ReadRequestMeta,
+		response: &ReadResponseMeta,
+	) -> std::io::Result<()> {
+		let result_count = if response.status == ReadStatus::OK {
+			1
+		} else {
+			0
+		};
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			Some(meta.key_identity),
+			AuditOperation::DataRead,
+			DataAccessKind::Read,
+			DataAccessPhase::Completed,
+			DataAccessSchema {
+				locality: Some(Locality::from(meta.key_identity).get()),
+				locality_end: None,
+				durability: None,
+				charged_bytes: None,
+				returned_bytes: Some(response.value_len as u64),
+				result_count: Some(result_count),
+			},
+			completed_read_audit_outcome(response.status),
+			"completed data read request",
+			vec![
+				("status", json!(response.status.as_str())),
+				("consistency", json!(meta.consistency.0)),
+				("expected_epoch", json!(meta.expected_epoch)),
+				(
+					"value_hlc_physical_ms",
+					json!(response.value_hlc.physical_ms),
+				),
+				("value_hlc_logical", json!(response.value_hlc.logical)),
+				("value_hlc_node_id", json!(response.value_hlc.node_id)),
+			],
+		)
+	}
+
+	fn emit_read_denied_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &ReadRequestMeta,
+		status: ReadStatus,
+		reason: impl Into<String>,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			Some(meta.key_identity),
+			AuditOperation::DataRead,
+			DataAccessKind::Read,
+			DataAccessPhase::Denied,
+			DataAccessSchema {
+				locality: Some(Locality::from(meta.key_identity).get()),
+				locality_end: None,
+				durability: None,
+				charged_bytes: None,
+				returned_bytes: None,
+				result_count: None,
+			},
+			Some(AuditOutcome::Denied),
+			"denied data read request before execution",
+			vec![
+				("status", json!(status.as_str())),
+				("reason", json!(reason.into())),
+			],
+		)
+	}
+
+	fn emit_query_completion_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &QueryRequestMeta,
+		response: &QueryResponseMeta,
+		returned_bytes: u64,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			None,
+			AuditOperation::DataRangeQuery,
+			DataAccessKind::RangeQuery,
+			DataAccessPhase::Completed,
+			DataAccessSchema {
+				locality: Some(meta.locality_range_start),
+				locality_end: Some(meta.locality_range_end),
+				durability: None,
+				charged_bytes: None,
+				returned_bytes: Some(returned_bytes),
+				result_count: Some(response.rows),
+			},
+			completed_read_audit_outcome(response.status),
+			"completed data range query request",
+			vec![
+				("status", json!(response.status.as_str())),
+				("consistency", json!(meta.consistency.0)),
+				("expected_epoch", json!(meta.expected_epoch)),
+				("bytecode_len", json!(meta.bytecode_len)),
+				(
+					"value_hlc_physical_ms",
+					json!(response.value_hlc.physical_ms),
+				),
+				("value_hlc_logical", json!(response.value_hlc.logical)),
+				("value_hlc_node_id", json!(response.value_hlc.node_id)),
+			],
+		)
+	}
+
+	fn emit_query_denied_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &QueryRequestMeta,
+		status: ReadStatus,
+		reason: impl Into<String>,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			None,
+			AuditOperation::DataRangeQuery,
+			DataAccessKind::RangeQuery,
+			DataAccessPhase::Denied,
+			DataAccessSchema {
+				locality: Some(meta.locality_range_start),
+				locality_end: Some(meta.locality_range_end),
+				durability: None,
+				charged_bytes: None,
+				returned_bytes: None,
+				result_count: None,
+			},
+			Some(AuditOutcome::Denied),
+			"denied data range query request before execution",
+			vec![
+				("status", json!(status.as_str())),
+				("reason", json!(reason.into())),
+			],
+		)
 	}
 
 	fn apply_local_persistence_runtime_fence(&self) {
@@ -2482,7 +2768,11 @@ impl WendelonDataServer {
 	/// one-frame concatenation. This helper keeps direct frame-based
 	/// tests and any remaining unary callers working by packaging the
 	/// entire response into one terminal frame.
-	async fn handle_query(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_query(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
 		let span = tracing::info_span!(
@@ -2496,6 +2786,15 @@ impl WendelonDataServer {
 			.execute_query_with_migration_merge(&meta, &bytecode)
 			.instrument(span)
 			.await?;
+		self.emit_query_completion_audit(
+			actor,
+			&meta,
+			&resp_meta,
+			arrow_bytes
+				.as_ref()
+				.map(|bytes| bytes.len() as u64)
+				.unwrap_or(0),
+		)?;
 		Ok(self.build_query_response_frame(
 			frame.header.stream_id,
 			resp_meta,
@@ -3030,6 +3329,7 @@ impl WendelonDataServer {
 
 	async fn handle_query_stream(
 		&self,
+		actor: &ActorIdentity,
 		frame: HrftFrame,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
@@ -3048,6 +3348,7 @@ impl WendelonDataServer {
 			.await?;
 
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
+			self.emit_query_completion_audit(actor, &meta, &plan.response, 0)?;
 			let response = self.build_query_response_frame(
 				frame.header.stream_id,
 				plan.response,
@@ -3066,9 +3367,12 @@ impl WendelonDataServer {
 		} = plan;
 		let Some(encoded_batches) = encode_query_stream_batches_with_deadline(batches, deadline)?
 		else {
+			let budget_resp =
+				query_error_meta(&meta, ReadStatus::QUERY_BUDGET_EXCEEDED, self.local_node);
+			self.emit_query_completion_audit(actor, &meta, &budget_resp, 0)?;
 			let response = self.build_query_response_frame(
 				frame.header.stream_id,
-				query_error_meta(&meta, ReadStatus::QUERY_BUDGET_EXCEEDED, self.local_node),
+				budget_resp,
 				None,
 				FRAME_FLAG_STREAM_END,
 			);
@@ -3076,6 +3380,8 @@ impl WendelonDataServer {
 			stream.finish().await?;
 			return Ok(());
 		};
+		let total_bytes = encoded_batches.iter().map(|arrow| arrow.len() as u64).sum();
+		self.emit_query_completion_audit(actor, &meta, &response, total_bytes)?;
 		let batch_count = encoded_batches.len();
 		for (index, arrow) in encoded_batches.into_iter().enumerate() {
 			let is_last = index + 1 == batch_count;
@@ -3118,6 +3424,7 @@ impl WendelonDataServer {
 
 	async fn handle_bulk_stream(
 		&self,
+		actor: &ActorIdentity,
 		first_frame: HrftFrame,
 		mut stream: Box<dyn TransportStream>,
 	) -> std::io::Result<()> {
@@ -3153,6 +3460,7 @@ impl WendelonDataServer {
 				durability = meta.durability.0,
 				write_sequence = meta.write_id.sequence_no,
 			);
+			self.emit_write_requested_audit(actor, &meta, frame.header.arrow_len as u64)?;
 			let (resp, trailing) = match self.write(meta, payload).instrument(span).await {
 				Ok(ok) => ok,
 				Err(_) => self.counted_write_result(
@@ -3160,6 +3468,7 @@ impl WendelonDataServer {
 					None,
 				),
 			};
+			self.emit_write_completion_audit(actor, &meta, &resp, frame.header.arrow_len as u64)?;
 			let response = self.build_write_response_frame(
 				MsgType::BULK_WRITE_RESP,
 				frame.header.stream_id,
@@ -3180,7 +3489,11 @@ impl WendelonDataServer {
 		Ok(())
 	}
 
-	async fn handle_write(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_write(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		let (meta, payload) = self.decode_write_request_frame(&frame, "WRITE_REQ")?;
 		let span = tracing::info_span!(
 			"data_ring.write.request",
@@ -3191,6 +3504,7 @@ impl WendelonDataServer {
 			durability = meta.durability.0,
 			write_sequence = meta.write_id.sequence_no,
 		);
+		self.emit_write_requested_audit(actor, &meta, frame.header.arrow_len as u64)?;
 		let (resp, trailing) = match self.write(meta, payload).instrument(span).await {
 			Ok(ok) => ok,
 			Err(_) => self.counted_write_result(
@@ -3198,6 +3512,7 @@ impl WendelonDataServer {
 				None,
 			),
 		};
+		self.emit_write_completion_audit(actor, &meta, &resp, frame.header.arrow_len as u64)?;
 		Ok(self.build_write_response_frame(
 			MsgType::WRITE_RESP,
 			frame.header.stream_id,
@@ -3206,7 +3521,11 @@ impl WendelonDataServer {
 		))
 	}
 
-	async fn handle_read(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+	async fn handle_read(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
 		if frame.meta.len() < std::mem::size_of::<ReadRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -3230,6 +3549,7 @@ impl WendelonDataServer {
 			consistency = meta.consistency.0,
 		);
 		let (resp, value_batch) = self.read(meta, key).instrument(span).await?;
+		self.emit_read_completion_audit(actor, &meta, &resp)?;
 		let arrow_payload = value_batch.map(|batch| {
 			let bytes = encode_batch(&batch)?;
 			let mut buf = self.pool.acquire();
@@ -4187,14 +4507,17 @@ impl DataRingServer for WendelonDataServer {
 				}
 				let meta: WriteRequestMeta =
 					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
-				if self
-					.authorize_actor_for_data(
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				) {
+					self.emit_write_denied_audit(
 						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Write,
-					)
-					.is_err()
-				{
+						&meta,
+						WriteStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
 					return Ok(Some(self.unauthorized_write_frame(
 						MsgType::WRITE_RESP,
 						frame.header.stream_id,
@@ -4207,7 +4530,16 @@ impl DataRingServer for WendelonDataServer {
 					DataOperation::Write,
 				)? {
 					Ok(admission) => admission,
-					Err(_) => {
+					Err(scope) => {
+						self.emit_write_denied_audit(
+							&context.actor,
+							&meta,
+							WriteStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
 						return Ok(Some(self.backpressured_write_frame(
 							MsgType::WRITE_RESP,
 							frame.header.stream_id,
@@ -4215,7 +4547,7 @@ impl DataRingServer for WendelonDataServer {
 						)));
 					}
 				};
-				self.handle_write(frame).await.map(Some)
+				self.handle_write(&context.actor, frame).await.map(Some)
 			}
 			MsgType::READ_REQ => {
 				if frame.meta.len() < std::mem::size_of::<ReadRequestMeta>() {
@@ -4226,14 +4558,17 @@ impl DataRingServer for WendelonDataServer {
 				}
 				let meta: ReadRequestMeta =
 					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<ReadRequestMeta>()]);
-				if self
-					.authorize_actor_for_data(
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Read,
+				) {
+					self.emit_read_denied_audit(
 						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Read,
-					)
-					.is_err()
-				{
+						&meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
 					return Ok(Some(
 						self.unauthorized_read_frame(frame.header.stream_id, &meta),
 					));
@@ -4244,13 +4579,22 @@ impl DataRingServer for WendelonDataServer {
 					DataOperation::Read,
 				)? {
 					Ok(admission) => admission,
-					Err(_) => {
+					Err(scope) => {
+						self.emit_read_denied_audit(
+							&context.actor,
+							&meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
 						return Ok(Some(
 							self.backpressured_read_frame(frame.header.stream_id, &meta),
 						));
 					}
 				};
-				self.handle_read(frame).await.map(Some)
+				self.handle_read(&context.actor, frame).await.map(Some)
 			}
 			MsgType::REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<ReplicaWriteMeta>() {
@@ -4284,14 +4628,17 @@ impl DataRingServer for WendelonDataServer {
 				}
 				let meta: QueryRequestMeta =
 					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
-				if self
-					.authorize_actor_for_data(
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				) {
+					self.emit_query_denied_audit(
 						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Query,
-					)
-					.is_err()
-				{
+						&meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
 					return Ok(Some(
 						self.unauthorized_query_frame(frame.header.stream_id, &meta),
 					));
@@ -4302,13 +4649,22 @@ impl DataRingServer for WendelonDataServer {
 					DataOperation::Query,
 				)? {
 					Ok(admission) => admission,
-					Err(_) => {
+					Err(scope) => {
+						self.emit_query_denied_audit(
+							&context.actor,
+							&meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
 						return Ok(Some(
 							self.backpressured_query_frame(frame.header.stream_id, &meta),
 						));
 					}
 				};
-				self.handle_query(frame).await.map(Some)
+				self.handle_query(&context.actor, frame).await.map(Some)
 			}
 			MsgType::MIGRATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<MigrateRequestMeta>() {
@@ -4383,14 +4739,17 @@ impl DataRingServer for WendelonDataServer {
 				}
 				let meta: WriteRequestMeta =
 					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
-				if self
-					.authorize_actor_for_data(
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				) {
+					self.emit_write_denied_audit(
 						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Write,
-					)
-					.is_err()
-				{
+						&meta,
+						WriteStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
 					let response = self.unauthorized_write_frame(
 						MsgType::BULK_WRITE_RESP,
 						frame.header.stream_id,
@@ -4413,7 +4772,16 @@ impl DataRingServer for WendelonDataServer {
 					DataOperation::Write,
 				)? {
 					Ok(admission) => admission,
-					Err(_) => {
+					Err(scope) => {
+						self.emit_write_denied_audit(
+							&context.actor,
+							&meta,
+							WriteStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
 						let response = self.backpressured_write_frame(
 							MsgType::BULK_WRITE_RESP,
 							frame.header.stream_id,
@@ -4431,7 +4799,7 @@ impl DataRingServer for WendelonDataServer {
 						return Ok(());
 					}
 				};
-				self.handle_bulk_stream(frame, stream).await
+				self.handle_bulk_stream(&context.actor, frame, stream).await
 			}
 			MsgType::QUERY_REQ => {
 				if frame.meta.len() < std::mem::size_of::<QueryRequestMeta>() {
@@ -4442,14 +4810,17 @@ impl DataRingServer for WendelonDataServer {
 				}
 				let meta: QueryRequestMeta =
 					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
-				if self
-					.authorize_actor_for_data(
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				) {
+					self.emit_query_denied_audit(
 						&context.actor,
-						Some(meta.tenant_id),
-						DataOperation::Query,
-					)
-					.is_err()
-				{
+						&meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
 					let response = self.unauthorized_query_frame(frame.header.stream_id, &meta);
 					write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
 					stream.finish().await?;
@@ -4461,7 +4832,16 @@ impl DataRingServer for WendelonDataServer {
 					DataOperation::Query,
 				)? {
 					Ok(admission) => admission,
-					Err(_) => {
+					Err(scope) => {
+						self.emit_query_denied_audit(
+							&context.actor,
+							&meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
 						let response =
 							self.backpressured_query_frame(frame.header.stream_id, &meta);
 						write_frame(
@@ -4476,7 +4856,8 @@ impl DataRingServer for WendelonDataServer {
 						return Ok(());
 					}
 				};
-				self.handle_query_stream(frame, stream).await
+				self.handle_query_stream(&context.actor, frame, stream)
+					.await
 			}
 			MsgType::STREAM_FIN_REQ => {
 				if self
@@ -5702,6 +6083,27 @@ fn decode_pending_witness_records(bytes: &[u8]) -> std::io::Result<Vec<PendingFi
 	})
 }
 
+fn backpressure_scope_name(scope: BackpressureScope) -> &'static str {
+	match scope {
+		BackpressureScope::Tenant => "tenant",
+		BackpressureScope::Actor => "actor",
+	}
+}
+
+fn completed_write_audit_outcome(status: WriteStatus) -> Option<AuditOutcome> {
+	match status {
+		WriteStatus::OK | WriteStatus::DUPLICATE | WriteStatus::FINALIZATION_PENDING => None,
+		_ => Some(AuditOutcome::Error),
+	}
+}
+
+fn completed_read_audit_outcome(status: ReadStatus) -> Option<AuditOutcome> {
+	match status {
+		ReadStatus::OK | ReadStatus::KEY_NOT_FOUND => None,
+		_ => Some(AuditOutcome::Error),
+	}
+}
+
 fn query_error_meta(
 	meta: &QueryRequestMeta,
 	status: ReadStatus,
@@ -6809,6 +7211,23 @@ mod tests {
 			vec![1, 2, 3, 4],
 		)
 		.unwrap()
+	}
+
+	async fn wait_for_audit_log(path: &std::path::Path, needles: &[&str]) -> String {
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			let audit = std::fs::read_to_string(path).unwrap_or_default();
+			if needles.iter().all(|needle| audit.contains(needle)) {
+				return audit;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for audit needles {:?}; current log: {}",
+				needles,
+				audit
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
 	}
 
 	#[tokio::test]
@@ -9650,6 +10069,7 @@ mod tests {
 	#[tokio::test]
 	async fn dispatcher_rejects_read_only_observer_data_read() {
 		let dir = bootstrap_tempdir("auth-read");
+		let audit_path = dir.join("audit.ndjson");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			22,
 			dir,
@@ -9696,6 +10116,345 @@ mod tests {
 		let meta: ReadResponseMeta =
 			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
 		assert_eq!(meta.status, ReadStatus::AUTHORIZATION_FAILED);
+		let audit = wait_for_audit_log(
+			&audit_path,
+			&[
+				"\"event_type\":\"data.read\"",
+				"\"phase\":\"denied\"",
+				"\"status\":\"authorization_failed\"",
+				"\"actor_role\":\"read_only_observer\"",
+			],
+		)
+		.await;
+		assert!(audit.contains("\"type\":\"data_access\""));
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_emits_write_request_and_completion_audit_events() {
+		let dir = bootstrap_tempdir("audit-write-events");
+		let audit_path = dir.join("audit.ndjson");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			31,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let meta = simple_write_meta(1);
+		let payload = encode_batch(&single_kv_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::WRITE_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: WriteResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<WriteResponseMeta>()]);
+		assert_eq!(meta.status, WriteStatus::OK);
+
+		let audit = wait_for_audit_log(
+			&audit_path,
+			&[
+				"\"event_type\":\"data.write\"",
+				"\"phase\":\"requested\"",
+				"\"phase\":\"completed\"",
+				"\"status\":\"ok\"",
+			],
+		)
+		.await;
+		assert!(audit.contains("\"record_identity\""));
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_refuses_write_when_data_access_audit_emit_fails() {
+		struct RejectingAuditSink;
+
+		impl AuditSink for RejectingAuditSink {
+			fn emit(&self, _event: AuditEvent) -> std::io::Result<()> {
+				Err(Error::other("simulated data-access audit failure"))
+			}
+		}
+
+		let dir = bootstrap_tempdir("audit-write-fail-closed");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			34,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let fail_closed_server = Arc::new(
+			WendelonDataServer::new(
+				node.slab.clone(),
+				node.raft.clone(),
+				node.log_store.clone(),
+				node.state_machine.clone(),
+				node.local_node,
+				node.clock.clone(),
+				node.data_server.router.clone(),
+				node.data_server.factory.clone(),
+				node.pool.clone(),
+			)
+			.unwrap()
+			.with_audit_sink(Arc::new(RejectingAuditSink)),
+		);
+
+		let meta = simple_write_meta(1);
+		let payload = encode_batch(&single_kv_batch()).unwrap();
+		let before_bytes = node.slab.local_l1_bytes().await;
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&payload);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::WRITE_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let err = DataRingServer::handle_data_frame(
+			fail_closed_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap_err();
+		assert!(err.to_string().contains("data access audit emit failed"));
+		assert_eq!(
+			node.slab.local_l1_bytes().await,
+			before_bytes,
+			"failed local-chain emission must reject the write before any payload bytes append"
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_emits_completed_read_audit_event() {
+		let dir = bootstrap_tempdir("audit-read-events");
+		let audit_path = dir.join("audit.ndjson");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			32,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		let (_write_resp, _) = node
+			.data_server
+			.write(simple_write_meta(1), single_kv_batch())
+			.await
+			.unwrap();
+
+		let meta = simple_read_meta(1);
+		let key = encode_batch(&single_key_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&key);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: ReadResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::OK);
+
+		let audit = wait_for_audit_log(
+			&audit_path,
+			&[
+				"\"event_type\":\"data.read\"",
+				"\"phase\":\"completed\"",
+				"\"status\":\"ok\"",
+				"\"result_count\":1",
+			],
+		)
+		.await;
+		assert!(audit.contains("\"returned_bytes\":1"));
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn dispatcher_emits_completed_range_query_audit_event() {
+		let dir = bootstrap_tempdir("audit-range-query-events");
+		let audit_path = dir.join("audit.ndjson");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			33,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		let (_write_resp, _) = node
+			.data_server
+			.write(simple_write_meta(1), single_kv_batch())
+			.await
+			.unwrap();
+
+		let mut meta = base_meta();
+		meta.expected_epoch = 1;
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::QUERY_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::OK);
+		assert_eq!(meta.rows, 1);
+
+		let audit = wait_for_audit_log(
+			&audit_path,
+			&[
+				"\"event_type\":\"data.range_query\"",
+				"\"phase\":\"completed\"",
+				"\"status\":\"ok\"",
+				"\"result_count\":1",
+			],
+		)
+		.await;
+		assert!(audit.contains("\"locality_end\":18446744073709551615"));
 
 		node.handles.abort();
 	}

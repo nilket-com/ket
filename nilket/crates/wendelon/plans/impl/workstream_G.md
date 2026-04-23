@@ -70,6 +70,9 @@ Implement the typed schema for:
 
 Free-form logs are not audit records.
 
+Status: complete.
+Artifact: `plans/impl/workstream_G_canonical_schema_reference.md`
+
 ### G2. Authority Versus Materialization
 
 Encode the model explicitly:
@@ -79,6 +82,9 @@ Encode the model explicitly:
 - NDJSON materialization on every serious deployment
 
 This should be visible in code and docs.
+
+Status: complete.
+Artifact: `plans/impl/workstream_G_evidence_path_note.md`
 
 ### G3. Data-Access Event Coverage
 
@@ -91,6 +97,9 @@ Add at least:
 
 Sampling policy should be explicit rather than implied.
 
+Status: complete.
+Artifact: `plans/impl/workstream_G_sampling_policy_note.md`
+
 ### G4. Verification Tooling
 
 Build `audit verify` or an equivalent tool that can:
@@ -98,6 +107,9 @@ Build `audit verify` or an equivalent tool that can:
 - verify chain continuity
 - verify replay-forward where applicable
 - report missing or malformed evidence
+
+Status: complete.
+Artifact: `plans/impl/workstream_G_audit_verify_usage.md`
 
 ### G5. Archive And WORM Layer
 
@@ -107,11 +119,17 @@ Add the baseline archive path on top of local authority:
 - optional object-lock or WORM support
 - documented operator retention duties
 
+Status: complete.
+Artifact: `plans/impl/workstream_G_archive_retention_guide.md`
+
 ### G6. Optional Kafka Evidence Path
 
 Do not make Kafka the baseline.
 
 If Kafka is later used as an evidence-grade stream, it must carry the canonical chain or authority fields needed for replay and verification.
+
+Status: complete.
+Artifact: `plans/impl/workstream_G_kafka_evidence_path_note.md`
 
 ## Tests And Benchmarks
 
@@ -138,6 +156,7 @@ If Kafka is later used as an evidence-grade stream, it must carry the canonical 
 - sampling-policy note
 - `audit verify` usage guide
 - retention and archive guide
+- Kafka evidence-path note
 
 ## Deferred Follow-Ons
 

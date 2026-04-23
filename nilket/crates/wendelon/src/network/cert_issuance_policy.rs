@@ -5,7 +5,10 @@
 //! may issue, which CA must sign them, and what claim payload each
 //! issued leaf must carry.
 
-use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditOutcome};
+use crate::audit::{
+	AdministrativeControlAction, AdministrativeControlSchema, AuditAuthority, AuditEvent,
+	AuditOperation, AuditOutcome, AuditSchema,
+};
 use crate::network::tls::{
 	ACTOR_CLAIMS_OID_DOTTED, ActorIdentity, ActorRole, ActorTrustDomain, BreakGlassScope,
 	canonical_node_dns_name, encode_actor_claims_cbor_v1,
@@ -110,7 +113,15 @@ impl PreparedCertIssue {
 		.with_parameter("issued_scope", metadata.scope.as_str())
 		.with_parameter("incident_ticket_id", metadata.incident_ticket_id.clone())
 		.with_parameter("reason", metadata.reason.clone())
-		.with_parameter("ttl_seconds", self.ttl.as_secs()))
+		.with_parameter("ttl_seconds", self.ttl.as_secs())
+		.with_schema(AuditSchema::AdministrativeControl {
+			action: AdministrativeControlAction::BreakGlassIssue,
+			detail: AdministrativeControlSchema {
+				target_role: Some(self.role.as_str().to_string()),
+				target_scope: Some(metadata.scope.as_str().to_string()),
+				..AdministrativeControlSchema::default()
+			},
+		}))
 	}
 }
 
