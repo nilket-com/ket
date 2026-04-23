@@ -77,10 +77,8 @@ The current operator-facing recovery catalog is:
 - `plans/ops/runbooks/cluster_restore.md`
 - `plans/ops/runbooks/node_replacement.md`
 
-The deeper implementation notes remain:
-
-- `plans/impl/workstream_H_restore_runbook.md`
-- `plans/impl/workstream_H_node_replacement_runbook.md`
+The implementation details are code-backed by the backup/restore and multinode
+replacement tests; the runbooks above are the operator-facing procedures.
 
 ## Deferred
 

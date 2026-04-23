@@ -153,7 +153,7 @@ wait "$driver_pid"
 trap - INT TERM
 
 cat >"$OUTPUT_DIR/next_steps.txt" <<EOF
-1. Copy the environment and command lines into plans/impl/workstream_D_soak_report.md
+1. Preserve this output directory with the run evidence; no repo-local soak report template is maintained.
 2. Fill in the churn timeline from:
    - $OUTPUT_DIR/churn.log (if present)
    - your manual operator notes otherwise

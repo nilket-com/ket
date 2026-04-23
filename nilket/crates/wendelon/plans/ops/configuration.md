@@ -1,6 +1,6 @@
 # Configuration Schema
 
-This document describes the configuration schema implemented by Workstream E.1.
+This document describes the configuration schema implemented by the config loader.
 
 Nodes are bootstrapped from a static TOML file such as `wendelon.toml`. The
 current loader is intentionally narrow: it covers the single-node bootstrap and

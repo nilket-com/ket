@@ -122,5 +122,5 @@ Escalate immediately if:
 ## References
 
 - `scripts/recovery/run_node_replacement_contract.sh`
-- `plans/impl/workstream_H_node_replacement_runbook.md`
-- `plans/impl/workstream_H_fallback_automation_contract.md`
+- `plans/ops/backup_dr.md`
+- `tests/multinode_bootstrap.rs`

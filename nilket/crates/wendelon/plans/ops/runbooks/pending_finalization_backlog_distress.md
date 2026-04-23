@@ -115,5 +115,5 @@ Escalate if:
 
 ## References
 
-- `plans/impl/workstream_B_operator_notes.md`
-- `plans/impl/workstream_D_metric_catalog.md`
+- `plans/ops/runbooks/degraded_fenced_leader.md`
+- `plans/ops/observability.md`

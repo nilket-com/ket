@@ -2,7 +2,7 @@
 set -euo pipefail
 
 profile="${1:-fips}"
-out_dir="${2:-target/workstream_J/${profile}}"
+out_dir="${2:-target/regulated_release/${profile}}"
 
 case "${profile}" in
   default|fips)

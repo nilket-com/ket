@@ -1,7 +1,7 @@
 # Upgrade Strategy
 
 Wendelon supports controlled rolling upgrades inside a bounded compatibility
-window. The rules below are the operator contract for Workstream E.5.
+window. The rules below are the operator-facing upgrade contract.
 
 ## 1. Version Axes
 

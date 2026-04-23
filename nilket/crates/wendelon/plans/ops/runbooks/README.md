@@ -23,4 +23,4 @@ Current runbooks:
     materialization lag
 
 These runbooks complement, but do not replace, the deeper implementation notes
-under `plans/impl/workstream_H_*.md`.
+in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

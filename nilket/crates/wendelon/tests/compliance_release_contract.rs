@@ -71,7 +71,7 @@ fn fips_startup_self_tests_are_code_backed_and_documented() {
 		assert_contains(&build_info, required, "src/build_info.rs");
 	}
 
-	let evidence = read_repo_file("plans/impl/workstream_J_self_test_evidence.md");
+	let evidence = read_repo_file("plans/compliance/self_test_evidence.md");
 	for required in [
 		"aws_lc_rs::try_fips_mode()",
 		"SHA-256",
@@ -80,28 +80,28 @@ fn fips_startup_self_tests_are_code_backed_and_documented() {
 		"cargo test --lib build_info::tests",
 		"CC=clang CXX=clang++ cargo test --lib --no-default-features --features fips build_info::tests",
 	] {
-		assert_contains(&evidence, required, "Workstream J self-test evidence");
+		assert_contains(&evidence, required, "compliance self-test evidence");
 	}
 }
 
 #[test]
-fn workstream_j_artifacts_exist_and_name_current_boundary_gaps() {
+fn compliance_artifacts_exist_and_name_current_boundary_gaps() {
 	for path in [
-		"plans/impl/workstream_J_crypto_boundary_inventory.md",
-		"plans/impl/workstream_J_fips_build_profile.md",
-		"plans/impl/workstream_J_self_test_evidence.md",
-		"plans/impl/workstream_J_release_artifact_evidence.md",
-		"plans/impl/workstream_J_cmvp_status_evidence.md",
-		"plans/impl/workstream_J_compliance_pack_index.md",
-		"plans/impl/external/cmvp_lab_contact_record.md",
+		"plans/compliance/crypto_boundary_inventory.md",
+		"plans/compliance/fips_build_profile.md",
+		"plans/compliance/self_test_evidence.md",
+		"plans/compliance/release_artifact_evidence.md",
+		"plans/compliance/cmvp_status_evidence.md",
+		"plans/compliance/compliance_pack_index.md",
+		"plans/compliance/external/cmvp_lab_contact_record.md",
 	] {
 		assert!(
 			repo_root().join(path).exists(),
-			"Workstream J artifact should exist: {path}"
+			"compliance artifact should exist: {path}"
 		);
 	}
 
-	let boundary = read_repo_file("plans/impl/workstream_J_crypto_boundary_inventory.md");
+	let boundary = read_repo_file("plans/compliance/crypto_boundary_inventory.md");
 	for required in [
 		"ed25519-dalek",
 		"scrypt",
@@ -110,7 +110,7 @@ fn workstream_j_artifacts_exist_and_name_current_boundary_gaps() {
 		"Current FIPS-profile gap",
 		"not FIPS-certified",
 	] {
-		assert_contains(&boundary, required, "Workstream J boundary inventory");
+		assert_contains(&boundary, required, "compliance boundary inventory");
 	}
 }
 
@@ -167,18 +167,18 @@ fn release_evidence_scripts_cover_sbom_signing_and_attestation_contract() {
 
 #[test]
 fn cmvp_status_language_remains_narrow() {
-	let cmvp = read_repo_file("plans/impl/workstream_J_cmvp_status_evidence.md");
+	let cmvp = read_repo_file("plans/compliance/cmvp_status_evidence.md");
 	for required in [
 		"not FIPS-certified",
 		"not CMVP validated",
 		"not represented in this repo as being in validation",
 		"not a CMVP certificate",
-		"plans/impl/external/cmvp_lab_contact_record.md",
+		"plans/compliance/external/cmvp_lab_contact_record.md",
 	] {
 		assert_contains(&cmvp, required, "CMVP status evidence");
 	}
 
-	let lab_record = read_repo_file("plans/impl/external/cmvp_lab_contact_record.md");
+	let lab_record = read_repo_file("plans/compliance/external/cmvp_lab_contact_record.md");
 	for required in [
 		"no external lab contact recorded",
 		"not evidence of lab engagement",

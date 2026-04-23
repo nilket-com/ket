@@ -107,7 +107,7 @@ The architecture already rejected bearer tokens as the primary trust primitive. 
 
 - **OID assignment.** The exact OID prefix still depends on PEN registration, but that is an identifier-registration task, not a blocker to the architectural model itself.
 - **Exact issuance topology for the cert-service.** The service shape and HA packaging are implementation decisions built on top of this role and scope model.
-- **Exact break-glass policy defaults.** Scope TTLs, approval windows, and approval counts are design-lock items layered on top of this identity model.
+- **Exact break-glass policy defaults.** Scope TTLs, approval windows, and approval counts are operational policy items layered on top of this identity model.
 
 ## References
 - ADR 011: Transport Support Strategy (QUIC First, Multi-Transport Later)

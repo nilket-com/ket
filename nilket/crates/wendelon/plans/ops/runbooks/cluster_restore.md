@@ -110,5 +110,5 @@ Do not:
 
 ## References
 
-- `plans/impl/workstream_H_restore_runbook.md`
-- `plans/impl/workstream_H_backup_manifest_spec.md`
+- `plans/ops/backup_dr.md`
+- `tests/backup_restore.rs`

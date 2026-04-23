@@ -1,4 +1,4 @@
-//! Certificate issuance policy surface for Workstream F.
+//! Certificate issuance policy surface.
 //!
 //! This module intentionally does not stand up an RPC/HTTP issuer.
 //! It is the policy engine that defines which leaf classes Wendelon

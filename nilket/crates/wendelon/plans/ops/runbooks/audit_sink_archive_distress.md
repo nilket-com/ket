@@ -116,5 +116,4 @@ Escalate if:
 ## References
 
 - `plans/ops/audit.md`
-- `plans/impl/workstream_G_evidence_path_note.md`
-- `plans/impl/workstream_G_archive_retention_guide.md`
+- `plans/ops/observability.md`

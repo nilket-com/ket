@@ -85,7 +85,7 @@ When a node misses the 30-second soft target:
 
 This document is the budget reference for:
 
-- `plans/impl/W1_foundation_and_storage_seam.md` §3 ADR 017 cold-start budget
+- ADR `017` cold-start budget
 - redb replay-forward authority rules from ADR 017
 - the W1 CI checks that exercise WAL replay, snapshot recovery, and metadata
   sync behavior
