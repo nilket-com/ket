@@ -48,6 +48,7 @@ use crate::crypto::{
 use crate::metrics::global as metrics;
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
+	TenantKekId,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
@@ -72,6 +73,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 const STORAGE_BACKUP_FORMAT_VERSION: u16 = 1;
 
@@ -226,6 +228,12 @@ pub struct TieredSlabPointer {
 	/// once and stamp the truth back through `commit_tier_slab`.
 	#[serde(default)]
 	pub is_encrypted: bool,
+	/// Tenant that owns the slab payload when known.
+	#[serde(default)]
+	pub tenant_id: Option<TenantId>,
+	/// Tenant KEK version referenced by the encrypted footer when known.
+	#[serde(default)]
+	pub tenant_kek_id: Option<TenantKekId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -792,6 +800,19 @@ impl SlabManager {
 		blob: &[u8],
 	) -> std::io::Result<Option<FooterSummary>> {
 		self.config.crypto.encrypted_footer_summary(blob)
+	}
+
+	pub(crate) fn decode_tiered_object_blob(
+		&self,
+		pointer: &TieredSlabPointer,
+		blob: &[u8],
+	) -> std::io::Result<Vec<u8>> {
+		validate_tiered_blob(pointer, blob)?;
+		decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob)
+	}
+
+	pub(crate) fn active_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
+		self.config.crypto.active_tenant_kek_id(tenant_id)
 	}
 
 	/// Export the authoritative local slab set as a backup image.
@@ -2045,7 +2066,11 @@ impl SlabManager {
 			.get(&pointer.l2_uri)
 			.await?;
 		validate_tiered_blob(pointer, &old_blob)?;
-		let plaintext = decode_tiered_blob(self.config.crypto.as_ref(), pointer, &old_blob)?;
+		let plaintext = Zeroizing::new(decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+		)?);
 		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
 			.map(|(tenant_id, key_identity, old_location)| CompactionRecord {
@@ -2077,7 +2102,7 @@ impl SlabManager {
 
 		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
-		let rewrite_result = async {
+		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
 					&tmp_path,
@@ -2088,23 +2113,25 @@ impl SlabManager {
 				.await?,
 			);
 			for record in records.iter().filter(|record| !record.reclaim) {
-				let frame = extract_record_from_blob(&plaintext, record.old_location)?;
+				let frame =
+					Zeroizing::new(extract_record_from_blob(&plaintext, record.old_location)?);
 				rewritten
 					.append(
 						record.tenant_id,
 						record.key_identity,
 						record.old_location.hlc,
-						&frame,
+						frame.as_ref(),
 					)
 					.await?;
 			}
 			rewritten.fsync().await?;
-			self.file_ops.read_all(&tmp_path).await
+			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
 		}
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
-		let encrypted = self.encrypt_tiered_object_blob(pointer.slab_id, &rewritten_plaintext)?;
+		let encrypted =
+			self.encrypt_tiered_object_blob(pointer.slab_id, rewritten_plaintext.as_ref())?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -3083,6 +3110,8 @@ mod tests {
 			l2_uri: format!("memory://tiered/{slab_id:016x}"),
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
 		};
 
 		let err =
@@ -3355,6 +3384,8 @@ mod tests {
 				l2_uri: uri,
 				payload_hash,
 				is_encrypted: true,
+				tenant_id: Some(tenant()),
+				tenant_kek_id: Some(encrypted.tenant_kek_id),
 			})
 			.await
 			.unwrap();

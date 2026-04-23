@@ -1,4 +1,4 @@
-use crate::schema::{HybridTimestamp, Identity, SlabId, TenantId};
+use crate::schema::{HybridTimestamp, Identity, SlabId, TenantId, TenantKekId};
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -13,10 +13,16 @@ const RECORDS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slab_
 /// `is_encrypted` byte. Read-only; one-shot migrated into V2 the
 /// first time a process opens an index that still has V1 rows.
 const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v1");
-/// V2 layout: `payload_hash[32] || flags_byte || l2_uri_utf8`. The
-/// flags byte is bit 0 = `is_encrypted`. Higher bits reserved as
-/// zero so a future flag (e.g., compression) can land without
-/// another table bump.
+/// V2 layout: `payload_hash[32] || flags_byte || [optional metadata] ||
+/// l2_uri_utf8`.
+///
+/// Flags:
+/// - bit 0 = `is_encrypted`
+/// - bit 1 = `tenant_id` present (8 LE bytes)
+/// - bit 2 = `tenant_kek_id` present (8 LE bytes)
+///
+/// Older rows only use bit 0 and therefore decode cleanly with
+/// missing tenant / tenant-KEK metadata.
 const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v2");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
@@ -27,6 +33,8 @@ const TIERED_POINTER_HASH_LEN: usize = 32;
 const TIERED_POINTER_FLAGS_LEN: usize = 1;
 const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
 const TIERED_FLAG_IS_ENCRYPTED: u8 = 0b0000_0001;
+const TIERED_FLAG_HAS_TENANT_ID: u8 = 0b0000_0010;
+const TIERED_FLAG_HAS_TENANT_KEK_ID: u8 = 0b0000_0100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -368,7 +376,19 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	if pointer.is_encrypted {
 		flags |= TIERED_FLAG_IS_ENCRYPTED;
 	}
+	if pointer.tenant_id.is_some() {
+		flags |= TIERED_FLAG_HAS_TENANT_ID;
+	}
+	if pointer.tenant_kek_id.is_some() {
+		flags |= TIERED_FLAG_HAS_TENANT_KEK_ID;
+	}
 	bytes.push(flags);
+	if let Some(tenant_id) = pointer.tenant_id {
+		bytes.extend_from_slice(&tenant_id.get().to_le_bytes());
+	}
+	if let Some(tenant_kek_id) = pointer.tenant_kek_id {
+		bytes.extend_from_slice(&tenant_kek_id.get().to_le_bytes());
+	}
 	bytes.extend_from_slice(pointer.l2_uri.as_bytes());
 	bytes
 }
@@ -387,7 +407,44 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	payload_hash.copy_from_slice(&value[..TIERED_POINTER_HASH_LEN]);
 	let flags = value[TIERED_POINTER_HASH_LEN];
 	let is_encrypted = (flags & TIERED_FLAG_IS_ENCRYPTED) != 0;
-	let l2_uri = std::str::from_utf8(&value[TIERED_POINTER_PREFIX_LEN..])
+	let mut cursor = TIERED_POINTER_PREFIX_LEN;
+	let tenant_id = if (flags & TIERED_FLAG_HAS_TENANT_ID) != 0 {
+		let end = cursor.saturating_add(8);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding tenant_id",
+			)
+		})?;
+		cursor = end;
+		Some(TenantId::new(u64::from_le_bytes(
+			slot.try_into().expect("fixed width"),
+		)))
+	} else {
+		None
+	};
+	let tenant_kek_id = if (flags & TIERED_FLAG_HAS_TENANT_KEK_ID) != 0 {
+		let end = cursor.saturating_add(8);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding tenant_kek_id",
+			)
+		})?;
+		cursor = end;
+		Some(
+			TenantKekId::try_from(u64::from_le_bytes(slot.try_into().expect("fixed width")))
+				.map_err(|err| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("invalid tiered slab tenant_kek_id: {err}"),
+					)
+				})?,
+		)
+	} else {
+		None
+	};
+	let l2_uri = std::str::from_utf8(&value[cursor..])
 		.map_err(|err| {
 			Error::new(
 				ErrorKind::InvalidData,
@@ -400,6 +457,8 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 		l2_uri,
 		payload_hash,
 		is_encrypted,
+		tenant_id,
+		tenant_kek_id,
 	})
 }
 
@@ -434,6 +493,8 @@ fn decode_tiered_pointer_v1(slab_id: SlabId, value: &[u8]) -> std::io::Result<Ti
 		l2_uri,
 		payload_hash,
 		is_encrypted: false,
+		tenant_id: None,
+		tenant_kek_id: None,
 	})
 }
 
@@ -518,6 +579,8 @@ mod tests {
 			l2_uri: "file:///tmp/example".into(),
 			payload_hash: [0xAB; 32],
 			is_encrypted: true,
+			tenant_id: Some(TenantId::new(9)),
+			tenant_kek_id: Some(TenantKekId::try_from(11).unwrap()),
 		};
 		let encoded = encode_tiered_pointer(&pointer);
 		let decoded = decode_tiered_pointer(pointer.slab_id, &encoded).unwrap();
@@ -545,6 +608,8 @@ mod tests {
 			l2_uri: "file:///tmp/tiered".into(),
 			payload_hash: [0x11; 32],
 			is_encrypted: true,
+			tenant_id: Some(TenantId::new(5)),
+			tenant_kek_id: Some(TenantKekId::try_from(15).unwrap()),
 		};
 		let local_row = PersistentRecordRow {
 			location: RecordLocation {
@@ -584,6 +649,8 @@ mod tests {
 			l2_uri: "file:///tmp/tiered-watermark".into(),
 			payload_hash: [0x22; 32],
 			is_encrypted: true,
+			tenant_id: Some(TenantId::new(6)),
+			tenant_kek_id: Some(TenantKekId::try_from(16).unwrap()),
 		};
 
 		index

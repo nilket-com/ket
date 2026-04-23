@@ -56,11 +56,11 @@ use crate::consensus::{
 	TenantRecord, TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse,
 	WendelonTypeConfig,
 };
-use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
+use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::metrics::global as metrics;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
-	RaftLogEntryFixed, SlabId, SnapshotHeader, WALRecordHeader,
+	RaftLogEntryFixed, SlabId, SnapshotHeader, TenantId, TenantKekId, WALRecordHeader,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
@@ -1505,6 +1505,72 @@ pub struct SmState {
 	pub tenant_keysets: HashMap<crate::schema::TenantId, TenantKeyset>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantKekRetirementVersionStatus {
+	pub tenant_kek_id: TenantKekId,
+	pub is_active: bool,
+	pub tiered_slab_ref_count: u64,
+	pub safe_to_retire: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TenantKekRetirementStatus {
+	pub accounting_complete: bool,
+	pub versions: Vec<TenantKekRetirementVersionStatus>,
+}
+
+pub(crate) fn tenant_kek_retirement_status(
+	snapshot: &SmState,
+	tenant_id: TenantId,
+) -> TenantKekRetirementStatus {
+	let Some(keyset) = snapshot.tenant_keysets.get(&tenant_id) else {
+		return TenantKekRetirementStatus {
+			accounting_complete: true,
+			versions: Vec::new(),
+		};
+	};
+	let active_tenant_kek_id = keyset.active_tenant_kek_id;
+	let mut tiered_ref_counts: BTreeMap<TenantKekId, u64> = BTreeMap::new();
+	let mut accounting_complete = !snapshot
+		.tiered_slabs
+		.values()
+		.any(|tier| tier.is_encrypted && tier.tenant_id.is_none());
+	for tier in snapshot.tiered_slabs.values() {
+		if !tier.is_encrypted {
+			continue;
+		}
+		match (tier.tenant_id, tier.tenant_kek_id) {
+			(Some(tier_tenant_id), Some(tenant_kek_id)) if tier_tenant_id == tenant_id => {
+				*tiered_ref_counts.entry(tenant_kek_id).or_default() += 1;
+			}
+			(Some(tier_tenant_id), None) if tier_tenant_id == tenant_id => {
+				accounting_complete = false;
+			}
+			_ => {}
+		}
+	}
+	let mut versions = keyset
+		.keys
+		.keys()
+		.copied()
+		.map(|tenant_kek_id| {
+			let tiered_slab_ref_count = tiered_ref_counts.get(&tenant_kek_id).copied().unwrap_or(0);
+			let is_active = Some(tenant_kek_id) == active_tenant_kek_id;
+			TenantKekRetirementVersionStatus {
+				tenant_kek_id,
+				is_active,
+				tiered_slab_ref_count,
+				safe_to_retire: accounting_complete && !is_active && tiered_slab_ref_count == 0,
+			}
+		})
+		.collect::<Vec<_>>();
+	versions.sort_by_key(|version| version.tenant_kek_id);
+	TenantKekRetirementStatus {
+		accounting_complete,
+		versions,
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionSnapshot {
 	pub current_epoch: u64,
@@ -2192,10 +2258,17 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					}
 					_ => None,
 				};
-				let is_create_tenant = matches!(
+				let has_tenant_kek_rotation = tenant_kek_rotation.is_some();
+				let mut requires_tenant_kek_snapshot_sync = matches!(
 					&entry.payload,
 					EntryPayload::Normal(WendelonRequest::CreateTenant(_))
 				);
+				if matches!(
+					&entry.payload,
+					EntryPayload::Normal(WendelonRequest::RetireTenantKekVersion(_))
+				) {
+					requires_tenant_kek_snapshot_sync = true;
+				}
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
@@ -2208,14 +2281,15 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				if let Some(rotation) = tenant_kek_rotation {
 					if applied_successfully {
 						pending_tenant_kek_events.push((rotation, entry.log_id.index));
-						pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
 					}
 				}
-				// CreateTenant installs the initial tenant keyset directly in
-				// the state machine without a separate InstallTenantKekVersion
-				// entry. The local CryptoManager still needs to learn about
-				// the new keys, so reconcile from the committed snapshot.
-				if is_create_tenant && applied_successfully {
+				// CreateTenant and destructive tenant-KEK retirement update
+				// the authoritative keyset without an incremental observer
+				// callback. Rotation also snapshots here so local crypto can
+				// converge even if incremental apply missed a commit.
+				if (requires_tenant_kek_snapshot_sync || has_tenant_kek_rotation)
+					&& applied_successfully
+				{
 					pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
 				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
@@ -2523,7 +2597,9 @@ fn raft_audit_event(
 		// can reject for transient state-machine reasons and an error
 		// record per replay would flood the audit log.
 		WendelonRequest::Finalize(_) if is_err => None,
-		WendelonRequest::AdvanceEpoch(_) | WendelonRequest::InstallTenantKekVersion(_)
+		WendelonRequest::AdvanceEpoch(_)
+			| WendelonRequest::InstallTenantKekVersion(_)
+			| WendelonRequest::RetireTenantKekVersion(_)
 			if is_err =>
 		{
 			None
@@ -2605,6 +2681,25 @@ fn raft_audit_event(
 			.with_parameter("raft_term", entry.log_id.leader_id.term)
 			.with_parameter("tenant_id", rotation.tenant_id.get())
 			.with_parameter("tenant_kek_id", rotation.tenant_kek_id.get()),
+		),
+		WendelonRequest::RetireTenantKekVersion(retirement) => Some(
+			AuditEvent::new(
+				AuditAuthority::RaftLog,
+				AuditOperation::CryptoTenantKekRetired,
+				local_node,
+				format!(
+					"raft_log_index={} raft_term={} tenant_id={} tenant_kek_id={}",
+					entry.log_id.index,
+					entry.log_id.leader_id.term,
+					retirement.tenant_id.get(),
+					retirement.tenant_kek_id.get(),
+				),
+			)
+			.with_outcome(outcome)
+			.with_raft_log_index(entry.log_id.index)
+			.with_parameter("raft_term", entry.log_id.leader_id.term)
+			.with_parameter("tenant_id", retirement.tenant_id.get())
+			.with_parameter("tenant_kek_id", retirement.tenant_kek_id.get()),
 		),
 		// Tenant admin ops are attempt-audited per ADR 021 §5: every
 		// mutation — including rejected ones — emits a record so the
@@ -2988,6 +3083,9 @@ fn apply_request(
 			keyset.active_tenant_kek_id = Some(rotation.tenant_kek_id);
 			(WendelonResponse::Success, None)
 		}
+		WendelonRequest::RetireTenantKekVersion(retirement) => {
+			(apply_retire_tenant_kek_version(state, retirement), None)
+		}
 		WendelonRequest::SeedMigration(seed) => {
 			apply_seed_migration(state, seed);
 			(WendelonResponse::Success, None)
@@ -3132,6 +3230,80 @@ fn apply_advance_epoch(state: &mut SmState, record: AdvanceEpochRecord) {
 		.epoch_history
 		.entry(record.to.epoch)
 		.or_insert(record.to);
+}
+
+fn apply_retire_tenant_kek_version(
+	state: &mut SmState,
+	retirement: RetireTenantKekVersion,
+) -> WendelonResponse {
+	let Some(tenant) = state.tenants.get(&retirement.tenant_id) else {
+		return WendelonResponse::Error(format!(
+			"tenant {} does not exist",
+			retirement.tenant_id.get()
+		));
+	};
+	if tenant.state == TenantLifecycleState::Deleted {
+		return WendelonResponse::Error(format!(
+			"tenant {} is deleted",
+			retirement.tenant_id.get()
+		));
+	}
+	let Some(keyset) = state.tenant_keysets.get(&retirement.tenant_id) else {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} does not exist",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get()
+		));
+	};
+	if !keyset.keys.contains_key(&retirement.tenant_kek_id) {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} does not exist",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get()
+		));
+	}
+	if keyset.active_tenant_kek_id == Some(retirement.tenant_kek_id) {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} is active and cannot be retired",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get()
+		));
+	}
+	let status = tenant_kek_retirement_status(state, retirement.tenant_id);
+	if !status.accounting_complete {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant KEK accounting is incomplete",
+			retirement.tenant_id.get()
+		));
+	}
+	let Some(version) = status
+		.versions
+		.iter()
+		.find(|version| version.tenant_kek_id == retirement.tenant_kek_id)
+	else {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} does not exist",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get()
+		));
+	};
+	if version.tiered_slab_ref_count > 0 {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} is still referenced by {} tiered slabs",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get(),
+			version.tiered_slab_ref_count,
+		));
+	}
+	let Some(keyset) = state.tenant_keysets.get_mut(&retirement.tenant_id) else {
+		return WendelonResponse::Error(format!(
+			"tenant {} tenant_kek_id {} does not exist",
+			retirement.tenant_id.get(),
+			retirement.tenant_kek_id.get()
+		));
+	};
+	keyset.keys.remove(&retirement.tenant_kek_id);
+	WendelonResponse::Success
 }
 
 /// Fold a [`SeedMigration`] into the ledger. Idempotent: a replay
@@ -4067,6 +4239,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		EntryPayload::Normal(WendelonRequest::ResumeTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::DeleteTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(_)) => {
+			(LogEntryKind::APPEND, 0)
+		}
+		EntryPayload::Normal(WendelonRequest::RetireTenantKekVersion(_)) => {
 			(LogEntryKind::APPEND, 0)
 		}
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
@@ -6404,6 +6579,8 @@ mod tiered_slab_tests {
 			l2_uri: "memory://tier/slab_0000000000000007.wnd".into(),
 			payload_hash: [0xAB; 32],
 			is_encrypted: true,
+			tenant_id: None,
+			tenant_kek_id: None,
 		};
 
 		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
@@ -6432,7 +6609,7 @@ mod tiered_slab_tests {
 mod tenant_kek_tests {
 	use super::*;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
-	use crate::schema::{TenantId, TenantKekId};
+	use crate::schema::{SlabId, TenantId, TenantKekId};
 
 	fn seed_active_tenant(state: &mut SmState, tenant_id: TenantId) {
 		state.tenants.insert(
@@ -6445,6 +6622,29 @@ mod tenant_kek_tests {
 				replication_factor: 3,
 			},
 		);
+	}
+
+	fn seed_two_version_keyset(
+		state: &mut SmState,
+		tenant_id: TenantId,
+		historical_id: TenantKekId,
+		active_id: TenantKekId,
+	) {
+		let mut keyset = TenantKeyset::default();
+		keyset.active_tenant_kek_id = Some(active_id);
+		keyset.keys.insert(
+			historical_id,
+			WrappedTenantKek {
+				wrapped_key: vec![1; 40],
+			},
+		);
+		keyset.keys.insert(
+			active_id,
+			WrappedTenantKek {
+				wrapped_key: vec![2; 40],
+			},
+		);
+		state.tenant_keysets.insert(tenant_id, keyset);
 	}
 
 	#[test]
@@ -6532,5 +6732,101 @@ mod tenant_kek_tests {
 		assert_eq!(keyset.keys.len(), 2);
 		assert_eq!(keyset.keys.get(&historical_id), Some(&historical));
 		assert_eq!(keyset.keys.get(&active_id), Some(&active));
+	}
+
+	#[test]
+	fn retire_tenant_kek_rejects_active_version() {
+		let tenant_id = TenantId::ZERO;
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let mut state = SmState::default();
+		seed_active_tenant(&mut state, tenant_id);
+		seed_two_version_keyset(&mut state, tenant_id, historical_id, active_id);
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id,
+				tenant_kek_id: active_id,
+			}),
+		);
+		match resp {
+			WendelonResponse::Error(message) => {
+				assert!(message.contains("is active and cannot be retired"));
+			}
+			other => panic!("expected active tenant KEK rejection, got {other:?}"),
+		}
+
+		let keyset = state.tenant_keysets.get(&tenant_id).unwrap();
+		assert!(keyset.keys.contains_key(&historical_id));
+		assert!(keyset.keys.contains_key(&active_id));
+	}
+
+	#[test]
+	fn retire_tenant_kek_rejects_referenced_historical_version() {
+		let tenant_id = TenantId::ZERO;
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let mut state = SmState::default();
+		seed_active_tenant(&mut state, tenant_id);
+		seed_two_version_keyset(&mut state, tenant_id, historical_id, active_id);
+		state.tiered_slabs.insert(
+			SlabId::new(41),
+			TieredSlab {
+				slab_id: SlabId::new(41),
+				l2_uri: "s3://bucket/slab-41".to_string(),
+				payload_hash: [9; 32],
+				is_encrypted: true,
+				tenant_id: Some(tenant_id),
+				tenant_kek_id: Some(historical_id),
+			},
+		);
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		match resp {
+			WendelonResponse::Error(message) => {
+				assert!(message.contains("is still referenced by 1 tiered slabs"));
+			}
+			other => panic!("expected referenced tenant KEK rejection, got {other:?}"),
+		}
+
+		assert!(
+			state
+				.tenant_keysets
+				.get(&tenant_id)
+				.unwrap()
+				.keys
+				.contains_key(&historical_id)
+		);
+	}
+
+	#[test]
+	fn retire_tenant_kek_removes_unreferenced_historical_version() {
+		let tenant_id = TenantId::ZERO;
+		let historical_id = TenantKekId::try_from(6).unwrap();
+		let active_id = TenantKekId::try_from(7).unwrap();
+		let mut state = SmState::default();
+		seed_active_tenant(&mut state, tenant_id);
+		seed_two_version_keyset(&mut state, tenant_id, historical_id, active_id);
+
+		let (resp, _) = apply_request(
+			&mut state,
+			WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+				tenant_id,
+				tenant_kek_id: historical_id,
+			}),
+		);
+		assert_eq!(resp, WendelonResponse::Success);
+
+		let keyset = state.tenant_keysets.get(&tenant_id).unwrap();
+		assert_eq!(keyset.active_tenant_kek_id, Some(active_id));
+		assert!(!keyset.keys.contains_key(&historical_id));
+		assert!(keyset.keys.contains_key(&active_id));
 	}
 }

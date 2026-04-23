@@ -301,12 +301,13 @@ impl NodeBootstrapConfig {
 			));
 		}
 		#[cfg(feature = "fips")]
-		if matches!(self.root_kek_provider, RootKekProviderConfig::DevInsecure) {
+		if matches!(&self.root_kek_provider, RootKekProviderConfig::DevInsecure) {
 			return Err(Error::new(
 				ErrorKind::Unsupported,
 				"crypto.root_kek_provider=dev-insecure is disabled in fips builds",
 			));
 		}
+		self.root_kek_provider.validate()?;
 		self.crypto_cache.validate()?;
 		if self.group_commit.floor.is_zero() {
 			return Err(Error::new(
@@ -981,6 +982,11 @@ impl WendelonNode {
 			cfg.transfer_signing_secret,
 			&cfg.trusted_transfer_signers,
 		)?);
+		if matches!(&cfg.root_kek_provider, RootKekProviderConfig::DevInsecure) {
+			tracing::warn!(
+				"crypto.root_kek_provider=dev-insecure is enabled; this is a dev/test-only custody path and not a serious deployment boundary"
+			);
+		}
 
 		// 1. Shared buffer pool (HRFT frames + postcard bodies).
 		let pool = BufPool::new(256, 1024 * 1024);
@@ -1057,6 +1063,8 @@ impl WendelonNode {
 					l2_uri: tier.l2_uri,
 					payload_hash: tier.payload_hash,
 					is_encrypted: tier.is_encrypted,
+					tenant_id: tier.tenant_id,
+					tenant_kek_id: tier.tenant_kek_id,
 				},
 				recovered_log_index,
 			)
@@ -2655,6 +2663,8 @@ mod tests {
 				l2_uri,
 				payload_hash,
 				is_encrypted: true,
+				tenant_id: Some(tenant_id),
+				tenant_kek_id: Some(encrypted.tenant_kek_id),
 			}))
 			.await
 			.unwrap();
@@ -2740,6 +2750,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "sealed/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 		let first_report = sweeper.sweep_once().await.unwrap();
@@ -2791,7 +2802,27 @@ mod tests {
 			.unwrap();
 		let second_report = sweeper.sweep_once().await.unwrap();
 		assert!(second_report.tiered >= 1);
+		assert_eq!(second_report.rewrapped_tiered_deks, 1);
+		assert_eq!(second_report.dek_rewrap_failures, 0);
 		assert!(node.slab.is_tiered(filler_loc.slab_id).await);
+
+		let rewritten_old_pointer = node.slab.tier_pointer(old_loc.slab_id).await.unwrap();
+		assert_ne!(rewritten_old_pointer.l2_uri, old_pointer.l2_uri);
+		let rewritten_old_blob = object_store
+			.get(&rewritten_old_pointer.l2_uri)
+			.await
+			.unwrap();
+		let rewritten_old_footer = node
+			.crypto
+			.encrypted_footer_summary(&rewritten_old_blob)
+			.unwrap()
+			.expect("re-wrapped tiered object must remain envelope-encrypted");
+		assert_eq!(rewritten_old_footer.tenant_kek_id, rotated_kek_id);
+		assert_ne!(rewritten_old_footer.tenant_kek_id, old_footer.tenant_kek_id);
+		assert!(
+			object_store.get(&old_pointer.l2_uri).await.is_err(),
+			"old tenant-KEK object should be deleted after re-wrap"
+		);
 
 		let new_pointer = node.slab.tier_pointer(filler_loc.slab_id).await.unwrap();
 		let new_blob = object_store.get(&new_pointer.l2_uri).await.unwrap();

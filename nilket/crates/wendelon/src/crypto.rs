@@ -2,6 +2,8 @@ use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, Aud
 use crate::metrics::global as metrics;
 use crate::schema::{IdentityPrefix, NodeId, SlabId, TenantId, TenantKekId};
 use async_trait::async_trait;
+use base64::Engine as _;
+use chrono::Utc;
 #[cfg(all(feature = "fips", feature = "non-fips"))]
 compile_error!("features `fips` and `non-fips` are mutually exclusive");
 #[cfg(not(any(feature = "fips", feature = "non-fips")))]
@@ -11,19 +13,18 @@ use aws_lc_rs::aead::AES_256_GCM_SIV;
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::hmac;
 use aws_lc_rs::key_wrap::{AES_256, AesKek, KeyWrapPadded};
+use reqwest::Url;
+use scrypt::{Params as ScryptParams, scrypt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-#[cfg(any(test, not(feature = "fips")))]
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::io::{Error, ErrorKind};
-#[cfg(any(test, not(feature = "fips")))]
 use std::io::{Read, Write};
 use std::ops::Range;
-#[cfg(all(unix, any(test, not(feature = "fips"))))]
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-#[cfg(any(test, not(feature = "fips")))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -64,6 +65,32 @@ const PARALLEL_CHUNK_CRYPTO_MAX_WORKERS: usize = 8;
 const DEV_INSECURE_ROOT_KEK_DIR: &str = ".wendelon";
 #[cfg(any(test, not(feature = "fips")))]
 const DEV_INSECURE_ROOT_KEK_FILE: &str = "dev-root-kek.bin";
+const LOCAL_SEALED_ROOT_KEK_DIR: &str = ".wendelon";
+const LOCAL_SEALED_ROOT_KEK_FILE: &str = "local-sealed-root-kek.bin";
+const LOCAL_SEALED_ROOT_KEK_MAGIC: [u8; 8] = *b"WENDLKEK";
+const LOCAL_SEALED_ROOT_KEK_VERSION: u32 = 1;
+const LOCAL_SEALED_ROOT_KEK_SALT_BYTES: usize = 32;
+const LOCAL_SEALED_ROOT_KEK_NONCE_BYTES: usize = 12;
+const LOCAL_SEALED_ROOT_KEK_CIPHERTEXT_BYTES: usize = 32 + 16;
+const LOCAL_SEALED_ROOT_KEK_TOTAL_BYTES: usize = LOCAL_SEALED_ROOT_KEK_MAGIC.len()
+	+ 4 + LOCAL_SEALED_ROOT_KEK_SALT_BYTES
+	+ LOCAL_SEALED_ROOT_KEK_NONCE_BYTES
+	+ LOCAL_SEALED_ROOT_KEK_CIPHERTEXT_BYTES;
+const LOCAL_SEALED_ROOT_KEK_SCRYPT_LOG_N: u8 = 15;
+const LOCAL_SEALED_ROOT_KEK_SCRYPT_R: u32 = 8;
+const LOCAL_SEALED_ROOT_KEK_SCRYPT_P: u32 = 1;
+const LOCAL_SEALED_ROOT_KEK_AAD: &[u8] = b"wendelon.local-sealed.root-kek.v1";
+const AWS_KMS_ROOT_KEK_DIR: &str = ".wendelon";
+const AWS_KMS_ROOT_KEK_FILE: &str = "aws-kms-root-kek.bin";
+const AWS_KMS_ROOT_KEK_MAGIC: [u8; 8] = *b"WENDAKMS";
+const AWS_KMS_ROOT_KEK_VERSION: u32 = 1;
+const AWS_KMS_SERVICE: &str = "kms";
+const AWS_KMS_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
+const AWS_KMS_TIMEOUT_SECS: u64 = 5;
+pub const DEFAULT_LOCAL_SEALED_ROOT_KEK_SECRET_ENV: &str = "WENDELON_ROOT_KEK_SECRET";
+pub const DEFAULT_AWS_KMS_ACCESS_KEY_ID_ENV: &str = "AWS_ACCESS_KEY_ID";
+pub const DEFAULT_AWS_KMS_SECRET_ACCESS_KEY_ENV: &str = "AWS_SECRET_ACCESS_KEY";
+pub const DEFAULT_AWS_KMS_SESSION_TOKEN_ENV: &str = "AWS_SESSION_TOKEN";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -99,21 +126,683 @@ impl CipherId {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootKekProviderConfig {
-	#[default]
 	DevInsecure,
+	LocalSealed(LocalSealedRootKekConfig),
+	AwsKms(AwsKmsRootKekConfig),
+	Pkcs11(Pkcs11RootKekConfig),
 }
 
-impl RootKekProviderConfig {
-	pub fn label(self) -> &'static str {
+impl Default for RootKekProviderConfig {
+	fn default() -> Self {
+		Self::LocalSealed(LocalSealedRootKekConfig::default())
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalSealedRootKekConfig {
+	#[serde(default)]
+	pub unlock_secret_env: Option<String>,
+	#[serde(default)]
+	pub unlock_secret_file: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsKmsRootKekConfig {
+	pub region: String,
+	pub key_id: String,
+	#[serde(default)]
+	pub endpoint: Option<String>,
+	#[serde(default = "default_aws_kms_access_key_id_env")]
+	pub access_key_id_env: String,
+	#[serde(default = "default_aws_kms_secret_access_key_env")]
+	pub secret_access_key_env: String,
+	#[serde(default = "default_aws_kms_session_token_env")]
+	pub session_token_env: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pkcs11RootKekConfig {
+	pub library_path: PathBuf,
+	pub token_label: String,
+	pub key_label: String,
+	pub pin_env: String,
+	#[serde(default)]
+	pub slot: Option<u64>,
+}
+
+impl Default for LocalSealedRootKekConfig {
+	fn default() -> Self {
+		Self {
+			unlock_secret_env: Some(DEFAULT_LOCAL_SEALED_ROOT_KEK_SECRET_ENV.into()),
+			unlock_secret_file: None,
+		}
+	}
+}
+
+fn default_aws_kms_access_key_id_env() -> String {
+	DEFAULT_AWS_KMS_ACCESS_KEY_ID_ENV.into()
+}
+
+fn default_aws_kms_secret_access_key_env() -> String {
+	DEFAULT_AWS_KMS_SECRET_ACCESS_KEY_ENV.into()
+}
+
+fn default_aws_kms_session_token_env() -> String {
+	DEFAULT_AWS_KMS_SESSION_TOKEN_ENV.into()
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum RootKekProviderConfigWire {
+	Label(String),
+	Structured {
+		kind: String,
+		#[serde(default)]
+		unlock_secret_env: Option<String>,
+		#[serde(default)]
+		unlock_secret_file: Option<PathBuf>,
+		#[serde(default)]
+		region: Option<String>,
+		#[serde(default)]
+		key_id: Option<String>,
+		#[serde(default)]
+		endpoint: Option<String>,
+		#[serde(default)]
+		access_key_id_env: Option<String>,
+		#[serde(default)]
+		secret_access_key_env: Option<String>,
+		#[serde(default)]
+		session_token_env: Option<String>,
+		#[serde(default)]
+		library_path: Option<PathBuf>,
+		#[serde(default)]
+		token_label: Option<String>,
+		#[serde(default)]
+		key_label: Option<String>,
+		#[serde(default)]
+		pin_env: Option<String>,
+		#[serde(default)]
+		slot: Option<u64>,
+	},
+}
+
+impl Serialize for RootKekProviderConfig {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
 		match self {
-			Self::DevInsecure => "dev-insecure",
+			Self::DevInsecure => RootKekProviderConfigWire::Label("dev-insecure".into()),
+			Self::LocalSealed(cfg) => RootKekProviderConfigWire::Structured {
+				kind: "local-sealed".into(),
+				unlock_secret_env: cfg.unlock_secret_env.clone(),
+				unlock_secret_file: cfg.unlock_secret_file.clone(),
+				region: None,
+				key_id: None,
+				endpoint: None,
+				access_key_id_env: None,
+				secret_access_key_env: None,
+				session_token_env: None,
+				library_path: None,
+				token_label: None,
+				key_label: None,
+				pin_env: None,
+				slot: None,
+			},
+			Self::AwsKms(cfg) => RootKekProviderConfigWire::Structured {
+				kind: "aws-kms".into(),
+				unlock_secret_env: None,
+				unlock_secret_file: None,
+				region: Some(cfg.region.clone()),
+				key_id: Some(cfg.key_id.clone()),
+				endpoint: cfg.endpoint.clone(),
+				access_key_id_env: Some(cfg.access_key_id_env.clone()),
+				secret_access_key_env: Some(cfg.secret_access_key_env.clone()),
+				session_token_env: Some(cfg.session_token_env.clone()),
+				library_path: None,
+				token_label: None,
+				key_label: None,
+				pin_env: None,
+				slot: None,
+			},
+			Self::Pkcs11(cfg) => RootKekProviderConfigWire::Structured {
+				kind: "pkcs11".into(),
+				unlock_secret_env: None,
+				unlock_secret_file: None,
+				region: None,
+				key_id: None,
+				endpoint: None,
+				access_key_id_env: None,
+				secret_access_key_env: None,
+				session_token_env: None,
+				library_path: Some(cfg.library_path.clone()),
+				token_label: Some(cfg.token_label.clone()),
+				key_label: Some(cfg.key_label.clone()),
+				pin_env: Some(cfg.pin_env.clone()),
+				slot: cfg.slot,
+			},
+		}
+		.serialize(serializer)
+	}
+}
+
+impl<'de> Deserialize<'de> for RootKekProviderConfig {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		match RootKekProviderConfigWire::deserialize(deserializer)? {
+			RootKekProviderConfigWire::Label(label) => match label.as_str() {
+				"dev-insecure" => Ok(Self::DevInsecure),
+				"local-sealed" => Err(serde::de::Error::custom(
+					"crypto.root_kek_provider=local-sealed requires object form with unlock_secret_env or unlock_secret_file",
+				)),
+				other => Err(serde::de::Error::custom(format!(
+					"unknown crypto.root_kek_provider '{other}'"
+				))),
+			},
+			RootKekProviderConfigWire::Structured {
+				kind,
+				unlock_secret_env,
+				unlock_secret_file,
+				region,
+				key_id,
+				endpoint,
+				access_key_id_env,
+				secret_access_key_env,
+				session_token_env,
+				library_path,
+				token_label,
+				key_label,
+				pin_env,
+				slot,
+			} => {
+				match kind.as_str() {
+					"dev-insecure" => {
+						if unlock_secret_env.is_some()
+							|| unlock_secret_file.is_some()
+							|| region.is_some() || key_id.is_some()
+							|| endpoint.is_some() || access_key_id_env.is_some()
+							|| secret_access_key_env.is_some()
+							|| session_token_env.is_some()
+							|| library_path.is_some()
+							|| token_label.is_some()
+							|| key_label.is_some()
+							|| pin_env.is_some() || slot.is_some()
+						{
+							return Err(serde::de::Error::custom(
+								"crypto.root_kek_provider kind=dev-insecure does not accept provider-specific fields",
+							));
+						}
+						Ok(Self::DevInsecure)
+					}
+					"local-sealed" => {
+						if region.is_some()
+							|| key_id.is_some() || endpoint.is_some()
+							|| access_key_id_env.is_some()
+							|| secret_access_key_env.is_some()
+							|| session_token_env.is_some()
+							|| library_path.is_some()
+							|| token_label.is_some()
+							|| key_label.is_some()
+							|| pin_env.is_some() || slot.is_some()
+						{
+							return Err(serde::de::Error::custom(
+								"crypto.root_kek_provider kind=local-sealed does not accept aws-kms or pkcs11 fields",
+							));
+						}
+						Ok(Self::LocalSealed(LocalSealedRootKekConfig {
+							unlock_secret_env,
+							unlock_secret_file,
+						}))
+					}
+					"aws-kms" => {
+						if unlock_secret_env.is_some()
+							|| unlock_secret_file.is_some()
+							|| library_path.is_some()
+							|| token_label.is_some()
+							|| key_label.is_some()
+							|| pin_env.is_some() || slot.is_some()
+						{
+							return Err(serde::de::Error::custom(
+								"crypto.root_kek_provider kind=aws-kms does not accept local-sealed or pkcs11 fields",
+							));
+						}
+						let region = region.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=aws-kms requires region",
+							)
+						})?;
+						let key_id = key_id.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=aws-kms requires key_id",
+							)
+						})?;
+						Ok(Self::AwsKms(AwsKmsRootKekConfig {
+							region,
+							key_id,
+							endpoint,
+							access_key_id_env: access_key_id_env
+								.unwrap_or_else(default_aws_kms_access_key_id_env),
+							secret_access_key_env: secret_access_key_env
+								.unwrap_or_else(default_aws_kms_secret_access_key_env),
+							session_token_env: session_token_env
+								.unwrap_or_else(default_aws_kms_session_token_env),
+						}))
+					}
+					"pkcs11" => {
+						if unlock_secret_env.is_some()
+							|| unlock_secret_file.is_some()
+							|| region.is_some() || key_id.is_some()
+							|| endpoint.is_some() || access_key_id_env.is_some()
+							|| secret_access_key_env.is_some()
+							|| session_token_env.is_some()
+						{
+							return Err(serde::de::Error::custom(
+								"crypto.root_kek_provider kind=pkcs11 does not accept local-sealed or aws-kms fields",
+							));
+						}
+						let library_path = library_path.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=pkcs11 requires library_path",
+							)
+						})?;
+						let token_label = token_label.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=pkcs11 requires token_label",
+							)
+						})?;
+						let key_label = key_label.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=pkcs11 requires key_label",
+							)
+						})?;
+						let pin_env = pin_env.ok_or_else(|| {
+							serde::de::Error::custom(
+								"crypto.root_kek_provider kind=pkcs11 requires pin_env",
+							)
+						})?;
+						Ok(Self::Pkcs11(Pkcs11RootKekConfig {
+							library_path,
+							token_label,
+							key_label,
+							pin_env,
+							slot,
+						}))
+					}
+					other => Err(serde::de::Error::custom(format!(
+						"unknown crypto.root_kek_provider kind '{other}'"
+					))),
+				}
+			}
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootKekBootstrapMode {
+	GenerateOrCreate,
+	EnrollExisting,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootKekProviderHealth {
+	pub ready: bool,
+	pub detail: Option<String>,
+}
+
+impl RootKekProviderHealth {
+	pub fn ready() -> Self {
+		Self {
+			ready: true,
+			detail: None,
 		}
 	}
 
-	pub(crate) fn build(self, _data_dir: &Path) -> std::io::Result<Arc<dyn RootKekProvider>> {
+	pub fn degraded(detail: impl Into<String>) -> Self {
+		Self {
+			ready: false,
+			detail: Some(detail.into()),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootKekProviderInit<'a> {
+	data_dir: &'a Path,
+	bootstrap_mode: RootKekBootstrapMode,
+}
+
+impl<'a> RootKekProviderInit<'a> {
+	fn generate_or_create(data_dir: &'a Path) -> Self {
+		Self {
+			data_dir,
+			bootstrap_mode: RootKekBootstrapMode::GenerateOrCreate,
+		}
+	}
+}
+
+impl LocalSealedRootKekConfig {
+	pub(crate) fn absolutize_from_config_dir(&mut self, config_path: &Path) {
+		if let Some(path) = self.unlock_secret_file.as_mut() {
+			if !path.is_absolute() {
+				*path = config_path
+					.parent()
+					.unwrap_or_else(|| Path::new("."))
+					.join(&*path);
+			}
+		}
+	}
+
+	fn validate(&self) -> std::io::Result<()> {
+		match (
+			self.unlock_secret_env.as_deref(),
+			self.unlock_secret_file.as_ref(),
+		) {
+			(Some(env), None) => {
+				if env.trim().is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						"crypto.root_kek_provider.unlock_secret_env must not be empty",
+					));
+				}
+				if std::env::var_os(env).is_none() {
+					return Err(Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"crypto.root_kek_provider.unlock_secret_env '{}' is not set",
+							env
+						),
+					));
+				}
+				Ok(())
+			}
+			(None, Some(path)) => {
+				if !path.is_file() {
+					return Err(Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"crypto.root_kek_provider.unlock_secret_file is not an existing file: {}",
+							path.display()
+						),
+					));
+				}
+				Ok(())
+			}
+			(Some(_), Some(_)) => Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider local-sealed requires exactly one of unlock_secret_env or unlock_secret_file",
+			)),
+			(None, None) => Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider local-sealed requires unlock_secret_env or unlock_secret_file",
+			)),
+		}
+	}
+
+	fn load_unlock_secret(&self) -> std::io::Result<Zeroizing<Vec<u8>>> {
+		match (
+			self.unlock_secret_env.as_deref(),
+			self.unlock_secret_file.as_ref(),
+		) {
+			(Some(env), None) => {
+				let secret = std::env::var(env).map_err(|error| {
+					Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"failed to load crypto.root_kek_provider.unlock_secret_env '{}': {error}",
+							env
+						),
+					)
+				})?;
+				let secret = Zeroizing::new(secret.into_bytes());
+				if secret.is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!(
+							"crypto.root_kek_provider.unlock_secret_env '{}' must not be empty",
+							env
+						),
+					));
+				}
+				Ok(secret)
+			}
+			(None, Some(path)) => {
+				let secret = Zeroizing::new(std::fs::read(path).map_err(|error| {
+					Error::new(
+						error.kind(),
+						format!(
+							"failed to read crypto.root_kek_provider.unlock_secret_file {}: {error}",
+							path.display()
+						),
+					)
+				})?);
+				if secret.is_empty() {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!(
+							"crypto.root_kek_provider.unlock_secret_file {} must not be empty",
+							path.display()
+						),
+					));
+				}
+				Ok(secret)
+			}
+			(Some(_), Some(_)) => Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider local-sealed requires exactly one of unlock_secret_env or unlock_secret_file",
+			)),
+			(None, None) => Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider local-sealed requires unlock_secret_env or unlock_secret_file",
+			)),
+		}
+	}
+}
+
+impl AwsKmsRootKekConfig {
+	fn validate(&self) -> std::io::Result<()> {
+		if self.region.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider.region must not be empty for aws-kms",
+			));
+		}
+		if self.key_id.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"crypto.root_kek_provider.key_id must not be empty for aws-kms",
+			));
+		}
+		for (field, value) in [
+			("access_key_id_env", self.access_key_id_env.as_str()),
+			("secret_access_key_env", self.secret_access_key_env.as_str()),
+			("session_token_env", self.session_token_env.as_str()),
+		] {
+			if value.trim().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!("crypto.root_kek_provider.{field} must not be empty for aws-kms"),
+				));
+			}
+		}
+		if let Some(endpoint) = self.endpoint.as_deref() {
+			let url = Url::parse(endpoint).map_err(|error| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"crypto.root_kek_provider.endpoint is not a valid URL for aws-kms: {error}"
+					),
+				)
+			})?;
+			match url.scheme() {
+				"http" | "https" => {}
+				other => {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!(
+							"crypto.root_kek_provider.endpoint for aws-kms must use http or https, got '{other}'"
+						),
+					));
+				}
+			}
+			if url.host_str().is_none() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"crypto.root_kek_provider.endpoint for aws-kms must include a host",
+				));
+			}
+			if url.path() != "/" && !url.path().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"crypto.root_kek_provider.endpoint for aws-kms must not include a path",
+				));
+			}
+		}
+		Ok(())
+	}
+
+	fn load_credentials(&self) -> std::io::Result<AwsKmsCredentials> {
+		let access_key_id = std::env::var(&self.access_key_id_env).map_err(|error| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"failed to load crypto.root_kek_provider.access_key_id_env '{}': {error}",
+					self.access_key_id_env
+				),
+			)
+		})?;
+		if access_key_id.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"crypto.root_kek_provider.access_key_id_env '{}' must not be empty",
+					self.access_key_id_env
+				),
+			));
+		}
+		let secret_access_key = std::env::var(&self.secret_access_key_env).map_err(|error| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"failed to load crypto.root_kek_provider.secret_access_key_env '{}': {error}",
+					self.secret_access_key_env
+				),
+			)
+		})?;
+		if secret_access_key.trim().is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"crypto.root_kek_provider.secret_access_key_env '{}' must not be empty",
+					self.secret_access_key_env
+				),
+			));
+		}
+		let session_token = match std::env::var(&self.session_token_env) {
+			Ok(value) if !value.trim().is_empty() => Some(value),
+			Ok(_) => None,
+			Err(std::env::VarError::NotPresent) => None,
+			Err(error) => {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"failed to load crypto.root_kek_provider.session_token_env '{}': {error}",
+						self.session_token_env
+					),
+				));
+			}
+		};
+		Ok(AwsKmsCredentials {
+			access_key_id,
+			secret_access_key,
+			session_token,
+		})
+	}
+}
+
+impl Pkcs11RootKekConfig {
+	pub(crate) fn absolutize_from_config_dir(&mut self, config_path: &Path) {
+		if !self.library_path.is_absolute() {
+			self.library_path = config_path
+				.parent()
+				.unwrap_or_else(|| Path::new("."))
+				.join(&self.library_path);
+		}
+	}
+
+	fn validate(&self) -> std::io::Result<()> {
+		if !self.library_path.is_file() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"crypto.root_kek_provider.library_path is not an existing file for pkcs11: {}",
+					self.library_path.display()
+				),
+			));
+		}
+		for (field, value) in [
+			("token_label", self.token_label.as_str()),
+			("key_label", self.key_label.as_str()),
+			("pin_env", self.pin_env.as_str()),
+		] {
+			if value.trim().is_empty() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!("crypto.root_kek_provider.{field} must not be empty for pkcs11"),
+				));
+			}
+		}
+		if std::env::var_os(&self.pin_env).is_none() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"crypto.root_kek_provider.pin_env '{}' is not set for pkcs11",
+					self.pin_env
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
+impl RootKekProviderConfig {
+	pub fn label(&self) -> &'static str {
+		match self {
+			Self::DevInsecure => "dev-insecure",
+			Self::LocalSealed(_) => "local-sealed",
+			Self::AwsKms(_) => "aws-kms",
+			Self::Pkcs11(_) => "pkcs11",
+		}
+	}
+
+	pub(crate) fn absolutize_from_config_dir(&mut self, config_path: &Path) {
+		match self {
+			Self::LocalSealed(cfg) => cfg.absolutize_from_config_dir(config_path),
+			Self::Pkcs11(cfg) => cfg.absolutize_from_config_dir(config_path),
+			Self::DevInsecure | Self::AwsKms(_) => {}
+		}
+	}
+
+	pub(crate) fn validate(&self) -> std::io::Result<()> {
+		match self {
+			Self::DevInsecure => Ok(()),
+			Self::LocalSealed(cfg) => cfg.validate(),
+			Self::AwsKms(cfg) => cfg.validate(),
+			Self::Pkcs11(cfg) => cfg.validate(),
+		}
+	}
+
+	pub(crate) fn build(&self, data_dir: &Path) -> std::io::Result<Arc<dyn RootKekProvider>> {
+		self.initialize(RootKekProviderInit::generate_or_create(data_dir))
+	}
+
+	pub(crate) fn initialize(
+		&self,
+		init: RootKekProviderInit<'_>,
+	) -> std::io::Result<Arc<dyn RootKekProvider>> {
 		match self {
 			Self::DevInsecure => {
 				#[cfg(feature = "fips")]
@@ -125,11 +814,22 @@ impl RootKekProviderConfig {
 				}
 				#[cfg(not(feature = "fips"))]
 				{
-					Ok(Arc::new(DevRootKekProvider::from_dev_insecure_dir(
-						_data_dir,
-					)?))
+					Ok(Arc::new(DevRootKekProvider::initialize(init)?))
 				}
 			}
+			Self::LocalSealed(cfg) => {
+				Ok(Arc::new(LocalSealedRootKekProvider::initialize(init, cfg)?))
+			}
+			Self::AwsKms(cfg) => Ok(Arc::new(AwsKmsRootKekProvider::initialize(init, cfg)?)),
+			Self::Pkcs11(cfg) => Err(Error::new(
+				ErrorKind::Unsupported,
+				format!(
+					"crypto.root_kek_provider=pkcs11 is not implemented yet; provider seam only (library_path='{}', token_label='{}', key_label='{}')",
+					cfg.library_path.display(),
+					cfg.token_label,
+					cfg.key_label,
+				),
+			)),
 		}
 	}
 }
@@ -214,9 +914,16 @@ pub struct InstallTenantKekVersion {
 	pub wrapped_tenant_kek: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireTenantKekVersion {
+	pub tenant_id: TenantId,
+	pub tenant_kek_id: TenantKekId,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedTieredSlab {
 	pub bytes: Vec<u8>,
+	pub tenant_id: TenantId,
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
 	pub chunk_count: u32,
@@ -394,6 +1101,10 @@ impl CryptoManager {
 
 	pub fn root_kek_provider_label(&self) -> &'static str {
 		self.root_kek.label()
+	}
+
+	pub fn root_kek_provider_health(&self) -> std::io::Result<RootKekProviderHealth> {
+		self.root_kek.health()
 	}
 
 	pub fn mlock_status_label(&self) -> &'static str {
@@ -616,6 +1327,7 @@ impl CryptoManager {
 
 		Ok(EncryptedTieredSlab {
 			bytes: out,
+			tenant_id: metadata.tenant_id,
 			tenant_kek_id,
 			cipher_id,
 			chunk_count,
@@ -2492,8 +3204,20 @@ fn parse_encrypted_footer_from_tail_window(
 
 pub(crate) trait RootKekProvider: Send + Sync {
 	fn label(&self) -> &'static str;
+	fn health(&self) -> std::io::Result<RootKekProviderHealth>;
 	fn wrap_tenant_kek(&self, plaintext_key: &KeyMaterialBytes) -> std::io::Result<Vec<u8>>;
 	fn unwrap_tenant_kek(&self, wrapped_key: &[u8]) -> std::io::Result<KeyMaterialBytes>;
+
+	#[allow(dead_code)]
+	fn rotate_root_kek(&self) -> std::io::Result<()> {
+		Err(Error::new(
+			ErrorKind::Unsupported,
+			format!(
+				"root KEK provider '{}' does not support in-place root KEK rotation",
+				self.label()
+			),
+		))
+	}
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -2526,6 +3250,554 @@ impl AsRef<[u8]> for KeyMaterialBytes {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+struct AwsKmsCredentials {
+	access_key_id: String,
+	secret_access_key: String,
+	session_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AwsKmsRootKekEnvelope {
+	region: String,
+	key_id: String,
+	ciphertext_blob: Vec<u8>,
+}
+
+struct AwsKmsClient {
+	http: reqwest::blocking::Client,
+	endpoint: Url,
+	region: String,
+	key_id: String,
+	credentials: AwsKmsCredentials,
+}
+
+impl AwsKmsClient {
+	fn new(cfg: &AwsKmsRootKekConfig, credentials: AwsKmsCredentials) -> std::io::Result<Self> {
+		let endpoint = match cfg.endpoint.as_deref() {
+			Some(endpoint) => Url::parse(endpoint),
+			None => Url::parse(&format!("https://kms.{}.amazonaws.com/", cfg.region)),
+		}
+		.map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("failed to construct aws-kms endpoint URL: {error}"),
+			)
+		})?;
+		let http = reqwest::blocking::Client::builder()
+			.timeout(Duration::from_secs(AWS_KMS_TIMEOUT_SECS))
+			.build()
+			.map_err(|error| {
+				Error::other(format!("failed to construct aws-kms client: {error}"))
+			})?;
+		Ok(Self {
+			http,
+			endpoint,
+			region: cfg.region.clone(),
+			key_id: cfg.key_id.clone(),
+			credentials,
+		})
+	}
+
+	fn encrypt_root_kek(&self, plaintext: &KeyMaterialBytes) -> std::io::Result<Vec<u8>> {
+		let request = serde_json::json!({
+			"KeyId": self.key_id,
+			"Plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext.as_ref()),
+			"EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
+		});
+		let response: AwsKmsEncryptResponse = self.call("TrentService.Encrypt", &request)?;
+		base64::engine::general_purpose::STANDARD
+			.decode(response.ciphertext_blob)
+			.map_err(|error| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"aws-kms encrypt response contained invalid base64 ciphertext: {error}"
+					),
+				)
+			})
+	}
+
+	fn decrypt_root_kek(&self, ciphertext_blob: &[u8]) -> std::io::Result<KeyMaterialBytes> {
+		let request = serde_json::json!({
+			"CiphertextBlob": base64::engine::general_purpose::STANDARD.encode(ciphertext_blob),
+			"KeyId": self.key_id,
+			"EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
+		});
+		let response: AwsKmsDecryptResponse = self.call("TrentService.Decrypt", &request)?;
+		let plaintext = Zeroizing::new(
+			base64::engine::general_purpose::STANDARD
+				.decode(response.plaintext.as_bytes())
+				.map_err(|error| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"aws-kms decrypt response contained invalid base64 plaintext: {error}"
+						),
+					)
+				})?,
+		);
+		KeyMaterialBytes::copy_from_slice(plaintext.as_ref(), "aws-kms root KEK plaintext")
+	}
+
+	fn describe_key(&self) -> std::io::Result<RootKekProviderHealth> {
+		let request = serde_json::json!({
+			"KeyId": self.key_id,
+		});
+		let response: AwsKmsDescribeKeyResponse =
+			self.call("TrentService.DescribeKey", &request)?;
+		let metadata = response.key_metadata;
+		if metadata.enabled {
+			Ok(RootKekProviderHealth::ready())
+		} else {
+			Ok(RootKekProviderHealth::degraded(format!(
+				"aws-kms key '{}' is not enabled (state={})",
+				metadata.key_id.unwrap_or_else(|| self.key_id.clone()),
+				metadata.key_state.unwrap_or_else(|| "Unknown".into())
+			)))
+		}
+	}
+
+	fn call<T>(&self, target: &str, payload: &serde_json::Value) -> std::io::Result<T>
+	where
+		T: for<'de> Deserialize<'de>,
+	{
+		let body = serde_json::to_vec(payload).map_err(|error| {
+			Error::other(format!("failed to encode aws-kms request body: {error}"))
+		})?;
+		let now = Utc::now();
+		let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+		let date_scope = now.format("%Y%m%d").to_string();
+		let payload_hash = bytes_to_hex(&crate::hash::sha256::digest(&body));
+		let host = host_header_value(&self.endpoint)?;
+		let mut headers = vec![
+			("content-type".to_string(), AWS_KMS_CONTENT_TYPE.to_string()),
+			("host".to_string(), host.clone()),
+			("x-amz-date".to_string(), amz_date.clone()),
+			("x-amz-target".to_string(), target.to_string()),
+		];
+		if let Some(token) = self.credentials.session_token.as_deref() {
+			headers.push(("x-amz-security-token".to_string(), token.to_string()));
+		}
+		headers.sort_by(|a, b| a.0.cmp(&b.0));
+		let canonical_headers = headers
+			.iter()
+			.map(|(name, value)| format!("{name}:{}\n", canonicalize_header_value(value)))
+			.collect::<String>();
+		let signed_headers = headers
+			.iter()
+			.map(|(name, _)| name.as_str())
+			.collect::<Vec<_>>()
+			.join(";");
+		let canonical_request =
+			format!("POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+		let canonical_request_hash =
+			bytes_to_hex(&crate::hash::sha256::digest(canonical_request.as_bytes()));
+		let credential_scope = format!(
+			"{date_scope}/{}/{}/aws4_request",
+			self.region, AWS_KMS_SERVICE
+		);
+		let string_to_sign =
+			format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
+		let signing_key = derive_aws_sigv4_signing_key(
+			self.credentials.secret_access_key.as_bytes(),
+			&date_scope,
+			&self.region,
+			AWS_KMS_SERVICE,
+		)?;
+		let signature =
+			bytes_to_hex(aws_hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes()).as_ref());
+		let authorization = format!(
+			"AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+			self.credentials.access_key_id, credential_scope, signed_headers, signature
+		);
+
+		let mut request = self
+			.http
+			.post(self.endpoint.clone())
+			.header("content-type", AWS_KMS_CONTENT_TYPE)
+			.header("x-amz-date", amz_date)
+			.header("x-amz-target", target)
+			.header("authorization", authorization)
+			.header("host", host);
+		if let Some(token) = self.credentials.session_token.as_deref() {
+			request = request.header("x-amz-security-token", token);
+		}
+		let response = request
+			.body(body)
+			.send()
+			.map_err(|error| Error::other(format!("aws-kms request failed: {error}")))?;
+		let status = response.status();
+		let body = response.bytes().map_err(|error| {
+			Error::other(format!("failed to read aws-kms response body: {error}"))
+		})?;
+		if !status.is_success() {
+			return Err(map_aws_kms_error(status.as_u16(), &body));
+		}
+		serde_json::from_slice(&body).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("failed to decode aws-kms response: {error}"),
+			)
+		})
+	}
+}
+
+struct AwsKmsRootKekProvider {
+	key: LockedKeyMaterial,
+	client: AwsKmsClient,
+}
+
+impl AwsKmsRootKekProvider {
+	fn initialize(
+		init: RootKekProviderInit<'_>,
+		cfg: &AwsKmsRootKekConfig,
+	) -> std::io::Result<Self> {
+		let credentials = cfg.load_credentials()?;
+		let client = AwsKmsClient::new(cfg, credentials)?;
+		let path = aws_kms_root_kek_path(init.data_dir);
+		let key = match init.bootstrap_mode {
+			RootKekBootstrapMode::GenerateOrCreate => {
+				match read_aws_kms_root_kek_envelope(&path, cfg) {
+					Ok(envelope) => client.decrypt_root_kek(&envelope.ciphertext_blob)?,
+					Err(error) if error.kind() == ErrorKind::NotFound => {
+						let key = KeyMaterialBytes::random()?;
+						let ciphertext_blob = client.encrypt_root_kek(&key)?;
+						let envelope = AwsKmsRootKekEnvelope {
+							region: cfg.region.clone(),
+							key_id: cfg.key_id.clone(),
+							ciphertext_blob,
+						};
+						match persist_new_aws_kms_root_kek_envelope(&path, &envelope) {
+							Ok(()) => key,
+							Err(persist_error)
+								if persist_error.kind() == ErrorKind::AlreadyExists =>
+							{
+								let envelope = read_aws_kms_root_kek_envelope(&path, cfg)?;
+								client.decrypt_root_kek(&envelope.ciphertext_blob)?
+							}
+							Err(persist_error) => {
+								return Err(Error::new(
+									persist_error.kind(),
+									format!(
+										"failed to persist aws-kms root KEK envelope at {}: {persist_error}",
+										path.display()
+									),
+								));
+							}
+						}
+					}
+					Err(error) => {
+						return Err(Error::new(
+							error.kind(),
+							format!(
+								"failed to read aws-kms root KEK envelope at {}: {error}",
+								path.display()
+							),
+						));
+					}
+				}
+			}
+			RootKekBootstrapMode::EnrollExisting => {
+				let envelope = read_aws_kms_root_kek_envelope(&path, cfg).map_err(|error| {
+					Error::new(
+						error.kind(),
+						format!(
+							"failed to enroll existing aws-kms root KEK envelope from {}: {error}",
+							path.display()
+						),
+					)
+				})?;
+				client.decrypt_root_kek(&envelope.ciphertext_blob)?
+			}
+		};
+		Ok(Self {
+			key: LockedKeyMaterial::new(key)?,
+			client,
+		})
+	}
+}
+
+fn aws_kms_root_kek_path(data_dir: &Path) -> PathBuf {
+	data_dir
+		.join(AWS_KMS_ROOT_KEK_DIR)
+		.join(AWS_KMS_ROOT_KEK_FILE)
+}
+
+fn read_aws_kms_root_kek_envelope(
+	path: &Path,
+	cfg: &AwsKmsRootKekConfig,
+) -> std::io::Result<AwsKmsRootKekEnvelope> {
+	let mut file = OpenOptions::new().read(true).open(path)?;
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	if bytes.len() < AWS_KMS_ROOT_KEK_MAGIC.len() + 12 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("aws-kms root KEK file {} is truncated", path.display()),
+		));
+	}
+	if bytes[..AWS_KMS_ROOT_KEK_MAGIC.len()] != AWS_KMS_ROOT_KEK_MAGIC {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"aws-kms root KEK file {} has invalid magic header",
+				path.display()
+			),
+		));
+	}
+	let mut cursor = AWS_KMS_ROOT_KEK_MAGIC.len();
+	let version = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().expect("slice len"));
+	cursor += 4;
+	if version != AWS_KMS_ROOT_KEK_VERSION {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"aws-kms root KEK file {} has unsupported version {version}",
+				path.display()
+			),
+		));
+	}
+	let region_len =
+		u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().expect("slice len")) as usize;
+	cursor += 2;
+	let key_id_len =
+		u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().expect("slice len")) as usize;
+	cursor += 2;
+	let ciphertext_len =
+		u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().expect("slice len")) as usize;
+	cursor += 4;
+	let expected_len = cursor + region_len + key_id_len + ciphertext_len;
+	if bytes.len() != expected_len {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"aws-kms root KEK file {} has invalid length {}; expected {} bytes",
+				path.display(),
+				bytes.len(),
+				expected_len
+			),
+		));
+	}
+	let region =
+		String::from_utf8(bytes[cursor..cursor + region_len].to_vec()).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"aws-kms root KEK file {} has invalid region bytes: {error}",
+					path.display()
+				),
+			)
+		})?;
+	cursor += region_len;
+	let key_id =
+		String::from_utf8(bytes[cursor..cursor + key_id_len].to_vec()).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"aws-kms root KEK file {} has invalid key-id bytes: {error}",
+					path.display()
+				),
+			)
+		})?;
+	cursor += key_id_len;
+	if region != cfg.region || key_id != cfg.key_id {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"aws-kms root KEK file {} was sealed for region='{}' key_id='{}', but config selected region='{}' key_id='{}'",
+				path.display(),
+				region,
+				key_id,
+				cfg.region,
+				cfg.key_id
+			),
+		));
+	}
+	Ok(AwsKmsRootKekEnvelope {
+		region,
+		key_id,
+		ciphertext_blob: bytes[cursor..].to_vec(),
+	})
+}
+
+fn persist_new_aws_kms_root_kek_envelope(
+	path: &Path,
+	envelope: &AwsKmsRootKekEnvelope,
+) -> std::io::Result<()> {
+	let region_bytes = envelope.region.as_bytes();
+	let key_id_bytes = envelope.key_id.as_bytes();
+	let region_len = u16::try_from(region_bytes.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"aws-kms region exceeds u16::MAX bytes",
+		)
+	})?;
+	let key_id_len = u16::try_from(key_id_bytes.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"aws-kms key_id exceeds u16::MAX bytes",
+		)
+	})?;
+	let ciphertext_len = u32::try_from(envelope.ciphertext_blob.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"aws-kms ciphertext blob exceeds u32::MAX bytes",
+		)
+	})?;
+	let mut encoded = Vec::with_capacity(
+		AWS_KMS_ROOT_KEK_MAGIC.len()
+			+ 4 + 2 + 2
+			+ 4 + region_bytes.len()
+			+ key_id_bytes.len()
+			+ envelope.ciphertext_blob.len(),
+	);
+	encoded.extend_from_slice(&AWS_KMS_ROOT_KEK_MAGIC);
+	encoded.extend_from_slice(&AWS_KMS_ROOT_KEK_VERSION.to_be_bytes());
+	encoded.extend_from_slice(&region_len.to_be_bytes());
+	encoded.extend_from_slice(&key_id_len.to_be_bytes());
+	encoded.extend_from_slice(&ciphertext_len.to_be_bytes());
+	encoded.extend_from_slice(region_bytes);
+	encoded.extend_from_slice(key_id_bytes);
+	encoded.extend_from_slice(&envelope.ciphertext_blob);
+	persist_new_file_atomically(path, &encoded)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AwsKmsEncryptResponse {
+	ciphertext_blob: String,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "PascalCase")]
+struct AwsKmsDecryptResponse {
+	plaintext: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AwsKmsDescribeKeyResponse {
+	key_metadata: AwsKmsKeyMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AwsKmsKeyMetadata {
+	#[serde(default)]
+	key_id: Option<String>,
+	enabled: bool,
+	#[serde(default)]
+	key_state: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AwsKmsErrorBody {
+	#[serde(rename = "__type")]
+	#[serde(default)]
+	type_name: Option<String>,
+	#[serde(rename = "message")]
+	#[serde(default)]
+	message_lower: Option<String>,
+	#[serde(rename = "Message")]
+	#[serde(default)]
+	message_upper: Option<String>,
+}
+
+fn map_aws_kms_error(status: u16, body: &[u8]) -> std::io::Error {
+	let parsed = serde_json::from_slice::<AwsKmsErrorBody>(body).ok();
+	let type_name = parsed
+		.as_ref()
+		.and_then(|error| error.type_name.as_deref())
+		.unwrap_or("AwsKmsError");
+	let message = parsed
+		.as_ref()
+		.and_then(|error| {
+			error
+				.message_lower
+				.as_deref()
+				.or(error.message_upper.as_deref())
+		})
+		.unwrap_or("request failed");
+	let kind = if type_name.contains("AccessDenied") {
+		ErrorKind::PermissionDenied
+	} else if type_name.contains("NotFound") {
+		ErrorKind::NotFound
+	} else if type_name.contains("InvalidCiphertext") || type_name.contains("Disabled") {
+		ErrorKind::InvalidData
+	} else {
+		ErrorKind::Other
+	};
+	Error::new(
+		kind,
+		format!("aws-kms returned HTTP {status} ({type_name}): {message}"),
+	)
+}
+
+fn host_header_value(url: &Url) -> std::io::Result<String> {
+	let host = url.host_str().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"aws-kms endpoint URL is missing a host",
+		)
+	})?;
+	Ok(match url.port() {
+		Some(port) => format!("{host}:{port}"),
+		None => host.to_string(),
+	})
+}
+
+fn canonicalize_header_value(value: &str) -> String {
+	value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn derive_aws_sigv4_signing_key(
+	secret_access_key: &[u8],
+	date_scope: &str,
+	region: &str,
+	service: &str,
+) -> std::io::Result<KeyMaterialBytes> {
+	let mut prefixed = Zeroizing::new(Vec::with_capacity(4 + secret_access_key.len()));
+	prefixed.extend_from_slice(b"AWS4");
+	prefixed.extend_from_slice(secret_access_key);
+	let date_key = hmac_key_material(
+		prefixed.as_ref(),
+		date_scope.as_bytes(),
+		"aws sigv4 date key",
+	)?;
+	let region_key =
+		hmac_key_material(date_key.as_ref(), region.as_bytes(), "aws sigv4 region key")?;
+	let service_key = hmac_key_material(
+		region_key.as_ref(),
+		service.as_bytes(),
+		"aws sigv4 service key",
+	)?;
+	hmac_key_material(
+		service_key.as_ref(),
+		b"aws4_request",
+		"aws sigv4 signing key",
+	)
+}
+
+fn hmac_key_material(key: &[u8], data: &[u8], context: &str) -> std::io::Result<KeyMaterialBytes> {
+	let tag = aws_hmac_sha256(key, data);
+	KeyMaterialBytes::copy_from_slice(tag.as_ref(), context)
+}
+
+fn aws_hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+	let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+	hmac::sign(&key, data)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+	let mut out = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		use std::fmt::Write as _;
+		let _ = write!(&mut out, "{byte:02x}");
+	}
+	out
+}
+
 struct DevRootKekProvider {
 	key: LockedKeyMaterial,
 }
@@ -2533,32 +3805,50 @@ struct DevRootKekProvider {
 impl DevRootKekProvider {
 	#[cfg(any(test, not(feature = "fips")))]
 	fn from_dev_insecure_dir(data_dir: &Path) -> std::io::Result<Self> {
-		let path = dev_insecure_root_kek_path(data_dir);
-		let key = match read_dev_insecure_root_kek(&path) {
-			Ok(key) => key,
-			Err(error) if error.kind() == ErrorKind::NotFound => {
-				let key = KeyMaterialBytes::random()?;
-				match persist_new_dev_insecure_root_kek(&path, &key) {
-					Ok(()) => key,
-					Err(persist_error) if persist_error.kind() == ErrorKind::AlreadyExists => {
-						read_dev_insecure_root_kek(&path)?
-					}
-					Err(persist_error) => {
-						return Err(Error::new(
-							persist_error.kind(),
-							format!(
-								"failed to persist dev root KEK at {}: {persist_error}",
-								path.display()
-							),
-						));
+		Self::initialize(RootKekProviderInit::generate_or_create(data_dir))
+	}
+
+	#[cfg(any(test, not(feature = "fips")))]
+	fn initialize(init: RootKekProviderInit<'_>) -> std::io::Result<Self> {
+		let path = dev_insecure_root_kek_path(init.data_dir);
+		let key = match init.bootstrap_mode {
+			RootKekBootstrapMode::GenerateOrCreate => match read_dev_insecure_root_kek(&path) {
+				Ok(key) => key,
+				Err(error) if error.kind() == ErrorKind::NotFound => {
+					let key = KeyMaterialBytes::random()?;
+					match persist_new_dev_insecure_root_kek(&path, &key) {
+						Ok(()) => key,
+						Err(persist_error) if persist_error.kind() == ErrorKind::AlreadyExists => {
+							read_dev_insecure_root_kek(&path)?
+						}
+						Err(persist_error) => {
+							return Err(Error::new(
+								persist_error.kind(),
+								format!(
+									"failed to persist dev root KEK at {}: {persist_error}",
+									path.display()
+								),
+							));
+						}
 					}
 				}
-			}
-			Err(error) => {
-				return Err(Error::new(
-					error.kind(),
-					format!("failed to read dev root KEK at {}: {error}", path.display()),
-				));
+				Err(error) => {
+					return Err(Error::new(
+						error.kind(),
+						format!("failed to read dev root KEK at {}: {error}", path.display()),
+					));
+				}
+			},
+			RootKekBootstrapMode::EnrollExisting => {
+				read_dev_insecure_root_kek(&path).map_err(|error| {
+					Error::new(
+						error.kind(),
+						format!(
+							"failed to enroll existing dev root KEK from {}: {error}",
+							path.display()
+						),
+					)
+				})?
 			}
 		};
 		Ok(Self {
@@ -2603,9 +3893,332 @@ fn persist_new_dev_insecure_root_kek(path: &Path, key: &KeyMaterialBytes) -> std
 	file.sync_all()
 }
 
+struct LocalSealedRootKekProvider {
+	key: LockedKeyMaterial,
+}
+
+impl LocalSealedRootKekProvider {
+	fn initialize(
+		init: RootKekProviderInit<'_>,
+		cfg: &LocalSealedRootKekConfig,
+	) -> std::io::Result<Self> {
+		let path = local_sealed_root_kek_path(init.data_dir);
+		let unlock_secret = cfg.load_unlock_secret()?;
+		let key = match init.bootstrap_mode {
+			RootKekBootstrapMode::GenerateOrCreate => {
+				match read_local_sealed_root_kek(&path, unlock_secret.as_ref()) {
+					Ok(key) => key,
+					Err(error) if error.kind() == ErrorKind::NotFound => {
+						let key = KeyMaterialBytes::random()?;
+						match persist_new_local_sealed_root_kek(&path, unlock_secret.as_ref(), &key)
+						{
+							Ok(()) => key,
+							Err(persist_error)
+								if persist_error.kind() == ErrorKind::AlreadyExists =>
+							{
+								read_local_sealed_root_kek(&path, unlock_secret.as_ref())?
+							}
+							Err(persist_error) => {
+								return Err(Error::new(
+									persist_error.kind(),
+									format!(
+										"failed to persist local-sealed root KEK at {}: {persist_error}",
+										path.display()
+									),
+								));
+							}
+						}
+					}
+					Err(error) => {
+						return Err(Error::new(
+							error.kind(),
+							format!(
+								"failed to read local-sealed root KEK at {}: {error}",
+								path.display()
+							),
+						));
+					}
+				}
+			}
+			RootKekBootstrapMode::EnrollExisting => {
+				read_local_sealed_root_kek(&path, unlock_secret.as_ref()).map_err(|error| {
+					Error::new(
+						error.kind(),
+						format!(
+							"failed to enroll existing local-sealed root KEK from {}: {error}",
+							path.display()
+						),
+					)
+				})?
+			}
+		};
+		Ok(Self {
+			key: LockedKeyMaterial::new(key)?,
+		})
+	}
+}
+
+fn local_sealed_root_kek_path(data_dir: &Path) -> PathBuf {
+	data_dir
+		.join(LOCAL_SEALED_ROOT_KEK_DIR)
+		.join(LOCAL_SEALED_ROOT_KEK_FILE)
+}
+
+fn derive_local_sealed_wrapping_key(
+	unlock_secret: &[u8],
+	salt: &[u8; LOCAL_SEALED_ROOT_KEK_SALT_BYTES],
+) -> std::io::Result<KeyMaterialBytes> {
+	let params = ScryptParams::new(
+		LOCAL_SEALED_ROOT_KEK_SCRYPT_LOG_N,
+		LOCAL_SEALED_ROOT_KEK_SCRYPT_R,
+		LOCAL_SEALED_ROOT_KEK_SCRYPT_P,
+		32,
+	)
+	.map_err(|error| {
+		Error::other(format!(
+			"failed to construct local-sealed scrypt params: {error}"
+		))
+	})?;
+	let mut derived = KeyMaterialBytes([0_u8; 32]);
+	scrypt(unlock_secret, salt, &params, &mut derived.0)
+		.map_err(|error| Error::other(format!("local-sealed scrypt derivation failed: {error}")))?;
+	Ok(derived)
+}
+
+fn read_local_sealed_root_kek(
+	path: &Path,
+	unlock_secret: &[u8],
+) -> std::io::Result<KeyMaterialBytes> {
+	let mut file = OpenOptions::new().read(true).open(path)?;
+	let mut bytes = Vec::new();
+	file.read_to_end(&mut bytes)?;
+	if bytes.len() != LOCAL_SEALED_ROOT_KEK_TOTAL_BYTES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"local-sealed root KEK file {} has invalid length {}; expected {} bytes",
+				path.display(),
+				bytes.len(),
+				LOCAL_SEALED_ROOT_KEK_TOTAL_BYTES
+			),
+		));
+	}
+	if bytes[..LOCAL_SEALED_ROOT_KEK_MAGIC.len()] != LOCAL_SEALED_ROOT_KEK_MAGIC {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"local-sealed root KEK file {} has invalid magic header",
+				path.display()
+			),
+		));
+	}
+	let version_offset = LOCAL_SEALED_ROOT_KEK_MAGIC.len();
+	let version = u32::from_be_bytes(
+		bytes[version_offset..version_offset + 4]
+			.try_into()
+			.expect("slice len"),
+	);
+	if version != LOCAL_SEALED_ROOT_KEK_VERSION {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"local-sealed root KEK file {} has unsupported version {version}",
+				path.display()
+			),
+		));
+	}
+	let salt_offset = version_offset + 4;
+	let nonce_offset = salt_offset + LOCAL_SEALED_ROOT_KEK_SALT_BYTES;
+	let ciphertext_offset = nonce_offset + LOCAL_SEALED_ROOT_KEK_NONCE_BYTES;
+	let salt: [u8; LOCAL_SEALED_ROOT_KEK_SALT_BYTES] = bytes[salt_offset..nonce_offset]
+		.try_into()
+		.expect("slice len");
+	let seal_key = derive_local_sealed_wrapping_key(unlock_secret, &salt)?;
+	let key = LessSafeKey::new(
+		UnboundKey::new(&AES_256_GCM, seal_key.as_ref())
+			.map_err(|_| Error::other("failed to construct local-sealed AES-GCM key"))?,
+	);
+	let nonce: [u8; LOCAL_SEALED_ROOT_KEK_NONCE_BYTES] = bytes[nonce_offset..ciphertext_offset]
+		.try_into()
+		.expect("slice len");
+	let mut in_out = Zeroizing::new(bytes[ciphertext_offset..].to_vec());
+	let plaintext = key
+		.open_in_place(
+			Nonce::assume_unique_for_key(nonce),
+			Aad::from(LOCAL_SEALED_ROOT_KEK_AAD),
+			in_out.as_mut_slice(),
+		)
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"failed to decrypt local-sealed root KEK at {}; unlock secret is invalid or the file is corrupted",
+					path.display()
+				),
+			)
+		})?;
+	KeyMaterialBytes::copy_from_slice(plaintext, "local-sealed root KEK")
+}
+
+fn persist_new_local_sealed_root_kek(
+	path: &Path,
+	unlock_secret: &[u8],
+	key: &KeyMaterialBytes,
+) -> std::io::Result<()> {
+	let mut salt = [0_u8; LOCAL_SEALED_ROOT_KEK_SALT_BYTES];
+	aws_lc_rs::rand::fill(&mut salt)
+		.map_err(|_| Error::other("failed to generate local-sealed root KEK salt"))?;
+	let seal_key = derive_local_sealed_wrapping_key(unlock_secret, &salt)?;
+	let mut nonce = [0_u8; LOCAL_SEALED_ROOT_KEK_NONCE_BYTES];
+	aws_lc_rs::rand::fill(&mut nonce)
+		.map_err(|_| Error::other("failed to generate local-sealed root KEK nonce"))?;
+	let aead = LessSafeKey::new(
+		UnboundKey::new(&AES_256_GCM, seal_key.as_ref())
+			.map_err(|_| Error::other("failed to construct local-sealed AES-GCM key"))?,
+	);
+	let mut ciphertext = key.as_ref().to_vec();
+	aead.seal_in_place_append_tag(
+		Nonce::assume_unique_for_key(nonce),
+		Aad::from(LOCAL_SEALED_ROOT_KEK_AAD),
+		&mut ciphertext,
+	)
+	.map_err(|_| Error::other("failed to encrypt local-sealed root KEK"))?;
+
+	let mut encoded = Vec::with_capacity(LOCAL_SEALED_ROOT_KEK_TOTAL_BYTES);
+	encoded.extend_from_slice(&LOCAL_SEALED_ROOT_KEK_MAGIC);
+	encoded.extend_from_slice(&LOCAL_SEALED_ROOT_KEK_VERSION.to_be_bytes());
+	encoded.extend_from_slice(&salt);
+	encoded.extend_from_slice(&nonce);
+	encoded.extend_from_slice(&ciphertext);
+	ciphertext.zeroize();
+	persist_new_file_atomically(path, &encoded)
+}
+
+fn persist_new_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+	if let Some(parent) = path.parent() {
+		std::fs::create_dir_all(parent)?;
+	}
+	if path.exists() {
+		return Err(Error::new(
+			ErrorKind::AlreadyExists,
+			format!("refusing to overwrite existing file {}", path.display()),
+		));
+	}
+	let tmp_path = atomic_tmp_path(path);
+	let persist_result = (|| {
+		let mut options = OpenOptions::new();
+		options.write(true).create_new(true).truncate(true);
+		#[cfg(unix)]
+		options.mode(0o600);
+		let mut file = options.open(&tmp_path)?;
+		file.write_all(bytes)?;
+		file.sync_all()?;
+		drop(file);
+		if path.exists() {
+			return Err(Error::new(
+				ErrorKind::AlreadyExists,
+				format!("refusing to overwrite existing file {}", path.display()),
+			));
+		}
+		std::fs::rename(&tmp_path, path)?;
+		fsync_parent_dir_sync(path)
+	})();
+	if persist_result.is_err() {
+		let _ = std::fs::remove_file(&tmp_path);
+	}
+	persist_result
+}
+
+fn atomic_tmp_path(path: &Path) -> PathBuf {
+	let mut tmp = path.to_path_buf();
+	tmp.as_mut_os_string().push(format!(
+		".tmp-{}-{}",
+		std::process::id(),
+		Utc::now().timestamp_nanos_opt().unwrap_or_default()
+	));
+	tmp
+}
+
+fn fsync_parent_dir_sync(path: &Path) -> std::io::Result<()> {
+	let Some(parent) = path.parent() else {
+		return Ok(());
+	};
+	OpenOptions::new().read(true).open(parent)?.sync_all()
+}
+
 impl RootKekProvider for DevRootKekProvider {
 	fn label(&self) -> &'static str {
 		RootKekProviderConfig::DevInsecure.label()
+	}
+
+	fn health(&self) -> std::io::Result<RootKekProviderHealth> {
+		Ok(RootKekProviderHealth::ready())
+	}
+
+	fn wrap_tenant_kek(&self, plaintext_key: &KeyMaterialBytes) -> std::io::Result<Vec<u8>> {
+		let mut out = vec![0_u8; plaintext_key.as_ref().len() + 15];
+		let wrapped = AesKek::new(&AES_256, self.key.as_ref())
+			.map_err(|_| Error::other("failed to construct root AES-KWP key"))?
+			.wrap_with_padding(plaintext_key.as_ref(), &mut out)
+			.map_err(|_| Error::other("failed to wrap tenant KEK under root KEK"))?;
+		Ok(wrapped.to_vec())
+	}
+
+	fn unwrap_tenant_kek(&self, wrapped_key: &[u8]) -> std::io::Result<KeyMaterialBytes> {
+		let mut out = Zeroizing::new(vec![0_u8; wrapped_key.len()]);
+		let plaintext = AesKek::new(&AES_256, self.key.as_ref())
+			.map_err(|_| Error::other("failed to construct root AES-KWP key"))?
+			.unwrap_with_padding(wrapped_key, &mut out)
+			.map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"failed to unwrap tenant KEK under root KEK",
+				)
+			})?;
+		KeyMaterialBytes::copy_from_slice(plaintext, "tenant KEK")
+	}
+}
+
+impl RootKekProvider for LocalSealedRootKekProvider {
+	fn label(&self) -> &'static str {
+		"local-sealed"
+	}
+
+	fn health(&self) -> std::io::Result<RootKekProviderHealth> {
+		Ok(RootKekProviderHealth::ready())
+	}
+
+	fn wrap_tenant_kek(&self, plaintext_key: &KeyMaterialBytes) -> std::io::Result<Vec<u8>> {
+		let mut out = vec![0_u8; plaintext_key.as_ref().len() + 15];
+		let wrapped = AesKek::new(&AES_256, self.key.as_ref())
+			.map_err(|_| Error::other("failed to construct root AES-KWP key"))?
+			.wrap_with_padding(plaintext_key.as_ref(), &mut out)
+			.map_err(|_| Error::other("failed to wrap tenant KEK under root KEK"))?;
+		Ok(wrapped.to_vec())
+	}
+
+	fn unwrap_tenant_kek(&self, wrapped_key: &[u8]) -> std::io::Result<KeyMaterialBytes> {
+		let mut out = Zeroizing::new(vec![0_u8; wrapped_key.len()]);
+		let plaintext = AesKek::new(&AES_256, self.key.as_ref())
+			.map_err(|_| Error::other("failed to construct root AES-KWP key"))?
+			.unwrap_with_padding(wrapped_key, &mut out)
+			.map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"failed to unwrap tenant KEK under root KEK",
+				)
+			})?;
+		KeyMaterialBytes::copy_from_slice(plaintext, "tenant KEK")
+	}
+}
+
+impl RootKekProvider for AwsKmsRootKekProvider {
+	fn label(&self) -> &'static str {
+		"aws-kms"
+	}
+
+	fn health(&self) -> std::io::Result<RootKekProviderHealth> {
+		self.client.describe_key()
 	}
 
 	fn wrap_tenant_kek(&self, plaintext_key: &KeyMaterialBytes) -> std::io::Result<Vec<u8>> {
@@ -2654,6 +4267,19 @@ impl LockedKeyMaterial {
 			};
 		Ok(Self { key: boxed, locked })
 	}
+
+	fn scrub_for_drop(&mut self) {
+		self.key.zeroize();
+		if self.locked {
+			unsafe {
+				libc::munlock(
+					self.key.0.as_mut_ptr().cast(),
+					std::mem::size_of::<[u8; 32]>(),
+				);
+			}
+			self.locked = false;
+		}
+	}
 }
 
 impl AsRef<[u8]> for LockedKeyMaterial {
@@ -2664,15 +4290,7 @@ impl AsRef<[u8]> for LockedKeyMaterial {
 
 impl Drop for LockedKeyMaterial {
 	fn drop(&mut self) {
-		self.key.zeroize();
-		if self.locked {
-			unsafe {
-				libc::munlock(
-					self.key.0.as_mut_ptr().cast(),
-					std::mem::size_of::<[u8; 32]>(),
-				);
-			}
-		}
+		self.scrub_for_drop();
 	}
 }
 
@@ -2792,8 +4410,190 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::collections::HashMap as StdHashMap;
+	use std::io::{BufRead, BufReader};
+	use std::net::{TcpListener, TcpStream};
+	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::time::Duration as StdDuration;
 
 	const WEEKLY_NONCE_SAMPLE_COUNT: u64 = 100_000_000;
+
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	struct FakeAwsKmsRequest {
+		target: String,
+		authorization: String,
+		security_token: Option<String>,
+	}
+
+	#[derive(Default)]
+	struct FakeAwsKmsState {
+		requests: Vec<FakeAwsKmsRequest>,
+		ciphertexts: StdHashMap<Vec<u8>, Vec<u8>>,
+	}
+
+	struct FakeAwsKmsServer {
+		endpoint: String,
+		state: Arc<Mutex<FakeAwsKmsState>>,
+		stop: Arc<AtomicBool>,
+		thread: Option<std::thread::JoinHandle<()>>,
+	}
+
+	impl FakeAwsKmsServer {
+		fn start(key_id: &str) -> Self {
+			let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+			listener.set_nonblocking(true).unwrap();
+			let endpoint = format!("http://{}", listener.local_addr().unwrap());
+			let state = Arc::new(Mutex::new(FakeAwsKmsState::default()));
+			let stop = Arc::new(AtomicBool::new(false));
+			let key_id = key_id.to_string();
+			let thread_state = state.clone();
+			let thread_stop = stop.clone();
+			let thread = std::thread::spawn(move || {
+				while !thread_stop.load(Ordering::SeqCst) {
+					match listener.accept() {
+						Ok((stream, _)) => {
+							handle_fake_aws_kms_connection(stream, &key_id, &thread_state);
+						}
+						Err(error) if error.kind() == ErrorKind::WouldBlock => {
+							std::thread::sleep(StdDuration::from_millis(10));
+						}
+						Err(_) => break,
+					}
+				}
+			});
+			Self {
+				endpoint,
+				state,
+				stop,
+				thread: Some(thread),
+			}
+		}
+
+		fn endpoint(&self) -> &str {
+			&self.endpoint
+		}
+
+		fn requests(&self) -> Vec<FakeAwsKmsRequest> {
+			self.state.lock().unwrap().requests.clone()
+		}
+	}
+
+	impl Drop for FakeAwsKmsServer {
+		fn drop(&mut self) {
+			self.stop.store(true, Ordering::SeqCst);
+			let _ = TcpStream::connect(
+				self.endpoint
+					.strip_prefix("http://")
+					.expect("endpoint prefix"),
+			);
+			if let Some(thread) = self.thread.take() {
+				let _ = thread.join();
+			}
+		}
+	}
+
+	fn handle_fake_aws_kms_connection(
+		stream: TcpStream,
+		key_id: &str,
+		state: &Arc<Mutex<FakeAwsKmsState>>,
+	) {
+		stream
+			.set_read_timeout(Some(StdDuration::from_secs(1)))
+			.unwrap();
+		let mut reader = BufReader::new(stream.try_clone().unwrap());
+		let mut request_line = String::new();
+		if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+			return;
+		}
+		let mut headers = StdHashMap::new();
+		loop {
+			let mut line = String::new();
+			if reader.read_line(&mut line).is_err() || line == "\r\n" {
+				break;
+			}
+			if let Some((name, value)) = line.split_once(':') {
+				headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+			}
+		}
+		let content_length = headers
+			.get("content-length")
+			.and_then(|value| value.parse::<usize>().ok())
+			.unwrap_or(0);
+		let mut body = vec![0_u8; content_length];
+		if reader.read_exact(&mut body).is_err() {
+			return;
+		}
+		let target = headers
+			.get("x-amz-target")
+			.cloned()
+			.unwrap_or_else(|| "unknown".into());
+		let authorization = headers.get("authorization").cloned().unwrap_or_default();
+		let security_token = headers.get("x-amz-security-token").cloned();
+		{
+			let mut guard = state.lock().unwrap();
+			guard.requests.push(FakeAwsKmsRequest {
+				target: target.clone(),
+				authorization,
+				security_token,
+			});
+		}
+		let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		let response_body = match target.as_str() {
+			"TrentService.Encrypt" => {
+				let plaintext = base64::engine::general_purpose::STANDARD
+					.decode(payload["Plaintext"].as_str().unwrap())
+					.unwrap();
+				let mut ciphertext = b"cipher:".to_vec();
+				ciphertext.extend_from_slice(&plaintext);
+				state
+					.lock()
+					.unwrap()
+					.ciphertexts
+					.insert(ciphertext.clone(), plaintext);
+				serde_json::json!({
+					"CiphertextBlob": base64::engine::general_purpose::STANDARD.encode(ciphertext),
+					"KeyId": key_id,
+				})
+			}
+			"TrentService.Decrypt" => {
+				let ciphertext = base64::engine::general_purpose::STANDARD
+					.decode(payload["CiphertextBlob"].as_str().unwrap())
+					.unwrap();
+				let plaintext = state
+					.lock()
+					.unwrap()
+					.ciphertexts
+					.get(&ciphertext)
+					.cloned()
+					.unwrap();
+				serde_json::json!({
+					"Plaintext": base64::engine::general_purpose::STANDARD.encode(plaintext),
+					"KeyId": key_id,
+				})
+			}
+			"TrentService.DescribeKey" => serde_json::json!({
+				"KeyMetadata": {
+					"KeyId": key_id,
+					"Arn": key_id,
+					"Enabled": true,
+					"KeyState": "Enabled"
+				}
+			}),
+			other => serde_json::json!({
+				"__type": "UnsupportedOperationException",
+				"message": format!("unsupported fake aws-kms target {other}")
+			}),
+		};
+		let response_body = serde_json::to_vec(&response_body).unwrap();
+		let response = format!(
+			"HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+			response_body.len()
+		);
+		let mut stream = stream;
+		stream.write_all(response.as_bytes()).unwrap();
+		stream.write_all(&response_body).unwrap();
+		stream.flush().unwrap();
+	}
 
 	/// Real injectivity check for the chunk-nonce encoder.
 	///
@@ -3026,6 +4826,34 @@ mod tests {
 		assert_eq!(decrypted.chunk_count as usize, chunk_count + 1);
 	}
 
+	#[test]
+	fn key_material_bytes_drop_zeroizes_memory() {
+		let raw = Box::into_raw(Box::new(
+			KeyMaterialBytes::copy_from_slice(&[0x5a; 32], "test key material").unwrap(),
+		));
+		unsafe {
+			std::ptr::drop_in_place(raw);
+			let scrubbed = std::ptr::read(raw.cast::<[u8; 32]>());
+			assert_eq!(scrubbed, [0_u8; 32]);
+			std::alloc::dealloc(
+				raw.cast::<u8>(),
+				std::alloc::Layout::new::<KeyMaterialBytes>(),
+			);
+		}
+	}
+
+	#[test]
+	fn locked_key_material_scrub_zeroizes_inner_bytes() {
+		let mut locked = LockedKeyMaterial::new(
+			KeyMaterialBytes::copy_from_slice(&[0xa5; 32], "locked key material").unwrap(),
+		)
+		.unwrap();
+		assert_eq!(locked.key.0, [0xa5; 32]);
+		locked.scrub_for_drop();
+		assert_eq!(locked.key.0, [0_u8; 32]);
+		assert!(!locked.locked);
+	}
+
 	#[cfg(not(feature = "fips"))]
 	#[test]
 	fn dev_insecure_root_kek_persists_per_data_dir() {
@@ -3048,6 +4876,309 @@ mod tests {
 		let unwrapped = reopened.unwrap_tenant_kek(&wrapped).unwrap();
 		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
 
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[cfg(not(feature = "fips"))]
+	#[test]
+	fn dev_insecure_root_kek_enroll_existing_requires_materialized_key() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-dev-root-kek-enroll-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let err = match RootKekProviderConfig::DevInsecure.initialize(RootKekProviderInit {
+			data_dir: &dir,
+			bootstrap_mode: RootKekBootstrapMode::EnrollExisting,
+		}) {
+			Ok(_) => panic!("enrolling an unmateralized dev-insecure root KEK should fail"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::NotFound);
+
+		let generated = RootKekProviderConfig::DevInsecure.build(&dir).unwrap();
+		let tenant_kek = random_256_bit_key().unwrap();
+		let wrapped = generated.wrap_tenant_kek(&tenant_kek).unwrap();
+
+		let enrolled = RootKekProviderConfig::DevInsecure
+			.initialize(RootKekProviderInit {
+				data_dir: &dir,
+				bootstrap_mode: RootKekBootstrapMode::EnrollExisting,
+			})
+			.unwrap();
+		let unwrapped = enrolled.unwrap_tenant_kek(&wrapped).unwrap();
+		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[cfg(not(feature = "fips"))]
+	#[test]
+	fn dev_insecure_root_kek_reports_ready_and_rotation_unsupported() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-dev-root-kek-health-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let provider = RootKekProviderConfig::DevInsecure.build(&dir).unwrap();
+		let health = provider.health().unwrap();
+		assert!(health.ready);
+		assert!(health.detail.is_none());
+
+		let err = provider.rotate_root_kek().unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::Unsupported);
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn local_sealed_root_kek_persists_per_data_dir_with_env_secret() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-local-sealed-root-kek-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let env_name = format!(
+			"WENDELON_ROOT_KEK_SECRET_{}_{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		);
+		unsafe {
+			std::env::set_var(&env_name, "correct horse battery staple");
+		}
+
+		let provider = RootKekProviderConfig::LocalSealed(LocalSealedRootKekConfig {
+			unlock_secret_env: Some(env_name.clone()),
+			unlock_secret_file: None,
+		})
+		.build(&dir)
+		.unwrap();
+		let root_kek_path = local_sealed_root_kek_path(&dir);
+		assert!(root_kek_path.exists());
+		let tenant_kek = random_256_bit_key().unwrap();
+		let wrapped = provider.wrap_tenant_kek(&tenant_kek).unwrap();
+
+		let reopened = RootKekProviderConfig::LocalSealed(LocalSealedRootKekConfig {
+			unlock_secret_env: Some(env_name.clone()),
+			unlock_secret_file: None,
+		})
+		.build(&dir)
+		.unwrap();
+		let unwrapped = reopened.unwrap_tenant_kek(&wrapped).unwrap();
+		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
+
+		unsafe {
+			std::env::remove_var(&env_name);
+		}
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn local_sealed_root_kek_supports_unlock_secret_file() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-local-sealed-root-kek-file-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let secret_file = dir.join("root-kek.secret");
+		std::fs::write(&secret_file, b"mounted-secret-material").unwrap();
+
+		let provider = RootKekProviderConfig::LocalSealed(LocalSealedRootKekConfig {
+			unlock_secret_env: None,
+			unlock_secret_file: Some(secret_file.clone()),
+		})
+		.build(&dir)
+		.unwrap();
+		let tenant_kek = random_256_bit_key().unwrap();
+		let wrapped = provider.wrap_tenant_kek(&tenant_kek).unwrap();
+
+		let reopened = RootKekProviderConfig::LocalSealed(LocalSealedRootKekConfig {
+			unlock_secret_env: None,
+			unlock_secret_file: Some(secret_file),
+		})
+		.build(&dir)
+		.unwrap();
+		let unwrapped = reopened.unwrap_tenant_kek(&wrapped).unwrap();
+		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn local_sealed_root_kek_rejects_wrong_unlock_secret() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-local-sealed-root-kek-wrong-secret-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let secret_file = dir.join("root-kek.secret");
+		std::fs::write(&secret_file, b"correct-secret").unwrap();
+		let provider_cfg = RootKekProviderConfig::LocalSealed(LocalSealedRootKekConfig {
+			unlock_secret_env: None,
+			unlock_secret_file: Some(secret_file.clone()),
+		});
+		let provider = provider_cfg.build(&dir).unwrap();
+		let tenant_kek = random_256_bit_key().unwrap();
+		let wrapped = provider.wrap_tenant_kek(&tenant_kek).unwrap();
+
+		std::fs::write(&secret_file, b"wrong-secret").unwrap();
+		let err = match provider_cfg.build(&dir) {
+			Ok(_) => panic!("local-sealed provider should reject an invalid unlock secret"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("unlock secret is invalid"));
+
+		std::fs::write(&secret_file, b"correct-secret").unwrap();
+		let reopened = provider_cfg.build(&dir).unwrap();
+		let unwrapped = reopened.unwrap_tenant_kek(&wrapped).unwrap();
+		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn aws_kms_root_kek_persists_per_data_dir_with_env_credentials() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-aws-kms-root-kek-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let key_id = "arn:aws:kms:us-east-1:111122223333:key/test-root-kek";
+		let server = FakeAwsKmsServer::start(key_id);
+		let access_key_env = format!("WENDELON_AWS_KMS_ACCESS_KEY_{}", uuid::Uuid::new_v4());
+		let secret_key_env = format!("WENDELON_AWS_KMS_SECRET_KEY_{}", uuid::Uuid::new_v4());
+		let session_token_env = format!("WENDELON_AWS_KMS_SESSION_TOKEN_{}", uuid::Uuid::new_v4());
+		unsafe {
+			std::env::set_var(&access_key_env, "AKIATESTACCESSKEY");
+			std::env::set_var(&secret_key_env, "super-secret-test-key");
+			std::env::set_var(&session_token_env, "session-token-test");
+		}
+		let provider_cfg = RootKekProviderConfig::AwsKms(AwsKmsRootKekConfig {
+			region: "us-east-1".into(),
+			key_id: key_id.into(),
+			endpoint: Some(server.endpoint().into()),
+			access_key_id_env: access_key_env.clone(),
+			secret_access_key_env: secret_key_env.clone(),
+			session_token_env: session_token_env.clone(),
+		});
+
+		let provider = provider_cfg.build(&dir).unwrap();
+		let root_kek_path = aws_kms_root_kek_path(&dir);
+		assert!(root_kek_path.exists());
+		let tenant_kek = random_256_bit_key().unwrap();
+		let wrapped = provider.wrap_tenant_kek(&tenant_kek).unwrap();
+
+		let reopened = provider_cfg.build(&dir).unwrap();
+		let unwrapped = reopened.unwrap_tenant_kek(&wrapped).unwrap();
+		assert_eq!(unwrapped.as_ref(), tenant_kek.as_ref());
+
+		let health = reopened.health().unwrap();
+		assert!(health.ready);
+		assert!(health.detail.is_none());
+
+		let requests = server.requests();
+		assert_eq!(
+			requests
+				.iter()
+				.map(|request| request.target.as_str())
+				.collect::<Vec<_>>(),
+			vec![
+				"TrentService.Encrypt",
+				"TrentService.Decrypt",
+				"TrentService.DescribeKey"
+			]
+		);
+		for request in requests {
+			assert!(
+				request
+					.authorization
+					.contains("Credential=AKIATESTACCESSKEY/"),
+				"missing access key in aws-kms authorization header: {:?}",
+				request
+			);
+			assert_eq!(
+				request.security_token.as_deref(),
+				Some("session-token-test")
+			);
+		}
+
+		unsafe {
+			std::env::remove_var(&access_key_env);
+			std::env::remove_var(&secret_key_env);
+			std::env::remove_var(&session_token_env);
+		}
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn pkcs11_provider_seam_is_configurable_but_build_is_unsupported() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-pkcs11-root-kek-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let module_path = dir.join("libpkcs11-test.so");
+		std::fs::write(&module_path, b"pkcs11 seam only").unwrap();
+		let pin_env = format!("WENDELON_PKCS11_PIN_{}", uuid::Uuid::new_v4());
+		unsafe {
+			std::env::set_var(&pin_env, "123456");
+		}
+
+		let cfg = RootKekProviderConfig::Pkcs11(Pkcs11RootKekConfig {
+			library_path: module_path.clone(),
+			token_label: "WendelonToken".into(),
+			key_label: "root-kek".into(),
+			pin_env: pin_env.clone(),
+			slot: Some(5),
+		});
+		cfg.validate().unwrap();
+		let err = match cfg.build(&dir) {
+			Ok(_) => panic!("pkcs11 provider seam should remain unsupported at build time"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::Unsupported);
+		assert!(err.to_string().contains("provider seam only"));
+		assert!(
+			err.to_string()
+				.contains(module_path.to_string_lossy().as_ref())
+		);
+
+		unsafe {
+			std::env::remove_var(&pin_env);
+		}
 		std::fs::remove_dir_all(&dir).unwrap();
 	}
 

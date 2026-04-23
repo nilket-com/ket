@@ -35,6 +35,8 @@ autonomous_action_surfaces! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorGatedAction {
 	TenantDeleteConfirm,
+	TenantKekRotateConfirm,
+	TenantKekRetireConfirm,
 	BreakGlassAccess,
 	CrossCaPromotion,
 }
@@ -64,9 +66,10 @@ pub fn require_operator_signal(
 	action: OperatorGatedAction,
 ) -> std::io::Result<()> {
 	match action {
-		OperatorGatedAction::TenantDeleteConfirm | OperatorGatedAction::CrossCaPromotion => {
-			authorize_actor(actor, ActorPermission::OpsControl)
-		}
+		OperatorGatedAction::TenantDeleteConfirm
+		| OperatorGatedAction::TenantKekRotateConfirm
+		| OperatorGatedAction::TenantKekRetireConfirm
+		| OperatorGatedAction::CrossCaPromotion => authorize_actor(actor, ActorPermission::OpsControl),
 		OperatorGatedAction::BreakGlassAccess
 			if actor.break_glass
 				&& actor.role == ActorRole::BreakGlassAdmin
@@ -126,7 +129,21 @@ mod tests {
 			require_operator_signal(&operator, OperatorGatedAction::TenantDeleteConfirm).is_ok()
 		);
 		assert!(
+			require_operator_signal(&operator, OperatorGatedAction::TenantKekRotateConfirm).is_ok()
+		);
+		assert!(
+			require_operator_signal(&operator, OperatorGatedAction::TenantKekRetireConfirm).is_ok()
+		);
+		assert!(
 			require_operator_signal(&data_node, OperatorGatedAction::TenantDeleteConfirm).is_err()
+		);
+		assert!(
+			require_operator_signal(&data_node, OperatorGatedAction::TenantKekRotateConfirm)
+				.is_err()
+		);
+		assert!(
+			require_operator_signal(&data_node, OperatorGatedAction::TenantKekRetireConfirm)
+				.is_err()
 		);
 		assert!(require_operator_signal(&operator, OperatorGatedAction::BreakGlassAccess).is_err());
 		assert!(

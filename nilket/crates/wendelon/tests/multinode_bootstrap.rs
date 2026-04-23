@@ -110,6 +110,9 @@ transfer_signing_secret = "{transfer_secret}"
 {trusted_lease}
 [identity.trusted_transfer_signers]
 {trusted_transfer}
+
+[crypto]
+root_kek_provider = "dev-insecure"
 "#,
 		node_id = node_id,
 		advertise_address = advertise_address,

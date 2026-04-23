@@ -260,6 +260,7 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 			max_upload_bytes_per_sec: None,
 			key_prefix: "metrics/".into(),
 			max_plaintext_rewrites_per_pass: 1,
+			max_dek_rewraps_per_pass: 1,
 		},
 	);
 	let report = sweeper.sweep_once().await.unwrap();

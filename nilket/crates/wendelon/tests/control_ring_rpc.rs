@@ -845,6 +845,190 @@ async fn tenant_admin_create_and_list_flow_commits_through_control_ring() {
 }
 
 #[tokio::test]
+async fn tenant_admin_rotate_tenant_kek_commits_and_returns_new_active_version() {
+	let node = support::bootstrap_node("tenant-admin-rotate-kek", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let create_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				1,
+				&TenantAdminRequestWire::Create {
+					target_tenant_id: TenantId::new(7),
+					quota_bytes: 4_096,
+					replication_factor: 1,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let create_meta = decode_tenant_admin_response(&create_resp);
+	let old_kek_id = create_meta
+		.tenant
+		.as_ref()
+		.and_then(|tenant| tenant.active_tenant_kek_id)
+		.expect("created tenant should report an active tenant_kek_id");
+
+	let rotate_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				2,
+				&TenantAdminRequestWire::RotateTenantKek {
+					target_tenant_id: TenantId::new(7),
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let rotate_meta = decode_tenant_admin_response(&rotate_resp);
+	assert!(rotate_meta.accepted);
+	assert_eq!(rotate_meta.reason_code, CONTROL_REASON_GRANTED);
+	let new_kek_id = rotate_meta
+		.tenant
+		.as_ref()
+		.and_then(|tenant| tenant.active_tenant_kek_id)
+		.expect("rotated tenant should report a new active tenant_kek_id");
+	assert_ne!(new_kek_id, old_kek_id);
+	let tenant = rotate_meta.tenant.as_ref().unwrap();
+	assert!(tenant.tenant_kek_accounting_complete);
+	let old_version = tenant
+		.tenant_kek_versions
+		.iter()
+		.find(|version| version.tenant_kek_id == old_kek_id)
+		.expect("historical KEK version should remain visible");
+	assert_eq!(old_version.tiered_slab_ref_count, 0);
+	assert!(old_version.safe_to_retire);
+	let active_version = tenant
+		.tenant_kek_versions
+		.iter()
+		.find(|version| version.tenant_kek_id == new_kek_id)
+		.expect("active KEK version should be visible");
+	assert!(active_version.is_active);
+	assert!(!active_version.safe_to_retire);
+
+	let snapshot = node.state_machine.state_snapshot().await;
+	let keyset = snapshot.tenant_keysets.get(&TenantId::new(7)).unwrap();
+	assert_eq!(keyset.active_tenant_kek_id, Some(new_kek_id));
+	assert!(keyset.keys.contains_key(&old_kek_id));
+	assert!(keyset.keys.contains_key(&new_kek_id));
+	assert_eq!(
+		node.crypto.active_tenant_kek_id(TenantId::new(7)).unwrap(),
+		new_kek_id
+	);
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
+async fn tenant_admin_retire_tenant_kek_removes_safe_historical_version() {
+	let node = support::bootstrap_node("tenant-admin-retire-kek", 1).await;
+	support::wait_for_local_leader(&node).await;
+
+	let create_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				1,
+				&TenantAdminRequestWire::Create {
+					target_tenant_id: TenantId::new(7),
+					quota_bytes: 4_096,
+					replication_factor: 1,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let create_meta = decode_tenant_admin_response(&create_resp);
+	let retired_kek_id = create_meta
+		.tenant
+		.as_ref()
+		.and_then(|tenant| tenant.active_tenant_kek_id)
+		.expect("created tenant should report an active tenant_kek_id");
+
+	let rotate_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				2,
+				&TenantAdminRequestWire::RotateTenantKek {
+					target_tenant_id: TenantId::new(7),
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let rotate_meta = decode_tenant_admin_response(&rotate_resp);
+	assert!(rotate_meta.accepted);
+	let active_kek_id = rotate_meta
+		.tenant
+		.as_ref()
+		.and_then(|tenant| tenant.active_tenant_kek_id)
+		.expect("rotated tenant should report an active tenant_kek_id");
+	assert_ne!(active_kek_id, retired_kek_id);
+
+	let retire_resp = node
+		.router
+		.handle_frame(
+			context(actor(ActorRole::Operator, None), node.local_node),
+			tenant_admin_frame(
+				&node,
+				3,
+				&TenantAdminRequestWire::RetireTenantKek {
+					target_tenant_id: TenantId::new(7),
+					tenant_kek_id: retired_kek_id,
+				},
+			),
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	let retire_meta = decode_tenant_admin_response(&retire_resp);
+	assert!(retire_meta.accepted);
+	let tenant = retire_meta.tenant.as_ref().unwrap();
+	assert_eq!(tenant.active_tenant_kek_id, Some(active_kek_id));
+	assert!(
+		tenant
+			.tenant_kek_versions
+			.iter()
+			.all(|version| version.tenant_kek_id != retired_kek_id)
+	);
+	assert!(
+		tenant
+			.tenant_kek_versions
+			.iter()
+			.any(|version| version.tenant_kek_id == active_kek_id && version.is_active)
+	);
+
+	let snapshot = node.state_machine.state_snapshot().await;
+	let keyset = snapshot.tenant_keysets.get(&TenantId::new(7)).unwrap();
+	assert_eq!(keyset.active_tenant_kek_id, Some(active_kek_id));
+	assert!(!keyset.keys.contains_key(&retired_kek_id));
+	assert!(keyset.keys.contains_key(&active_kek_id));
+
+	let local_keysets = node.crypto.tenant_keysets_snapshot().unwrap();
+	let local_keyset = local_keysets.get(&TenantId::new(7)).unwrap();
+	assert_eq!(local_keyset.active_tenant_kek_id, Some(active_kek_id));
+	assert!(!local_keyset.keys.contains_key(&retired_kek_id));
+	assert!(local_keyset.keys.contains_key(&active_kek_id));
+
+	support::abort_node(&node);
+}
+
+#[tokio::test]
 async fn tenant_admin_rejects_mutation_for_read_only_or_tenant_scoped_actor() {
 	let node = support::bootstrap_node("tenant-admin-authz", 1).await;
 	support::wait_for_local_leader(&node).await;

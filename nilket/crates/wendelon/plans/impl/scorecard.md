@@ -30,6 +30,15 @@ Status vocabulary:
 | `M0 Foundation` | Implementation roadmap | `done` | `A` | `plans/impl/roadmap.md` | Current milestone/dependency map |
 | `M0 Foundation` | Artifact registry | `done` | `D` | `plans/impl/artifact_registry.md` | Minimal `A-lite` support for `D` |
 | `M0 Foundation` | Scorecard | `done` | `D` | `plans/impl/scorecard.md` | This file |
+| `M0 Foundation` | E provider contract note | `done` | `E` | `plans/impl/workstream_E_provider_contract.md` | E1 freezes the root-KEK provider seam before `local-sealed` and cloud-KMS land |
+| `M3 Customer Pilot Ready` | E local-sealed baseline note | `done` | `E` | `plans/impl/workstream_E_local_sealed_baseline.md` | E2 lands the first non-`dev-insecure` custody path with env/file unlock |
+| `M3 Customer Pilot Ready` | E production-gating note | `done` | `E` | `plans/impl/workstream_E_production_gating.md` | E3 makes `local-sealed` the ordinary config default and keeps `dev-insecure` explicit-only |
+| `M3 Customer Pilot Ready` | E AWS KMS uplift note | `done` | `E` | `plans/impl/workstream_E_aws_kms_uplift.md` | E4 lands the first real cloud custody uplift and keeps KMS off the tenant-KEK hot path |
+| `M3 Customer Pilot Ready` | E DEK re-wrap sweeper note | `done` | `E` | `plans/impl/workstream_E_dek_rewrap_sweeper.md` | E6 makes tenant-KEK rotation converge historical encrypted tiered slabs through a bounded background rewrite pass |
+| `M3 Customer Pilot Ready` | E tenant-KEK retirement note | `done` | `E` | `plans/impl/workstream_E_tenant_kek_retirement_accounting.md` | Historical KEK retirement is now measured from replicated tier metadata and enforced through an explicit Control Ring retirement mutation |
+| `M3 Customer Pilot Ready` | E zeroization evidence note | `done` | `E` | `plans/impl/workstream_E_zeroization_note.md` | E7 narrows zeroization to actual secret material and transient re-encryption buffers, with explicit non-goals for broader plaintext payloads |
+| `M3 Customer Pilot Ready` | E PKCS#11 seam note | `done` | `E` | `plans/impl/workstream_E_pkcs11_seam.md` | E8 lands a stable `pkcs11` config/provider seam and explicit unsupported status without shipping a fake HSM backend |
+| `M3 Customer Pilot Ready` | E rotation runbook | `done` | `E` | `plans/ops/key_rotation.md` | E5 now has a live Control Ring operator surface and documents the convergence/audit contract |
 | `M1 Correctness Locked` | B transition table | `done` | `B` | `plans/impl/workstream_B_transition_table.md` | |
 | `M1 Correctness Locked` | B fault-injection report | `done` | `B` | `plans/impl/workstream_B_fault_injection_report.md` | |
 | `M1 Correctness Locked` | B replay/idempotency note | `done` | `B` | `plans/impl/workstream_B_replay_idempotency_note.md` | |

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use wendelon::config::{load_node_bootstrap_config, render_example_config, write_example_config};
 use wendelon::crypto::{
-	DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES, DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES,
-	SLAB_MAX_BYTES_HARD_CEILING,
+	DEFAULT_LOCAL_SEALED_ROOT_KEK_SECRET_ENV, DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES,
+	DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES, SLAB_MAX_BYTES_HARD_CEILING,
 };
 use wendelon::network::{
 	dev_lease_signing_secret, dev_transfer_signing_secret, lease_verifying_key_bytes,
@@ -30,6 +30,12 @@ fn hex(bytes: [u8; 32]) -> String {
 }
 
 fn write_config(dir: &Path, body: &str) -> PathBuf {
+	unsafe {
+		std::env::set_var(
+			DEFAULT_LOCAL_SEALED_ROOT_KEK_SECRET_ENV,
+			"config-loader-test-local-sealed-secret",
+		);
+	}
 	let path = dir.join("wendelon.toml");
 	std::fs::write(&path, body).unwrap();
 	path
@@ -113,6 +119,16 @@ transfer_signing_secret = "{transfer_secret}"
 		cfg.crypto_cache.slab_dek_cache_max_entries,
 		DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES
 	);
+	match &cfg.root_kek_provider {
+		wendelon::crypto::RootKekProviderConfig::LocalSealed(local) => {
+			assert_eq!(
+				local.unlock_secret_env.as_deref(),
+				Some(DEFAULT_LOCAL_SEALED_ROOT_KEK_SECRET_ENV)
+			);
+			assert!(local.unlock_secret_file.is_none());
+		}
+		other => panic!("expected local-sealed root_kek_provider default, got {other:?}"),
+	}
 }
 
 #[test]
@@ -258,6 +274,182 @@ slab_dek_cache_max_entries = 91
 	let cfg = load_node_bootstrap_config(&config_path).unwrap();
 	assert_eq!(cfg.crypto_cache.tenant_kek_cache_max_entries, 17);
 	assert_eq!(cfg.crypto_cache.slab_dek_cache_max_entries, 91);
+}
+
+#[test]
+fn loads_local_sealed_root_kek_provider_from_secret_file() {
+	let root = fresh_dir("local-sealed-provider");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let secret_path = root.join("root-kek.secret");
+	std::fs::write(&secret_path, b"correct horse battery staple").unwrap();
+
+	let node_id = 45u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4715"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[crypto]
+root_kek_provider = {{ kind = "local-sealed", unlock_secret_file = "root-kek.secret" }}
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	match &cfg.root_kek_provider {
+		wendelon::crypto::RootKekProviderConfig::LocalSealed(local) => {
+			assert!(local.unlock_secret_env.is_none());
+			assert_eq!(
+				local.unlock_secret_file.as_deref(),
+				Some(secret_path.as_path())
+			);
+		}
+		other => panic!("expected local-sealed root_kek_provider, got {other:?}"),
+	}
+}
+
+#[test]
+fn loads_aws_kms_root_kek_provider_from_config() {
+	let root = fresh_dir("aws-kms-provider");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 46u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4716"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[crypto]
+root_kek_provider = {{ kind = "aws-kms", region = "us-east-1", key_id = "arn:aws:kms:us-east-1:111122223333:key/test", endpoint = "http://127.0.0.1:4566", access_key_id_env = "WENDELON_TEST_AWS_ACCESS_KEY_ID", secret_access_key_env = "WENDELON_TEST_AWS_SECRET_ACCESS_KEY", session_token_env = "WENDELON_TEST_AWS_SESSION_TOKEN" }}
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	match &cfg.root_kek_provider {
+		wendelon::crypto::RootKekProviderConfig::AwsKms(aws) => {
+			assert_eq!(aws.region, "us-east-1");
+			assert_eq!(aws.key_id, "arn:aws:kms:us-east-1:111122223333:key/test");
+			assert_eq!(aws.endpoint.as_deref(), Some("http://127.0.0.1:4566"));
+			assert_eq!(aws.access_key_id_env, "WENDELON_TEST_AWS_ACCESS_KEY_ID");
+			assert_eq!(
+				aws.secret_access_key_env,
+				"WENDELON_TEST_AWS_SECRET_ACCESS_KEY"
+			);
+			assert_eq!(aws.session_token_env, "WENDELON_TEST_AWS_SESSION_TOKEN");
+		}
+		other => panic!("expected aws-kms root_kek_provider, got {other:?}"),
+	}
+}
+
+#[test]
+fn loads_pkcs11_root_kek_provider_from_config() {
+	let root = fresh_dir("pkcs11-provider");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let module_path = root.join("libpkcs11-test.so");
+	std::fs::write(&module_path, b"not-a-real-pkcs11-module").unwrap();
+	let pin_env = format!("WENDELON_TEST_PKCS11_PIN_{}", uuid::Uuid::new_v4());
+	unsafe {
+		std::env::set_var(&pin_env, "123456");
+	}
+
+	let node_id = 47u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4717"
+
+[storage]
+data_dir = "data"
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+
+[crypto]
+root_kek_provider = {{ kind = "pkcs11", library_path = "libpkcs11-test.so", token_label = "WendelonToken", key_label = "root-kek", pin_env = "{pin_env}", slot = 7 }}
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+			pin_env = pin_env,
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	match &cfg.root_kek_provider {
+		wendelon::crypto::RootKekProviderConfig::Pkcs11(pkcs11) => {
+			assert_eq!(pkcs11.library_path, module_path);
+			assert_eq!(pkcs11.token_label, "WendelonToken");
+			assert_eq!(pkcs11.key_label, "root-kek");
+			assert_eq!(pkcs11.pin_env, pin_env);
+			assert_eq!(pkcs11.slot, Some(7));
+		}
+		other => panic!("expected pkcs11 root_kek_provider, got {other:?}"),
+	}
+
+	unsafe {
+		std::env::remove_var(&pin_env);
+	}
 }
 
 #[test]
@@ -1083,6 +1275,10 @@ fn rendered_example_config_loads_after_writing() {
 	assert_eq!(cfg.node_id, 1);
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:7001");
+	assert!(matches!(
+		cfg.root_kek_provider,
+		wendelon::crypto::RootKekProviderConfig::DevInsecure
+	));
 }
 
 #[test]

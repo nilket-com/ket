@@ -300,7 +300,7 @@ struct RawAuditKafkaConfig {
 }
 
 impl RawConfig {
-	fn into_bootstrap_config(self, source_path: &Path) -> std::io::Result<NodeBootstrapConfig> {
+	fn into_bootstrap_config(mut self, source_path: &Path) -> std::io::Result<NodeBootstrapConfig> {
 		let data_dir = absolutize_from_config_dir(source_path, &self.storage.data_dir);
 		if !data_dir.is_dir() {
 			return Err(Error::new(
@@ -414,6 +414,9 @@ impl RawConfig {
 			operator_ca_path: absolutize_from_config_dir(source_path, &tls.operator_ca_path),
 			cluster_domain: tls.cluster_domain,
 		});
+		self.crypto
+			.root_kek_provider
+			.absolutize_from_config_dir(source_path);
 		let observability = self.observability.into_runtime_config(source_path)?;
 		let audit = AuditSinksConfig {
 			syslog: self.audit.syslog.map(|syslog| SyslogAuditConfig {

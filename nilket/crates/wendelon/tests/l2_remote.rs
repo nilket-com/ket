@@ -651,6 +651,7 @@ async fn sweeper_persists_remote_uri_shape_in_tier_metadata() {
 			max_upload_bytes_per_sec: None,
 			key_prefix: "sealed/".into(),
 			max_plaintext_rewrites_per_pass: 1,
+			max_dek_rewraps_per_pass: 1,
 		},
 	);
 

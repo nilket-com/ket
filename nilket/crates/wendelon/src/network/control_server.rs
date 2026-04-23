@@ -14,7 +14,7 @@ use crate::consensus::{
 	SeedMigration, TenantLifecycleState, TenantRecord, UpdateTenantQuota, WendelonRaft,
 	WendelonRequest, WendelonResponse,
 };
-use crate::crypto::CryptoManager;
+use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{OperatorGatedAction, require_operator_signal};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -33,7 +33,7 @@ use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, ReleaseLeaseRequestMeta,
-	ReleaseLeaseResponseMeta, TenantId, TransferToken, epoch_entry_var_schema,
+	ReleaseLeaseResponseMeta, TenantId, TenantKekId, TransferToken, epoch_entry_var_schema,
 };
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
@@ -123,6 +123,13 @@ pub enum TenantAdminRequestWire {
 	Delete {
 		target_tenant_id: TenantId,
 	},
+	RotateTenantKek {
+		target_tenant_id: TenantId,
+	},
+	RetireTenantKek {
+		target_tenant_id: TenantId,
+		tenant_kek_id: TenantKekId,
+	},
 	Get {
 		target_tenant_id: TenantId,
 	},
@@ -136,6 +143,21 @@ pub struct TenantAdminTenantWire {
 	pub used_bytes: u64,
 	pub replication_factor: u32,
 	pub state: TenantLifecycleState,
+	#[serde(default)]
+	pub active_tenant_kek_id: Option<TenantKekId>,
+	#[serde(default)]
+	pub tenant_kek_accounting_complete: bool,
+	#[serde(default)]
+	pub tenant_kek_versions: Vec<TenantAdminTenantKekVersionWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAdminTenantKekVersionWire {
+	pub tenant_kek_id: TenantKekId,
+	pub is_active: bool,
+	pub tiered_slab_ref_count: u64,
+	#[serde(default)]
+	pub safe_to_retire: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,14 +325,46 @@ impl WendelonControlServer {
 		)
 	}
 
-	fn tenant_admin_tenant_wire(record: &TenantRecord) -> TenantAdminTenantWire {
+	fn tenant_admin_tenant_wire(
+		snapshot: &crate::consensus::raft_storage::SmState,
+		record: &TenantRecord,
+	) -> TenantAdminTenantWire {
+		let (tenant_kek_accounting_complete, tenant_kek_versions) =
+			Self::tenant_kek_versions_wire(snapshot, record.tenant_id);
 		TenantAdminTenantWire {
 			tenant_id: record.tenant_id,
 			quota_bytes: record.quota_bytes,
 			used_bytes: record.used_bytes,
 			replication_factor: record.replication_factor,
 			state: record.state,
+			active_tenant_kek_id: snapshot
+				.tenant_keysets
+				.get(&record.tenant_id)
+				.and_then(|keyset| keyset.active_tenant_kek_id),
+			tenant_kek_accounting_complete,
+			tenant_kek_versions,
 		}
+	}
+
+	fn tenant_kek_versions_wire(
+		snapshot: &crate::consensus::raft_storage::SmState,
+		tenant_id: TenantId,
+	) -> (bool, Vec<TenantAdminTenantKekVersionWire>) {
+		let status =
+			crate::consensus::raft_storage::tenant_kek_retirement_status(snapshot, tenant_id);
+		(
+			status.accounting_complete,
+			status
+				.versions
+				.into_iter()
+				.map(|version| TenantAdminTenantKekVersionWire {
+					tenant_kek_id: version.tenant_kek_id,
+					is_active: version.is_active,
+					tiered_slab_ref_count: version.tiered_slab_ref_count,
+					safe_to_retire: version.safe_to_retire,
+				})
+				.collect(),
+		)
 	}
 
 	fn build_create_tenant_request(
@@ -363,7 +417,10 @@ impl WendelonControlServer {
 	fn tenant_admin_error_reason(message: &str) -> u8 {
 		if message.contains("does not exist") {
 			CONTROL_REASON_NOT_FOUND
-		} else if message.contains("already exists") {
+		} else if message.contains("already exists")
+			|| message.contains("cannot be retired")
+			|| message.contains("still referenced")
+		{
 			CONTROL_REASON_INVALID_TARGET
 		} else {
 			CONTROL_REASON_INVALID_CONFIG
@@ -379,7 +436,7 @@ impl WendelonControlServer {
 		let tenant = snapshot
 			.tenants
 			.get(&target_tenant_id)
-			.map(Self::tenant_admin_tenant_wire);
+			.map(|record| Self::tenant_admin_tenant_wire(&snapshot, record));
 		self.build_tenant_admin_frame(
 			stream_id,
 			&TenantAdminResponseWire {
@@ -415,6 +472,190 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from tenant mutation",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
+		}
+	}
+
+	async fn submit_tenant_kek_rotation(
+		&self,
+		frame: &HrftFrame,
+		target_tenant_id: TenantId,
+	) -> std::io::Result<HrftFrame> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		if !snapshot.tenants.contains_key(&target_tenant_id) {
+			return self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_FOUND,
+				format!("tenant {} does not exist", target_tenant_id.get()),
+				None,
+			);
+		}
+		let rotation = match self.crypto.prepare_rotation(target_tenant_id) {
+			Ok(rotation) => rotation,
+			Err(err) => {
+				let message = err.to_string();
+				let reason = Self::tenant_admin_error_reason(&message);
+				return self.tenant_admin_rejection(frame, reason, message, None);
+			}
+		};
+		let tenant_kek_id = rotation.tenant_kek_id;
+		match self
+			.raft
+			.client_write(WendelonRequest::InstallTenantKekVersion(rotation))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => {
+					let local_active = match self.crypto.active_tenant_kek_id(target_tenant_id) {
+						Ok(tenant_kek_id) => tenant_kek_id,
+						Err(err) => {
+							return self.tenant_admin_rejection(
+								frame,
+								CONTROL_REASON_INTERNAL_ERROR,
+								format!(
+									"rotate_tenant_kek: committed tenant_kek_id {} but local crypto lookup failed: {err}",
+									tenant_kek_id
+								),
+								None,
+							);
+						}
+					};
+					if local_active != tenant_kek_id {
+						return self.tenant_admin_rejection(
+							frame,
+							CONTROL_REASON_INTERNAL_ERROR,
+							format!(
+								"rotate_tenant_kek: committed tenant_kek_id {} but local crypto active_tenant_kek_id is {}",
+								tenant_kek_id, local_active
+							),
+							None,
+						);
+					}
+					self.tenant_admin_success_for_target(frame.header.stream_id, target_tenant_id)
+						.await
+				}
+				WendelonResponse::Error(message) => self.tenant_admin_rejection(
+					frame,
+					Self::tenant_admin_error_reason(&message),
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from InstallTenantKekVersion",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
+		}
+	}
+
+	async fn submit_tenant_kek_retirement(
+		&self,
+		frame: &HrftFrame,
+		target_tenant_id: TenantId,
+		tenant_kek_id: TenantKekId,
+	) -> std::io::Result<HrftFrame> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		if !snapshot.tenants.contains_key(&target_tenant_id) {
+			return self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_FOUND,
+				format!("tenant {} does not exist", target_tenant_id.get()),
+				None,
+			);
+		}
+		match self
+			.raft
+			.client_write(WendelonRequest::RetireTenantKekVersion(
+				RetireTenantKekVersion {
+					tenant_id: target_tenant_id,
+					tenant_kek_id,
+				},
+			))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => {
+					let local_keysets = match self.crypto.tenant_keysets_snapshot() {
+						Ok(snapshot) => snapshot,
+						Err(err) => {
+							return self.tenant_admin_rejection(
+								frame,
+								CONTROL_REASON_INTERNAL_ERROR,
+								format!(
+									"retire_tenant_kek: committed tenant_kek_id {} but local crypto snapshot failed: {err}",
+									tenant_kek_id.get()
+								),
+								None,
+							);
+						}
+					};
+					let Some(local_keyset) = local_keysets.get(&target_tenant_id) else {
+						return self.tenant_admin_rejection(
+							frame,
+							CONTROL_REASON_INTERNAL_ERROR,
+							format!(
+								"retire_tenant_kek: committed tenant_kek_id {} but local tenant keyset is missing",
+								tenant_kek_id.get()
+							),
+							None,
+						);
+					};
+					if local_keyset.keys.contains_key(&tenant_kek_id) {
+						return self.tenant_admin_rejection(
+							frame,
+							CONTROL_REASON_INTERNAL_ERROR,
+							format!(
+								"retire_tenant_kek: committed tenant_kek_id {} but local crypto still retains it",
+								tenant_kek_id.get()
+							),
+							None,
+						);
+					}
+					self.tenant_admin_success_for_target(frame.header.stream_id, target_tenant_id)
+						.await
+				}
+				WendelonResponse::Error(message) => self.tenant_admin_rejection(
+					frame,
+					Self::tenant_admin_error_reason(&message),
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from RetireTenantKekVersion",
 					None,
 				),
 			},
@@ -571,6 +812,39 @@ impl WendelonControlServer {
 				)
 				.await
 			}
+			TenantAdminRequestWire::RotateTenantKek { target_tenant_id } => {
+				if let Err(error) = require_operator_signal(
+					&context.actor,
+					OperatorGatedAction::TenantKekRotateConfirm,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_tenant_kek_rotation(&frame, target_tenant_id)
+					.await
+			}
+			TenantAdminRequestWire::RetireTenantKek {
+				target_tenant_id,
+				tenant_kek_id,
+			} => {
+				if let Err(error) = require_operator_signal(
+					&context.actor,
+					OperatorGatedAction::TenantKekRetireConfirm,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_tenant_kek_retirement(&frame, target_tenant_id, tenant_kek_id)
+					.await
+			}
 			TenantAdminRequestWire::Get { target_tenant_id } => {
 				let snapshot = self.state_machine.state_snapshot().await;
 				let Some(record) = snapshot.tenants.get(&target_tenant_id) else {
@@ -587,7 +861,7 @@ impl WendelonControlServer {
 						accepted: true,
 						reason_code: CONTROL_REASON_GRANTED,
 						leader_hint: Some(self.local_node.id),
-						tenant: Some(Self::tenant_admin_tenant_wire(record)),
+						tenant: Some(Self::tenant_admin_tenant_wire(&snapshot, record)),
 						tenants: Vec::new(),
 						message: None,
 					},
@@ -598,7 +872,7 @@ impl WendelonControlServer {
 				let mut tenants = snapshot
 					.tenants
 					.values()
-					.map(Self::tenant_admin_tenant_wire)
+					.map(|record| Self::tenant_admin_tenant_wire(&snapshot, record))
 					.collect::<Vec<_>>();
 				tenants.sort_by_key(|tenant| tenant.tenant_id);
 				self.build_tenant_admin_frame(
@@ -2241,7 +2515,10 @@ fn not_leader_error(leader_hint: Option<u32>) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::consensus::TieredSlab;
+	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::network::transport::{TransportTier, TransportTierSet};
+	use crate::schema::SlabId;
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -2309,5 +2586,100 @@ mod tests {
 			assert_eq!(seed.entry.source_replicas, upstream.source_replicas);
 			assert_eq!(seed.entry.migration_hlc_floor, upstream.migration_hlc_floor);
 		}
+	}
+
+	#[test]
+	fn tenant_kek_versions_wire_marks_old_unreferenced_keys_safe_to_retire() {
+		let tenant_id = TenantId::new(7);
+		let old_kek_id = TenantKekId::try_from(11).unwrap();
+		let active_kek_id = TenantKekId::try_from(12).unwrap();
+		let mut snapshot = crate::consensus::raft_storage::SmState::default();
+		let mut keyset = TenantKeyset::default();
+		keyset.active_tenant_kek_id = Some(active_kek_id);
+		keyset.keys.insert(
+			old_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![1; 40],
+			},
+		);
+		keyset.keys.insert(
+			active_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![2; 40],
+			},
+		);
+		snapshot.tenant_keysets.insert(tenant_id, keyset);
+
+		let (complete, versions) =
+			WendelonControlServer::tenant_kek_versions_wire(&snapshot, tenant_id);
+		assert!(complete);
+		assert_eq!(versions.len(), 2);
+		assert_eq!(versions[0].tenant_kek_id, old_kek_id);
+		assert!(!versions[0].is_active);
+		assert_eq!(versions[0].tiered_slab_ref_count, 0);
+		assert!(versions[0].safe_to_retire);
+		assert_eq!(versions[1].tenant_kek_id, active_kek_id);
+		assert!(versions[1].is_active);
+		assert!(!versions[1].safe_to_retire);
+	}
+
+	#[test]
+	fn tenant_kek_versions_wire_blocks_retirement_when_refs_or_metadata_gaps_exist() {
+		let tenant_id = TenantId::new(9);
+		let old_kek_id = TenantKekId::try_from(21).unwrap();
+		let active_kek_id = TenantKekId::try_from(22).unwrap();
+		let mut snapshot = crate::consensus::raft_storage::SmState::default();
+		let mut keyset = TenantKeyset::default();
+		keyset.active_tenant_kek_id = Some(active_kek_id);
+		keyset.keys.insert(
+			old_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![3; 40],
+			},
+		);
+		keyset.keys.insert(
+			active_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![4; 40],
+			},
+		);
+		snapshot.tenant_keysets.insert(tenant_id, keyset);
+		snapshot.tiered_slabs.insert(
+			SlabId::new(100),
+			TieredSlab {
+				slab_id: SlabId::new(100),
+				l2_uri: "memory://tier/slab_100".into(),
+				payload_hash: [7; 32],
+				is_encrypted: true,
+				tenant_id: Some(tenant_id),
+				tenant_kek_id: Some(old_kek_id),
+			},
+		);
+		snapshot.tiered_slabs.insert(
+			SlabId::new(101),
+			TieredSlab {
+				slab_id: SlabId::new(101),
+				l2_uri: "memory://tier/slab_101".into(),
+				payload_hash: [8; 32],
+				is_encrypted: true,
+				tenant_id: None,
+				tenant_kek_id: None,
+			},
+		);
+
+		let (complete, versions) =
+			WendelonControlServer::tenant_kek_versions_wire(&snapshot, tenant_id);
+		assert!(!complete);
+		let old = versions
+			.iter()
+			.find(|version| version.tenant_kek_id == old_kek_id)
+			.unwrap();
+		assert_eq!(old.tiered_slab_ref_count, 1);
+		assert!(!old.safe_to_retire);
+		let active = versions
+			.iter()
+			.find(|version| version.tenant_kek_id == active_kek_id)
+			.unwrap();
+		assert!(!active.safe_to_retire);
 	}
 }

@@ -13,16 +13,18 @@ default = ["non-fips"]
 non-fips = ["aws-lc-rs/non-fips"]
 fips = ["aws-lc-rs/fips"]
 audit-kafka = ["dep:rdkafka"]
-otlp-http = ["dep:reqwest"]
+otlp-http = []
 otlp-grpc = ["dep:h2", "dep:http"]
 
 [dependencies]
 arrow = { version = "58.1.0", features = ["ipc_compression"] }
 async-trait = "0.1"
 aws-lc-rs = { version = "1.14", default-features = false }
+base64 = "0.22"
 blake3 = "1.5"
 bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
 bytes = "1.6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dashmap = "6.1.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 h2 = { version = "0.4", optional = true }
@@ -36,12 +38,13 @@ quinn = "0.11"
 rand = "0.10.1"
 rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl"], optional = true }
 redb = "4.0.0"
-reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2"], optional = true }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "blocking", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_bytes = "0.11.19"
+scrypt = "0.11.0"
 thiserror = "2.0.18"
 tokio = { version = "1.37", features = ["full"] }
 tokio-rustls = "0.26"

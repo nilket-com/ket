@@ -158,15 +158,34 @@ without reshaping the provider contract later.
 
 ## Artifacts
 
-- provider contract note
+- provider contract note: `plans/impl/workstream_E_provider_contract.md`
+- local-sealed baseline note: `plans/impl/workstream_E_local_sealed_baseline.md`
+- production-gating note: `plans/impl/workstream_E_production_gating.md`
+- AWS KMS uplift note: `plans/impl/workstream_E_aws_kms_uplift.md`
+- DEK re-wrap sweeper note: `plans/impl/workstream_E_dek_rewrap_sweeper.md`
+- tenant-KEK retirement note: `plans/impl/workstream_E_tenant_kek_retirement_accounting.md`
+- zeroization evidence note: `plans/impl/workstream_E_zeroization_note.md`
+- PKCS#11 seam note: `plans/impl/workstream_E_pkcs11_seam.md`
 - custody threat-model note
 - production-config policy for provider selection
 - rotation runbook
-- zeroization evidence note
+
+## Current Status
+
+- `E1` provider contract: complete
+- `E2` local-sealed baseline: complete
+- `E3` production gating: complete
+- `E4` AWS KMS uplift: complete
+- `E5` tenant KEK rotation surface: complete
+- `E6` DEK re-wrap sweeper: complete
+- `E7` zeroization and sensitive-buffer hygiene: complete
+- `E8` PKCS#11 seam: complete
+- tenant-KEK retirement accounting and explicit retirement mutation: complete
 
 ## Deferred Follow-Ons
 
 - multi-cloud provider breadth beyond the first real provider
 - PKCS#11 vendor-specific hardening
 - escrow ceremony details
+- policy-driven automatic retirement of historical tenant KEK versions once `safe_to_retire = true`
 - stronger regulated-profile operational controls layered above the same provider stack

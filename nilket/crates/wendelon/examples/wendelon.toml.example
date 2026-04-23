@@ -37,16 +37,25 @@ transfer_signing_secret = "{{TRANSFER_SIGNING_SECRET}}"
 [identity.trusted_transfer_signers]
 "{{NODE_ID}}" = "{{TRANSFER_VERIFYING_KEY}}"
 
-# Optional W4 root-KEK bootstrap selector. `dev-insecure` is the
-# current dev/test placeholder. It persists a local plaintext Root
-# KEK at `<data_dir>/.wendelon/dev-root-kek.bin` so restarted dev
-# nodes can still unwrap prior Tenant KEKs, and is not suitable for
-# a production custody boundary.
+# Root-KEK bootstrap selector.
 #
-# [crypto]
-# root_kek_provider = "dev-insecure"
-# tenant_kek_cache_max_entries = 2048
-# slab_dek_cache_max_entries = 10000
+# This checked-in example is explicitly dev-only, so it uses the
+# `dev-insecure` provider on purpose. Serious deployments should switch
+# this to `local-sealed`, which is the default serious custody path for
+# ordinary config loading:
+#
+#   root_kek_provider = { kind = "local-sealed", unlock_secret_env = "WENDELON_ROOT_KEK_SECRET" }
+#   root_kek_provider = { kind = "aws-kms", region = "us-east-1", key_id = "arn:aws:kms:us-east-1:111122223333:key/your-root-kek", access_key_id_env = "AWS_ACCESS_KEY_ID", secret_access_key_env = "AWS_SECRET_ACCESS_KEY", session_token_env = "AWS_SESSION_TOKEN" }
+#   root_kek_provider = { kind = "pkcs11", library_path = "/usr/lib/your-pkcs11.so", token_label = "WendelonToken", key_label = "root-kek", pin_env = "WENDELON_PKCS11_PIN", slot = 0 }   # seam only; runtime support not implemented yet
+#
+# `dev-insecure` persists a local plaintext Root KEK at
+# `<data_dir>/.wendelon/dev-root-kek.bin` and is not a real custody
+# boundary.
+
+[crypto]
+root_kek_provider = "dev-insecure"
+tenant_kek_cache_max_entries = 2048
+slab_dek_cache_max_entries = 10000
 
 # Optional inter-node mTLS transport. When configured, Wendelon binds
 # the real QUIC transport stack (`quinn`) plus the TCP+TLS fallback

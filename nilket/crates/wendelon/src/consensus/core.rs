@@ -1,7 +1,7 @@
-use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
+use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
-	ReleaseLeaseRequestMeta, SlabId, TenantId,
+	ReleaseLeaseRequestMeta, SlabId, TenantId, TenantKekId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -37,6 +37,18 @@ pub struct TieredSlab {
 	/// truth back through a fresh `TierSlab` commit on the next pass).
 	#[serde(default)]
 	pub is_encrypted: bool,
+	/// Tenant that owns the slab payload. Trailing optional field so
+	/// older Raft entries deserialize cleanly and can be backfilled
+	/// by a later `TierSlab` refresh without a separate migration.
+	#[serde(default)]
+	pub tenant_id: Option<TenantId>,
+	/// Tenant KEK version referenced by the tiered slab footer when
+	/// `is_encrypted = true`. Used for retirement accounting. Older
+	/// entries default to `None` and are conservatively treated as
+	/// "not yet accounted" until a later sweeper refresh stamps the
+	/// authoritative value through replicated state.
+	#[serde(default)]
+	pub tenant_kek_id: Option<TenantKekId>,
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.
@@ -310,9 +322,14 @@ pub enum WendelonRequest {
 	/// subsequent slab DEK wraps. Historical versions remain in the
 	/// state machine so pre-rotation slabs keep decrypting.
 	///
-	/// Keep this durable variant at the end of the enum so postcard
-	/// discriminants for older variants remain upgrade-compatible.
+	/// Keep durable tenant-crypto variants at the end of the enum so
+	/// postcard discriminants for older variants remain
+	/// upgrade-compatible.
 	InstallTenantKekVersion(InstallTenantKekVersion),
+	/// Destructively retire a historical Tenant KEK version once the
+	/// replicated tiered-slab accounting proves no encrypted slab still
+	/// references it.
+	RetireTenantKekVersion(RetireTenantKekVersion),
 }
 
 /// The response returned to the client after a Raft command is committed.

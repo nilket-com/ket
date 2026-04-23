@@ -50,6 +50,10 @@
 //!  * `max_plaintext_rewrites_per_pass`: how many legacy plaintext
 //!    L2 slabs are re-encrypted per scan. Setting it to 0 pauses
 //!    the migration without disabling fresh tier uploads.
+//!  * `max_dek_rewraps_per_pass`: how many encrypted L2 slabs
+//!    sealed under stale tenant KEKs are re-emitted per scan.
+//!    Setting it to 0 pauses the background re-wrap path without
+//!    disabling fresh tier uploads or plaintext migration.
 //!
 //! ## Leader-only uploads
 //!
@@ -68,7 +72,7 @@ use crate::consensus::{
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
-use crate::schema::{HybridTimestamp, NodeId, SlabId};
+use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
@@ -80,6 +84,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
+use zeroize::Zeroizing;
 
 /// Knobs for the background sweeper. Defaults aim for "runs on a
 /// laptop without destroying your write throughput" — production
@@ -106,6 +111,10 @@ pub struct SweeperConfig {
 	/// Maximum number of legacy plaintext L2 slabs to rewrite into
 	/// ciphertext during one scan. `0` pauses the rewrite path.
 	pub max_plaintext_rewrites_per_pass: usize,
+	/// Maximum number of encrypted L2 slabs to re-wrap under the
+	/// active tenant KEK during one scan. `0` pauses the re-wrap
+	/// path.
+	pub max_dek_rewraps_per_pass: usize,
 }
 
 impl Default for SweeperConfig {
@@ -116,6 +125,7 @@ impl Default for SweeperConfig {
 			max_upload_bytes_per_sec: None,
 			key_prefix: String::new(),
 			max_plaintext_rewrites_per_pass: 1,
+			max_dek_rewraps_per_pass: 1,
 		}
 	}
 }
@@ -314,6 +324,14 @@ impl SlabSweeper {
 		report.skipped_already_encrypted_tiered = rewritten.skipped_already_encrypted;
 		report.plaintext_rewrite_failures = rewritten.failed;
 		report.failed += rewritten.failed;
+		let rewrapped = self
+			.rewrap_tiered_slabs_once(self.config.max_dek_rewraps_per_pass)
+			.await?;
+		report.rewrapped_tiered_deks = rewrapped.rewrapped;
+		report.skipped_current_tenant_kek_tiered = rewrapped.skipped_already_current;
+		report.backfilled_tenant_kek_metadata_tiered = rewrapped.backfilled_metadata;
+		report.dek_rewrap_failures = rewrapped.failed;
+		report.failed += rewrapped.failed;
 		let retention_rewrites = self
 			.rewrite_tiered_slabs_for_retention_once(RETENTION_TIERED_REWRITE_MAX_PER_PASS)
 			.await?;
@@ -362,10 +380,10 @@ impl SlabSweeper {
 		// loudly if the slab has been rotated away or already
 		// tiered — either is a sign the caller's info went stale,
 		// and re-listing on the next pass will converge.
-		let plaintext: Vec<u8> = self.slab.read_sealed_raw(info.slab_id).await?;
+		let plaintext = Zeroizing::new(self.slab.read_sealed_raw(info.slab_id).await?);
 		let encrypted = self
 			.slab
-			.encrypt_tiered_object_blob(info.slab_id, &plaintext)?;
+			.encrypt_tiered_object_blob(info.slab_id, plaintext.as_ref())?;
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
 
 		// Phase 2: upload to L2, applying the rate limit.
@@ -410,6 +428,8 @@ impl SlabSweeper {
 			l2_uri: l2_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
@@ -531,6 +551,8 @@ impl SlabSweeper {
 			l2_uri: new_uri.clone(),
 			payload_hash: expected_hash,
 			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -563,6 +585,166 @@ impl SlabSweeper {
 			"rewrote plaintext L2 slab into ADR 022 ciphertext"
 		);
 		Ok(PlaintextRewriteOutcome::Rewritten)
+	}
+
+	async fn rewrap_tiered_slabs_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<TenantKekRewrapReport> {
+		let mut report = TenantKekRewrapReport::default();
+		if max_slabs == 0 {
+			return Ok(report);
+		}
+		for pointer in self.slab.list_tiered_slabs().await {
+			if report.rewrapped + report.backfilled_metadata >= max_slabs {
+				break;
+			}
+			match self.rewrap_one_tiered_slab(&pointer).await {
+				Ok(TenantKekRewrapOutcome::AlreadyCurrent) => {
+					report.skipped_already_current += 1;
+				}
+				Ok(TenantKekRewrapOutcome::MetadataBackfilled) => {
+					report.backfilled_metadata += 1;
+				}
+				Ok(TenantKekRewrapOutcome::Rewrapped) => {
+					report.rewrapped += 1;
+				}
+				Err(error) => {
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"tenant KEK re-wrap failed; will retry on next scan"
+					);
+					report.failed += 1;
+				}
+			}
+		}
+		Ok(report)
+	}
+
+	async fn rewrap_one_tiered_slab(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<TenantKekRewrapOutcome> {
+		if let (Some(tenant_id), Some(pointer_tenant_kek_id)) =
+			(pointer.tenant_id, pointer.tenant_kek_id)
+		{
+			let active_tenant_kek_id = self.slab.active_tenant_kek_id(tenant_id)?;
+			if pointer_tenant_kek_id == active_tenant_kek_id {
+				return Ok(TenantKekRewrapOutcome::AlreadyCurrent);
+			}
+		}
+		let blob = self.object_store.get_bytes(&pointer.l2_uri).await?;
+		let Some(footer) = self.slab.encrypted_tiered_footer_summary(blob.as_ref())? else {
+			return Ok(TenantKekRewrapOutcome::AlreadyCurrent);
+		};
+		let active_tenant_kek_id = self.slab.active_tenant_kek_id(footer.tenant_id)?;
+		if footer.tenant_kek_id == active_tenant_kek_id
+			&& pointer.tenant_id == Some(footer.tenant_id)
+			&& pointer.tenant_kek_id == Some(footer.tenant_kek_id)
+		{
+			return Ok(TenantKekRewrapOutcome::AlreadyCurrent);
+		}
+		if footer.tenant_kek_id == active_tenant_kek_id {
+			let tier = TieredSlab {
+				slab_id: pointer.slab_id,
+				l2_uri: pointer.l2_uri.clone(),
+				payload_hash: pointer.payload_hash,
+				is_encrypted: true,
+				tenant_id: Some(footer.tenant_id),
+				tenant_kek_id: Some(footer.tenant_kek_id),
+			};
+			if let Err(error) = self.raft.commit_tier_slab(tier).await {
+				return Err(error);
+			}
+			if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
+				self.slab.apply_tier_slab(pointer).await?;
+			}
+			return Ok(TenantKekRewrapOutcome::MetadataBackfilled);
+		}
+		let plaintext = Zeroizing::new(
+			self.slab
+				.decode_tiered_object_blob(pointer, blob.as_ref())?,
+		);
+		let encrypted = self
+			.slab
+			.encrypt_tiered_object_blob(pointer.slab_id, plaintext.as_ref())?;
+		if encrypted.tenant_kek_id != active_tenant_kek_id {
+			return Err(std::io::Error::other(format!(
+				"tenant KEK re-wrap for slab {} expected active tenant_kek_id {}, got {}",
+				pointer.slab_id, active_tenant_kek_id, encrypted.tenant_kek_id
+			)));
+		}
+		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
+		let key = self.rewritten_key(pointer.slab_id);
+		self.rate_limit_upload(encrypted.bytes.len()).await;
+		let new_uri = self.object_store.put(&key, &encrypted.bytes).await?;
+		let fetched = self.object_store.get(&new_uri).await?;
+		let fetched_hash = crate::hash::content::digest(&fetched);
+		if fetched_hash != expected_hash {
+			let _ = self.delete_object_if_present(&new_uri).await;
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"tenant KEK re-wrap hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+					pointer.slab_id,
+					&expected_hash[..4],
+					&fetched_hash[..4],
+				),
+			));
+		}
+
+		let tier = TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: new_uri.clone(),
+			payload_hash: expected_hash,
+			is_encrypted: true,
+			tenant_id: Some(footer.tenant_id),
+			tenant_kek_id: Some(active_tenant_kek_id),
+		};
+		if let Err(error) = self.raft.commit_tier_slab(tier).await {
+			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
+				.await;
+			return Err(error);
+		}
+
+		if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
+			self.slab.apply_tier_slab(pointer).await?;
+		}
+
+		if pointer.l2_uri != new_uri {
+			if let Err(error) = self.delete_object_if_present(&pointer.l2_uri).await {
+				tracing::warn!(
+					slab_id = pointer.slab_id.get(),
+					l2_uri = %pointer.l2_uri,
+					error = %error,
+					"tenant KEK re-wrap committed but old object cleanup failed"
+				);
+			} else {
+				self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
+			}
+		} else {
+			self.slab.clear_retired_tiered_cleanup(pointer.slab_id);
+		}
+		tracing::info!(
+			slab_id = pointer.slab_id.get(),
+			tenant_id = footer.tenant_id.get(),
+			old_tenant_kek_id = footer.tenant_kek_id.get(),
+			new_tenant_kek_id = active_tenant_kek_id.get(),
+			old_l2_uri = %pointer.l2_uri,
+			new_l2_uri = %new_uri,
+			"re-wrapped tiered slab under active tenant KEK"
+		);
+		self.emit_tenant_kek_rewrap_audit(
+			pointer.slab_id,
+			footer.tenant_id,
+			footer.tenant_kek_id,
+			active_tenant_kek_id,
+			&pointer.l2_uri,
+			&new_uri,
+		);
+		Ok(TenantKekRewrapOutcome::Rewrapped)
 	}
 
 	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
@@ -653,12 +835,26 @@ impl SlabSweeper {
 						),
 					));
 				}
+				let footer = self
+					.slab
+					.encrypted_tiered_footer_summary(&encrypted_bytes)?
+					.ok_or_else(|| {
+						std::io::Error::new(
+							std::io::ErrorKind::InvalidData,
+							format!(
+								"retention rewrite for slab {} did not produce an encrypted footer",
+								slab_id
+							),
+						)
+					})?;
 
 				let tier = TieredSlab {
 					slab_id,
 					l2_uri: new_uri.clone(),
 					payload_hash,
 					is_encrypted: true,
+					tenant_id: Some(footer.tenant_id),
+					tenant_kek_id: Some(footer.tenant_kek_id),
 				};
 				if let Err(error) = self.raft.commit_tier_slab(tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
@@ -794,6 +990,46 @@ impl SlabSweeper {
 		}
 	}
 
+	fn emit_tenant_kek_rewrap_audit(
+		&self,
+		slab_id: SlabId,
+		tenant_id: TenantId,
+		old_tenant_kek_id: TenantKekId,
+		new_tenant_kek_id: TenantKekId,
+		old_l2_uri: &str,
+		new_l2_uri: &str,
+	) {
+		let message = format!(
+			"slab_id={} tenant_id={} old_tenant_kek_id={} new_tenant_kek_id={} old_l2_uri={} new_l2_uri={}",
+			slab_id.get(),
+			tenant_id.get(),
+			old_tenant_kek_id.get(),
+			new_tenant_kek_id.get(),
+			old_l2_uri,
+			new_l2_uri,
+		);
+		let audit = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::CryptoSlabDekRewrapped,
+			self.local_node,
+			message,
+		)
+		.with_tenant(tenant_id)
+		.with_parameter("slab_id", slab_id.get())
+		.with_parameter("tenant_id", tenant_id.get())
+		.with_parameter("old_tenant_kek_id", old_tenant_kek_id.get())
+		.with_parameter("new_tenant_kek_id", new_tenant_kek_id.get())
+		.with_parameter("old_l2_uri", old_l2_uri)
+		.with_parameter("new_l2_uri", new_l2_uri);
+		if let Err(err) = self.audit_sink.emit(audit) {
+			tracing::warn!(
+				slab_id = slab_id.get(),
+				error = %err,
+				"tenant KEK re-wrap audit emission failed"
+			);
+		}
+	}
+
 	/// Pull the state machine's authoritative tier pointer for a
 	/// slab (post-apply). Returns `None` if for some reason the
 	/// apply didn't land — which we treat as a terminal failure
@@ -805,6 +1041,8 @@ impl SlabSweeper {
 			l2_uri: t.l2_uri.clone(),
 			payload_hash: t.payload_hash,
 			is_encrypted: t.is_encrypted,
+			tenant_id: t.tenant_id,
+			tenant_kek_id: t.tenant_kek_id,
 		})
 	}
 
@@ -818,6 +1056,8 @@ impl SlabSweeper {
 				l2_uri: tier.l2_uri.clone(),
 				payload_hash: tier.payload_hash,
 				is_encrypted: tier.is_encrypted,
+				tenant_id: tier.tenant_id,
+				tenant_kek_id: tier.tenant_kek_id,
 			})
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
@@ -1057,6 +1297,10 @@ pub struct SweepReport {
 	pub rewritten_plaintext_tiered: usize,
 	pub skipped_already_encrypted_tiered: usize,
 	pub plaintext_rewrite_failures: usize,
+	pub rewrapped_tiered_deks: usize,
+	pub skipped_current_tenant_kek_tiered: usize,
+	pub backfilled_tenant_kek_metadata_tiered: usize,
+	pub dek_rewrap_failures: usize,
 	pub retention_rewritten_tiered: usize,
 	pub retention_pruned_versions: usize,
 	pub retention_reclaimed_bytes: u64,
@@ -1071,6 +1315,14 @@ pub struct SweepReport {
 struct PlaintextRewriteReport {
 	rewritten: usize,
 	skipped_already_encrypted: usize,
+	failed: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TenantKekRewrapReport {
+	rewrapped: usize,
+	skipped_already_current: usize,
+	backfilled_metadata: usize,
 	failed: usize,
 }
 
@@ -1098,6 +1350,13 @@ struct PreparedTieredRetentionOutcome {
 enum PlaintextRewriteOutcome {
 	AlreadyEncrypted,
 	Rewritten,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenantKekRewrapOutcome {
+	AlreadyCurrent,
+	MetadataBackfilled,
+	Rewrapped,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1140,6 +1399,8 @@ impl TierObserver for ManagerTierObserver {
 					l2_uri: tier.l2_uri.clone(),
 					payload_hash: tier.payload_hash,
 					is_encrypted: tier.is_encrypted,
+					tenant_id: tier.tenant_id,
+					tenant_kek_id: tier.tenant_kek_id,
 				},
 				Some(applied_log_index),
 			)
@@ -1274,6 +1535,8 @@ mod tests {
 			l2_uri: pointer.l2_uri.clone(),
 			payload_hash: pointer.payload_hash,
 			is_encrypted: pointer.is_encrypted,
+			tenant_id: pointer.tenant_id,
+			tenant_kek_id: pointer.tenant_kek_id,
 		})
 		.await;
 	}
@@ -1379,6 +1642,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 
@@ -1425,6 +1689,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 		sweeper.sweep_once().await.unwrap();
@@ -1458,6 +1723,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 		let report = sweeper.sweep_once().await.unwrap();
@@ -1490,6 +1756,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: String::new(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 		let report = sweeper.sweep_once().await.unwrap();
@@ -1516,6 +1783,8 @@ mod tests {
 			l2_uri: "file:///dev/null".into(),
 			payload_hash: [0; 32],
 			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
@@ -1543,6 +1812,8 @@ mod tests {
 			l2_uri: old_uri.clone(),
 			payload_hash: old_hash,
 			is_encrypted: false,
+			tenant_id: None,
+			tenant_kek_id: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
@@ -1563,6 +1834,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 
@@ -1593,6 +1865,197 @@ mod tests {
 		let second = sweeper.sweep_once().await.unwrap();
 		assert_eq!(second.rewritten_plaintext_tiered, 0);
 		assert!(second.skipped_already_encrypted_tiered >= 1);
+	}
+
+	#[tokio::test]
+	async fn sweeper_rewraps_tiered_slabs_to_the_active_tenant_kek() {
+		use crate::storage::core::StorageEngine;
+
+		let l1_dir = fresh_dir("tenant-kek-rewrap-l1");
+		let l2_root = fresh_dir("tenant-kek-rewrap-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: crypto.clone(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let old_loc = manager
+			.append(tenant(), id(0x5150), hlc_at(10), b"before-rotation")
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		assert_eq!(old_loc.slab_id, sealed_id);
+
+		let sm = WendelonStateMachine::new();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let audit_sink = Arc::new(InMemoryAuditSink::new());
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		)
+		.with_audit_sink(node_id(7), audit_sink.clone());
+
+		let first = sweeper.sweep_once().await.unwrap();
+		assert_eq!(first.tiered, 1);
+		let old_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		let old_blob = l2.get(&old_pointer.l2_uri).await.unwrap();
+		let old_footer = manager
+			.encrypted_tiered_footer_summary(&old_blob)
+			.unwrap()
+			.expect("initial tiered object must be encrypted");
+		assert_eq!(manager.read(old_loc).await.unwrap(), b"before-rotation");
+
+		let rotation = crypto.prepare_rotation(tenant()).unwrap();
+		let rotated_tenant_kek_id = rotation.tenant_kek_id;
+		crypto.apply_rotation(&rotation).unwrap();
+
+		let second = sweeper.sweep_once().await.unwrap();
+		assert_eq!(second.rewrapped_tiered_deks, 1);
+		assert_eq!(second.dek_rewrap_failures, 0);
+		let new_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_ne!(new_pointer.l2_uri, old_pointer.l2_uri);
+		let new_blob = l2.get(&new_pointer.l2_uri).await.unwrap();
+		let new_footer = manager
+			.encrypted_tiered_footer_summary(&new_blob)
+			.unwrap()
+			.expect("re-wrapped tiered object must remain encrypted");
+		assert_eq!(new_footer.tenant_kek_id, rotated_tenant_kek_id);
+		assert_ne!(new_footer.tenant_kek_id, old_footer.tenant_kek_id);
+		assert!(
+			l2.get(&old_pointer.l2_uri).await.is_err(),
+			"old tenant-KEK object should be deleted after re-wrap"
+		);
+		assert_eq!(manager.read(old_loc).await.unwrap(), b"before-rotation");
+
+		let events = audit_sink.events();
+		assert_eq!(events.len(), 1);
+		assert_eq!(events[0].event_type(), "crypto.slab_dek_rewrapped");
+		assert!(events[0].message.contains(&format!(
+			"old_tenant_kek_id={}",
+			old_footer.tenant_kek_id.get()
+		)));
+		assert!(events[0].message.contains(&format!(
+			"new_tenant_kek_id={}",
+			rotated_tenant_kek_id.get()
+		)));
+	}
+
+	#[tokio::test]
+	async fn sweeper_backfills_missing_tenant_kek_pointer_metadata_without_rewrap() {
+		use crate::storage::core::StorageEngine;
+
+		let l1_dir = fresh_dir("tenant-kek-backfill-l1");
+		let l2_root = fresh_dir("tenant-kek-backfill-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let old_loc = manager
+			.append(tenant(), id(0x5151), hlc_at(10), b"metadata-backfill")
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		assert_eq!(old_loc.slab_id, sealed_id);
+
+		let sm = WendelonStateMachine::new();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let audit_sink = Arc::new(InMemoryAuditSink::new());
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2.clone(),
+			committer,
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		)
+		.with_audit_sink(node_id(8), audit_sink.clone());
+
+		let first = sweeper.sweep_once().await.unwrap();
+		assert_eq!(first.tiered, 1);
+
+		let current_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		let current_blob = l2.get(&current_pointer.l2_uri).await.unwrap();
+		let current_footer = manager
+			.encrypted_tiered_footer_summary(&current_blob)
+			.unwrap()
+			.expect("tiered object must be encrypted");
+
+		let metadata_missing_pointer = TieredSlabPointer {
+			slab_id: current_pointer.slab_id,
+			l2_uri: current_pointer.l2_uri.clone(),
+			payload_hash: current_pointer.payload_hash,
+			is_encrypted: current_pointer.is_encrypted,
+			tenant_id: None,
+			tenant_kek_id: None,
+		};
+		manager
+			.apply_tier_slab(metadata_missing_pointer.clone())
+			.await
+			.unwrap();
+		seed_state_machine_pointer(&sm, &metadata_missing_pointer).await;
+
+		let second = sweeper.sweep_once().await.unwrap();
+		assert_eq!(second.rewrapped_tiered_deks, 0);
+		assert_eq!(second.backfilled_tenant_kek_metadata_tiered, 1);
+		assert_eq!(second.skipped_current_tenant_kek_tiered, 0);
+		assert_eq!(second.dek_rewrap_failures, 0);
+		assert!(audit_sink.events().is_empty());
+
+		let refreshed_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(refreshed_pointer.l2_uri, current_pointer.l2_uri);
+		assert_eq!(refreshed_pointer.tenant_id, Some(current_footer.tenant_id));
+		assert_eq!(
+			refreshed_pointer.tenant_kek_id,
+			Some(current_footer.tenant_kek_id)
+		);
+
+		let third = sweeper.sweep_once().await.unwrap();
+		assert_eq!(third.rewrapped_tiered_deks, 0);
+		assert_eq!(third.backfilled_tenant_kek_metadata_tiered, 0);
+		assert!(third.skipped_current_tenant_kek_tiered >= 1);
 	}
 
 	#[tokio::test]
@@ -1652,6 +2115,14 @@ mod tests {
 			l2_uri: old_uri.clone(),
 			payload_hash: old_hash,
 			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -1672,6 +2143,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		)
 		.with_clock(Arc::new(FixedClock { now_ms }))
@@ -1761,6 +2233,14 @@ mod tests {
 			l2_uri: old_uri.clone(),
 			payload_hash: old_hash,
 			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		manager
@@ -1789,6 +2269,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		)
 		.with_clock(Arc::new(FixedClock { now_ms }))
@@ -1893,6 +2374,14 @@ mod tests {
 			l2_uri: old_uri,
 			payload_hash: old_hash,
 			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -1912,6 +2401,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		)
 		.with_clock(Arc::new(FixedClock { now_ms }))
@@ -1998,6 +2488,14 @@ mod tests {
 			l2_uri: old_uri.clone(),
 			payload_hash: old_hash,
 			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2021,6 +2519,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		)
 		.with_clock(Arc::new(FixedClock { now_ms }))
@@ -2061,6 +2560,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		)
 		.with_clock(Arc::new(FixedClock { now_ms }))
@@ -2117,6 +2617,14 @@ mod tests {
 				l2_uri: old_uri.clone(),
 				payload_hash,
 				is_encrypted: true,
+				tenant_id: Some(tenant()),
+				tenant_kek_id: Some(
+					manager
+						.encrypted_tiered_footer_summary(&encrypted.bytes)
+						.unwrap()
+						.unwrap()
+						.tenant_kek_id,
+				),
 			})
 			.await
 			.unwrap();
@@ -2152,6 +2660,7 @@ mod tests {
 				max_upload_bytes_per_sec: None,
 				key_prefix: "tier/".into(),
 				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
 			},
 		);
 		let report = sweeper.sweep_once().await.unwrap();
