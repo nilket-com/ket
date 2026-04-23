@@ -26,6 +26,13 @@ State vocabulary:
 
 | Artifact | Owner | Canonical Path | Gate | State | Notes |
 |---|---|---|---|---|---|
+| A ADR status matrix | `A` | `plans/impl/adr_status_matrix.md` | `M0` | `present` | Current status, owner, blocking milestone, and next action for every ADR through `034` |
+| A design-lock register | `A` | `plans/gap/design_lock_20260422.md` | `M0` | `present` | Maintained `DL-*` register for narrow load-bearing implementation decisions |
+| A claim-discipline register | `A` | `plans/impl/claim_discipline.md` | `M0-M5` | `present` | Standing claim baseline for docs, comments, and release-facing language |
+| A external dependency tracker | `A` | `plans/impl/external_dependency_tracker.md` | `M0-M5` | `present` | Repo-visible tracker for IANA PEN, CMVP/lab, and custody-provider onboarding |
+| A IANA PEN filing record | `A` + `F` | `plans/impl/external/iana_pen_filing_record.md` | `M0/M3` | `reserved` | External receipt path; tracker row remains `open` until this exists |
+| A CMVP lab contact record | `A` + `J` | `plans/impl/external/cmvp_lab_contact_record.md` | `M0/M5` | `reserved` | External lab outreach/selection path |
+| A custody-provider onboarding record | `A` + `E` | `plans/impl/external/custody_provider_onboarding_record.md` | `M0/M3` | `reserved` | External provider/legal/procurement state path |
 | B transition table | `B` | `plans/impl/workstream_B_transition_table.md` | `M1` | `present` | Write-outcome state model |
 | B fault-injection report | `B` | `plans/impl/workstream_B_fault_injection_report.md` | `M1` | `present` | Current injected-failure evidence |
 | B replay/idempotency note | `B` | `plans/impl/workstream_B_replay_idempotency_note.md` | `M1` | `present` | Duplicate/restart semantics |
@@ -45,6 +52,8 @@ State vocabulary:
 | D soak report | `D` | `plans/impl/workstream_D_soak_report.md` | `M2/M3` | `present` | D6 report template; measured evidence still pending |
 | D dashboard inventory | `D` | `plans/impl/workstream_D_dashboard_inventory.md` | `M2/M3` | `reserved` | Can stay thin at first |
 | D alert inventory | `D` | `plans/impl/workstream_D_alert_inventory.md` | `M2/M3` | `reserved` | Can stay thin at first |
+| D audit/trace correlation inventory | `D` + `G` | `plans/impl/workstream_D_audit_trace_correlation_inventory.md` | `M3` | `reserved` | Correlation fields and join points between trace inventory and audit evidence |
+| D hostile-failure evidence package | `D` | `plans/impl/workstream_D_hostile_failure_evidence_package.md` | `M4` | `reserved` | Consolidated hostile-review, chaos, simulator, and soak evidence package for regulated pilot authorization |
 | E provider contract note | `E` | `plans/impl/workstream_E_provider_contract.md` | `M0/M3` | `present` | E1 root-KEK bootstrap, health, and rotation seam |
 | E local-sealed baseline note | `E` | `plans/impl/workstream_E_local_sealed_baseline.md` | `M3` | `present` | E2 encrypted-at-rest commodity baseline with env/file unlock |
 | E production-gating note | `E` | `plans/impl/workstream_E_production_gating.md` | `M3` | `present` | E3 removes the silent `dev-insecure` default and narrows it to explicit dev/test paths |
@@ -74,6 +83,13 @@ State vocabulary:
 | H first-party operator direction | `H` | `plans/impl/workstream_H_first_party_operator_direction.md` | `M3` | `present` | H5 freezes the future Wendelon-owned operator scope as storage-tier-only orchestration over the H2/H3/H4 recovery surfaces, with explicit replacement ownership and drill integration points |
 | H runbook catalog | `H` | `plans/ops/runbooks/README.md` | `M3` | `present` | H6 promotes the operator-facing runbook set for replacement, restore, pending-finalization distress, and audit/archive distress out of internal notes and into the durable ops catalog |
 | H drill report | `H` | `plans/impl/workstream_H_drill_report.md` | `M3` | `present` | H6 records the required non-author drill evidence shape honestly; the artifact exists, but the gate remains open until a real non-author restore or replacement drill is entered |
+| I Toron boundary contract | `I` | `plans/impl/workstream_I_boundary_contract.md` | `M4` | `reserved` | Versioned compute-storage contract covering identity handoff, schema intent, quota/error semantics, trace context, and audit attribution |
+| I contract-test inventory | `I` + `D` | `plans/impl/workstream_I_contract_test_inventory.md` | `M4` | `reserved` | Reference test fleet for identity propagation, schema transitions, quota failures, trace continuity, and audit attribution |
+| J crypto-boundary inventory | `J` | `plans/impl/workstream_J_crypto_boundary_inventory.md` | `M5` | `reserved` | Crypto libraries, FIPS-bound functions, transport posture, build flags, and target platforms |
+| J FIPS build-profile note | `J` | `plans/impl/workstream_J_fips_build_profile.md` | `M5` | `reserved` | Build profile, dependency pins, boundary restrictions, and self-test posture |
+| J release artifact evidence | `J` | `plans/impl/workstream_J_release_artifact_evidence.md` | `M5` | `reserved` | SBOM, signing, provenance, and verification outputs |
+| J CMVP status evidence package | `J` + `A` | `plans/impl/workstream_J_cmvp_status_evidence.md` | `M5` | `reserved` | CMVP status, lab evidence, and allowed FIPS/CMVP claim language |
+| J compliance-pack index | `J` | `plans/impl/workstream_J_compliance_pack_index.md` | `M5` | `reserved` | Regulated compliance pack skeleton and evidence index |
 
 ## Registry Rules
 

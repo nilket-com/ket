@@ -140,6 +140,7 @@ The workstream does not execute those external processes alone, but it does own 
 
 - link-check or reference-check for roadmap and ADR anchors
 - CI smoke that the scorecard inputs resolve to real files or artifact locations
+- `tests/governance_artifacts.rs` validates the A-owned control-plane artifact references
 - scheduled review cadence:
   - weekly ADR/design-lock review
   - milestone readiness review before each milestone transition
@@ -154,11 +155,12 @@ The workstream does not execute those external processes alone, but it does own 
 
 ## Artifacts
 
-- ADR status matrix
-- updated design-lock register
-- milestone scorecard definition
-- artifact registry
-- external dependency tracker
+- ADR status matrix: `plans/impl/adr_status_matrix.md`
+- updated design-lock register: `plans/gap/design_lock_20260422.md`
+- claim-discipline register: `plans/impl/claim_discipline.md`
+- milestone scorecard definition: `plans/impl/scorecard.md`
+- artifact registry: `plans/impl/artifact_registry.md`
+- external dependency tracker: `plans/impl/external_dependency_tracker.md`
 
 ## Deferred Follow-Ons
 

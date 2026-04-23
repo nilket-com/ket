@@ -25,8 +25,10 @@ Status vocabulary:
 
 | Gate | Row | Status | Owner | Artifact / Source | Notes |
 |---|---|---|---|---|---|
-| `M0 Foundation` | ADR wave accepted/amended through `034` | `done` | `A` | `plans/adr/003,009,011,018,020,021,025,027,029,030-034` | Current architecture baseline |
-| `M0 Foundation` | Design-lock register | `done` | `A` | `plans/gap/design_lock_20260422.md` | Program-of-record narrow decisions |
+| `M0 Foundation` | ADR wave status-normalized through `034` | `done` | `A` | `plans/impl/adr_status_matrix.md` | Every ADR has status, owner, blocking milestone, and next action |
+| `M0 Foundation` | Design-lock register | `done` | `A` | `plans/gap/design_lock_20260422.md` | Program-of-record narrow decisions with maintained `DL-*` register |
+| `M0 Foundation` | Claim-discipline register | `done` | `A` | `plans/impl/claim_discipline.md` | Standing allowed/prohibited claim baseline for transport, custody, recovery, audit, compliance, and Toron |
+| `M0 Foundation` | External dependency tracker | `partial` | `A` | `plans/impl/external_dependency_tracker.md` | Tracker is live; repo-visible filing, lab, and provider receipts are still open |
 | `M0 Foundation` | Implementation roadmap | `done` | `A` | `plans/impl/roadmap.md` | Current milestone/dependency map |
 | `M0 Foundation` | Artifact registry | `done` | `D` | `plans/impl/artifact_registry.md` | Minimal `A-lite` support for `D` |
 | `M0 Foundation` | Scorecard | `done` | `D` | `plans/impl/scorecard.md` | This file |
@@ -63,25 +65,29 @@ Status vocabulary:
 | `M1 Correctness Locked` | B fault-injection report | `done` | `B` | `plans/impl/workstream_B_fault_injection_report.md` | |
 | `M1 Correctness Locked` | B replay/idempotency note | `done` | `B` | `plans/impl/workstream_B_replay_idempotency_note.md` | |
 | `M1 Correctness Locked` | B operator note | `done` | `B` | `plans/impl/workstream_B_operator_notes.md` | |
-| `M1 Correctness Locked` | B write-path benchmark delta | `open` | `B` + `D` | reserved in `artifact_registry.md` | Harness exists; measured delta report does not |
+| `M1 Correctness Locked` | B write-path benchmark delta | `open` | `B` + `D` | reserved in `plans/impl/artifact_registry.md` | Harness exists; measured delta report does not |
 | `M1 Correctness Locked` | D metric catalog | `done` | `D` | `plans/impl/workstream_D_metric_catalog.md` | D1 output |
 | `M1 Correctness Locked` | D trace inventory | `done` | `D` | `plans/impl/workstream_D_trace_inventory.md` | D2 first-pass live span inventory is on disk |
 | `M1 Correctness Locked` | D chaos matrix | `done` | `D` | `plans/impl/workstream_D_chaos_matrix.md` | Matrix is on disk and every planned first-pass row is now live, including isolated-leader partition-plus-restart |
 | `M1 Correctness Locked` | D simulator registry | `done` | `D` | `plans/impl/workstream_D_simulator_registry.md` | D4 registry is complete and every planned simulator row is now live |
 | `M1 Correctness Locked` | D property suite | `done` | `D` | `plans/impl/workstream_D_property_suite.md`, `tests/property_suite.rs` | D5 minimum property suite is live in ordinary CI |
-| `M2 Scale & Survive` | C admission snapshot note | `open` | `C` + `D` | reserved in `artifact_registry.md` | Code landed in `C1`; canonical note does not exist yet |
-| `M2 Scale & Survive` | C execution-topology note | `open` | `C` + `D` | reserved in `artifact_registry.md` | WAL/slab split is live; note is still missing |
-| `M2 Scale & Survive` | C overload-limit matrix | `open` | `C` + `D` | reserved in `artifact_registry.md` | Limits and tests exist; operator-facing matrix does not |
-| `M2 Scale & Survive` | C panic/poison disposition note | `open` | `C` + `D` | reserved in `artifact_registry.md` | C6 closed code paths; evidence note is still missing |
+| `M2 Scale & Survive` | C admission snapshot note | `open` | `C` + `D` | reserved in `plans/impl/artifact_registry.md` | Code landed in `C1`; canonical note does not exist yet |
+| `M2 Scale & Survive` | C execution-topology note | `open` | `C` + `D` | reserved in `plans/impl/artifact_registry.md` | WAL/slab split is live; note is still missing |
+| `M2 Scale & Survive` | C overload-limit matrix | `open` | `C` + `D` | reserved in `plans/impl/artifact_registry.md` | Limits and tests exist; operator-facing matrix does not |
+| `M2 Scale & Survive` | C panic/poison disposition note | `open` | `C` + `D` | reserved in `plans/impl/artifact_registry.md` | C6 closed code paths; evidence note is still missing |
 | `M2 Scale & Survive` | C overload-limit implementation | `done` | `C` | code + tests under `src/network/server.rs` | Listener and post-auth bounds are live |
 | `M2 Scale & Survive` | C execution-topology benchmark harness | `done` | `C` | `benches/io_topology.rs` | Shared vs split modes both compile |
-| `M2 Scale & Survive` | C benchmark numbers on real hardware | `open` | `C` + `D` | reserved in `artifact_registry.md` | Sandbox compile only, no authoritative numbers |
+| `M2 Scale & Survive` | C benchmark numbers on real hardware | `open` | `C` + `D` | reserved in `plans/impl/artifact_registry.md` | Sandbox compile only, no authoritative numbers |
 | `M2 Scale & Survive` | D critical-path metric ownership | `done` | `D` | `plans/impl/workstream_D_metric_catalog.md` | B/WAL, migration-proxy, and `io_uring` rows are live |
 | `M2 Scale & Survive` | D trace inventory | `done` | `D` | `plans/impl/workstream_D_trace_inventory.md` | Request-entry and pending-reconcile span inventory is on disk |
 | `M2 Scale & Survive` | D soak spec | `done` | `D` | `plans/impl/workstream_D_soak_spec.md` | D6 workload shape and promotion rule are fixed |
 | `M2 Scale & Survive` | D soak report | `partial` | `D` | `plans/impl/workstream_D_soak_report.md` | Template is present; authoritative measured run is still pending |
-| `M3 Customer Pilot Ready` | Audit/trace correlation inventory | `open` | `D` + `G` | reserved in `artifact_registry.md` | Depends on D2 and G |
-| `M4 Regulated Pilot Authorization` | Hostile-failure evidence package | `open` | `D` | reserved in `artifact_registry.md` | Depends on D3-D6 |
+| `M3 Customer Pilot Ready` | Audit/trace correlation inventory | `open` | `D` + `G` | reserved in `plans/impl/artifact_registry.md` | Depends on D2 and G |
+| `M4 Regulated Pilot Authorization` | Toron boundary contract | `open` | `I` + `F` + `G` + `D` | reserved in `plans/impl/artifact_registry.md` | Needs versioned boundary doc and identity/schema/quota/trace/audit contract tests |
+| `M4 Regulated Pilot Authorization` | Hostile-failure evidence package | `open` | `D` | reserved in `plans/impl/artifact_registry.md` | Depends on D3-D6 |
+| `M5 Regulated GA` | CMVP status and evidence package | `open` | `J` + `A` | reserved in `plans/impl/artifact_registry.md` | Depends on external CMVP/lab tracker and J crypto-boundary artifacts |
+| `M5 Regulated GA` | SBOM and signed release artifacts | `open` | `J` | reserved in `plans/impl/artifact_registry.md` | Release artifact evidence path is reserved; implementation not started |
+| `M5 Regulated GA` | Regulated compliance-pack index | `open` | `J` + `G` + `E` + `F` | reserved in `plans/impl/artifact_registry.md` | Compliance pack index is reserved; evidence package not assembled |
 
 ## Immediate D Priorities
 

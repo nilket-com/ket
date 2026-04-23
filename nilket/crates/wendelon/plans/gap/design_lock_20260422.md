@@ -260,6 +260,31 @@ These are real decisions, but they do **not** deserve their own ADRs.
 
 These belong in this file or in implementation design notes, not in ADRs.
 
+## Maintained Register
+
+This section is the current design-lock register. Earlier sections explain why these decisions belong here rather than in new ADRs.
+
+Register rules:
+
+- The register is append-only. If a lock changes, add a superseding `DL-*` row instead of silently editing history.
+- A design-lock row refines ADRs; it does not override them.
+- If a design-lock decision invalidates an ADR assumption, reopen the ADR and update `plans/impl/adr_status_matrix.md`.
+
+| ID | Decision | Owner | Date locked | Unblock target | Related ADRs | Downstream files/workstreams affected | Status | Reopen condition |
+|---|---|---|---|---|---|---|---|---|
+| `DL-001` | Recoverable Stellarator outcomes require durable pending-finalization intent before any recoverable success state is returned. | `B` | 2026-04-22 | `M1` | `003` | `src/network/data_server.rs`; `src/network/pending_finalizations.rs`; `plans/impl/workstream_B_transition_table.md`; `B` | `locked` | Reopen only if ADR `003` changes the recoverable-pending contract |
+| `DL-002` | When the leader is in the replica set, leader-local durable append is a required quorum leg; integrity-threatening local persistence failures fence or degrade leadership. | `B` | 2026-04-22 | `M1` | `003` | `src/network/data_server.rs`; `plans/impl/workstream_B_fault_injection_report.md`; `B` | `locked` | Reopen if B fault-injection evidence proves a safer non-fencing behavior |
+| `DL-003` | WAL and slab I/O split by durability class first; premium hardware support is explicit configuration before automatic topology discovery. | `C` + `D` | 2026-04-22 | `M2` | `009`, `030` | `src/storage/io_uring.rs`; `benches/io_topology.rs`; `plans/impl/workstream_C_execution_topology_note.md`; `C`, `D` | `locked` | Reopen if the benchmark-backed implementation moves to automatic topology discovery |
+| `DL-004` | The release-facing transport claim is QUIC-first; adaptive multi-transport, RDMA, GSO, and QUIC `io_uring` acceleration are future-only until implemented and benchmarked. | `C` + `A` | 2026-04-22 | `M2` | `011`, `030` | `src/network/transport.rs`; `src/network/quic_transport.rs`; `plans/network/transport.md`; `plans/impl/claim_discipline.md`; `C` | `locked` | Reopen when a second real transport or transport acceleration path lands with benchmarks |
+| `DL-005` | Supported day-1 transport includes bounded admission: total connection, per-peer, per-connection, task fan-out, and post-auth backpressure limits. | `C` + `D` | 2026-04-22 | `M2` | `011`, `027` | `src/network/server.rs`; `plans/impl/workstream_C_overload_limit_matrix.md`; `plans/impl/workstream_D_metric_catalog.md`; `C`, `D` | `locked` | Reopen if overload validation changes the minimum supported limit categories |
+| `DL-006` | Pilot audit authority is local NDJSON hash-chain baseline plus additive archival shipping; Kafka remains optional unless configured as a projection path. | `G` | 2026-04-22 | `M3` | `025`, `027` | `src/audit.rs`; `plans/impl/workstream_G_evidence_path_note.md`; `plans/impl/workstream_G_kafka_evidence_path_note.md`; `G` | `locked` | Reopen if ADR `025` accepts a different authority/materialization model |
+| `DL-007` | Actor certificate claim OID uses the current placeholder only until IANA PEN assignment; final pilot credentials must update the OID and ADR `018` together. | `F` + `A` | 2026-04-22 | `M3` | `018`, `034` | `src/network/tls.rs`; `src/network/cert_issuance_policy.rs`; `plans/impl/workstream_F_claim_oid_note.md`; `plans/impl/external_dependency_tracker.md`; `F`, `I` | `locked` | Reopen when the PEN is assigned or if the claim payload shape changes |
+| `DL-008` | Production custody posture is `local-sealed` by default for serious local deployments; `dev-insecure` is explicit dev/test only; AWS KMS and PKCS#11 stay behind their documented provider seams. | `E` + `J` | 2026-04-22 | `M3` | `020`, `031`, `026` | `src/config.rs`; `plans/impl/workstream_E_production_gating.md`; `plans/ops/key_rotation.md`; `E`, `J` | `locked` | Reopen if a different provider becomes the first production default |
+| `DL-009` | Supported node replacement baseline is documented remove/replace plus the external automation contract; first-party operator automation remains future direction, not current support. | `H` + `A` | 2026-04-22 | `M3` | `001`, `030`, `033` | `scripts/recovery/run_node_replacement_contract.sh`; `plans/impl/workstream_H_node_replacement_runbook.md`; `plans/impl/workstream_H_fallback_automation_contract.md`; `H` | `locked` | Reopen when a first-party operator is implemented and evidenced |
+| `DL-010` | Restore support requires the cluster backup manifest, remote-tier validation, readiness gating, and a recorded non-author drill before pilot-readiness claims close. | `H` + `D` | 2026-04-22 | `M3/M4` | `025`, `030`, `033` | `plans/impl/workstream_H_backup_manifest_spec.md`; `plans/impl/workstream_H_restore_runbook.md`; `plans/impl/workstream_H_drill_report.md`; `H`, `D` | `locked` | Reopen after a completed drill changes the required evidence shape |
+| `DL-011` | Wendelon owns durable schema sequencing through the control ring; Toron provides schema intent and integration context, not the durable schema authority. | `I` + `A` | 2026-04-22 | `M4` | `032`, `034` | `plans/schema/evolution.md`; `plans/impl/workstream_I.md`; `I` | `locked` | Reopen if ADR `032` or ADR `034` changes the ownership boundary |
+| `DL-012` | FIPS and CMVP wording must stay pre-validation until external lab evidence permits narrower staged language; engineering tests are not certification claims. | `J` + compliance/program lead | 2026-04-22 | `M5` | `019`, `026`, `031` | `ci/check_fips_symbol_sweep.sh`; `plans/impl/external_dependency_tracker.md`; `plans/impl/claim_discipline.md`; `J` | `locked` | Reopen when CMVP lab status changes the allowed public wording |
+
 ## Deferred ADR Work
 
 These matter, but I would not put them in the first ADR wave from this planning round.
