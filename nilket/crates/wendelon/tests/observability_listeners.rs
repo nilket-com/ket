@@ -2,6 +2,7 @@
 mod tls_pki;
 
 use async_trait::async_trait;
+use std::io::Error;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +11,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
 use uuid::Uuid;
-use wendelon::audit::{AuditSink, LocalAuditSink};
+use wendelon::audit::{AuditEvent, AuditSink, LocalAuditSink};
 use wendelon::metrics::observability::{
 	self, DrainState, ListenerAddresses, ObservabilityHandles, ReadinessReporter, ReadinessSnapshot,
 };
@@ -347,6 +348,74 @@ async fn readiness_returns_service_unavailable_when_audit_lag_is_non_zero() {
 			"unexpected degraded ready body: {ready}"
 		);
 	}
+
+	shutdown(handles).await;
+}
+
+#[tokio::test]
+async fn observability_metrics_fail_closed_when_local_audit_sink_rejects() {
+	struct RejectingAuditSink;
+
+	impl AuditSink for RejectingAuditSink {
+		fn emit(&self, _event: AuditEvent) -> std::io::Result<()> {
+			Err(Error::other("simulated local audit sink failure"))
+		}
+	}
+
+	let root = fresh_dir("audit-fail-closed");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let trust_roots = Arc::new(ActorTrustRoots::load(&pki.ca_cert, &pki.ops_ca_cert).unwrap());
+	let audit_sink: Arc<dyn AuditSink> = Arc::new(RejectingAuditSink);
+	let acceptor = TlsAcceptor::from(Arc::new(
+		rustls_server_config_with_peer_roots(
+			&server_material,
+			trust_roots.combined_roots(),
+			Vec::new(),
+		)
+		.unwrap(),
+	));
+	let handles = observability::spawn(
+		ListenerAddresses {
+			health: "127.0.0.1:0".into(),
+			ready: "127.0.0.1:0".into(),
+			metrics: "127.0.0.1:0".into(),
+		},
+		acceptor,
+		Arc::new(FixedReporter {
+			snapshot: ReadinessSnapshot {
+				node_id: 1,
+				epoch: 42,
+				leader_id: Some(1),
+				cluster_members: vec![1, 2, 3],
+				drain_state: DrainState::None,
+				audit_materialization_lag_entries: 0,
+				degraded_reason: None,
+				fips_mode: cfg!(feature = "fips"),
+				fips_self_test_last_ts: cfg!(feature = "fips").then_some(1_700_000_000),
+			},
+		}),
+		1,
+		tls_pki::CLUSTER_DOMAIN,
+		trust_roots,
+		audit_sink,
+	)
+	.await
+	.unwrap();
+
+	let metrics_response = request_mtls(
+		handles.metrics.local_addr,
+		"/metrics",
+		&pki.operator_cert,
+		&pki.operator_key,
+		&pki.ca_cert,
+	)
+	.await;
+	assert!(
+		metrics_response.is_empty(),
+		"metrics path must fail closed before emitting any HTTP response bytes when the local audit sink rejects the event: {metrics_response}"
+	);
 
 	shutdown(handles).await;
 }

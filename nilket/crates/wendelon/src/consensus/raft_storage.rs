@@ -57,6 +57,7 @@ use crate::consensus::{
 	WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, TenantKeyset};
+use crate::metrics::global as metrics;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
 	RaftLogEntryFixed, SlabId, SnapshotHeader, WALRecordHeader,
@@ -323,6 +324,10 @@ struct LogStoreInner {
 	recovered_snapshot: Option<LoadedSnapshot>,
 	/// Recovered checkpoint counters from the WAL.
 	recovery_checkpoint: Option<RecoveryCheckpoint>,
+	/// Durable committed pointer recovered from the WAL checkpoint
+	/// stream. When absent, openraft falls back to `last_applied`
+	/// and re-establishes commit on fresh leader traffic.
+	recovery_committed: Option<LogId<u32>>,
 	/// Whether startup was a true fresh bootstrap or durable recovery.
 	bootstrap_mode: DurableBootstrapMode,
 	/// File I/O seam over io_uring and namespace operations. `None`
@@ -375,6 +380,7 @@ impl WendelonLogStore {
 				artifact_paths: None,
 				recovered_snapshot: None,
 				recovery_checkpoint: None,
+				recovery_committed: None,
 				bootstrap_mode: DurableBootstrapMode::FreshBootstrap,
 				file_ops: None,
 				wal_segments: Vec::new(),
@@ -458,6 +464,8 @@ impl WendelonLogStore {
 		let vote = load_vote_state(file_ops.as_ref(), vote_path).await?;
 		let snapshot = load_snapshot_artifact(file_ops.as_ref(), snapshot_path).await?;
 		let replay = replay_wal(file_ops.as_ref(), wal_path, snapshot.as_ref()).await?;
+		let recovery_committed =
+			resolve_recovered_committed(snapshot.as_ref(), &replay.entries, replay.checkpoint)?;
 		let wal_file = if replay.last_segment_needs_truncate {
 			let last = replay.wal_segments.last().ok_or_else(|| {
 				Error::new(
@@ -494,6 +502,7 @@ impl WendelonLogStore {
 				artifact_paths: Some(artifact_paths),
 				recovered_snapshot: snapshot,
 				recovery_checkpoint: replay.checkpoint,
+				recovery_committed,
 				bootstrap_mode,
 				file_ops: Some(file_ops),
 				wal_segments: replay.wal_segments,
@@ -521,12 +530,6 @@ impl WendelonLogStore {
 		let Some(last_log_id) = observation.last_log_id else {
 			return Ok(());
 		};
-		let page = serialize_checkpoint_page(
-			observation.checkpoint.commit_index,
-			observation.checkpoint.e_safe_index,
-			last_log_id.index,
-			last_log_id.leader_id.term,
-		);
 		let _gate = self.wal_gate.lock().await;
 		let (
 			file_ops,
@@ -535,6 +538,7 @@ impl WendelonLogStore {
 			mut wal_file,
 			mut wal_cursor,
 			segment_bytes,
+			current_checkpoint,
 		) = {
 			let guard = self.inner.read().await;
 			(
@@ -544,8 +548,35 @@ impl WendelonLogStore {
 				guard.wal_file.clone(),
 				guard.wal_cursor,
 				guard.wal_segment_bytes,
+				guard.recovery_checkpoint,
 			)
 		};
+		let current_checkpoint = current_checkpoint.unwrap_or_default();
+		let next_checkpoint = RecoveryCheckpoint {
+			commit_index: observation
+				.checkpoint
+				.commit_index
+				.max(current_checkpoint.commit_index),
+			e_safe_index: if observation.checkpoint.commit_index > current_checkpoint.commit_index {
+				observation.checkpoint.e_safe_index
+			} else {
+				observation
+					.checkpoint
+					.e_safe_index
+					.max(current_checkpoint.e_safe_index)
+			},
+		};
+		if next_checkpoint == current_checkpoint {
+			let mut guard = self.inner.write().await;
+			guard.recovery_committed = Some(last_log_id);
+			return Ok(());
+		}
+		let page = serialize_checkpoint_page(
+			next_checkpoint.commit_index,
+			next_checkpoint.e_safe_index,
+			last_log_id.index,
+			last_log_id.leader_id.term,
+		);
 		let file_ops = file_ops.ok_or_else(|| {
 			Error::new(
 				ErrorKind::Unsupported,
@@ -614,7 +645,8 @@ impl WendelonLogStore {
 		file_ops.fdatasync(&active_handle).await?;
 
 		let mut guard = self.inner.write().await;
-		guard.recovery_checkpoint = Some(observation.checkpoint);
+		guard.recovery_checkpoint = Some(next_checkpoint);
+		guard.recovery_committed = Some(last_log_id);
 		guard.wal_segments = wal_segments;
 		guard.wal_file = wal_file;
 		guard.wal_cursor = wal_cursor;
@@ -924,6 +956,38 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 		Ok(self.inner.read().await.vote)
 	}
 
+	async fn save_committed(
+		&mut self,
+		committed: Option<LogId<u32>>,
+	) -> Result<(), StorageError<u32>> {
+		let Some(committed) = committed else {
+			return Ok(());
+		};
+
+		let current = {
+			let guard = self.inner.read().await;
+			guard.recovery_checkpoint
+		};
+		let e_safe_index = current
+			.map(|checkpoint| checkpoint.e_safe_index.min(committed.index))
+			.unwrap_or(0);
+		self.write_recovery_checkpoint(CheckpointObservation {
+			last_log_id: Some(committed),
+			checkpoint: RecoveryCheckpoint {
+				commit_index: committed.index,
+				e_safe_index,
+			},
+			force: false,
+		})
+		.await
+		.map_err(|err| StorageIOError::write_logs(AnyError::new(&err)))?;
+		Ok(())
+	}
+
+	async fn read_committed(&mut self) -> Result<Option<LogId<u32>>, StorageError<u32>> {
+		Ok(self.inner.read().await.recovery_committed)
+	}
+
 	async fn append<I>(
 		&mut self,
 		entries: I,
@@ -984,6 +1048,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 
 		let mut touched_segments: Vec<(u64, FileHandle)> = Vec::new();
 		let mut pending = Vec::with_capacity(batch.len());
+		let wal_append_started = Instant::now();
 		for (entry, page) in batch.iter().zip(pages) {
 			if page.len() as u64 > segment_bytes {
 				let err = Error::new(
@@ -1052,7 +1117,9 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 			active_segment.len_bytes = wal_cursor;
 			active_segment.end_log_index = Some(entry.log_id.index);
 		}
+		metrics().observe_wal_append_latency(wal_append_started.elapsed());
 
+		let wal_fsync_started = Instant::now();
 		for (_, handle) in &touched_segments {
 			// Durability barrier. All write CQEs above have already
 			// been awaited, so this fdatasync meaningfully covers them
@@ -1063,6 +1130,7 @@ impl RaftLogStorage<WendelonTypeConfig> for WendelonLogStore {
 				return Err(StorageIOError::write_logs(AnyError::new(&e)).into());
 			}
 		}
+		metrics().observe_wal_fsync_latency(wal_fsync_started.elapsed());
 
 		{
 			let mut guard = self.inner.write().await;
@@ -1939,7 +2007,7 @@ impl WendelonStateMachine {
 			}
 			cp.commit_index
 		} else {
-			entries.last().map(|entry| entry.log_id.index).unwrap_or(0)
+			snapshot_boundary.unwrap_or(0)
 		};
 
 		for entry in entries {
@@ -3627,6 +3695,34 @@ async fn replay_wal(
 	Ok(replay)
 }
 
+fn resolve_recovered_committed(
+	snapshot: Option<&LoadedSnapshot>,
+	entries: &BTreeMap<u64, Entry<WendelonTypeConfig>>,
+	checkpoint: Option<RecoveryCheckpoint>,
+) -> std::io::Result<Option<LogId<u32>>> {
+	let Some(checkpoint) = checkpoint else {
+		return Ok(None);
+	};
+	if checkpoint.commit_index == 0 {
+		return Ok(None);
+	}
+	if let Some(snapshot_log_id) = snapshot.and_then(|loaded| loaded.last_included) {
+		if checkpoint.commit_index == snapshot_log_id.index {
+			return Ok(Some(snapshot_log_id));
+		}
+	}
+	if let Some(entry) = entries.get(&checkpoint.commit_index) {
+		return Ok(Some(entry.log_id));
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"recovery checkpoint commit_index {} is not present in the retained WAL tail or snapshot boundary",
+			checkpoint.commit_index
+		),
+	))
+}
+
 async fn replay_wal_segment(
 	file_ops: &dyn AsyncFileOps,
 	segment: &DiscoveredWalSegment,
@@ -4734,7 +4830,13 @@ mod recovery_tests {
 		let (wal, vote, _snapshot) = artifact_paths(&dir);
 		write_vote_file(&vote, Vote::new_committed(3, 7));
 		let entry = lease_entry(1, 0, 99, 7);
-		write_wal_pages(&wal, &[serialize_entry_page(&entry).unwrap()]);
+		write_wal_pages(
+			&wal,
+			&[
+				serialize_entry_page(&entry).unwrap(),
+				serialize_checkpoint_page(1, 0, 1, 1),
+			],
+		);
 
 		let mut store = open_store(&dir).await;
 		assert_eq!(store.bootstrap_mode().await, DurableBootstrapMode::Recovery);
@@ -4742,6 +4844,7 @@ mod recovery_tests {
 			store.read_vote().await.unwrap(),
 			Some(Vote::new_committed(3, 7))
 		);
+		assert_eq!(store.read_committed().await.unwrap(), Some(log_id(1, 1)));
 
 		let state = store.get_log_state().await.unwrap();
 		assert_eq!(state.last_purged_log_id, None);
@@ -4751,6 +4854,44 @@ mod recovery_tests {
 		let snapshot = sm.state_snapshot().await;
 		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(snapshot.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn restart_without_checkpoint_defers_tail_state_machine_replay() {
+		let dir = tempdir("no-checkpoint");
+		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		write_wal_pages(
+			&wal,
+			&[serialize_entry_page(&lease_entry(1, 0, 99, 7)).unwrap()],
+		);
+
+		let mut store = open_store(&dir).await;
+		assert_eq!(store.read_committed().await.unwrap(), None);
+
+		let sm = store.recovered_state_machine().await.unwrap();
+		let snapshot = sm.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, None);
+		assert!(!snapshot.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn save_committed_persists_replay_boundary_for_restart() {
+		let dir = tempdir("save-committed");
+		let mut store = open_store(&dir).await;
+		store
+			.blocking_append(vec![lease_entry(1, 0, 9, 1), lease_entry(2, 10, 19, 2)])
+			.await
+			.unwrap();
+		store.save_committed(Some(log_id(1, 2))).await.unwrap();
+
+		let mut reopened = open_store(&dir).await;
+		assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(1, 2)));
+		let recovered = reopened.recovered_state_machine().await.unwrap();
+		let snapshot = recovered.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 2)));
+		assert!(snapshot.leases.contains_key(&0));
+		assert!(snapshot.leases.contains_key(&10));
 	}
 
 	#[tokio::test]
@@ -4774,11 +4915,12 @@ mod recovery_tests {
 		let state = store.get_log_state().await.unwrap();
 		assert_eq!(state.last_log_id, Some(log_id(1, 1)));
 		assert_eq!(std::fs::metadata(&wal).unwrap().len(), first.len() as u64);
+		assert_eq!(store.read_committed().await.unwrap(), None);
 
 		let sm = store.recovered_state_machine().await.unwrap();
 		let snapshot = sm.state_snapshot().await;
-		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
-		assert_eq!(snapshot.leases.len(), 1);
+		assert_eq!(snapshot.last_applied_log_id, None);
+		assert_eq!(snapshot.leases.len(), 0);
 	}
 
 	#[tokio::test]

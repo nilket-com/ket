@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use tokio::sync::Mutex;
 
@@ -74,6 +75,7 @@ impl PendingFinalizationRecord {
 pub struct PendingFinalizationStore {
 	db: Arc<Database>,
 	write_lock: Mutex<()>,
+	count: AtomicU64,
 	#[cfg(test)]
 	fail_next_upsert: StdMutex<Option<String>>,
 }
@@ -102,6 +104,7 @@ impl PendingFinalizationStore {
 				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
 				.map_err(redb_to_io)?;
 		}
+		let mut initial_count = 0u64;
 		{
 			let primary = write_txn
 				.open_table(PENDING_FINALIZATIONS_TABLE)
@@ -116,6 +119,7 @@ impl PendingFinalizationStore {
 			for entry in primary.iter().map_err(redb_to_io)? {
 				let (_key, value) = entry.map_err(redb_to_io)?;
 				let record = decode_pending_finalization_record(value.value())?;
+				initial_count = initial_count.saturating_add(1);
 				let write_key = encode_write_id_key(record.write_id);
 				by_write_id
 					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
@@ -126,6 +130,7 @@ impl PendingFinalizationStore {
 		let store = Arc::new(Self {
 			db,
 			write_lock: Mutex::new(()),
+			count: AtomicU64::new(initial_count),
 			#[cfg(test)]
 			fail_next_upsert: StdMutex::new(None),
 		});
@@ -227,14 +232,18 @@ impl PendingFinalizationStore {
 			)));
 		}
 		let db = self.db.clone();
-		spawn_blocking_io(move || {
+		let inserted_new = spawn_blocking_io(move || {
 			let encoded = postcard::to_stdvec(&record)
 				.map_err(|err| Error::other(format!("encode pending finalization: {err}")))?;
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
+			let inserted_new = {
 				let mut table = write_txn
 					.open_table(PENDING_FINALIZATIONS_TABLE)
 					.map_err(redb_to_io)?;
+				let existed = table
+					.get(&record.id.as_bytes()[..])
+					.map_err(redb_to_io)?
+					.is_some();
 				table
 					.insert(&record.id.as_bytes()[..], encoded.as_slice())
 					.map_err(redb_to_io)?;
@@ -245,18 +254,24 @@ impl PendingFinalizationStore {
 				by_write_id
 					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
 					.map_err(redb_to_io)?;
-			}
-			write_txn.commit().map_err(redb_to_io)
+				!existed
+			};
+			write_txn.commit().map_err(redb_to_io)?;
+			Ok(inserted_new)
 		})
-		.await
+		.await?;
+		if inserted_new {
+			self.count.fetch_add(1, Ordering::Relaxed);
+		}
+		Ok(())
 	}
 
 	pub async fn remove(&self, id: PendingFinalizationId) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
 		let db = self.db.clone();
-		spawn_blocking_io(move || {
+		let removed = spawn_blocking_io(move || {
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
-			{
+			let removed_any = {
 				let mut table = write_txn
 					.open_table(PENDING_FINALIZATIONS_TABLE)
 					.map_err(redb_to_io)?;
@@ -264,7 +279,10 @@ impl PendingFinalizationStore {
 					Some(value) => Some(decode_pending_finalization_record(value.value())?),
 					None => None,
 				};
-				let _ = table.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
+				let removed_any = table
+					.remove(&id.as_bytes()[..])
+					.map_err(redb_to_io)?
+					.is_some();
 				let replacement_id = if let Some(record) = removed_record.as_ref() {
 					let mut replacement = None;
 					for entry in table.iter().map_err(redb_to_io)? {
@@ -303,10 +321,20 @@ impl PendingFinalizationStore {
 						}
 					}
 				}
-			}
-			write_txn.commit().map_err(redb_to_io)
+				removed_any
+			};
+			write_txn.commit().map_err(redb_to_io)?;
+			Ok(removed_any)
 		})
-		.await
+		.await?;
+		if removed {
+			self.count.fetch_sub(1, Ordering::Relaxed);
+		}
+		Ok(())
+	}
+
+	pub fn count(&self) -> u64 {
+		self.count.load(Ordering::Relaxed)
 	}
 
 	#[cfg(test)]
@@ -409,7 +437,9 @@ mod tests {
 	async fn pending_store_roundtrips_records() {
 		let store = PendingFinalizationStore::open(temp_path("roundtrip")).unwrap();
 		let record = record();
+		assert_eq!(store.count(), 0);
 		store.upsert(record.clone()).await.unwrap();
+		assert_eq!(store.count(), 1);
 		assert_eq!(store.get(record.id).await.unwrap(), Some(record.clone()));
 		assert_eq!(
 			store.find_by_write_id(record.write_id).await.unwrap(),
@@ -417,6 +447,7 @@ mod tests {
 		);
 		assert_eq!(store.load_all().await.unwrap(), vec![record.clone()]);
 		store.remove(record.id).await.unwrap();
+		assert_eq!(store.count(), 0);
 		assert!(store.get(record.id).await.unwrap().is_none());
 		assert!(
 			store
@@ -444,6 +475,7 @@ mod tests {
 		drop(db);
 
 		let store = PendingFinalizationStore::open(path).unwrap();
+		assert_eq!(store.count(), 1);
 		assert_eq!(
 			store.find_by_write_id(record.write_id).await.unwrap(),
 			Some(record)

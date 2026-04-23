@@ -46,6 +46,7 @@ use crate::consensus::raft_storage::{
 };
 use crate::consensus::{WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
+use crate::metrics::IoUringClass;
 use crate::metrics::observability::{
 	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
 };
@@ -84,7 +85,7 @@ use crate::network::transport::{
 };
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
-use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named};
+use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
@@ -985,8 +986,16 @@ impl WendelonNode {
 		let pool = BufPool::new(256, 1024 * 1024);
 
 		// 2. Dedicated `io_uring` workers for the two durability classes.
-		let slab_io = spawn_io_thread_named(cfg.slab_io_depth, "wendelon-io-uring-slab")?;
-		let wal_io = spawn_io_thread_named(cfg.wal_io_depth, "wendelon-io-uring-wal")?;
+		let slab_io = spawn_io_thread_named_for_class(
+			cfg.slab_io_depth,
+			"wendelon-io-uring-slab",
+			IoUringClass::Slab,
+		)?;
+		let wal_io = spawn_io_thread_named_for_class(
+			cfg.wal_io_depth,
+			"wendelon-io-uring-wal",
+			IoUringClass::Wal,
+		)?;
 
 		// 3. L1 slab storage.
 		let l2 = cfg.l2.as_ref().map(ObjectStoreConfig::build).transpose()?;

@@ -31,6 +31,9 @@ const DEFAULT_CHAOS_SEED: u64 = 0xC4A0_57E0_2026_0421;
 const CHAOS_SEED_DIR: &str = "tests/chaos/seeds";
 const CHAOS_SMOKE_SCENARIOS: &[&str] = &[
 	"leader_partition_and_rejoin",
+	"leader_partition_restart_and_rejoin",
+	"follower_partition_restart_and_rejoin",
+	"follower_loss_under_control_write_load",
 	"rolling_kill",
 	"packet_drop_single_stream",
 ];
@@ -402,11 +405,16 @@ async fn commit_control_write(
 }
 
 async fn kill_node(node: WendelonNode, registry: &Arc<SimulatedTransportNetwork>) {
+	// In-process crash simulation still needs to stop openraft's
+	// internal runtime explicitly; dropping the node object alone
+	// does not guarantee the consensus tasks vanish before a new
+	// node with the same durable state is booted in the same test
+	// process.
+	let _ = tokio::time::timeout(Duration::from_millis(500), node.raft.shutdown()).await;
 	registry.unpublish(node.local_node);
-	tokio::time::timeout(Duration::from_secs(5), node.shutdown())
-		.await
-		.expect("killed node shutdown should finish")
-		.unwrap();
+	node.handles.abort();
+	drop(node);
+	tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 struct ChaosCluster {
@@ -597,6 +605,351 @@ async fn run_leader_partition_and_rejoin(seed: u64) -> std::result::Result<(), C
 	Ok(())
 }
 
+async fn run_leader_partition_restart_and_rejoin(
+	seed: u64,
+) -> std::result::Result<(), ChaosFailure> {
+	let mut cluster = match ChaosCluster::bootstrap("chaos-leader-partition-restart").await {
+		Ok(cluster) => cluster,
+		Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+			handle_bootstrap_permission_denied("leader_partition_restart_and_rejoin", seed, &err)?;
+			return Ok(());
+		}
+		Err(err) => {
+			return Err(ChaosFailure::new(
+				"leader_partition_restart_and_rejoin",
+				seed,
+				0,
+				format!("cluster bootstrap failed: {err}"),
+			));
+		}
+	};
+
+	let original_leader = wait_for_shared_leader(&cluster.nodes, None).await;
+	commit_control_write(
+		cluster.nodes.get(&original_leader).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		60,
+		60_000,
+	)
+	.await;
+	cluster.registry.clear_events();
+
+	for peer in [1u32, 2, 3] {
+		if peer == original_leader {
+			continue;
+		}
+		cluster
+			.registry
+			.block_bidirectional(node(original_leader), node(peer));
+	}
+
+	let survivors = cluster
+		.nodes
+		.iter()
+		.filter(|(id, _)| **id != original_leader)
+		.map(|(id, node)| (*id, node))
+		.collect::<Vec<_>>();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+	let new_leader = loop {
+		let left = survivors[0].1.raft.current_leader().await;
+		let right = survivors[1].1.raft.current_leader().await;
+		if let (Some(left), Some(right)) = (left, right) {
+			if left == right && left != original_leader {
+				break left;
+			}
+		}
+		if tokio::time::Instant::now() >= deadline {
+			cluster.shutdown().await;
+			return Err(ChaosFailure::new(
+				"leader_partition_restart_and_rejoin",
+				seed,
+				1,
+				format!(
+					"partitioned leader {} did not fail over; survivors reported {:?} and {:?}",
+					original_leader, left, right
+				),
+			));
+		}
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	};
+
+	let survivor_targets = cluster
+		.nodes
+		.keys()
+		.copied()
+		.filter(|candidate| *candidate != original_leader)
+		.collect::<Vec<_>>();
+	commit_control_write(
+		cluster.nodes.get(&new_leader).unwrap(),
+		&cluster.nodes,
+		survivor_targets,
+		61,
+		61_000,
+	)
+	.await;
+
+	let isolated = cluster.nodes.remove(&original_leader).unwrap();
+	kill_node(isolated, &cluster.registry).await;
+
+	for peer in [1u32, 2, 3] {
+		if peer == original_leader {
+			continue;
+		}
+		cluster
+			.registry
+			.heal_bidirectional(node(original_leader), node(peer));
+	}
+
+	let mut restart_cfg = cluster.configs.get(&original_leader).unwrap().clone();
+	restart_cfg.cluster = ClusterBootstrapConfig::Join {
+		seeds: vec![SeedNodeConfig {
+			node_id: new_leader,
+			address: cluster
+				.configs
+				.get(&new_leader)
+				.unwrap()
+				.advertise_address
+				.clone(),
+		}],
+	};
+	let restarted = ChaosCluster::bootstrap_node(
+		restart_cfg,
+		provider_for(original_leader, cluster.registry.clone()),
+	)
+	.await
+	.map_err(|err| {
+		ChaosFailure::new(
+			"leader_partition_restart_and_rejoin",
+			seed,
+			2,
+			format!("restart of partitioned leader {original_leader} failed: {err}"),
+		)
+	})?;
+	cluster.nodes.insert(original_leader, restarted);
+
+	let healed_leader = wait_for_shared_leader(&cluster.nodes, None).await;
+	if healed_leader != new_leader {
+		cluster.shutdown().await;
+		return Err(ChaosFailure::new(
+			"leader_partition_restart_and_rejoin",
+			seed,
+			3,
+			format!(
+				"healed cluster did not converge on survivor leader {}; observed {}",
+				new_leader, healed_leader
+			),
+		));
+	}
+	for node in cluster.nodes.values() {
+		wait_for_leader(node, new_leader).await;
+		wait_for_cluster(node, 3, 3).await;
+	}
+	commit_control_write(
+		cluster.nodes.get(&new_leader).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		62,
+		62_000,
+	)
+	.await;
+
+	let events = cluster.registry.events();
+	let blocked_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteBlocked))
+		.count();
+	let healed_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteHealed))
+		.count();
+	let unpublished_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::Unpublished))
+		.count();
+	cluster.shutdown().await;
+	if blocked_events < 4 || healed_events < 4 || unpublished_events == 0 {
+		return Err(ChaosFailure::new(
+			"leader_partition_restart_and_rejoin",
+			seed,
+			4,
+			format!(
+				"expected partition/heal/restart evidence; saw blocked={} healed={} unpublished={}",
+				blocked_events, healed_events, unpublished_events
+			),
+		));
+	}
+	Ok(())
+}
+
+async fn run_follower_partition_restart_and_rejoin(
+	seed: u64,
+) -> std::result::Result<(), ChaosFailure> {
+	let mut cluster = match ChaosCluster::bootstrap("chaos-partition-restart").await {
+		Ok(cluster) => cluster,
+		Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+			handle_bootstrap_permission_denied(
+				"follower_partition_restart_and_rejoin",
+				seed,
+				&err,
+			)?;
+			return Ok(());
+		}
+		Err(err) => {
+			return Err(ChaosFailure::new(
+				"follower_partition_restart_and_rejoin",
+				seed,
+				0,
+				format!("cluster bootstrap failed: {err}"),
+			));
+		}
+	};
+	let leader_id = wait_for_shared_leader(&cluster.nodes, None).await;
+	let victim = [1u32, 2, 3]
+		.into_iter()
+		.find(|candidate| *candidate != leader_id)
+		.unwrap();
+	commit_control_write(
+		cluster.nodes.get(&leader_id).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		30,
+		30_000,
+	)
+	.await;
+	cluster.registry.clear_events();
+
+	for peer in [1u32, 2, 3] {
+		if peer == victim {
+			continue;
+		}
+		cluster
+			.registry
+			.block_bidirectional(node(victim), node(peer));
+	}
+
+	let survivor_leader = wait_for_shared_leader(&cluster.nodes, Some(victim)).await;
+	if survivor_leader != leader_id {
+		cluster.shutdown().await;
+		return Err(ChaosFailure::new(
+			"follower_partition_restart_and_rejoin",
+			seed,
+			1,
+			format!(
+				"partitioned follower {} should not change leader {}; observed {}",
+				victim, leader_id, survivor_leader
+			),
+		));
+	}
+	let survivor_targets = cluster
+		.nodes
+		.keys()
+		.copied()
+		.filter(|candidate| *candidate != victim)
+		.collect::<Vec<_>>();
+	commit_control_write(
+		cluster.nodes.get(&leader_id).unwrap(),
+		&cluster.nodes,
+		survivor_targets,
+		31,
+		31_000,
+	)
+	.await;
+
+	let isolated = cluster.nodes.remove(&victim).unwrap();
+	kill_node(isolated, &cluster.registry).await;
+
+	for peer in [1u32, 2, 3] {
+		if peer == victim {
+			continue;
+		}
+		cluster
+			.registry
+			.heal_bidirectional(node(victim), node(peer));
+	}
+
+	let survivor_leader = wait_for_shared_leader(&cluster.nodes, Some(victim)).await;
+	if survivor_leader != leader_id {
+		cluster.shutdown().await;
+		return Err(ChaosFailure::new(
+			"follower_partition_restart_and_rejoin",
+			seed,
+			2,
+			format!(
+				"survivors changed leader during follower restart; expected {} observed {}",
+				leader_id, survivor_leader
+			),
+		));
+	}
+
+	let restart_cfg = cluster.configs.get(&victim).unwrap().clone();
+	let restarted =
+		ChaosCluster::bootstrap_node(restart_cfg, provider_for(victim, cluster.registry.clone()))
+			.await
+			.map_err(|err| {
+				ChaosFailure::new(
+					"follower_partition_restart_and_rejoin",
+					seed,
+					3,
+					format!("restart of partitioned follower {victim} failed: {err}"),
+				)
+			})?;
+	cluster.nodes.insert(victim, restarted);
+
+	let healed_leader = wait_for_shared_leader(&cluster.nodes, None).await;
+	if healed_leader != leader_id {
+		cluster.shutdown().await;
+		return Err(ChaosFailure::new(
+			"follower_partition_restart_and_rejoin",
+			seed,
+			4,
+			format!(
+				"healed cluster did not converge on original leader {}; observed {}",
+				leader_id, healed_leader
+			),
+		));
+	}
+	for node in cluster.nodes.values() {
+		wait_for_leader(node, leader_id).await;
+		wait_for_cluster(node, 3, 3).await;
+	}
+	commit_control_write(
+		cluster.nodes.get(&leader_id).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		32,
+		32_000,
+	)
+	.await;
+
+	let events = cluster.registry.events();
+	let blocked_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteBlocked))
+		.count();
+	let healed_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::RouteHealed))
+		.count();
+	let unpublished_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::Unpublished))
+		.count();
+	cluster.shutdown().await;
+	if blocked_events < 4 || healed_events < 4 || unpublished_events == 0 {
+		return Err(ChaosFailure::new(
+			"follower_partition_restart_and_rejoin",
+			seed,
+			5,
+			format!(
+				"expected partition/heal/restart evidence; saw blocked={} healed={} unpublished={}",
+				blocked_events, healed_events, unpublished_events
+			),
+		));
+	}
+	Ok(())
+}
+
 async fn run_packet_drop_single_stream(seed: u64) -> std::result::Result<(), ChaosFailure> {
 	let cluster = match ChaosCluster::bootstrap("chaos-packet-drop").await {
 		Ok(cluster) => cluster,
@@ -684,6 +1037,110 @@ async fn run_packet_drop_single_stream(seed: u64) -> std::result::Result<(), Cha
 			seed,
 			3,
 			"expected at least one simulated packet-drop fault event",
+		));
+	}
+	Ok(())
+}
+
+async fn run_follower_loss_under_control_write_load(
+	seed: u64,
+) -> std::result::Result<(), ChaosFailure> {
+	let mut cluster = match ChaosCluster::bootstrap("chaos-follower-loss-load").await {
+		Ok(cluster) => cluster,
+		Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+			handle_bootstrap_permission_denied(
+				"follower_loss_under_control_write_load",
+				seed,
+				&err,
+			)?;
+			return Ok(());
+		}
+		Err(err) => {
+			return Err(ChaosFailure::new(
+				"follower_loss_under_control_write_load",
+				seed,
+				0,
+				format!("cluster bootstrap failed: {err}"),
+			));
+		}
+	};
+	let mut rng = StdRng::seed_from_u64(seed);
+	let leader_id = wait_for_shared_leader(&cluster.nodes, None).await;
+	let mut followers = [1u32, 2, 3]
+		.into_iter()
+		.filter(|candidate| *candidate != leader_id)
+		.collect::<Vec<_>>();
+	followers.shuffle(&mut rng);
+	let victim = followers[0];
+
+	commit_control_write(
+		cluster.nodes.get(&leader_id).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		40,
+		40_000,
+	)
+	.await;
+	cluster.registry.clear_events();
+
+	let killed = cluster.nodes.remove(&victim).unwrap();
+	kill_node(killed, &cluster.registry).await;
+
+	for iteration in 0..4u64 {
+		let current_leader = wait_for_shared_leader(&cluster.nodes, Some(victim)).await;
+		let survivor_targets = cluster.nodes.keys().copied().collect::<Vec<_>>();
+		commit_control_write(
+			cluster.nodes.get(&current_leader).unwrap(),
+			&cluster.nodes,
+			survivor_targets,
+			41 + iteration,
+			41_000 + iteration,
+		)
+		.await;
+	}
+
+	let restarted = ChaosCluster::bootstrap_node(
+		cluster.configs.get(&victim).unwrap().clone(),
+		provider_for(victim, cluster.registry.clone()),
+	)
+	.await
+	.map_err(|err| {
+		ChaosFailure::new(
+			"follower_loss_under_control_write_load",
+			seed,
+			2,
+			format!("restart of follower {victim} failed: {err}"),
+		)
+	})?;
+	wait_for_cluster(&restarted, 3, 3).await;
+	cluster.nodes.insert(victim, restarted);
+	for node in cluster.nodes.values() {
+		wait_for_cluster(node, 3, 3).await;
+	}
+	wait_for_voters(cluster.nodes.get(&victim).unwrap(), &[1, 2, 3]).await;
+
+	let converged_leader = wait_for_shared_leader(&cluster.nodes, None).await;
+	commit_control_write(
+		cluster.nodes.get(&converged_leader).unwrap(),
+		&cluster.nodes,
+		vec![1, 2, 3],
+		50,
+		50_000,
+	)
+	.await;
+
+	let events = cluster.registry.events();
+	let unpublished_events = events
+		.iter()
+		.filter(|event| matches!(event.kind, SimulatedTransportEventKind::Unpublished))
+		.count();
+	cluster.shutdown().await;
+	if unpublished_events == 0 {
+		return Err(ChaosFailure::new(
+			"follower_loss_under_control_write_load",
+			seed,
+			3,
+			"expected follower kill/restart to emit at least one unpublish event",
 		));
 	}
 	Ok(())
@@ -782,6 +1239,15 @@ async fn run_rolling_kill(seed: u64) -> std::result::Result<(), ChaosFailure> {
 async fn run_chaos_scenario(scenario: &str, seed: u64) -> std::result::Result<(), ChaosFailure> {
 	match scenario {
 		"leader_partition_and_rejoin" => run_leader_partition_and_rejoin(seed).await,
+		"leader_partition_restart_and_rejoin" => {
+			run_leader_partition_restart_and_rejoin(seed).await
+		}
+		"follower_partition_restart_and_rejoin" => {
+			run_follower_partition_restart_and_rejoin(seed).await
+		}
+		"follower_loss_under_control_write_load" => {
+			run_follower_loss_under_control_write_load(seed).await
+		}
 		"packet_drop_single_stream" => run_packet_drop_single_stream(seed).await,
 		"rolling_kill" => run_rolling_kill(seed).await,
 		other => Err(ChaosFailure::new(
@@ -827,4 +1293,12 @@ async fn chaos_smoke_catalog() {
 			.unwrap_or_else(|err| panic!("{err}"));
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
+}
+
+#[tokio::test]
+async fn leader_partition_restart_and_rejoin() {
+	let seed = chaos_seed_from_env();
+	run_leader_partition_restart_and_rejoin(seed)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
 }

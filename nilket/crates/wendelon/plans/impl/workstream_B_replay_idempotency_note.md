@@ -52,8 +52,13 @@ For a write request with `write_id = W`, the server now resolves replay in this 
 - Durable pending rows survive restart in `pending_finalizations.redb`.
 - `find_by_write_id()` is now indexed, not an O(n) scan.
 - If multiple pending rows share a `write_id`, `remove()` repoints the index to a surviving row rather than dropping lookup coverage.
+- Raft storage now persists committed progress explicitly, and restart recovery will not replay an uncommitted surviving WAL tail into the state machine when no durable checkpoint exists.
 
 This means restart replay and same-process duplicate replay now funnel through the same pending-record semantics instead of diverging.
+
+Operator-facing note:
+
+- the degraded/fenced-leader note in `plans/impl/workstream_B_operator_notes.md` now calls out the tighter restart boundary so a pre-checkpoint restart does not look like silent data loss when it is actually truncating uncommitted tail residue.
 
 ## Leader-Turnover Semantics
 
@@ -88,4 +93,3 @@ Important nuance:
 - Replay is unified for committed, pending, restart, and leader-turnover cases.
 - The remaining gap is not replay semantics; it is observability and benchmark evidence around those semantics.
 - A clean leadership-abdication flow is still separate from this note. Current distrust behavior is shutdown-and-fence, not a polished transfer-leadership sequence.
-

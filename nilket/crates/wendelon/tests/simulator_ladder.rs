@@ -1,5 +1,12 @@
+#[path = "support/control_ring.rs"]
+mod support;
+
+use arrow::array::LargeBinaryBuilder;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
+use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
+use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::Deserialize;
@@ -7,13 +14,33 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{ErrorKind, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use wendelon::client::{
+	ClusterPeerWire, ClusterStatusWire, DATA_RETRY_BUDGET, KeyRange, MIGRATION_RETRY_BACKOFF,
+	TopologySource, WendelonClient, WriteRequest,
+};
+use wendelon::consensus::raft_storage::{WendelonLogStore, WendelonStateMachine};
+use wendelon::consensus::{
+	TenantFinalization, UpdateTenantQuota, WendelonRequest, WendelonTypeConfig,
+};
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
-use wendelon::network::pool::BufPool;
+use wendelon::network::pending_finalizations::{
+	PendingFinalizationRecord, PendingFinalizationStore, pending_finalizations_path,
+};
+use wendelon::network::pool::{BufPool, PooledBuf};
 use wendelon::network::server::{HrftService, RequestContext};
-use wendelon::network::transport::{TransportProvider, TransportStream, TransportTier};
-use wendelon::schema::{FrameHeader, MsgType, NodeId};
+use wendelon::network::tls::{ActorIdentity, ActorPermission, ActorRole, authorize_actor};
+use wendelon::network::transport::{
+	NodeRole, NodeRoleSet, TransportProvider, TransportStream, TransportTier, TransportTierSet,
+};
+use wendelon::node::{NodeBootstrapConfig, WendelonNode};
+use wendelon::schema::{
+	ClientWriteId, Consistency, DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker,
+	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, MsgType, NodeId, QueryRequestMeta,
+	QueryResponseMeta, ReadStatus, TenantId, WriteRequestMeta, write_payload_schema,
+};
 use wendelon::simulator::checkers::{
 	CounterHistoryEntry, CounterOperation, MonotonicCounterChecker, RegisterHistoryEntry,
 	RegisterLinearizabilityChecker, RegisterOperation,
@@ -23,10 +50,12 @@ use wendelon::simulator::network::{
 	InjectedSimulatedTransportFault, SimulatedTransportEventKind, SimulatedTransportFaultAction,
 	SimulatedTransportFaultOp, SimulatedTransportNetwork, SimulatedTransportProvider,
 };
+use wendelon::storage::BlockingFileOps;
 use wendelon::storage::l2::{
 	InjectedMockObjectStoreFault, MockObjectStore, MockObjectStoreConfig,
 	MockObjectStoreFaultAction, MockObjectStoreOp, ObjectStore,
 };
+use wendelon_client::{Client, ClientError, WriteOptions};
 
 const DEFAULT_LADDER_SEED: u64 = 0x57A1_4D3E_2026_0421;
 const SIM_SEED_DIR: &str = "tests/sim/seeds";
@@ -160,7 +189,323 @@ fn is_iso_date(raw: &str) -> bool {
 }
 
 fn supported_scenario(name: &str) -> bool {
-	matches!(name, "coverage_ladder")
+	matches!(
+		name,
+		"coverage_ladder"
+			| "replay_ordering"
+			| "apply_order_races"
+			| "interrupted_finalization_recovery"
+			| "lazy_migration_pressure"
+			| "quota_authorization_boundary"
+	)
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
+
+fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
+	HybridTimestamp {
+		physical_ms,
+		logical,
+		node_id,
+	}
+}
+
+fn tier_bits() -> u8 {
+	TransportTierSet::empty()
+		.with(TransportTier::QuicIoUring)
+		.as_u8()
+}
+
+fn role_bits() -> u8 {
+	NodeRoleSet::empty()
+		.with(NodeRole::Data)
+		.with(NodeRole::Control)
+		.as_u8()
+}
+
+fn snapshot(epoch: u64, leader: Option<u32>, peers: &[(u32, &str)]) -> ClusterStatusWire {
+	ClusterStatusWire {
+		epoch,
+		leader,
+		replication_factor: 1,
+		peers: peers
+			.iter()
+			.map(|(node_id, address)| ClusterPeerWire {
+				node_id: *node_id,
+				address: (*address).to_string(),
+				tier_bits: tier_bits(),
+				role_bits: role_bits(),
+			})
+			.collect(),
+	}
+}
+
+async fn refresh_leases(node: &wendelon::node::WendelonNode) {
+	support::wait_for_local_leader(node).await;
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, wendelon::node::LEASE_TTL_MS)
+		.await;
+}
+
+fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
+	let schema = Arc::new(write_payload_schema());
+	let mut keys = LargeBinaryBuilder::new();
+	keys.append_value(key);
+	let mut values = LargeBinaryBuilder::new();
+	values.append_value(value);
+	RecordBatch::try_new(
+		schema,
+		vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+	)
+	.unwrap()
+}
+
+fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRequestMeta {
+	WriteRequestMeta {
+		write_id: ClientWriteId {
+			client_uuid: [0x44; 16],
+			sequence_no,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		},
+		client_hlc: hlc(5_000 + sequence_no, 0, 77),
+		expected_epoch: epoch,
+		tenant_id: tenant(),
+		proxy_hop: 0,
+		durability: DurabilityLevel::QUORUM,
+		await_finalization: 0,
+		_pad1: [0; 5],
+		proxy_source: NodeId {
+			id: 0,
+			_reserved: 0,
+		},
+		key_identity: Identity::blake3_tenant(tenant(), key),
+		key_len: key.len() as u32,
+		value_len: value.len() as u32,
+	}
+}
+
+fn take_retry(counter: &AtomicUsize) -> bool {
+	counter
+		.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+			if remaining > 0 {
+				Some(remaining - 1)
+			} else {
+				None
+			}
+		})
+		.is_ok()
+}
+
+fn migration_incomplete_query_frame(frame: &HrftFrame, req: &QueryRequestMeta) -> HrftFrame {
+	let resp = QueryResponseMeta {
+		status: ReadStatus::MIGRATION_INCOMPLETE,
+		_pad1: [0; 7],
+		value_hlc: req.min_hlc,
+		epoch: req.expected_epoch,
+		leader_hint: NodeId {
+			id: 0,
+			_reserved: 0,
+		},
+		rows: 0,
+		arrow_len: 0,
+		_pad2: [0; 4],
+	};
+	HrftFrame {
+		header: FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::QUERY_RESP.0,
+			flags: FRAME_FLAG_STREAM_END,
+			stream_id: frame.header.stream_id,
+			meta_len: std::mem::size_of::<QueryResponseMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		},
+		meta: PooledBuf::orphan(bytemuck::bytes_of(&resp).to_vec()),
+		arrow_payload: None,
+		trailing: None,
+	}
+}
+
+struct FlakyMigrationService {
+	inner: Arc<dyn HrftService>,
+	query_failures_remaining: AtomicUsize,
+	query_calls: AtomicUsize,
+}
+
+impl FlakyMigrationService {
+	fn new(inner: Arc<dyn HrftService>, query_failures_remaining: usize) -> Self {
+		Self {
+			inner,
+			query_failures_remaining: AtomicUsize::new(query_failures_remaining),
+			query_calls: AtomicUsize::new(0),
+		}
+	}
+
+	fn query_calls(&self) -> usize {
+		self.query_calls.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl HrftService for FlakyMigrationService {
+	async fn handle_frame(
+		&self,
+		context: RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
+		if MsgType(frame.header.msg_type) == MsgType::QUERY_REQ {
+			self.query_calls.fetch_add(1, Ordering::SeqCst);
+			if take_retry(&self.query_failures_remaining) {
+				let req: &QueryRequestMeta =
+					bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryRequestMeta>()]);
+				return Ok(Some(migration_incomplete_query_frame(&frame, req)));
+			}
+		}
+		self.inner.handle_frame(context, frame).await
+	}
+}
+
+struct CountingTopologySource {
+	snapshot: Mutex<ClusterStatusWire>,
+	fetches: AtomicUsize,
+}
+
+impl CountingTopologySource {
+	fn new(snapshot: ClusterStatusWire) -> Self {
+		Self {
+			snapshot: Mutex::new(snapshot),
+			fetches: AtomicUsize::new(0),
+		}
+	}
+
+	fn fetches(&self) -> usize {
+		self.fetches.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl TopologySource for CountingTopologySource {
+	async fn fetch(&self) -> std::io::Result<ClusterStatusWire> {
+		self.fetches.fetch_add(1, Ordering::SeqCst);
+		Ok(self.snapshot.lock().unwrap().clone())
+	}
+}
+
+struct CountingWriteService {
+	inner: Arc<dyn HrftService>,
+	write_calls: AtomicUsize,
+}
+
+impl CountingWriteService {
+	fn new(inner: Arc<dyn HrftService>) -> Self {
+		Self {
+			inner,
+			write_calls: AtomicUsize::new(0),
+		}
+	}
+
+	fn write_calls(&self) -> usize {
+		self.write_calls.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl HrftService for CountingWriteService {
+	async fn handle_frame(
+		&self,
+		context: RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
+		if MsgType(frame.header.msg_type) == MsgType::WRITE_REQ {
+			self.write_calls.fetch_add(1, Ordering::SeqCst);
+		}
+		self.inner.handle_frame(context, frame).await
+	}
+}
+
+fn log_id(term: u64, index: u64) -> LogId<u32> {
+	LogId::new(CommittedLeaderId::new(term, 0), index)
+}
+
+fn lease_entry(
+	index: u64,
+	range_start: u64,
+	range_end: u64,
+	holder: u32,
+) -> Entry<WendelonTypeConfig> {
+	let lease = LeaseDescriptor {
+		epoch: 1,
+		holder: NodeId {
+			id: holder,
+			_reserved: 0,
+		},
+		range_start,
+		range_end,
+		lease_start: HybridTimestamp {
+			physical_ms: index,
+			logical: 0,
+			node_id: holder,
+		},
+		lease_expiry: HybridTimestamp {
+			physical_ms: index + 1_000,
+			logical: 0,
+			node_id: holder,
+		},
+		min_commit_index: 0,
+		issuer: NodeId {
+			id: 1,
+			_reserved: 0,
+		},
+		signature: [0; 64],
+	};
+	Entry {
+		log_id: log_id(1, index),
+		payload: EntryPayload::Normal(WendelonRequest::AcquireLease(lease)),
+	}
+}
+
+fn finalize_entry(index: u64, physical_ms: u64) -> Entry<WendelonTypeConfig> {
+	finalize_entry_for_epoch(index, 1, physical_ms)
+}
+
+fn finalize_entry_for_epoch(index: u64, epoch: u64, physical_ms: u64) -> Entry<WendelonTypeConfig> {
+	Entry {
+		log_id: log_id(1, index),
+		payload: EntryPayload::Normal(WendelonRequest::Finalize(TenantFinalization {
+			marker: FinalizationMarker {
+				log_index: index,
+				term: 1,
+				epoch,
+				commit_hlc: HybridTimestamp {
+					physical_ms,
+					logical: 0,
+					node_id: 1,
+				},
+				payload_hash: [0; 32],
+				e_safe_index: index,
+				durability: DurabilityLevel::QUORUM,
+				_pad: [0; 7],
+			},
+			tenant_id: TenantId::ZERO,
+			key_identity: Identity::ZERO,
+			charged_bytes: 0,
+		})),
+	}
+}
+
+async fn append_and_apply(
+	store: &mut WendelonLogStore,
+	sm: &mut WendelonStateMachine,
+	entry: Entry<WendelonTypeConfig>,
+) -> std::result::Result<(), openraft::StorageError<u32>> {
+	store.blocking_append(vec![entry.clone()]).await?;
+	<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::apply(sm, vec![entry])
+		.await
+		.map(|_| ())
 }
 
 fn frozen_seed_paths() -> Result<Vec<PathBuf>> {
@@ -756,6 +1101,806 @@ async fn run_transport_scenario(seed: u64, ops: u64) -> std::result::Result<u64,
 	Ok(ops)
 }
 
+async fn run_replay_ordering_scenario(seed: u64, ops: u64) -> std::result::Result<u64, SimFailure> {
+	let iterations = ops.max(1).min(16);
+	for iteration in 0..iterations {
+		let dir = tempdir(&format!("replay-ordering-{seed}-{iteration}"));
+		let wal = dir.join("control.wal");
+		let vote = dir.join("vote.wnd");
+		let snapshot = dir.join("snapshot.wnd");
+		let range_start = 100 * iteration;
+		let expected_hlc = 10_000 + iteration;
+
+		let mut store =
+			WendelonLogStore::open_with_file_ops(&wal, &vote, &snapshot, Arc::new(BlockingFileOps))
+				.await
+				.map_err(|err| {
+					SimFailure::new(
+						"replay_ordering",
+						seed,
+						iteration + 1,
+						format!("open log store failed: {err}"),
+					)
+				})?;
+		store
+			.blocking_append(vec![
+				lease_entry(1, range_start, range_start + 9, 1),
+				finalize_entry(2, expected_hlc),
+				lease_entry(3, range_start + 10, range_start + 19, 2),
+			])
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"replay_ordering",
+					seed,
+					iteration + 1,
+					format!("append failed: {err}"),
+				)
+			})?;
+		store
+			.save_committed(Some(log_id(1, 2)))
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"replay_ordering",
+					seed,
+					iteration + 1,
+					format!("save_committed failed: {err}"),
+				)
+			})?;
+		drop(store);
+
+		let mut reopened =
+			WendelonLogStore::open_with_file_ops(&wal, &vote, &snapshot, Arc::new(BlockingFileOps))
+				.await
+				.map_err(|err| {
+					SimFailure::new(
+						"replay_ordering",
+						seed,
+						iteration + 1,
+						format!("reopen failed: {err}"),
+					)
+				})?;
+		let committed = reopened.read_committed().await.map_err(|err| {
+			SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				format!("read_committed failed: {err}"),
+			)
+		})?;
+		if committed != Some(log_id(1, 2)) {
+			return Err(SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				format!("expected committed log id 2 after reopen, got {committed:?}"),
+			));
+		}
+		let recovered = reopened.recovered_state_machine().await.map_err(|err| {
+			SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				format!("recovered_state_machine failed: {err}"),
+			)
+		})?;
+		let state = recovered.state_snapshot().await;
+		if state.last_applied_log_id != Some(log_id(1, 2)) {
+			return Err(SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				format!(
+					"expected last_applied log id 2 after reopen, got {:?}",
+					state.last_applied_log_id
+				),
+			));
+		}
+		if !state.leases.contains_key(&range_start) {
+			return Err(SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				"committed lease entry was not replayed".to_string(),
+			));
+		}
+		if state.leases.contains_key(&(range_start + 10)) {
+			return Err(SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				"uncommitted tail lease was replayed into recovered state".to_string(),
+			));
+		}
+		let watermark = state.e_safe_watermarks.get(&1).copied();
+		let expected = HybridTimestamp {
+			physical_ms: expected_hlc,
+			logical: 0,
+			node_id: 1,
+		};
+		if watermark != Some(expected) {
+			return Err(SimFailure::new(
+				"replay_ordering",
+				seed,
+				iteration + 1,
+				format!("expected e_safe watermark {expected:?}, got {watermark:?}"),
+			));
+		}
+	}
+
+	Ok(iterations)
+}
+
+async fn run_apply_order_races_scenario(
+	seed: u64,
+	ops: u64,
+) -> std::result::Result<u64, SimFailure> {
+	let iterations = ops.max(1).min(8);
+	for iteration in 0..iterations {
+		let target_dir = tempdir(&format!("apply-order-target-{seed}-{iteration}"));
+		let wal = target_dir.join("control.wal");
+		let vote = target_dir.join("vote.wnd");
+		let snapshot_path = target_dir.join("snapshot.wnd");
+		let mut target_store = WendelonLogStore::open_with_file_ops(
+			&wal,
+			&vote,
+			&snapshot_path,
+			Arc::new(BlockingFileOps),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("open target log store failed: {err}"),
+			)
+		})?;
+		let mut target_sm = target_store
+			.recovered_state_machine()
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"apply_order_races",
+					seed,
+					iteration + 1,
+					format!("target recovered_state_machine failed: {err}"),
+				)
+			})?;
+		let mut snapshots = target_sm.subscribe_admission_snapshot();
+		let initial = snapshots.borrow().clone();
+
+		append_and_apply(
+			&mut target_store,
+			&mut target_sm,
+			finalize_entry(1, 1_000 + iteration),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("target finalize apply failed: {err}"),
+			)
+		})?;
+		snapshots.changed().await.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("target admission watch failed after finalize: {err}"),
+			)
+		})?;
+		let after_apply = snapshots.borrow().clone();
+		if after_apply.current_epoch < initial.current_epoch {
+			return Err(SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!(
+					"admission snapshot regressed after finalize: initial_epoch={} current_epoch={}",
+					initial.current_epoch, after_apply.current_epoch
+				),
+			));
+		}
+		let expected_epoch_one = HybridTimestamp {
+			physical_ms: 1_000 + iteration,
+			logical: 0,
+			node_id: 1,
+		};
+		if after_apply.e_safe_watermarks.get(&1).copied() != Some(expected_epoch_one) {
+			return Err(SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!(
+					"expected epoch-1 watermark {:?}, got {:?}",
+					expected_epoch_one,
+					after_apply.e_safe_watermarks.get(&1).copied()
+				),
+			));
+		}
+
+		append_and_apply(
+			&mut target_store,
+			&mut target_sm,
+			lease_entry(2, iteration * 10, iteration * 10 + 9, 1),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("target lease apply failed: {err}"),
+			)
+		})?;
+		let changed = tokio::time::timeout(Duration::from_millis(50), snapshots.changed()).await;
+		if changed.is_ok() {
+			return Err(SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				"lease-only apply unexpectedly published a new admission snapshot".to_string(),
+			));
+		}
+
+		let source_dir = tempdir(&format!("apply-order-source-{seed}-{iteration}"));
+		let source_wal = source_dir.join("control.wal");
+		let source_vote = source_dir.join("vote.wnd");
+		let source_snapshot = source_dir.join("snapshot.wnd");
+		let mut source_store = WendelonLogStore::open_with_file_ops(
+			&source_wal,
+			&source_vote,
+			&source_snapshot,
+			Arc::new(BlockingFileOps),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("open source log store failed: {err}"),
+			)
+		})?;
+		let mut source_sm = source_store
+			.recovered_state_machine()
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"apply_order_races",
+					seed,
+					iteration + 1,
+					format!("source recovered_state_machine failed: {err}"),
+				)
+			})?;
+		append_and_apply(
+			&mut source_store,
+			&mut source_sm,
+			finalize_entry(1, 1_000 + iteration),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("source epoch-1 finalize failed: {err}"),
+			)
+		})?;
+		append_and_apply(
+			&mut source_store,
+			&mut source_sm,
+			finalize_entry_for_epoch(2, 2, 2_000 + iteration),
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("source epoch-2 finalize failed: {err}"),
+			)
+		})?;
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("build snapshot failed: {err}"),
+			)
+		})?;
+		let meta = built.meta.clone();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&meta,
+			built.snapshot,
+		)
+		.await
+		.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("install snapshot failed: {err}"),
+			)
+		})?;
+		snapshots.changed().await.map_err(|err| {
+			SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!("target admission watch failed after install_snapshot: {err}"),
+			)
+		})?;
+		let after_install = snapshots.borrow().clone();
+		if after_install.current_epoch < after_apply.current_epoch {
+			return Err(SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!(
+					"snapshot install regressed epoch: apply_epoch={} install_epoch={}",
+					after_apply.current_epoch, after_install.current_epoch
+				),
+			));
+		}
+		for (epoch, watermark) in after_apply.e_safe_watermarks.iter() {
+			if let Some(next) = after_install.e_safe_watermarks.get(epoch) {
+				if next < watermark {
+					return Err(SimFailure::new(
+						"apply_order_races",
+						seed,
+						iteration + 1,
+						format!(
+							"snapshot install regressed watermark for epoch {epoch}: before={watermark:?} after={next:?}"
+						),
+					));
+				}
+			}
+		}
+		let expected_epoch_two = HybridTimestamp {
+			physical_ms: 2_000 + iteration,
+			logical: 0,
+			node_id: 1,
+		};
+		if after_install.e_safe_watermarks.get(&2).copied() != Some(expected_epoch_two) {
+			return Err(SimFailure::new(
+				"apply_order_races",
+				seed,
+				iteration + 1,
+				format!(
+					"expected epoch-2 watermark {:?}, got {:?}",
+					expected_epoch_two,
+					after_install.e_safe_watermarks.get(&2).copied()
+				),
+			));
+		}
+	}
+
+	Ok(iterations)
+}
+
+async fn run_interrupted_finalization_recovery_scenario(
+	seed: u64,
+	ops: u64,
+) -> std::result::Result<u64, SimFailure> {
+	let iterations = ops.max(1).min(6);
+	for iteration in 0..iterations {
+		let node_id = 800 + ((seed as u32).wrapping_add(iteration as u32) % 100);
+		let cfg = NodeBootstrapConfig::dev(
+			node_id,
+			tempdir(&format!("interrupted-finalization-{seed}-{iteration}")),
+			"127.0.0.1:0".into(),
+		);
+		let initial = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"interrupted_finalization_recovery",
+					seed,
+					iteration + 1,
+					format!("initial bootstrap failed: {err}"),
+				)
+			})?;
+		support::wait_for_local_leader(&initial).await;
+		initial.shutdown().await.map_err(|err| {
+			SimFailure::new(
+				"interrupted_finalization_recovery",
+				seed,
+				iteration + 1,
+				format!("initial shutdown failed: {err}"),
+			)
+		})?;
+
+		let store = PendingFinalizationStore::open(pending_finalizations_path(&cfg.data_dir))
+			.map_err(|err| {
+				SimFailure::new(
+					"interrupted_finalization_recovery",
+					seed,
+					iteration + 1,
+					format!("open pending-finalization store failed: {err}"),
+				)
+			})?;
+		let record = PendingFinalizationRecord::new(
+			ClientWriteId {
+				client_uuid: [iteration as u8; 16],
+				sequence_no: iteration + 1,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+			true,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 2,
+					term: 1,
+					epoch: 100 + iteration,
+					commit_hlc: HybridTimestamp {
+						physical_ms: 10_000 + iteration,
+						logical: 0,
+						node_id,
+					},
+					payload_hash: [iteration as u8; 32],
+					e_safe_index: 2,
+					durability: DurabilityLevel::QUORUM,
+					_pad: [0; 7],
+				},
+				tenant_id: TenantId::ZERO,
+				key_identity: Identity::blake3_tenant(
+					TenantId::ZERO,
+					format!("sim-interrupted-finalization-{seed}-{iteration}").as_bytes(),
+				),
+				charged_bytes: 0,
+			},
+		);
+		store.upsert(record.clone()).await.map_err(|err| {
+			SimFailure::new(
+				"interrupted_finalization_recovery",
+				seed,
+				iteration + 1,
+				format!("seed pending-finalization record failed: {err}"),
+			)
+		})?;
+		let seeded = store.load_all().await.map_err(|err| {
+			SimFailure::new(
+				"interrupted_finalization_recovery",
+				seed,
+				iteration + 1,
+				format!("read back seeded pending-finalization record failed: {err}"),
+			)
+		})?;
+		if seeded.len() != 1 {
+			return Err(SimFailure::new(
+				"interrupted_finalization_recovery",
+				seed,
+				iteration + 1,
+				format!("expected exactly one seeded record, found {}", seeded.len()),
+			));
+		}
+
+		let recovered = WendelonNode::bootstrap_single_node(cfg.clone())
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"interrupted_finalization_recovery",
+					seed,
+					iteration + 1,
+					format!("recovery bootstrap failed: {err}"),
+				)
+			})?;
+		support::wait_for_local_leader(&recovered).await;
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			let pending = store.load_all().await.map_err(|err| {
+				SimFailure::new(
+					"interrupted_finalization_recovery",
+					seed,
+					iteration + 1,
+					format!("load pending-finalization store during recovery failed: {err}"),
+				)
+			})?;
+			let snapshot = recovered.state_machine.state_snapshot().await;
+			if pending.is_empty()
+				&& snapshot
+					.e_safe_watermarks
+					.get(&record.finalization.marker.epoch)
+					.copied() == Some(record.finalization.marker.commit_hlc)
+			{
+				break;
+			}
+			if tokio::time::Instant::now() >= deadline {
+				recovered.shutdown().await.map_err(|err| {
+					SimFailure::new(
+						"interrupted_finalization_recovery",
+						seed,
+						iteration + 1,
+						format!("recovery shutdown after timeout failed: {err}"),
+					)
+				})?;
+				return Err(SimFailure::new(
+					"interrupted_finalization_recovery",
+					seed,
+					iteration + 1,
+					format!(
+						"timed out waiting for startup reconciler to finalize seeded record; pending={} watermark={:?}",
+						pending.len(),
+						snapshot
+							.e_safe_watermarks
+							.get(&record.finalization.marker.epoch)
+							.copied()
+					),
+				));
+			}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		recovered.shutdown().await.map_err(|err| {
+			SimFailure::new(
+				"interrupted_finalization_recovery",
+				seed,
+				iteration + 1,
+				format!("recovery shutdown failed: {err}"),
+			)
+		})?;
+	}
+
+	Ok(iterations)
+}
+
+async fn run_lazy_migration_pressure_scenario(
+	seed: u64,
+	ops: u64,
+) -> std::result::Result<u64, SimFailure> {
+	let retries = usize::try_from(ops.max(1).min((DATA_RETRY_BUDGET - 1) as u64)).unwrap();
+	let node_id = 600 + ((seed as u32) % 50);
+	let node = support::bootstrap_node("sim-lazy-migration", node_id).await;
+	let result = async {
+		refresh_leases(&node).await;
+
+		let service = Arc::new(FlakyMigrationService::new(
+			node.router.clone() as Arc<dyn HrftService>,
+			retries,
+		));
+		let address = format!("loopback://node-{}", node.local_node.id);
+		let bootstrap = snapshot(
+			1,
+			Some(node.local_node.id),
+			&[(node.local_node.id, &address)],
+		);
+		let topology = Arc::new(CountingTopologySource::new(bootstrap.clone()));
+		let client = WendelonClient::new(support::loopback_client_config_with_topology(
+			node.local_node,
+			service.clone() as Arc<dyn HrftService>,
+			bootstrap,
+			topology.clone(),
+		));
+
+		let key = b"sim-migration-key";
+		let value = b"sim-migration-value";
+		client
+			.write(WriteRequest {
+				meta: write_meta(1, key, value, 1),
+				payload: kv_batch(key, value),
+			})
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"lazy_migration_pressure",
+					seed,
+					1,
+					format!("seed write failed: {err}"),
+				)
+			})?;
+
+		let start = tokio::time::Instant::now();
+		let batches = client
+			.query(
+				tenant(),
+				Vec::new(),
+				KeyRange::full(),
+				1,
+				hlc(0, 0, 0),
+				Consistency::STALE,
+				hlc(0, 0, 0),
+			)
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"lazy_migration_pressure",
+					seed,
+					2,
+					format!("query start failed: {err}"),
+				)
+			})?
+			.collect_all()
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"lazy_migration_pressure",
+					seed,
+					3,
+					format!("query collect failed: {err}"),
+				)
+			})?;
+		if batches.len() != 1 {
+			return Err(SimFailure::new(
+				"lazy_migration_pressure",
+				seed,
+				4,
+				format!("expected one batch after retries, got {}", batches.len()),
+			));
+		}
+		if service.query_calls() != retries + 1 {
+			return Err(SimFailure::new(
+				"lazy_migration_pressure",
+				seed,
+				5,
+				format!(
+					"expected {} query attempts, got {}",
+					retries + 1,
+					service.query_calls()
+				),
+			));
+		}
+		if topology.fetches() != 0 {
+			return Err(SimFailure::new(
+				"lazy_migration_pressure",
+				seed,
+				6,
+				format!(
+					"migration pressure scenario should not refresh topology, got {} fetches",
+					topology.fetches()
+				),
+			));
+		}
+		let expected_delay = MIGRATION_RETRY_BACKOFF * (retries as u32);
+		if start.elapsed() < expected_delay {
+			return Err(SimFailure::new(
+				"lazy_migration_pressure",
+				seed,
+				7,
+				format!(
+					"expected retry backoff of at least {:?}, observed {:?}",
+					expected_delay,
+					start.elapsed()
+				),
+			));
+		}
+		Ok((retries + 2) as u64)
+	}
+	.await;
+	support::abort_node(&node);
+	result
+}
+
+async fn run_quota_authorization_boundary_scenario(
+	seed: u64,
+	_ops: u64,
+) -> std::result::Result<u64, SimFailure> {
+	let node_id = 700 + ((seed as u32) % 50);
+	let node = support::bootstrap_node("sim-quota-auth", node_id).await;
+	let result = async {
+		refresh_leases(&node).await;
+		node.raft
+			.client_write(WendelonRequest::UpdateTenantQuota(UpdateTenantQuota {
+				tenant_id: TenantId::ZERO,
+				quota_bytes: 0,
+			}))
+			.await
+			.map_err(|err| {
+				SimFailure::new(
+					"quota_authorization_boundary",
+					seed,
+					1,
+					format!("quota update failed: {err}"),
+				)
+			})?;
+		node.data_server.sync_tenant_policy_cache_once().await;
+
+		let service = Arc::new(CountingWriteService::new(
+			node.router.clone() as Arc<dyn HrftService>
+		));
+		let address = format!("loopback://node-{}", node.local_node.id);
+		let bootstrap = snapshot(
+			1,
+			Some(node.local_node.id),
+			&[(node.local_node.id, &address)],
+		);
+		let inner = WendelonClient::new(support::loopback_client_config(
+			node.local_node,
+			service.clone() as Arc<dyn HrftService>,
+			bootstrap,
+		));
+		let sdk = Client::from_inner(inner);
+
+		let err = sdk
+			.write(
+				tenant(),
+				b"sim-quota-key",
+				b"sim-quota-value",
+				WriteOptions::default(),
+			)
+			.await
+			.expect_err("quota-zero tenant must reject writes");
+		if !matches!(
+			err,
+			ClientError::QuotaExceeded {
+				tenant_id: TenantId::ZERO
+			}
+		) {
+			return Err(SimFailure::new(
+				"quota_authorization_boundary",
+				seed,
+				2,
+				format!("expected QuotaExceeded, got {err:?}"),
+			));
+		}
+		if service.write_calls() != 1 {
+			return Err(SimFailure::new(
+				"quota_authorization_boundary",
+				seed,
+				3,
+				format!(
+					"quota boundary should fail without write retries; observed {} write calls",
+					service.write_calls()
+				),
+			));
+		}
+
+		let data_node = ActorIdentity::data_node(NodeId {
+			id: 7,
+			_reserved: 0,
+		});
+		let operator = ActorIdentity::new(
+			ActorRole::Operator,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![9, 8, 7, 6],
+		)
+		.unwrap();
+		let observer = ActorIdentity::new(
+			ActorRole::ReadOnlyObserver,
+			None,
+			None,
+			vec!["cluster".into()],
+			vec![6, 7, 8, 9],
+		)
+		.unwrap();
+		if authorize_actor(&data_node, ActorPermission::InterNodeTransport).is_err()
+			|| authorize_actor(&data_node, ActorPermission::ObservabilityReady).is_err()
+			|| authorize_actor(&data_node, ActorPermission::ObservabilityMetrics).is_ok()
+			|| authorize_actor(&data_node, ActorPermission::OpsControl).is_ok()
+			|| authorize_actor(&operator, ActorPermission::OpsControl).is_err()
+			|| authorize_actor(&operator, ActorPermission::ObservabilityMetrics).is_err()
+			|| authorize_actor(&operator, ActorPermission::InterNodeTransport).is_ok()
+			|| authorize_actor(&observer, ActorPermission::ObservabilityMetrics).is_err()
+			|| authorize_actor(&observer, ActorPermission::OpsControl).is_ok()
+		{
+			return Err(SimFailure::new(
+				"quota_authorization_boundary",
+				seed,
+				4,
+				"authorization boundary matrix regressed".to_string(),
+			));
+		}
+
+		Ok(10)
+	}
+	.await;
+	support::abort_node(&node);
+	result
+}
+
 async fn run_coverage_ladder_with_history_export(
 	seed: u64,
 	ops: u64,
@@ -786,6 +1931,15 @@ async fn run_named_scenario(
 ) -> std::result::Result<u64, SimFailure> {
 	match name {
 		"coverage_ladder" => run_coverage_ladder(seed, ops).await,
+		"replay_ordering" => run_replay_ordering_scenario(seed, ops).await,
+		"apply_order_races" => run_apply_order_races_scenario(seed, ops).await,
+		"interrupted_finalization_recovery" => {
+			run_interrupted_finalization_recovery_scenario(seed, ops).await
+		}
+		"lazy_migration_pressure" => run_lazy_migration_pressure_scenario(seed, ops).await,
+		"quota_authorization_boundary" => {
+			run_quota_authorization_boundary_scenario(seed, ops).await
+		}
 		other => Err(SimFailure::new(
 			other,
 			seed,
@@ -850,6 +2004,47 @@ async fn simulator_register_history_export_surface_writes_json_artifact() {
 	assert_eq!(artifact.requested_ops, coverage_budget(ops).register_ops);
 	assert!(!artifact.batches.is_empty());
 	assert!(!artifact.events.is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn simulator_replay_ordering_scenario_is_live() {
+	let executed = run_replay_ordering_scenario(0xD401, 4)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+	assert_eq!(executed, 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn simulator_apply_order_races_scenario_is_live() {
+	let executed = run_apply_order_races_scenario(0xD402, 3)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+	assert_eq!(executed, 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn simulator_interrupted_finalization_recovery_scenario_is_live() {
+	let executed = run_interrupted_finalization_recovery_scenario(0xD403, 2)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+	assert_eq!(executed, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn simulator_lazy_migration_pressure_scenario_is_live() {
+	let retries = 3_u64;
+	let executed = run_lazy_migration_pressure_scenario(0xD404, retries)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+	assert!(executed >= retries);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn simulator_quota_authorization_boundary_scenario_is_live() {
+	let executed = run_quota_authorization_boundary_scenario(0xD405, 1)
+		.await
+		.unwrap_or_else(|err| panic!("{err}"));
+	assert!(executed >= 1);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1,3 +1,5 @@
+use crate::schema::WriteStatus;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -14,6 +16,25 @@ const L2_RANGE_READ_LATENCY_BUCKETS_MICROS: &[u64] = &[
 ];
 const L2_UPLOAD_LATENCY_BUCKETS_MICROS: &[u64] = &[
 	10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
+];
+const DURABLE_QUORUM_LATENCY_BUCKETS_MICROS: &[u64] = &[
+	500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+	2_500_000, 5_000_000,
+];
+const PENDING_FINALIZATION_REPLAY_LATENCY_BUCKETS_MICROS: &[u64] = &[
+	500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+	2_500_000, 5_000_000,
+];
+const MIGRATION_PROXY_READ_LATENCY_BUCKETS_MICROS: &[u64] = &[
+	500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000,
+	2_500_000, 5_000_000,
+];
+const WAL_APPEND_LATENCY_BUCKETS_MICROS: &[u64] = &[
+	100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+];
+const WAL_FSYNC_LATENCY_BUCKETS_MICROS: &[u64] = &[
+	100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+	1_000_000,
 ];
 
 pub fn global() -> &'static MetricsRegistry {
@@ -68,6 +89,395 @@ pub struct HistogramSnapshot<'a> {
 	bucket_counts: Vec<u64>,
 	sum_micros: u64,
 	count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingFinalizationReplayPath {
+	DuplicateReplay,
+	Reconciler,
+	OrphanWitnessImport,
+}
+
+impl PendingFinalizationReplayPath {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::DuplicateReplay => "duplicate_replay",
+			Self::Reconciler => "reconciler",
+			Self::OrphanWitnessImport => "orphan_witness_import",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationProxyReadOutcome {
+	Hit,
+	AuthoritativeMiss,
+	Incomplete,
+}
+
+impl MigrationProxyReadOutcome {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Hit => "hit",
+			Self::AuthoritativeMiss => "authoritative_miss",
+			Self::Incomplete => "incomplete",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoUringClass {
+	Generic,
+	Wal,
+	Slab,
+}
+
+impl IoUringClass {
+	const ALL: [Self; 3] = [Self::Generic, Self::Wal, Self::Slab];
+
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Generic => "generic",
+			Self::Wal => "wal",
+			Self::Slab => "slab",
+		}
+	}
+}
+
+#[derive(Default)]
+struct IoUringQueueDepthGauges {
+	generic: Gauge,
+	wal: Gauge,
+	slab: Gauge,
+}
+
+impl IoUringQueueDepthGauges {
+	fn gauge(&self, class: IoUringClass) -> &Gauge {
+		match class {
+			IoUringClass::Generic => &self.generic,
+			IoUringClass::Wal => &self.wal,
+			IoUringClass::Slab => &self.slab,
+		}
+	}
+
+	fn set(&self, class: IoUringClass, value: u64) {
+		self.gauge(class).set(value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_gauge_family_header(out, name, help);
+		for class in IoUringClass::ALL {
+			render_gauge_with_labels(
+				out,
+				name,
+				&[("class", class.as_str())],
+				self.gauge(class).get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct IoUringErrorCounters(Mutex<BTreeMap<(String, String, String), u64>>);
+
+impl IoUringErrorCounters {
+	fn observe(&self, class: IoUringClass, op: &str, errno: i32) {
+		let mut counters = self
+			.0
+			.lock()
+			.expect("io_uring error counter mutex poisoned");
+		let key = (
+			class.as_str().to_string(),
+			op.to_string(),
+			errno.to_string(),
+		);
+		*counters.entry(key).or_default() += 1;
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_io_uring_errors_total",
+			"io_uring failures broken down by durability class, operation, and errno.",
+		);
+		for ((class, op, errno), count) in self
+			.0
+			.lock()
+			.expect("io_uring error counter mutex poisoned")
+			.iter()
+		{
+			render_counter_with_labels(
+				out,
+				"wendelon_io_uring_errors_total",
+				&[
+					("class", class.as_str()),
+					("op", op.as_str()),
+					("errno", errno.as_str()),
+				],
+				*count,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct WriteOutcomeCounters {
+	ok: Counter,
+	epoch_stale: Counter,
+	not_leader: Counter,
+	duplicate: Counter,
+	proxy_limit: Counter,
+	payload_too_large: Counter,
+	lease_expired: Counter,
+	invalid_lease_signature: Counter,
+	internal_error: Counter,
+	quota_exceeded: Counter,
+	tenant_suspended: Counter,
+	tenant_unavailable: Counter,
+	authorization_failed: Counter,
+	finalization_pending: Counter,
+	backpressured: Counter,
+	unknown: Mutex<BTreeMap<u8, u64>>,
+}
+
+impl WriteOutcomeCounters {
+	fn observe(&self, status: WriteStatus) {
+		match status {
+			s if s == WriteStatus::OK => self.ok.inc(),
+			s if s == WriteStatus::EPOCH_STALE => self.epoch_stale.inc(),
+			s if s == WriteStatus::NOT_LEADER => self.not_leader.inc(),
+			s if s == WriteStatus::DUPLICATE => self.duplicate.inc(),
+			s if s == WriteStatus::PROXY_LIMIT => self.proxy_limit.inc(),
+			s if s == WriteStatus::PAYLOAD_TOO_LARGE => self.payload_too_large.inc(),
+			s if s == WriteStatus::LEASE_EXPIRED => self.lease_expired.inc(),
+			s if s == WriteStatus::INVALID_LEASE_SIGNATURE => {
+				self.invalid_lease_signature.inc();
+			}
+			s if s == WriteStatus::INTERNAL_ERROR => self.internal_error.inc(),
+			s if s == WriteStatus::QUOTA_EXCEEDED => self.quota_exceeded.inc(),
+			s if s == WriteStatus::TENANT_SUSPENDED => self.tenant_suspended.inc(),
+			s if s == WriteStatus::TENANT_UNAVAILABLE => self.tenant_unavailable.inc(),
+			s if s == WriteStatus::AUTHORIZATION_FAILED => self.authorization_failed.inc(),
+			s if s == WriteStatus::FINALIZATION_PENDING => self.finalization_pending.inc(),
+			s if s == WriteStatus::BACKPRESSURED => self.backpressured.inc(),
+			_ => {
+				let mut unknown = self
+					.unknown
+					.lock()
+					.expect("write outcome unknown counter mutex poisoned");
+				*unknown.entry(status.0).or_default() += 1;
+			}
+		}
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			"Write responses emitted by the Data Ring, grouped by final status.",
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "ok")],
+			self.ok.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "epoch_stale")],
+			self.epoch_stale.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "not_leader")],
+			self.not_leader.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "duplicate")],
+			self.duplicate.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "proxy_limit")],
+			self.proxy_limit.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "payload_too_large")],
+			self.payload_too_large.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "lease_expired")],
+			self.lease_expired.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "invalid_lease_signature")],
+			self.invalid_lease_signature.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "internal_error")],
+			self.internal_error.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "quota_exceeded")],
+			self.quota_exceeded.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "tenant_suspended")],
+			self.tenant_suspended.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "tenant_unavailable")],
+			self.tenant_unavailable.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "authorization_failed")],
+			self.authorization_failed.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "finalization_pending")],
+			self.finalization_pending.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_write_outcome_total",
+			&[("outcome", "backpressured")],
+			self.backpressured.get(),
+		);
+		for (status, count) in self
+			.unknown
+			.lock()
+			.expect("write outcome unknown counter mutex poisoned")
+			.iter()
+		{
+			let outcome = format!("unknown_{status}");
+			render_counter_with_labels(
+				out,
+				"wendelon_data_ring_write_outcome_total",
+				&[("outcome", outcome.as_str())],
+				*count,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct MigrationProxyReadCounters {
+	hit: Counter,
+	authoritative_miss: Counter,
+	incomplete: Counter,
+}
+
+impl MigrationProxyReadCounters {
+	fn observe(&self, outcome: MigrationProxyReadOutcome) {
+		match outcome {
+			MigrationProxyReadOutcome::Hit => self.hit.inc(),
+			MigrationProxyReadOutcome::AuthoritativeMiss => self.authoritative_miss.inc(),
+			MigrationProxyReadOutcome::Incomplete => self.incomplete.inc(),
+		}
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_data_ring_migration_proxy_reads_total",
+			"Lazy-migration point-read proxy attempts by outcome.",
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_migration_proxy_reads_total",
+			&[("outcome", MigrationProxyReadOutcome::Hit.as_str())],
+			self.hit.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_migration_proxy_reads_total",
+			&[(
+				"outcome",
+				MigrationProxyReadOutcome::AuthoritativeMiss.as_str(),
+			)],
+			self.authoritative_miss.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_migration_proxy_reads_total",
+			&[("outcome", MigrationProxyReadOutcome::Incomplete.as_str())],
+			self.incomplete.get(),
+		);
+	}
+}
+
+#[derive(Default)]
+struct PendingFinalizationReplayCounters {
+	duplicate_replay: Counter,
+	reconciler: Counter,
+	orphan_witness_import: Counter,
+}
+
+impl PendingFinalizationReplayCounters {
+	fn observe(&self, path: PendingFinalizationReplayPath) {
+		match path {
+			PendingFinalizationReplayPath::DuplicateReplay => self.duplicate_replay.inc(),
+			PendingFinalizationReplayPath::Reconciler => self.reconciler.inc(),
+			PendingFinalizationReplayPath::OrphanWitnessImport => {
+				self.orphan_witness_import.inc();
+			}
+		}
+	}
+
+	fn render(&self, out: &mut String) {
+		render_counter_family_header(
+			out,
+			"wendelon_data_ring_pending_finalization_replay_total",
+			"Pending-finalization recovery work attempted by path.",
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_pending_finalization_replay_total",
+			&[(
+				"path",
+				PendingFinalizationReplayPath::DuplicateReplay.as_str(),
+			)],
+			self.duplicate_replay.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_pending_finalization_replay_total",
+			&[("path", PendingFinalizationReplayPath::Reconciler.as_str())],
+			self.reconciler.get(),
+		);
+		render_counter_with_labels(
+			out,
+			"wendelon_data_ring_pending_finalization_replay_total",
+			&[(
+				"path",
+				PendingFinalizationReplayPath::OrphanWitnessImport.as_str(),
+			)],
+			self.orphan_witness_import.get(),
+		);
+	}
 }
 
 impl Histogram {
@@ -140,20 +550,30 @@ pub struct MetricsRegistry {
 	pub data_ring_read_requests_total: Counter,
 	pub data_ring_query_requests_total: Counter,
 	pub data_ring_migrate_requests_total: Counter,
+	data_ring_write_outcomes: WriteOutcomeCounters,
 	pub data_ring_lease_refresh_passes_total: Counter,
 	pub data_ring_lease_grants_total: Counter,
 	pub data_ring_lease_denials_total: Counter,
 	pub data_ring_lease_errors_total: Counter,
 	pub data_ring_lease_cache_entries: Gauge,
+	pub data_ring_pending_finalization_backlog: Gauge,
+	data_ring_pending_finalization_replay: PendingFinalizationReplayCounters,
+	data_ring_migration_proxy_reads: MigrationProxyReadCounters,
 	pub data_ring_backpressure_rejections_tenant_total: Counter,
 	pub data_ring_backpressure_rejections_actor_total: Counter,
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
 
 	pub group_commit_window_seconds: Histogram,
+	pub data_ring_durable_quorum_latency_seconds: Histogram,
+	pub data_ring_pending_finalization_replay_latency_seconds: Histogram,
+	pub data_ring_migration_proxy_read_latency_seconds: Histogram,
 	pub l1_read_latency_seconds: Histogram,
 	pub l2_upload_latency_seconds: Histogram,
 	pub l2_range_read_latency_seconds: Histogram,
+	io_uring_submission_queue_depth: IoUringQueueDepthGauges,
+	io_uring_completion_queue_depth: IoUringQueueDepthGauges,
+	io_uring_errors: IoUringErrorCounters,
 
 	pub storage_tiering_passes_total: Counter,
 	pub storage_tiering_pass_errors_total: Counter,
@@ -163,6 +583,8 @@ pub struct MetricsRegistry {
 	pub storage_tiering_skipped_already_tiered_total: Counter,
 	pub storage_wal_blocking_queue_depth: Gauge,
 	pub storage_slab_blocking_queue_depth: Gauge,
+	pub storage_wal_append_latency_seconds: Histogram,
+	pub storage_wal_fsync_latency_seconds: Histogram,
 	pub storage_rehydration_guard_skips_total: Counter,
 	pub storage_rehydrated_reclaims_total: Counter,
 	pub storage_migration_reclaimed_slabs_total: Counter,
@@ -218,20 +640,36 @@ impl Default for MetricsRegistry {
 			data_ring_read_requests_total: Counter::default(),
 			data_ring_query_requests_total: Counter::default(),
 			data_ring_migrate_requests_total: Counter::default(),
+			data_ring_write_outcomes: WriteOutcomeCounters::default(),
 			data_ring_lease_refresh_passes_total: Counter::default(),
 			data_ring_lease_grants_total: Counter::default(),
 			data_ring_lease_denials_total: Counter::default(),
 			data_ring_lease_errors_total: Counter::default(),
 			data_ring_lease_cache_entries: Gauge::default(),
+			data_ring_pending_finalization_backlog: Gauge::default(),
+			data_ring_pending_finalization_replay: PendingFinalizationReplayCounters::default(),
+			data_ring_migration_proxy_reads: MigrationProxyReadCounters::default(),
 			data_ring_backpressure_rejections_tenant_total: Counter::default(),
 			data_ring_backpressure_rejections_actor_total: Counter::default(),
 			data_ring_backpressure_active_tenant_requests: Gauge::default(),
 			data_ring_backpressure_active_actor_requests: Gauge::default(),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
+			data_ring_durable_quorum_latency_seconds: Histogram::new(
+				DURABLE_QUORUM_LATENCY_BUCKETS_MICROS,
+			),
+			data_ring_pending_finalization_replay_latency_seconds: Histogram::new(
+				PENDING_FINALIZATION_REPLAY_LATENCY_BUCKETS_MICROS,
+			),
+			data_ring_migration_proxy_read_latency_seconds: Histogram::new(
+				MIGRATION_PROXY_READ_LATENCY_BUCKETS_MICROS,
+			),
 			l1_read_latency_seconds: Histogram::new(LOCAL_READ_LATENCY_BUCKETS_MICROS),
 			l2_upload_latency_seconds: Histogram::new(L2_UPLOAD_LATENCY_BUCKETS_MICROS),
 			l2_range_read_latency_seconds: Histogram::new(L2_RANGE_READ_LATENCY_BUCKETS_MICROS),
+			io_uring_submission_queue_depth: IoUringQueueDepthGauges::default(),
+			io_uring_completion_queue_depth: IoUringQueueDepthGauges::default(),
+			io_uring_errors: IoUringErrorCounters::default(),
 
 			storage_tiering_passes_total: Counter::default(),
 			storage_tiering_pass_errors_total: Counter::default(),
@@ -241,6 +679,8 @@ impl Default for MetricsRegistry {
 			storage_tiering_skipped_already_tiered_total: Counter::default(),
 			storage_wal_blocking_queue_depth: Gauge::default(),
 			storage_slab_blocking_queue_depth: Gauge::default(),
+			storage_wal_append_latency_seconds: Histogram::new(WAL_APPEND_LATENCY_BUCKETS_MICROS),
+			storage_wal_fsync_latency_seconds: Histogram::new(WAL_FSYNC_LATENCY_BUCKETS_MICROS),
 			storage_rehydration_guard_skips_total: Counter::default(),
 			storage_rehydrated_reclaims_total: Counter::default(),
 			storage_migration_reclaimed_slabs_total: Counter::default(),
@@ -266,6 +706,61 @@ impl Default for MetricsRegistry {
 }
 
 impl MetricsRegistry {
+	pub fn observe_write_outcome(&self, status: WriteStatus) {
+		self.data_ring_write_outcomes.observe(status);
+	}
+
+	pub fn set_pending_finalization_backlog(&self, value: u64) {
+		self.data_ring_pending_finalization_backlog.set(value);
+	}
+
+	pub fn observe_pending_finalization_replay(
+		&self,
+		path: PendingFinalizationReplayPath,
+		duration: Duration,
+	) {
+		self.data_ring_pending_finalization_replay.observe(path);
+		self.data_ring_pending_finalization_replay_latency_seconds
+			.observe_duration(duration);
+	}
+
+	pub fn observe_migration_proxy_read(
+		&self,
+		outcome: MigrationProxyReadOutcome,
+		duration: Duration,
+	) {
+		self.data_ring_migration_proxy_reads.observe(outcome);
+		self.data_ring_migration_proxy_read_latency_seconds
+			.observe_duration(duration);
+	}
+
+	pub fn set_io_uring_submission_queue_depth(&self, class: IoUringClass, value: u64) {
+		self.io_uring_submission_queue_depth.set(class, value);
+	}
+
+	pub fn set_io_uring_completion_queue_depth(&self, class: IoUringClass, value: u64) {
+		self.io_uring_completion_queue_depth.set(class, value);
+	}
+
+	pub fn observe_io_uring_error(&self, class: IoUringClass, op: &str, errno: i32) {
+		self.io_uring_errors.observe(class, op, errno);
+	}
+
+	pub fn observe_durable_quorum_latency(&self, duration: Duration) {
+		self.data_ring_durable_quorum_latency_seconds
+			.observe_duration(duration);
+	}
+
+	pub fn observe_wal_append_latency(&self, duration: Duration) {
+		self.storage_wal_append_latency_seconds
+			.observe_duration(duration);
+	}
+
+	pub fn observe_wal_fsync_latency(&self, duration: Duration) {
+		self.storage_wal_fsync_latency_seconds
+			.observe_duration(duration);
+	}
+
 	pub fn set_raft_observability_state(&self, epoch: u64, leader_id: Option<u32>) {
 		self.raft_membership_epoch.set(epoch);
 		*self
@@ -456,6 +951,7 @@ impl MetricsRegistry {
 			"Data Ring migration requests handled.",
 			self.data_ring_migrate_requests_total.get(),
 		);
+		self.data_ring_write_outcomes.render(&mut out);
 		render_counter(
 			&mut out,
 			"wendelon_data_ring_lease_refresh_passes_total",
@@ -486,6 +982,14 @@ impl MetricsRegistry {
 			"Lease descriptors currently cached by the local Data Ring.",
 			self.data_ring_lease_cache_entries.get(),
 		);
+		render_gauge(
+			&mut out,
+			"wendelon_data_ring_pending_finalization_backlog",
+			"Durably persisted pending-finalization records currently awaiting reconciliation.",
+			self.data_ring_pending_finalization_backlog.get(),
+		);
+		self.data_ring_pending_finalization_replay.render(&mut out);
+		self.data_ring_migration_proxy_reads.render(&mut out);
 		render_counter_family_header(
 			&mut out,
 			"wendelon_data_ring_backpressure_rejections_total",
@@ -523,6 +1027,28 @@ impl MetricsRegistry {
 		);
 		render_histogram(
 			&mut out,
+			"wendelon_data_ring_durable_quorum_latency_seconds",
+			"Time from write admission to durable quorum satisfaction on the data branch.",
+			&self.data_ring_durable_quorum_latency_seconds.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_data_ring_pending_finalization_replay_latency_seconds",
+			"Time spent reconciling or importing pending-finalization work.",
+			&self
+				.data_ring_pending_finalization_replay_latency_seconds
+				.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_data_ring_migration_proxy_read_latency_seconds",
+			"Time spent resolving a point read through the lazy-migration proxy path.",
+			&self
+				.data_ring_migration_proxy_read_latency_seconds
+				.snapshot(),
+		);
+		render_histogram(
+			&mut out,
 			"wendelon_l1_read_latency_seconds",
 			"Storage-side latency for reads served from local L1 slabs.",
 			&self.l1_read_latency_seconds.snapshot(),
@@ -539,6 +1065,17 @@ impl MetricsRegistry {
 			"Storage-side latency for reads served from tiered L2 slabs.",
 			&self.l2_range_read_latency_seconds.snapshot(),
 		);
+		self.io_uring_submission_queue_depth.render(
+			&mut out,
+			"wendelon_io_uring_submission_queue_depth",
+			"Pending Wendelon-side io_uring submissions queued for each durability class before kernel dispatch.",
+		);
+		self.io_uring_completion_queue_depth.render(
+			&mut out,
+			"wendelon_io_uring_completion_queue_depth",
+			"In-flight io_uring operations awaiting completion for each durability class.",
+		);
+		self.io_uring_errors.render(&mut out);
 		render_counter(
 			&mut out,
 			"wendelon_storage_tiering_passes_total",
@@ -586,6 +1123,18 @@ impl MetricsRegistry {
 			"wendelon_storage_slab_blocking_queue_depth",
 			"Queued slab metadata file operations waiting on the isolated blocking executor.",
 			self.storage_slab_blocking_queue_depth.get(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_storage_wal_append_latency_seconds",
+			"Time spent issuing durable Control Ring WAL append writes before fdatasync.",
+			&self.storage_wal_append_latency_seconds.snapshot(),
+		);
+		render_histogram(
+			&mut out,
+			"wendelon_storage_wal_fsync_latency_seconds",
+			"Time spent awaiting Control Ring WAL durability flushes.",
+			&self.storage_wal_fsync_latency_seconds.snapshot(),
 		);
 		render_counter(
 			&mut out,
@@ -810,7 +1359,11 @@ fn render_seconds_from_micros(value_micros: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-	use super::{Histogram, render_histogram};
+	use super::{
+		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
+		PendingFinalizationReplayPath, render_histogram,
+	};
+	use crate::schema::WriteStatus;
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
@@ -836,5 +1389,61 @@ mod tests {
 		assert!(rendered.contains("wendelon_test_latency_seconds_bucket{le=\"+Inf\"} 2"));
 		assert!(rendered.contains("wendelon_test_latency_seconds_sum 0.00125"));
 		assert!(rendered.contains("wendelon_test_latency_seconds_count 2"));
+	}
+
+	#[test]
+	fn registry_renders_d2_write_and_wal_metrics() {
+		let registry = MetricsRegistry::default();
+		registry.observe_write_outcome(WriteStatus::OK);
+		registry.observe_write_outcome(WriteStatus::FINALIZATION_PENDING);
+		registry.observe_write_outcome(WriteStatus::NOT_LEADER);
+		registry.observe_write_outcome(WriteStatus(250));
+		registry.set_pending_finalization_backlog(3);
+		registry.observe_pending_finalization_replay(
+			PendingFinalizationReplayPath::DuplicateReplay,
+			Duration::from_micros(900),
+		);
+		registry.observe_migration_proxy_read(
+			MigrationProxyReadOutcome::Hit,
+			Duration::from_micros(3_400),
+		);
+		registry.set_io_uring_submission_queue_depth(IoUringClass::Wal, 4);
+		registry.set_io_uring_completion_queue_depth(IoUringClass::Slab, 7);
+		registry.observe_io_uring_error(IoUringClass::Wal, "write", 5);
+		registry.observe_durable_quorum_latency(Duration::from_micros(1_500));
+		registry.observe_wal_append_latency(Duration::from_micros(400));
+		registry.observe_wal_fsync_latency(Duration::from_micros(2_200));
+
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
+		assert!(rendered.contains(
+			"wendelon_data_ring_write_outcome_total{outcome=\"finalization_pending\"} 1"
+		));
+		assert!(
+			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"not_leader\"} 1")
+		);
+		assert!(
+			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")
+		);
+		assert!(rendered.contains("wendelon_data_ring_pending_finalization_backlog 3"));
+		assert!(rendered.contains(
+			"wendelon_data_ring_pending_finalization_replay_total{path=\"duplicate_replay\"} 1"
+		));
+		assert!(
+			rendered.contains("wendelon_data_ring_migration_proxy_reads_total{outcome=\"hit\"} 1")
+		);
+		assert!(
+			rendered.contains("wendelon_data_ring_migration_proxy_read_latency_seconds_count 1")
+		);
+		assert!(rendered.contains("wendelon_io_uring_submission_queue_depth{class=\"wal\"} 4"));
+		assert!(rendered.contains("wendelon_io_uring_completion_queue_depth{class=\"slab\"} 7"));
+		assert!(
+			rendered.contains(
+				"wendelon_io_uring_errors_total{class=\"wal\",op=\"write\",errno=\"5\"} 1"
+			)
+		);
+		assert!(rendered.contains("wendelon_data_ring_durable_quorum_latency_seconds_count 1"));
+		assert!(rendered.contains("wendelon_storage_wal_append_latency_seconds_count 1"));
+		assert!(rendered.contains("wendelon_storage_wal_fsync_latency_seconds_count 1"));
 	}
 }

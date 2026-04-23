@@ -79,3 +79,20 @@ What does not exist yet:
 - a first-party operator workflow for clearing the distrust marker
 - D-workstream metrics/traces proving distrust behavior under broader chaos coverage
 
+## Restart Recovery Boundary
+
+Recent recovery work tightened the restart contract for pre-checkpoint nodes:
+
+- committed progress is now persisted explicitly through the Raft storage `save_committed` / `read_committed` path
+- a torn WAL tail at EOF no longer implies `last_applied = last surviving log entry`
+- when no durable checkpoint exists, restart recovery now treats an uncommitted surviving WAL tail as `last_applied = None`
+
+Operational meaning:
+
+- a restarted node may come back with a smaller recovered state-machine boundary than older builds implied
+- that is intentional and safer; uncommitted WAL residue must not be replayed into the state machine
+- operators investigating restart behavior should expect the recovered state machine to follow the committed boundary, not the raw last surviving WAL page
+
+Cross-reference:
+
+- `plans/impl/workstream_B_replay_idempotency_note.md`

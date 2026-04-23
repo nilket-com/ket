@@ -5,6 +5,9 @@ Frozen chaos regressions live here as TOML files named `{issue_number}.seed`.
 Supported `scenario` values in the current catalog are:
 
 - `leader_partition_and_rejoin`
+- `leader_partition_restart_and_rejoin`
+- `follower_partition_restart_and_rejoin`
+- `follower_loss_under_control_write_load`
 - `rolling_kill`
 - `packet_drop_single_stream`
 

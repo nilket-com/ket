@@ -20,6 +20,15 @@ Rules:
 - `introduced_at` must use `YYYY-MM-DD`.
 - Frozen seeds are deleted only by explicit PR, with the retirement recorded in `tests/seeds/RETIRED.md`.
 
+Supported `scenario` values in the current catalog are:
+
+- `coverage_ladder`
+- `replay_ordering`
+- `apply_order_races`
+- `interrupted_finalization_recovery`
+- `lazy_migration_pressure`
+- `quota_authorization_boundary`
+
 The weekly `seed-retention-advisory.yml` workflow scans this registry and the
 chaos registry to produce an advisory retirement report; the workflow never
 removes seeds on its own.

@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+use wendelon::metrics::IoUringClass;
 use wendelon::storage::{
-	AlignedBuf, AsyncFileOps, DIRECT_IO_ALIGN, IoUringFileOps, OpenFlags, spawn_io_thread_named,
+	AlignedBuf, AsyncFileOps, DIRECT_IO_ALIGN, IoUringFileOps, OpenFlags,
+	spawn_io_thread_named_for_class,
 };
 
 const WAL_DEPTH: u32 = 64;
@@ -125,14 +127,25 @@ async fn run_scenario(
 
 	let (wal_ops, slab_ops): (Arc<dyn AsyncFileOps>, Arc<dyn AsyncFileOps>) = match topology {
 		Topology::Shared => {
-			let shared =
-				spawn_io_thread_named(WAL_DEPTH.max(SLAB_DEPTH), "wendelon-bench-io-shared")?;
+			let shared = spawn_io_thread_named_for_class(
+				WAL_DEPTH.max(SLAB_DEPTH),
+				"wendelon-bench-io-shared",
+				IoUringClass::Generic,
+			)?;
 			let ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::new(shared));
 			(ops.clone(), ops)
 		}
 		Topology::Split => {
-			let wal_io = spawn_io_thread_named(WAL_DEPTH, "wendelon-bench-io-wal")?;
-			let slab_io = spawn_io_thread_named(SLAB_DEPTH, "wendelon-bench-io-slab")?;
+			let wal_io = spawn_io_thread_named_for_class(
+				WAL_DEPTH,
+				"wendelon-bench-io-wal",
+				IoUringClass::Wal,
+			)?;
+			let slab_io = spawn_io_thread_named_for_class(
+				SLAB_DEPTH,
+				"wendelon-bench-io-slab",
+				IoUringClass::Slab,
+			)?;
 			(
 				Arc::new(IoUringFileOps::new(wal_io)),
 				Arc::new(IoUringFileOps::new(slab_io)),

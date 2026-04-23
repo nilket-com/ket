@@ -1,15 +1,26 @@
 #[path = "support/tls_pki.rs"]
 mod tls_pki;
 
+use arrow::array::LargeBinaryBuilder;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::audit::AuditSinksConfig;
+use wendelon::client::{
+	ClusterPeerWire, ClusterStatusWire, TopologySource, WendelonClient, WendelonClientConfig,
+	WriteRequest,
+};
+use wendelon::network::core::{HRFT_MAGIC, HrftFrame};
+use wendelon::network::pool::PooledBuf;
+use wendelon::network::ring::{RingRouter, RingState};
+use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::{
 	ActorRole, BufPool, EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet,
 	PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
@@ -21,7 +32,10 @@ use wendelon::network::{
 use wendelon::node::{
 	ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, TransportTlsConfig, WendelonNode,
 };
-use wendelon::schema::{FrameHeader, MsgType, NodeId};
+use wendelon::schema::{
+	ClientWriteId, DurabilityLevel, FrameHeader, HybridTimestamp, Identity, Locality, MsgType,
+	NodeId, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, write_payload_schema,
+};
 
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
 	let dir = std::env::temp_dir().join(format!(
@@ -38,6 +52,217 @@ fn reserve_socket_addr() -> String {
 	let addr = listener.local_addr().unwrap();
 	drop(listener);
 	addr.to_string()
+}
+
+fn node(id: u32) -> NodeId {
+	NodeId { id, _reserved: 0 }
+}
+
+fn tenant() -> TenantId {
+	TenantId::ZERO
+}
+
+fn tier_bits() -> u8 {
+	TransportTierSet::empty()
+		.with(TransportTier::QuicIoUring)
+		.as_u8()
+}
+
+fn role_bits() -> u8 {
+	NodeRoleSet::empty()
+		.with(NodeRole::Data)
+		.with(NodeRole::Control)
+		.as_u8()
+}
+
+fn hlc(physical_ms: u64, logical: u32, node_id: u32) -> HybridTimestamp {
+	HybridTimestamp {
+		physical_ms,
+		logical,
+		node_id,
+	}
+}
+
+fn snapshot(
+	epoch: u64,
+	leader: Option<u32>,
+	replication_factor: u32,
+	peers: &[(u32, &str)],
+) -> ClusterStatusWire {
+	ClusterStatusWire {
+		epoch,
+		leader,
+		replication_factor,
+		peers: peers
+			.iter()
+			.map(|(node_id, address)| ClusterPeerWire {
+				node_id: *node_id,
+				address: (*address).to_string(),
+				tier_bits: tier_bits(),
+				role_bits: role_bits(),
+			})
+			.collect(),
+	}
+}
+
+fn write_meta(epoch: u64, key: &[u8], value: &[u8], sequence_no: u64) -> WriteRequestMeta {
+	WriteRequestMeta {
+		write_id: ClientWriteId {
+			client_uuid: [7u8; 16],
+			sequence_no,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		},
+		client_hlc: hlc(5_000 + sequence_no, 0, 42),
+		expected_epoch: epoch,
+		tenant_id: tenant(),
+		proxy_hop: 0,
+		durability: DurabilityLevel::QUORUM,
+		await_finalization: 0,
+		_pad1: [0; 5],
+		proxy_source: node(0),
+		key_identity: Identity::blake3_tenant(tenant(), key),
+		key_len: key.len() as u32,
+		value_len: value.len() as u32,
+	}
+}
+
+fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
+	let schema = Arc::new(write_payload_schema());
+	let mut keys = LargeBinaryBuilder::new();
+	keys.append_value(key);
+	let mut values = LargeBinaryBuilder::new();
+	values.append_value(value);
+	RecordBatch::try_new(
+		schema,
+		vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+	)
+	.unwrap()
+}
+
+fn find_key_for_replica(snapshot: &ClusterStatusWire, target: NodeId) -> Vec<u8> {
+	let ring = RingRouter::new(RingState::build(
+		&snapshot.to_membership(),
+		snapshot.replication_factor as usize,
+	));
+	for i in 0..100_000u64 {
+		let candidate = format!("quic-retry-key-{i}");
+		let locality = Locality::from(Identity::blake3_tenant(tenant(), candidate.as_bytes()));
+		if ring
+			.replicas_for_locality(locality)
+			.into_iter()
+			.any(|replica| replica == target)
+		{
+			return candidate.into_bytes();
+		}
+	}
+	panic!("failed to find key routed to replica {}", target.id);
+}
+
+struct CountingTopologySource {
+	snapshot: Mutex<ClusterStatusWire>,
+	fetches: AtomicUsize,
+}
+
+impl CountingTopologySource {
+	fn new(snapshot: ClusterStatusWire) -> Self {
+		Self {
+			snapshot: Mutex::new(snapshot),
+			fetches: AtomicUsize::new(0),
+		}
+	}
+
+	fn fetches(&self) -> usize {
+		self.fetches.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl TopologySource for CountingTopologySource {
+	async fn fetch(&self) -> std::io::Result<ClusterStatusWire> {
+		self.fetches.fetch_add(1, Ordering::SeqCst);
+		Ok(self.snapshot.lock().unwrap().clone())
+	}
+}
+
+struct WriteResponseService {
+	status: WriteStatus,
+	leader_hint: NodeId,
+	epoch: u64,
+	commit_hlc: HybridTimestamp,
+	calls: AtomicUsize,
+}
+
+impl WriteResponseService {
+	fn new(
+		status: WriteStatus,
+		leader_hint: NodeId,
+		epoch: u64,
+		commit_hlc: HybridTimestamp,
+	) -> Self {
+		Self {
+			status,
+			leader_hint,
+			epoch,
+			commit_hlc,
+			calls: AtomicUsize::new(0),
+		}
+	}
+
+	fn calls(&self) -> usize {
+		self.calls.load(Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl HrftService for WriteResponseService {
+	async fn handle_frame(
+		&self,
+		_context: RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		match MsgType(frame.header.msg_type) {
+			MsgType::WRITE_REQ => {
+				let req: &WriteRequestMeta =
+					bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<WriteRequestMeta>()]);
+				let resp = WriteResponseMeta {
+					status: self.status,
+					_pad1: [0; 7],
+					log_index: 1,
+					term: 1,
+					epoch: self.epoch.max(req.expected_epoch),
+					commit_hlc: self.commit_hlc,
+					leader_hint: self.leader_hint,
+					echoed_write_id: req.write_id,
+					has_finalization: 0,
+					_pad2: [0; 7],
+				};
+				Ok(Some(HrftFrame {
+					header: FrameHeader {
+						magic: HRFT_MAGIC,
+						version: 1,
+						msg_type: MsgType::WRITE_RESP.0,
+						flags: 0,
+						stream_id: frame.header.stream_id,
+						meta_len: std::mem::size_of::<WriteResponseMeta>() as u32,
+						arrow_len: 0,
+						trailing_len: 0,
+					},
+					meta: PooledBuf::orphan(bytemuck::bytes_of(&resp).to_vec()),
+					arrow_payload: None,
+					trailing: None,
+				}))
+			}
+			other => Err(Error::new(
+				ErrorKind::Unsupported,
+				format!(
+					"write response service does not handle msg_type=0x{:02x}",
+					other.0
+				),
+			)),
+		}
+	}
 }
 
 struct RefusingProvider;
@@ -283,6 +508,152 @@ async fn quic_accept_loop_refuses_connections_over_limit() {
 	server.await.unwrap();
 	client_endpoint.wait_idle().await;
 	server_endpoint.wait_idle().await;
+}
+
+#[tokio::test]
+async fn listener_overload_sheds_excess_handshakes_while_retry_redirect_succeeds() {
+	let root = fresh_dir("listener-overload-retry");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+
+	let node1_server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let node2_server_material =
+		TlsMaterial::load(&pki.data_client_cert, &pki.data_client_key, &pki.ca_cert).unwrap();
+	let client_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+
+	let node1_endpoint =
+		endpoint_from_tls(&node1_server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let node2_endpoint =
+		endpoint_from_tls(&node2_server_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let client_endpoint =
+		endpoint_from_tls(&client_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let raw_endpoint = endpoint_from_tls(&client_material, "127.0.0.1:0".parse().unwrap()).unwrap();
+
+	let node1_addr = node1_endpoint.local_addr().unwrap().to_string();
+	let node2_addr = node2_endpoint.local_addr().unwrap().to_string();
+
+	let lifecycle1 = ServerLifecycle::new();
+	let lifecycle2 = ServerLifecycle::new();
+	let leader_service = Arc::new(WriteResponseService::new(
+		WriteStatus::OK,
+		node(1),
+		11,
+		hlc(11_000, 0, 1),
+	));
+	let redirect_service = Arc::new(WriteResponseService::new(
+		WriteStatus::NOT_LEADER,
+		node(1),
+		10,
+		hlc(10_000, 0, 2),
+	));
+
+	let server1 = tokio::spawn({
+		let endpoint = node1_endpoint.clone();
+		let lifecycle = lifecycle1.clone();
+		let service = leader_service.clone();
+		async move {
+			serve_with_admission(
+				endpoint,
+				service,
+				BufPool::new(8, 1024),
+				lifecycle,
+				ServerAdmissionConfig {
+					max_inbound_connections: 8,
+					max_inbound_connections_per_ip: 8,
+					max_inbound_streams_per_connection: 8,
+					max_concurrent_stream_tasks: 16,
+				},
+				tls_pki::CLUSTER_DOMAIN,
+			)
+			.await
+			.unwrap();
+		}
+	});
+	let server2 = tokio::spawn({
+		let endpoint = node2_endpoint.clone();
+		let lifecycle = lifecycle2.clone();
+		let service = redirect_service.clone();
+		async move {
+			serve_with_admission(
+				endpoint,
+				service,
+				BufPool::new(8, 1024),
+				lifecycle,
+				ServerAdmissionConfig {
+					max_inbound_connections: 1,
+					max_inbound_connections_per_ip: 4,
+					max_inbound_streams_per_connection: 8,
+					max_concurrent_stream_tasks: 16,
+				},
+				tls_pki::CLUSTER_DOMAIN,
+			)
+			.await
+			.unwrap();
+		}
+	});
+
+	let stale_snapshot = snapshot(10, Some(2), 2, &[(1, &node1_addr), (2, &node2_addr)]);
+	let fresh_snapshot = snapshot(11, Some(1), 2, &[(1, &node1_addr), (2, &node2_addr)]);
+	let topology = Arc::new(CountingTopologySource::new(fresh_snapshot));
+	let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
+	providers.insert(
+		TransportTier::QuicIoUring,
+		Arc::new(QuicTransportProvider::with_cluster_domain(
+			Arc::new(client_endpoint.clone()),
+			canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+			tls_pki::CLUSTER_DOMAIN,
+		)),
+	);
+	let client = WendelonClient::new(WendelonClientConfig {
+		local_tiers: TransportTierSet::empty().with(TransportTier::QuicIoUring),
+		providers,
+		bootstrap: stale_snapshot.clone(),
+		topology: topology.clone(),
+		pool_max_retained: 64,
+		pool_max_cap_bytes: 1024 * 1024,
+	});
+
+	let key = find_key_for_replica(&stale_snapshot, node(2));
+	let value = b"retry-survives-listener-overload";
+	let write = client
+		.write(WriteRequest {
+			meta: write_meta(10, &key, value, 1),
+			payload: kv_batch(&key, value),
+		})
+		.await
+		.unwrap();
+	assert_eq!(write.response.status, WriteStatus::OK);
+	assert_eq!(redirect_service.calls(), 1);
+	assert_eq!(leader_service.calls(), 1);
+	assert_eq!(topology.fetches(), 1);
+	assert_eq!(client.leader(), Some(node(1)));
+
+	tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	let overload_err = raw_endpoint
+		.connect(
+			node2_addr.parse().unwrap(),
+			&canonical_node_dns_name(2, tls_pki::CLUSTER_DOMAIN),
+		)
+		.unwrap()
+		.await;
+	assert!(
+		overload_err.is_err(),
+		"excess handshake should be refused while retry traffic still holds the listener slot"
+	);
+
+	raw_endpoint.close(0u32.into(), b"done");
+	client_endpoint.close(0u32.into(), b"done");
+	lifecycle1.begin_drain();
+	lifecycle2.begin_drain();
+	node1_endpoint.close(0u32.into(), b"done");
+	node2_endpoint.close(0u32.into(), b"done");
+	server1.await.unwrap();
+	server2.await.unwrap();
+	raw_endpoint.wait_idle().await;
+	client_endpoint.wait_idle().await;
+	node1_endpoint.wait_idle().await;
+	node2_endpoint.wait_idle().await;
 }
 
 #[tokio::test]

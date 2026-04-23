@@ -139,12 +139,29 @@ The mixed-load shape should include:
 
 ## Artifacts
 
-- metric catalog
-- dashboard and alert inventory
-- trace-span inventory
-- chaos matrix and seed registry
-- simulator scenario registry
-- soak report and SLO evidence package
+- metric catalog: `plans/impl/workstream_D_metric_catalog.md`
+- scorecard support: `plans/impl/scorecard.md`
+- artifact registry support: `plans/impl/artifact_registry.md`
+- trace-span inventory: `plans/impl/workstream_D_trace_inventory.md`
+- chaos matrix: `plans/impl/workstream_D_chaos_matrix.md`
+- simulator scenario registry: `plans/impl/workstream_D_simulator_registry.md`
+- property suite note: `plans/impl/workstream_D_property_suite.md`
+- soak specification: `plans/impl/workstream_D_soak_spec.md`
+- soak report and SLO evidence package: `plans/impl/workstream_D_soak_report.md`
+- dashboard and alert inventory: pending
+
+## Current D1 Status
+
+- `D1` metric catalog: complete
+- `A-lite` dependency support for scorecard/artifact discipline: complete and canonicalized in `plans/impl/scorecard.md` and `plans/impl/artifact_registry.md`
+- `D2` first pass: complete for B-path and WAL-path metrics plus trace inventory
+- `D2.2`: complete for lazy-migration proxy metrics and span inventory
+- `D2.3`: complete for `io_uring` queue/error metrics and internal batch trace seam
+- `D2`: first-pass complete; remaining trace follow-ons are tracked in `plans/impl/workstream_D_trace_inventory.md`
+- `D3`: first-pass complete; the formerly deferred isolated-leader partition-plus-restart case is now live, while the durable-quorum-to-finalization crash row remains partial until it has multi-node chaos evidence
+- `D4`: complete for replay-ordering, apply-order-race, interrupted-finalization-recovery, lazy-migration-pressure, and quota/auth-boundary scenarios
+- `D5`: complete for the minimum property suite and promoted CI gate
+- `D6`: soak specification and report scaffold are complete; authoritative measured run is still pending
 
 ## Deferred Follow-Ons
 

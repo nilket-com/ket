@@ -18,10 +18,13 @@
 //! indexing, or recovery; those belong to a higher layer that uses
 //! this driver as its backing.
 
+use crate::metrics::{IoUringClass, global as metrics};
 use io_uring::{IoUring, opcode, types};
 use std::alloc::{self, Layout};
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
 
@@ -146,6 +149,12 @@ pub struct IoCompletion {
 	pub result: i32,
 }
 
+struct InFlightRequest {
+	op: IoOp,
+	buf: Option<AlignedBuf>,
+	reply: oneshot::Sender<IoCompletion>,
+}
+
 // ============================================================
 //  TOKIO-SIDE HANDLE
 // ============================================================
@@ -155,6 +164,8 @@ pub struct IoCompletion {
 #[derive(Clone)]
 pub struct IoRingHandle {
 	tx: mpsc::Sender<IoRequest>,
+	class: IoUringClass,
+	pending_submissions: Arc<AtomicU64>,
 }
 
 impl IoRingHandle {
@@ -175,9 +186,18 @@ impl IoRingHandle {
 			offset,
 			reply: reply_tx,
 		};
-		self.tx.send(req).await.map_err(|_| {
-			std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring thread is gone")
-		})?;
+		self.pending_submissions.fetch_add(1, Ordering::Relaxed);
+		metrics().set_io_uring_submission_queue_depth(
+			self.class,
+			self.pending_submissions.load(Ordering::Relaxed),
+		);
+		if self.tx.send(req).await.is_err() {
+			decrement_pending_submissions(&self.pending_submissions, self.class);
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"io_uring thread is gone",
+			));
+		}
 		Ok(reply_rx)
 	}
 
@@ -214,9 +234,18 @@ impl IoRingHandle {
 			offset: 0,
 			reply: reply_tx,
 		};
-		self.tx.send(req).await.map_err(|_| {
-			std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring thread is gone")
-		})?;
+		self.pending_submissions.fetch_add(1, Ordering::Relaxed);
+		metrics().set_io_uring_submission_queue_depth(
+			self.class,
+			self.pending_submissions.load(Ordering::Relaxed),
+		);
+		if self.tx.send(req).await.is_err() {
+			decrement_pending_submissions(&self.pending_submissions, self.class);
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::BrokenPipe,
+				"io_uring thread is gone",
+			));
+		}
 		Ok(reply_rx)
 	}
 }
@@ -237,15 +266,34 @@ pub fn spawn_io_thread_named(
 	depth: u32,
 	thread_name: impl Into<String>,
 ) -> std::io::Result<IoRingHandle> {
+	spawn_io_thread_named_for_class(depth, thread_name, IoUringClass::Generic)
+}
+
+/// Spawn a dedicated OS thread owning a fresh `io_uring` with
+/// `depth` SQ entries, a caller-supplied thread name, and an
+/// explicit durability class for metrics.
+pub fn spawn_io_thread_named_for_class(
+	depth: u32,
+	thread_name: impl Into<String>,
+	class: IoUringClass,
+) -> std::io::Result<IoRingHandle> {
 	let ring = IoUring::new(depth)?;
 	// Channel capacity: 2× depth gives slack for bursty submitters
 	// without unbounded memory growth.
 	let (tx, rx) = mpsc::channel::<IoRequest>((depth as usize).saturating_mul(2).max(1));
+	let pending_submissions = Arc::new(AtomicU64::new(0));
 	let thread_name = thread_name.into();
-	thread::Builder::new()
-		.name(thread_name)
-		.spawn(move || io_thread_loop(ring, rx))?;
-	Ok(IoRingHandle { tx })
+	metrics().set_io_uring_submission_queue_depth(class, 0);
+	metrics().set_io_uring_completion_queue_depth(class, 0);
+	thread::Builder::new().name(thread_name).spawn({
+		let pending_submissions = pending_submissions.clone();
+		move || io_thread_loop(ring, rx, class, pending_submissions)
+	})?;
+	Ok(IoRingHandle {
+		tx,
+		class,
+		pending_submissions,
+	})
 }
 
 // ============================================================
@@ -268,17 +316,27 @@ pub fn spawn_io_thread_named(
 //  delay. A future revision can register an eventfd with the
 //  ring to wake the submit call on channel activity.
 // ============================================================
-fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
+fn io_thread_loop(
+	mut ring: IoUring,
+	mut rx: mpsc::Receiver<IoRequest>,
+	class: IoUringClass,
+	pending_submissions: Arc<AtomicU64>,
+) {
 	let mut cookie: u64 = 1;
-	let mut in_flight: HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)> =
-		HashMap::new();
+	let mut in_flight: HashMap<u64, InFlightRequest> = HashMap::new();
 
 	loop {
 		// 1. Block when idle. Shutdown signalled by channel close.
 		if in_flight.is_empty() {
 			match rx.blocking_recv() {
-				Some(req) => push_request(&mut ring, &mut cookie, &mut in_flight, req),
-				None => return,
+				Some(req) => {
+					decrement_pending_submissions(&pending_submissions, class);
+					push_request(&mut ring, &mut cookie, &mut in_flight, req);
+				}
+				None => {
+					metrics().set_io_uring_completion_queue_depth(class, 0);
+					return;
+				}
 			}
 		}
 
@@ -288,7 +346,10 @@ fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
 				break;
 			}
 			match rx.try_recv() {
-				Ok(req) => push_request(&mut ring, &mut cookie, &mut in_flight, req),
+				Ok(req) => {
+					decrement_pending_submissions(&pending_submissions, class);
+					push_request(&mut ring, &mut cookie, &mut in_flight, req);
+				}
 				Err(mpsc::error::TryRecvError::Empty) => break,
 				Err(mpsc::error::TryRecvError::Disconnected) => {
 					// No more new work will arrive, but we must still
@@ -298,29 +359,61 @@ fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
 			}
 		}
 
+		metrics().set_io_uring_completion_queue_depth(class, in_flight.len() as u64);
+		let span = tracing::trace_span!(
+			"storage.io_uring.batch",
+			class = class.as_str(),
+			submission_queue_depth = pending_submissions.load(Ordering::Relaxed),
+			completion_queue_depth = in_flight.len() as u64,
+			cq_ready = tracing::field::Empty,
+		);
+		let _enter = span.enter();
+
 		// 3. Submit + wait for at least one completion.
 		match ring.submit_and_wait(1) {
 			Ok(_) => {}
 			Err(e) => {
 				// Fatal: tear down all pending oneshots with the error.
-				drain_with_error(&mut in_flight, &e);
+				let errno = e.raw_os_error().unwrap_or(5);
+				metrics().observe_io_uring_error(class, "submit", errno);
+				tracing::warn!(
+					class = class.as_str(),
+					op = "submit",
+					errno,
+					"io_uring submit_and_wait failed"
+				);
+				drain_with_error(&mut in_flight, class, &e);
+				metrics().set_io_uring_completion_queue_depth(class, 0);
 				return;
 			}
 		}
 
 		// 4. Reap CQEs.
 		let mut cq = ring.completion();
+		span.record("cq_ready", cq.len() as i64);
 		while let Some(cqe) = cq.next() {
-			if let Some((buf, reply)) = in_flight.remove(&cqe.user_data()) {
-				let _ = reply.send(IoCompletion {
-					buf,
+			if let Some(request) = in_flight.remove(&cqe.user_data()) {
+				if cqe.result() < 0 {
+					let errno = -cqe.result();
+					metrics().observe_io_uring_error(class, request.op.as_str(), errno);
+					tracing::warn!(
+						class = class.as_str(),
+						op = request.op.as_str(),
+						errno,
+						"io_uring operation failed"
+					);
+				}
+				let _ = request.reply.send(IoCompletion {
+					buf: request.buf,
 					result: cqe.result(),
 				});
 			}
 		}
+		metrics().set_io_uring_completion_queue_depth(class, in_flight.len() as u64);
 
 		// If the channel is closed and nothing remains in flight, exit.
 		if rx.is_closed() && in_flight.is_empty() {
+			metrics().set_io_uring_completion_queue_depth(class, 0);
 			return;
 		}
 	}
@@ -331,7 +424,7 @@ fn io_thread_loop(mut ring: IoUring, mut rx: mpsc::Receiver<IoRequest>) {
 fn push_request(
 	ring: &mut IoUring,
 	cookie: &mut u64,
-	in_flight: &mut HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)>,
+	in_flight: &mut HashMap<u64, InFlightRequest>,
 	req: IoRequest,
 ) {
 	let id = *cookie;
@@ -371,7 +464,7 @@ fn push_request(
 			.user_data(id),
 	};
 
-	in_flight.insert(id, (buf, reply));
+	in_flight.insert(id, InFlightRequest { op, buf, reply });
 
 	// Safety: the buffer referenced by `entry` is kept alive in
 	// `in_flight` until the matching CQE is reaped.
@@ -384,16 +477,50 @@ fn push_request(
 
 /// Send an error result to every pending oneshot, dropping their buffers.
 fn drain_with_error(
-	in_flight: &mut HashMap<u64, (Option<AlignedBuf>, oneshot::Sender<IoCompletion>)>,
+	in_flight: &mut HashMap<u64, InFlightRequest>,
+	class: IoUringClass,
 	err: &std::io::Error,
 ) {
 	// EIO on Linux; used as a generic fallback when the std::io::Error
 	// carries no OS errno (avoiding a direct `libc` dep).
 	const GENERIC_IO_ERRNO: i32 = 5;
-	for (_id, (buf, reply)) in in_flight.drain() {
-		let _ = reply.send(IoCompletion {
-			buf,
-			result: -err.raw_os_error().unwrap_or(GENERIC_IO_ERRNO),
+	let errno = err.raw_os_error().unwrap_or(GENERIC_IO_ERRNO);
+	for (_id, request) in in_flight.drain() {
+		metrics().observe_io_uring_error(class, request.op.as_str(), errno);
+		let _ = request.reply.send(IoCompletion {
+			buf: request.buf,
+			result: -errno,
 		});
+	}
+}
+
+fn decrement_pending_submissions(pending_submissions: &AtomicU64, class: IoUringClass) {
+	let mut current = pending_submissions.load(Ordering::Relaxed);
+	loop {
+		debug_assert!(current > 0, "pending submission count underflow");
+		let next = current.saturating_sub(1);
+		match pending_submissions.compare_exchange_weak(
+			current,
+			next,
+			Ordering::Relaxed,
+			Ordering::Relaxed,
+		) {
+			Ok(_) => {
+				metrics().set_io_uring_submission_queue_depth(class, next);
+				return;
+			}
+			Err(observed) => current = observed,
+		}
+	}
+}
+
+impl IoOp {
+	fn as_str(self) -> &'static str {
+		match self {
+			IoOp::Write => "write",
+			IoOp::Read => "read",
+			IoOp::Fsync => "fsync",
+			IoOp::Fdatasync => "fdatasync",
+		}
 	}
 }

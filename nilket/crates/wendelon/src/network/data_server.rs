@@ -46,7 +46,7 @@ use crate::consensus::{
 	WendelonResponse, WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
-use crate::metrics::global as metrics;
+use crate::metrics::{MigrationProxyReadOutcome, PendingFinalizationReplayPath, global as metrics};
 use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
@@ -96,6 +96,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use tracing::Instrument;
 
 use crate::network::core::HrftFrame;
 use crate::network::traits::DataRing;
@@ -844,6 +845,24 @@ impl WendelonDataServer {
 		self.admission_snapshot_rx.borrow().clone()
 	}
 
+	fn refresh_pending_finalization_backlog_metric(&self) {
+		metrics().set_pending_finalization_backlog(self.pending_finalizations.count());
+	}
+
+	fn counted_write_response(&self, response: WriteResponseMeta) -> WriteResponseMeta {
+		metrics().observe_write_outcome(response.status);
+		response
+	}
+
+	fn counted_write_result(
+		&self,
+		response: WriteResponseMeta,
+		trailing: Option<FinalizationMarker>,
+	) -> (WriteResponseMeta, Option<FinalizationMarker>) {
+		metrics().observe_write_outcome(response.status);
+		(response, trailing)
+	}
+
 	fn apply_local_persistence_runtime_fence(&self) {
 		let runtime = self.raft.runtime_config();
 		runtime.heartbeat(false);
@@ -919,6 +938,7 @@ impl WendelonDataServer {
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
 		};
+		server.refresh_pending_finalization_backlog_metric();
 		if server.degraded_reason().is_some() {
 			tracing::error!(
 				node_id = server.local_node.id,
@@ -1093,7 +1113,7 @@ impl WendelonDataServer {
 		} else {
 			WriteStatus::INTERNAL_ERROR
 		};
-		(error_response(meta, status, leader_hint), None)
+		self.counted_write_result(error_response(meta, status, leader_hint), None)
 	}
 
 	#[cfg(test)]
@@ -1516,6 +1536,8 @@ impl WendelonDataServer {
 				error = %err,
 				"failed to remove reconciled pending finalization"
 			);
+		} else {
+			self.refresh_pending_finalization_backlog_metric();
 		}
 		Ok((response, trailing))
 	}
@@ -1588,18 +1610,38 @@ impl WendelonDataServer {
 	async fn try_reconcile_pending_record_once(
 		&self,
 		record: &PendingFinalizationRecord,
+		path: PendingFinalizationReplayPath,
 	) -> std::io::Result<Option<(WriteResponseMeta, Option<FinalizationMarker>)>> {
 		let Some(_claim) = self.try_claim_pending_finalization(record.id) else {
 			return Ok(None);
 		};
-		match self.resolve_pending_finalization(record).await {
-			Ok(resolution) => self
-				.complete_pending_finalization(record, resolution)
-				.await
-				.map(Some),
-			Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
-			Err(err) => Err(err),
+		let started = Instant::now();
+		let span = tracing::info_span!(
+			"data_ring.pending_finalization.reconcile",
+			node_id = self.local_node.id,
+			tenant_id = record.finalization.tenant_id.get(),
+			epoch = record.finalization.marker.epoch,
+			path = match path {
+				PendingFinalizationReplayPath::DuplicateReplay => "duplicate_replay",
+				PendingFinalizationReplayPath::Reconciler => "reconciler",
+				PendingFinalizationReplayPath::OrphanWitnessImport => "orphan_witness_import",
+			},
+			pending_id = %format_bytes_hex(record.id.as_bytes()),
+		);
+		let result = async {
+			match self.resolve_pending_finalization(record).await {
+				Ok(resolution) => self
+					.complete_pending_finalization(record, resolution)
+					.await
+					.map(Some),
+				Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
+				Err(err) => Err(err),
+			}
 		}
+		.instrument(span)
+		.await;
+		metrics().observe_pending_finalization_replay(path, started.elapsed());
+		result
 	}
 
 	async fn replay_write_outcome(
@@ -1626,10 +1668,16 @@ impl WendelonDataServer {
 						return Ok(self.redirected_pending_response(response, leader_hint));
 					}
 				}
-				match self.try_reconcile_pending_record_once(&record).await {
+				match self
+					.try_reconcile_pending_record_once(
+						&record,
+						PendingFinalizationReplayPath::DuplicateReplay,
+					)
+					.await
+				{
 					Ok(Some((mut committed_response, trailing))) => {
 						committed_response.status = WriteStatus::DUPLICATE;
-						return Ok((committed_response, trailing));
+						return Ok(self.counted_write_result(committed_response, trailing));
 					}
 					Ok(None) => {}
 					Err(err) => {
@@ -1645,7 +1693,9 @@ impl WendelonDataServer {
 							.map(|id| NodeId { id, _reserved: 0 })
 						{
 							if leader_hint.id != self.local_node.id {
-								return Ok(self.redirected_pending_response(response, leader_hint));
+								let (redirected, trailing) =
+									self.redirected_pending_response(response, leader_hint);
+								return Ok(self.counted_write_result(redirected, trailing));
 							}
 						}
 					}
@@ -1660,11 +1710,16 @@ impl WendelonDataServer {
 						pending_finalization_id: cached_id,
 						..
 					} if cached_id == pending_finalization_id => {}
-					newer_outcome => return Ok(self.duplicate_response_for_outcome(newer_outcome)),
+					newer_outcome => {
+						let (response, trailing) =
+							self.duplicate_response_for_outcome(newer_outcome);
+						return Ok(self.counted_write_result(response, trailing));
+					}
 				}
 			}
 		}
-		Ok(self.duplicate_response_for_outcome(outcome))
+		let (response, trailing) = self.duplicate_response_for_outcome(outcome);
+		Ok(self.counted_write_result(response, trailing))
 	}
 
 	fn try_claim_pending_finalization(
@@ -1697,7 +1752,13 @@ impl WendelonDataServer {
 
 		let mut reconciled = 0usize;
 		for record in records {
-			match self.try_reconcile_pending_record_once(&record).await {
+			match self
+				.try_reconcile_pending_record_once(
+					&record,
+					PendingFinalizationReplayPath::Reconciler,
+				)
+				.await
+			{
 				Ok(Some((_response, _trailing))) => {
 					reconciled += 1;
 				}
@@ -1955,6 +2016,7 @@ impl WendelonDataServer {
 		peer: NodeId,
 		request_epoch: u64,
 	) -> std::io::Result<usize> {
+		let started = Instant::now();
 		let records = self
 			.pull_pending_witnesses_from_peer(peer, request_epoch)
 			.await?;
@@ -1965,6 +2027,13 @@ impl WendelonDataServer {
 				imported += 1;
 			}
 		}
+		if imported > 0 {
+			self.refresh_pending_finalization_backlog_metric();
+		}
+		metrics().observe_pending_finalization_replay(
+			PendingFinalizationReplayPath::OrphanWitnessImport,
+			started.elapsed(),
+		);
 		Ok(imported)
 	}
 
@@ -2416,9 +2485,16 @@ impl WendelonDataServer {
 	async fn handle_query(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
-
+		let span = tracing::info_span!(
+			"data_ring.query.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			consistency = meta.consistency.0,
+		);
 		let (resp_meta, arrow_bytes) = self
 			.execute_query_with_migration_merge(&meta, &bytecode)
+			.instrument(span)
 			.await?;
 		Ok(self.build_query_response_frame(
 			frame.header.stream_id,
@@ -2622,7 +2698,11 @@ impl WendelonDataServer {
 		self.build_write_response_frame(
 			msg_type,
 			stream_id,
-			error_response(meta, WriteStatus::AUTHORIZATION_FAILED, self.local_node),
+			self.counted_write_response(error_response(
+				meta,
+				WriteStatus::AUTHORIZATION_FAILED,
+				self.local_node,
+			)),
 			None,
 		)
 	}
@@ -2636,7 +2716,11 @@ impl WendelonDataServer {
 		self.build_write_response_frame(
 			msg_type,
 			stream_id,
-			error_response(meta, WriteStatus::BACKPRESSURED, self.local_node),
+			self.counted_write_response(error_response(
+				meta,
+				WriteStatus::BACKPRESSURED,
+				self.local_node,
+			)),
 			None,
 		)
 	}
@@ -2951,8 +3035,16 @@ impl WendelonDataServer {
 	) -> std::io::Result<()> {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode) = self.decode_query_request_frame(&frame)?;
+		let span = tracing::info_span!(
+			"data_ring.query.stream",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			consistency = meta.consistency.0,
+		);
 		let plan = self
 			.prepare_query_execution_plan_with_migration(&meta, &bytecode)
+			.instrument(span)
 			.await?;
 
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
@@ -3052,9 +3144,18 @@ impl WendelonDataServer {
 			}
 
 			let (meta, payload) = self.decode_write_request_frame(&frame, "BULK_WRITE_REQ")?;
-			let (resp, trailing) = match self.write(meta, payload).await {
+			let span = tracing::info_span!(
+				"data_ring.bulk_write.request",
+				stream_id = frame.header.stream_id,
+				tenant_id = meta.tenant_id.get(),
+				expected_epoch = meta.expected_epoch,
+				await_finalization = meta.await_finalization != 0,
+				durability = meta.durability.0,
+				write_sequence = meta.write_id.sequence_no,
+			);
+			let (resp, trailing) = match self.write(meta, payload).instrument(span).await {
 				Ok(ok) => ok,
-				Err(_) => (
+				Err(_) => self.counted_write_result(
 					error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
 					None,
 				),
@@ -3081,10 +3182,18 @@ impl WendelonDataServer {
 
 	async fn handle_write(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
 		let (meta, payload) = self.decode_write_request_frame(&frame, "WRITE_REQ")?;
-
-		let (resp, trailing) = match self.write(meta, payload).await {
+		let span = tracing::info_span!(
+			"data_ring.write.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			await_finalization = meta.await_finalization != 0,
+			durability = meta.durability.0,
+			write_sequence = meta.write_id.sequence_no,
+		);
+		let (resp, trailing) = match self.write(meta, payload).instrument(span).await {
 			Ok(ok) => ok,
-			Err(_) => (
+			Err(_) => self.counted_write_result(
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
 			),
@@ -3113,7 +3222,14 @@ impl WendelonDataServer {
 		let key = decode_batch(key_bytes)?;
 		validate_read_request_batch(&meta, &key)?;
 
-		let (resp, value_batch) = self.read(meta, key).await?;
+		let span = tracing::info_span!(
+			"data_ring.read.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			consistency = meta.consistency.0,
+		);
+		let (resp, value_batch) = self.read(meta, key).instrument(span).await?;
 		let arrow_payload = value_batch.map(|batch| {
 			let bytes = encode_batch(&batch)?;
 			let mut buf = self.pool.acquire();
@@ -3453,130 +3569,179 @@ impl WendelonDataServer {
 		key_identity: Identity,
 		as_of_hlc: HybridTimestamp,
 	) -> std::io::Result<PointReadOutcome> {
+		let started = Instant::now();
 		let key_locality = Locality::from(key_identity).get();
-		let sm = self.state_machine.state_snapshot().await;
-		let Some(entry) =
-			pending_owned_entry(&sm.migrations, Locality::new(key_locality), self.local_node)
-		else {
-			return Ok(PointReadOutcome::AuthoritativeMiss);
-		};
+		let span = tracing::info_span!(
+			"data_ring.migration.proxy_read",
+			node_id = self.local_node.id,
+			tenant_id = tenant_id.get(),
+			key_locality,
+			as_of_hlc_physical_ms = as_of_hlc.physical_ms,
+			as_of_hlc_logical = as_of_hlc.logical,
+			as_of_hlc_node_id = as_of_hlc.node_id,
+			migration_id = tracing::field::Empty,
+			source_count = tracing::field::Empty,
+			outcome = tracing::field::Empty,
+		);
+		let result = async {
+			let sm = self.state_machine.state_snapshot().await;
+			let Some(entry) =
+				pending_owned_entry(&sm.migrations, Locality::new(key_locality), self.local_node)
+			else {
+				return Ok(PointReadOutcome::AuthoritativeMiss);
+			};
 
-		let gate = self
-			.migration_registry
-			.gate(entry.migration_id, tenant_id, key_identity);
-		// Registry cleanup guard — drops AFTER `_guard` releases the
-		// mutex, so the inflight slot is freed only once the pull has
-		// fully completed. A racer that arrives after removal mints a
-		// fresh mutex, re-checks the local index (now a hit post
-		// `append_migration`), and skips the RPC.
-		let _scope = RegistryScopeGuard {
-			registry: &self.migration_registry,
-			migration_id: entry.migration_id,
-			tenant_id,
-			key_identity,
-		};
-		let _guard = gate.lock().await;
+			span.record("migration_id", entry.migration_id);
+			span.record("source_count", entry.source_replicas.len() as i64);
 
-		// Another task may have filled this key while we waited
-		// on the gate. If so, skip the RPC entirely — the fast
-		// path is the only ack the caller needed.
-		if let Some(location) = self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc) {
-			let bytes = self.slab.read(location).await?;
-			return Ok(PointReadOutcome::Hit(location, bytes));
-		}
+			let gate = self
+				.migration_registry
+				.gate(entry.migration_id, tenant_id, key_identity);
+			// Registry cleanup guard — drops AFTER `_guard` releases
+			// the mutex, so the inflight slot is freed only once the
+			// pull has fully completed. A racer that arrives after
+			// removal mints a fresh mutex, re-checks the local index
+			// (now a hit post `append_migration`), and skips the RPC.
+			let _scope = RegistryScopeGuard {
+				registry: &self.migration_registry,
+				migration_id: entry.migration_id,
+				tenant_id,
+				key_identity,
+			};
+			let _guard = gate.lock().await;
 
-		// Walk the ledger's ordered source candidates. Classify
-		// each response into two buckets:
-		//
-		// * *authoritative* — the source is reachable and replies
-		//   that it definitively lacks the version at `as_of_hlc`.
-		//   An OK response (records may satisfy the read or not)
-		//   and `KEY_NOT_FOUND` both count here. A unanimous
-		//   authoritative-miss proves the key absent.
-		//
-		// * *inconclusive* — a transport error, `REDIRECT`,
-		//   `STALE_LEDGER`, or `INTERNAL_ERROR`. The source cannot
-		//   speak for the record's existence, so the loop must not
-		//   collapse the union into a false negative.
-		//
-		// After the loop, `any_inconclusive` decides between
-		// `AuthoritativeMiss` (safe to return `KEY_NOT_FOUND` to
-		// the client) and `Incomplete` (surface
-		// `MIGRATION_INCOMPLETE` so the client retries).
-		let req = MigrateRequestMeta {
-			migration_id: entry.migration_id,
-			expected_to_epoch: entry.to_epoch,
-			requester: self.local_node,
-			tenant_id,
-			range_start: key_locality,
-			range_end: key_locality,
-			key_identity,
-			migration_hlc_floor: entry.migration_hlc_floor,
-			cursor_identity: Identity::ZERO,
-			cursor_hlc: bytemuck::Zeroable::zeroed(),
-			max_records: 0,
-			max_bytes: 0,
-			kind: MigrateRequestKind::POINT_LOOKUP,
-			_pad: [0; 7],
-		};
-
-		let mut any_inconclusive = false;
-		for source in &entry.source_replicas {
-			if source.id == self.local_node.id {
-				continue;
+			// Another task may have filled this key while we waited
+			// on the gate. If so, skip the RPC entirely — the fast
+			// path is the only ack the caller needed.
+			if let Some(location) = self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc) {
+				let bytes = self.slab.read(location).await?;
+				return Ok(PointReadOutcome::Hit(location, bytes));
 			}
-			match self.migrate_request(*source, &req).await {
-				Ok((resp, records)) if resp.status == MigrateStatus::OK => {
-					for record in &records {
-						self.slab
-							.append_migration(
-								entry.migration_id,
-								record.tenant_id,
-								record.key_identity,
-								record.hlc,
-								record.payload_hash,
-								&record.frame_bytes,
-							)
-							.await?;
+
+			// Walk the ledger's ordered source candidates. Classify
+			// each response into two buckets:
+			//
+			// * *authoritative* — the source is reachable and replies
+			//   that it definitively lacks the version at `as_of_hlc`.
+			//   An OK response (records may satisfy the read or not)
+			//   and `KEY_NOT_FOUND` both count here. A unanimous
+			//   authoritative-miss proves the key absent.
+			//
+			// * *inconclusive* — a transport error, `REDIRECT`,
+			//   `STALE_LEDGER`, or `INTERNAL_ERROR`. The source cannot
+			//   speak for the record's existence, so the loop must not
+			//   collapse the union into a false negative.
+			//
+			// After the loop, `any_inconclusive` decides between
+			// `AuthoritativeMiss` (safe to return `KEY_NOT_FOUND` to
+			// the client) and `Incomplete` (surface
+			// `MIGRATION_INCOMPLETE` so the client retries).
+			let req = MigrateRequestMeta {
+				migration_id: entry.migration_id,
+				expected_to_epoch: entry.to_epoch,
+				requester: self.local_node,
+				tenant_id,
+				range_start: key_locality,
+				range_end: key_locality,
+				key_identity,
+				migration_hlc_floor: entry.migration_hlc_floor,
+				cursor_identity: Identity::ZERO,
+				cursor_hlc: bytemuck::Zeroable::zeroed(),
+				max_records: 0,
+				max_bytes: 0,
+				kind: MigrateRequestKind::POINT_LOOKUP,
+				_pad: [0; 7],
+			};
+
+			let mut any_inconclusive = false;
+			for source in &entry.source_replicas {
+				if source.id == self.local_node.id {
+					continue;
+				}
+				match self.migrate_request(*source, &req).await {
+					Ok((resp, records)) if resp.status == MigrateStatus::OK => {
+						for record in &records {
+							self.slab
+								.append_migration(
+									entry.migration_id,
+									record.tenant_id,
+									record.key_identity,
+									record.hlc,
+									record.payload_hash,
+									&record.frame_bytes,
+								)
+								.await?;
+						}
+						if let Some(location) =
+							self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)
+						{
+							let bytes = self.slab.read(location).await?;
+							return Ok(PointReadOutcome::Hit(location, bytes));
+						}
+						// Source responded OK but did not hold a
+						// version of the key that satisfies
+						// `as_of_hlc`. Under quorum writes, a
+						// different replica may still carry the older
+						// retained version we need — fall through and
+						// try the next candidate. This still counts as
+						// an authoritative miss *for this source* —
+						// no bit flipped on `any_inconclusive`.
+						continue;
 					}
-					if let Some(location) =
-						self.slab.lookup_as_of(tenant_id, key_identity, as_of_hlc)
-					{
-						let bytes = self.slab.read(location).await?;
-						return Ok(PointReadOutcome::Hit(location, bytes));
+					Ok((resp, _)) if resp.status == MigrateStatus::KEY_NOT_FOUND => {
+						// Authoritative miss — the source is
+						// reachable and affirmatively has no record
+						// under the ledger floor.
+						continue;
 					}
-					// Source responded OK but did not hold a version
-					// of the key that satisfies `as_of_hlc`. Under
-					// quorum writes, a different replica may still
-					// carry the older retained version we need —
-					// fall through and try the next candidate. This
-					// still counts as an authoritative miss *for
-					// this source* — no bit flipped on
-					// `any_inconclusive`.
-					continue;
+					// REDIRECT / STALE_LEDGER / INTERNAL_ERROR or a
+					// transport error. None of these let us conclude
+					// the key is absent; record an inconclusive
+					// observation and keep trying remaining sources.
+					_ => {
+						any_inconclusive = true;
+						continue;
+					}
 				}
-				Ok((resp, _)) if resp.status == MigrateStatus::KEY_NOT_FOUND => {
-					// Authoritative miss — the source is reachable
-					// and affirmatively has no record under the
-					// ledger floor.
-					continue;
-				}
-				// REDIRECT / STALE_LEDGER / INTERNAL_ERROR or a
-				// transport error. None of these let us conclude
-				// the key is absent; record an inconclusive
-				// observation and keep trying remaining sources.
-				_ => {
-					any_inconclusive = true;
-					continue;
-				}
+			}
+
+			if any_inconclusive {
+				Ok(PointReadOutcome::Incomplete)
+			} else {
+				Ok(PointReadOutcome::AuthoritativeMiss)
+			}
+		}
+		.instrument(span.clone())
+		.await;
+
+		match &result {
+			Ok(PointReadOutcome::Hit(..)) => {
+				span.record("outcome", "hit");
+				metrics().observe_migration_proxy_read(
+					MigrationProxyReadOutcome::Hit,
+					started.elapsed(),
+				);
+			}
+			Ok(PointReadOutcome::AuthoritativeMiss) => {
+				span.record("outcome", "authoritative_miss");
+				metrics().observe_migration_proxy_read(
+					MigrationProxyReadOutcome::AuthoritativeMiss,
+					started.elapsed(),
+				);
+			}
+			Ok(PointReadOutcome::Incomplete) => {
+				span.record("outcome", "incomplete");
+				metrics().observe_migration_proxy_read(
+					MigrationProxyReadOutcome::Incomplete,
+					started.elapsed(),
+				);
+			}
+			Err(_) => {
+				span.record("outcome", "error");
 			}
 		}
 
-		if any_inconclusive {
-			Ok(PointReadOutcome::Incomplete)
-		} else {
-			Ok(PointReadOutcome::AuthoritativeMiss)
-		}
+		result
 	}
 
 	/// Paged `RANGE_PAGE` pull covering `[range_start, range_end]`
@@ -3950,7 +4115,10 @@ impl WendelonDataServer {
 				Ok(_) => {
 					let pending = self.pending_finalization_record_from_replica_meta(&meta);
 					match self.pending_finalizations.upsert(pending).await {
-						Ok(()) => (ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE),
+						Ok(()) => {
+							self.refresh_pending_finalization_backlog_metric();
+							(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
+						}
 						Err(err) => {
 							tracing::error!(
 								write_id = ?meta.write_id,
@@ -4360,7 +4528,7 @@ impl DataRing for WendelonDataServer {
 		metrics().data_ring_write_requests_total.inc();
 		// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
 		if meta.proxy_hop >= 2 {
-			return Ok((
+			return Ok(self.counted_write_result(
 				error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
 				None,
 			));
@@ -4373,7 +4541,7 @@ impl DataRing for WendelonDataServer {
 		let admission = self.admission_snapshot();
 		let current_epoch = admission.current_epoch;
 		if meta.expected_epoch < current_epoch {
-			return Ok((
+			return Ok(self.counted_write_result(
 				error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
 				None,
 			));
@@ -4417,7 +4585,7 @@ impl DataRing for WendelonDataServer {
 			false
 		};
 		if self.lease_gate_enabled && !lease_gate_is_primary {
-			return Ok((
+			return Ok(self.counted_write_result(
 				error_response(&meta, WriteStatus::NOT_LEADER, self.local_node),
 				None,
 			));
@@ -4459,13 +4627,13 @@ impl DataRing for WendelonDataServer {
 			{
 				LeaseGateResult::Valid => {}
 				LeaseGateResult::Missing => {
-					return Ok((
+					return Ok(self.counted_write_result(
 						error_response(&meta, WriteStatus::LEASE_EXPIRED, self.local_node),
 						None,
 					));
 				}
 				LeaseGateResult::InvalidSignature => {
-					return Ok((
+					return Ok(self.counted_write_result(
 						error_response(
 							&meta,
 							WriteStatus::INVALID_LEASE_SIGNATURE,
@@ -4482,7 +4650,11 @@ impl DataRing for WendelonDataServer {
 			.await
 		{
 			Ok(reservation) => reservation,
-			Err(status) => return Ok((error_response(&meta, status, self.local_node), None)),
+			Err(status) => {
+				return Ok(
+					self.counted_write_result(error_response(&meta, status, self.local_node), None)
+				);
+			}
 		};
 
 		// 6. HLC for this write. The leader is authoritative: it
@@ -4495,7 +4667,7 @@ impl DataRing for WendelonDataServer {
 		// to a pre-Stellarator single-node append.
 		let replicas = self.router.replicas_for_locality(bifurcated.locality);
 		if replicas.is_empty() {
-			return Ok((
+			return Ok(self.counted_write_result(
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
 			));
@@ -4504,6 +4676,7 @@ impl DataRing for WendelonDataServer {
 		let quorum = (rf / 2) + 1;
 		let local_is_replica = replicas.iter().any(|n| n.id == self.local_node.id);
 		let mut quorum_tracker = DurableQuorumTracker::new(quorum, local_is_replica);
+		let durable_quorum_started = Instant::now();
 
 		// 8. Start the leader-local durable append (if this node is
 		// in the replica set) and remote fan-out concurrently. Each
@@ -4607,11 +4780,12 @@ impl DataRing for WendelonDataServer {
 		}
 
 		if !quorum_tracker.is_satisfied() {
-			return Ok((
+			return Ok(self.counted_write_result(
 				error_response(&meta, WriteStatus::INTERNAL_ERROR, self.local_node),
 				None,
 			));
 		}
+		metrics().observe_durable_quorum_latency(durable_quorum_started.elapsed());
 
 		// 10. Finalization. Before we touch the Control Ring, persist a
 		// local recovery intent so "data quorum durable, control branch
@@ -4635,7 +4809,8 @@ impl DataRing for WendelonDataServer {
 				Ok(resolution) => {
 					let committed = self
 						.complete_pending_finalization(&pending, resolution)
-						.await;
+						.await
+						.map(|(response, trailing)| self.counted_write_result(response, trailing));
 					self.trip_local_persistence_distrust(format!(
 						"pending finalization intent persistence failed after durable quorum: {err}"
 					))
@@ -4657,13 +4832,15 @@ impl DataRing for WendelonDataServer {
 					return Ok(self.fenced_write_response(&meta).await);
 				}
 			}
+		} else {
+			self.refresh_pending_finalization_backlog_metric();
 		}
 
 		match self.resolve_pending_finalization(&pending).await {
-			Ok(resolution) => {
-				self.complete_pending_finalization(&pending, resolution)
-					.await
-			}
+			Ok(resolution) => self
+				.complete_pending_finalization(&pending, resolution)
+				.await
+				.map(|(response, trailing)| self.counted_write_result(response, trailing)),
 			Err(err) => {
 				tracing::warn!(
 					pending_id = %format_bytes_hex(pending.id.as_bytes()),
@@ -4683,7 +4860,7 @@ impl DataRing for WendelonDataServer {
 					}),
 				);
 				self.pending_finalization_wakeup.notify_one();
-				Ok((response, None))
+				Ok(self.counted_write_result(response, None))
 			}
 		}
 	}
@@ -4941,7 +5118,11 @@ impl DataRing for WendelonDataServer {
 			while let Some((meta, payload)) = requests.recv().await {
 				let response = match server.write(meta, payload).await {
 					Ok((resp, _)) => resp,
-					Err(_) => error_response(&meta, WriteStatus::INTERNAL_ERROR, server.local_node),
+					Err(_) => server.counted_write_response(error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						server.local_node,
+					)),
 				};
 				if tx.send(response).await.is_err() {
 					break;
