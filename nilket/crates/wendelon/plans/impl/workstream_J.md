@@ -109,6 +109,11 @@ This is a skeleton first, not the final polished binder.
 
 ## Tests And Benchmarks
 
+- `cargo test --lib build_info::tests`
+- `CC=clang CXX=clang++ cargo test --lib --no-default-features --features fips build_info::tests`
+- `cargo test --test compliance_release_contract`
+- `cargo test --test governance_artifacts`
+- `bash -n ci/check_fips_symbol_sweep.sh ci/generate_regulated_release_evidence.sh ci/verify_regulated_release_evidence.sh`
 - symbol-sweep CI job
 - self-test success and failure-path tests
 - build-profile reproducibility checks where practical
@@ -125,11 +130,15 @@ This is a skeleton first, not the final polished binder.
 
 ## Artifacts
 
-- crypto-boundary inventory
-- FIPS build-profile note
-- self-test evidence note
-- SBOM and signing outputs
-- compliance-pack index
+- crypto-boundary inventory: `plans/impl/workstream_J_crypto_boundary_inventory.md`
+- FIPS build-profile note: `plans/impl/workstream_J_fips_build_profile.md`
+- self-test evidence note: `plans/impl/workstream_J_self_test_evidence.md`
+- release artifact evidence: `plans/impl/workstream_J_release_artifact_evidence.md`
+- CMVP status evidence: `plans/impl/workstream_J_cmvp_status_evidence.md`
+- compliance-pack index: `plans/impl/workstream_J_compliance_pack_index.md`
+- external lab contact record: `plans/impl/external/cmvp_lab_contact_record.md`
+- release scripts: `ci/generate_regulated_release_evidence.sh`, `ci/verify_regulated_release_evidence.sh`
+- FIPS symbol sweep: `ci/check_fips_symbol_sweep.sh`
 
 ## Deferred Follow-Ons
 

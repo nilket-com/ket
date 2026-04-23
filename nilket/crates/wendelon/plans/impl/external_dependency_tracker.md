@@ -14,7 +14,7 @@ The status below is repo-visible status, not a claim about external paperwork th
 | Dependency | Owner | Gate impact | Repo-visible status | Canonical evidence path | Next action | Review cadence |
 |---|---|---|---|---|---|---|
 | IANA PEN filing and assignment | `A` + `F` + compliance/program lead | `M0` kickoff, `M3` pilot credential freeze | `open` | `plans/impl/external/iana_pen_filing_record.md` | File or record the PEN request, then replace the placeholder actor-claims OID and update ADR `018` plus `plans/impl/workstream_F_claim_oid_note.md` | weekly until assigned |
-| CMVP/lab contact state | `A` + `J` + compliance/program lead | `M0` kickoff, `M5` regulated GA | `open` | `plans/impl/external/cmvp_lab_contact_record.md` | Record lab shortlist, outreach date, responses, selected lab, and the exact wording allowed for FIPS/CMVP claims | weekly during outreach, monthly after kickoff |
+| CMVP/lab contact state | `A` + `J` + compliance/program lead | `M0` kickoff, `M5` regulated GA | `open` | `plans/impl/external/cmvp_lab_contact_record.md` | Placeholder record exists; replace it with lab shortlist, outreach date, responses, selected lab, and the exact wording allowed for FIPS/CMVP claims | weekly during outreach, monthly after kickoff |
 | Custody-provider onboarding | `A` + `E` + legal/procurement owner | `M0` kickoff, `M3` customer pilot custody | `partial` | `plans/impl/external/custody_provider_onboarding_record.md` | Record provider account/legal status for local-sealed, cloud KMS, and PKCS#11/HSM tracks; keep unsupported providers marked unsupported | weekly until pilot provider path is executable |
 
 ## Dependency Rules

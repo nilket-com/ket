@@ -65,6 +65,9 @@ panic = "abort"
 strip = true
 debug = 0
 
+[profile.fips]
+inherits = "release"
+
 [[bench]]
 name = "quic_hot_path"
 harness = false

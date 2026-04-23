@@ -85,9 +85,9 @@ Status vocabulary:
 | `M3 Customer Pilot Ready` | Audit/trace correlation inventory | `open` | `D` + `G` | reserved in `plans/impl/artifact_registry.md` | Depends on D2 and G |
 | `M4 Regulated Pilot Authorization` | Generic compute/storage boundary for Toron | `done` | `I` + `F` + `G` + `D` | `plans/impl/workstream_I_boundary_contract.md`, `plans/impl/workstream_I_contract_test_inventory.md` | Wendelon-side boundary and mock compute-client tests are live; `../toron` has not implemented the contract yet |
 | `M4 Regulated Pilot Authorization` | Hostile-failure evidence package | `open` | `D` | reserved in `plans/impl/artifact_registry.md` | Depends on D3-D6 |
-| `M5 Regulated GA` | CMVP status and evidence package | `open` | `J` + `A` | reserved in `plans/impl/artifact_registry.md` | Depends on external CMVP/lab tracker and J crypto-boundary artifacts |
-| `M5 Regulated GA` | SBOM and signed release artifacts | `open` | `J` | reserved in `plans/impl/artifact_registry.md` | Release artifact evidence path is reserved; implementation not started |
-| `M5 Regulated GA` | Regulated compliance-pack index | `open` | `J` + `G` + `E` + `F` | reserved in `plans/impl/artifact_registry.md` | Compliance pack index is reserved; evidence package not assembled |
+| `M5 Regulated GA` | CMVP status and evidence package | `partial` | `J` + `A` | `plans/impl/workstream_J_cmvp_status_evidence.md`, `plans/impl/external/cmvp_lab_contact_record.md` | Evidence paths exist and claim language is narrowed; external lab engagement is still open |
+| `M5 Regulated GA` | SBOM and signed release artifacts | `partial` | `J` | `plans/impl/workstream_J_release_artifact_evidence.md`, `ci/generate_regulated_release_evidence.sh`, `ci/verify_regulated_release_evidence.sh` | Scripts define the repeatable output contract; no authoritative signed release output is checked in yet |
+| `M5 Regulated GA` | Regulated compliance-pack index | `partial` | `J` + `G` + `E` + `F` | `plans/impl/workstream_J_compliance_pack_index.md` | Skeleton index exists; regulated GA evidence remains incomplete |
 
 ## Immediate D Priorities
 

@@ -31,7 +31,7 @@ State vocabulary:
 | A claim-discipline register | `A` | `plans/impl/claim_discipline.md` | `M0-M5` | `present` | Standing claim baseline for docs, comments, and release-facing language |
 | A external dependency tracker | `A` | `plans/impl/external_dependency_tracker.md` | `M0-M5` | `present` | Repo-visible tracker for IANA PEN, CMVP/lab, and custody-provider onboarding |
 | A IANA PEN filing record | `A` + `F` | `plans/impl/external/iana_pen_filing_record.md` | `M0/M3` | `reserved` | External receipt path; tracker row remains `open` until this exists |
-| A CMVP lab contact record | `A` + `J` | `plans/impl/external/cmvp_lab_contact_record.md` | `M0/M5` | `reserved` | External lab outreach/selection path |
+| A CMVP lab contact record | `A` + `J` | `plans/impl/external/cmvp_lab_contact_record.md` | `M0/M5` | `present` | Placeholder record exists; external lab state remains `open` until real outreach is recorded |
 | A custody-provider onboarding record | `A` + `E` | `plans/impl/external/custody_provider_onboarding_record.md` | `M0/M3` | `reserved` | External provider/legal/procurement state path |
 | B transition table | `B` | `plans/impl/workstream_B_transition_table.md` | `M1` | `present` | Write-outcome state model |
 | B fault-injection report | `B` | `plans/impl/workstream_B_fault_injection_report.md` | `M1` | `present` | Current injected-failure evidence |
@@ -88,11 +88,12 @@ State vocabulary:
 | I integration runbook | `I` | `plans/impl/workstream_I_integration_runbook.md` | `M4` | `present` | Operator and implementer steps for onboarding a compute client such as Toron |
 | I contract-test inventory | `I` + `D` | `plans/impl/workstream_I_contract_test_inventory.md` | `M4` | `present` | Reference test fleet for identity propagation, schema transitions, quota failures, trace continuity, and audit attribution |
 | I driver and identity mapping note | `I` | `plans/impl/workstream_I_driver_identity_mapping_note.md` | `M4` | `present` | Generic driver, SSO, ingest, and query-session mapping posture without Toron-specific API names |
-| J crypto-boundary inventory | `J` | `plans/impl/workstream_J_crypto_boundary_inventory.md` | `M5` | `reserved` | Crypto libraries, FIPS-bound functions, transport posture, build flags, and target platforms |
-| J FIPS build-profile note | `J` | `plans/impl/workstream_J_fips_build_profile.md` | `M5` | `reserved` | Build profile, dependency pins, boundary restrictions, and self-test posture |
-| J release artifact evidence | `J` | `plans/impl/workstream_J_release_artifact_evidence.md` | `M5` | `reserved` | SBOM, signing, provenance, and verification outputs |
-| J CMVP status evidence package | `J` + `A` | `plans/impl/workstream_J_cmvp_status_evidence.md` | `M5` | `reserved` | CMVP status, lab evidence, and allowed FIPS/CMVP claim language |
-| J compliance-pack index | `J` | `plans/impl/workstream_J_compliance_pack_index.md` | `M5` | `reserved` | Regulated compliance pack skeleton and evidence index |
+| J crypto-boundary inventory | `J` | `plans/impl/workstream_J_crypto_boundary_inventory.md` | `M5` | `present` | Crypto libraries, FIPS-bound functions, transport posture, build flags, and target platforms |
+| J FIPS build-profile note | `J` | `plans/impl/workstream_J_fips_build_profile.md` | `M5` | `present` | Build profile, dependency pins, boundary restrictions, and self-test posture |
+| J self-test evidence note | `J` | `plans/impl/workstream_J_self_test_evidence.md` | `M5` | `present` | Startup FIPS-mode check, KATs, failure behavior, metrics/readiness evidence |
+| J release artifact evidence | `J` | `plans/impl/workstream_J_release_artifact_evidence.md` | `M5` | `present` | SBOM, signing, provenance, and verification contract; final release outputs still pending |
+| J CMVP status evidence package | `J` + `A` | `plans/impl/workstream_J_cmvp_status_evidence.md` | `M5` | `present` | CMVP status, lab evidence, and allowed FIPS/CMVP claim language |
+| J compliance-pack index | `J` | `plans/impl/workstream_J_compliance_pack_index.md` | `M5` | `present` | Regulated compliance pack skeleton and evidence index |
 
 ## Registry Rules
 
