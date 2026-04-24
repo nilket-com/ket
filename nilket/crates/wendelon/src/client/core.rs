@@ -51,8 +51,10 @@ use crate::network::transport::{
 use crate::schema::{
 	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
 	Locality, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	read_key_schema, read_value_schema, write_payload_schema,
+	ReadResponseMeta, ReadStatus, TableQueryRequestMeta, TableSchemaDescriptorV1,
+	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WpbcRejectCode, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, read_key_schema, read_value_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
@@ -280,6 +282,29 @@ pub struct WriteResult {
 	pub finalization: Option<FinalizationMarker>,
 }
 
+/// Client-visible typed table write request for ADR 037.
+#[derive(Clone, Debug)]
+pub struct TableWriteRequest {
+	pub meta: TableWriteRequestMeta,
+	pub descriptor: TableSchemaDescriptorV1,
+	pub payload: RecordBatch,
+}
+
+/// Result of a typed table write.
+#[derive(Clone, Debug)]
+pub struct TableWriteResult {
+	pub response: TableWriteResponseMeta,
+	pub finalization: Option<FinalizationMarker>,
+}
+
+/// Client-visible typed table scan request for ADR 037.
+#[derive(Clone, Debug)]
+pub struct TableQueryRequest {
+	pub meta: TableQueryRequestMeta,
+	pub descriptor: TableSchemaDescriptorV1,
+	pub wpbc: Vec<u8>,
+}
+
 /// Client-visible point read request for the Data Ring wire API.
 #[derive(Clone, Debug)]
 pub struct ReadRequest {
@@ -391,6 +416,73 @@ impl WendelonClient {
 			}
 			self.prepare_retry(Some(key_locality), retry).await?;
 			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Issue one `TABLE_WRITE_REQ` over HRFT. The accepting data node
+	/// may split a multi-row batch across multiple replica sets while
+	/// preserving one parent finalization for the logical write.
+	pub async fn table_write(
+		&self,
+		request: TableWriteRequest,
+	) -> std::io::Result<TableWriteResult> {
+		let admission = validate_table_write_request_batch(
+			&request.meta,
+			&request.payload,
+			&request.descriptor,
+		)
+		.map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
+		let Some(key_locality) = admission.localities.first().copied() else {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"TABLE_WRITE_REQ must contain at least one row",
+			));
+		};
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
+			let result = self.table_write_once(target, &request).await?;
+			self.observe_write_response(&result.response.write);
+			if result.response.reject_code != WpbcRejectCode::NONE.0 {
+				return Ok(result);
+			}
+			let Some(retry) = retry_write_response(&result.response.write) else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(key_locality), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Issue one `TABLE_QUERY_REQ` over HRFT. The descriptor is
+	/// carried client-side so the smart client can route the request
+	/// to a table-owned locality arc while the server validates the
+	/// authoritative schema generation from its catalog.
+	pub async fn table_query(
+		&self,
+		request: TableQueryRequest,
+	) -> std::io::Result<StreamingQueryResult> {
+		validate_table_query_request(&request)?;
+		let route_locality =
+			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
+			match self.table_query_once(target, &request).await? {
+				QueryOutcome::Ok(result) => return Ok(result),
+				QueryOutcome::Redirect(retry) => {
+					if attempt + 1 == DATA_RETRY_BUDGET {
+						return Err(retry.exhausted_query_error());
+					}
+					self.prepare_retry(Some(route_locality), retry).await?;
+					preferred_target = retry.preferred_target;
+				}
+			}
 		}
 		unreachable!("bounded retry loop must return within budget")
 	}
@@ -527,6 +619,40 @@ impl WendelonClient {
 		decode_write_response_frame(frame, MsgType::WRITE_RESP)
 	}
 
+	async fn table_write_once(
+		&self,
+		target: NodeId,
+		request: &TableWriteRequest,
+	) -> std::io::Result<TableWriteResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let arrow = encode_batch(&request.payload)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_WRITE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<TableWriteRequestMeta>() as u32,
+			arrow_len: arrow.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			Some(&arrow),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_table_write_response_frame(frame)
+	}
+
 	async fn read_once(
 		&self,
 		target: NodeId,
@@ -559,6 +685,40 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_read_response_frame(frame)
+	}
+
+	async fn table_query_once(
+		&self,
+		target: NodeId,
+		request: &TableQueryRequest,
+	) -> std::io::Result<QueryOutcome> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+
+		let meta_bytes = bytemuck::bytes_of(&request.meta);
+		let trailing: Option<&[u8]> = if request.wpbc.is_empty() {
+			None
+		} else {
+			Some(&request.wpbc)
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_QUERY_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: 0,
+			trailing_len: trailing.map(|t| t.len() as u32).unwrap_or(0),
+		};
+		write_frame(&mut *stream, &header, meta_bytes, None, trailing).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+		let resp = read_frame(&mut *stream, &self.pool).await?;
+		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::TABLE_QUERY_RESP)
 	}
 
 	async fn bulk_write_group(
@@ -718,6 +878,7 @@ pub struct StreamingQueryResult {
 	pending_batch: Option<RecordBatch>,
 	stream: Option<Box<dyn TransportStream>>,
 	pool: Arc<BufPool>,
+	expected_msg_type: MsgType,
 }
 
 impl std::fmt::Debug for StreamingQueryResult {
@@ -728,6 +889,7 @@ impl std::fmt::Debug for StreamingQueryResult {
 			.field("rows", &self.rows)
 			.field("has_pending_batch", &self.pending_batch.is_some())
 			.field("stream_open", &self.stream.is_some())
+			.field("expected_msg_type", &self.expected_msg_type.0)
 			.finish()
 	}
 }
@@ -742,12 +904,12 @@ impl StreamingQueryResult {
 		};
 
 		let frame = read_frame(&mut **stream, &self.pool).await?;
-		if frame.header.msg_type != MsgType::QUERY_RESP.0 {
+		if frame.header.msg_type != self.expected_msg_type.0 {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
-					"expected QUERY_RESP continuation, got msg_type=0x{:02x}",
-					frame.header.msg_type
+					"expected query continuation msg_type=0x{:02x}, got msg_type=0x{:02x}",
+					self.expected_msg_type.0, frame.header.msg_type
 				),
 			));
 		}
@@ -900,70 +1062,7 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 
 		let resp = read_frame(&mut *stream, &self.pool).await?;
-		if resp.header.msg_type != MsgType::QUERY_RESP.0 {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"expected QUERY_RESP, got msg_type=0x{:02x}",
-					resp.header.msg_type
-				),
-			));
-		}
-		if resp.meta.len() < std::mem::size_of::<QueryResponseMeta>() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"QUERY_RESP meta too small",
-			));
-		}
-		if resp.trailing.is_some() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"QUERY_RESP must not carry trailing bytes",
-			));
-		}
-		let ack: &QueryResponseMeta =
-			bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
-		let is_end = (resp.header.flags & FRAME_FLAG_STREAM_END) != 0;
-		let retry = retry_read_status(ack.status, ack.leader_hint);
-
-		match ack.status {
-			s if s == ReadStatus::OK => {
-				if resp.header.arrow_len != ack.arrow_len {
-					return Err(Error::new(
-						ErrorKind::InvalidData,
-						format!(
-							"QUERY_RESP first-frame arrow_len mismatch: meta={} header={}",
-							ack.arrow_len, resp.header.arrow_len
-						),
-					));
-				}
-				let arrow = resp.arrow_payload.as_ref().ok_or_else(|| {
-					Error::new(
-						ErrorKind::InvalidData,
-						"QUERY_RESP OK missing Arrow payload",
-					)
-				})?;
-				let batch = decode_batch(&arrow[..])?;
-				Ok(QueryOutcome::Ok(StreamingQueryResult {
-					value_hlc: ack.value_hlc,
-					epoch: ack.epoch,
-					rows: ack.rows,
-					pending_batch: Some(batch),
-					stream: if is_end { None } else { Some(stream) },
-					pool: self.pool.clone(),
-				}))
-			}
-			_ if retry.is_some() => Ok(QueryOutcome::Redirect(retry.expect("retry checked above"))),
-			s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(StreamingQueryResult {
-				value_hlc: ack.value_hlc,
-				epoch: ack.epoch,
-				rows: 0,
-				pending_batch: None,
-				stream: None,
-				pool: self.pool.clone(),
-			})),
-			other => Err(query_failure_error(other)),
-		}
+		decode_initial_query_response(resp, stream, self.pool.clone(), MsgType::QUERY_RESP)
 	}
 }
 
@@ -1038,6 +1137,134 @@ fn query_failure_error(status: ReadStatus) -> Error {
 	}
 }
 
+fn decode_initial_query_response(
+	resp: crate::network::core::HrftFrame,
+	stream: Box<dyn TransportStream>,
+	pool: Arc<BufPool>,
+	expected_msg_type: MsgType,
+) -> std::io::Result<QueryOutcome> {
+	if resp.header.msg_type != expected_msg_type.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected query response msg_type=0x{:02x}, got msg_type=0x{:02x}",
+				expected_msg_type.0, resp.header.msg_type
+			),
+		));
+	}
+	if resp.meta.len() < std::mem::size_of::<QueryResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"query response meta too small",
+		));
+	}
+	if resp.trailing.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"query response must not carry trailing bytes",
+		));
+	}
+	let ack: &QueryResponseMeta =
+		bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+	let is_end = (resp.header.flags & FRAME_FLAG_STREAM_END) != 0;
+	let retry = retry_read_status(ack.status, ack.leader_hint);
+
+	match ack.status {
+		s if s == ReadStatus::OK => {
+			if resp.header.arrow_len != ack.arrow_len {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"query response first-frame arrow_len mismatch: meta={} header={}",
+						ack.arrow_len, resp.header.arrow_len
+					),
+				));
+			}
+			let arrow = resp.arrow_payload.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"query response OK missing Arrow payload",
+				)
+			})?;
+			let batch = decode_batch(&arrow[..])?;
+			Ok(QueryOutcome::Ok(StreamingQueryResult {
+				value_hlc: ack.value_hlc,
+				epoch: ack.epoch,
+				rows: ack.rows,
+				pending_batch: Some(batch),
+				stream: if is_end { None } else { Some(stream) },
+				pool,
+				expected_msg_type,
+			}))
+		}
+		_ if retry.is_some() => Ok(QueryOutcome::Redirect(retry.expect("retry checked above"))),
+		s if s == ReadStatus::KEY_NOT_FOUND => Ok(QueryOutcome::Ok(StreamingQueryResult {
+			value_hlc: ack.value_hlc,
+			epoch: ack.epoch,
+			rows: 0,
+			pending_batch: None,
+			stream: None,
+			pool,
+			expected_msg_type,
+		})),
+		other => Err(query_failure_error(other)),
+	}
+}
+
+fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<()> {
+	request.descriptor.validate()?;
+	if request.meta.table_object_id != request.descriptor.table_object_id {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ table_object_id does not match descriptor",
+		));
+	}
+	if request.meta.schema_generation != request.descriptor.schema_generation {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ schema_generation does not match descriptor",
+		));
+	}
+	let bytecode_len = u32::try_from(request.wpbc.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ WPBC bytecode exceeds u32 length",
+		)
+	})?;
+	if request.meta.bytecode_len != bytecode_len {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"TABLE_QUERY_REQ bytecode_len mismatch: meta={} actual={}",
+				request.meta.bytecode_len, bytecode_len
+			),
+		));
+	}
+	Ok(())
+}
+
+fn table_query_route_locality(
+	tenant_id: TenantId,
+	descriptor: &TableSchemaDescriptorV1,
+) -> std::io::Result<Locality> {
+	match descriptor.locality_policy {
+		crate::schema::LocalityPolicyV1::TableSpreadProjection(spread) => {
+			let ranges = table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread)?;
+			ranges.first().map(|(start, _)| *start).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"table spread descriptor produced no scan ranges",
+				)
+			})
+		}
+		crate::schema::LocalityPolicyV1::IdentityProjection => Ok(Locality::ZERO),
+		crate::schema::LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ does not support column-projection locality in V1",
+		)),
+	}
+}
+
 fn nonzero_node_id(node: NodeId) -> Option<NodeId> {
 	(node.id != 0).then_some(node)
 }
@@ -1104,6 +1331,72 @@ fn decode_write_response_frame(
 		}
 	};
 	Ok(WriteResult {
+		response,
+		finalization,
+	})
+}
+
+fn decode_table_write_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<TableWriteResult> {
+	if frame.header.msg_type != MsgType::TABLE_WRITE_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected TABLE_WRITE_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<TableWriteResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_WRITE_RESP meta too small",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_WRITE_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: TableWriteResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableWriteResponseMeta>()]);
+	let finalization = match response.write.has_finalization {
+		0 => {
+			if frame.trailing.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_WRITE_RESP trailing marker present but has_finalization=0",
+				));
+			}
+			None
+		}
+		1 => {
+			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_WRITE_RESP missing FinalizationMarker payload",
+				)
+			})?;
+			if trailing.len() < std::mem::size_of::<FinalizationMarker>() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_WRITE_RESP FinalizationMarker payload too small",
+				));
+			}
+			Some(*bytemuck::from_bytes(
+				&trailing[..std::mem::size_of::<FinalizationMarker>()],
+			))
+		}
+		other => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("TABLE_WRITE_RESP invalid has_finalization value {other}"),
+			));
+		}
+	};
+	Ok(TableWriteResult {
 		response,
 		finalization,
 	})
@@ -1320,7 +1613,11 @@ mod tests {
 	use super::*;
 	use crate::client::topology::{ClusterPeerWire, StaticTopologySource};
 	use crate::network::transport::TransportTier;
-	use crate::schema::ClientWriteId;
+	use crate::schema::{
+		ClientWriteId, LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+	};
+	use arrow::datatypes::{DataType, Field, Schema};
 
 	fn tier_bits() -> u8 {
 		TransportTierSet::empty()
@@ -1359,6 +1656,24 @@ mod tests {
 			pool_max_retained: 4,
 			pool_max_cap_bytes: 64 * 1024,
 		}
+	}
+
+	fn table_query_descriptor(locality_policy: LocalityPolicyV1) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("name", DataType::Utf8, true),
+		]);
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x51; 16]),
+			3,
+			"client",
+			"items",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			locality_policy,
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
 	}
 
 	#[tokio::test]
@@ -1420,6 +1735,50 @@ mod tests {
 		assert!(retry_read_status(ReadStatus::QUERY_INVALID_PROGRAM, zero).is_none());
 		assert!(retry_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED, zero).is_none());
 		assert!(retry_read_status(ReadStatus::RETENTION_EXPIRED, zero).is_none());
+	}
+
+	#[test]
+	fn table_query_route_uses_first_table_spread_prefix() {
+		let tenant_id = TenantId::new(9);
+		let spread = TableSpreadLocalityDescriptorV1 {
+			spread_factor: 4,
+			prefix_bits: 12,
+		};
+		let descriptor = table_query_descriptor(LocalityPolicyV1::TableSpreadProjection(spread));
+		let expected =
+			table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread).unwrap()[0].0;
+
+		assert_eq!(
+			table_query_route_locality(tenant_id, &descriptor).unwrap(),
+			expected
+		);
+	}
+
+	#[test]
+	fn table_query_request_validation_checks_descriptor_and_bytecode_len() {
+		let descriptor = table_query_descriptor(LocalityPolicyV1::default_table_spread());
+		let request = TableQueryRequest {
+			meta: TableQueryRequestMeta {
+				min_hlc: bytemuck::Zeroable::zeroed(),
+				expected_epoch: 7,
+				tenant_id: TenantId::new(9),
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				consistency: Consistency::LINEARIZABLE,
+				_pad: [0; 7],
+				bytecode_len: 2,
+				_pad2: [0; 4],
+				as_of_hlc: bytemuck::Zeroable::zeroed(),
+			},
+			descriptor,
+			wpbc: vec![0x01, 0x02],
+		};
+		validate_table_query_request(&request).unwrap();
+
+		let mut bad = request.clone();
+		bad.meta.bytecode_len = 1;
+		let err = validate_table_query_request(&bad).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
 	}
 
 	#[test]

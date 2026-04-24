@@ -2719,6 +2719,7 @@ mod tests {
 							format!("ready-audit-{seq}").as_bytes(),
 						),
 						charged_bytes: seq,
+						record_count: 1,
 					},
 				))
 				.await
@@ -2859,6 +2860,7 @@ mod tests {
 					tenant_id: TenantId::ZERO,
 					key_identity: Identity::blake3_tenant(TenantId::ZERO, b"startup-finalize"),
 					charged_bytes: 0,
+					record_count: 1,
 				},
 			))
 			.await

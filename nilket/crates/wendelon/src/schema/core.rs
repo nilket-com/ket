@@ -460,6 +460,15 @@ impl MsgType {
 	// epoch, so duplicate retries converge instead of re-appending.
 	pub const PENDING_WITNESS_REQ: Self = Self(0x26);
 	pub const PENDING_WITNESS_RESP: Self = Self(0x27);
+	// Typed table write frames (ADR 037). Kept out of the legacy
+	// WRITE_REQ shape so existing KV clients retain their fixed
+	// `WriteRequestMeta` contract.
+	pub const TABLE_WRITE_REQ: Self = Self(0x28);
+	pub const TABLE_WRITE_RESP: Self = Self(0x29);
+	pub const TABLE_REPLICATE_REQ: Self = Self(0x2A);
+	pub const TABLE_REPLICATE_RESP: Self = Self(0x2B);
+	pub const TABLE_QUERY_REQ: Self = Self(0x2C);
+	pub const TABLE_QUERY_RESP: Self = Self(0x2D);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);
@@ -478,6 +487,8 @@ impl MsgType {
 	pub const TENANT_ADMIN_RESP: Self = Self(0x1D);
 	pub const AUDIT_CHAIN_HEAD_REQ: Self = Self(0x1E);
 	pub const AUDIT_CHAIN_HEAD_RESP: Self = Self(0x1F);
+	pub const SCHEMA_UPDATE_REQ: Self = Self(0x2E);
+	pub const SCHEMA_UPDATE_RESP: Self = Self(0x2F);
 	pub const REVOCATION_ADMIN_REQ: Self = Self(0x30);
 	pub const REVOCATION_ADMIN_RESP: Self = Self(0x31);
 
@@ -1160,12 +1171,13 @@ pub fn read_value_schema() -> Schema {
 /// physical holder to the new logical owner. `frame_bytes` is
 /// the verbatim Arrow IPC payload the holder originally stored
 /// on disk — the receiver re-appends it via
-/// [`SlabManager::append_migration`](crate::storage::manager::SlabManager::append_migration)
-/// without reshaping.
+/// [`SlabManager::append_migration_with_locality`](crate::storage::manager::SlabManager::append_migration_with_locality)
+/// without reshaping or losing custom table routing locality.
 pub fn migration_record_schema() -> Schema {
 	Schema::new(vec![
 		Field::new("tenant_id", DataType::UInt64, false),
 		Field::new("key_identity", DataType::FixedSizeBinary(32), false),
+		Field::new("routing_locality", DataType::UInt64, false),
 		Field::new("hlc_physical_ms", DataType::UInt64, false),
 		Field::new("hlc_logical", DataType::UInt32, false),
 		Field::new("hlc_node_id", DataType::UInt32, false),

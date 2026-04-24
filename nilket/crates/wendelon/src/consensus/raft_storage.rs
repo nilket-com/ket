@@ -58,11 +58,15 @@ use crate::consensus::{
 	WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
+use crate::integration::compute::{
+	SchemaMutationKindV1, SchemaObjectKind, decode_schema_update_envelope_v1,
+};
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
-	RaftLogEntryFixed, SlabId, SnapshotHeader, TenantId, TenantKekId, WALRecordHeader,
+	RaftLogEntryFixed, SlabId, SnapshotHeader, TableSchemaCatalogV1, TenantId, TenantKekId,
+	WALRecordHeader, decode_table_schema_descriptor_v1, validate_table_schema_evolution,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
@@ -1515,6 +1519,11 @@ pub struct SmState {
 	/// fetch timing.
 	#[serde(default)]
 	pub revoked_actor_keys: BTreeMap<RevokedActorKeyId, u64>,
+	/// ADR 037 tenant table schema descriptors keyed by durable table
+	/// object id and schema generation. Legacy KV traffic can still use
+	/// the default descriptor without needing this map populated.
+	#[serde(default)]
+	pub table_schemas: TableSchemaCatalogV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2700,13 +2709,14 @@ fn raft_audit_event(
 				AuditOperation::DataWriteFinalized,
 				local_node,
 				format!(
-					"raft_log_index={} raft_term={} tenant_id={} locality={} durability={} charged_bytes={} commit_hlc={:?} payload_hash={}",
+					"raft_log_index={} raft_term={} tenant_id={} locality={} durability={} charged_bytes={} record_count={} commit_hlc={:?} payload_hash={}",
 					entry.log_id.index,
 					entry.log_id.leader_id.term,
 					finalization.tenant_id.get(),
 					Locality::from(finalization.key_identity).get(),
 					finalization.marker.durability.0,
 					finalization.charged_bytes,
+					finalization.record_count,
 					finalization.marker.commit_hlc,
 					format_bytes_hex(&finalization.marker.payload_hash),
 				),
@@ -2718,6 +2728,7 @@ fn raft_audit_event(
 			.with_parameter("locality", Locality::from(finalization.key_identity).get())
 			.with_parameter("durability", finalization.marker.durability.0 as u64)
 			.with_parameter("charged_bytes", finalization.charged_bytes)
+			.with_parameter("record_count", finalization.record_count as u64)
 			.with_parameter(
 				"commit_hlc",
 				format!("{:?}", finalization.marker.commit_hlc),
@@ -2735,7 +2746,7 @@ fn raft_audit_event(
 					durability: Some(finalization.marker.durability.0 as u64),
 					charged_bytes: Some(finalization.charged_bytes),
 					returned_bytes: None,
-					result_count: Some(1),
+					result_count: Some(finalization.record_count as u64),
 				},
 			})
 			.with_tenant(finalization.tenant_id)
@@ -3075,6 +3086,7 @@ fn finalization_matches(left: &TenantFinalization, right: &TenantFinalization) -
 	left.tenant_id == right.tenant_id
 		&& left.key_identity == right.key_identity
 		&& left.charged_bytes == right.charged_bytes
+		&& left.record_count == right.record_count
 		&& left.marker.epoch == right.marker.epoch
 		&& left.marker.commit_hlc == right.marker.commit_hlc
 		&& left.marker.payload_hash == right.marker.payload_hash
@@ -3184,12 +3196,10 @@ fn apply_request(
 			apply_advance_epoch(state, record);
 			(WendelonResponse::Success, None)
 		}
-		WendelonRequest::SchemaUpdate(_bytes) => {
-			// Schema registry is not modelled in SmState yet;
-			// accepting the write keeps the log replayable and
-			// lets the control-ring feature land incrementally.
-			(WendelonResponse::Success, None)
-		}
+		WendelonRequest::SchemaUpdate(bytes) => match apply_schema_update(state, &bytes) {
+			Ok(()) => (WendelonResponse::Success, None),
+			Err(err) => (WendelonResponse::Error(err), None),
+		},
 		WendelonRequest::TierSlab(tier) => {
 			// Idempotent replays keep the existing mapping; pointer
 			// refreshes (for re-encryption or URI/hash repair) update
@@ -3360,6 +3370,84 @@ fn apply_update_tenant_quota(state: &mut SmState, update: UpdateTenantQuota) -> 
 	}
 	record.quota_bytes = update.quota_bytes;
 	WendelonResponse::Success
+}
+
+fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> {
+	let envelope = decode_schema_update_envelope_v1(bytes).map_err(|err| err.to_string())?;
+	if envelope.object.kind != SchemaObjectKind::Table {
+		return Err(format!(
+			"schema object kind {:?} is not implemented",
+			envelope.object.kind
+		));
+	}
+	match envelope.mutation {
+		SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter => {
+			let descriptor = decode_table_schema_descriptor_v1(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			let current_descriptor = state
+				.table_schemas
+				.latest_by_name(
+					envelope.tenant_id,
+					envelope.object.namespace.as_str(),
+					envelope.object.name.as_str(),
+				)
+				.cloned();
+			let current_generation = current_descriptor
+				.as_ref()
+				.map(|descriptor| descriptor.schema_generation)
+				.unwrap_or(0);
+			if current_generation != envelope.expected_generation.get() {
+				return Err(format!(
+					"schema expected_generation {} does not match current generation {}",
+					envelope.expected_generation.get(),
+					current_generation
+				));
+			}
+			if envelope.mutation == SchemaMutationKindV1::Create && current_generation != 0 {
+				return Err("table schema create cannot replace an existing table".to_owned());
+			}
+			if envelope.mutation == SchemaMutationKindV1::Create
+				&& state
+					.table_schemas
+					.latest_by_id(envelope.tenant_id, descriptor.table_object_id)
+					.is_some()
+			{
+				return Err(
+					"table schema create cannot reuse an existing table_object_id".to_owned(),
+				);
+			}
+			if envelope.mutation == SchemaMutationKindV1::Alter && current_generation == 0 {
+				return Err("table schema alter requires an existing table".to_owned());
+			}
+			if let (SchemaMutationKindV1::Alter, Some(previous)) =
+				(envelope.mutation, current_descriptor.as_ref())
+			{
+				validate_table_schema_evolution(previous, &descriptor)
+					.map_err(|err| err.to_string())?;
+			}
+			if descriptor.schema_generation != envelope.requested_generation.get() {
+				return Err(format!(
+					"table schema descriptor generation {} does not match requested generation {}",
+					descriptor.schema_generation,
+					envelope.requested_generation.get()
+				));
+			}
+			if descriptor.namespace != envelope.object.namespace
+				|| descriptor.table_name != envelope.object.name
+			{
+				return Err(
+					"table schema descriptor object does not match schema envelope".to_owned(),
+				);
+			}
+			state
+				.table_schemas
+				.upsert(envelope.tenant_id, descriptor)
+				.map_err(|err| err.to_string())
+		}
+		SchemaMutationKindV1::Drop => {
+			Err("table schema drops require an explicit data-rewrite migration".to_owned())
+		}
+	}
 }
 
 fn apply_tenant_state_transition(
@@ -4769,6 +4857,297 @@ fn clone_entry(e: &Entry<WendelonTypeConfig>) -> Entry<WendelonTypeConfig> {
 #[allow(dead_code)]
 fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 
+#[cfg(test)]
+mod schema_state_tests {
+	use super::*;
+	use crate::integration::compute::{
+		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+		SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		encode_schema_update_envelope_v1,
+	};
+	use crate::schema::{
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
+		TableSchemaDescriptorV1, encode_table_schema_descriptor_v1,
+	};
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	fn table_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Int64, true),
+		])
+	}
+
+	fn table_descriptor_for_schema(generation: u64, schema: &Schema) -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([4; 16]),
+			generation,
+			"analytics",
+			"events",
+			schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+		table_descriptor_for_schema(generation, &table_schema())
+	}
+
+	fn schema_envelope(
+		descriptor: &TableSchemaDescriptorV1,
+		expected_generation: u64,
+		requested_generation: u64,
+		mutation: SchemaMutationKindV1,
+	) -> Vec<u8> {
+		schema_envelope_for_kind(
+			descriptor,
+			expected_generation,
+			requested_generation,
+			mutation,
+			SchemaObjectKind::Table,
+		)
+	}
+
+	fn schema_envelope_for_kind(
+		descriptor: &TableSchemaDescriptorV1,
+		expected_generation: u64,
+		requested_generation: u64,
+		mutation: SchemaMutationKindV1,
+		kind: SchemaObjectKind,
+	) -> Vec<u8> {
+		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: TenantId::new(7),
+			object: SchemaObjectRefV1 {
+				kind,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.table_name.clone(),
+			},
+			expected_generation: SchemaGeneration::new(expected_generation),
+			requested_generation: SchemaGeneration::new(requested_generation),
+			intent_id: SchemaIntentId::new([9; 16]),
+			mutation,
+			payload,
+		};
+		encode_schema_update_envelope_v1(&envelope).unwrap()
+	}
+
+	#[test]
+	fn schema_update_applies_table_descriptor_to_state() {
+		let descriptor = table_descriptor(1);
+		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create);
+		let mut state = SmState::default();
+		apply_schema_update(&mut state, &bytes).unwrap();
+		assert_eq!(
+			state
+				.table_schemas
+				.get(TenantId::new(7), descriptor.table_object_id, 1),
+			Some(&descriptor)
+		);
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
+	}
+
+	#[test]
+	fn schema_update_rejects_descriptor_generation_mismatch() {
+		let descriptor = table_descriptor(2);
+		let bytes = schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create);
+		let mut state = SmState::default();
+		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
+		assert!(err.contains("does not match requested generation"));
+		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn schema_update_rejects_stale_expected_generation() {
+		let descriptor = table_descriptor(1);
+		let mut state = SmState::default();
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.unwrap();
+
+		let next_descriptor = table_descriptor(2);
+		let err = apply_schema_update(
+			&mut state,
+			&schema_envelope(&next_descriptor, 0, 2, SchemaMutationKindV1::Alter),
+		)
+		.unwrap_err();
+		assert!(err.contains("expected_generation"));
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
+	}
+
+	#[test]
+	fn schema_update_rejects_non_additive_alter() {
+		let descriptor = table_descriptor(1);
+		let mut state = SmState::default();
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.unwrap();
+
+		let changed_type_schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Utf8, true),
+		]);
+		let changed_type = table_descriptor_for_schema(2, &changed_type_schema);
+		let err = apply_schema_update(
+			&mut state,
+			&schema_envelope(&changed_type, 1, 2, SchemaMutationKindV1::Alter),
+		)
+		.unwrap_err();
+		assert!(err.contains("change type"));
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
+		assert!(
+			state
+				.table_schemas
+				.get(TenantId::new(7), changed_type.table_object_id, 2)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn schema_update_rejects_create_reusing_table_object_id() {
+		let descriptor = table_descriptor(1);
+		let mut state = SmState::default();
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.unwrap();
+
+		let conflicting = TableSchemaDescriptorV1::new(
+			descriptor.table_object_id,
+			1,
+			"analytics",
+			"events_copy",
+			&table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let err = apply_schema_update(
+			&mut state,
+			&schema_envelope(&conflicting, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.unwrap_err();
+		assert!(err.contains("reuse an existing table_object_id"));
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events_copy")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn schema_update_rejects_descriptor_fingerprint_corruption() {
+		let mut descriptor = table_descriptor(1);
+		descriptor.schema_fingerprint[0] ^= 0xff;
+		let payload = postcard::to_allocvec(&descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: TenantId::new(7),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Table,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.table_name.clone(),
+			},
+			expected_generation: SchemaGeneration::ZERO,
+			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
+			intent_id: SchemaIntentId::new([9; 16]),
+			mutation: SchemaMutationKindV1::Create,
+			payload,
+		};
+		let bytes = encode_schema_update_envelope_v1(&envelope).unwrap();
+		let mut state = SmState::default();
+		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
+		assert!(err.contains("fingerprint"));
+		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn schema_update_rejects_descriptor_envelope_object_mismatch() {
+		let descriptor = table_descriptor(1);
+		let payload = encode_table_schema_descriptor_v1(&descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: TenantId::new(7),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Table,
+				namespace: "analytics".to_owned(),
+				name: "events_shadow".to_owned(),
+			},
+			expected_generation: SchemaGeneration::ZERO,
+			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
+			intent_id: SchemaIntentId::new([9; 16]),
+			mutation: SchemaMutationKindV1::Create,
+			payload,
+		};
+		let bytes = encode_schema_update_envelope_v1(&envelope).unwrap();
+		let mut state = SmState::default();
+		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
+		assert!(err.contains("object does not match"));
+		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn schema_update_rejects_drop() {
+		let descriptor = table_descriptor(1);
+		let bytes = schema_envelope(&descriptor, 1, 2, SchemaMutationKindV1::Drop);
+		let mut state = SmState::default();
+		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
+		assert!(err.contains("drops require"));
+		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn schema_update_rejects_unimplemented_object_kind() {
+		let descriptor = table_descriptor(1);
+		let bytes = schema_envelope_for_kind(
+			&descriptor,
+			0,
+			1,
+			SchemaMutationKindV1::Create,
+			SchemaObjectKind::Index,
+		);
+		let mut state = SmState::default();
+		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
+		assert!(err.contains("schema object kind Index is not implemented"));
+		assert!(state.table_schemas.is_empty());
+	}
+}
+
 // ============================================================
 //  RECOVERY TESTS
 // ============================================================
@@ -4776,11 +5155,21 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 mod recovery_tests {
 	use super::*;
-	use crate::schema::{FinalizationMarker, LeaseDescriptor, NodeId as SchemaNodeId, TenantId};
+	use crate::integration::compute::{
+		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+		SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		encode_schema_update_envelope_v1,
+	};
+	use crate::schema::{
+		FinalizationMarker, LeaseDescriptor, LocalityPolicyV1, NodeId as SchemaNodeId,
+		PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
+		TenantId, encode_table_schema_descriptor_v1,
+	};
 	use crate::storage::{
 		AlignedBuf, AsyncFileOps, BlockingFileOps, DirectoryEntry, FaultAction, FaultOp,
 		FaultyFileOps, FileHandle, InjectedFault, OpenFlags,
 	};
+	use arrow::datatypes::{DataType, Field, Schema};
 	use openraft::Vote;
 	use openraft::storage::{RaftLogStorageExt, RaftSnapshotBuilder, RaftStateMachine};
 	use std::collections::HashMap;
@@ -4885,6 +5274,58 @@ mod recovery_tests {
 		finalize_entry_for_epoch(index, 1, physical_ms)
 	}
 
+	fn recovery_table_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		])
+	}
+
+	fn recovery_table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([8; 16]),
+			generation,
+			"analytics",
+			"events",
+			&recovery_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn schema_update_entry(
+		index: u64,
+		descriptor: &TableSchemaDescriptorV1,
+		expected_generation: u64,
+		requested_generation: u64,
+		mutation: SchemaMutationKindV1,
+	) -> Entry<WendelonTypeConfig> {
+		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: TenantId::new(7),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Table,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.table_name.clone(),
+			},
+			expected_generation: SchemaGeneration::new(expected_generation),
+			requested_generation: SchemaGeneration::new(requested_generation),
+			intent_id: SchemaIntentId::new([index as u8; 16]),
+			mutation,
+			payload,
+		};
+		Entry {
+			log_id: log_id(1, index),
+			payload: EntryPayload::Normal(WendelonRequest::SchemaUpdate(
+				encode_schema_update_envelope_v1(&envelope).unwrap(),
+			)),
+		}
+	}
+
 	fn finalize_entry_for_epoch(
 		index: u64,
 		epoch: u64,
@@ -4911,6 +5352,7 @@ mod recovery_tests {
 					tenant_id: TenantId::ZERO,
 					key_identity: crate::schema::Identity::ZERO,
 					charged_bytes: 0,
+					record_count: 1,
 				},
 			)),
 		}
@@ -5527,6 +5969,70 @@ mod recovery_tests {
 		let state = reopened_sm.state_snapshot().await;
 		assert_eq!(state.last_applied_log_id, Some(log_id(1, 1)));
 		assert!(state.leases.contains_key(&0));
+	}
+
+	#[tokio::test]
+	async fn installed_snapshot_roundtrips_table_schema_catalog() {
+		let source_dir = tempdir("snapshot-table-schema-source");
+		let mut source_store = open_store(&source_dir).await;
+		let mut source_sm = source_store.recovered_state_machine().await.unwrap();
+		let descriptor = recovery_table_descriptor(1);
+		append_and_apply(
+			&mut source_store,
+			&mut source_sm,
+			schema_update_entry(1, &descriptor, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.await;
+
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+
+		let target_dir = tempdir("snapshot-table-schema-target");
+		let target_store = open_store(&target_dir).await;
+		let mut target_sm = target_store.recovered_state_machine().await.unwrap();
+		let meta = built.meta.clone();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+
+		let installed = target_sm.state_snapshot().await;
+		assert_eq!(installed.last_applied_log_id, Some(log_id(1, 1)));
+		assert_eq!(
+			installed
+				.table_schemas
+				.get(TenantId::new(7), descriptor.table_object_id, 1),
+			Some(&descriptor)
+		);
+		assert_eq!(
+			installed
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
+
+		let reopened = open_store(&target_dir).await;
+		let reopened_sm = reopened.recovered_state_machine().await.unwrap();
+		let recovered = reopened_sm.state_snapshot().await;
+		assert_eq!(
+			recovered
+				.table_schemas
+				.latest_by_id(TenantId::new(7), descriptor.table_object_id),
+			Some(&descriptor)
+		);
+		assert_eq!(
+			recovered
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "events"),
+			Some(&descriptor)
+		);
 	}
 
 	#[tokio::test]

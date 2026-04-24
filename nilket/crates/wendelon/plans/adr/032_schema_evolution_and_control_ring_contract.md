@@ -44,7 +44,7 @@ This ADR exists to freeze the Wendelon side of that contract before more impleme
    - or disabled and omitted from support claims
 
 5. **The control ring has one authoritative membership and epoch source.**
-   There must not be a hidden second topology, second epoch authority, or implicit control/data-plane split in customer-facing behavior.
+   There must not be a hidden second topology, second epoch authority, or implicit coordination/data split in customer-facing behavior.
 
 ## Rationale
 

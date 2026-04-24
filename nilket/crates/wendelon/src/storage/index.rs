@@ -1,8 +1,8 @@
-use crate::schema::{HybridTimestamp, Identity, SlabId, TenantId, TenantKekId};
+use crate::schema::{HybridTimestamp, Identity, Locality, SlabId, TenantId, TenantKekId};
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +28,8 @@ const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_ind
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 
 const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
-const RECORD_VALUE_LEN: usize = 4;
+const RECORD_VALUE_LEN_V1: usize = 4;
+const RECORD_VALUE_LEN: usize = 4 + 8;
 const TIERED_POINTER_HASH_LEN: usize = 32;
 const TIERED_POINTER_FLAGS_LEN: usize = 1;
 const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
@@ -40,6 +41,7 @@ const TIERED_FLAG_HAS_TENANT_KEK_ID: u8 = 0b0000_0100;
 pub(crate) struct PersistentRecordRow {
 	pub tenant_id: TenantId,
 	pub key_identity: Identity,
+	pub routing_locality: Locality,
 	pub location: RecordLocation,
 }
 
@@ -47,6 +49,7 @@ pub(crate) struct PersistentRecordRow {
 pub(crate) struct PersistentIndexSnapshot {
 	pub tiered_slabs: Vec<TieredSlabPointer>,
 	pub tiered_records: Vec<PersistentRecordRow>,
+	pub record_localities: Vec<(TenantId, Identity, Locality)>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -144,13 +147,32 @@ impl PersistentLocalIndex {
 
 			let records_table = read_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 			let mut tiered_records = Vec::new();
+			let mut locality_by_key: HashMap<(TenantId, Identity), (Locality, HybridTimestamp)> =
+				HashMap::new();
 			for entry in records_table.iter().map_err(redb_to_io)? {
 				let (key, value) = entry.map_err(redb_to_io)?;
 				let row = decode_record_row(key.value(), value.value())?;
+				locality_by_key
+					.entry((row.tenant_id, row.key_identity))
+					.and_modify(|(locality, hlc)| {
+						if row.location.hlc >= *hlc {
+							*locality = row.routing_locality;
+							*hlc = row.location.hlc;
+						}
+					})
+					.or_insert((row.routing_locality, row.location.hlc));
 				if tiered_ids.contains(&row.location.slab_id) {
 					tiered_records.push(row);
 				}
 			}
+			let mut record_localities = locality_by_key
+				.into_iter()
+				.map(|((tenant_id, key_identity), (locality, _))| {
+					(tenant_id, key_identity, locality)
+				})
+				.collect::<Vec<_>>();
+			record_localities
+				.sort_by_key(|(tenant_id, key_identity, _)| (tenant_id.get(), *key_identity));
 			let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			let last_control_log_index = meta_table
 				.get(META_LAST_CONTROL_LOG_INDEX)
@@ -160,6 +182,7 @@ impl PersistentLocalIndex {
 			Ok(PersistentIndexSnapshot {
 				tiered_slabs,
 				tiered_records,
+				record_localities,
 				last_control_log_index,
 			})
 		})
@@ -182,7 +205,7 @@ impl PersistentLocalIndex {
 				let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 				for row in rows {
 					let key = encode_record_key(row);
-					let value = encode_record_value(row.location);
+					let value = encode_record_value(row);
 					table
 						.insert(key.as_slice(), value.as_slice())
 						.map_err(redb_to_io)?;
@@ -222,7 +245,7 @@ impl PersistentLocalIndex {
 				}
 				for row in update.put_records {
 					let key = encode_record_key(row);
-					let value = encode_record_value(row.location);
+					let value = encode_record_value(row);
 					table
 						.insert(key.as_slice(), value.as_slice())
 						.map_err(redb_to_io)?;
@@ -319,8 +342,11 @@ fn encode_record_key(row: PersistentRecordRow) -> [u8; RECORD_KEY_LEN] {
 	bytes
 }
 
-fn encode_record_value(location: RecordLocation) -> [u8; RECORD_VALUE_LEN] {
-	location.length.to_le_bytes()
+fn encode_record_value(row: PersistentRecordRow) -> [u8; RECORD_VALUE_LEN] {
+	let mut bytes = [0u8; RECORD_VALUE_LEN];
+	bytes[..4].copy_from_slice(&row.location.length.to_le_bytes());
+	bytes[4..].copy_from_slice(&row.routing_locality.get().to_le_bytes());
+	bytes
 }
 
 fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentRecordRow> {
@@ -333,11 +359,11 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 			),
 		));
 	}
-	if value.len() != RECORD_VALUE_LEN {
+	if value.len() != RECORD_VALUE_LEN && value.len() != RECORD_VALUE_LEN_V1 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"persistent record value length mismatch: expected {RECORD_VALUE_LEN}, got {}",
+				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1} or {RECORD_VALUE_LEN}, got {}",
 				value.len()
 			),
 		));
@@ -351,11 +377,19 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 	let node_id = read_u32(key, &mut cursor)?;
 	let slab_id = read_u64(key, &mut cursor)?;
 	let offset = read_u64(key, &mut cursor)?;
-	let length = u32::from_le_bytes(value.try_into().expect("validated above"));
+	let length = u32::from_le_bytes(value[..4].try_into().expect("validated above"));
+	let routing_locality = if value.len() == RECORD_VALUE_LEN {
+		Locality::new(u64::from_le_bytes(
+			value[4..12].try_into().expect("validated above"),
+		))
+	} else {
+		Locality::from(key_identity)
+	};
 
 	Ok(PersistentRecordRow {
 		tenant_id,
 		key_identity,
+		routing_locality,
 		location: RecordLocation {
 			slab_id: SlabId::new(slab_id),
 			offset,
@@ -550,6 +584,7 @@ mod tests {
 		PersistentRecordRow {
 			tenant_id: TenantId::new(7),
 			key_identity: Identity::blake3(b"row-key"),
+			routing_locality: Locality::new(0x8877),
 			location: RecordLocation {
 				slab_id: SlabId::new(9),
 				offset: 128,
@@ -567,7 +602,7 @@ mod tests {
 	fn record_row_roundtrip_preserves_every_field() {
 		let row = row();
 		let key = encode_record_key(row);
-		let value = encode_record_value(row.location);
+		let value = encode_record_value(row);
 		let decoded = decode_record_row(&key, &value).unwrap();
 		assert_eq!(decoded, row);
 	}
@@ -637,6 +672,10 @@ mod tests {
 		let snapshot = index.load_snapshot().await.unwrap();
 		assert_eq!(snapshot.tiered_slabs, vec![tiered_pointer]);
 		assert_eq!(snapshot.tiered_records, vec![tiered_row]);
+		assert_eq!(
+			snapshot.record_localities,
+			vec![(row().tenant_id, row().key_identity, row().routing_locality)]
+		);
 	}
 
 	#[tokio::test]

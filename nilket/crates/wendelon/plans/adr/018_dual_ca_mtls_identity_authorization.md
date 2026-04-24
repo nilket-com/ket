@@ -97,7 +97,7 @@ The architecture already rejected bearer tokens as the primary trust primitive. 
 ## Consequences (The "Negatives")
 
 - **Two CA ceremonies still exist.** That is accepted in exchange for cleaner separation between node/runtime and operator/admin trust.
-- **The cert-service becomes a real control-plane component.** It must be reliable enough to support short-lived credentials and rotation.
+- **The cert-service becomes a real coordination component.** It must be reliable enough to support short-lived credentials and rotation.
 - **Short-lived query-session credentials add issuance pressure.** Accepted because they are the cleanest way to bind compute-originated user identity to storage RPCs.
 - **Rejected alternative: single CA for every actor.** Rejected because it weakens separation and incident response.
 - **Rejected alternative: universal tenant-application CA in v1.** Rejected because it would expand Wendelon into a broader PKI system than the product needs.

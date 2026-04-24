@@ -13,9 +13,12 @@ use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
-	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, ReadRequest,
-	WendelonClient as InnerClient, WendelonClientConfig, WriteRequest,
+	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, DATA_RETRY_BUDGET, ReadRequest,
+	TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig,
+	WriteRequest,
 };
+use wendelon::network::control_server::{CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire};
+use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::quic_transport::{
@@ -26,9 +29,12 @@ use wendelon::network::transport::{
 	CapabilityResolver, EpochCapabilityResolver, NodeRole, NodeRoleSet, TransportProvider,
 	TransportTier, TransportTierSet,
 };
+use wendelon::network::wire;
 use wendelon::schema::{
-	ClientWriteId, FinalizationMarker, HybridTimestamp, Identity, NodeId, ReadRequestMeta,
-	ReadStatus, TenantId, WriteRequestMeta, WriteStatus, read_key_schema, write_payload_schema,
+	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
+	ReadRequestMeta, ReadStatus, TableQueryRequestMeta, TableWriteRequestMeta, TenantId,
+	WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1, encode_table_write_row_count,
+	read_key_schema, write_payload_schema,
 };
 
 pub use wendelon::client::{QueryLocalityRange, StreamingQueryResult};
@@ -40,7 +46,11 @@ pub use wendelon::integration::compute::{
 	encode_schema_update_envelope_v1, map_read_status_for_compute, map_write_status_for_compute,
 	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
 };
-pub use wendelon::schema::{Consistency as ReadConsistency, DurabilityLevel as DurabilityClass};
+pub use wendelon::schema::{
+	Consistency as ReadConsistency, DurabilityLevel as DurabilityClass, LocalityPolicyV1,
+	PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, SchemaEvolutionPolicyV1, TableObjectId,
+	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, WpbcRejectCode,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapPeer {
@@ -132,6 +142,23 @@ impl Default for QueryOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableQueryOptions {
+	pub consistency: ReadConsistency,
+	pub min_hlc: Option<HybridTimestamp>,
+	pub as_of_hlc: Option<HybridTimestamp>,
+}
+
+impl Default for TableQueryOptions {
+	fn default() -> Self {
+		Self {
+			consistency: ReadConsistency::LINEARIZABLE,
+			min_hlc: None,
+			as_of_hlc: None,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteReceipt {
 	pub identity: Identity,
 	pub duplicate: bool,
@@ -141,6 +168,92 @@ pub struct WriteReceipt {
 	pub epoch: u64,
 	pub commit_hlc: HybridTimestamp,
 	pub finalization: Option<FinalizationMarker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableWriteReceipt {
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub rows: usize,
+	pub duplicate: bool,
+	pub requested_durability: DurabilityClass,
+	pub log_index: u64,
+	pub term: u64,
+	pub epoch: u64,
+	pub commit_hlc: HybridTimestamp,
+	pub finalization: Option<FinalizationMarker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSchemaUpdateRequest {
+	pub tenant_id: TenantId,
+	pub descriptor: TableSchemaDescriptorV1,
+	pub expected_generation: SchemaGeneration,
+	pub mutation: SchemaMutationKindV1,
+	pub intent_id: SchemaIntentId,
+}
+
+impl TableSchemaUpdateRequest {
+	pub fn create(
+		tenant_id: TenantId,
+		descriptor: TableSchemaDescriptorV1,
+		intent_id: SchemaIntentId,
+	) -> Self {
+		Self {
+			tenant_id,
+			descriptor,
+			expected_generation: SchemaGeneration::ZERO,
+			mutation: SchemaMutationKindV1::Create,
+			intent_id,
+		}
+	}
+
+	pub fn alter(
+		tenant_id: TenantId,
+		descriptor: TableSchemaDescriptorV1,
+		expected_generation: impl Into<SchemaGeneration>,
+		intent_id: SchemaIntentId,
+	) -> Self {
+		Self {
+			tenant_id,
+			descriptor,
+			expected_generation: expected_generation.into(),
+			mutation: SchemaMutationKindV1::Alter,
+			intent_id,
+		}
+	}
+
+	pub fn envelope(&self) -> std::io::Result<SchemaUpdateEnvelopeV1> {
+		if self.mutation == SchemaMutationKindV1::Drop {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"table schema drops require a rewrite migration and are not supported by this helper",
+			));
+		}
+		let payload = encode_table_schema_descriptor_v1(&self.descriptor)?;
+		Ok(SchemaUpdateEnvelopeV1::compute_client_intent(
+			self.tenant_id,
+			SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Table,
+				namespace: self.descriptor.namespace.clone(),
+				name: self.descriptor.table_name.clone(),
+			},
+			self.expected_generation,
+			SchemaGeneration::new(self.descriptor.schema_generation),
+			self.intent_id,
+			self.mutation,
+			payload,
+		))
+	}
+
+	pub fn encode(&self) -> std::io::Result<Vec<u8>> {
+		encode_schema_update_envelope_v1(&self.envelope()?)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaUpdateReceipt {
+	pub leader_hint: Option<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +286,10 @@ pub enum ClientError {
 	AuthorizationFailed,
 	#[error("write failed with status {status:?}")]
 	WriteFailed { status: WriteStatus },
+	#[error("table write rejected with code {reject_code:?}")]
+	TableWriteRejected { reject_code: WpbcRejectCode },
+	#[error("schema update rejected with reason {reason_code}: {message}")]
+	SchemaUpdateRejected { reason_code: u8, message: String },
 	#[error("read failed with status {status:?}")]
 	ReadFailed { status: ReadStatus },
 }
@@ -187,6 +304,8 @@ impl ClientError {
 			}
 			Self::AuthorizationFailed => StorageStatusKind::AuthorizationFailed,
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
+			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
+			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
 		}
 	}
@@ -279,6 +398,110 @@ impl Client {
 		Identity::blake3_tenant(tenant_id, key)
 	}
 
+	pub fn prepare_table_schema_update(
+		&self,
+		tenant_id: TenantId,
+		descriptor: TableSchemaDescriptorV1,
+		expected_generation: impl Into<SchemaGeneration>,
+		mutation: SchemaMutationKindV1,
+		intent_id: SchemaIntentId,
+	) -> TableSchemaUpdateRequest {
+		TableSchemaUpdateRequest {
+			tenant_id,
+			descriptor,
+			expected_generation: expected_generation.into(),
+			mutation,
+			intent_id,
+		}
+	}
+
+	pub async fn submit_table_schema_update(
+		&self,
+		request: TableSchemaUpdateRequest,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
+		let payload = request.encode()?;
+		let mut preferred_target = self.inner.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = if let Some(target) = preferred_target {
+				target
+			} else {
+				self.inner.refresh_topology().await?;
+				self.inner.leader().ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::NotConnected,
+						"schema update requires a known control-ring leader",
+					)
+				})?
+			};
+			let response = self.submit_schema_update_once(target, &payload).await?;
+			if response.accepted {
+				return Ok(SchemaUpdateReceipt {
+					leader_hint: response.leader_hint.map(|id| NodeId { id, _reserved: 0 }),
+				});
+			}
+			if response.reason_code == CONTROL_REASON_NOT_LEADER && attempt + 1 < DATA_RETRY_BUDGET
+			{
+				preferred_target = response.leader_hint.map(|id| NodeId { id, _reserved: 0 });
+				self.inner.refresh_topology().await?;
+				continue;
+			}
+			return Err(ClientError::SchemaUpdateRejected {
+				reason_code: response.reason_code,
+				message: response
+					.message
+					.unwrap_or_else(|| "schema update rejected".to_owned()),
+			});
+		}
+		Err(ClientError::SchemaUpdateRejected {
+			reason_code: CONTROL_REASON_NOT_LEADER,
+			message: "schema update retry budget exhausted".to_owned(),
+		})
+	}
+
+	async fn submit_schema_update_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> Result<SchemaUpdateResponseWire, ClientError> {
+		let conn = self.inner.factory().get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::SCHEMA_UPDATE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+
+		let frame = read_frame(&mut *stream, self.inner.pool()).await?;
+		if frame.header.msg_type != MsgType::SCHEMA_UPDATE_RESP.0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"expected SCHEMA_UPDATE_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			)
+			.into());
+		}
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"SCHEMA_UPDATE_RESP must not carry Arrow or trailing payloads",
+			)
+			.into());
+		}
+		Ok(wire::decode::<SchemaUpdateResponseWire>(&frame.meta)?)
+	}
+
 	pub async fn write(
 		&self,
 		tenant_id: TenantId,
@@ -319,6 +542,71 @@ impl Client {
 				term: result.response.term,
 				epoch: result.response.epoch,
 				commit_hlc: result.response.commit_hlc,
+				finalization: result.finalization,
+			}),
+			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
+			s if s == WriteStatus::TENANT_SUSPENDED => {
+				Err(ClientError::TenantSuspended { tenant_id })
+			}
+			s if s == WriteStatus::TENANT_UNAVAILABLE => {
+				Err(ClientError::TenantUnavailable { tenant_id })
+			}
+			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			status => Err(ClientError::WriteFailed { status }),
+		}
+	}
+
+	pub async fn table_write(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		payload: RecordBatch,
+		options: WriteOptions,
+	) -> Result<TableWriteReceipt, ClientError> {
+		let rows = payload.num_rows();
+		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+		let request = TableWriteRequest {
+			meta: TableWriteRequestMeta {
+				parent_write_id: ClientWriteId {
+					client_uuid: self.client_uuid,
+					sequence_no,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
+				expected_epoch: self.inner.epoch(),
+				tenant_id,
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				child_ordinal_base: 0,
+				proxy_source: zero_node(),
+				row_count: encode_table_write_row_count(rows)?,
+				proxy_hop: 0,
+				durability: options.durability,
+				await_finalization: u8::from(options.await_finalization),
+				_pad: [0; 3],
+			},
+			descriptor: descriptor.clone(),
+			payload,
+		};
+		let result = self.inner.table_write(request).await?;
+		if result.response.reject_code != WpbcRejectCode::NONE.0 {
+			return Err(ClientError::TableWriteRejected {
+				reject_code: WpbcRejectCode(result.response.reject_code),
+			});
+		}
+		let response = result.response.write;
+		match response.status {
+			s if s == WriteStatus::OK || s == WriteStatus::DUPLICATE => Ok(TableWriteReceipt {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				rows,
+				duplicate: response.status == WriteStatus::DUPLICATE,
+				requested_durability: options.durability,
+				log_index: response.log_index,
+				term: response.term,
+				epoch: response.epoch,
+				commit_hlc: response.commit_hlc,
 				finalization: result.finalization,
 			}),
 			s if s == WriteStatus::QUOTA_EXCEEDED => Err(ClientError::QuotaExceeded { tenant_id }),
@@ -403,6 +691,62 @@ impl Client {
 		options: QueryOptions,
 	) -> Result<QueryResult, ClientError> {
 		let stream = self.query_stream(tenant_id, wpbc, options).await?;
+		let epoch = stream.epoch;
+		let value_hlc = stream.value_hlc;
+		let rows = stream.rows;
+		let batches = stream.collect_all().await?;
+		Ok(QueryResult {
+			epoch,
+			value_hlc,
+			rows,
+			batches,
+		})
+	}
+
+	pub async fn table_query_stream(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		wpbc: Vec<u8>,
+		options: TableQueryOptions,
+	) -> Result<StreamingQueryResult, ClientError> {
+		let bytecode_len = u32::try_from(wpbc.len()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidInput,
+				"table query WPBC bytecode exceeds u32 length",
+			)
+		})?;
+		Ok(self
+			.inner
+			.table_query(TableQueryRequest {
+				meta: TableQueryRequestMeta {
+					min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
+					expected_epoch: self.inner.epoch(),
+					tenant_id,
+					table_object_id: descriptor.table_object_id,
+					schema_generation: descriptor.schema_generation,
+					consistency: options.consistency,
+					_pad: [0; 7],
+					bytecode_len,
+					_pad2: [0; 4],
+					as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+				},
+				descriptor: descriptor.clone(),
+				wpbc,
+			})
+			.await?)
+	}
+
+	pub async fn table_query(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		wpbc: Vec<u8>,
+		options: TableQueryOptions,
+	) -> Result<QueryResult, ClientError> {
+		let stream = self
+			.table_query_stream(tenant_id, descriptor, wpbc, options)
+			.await?;
 		let epoch = stream.epoch;
 		let value_hlc = stream.value_hlc;
 		let rows = stream.rows;
@@ -508,5 +852,68 @@ fn zero_node() -> NodeId {
 	NodeId {
 		id: 0,
 		_reserved: 0,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use wendelon::schema::decode_table_schema_descriptor_v1;
+
+	fn table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("name", DataType::Utf8, true),
+		]);
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x42; 16]),
+			generation,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn table_schema_update_request_encodes_descriptor_payload() {
+		let descriptor = table_descriptor(1);
+		let request = TableSchemaUpdateRequest::create(
+			TenantId::new(7),
+			descriptor.clone(),
+			SchemaIntentId::new([0xAB; 16]),
+		);
+
+		let encoded = request.encode().unwrap();
+		let envelope = decode_schema_update_envelope_v1(&encoded).unwrap();
+		assert_eq!(envelope.tenant_id, TenantId::new(7));
+		assert_eq!(envelope.object.kind, SchemaObjectKind::Table);
+		assert_eq!(envelope.object.namespace, "analytics");
+		assert_eq!(envelope.object.name, "events");
+		assert_eq!(envelope.expected_generation, SchemaGeneration::ZERO);
+		assert_eq!(envelope.requested_generation, SchemaGeneration::new(1));
+		assert_eq!(envelope.mutation, SchemaMutationKindV1::Create);
+		assert_eq!(
+			decode_table_schema_descriptor_v1(&envelope.payload).unwrap(),
+			descriptor
+		);
+	}
+
+	#[test]
+	fn table_schema_update_request_rejects_drop_helper() {
+		let request = TableSchemaUpdateRequest {
+			tenant_id: TenantId::new(7),
+			descriptor: table_descriptor(2),
+			expected_generation: SchemaGeneration::new(1),
+			mutation: SchemaMutationKindV1::Drop,
+			intent_id: SchemaIntentId::new([0xCD; 16]),
+		};
+
+		let err = request.encode().unwrap_err();
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 	}
 }

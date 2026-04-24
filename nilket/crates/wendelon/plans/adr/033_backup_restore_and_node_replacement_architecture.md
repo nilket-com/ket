@@ -67,7 +67,7 @@ The planning cycle made the current gap explicit: node-image folklore and ad hoc
 - **Cluster-consistent backup requires coordination across control and storage state.** Accepted because per-node snapshots taken independently do not add up to a believable cluster restore.
 - **Rejected alternative: node-image restore as the whole DR story.** Rejected because it is too informal and too host-shaped.
 - **Rejected alternative: database-owned provisioning.** Rejected because ADR `001` already drew the correct boundary.
-- **Rejected alternative: defer recovery architecture until operator work lands.** Rejected because recovery shape drives data and control-plane decisions now.
+- **Rejected alternative: defer recovery architecture until operator work lands.** Rejected because recovery shape drives data and coordination decisions now.
 
 ## References
 - ADR 001: Boundary of Autonomous Self-Healing vs. Infrastructure Provisioning

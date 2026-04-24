@@ -255,6 +255,12 @@ pub struct TenantFinalization {
 	pub tenant_id: TenantId,
 	pub key_identity: Identity,
 	pub charged_bytes: u64,
+	#[serde(default = "default_finalized_record_count")]
+	pub record_count: u32,
+}
+
+const fn default_finalized_record_count() -> u32 {
+	1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

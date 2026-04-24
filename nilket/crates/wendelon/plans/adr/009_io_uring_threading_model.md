@@ -54,7 +54,7 @@ Wendelon will use an `io_uring` execution topology organized by **durability cla
 
 ## Rationale
 
-- **Durability class is the real first-order separation.** The WAL exists to preserve cluster control-plane correctness. Slab I/O exists to carry the data path. Sharing them defeats the purpose of the architecture even on a single fast device.
+- **Durability class is the real first-order separation.** The WAL exists to preserve cluster coordination correctness. Slab I/O exists to carry the data path. Sharing them defeats the purpose of the architecture even on a single fast device.
 - **Commodity default and premium support can coexist.** A small deployment can run with a simple configuration while a larger deployment still gets an explicit, supported path onto better hardware.
 - **Topology-aware automation is valuable but not the initial truth boundary.** The critical requirement is that better hardware is supportable without redesign. Automatic placement can come after the separation model is correct.
 - **WAL latency is the canary.** If the WAL path cannot be insulated from slab pressure, Raft tail latency becomes a hidden function of data-path pressure, which is exactly the coupling this ADR is meant to avoid.

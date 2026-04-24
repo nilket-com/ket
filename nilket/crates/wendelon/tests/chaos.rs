@@ -365,6 +365,7 @@ fn tenant_finalization(marker: FinalizationMarker) -> TenantFinalization {
 		tenant_id: tenant(),
 		key_identity: id(marker.epoch),
 		charged_bytes: marker.epoch,
+		record_count: 1,
 	}
 }
 

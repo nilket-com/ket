@@ -493,6 +493,7 @@ fn finalize_entry_for_epoch(index: u64, epoch: u64, physical_ms: u64) -> Entry<W
 			tenant_id: TenantId::ZERO,
 			key_identity: Identity::ZERO,
 			charged_bytes: 0,
+			record_count: 1,
 		})),
 	}
 }
@@ -1559,6 +1560,7 @@ async fn run_interrupted_finalization_recovery_scenario(
 					format!("sim-interrupted-finalization-{seed}-{iteration}").as_bytes(),
 				),
 				charged_bytes: 0,
+				record_count: 1,
 			},
 		);
 		store.upsert(record.clone()).await.map_err(|err| {

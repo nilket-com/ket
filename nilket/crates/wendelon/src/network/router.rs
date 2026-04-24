@@ -8,7 +8,7 @@
 //! ```text
 //!   0x01..=0x0F  →  Data Ring
 //!   0x10..=0x1F  →  Control Ring core RPCs
-//!   0x20..=0x2F  →  Raft internal
+//!   0x20..=0x2F  →  Raft internal, with exact-match Data Ring extensions
 //!   0x30..=0x3F  →  Control/admin extensions
 //! ```
 //!
@@ -51,7 +51,8 @@ use std::sync::Arc;
 //  PER-RING TRAITS
 // ============================================================
 
-/// Handler for Data Ring frames: `msg_type` in `0x01..=0x0F`.
+/// Handler for Data Ring frames: `msg_type` in `0x01..=0x0F`, plus
+/// exact-match Data Ring extension frames.
 #[async_trait]
 pub trait DataRingServer: Send + Sync + 'static {
 	async fn handle_data_frame(
@@ -141,10 +142,20 @@ impl HrftService for MsgRouter {
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = frame.header.msg_type;
 		match msg_type {
-			x if x == MsgType::PENDING_WITNESS_REQ.0 => match &self.data {
-				Some(h) => h.handle_data_frame(context, frame).await,
-				None => Err(unhandled("Data Ring", msg_type)),
-			},
+			x if x == MsgType::PENDING_WITNESS_REQ.0
+				|| x == MsgType::PENDING_WITNESS_RESP.0
+				|| x == MsgType::TABLE_WRITE_REQ.0
+				|| x == MsgType::TABLE_WRITE_RESP.0
+				|| x == MsgType::TABLE_REPLICATE_REQ.0
+				|| x == MsgType::TABLE_REPLICATE_RESP.0
+				|| x == MsgType::TABLE_QUERY_REQ.0
+				|| x == MsgType::TABLE_QUERY_RESP.0 =>
+			{
+				match &self.data {
+					Some(h) => h.handle_data_frame(context, frame).await,
+					None => Err(unhandled("Data Ring", msg_type)),
+				}
+			}
 			0x01..=0x0F => match &self.data {
 				Some(h) => h.handle_data_frame(context, frame).await,
 				None => Err(unhandled("Data Ring", msg_type)),

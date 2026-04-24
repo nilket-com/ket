@@ -66,13 +66,15 @@ use crate::network::transport::{MembershipEpoch, NodeRole, TransportStream};
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, Consistency, FRAME_FLAG_STREAM_END,
 	FinalizationMarker, FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus,
-	Locality, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
-	NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
+	Locality, LocalityPolicyV1, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta,
+	MigrateStatus, MsgType, NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
 	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
-	ReplicaWriteStatus, StreamFinalizationRequestMeta, TenantId, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, migration_record_schema, read_key_schema, wpbc,
-	write_payload_schema,
+	ReplicaWriteStatus, StreamFinalizationRequestMeta, TableQueryRequestMeta,
+	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
+	TableWriteValidationError, TenantId, WpbcRejectCode, WriteRequestMeta, WriteResponseMeta,
+	WriteStatus, migration_record_schema, read_key_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, wpbc, write_payload_schema,
 };
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
@@ -82,7 +84,7 @@ use arrow::array::{
 	UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::compute::concat_batches;
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -219,6 +221,43 @@ struct OrphanWitnessRecoveryStamp {
 
 #[derive(Clone, Debug)]
 struct BifurcatedWrite {
+	key_identity: Identity,
+	locality: Locality,
+	frame_bytes: Arc<Vec<u8>>,
+	payload_hash: [u8; 32],
+	charged_bytes: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct BifurcatedTableWrite {
+	children: Vec<BifurcatedTableChildWrite>,
+	parent_key_identity: Identity,
+	payload_hash: [u8; 32],
+	charged_bytes: u64,
+	record_count: u32,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct BifurcatedTableChildWrite {
+	child_ordinal: u64,
+	key_identity: Identity,
+	locality: Locality,
+	frame_bytes: Arc<Vec<u8>>,
+	payload_hash: [u8; 32],
+	charged_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TableReplicaGroup {
+	replicas: Vec<NodeId>,
+	children: Vec<BifurcatedTableChildWrite>,
+}
+
+#[derive(Clone, Debug)]
+struct TableReplicaChildPayload {
+	child_ordinal: u64,
 	key_identity: Identity,
 	locality: Locality,
 	frame_bytes: Arc<Vec<u8>>,
@@ -1652,6 +1691,7 @@ impl WendelonDataServer {
 				tenant_id: meta.tenant_id,
 				key_identity: bifurcated.key_identity,
 				charged_bytes: bifurcated.charged_bytes,
+				record_count: 1,
 			},
 		)
 	}
@@ -1677,6 +1717,61 @@ impl WendelonDataServer {
 				tenant_id: meta.tenant_id,
 				key_identity: meta.key_identity,
 				charged_bytes: meta.charged_bytes,
+				record_count: 1,
+			},
+		)
+	}
+
+	fn pending_finalization_record_for_table(
+		&self,
+		meta: &TableWriteRequestMeta,
+		bifurcated: &BifurcatedTableWrite,
+		commit_hlc: HybridTimestamp,
+	) -> PendingFinalizationRecord {
+		PendingFinalizationRecord::new(
+			meta.parent_write_id,
+			meta.await_finalization != 0,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: meta.expected_epoch,
+					commit_hlc,
+					payload_hash: bifurcated.payload_hash,
+					e_safe_index: 0,
+					durability: meta.durability,
+					_pad: [0; 7],
+				},
+				tenant_id: meta.tenant_id,
+				key_identity: bifurcated.parent_key_identity,
+				charged_bytes: bifurcated.charged_bytes,
+				record_count: bifurcated.record_count,
+			},
+		)
+	}
+
+	fn pending_finalization_record_from_table_replica_meta(
+		&self,
+		meta: &TableReplicaWriteMeta,
+	) -> PendingFinalizationRecord {
+		PendingFinalizationRecord::new(
+			meta.parent_write_id,
+			meta.await_finalization != 0,
+			TenantFinalization {
+				marker: FinalizationMarker {
+					log_index: 0,
+					term: 0,
+					epoch: meta.epoch,
+					commit_hlc: meta.commit_hlc,
+					payload_hash: meta.payload_hash,
+					e_safe_index: 0,
+					durability: meta.durability,
+					_pad: [0; 7],
+				},
+				tenant_id: meta.tenant_id,
+				key_identity: meta.parent_key_identity,
+				charged_bytes: meta.charged_bytes,
+				record_count: meta.record_count,
 			},
 		)
 	}
@@ -2762,6 +2857,70 @@ impl WendelonDataServer {
 		Ok(ack.ack_level)
 	}
 
+	async fn replicate_table_batch_to_remote(
+		factory: Arc<TransportProviderFactory>,
+		pool: Arc<BufPool>,
+		target: NodeId,
+		meta: TableReplicaWriteMeta,
+		arrow_bytes: Arc<Vec<u8>>,
+	) -> std::io::Result<ReplicaAckLevel> {
+		let conn = factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+
+		let meta_bytes = bytemuck::bytes_of(&meta);
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_REPLICATE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: meta_bytes.len() as u32,
+			arrow_len: arrow_bytes.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			meta_bytes,
+			Some(arrow_bytes.as_slice()),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+		let resp = read_frame(&mut *stream, &pool).await?;
+		if resp.header.msg_type != MsgType::TABLE_REPLICATE_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected TABLE_REPLICATE_RESP, got msg_type=0x{:02x}",
+					resp.header.msg_type
+				),
+			));
+		}
+		if resp.meta.len() < std::mem::size_of::<ReplicaWriteRespMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_REPLICATE_RESP meta too small",
+			));
+		}
+		let ack: &ReplicaWriteRespMeta =
+			bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReplicaWriteRespMeta>()]);
+		if ack.status != ReplicaWriteStatus::OK {
+			return Err(Error::new(
+				ErrorKind::Other,
+				format!(
+					"replica {target:?} rejected table batch: status={}",
+					ack.status.0
+				),
+			));
+		}
+		Ok(ack.ack_level)
+	}
+
 	/// Unary compatibility path for QUERY_REQ. The production HRFT
 	/// path goes through [`Self::handle_query_stream`] so large
 	/// result sets can flow as multiple `QUERY_RESP` frames without
@@ -2803,6 +2962,56 @@ impl WendelonDataServer {
 		))
 	}
 
+	async fn handle_table_query(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		metrics().data_ring_query_requests_total.inc();
+		let (meta, bytecode) = self.decode_table_query_request_frame(&frame)?;
+		let audit_meta = table_query_as_range_query(&meta);
+		let span = tracing::info_span!(
+			"data_ring.table_query.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+			schema_generation = meta.schema_generation,
+			expected_epoch = meta.expected_epoch,
+			consistency = meta.consistency.0,
+		);
+		let plan = self
+			.prepare_table_query_execution_plan_with_migration(&meta, &bytecode)
+			.instrument(span)
+			.await?;
+		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
+			self.emit_query_completion_audit(actor, &audit_meta, &plan.response, 0)?;
+			return Ok(self.build_query_response_frame_with_type(
+				MsgType::TABLE_QUERY_RESP,
+				frame.header.stream_id,
+				plan.response,
+				None,
+				FRAME_FLAG_STREAM_END,
+			));
+		}
+
+		let schema = plan.batches[0].schema();
+		let concatenated = concat_batches(&schema, &plan.batches)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("table query concat: {e}")))?;
+		let arrow_bytes = encode_batch(&concatenated)?;
+		let response = QueryResponseMeta {
+			arrow_len: arrow_bytes.len() as u32,
+			..plan.response
+		};
+		self.emit_query_completion_audit(actor, &audit_meta, &response, arrow_bytes.len() as u64)?;
+		Ok(self.build_query_response_frame_with_type(
+			MsgType::TABLE_QUERY_RESP,
+			frame.header.stream_id,
+			response,
+			Some(arrow_bytes),
+			FRAME_FLAG_STREAM_END,
+		))
+	}
+
 	fn decode_query_request_frame(
 		&self,
 		frame: &HrftFrame,
@@ -2836,8 +3045,58 @@ impl WendelonDataServer {
 		Ok((meta, bytecode))
 	}
 
+	fn decode_table_query_request_frame(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<(TableQueryRequestMeta, Vec<u8>)> {
+		if frame.meta.len() < std::mem::size_of::<TableQueryRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_REQ meta too small",
+			));
+		}
+		let meta: TableQueryRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()]);
+		let bytecode = if meta.bytecode_len == 0 {
+			Vec::new()
+		} else {
+			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_QUERY_REQ declared bytecode_len > 0 but trailing is absent",
+				)
+			})?;
+			let want = meta.bytecode_len as usize;
+			if trailing.len() < want {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_QUERY_REQ trailing is shorter than declared bytecode_len",
+				));
+			}
+			trailing[..want].to_vec()
+		};
+		Ok((meta, bytecode))
+	}
+
 	fn build_query_response_frame(
 		&self,
+		stream_id: u32,
+		resp: QueryResponseMeta,
+		arrow_bytes: Option<Vec<u8>>,
+		flags: u16,
+	) -> HrftFrame {
+		self.build_query_response_frame_with_type(
+			MsgType::QUERY_RESP,
+			stream_id,
+			resp,
+			arrow_bytes,
+			flags,
+		)
+	}
+
+	fn build_query_response_frame_with_type(
+		&self,
+		msg_type: MsgType,
 		stream_id: u32,
 		resp: QueryResponseMeta,
 		arrow_bytes: Option<Vec<u8>>,
@@ -2859,7 +3118,7 @@ impl WendelonDataServer {
 			header: FrameHeader {
 				magic: HRFT_MAGIC,
 				version: 1,
-				msg_type: MsgType::QUERY_RESP.0,
+				msg_type: msg_type.0,
 				flags,
 				stream_id,
 				meta_len: body.len() as u32,
@@ -2896,6 +3155,28 @@ impl WendelonDataServer {
 		Ok((meta, payload))
 	}
 
+	fn decode_table_write_request_frame(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<(TableWriteRequestMeta, RecordBatch)> {
+		if frame.meta.len() < std::mem::size_of::<TableWriteRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_WRITE_REQ meta too small",
+			));
+		}
+		let meta: TableWriteRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableWriteRequestMeta>()]);
+		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_WRITE_REQ missing Arrow payload",
+			)
+		})?;
+		let payload = decode_batch(payload_bytes)?;
+		Ok((meta, payload))
+	}
+
 	fn build_write_response_frame(
 		&self,
 		msg_type: MsgType,
@@ -2920,6 +3201,41 @@ impl WendelonDataServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: msg_type.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		}
+	}
+
+	fn build_table_write_response_frame(
+		&self,
+		stream_id: u32,
+		resp: TableWriteResponseMeta,
+		trailing: Option<FinalizationMarker>,
+	) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		let trailing = trailing.map(|marker| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec()
+				.extend_from_slice(bytemuck::bytes_of(&marker));
+			buf
+		});
+		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
+
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_WRITE_RESP.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta_buf.len() as u32,
@@ -3024,6 +3340,30 @@ impl WendelonDataServer {
 		)
 	}
 
+	fn table_write_error_response(
+		&self,
+		meta: &TableWriteRequestMeta,
+		status: WriteStatus,
+		reject_code: WpbcRejectCode,
+	) -> TableWriteResponseMeta {
+		TableWriteResponseMeta {
+			write: self.counted_write_response(WriteResponseMeta {
+				status,
+				_pad1: [0; 7],
+				log_index: 0,
+				term: 0,
+				epoch: meta.expected_epoch,
+				commit_hlc: meta.client_hlc,
+				leader_hint: self.local_node,
+				echoed_write_id: meta.parent_write_id,
+				has_finalization: 0,
+				_pad2: [0; 7],
+			}),
+			reject_code: reject_code.0,
+			_pad: [0; 6],
+		}
+	}
+
 	fn unauthorized_read_frame(&self, stream_id: u32, meta: &ReadRequestMeta) -> HrftFrame {
 		let mut meta_buf = self.pool.acquire();
 		meta_buf
@@ -3089,6 +3429,22 @@ impl WendelonDataServer {
 		self.build_query_response_frame(
 			stream_id,
 			query_error_meta(meta, ReadStatus::BACKPRESSURED, self.local_node),
+			None,
+			FRAME_FLAG_STREAM_END,
+		)
+	}
+
+	fn table_query_error_frame(
+		&self,
+		stream_id: u32,
+		meta: &TableQueryRequestMeta,
+		status: ReadStatus,
+	) -> HrftFrame {
+		let range_meta = table_query_as_range_query(meta);
+		self.build_query_response_frame_with_type(
+			MsgType::TABLE_QUERY_RESP,
+			stream_id,
+			query_error_meta(&range_meta, status, self.local_node),
 			None,
 			FRAME_FLAG_STREAM_END,
 		)
@@ -3521,6 +3877,28 @@ impl WendelonDataServer {
 		))
 	}
 
+	async fn handle_table_write(
+		&self,
+		_actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		let (meta, payload) = self.decode_table_write_request_frame(&frame)?;
+		let span = tracing::info_span!(
+			"data_ring.table_write.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+			schema_generation = meta.schema_generation,
+			row_count = meta.decoded_row_count(),
+			await_finalization = meta.await_finalization != 0,
+			durability = meta.durability.0,
+			write_sequence = meta.parent_write_id.sequence_no,
+		);
+		let (resp, trailing) = self.table_write(meta, payload).instrument(span).await?;
+		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, trailing))
+	}
+
 	async fn handle_read(
 		&self,
 		actor: &ActorIdentity,
@@ -3767,7 +4145,7 @@ impl WendelonDataServer {
 		// window; range pages walk the full ledger window keyed by
 		// `(cursor_hash, cursor_hlc)` so fat keys with more retained
 		// versions than fit in one page still stream exhaustively.
-		let mut locations: Vec<(TenantId, Identity, RecordLocation)> = match meta.kind {
+		let mut locations: Vec<(TenantId, Identity, Locality, RecordLocation)> = match meta.kind {
 			MigrateRequestKind::POINT_LOOKUP => self
 				.slab
 				.scan_all_versions(
@@ -3776,7 +4154,7 @@ impl WendelonDataServer {
 					entry.migration_hlc_floor,
 				)
 				.into_iter()
-				.filter(|(tenant_id, key_identity, _)| {
+				.filter(|(tenant_id, key_identity, _, _)| {
 					*tenant_id == meta.tenant_id && *key_identity == meta.key_identity
 				})
 				.collect(),
@@ -3819,12 +4197,12 @@ impl WendelonDataServer {
 		};
 
 		let total_locations = locations.len();
-		let mut rows: Vec<(TenantId, Identity, RecordLocation, Vec<u8>)> = Vec::new();
+		let mut rows: Vec<(TenantId, Identity, Locality, RecordLocation, Vec<u8>)> = Vec::new();
 		let mut packed_bytes: usize = 0;
 		let mut last_key = (TenantId::ZERO, Identity::ZERO);
 		let mut last_hlc: HybridTimestamp = bytemuck::Zeroable::zeroed();
 		let mut truncated = false;
-		for (tenant_id, key_identity, loc) in locations.drain(..) {
+		for (tenant_id, key_identity, routing_locality, loc) in locations.drain(..) {
 			if rows.len() >= max_records {
 				truncated = true;
 				break;
@@ -3837,7 +4215,7 @@ impl WendelonDataServer {
 			packed_bytes = packed_bytes.saturating_add(frame.len());
 			last_key = (tenant_id, key_identity);
 			last_hlc = loc.hlc;
-			rows.push((tenant_id, key_identity, loc, frame));
+			rows.push((tenant_id, key_identity, routing_locality, loc, frame));
 		}
 		let emitted_all = rows.len() == total_locations;
 		let has_more = meta.kind == MigrateRequestKind::RANGE_PAGE && truncated && !emitted_all;
@@ -3982,10 +4360,11 @@ impl WendelonDataServer {
 					Ok((resp, records)) if resp.status == MigrateStatus::OK => {
 						for record in &records {
 							self.slab
-								.append_migration(
+								.append_migration_with_locality(
 									entry.migration_id,
 									record.tenant_id,
 									record.key_identity,
+									record.routing_locality,
 									record.hlc,
 									record.payload_hash,
 									&record.frame_bytes,
@@ -4154,10 +4533,11 @@ impl WendelonDataServer {
 				}
 				for record in &records {
 					self.slab
-						.append_migration(
+						.append_migration_with_locality(
 							entry.migration_id,
 							record.tenant_id,
 							record.key_identity,
+							record.routing_locality,
 							record.hlc,
 							record.payload_hash,
 							&record.frame_bytes,
@@ -4326,6 +4706,120 @@ impl WendelonDataServer {
 		.await
 	}
 
+	async fn prepare_table_query_execution_plan_with_migration(
+		&self,
+		meta: &TableQueryRequestMeta,
+		bytecode: &[u8],
+	) -> std::io::Result<QueryExecutionPlan> {
+		let range_meta = table_query_as_range_query(meta);
+		let admission = self.admission_snapshot();
+		let current_epoch = admission.current_epoch;
+		if meta.expected_epoch < current_epoch {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::EPOCH_STALE,
+				self.local_node,
+			));
+		}
+		if let Err(status) = self.enforce_read_policy(meta.tenant_id).await {
+			return Ok(query_plan_error(&range_meta, status, self.local_node));
+		}
+		if meta.consistency == Consistency::LINEARIZABLE {
+			let watermark = admission
+				.e_safe_watermarks
+				.get(&meta.expected_epoch)
+				.copied()
+				.unwrap_or(HybridTimestamp {
+					physical_ms: 0,
+					logical: 0,
+					node_id: 0,
+				});
+			if watermark < meta.min_hlc {
+				return Ok(query_plan_error(
+					&range_meta,
+					ReadStatus::E_SAFE_BEHIND,
+					self.local_node,
+				));
+			}
+		}
+		if self.snapshot_request_outside_retention(meta.as_of_hlc) {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::RETENTION_EXPIRED,
+				self.local_node,
+			));
+		}
+
+		let sm_peek = self.state_machine.state_snapshot().await;
+		let Some(descriptor) = sm_peek
+			.table_schemas
+			.get(meta.tenant_id, meta.table_object_id, meta.schema_generation)
+			.cloned()
+		else {
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::QUERY_INVALID_PROGRAM,
+				self.local_node,
+			));
+		};
+		let ranges = match table_query_scan_ranges(meta.tenant_id, &descriptor) {
+			Ok(ranges) => ranges,
+			Err(status) => return Ok(query_plan_error(&range_meta, status, self.local_node)),
+		};
+		let pending: Vec<MigrationLedgerEntry> = sm_peek
+			.migrations
+			.values()
+			.filter(|e| {
+				e.logical_owner.id == self.local_node.id
+					&& e.state != MigrationState::Completed
+					&& ranges.iter().any(|range| {
+						e.range_start <= range.end.get() && e.range_end >= range.start.get()
+					})
+			})
+			.cloned()
+			.collect();
+		drop(sm_peek);
+
+		for entry in &pending {
+			for range in &ranges {
+				let rs = entry.range_start.max(range.start.get());
+				let re = entry.range_end.min(range.end.get());
+				if rs > re {
+					continue;
+				}
+				if let Err(_e) = self.pull_migration_range(entry, rs, re).await {
+					return Ok(query_plan_error(
+						&range_meta,
+						ReadStatus::MIGRATION_INCOMPLETE,
+						self.local_node,
+					));
+				}
+			}
+		}
+
+		let program = match wpbc::Program::compile(bytecode) {
+			Ok(program) => program,
+			Err(_) => {
+				return Ok(query_plan_error(
+					&range_meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					self.local_node,
+				));
+			}
+		};
+
+		plan_query_execution_for_ranges_with_program(
+			&self.slab,
+			self.local_node,
+			&range_meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+	}
+
 	/// Issue a single `MIGRATE_REQ` to `target` and decode the
 	/// response body into `(meta, records)`. Errors bubble the
 	/// transport failure; logical status bytes (KEY_NOT_FOUND,
@@ -4483,6 +4977,117 @@ impl WendelonDataServer {
 			trailing: None,
 		})
 	}
+
+	async fn handle_table_replicate(&self, frame: HrftFrame) -> std::io::Result<HrftFrame> {
+		if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_REPLICATE_REQ meta too small",
+			));
+		}
+		let meta: TableReplicaWriteMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableReplicaWriteMeta>()]);
+		if let Some(tracker) = &self.tracker {
+			let peer = NodeId {
+				id: meta.commit_hlc.node_id,
+				_reserved: 0,
+			};
+			tracker.record_hlc(peer, meta.commit_hlc);
+		}
+		let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_REPLICATE_REQ missing arrow payload",
+			)
+		})?;
+
+		let (status, ack_level) = if self.degraded_reason().is_some() {
+			(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+		} else {
+			match decode_table_replica_children(&arrow[..]).and_then(|children| {
+				validate_table_replica_payload(&meta, &children).map(|()| children)
+			}) {
+				Ok(children) => {
+					let append_result = append_table_children_durable(
+						&self.slab,
+						meta.tenant_id,
+						meta.commit_hlc,
+						&children,
+					)
+					.await;
+					match append_result {
+						Ok(()) => {
+							// A split table-replication frame is only proof for its child
+							// group; the aggregate pending witness belongs to the coordinator
+							// unless this frame carries the whole parent batch.
+							if meta.group_record_count == meta.record_count
+								&& meta.group_payload_hash == meta.payload_hash
+							{
+								let pending =
+									self.pending_finalization_record_from_table_replica_meta(&meta);
+								match self.pending_finalizations.upsert(pending).await {
+									Ok(()) => {
+										self.refresh_pending_finalization_backlog_metric();
+										(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
+									}
+									Err(err) => {
+										tracing::error!(
+											write_id = ?meta.parent_write_id,
+											tenant_id = meta.tenant_id.get(),
+											error = %err,
+											"replica failed to persist table pending-finalization witness after durable append"
+										);
+										self.trip_local_persistence_distrust(format!(
+											"table replica pending finalization witness persistence failed after durable append: {err}"
+										))
+										.await;
+										(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+									}
+								}
+							} else {
+								(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
+							}
+						}
+						Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
+					}
+				}
+				Err(err) => {
+					tracing::warn!(
+						write_id = ?meta.parent_write_id,
+						tenant_id = meta.tenant_id.get(),
+						error = %err,
+						"replica rejected malformed table batch"
+					);
+					(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
+				}
+			}
+		};
+
+		let resp = ReplicaWriteRespMeta {
+			status,
+			ack_level,
+			_pad: [0; 6],
+		};
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_REPLICATE_RESP.0,
+			flags: 0,
+			stream_id: frame.header.stream_id,
+			meta_len: body.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		Ok(HrftFrame {
+			header,
+			meta: body,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
 }
 
 // ============================================================
@@ -4548,6 +5153,102 @@ impl DataRingServer for WendelonDataServer {
 					}
 				};
 				self.handle_write(&context.actor, frame).await.map(Some)
+			}
+			MsgType::TABLE_WRITE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<TableWriteRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_WRITE_REQ meta too small",
+					));
+				}
+				let meta: TableWriteRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableWriteRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Write,
+					)
+					.is_err()
+				{
+					let resp = self.table_write_error_response(
+						&meta,
+						WriteStatus::AUTHORIZATION_FAILED,
+						WpbcRejectCode::NONE,
+					);
+					return Ok(Some(self.build_table_write_response_frame(
+						frame.header.stream_id,
+						resp,
+						None,
+					)));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						let resp = self.table_write_error_response(
+							&meta,
+							WriteStatus::BACKPRESSURED,
+							WpbcRejectCode::NONE,
+						);
+						return Ok(Some(self.build_table_write_response_frame(
+							frame.header.stream_id,
+							resp,
+							None,
+						)));
+					}
+				};
+				self.handle_table_write(&context.actor, frame)
+					.await
+					.map(Some)
+			}
+			MsgType::TABLE_REPLICATE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_REPLICATE_REQ meta too small",
+					));
+				}
+				let meta: TableReplicaWriteMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableReplicaWriteMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Replicate,
+					)
+					.is_err()
+				{
+					let resp = ReplicaWriteRespMeta {
+						status: ReplicaWriteStatus::NOT_AUTHORIZED,
+						ack_level: ReplicaAckLevel::NONE,
+						_pad: [0; 6],
+					};
+					let mut body = self.pool.acquire();
+					body.as_mut_vec()
+						.extend_from_slice(bytemuck::bytes_of(&resp));
+					return Ok(Some(HrftFrame {
+						header: FrameHeader {
+							magic: HRFT_MAGIC,
+							version: 1,
+							msg_type: MsgType::TABLE_REPLICATE_RESP.0,
+							flags: 0,
+							stream_id: frame.header.stream_id,
+							meta_len: body.len() as u32,
+							arrow_len: 0,
+							trailing_len: 0,
+						},
+						meta: body,
+						arrow_payload: None,
+						trailing: None,
+					}));
+				}
+				self.handle_table_replicate(frame).await.map(Some)
 			}
 			MsgType::READ_REQ => {
 				if frame.meta.len() < std::mem::size_of::<ReadRequestMeta>() {
@@ -4665,6 +5366,61 @@ impl DataRingServer for WendelonDataServer {
 					}
 				};
 				self.handle_query(&context.actor, frame).await.map(Some)
+			}
+			MsgType::TABLE_QUERY_REQ => {
+				if frame.meta.len() < std::mem::size_of::<TableQueryRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_QUERY_REQ meta too small",
+					));
+				}
+				let meta: TableQueryRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()],
+				);
+				let audit_meta = table_query_as_range_query(&meta);
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				) {
+					self.emit_query_denied_audit(
+						&context.actor,
+						&audit_meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
+					return Ok(Some(self.table_query_error_frame(
+						frame.header.stream_id,
+						&meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+					)));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Query,
+				)? {
+					Ok(admission) => admission,
+					Err(scope) => {
+						self.emit_query_denied_audit(
+							&context.actor,
+							&audit_meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
+						return Ok(Some(self.table_query_error_frame(
+							frame.header.stream_id,
+							&meta,
+							ReadStatus::BACKPRESSURED,
+						)));
+					}
+				};
+				self.handle_table_query(&context.actor, frame)
+					.await
+					.map(Some)
 			}
 			MsgType::MIGRATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<MigrateRequestMeta>() {
@@ -4899,59 +5655,15 @@ impl DataRingServer for WendelonDataServer {
 	}
 }
 
-#[async_trait]
-impl DataRing for WendelonDataServer {
-	async fn write(
+impl WendelonDataServer {
+	async fn write_bifurcated(
 		&self,
 		meta: WriteRequestMeta,
-		payload: RecordBatch,
+		bifurcated: BifurcatedWrite,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		metrics().data_ring_write_requests_total.inc();
-		// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
-		if meta.proxy_hop >= 2 {
-			return Ok(self.counted_write_result(
-				error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
-				None,
-			));
-		}
-
-		// 2. Epoch validation. The authoritative current epoch is
-		// the highest epoch the SM has seen an E_safe advancement
-		// for; a client that believes in an older epoch gets a
-		// redirect, not a silent accept.
-		let admission = self.admission_snapshot();
-		let current_epoch = admission.current_epoch;
-		if meta.expected_epoch < current_epoch {
-			return Ok(self.counted_write_result(
-				error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
-				None,
-			));
-		}
-
-		// 3. Idempotency fast path.
 		let key = Self::idempotency_key_for(meta.write_id);
-		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
-			return self.replay_write_outcome(cached.outcome()).await;
-		}
 
-		if self.degraded_reason().is_some() {
-			return Ok(self.fenced_write_response(&meta).await);
-		}
-
-		// 3a. Decode the payload before cache-miss admission so we can
-		// make non-primary redirect decisions without forcing a fresh
-		// leader to complete orphan-witness recovery for a range this
-		// node does not own.
-		//
-		// This is still pre-bifurcation bookkeeping: no durable write
-		// work has started yet.
-		//
-		// 4. Cross the ADR 003 bifurcation boundary exactly once.
-		// The returned bundle becomes the single source of truth for
-		// both the data branch and the control branch.
-		let bifurcated = bifurcate_client_write(&meta, &payload)?;
-
-		// 4a. Non-primary redirect must happen before the fresh-leader
+		// Non-primary redirect must happen before the fresh-leader
 		// orphan-witness sweep. A node that does not own this range
 		// should return `NOT_LEADER` cheaply rather than failing on a
 		// peer-sweep precondition that is only relevant to primary-owned
@@ -4981,10 +5693,10 @@ impl DataRing for WendelonDataServer {
 		self.ensure_orphan_witnesses_recovered_for_leadership()
 			.await?;
 
-		// 4b. Restart-safe pending replay path. A recovered server
-		// starts with an empty idempotency cache, so consult the
-		// durable pending-intent store before crossing the
-		// bifurcation boundary again.
+		// Restart-safe pending replay path. A recovered server starts
+		// with an empty idempotency cache, so consult the durable
+		// pending-intent store before crossing the bifurcation boundary
+		// again.
 		if let Some(record) = self
 			.pending_finalizations
 			.find_by_write_id(meta.write_id)
@@ -4996,11 +5708,9 @@ impl DataRing for WendelonDataServer {
 			return self.replay_write_outcome(outcome).await;
 		}
 
-		// 4c. Per-range lease gate (plan 018). When enabled, this
-		// node accepts the write only if it holds a valid lease
-		// covering `key_locality` in the client's epoch. Primary-owner
-		// routing was decided above; this branch now answers only the
-		// lease-validity question.
+		// Per-range lease gate (plan 018). When enabled, this node
+		// accepts the write only if it holds a valid lease covering
+		// the child's routing locality in the client's epoch.
 		if self.lease_gate_enabled {
 			match self
 				.lease_gate_result(bifurcated.locality, meta.expected_epoch, meta.client_hlc)
@@ -5038,14 +5748,11 @@ impl DataRing for WendelonDataServer {
 			}
 		};
 
-		// 6. HLC for this write. The leader is authoritative: it
-		// merges the client's timestamp with its own monotonic HLC
-		// view and stamps `max(leader_hlc, client_hlc) + 1`.
+		// HLC for this write. The leader is authoritative: it merges
+		// the client's timestamp with its own monotonic HLC view and
+		// stamps `max(leader_hlc, client_hlc) + 1`.
 		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
 
-		// 7. Resolve the replica set. An empty set is a
-		// configuration bug — refuse rather than silently dropping
-		// to a pre-Stellarator single-node append.
 		let replicas = self.router.replicas_for_locality(bifurcated.locality);
 		if replicas.is_empty() {
 			return Ok(self.counted_write_result(
@@ -5059,11 +5766,6 @@ impl DataRing for WendelonDataServer {
 		let mut quorum_tracker = DurableQuorumTracker::new(quorum, local_is_replica);
 		let durable_quorum_started = Instant::now();
 
-		// 8. Start the leader-local durable append (if this node is
-		// in the replica set) and remote fan-out concurrently. Each
-		// remote leg runs on its own task so head-of-line blocking
-		// on any single peer only slows *that* leg; the local append
-		// is just another quorum leg racing in parallel.
 		let mut local_durable_task: Option<JoinHandle<std::io::Result<RecordLocation>>> =
 			if local_is_replica {
 				let slab = self.slab.clone();
@@ -5115,10 +5817,6 @@ impl DataRing for WendelonDataServer {
 			});
 		}
 
-		// 9. Quorum race. Stop once the centralized tracker says the
-		// quorum is satisfied. When the leader is itself a replica,
-		// pure-remote durable quorum is explicitly insufficient until
-		// the leader-local durable leg succeeds too.
 		while !quorum_tracker.is_satisfied() {
 			tokio::select! {
 				local = async {
@@ -5168,10 +5866,6 @@ impl DataRing for WendelonDataServer {
 		}
 		metrics().observe_durable_quorum_latency(durable_quorum_started.elapsed());
 
-		// 10. Finalization. Before we touch the Control Ring, persist a
-		// local recovery intent so "data quorum durable, control branch
-		// failed" survives restart and can be replayed without redoing
-		// the data branch.
 		let pending = self.pending_finalization_record(&meta, &bifurcated, commit_hlc);
 		let _pending_claim = self
 			.try_claim_pending_finalization(pending.id)
@@ -5244,6 +5938,470 @@ impl DataRing for WendelonDataServer {
 				Ok(self.counted_write_result(response, None))
 			}
 		}
+	}
+
+	fn table_batch_replica_groups(
+		&self,
+		children: &[BifurcatedTableChildWrite],
+	) -> Option<Vec<TableReplicaGroup>> {
+		let mut groups: Vec<TableReplicaGroup> = Vec::new();
+		for child in children {
+			let replicas = self.router.replicas_for_locality(child.locality);
+			if replicas.is_empty() {
+				return None;
+			}
+			if let Some(group) = groups.iter_mut().find(|group| group.replicas == replicas) {
+				group.children.push(child.clone());
+			} else {
+				groups.push(TableReplicaGroup {
+					replicas,
+					children: vec![child.clone()],
+				});
+			}
+		}
+		Some(groups)
+	}
+
+	async fn write_table_bifurcated(
+		&self,
+		meta: TableWriteRequestMeta,
+		bifurcated: BifurcatedTableWrite,
+		groups: Vec<TableReplicaGroup>,
+	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		let synthetic = table_write_synthetic_meta(
+			&meta,
+			bifurcated.parent_key_identity,
+			bifurcated.charged_bytes,
+		);
+		let key = Self::idempotency_key_for(meta.parent_write_id);
+
+		let lease_gate_is_primary_for_all_groups = if self.lease_gate_enabled {
+			groups.iter().all(|group| {
+				group
+					.replicas
+					.first()
+					.map(|n| n.id == self.local_node.id)
+					.unwrap_or(false)
+			})
+		} else {
+			true
+		};
+		if self.lease_gate_enabled && !lease_gate_is_primary_for_all_groups {
+			return Ok(self.counted_write_result(
+				error_response(&synthetic, WriteStatus::NOT_LEADER, self.local_node),
+				None,
+			));
+		}
+
+		self.ensure_orphan_witnesses_recovered_for_leadership()
+			.await?;
+
+		if let Some(record) = self
+			.pending_finalizations
+			.find_by_write_id(meta.parent_write_id)
+			.await?
+		{
+			let outcome = self.recoverable_pending_outcome_for_record(&record);
+			self.idempotency
+				.insert(key, CachedWriteOutcome::new(outcome));
+			return self.replay_write_outcome(outcome).await;
+		}
+
+		if self.lease_gate_enabled {
+			for child in &bifurcated.children {
+				match self
+					.lease_gate_result(child.locality, meta.expected_epoch, meta.client_hlc)
+					.await
+				{
+					LeaseGateResult::Valid => {}
+					LeaseGateResult::Missing => {
+						return Ok(self.counted_write_result(
+							error_response(&synthetic, WriteStatus::LEASE_EXPIRED, self.local_node),
+							None,
+						));
+					}
+					LeaseGateResult::InvalidSignature => {
+						return Ok(self.counted_write_result(
+							error_response(
+								&synthetic,
+								WriteStatus::INVALID_LEASE_SIGNATURE,
+								self.local_node,
+							),
+							None,
+						));
+					}
+				}
+			}
+		}
+
+		let _quota_reservation = match self
+			.enforce_write_policy(meta.tenant_id, bifurcated.charged_bytes)
+			.await
+		{
+			Ok(reservation) => reservation,
+			Err(status) => {
+				return Ok(self.counted_write_result(
+					error_response(&synthetic, status, self.local_node),
+					None,
+				));
+			}
+		};
+
+		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+
+		if groups.is_empty() {
+			return Ok(self.counted_write_result(
+				error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
+				None,
+			));
+		}
+		let mut quorum_trackers = groups
+			.iter()
+			.map(|group| {
+				let rf = group.replicas.len();
+				let quorum = (rf / 2) + 1;
+				let local_is_replica = group.replicas.iter().any(|n| n.id == self.local_node.id);
+				DurableQuorumTracker::new(quorum, local_is_replica)
+			})
+			.collect::<Vec<_>>();
+		let durable_quorum_started = Instant::now();
+
+		let local_groups = groups
+			.iter()
+			.enumerate()
+			.filter(|(_index, group)| group.replicas.iter().any(|n| n.id == self.local_node.id))
+			.map(|(index, group)| (index, group.children.clone()))
+			.collect::<Vec<_>>();
+		let mut local_durable_task: Option<JoinHandle<std::io::Result<Vec<usize>>>> =
+			if local_groups.is_empty() {
+				None
+			} else {
+				let slab = self.slab.clone();
+				let tenant_id = meta.tenant_id;
+				#[cfg(test)]
+				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
+				Some(tokio::spawn(async move {
+					#[cfg(test)]
+					if let Some((kind, message)) = fail_next_local_durable_append
+						.lock()
+						.expect("local durable append failpoint poisoned")
+						.take()
+					{
+						return Err(Error::new(
+							kind,
+							format!("injected local durable append failure: {message}"),
+						));
+					}
+					let mut completed = Vec::with_capacity(local_groups.len());
+					for (index, children) in local_groups {
+						append_bifurcated_table_children_durable(
+							&slab, tenant_id, commit_hlc, &children,
+						)
+						.await?;
+						completed.push(index);
+					}
+					Ok(completed)
+				}))
+			};
+		let mut join: JoinSet<std::io::Result<(usize, ReplicaAckLevel)>> = JoinSet::new();
+		for (group_index, group) in groups.iter().enumerate() {
+			let replica_payload = Arc::new(encode_table_replica_children(&group.children)?);
+			let replica_meta = table_replica_meta(&meta, &bifurcated, &group.children, commit_hlc);
+			for target in group.replicas.iter().copied() {
+				if target.id == self.local_node.id {
+					continue;
+				}
+				let factory = self.factory.clone();
+				let pool = self.pool.clone();
+				let bytes = replica_payload.clone();
+				join.spawn(async move {
+					Self::replicate_table_batch_to_remote(
+						factory,
+						pool,
+						target,
+						replica_meta,
+						bytes,
+					)
+					.await
+					.map(|ack| (group_index, ack))
+				});
+			}
+		}
+
+		while !quorum_trackers
+			.iter()
+			.all(DurableQuorumTracker::is_satisfied)
+		{
+			tokio::select! {
+				local = async {
+					match local_durable_task.as_mut() {
+						Some(task) => Some(task.await),
+						None => None,
+					}
+				}, if local_durable_task.is_some() => {
+					match local {
+						Some(Ok(Ok(completed))) => {
+							for index in completed {
+								quorum_trackers[index].note_local_durable();
+							}
+						}
+						Some(Ok(Err(err))) => {
+							self.trip_local_persistence_distrust(format!(
+								"local table durable append returned error: {err}"
+							))
+							.await;
+							return Ok(self.fenced_write_response(&synthetic).await);
+						}
+						Some(Err(err)) => {
+							self.trip_local_persistence_distrust(format!(
+								"local table durable append task failed: {err}"
+							))
+							.await;
+							return Ok(self.fenced_write_response(&synthetic).await);
+						}
+						None => continue,
+					}
+					local_durable_task = None;
+				}
+				remote = join.join_next(), if !join.is_empty() => {
+					match remote {
+						Some(Ok(Ok((index, level)))) => {
+							quorum_trackers[index].note_remote_ack(level);
+						}
+						Some(_) => { /* leg failed — keep racing */ }
+						None => {}
+					}
+				}
+				else => break,
+			}
+		}
+
+		if !quorum_trackers
+			.iter()
+			.all(DurableQuorumTracker::is_satisfied)
+		{
+			return Ok(self.counted_write_result(
+				error_response(&synthetic, WriteStatus::INTERNAL_ERROR, self.local_node),
+				None,
+			));
+		}
+		metrics().observe_durable_quorum_latency(durable_quorum_started.elapsed());
+
+		let pending = self.pending_finalization_record_for_table(&meta, &bifurcated, commit_hlc);
+		let _pending_claim = self
+			.try_claim_pending_finalization(pending.id)
+			.ok_or_else(|| {
+				Error::other("pending finalization for this table write is already being processed")
+			})?;
+		if let Err(err) = self.pending_finalizations.upsert(pending.clone()).await {
+			tracing::error!(
+				pending_id = %format_bytes_hex(pending.id.as_bytes()),
+				write_id = ?meta.parent_write_id,
+				tenant_id = meta.tenant_id.get(),
+				error = %err,
+				"failed to persist table pending finalization; attempting immediate finalization before fencing node"
+			);
+			match self.resolve_pending_finalization(&pending).await {
+				Ok(resolution) => {
+					let committed = self
+						.complete_pending_finalization(&pending, resolution)
+						.await
+						.map(|(response, trailing)| self.counted_write_result(response, trailing));
+					self.trip_local_persistence_distrust(format!(
+						"table pending finalization intent persistence failed after durable quorum: {err}"
+					))
+					.await;
+					return committed;
+				}
+				Err(finalize_err) => {
+					tracing::error!(
+						pending_id = %format_bytes_hex(pending.id.as_bytes()),
+						write_id = ?meta.parent_write_id,
+						tenant_id = meta.tenant_id.get(),
+						error = %finalize_err,
+						"immediate table finalization also failed after pending intent persistence failure; fencing node"
+					);
+					self.trip_local_persistence_distrust(format!(
+						"table pending finalization intent persistence failed after durable quorum: {err}; immediate finalization failed: {finalize_err}"
+					))
+					.await;
+					return Ok(self.fenced_write_response(&synthetic).await);
+				}
+			}
+		} else {
+			self.refresh_pending_finalization_backlog_metric();
+		}
+
+		match self.resolve_pending_finalization(&pending).await {
+			Ok(resolution) => self
+				.complete_pending_finalization(&pending, resolution)
+				.await
+				.map(|(response, trailing)| self.counted_write_result(response, trailing)),
+			Err(err) => {
+				tracing::warn!(
+					pending_id = %format_bytes_hex(pending.id.as_bytes()),
+					error = %err,
+					"table finalization commit failed after the data branch reached durable quorum"
+				);
+				let response = self.recoverable_pending_response(
+					meta.parent_write_id,
+					meta.expected_epoch,
+					commit_hlc,
+				);
+				self.idempotency.insert(
+					key,
+					CachedWriteOutcome::new(WriteOutcome::FinalizationRecoverablePending {
+						response,
+						pending_finalization_id: pending.id,
+					}),
+				);
+				self.pending_finalization_wakeup.notify_one();
+				Ok(self.counted_write_result(response, None))
+			}
+		}
+	}
+
+	async fn table_write(
+		&self,
+		meta: TableWriteRequestMeta,
+		payload: RecordBatch,
+	) -> std::io::Result<(TableWriteResponseMeta, Option<FinalizationMarker>)> {
+		metrics().data_ring_write_requests_total.inc();
+		if meta.proxy_hop >= 2 {
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::PROXY_LIMIT,
+					WpbcRejectCode::NONE,
+				),
+				None,
+			));
+		}
+
+		let admission = self.admission_snapshot();
+		if meta.expected_epoch < admission.current_epoch {
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::EPOCH_STALE,
+					WpbcRejectCode::NONE,
+				),
+				None,
+			));
+		}
+
+		let key = Self::idempotency_key_for(meta.parent_write_id);
+		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
+			let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
+			return Ok((table_write_response(write, WpbcRejectCode::NONE), trailing));
+		}
+
+		if self.degraded_reason().is_some() {
+			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
+			let (write, trailing) = self.fenced_write_response(&synthetic).await;
+			return Ok((table_write_response(write, WpbcRejectCode::NONE), trailing));
+		}
+
+		let descriptor = {
+			let state = self.state_machine.state_snapshot().await;
+			state
+				.table_schemas
+				.latest_by_id(meta.tenant_id, meta.table_object_id)
+				.cloned()
+		};
+		let Some(descriptor) = descriptor else {
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					WpbcRejectCode::WPBC_REJECT_SCHEMA_UNKNOWN,
+				),
+				None,
+			));
+		};
+
+		let bifurcated = match bifurcate_table_write(&meta, &payload, &descriptor) {
+			Ok(bifurcated) => bifurcated,
+			Err(err) => {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						table_write_status_for_reject(err.code),
+						err.code,
+					),
+					None,
+				));
+			}
+		};
+		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					WpbcRejectCode::WPBC_REJECT_LOCALITY_UNSUPPORTED,
+				),
+				None,
+			));
+		};
+		let (write, trailing) = self
+			.write_table_bifurcated(meta, bifurcated, groups)
+			.await?;
+		Ok((table_write_response(write, WpbcRejectCode::NONE), trailing))
+	}
+}
+
+#[async_trait]
+impl DataRing for WendelonDataServer {
+	async fn write(
+		&self,
+		meta: WriteRequestMeta,
+		payload: RecordBatch,
+	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
+		metrics().data_ring_write_requests_total.inc();
+		// 1. Proxy-hop guard — two-hop cap per ADR 003 §2.
+		if meta.proxy_hop >= 2 {
+			return Ok(self.counted_write_result(
+				error_response(&meta, WriteStatus::PROXY_LIMIT, self.local_node),
+				None,
+			));
+		}
+
+		// 2. Epoch validation. The authoritative current epoch is
+		// the highest epoch the SM has seen an E_safe advancement
+		// for; a client that believes in an older epoch gets a
+		// redirect, not a silent accept.
+		let admission = self.admission_snapshot();
+		let current_epoch = admission.current_epoch;
+		if meta.expected_epoch < current_epoch {
+			return Ok(self.counted_write_result(
+				error_response(&meta, WriteStatus::EPOCH_STALE, self.local_node),
+				None,
+			));
+		}
+
+		// 3. Idempotency fast path.
+		let key = Self::idempotency_key_for(meta.write_id);
+		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
+			return self.replay_write_outcome(cached.outcome()).await;
+		}
+
+		if self.degraded_reason().is_some() {
+			return Ok(self.fenced_write_response(&meta).await);
+		}
+
+		// 3a. Decode the payload before cache-miss admission so we can
+		// make non-primary redirect decisions without forcing a fresh
+		// leader to complete orphan-witness recovery for a range this
+		// node does not own.
+		//
+		// This is still pre-bifurcation bookkeeping: no durable write
+		// work has started yet.
+		//
+		// 4. Cross the ADR 003 bifurcation boundary exactly once.
+		// The returned bundle becomes the single source of truth for
+		// both the data branch and the control branch.
+		let bifurcated = bifurcate_client_write(&meta, &payload)?;
+		self.write_bifurcated(meta, bifurcated).await
 	}
 
 	async fn read(
@@ -5533,6 +6691,19 @@ struct QueryRecordLocation {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct QueryScanRange {
+	start: Locality,
+	end: Locality,
+}
+
+struct RebatchGroup {
+	schema: Arc<Schema>,
+	batches: Vec<RecordBatch>,
+	max_hlc: HybridTimestamp,
+	input_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct QueryExecutionBudget {
 	max_locations: usize,
 	max_rows: u64,
@@ -5639,12 +6810,25 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 			));
 		}
 	};
-	let scanned = slab.scan_as_of_with_identity(
-		meta.tenant_id,
-		Locality::new(meta.locality_range_start),
-		Locality::new(meta.locality_range_end),
-		meta.as_of_hlc,
-	);
+	let ranges = [QueryScanRange {
+		start: Locality::new(meta.locality_range_start),
+		end: Locality::new(meta.locality_range_end),
+	}];
+	plan_query_execution_for_ranges_with_program(
+		slab, local_node, meta, &program, &ranges, budget, None,
+	)
+	.await
+}
+
+async fn plan_query_execution_for_ranges_with_program(
+	slab: &SlabManager,
+	local_node: NodeId,
+	meta: &QueryRequestMeta,
+	program: &wpbc::Program,
+	ranges: &[QueryScanRange],
+	budget: QueryExecutionBudget,
+	table_descriptor: Option<&TableSchemaDescriptorV1>,
+) -> std::io::Result<QueryExecutionPlan> {
 	let mut batches = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
@@ -5655,72 +6839,172 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		logical: 0,
 		node_id: 0,
 	};
-	for (key_identity, location) in scanned {
-		if started_at.elapsed() > budget.max_wall_time {
-			return Ok(query_plan_error(
-				meta,
-				ReadStatus::QUERY_BUDGET_EXCEEDED,
-				local_node,
-			));
-		}
-		// Wall-time is enforced between locations, not in the middle of one.
-		// We pair that with a hard per-location row cap during batch
-		// materialization so one oversized slab cannot burn unbounded WPBC
-		// row-eval time before the next deadline check. If future opcodes grow
-		// into unbounded aggregates/joins, revisit this bound.
-		scanned_locations = scanned_locations.saturating_add(1);
-		if scanned_locations > budget.max_locations {
-			return Ok(query_plan_error(
-				meta,
-				ReadStatus::QUERY_BUDGET_EXCEEDED,
-				local_node,
-			));
-		}
-		let query_record = QueryRecordLocation {
-			identity: key_identity,
-			locality: Locality::from(key_identity),
-			location,
-		};
-		let result = match materialize_query_batch_with_program(
-			slab,
-			query_record,
-			&program,
-			budget.max_rows,
-		)
-		.await
-		{
-			Ok(result) => result,
-			Err(QueryBatchMaterializationError::Io(err)) => return Err(err),
-			Err(QueryBatchMaterializationError::InvalidProgram) => {
-				return Ok(query_plan_error(
-					meta,
-					ReadStatus::QUERY_INVALID_PROGRAM,
-					local_node,
-				));
+	if program.requires_scalar_context() {
+		for range in ranges {
+			let scanned = slab.scan_as_of_with_identity_and_locality(
+				meta.tenant_id,
+				range.start,
+				range.end,
+				meta.as_of_hlc,
+			);
+			for (key_identity, locality, location) in scanned {
+				if started_at.elapsed() > budget.max_wall_time {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				scanned_locations = scanned_locations.saturating_add(1);
+				if scanned_locations > budget.max_locations {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				let query_record = QueryRecordLocation {
+					identity: key_identity,
+					locality,
+					location,
+				};
+				let result = match materialize_query_batch_with_program(
+					slab,
+					query_record,
+					program,
+					budget.max_rows,
+				)
+				.await
+				{
+					Ok(result) => result,
+					Err(QueryBatchMaterializationError::Io(err)) => return Err(err),
+					Err(QueryBatchMaterializationError::InvalidProgram) => {
+						return Ok(query_plan_error(
+							meta,
+							ReadStatus::QUERY_INVALID_PROGRAM,
+							local_node,
+						));
+					}
+					Err(QueryBatchMaterializationError::BudgetExceeded) => {
+						return Ok(query_plan_error(
+							meta,
+							ReadStatus::QUERY_BUDGET_EXCEEDED,
+							local_node,
+						));
+					}
+				};
+				if result.num_rows() == 0 {
+					continue;
+				}
+				if query_record.location.hlc > max_hlc {
+					max_hlc = query_record.location.hlc;
+				}
+				rows = rows.saturating_add(result.num_rows() as u64);
+				if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				batches.push(result);
 			}
-			Err(QueryBatchMaterializationError::BudgetExceeded) => {
+		}
+	} else {
+		let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
+		let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
+		for range in ranges {
+			let scanned = slab.scan_as_of_with_identity_and_locality(
+				meta.tenant_id,
+				range.start,
+				range.end,
+				meta.as_of_hlc,
+			);
+			for (key_identity, locality, location) in scanned {
+				if started_at.elapsed() > budget.max_wall_time {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				scanned_locations = scanned_locations.saturating_add(1);
+				if scanned_locations > budget.max_locations {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				let bytes = slab.read(location).await?;
+				let batch = decode_batch(&bytes)?;
+				if batch.num_rows() > max_rows_per_location {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_BUDGET_EXCEEDED,
+						local_node,
+					));
+				}
+				if let Some(descriptor) = table_descriptor {
+					if !table_record_matches_descriptor(
+						meta,
+						descriptor,
+						key_identity,
+						locality,
+						&batch,
+					)? {
+						continue;
+					}
+				}
+				let input_rows = batch.num_rows() as u64;
+				if let Some(group) = rebatch_groups
+					.iter_mut()
+					.find(|group| group.schema.as_ref() == batch.schema().as_ref())
+				{
+					if location.hlc > group.max_hlc {
+						group.max_hlc = location.hlc;
+					}
+					group.input_rows = group.input_rows.saturating_add(input_rows);
+					group.batches.push(batch);
+				} else {
+					rebatch_groups.push(RebatchGroup {
+						schema: batch.schema(),
+						batches: vec![batch],
+						max_hlc: location.hlc,
+						input_rows,
+					});
+				}
+			}
+		}
+		for group in rebatch_groups {
+			let concatenated = concat_batches(&group.schema, &group.batches)
+				.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
+			let result = match wpbc::execute_program(program, &concatenated) {
+				Ok(result) => result,
+				Err(_) => {
+					return Ok(query_plan_error(
+						meta,
+						ReadStatus::QUERY_INVALID_PROGRAM,
+						local_node,
+					));
+				}
+			};
+			if result.num_rows() == 0 {
+				continue;
+			}
+			if group.max_hlc > max_hlc {
+				max_hlc = group.max_hlc;
+			}
+			rows = rows.saturating_add(result.num_rows() as u64);
+			if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
 				return Ok(query_plan_error(
 					meta,
 					ReadStatus::QUERY_BUDGET_EXCEEDED,
 					local_node,
 				));
 			}
-		};
-		if result.num_rows() == 0 {
-			continue;
+			batches.push(result);
 		}
-		if query_record.location.hlc > max_hlc {
-			max_hlc = query_record.location.hlc;
-		}
-		rows = rows.saturating_add(result.num_rows() as u64);
-		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
-			return Ok(query_plan_error(
-				meta,
-				ReadStatus::QUERY_BUDGET_EXCEEDED,
-				local_node,
-			));
-		}
-		batches.push(result);
 	}
 
 	// 4. Empty result is a legitimate answer. Clients map
@@ -5796,6 +7080,30 @@ async fn materialize_query_batch_with_program(
 		}),
 	)
 	.map_err(|_| QueryBatchMaterializationError::InvalidProgram)
+}
+
+fn table_record_matches_descriptor(
+	meta: &QueryRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+	key_identity: Identity,
+	locality: Locality,
+	batch: &RecordBatch,
+) -> std::io::Result<bool> {
+	if batch.num_rows() != 1 {
+		return Ok(false);
+	}
+	if batch.schema().as_ref() != &descriptor.arrow_schema()? {
+		return Ok(false);
+	}
+	let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	table_meta.tenant_id = meta.tenant_id;
+	table_meta.table_object_id = descriptor.table_object_id;
+	table_meta.schema_generation = descriptor.schema_generation;
+	table_meta.row_count = 1;
+	let admission = validate_table_write_request_batch(&table_meta, batch, descriptor)
+		.map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+	Ok(admission.key_identities.as_slice() == [key_identity]
+		&& admission.localities.as_slice() == [locality])
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -5887,6 +7195,7 @@ const ZERO_NODE: NodeId = NodeId {
 struct MigrationRecord {
 	tenant_id: TenantId,
 	key_identity: Identity,
+	routing_locality: Locality,
 	hlc: HybridTimestamp,
 	payload_hash: [u8; 32],
 	frame_bytes: Vec<u8>,
@@ -5933,26 +7242,29 @@ fn migrate_error_meta(
 	}
 }
 
-/// Pack `(key_identity, RecordLocation, frame_bytes)` rows into an
-/// Arrow IPC stream over [`migration_record_schema`]. `payload_hash`
-/// is computed here — receivers use it to fast-path
-/// `append_migration` idempotency without re-hashing themselves.
+/// Pack `(key_identity, routing_locality, RecordLocation,
+/// frame_bytes)` rows into an Arrow IPC stream over
+/// [`migration_record_schema`]. `payload_hash` is computed here —
+/// receivers use it to fast-path `append_migration` idempotency
+/// without re-hashing themselves.
 fn encode_migration_records(
-	rows: &[(TenantId, Identity, RecordLocation, Vec<u8>)],
+	rows: &[(TenantId, Identity, Locality, RecordLocation, Vec<u8>)],
 ) -> std::io::Result<Vec<u8>> {
 	let mut tenant_id = UInt64Builder::with_capacity(rows.len());
 	let mut key_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
+	let mut routing_locality = UInt64Builder::with_capacity(rows.len());
 	let mut hlc_phys = UInt64Builder::with_capacity(rows.len());
 	let mut hlc_log = UInt32Builder::with_capacity(rows.len());
 	let mut hlc_node = UInt32Builder::with_capacity(rows.len());
 	let mut payload = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 	let mut frame = LargeBinaryBuilder::new();
 
-	for (row_tenant_id, identity, loc, bytes) in rows {
+	for (row_tenant_id, identity, locality, loc, bytes) in rows {
 		tenant_id.append_value(row_tenant_id.get());
 		key_identity
 			.append_value(identity.as_bytes())
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("identity append: {e}")))?;
+		routing_locality.append_value(locality.get());
 		hlc_phys.append_value(loc.hlc.physical_ms);
 		hlc_log.append_value(loc.hlc.logical);
 		hlc_node.append_value(loc.hlc.node_id);
@@ -5969,6 +7281,7 @@ fn encode_migration_records(
 		vec![
 			Arc::new(tenant_id.finish()),
 			Arc::new(key_identity.finish()),
+			Arc::new(routing_locality.finish()),
 			Arc::new(hlc_phys.finish()),
 			Arc::new(hlc_log.finish()),
 			Arc::new(hlc_node.finish()),
@@ -6012,28 +7325,33 @@ fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "key_identity col type"))?;
-		let phys_col: &UInt64Array = batch
+		let locality_col: &UInt64Array = batch
 			.column(2)
+			.as_any()
+			.downcast_ref()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "routing_locality col type"))?;
+		let phys_col: &UInt64Array = batch
+			.column(3)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_physical_ms col type"))?;
 		let log_col: &UInt32Array = batch
-			.column(3)
+			.column(4)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_logical col type"))?;
 		let node_col: &UInt32Array = batch
-			.column(4)
+			.column(5)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "hlc_node_id col type"))?;
 		let hash_col: &FixedSizeBinaryArray = batch
-			.column(5)
+			.column(6)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "payload_hash col type"))?;
 		let frame_col: &LargeBinaryArray = batch
-			.column(6)
+			.column(7)
 			.as_any()
 			.downcast_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "frame_bytes col type"))?;
@@ -6054,6 +7372,7 @@ fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord
 			out.push(MigrationRecord {
 				tenant_id: TenantId::new(tenant_col.value(i)),
 				key_identity: Identity::new(key_identity),
+				routing_locality: Locality::new(locality_col.value(i)),
 				hlc: HybridTimestamp {
 					physical_ms: phys_col.value(i),
 					logical: log_col.value(i),
@@ -6125,6 +7444,42 @@ fn query_error_meta(
 	}
 }
 
+fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta {
+	QueryRequestMeta {
+		min_hlc: meta.min_hlc,
+		expected_epoch: meta.expected_epoch,
+		tenant_id: meta.tenant_id,
+		consistency: meta.consistency,
+		_pad: [0; 7],
+		locality_range_start: 0,
+		locality_range_end: u64::MAX,
+		bytecode_len: meta.bytecode_len,
+		_pad2: [0; 4],
+		as_of_hlc: meta.as_of_hlc,
+	}
+}
+
+fn table_query_scan_ranges(
+	tenant_id: TenantId,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<Vec<QueryScanRange>, ReadStatus> {
+	match descriptor.locality_policy {
+		LocalityPolicyV1::TableSpreadProjection(spread) => {
+			let ranges = table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread)
+				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
+			Ok(ranges
+				.into_iter()
+				.map(|(start, end)| QueryScanRange { start, end })
+				.collect())
+		}
+		LocalityPolicyV1::IdentityProjection => Ok(vec![QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}]),
+		LocalityPolicyV1::ColumnProjection(_) => Err(ReadStatus::QUERY_INVALID_PROGRAM),
+	}
+}
+
 // ============================================================
 //  ERROR RESPONSE HELPERS
 // ============================================================
@@ -6146,6 +7501,318 @@ fn error_response(
 		has_finalization: 0,
 		_pad2: [0; 7],
 	}
+}
+
+fn table_write_response(
+	write: WriteResponseMeta,
+	reject_code: WpbcRejectCode,
+) -> TableWriteResponseMeta {
+	TableWriteResponseMeta {
+		write,
+		reject_code: reject_code.0,
+		_pad: [0; 6],
+	}
+}
+
+fn table_write_synthetic_meta(
+	meta: &TableWriteRequestMeta,
+	key_identity: Identity,
+	charged_bytes: u64,
+) -> WriteRequestMeta {
+	WriteRequestMeta {
+		write_id: meta.parent_write_id,
+		client_hlc: meta.client_hlc,
+		expected_epoch: meta.expected_epoch,
+		tenant_id: meta.tenant_id,
+		proxy_hop: meta.proxy_hop,
+		durability: meta.durability,
+		await_finalization: meta.await_finalization,
+		_pad1: [0; 5],
+		proxy_source: meta.proxy_source,
+		key_identity,
+		key_len: 0,
+		value_len: u32::try_from(charged_bytes).unwrap_or(u32::MAX),
+	}
+}
+
+fn table_write_status_for_reject(code: WpbcRejectCode) -> WriteStatus {
+	match code {
+		WpbcRejectCode::WPBC_REJECT_SCHEMA_STALE => WriteStatus::EPOCH_STALE,
+		WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE => WriteStatus::PAYLOAD_TOO_LARGE,
+		_ => WriteStatus::INTERNAL_ERROR,
+	}
+}
+
+fn table_replica_child_schema() -> Schema {
+	Schema::new(vec![
+		Field::new("child_ordinal", DataType::UInt64, false),
+		Field::new("key_identity", DataType::FixedSizeBinary(32), false),
+		Field::new("routing_locality", DataType::UInt64, false),
+		Field::new("payload_hash", DataType::FixedSizeBinary(32), false),
+		Field::new("charged_bytes", DataType::UInt64, false),
+		Field::new("frame", DataType::LargeBinary, false),
+	])
+}
+
+fn table_write_parent_identity(meta: &TableWriteRequestMeta) -> Identity {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"wendelon.table-write-parent.v1");
+	hasher.update(&meta.tenant_id.get().to_le_bytes());
+	hasher.update(meta.table_object_id.as_bytes());
+	hasher.update(bytemuck::bytes_of(&meta.parent_write_id));
+	hasher.update(&meta.schema_generation.to_le_bytes());
+	hasher.update(&(meta.decoded_row_count() as u64).to_le_bytes());
+	Identity::new(*hasher.finalize().as_bytes())
+}
+
+fn table_batch_payload_digest(children: &[BifurcatedTableChildWrite]) -> [u8; 32] {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"wendelon.table-batch-payload.v1");
+	hasher.update(&(children.len() as u64).to_le_bytes());
+	for child in children {
+		hasher.update(&child.child_ordinal.to_le_bytes());
+		hasher.update(child.key_identity.as_bytes());
+		hasher.update(&child.payload_hash);
+		hasher.update(&child.charged_bytes.to_le_bytes());
+	}
+	*hasher.finalize().as_bytes()
+}
+
+fn table_replica_payload_digest(children: &[TableReplicaChildPayload]) -> [u8; 32] {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"wendelon.table-batch-payload.v1");
+	hasher.update(&(children.len() as u64).to_le_bytes());
+	for child in children {
+		hasher.update(&child.child_ordinal.to_le_bytes());
+		hasher.update(child.key_identity.as_bytes());
+		hasher.update(&child.payload_hash);
+		hasher.update(&child.charged_bytes.to_le_bytes());
+	}
+	*hasher.finalize().as_bytes()
+}
+
+fn table_replica_meta(
+	meta: &TableWriteRequestMeta,
+	bifurcated: &BifurcatedTableWrite,
+	group_children: &[BifurcatedTableChildWrite],
+	commit_hlc: HybridTimestamp,
+) -> TableReplicaWriteMeta {
+	let group_charged_bytes = group_children
+		.iter()
+		.map(|child| child.charged_bytes)
+		.fold(0_u64, u64::saturating_add);
+	TableReplicaWriteMeta {
+		commit_hlc,
+		parent_write_id: meta.parent_write_id,
+		epoch: meta.expected_epoch,
+		tenant_id: meta.tenant_id,
+		table_object_id: meta.table_object_id,
+		charged_bytes: bifurcated.charged_bytes,
+		group_charged_bytes,
+		parent_key_identity: bifurcated.parent_key_identity,
+		payload_hash: bifurcated.payload_hash,
+		group_payload_hash: table_batch_payload_digest(group_children),
+		record_count: bifurcated.record_count,
+		group_record_count: u32::try_from(group_children.len()).unwrap_or(u32::MAX),
+		durability: meta.durability,
+		await_finalization: meta.await_finalization,
+		_pad: [0; 6],
+	}
+}
+
+fn encode_table_replica_children(
+	children: &[BifurcatedTableChildWrite],
+) -> std::io::Result<Vec<u8>> {
+	let mut child_ordinal = UInt64Builder::with_capacity(children.len());
+	let mut key_identity = FixedSizeBinaryBuilder::with_capacity(children.len(), 32);
+	let mut routing_locality = UInt64Builder::with_capacity(children.len());
+	let mut payload_hash = FixedSizeBinaryBuilder::with_capacity(children.len(), 32);
+	let mut charged_bytes = UInt64Builder::with_capacity(children.len());
+	let mut frame = LargeBinaryBuilder::new();
+
+	for child in children {
+		child_ordinal.append_value(child.child_ordinal);
+		key_identity
+			.append_value(child.key_identity.as_bytes())
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("identity append: {e}")))?;
+		routing_locality.append_value(child.locality.get());
+		payload_hash
+			.append_value(child.payload_hash)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("payload hash append: {e}")))?;
+		charged_bytes.append_value(child.charged_bytes);
+		frame.append_value(child.frame_bytes.as_slice());
+	}
+
+	let schema = Arc::new(table_replica_child_schema());
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(child_ordinal.finish()),
+			Arc::new(key_identity.finish()),
+			Arc::new(routing_locality.finish()),
+			Arc::new(payload_hash.finish()),
+			Arc::new(charged_bytes.finish()),
+			Arc::new(frame.finish()),
+		],
+	)
+	.map_err(|e| Error::new(ErrorKind::InvalidData, format!("table replica batch: {e}")))?;
+	encode_batch(&batch)
+}
+
+fn fixed_32_value(
+	array: &FixedSizeBinaryArray,
+	row: usize,
+	label: &str,
+) -> std::io::Result<[u8; 32]> {
+	let value = array.value(row);
+	if value.len() != 32 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("{label} width mismatch: expected=32 actual={}", value.len()),
+		));
+	}
+	let mut out = [0_u8; 32];
+	out.copy_from_slice(value);
+	Ok(out)
+}
+
+fn decode_table_replica_children(bytes: &[u8]) -> std::io::Result<Vec<TableReplicaChildPayload>> {
+	let batch = decode_batch(bytes)?;
+	if batch.schema().as_ref() != &table_replica_child_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_REPLICATE_REQ payload schema mismatch",
+		));
+	}
+	let child_ordinal = batch
+		.column_by_name("child_ordinal")
+		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing child_ordinal column"))?;
+	let key_identity = batch
+		.column_by_name("key_identity")
+		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing key_identity column"))?;
+	let routing_locality = batch
+		.column_by_name("routing_locality")
+		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing routing_locality column"))?;
+	let payload_hash = batch
+		.column_by_name("payload_hash")
+		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing payload_hash column"))?;
+	let charged_bytes = batch
+		.column_by_name("charged_bytes")
+		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing charged_bytes column"))?;
+	let frame = batch
+		.column_by_name("frame")
+		.and_then(|array| array.as_any().downcast_ref::<LargeBinaryArray>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing frame column"))?;
+
+	let mut children = Vec::with_capacity(batch.num_rows());
+	for row in 0..batch.num_rows() {
+		children.push(TableReplicaChildPayload {
+			child_ordinal: child_ordinal.value(row),
+			key_identity: Identity::new(fixed_32_value(key_identity, row, "key_identity")?),
+			locality: Locality::new(routing_locality.value(row)),
+			payload_hash: fixed_32_value(payload_hash, row, "payload_hash")?,
+			charged_bytes: charged_bytes.value(row),
+			frame_bytes: Arc::new(frame.value(row).to_vec()),
+		});
+	}
+	Ok(children)
+}
+
+fn validate_table_replica_payload(
+	meta: &TableReplicaWriteMeta,
+	children: &[TableReplicaChildPayload],
+) -> std::io::Result<()> {
+	if children.is_empty() || children.len() != meta.group_record_count as usize {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"table replica group_record_count mismatch: meta={} actual={}",
+				meta.group_record_count,
+				children.len()
+			),
+		));
+	}
+	let charged_bytes = children
+		.iter()
+		.map(|child| child.charged_bytes)
+		.fold(0_u64, u64::saturating_add);
+	if charged_bytes != meta.group_charged_bytes {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"table replica group_charged_bytes mismatch: meta={} actual={charged_bytes}",
+				meta.group_charged_bytes
+			),
+		));
+	}
+	for child in children {
+		let actual_len = child.frame_bytes.len() as u64;
+		if child.charged_bytes != actual_len {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"table child charged_bytes mismatch: meta={} actual={actual_len}",
+					child.charged_bytes
+				),
+			));
+		}
+		if payload_digest(child.frame_bytes.as_slice()) != child.payload_hash {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"table child payload hash mismatch",
+			));
+		}
+	}
+	if table_replica_payload_digest(children) != meta.group_payload_hash {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"table replica group payload hash mismatch",
+		));
+	}
+	Ok(())
+}
+
+async fn append_bifurcated_table_children_durable(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	commit_hlc: HybridTimestamp,
+	children: &[BifurcatedTableChildWrite],
+) -> std::io::Result<()> {
+	for child in children {
+		slab.append_durable_with_locality(
+			tenant_id,
+			child.key_identity,
+			child.locality,
+			commit_hlc,
+			child.frame_bytes.as_slice(),
+		)
+		.await?;
+	}
+	Ok(())
+}
+
+async fn append_table_children_durable(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	commit_hlc: HybridTimestamp,
+	children: &[TableReplicaChildPayload],
+) -> std::io::Result<()> {
+	for child in children {
+		slab.append_durable_with_locality(
+			tenant_id,
+			child.key_identity,
+			child.locality,
+			commit_hlc,
+			child.frame_bytes.as_slice(),
+		)
+		.await?;
+	}
+	Ok(())
 }
 
 fn error_read_response(
@@ -6273,6 +7940,48 @@ fn bifurcate_client_write(
 	})
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn bifurcate_table_write(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
+	let admission = validate_table_write_request_batch(meta, batch, descriptor)?;
+	let mut children = Vec::with_capacity(batch.num_rows());
+	let mut charged_bytes = 0_u64;
+	for row in 0..batch.num_rows() {
+		let row_batch = batch.slice(row, 1);
+		let frame_bytes =
+			Arc::new(
+				encode_batch(&row_batch).map_err(|err| TableWriteValidationError {
+					code: WpbcRejectCode::WPBC_REJECT_COLUMN_TYPE_MISMATCH,
+					message: format!("failed to encode single-row table payload: {err}"),
+				})?,
+			);
+		let child_charged_bytes = frame_bytes.len() as u64;
+		charged_bytes = charged_bytes.saturating_add(child_charged_bytes);
+		children.push(BifurcatedTableChildWrite {
+			child_ordinal: meta.child_ordinal_base.saturating_add(row as u64),
+			key_identity: admission.key_identities[row],
+			locality: admission.localities[row],
+			payload_hash: payload_digest(frame_bytes.as_slice()),
+			charged_bytes: child_charged_bytes,
+			frame_bytes,
+		});
+	}
+	let payload_hash = table_batch_payload_digest(&children);
+	Ok(BifurcatedTableWrite {
+		parent_key_identity: table_write_parent_identity(meta),
+		payload_hash,
+		children,
+		charged_bytes,
+		record_count: u32::try_from(batch.num_rows()).map_err(|_| TableWriteValidationError {
+			code: WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE,
+			message: "table write row count exceeds u32".to_string(),
+		})?,
+	})
+}
+
 /// Read the first value of a named `LargeBinary` column from a
 /// single-row RecordBatch. Both `write_payload_schema` and
 /// `read_key_schema` are single-row / LargeBinary-shaped, so this
@@ -6382,19 +8091,117 @@ fn format_bytes_hex(bytes: &[u8]) -> String {
 mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
+	use crate::integration::compute::{
+		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
+		SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
+		encode_schema_update_envelope_v1,
+	};
 	use crate::schema::wpbc::{
 		OP_AND, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_PROJECT,
 		OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_RANGE_LOCALITY,
 		OP_ROUTE_BY_LOCALITY,
 	};
-	use crate::schema::write_payload_schema;
+	use crate::schema::{
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
+		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
+		table_spread_prefix_ranges, write_payload_schema,
+	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::manager::SlabManagerConfig;
+	use arrow::array::{Int64Array, LargeStringArray};
+	use arrow::datatypes::{DataType, Field};
 	use std::panic::AssertUnwindSafe;
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
+	}
+
+	fn typed_table_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("name", DataType::LargeUtf8, true),
+		])
+	}
+
+	fn typed_table_descriptor() -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x37; 16]),
+			3,
+			"analytics",
+			"events",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn typed_table_batch(ids: Vec<i64>) -> RecordBatch {
+		let names: Vec<&str> = ids
+			.iter()
+			.enumerate()
+			.map(|(idx, _)| match idx {
+				0 => "codex",
+				1 => "claude",
+				_ => "gemini",
+			})
+			.collect();
+		RecordBatch::try_new(
+			Arc::new(typed_table_schema()),
+			vec![
+				Arc::new(Int64Array::from(ids)),
+				Arc::new(LargeStringArray::from(names)),
+			],
+		)
+		.unwrap()
+	}
+
+	fn typed_table_meta(
+		descriptor: &TableSchemaDescriptorV1,
+		row_count: usize,
+	) -> TableWriteRequestMeta {
+		TableWriteRequestMeta {
+			parent_write_id: crate::schema::ClientWriteId {
+				client_uuid: [0x44; 16],
+				sequence_no: 55,
+				idempotency_ttl_ms: 30_000,
+				_pad: 0,
+			},
+			client_hlc: hlc(1, 0, 1),
+			expected_epoch: 1,
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			child_ordinal_base: 1_000,
+			proxy_source: n(0),
+			row_count: encode_table_write_row_count(row_count).unwrap(),
+			proxy_hop: 0,
+			durability: DurabilityLevel::QUORUM,
+			await_finalization: 0,
+			_pad: [0; 3],
+		}
+	}
+
+	fn typed_table_schema_update(descriptor: &TableSchemaDescriptorV1) -> Vec<u8> {
+		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: tenant(),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Table,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.table_name.clone(),
+			},
+			expected_generation: SchemaGeneration::ZERO,
+			requested_generation: SchemaGeneration::new(descriptor.schema_generation),
+			intent_id: SchemaIntentId::new([0x37; 16]),
+			mutation: SchemaMutationKindV1::Create,
+			payload,
+		};
+		encode_schema_update_envelope_v1(&envelope).unwrap()
 	}
 
 	fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -6434,6 +8241,7 @@ mod tests {
 			tenant_id: TenantId::ZERO,
 			key_identity: Identity::blake3_tenant(TenantId::ZERO, b"claim-key"),
 			charged_bytes: 128,
+			record_count: 1,
 		};
 		let id = PendingFinalizationId::for_record(write_id, &finalization);
 
@@ -7240,12 +9048,18 @@ mod tests {
 		))
 		.await
 		.unwrap();
-		// Force the cache empty so the gate can't find a lease.
+		// Stop background renewal before forcing the cache empty; under
+		// parallel test runners the lease manager can otherwise repopulate
+		// the cache between clear() and the write under test.
+		node.handles.lease_manager.abort();
+		tokio::task::yield_now().await;
 		node.data_server.lease_cache().write().unwrap().clear();
 
+		let mut meta = simple_write_meta(1);
+		meta.client_hlc = hlc(u64::MAX / 4, 0, node.local_node.id);
 		let (resp, _) = node
 			.data_server
-			.write(simple_write_meta(1), single_kv_batch())
+			.write(meta, single_kv_batch())
 			.await
 			.unwrap();
 		assert_eq!(resp.status, WriteStatus::LEASE_EXPIRED);
@@ -7416,6 +9230,586 @@ mod tests {
 		meta.key_identity = Identity::blake3_tenant(tenant(), b"wrong-key");
 		let err = bifurcate_client_write(&meta, &single_kv_batch()).unwrap_err();
 		assert!(err.to_string().contains("key_identity mismatch"));
+	}
+
+	#[test]
+	fn table_bifurcation_splits_rows_into_independent_arrow_frames() {
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![7, 8]);
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+
+		assert_eq!(bifurcated.children.len(), 2);
+		assert_eq!(
+			bifurcated.charged_bytes,
+			bifurcated
+				.children
+				.iter()
+				.map(|child| child.charged_bytes)
+				.sum::<u64>()
+		);
+		assert_ne!(
+			bifurcated.children[0].key_identity,
+			bifurcated.children[1].key_identity
+		);
+		assert_eq!(bifurcated.children[0].child_ordinal, 1_000);
+		assert_eq!(bifurcated.children[1].child_ordinal, 1_001);
+		let ranges = table_spread_prefix_ranges(
+			meta.tenant_id,
+			meta.table_object_id,
+			match descriptor.locality_policy {
+				LocalityPolicyV1::TableSpreadProjection(spread) => spread,
+				_ => unreachable!(),
+			},
+		)
+		.unwrap();
+
+		for (idx, child) in bifurcated.children.iter().enumerate() {
+			assert!(
+				ranges
+					.iter()
+					.any(|(start, end)| start.get() <= child.locality.get()
+						&& child.locality.get() <= end.get())
+			);
+			assert_eq!(
+				child.payload_hash,
+				payload_digest(child.frame_bytes.as_slice())
+			);
+			let row = decode_batch(child.frame_bytes.as_slice()).unwrap();
+			assert_eq!(row.num_rows(), 1);
+			assert_eq!(row.schema().as_ref(), &typed_table_schema());
+			let ids = row
+				.column_by_name("id")
+				.unwrap()
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap();
+			assert_eq!(ids.value(0), if idx == 0 { 7 } else { 8 });
+		}
+	}
+
+	#[test]
+	fn table_bifurcation_rejects_duplicate_pk_before_encoding_children() {
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![7, 7]);
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let err = bifurcate_table_write(&meta, &batch, &descriptor).unwrap_err();
+		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_DUPLICATE_PK_IN_BATCH);
+	}
+
+	#[tokio::test]
+	async fn table_write_single_row_commits_typed_arrow_payload() {
+		let dir = bootstrap_tempdir("table-write-single-row");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			37,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7]);
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert!(trailing.is_none());
+
+		let key_identity =
+			table_row_identity(tenant(), descriptor.table_object_id, &7_i64.to_le_bytes());
+		let location = node
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("table row should be indexed by PK-derived identity");
+		let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
+		assert_eq!(stored.schema().as_ref(), &typed_table_schema());
+		assert_eq!(stored.num_rows(), 1);
+		let ids = stored
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.value(0), 7);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_rejects_stale_schema_generation_distinct_from_unknown() {
+		let dir = bootstrap_tempdir("table-write-stale-schema");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			40,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		for (sequence_no, schema_generation) in [
+			(58_u64, descriptor.schema_generation - 1),
+			(59_u64, descriptor.schema_generation + 1),
+		] {
+			let batch = typed_table_batch(vec![7]);
+			let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+			meta.parent_write_id.sequence_no = sequence_no;
+			meta.schema_generation = schema_generation;
+			let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+			assert_eq!(resp.write.status, WriteStatus::EPOCH_STALE);
+			assert_eq!(resp.reject_code, WpbcRejectCode::WPBC_REJECT_SCHEMA_STALE.0);
+			assert!(trailing.is_none());
+		}
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_multi_row_commits_one_parent_finalization() {
+		let dir = bootstrap_tempdir("table-write-multi-row");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			38,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7, 8]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 56;
+		meta.await_finalization = 1;
+		let expected_bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		let (resp, trailing) = node
+			.data_server
+			.table_write(meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert_eq!(resp.write.has_finalization, 1);
+		assert!(trailing.is_some());
+
+		let expected_finalization = TenantFinalization {
+			marker: FinalizationMarker {
+				log_index: 0,
+				term: 0,
+				epoch: meta.expected_epoch,
+				commit_hlc: resp.write.commit_hlc,
+				payload_hash: expected_bifurcated.payload_hash,
+				e_safe_index: 0,
+				durability: meta.durability,
+				_pad: [0; 7],
+			},
+			tenant_id: meta.tenant_id,
+			key_identity: expected_bifurcated.parent_key_identity,
+			charged_bytes: expected_bifurcated.charged_bytes,
+			record_count: 2,
+		};
+		assert!(
+			node.log_store
+				.find_applied_finalization(&expected_finalization, resp.write.log_index)
+				.await
+				.unwrap()
+				.is_some(),
+			"expected one aggregate finalization for the parent table write"
+		);
+
+		for id_value in [7_i64, 8_i64] {
+			let key_identity = table_row_identity(
+				tenant(),
+				descriptor.table_object_id,
+				&id_value.to_le_bytes(),
+			);
+			let location = node
+				.slab
+				.lookup(tenant(), key_identity)
+				.expect("table row should be indexed by PK-derived identity");
+			let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
+			assert_eq!(stored.schema().as_ref(), &typed_table_schema());
+			assert_eq!(stored.num_rows(), 1);
+			let ids = stored
+				.column_by_name("id")
+				.unwrap()
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap();
+			assert_eq!(ids.value(0), id_value);
+		}
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_query_dispatch_rebatches_split_rows_before_wpbc() {
+		let dir = bootstrap_tempdir("table-query-rebatch");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			39,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7, 8]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 57;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch)
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&8_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let query_meta = TableQueryRequestMeta {
+			min_hlc: hlc(0, 0, 0),
+			expected_epoch: 1,
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			consistency: Consistency::SERIALIZABLE,
+			_pad: [0; 7],
+			bytecode_len: bytecode.len() as u32,
+			_pad2: [0; 4],
+			as_of_hlc: hlc(0, 0, 0),
+		};
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&query_meta));
+		let mut trailing = node.pool.acquire();
+		trailing.as_mut_vec().extend_from_slice(&bytecode);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_REQ.0,
+				flags: 0,
+				stream_id: 39,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.len() as u32,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: Some(trailing),
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::TABLE_QUERY_RESP.0);
+		let meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(meta.status, ReadStatus::OK, "got meta={meta:?}");
+		assert_eq!(meta.rows, 1);
+		let result = decode_batch(resp.arrow_payload.as_ref().expect("query result batch"))
+			.expect("query result decodes");
+		assert_eq!(result.num_rows(), 1);
+		let ids = result
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.value(0), 8);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_fans_out_child_groups_to_distinct_replica_sets() {
+		let leader_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			40,
+			bootstrap_tempdir("table-fanout-leader"),
+			"loopback://40".into(),
+		))
+		.await
+		.unwrap();
+		let durable_a_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			41,
+			bootstrap_tempdir("table-fanout-a"),
+			"loopback://41".into(),
+		))
+		.await
+		.unwrap();
+		let durable_b_node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			42,
+			bootstrap_tempdir("table-fanout-b"),
+			"loopback://42".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if leader_node.raft.current_leader().await == Some(leader_node.local_node.id)
+				&& durable_a_node.raft.current_leader().await == Some(durable_a_node.local_node.id)
+				&& durable_b_node.raft.current_leader().await == Some(durable_b_node.local_node.id)
+			{
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leaders"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		let descriptor = typed_table_descriptor();
+		leader_node
+			.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let batch = typed_table_batch(vec![7, 8]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 58;
+		let expected = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		assert_eq!(expected.children.len(), 2);
+
+		let pool = leader_node.pool.clone();
+		let handlers = LoopbackHandlers::new(pool.clone());
+		let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
+			handlers: handlers.clone(),
+			tier: TransportTier::QuicIoUring,
+		});
+		let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = StdHashMap::new();
+		for (node_id, address) in [
+			(leader_node.local_node, "loopback://40"),
+			(durable_a_node.local_node, "loopback://41"),
+			(durable_b_node.local_node, "loopback://42"),
+		] {
+			peers.insert(
+				node_id,
+				PeerCapabilities {
+					address: address.into(),
+					tiers,
+					roles,
+				},
+			);
+		}
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let build_factory = || {
+			let mut providers: StdHashMap<TransportTier, Arc<dyn TransportProvider>> =
+				StdHashMap::new();
+			providers.insert(TransportTier::QuicIoUring, loopback_provider.clone());
+			TransportProviderFactory::new(tiers, providers, resolver.clone(), epoch_rx.clone())
+		};
+		let router: Arc<dyn ReplicaRouter> = Arc::new(
+			FixedReplicaRouter::new(vec![leader_node.local_node])
+				.with_route(
+					expected.children[0].locality,
+					vec![leader_node.local_node, durable_a_node.local_node],
+				)
+				.with_route(
+					expected.children[1].locality,
+					vec![durable_b_node.local_node],
+				),
+		);
+
+		let leader = Arc::new(
+			WendelonDataServer::new(
+				leader_node.slab.clone(),
+				leader_node.raft.clone(),
+				leader_node.log_store.clone(),
+				leader_node.state_machine.clone(),
+				leader_node.local_node,
+				leader_node.clock.clone(),
+				router.clone(),
+				build_factory(),
+				pool.clone(),
+			)
+			.unwrap(),
+		);
+		let durable_a = Arc::new(
+			WendelonDataServer::new(
+				durable_a_node.slab.clone(),
+				durable_a_node.raft.clone(),
+				durable_a_node.log_store.clone(),
+				durable_a_node.state_machine.clone(),
+				durable_a_node.local_node,
+				durable_a_node.clock.clone(),
+				router.clone(),
+				build_factory(),
+				durable_a_node.pool.clone(),
+			)
+			.unwrap(),
+		);
+		let durable_b = Arc::new(
+			WendelonDataServer::new(
+				durable_b_node.slab.clone(),
+				durable_b_node.raft.clone(),
+				durable_b_node.log_store.clone(),
+				durable_b_node.state_machine.clone(),
+				durable_b_node.local_node,
+				durable_b_node.clock.clone(),
+				router,
+				build_factory(),
+				durable_b_node.pool.clone(),
+			)
+			.unwrap(),
+		);
+		handlers.register(
+			durable_a_node.local_node,
+			Arc::new(
+				MsgRouter::builder()
+					.with_data_ring(durable_a.clone())
+					.build(),
+			),
+		);
+		handlers.register(
+			durable_b_node.local_node,
+			Arc::new(
+				MsgRouter::builder()
+					.with_data_ring(durable_b.clone())
+					.build(),
+			),
+		);
+
+		let (resp, _) = leader.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+
+		assert!(
+			leader_node
+				.slab
+				.lookup(tenant(), expected.children[0].key_identity)
+				.is_some(),
+			"leader should store the first child group where it is a replica"
+		);
+		assert!(
+			durable_a_node
+				.slab
+				.lookup(tenant(), expected.children[0].key_identity)
+				.is_some(),
+			"durable_a should receive the first child group"
+		);
+		assert!(
+			durable_b_node
+				.slab
+				.lookup(tenant(), expected.children[1].key_identity)
+				.is_some(),
+			"durable_b should receive the remote-only child group"
+		);
+		assert!(
+			leader_node
+				.slab
+				.lookup(tenant(), expected.children[1].key_identity)
+				.is_none(),
+			"leader must not locally append a child for a replica set it is not in"
+		);
+
+		leader_node.handles.abort();
+		durable_a_node.handles.abort();
+		durable_b_node.handles.abort();
 	}
 
 	#[test]
@@ -7838,6 +10232,7 @@ mod tests {
 				tenant_id: tenant(),
 				key_identity: id(9001),
 				charged_bytes: 512,
+				record_count: 1,
 			},
 		);
 		fx.follower
@@ -7920,6 +10315,7 @@ mod tests {
 				tenant_id: meta.tenant_id,
 				key_identity: meta.key_identity,
 				charged_bytes: bifurcated.charged_bytes,
+				record_count: 1,
 			},
 		);
 		fx.follower
@@ -8273,7 +10669,7 @@ mod tests {
 				break;
 			}
 			let take = locations.len().min(max_records);
-			for (_tenant_id, h, loc) in locations.iter().take(take) {
+			for (_tenant_id, h, _routing_locality, loc) in locations.iter().take(take) {
 				assert_eq!(*h, id(key));
 				collected.push(loc.hlc);
 			}
@@ -8281,7 +10677,7 @@ mod tests {
 			if !truncated {
 				break;
 			}
-			let (_last_tenant_id, last_h, last_loc) = locations[take - 1];
+			let (_last_tenant_id, last_h, _last_routing_locality, last_loc) = locations[take - 1];
 			cursor_identity = last_h;
 			cursor_hlc = last_loc.hlc;
 		}
@@ -8330,12 +10726,20 @@ mod tests {
 		// the same `append_migration` path the real loop uses.
 		let hits = source_full.scan_all_versions(key, key, floor);
 		assert_eq!(hits.len(), 1);
-		let (tenant_id, h, loc) = hits[0];
+		let (tenant_id, h, routing_locality, loc) = hits[0];
 		assert_eq!(tenant_id, tenant());
 		let frame = source_full.read(loc).await.unwrap();
 		let payload_hash = payload_digest(&frame);
 		destination
-			.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
+			.append_migration_with_locality(
+				1,
+				tenant_id,
+				h,
+				routing_locality,
+				loc.hlc,
+				payload_hash,
+				&frame,
+			)
 			.await
 			.unwrap();
 
@@ -8374,11 +10778,19 @@ mod tests {
 		// network. Every record goes through `append_migration`, the
 		// idempotent ingest boundary — so a rerun would be a no-op.
 		let pulled = source.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
-		for (tenant_id, h, loc) in pulled {
+		for (tenant_id, h, routing_locality, loc) in pulled {
 			let frame = source.read(loc).await.unwrap();
 			let payload_hash = payload_digest(&frame);
 			destination
-				.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
+				.append_migration_with_locality(
+					1,
+					tenant_id,
+					h,
+					routing_locality,
+					loc.hlc,
+					payload_hash,
+					&frame,
+				)
 				.await
 				.unwrap();
 		}
@@ -8429,11 +10841,19 @@ mod tests {
 		// *every* candidate in source_replicas, not just the first.
 		for src in [&source_a, &source_b] {
 			let rows = src.scan_all_versions_from(0, 99, floor, Identity::ZERO, floor);
-			for (tenant_id, h, loc) in rows {
+			for (tenant_id, h, routing_locality, loc) in rows {
 				let frame = src.read(loc).await.unwrap();
 				let payload_hash = payload_digest(&frame);
 				destination
-					.append_migration(1, tenant_id, h, loc.hlc, payload_hash, &frame)
+					.append_migration_with_locality(
+						1,
+						tenant_id,
+						h,
+						routing_locality,
+						loc.hlc,
+						payload_hash,
+						&frame,
+					)
 					.await
 					.unwrap();
 			}
@@ -8690,6 +11110,7 @@ mod tests {
 			(
 				tenant(),
 				id(7),
+				Locality::new(70),
 				crate::storage::core::RecordLocation {
 					slab_id: SlabId::ZERO,
 					offset: 0,
@@ -8701,6 +11122,7 @@ mod tests {
 			(
 				tenant(),
 				id(42),
+				Locality::new(420),
 				crate::storage::core::RecordLocation {
 					slab_id: SlabId::ZERO,
 					offset: 0,
@@ -8714,10 +11136,12 @@ mod tests {
 		let decoded = decode_migration_records(&bytes).unwrap();
 		assert_eq!(decoded.len(), 2);
 		assert_eq!(decoded[0].key_identity, id(7));
+		assert_eq!(decoded[0].routing_locality, Locality::new(70));
 		assert_eq!(decoded[0].hlc, hlc(10, 2, 3));
 		assert_eq!(decoded[0].frame_bytes, b"frame-one");
 		assert_eq!(decoded[0].payload_hash, payload_digest(b"frame-one"));
 		assert_eq!(decoded[1].key_identity, id(42));
+		assert_eq!(decoded[1].routing_locality, Locality::new(420));
 		assert_eq!(decoded[1].frame_bytes, b"frame-two");
 	}
 

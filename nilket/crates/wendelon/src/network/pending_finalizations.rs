@@ -429,6 +429,7 @@ mod tests {
 				tenant_id: TenantId::new(11),
 				key_identity: Identity::blake3_tenant(TenantId::new(11), b"pending-key"),
 				charged_bytes: 8192,
+				record_count: 1,
 			},
 		)
 	}
@@ -507,6 +508,7 @@ mod tests {
 				tenant_id: TenantId::new(11),
 				key_identity: Identity::blake3_tenant(TenantId::new(11), b"pending-key"),
 				charged_bytes: 16_384,
+				record_count: 1,
 			},
 		);
 

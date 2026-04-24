@@ -94,23 +94,6 @@ fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
 	.unwrap()
 }
 
-fn extract_single_kv(batch: &RecordBatch) -> (Vec<u8>, Vec<u8>) {
-	let keys: &LargeBinaryArray = batch
-		.column_by_name("key")
-		.unwrap()
-		.as_any()
-		.downcast_ref()
-		.unwrap();
-	let values: &LargeBinaryArray = batch
-		.column_by_name("value")
-		.unwrap()
-		.as_any()
-		.downcast_ref()
-		.unwrap();
-	assert_eq!(batch.num_rows(), 1, "test expects one stored row per batch");
-	(keys.value(0).to_vec(), values.value(0).to_vec())
-}
-
 fn key_locality(bytes: &[u8]) -> u64 {
 	Locality::from(Identity::blake3_tenant(tenant(), bytes)).get()
 }
@@ -165,16 +148,23 @@ async fn client_query_streams_multiple_batches_and_terminates() {
 	assert_eq!(query.rows, rows.len() as u64);
 
 	let mut streamed = Vec::new();
-	for _ in 0..rows.len() {
-		let batch = query
-			.next_batch()
-			.await
+	while let Some(batch) = query.next_batch().await.unwrap() {
+		let keys: &LargeBinaryArray = batch
+			.column_by_name("key")
 			.unwrap()
-			.expect("stream ended before all batches arrived");
-		streamed.push(extract_single_kv(&batch));
+			.as_any()
+			.downcast_ref()
+			.unwrap();
+		let values: &LargeBinaryArray = batch
+			.column_by_name("value")
+			.unwrap()
+			.as_any()
+			.downcast_ref()
+			.unwrap();
+		for i in 0..batch.num_rows() {
+			streamed.push((keys.value(i).to_vec(), values.value(i).to_vec()));
+		}
 	}
-	assert!(query.next_batch().await.unwrap().is_none());
-	assert!(query.next_batch().await.unwrap().is_none());
 
 	let mut expected = rows.clone();
 	expected.sort_by_key(|(key, _)| key_locality(key));

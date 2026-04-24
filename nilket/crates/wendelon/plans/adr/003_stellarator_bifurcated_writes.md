@@ -21,7 +21,7 @@ Those details are not implementation trivia. They are the correctness contract o
 Wendelon keeps the bifurcated write architecture, but the contract is now explicit.
 
 1. **Bulk payloads never enter the global Raft WAL.**
-   Payload bytes are replicated through the data path. Raft only carries the control-plane records required to finalize visibility and sequencing.
+   Payload bytes are replicated through the data path. Raft only carries the coordination records required to finalize visibility and sequencing.
 
 2. **Pending-finalization intent is mandatory for any recoverable branch.**
    Before Wendelon may return a success state that implies recoverability after crash, the leader must durably persist a pending-finalization intent locally. There is no best-effort recovery branch.

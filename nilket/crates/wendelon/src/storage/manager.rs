@@ -309,6 +309,10 @@ pub struct SlabManager {
 	/// inside the requested window, instead of filtering every key in
 	/// the tenant-wide `key_index`.
 	locality_index: RwLock<TenantLocalityMembers>,
+	/// Routing locality for each key. Legacy KV keys default to
+	/// `Locality::from(key_identity)`; typed table rows can pin a
+	/// table-scoped projection computed at ingest.
+	key_localities: DashMap<TenantKey, Locality>,
 	/// Best-effort compatibility map for in-flight readers that
 	/// raced a compaction rewrite. New lookups pivot to the fresh
 	/// location through `key_index`; a stale snapshot of the prior
@@ -391,11 +395,26 @@ impl SlabManager {
 		key_identity: Identity,
 		location: RecordLocation,
 	) {
+		self.index_appended_location_with_locality(
+			tenant_id,
+			key_identity,
+			Locality::from(key_identity),
+			location,
+		);
+	}
+
+	fn index_appended_location_with_locality(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		routing_locality: Locality,
+		location: RecordLocation,
+	) {
 		self.key_index
 			.entry((tenant_id, key_identity))
 			.and_modify(|versions| insert_version_sorted(versions, location))
 			.or_insert_with(|| vec![location]);
-		self.insert_locality_membership(tenant_id, key_identity);
+		self.insert_locality_membership_with_locality(tenant_id, key_identity, routing_locality);
 	}
 
 	fn rollback_indexed_location(
@@ -417,17 +436,65 @@ impl SlabManager {
 		}
 	}
 
-	fn insert_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
-		recover_rwlock_write(&self.locality_index, "locality_index")
+	fn routing_locality_for_key(&self, tenant_id: TenantId, key_identity: Identity) -> Locality {
+		self.key_localities
+			.get(&(tenant_id, key_identity))
+			.map(|entry| *entry.value())
+			.unwrap_or_else(|| Locality::from(key_identity))
+	}
+
+	fn routing_locality_for_identity_any_tenant(&self, key_identity: Identity) -> Locality {
+		// Migration cursors carry identity + HLC, while the scan
+		// order is locality + identity + HLC. Resolve the current
+		// routing locality for table-spread rows before resuming.
+		self.key_localities
+			.iter()
+			.find_map(|entry| (entry.key().1 == key_identity).then_some(*entry.value()))
+			.unwrap_or_else(|| Locality::from(key_identity))
+	}
+
+	fn persistent_record_row(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) -> PersistentRecordRow {
+		PersistentRecordRow {
+			tenant_id,
+			key_identity,
+			routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
+			location,
+		}
+	}
+
+	fn insert_locality_membership_with_locality(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		routing_locality: Locality,
+	) {
+		let previous = self
+			.key_localities
+			.insert((tenant_id, key_identity), routing_locality);
+		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
+		if let Some(previous_locality) = previous {
+			if previous_locality != routing_locality {
+				if let Some(members) = locality_index.get_mut(&tenant_id) {
+					members.remove(&(previous_locality, key_identity));
+				}
+			}
+		}
+		locality_index
 			.entry(tenant_id)
 			.or_default()
-			.insert((Locality::from(key_identity), key_identity));
+			.insert((routing_locality, key_identity));
 	}
 
 	fn remove_locality_membership(&self, tenant_id: TenantId, key_identity: Identity) {
 		let mut locality_index = recover_rwlock_write(&self.locality_index, "locality_index");
+		let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
 		let should_remove_tenant = if let Some(members) = locality_index.get_mut(&tenant_id) {
-			members.remove(&(Locality::from(key_identity), key_identity));
+			members.remove(&(routing_locality, key_identity));
 			members.is_empty()
 		} else {
 			false
@@ -435,6 +502,7 @@ impl SlabManager {
 		if should_remove_tenant {
 			locality_index.remove(&tenant_id);
 		}
+		self.key_localities.remove(&(tenant_id, key_identity));
 	}
 
 	/// Append a record and force the destination slab's durability
@@ -450,6 +518,28 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
+		self.append_durable_with_locality(
+			tenant_id,
+			key_identity,
+			Locality::from(key_identity),
+			hlc,
+			frame,
+		)
+		.await
+	}
+
+	/// Append a record whose routing locality is not the identity
+	/// projection. Typed table writes use this to place row-keyed
+	/// records on table-scoped arcs while preserving `key_identity`
+	/// for MVCC and point reads.
+	pub async fn append_durable_with_locality(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		routing_locality: Locality,
+		hlc: HybridTimestamp,
+		frame: &[u8],
+	) -> std::io::Result<RecordLocation> {
 		let (slab, location) = self
 			.append_on_target(tenant_id, key_identity, hlc, frame)
 			.await?;
@@ -459,14 +549,19 @@ impl SlabManager {
 			return Err(err);
 		}
 		if let Err(err) = self
-			.persist_record_row_strict(tenant_id, key_identity, location)
+			.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
 			.await
 		{
 			slab.rollback_index_entry(tenant_id, key_identity, location);
 			self.rollback_indexed_location(tenant_id, key_identity, location);
 			return Err(err);
 		}
-		self.index_appended_location(tenant_id, key_identity, location);
+		self.index_appended_location_with_locality(
+			tenant_id,
+			key_identity,
+			routing_locality,
+			location,
+		);
 		Ok(location)
 	}
 
@@ -594,6 +689,7 @@ impl SlabManager {
 			(active, active_id.saturating_add(1))
 		};
 
+		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let persistent_index =
 			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
 				Ok(index) => Some(Arc::new(index)),
@@ -617,7 +713,13 @@ impl SlabManager {
 							.entry((row.tenant_id, row.key_identity))
 							.and_modify(|versions| insert_version_sorted(versions, row.location))
 							.or_insert_with(|| vec![row.location]);
+						persistent_key_localities.push((
+							row.tenant_id,
+							row.key_identity,
+							row.routing_locality,
+						));
 					}
+					persistent_key_localities.extend(snapshot.record_localities);
 				}
 				Err(err) => {
 					tracing::warn!(
@@ -628,7 +730,13 @@ impl SlabManager {
 				}
 			}
 		}
-		let locality_index = build_locality_index(&key_index);
+		let key_localities = build_key_localities(&key_index);
+		for (tenant_id, key_identity, locality) in persistent_key_localities {
+			if key_index.contains_key(&(tenant_id, key_identity)) {
+				key_localities.insert((tenant_id, key_identity), locality);
+			}
+		}
+		let locality_index = build_locality_index(&key_localities);
 
 		let manager = Self {
 			config,
@@ -644,6 +752,7 @@ impl SlabManager {
 			}),
 			key_index,
 			locality_index: RwLock::new(locality_index),
+			key_localities,
 			relocated_reads: DashMap::new(),
 			persistent_index,
 			retired_tiered_cleanup: DashMap::new(),
@@ -1243,10 +1352,15 @@ impl SlabManager {
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
 	) -> Vec<(u64, RecordLocation)> {
-		self.scan_as_of_with_identity(tenant_id, start_locality, end_locality, as_of_hlc)
-			.into_iter()
-			.map(|(key_identity, loc)| (Locality::from(key_identity).get(), loc))
-			.collect()
+		self.scan_as_of_with_identity_and_locality(
+			tenant_id,
+			start_locality,
+			end_locality,
+			as_of_hlc,
+		)
+		.into_iter()
+		.map(|(_key_identity, locality, loc)| (locality.get(), loc))
+		.collect()
 	}
 
 	/// Variant of [`Self::scan_as_of`] that preserves the full
@@ -1261,6 +1375,27 @@ impl SlabManager {
 		end_locality: impl Into<Locality>,
 		as_of_hlc: HybridTimestamp,
 	) -> Vec<(Identity, RecordLocation)> {
+		self.scan_as_of_with_identity_and_locality(
+			tenant_id,
+			start_locality,
+			end_locality,
+			as_of_hlc,
+		)
+		.into_iter()
+		.map(|(key_identity, _locality, location)| (key_identity, location))
+		.collect()
+	}
+
+	/// Scan variant that also returns the routing locality used for
+	/// range membership. This differs from `Locality::from(identity)`
+	/// for typed table rows placed via `TableSpreadProjection`.
+	pub fn scan_as_of_with_identity_and_locality(
+		&self,
+		tenant_id: TenantId,
+		start_locality: impl Into<Locality>,
+		end_locality: impl Into<Locality>,
+		as_of_hlc: HybridTimestamp,
+	) -> Vec<(Identity, Locality, RecordLocation)> {
 		let start_locality = start_locality.into();
 		let end_locality = end_locality.into();
 		if start_locality > end_locality {
@@ -1274,7 +1409,12 @@ impl SlabManager {
 				continue;
 			};
 			if let Some(location) = newest_version_as_of(versions.value(), as_of_hlc) {
-				out.push((key_identity, location));
+				let locality = self
+					.key_localities
+					.get(&(tenant_id, key_identity))
+					.map(|entry| *entry.value())
+					.unwrap_or_else(|| Locality::from(key_identity));
+				out.push((key_identity, locality, location));
 			}
 		}
 		out
@@ -1296,7 +1436,7 @@ impl SlabManager {
 		start_locality: impl Into<Locality>,
 		end_locality: impl Into<Locality>,
 		migration_hlc_floor: HybridTimestamp,
-	) -> Vec<(TenantId, Identity, RecordLocation)> {
+	) -> Vec<(TenantId, Identity, Locality, RecordLocation)> {
 		self.scan_all_versions_from(
 			start_locality,
 			end_locality,
@@ -1326,7 +1466,7 @@ impl SlabManager {
 		migration_hlc_floor: HybridTimestamp,
 		cursor_identity: Identity,
 		cursor_hlc: HybridTimestamp,
-	) -> Vec<(TenantId, Identity, RecordLocation)> {
+	) -> Vec<(TenantId, Identity, Locality, RecordLocation)> {
 		let start_locality = start_locality.into();
 		let end_locality = end_locality.into();
 		if start_locality > end_locality {
@@ -1334,8 +1474,12 @@ impl SlabManager {
 		}
 		let cursor_active =
 			cursor_identity != Identity::ZERO || cursor_hlc != bytemuck::Zeroable::zeroed();
-		let cursor_locality = Locality::from(cursor_identity);
-		let mut out: Vec<(TenantId, Identity, RecordLocation)> = Vec::new();
+		let cursor_locality = if cursor_active {
+			self.routing_locality_for_identity_any_tenant(cursor_identity)
+		} else {
+			start_locality
+		};
+		let mut out: Vec<(TenantId, Identity, Locality, RecordLocation)> = Vec::new();
 		for (tenant_id, locality, key_identity) in
 			self.locality_candidates_for_all_tenants(start_locality, end_locality)
 		{
@@ -1352,17 +1496,14 @@ impl SlabManager {
 				{
 					continue;
 				}
-				out.push((tenant_id, key_identity, *loc));
+				out.push((tenant_id, key_identity, locality, *loc));
 			}
 		}
-		out.sort_by(|(tenant_a, ida, la), (tenant_b, idb, lb)| {
-			(Locality::from(*ida), *tenant_a, *ida, la.hlc).cmp(&(
-				Locality::from(*idb),
-				*tenant_b,
-				*idb,
-				lb.hlc,
-			))
-		});
+		out.sort_by(
+			|(tenant_a, ida, locality_a, la), (tenant_b, idb, locality_b, lb)| {
+				(*locality_a, *tenant_a, *ida, la.hlc).cmp(&(*locality_b, *tenant_b, *idb, lb.hlc))
+			},
+		);
 		out
 	}
 
@@ -1397,6 +1538,32 @@ impl SlabManager {
 		payload_hash: [u8; 32],
 		frame: &[u8],
 	) -> std::io::Result<MigrationIngestOutcome> {
+		self.append_migration_with_locality(
+			migration_id,
+			tenant_id,
+			key_identity,
+			Locality::from(key_identity),
+			hlc,
+			payload_hash,
+			frame,
+		)
+		.await
+	}
+
+	/// Idempotent migration ingest for records whose routing
+	/// locality is not the identity projection. Table-spread rows
+	/// use this path so range migration preserves their table arc
+	/// placement across replica-set movement.
+	pub async fn append_migration_with_locality(
+		&self,
+		migration_id: u64,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		routing_locality: Locality,
+		hlc: HybridTimestamp,
+		payload_hash: [u8; 32],
+		frame: &[u8],
+	) -> std::io::Result<MigrationIngestOutcome> {
 		// Fast-path collision check before touching disk: walk the
 		// key's existing version chain under a short-lived read
 		// guard and look for an exact HLC match. DashMap's read
@@ -1415,6 +1582,13 @@ impl SlabManager {
 			let stored = self.read(location).await?;
 			let stored_hash = crate::hash::content::digest(&stored);
 			if stored_hash == payload_hash {
+				self.insert_locality_membership_with_locality(
+					tenant_id,
+					key_identity,
+					routing_locality,
+				);
+				self.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
+					.await?;
 				return Ok(MigrationIngestOutcome::Duplicate(location));
 			}
 			// Different bytes claim the same MVCC slot. Refuse
@@ -1430,11 +1604,25 @@ impl SlabManager {
 			));
 		}
 
-		// No prior version at this exact HLC — take the normal
-		// append path. `StorageEngine::append` handles rotation,
-		// disk ack, and folding the new version into the
-		// multi-version index.
-		let location = self.append(tenant_id, key_identity, hlc, frame).await?;
+		// No prior version at this exact HLC — append to the same
+		// slab machinery as hot writes, but publish the caller's
+		// routing locality instead of deriving it from identity.
+		let (slab, location) = self
+			.append_on_target(tenant_id, key_identity, hlc, frame)
+			.await?;
+		if let Err(err) = self
+			.persist_record_row_strict(tenant_id, key_identity, routing_locality, location)
+			.await
+		{
+			slab.rollback_index_entry(tenant_id, key_identity, location);
+			return Err(err);
+		}
+		self.index_appended_location_with_locality(
+			tenant_id,
+			key_identity,
+			routing_locality,
+			location,
+		);
 		Ok(MigrationIngestOutcome::Inserted(location))
 	}
 
@@ -1699,11 +1887,7 @@ impl SlabManager {
 		for entry in self.key_index.iter() {
 			let (tenant_id, key_identity) = *entry.key();
 			for location in entry.value().iter() {
-				rows.push(PersistentRecordRow {
-					tenant_id,
-					key_identity,
-					location: *location,
-				});
+				rows.push(self.persistent_record_row(tenant_id, key_identity, *location));
 			}
 		}
 		rows.sort_by_key(|row| {
@@ -1793,11 +1977,7 @@ impl SlabManager {
 		let Some(index) = &self.persistent_index else {
 			return;
 		};
-		let row = PersistentRecordRow {
-			tenant_id,
-			key_identity,
-			location,
-		};
+		let row = self.persistent_record_row(tenant_id, key_identity, location);
 		if let Err(err) = index.upsert_record(row).await {
 			tracing::warn!(
 				error = %err,
@@ -1813,6 +1993,7 @@ impl SlabManager {
 		&self,
 		tenant_id: TenantId,
 		key_identity: Identity,
+		routing_locality: Locality,
 		location: RecordLocation,
 	) -> std::io::Result<()> {
 		let Some(index) = &self.persistent_index else {
@@ -1821,6 +2002,7 @@ impl SlabManager {
 		let row = PersistentRecordRow {
 			tenant_id,
 			key_identity,
+			routing_locality,
 			location,
 		};
 		if let Err(err) = index.upsert_record(row).await {
@@ -1854,6 +2036,7 @@ impl SlabManager {
 			.map(|record| PersistentRecordRow {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -1877,6 +2060,7 @@ impl SlabManager {
 			.map(|record| PersistentRecordRow {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -1885,6 +2069,7 @@ impl SlabManager {
 			.map(|record| PersistentRecordRow {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
 				location: record.new_location,
 			})
 			.collect::<Vec<_>>();
@@ -1953,11 +2138,7 @@ impl SlabManager {
 			let (tenant_id, key_identity) = *entry.key();
 			for location in entry.value().iter() {
 				if location.slab_id == slab_id {
-					rows.push(PersistentRecordRow {
-						tenant_id,
-						key_identity,
-						location: *location,
-					});
+					rows.push(self.persistent_record_row(tenant_id, key_identity, *location));
 				}
 			}
 		}
@@ -2001,6 +2182,7 @@ impl SlabManager {
 			.map(|(tenant_id, key_identity, location)| PersistentRecordRow {
 				tenant_id,
 				key_identity,
+				routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
 				location,
 			})
 			.collect::<Vec<_>>())
@@ -2070,7 +2252,11 @@ impl SlabManager {
 					}
 				})
 				.or_insert_with(|| vec![row.location]);
-			self.insert_locality_membership(row.tenant_id, row.key_identity);
+			self.insert_locality_membership_with_locality(
+				row.tenant_id,
+				row.key_identity,
+				row.routing_locality,
+			);
 		}
 		self.mirror_persistent_update(
 			PersistentIndexUpdate {
@@ -2114,6 +2300,7 @@ impl SlabManager {
 			.map(|(tenant_id, key_identity, old_location)| CompactionRecord {
 				tenant_id,
 				key_identity,
+				routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
 				old_location,
 				reclaim: self.is_retention_prunable(
 					tenant_id,
@@ -2198,13 +2385,14 @@ impl SlabManager {
 			.iter()
 			.flat_map(|entry| {
 				let (tenant_id, key_identity) = *entry.key();
-				let locality = Locality::from(key_identity);
+				let locality = self.routing_locality_for_key(tenant_id, key_identity);
 				entry
 					.value()
 					.iter()
 					.map(move |loc| CompactionRecord {
 						tenant_id,
 						key_identity,
+						routing_locality: locality,
 						old_location: *loc,
 						reclaim: tombstones.iter().any(|tombstone| {
 							locality.get() >= tombstone.range_start
@@ -2232,12 +2420,14 @@ impl SlabManager {
 			.iter()
 			.flat_map(|entry| {
 				let (tenant_id, key_identity) = *entry.key();
+				let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
 				entry
 					.value()
 					.iter()
 					.map(move |loc| CompactionRecord {
 						tenant_id,
 						key_identity,
+						routing_locality,
 						old_location: *loc,
 						reclaim: self.is_retention_prunable(
 							tenant_id,
@@ -2321,6 +2511,7 @@ impl SlabManager {
 			relocations.push(RelocatedRecord {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
 				old_location: record.old_location,
 				new_location,
 			});
@@ -2399,9 +2590,10 @@ impl SlabManager {
 			);
 		}
 		for relocation in relocations {
-			self.index_appended_location(
+			self.index_appended_location_with_locality(
 				relocation.tenant_id,
 				relocation.key_identity,
+				relocation.routing_locality,
 				relocation.new_location,
 			);
 			self.relocated_reads
@@ -2639,6 +2831,7 @@ impl SlabManager {
 struct CompactionRecord {
 	tenant_id: TenantId,
 	key_identity: Identity,
+	routing_locality: Locality,
 	old_location: RecordLocation,
 	reclaim: bool,
 }
@@ -2647,6 +2840,7 @@ struct CompactionRecord {
 struct RelocatedRecord {
 	tenant_id: TenantId,
 	key_identity: Identity,
+	routing_locality: Locality,
 	old_location: RecordLocation,
 	new_location: RecordLocation,
 }
@@ -2940,16 +3134,25 @@ fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<Re
 	}
 }
 
-fn build_locality_index(
+fn build_key_localities(
 	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
-) -> TenantLocalityMembers {
-	let mut locality_index = TenantLocalityMembers::new();
+) -> DashMap<TenantKey, Locality> {
+	let key_localities = DashMap::new();
 	for entry in key_index.iter() {
+		let (tenant_id, key_identity) = *entry.key();
+		key_localities.insert((tenant_id, key_identity), Locality::from(key_identity));
+	}
+	key_localities
+}
+
+fn build_locality_index(key_localities: &DashMap<TenantKey, Locality>) -> TenantLocalityMembers {
+	let mut locality_index = TenantLocalityMembers::new();
+	for entry in key_localities.iter() {
 		let (tenant_id, key_identity) = *entry.key();
 		locality_index
 			.entry(tenant_id)
 			.or_default()
-			.insert((Locality::from(key_identity), key_identity));
+			.insert((*entry.value(), key_identity));
 	}
 	locality_index
 }
@@ -3213,13 +3416,16 @@ mod tests {
 		// Sorted first by locality/identity, then by hlc ascending.
 		assert_eq!(hits[0].0, tenant());
 		assert_eq!(hits[0].1, key_a);
-		assert_eq!(hits[0].2.hlc.physical_ms, 50);
+		assert_eq!(hits[0].2, Locality::from(key_a));
+		assert_eq!(hits[0].3.hlc.physical_ms, 50);
 		assert_eq!(hits[1].0, tenant());
 		assert_eq!(hits[1].1, key_b);
-		assert_eq!(hits[1].2.hlc.physical_ms, 20);
+		assert_eq!(hits[1].2, Locality::from(key_b));
+		assert_eq!(hits[1].3.hlc.physical_ms, 20);
 		assert_eq!(hits[2].0, tenant());
 		assert_eq!(hits[2].1, key_b);
-		assert_eq!(hits[2].2.hlc.physical_ms, 200);
+		assert_eq!(hits[2].2, Locality::from(key_b));
+		assert_eq!(hits[2].3.hlc.physical_ms, 200);
 
 		// Inverted window → empty rather than panic.
 		assert!(
@@ -3252,6 +3458,52 @@ mod tests {
 		let locality = Locality::from(key);
 		let versions = mgr.scan_all_versions(locality, locality, hlc(0));
 		assert_eq!(versions.len(), 1);
+	}
+
+	#[tokio::test]
+	async fn append_migration_with_locality_preserves_custom_range_membership() {
+		let source = fresh_manager().await;
+		let destination = fresh_manager().await;
+		let key = id(0xDADA);
+		let identity_locality = Locality::from(key);
+		let routing_locality = Locality::new(identity_locality.get().wrapping_add(1));
+		assert_ne!(routing_locality, identity_locality);
+		let ts = hlc(100);
+
+		source
+			.append_durable_with_locality(tenant(), key, routing_locality, ts, b"table-row")
+			.await
+			.unwrap();
+		let source_versions = source.scan_all_versions(routing_locality, routing_locality, hlc(0));
+		assert_eq!(source_versions.len(), 1);
+		let (tenant_id, migrated_key, migrated_locality, source_loc) = source_versions[0];
+		assert_eq!(migrated_key, key);
+		assert_eq!(migrated_locality, routing_locality);
+
+		let frame = source.read(source_loc).await.unwrap();
+		let payload_hash = crate::hash::content::digest(&frame);
+		destination
+			.append_migration_with_locality(
+				7,
+				tenant_id,
+				migrated_key,
+				migrated_locality,
+				source_loc.hlc,
+				payload_hash,
+				&frame,
+			)
+			.await
+			.unwrap();
+
+		let custom_hits = destination.scan_all_versions(routing_locality, routing_locality, hlc(0));
+		assert_eq!(custom_hits.len(), 1);
+		assert_eq!(custom_hits[0].1, key);
+		assert_eq!(custom_hits[0].2, routing_locality);
+		assert!(
+			destination
+				.scan_all_versions(identity_locality, identity_locality, hlc(0))
+				.is_empty()
+		);
 	}
 
 	#[tokio::test]
@@ -3333,6 +3585,74 @@ mod tests {
 		assert_eq!(secondary.len(), 1);
 		assert_eq!(secondary[0].0, locality.get());
 		assert_eq!(secondary[0].1.hlc.physical_ms, 20);
+	}
+
+	#[tokio::test]
+	async fn custom_routing_locality_survives_reopen() {
+		let dir = fresh_dir("custom-locality-reopen");
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: dir.clone(),
+				max_slab_bytes: 1024 * 1024,
+				io: spawn_io_thread(64).unwrap(),
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let key = id(0xCAFE);
+		let routing_locality = Locality::new(42);
+		assert_ne!(routing_locality, Locality::from(key));
+		manager
+			.append_durable_with_locality(tenant(), key, routing_locality, hlc(10), b"table-row")
+			.await
+			.unwrap();
+		assert_eq!(
+			manager
+				.scan_as_of_with_identity_and_locality(
+					tenant(),
+					routing_locality,
+					routing_locality,
+					hlc(20),
+				)
+				.len(),
+			1
+		);
+		drop(manager);
+
+		let reopened = SlabManager::open(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1024 * 1024,
+			io: spawn_io_thread(64).unwrap(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap();
+		let custom_hits = reopened.scan_as_of_with_identity_and_locality(
+			tenant(),
+			routing_locality,
+			routing_locality,
+			hlc(20),
+		);
+		assert_eq!(custom_hits.len(), 1);
+		assert_eq!(custom_hits[0].0, key);
+		assert_eq!(custom_hits[0].1, routing_locality);
+		assert!(
+			reopened
+				.scan_as_of_with_identity_and_locality(
+					tenant(),
+					Locality::from(key),
+					Locality::from(key),
+					hlc(20),
+				)
+				.is_empty()
+		);
 	}
 
 	#[tokio::test]

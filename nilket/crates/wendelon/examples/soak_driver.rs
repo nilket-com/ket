@@ -551,6 +551,12 @@ fn error_label(err: &ClientError) -> String {
 		ClientError::WriteFailed { status } => format!("write_status_{status:?}"),
 		ClientError::ReadFailed { status } => format!("read_status_{status:?}"),
 		ClientError::Io(err) => format!("io_{}", err.kind()),
+		ClientError::TableWriteRejected { reject_code } => {
+			format!("table_write_rejected_{}", reject_code.0)
+		}
+		ClientError::SchemaUpdateRejected { reason_code, .. } => {
+			format!("schema_update_rejected_{reason_code}")
+		}
 	}
 }
 

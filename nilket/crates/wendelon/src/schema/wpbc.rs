@@ -1,44 +1,46 @@
 //! Wendelon Pushdown Bytecode (WPBC) interpreter.
 //!
 //! The stack machine defined in `plans/schema/compute_ast.md`.
-//! DataFusion `TableProvider`s compile `WHERE` / `SELECT` fragments
-//! into WPBC and attach the bytes to a `ReadRequestMeta` frame's
+//! Toron lowers pushdown-capable typed expression fragments into
+//! WPBC and attaches the bytes to a `ReadRequestMeta` frame's
 //! trailing section. A Wendelon Data Node runs the program locally
 //! against the Arrow `RecordBatch` it was about to return, yielding
-//! a filtered + projected batch so only the rows the client asked
-//! for cross the network.
+//! a filtered + projected batch so only the requested rows and
+//! columns cross the network.
 //!
 //! ## Safety model
 //!
-//! Every bound from the spec §4.3 is enforced:
+//! The production vectorized path is bounded by the validated bytecode
+//! length, stack depth, opcode families, query deadlines, and upstream
+//! materialization limits:
 //!
 //! * programs longer than [`MAX_BYTECODE_BYTES`] are rejected at
 //!   compile time,
 //! * the evaluation stack is capped at [`STACK_DEPTH_LIMIT`] slots,
-//! * each row is given [`FUEL_PER_ROW`] opcode ticks before a trap.
+//! * unsupported runtime type combinations fail closed by producing
+//!   a false/null mask entry or an empty projected batch.
 //!
-//! A trap — whether from stack over/underflow, fuel exhaustion,
-//! type mismatch, or NaN — evaluates the current row to `false`
-//! (i.e. the row is discarded). Null operands propagate per 3VL
-//! and ultimately drop the row; `IS_NULL` / `IS_NOT_NULL` are the
-//! only ways to produce a concrete boolean from a Null.
+//! Null operands propagate per 3VL and ultimately drop the row;
+//! `IS_NULL` / `IS_NOT_NULL` are the only ways to produce a concrete
+//! boolean from a Null.
 //!
 //! ## Compile-then-run
 //!
 //! The raw byte stream is parsed once into a [`Program`] (a `Vec`
-//! of decoded [`Op`]s plus an optional projection list); per-row
-//! evaluation then walks that compiled form so we pay string /
-//! slice decoding exactly once per query rather than per row.
+//! of decoded [`Op`]s plus an optional projection list); vector
+//! evaluation then walks that compiled form once per batch.
 
+use crate::metrics::{WpbcRuntime, global as metrics};
 use crate::schema::{Identity, Locality};
 use arrow::array::{
-	Array, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int32Array, Int64Array,
-	LargeStringArray, StringArray, TimestampMillisecondArray,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, Datum, Float32Array, Float64Array, Int32Array,
+	Int64Array, LargeStringArray, StringArray, TimestampMillisecondArray,
 };
 use arrow::compute;
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use std::io::{Error, ErrorKind};
+use std::time::{Duration, Instant};
 
 // ============================================================
 //  OPCODES — mirrors `plans/schema/compute_ast.md` §3.
@@ -83,6 +85,7 @@ pub const OP_PROJECT: u8 = 0xFF;
 
 pub const MAX_BYTECODE_BYTES: usize = 4096;
 pub const STACK_DEPTH_LIMIT: usize = 64;
+#[cfg(test)]
 pub const FUEL_PER_ROW: usize = 1024;
 
 // ============================================================
@@ -145,6 +148,12 @@ impl Program {
 			));
 		}
 		compile(bytecode)
+	}
+
+	pub fn requires_scalar_context(&self) -> bool {
+		self.ops
+			.iter()
+			.any(|op| matches!(op, Op::LoadIdentity | Op::RouteByLocality))
 	}
 }
 
@@ -425,28 +434,72 @@ pub fn execute_program_with_context(
 	context: Option<ExecutionContext>,
 ) -> std::io::Result<RecordBatch> {
 	validate_program_against_batch(program, batch)?;
-	// Filter stage. An empty op list means the caller sent only a
-	// PROJECT (or nothing at all); either way there's no predicate
-	// to apply and every row passes.
-	let filtered = if program.ops.is_empty() {
-		batch.clone()
-	} else {
-		let n_rows = batch.num_rows();
-		let mut mask = BooleanBuilder::with_capacity(n_rows);
-		for row in 0..n_rows {
-			mask.append_value(eval_row(&program.ops, batch, row, context));
-		}
-		let filter: BooleanArray = mask.finish();
-		compute::filter_record_batch(batch, &filter)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC filter: {e}")))?
-	};
+	execute_program_vectorized(program, batch, context)
+}
 
+fn execute_program_vectorized(
+	program: &Program,
+	batch: &RecordBatch,
+	context: Option<ExecutionContext>,
+) -> std::io::Result<RecordBatch> {
+	let started = Instant::now();
+	let mut stats = VectorExecStats::default();
+	let result = match evaluate_program_vectorized(program, batch, context, &mut stats) {
+		Ok(None) => apply_projection(program, batch),
+		Ok(Some(mask)) => {
+			let filtered = compute::filter_record_batch(batch, &mask).map_err(|e| {
+				stats.kernel_errors += 1;
+				Error::new(ErrorKind::InvalidData, format!("WPBC filter: {e}"))
+			})?;
+			apply_projection(program, &filtered)
+		}
+		Err(err) => {
+			stats.kernel_errors += 1;
+			tracing::debug!(error = %err, "WPBC vector runtime trap normalized to empty batch");
+			empty_filtered_batch(program, batch)
+		}
+	};
+	if let Ok(out) = &result {
+		observe_wpbc_execution(
+			WpbcRuntime::Vectorized,
+			batch.num_rows(),
+			out.num_rows(),
+			started.elapsed(),
+			stats,
+		);
+	}
+	result
+}
+
+fn apply_projection(program: &Program, batch: &RecordBatch) -> std::io::Result<RecordBatch> {
 	match &program.project {
-		Some(indices) => filtered
+		Some(indices) => batch
 			.project(indices)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC project: {e}"))),
-		None => Ok(filtered),
+		None => Ok(batch.clone()),
 	}
+}
+
+fn empty_filtered_batch(program: &Program, batch: &RecordBatch) -> std::io::Result<RecordBatch> {
+	let empty = batch.slice(0, 0);
+	apply_projection(program, &empty)
+}
+
+fn observe_wpbc_execution(
+	runtime: WpbcRuntime,
+	rows_scanned: usize,
+	rows_returned: usize,
+	duration: Duration,
+	stats: VectorExecStats,
+) {
+	metrics().observe_wpbc_execution(
+		runtime,
+		rows_scanned as u64,
+		rows_returned as u64,
+		duration,
+		stats.kernel_errors,
+		stats.intermediate_arrays,
+	);
 }
 
 fn validate_program_against_batch(program: &Program, batch: &RecordBatch) -> std::io::Result<()> {
@@ -508,9 +561,815 @@ fn is_supported_pushcol_type(data_type: &DataType) -> bool {
 }
 
 // ============================================================
+//  VECTORIZED INTERPRETER
+// ============================================================
+
+#[derive(Clone, Debug)]
+enum VectorValue {
+	Array(ArrayRef),
+	Scalar(ScalarLit),
+	Bool(BooleanArray),
+	Identity(Identity),
+	Locality(Locality),
+}
+
+#[derive(Clone, Debug)]
+enum ScalarLit {
+	Int(i64),
+	Float(f64),
+	Str(Vec<u8>),
+	Bool(bool),
+	Ts(i64),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VectorExecStats {
+	kernel_errors: u64,
+	intermediate_arrays: u64,
+}
+
+struct ColumnCache<'a> {
+	batch: &'a RecordBatch,
+	columns: Vec<Option<ArrayRef>>,
+}
+
+impl<'a> ColumnCache<'a> {
+	fn new(batch: &'a RecordBatch) -> Self {
+		Self {
+			batch,
+			columns: vec![None; batch.num_columns()],
+		}
+	}
+
+	fn column(&mut self, index: usize) -> Result<ArrayRef, String> {
+		if index >= self.batch.num_columns() {
+			return Err(format!("column index {index} is out of bounds"));
+		}
+		if self.columns[index].is_none() {
+			self.columns[index] = Some(self.batch.column(index).clone());
+		}
+		Ok(self.columns[index]
+			.as_ref()
+			.expect("column cache populated")
+			.clone())
+	}
+}
+
+fn evaluate_program_vectorized(
+	program: &Program,
+	batch: &RecordBatch,
+	context: Option<ExecutionContext>,
+	stats: &mut VectorExecStats,
+) -> Result<Option<BooleanArray>, String> {
+	if program.ops.is_empty() {
+		return Ok(None);
+	}
+
+	let len = batch.num_rows();
+	let mut cache = ColumnCache::new(batch);
+	let mut stack: Vec<VectorValue> = Vec::with_capacity(STACK_DEPTH_LIMIT);
+	for op in &program.ops {
+		match op {
+			Op::PushCol(col) => stack.push(VectorValue::Array(cache.column(*col as usize)?)),
+			Op::PushInt(value) => stack.push(VectorValue::Scalar(ScalarLit::Int(*value))),
+			Op::PushStr(bytes) => stack.push(VectorValue::Scalar(ScalarLit::Str(bytes.clone()))),
+			Op::PushBool(value) => stack.push(VectorValue::Scalar(ScalarLit::Bool(*value))),
+			Op::PushFloat(value) => stack.push(VectorValue::Scalar(ScalarLit::Float(*value))),
+			Op::PushTs(value) => stack.push(VectorValue::Scalar(ScalarLit::Ts(*value))),
+			Op::LoadIdentity => {
+				let ctx = context.ok_or("LOAD_IDENTITY requires execution context")?;
+				stack.push(VectorValue::Identity(ctx.identity));
+			}
+			Op::PushIdentity(value) => stack.push(VectorValue::Identity(*value)),
+			Op::EqIdentity => {
+				let rhs = pop_vector(&mut stack, "identity rhs")?;
+				let lhs = pop_vector(&mut stack, "identity lhs")?;
+				let mask = identity_eq_mask(lhs, rhs, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::HashRangeIdentity => {
+				let upper = pop_vector(&mut stack, "identity upper bound")?;
+				let lower = pop_vector(&mut stack, "identity lower bound")?;
+				let target = pop_vector(&mut stack, "identity target")?;
+				let mask = identity_range_mask(target, lower, upper, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::RouteByLocality => {
+				let ctx = context.ok_or("ROUTE_BY_LOCALITY requires execution context")?;
+				stack.push(VectorValue::Locality(ctx.locality));
+			}
+			Op::PushLocality(value) => stack.push(VectorValue::Locality(*value)),
+			Op::RangeLocality => {
+				let upper = pop_vector(&mut stack, "locality upper bound")?;
+				let lower = pop_vector(&mut stack, "locality lower bound")?;
+				let target = pop_vector(&mut stack, "locality target")?;
+				let mask = locality_range_mask(target, lower, upper, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::Eq | Op::Neq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+				let rhs = pop_vector(&mut stack, "comparison rhs")?;
+				let lhs = pop_vector(&mut stack, "comparison lhs")?;
+				let mask = compare_vector_values(&lhs, &rhs, op, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::And => {
+				let rhs = pop_vector(&mut stack, "logical rhs")?;
+				let lhs = pop_vector(&mut stack, "logical lhs")?;
+				let lhs = bool_array_from_value(&lhs, len)?;
+				let rhs = bool_array_from_value(&rhs, len)?;
+				let mask = compute::and_kleene(&lhs, &rhs)
+					.map_err(|e| format!("AND boolean kernel: {e}"))?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::Or => {
+				let rhs = pop_vector(&mut stack, "logical rhs")?;
+				let lhs = pop_vector(&mut stack, "logical lhs")?;
+				let lhs = bool_array_from_value(&lhs, len)?;
+				let rhs = bool_array_from_value(&rhs, len)?;
+				let mask = compute::or_kleene(&lhs, &rhs)
+					.map_err(|e| format!("OR boolean kernel: {e}"))?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::Not => {
+				let value = pop_vector(&mut stack, "logical operand")?;
+				let value = bool_array_from_value(&value, len)?;
+				let mask = compute::not(&value).map_err(|e| format!("NOT boolean kernel: {e}"))?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::InList(count) => {
+				let count = *count as usize;
+				if stack.len() < count + 1 {
+					return Err("IN_LIST stack underflow".to_owned());
+				}
+				let split = stack.len() - count;
+				let items = stack.drain(split..).collect::<Vec<_>>();
+				let target = pop_vector(&mut stack, "IN_LIST target")?;
+				let mask = in_list_vector(&target, &items, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::IsNull => {
+				let value = pop_vector(&mut stack, "null-check operand")?;
+				let mask = is_null_vector(&value, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+			Op::IsNotNull => {
+				let value = pop_vector(&mut stack, "null-check operand")?;
+				let mask = is_not_null_vector(&value, len)?;
+				stats.intermediate_arrays += 1;
+				stack.push(VectorValue::Bool(mask));
+			}
+		}
+		if stack.len() > STACK_DEPTH_LIMIT {
+			return Err("stack depth limit exceeded during vector execution".to_owned());
+		}
+	}
+
+	let top = stack
+		.last()
+		.ok_or_else(|| "program ended with an empty stack".to_owned())?;
+	Ok(Some(finish_mask(top, len)?))
+}
+
+fn pop_vector(stack: &mut Vec<VectorValue>, label: &str) -> Result<VectorValue, String> {
+	stack
+		.pop()
+		.ok_or_else(|| format!("stack underflow while executing {label}"))
+}
+
+fn finish_mask(value: &VectorValue, len: usize) -> Result<BooleanArray, String> {
+	bool_array_from_value(value, len)
+}
+
+fn bool_array_from_value(value: &VectorValue, len: usize) -> Result<BooleanArray, String> {
+	match value {
+		VectorValue::Bool(mask) => Ok(mask.clone()),
+		VectorValue::Array(array) if matches!(array.data_type(), DataType::Boolean) => Ok(array
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.ok_or_else(|| "Boolean array downcast failed".to_owned())?
+			.clone()),
+		VectorValue::Scalar(ScalarLit::Bool(value)) => Ok(const_bool_array(*value, len)),
+		other => Err(format!(
+			"expected Boolean vector value, got {}",
+			vector_value_type(other)
+		)),
+	}
+}
+
+fn const_bool_array(value: bool, len: usize) -> BooleanArray {
+	BooleanArray::from(vec![value; len])
+}
+
+fn identity_eq_mask(
+	lhs: VectorValue,
+	rhs: VectorValue,
+	len: usize,
+) -> Result<BooleanArray, String> {
+	let VectorValue::Identity(lhs) = lhs else {
+		return Err("EQ_IDENTITY lhs was not Identity".to_owned());
+	};
+	let VectorValue::Identity(rhs) = rhs else {
+		return Err("EQ_IDENTITY rhs was not Identity".to_owned());
+	};
+	Ok(const_bool_array(lhs == rhs, len))
+}
+
+fn identity_range_mask(
+	target: VectorValue,
+	lower: VectorValue,
+	upper: VectorValue,
+	len: usize,
+) -> Result<BooleanArray, String> {
+	let VectorValue::Identity(target) = target else {
+		return Err("HASH_RANGE_IDENTITY target was not Identity".to_owned());
+	};
+	let VectorValue::Identity(lower) = lower else {
+		return Err("HASH_RANGE_IDENTITY lower bound was not Identity".to_owned());
+	};
+	let VectorValue::Identity(upper) = upper else {
+		return Err("HASH_RANGE_IDENTITY upper bound was not Identity".to_owned());
+	};
+	Ok(const_bool_array(lower <= target && target <= upper, len))
+}
+
+fn locality_range_mask(
+	target: VectorValue,
+	lower: VectorValue,
+	upper: VectorValue,
+	len: usize,
+) -> Result<BooleanArray, String> {
+	let VectorValue::Locality(target) = target else {
+		return Err("RANGE_LOCALITY target was not Locality".to_owned());
+	};
+	let VectorValue::Locality(lower) = lower else {
+		return Err("RANGE_LOCALITY lower bound was not Locality".to_owned());
+	};
+	let VectorValue::Locality(upper) = upper else {
+		return Err("RANGE_LOCALITY upper bound was not Locality".to_owned());
+	};
+	Ok(const_bool_array(lower <= target && target <= upper, len))
+}
+
+fn is_null_vector(value: &VectorValue, len: usize) -> Result<BooleanArray, String> {
+	match value {
+		VectorValue::Array(array) => {
+			compute::is_null(array.as_ref()).map_err(|e| format!("IS_NULL null kernel: {e}"))
+		}
+		VectorValue::Bool(mask) => {
+			compute::is_null(mask).map_err(|e| format!("IS_NULL boolean null kernel: {e}"))
+		}
+		VectorValue::Scalar(_) => Ok(const_bool_array(false, len)),
+		VectorValue::Identity(_) | VectorValue::Locality(_) => {
+			Err("IS_NULL cannot consume typed identity/locality values".to_owned())
+		}
+	}
+}
+
+fn is_not_null_vector(value: &VectorValue, len: usize) -> Result<BooleanArray, String> {
+	match value {
+		VectorValue::Array(array) => compute::is_not_null(array.as_ref())
+			.map_err(|e| format!("IS_NOT_NULL null kernel: {e}")),
+		VectorValue::Bool(mask) => {
+			compute::is_not_null(mask).map_err(|e| format!("IS_NOT_NULL boolean null kernel: {e}"))
+		}
+		VectorValue::Scalar(_) => Ok(const_bool_array(true, len)),
+		VectorValue::Identity(_) | VectorValue::Locality(_) => {
+			Err("IS_NOT_NULL cannot consume typed identity/locality values".to_owned())
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Cell<'a> {
+	Null,
+	Int(i64),
+	Float(f64),
+	Bool(bool),
+	Str(&'a [u8]),
+	Ts(i64),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CompareResult {
+	Null,
+	Bool(bool),
+	Trap,
+}
+
+fn compare_vector_values(
+	lhs: &VectorValue,
+	rhs: &VectorValue,
+	op: &Op,
+	len: usize,
+) -> Result<BooleanArray, String> {
+	if let Some(mask) = compare_vector_values_fast(lhs, rhs, op)? {
+		return Ok(mask);
+	}
+
+	let mut mask = BooleanBuilder::with_capacity(len);
+	for row in 0..len {
+		let lhs = cell_at(lhs, row).ok_or_else(|| {
+			format!(
+				"comparison lhs unsupported vector value {}",
+				vector_value_type(lhs)
+			)
+		})?;
+		let rhs = cell_at(rhs, row).ok_or_else(|| {
+			format!(
+				"comparison rhs unsupported vector value {}",
+				vector_value_type(rhs)
+			)
+		})?;
+		match compare_cells(lhs, rhs, op) {
+			CompareResult::Bool(value) => mask.append_value(value),
+			CompareResult::Null => mask.append_null(),
+			CompareResult::Trap => mask.append_value(false),
+		}
+	}
+	Ok(mask.finish())
+}
+
+fn compare_vector_values_fast(
+	lhs: &VectorValue,
+	rhs: &VectorValue,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	match (lhs, rhs) {
+		(VectorValue::Array(array), VectorValue::Scalar(scalar)) => {
+			compare_array_scalar_fast(array, scalar, op)
+		}
+		(VectorValue::Scalar(scalar), VectorValue::Array(array)) => {
+			compare_scalar_array_fast(scalar, array, op)
+		}
+		(VectorValue::Array(lhs), VectorValue::Array(rhs)) => {
+			compare_array_array_fast(lhs, rhs, op)
+		}
+		(VectorValue::Array(array), VectorValue::Bool(mask)) => {
+			compare_array_bool_fast(array, mask, op)
+		}
+		(VectorValue::Bool(mask), VectorValue::Array(array)) => {
+			compare_bool_array_fast(mask, array, op)
+		}
+		(VectorValue::Bool(lhs), VectorValue::Bool(rhs)) => {
+			compare_arrow_datums(lhs, rhs, op).map(Some)
+		}
+		(VectorValue::Bool(mask), VectorValue::Scalar(ScalarLit::Bool(value))) => {
+			let scalar = BooleanArray::new_scalar(*value);
+			compare_arrow_datums(mask, &scalar, op).map(Some)
+		}
+		(VectorValue::Scalar(ScalarLit::Bool(value)), VectorValue::Bool(mask)) => {
+			let scalar = BooleanArray::new_scalar(*value);
+			compare_arrow_datums(&scalar, mask, op).map(Some)
+		}
+		_ => Ok(None),
+	}
+}
+
+fn compare_array_scalar_fast(
+	array: &ArrayRef,
+	scalar: &ScalarLit,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	match (array.data_type(), scalar) {
+		(DataType::Int64, ScalarLit::Int(value)) | (DataType::Int64, ScalarLit::Ts(value)) => {
+			let lhs = array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| "Int64 array downcast failed".to_owned())?;
+			let rhs = Int64Array::new_scalar(*value);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		(DataType::Int32, ScalarLit::Int(value)) | (DataType::Int32, ScalarLit::Ts(value))
+			if i32::try_from(*value).is_ok() =>
+		{
+			let lhs = array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.ok_or_else(|| "Int32 array downcast failed".to_owned())?;
+			let rhs = Int32Array::new_scalar(*value as i32);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		(DataType::Boolean, ScalarLit::Bool(value)) => {
+			let lhs = array
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.ok_or_else(|| "Boolean array downcast failed".to_owned())?;
+			let rhs = BooleanArray::new_scalar(*value);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		(DataType::Utf8, ScalarLit::Str(bytes)) => {
+			let Ok(value) = std::str::from_utf8(bytes) else {
+				return Ok(None);
+			};
+			let lhs = array
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.ok_or_else(|| "Utf8 array downcast failed".to_owned())?;
+			let rhs = StringArray::new_scalar(value);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		(DataType::LargeUtf8, ScalarLit::Str(bytes)) => {
+			let Ok(value) = std::str::from_utf8(bytes) else {
+				return Ok(None);
+			};
+			let lhs = array
+				.as_any()
+				.downcast_ref::<LargeStringArray>()
+				.ok_or_else(|| "LargeUtf8 array downcast failed".to_owned())?;
+			let rhs = LargeStringArray::new_scalar(value);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		(DataType::Timestamp(TimeUnit::Millisecond, _), ScalarLit::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Millisecond, _), ScalarLit::Int(value)) => {
+			let lhs = array
+				.as_any()
+				.downcast_ref::<TimestampMillisecondArray>()
+				.ok_or_else(|| "TimestampMillisecond array downcast failed".to_owned())?;
+			let rhs = TimestampMillisecondArray::new_scalar(*value);
+			compare_arrow_datums(lhs, &rhs, op).map(Some)
+		}
+		_ => Ok(None),
+	}
+}
+
+fn compare_scalar_array_fast(
+	scalar: &ScalarLit,
+	array: &ArrayRef,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	match (scalar, array.data_type()) {
+		(ScalarLit::Int(value), DataType::Int64) | (ScalarLit::Ts(value), DataType::Int64) => {
+			let lhs = Int64Array::new_scalar(*value);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| "Int64 array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		(ScalarLit::Int(value), DataType::Int32) | (ScalarLit::Ts(value), DataType::Int32)
+			if i32::try_from(*value).is_ok() =>
+		{
+			let lhs = Int32Array::new_scalar(*value as i32);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.ok_or_else(|| "Int32 array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		(ScalarLit::Bool(value), DataType::Boolean) => {
+			let lhs = BooleanArray::new_scalar(*value);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.ok_or_else(|| "Boolean array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		(ScalarLit::Str(bytes), DataType::Utf8) => {
+			let Ok(value) = std::str::from_utf8(bytes) else {
+				return Ok(None);
+			};
+			let lhs = StringArray::new_scalar(value);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.ok_or_else(|| "Utf8 array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		(ScalarLit::Str(bytes), DataType::LargeUtf8) => {
+			let Ok(value) = std::str::from_utf8(bytes) else {
+				return Ok(None);
+			};
+			let lhs = LargeStringArray::new_scalar(value);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<LargeStringArray>()
+				.ok_or_else(|| "LargeUtf8 array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		(ScalarLit::Ts(value), DataType::Timestamp(TimeUnit::Millisecond, _))
+		| (ScalarLit::Int(value), DataType::Timestamp(TimeUnit::Millisecond, _)) => {
+			let lhs = TimestampMillisecondArray::new_scalar(*value);
+			let rhs = array
+				.as_any()
+				.downcast_ref::<TimestampMillisecondArray>()
+				.ok_or_else(|| "TimestampMillisecond array downcast failed".to_owned())?;
+			compare_arrow_datums(&lhs, rhs, op).map(Some)
+		}
+		_ => Ok(None),
+	}
+}
+
+fn compare_array_array_fast(
+	lhs: &ArrayRef,
+	rhs: &ArrayRef,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	if matches!(
+		(lhs.data_type(), rhs.data_type()),
+		(
+			DataType::Timestamp(TimeUnit::Millisecond, _),
+			DataType::Timestamp(TimeUnit::Millisecond, _)
+		)
+	) && lhs.data_type() != rhs.data_type()
+	{
+		return Ok(None);
+	}
+
+	match (lhs.data_type(), rhs.data_type()) {
+		(DataType::Int64, DataType::Int64) => compare_arrow_arrays::<Int64Array>(lhs, rhs, op),
+		(DataType::Int32, DataType::Int32) => compare_arrow_arrays::<Int32Array>(lhs, rhs, op),
+		(DataType::Boolean, DataType::Boolean) => {
+			compare_arrow_arrays::<BooleanArray>(lhs, rhs, op)
+		}
+		(DataType::Utf8, DataType::Utf8) => compare_arrow_arrays::<StringArray>(lhs, rhs, op),
+		(DataType::LargeUtf8, DataType::LargeUtf8) => {
+			compare_arrow_arrays::<LargeStringArray>(lhs, rhs, op)
+		}
+		(
+			DataType::Timestamp(TimeUnit::Millisecond, _),
+			DataType::Timestamp(TimeUnit::Millisecond, _),
+		) => compare_arrow_arrays::<TimestampMillisecondArray>(lhs, rhs, op),
+		_ => Ok(None),
+	}
+}
+
+fn compare_arrow_arrays<T: Array + 'static>(
+	lhs: &ArrayRef,
+	rhs: &ArrayRef,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	let lhs = lhs
+		.as_any()
+		.downcast_ref::<T>()
+		.ok_or_else(|| "lhs array downcast failed".to_owned())?;
+	let rhs = rhs
+		.as_any()
+		.downcast_ref::<T>()
+		.ok_or_else(|| "rhs array downcast failed".to_owned())?;
+	compare_arrow_datums(lhs, rhs, op).map(Some)
+}
+
+fn compare_array_bool_fast(
+	array: &ArrayRef,
+	mask: &BooleanArray,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	if !matches!(array.data_type(), DataType::Boolean) {
+		return Ok(None);
+	}
+	let array = array
+		.as_any()
+		.downcast_ref::<BooleanArray>()
+		.ok_or_else(|| "Boolean array downcast failed".to_owned())?;
+	compare_arrow_datums(array, mask, op).map(Some)
+}
+
+fn compare_bool_array_fast(
+	mask: &BooleanArray,
+	array: &ArrayRef,
+	op: &Op,
+) -> Result<Option<BooleanArray>, String> {
+	if !matches!(array.data_type(), DataType::Boolean) {
+		return Ok(None);
+	}
+	let array = array
+		.as_any()
+		.downcast_ref::<BooleanArray>()
+		.ok_or_else(|| "Boolean array downcast failed".to_owned())?;
+	compare_arrow_datums(mask, array, op).map(Some)
+}
+
+fn compare_arrow_datums(lhs: &dyn Datum, rhs: &dyn Datum, op: &Op) -> Result<BooleanArray, String> {
+	match op {
+		Op::Eq => compute::kernels::cmp::eq(lhs, rhs),
+		Op::Neq => compute::kernels::cmp::neq(lhs, rhs),
+		Op::Gt => compute::kernels::cmp::gt(lhs, rhs),
+		Op::Lt => compute::kernels::cmp::lt(lhs, rhs),
+		Op::Gte => compute::kernels::cmp::gt_eq(lhs, rhs),
+		Op::Lte => compute::kernels::cmp::lt_eq(lhs, rhs),
+		_ => return Err("unsupported comparison opcode".to_owned()),
+	}
+	.map_err(|e| format!("Arrow comparison kernel: {e}"))
+}
+
+fn in_list_vector(
+	target: &VectorValue,
+	items: &[VectorValue],
+	len: usize,
+) -> Result<BooleanArray, String> {
+	if let Some(mask) = in_list_vector_fast(target, items)? {
+		return Ok(mask);
+	}
+
+	let mut mask = BooleanBuilder::with_capacity(len);
+	for row in 0..len {
+		let target_cell = cell_at(target, row)
+			.ok_or_else(|| format!("IN_LIST target unsupported {}", vector_value_type(target)))?;
+		if matches!(target_cell, Cell::Null) {
+			mask.append_null();
+			continue;
+		}
+
+		let mut found = false;
+		for item in items {
+			let Some(item_cell) = cell_at(item, row) else {
+				continue;
+			};
+			if matches!(
+				compare_cells(target_cell, item_cell, &Op::Eq),
+				CompareResult::Bool(true)
+			) {
+				found = true;
+				break;
+			}
+		}
+		mask.append_value(found);
+	}
+	Ok(mask.finish())
+}
+
+fn in_list_vector_fast(
+	target: &VectorValue,
+	items: &[VectorValue],
+) -> Result<Option<BooleanArray>, String> {
+	if items.is_empty() {
+		return Ok(None);
+	}
+
+	let mut combined: Option<BooleanArray> = None;
+	for item in items {
+		let Some(eq) = compare_vector_values_fast(target, item, &Op::Eq)? else {
+			return Ok(None);
+		};
+		combined = Some(match combined {
+			Some(current) => compute::or_kleene(&current, &eq)
+				.map_err(|e| format!("IN_LIST OR boolean kernel: {e}"))?,
+			None => eq,
+		});
+	}
+	Ok(combined)
+}
+
+fn cell_at(value: &VectorValue, row: usize) -> Option<Cell<'_>> {
+	match value {
+		VectorValue::Array(array) => array_cell_at(array.as_ref(), row),
+		VectorValue::Bool(mask) => bool_cell_at(mask, row),
+		VectorValue::Scalar(scalar) => Some(scalar_cell(scalar)),
+		VectorValue::Identity(_) | VectorValue::Locality(_) => None,
+	}
+}
+
+fn scalar_cell(scalar: &ScalarLit) -> Cell<'_> {
+	match scalar {
+		ScalarLit::Int(value) => Cell::Int(*value),
+		ScalarLit::Float(value) => Cell::Float(*value),
+		ScalarLit::Str(bytes) => Cell::Str(bytes.as_slice()),
+		ScalarLit::Bool(value) => Cell::Bool(*value),
+		ScalarLit::Ts(value) => Cell::Ts(*value),
+	}
+}
+
+fn bool_cell_at(array: &BooleanArray, row: usize) -> Option<Cell<'_>> {
+	if array.is_null(row) {
+		Some(Cell::Null)
+	} else {
+		Some(Cell::Bool(array.value(row)))
+	}
+}
+
+fn array_cell_at(array: &dyn Array, row: usize) -> Option<Cell<'_>> {
+	if array.is_null(row) {
+		return Some(Cell::Null);
+	}
+	match array.data_type() {
+		DataType::Int64 => array
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.map(|a| Cell::Int(a.value(row))),
+		DataType::Int32 => array
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.map(|a| Cell::Int(a.value(row) as i64)),
+		DataType::Float64 => array
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.map(|a| Cell::Float(a.value(row))),
+		DataType::Float32 => array
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.map(|a| Cell::Float(a.value(row) as f64)),
+		DataType::Boolean => array
+			.as_any()
+			.downcast_ref::<BooleanArray>()
+			.map(|a| Cell::Bool(a.value(row))),
+		DataType::Utf8 => array
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.map(|a| Cell::Str(a.value(row).as_bytes())),
+		DataType::LargeUtf8 => array
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.map(|a| Cell::Str(a.value(row).as_bytes())),
+		DataType::Timestamp(TimeUnit::Millisecond, _) => array
+			.as_any()
+			.downcast_ref::<TimestampMillisecondArray>()
+			.map(|a| Cell::Ts(a.value(row))),
+		_ => None,
+	}
+}
+
+fn compare_cells(lhs: Cell<'_>, rhs: Cell<'_>, op: &Op) -> CompareResult {
+	if matches!(lhs, Cell::Null) || matches!(rhs, Cell::Null) {
+		return CompareResult::Null;
+	}
+
+	use std::cmp::Ordering;
+	let Some(ord) = (match (lhs, rhs) {
+		(Cell::Int(x), Cell::Int(y)) => Some(x.cmp(&y)),
+		(Cell::Int(x), Cell::Float(y)) => (x as f64).partial_cmp(&y),
+		(Cell::Float(x), Cell::Int(y)) => x.partial_cmp(&(y as f64)),
+		(Cell::Float(x), Cell::Float(y)) => x.partial_cmp(&y),
+		(Cell::Bool(x), Cell::Bool(y)) => Some(x.cmp(&y)),
+		(Cell::Str(x), Cell::Str(y)) => Some(x.cmp(y)),
+		(Cell::Ts(x), Cell::Ts(y)) => Some(x.cmp(&y)),
+		(Cell::Ts(x), Cell::Int(y)) => Some(x.cmp(&y)),
+		(Cell::Int(x), Cell::Ts(y)) => Some(x.cmp(&y)),
+		_ => None,
+	}) else {
+		return CompareResult::Trap;
+	};
+
+	let result = match op {
+		Op::Eq => ord == Ordering::Equal,
+		Op::Neq => ord != Ordering::Equal,
+		Op::Gt => ord == Ordering::Greater,
+		Op::Lt => ord == Ordering::Less,
+		Op::Gte => ord != Ordering::Less,
+		Op::Lte => ord != Ordering::Greater,
+		_ => return CompareResult::Trap,
+	};
+	CompareResult::Bool(result)
+}
+
+fn vector_value_type(value: &VectorValue) -> String {
+	match value {
+		VectorValue::Array(array) => format!("array({:?})", array.data_type()),
+		VectorValue::Scalar(ScalarLit::Int(_)) => "int-scalar".to_owned(),
+		VectorValue::Scalar(ScalarLit::Float(_)) => "float-scalar".to_owned(),
+		VectorValue::Scalar(ScalarLit::Str(_)) => "string-scalar".to_owned(),
+		VectorValue::Scalar(ScalarLit::Bool(_)) => "bool-scalar".to_owned(),
+		VectorValue::Scalar(ScalarLit::Ts(_)) => "timestamp-scalar".to_owned(),
+		VectorValue::Bool(mask) => format!("bool-array(nulls={})", mask.null_count()),
+		VectorValue::Identity(_) => "identity".to_owned(),
+		VectorValue::Locality(_) => "locality".to_owned(),
+	}
+}
+
+// ============================================================
 //  PER-ROW INTERPRETER
 // ============================================================
 
+#[cfg(test)]
+fn execute_program_scalar_reference(
+	program: &Program,
+	batch: &RecordBatch,
+	context: Option<ExecutionContext>,
+) -> std::io::Result<RecordBatch> {
+	validate_program_against_batch(program, batch)?;
+	let started = Instant::now();
+	let filtered = if program.ops.is_empty() {
+		batch.clone()
+	} else {
+		let n_rows = batch.num_rows();
+		let mut mask = BooleanBuilder::with_capacity(n_rows);
+		for row in 0..n_rows {
+			mask.append_value(eval_row(&program.ops, batch, row, context));
+		}
+		let filter: BooleanArray = mask.finish();
+		compute::filter_record_batch(batch, &filter)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC filter: {e}")))?
+	};
+	let out = apply_projection(program, &filtered)?;
+	observe_wpbc_execution(
+		WpbcRuntime::ScalarReference,
+		batch.num_rows(),
+		out.num_rows(),
+		started.elapsed(),
+		VectorExecStats::default(),
+	);
+	Ok(out)
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug)]
 enum Value<'a> {
 	Null,
@@ -526,6 +1385,7 @@ enum Value<'a> {
 	Locality(Locality),
 }
 
+#[cfg(test)]
 fn eval_row(
 	ops: &[Op],
 	batch: &RecordBatch,
@@ -549,6 +1409,7 @@ fn eval_row(
 	matches!(stack.last(), Some(Value::Bool(true)))
 }
 
+#[cfg(test)]
 fn exec_op<'a>(
 	op: &'a Op,
 	stack: &mut Vec<Value<'a>>,
@@ -689,6 +1550,7 @@ fn exec_op<'a>(
 /// Apply a comparison opcode. `None` signals a trap (type mismatch
 /// or NaN); `Some(Value::Null)` carries 3VL null propagation; the
 /// normal result is `Some(Value::Bool(_))`.
+#[cfg(test)]
 fn compare<'a>(a: &Value<'a>, b: &Value<'a>, op: &Op) -> Option<Value<'a>> {
 	if matches!(a, Value::Null) || matches!(b, Value::Null) {
 		return Some(Value::Null);
@@ -722,6 +1584,7 @@ fn compare<'a>(a: &Value<'a>, b: &Value<'a>, op: &Op) -> Option<Value<'a>> {
 /// the Arrow `DataType`. Returns `Some(Value::Null)` for real nulls
 /// and `None` for types the interpreter doesn't support — the
 /// latter traps the current row to `false`.
+#[cfg(test)]
 fn read_column(batch: &RecordBatch, col: usize, row: usize) -> Option<Value<'_>> {
 	if col >= batch.num_columns() {
 		return None;
@@ -820,7 +1683,8 @@ fn read_identity(buf: &[u8], i: &mut usize) -> std::io::Result<Identity> {
 mod tests {
 	use super::*;
 	use arrow::array::{
-		FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int64Array, StringArray, UInt64Array,
+		FixedSizeBinaryArray, FixedSizeBinaryBuilder, Float32Array, Float64Array, Int32Array,
+		Int64Array, LargeStringArray, StringArray, TimestampMillisecondArray, UInt64Array,
 	};
 	use arrow::datatypes::{Field, Schema};
 	use rand::{Rng, SeedableRng};
@@ -848,6 +1712,18 @@ mod tests {
 					out.push(OP_PUSH_STR);
 					out.extend_from_slice(&(s.len() as u16).to_le_bytes());
 					out.extend_from_slice(s.as_bytes());
+				}
+				Instr::PushBool(value) => {
+					out.push(OP_PUSH_BOOL);
+					out.push(u8::from(*value));
+				}
+				Instr::PushFloat(value) => {
+					out.push(OP_PUSH_FLOAT);
+					out.extend_from_slice(&value.to_le_bytes());
+				}
+				Instr::PushTs(value) => {
+					out.push(OP_PUSH_TS);
+					out.extend_from_slice(&value.to_le_bytes());
 				}
 				Instr::PushIdentity(bytes) => {
 					out.push(OP_PUSH_IDENTITY);
@@ -879,6 +1755,9 @@ mod tests {
 		PushCol(u32),
 		PushInt(i64),
 		PushStr(&'a str),
+		PushBool(bool),
+		PushFloat(f64),
+		PushTs(i64),
 		PushIdentity([u8; 32]),
 		PushLocality(u64),
 		Raw(u8),
@@ -926,6 +1805,59 @@ mod tests {
 				Arc::new(identities.finish()),
 				Arc::new(localities),
 				Arc::new(labels),
+			],
+		)
+		.unwrap()
+	}
+
+	fn analytics_batch() -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("small", DataType::Int32, true),
+			Field::new("score", DataType::Float64, true),
+			Field::new("flag", DataType::Boolean, true),
+			Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+			Field::new("tag", DataType::LargeUtf8, true),
+			Field::new("score32", DataType::Float32, true),
+		]));
+		let small = Int32Array::from(vec![Some(1_i32), Some(7), None, Some(-3), Some(i32::MAX)]);
+		let score = Float64Array::from(vec![
+			Some(1.5_f64),
+			Some(f64::NAN),
+			None,
+			Some(-0.0),
+			Some(10.0),
+		]);
+		let flag = BooleanArray::from(vec![Some(true), Some(false), None, Some(true), Some(false)]);
+		let ts = TimestampMillisecondArray::from(vec![
+			Some(1_000_i64),
+			Some(2_000),
+			None,
+			Some(-100),
+			Some(10_000),
+		]);
+		let tag = LargeStringArray::from(vec![
+			Some("alpha"),
+			Some("beta"),
+			None,
+			Some("gamma"),
+			Some("delta"),
+		]);
+		let score32 = Float32Array::from(vec![
+			Some(1.25_f32),
+			Some(f32::NAN),
+			None,
+			Some(-0.0),
+			Some(9.5),
+		]);
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(small),
+				Arc::new(score),
+				Arc::new(flag),
+				Arc::new(ts),
+				Arc::new(tag),
+				Arc::new(score32),
 			],
 		)
 		.unwrap()
@@ -1178,9 +2110,51 @@ mod tests {
 				.unwrap()
 				.value(row)
 				.to_owned(),
+			DataType::LargeUtf8 => array
+				.as_any()
+				.downcast_ref::<LargeStringArray>()
+				.unwrap()
+				.value(row)
+				.to_owned(),
 			DataType::Int64 => array
 				.as_any()
 				.downcast_ref::<Int64Array>()
+				.unwrap()
+				.value(row)
+				.to_string(),
+			DataType::Int32 => array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.unwrap()
+				.value(row)
+				.to_string(),
+			DataType::Float64 => format!(
+				"{:016x}",
+				array
+					.as_any()
+					.downcast_ref::<Float64Array>()
+					.unwrap()
+					.value(row)
+					.to_bits()
+			),
+			DataType::Float32 => format!(
+				"{:08x}",
+				array
+					.as_any()
+					.downcast_ref::<Float32Array>()
+					.unwrap()
+					.value(row)
+					.to_bits()
+			),
+			DataType::Boolean => array
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.unwrap()
+				.value(row)
+				.to_string(),
+			DataType::Timestamp(TimeUnit::Millisecond, _) => array
+				.as_any()
+				.downcast_ref::<TimestampMillisecondArray>()
 				.unwrap()
 				.value(row)
 				.to_string(),
@@ -1223,6 +2197,32 @@ mod tests {
 					expected.schema().field(col).name(),
 				);
 			}
+		}
+	}
+
+	fn assert_scalar_vector_parity(
+		bytecode: &[u8],
+		batch: &RecordBatch,
+		context: Option<ExecutionContext>,
+	) {
+		let program = Program::compile(bytecode).expect("parity bytecode must compile");
+		assert_program_scalar_vector_parity(&program, batch, context);
+	}
+
+	fn assert_program_scalar_vector_parity(
+		program: &Program,
+		batch: &RecordBatch,
+		context: Option<ExecutionContext>,
+	) {
+		let scalar = execute_program_scalar_reference(program, batch, context);
+		let vector = execute_program_with_context(program, batch, context);
+		assert_eq!(
+			scalar.is_ok(),
+			vector.is_ok(),
+			"scalar/vector accepted behavior diverged: scalar={scalar:?} vector={vector:?}"
+		);
+		if let (Ok(expected), Ok(actual)) = (scalar, vector) {
+			assert_batches_equivalent(&expected, &actual);
 		}
 	}
 
@@ -1299,6 +2299,7 @@ mod tests {
 							execute_program_with_context(&program, &batch, case.context).unwrap();
 						let expected = reference_output(&batch, reference);
 						assert_batches_equivalent(&expected, &actual);
+						assert_program_scalar_vector_parity(&program, &batch, case.context);
 					}
 					None => {
 						assert!(
@@ -1325,7 +2326,159 @@ mod tests {
 				rng.fill_bytes(&mut bytecode);
 				bytecode
 			};
-			let _ = execute_with_context(&bytecode, &batch, context);
+			if let Ok(program) = Program::compile(&bytecode) {
+				assert_program_scalar_vector_parity(&program, &batch, Some(context));
+			} else {
+				let _ = execute_with_context(&bytecode, &batch, context);
+			}
+		}
+	}
+
+	fn assert_generated_valid_program_fuzz(sample_count: u64) {
+		let mut rng = rand::rngs::StdRng::seed_from_u64(0x005E_D1FF_C0DE_2026);
+		for _ in 0..sample_count {
+			let (batch, bytecode, context) = generated_valid_case(&mut rng);
+			assert_scalar_vector_parity(&bytecode, &batch, context);
+		}
+	}
+
+	fn generated_valid_case(
+		rng: &mut rand::rngs::StdRng,
+	) -> (RecordBatch, Vec<u8>, Option<ExecutionContext>) {
+		match rng.next_u32() % 12 {
+			0 => (
+				users_batch(),
+				assemble(&[
+					Instr::PushCol(1),
+					Instr::PushInt((rng.next_u32() % 40) as i64),
+					Instr::Raw(OP_GTE),
+				]),
+				None,
+			),
+			1 => (
+				users_batch(),
+				assemble(&[
+					Instr::PushCol(2),
+					Instr::PushStr("active"),
+					Instr::PushStr("pending"),
+					Instr::PushStr("missing"),
+					Instr::InList(3),
+				]),
+				None,
+			),
+			2 => (
+				users_batch(),
+				assemble(&[
+					Instr::PushCol(1),
+					Instr::PushInt(18),
+					Instr::Raw(OP_GTE),
+					Instr::PushCol(2),
+					Instr::PushStr("active"),
+					Instr::Raw(OP_EQ),
+					Instr::Raw(OP_OR),
+					Instr::Project(&[0, 1]),
+				]),
+				None,
+			),
+			3 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(0),
+					Instr::PushInt(rng.next_u32() as i64 - i32::MAX as i64),
+					Instr::Raw(OP_LT),
+				]),
+				None,
+			),
+			4 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(1),
+					Instr::PushFloat((rng.next_u32() % 12) as f64 - 2.0),
+					Instr::Raw(OP_GTE),
+				]),
+				None,
+			),
+			5 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(5),
+					Instr::PushFloat((rng.next_u32() % 8) as f64),
+					Instr::Raw(OP_LTE),
+				]),
+				None,
+			),
+			6 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(3),
+					Instr::PushTs((rng.next_u32() % 4_000) as i64),
+					Instr::Raw(OP_GTE),
+				]),
+				None,
+			),
+			7 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(4),
+					Instr::PushStr(if rng.next_u32() % 2 == 0 {
+						"alpha"
+					} else {
+						"delta"
+					}),
+					Instr::Raw(OP_EQ),
+				]),
+				None,
+			),
+			8 => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(2),
+					Instr::PushBool(true),
+					Instr::Raw(OP_EQ),
+					Instr::Raw(OP_NOT),
+				]),
+				None,
+			),
+			9 => {
+				let ctx = ExecutionContext {
+					identity: identity(0x22),
+					locality: Locality::new(2),
+				};
+				(
+					identity_locality_batch(),
+					assemble(&[
+						Instr::Raw(OP_LOAD_IDENTITY),
+						Instr::PushIdentity(
+							identity(if rng.next_u32() % 2 == 0 { 0x22 } else { 0x33 })
+								.into_bytes(),
+						),
+						Instr::Raw(OP_EQ_IDENTITY),
+					]),
+					Some(ctx),
+				)
+			}
+			10 => (
+				identity_locality_batch(),
+				assemble(&[
+					Instr::Raw(OP_ROUTE_BY_LOCALITY),
+					Instr::PushLocality(1),
+					Instr::PushLocality(3),
+					Instr::Raw(OP_RANGE_LOCALITY),
+				]),
+				Some(ExecutionContext {
+					identity: identity(0x11),
+					locality: Locality::new(rng.next_u64() % 5),
+				}),
+			),
+			_ => (
+				analytics_batch(),
+				assemble(&[
+					Instr::PushCol(1),
+					Instr::PushFloat(f64::NAN),
+					Instr::Raw(OP_EQ),
+				]),
+				None,
+			),
 		}
 	}
 
@@ -1584,6 +2737,92 @@ mod tests {
 			Instr::Raw(OP_RANGE_LOCALITY),
 		]);
 		assert!(Program::compile(&invalid_locality_range).is_err());
+	}
+
+	#[test]
+	fn scalar_reference_matches_vectorized_structured_corpus() {
+		for case in structured_fuzz_cases() {
+			if case.reference.is_none() {
+				continue;
+			}
+			let batch = batch_for_fuzz_fixture(case.batch);
+			assert_scalar_vector_parity(&case.bytecode, &batch, case.context);
+		}
+	}
+
+	#[test]
+	fn generated_valid_programs_match_scalar_reference() {
+		assert_generated_valid_program_fuzz(512);
+	}
+
+	#[test]
+	fn float_nan_comparison_drops_nan_row_without_total_ordering() {
+		let bytecode = assemble(&[Instr::PushCol(1), Instr::PushFloat(0.0), Instr::Raw(OP_GT)]);
+		let batch = analytics_batch();
+		assert_scalar_vector_parity(&bytecode, &batch, None);
+		let out = execute(&bytecode, &batch).unwrap();
+		assert_eq!(out.num_rows(), 2);
+	}
+
+	#[test]
+	fn timestamp_int_cross_type_comparison_matches_scalar_semantics() {
+		let bytecode = assemble(&[Instr::PushCol(3), Instr::PushInt(1_000), Instr::Raw(OP_GTE)]);
+		let batch = analytics_batch();
+		assert_scalar_vector_parity(&bytecode, &batch, None);
+		let out = execute(&bytecode, &batch).unwrap();
+		assert_eq!(out.num_rows(), 3);
+	}
+
+	#[test]
+	fn int_float_cross_type_comparison_matches_scalar_semantics() {
+		let bytecode = assemble(&[Instr::PushCol(0), Instr::PushFloat(0.5), Instr::Raw(OP_GT)]);
+		let batch = analytics_batch();
+		assert_scalar_vector_parity(&bytecode, &batch, None);
+		let out = execute(&bytecode, &batch).unwrap();
+		assert_eq!(out.num_rows(), 3);
+	}
+
+	#[test]
+	fn in_list_null_target_remains_null_for_is_null() {
+		let bytecode = assemble(&[
+			Instr::PushCol(1),
+			Instr::PushInt(18),
+			Instr::InList(1),
+			Instr::Raw(OP_IS_NULL),
+		]);
+		let batch = users_batch();
+		assert_scalar_vector_parity(&bytecode, &batch, None);
+		let out = execute(&bytecode, &batch).unwrap();
+		assert_eq!(out.num_rows(), 1);
+	}
+
+	#[test]
+	fn runtime_trap_returns_empty_projected_batch() {
+		let bytecode = assemble(&[
+			Instr::PushCol(1),
+			Instr::PushBool(true),
+			Instr::Raw(OP_AND),
+			Instr::Project(&[0]),
+		]);
+		let out = execute(&bytecode, &users_batch()).unwrap();
+		assert_eq!(out.num_rows(), 0);
+		assert_eq!(out.num_columns(), 1);
+		assert_eq!(out.schema().field(0).name(), "name");
+	}
+
+	#[test]
+	fn empty_batch_with_projection_stays_empty_and_projected() {
+		let bytecode = assemble(&[
+			Instr::PushCol(1),
+			Instr::PushInt(18),
+			Instr::Raw(OP_GTE),
+			Instr::Project(&[0]),
+		]);
+		let batch = users_batch().slice(0, 0);
+		assert_scalar_vector_parity(&bytecode, &batch, None);
+		let out = execute(&bytecode, &batch).unwrap();
+		assert_eq!(out.num_rows(), 0);
+		assert_eq!(out.num_columns(), 1);
 	}
 
 	#[test]

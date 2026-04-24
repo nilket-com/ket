@@ -36,6 +36,9 @@ const WAL_FSYNC_LATENCY_BUCKETS_MICROS: &[u64] = &[
 	100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
 	1_000_000,
 ];
+const WPBC_EXEC_BUCKETS_MICROS: &[u64] = &[
+	25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
+];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -69,6 +72,100 @@ impl Gauge {
 
 	pub fn get(&self) -> u64 {
 		self.0.load(Ordering::Relaxed)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WpbcRuntime {
+	Vectorized,
+	ScalarReference,
+}
+
+impl WpbcRuntime {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Vectorized => "vectorized",
+			Self::ScalarReference => "scalar_reference",
+		}
+	}
+}
+
+#[derive(Default)]
+struct WpbcRuntimeCounters {
+	vectorized: Counter,
+	scalar_reference: Counter,
+}
+
+impl WpbcRuntimeCounters {
+	fn counter(&self, runtime: WpbcRuntime) -> &Counter {
+		match runtime {
+			WpbcRuntime::Vectorized => &self.vectorized,
+			WpbcRuntime::ScalarReference => &self.scalar_reference,
+		}
+	}
+
+	fn add(&self, runtime: WpbcRuntime, value: u64) {
+		self.counter(runtime).add(value);
+	}
+
+	fn total(&self) -> u64 {
+		self.vectorized.get() + self.scalar_reference.get()
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for runtime in [WpbcRuntime::Vectorized, WpbcRuntime::ScalarReference] {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("runtime", runtime.as_str())],
+				self.counter(runtime).get(),
+			);
+		}
+	}
+}
+
+struct WpbcRuntimeHistograms {
+	vectorized: Histogram,
+	scalar_reference: Histogram,
+}
+
+impl Default for WpbcRuntimeHistograms {
+	fn default() -> Self {
+		Self {
+			vectorized: Histogram::new(WPBC_EXEC_BUCKETS_MICROS),
+			scalar_reference: Histogram::new(WPBC_EXEC_BUCKETS_MICROS),
+		}
+	}
+}
+
+impl WpbcRuntimeHistograms {
+	fn histogram(&self, runtime: WpbcRuntime) -> &Histogram {
+		match runtime {
+			WpbcRuntime::Vectorized => &self.vectorized,
+			WpbcRuntime::ScalarReference => &self.scalar_reference,
+		}
+	}
+
+	fn observe_duration(&self, runtime: WpbcRuntime, duration: Duration) {
+		self.histogram(runtime).observe_duration(duration);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		render_histogram_micros_series(
+			out,
+			name,
+			&[("runtime", WpbcRuntime::Vectorized.as_str())],
+			&self.vectorized.snapshot(),
+		);
+		render_histogram_micros_series(
+			out,
+			name,
+			&[("runtime", WpbcRuntime::ScalarReference.as_str())],
+			&self.scalar_reference.snapshot(),
+		);
 	}
 }
 
@@ -563,6 +660,11 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_rejections_actor_total: Counter,
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
+	wpbc_rows_scanned: WpbcRuntimeCounters,
+	wpbc_rows_returned: WpbcRuntimeCounters,
+	wpbc_exec_micros: WpbcRuntimeHistograms,
+	wpbc_kernel_error_total: WpbcRuntimeCounters,
+	wpbc_intermediate_arrays: WpbcRuntimeCounters,
 
 	pub group_commit_window_seconds: Histogram,
 	pub data_ring_durable_quorum_latency_seconds: Histogram,
@@ -658,6 +760,11 @@ impl Default for MetricsRegistry {
 			data_ring_backpressure_rejections_actor_total: Counter::default(),
 			data_ring_backpressure_active_tenant_requests: Gauge::default(),
 			data_ring_backpressure_active_actor_requests: Gauge::default(),
+			wpbc_rows_scanned: WpbcRuntimeCounters::default(),
+			wpbc_rows_returned: WpbcRuntimeCounters::default(),
+			wpbc_exec_micros: WpbcRuntimeHistograms::default(),
+			wpbc_kernel_error_total: WpbcRuntimeCounters::default(),
+			wpbc_intermediate_arrays: WpbcRuntimeCounters::default(),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			data_ring_durable_quorum_latency_seconds: Histogram::new(
@@ -777,6 +884,23 @@ impl MetricsRegistry {
 			.raft_current_leader_id
 			.lock()
 			.expect("raft leader gauge mutex poisoned") = leader_id.map(|id| format!("n-{id:02}"));
+	}
+
+	pub fn observe_wpbc_execution(
+		&self,
+		runtime: WpbcRuntime,
+		rows_scanned: u64,
+		rows_returned: u64,
+		duration: Duration,
+		kernel_errors: u64,
+		intermediate_arrays: u64,
+	) {
+		self.wpbc_rows_scanned.add(runtime, rows_scanned);
+		self.wpbc_rows_returned.add(runtime, rows_returned);
+		self.wpbc_exec_micros.observe_duration(runtime, duration);
+		self.wpbc_kernel_error_total.add(runtime, kernel_errors);
+		self.wpbc_intermediate_arrays
+			.add(runtime, intermediate_arrays);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1028,6 +1152,42 @@ impl MetricsRegistry {
 			"wendelon_data_ring_backpressure_active_actor_requests",
 			"Actor-scoped Data Ring requests currently admitted by post-auth backpressure control.",
 			self.data_ring_backpressure_active_actor_requests.get(),
+		);
+		self.wpbc_rows_scanned.render(
+			&mut out,
+			"wendelon_wpbc_rows_scanned_total",
+			"Rows scanned by WPBC execution.",
+		);
+		self.wpbc_rows_returned.render(
+			&mut out,
+			"wendelon_wpbc_rows_returned_total",
+			"Rows returned after WPBC filtering.",
+		);
+		// Derived from the scanned/returned counters instead of stored as
+		// a separate hot-path metric.
+		render_gauge_f64(
+			&mut out,
+			"wendelon_wpbc_mask_selectivity",
+			"Aggregate WPBC mask selectivity, computed as rows_returned / rows_scanned.",
+			mask_selectivity(
+				self.wpbc_rows_scanned.total(),
+				self.wpbc_rows_returned.total(),
+			),
+		);
+		self.wpbc_exec_micros.render(
+			&mut out,
+			"wendelon_wpbc_exec_micros",
+			"WPBC execution duration in microseconds.",
+		);
+		self.wpbc_kernel_error_total.render(
+			&mut out,
+			"wendelon_wpbc_kernel_error_total",
+			"WPBC vector kernel or runtime-trap errors normalized during execution.",
+		);
+		self.wpbc_intermediate_arrays.render(
+			&mut out,
+			"wendelon_wpbc_intermediate_arrays_total",
+			"Intermediate Arrow arrays materialized by WPBC execution.",
 		);
 		render_histogram(
 			&mut out,
@@ -1328,6 +1488,12 @@ fn render_gauge(out: &mut String, name: &str, help: &str, value: u64) {
 	let _ = writeln!(out, "{name} {value}");
 }
 
+fn render_gauge_f64(out: &mut String, name: &str, help: &str, value: f64) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} gauge");
+	let _ = writeln!(out, "{name} {value:.6}");
+}
+
 fn render_counter_family_header(out: &mut String, name: &str, help: &str) {
 	let _ = writeln!(out, "# HELP {name} {help}");
 	let _ = writeln!(out, "# TYPE {name} counter");
@@ -1368,6 +1534,34 @@ fn render_histogram(out: &mut String, name: &str, help: &str, snapshot: &Histogr
 	let _ = writeln!(out, "{name}_count {}", snapshot.count);
 }
 
+fn render_histogram_micros_series(
+	out: &mut String,
+	name: &str,
+	labels: &[(&str, &str)],
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let rendered_labels = render_labels(labels);
+	let mut cumulative = 0u64;
+	for (idx, bound_micros) in snapshot.bounds_micros.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(
+			out,
+			"{name}_bucket{{{rendered_labels},le=\"{bound_micros}\"}} {cumulative}",
+		);
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds_micros.len()];
+	let _ = writeln!(
+		out,
+		"{name}_bucket{{{rendered_labels},le=\"+Inf\"}} {cumulative}"
+	);
+	let _ = writeln!(
+		out,
+		"{name}_sum{{{rendered_labels}}} {}",
+		snapshot.sum_micros
+	);
+	let _ = writeln!(out, "{name}_count{{{rendered_labels}}} {}", snapshot.count);
+}
+
 fn render_labels(labels: &[(&str, &str)]) -> String {
 	let mut rendered = String::new();
 	for (idx, (key, value)) in labels.iter().enumerate() {
@@ -1397,11 +1591,19 @@ fn render_seconds_from_micros(value_micros: u64) -> String {
 	format!("{seconds}.{fractional}")
 }
 
+fn mask_selectivity(rows_scanned: u64, rows_returned: u64) -> f64 {
+	if rows_scanned == 0 {
+		0.0
+	} else {
+		rows_returned as f64 / rows_scanned as f64
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{
 		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
-		PendingFinalizationReplayPath, render_histogram,
+		PendingFinalizationReplayPath, WpbcRuntime, render_histogram,
 	};
 	use crate::schema::WriteStatus;
 	use std::time::Duration;
@@ -1453,6 +1655,14 @@ mod tests {
 		registry.observe_durable_quorum_latency(Duration::from_micros(1_500));
 		registry.observe_wal_append_latency(Duration::from_micros(400));
 		registry.observe_wal_fsync_latency(Duration::from_micros(2_200));
+		registry.observe_wpbc_execution(
+			WpbcRuntime::Vectorized,
+			10,
+			4,
+			Duration::from_micros(125),
+			1,
+			3,
+		);
 
 		let rendered = registry.render_prometheus();
 		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
@@ -1461,6 +1671,17 @@ mod tests {
 		));
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"not_leader\"} 1")
+		);
+		assert!(rendered.contains("wendelon_wpbc_rows_scanned_total{runtime=\"vectorized\"} 10"));
+		assert!(rendered.contains("wendelon_wpbc_rows_returned_total{runtime=\"vectorized\"} 4"));
+		assert!(rendered.contains("wendelon_wpbc_mask_selectivity 0.400000"));
+		assert!(
+			rendered
+				.contains("wendelon_wpbc_exec_micros_bucket{runtime=\"vectorized\",le=\"250\"} 1")
+		);
+		assert!(rendered.contains("wendelon_wpbc_kernel_error_total{runtime=\"vectorized\"} 1"));
+		assert!(
+			rendered.contains("wendelon_wpbc_intermediate_arrays_total{runtime=\"vectorized\"} 3")
 		);
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")

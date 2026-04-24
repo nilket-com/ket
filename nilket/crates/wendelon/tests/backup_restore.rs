@@ -76,6 +76,7 @@ fn tenant_finalization(
 		tenant_id,
 		key_identity: id(1),
 		charged_bytes,
+		record_count: 1,
 	}
 }
 

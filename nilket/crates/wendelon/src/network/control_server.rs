@@ -16,6 +16,7 @@ use crate::consensus::{
 };
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
+use crate::integration::compute::decode_schema_update_envelope_v1;
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
@@ -68,6 +69,7 @@ enum ControlOperation {
 	Transfer,
 	AdvanceEpoch,
 	Join,
+	SchemaUpdate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +104,15 @@ pub struct JoinClusterResponseWire {
 pub struct AuditChainHeadResponseWire {
 	#[serde(default)]
 	pub head: Option<AuditChainHead>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaUpdateResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +302,7 @@ impl WendelonControlServer {
 			| ControlOperation::Transfer
 			| ControlOperation::AdvanceEpoch
 			| ControlOperation::Join => ActorPermission::ClusterControl,
+			ControlOperation::SchemaUpdate => ActorPermission::TenantAdminMutation,
 		};
 		authorize_actor(&context.actor, permission).map_err(|error| {
 			Error::new(
@@ -346,6 +358,29 @@ impl WendelonControlServer {
 		})
 	}
 
+	fn build_schema_update_frame(
+		&self,
+		stream_id: u32,
+		resp: &SchemaUpdateResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, resp)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::SCHEMA_UPDATE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
 	fn tenant_admin_rejection(
 		&self,
 		frame: &HrftFrame,
@@ -380,6 +415,24 @@ impl WendelonControlServer {
 				reason_code,
 				leader_hint: leader_hint.map(|node| node.id),
 				entries: Vec::new(),
+				message: Some(message.into()),
+			},
+		)
+	}
+
+	fn schema_update_rejection(
+		&self,
+		frame: &HrftFrame,
+		reason_code: u8,
+		message: impl Into<String>,
+		leader_hint: Option<NodeId>,
+	) -> std::io::Result<HrftFrame> {
+		self.build_schema_update_frame(
+			frame.header.stream_id,
+			&SchemaUpdateResponseWire {
+				accepted: false,
+				reason_code,
+				leader_hint: leader_hint.map(|node| node.id),
 				message: Some(message.into()),
 			},
 		)
@@ -656,6 +709,101 @@ impl WendelonControlServer {
 				self.revocation_admin_success_frame(frame.header.stream_id)
 					.await
 			}
+		}
+	}
+
+	async fn handle_schema_update(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"SCHEMA_UPDATE_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let envelope = match decode_schema_update_envelope_v1(&frame.meta) {
+			Ok(envelope) => envelope,
+			Err(err) => {
+				return self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					err.to_string(),
+					None,
+				);
+			}
+		};
+		// Tenant-scoped actors are limited to their claimed tenant.
+		// Cluster/platform actors have no tenant claim and are already
+		// gated by TenantAdminMutation above.
+		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()? {
+			if claimed_tenant != envelope.tenant_id {
+				return self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_AUTHORIZATION_FAILED,
+					format!(
+						"actor tenant {} is not allowed to update schema for tenant {}",
+						claimed_tenant.get(),
+						envelope.tenant_id.get()
+					),
+					None,
+				);
+			}
+		}
+		if !self.is_leader().await {
+			return self.schema_update_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				"schema updates must be sent to the current leader",
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			);
+		}
+
+		match self
+			.raft
+			.client_write(WendelonRequest::SchemaUpdate(frame.meta.to_vec()))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => self.build_schema_update_frame(
+					frame.header.stream_id,
+					&SchemaUpdateResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						message: None,
+					},
+				),
+				WendelonResponse::Error(message) => self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_INVALID_CONFIG,
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from schema update",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.schema_update_rejection(
+				&frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.schema_update_rejection(
+				&frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
 		}
 	}
 
@@ -2295,6 +2443,10 @@ impl ControlRingServer for WendelonControlServer {
 			MsgType::JOIN_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Join)?;
 				self.handle_join(&context, frame).await?
+			}
+			MsgType::SCHEMA_UPDATE_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::SchemaUpdate)?;
+				self.handle_schema_update(&context, frame).await?
 			}
 			MsgType::TENANT_ADMIN_REQ => self.handle_tenant_admin(&context, frame).await?,
 			_ => {

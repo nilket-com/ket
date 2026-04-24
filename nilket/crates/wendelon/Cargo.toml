@@ -79,3 +79,7 @@ harness = false
 [[bench]]
 name = "io_topology"
 harness = false
+
+[[bench]]
+name = "wpbc_vectorized"
+harness = false

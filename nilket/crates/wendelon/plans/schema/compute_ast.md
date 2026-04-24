@@ -1,18 +1,18 @@
 # Wendelon Pushdown Bytecode (WPBC) Spec
 
-To keep Wendelon strictly as a high-performance storage layer while supporting complex relational queries from DataFusion and Ballista, Wendelon implements a native, stack-based bytecode AST for Predicate Pushdown.
+To keep Wendelon strictly as a high-performance storage layer while supporting complex relational and programmatic queries from the Toron compute tier, Wendelon implements a native, stack-based bytecode AST for Predicate Pushdown.
 
 ## 1. The Compute Boundary
 
-Wendelon does not parse SQL. It is a dumb, zero-copy byte server. 
-When a DataFusion `TableProvider` executes a query, it compiles the physical plan's `WHERE` clauses and `SELECT` projections into WPBC. 
+Wendelon does not parse SQL or Rune. It is a dumb, zero-copy byte server.
+User queries are authored in Rune or SQL, lowered into `toron-ir` by Toron, and the targetable physical-expression fragments are compiled to WPBC (per ADR 036). Wendelon receives only validated WPBC bytes.
 
-This bytecode is attached as the "trailing section" of a `ReadRequestMeta` frame. The Wendelon Data Node executes this bytecode against the Arrow `RecordBatch` *before* returning it over the network, drastically reducing QUIC bandwidth and client-side memory pressure.
+The bytecode is attached as the "trailing section" of a `ReadRequestMeta` frame. The Wendelon Data Node executes this bytecode against the Arrow `RecordBatch` *before* returning it over the network, drastically reducing QUIC bandwidth and client-side memory pressure.
 
 ## 2. The Stack Machine
 
 The WPBC interpreter is a zero-allocation, hyper-optimized stack machine running directly on the Data Node.
-- It evaluates the bytecode against each row in the Arrow batch (or utilizing Arrow's vectorized compute kernels where supported).
+- It evaluates the bytecode against each `RecordBatch` using Arrow's vectorized compute kernels; rows evaluating to `false` or `null` are discarded (see ADR 035).
 - The execution produces a boolean filter mask.
 - Rows evaluating to `false` are discarded.
 - Only the projected columns of the surviving rows are serialized back to the client.
@@ -52,7 +52,7 @@ WPBC uses 1-byte opcodes followed by optional immediate arguments.
 
 ## 4. Type System & Safety Bounds
 
-To ensure Wendelon Data Nodes cannot be crashed or OOM'd by malicious or buggy WPBC payloads from DataFusion, strict safety bounds are enforced.
+To ensure Wendelon Data Nodes cannot be crashed or OOM'd by malicious or buggy WPBC payloads from Toron, strict safety bounds are enforced.
 
 ### 4.1 Type System & Mismatches
 WPBC is dynamically typed during interpretation (based on the Arrow schema). 
@@ -71,9 +71,9 @@ Wendelon adheres strictly to SQL's Three-Valued Logic (3VL).
 
 ## 5. Execution Example
 
-**SQL Query:** `SELECT name, age FROM users WHERE age >= 18 AND status IN ('active', 'pending')`
+**Example query (Rune or SQL through Toron):** `SELECT name, age FROM users WHERE age >= 18 AND status IN ('active', 'pending')`
 
-**WPBC Compilation (sent to Wendelon):**
+**WPBC compilation (emitted by Toron, consumed by Wendelon):**
 ```text
 PUSH_COL_u32 1      // Push 'age' column (index 1)
 PUSH_INT_i64 18     // Push literal 18
@@ -89,4 +89,4 @@ AND                 // Pop the two booleans, Push final result
 PROJECT 2 0 1       // Keep only 'name' (index 0) and 'age' (index 1)
 ```
 
-By executing this locally, Wendelon ensures DataFusion only receives the exact bytes necessary to satisfy the query, adhering to the strict Storage/Compute decoupling.
+By executing this locally, Wendelon ensures Toron only receives the exact bytes necessary to satisfy the query, adhering to the strict Storage/Compute decoupling.
