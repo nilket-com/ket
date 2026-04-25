@@ -130,6 +130,32 @@ pub struct Program {
 	project: Option<Vec<usize>>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColumnPredicateV1 {
+	pub column_index: usize,
+	pub comparison: ColumnPredicateComparisonV1,
+	pub literal: ColumnPredicateLiteralV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnPredicateComparisonV1 {
+	Eq,
+	Gt,
+	Gte,
+	Lt,
+	Lte,
+	InList,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColumnPredicateLiteralV1 {
+	Int(i64),
+	Str(Vec<u8>),
+	Float(f64),
+	Ts(i64),
+	List(Vec<ColumnPredicateLiteralV1>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionContext {
 	pub identity: Identity,
@@ -154,6 +180,172 @@ impl Program {
 		self.ops
 			.iter()
 			.any(|op| matches!(op, Op::LoadIdentity | Op::RouteByLocality))
+	}
+
+	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicateV1>> {
+		extract_conjunctive_column_predicates(&self.ops)
+	}
+}
+
+#[derive(Clone, Debug)]
+enum PredicateExpr {
+	Column(usize),
+	Literal(ColumnPredicateLiteralV1),
+	Predicates(Vec<ColumnPredicateV1>),
+	True,
+	Unsupported,
+}
+
+fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredicateV1>> {
+	if ops.is_empty() {
+		return Some(Vec::new());
+	}
+	let mut stack = Vec::with_capacity(STACK_DEPTH_LIMIT);
+	for op in ops {
+		match op {
+			Op::PushCol(column) => stack.push(PredicateExpr::Column(*column as usize)),
+			Op::PushInt(value) => stack.push(PredicateExpr::Literal(
+				ColumnPredicateLiteralV1::Int(*value),
+			)),
+			Op::PushStr(bytes) => stack.push(PredicateExpr::Literal(
+				ColumnPredicateLiteralV1::Str(bytes.clone()),
+			)),
+			Op::PushBool(value) => {
+				if *value {
+					stack.push(PredicateExpr::True);
+				} else {
+					stack.push(PredicateExpr::Unsupported);
+				}
+			}
+			Op::PushFloat(value) => stack.push(PredicateExpr::Literal(
+				ColumnPredicateLiteralV1::Float(*value),
+			)),
+			Op::PushTs(value) => {
+				stack.push(PredicateExpr::Literal(ColumnPredicateLiteralV1::Ts(*value)))
+			}
+			Op::Eq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+				let rhs = stack.pop()?;
+				let lhs = stack.pop()?;
+				stack.push(predicate_from_comparison(lhs, rhs, op)?);
+			}
+			Op::And => {
+				let rhs = stack.pop()?;
+				let lhs = stack.pop()?;
+				stack.push(predicate_and(lhs, rhs)?);
+			}
+			Op::InList(count) => {
+				let count = *count as usize;
+				if stack.len() < count + 1 {
+					return None;
+				}
+				let split = stack.len() - count;
+				let items = stack.drain(split..).collect::<Vec<_>>();
+				let target = stack.pop()?;
+				stack.push(predicate_from_in_list(target, items)?);
+			}
+			Op::Neq
+			| Op::Or
+			| Op::Not
+			| Op::IsNull
+			| Op::IsNotNull
+			| Op::LoadIdentity
+			| Op::PushIdentity(_)
+			| Op::EqIdentity
+			| Op::HashRangeIdentity
+			| Op::RouteByLocality
+			| Op::PushLocality(_)
+			| Op::RangeLocality => stack.push(PredicateExpr::Unsupported),
+		}
+		if stack.len() > STACK_DEPTH_LIMIT {
+			return None;
+		}
+	}
+	match stack.as_slice() {
+		[PredicateExpr::Predicates(predicates)] => Some(predicates.clone()),
+		[PredicateExpr::True] => Some(Vec::new()),
+		_ => None,
+	}
+}
+
+fn predicate_from_in_list(
+	target: PredicateExpr,
+	items: Vec<PredicateExpr>,
+) -> Option<PredicateExpr> {
+	let PredicateExpr::Column(column_index) = target else {
+		return None;
+	};
+	let mut literals = Vec::with_capacity(items.len());
+	for item in items {
+		match item {
+			PredicateExpr::Literal(literal) => literals.push(literal),
+			_ => return None,
+		}
+	}
+	Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+		column_index,
+		comparison: ColumnPredicateComparisonV1::InList,
+		literal: ColumnPredicateLiteralV1::List(literals),
+	}]))
+}
+
+fn predicate_from_comparison(
+	lhs: PredicateExpr,
+	rhs: PredicateExpr,
+	op: &Op,
+) -> Option<PredicateExpr> {
+	match (lhs, rhs) {
+		(PredicateExpr::Column(column_index), PredicateExpr::Literal(literal)) => {
+			Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+				column_index,
+				comparison: predicate_comparison(op)?,
+				literal,
+			}]))
+		}
+		(PredicateExpr::Literal(literal), PredicateExpr::Column(column_index)) => {
+			Some(PredicateExpr::Predicates(vec![ColumnPredicateV1 {
+				column_index,
+				comparison: predicate_comparison_reversed(op)?,
+				literal,
+			}]))
+		}
+		_ => None,
+	}
+}
+
+fn predicate_and(lhs: PredicateExpr, rhs: PredicateExpr) -> Option<PredicateExpr> {
+	match (lhs, rhs) {
+		(PredicateExpr::Predicates(mut left), PredicateExpr::Predicates(right)) => {
+			left.extend(right);
+			Some(PredicateExpr::Predicates(left))
+		}
+		(PredicateExpr::Predicates(predicates), PredicateExpr::True)
+		| (PredicateExpr::True, PredicateExpr::Predicates(predicates)) => {
+			Some(PredicateExpr::Predicates(predicates))
+		}
+		(PredicateExpr::True, PredicateExpr::True) => Some(PredicateExpr::True),
+		_ => None,
+	}
+}
+
+fn predicate_comparison(op: &Op) -> Option<ColumnPredicateComparisonV1> {
+	match op {
+		Op::Eq => Some(ColumnPredicateComparisonV1::Eq),
+		Op::Gt => Some(ColumnPredicateComparisonV1::Gt),
+		Op::Gte => Some(ColumnPredicateComparisonV1::Gte),
+		Op::Lt => Some(ColumnPredicateComparisonV1::Lt),
+		Op::Lte => Some(ColumnPredicateComparisonV1::Lte),
+		_ => None,
+	}
+}
+
+fn predicate_comparison_reversed(op: &Op) -> Option<ColumnPredicateComparisonV1> {
+	match op {
+		Op::Eq => Some(ColumnPredicateComparisonV1::Eq),
+		Op::Gt => Some(ColumnPredicateComparisonV1::Lt),
+		Op::Gte => Some(ColumnPredicateComparisonV1::Lte),
+		Op::Lt => Some(ColumnPredicateComparisonV1::Gt),
+		Op::Lte => Some(ColumnPredicateComparisonV1::Gte),
+		_ => None,
 	}
 }
 

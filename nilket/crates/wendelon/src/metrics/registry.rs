@@ -39,6 +39,9 @@ const WAL_FSYNC_LATENCY_BUCKETS_MICROS: &[u64] = &[
 const WPBC_EXEC_BUCKETS_MICROS: &[u64] = &[
 	25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
 ];
+const WPBC_LOCALITY_BUCKETS_MICROS: &[u64] = &[
+	10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
+];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -665,6 +668,10 @@ pub struct MetricsRegistry {
 	wpbc_exec_micros: WpbcRuntimeHistograms,
 	wpbc_kernel_error_total: WpbcRuntimeCounters,
 	wpbc_intermediate_arrays: WpbcRuntimeCounters,
+	wpbc_locality_arcs_scanned_total: Counter,
+	wpbc_range_decomposition_overflow_total: Counter,
+	wpbc_locality_decomposition_micros: Histogram,
+	wpbc_locality_encode_micros: Histogram,
 
 	pub group_commit_window_seconds: Histogram,
 	pub data_ring_durable_quorum_latency_seconds: Histogram,
@@ -765,6 +772,10 @@ impl Default for MetricsRegistry {
 			wpbc_exec_micros: WpbcRuntimeHistograms::default(),
 			wpbc_kernel_error_total: WpbcRuntimeCounters::default(),
 			wpbc_intermediate_arrays: WpbcRuntimeCounters::default(),
+			wpbc_locality_arcs_scanned_total: Counter::default(),
+			wpbc_range_decomposition_overflow_total: Counter::default(),
+			wpbc_locality_decomposition_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
+			wpbc_locality_encode_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			data_ring_durable_quorum_latency_seconds: Histogram::new(
@@ -901,6 +912,23 @@ impl MetricsRegistry {
 		self.wpbc_kernel_error_total.add(runtime, kernel_errors);
 		self.wpbc_intermediate_arrays
 			.add(runtime, intermediate_arrays);
+	}
+
+	pub fn observe_wpbc_locality_arcs_scanned(&self, arcs: u64) {
+		self.wpbc_locality_arcs_scanned_total.add(arcs);
+	}
+
+	pub fn observe_wpbc_range_decomposition_overflow(&self) {
+		self.wpbc_range_decomposition_overflow_total.inc();
+	}
+
+	pub fn observe_wpbc_locality_decomposition(&self, duration: Duration) {
+		self.wpbc_locality_decomposition_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_wpbc_locality_encode(&self, duration: Duration) {
+		self.wpbc_locality_encode_micros.observe_duration(duration);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1188,6 +1216,30 @@ impl MetricsRegistry {
 			&mut out,
 			"wendelon_wpbc_intermediate_arrays_total",
 			"Intermediate Arrow arrays materialized by WPBC execution.",
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_locality_arcs_scanned_total",
+			"Locality arcs admitted for WPBC scan planning.",
+			self.wpbc_locality_arcs_scanned_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_range_decomposition_overflow_total",
+			"Column-projection range decompositions that exceeded the arc or node budget and fell back to full table arcs.",
+			self.wpbc_range_decomposition_overflow_total.get(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_wpbc_locality_decomposition_micros",
+			"Column-projection locality range decomposition duration in microseconds.",
+			&self.wpbc_locality_decomposition_micros.snapshot(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_wpbc_locality_encode_micros",
+			"Column-projection write-locality encoding duration in microseconds.",
+			&self.wpbc_locality_encode_micros.snapshot(),
 		);
 		render_histogram(
 			&mut out,
@@ -1534,6 +1586,25 @@ fn render_histogram(out: &mut String, name: &str, help: &str, snapshot: &Histogr
 	let _ = writeln!(out, "{name}_count {}", snapshot.count);
 }
 
+fn render_histogram_micros(
+	out: &mut String,
+	name: &str,
+	help: &str,
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} histogram");
+	let mut cumulative = 0u64;
+	for (idx, bound_micros) in snapshot.bounds_micros.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(out, "{name}_bucket{{le=\"{bound_micros}\"}} {cumulative}");
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds_micros.len()];
+	let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+	let _ = writeln!(out, "{name}_sum {}", snapshot.sum_micros);
+	let _ = writeln!(out, "{name}_count {}", snapshot.count);
+}
+
 fn render_histogram_micros_series(
 	out: &mut String,
 	name: &str,
@@ -1663,6 +1734,10 @@ mod tests {
 			1,
 			3,
 		);
+		registry.observe_wpbc_locality_arcs_scanned(6);
+		registry.observe_wpbc_range_decomposition_overflow();
+		registry.observe_wpbc_locality_decomposition(Duration::from_micros(80));
+		registry.observe_wpbc_locality_encode(Duration::from_micros(40));
 
 		let rendered = registry.render_prometheus();
 		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
@@ -1683,6 +1758,14 @@ mod tests {
 		assert!(
 			rendered.contains("wendelon_wpbc_intermediate_arrays_total{runtime=\"vectorized\"} 3")
 		);
+		assert!(rendered.contains("wendelon_wpbc_locality_arcs_scanned_total 6"));
+		assert!(rendered.contains("wendelon_wpbc_range_decomposition_overflow_total 1"));
+		assert!(
+			rendered.contains("wendelon_wpbc_locality_decomposition_micros_bucket{le=\"100\"} 1")
+		);
+		assert!(rendered.contains("wendelon_wpbc_locality_decomposition_micros_count 1"));
+		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_bucket{le=\"50\"} 1"));
+		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_count 1"));
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")
 		);

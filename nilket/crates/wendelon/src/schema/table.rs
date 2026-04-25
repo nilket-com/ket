@@ -1,3 +1,6 @@
+use crate::schema::wpbc::{
+	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as WpbcProgram,
+};
 use crate::schema::{
 	ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, Locality, NodeId, TenantId,
 	WriteResponseMeta, write_payload_schema,
@@ -19,6 +22,7 @@ use std::io::{Cursor, Error, ErrorKind};
 
 const TABLE_ROW_IDENTITY_DOMAIN: &[u8] = b"wendelon.table-row.v1";
 const TABLE_LOCALITY_DOMAIN: &[u8] = b"wendelon.table-locality.v1";
+const TABLE_COLUMN_LOCALITY_HASH_DOMAIN: &[u8] = b"wendelon.table-column-locality.v1";
 
 pub const TABLE_SCHEMA_DESCRIPTOR_VERSION: u16 = 1;
 pub const TABLE_SPREAD_DEFAULT_FACTOR: u16 = 4;
@@ -26,6 +30,8 @@ pub const TABLE_SPREAD_MAX_FACTOR: u16 = 256;
 pub const TABLE_SPREAD_DEFAULT_PREFIX_BITS: u8 = 16;
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
+pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
+pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
 
 #[derive(
 	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
@@ -220,6 +226,50 @@ impl WpbcRejectCode {
 	pub const WPBC_REJECT_DUPLICATE_PK_IN_BATCH: Self = Self(0x3707);
 	pub const WPBC_REJECT_LOCALITY_UNSUPPORTED: Self = Self(0x3708);
 	pub const WPBC_REJECT_BATCH_TOO_LARGE: Self = Self(0x3709);
+	pub const WPBC_REJECT_CLUSTERING_TOO_WIDE: Self = Self(0x3801);
+	pub const WPBC_REJECT_CLUSTERING_EMPTY: Self = Self(0x3802);
+	pub const WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN: Self = Self(0x3803);
+	pub const WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED: Self = Self(0x3804);
+	pub const WPBC_REJECT_CLUSTERING_NULLABLE: Self = Self(0x3805);
+	pub const WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW: Self = Self(0x3806);
+	pub const WPBC_REJECT_CLUSTERING_WIDTH_INVALID: Self = Self(0x3807);
+	pub const WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED: Self = Self(0x3808);
+	pub const WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW: Self = Self(0x3809);
+	pub const WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN: Self = Self(0x380A);
+	pub const WPBC_REJECT_CLUSTERING_VALUE_NULL: Self = Self(0x380B);
+
+	pub const fn name(self) -> &'static str {
+		match self.0 {
+			0 => "NONE",
+			0x3701 => "WPBC_REJECT_SCHEMA_STALE",
+			0x3702 => "WPBC_REJECT_SCHEMA_UNKNOWN",
+			0x3703 => "WPBC_REJECT_COLUMN_TYPE_MISMATCH",
+			0x3704 => "WPBC_REJECT_PK_MISSING",
+			0x3705 => "WPBC_REJECT_PK_NULL",
+			0x3706 => "WPBC_REJECT_PK_TYPE_UNSUPPORTED",
+			0x3707 => "WPBC_REJECT_DUPLICATE_PK_IN_BATCH",
+			0x3708 => "WPBC_REJECT_LOCALITY_UNSUPPORTED",
+			0x3709 => "WPBC_REJECT_BATCH_TOO_LARGE",
+			0x3801 => "WPBC_REJECT_CLUSTERING_TOO_WIDE",
+			0x3802 => "WPBC_REJECT_CLUSTERING_EMPTY",
+			0x3803 => "WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN",
+			0x3804 => "WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED",
+			0x3805 => "WPBC_REJECT_CLUSTERING_NULLABLE",
+			0x3806 => "WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW",
+			0x3807 => "WPBC_REJECT_CLUSTERING_WIDTH_INVALID",
+			0x3808 => "WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED",
+			0x3809 => "WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW",
+			0x380A => "WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN",
+			0x380B => "WPBC_REJECT_CLUSTERING_VALUE_NULL",
+			_ => "WPBC_REJECT_UNKNOWN",
+		}
+	}
+}
+
+impl fmt::Display for WpbcRejectCode {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(self.name())
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,7 +289,7 @@ impl TableWriteValidationError {
 
 impl fmt::Display for TableWriteValidationError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "{:?}: {}", self.code, self.message)
+		write!(f, "{}: {}", self.code, self.message)
 	}
 }
 
@@ -337,7 +387,7 @@ pub fn validate_table_write_request_batch(
 
 	let mut key_identities = Vec::with_capacity(canonical_primary_keys.len());
 	let mut localities = Vec::with_capacity(canonical_primary_keys.len());
-	for pk in &canonical_primary_keys {
+	for (row, pk) in canonical_primary_keys.iter().enumerate() {
 		let key_identity = table_row_identity(meta.tenant_id, meta.table_object_id, pk);
 		let locality = match descriptor.locality_policy {
 			LocalityPolicyV1::IdentityProjection => Locality::from(key_identity),
@@ -350,12 +400,14 @@ pub fn validate_table_write_request_batch(
 						)
 					})?
 			}
-			LocalityPolicyV1::ColumnProjection(_) => {
-				return Err(TableWriteValidationError::new(
-					WpbcRejectCode::WPBC_REJECT_LOCALITY_UNSUPPORTED,
-					"ColumnProjection locality is reserved for ADR 038",
-				));
-			}
+			LocalityPolicyV1::ColumnProjection(ref projection) => column_projection_locality(
+				meta.tenant_id,
+				meta.table_object_id,
+				key_identity,
+				projection,
+				batch,
+				row,
+			)?,
 		};
 		key_identities.push(key_identity);
 		localities.push(locality);
@@ -496,10 +548,17 @@ pub struct TableSpreadLocalityDescriptorV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnLocalityDescriptorV1 {
-	pub columns: Vec<String>,
+	pub columns: Vec<ClusteringColumnSpecV1>,
 	pub projection: ProjectionFunctionV1,
 	pub spread_factor: u16,
 	pub prefix_bits: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusteringColumnSpecV1 {
+	pub name: String,
+	pub width_bits: u8,
+	pub string_prefix_bytes: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +566,7 @@ pub struct ColumnLocalityDescriptorV1 {
 pub enum ProjectionFunctionV1 {
 	RandomHash,
 	ZOrder,
+	Hilbert,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -760,6 +820,180 @@ pub fn table_spread_prefix_ranges(
 		.collect())
 }
 
+pub fn column_projection_prefix_ranges(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	projection: &ColumnLocalityDescriptorV1,
+) -> std::io::Result<Vec<(Locality, Locality)>> {
+	table_spread_prefix_ranges(
+		tenant_id,
+		table_object_id,
+		TableSpreadLocalityDescriptorV1 {
+			spread_factor: projection.spread_factor,
+			prefix_bits: projection.prefix_bits,
+		},
+	)
+}
+
+pub fn column_projection_predicate_ranges(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	schema: &Schema,
+	projection: &ColumnLocalityDescriptorV1,
+	program: &WpbcProgram,
+	arc_budget: usize,
+) -> std::io::Result<ColumnProjectionRangePruning> {
+	validate_column_projection(schema, projection)?;
+	if projection.projection != ProjectionFunctionV1::ZOrder {
+		return Ok(ColumnProjectionRangePruning::Fallback);
+	}
+	let Some(predicates) = program.conjunctive_column_predicates() else {
+		return Ok(ColumnProjectionRangePruning::Fallback);
+	};
+	let widths: Vec<u8> = projection
+		.columns
+		.iter()
+		.map(|column| column.width_bits)
+		.collect();
+	let clustering_columns: Vec<(usize, &ClusteringColumnSpecV1, usize)> = projection
+		.columns
+		.iter()
+		.enumerate()
+		.map(|(dim, column)| {
+			let column_index = schema.index_of(&column.name).map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("locality column {:?} cannot be indexed: {err}", column.name),
+				)
+			})?;
+			Ok((dim, column, column_index))
+		})
+		.collect::<std::io::Result<_>>()?;
+	let mut lower = vec![0_u64; projection.columns.len()];
+	let mut upper: Vec<u64> = widths
+		.iter()
+		.map(|width| low_mask(u32::from(*width)))
+		.collect();
+	let mut allowed_values: Vec<Option<BTreeSet<u64>>> =
+		projection.columns.iter().map(|_| None).collect();
+	let mut constrained = false;
+	for predicate in predicates {
+		for (dim, column, column_index) in &clustering_columns {
+			if *column_index != predicate.column_index {
+				continue;
+			}
+			let field = schema.field(*column_index);
+			match predicate.comparison {
+				ColumnPredicateComparisonV1::Eq => {
+					let Some(value) =
+						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
+					else {
+						return Ok(ColumnProjectionRangePruning::Fallback);
+					};
+					constrained = true;
+					lower[*dim] = lower[*dim].max(value);
+					upper[*dim] = upper[*dim].min(value);
+					let mut values = BTreeSet::new();
+					values.insert(value);
+					restrict_allowed_values(&mut allowed_values[*dim], values);
+				}
+				ColumnPredicateComparisonV1::Gt | ColumnPredicateComparisonV1::Gte => {
+					let Some(value) =
+						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
+					else {
+						return Ok(ColumnProjectionRangePruning::Fallback);
+					};
+					constrained = true;
+					lower[*dim] = lower[*dim].max(value);
+				}
+				ColumnPredicateComparisonV1::Lt | ColumnPredicateComparisonV1::Lte => {
+					let Some(value) =
+						normalize_clustering_literal(field.data_type(), &predicate.literal, column)
+					else {
+						return Ok(ColumnProjectionRangePruning::Fallback);
+					};
+					constrained = true;
+					upper[*dim] = upper[*dim].min(value);
+				}
+				ColumnPredicateComparisonV1::InList => {
+					let ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
+						return Ok(ColumnProjectionRangePruning::Fallback);
+					};
+					constrained = true;
+					let mut values = BTreeSet::new();
+					for literal in literals {
+						let Some(value) =
+							normalize_clustering_literal(field.data_type(), literal, column)
+						else {
+							return Ok(ColumnProjectionRangePruning::Fallback);
+						};
+						values.insert(value);
+					}
+					restrict_allowed_values(&mut allowed_values[*dim], values);
+				}
+			}
+		}
+	}
+	if !constrained {
+		return Ok(ColumnProjectionRangePruning::Fallback);
+	}
+	if lower.iter().zip(&upper).any(|(lo, hi)| lo > hi) {
+		return Ok(ColumnProjectionRangePruning::Pruned(Vec::new()));
+	}
+	for (dim, values) in allowed_values.iter_mut().enumerate() {
+		if let Some(values) = values {
+			values.retain(|value| lower[dim] <= *value && *value <= upper[dim]);
+			if values.is_empty() {
+				return Ok(ColumnProjectionRangePruning::Pruned(Vec::new()));
+			}
+		}
+	}
+	let table_prefixes = column_projection_table_prefixes(tenant_id, table_object_id, projection)?;
+	let prefix_count = table_prefixes.len().max(1);
+	let suffix_budget = (arc_budget / prefix_count).max(1);
+	let suffix_arcs = match decompose_z_order_ranges_with_allowed_values(
+		&lower,
+		&upper,
+		&widths,
+		&allowed_values,
+		suffix_budget,
+	) {
+		Ok(arcs) => arcs,
+		Err(RangeDecompositionOverflow) => return Ok(ColumnProjectionRangePruning::Overflow),
+	};
+	let suffix_width = clustering_suffix_width(&widths);
+	let entropy_bits = 64 - u32::from(projection.prefix_bits) - u32::from(suffix_width);
+	let entropy_mask = low_mask(entropy_bits);
+	let mut ranges = Vec::new();
+	for table_prefix in table_prefixes {
+		for (suffix_start, suffix_end) in &suffix_arcs {
+			if ranges.len() >= arc_budget {
+				return Ok(ColumnProjectionRangePruning::Overflow);
+			}
+			ranges.push((
+				Locality::new(table_prefix | (suffix_start << entropy_bits)),
+				Locality::new(table_prefix | (suffix_end << entropy_bits) | entropy_mask),
+			));
+		}
+	}
+	Ok(ColumnProjectionRangePruning::Pruned(ranges))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnProjectionRangePruning {
+	Pruned(Vec<(Locality, Locality)>),
+	Fallback,
+	Overflow,
+}
+
+fn restrict_allowed_values(slot: &mut Option<BTreeSet<u64>>, values: BTreeSet<u64>) {
+	if let Some(existing) = slot {
+		existing.retain(|value| values.contains(value));
+	} else {
+		*slot = Some(values);
+	}
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchemaCatalogV1 {
 	#[serde(default)]
@@ -967,23 +1201,184 @@ fn validate_locality_policy(schema: &Schema, policy: &LocalityPolicyV1) -> std::
 				spread_factor: projection.spread_factor,
 				prefix_bits: projection.prefix_bits,
 			})?;
-			if projection.columns.is_empty() {
+			validate_column_projection(schema, projection)
+		}
+	}
+}
+
+fn validate_column_projection(
+	schema: &Schema,
+	projection: &ColumnLocalityDescriptorV1,
+) -> std::io::Result<()> {
+	match projection.projection {
+		ProjectionFunctionV1::RandomHash | ProjectionFunctionV1::ZOrder => {}
+		ProjectionFunctionV1::Hilbert => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: Hilbert column locality is reserved for a future ADR",
+					WpbcRejectCode::WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED
+				),
+			));
+		}
+	}
+	if projection.columns.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: column locality projection requires at least one column",
+				WpbcRejectCode::WPBC_REJECT_CLUSTERING_EMPTY
+			),
+		));
+	}
+	if projection.columns.len() > TABLE_CLUSTERING_MAX_COLUMNS {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: column locality projection supports at most {TABLE_CLUSTERING_MAX_COLUMNS} columns",
+				WpbcRejectCode::WPBC_REJECT_CLUSTERING_TOO_WIDE
+			),
+		));
+	}
+
+	let mut seen = BTreeSet::new();
+	let mut width_sum = u16::from(projection.prefix_bits);
+	for column in &projection.columns {
+		validate_descriptor_name("locality column", &column.name)?;
+		if !seen.insert(column.name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate locality column {:?}",
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN,
+					column.name
+				),
+			));
+		}
+		if column.width_bits == 0 || column.width_bits > 64 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: locality column {:?} width_bits must be in 1..=64",
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+					column.name
+				),
+			));
+		}
+		width_sum = width_sum.saturating_add(u16::from(column.width_bits));
+		if width_sum > 64 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: sum(width_bits) + prefix_bits exceeds 64",
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW
+				),
+			));
+		}
+		let field = schema.field_with_name(&column.name).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: locality column {:?} is not present in Arrow schema",
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
+					column.name
+				),
+			)
+		})?;
+		if field.is_nullable() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: locality column {:?} must be non-nullable",
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_NULLABLE,
+					column.name
+				),
+			));
+		}
+		validate_clustering_type_and_width(field.data_type(), column)?;
+	}
+	Ok(())
+}
+
+fn validate_clustering_type_and_width(
+	data_type: &DataType,
+	column: &ClusteringColumnSpecV1,
+) -> std::io::Result<()> {
+	match data_type {
+		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+			let Some(prefix_bytes) = column.string_prefix_bytes else {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
-					"column locality projection requires at least one column",
+					format!(
+						"{}: locality column {:?} requires string_prefix_bytes",
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						column.name
+					),
 				));
-			}
-			for column in &projection.columns {
-				validate_descriptor_name("locality column", column)?;
-				schema.field_with_name(column).map_err(|_| {
-					Error::new(
-						ErrorKind::InvalidData,
-						format!("locality column {column:?} is not present in Arrow schema"),
-					)
-				})?;
+			};
+			if prefix_bytes == 0
+				|| prefix_bytes > 8
+				|| prefix_bytes.saturating_mul(8) != column.width_bits
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: locality column {:?} string_prefix_bytes must match width_bits",
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						column.name
+					),
+				));
 			}
 			Ok(())
 		}
+		DataType::Int8
+		| DataType::Int16
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::UInt8
+		| DataType::UInt16
+		| DataType::UInt32
+		| DataType::UInt64
+		| DataType::Timestamp(TimeUnit::Millisecond, _) => {
+			let natural_bits = match data_type {
+				DataType::Int8 | DataType::UInt8 => 8,
+				DataType::Int16 | DataType::UInt16 => 16,
+				DataType::Int32 | DataType::UInt32 => 32,
+				DataType::Int64
+				| DataType::UInt64
+				| DataType::Timestamp(TimeUnit::Millisecond, _) => 64,
+				_ => unreachable!("numeric locality type match drifted"),
+			};
+			if column.width_bits > natural_bits {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: locality column {:?} width_bits exceeds natural type width",
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						column.name
+					),
+				));
+			}
+			if column.string_prefix_bytes.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: numeric locality column {:?} cannot declare string_prefix_bytes",
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						column.name
+					),
+				));
+			}
+			Ok(())
+		}
+		other => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: locality column {:?} uses unsupported V1 type {other:?}",
+				WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+				column.name
+			),
+		)),
 	}
 }
 
@@ -1185,6 +1580,645 @@ fn table_spread_prefix_hash(
 	u64::from_le_bytes(bytes)
 }
 
+fn column_projection_locality(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	key_identity: Identity,
+	projection: &ColumnLocalityDescriptorV1,
+	batch: &RecordBatch,
+	row: usize,
+) -> Result<Locality, TableWriteValidationError> {
+	let coords = normalize_clustering_row(batch, projection, row)?;
+	let widths: Vec<u8> = projection
+		.columns
+		.iter()
+		.map(|column| column.width_bits)
+		.collect();
+	let suffix_width = clustering_suffix_width(&widths);
+	let z_suffix = match projection.projection {
+		ProjectionFunctionV1::ZOrder => z_order_encode(&coords, &widths),
+		ProjectionFunctionV1::RandomHash => random_hash_suffix(&coords, &widths, suffix_width),
+		ProjectionFunctionV1::Hilbert => {
+			return Err(TableWriteValidationError::new(
+				WpbcRejectCode::WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED,
+				"Hilbert column locality is reserved for a future ADR",
+			));
+		}
+	};
+	let bucket = jump_consistent_hash(identity_u64(key_identity), projection.spread_factor);
+	let table_hash = table_spread_prefix_hash(tenant_id, table_object_id, bucket);
+	let prefix_mask = u64::MAX << (64 - projection.prefix_bits);
+	let entropy_bits = 64 - u32::from(projection.prefix_bits) - u32::from(suffix_width);
+	let entropy_tail = identity_u64(key_identity) & low_mask(entropy_bits);
+	let locality = (table_hash & prefix_mask) | (z_suffix << entropy_bits) | entropy_tail;
+	Ok(Locality::new(locality))
+}
+
+fn column_projection_table_prefixes(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	projection: &ColumnLocalityDescriptorV1,
+) -> std::io::Result<Vec<u64>> {
+	validate_table_spread(TableSpreadLocalityDescriptorV1 {
+		spread_factor: projection.spread_factor,
+		prefix_bits: projection.prefix_bits,
+	})?;
+	let (prefix_mask, _) = locality_masks(projection.prefix_bits)?;
+	let mut prefixes = BTreeSet::new();
+	for bucket in 0..projection.spread_factor {
+		prefixes.insert(table_spread_prefix_hash(tenant_id, table_object_id, bucket) & prefix_mask);
+	}
+	Ok(prefixes.into_iter().collect())
+}
+
+fn normalize_clustering_row(
+	batch: &RecordBatch,
+	projection: &ColumnLocalityDescriptorV1,
+	row: usize,
+) -> Result<Vec<u64>, TableWriteValidationError> {
+	let mut coords = Vec::with_capacity(projection.columns.len());
+	for column in &projection.columns {
+		let array = batch.column_by_name(&column.name).ok_or_else(|| {
+			TableWriteValidationError::new(
+				WpbcRejectCode::WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
+				format!("table write is missing clustering column {:?}", column.name),
+			)
+		})?;
+		if array.is_null(row) {
+			return Err(TableWriteValidationError::new(
+				WpbcRejectCode::WPBC_REJECT_CLUSTERING_VALUE_NULL,
+				format!("clustering column {:?} is null at row {row}", column.name),
+			));
+		}
+		coords.push(normalize_clustering_value(array.as_ref(), row, column)?);
+	}
+	Ok(coords)
+}
+
+fn normalize_clustering_value(
+	array: &dyn Array,
+	row: usize,
+	column: &ClusteringColumnSpecV1,
+) -> Result<u64, TableWriteValidationError> {
+	macro_rules! signed_width {
+		($array:expr, $ty:ty, $bits:expr) => {{
+			let array = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+				TableWriteValidationError::new(
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+					format!(
+						"clustering array downcast failed for {:?}",
+						$array.data_type()
+					),
+				)
+			})?;
+			Ok(normalize_signed_int(
+				array.value(row) as i64,
+				$bits,
+				column.width_bits,
+			))
+		}};
+	}
+	macro_rules! unsigned_width {
+		($array:expr, $ty:ty, $bits:expr) => {{
+			let array = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
+				TableWriteValidationError::new(
+					WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+					format!(
+						"clustering array downcast failed for {:?}",
+						$array.data_type()
+					),
+				)
+			})?;
+			Ok(take_high_bits(
+				array.value(row) as u64,
+				$bits,
+				column.width_bits,
+			))
+		}};
+	}
+
+	match array.data_type() {
+		DataType::Int8 => signed_width!(array, Int8Array, 8),
+		DataType::Int16 => signed_width!(array, Int16Array, 16),
+		DataType::Int32 => signed_width!(array, Int32Array, 32),
+		DataType::Int64 => signed_width!(array, Int64Array, 64),
+		DataType::UInt8 => unsigned_width!(array, UInt8Array, 8),
+		DataType::UInt16 => unsigned_width!(array, UInt16Array, 16),
+		DataType::UInt32 => unsigned_width!(array, UInt32Array, 32),
+		DataType::UInt64 => unsigned_width!(array, UInt64Array, 64),
+		DataType::Timestamp(TimeUnit::Millisecond, _) => {
+			signed_width!(array, TimestampMillisecondArray, 64)
+		}
+		DataType::Utf8 => {
+			let array = array
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.ok_or_else(|| {
+					TableWriteValidationError::new(
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						"Utf8 clustering array downcast failed",
+					)
+				})?;
+			Ok(normalize_prefix_bytes(
+				array.value(row).as_bytes(),
+				column.string_prefix_bytes.unwrap_or(0),
+			))
+		}
+		DataType::LargeUtf8 => {
+			let array = array
+				.as_any()
+				.downcast_ref::<LargeStringArray>()
+				.ok_or_else(|| {
+					TableWriteValidationError::new(
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						"LargeUtf8 clustering array downcast failed",
+					)
+				})?;
+			Ok(normalize_prefix_bytes(
+				array.value(row).as_bytes(),
+				column.string_prefix_bytes.unwrap_or(0),
+			))
+		}
+		DataType::Binary => {
+			let array = array
+				.as_any()
+				.downcast_ref::<BinaryArray>()
+				.ok_or_else(|| {
+					TableWriteValidationError::new(
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						"Binary clustering array downcast failed",
+					)
+				})?;
+			Ok(normalize_prefix_bytes(
+				array.value(row),
+				column.string_prefix_bytes.unwrap_or(0),
+			))
+		}
+		DataType::LargeBinary => {
+			let array = array
+				.as_any()
+				.downcast_ref::<LargeBinaryArray>()
+				.ok_or_else(|| {
+					TableWriteValidationError::new(
+						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						"LargeBinary clustering array downcast failed",
+					)
+				})?;
+			Ok(normalize_prefix_bytes(
+				array.value(row),
+				column.string_prefix_bytes.unwrap_or(0),
+			))
+		}
+		other => Err(TableWriteValidationError::new(
+			WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+			format!("unsupported clustering column type {other:?}"),
+		)),
+	}
+}
+
+fn normalize_clustering_literal(
+	data_type: &DataType,
+	literal: &ColumnPredicateLiteralV1,
+	column: &ClusteringColumnSpecV1,
+) -> Option<u64> {
+	match (data_type, literal) {
+		(DataType::Int8, ColumnPredicateLiteralV1::Int(value))
+			if (i8::MIN as i64..=i8::MAX as i64).contains(value) =>
+		{
+			Some(normalize_signed_int(*value, 8, column.width_bits))
+		}
+		(DataType::Int16, ColumnPredicateLiteralV1::Int(value))
+			if (i16::MIN as i64..=i16::MAX as i64).contains(value) =>
+		{
+			Some(normalize_signed_int(*value, 16, column.width_bits))
+		}
+		(DataType::Int32, ColumnPredicateLiteralV1::Int(value))
+			if (i32::MIN as i64..=i32::MAX as i64).contains(value) =>
+		{
+			Some(normalize_signed_int(*value, 32, column.width_bits))
+		}
+		(DataType::Int64, ColumnPredicateLiteralV1::Int(value)) => {
+			Some(normalize_signed_int(*value, 64, column.width_bits))
+		}
+		(DataType::UInt8, ColumnPredicateLiteralV1::Int(value))
+			if (0..=u8::MAX as i64).contains(value) =>
+		{
+			Some(take_high_bits(*value as u64, 8, column.width_bits))
+		}
+		(DataType::UInt16, ColumnPredicateLiteralV1::Int(value))
+			if (0..=u16::MAX as i64).contains(value) =>
+		{
+			Some(take_high_bits(*value as u64, 16, column.width_bits))
+		}
+		(DataType::UInt32, ColumnPredicateLiteralV1::Int(value))
+			if (0..=u32::MAX as i64).contains(value) =>
+		{
+			Some(take_high_bits(*value as u64, 32, column.width_bits))
+		}
+		(DataType::UInt64, ColumnPredicateLiteralV1::Int(value)) if *value >= 0 => {
+			Some(take_high_bits(*value as u64, 64, column.width_bits))
+		}
+		(DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteralV1::Ts(value))
+		| (DataType::Timestamp(TimeUnit::Millisecond, _), ColumnPredicateLiteralV1::Int(value)) => {
+			Some(normalize_signed_int(*value, 64, column.width_bits))
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, ColumnPredicateLiteralV1::Str(bytes)) => Some(
+			normalize_prefix_bytes(bytes, column.string_prefix_bytes.unwrap_or(0)),
+		),
+		_ => None,
+	}
+}
+
+fn normalize_signed_int(value: i64, natural_bits: u8, width_bits: u8) -> u64 {
+	let sign_bit = 1_u64 << (natural_bits - 1);
+	let normalized = if natural_bits == 64 {
+		(value as u64) ^ sign_bit
+	} else {
+		((value as u64) & low_mask(u32::from(natural_bits))) ^ sign_bit
+	};
+	take_high_bits(normalized, natural_bits, width_bits)
+}
+
+fn take_high_bits(value: u64, natural_bits: u8, width_bits: u8) -> u64 {
+	if width_bits == 64 {
+		if natural_bits == 64 {
+			value
+		} else {
+			value << (64 - natural_bits)
+		}
+	} else if width_bits <= natural_bits {
+		(value >> (natural_bits - width_bits)) & low_mask(u32::from(width_bits))
+	} else {
+		(value << (width_bits - natural_bits)) & low_mask(u32::from(width_bits))
+	}
+}
+
+fn normalize_prefix_bytes(bytes: &[u8], prefix_bytes: u8) -> u64 {
+	let mut out = 0_u64;
+	for idx in 0..prefix_bytes as usize {
+		out <<= 8;
+		out |= u64::from(bytes.get(idx).copied().unwrap_or(0));
+	}
+	out
+}
+
+fn z_order_encode(coords: &[u64], widths: &[u8]) -> u64 {
+	if let Some(encoded) = z_order_encode_bmi2(coords, widths) {
+		return encoded;
+	}
+	z_order_encode_portable(coords, widths)
+}
+
+fn z_order_encode_portable(coords: &[u64], widths: &[u8]) -> u64 {
+	debug_assert_eq!(coords.len(), widths.len());
+	if coords.len() == 1 {
+		return coords[0] & low_mask(u32::from(widths[0]));
+	}
+	let max_width = widths.iter().copied().max().unwrap_or(0);
+	let mut out = 0_u64;
+	for level in 0..max_width {
+		for (coord, width) in coords.iter().zip(widths.iter().copied()) {
+			if level < width {
+				let bit_index = width - 1 - level;
+				out = (out << 1) | ((coord >> bit_index) & 1);
+			}
+		}
+	}
+	out
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn z_order_encode_bmi2(coords: &[u64], widths: &[u8]) -> Option<u64> {
+	if !std::arch::is_x86_feature_detected!("bmi2") {
+		return None;
+	}
+	Some(unsafe { z_order_encode_bmi2_unchecked(coords, widths) })
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn z_order_encode_bmi2(_coords: &[u64], _widths: &[u8]) -> Option<u64> {
+	None
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "bmi2")]
+unsafe fn z_order_encode_bmi2_unchecked(coords: &[u64], widths: &[u8]) -> u64 {
+	debug_assert_eq!(coords.len(), widths.len());
+	if coords.len() == 1 {
+		return coords[0] & low_mask(u32::from(widths[0]));
+	}
+	let masks = z_order_deposit_masks(widths);
+	let mut out = 0_u64;
+	for ((coord, width), mask) in coords.iter().zip(widths.iter().copied()).zip(masks) {
+		out |= unsafe { pdep_u64(*coord & low_mask(u32::from(width)), mask) };
+	}
+	out
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pdep_u64(value: u64, mask: u64) -> u64 {
+	unsafe { std::arch::x86_64::_pdep_u64(value, mask) }
+}
+
+#[cfg(target_arch = "x86")]
+unsafe fn pdep_u64(value: u64, mask: u64) -> u64 {
+	unsafe { std::arch::x86::_pdep_u64(value, mask) }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn z_order_deposit_masks(widths: &[u8]) -> Vec<u64> {
+	let mut masks = vec![0_u64; widths.len()];
+	let max_width = widths.iter().copied().max().unwrap_or(0);
+	let mut out_bit = widths.iter().map(|width| u32::from(*width)).sum::<u32>();
+	for level in 0..max_width {
+		for (idx, width) in widths.iter().copied().enumerate() {
+			if level < width {
+				out_bit -= 1;
+				masks[idx] |= 1_u64 << out_bit;
+			}
+		}
+	}
+	debug_assert_eq!(out_bit, 0);
+	masks
+}
+
+fn random_hash_suffix(coords: &[u64], widths: &[u8], suffix_width: u8) -> u64 {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(TABLE_COLUMN_LOCALITY_HASH_DOMAIN);
+	for (coord, width) in coords.iter().zip(widths.iter().copied()) {
+		hasher.update(&[width]);
+		hasher.update(&coord.to_le_bytes());
+	}
+	let digest = hasher.finalize();
+	let mut bytes = [0; 8];
+	bytes.copy_from_slice(&digest.as_bytes()[..8]);
+	u64::from_le_bytes(bytes) & low_mask(u32::from(suffix_width))
+}
+
+fn clustering_suffix_width(widths: &[u8]) -> u8 {
+	widths.iter().copied().sum()
+}
+
+fn low_mask(bits: u32) -> u64 {
+	match bits {
+		0 => 0,
+		64.. => u64::MAX,
+		_ => (1_u64 << bits) - 1,
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeDecompositionOverflow;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZCellRelation {
+	Disjoint,
+	Inside,
+	Partial,
+}
+
+fn decompose_z_order_ranges(
+	lower: &[u64],
+	upper: &[u64],
+	widths: &[u8],
+	arc_budget: usize,
+) -> Result<Vec<(u64, u64)>, RangeDecompositionOverflow> {
+	debug_assert_eq!(lower.len(), widths.len());
+	debug_assert_eq!(upper.len(), widths.len());
+	let suffix_width = widths.iter().map(|width| u32::from(*width)).sum::<u32>();
+	if suffix_width == 0 {
+		return Ok(Vec::new());
+	}
+	let sequence = z_order_dimension_sequence(widths);
+	let mut state = ZRangeDecomposer {
+		lower,
+		upper,
+		widths,
+		sequence,
+		arc_budget: arc_budget.max(1),
+		node_budget: arc_budget
+			.max(1)
+			.saturating_mul(suffix_width as usize + 1)
+			.saturating_mul(4),
+		nodes_visited: 0,
+		suffix_width,
+		prefixes: vec![0; widths.len()],
+		fixed_bits: vec![0; widths.len()],
+		arcs: Vec::new(),
+	};
+	state.visit(0, 0)?;
+	Ok(state.arcs)
+}
+
+fn decompose_z_order_ranges_with_allowed_values(
+	lower: &[u64],
+	upper: &[u64],
+	widths: &[u8],
+	allowed_values: &[Option<BTreeSet<u64>>],
+	arc_budget: usize,
+) -> Result<Vec<(u64, u64)>, RangeDecompositionOverflow> {
+	if allowed_values.iter().all(Option::is_none) {
+		return decompose_z_order_ranges(lower, upper, widths, arc_budget);
+	}
+	let mut arcs = Vec::new();
+	let mut combo_lower = lower.to_vec();
+	let mut combo_upper = upper.to_vec();
+	collect_allowed_z_order_ranges(
+		0,
+		lower,
+		upper,
+		widths,
+		allowed_values,
+		&mut combo_lower,
+		&mut combo_upper,
+		arc_budget.max(1),
+		&mut arcs,
+	)?;
+	Ok(arcs)
+}
+
+fn collect_allowed_z_order_ranges(
+	dim: usize,
+	lower: &[u64],
+	upper: &[u64],
+	widths: &[u8],
+	allowed_values: &[Option<BTreeSet<u64>>],
+	combo_lower: &mut [u64],
+	combo_upper: &mut [u64],
+	arc_budget: usize,
+	arcs: &mut Vec<(u64, u64)>,
+) -> Result<(), RangeDecompositionOverflow> {
+	if dim == allowed_values.len() {
+		let remaining_budget = arc_budget.saturating_sub(arcs.len()).max(1);
+		let next = decompose_z_order_ranges(combo_lower, combo_upper, widths, remaining_budget)?;
+		merge_z_order_arcs(arcs, next, arc_budget)?;
+		return Ok(());
+	}
+	if let Some(values) = &allowed_values[dim] {
+		for value in values {
+			combo_lower[dim] = *value;
+			combo_upper[dim] = *value;
+			collect_allowed_z_order_ranges(
+				dim + 1,
+				lower,
+				upper,
+				widths,
+				allowed_values,
+				combo_lower,
+				combo_upper,
+				arc_budget,
+				arcs,
+			)?;
+		}
+		combo_lower[dim] = lower[dim];
+		combo_upper[dim] = upper[dim];
+	} else {
+		combo_lower[dim] = lower[dim];
+		combo_upper[dim] = upper[dim];
+		collect_allowed_z_order_ranges(
+			dim + 1,
+			lower,
+			upper,
+			widths,
+			allowed_values,
+			combo_lower,
+			combo_upper,
+			arc_budget,
+			arcs,
+		)?;
+	}
+	Ok(())
+}
+
+fn merge_z_order_arcs(
+	arcs: &mut Vec<(u64, u64)>,
+	mut next: Vec<(u64, u64)>,
+	arc_budget: usize,
+) -> Result<(), RangeDecompositionOverflow> {
+	arcs.append(&mut next);
+	arcs.sort_unstable_by_key(|arc| arc.0);
+	let mut merged: Vec<(u64, u64)> = Vec::with_capacity(arcs.len());
+	for (start, end) in arcs.drain(..) {
+		if let Some(last) = merged.last_mut() {
+			let adjacent_or_overlap = last.1 == u64::MAX || start <= last.1 + 1;
+			if adjacent_or_overlap {
+				last.1 = last.1.max(end);
+				continue;
+			}
+		}
+		merged.push((start, end));
+	}
+	if merged.len() > arc_budget {
+		return Err(RangeDecompositionOverflow);
+	}
+	*arcs = merged;
+	Ok(())
+}
+
+struct ZRangeDecomposer<'a> {
+	lower: &'a [u64],
+	upper: &'a [u64],
+	widths: &'a [u8],
+	sequence: Vec<usize>,
+	arc_budget: usize,
+	node_budget: usize,
+	nodes_visited: usize,
+	suffix_width: u32,
+	prefixes: Vec<u64>,
+	fixed_bits: Vec<u8>,
+	arcs: Vec<(u64, u64)>,
+}
+
+impl ZRangeDecomposer<'_> {
+	fn visit(&mut self, pos: usize, z_prefix: u64) -> Result<(), RangeDecompositionOverflow> {
+		self.nodes_visited = self.nodes_visited.saturating_add(1);
+		if self.nodes_visited > self.node_budget {
+			return Err(RangeDecompositionOverflow);
+		}
+		match self.cell_relation() {
+			ZCellRelation::Disjoint => return Ok(()),
+			ZCellRelation::Inside => {
+				let remaining = self.suffix_width - pos as u32;
+				let start = shift_prefix(z_prefix, remaining);
+				let end = start | low_mask(remaining);
+				self.push_arc(start, end)?;
+				return Ok(());
+			}
+			ZCellRelation::Partial => {}
+		}
+		if pos == self.sequence.len() {
+			self.push_arc(z_prefix, z_prefix)?;
+			return Ok(());
+		}
+		let dim = self.sequence[pos];
+		for bit in 0..=1 {
+			self.prefixes[dim] = (self.prefixes[dim] << 1) | bit;
+			self.fixed_bits[dim] += 1;
+			self.visit(pos + 1, (z_prefix << 1) | bit)?;
+			self.fixed_bits[dim] -= 1;
+			self.prefixes[dim] >>= 1;
+		}
+		Ok(())
+	}
+
+	fn cell_relation(&self) -> ZCellRelation {
+		let mut inside = true;
+		for dim in 0..self.widths.len() {
+			let remaining = u32::from(self.widths[dim] - self.fixed_bits[dim]);
+			let cell_low = shift_prefix(self.prefixes[dim], remaining);
+			let cell_high = cell_low | low_mask(remaining);
+			if cell_high < self.lower[dim] || cell_low > self.upper[dim] {
+				return ZCellRelation::Disjoint;
+			}
+			if cell_low < self.lower[dim] || cell_high > self.upper[dim] {
+				inside = false;
+			}
+		}
+		if inside {
+			ZCellRelation::Inside
+		} else {
+			ZCellRelation::Partial
+		}
+	}
+
+	fn push_arc(&mut self, start: u64, end: u64) -> Result<(), RangeDecompositionOverflow> {
+		if let Some(last) = self.arcs.last_mut() {
+			let adjacent_or_overlap = last.1 == u64::MAX || start <= last.1 + 1;
+			if adjacent_or_overlap {
+				last.1 = last.1.max(end);
+				return Ok(());
+			}
+		}
+		if self.arcs.len() >= self.arc_budget {
+			return Err(RangeDecompositionOverflow);
+		}
+		self.arcs.push((start, end));
+		Ok(())
+	}
+}
+
+fn shift_prefix(prefix: u64, remaining_bits: u32) -> u64 {
+	if remaining_bits >= 64 {
+		0
+	} else {
+		prefix << remaining_bits
+	}
+}
+
+fn z_order_dimension_sequence(widths: &[u8]) -> Vec<usize> {
+	let suffix_width = widths.iter().map(|width| usize::from(*width)).sum();
+	let mut sequence = Vec::with_capacity(suffix_width);
+	let max_width = widths.iter().copied().max().unwrap_or(0);
+	for level in 0..max_width {
+		for (idx, width) in widths.iter().copied().enumerate() {
+			if level < width {
+				sequence.push(idx);
+			}
+		}
+	}
+	sequence
+}
+
 fn locality_masks(prefix_bits: u8) -> std::io::Result<(u64, u64)> {
 	if prefix_bits == 0 || prefix_bits >= 64 {
 		return Err(Error::new(
@@ -1213,10 +2247,14 @@ fn jump_consistent_hash(key: u64, buckets: u16) -> u16 {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use arrow::array::{Int64Array, LargeStringArray};
+	use crate::schema::wpbc::{
+		OP_AND, OP_EQ, OP_GT, OP_GTE, OP_IN_LIST, OP_LTE, OP_OR, OP_PUSH_COL, OP_PUSH_INT,
+		OP_PUSH_STR,
+	};
+	use arrow::array::{Int64Array, LargeStringArray, UInt32Array};
 	use arrow::datatypes::{Field, Schema};
 	use arrow::record_batch::RecordBatch;
-	use std::collections::HashMap;
+	use std::collections::{BTreeSet, HashMap};
 	use std::sync::Arc;
 
 	fn table_schema(data_type: DataType, nullable_pk: bool) -> Schema {
@@ -1269,6 +2307,94 @@ mod tests {
 
 	fn descriptor_for(schema: &Schema) -> TableSchemaDescriptorV1 {
 		descriptor_for_generation(schema, 1)
+	}
+
+	fn cluster_column(name: &str, width_bits: u8) -> ClusteringColumnSpecV1 {
+		ClusteringColumnSpecV1 {
+			name: name.to_owned(),
+			width_bits,
+			string_prefix_bytes: None,
+		}
+	}
+
+	fn cluster_string_column(name: &str, string_prefix_bytes: u8) -> ClusteringColumnSpecV1 {
+		ClusteringColumnSpecV1 {
+			name: name.to_owned(),
+			width_bits: string_prefix_bytes * 8,
+			string_prefix_bytes: Some(string_prefix_bytes),
+		}
+	}
+
+	fn clustered_schema() -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("event_hour", DataType::UInt32, false),
+			Field::new("customer_id", DataType::UInt32, false),
+			Field::new("region", DataType::LargeUtf8, false),
+		])
+	}
+
+	fn schema_with_clustering_candidate(data_type: DataType) -> Schema {
+		Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("candidate", data_type, false),
+		])
+	}
+
+	fn clustered_batch() -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(clustered_schema()),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])) as Arc<dyn Array>,
+				Arc::new(UInt32Array::from(vec![10_u32, 11, 12])) as Arc<dyn Array>,
+				Arc::new(UInt32Array::from(vec![100_u32, 101, 102])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec!["us", "eu", "ap"])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	fn clustered_descriptor(
+		projection: ProjectionFunctionV1,
+		columns: Vec<ClusteringColumnSpecV1>,
+	) -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns,
+				projection,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn push_col(bytes: &mut Vec<u8>, column: u32) {
+		bytes.push(OP_PUSH_COL);
+		bytes.extend_from_slice(&column.to_le_bytes());
+	}
+
+	fn push_int(bytes: &mut Vec<u8>, value: i64) {
+		bytes.push(OP_PUSH_INT);
+		bytes.extend_from_slice(&value.to_le_bytes());
+	}
+
+	fn push_str(bytes: &mut Vec<u8>, value: &str) {
+		bytes.push(OP_PUSH_STR);
+		bytes.extend_from_slice(&(value.len() as u16).to_le_bytes());
+		bytes.extend_from_slice(value.as_bytes());
+	}
+
+	fn in_list(bytes: &mut Vec<u8>, count: u16) {
+		bytes.push(OP_IN_LIST);
+		bytes.extend_from_slice(&count.to_le_bytes());
 	}
 
 	fn table_meta(descriptor: &TableSchemaDescriptorV1, row_count: usize) -> TableWriteRequestMeta {
@@ -1357,6 +2483,67 @@ mod tests {
 		let previous = descriptor_for_generation(&previous_schema, 1);
 		let next = descriptor_for_generation(&next_schema, 2);
 		validate_table_schema_evolution(&previous, &next).unwrap();
+	}
+
+	#[test]
+	fn column_projection_schema_evolution_requires_stable_descriptor() {
+		let previous_schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("event_hour", DataType::UInt32, false),
+		]);
+		let next_schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("event_hour", DataType::UInt32, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let locality = LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			columns: vec![cluster_column("event_hour", 16)],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+		});
+		let previous = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&previous_schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			locality.clone(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let next = TableSchemaDescriptorV1::new(
+			previous.table_object_id,
+			2,
+			"analytics",
+			"events",
+			&next_schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			locality,
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		validate_table_schema_evolution(&previous, &next).unwrap();
+
+		let changed_locality = TableSchemaDescriptorV1::new(
+			previous.table_object_id,
+			3,
+			"analytics",
+			"events",
+			&next_schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![cluster_column("event_hour", 20)],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let err = validate_table_schema_evolution(&previous, &changed_locality).unwrap_err();
+		assert!(err.to_string().contains("cannot change locality_policy"));
 	}
 
 	#[test]
@@ -1469,6 +2656,504 @@ mod tests {
 				.iter()
 				.any(|(start, end)| start.get() <= locality.get() && locality.get() <= end.get())
 		);
+	}
+
+	#[test]
+	fn column_projection_descriptor_validation_rejects_invalid_shapes() {
+		let empty = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(empty.to_string().contains("WPBC_REJECT_CLUSTERING_EMPTY"));
+
+		let too_wide = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![
+					cluster_column("id", 1),
+					cluster_column("event_hour", 1),
+					cluster_column("customer_id", 1),
+					cluster_string_column("region", 1),
+					cluster_column("id", 1),
+					cluster_column("event_hour", 1),
+					cluster_column("customer_id", 1),
+				],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			too_wide
+				.to_string()
+				.contains("WPBC_REJECT_CLUSTERING_TOO_WIDE")
+		);
+
+		let duplicate = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![
+					cluster_column("event_hour", 4),
+					cluster_column("event_hour", 4),
+				],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			duplicate
+				.to_string()
+				.contains("WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN")
+		);
+
+		let nullable = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&table_schema(DataType::Int64, false),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![cluster_string_column("name", 2)],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			nullable
+				.to_string()
+				.contains("WPBC_REJECT_CLUSTERING_NULLABLE")
+		);
+
+		let hilbert = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![cluster_column("event_hour", 16)],
+				projection: ProjectionFunctionV1::Hilbert,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			hilbert
+				.to_string()
+				.contains("WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED")
+		);
+
+		let overflow = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&clustered_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![cluster_column("id", 64)],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			overflow
+				.to_string()
+				.contains("WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW")
+		);
+
+		let over_natural_width = TableSchemaDescriptorV1::new(
+			TableObjectId::new([7; 16]),
+			1,
+			"analytics",
+			"events",
+			&table_schema(DataType::UInt8, false),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![cluster_column("id", 16)],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap_err();
+		assert!(
+			over_natural_width
+				.to_string()
+				.contains("WPBC_REJECT_CLUSTERING_WIDTH_INVALID")
+		);
+
+		for data_type in [
+			DataType::Float64,
+			DataType::Decimal128(10, 2),
+			DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+		] {
+			let unsupported = TableSchemaDescriptorV1::new(
+				TableObjectId::new([7; 16]),
+				1,
+				"analytics",
+				"events",
+				&schema_with_clustering_candidate(data_type),
+				PrimaryKeyDescriptorV1::single("id"),
+				LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+					columns: vec![cluster_column("candidate", 8)],
+					projection: ProjectionFunctionV1::ZOrder,
+					spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+					prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+				}),
+				SchemaEvolutionPolicyV1::AdditiveOnly,
+			)
+			.unwrap_err();
+			assert!(
+				unsupported
+					.to_string()
+					.contains("WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED")
+			);
+		}
+	}
+
+	#[test]
+	fn column_projection_ranges_reuse_table_spread_shape() {
+		let tenant = TenantId::new(9);
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![
+				cluster_column("event_hour", 24),
+				cluster_column("customer_id", 20),
+			],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let ranges =
+			column_projection_prefix_ranges(tenant, descriptor.table_object_id, projection)
+				.unwrap();
+		assert!(!ranges.is_empty());
+		assert!(ranges.len() <= usize::from(TABLE_SPREAD_DEFAULT_FACTOR));
+	}
+
+	#[test]
+	fn string_prefix_clustering_uses_lexicographic_bytes() {
+		let projection = ColumnLocalityDescriptorV1 {
+			columns: vec![cluster_string_column("region", 1)],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+		};
+		let batch = clustered_batch();
+		let regions = (0..batch.num_rows())
+			.map(|row| normalize_clustering_row(&batch, &projection, row).unwrap()[0])
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			regions,
+			vec![u64::from(b'u'), u64::from(b'e'), u64::from(b'a')]
+		);
+		assert!(regions[2] < regions[1]);
+		assert!(regions[1] < regions[0]);
+		assert_eq!(z_order_encode(&[regions[1]], &[8]), u64::from(b'e'));
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_prune_z_suffix() {
+		let tenant = TenantId::new(9);
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![cluster_column("event_hour", 4)],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0xa000_0000);
+		bytecode.push(OP_EQ);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let ranges = match column_projection_predicate_ranges(
+			tenant,
+			descriptor.table_object_id,
+			&clustered_schema(),
+			projection,
+			&program,
+			COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+		)
+		.unwrap()
+		{
+			ColumnProjectionRangePruning::Pruned(ranges) => ranges,
+			other => panic!("expected pruned ranges, got {other:?}"),
+		};
+		let entropy_bits = 64 - u32::from(projection.prefix_bits) - 4;
+		let entropy_mask = low_mask(entropy_bits);
+
+		assert!(!ranges.is_empty());
+		assert!(ranges.len() <= usize::from(TABLE_SPREAD_DEFAULT_FACTOR));
+		for (start, end) in ranges {
+			assert_eq!((start.get() >> entropy_bits) & 0xf, 0xa);
+			assert_eq!((end.get() >> entropy_bits) & 0xf, 0xa);
+			assert_eq!(start.get() & entropy_mask, 0);
+			assert_eq!(end.get() & entropy_mask, entropy_mask);
+		}
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_prune_in_list_values() {
+		let tenant = TenantId::new(9);
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![cluster_string_column("region", 1)],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 3);
+		push_str(&mut bytecode, "eu");
+		push_str(&mut bytecode, "us");
+		in_list(&mut bytecode, 2);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let ranges = match column_projection_predicate_ranges(
+			tenant,
+			descriptor.table_object_id,
+			&clustered_schema(),
+			projection,
+			&program,
+			COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+		)
+		.unwrap()
+		{
+			ColumnProjectionRangePruning::Pruned(ranges) => ranges,
+			other => panic!("expected pruned ranges, got {other:?}"),
+		};
+		let entropy_bits = 64 - u32::from(projection.prefix_bits) - 8;
+		let suffixes = ranges
+			.iter()
+			.map(|(start, end)| {
+				assert_eq!(start.get() & low_mask(entropy_bits), 0);
+				assert_eq!(end.get() & low_mask(entropy_bits), low_mask(entropy_bits));
+				(start.get() >> entropy_bits) & 0xff
+			})
+			.collect::<BTreeSet<_>>();
+
+		assert_eq!(suffixes, BTreeSet::from([u64::from(b'e'), u64::from(b'u')]));
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_return_empty_for_unsatisfiable_bounds() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![cluster_column("event_hour", 4)],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0x5000_0000);
+		bytecode.push(OP_EQ);
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0xa000_0000);
+		bytecode.push(OP_GT);
+		bytecode.push(OP_AND);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+
+		assert_eq!(
+			column_projection_predicate_ranges(
+				TenantId::new(9),
+				descriptor.table_object_id,
+				&clustered_schema(),
+				projection,
+				&program,
+				COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+			)
+			.unwrap(),
+			ColumnProjectionRangePruning::Pruned(Vec::new())
+		);
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_fall_back_for_disjunctions() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![cluster_column("event_hour", 4)],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0x2000_0000);
+		bytecode.push(OP_GTE);
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0xe000_0000);
+		bytecode.push(OP_LTE);
+		bytecode.push(OP_OR);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+
+		assert_eq!(
+			column_projection_predicate_ranges(
+				TenantId::new(9),
+				descriptor.table_object_id,
+				&clustered_schema(),
+				projection,
+				&program,
+				COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+			)
+			.unwrap(),
+			ColumnProjectionRangePruning::Fallback
+		);
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_fall_back_when_arc_budget_overflows() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![cluster_column("event_hour", 4)],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0xa000_0000);
+		bytecode.push(OP_GTE);
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0xb000_0000);
+		bytecode.push(OP_LTE);
+		bytecode.push(OP_AND);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+
+		assert_eq!(
+			column_projection_predicate_ranges(
+				TenantId::new(9),
+				descriptor.table_object_id,
+				&clustered_schema(),
+				projection,
+				&program,
+				0,
+			)
+			.unwrap(),
+			ColumnProjectionRangePruning::Overflow
+		);
+	}
+
+	#[test]
+	fn column_projection_predicate_ranges_overflow_realistic_sparse_z_slice() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![
+				cluster_column("event_hour", 16),
+				cluster_column("customer_id", 16),
+			],
+		);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let mut bytecode = Vec::new();
+		push_col(&mut bytecode, 1);
+		push_int(&mut bytecode, 0x8000_0000);
+		bytecode.push(OP_EQ);
+		let program = WpbcProgram::compile(&bytecode).unwrap();
+
+		assert_eq!(
+			column_projection_predicate_ranges(
+				TenantId::new(9),
+				descriptor.table_object_id,
+				&clustered_schema(),
+				projection,
+				&program,
+				COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+			)
+			.unwrap(),
+			ColumnProjectionRangePruning::Overflow
+		);
+	}
+
+	#[test]
+	fn z_order_encoder_uses_msb_first_uneven_widths() {
+		let coords = [0b101_u64, 0b11_u64];
+		let widths = [3_u8, 2_u8];
+		assert_eq!(z_order_encode(&coords, &widths), 0b11011);
+		assert_eq!(z_order_encode(&[0b1010], &[4]), 0b1010);
+	}
+
+	#[test]
+	fn z_order_bmi2_matches_portable_when_available() {
+		let cases: &[(&[u64], &[u8])] = &[
+			(&[0b101, 0b11], &[3, 2]),
+			(&[0xabc, 0x123, 0x3f], &[12, 12, 6]),
+			(&[0xf, 0x00ff, 0x1555, 0x2a], &[4, 8, 13, 6]),
+			(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc], &[8, 8, 8, 8, 8, 8]),
+		];
+		for (coords, widths) in cases {
+			assert_eq!(
+				z_order_encode(coords, widths),
+				z_order_encode_portable(coords, widths)
+			);
+			#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+			if std::arch::is_x86_feature_detected!("bmi2") {
+				assert_eq!(
+					unsafe { z_order_encode_bmi2_unchecked(coords, widths) },
+					z_order_encode_portable(coords, widths)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn signed_clustering_normalization_preserves_order() {
+		assert_eq!(normalize_signed_int(i8::MIN as i64, 8, 8), 0x00);
+		assert_eq!(normalize_signed_int(-1, 8, 8), 0x7f);
+		assert_eq!(normalize_signed_int(0, 8, 8), 0x80);
+		assert_eq!(normalize_signed_int(i8::MAX as i64, 8, 8), 0xff);
+		assert_eq!(normalize_signed_int(-1, 8, 4), 0x7);
+		assert_eq!(normalize_signed_int(0, 8, 12), 0x800);
+		assert!(normalize_signed_int(-2, 16, 16) < normalize_signed_int(-1, 16, 16));
+		assert!(normalize_signed_int(-1, 16, 16) < normalize_signed_int(0, 16, 16));
 	}
 
 	#[test]
@@ -1602,27 +3287,73 @@ mod tests {
 	}
 
 	#[test]
-	fn table_write_validation_rejects_column_projection_in_v1() {
-		let schema = table_schema(DataType::Int64, false);
-		let descriptor = TableSchemaDescriptorV1::new(
-			TableObjectId::new([7; 16]),
-			1,
-			"analytics",
-			"events",
-			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
-				columns: vec!["name".to_owned()],
-				projection: ProjectionFunctionV1::RandomHash,
-				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
-				prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
-			}),
-			SchemaEvolutionPolicyV1::AdditiveOnly,
+	fn table_write_validation_accepts_column_projection_zorder() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::ZOrder,
+			vec![
+				cluster_string_column("region", 1),
+				cluster_column("event_hour", 20),
+				cluster_column("customer_id", 20),
+			],
+		);
+		let batch = clustered_batch();
+		let meta = table_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		assert_eq!(admission.localities.len(), 3);
+		let projection = match &descriptor.locality_policy {
+			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			_ => unreachable!(),
+		};
+		let ranges =
+			column_projection_prefix_ranges(meta.tenant_id, meta.table_object_id, projection)
+				.unwrap();
+		assert!(admission.localities.iter().all(|locality| {
+			ranges
+				.iter()
+				.any(|(start, end)| start.get() <= locality.get() && locality.get() <= end.get())
+		}));
+		assert_ne!(admission.localities[0], admission.localities[1]);
+	}
+
+	#[test]
+	fn clustering_row_normalization_rejects_null_value() {
+		let projection = ColumnLocalityDescriptorV1 {
+			columns: vec![cluster_column("event_hour", 4)],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
+			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
+		};
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("event_hour", DataType::UInt32, true),
+				Field::new("customer_id", DataType::UInt32, false),
+				Field::new("region", DataType::LargeUtf8, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2])) as Arc<dyn Array>,
+				Arc::new(UInt32Array::from(vec![Some(10_u32), None])) as Arc<dyn Array>,
+				Arc::new(UInt32Array::from(vec![100_u32, 101])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec!["us", "eu"])) as Arc<dyn Array>,
+			],
 		)
 		.unwrap();
-		let batch = table_batch(vec![Some(1), Some(2)]);
+		let err = normalize_clustering_row(&batch, &projection, 1).unwrap_err();
+		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_CLUSTERING_VALUE_NULL);
+	}
+
+	#[test]
+	fn table_write_validation_accepts_column_projection_random_hash() {
+		let descriptor = clustered_descriptor(
+			ProjectionFunctionV1::RandomHash,
+			vec![
+				cluster_column("event_hour", 24),
+				cluster_column("customer_id", 20),
+			],
+		);
+		let batch = clustered_batch();
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let err = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap_err();
-		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_LOCALITY_UNSUPPORTED);
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		assert_eq!(admission.localities.len(), 3);
 	}
 }

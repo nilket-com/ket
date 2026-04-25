@@ -64,16 +64,18 @@ use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::{MembershipEpoch, NodeRole, TransportStream};
 use crate::schema::{
-	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, Consistency, FRAME_FLAG_STREAM_END,
-	FinalizationMarker, FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus,
-	Locality, LocalityPolicyV1, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta,
-	MigrateStatus, MsgType, NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
+	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+	ColumnProjectionRangePruning, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker,
+	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality,
+	LocalityPolicyV1, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
+	MsgType, NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
 	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
 	ReplicaWriteStatus, StreamFinalizationRequestMeta, TableQueryRequestMeta,
 	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TableWriteValidationError, TenantId, WpbcRejectCode, WriteRequestMeta, WriteResponseMeta,
-	WriteStatus, migration_record_schema, read_key_schema, table_spread_prefix_ranges,
+	WriteStatus, column_projection_predicate_ranges, column_projection_prefix_ranges,
+	migration_record_schema, read_key_schema, table_spread_prefix_ranges,
 	validate_table_write_request_batch, wpbc, write_payload_schema,
 };
 use crate::storage::MvccRetentionPolicy;
@@ -4762,7 +4764,17 @@ impl WendelonDataServer {
 				self.local_node,
 			));
 		};
-		let ranges = match table_query_scan_ranges(meta.tenant_id, &descriptor) {
+		let program = match wpbc::Program::compile(bytecode) {
+			Ok(program) => program,
+			Err(_) => {
+				return Ok(query_plan_error(
+					&range_meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					self.local_node,
+				));
+			}
+		};
+		let ranges = match table_query_scan_ranges(meta.tenant_id, &descriptor, Some(&program)) {
 			Ok(ranges) => ranges,
 			Err(status) => return Ok(query_plan_error(&range_meta, status, self.local_node)),
 		};
@@ -4796,17 +4808,6 @@ impl WendelonDataServer {
 				}
 			}
 		}
-
-		let program = match wpbc::Program::compile(bytecode) {
-			Ok(program) => program,
-			Err(_) => {
-				return Ok(query_plan_error(
-					&range_meta,
-					ReadStatus::QUERY_INVALID_PROGRAM,
-					self.local_node,
-				));
-			}
-		};
 
 		plan_query_execution_for_ranges_with_program(
 			&self.slab,
@@ -6829,6 +6830,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
 ) -> std::io::Result<QueryExecutionPlan> {
+	metrics().observe_wpbc_locality_arcs_scanned(ranges.len() as u64);
 	let mut batches = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
@@ -7462,6 +7464,7 @@ fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta 
 fn table_query_scan_ranges(
 	tenant_id: TenantId,
 	descriptor: &TableSchemaDescriptorV1,
+	program: Option<&wpbc::Program>,
 ) -> Result<Vec<QueryScanRange>, ReadStatus> {
 	match descriptor.locality_policy {
 		LocalityPolicyV1::TableSpreadProjection(spread) => {
@@ -7476,7 +7479,49 @@ fn table_query_scan_ranges(
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}]),
-		LocalityPolicyV1::ColumnProjection(_) => Err(ReadStatus::QUERY_INVALID_PROGRAM),
+		LocalityPolicyV1::ColumnProjection(ref projection) => {
+			let schema = descriptor
+				.arrow_schema()
+				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
+			let ranges = if let Some(program) = program {
+				let decomposition_started = Instant::now();
+				let pruning = column_projection_predicate_ranges(
+					tenant_id,
+					descriptor.table_object_id,
+					&schema,
+					projection,
+					program,
+					COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+				)
+				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
+				metrics().observe_wpbc_locality_decomposition(decomposition_started.elapsed());
+				match pruning {
+					ColumnProjectionRangePruning::Pruned(ranges) => ranges,
+					ColumnProjectionRangePruning::Fallback => column_projection_prefix_ranges(
+						tenant_id,
+						descriptor.table_object_id,
+						projection,
+					)
+					.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?,
+					ColumnProjectionRangePruning::Overflow => {
+						metrics().observe_wpbc_range_decomposition_overflow();
+						column_projection_prefix_ranges(
+							tenant_id,
+							descriptor.table_object_id,
+							projection,
+						)
+						.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?
+					}
+				}
+			} else {
+				column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, projection)
+					.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?
+			};
+			Ok(ranges
+				.into_iter()
+				.map(|(start, end)| QueryScanRange { start, end })
+				.collect())
+		}
 	}
 }
 
@@ -7946,7 +7991,16 @@ fn bifurcate_table_write(
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
-	let admission = validate_table_write_request_batch(meta, batch, descriptor)?;
+	let observe_encode = matches!(
+		&descriptor.locality_policy,
+		LocalityPolicyV1::ColumnProjection(_)
+	);
+	let encode_started = Instant::now();
+	let admission = validate_table_write_request_batch(meta, batch, descriptor);
+	if observe_encode {
+		metrics().observe_wpbc_locality_encode(encode_started.elapsed());
+	}
+	let admission = admission?;
 	let mut children = Vec::with_capacity(batch.num_rows());
 	let mut charged_bytes = 0_u64;
 	for row in 0..batch.num_rows() {
@@ -8102,15 +8156,18 @@ mod tests {
 		OP_ROUTE_BY_LOCALITY,
 	};
 	use crate::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
-		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
-		table_spread_prefix_ranges, write_payload_schema,
+		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
+		PrimaryKeyDescriptorV1, ProjectionFunctionV1, SchemaEvolutionPolicyV1, SlabRecordHeader,
+		TableObjectId, column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
+		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
+		write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::manager::SlabManagerConfig;
 	use arrow::array::{Int64Array, LargeStringArray};
 	use arrow::datatypes::{DataType, Field};
+	use std::io::{Read, Seek, SeekFrom};
 	use std::panic::AssertUnwindSafe;
 
 	fn n(id: u32) -> NodeId {
@@ -8133,6 +8190,29 @@ mod tests {
 			&typed_table_schema(),
 			PrimaryKeyDescriptorV1::single("id"),
 			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn column_projection_table_descriptor() -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x38; 16]),
+			3,
+			"analytics",
+			"events",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				columns: vec![ClusteringColumnSpecV1 {
+					name: "id".to_owned(),
+					width_bits: 16,
+					string_prefix_bytes: None,
+				}],
+				projection: ProjectionFunctionV1::ZOrder,
+				spread_factor: 4,
+				prefix_bits: 16,
+			}),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
@@ -9289,6 +9369,85 @@ mod tests {
 	}
 
 	#[test]
+	fn table_query_scan_ranges_accepts_column_projection_prefixes() {
+		let tenant_id = tenant();
+		let projection = ColumnLocalityDescriptorV1 {
+			columns: vec![ClusteringColumnSpecV1 {
+				name: "id".to_owned(),
+				width_bits: 16,
+				string_prefix_bytes: None,
+			}],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: 4,
+			prefix_bits: 12,
+		};
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x38; 16]),
+			3,
+			"analytics",
+			"events",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(projection.clone()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let ranges = table_query_scan_ranges(tenant_id, &descriptor, None).unwrap();
+		let expected =
+			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, &projection)
+				.unwrap();
+
+		assert_eq!(ranges.len(), expected.len());
+		for (range, (start, end)) in ranges.iter().zip(expected) {
+			assert_eq!(range.start, start);
+			assert_eq!(range.end, end);
+		}
+	}
+
+	#[test]
+	fn table_query_scan_ranges_prune_column_projection_from_wpbc() {
+		let tenant_id = tenant();
+		let projection = ColumnLocalityDescriptorV1 {
+			columns: vec![ClusteringColumnSpecV1 {
+				name: "id".to_owned(),
+				width_bits: 16,
+				string_prefix_bytes: None,
+			}],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: 4,
+			prefix_bits: 12,
+		};
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x39; 16]),
+			3,
+			"analytics",
+			"events",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::ColumnProjection(projection.clone()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let mut bytecode = vec![OP_PUSH_COL];
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&7_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let ranges = table_query_scan_ranges(tenant_id, &descriptor, Some(&program)).unwrap();
+		let full =
+			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, &projection)
+				.unwrap();
+
+		assert_eq!(ranges.len(), full.len());
+		assert!(ranges.iter().zip(full.iter()).all(|(range, (start, end))| {
+			start.get() <= range.start.get()
+				&& range.end.get() <= end.get()
+				&& (range.start != *start || range.end != *end)
+		}));
+	}
+
+	#[test]
 	fn table_bifurcation_rejects_duplicate_pk_before_encoding_children() {
 		let descriptor = typed_table_descriptor();
 		let batch = typed_table_batch(vec![7, 7]);
@@ -9353,6 +9512,67 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.unwrap();
 		assert_eq!(ids.value(0), 7);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn column_projection_write_preserves_slab_record_header_layout() {
+		let dir = bootstrap_tempdir("column-projection-slab-header");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			38,
+			dir.clone(),
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = column_projection_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7]);
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert!(trailing.is_none());
+
+		let key_identity =
+			table_row_identity(tenant(), descriptor.table_object_id, &7_i64.to_le_bytes());
+		let location = node
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("table row should be indexed by PK-derived identity");
+		let slab_path = dir.join(format!("slab_{:016x}.wnd", location.slab_id.get()));
+		let mut file = std::fs::File::open(slab_path).unwrap();
+		file.seek(SeekFrom::Start(location.offset)).unwrap();
+		let mut header_bytes = vec![0_u8; std::mem::size_of::<SlabRecordHeader>()];
+		file.read_exact(&mut header_bytes).unwrap();
+		let header = bytemuck::pod_read_unaligned::<SlabRecordHeader>(&header_bytes);
+
+		assert_eq!(std::mem::size_of::<SlabRecordHeader>(), 72);
+		assert_eq!(header._pad_align, 0);
+		assert_eq!(header.tenant_id, tenant());
+		assert_eq!(header.key_identity, key_identity);
 
 		node.handles.abort();
 	}

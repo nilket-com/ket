@@ -10,7 +10,7 @@
 //! One record is the concatenation:
 //!
 //! ```text
-//! [SlabRecordHeader : 64B] [ HRFT frame bytes : frame_len ] [ zero pad → 4K ]
+//! [SlabRecordHeader : 72B] [ HRFT frame bytes : frame_len ] [ zero pad -> 4K ]
 //! ```
 //!
 //! The zero pad exists only because `O_DIRECT` requires every I/O
@@ -605,7 +605,7 @@ fn page_round_up(n: usize) -> usize {
 //  Algorithm:
 //    Start at offset 0. Records are page-padded so each record
 //    begins on a `DIRECT_IO_ALIGN` boundary. Read the first page
-//    at the current cursor — the 64-byte `SlabRecordHeader` sits
+//    at the current cursor — the 72-byte `SlabRecordHeader` sits
 //    in its prefix. If magic matches, compute the padded size,
 //    insert the record into the index, and advance. If magic does
 //    not match, we have reached either the end of valid data or a

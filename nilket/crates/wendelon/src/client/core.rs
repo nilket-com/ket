@@ -53,8 +53,9 @@ use crate::schema::{
 	Locality, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, TableQueryRequestMeta, TableSchemaDescriptorV1,
 	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WpbcRejectCode, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, read_key_schema, read_value_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, write_payload_schema,
+	WriteResponseMeta, WriteStatus, column_projection_prefix_ranges, read_key_schema,
+	read_value_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
+	write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
@@ -1258,10 +1259,16 @@ fn table_query_route_locality(
 			})
 		}
 		crate::schema::LocalityPolicyV1::IdentityProjection => Ok(Locality::ZERO),
-		crate::schema::LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
-			ErrorKind::InvalidInput,
-			"TABLE_QUERY_REQ does not support column-projection locality in V1",
-		)),
+		crate::schema::LocalityPolicyV1::ColumnProjection(ref projection) => {
+			let ranges =
+				column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, projection)?;
+			ranges.first().map(|(start, _)| *start).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"column projection descriptor produced no scan ranges",
+				)
+			})
+		}
 	}
 }
 
@@ -1614,8 +1621,9 @@ mod tests {
 	use crate::client::topology::{ClusterPeerWire, StaticTopologySource};
 	use crate::network::transport::TransportTier;
 	use crate::schema::{
-		ClientWriteId, LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
+		PrimaryKeyDescriptorV1, ProjectionFunctionV1, SchemaEvolutionPolicyV1, TableObjectId,
+		TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -1747,6 +1755,32 @@ mod tests {
 		let descriptor = table_query_descriptor(LocalityPolicyV1::TableSpreadProjection(spread));
 		let expected =
 			table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread).unwrap()[0].0;
+
+		assert_eq!(
+			table_query_route_locality(tenant_id, &descriptor).unwrap(),
+			expected
+		);
+	}
+
+	#[test]
+	fn table_query_route_uses_first_column_projection_prefix() {
+		let tenant_id = TenantId::new(9);
+		let projection = ColumnLocalityDescriptorV1 {
+			columns: vec![ClusteringColumnSpecV1 {
+				name: "id".to_owned(),
+				width_bits: 16,
+				string_prefix_bytes: None,
+			}],
+			projection: ProjectionFunctionV1::ZOrder,
+			spread_factor: 4,
+			prefix_bits: 12,
+		};
+		let descriptor =
+			table_query_descriptor(LocalityPolicyV1::ColumnProjection(projection.clone()));
+		let expected =
+			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, &projection)
+				.unwrap()[0]
+				.0;
 
 		assert_eq!(
 			table_query_route_locality(tenant_id, &descriptor).unwrap(),
