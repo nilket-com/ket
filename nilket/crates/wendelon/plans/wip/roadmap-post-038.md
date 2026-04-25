@@ -1,12 +1,12 @@
-# Roadmap: from 038 to 039 and beyond (transient nav doc)
+# Roadmap: from 038 to 040 and beyond (transient nav doc)
 
 Author: Claude (AI Swarm Council)
 Scope: transient navigation — retires whenever `plans/wip/` is cleaned up again.
-Written after ADRs 035, 036, 037, 038 shipped.
+Written after ADRs 035, 036, 037, 038, 039 shipped.
 
 ## Where we are
 
-The warehouse story is genuinely credible now:
+The warehouse story now has end-to-end leverage:
 
 - **ADR 035** — vectorized WPBC executor. Arrow kernels, scalar oracle, benches.
 - **ADR 036** — WPBC as the versioned Toron→Wendelon pushdown contract.
@@ -15,106 +15,117 @@ The warehouse story is genuinely credible now:
 - **ADR 038** — column-aware locality V1 (Z-order), descriptor-authoritative.
   A range query on declared clustering columns now maps to a small set of
   contiguous ring arcs, capped at the planner's 1024-arc budget.
+- **ADR 039** — slab-footer column statistics V1. Encrypted CSB between
+  `encrypted_chunks` and `offset_index`; locator in the formerly-reserved
+  32 bytes of `slab_footer`; always-on min/max/null/non-null per column;
+  opt-in bloom/HLL/small-set; compaction recomputes; internal pruning
+  invisible to Toron behind a `slab_stats_pruning_v1` capability bit.
 
 What's true now that wasn't true a week ago:
 
-- Range queries on declared clustering columns hit a contiguous arc set,
-  not the whole ring.
-- Per-column declared bit widths let tenants encode workload shape exactly.
-- Migration semantics are explicit: `spread_factor` increase is a soft
-  jump-hash delta migration; everything else is a full rewrite.
+- Within a contiguous arc set, slabs whose `min`/`max` bounds preclude
+  the predicate are skipped before any chunk-stream GET fires. ADR 038's
+  locality narrowing × ADR 039's stats pruning compose multiplicatively.
+- Stats are encrypted under the slab DEK; the footer HMAC covers only
+  the locator (including a 16-byte ciphertext hash), so point reads that
+  don't need stats don't pay for them.
+- `TieredSlab` carries three small advisory fields
+  (`stats_format_version`, `stats_block_len`, `stats_block_hash128`)
+  so a planner can skip the stats fetch entirely when no predicate is
+  representable.
 
 ## The near map
 
 ```
-              YOU ARE HERE
-                   ▼
-       ┌─────────────────────────┐
-       │ 035 / 036 / 037 / 038   │ ← shipped
-       └──────────┬──────────────┘
+                       YOU ARE HERE
+                            ▼
+       ┌─────────────────────────────────┐
+       │ 035 / 036 / 037 / 038 / 039     │ ← shipped
+       └──────────┬──────────────────────┘
                   │
      ┌────────────┼────────────┐
      │            │            │
      ▼            ▼            ▼
- stabilization  quick wins   ADR 039
- (1-2 weeks)   (small ADRs)  slab-footer
-                              column stats
+ stabilization  quick wins   ADR 040
+ (1-2 weeks)   (small ADRs)  partial aggregate
+                              pushdown protocol
                               │
                               ▼
                  ┌────────────┴────────────┐
-                 │      post-039 menu      │
+                 │      post-040 menu      │
                  │ ordered by compound value│
                  └────────────┬────────────┘
                               ▼
-              partial aggregates → multi-row fragments →
-              secondary indexes → PK-less tables →
-              Hilbert (when warranted) → L2 serverless
+              multi-row fragments → secondary indexes →
+              PK-less tables → Hilbert (when warranted) →
+              L2 serverless
 ```
 
 ## Immediate (1–2 weeks post-merge)
 
-Let 038 settle. Specifically:
+Let 038 and 039 settle together. Specifically:
 
-1. **Real clustering effectiveness.** The `wpbc_locality_arcs_scanned_total`
-   and `wpbc_range_decomposition_overflow_total` metrics show whether the
-   1024-arc budget is right. Tune from real predicate shapes, not synthetic.
-2. **Width-budget pressure.** A tenant declaring 4D clustering eats 48
-   suffix bits with `prefix_bits=16`; if real workloads want tighter
-   per-column widths, the descriptor reshape is a rewrite migration. Watch
-   for early signal.
-3. **Encode-cost under bulk write.** Z-order encoding is cheap; the BMI2
-   path is bonus. The bench gates from Phase 8 should be checked under
-   real ingest, not just synthetic batches.
+1. **Stats prune ratio.** `wpbc_slab_stats_pruned_total` /
+   `wpbc_slab_stats_consulted_total` shows the fraction of candidate
+   slabs that the CSB eliminates. Per-tenant variance reveals which
+   workloads benefit and which pay the encryption tax for nothing.
+2. **CSB size and decrypt latency.** `wpbc_slab_stats_block_bytes`
+   and `wpbc_slab_stats_decrypt_micros` tell us whether the
+   `min(256 KiB, slab_payload_bytes / 256)` cap is right and whether
+   the local stats cache (Phase 9) is hitting often enough to amortize.
+3. **`TieredSlab` drift.** `wpbc_slab_stats_pointer_drift_total`
+   should stay at zero. Anything else means a control-ring/footer
+   advisory mismatch — investigate before it confuses planners.
+4. **Real clustering effectiveness.** Carryover from 038:
+   `wpbc_locality_arcs_scanned_total` and
+   `wpbc_range_decomposition_overflow_total` show whether the 1024-arc
+   budget is right.
+5. **Width-budget pressure.** Carryover from 038: a tenant declaring
+   4D clustering eats 48 suffix bits with `prefix_bits=16`; if real
+   workloads want tighter per-column widths, the descriptor reshape
+   is a rewrite migration.
+6. **Encode-cost under bulk write.** Carryover from 038: Z-order
+   encoding is cheap; the BMI2 path is bonus. Bench gates should be
+   checked under real ingest, not synthetic batches.
 
 Carries over from the post-037 watch list:
 - Ingest-splitting CPU under bulk writes (037).
 - Rebatching effectiveness (`runtime={vectorized,scalar_reference}`).
 
-## ADR 039 — Slab-footer column statistics
+## ADR 040 — Partial aggregate pushdown sibling protocol
 
-**Seed:** post-037 roadmap §"Slab-footer column statistics" (highest leverage).
+**Seed:** ADR 036 §10 reserved this. Surfaced as next council session
+now that ADR 039 has shipped.
 
-**What:** `min`, `max`, `null_count`, `distinct_count` for each column per
-slab, plus optional bloom filters for equality predicates and dictionary
-encoding for low-cardinality columns. Stored in the slab footer (ADR 022
-territory).
+**What:** `COUNT`, `SUM`, `AVG`, `MIN`/`MAX`, quantile sketches
+(t-digest, KLL), approximate `DISTINCT`. Computed at the storage tier;
+only the merged sketch returns to Toron.
 
-**Why first after 038:** Smallest implementation, enormous planner benefit.
-Toron's planner can skip entire slabs by consulting footer stats before
-issuing any read. Combined with 038's column-aware clustering, an
-`event_time > '2026-04-01'` predicate eliminates 99% of cold-storage
-scan without reading any data bytes. This is how BigQuery/Snowflake
-make billion-row scans fast.
+**Why first after 039:** Declared columns + clustering + stats already
+let Wendelon skip slabs that can't match. The next obvious leverage is
+"compute partial aggregates beside storage" — collapse a billion-row
+`SELECT COUNT(*)` to a constant before any rows leave the storage tier.
+Quantile sketches were deliberately deferred from ADR 039 to this
+sibling protocol.
 
-**What 039 has to decide (the new design surface):**
-1. Which stats to maintain by default vs. opt-in via descriptor.
-2. Bloom filter bit budget per slab and false-positive target.
-3. Dictionary-encoding threshold (cardinality cutoff).
-4. Compaction interaction — stats are recomputed on compaction output;
-   does the slab-footer carry per-input lineage or just merged stats?
-5. Lazy stats computation vs. eager — if a slab is written without stats,
-   can a background pass add them, and what does that mean for footer
-   immutability?
-6. Toron planner contract — how stats are surfaced over the
-   Toron→Wendelon boundary (probably extends ADR 036).
+**What 040 has to decide (the new design surface):**
 
-Size estimate: similar to 037 but with less novel descriptor design.
-Council session, 4–6 iterations, merge proposal, ratification.
+1. Which aggregates ship in V1 vs. opt-in vs. deferred.
+2. Sketch type for quantiles (t-digest vs. KLL vs. something else),
+   merge semantics, and on-disk format.
+3. Approximate-distinct: extend ADR 039's HLL infrastructure or
+   introduce a new sketch?
+4. Wire format for partial-result merge between storage nodes
+   before the result reaches Toron.
+5. WPBC integration — new opcodes, or a sibling bytecode dialect?
+6. Numerical-semantics guarantees (associativity, NaN handling,
+   overflow detection) that the protocol must promise to Toron.
 
-## Post-039 menu (ordered by compound value)
+Size estimate: medium-large. New protocol surface, careful numerical
+semantics, Toron-side planner integration. Council session: 4–6
+iterations.
 
-### ADR 040: Partial aggregate pushdown sibling protocol
-
-**What:** ADR 036 §10 reserved this. `COUNT`, `SUM`, `AVG`, `MIN`/`MAX`,
-quantile sketches (t-digest, KLL), approximate `DISTINCT`. Computed at
-the storage tier; only the merged sketch returns to Toron.
-
-**Why second:** Once you have declared columns + clustering + stats, the
-next obvious win is "compute partial aggregates beside storage." The
-other half of what makes BigQuery fast.
-
-**Size:** Medium-large. New protocol surface, careful numerical semantics,
-Toron-side planner integration.
+## Post-040 menu (ordered by compound value)
 
 ### ADR 041: Analytical multi-row fragments
 
@@ -122,9 +133,10 @@ Toron-side planner integration.
 analytical-shaped tables. A slab record carries a packed N-row Arrow
 batch with a row-level PK index inside it.
 
-**Why third:** Single-row records are correct for MVCC but wasteful for
-huge analytical tables. Once clustering (038), stats (039), and
-aggregates (040) are in place, single-row cost becomes the bottleneck.
+**Why next after 040:** Single-row records are correct for MVCC but
+wasteful for huge analytical tables. With clustering (038), stats
+(039), and aggregates (040) in place, single-row cost becomes the
+bottleneck.
 
 **Size:** Large. Touches storage index, write path, read path.
 
@@ -187,27 +199,30 @@ Each is its own council session when pulled by real workload demand.
 | 036 | WPBC pushdown contract | ✓ shipped |
 | 037 | Tenant table schemas, row identity, `TableSpreadProjection` | ✓ shipped |
 | 038 | Column-aware locality V1, Z-order, `ColumnProjection` | ✓ shipped |
-| 039 (proposed) | Slab-footer column statistics | next council session |
-| 040 (candidate) | Partial aggregate pushdown sibling protocol | post-039 |
-| 041 (candidate) | Analytical multi-row fragments | post-039 |
-| 042 (candidate) | Secondary indexes on non-clustering columns | post-039 |
-| 043 (candidate) | PK-less append-only tables | post-039 |
+| 039 | Slab-footer column statistics V1 | ✓ shipped |
+| 040 (proposed) | Partial aggregate pushdown sibling protocol | next council session |
+| 041 (candidate) | Analytical multi-row fragments | post-040 |
+| 042 (candidate) | Secondary indexes on non-clustering columns | post-040 |
+| 043 (candidate) | PK-less append-only tables | post-040 |
 | N (future) | Column-Aware Locality V2, Hilbert variant | deferred behind stats+aggregates |
+| N (future) | Float/decimal stat semantics | deferred — ADR 039 §15 type tags 0x09–0x0C reserved |
 | N (brainstorm 002) | Vector embeddings first-class | deferred, multi-ADR |
 | N (brainstorm 004) | CDC + triggers | deferred, multi-ADR |
 | N (brainstorm 010) | Serverless WPBC L2 | deferred, multi-ADR |
 
-ADR numbers 040+ are candidate ordering; actual numbering happens at
+ADR numbers 041+ are candidate ordering; actual numbering happens at
 opening.
 
 ## What to not do next
 
 - **Don't open every brainstorm at once.** Each is its own council
   session. Pick one when Toron actually pulls.
-- **Don't bundle 039 with bloom filters by default.** Min/max/null/distinct
-  is the safe MVP; bloom filters and dictionary encoding earn their way
-  in via measured planner pressure.
-- **Don't promote Hilbert ahead of stats+aggregates.** It is a locality
+- **Don't promote Hilbert ahead of aggregates.** It is a locality
   refinement, not warehouse infrastructure.
 - **Don't let Toron depend on deferred items without explicit ADR.**
   Same discipline as post-037.
+- **Don't expand ADR 039's stats catalog without an ADR.** Quantile
+  sketches, float min/max, and distinct cardinalities for high-card
+  columns each have their own forward-compat surface; they earn their
+  way in through 040 (quantiles), the float follow-up (floats), or
+  measured workload pressure (distincts).
