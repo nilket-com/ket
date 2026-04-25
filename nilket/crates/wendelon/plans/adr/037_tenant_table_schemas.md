@@ -287,7 +287,7 @@ ADR 036 Deferred Decision #1 anticipated that the reject-code enum would extend 
 - ADR 034: Toron-Wendelon Integration Contract
 - ADR 035: Vectorized WPBC Executor
 - ADR 036: WPBC Pushdown Contract — 037 extends its reject-code enum per its Deferred Decision #1.
-- ADR 038 (to be opened): Column-Aware Locality and Z-Order Clustering — fills the `ColumnProjection` slot reserved here.
+- ADR 038: Column-Aware Locality V1 (Z-Order) — fills the `ColumnProjection` slot reserved here.
 - `plans/schema/compute_ast.md` — WPBC V1 spec, unchanged.
 - `plans/schema/schemas.md` — legacy `write_payload_schema` for the default KV descriptor, unchanged.
 - `src/schema/core.rs` — `SlabRecordHeader` and `WriteRequestMeta` layouts that this ADR does not modify.
