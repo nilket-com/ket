@@ -73,7 +73,7 @@ If these are left as ad hoc API details, the two systems will drift into incompa
 - **Rejected alternative: use opaque internal tokens with no storage-facing session credential.** Rejected because it weakens the trust and audit boundary at the storage RPC surface.
 
 ## References
-- ADR 005: Decoupling Compute via Pushdown Bytecode (WPBC)
+- ADR 005: Decoupling Compute via Pushdown Bytecode (PBC)
 - ADR 018: Dual-CA mTLS Identity And OID-Bound Authorization
 - ADR 021: Tenant-Aware Architecture from Day One
 - ADR 032: Schema Evolution And Control-Ring Contract

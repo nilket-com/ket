@@ -9,7 +9,7 @@
 //!    bootstrap topology plus whatever the Control Ring's status
 //!    RPC said last — so it can dial the exact replica that owns
 //!    a given routing locality without a proxy hop.
-//! 2. **Zero-copy querying.** Pushdown scans ship a WPBC program
+//! 2. **Zero-copy querying.** Pushdown scans ship a PBC program
 //!    (ADR 005) in a custom HRFT frame (ADR 004) straight to a
 //!    data node; the server evaluates the program against its
 //!    local Arrow batches and streams the filtered IPC back on
@@ -21,7 +21,7 @@
 //! Build a [`WendelonClient`] via [`WendelonClient::builder`]:
 //!
 //! ```text
-//!   TopologySource → WendelonClient → query(wpbc, range)
+//!   TopologySource → WendelonClient → query(pbc, range)
 //!        │                               │
 //!        └───── watch<MembershipEpoch> ─┘
 //! ```
@@ -53,7 +53,7 @@ use crate::schema::{
 	Locality, MsgType, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta,
 	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, TableQueryRequestMeta,
 	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
-	WpbcRejectCode, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	PbcRejectCode, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	column_projection_prefix_ranges, read_key_schema, read_value_schema,
 	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
@@ -303,7 +303,7 @@ pub struct TableWriteResult {
 pub struct TableQueryRequest {
 	pub meta: TableQueryRequestMeta,
 	pub descriptor: TableSchemaDescriptorV1,
-	pub wpbc: Vec<u8>,
+	pub pbc: Vec<u8>,
 }
 
 /// Client-visible point read request for the Data Ring wire API.
@@ -445,7 +445,7 @@ impl WendelonClient {
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
 			let result = self.table_write_once(target, &request).await?;
 			self.observe_write_response(&result.response.write);
-			if result.response.reject_code != WpbcRejectCode::NONE.0 {
+			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
 			}
 			let Some(retry) = retry_write_response(&result.response.write) else {
@@ -708,10 +708,10 @@ impl WendelonClient {
 		let mut stream = conn.open_bi().await?;
 
 		let meta_bytes = bytemuck::bytes_of(&request.meta);
-		let trailing: Option<&[u8]> = if request.wpbc.is_empty() {
+		let trailing: Option<&[u8]> = if request.pbc.is_empty() {
 			None
 		} else {
-			Some(&request.wpbc)
+			Some(&request.pbc)
 		};
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
@@ -966,11 +966,11 @@ impl StreamingQueryResult {
 }
 
 impl WendelonClient {
-	/// Push a WPBC program to the replica that owns
+	/// Push a PBC program to the replica that owns
 	/// `range.start_locality`
 	/// and stream the filtered Arrow IPC result back.
 	///
-	/// * `wpbc_ast` — raw WPBC bytecode. Empty is legal and means
+	/// * `pbc_ast` — raw PBC bytecode. Empty is legal and means
 	///   "no filter, no projection".
 	/// * `range` — inclusive locality window. V1 targets the owner
 	///   of `start_locality`; a true cross-replica scan fan-out is
@@ -989,7 +989,7 @@ impl WendelonClient {
 	pub async fn query(
 		&self,
 		tenant_id: TenantId,
-		wpbc_ast: Vec<u8>,
+		pbc_ast: Vec<u8>,
 		range: QueryLocalityRange,
 		expected_epoch: u64,
 		min_hlc: HybridTimestamp,
@@ -1013,11 +1013,11 @@ impl WendelonClient {
 				_pad: pad,
 				locality_range_start: range.start_locality.get(),
 				locality_range_end: range.end_locality.get(),
-				bytecode_len: wpbc_ast.len() as u32,
+				bytecode_len: pbc_ast.len() as u32,
 				_pad2: [0; 4],
 				as_of_hlc,
 			};
-			match self.query_once(target, &meta, &wpbc_ast).await? {
+			match self.query_once(target, &meta, &pbc_ast).await? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
@@ -1048,7 +1048,7 @@ impl WendelonClient {
 	/// dispatch attempt against `target`. If the caller asked for
 	/// stats pruning but the chosen target peer does not advertise
 	/// `SlabStatsPruning`, the flag is silently forced off and the
-	/// `wpbc_slab_stats_skipped_no_capability_total` counter is
+	/// `pbc_slab_stats_skipped_no_capability_total` counter is
 	/// incremented (per ADR 036 §"Capability negotiation contract").
 	fn slab_stats_pruning_for_target(&self, target: NodeId, requested: bool) -> bool {
 		if !requested {
@@ -1058,7 +1058,7 @@ impl WendelonClient {
 			return true;
 		}
 		crate::metrics::global()
-			.wpbc_slab_stats_skipped_no_capability_total
+			.pbc_slab_stats_skipped_no_capability_total
 			.inc();
 		false
 	}
@@ -1085,13 +1085,13 @@ impl WendelonClient {
 		&self,
 		target: NodeId,
 		meta: &QueryRequestMeta,
-		wpbc: &[u8],
+		pbc: &[u8],
 	) -> std::io::Result<QueryOutcome> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
 
 		let meta_bytes = bytemuck::bytes_of(meta);
-		let trailing: Option<&[u8]> = if wpbc.is_empty() { None } else { Some(wpbc) };
+		let trailing: Option<&[u8]> = if pbc.is_empty() { None } else { Some(pbc) };
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
 			version: 1,
@@ -1272,10 +1272,10 @@ fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<
 			"TABLE_QUERY_REQ schema_generation does not match descriptor",
 		));
 	}
-	let bytecode_len = u32::try_from(request.wpbc.len()).map_err(|_| {
+	let bytecode_len = u32::try_from(request.pbc.len()).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidInput,
-			"TABLE_QUERY_REQ WPBC bytecode exceeds u32 length",
+			"TABLE_QUERY_REQ PBC bytecode exceeds u32 length",
 		)
 	})?;
 	if request.meta.bytecode_len != bytecode_len {
@@ -1768,7 +1768,7 @@ mod tests {
 		assert!(client.peer_advertises(advertising, NodeCapability::SlabStatsPruning));
 		assert!(!client.peer_advertises(silent, NodeCapability::SlabStatsPruning));
 
-		let metric = &crate::metrics::global().wpbc_slab_stats_skipped_no_capability_total;
+		let metric = &crate::metrics::global().pbc_slab_stats_skipped_no_capability_total;
 		let before = metric.get();
 
 		assert!(client.slab_stats_pruning_for_target(advertising, true));
@@ -1898,7 +1898,7 @@ mod tests {
 				as_of_hlc: bytemuck::Zeroable::zeroed(),
 			},
 			descriptor,
-			wpbc: vec![0x01, 0x02],
+			pbc: vec![0x01, 0x02],
 		};
 		validate_table_query_request(&request).unwrap();
 

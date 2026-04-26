@@ -441,7 +441,7 @@ impl MsgType {
 	pub const REPLICATE_REQ: Self = Self(0x09);
 	pub const REPLICATE_RESP: Self = Self(0x0A);
 	// Pushdown scan from a Smart Client SDK (ADR 005 + ADR 004).
-	// The client frames a WPBC program over a key-hash range and
+	// The client frames a PBC program over a key-hash range and
 	// the server streams one or more QUERY_RESP frames carrying the
 	// filtered Arrow IPC result back on the same bidi stream.
 	pub const QUERY_REQ: Self = Self(0x0B);
@@ -843,7 +843,7 @@ impl ReadStatus {
 	pub const MIGRATION_INCOMPLETE: Self = Self(7);
 	pub const TENANT_UNAVAILABLE: Self = Self(8);
 	pub const AUTHORIZATION_FAILED: Self = Self(9);
-	/// The query's WPBC program failed validation or referenced an
+	/// The query's PBC program failed validation or referenced an
 	/// unsupported column shape. The caller must fix the program;
 	/// retrying unchanged bytes will not succeed.
 	pub const QUERY_INVALID_PROGRAM: Self = Self(10);
@@ -900,7 +900,7 @@ pub struct ReadResponseMeta {
 //  QUERY REQUEST METADATA — 80 bytes, fixed
 //
 //  Carries the fixed envelope for a Smart Client pushdown scan
-//  (ADR 005). The WPBC bytecode itself rides in the frame's
+//  (ADR 005). The PBC bytecode itself rides in the frame's
 //  trailing section so it does not bloat this POD; the Arrow
 //  section is unused on the request side.
 // ============================================================
@@ -920,7 +920,7 @@ pub struct QueryRequestMeta {
 	pub locality_range_start: u64, //  8 bytes
 	/// Inclusive upper bound.
 	pub locality_range_end: u64, //  8 bytes
-	/// Length of the WPBC bytecode in the trailing section. Zero
+	/// Length of the PBC bytecode in the trailing section. Zero
 	/// means "no filter, all rows in range".
 	pub bytecode_len: u32, //  4 bytes
 	pub _pad2: [u8; 4],      //  4 bytes
@@ -945,7 +945,7 @@ pub fn query_request_stats_pruning_enabled(meta: &QueryRequestMeta) -> bool {
 //
 //  Response envelope for pushdown scans. The filtered Arrow IPC
 //  result rides in the frame's arrow section; `rows` is the row
-//  count after WPBC filter + project and lets the client size its
+//  count after PBC filter + project and lets the client size its
 //  downstream collection without walking the batch first.
 // ============================================================
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]

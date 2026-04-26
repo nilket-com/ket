@@ -155,3 +155,63 @@ fn test_forbidden_word_count() {
 		max_allowed
 	);
 }
+
+// Per ADR 041 (Project-name decoupling) Tier-1 enforcement: brand-leaked
+// names of the predicate-bytecode protocol are forbidden in code surfaces.
+// The `Wendelon[A-Z]` Tier-2 audit is a separate follow-up effort and is
+// not enforced by this test.
+#[test]
+fn test_no_wpbc_in_code_surfaces() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let scan_roots = ["src", "tests", "benches", "examples", "crates"];
+	let mut violations: Vec<String> = Vec::new();
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_none_or(|ext| ext != "rs")
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in ["WPBC", "Wpbc", "wpbc"] {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	let wpbc_module = manifest_dir.join("src/schema/wpbc.rs");
+	if wpbc_module.exists() {
+		violations.push(format!(
+			"{}: forbidden module path; rename to src/schema/pbc.rs",
+			wpbc_module.display()
+		));
+	}
+
+	assert!(
+		violations.is_empty(),
+		"WPBC brand-leaked names are forbidden in code surfaces (ADR 041 Tier-1):\n{}",
+		violations.join("\n")
+	);
+}

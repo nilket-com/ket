@@ -73,10 +73,10 @@ use crate::schema::{
 	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
 	ReplicaWriteStatus, SlabId, StreamFinalizationRequestMeta, TableQueryRequestMeta,
 	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
-	TableWriteValidationError, TenantId, WpbcRejectCode, WriteRequestMeta, WriteResponseMeta,
+	TableWriteValidationError, TenantId, PbcRejectCode, WriteRequestMeta, WriteResponseMeta,
 	WriteStatus, column_projection_predicate_ranges, column_projection_prefix_ranges,
 	migration_record_schema, query_request_stats_pruning_enabled, read_key_schema,
-	table_spread_prefix_ranges, validate_table_write_request_batch, wpbc, write_payload_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, pbc, write_payload_schema,
 };
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
@@ -3350,7 +3350,7 @@ impl WendelonDataServer {
 		&self,
 		meta: &TableWriteRequestMeta,
 		status: WriteStatus,
-		reject_code: WpbcRejectCode,
+		reject_code: PbcRejectCode,
 	) -> TableWriteResponseMeta {
 		TableWriteResponseMeta {
 			write: self.counted_write_response(WriteResponseMeta {
@@ -4610,7 +4610,7 @@ impl WendelonDataServer {
 		} = plan;
 		let schema = batches[0].schema();
 		let concatenated = concat_batches(&schema, &batches)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
 		let arrow_bytes = encode_batch(&concatenated)?;
 		let response = QueryResponseMeta {
 			arrow_len: arrow_bytes.len() as u32,
@@ -4769,7 +4769,7 @@ impl WendelonDataServer {
 				self.local_node,
 			));
 		};
-		let program = match wpbc::Program::compile(bytecode) {
+		let program = match pbc::Program::compile(bytecode) {
 			Ok(program) => program,
 			Err(_) => {
 				return Ok(query_plan_error(
@@ -5181,7 +5181,7 @@ impl DataRingServer for WendelonDataServer {
 					let resp = self.table_write_error_response(
 						&meta,
 						WriteStatus::AUTHORIZATION_FAILED,
-						WpbcRejectCode::NONE,
+						PbcRejectCode::NONE,
 					);
 					return Ok(Some(self.build_table_write_response_frame(
 						frame.header.stream_id,
@@ -5199,7 +5199,7 @@ impl DataRingServer for WendelonDataServer {
 						let resp = self.table_write_error_response(
 							&meta,
 							WriteStatus::BACKPRESSURED,
-							WpbcRejectCode::NONE,
+							PbcRejectCode::NONE,
 						);
 						return Ok(Some(self.build_table_write_response_frame(
 							frame.header.stream_id,
@@ -6278,7 +6278,7 @@ impl WendelonDataServer {
 				self.table_write_error_response(
 					&meta,
 					WriteStatus::PROXY_LIMIT,
-					WpbcRejectCode::NONE,
+					PbcRejectCode::NONE,
 				),
 				None,
 			));
@@ -6290,7 +6290,7 @@ impl WendelonDataServer {
 				self.table_write_error_response(
 					&meta,
 					WriteStatus::EPOCH_STALE,
-					WpbcRejectCode::NONE,
+					PbcRejectCode::NONE,
 				),
 				None,
 			));
@@ -6299,13 +6299,13 @@ impl WendelonDataServer {
 		let key = Self::idempotency_key_for(meta.parent_write_id);
 		if let Some(cached) = self.idempotency.get(&key).map(|entry| *entry.value()) {
 			let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
-			return Ok((table_write_response(write, WpbcRejectCode::NONE), trailing));
+			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
 		if self.degraded_reason().is_some() {
 			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
 			let (write, trailing) = self.fenced_write_response(&synthetic).await;
-			return Ok((table_write_response(write, WpbcRejectCode::NONE), trailing));
+			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
 		let descriptor = {
@@ -6320,7 +6320,7 @@ impl WendelonDataServer {
 				self.table_write_error_response(
 					&meta,
 					WriteStatus::INTERNAL_ERROR,
-					WpbcRejectCode::WPBC_REJECT_SCHEMA_UNKNOWN,
+					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
 				),
 				None,
 			));
@@ -6344,7 +6344,7 @@ impl WendelonDataServer {
 				self.table_write_error_response(
 					&meta,
 					WriteStatus::INTERNAL_ERROR,
-					WpbcRejectCode::WPBC_REJECT_LOCALITY_UNSUPPORTED,
+					PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
 				),
 				None,
 			));
@@ -6352,7 +6352,7 @@ impl WendelonDataServer {
 		let (write, trailing) = self
 			.write_table_bifurcated(meta, bifurcated, groups)
 			.await?;
-		Ok((table_write_response(write, WpbcRejectCode::NONE), trailing))
+		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
 	}
 }
 
@@ -6783,7 +6783,7 @@ fn query_deadline_exceeded(deadline: Instant) -> bool {
 async fn table_stats_may_match_location(
 	slab: &SlabManager,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
-	program: &wpbc::Program,
+	program: &pbc::Program,
 	cache: &mut QueryStatsPruneCache,
 	location: RecordLocation,
 ) -> std::io::Result<bool> {
@@ -6803,7 +6803,7 @@ async fn table_stats_may_match_location(
 		cache.decisions.insert(location.slab_id, true);
 		return Ok(true);
 	};
-	let decrypt_failed_before = metrics().wpbc_slab_stats_decrypt_failed_total.get();
+	let decrypt_failed_before = metrics().pbc_slab_stats_decrypt_failed_total.get();
 	let stats = match slab
 		.load_tiered_column_stats_block(&pointer, descriptor)
 		.await
@@ -6819,7 +6819,7 @@ async fn table_stats_may_match_location(
 			cache.explain.slabs_scanned_stats_missing =
 				cache.explain.slabs_scanned_stats_missing.saturating_add(1);
 			let decrypt_failed = metrics()
-				.wpbc_slab_stats_decrypt_failed_total
+				.pbc_slab_stats_decrypt_failed_total
 				.get()
 				.saturating_sub(decrypt_failed_before);
 			cache.explain.stats_decrypt_failed_total = cache
@@ -6833,7 +6833,7 @@ async fn table_stats_may_match_location(
 	let outcome = match slab_stats_query_outcome(descriptor, program, &stats) {
 		Ok(outcome) => outcome,
 		Err(_) => {
-			metrics().wpbc_slab_stats_unsupported_total.inc();
+			metrics().pbc_slab_stats_unsupported_total.inc();
 			cache.explain.slabs_scanned_stats_unsupported = cache
 				.explain
 				.slabs_scanned_stats_unsupported
@@ -6843,7 +6843,7 @@ async fn table_stats_may_match_location(
 		}
 	};
 	if outcome.unsupported {
-		metrics().wpbc_slab_stats_unsupported_total.inc();
+		metrics().pbc_slab_stats_unsupported_total.inc();
 		cache.explain.slabs_scanned_stats_unsupported = cache
 			.explain
 			.slabs_scanned_stats_unsupported
@@ -6851,7 +6851,7 @@ async fn table_stats_may_match_location(
 	}
 	if outcome.predicate_unrepresentable {
 		metrics()
-			.wpbc_slab_stats_predicate_unrepresentable_total
+			.pbc_slab_stats_predicate_unrepresentable_total
 			.inc();
 		cache.explain.slabs_scanned_predicate_unrepresentable = cache
 			.explain
@@ -6859,7 +6859,7 @@ async fn table_stats_may_match_location(
 			.saturating_add(1);
 	}
 	if !outcome.may_match {
-		metrics().wpbc_slab_stats_pruned_total.inc();
+		metrics().pbc_slab_stats_pruned_total.inc();
 		cache.explain.slabs_pruned_by_stats = cache.explain.slabs_pruned_by_stats.saturating_add(1);
 	}
 	cache.decisions.insert(location.slab_id, outcome.may_match);
@@ -6869,7 +6869,7 @@ async fn table_stats_may_match_location(
 #[cfg_attr(not(test), allow(dead_code))]
 fn slab_stats_may_match_query(
 	descriptor: &TableSchemaDescriptorV1,
-	program: &wpbc::Program,
+	program: &pbc::Program,
 	stats: &ParsedColumnStatsBlock,
 ) -> std::io::Result<bool> {
 	Ok(slab_stats_query_outcome(descriptor, program, stats)?.may_match)
@@ -6877,7 +6877,7 @@ fn slab_stats_may_match_query(
 
 fn slab_stats_query_outcome(
 	descriptor: &TableSchemaDescriptorV1,
-	program: &wpbc::Program,
+	program: &pbc::Program,
 	stats: &ParsedColumnStatsBlock,
 ) -> std::io::Result<SlabStatsQueryOutcome> {
 	let Some(predicates) = program.conjunctive_column_predicates() else {
@@ -6940,16 +6940,16 @@ fn slab_stats_query_outcome(
 
 fn encoded_stats_predicate(
 	data_type: &DataType,
-	predicate: &wpbc::ColumnPredicateV1,
+	predicate: &pbc::ColumnPredicateV1,
 ) -> std::io::Result<Option<EncodedStatsPredicate>> {
 	match predicate.comparison {
-		wpbc::ColumnPredicateComparisonV1::Eq => {
+		pbc::ColumnPredicateComparisonV1::Eq => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
 			Ok(Some(EncodedStatsPredicate::AnyOf(vec![value])))
 		}
-		wpbc::ColumnPredicateComparisonV1::Gt | wpbc::ColumnPredicateComparisonV1::Gte => {
+		pbc::ColumnPredicateComparisonV1::Gt | pbc::ColumnPredicateComparisonV1::Gte => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
@@ -6958,7 +6958,7 @@ fn encoded_stats_predicate(
 				upper: None,
 			}))
 		}
-		wpbc::ColumnPredicateComparisonV1::Lt | wpbc::ColumnPredicateComparisonV1::Lte => {
+		pbc::ColumnPredicateComparisonV1::Lt | pbc::ColumnPredicateComparisonV1::Lte => {
 			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
 				return Ok(None);
 			};
@@ -6967,8 +6967,8 @@ fn encoded_stats_predicate(
 				upper: Some(value),
 			}))
 		}
-		wpbc::ColumnPredicateComparisonV1::InList => {
-			let wpbc::ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
+		pbc::ColumnPredicateComparisonV1::InList => {
+			let pbc::ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
 				return Ok(None);
 			};
 			let mut encoded = Vec::with_capacity(literals.len());
@@ -6985,27 +6985,27 @@ fn encoded_stats_predicate(
 
 fn encode_stats_literal(
 	data_type: &DataType,
-	literal: &wpbc::ColumnPredicateLiteralV1,
+	literal: &pbc::ColumnPredicateLiteralV1,
 ) -> std::io::Result<Option<Vec<u8>>> {
 	match (data_type, literal) {
-		(DataType::Int64, wpbc::ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Int64, wpbc::ColumnPredicateLiteralV1::Ts(value))
+		(DataType::Int64, pbc::ColumnPredicateLiteralV1::Int(value))
+		| (DataType::Int64, pbc::ColumnPredicateLiteralV1::Ts(value))
 		| (
 			DataType::Timestamp(TimeUnit::Millisecond, _),
-			wpbc::ColumnPredicateLiteralV1::Int(value),
+			pbc::ColumnPredicateLiteralV1::Int(value),
 		)
 		| (
 			DataType::Timestamp(TimeUnit::Millisecond, _),
-			wpbc::ColumnPredicateLiteralV1::Ts(value),
+			pbc::ColumnPredicateLiteralV1::Ts(value),
 		) => encode_signed_stat_value(*value, 8).map(Some),
-		(DataType::Int32, wpbc::ColumnPredicateLiteralV1::Int(value))
-		| (DataType::Int32, wpbc::ColumnPredicateLiteralV1::Ts(value)) => {
+		(DataType::Int32, pbc::ColumnPredicateLiteralV1::Int(value))
+		| (DataType::Int32, pbc::ColumnPredicateLiteralV1::Ts(value)) => {
 			let Ok(value) = i32::try_from(*value) else {
 				return Ok(None);
 			};
 			encode_signed_stat_value(i64::from(value), 4).map(Some)
 		}
-		(DataType::Utf8 | DataType::LargeUtf8, wpbc::ColumnPredicateLiteralV1::Str(bytes)) => {
+		(DataType::Utf8 | DataType::LargeUtf8, pbc::ColumnPredicateLiteralV1::Str(bytes)) => {
 			if std::str::from_utf8(bytes).is_err() {
 				return Ok(None);
 			}
@@ -7015,7 +7015,7 @@ fn encode_stats_literal(
 	}
 }
 
-/// Plan a [`QueryRequestMeta`] + WPBC program against a local
+/// Plan a [`QueryRequestMeta`] + PBC program against a local
 /// [`SlabManager`] without concatenating the full result set.
 ///
 /// The returned plan caches the filtered batches discovered during
@@ -7072,12 +7072,12 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		));
 	}
 
-	// 3. Compile WPBC once so per-row evaluation skips repeated
+	// 3. Compile PBC once so per-row evaluation skips repeated
 	// decoding when the scan hits many records.
-	// `wpbc::execute` already does this internally per call, but
+	// `pbc::execute` already does this internally per call, but
 	// we mirror the pattern so a follow-up that batches rows can
 	// lift the compile out of the loop without touching semantics.
-	let program = match wpbc::Program::compile(bytecode) {
+	let program = match pbc::Program::compile(bytecode) {
 		Ok(program) => program,
 		Err(_) => {
 			return Ok(query_plan_error(
@@ -7101,7 +7101,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	slab: &SlabManager,
 	local_node: NodeId,
 	meta: &QueryRequestMeta,
-	program: &wpbc::Program,
+	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
@@ -7111,7 +7111,7 @@ async fn plan_query_execution_for_ranges_with_program(
 			&& query_request_stats_pruning_enabled(meta),
 		..budget
 	};
-	metrics().observe_wpbc_locality_arcs_scanned(ranges.len() as u64);
+	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
 	let mut batches = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
@@ -7286,8 +7286,8 @@ async fn plan_query_execution_for_ranges_with_program(
 		}
 		for group in rebatch_groups {
 			let concatenated = concat_batches(&group.schema, &group.batches)
-				.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
-			let result = match wpbc::execute_program(program, &concatenated) {
+				.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
+			let result = match pbc::execute_program(program, &concatenated) {
 				Ok(result) => result,
 				Err(_) => {
 					return Ok(query_plan_error(
@@ -7366,7 +7366,7 @@ fn encode_query_stream_batches_with_deadline(
 async fn materialize_query_batch_with_program(
 	slab: &SlabManager,
 	record: QueryRecordLocation,
-	program: &wpbc::Program,
+	program: &pbc::Program,
 	max_rows_per_location: u64,
 ) -> Result<RecordBatch, QueryBatchMaterializationError> {
 	let bytes: Vec<u8> = slab
@@ -7378,10 +7378,10 @@ async fn materialize_query_batch_with_program(
 	if batch.num_rows() > max_rows_per_location {
 		return Err(QueryBatchMaterializationError::BudgetExceeded);
 	}
-	wpbc::execute_program_with_context(
+	pbc::execute_program_with_context(
 		program,
 		&batch,
-		Some(wpbc::ExecutionContext {
+		Some(pbc::ExecutionContext {
 			identity: record.identity,
 			locality: record.locality,
 		}),
@@ -7414,7 +7414,7 @@ fn table_record_matches_descriptor(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-/// Execute a [`QueryRequestMeta`] + WPBC program against a local
+/// Execute a [`QueryRequestMeta`] + PBC program against a local
 /// [`SlabManager`]. Returns the POD response meta plus the
 /// concatenated Arrow IPC bytes when `status == OK`.
 ///
@@ -7467,7 +7467,7 @@ async fn execute_query_plan_with_budget_and_retention_floor(
 
 	let schema = plan.batches[0].schema();
 	let concatenated = concat_batches(&schema, &plan.batches)
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC concat: {e}")))?;
+		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
 	let arrow_bytes = encode_batch(&concatenated)?;
 	let response = QueryResponseMeta {
 		arrow_len: arrow_bytes.len() as u32,
@@ -7770,7 +7770,7 @@ fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta 
 fn table_query_scan_ranges(
 	tenant_id: TenantId,
 	descriptor: &TableSchemaDescriptorV1,
-	program: Option<&wpbc::Program>,
+	program: Option<&pbc::Program>,
 ) -> Result<Vec<QueryScanRange>, ReadStatus> {
 	match descriptor.locality_policy {
 		LocalityPolicyV1::TableSpreadProjection(spread) => {
@@ -7800,7 +7800,7 @@ fn table_query_scan_ranges(
 					COLUMN_PROJECTION_RANGE_ARC_BUDGET,
 				)
 				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
-				metrics().observe_wpbc_locality_decomposition(decomposition_started.elapsed());
+				metrics().observe_pbc_locality_decomposition(decomposition_started.elapsed());
 				match pruning {
 					ColumnProjectionRangePruning::Pruned(ranges) => ranges,
 					ColumnProjectionRangePruning::Fallback => column_projection_prefix_ranges(
@@ -7810,7 +7810,7 @@ fn table_query_scan_ranges(
 					)
 					.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?,
 					ColumnProjectionRangePruning::Overflow => {
-						metrics().observe_wpbc_range_decomposition_overflow();
+						metrics().observe_pbc_range_decomposition_overflow();
 						column_projection_prefix_ranges(
 							tenant_id,
 							descriptor.table_object_id,
@@ -7856,7 +7856,7 @@ fn error_response(
 
 fn table_write_response(
 	write: WriteResponseMeta,
-	reject_code: WpbcRejectCode,
+	reject_code: PbcRejectCode,
 ) -> TableWriteResponseMeta {
 	TableWriteResponseMeta {
 		write,
@@ -7886,10 +7886,10 @@ fn table_write_synthetic_meta(
 	}
 }
 
-fn table_write_status_for_reject(code: WpbcRejectCode) -> WriteStatus {
+fn table_write_status_for_reject(code: PbcRejectCode) -> WriteStatus {
 	match code {
-		WpbcRejectCode::WPBC_REJECT_SCHEMA_STALE => WriteStatus::EPOCH_STALE,
-		WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE => WriteStatus::PAYLOAD_TOO_LARGE,
+		PbcRejectCode::PBC_REJECT_SCHEMA_STALE => WriteStatus::EPOCH_STALE,
+		PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE => WriteStatus::PAYLOAD_TOO_LARGE,
 		_ => WriteStatus::INTERNAL_ERROR,
 	}
 }
@@ -8304,7 +8304,7 @@ fn bifurcate_table_write(
 	let encode_started = Instant::now();
 	let admission = validate_table_write_request_batch(meta, batch, descriptor);
 	if observe_encode {
-		metrics().observe_wpbc_locality_encode(encode_started.elapsed());
+		metrics().observe_pbc_locality_encode(encode_started.elapsed());
 	}
 	let admission = admission?;
 	let mut children = Vec::with_capacity(batch.num_rows());
@@ -8314,7 +8314,7 @@ fn bifurcate_table_write(
 		let frame_bytes =
 			Arc::new(
 				encode_batch(&row_batch).map_err(|err| TableWriteValidationError {
-					code: WpbcRejectCode::WPBC_REJECT_COLUMN_TYPE_MISMATCH,
+					code: PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
 					message: format!("failed to encode single-row table payload: {err}"),
 				})?,
 			);
@@ -8336,7 +8336,7 @@ fn bifurcate_table_write(
 		children,
 		charged_bytes,
 		record_count: u32::try_from(batch.num_rows()).map_err(|_| TableWriteValidationError {
-			code: WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE,
+			code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
 			message: "table write row count exceeds u32".to_string(),
 		})?,
 	})
@@ -8456,7 +8456,7 @@ mod tests {
 		SchemaMutationKindV1, SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
 		encode_schema_update_envelope_v1,
 	};
-	use crate::schema::wpbc::{
+	use crate::schema::pbc::{
 		OP_AND, OP_EQ, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_OR,
 		OP_PROJECT, OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_PUSH_STR,
 		OP_RANGE_LOCALITY, OP_ROUTE_BY_LOCALITY,
@@ -9166,10 +9166,10 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn wpbc_filter_drops_rows_below_threshold() {
-		// Stored records carry an Int64 `age` column so WPBC can
+	async fn pbc_filter_drops_rows_below_threshold() {
+		// Stored records carry an Int64 `age` column so PBC can
 		// actually compare against a literal — the write-path
-		// schema is LargeBinary and WPBC does not support bytes,
+		// schema is LargeBinary and PBC does not support bytes,
 		// so tests that exercise filter opcodes use their own
 		// schema via direct slab.append.
 		use arrow::array::Int64Array;
@@ -9211,11 +9211,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn wpbc_projection_narrows_schema() {
+	async fn pbc_projection_narrows_schema() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
-		// PROJECT column 0 (the `key` column) only — WPBC compiles
+		// PROJECT column 0 (the `key` column) only — PBC compiles
 		// a terminal PROJECT with no preceding filter, so every row
 		// is kept and only the `key` column survives.
 		let mut bytecode = Vec::new();
@@ -9237,7 +9237,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn typed_identity_wpbc_filters_by_record_identity() {
+	async fn typed_identity_pbc_filters_by_record_identity() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
@@ -9261,7 +9261,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn typed_locality_wpbc_filters_by_routing_projection() {
+	async fn typed_locality_pbc_filters_by_routing_projection() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
@@ -9288,7 +9288,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn typed_identity_range_wpbc_uses_byte_exact_bounds() {
+	async fn typed_identity_range_pbc_uses_byte_exact_bounds() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
@@ -9315,7 +9315,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn invalid_wpbc_returns_structured_query_status() {
+	async fn invalid_pbc_returns_structured_query_status() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
 
@@ -9834,7 +9834,7 @@ mod tests {
 	}
 
 	#[test]
-	fn table_query_scan_ranges_prune_column_projection_from_wpbc() {
+	fn table_query_scan_ranges_prune_column_projection_from_pbc() {
 		let tenant_id = tenant();
 		let projection = ColumnLocalityDescriptorV1 {
 			columns: vec![ClusteringColumnSpecV1 {
@@ -9862,7 +9862,7 @@ mod tests {
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&7_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 		let ranges = table_query_scan_ranges(tenant_id, &descriptor, Some(&program)).unwrap();
 		let full =
 			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, &projection)
@@ -9952,14 +9952,14 @@ mod tests {
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&100_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 		let meta = base_meta();
 		let ranges = [QueryScanRange {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}];
-		let pruned_before = metrics().wpbc_slab_stats_pruned_total.get();
-		let consulted_before = metrics().wpbc_slab_stats_consulted_total.get();
+		let pruned_before = metrics().pbc_slab_stats_pruned_total.get();
+		let consulted_before = metrics().pbc_slab_stats_consulted_total.get();
 
 		let plan = plan_query_execution_for_ranges_with_program(
 			&mgr,
@@ -9988,11 +9988,11 @@ mod tests {
 			}
 		);
 		assert!(
-			metrics().wpbc_slab_stats_consulted_total.get() >= consulted_before + 1,
+			metrics().pbc_slab_stats_consulted_total.get() >= consulted_before + 1,
 			"tiered stats should be consulted before L2 row reads"
 		);
 		assert!(
-			metrics().wpbc_slab_stats_pruned_total.get() >= pruned_before + 1,
+			metrics().pbc_slab_stats_pruned_total.get() >= pruned_before + 1,
 			"the slab-level id min/max should rule out id >= 100"
 		);
 
@@ -10010,7 +10010,7 @@ mod tests {
 				message: "cached stats must not range-read L2".to_owned(),
 			},
 		));
-		let cache_hits_before = metrics().wpbc_slab_stats_cache_hits_total.get();
+		let cache_hits_before = metrics().pbc_slab_stats_cache_hits_total.get();
 
 		let second = plan_query_execution_for_ranges_with_program(
 			&mgr,
@@ -10026,7 +10026,7 @@ mod tests {
 
 		assert_eq!(second.response.status, ReadStatus::KEY_NOT_FOUND);
 		assert!(
-			metrics().wpbc_slab_stats_cache_hits_total.get() >= cache_hits_before + 1,
+			metrics().pbc_slab_stats_cache_hits_total.get() >= cache_hits_before + 1,
 			"second query should reuse the parsed stats block cached by the slab manager"
 		);
 	}
@@ -10057,7 +10057,7 @@ mod tests {
 			.unwrap();
 		}
 
-		let program = wpbc::Program::compile(&[]).unwrap();
+		let program = pbc::Program::compile(&[]).unwrap();
 		let mut meta = base_meta();
 		meta._pad[0] |= crate::schema::QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 		let plan = plan_query_execution_for_ranges_with_program(
@@ -10081,10 +10081,10 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn table_stats_admit_slab_then_wpbc_filters_rows() {
+	async fn table_stats_admit_slab_then_pbc_filters_rows() {
 		let l2 = Arc::new(MockObjectStore::default());
 		let (mgr, descriptor) =
-			tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-admit-wpbc.wnd").await;
+			tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-admit-pbc.wnd").await;
 
 		let mut bytecode = Vec::new();
 		bytecode.push(OP_PUSH_COL);
@@ -10092,7 +10092,7 @@ mod tests {
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&2_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 		let plan = plan_query_execution_for_ranges_with_program(
 			&mgr,
 			n(1),
@@ -10144,7 +10144,7 @@ mod tests {
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&2_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 		let plan = plan_query_execution_for_ranges_with_program(
 			&mgr,
 			n(1),
@@ -10202,7 +10202,7 @@ mod tests {
 		bytecode.extend_from_slice(&2_i64.to_le_bytes());
 		bytecode.push(OP_EQ);
 		bytecode.push(OP_OR);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 		let plan = plan_query_execution_for_ranges_with_program(
 			&mgr,
 			n(1),
@@ -10282,7 +10282,7 @@ mod tests {
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&100_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
-		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let program = pbc::Program::compile(&bytecode).unwrap();
 
 		assert!(
 			slab_stats_may_match_query(&descriptor, &program, &stats).unwrap(),
@@ -10329,7 +10329,7 @@ mod tests {
 		boundary.extend_from_slice(&5_u16.to_le_bytes());
 		boundary.extend_from_slice(b"apple");
 		boundary.push(OP_GTE);
-		let boundary_program = wpbc::Program::compile(&boundary).unwrap();
+		let boundary_program = pbc::Program::compile(&boundary).unwrap();
 		assert!(
 			slab_stats_may_match_query(&descriptor, &boundary_program, &stats).unwrap(),
 			"truncated max prefix 'app' must not prune predicate value 'apple'"
@@ -10342,7 +10342,7 @@ mod tests {
 		outside.extend_from_slice(&3_u16.to_le_bytes());
 		outside.extend_from_slice(b"apq");
 		outside.push(OP_GTE);
-		let outside_program = wpbc::Program::compile(&outside).unwrap();
+		let outside_program = pbc::Program::compile(&outside).unwrap();
 		assert!(
 			!slab_stats_may_match_query(&descriptor, &outside_program, &stats).unwrap(),
 			"values at or beyond the prefix successor can still prune safely"
@@ -10355,7 +10355,7 @@ mod tests {
 		let batch = typed_table_batch(vec![7, 7]);
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
 		let err = bifurcate_table_write(&meta, &batch, &descriptor).unwrap_err();
-		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_DUPLICATE_PK_IN_BATCH);
+		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 	}
 
 	#[tokio::test]
@@ -10395,7 +10395,7 @@ mod tests {
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
 		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
 		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
-		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert_eq!(resp.reject_code, PbcRejectCode::NONE.0);
 		assert!(trailing.is_none());
 
 		let key_identity =
@@ -10455,7 +10455,7 @@ mod tests {
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
 		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
 		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
-		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert_eq!(resp.reject_code, PbcRejectCode::NONE.0);
 		assert!(trailing.is_none());
 
 		let key_identity =
@@ -10522,7 +10522,7 @@ mod tests {
 			meta.schema_generation = schema_generation;
 			let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
 			assert_eq!(resp.write.status, WriteStatus::EPOCH_STALE);
-			assert_eq!(resp.reject_code, WpbcRejectCode::WPBC_REJECT_SCHEMA_STALE.0);
+			assert_eq!(resp.reject_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE.0);
 			assert!(trailing.is_none());
 		}
 
@@ -10573,7 +10573,7 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
-		assert_eq!(resp.reject_code, WpbcRejectCode::NONE.0);
+		assert_eq!(resp.reject_code, PbcRejectCode::NONE.0);
 		assert_eq!(resp.write.has_finalization, 1);
 		assert!(trailing.is_some());
 
@@ -10628,7 +10628,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn table_query_dispatch_rebatches_split_rows_before_wpbc() {
+	async fn table_query_dispatch_rebatches_split_rows_before_pbc() {
 		let dir = bootstrap_tempdir("table-query-rebatch");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			39,

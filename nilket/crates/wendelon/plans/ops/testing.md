@@ -233,7 +233,7 @@ Fuzzing targets parsers and state machines that consume untrusted or adversarial
 ### 8.1 Active fuzz targets
 
 - **`FrameHeader` / metadata zero-copy casts.** Every `bytemuck`/`zerocopy` cast that accepts arbitrary bytes is fuzzed against random byte arrays to confirm no panic, no out-of-bounds, no undefined behavior. This is load-bearing — the QUIC frame path and the slab footer path both rely on these casts.
-- **WPBC execution.** The pushdown-stack machine is fuzzed against malformed opcodes; invariant: any malformed program returns a typed error, never panics, never runs for unbounded steps.
+- **PBC execution.** The pushdown-stack machine is fuzzed against malformed opcodes; invariant: any malformed program returns a typed error, never panics, never runs for unbounded steps.
 - **Audit canonical CBOR.** The hashing serializer is fuzzed against random inputs; invariant: round-trip stability (decode(encode(x)) == x) and hash stability across library minor versions.
 - **RPC frame decoder.** The outer RPC frame decoder is fuzzed; invariant: no panic on any byte sequence; decode either succeeds, returns a framing error, or signals more-data-needed.
 

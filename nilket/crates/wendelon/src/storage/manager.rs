@@ -995,20 +995,20 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 		descriptor: &TableSchemaDescriptorV1,
 	) -> std::io::Result<Option<ParsedColumnStatsBlock>> {
-		metrics().wpbc_slab_stats_consulted_total.inc();
+		metrics().pbc_slab_stats_consulted_total.inc();
 		let Some(cache_key) = tiered_stats_cache_key(pointer, descriptor) else {
-			metrics().wpbc_slab_stats_missing_total.inc();
+			metrics().pbc_slab_stats_missing_total.inc();
 			return Ok(None);
 		};
 		if let Some(entry) = self.tiered_stats_cache.get(&cache_key) {
-			metrics().wpbc_slab_stats_cache_hits_total.inc();
+			metrics().pbc_slab_stats_cache_hits_total.inc();
 			return Ok(Some(entry.value().clone()));
 		}
 		let Some(l2) = self.config.l2.as_ref() else {
-			metrics().wpbc_slab_stats_missing_total.inc();
+			metrics().pbc_slab_stats_missing_total.inc();
 			return Ok(None);
 		};
-		metrics().wpbc_slab_stats_cache_misses_total.inc();
+		metrics().pbc_slab_stats_cache_misses_total.inc();
 		let metadata = l2.head(&pointer.l2_uri).await?;
 		let tail_start = metadata
 			.size_bytes
@@ -1023,7 +1023,7 @@ impl SlabManager {
 		) {
 			Ok(range) => range,
 			Err(error) => {
-				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				metrics().pbc_slab_stats_decrypt_failed_total.inc();
 				return Err(error);
 			}
 		};
@@ -1038,7 +1038,7 @@ impl SlabManager {
 			additional_metadata.as_deref(),
 		)?
 		else {
-			metrics().wpbc_slab_stats_missing_total.inc();
+			metrics().pbc_slab_stats_missing_total.inc();
 			return Ok(None);
 		};
 		let locator = plan.locator();
@@ -1046,7 +1046,7 @@ impl SlabManager {
 			|| pointer.stats_block_len != Some(locator.stats_block_len)
 			|| pointer.stats_block_hash128 != Some(locator.stats_block_hash128)
 		{
-			metrics().wpbc_slab_stats_pointer_drift_total.inc();
+			metrics().pbc_slab_stats_pointer_drift_total.inc();
 			return Ok(None);
 		}
 		let stats_ciphertext = l2
@@ -1057,7 +1057,7 @@ impl SlabManager {
 		if ColumnStatsDescriptorIdentity::from_header(&parsed.header)
 			!= ColumnStatsDescriptorIdentity::from_descriptor(descriptor)
 		{
-			metrics().wpbc_slab_stats_pointer_drift_total.inc();
+			metrics().pbc_slab_stats_pointer_drift_total.inc();
 			return Ok(None);
 		}
 		self.tiered_stats_cache.insert(cache_key, parsed.clone());
@@ -1598,7 +1598,7 @@ impl SlabManager {
 	/// Enumerate every live `(key_identity, RecordLocation)` whose
 	/// locality falls in the inclusive window
 	/// `[start_locality, end_locality]`. Used
-	/// by the Data Ring query path (ADR 005) to feed the WPBC
+	/// by the Data Ring query path (ADR 005) to feed the PBC
 	/// interpreter; the server then reads each location via the
 	/// normal `StorageEngine::read` surface, which transparently
 	/// pivots L1 vs. L2.
@@ -1650,7 +1650,7 @@ impl SlabManager {
 
 	/// Variant of [`Self::scan_as_of`] that preserves the full
 	/// authoritative [`Identity`] for each retained version. Query
-	/// planning uses this when WPBC needs to evaluate typed
+	/// planning uses this when PBC needs to evaluate typed
 	/// identity/locality predicates against record metadata rather
 	/// than the decoded Arrow payload alone.
 	pub fn scan_as_of_with_identity(
@@ -3974,7 +3974,7 @@ mod tests {
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(drifted_hash),
 		};
-		let drift_before = metrics().wpbc_slab_stats_pointer_drift_total.get();
+		let drift_before = metrics().pbc_slab_stats_pointer_drift_total.get();
 
 		let stats = mgr
 			.load_tiered_column_stats_block(&pointer, &descriptor)
@@ -3983,7 +3983,7 @@ mod tests {
 
 		assert!(stats.is_none());
 		assert!(
-			metrics().wpbc_slab_stats_pointer_drift_total.get() >= drift_before + 1,
+			metrics().pbc_slab_stats_pointer_drift_total.get() >= drift_before + 1,
 			"pointer drift metric should increment when advisories disagree with footer locator"
 		);
 	}

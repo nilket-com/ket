@@ -1212,9 +1212,9 @@ impl TieredStatsBlockReadPlan {
 			})
 		})();
 		if result.is_err() {
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 		}
-		metrics().observe_wpbc_slab_stats_decrypt(start.elapsed());
+		metrics().observe_pbc_slab_stats_decrypt(start.elapsed());
 		result
 	}
 }
@@ -1699,10 +1699,10 @@ impl CryptoManager {
 			Ok(Some(DecryptedTieredStatsBlock { plaintext, locator }))
 		})();
 		if result.is_err() {
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 		}
 		if !matches!(result, Ok(None)) {
-			metrics().observe_wpbc_slab_stats_decrypt(start.elapsed());
+			metrics().observe_pbc_slab_stats_decrypt(start.elapsed());
 		}
 		result
 	}
@@ -1756,7 +1756,7 @@ impl CryptoManager {
 		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
 			Ok(parsed) => parsed,
 			Err(error) => {
-				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				metrics().pbc_slab_stats_decrypt_failed_total.inc();
 				self.emit_decrypt_rejected(expected_slab_id, None, "footer_parse", &error);
 				return Err(error);
 			}
@@ -1770,7 +1770,7 @@ impl CryptoManager {
 					parsed.slab_id, expected_slab_id
 				),
 			);
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
@@ -1782,7 +1782,7 @@ impl CryptoManager {
 					parsed.nonce_version, expected_slab_id
 				),
 			);
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
@@ -1790,7 +1790,7 @@ impl CryptoManager {
 			return Ok(None);
 		};
 		let Some(stats_range_in_object) = parsed.stats_ciphertext_range_in_object.clone() else {
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				"ADR 039 stats locator present without object range",
@@ -1805,12 +1805,12 @@ impl CryptoManager {
 					"tenant_kek_lookup",
 					&error,
 				);
-				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				metrics().pbc_slab_stats_decrypt_failed_total.inc();
 				return Err(error);
 			}
 		};
 		if let Err(error) = verify_tail_surface_hmac(&tenant_kek, &parsed, additional_metadata) {
-			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			metrics().pbc_slab_stats_decrypt_failed_total.inc();
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
 			return Err(error);
 		}
@@ -1823,7 +1823,7 @@ impl CryptoManager {
 		) {
 			Ok(prepared) => prepared,
 			Err(error) => {
-				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				metrics().pbc_slab_stats_decrypt_failed_total.inc();
 				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
 				return Err(error);
 			}

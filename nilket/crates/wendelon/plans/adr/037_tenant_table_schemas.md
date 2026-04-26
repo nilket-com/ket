@@ -5,7 +5,7 @@ Accepted
 
 ## Context
 
-ADR 005 committed Wendelon to pushdown bytecode (WPBC) as the compute/storage boundary. ADR 035 shipped a vectorized WPBC executor that runs those programs directly over Arrow `RecordBatch`es, and ADR 036 pinned WPBC as Toron's storage-side physical pushdown target (Rune/SQL → `toron-ir` → WPBC). Together those ADRs gave Wendelon a fast columnar filter engine.
+ADR 005 committed Wendelon to pushdown bytecode (PBC) as the compute/storage boundary. ADR 035 shipped a vectorized PBC executor that runs those programs directly over Arrow `RecordBatch`es, and ADR 036 pinned PBC as Toron's storage-side physical pushdown target (Rune/SQL → `toron-ir` → PBC). Together those ADRs gave Wendelon a fast columnar filter engine.
 
 The engine is only as useful as the columns it can see. Today's write RPC (see `plans/schema/schemas.md`'s `write_payload_schema`) pins every incoming batch to a two-column `{key: LargeBinary, value: LargeBinary}` shape, so predicates like `age >= 18` cannot reach columns hidden inside the opaque `value` blob. Wendelon therefore cannot yet serve the warehouse workload Toron is being designed for: real tables with declared columns, scans that stay on a bounded arc of the ring, MVCC-clean updates by primary key.
 
@@ -72,9 +72,9 @@ Wendelon adopts a unified tenant-table schema contract for the write path and ta
     V1 does not define last-write-wins inside one batch. Clients that intend multiple versions send separate writes.
 
 13. **Read-side rebatching is mandatory query-plan work.**
-    Scans decode row-keyed payloads, group compatible records by `(table_object_id, schema_generation, output_projection)`, concatenate into vector-sized `RecordBatch` chunks, then run WPBC. Without rebatching, ingest splitting would throw away ADR 035's vectorization win.
+    Scans decode row-keyed payloads, group compatible records by `(table_object_id, schema_generation, output_projection)`, concatenate into vector-sized `RecordBatch` chunks, then run PBC. Without rebatching, ingest splitting would throw away ADR 035's vectorization win.
 
-14. **Scalar identity/locality WPBC context disables rebatching in V1.**
+14. **Scalar identity/locality PBC context disables rebatching in V1.**
     ADR 035's `LOAD_IDENTITY` and `ROUTE_BY_LOCALITY` opcodes consume scalar per-batch context. Programs using those opcodes run per-record until per-row metadata columns or typed metadata-column opcodes land.
 
 15. **Schema generation lives in persisted write metadata.**
@@ -187,9 +187,9 @@ locality    = (table_hash & prefix_mask) | (row_hash & suffix_mask)
 
 **Why `TableSpreadProjection` in V1, and not full z-order.** `IdentityProjection` gives beautiful point-balance but scatters tables uniformly across the ring — any full-table scan hits every node. That defeats the OLAP scan goal the stack is being built for. The minimal fix is table-scoped spread: keep one table in a bounded number of arcs so scans stay sequential on a known working set. Hot tables don't collapse to a single arc because `spread_factor` spreads them across several via jump-consistent hash. The full z-order story (multi-dimensional clustering by declared columns, time bucketing, bit interleaving order, policy migration under spread-factor change, compaction interaction) is substantial additional design space that belongs in ADR 038. Shipping `TableSpreadProjection` now delivers the 80% scan benefit without committing to those decisions.
 
-**Why multi-row at the wire, single-row in the slab.** Arrow is designed for bulk; forcing 10,000 RPCs for 10,000 rows throws away the main efficiency Arrow exists for. The V1 storage index has one `key_identity` per slab record, which is load-bearing for MVCC and point reads. Accepting multi-row batches at the edge and splitting at ingest preserves Arrow's wire efficiency without rewriting the storage index. The cost is paid at ingest (N BLAKE3 computations, N index inserts per N-row batch) and at read time (rebatching before WPBC). Analytical multi-row fragments are deferred to a follow-up ADR when the cost profile warrants row-level secondary indexes.
+**Why multi-row at the wire, single-row in the slab.** Arrow is designed for bulk; forcing 10,000 RPCs for 10,000 rows throws away the main efficiency Arrow exists for. The V1 storage index has one `key_identity` per slab record, which is load-bearing for MVCC and point reads. Accepting multi-row batches at the edge and splitting at ingest preserves Arrow's wire efficiency without rewriting the storage index. The cost is paid at ingest (N BLAKE3 computations, N index inserts per N-row batch) and at read time (rebatching before PBC). Analytical multi-row fragments are deferred to a follow-up ADR when the cost profile warrants row-level secondary indexes.
 
-**Why read-side rebatching is mandatory, not opportunistic.** Single-row slab records are correct for MVCC but destroy ADR 035's vectorization win if WPBC is invoked per record. Reassembling compatible records into vector-sized batches before WPBC reclaims the win. The scalar-context exception (programs using `LOAD_IDENTITY` / `ROUTE_BY_LOCALITY`) is honest: those opcodes take one context per batch, and mixing records would misapply the first record's context to the rest.
+**Why read-side rebatching is mandatory, not opportunistic.** Single-row slab records are correct for MVCC but destroy ADR 035's vectorization win if PBC is invoked per record. Reassembling compatible records into vector-sized batches before PBC reclaims the win. The scalar-context exception (programs using `LOAD_IDENTITY` / `ROUTE_BY_LOCALITY`) is honest: those opcodes take one context per batch, and mixing records would misapply the first record's context to the rest.
 
 **Why fingerprint on descriptor only.** Including `schema_fingerprint` on every child frame costs 32 bytes × up to 65,536 rows = 2 MB per bulk write. The fingerprint defends against replicated descriptor corruption, which is a descriptor-load concern, not a per-write concern. Descriptor-load-time validation closes the same threat at near-zero hot-path cost.
 
@@ -211,7 +211,7 @@ locality    = (table_hash & prefix_mask) | (row_hash & suffix_mask)
 - **`IdentityProjection` as the V1 default for typed tables.** Rejected. Scans would scatter uniformly across the ring; warehouse workloads would be abysmal.
 - **`TableSpreadProjection` with fixed, non-configurable parameters.** Rejected. Hot tables and small tables want different spread factors; configurability via the descriptor is cheap and forward-compatible.
 - **Composite PKs in V1.** Deferred. The `columns: Vec<String>` shape keeps the door open for a later ADR without a descriptor-format break.
-- **Row-level secondary indexes in V1.** Deferred. Point reads under V1 go through the `TableSpreadProjection` arc plus WPBC filter; sufficient for the initial workload shape. A PK-to-row secondary index ADR opens if point-read latency requires it.
+- **Row-level secondary indexes in V1.** Deferred. Point reads under V1 go through the `TableSpreadProjection` arc plus PBC filter; sufficient for the initial workload shape. A PK-to-row secondary index ADR opens if point-read latency requires it.
 - **Bundling column-aware clustering (z-order, time bucketing) into 037.** Rejected — opens substantial additional design surface (bit layout, type support, migration under policy change, compaction) that deserves its own ADR.
 
 ## Implementation staging
@@ -246,8 +246,8 @@ locality    = (table_hash & prefix_mask) | (row_hash & suffix_mask)
 
 - For `TableSpreadProjection`, map table scans to unique table-bucket prefix ranges.
 - Decode candidate row-keyed Arrow payloads.
-- Group compatible records by `(table_object_id, schema_generation, output_projection)` and WPBC scalar-context safety.
-- Concatenate compatible records into vector-sized batches before WPBC.
+- Group compatible records by `(table_object_id, schema_generation, output_projection)` and PBC scalar-context safety.
+- Concatenate compatible records into vector-sized batches before PBC.
 - Fall back to per-record execution for identity/locality-context programs.
 
 ### Phase E: column locality follow-up (out of scope for this ADR)
@@ -259,35 +259,35 @@ ADR 038 will define `ColumnProjection` and cover z-order bit layout, supported c
 1. **Mixed schema generations on read.**
    Lean: the query planner names a target schema generation; V1 rejects incompatible mixes; a later read-time projection layer can map additive older generations forward.
 
-2. **Per-row identity/locality in WPBC.**
+2. **Per-row identity/locality in PBC.**
    Rebatching and scalar context remain in tension. Per-row metadata columns or typed metadata-column opcodes are a future ADR.
 
 3. **Large-write chaining above 65,536 rows.**
    The per-frame cap is pinned. The multi-frame parent-write chaining protocol is implementation design.
 
-## Appendix A: new WPBC reject codes
+## Appendix A: new PBC reject codes
 
 ADR 036 Deferred Decision #1 anticipated that the reject-code enum would extend during implementation. ADR 037 introduces the following stable codes, all consistent with ADR 036's "no free-form error strings across the boundary" rule:
 
-- `WPBC_REJECT_SCHEMA_STALE` — `expected_schema_version` in the write frame does not match the current descriptor generation.
-- `WPBC_REJECT_SCHEMA_UNKNOWN` — `table_object_id` is unknown to the tenant's schema state, or the schema has not yet replicated.
-- `WPBC_REJECT_COLUMN_TYPE_MISMATCH` — the incoming Arrow schema does not match the descriptor at the named generation.
-- `WPBC_REJECT_PK_MISSING` — the PK column declared in the descriptor is absent from the incoming batch.
-- `WPBC_REJECT_PK_NULL` — a row's PK value is null (nullable PKs are rejected in V1).
-- `WPBC_REJECT_PK_TYPE_UNSUPPORTED` — PK type is outside the V1 canonicalization set (§6).
-- `WPBC_REJECT_DUPLICATE_PK_IN_BATCH` — two or more rows in the batch share a PK value.
-- `WPBC_REJECT_LOCALITY_UNSUPPORTED` — descriptor declares `ColumnProjection`, which is reserved for ADR 038.
-- `WPBC_REJECT_BATCH_TOO_LARGE` — batch exceeds the 65,536-row admission cap or the byte-size limit.
+- `PBC_REJECT_SCHEMA_STALE` — `expected_schema_version` in the write frame does not match the current descriptor generation.
+- `PBC_REJECT_SCHEMA_UNKNOWN` — `table_object_id` is unknown to the tenant's schema state, or the schema has not yet replicated.
+- `PBC_REJECT_COLUMN_TYPE_MISMATCH` — the incoming Arrow schema does not match the descriptor at the named generation.
+- `PBC_REJECT_PK_MISSING` — the PK column declared in the descriptor is absent from the incoming batch.
+- `PBC_REJECT_PK_NULL` — a row's PK value is null (nullable PKs are rejected in V1).
+- `PBC_REJECT_PK_TYPE_UNSUPPORTED` — PK type is outside the V1 canonicalization set (§6).
+- `PBC_REJECT_DUPLICATE_PK_IN_BATCH` — two or more rows in the batch share a PK value.
+- `PBC_REJECT_LOCALITY_UNSUPPORTED` — descriptor declares `ColumnProjection`, which is reserved for ADR 038.
+- `PBC_REJECT_BATCH_TOO_LARGE` — batch exceeds the 65,536-row admission cap or the byte-size limit.
 
 ## References
 
-- ADR 005: Decoupling Compute via Pushdown Bytecode (WPBC)
+- ADR 005: Decoupling Compute via Pushdown Bytecode (PBC)
 - ADR 029: Identity vs. Locality
 - ADR 032: Schema Evolution And Control-Ring Contract
 - ADR 034: Toron-Wendelon Integration Contract
-- ADR 035: Vectorized WPBC Executor
-- ADR 036: WPBC Pushdown Contract — 037 extends its reject-code enum per its Deferred Decision #1.
+- ADR 035: Vectorized PBC Executor
+- ADR 036: PBC Pushdown Contract — 037 extends its reject-code enum per its Deferred Decision #1.
 - ADR 038: Column-Aware Locality V1 (Z-Order) — fills the `ColumnProjection` slot reserved here.
-- `plans/schema/compute_ast.md` — WPBC V1 spec, unchanged.
+- `plans/schema/compute_ast.md` — PBC V1 spec, unchanged.
 - `plans/schema/schemas.md` — legacy `write_payload_schema` for the default KV descriptor, unchanged.
 - `src/schema/core.rs` — `SlabRecordHeader` and `WriteRequestMeta` layouts that this ADR does not modify.

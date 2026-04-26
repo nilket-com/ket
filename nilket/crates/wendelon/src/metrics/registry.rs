@@ -36,16 +36,16 @@ const WAL_FSYNC_LATENCY_BUCKETS_MICROS: &[u64] = &[
 	100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
 	1_000_000,
 ];
-const WPBC_EXEC_BUCKETS_MICROS: &[u64] = &[
+const PBC_EXEC_BUCKETS_MICROS: &[u64] = &[
 	25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
 ];
-const WPBC_LOCALITY_BUCKETS_MICROS: &[u64] = &[
+const PBC_LOCALITY_BUCKETS_MICROS: &[u64] = &[
 	10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
 ];
-const WPBC_SLAB_STATS_BUCKETS_MICROS: &[u64] = &[
+const PBC_SLAB_STATS_BUCKETS_MICROS: &[u64] = &[
 	10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
 ];
-const WPBC_SLAB_STATS_BLOCK_BYTES_BUCKETS: &[u64] =
+const PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS: &[u64] =
 	&[1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304];
 
 pub fn global() -> &'static MetricsRegistry {
@@ -84,12 +84,12 @@ impl Gauge {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WpbcRuntime {
+pub enum PbcRuntime {
 	Vectorized,
 	ScalarReference,
 }
 
-impl WpbcRuntime {
+impl PbcRuntime {
 	fn as_str(self) -> &'static str {
 		match self {
 			Self::Vectorized => "vectorized",
@@ -99,20 +99,20 @@ impl WpbcRuntime {
 }
 
 #[derive(Default)]
-struct WpbcRuntimeCounters {
+struct PbcRuntimeCounters {
 	vectorized: Counter,
 	scalar_reference: Counter,
 }
 
-impl WpbcRuntimeCounters {
-	fn counter(&self, runtime: WpbcRuntime) -> &Counter {
+impl PbcRuntimeCounters {
+	fn counter(&self, runtime: PbcRuntime) -> &Counter {
 		match runtime {
-			WpbcRuntime::Vectorized => &self.vectorized,
-			WpbcRuntime::ScalarReference => &self.scalar_reference,
+			PbcRuntime::Vectorized => &self.vectorized,
+			PbcRuntime::ScalarReference => &self.scalar_reference,
 		}
 	}
 
-	fn add(&self, runtime: WpbcRuntime, value: u64) {
+	fn add(&self, runtime: PbcRuntime, value: u64) {
 		self.counter(runtime).add(value);
 	}
 
@@ -122,7 +122,7 @@ impl WpbcRuntimeCounters {
 
 	fn render(&self, out: &mut String, name: &str, help: &str) {
 		render_counter_family_header(out, name, help);
-		for runtime in [WpbcRuntime::Vectorized, WpbcRuntime::ScalarReference] {
+		for runtime in [PbcRuntime::Vectorized, PbcRuntime::ScalarReference] {
 			render_counter_with_labels(
 				out,
 				name,
@@ -133,29 +133,29 @@ impl WpbcRuntimeCounters {
 	}
 }
 
-struct WpbcRuntimeHistograms {
+struct PbcRuntimeHistograms {
 	vectorized: Histogram,
 	scalar_reference: Histogram,
 }
 
-impl Default for WpbcRuntimeHistograms {
+impl Default for PbcRuntimeHistograms {
 	fn default() -> Self {
 		Self {
-			vectorized: Histogram::new(WPBC_EXEC_BUCKETS_MICROS),
-			scalar_reference: Histogram::new(WPBC_EXEC_BUCKETS_MICROS),
+			vectorized: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
+			scalar_reference: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
 		}
 	}
 }
 
-impl WpbcRuntimeHistograms {
-	fn histogram(&self, runtime: WpbcRuntime) -> &Histogram {
+impl PbcRuntimeHistograms {
+	fn histogram(&self, runtime: PbcRuntime) -> &Histogram {
 		match runtime {
-			WpbcRuntime::Vectorized => &self.vectorized,
-			WpbcRuntime::ScalarReference => &self.scalar_reference,
+			PbcRuntime::Vectorized => &self.vectorized,
+			PbcRuntime::ScalarReference => &self.scalar_reference,
 		}
 	}
 
-	fn observe_duration(&self, runtime: WpbcRuntime, duration: Duration) {
+	fn observe_duration(&self, runtime: PbcRuntime, duration: Duration) {
 		self.histogram(runtime).observe_duration(duration);
 	}
 
@@ -165,13 +165,13 @@ impl WpbcRuntimeHistograms {
 		render_histogram_micros_series(
 			out,
 			name,
-			&[("runtime", WpbcRuntime::Vectorized.as_str())],
+			&[("runtime", PbcRuntime::Vectorized.as_str())],
 			&self.vectorized.snapshot(),
 		);
 		render_histogram_micros_series(
 			out,
 			name,
-			&[("runtime", WpbcRuntime::ScalarReference.as_str())],
+			&[("runtime", PbcRuntime::ScalarReference.as_str())],
 			&self.scalar_reference.snapshot(),
 		);
 	}
@@ -672,28 +672,28 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_rejections_actor_total: Counter,
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
-	wpbc_rows_scanned: WpbcRuntimeCounters,
-	wpbc_rows_returned: WpbcRuntimeCounters,
-	wpbc_exec_micros: WpbcRuntimeHistograms,
-	wpbc_kernel_error_total: WpbcRuntimeCounters,
-	wpbc_intermediate_arrays: WpbcRuntimeCounters,
-	wpbc_locality_arcs_scanned_total: Counter,
-	wpbc_range_decomposition_overflow_total: Counter,
-	wpbc_locality_decomposition_micros: Histogram,
-	wpbc_locality_encode_micros: Histogram,
-	pub wpbc_slab_stats_consulted_total: Counter,
-	pub wpbc_slab_stats_pruned_total: Counter,
-	pub wpbc_slab_stats_missing_total: Counter,
-	pub wpbc_slab_stats_unsupported_total: Counter,
-	pub wpbc_slab_stats_predicate_unrepresentable_total: Counter,
-	pub wpbc_slab_stats_decrypt_failed_total: Counter,
-	pub wpbc_slab_stats_pointer_drift_total: Counter,
-	pub wpbc_slab_stats_cache_hits_total: Counter,
-	pub wpbc_slab_stats_cache_misses_total: Counter,
-	pub wpbc_slab_stats_skipped_no_capability_total: Counter,
-	wpbc_slab_stats_build_micros: Histogram,
-	wpbc_slab_stats_decrypt_micros: Histogram,
-	wpbc_slab_stats_block_bytes: Histogram,
+	pbc_rows_scanned: PbcRuntimeCounters,
+	pbc_rows_returned: PbcRuntimeCounters,
+	pbc_exec_micros: PbcRuntimeHistograms,
+	pbc_kernel_error_total: PbcRuntimeCounters,
+	pbc_intermediate_arrays: PbcRuntimeCounters,
+	pbc_locality_arcs_scanned_total: Counter,
+	pbc_range_decomposition_overflow_total: Counter,
+	pbc_locality_decomposition_micros: Histogram,
+	pbc_locality_encode_micros: Histogram,
+	pub pbc_slab_stats_consulted_total: Counter,
+	pub pbc_slab_stats_pruned_total: Counter,
+	pub pbc_slab_stats_missing_total: Counter,
+	pub pbc_slab_stats_unsupported_total: Counter,
+	pub pbc_slab_stats_predicate_unrepresentable_total: Counter,
+	pub pbc_slab_stats_decrypt_failed_total: Counter,
+	pub pbc_slab_stats_pointer_drift_total: Counter,
+	pub pbc_slab_stats_cache_hits_total: Counter,
+	pub pbc_slab_stats_cache_misses_total: Counter,
+	pub pbc_slab_stats_skipped_no_capability_total: Counter,
+	pbc_slab_stats_build_micros: Histogram,
+	pbc_slab_stats_decrypt_micros: Histogram,
+	pbc_slab_stats_block_bytes: Histogram,
 
 	pub group_commit_window_seconds: Histogram,
 	pub data_ring_durable_quorum_latency_seconds: Histogram,
@@ -789,28 +789,28 @@ impl Default for MetricsRegistry {
 			data_ring_backpressure_rejections_actor_total: Counter::default(),
 			data_ring_backpressure_active_tenant_requests: Gauge::default(),
 			data_ring_backpressure_active_actor_requests: Gauge::default(),
-			wpbc_rows_scanned: WpbcRuntimeCounters::default(),
-			wpbc_rows_returned: WpbcRuntimeCounters::default(),
-			wpbc_exec_micros: WpbcRuntimeHistograms::default(),
-			wpbc_kernel_error_total: WpbcRuntimeCounters::default(),
-			wpbc_intermediate_arrays: WpbcRuntimeCounters::default(),
-			wpbc_locality_arcs_scanned_total: Counter::default(),
-			wpbc_range_decomposition_overflow_total: Counter::default(),
-			wpbc_locality_decomposition_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
-			wpbc_locality_encode_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
-			wpbc_slab_stats_consulted_total: Counter::default(),
-			wpbc_slab_stats_pruned_total: Counter::default(),
-			wpbc_slab_stats_missing_total: Counter::default(),
-			wpbc_slab_stats_unsupported_total: Counter::default(),
-			wpbc_slab_stats_predicate_unrepresentable_total: Counter::default(),
-			wpbc_slab_stats_decrypt_failed_total: Counter::default(),
-			wpbc_slab_stats_pointer_drift_total: Counter::default(),
-			wpbc_slab_stats_cache_hits_total: Counter::default(),
-			wpbc_slab_stats_cache_misses_total: Counter::default(),
-			wpbc_slab_stats_skipped_no_capability_total: Counter::default(),
-			wpbc_slab_stats_build_micros: Histogram::new(WPBC_SLAB_STATS_BUCKETS_MICROS),
-			wpbc_slab_stats_decrypt_micros: Histogram::new(WPBC_SLAB_STATS_BUCKETS_MICROS),
-			wpbc_slab_stats_block_bytes: Histogram::new(WPBC_SLAB_STATS_BLOCK_BYTES_BUCKETS),
+			pbc_rows_scanned: PbcRuntimeCounters::default(),
+			pbc_rows_returned: PbcRuntimeCounters::default(),
+			pbc_exec_micros: PbcRuntimeHistograms::default(),
+			pbc_kernel_error_total: PbcRuntimeCounters::default(),
+			pbc_intermediate_arrays: PbcRuntimeCounters::default(),
+			pbc_locality_arcs_scanned_total: Counter::default(),
+			pbc_range_decomposition_overflow_total: Counter::default(),
+			pbc_locality_decomposition_micros: Histogram::new(PBC_LOCALITY_BUCKETS_MICROS),
+			pbc_locality_encode_micros: Histogram::new(PBC_LOCALITY_BUCKETS_MICROS),
+			pbc_slab_stats_consulted_total: Counter::default(),
+			pbc_slab_stats_pruned_total: Counter::default(),
+			pbc_slab_stats_missing_total: Counter::default(),
+			pbc_slab_stats_unsupported_total: Counter::default(),
+			pbc_slab_stats_predicate_unrepresentable_total: Counter::default(),
+			pbc_slab_stats_decrypt_failed_total: Counter::default(),
+			pbc_slab_stats_pointer_drift_total: Counter::default(),
+			pbc_slab_stats_cache_hits_total: Counter::default(),
+			pbc_slab_stats_cache_misses_total: Counter::default(),
+			pbc_slab_stats_skipped_no_capability_total: Counter::default(),
+			pbc_slab_stats_build_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
+			pbc_slab_stats_decrypt_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
+			pbc_slab_stats_block_bytes: Histogram::new(PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			data_ring_durable_quorum_latency_seconds: Histogram::new(
@@ -932,51 +932,51 @@ impl MetricsRegistry {
 			.expect("raft leader gauge mutex poisoned") = leader_id.map(|id| format!("n-{id:02}"));
 	}
 
-	pub fn observe_wpbc_execution(
+	pub fn observe_pbc_execution(
 		&self,
-		runtime: WpbcRuntime,
+		runtime: PbcRuntime,
 		rows_scanned: u64,
 		rows_returned: u64,
 		duration: Duration,
 		kernel_errors: u64,
 		intermediate_arrays: u64,
 	) {
-		self.wpbc_rows_scanned.add(runtime, rows_scanned);
-		self.wpbc_rows_returned.add(runtime, rows_returned);
-		self.wpbc_exec_micros.observe_duration(runtime, duration);
-		self.wpbc_kernel_error_total.add(runtime, kernel_errors);
-		self.wpbc_intermediate_arrays
+		self.pbc_rows_scanned.add(runtime, rows_scanned);
+		self.pbc_rows_returned.add(runtime, rows_returned);
+		self.pbc_exec_micros.observe_duration(runtime, duration);
+		self.pbc_kernel_error_total.add(runtime, kernel_errors);
+		self.pbc_intermediate_arrays
 			.add(runtime, intermediate_arrays);
 	}
 
-	pub fn observe_wpbc_locality_arcs_scanned(&self, arcs: u64) {
-		self.wpbc_locality_arcs_scanned_total.add(arcs);
+	pub fn observe_pbc_locality_arcs_scanned(&self, arcs: u64) {
+		self.pbc_locality_arcs_scanned_total.add(arcs);
 	}
 
-	pub fn observe_wpbc_range_decomposition_overflow(&self) {
-		self.wpbc_range_decomposition_overflow_total.inc();
+	pub fn observe_pbc_range_decomposition_overflow(&self) {
+		self.pbc_range_decomposition_overflow_total.inc();
 	}
 
-	pub fn observe_wpbc_locality_decomposition(&self, duration: Duration) {
-		self.wpbc_locality_decomposition_micros
+	pub fn observe_pbc_locality_decomposition(&self, duration: Duration) {
+		self.pbc_locality_decomposition_micros
 			.observe_duration(duration);
 	}
 
-	pub fn observe_wpbc_locality_encode(&self, duration: Duration) {
-		self.wpbc_locality_encode_micros.observe_duration(duration);
+	pub fn observe_pbc_locality_encode(&self, duration: Duration) {
+		self.pbc_locality_encode_micros.observe_duration(duration);
 	}
 
-	pub fn observe_wpbc_slab_stats_build(&self, duration: Duration) {
-		self.wpbc_slab_stats_build_micros.observe_duration(duration);
+	pub fn observe_pbc_slab_stats_build(&self, duration: Duration) {
+		self.pbc_slab_stats_build_micros.observe_duration(duration);
 	}
 
-	pub fn observe_wpbc_slab_stats_decrypt(&self, duration: Duration) {
-		self.wpbc_slab_stats_decrypt_micros
+	pub fn observe_pbc_slab_stats_decrypt(&self, duration: Duration) {
+		self.pbc_slab_stats_decrypt_micros
 			.observe_duration(duration);
 	}
 
-	pub fn observe_wpbc_slab_stats_block_bytes(&self, bytes: u64) {
-		self.wpbc_slab_stats_block_bytes.observe_value(bytes);
+	pub fn observe_pbc_slab_stats_block_bytes(&self, bytes: u64) {
+		self.pbc_slab_stats_block_bytes.observe_value(bytes);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1229,143 +1229,143 @@ impl MetricsRegistry {
 			"Actor-scoped Data Ring requests currently admitted by post-auth backpressure control.",
 			self.data_ring_backpressure_active_actor_requests.get(),
 		);
-		self.wpbc_rows_scanned.render(
+		self.pbc_rows_scanned.render(
 			&mut out,
-			"wendelon_wpbc_rows_scanned_total",
-			"Rows scanned by WPBC execution.",
+			"wendelon_pbc_rows_scanned_total",
+			"Rows scanned by PBC execution.",
 		);
-		self.wpbc_rows_returned.render(
+		self.pbc_rows_returned.render(
 			&mut out,
-			"wendelon_wpbc_rows_returned_total",
-			"Rows returned after WPBC filtering.",
+			"wendelon_pbc_rows_returned_total",
+			"Rows returned after PBC filtering.",
 		);
 		// Derived from the scanned/returned counters instead of stored as
 		// a separate hot-path metric.
 		render_gauge_f64(
 			&mut out,
-			"wendelon_wpbc_mask_selectivity",
-			"Aggregate WPBC mask selectivity, computed as rows_returned / rows_scanned.",
+			"wendelon_pbc_mask_selectivity",
+			"Aggregate PBC mask selectivity, computed as rows_returned / rows_scanned.",
 			mask_selectivity(
-				self.wpbc_rows_scanned.total(),
-				self.wpbc_rows_returned.total(),
+				self.pbc_rows_scanned.total(),
+				self.pbc_rows_returned.total(),
 			),
 		);
-		self.wpbc_exec_micros.render(
+		self.pbc_exec_micros.render(
 			&mut out,
-			"wendelon_wpbc_exec_micros",
-			"WPBC execution duration in microseconds.",
+			"wendelon_pbc_exec_micros",
+			"PBC execution duration in microseconds.",
 		);
-		self.wpbc_kernel_error_total.render(
+		self.pbc_kernel_error_total.render(
 			&mut out,
-			"wendelon_wpbc_kernel_error_total",
-			"WPBC vector kernel or runtime-trap errors normalized during execution.",
+			"wendelon_pbc_kernel_error_total",
+			"PBC vector kernel or runtime-trap errors normalized during execution.",
 		);
-		self.wpbc_intermediate_arrays.render(
+		self.pbc_intermediate_arrays.render(
 			&mut out,
-			"wendelon_wpbc_intermediate_arrays_total",
-			"Intermediate Arrow arrays materialized by WPBC execution.",
-		);
-		render_counter(
-			&mut out,
-			"wendelon_wpbc_locality_arcs_scanned_total",
-			"Locality arcs admitted for WPBC scan planning.",
-			self.wpbc_locality_arcs_scanned_total.get(),
+			"wendelon_pbc_intermediate_arrays_total",
+			"Intermediate Arrow arrays materialized by PBC execution.",
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_range_decomposition_overflow_total",
+			"wendelon_pbc_locality_arcs_scanned_total",
+			"Locality arcs admitted for PBC scan planning.",
+			self.pbc_locality_arcs_scanned_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_pbc_range_decomposition_overflow_total",
 			"Column-projection range decompositions that exceeded the arc or node budget and fell back to full table arcs.",
-			self.wpbc_range_decomposition_overflow_total.get(),
+			self.pbc_range_decomposition_overflow_total.get(),
 		);
 		render_histogram_micros(
 			&mut out,
-			"wendelon_wpbc_locality_decomposition_micros",
+			"wendelon_pbc_locality_decomposition_micros",
 			"Column-projection locality range decomposition duration in microseconds.",
-			&self.wpbc_locality_decomposition_micros.snapshot(),
+			&self.pbc_locality_decomposition_micros.snapshot(),
 		);
 		render_histogram_micros(
 			&mut out,
-			"wendelon_wpbc_locality_encode_micros",
+			"wendelon_pbc_locality_encode_micros",
 			"Column-projection write-locality encoding duration in microseconds.",
-			&self.wpbc_locality_encode_micros.snapshot(),
+			&self.pbc_locality_encode_micros.snapshot(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_consulted_total",
+			"wendelon_pbc_slab_stats_consulted_total",
 			"Slab stats blocks consulted during scan planning.",
-			self.wpbc_slab_stats_consulted_total.get(),
+			self.pbc_slab_stats_consulted_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_pruned_total",
+			"wendelon_pbc_slab_stats_pruned_total",
 			"Candidate slabs pruned by ADR 039 column statistics.",
-			self.wpbc_slab_stats_pruned_total.get(),
+			self.pbc_slab_stats_pruned_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_missing_total",
+			"wendelon_pbc_slab_stats_missing_total",
 			"Candidate slabs scanned because stats were unavailable.",
-			self.wpbc_slab_stats_missing_total.get(),
+			self.pbc_slab_stats_missing_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_unsupported_total",
+			"wendelon_pbc_slab_stats_unsupported_total",
 			"Candidate slabs scanned because stats did not cover the predicate columns.",
-			self.wpbc_slab_stats_unsupported_total.get(),
+			self.pbc_slab_stats_unsupported_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_predicate_unrepresentable_total",
+			"wendelon_pbc_slab_stats_predicate_unrepresentable_total",
 			"Candidate slabs scanned because the predicate shape was not stats-representable.",
-			self.wpbc_slab_stats_predicate_unrepresentable_total.get(),
+			self.pbc_slab_stats_predicate_unrepresentable_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_decrypt_failed_total",
+			"wendelon_pbc_slab_stats_decrypt_failed_total",
 			"Stats blocks whose AEAD authentication failed after footer validation.",
-			self.wpbc_slab_stats_decrypt_failed_total.get(),
+			self.pbc_slab_stats_decrypt_failed_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_pointer_drift_total",
+			"wendelon_pbc_slab_stats_pointer_drift_total",
 			"TieredSlab stats advisories that disagreed with the slab footer.",
-			self.wpbc_slab_stats_pointer_drift_total.get(),
+			self.pbc_slab_stats_pointer_drift_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_cache_hits_total",
+			"wendelon_pbc_slab_stats_cache_hits_total",
 			"Parsed slab-stats cache hits.",
-			self.wpbc_slab_stats_cache_hits_total.get(),
+			self.pbc_slab_stats_cache_hits_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_cache_misses_total",
+			"wendelon_pbc_slab_stats_cache_misses_total",
 			"Parsed slab-stats cache misses.",
-			self.wpbc_slab_stats_cache_misses_total.get(),
+			self.pbc_slab_stats_cache_misses_total.get(),
 		);
 		render_counter(
 			&mut out,
-			"wendelon_wpbc_slab_stats_skipped_no_capability_total",
+			"wendelon_pbc_slab_stats_skipped_no_capability_total",
 			"Queries that disabled stats pruning because the chosen target peer does not advertise the SlabStatsPruning capability.",
-			self.wpbc_slab_stats_skipped_no_capability_total.get(),
+			self.pbc_slab_stats_skipped_no_capability_total.get(),
 		);
 		render_histogram_micros(
 			&mut out,
-			"wendelon_wpbc_slab_stats_build_micros",
+			"wendelon_pbc_slab_stats_build_micros",
 			"Slab stats build duration in microseconds.",
-			&self.wpbc_slab_stats_build_micros.snapshot(),
+			&self.pbc_slab_stats_build_micros.snapshot(),
 		);
 		render_histogram_micros(
 			&mut out,
-			"wendelon_wpbc_slab_stats_decrypt_micros",
+			"wendelon_pbc_slab_stats_decrypt_micros",
 			"Stats block decrypt duration in microseconds.",
-			&self.wpbc_slab_stats_decrypt_micros.snapshot(),
+			&self.pbc_slab_stats_decrypt_micros.snapshot(),
 		);
 		render_histogram_raw(
 			&mut out,
-			"wendelon_wpbc_slab_stats_block_bytes",
+			"wendelon_pbc_slab_stats_block_bytes",
 			"Stats block ciphertext size in bytes.",
-			&self.wpbc_slab_stats_block_bytes.snapshot(),
+			&self.pbc_slab_stats_block_bytes.snapshot(),
 		);
 		render_histogram(
 			&mut out,
@@ -1819,7 +1819,7 @@ fn mask_selectivity(rows_scanned: u64, rows_returned: u64) -> f64 {
 mod tests {
 	use super::{
 		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
-		PendingFinalizationReplayPath, WpbcRuntime, render_histogram,
+		PendingFinalizationReplayPath, PbcRuntime, render_histogram,
 	};
 	use crate::schema::WriteStatus;
 	use std::time::Duration;
@@ -1871,33 +1871,33 @@ mod tests {
 		registry.observe_durable_quorum_latency(Duration::from_micros(1_500));
 		registry.observe_wal_append_latency(Duration::from_micros(400));
 		registry.observe_wal_fsync_latency(Duration::from_micros(2_200));
-		registry.observe_wpbc_execution(
-			WpbcRuntime::Vectorized,
+		registry.observe_pbc_execution(
+			PbcRuntime::Vectorized,
 			10,
 			4,
 			Duration::from_micros(125),
 			1,
 			3,
 		);
-		registry.observe_wpbc_locality_arcs_scanned(6);
-		registry.observe_wpbc_range_decomposition_overflow();
-		registry.observe_wpbc_locality_decomposition(Duration::from_micros(80));
-		registry.observe_wpbc_locality_encode(Duration::from_micros(40));
-		registry.wpbc_slab_stats_consulted_total.add(3);
-		registry.wpbc_slab_stats_pruned_total.inc();
-		registry.wpbc_slab_stats_missing_total.inc();
-		registry.wpbc_slab_stats_unsupported_total.inc();
+		registry.observe_pbc_locality_arcs_scanned(6);
+		registry.observe_pbc_range_decomposition_overflow();
+		registry.observe_pbc_locality_decomposition(Duration::from_micros(80));
+		registry.observe_pbc_locality_encode(Duration::from_micros(40));
+		registry.pbc_slab_stats_consulted_total.add(3);
+		registry.pbc_slab_stats_pruned_total.inc();
+		registry.pbc_slab_stats_missing_total.inc();
+		registry.pbc_slab_stats_unsupported_total.inc();
 		registry
-			.wpbc_slab_stats_predicate_unrepresentable_total
+			.pbc_slab_stats_predicate_unrepresentable_total
 			.inc();
-		registry.wpbc_slab_stats_decrypt_failed_total.inc();
-		registry.wpbc_slab_stats_pointer_drift_total.inc();
-		registry.wpbc_slab_stats_cache_hits_total.inc();
-		registry.wpbc_slab_stats_cache_misses_total.inc();
-		registry.wpbc_slab_stats_skipped_no_capability_total.inc();
-		registry.observe_wpbc_slab_stats_build(Duration::from_micros(70));
-		registry.observe_wpbc_slab_stats_decrypt(Duration::from_micros(30));
-		registry.observe_wpbc_slab_stats_block_bytes(16_384);
+		registry.pbc_slab_stats_decrypt_failed_total.inc();
+		registry.pbc_slab_stats_pointer_drift_total.inc();
+		registry.pbc_slab_stats_cache_hits_total.inc();
+		registry.pbc_slab_stats_cache_misses_total.inc();
+		registry.pbc_slab_stats_skipped_no_capability_total.inc();
+		registry.observe_pbc_slab_stats_build(Duration::from_micros(70));
+		registry.observe_pbc_slab_stats_decrypt(Duration::from_micros(30));
+		registry.observe_pbc_slab_stats_block_bytes(16_384);
 
 		let rendered = registry.render_prometheus();
 		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
@@ -1907,38 +1907,38 @@ mod tests {
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"not_leader\"} 1")
 		);
-		assert!(rendered.contains("wendelon_wpbc_rows_scanned_total{runtime=\"vectorized\"} 10"));
-		assert!(rendered.contains("wendelon_wpbc_rows_returned_total{runtime=\"vectorized\"} 4"));
-		assert!(rendered.contains("wendelon_wpbc_mask_selectivity 0.400000"));
+		assert!(rendered.contains("wendelon_pbc_rows_scanned_total{runtime=\"vectorized\"} 10"));
+		assert!(rendered.contains("wendelon_pbc_rows_returned_total{runtime=\"vectorized\"} 4"));
+		assert!(rendered.contains("wendelon_pbc_mask_selectivity 0.400000"));
 		assert!(
 			rendered
-				.contains("wendelon_wpbc_exec_micros_bucket{runtime=\"vectorized\",le=\"250\"} 1")
+				.contains("wendelon_pbc_exec_micros_bucket{runtime=\"vectorized\",le=\"250\"} 1")
 		);
-		assert!(rendered.contains("wendelon_wpbc_kernel_error_total{runtime=\"vectorized\"} 1"));
+		assert!(rendered.contains("wendelon_pbc_kernel_error_total{runtime=\"vectorized\"} 1"));
 		assert!(
-			rendered.contains("wendelon_wpbc_intermediate_arrays_total{runtime=\"vectorized\"} 3")
+			rendered.contains("wendelon_pbc_intermediate_arrays_total{runtime=\"vectorized\"} 3")
 		);
-		assert!(rendered.contains("wendelon_wpbc_locality_arcs_scanned_total 6"));
-		assert!(rendered.contains("wendelon_wpbc_range_decomposition_overflow_total 1"));
+		assert!(rendered.contains("wendelon_pbc_locality_arcs_scanned_total 6"));
+		assert!(rendered.contains("wendelon_pbc_range_decomposition_overflow_total 1"));
 		assert!(
-			rendered.contains("wendelon_wpbc_locality_decomposition_micros_bucket{le=\"100\"} 1")
+			rendered.contains("wendelon_pbc_locality_decomposition_micros_bucket{le=\"100\"} 1")
 		);
-		assert!(rendered.contains("wendelon_wpbc_locality_decomposition_micros_count 1"));
-		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_bucket{le=\"50\"} 1"));
-		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_count 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_consulted_total 3"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_pruned_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_missing_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_unsupported_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_predicate_unrepresentable_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_decrypt_failed_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_pointer_drift_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_cache_hits_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_cache_misses_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_skipped_no_capability_total 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_build_micros_bucket{le=\"100\"} 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_decrypt_micros_bucket{le=\"50\"} 1"));
-		assert!(rendered.contains("wendelon_wpbc_slab_stats_block_bytes_bucket{le=\"16384\"} 1"));
+		assert!(rendered.contains("wendelon_pbc_locality_decomposition_micros_count 1"));
+		assert!(rendered.contains("wendelon_pbc_locality_encode_micros_bucket{le=\"50\"} 1"));
+		assert!(rendered.contains("wendelon_pbc_locality_encode_micros_count 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_consulted_total 3"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_pruned_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_missing_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_unsupported_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_predicate_unrepresentable_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_decrypt_failed_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_pointer_drift_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_cache_hits_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_cache_misses_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_skipped_no_capability_total 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_build_micros_bucket{le=\"100\"} 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_decrypt_micros_bucket{le=\"50\"} 1"));
+		assert!(rendered.contains("wendelon_pbc_slab_stats_block_bytes_bucket{le=\"16384\"} 1"));
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")
 		);

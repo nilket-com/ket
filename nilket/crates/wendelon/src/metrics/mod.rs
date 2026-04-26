@@ -5,5 +5,5 @@ pub mod telemetry;
 
 pub use registry::{
 	Counter, Gauge, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
-	PendingFinalizationReplayPath, WpbcRuntime, global,
+	PendingFinalizationReplayPath, PbcRuntime, global,
 };

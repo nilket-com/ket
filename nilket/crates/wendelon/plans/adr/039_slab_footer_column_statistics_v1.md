@@ -6,7 +6,7 @@ Ratified.
 
 ## Context
 
-ADR 035 gave Wendelon a vectorized WPBC executor. ADR 037 made tenant
+ADR 035 gave Wendelon a vectorized PBC executor. ADR 037 made tenant
 tables real with declared columns. ADR 038 closed the column-aware-
 locality half: range queries on declared clustering columns now map
 to a small, contiguous arc set on the unified ring.
@@ -116,7 +116,7 @@ wire RPC names slab IDs.
      it (rather than the column being absent from the descriptor at
      write time). Opt-in stat policies (bloom/HLL/small-set) that
      name an opaque-typed column still fail descriptor validation
-     with `WPBC_REJECT_STATS_UNSUPPORTED_TYPE`; only the always-on
+     with `PBC_REJECT_STATS_UNSUPPORTED_TYPE`; only the always-on
      null/non-null counts are produced.
 
 6. **Bloom filter (opt-in).** SipHash-1-3 with two seeds, k = 7 hash
@@ -344,7 +344,7 @@ wire RPC names slab IDs.
 15. **Canonical byte-comparable encoding for stat values.** Min/max
     values, small-set entries, and bloom-filter hash inputs share one
     on-disk encoding per Arrow type, chosen so that lexicographic
-    `memcmp` over the stored bytes matches the column's WPBC
+    `memcmp` over the stored bytes matches the column's PBC
     comparison semantics. This makes range pruning a branch-free byte
     compare and pins the writer's output bytes so two writers on the
     same data emit identical CSBs (golden-test stable):
@@ -373,7 +373,7 @@ wire RPC names slab IDs.
     null/non-null counts. Pinning their canonical encodings (NaN
     handling, signed-zero bias, subnormals, decimal scale
     normalization, nested-element ordering) requires semantic
-    decisions that compose with WPBC's comparison rules and a
+    decisions that compose with PBC's comparison rules and a
     dedicated test corpus. Until those encodings are pinned, the
     opaque-tag path lets the writer be honest with the planner — the
     column is known, it just isn't statable — without inventing a
@@ -442,7 +442,7 @@ wire RPC names slab IDs.
     038). Stats consultation runs as an additional internal filter
     inside the existing scan plan: after locality narrows the ring
     arcs and slab enumeration produces candidate slabs, but before
-    chunk-stream decryption and WPBC dispatch. Toron issues the same
+    chunk-stream decryption and PBC dispatch. Toron issues the same
     query plan it issues today; the prune happens invisibly.
 
 21. **ADR 036 extends with a single capability bit and stats-pruning
@@ -465,10 +465,10 @@ wire RPC names slab IDs.
     No predicate-level prune reasons cross the boundary as free-form
     strings; ADR 039 does not add fields to `QueryResponseMeta`.
 
-22. **Stats are planner-level, not WPBC opcodes.** ADR 035's WPBC
+22. **Stats are planner-level, not PBC opcodes.** ADR 035's PBC
     executor stays bytecode-pure. Stats consultation precedes
-    bytecode dispatch; once a slab is admitted, the WPBC program runs
-    over its records as before. No new WPBC opcodes for stats.
+    bytecode dispatch; once a slab is admitted, the PBC program runs
+    over its records as before. No new PBC opcodes for stats.
 
 23. **Stats absence and unsupported predicates fall through to full
     scan.** A slab without stats (legacy v1, opt-out configuration,
@@ -542,7 +542,7 @@ wire RPC names slab IDs.
     decrypt. The slab tail remains the source of truth — a discrepancy
     between `TieredSlab` and the on-object footer fails closed by
     treating stats as `STATS_UNAVAILABLE` for that query and emitting
-    a `wpbc_slab_stats_pointer_drift_total` metric for the operator.
+    a `pbc_slab_stats_pointer_drift_total` metric for the operator.
     Per-column stats are deliberately *not* replicated to the control
     ring; that would bloat Raft state and duplicate the slab's
     authoritative bytes.
@@ -560,7 +560,7 @@ the query":
   ADRs).
 - AEAD authentication failure on the stats ciphertext after footer
   HMAC succeeds (suspect tampering; falls back to scan, raises
-  `wpbc_slab_stats_decrypt_failed_total` for ops visibility).
+  `pbc_slab_stats_decrypt_failed_total` for ops visibility).
 - `schema_fingerprint` mismatch against descriptor cache.
 - Predicate references a column that has no stats (column not in the
   descriptor's stats policy or column is in the unsupported-types
@@ -619,7 +619,7 @@ Validation invariants:
   `Decimal128`/`Decimal256`, and any nested type (list/struct/map).
   Such columns may exist in the schema but carry only opaque-tagged
   always-on entries (§5); opt-in stat policies that name them fail
-  descriptor validation with `WPBC_REJECT_STATS_UNSUPPORTED_TYPE`.
+  descriptor validation with `PBC_REJECT_STATS_UNSUPPORTED_TYPE`.
 - HLL additionally rejects columns whose canonical-encoded values
   exceed 64 bytes (very long strings → cap at 64-byte prefix hash
   for HLL input).
@@ -960,18 +960,18 @@ encoding that would have to be unwound later.
   membership for equality, null-count short-circuits. No new wire
   surface; ADR 036 sees only an extra capability bit, a diagnostic
   opt-out flag, and the process/internal counters from §21. Counters:
-  `wpbc_slab_stats_consulted_total`,
-  `wpbc_slab_stats_pruned_total`, `wpbc_slab_stats_missing_total`,
-  `wpbc_slab_stats_unsupported_total`,
-  `wpbc_slab_stats_predicate_unrepresentable_total`,
-  `wpbc_slab_stats_decrypt_failed_total`,
-  `wpbc_slab_stats_pointer_drift_total`.
+  `pbc_slab_stats_consulted_total`,
+  `pbc_slab_stats_pruned_total`, `pbc_slab_stats_missing_total`,
+  `pbc_slab_stats_unsupported_total`,
+  `pbc_slab_stats_predicate_unrepresentable_total`,
+  `pbc_slab_stats_decrypt_failed_total`,
+  `pbc_slab_stats_pointer_drift_total`.
 - **Phase 9 — Stats cache.** Local parsed-stats cache keyed by
   `(slab_id, payload_hash, stats_block_hash128)`. Counters:
-  `wpbc_slab_stats_cache_hits_total`,
-  `wpbc_slab_stats_cache_misses_total`. Histograms:
-  `wpbc_slab_stats_build_micros`, `wpbc_slab_stats_decrypt_micros`,
-  `wpbc_slab_stats_block_bytes`. Cache is rebuildable from slab tail;
+  `pbc_slab_stats_cache_hits_total`,
+  `pbc_slab_stats_cache_misses_total`. Histograms:
+  `pbc_slab_stats_build_micros`, `pbc_slab_stats_decrypt_micros`,
+  `pbc_slab_stats_block_bytes`. Cache is rebuildable from slab tail;
   not authoritative.
 - **Phase 10 — `TieredSlab` advisory fields.** Add the three
   optional presence-advertisement fields to the tiered-slab pointer
@@ -1023,34 +1023,34 @@ encoding that would have to be unwound later.
    into an explicit query diagnostic. Deferred pending real operator
    demand.
 
-## Appendix A: WPBC reject codes
+## Appendix A: PBC reject codes
 
 Extends ADR 037 §"Appendix A" and ADR 038 §"Appendix A" consistently
 with ADR 036's "no free-form error strings" rule:
 
-- `WPBC_REJECT_STATS_UNSUPPORTED_TYPE` — column type cannot carry
+- `PBC_REJECT_STATS_UNSUPPORTED_TYPE` — column type cannot carry
   the declared stat (e.g., bloom or small-set on Float).
-- `WPBC_REJECT_STATS_DUPLICATE_COLUMN` — same column declared in
+- `PBC_REJECT_STATS_DUPLICATE_COLUMN` — same column declared in
   multiple specs *within the same stat kind*.
-- `WPBC_REJECT_STATS_COLUMN_UNKNOWN` — a stat policy entry names
+- `PBC_REJECT_STATS_COLUMN_UNKNOWN` — a stat policy entry names
   a column that is absent from the descriptor's Arrow schema at
   the named `schema_generation`.
-- `WPBC_REJECT_STATS_BUDGET_EXCEEDED` — descriptor's worst-case
+- `PBC_REJECT_STATS_BUDGET_EXCEEDED` — descriptor's worst-case
   per-slab CSB ciphertext size at declared row capacity exceeds
   `slab_payload_bytes / 256`.
-- `WPBC_REJECT_STATS_PRECISION_INVALID` — HLL precision outside
+- `PBC_REJECT_STATS_PRECISION_INVALID` — HLL precision outside
   `10..=14`.
-- `WPBC_REJECT_STATS_BITS_INVALID` — bloom `bits_per_row` outside
+- `PBC_REJECT_STATS_BITS_INVALID` — bloom `bits_per_row` outside
   `1..=32`.
-- `WPBC_REJECT_STATS_SMALLSET_INVALID` — `max_distinct_values`
+- `PBC_REJECT_STATS_SMALLSET_INVALID` — `max_distinct_values`
   outside `1..=4096` or `max_bytes` outside `1..=32_768`.
-- `WPBC_REJECT_STATS_FORMAT_VERSION` — slab declares
+- `PBC_REJECT_STATS_FORMAT_VERSION` — slab declares
   `slab_format_version = 2` but the CSB layout is unparseable.
-- `WPBC_REJECT_STATS_FINGERPRINT_MISMATCH` — CSB `schema_fingerprint`
+- `PBC_REJECT_STATS_FINGERPRINT_MISMATCH` — CSB `schema_fingerprint`
   does not match the descriptor at the named `schema_generation`.
-- `WPBC_REJECT_STATS_DECRYPT_FAILED` — CSB AEAD authentication failed
+- `PBC_REJECT_STATS_DECRYPT_FAILED` — CSB AEAD authentication failed
   after footer HMAC succeeded (suspected tampering; surfaced via
-  metric `wpbc_slab_stats_decrypt_failed_total` and treated as
+  metric `pbc_slab_stats_decrypt_failed_total` and treated as
   `STATS_UNAVAILABLE` for query correctness).
 
 ## Appendix B: Arrow type tag mapping
@@ -1094,7 +1094,7 @@ mapping; tags are never renumbered.
 
 ## References
 
-- ADR 005: Decoupling Compute via Pushdown Bytecode (WPBC)
+- ADR 005: Decoupling Compute via Pushdown Bytecode (PBC)
 - ADR 020: L2 Envelope Encryption and DEK Lifecycle
 - ADR 022: L2 Slab Format and Footer-Indexed Range Reads — this ADR
   extends its slab layout.
@@ -1105,7 +1105,7 @@ mapping; tags are never renumbered.
 - ADR 032: Schema Evolution and Schema-Ring Contract — descriptor
   evolution rules carry over.
 - ADR 034: Toron-Wendelon Integration Contract.
-- ADR 036: WPBC Pushdown Contract — this ADR extends it with the
+- ADR 036: PBC Pushdown Contract — this ADR extends it with the
   `slab_stats_pruning_v1` capability bit and explain counters.
 - ADR 037: Tenant Table Schemas, Row Identity, Table-Scoped Locality.
 - ADR 038: Column-Aware Locality V1 (Z-Order) — composes with stats

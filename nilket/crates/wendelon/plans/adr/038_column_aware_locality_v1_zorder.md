@@ -45,7 +45,7 @@ metadata carrier and no changes to `SlabRecordHeader`.
 
 2. **`ProjectionFunctionV1::Hilbert` is reserved but not supported in V1.**
    Descriptors declaring `Hilbert` validate-and-reject with
-   `WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED`. A future Hilbert ADR
+   `PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED`. A future Hilbert ADR
    (number assigned at opening) lifts that rejection.
 
 3. **`ProjectionFunctionV1::RandomHash` keeps its meaning** — column-hash
@@ -55,7 +55,7 @@ metadata carrier and no changes to `SlabRecordHeader`.
 ### Dimensionality and types
 
 4. **Hard cap: `columns.len() ∈ 1..=6`.**
-   `> 6` fails descriptor validation with `WPBC_REJECT_CLUSTERING_TOO_WIDE`.
+   `> 6` fails descriptor validation with `PBC_REJECT_CLUSTERING_TOO_WIDE`.
    No silent truncation. No implicit secondary lex sort. The reason is
    query-time prefix decomposition: a d-dimensional range predicate fragments
    into Morton arcs at a rate that grows superlinearly with `d`. The
@@ -84,7 +84,7 @@ metadata carrier and no changes to `SlabRecordHeader`.
    Rejected in V1:
    - floats (NaN ordering, signed-zero, denormals — separate ADR if needed)
    - decimals (locality-relevant ordering depends on scale; deferred)
-   - nullable clustering columns (rejected with `WPBC_REJECT_CLUSTERING_NULLABLE`)
+   - nullable clustering columns (rejected with `PBC_REJECT_CLUSTERING_NULLABLE`)
    - nested types (`Struct`, `List`, `Map`)
 
    String prefix clustering is included to support common warehouse patterns
@@ -193,10 +193,10 @@ metadata carrier and no changes to `SlabRecordHeader`.
 
 17. **Range decomposition has a hard admission budget.** Default cap: 1024
     output arcs per scan. Overflow falls back to the table's full
-    `spread_factor` arcs and lets WPBC do the filtering. The cap is a
+    `spread_factor` arcs and lets PBC do the filtering. The cap is a
     `wendelon-server` config value, not a per-query knob, so behavior is
     predictable across Toron planners. Surfaced metric:
-    `wpbc_range_decomposition_overflow_total`.
+    `pbc_range_decomposition_overflow_total`.
 
 ### Compaction
 
@@ -253,7 +253,7 @@ struct ClusteringColumnSpecV1 {
 enum ProjectionFunctionV1 {
     RandomHash,
     ZOrder,
-    Hilbert,                                  // parsed; rejected as WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED
+    Hilbert,                                  // parsed; rejected as PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED
 }
 ```
 
@@ -437,7 +437,7 @@ table property, not a row property, so the per-row cost is pure overhead.
 ADR 037 §15 made this trade explicitly for `schema_generation`; the same
 trade applies to projection function. The "fast branch in the planner"
 framing assumes per-row dispatch in the read path; the actual hot path is
-WPBC kernel execution over a `RecordBatch`, where the SFC choice has already
+PBC kernel execution over a `RecordBatch`, where the SFC choice has already
 been resolved into the scan strategy. Adding a per-record byte to enable a
 branch we don't take is a Chesterton's-fence reversal of ADR 037.
 
@@ -488,7 +488,7 @@ ontology that cannot then be removed.
 
 - **Header-byte metadata overload (`SlabRecordHeader._pad_align` or top bits of `prefix_bits`).**
   Rejected. Projection kind is table metadata, and planners branch once per scan after descriptor lookup.
-  The strongest peer argument for header placement is recovery without a hot descriptor cache. The counter: Wendelon already cannot serve a record whose descriptor has not been loaded — `schema_generation` drives column resolution, type validation, and WPBC compilation. Adding the projection function to the per-record header would let us decode the locality bits without the descriptor, but we still couldn't interpret the row. The recovery story is incomplete either way; the right place to harden it is descriptor-replication and warm-start, not header duplication. If a future ADR proves header placement necessary, naming the field (don't anonymously overload `_pad_align`) is the right discipline; ADR 038 records that as the fallback shape rather than the V1 path.
+  The strongest peer argument for header placement is recovery without a hot descriptor cache. The counter: Wendelon already cannot serve a record whose descriptor has not been loaded — `schema_generation` drives column resolution, type validation, and PBC compilation. Adding the projection function to the per-record header would let us decode the locality bits without the descriptor, but we still couldn't interpret the row. The recovery story is incomplete either way; the right place to harden it is descriptor-replication and warm-start, not header duplication. If a future ADR proves header placement necessary, naming the field (don't anonymously overload `_pad_align`) is the right discipline; ADR 038 records that as the fallback shape rather than the V1 path.
 - **Salt-after-SFC (apply jump-consistent hash to the encoded suffix rather than to the prefix bucket selector).** Rejected. Hashing the encoded SFC scrambles adjacent ring positions for adjacent clustering coords — i.e., it destroys the clustering the SFC just computed. The intuition behind "spread hot bounding boxes" can be partially recovered by raising `spread_factor` (more arcs per table, each still internally clustered), which is the salt-before-SFC mechanism we already ship.
 - **Reserving `SaltPositionV1::AfterSfcBits` in V1.** Rejected as premature compatibility. Salt-before-SFC is the only V1 behavior, and a future salt strategy can arrive as a descriptor-generation change.
 - **Bundling Hilbert into ADR 038.** Rejected for scope. Hilbert shares the descriptor but not the range-decomposition algorithm. It deserves its own ADR.
@@ -522,19 +522,19 @@ ontology that cannot then be removed.
 2. **Online migration protocol** — V1 is offline-rewrite-only; a dual-write window protocol is its own ADR if any tenant demands non-stop reclustering.
 3. **Audit-record schema for clustering-policy changes** — inherits ADR 025's tamper-evident chain; payload defined when migration tool ships.
 4. **Descriptor warm-start guarantee for recovery** — inherits ADR 032; ADR 038 introduces no new lazy-load semantics.
-5. **`WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW` exposure to Toron** — metric-only by default; reject code reserved in Appendix A for opt-in via request-options struct if Toron ever needs the explicit diagnostic.
+5. **`PBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW` exposure to Toron** — metric-only by default; reject code reserved in Appendix A for opt-in via request-options struct if Toron ever needs the explicit diagnostic.
 
-## Appendix A: WPBC reject codes
+## Appendix A: PBC reject codes
 
-- `WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN`
-- `WPBC_REJECT_CLUSTERING_EMPTY`
-- `WPBC_REJECT_CLUSTERING_NULLABLE`
-- `WPBC_REJECT_CLUSTERING_TOO_WIDE`
-- `WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED`
-- `WPBC_REJECT_CLUSTERING_WIDTH_INVALID`
-- `WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW`
-- `WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED`
-- `WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW` (optional explicit diagnostic; default runtime behavior is fallback plus metric)
+- `PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN`
+- `PBC_REJECT_CLUSTERING_EMPTY`
+- `PBC_REJECT_CLUSTERING_NULLABLE`
+- `PBC_REJECT_CLUSTERING_TOO_WIDE`
+- `PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED`
+- `PBC_REJECT_CLUSTERING_WIDTH_INVALID`
+- `PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW`
+- `PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED`
+- `PBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW` (optional explicit diagnostic; default runtime behavior is fallback plus metric)
 
 ## Appendix B: Header metadata fallback (non-recommended)
 
@@ -558,13 +558,13 @@ byte 3: spread_factor_minus_1, decoded as 1..=256
 
 ## References
 
-- ADR 005: Decoupling Compute via Pushdown Bytecode (WPBC)
+- ADR 005: Decoupling Compute via Pushdown Bytecode (PBC)
 - ADR 029: Identity vs. Locality
 - ADR 032: Schema Evolution and Schema-Ring Contract
 - ADR 034: Toron-Wendelon Integration Contract
-- ADR 035: Vectorized WPBC Executor
-- ADR 036: WPBC Pushdown Contract
+- ADR 035: Vectorized PBC Executor
+- ADR 036: PBC Pushdown Contract
 - ADR 037: Tenant Table Schemas, Row Identity, Table-Scoped Locality — this ADR fills its `ColumnProjection` slot.
 - Future Hilbert ADR (number assigned at opening): Column-Aware Locality V2, Hilbert variant.
 - `plans/brainstorms/001_olap_locality_projections.md` — direction seed.
-- `plans/schema/compute_ast.md` — WPBC V1 spec.
+- `plans/schema/compute_ast.md` — PBC V1 spec.

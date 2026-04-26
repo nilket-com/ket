@@ -623,8 +623,8 @@ fn build_column_stats_block_internal(
 		})?,
 	};
 	let encoded = encode_column_stats_block(&header, &columns)?;
-	crate::metrics::global().observe_wpbc_slab_stats_build(start.elapsed());
-	crate::metrics::global().observe_wpbc_slab_stats_block_bytes(encoded.len() as u64);
+	crate::metrics::global().observe_pbc_slab_stats_build(start.elapsed());
+	crate::metrics::global().observe_pbc_slab_stats_block_bytes(encoded.len() as u64);
 	Ok(encoded)
 }
 

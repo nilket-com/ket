@@ -1,17 +1,17 @@
-# Wendelon Pushdown Bytecode (WPBC) Spec
+# Pushdown Bytecode (PBC) Spec
 
 To keep Wendelon strictly as a high-performance storage layer while supporting complex relational and programmatic queries from the Toron compute tier, Wendelon implements a native, stack-based bytecode AST for Predicate Pushdown.
 
 ## 1. The Compute Boundary
 
 Wendelon does not parse SQL or Rune. It is a dumb, zero-copy byte server.
-User queries are authored in Rune or SQL, lowered into `toron-ir` by Toron, and the targetable physical-expression fragments are compiled to WPBC (per ADR 036). Wendelon receives only validated WPBC bytes.
+User queries are authored in Rune or SQL, lowered into `toron-ir` by Toron, and the targetable physical-expression fragments are compiled to PBC (per ADR 036). Wendelon receives only validated PBC bytes.
 
 The bytecode is attached as the "trailing section" of a `ReadRequestMeta` frame. The Wendelon Data Node executes this bytecode against the Arrow `RecordBatch` *before* returning it over the network, drastically reducing QUIC bandwidth and client-side memory pressure.
 
 ## 2. The Stack Machine
 
-The WPBC interpreter is a zero-allocation, hyper-optimized stack machine running directly on the Data Node.
+The PBC interpreter is a zero-allocation, hyper-optimized stack machine running directly on the Data Node.
 - It evaluates the bytecode against each `RecordBatch` using Arrow's vectorized compute kernels; rows evaluating to `false` or `null` are discarded (see ADR 035).
 - The execution produces a boolean filter mask.
 - Rows evaluating to `false` are discarded.
@@ -19,7 +19,7 @@ The WPBC interpreter is a zero-allocation, hyper-optimized stack machine running
 
 ## 3. Instruction Set Architecture (ISA)
 
-WPBC uses 1-byte opcodes followed by optional immediate arguments. 
+PBC uses 1-byte opcodes followed by optional immediate arguments. 
 
 ### 3.1 Data Push (Loads data onto the stack)
 - `0x01 PUSH_COL_u32 [4 bytes col_index]`: Pushes the value of column `N` for the current row.
@@ -52,28 +52,28 @@ WPBC uses 1-byte opcodes followed by optional immediate arguments.
 
 ## 4. Type System & Safety Bounds
 
-To ensure Wendelon Data Nodes cannot be crashed or OOM'd by malicious or buggy WPBC payloads from Toron, strict safety bounds are enforced.
+To ensure Wendelon Data Nodes cannot be crashed or OOM'd by malicious or buggy PBC payloads from Toron, strict safety bounds are enforced.
 
 ### 4.1 Type System & Mismatches
-WPBC is dynamically typed during interpretation (based on the Arrow schema). 
+PBC is dynamically typed during interpretation (based on the Arrow schema). 
 - **Type Mismatch:** If an operation is invalid (e.g., comparing an `Int64` column to a `String` literal with `GT`), the interpreter immediately traps. The row evaluates to `false` (discarded).
 - **Extended Types:** The ISA includes push opcodes for advanced Arrow types commonly used in analytics: `PUSH_FLOAT_f64`, `PUSH_TS_ms` (Timestamp milliseconds).
 
 ### 4.2 Null Propagation (3VL)
 Wendelon adheres strictly to SQL's Three-Valued Logic (3VL).
 - If any operand to a comparison (`EQ`, `GT`, etc.) is an Arrow Null, the result of the comparison is Null.
-- In WPBC, a Null evaluation at the top of the stack is ultimately treated as `false` for the purpose of row filtering (i.e., the row is discarded), matching standard `WHERE` clause semantics.
+- In PBC, a Null evaluation at the top of the stack is ultimately treated as `false` for the purpose of row filtering (i.e., the row is discarded), matching standard `WHERE` clause semantics.
 
 ### 4.3 Memory and Execution Bounds
 - **Stack Depth Limit:** The stack is a fixed-size pre-allocated array of 64 slots. Pushing beyond 64 items traps the interpreter.
-- **Instruction Limit:** A single WPBC payload cannot exceed 4096 bytes (4 KB).
+- **Instruction Limit:** A single PBC payload cannot exceed 4096 bytes (4 KB).
 - **Execution Fuel:** To prevent infinite loops (if jump instructions are added in V2), the interpreter traps if it executes more than 1024 instructions per row.
 
 ## 5. Execution Example
 
 **Example query (Rune or SQL through Toron):** `SELECT name, age FROM users WHERE age >= 18 AND status IN ('active', 'pending')`
 
-**WPBC compilation (emitted by Toron, consumed by Wendelon):**
+**PBC compilation (emitted by Toron, consumed by Wendelon):**
 ```text
 PUSH_COL_u32 1      // Push 'age' column (index 1)
 PUSH_INT_i64 18     // Push literal 18

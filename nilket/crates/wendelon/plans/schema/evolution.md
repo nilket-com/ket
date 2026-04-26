@@ -14,4 +14,4 @@ While Wendelon is a dumb storage layer, the Control Ring may host a lightweight 
 
 ## 3. Migration & Casting
 - **Backward Compatibility:** Adding nullable columns is safe. Dropping columns or changing types is a breaking change.
-- **Read-time Casting:** The WPBC (Pushdown Bytecode) can include cast instructions to map older physical schemas to newer logical schemas during the read path, hiding the schema evolution from the end user.
+- **Read-time Casting:** The PBC (Pushdown Bytecode) can include cast instructions to map older physical schemas to newer logical schemas during the read path, hiding the schema evolution from the end user.

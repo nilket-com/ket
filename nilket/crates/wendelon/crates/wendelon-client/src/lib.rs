@@ -50,7 +50,7 @@ pub use wendelon::integration::compute::{
 pub use wendelon::schema::{
 	Consistency as ReadConsistency, DurabilityLevel as DurabilityClass, LocalityPolicyV1,
 	PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, WpbcRejectCode,
+	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, PbcRejectCode,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -292,7 +292,7 @@ pub enum ClientError {
 	#[error("write failed with status {status:?}")]
 	WriteFailed { status: WriteStatus },
 	#[error("table write rejected with code {reject_code:?}")]
-	TableWriteRejected { reject_code: WpbcRejectCode },
+	TableWriteRejected { reject_code: PbcRejectCode },
 	#[error("schema update rejected with reason {reason_code}: {message}")]
 	SchemaUpdateRejected { reason_code: u8, message: String },
 	#[error("read failed with status {status:?}")]
@@ -595,9 +595,9 @@ impl Client {
 			payload,
 		};
 		let result = self.inner.table_write(request).await?;
-		if result.response.reject_code != WpbcRejectCode::NONE.0 {
+		if result.response.reject_code != PbcRejectCode::NONE.0 {
 			return Err(ClientError::TableWriteRejected {
-				reject_code: WpbcRejectCode(result.response.reject_code),
+				reject_code: PbcRejectCode(result.response.reject_code),
 			});
 		}
 		let response = result.response.write;
@@ -672,14 +672,14 @@ impl Client {
 	pub async fn query_stream(
 		&self,
 		tenant_id: TenantId,
-		wpbc: Vec<u8>,
+		pbc: Vec<u8>,
 		options: QueryOptions,
 	) -> Result<StreamingQueryResult, ClientError> {
 		Ok(self
 			.inner
 			.query(
 				tenant_id,
-				wpbc,
+				pbc,
 				options.range,
 				self.inner.epoch(),
 				options.min_hlc.unwrap_or_else(zero_hlc),
@@ -693,10 +693,10 @@ impl Client {
 	pub async fn query(
 		&self,
 		tenant_id: TenantId,
-		wpbc: Vec<u8>,
+		pbc: Vec<u8>,
 		options: QueryOptions,
 	) -> Result<QueryResult, ClientError> {
-		let stream = self.query_stream(tenant_id, wpbc, options).await?;
+		let stream = self.query_stream(tenant_id, pbc, options).await?;
 		let epoch = stream.epoch;
 		let value_hlc = stream.value_hlc;
 		let rows = stream.rows;
@@ -713,13 +713,13 @@ impl Client {
 		&self,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptorV1,
-		wpbc: Vec<u8>,
+		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<StreamingQueryResult, ClientError> {
-		let bytecode_len = u32::try_from(wpbc.len()).map_err(|_| {
+		let bytecode_len = u32::try_from(pbc.len()).map_err(|_| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidInput,
-				"table query WPBC bytecode exceeds u32 length",
+				"table query PBC bytecode exceeds u32 length",
 			)
 		})?;
 		let mut pad = [0; 7];
@@ -742,7 +742,7 @@ impl Client {
 					as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 				},
 				descriptor: descriptor.clone(),
-				wpbc,
+				pbc,
 			})
 			.await?)
 	}
@@ -751,11 +751,11 @@ impl Client {
 		&self,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptorV1,
-		wpbc: Vec<u8>,
+		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<QueryResult, ClientError> {
 		let stream = self
-			.table_query_stream(tenant_id, descriptor, wpbc, options)
+			.table_query_stream(tenant_id, descriptor, pbc, options)
 			.await?;
 		let epoch = stream.epoch;
 		let value_hlc = stream.value_hlc;

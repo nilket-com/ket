@@ -1,8 +1,8 @@
-//! Wendelon Pushdown Bytecode (WPBC) interpreter.
+//! Pushdown Bytecode (PBC) interpreter.
 //!
 //! The stack machine defined in `plans/schema/compute_ast.md`.
 //! Toron lowers pushdown-capable typed expression fragments into
-//! WPBC and attaches the bytes to a `ReadRequestMeta` frame's
+//! PBC and attaches the bytes to a `ReadRequestMeta` frame's
 //! trailing section. A Wendelon Data Node runs the program locally
 //! against the Arrow `RecordBatch` it was about to return, yielding
 //! a filtered + projected batch so only the requested rows and
@@ -30,7 +30,7 @@
 //! of decoded [`Op`]s plus an optional projection list); vector
 //! evaluation then walks that compiled form once per batch.
 
-use crate::metrics::{WpbcRuntime, global as metrics};
+use crate::metrics::{PbcRuntime, global as metrics};
 use crate::schema::{Identity, Locality};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Datum, Float32Array, Float64Array, Int32Array,
@@ -168,7 +168,7 @@ impl Program {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
-					"WPBC bytecode is {} bytes; {MAX_BYTECODE_BYTES}-byte cap exceeded",
+					"PBC bytecode is {} bytes; {MAX_BYTECODE_BYTES}-byte cap exceeded",
 					bytecode.len()
 				),
 			));
@@ -420,14 +420,14 @@ fn compile(bytecode: &[u8]) -> std::io::Result<Program> {
 				if i != bytecode.len() {
 					return Err(Error::new(
 						ErrorKind::InvalidData,
-						"WPBC: PROJECT must be the terminal instruction",
+						"PBC: PROJECT must be the terminal instruction",
 					));
 				}
 			}
 			other => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
-					format!("WPBC: unknown opcode 0x{other:02x}"),
+					format!("PBC: unknown opcode 0x{other:02x}"),
 				));
 			}
 		}
@@ -527,7 +527,7 @@ fn validate_program(program: &Program) -> std::io::Result<()> {
 		if stack.len() > STACK_DEPTH_LIMIT {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
-				"WPBC: stack depth limit exceeded at program load",
+				"PBC: stack depth limit exceeded at program load",
 			));
 		}
 	}
@@ -538,7 +538,7 @@ fn pop_kind(stack: &mut Vec<StackKind>, label: &str) -> std::io::Result<StackKin
 	stack.pop().ok_or_else(|| {
 		Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: stack underflow while validating {label}"),
+			format!("PBC: stack underflow while validating {label}"),
 		)
 	})
 }
@@ -548,7 +548,7 @@ fn expect_boolish(kind: StackKind, op: &str) -> std::io::Result<()> {
 		StackKind::Bool | StackKind::Unknown => Ok(()),
 		StackKind::Identity | StackKind::Locality => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} cannot consume typed identity/locality values"),
+			format!("PBC: {op} cannot consume typed identity/locality values"),
 		)),
 	}
 }
@@ -558,11 +558,11 @@ fn expect_identity(kind: StackKind, op: &str) -> std::io::Result<()> {
 		StackKind::Identity => Ok(()),
 		StackKind::Locality => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} expected Identity, got Locality"),
+			format!("PBC: {op} expected Identity, got Locality"),
 		)),
 		_ => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} expected Identity operands"),
+			format!("PBC: {op} expected Identity operands"),
 		)),
 	}
 }
@@ -572,11 +572,11 @@ fn expect_locality(kind: StackKind, op: &str) -> std::io::Result<()> {
 		StackKind::Locality => Ok(()),
 		StackKind::Identity => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} expected Locality, got Identity"),
+			format!("PBC: {op} expected Locality, got Identity"),
 		)),
 		_ => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} expected Locality operands"),
+			format!("PBC: {op} expected Locality operands"),
 		)),
 	}
 }
@@ -585,7 +585,7 @@ fn reject_typed_family(kind: StackKind, op: &str) -> std::io::Result<()> {
 	match kind {
 		StackKind::Identity | StackKind::Locality => Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: {op} must use typed identity/locality opcodes"),
+			format!("PBC: {op} must use typed identity/locality opcodes"),
 		)),
 		_ => Ok(()),
 	}
@@ -641,19 +641,19 @@ fn execute_program_vectorized(
 		Ok(Some(mask)) => {
 			let filtered = compute::filter_record_batch(batch, &mask).map_err(|e| {
 				stats.kernel_errors += 1;
-				Error::new(ErrorKind::InvalidData, format!("WPBC filter: {e}"))
+				Error::new(ErrorKind::InvalidData, format!("PBC filter: {e}"))
 			})?;
 			apply_projection(program, &filtered)
 		}
 		Err(err) => {
 			stats.kernel_errors += 1;
-			tracing::debug!(error = %err, "WPBC vector runtime trap normalized to empty batch");
+			tracing::debug!(error = %err, "PBC vector runtime trap normalized to empty batch");
 			empty_filtered_batch(program, batch)
 		}
 	};
 	if let Ok(out) = &result {
-		observe_wpbc_execution(
-			WpbcRuntime::Vectorized,
+		observe_pbc_execution(
+			PbcRuntime::Vectorized,
 			batch.num_rows(),
 			out.num_rows(),
 			started.elapsed(),
@@ -667,7 +667,7 @@ fn apply_projection(program: &Program, batch: &RecordBatch) -> std::io::Result<R
 	match &program.project {
 		Some(indices) => batch
 			.project(indices)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC project: {e}"))),
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC project: {e}"))),
 		None => Ok(batch.clone()),
 	}
 }
@@ -677,14 +677,14 @@ fn empty_filtered_batch(program: &Program, batch: &RecordBatch) -> std::io::Resu
 	apply_projection(program, &empty)
 }
 
-fn observe_wpbc_execution(
-	runtime: WpbcRuntime,
+fn observe_pbc_execution(
+	runtime: PbcRuntime,
 	rows_scanned: usize,
 	rows_returned: usize,
 	duration: Duration,
 	stats: VectorExecStats,
 ) {
-	metrics().observe_wpbc_execution(
+	metrics().observe_pbc_execution(
 		runtime,
 		rows_scanned as u64,
 		rows_returned as u64,
@@ -703,7 +703,7 @@ fn validate_program_against_batch(program: &Program, batch: &RecordBatch) -> std
 		let field = schema.fields().get(*col as usize).ok_or_else(|| {
 			Error::new(
 				ErrorKind::InvalidData,
-				format!("WPBC: column index {} is out of bounds", col),
+				format!("PBC: column index {} is out of bounds", col),
 			)
 		})?;
 		if is_supported_pushcol_type(field.data_type()) {
@@ -716,13 +716,13 @@ fn validate_program_against_batch(program: &Program, batch: &RecordBatch) -> std
 			other => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
-					format!("WPBC: PUSH_COL does not support Arrow type {other:?}"),
+					format!("PBC: PUSH_COL does not support Arrow type {other:?}"),
 				));
 			}
 		};
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("WPBC: column '{}' {msg}", field.name()),
+			format!("PBC: column '{}' {msg}", field.name()),
 		));
 	}
 	if let Some(indices) = &program.project {
@@ -730,7 +730,7 @@ fn validate_program_against_batch(program: &Program, batch: &RecordBatch) -> std
 			if *index >= batch.num_columns() {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
-					format!("WPBC: PROJECT column index {} is out of bounds", index),
+					format!("PBC: PROJECT column index {} is out of bounds", index),
 				));
 			}
 		}
@@ -1548,11 +1548,11 @@ fn execute_program_scalar_reference(
 		}
 		let filter: BooleanArray = mask.finish();
 		compute::filter_record_batch(batch, &filter)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("WPBC filter: {e}")))?
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC filter: {e}")))?
 	};
 	let out = apply_projection(program, &filtered)?;
-	observe_wpbc_execution(
-		WpbcRuntime::ScalarReference,
+	observe_pbc_execution(
+		PbcRuntime::ScalarReference,
 		batch.num_rows(),
 		out.num_rows(),
 		started.elapsed(),
@@ -1830,7 +1830,7 @@ fn read_slice<'a>(buf: &'a [u8], i: &mut usize, n: usize) -> std::io::Result<&'a
 	if i.checked_add(n).map(|end| end > buf.len()).unwrap_or(true) {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"WPBC: truncated instruction operand",
+			"PBC: truncated instruction operand",
 		));
 	}
 	let out = &buf[*i..*i + n];
@@ -2470,7 +2470,7 @@ mod tests {
 		}
 	}
 
-	fn assert_wpbc_fuzz_surface(sample_count: u64, max_bytecode_bytes: usize) {
+	fn assert_pbc_fuzz_surface(sample_count: u64, max_bytecode_bytes: usize) {
 		let structured = structured_fuzz_cases();
 		let mutation_seeds = structured
 			.iter()
@@ -3018,18 +3018,18 @@ mod tests {
 	}
 
 	#[test]
-	fn wpbc_surface_survives_smoke_fuzz_samples() {
-		assert_wpbc_fuzz_surface(SMOKE_FUZZ_SAMPLE_COUNT, 512);
+	fn pbc_surface_survives_smoke_fuzz_samples() {
+		assert_pbc_fuzz_surface(SMOKE_FUZZ_SAMPLE_COUNT, 512);
 	}
 
 	#[test]
-	#[ignore = "weekly ladder: run via ci/check_wpbc_fuzz_ladder.sh"]
-	fn wpbc_surface_survives_weekly_fuzz_ladder() {
-		let sample_count = std::env::var("WPBC_FUZZ_SAMPLES")
+	#[ignore = "weekly ladder: run via ci/check_pbc_fuzz_ladder.sh"]
+	fn pbc_surface_survives_weekly_fuzz_ladder() {
+		let sample_count = std::env::var("PBC_FUZZ_SAMPLES")
 			.ok()
 			.and_then(|raw| raw.parse::<u64>().ok())
 			.unwrap_or(WEEKLY_FUZZ_SAMPLE_COUNT);
-		eprintln!("running WPBC fuzz ladder with {sample_count} samples");
-		assert_wpbc_fuzz_surface(sample_count, MAX_BYTECODE_BYTES);
+		eprintln!("running PBC fuzz ladder with {sample_count} samples");
+		assert_pbc_fuzz_surface(sample_count, MAX_BYTECODE_BYTES);
 	}
 }

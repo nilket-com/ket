@@ -16,6 +16,7 @@ ADR; flag violations in code review.
 - [no-version-suffixes.md](no-version-suffixes.md) — drop `V1` / `V2` / `V3` suffixes from Rust types; reserve version bytes for actual wire-protocol envelopes only.
 - [no-premature-backward-compat.md](no-premature-backward-compat.md) — no compat structs, tolerant decoders, legacy-decode tests, or spec-level "future ADR" hedges.
 - [capability-vs-feature-naming.md](capability-vs-feature-naming.md) — code uses "capability" precisely; "feature" is for marketing or casual prose.
+- [no-project-name-in-protocols.md](no-project-name-in-protocols.md) — keep the project's brand name out of protocol acronyms, reject codes, metric prefixes, module names, and struct prefixes; brand lives at the cargo crate / repo / README level only.
 
 ## Adding a convention
 

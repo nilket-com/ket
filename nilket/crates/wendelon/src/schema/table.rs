@@ -1,5 +1,5 @@
-use crate::schema::wpbc::{
-	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as WpbcProgram,
+use crate::schema::pbc::{
+	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
 };
 use crate::schema::{
 	ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, Locality, NodeId, TenantId,
@@ -136,7 +136,7 @@ impl TableWriteRequestMeta {
 pub struct TableWriteResponseMeta {
 	pub write: WriteResponseMeta, // 96 bytes
 	/// Zero on non-table-specific outcomes. Non-zero values are
-	/// [`WpbcRejectCode`] discriminants for schema/admission rejects.
+	/// [`PbcRejectCode`] discriminants for schema/admission rejects.
 	pub reject_code: u16, //  2 bytes
 	pub _pad: [u8; 6],            //  6 bytes alignment
 }
@@ -191,7 +191,7 @@ pub struct TableQueryRequestMeta {
 	pub schema_generation: u64,                  //  8 bytes
 	pub consistency: crate::schema::Consistency, //  1 byte
 	pub _pad: [u8; 7],                           //  7 bytes
-	/// Length of the WPBC bytecode in the trailing section.
+	/// Length of the PBC bytecode in the trailing section.
 	pub bytecode_len: u32, //  4 bytes
 	pub _pad2: [u8; 4],                          //  4 bytes
 	/// Time-travel upper bound (zero = latest).
@@ -229,80 +229,80 @@ pub fn encode_table_write_row_count(row_count: usize) -> std::io::Result<u16> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
-pub struct WpbcRejectCode(pub u16);
+pub struct PbcRejectCode(pub u16);
 
-impl WpbcRejectCode {
+impl PbcRejectCode {
 	pub const NONE: Self = Self(0);
-	pub const WPBC_REJECT_SCHEMA_STALE: Self = Self(0x3701);
-	pub const WPBC_REJECT_SCHEMA_UNKNOWN: Self = Self(0x3702);
-	pub const WPBC_REJECT_COLUMN_TYPE_MISMATCH: Self = Self(0x3703);
-	pub const WPBC_REJECT_PK_MISSING: Self = Self(0x3704);
-	pub const WPBC_REJECT_PK_NULL: Self = Self(0x3705);
-	pub const WPBC_REJECT_PK_TYPE_UNSUPPORTED: Self = Self(0x3706);
-	pub const WPBC_REJECT_DUPLICATE_PK_IN_BATCH: Self = Self(0x3707);
-	pub const WPBC_REJECT_LOCALITY_UNSUPPORTED: Self = Self(0x3708);
-	pub const WPBC_REJECT_BATCH_TOO_LARGE: Self = Self(0x3709);
-	pub const WPBC_REJECT_CLUSTERING_TOO_WIDE: Self = Self(0x3801);
-	pub const WPBC_REJECT_CLUSTERING_EMPTY: Self = Self(0x3802);
-	pub const WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN: Self = Self(0x3803);
-	pub const WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED: Self = Self(0x3804);
-	pub const WPBC_REJECT_CLUSTERING_NULLABLE: Self = Self(0x3805);
-	pub const WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW: Self = Self(0x3806);
-	pub const WPBC_REJECT_CLUSTERING_WIDTH_INVALID: Self = Self(0x3807);
-	pub const WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED: Self = Self(0x3808);
-	pub const WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW: Self = Self(0x3809);
-	pub const WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN: Self = Self(0x380A);
-	pub const WPBC_REJECT_CLUSTERING_VALUE_NULL: Self = Self(0x380B);
-	pub const WPBC_REJECT_STATS_UNSUPPORTED_TYPE: Self = Self(0x3901);
-	pub const WPBC_REJECT_STATS_DUPLICATE_COLUMN: Self = Self(0x3902);
-	pub const WPBC_REJECT_STATS_COLUMN_UNKNOWN: Self = Self(0x3903);
-	pub const WPBC_REJECT_STATS_BUDGET_EXCEEDED: Self = Self(0x3904);
-	pub const WPBC_REJECT_STATS_PRECISION_INVALID: Self = Self(0x3905);
-	pub const WPBC_REJECT_STATS_BITS_INVALID: Self = Self(0x3906);
-	pub const WPBC_REJECT_STATS_SMALLSET_INVALID: Self = Self(0x3907);
-	pub const WPBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
-	pub const WPBC_REJECT_STATS_FINGERPRINT_MISMATCH: Self = Self(0x3909);
-	pub const WPBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
+	pub const PBC_REJECT_SCHEMA_STALE: Self = Self(0x3701);
+	pub const PBC_REJECT_SCHEMA_UNKNOWN: Self = Self(0x3702);
+	pub const PBC_REJECT_COLUMN_TYPE_MISMATCH: Self = Self(0x3703);
+	pub const PBC_REJECT_PK_MISSING: Self = Self(0x3704);
+	pub const PBC_REJECT_PK_NULL: Self = Self(0x3705);
+	pub const PBC_REJECT_PK_TYPE_UNSUPPORTED: Self = Self(0x3706);
+	pub const PBC_REJECT_DUPLICATE_PK_IN_BATCH: Self = Self(0x3707);
+	pub const PBC_REJECT_LOCALITY_UNSUPPORTED: Self = Self(0x3708);
+	pub const PBC_REJECT_BATCH_TOO_LARGE: Self = Self(0x3709);
+	pub const PBC_REJECT_CLUSTERING_TOO_WIDE: Self = Self(0x3801);
+	pub const PBC_REJECT_CLUSTERING_EMPTY: Self = Self(0x3802);
+	pub const PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN: Self = Self(0x3803);
+	pub const PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED: Self = Self(0x3804);
+	pub const PBC_REJECT_CLUSTERING_NULLABLE: Self = Self(0x3805);
+	pub const PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW: Self = Self(0x3806);
+	pub const PBC_REJECT_CLUSTERING_WIDTH_INVALID: Self = Self(0x3807);
+	pub const PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED: Self = Self(0x3808);
+	pub const PBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW: Self = Self(0x3809);
+	pub const PBC_REJECT_CLUSTERING_DUPLICATE_COLUMN: Self = Self(0x380A);
+	pub const PBC_REJECT_CLUSTERING_VALUE_NULL: Self = Self(0x380B);
+	pub const PBC_REJECT_STATS_UNSUPPORTED_TYPE: Self = Self(0x3901);
+	pub const PBC_REJECT_STATS_DUPLICATE_COLUMN: Self = Self(0x3902);
+	pub const PBC_REJECT_STATS_COLUMN_UNKNOWN: Self = Self(0x3903);
+	pub const PBC_REJECT_STATS_BUDGET_EXCEEDED: Self = Self(0x3904);
+	pub const PBC_REJECT_STATS_PRECISION_INVALID: Self = Self(0x3905);
+	pub const PBC_REJECT_STATS_BITS_INVALID: Self = Self(0x3906);
+	pub const PBC_REJECT_STATS_SMALLSET_INVALID: Self = Self(0x3907);
+	pub const PBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
+	pub const PBC_REJECT_STATS_FINGERPRINT_MISMATCH: Self = Self(0x3909);
+	pub const PBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
 
 	pub const fn name(self) -> &'static str {
 		match self.0 {
 			0 => "NONE",
-			0x3701 => "WPBC_REJECT_SCHEMA_STALE",
-			0x3702 => "WPBC_REJECT_SCHEMA_UNKNOWN",
-			0x3703 => "WPBC_REJECT_COLUMN_TYPE_MISMATCH",
-			0x3704 => "WPBC_REJECT_PK_MISSING",
-			0x3705 => "WPBC_REJECT_PK_NULL",
-			0x3706 => "WPBC_REJECT_PK_TYPE_UNSUPPORTED",
-			0x3707 => "WPBC_REJECT_DUPLICATE_PK_IN_BATCH",
-			0x3708 => "WPBC_REJECT_LOCALITY_UNSUPPORTED",
-			0x3709 => "WPBC_REJECT_BATCH_TOO_LARGE",
-			0x3801 => "WPBC_REJECT_CLUSTERING_TOO_WIDE",
-			0x3802 => "WPBC_REJECT_CLUSTERING_EMPTY",
-			0x3803 => "WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN",
-			0x3804 => "WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED",
-			0x3805 => "WPBC_REJECT_CLUSTERING_NULLABLE",
-			0x3806 => "WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW",
-			0x3807 => "WPBC_REJECT_CLUSTERING_WIDTH_INVALID",
-			0x3808 => "WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED",
-			0x3809 => "WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW",
-			0x380A => "WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN",
-			0x380B => "WPBC_REJECT_CLUSTERING_VALUE_NULL",
-			0x3901 => "WPBC_REJECT_STATS_UNSUPPORTED_TYPE",
-			0x3902 => "WPBC_REJECT_STATS_DUPLICATE_COLUMN",
-			0x3903 => "WPBC_REJECT_STATS_COLUMN_UNKNOWN",
-			0x3904 => "WPBC_REJECT_STATS_BUDGET_EXCEEDED",
-			0x3905 => "WPBC_REJECT_STATS_PRECISION_INVALID",
-			0x3906 => "WPBC_REJECT_STATS_BITS_INVALID",
-			0x3907 => "WPBC_REJECT_STATS_SMALLSET_INVALID",
-			0x3908 => "WPBC_REJECT_STATS_FORMAT_VERSION",
-			0x3909 => "WPBC_REJECT_STATS_FINGERPRINT_MISMATCH",
-			0x390A => "WPBC_REJECT_STATS_DECRYPT_FAILED",
-			_ => "WPBC_REJECT_UNKNOWN",
+			0x3701 => "PBC_REJECT_SCHEMA_STALE",
+			0x3702 => "PBC_REJECT_SCHEMA_UNKNOWN",
+			0x3703 => "PBC_REJECT_COLUMN_TYPE_MISMATCH",
+			0x3704 => "PBC_REJECT_PK_MISSING",
+			0x3705 => "PBC_REJECT_PK_NULL",
+			0x3706 => "PBC_REJECT_PK_TYPE_UNSUPPORTED",
+			0x3707 => "PBC_REJECT_DUPLICATE_PK_IN_BATCH",
+			0x3708 => "PBC_REJECT_LOCALITY_UNSUPPORTED",
+			0x3709 => "PBC_REJECT_BATCH_TOO_LARGE",
+			0x3801 => "PBC_REJECT_CLUSTERING_TOO_WIDE",
+			0x3802 => "PBC_REJECT_CLUSTERING_EMPTY",
+			0x3803 => "PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN",
+			0x3804 => "PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED",
+			0x3805 => "PBC_REJECT_CLUSTERING_NULLABLE",
+			0x3806 => "PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW",
+			0x3807 => "PBC_REJECT_CLUSTERING_WIDTH_INVALID",
+			0x3808 => "PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED",
+			0x3809 => "PBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW",
+			0x380A => "PBC_REJECT_CLUSTERING_DUPLICATE_COLUMN",
+			0x380B => "PBC_REJECT_CLUSTERING_VALUE_NULL",
+			0x3901 => "PBC_REJECT_STATS_UNSUPPORTED_TYPE",
+			0x3902 => "PBC_REJECT_STATS_DUPLICATE_COLUMN",
+			0x3903 => "PBC_REJECT_STATS_COLUMN_UNKNOWN",
+			0x3904 => "PBC_REJECT_STATS_BUDGET_EXCEEDED",
+			0x3905 => "PBC_REJECT_STATS_PRECISION_INVALID",
+			0x3906 => "PBC_REJECT_STATS_BITS_INVALID",
+			0x3907 => "PBC_REJECT_STATS_SMALLSET_INVALID",
+			0x3908 => "PBC_REJECT_STATS_FORMAT_VERSION",
+			0x3909 => "PBC_REJECT_STATS_FINGERPRINT_MISMATCH",
+			0x390A => "PBC_REJECT_STATS_DECRYPT_FAILED",
+			_ => "PBC_REJECT_UNKNOWN",
 		}
 	}
 }
 
-impl fmt::Display for WpbcRejectCode {
+impl fmt::Display for PbcRejectCode {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		f.write_str(self.name())
 	}
@@ -310,12 +310,12 @@ impl fmt::Display for WpbcRejectCode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableWriteValidationError {
-	pub code: WpbcRejectCode,
+	pub code: PbcRejectCode,
 	pub message: String,
 }
 
 impl TableWriteValidationError {
-	fn new(code: WpbcRejectCode, message: impl Into<String>) -> Self {
+	fn new(code: PbcRejectCode, message: impl Into<String>) -> Self {
 		Self {
 			code,
 			message: message.into(),
@@ -345,19 +345,19 @@ pub fn validate_table_write_request_batch(
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
 	descriptor.validate().map_err(|err| {
 		TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_SCHEMA_UNKNOWN,
+			PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
 			format!("invalid table schema descriptor: {err}"),
 		)
 	})?;
 	if descriptor.table_object_id != meta.table_object_id {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_SCHEMA_UNKNOWN,
+			PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
 			"table write references a different table_object_id than the descriptor",
 		));
 	}
 	if descriptor.schema_generation != meta.schema_generation {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_SCHEMA_STALE,
+			PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
 			format!(
 				"table write schema_generation {} does not match descriptor generation {}",
 				meta.schema_generation, descriptor.schema_generation
@@ -367,7 +367,7 @@ pub fn validate_table_write_request_batch(
 	let expected_rows = meta.decoded_row_count();
 	if batch.num_rows() == 0 || batch.num_rows() > TABLE_WRITE_MAX_ROWS {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE,
+			PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
 			format!(
 				"table write row_count {} is outside 1..={TABLE_WRITE_MAX_ROWS}",
 				batch.num_rows()
@@ -376,7 +376,7 @@ pub fn validate_table_write_request_batch(
 	}
 	if batch.num_rows() != expected_rows {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_BATCH_TOO_LARGE,
+			PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
 			format!(
 				"table write row_count mismatch: meta={} actual={}",
 				expected_rows,
@@ -387,25 +387,25 @@ pub fn validate_table_write_request_batch(
 
 	let schema = descriptor.arrow_schema().map_err(|err| {
 		TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_COLUMN_TYPE_MISMATCH,
+			PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
 			format!("descriptor Arrow schema cannot be decoded: {err}"),
 		)
 	})?;
 	let primary_key_column = descriptor.primary_key.columns.first().ok_or_else(|| {
 		TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_PK_MISSING,
+			PbcRejectCode::PBC_REJECT_PK_MISSING,
 			"table descriptor does not declare a primary key column",
 		)
 	})?;
 	if batch.column_by_name(primary_key_column).is_none() {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_PK_MISSING,
+			PbcRejectCode::PBC_REJECT_PK_MISSING,
 			format!("table write is missing primary key column {primary_key_column:?}"),
 		));
 	}
 	if batch.schema().as_ref() != &schema {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_COLUMN_TYPE_MISMATCH,
+			PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
 			"table write Arrow schema does not match descriptor schema",
 		));
 	}
@@ -415,7 +415,7 @@ pub fn validate_table_write_request_batch(
 	for pk in &canonical_primary_keys {
 		if !seen.insert(pk.clone()) {
 			return Err(TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_DUPLICATE_PK_IN_BATCH,
+				PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH,
 				"table write contains duplicate primary key values",
 			));
 		}
@@ -431,7 +431,7 @@ pub fn validate_table_write_request_batch(
 				table_spread_locality(meta.tenant_id, meta.table_object_id, key_identity, spread)
 					.map_err(|err| {
 						TableWriteValidationError::new(
-							WpbcRejectCode::WPBC_REJECT_LOCALITY_UNSUPPORTED,
+							PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
 							format!("table spread locality failed: {err}"),
 						)
 					})?
@@ -1141,7 +1141,7 @@ pub fn column_projection_predicate_ranges(
 	table_object_id: TableObjectId,
 	schema: &Schema,
 	projection: &ColumnLocalityDescriptorV1,
-	program: &WpbcProgram,
+	program: &PbcProgram,
 	arc_budget: usize,
 ) -> std::io::Result<ColumnProjectionRangePruning> {
 	validate_column_projection(schema, projection)?;
@@ -1535,7 +1535,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: Hilbert column locality is reserved for a future ADR",
-					WpbcRejectCode::WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED
+					PbcRejectCode::PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED
 				),
 			));
 		}
@@ -1545,7 +1545,7 @@ fn validate_column_projection(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: column locality projection requires at least one column",
-				WpbcRejectCode::WPBC_REJECT_CLUSTERING_EMPTY
+				PbcRejectCode::PBC_REJECT_CLUSTERING_EMPTY
 			),
 		));
 	}
@@ -1554,7 +1554,7 @@ fn validate_column_projection(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: column locality projection supports at most {TABLE_CLUSTERING_MAX_COLUMNS} columns",
-				WpbcRejectCode::WPBC_REJECT_CLUSTERING_TOO_WIDE
+				PbcRejectCode::PBC_REJECT_CLUSTERING_TOO_WIDE
 			),
 		));
 	}
@@ -1568,7 +1568,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: duplicate locality column {:?}",
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_DUPLICATE_COLUMN,
 					column.name
 				),
 			));
@@ -1578,7 +1578,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: locality column {:?} width_bits must be in 1..=64",
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_INVALID,
 					column.name
 				),
 			));
@@ -1589,7 +1589,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: sum(width_bits) + prefix_bits exceeds 64",
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW
+					PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW
 				),
 			));
 		}
@@ -1598,7 +1598,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: locality column {:?} is not present in Arrow schema",
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
 					column.name
 				),
 			)
@@ -1608,7 +1608,7 @@ fn validate_column_projection(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: locality column {:?} must be non-nullable",
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_NULLABLE,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_NULLABLE,
 					column.name
 				),
 			));
@@ -1646,7 +1646,7 @@ fn validate_stats_policy_budget(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: estimated CSB ciphertext size {estimated} exceeds descriptor budget {budget}",
-				WpbcRejectCode::WPBC_REJECT_STATS_BUDGET_EXCEEDED
+				PbcRejectCode::PBC_REJECT_STATS_BUDGET_EXCEEDED
 			),
 		));
 	}
@@ -1739,7 +1739,7 @@ fn validate_bloom_stats_policy(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: duplicate bloom-filter stats column {:?}",
-					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
 					spec.column_name
 				),
 			));
@@ -1749,7 +1749,7 @@ fn validate_bloom_stats_policy(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: bloom bits_per_row for {:?} is invalid: {}",
-					WpbcRejectCode::WPBC_REJECT_STATS_BITS_INVALID,
+					PbcRejectCode::PBC_REJECT_STATS_BITS_INVALID,
 					spec.column_name,
 					err
 				),
@@ -1769,7 +1769,7 @@ fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpecV1]) -> std:
 				ErrorKind::InvalidData,
 				format!(
 					"{}: duplicate HLL stats column {:?}",
-					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
 					spec.column_name
 				),
 			));
@@ -1779,7 +1779,7 @@ fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpecV1]) -> std:
 				ErrorKind::InvalidData,
 				format!(
 					"{}: HLL precision for {:?} is invalid: {}",
-					WpbcRejectCode::WPBC_REJECT_STATS_PRECISION_INVALID,
+					PbcRejectCode::PBC_REJECT_STATS_PRECISION_INVALID,
 					spec.column_name,
 					err
 				),
@@ -1802,7 +1802,7 @@ fn validate_small_set_stats_policy(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: duplicate small-set stats column {:?}",
-					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					PbcRejectCode::PBC_REJECT_STATS_DUPLICATE_COLUMN,
 					spec.column_name
 				),
 			));
@@ -1816,7 +1816,7 @@ fn validate_small_set_stats_policy(
 				ErrorKind::InvalidData,
 				format!(
 					"{}: small-set stats limits for {:?} are invalid: {}",
-					WpbcRejectCode::WPBC_REJECT_STATS_SMALLSET_INVALID,
+					PbcRejectCode::PBC_REJECT_STATS_SMALLSET_INVALID,
 					spec.column_name,
 					err
 				),
@@ -1837,7 +1837,7 @@ fn validate_stats_policy_column_type(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: {stat_kind} stats column {column_name:?} is not present in Arrow schema",
-				WpbcRejectCode::WPBC_REJECT_STATS_COLUMN_UNKNOWN
+				PbcRejectCode::PBC_REJECT_STATS_COLUMN_UNKNOWN
 			),
 		)
 	})?;
@@ -1846,7 +1846,7 @@ fn validate_stats_policy_column_type(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: {stat_kind} stats column {column_name:?} uses unsupported V1 type {:?}",
-				WpbcRejectCode::WPBC_REJECT_STATS_UNSUPPORTED_TYPE,
+				PbcRejectCode::PBC_REJECT_STATS_UNSUPPORTED_TYPE,
 				field.data_type()
 			),
 		));
@@ -1887,7 +1887,7 @@ fn validate_clustering_type_and_width(
 					ErrorKind::InvalidData,
 					format!(
 						"{}: locality column {:?} requires string_prefix_bytes",
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_INVALID,
 						column.name
 					),
 				));
@@ -1900,7 +1900,7 @@ fn validate_clustering_type_and_width(
 					ErrorKind::InvalidData,
 					format!(
 						"{}: locality column {:?} string_prefix_bytes must match width_bits",
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_INVALID,
 						column.name
 					),
 				));
@@ -1930,7 +1930,7 @@ fn validate_clustering_type_and_width(
 					ErrorKind::InvalidData,
 					format!(
 						"{}: locality column {:?} width_bits exceeds natural type width",
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_INVALID,
 						column.name
 					),
 				));
@@ -1940,7 +1940,7 @@ fn validate_clustering_type_and_width(
 					ErrorKind::InvalidData,
 					format!(
 						"{}: numeric locality column {:?} cannot declare string_prefix_bytes",
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_WIDTH_INVALID,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_WIDTH_INVALID,
 						column.name
 					),
 				));
@@ -1951,7 +1951,7 @@ fn validate_clustering_type_and_width(
 			ErrorKind::InvalidData,
 			format!(
 				"{}: locality column {:?} uses unsupported V1 type {other:?}",
-				WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+				PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 				column.name
 			),
 		)),
@@ -2005,7 +2005,7 @@ fn canonicalize_primary_key_column(
 ) -> Result<Vec<Vec<u8>>, TableWriteValidationError> {
 	if descriptor.primary_key.canonical_encoding != PrimaryKeyEncodingV1::ArrowV1 {
 		return Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+			PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 			"unsupported primary key canonical encoding",
 		));
 	}
@@ -2015,14 +2015,14 @@ fn canonicalize_primary_key_column(
 		.first()
 		.ok_or_else(|| {
 			TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_PK_MISSING,
+				PbcRejectCode::PBC_REJECT_PK_MISSING,
 				"table descriptor does not declare a primary key column",
 			)
 		})?
 		.as_str();
 	let array = batch.column_by_name(column_name).ok_or_else(|| {
 		TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_PK_MISSING,
+			PbcRejectCode::PBC_REJECT_PK_MISSING,
 			format!("table write is missing primary key column {column_name:?}"),
 		)
 	})?;
@@ -2030,7 +2030,7 @@ fn canonicalize_primary_key_column(
 	for row in 0..batch.num_rows() {
 		if array.is_null(row) {
 			return Err(TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_PK_NULL,
+				PbcRejectCode::PBC_REJECT_PK_NULL,
 				format!("primary key column {column_name:?} is null at row {row}"),
 			));
 		}
@@ -2047,7 +2047,7 @@ fn canonicalize_primary_key_value(
 		($array:expr, $ty:ty) => {{
 			let array = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
 				TableWriteValidationError::new(
-					WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+					PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 					format!(
 						"primary key array downcast failed for {:?}",
 						$array.data_type()
@@ -2073,7 +2073,7 @@ fn canonicalize_primary_key_value(
 				.downcast_ref::<StringArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 						"Utf8 primary key array downcast failed",
 					)
 				})?;
@@ -2085,7 +2085,7 @@ fn canonicalize_primary_key_value(
 				.downcast_ref::<LargeStringArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 						"LargeUtf8 primary key array downcast failed",
 					)
 				})?;
@@ -2097,7 +2097,7 @@ fn canonicalize_primary_key_value(
 				.downcast_ref::<BinaryArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 						"Binary primary key array downcast failed",
 					)
 				})?;
@@ -2109,7 +2109,7 @@ fn canonicalize_primary_key_value(
 				.downcast_ref::<LargeBinaryArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 						"LargeBinary primary key array downcast failed",
 					)
 				})?;
@@ -2121,14 +2121,14 @@ fn canonicalize_primary_key_value(
 				.downcast_ref::<TimestampMillisecondArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 						"Timestamp(Millisecond) primary key array downcast failed",
 					)
 				})?;
 			Ok(array.value(row).to_le_bytes().to_vec())
 		}
 		other => Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_PK_TYPE_UNSUPPORTED,
+			PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 			format!("unsupported primary key type {other:?}"),
 		)),
 	}
@@ -2176,7 +2176,7 @@ fn column_projection_locality(
 		ProjectionFunctionV1::RandomHash => random_hash_suffix(&coords, &widths, suffix_width),
 		ProjectionFunctionV1::Hilbert => {
 			return Err(TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED,
+				PbcRejectCode::PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED,
 				"Hilbert column locality is reserved for a future ADR",
 			));
 		}
@@ -2216,13 +2216,13 @@ fn normalize_clustering_row(
 	for column in &projection.columns {
 		let array = batch.column_by_name(&column.name).ok_or_else(|| {
 			TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
+				PbcRejectCode::PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN,
 				format!("table write is missing clustering column {:?}", column.name),
 			)
 		})?;
 		if array.is_null(row) {
 			return Err(TableWriteValidationError::new(
-				WpbcRejectCode::WPBC_REJECT_CLUSTERING_VALUE_NULL,
+				PbcRejectCode::PBC_REJECT_CLUSTERING_VALUE_NULL,
 				format!("clustering column {:?} is null at row {row}", column.name),
 			));
 		}
@@ -2240,7 +2240,7 @@ fn normalize_clustering_value(
 		($array:expr, $ty:ty, $bits:expr) => {{
 			let array = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
 				TableWriteValidationError::new(
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 					format!(
 						"clustering array downcast failed for {:?}",
 						$array.data_type()
@@ -2258,7 +2258,7 @@ fn normalize_clustering_value(
 		($array:expr, $ty:ty, $bits:expr) => {{
 			let array = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| {
 				TableWriteValidationError::new(
-					WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+					PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 					format!(
 						"clustering array downcast failed for {:?}",
 						$array.data_type()
@@ -2291,7 +2291,7 @@ fn normalize_clustering_value(
 				.downcast_ref::<StringArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 						"Utf8 clustering array downcast failed",
 					)
 				})?;
@@ -2306,7 +2306,7 @@ fn normalize_clustering_value(
 				.downcast_ref::<LargeStringArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 						"LargeUtf8 clustering array downcast failed",
 					)
 				})?;
@@ -2321,7 +2321,7 @@ fn normalize_clustering_value(
 				.downcast_ref::<BinaryArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 						"Binary clustering array downcast failed",
 					)
 				})?;
@@ -2336,7 +2336,7 @@ fn normalize_clustering_value(
 				.downcast_ref::<LargeBinaryArray>()
 				.ok_or_else(|| {
 					TableWriteValidationError::new(
-						WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+						PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 						"LargeBinary clustering array downcast failed",
 					)
 				})?;
@@ -2346,7 +2346,7 @@ fn normalize_clustering_value(
 			))
 		}
 		other => Err(TableWriteValidationError::new(
-			WpbcRejectCode::WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
+			PbcRejectCode::PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED,
 			format!("unsupported clustering column type {other:?}"),
 		)),
 	}
@@ -2823,7 +2823,7 @@ fn jump_consistent_hash(key: u64, buckets: u16) -> u16 {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::schema::wpbc::{
+	use crate::schema::pbc::{
 		OP_AND, OP_EQ, OP_GT, OP_GTE, OP_IN_LIST, OP_LTE, OP_OR, OP_PUSH_COL, OP_PUSH_INT,
 		OP_PUSH_STR,
 	};
@@ -3042,7 +3042,7 @@ mod tests {
 	}
 
 	#[test]
-	fn table_query_wire_contract_remains_descriptor_and_wpbc_only() {
+	fn table_query_wire_contract_remains_descriptor_and_pbc_only() {
 		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 88);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
 		assert_eq!(
@@ -3110,7 +3110,7 @@ mod tests {
 		assert!(
 			duplicate
 				.to_string()
-				.contains("WPBC_REJECT_STATS_DUPLICATE_COLUMN")
+				.contains("PBC_REJECT_STATS_DUPLICATE_COLUMN")
 		);
 
 		let unknown = descriptor_with_stats(
@@ -3124,7 +3124,7 @@ mod tests {
 		assert!(
 			unknown
 				.to_string()
-				.contains("WPBC_REJECT_STATS_COLUMN_UNKNOWN")
+				.contains("PBC_REJECT_STATS_COLUMN_UNKNOWN")
 		);
 
 		let unsupported = descriptor_with_stats(
@@ -3138,7 +3138,7 @@ mod tests {
 		assert!(
 			unsupported
 				.to_string()
-				.contains("WPBC_REJECT_STATS_UNSUPPORTED_TYPE")
+				.contains("PBC_REJECT_STATS_UNSUPPORTED_TYPE")
 		);
 
 		let invalid_bits = descriptor_with_stats(
@@ -3155,7 +3155,7 @@ mod tests {
 		assert!(
 			invalid_bits
 				.to_string()
-				.contains("WPBC_REJECT_STATS_BITS_INVALID")
+				.contains("PBC_REJECT_STATS_BITS_INVALID")
 		);
 
 		let invalid_precision = descriptor_with_stats(
@@ -3172,7 +3172,7 @@ mod tests {
 		assert!(
 			invalid_precision
 				.to_string()
-				.contains("WPBC_REJECT_STATS_PRECISION_INVALID")
+				.contains("PBC_REJECT_STATS_PRECISION_INVALID")
 		);
 
 		let invalid_small_set = descriptor_with_stats(
@@ -3190,7 +3190,7 @@ mod tests {
 		assert!(
 			invalid_small_set
 				.to_string()
-				.contains("WPBC_REJECT_STATS_SMALLSET_INVALID")
+				.contains("PBC_REJECT_STATS_SMALLSET_INVALID")
 		);
 
 		let budget = descriptor_with_stats(
@@ -3208,7 +3208,7 @@ mod tests {
 		assert!(
 			budget
 				.to_string()
-				.contains("WPBC_REJECT_STATS_BUDGET_EXCEEDED")
+				.contains("PBC_REJECT_STATS_BUDGET_EXCEEDED")
 		);
 	}
 
@@ -3466,7 +3466,7 @@ mod tests {
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap_err();
-		assert!(empty.to_string().contains("WPBC_REJECT_CLUSTERING_EMPTY"));
+		assert!(empty.to_string().contains("PBC_REJECT_CLUSTERING_EMPTY"));
 
 		let too_wide = TableSchemaDescriptorV1::new(
 			TableObjectId::new([7; 16]),
@@ -3495,7 +3495,7 @@ mod tests {
 		assert!(
 			too_wide
 				.to_string()
-				.contains("WPBC_REJECT_CLUSTERING_TOO_WIDE")
+				.contains("PBC_REJECT_CLUSTERING_TOO_WIDE")
 		);
 
 		let duplicate = TableSchemaDescriptorV1::new(
@@ -3520,7 +3520,7 @@ mod tests {
 		assert!(
 			duplicate
 				.to_string()
-				.contains("WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN")
+				.contains("PBC_REJECT_CLUSTERING_DUPLICATE_COLUMN")
 		);
 
 		let nullable = TableSchemaDescriptorV1::new(
@@ -3542,7 +3542,7 @@ mod tests {
 		assert!(
 			nullable
 				.to_string()
-				.contains("WPBC_REJECT_CLUSTERING_NULLABLE")
+				.contains("PBC_REJECT_CLUSTERING_NULLABLE")
 		);
 
 		let hilbert = TableSchemaDescriptorV1::new(
@@ -3564,7 +3564,7 @@ mod tests {
 		assert!(
 			hilbert
 				.to_string()
-				.contains("WPBC_REJECT_PROJECTION_NOT_YET_SUPPORTED")
+				.contains("PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED")
 		);
 
 		let overflow = TableSchemaDescriptorV1::new(
@@ -3586,7 +3586,7 @@ mod tests {
 		assert!(
 			overflow
 				.to_string()
-				.contains("WPBC_REJECT_CLUSTERING_WIDTH_OVERFLOW")
+				.contains("PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW")
 		);
 
 		let over_natural_width = TableSchemaDescriptorV1::new(
@@ -3608,7 +3608,7 @@ mod tests {
 		assert!(
 			over_natural_width
 				.to_string()
-				.contains("WPBC_REJECT_CLUSTERING_WIDTH_INVALID")
+				.contains("PBC_REJECT_CLUSTERING_WIDTH_INVALID")
 		);
 
 		for data_type in [
@@ -3635,7 +3635,7 @@ mod tests {
 			assert!(
 				unsupported
 					.to_string()
-					.contains("WPBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED")
+					.contains("PBC_REJECT_CLUSTERING_TYPE_UNSUPPORTED")
 			);
 		}
 	}
@@ -3698,7 +3698,7 @@ mod tests {
 		push_col(&mut bytecode, 1);
 		push_int(&mut bytecode, 0xa000_0000);
 		bytecode.push(OP_EQ);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 		let ranges = match column_projection_predicate_ranges(
 			tenant,
 			descriptor.table_object_id,
@@ -3741,7 +3741,7 @@ mod tests {
 		push_str(&mut bytecode, "eu");
 		push_str(&mut bytecode, "us");
 		in_list(&mut bytecode, 2);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 		let ranges = match column_projection_predicate_ranges(
 			tenant,
 			descriptor.table_object_id,
@@ -3786,7 +3786,7 @@ mod tests {
 		push_int(&mut bytecode, 0xa000_0000);
 		bytecode.push(OP_GT);
 		bytecode.push(OP_AND);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 
 		assert_eq!(
 			column_projection_predicate_ranges(
@@ -3820,7 +3820,7 @@ mod tests {
 		push_int(&mut bytecode, 0xe000_0000);
 		bytecode.push(OP_LTE);
 		bytecode.push(OP_OR);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 
 		assert_eq!(
 			column_projection_predicate_ranges(
@@ -3854,7 +3854,7 @@ mod tests {
 		push_int(&mut bytecode, 0xb000_0000);
 		bytecode.push(OP_LTE);
 		bytecode.push(OP_AND);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 
 		assert_eq!(
 			column_projection_predicate_ranges(
@@ -3887,7 +3887,7 @@ mod tests {
 		push_col(&mut bytecode, 1);
 		push_int(&mut bytecode, 0x8000_0000);
 		bytecode.push(OP_EQ);
-		let program = WpbcProgram::compile(&bytecode).unwrap();
+		let program = PbcProgram::compile(&bytecode).unwrap();
 
 		assert_eq!(
 			column_projection_predicate_ranges(
@@ -4064,7 +4064,7 @@ mod tests {
 		let batch = table_batch(vec![Some(1), Some(1)]);
 		let meta = table_meta(&descriptor, batch.num_rows());
 		let err = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap_err();
-		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_DUPLICATE_PK_IN_BATCH);
+		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 	}
 
 	#[test]
@@ -4073,7 +4073,7 @@ mod tests {
 		let batch = table_batch(vec![Some(1), None]);
 		let meta = table_meta(&descriptor, batch.num_rows());
 		let err = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap_err();
-		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_PK_NULL);
+		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_PK_NULL);
 	}
 
 	#[test]
@@ -4129,7 +4129,7 @@ mod tests {
 		)
 		.unwrap();
 		let err = normalize_clustering_row(&batch, &projection, 1).unwrap_err();
-		assert_eq!(err.code, WpbcRejectCode::WPBC_REJECT_CLUSTERING_VALUE_NULL);
+		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_CLUSTERING_VALUE_NULL);
 	}
 
 	#[test]

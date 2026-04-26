@@ -6,7 +6,7 @@ use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use wendelon::schema::wpbc::{
+use wendelon::schema::pbc::{
 	OP_AND, OP_EQ, OP_GTE, OP_IN_LIST, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, OP_PUSH_STR, Program,
 	execute_program,
 };
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			row_loop,
 		);
 		println!(
-			"wpbc_vectorized case={} rows={} speedup_vs_scalar_interpreter={:.2}",
+			"pbc_vectorized case={} rows={} speedup_vs_scalar_interpreter={:.2}",
 			case.label,
 			case.rows,
 			row_loop.as_secs_f64() / vector.as_secs_f64()
@@ -387,7 +387,7 @@ fn compare_bench_values<'a>(
 fn print_measurement(label: &str, mode: &str, rows: usize, avg: Duration) {
 	let rows_per_second = rows as f64 / avg.as_secs_f64();
 	println!(
-		"wpbc_vectorized case={label} mode={mode} rows={rows} avg_ns={} rows_per_second={rows_per_second:.2}",
+		"pbc_vectorized case={label} mode={mode} rows={rows} avg_ns={} rows_per_second={rows_per_second:.2}",
 		avg.as_nanos(),
 	);
 }
