@@ -6208,6 +6208,7 @@ mod recovery_tests {
 						byte_length: u32::try_from(b"before-snapshot".len()).unwrap(),
 						flags: 0,
 					}],
+					column_stats_block: None,
 				},
 				b"before-snapshot",
 			)
@@ -7375,6 +7376,9 @@ mod tiered_slab_tests {
 			is_encrypted: true,
 			tenant_id: None,
 			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 
 		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
@@ -7573,6 +7577,9 @@ mod tenant_kek_tests {
 				is_encrypted: true,
 				tenant_id: Some(tenant_id),
 				tenant_kek_id: Some(historical_id),
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
 			},
 		);
 

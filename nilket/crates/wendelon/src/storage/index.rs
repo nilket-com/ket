@@ -20,6 +20,9 @@ const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// - bit 0 = `is_encrypted`
 /// - bit 1 = `tenant_id` present (8 LE bytes)
 /// - bit 2 = `tenant_kek_id` present (8 LE bytes)
+/// - bit 3 = `stats_format_version` present (2 LE bytes)
+/// - bit 4 = `stats_block_len` present (4 LE bytes)
+/// - bit 5 = `stats_block_hash128` present (16 raw bytes)
 ///
 /// Older rows only use bit 0 and therefore decode cleanly with
 /// missing tenant / tenant-KEK metadata.
@@ -36,6 +39,15 @@ const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTE
 const TIERED_FLAG_IS_ENCRYPTED: u8 = 0b0000_0001;
 const TIERED_FLAG_HAS_TENANT_ID: u8 = 0b0000_0010;
 const TIERED_FLAG_HAS_TENANT_KEK_ID: u8 = 0b0000_0100;
+const TIERED_FLAG_HAS_STATS_FORMAT_VERSION: u8 = 0b0000_1000;
+const TIERED_FLAG_HAS_STATS_BLOCK_LEN: u8 = 0b0001_0000;
+const TIERED_FLAG_HAS_STATS_BLOCK_HASH128: u8 = 0b0010_0000;
+const TIERED_FLAG_KNOWN_MASK: u8 = TIERED_FLAG_IS_ENCRYPTED
+	| TIERED_FLAG_HAS_TENANT_ID
+	| TIERED_FLAG_HAS_TENANT_KEK_ID
+	| TIERED_FLAG_HAS_STATS_FORMAT_VERSION
+	| TIERED_FLAG_HAS_STATS_BLOCK_LEN
+	| TIERED_FLAG_HAS_STATS_BLOCK_HASH128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -416,12 +428,30 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	if pointer.tenant_kek_id.is_some() {
 		flags |= TIERED_FLAG_HAS_TENANT_KEK_ID;
 	}
+	if pointer.stats_format_version.is_some() {
+		flags |= TIERED_FLAG_HAS_STATS_FORMAT_VERSION;
+	}
+	if pointer.stats_block_len.is_some() {
+		flags |= TIERED_FLAG_HAS_STATS_BLOCK_LEN;
+	}
+	if pointer.stats_block_hash128.is_some() {
+		flags |= TIERED_FLAG_HAS_STATS_BLOCK_HASH128;
+	}
 	bytes.push(flags);
 	if let Some(tenant_id) = pointer.tenant_id {
 		bytes.extend_from_slice(&tenant_id.get().to_le_bytes());
 	}
 	if let Some(tenant_kek_id) = pointer.tenant_kek_id {
 		bytes.extend_from_slice(&tenant_kek_id.get().to_le_bytes());
+	}
+	if let Some(stats_format_version) = pointer.stats_format_version {
+		bytes.extend_from_slice(&stats_format_version.to_le_bytes());
+	}
+	if let Some(stats_block_len) = pointer.stats_block_len {
+		bytes.extend_from_slice(&stats_block_len.to_le_bytes());
+	}
+	if let Some(stats_block_hash128) = pointer.stats_block_hash128 {
+		bytes.extend_from_slice(&stats_block_hash128);
 	}
 	bytes.extend_from_slice(pointer.l2_uri.as_bytes());
 	bytes
@@ -440,6 +470,12 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	let mut payload_hash = [0u8; TIERED_POINTER_HASH_LEN];
 	payload_hash.copy_from_slice(&value[..TIERED_POINTER_HASH_LEN]);
 	let flags = value[TIERED_POINTER_HASH_LEN];
+	if flags & !TIERED_FLAG_KNOWN_MASK != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("tiered slab value has unknown flags 0x{flags:02x}"),
+		));
+	}
 	let is_encrypted = (flags & TIERED_FLAG_IS_ENCRYPTED) != 0;
 	let mut cursor = TIERED_POINTER_PREFIX_LEN;
 	let tenant_id = if (flags & TIERED_FLAG_HAS_TENANT_ID) != 0 {
@@ -478,6 +514,47 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	} else {
 		None
 	};
+	let stats_format_version = if (flags & TIERED_FLAG_HAS_STATS_FORMAT_VERSION) != 0 {
+		let end = cursor.saturating_add(2);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding stats_format_version",
+			)
+		})?;
+		cursor = end;
+		Some(u16::from_le_bytes(slot.try_into().expect("fixed width")))
+	} else {
+		None
+	};
+	let stats_block_len = if (flags & TIERED_FLAG_HAS_STATS_BLOCK_LEN) != 0 {
+		let end = cursor.saturating_add(4);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding stats_block_len",
+			)
+		})?;
+		cursor = end;
+		Some(u32::from_le_bytes(slot.try_into().expect("fixed width")))
+	} else {
+		None
+	};
+	let stats_block_hash128 = if (flags & TIERED_FLAG_HAS_STATS_BLOCK_HASH128) != 0 {
+		let end = cursor.saturating_add(16);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding stats_block_hash128",
+			)
+		})?;
+		cursor = end;
+		let mut hash = [0_u8; 16];
+		hash.copy_from_slice(slot);
+		Some(hash)
+	} else {
+		None
+	};
 	let l2_uri = std::str::from_utf8(&value[cursor..])
 		.map_err(|err| {
 			Error::new(
@@ -493,6 +570,9 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 		is_encrypted,
 		tenant_id,
 		tenant_kek_id,
+		stats_format_version,
+		stats_block_len,
+		stats_block_hash128,
 	})
 }
 
@@ -529,6 +609,9 @@ fn decode_tiered_pointer_v1(slab_id: SlabId, value: &[u8]) -> std::io::Result<Ti
 		is_encrypted: false,
 		tenant_id: None,
 		tenant_kek_id: None,
+		stats_format_version: None,
+		stats_block_len: None,
+		stats_block_hash128: None,
 	})
 }
 
@@ -616,6 +699,9 @@ mod tests {
 			is_encrypted: true,
 			tenant_id: Some(TenantId::new(9)),
 			tenant_kek_id: Some(TenantKekId::try_from(11).unwrap()),
+			stats_format_version: Some(1),
+			stats_block_len: Some(128),
+			stats_block_hash128: Some([0x5A; 16]),
 		};
 		let encoded = encode_tiered_pointer(&pointer);
 		let decoded = decode_tiered_pointer(pointer.slab_id, &encoded).unwrap();
@@ -631,6 +717,9 @@ mod tests {
 		assert!(!decoded.is_encrypted);
 		assert_eq!(decoded.payload_hash, [0xCD; 32]);
 		assert_eq!(decoded.l2_uri, "file:///tmp/legacy");
+		assert_eq!(decoded.stats_format_version, None);
+		assert_eq!(decoded.stats_block_len, None);
+		assert_eq!(decoded.stats_block_hash128, None);
 	}
 
 	#[tokio::test]
@@ -645,6 +734,9 @@ mod tests {
 			is_encrypted: true,
 			tenant_id: Some(TenantId::new(5)),
 			tenant_kek_id: Some(TenantKekId::try_from(15).unwrap()),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 		let local_row = PersistentRecordRow {
 			location: RecordLocation {
@@ -690,6 +782,9 @@ mod tests {
 			is_encrypted: true,
 			tenant_id: Some(TenantId::new(6)),
 			tenant_kek_id: Some(TenantKekId::try_from(16).unwrap()),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 
 		index

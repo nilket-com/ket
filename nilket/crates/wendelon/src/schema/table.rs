@@ -32,6 +32,22 @@ pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
 pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
 pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
+pub const COLUMN_STATS_BLOOM_DEFAULT_BITS_PER_ROW: u8 = 10;
+pub const COLUMN_STATS_BLOOM_MIN_BITS_PER_ROW: u8 = 1;
+pub const COLUMN_STATS_BLOOM_MAX_BITS_PER_ROW: u8 = 32;
+pub const COLUMN_STATS_HLL_DEFAULT_PRECISION: u8 = 12;
+pub const COLUMN_STATS_HLL_MIN_PRECISION: u8 = 10;
+pub const COLUMN_STATS_HLL_MAX_PRECISION: u8 = 14;
+pub const COLUMN_STATS_SMALL_SET_DEFAULT_MAX_DISTINCT_VALUES: u32 = 4096;
+pub const COLUMN_STATS_SMALL_SET_MAX_DISTINCT_VALUES: u32 = 4096;
+pub const COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES: u32 = 32 * 1024;
+pub const COLUMN_STATS_SMALL_SET_MAX_BYTES: u32 = 32 * 1024;
+pub const COLUMN_STATS_CIPHERTEXT_BUDGET_DIVISOR: u64 = 256;
+pub const COLUMN_STATS_DESCRIPTOR_SLAB_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+pub const COLUMN_STATS_CSB_AEAD_TAG_BYTES: u64 = 16;
+pub const COLUMN_STATS_CSB_HEADER_BYTES: u64 = 84;
+pub const COLUMN_STATS_CSB_COLUMN_HEADER_BYTES: u64 = 9;
+pub const COLUMN_STATS_DEFAULT_STRING_PREFIX_BYTES: u64 = 64;
 
 #[derive(
 	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
@@ -237,6 +253,16 @@ impl WpbcRejectCode {
 	pub const WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW: Self = Self(0x3809);
 	pub const WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN: Self = Self(0x380A);
 	pub const WPBC_REJECT_CLUSTERING_VALUE_NULL: Self = Self(0x380B);
+	pub const WPBC_REJECT_STATS_UNSUPPORTED_TYPE: Self = Self(0x3901);
+	pub const WPBC_REJECT_STATS_DUPLICATE_COLUMN: Self = Self(0x3902);
+	pub const WPBC_REJECT_STATS_COLUMN_UNKNOWN: Self = Self(0x3903);
+	pub const WPBC_REJECT_STATS_BUDGET_EXCEEDED: Self = Self(0x3904);
+	pub const WPBC_REJECT_STATS_PRECISION_INVALID: Self = Self(0x3905);
+	pub const WPBC_REJECT_STATS_BITS_INVALID: Self = Self(0x3906);
+	pub const WPBC_REJECT_STATS_SMALLSET_INVALID: Self = Self(0x3907);
+	pub const WPBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
+	pub const WPBC_REJECT_STATS_FINGERPRINT_MISMATCH: Self = Self(0x3909);
+	pub const WPBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
 
 	pub const fn name(self) -> &'static str {
 		match self.0 {
@@ -261,6 +287,16 @@ impl WpbcRejectCode {
 			0x3809 => "WPBC_REJECT_RANGE_DECOMPOSITION_OVERFLOW",
 			0x380A => "WPBC_REJECT_CLUSTERING_DUPLICATE_COLUMN",
 			0x380B => "WPBC_REJECT_CLUSTERING_VALUE_NULL",
+			0x3901 => "WPBC_REJECT_STATS_UNSUPPORTED_TYPE",
+			0x3902 => "WPBC_REJECT_STATS_DUPLICATE_COLUMN",
+			0x3903 => "WPBC_REJECT_STATS_COLUMN_UNKNOWN",
+			0x3904 => "WPBC_REJECT_STATS_BUDGET_EXCEEDED",
+			0x3905 => "WPBC_REJECT_STATS_PRECISION_INVALID",
+			0x3906 => "WPBC_REJECT_STATS_BITS_INVALID",
+			0x3907 => "WPBC_REJECT_STATS_SMALLSET_INVALID",
+			0x3908 => "WPBC_REJECT_STATS_FORMAT_VERSION",
+			0x3909 => "WPBC_REJECT_STATS_FINGERPRINT_MISMATCH",
+			0x390A => "WPBC_REJECT_STATS_DECRYPT_FAILED",
 			_ => "WPBC_REJECT_UNKNOWN",
 		}
 	}
@@ -431,6 +467,8 @@ pub struct TableSchemaDescriptorV1 {
 	pub arrow_schema_ipc: Vec<u8>,
 	pub primary_key: PrimaryKeyDescriptorV1,
 	pub locality_policy: LocalityPolicyV1,
+	#[serde(default)]
+	pub stats_policy: ColumnStatsPolicyV1,
 	pub schema_fingerprint: [u8; 32],
 	pub evolution_policy: SchemaEvolutionPolicyV1,
 }
@@ -455,6 +493,7 @@ impl TableSchemaDescriptorV1 {
 			arrow_schema_ipc: encode_arrow_schema_ipc(arrow_schema)?,
 			primary_key,
 			locality_policy,
+			stats_policy: ColumnStatsPolicyV1::default(),
 			schema_fingerprint: [0; 32],
 			evolution_policy,
 		};
@@ -498,6 +537,7 @@ impl TableSchemaDescriptorV1 {
 		let schema = self.arrow_schema()?;
 		validate_primary_key(&schema, &self.primary_key)?;
 		validate_locality_policy(&schema, &self.locality_policy)?;
+		validate_stats_policy(&schema, &self.stats_policy)?;
 		Ok(())
 	}
 }
@@ -559,6 +599,267 @@ pub struct ClusteringColumnSpecV1 {
 	pub name: String,
 	pub width_bits: u8,
 	pub string_prefix_bytes: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnStatsPolicyV1 {
+	pub bloom_filters: Vec<ColumnBloomSpecV1>,
+	pub hll_distincts: Vec<ColumnHllSpecV1>,
+	pub small_sets: Vec<ColumnSmallSetSpecV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnBloomSpecV1 {
+	pub column_name: String,
+	pub bits_per_row: BloomBitsPerRow,
+}
+
+impl ColumnBloomSpecV1 {
+	pub fn new(column_name: impl Into<String>) -> Self {
+		Self {
+			column_name: column_name.into(),
+			bits_per_row: BloomBitsPerRow::DEFAULT,
+		}
+	}
+
+	pub fn with_bits_per_row(
+		column_name: impl Into<String>,
+		bits_per_row: u8,
+	) -> std::io::Result<Self> {
+		Ok(Self {
+			column_name: column_name.into(),
+			bits_per_row: BloomBitsPerRow::new(bits_per_row)?,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnHllSpecV1 {
+	pub column_name: String,
+	pub precision: HllPrecision,
+}
+
+impl ColumnHllSpecV1 {
+	pub fn new(column_name: impl Into<String>) -> Self {
+		Self {
+			column_name: column_name.into(),
+			precision: HllPrecision::DEFAULT,
+		}
+	}
+
+	pub fn with_precision(column_name: impl Into<String>, precision: u8) -> std::io::Result<Self> {
+		Ok(Self {
+			column_name: column_name.into(),
+			precision: HllPrecision::new(precision)?,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColumnSmallSetSpecV1 {
+	pub column_name: String,
+	pub max_distinct_values: SmallSetValueCap,
+	pub max_bytes: SmallSetByteCap,
+}
+
+impl ColumnSmallSetSpecV1 {
+	pub fn new(column_name: impl Into<String>) -> Self {
+		Self {
+			column_name: column_name.into(),
+			max_distinct_values: SmallSetValueCap::DEFAULT,
+			max_bytes: SmallSetByteCap::DEFAULT,
+		}
+	}
+
+	pub fn with_caps(
+		column_name: impl Into<String>,
+		max_distinct_values: u32,
+		max_bytes: u32,
+	) -> std::io::Result<Self> {
+		Ok(Self {
+			column_name: column_name.into(),
+			max_distinct_values: SmallSetValueCap::new(max_distinct_values)?,
+			max_bytes: SmallSetByteCap::new(max_bytes)?,
+		})
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct BloomBitsPerRow(u8);
+
+impl BloomBitsPerRow {
+	pub const DEFAULT: Self = Self(COLUMN_STATS_BLOOM_DEFAULT_BITS_PER_ROW);
+
+	pub fn new(bits_per_row: u8) -> std::io::Result<Self> {
+		let value = Self(bits_per_row);
+		value.validate()?;
+		Ok(value)
+	}
+
+	pub const fn get(self) -> u8 {
+		self.0
+	}
+
+	fn validate(self) -> std::io::Result<()> {
+		if !(COLUMN_STATS_BLOOM_MIN_BITS_PER_ROW..=COLUMN_STATS_BLOOM_MAX_BITS_PER_ROW)
+			.contains(&self.0)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"bloom bits_per_row must be in {}..={}",
+					COLUMN_STATS_BLOOM_MIN_BITS_PER_ROW, COLUMN_STATS_BLOOM_MAX_BITS_PER_ROW
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
+impl Default for BloomBitsPerRow {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
+impl From<BloomBitsPerRow> for u8 {
+	fn from(value: BloomBitsPerRow) -> Self {
+		value.get()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct HllPrecision(u8);
+
+impl HllPrecision {
+	pub const DEFAULT: Self = Self(COLUMN_STATS_HLL_DEFAULT_PRECISION);
+
+	pub fn new(precision: u8) -> std::io::Result<Self> {
+		let value = Self(precision);
+		value.validate()?;
+		Ok(value)
+	}
+
+	pub const fn get(self) -> u8 {
+		self.0
+	}
+
+	fn validate(self) -> std::io::Result<()> {
+		if !(COLUMN_STATS_HLL_MIN_PRECISION..=COLUMN_STATS_HLL_MAX_PRECISION).contains(&self.0) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"HLL precision must be in {}..={}",
+					COLUMN_STATS_HLL_MIN_PRECISION, COLUMN_STATS_HLL_MAX_PRECISION
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
+impl Default for HllPrecision {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
+impl From<HllPrecision> for u8 {
+	fn from(value: HllPrecision) -> Self {
+		value.get()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct SmallSetValueCap(u32);
+
+impl SmallSetValueCap {
+	pub const DEFAULT: Self = Self(COLUMN_STATS_SMALL_SET_DEFAULT_MAX_DISTINCT_VALUES);
+
+	pub fn new(max_distinct_values: u32) -> std::io::Result<Self> {
+		let value = Self(max_distinct_values);
+		value.validate()?;
+		Ok(value)
+	}
+
+	pub const fn get(self) -> u32 {
+		self.0
+	}
+
+	fn validate(self) -> std::io::Result<()> {
+		if self.0 == 0 || self.0 > COLUMN_STATS_SMALL_SET_MAX_DISTINCT_VALUES {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"small-set max_distinct_values must be in 1..={}",
+					COLUMN_STATS_SMALL_SET_MAX_DISTINCT_VALUES
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
+impl Default for SmallSetValueCap {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
+impl From<SmallSetValueCap> for u32 {
+	fn from(value: SmallSetValueCap) -> Self {
+		value.get()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct SmallSetByteCap(u32);
+
+impl SmallSetByteCap {
+	pub const DEFAULT: Self = Self(COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES);
+
+	pub fn new(max_bytes: u32) -> std::io::Result<Self> {
+		let value = Self(max_bytes);
+		value.validate()?;
+		Ok(value)
+	}
+
+	pub const fn get(self) -> u32 {
+		self.0
+	}
+
+	fn validate(self) -> std::io::Result<()> {
+		if self.0 == 0 || self.0 > COLUMN_STATS_SMALL_SET_MAX_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"small-set max_bytes must be in 1..={}",
+					COLUMN_STATS_SMALL_SET_MAX_BYTES
+				),
+			));
+		}
+		Ok(())
+	}
+}
+
+impl Default for SmallSetByteCap {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
+impl From<SmallSetByteCap> for u32 {
+	fn from(value: SmallSetByteCap) -> Self {
+		value.get()
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1114,6 +1415,23 @@ impl TableSchemaCatalogV1 {
 			.map(|(_, descriptor)| descriptor)
 	}
 
+	pub fn descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptorV1> {
+		let start = TableSchemaCatalogKey {
+			tenant_id,
+			table_object_id: TableObjectId::new([0; 16]),
+			schema_generation: 0,
+		};
+		let end = TableSchemaCatalogKey {
+			tenant_id,
+			table_object_id: TableObjectId::new([0xFF; 16]),
+			schema_generation: u64::MAX,
+		};
+		self.by_id
+			.range(start..=end)
+			.map(|(_, descriptor)| descriptor.clone())
+			.collect()
+	}
+
 	pub fn len(&self) -> usize {
 		self.by_id.len()
 	}
@@ -1298,6 +1616,264 @@ fn validate_column_projection(
 		validate_clustering_type_and_width(field.data_type(), column)?;
 	}
 	Ok(())
+}
+
+fn validate_stats_policy(schema: &Schema, policy: &ColumnStatsPolicyV1) -> std::io::Result<()> {
+	validate_bloom_stats_policy(schema, &policy.bloom_filters)?;
+	validate_hll_stats_policy(schema, &policy.hll_distincts)?;
+	validate_small_set_stats_policy(schema, &policy.small_sets)?;
+	validate_stats_policy_budget(schema, policy)?;
+	Ok(())
+}
+
+pub const fn max_column_stats_block_ciphertext_bytes_for_slab_payload(
+	slab_payload_bytes: u64,
+) -> u64 {
+	slab_payload_bytes / COLUMN_STATS_CIPHERTEXT_BUDGET_DIVISOR
+}
+
+fn validate_stats_policy_budget(
+	schema: &Schema,
+	policy: &ColumnStatsPolicyV1,
+) -> std::io::Result<()> {
+	let budget = max_column_stats_block_ciphertext_bytes_for_slab_payload(
+		COLUMN_STATS_DESCRIPTOR_SLAB_PAYLOAD_BYTES,
+	);
+	let estimated =
+		estimate_stats_policy_csb_ciphertext_bytes(schema, policy, TABLE_WRITE_MAX_ROWS as u64)?;
+	if estimated > budget {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: estimated CSB ciphertext size {estimated} exceeds descriptor budget {budget}",
+				WpbcRejectCode::WPBC_REJECT_STATS_BUDGET_EXCEEDED
+			),
+		));
+	}
+	Ok(())
+}
+
+fn estimate_stats_policy_csb_ciphertext_bytes(
+	schema: &Schema,
+	policy: &ColumnStatsPolicyV1,
+	row_capacity: u64,
+) -> std::io::Result<u64> {
+	let column_count = u64::try_from(schema.fields().len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"stats schema field count exceeds u64::MAX",
+		)
+	})?;
+	let mut bytes = COLUMN_STATS_CSB_AEAD_TAG_BYTES
+		.checked_add(COLUMN_STATS_CSB_HEADER_BYTES)
+		.and_then(|bytes| {
+			bytes.checked_add(column_count.checked_mul(COLUMN_STATS_CSB_COLUMN_HEADER_BYTES)?)
+		})
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+
+	for field in schema.fields() {
+		bytes = bytes
+			.checked_add(estimated_always_on_column_stats_payload_bytes(
+				field.data_type(),
+			))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.bloom_filters {
+		let bit_count = row_capacity
+			.checked_mul(u64::from(spec.bits_per_row.get()))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats bloom estimate overflow"))?;
+		let bloom_bytes = 4_u64
+			.checked_add(bit_count.div_ceil(8))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats bloom estimate overflow"))?;
+		bytes = bytes
+			.checked_add(bloom_bytes)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.hll_distincts {
+		let registers = 1_u64
+			.checked_shl(u32::from(spec.precision.get()))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats HLL estimate overflow"))?;
+		bytes = bytes
+			.checked_add(1_u64 + registers)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	for spec in &policy.small_sets {
+		bytes = bytes
+			.checked_add(u64::from(spec.max_bytes.get()))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "stats budget estimate overflow"))?;
+	}
+	Ok(bytes)
+}
+
+fn estimated_always_on_column_stats_payload_bytes(data_type: &DataType) -> u64 {
+	let Some(value_bytes) = estimated_canonical_stats_value_bytes(data_type) else {
+		return 16;
+	};
+	2 * (4 + value_bytes) + 16
+}
+
+fn estimated_canonical_stats_value_bytes(data_type: &DataType) -> Option<u64> {
+	match data_type {
+		DataType::Int8 | DataType::UInt8 | DataType::Boolean => Some(1),
+		DataType::Int16 | DataType::UInt16 => Some(2),
+		DataType::Int32 | DataType::UInt32 | DataType::Date32 => Some(4),
+		DataType::Int64 | DataType::UInt64 | DataType::Timestamp(_, _) | DataType::Date64 => {
+			Some(8)
+		}
+		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
+			Some(COLUMN_STATS_DEFAULT_STRING_PREFIX_BYTES)
+		}
+		_ => None,
+	}
+}
+
+fn validate_bloom_stats_policy(
+	schema: &Schema,
+	specs: &[ColumnBloomSpecV1],
+) -> std::io::Result<()> {
+	let mut seen = BTreeSet::new();
+	for spec in specs {
+		validate_descriptor_name("stats bloom column", &spec.column_name)?;
+		if !seen.insert(spec.column_name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate bloom-filter stats column {:?}",
+					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_name
+				),
+			));
+		}
+		if let Err(err) = spec.bits_per_row.validate() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: bloom bits_per_row for {:?} is invalid: {}",
+					WpbcRejectCode::WPBC_REJECT_STATS_BITS_INVALID,
+					spec.column_name,
+					err
+				),
+			));
+		}
+		validate_stats_policy_column_type(schema, &spec.column_name, "bloom-filter")?;
+	}
+	Ok(())
+}
+
+fn validate_hll_stats_policy(schema: &Schema, specs: &[ColumnHllSpecV1]) -> std::io::Result<()> {
+	let mut seen = BTreeSet::new();
+	for spec in specs {
+		validate_descriptor_name("stats HLL column", &spec.column_name)?;
+		if !seen.insert(spec.column_name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate HLL stats column {:?}",
+					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_name
+				),
+			));
+		}
+		if let Err(err) = spec.precision.validate() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: HLL precision for {:?} is invalid: {}",
+					WpbcRejectCode::WPBC_REJECT_STATS_PRECISION_INVALID,
+					spec.column_name,
+					err
+				),
+			));
+		}
+		validate_stats_policy_column_type(schema, &spec.column_name, "HLL")?;
+	}
+	Ok(())
+}
+
+fn validate_small_set_stats_policy(
+	schema: &Schema,
+	specs: &[ColumnSmallSetSpecV1],
+) -> std::io::Result<()> {
+	let mut seen = BTreeSet::new();
+	for spec in specs {
+		validate_descriptor_name("stats small-set column", &spec.column_name)?;
+		if !seen.insert(spec.column_name.clone()) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: duplicate small-set stats column {:?}",
+					WpbcRejectCode::WPBC_REJECT_STATS_DUPLICATE_COLUMN,
+					spec.column_name
+				),
+			));
+		}
+		if let Err(err) = spec
+			.max_distinct_values
+			.validate()
+			.and_then(|()| spec.max_bytes.validate())
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: small-set stats limits for {:?} are invalid: {}",
+					WpbcRejectCode::WPBC_REJECT_STATS_SMALLSET_INVALID,
+					spec.column_name,
+					err
+				),
+			));
+		}
+		validate_stats_policy_column_type(schema, &spec.column_name, "small-set")?;
+	}
+	Ok(())
+}
+
+fn validate_stats_policy_column_type(
+	schema: &Schema,
+	column_name: &str,
+	stat_kind: &str,
+) -> std::io::Result<()> {
+	let field = schema.field_with_name(column_name).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: {stat_kind} stats column {column_name:?} is not present in Arrow schema",
+				WpbcRejectCode::WPBC_REJECT_STATS_COLUMN_UNKNOWN
+			),
+		)
+	})?;
+	if !is_supported_column_stats_type(field.data_type()) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"{}: {stat_kind} stats column {column_name:?} uses unsupported V1 type {:?}",
+				WpbcRejectCode::WPBC_REJECT_STATS_UNSUPPORTED_TYPE,
+				field.data_type()
+			),
+		));
+	}
+	Ok(())
+}
+
+pub fn is_supported_column_stats_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+			| DataType::Boolean
+			| DataType::Timestamp(_, _)
+			| DataType::Date32
+			| DataType::Date64
+			| DataType::Utf8
+			| DataType::LargeUtf8
+			| DataType::Binary
+			| DataType::LargeBinary
+	)
 }
 
 fn validate_clustering_type_and_width(
@@ -2309,6 +2885,17 @@ mod tests {
 		descriptor_for_generation(schema, 1)
 	}
 
+	fn descriptor_with_stats(
+		schema: &Schema,
+		stats_policy: ColumnStatsPolicyV1,
+	) -> std::io::Result<TableSchemaDescriptorV1> {
+		let mut descriptor = descriptor_for(schema);
+		descriptor.stats_policy = stats_policy;
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint()?;
+		descriptor.validate()?;
+		Ok(descriptor)
+	}
+
 	fn cluster_column(name: &str, width_bits: u8) -> ClusteringColumnSpecV1 {
 		ClusteringColumnSpecV1 {
 			name: name.to_owned(),
@@ -2452,6 +3039,209 @@ mod tests {
 		let mut tampered = descriptor;
 		tampered.table_name = "other".to_owned();
 		assert!(tampered.validate().is_err());
+	}
+
+	#[test]
+	fn table_query_wire_contract_remains_descriptor_and_wpbc_only() {
+		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 88);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, expected_epoch),
+			16
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, tenant_id), 24);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, table_object_id),
+			32
+		);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, schema_generation),
+			48
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, consistency), 56);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad), 57);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, bytecode_len),
+			64
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad2), 68);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 72);
+	}
+
+	#[test]
+	fn stats_policy_defaults_empty_and_roundtrips_in_fingerprint() {
+		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
+		assert_eq!(descriptor.stats_policy, ColumnStatsPolicyV1::default());
+
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+			Field::new("active", DataType::Boolean, true),
+		]);
+		let descriptor = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				bloom_filters: vec![ColumnBloomSpecV1::new("region")],
+				hll_distincts: vec![ColumnHllSpecV1::new("id")],
+				small_sets: vec![ColumnSmallSetSpecV1::new("active")],
+			},
+		)
+		.unwrap();
+		let encoded = encode_table_schema_descriptor_v1(&descriptor).unwrap();
+		let decoded = decode_table_schema_descriptor_v1(&encoded).unwrap();
+		assert_eq!(decoded, descriptor);
+	}
+
+	#[test]
+	fn stats_policy_validation_uses_stable_reject_codes() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("score", DataType::Float64, true),
+		]);
+
+		let duplicate = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				bloom_filters: vec![ColumnBloomSpecV1::new("id"), ColumnBloomSpecV1::new("id")],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			duplicate
+				.to_string()
+				.contains("WPBC_REJECT_STATS_DUPLICATE_COLUMN")
+		);
+
+		let unknown = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				hll_distincts: vec![ColumnHllSpecV1::new("missing")],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			unknown
+				.to_string()
+				.contains("WPBC_REJECT_STATS_COLUMN_UNKNOWN")
+		);
+
+		let unsupported = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				small_sets: vec![ColumnSmallSetSpecV1::new("score")],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			unsupported
+				.to_string()
+				.contains("WPBC_REJECT_STATS_UNSUPPORTED_TYPE")
+		);
+
+		let invalid_bits = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				bloom_filters: vec![ColumnBloomSpecV1 {
+					column_name: "id".into(),
+					bits_per_row: BloomBitsPerRow(0),
+				}],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			invalid_bits
+				.to_string()
+				.contains("WPBC_REJECT_STATS_BITS_INVALID")
+		);
+
+		let invalid_precision = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				hll_distincts: vec![ColumnHllSpecV1 {
+					column_name: "id".into(),
+					precision: HllPrecision(COLUMN_STATS_HLL_MIN_PRECISION - 1),
+				}],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			invalid_precision
+				.to_string()
+				.contains("WPBC_REJECT_STATS_PRECISION_INVALID")
+		);
+
+		let invalid_small_set = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				small_sets: vec![ColumnSmallSetSpecV1 {
+					column_name: "id".into(),
+					max_distinct_values: SmallSetValueCap(0),
+					max_bytes: SmallSetByteCap::DEFAULT,
+				}],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			invalid_small_set
+				.to_string()
+				.contains("WPBC_REJECT_STATS_SMALLSET_INVALID")
+		);
+
+		let budget = descriptor_with_stats(
+			&schema,
+			ColumnStatsPolicyV1 {
+				bloom_filters: vec![ColumnBloomSpecV1 {
+					column_name: "id".into(),
+					bits_per_row: BloomBitsPerRow::new(COLUMN_STATS_BLOOM_MAX_BITS_PER_ROW)
+						.unwrap(),
+				}],
+				..ColumnStatsPolicyV1::default()
+			},
+		)
+		.unwrap_err();
+		assert!(
+			budget
+				.to_string()
+				.contains("WPBC_REJECT_STATS_BUDGET_EXCEEDED")
+		);
+	}
+
+	#[test]
+	fn stats_policy_newtypes_validate_units_at_construction() {
+		assert_eq!(
+			BloomBitsPerRow::new(COLUMN_STATS_BLOOM_DEFAULT_BITS_PER_ROW)
+				.unwrap()
+				.get(),
+			COLUMN_STATS_BLOOM_DEFAULT_BITS_PER_ROW
+		);
+		assert!(BloomBitsPerRow::new(0).is_err());
+		assert_eq!(
+			HllPrecision::new(COLUMN_STATS_HLL_DEFAULT_PRECISION)
+				.unwrap()
+				.get(),
+			COLUMN_STATS_HLL_DEFAULT_PRECISION
+		);
+		assert!(HllPrecision::new(COLUMN_STATS_HLL_MAX_PRECISION + 1).is_err());
+		assert_eq!(
+			SmallSetValueCap::new(COLUMN_STATS_SMALL_SET_DEFAULT_MAX_DISTINCT_VALUES)
+				.unwrap()
+				.get(),
+			COLUMN_STATS_SMALL_SET_DEFAULT_MAX_DISTINCT_VALUES
+		);
+		assert!(SmallSetValueCap::new(0).is_err());
+		assert_eq!(
+			SmallSetByteCap::new(COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES)
+				.unwrap()
+				.get(),
+			COLUMN_STATS_SMALL_SET_DEFAULT_MAX_BYTES
+		);
+		assert!(SmallSetByteCap::new(COLUMN_STATS_SMALL_SET_MAX_BYTES + 1).is_err());
 	}
 
 	#[test]

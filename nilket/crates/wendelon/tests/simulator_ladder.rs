@@ -237,6 +237,7 @@ fn snapshot(epoch: u64, leader: Option<u32>, peers: &[(u32, &str)]) -> ClusterSt
 				address: (*address).to_string(),
 				tier_bits: tier_bits(),
 				role_bits: role_bits(),
+				capability_bits: 0,
 			})
 			.collect(),
 	}
@@ -1713,6 +1714,7 @@ async fn run_lazy_migration_pressure_scenario(
 				hlc(0, 0, 0),
 				Consistency::STALE,
 				hlc(0, 0, 0),
+				true,
 			)
 			.await
 			.map_err(|err| {

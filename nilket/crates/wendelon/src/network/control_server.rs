@@ -28,7 +28,8 @@ use crate::network::tls::{ActorPermission, ActorTrustDomain, authorize_actor};
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
-	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
+	TransportTierSet,
 };
 use crate::network::wire;
 use crate::schema::{
@@ -85,6 +86,8 @@ pub struct JoinClusterRequestWire {
 	pub advertise_address: String,
 	pub tier_bits: u8,
 	pub role_bits: u8,
+	#[serde(default)]
+	pub capability_bits: u8,
 	#[serde(default)]
 	pub protocol: ProtocolVersionWindow,
 }
@@ -1901,6 +1904,7 @@ impl WendelonControlServer {
 				address: caps.address.clone(),
 				tier_bits: caps.tiers.as_u8(),
 				role_bits: caps.roles.as_u8(),
+				capability_bits: caps.capabilities.as_u8(),
 			})
 			.collect();
 		peers.sort_by_key(|peer| peer.node_id);
@@ -2273,6 +2277,7 @@ impl WendelonControlServer {
 			address: req.advertise_address.clone(),
 			tiers: TransportTierSet::from_u8(req.tier_bits),
 			roles: NodeRoleSet::from_u8(req.role_bits),
+			capabilities: NodeCapabilitySet::from_u8(req.capability_bits),
 		};
 		let joining_node = BasicNode {
 			addr: req.advertise_address.clone(),
@@ -2507,6 +2512,7 @@ pub(crate) fn epoch_config_from_membership(epoch: &MembershipEpoch) -> EpochConf
 				address: caps.address.clone(),
 				tier_bits: caps.tiers.as_u8(),
 				role_bits: caps.roles.as_u8(),
+				capability_bits: caps.capabilities.as_u8(),
 			},
 		);
 	}
@@ -2525,6 +2531,7 @@ pub(crate) fn membership_from_epoch_config(config: &EpochConfig) -> MembershipEp
 				address: peer.address.clone(),
 				tiers: TransportTierSet::from_u8(peer.tier_bits),
 				roles: NodeRoleSet::from_u8(peer.role_bits),
+				capabilities: NodeCapabilitySet::from_u8(peer.capability_bits),
 			},
 		);
 	}
@@ -2772,6 +2779,7 @@ fn insert_epoch_peer(
 			roles: NodeRoleSet::empty()
 				.with(NodeRole::Data)
 				.with(NodeRole::Control),
+			capabilities: NodeCapabilitySet::empty(),
 		});
 	caps.address = address;
 	if let Some(override_bits) = overrides.get(&id).and_then(|o| o.tier_bits) {
@@ -2987,6 +2995,7 @@ mod tests {
 					roles: NodeRoleSet::empty()
 						.with(NodeRole::Data)
 						.with(NodeRole::Control),
+					capabilities: NodeCapabilitySet::empty(),
 				},
 			);
 		}
@@ -3097,6 +3106,9 @@ mod tests {
 				is_encrypted: true,
 				tenant_id: Some(tenant_id),
 				tenant_kek_id: Some(old_kek_id),
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
 			},
 		);
 		snapshot.tiered_slabs.insert(
@@ -3108,6 +3120,9 @@ mod tests {
 				is_encrypted: true,
 				tenant_id: None,
 				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
 			},
 		);
 

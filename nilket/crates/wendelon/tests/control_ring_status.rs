@@ -66,6 +66,7 @@ async fn wendelon_client_refreshes_topology_from_live_control_ring() {
 				.with(NodeRole::Data)
 				.with(NodeRole::Control)
 				.as_u8(),
+			capability_bits: 0,
 		}],
 	};
 

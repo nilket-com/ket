@@ -460,7 +460,8 @@ fn push_or_merge_segment(
 mod tests {
 	use super::*;
 	use crate::network::transport::{
-		MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTierSet,
+		MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
+		TransportTierSet,
 	};
 
 	fn n(id: u32) -> NodeId {
@@ -472,6 +473,7 @@ mod tests {
 			address: "127.0.0.1:0".into(),
 			tiers: TransportTierSet::empty(),
 			roles: NodeRoleSet::empty().with(NodeRole::Data),
+			capabilities: NodeCapabilitySet::empty(),
 		}
 	}
 
@@ -480,6 +482,7 @@ mod tests {
 			address: "127.0.0.1:0".into(),
 			tiers: TransportTierSet::empty(),
 			roles: NodeRoleSet::empty().with(NodeRole::Control),
+			capabilities: NodeCapabilitySet::empty(),
 		}
 	}
 

@@ -57,6 +57,55 @@ WPBC is a versioned physical expression format emitted by Toron for storage-loca
 11. **Targetability diagnostics belong on Toron expression nodes.**
     The `WendelonExact`/`WendelonApprox`/`ToronOnly`/`Rejected(reason_code)` label is carried per `toron-ir` expression node, not per whole query. Useful plans routinely split: a pushable filter leaf may sit under a Toron-only window, join, or final aggregate. Query-level labels would throw away that optimization space.
 
+## Capability negotiation contract
+
+[adopted 2026-04-25; resolves Deferred Decision #2]
+
+ADR 039's `SlabStatsPruning` was the first capability-negotiation
+consumer. This section pins the shape that every subsequent
+capability inherits.
+
+**Payload shape.** Capability negotiation currently uses a `u8`
+bitmask (`NodeCapabilitySet`). Bits do not renumber within this
+shape; new capabilities append. If the mask needs to grow beyond
+8 bits, the widening is handled by the ADR that introduces the
+first capability requiring it; if deployed state exists by then,
+that ADR must include the migration.
+
+**Per-capability-bit contract.** Each `NodeCapability` variant must
+declare four things, either inline at its definition site or in the
+ADR that introduces it:
+
+- **Advertise rule.** What `advertised_capabilities()` includes for
+  a node that supports the capability — typically unconditional once
+  the supporting code is built in, but a capability can be gated on
+  config or feature flags if its dependencies require.
+- **Dispatcher-check rule.** Every dispatch site that uses the
+  capability must verify the target peer advertises it before
+  dispatching the optional path. Absence is silent fall-through, not
+  a hard error.
+- **Fallback behavior.** What the dispatcher does when the bit is
+  missing on the chosen peer (typically: skip the optional path and
+  emit `wpbc_<capability>_skipped_no_capability_total`).
+- **Required tests.** Round-trip in the topology snapshot, plus a
+  mixed-version dispatcher test using the shared harness — peer A
+  advertises, peer B does not, dispatcher honors the asymmetry.
+
+**Naming.** Types and fields use "capability" per
+`plans/conventions/capability-vs-feature-naming.md`. Capability
+variants do not carry `V1` / `V2` suffixes per
+`plans/conventions/no-version-suffixes.md`. A literal version byte
+inside a wire envelope is fine; the Rust enum variant wrapping it
+does not also inherit the suffix.
+
+**Scope.** `NodeCapability` is intra-cluster only — it lives in the
+topology snapshot and gates server-to-server optional paths. The
+Toron-Wendelon query-session handshake from ADR 034 is a separate
+surface and is not modified by this contract; if Toron needs to
+learn about an intra-cluster capability, that projection is an
+explicit decision in the ADR introducing the capability, not an
+automatic consequence of advertising it.
+
 ## Rationale
 The main product bet is not "SQL but faster." The bet is a data stack where a serious programmable environment can lower rich analytical work into a distributed Arrow engine, while storage-local fragments execute at memory bandwidth beside the data.
 
@@ -81,7 +130,7 @@ The contract creates a compiler obligation on Toron: every candidate pushdown ne
 Bounded implementation-time decisions against this fixed contract. Each becomes its own ADR or implementation note when the first consumer forces the answer.
 
 1. **Exact reason-code set.** The final enum is selected during implementation so it matches the real validation failures without becoming a free-form error channel.
-2. **Capability payload shape.** The smallest useful handshake field is chosen when vectorized WPBC has its first capability-negotiation consumer: single `wpbc_version`, opcode bitset, Arrow type bitset, or a compact struct.
+2. **Capability payload shape.** *Resolved 2026-04-25* in §"Capability negotiation contract" above. Versioned `u8` bitmask (`NodeCapabilitySet`); growth path widens to `u16` when bit 9 is needed.
 3. **Approximate pushdown policy.** `WendelonApprox` exists for future vector and sketch work; its planner and user-visible semantics need a separate ADR before it affects execution.
 
 ## References

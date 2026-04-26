@@ -35,9 +35,12 @@ pub const SLAB_MAX_BYTES_HARD_CEILING: u64 = 1 << 35;
 pub const SLAB_ENCRYPTION_CHUNK_BYTES: usize = 64 * 1024;
 pub const SLAB_AEAD_TAG_BYTES: usize = 16;
 pub const SLAB_AAD_BYTES: usize = 48;
+pub const SLAB_STATS_AAD_BYTES: usize = 64;
 pub const SLAB_NONCE_BYTES: usize = 12;
 pub const SLAB_NONCE_VERSION: u32 = 0;
 pub const SLAB_ENVELOPE_FORMAT_VERSION: u32 = 1;
+pub const SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS: u32 = 2;
+pub const SLAB_STATS_FORMAT_VERSION_ADR039_V1: u16 = 1;
 pub const DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES: usize = 2048;
 pub const DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES: usize = 10_000;
 
@@ -55,6 +58,19 @@ const ADR_TIERED_SLAB_HMAC_OFFSET: usize = 192;
 const ADR_TIERED_SLAB_HMAC_BYTES: usize = 32;
 const ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES: usize = 32;
 const ADR_TIERED_SLAB_CHUNK_SIZE_BYTES: u32 = SLAB_ENCRYPTION_CHUNK_BYTES as u32;
+const ADR039_STATS_LOCATOR_OFFSET: usize = 224;
+const ADR039_STATS_LOCATOR_BYTES: usize = 32;
+const ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED: u16 = 1 << 0;
+const ADR039_STATS_FLAG_HAS_SMALL_SET: u16 = 1 << 1;
+const ADR039_STATS_FLAG_HAS_BLOOM: u16 = 1 << 2;
+const ADR039_STATS_FLAG_HAS_HLL: u16 = 1 << 3;
+const ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED: u16 = 1 << 4;
+const ADR039_STATS_FLAGS_RESERVED_MASK: u16 = !0x001F;
+const _: [(); ADR039_STATS_LOCATOR_OFFSET] =
+	[(); ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES];
+const _: [(); ADR_TIERED_SLAB_FOOTER_BYTES] =
+	[(); ADR039_STATS_LOCATOR_OFFSET + ADR039_STATS_LOCATOR_BYTES];
+const _: [(); ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES] = [(); ADR039_STATS_LOCATOR_BYTES];
 const SLAB_AAD_WIDE_FIELD_BYTES: usize = 16;
 const DEFAULT_TENANT_KEK_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_TENANT_KEK_ABSOLUTE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -927,6 +943,8 @@ pub struct EncryptedTieredSlab {
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
 	pub chunk_count: u32,
+	pub slab_format_version: u32,
+	pub stats_locator: Option<TieredStatsBlockLocator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -941,11 +959,13 @@ pub struct DecryptedTieredSlab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FooterSummary {
+	pub slab_format_version: u32,
 	pub tenant_id: TenantId,
 	pub slab_id: SlabId,
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
 	pub chunk_count: u32,
+	pub stats_locator: Option<TieredStatsBlockLocator>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -956,18 +976,122 @@ pub struct TieredOffsetIndexEntry {
 	pub flags: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TieredStatsBlockLocator {
+	pub stats_format_version: u16,
+	pub stats_flags: u16,
+	pub stats_block_len: u32,
+	pub stats_plaintext_len: u32,
+	pub stats_column_count: u32,
+	pub stats_block_hash128: [u8; 16],
+}
+
+impl TieredStatsBlockLocator {
+	pub fn has_small_set(self) -> bool {
+		self.stats_flags & ADR039_STATS_FLAG_HAS_SMALL_SET != 0
+	}
+
+	pub fn has_bloom(self) -> bool {
+		self.stats_flags & ADR039_STATS_FLAG_HAS_BLOOM != 0
+	}
+
+	pub fn has_hll(self) -> bool {
+		self.stats_flags & ADR039_STATS_FLAG_HAS_HLL != 0
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecryptedTieredStatsBlock {
+	pub plaintext: Vec<u8>,
+	pub locator: TieredStatsBlockLocator,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TieredColumnStatsBlock {
+	Encrypted {
+		ciphertext: Vec<u8>,
+		plaintext_len: u32,
+		column_count: u32,
+		flags: u16,
+	},
+	Plaintext {
+		plaintext: Vec<u8>,
+		schema_generation: u64,
+		column_count: u32,
+		flags: u16,
+	},
+}
+
+impl TieredColumnStatsBlock {
+	pub fn encrypted(
+		ciphertext: Vec<u8>,
+		plaintext_len: u32,
+		column_count: u32,
+		flags: u16,
+	) -> Self {
+		Self::Encrypted {
+			ciphertext,
+			plaintext_len,
+			column_count,
+			flags,
+		}
+	}
+
+	pub fn plaintext(
+		plaintext: Vec<u8>,
+		schema_generation: u64,
+		column_count: u32,
+		flags: u16,
+	) -> Self {
+		Self::Plaintext {
+			plaintext,
+			schema_generation,
+			column_count,
+			flags,
+		}
+	}
+
+	fn plaintext_len(&self) -> std::io::Result<u32> {
+		match self {
+			Self::Encrypted { plaintext_len, .. } => Ok(*plaintext_len),
+			Self::Plaintext { plaintext, .. } => u32::try_from(plaintext.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"ADR 039 stats block plaintext exceeds u32::MAX bytes",
+				)
+			}),
+		}
+	}
+
+	fn column_count(&self) -> u32 {
+		match self {
+			Self::Encrypted { column_count, .. } | Self::Plaintext { column_count, .. } => {
+				*column_count
+			}
+		}
+	}
+
+	fn flags(&self) -> u16 {
+		match self {
+			Self::Encrypted { flags, .. } | Self::Plaintext { flags, .. } => *flags,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TieredSlabObjectMetadata {
 	pub tenant_id: TenantId,
 	/// Transitional until the slab footer carries the full in-memory HLC.
 	pub created_hlc: u64,
 	pub offset_index: Vec<TieredOffsetIndexEntry>,
+	pub column_stats_block: Option<TieredColumnStatsBlock>,
 }
 
 pub struct TieredRangeReadPlan {
 	footer: FooterSummary,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	cipher_id: CipherId,
 	plaintext_len: usize,
 	chunk_range: Range<usize>,
@@ -1002,6 +1126,7 @@ impl TieredRangeReadPlan {
 			self.cipher_id,
 			self.tenant_id,
 			self.slab_id,
+			self.slab_format_version,
 			self.prepared_slab_dek.clone(),
 			self.plaintext_len,
 			ciphertext,
@@ -1028,6 +1153,69 @@ impl TieredRangeReadPlan {
 				)
 			})?;
 		Ok(decrypted[relative_start..relative_end].to_vec())
+	}
+}
+
+pub struct TieredStatsBlockReadPlan {
+	footer: FooterSummary,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	cipher_id: CipherId,
+	locator: TieredStatsBlockLocator,
+	stats_range_in_object: Range<u64>,
+	prepared_slab_dek: Arc<PreparedSlabDek>,
+}
+
+impl TieredStatsBlockReadPlan {
+	pub fn footer(&self) -> FooterSummary {
+		self.footer
+	}
+
+	pub fn locator(&self) -> TieredStatsBlockLocator {
+		self.locator
+	}
+
+	pub fn stats_range_in_object(&self) -> Range<u64> {
+		self.stats_range_in_object.clone()
+	}
+
+	pub fn decrypt(
+		&self,
+		ciphertext: &[u8],
+		schema_generation: u64,
+	) -> std::io::Result<DecryptedTieredStatsBlock> {
+		let start = Instant::now();
+		let result = (|| {
+			let expected_ciphertext_len =
+				(self.stats_range_in_object.end - self.stats_range_in_object.start) as usize;
+			if ciphertext.len() != expected_ciphertext_len {
+				return Err(Error::new(
+					ErrorKind::UnexpectedEof,
+					format!(
+						"tiered stats read expected {expected_ciphertext_len} ciphertext bytes, got {}",
+						ciphertext.len()
+					),
+				));
+			}
+			let plaintext = decrypt_stats_block(
+				self.prepared_slab_dek.as_ref(),
+				self.cipher_id,
+				self.tenant_id,
+				self.slab_id,
+				schema_generation,
+				self.locator,
+				ciphertext,
+			)?;
+			Ok(DecryptedTieredStatsBlock {
+				plaintext,
+				locator: self.locator,
+			})
+		})();
+		if result.is_err() {
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+		}
+		metrics().observe_wpbc_slab_stats_decrypt(start.elapsed());
+		result
 	}
 }
 
@@ -1247,15 +1435,24 @@ impl CryptoManager {
 		let (tenant_kek_id, tenant_kek) = self.get_active_tenant_kek(metadata.tenant_id)?;
 		let wrapped_slab_dek = SlabDek::fresh_for(slab_id)?.wrap(&tenant_kek)?;
 		let cipher_id = selected_cipher_id();
+		// ADR 039 forbids writer-side lazy CSB attachment: no stats means a
+		// v1 slab, while any v2 locator is sealed before the footer HMAC.
+		let slab_format_version = if metadata.column_stats_block.is_some() {
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
+		} else {
+			SLAB_ENVELOPE_FORMAT_VERSION
+		};
 		let chunk_count = chunk_count_for_len(plaintext.len())?;
 		let encrypted_chunks = encrypt_chunks(
 			cipher_id,
 			metadata.tenant_id,
+			slab_format_version,
 			wrapped_slab_dek,
 			chunk_count,
 			plaintext,
 		)?;
 		let header_bytes = encode_adr022_header(
+			slab_format_version,
 			slab_id,
 			metadata.tenant_id,
 			metadata.created_hlc,
@@ -1263,6 +1460,19 @@ impl CryptoManager {
 			chunk_count,
 		)?;
 		let index_bytes = encode_adr022_offset_index(&metadata.offset_index, plaintext.len())?;
+		let stats_ciphertext = metadata
+			.column_stats_block
+			.as_ref()
+			.map(|block| {
+				stats_ciphertext_for_block(
+					block,
+					encrypted_chunks.cache_key.as_ref(),
+					cipher_id,
+					metadata.tenant_id,
+					slab_id,
+				)
+			})
+			.transpose()?;
 		let record_count = u64::try_from(metadata.offset_index.len()).map_err(|_| {
 			Error::new(
 				ErrorKind::InvalidInput,
@@ -1270,6 +1480,7 @@ impl CryptoManager {
 			)
 		})?;
 		let mut footer = encode_adr022_footer(
+			slab_format_version,
 			slab_id,
 			metadata.tenant_id,
 			metadata.created_hlc,
@@ -1279,6 +1490,13 @@ impl CryptoManager {
 			tenant_kek_id,
 			&encrypted_chunks.wrapped_slab_dek,
 		)?;
+		let stats_locator = metadata
+			.column_stats_block
+			.as_ref()
+			.zip(stats_ciphertext.as_deref())
+			.map(|(block, ciphertext)| stats_locator_for_block(block, ciphertext))
+			.transpose()?;
+		encode_adr039_stats_locator(&mut footer, stats_locator);
 		let footer_len_u32 = ADR_TIERED_SLAB_FOOTER_BYTES as u32;
 		let index_len_u32 = u32::try_from(index_bytes.len()).map_err(|_| {
 			Error::new(
@@ -1303,6 +1521,7 @@ impl CryptoManager {
 			.len()
 			.checked_add(header_bytes.len())
 			.and_then(|n| n.checked_add(encrypted_chunks.ciphertext.len()))
+			.and_then(|n| n.checked_add(stats_ciphertext.as_ref().map(Vec::len).unwrap_or(0)))
 			.and_then(|n| n.checked_add(index_bytes.len()))
 			.and_then(|n| n.checked_add(footer.len()))
 			.and_then(|n| n.checked_add(ADR_TIERED_SLAB_TAIL_BYTES))
@@ -1311,6 +1530,9 @@ impl CryptoManager {
 		out.extend_from_slice(&ADR_TIERED_SLAB_MAGIC_HEAD);
 		out.extend_from_slice(&header_bytes);
 		out.extend_from_slice(&encrypted_chunks.ciphertext);
+		if let Some(stats_ciphertext) = stats_ciphertext.as_deref() {
+			out.extend_from_slice(stats_ciphertext);
+		}
 		out.extend_from_slice(&index_bytes);
 		out.extend_from_slice(&footer);
 		push_u32_be(&mut out, footer_len_u32);
@@ -1331,6 +1553,8 @@ impl CryptoManager {
 			tenant_kek_id,
 			cipher_id,
 			chunk_count,
+			slab_format_version,
+			stats_locator,
 		})
 	}
 
@@ -1402,6 +1626,7 @@ impl CryptoManager {
 			parsed.cipher_id,
 			parsed.tenant_id,
 			parsed.slab_id,
+			parsed.slab_format_version,
 			slab_dek,
 			parsed.chunk_count,
 			parsed.plaintext_len,
@@ -1421,6 +1646,65 @@ impl CryptoManager {
 			cipher_id: parsed.cipher_id,
 			chunk_count: parsed.chunk_count,
 		})
+	}
+
+	pub fn decrypt_tiered_stats_block(
+		&self,
+		expected_slab_id: SlabId,
+		blob: &[u8],
+		schema_generation: u64,
+	) -> std::io::Result<Option<DecryptedTieredStatsBlock>> {
+		let start = Instant::now();
+		let result = (|| {
+			let parsed = parse_encrypted_footer(blob)?;
+			if parsed.slab_id != expected_slab_id {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"tiered slab footer slab_id {} does not match expected {}",
+						parsed.slab_id, expected_slab_id
+					),
+				));
+			}
+			if parsed.nonce_version != SLAB_NONCE_VERSION {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"unsupported nonce version {} in tiered slab {}",
+						parsed.nonce_version, expected_slab_id
+					),
+				));
+			}
+			let Some(locator) = parsed.stats_locator else {
+				return Ok(None);
+			};
+			let tenant_kek = self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id)?;
+			verify_parsed_surface_hmac(&tenant_kek, &parsed)?;
+			let slab_dek = self.resolve_prepared_slab_dek(
+				parsed.tenant_id,
+				parsed.tenant_kek_id,
+				parsed.slab_id,
+				parsed.cipher_id,
+				&parsed.wrapped_slab_dek,
+			)?;
+			let plaintext = decrypt_stats_block(
+				slab_dek.as_ref(),
+				parsed.cipher_id,
+				parsed.tenant_id,
+				parsed.slab_id,
+				schema_generation,
+				locator,
+				parsed.stats_ciphertext,
+			)?;
+			Ok(Some(DecryptedTieredStatsBlock { plaintext, locator }))
+		})();
+		if result.is_err() {
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+		}
+		if !matches!(result, Ok(None)) {
+			metrics().observe_wpbc_slab_stats_decrypt(start.elapsed());
+		}
+		result
 	}
 
 	pub fn additional_tiered_metadata_range(
@@ -1460,6 +1744,99 @@ impl CryptoManager {
 			return Err(error);
 		}
 		Ok(parsed.missing_index_range())
+	}
+
+	pub fn plan_tiered_stats_block_read(
+		&self,
+		expected_slab_id: SlabId,
+		object_size_bytes: u64,
+		tail_window: &[u8],
+		additional_metadata: Option<&[u8]>,
+	) -> std::io::Result<Option<TieredStatsBlockReadPlan>> {
+		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
+			Ok(parsed) => parsed,
+			Err(error) => {
+				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				self.emit_decrypt_rejected(expected_slab_id, None, "footer_parse", &error);
+				return Err(error);
+			}
+		};
+		let footer = parsed.footer_summary();
+		if parsed.slab_id != expected_slab_id {
+			let error = Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"tiered slab footer slab_id {} does not match expected {}",
+					parsed.slab_id, expected_slab_id
+				),
+			);
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
+			return Err(error);
+		}
+		if parsed.nonce_version != SLAB_NONCE_VERSION {
+			let error = Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"unsupported nonce version {} in tiered slab {}",
+					parsed.nonce_version, expected_slab_id
+				),
+			);
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
+			return Err(error);
+		}
+		let Some(locator) = parsed.stats_locator else {
+			return Ok(None);
+		};
+		let Some(stats_range_in_object) = parsed.stats_ciphertext_range_in_object.clone() else {
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"ADR 039 stats locator present without object range",
+			));
+		};
+		let tenant_kek = match self.get_tenant_kek(parsed.tenant_id, parsed.tenant_kek_id) {
+			Ok(tenant_kek) => tenant_kek,
+			Err(error) => {
+				self.emit_decrypt_rejected(
+					expected_slab_id,
+					Some(footer),
+					"tenant_kek_lookup",
+					&error,
+				);
+				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				return Err(error);
+			}
+		};
+		if let Err(error) = verify_tail_surface_hmac(&tenant_kek, &parsed, additional_metadata) {
+			metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
+			return Err(error);
+		}
+		let prepared_slab_dek = match self.resolve_prepared_slab_dek(
+			parsed.tenant_id,
+			parsed.tenant_kek_id,
+			parsed.slab_id,
+			parsed.cipher_id,
+			&parsed.wrapped_slab_dek,
+		) {
+			Ok(prepared) => prepared,
+			Err(error) => {
+				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				self.emit_decrypt_rejected(expected_slab_id, Some(footer), "hmac", &error);
+				return Err(error);
+			}
+		};
+		Ok(Some(TieredStatsBlockReadPlan {
+			footer,
+			tenant_id: parsed.tenant_id,
+			slab_id: parsed.slab_id,
+			cipher_id: parsed.cipher_id,
+			locator,
+			stats_range_in_object,
+			prepared_slab_dek,
+		}))
 	}
 
 	pub fn plan_tiered_range_read(
@@ -1566,6 +1943,7 @@ impl CryptoManager {
 			footer,
 			tenant_id: parsed.tenant_id,
 			slab_id: parsed.slab_id,
+			slab_format_version: parsed.slab_format_version,
 			cipher_id: parsed.cipher_id,
 			plaintext_len: parsed.plaintext_len,
 			chunk_range,
@@ -1938,6 +2316,32 @@ fn encode_u64_aad_field(value: u64) -> [u8; SLAB_AAD_WIDE_FIELD_BYTES] {
 	out
 }
 
+fn encode_stats_nonce() -> [u8; SLAB_NONCE_BYTES] {
+	let mut nonce = [0_u8; SLAB_NONCE_BYTES];
+	nonce[..4].copy_from_slice(&SLAB_NONCE_VERSION.to_be_bytes());
+	nonce[4..].copy_from_slice(&u64::MAX.to_be_bytes());
+	nonce
+}
+
+fn encode_stats_aad(
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	cipher_id: CipherId,
+	schema_generation: u64,
+) -> [u8; SLAB_STATS_AAD_BYTES] {
+	let mut aad = [0_u8; SLAB_STATS_AAD_BYTES];
+	aad[..16].copy_from_slice(&encode_u64_aad_field(tenant_id.get()));
+	aad[16..32].copy_from_slice(&encode_u64_aad_field(slab_id.get()));
+	aad[32..36].copy_from_slice(&SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS.to_be_bytes());
+	aad[36..38].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+	aad[38] = cipher_id.to_wire();
+	aad[40..48].copy_from_slice(&schema_generation.to_be_bytes());
+	// Bytes 48..64 stay reserved-zero in V1. The locator hash is checked
+	// before decrypt and covered by the footer HMAC; feeding it into AAD would
+	// be circular for AEAD modes whose ciphertext depends on AAD.
+	aad
+}
+
 fn detect_cipher_once() -> CipherId {
 	#[cfg(feature = "fips")]
 	{
@@ -2069,11 +2473,111 @@ impl<'a> Extend<&'a u8> for ChunkSealBuffer<'_> {
 	}
 }
 
+fn encrypt_stats_block(
+	prepared: &PreparedSlabDek,
+	cipher_id: CipherId,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	schema_generation: u64,
+	plaintext: &[u8],
+) -> std::io::Result<Vec<u8>> {
+	seal_stats_block(
+		prepared,
+		cipher_id,
+		tenant_id,
+		slab_id,
+		schema_generation,
+		plaintext,
+	)
+}
+
+fn seal_stats_block(
+	prepared: &PreparedSlabDek,
+	cipher_id: CipherId,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	schema_generation: u64,
+	plaintext: &[u8],
+) -> std::io::Result<Vec<u8>> {
+	let mut out = vec![0_u8; plaintext.len() + SLAB_AEAD_TAG_BYTES];
+	let (body, tag) = out.split_at_mut(plaintext.len());
+	body.copy_from_slice(plaintext);
+	let mut in_out = ChunkSealBuffer::new(body, tag);
+	// The stats block uses the slab DEK and a reserved nonce-domain value.
+	// Slab chunk indices cannot reach u64::MAX under the hard slab size cap.
+	prepared
+		.aead()
+		.seal_in_place_append_tag(
+			Nonce::assume_unique_for_key(encode_stats_nonce()),
+			Aad::from(encode_stats_aad(
+				tenant_id,
+				slab_id,
+				cipher_id,
+				schema_generation,
+			)),
+			&mut in_out,
+		)
+		.map_err(|_| Error::other("ADR 039 stats block encrypt failed"))?;
+	debug_assert_eq!(in_out.suffix_len(), SLAB_AEAD_TAG_BYTES);
+	Ok(out)
+}
+
+fn decrypt_stats_block(
+	prepared: &PreparedSlabDek,
+	cipher_id: CipherId,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	schema_generation: u64,
+	locator: TieredStatsBlockLocator,
+	ciphertext: &[u8],
+) -> std::io::Result<Vec<u8>> {
+	if ciphertext.len() != locator.stats_block_len as usize {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats block length disagrees with locator",
+		));
+	}
+	if stats_ciphertext_hash128(ciphertext) != locator.stats_block_hash128 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats block hash disagrees with locator",
+		));
+	}
+	if ciphertext.len() < SLAB_AEAD_TAG_BYTES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats block shorter than AEAD tag",
+		));
+	}
+	let mut scratch = ciphertext.to_vec();
+	let opened = prepared
+		.aead()
+		.open_in_place(
+			Nonce::assume_unique_for_key(encode_stats_nonce()),
+			Aad::from(encode_stats_aad(
+				tenant_id,
+				slab_id,
+				cipher_id,
+				schema_generation,
+			)),
+			scratch.as_mut_slice(),
+		)
+		.map_err(|_| Error::new(ErrorKind::InvalidData, "ADR 039 stats block decrypt failed"))?;
+	if opened.len() != locator.stats_plaintext_len as usize {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats block plaintext length disagrees with locator",
+		));
+	}
+	Ok(opened.to_vec())
+}
+
 fn encrypt_chunk_range(
 	prepared: &PreparedSlabDek,
 	cipher_id: CipherId,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	plaintext: &[u8],
 	chunk_range: std::ops::Range<usize>,
 	out: &mut [u8],
@@ -2100,7 +2604,7 @@ fn encrypt_chunk_range(
 					tenant_id,
 					slab_id,
 					chunk_index as u64,
-					SLAB_ENVELOPE_FORMAT_VERSION,
+					slab_format_version,
 					cipher_id,
 				)),
 				&mut in_out,
@@ -2114,6 +2618,7 @@ fn encrypt_chunk_range(
 fn encrypt_chunks(
 	cipher_id: CipherId,
 	tenant_id: TenantId,
+	slab_format_version: u32,
 	dek: WrappedSlabDek,
 	chunk_count: u32,
 	plaintext: &[u8],
@@ -2140,6 +2645,7 @@ fn encrypt_chunks(
 			cipher_id,
 			tenant_id,
 			slab_id,
+			slab_format_version,
 			plaintext,
 			0..chunk_count,
 			out.as_mut_slice(),
@@ -2164,6 +2670,7 @@ fn encrypt_chunks(
 						cipher_id,
 						tenant_id,
 						slab_id,
+						slab_format_version,
 						plaintext,
 						range,
 						worker_out,
@@ -2191,6 +2698,7 @@ fn decrypt_chunk_range(
 	cipher_id: CipherId,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 	chunk_range: std::ops::Range<usize>,
@@ -2214,7 +2722,7 @@ fn decrypt_chunk_range(
 					tenant_id,
 					slab_id,
 					chunk_index as u64,
-					SLAB_ENVELOPE_FORMAT_VERSION,
+					slab_format_version,
 					cipher_id,
 				)),
 				&mut scratch[..encrypted_len],
@@ -2231,6 +2739,7 @@ fn decrypt_chunks(
 	cipher_id: CipherId,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	prepared: Arc<PreparedSlabDek>,
 	chunk_count: u32,
 	plaintext_len: usize,
@@ -2251,6 +2760,7 @@ fn decrypt_chunks(
 			cipher_id,
 			tenant_id,
 			slab_id,
+			slab_format_version,
 			plaintext_len,
 			ciphertext,
 			0..chunk_count,
@@ -2276,6 +2786,7 @@ fn decrypt_chunks(
 						cipher_id,
 						tenant_id,
 						slab_id,
+						slab_format_version,
 						plaintext_len,
 						ciphertext,
 						range,
@@ -2300,6 +2811,7 @@ fn decrypt_chunk_range_from_slice(
 	cipher_id: CipherId,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 	chunk_range: Range<usize>,
@@ -2324,7 +2836,7 @@ fn decrypt_chunk_range_from_slice(
 					tenant_id,
 					slab_id,
 					chunk_index as u64,
-					SLAB_ENVELOPE_FORMAT_VERSION,
+					slab_format_version,
 					cipher_id,
 				)),
 				&mut scratch[..encrypted_len],
@@ -2341,6 +2853,7 @@ fn decrypt_partial_chunks(
 	cipher_id: CipherId,
 	tenant_id: TenantId,
 	slab_id: SlabId,
+	slab_format_version: u32,
 	prepared: Arc<PreparedSlabDek>,
 	plaintext_len: usize,
 	ciphertext: &[u8],
@@ -2369,6 +2882,7 @@ fn decrypt_partial_chunks(
 		cipher_id,
 		tenant_id,
 		slab_id,
+		slab_format_version,
 		plaintext_len,
 		ciphertext,
 		chunk_range,
@@ -2561,11 +3075,13 @@ fn push_u64_be(buf: &mut Vec<u8>, value: u64) {
 }
 
 struct ParsedEncryptedFooterFields {
+	slab_format_version: u32,
 	slab_id: SlabId,
 	tenant_id: TenantId,
 	tenant_kek_id: TenantKekId,
 	cipher_id: CipherId,
 	chunk_count: u32,
+	stats_locator: Option<TieredStatsBlockLocator>,
 	plaintext_len: usize,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
@@ -2575,6 +3091,7 @@ struct ParsedEncryptedFooterFields {
 	footer_len_u32: u32,
 	index_len_u32: u32,
 	ciphertext_offset_in_object: u64,
+	stats_ciphertext_range_in_object: Option<Range<u64>>,
 	header_bytes_for_hmac: Vec<u8>,
 	index_from_tail: Option<Vec<u8>>,
 	missing_index_range_in_object: Option<Range<u64>>,
@@ -2583,11 +3100,13 @@ struct ParsedEncryptedFooterFields {
 }
 
 struct ParsedEncryptedFooter<'a> {
+	slab_format_version: u32,
 	slab_id: SlabId,
 	tenant_id: TenantId,
 	tenant_kek_id: TenantKekId,
 	cipher_id: CipherId,
 	chunk_count: u32,
+	stats_locator: Option<TieredStatsBlockLocator>,
 	plaintext_len: usize,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
@@ -2599,6 +3118,7 @@ struct ParsedEncryptedFooter<'a> {
 	header_bytes_for_hmac: &'a [u8],
 	index: &'a [u8],
 	ciphertext: &'a [u8],
+	stats_ciphertext: &'a [u8],
 	#[cfg(test)]
 	wrapped_slab_dek_range_in_blob: std::ops::Range<usize>,
 }
@@ -2611,11 +3131,13 @@ impl ParsedEncryptedFooterFields {
 
 	fn footer_summary(&self) -> FooterSummary {
 		FooterSummary {
+			slab_format_version: self.slab_format_version,
 			tenant_id: self.tenant_id,
 			slab_id: self.slab_id,
 			tenant_kek_id: self.tenant_kek_id,
 			cipher_id: self.cipher_id,
 			chunk_count: self.chunk_count,
+			stats_locator: self.stats_locator,
 		}
 	}
 
@@ -2661,11 +3183,13 @@ impl ParsedEncryptedFooterFields {
 impl ParsedEncryptedFooter<'_> {
 	fn footer_summary(&self) -> FooterSummary {
 		FooterSummary {
+			slab_format_version: self.slab_format_version,
 			tenant_id: self.tenant_id,
 			slab_id: self.slab_id,
 			tenant_kek_id: self.tenant_kek_id,
 			cipher_id: self.cipher_id,
 			chunk_count: self.chunk_count,
+			stats_locator: self.stats_locator,
 		}
 	}
 }
@@ -2733,7 +3257,174 @@ fn decode_adr022_u64_slot(src: &[u8], field: &str) -> std::io::Result<u64> {
 	Ok(u64::from_be_bytes(src[..8].try_into().expect("slice len")))
 }
 
+fn stats_ciphertext_for_block(
+	block: &TieredColumnStatsBlock,
+	prepared: &PreparedSlabDek,
+	cipher_id: CipherId,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+) -> std::io::Result<Vec<u8>> {
+	match block {
+		TieredColumnStatsBlock::Encrypted { ciphertext, .. } => Ok(ciphertext.clone()),
+		TieredColumnStatsBlock::Plaintext {
+			plaintext,
+			schema_generation,
+			..
+		} => encrypt_stats_block(
+			prepared,
+			cipher_id,
+			tenant_id,
+			slab_id,
+			*schema_generation,
+			plaintext,
+		),
+	}
+}
+
+fn stats_locator_for_block(
+	block: &TieredColumnStatsBlock,
+	ciphertext: &[u8],
+) -> std::io::Result<TieredStatsBlockLocator> {
+	let stats_block_len = u32::try_from(ciphertext.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"ADR 039 stats block ciphertext exceeds u32::MAX bytes",
+		)
+	})?;
+	if stats_block_len == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"ADR 039 stats block ciphertext must not be empty",
+		));
+	}
+	let stats_flags = block.flags()
+		| ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
+		| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED;
+	validate_stats_locator_flags(stats_flags)?;
+	let mut stats_block_hash128 = [0_u8; 16];
+	stats_block_hash128.copy_from_slice(&stats_ciphertext_hash128(ciphertext));
+	Ok(TieredStatsBlockLocator {
+		stats_format_version: SLAB_STATS_FORMAT_VERSION_ADR039_V1,
+		stats_flags,
+		stats_block_len,
+		stats_plaintext_len: block.plaintext_len()?,
+		stats_column_count: block.column_count(),
+		stats_block_hash128,
+	})
+}
+
+fn stats_ciphertext_hash128(ciphertext: &[u8]) -> [u8; 16] {
+	let mut hash = [0_u8; 16];
+	hash.copy_from_slice(&crate::hash::blake3::digest(ciphertext)[..16]);
+	hash
+}
+
+fn validate_stats_locator_flags(stats_flags: u16) -> std::io::Result<()> {
+	if stats_flags & ADR039_STATS_FLAGS_RESERVED_MASK != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats_flags reserved bits must be zero",
+		));
+	}
+	if stats_flags & ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats_flags must set present_and_encrypted",
+		));
+	}
+	if stats_flags & ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats_flags must set always_on_complete_for_supported",
+		));
+	}
+	Ok(())
+}
+
+fn encode_adr039_stats_locator(
+	footer: &mut [u8; ADR_TIERED_SLAB_FOOTER_BYTES],
+	locator: Option<TieredStatsBlockLocator>,
+) {
+	let suffix = &mut footer
+		[ADR039_STATS_LOCATOR_OFFSET..ADR039_STATS_LOCATOR_OFFSET + ADR039_STATS_LOCATOR_BYTES];
+	let Some(locator) = locator else {
+		suffix.fill(0);
+		return;
+	};
+	suffix[0..2].copy_from_slice(&locator.stats_format_version.to_be_bytes());
+	suffix[2..4].copy_from_slice(&locator.stats_flags.to_be_bytes());
+	suffix[4..8].copy_from_slice(&locator.stats_block_len.to_be_bytes());
+	suffix[8..12].copy_from_slice(&locator.stats_plaintext_len.to_be_bytes());
+	suffix[12..16].copy_from_slice(&locator.stats_column_count.to_be_bytes());
+	suffix[16..32].copy_from_slice(&locator.stats_block_hash128);
+}
+
+fn parse_adr039_stats_locator(
+	slab_format_version: u32,
+	suffix: &[u8],
+) -> std::io::Result<Option<TieredStatsBlockLocator>> {
+	if suffix.len() != ADR039_STATS_LOCATOR_BYTES {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 stats locator must be 32 bytes",
+		));
+	}
+	if slab_format_version == SLAB_ENVELOPE_FORMAT_VERSION {
+		if suffix.iter().any(|byte| *byte != 0) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"ADR 022 footer reserved suffix must be all zero",
+			));
+		}
+		return Ok(None);
+	}
+	if slab_format_version != SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("unsupported ADR slab format version {slab_format_version}"),
+		));
+	}
+	let stats_format_version = u16::from_be_bytes(suffix[0..2].try_into().expect("slice len"));
+	if stats_format_version == 0 {
+		if suffix.iter().any(|byte| *byte != 0) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"ADR 039 absent stats locator must be all zero",
+			));
+		}
+		return Ok(None);
+	}
+	if stats_format_version != SLAB_STATS_FORMAT_VERSION_ADR039_V1 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("unsupported ADR 039 stats format version {stats_format_version}"),
+		));
+	}
+	let stats_flags = u16::from_be_bytes(suffix[2..4].try_into().expect("slice len"));
+	validate_stats_locator_flags(stats_flags)?;
+	let stats_block_len = u32::from_be_bytes(suffix[4..8].try_into().expect("slice len"));
+	let stats_plaintext_len = u32::from_be_bytes(suffix[8..12].try_into().expect("slice len"));
+	let stats_column_count = u32::from_be_bytes(suffix[12..16].try_into().expect("slice len"));
+	if stats_block_len == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 039 present stats locator has zero stats_block_len",
+		));
+	}
+	let mut stats_block_hash128 = [0_u8; 16];
+	stats_block_hash128.copy_from_slice(&suffix[16..32]);
+	Ok(Some(TieredStatsBlockLocator {
+		stats_format_version,
+		stats_flags,
+		stats_block_len,
+		stats_plaintext_len,
+		stats_column_count,
+		stats_block_hash128,
+	}))
+}
+
 fn encode_adr022_header(
+	slab_format_version: u32,
 	slab_id: SlabId,
 	tenant_id: TenantId,
 	created_hlc: u64,
@@ -2741,7 +3432,7 @@ fn encode_adr022_header(
 	chunk_count: u32,
 ) -> std::io::Result<[u8; ADR_TIERED_SLAB_HEADER_BYTES]> {
 	let mut header = [0_u8; ADR_TIERED_SLAB_HEADER_BYTES];
-	header[..4].copy_from_slice(&SLAB_ENVELOPE_FORMAT_VERSION.to_be_bytes());
+	header[..4].copy_from_slice(&slab_format_version.to_be_bytes());
 	header[4] = cipher_id.to_wire();
 	encode_adr022_u64_slot(
 		&mut header[8..8 + ADR_TIERED_SLAB_WIDE_ID_BYTES],
@@ -2760,6 +3451,7 @@ fn encode_adr022_header(
 }
 
 fn encode_adr022_footer(
+	slab_format_version: u32,
 	slab_id: SlabId,
 	tenant_id: TenantId,
 	created_hlc: u64,
@@ -2780,7 +3472,7 @@ fn encode_adr022_footer(
 		));
 	}
 	let mut footer = [0_u8; ADR_TIERED_SLAB_FOOTER_BYTES];
-	footer[..4].copy_from_slice(&SLAB_ENVELOPE_FORMAT_VERSION.to_be_bytes());
+	footer[..4].copy_from_slice(&slab_format_version.to_be_bytes());
 	footer[4] = cipher_id.to_wire();
 	encode_adr022_u64_slot(&mut footer[8..24], slab_id.get())?;
 	encode_adr022_u64_slot(&mut footer[24..40], tenant_id.get())?;
@@ -2970,10 +3662,13 @@ fn parse_adr022_footer_fields(
 		));
 	}
 	let slab_format_version = u32::from_be_bytes(footer[..4].try_into().expect("slice len"));
-	if slab_format_version != SLAB_ENVELOPE_FORMAT_VERSION {
+	if !matches!(
+		slab_format_version,
+		SLAB_ENVELOPE_FORMAT_VERSION | SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
+	) {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("unsupported ADR 022 slab format version {slab_format_version}"),
+			format!("unsupported ADR slab format version {slab_format_version}"),
 		));
 	}
 	let cipher_id = CipherId::from_wire(footer[4])?;
@@ -3039,22 +3734,30 @@ fn parse_adr022_footer_fields(
 		.to_vec();
 	let footer_suffix_after_hmac =
 		footer[ADR_TIERED_SLAB_HMAC_OFFSET + ADR_TIERED_SLAB_HMAC_BYTES..].to_vec();
-	if footer_suffix_after_hmac.len() != ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES
-		|| footer_suffix_after_hmac.iter().any(|byte| *byte != 0)
-	{
+	if footer_suffix_after_hmac.len() != ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 022 footer reserved suffix must be all zero",
+			"ADR footer suffix must be 32 bytes",
 		));
 	}
-	let header_bytes_for_hmac =
-		encode_adr022_header(slab_id, tenant_id, created_hlc, cipher_id, chunk_count)?.to_vec();
+	let stats_locator = parse_adr039_stats_locator(slab_format_version, &footer_suffix_after_hmac)?;
+	let header_bytes_for_hmac = encode_adr022_header(
+		slab_format_version,
+		slab_id,
+		tenant_id,
+		created_hlc,
+		cipher_id,
+		chunk_count,
+	)?
+	.to_vec();
 	Ok(ParsedEncryptedFooterFields {
+		slab_format_version,
 		slab_id,
 		tenant_id,
 		tenant_kek_id,
 		cipher_id,
 		chunk_count,
+		stats_locator,
 		plaintext_len: 0,
 		nonce_version: SLAB_NONCE_VERSION,
 		wrapped_slab_dek,
@@ -3065,6 +3768,7 @@ fn parse_adr022_footer_fields(
 		index_len_u32,
 		ciphertext_offset_in_object: (ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			+ ADR_TIERED_SLAB_HEADER_BYTES) as u64,
+		stats_ciphertext_range_in_object: None,
 		header_bytes_for_hmac,
 		index_from_tail: None,
 		missing_index_range_in_object: None,
@@ -3088,29 +3792,38 @@ fn parse_adr022_encrypted_footer(blob: &[u8]) -> std::io::Result<ParsedEncrypted
 		.checked_sub(index_len_u32 as usize)
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "tiered slab index underflow"))?;
 	let ciphertext_start = ADR_TIERED_SLAB_MAGIC_HEAD.len() + ADR_TIERED_SLAB_HEADER_BYTES;
-	if index_start < ciphertext_start {
+	let footer = &blob[footer_start..tail_offset];
+	let fields = parse_adr022_footer_fields(footer, footer_len_u32, index_len_u32)?;
+	let stats_len = fields
+		.stats_locator
+		.map(|locator| locator.stats_block_len as usize)
+		.unwrap_or(0);
+	let stats_start = index_start
+		.checked_sub(stats_len)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 039 stats block underflow"))?;
+	if stats_start < ciphertext_start {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 022 tiered slab index overlaps ciphertext prefix",
+			"ADR tiered slab stats/index overlaps ciphertext prefix",
 		));
 	}
 	let header = &blob[ADR_TIERED_SLAB_MAGIC_HEAD.len()..ciphertext_start];
-	let footer = &blob[footer_start..tail_offset];
-	let fields = parse_adr022_footer_fields(footer, footer_len_u32, index_len_u32)?;
 	if header != fields.header_bytes_for_hmac.as_slice() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"ADR 022 slab header does not match footer metadata",
 		));
 	}
-	let ciphertext = &blob[ciphertext_start..index_start];
+	let ciphertext = &blob[ciphertext_start..stats_start];
 	let fields = fields.finalize_from_ciphertext_len(ciphertext.len())?;
 	Ok(ParsedEncryptedFooter {
+		slab_format_version: fields.slab_format_version,
 		slab_id: fields.slab_id,
 		tenant_id: fields.tenant_id,
 		tenant_kek_id: fields.tenant_kek_id,
 		cipher_id: fields.cipher_id,
 		chunk_count: fields.chunk_count,
+		stats_locator: fields.stats_locator,
 		plaintext_len: fields.plaintext_len,
 		nonce_version: fields.nonce_version,
 		wrapped_slab_dek: fields.wrapped_slab_dek,
@@ -3122,6 +3835,7 @@ fn parse_adr022_encrypted_footer(blob: &[u8]) -> std::io::Result<ParsedEncrypted
 		header_bytes_for_hmac: header,
 		index: &blob[index_start..footer_start],
 		ciphertext,
+		stats_ciphertext: &blob[stats_start..index_start],
 		#[cfg(test)]
 		wrapped_slab_dek_range_in_blob: (footer_start
 			+ fields.wrapped_slab_dek_range_in_footer.start)
@@ -3154,15 +3868,22 @@ fn parse_adr022_encrypted_footer_from_tail_window(
 	let index_start_in_object = footer_start_in_object
 		.checked_sub(u64::from(index_len_u32))
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 022 index underflow"))?;
+	let stats_block_len = fields
+		.stats_locator
+		.map(|locator| u64::from(locator.stats_block_len))
+		.unwrap_or(0);
+	let stats_start_in_object = index_start_in_object
+		.checked_sub(stats_block_len)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 039 stats block underflow"))?;
 	let ciphertext_offset_in_object =
 		(ADR_TIERED_SLAB_MAGIC_HEAD.len() + ADR_TIERED_SLAB_HEADER_BYTES) as u64;
-	if index_start_in_object < ciphertext_offset_in_object {
+	if stats_start_in_object < ciphertext_offset_in_object {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 022 tiered slab index overlaps ciphertext prefix",
+			"ADR tiered slab stats/index overlaps ciphertext prefix",
 		));
 	}
-	let ciphertext_len_u64 = index_start_in_object - ciphertext_offset_in_object;
+	let ciphertext_len_u64 = stats_start_in_object - ciphertext_offset_in_object;
 	let ciphertext_len = usize::try_from(ciphertext_len_u64).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidData,
@@ -3170,6 +3891,10 @@ fn parse_adr022_encrypted_footer_from_tail_window(
 		)
 	})?;
 	let mut fields = fields.finalize_from_ciphertext_len(ciphertext_len)?;
+	if fields.stats_locator.is_some() {
+		fields.stats_ciphertext_range_in_object =
+			Some(stats_start_in_object..index_start_in_object);
+	}
 	let tail_window_start_in_object = object_size_bytes.saturating_sub(tail_window.len() as u64);
 	if index_len_u32 == 0 {
 		fields.index_from_tail = Some(Vec::new());
@@ -4688,10 +5413,18 @@ mod tests {
 							.expect("test slab plaintext length must fit in u32"),
 						flags: 0,
 					}],
+					column_stats_block: None,
 				},
 				plaintext,
 			)
 			.unwrap()
+	}
+
+	fn footer_stats_locator_suffix(bytes: &[u8]) -> &[u8] {
+		let (footer_len, _, tail_offset) = parse_adr022_tail_anchor(bytes).unwrap();
+		let footer_start = tail_offset - footer_len as usize;
+		&bytes[footer_start + ADR039_STATS_LOCATOR_OFFSET
+			..footer_start + ADR039_STATS_LOCATOR_OFFSET + ADR039_STATS_LOCATOR_BYTES]
 	}
 
 	#[test]
@@ -4770,6 +5503,7 @@ mod tests {
 						byte_length: 5,
 						flags: 0,
 					}],
+					column_stats_block: None,
 				},
 				&plaintext,
 			)
@@ -4785,6 +5519,589 @@ mod tests {
 			err.to_string().contains("footer index"),
 			"unexpected error: {err}"
 		);
+	}
+
+	#[test]
+	fn adr039_stats_locator_roundtrips_without_entering_point_read_hmac_payload() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = b"stats-aware slab payload".to_vec();
+		let stats_ciphertext = b"opaque encrypted stats block".to_vec();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(42),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 12,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: plaintext.len().try_into().unwrap(),
+						flags: 0,
+					}],
+					column_stats_block: Some(TieredColumnStatsBlock::encrypted(
+						stats_ciphertext.clone(),
+						84,
+						2,
+						0,
+					)),
+				},
+				&plaintext,
+			)
+			.unwrap();
+
+		assert_eq!(
+			encrypted.slab_format_version,
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
+		);
+		let locator = encrypted.stats_locator.expect("stats locator");
+		assert_eq!(
+			locator.stats_format_version,
+			SLAB_STATS_FORMAT_VERSION_ADR039_V1
+		);
+		assert_eq!(
+			locator.stats_flags,
+			ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
+				| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED
+		);
+		assert_eq!(locator.stats_block_len, stats_ciphertext.len() as u32);
+		assert_eq!(locator.stats_plaintext_len, 84);
+		assert_eq!(locator.stats_column_count, 2);
+		let footer = crypto
+			.encrypted_footer_summary(&encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer");
+		assert_eq!(
+			footer.slab_format_version,
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
+		);
+		assert_eq!(footer.stats_locator, Some(locator));
+		assert_eq!(
+			crypto
+				.decrypt_tiered_slab(SlabId::new(42), &encrypted.bytes)
+				.unwrap()
+				.plaintext,
+			plaintext
+		);
+
+		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
+			+ ADR_TIERED_SLAB_HEADER_BYTES
+			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+		let mut stats_tampered = encrypted.bytes.clone();
+		stats_tampered[stats_start] ^= 0x80;
+		assert_eq!(
+			crypto
+				.decrypt_tiered_slab(SlabId::new(42), &stats_tampered)
+				.unwrap()
+				.plaintext,
+			plaintext,
+			"point reads must not authenticate or fetch stats bytes"
+		);
+
+		let tail_offset = encrypted.bytes.len() - ADR_TIERED_SLAB_TAIL_BYTES;
+		let footer_start = tail_offset - ADR_TIERED_SLAB_FOOTER_BYTES;
+		let mut locator_tampered = encrypted.bytes.clone();
+		locator_tampered[footer_start + 240] ^= 0x01;
+		let err = crypto
+			.decrypt_tiered_slab(SlabId::new(42), &locator_tampered)
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("footer HMAC failed"),
+			"locator bytes must be covered by footer HMAC: {err}"
+		);
+	}
+
+	#[test]
+	fn adr039_stats_locator_uses_footer_reserved_suffix_layout() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let no_stats =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(44), TenantId::ZERO, b"no stats");
+		assert_eq!(no_stats.slab_format_version, SLAB_ENVELOPE_FORMAT_VERSION);
+		assert!(
+			footer_stats_locator_suffix(&no_stats.bytes)
+				.iter()
+				.all(|byte| *byte == 0),
+			"ADR 022 v1 footer suffix must remain reserved-zero"
+		);
+		assert_eq!(
+			crypto
+				.encrypted_footer_summary(&no_stats.bytes)
+				.unwrap()
+				.expect("footer summary")
+				.stats_locator,
+			None
+		);
+
+		let stats_ciphertext = b"known stats ciphertext bytes".to_vec();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(45),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 14,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: 10,
+						flags: 0,
+					}],
+					column_stats_block: Some(TieredColumnStatsBlock::encrypted(
+						stats_ciphertext,
+						123,
+						3,
+						ADR039_STATS_FLAG_HAS_SMALL_SET | ADR039_STATS_FLAG_HAS_BLOOM,
+					)),
+				},
+				b"stats here",
+			)
+			.unwrap();
+		assert_eq!(
+			encrypted.slab_format_version,
+			SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS
+		);
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let suffix = footer_stats_locator_suffix(&encrypted.bytes);
+		assert_eq!(
+			u16::from_be_bytes(suffix[0..2].try_into().unwrap()),
+			SLAB_STATS_FORMAT_VERSION_ADR039_V1
+		);
+		assert_eq!(
+			u16::from_be_bytes(suffix[2..4].try_into().unwrap()),
+			locator.stats_flags
+		);
+		assert_eq!(
+			u32::from_be_bytes(suffix[4..8].try_into().unwrap()),
+			locator.stats_block_len
+		);
+		assert_eq!(
+			u32::from_be_bytes(suffix[8..12].try_into().unwrap()),
+			locator.stats_plaintext_len
+		);
+		assert_eq!(
+			u32::from_be_bytes(suffix[12..16].try_into().unwrap()),
+			locator.stats_column_count
+		);
+		assert_eq!(&suffix[16..32], locator.stats_block_hash128.as_slice());
+		assert_eq!(
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, suffix).unwrap(),
+			Some(locator)
+		);
+	}
+
+	#[test]
+	fn adr039_stats_locator_rejects_reserved_suffix_and_flag_violations() {
+		let valid_flags = ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
+			| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED;
+		let mut suffix = [0_u8; ADR039_STATS_LOCATOR_BYTES];
+		suffix[0..2].copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+		suffix[2..4].copy_from_slice(&valid_flags.to_be_bytes());
+		suffix[4..8].copy_from_slice(&1_u32.to_be_bytes());
+		assert!(
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &suffix)
+				.unwrap()
+				.is_some()
+		);
+
+		let err = parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION, &suffix).unwrap_err();
+		assert!(
+			err.to_string().contains("reserved suffix must be all zero"),
+			"v1 footer suffix must reject non-zero locator bytes: {err}"
+		);
+
+		let mut absent_dirty = [0_u8; ADR039_STATS_LOCATOR_BYTES];
+		absent_dirty[2] = 1;
+		let err =
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &absent_dirty)
+				.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("absent stats locator must be all zero"),
+			"format_version=0 locator must be wholly zero: {err}"
+		);
+
+		let mut unknown_format = suffix;
+		unknown_format[0..2].copy_from_slice(&2_u16.to_be_bytes());
+		let err =
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &unknown_format)
+				.unwrap_err();
+		assert!(
+			err.to_string().contains("unsupported ADR 039 stats format"),
+			"unknown stats locator format must reject: {err}"
+		);
+
+		let mut reserved_flag = suffix;
+		reserved_flag[2..4].copy_from_slice(&(valid_flags | (1 << 5)).to_be_bytes());
+		let err =
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &reserved_flag)
+				.unwrap_err();
+		assert!(
+			err.to_string().contains("reserved bits must be zero"),
+			"reserved stats_flags bits must reject: {err}"
+		);
+
+		let mut missing_present = suffix;
+		missing_present[2..4]
+			.copy_from_slice(&ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED.to_be_bytes());
+		let err =
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &missing_present)
+				.unwrap_err();
+		assert!(
+			err.to_string().contains("present_and_encrypted"),
+			"present_and_encrypted is mandatory in V1: {err}"
+		);
+
+		let mut missing_always_on = suffix;
+		missing_always_on[2..4]
+			.copy_from_slice(&ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED.to_be_bytes());
+		let err =
+			parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &missing_always_on)
+				.unwrap_err();
+		assert!(
+			err.to_string().contains("always_on_complete_for_supported"),
+			"always_on_complete_for_supported is mandatory in V1: {err}"
+		);
+
+		let mut zero_len = suffix;
+		zero_len[4..8].copy_from_slice(&0_u32.to_be_bytes());
+		let err = parse_adr039_stats_locator(SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS, &zero_len)
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("zero stats_block_len"),
+			"present locator must have a non-zero ciphertext length: {err}"
+		);
+	}
+
+	#[test]
+	fn adr039_no_stats_writer_emits_v1_and_stats_plan_returns_none() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(46);
+		let encrypted = encrypt_test_tiered_slab(&crypto, slab_id, TenantId::ZERO, b"no lazy csb");
+
+		assert_eq!(encrypted.slab_format_version, SLAB_ENVELOPE_FORMAT_VERSION);
+		assert_eq!(encrypted.stats_locator, None);
+		assert_eq!(
+			crypto
+				.encrypted_footer_summary(&encrypted.bytes)
+				.unwrap()
+				.expect("footer summary")
+				.stats_locator,
+			None
+		);
+		assert!(
+			crypto
+				.plan_tiered_stats_block_read(
+					slab_id,
+					encrypted.bytes.len() as u64,
+					&encrypted.bytes,
+					None,
+				)
+				.unwrap()
+				.is_none(),
+			"stats-required paths treat no-locator slabs as stats unavailable"
+		);
+		assert!(
+			parse_adr039_stats_locator(
+				SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS,
+				&[0_u8; ADR039_STATS_LOCATOR_BYTES],
+			)
+			.unwrap()
+			.is_none(),
+			"transitional v2 zero-locator slabs are also stats unavailable"
+		);
+	}
+
+	#[test]
+	fn adr039_lazy_stats_attachment_is_rejected_by_footer_hmac() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let slab_id = SlabId::new(47);
+		let encrypted = encrypt_test_tiered_slab(&crypto, slab_id, TenantId::ZERO, b"late stats");
+		let fake_stats = b"not actually sealed at slab finalization".to_vec();
+		let (footer_len, index_len, tail_offset) =
+			parse_adr022_tail_anchor(&encrypted.bytes).unwrap();
+		let footer_start = tail_offset - footer_len as usize;
+		let index_start = footer_start - index_len as usize;
+
+		let mut lazily_attached = Vec::with_capacity(encrypted.bytes.len() + fake_stats.len());
+		lazily_attached.extend_from_slice(&encrypted.bytes[..index_start]);
+		lazily_attached.extend_from_slice(&fake_stats);
+		lazily_attached.extend_from_slice(&encrypted.bytes[index_start..]);
+
+		let new_tail_offset = lazily_attached.len() - ADR_TIERED_SLAB_TAIL_BYTES;
+		let new_footer_start = new_tail_offset - footer_len as usize;
+		lazily_attached[new_footer_start..new_footer_start + 4]
+			.copy_from_slice(&SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS.to_be_bytes());
+		let locator_start = new_footer_start + ADR039_STATS_LOCATOR_OFFSET;
+		let valid_flags = ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED
+			| ADR039_STATS_FLAG_ALWAYS_ON_COMPLETE_FOR_SUPPORTED;
+		lazily_attached[locator_start..locator_start + 2]
+			.copy_from_slice(&SLAB_STATS_FORMAT_VERSION_ADR039_V1.to_be_bytes());
+		lazily_attached[locator_start + 2..locator_start + 4]
+			.copy_from_slice(&valid_flags.to_be_bytes());
+		lazily_attached[locator_start + 4..locator_start + 8]
+			.copy_from_slice(&(fake_stats.len() as u32).to_be_bytes());
+		lazily_attached[locator_start + 8..locator_start + 12]
+			.copy_from_slice(&17_u32.to_be_bytes());
+		lazily_attached[locator_start + 12..locator_start + 16]
+			.copy_from_slice(&1_u32.to_be_bytes());
+		lazily_attached[locator_start + 16..locator_start + 32]
+			.copy_from_slice(&stats_ciphertext_hash128(&fake_stats));
+
+		let err = match crypto.plan_tiered_stats_block_read(
+			slab_id,
+			lazily_attached.len() as u64,
+			&lazily_attached,
+			None,
+		) {
+			Ok(_) => panic!("late CSB attachment must not produce a stats read plan"),
+			Err(error) => error,
+		};
+		assert!(
+			err.to_string().contains("footer HMAC failed"),
+			"late CSB attachment must rebuild the slab footer and HMAC: {err}"
+		);
+	}
+
+	#[test]
+	fn adr039_stats_section_sits_between_chunks_and_offset_index() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = b"stats block physical layout payload".to_vec();
+		let stats_plaintext = b"variable length encrypted stats payload".to_vec();
+		let offset_index = vec![
+			TieredOffsetIndexEntry {
+				key_locator: IdentityPrefix::new([0x11; 16]),
+				byte_offset: 0,
+				byte_length: 12,
+				flags: 0,
+			},
+			TieredOffsetIndexEntry {
+				key_locator: IdentityPrefix::new([0x22; 16]),
+				byte_offset: 12,
+				byte_length: (plaintext.len() - 12).try_into().unwrap(),
+				flags: 0,
+			},
+		];
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(43),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 13,
+					offset_index: offset_index.clone(),
+					column_stats_block: Some(TieredColumnStatsBlock::plaintext(
+						stats_plaintext.clone(),
+						99,
+						1,
+						0,
+					)),
+				},
+				&plaintext,
+			)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let expected_index = encode_adr022_offset_index(&offset_index, plaintext.len()).unwrap();
+		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
+			+ ADR_TIERED_SLAB_HEADER_BYTES
+			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+		let stats_end = stats_start + locator.stats_block_len as usize;
+		let (footer_len, index_len, tail_offset) =
+			parse_adr022_tail_anchor(&encrypted.bytes).unwrap();
+		let footer_start = tail_offset - footer_len as usize;
+		let index_start = footer_start - index_len as usize;
+
+		assert_eq!(footer_len as usize, ADR_TIERED_SLAB_FOOTER_BYTES);
+		assert_eq!(index_len as usize, expected_index.len());
+		assert_eq!(stats_end, index_start);
+		assert_eq!(
+			&encrypted.bytes[index_start..footer_start],
+			expected_index.as_slice()
+		);
+		assert_eq!(
+			&encrypted.bytes[tail_offset + 8..],
+			ADR_TIERED_SLAB_MAGIC_TAIL.as_slice()
+		);
+		assert_eq!(
+			locator.stats_block_len,
+			stats_plaintext.len() as u32 + SLAB_AEAD_TAG_BYTES as u32
+		);
+		assert_eq!(
+			locator.stats_block_hash128,
+			stats_ciphertext_hash128(&encrypted.bytes[stats_start..stats_end])
+		);
+
+		let mut stats_tampered = encrypted.bytes.clone();
+		stats_tampered[stats_start] ^= 0x01;
+		let stats_err = crypto
+			.decrypt_tiered_stats_block(SlabId::new(43), &stats_tampered, 99)
+			.unwrap_err();
+		assert!(
+			stats_err
+				.to_string()
+				.contains("stats block hash disagrees with locator"),
+			"stats reads must reject mutated CSB bytes before AEAD open: {stats_err}"
+		);
+		assert_eq!(
+			crypto
+				.decrypt_tiered_slab(SlabId::new(43), &stats_tampered)
+				.unwrap()
+				.plaintext,
+			plaintext,
+			"point reads must not authenticate or fetch stats bytes"
+		);
+
+		let mut index_tampered = encrypted.bytes.clone();
+		index_tampered[index_start] ^= 0x01;
+		let index_err = crypto
+			.decrypt_tiered_slab(SlabId::new(43), &index_tampered)
+			.unwrap_err();
+		assert!(
+			index_err.to_string().contains("footer HMAC failed"),
+			"offset index bytes must stay in the point-read HMAC payload: {index_err}"
+		);
+	}
+
+	#[test]
+	fn adr039_plaintext_stats_block_is_encrypted_and_decryptable() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = b"stats-backed slab payload".to_vec();
+		let stats_plaintext = b"real column stats block bytes".to_vec();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(43),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 13,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: plaintext.len().try_into().unwrap(),
+						flags: 0,
+					}],
+					column_stats_block: Some(TieredColumnStatsBlock::plaintext(
+						stats_plaintext.clone(),
+						99,
+						1,
+						0,
+					)),
+				},
+				&plaintext,
+			)
+			.unwrap();
+
+		let locator = encrypted.stats_locator.expect("stats locator");
+		assert_eq!(locator.stats_plaintext_len, stats_plaintext.len() as u32);
+		assert_eq!(
+			locator.stats_block_len,
+			stats_plaintext.len() as u32 + SLAB_AEAD_TAG_BYTES as u32
+		);
+		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
+			+ ADR_TIERED_SLAB_HEADER_BYTES
+			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+		let stats_end = stats_start + locator.stats_block_len as usize;
+		assert_ne!(
+			&encrypted.bytes[stats_start..stats_start + stats_plaintext.len()],
+			stats_plaintext.as_slice()
+		);
+		assert_eq!(
+			locator.stats_block_hash128,
+			stats_ciphertext_hash128(&encrypted.bytes[stats_start..stats_end])
+		);
+
+		let decrypted = crypto
+			.decrypt_tiered_stats_block(SlabId::new(43), &encrypted.bytes, 99)
+			.unwrap()
+			.expect("stats block");
+		assert_eq!(decrypted.locator, locator);
+		assert_eq!(decrypted.plaintext, stats_plaintext);
+
+		let err = crypto
+			.decrypt_tiered_stats_block(SlabId::new(43), &encrypted.bytes, 100)
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("decrypt failed"),
+			"schema generation must bind stats AAD: {err}"
+		);
+	}
+
+	#[test]
+	fn adr039_arrow_csb_plaintext_roundtrips_through_stats_envelope() {
+		use crate::schema::table::{
+			LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
+			TableSchemaDescriptorV1,
+		};
+		use crate::storage::stats::{
+			build_always_on_column_stats_block, decode_column_stats_payload,
+			encode_signed_stat_value, parse_column_stats_block,
+		};
+		use arrow::array::{Array, Int64Array, LargeStringArray};
+		use arrow::datatypes::{DataType, Field, Schema};
+		use arrow::record_batch::RecordBatch;
+
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([3; 16]),
+			17,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(5), Some(-2), Some(8)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![Some("us"), None, Some("eu")]))
+					as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let csb = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
+		let parsed_before = parse_column_stats_block(&csb).unwrap();
+		assert_eq!(parsed_before.header.column_block_count, 2);
+		let payload = decode_column_stats_payload(&parsed_before.columns[0]).unwrap();
+		assert_eq!(payload.min, Some(encode_signed_stat_value(-2, 8).unwrap()));
+
+		let plaintext = b"payload covered by normal slab chunks".to_vec();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(44),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 14,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: plaintext.len().try_into().unwrap(),
+						flags: 0,
+					}],
+					column_stats_block: Some(TieredColumnStatsBlock::plaintext(
+						csb,
+						descriptor.schema_generation,
+						parsed_before.header.column_block_count,
+						0,
+					)),
+				},
+				&plaintext,
+			)
+			.unwrap();
+		let decrypted = crypto
+			.decrypt_tiered_stats_block(SlabId::new(44), &encrypted.bytes, 17)
+			.unwrap()
+			.expect("stats block");
+		let parsed_after = parse_column_stats_block(&decrypted.plaintext).unwrap();
+		assert_eq!(parsed_after, parsed_before);
 	}
 
 	#[test]

@@ -38,6 +38,7 @@ fn snapshot(node_id: u32, address: &str) -> ClusterStatusWire {
 			address: address.to_string(),
 			tier_bits,
 			role_bits,
+			capability_bits: 0,
 		}],
 	}
 }
@@ -196,6 +197,7 @@ async fn sdk_query_reads_retained_snapshot_as_of_hlc() {
 				consistency: ReadConsistency::STALE,
 				min_hlc: None,
 				as_of_hlc: Some(first.commit_hlc),
+				stats_pruning_enabled: true,
 			},
 		)
 		.await

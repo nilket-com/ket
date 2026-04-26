@@ -51,6 +51,7 @@ fn snapshot(epoch: u64, leader: Option<u32>, peers: &[(u32, &str)]) -> ClusterSt
 				address: (*address).to_string(),
 				tier_bits: tier_bits(),
 				role_bits: role_bits(),
+				capability_bits: 0,
 			})
 			.collect(),
 	}
@@ -142,6 +143,7 @@ async fn client_query_streams_multiple_batches_and_terminates() {
 			hlc(0, 0, 0),
 			Consistency::STALE,
 			hlc(0, 0, 0),
+			true,
 		)
 		.await
 		.unwrap();
@@ -193,6 +195,7 @@ async fn client_query_empty_result_terminates_cleanly() {
 			hlc(0, 0, 0),
 			Consistency::STALE,
 			hlc(0, 0, 0),
+			true,
 		)
 		.await
 		.unwrap();

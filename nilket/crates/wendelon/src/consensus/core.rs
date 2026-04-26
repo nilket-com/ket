@@ -50,6 +50,16 @@ pub struct TieredSlab {
 	/// authoritative value through replicated state.
 	#[serde(default)]
 	pub tenant_kek_id: Option<TenantKekId>,
+	/// ADR 039 advisory: stats format advertised by the slab footer
+	/// when known. The slab tail remains authoritative.
+	#[serde(default)]
+	pub stats_format_version: Option<u16>,
+	/// ADR 039 advisory: stats-block ciphertext length when known.
+	#[serde(default)]
+	pub stats_block_len: Option<u32>,
+	/// ADR 039 advisory: BLAKE3(stats ciphertext)[0..16] when known.
+	#[serde(default)]
+	pub stats_block_hash128: Option<[u8; 16]>,
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.
@@ -160,6 +170,8 @@ pub struct EpochPeer {
 	pub address: String,
 	pub tier_bits: u8,
 	pub role_bits: u8,
+	#[serde(default)]
+	pub capability_bits: u8,
 }
 
 /// Durable projection of a committed `ring(E)` membership snapshot.

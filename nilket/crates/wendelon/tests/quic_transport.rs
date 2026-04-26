@@ -22,8 +22,8 @@ use wendelon::network::pool::PooledBuf;
 use wendelon::network::ring::{RingRouter, RingState};
 use wendelon::network::server::{HrftService, RequestContext};
 use wendelon::network::{
-	ActorRole, BufPool, EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet,
-	PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
+	ActorRole, BufPool, EpochCapabilityResolver, MembershipEpoch, NodeCapabilitySet, NodeRole,
+	NodeRoleSet, PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
 	TcpTlsTransportProvider, TlsMaterial, TransportConnection, TransportProvider,
 	TransportProviderFactory, TransportTier, TransportTierSet, UnroutedService,
 	canonical_node_dns_name, canonical_server_name_resolver, endpoint_from_tls, read_frame,
@@ -100,6 +100,7 @@ fn snapshot(
 				address: (*address).to_string(),
 				tier_bits: tier_bits(),
 				role_bits: role_bits(),
+				capability_bits: 0,
 			})
 			.collect(),
 	}
@@ -767,6 +768,7 @@ async fn shared_factory_falls_back_to_tcp_tls_against_dual_stack_node() {
 			roles: NodeRoleSet::empty()
 				.with(NodeRole::Control)
 				.with(NodeRole::Data),
+			capabilities: NodeCapabilitySet::empty(),
 		},
 	);
 	let epoch = MembershipEpoch { epoch: 1, peers };

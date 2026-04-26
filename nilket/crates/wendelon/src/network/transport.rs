@@ -315,6 +315,59 @@ impl NodeRoleSet {
 }
 
 // ============================================================
+//  NODE FEATURES
+// ============================================================
+
+/// Optional node-level capabilities advertised through the
+/// cluster-status topology projection. These are not routing roles:
+/// they tell clients which optional paths a node may use when
+/// serving traffic it already accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum NodeCapability {
+	/// ADR 039 column-statistics pruning for table queries.
+	SlabStatsPruning = 0,
+}
+
+impl NodeCapability {
+	pub const ALL: [NodeCapability; 1] = [NodeCapability::SlabStatsPruning];
+
+	#[inline]
+	const fn bit(self) -> u8 {
+		1u8 << (self as u8)
+	}
+}
+
+/// Compact bitmask of optional node capabilities. The raw byte is
+/// preserved across topology snapshots so older clients can ignore
+/// unknown bits and newer clients can gate optional paths explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeCapabilitySet(u8);
+
+impl NodeCapabilitySet {
+	pub const fn empty() -> Self {
+		Self(0)
+	}
+
+	pub const fn from_u8(bits: u8) -> Self {
+		Self(bits)
+	}
+
+	pub const fn as_u8(self) -> u8 {
+		self.0
+	}
+
+	pub fn with(mut self, capability: NodeCapability) -> Self {
+		self.0 |= capability.bit();
+		self
+	}
+
+	pub fn contains(self, capability: NodeCapability) -> bool {
+		self.0 & capability.bit() != 0
+	}
+}
+
+// ============================================================
 //  MEMBERSHIP SNAPSHOT
 // ============================================================
 
@@ -339,6 +392,10 @@ pub struct PeerCapabilities {
 	/// Defaults to an empty set so a peer that elects not to
 	/// serve any role is addressable but unreachable for routing.
 	pub roles: NodeRoleSet,
+	/// Optional ADR-level capabilities the peer supports for traffic
+	/// it already accepts. Unknown bits are carried but ignored by
+	/// the current server-side routing layers.
+	pub capabilities: NodeCapabilitySet,
 }
 
 /// Projection of Raft `ring(E)` into the shape the transport
@@ -516,5 +573,13 @@ mod tests {
 			.with(TransportTier::RdmaRoceV2)
 			.with(TransportTier::TcpTls);
 		assert_eq!(TransportTierSet::from_u8(set.as_u8()), set);
+	}
+
+	#[test]
+	fn node_capability_bits_round_trip() {
+		let set = NodeCapabilitySet::empty().with(NodeCapability::SlabStatsPruning);
+		assert_eq!(set.as_u8(), 0b0000_0001);
+		assert!(set.contains(NodeCapability::SlabStatsPruning));
+		assert_eq!(NodeCapabilitySet::from_u8(set.as_u8()), set);
 	}
 }

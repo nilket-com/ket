@@ -42,10 +42,14 @@
 
 use crate::consensus::MigratedRangeTombstone;
 use crate::crypto::{
-	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredOffsetIndexEntry,
-	TieredSlabObjectMetadata,
+	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredColumnStatsBlock,
+	TieredOffsetIndexEntry, TieredSlabObjectMetadata,
 };
 use crate::metrics::global as metrics;
+use crate::schema::table::{
+	TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1, TableWriteRequestMeta,
+	validate_table_write_request_batch,
+};
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
 	TenantKekId,
@@ -59,15 +63,23 @@ use crate::storage::index::{
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
+use crate::storage::stats::{
+	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
+	build_column_stats_block_with_ciphertext_budget, locator_flags_for_parsed_column_stats_block,
+	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
+};
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, OpenFlags, write_file,
 };
+use arrow::compute::concat_batches;
+use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Error, ErrorKind};
+use std::io::{Cursor, Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -234,6 +246,14 @@ pub struct TieredSlabPointer {
 	/// Tenant KEK version referenced by the encrypted footer when known.
 	#[serde(default)]
 	pub tenant_kek_id: Option<TenantKekId>,
+	/// ADR 039 advisory fields copied from the footer locator when
+	/// known. The slab tail is still the source of truth.
+	#[serde(default)]
+	pub stats_format_version: Option<u16>,
+	#[serde(default)]
+	pub stats_block_len: Option<u32>,
+	#[serde(default)]
+	pub stats_block_hash128: Option<[u8; 16]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +353,36 @@ pub struct SlabManager {
 	/// deletes the old L2 object. The sweeper reconciles this set
 	/// against the committed SM view on the next pass.
 	retired_tiered_cleanup: DashMap<SlabId, TieredSlabPointer>,
+	/// Parsed ADR 039 CSBs keyed by slab, descriptor, and footer
+	/// locator identity. This avoids repeated L2 range reads and
+	/// AEAD decrypts for WFRM query bursts over the same cold slab.
+	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TieredStatsCacheKey {
+	slab_id: SlabId,
+	table_object_id: TableObjectId,
+	schema_generation: u64,
+	schema_fingerprint: [u8; 32],
+	stats_format_version: u16,
+	stats_block_len: u32,
+	stats_block_hash128: [u8; 16],
+}
+
+fn tiered_stats_cache_key(
+	pointer: &TieredSlabPointer,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Option<TieredStatsCacheKey> {
+	Some(TieredStatsCacheKey {
+		slab_id: pointer.slab_id,
+		table_object_id: descriptor.table_object_id,
+		schema_generation: descriptor.schema_generation,
+		schema_fingerprint: descriptor.schema_fingerprint,
+		stats_format_version: pointer.stats_format_version?,
+		stats_block_len: pointer.stats_block_len?,
+		stats_block_hash128: pointer.stats_block_hash128?,
+	})
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -756,6 +806,7 @@ impl SlabManager {
 			relocated_reads: DashMap::new(),
 			persistent_index,
 			retired_tiered_cleanup: DashMap::new(),
+			tiered_stats_cache: DashMap::new(),
 		};
 		manager.rebuild_persistent_index().await;
 		Ok(manager)
@@ -901,6 +952,24 @@ impl SlabManager {
 			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
 	}
 
+	pub fn encrypt_tiered_object_blob_with_table_stats(
+		&self,
+		slab_id: SlabId,
+		plaintext_blob: &[u8],
+		table_schemas: &TableSchemaCatalogV1,
+	) -> std::io::Result<EncryptedTieredSlab> {
+		let mut metadata = build_tiered_object_metadata(plaintext_blob, slab_id)?;
+		metadata.column_stats_block = self.build_tiered_column_stats_block(
+			plaintext_blob,
+			slab_id,
+			metadata.tenant_id,
+			table_schemas,
+		)?;
+		self.config
+			.crypto
+			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
+	}
+
 	/// Detect whether a tiered object already carries an encrypted
 	/// footer. Callers use this to distinguish legacy plaintext L2
 	/// objects from ciphertext ones during migration.
@@ -920,8 +989,216 @@ impl SlabManager {
 		decode_tiered_blob(self.config.crypto.as_ref(), pointer, blob)
 	}
 
+	#[allow(dead_code)]
+	pub(crate) async fn load_tiered_column_stats_block(
+		&self,
+		pointer: &TieredSlabPointer,
+		descriptor: &TableSchemaDescriptorV1,
+	) -> std::io::Result<Option<ParsedColumnStatsBlock>> {
+		metrics().wpbc_slab_stats_consulted_total.inc();
+		let Some(cache_key) = tiered_stats_cache_key(pointer, descriptor) else {
+			metrics().wpbc_slab_stats_missing_total.inc();
+			return Ok(None);
+		};
+		if let Some(entry) = self.tiered_stats_cache.get(&cache_key) {
+			metrics().wpbc_slab_stats_cache_hits_total.inc();
+			return Ok(Some(entry.value().clone()));
+		}
+		let Some(l2) = self.config.l2.as_ref() else {
+			metrics().wpbc_slab_stats_missing_total.inc();
+			return Ok(None);
+		};
+		metrics().wpbc_slab_stats_cache_misses_total.inc();
+		let metadata = l2.head(&pointer.l2_uri).await?;
+		let tail_start = metadata
+			.size_bytes
+			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
+		let tail_window = l2
+			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
+			.await?;
+		let additional_metadata_range = match self.config.crypto.additional_tiered_metadata_range(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+		) {
+			Ok(range) => range,
+			Err(error) => {
+				metrics().wpbc_slab_stats_decrypt_failed_total.inc();
+				return Err(error);
+			}
+		};
+		let additional_metadata = match additional_metadata_range {
+			Some(range) => Some(l2.get_range(&pointer.l2_uri, range).await?),
+			None => None,
+		};
+		let Some(plan) = self.config.crypto.plan_tiered_stats_block_read(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+			additional_metadata.as_deref(),
+		)?
+		else {
+			metrics().wpbc_slab_stats_missing_total.inc();
+			return Ok(None);
+		};
+		let locator = plan.locator();
+		if pointer.stats_format_version != Some(locator.stats_format_version)
+			|| pointer.stats_block_len != Some(locator.stats_block_len)
+			|| pointer.stats_block_hash128 != Some(locator.stats_block_hash128)
+		{
+			metrics().wpbc_slab_stats_pointer_drift_total.inc();
+			return Ok(None);
+		}
+		let stats_ciphertext = l2
+			.get_range(&pointer.l2_uri, plan.stats_range_in_object())
+			.await?;
+		let stats = plan.decrypt(stats_ciphertext.as_ref(), descriptor.schema_generation)?;
+		let parsed = parse_column_stats_block(&stats.plaintext)?;
+		if ColumnStatsDescriptorIdentity::from_header(&parsed.header)
+			!= ColumnStatsDescriptorIdentity::from_descriptor(descriptor)
+		{
+			metrics().wpbc_slab_stats_pointer_drift_total.inc();
+			return Ok(None);
+		}
+		self.tiered_stats_cache.insert(cache_key, parsed.clone());
+		Ok(Some(parsed))
+	}
+
 	pub(crate) fn active_tenant_kek_id(&self, tenant_id: TenantId) -> std::io::Result<TenantKekId> {
 		self.config.crypto.active_tenant_kek_id(tenant_id)
+	}
+
+	fn build_tiered_column_stats_block(
+		&self,
+		blob: &[u8],
+		slab_id: SlabId,
+		tenant_id: TenantId,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> std::io::Result<Option<TieredColumnStatsBlock>> {
+		let descriptors = table_schemas
+			.descriptors_for_tenant(tenant_id)
+			.into_iter()
+			.filter(|descriptor| descriptor.table_object_id != TableObjectId::DEFAULT_KV)
+			.collect::<Vec<_>>();
+		if descriptors.is_empty() {
+			return Ok(None);
+		}
+		let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+		let mut candidates: Option<Vec<TableSchemaDescriptorV1>> = None;
+		let mut saw_unmatched_row = false;
+		let mut row_batches = Vec::with_capacity(entries.len());
+
+		for (record_tenant_id, key_identity, location) in entries {
+			if record_tenant_id != tenant_id {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"ADR 039 typed-table stats build saw tenant {} in slab {} after metadata chose tenant {}",
+						record_tenant_id.get(),
+						slab_id,
+						tenant_id.get(),
+					),
+				));
+			}
+			let frame = extract_record_from_blob(blob, location)?;
+			let batch = match decode_record_batch(&frame) {
+				Ok(batch) if batch.num_rows() == 1 => batch,
+				_ => {
+					saw_unmatched_row = true;
+					continue;
+				}
+			};
+			let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
+			let had_candidates = candidates.is_some();
+			let matching = match candidates.take() {
+				Some(existing) => existing,
+				None => descriptors.clone(),
+			}
+			.into_iter()
+			.filter_map(|descriptor| {
+				match descriptor_matches_tiered_row(
+					&descriptor,
+					tenant_id,
+					key_identity,
+					routing_locality,
+					&batch,
+				) {
+					Ok(true) => Some(descriptor),
+					Ok(false) | Err(_) => None,
+				}
+			})
+			.collect::<Vec<_>>();
+			if matching.is_empty() {
+				if had_candidates {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"ADR 039 typed-table slab {slab_id} contains a row outside the matched table descriptor; stats are mandatory for typed-table v2 slabs"
+						),
+					));
+				}
+				saw_unmatched_row = true;
+				continue;
+			}
+			candidates = Some(matching);
+			row_batches.push(batch);
+		}
+
+		let Some(mut candidates) = candidates else {
+			return Ok(None);
+		};
+		if saw_unmatched_row {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 039 typed-table slab {slab_id} also contains rows that cannot be represented by the matched table descriptor; stats are mandatory for typed-table v2 slabs"
+				),
+			));
+		}
+		if candidates.len() != 1 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 039 typed-table slab {slab_id} matches {} table descriptors; cannot choose a mandatory CSB descriptor",
+					candidates.len()
+				),
+			));
+		}
+		if row_batches.is_empty() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 039 typed-table slab {slab_id} matched a descriptor but no row batches"
+				),
+			));
+		}
+		let descriptor = candidates.remove(0);
+		let schema = row_batches[0].schema();
+		let batch = concat_batches(&schema, &row_batches).map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 039 CSB row concat failed: {err}"),
+			)
+		})?;
+		let max_stats_ciphertext_bytes = max_column_stats_ciphertext_bytes_for_slab_payload(
+			usize::try_from(self.config.max_slab_bytes).unwrap_or(usize::MAX),
+		);
+		let plaintext = build_column_stats_block_with_ciphertext_budget(
+			&descriptor,
+			&batch,
+			crate::storage::stats::COLUMN_STATS_DEFAULT_PREFIX_BYTES,
+			max_stats_ciphertext_bytes,
+		)?;
+		let parsed = parse_column_stats_block(&plaintext)?;
+		if parsed.header.column_block_count == 0 {
+			return Ok(None);
+		}
+		Ok(Some(TieredColumnStatsBlock::plaintext(
+			plaintext,
+			descriptor.schema_generation,
+			parsed.header.column_block_count,
+			locator_flags_for_parsed_column_stats_block(&parsed),
+		)))
 	}
 
 	/// Export the authoritative local slab set as a backup image.
@@ -1109,6 +1386,13 @@ impl SlabManager {
 				self.relocated_reads.insert(*old_location, *new_location);
 			}
 		}
+		if old_pointer
+			.as_ref()
+			.map(|old| old != &pointer)
+			.unwrap_or(true)
+		{
+			self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
+		}
 		{
 			let mut state = self.state.lock().await;
 			let _old = state.sealed.remove(&pointer.slab_id);
@@ -1173,6 +1457,7 @@ impl SlabManager {
 		self.relocated_reads.retain(|old_location, new_location| {
 			old_location.slab_id != slab_id && new_location.slab_id != slab_id
 		});
+		self.clear_tiered_stats_cache_for_slab(slab_id);
 		let path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		Ok(true)
@@ -1911,6 +2196,11 @@ impl SlabManager {
 		})
 	}
 
+	fn clear_tiered_stats_cache_for_slab(&self, slab_id: SlabId) {
+		self.tiered_stats_cache
+			.retain(|key, _stats| key.slab_id != slab_id);
+	}
+
 	async fn tiered_pointers_snapshot(&self) -> Vec<TieredSlabPointer> {
 		let state = self.state.lock().await;
 		let mut tiered = state
@@ -2273,6 +2563,7 @@ impl SlabManager {
 		&self,
 		pointer: &TieredSlabPointer,
 		retention_floor: HybridTimestamp,
+		table_schemas: &TableSchemaCatalogV1,
 	) -> std::io::Result<Option<PreparedTieredRetentionRewrite>> {
 		let old_blob = self
 			.config
@@ -2355,8 +2646,11 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
-		let encrypted =
-			self.encrypt_tiered_object_blob(pointer.slab_id, rewritten_plaintext.as_ref())?;
+		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+			pointer.slab_id,
+			rewritten_plaintext.as_ref(),
+			table_schemas,
+		)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
@@ -2963,6 +3257,56 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 	Ok(blob[offset + header_size..end].to_vec())
 }
 
+fn decode_record_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
+	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
+	let batch = match reader.next() {
+		Some(Ok(batch)) => Ok(batch),
+		Some(Err(err)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("arrow stream read: {err}"),
+		)),
+		None => Err(Error::new(
+			ErrorKind::InvalidData,
+			"arrow stream contained no record batch",
+		)),
+	}?;
+	match reader.next() {
+		Some(Ok(_)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			"arrow stream contained multiple record batches",
+		)),
+		Some(Err(err)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("arrow stream read: {err}"),
+		)),
+		None => Ok(batch),
+	}
+}
+
+fn descriptor_matches_tiered_row(
+	descriptor: &TableSchemaDescriptorV1,
+	tenant_id: TenantId,
+	key_identity: Identity,
+	routing_locality: Locality,
+	batch: &RecordBatch,
+) -> std::io::Result<bool> {
+	if batch.num_rows() != 1 || batch.schema().as_ref() != &descriptor.arrow_schema()? {
+		return Ok(false);
+	}
+	let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	table_meta.tenant_id = tenant_id;
+	table_meta.table_object_id = descriptor.table_object_id;
+	table_meta.schema_generation = descriptor.schema_generation;
+	table_meta.row_count = 1;
+	let admission = match validate_table_write_request_batch(&table_meta, batch, descriptor) {
+		Ok(admission) => admission,
+		Err(_) => return Ok(false),
+	};
+	Ok(admission.key_identities.as_slice() == [key_identity]
+		&& admission.localities.as_slice() == [routing_locality])
+}
+
 fn build_tiered_object_metadata(
 	blob: &[u8],
 	slab_id: SlabId,
@@ -3001,6 +3345,7 @@ fn build_tiered_object_metadata(
 		tenant_id,
 		created_hlc: first_location.hlc.physical_ms,
 		offset_index,
+		column_stats_block: None,
 	})
 }
 
@@ -3162,8 +3507,21 @@ mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
 	use crate::schema::NodeId;
+	use crate::schema::table::{
+		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, PrimaryKeyDescriptorV1,
+		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
+		default_kv_table_descriptor_v1, encode_table_write_row_count,
+	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
+	use crate::storage::stats::{
+		ARROW_STATS_TAG_INT64, decode_column_stats_payload, encode_signed_stat_value,
+		parse_column_stats_block,
+	};
+	use arrow::array::{Array, Int64Array, LargeBinaryBuilder, LargeStringArray};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::ipc::writer::StreamWriter;
+	use arrow::record_batch::RecordBatch;
 
 	fn fresh_dir(tag: &str) -> std::path::PathBuf {
 		let dir = std::env::temp_dir().join(format!(
@@ -3197,6 +3555,16 @@ mod tests {
 		let crypto = Arc::new(CryptoManager::new_dev());
 		crypto.install_local_only_for_tests(tenant()).unwrap();
 		crypto
+	}
+
+	fn encode_test_batch(batch: &RecordBatch) -> Vec<u8> {
+		let mut buf = Vec::new();
+		{
+			let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
+			writer.write(batch).unwrap();
+			writer.finish().unwrap();
+		}
+		buf
 	}
 
 	async fn fresh_manager() -> Arc<SlabManager> {
@@ -3300,6 +3668,583 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn encrypt_tiered_object_blob_with_table_stats_builds_decryptable_csb() {
+		let mgr = fresh_manager().await;
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x39; 16]),
+			3,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(9), Some(1)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![Some("us"), Some("eu")])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_test_batch(&row_batch);
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		assert_eq!(locator.stats_column_count, 2);
+		assert!(locator.has_small_set());
+		let stats = mgr
+			.config
+			.crypto
+			.decrypt_tiered_stats_block(slab_id, &encrypted.bytes, descriptor.schema_generation)
+			.unwrap()
+			.expect("stats block");
+		let parsed = parse_column_stats_block(&stats.plaintext).unwrap();
+		assert_eq!(parsed.header.table_object_id, descriptor.table_object_id);
+		assert_eq!(
+			parsed.header.schema_generation,
+			descriptor.schema_generation
+		);
+		assert_eq!(parsed.header.row_count, 2);
+		assert_eq!(parsed.columns[0].arrow_type_tag, ARROW_STATS_TAG_INT64);
+		let id_stats = decode_column_stats_payload(&parsed.columns[0]).unwrap();
+		assert_eq!(id_stats.min, Some(encode_signed_stat_value(1, 8).unwrap()));
+		assert_eq!(id_stats.max, Some(encode_signed_stat_value(9, 8).unwrap()));
+		let region_stats = decode_column_stats_payload(&parsed.columns[1]).unwrap();
+		assert_eq!(
+			region_stats.small_set,
+			Some(vec![b"eu".to_vec(), b"us".to_vec()])
+		);
+	}
+
+	#[tokio::test]
+	async fn table_stats_ignore_default_kv_descriptor_for_legacy_slabs() {
+		let mgr = fresh_manager().await;
+		let descriptor = default_kv_table_descriptor_v1().unwrap();
+		let schema = descriptor.arrow_schema().unwrap();
+		let mut keys = LargeBinaryBuilder::new();
+		keys.append_value(b"legacy-key");
+		let mut values = LargeBinaryBuilder::new();
+		values.append_value(b"legacy-value");
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![Arc::new(keys.finish()), Arc::new(values.finish())],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let frame = encode_test_batch(&batch);
+		mgr.append(tenant(), admission.key_identities[0], hlc(12), &frame)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor).unwrap();
+
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+
+		assert!(
+			encrypted.stats_locator.is_none(),
+			"default KV descriptors must not opt legacy KV slabs into ADR 039 stats"
+		);
+	}
+
+	#[tokio::test]
+	async fn typed_table_stats_are_mandatory_when_any_row_matches_descriptor() {
+		let mgr = fresh_manager().await;
+		mgr.append(tenant(), id(0x44), hlc(9), b"legacy-row")
+			.await
+			.unwrap();
+
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x41; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(7)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![Some("us")])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let frame = encode_test_batch(&batch);
+		mgr.append_durable_with_locality(
+			tenant(),
+			admission.key_identities[0],
+			admission.localities[0],
+			hlc(10),
+			&frame,
+		)
+		.await
+		.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor).unwrap();
+
+		let err = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap_err();
+
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string().contains("stats are mandatory"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn stats_advisory_absence_skips_stats_fetch() {
+		let mgr = fresh_manager().await;
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x42; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id: SlabId::new(42),
+			l2_uri: "memory://stats-should-not-be-read".to_owned(),
+			payload_hash: [0xAB; 32],
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(TenantKekId::try_from(1).unwrap()),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+		};
+
+		let stats = mgr
+			.load_tiered_column_stats_block(&pointer, &descriptor)
+			.await
+			.unwrap();
+
+		assert!(stats.is_none());
+	}
+
+	#[tokio::test]
+	async fn stats_advisory_drift_fails_closed_to_unavailable() {
+		let l1_dir = fresh_dir("stats-drift-l1");
+		let l2_root = fresh_dir("stats-drift-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x43; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(1)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![Some("eu")])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let frame = encode_test_batch(&batch);
+		mgr.append_durable_with_locality(
+			tenant(),
+			admission.key_identities[0],
+			admission.localities[0],
+			hlc(10),
+			&frame,
+		)
+		.await
+		.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put(
+				&format!("stats-drift/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let mut drifted_hash = locator.stats_block_hash128;
+		drifted_hash[0] ^= 0xFF;
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(drifted_hash),
+		};
+		let drift_before = metrics().wpbc_slab_stats_pointer_drift_total.get();
+
+		let stats = mgr
+			.load_tiered_column_stats_block(&pointer, &descriptor)
+			.await
+			.unwrap();
+
+		assert!(stats.is_none());
+		assert!(
+			metrics().wpbc_slab_stats_pointer_drift_total.get() >= drift_before + 1,
+			"pointer drift metric should increment when advisories disagree with footer locator"
+		);
+	}
+
+	#[tokio::test]
+	async fn column_stats_plaintext_does_not_encode_slab_lineage() {
+		let mgr = fresh_manager().await;
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x40; 16]),
+			4,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![Some(2), Some(8)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![Some("eu"), Some("us")])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_test_batch(&row_batch);
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(20 + row as u64),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let alternate_slab_id = slab_id.saturating_add(0x1000);
+		let alternate_encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(alternate_slab_id, &raw, &catalog)
+			.unwrap();
+		assert_ne!(
+			encrypted
+				.stats_locator
+				.expect("stats locator")
+				.stats_block_hash128,
+			alternate_encrypted
+				.stats_locator
+				.expect("alternate stats locator")
+				.stats_block_hash128,
+			"CSB ciphertext is still slab-bound through ADR 039 AEAD metadata"
+		);
+
+		let stats = mgr
+			.config
+			.crypto
+			.decrypt_tiered_stats_block(slab_id, &encrypted.bytes, descriptor.schema_generation)
+			.unwrap()
+			.expect("stats block");
+		let alternate_stats = mgr
+			.config
+			.crypto
+			.decrypt_tiered_stats_block(
+				alternate_slab_id,
+				&alternate_encrypted.bytes,
+				descriptor.schema_generation,
+			)
+			.unwrap()
+			.expect("alternate stats block");
+		assert_eq!(
+			stats.plaintext, alternate_stats.plaintext,
+			"CSB plaintext is a function of output rows and descriptor only"
+		);
+		let parsed = parse_column_stats_block(&stats.plaintext).unwrap();
+		assert_eq!(parsed.header.table_object_id, descriptor.table_object_id);
+		assert_eq!(
+			parsed.header.schema_generation,
+			descriptor.schema_generation
+		);
+		assert_eq!(parsed.header.row_count, 2);
+		assert_eq!(parsed.header.column_block_count, 2);
+	}
+
+	#[tokio::test]
+	async fn tiered_retention_rewrite_recomputes_stats_from_survivors() {
+		let l1_dir = fresh_dir("retention-stats-l1");
+		let l2_root = fresh_dir("retention-stats-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x39; 16]),
+			3,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+
+		for (hlc_value, region) in [
+			(hlc(10), "aa-old"),
+			(hlc(20), "mm-anchor"),
+			(hlc(30), "zz-latest"),
+		] {
+			let batch = RecordBatch::try_new(
+				Arc::new(schema.clone()),
+				vec![
+					Arc::new(Int64Array::from(vec![Some(9)])) as Arc<dyn Array>,
+					Arc::new(LargeStringArray::from(vec![Some(region)])) as Arc<dyn Array>,
+				],
+			)
+			.unwrap();
+			let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+			meta.tenant_id = tenant();
+			meta.table_object_id = descriptor.table_object_id;
+			meta.schema_generation = descriptor.schema_generation;
+			meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+			let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+			let frame = encode_test_batch(&batch);
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[0],
+				admission.localities[0],
+				hlc_value,
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let old_stats = mgr
+			.config
+			.crypto
+			.decrypt_tiered_stats_block(slab_id, &old_encrypted.bytes, descriptor.schema_generation)
+			.unwrap()
+			.expect("old stats block");
+		let old_region = decode_column_stats_payload(
+			&parse_column_stats_block(&old_stats.plaintext)
+				.unwrap()
+				.columns[1],
+		)
+		.unwrap();
+		assert_eq!(old_region.min, Some(b"aa-old".to_vec()));
+		let old_footer = mgr
+			.encrypted_tiered_footer_summary(&old_encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer");
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_footer.tenant_kek_id),
+			stats_format_version: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_retention_rewrite(&old_pointer, hlc(25), &catalog)
+			.await
+			.unwrap()
+			.expect("retention rewrite");
+		let PreparedTieredRetentionRewrite::Rewrite {
+			encrypted_bytes,
+			pruned_versions,
+			..
+		} = prepared
+		else {
+			panic!("expected rewrite, not retire");
+		};
+		assert_eq!(pruned_versions, 1);
+		let rewritten_stats = mgr
+			.config
+			.crypto
+			.decrypt_tiered_stats_block(slab_id, &encrypted_bytes, descriptor.schema_generation)
+			.unwrap()
+			.expect("rewritten stats block");
+		let parsed = parse_column_stats_block(&rewritten_stats.plaintext).unwrap();
+		assert_eq!(parsed.header.row_count, 2);
+		let region_stats = decode_column_stats_payload(&parsed.columns[1]).unwrap();
+		assert_eq!(region_stats.min, Some(b"mm-anchor".to_vec()));
+		assert_eq!(region_stats.max, Some(b"zz-latest".to_vec()));
+		assert_eq!(
+			region_stats.small_set,
+			Some(vec![b"mm-anchor".to_vec(), b"zz-latest".to_vec()])
+		);
+	}
+
+	#[tokio::test]
 	async fn encrypt_tiered_object_blob_rejects_empty_plain_slab() {
 		let mgr = fresh_manager().await;
 		let err = mgr
@@ -3342,6 +4287,7 @@ mod tests {
 						byte_length: plaintext.len().try_into().unwrap(),
 						flags: 0,
 					}],
+					column_stats_block: None,
 				},
 				&plaintext,
 			)
@@ -3353,6 +4299,15 @@ mod tests {
 			is_encrypted: true,
 			tenant_id: Some(tenant()),
 			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
 		};
 
 		let err =
@@ -3744,6 +4699,15 @@ mod tests {
 				is_encrypted: true,
 				tenant_id: Some(tenant()),
 				tenant_kek_id: Some(encrypted.tenant_kek_id),
+				stats_format_version: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_format_version),
+				stats_block_len: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_len),
+				stats_block_hash128: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_hash128),
 			})
 			.await
 			.unwrap();

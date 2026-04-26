@@ -931,6 +931,15 @@ pub struct QueryRequestMeta {
 	pub as_of_hlc: HybridTimestamp, // 16 bytes
 }
 
+/// Query request `_pad[0]` bit: force ADR 039 slab-statistics
+/// pruning off for this query. The default zero bit means stats
+/// pruning may be used when the node advertises support.
+pub const QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING: u8 = 0b0000_0001;
+
+pub fn query_request_stats_pruning_enabled(meta: &QueryRequestMeta) -> bool {
+	meta._pad[0] & QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING == 0
+}
+
 // ============================================================
 //  QUERY RESPONSE METADATA — 56 bytes, fixed
 //
@@ -1379,7 +1388,7 @@ const _: () = assert!(std::mem::size_of::<SnapshotHeader>() == 80);
 
 #[cfg(test)]
 mod tests {
-	use super::NodeId;
+	use super::{MsgType, NodeId, QueryRequestMeta, QueryResponseMeta};
 
 	#[test]
 	fn node_id_wire_text_round_trips() {
@@ -1395,5 +1404,38 @@ mod tests {
 	fn node_id_parse_wire_rejects_invalid_text() {
 		assert!(NodeId::parse_wire("123").is_err());
 		assert!(NodeId::parse_wire("n-abc").is_err());
+	}
+
+	#[test]
+	fn query_wire_contract_has_no_stats_or_slab_surface() {
+		assert_eq!(MsgType::QUERY_REQ.0, 0x0B);
+		assert_eq!(MsgType::QUERY_RESP.0, 0x0C);
+		assert_eq!(std::mem::size_of::<QueryRequestMeta>(), 80);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, min_hlc), 0);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, expected_epoch), 16);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, tenant_id), 24);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, consistency), 32);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, _pad), 33);
+		assert_eq!(
+			std::mem::offset_of!(QueryRequestMeta, locality_range_start),
+			40
+		);
+		assert_eq!(
+			std::mem::offset_of!(QueryRequestMeta, locality_range_end),
+			48
+		);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, bytecode_len), 56);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, _pad2), 60);
+		assert_eq!(std::mem::offset_of!(QueryRequestMeta, as_of_hlc), 64);
+
+		assert_eq!(std::mem::size_of::<QueryResponseMeta>(), 56);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, status), 0);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, _pad1), 1);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, value_hlc), 8);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, epoch), 24);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, leader_hint), 32);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, rows), 40);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, arrow_len), 48);
+		assert_eq!(std::mem::offset_of!(QueryResponseMeta, _pad2), 52);
 	}
 }

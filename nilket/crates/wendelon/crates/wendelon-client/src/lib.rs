@@ -32,9 +32,10 @@ use wendelon::network::transport::{
 use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, FinalizationMarker, FrameHeader, HybridTimestamp, Identity, MsgType, NodeId,
-	ReadRequestMeta, ReadStatus, TableQueryRequestMeta, TableWriteRequestMeta, TenantId,
-	WriteRequestMeta, WriteStatus, encode_table_schema_descriptor_v1, encode_table_write_row_count,
-	read_key_schema, write_payload_schema,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus, TableQueryRequestMeta,
+	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
+	write_payload_schema,
 };
 
 pub use wendelon::client::{QueryLocalityRange, StreamingQueryResult};
@@ -128,6 +129,7 @@ pub struct QueryOptions {
 	pub consistency: ReadConsistency,
 	pub min_hlc: Option<HybridTimestamp>,
 	pub as_of_hlc: Option<HybridTimestamp>,
+	pub stats_pruning_enabled: bool,
 }
 
 impl Default for QueryOptions {
@@ -137,6 +139,7 @@ impl Default for QueryOptions {
 			consistency: ReadConsistency::LINEARIZABLE,
 			min_hlc: None,
 			as_of_hlc: None,
+			stats_pruning_enabled: true,
 		}
 	}
 }
@@ -146,6 +149,7 @@ pub struct TableQueryOptions {
 	pub consistency: ReadConsistency,
 	pub min_hlc: Option<HybridTimestamp>,
 	pub as_of_hlc: Option<HybridTimestamp>,
+	pub stats_pruning_enabled: bool,
 }
 
 impl Default for TableQueryOptions {
@@ -154,6 +158,7 @@ impl Default for TableQueryOptions {
 			consistency: ReadConsistency::LINEARIZABLE,
 			min_hlc: None,
 			as_of_hlc: None,
+			stats_pruning_enabled: true,
 		}
 	}
 }
@@ -680,6 +685,7 @@ impl Client {
 				options.min_hlc.unwrap_or_else(zero_hlc),
 				options.consistency,
 				options.as_of_hlc.unwrap_or_else(zero_hlc),
+				options.stats_pruning_enabled,
 			)
 			.await?)
 	}
@@ -716,6 +722,10 @@ impl Client {
 				"table query WPBC bytecode exceeds u32 length",
 			)
 		})?;
+		let mut pad = [0; 7];
+		if !options.stats_pruning_enabled {
+			pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
+		}
 		Ok(self
 			.inner
 			.table_query(TableQueryRequest {
@@ -726,7 +736,7 @@ impl Client {
 					table_object_id: descriptor.table_object_id,
 					schema_generation: descriptor.schema_generation,
 					consistency: options.consistency,
-					_pad: [0; 7],
+					_pad: pad,
 					bytecode_len,
 					_pad2: [0; 4],
 					as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
@@ -779,6 +789,7 @@ fn bootstrap_snapshot(bootstrap: &[BootstrapPeer]) -> ClusterStatusWire {
 				address: peer.address.clone(),
 				tier_bits,
 				role_bits,
+				capability_bits: 0,
 			})
 			.collect(),
 	}

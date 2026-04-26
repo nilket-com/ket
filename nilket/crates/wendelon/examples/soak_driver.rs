@@ -775,6 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 								consistency: parse_consistency(cfg.query_consistency).unwrap(),
 								min_hlc: None,
 								as_of_hlc: None,
+								stats_pruning_enabled: true,
 							},
 						)
 						.await;

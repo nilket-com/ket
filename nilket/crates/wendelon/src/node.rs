@@ -83,8 +83,8 @@ use crate::network::transfer_signing::{
 	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
 };
 use crate::network::transport::{
-	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportConnection,
-	TransportProvider, TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapability, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
+	TransportConnection, TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
@@ -1311,6 +1311,9 @@ impl WendelonNode {
 					is_encrypted: tier.is_encrypted,
 					tenant_id: tier.tenant_id,
 					tenant_kek_id: tier.tenant_kek_id,
+					stats_format_version: tier.stats_format_version,
+					stats_block_len: tier.stats_block_len,
+					stats_block_hash128: tier.stats_block_hash128,
 				},
 				recovered_log_index,
 			)
@@ -1568,6 +1571,7 @@ impl WendelonNode {
 						&cfg.advertise_address,
 						local_tiers,
 						advertised_roles(),
+						advertised_capabilities(),
 						cfg.protocol,
 						dial_provider.clone(),
 						pool.clone(),
@@ -2067,9 +2071,14 @@ fn seed_single_node_epoch(
 			address: address.to_string(),
 			tiers,
 			roles: advertised_roles(),
+			capabilities: advertised_capabilities(),
 		},
 	);
 	MembershipEpoch { epoch: 1, peers }
+}
+
+fn advertised_capabilities() -> NodeCapabilitySet {
+	NodeCapabilitySet::empty().with(NodeCapability::SlabStatsPruning)
 }
 
 fn transport_tiers_for_provider(provider_tier: TransportTier) -> TransportTierSet {
@@ -2323,6 +2332,7 @@ async fn request_join_via_seeds(
 	advertise_address: &str,
 	local_tiers: TransportTierSet,
 	local_roles: NodeRoleSet,
+	local_capabilities: NodeCapabilitySet,
 	local_protocol: ProtocolVersionWindow,
 	provider: Arc<dyn TransportProvider>,
 	pool: Arc<BufPool>,
@@ -2333,6 +2343,7 @@ async fn request_join_via_seeds(
 		advertise_address: advertise_address.to_string(),
 		tier_bits: local_tiers.as_u8(),
 		role_bits: local_roles.as_u8(),
+		capability_bits: local_capabilities.as_u8(),
 		protocol: local_protocol,
 	};
 	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2974,6 +2985,15 @@ mod tests {
 				is_encrypted: true,
 				tenant_id: Some(tenant_id),
 				tenant_kek_id: Some(encrypted.tenant_kek_id),
+				stats_format_version: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_format_version),
+				stats_block_len: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_len),
+				stats_block_hash128: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_hash128),
 			}))
 			.await
 			.unwrap();
@@ -3075,6 +3095,15 @@ mod tests {
 				is_encrypted: true,
 				tenant_id: Some(tenant_id),
 				tenant_kek_id: Some(encrypted.tenant_kek_id),
+				stats_format_version: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_format_version),
+				stats_block_len: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_len),
+				stats_block_hash128: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_hash128),
 			}))
 			.await
 			.unwrap();

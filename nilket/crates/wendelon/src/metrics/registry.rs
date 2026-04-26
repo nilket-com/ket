@@ -42,6 +42,11 @@ const WPBC_EXEC_BUCKETS_MICROS: &[u64] = &[
 const WPBC_LOCALITY_BUCKETS_MICROS: &[u64] = &[
 	10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
 ];
+const WPBC_SLAB_STATS_BUCKETS_MICROS: &[u64] = &[
+	10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000,
+];
+const WPBC_SLAB_STATS_BLOCK_BYTES_BUCKETS: &[u64] =
+	&[1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -604,6 +609,10 @@ impl Histogram {
 		state.bucket_counts[index] += 1;
 	}
 
+	pub fn observe_value(&self, value: u64) {
+		self.observe_micros(value);
+	}
+
 	pub fn observe_duration(&self, duration: Duration) {
 		self.observe_micros(duration_to_micros(duration));
 	}
@@ -672,6 +681,19 @@ pub struct MetricsRegistry {
 	wpbc_range_decomposition_overflow_total: Counter,
 	wpbc_locality_decomposition_micros: Histogram,
 	wpbc_locality_encode_micros: Histogram,
+	pub wpbc_slab_stats_consulted_total: Counter,
+	pub wpbc_slab_stats_pruned_total: Counter,
+	pub wpbc_slab_stats_missing_total: Counter,
+	pub wpbc_slab_stats_unsupported_total: Counter,
+	pub wpbc_slab_stats_predicate_unrepresentable_total: Counter,
+	pub wpbc_slab_stats_decrypt_failed_total: Counter,
+	pub wpbc_slab_stats_pointer_drift_total: Counter,
+	pub wpbc_slab_stats_cache_hits_total: Counter,
+	pub wpbc_slab_stats_cache_misses_total: Counter,
+	pub wpbc_slab_stats_skipped_no_capability_total: Counter,
+	wpbc_slab_stats_build_micros: Histogram,
+	wpbc_slab_stats_decrypt_micros: Histogram,
+	wpbc_slab_stats_block_bytes: Histogram,
 
 	pub group_commit_window_seconds: Histogram,
 	pub data_ring_durable_quorum_latency_seconds: Histogram,
@@ -776,6 +798,19 @@ impl Default for MetricsRegistry {
 			wpbc_range_decomposition_overflow_total: Counter::default(),
 			wpbc_locality_decomposition_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
 			wpbc_locality_encode_micros: Histogram::new(WPBC_LOCALITY_BUCKETS_MICROS),
+			wpbc_slab_stats_consulted_total: Counter::default(),
+			wpbc_slab_stats_pruned_total: Counter::default(),
+			wpbc_slab_stats_missing_total: Counter::default(),
+			wpbc_slab_stats_unsupported_total: Counter::default(),
+			wpbc_slab_stats_predicate_unrepresentable_total: Counter::default(),
+			wpbc_slab_stats_decrypt_failed_total: Counter::default(),
+			wpbc_slab_stats_pointer_drift_total: Counter::default(),
+			wpbc_slab_stats_cache_hits_total: Counter::default(),
+			wpbc_slab_stats_cache_misses_total: Counter::default(),
+			wpbc_slab_stats_skipped_no_capability_total: Counter::default(),
+			wpbc_slab_stats_build_micros: Histogram::new(WPBC_SLAB_STATS_BUCKETS_MICROS),
+			wpbc_slab_stats_decrypt_micros: Histogram::new(WPBC_SLAB_STATS_BUCKETS_MICROS),
+			wpbc_slab_stats_block_bytes: Histogram::new(WPBC_SLAB_STATS_BLOCK_BYTES_BUCKETS),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			data_ring_durable_quorum_latency_seconds: Histogram::new(
@@ -929,6 +964,19 @@ impl MetricsRegistry {
 
 	pub fn observe_wpbc_locality_encode(&self, duration: Duration) {
 		self.wpbc_locality_encode_micros.observe_duration(duration);
+	}
+
+	pub fn observe_wpbc_slab_stats_build(&self, duration: Duration) {
+		self.wpbc_slab_stats_build_micros.observe_duration(duration);
+	}
+
+	pub fn observe_wpbc_slab_stats_decrypt(&self, duration: Duration) {
+		self.wpbc_slab_stats_decrypt_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_wpbc_slab_stats_block_bytes(&self, bytes: u64) {
+		self.wpbc_slab_stats_block_bytes.observe_value(bytes);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1240,6 +1288,84 @@ impl MetricsRegistry {
 			"wendelon_wpbc_locality_encode_micros",
 			"Column-projection write-locality encoding duration in microseconds.",
 			&self.wpbc_locality_encode_micros.snapshot(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_consulted_total",
+			"Slab stats blocks consulted during scan planning.",
+			self.wpbc_slab_stats_consulted_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_pruned_total",
+			"Candidate slabs pruned by ADR 039 column statistics.",
+			self.wpbc_slab_stats_pruned_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_missing_total",
+			"Candidate slabs scanned because stats were unavailable.",
+			self.wpbc_slab_stats_missing_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_unsupported_total",
+			"Candidate slabs scanned because stats did not cover the predicate columns.",
+			self.wpbc_slab_stats_unsupported_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_predicate_unrepresentable_total",
+			"Candidate slabs scanned because the predicate shape was not stats-representable.",
+			self.wpbc_slab_stats_predicate_unrepresentable_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_decrypt_failed_total",
+			"Stats blocks whose AEAD authentication failed after footer validation.",
+			self.wpbc_slab_stats_decrypt_failed_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_pointer_drift_total",
+			"TieredSlab stats advisories that disagreed with the slab footer.",
+			self.wpbc_slab_stats_pointer_drift_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_cache_hits_total",
+			"Parsed slab-stats cache hits.",
+			self.wpbc_slab_stats_cache_hits_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_cache_misses_total",
+			"Parsed slab-stats cache misses.",
+			self.wpbc_slab_stats_cache_misses_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_wpbc_slab_stats_skipped_no_capability_total",
+			"Queries that disabled stats pruning because the chosen target peer does not advertise the SlabStatsPruning capability.",
+			self.wpbc_slab_stats_skipped_no_capability_total.get(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_wpbc_slab_stats_build_micros",
+			"Slab stats build duration in microseconds.",
+			&self.wpbc_slab_stats_build_micros.snapshot(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_wpbc_slab_stats_decrypt_micros",
+			"Stats block decrypt duration in microseconds.",
+			&self.wpbc_slab_stats_decrypt_micros.snapshot(),
+		);
+		render_histogram_raw(
+			&mut out,
+			"wendelon_wpbc_slab_stats_block_bytes",
+			"Stats block ciphertext size in bytes.",
+			&self.wpbc_slab_stats_block_bytes.snapshot(),
 		);
 		render_histogram(
 			&mut out,
@@ -1605,6 +1731,25 @@ fn render_histogram_micros(
 	let _ = writeln!(out, "{name}_count {}", snapshot.count);
 }
 
+fn render_histogram_raw(
+	out: &mut String,
+	name: &str,
+	help: &str,
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} histogram");
+	let mut cumulative = 0u64;
+	for (idx, bound) in snapshot.bounds_micros.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds_micros.len()];
+	let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+	let _ = writeln!(out, "{name}_sum {}", snapshot.sum_micros);
+	let _ = writeln!(out, "{name}_count {}", snapshot.count);
+}
+
 fn render_histogram_micros_series(
 	out: &mut String,
 	name: &str,
@@ -1738,6 +1883,21 @@ mod tests {
 		registry.observe_wpbc_range_decomposition_overflow();
 		registry.observe_wpbc_locality_decomposition(Duration::from_micros(80));
 		registry.observe_wpbc_locality_encode(Duration::from_micros(40));
+		registry.wpbc_slab_stats_consulted_total.add(3);
+		registry.wpbc_slab_stats_pruned_total.inc();
+		registry.wpbc_slab_stats_missing_total.inc();
+		registry.wpbc_slab_stats_unsupported_total.inc();
+		registry
+			.wpbc_slab_stats_predicate_unrepresentable_total
+			.inc();
+		registry.wpbc_slab_stats_decrypt_failed_total.inc();
+		registry.wpbc_slab_stats_pointer_drift_total.inc();
+		registry.wpbc_slab_stats_cache_hits_total.inc();
+		registry.wpbc_slab_stats_cache_misses_total.inc();
+		registry.wpbc_slab_stats_skipped_no_capability_total.inc();
+		registry.observe_wpbc_slab_stats_build(Duration::from_micros(70));
+		registry.observe_wpbc_slab_stats_decrypt(Duration::from_micros(30));
+		registry.observe_wpbc_slab_stats_block_bytes(16_384);
 
 		let rendered = registry.render_prometheus();
 		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
@@ -1766,6 +1926,19 @@ mod tests {
 		assert!(rendered.contains("wendelon_wpbc_locality_decomposition_micros_count 1"));
 		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_bucket{le=\"50\"} 1"));
 		assert!(rendered.contains("wendelon_wpbc_locality_encode_micros_count 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_consulted_total 3"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_pruned_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_missing_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_unsupported_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_predicate_unrepresentable_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_decrypt_failed_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_pointer_drift_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_cache_hits_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_cache_misses_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_skipped_no_capability_total 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_build_micros_bucket{le=\"100\"} 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_decrypt_micros_bucket{le=\"50\"} 1"));
+		assert!(rendered.contains("wendelon_wpbc_slab_stats_block_bytes_bucket{le=\"16384\"} 1"));
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")
 		);

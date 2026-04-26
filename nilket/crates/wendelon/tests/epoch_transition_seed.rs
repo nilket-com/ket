@@ -7,7 +7,8 @@ use wendelon::consensus::{AdvanceEpochRecord, EpochConfig, EpochPeer, WendelonRe
 use wendelon::network::control_server::{AdvanceEpochResponseWire, CONTROL_REASON_GRANTED};
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{
-	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
+	TransportTierSet,
 };
 use wendelon::network::wire;
 use wendelon::schema::{MsgType, NodeId};
@@ -36,6 +37,7 @@ fn epoch_two_members() -> MembershipEpoch {
 			address: "127.0.0.1:0".into(),
 			tiers: TransportTierSet::from_u8(tier_bits),
 			roles: NodeRoleSet::from_u8(role_bits),
+			capabilities: NodeCapabilitySet::empty(),
 		},
 	);
 	peers.insert(
@@ -47,6 +49,7 @@ fn epoch_two_members() -> MembershipEpoch {
 			address: "127.0.0.1:1".into(),
 			tiers: TransportTierSet::from_u8(tier_bits),
 			roles: NodeRoleSet::from_u8(role_bits),
+			capabilities: NodeCapabilitySet::empty(),
 		},
 	);
 	MembershipEpoch { epoch: 2, peers }
@@ -62,6 +65,7 @@ fn epoch_config(epoch: &MembershipEpoch) -> EpochConfig {
 				address: caps.address.clone(),
 				tier_bits: caps.tiers.as_u8(),
 				role_bits: caps.roles.as_u8(),
+				capability_bits: caps.capabilities.as_u8(),
 			},
 		);
 	}

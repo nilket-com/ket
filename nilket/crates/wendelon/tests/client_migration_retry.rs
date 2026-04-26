@@ -59,6 +59,7 @@ fn snapshot(epoch: u64, leader: Option<u32>, peers: &[(u32, &str)]) -> ClusterSt
 				address: (*address).to_string(),
 				tier_bits: tier_bits(),
 				role_bits: role_bits(),
+				capability_bits: 0,
 			})
 			.collect(),
 	}
@@ -389,6 +390,7 @@ async fn client_retries_query_after_migration_incomplete() {
 			hlc(0, 0, 0),
 			Consistency::STALE,
 			hlc(0, 0, 0),
+			true,
 		)
 		.await
 		.unwrap()
@@ -444,6 +446,7 @@ async fn client_reports_query_migration_incomplete_after_retry_budget() {
 			hlc(0, 0, 0),
 			Consistency::STALE,
 			hlc(0, 0, 0),
+			true,
 		)
 		.await
 		.unwrap_err();

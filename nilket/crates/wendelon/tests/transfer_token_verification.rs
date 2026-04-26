@@ -11,7 +11,8 @@ use wendelon::network::router::MsgRouterBuilder;
 use wendelon::network::server::HrftService;
 use wendelon::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use wendelon::network::transport::{
-	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
+	TransportTierSet,
 };
 use wendelon::network::wire;
 use wendelon::network::{
@@ -75,6 +76,7 @@ async fn build_transfer_fixture() -> (
 			address: "127.0.0.1:0".into(),
 			tiers,
 			roles,
+			capabilities: NodeCapabilitySet::empty(),
 		},
 	);
 	peers.insert(
@@ -83,6 +85,7 @@ async fn build_transfer_fixture() -> (
 			address: "127.0.0.1:1".into(),
 			tiers,
 			roles,
+			capabilities: NodeCapabilitySet::empty(),
 		},
 	);
 	let epoch = MembershipEpoch { epoch: 1, peers };

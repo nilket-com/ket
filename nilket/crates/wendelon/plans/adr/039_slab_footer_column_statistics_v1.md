@@ -103,16 +103,21 @@ wire RPC names slab IDs.
    - `row_count`: u64; identical for every column in the slab (slab
      property), but stored in the stats block header for reader
      convenience and redundancy with `slab_footer.record_count`.
-   - **Unsupported-column entries.** Columns whose type is not in the
-     §15 allowlist (currently floats, decimals, nested types) still
-     get a CSB entry with `stat_flags` bit `is_unsupported = 1`,
-     `null_count` and `non_null_count` from the Arrow validity bitmap
-     (cheap), and no min/max. Explicit "unsupported" is preferable
-     to omission: it tells the planner the writer knew about the
-     column and chose not to stat it (rather than the column being
-     absent from the descriptor at write time), and reserves the slot
-     for a future ADR that adds support without breaking the V1
-     layout.
+   - **Opaque-tagged entries.** Any column whose type does not have a
+     pinned canonical byte-comparable encoding under §15 — currently
+     `Float32`, `Float64`, `Decimal128`, `Decimal256`, and any nested
+     type (list/struct/map) — still gets a CSB entry, but with
+     `arrow_type_tag = 0x0E` (`OpaqueUnsupported`, see Appendix B).
+     The entry carries only `has_null_count = 1` and
+     `has_non_null_count = 1` from the Arrow validity bitmap (cheap);
+     no min/max, no bloom, no HLL, no small-set, no truncation flags.
+     An explicit opaque entry is preferable to omission: it tells the
+     planner the writer knew about the column and chose not to stat
+     it (rather than the column being absent from the descriptor at
+     write time). Opt-in stat policies (bloom/HLL/small-set) that
+     name an opaque-typed column still fail descriptor validation
+     with `WPBC_REJECT_STATS_UNSUPPORTED_TYPE`; only the always-on
+     null/non-null counts are produced.
 
 6. **Bloom filter (opt-in).** SipHash-1-3 with two seeds, k = 7 hash
    functions, default bit budget = `ceil(row_count × 9.6)` bits per
@@ -269,7 +274,7 @@ wire RPC names slab IDs.
     fixed    84 bytes header
 
     per column block (one per column entry; one entry per supported
-    column, plus one entry per unsupported column):
+    column, plus one entry per opaque-tagged column):
       column_ordinal         (u16, ordinal in the descriptor)
       arrow_type_tag         (u8, see Appendix B)
       stat_flags_hi          (u8, high byte of column-level flags;
@@ -290,10 +295,7 @@ wire RPC names slab IDs.
       bit  6  has_small_set
       bit  7  min_truncated             (Utf8/Binary only)
       bit  8  max_truncated             (Utf8/Binary only)
-      bit  9  is_unsupported            (column type not in §15
-                                         allowlist; only null/non-null
-                                         counts present for this entry)
-      bits 10..15  reserved, must be 0
+      bits 9..15  reserved, must be 0
     ```
 
     The `csb_magic` is forensic only — the AEAD tag is the integrity
@@ -332,9 +334,12 @@ wire RPC names slab IDs.
     pinned in §15. For `Utf8`/`LargeUtf8`/`Binary`/`LargeBinary`, the
     bytes are the prefix-truncated form; the truncation status is in
     `stat_flags` bits 7 (`min_truncated`) and 8 (`max_truncated`).
-    Unsupported-column entries (`stat_flags` bit 9 = 1) carry only
-    `null_count` and `non_null_count`; `has_min` and `has_max` are
-    forced to 0.
+    Opaque-tagged entries (`arrow_type_tag = 0x0E`) carry only
+    `null_count` and `non_null_count`; `stat_flags` must equal
+    exactly `has_null_count | has_non_null_count`. Any other flag
+    bit set on an opaque entry — `has_min`, `has_max`, `has_bloom`,
+    `has_hll`, `has_small_set`, or either truncation bit — is
+    malformed and the reader falls back to `STATS_UNAVAILABLE`.
 
 15. **Canonical byte-comparable encoding for stat values.** Min/max
     values, small-set entries, and bloom-filter hash inputs share one
@@ -361,20 +366,21 @@ wire RPC names slab IDs.
                                   encoded as min/max
     ```
 
-    **Float and decimal types are not supported in V1.** Their Arrow
-    type tag values stay reserved in Appendix B but are rejected at
-    descriptor-validation time and at write time; columns of those
-    types receive `is_unsupported = 1` entries (decision §5) carrying
-    only `null_count` / `non_null_count`. Pinning their canonical
-    encodings — NaN handling, signed-zero bias, subnormals, decimal
-    scale normalization — requires semantic decisions that compose
-    with WPBC's float comparison rules and deserve their own follow-up
-    ADR with a dedicated test corpus. Shipping a placeholder encoding
-    now would create a forward-compatibility landmine the moment the
-    follow-up ADR needs to differ.
+    **Float, decimal, and nested types do not have canonical
+    byte-comparable encodings here.** `Float32`, `Float64`,
+    `Decimal128`, `Decimal256`, and any nested type (list/struct/map)
+    receive opaque-tagged CSB entries per §5, carrying only
+    null/non-null counts. Pinning their canonical encodings (NaN
+    handling, signed-zero bias, subnormals, decimal scale
+    normalization, nested-element ordering) requires semantic
+    decisions that compose with WPBC's comparison rules and a
+    dedicated test corpus. Until those encodings are pinned, the
+    opaque-tag path lets the writer be honest with the planner — the
+    column is known, it just isn't statable — without inventing a
+    placeholder encoding that would have to be unwound later.
 
 16. **Per-slab CSB byte budget.** Total CSB ciphertext size is capped
-    at `min(256 KiB, slab_payload_bytes / 256)`. Scales with slab
+    at `slab_payload_bytes / 256`. Scales with slab
     size: a 64 MiB slab gets 256 KiB cap; a 1 GiB slab gets 4 MiB cap;
     a 32 MiB slab gets 128 KiB cap. The descriptor validator estimates
     worst-case CSB size at the descriptor's declared row capacity and
@@ -386,7 +392,7 @@ wire RPC names slab IDs.
     Operator-facing initial caps that fall out of these rules:
 
     ```
-    max_stats_block_ciphertext_bytes_per_slab = min(256 KiB, slab_payload_bytes / 256)
+    max_stats_block_ciphertext_bytes_per_slab = slab_payload_bytes / 256
     max_small_set_values_per_column           = 4096
     max_small_set_bytes_per_column            = 32 KiB
     default_bloom_false_positive_target       = 1%
@@ -439,8 +445,9 @@ wire RPC names slab IDs.
     chunk-stream decryption and WPBC dispatch. Toron issues the same
     query plan it issues today; the prune happens invisibly.
 
-21. **ADR 036 extends with a single capability bit and explain
-    counters, not a new wire surface.** Toron-visible additions:
+21. **ADR 036 extends with a single capability bit and stats-pruning
+    diagnostics, not a new query-response surface.** Toron-visible
+    additions:
 
     - **Capability bit `slab_stats_pruning_v1`** advertised by
       Wendelon nodes that have ADR 039 stats support compiled in and
@@ -448,14 +455,15 @@ wire RPC names slab IDs.
     - **Optional per-query session flag** "stats pruning may be used"
       — defaults on when the capability bit is present; can be forced
       off by Toron for diagnostic / repro runs.
-    - **Stable explain counters** in the query response:
+    - **Stable stats-pruning counters** emitted as process metrics
+      and carried in Wendelon's internal query-plan diagnostics:
       `candidate_slabs_before_stats`, `slabs_pruned_by_stats`,
       `slabs_scanned_stats_missing`, `slabs_scanned_stats_unsupported`,
       `slabs_scanned_predicate_unrepresentable`, `stats_cache_hits`,
       `stats_cache_misses`, `stats_decrypt_failed_total`.
 
     No predicate-level prune reasons cross the boundary as free-form
-    strings; Toron sees aggregate counts only.
+    strings; ADR 039 does not add fields to `QueryResponseMeta`.
 
 22. **Stats are planner-level, not WPBC opcodes.** ADR 035's WPBC
     executor stays bytecode-pure. Stats consultation precedes
@@ -577,24 +585,28 @@ struct ColumnStatsPolicyV1 {
 
 struct ColumnBloomSpecV1 {
     column_name: String,
-    bits_per_row: u8,                   // 1..=32, default 10 (≈ 1% FP)
+    bits_per_row: BloomBitsPerRow,      // 1..=32, default 10 (≈ 1% FP)
 }
 
 struct ColumnHllSpecV1 {
     column_name: String,
-    precision: u8,                      // 10..=14, default 12 (~1.5% std error)
+    precision: HllPrecision,            // 10..=14, default 12 (~1.5% std error)
 }
 
 struct ColumnSmallSetSpecV1 {
     column_name: String,
-    max_distinct_values: u32,           // 1..=4096, default 4096
-    max_bytes: u32,                     // 1..=32_768, default 32_768 (32 KiB)
+    max_distinct_values: SmallSetValueCap, // 1..=4096, default 4096
+    max_bytes: SmallSetByteCap,         // 1..=32_768, default 32_768 (32 KiB)
 }
 ```
 
 Embedded in `TableSchemaDescriptorV1` as a new `stats_policy:
 ColumnStatsPolicyV1` field. Always-on stats are not represented in
 the policy because they are not optional.
+
+The stat-policy scalar fields are transparent serde newtypes, not raw
+integers, so normal Rust construction goes through range-checked unit
+constructors while the serialized descriptor remains primitive-sized.
 
 Validation invariants:
 
@@ -603,18 +615,17 @@ Validation invariants:
   one `ColumnHllSpecV1`, and at most one `ColumnSmallSetSpecV1` (no
   duplicates within a stat kind; a column may appear across kinds).
 - Bloom filters, HLL, and small-sets all reject columns of types not
-  in §15's V1 allowlist — i.e., `Float32`/`Float64`,
+  in §15's allowlist — i.e., `Float32`/`Float64`,
   `Decimal128`/`Decimal256`, and any nested type (list/struct/map).
-  Those columns may carry only `is_unsupported` always-on entries;
-  opt-in stat policies that name them fail descriptor validation
-  with `WPBC_REJECT_STATS_UNSUPPORTED_TYPE`.
+  Such columns may exist in the schema but carry only opaque-tagged
+  always-on entries (§5); opt-in stat policies that name them fail
+  descriptor validation with `WPBC_REJECT_STATS_UNSUPPORTED_TYPE`.
 - HLL additionally rejects columns whose canonical-encoded values
   exceed 64 bytes (very long strings → cap at 64-byte prefix hash
   for HLL input).
 - Total estimated per-slab CSB ciphertext size at the descriptor's
-  declared row capacity must not exceed
-  `min(256 KiB, slab_payload_bytes / 256)` — scales with slab size,
-  bounded above to keep tail-fetch behavior predictable.
+  declared row capacity must not exceed `slab_payload_bytes / 256`;
+  it scales with the configured slab size.
 
 ## Slab footer extension diagram
 
@@ -689,10 +700,10 @@ CSB AEAD:
   nonce = derived from a stats-block-specific domain separator,
           distinct from chunk AEAD nonces (ADR 020 §2)
   AAD   = tenant_id ‖ slab_id ‖ stats_format_version ‖ schema_generation
-          ‖ stats_block_hash128
-  Including the footer-pinned hash in the AAD cross-binds the
-  ciphertext to the locator: a swapped CSB ciphertext fails AEAD
-  authentication even before its own internal hash is checked.
+  stats_block_hash128 is not AAD because it is computed over the
+  ciphertext. The reader verifies the footer HMAC first, then checks
+  the footer-pinned stats_block_hash128 before decrypting the CSB; the
+  CSB AEAD tag then authenticates the plaintext under the slab DEK.
 ```
 
 ## Rationale
@@ -799,12 +810,13 @@ adds branchy code (per-type dispatch) and ties stat correctness to
 specific Arrow kernel versions. Pinning a byte-comparable on-disk
 form (sign-flipped BE for signed ints, BE for unsigned, etc.)
 collapses the comparison to a single `memcmp` and produces stable
-golden bytes across writers. Float and decimal types are excluded
-from V1 entirely — they get `is_unsupported` entries with only
-null/non-null counts — because their byte-comparable forms have
-non-trivial edge cases (NaN, signed zero, subnormals, scale
-mismatch) that deserve their own ADR rather than getting smuggled
-in here. Tag values `0x09`–`0x0C` are reserved for that follow-up.
+golden bytes across writers. Float, decimal, and nested types are
+allowed in schemas but produce opaque-tagged CSB entries (§5)
+carrying only null/non-null counts, because their byte-comparable
+forms have non-trivial edge cases (NaN, signed zero, subnormals,
+scale mismatch, nested-element ordering) that need their own
+pinning work. The opaque tag avoids inventing a placeholder
+encoding that would have to be unwound later.
 
 ## Consequences (the negatives)
 
@@ -946,8 +958,9 @@ in here. Tag values `0x09`–`0x0C` are reserved for that follow-up.
   column-predicate machinery. Server-side evaluation: min/max bounds
   (truncation-aware for strings), small-set membership, bloom
   membership for equality, null-count short-circuits. No new wire
-  surface; ADR 036 sees only an extra capability bit and the explain
-  counters from §21. Counters: `wpbc_slab_stats_consulted_total`,
+  surface; ADR 036 sees only an extra capability bit, a diagnostic
+  opt-out flag, and the process/internal counters from §21. Counters:
+  `wpbc_slab_stats_consulted_total`,
   `wpbc_slab_stats_pruned_total`, `wpbc_slab_stats_missing_total`,
   `wpbc_slab_stats_unsupported_total`,
   `wpbc_slab_stats_predicate_unrepresentable_total`,
@@ -1003,16 +1016,7 @@ in here. Tag values `0x09`–`0x0C` are reserved for that follow-up.
    The cap exists; whether to charge tenants in storage-cost
    accounting is operational, not architectural.
 
-6. **Float and decimal stats support.** V1 excludes
-   `Float32`/`Float64`/`Decimal128`/`Decimal256` entirely; columns
-   of those types carry `is_unsupported` entries with only
-   null/non-null counts. Type tags `0x09`–`0x0C` are reserved for
-   the follow-up ADR that pins NaN, signed-zero, subnormal, and
-   decimal-scale rules. That ADR will define the canonical
-   byte-comparable encoding, lift the bloom/HLL rejection where
-   semantics permit, and add a test corpus.
-
-7. **Strict-diagnostics mode for stats failures.** Default behavior
+6. **Strict-diagnostics mode for stats failures.** Default behavior
    treats `STATS_DECRYPT_FAILED` and `FINGERPRINT_MISMATCH` as
    `STATS_UNAVAILABLE` for query correctness while raising metrics.
    A future operator/debug session flag could turn stats corruption
@@ -1033,7 +1037,7 @@ with ADR 036's "no free-form error strings" rule:
   the named `schema_generation`.
 - `WPBC_REJECT_STATS_BUDGET_EXCEEDED` — descriptor's worst-case
   per-slab CSB ciphertext size at declared row capacity exceeds
-  `min(256 KiB, slab_payload_bytes / 256)`.
+  `slab_payload_bytes / 256`.
 - `WPBC_REJECT_STATS_PRECISION_INVALID` — HLL precision outside
   `10..=14`.
 - `WPBC_REJECT_STATS_BITS_INVALID` — bloom `bits_per_row` outside
@@ -1065,10 +1069,9 @@ never renumber.
 0x06  UInt16
 0x07  UInt32
 0x08  UInt64
-0x09  Float32                  (reserved; not valid in V1 — see §15)
-0x0A  Float64                  (reserved; not valid in V1 — see §15)
-0x0B  Decimal128               (reserved; not valid in V1 — see §15)
-0x0C  Decimal256               (reserved; not valid in V1 — see §15)
+0x0E  OpaqueUnsupported        (writer-known, no canonical stats —
+                                see §5; payload carries only null
+                                and non-null counts)
 0x10  Utf8
 0x11  LargeUtf8
 0x12  Binary
@@ -1082,11 +1085,12 @@ never renumber.
 0xFF  Reserved (must not appear)
 ```
 
-Tags `0x09`–`0x0C` are reserved tag-numbers held for a follow-up
-ADR that pins float/decimal stat semantics. A V1 writer never emits
-column entries with these tags; a V1 reader that encounters one
-treats the column entry as malformed and falls back to
-`STATS_UNAVAILABLE` for that column.
+All other tag values (including `0x09`–`0x0D`, `0x0F`, the gaps
+inside the `0x14`–`0x1F`, `0x23`–`0x2F`, `0x32`–`0x3F`,
+`0x41`–`0xFE` ranges) are unassigned. A reader that encounters an
+unassigned tag treats the column entry as malformed and falls back
+to `STATS_UNAVAILABLE` for that column. New types append to the
+mapping; tags are never renumbered.
 
 ## References
 

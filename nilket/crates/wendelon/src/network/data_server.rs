@@ -71,22 +71,26 @@ use crate::schema::{
 	MsgType, NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
 	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
-	ReplicaWriteStatus, StreamFinalizationRequestMeta, TableQueryRequestMeta,
+	ReplicaWriteStatus, SlabId, StreamFinalizationRequestMeta, TableQueryRequestMeta,
 	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TableWriteValidationError, TenantId, WpbcRejectCode, WriteRequestMeta, WriteResponseMeta,
 	WriteStatus, column_projection_predicate_ranges, column_projection_prefix_ranges,
-	migration_record_schema, read_key_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, wpbc, write_payload_schema,
+	migration_record_schema, query_request_stats_pruning_enabled, read_key_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, wpbc, write_payload_schema,
 };
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
+use crate::storage::stats::{
+	ColumnStatsPrune, ParsedColumnStatsBlock, column_stats_entry_matches_data_type,
+	encode_signed_stat_value, prune_by_encoded_any_of, prune_by_encoded_min_max,
+};
 use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
 	UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -3722,6 +3726,7 @@ impl WendelonDataServer {
 			response,
 			batches,
 			deadline,
+			..
 		} = plan;
 		let Some(encoded_batches) = encode_query_stream_batches_with_deadline(batches, deadline)?
 		else {
@@ -6682,6 +6687,7 @@ struct QueryExecutionPlan {
 	response: QueryResponseMeta,
 	batches: Vec<RecordBatch>,
 	deadline: Instant,
+	stats_explain: QueryStatsExplainCounters,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6709,6 +6715,7 @@ struct QueryExecutionBudget {
 	max_locations: usize,
 	max_rows: u64,
 	max_wall_time: Duration,
+	stats_pruning_enabled: bool,
 }
 
 impl Default for QueryExecutionBudget {
@@ -6717,8 +6724,21 @@ impl Default for QueryExecutionBudget {
 			max_locations: 4_096,
 			max_rows: 65_536,
 			max_wall_time: Duration::from_millis(250),
+			stats_pruning_enabled: true,
 		}
 	}
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct QueryStatsExplainCounters {
+	candidate_slabs_before_stats: u64,
+	slabs_pruned_by_stats: u64,
+	slabs_scanned_stats_missing: u64,
+	slabs_scanned_stats_unsupported: u64,
+	slabs_scanned_predicate_unrepresentable: u64,
+	stats_cache_hits: u64,
+	stats_cache_misses: u64,
+	stats_decrypt_failed_total: u64,
 }
 
 #[derive(Debug)]
@@ -6726,6 +6746,27 @@ enum QueryBatchMaterializationError {
 	Io(std::io::Error),
 	InvalidProgram,
 	BudgetExceeded,
+}
+
+#[derive(Default)]
+struct QueryStatsPruneCache {
+	decisions: HashMap<SlabId, bool>,
+	explain: QueryStatsExplainCounters,
+}
+
+enum EncodedStatsPredicate {
+	Range {
+		lower: Option<Vec<u8>>,
+		upper: Option<Vec<u8>>,
+	},
+	AnyOf(Vec<Vec<u8>>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlabStatsQueryOutcome {
+	may_match: bool,
+	unsupported: bool,
+	predicate_unrepresentable: bool,
 }
 
 fn snapshot_request_outside_retention(
@@ -6737,6 +6778,241 @@ fn snapshot_request_outside_retention(
 
 fn query_deadline_exceeded(deadline: Instant) -> bool {
 	Instant::now() > deadline
+}
+
+async fn table_stats_may_match_location(
+	slab: &SlabManager,
+	table_descriptor: Option<&TableSchemaDescriptorV1>,
+	program: &wpbc::Program,
+	cache: &mut QueryStatsPruneCache,
+	location: RecordLocation,
+) -> std::io::Result<bool> {
+	let Some(descriptor) = table_descriptor else {
+		return Ok(true);
+	};
+	if let Some(decision) = cache.decisions.get(&location.slab_id) {
+		cache.explain.stats_cache_hits = cache.explain.stats_cache_hits.saturating_add(1);
+		return Ok(*decision);
+	}
+	cache.explain.candidate_slabs_before_stats =
+		cache.explain.candidate_slabs_before_stats.saturating_add(1);
+	cache.explain.stats_cache_misses = cache.explain.stats_cache_misses.saturating_add(1);
+	let Some(pointer) = slab.tier_pointer(location.slab_id).await else {
+		cache.explain.slabs_scanned_stats_missing =
+			cache.explain.slabs_scanned_stats_missing.saturating_add(1);
+		cache.decisions.insert(location.slab_id, true);
+		return Ok(true);
+	};
+	let decrypt_failed_before = metrics().wpbc_slab_stats_decrypt_failed_total.get();
+	let stats = match slab
+		.load_tiered_column_stats_block(&pointer, descriptor)
+		.await
+	{
+		Ok(Some(stats)) => stats,
+		Ok(None) => {
+			cache.explain.slabs_scanned_stats_missing =
+				cache.explain.slabs_scanned_stats_missing.saturating_add(1);
+			cache.decisions.insert(location.slab_id, true);
+			return Ok(true);
+		}
+		Err(_) => {
+			cache.explain.slabs_scanned_stats_missing =
+				cache.explain.slabs_scanned_stats_missing.saturating_add(1);
+			let decrypt_failed = metrics()
+				.wpbc_slab_stats_decrypt_failed_total
+				.get()
+				.saturating_sub(decrypt_failed_before);
+			cache.explain.stats_decrypt_failed_total = cache
+				.explain
+				.stats_decrypt_failed_total
+				.saturating_add(decrypt_failed);
+			cache.decisions.insert(location.slab_id, true);
+			return Ok(true);
+		}
+	};
+	let outcome = match slab_stats_query_outcome(descriptor, program, &stats) {
+		Ok(outcome) => outcome,
+		Err(_) => {
+			metrics().wpbc_slab_stats_unsupported_total.inc();
+			cache.explain.slabs_scanned_stats_unsupported = cache
+				.explain
+				.slabs_scanned_stats_unsupported
+				.saturating_add(1);
+			cache.decisions.insert(location.slab_id, true);
+			return Ok(true);
+		}
+	};
+	if outcome.unsupported {
+		metrics().wpbc_slab_stats_unsupported_total.inc();
+		cache.explain.slabs_scanned_stats_unsupported = cache
+			.explain
+			.slabs_scanned_stats_unsupported
+			.saturating_add(1);
+	}
+	if outcome.predicate_unrepresentable {
+		metrics()
+			.wpbc_slab_stats_predicate_unrepresentable_total
+			.inc();
+		cache.explain.slabs_scanned_predicate_unrepresentable = cache
+			.explain
+			.slabs_scanned_predicate_unrepresentable
+			.saturating_add(1);
+	}
+	if !outcome.may_match {
+		metrics().wpbc_slab_stats_pruned_total.inc();
+		cache.explain.slabs_pruned_by_stats = cache.explain.slabs_pruned_by_stats.saturating_add(1);
+	}
+	cache.decisions.insert(location.slab_id, outcome.may_match);
+	Ok(outcome.may_match)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn slab_stats_may_match_query(
+	descriptor: &TableSchemaDescriptorV1,
+	program: &wpbc::Program,
+	stats: &ParsedColumnStatsBlock,
+) -> std::io::Result<bool> {
+	Ok(slab_stats_query_outcome(descriptor, program, stats)?.may_match)
+}
+
+fn slab_stats_query_outcome(
+	descriptor: &TableSchemaDescriptorV1,
+	program: &wpbc::Program,
+	stats: &ParsedColumnStatsBlock,
+) -> std::io::Result<SlabStatsQueryOutcome> {
+	let Some(predicates) = program.conjunctive_column_predicates() else {
+		return Ok(SlabStatsQueryOutcome {
+			may_match: true,
+			unsupported: false,
+			predicate_unrepresentable: true,
+		});
+	};
+	if predicates.is_empty() {
+		return Ok(SlabStatsQueryOutcome {
+			may_match: true,
+			unsupported: false,
+			predicate_unrepresentable: false,
+		});
+	}
+	let mut outcome = SlabStatsQueryOutcome {
+		may_match: true,
+		unsupported: false,
+		predicate_unrepresentable: false,
+	};
+	let schema = descriptor.arrow_schema()?;
+	for predicate in predicates {
+		let Some(field) = schema.fields().get(predicate.column_index) else {
+			outcome.unsupported = true;
+			continue;
+		};
+		let Some(entry) = stats
+			.columns
+			.iter()
+			.find(|entry| entry.column_ordinal as usize == predicate.column_index)
+		else {
+			outcome.unsupported = true;
+			continue;
+		};
+		if !column_stats_entry_matches_data_type(entry, field.data_type()) {
+			outcome.unsupported = true;
+			continue;
+		}
+		let Some(encoded) = encoded_stats_predicate(field.data_type(), &predicate)? else {
+			outcome.predicate_unrepresentable = true;
+			continue;
+		};
+		let may_match = match encoded {
+			EncodedStatsPredicate::Range { lower, upper } => {
+				prune_by_encoded_min_max(entry, lower.as_deref(), upper.as_deref())?
+					== ColumnStatsPrune::MayMatch
+			}
+			EncodedStatsPredicate::AnyOf(values) => {
+				prune_by_encoded_any_of(entry, &values)? == ColumnStatsPrune::MayMatch
+			}
+		};
+		if !may_match {
+			outcome.may_match = false;
+			return Ok(outcome);
+		}
+	}
+	Ok(outcome)
+}
+
+fn encoded_stats_predicate(
+	data_type: &DataType,
+	predicate: &wpbc::ColumnPredicateV1,
+) -> std::io::Result<Option<EncodedStatsPredicate>> {
+	match predicate.comparison {
+		wpbc::ColumnPredicateComparisonV1::Eq => {
+			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
+				return Ok(None);
+			};
+			Ok(Some(EncodedStatsPredicate::AnyOf(vec![value])))
+		}
+		wpbc::ColumnPredicateComparisonV1::Gt | wpbc::ColumnPredicateComparisonV1::Gte => {
+			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
+				return Ok(None);
+			};
+			Ok(Some(EncodedStatsPredicate::Range {
+				lower: Some(value),
+				upper: None,
+			}))
+		}
+		wpbc::ColumnPredicateComparisonV1::Lt | wpbc::ColumnPredicateComparisonV1::Lte => {
+			let Some(value) = encode_stats_literal(data_type, &predicate.literal)? else {
+				return Ok(None);
+			};
+			Ok(Some(EncodedStatsPredicate::Range {
+				lower: None,
+				upper: Some(value),
+			}))
+		}
+		wpbc::ColumnPredicateComparisonV1::InList => {
+			let wpbc::ColumnPredicateLiteralV1::List(literals) = &predicate.literal else {
+				return Ok(None);
+			};
+			let mut encoded = Vec::with_capacity(literals.len());
+			for literal in literals {
+				let Some(value) = encode_stats_literal(data_type, literal)? else {
+					return Ok(None);
+				};
+				encoded.push(value);
+			}
+			Ok(Some(EncodedStatsPredicate::AnyOf(encoded)))
+		}
+	}
+}
+
+fn encode_stats_literal(
+	data_type: &DataType,
+	literal: &wpbc::ColumnPredicateLiteralV1,
+) -> std::io::Result<Option<Vec<u8>>> {
+	match (data_type, literal) {
+		(DataType::Int64, wpbc::ColumnPredicateLiteralV1::Int(value))
+		| (DataType::Int64, wpbc::ColumnPredicateLiteralV1::Ts(value))
+		| (
+			DataType::Timestamp(TimeUnit::Millisecond, _),
+			wpbc::ColumnPredicateLiteralV1::Int(value),
+		)
+		| (
+			DataType::Timestamp(TimeUnit::Millisecond, _),
+			wpbc::ColumnPredicateLiteralV1::Ts(value),
+		) => encode_signed_stat_value(*value, 8).map(Some),
+		(DataType::Int32, wpbc::ColumnPredicateLiteralV1::Int(value))
+		| (DataType::Int32, wpbc::ColumnPredicateLiteralV1::Ts(value)) => {
+			let Ok(value) = i32::try_from(*value) else {
+				return Ok(None);
+			};
+			encode_signed_stat_value(i64::from(value), 4).map(Some)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, wpbc::ColumnPredicateLiteralV1::Str(bytes)) => {
+			if std::str::from_utf8(bytes).is_err() {
+				return Ok(None);
+			}
+			Ok(Some(bytes.clone()))
+		}
+		_ => Ok(None),
+	}
 }
 
 /// Plan a [`QueryRequestMeta`] + WPBC program against a local
@@ -6830,6 +7106,11 @@ async fn plan_query_execution_for_ranges_with_program(
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
 ) -> std::io::Result<QueryExecutionPlan> {
+	let budget = QueryExecutionBudget {
+		stats_pruning_enabled: budget.stats_pruning_enabled
+			&& query_request_stats_pruning_enabled(meta),
+		..budget
+	};
 	metrics().observe_wpbc_locality_arcs_scanned(ranges.len() as u64);
 	let mut batches = Vec::new();
 	let mut rows = 0u64;
@@ -6841,6 +7122,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		logical: 0,
 		node_id: 0,
 	};
+	let mut stats_prune_cache = QueryStatsPruneCache::default();
 	if program.requires_scalar_context() {
 		for range in ranges {
 			let scanned = slab.scan_as_of_with_identity_and_locality(
@@ -6856,6 +7138,18 @@ async fn plan_query_execution_for_ranges_with_program(
 						ReadStatus::QUERY_BUDGET_EXCEEDED,
 						local_node,
 					));
+				}
+				if budget.stats_pruning_enabled
+					&& !table_stats_may_match_location(
+						slab,
+						table_descriptor,
+						program,
+						&mut stats_prune_cache,
+						location,
+					)
+					.await?
+				{
+					continue;
 				}
 				scanned_locations = scanned_locations.saturating_add(1);
 				if scanned_locations > budget.max_locations {
@@ -6929,6 +7223,18 @@ async fn plan_query_execution_for_ranges_with_program(
 						ReadStatus::QUERY_BUDGET_EXCEEDED,
 						local_node,
 					));
+				}
+				if budget.stats_pruning_enabled
+					&& !table_stats_may_match_location(
+						slab,
+						table_descriptor,
+						program,
+						&mut stats_prune_cache,
+						location,
+					)
+					.await?
+				{
+					continue;
 				}
 				scanned_locations = scanned_locations.saturating_add(1);
 				if scanned_locations > budget.max_locations {
@@ -7013,11 +7319,9 @@ async fn plan_query_execution_for_ranges_with_program(
 	// KEY_NOT_FOUND to an empty batch on the receive side, so we
 	// avoid the cost of encoding a zero-row stream.
 	if batches.is_empty() {
-		return Ok(query_plan_error(
-			meta,
-			ReadStatus::KEY_NOT_FOUND,
-			local_node,
-		));
+		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
+		plan.stats_explain = stats_prune_cache.explain;
+		return Ok(plan);
 	}
 
 	Ok(QueryExecutionPlan {
@@ -7033,6 +7337,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		},
 		batches,
 		deadline,
+		stats_explain: stats_prune_cache.explain,
 	})
 }
 
@@ -7180,6 +7485,7 @@ fn query_plan_error(
 		response: query_error_meta(meta, status, local_node),
 		batches: Vec::new(),
 		deadline: Instant::now(),
+		stats_explain: QueryStatsExplainCounters::default(),
 	}
 }
 
@@ -7452,7 +7758,7 @@ fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta 
 		expected_epoch: meta.expected_epoch,
 		tenant_id: meta.tenant_id,
 		consistency: meta.consistency,
-		_pad: [0; 7],
+		_pad: meta._pad,
 		locality_range_start: 0,
 		locality_range_end: u64::MAX,
 		bytecode_len: meta.bytecode_len,
@@ -8151,20 +8457,24 @@ mod tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::wpbc::{
-		OP_AND, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_PROJECT,
-		OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_RANGE_LOCALITY,
-		OP_ROUTE_BY_LOCALITY,
+		OP_AND, OP_EQ, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_OR,
+		OP_PROJECT, OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_PUSH_STR,
+		OP_RANGE_LOCALITY, OP_ROUTE_BY_LOCALITY,
 	};
 	use crate::schema::{
 		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
 		PrimaryKeyDescriptorV1, ProjectionFunctionV1, SchemaEvolutionPolicyV1, SlabRecordHeader,
-		TableObjectId, column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
-		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
-		write_payload_schema,
+		TableObjectId, TableSchemaCatalogV1, column_projection_prefix_ranges,
+		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
+		table_spread_prefix_ranges, write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
-	use crate::storage::manager::SlabManagerConfig;
+	use crate::storage::l2::{
+		InjectedMockObjectStoreFault, MockObjectStore, MockObjectStoreFaultAction,
+		MockObjectStoreOp, ObjectStore,
+	};
+	use crate::storage::manager::{SlabManagerConfig, TieredSlabPointer};
 	use arrow::array::{Int64Array, LargeStringArray};
 	use arrow::datatypes::{DataType, Field};
 	use std::io::{Read, Seek, SeekFrom};
@@ -8442,6 +8752,7 @@ mod tests {
 				address: "loopback://26".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		peers.insert(
@@ -8450,6 +8761,7 @@ mod tests {
 				address: "loopback://27".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		let epoch = MembershipEpoch { epoch: 2, peers };
@@ -8530,6 +8842,120 @@ mod tests {
 			.await
 			.unwrap(),
 		)
+	}
+
+	async fn make_manager_with_l2(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
+		let dir = fresh_dir("query-l2");
+		let io = spawn_io_thread(64).unwrap();
+		let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
+		rehydration.promote_after_l2_reads = 0;
+		rehydration.tail_read_window_bytes = 256 + 16;
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		)
+	}
+
+	async fn append_typed_table_rows(
+		mgr: &SlabManager,
+		descriptor: &TableSchemaDescriptorV1,
+		ids: Vec<i64>,
+	) -> SlabId {
+		let batch = typed_table_batch(ids);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
+			.expect("typed rows should validate");
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_batch(&row_batch).unwrap();
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64, 0, 1),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+		mgr.force_seal_active_for_test().await
+	}
+
+	async fn tier_typed_table_batch_with_stats(
+		l2: Arc<MockObjectStore>,
+		ids: Vec<i64>,
+		object_name: &str,
+	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+		let mgr = make_manager_with_l2(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
+
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2.put(object_name, &encrypted.bytes).await.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+		})
+		.await
+		.unwrap();
+
+		(mgr, descriptor)
+	}
+
+	async fn tier_typed_table_batch_without_stats(
+		l2: Arc<MockObjectStore>,
+		ids: Vec<i64>,
+		object_name: &str,
+	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+		let mgr = make_manager_with_l2(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
+
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		assert!(encrypted.stats_locator.is_none());
+		let l2_uri = l2.put(object_name, &encrypted.bytes).await.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+		})
+		.await
+		.unwrap();
+
+		(mgr, descriptor)
 	}
 
 	async fn seed_record(
@@ -8922,6 +9348,7 @@ mod tests {
 				max_locations: 1,
 				max_rows: 10,
 				max_wall_time: Duration::from_secs(1),
+				stats_pruning_enabled: true,
 			},
 			None,
 		)
@@ -8958,6 +9385,7 @@ mod tests {
 				max_locations: 1,
 				max_rows: 10,
 				max_wall_time: Duration::from_secs(1),
+				stats_pruning_enabled: true,
 			},
 			None,
 		)
@@ -8987,6 +9415,7 @@ mod tests {
 				max_locations: 10,
 				max_rows: 10,
 				max_wall_time: Duration::from_secs(1),
+				stats_pruning_enabled: true,
 			},
 			None,
 		)
@@ -9445,6 +9874,479 @@ mod tests {
 				&& range.end.get() <= end.get()
 				&& (range.start != *start || range.end != *end)
 		}));
+	}
+
+	#[tokio::test]
+	async fn table_query_skips_tiered_slab_when_column_stats_cannot_match() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![1, 2]);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
+			.expect("typed rows should validate");
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_batch(&row_batch).unwrap();
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64, 0, 1),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+
+		let slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put(&format!("stats-prune-{slab_id}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		l2.inject(InjectedMockObjectStoreFault::on(
+			MockObjectStoreOp::GetBytes,
+			MockObjectStoreFaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "stats pruning must not fetch the full L2 object".to_owned(),
+			},
+		));
+		l2.inject(
+			InjectedMockObjectStoreFault::on(
+				MockObjectStoreOp::GetRange,
+				MockObjectStoreFaultAction::Error {
+					kind: ErrorKind::Other,
+					message: "pruned query must not range-read row ciphertext".to_owned(),
+				},
+			)
+			.after_matches(3),
+		);
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+		})
+		.await
+		.unwrap();
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&100_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let meta = base_meta();
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let pruned_before = metrics().wpbc_slab_stats_pruned_total.get();
+		let consulted_before = metrics().wpbc_slab_stats_consulted_total.get();
+
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::KEY_NOT_FOUND);
+		assert_eq!(
+			plan.stats_explain,
+			QueryStatsExplainCounters {
+				candidate_slabs_before_stats: 1,
+				slabs_pruned_by_stats: 1,
+				slabs_scanned_stats_missing: 0,
+				slabs_scanned_stats_unsupported: 0,
+				slabs_scanned_predicate_unrepresentable: 0,
+				stats_cache_hits: 1,
+				stats_cache_misses: 1,
+				stats_decrypt_failed_total: 0,
+			}
+		);
+		assert!(
+			metrics().wpbc_slab_stats_consulted_total.get() >= consulted_before + 1,
+			"tiered stats should be consulted before L2 row reads"
+		);
+		assert!(
+			metrics().wpbc_slab_stats_pruned_total.get() >= pruned_before + 1,
+			"the slab-level id min/max should rule out id >= 100"
+		);
+
+		l2.inject(InjectedMockObjectStoreFault::on(
+			MockObjectStoreOp::Head,
+			MockObjectStoreFaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "cached stats must not HEAD L2".to_owned(),
+			},
+		));
+		l2.inject(InjectedMockObjectStoreFault::on(
+			MockObjectStoreOp::GetRange,
+			MockObjectStoreFaultAction::Error {
+				kind: ErrorKind::Other,
+				message: "cached stats must not range-read L2".to_owned(),
+			},
+		));
+		let cache_hits_before = metrics().wpbc_slab_stats_cache_hits_total.get();
+
+		let second = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(second.response.status, ReadStatus::KEY_NOT_FOUND);
+		assert!(
+			metrics().wpbc_slab_stats_cache_hits_total.get() >= cache_hits_before + 1,
+			"second query should reuse the parsed stats block cached by the slab manager"
+		);
+	}
+
+	#[tokio::test]
+	async fn query_request_flag_disables_table_stats_pruning() {
+		let mgr = make_manager().await;
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![1, 2]);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
+			.expect("typed rows should validate");
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_batch(&row_batch).unwrap();
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64, 0, 1),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+
+		let program = wpbc::Program::compile(&[]).unwrap();
+		let mut meta = base_meta();
+		meta._pad[0] |= crate::schema::QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 2);
+		assert_eq!(plan.stats_explain, QueryStatsExplainCounters::default());
+	}
+
+	#[tokio::test]
+	async fn table_stats_admit_slab_then_wpbc_filters_rows() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-admit-wpbc.wnd").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&2_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
+		assert_eq!(
+			plan.stats_explain,
+			QueryStatsExplainCounters {
+				candidate_slabs_before_stats: 1,
+				slabs_pruned_by_stats: 0,
+				slabs_scanned_stats_missing: 0,
+				slabs_scanned_stats_unsupported: 0,
+				slabs_scanned_predicate_unrepresentable: 0,
+				stats_cache_hits: 1,
+				stats_cache_misses: 1,
+				stats_decrypt_failed_total: 0,
+			}
+		);
+		let ids = plan.batches[0]
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.values(), &[2]);
+	}
+
+	#[tokio::test]
+	async fn table_stats_absence_falls_through_to_full_scan() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_typed_table_batch_without_stats(l2, vec![1, 2], "stats-missing-scan.wnd").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&2_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
+		assert_eq!(
+			plan.stats_explain,
+			QueryStatsExplainCounters {
+				candidate_slabs_before_stats: 1,
+				slabs_pruned_by_stats: 0,
+				slabs_scanned_stats_missing: 1,
+				slabs_scanned_stats_unsupported: 0,
+				slabs_scanned_predicate_unrepresentable: 0,
+				stats_cache_hits: 1,
+				stats_cache_misses: 1,
+				stats_decrypt_failed_total: 0,
+			}
+		);
+		let ids = plan.batches[0]
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.values(), &[2]);
+	}
+
+	#[tokio::test]
+	async fn unsupported_stats_predicate_falls_through_to_full_scan() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-or-scan.wnd").await;
+
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&3_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&2_i64.to_le_bytes());
+		bytecode.push(OP_EQ);
+		bytecode.push(OP_OR);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
+		assert_eq!(
+			plan.stats_explain,
+			QueryStatsExplainCounters {
+				candidate_slabs_before_stats: 1,
+				slabs_pruned_by_stats: 0,
+				slabs_scanned_stats_missing: 0,
+				slabs_scanned_stats_unsupported: 0,
+				slabs_scanned_predicate_unrepresentable: 1,
+				stats_cache_hits: 1,
+				stats_cache_misses: 1,
+				stats_decrypt_failed_total: 0,
+			}
+		);
+		let ids = plan.batches[0]
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.values(), &[2]);
+	}
+
+	#[test]
+	fn slab_stats_pruning_ignores_mismatched_arrow_type_tag() {
+		use crate::storage::stats::{
+			ARROW_STATS_TAG_LARGE_UTF8, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN,
+			COLUMN_STAT_HAS_NON_NULL_COUNT, COLUMN_STAT_HAS_NULL_COUNT, ColumnStatsBlockEntry,
+			ColumnStatsBlockHeader, ParsedColumnStatsBlock, encode_length_prefixed_bytes,
+		};
+
+		let descriptor = typed_table_descriptor();
+		let mut payload = Vec::new();
+		encode_length_prefixed_bytes(&mut payload, &encode_signed_stat_value(1, 8).unwrap())
+			.unwrap();
+		encode_length_prefixed_bytes(&mut payload, &encode_signed_stat_value(9, 8).unwrap())
+			.unwrap();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&2_u64.to_be_bytes());
+		let stats = ParsedColumnStatsBlock {
+			header: ColumnStatsBlockHeader {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				schema_fingerprint: descriptor.schema_fingerprint,
+				row_count: 2,
+				column_block_count: 1,
+			},
+			columns: vec![ColumnStatsBlockEntry {
+				column_ordinal: 0,
+				arrow_type_tag: ARROW_STATS_TAG_LARGE_UTF8,
+				stat_flags: COLUMN_STAT_HAS_MIN
+					| COLUMN_STAT_HAS_MAX
+					| COLUMN_STAT_HAS_NULL_COUNT
+					| COLUMN_STAT_HAS_NON_NULL_COUNT,
+				payload,
+			}],
+		};
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&100_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
+		let program = wpbc::Program::compile(&bytecode).unwrap();
+
+		assert!(
+			slab_stats_may_match_query(&descriptor, &program, &stats).unwrap(),
+			"mismatched stat type tags must fail closed instead of pruning"
+		);
+	}
+
+	#[test]
+	fn slab_stats_pruning_respects_truncated_string_max_prefix() {
+		use crate::storage::stats::{
+			ARROW_STATS_TAG_LARGE_UTF8, COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_NON_NULL_COUNT,
+			COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_MAX_TRUNCATED, ColumnStatsBlockEntry,
+			ColumnStatsBlockHeader, ParsedColumnStatsBlock, encode_length_prefixed_bytes,
+		};
+
+		let descriptor = typed_table_descriptor();
+		let mut payload = Vec::new();
+		encode_length_prefixed_bytes(&mut payload, b"app").unwrap();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&3_u64.to_be_bytes());
+		let stats = ParsedColumnStatsBlock {
+			header: ColumnStatsBlockHeader {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				schema_fingerprint: descriptor.schema_fingerprint,
+				row_count: 3,
+				column_block_count: 1,
+			},
+			columns: vec![ColumnStatsBlockEntry {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_LARGE_UTF8,
+				stat_flags: COLUMN_STAT_HAS_MAX
+					| COLUMN_STAT_MAX_TRUNCATED
+					| COLUMN_STAT_HAS_NULL_COUNT
+					| COLUMN_STAT_HAS_NON_NULL_COUNT,
+				payload,
+			}],
+		};
+
+		let mut boundary = Vec::new();
+		boundary.push(OP_PUSH_COL);
+		boundary.extend_from_slice(&1_u32.to_le_bytes());
+		boundary.push(OP_PUSH_STR);
+		boundary.extend_from_slice(&5_u16.to_le_bytes());
+		boundary.extend_from_slice(b"apple");
+		boundary.push(OP_GTE);
+		let boundary_program = wpbc::Program::compile(&boundary).unwrap();
+		assert!(
+			slab_stats_may_match_query(&descriptor, &boundary_program, &stats).unwrap(),
+			"truncated max prefix 'app' must not prune predicate value 'apple'"
+		);
+
+		let mut outside = Vec::new();
+		outside.push(OP_PUSH_COL);
+		outside.extend_from_slice(&1_u32.to_le_bytes());
+		outside.push(OP_PUSH_STR);
+		outside.extend_from_slice(&3_u16.to_le_bytes());
+		outside.extend_from_slice(b"apq");
+		outside.push(OP_GTE);
+		let outside_program = wpbc::Program::compile(&outside).unwrap();
+		assert!(
+			!slab_stats_may_match_query(&descriptor, &outside_program, &stats).unwrap(),
+			"values at or beyond the prefix successor can still prune safely"
+		);
 	}
 
 	#[test]
@@ -9910,6 +10812,7 @@ mod tests {
 					address: address.into(),
 					tiers,
 					roles,
+					capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 				},
 			);
 		}
@@ -10581,6 +11484,7 @@ mod tests {
 				address: "loopback://99".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		fx.epoch_tx
@@ -11955,6 +12859,7 @@ mod tests {
 				address: "loopback://41".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		peers.insert(
@@ -11963,6 +12868,7 @@ mod tests {
 				address: "loopback://42".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		peers.insert(
@@ -11971,6 +12877,7 @@ mod tests {
 				address: "loopback://43".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		let epoch = MembershipEpoch { epoch: 1, peers };
@@ -12275,6 +13182,7 @@ mod tests {
 				address: "loopback://31".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		peers.insert(
@@ -12283,6 +13191,7 @@ mod tests {
 				address: "loopback://32".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		peers.insert(
@@ -12291,6 +13200,7 @@ mod tests {
 				address: "loopback://33".into(),
 				tiers,
 				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 			},
 		);
 		let epoch = MembershipEpoch { epoch: 1, peers };

@@ -530,6 +530,7 @@ mod tests {
 			tiers,
 			roles: crate::network::transport::NodeRoleSet::empty()
 				.with(crate::network::transport::NodeRole::Data),
+			capabilities: crate::network::transport::NodeCapabilitySet::empty(),
 		}
 	}
 

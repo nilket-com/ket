@@ -6,6 +6,7 @@ This directory contains durable architecture, operations, and evidence documents
 - `README.md`: This file — index and conventions for the `plans/` directory.
 - `TEMPLATE.md`: Template for creating new plan documents.
 - `adr/`: Architecture Decision Records (numbered 001..N).
+- `conventions/`: Recurring style, naming, and design rules; applies to every collaborator (human or AI) editing the repo.
 - `governance/`: Claim discipline and external dependency tracking.
 - `compliance/`: FIPS/CMVP, crypto-boundary, release evidence, and compliance-pack artifacts.
 - `consensus/`: Raft, WAL, snapshot, epoch transition docs (maps to src/consensus/).
@@ -29,3 +30,4 @@ This directory contains durable architecture, operations, and evidence documents
 - `network/` contains framing, transport, and RPC interface guidance.
 - `ops/` contains reproducible benchmark and operational playbooks.
 - `governance/` and `compliance/` contain durable non-code evidence that should survive workstream cleanup.
+- `conventions/` contains the style and naming rules every collaborator (human or AI) is expected to follow when editing the repo. Read it before introducing new types, naming new fields, or amending an ADR.

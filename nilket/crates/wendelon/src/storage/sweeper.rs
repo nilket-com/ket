@@ -86,6 +86,19 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use zeroize::Zeroizing;
 
+fn stats_advisory_fields(
+	locator: Option<crate::crypto::TieredStatsBlockLocator>,
+) -> (Option<u16>, Option<u32>, Option<[u8; 16]>) {
+	match locator {
+		Some(locator) => (
+			Some(locator.stats_format_version),
+			Some(locator.stats_block_len),
+			Some(locator.stats_block_hash128),
+		),
+		None => (None, None, None),
+	}
+}
+
 /// Knobs for the background sweeper. Defaults aim for "runs on a
 /// laptop without destroying your write throughput" — production
 /// deployments will want to set `max_upload_bytes_per_sec` from
@@ -382,8 +395,8 @@ impl SlabSweeper {
 		// and re-listing on the next pass will converge.
 		let plaintext = Zeroizing::new(self.slab.read_sealed_raw(info.slab_id).await?);
 		let encrypted = self
-			.slab
-			.encrypt_tiered_object_blob(info.slab_id, plaintext.as_ref())?;
+			.encrypt_tiered_object_blob_with_current_stats(info.slab_id, plaintext.as_ref())
+			.await?;
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
 
 		// Phase 2: upload to L2, applying the rate limit.
@@ -423,6 +436,8 @@ impl SlabSweeper {
 		// via `SlabManager::apply_tier_slab`. Readers that
 		// captured an `Arc<LocalSlabStore>` *before* the apply
 		// keep their open fd (Linux unlink semantics).
+		let (stats_format_version, stats_block_len, stats_block_hash128) =
+			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
 			slab_id: info.slab_id,
 			l2_uri: l2_uri.clone(),
@@ -430,6 +445,9 @@ impl SlabSweeper {
 			is_encrypted: true,
 			tenant_id: Some(encrypted.tenant_id),
 			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version,
+			stats_block_len,
+			stats_block_hash128,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
@@ -448,6 +466,19 @@ impl SlabSweeper {
 		}
 
 		Ok(())
+	}
+
+	async fn encrypt_tiered_object_blob_with_current_stats(
+		&self,
+		slab_id: SlabId,
+		plaintext_blob: &[u8],
+	) -> std::io::Result<crate::crypto::EncryptedTieredSlab> {
+		let snapshot = self.state_machine.state_snapshot().await;
+		self.slab.encrypt_tiered_object_blob_with_table_stats(
+			slab_id,
+			plaintext_blob,
+			&snapshot.table_schemas,
+		)
 	}
 
 	async fn rewrite_plaintext_tiered_slabs_once(
@@ -518,8 +549,8 @@ impl SlabSweeper {
 		}
 
 		let encrypted = self
-			.slab
-			.encrypt_tiered_object_blob(pointer.slab_id, blob.as_ref())?;
+			.encrypt_tiered_object_blob_with_current_stats(pointer.slab_id, blob.as_ref())
+			.await?;
 		let expected_hash = crate::hash::content::digest(&encrypted.bytes);
 		// Per-attempt suffix so a leader-handoff retry never races
 		// the same key as an earlier in-flight upload. The earlier
@@ -546,6 +577,8 @@ impl SlabSweeper {
 			));
 		}
 
+		let (stats_format_version, stats_block_len, stats_block_hash128) =
+			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
 			slab_id: pointer.slab_id,
 			l2_uri: new_uri.clone(),
@@ -553,6 +586,9 @@ impl SlabSweeper {
 			is_encrypted: true,
 			tenant_id: Some(encrypted.tenant_id),
 			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version,
+			stats_block_len,
+			stats_block_hash128,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -647,6 +683,8 @@ impl SlabSweeper {
 			return Ok(TenantKekRewrapOutcome::AlreadyCurrent);
 		}
 		if footer.tenant_kek_id == active_tenant_kek_id {
+			let (stats_format_version, stats_block_len, stats_block_hash128) =
+				stats_advisory_fields(footer.stats_locator);
 			let tier = TieredSlab {
 				slab_id: pointer.slab_id,
 				l2_uri: pointer.l2_uri.clone(),
@@ -654,6 +692,9 @@ impl SlabSweeper {
 				is_encrypted: true,
 				tenant_id: Some(footer.tenant_id),
 				tenant_kek_id: Some(footer.tenant_kek_id),
+				stats_format_version,
+				stats_block_len,
+				stats_block_hash128,
 			};
 			if let Err(error) = self.raft.commit_tier_slab(tier).await {
 				return Err(error);
@@ -668,8 +709,8 @@ impl SlabSweeper {
 				.decode_tiered_object_blob(pointer, blob.as_ref())?,
 		);
 		let encrypted = self
-			.slab
-			.encrypt_tiered_object_blob(pointer.slab_id, plaintext.as_ref())?;
+			.encrypt_tiered_object_blob_with_current_stats(pointer.slab_id, plaintext.as_ref())
+			.await?;
 		if encrypted.tenant_kek_id != active_tenant_kek_id {
 			return Err(std::io::Error::other(format!(
 				"tenant KEK re-wrap for slab {} expected active tenant_kek_id {}, got {}",
@@ -695,6 +736,8 @@ impl SlabSweeper {
 			));
 		}
 
+		let (stats_format_version, stats_block_len, stats_block_hash128) =
+			stats_advisory_fields(encrypted.stats_locator);
 		let tier = TieredSlab {
 			slab_id: pointer.slab_id,
 			l2_uri: new_uri.clone(),
@@ -702,6 +745,9 @@ impl SlabSweeper {
 			is_encrypted: true,
 			tenant_id: Some(footer.tenant_id),
 			tenant_kek_id: Some(active_tenant_kek_id),
+			stats_format_version,
+			stats_block_len,
+			stats_block_hash128,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -802,9 +848,10 @@ impl SlabSweeper {
 		retention_floor: HybridTimestamp,
 	) -> std::io::Result<Option<PreparedTieredRetentionOutcome>> {
 		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2RetentionRewrite);
+		let snapshot = self.state_machine.state_snapshot().await;
 		let Some(prepared) = self
 			.slab
-			.prepare_tiered_retention_rewrite(pointer, retention_floor)
+			.prepare_tiered_retention_rewrite(pointer, retention_floor, &snapshot.table_schemas)
 			.await?
 		else {
 			return Ok(None);
@@ -848,6 +895,8 @@ impl SlabSweeper {
 						)
 					})?;
 
+				let (stats_format_version, stats_block_len, stats_block_hash128) =
+					stats_advisory_fields(footer.stats_locator);
 				let tier = TieredSlab {
 					slab_id,
 					l2_uri: new_uri.clone(),
@@ -855,6 +904,9 @@ impl SlabSweeper {
 					is_encrypted: true,
 					tenant_id: Some(footer.tenant_id),
 					tenant_kek_id: Some(footer.tenant_kek_id),
+					stats_format_version,
+					stats_block_len,
+					stats_block_hash128,
 				};
 				if let Err(error) = self.raft.commit_tier_slab(tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
@@ -1043,6 +1095,9 @@ impl SlabSweeper {
 			is_encrypted: t.is_encrypted,
 			tenant_id: t.tenant_id,
 			tenant_kek_id: t.tenant_kek_id,
+			stats_format_version: t.stats_format_version,
+			stats_block_len: t.stats_block_len,
+			stats_block_hash128: t.stats_block_hash128,
 		})
 	}
 
@@ -1058,6 +1113,9 @@ impl SlabSweeper {
 				is_encrypted: tier.is_encrypted,
 				tenant_id: tier.tenant_id,
 				tenant_kek_id: tier.tenant_kek_id,
+				stats_format_version: tier.stats_format_version,
+				stats_block_len: tier.stats_block_len,
+				stats_block_hash128: tier.stats_block_hash128,
 			})
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
@@ -1401,6 +1459,9 @@ impl TierObserver for ManagerTierObserver {
 					is_encrypted: tier.is_encrypted,
 					tenant_id: tier.tenant_id,
 					tenant_kek_id: tier.tenant_kek_id,
+					stats_format_version: tier.stats_format_version,
+					stats_block_len: tier.stats_block_len,
+					stats_block_hash128: tier.stats_block_hash128,
 				},
 				Some(applied_log_index),
 			)
@@ -1537,6 +1598,9 @@ mod tests {
 			is_encrypted: pointer.is_encrypted,
 			tenant_id: pointer.tenant_id,
 			tenant_kek_id: pointer.tenant_kek_id,
+			stats_format_version: pointer.stats_format_version,
+			stats_block_len: pointer.stats_block_len,
+			stats_block_hash128: pointer.stats_block_hash128,
 		})
 		.await;
 	}
@@ -1785,6 +1849,9 @@ mod tests {
 			is_encrypted: false,
 			tenant_id: None,
 			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
@@ -1814,6 +1881,9 @@ mod tests {
 			is_encrypted: false,
 			tenant_id: None,
 			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
@@ -2030,6 +2100,9 @@ mod tests {
 			is_encrypted: current_pointer.is_encrypted,
 			tenant_id: None,
 			tenant_kek_id: None,
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
 		};
 		manager
 			.apply_tier_slab(metadata_missing_pointer.clone())
@@ -2123,6 +2196,15 @@ mod tests {
 					.unwrap()
 					.tenant_kek_id,
 			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2241,6 +2323,15 @@ mod tests {
 					.unwrap()
 					.tenant_kek_id,
 			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		manager
@@ -2382,6 +2473,15 @@ mod tests {
 					.unwrap()
 					.tenant_kek_id,
 			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2496,6 +2596,15 @@ mod tests {
 					.unwrap()
 					.tenant_kek_id,
 			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2625,6 +2734,15 @@ mod tests {
 						.unwrap()
 						.tenant_kek_id,
 				),
+				stats_format_version: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_format_version),
+				stats_block_len: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_len),
+				stats_block_hash128: encrypted
+					.stats_locator
+					.map(|locator| locator.stats_block_hash128),
 			})
 			.await
 			.unwrap();

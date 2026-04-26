@@ -14,8 +14,8 @@ use wendelon::network::factory::TransportProviderFactory;
 use wendelon::network::pool::BufPool;
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{
-	EpochCapabilityResolver, MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities,
-	TransportProvider, TransportTier, TransportTierSet,
+	EpochCapabilityResolver, MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet,
+	PeerCapabilities, TransportProvider, TransportTier, TransportTierSet,
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{FrameHeader, MsgType, NodeId};
@@ -131,6 +131,7 @@ pub fn loopback_factory_many_from(
 				roles: NodeRoleSet::empty()
 					.with(NodeRole::Control)
 					.with(NodeRole::Data),
+				capabilities: NodeCapabilitySet::empty(),
 			},
 		);
 		registry.publish(remote, &address, service);

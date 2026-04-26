@@ -41,6 +41,7 @@ fn encrypt_bench_tiered_slab(
 				})?,
 				flags: 0,
 			}],
+			column_stats_block: None,
 		},
 		plaintext,
 	)

@@ -39,7 +39,9 @@
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
-use crate::network::transport::{MembershipEpoch, NodeRoleSet, PeerCapabilities, TransportTierSet};
+use crate::network::transport::{
+	MembershipEpoch, NodeCapabilitySet, NodeRoleSet, PeerCapabilities, TransportTierSet,
+};
 use crate::network::wire;
 use crate::schema::{FrameHeader, MsgType, NodeId};
 use async_trait::async_trait;
@@ -96,6 +98,11 @@ pub struct ClusterPeerWire {
 	/// to the Unified Hash Ring until they re-publish with roles.
 	#[serde(default)]
 	pub role_bits: u8,
+	/// Raw [`NodeCapabilitySet`] bitmask (ADR 039). Defaults to zero so
+	/// older control-ring status payloads deserialize as "no optional
+	/// capabilities advertised" rather than failing topology refresh.
+	#[serde(default)]
+	pub capability_bits: u8,
 }
 
 impl ClusterStatusWire {
@@ -116,6 +123,7 @@ impl ClusterStatusWire {
 					address: p.address.clone(),
 					tiers: TransportTierSet::from_u8(p.tier_bits),
 					roles: NodeRoleSet::from_u8(p.role_bits),
+					capabilities: NodeCapabilitySet::from_u8(p.capability_bits),
 				},
 			);
 		}
@@ -307,7 +315,7 @@ impl TopologySource for ControlRingTopologySource {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::network::transport::TransportTier;
+	use crate::network::transport::{NodeCapability, TransportTier};
 
 	fn sample_snapshot() -> ClusterStatusWire {
 		ClusterStatusWire {
@@ -324,6 +332,9 @@ mod tests {
 					role_bits: NodeRoleSet::empty()
 						.with(crate::network::transport::NodeRole::Data)
 						.as_u8(),
+					capability_bits: NodeCapabilitySet::empty()
+						.with(NodeCapability::SlabStatsPruning)
+						.as_u8(),
 				},
 				ClusterPeerWire {
 					node_id: 2,
@@ -335,6 +346,7 @@ mod tests {
 					role_bits: NodeRoleSet::empty()
 						.with(crate::network::transport::NodeRole::Data)
 						.as_u8(),
+					capability_bits: 0,
 				},
 			],
 		}
@@ -356,6 +368,7 @@ mod tests {
 		assert_eq!(p1.address, "127.0.0.1:9001");
 		assert!(p1.tiers.contains(TransportTier::QuicIoUring));
 		assert!(!p1.tiers.contains(TransportTier::TcpTls));
+		assert!(p1.capabilities.contains(NodeCapability::SlabStatsPruning));
 		let p2 = mem
 			.peers
 			.get(&NodeId {
@@ -364,6 +377,7 @@ mod tests {
 			})
 			.unwrap();
 		assert!(p2.tiers.contains(TransportTier::TcpTls));
+		assert!(!p2.capabilities.contains(NodeCapability::SlabStatsPruning));
 	}
 
 	#[tokio::test]

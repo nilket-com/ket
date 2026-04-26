@@ -45,17 +45,17 @@ use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::{RingRouter, RingState};
 use crate::network::transport::{
-	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, TransportProvider,
-	TransportStream, TransportTier, TransportTierSet,
+	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, NodeCapability,
+	TransportProvider, TransportStream, TransportTier, TransportTierSet,
 };
 use crate::schema::{
 	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
-	Locality, MsgType, NodeId, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, TableQueryRequestMeta, TableSchemaDescriptorV1,
-	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WpbcRejectCode, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, column_projection_prefix_ranges, read_key_schema,
-	read_value_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
-	write_payload_schema,
+	Locality, MsgType, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta,
+	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, TableQueryRequestMeta,
+	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
+	WpbcRejectCode, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	column_projection_prefix_ranges, read_key_schema, read_value_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
@@ -471,10 +471,21 @@ impl WendelonClient {
 		validate_table_query_request(&request)?;
 		let route_locality =
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
+		let requested_stats_pruning =
+			request.meta._pad[0] & QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING == 0;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
-			match self.table_query_once(target, &request).await? {
+			let effective_stats_pruning =
+				self.slab_stats_pruning_for_target(target, requested_stats_pruning);
+			let attempt_request = if effective_stats_pruning == requested_stats_pruning {
+				request.clone()
+			} else {
+				let mut adjusted = request.clone();
+				adjusted.meta._pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
+				adjusted
+			};
+			match self.table_query_once(target, &attempt_request).await? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
 					if attempt + 1 == DATA_RETRY_BUDGET {
@@ -984,24 +995,28 @@ impl WendelonClient {
 		min_hlc: HybridTimestamp,
 		consistency: Consistency,
 		as_of_hlc: HybridTimestamp,
+		stats_pruning_enabled: bool,
 	) -> std::io::Result<StreamingQueryResult> {
-		let meta = QueryRequestMeta {
-			min_hlc,
-			expected_epoch,
-			tenant_id,
-			consistency,
-			_pad: [0; 7],
-			locality_range_start: range.start_locality.get(),
-			locality_range_end: range.end_locality.get(),
-			bytecode_len: wpbc_ast.len() as u32,
-			_pad2: [0; 4],
-			as_of_hlc,
-		};
-
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
 			let target =
 				preferred_target.unwrap_or(self.target_for_locality(range.start_locality)?);
+			let mut pad = [0; 7];
+			if !self.slab_stats_pruning_for_target(target, stats_pruning_enabled) {
+				pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
+			}
+			let meta = QueryRequestMeta {
+				min_hlc,
+				expected_epoch,
+				tenant_id,
+				consistency,
+				_pad: pad,
+				locality_range_start: range.start_locality.get(),
+				locality_range_end: range.end_locality.get(),
+				bytecode_len: wpbc_ast.len() as u32,
+				_pad2: [0; 4],
+				as_of_hlc,
+			};
 			match self.query_once(target, &meta, &wpbc_ast).await? {
 				QueryOutcome::Ok(result) => return Ok(result),
 				QueryOutcome::Redirect(retry) => {
@@ -1015,6 +1030,37 @@ impl WendelonClient {
 			}
 		}
 		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// True iff the named peer advertises `capability` in the current
+	/// membership snapshot. Returns false for peers absent from the
+	/// snapshot, which means the dispatcher silently skips the
+	/// optional path rather than racing against a stale view.
+	fn peer_advertises(&self, target: NodeId, capability: NodeCapability) -> bool {
+		self.topology_tx
+			.borrow()
+			.peers
+			.get(&target)
+			.is_some_and(|caps| caps.capabilities.contains(capability))
+	}
+
+	/// Resolve the effective `stats_pruning_enabled` flag for a single
+	/// dispatch attempt against `target`. If the caller asked for
+	/// stats pruning but the chosen target peer does not advertise
+	/// `SlabStatsPruning`, the flag is silently forced off and the
+	/// `wpbc_slab_stats_skipped_no_capability_total` counter is
+	/// incremented (per ADR 036 §"Capability negotiation contract").
+	fn slab_stats_pruning_for_target(&self, target: NodeId, requested: bool) -> bool {
+		if !requested {
+			return false;
+		}
+		if self.peer_advertises(target, NodeCapability::SlabStatsPruning) {
+			return true;
+		}
+		crate::metrics::global()
+			.wpbc_slab_stats_skipped_no_capability_total
+			.inc();
+		false
 	}
 
 	/// First-pass dispatch target: the head of the replica set for
@@ -1645,6 +1691,7 @@ mod tests {
 					address: format!("127.0.0.1:{}", 9000 + *id),
 					tier_bits: tier_bits(),
 					role_bits: role_bits(),
+					capability_bits: 0,
 				})
 				.collect(),
 		}
@@ -1698,6 +1745,52 @@ mod tests {
 			})
 		);
 		assert_eq!(client.replication_factor(), 3);
+	}
+
+	#[tokio::test]
+	async fn slab_stats_pruning_gate_skips_peers_without_capability() {
+		use crate::network::transport::{NodeCapability, NodeCapabilitySet};
+		let mut snap = snapshot(1, Some(1), &[1, 2]);
+		snap.peers[0].capability_bits = NodeCapabilitySet::empty()
+			.with(NodeCapability::SlabStatsPruning)
+			.as_u8();
+		snap.peers[1].capability_bits = 0;
+		let client = WendelonClient::new(test_config(snap));
+		let advertising = NodeId {
+			id: 1,
+			_reserved: 0,
+		};
+		let silent = NodeId {
+			id: 2,
+			_reserved: 0,
+		};
+
+		assert!(client.peer_advertises(advertising, NodeCapability::SlabStatsPruning));
+		assert!(!client.peer_advertises(silent, NodeCapability::SlabStatsPruning));
+
+		let metric = &crate::metrics::global().wpbc_slab_stats_skipped_no_capability_total;
+		let before = metric.get();
+
+		assert!(client.slab_stats_pruning_for_target(advertising, true));
+		assert_eq!(
+			metric.get(),
+			before,
+			"advertising peer must not increment the skip counter"
+		);
+
+		assert!(!client.slab_stats_pruning_for_target(silent, true));
+		assert_eq!(
+			metric.get(),
+			before + 1,
+			"non-advertising peer must increment the skip counter exactly once"
+		);
+
+		assert!(!client.slab_stats_pruning_for_target(silent, false));
+		assert_eq!(
+			metric.get(),
+			before + 1,
+			"caller-disabled requests must not increment the skip counter even on non-advertising peers"
+		);
 	}
 
 	#[tokio::test]
@@ -2006,6 +2099,7 @@ mod tests {
 					address: format!("127.0.0.1:{}", 9000 + id),
 					tier_bits: tier_bits(),
 					role_bits: role_bits(),
+					capability_bits: 0,
 				})
 				.collect(),
 		};

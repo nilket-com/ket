@@ -15,7 +15,8 @@ use wendelon::network::control_server::WendelonControlServer;
 use wendelon::network::router::MsgRouterBuilder;
 use wendelon::network::server::HrftService;
 use wendelon::network::transport::{
-	MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier, TransportTierSet,
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTier,
+	TransportTierSet,
 };
 use wendelon::network::wire;
 use wendelon::node::{
@@ -35,6 +36,7 @@ fn caps(address: &str) -> PeerCapabilities {
 		roles: NodeRoleSet::empty()
 			.with(NodeRole::Control)
 			.with(NodeRole::Data),
+		capabilities: NodeCapabilitySet::empty(),
 	}
 }
 

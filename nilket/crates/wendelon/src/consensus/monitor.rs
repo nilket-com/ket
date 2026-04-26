@@ -779,7 +779,8 @@ impl MembershipAdvancer for RecordingAdvancer {
 mod tests {
 	use super::*;
 	use crate::network::transport::{
-		MembershipEpoch, NodeRole, NodeRoleSet, PeerCapabilities, TransportTierSet,
+		MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
+		TransportTierSet,
 	};
 	use std::collections::HashMap;
 	use std::panic::AssertUnwindSafe;
@@ -793,6 +794,7 @@ mod tests {
 			address: "127.0.0.1:0".into(),
 			tiers: TransportTierSet::empty(),
 			roles: NodeRoleSet::empty().with(NodeRole::Data),
+			capabilities: NodeCapabilitySet::empty(),
 		}
 	}
 
