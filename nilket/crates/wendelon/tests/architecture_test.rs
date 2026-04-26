@@ -156,14 +156,14 @@ fn test_forbidden_word_count() {
 	);
 }
 
-// Per ADR 041 (Project-name decoupling) Tier-1 enforcement: brand-leaked
-// names of the predicate-bytecode protocol are forbidden in code surfaces.
-// The `Wendelon[A-Z]` Tier-2 audit is a separate follow-up effort and is
-// not enforced by this test.
+// Per ADR 041 (Project-name decoupling) Tier-1 enforcement: former
+// brand-leaked names of the predicate-bytecode protocol are forbidden in code
+// surfaces. The `Wendelon[A-Z]` Tier-2 audit is a separate follow-up effort and
+// is not enforced by this test.
 #[test]
-fn test_no_wpbc_in_code_surfaces() {
+fn test_no_brand_leaked_pbc_names_in_code_surfaces() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-	let scan_roots = ["src", "tests", "benches", "examples", "crates"];
+	let scan_roots = ["src", "tests", "benches", "examples", "crates", "ci"];
 	let mut violations: Vec<String> = Vec::new();
 
 	for root in scan_roots {
@@ -172,10 +172,10 @@ fn test_no_wpbc_in_code_surfaces() {
 			continue;
 		}
 		walk_dir(&root_path, &mut |path| {
-			if path
+			if !path
 				.extension()
 				.and_then(|ext| ext.to_str())
-				.is_none_or(|ext| ext != "rs")
+				.is_some_and(|ext| matches!(ext, "rs" | "sh"))
 			{
 				return;
 			}
@@ -201,11 +201,11 @@ fn test_no_wpbc_in_code_surfaces() {
 		});
 	}
 
-	let wpbc_module = manifest_dir.join("src/schema/wpbc.rs");
-	if wpbc_module.exists() {
+	let old_pbc_module = manifest_dir.join("src/schema/wpbc.rs");
+	if old_pbc_module.exists() {
 		violations.push(format!(
 			"{}: forbidden module path; rename to src/schema/pbc.rs",
-			wpbc_module.display()
+			old_pbc_module.display()
 		));
 	}
 

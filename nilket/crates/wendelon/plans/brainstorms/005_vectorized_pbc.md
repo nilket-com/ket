@@ -1,12 +1,12 @@
-# Brainstorm 005: Vectorized Stack Machine for WPBC
+# Brainstorm 005: Vectorized Stack Machine for PBC
 
 ## The Premise
-The current implementation of Wendelon Pushdown Bytecode (WPBC) in `src/schema/wpbc.rs` evaluates its stack machine using a scalar, row-by-row loop (`for row in 0..n_rows`). For every single row, it downcasts Arrow arrays, pushes scalar `Value` enum variants onto a stack, and evaluates them one by one.
+The current implementation of Pushdown Bytecode (PBC) in `src/schema/pbc.rs` evaluates its stack machine using a scalar, row-by-row loop (`for row in 0..n_rows`). For every single row, it downcasts Arrow arrays, pushes scalar `Value` enum variants onto a stack, and evaluates them one by one.
 
 While this makes sense for parsing raw bytes out of a Raft WAL, the Data Ring already holds data natively in columnar Apache Arrow `RecordBatch`es. By iterating row-by-row, we destroy branch prediction, pay the cost of dynamic dispatch repeatedly, and completely fail to utilize modern CPU SIMD (Single Instruction, Multiple Data) capabilities. We are leaving massive performance on the table.
 
 ## The Conceptual Shift: A Vectorized Stack
-Standard stack machines (like the JVM or Wasm) operate on scalar values. To fix WPBC's performance, we need to transition to a **Vectorized Stack Machine**. 
+Standard stack machines (like the JVM or Wasm) operate on scalar values. To fix PBC's performance, we need to transition to a **Vectorized Stack Machine**.
 
 Instead of the evaluation stack holding a single row's values (e.g., `Value::Int(18)`), the stack will hold entire columns: `Arc<dyn Array>` or Arrow `Scalar` representations.
 
@@ -31,8 +31,8 @@ At the end of the bytecode execution, the stack will contain exactly one item: a
 3.  **Hardware Acceleration for Free:** By feeding whole arrays to `arrow::compute` kernels, Wendelon's storage nodes inherit heavily optimized SIMD filtering out of the box, allowing the Data Ring to scan gigabytes per second per core.
 
 ## Conclusion
-WPBC doesn't need to become a complex distributed execution engine like Spark. By simply upgrading its internal evaluation model from a Scalar Stack to a Vectorized Stack, it can become the ultimate, SIMD-accelerated "bouncer" for the Data Ring, dropping rows at memory-bandwidth speeds before they ever touch the network.
+PBC doesn't need to become a complex distributed execution engine like Spark. By simply upgrading its internal evaluation model from a Scalar Stack to a Vectorized Stack, it can become the ultimate, SIMD-accelerated "bouncer" for the Data Ring, dropping rows at memory-bandwidth speeds before they ever touch the network.
 
 ---
 
-*The serverless/L2 pushdown ideas that were originally part of this brainstorm moved to brainstorm 010 as a separate workstream. The executor change itself was accepted as ADR 035 (Vectorized WPBC Executor).*
+*The serverless/L2 pushdown ideas that were originally part of this brainstorm moved to brainstorm 010 as a separate workstream. The executor change itself was accepted as ADR 035 (Vectorized PBC Executor).*

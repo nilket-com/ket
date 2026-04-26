@@ -28,7 +28,7 @@ let locality = Locality::from_z_order(tenant_id, timestamp, dimension_x);
 ## Why this wins at OLAP (BI)
 
 1. **Massive Sequential Reads:** A compute layer asking for a "Time Range" or a "Tenant" maps to a single contiguous range on the Ring. Instead of talking to 1,000 nodes for 1KB each (IOPS bottleneck), it talks to 3 nodes for 1GB each (Throughput champion).
-2. **Zero-Copy Active Storage:** Because the records are clustered, the **WPBC (Wendelon Pushdown Bytecode)** can operate on large contiguous Arrow batches in-place, filtering and aggregating before a single byte leaves the node.
+2. **Zero-Copy Active Storage:** Because the records are clustered, the **PBC (Pushdown Bytecode)** can operate on large contiguous Arrow batches in-place, filtering and aggregating before a single byte leaves the node.
 3. **Scale-Invariant Skipping:** Combined with **BF-Trees** (Bloom Filter B-Trees) at the Slab level, we can skip entire petabytes of data with a few RAM-local lookups.
 
 ## The "One Ring" Invariant

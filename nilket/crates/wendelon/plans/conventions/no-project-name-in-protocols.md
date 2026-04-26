@@ -63,7 +63,7 @@ Brand-clean (good):
 - `CSB` (Column Statistics Block, ADR 039), `HLC` (Hybrid
   Logical Clock) — functional acronyms.
 
-Brand-leaked (subject to refactor under ADR 04N):
+Formerly brand-leaked surfaces renamed by ADR 041:
 
 - `WPBC` (Wendelon Pushdown Bytecode) → `PBC`.
 - `WPBC_REJECT_*` reject codes → `PBC_REJECT_*`.
@@ -87,24 +87,26 @@ metric prefix, module name, or struct type:
   matching the existing pattern (`AGG`, `PBC`, `CSB`, `HLC`).
 - For reject codes: `<protocol>_REJECT_*` where `<protocol>` is
   the functional acronym.
-- For metric prefixes: `<protocol>_*` (e.g., `agg_*`, `pbc_*`),
-  not `<brand>_<protocol>_*`.
+- For protocol-specific metric prefixes: `<protocol>_*` (e.g.,
+  `agg_*`, `pbc_*`), not `<brand><protocol>_*`. If the metrics
+  registry applies a repo-level Prometheus namespace, keep the
+  protocol segment functional: `wendelon_pbc_*`, not
+  `wendelon_wpbc_*`.
 - For module names: descriptive, not brand-prefixed
   (`src/schema/aggregate.rs`, not `src/schema/wendelon_aggregate.rs`).
 
 ## Architectural enforcement
 
-A future addition to `tests/architecture_test.rs` (parallel to
-the existing "Control Plane" / "Data Plane" forbidden-words test
-established in `plans/philosophy.md`) greps the codebase for
-`Wendelon` references outside the cargo manifest, README, and
-explicitly-branded top-level prose. New occurrences in protocol
-surfaces, reject codes, metric prefixes, or struct types fail CI.
+`tests/architecture_test.rs` enforces ADR 041 Tier-1 by scanning
+code surfaces for the predicate-bytecode protocol's former
+brand-leaked tokens (`WPBC`, `Wpbc`, `wpbc`) and for the old
+`src/schema/wpbc.rs` module path. The Tier-2 struct-prefix rule
+for `Wendelon[A-Z]` lands after the ADR 041 follow-up audit.
 
 The architectural test makes the rule load-bearing rather than
 aspirational. The same enforcement pattern that keeps "Control
-Plane" out of the codebase keeps "Wendelon" out of internal
-identifiers.
+Plane" out of the codebase keeps brand prefixes out of internal
+protocol identifiers.
 
 ## When this changes
 
@@ -130,6 +132,6 @@ identifiers.
 - `plans/philosophy.md` — "Linguistic Forbidden Zones" section
   on `Control Plane` / `Data Plane`; same enforcement pattern,
   applied to a different forbidden vocabulary.
-- `plans/wip/claude_adr_04N.md` — ADR establishing this
-  convention, with the migration plan for existing brand-leaked
-  identifiers.
+- `plans/adr/041_protocol_naming_decoupling.md` — ADR
+  establishing this convention, with the migration plan for
+  existing brand-leaked identifiers.

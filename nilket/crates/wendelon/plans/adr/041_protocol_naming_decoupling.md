@@ -59,6 +59,13 @@ where the brand leak has the highest compounding cost:
 | `WpbcProgram`, `WpbcExecutor`, etc. | `PbcProgram`, `PbcExecutor`, etc. |
 | `plans/schema/compute_ast.md` content | references "PBC" throughout (filename stays — already brand-clean) |
 
+Metric names may still carry the repo-level Prometheus namespace
+where the metrics registry already uses one. The protocol segment
+must be functional: `wendelon_pbc_*` is fine; `wendelon_wpbc_*`
+is not. See
+`plans/conventions/no-project-name-in-protocols.md` for the
+review rule.
+
 The acronym `PBC` is chosen over alternatives (`PDX`, `BC`,
 spelled-out "Bytecode") for these reasons:
 
@@ -301,8 +308,9 @@ documentation matches the current code state.
   "control plane / data plane" forbidden-words test in
   `tests/architecture_test.rs`): forbid the literal substring
   `WPBC` and the `wpbc_` prefix in metric/reject-code string
-  literals across `src/`, `tests/`, `benches/`, `examples/`.
-  Exempt cargo manifest, README, and `plans/`.
+  literals across `src/`, `tests/`, `benches`, `examples`,
+  `crates`, and CI helper scripts. Exempt cargo manifest,
+  README, and `plans/`.
 - The test does **not** forbid the `Wendelon[A-Z]` pattern in
   this merge; that rule lands after the Tier-2 audit.
 

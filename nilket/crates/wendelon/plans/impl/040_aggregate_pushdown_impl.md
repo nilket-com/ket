@@ -377,7 +377,7 @@ Tests:
 
 Exit:
 
-- Approximate aggregates work end-to-end. `WendelonApprox`
+- Approximate aggregates work end-to-end. `PushdownApprox`
   becomes load-bearing.
 
 ## Phase 7 — Metrics and documentation

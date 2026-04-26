@@ -54,7 +54,7 @@ What's true now that wasn't true a week ago:
   codes, metric prefixes, or module names. A future project
   rename (Wendelon → another name) is a Tier-3 metadata change,
   not a protocol break.
-- ADR 036's `WendelonApprox` targetability label, idle since
+- ADR 036's `PushdownApprox` targetability label, idle since
   the contract was written, is now load-bearing for
   `quantile_kll` and `approx_distinct`.
 
