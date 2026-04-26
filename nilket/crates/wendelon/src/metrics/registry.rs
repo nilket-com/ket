@@ -707,6 +707,7 @@ pub struct MetricsRegistry {
 	pub agg_rows_filtered_out_total: Counter,
 	pub agg_partials_merged_total: Counter,
 	pub agg_csb_short_circuit_total: Counter,
+	pub agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter,
 	pub agg_int_overflow_total: Counter,
 	pub agg_skipped_no_capability_total: Counter,
 	agg_partial_bytes: Histogram,
@@ -836,6 +837,7 @@ impl Default for MetricsRegistry {
 			agg_rows_filtered_out_total: Counter::default(),
 			agg_partials_merged_total: Counter::default(),
 			agg_csb_short_circuit_total: Counter::default(),
+			agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter::default(),
 			agg_int_overflow_total: Counter::default(),
 			agg_skipped_no_capability_total: Counter::default(),
 			agg_partial_bytes: Histogram::new(AGG_PARTIAL_BYTES_BUCKETS),
@@ -1038,6 +1040,11 @@ impl MetricsRegistry {
 
 	pub fn observe_agg_int_overflow(&self) {
 		self.agg_int_overflow_total.inc();
+	}
+
+	pub fn observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata(&self) {
+		self.agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total
+			.inc();
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1469,6 +1476,13 @@ impl MetricsRegistry {
 			"wendelon_agg_csb_short_circuit_total",
 			"Aggregate slab answers derived directly from column statistics blocks.",
 			self.agg_csb_short_circuit_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total",
+			"Aggregate CSB direct-answer attempts skipped because tombstone metadata is untracked.",
+			self.agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total
+				.get(),
 		);
 		render_counter(
 			&mut out,
@@ -1951,8 +1965,8 @@ fn mask_selectivity(rows_scanned: u64, rows_returned: u64) -> f64 {
 #[cfg(test)]
 mod tests {
 	use super::{
-		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
-		PendingFinalizationReplayPath, PbcRuntime, render_histogram,
+		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome, PbcRuntime,
+		PendingFinalizationReplayPath, render_histogram,
 	};
 	use crate::schema::WriteStatus;
 	use std::time::Duration;
@@ -2035,6 +2049,7 @@ mod tests {
 		registry.observe_agg_merge(2, Duration::from_micros(35));
 		registry.observe_agg_int_overflow();
 		registry.agg_csb_short_circuit_total.inc();
+		registry.observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
 		registry.agg_skipped_no_capability_total.inc();
 
 		let rendered = registry.render_prometheus();
@@ -2083,6 +2098,9 @@ mod tests {
 		assert!(rendered.contains("wendelon_agg_rows_filtered_out_total 8"));
 		assert!(rendered.contains("wendelon_agg_partials_merged_total 2"));
 		assert!(rendered.contains("wendelon_agg_csb_short_circuit_total 1"));
+		assert!(rendered.contains(
+			"wendelon_agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total 1"
+		));
 		assert!(rendered.contains("wendelon_agg_int_overflow_total 1"));
 		assert!(rendered.contains("wendelon_agg_skipped_no_capability_total 1"));
 		assert!(rendered.contains("wendelon_agg_partial_bytes_bucket{le=\"128\"} 1"));

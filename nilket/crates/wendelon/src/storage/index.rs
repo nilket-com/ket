@@ -1,4 +1,6 @@
-use crate::schema::{HybridTimestamp, Identity, Locality, SlabId, TenantId, TenantKekId};
+use crate::schema::{
+	HybridTimestamp, Identity, Locality, SlabId, TenantId, TenantKekId, TombstoneMetadata,
+};
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -23,7 +25,8 @@ const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// - bit 3 = `stats_format_version` present (2 LE bytes)
 /// - bit 4 = `stats_block_len` present (4 LE bytes)
 /// - bit 5 = `stats_block_hash128` present (16 raw bytes)
-/// - bit 6 = `first_tombstone_hlc` present (16 LE bytes)
+/// - bit 6 = earliest tombstone HLC present (16 LE bytes)
+/// - bit 7 = tombstone metadata is tracked
 ///
 /// Older rows only use bit 0 and therefore decode cleanly with
 /// missing tenant / tenant-KEK metadata.
@@ -44,13 +47,15 @@ const TIERED_FLAG_HAS_STATS_FORMAT_VERSION: u8 = 0b0000_1000;
 const TIERED_FLAG_HAS_STATS_BLOCK_LEN: u8 = 0b0001_0000;
 const TIERED_FLAG_HAS_STATS_BLOCK_HASH128: u8 = 0b0010_0000;
 const TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC: u8 = 0b0100_0000;
+const TIERED_FLAG_TOMBSTONE_METADATA_TRACKED: u8 = 0b1000_0000;
 const TIERED_FLAG_KNOWN_MASK: u8 = TIERED_FLAG_IS_ENCRYPTED
 	| TIERED_FLAG_HAS_TENANT_ID
 	| TIERED_FLAG_HAS_TENANT_KEK_ID
 	| TIERED_FLAG_HAS_STATS_FORMAT_VERSION
 	| TIERED_FLAG_HAS_STATS_BLOCK_LEN
 	| TIERED_FLAG_HAS_STATS_BLOCK_HASH128
-	| TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC;
+	| TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC
+	| TIERED_FLAG_TOMBSTONE_METADATA_TRACKED;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -440,8 +445,14 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	if pointer.stats_block_hash128.is_some() {
 		flags |= TIERED_FLAG_HAS_STATS_BLOCK_HASH128;
 	}
-	if pointer.first_tombstone_hlc.is_some() {
-		flags |= TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC;
+	match pointer.tombstone_metadata {
+		TombstoneMetadata::Untracked => {}
+		TombstoneMetadata::None => {
+			flags |= TIERED_FLAG_TOMBSTONE_METADATA_TRACKED;
+		}
+		TombstoneMetadata::Earliest(_) => {
+			flags |= TIERED_FLAG_TOMBSTONE_METADATA_TRACKED | TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC;
+		}
 	}
 	bytes.push(flags);
 	if let Some(tenant_id) = pointer.tenant_id {
@@ -459,10 +470,10 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	if let Some(stats_block_hash128) = pointer.stats_block_hash128 {
 		bytes.extend_from_slice(&stats_block_hash128);
 	}
-	if let Some(first_tombstone_hlc) = pointer.first_tombstone_hlc {
-		bytes.extend_from_slice(&first_tombstone_hlc.physical_ms.to_le_bytes());
-		bytes.extend_from_slice(&first_tombstone_hlc.logical.to_le_bytes());
-		bytes.extend_from_slice(&first_tombstone_hlc.node_id.to_le_bytes());
+	if let TombstoneMetadata::Earliest(tombstone_metadata) = pointer.tombstone_metadata {
+		bytes.extend_from_slice(&tombstone_metadata.physical_ms.to_le_bytes());
+		bytes.extend_from_slice(&tombstone_metadata.logical.to_le_bytes());
+		bytes.extend_from_slice(&tombstone_metadata.node_id.to_le_bytes());
 	}
 	bytes.extend_from_slice(pointer.l2_uri.as_bytes());
 	bytes
@@ -566,22 +577,24 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	} else {
 		None
 	};
-	let first_tombstone_hlc = if (flags & TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC) != 0 {
+	let tombstone_metadata = if (flags & TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC) != 0 {
 		let end = cursor.saturating_add(16);
 		let slot = value.get(cursor..end).ok_or_else(|| {
 			Error::new(
 				ErrorKind::InvalidData,
-				"tiered slab value truncated while decoding first_tombstone_hlc",
+				"tiered slab value truncated while decoding tombstone_metadata",
 			)
 		})?;
 		cursor = end;
-		Some(HybridTimestamp {
+		TombstoneMetadata::Earliest(HybridTimestamp {
 			physical_ms: u64::from_le_bytes(slot[0..8].try_into().expect("fixed width")),
 			logical: u32::from_le_bytes(slot[8..12].try_into().expect("fixed width")),
 			node_id: u32::from_le_bytes(slot[12..16].try_into().expect("fixed width")),
 		})
+	} else if (flags & TIERED_FLAG_TOMBSTONE_METADATA_TRACKED) != 0 {
+		TombstoneMetadata::None
 	} else {
-		None
+		TombstoneMetadata::Untracked
 	};
 	let l2_uri = std::str::from_utf8(&value[cursor..])
 		.map_err(|err| {
@@ -601,7 +614,7 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 		stats_format_version,
 		stats_block_len,
 		stats_block_hash128,
-		first_tombstone_hlc,
+		tombstone_metadata,
 	})
 }
 
@@ -641,7 +654,7 @@ fn decode_tiered_pointer_v1(slab_id: SlabId, value: &[u8]) -> std::io::Result<Ti
 		stats_format_version: None,
 		stats_block_len: None,
 		stats_block_hash128: None,
-		first_tombstone_hlc: None,
+		tombstone_metadata: TombstoneMetadata::Untracked,
 	})
 }
 
@@ -732,7 +745,7 @@ mod tests {
 			stats_format_version: Some(1),
 			stats_block_len: Some(128),
 			stats_block_hash128: Some([0x5A; 16]),
-			first_tombstone_hlc: Some(HybridTimestamp {
+			tombstone_metadata: TombstoneMetadata::Earliest(HybridTimestamp {
 				physical_ms: 99,
 				logical: 1,
 				node_id: 2,
@@ -741,6 +754,24 @@ mod tests {
 		let encoded = encode_tiered_pointer(&pointer);
 		let decoded = decode_tiered_pointer(pointer.slab_id, &encoded).unwrap();
 		assert_eq!(decoded, pointer);
+
+		for tombstone_metadata in [
+			TombstoneMetadata::Untracked,
+			TombstoneMetadata::None,
+			TombstoneMetadata::Earliest(HybridTimestamp {
+				physical_ms: 100,
+				logical: 2,
+				node_id: 3,
+			}),
+		] {
+			let pointer = TieredSlabPointer {
+				tombstone_metadata,
+				..pointer.clone()
+			};
+			let decoded =
+				decode_tiered_pointer(pointer.slab_id, &encode_tiered_pointer(&pointer)).unwrap();
+			assert_eq!(decoded.tombstone_metadata, tombstone_metadata);
+		}
 	}
 
 	#[test]
@@ -755,7 +786,7 @@ mod tests {
 		assert_eq!(decoded.stats_format_version, None);
 		assert_eq!(decoded.stats_block_len, None);
 		assert_eq!(decoded.stats_block_hash128, None);
-		assert_eq!(decoded.first_tombstone_hlc, None);
+		assert_eq!(decoded.tombstone_metadata, TombstoneMetadata::Untracked);
 	}
 
 	#[tokio::test]
@@ -773,7 +804,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		let local_row = PersistentRecordRow {
 			location: RecordLocation {
@@ -822,7 +853,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 
 		index

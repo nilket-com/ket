@@ -2,7 +2,7 @@ use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyse
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
-	ReleaseLeaseRequestMeta, SlabId, TenantId, TenantKekId,
+	ReleaseLeaseRequestMeta, SlabId, TenantId, TenantKekId, TombstoneMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -60,10 +60,11 @@ pub struct TieredSlab {
 	/// ADR 039 advisory: BLAKE3(stats ciphertext)[0..16] when known.
 	#[serde(default)]
 	pub stats_block_hash128: Option<[u8; 16]>,
-	/// ADR 040 visibility proof: earliest tombstone committed
-	/// against any row in this slab, if known.
+	/// ADR 040 visibility proof for CSB aggregate answers.
+	/// `Untracked` means this pointer cannot prove aggregate
+	/// short-circuit visibility.
 	#[serde(default)]
-	pub first_tombstone_hlc: Option<HybridTimestamp>,
+	pub tombstone_metadata: TombstoneMetadata,
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.
@@ -210,6 +211,7 @@ pub struct MigratedRangeTombstone {
 	pub range_end: u64,
 	pub to_epoch: u64,
 	pub completed_by: NodeId,
+	pub completed_at_hlc: HybridTimestamp,
 	pub migration_hlc_floor: HybridTimestamp,
 }
 

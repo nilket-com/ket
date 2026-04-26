@@ -63,6 +63,8 @@ use crate::integration::compute::{
 };
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
+#[cfg(test)]
+use crate::schema::TombstoneMetadata;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
 	RaftLogEntryFixed, SlabId, SnapshotHeader, TableSchemaCatalogV1, TenantId, TenantKekId,
@@ -1668,6 +1670,15 @@ pub trait TierObserver: Send + Sync {
 		let _ = (slab_id, applied_log_index);
 		Ok(())
 	}
+
+	async fn on_migrated_range_tombstone(
+		&self,
+		tombstone: &MigratedRangeTombstone,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		let _ = (tombstone, applied_log_index);
+		Ok(())
+	}
 }
 
 #[async_trait::async_trait]
@@ -2262,6 +2273,10 @@ impl WendelonStateMachine {
 		self.inner.read().await.state.clone()
 	}
 
+	pub async fn tombstones_snapshot(&self) -> Vec<MigratedRangeTombstone> {
+		self.inner.read().await.state.tombstones.clone()
+	}
+
 	pub async fn checkpoint_observation(&self, force: bool) -> Option<CheckpointObservation> {
 		let guard = self.inner.read().await;
 		checkpoint_observation_from_state(&guard.state, force)
@@ -2302,6 +2317,15 @@ impl WendelonStateMachine {
 	pub async fn seed_tiered_slab_for_test(&self, tier: crate::consensus::TieredSlab) {
 		let mut guard = self.inner.write().await;
 		guard.state.tiered_slabs.insert(tier.slab_id, tier);
+	}
+
+	#[cfg(test)]
+	pub async fn seed_migrated_range_tombstone_for_test(
+		&self,
+		tombstone: crate::consensus::MigratedRangeTombstone,
+	) {
+		let mut guard = self.inner.write().await;
+		guard.state.tombstones.push(tombstone);
 	}
 
 	#[cfg(test)]
@@ -2427,6 +2451,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						.on_slab_retired(*slab_id, *applied_log_index)
 						.await
 						.map_err(|error| (*slab_id, error)),
+					TierObserverEvent::MigratedRangeTombstone(tombstone) => observer
+						.on_migrated_range_tombstone(tombstone, *applied_log_index)
+						.await
+						.map_err(|error| (SlabId::new(0), error)),
 				};
 				if let Err((slab_id, error)) = result {
 					tracing::warn!(
@@ -2657,6 +2685,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 enum TierObserverEvent {
 	Tiered(TieredSlab),
 	Retired(SlabId),
+	MigratedRangeTombstone(MigratedRangeTombstone),
 }
 
 /// Fold one committed [`WendelonRequest`] into the SM state.
@@ -3296,8 +3325,11 @@ fn apply_request(
 			(WendelonResponse::Success, None)
 		}
 		WendelonRequest::MigrationComplete(done) => {
-			apply_migration_complete(state, done);
-			(WendelonResponse::Success, None)
+			let tombstone = apply_migration_complete(state, done);
+			(
+				WendelonResponse::Success,
+				tombstone.map(TierObserverEvent::MigratedRangeTombstone),
+			)
 		}
 	}
 }
@@ -3630,7 +3662,10 @@ fn apply_seed_migration(state: &mut SmState, seed: SeedMigration) {
 /// here (the leader is the one proposing), but dropping rather
 /// than erroring keeps the state machine deterministic under
 /// replay.
-fn apply_migration_complete(state: &mut SmState, done: MigrationComplete) {
+fn apply_migration_complete(
+	state: &mut SmState,
+	done: MigrationComplete,
+) -> Option<MigratedRangeTombstone> {
 	let matches = state
 		.migrations
 		.get(&done.migration_id)
@@ -3642,7 +3677,7 @@ fn apply_migration_complete(state: &mut SmState, done: MigrationComplete) {
 		})
 		.unwrap_or(false);
 	if !matches {
-		return;
+		return None;
 	}
 
 	{
@@ -3651,21 +3686,23 @@ fn apply_migration_complete(state: &mut SmState, done: MigrationComplete) {
 			.get_mut(&done.migration_id)
 			.expect("matched above");
 		if entry.state == MigrationState::Completed {
-			return; // idempotent replay
+			return None; // idempotent replay
 		}
 		entry.state = MigrationState::Completed;
 		entry.completed_by = Some(done.completed_by);
 		entry.completed_at_hlc = Some(done.completed_at_hlc);
 	}
 
-	state.tombstones.push(MigratedRangeTombstone {
+	let tombstone = MigratedRangeTombstone {
 		migration_id: done.migration_id,
 		range_start: done.range_start,
 		range_end: done.range_end,
 		to_epoch: done.to_epoch,
 		completed_by: done.completed_by,
+		completed_at_hlc: done.completed_at_hlc,
 		migration_hlc_floor: done.migration_hlc_floor,
-	});
+	};
+	state.tombstones.push(tombstone.clone());
 
 	// Descendant reconciliation under the drain-all rule.
 	//
@@ -3716,6 +3753,8 @@ fn apply_migration_complete(state: &mut SmState, done: MigrationComplete) {
 			.retain(|n| n.id != done.completed_by.id);
 		entry.source_replicas.insert(0, done.completed_by);
 	}
+
+	Some(tombstone)
 }
 
 // ============================================================
@@ -7379,7 +7418,7 @@ mod tiered_slab_tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 
 		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
@@ -7581,7 +7620,7 @@ mod tenant_kek_tests {
 				stats_format_version: None,
 				stats_block_len: None,
 				stats_block_hash128: None,
-				first_tombstone_hlc: None,
+				tombstone_metadata: TombstoneMetadata::None,
 			},
 		);
 

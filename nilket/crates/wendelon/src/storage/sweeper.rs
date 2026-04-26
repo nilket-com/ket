@@ -68,11 +68,12 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditSink, NoopAuditSink};
 use crate::consensus::monitor::{PhysicalClock, SystemClock};
 use crate::consensus::{
-	RetireTieredSlab, TieredSlab, WendelonRaft, WendelonRequest, WendelonStateMachine,
+	MigratedRangeTombstone, RetireTieredSlab, TieredSlab, WendelonRaft, WendelonRequest,
+	WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
-use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId};
+use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
@@ -448,7 +449,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
@@ -590,7 +591,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
-			first_tombstone_hlc: pointer.first_tombstone_hlc,
+			tombstone_metadata: pointer.tombstone_metadata,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -697,7 +698,7 @@ impl SlabSweeper {
 				stats_format_version,
 				stats_block_len,
 				stats_block_hash128,
-				first_tombstone_hlc: pointer.first_tombstone_hlc,
+				tombstone_metadata: pointer.tombstone_metadata,
 			};
 			if let Err(error) = self.raft.commit_tier_slab(tier).await {
 				return Err(error);
@@ -751,7 +752,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
-			first_tombstone_hlc: pointer.first_tombstone_hlc,
+			tombstone_metadata: pointer.tombstone_metadata,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -866,6 +867,7 @@ impl SlabSweeper {
 				old_l2_uri,
 				encrypted_bytes,
 				payload_hash,
+				tombstone_metadata,
 				pruned_versions,
 				reclaimed_bytes,
 			} => {
@@ -911,7 +913,7 @@ impl SlabSweeper {
 					stats_format_version,
 					stats_block_len,
 					stats_block_hash128,
-					first_tombstone_hlc: None,
+					tombstone_metadata,
 				};
 				if let Err(error) = self.raft.commit_tier_slab(tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
@@ -1103,7 +1105,7 @@ impl SlabSweeper {
 			stats_format_version: t.stats_format_version,
 			stats_block_len: t.stats_block_len,
 			stats_block_hash128: t.stats_block_hash128,
-			first_tombstone_hlc: t.first_tombstone_hlc,
+			tombstone_metadata: t.tombstone_metadata,
 		})
 	}
 
@@ -1122,7 +1124,7 @@ impl SlabSweeper {
 				stats_format_version: tier.stats_format_version,
 				stats_block_len: tier.stats_block_len,
 				stats_block_hash128: tier.stats_block_hash128,
-				first_tombstone_hlc: tier.first_tombstone_hlc,
+				tombstone_metadata: tier.tombstone_metadata,
 			})
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
@@ -1469,7 +1471,7 @@ impl TierObserver for ManagerTierObserver {
 					stats_format_version: tier.stats_format_version,
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
-					first_tombstone_hlc: tier.first_tombstone_hlc,
+					tombstone_metadata: tier.tombstone_metadata,
 				},
 				Some(applied_log_index),
 			)
@@ -1483,6 +1485,17 @@ impl TierObserver for ManagerTierObserver {
 	) -> std::io::Result<()> {
 		self.slab
 			.retire_tiered_slab_committed(slab_id, Some(applied_log_index))
+			.await
+			.map(|_| ())
+	}
+
+	async fn on_migrated_range_tombstone(
+		&self,
+		tombstone: &MigratedRangeTombstone,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.slab
+			.record_migrated_range_tombstone(tombstone, Some(applied_log_index))
 			.await
 			.map(|_| ())
 	}
@@ -1609,7 +1622,7 @@ mod tests {
 			stats_format_version: pointer.stats_format_version,
 			stats_block_len: pointer.stats_block_len,
 			stats_block_hash128: pointer.stats_block_hash128,
-			first_tombstone_hlc: pointer.first_tombstone_hlc,
+			tombstone_metadata: pointer.tombstone_metadata,
 		})
 		.await;
 	}
@@ -1861,7 +1874,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
@@ -1894,7 +1907,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
@@ -2114,7 +2127,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: current_pointer.first_tombstone_hlc,
+			tombstone_metadata: current_pointer.tombstone_metadata,
 		};
 		manager
 			.apply_tier_slab(metadata_missing_pointer.clone())
@@ -2195,6 +2208,7 @@ mod tests {
 			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
 			.await
 			.unwrap();
+		let tombstone_metadata = TombstoneMetadata::Earliest(hlc_at(now_ms.saturating_sub(1_000)));
 		let old_pointer = TieredSlabPointer {
 			slab_id: sealed_id,
 			l2_uri: old_uri.clone(),
@@ -2217,7 +2231,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2252,6 +2266,7 @@ mod tests {
 
 		let new_pointer = manager.tier_pointer(sealed_id).await.unwrap();
 		assert_ne!(new_pointer.l2_uri, old_uri);
+		assert_eq!(new_pointer.tombstone_metadata, tombstone_metadata);
 		assert!(
 			l2.get(&old_uri).await.is_err(),
 			"old tiered object should be deleted after retention rewrite"
@@ -2345,7 +2360,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		manager
@@ -2496,7 +2511,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2620,7 +2635,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2759,7 +2774,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
-				first_tombstone_hlc: None,
+				tombstone_metadata: TombstoneMetadata::None,
 			})
 			.await
 			.unwrap();

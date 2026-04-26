@@ -50,10 +50,9 @@ CSB drives both predicate pruning during slab admission AND a
 narrow direct-answer short-circuit for `count_star`,
 `count_non_null`, `min`, and `max` under a strict
 visibility-and-nonrestrictive-predicate proof condition (§5).
-The proof depends on a small ADR 039 TieredSlab pointer
-extension amended by this ADR:
-`first_tombstone_hlc: Option<HybridTimestamp>` (§"ADR 039
-amendment").
+The proof depends on a small ADR 039 TieredSlab pointer extension
+amended by this ADR: `tombstone_metadata: TombstoneMetadata`
+(§"ADR 039 amendment").
 
 ### Scope and shape
 
@@ -161,8 +160,9 @@ amendment").
       the relevant always-on stat in the CSB (ADR 039 §5).
    2. The slab is **visibility-complete at `as_of_hlc`**:
       `slab.seal_hlc ≤ as_of_hlc` AND
-      (`slab.first_tombstone_hlc` is `None` OR > `as_of_hlc`).
-      The `first_tombstone_hlc` field amends ADR 039's
+      `slab.tombstone_metadata` is tracked AND either records no
+      tombstone or records an earliest tombstone > `as_of_hlc`.
+      The `tombstone_metadata` field amends ADR 039's
       TieredSlab pointer; see §"ADR 039 amendment".
    3. The PBC predicate (if any) is **provably non-restrictive
       for the slab**: every row in the slab satisfies the
@@ -629,7 +629,7 @@ amendment").
     References to the predicate bytecode use `PBC` per ADR 041's
     project-name decoupling.
 
-## ADR 039 amendment: `first_tombstone_hlc` field
+## ADR 039 amendment: `tombstone_metadata` field
 
 V1's CSB short-circuit (§5) requires a small extension to ADR
 039's TieredSlab pointer schema. This ADR amends ADR 039 in
@@ -638,25 +638,33 @@ contract, while ADR 040 is the first consumer.
 
 ```rust
 // added to TieredSlab pointer (control-ring state):
-first_tombstone_hlc: Option<HybridTimestamp>
+tombstone_metadata: TombstoneMetadata
+
+enum TombstoneMetadata {
+    Untracked,
+    None,
+    Earliest(HybridTimestamp),
+}
 ```
 
 Semantics: when a tombstone record at HLC `T` is committed
 against a row in slab `S`, the storage layer atomically updates
-the slab's field to retain the *earliest* tombstone timestamp:
+the slab's tracked field to retain the *earliest* tombstone
+timestamp:
 
 ```rust
-S.first_tombstone_hlc = match S.first_tombstone_hlc {
-    None         => Some(T),
-    Some(prev_t) => Some(min(prev_t, T)),
+S.tombstone_metadata = match S.tombstone_metadata {
+    Untracked        => Untracked,
+    None             => Earliest(T),
+    Earliest(prev_t) => Earliest(min(prev_t, T)),
 };
 ```
 
-(This is *not* the default `Ord` behavior on `Option<T>` — that
-treats `None < Some(_)`, which is the wrong direction for "no
-tombstones means latest possible." The match above captures the
-intended semantics: `None` means "no tombstones yet"; any
-`Some(t)` means "earliest tombstone is at HLC `t`.")
+`Untracked` means the pointer was decoded without tombstone
+metadata, so the CSB short-circuit must treat the slab as
+ineligible until a natural compaction or rewrite produces a tracked
+pointer. `None` means "tracked and no tombstones yet";
+`Earliest(t)` means "earliest committed tombstone is at HLC `t`."
 
 Default `None` for a freshly sealed slab.
 
@@ -664,18 +672,19 @@ The CSB short-circuit visibility check is:
 
 ```
 slab.seal_hlc ≤ as_of_hlc
-&& slab.first_tombstone_hlc.is_none_or(|t| t > as_of_hlc)
+&& slab.tombstone_metadata is tracked
+&& slab.tombstone_metadata.earliest().is_none_or(|t| t > as_of_hlc)
 ```
 
-Cost: ~16 bytes per TieredSlab pointer and one CAS per tombstone
-write. Both negligible relative to the optimization they unlock
-(chunk-decryption-free MIN/MAX/COUNT for append-only and
-steady-state reads).
+Cost: two pointer flag bits, 16 bytes when an earliest tombstone HLC
+is present, and one CAS per tombstone write. All are negligible
+relative to the optimization they unlock (chunk-decryption-free
+MIN/MAX/COUNT for append-only and steady-state reads).
 
 Pre-amendment sealed slabs have no encoded field; decode defaults
-to `None`. CSB short-circuit treats those slabs conservatively as
-"not eligible" until natural compaction or rewrite produces a
-pointer under the amended schema.
+to `Untracked`. CSB short-circuit treats those slabs
+conservatively as "not eligible" until natural compaction or
+rewrite produces a pointer under the amended schema.
 
 ## Rationale
 
@@ -736,7 +745,7 @@ selectivity-only.
 optimization is too valuable to drop (`MIN(event_time)` over a
 billion-row append-only table reads one slab tail per slab
 instead of every chunk) and the proof shape is cheap (one
-`Option<HybridTimestamp>` field, one CAS per tombstone). The
+tracked tombstone metadata field, one CAS per tombstone). The
 proof condition closes the soundness gap: short-circuit is
 allowed exactly when slab-write-time stats equal visibility-at-
 `as_of_hlc` stats.
@@ -773,9 +782,9 @@ into a stability contract it doesn't deserve.
   user-surface decisions.
 - **`GROUP BY` queries get no leverage in V1.**
 - **No float or decimal SUM/AVG.**
-- **`first_tombstone_hlc` adds tombstone-write cost.** Each
+- **`tombstone_metadata` adds tombstone-write cost.** Each
   tombstone write does a CAS on the slab pointer's
-  `first_tombstone_hlc` field. Negligible at warehouse write
+  `tombstone_metadata` field. Negligible at warehouse write
   rates, but it's not free.
 - **CSB short-circuit's narrow soundness window.** Tables with
   active tombstone churn won't see the optimization; only
@@ -939,7 +948,7 @@ atomicity strategy) are tracked alongside the implementation PR.
 - ADR 038: Column-Aware Locality V1 (Z-Order).
 - ADR 039: Slab-Footer Column Statistics V1 — CSB drives
   predicate pruning during AGG execution; AGG V1 extends the
-  TieredSlab pointer with `first_tombstone_hlc` to enable CSB
+  TieredSlab pointer with `tombstone_metadata` to enable CSB
   short-circuit under MVCC.
 - ADR 041: Project-name decoupling from internal protocols and
   types.

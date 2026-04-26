@@ -64,6 +64,8 @@ use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::{MembershipEpoch, NodeCapability, NodeRole, TransportStream};
 use crate::network::wire;
+#[cfg(test)]
+use crate::schema::TombstoneMetadata;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
 	AggregateDiagnostics, AggregateExpressionIndex, AggregateFunction, AggregateRequest,
@@ -5108,6 +5110,7 @@ impl WendelonDataServer {
 			return Ok(None);
 		}
 
+		let committed_tombstones = self.state_machine.tombstones_snapshot().await;
 		let mut slab_ids = HashSet::new();
 		let mut responses = Vec::new();
 		for range in &prepared.ranges {
@@ -5124,9 +5127,20 @@ impl WendelonDataServer {
 				let Some(pointer) = self.slab.tier_pointer(location.slab_id).await else {
 					return Ok(None);
 				};
+				if pointer.tombstone_metadata.is_untracked() {
+					metrics().observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
+					return Ok(None);
+				}
+				if self.slab.slab_has_migrated_range_tombstone_at(
+					location.slab_id,
+					request.as_of_hlc,
+					&committed_tombstones,
+				) {
+					return Ok(None);
+				}
 				if !crate::storage::slab_visibility_complete(
 					location.hlc,
-					pointer.first_tombstone_hlc,
+					pointer.tombstone_metadata,
 					request.as_of_hlc,
 				) {
 					return Ok(None);
@@ -9852,7 +9866,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -9887,7 +9901,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -9918,7 +9932,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -10910,7 +10924,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -12334,6 +12348,128 @@ mod tests {
 		let max = encode_signed_stat_value(2, 8).unwrap();
 		assert_eq!(&response.partials[2].state[4..12], min.as_slice());
 		assert_eq!(&response.partials[3].state[4..12], max.as_slice());
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_direct_answer_falls_through_when_sm_tombstone_affects_slab() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-tombstone.wnd")
+				.await;
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			50,
+			bootstrap_tempdir("aggregate-csb-tombstone-node"),
+			"loopback://50".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		node.state_machine
+			.seed_migrated_range_tombstone_for_test(crate::consensus::MigratedRangeTombstone {
+				migration_id: 77,
+				range_start: 0,
+				range_end: u64::MAX,
+				to_epoch: 2,
+				completed_by: n(50),
+				completed_at_hlc: hlc(50, 0, 1),
+				migration_hlc_floor: hlc(0, 0, 0),
+			})
+			.await;
+
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://50".into(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap();
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(491),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc: hlc(99, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression::count_star()],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+
+		let prepared = server
+			.prepare_aggregate_execution_context_with_migration(&request)
+			.await
+			.unwrap()
+			.unwrap();
+		let metric_before = metrics().agg_csb_short_circuit_total.get();
+		assert!(
+			server
+				.try_aggregate_csb_direct_answer(&request, &prepared)
+				.await
+				.unwrap()
+				.is_none(),
+			"state-machine tombstones must fence CSB direct answer even when the pointer says None"
+		);
+		assert_eq!(
+			metrics().agg_csb_short_circuit_total.get(),
+			metric_before,
+			"fall-through must not count as a CSB direct answer"
+		);
 
 		node.handles.abort();
 	}

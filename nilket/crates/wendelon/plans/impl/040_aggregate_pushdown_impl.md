@@ -14,7 +14,7 @@ the predicate bytecode. Concretely:
   execution.
 - Coordinator-node fan-out: merge peer partials, return one
   envelope to Toron.
-- Add the `first_tombstone_hlc` field to TieredSlab pointers so
+- Add the `tombstone_metadata` field to TieredSlab pointers so
   CSB short-circuit is sound under MVCC.
 - Advertise the path through
   `NodeCapability::PartialAggregatePushdown` (bit 1; ADR 039's
@@ -48,17 +48,20 @@ Outputs:
 
 Visibility-flag prep:
 
-- Add `first_tombstone_hlc: Option<HybridTimestamp>` to the
+- Add tri-state `tombstone_metadata: TombstoneMetadata` to the
   TieredSlab pointer schema in `src/storage/index.rs`.
-- Default `None` for freshly sealed slabs.
+- States:
+  - `Untracked`: pre-metadata pointer; CSB aggregate direct
+    answers are ineligible.
+  - `None`: tracked pointer with no committed tombstone.
+  - `Earliest(HybridTimestamp)`: tracked pointer with the
+    earliest committed tombstone HLC.
+- Default `None` for freshly sealed slabs; default decode for
+  absent serialized metadata is `Untracked`.
 - Tombstone-write hook: when a tombstone is committed against a
-  row in slab S at HLC T, atomically update
-  `S.first_tombstone_hlc` to retain the *earliest* tombstone
-  timestamp (per ADR 040 §"Dependency on ADR 039"; not the
-  default `Ord` direction on `Option`).
-- Backfill: existing TieredSlab pointers get `None`. CSB
-  short-circuit treats absence as "not eligible" until natural
-  compaction populates the field.
+  row in slab S at HLC T, update `S.tombstone_metadata` to retain
+  the *earliest* tombstone timestamp. `Untracked` remains
+  untracked until compaction/rewrite produces a tracked pointer.
 
 Decisions to make at Phase 0:
 
@@ -106,7 +109,7 @@ Work:
 - Add `PredicateBytecode` alias for the `PbcProgram` type
   (per ADR 041's protocol-naming).
 - Extend topology snapshot serialization tests for the new bit.
-- TieredSlab pointer with `first_tombstone_hlc = Some(t)`
+- TieredSlab pointer with `tombstone_metadata = Earliest(t)`
   round-trips through Raft state and snapshot.
 
 Tests:
@@ -122,7 +125,7 @@ Tests:
 Exit:
 
 - Aggregate protocol types compile, validate, and round-trip.
-- `first_tombstone_hlc` is plumbed into the TieredSlab schema.
+- `tombstone_metadata` is plumbed into the TieredSlab schema.
 - No executor behavior exists yet.
 
 ## Phase 2 — Accumulator and sketch library
@@ -310,7 +313,8 @@ Work:
   (must scan).
 - Add a `slab_visibility_complete(slab, as_of_hlc)` helper:
   returns true iff `slab.seal_hlc ≤ as_of_hlc` AND
-  (`slab.first_tombstone_hlc` is `None` OR > `as_of_hlc`).
+  `slab.tombstone_metadata` is tracked and either `None` or
+  `Earliest(t) where t > as_of_hlc`.
 - For `count_star`, `count_non_null`, `min`, `max`: when the
   aggregate is in this set AND the predicate is non-restrictive
   (or absent) AND visibility is complete, answer from CSB
@@ -325,7 +329,7 @@ Tests:
 - No-predicate `count_star` over an append-only slab (visibility
   complete) short-circuits and returns the row count from CSB
   without chunk reads.
-- Same query over a slab with `first_tombstone_hlc <= as_of_hlc`
+- Same query over a slab with `Earliest(t) where t <= as_of_hlc`
   does *not* short-circuit; falls through to scan.
 - Non-restrictive predicate over a visibility-complete slab
   short-circuits.
@@ -335,10 +339,10 @@ Tests:
 - CSB-derived answer matches the row-scan oracle for every
   eligible aggregate.
 - Concurrent tombstone writes correctly update
-  `first_tombstone_hlc` (CAS test).
-- A slab with `first_tombstone_hlc = None` newly migrated from
-  pre-040 state: short-circuit conservatively disabled until a
-  fresh sealed slab carries the field.
+  `tombstone_metadata` (CAS test).
+- A slab with `tombstone_metadata = Untracked` newly migrated
+  from pre-040 state: short-circuit conservatively disabled until
+  a fresh sealed slab carries the field.
 
 Exit:
 
@@ -403,6 +407,7 @@ Metrics work:
   counter   agg_rows_filtered_out_total
   counter   agg_partials_merged_total
   counter   agg_csb_short_circuit_total
+  counter   agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total
   counter   agg_int_overflow_total
   counter   agg_skipped_no_capability_total
   histogram agg_partial_bytes
@@ -425,7 +430,7 @@ Documentation work:
   (ADR 040 §10–15), merge function definitions, KLL `k` spec,
   HLL precision spec, `AGG_REJECT_*` enumeration.
 - Cross-link from ADR 036 (capability surface), ADR 039 (CSB
-  pruning + `first_tombstone_hlc` field), and roadmap.
+  pruning + `tombstone_metadata` field), and roadmap.
 - Pin a Rust reference implementation of every merge function in
   the `wendelon-client` crate so Toron's planner integration
   tests can pull it in.
@@ -508,7 +513,7 @@ consistency with ADR 041's renames in `src/schema/pbc.rs`.
 
 ## Suggested review order
 
-1. Protocol / schema types + `first_tombstone_hlc` field
+1. Protocol / schema types + `tombstone_metadata` field
    (Phase 0–1).
 2. Accumulator and sketch library with oracle tests (Phase 2).
 3. Local single-node execution (Phase 3).
@@ -533,6 +538,9 @@ Mirrors ADR 039's post-merge watch. Once 040 ships:
   CSB short-circuit value in real workloads. Per-tenant variance
   reveals which tenants benefit (append-only) and which don't
   (high tombstone churn).
+- `agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total`
+  → pre-tri-state pointer backlog; should decay as compaction or
+  rewrite refreshes old slabs.
 - `agg_skipped_no_capability_total` → rolling-upgrade
   visibility.
 - `agg_int_overflow_total` → workload-shape signal; zero is the
@@ -540,7 +548,7 @@ Mirrors ADR 039's post-merge watch. Once 040 ships:
 - `agg_partial_bytes` distribution → KLL sizing pressure;
   informs whether default `k = 200` holds.
 - `agg_merge_micros` → coordinator fan-out cost under peer-count
-  variation.
+  variation, plus CSB tombstone safety-net scan amplification.
 
 ## Open implementation questions
 
@@ -563,16 +571,19 @@ Mirrors ADR 039's post-merge watch. Once 040 ships:
    + handcrafted big-endian for per-aggregate `state` (golden
    tests need byte-layout determinism).
 
-5. **`first_tombstone_hlc` field migration story.** Newly sealed
-   slabs populate the field. Pre-040 sealed slabs have `None`;
-   CSB short-circuit is conservatively disabled for them.
-   Natural compaction gradually populates the field.
+5. **`tombstone_metadata` field migration story.** Newly sealed
+   slabs populate `TombstoneMetadata::None`. Pre-040 sealed slabs
+   decode as `Untracked`; CSB short-circuit is conservatively
+   disabled for them. Natural compaction gradually populates the
+   field.
 
-6. **Tombstone-write atomicity for `first_tombstone_hlc`.** CAS
-   on the TieredSlab pointer must be atomic with the tombstone
-   record's own commit. Two paths: (a) bundle into the
-   tombstone's Raft log entry, (b) follow-up CAS on commit.
-   Decide at Phase 5.
+6. **Tombstone-write atomicity for `tombstone_metadata`.** The
+   shipped migration tombstone path records
+   `MigrationComplete.completed_at_hlc` onto affected tiered
+   pointers through the state-machine apply observer. The CSB
+   direct-answer path also consults committed migration
+   tombstones before trusting pointer metadata, so the
+   apply-to-pointer window fails closed.
 
 7. **Integration with ADR 037's `TableSpreadProjection`.** Verify
    the existing arc-fan-out code composes with aggregate request

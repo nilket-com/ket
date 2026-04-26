@@ -52,7 +52,7 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
-	TenantKekId,
+	TenantKekId, TombstoneMetadata,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
@@ -255,14 +255,15 @@ pub struct TieredSlabPointer {
 	#[serde(default)]
 	pub stats_block_hash128: Option<[u8; 16]>,
 	/// ADR 040 visibility proof for CSB aggregate answers.
+	/// `Untracked` is conservative and cannot short-circuit.
 	#[serde(default)]
-	pub first_tombstone_hlc: Option<HybridTimestamp>,
+	pub tombstone_metadata: TombstoneMetadata,
 }
 
 impl TieredSlabPointer {
 	pub fn record_tombstone_hlc(&mut self, tombstone_hlc: HybridTimestamp) {
-		self.first_tombstone_hlc = crate::storage::aggregate::merge_earliest_tombstone(
-			self.first_tombstone_hlc,
+		self.tombstone_metadata = crate::storage::aggregate::merge_earliest_tombstone(
+			self.tombstone_metadata,
 			tombstone_hlc,
 		);
 	}
@@ -313,6 +314,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 		old_l2_uri: String,
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
+		tombstone_metadata: TombstoneMetadata,
 		pruned_versions: usize,
 		reclaimed_bytes: u64,
 	},
@@ -1804,6 +1806,97 @@ impl SlabManager {
 		out
 	}
 
+	fn migrated_tombstone_affects_slab(
+		&self,
+		slab_id: SlabId,
+		tombstone: &MigratedRangeTombstone,
+	) -> bool {
+		self.locality_candidates_for_all_tenants(
+			Locality::new(tombstone.range_start),
+			Locality::new(tombstone.range_end),
+		)
+		.into_iter()
+		.any(|(tenant_id, _locality, key_identity)| {
+			self.key_index
+				.get(&(tenant_id, key_identity))
+				.is_some_and(|versions| {
+					versions.iter().any(|loc| {
+						loc.slab_id == slab_id && loc.hlc >= tombstone.migration_hlc_floor
+					})
+				})
+		})
+	}
+
+	fn migrated_tombstone_affected_tiered_slabs(
+		&self,
+		tombstone: &MigratedRangeTombstone,
+	) -> HashSet<SlabId> {
+		self.locality_candidates_for_all_tenants(
+			Locality::new(tombstone.range_start),
+			Locality::new(tombstone.range_end),
+		)
+		.into_iter()
+		.flat_map(|(tenant_id, _locality, key_identity)| {
+			self.key_index
+				.get(&(tenant_id, key_identity))
+				.map(|versions| {
+					versions
+						.iter()
+						.filter(|loc| loc.hlc >= tombstone.migration_hlc_floor)
+						.map(|loc| loc.slab_id)
+						.collect::<Vec<_>>()
+				})
+				.unwrap_or_default()
+		})
+		.collect()
+	}
+
+	pub fn slab_has_migrated_range_tombstone_at(
+		&self,
+		slab_id: SlabId,
+		as_of_hlc: HybridTimestamp,
+		tombstones: &[MigratedRangeTombstone],
+	) -> bool {
+		tombstones.iter().any(|tombstone| {
+			tombstone.completed_at_hlc <= as_of_hlc
+				&& self.migrated_tombstone_affects_slab(slab_id, tombstone)
+		})
+	}
+
+	pub async fn record_migrated_range_tombstone(
+		&self,
+		tombstone: &MigratedRangeTombstone,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<usize> {
+		let affected_slab_ids = self.migrated_tombstone_affected_tiered_slabs(tombstone);
+		if affected_slab_ids.is_empty() {
+			return Ok(0);
+		}
+
+		let mut changed = Vec::new();
+		{
+			let state = self.state.lock().await;
+			for slab_id in affected_slab_ids {
+				let Some(mut pointer) = state.tiered.get_mut(&slab_id) else {
+					continue;
+				};
+				let before = pointer.tombstone_metadata;
+				pointer.record_tombstone_hlc(tombstone.completed_at_hlc);
+				if pointer.tombstone_metadata != before {
+					changed.push((*pointer).clone());
+				}
+			}
+		}
+
+		for pointer in &changed {
+			self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
+				.await?;
+			self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
+		}
+
+		Ok(changed.len())
+	}
+
 	/// Idempotent migration ingest (Plan 019).
 	///
 	/// Distinct from [`StorageEngine::append`] so the correctness
@@ -1994,7 +2087,14 @@ impl SlabManager {
 		tombstones: &[MigratedRangeTombstone],
 		max_slabs: usize,
 	) -> std::io::Result<TombstoneCompactionReport> {
-		if tombstones.is_empty() || max_slabs == 0 {
+		if tombstones.is_empty() {
+			return Ok(TombstoneCompactionReport::default());
+		}
+		for tombstone in tombstones {
+			self.record_migrated_range_tombstone(tombstone, None)
+				.await?;
+		}
+		if max_slabs == 0 {
 			return Ok(TombstoneCompactionReport::default());
 		}
 
@@ -2667,6 +2767,7 @@ impl SlabManager {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			tombstone_metadata: pointer.tombstone_metadata,
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
 			encrypted_bytes: encrypted.bytes,
@@ -3890,7 +3991,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 
 		let stats = mgr
@@ -3986,7 +4087,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(drifted_hash),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		let drift_before = metrics().pbc_slab_stats_pointer_drift_total.get();
 
@@ -4224,7 +4325,7 @@ mod tests {
 			stats_block_hash128: old_encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -4323,7 +4424,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
-			first_tombstone_hlc: None,
+			tombstone_metadata: TombstoneMetadata::None,
 		};
 
 		let err =
@@ -4724,7 +4825,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
-				first_tombstone_hlc: None,
+				tombstone_metadata: TombstoneMetadata::None,
 			})
 			.await
 			.unwrap();
@@ -4823,6 +4924,7 @@ mod tests {
 						id: 7,
 						_reserved: 0,
 					},
+					completed_at_hlc: hlc(1),
 					migration_hlc_floor: hlc(0),
 				}],
 				1,
@@ -4865,6 +4967,81 @@ mod tests {
 			.lookup(tenant(), survivor_key)
 			.expect("survivor should still be indexed after reopen");
 		assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
+	}
+
+	#[tokio::test]
+	async fn migrated_range_tombstone_marks_tiered_slab_visibility_incomplete() {
+		let manager = fresh_manager().await;
+		let key = id(0x5151);
+		manager
+			.append_durable(tenant(), key, hlc(10), b"migrated")
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		{
+			let state = manager.state.lock().await;
+			state.sealed.remove(&sealed_id);
+			state.tiered.insert(
+				sealed_id,
+				TieredSlabPointer {
+					slab_id: sealed_id,
+					l2_uri: "memory://tiered".to_owned(),
+					payload_hash: [0xAA; 32],
+					is_encrypted: false,
+					tenant_id: Some(tenant()),
+					tenant_kek_id: None,
+					stats_format_version: None,
+					stats_block_len: None,
+					stats_block_hash128: None,
+					tombstone_metadata: TombstoneMetadata::None,
+				},
+			);
+		}
+
+		let locality = Locality::from(key).get();
+		let tombstone = MigratedRangeTombstone {
+			migration_id: 9,
+			range_start: locality,
+			range_end: locality,
+			to_epoch: 2,
+			completed_by: NodeId {
+				id: 7,
+				_reserved: 0,
+			},
+			completed_at_hlc: hlc(50),
+			migration_hlc_floor: hlc(0),
+		};
+		assert!(!manager.slab_has_migrated_range_tombstone_at(
+			sealed_id,
+			hlc(49),
+			std::slice::from_ref(&tombstone)
+		));
+		assert!(manager.slab_has_migrated_range_tombstone_at(
+			sealed_id,
+			hlc(50),
+			std::slice::from_ref(&tombstone)
+		));
+
+		let changed = manager
+			.record_migrated_range_tombstone(&tombstone, Some(99))
+			.await
+			.unwrap();
+		assert_eq!(changed, 1);
+		let pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(50))
+		);
+		assert!(crate::storage::slab_visibility_complete(
+			hlc(10),
+			pointer.tombstone_metadata,
+			hlc(49)
+		));
+		assert!(!crate::storage::slab_visibility_complete(
+			hlc(10),
+			pointer.tombstone_metadata,
+			hlc(50)
+		));
 	}
 
 	#[tokio::test]

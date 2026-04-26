@@ -6,6 +6,7 @@ use crate::schema::aggregate::{
 use crate::schema::pbc::Program as PbcProgram;
 use crate::schema::{
 	AggregateExpressionIndex, HllPrecision, HybridTimestamp, KllK, TableObjectId, TenantId,
+	TombstoneMetadata,
 };
 use crate::storage::sketch::{HllRegisters, KllSketch};
 use crate::storage::stats::{
@@ -1315,19 +1316,26 @@ fn kll_compaction_seed(
 
 pub fn slab_visibility_complete(
 	seal_hlc: HybridTimestamp,
-	first_tombstone_hlc: Option<HybridTimestamp>,
+	tombstone_metadata: TombstoneMetadata,
 	as_of_hlc: HybridTimestamp,
 ) -> bool {
-	seal_hlc <= as_of_hlc && first_tombstone_hlc.is_none_or(|t| t > as_of_hlc)
+	seal_hlc <= as_of_hlc
+		&& tombstone_metadata.is_tracked()
+		&& tombstone_metadata
+			.earliest()
+			.is_none_or(|tombstone_hlc| tombstone_hlc > as_of_hlc)
 }
 
 pub fn merge_earliest_tombstone(
-	current: Option<HybridTimestamp>,
+	current: TombstoneMetadata,
 	candidate: HybridTimestamp,
-) -> Option<HybridTimestamp> {
+) -> TombstoneMetadata {
 	match current {
-		None => Some(candidate),
-		Some(previous) => Some(previous.min(candidate)),
+		TombstoneMetadata::Untracked => TombstoneMetadata::Untracked,
+		TombstoneMetadata::None => TombstoneMetadata::Earliest(candidate),
+		TombstoneMetadata::Earliest(previous) => {
+			TombstoneMetadata::Earliest(previous.min(candidate))
+		}
 	}
 }
 
@@ -1672,13 +1680,37 @@ mod tests {
 
 	#[test]
 	fn visibility_helper_uses_earliest_tombstone_direction() {
-		assert!(slab_visibility_complete(hlc(10), None, hlc(11)));
-		assert!(slab_visibility_complete(hlc(10), Some(hlc(12)), hlc(11)));
-		assert!(!slab_visibility_complete(hlc(10), Some(hlc(11)), hlc(11)));
-		assert_eq!(merge_earliest_tombstone(None, hlc(20)), Some(hlc(20)));
+		assert!(!slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::Untracked,
+			hlc(11)
+		));
+		assert!(slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::None,
+			hlc(11)
+		));
+		assert!(slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::Earliest(hlc(12)),
+			hlc(11)
+		));
+		assert!(!slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::Earliest(hlc(11)),
+			hlc(11)
+		));
 		assert_eq!(
-			merge_earliest_tombstone(Some(hlc(20)), hlc(15)),
-			Some(hlc(15))
+			merge_earliest_tombstone(TombstoneMetadata::Untracked, hlc(20)),
+			TombstoneMetadata::Untracked
+		);
+		assert_eq!(
+			merge_earliest_tombstone(TombstoneMetadata::None, hlc(20)),
+			TombstoneMetadata::Earliest(hlc(20))
+		);
+		assert_eq!(
+			merge_earliest_tombstone(TombstoneMetadata::Earliest(hlc(20)), hlc(15)),
+			TombstoneMetadata::Earliest(hlc(15))
 		);
 	}
 

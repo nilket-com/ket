@@ -87,6 +87,8 @@ use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
+#[cfg(test)]
+use crate::schema::TombstoneMetadata;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
@@ -1314,7 +1316,7 @@ impl WendelonNode {
 					stats_format_version: tier.stats_format_version,
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
-					first_tombstone_hlc: tier.first_tombstone_hlc,
+					tombstone_metadata: tier.tombstone_metadata,
 				},
 				recovered_log_index,
 			)
@@ -2997,7 +2999,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
-				first_tombstone_hlc: None,
+				tombstone_metadata: TombstoneMetadata::None,
 			}))
 			.await
 			.unwrap();
@@ -3108,7 +3110,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
-				first_tombstone_hlc: None,
+				tombstone_metadata: TombstoneMetadata::None,
 			}))
 			.await
 			.unwrap();
