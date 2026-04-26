@@ -53,12 +53,18 @@
 //! [`append`]: LocalSlabStore::append
 
 use crate::metrics::global as metrics;
-use crate::schema::{HybridTimestamp, Identity, SlabId, SlabRecordHeader, TenantId};
+use crate::schema::{
+	HybridTimestamp, Identity, Locality, RecordRowIndex, STORAGE_ROW_HLC_COLUMN,
+	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SlabId, SlabRecordHeader,
+	TenantId,
+};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
+use arrow::array::{FixedSizeBinaryArray, UInt64Array};
+use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use std::io::{Error, ErrorKind};
+use std::io::{Cursor, Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +82,24 @@ pub struct RecordLocation {
 	pub offset: u64,
 	pub length: u32,
 	pub hlc: HybridTimestamp,
+	pub record_row_index: RecordRowIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MultiRowIndexEntry {
+	pub key_identity: Identity,
+	pub routing_locality: Locality,
+	pub row_hlc: HybridTimestamp,
+	pub record_row_index: RecordRowIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveredSlabEntry {
+	pub tenant_id: TenantId,
+	pub key_identity: Identity,
+	pub routing_locality: Locality,
+	pub routing_locality_trusted: bool,
+	pub location: RecordLocation,
 }
 
 type TenantKey = (TenantId, Identity);
@@ -177,6 +201,12 @@ pub struct LocalSlabStore {
 	/// multiple slabs are live.
 	slab_id: SlabId,
 
+	/// Routing localities recovered from storage-only synthetic
+	/// columns. Live writes publish locality through `SlabManager`;
+	/// this map exists so restart recovery does not need table
+	/// descriptor context to rebuild the manager's locality index.
+	pub(crate) recovered_localities: DashMap<TenantKey, Locality>,
+
 	/// Owning handle to the slab file.
 	file: FileHandle,
 
@@ -225,10 +255,11 @@ impl LocalSlabStore {
 
 		// Scan any existing records so a restart resumes writing
 		// past the last complete record and serves reads immediately.
-		let (index, write_cursor) = recover_slab(&file, slab_id)?;
+		let (index, recovered_localities, write_cursor) = recover_slab(&file, slab_id)?;
 
 		Ok(Self {
 			index,
+			recovered_localities,
 			slab_id,
 			file,
 			file_ops,
@@ -380,6 +411,18 @@ impl LocalSlabStore {
 		}
 	}
 
+	pub(crate) fn index_location(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
+		self.index
+			.entry((tenant_id, key_identity))
+			.and_modify(|versions| insert_version_sorted(versions, location))
+			.or_insert_with(|| vec![location]);
+	}
+
 	#[cfg(test)]
 	pub(crate) fn fdatasync_call_count(&self) -> u64 {
 		self.fdatasync_calls.load(Ordering::Relaxed)
@@ -447,6 +490,7 @@ impl StorageEngine for LocalSlabStore {
 			offset,
 			length: payload_size as u32,
 			hlc,
+			record_row_index: RecordRowIndex::ZERO,
 		};
 		// DashMap's `entry` API gives us an atomic read-modify-write
 		// on the per-key version chain, so concurrent appends on
@@ -620,12 +664,17 @@ fn page_round_up(n: usize) -> usize {
 fn recover_slab(
 	file: &FileHandle,
 	slab_id: SlabId,
-) -> std::io::Result<(DashMap<TenantKey, Vec<RecordLocation>>, u64)> {
+) -> std::io::Result<(
+	DashMap<TenantKey, Vec<RecordLocation>>,
+	DashMap<TenantKey, Locality>,
+	u64,
+)> {
 	use std::os::unix::fs::FileExt;
 
 	let file = file.try_clone()?;
 	let file_size = file.metadata()?.len();
 	let index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
+	let recovered_localities: DashMap<TenantKey, Locality> = DashMap::new();
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	// One page is enough for the header probe — every record
 	// starts on a page boundary and the header occupies only the
@@ -676,26 +725,33 @@ fn recover_slab(
 			break;
 		}
 
-		let location = RecordLocation {
+		let base_location = RecordLocation {
 			slab_id,
 			offset: cursor,
 			length: payload_size as u32,
 			hlc: header.hlc,
+			record_row_index: RecordRowIndex::ZERO,
 		};
-		index
-			.entry((header.tenant_id, header.key_identity))
-			.and_modify(|versions| insert_version_sorted(versions, location))
-			.or_insert_with(|| vec![location]);
+		for entry in recover_entries_for_record(&header, base_location, &frame_bytes)? {
+			index
+				.entry((entry.tenant_id, entry.key_identity))
+				.and_modify(|versions| insert_version_sorted(versions, entry.location))
+				.or_insert_with(|| vec![entry.location]);
+			recovered_localities.insert(
+				(entry.tenant_id, entry.key_identity),
+				entry.routing_locality,
+			);
+		}
 		cursor += padded;
 	}
 
-	Ok((index, cursor))
+	Ok((index, recovered_localities, cursor))
 }
 
 pub(crate) fn recover_slab_entries_from_blob(
 	blob: &[u8],
 	slab_id: SlabId,
-) -> std::io::Result<Vec<(TenantId, Identity, RecordLocation)>> {
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
 	let mut cursor: usize = 0;
@@ -722,17 +778,208 @@ pub(crate) fn recover_slab_entries_from_blob(
 			break;
 		}
 
-		let location = RecordLocation {
+		let base_location = RecordLocation {
 			slab_id,
 			offset: cursor as u64,
 			length: payload_size as u32,
 			hlc: header.hlc,
+			record_row_index: RecordRowIndex::ZERO,
 		};
-		entries.push((header.tenant_id, header.key_identity, location));
+		entries.extend(recover_entries_for_record(&header, base_location, frame)?);
 		cursor += padded;
 	}
 
 	Ok(entries)
+}
+
+fn recover_entries_for_record(
+	header: &SlabRecordHeader,
+	base_location: RecordLocation,
+	frame: &[u8],
+) -> std::io::Result<Vec<RecoveredSlabEntry>> {
+	let Some(entries) = storage_multirow_index_entries_from_frame(frame)? else {
+		return Ok(vec![RecoveredSlabEntry {
+			tenant_id: header.tenant_id,
+			key_identity: header.key_identity,
+			routing_locality: Locality::from(header.key_identity),
+			routing_locality_trusted: false,
+			location: base_location,
+		}]);
+	};
+	Ok(entries
+		.into_iter()
+		.map(|entry| RecoveredSlabEntry {
+			tenant_id: header.tenant_id,
+			key_identity: entry.key_identity,
+			routing_locality: entry.routing_locality,
+			routing_locality_trusted: true,
+			location: RecordLocation {
+				hlc: entry.row_hlc,
+				record_row_index: entry.record_row_index,
+				..base_location
+			},
+		})
+		.collect())
+}
+
+pub(crate) fn storage_multirow_index_entries_from_frame(
+	frame: &[u8],
+) -> std::io::Result<Option<Vec<MultiRowIndexEntry>>> {
+	if !has_plausible_arrow_stream_prefix(frame) {
+		return Ok(None);
+	}
+	let batch = match decode_recovery_batch(frame) {
+		Ok(batch) => batch,
+		Err(_) => return Ok(None),
+	};
+	let has_hlc = batch.column_by_name(STORAGE_ROW_HLC_COLUMN).is_some();
+	let has_identity = batch.column_by_name(STORAGE_ROW_KEY_ID_COLUMN).is_some();
+	let has_locality = batch
+		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
+		.is_some();
+	if !(has_hlc || has_identity || has_locality) {
+		return Ok(None);
+	}
+	if !(has_hlc && has_identity && has_locality) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"multi-row storage record has an incomplete synthetic-column set",
+		));
+	}
+	let row_hlcs = batch
+		.column_by_name(STORAGE_ROW_HLC_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"multi-row storage record has invalid __row_hlc__ column",
+			)
+		})?;
+	let identities = batch
+		.column_by_name(STORAGE_ROW_KEY_ID_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"multi-row storage record has invalid __row_key_id__ column",
+			)
+		})?;
+	let localities = batch
+		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"multi-row storage record has invalid __row_routing_locality__ column",
+			)
+		})?;
+	let mut entries = Vec::with_capacity(batch.num_rows());
+	for row in 0..batch.num_rows() {
+		let record_row_index = u32::try_from(row).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"multi-row storage record row index exceeds u32",
+			)
+		})?;
+		entries.push(MultiRowIndexEntry {
+			key_identity: Identity::new(fixed_size_binary_32(
+				identities,
+				row,
+				STORAGE_ROW_KEY_ID_COLUMN,
+			)?),
+			routing_locality: Locality::new(localities.value(row)),
+			row_hlc: decode_storage_hlc(fixed_size_binary_16(
+				row_hlcs,
+				row,
+				STORAGE_ROW_HLC_COLUMN,
+			)?)?,
+			record_row_index: RecordRowIndex::new(record_row_index),
+		});
+	}
+	Ok(Some(entries))
+}
+
+fn has_plausible_arrow_stream_prefix(frame: &[u8]) -> bool {
+	if frame.len() < 8 {
+		return false;
+	}
+	let first = u32::from_le_bytes(frame[..4].try_into().expect("fixed width"));
+	let (prefix_len, message_len) = if first == u32::MAX {
+		let message_len = u32::from_le_bytes(frame[4..8].try_into().expect("fixed width"));
+		(8_usize, message_len as usize)
+	} else {
+		(4_usize, first as usize)
+	};
+	message_len > 0 && message_len <= frame.len().saturating_sub(prefix_len)
+}
+
+fn decode_recovery_batch(frame: &[u8]) -> std::io::Result<arrow::record_batch::RecordBatch> {
+	let mut reader = StreamReader::try_new(Cursor::new(frame), None)
+		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
+	let batch = match reader.next() {
+		Some(Ok(batch)) => Ok(batch),
+		Some(Err(err)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("arrow stream read: {err}"),
+		)),
+		None => Err(Error::new(
+			ErrorKind::InvalidData,
+			"arrow stream contained no record batch",
+		)),
+	}?;
+	match reader.next() {
+		Some(Ok(_)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			"arrow stream contained multiple record batches",
+		)),
+		Some(Err(err)) => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("arrow stream read: {err}"),
+		)),
+		None => Ok(batch),
+	}
+}
+
+fn fixed_size_binary_16(
+	array: &FixedSizeBinaryArray,
+	row: usize,
+	label: &str,
+) -> std::io::Result<[u8; 16]> {
+	let value = array.value(row);
+	if value.len() != 16 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("{label} width mismatch: expected=16 actual={}", value.len()),
+		));
+	}
+	let mut out = [0_u8; 16];
+	out.copy_from_slice(value);
+	Ok(out)
+}
+
+fn fixed_size_binary_32(
+	array: &FixedSizeBinaryArray,
+	row: usize,
+	label: &str,
+) -> std::io::Result<[u8; 32]> {
+	let value = array.value(row);
+	if value.len() != 32 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("{label} width mismatch: expected=32 actual={}", value.len()),
+		));
+	}
+	let mut out = [0_u8; 32];
+	out.copy_from_slice(value);
+	Ok(out)
+}
+
+fn decode_storage_hlc(bytes: [u8; 16]) -> std::io::Result<HybridTimestamp> {
+	Ok(HybridTimestamp {
+		physical_ms: u64::from_le_bytes(bytes[0..8].try_into().expect("fixed width")),
+		logical: u32::from_le_bytes(bytes[8..12].try_into().expect("fixed width")),
+		node_id: u32::from_le_bytes(bytes[12..16].try_into().expect("fixed width")),
+	})
 }
 
 // ============================================================
@@ -784,6 +1031,10 @@ fn verify_record_checksum(header: &SlabRecordHeader, frame: &[u8]) -> std::io::R
 mod tests {
 	use super::*;
 	use crate::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
+	use arrow::array::{FixedSizeBinaryBuilder, UInt64Array, UInt64Builder};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::ipc::writer::StreamWriter;
+	use arrow::record_batch::RecordBatch;
 	use async_trait::async_trait;
 	use std::path::Path;
 	use std::sync::{Arc, Mutex};
@@ -803,7 +1054,64 @@ mod tests {
 			offset,
 			length: 4096,
 			hlc,
+			record_row_index: RecordRowIndex::ZERO,
 		}
+	}
+
+	fn hlc_bytes(hlc: HybridTimestamp) -> [u8; 16] {
+		let mut bytes = [0_u8; 16];
+		bytes[..8].copy_from_slice(&hlc.physical_ms.to_le_bytes());
+		bytes[8..12].copy_from_slice(&hlc.logical.to_le_bytes());
+		bytes[12..16].copy_from_slice(&hlc.node_id.to_le_bytes());
+		bytes
+	}
+
+	fn encode_batch(batch: &RecordBatch) -> Vec<u8> {
+		let mut out = Vec::new();
+		{
+			let mut writer = StreamWriter::try_new(&mut out, batch.schema().as_ref()).unwrap();
+			writer.write(batch).unwrap();
+			writer.finish().unwrap();
+		}
+		out
+	}
+
+	fn multirow_storage_frame(
+		row0: Identity,
+		row1: Identity,
+		hlc0: HybridTimestamp,
+		hlc1: HybridTimestamp,
+	) -> Vec<u8> {
+		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(2, 16);
+		row_hlc.append_value(hlc_bytes(hlc0)).unwrap();
+		row_hlc.append_value(hlc_bytes(hlc1)).unwrap();
+		let mut row_id = FixedSizeBinaryBuilder::with_capacity(2, 32);
+		row_id.append_value(row0.as_bytes()).unwrap();
+		row_id.append_value(row1.as_bytes()).unwrap();
+		let mut row_locality = UInt64Builder::with_capacity(2);
+		row_locality.append_value(70);
+		row_locality.append_value(80);
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("value", DataType::UInt64, false),
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(UInt64Array::from(vec![1_u64, 2])),
+				Arc::new(row_hlc.finish()),
+				Arc::new(row_id.finish()),
+				Arc::new(row_locality.finish()),
+			],
+		)
+		.unwrap();
+		encode_batch(&batch)
 	}
 
 	#[test]
@@ -867,6 +1175,17 @@ mod tests {
 	}
 
 	#[test]
+	fn multirow_recovery_rejects_non_arrow_payload_prefixes() {
+		assert!(!has_plausible_arrow_stream_prefix(b"v-old"));
+		assert!(!has_plausible_arrow_stream_prefix(b"v-anchor"));
+		assert!(
+			storage_multirow_index_entries_from_frame(b"v-anchor")
+				.unwrap()
+				.is_none()
+		);
+	}
+
+	#[test]
 	fn group_commit_window_clamps_to_floor_and_ceiling() {
 		let cfg = GroupCommitConfig {
 			floor: Duration::from_micros(200),
@@ -877,6 +1196,80 @@ mod tests {
 		assert_eq!(cfg.window_for_pending(1), Duration::from_micros(200));
 		assert_eq!(cfg.window_for_pending(4), Duration::from_micros(400));
 		assert_eq!(cfg.window_for_pending(64), Duration::from_millis(2));
+	}
+
+	#[tokio::test]
+	async fn recovery_indexes_multirow_synthetic_aliases() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-multirow-recovery-{}-{}",
+			std::process::id(),
+			uuid::Uuid::new_v4()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("slab_0000000000000000.wnd");
+		let file_ops = Arc::new(BlockingFileOps);
+		let row0 = Identity::new([1; 32]);
+		let row1 = Identity::new([2; 32]);
+		let frame = multirow_storage_frame(row0, row1, hlc(10, 0), hlc(20, 3));
+		{
+			let store = LocalSlabStore::open(
+				&path,
+				SlabId::ZERO,
+				file_ops.clone(),
+				GroupCommitConfig {
+					floor: Duration::ZERO,
+					ceiling: Duration::ZERO,
+					per_write_cost_estimate: Duration::ZERO,
+				},
+			)
+			.await
+			.unwrap();
+			store
+				.append(TenantId::new(7), Identity::new([9; 32]), hlc(99, 0), &frame)
+				.await
+				.unwrap();
+			store.fsync().await.unwrap();
+		}
+
+		let recovered = LocalSlabStore::open(
+			&path,
+			SlabId::ZERO,
+			file_ops,
+			GroupCommitConfig {
+				floor: Duration::ZERO,
+				ceiling: Duration::ZERO,
+				per_write_cost_estimate: Duration::ZERO,
+			},
+		)
+		.await
+		.unwrap();
+		assert!(
+			recovered
+				.lookup(TenantId::new(7), Identity::new([9; 32]))
+				.is_none()
+		);
+
+		let loc0 = recovered.lookup(TenantId::new(7), row0).unwrap();
+		assert_eq!(loc0.hlc, hlc(10, 0));
+		assert_eq!(loc0.record_row_index, RecordRowIndex::ZERO);
+		assert_eq!(
+			recovered
+				.recovered_localities
+				.get(&(TenantId::new(7), row0))
+				.map(|entry| *entry.value()),
+			Some(Locality::new(70))
+		);
+
+		let loc1 = recovered.lookup(TenantId::new(7), row1).unwrap();
+		assert_eq!(loc1.hlc, hlc(20, 3));
+		assert_eq!(loc1.record_row_index, RecordRowIndex::new(1));
+		assert_eq!(
+			recovered
+				.recovered_localities
+				.get(&(TenantId::new(7), row1))
+				.map(|entry| *entry.value()),
+			Some(Locality::new(80))
+		);
 	}
 
 	#[derive(Clone, Default)]

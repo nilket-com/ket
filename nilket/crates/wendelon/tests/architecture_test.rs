@@ -215,3 +215,134 @@ fn test_no_brand_leaked_pbc_names_in_code_surfaces() {
 		violations.join("\n")
 	);
 }
+
+#[test]
+fn test_adr042_protocol_surfaces_stay_brand_clean_and_unsuffixed() {
+	let rendered_metrics = wendelon::metrics::MetricsRegistry::default().render_prometheus();
+	let mut violations: Vec<String> = Vec::new();
+	for metric in prometheus_metric_names(&rendered_metrics) {
+		if metric.starts_with("wendelon_agg")
+			|| metric.starts_with("wendelon_pbc")
+			|| metric.starts_with("wendelon_storage_multirow")
+		{
+			if metric.starts_with("wendelon_w") {
+				violations.push(format!(
+					"metric '{metric}' brand-prefixes the protocol segment"
+				));
+			}
+			if metric.contains("_v1") || metric.contains("_v2") {
+				violations.push(format!("metric '{metric}' carries a version suffix"));
+			}
+		}
+	}
+
+	for column in [
+		wendelon::schema::STORAGE_ROW_HLC_COLUMN,
+		wendelon::schema::STORAGE_ROW_KEY_ID_COLUMN,
+		wendelon::schema::STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	] {
+		if !column.starts_with("__row_") || !column.ends_with("__") {
+			violations.push(format!("synthetic column '{column}' is not row-functional"));
+		}
+		if column.contains("wendelon") || column.contains("_v1") || column.contains("_v2") {
+			violations.push(format!(
+				"synthetic column '{column}' is brand-prefixed or version-suffixed"
+			));
+		}
+	}
+
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	forbidden_protocol_tokens_in_code(manifest_dir, &mut violations);
+
+	assert!(
+		violations.is_empty(),
+		"ADR 042 protocol surfaces must stay brand-clean, unsuffixed, and free of deleted scalar-context opcodes:\n{}",
+		violations.join("\n")
+	);
+}
+
+fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
+	let mut names = Vec::new();
+	for line in rendered.lines() {
+		let line = line.trim();
+		if line.is_empty() {
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("# HELP ") {
+			if let Some(name) = rest.split_whitespace().next() {
+				names.push(name);
+			}
+			continue;
+		}
+		if let Some(rest) = line.strip_prefix("# TYPE ") {
+			if let Some(name) = rest.split_whitespace().next() {
+				names.push(name);
+			}
+			continue;
+		}
+		if line.starts_with('#') {
+			continue;
+		}
+		if let Some(name) = line.split_whitespace().next() {
+			names.push(name.split_once('{').map(|(name, _)| name).unwrap_or(name));
+		}
+	}
+	names.sort_unstable();
+	names.dedup();
+	names
+}
+
+fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("LOAD", "_", "IDENTITY"),
+		concat!("ROUTE", "_", "BY", "_", "LOCALITY"),
+		concat!("WENDELON", "_", "PBC_REJECT"),
+		concat!("WENDELON", "_", "AGG"),
+		concat!("WENDELON", "_", "CSB"),
+		concat!("WENDELON", "_", "MULTIROW"),
+		concat!("Wendelon", "Pbc"),
+		concat!("Wendelon", "Agg"),
+		concat!("Wendelon", "Csb"),
+		concat!("Wendelon", "MultiRow"),
+		concat!("W", "AGG"),
+		concat!("W", "CSB"),
+		concat!("W", "MULTIROW"),
+		concat!("__wendelon", "_row"),
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 042 protocol token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+}

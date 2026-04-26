@@ -47,22 +47,28 @@ use crate::crypto::{
 };
 use crate::metrics::global as metrics;
 use crate::schema::table::{
-	TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1, TableWriteRequestMeta,
-	validate_table_write_request_batch,
+	RecordLayoutPolicy, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1,
+	TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, IdentityPrefix, Locality, SlabId, SlabRecordHeader, TenantId,
-	TenantKekId, TombstoneMetadata,
+	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordRowIndex, SlabId, SlabRecordHeader,
+	SupersessionMetadata, TenantId, TenantKekId, TombstoneMetadata,
 };
 use crate::storage::core::{
-	GroupCommitConfig, LocalSlabStore, RecordLocation, StorageEngine, insert_version_sorted,
-	newest_version_as_of, recover_slab_entries_from_blob, remove_version_exact,
+	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
+	StorageEngine, insert_version_sorted, newest_version_as_of, recover_slab_entries_from_blob,
+	remove_version_exact, storage_multirow_index_entries_from_frame,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow, persistent_index_path,
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::l2::ObjectStore;
+use crate::storage::multirow::{
+	MultiRowSourceRow, decode_batch as decode_record_batch, encode_batch as encode_record_batch,
+	encode_multirow_from_survivors, has_storage_synthetic_columns,
+	materialize_record_location_batch, pack_multirow_source_rows,
+};
 use crate::storage::stats::{
 	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
 	build_column_stats_block_with_ciphertext_budget, locator_flags_for_parsed_column_stats_block,
@@ -72,14 +78,13 @@ use crate::storage::{
 	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, OpenFlags, write_file,
 };
 use arrow::compute::concat_batches;
-use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Cursor, Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -258,6 +263,10 @@ pub struct TieredSlabPointer {
 	/// `Untracked` is conservative and cannot short-circuit.
 	#[serde(default)]
 	pub tombstone_metadata: TombstoneMetadata,
+	/// ADR 042 visibility proof for CSB aggregate answers.
+	/// `Untracked` is conservative and cannot short-circuit.
+	#[serde(default)]
+	pub supersession_metadata: SupersessionMetadata,
 }
 
 impl TieredSlabPointer {
@@ -265,6 +274,13 @@ impl TieredSlabPointer {
 		self.tombstone_metadata = crate::storage::aggregate::merge_earliest_tombstone(
 			self.tombstone_metadata,
 			tombstone_hlc,
+		);
+	}
+
+	pub fn record_supersession_hlc(&mut self, supersession_hlc: HybridTimestamp) {
+		self.supersession_metadata = crate::storage::aggregate::merge_earliest_supersession(
+			self.supersession_metadata,
+			supersession_hlc,
 		);
 	}
 }
@@ -308,6 +324,15 @@ pub struct RetentionPruningReport {
 	pub reclaimed_bytes: u64,
 }
 
+/// Outcome of one explicit table layout recluster pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutReclusterReport {
+	pub rewritten_slabs: usize,
+	pub rewritten_records: usize,
+	pub relocated_rows: usize,
+	pub reclaimed_bytes: u64,
+}
+
 pub(crate) enum PreparedTieredRetentionRewrite {
 	Rewrite {
 		slab_id: SlabId,
@@ -315,6 +340,7 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 		encrypted_bytes: Vec<u8>,
 		payload_hash: [u8; 32],
 		tombstone_metadata: TombstoneMetadata,
+		supersession_metadata: SupersessionMetadata,
 		pruned_versions: usize,
 		reclaimed_bytes: u64,
 	},
@@ -481,6 +507,23 @@ impl SlabManager {
 		self.insert_locality_membership_with_locality(tenant_id, key_identity, routing_locality);
 	}
 
+	fn latest_location_before(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> Option<RecordLocation> {
+		self.key_index
+			.get(&(tenant_id, key_identity))
+			.and_then(|versions| {
+				versions
+					.iter()
+					.filter(|location| location.hlc < hlc)
+					.max_by_key(|location| location.hlc)
+					.copied()
+			})
+	}
+
 	fn rollback_indexed_location(
 		&self,
 		tenant_id: TenantId,
@@ -515,6 +558,14 @@ impl SlabManager {
 			.iter()
 			.find_map(|entry| (entry.key().1 == key_identity).then_some(*entry.value()))
 			.unwrap_or_else(|| Locality::from(key_identity))
+	}
+
+	fn recovered_entry_routing_locality(&self, entry: &RecoveredSlabEntry) -> Locality {
+		if entry.routing_locality_trusted {
+			entry.routing_locality
+		} else {
+			self.routing_locality_for_key(entry.tenant_id, entry.key_identity)
+		}
 	}
 
 	fn persistent_record_row(
@@ -604,6 +655,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
+		let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
 		let (slab, location) = self
 			.append_on_target(tenant_id, key_identity, hlc, frame)
 			.await?;
@@ -626,7 +678,84 @@ impl SlabManager {
 			routing_locality,
 			location,
 		);
+		if let Some(previous) = superseded {
+			let _ = self
+				.record_supersession_for_slab(previous.slab_id, hlc, None)
+				.await?;
+		}
 		Ok(location)
+	}
+
+	pub(crate) async fn append_durable_multirow_with_locality(
+		&self,
+		tenant_id: TenantId,
+		frame: &[u8],
+		entries: &[MultiRowIndexEntry],
+	) -> std::io::Result<RecordLocation> {
+		let Some(primary) = entries.first().copied() else {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"multi-row append requires at least one index entry",
+			));
+		};
+		let record_hlc = entries
+			.iter()
+			.map(|entry| entry.row_hlc)
+			.max()
+			.unwrap_or(primary.row_hlc);
+		let superseded = entries
+			.iter()
+			.filter_map(|entry| {
+				self.latest_location_before(tenant_id, entry.key_identity, entry.row_hlc)
+					.map(|previous| (previous.slab_id, entry.row_hlc))
+			})
+			.collect::<Vec<_>>();
+		let (slab, base_location) = self
+			.append_on_target(tenant_id, primary.key_identity, record_hlc, frame)
+			.await?;
+		if let Err(err) = slab.wait_durable_commit().await {
+			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
+			self.rollback_indexed_location(tenant_id, primary.key_identity, base_location);
+			return Err(err);
+		}
+
+		let rows = entries
+			.iter()
+			.map(|entry| PersistentRecordRow {
+				tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: entry.routing_locality,
+				location: RecordLocation {
+					hlc: entry.row_hlc,
+					record_row_index: entry.record_row_index,
+					..base_location
+				},
+			})
+			.collect::<Vec<_>>();
+		if let Err(err) = self.persist_record_rows_strict(rows.clone()).await {
+			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
+			for row in &rows {
+				self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+			}
+			return Err(err);
+		}
+
+		slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
+		for row in &rows {
+			slab.index_location(row.tenant_id, row.key_identity, row.location);
+			self.index_appended_location_with_locality(
+				row.tenant_id,
+				row.key_identity,
+				row.routing_locality,
+				row.location,
+			);
+		}
+		for (slab_id, supersession_hlc) in superseded {
+			let _ = self
+				.record_supersession_for_slab(slab_id, supersession_hlc, None)
+				.await?;
+		}
+		Ok(base_location)
 	}
 
 	/// Durability barrier across every local L1 slab currently
@@ -709,6 +838,7 @@ impl SlabManager {
 		let tiered: DashMap<SlabId, TieredSlabPointer> = DashMap::new();
 		let rehydrated: DashMap<SlabId, RehydratedSlabState> = DashMap::new();
 
+		let mut recovered_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let (active, next_slab_id) = if existing_ids.is_empty() {
 			let id = SlabId::ZERO;
 			let slab = Arc::new(
@@ -720,7 +850,7 @@ impl SlabManager {
 				)
 				.await?,
 			);
-			drain_slab_index(&slab, &key_index);
+			drain_slab_index(&slab, &key_index, &mut recovered_key_localities);
 			(slab, id.saturating_add(1))
 		} else {
 			// Split: everything except the max becomes sealed, the
@@ -737,7 +867,7 @@ impl SlabManager {
 					)
 					.await?,
 				);
-				drain_slab_index(&slab, &key_index);
+				drain_slab_index(&slab, &key_index, &mut recovered_key_localities);
 				sealed.insert(id, slab);
 			}
 			let active = Arc::new(
@@ -749,7 +879,7 @@ impl SlabManager {
 				)
 				.await?,
 			);
-			drain_slab_index(&active, &key_index);
+			drain_slab_index(&active, &key_index, &mut recovered_key_localities);
 			(active, active_id.saturating_add(1))
 		};
 
@@ -795,6 +925,11 @@ impl SlabManager {
 			}
 		}
 		let key_localities = build_key_localities(&key_index);
+		for (tenant_id, key_identity, locality) in recovered_key_localities {
+			if key_index.contains_key(&(tenant_id, key_identity)) {
+				key_localities.insert((tenant_id, key_identity), locality);
+			}
+		}
 		for (tenant_id, key_identity, locality) in persistent_key_localities {
 			if key_index.contains_key(&(tenant_id, key_identity)) {
 				key_localities.insert((tenant_id, key_identity), locality);
@@ -1102,7 +1237,11 @@ impl SlabManager {
 		let mut saw_unmatched_row = false;
 		let mut row_batches = Vec::with_capacity(entries.len());
 
-		for (record_tenant_id, key_identity, location) in entries {
+		for entry in entries {
+			let record_tenant_id = entry.tenant_id;
+			let key_identity = entry.key_identity;
+			let routing_locality = self.recovered_entry_routing_locality(&entry);
+			let location = entry.location;
 			if record_tenant_id != tenant_id {
 				return Err(Error::new(
 					ErrorKind::InvalidInput,
@@ -1116,13 +1255,20 @@ impl SlabManager {
 			}
 			let frame = extract_record_from_blob(blob, location)?;
 			let batch = match decode_record_batch(&frame) {
-				Ok(batch) if batch.num_rows() == 1 => batch,
+				Ok(batch) => {
+					match materialize_record_location_batch(&batch, location.record_row_index) {
+						Ok(batch) if batch.num_rows() == 1 => batch,
+						_ => {
+							saw_unmatched_row = true;
+							continue;
+						}
+					}
+				}
 				_ => {
 					saw_unmatched_row = true;
 					continue;
 				}
 			};
-			let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
 			let had_candidates = candidates.is_some();
 			let matching = match candidates.take() {
 				Some(existing) => existing,
@@ -1863,6 +2009,70 @@ impl SlabManager {
 		})
 	}
 
+	pub fn slab_has_supersession_at(&self, slab_id: SlabId, as_of_hlc: HybridTimestamp) -> bool {
+		let unbounded_as_of =
+			as_of_hlc.physical_ms == 0 && as_of_hlc.logical == 0 && as_of_hlc.node_id == 0;
+		self.key_index.iter().any(|entry| {
+			let versions = entry.value();
+			versions.iter().enumerate().any(|(index, location)| {
+				location.slab_id == slab_id
+					&& versions[index + 1..].iter().any(|newer| {
+						newer.hlc > location.hlc && (unbounded_as_of || newer.hlc <= as_of_hlc)
+					})
+			})
+		})
+	}
+
+	pub fn slab_supersession_metadata(&self, slab_id: SlabId) -> SupersessionMetadata {
+		let mut earliest: Option<HybridTimestamp> = None;
+		for entry in self.key_index.iter() {
+			let versions = entry.value();
+			for (index, location) in versions.iter().enumerate() {
+				if location.slab_id != slab_id {
+					continue;
+				}
+				if let Some(newer) = versions[index + 1..]
+					.iter()
+					.filter(|newer| newer.hlc > location.hlc)
+					.min_by_key(|newer| newer.hlc)
+				{
+					earliest = Some(
+						earliest
+							.map(|current| current.min(newer.hlc))
+							.unwrap_or(newer.hlc),
+					);
+				}
+			}
+		}
+		earliest.map_or(SupersessionMetadata::None, SupersessionMetadata::Earliest)
+	}
+
+	pub async fn record_supersession_for_slab(
+		&self,
+		slab_id: SlabId,
+		supersession_hlc: HybridTimestamp,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<bool> {
+		let mut changed = None;
+		{
+			let state = self.state.lock().await;
+			if let Some(mut pointer) = state.tiered.get_mut(&slab_id) {
+				let before = pointer.supersession_metadata;
+				pointer.record_supersession_hlc(supersession_hlc);
+				if pointer.supersession_metadata != before {
+					changed = Some((*pointer).clone());
+				}
+			}
+		}
+		let Some(pointer) = changed else {
+			return Ok(false);
+		};
+		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
+			.await?;
+		self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
+		Ok(true)
+	}
+
 	pub async fn record_migrated_range_tombstone(
 		&self,
 		tombstone: &MigratedRangeTombstone,
@@ -1992,6 +2202,33 @@ impl SlabManager {
                      incoming_hash={payload_hash:?}"
 				),
 			));
+		}
+
+		if let Some(entries) = storage_multirow_index_entries_from_frame(frame)? {
+			let Some(requested_entry) = entries
+				.iter()
+				.find(|entry| entry.key_identity == key_identity && entry.row_hlc == hlc)
+				.copied()
+			else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"multi-row migration frame does not contain the requested row identity/HLC",
+				));
+			};
+			if requested_entry.routing_locality != routing_locality {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"multi-row migration frame routing locality mismatch",
+				));
+			}
+			let base_location = self
+				.append_durable_multirow_with_locality(tenant_id, frame, &entries)
+				.await?;
+			return Ok(MigrationIngestOutcome::Inserted(RecordLocation {
+				hlc: requested_entry.row_hlc,
+				record_row_index: requested_entry.record_row_index,
+				..base_location
+			}));
 		}
 
 		// No prior version at this exact HLC — append to the same
@@ -2167,6 +2404,51 @@ impl SlabManager {
 		}
 		Ok(report)
 	}
+
+	pub async fn recluster_sealed_table_layout(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		max_slabs: usize,
+	) -> std::io::Result<LayoutReclusterReport> {
+		descriptor.validate()?;
+		if max_slabs == 0 {
+			return Ok(LayoutReclusterReport::default());
+		}
+
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+
+		let mut report = LayoutReclusterReport::default();
+		for (slab_id, slab) in sealed {
+			if report.rewritten_slabs >= max_slabs {
+				break;
+			}
+			if let Some(outcome) = self
+				.recluster_one_sealed_slab(slab_id, slab, tenant_id, descriptor)
+				.await?
+			{
+				report.rewritten_slabs += 1;
+				report.rewritten_records = report
+					.rewritten_records
+					.saturating_add(outcome.rewritten_records);
+				report.relocated_rows =
+					report.relocated_rows.saturating_add(outcome.relocated_rows);
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		Ok(report)
+	}
 }
 
 /// Authoritative location for a slab, as observed by the read
@@ -2294,6 +2576,7 @@ impl SlabManager {
 				row.key_identity,
 				row.location.hlc,
 				row.location.offset,
+				row.location.record_row_index,
 			)
 		});
 		rows
@@ -2424,10 +2707,47 @@ impl SlabManager {
 					row.key_identity,
 					row.location.hlc,
 					row.location.offset,
+					row.location.record_row_index,
 				)
 			});
 			let tiered = self.tiered_pointers_snapshot().await;
 			index.rebuild(rows, tiered, None).await?;
+		}
+		Ok(())
+	}
+
+	async fn persist_record_rows_strict(
+		&self,
+		rows: Vec<PersistentRecordRow>,
+	) -> std::io::Result<()> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(());
+		};
+		if let Err(err) = index
+			.apply(PersistentIndexUpdate {
+				put_records: rows.clone(),
+				..Default::default()
+			})
+			.await
+		{
+			tracing::warn!(
+				error = %err,
+				"redb batch upsert failed on durable multi-row append; rebuilding snapshot before retry"
+			);
+			let mut snapshot_rows = self.persistent_record_rows_snapshot();
+			snapshot_rows.extend(rows);
+			snapshot_rows.sort_by_key(|row| {
+				(
+					row.location.slab_id,
+					row.tenant_id,
+					row.key_identity,
+					row.location.hlc,
+					row.location.offset,
+					row.location.record_row_index,
+				)
+			});
+			let tiered = self.tiered_pointers_snapshot().await;
+			index.rebuild(snapshot_rows, tiered, None).await?;
 		}
 		Ok(())
 	}
@@ -2581,11 +2901,11 @@ impl SlabManager {
 		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
 		Ok(recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
-			.map(|(tenant_id, key_identity, location)| PersistentRecordRow {
-				tenant_id,
-				key_identity,
-				routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
-				location,
+			.map(|entry| PersistentRecordRow {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				location: entry.location,
 			})
 			.collect::<Vec<_>>())
 	}
@@ -2700,20 +3020,21 @@ impl SlabManager {
 		)?);
 		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
-			.map(|(tenant_id, key_identity, old_location)| CompactionRecord {
-				tenant_id,
-				key_identity,
-				routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
-				old_location,
+			.map(|entry| CompactionRecord {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				old_location: entry.location,
 				reclaim: self.is_retention_prunable(
-					tenant_id,
-					key_identity,
-					old_location,
+					entry.tenant_id,
+					entry.key_identity,
+					entry.location,
 					retention_floor,
 				),
 			})
 			.collect::<Vec<_>>();
 		records.sort_by_key(|record| record.old_location.offset);
+		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
 		if pruned_versions == 0 {
@@ -2730,6 +3051,7 @@ impl SlabManager {
 
 		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let mut multirow_recompact_count = 0_u64;
 		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
 			let rewritten = Arc::new(
 				LocalSlabStore::open(
@@ -2740,15 +3062,24 @@ impl SlabManager {
 				)
 				.await?,
 			);
-			for record in records.iter().filter(|record| !record.reclaim) {
+			for group in physical_groups.values() {
+				let Some(first) = group.first().copied() else {
+					continue;
+				};
 				let frame =
-					Zeroizing::new(extract_record_from_blob(&plaintext, record.old_location)?);
+					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let Some(compacted) = compact_physical_record_frame(frame.as_ref(), group)? else {
+					continue;
+				};
+				if compacted.was_multirow {
+					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+				}
 				rewritten
 					.append(
-						record.tenant_id,
-						record.key_identity,
-						record.old_location.hlc,
-						frame.as_ref(),
+						compacted.tenant_id,
+						compacted.key_identity,
+						compacted.hlc,
+						&compacted.frame,
 					)
 					.await?;
 			}
@@ -2758,6 +3089,9 @@ impl SlabManager {
 		.await;
 		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
 		let rewritten_plaintext = rewrite_result?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
 		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
 			pointer.slab_id,
 			rewritten_plaintext.as_ref(),
@@ -2768,6 +3102,7 @@ impl SlabManager {
 			old_l2_uri: pointer.l2_uri.clone(),
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
 			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
 			encrypted_bytes: encrypted.bytes,
@@ -2852,6 +3187,320 @@ impl SlabManager {
 			.await
 	}
 
+	async fn recluster_one_sealed_slab(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+	) -> std::io::Result<Option<LayoutReclusterOutcome>> {
+		let mut records: Vec<CompactionRecord> = slab
+			.index
+			.iter()
+			.flat_map(|entry| {
+				let (record_tenant_id, key_identity) = *entry.key();
+				let routing_locality =
+					self.routing_locality_for_key(record_tenant_id, key_identity);
+				entry
+					.value()
+					.iter()
+					.map(move |loc| CompactionRecord {
+						tenant_id: record_tenant_id,
+						key_identity,
+						routing_locality,
+						old_location: *loc,
+						reclaim: false,
+					})
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		if records.is_empty() {
+			return Ok(None);
+		}
+		records.sort_by_key(|record| {
+			(
+				record.old_location.offset,
+				record.old_location.record_row_index,
+			)
+		});
+
+		let target_is_multirow = descriptor.record_layout_policy.is_multi_row();
+		let mut needs_recluster = false;
+		let mut group_plans = Vec::new();
+		for group in physical_compaction_groups(&records).values() {
+			let Some(first) = group.first().copied() else {
+				continue;
+			};
+			let frame = slab.read(first.old_location).await?;
+			let source_is_multirow = storage_multirow_index_entries_from_frame(&frame)?.is_some();
+			let decoded = match decode_record_batch(&frame) {
+				Ok(batch) => Some(batch),
+				Err(err) if source_is_multirow => return Err(err),
+				Err(_) => None,
+			};
+			let mut matching_rows = Vec::new();
+			let mut nonmatching_records = Vec::new();
+			for record in group {
+				let matches_descriptor = match decoded.as_ref() {
+					Some(_) if record.tenant_id != tenant_id => false,
+					Some(batch) => {
+						let row_batch = materialize_record_location_batch(
+							batch,
+							record.old_location.record_row_index,
+						)?;
+						if descriptor_matches_tiered_row(
+							descriptor,
+							tenant_id,
+							record.key_identity,
+							record.routing_locality,
+							&row_batch,
+						)? {
+							matching_rows.push(ReclusterLogicalRow {
+								tenant_id: record.tenant_id,
+								key_identity: record.key_identity,
+								routing_locality: record.routing_locality,
+								old_location: record.old_location,
+								row_hlc: record.old_location.hlc,
+								batch: row_batch,
+							});
+							true
+						} else {
+							false
+						}
+					}
+					None => false,
+				};
+				if !matches_descriptor {
+					nonmatching_records.push(*record);
+				}
+			}
+			if !matching_rows.is_empty() && source_is_multirow != target_is_multirow {
+				needs_recluster = true;
+			}
+			group_plans.push(ReclusterGroupPlan {
+				frame,
+				records: group.clone(),
+				matching_rows,
+				nonmatching_records,
+			});
+		}
+
+		if !needs_recluster {
+			return Ok(None);
+		}
+
+		let old_bytes = slab.write_cursor();
+		let replacement_id = self.reserve_slab_id().await;
+		let replacement_path = slab_path(&self.config.dir, replacement_id);
+		let replacement = Arc::new(
+			LocalSlabStore::open(
+				&replacement_path,
+				replacement_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
+		let mut relocations = Vec::with_capacity(records.len());
+		let mut rows_to_recluster = Vec::new();
+		let mut rewritten_records = 0_usize;
+		let mut multirow_recompact_count = 0_u64;
+
+		for plan in group_plans {
+			if plan.matching_rows.is_empty() {
+				append_existing_frame_to_replacement(
+					&replacement,
+					&plan.frame,
+					&plan.records,
+					&mut relocations,
+				)
+				.await?;
+				rewritten_records = rewritten_records.saturating_add(1);
+				continue;
+			}
+
+			let matching_locations = plan
+				.matching_rows
+				.iter()
+				.map(|row| row.old_location)
+				.collect::<HashSet<_>>();
+			rows_to_recluster.extend(plan.matching_rows);
+			if plan.nonmatching_records.is_empty() {
+				continue;
+			}
+
+			let partial = plan
+				.records
+				.iter()
+				.map(|record| CompactionRecord {
+					reclaim: matching_locations.contains(&record.old_location),
+					..*record
+				})
+				.collect::<Vec<_>>();
+			if let Some(compacted) = compact_physical_record_frame(&plan.frame, &partial)? {
+				if compacted.was_multirow {
+					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+				}
+				append_compacted_frame_to_replacement(&replacement, compacted, &mut relocations)
+					.await?;
+				rewritten_records = rewritten_records.saturating_add(1);
+			}
+		}
+
+		match &descriptor.record_layout_policy {
+			RecordLayoutPolicy::SingleRow => {
+				rows_to_recluster.sort_by_key(|row| {
+					(
+						row.routing_locality,
+						row.key_identity,
+						row.row_hlc,
+						row.old_location.offset,
+						row.old_location.record_row_index,
+					)
+				});
+				for row in &rows_to_recluster {
+					let frame = encode_record_batch(&row.batch)?;
+					let new_location = replacement
+						.append(row.tenant_id, row.key_identity, row.row_hlc, &frame)
+						.await?;
+					relocations.push(RelocatedRecord {
+						tenant_id: row.tenant_id,
+						key_identity: row.key_identity,
+						routing_locality: row.routing_locality,
+						old_location: row.old_location,
+						new_location,
+					});
+					rewritten_records = rewritten_records.saturating_add(1);
+				}
+			}
+			RecordLayoutPolicy::MultiRow(layout) => {
+				let batches = rows_to_recluster
+					.iter()
+					.map(|row| row.batch.clone())
+					.collect::<Vec<_>>();
+				if !batches.is_empty() {
+					let schema = batches[0].schema();
+					let batch = concat_batches(&schema, &batches).map_err(|err| {
+						Error::new(
+							ErrorKind::InvalidData,
+							format!("layout recluster row concat failed: {err}"),
+						)
+					})?;
+					let source_rows = rows_to_recluster
+						.iter()
+						.enumerate()
+						.map(|(source_row_index, row)| MultiRowSourceRow {
+							source_row_index,
+							key_identity: row.key_identity,
+							routing_locality: row.routing_locality,
+							row_hlc: row.row_hlc,
+						})
+						.collect::<Vec<_>>();
+					for packed in pack_multirow_source_rows(*layout, &batch, &source_rows)? {
+						let Some(primary) = packed.encoded.rows.first().copied() else {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"layout recluster produced an empty multi-row frame",
+							));
+						};
+						let base_location = replacement
+							.append(
+								tenant_id,
+								primary.key_identity,
+								packed.encoded.max_row_hlc,
+								&packed.encoded.frame,
+							)
+							.await?;
+						replacement.rollback_index_entry(
+							tenant_id,
+							primary.key_identity,
+							base_location,
+						);
+						for (source_row, encoded_row) in
+							packed.source_rows.iter().zip(packed.encoded.rows.iter())
+						{
+							let old_row = rows_to_recluster
+								.get(source_row.source_row_index)
+								.ok_or_else(|| {
+									Error::new(
+										ErrorKind::InvalidData,
+										"layout recluster source row index out of bounds",
+									)
+								})?;
+							if old_row.key_identity != encoded_row.key_identity
+								|| old_row.routing_locality != encoded_row.routing_locality
+								|| old_row.row_hlc != encoded_row.row_hlc
+							{
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									"layout recluster storage metadata does not match source row",
+								));
+							}
+							let new_location = RecordLocation {
+								hlc: encoded_row.row_hlc,
+								record_row_index: encoded_row.record_row_index,
+								..base_location
+							};
+							replacement.index_location(
+								tenant_id,
+								encoded_row.key_identity,
+								new_location,
+							);
+							relocations.push(RelocatedRecord {
+								tenant_id,
+								key_identity: encoded_row.key_identity,
+								routing_locality: encoded_row.routing_locality,
+								old_location: old_row.old_location,
+								new_location,
+							});
+						}
+						rewritten_records = rewritten_records.saturating_add(1);
+						multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+					}
+				}
+			}
+		}
+
+		if relocations.len() != records.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"layout recluster relocation count mismatch: old_rows={} new_rows={}",
+					records.len(),
+					relocations.len()
+				),
+			));
+		}
+		replacement.fsync().await?;
+		let new_bytes = replacement.write_cursor();
+		if !self
+			.finish_compaction_with_replacement(
+				slab_id,
+				replacement_id,
+				replacement.clone(),
+				&records,
+				&relocations,
+			)
+			.await?
+		{
+			let path = slab_path(&self.config.dir, replacement_id);
+			let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
+			return Ok(None);
+		}
+
+		let old_path = slab_path(&self.config.dir, slab_id);
+		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
+
+		Ok(Some(LayoutReclusterOutcome {
+			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
+			rewritten_records,
+			relocated_rows: relocations.len(),
+		}))
+	}
+
 	fn is_retention_prunable(
 		&self,
 		tenant_id: TenantId,
@@ -2905,23 +3554,47 @@ impl SlabManager {
 			.await?,
 		);
 		let mut relocations = Vec::with_capacity(survivors);
-		for record in records.iter().filter(|record| !record.reclaim) {
-			let frame = slab.read(record.old_location).await?;
-			let new_location = replacement
+		let physical_groups = physical_compaction_groups(records);
+		let mut multirow_recompact_count = 0_u64;
+		for group in physical_groups.values() {
+			let Some(first) = group.first().copied() else {
+				continue;
+			};
+			let frame = slab.read(first.old_location).await?;
+			let Some(compacted) = compact_physical_record_frame(&frame, group)? else {
+				continue;
+			};
+			if compacted.was_multirow {
+				multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+			}
+			let base_location = replacement
 				.append(
-					record.tenant_id,
-					record.key_identity,
-					record.old_location.hlc,
-					&frame,
+					compacted.tenant_id,
+					compacted.key_identity,
+					compacted.hlc,
+					&compacted.frame,
 				)
 				.await?;
-			relocations.push(RelocatedRecord {
-				tenant_id: record.tenant_id,
-				key_identity: record.key_identity,
-				routing_locality: record.routing_locality,
-				old_location: record.old_location,
-				new_location,
-			});
+			replacement.rollback_index_entry(
+				compacted.tenant_id,
+				compacted.key_identity,
+				base_location,
+			);
+			for row in &compacted.rows {
+				let new_location = RecordLocation {
+					hlc: row.row_hlc,
+					record_row_index: row.record_row_index,
+					..base_location
+				};
+				replacement.index_location(row.tenant_id, row.key_identity, new_location);
+				relocations.push(RelocatedRecord {
+					tenant_id: row.tenant_id,
+					key_identity: row.key_identity,
+					routing_locality: row.routing_locality,
+					old_location: row.old_location,
+					new_location,
+				});
+			}
 		}
 		replacement.fsync().await?;
 		let new_bytes = replacement.write_cursor();
@@ -2943,6 +3616,9 @@ impl SlabManager {
 
 		let old_path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
 
 		Ok(Some(CompactionOutcome {
 			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
@@ -3243,6 +3919,42 @@ struct CompactionRecord {
 	reclaim: bool,
 }
 
+#[derive(Clone)]
+struct ReclusterLogicalRow {
+	tenant_id: TenantId,
+	key_identity: Identity,
+	routing_locality: Locality,
+	old_location: RecordLocation,
+	row_hlc: HybridTimestamp,
+	batch: RecordBatch,
+}
+
+struct ReclusterGroupPlan {
+	frame: Vec<u8>,
+	records: Vec<CompactionRecord>,
+	matching_rows: Vec<ReclusterLogicalRow>,
+	nonmatching_records: Vec<CompactionRecord>,
+}
+
+struct CompactedFrame {
+	tenant_id: TenantId,
+	key_identity: Identity,
+	hlc: HybridTimestamp,
+	frame: Vec<u8>,
+	was_multirow: bool,
+	rows: Vec<CompactedFrameRow>,
+}
+
+#[derive(Clone, Copy)]
+struct CompactedFrameRow {
+	tenant_id: TenantId,
+	key_identity: Identity,
+	routing_locality: Locality,
+	old_location: RecordLocation,
+	row_hlc: HybridTimestamp,
+	record_row_index: RecordRowIndex,
+}
+
 #[derive(Clone, Copy)]
 struct RelocatedRecord {
 	tenant_id: TenantId,
@@ -3256,6 +3968,13 @@ struct RelocatedRecord {
 struct CompactionOutcome {
 	reclaimed_bytes: u64,
 	reclaimed_records: usize,
+}
+
+#[derive(Clone, Copy)]
+struct LayoutReclusterOutcome {
+	reclaimed_bytes: u64,
+	rewritten_records: usize,
+	relocated_rows: usize,
 }
 
 // ============================================================
@@ -3370,31 +4089,192 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 	Ok(blob[offset + header_size..end].to_vec())
 }
 
-fn decode_record_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
-	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
-	let batch = match reader.next() {
-		Some(Ok(batch)) => Ok(batch),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained no record batch",
-		)),
-	}?;
-	match reader.next() {
-		Some(Ok(_)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained multiple record batches",
-		)),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Ok(batch),
+fn physical_compaction_groups(
+	records: &[CompactionRecord],
+) -> BTreeMap<(u64, u32), Vec<CompactionRecord>> {
+	let mut groups = BTreeMap::new();
+	for record in records {
+		groups
+			.entry((record.old_location.offset, record.old_location.length))
+			.or_insert_with(Vec::new)
+			.push(*record);
 	}
+	groups
+}
+
+async fn append_existing_frame_to_replacement(
+	replacement: &Arc<LocalSlabStore>,
+	frame: &[u8],
+	records: &[CompactionRecord],
+	relocations: &mut Vec<RelocatedRecord>,
+) -> std::io::Result<()> {
+	let Some(first) = records.first().copied() else {
+		return Ok(());
+	};
+	let hlc = records
+		.iter()
+		.map(|record| record.old_location.hlc)
+		.max()
+		.unwrap_or(first.old_location.hlc);
+	let base_location = replacement
+		.append(first.tenant_id, first.key_identity, hlc, frame)
+		.await?;
+	replacement.rollback_index_entry(first.tenant_id, first.key_identity, base_location);
+	for record in records {
+		let new_location = RecordLocation {
+			hlc: record.old_location.hlc,
+			record_row_index: record.old_location.record_row_index,
+			..base_location
+		};
+		replacement.index_location(record.tenant_id, record.key_identity, new_location);
+		relocations.push(RelocatedRecord {
+			tenant_id: record.tenant_id,
+			key_identity: record.key_identity,
+			routing_locality: record.routing_locality,
+			old_location: record.old_location,
+			new_location,
+		});
+	}
+	Ok(())
+}
+
+async fn append_compacted_frame_to_replacement(
+	replacement: &Arc<LocalSlabStore>,
+	compacted: CompactedFrame,
+	relocations: &mut Vec<RelocatedRecord>,
+) -> std::io::Result<()> {
+	let base_location = replacement
+		.append(
+			compacted.tenant_id,
+			compacted.key_identity,
+			compacted.hlc,
+			&compacted.frame,
+		)
+		.await?;
+	replacement.rollback_index_entry(compacted.tenant_id, compacted.key_identity, base_location);
+	for row in &compacted.rows {
+		let new_location = RecordLocation {
+			hlc: row.row_hlc,
+			record_row_index: row.record_row_index,
+			..base_location
+		};
+		replacement.index_location(row.tenant_id, row.key_identity, new_location);
+		relocations.push(RelocatedRecord {
+			tenant_id: row.tenant_id,
+			key_identity: row.key_identity,
+			routing_locality: row.routing_locality,
+			old_location: row.old_location,
+			new_location,
+		});
+	}
+	Ok(())
+}
+
+fn compact_physical_record_frame(
+	frame: &[u8],
+	records: &[CompactionRecord],
+) -> std::io::Result<Option<CompactedFrame>> {
+	let mut survivors = records
+		.iter()
+		.copied()
+		.filter(|record| !record.reclaim)
+		.collect::<Vec<_>>();
+	if survivors.is_empty() {
+		return Ok(None);
+	}
+
+	if storage_multirow_index_entries_from_frame(frame)?.is_none() {
+		if records.len() != 1 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"single-row storage record has multiple compaction index entries",
+			));
+		}
+		let record = survivors[0];
+		return Ok(Some(CompactedFrame {
+			tenant_id: record.tenant_id,
+			key_identity: record.key_identity,
+			hlc: record.old_location.hlc,
+			frame: frame.to_vec(),
+			was_multirow: false,
+			rows: vec![CompactedFrameRow {
+				tenant_id: record.tenant_id,
+				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
+				old_location: record.old_location,
+				row_hlc: record.old_location.hlc,
+				record_row_index: RecordRowIndex::ZERO,
+			}],
+		}));
+	}
+
+	let batch = decode_record_batch(frame)?;
+	if !has_storage_synthetic_columns(&batch) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"multi-row storage record decoded without synthetic columns",
+		));
+	}
+	survivors.sort_by_key(|record| {
+		(
+			record.routing_locality,
+			record.key_identity,
+			record.old_location.hlc,
+			record.old_location.record_row_index,
+		)
+	});
+	let source_rows = survivors
+		.iter()
+		.map(|record| MultiRowSourceRow {
+			source_row_index: record.old_location.record_row_index.get() as usize,
+			key_identity: record.key_identity,
+			routing_locality: record.routing_locality,
+			row_hlc: record.old_location.hlc,
+		})
+		.collect::<Vec<_>>();
+	let encoded = encode_multirow_from_survivors(&batch, &source_rows)?;
+	let entries = encoded.rows;
+	if entries.len() != survivors.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"rewritten multi-row storage record entry count mismatch: expected={} actual={}",
+				survivors.len(),
+				entries.len()
+			),
+		));
+	}
+
+	let primary = entries[0];
+	let hlc = encoded.max_row_hlc;
+	let mut rows = Vec::with_capacity(entries.len());
+	for (record, entry) in survivors.iter().zip(entries.iter()) {
+		if record.key_identity != entry.key_identity
+			|| record.routing_locality != entry.routing_locality
+			|| record.old_location.hlc != entry.row_hlc
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"rewritten multi-row storage metadata does not match surviving row",
+			));
+		}
+		rows.push(CompactedFrameRow {
+			tenant_id: record.tenant_id,
+			key_identity: entry.key_identity,
+			routing_locality: entry.routing_locality,
+			old_location: record.old_location,
+			row_hlc: entry.row_hlc,
+			record_row_index: entry.record_row_index,
+		});
+	}
+	Ok(Some(CompactedFrame {
+		tenant_id: survivors[0].tenant_id,
+		key_identity: primary.key_identity,
+		hlc,
+		frame: encoded.frame,
+		was_multirow: true,
+		rows,
+	}))
 }
 
 fn descriptor_matches_tiered_row(
@@ -3425,7 +4305,7 @@ fn build_tiered_object_metadata(
 	slab_id: SlabId,
 ) -> std::io::Result<TieredSlabObjectMetadata> {
 	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
-	let Some((tenant_id, _, first_location)) = entries.first().copied() else {
+	let Some(first_entry) = entries.first().copied() else {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
 			format!(
@@ -3434,8 +4314,12 @@ fn build_tiered_object_metadata(
 			),
 		));
 	};
+	let tenant_id = first_entry.tenant_id;
 	let mut offset_index = Vec::with_capacity(entries.len());
-	for (other_tenant_id, key_identity, location) in entries {
+	for entry in entries {
+		let other_tenant_id = entry.tenant_id;
+		let key_identity = entry.key_identity;
+		let location = entry.location;
 		if other_tenant_id != tenant_id {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
@@ -3456,7 +4340,7 @@ fn build_tiered_object_metadata(
 	}
 	Ok(TieredSlabObjectMetadata {
 		tenant_id,
-		created_hlc: first_location.hlc.physical_ms,
+		created_hlc: first_entry.location.hlc.physical_ms,
 		offset_index,
 		column_stats_block: None,
 	})
@@ -3580,7 +4464,11 @@ async fn discover_slab_ids(
 /// chain stays sorted globally even when older slabs contain
 /// versions that post-date newer slabs (a legal outcome of leader
 /// changes or cross-slab rewrites).
-fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<RecordLocation>>) {
+fn drain_slab_index(
+	slab: &LocalSlabStore,
+	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
+	recovered_key_localities: &mut Vec<(TenantId, Identity, Locality)>,
+) {
 	for entry in slab.index.iter() {
 		let tenant_key = *entry.key();
 		for loc in entry.value().iter() {
@@ -3590,6 +4478,11 @@ fn drain_slab_index(slab: &LocalSlabStore, key_index: &DashMap<TenantKey, Vec<Re
 				.or_insert_with(|| vec![*loc]);
 		}
 	}
+	recovered_key_localities.extend(
+		slab.recovered_localities
+			.iter()
+			.map(|entry| (entry.key().0, entry.key().1, *entry.value())),
+	);
 }
 
 fn build_key_localities(
@@ -3621,17 +4514,23 @@ mod tests {
 	use crate::crypto::CryptoManager;
 	use crate::schema::NodeId;
 	use crate::schema::table::{
-		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, PrimaryKeyDescriptorV1,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
+		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, MultiRowLayoutDescriptor,
+		PrimaryKeyDescriptorV1, RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN,
+		STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
 		default_kv_table_descriptor_v1, encode_table_write_row_count,
 	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
+	use crate::storage::multirow::pack_record_batch_by_bucket;
 	use crate::storage::stats::{
 		ARROW_STATS_TAG_INT64, decode_column_stats_payload, encode_signed_stat_value,
 		parse_column_stats_block,
 	};
-	use arrow::array::{Array, Int64Array, LargeBinaryBuilder, LargeStringArray};
+	use arrow::array::{
+		Array, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder, LargeStringArray,
+		UInt64Array, UInt64Builder,
+	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::ipc::writer::StreamWriter;
 	use arrow::record_batch::RecordBatch;
@@ -3678,6 +4577,108 @@ mod tests {
 			writer.finish().unwrap();
 		}
 		buf
+	}
+
+	fn test_hlc_storage_bytes(hlc: HybridTimestamp) -> [u8; 16] {
+		let mut bytes = [0_u8; 16];
+		bytes[..8].copy_from_slice(&hlc.physical_ms.to_le_bytes());
+		bytes[8..12].copy_from_slice(&hlc.logical.to_le_bytes());
+		bytes[12..16].copy_from_slice(&hlc.node_id.to_le_bytes());
+		bytes
+	}
+
+	fn encode_test_multirow_storage_frame(
+		rows: &[(Identity, Locality, HybridTimestamp, u64)],
+	) -> Vec<u8> {
+		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+		let mut row_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
+		let mut row_locality = UInt64Builder::with_capacity(rows.len());
+		for (identity, locality, hlc, _) in rows {
+			row_hlc.append_value(test_hlc_storage_bytes(*hlc)).unwrap();
+			row_identity.append_value(identity.as_bytes()).unwrap();
+			row_locality.append_value(locality.get());
+		}
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("value", DataType::UInt64, false),
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(UInt64Array::from(
+					rows.iter()
+						.map(|(_, _, _, value)| *value)
+						.collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(row_hlc.finish()) as Arc<dyn Array>,
+				Arc::new(row_identity.finish()) as Arc<dyn Array>,
+				Arc::new(row_locality.finish()) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		encode_test_batch(&batch)
+	}
+
+	fn layout_recluster_descriptor(
+		object_byte: u8,
+		generation: u64,
+		layout: RecordLayoutPolicy,
+	) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([object_byte; 16]),
+			generation,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+				spread_factor: 1,
+				prefix_bits: 1,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_layout_policy = layout;
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor
+	}
+
+	fn layout_recluster_batch(values: &[i64]) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(
+				values.iter().copied().map(Some).collect::<Vec<_>>(),
+			)) as Arc<dyn Array>],
+		)
+		.unwrap()
+	}
+
+	fn layout_recluster_meta(
+		descriptor: &TableSchemaDescriptorV1,
+		row_count: usize,
+	) -> TableWriteRequestMeta {
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(row_count).unwrap();
+		meta
+	}
+
+	fn first_i64(batch: &RecordBatch) -> i64 {
+		batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap()
+			.value(0)
 	}
 
 	async fn fresh_manager() -> Arc<SlabManager> {
@@ -3992,6 +4993,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 
 		let stats = mgr
@@ -4088,6 +5090,7 @@ mod tests {
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(drifted_hash),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		let drift_before = metrics().pbc_slab_stats_pointer_drift_total.get();
 
@@ -4326,6 +5329,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -4357,6 +5361,321 @@ mod tests {
 		assert_eq!(
 			region_stats.small_set,
 			Some(vec![b"mm-anchor".to_vec(), b"zz-latest".to_vec()])
+		);
+	}
+
+	#[tokio::test]
+	async fn tiered_retention_rewrite_filters_partial_multirow_storage_records() {
+		let l1_dir = fresh_dir("retention-multirow-l1");
+		let l2_root = fresh_dir("retention-multirow-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let key_a = id(0xA1);
+		let key_b = id(0xB2);
+		let key_c = id(0xC3);
+		let loc_a = Locality::new(20);
+		let loc_b = Locality::new(10);
+		let loc_c = Locality::new(30);
+		let frame = encode_test_multirow_storage_frame(&[
+			(key_c, loc_c, hlc(30), 300),
+			(key_a, loc_a, hlc(10), 100),
+			(key_b, loc_b, hlc(20), 200),
+		]);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("multi-row entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		mgr.append_durable_with_locality(tenant(), key_a, loc_a, hlc(40), b"new-a")
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_retention_rewrite(
+				&old_pointer,
+				hlc(50),
+				&TableSchemaCatalogV1::default(),
+			)
+			.await
+			.unwrap()
+			.expect("retention rewrite");
+		let PreparedTieredRetentionRewrite::Rewrite {
+			encrypted_bytes,
+			pruned_versions,
+			..
+		} = prepared
+		else {
+			panic!("expected rewrite, not retire");
+		};
+		assert_eq!(pruned_versions, 1);
+
+		let rewritten_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: "rewritten".to_string(),
+			payload_hash: crate::hash::content::digest(&encrypted_bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		let rewritten_plaintext = decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			&rewritten_pointer,
+			&encrypted_bytes,
+		)
+		.unwrap();
+		let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+		assert!(
+			!recovered
+				.iter()
+				.any(|entry| entry.key_identity == key_a && entry.location.hlc == hlc(10))
+		);
+		assert!(
+			recovered
+				.iter()
+				.any(|entry| entry.key_identity == key_a && entry.location.hlc == hlc(40))
+		);
+		assert!(
+			recovered
+				.iter()
+				.any(|entry| entry.key_identity == key_b && entry.location.hlc == hlc(20))
+		);
+		assert!(
+			recovered
+				.iter()
+				.any(|entry| entry.key_identity == key_c && entry.location.hlc == hlc(30))
+		);
+
+		let mut groups: BTreeMap<(u64, u32), Vec<RecoveredSlabEntry>> = BTreeMap::new();
+		for entry in recovered {
+			groups
+				.entry((entry.location.offset, entry.location.length))
+				.or_default()
+				.push(entry);
+		}
+		assert_eq!(groups.len(), 2);
+		let multirow = groups
+			.values()
+			.find(|entries| entries.len() == 2)
+			.expect("rewritten multi-row record");
+		assert_eq!(multirow[0].key_identity, key_b);
+		assert_eq!(multirow[0].location.record_row_index.get(), 0);
+		assert_eq!(multirow[1].key_identity, key_c);
+		assert_eq!(multirow[1].location.record_row_index.get(), 1);
+	}
+
+	#[tokio::test]
+	async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
+		let mgr = fresh_manager().await;
+		let key_a = id(0x1A);
+		let key_b = id(0x1B);
+		let key_c = id(0x1C);
+		let loc_a = Locality::new(20);
+		let loc_b = Locality::new(10);
+		let loc_c = Locality::new(30);
+		let frame = encode_test_multirow_storage_frame(&[
+			(key_c, loc_c, hlc(30), 300),
+			(key_a, loc_a, hlc(10), 100),
+			(key_b, loc_b, hlc(20), 200),
+		]);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("multi-row entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		mgr.append_durable_with_locality(tenant(), key_a, loc_a, hlc(40), b"new-a")
+			.await
+			.unwrap();
+
+		let old_slab_id = force_seal_active(&mgr).await;
+		let report = mgr.prune_versions_older_than(hlc(50), 1).await.unwrap();
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert!(
+			mgr.lookup_as_of(tenant(), key_a, hlc(10)).is_none(),
+			"pruned old row should leave the historical slot absent"
+		);
+
+		let loc_b_new = mgr.lookup(tenant(), key_b).expect("key_b survivor");
+		let loc_c_new = mgr.lookup(tenant(), key_c).expect("key_c survivor");
+		assert_ne!(loc_b_new.slab_id, old_slab_id);
+		assert_eq!(loc_b_new.slab_id, loc_c_new.slab_id);
+		assert_eq!(loc_b_new.offset, loc_c_new.offset);
+		assert_eq!(loc_b_new.record_row_index.get(), 0);
+		assert_eq!(loc_c_new.record_row_index.get(), 1);
+
+		let rewritten_frame = mgr.read(loc_b_new).await.unwrap();
+		let rewritten_entries = storage_multirow_index_entries_from_frame(&rewritten_frame)
+			.unwrap()
+			.expect("rewritten multi-row entries");
+		assert_eq!(rewritten_entries.len(), 2);
+		assert_eq!(rewritten_entries[0].key_identity, key_b);
+		assert_eq!(rewritten_entries[1].key_identity, key_c);
+		assert_eq!(
+			mgr.read(mgr.lookup(tenant(), key_a).expect("new key_a"))
+				.await
+				.unwrap(),
+			b"new-a"
+		);
+	}
+
+	#[tokio::test]
+	async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
+		let mgr = fresh_manager().await;
+		let single_descriptor = layout_recluster_descriptor(0x62, 1, RecordLayoutPolicy::SingleRow);
+		let multi_descriptor = layout_recluster_descriptor(
+			0x62,
+			2,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap()),
+		);
+		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
+		let meta = layout_recluster_meta(&single_descriptor, batch.num_rows());
+		let admission =
+			validate_table_write_request_batch(&meta, &batch, &single_descriptor).unwrap();
+		for row in 0..batch.num_rows() {
+			let row_batch = batch.slice(row, 1);
+			let frame = encode_test_batch(&row_batch);
+			mgr.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64),
+				&frame,
+			)
+			.await
+			.unwrap();
+		}
+		let old_slab_id = force_seal_active(&mgr).await;
+
+		let report = mgr
+			.recluster_sealed_table_layout(tenant(), &multi_descriptor, 10)
+			.await
+			.unwrap();
+
+		assert_eq!(report.rewritten_slabs, 1);
+		assert_eq!(report.relocated_rows, batch.num_rows());
+		let mut offsets = BTreeSet::new();
+		for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
+			let location = mgr
+				.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+				.expect("reclustered row");
+			assert_ne!(location.slab_id, old_slab_id);
+			offsets.insert(location.offset);
+			let frame = mgr.read(location).await.unwrap();
+			let storage_batch = decode_record_batch(&frame).unwrap();
+			assert!(has_storage_synthetic_columns(&storage_batch));
+			let user_batch =
+				materialize_record_location_batch(&storage_batch, location.record_row_index)
+					.unwrap();
+			assert_eq!(first_i64(&user_batch), expected);
+		}
+		assert_eq!(
+			offsets.len(),
+			batch.num_rows(),
+			"the test descriptor maps each primary key into a distinct routing bucket"
+		);
+
+		let second = mgr
+			.recluster_sealed_table_layout(tenant(), &multi_descriptor, 10)
+			.await
+			.unwrap();
+		assert_eq!(second, LayoutReclusterReport::default());
+	}
+
+	#[tokio::test]
+	async fn sealed_layout_recluster_multi_to_single_preserves_reads() {
+		let mgr = fresh_manager().await;
+		let multi_descriptor = layout_recluster_descriptor(
+			0x63,
+			1,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap()),
+		);
+		let single_descriptor = layout_recluster_descriptor(0x63, 2, RecordLayoutPolicy::SingleRow);
+		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
+		let meta = layout_recluster_meta(&multi_descriptor, batch.num_rows());
+		let admission =
+			validate_table_write_request_batch(&meta, &batch, &multi_descriptor).unwrap();
+		let packed =
+			pack_record_batch_by_bucket(&meta, &multi_descriptor, &batch, hlc(10)).unwrap();
+		for record in packed {
+			let entries = storage_multirow_index_entries_from_frame(&record.frame_bytes)
+				.unwrap()
+				.expect("multi-row entries");
+			mgr.append_durable_multirow_with_locality(tenant(), &record.frame_bytes, &entries)
+				.await
+				.unwrap();
+		}
+		let old_slab_id = force_seal_active(&mgr).await;
+
+		let report = mgr
+			.recluster_sealed_table_layout(tenant(), &single_descriptor, 10)
+			.await
+			.unwrap();
+
+		assert_eq!(report.rewritten_slabs, 1);
+		assert_eq!(report.relocated_rows, batch.num_rows());
+		let mut offsets = BTreeSet::new();
+		for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
+			let location = mgr
+				.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+				.expect("reclustered row");
+			assert_ne!(location.slab_id, old_slab_id);
+			assert_eq!(location.record_row_index, RecordRowIndex::ZERO);
+			offsets.insert(location.offset);
+			let frame = mgr.read(location).await.unwrap();
+			let user_batch = decode_record_batch(&frame).unwrap();
+			assert!(!has_storage_synthetic_columns(&user_batch));
+			assert_eq!(first_i64(&user_batch), expected);
+		}
+		assert_eq!(
+			offsets.len(),
+			batch.num_rows(),
+			"multi-row rollback should materialize one physical record per row"
 		);
 	}
 
@@ -4425,6 +5744,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 
 		let err =
@@ -4826,6 +6146,7 @@ mod tests {
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			})
 			.await
 			.unwrap();
@@ -4994,6 +6315,7 @@ mod tests {
 					stats_block_len: None,
 					stats_block_hash128: None,
 					tombstone_metadata: TombstoneMetadata::None,
+					supersession_metadata: SupersessionMetadata::None,
 				},
 			);
 		}
@@ -5035,12 +6357,58 @@ mod tests {
 		assert!(crate::storage::slab_visibility_complete(
 			hlc(10),
 			pointer.tombstone_metadata,
+			SupersessionMetadata::None,
 			hlc(49)
 		));
 		assert!(!crate::storage::slab_visibility_complete(
 			hlc(10),
 			pointer.tombstone_metadata,
+			SupersessionMetadata::None,
 			hlc(50)
+		));
+	}
+
+	#[tokio::test]
+	async fn post_tier_supersession_updates_tiered_pointer_visibility() {
+		let manager = fresh_manager().await;
+		let key = id(0x5151);
+		manager
+			.append_durable(tenant(), key, hlc(10), b"v10")
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: sealed_id,
+				l2_uri: "memory://supersession".into(),
+				payload_hash: [0x55; 32],
+				is_encrypted: false,
+				tenant_id: None,
+				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
+			})
+			.await
+			.unwrap();
+
+		manager
+			.append_durable(tenant(), key, hlc(20), b"v20")
+			.await
+			.unwrap();
+
+		let pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(
+			pointer.supersession_metadata,
+			SupersessionMetadata::Earliest(hlc(20))
+		);
+		assert!(!crate::storage::slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::None,
+			pointer.supersession_metadata,
+			hlc(20)
 		));
 	}
 

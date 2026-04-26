@@ -64,8 +64,6 @@ use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::{MembershipEpoch, NodeCapability, NodeRole, TransportStream};
 use crate::network::wire;
-#[cfg(test)]
-use crate::schema::TombstoneMetadata;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
 	AggregateDiagnostics, AggregateExpressionIndex, AggregateFunction, AggregateRequest,
@@ -75,17 +73,24 @@ use crate::schema::{
 	LocalityPolicyV1, LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta,
 	MigrateStatus, MsgType, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta,
-	ReplicaWriteRespMeta, ReplicaWriteStatus, SlabId, StreamFinalizationRequestMeta,
-	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta,
-	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, column_projection_predicate_ranges,
-	column_projection_prefix_ranges, encode_aggregate_state, migration_record_schema, pbc,
-	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, write_payload_schema,
+	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordLayoutPolicy, RecordRowIndex,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, SlabId,
+	StreamFinalizationRequestMeta, TableQueryRequestMeta, TableReplicaWriteMeta,
+	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
+	TableWriteValidationError, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
+	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
+	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
+#[cfg(test)]
+use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
+use crate::storage::multirow::{
+	decode_batch, encode_batch, has_storage_synthetic_columns, materialize_record_location_batch,
+	pack_admitted_record_batch_by_bucket, replace_storage_row_hlc_column,
+	storage_index_entries_from_batch,
+};
 use crate::storage::stats::{
 	COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED,
 	ColumnStatsBlockEntry, ColumnStatsPrune, ParsedColumnStatsBlock,
@@ -261,6 +266,7 @@ struct BifurcatedTableChildWrite {
 	child_ordinal: u64,
 	key_identity: Identity,
 	locality: Locality,
+	record_row_index: RecordRowIndex,
 	frame_bytes: Arc<Vec<u8>>,
 	payload_hash: [u8; 32],
 	charged_bytes: u64,
@@ -277,6 +283,7 @@ struct TableReplicaChildPayload {
 	child_ordinal: u64,
 	key_identity: Identity,
 	locality: Locality,
+	record_row_index: RecordRowIndex,
 	frame_bytes: Arc<Vec<u8>>,
 	payload_hash: [u8; 32],
 	charged_bytes: u64,
@@ -5131,6 +5138,11 @@ impl WendelonDataServer {
 					metrics().observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
 					return Ok(None);
 				}
+				if pointer.supersession_metadata.is_untracked() {
+					metrics()
+						.observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked();
+					return Ok(None);
+				}
 				if self.slab.slab_has_migrated_range_tombstone_at(
 					location.slab_id,
 					request.as_of_hlc,
@@ -5138,9 +5150,16 @@ impl WendelonDataServer {
 				) {
 					return Ok(None);
 				}
+				if self
+					.slab
+					.slab_has_supersession_at(location.slab_id, request.as_of_hlc)
+				{
+					return Ok(None);
+				}
 				if !crate::storage::slab_visibility_complete(
 					location.hlc,
 					pointer.tombstone_metadata,
+					pointer.supersession_metadata,
 					request.as_of_hlc,
 				) {
 					return Ok(None);
@@ -6529,8 +6548,8 @@ impl WendelonDataServer {
 	async fn write_table_bifurcated(
 		&self,
 		meta: TableWriteRequestMeta,
-		bifurcated: BifurcatedTableWrite,
-		groups: Vec<TableReplicaGroup>,
+		mut bifurcated: BifurcatedTableWrite,
+		mut groups: Vec<TableReplicaGroup>,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		let synthetic = table_write_synthetic_meta(
 			&meta,
@@ -6612,6 +6631,12 @@ impl WendelonDataServer {
 		};
 
 		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+		restamp_table_write_commit_hlc(&mut bifurcated, commit_hlc)?;
+		groups = self
+			.table_batch_replica_groups(&bifurcated.children)
+			.ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "table replica group restamp failed")
+			})?;
 
 		if groups.is_empty() {
 			return Ok(self.counted_write_result(
@@ -7257,13 +7282,6 @@ struct PreparedAggregateExecution {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct QueryRecordLocation {
-	identity: Identity,
-	locality: Locality,
-	location: RecordLocation,
-}
-
-#[derive(Clone, Copy, Debug)]
 struct QueryScanRange {
 	start: Locality,
 	end: Locality,
@@ -7305,13 +7323,6 @@ struct QueryStatsExplainCounters {
 	stats_cache_hits: u64,
 	stats_cache_misses: u64,
 	stats_decrypt_failed_total: u64,
-}
-
-#[derive(Debug)]
-enum QueryBatchMaterializationError {
-	Io(std::io::Error),
-	InvalidProgram,
-	BudgetExceeded,
 }
 
 #[derive(Default)]
@@ -7689,196 +7700,128 @@ async fn plan_query_execution_for_ranges_with_program(
 		node_id: 0,
 	};
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
-	if program.requires_scalar_context() {
-		for range in ranges {
-			let scanned = slab.scan_as_of_with_identity_and_locality(
-				meta.tenant_id,
-				range.start,
-				range.end,
-				meta.as_of_hlc,
-			);
-			for (key_identity, locality, location) in scanned {
-				if started_at.elapsed() > budget.max_wall_time {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				if budget.stats_pruning_enabled
-					&& !table_stats_may_match_location(
-						slab,
-						table_descriptor,
-						program,
-						&mut stats_prune_cache,
-						location,
-					)
-					.await?
-				{
-					continue;
-				}
-				scanned_locations = scanned_locations.saturating_add(1);
-				if scanned_locations > budget.max_locations {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				let query_record = QueryRecordLocation {
-					identity: key_identity,
-					locality,
-					location,
-				};
-				let result = match materialize_query_batch_with_program(
-					slab,
-					query_record,
-					program,
-					budget.max_rows,
-				)
-				.await
-				{
-					Ok(result) => result,
-					Err(QueryBatchMaterializationError::Io(err)) => return Err(err),
-					Err(QueryBatchMaterializationError::InvalidProgram) => {
-						return Ok(query_plan_error(
-							meta,
-							ReadStatus::QUERY_INVALID_PROGRAM,
-							local_node,
-						));
-					}
-					Err(QueryBatchMaterializationError::BudgetExceeded) => {
-						return Ok(query_plan_error(
-							meta,
-							ReadStatus::QUERY_BUDGET_EXCEEDED,
-							local_node,
-						));
-					}
-				};
-				if result.num_rows() == 0 {
-					continue;
-				}
-				if query_record.location.hlc > max_hlc {
-					max_hlc = query_record.location.hlc;
-				}
-				rows = rows.saturating_add(result.num_rows() as u64);
-				if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				batches.push(result);
-			}
-		}
-	} else {
-		let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
-		let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
-		for range in ranges {
-			let scanned = slab.scan_as_of_with_identity_and_locality(
-				meta.tenant_id,
-				range.start,
-				range.end,
-				meta.as_of_hlc,
-			);
-			for (key_identity, locality, location) in scanned {
-				if started_at.elapsed() > budget.max_wall_time {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				if budget.stats_pruning_enabled
-					&& !table_stats_may_match_location(
-						slab,
-						table_descriptor,
-						program,
-						&mut stats_prune_cache,
-						location,
-					)
-					.await?
-				{
-					continue;
-				}
-				scanned_locations = scanned_locations.saturating_add(1);
-				if scanned_locations > budget.max_locations {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				let bytes = slab.read(location).await?;
-				let batch = decode_batch(&bytes)?;
-				if batch.num_rows() > max_rows_per_location {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_BUDGET_EXCEEDED,
-						local_node,
-					));
-				}
-				if let Some(descriptor) = table_descriptor {
-					if !table_record_matches_descriptor(
-						meta,
-						descriptor,
-						key_identity,
-						locality,
-						&batch,
-					)? {
-						continue;
-					}
-				}
-				let input_rows = batch.num_rows() as u64;
-				if let Some(group) = rebatch_groups
-					.iter_mut()
-					.find(|group| group.schema.as_ref() == batch.schema().as_ref())
-				{
-					if location.hlc > group.max_hlc {
-						group.max_hlc = location.hlc;
-					}
-					group.input_rows = group.input_rows.saturating_add(input_rows);
-					group.batches.push(batch);
-				} else {
-					rebatch_groups.push(RebatchGroup {
-						schema: batch.schema(),
-						batches: vec![batch],
-						max_hlc: location.hlc,
-						input_rows,
-					});
-				}
-			}
-		}
-		for group in rebatch_groups {
-			let concatenated = concat_batches(&group.schema, &group.batches)
-				.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
-			let result = match pbc::execute_program(program, &concatenated) {
-				Ok(result) => result,
-				Err(_) => {
-					return Ok(query_plan_error(
-						meta,
-						ReadStatus::QUERY_INVALID_PROGRAM,
-						local_node,
-					));
-				}
-			};
-			if result.num_rows() == 0 {
-				continue;
-			}
-			if group.max_hlc > max_hlc {
-				max_hlc = group.max_hlc;
-			}
-			rows = rows.saturating_add(result.num_rows() as u64);
-			if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+	let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
+	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
+	for range in ranges {
+		let scanned = slab.scan_as_of_with_identity_and_locality(
+			meta.tenant_id,
+			range.start,
+			range.end,
+			meta.as_of_hlc,
+		);
+		for (key_identity, locality, location) in scanned {
+			if started_at.elapsed() > budget.max_wall_time {
 				return Ok(query_plan_error(
 					meta,
 					ReadStatus::QUERY_BUDGET_EXCEEDED,
 					local_node,
 				));
 			}
-			batches.push(result);
+			if budget.stats_pruning_enabled
+				&& !table_stats_may_match_location(
+					slab,
+					table_descriptor,
+					program,
+					&mut stats_prune_cache,
+					location,
+				)
+				.await?
+			{
+				continue;
+			}
+			scanned_locations = scanned_locations.saturating_add(1);
+			if scanned_locations > budget.max_locations {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			let bytes = slab.read(location).await?;
+			let decode_started = Instant::now();
+			let storage_batch = decode_batch(&bytes)?;
+			let storage_row_count = storage_batch.num_rows();
+			let was_multirow = has_storage_synthetic_columns(&storage_batch);
+			let batch =
+				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+			if was_multirow {
+				metrics().observe_storage_multirow_decode(
+					batch.num_rows() as u64,
+					bytes.len() as u64,
+					decode_started.elapsed(),
+				);
+				if storage_row_count <= 1 {
+					metrics()
+						.storage_multirow_uncompacted_row_records_total
+						.inc();
+				}
+			}
+			if batch.num_rows() > max_rows_per_location {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			if let Some(descriptor) = table_descriptor {
+				if !table_record_matches_descriptor(
+					meta,
+					descriptor,
+					key_identity,
+					locality,
+					&batch,
+				)? {
+					continue;
+				}
+			}
+			let input_rows = batch.num_rows() as u64;
+			if let Some(group) = rebatch_groups
+				.iter_mut()
+				.find(|group| group.schema.as_ref() == batch.schema().as_ref())
+			{
+				if location.hlc > group.max_hlc {
+					group.max_hlc = location.hlc;
+				}
+				group.input_rows = group.input_rows.saturating_add(input_rows);
+				group.batches.push(batch);
+			} else {
+				rebatch_groups.push(RebatchGroup {
+					schema: batch.schema(),
+					batches: vec![batch],
+					max_hlc: location.hlc,
+					input_rows,
+				});
+			}
 		}
+	}
+	for group in rebatch_groups {
+		let concatenated = concat_batches(&group.schema, &group.batches)
+			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
+		let result = match pbc::execute_program(program, &concatenated) {
+			Ok(result) => result,
+			Err(_) => {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					local_node,
+				));
+			}
+		};
+		if result.num_rows() == 0 {
+			continue;
+		}
+		if group.max_hlc > max_hlc {
+			max_hlc = group.max_hlc;
+		}
+		rows = rows.saturating_add(result.num_rows() as u64);
+		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		batches.push(result);
 	}
 
 	// 4. Empty result is a legitimate answer. Clients map
@@ -7927,32 +7870,6 @@ fn encode_query_stream_batches_with_deadline(
 		encoded.push(arrow);
 	}
 	Ok(Some(encoded))
-}
-
-async fn materialize_query_batch_with_program(
-	slab: &SlabManager,
-	record: QueryRecordLocation,
-	program: &pbc::Program,
-	max_rows_per_location: u64,
-) -> Result<RecordBatch, QueryBatchMaterializationError> {
-	let bytes: Vec<u8> = slab
-		.read(record.location)
-		.await
-		.map_err(QueryBatchMaterializationError::Io)?;
-	let batch = decode_batch(&bytes).map_err(QueryBatchMaterializationError::Io)?;
-	let max_rows_per_location = usize::try_from(max_rows_per_location).unwrap_or(usize::MAX);
-	if batch.num_rows() > max_rows_per_location {
-		return Err(QueryBatchMaterializationError::BudgetExceeded);
-	}
-	pbc::execute_program_with_context(
-		program,
-		&batch,
-		Some(pbc::ExecutionContext {
-			identity: record.identity,
-			locality: record.locality,
-		}),
-	)
-	.map_err(|_| QueryBatchMaterializationError::InvalidProgram)
 }
 
 fn table_record_matches_descriptor(
@@ -8827,6 +8744,7 @@ fn table_replica_child_schema() -> Schema {
 		Field::new("child_ordinal", DataType::UInt64, false),
 		Field::new("key_identity", DataType::FixedSizeBinary(32), false),
 		Field::new("routing_locality", DataType::UInt64, false),
+		Field::new("record_row_index", DataType::UInt32, false),
 		Field::new("payload_hash", DataType::FixedSizeBinary(32), false),
 		Field::new("charged_bytes", DataType::UInt64, false),
 		Field::new("frame", DataType::LargeBinary, false),
@@ -8851,6 +8769,7 @@ fn table_batch_payload_digest(children: &[BifurcatedTableChildWrite]) -> [u8; 32
 	for child in children {
 		hasher.update(&child.child_ordinal.to_le_bytes());
 		hasher.update(child.key_identity.as_bytes());
+		hasher.update(&child.record_row_index.get().to_le_bytes());
 		hasher.update(&child.payload_hash);
 		hasher.update(&child.charged_bytes.to_le_bytes());
 	}
@@ -8864,6 +8783,7 @@ fn table_replica_payload_digest(children: &[TableReplicaChildPayload]) -> [u8; 3
 	for child in children {
 		hasher.update(&child.child_ordinal.to_le_bytes());
 		hasher.update(child.key_identity.as_bytes());
+		hasher.update(&child.record_row_index.get().to_le_bytes());
 		hasher.update(&child.payload_hash);
 		hasher.update(&child.charged_bytes.to_le_bytes());
 	}
@@ -8899,12 +8819,45 @@ fn table_replica_meta(
 	}
 }
 
+fn restamp_table_children_commit_hlc(
+	children: &mut [BifurcatedTableChildWrite],
+	commit_hlc: HybridTimestamp,
+) -> std::io::Result<()> {
+	for child in children {
+		let decoded = decode_batch(child.frame_bytes.as_slice())?;
+		if !has_storage_synthetic_columns(&decoded) {
+			continue;
+		}
+		let rewritten = replace_storage_row_hlc_column(&decoded, commit_hlc)?;
+		let frame = encode_batch(&rewritten)?;
+		child.frame_bytes = Arc::new(frame);
+		child.payload_hash = payload_digest(child.frame_bytes.as_slice());
+		child.charged_bytes = child.frame_bytes.len() as u64;
+	}
+	Ok(())
+}
+
+fn restamp_table_write_commit_hlc(
+	bifurcated: &mut BifurcatedTableWrite,
+	commit_hlc: HybridTimestamp,
+) -> std::io::Result<()> {
+	restamp_table_children_commit_hlc(&mut bifurcated.children, commit_hlc)?;
+	bifurcated.charged_bytes = bifurcated
+		.children
+		.iter()
+		.map(|child| child.charged_bytes)
+		.fold(0_u64, u64::saturating_add);
+	bifurcated.payload_hash = table_batch_payload_digest(&bifurcated.children);
+	Ok(())
+}
+
 fn encode_table_replica_children(
 	children: &[BifurcatedTableChildWrite],
 ) -> std::io::Result<Vec<u8>> {
 	let mut child_ordinal = UInt64Builder::with_capacity(children.len());
 	let mut key_identity = FixedSizeBinaryBuilder::with_capacity(children.len(), 32);
 	let mut routing_locality = UInt64Builder::with_capacity(children.len());
+	let mut record_row_index = UInt32Builder::with_capacity(children.len());
 	let mut payload_hash = FixedSizeBinaryBuilder::with_capacity(children.len(), 32);
 	let mut charged_bytes = UInt64Builder::with_capacity(children.len());
 	let mut frame = LargeBinaryBuilder::new();
@@ -8915,6 +8868,7 @@ fn encode_table_replica_children(
 			.append_value(child.key_identity.as_bytes())
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("identity append: {e}")))?;
 		routing_locality.append_value(child.locality.get());
+		record_row_index.append_value(child.record_row_index.get());
 		payload_hash
 			.append_value(child.payload_hash)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("payload hash append: {e}")))?;
@@ -8929,6 +8883,7 @@ fn encode_table_replica_children(
 			Arc::new(child_ordinal.finish()),
 			Arc::new(key_identity.finish()),
 			Arc::new(routing_locality.finish()),
+			Arc::new(record_row_index.finish()),
 			Arc::new(payload_hash.finish()),
 			Arc::new(charged_bytes.finish()),
 			Arc::new(frame.finish()),
@@ -8975,6 +8930,10 @@ fn decode_table_replica_children(bytes: &[u8]) -> std::io::Result<Vec<TableRepli
 		.column_by_name("routing_locality")
 		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing routing_locality column"))?;
+	let record_row_index = batch
+		.column_by_name("record_row_index")
+		.and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing record_row_index column"))?;
 	let payload_hash = batch
 		.column_by_name("payload_hash")
 		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -8994,6 +8953,7 @@ fn decode_table_replica_children(bytes: &[u8]) -> std::io::Result<Vec<TableRepli
 			child_ordinal: child_ordinal.value(row),
 			key_identity: Identity::new(fixed_32_value(key_identity, row, "key_identity")?),
 			locality: Locality::new(routing_locality.value(row)),
+			record_row_index: RecordRowIndex::new(record_row_index.value(row)),
 			payload_hash: fixed_32_value(payload_hash, row, "payload_hash")?,
 			charged_bytes: charged_bytes.value(row),
 			frame_bytes: Arc::new(frame.value(row).to_vec()),
@@ -9063,14 +9023,26 @@ async fn append_bifurcated_table_children_durable(
 	children: &[BifurcatedTableChildWrite],
 ) -> std::io::Result<()> {
 	for child in children {
-		slab.append_durable_with_locality(
-			tenant_id,
-			child.key_identity,
-			child.locality,
-			commit_hlc,
-			child.frame_bytes.as_slice(),
-		)
-		.await?;
+		let decoded = decode_batch(child.frame_bytes.as_slice())?;
+		if has_storage_synthetic_columns(&decoded) {
+			let entries = storage_index_entries_from_batch(&decoded)?;
+			slab.append_durable_multirow_with_locality(
+				tenant_id,
+				child.frame_bytes.as_slice(),
+				&entries,
+			)
+			.await?;
+			metrics().observe_storage_multirow_record_written(entries.len() as u64);
+		} else {
+			slab.append_durable_with_locality(
+				tenant_id,
+				child.key_identity,
+				child.locality,
+				commit_hlc,
+				child.frame_bytes.as_slice(),
+			)
+			.await?;
+		}
 	}
 	Ok(())
 }
@@ -9082,14 +9054,26 @@ async fn append_table_children_durable(
 	children: &[TableReplicaChildPayload],
 ) -> std::io::Result<()> {
 	for child in children {
-		slab.append_durable_with_locality(
-			tenant_id,
-			child.key_identity,
-			child.locality,
-			commit_hlc,
-			child.frame_bytes.as_slice(),
-		)
-		.await?;
+		let decoded = decode_batch(child.frame_bytes.as_slice())?;
+		if has_storage_synthetic_columns(&decoded) {
+			let entries = storage_index_entries_from_batch(&decoded)?;
+			slab.append_durable_multirow_with_locality(
+				tenant_id,
+				child.frame_bytes.as_slice(),
+				&entries,
+			)
+			.await?;
+			metrics().observe_storage_multirow_record_written(entries.len() as u64);
+		} else {
+			slab.append_durable_with_locality(
+				tenant_id,
+				child.key_identity,
+				child.locality,
+				commit_hlc,
+				child.frame_bytes.as_slice(),
+			)
+			.await?;
+		}
 	}
 	Ok(())
 }
@@ -9237,36 +9221,67 @@ fn bifurcate_table_write(
 	let admission = admission?;
 	let mut children = Vec::with_capacity(batch.num_rows());
 	let mut charged_bytes = 0_u64;
-	for row in 0..batch.num_rows() {
-		let row_batch = batch.slice(row, 1);
-		let frame_bytes =
-			Arc::new(
-				encode_batch(&row_batch).map_err(|err| TableWriteValidationError {
-					code: PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
-					message: format!("failed to encode single-row table payload: {err}"),
-				})?,
-			);
-		let child_charged_bytes = frame_bytes.len() as u64;
-		charged_bytes = charged_bytes.saturating_add(child_charged_bytes);
-		children.push(BifurcatedTableChildWrite {
-			child_ordinal: meta.child_ordinal_base.saturating_add(row as u64),
-			key_identity: admission.key_identities[row],
-			locality: admission.localities[row],
-			payload_hash: payload_digest(frame_bytes.as_slice()),
-			charged_bytes: child_charged_bytes,
-			frame_bytes,
-		});
+	match &descriptor.record_layout_policy {
+		RecordLayoutPolicy::SingleRow => {
+			for row in 0..batch.num_rows() {
+				let row_batch = batch.slice(row, 1);
+				let frame_bytes = Arc::new(encode_batch(&row_batch).map_err(|err| {
+					TableWriteValidationError {
+						code: PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
+						message: format!("failed to encode single-row table payload: {err}"),
+					}
+				})?);
+				let child_charged_bytes = frame_bytes.len() as u64;
+				charged_bytes = charged_bytes.saturating_add(child_charged_bytes);
+				children.push(BifurcatedTableChildWrite {
+					child_ordinal: meta.child_ordinal_base.saturating_add(row as u64),
+					key_identity: admission.key_identities[row],
+					locality: admission.localities[row],
+					record_row_index: RecordRowIndex::ZERO,
+					payload_hash: payload_digest(frame_bytes.as_slice()),
+					charged_bytes: child_charged_bytes,
+					frame_bytes,
+				});
+			}
+		}
+		RecordLayoutPolicy::MultiRow(_) => {
+			let packed = pack_admitted_record_batch_by_bucket(
+				meta,
+				descriptor,
+				batch,
+				&admission,
+				meta.client_hlc,
+			)?;
+			children.reserve(packed.len());
+			for record in packed {
+				let frame_bytes = Arc::new(record.frame_bytes);
+				let child_charged_bytes = record.charged_bytes;
+				charged_bytes = charged_bytes.saturating_add(child_charged_bytes);
+				children.push(BifurcatedTableChildWrite {
+					child_ordinal: meta
+						.child_ordinal_base
+						.saturating_add(children.len() as u64),
+					key_identity: record.key_identity,
+					locality: record.locality,
+					record_row_index: RecordRowIndex::ZERO,
+					payload_hash: payload_digest(frame_bytes.as_slice()),
+					charged_bytes: child_charged_bytes,
+					frame_bytes,
+				});
+			}
+		}
 	}
 	let payload_hash = table_batch_payload_digest(&children);
+	let record_count = u32::try_from(children.len()).map_err(|_| TableWriteValidationError {
+		code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+		message: "table write record count exceeds u32".to_string(),
+	})?;
 	Ok(BifurcatedTableWrite {
 		parent_key_identity: table_write_parent_identity(meta),
 		payload_hash,
 		children,
 		charged_bytes,
-		record_count: u32::try_from(batch.num_rows()).map_err(|_| TableWriteValidationError {
-			code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
-			message: "table write row count exceeds u32".to_string(),
-		})?,
+		record_count,
 	})
 }
 
@@ -9297,40 +9312,6 @@ fn extract_first_binary<'a>(
 		));
 	}
 	Ok(arr.value(0))
-}
-
-/// Encode a RecordBatch as an Arrow IPC stream.
-fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
-	let mut buf = Vec::new();
-	{
-		let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream init: {e}")))?;
-		writer
-			.write(batch)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream write: {e}")))?;
-		writer
-			.finish()
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream finish: {e}")))?;
-	}
-	Ok(buf)
-}
-
-/// Inverse of [`encode_batch`]. Returns the first batch in the
-/// stream — Data Ring payloads are always single-batch today.
-fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
-	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {e}")))?;
-	match reader.next() {
-		Some(Ok(batch)) => Ok(batch),
-		Some(Err(e)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {e}"),
-		)),
-		None => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained no record batch",
-		)),
-	}
 }
 
 /// Wrap raw value bytes in a one-row RecordBatch shaped to
@@ -9385,16 +9366,16 @@ mod tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::pbc::{
-		OP_AND, OP_EQ, OP_EQ_IDENTITY, OP_GTE, OP_HASH_RANGE_IDENTITY, OP_LOAD_IDENTITY, OP_OR,
-		OP_PROJECT, OP_PUSH_COL, OP_PUSH_IDENTITY, OP_PUSH_INT, OP_PUSH_LOCALITY, OP_PUSH_STR,
-		OP_RANGE_LOCALITY, OP_ROUTE_BY_LOCALITY,
+		OP_AND, OP_EQ, OP_GTE, OP_OR, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, OP_PUSH_STR,
 	};
 	use crate::schema::{
 		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
 		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, LocalityPolicyV1,
-		LocalityRange, LocationCount, PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowCount,
-		SchemaEvolutionPolicyV1, SlabRecordHeader, TableObjectId, TableSchemaCatalogV1,
+		LocalityRange, LocationCount, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		ProjectionFunctionV1, RecordLayoutPolicy, RowCount, STORAGE_ROW_HLC_COLUMN,
+		STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1,
+		SlabRecordHeader, TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
 		column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
 		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
 		write_payload_schema,
@@ -9422,6 +9403,21 @@ mod tests {
 		])
 	}
 
+	fn assert_user_visible_schema_has_no_storage_columns(batch: &RecordBatch) {
+		for field in batch.schema().fields() {
+			assert!(
+				!matches!(
+					field.name().as_str(),
+					STORAGE_ROW_HLC_COLUMN
+						| STORAGE_ROW_KEY_ID_COLUMN
+						| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
+				),
+				"user-visible batch leaked storage synthetic column {}",
+				field.name()
+			);
+		}
+	}
+
 	fn typed_table_descriptor() -> TableSchemaDescriptorV1 {
 		TableSchemaDescriptorV1::new(
 			TableObjectId::new([0x37; 16]),
@@ -9434,6 +9430,20 @@ mod tests {
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
+	}
+
+	fn multirow_typed_table_descriptor() -> TableSchemaDescriptorV1 {
+		let mut descriptor = typed_table_descriptor();
+		descriptor.locality_policy =
+			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+				spread_factor: 1,
+				prefix_bits: 63,
+			});
+		descriptor.record_layout_policy =
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap());
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.validate().unwrap();
+		descriptor
 	}
 
 	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptorV1 {
@@ -9491,6 +9501,22 @@ mod tests {
 			],
 		)
 		.unwrap()
+	}
+
+	fn same_multirow_locality_ids(descriptor: &TableSchemaDescriptorV1, count: usize) -> Vec<i64> {
+		let mut buckets: HashMap<Locality, Vec<i64>> = HashMap::new();
+		for id in 0_i64..10_000 {
+			let batch = typed_table_batch(vec![id]);
+			let meta = typed_table_meta(descriptor, 1);
+			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let bucket = admission.localities[0];
+			let ids = buckets.entry(bucket).or_default();
+			ids.push(id);
+			if ids.len() == count {
+				return ids.clone();
+			}
+		}
+		panic!("failed to find {count} ids with shared test locality");
 	}
 
 	fn typed_table_meta(
@@ -9867,6 +9893,7 @@ mod tests {
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -9902,6 +9929,7 @@ mod tests {
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -9933,6 +9961,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -10219,81 +10248,19 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn typed_identity_pbc_filters_by_record_identity() {
+	async fn storage_metadata_scalar_pbc_opcodes_return_invalid_program() {
 		let mgr = make_manager().await;
 		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
-		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
-
-		let mut bytecode = Vec::new();
-		bytecode.push(OP_LOAD_IDENTITY);
-		bytecode.push(OP_PUSH_IDENTITY);
-		bytecode.extend_from_slice(id(2).as_bytes());
-		bytecode.push(OP_EQ_IDENTITY);
 
 		let sm = WendelonStateMachine::new();
 		let mut meta = base_meta();
-		meta.bytecode_len = bytecode.len() as u32;
-		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
+		meta.bytecode_len = 1;
+		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &[0x40])
 			.await
 			.unwrap();
-		assert_eq!(resp.status, ReadStatus::OK);
-		assert_eq!(resp.rows, 1);
-		let batch = decode_batch(&arrow.unwrap()).unwrap();
-		assert_eq!(extract_first_binary(&batch, "key").unwrap(), b"b");
-	}
-
-	#[tokio::test]
-	async fn typed_locality_pbc_filters_by_routing_projection() {
-		let mgr = make_manager().await;
-		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
-		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
-		seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"vc").await;
-
-		let mut bytecode = Vec::new();
-		bytecode.push(OP_ROUTE_BY_LOCALITY);
-		bytecode.push(OP_PUSH_LOCALITY);
-		bytecode.extend_from_slice(&2_u64.to_le_bytes());
-		bytecode.push(OP_PUSH_LOCALITY);
-		bytecode.extend_from_slice(&2_u64.to_le_bytes());
-		bytecode.push(OP_RANGE_LOCALITY);
-
-		let sm = WendelonStateMachine::new();
-		let mut meta = base_meta();
-		meta.bytecode_len = bytecode.len() as u32;
-		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
-			.await
-			.unwrap();
-		assert_eq!(resp.status, ReadStatus::OK);
-		assert_eq!(resp.rows, 1);
-		let batch = decode_batch(&arrow.unwrap()).unwrap();
-		assert_eq!(extract_first_binary(&batch, "key").unwrap(), b"b");
-	}
-
-	#[tokio::test]
-	async fn typed_identity_range_pbc_uses_byte_exact_bounds() {
-		let mgr = make_manager().await;
-		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
-		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
-		seed_record(&mgr, 3, hlc(3, 0, 1), b"c", b"vc").await;
-
-		let mut bytecode = Vec::new();
-		bytecode.push(OP_LOAD_IDENTITY);
-		bytecode.push(OP_PUSH_IDENTITY);
-		bytecode.extend_from_slice(id(2).as_bytes());
-		bytecode.push(OP_PUSH_IDENTITY);
-		bytecode.extend_from_slice(id(3).as_bytes());
-		bytecode.push(OP_HASH_RANGE_IDENTITY);
-
-		let sm = WendelonStateMachine::new();
-		let mut meta = base_meta();
-		meta.bytecode_len = bytecode.len() as u32;
-		let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &meta, &bytecode)
-			.await
-			.unwrap();
-		assert_eq!(resp.status, ReadStatus::OK);
-		assert_eq!(resp.rows, 2);
-		let batch = decode_batch(&arrow.unwrap()).unwrap();
-		assert_eq!(batch.num_rows(), 2);
+		assert_eq!(resp.status, ReadStatus::QUERY_INVALID_PROGRAM);
+		assert_eq!(resp.rows, 0);
+		assert!(arrow.is_none());
 	}
 
 	#[tokio::test]
@@ -10344,15 +10311,26 @@ mod tests {
 
 	#[tokio::test]
 	async fn query_budget_counts_scanned_locations_even_when_filter_rejects_rows() {
+		use arrow::array::Int64Array;
+		use arrow::datatypes::{DataType, Field, Schema};
+
 		let mgr = make_manager().await;
-		seed_record(&mgr, 1, hlc(1, 0, 1), b"a", b"va").await;
-		seed_record(&mgr, 2, hlc(2, 0, 1), b"b", b"vb").await;
+		let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
+		for (locality, age) in [(1_u64, 17_i64), (2, 22)] {
+			let ages = Int64Array::from(vec![age]);
+			let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
+			let bytes = encode_batch(&batch).unwrap();
+			mgr.append(tenant(), id(locality), hlc(age as u64, 0, 1), &bytes)
+				.await
+				.unwrap();
+		}
 
 		let mut bytecode = Vec::new();
-		bytecode.push(OP_LOAD_IDENTITY);
-		bytecode.push(OP_PUSH_IDENTITY);
-		bytecode.extend_from_slice(id(99).as_bytes());
-		bytecode.push(OP_EQ_IDENTITY);
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&99_i64.to_le_bytes());
+		bytecode.push(OP_GTE);
 
 		let sm = WendelonStateMachine::new();
 		let mut meta = base_meta();
@@ -10780,6 +10758,39 @@ mod tests {
 	}
 
 	#[test]
+	fn table_bifurcation_packs_multirow_records_with_storage_metadata() {
+		let descriptor = multirow_typed_table_descriptor();
+		let source_ids = same_multirow_locality_ids(&descriptor, 3);
+		let batch = typed_table_batch(source_ids.clone());
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+
+		assert_eq!(bifurcated.children.len(), 1);
+		assert_eq!(bifurcated.record_count, 1);
+		let storage = decode_batch(bifurcated.children[0].frame_bytes.as_slice()).unwrap();
+		assert_eq!(storage.num_rows(), 3);
+		assert!(has_storage_synthetic_columns(&storage));
+		let materialized =
+			materialize_record_location_batch(&storage, RecordRowIndex::new(1)).unwrap();
+		assert_eq!(materialized.schema().as_ref(), &typed_table_schema());
+		assert_user_visible_schema_has_no_storage_columns(&materialized);
+		let ids = materialized
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let storage_ids = storage
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(ids.value(0), storage_ids.value(1));
+		assert!(source_ids.contains(&ids.value(0)));
+	}
+
+	#[test]
 	fn table_query_scan_ranges_accepts_column_projection_prefixes() {
 		let tenant_id = tenant();
 		let projection = ColumnLocalityDescriptorV1 {
@@ -10925,6 +10936,7 @@ mod tests {
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		})
 		.await
 		.unwrap();
@@ -11611,7 +11623,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn table_query_dispatch_rebatches_split_rows_before_pbc() {
+	async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 		let dir = bootstrap_tempdir("table-query-rebatch");
 		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 			39,
@@ -11635,7 +11647,7 @@ mod tests {
 			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
 			.await;
 
-		let descriptor = typed_table_descriptor();
+		let descriptor = multirow_typed_table_descriptor();
 		node.raft
 			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
 				&descriptor,
@@ -11643,7 +11655,8 @@ mod tests {
 			.await
 			.unwrap();
 
-		let batch = typed_table_batch(vec![7, 8]);
+		let source_ids = same_multirow_locality_ids(&descriptor, 2);
+		let batch = typed_table_batch(source_ids.clone());
 		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
 		write_meta.parent_write_id.sequence_no = 57;
 		let (write_resp, _) = node
@@ -11657,7 +11670,7 @@ mod tests {
 		bytecode.push(OP_PUSH_COL);
 		bytecode.extend_from_slice(&0_u32.to_le_bytes());
 		bytecode.push(OP_PUSH_INT);
-		bytecode.extend_from_slice(&8_i64.to_le_bytes());
+		bytecode.extend_from_slice(&source_ids[1].to_le_bytes());
 		bytecode.push(OP_GTE);
 		let query_meta = TableQueryRequestMeta {
 			min_hlc: hlc(0, 0, 0),
@@ -11712,13 +11725,15 @@ mod tests {
 		let result = decode_batch(resp.arrow_payload.as_ref().expect("query result batch"))
 			.expect("query result decodes");
 		assert_eq!(result.num_rows(), 1);
+		assert_eq!(result.schema().as_ref(), &typed_table_schema());
+		assert_user_visible_schema_has_no_storage_columns(&result);
 		let ids = result
 			.column_by_name("id")
 			.unwrap()
 			.as_any()
 			.downcast_ref::<Int64Array>()
 			.unwrap();
-		assert_eq!(ids.value(0), 8);
+		assert_eq!(ids.value(0), source_ids[1]);
 
 		node.handles.abort();
 	}
@@ -12470,6 +12485,157 @@ mod tests {
 			metric_before,
 			"fall-through must not count as a CSB direct answer"
 		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_direct_answer_falls_through_when_tiered_slab_has_superseded_row() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_identity_typed_table_batch_with_stats(l2.clone(), vec![1, 2], "agg-csb-old.wnd")
+				.await;
+
+		let replacement = typed_table_batch(vec![1]);
+		let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		write_meta.tenant_id = tenant();
+		write_meta.table_object_id = descriptor.table_object_id;
+		write_meta.schema_generation = descriptor.schema_generation;
+		write_meta.row_count = encode_table_write_row_count(replacement.num_rows()).unwrap();
+		let admission =
+			validate_table_write_request_batch(&write_meta, &replacement, &descriptor).unwrap();
+		let frame = encode_batch(&replacement).unwrap();
+		mgr.append_durable_with_locality(
+			tenant(),
+			admission.key_identities[0],
+			admission.localities[0],
+			hlc(50, 0, 1),
+			&frame,
+		)
+		.await
+		.unwrap();
+		let replacement_slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(replacement_slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(replacement_slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2.put("agg-csb-new.wnd", &encrypted.bytes).await.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id: replacement_slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			51,
+			bootstrap_tempdir("aggregate-csb-supersession-node"),
+			"loopback://51".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://51".into(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap();
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(492),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc: hlc(99, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression::count_star()],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+
+		let prepared = server
+			.prepare_aggregate_execution_context_with_migration(&request)
+			.await
+			.unwrap()
+			.unwrap();
+		let metric_before = metrics().agg_csb_short_circuit_total.get();
+		assert!(
+			server
+				.try_aggregate_csb_direct_answer(&request, &prepared)
+				.await
+				.unwrap()
+				.is_none(),
+			"superseded rows in a tiered slab must fence CSB direct answer"
+		);
+		assert_eq!(metrics().agg_csb_short_circuit_total.get(), metric_before);
 
 		node.handles.abort();
 	}
@@ -13974,6 +14140,7 @@ mod tests {
 					offset: 0,
 					length: 0,
 					hlc: hlc(10, 2, 3),
+					record_row_index: crate::schema::RecordRowIndex::ZERO,
 				},
 				b"frame-one".to_vec(),
 			),
@@ -13986,6 +14153,7 @@ mod tests {
 					offset: 0,
 					length: 0,
 					hlc: hlc(20, 5, 3),
+					record_row_index: crate::schema::RecordRowIndex::ZERO,
 				},
 				b"frame-two".to_vec(),
 			),

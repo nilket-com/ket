@@ -137,6 +137,7 @@ async fn leader_issues_signed_lease_that_data_ring_accepts() {
 	.await
 	.unwrap();
 	support::wait_for_local_leader(&node).await;
+	node.handles.lease_manager.abort();
 
 	let granted = node
 		.data_server
@@ -182,6 +183,7 @@ async fn tampered_signed_lease_is_rejected_at_write_gate() {
 	.await
 	.unwrap();
 	support::wait_for_local_leader(&node).await;
+	node.handles.lease_manager.abort();
 	node.data_server.lease_cache().write().unwrap().clear();
 
 	let signer = LeaseAuthority::from_secret_bytes(node.local_node, secret, &{
@@ -220,6 +222,7 @@ async fn wrong_key_signed_lease_is_rejected_at_write_gate() {
 	.await
 	.unwrap();
 	support::wait_for_local_leader(&node).await;
+	node.handles.lease_manager.abort();
 	node.data_server.lease_cache().write().unwrap().clear();
 
 	let wrong_signer = LeaseAuthority::from_secret_bytes(node.local_node, wrong_secret, &{

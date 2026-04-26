@@ -60,6 +60,38 @@ impl TombstoneMetadata {
 	}
 }
 
+/// ADR 042 supersession-visibility metadata carried by tiered slab
+/// pointers.
+///
+/// `Untracked` is the conservative decode/default state for pointers
+/// written before supersession metadata existed. It is intentionally
+/// distinct from `None`, which means "this pointer is tracked and no
+/// newer row version has been recorded for rows in the slab."
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SupersessionMetadata {
+	#[default]
+	Untracked,
+	None,
+	Earliest(HybridTimestamp),
+}
+
+impl SupersessionMetadata {
+	pub const fn earliest(self) -> Option<HybridTimestamp> {
+		match self {
+			Self::Earliest(timestamp) => Some(timestamp),
+			Self::Untracked | Self::None => None,
+		}
+	}
+
+	pub const fn is_tracked(self) -> bool {
+		matches!(self, Self::None | Self::Earliest(_))
+	}
+
+	pub const fn is_untracked(self) -> bool {
+		matches!(self, Self::Untracked)
+	}
+}
+
 // ============================================================
 //  NODE IDENTITY — 8 bytes, fixed
 //

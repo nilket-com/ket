@@ -32,13 +32,13 @@ use crate::network::transport::{
 	TransportTierSet,
 };
 use crate::network::wire;
-#[cfg(test)]
-use crate::schema::TombstoneMetadata;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, ReleaseLeaseRequestMeta,
 	ReleaseLeaseResponseMeta, TenantId, TenantKekId, TransferToken, epoch_entry_var_schema,
 };
+#[cfg(test)]
+use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -3112,6 +3112,7 @@ mod tests {
 				stats_block_len: None,
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			},
 		);
 		snapshot.tiered_slabs.insert(
@@ -3127,6 +3128,7 @@ mod tests {
 				stats_block_len: None,
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			},
 		);
 

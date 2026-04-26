@@ -53,6 +53,8 @@ const AGG_EXEC_BUCKETS_MICROS: &[u64] = &[
 const AGG_PARTIAL_BYTES_BUCKETS: &[u64] = &[
 	8, 32, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152,
 ];
+const MULTIROW_ROWS_PER_RECORD_BUCKETS: &[u64] =
+	&[1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 65536];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -708,6 +710,7 @@ pub struct MetricsRegistry {
 	pub agg_partials_merged_total: Counter,
 	pub agg_csb_short_circuit_total: Counter,
 	pub agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter,
+	pub agg_csb_short_circuit_skipped_supersession_metadata_untracked_total: Counter,
 	pub agg_int_overflow_total: Counter,
 	pub agg_skipped_no_capability_total: Counter,
 	agg_partial_bytes: Histogram,
@@ -739,6 +742,14 @@ pub struct MetricsRegistry {
 	pub storage_rehydrated_reclaims_total: Counter,
 	pub storage_migration_reclaimed_slabs_total: Counter,
 	pub storage_migration_reclaimed_bytes_total: Counter,
+	pub storage_multirow_records_written_total: Counter,
+	pub storage_multirow_rows_written_total: Counter,
+	pub storage_multirow_rows_materialized_total: Counter,
+	pub storage_multirow_point_read_amplification_bytes: Counter,
+	pub storage_multirow_recompact_total: Counter,
+	pub storage_multirow_uncompacted_row_records_total: Counter,
+	storage_multirow_rows_per_record: Histogram,
+	storage_multirow_decode_micros: Histogram,
 
 	pub tenant_kek_cache_hits_total: Counter,
 	pub tenant_kek_cache_misses_total: Counter,
@@ -838,6 +849,7 @@ impl Default for MetricsRegistry {
 			agg_partials_merged_total: Counter::default(),
 			agg_csb_short_circuit_total: Counter::default(),
 			agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter::default(),
+			agg_csb_short_circuit_skipped_supersession_metadata_untracked_total: Counter::default(),
 			agg_int_overflow_total: Counter::default(),
 			agg_skipped_no_capability_total: Counter::default(),
 			agg_partial_bytes: Histogram::new(AGG_PARTIAL_BYTES_BUCKETS),
@@ -875,6 +887,14 @@ impl Default for MetricsRegistry {
 			storage_rehydrated_reclaims_total: Counter::default(),
 			storage_migration_reclaimed_slabs_total: Counter::default(),
 			storage_migration_reclaimed_bytes_total: Counter::default(),
+			storage_multirow_records_written_total: Counter::default(),
+			storage_multirow_rows_written_total: Counter::default(),
+			storage_multirow_rows_materialized_total: Counter::default(),
+			storage_multirow_point_read_amplification_bytes: Counter::default(),
+			storage_multirow_recompact_total: Counter::default(),
+			storage_multirow_uncompacted_row_records_total: Counter::default(),
+			storage_multirow_rows_per_record: Histogram::new(MULTIROW_ROWS_PER_RECORD_BUCKETS),
+			storage_multirow_decode_micros: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
 
 			tenant_kek_cache_hits_total: Counter::default(),
 			tenant_kek_cache_misses_total: Counter::default(),
@@ -1045,6 +1065,29 @@ impl MetricsRegistry {
 	pub fn observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata(&self) {
 		self.agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total
 			.inc();
+	}
+
+	pub fn observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked(&self) {
+		self.agg_csb_short_circuit_skipped_supersession_metadata_untracked_total
+			.inc();
+	}
+
+	pub fn observe_storage_multirow_record_written(&self, rows: u64) {
+		self.storage_multirow_records_written_total.inc();
+		self.storage_multirow_rows_written_total.add(rows);
+		self.storage_multirow_rows_per_record.observe_value(rows);
+	}
+
+	pub fn observe_storage_multirow_decode(&self, rows: u64, bytes: u64, duration: Duration) {
+		self.storage_multirow_rows_materialized_total.add(rows);
+		self.storage_multirow_point_read_amplification_bytes
+			.add(bytes);
+		self.storage_multirow_decode_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_storage_multirow_recompact(&self, records: u64) {
+		self.storage_multirow_recompact_total.add(records);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1486,6 +1529,13 @@ impl MetricsRegistry {
 		);
 		render_counter(
 			&mut out,
+			"wendelon_agg_csb_short_circuit_skipped_supersession_metadata_untracked_total",
+			"Aggregate CSB direct-answer attempts skipped because supersession metadata is untracked.",
+			self.agg_csb_short_circuit_skipped_supersession_metadata_untracked_total
+				.get(),
+		);
+		render_counter(
+			&mut out,
 			"wendelon_agg_int_overflow_total",
 			"Aggregate integer accumulator overflows observed.",
 			self.agg_int_overflow_total.get(),
@@ -1606,6 +1656,54 @@ impl MetricsRegistry {
 			"wendelon_storage_tiering_skipped_already_tiered_total",
 			"Sealed slabs skipped because the tier pivot was already applied.",
 			self.storage_tiering_skipped_already_tiered_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_records_written_total",
+			"Physical multi-row table records written to slab storage.",
+			self.storage_multirow_records_written_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_rows_written_total",
+			"Logical table rows written inside physical multi-row records.",
+			self.storage_multirow_rows_written_total.get(),
+		);
+		render_histogram_raw(
+			&mut out,
+			"wendelon_storage_multirow_rows_per_record",
+			"Logical rows per physical multi-row table record.",
+			&self.storage_multirow_rows_per_record.snapshot(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_storage_multirow_decode_micros",
+			"Time spent decoding and materializing rows from multi-row records.",
+			&self.storage_multirow_decode_micros.snapshot(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_rows_materialized_total",
+			"Logical rows materialized from physical multi-row records.",
+			self.storage_multirow_rows_materialized_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_point_read_amplification_bytes",
+			"Physical bytes decoded while materializing rows from multi-row records.",
+			self.storage_multirow_point_read_amplification_bytes.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_recompact_total",
+			"Background multi-row recompaction operations completed.",
+			self.storage_multirow_recompact_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_multirow_uncompacted_row_records_total",
+			"Single-row table records observed as pending multi-row recompaction.",
+			self.storage_multirow_uncompacted_row_records_total.get(),
 		);
 		render_gauge(
 			&mut out,
@@ -2050,6 +2148,7 @@ mod tests {
 		registry.observe_agg_int_overflow();
 		registry.agg_csb_short_circuit_total.inc();
 		registry.observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
+		registry.observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked();
 		registry.agg_skipped_no_capability_total.inc();
 
 		let rendered = registry.render_prometheus();
@@ -2100,6 +2199,9 @@ mod tests {
 		assert!(rendered.contains("wendelon_agg_csb_short_circuit_total 1"));
 		assert!(rendered.contains(
 			"wendelon_agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total 1"
+		));
+		assert!(rendered.contains(
+			"wendelon_agg_csb_short_circuit_skipped_supersession_metadata_untracked_total 1"
 		));
 		assert!(rendered.contains("wendelon_agg_int_overflow_total 1"));
 		assert!(rendered.contains("wendelon_agg_skipped_no_capability_total 1"));

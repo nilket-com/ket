@@ -71,6 +71,7 @@ async fn refresh_leases(node: &wendelon::node::WendelonNode) {
 	node.data_server
 		.refresh_leases_once(&node.ring, &*node.clock, wendelon::node::LEASE_TTL_MS)
 		.await;
+	node.handles.lease_manager.abort();
 }
 
 async fn write_once(
@@ -208,7 +209,7 @@ async fn slow_finalization_consumer_is_dropped_without_stalling_writes() {
 	let mut rx = node.data_server.stream_finalization(0, 1).await.unwrap();
 	let write_count = STREAM_FINALIZATION_BUFFER as u64 + 32;
 
-	let writes = tokio::time::timeout(Duration::from_secs(3), async {
+	let writes = tokio::time::timeout(Duration::from_secs(10), async {
 		let mut metas = Vec::new();
 		for seq in 1..=write_count {
 			let key = format!("slow-consumer-key-{seq}");

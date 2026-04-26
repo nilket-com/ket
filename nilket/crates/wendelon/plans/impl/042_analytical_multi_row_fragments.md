@@ -645,25 +645,265 @@ Exit criteria:
   pattern is general enough to appear in future ADRs (likely
   given row-tombstone follow-up).
 
-## Suggested PR slicing
+## Next-pass execution plan
 
-1. Descriptor extension + synthetic-column convention
-   + golden fixtures (Phases 0-2).
-2. `RecordLocation.record_row_index` + persistent index
-   migration (Phase 1, mechanical).
-3. Multi-row write path under descriptor opt-in (Phase 3).
-4. Read path + PBC/AGG composition + scalar-opcode removal
-   (Phase 4).
-5. `SupersessionMetadata` and CSB direct-answer extension
-   (Phase 5) — independently valuable for single-row tables;
-   can ship before multi-row writes if sequence matters.
-6. Stats / retention / tombstone composition (Phase 6).
-7. Compaction modes + single coherent compaction (Phase 7).
-8. LSM-friendliness helpers (Phase 8).
-9. Recovery and observability (Phase 9).
-10. Benchmarks (Phase 10).
-11. Ratification cleanup already landed in this PR; downstream
-    PRs are work, not paperwork.
+The current implementation pass has landed the core ADR 042
+surface: descriptor opt-in, `record_row_index`, redb row-index
+encoding, multi-row write/read composition, scalar-opcode
+removal, recovery, metrics, stats/retention/tombstone
+composition, coherent partial multi-row retention rewrites, and
+the benchmark harness.
+
+The next pass closes the remaining items from this plan without
+reopening completed work.
+
+Execution update:
+
+- Item 1 is implemented: production writes, retention rewrites,
+  L1 compaction, and `benches/multi_row_fragments.rs` now share
+  `src/storage/multirow.rs`.
+- Item 2 is implemented: `SupersessionMetadata` is persisted on
+  tiered pointers, redb round-trips all three states, AGG
+  visibility requires tracked tombstone and supersession
+  metadata, post-tier overwrites update the source pointer, and
+  the sweeper backfills `Untracked` tiered pointers to tracked
+  supersession metadata through a committed `TierSlab` pointer
+  update.
+- Item 3 is implemented for sealed L1 slabs: schema evolution now
+  allows explicit `SingleRow <-> MultiRow` layout flips while
+  preserving stable primary-key and locality contracts, and
+  `SlabManager::recluster_sealed_table_layout` performs the
+  explicit replacement-slab rewrite with `relocated_reads`.
+- Items 4 and 5 are implemented for the current compaction
+  surface: retention rewrites, tombstone-aware L1 compaction, and
+  layout recluster use shared survivor/packing helpers;
+  `storage_multirow_recompact_total` increments on completed
+  multi-row rewrites; and direct tests exercise
+  `merge_multirow_streams` as a two-way sorted merge.
+- Item 6 is implemented: synthetic-column IPC bytes and redb
+  `record_row_index` encoding have golden checks; multi-row
+  query materialization asserts user-visible batches strip
+  `__row_*__` columns; architecture tests enforce brand-clean
+  ADR 042 protocol surfaces, unsuffixed metric/synthetic names,
+  and deleted scalar-context opcode absence.
+- Item 7 verification completed for this pass with
+  `cargo test --lib --quiet`,
+  `cargo test --test architecture_test --quiet`,
+  `cargo bench --bench multi_row_fragments --no-run`,
+  `cargo bench --bench multi_row_fragments -- --quick`,
+  `git diff --check`, staged diff check, rustfmt over changed
+  Rust files, and the scalar-opcode kill-list grep over
+  `src tests benches`.
+
+1. **Extract the reusable multi-row storage module.**
+
+   Files:
+
+   - `src/storage/multirow.rs` (new)
+   - `src/storage/mod.rs`
+   - `src/network/data_server.rs`
+   - `src/storage/manager.rs`
+   - `benches/multi_row_fragments.rs`
+
+   Work:
+
+   - Move inline packing, synthetic-column append/strip,
+     row-take, IPC encode/decode, and compaction survivor
+     rewrite helpers into `src/storage/multirow.rs`.
+   - Introduce the shared types/functions the original Phase 2
+     and Phase 8 called for:
+     `PackedMultiRowRecord`,
+     `pack_record_batch_by_bucket`,
+     `encode_multirow_from_survivors`,
+     `decode_multirow_synthetic_only`,
+     `multirow_sort_key`, and
+     `merge_multirow_streams`.
+   - Make write-time packing and rewrite-time packing use the
+     same deterministic sort key:
+     `(__row_routing_locality__, __row_key_id__, __row_hlc__,
+     original_ordinal)`.
+   - Keep all helpers storage-internal; do not add a public HRFT
+     frame family.
+
+   Exit:
+
+   - Data server writes, retention rewrites, L1 compaction, and
+     the benchmark harness call the same helper module.
+   - Golden tests cover single-row IPC unchanged, two-row
+     multi-row IPC, three-row mixed-HLC IPC, and redb
+     `record_row_index` encoding.
+   - Deterministic encode -> decode -> encode tests pass for
+     identical survivor sets.
+
+2. **Land persisted supersession metadata.**
+
+   Files:
+
+   - `src/schema/core.rs`
+   - `src/storage/index.rs`
+   - `src/storage/manager.rs`
+   - `src/storage/aggregate.rs`
+   - `src/network/data_server.rs`
+   - `src/metrics/registry.rs`
+   - apply-observer code that sees committed row writes
+
+   Work:
+
+   - Add `SupersessionMetadata { Untracked, None,
+     Earliest(HybridTimestamp) }` parallel to
+     `TombstoneMetadata`.
+   - Add it to tiered slab pointer state and redb pointer
+     encoding with tri-state round trips.
+   - Wire the maintenance hooks:
+     write-apply supersession observation, active-slab seal
+     derivation, retention/tombstone compaction preservation or
+     recomputation, and backlog convergence for existing
+     pointers.
+   - Extend `slab_visibility_complete` to require both tracked
+     tombstone metadata and tracked supersession metadata.
+   - Keep the existing conservative direct-answer supersession
+     fence as defense in depth until persisted metadata is the
+     normal fast path.
+   - Add
+     `agg_csb_short_circuit_skipped_supersession_metadata_untracked_total`.
+
+   Exit:
+
+   - Pointer encoding round-trips all supersession states.
+   - Post-supersession writes make the source slab ineligible
+     for CSB direct answer at `as_of_hlc >= update_hlc`.
+   - `Untracked` fails closed and increments the metric.
+   - Pointer says `None` but committed state shows a
+     superseding write -> direct answer falls through.
+
+3. **Implement explicit layout migration sweeps.**
+
+   Files:
+
+   - `src/schema/table.rs`
+   - `src/storage/sweeper.rs`
+   - `src/storage/manager.rs`
+   - `src/storage/multirow.rs`
+
+   Work:
+
+   - Replace the current blanket `record_layout_policy` alter
+     rejection with an explicit recluster/migration path.
+   - Implement `SingleRow -> MultiRow` sweep: read eligible
+     row-record data, pack by bucket through the shared
+     multi-row helper, write replacement records, atomically
+     swap row-index entries, and populate `relocated_reads`.
+   - Implement `MultiRow -> SingleRow` sweep symmetrically for
+     rollback or workload-shape correction.
+   - Preserve mixed-layout readability during the migration
+     window.
+   - Keep migration explicit; do not introduce auto-triggered
+     single-to-multi migration.
+
+   Exit:
+
+   - Reads and queries match before/after migration at multiple
+     `as_of_hlc` values.
+   - In-flight reads resolve through `relocated_reads` and never
+     observe a torn state.
+   - `storage_multirow_uncompacted_row_records_total` reflects
+     remaining migration backlog.
+
+4. **Complete coherent compaction metadata upgrades.**
+
+   Files:
+
+   - `src/storage/manager.rs`
+   - `src/storage/sweeper.rs`
+   - `src/storage/multirow.rs`
+
+   Work:
+
+   - Ensure every retention rewrite, tombstone-aware reclaim,
+     and layout migration recomputes layout, tombstone metadata,
+     and supersession metadata inside one output construction.
+   - Commit those upgrades through one pointer/index swap; do
+     not add piecemeal sweeper passes.
+   - Increment `storage_multirow_recompact_total` when a
+     multi-row rewrite/recompact completes.
+
+   Exit:
+
+   - A slab with both tombstone and supersession metadata
+     `Untracked` transitions both to tracked in one committed
+     rewrite.
+   - Migrated-range tombstone compaction removes only affected
+     rows from multi-row records.
+   - Recompact tests verify rows-in == rows-out, per-row HLC
+     preservation, relocation soundness, and canonical output
+     sort order.
+
+5. **Add LSM-forward helper proof points without LSM policy.**
+
+   Files:
+
+   - `src/storage/multirow.rs`
+   - compaction tests
+   - `benches/multi_row_fragments.rs`
+
+   Work:
+
+   - Exercise `merge_multirow_streams` as a two-way sorted
+     merge over storage rows without using source slab offsets.
+   - Enforce fragment caps on rewrite output, not just write
+     input.
+   - Add explicit TODO hooks for future LSM concerns: bucket
+     overlap, global redb index vs. per-segment indexes,
+     segment/slab `target_rows` divergence, and CSB filter-cache
+     promotion.
+   - Keep out LSM policy: no levels, no run manifest, no
+     memtable redesign, no overlapping-run read merge.
+
+   Exit:
+
+   - Future LSM compaction has reusable row-sorted encode/merge
+     primitives.
+   - Tests prove mixed-HLC survivor rows retain AS OF semantics
+     after helper-driven rewrites.
+
+6. **Close architectural and golden-test gaps.**
+
+   Files:
+
+   - tests colocated with schema/storage modules
+   - metric registry tests
+   - scalar-opcode guard tests
+
+   Work:
+
+   - Add golden fixture checks for synthetic-column IPC bytes and
+     redb row-index encoding.
+   - Add a focused architectural test that user-facing read/query
+     outputs never expose `__row_*__` storage columns.
+   - Add a registry/catalog scan that ADR 042 metric segments,
+     reject codes, synthetic columns, helper names, and opcode
+     catalogs stay free of project-name protocol prefixes and
+     new `V1` / `V2` suffixes.
+   - Preserve the scalar-opcode kill-list check for
+     `LOAD_IDENTITY` and `ROUTE_BY_LOCALITY`.
+
+   Exit:
+
+   - The implementation plan's remaining literal tests are
+     represented in code.
+   - No hidden compatibility shim reintroduces scalar-context
+     PBC.
+
+7. **Verification gate for the next pass.**
+
+   Required before closing the pass:
+
+   - `cargo test --lib --quiet`
+   - `cargo bench --bench multi_row_fragments --no-run`
+   - `cargo bench --bench multi_row_fragments -- --quick`
+   - `git diff --check`
+   - `rustfmt --check --edition 2024` on touched Rust files
+   - scalar-opcode kill-list grep over `src tests benches`
 
 ## Post-merge stabilization watch
 

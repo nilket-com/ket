@@ -2,7 +2,8 @@ use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyse
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
-	ReleaseLeaseRequestMeta, SlabId, TenantId, TenantKekId, TombstoneMetadata,
+	ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TenantId, TenantKekId,
+	TombstoneMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -65,6 +66,11 @@ pub struct TieredSlab {
 	/// short-circuit visibility.
 	#[serde(default)]
 	pub tombstone_metadata: TombstoneMetadata,
+	/// ADR 042 visibility proof for CSB aggregate answers.
+	/// `Untracked` means this pointer cannot prove aggregate
+	/// short-circuit visibility.
+	#[serde(default)]
+	pub supersession_metadata: SupersessionMetadata,
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.

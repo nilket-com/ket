@@ -5,8 +5,8 @@ use crate::schema::aggregate::{
 };
 use crate::schema::pbc::Program as PbcProgram;
 use crate::schema::{
-	AggregateExpressionIndex, HllPrecision, HybridTimestamp, KllK, TableObjectId, TenantId,
-	TombstoneMetadata,
+	AggregateExpressionIndex, HllPrecision, HybridTimestamp, KllK, SupersessionMetadata,
+	TableObjectId, TenantId, TombstoneMetadata,
 };
 use crate::storage::sketch::{HllRegisters, KllSketch};
 use crate::storage::stats::{
@@ -1317,6 +1317,7 @@ fn kll_compaction_seed(
 pub fn slab_visibility_complete(
 	seal_hlc: HybridTimestamp,
 	tombstone_metadata: TombstoneMetadata,
+	supersession_metadata: SupersessionMetadata,
 	as_of_hlc: HybridTimestamp,
 ) -> bool {
 	seal_hlc <= as_of_hlc
@@ -1324,6 +1325,23 @@ pub fn slab_visibility_complete(
 		&& tombstone_metadata
 			.earliest()
 			.is_none_or(|tombstone_hlc| tombstone_hlc > as_of_hlc)
+		&& supersession_metadata.is_tracked()
+		&& supersession_metadata
+			.earliest()
+			.is_none_or(|supersession_hlc| supersession_hlc > as_of_hlc)
+}
+
+pub fn merge_earliest_supersession(
+	current: SupersessionMetadata,
+	supersession_hlc: HybridTimestamp,
+) -> SupersessionMetadata {
+	match current {
+		SupersessionMetadata::Untracked => SupersessionMetadata::Untracked,
+		SupersessionMetadata::None => SupersessionMetadata::Earliest(supersession_hlc),
+		SupersessionMetadata::Earliest(existing) => {
+			SupersessionMetadata::Earliest(existing.min(supersession_hlc))
+		}
+	}
 }
 
 pub fn merge_earliest_tombstone(
@@ -1683,21 +1701,43 @@ mod tests {
 		assert!(!slab_visibility_complete(
 			hlc(10),
 			TombstoneMetadata::Untracked,
+			SupersessionMetadata::None,
 			hlc(11)
 		));
 		assert!(slab_visibility_complete(
 			hlc(10),
 			TombstoneMetadata::None,
+			SupersessionMetadata::None,
 			hlc(11)
 		));
 		assert!(slab_visibility_complete(
 			hlc(10),
 			TombstoneMetadata::Earliest(hlc(12)),
+			SupersessionMetadata::None,
 			hlc(11)
 		));
 		assert!(!slab_visibility_complete(
 			hlc(10),
 			TombstoneMetadata::Earliest(hlc(11)),
+			SupersessionMetadata::None,
+			hlc(11)
+		));
+		assert!(!slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::None,
+			SupersessionMetadata::Untracked,
+			hlc(11)
+		));
+		assert!(slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::None,
+			SupersessionMetadata::Earliest(hlc(12)),
+			hlc(11)
+		));
+		assert!(!slab_visibility_complete(
+			hlc(10),
+			TombstoneMetadata::None,
+			SupersessionMetadata::Earliest(hlc(11)),
 			hlc(11)
 		));
 		assert_eq!(

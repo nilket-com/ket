@@ -50,12 +50,12 @@ use crate::network::transport::{
 };
 use crate::schema::{
 	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
-	Locality, MsgType, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta,
-	QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus, TableQueryRequestMeta,
-	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
-	PbcRejectCode, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	column_projection_prefix_ranges, read_key_schema, read_value_schema,
-	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
+	Locality, MsgType, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	TableQueryRequestMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
+	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, column_projection_prefix_ranges,
+	read_key_schema, read_value_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;

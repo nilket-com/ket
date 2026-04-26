@@ -49,8 +49,8 @@ pub use wendelon::integration::compute::{
 };
 pub use wendelon::schema::{
 	Consistency as ReadConsistency, DurabilityLevel as DurabilityClass, LocalityPolicyV1,
-	PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, PbcRejectCode,
+	PbcRejectCode, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

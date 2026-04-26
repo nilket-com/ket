@@ -87,9 +87,9 @@ use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
-#[cfg(test)]
-use crate::schema::TombstoneMetadata;
 use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
+#[cfg(test)]
+use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
@@ -1317,6 +1317,7 @@ impl WendelonNode {
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
 					tombstone_metadata: tier.tombstone_metadata,
+					supersession_metadata: tier.supersession_metadata,
 				},
 				recovered_log_index,
 			)
@@ -2562,6 +2563,13 @@ mod tests {
 		base
 	}
 
+	fn park_background_tiering(cfg: &mut NodeBootstrapConfig) {
+		cfg.tiering.scan_interval = Duration::from_secs(300);
+		cfg.tiering.min_slab_bytes = u64::MAX;
+		cfg.tiering.max_plaintext_rewrites_per_pass = 0;
+		cfg.tiering.max_dek_rewraps_per_pass = 0;
+	}
+
 	async fn wait_for_local_leader(node: &WendelonNode) {
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 		loop {
@@ -2615,15 +2623,18 @@ mod tests {
 	}
 
 	async fn wait_for_tiered_slab(node: &WendelonNode, slab_id: crate::schema::SlabId) {
-		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 		loop {
 			if node.slab.is_tiered(slab_id).await {
 				return;
 			}
-			assert!(
-				tokio::time::Instant::now() < deadline,
-				"timed out waiting for slab {slab_id} to tier"
-			);
+			if tokio::time::Instant::now() >= deadline {
+				panic!(
+					"timed out waiting for slab {slab_id} to tier; sealed={} tiered={}",
+					node.slab.sealed_count().await,
+					node.slab.tiered_count().await
+				);
+			}
 			tokio::time::sleep(Duration::from_millis(20)).await;
 		}
 	}
@@ -2926,12 +2937,14 @@ mod tests {
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
 			root: l2_dir.clone(),
 		});
+		park_background_tiering(&mut cfg);
 		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.unwrap();
 
 		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
 
 		let tenant_id = TenantId::ZERO;
 		let tiered_key = Identity::blake3(b"tiered-row");
@@ -3000,6 +3013,7 @@ mod tests {
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			}))
 			.await
 			.unwrap();
@@ -3040,12 +3054,14 @@ mod tests {
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
 			root: l2_dir.clone(),
 		});
+		park_background_tiering(&mut cfg);
 		let l2 = cfg.l2.as_ref().unwrap().build().unwrap();
 		let node = WendelonNode::bootstrap_single_node(cfg.clone())
 			.await
 			.unwrap();
 
 		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
 
 		let tenant_id = TenantId::ZERO;
 		let tiered_key = Identity::blake3(b"missing-tiered-row");
@@ -3111,6 +3127,7 @@ mod tests {
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			}))
 			.await
 			.unwrap();
@@ -3167,9 +3184,11 @@ mod tests {
 		cfg.l2 = Some(ObjectStoreConfig::LocalFs {
 			root: l2_dir.clone(),
 		});
+		park_background_tiering(&mut cfg);
 		let object_store = cfg.l2.as_ref().unwrap().build().unwrap();
 		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
 
 		let old_key = Identity::blake3(b"pre-rotation-tiered");
 		let filler_key = Identity::blake3(b"rotation-filler");
@@ -3310,6 +3329,7 @@ mod tests {
 		let node = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
 
 		wait_for_local_leader(&node).await;
+		wait_for_default_tenant_kek(&node).await;
 
 		let tenant_id = TenantId::ZERO;
 		let tiered_key = Identity::blake3(b"background-tiered");

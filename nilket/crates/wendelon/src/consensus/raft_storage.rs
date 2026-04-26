@@ -63,13 +63,13 @@ use crate::integration::compute::{
 };
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
-#[cfg(test)]
-use crate::schema::TombstoneMetadata;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
 	RaftLogEntryFixed, SlabId, SnapshotHeader, TableSchemaCatalogV1, TenantId, TenantKekId,
 	WALRecordHeader, decode_table_schema_descriptor_v1, validate_table_schema_evolution,
 };
+#[cfg(test)]
+use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, FileHandle, IoUringFileOps, OpenFlags, fsync_parent_dir,
@@ -7419,6 +7419,7 @@ mod tiered_slab_tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 
 		let (resp, event) = apply_request(&mut state, WendelonRequest::TierSlab(tier.clone()));
@@ -7621,6 +7622,7 @@ mod tenant_kek_tests {
 				stats_block_len: None,
 				stats_block_hash128: None,
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			},
 		);
 

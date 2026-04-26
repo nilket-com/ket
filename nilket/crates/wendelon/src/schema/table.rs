@@ -2,8 +2,8 @@ use crate::schema::pbc::{
 	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
 };
 use crate::schema::{
-	ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, Locality, NodeId, TenantId,
-	WriteResponseMeta, write_payload_schema,
+	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, Locality, MaxRowCount,
+	NodeId, TargetRowCount, TenantId, WriteResponseMeta, write_payload_schema,
 };
 use arrow::array::{
 	Array, BinaryArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -29,6 +29,13 @@ pub const TABLE_SPREAD_DEFAULT_FACTOR: u16 = 4;
 pub const TABLE_SPREAD_MAX_FACTOR: u16 = 256;
 pub const TABLE_SPREAD_DEFAULT_PREFIX_BITS: u8 = 16;
 pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
+pub const MULTI_ROW_DEFAULT_TARGET_ROWS: u32 = 4096;
+pub const MULTI_ROW_DEFAULT_MAX_ROWS: u32 = 65_536;
+pub const MULTI_ROW_DEFAULT_MAX_RECORD_BYTES: u64 = 1024 * 1024;
+pub const MULTI_ROW_MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
+pub const STORAGE_ROW_HLC_COLUMN: &str = "__row_hlc__";
+pub const STORAGE_ROW_KEY_ID_COLUMN: &str = "__row_key_id__";
+pub const STORAGE_ROW_ROUTING_LOCALITY_COLUMN: &str = "__row_routing_locality__";
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
 pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
 pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
@@ -338,6 +345,92 @@ pub struct TableWriteAdmission {
 	pub localities: Vec<Locality>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordLayoutPolicy {
+	SingleRow,
+	MultiRow(MultiRowLayoutDescriptor),
+}
+
+impl Default for RecordLayoutPolicy {
+	fn default() -> Self {
+		Self::SingleRow
+	}
+}
+
+impl RecordLayoutPolicy {
+	pub fn validate(&self) -> std::io::Result<()> {
+		match self {
+			Self::SingleRow => Ok(()),
+			Self::MultiRow(descriptor) => descriptor.validate(),
+		}
+	}
+
+	pub const fn is_multi_row(&self) -> bool {
+		matches!(self, Self::MultiRow(_))
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MultiRowLayoutDescriptor {
+	pub target_rows: TargetRowCount,
+	pub max_rows: MaxRowCount,
+	pub max_record_bytes: ByteCount,
+}
+
+impl Default for MultiRowLayoutDescriptor {
+	fn default() -> Self {
+		Self {
+			target_rows: TargetRowCount::new(MULTI_ROW_DEFAULT_TARGET_ROWS),
+			max_rows: MaxRowCount::new(MULTI_ROW_DEFAULT_MAX_ROWS),
+			max_record_bytes: ByteCount::new(MULTI_ROW_DEFAULT_MAX_RECORD_BYTES),
+		}
+	}
+}
+
+impl MultiRowLayoutDescriptor {
+	pub fn new(target_rows: u32, max_rows: u32, max_record_bytes: u64) -> std::io::Result<Self> {
+		let descriptor = Self {
+			target_rows: TargetRowCount::new(target_rows),
+			max_rows: MaxRowCount::new(max_rows),
+			max_record_bytes: ByteCount::new(max_record_bytes),
+		};
+		descriptor.validate()?;
+		Ok(descriptor)
+	}
+
+	pub fn validate(&self) -> std::io::Result<()> {
+		let target_rows = self.target_rows.get();
+		let max_rows = self.max_rows.get();
+		let max_record_bytes = self.max_record_bytes.get();
+		if target_rows == 0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"multi-row target_rows must be greater than zero",
+			));
+		}
+		if max_rows == 0 || max_rows as usize > TABLE_WRITE_MAX_ROWS {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("multi-row max_rows must be in 1..={TABLE_WRITE_MAX_ROWS}"),
+			));
+		}
+		if target_rows > max_rows {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"multi-row target_rows must not exceed max_rows",
+			));
+		}
+		if max_record_bytes == 0 || max_record_bytes > MULTI_ROW_MAX_RECORD_BYTES {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("multi-row max_record_bytes must be in 1..={MULTI_ROW_MAX_RECORD_BYTES}"),
+			));
+		}
+		Ok(())
+	}
+}
+
 pub fn validate_table_write_request_batch(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
@@ -469,6 +562,8 @@ pub struct TableSchemaDescriptorV1 {
 	pub locality_policy: LocalityPolicyV1,
 	#[serde(default)]
 	pub stats_policy: ColumnStatsPolicyV1,
+	#[serde(default)]
+	pub record_layout_policy: RecordLayoutPolicy,
 	pub schema_fingerprint: [u8; 32],
 	pub evolution_policy: SchemaEvolutionPolicyV1,
 }
@@ -494,6 +589,7 @@ impl TableSchemaDescriptorV1 {
 			primary_key,
 			locality_policy,
 			stats_policy: ColumnStatsPolicyV1::default(),
+			record_layout_policy: RecordLayoutPolicy::SingleRow,
 			schema_fingerprint: [0; 32],
 			evolution_policy,
 		};
@@ -538,6 +634,7 @@ impl TableSchemaDescriptorV1 {
 		validate_primary_key(&schema, &self.primary_key)?;
 		validate_locality_policy(&schema, &self.locality_policy)?;
 		validate_stats_policy(&schema, &self.stats_policy)?;
+		self.record_layout_policy.validate()?;
 		Ok(())
 	}
 }
@@ -948,6 +1045,10 @@ pub fn validate_table_schema_evolution(
 			"table schema alter cannot change locality_policy in V1",
 		));
 	}
+	// ADR 042 allows explicit recluster migrations between
+	// SingleRow and MultiRow layouts while the logical schema,
+	// primary key, and locality policy stay fixed. Existing rows
+	// remain self-describing and readable during the sweep.
 	if previous.evolution_policy != next.evolution_policy {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
@@ -3334,6 +3435,13 @@ mod tests {
 		.unwrap();
 		let err = validate_table_schema_evolution(&previous, &changed_locality).unwrap_err();
 		assert!(err.to_string().contains("cannot change locality_policy"));
+
+		let mut layout_change = next.clone();
+		layout_change.schema_generation = 3;
+		layout_change.record_layout_policy =
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
+		layout_change.schema_fingerprint = layout_change.compute_schema_fingerprint().unwrap();
+		validate_table_schema_evolution(&previous, &layout_change).unwrap();
 	}
 
 	#[test]

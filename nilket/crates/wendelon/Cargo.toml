@@ -83,3 +83,7 @@ harness = false
 [[bench]]
 name = "pbc_vectorized"
 harness = false
+
+[[bench]]
+name = "multi_row_fragments"
+harness = false

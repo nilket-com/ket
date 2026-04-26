@@ -31,7 +31,6 @@
 //! evaluation then walks that compiled form once per batch.
 
 use crate::metrics::{PbcRuntime, global as metrics};
-use crate::schema::{Identity, Locality};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Datum, Float32Array, Float64Array, Int32Array,
 	Int64Array, LargeStringArray, StringArray, TimestampMillisecondArray,
@@ -68,15 +67,6 @@ pub const OP_IN_LIST: u8 = 0x30;
 pub const OP_IS_NULL: u8 = 0x31;
 pub const OP_IS_NOT_NULL: u8 = 0x32;
 
-pub const OP_LOAD_IDENTITY: u8 = 0x40;
-pub const OP_PUSH_IDENTITY: u8 = 0x41;
-pub const OP_EQ_IDENTITY: u8 = 0x42;
-pub const OP_HASH_RANGE_IDENTITY: u8 = 0x43;
-
-pub const OP_ROUTE_BY_LOCALITY: u8 = 0x50;
-pub const OP_PUSH_LOCALITY: u8 = 0x51;
-pub const OP_RANGE_LOCALITY: u8 = 0x52;
-
 pub const OP_PROJECT: u8 = 0xFF;
 
 // ============================================================
@@ -112,13 +102,6 @@ enum Op {
 	InList(u16),
 	IsNull,
 	IsNotNull,
-	LoadIdentity,
-	PushIdentity(Identity),
-	EqIdentity,
-	HashRangeIdentity,
-	RouteByLocality,
-	PushLocality(Locality),
-	RangeLocality,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -156,12 +139,6 @@ pub enum ColumnPredicateLiteralV1 {
 	List(Vec<ColumnPredicateLiteralV1>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExecutionContext {
-	pub identity: Identity,
-	pub locality: Locality,
-}
-
 impl Program {
 	pub fn compile(bytecode: &[u8]) -> std::io::Result<Self> {
 		if bytecode.len() > MAX_BYTECODE_BYTES {
@@ -174,12 +151,6 @@ impl Program {
 			));
 		}
 		compile(bytecode)
-	}
-
-	pub fn requires_scalar_context(&self) -> bool {
-		self.ops
-			.iter()
-			.any(|op| matches!(op, Op::LoadIdentity | Op::RouteByLocality))
 	}
 
 	pub fn has_projection(&self) -> bool {
@@ -247,18 +218,9 @@ fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredica
 				let target = stack.pop()?;
 				stack.push(predicate_from_in_list(target, items)?);
 			}
-			Op::Neq
-			| Op::Or
-			| Op::Not
-			| Op::IsNull
-			| Op::IsNotNull
-			| Op::LoadIdentity
-			| Op::PushIdentity(_)
-			| Op::EqIdentity
-			| Op::HashRangeIdentity
-			| Op::RouteByLocality
-			| Op::PushLocality(_)
-			| Op::RangeLocality => stack.push(PredicateExpr::Unsupported),
+			Op::Neq | Op::Or | Op::Not | Op::IsNull | Op::IsNotNull => {
+				stack.push(PredicateExpr::Unsupported)
+			}
 		}
 		if stack.len() > STACK_DEPTH_LIMIT {
 			return None;
@@ -401,19 +363,6 @@ fn compile(bytecode: &[u8]) -> std::io::Result<Program> {
 			}
 			OP_IS_NULL => ops.push(Op::IsNull),
 			OP_IS_NOT_NULL => ops.push(Op::IsNotNull),
-			OP_LOAD_IDENTITY => ops.push(Op::LoadIdentity),
-			OP_PUSH_IDENTITY => {
-				let identity = read_identity(bytecode, &mut i)?;
-				ops.push(Op::PushIdentity(identity));
-			}
-			OP_EQ_IDENTITY => ops.push(Op::EqIdentity),
-			OP_HASH_RANGE_IDENTITY => ops.push(Op::HashRangeIdentity),
-			OP_ROUTE_BY_LOCALITY => ops.push(Op::RouteByLocality),
-			OP_PUSH_LOCALITY => {
-				let locality = read_u64(bytecode, &mut i)?;
-				ops.push(Op::PushLocality(Locality::new(locality)));
-			}
-			OP_RANGE_LOCALITY => ops.push(Op::RangeLocality),
 			OP_PROJECT => {
 				let count = read_u16(bytecode, &mut i)? as usize;
 				let mut indices = Vec::with_capacity(count);
@@ -445,8 +394,6 @@ fn compile(bytecode: &[u8]) -> std::io::Result<Program> {
 enum StackKind {
 	Unknown,
 	Bool,
-	Identity,
-	Locality,
 }
 
 fn validate_program(program: &Program) -> std::io::Result<()> {
@@ -460,8 +407,8 @@ fn validate_program(program: &Program) -> std::io::Result<()> {
 			Op::Eq | Op::Neq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
 				let rhs = pop_kind(&mut stack, "generic comparison rhs")?;
 				let lhs = pop_kind(&mut stack, "generic comparison lhs")?;
-				reject_typed_family(lhs, "generic comparison")?;
-				reject_typed_family(rhs, "generic comparison")?;
+				expect_scalar_comparable(lhs, "generic comparison")?;
+				expect_scalar_comparable(rhs, "generic comparison")?;
 				stack.push(StackKind::Bool);
 			}
 			Op::And | Op::Or => {
@@ -482,49 +429,15 @@ fn validate_program(program: &Program) -> std::io::Result<()> {
 					items.push(pop_kind(&mut stack, "IN_LIST item")?);
 				}
 				let target = pop_kind(&mut stack, "IN_LIST target")?;
-				reject_typed_family(target, "IN_LIST")?;
+				expect_scalar_comparable(target, "IN_LIST")?;
 				for item in items {
-					reject_typed_family(item, "IN_LIST")?;
+					expect_scalar_comparable(item, "IN_LIST")?;
 				}
 				stack.push(StackKind::Bool);
 			}
 			Op::IsNull | Op::IsNotNull => {
 				let value = pop_kind(&mut stack, "null-check operand")?;
-				reject_typed_family(value, "null-check")?;
-				stack.push(StackKind::Bool);
-			}
-			Op::LoadIdentity | Op::PushIdentity(_) => stack.push(StackKind::Identity),
-			Op::EqIdentity => {
-				expect_identity(pop_kind(&mut stack, "identity rhs")?, "EQ_IDENTITY")?;
-				expect_identity(pop_kind(&mut stack, "identity lhs")?, "EQ_IDENTITY")?;
-				stack.push(StackKind::Bool);
-			}
-			Op::HashRangeIdentity => {
-				expect_identity(
-					pop_kind(&mut stack, "identity upper bound")?,
-					"HASH_RANGE_IDENTITY",
-				)?;
-				expect_identity(
-					pop_kind(&mut stack, "identity lower bound")?,
-					"HASH_RANGE_IDENTITY",
-				)?;
-				expect_identity(
-					pop_kind(&mut stack, "identity target")?,
-					"HASH_RANGE_IDENTITY",
-				)?;
-				stack.push(StackKind::Bool);
-			}
-			Op::RouteByLocality | Op::PushLocality(_) => stack.push(StackKind::Locality),
-			Op::RangeLocality => {
-				expect_locality(
-					pop_kind(&mut stack, "locality upper bound")?,
-					"RANGE_LOCALITY",
-				)?;
-				expect_locality(
-					pop_kind(&mut stack, "locality lower bound")?,
-					"RANGE_LOCALITY",
-				)?;
-				expect_locality(pop_kind(&mut stack, "locality target")?, "RANGE_LOCALITY")?;
+				expect_scalar_comparable(value, "null-check")?;
 				stack.push(StackKind::Bool);
 			}
 		}
@@ -547,51 +460,15 @@ fn pop_kind(stack: &mut Vec<StackKind>, label: &str) -> std::io::Result<StackKin
 	})
 }
 
-fn expect_boolish(kind: StackKind, op: &str) -> std::io::Result<()> {
+fn expect_boolish(kind: StackKind, _op: &str) -> std::io::Result<()> {
 	match kind {
 		StackKind::Bool | StackKind::Unknown => Ok(()),
-		StackKind::Identity | StackKind::Locality => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} cannot consume typed identity/locality values"),
-		)),
 	}
 }
 
-fn expect_identity(kind: StackKind, op: &str) -> std::io::Result<()> {
+fn expect_scalar_comparable(kind: StackKind, _op: &str) -> std::io::Result<()> {
 	match kind {
-		StackKind::Identity => Ok(()),
-		StackKind::Locality => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} expected Identity, got Locality"),
-		)),
-		_ => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} expected Identity operands"),
-		)),
-	}
-}
-
-fn expect_locality(kind: StackKind, op: &str) -> std::io::Result<()> {
-	match kind {
-		StackKind::Locality => Ok(()),
-		StackKind::Identity => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} expected Locality, got Identity"),
-		)),
-		_ => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} expected Locality operands"),
-		)),
-	}
-}
-
-fn reject_typed_family(kind: StackKind, op: &str) -> std::io::Result<()> {
-	match kind {
-		StackKind::Identity | StackKind::Locality => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("PBC: {op} must use typed identity/locality opcodes"),
-		)),
-		_ => Ok(()),
+		StackKind::Unknown | StackKind::Bool => Ok(()),
 	}
 }
 
@@ -612,35 +489,17 @@ pub fn execute(bytecode: &[u8], batch: &RecordBatch) -> std::io::Result<RecordBa
 }
 
 pub fn execute_program(program: &Program, batch: &RecordBatch) -> std::io::Result<RecordBatch> {
-	execute_program_with_context(program, batch, None)
-}
-
-pub fn execute_with_context(
-	bytecode: &[u8],
-	batch: &RecordBatch,
-	context: ExecutionContext,
-) -> std::io::Result<RecordBatch> {
-	let program = Program::compile(bytecode)?;
-	execute_program_with_context(&program, batch, Some(context))
-}
-
-pub fn execute_program_with_context(
-	program: &Program,
-	batch: &RecordBatch,
-	context: Option<ExecutionContext>,
-) -> std::io::Result<RecordBatch> {
 	validate_program_against_batch(program, batch)?;
-	execute_program_vectorized(program, batch, context)
+	execute_program_vectorized(program, batch)
 }
 
 fn execute_program_vectorized(
 	program: &Program,
 	batch: &RecordBatch,
-	context: Option<ExecutionContext>,
 ) -> std::io::Result<RecordBatch> {
 	let started = Instant::now();
 	let mut stats = VectorExecStats::default();
-	let result = match evaluate_program_vectorized(program, batch, context, &mut stats) {
+	let result = match evaluate_program_vectorized(program, batch, &mut stats) {
 		Ok(None) => apply_projection(program, batch),
 		Ok(Some(mask)) => {
 			let filtered = compute::filter_record_batch(batch, &mask).map_err(|e| {
@@ -713,20 +572,13 @@ fn validate_program_against_batch(program: &Program, batch: &RecordBatch) -> std
 		if is_supported_pushcol_type(field.data_type()) {
 			continue;
 		}
-		let msg = match field.data_type() {
-			DataType::FixedSizeBinary(32) | DataType::UInt64 => {
-				"typed identity/locality values must use LOAD_IDENTITY / ROUTE_BY_LOCALITY"
-			}
-			other => {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					format!("PBC: PUSH_COL does not support Arrow type {other:?}"),
-				));
-			}
-		};
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			format!("PBC: column '{}' {msg}", field.name()),
+			format!(
+				"PBC: PUSH_COL column '{}' does not support Arrow type {:?}",
+				field.name(),
+				field.data_type()
+			),
 		));
 	}
 	if let Some(indices) = &program.project {
@@ -765,8 +617,6 @@ enum VectorValue {
 	Array(ArrayRef),
 	Scalar(ScalarLit),
 	Bool(BooleanArray),
-	Identity(Identity),
-	Locality(Locality),
 }
 
 #[derive(Clone, Debug)]
@@ -814,7 +664,6 @@ impl<'a> ColumnCache<'a> {
 fn evaluate_program_vectorized(
 	program: &Program,
 	batch: &RecordBatch,
-	context: Option<ExecutionContext>,
 	stats: &mut VectorExecStats,
 ) -> Result<Option<BooleanArray>, String> {
 	if program.ops.is_empty() {
@@ -832,39 +681,6 @@ fn evaluate_program_vectorized(
 			Op::PushBool(value) => stack.push(VectorValue::Scalar(ScalarLit::Bool(*value))),
 			Op::PushFloat(value) => stack.push(VectorValue::Scalar(ScalarLit::Float(*value))),
 			Op::PushTs(value) => stack.push(VectorValue::Scalar(ScalarLit::Ts(*value))),
-			Op::LoadIdentity => {
-				let ctx = context.ok_or("LOAD_IDENTITY requires execution context")?;
-				stack.push(VectorValue::Identity(ctx.identity));
-			}
-			Op::PushIdentity(value) => stack.push(VectorValue::Identity(*value)),
-			Op::EqIdentity => {
-				let rhs = pop_vector(&mut stack, "identity rhs")?;
-				let lhs = pop_vector(&mut stack, "identity lhs")?;
-				let mask = identity_eq_mask(lhs, rhs, len)?;
-				stats.intermediate_arrays += 1;
-				stack.push(VectorValue::Bool(mask));
-			}
-			Op::HashRangeIdentity => {
-				let upper = pop_vector(&mut stack, "identity upper bound")?;
-				let lower = pop_vector(&mut stack, "identity lower bound")?;
-				let target = pop_vector(&mut stack, "identity target")?;
-				let mask = identity_range_mask(target, lower, upper, len)?;
-				stats.intermediate_arrays += 1;
-				stack.push(VectorValue::Bool(mask));
-			}
-			Op::RouteByLocality => {
-				let ctx = context.ok_or("ROUTE_BY_LOCALITY requires execution context")?;
-				stack.push(VectorValue::Locality(ctx.locality));
-			}
-			Op::PushLocality(value) => stack.push(VectorValue::Locality(*value)),
-			Op::RangeLocality => {
-				let upper = pop_vector(&mut stack, "locality upper bound")?;
-				let lower = pop_vector(&mut stack, "locality lower bound")?;
-				let target = pop_vector(&mut stack, "locality target")?;
-				let mask = locality_range_mask(target, lower, upper, len)?;
-				stats.intermediate_arrays += 1;
-				stack.push(VectorValue::Bool(mask));
-			}
 			Op::Eq | Op::Neq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
 				let rhs = pop_vector(&mut stack, "comparison rhs")?;
 				let lhs = pop_vector(&mut stack, "comparison lhs")?;
@@ -965,56 +781,6 @@ fn const_bool_array(value: bool, len: usize) -> BooleanArray {
 	BooleanArray::from(vec![value; len])
 }
 
-fn identity_eq_mask(
-	lhs: VectorValue,
-	rhs: VectorValue,
-	len: usize,
-) -> Result<BooleanArray, String> {
-	let VectorValue::Identity(lhs) = lhs else {
-		return Err("EQ_IDENTITY lhs was not Identity".to_owned());
-	};
-	let VectorValue::Identity(rhs) = rhs else {
-		return Err("EQ_IDENTITY rhs was not Identity".to_owned());
-	};
-	Ok(const_bool_array(lhs == rhs, len))
-}
-
-fn identity_range_mask(
-	target: VectorValue,
-	lower: VectorValue,
-	upper: VectorValue,
-	len: usize,
-) -> Result<BooleanArray, String> {
-	let VectorValue::Identity(target) = target else {
-		return Err("HASH_RANGE_IDENTITY target was not Identity".to_owned());
-	};
-	let VectorValue::Identity(lower) = lower else {
-		return Err("HASH_RANGE_IDENTITY lower bound was not Identity".to_owned());
-	};
-	let VectorValue::Identity(upper) = upper else {
-		return Err("HASH_RANGE_IDENTITY upper bound was not Identity".to_owned());
-	};
-	Ok(const_bool_array(lower <= target && target <= upper, len))
-}
-
-fn locality_range_mask(
-	target: VectorValue,
-	lower: VectorValue,
-	upper: VectorValue,
-	len: usize,
-) -> Result<BooleanArray, String> {
-	let VectorValue::Locality(target) = target else {
-		return Err("RANGE_LOCALITY target was not Locality".to_owned());
-	};
-	let VectorValue::Locality(lower) = lower else {
-		return Err("RANGE_LOCALITY lower bound was not Locality".to_owned());
-	};
-	let VectorValue::Locality(upper) = upper else {
-		return Err("RANGE_LOCALITY upper bound was not Locality".to_owned());
-	};
-	Ok(const_bool_array(lower <= target && target <= upper, len))
-}
-
 fn is_null_vector(value: &VectorValue, len: usize) -> Result<BooleanArray, String> {
 	match value {
 		VectorValue::Array(array) => {
@@ -1024,9 +790,6 @@ fn is_null_vector(value: &VectorValue, len: usize) -> Result<BooleanArray, Strin
 			compute::is_null(mask).map_err(|e| format!("IS_NULL boolean null kernel: {e}"))
 		}
 		VectorValue::Scalar(_) => Ok(const_bool_array(false, len)),
-		VectorValue::Identity(_) | VectorValue::Locality(_) => {
-			Err("IS_NULL cannot consume typed identity/locality values".to_owned())
-		}
 	}
 }
 
@@ -1038,9 +801,6 @@ fn is_not_null_vector(value: &VectorValue, len: usize) -> Result<BooleanArray, S
 			compute::is_not_null(mask).map_err(|e| format!("IS_NOT_NULL boolean null kernel: {e}"))
 		}
 		VectorValue::Scalar(_) => Ok(const_bool_array(true, len)),
-		VectorValue::Identity(_) | VectorValue::Locality(_) => {
-			Err("IS_NOT_NULL cannot consume typed identity/locality values".to_owned())
-		}
 	}
 }
 
@@ -1420,7 +1180,6 @@ fn cell_at(value: &VectorValue, row: usize) -> Option<Cell<'_>> {
 		VectorValue::Array(array) => array_cell_at(array.as_ref(), row),
 		VectorValue::Bool(mask) => bool_cell_at(mask, row),
 		VectorValue::Scalar(scalar) => Some(scalar_cell(scalar)),
-		VectorValue::Identity(_) | VectorValue::Locality(_) => None,
 	}
 }
 
@@ -1525,8 +1284,6 @@ fn vector_value_type(value: &VectorValue) -> String {
 		VectorValue::Scalar(ScalarLit::Bool(_)) => "bool-scalar".to_owned(),
 		VectorValue::Scalar(ScalarLit::Ts(_)) => "timestamp-scalar".to_owned(),
 		VectorValue::Bool(mask) => format!("bool-array(nulls={})", mask.null_count()),
-		VectorValue::Identity(_) => "identity".to_owned(),
-		VectorValue::Locality(_) => "locality".to_owned(),
 	}
 }
 
@@ -1538,7 +1295,6 @@ fn vector_value_type(value: &VectorValue) -> String {
 fn execute_program_scalar_reference(
 	program: &Program,
 	batch: &RecordBatch,
-	context: Option<ExecutionContext>,
 ) -> std::io::Result<RecordBatch> {
 	validate_program_against_batch(program, batch)?;
 	let started = Instant::now();
@@ -1548,7 +1304,7 @@ fn execute_program_scalar_reference(
 		let n_rows = batch.num_rows();
 		let mut mask = BooleanBuilder::with_capacity(n_rows);
 		for row in 0..n_rows {
-			mask.append_value(eval_row(&program.ops, batch, row, context));
+			mask.append_value(eval_row(&program.ops, batch, row));
 		}
 		let filter: BooleanArray = mask.finish();
 		compute::filter_record_batch(batch, &filter)
@@ -1577,17 +1333,10 @@ enum Value<'a> {
 	/// re-validation on the hot path.
 	Str(&'a [u8]),
 	Ts(i64),
-	Identity(Identity),
-	Locality(Locality),
 }
 
 #[cfg(test)]
-fn eval_row(
-	ops: &[Op],
-	batch: &RecordBatch,
-	row: usize,
-	context: Option<ExecutionContext>,
-) -> bool {
+fn eval_row(ops: &[Op], batch: &RecordBatch, row: usize) -> bool {
 	let mut stack: Vec<Value<'_>> = Vec::with_capacity(STACK_DEPTH_LIMIT);
 	let mut fuel = FUEL_PER_ROW;
 	for op in ops {
@@ -1595,7 +1344,7 @@ fn eval_row(
 			return false;
 		}
 		fuel -= 1;
-		if !exec_op(op, &mut stack, batch, row, context) {
+		if !exec_op(op, &mut stack, batch, row) {
 			return false;
 		}
 		if stack.len() > STACK_DEPTH_LIMIT {
@@ -1606,13 +1355,7 @@ fn eval_row(
 }
 
 #[cfg(test)]
-fn exec_op<'a>(
-	op: &'a Op,
-	stack: &mut Vec<Value<'a>>,
-	batch: &'a RecordBatch,
-	row: usize,
-	context: Option<ExecutionContext>,
-) -> bool {
+fn exec_op<'a>(op: &'a Op, stack: &mut Vec<Value<'a>>, batch: &'a RecordBatch, row: usize) -> bool {
 	match op {
 		Op::PushCol(c) => match read_column(batch, *c as usize, row) {
 			Some(v) => stack.push(v),
@@ -1623,49 +1366,6 @@ fn exec_op<'a>(
 		Op::PushBool(b) => stack.push(Value::Bool(*b)),
 		Op::PushFloat(v) => stack.push(Value::Float(*v)),
 		Op::PushTs(v) => stack.push(Value::Ts(*v)),
-		Op::LoadIdentity => match context {
-			Some(ctx) => stack.push(Value::Identity(ctx.identity)),
-			None => return false,
-		},
-		Op::PushIdentity(v) => stack.push(Value::Identity(*v)),
-		Op::EqIdentity => {
-			let Some(Value::Identity(rhs)) = stack.pop() else {
-				return false;
-			};
-			let Some(Value::Identity(lhs)) = stack.pop() else {
-				return false;
-			};
-			stack.push(Value::Bool(lhs == rhs));
-		}
-		Op::HashRangeIdentity => {
-			let Some(Value::Identity(upper)) = stack.pop() else {
-				return false;
-			};
-			let Some(Value::Identity(lower)) = stack.pop() else {
-				return false;
-			};
-			let Some(Value::Identity(target)) = stack.pop() else {
-				return false;
-			};
-			stack.push(Value::Bool(lower <= target && target <= upper));
-		}
-		Op::RouteByLocality => match context {
-			Some(ctx) => stack.push(Value::Locality(ctx.locality)),
-			None => return false,
-		},
-		Op::PushLocality(v) => stack.push(Value::Locality(*v)),
-		Op::RangeLocality => {
-			let Some(Value::Locality(upper)) = stack.pop() else {
-				return false;
-			};
-			let Some(Value::Locality(lower)) = stack.pop() else {
-				return false;
-			};
-			let Some(Value::Locality(target)) = stack.pop() else {
-				return false;
-			};
-			stack.push(Value::Bool(lower <= target && target <= upper));
-		}
 		Op::Eq | Op::Neq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
 			let Some(b) = stack.pop() else { return false };
 			let Some(a) = stack.pop() else { return false };
@@ -1854,21 +1554,10 @@ fn read_u32(buf: &[u8], i: &mut usize) -> std::io::Result<u32> {
 	))
 }
 
-fn read_u64(buf: &[u8], i: &mut usize) -> std::io::Result<u64> {
-	Ok(u64::from_le_bytes(
-		read_slice(buf, i, 8)?.try_into().unwrap(),
-	))
-}
-
 fn read_i64(buf: &[u8], i: &mut usize) -> std::io::Result<i64> {
 	Ok(i64::from_le_bytes(
 		read_slice(buf, i, 8)?.try_into().unwrap(),
 	))
-}
-
-fn read_identity(buf: &[u8], i: &mut usize) -> std::io::Result<Identity> {
-	let bytes: [u8; 32] = read_slice(buf, i, 32)?.try_into().unwrap();
-	Ok(Identity::new(bytes))
 }
 
 // ============================================================
@@ -1921,14 +1610,6 @@ mod tests {
 					out.push(OP_PUSH_TS);
 					out.extend_from_slice(&value.to_le_bytes());
 				}
-				Instr::PushIdentity(bytes) => {
-					out.push(OP_PUSH_IDENTITY);
-					out.extend_from_slice(bytes);
-				}
-				Instr::PushLocality(locality) => {
-					out.push(OP_PUSH_LOCALITY);
-					out.extend_from_slice(&locality.to_le_bytes());
-				}
 				Instr::Raw(b) => out.push(*b),
 				Instr::InList(n) => {
 					out.push(OP_IN_LIST);
@@ -1954,8 +1635,6 @@ mod tests {
 		PushBool(bool),
 		PushFloat(f64),
 		PushTs(i64),
-		PushIdentity([u8; 32]),
-		PushLocality(u64),
 		Raw(u8),
 		InList(u16),
 		Project(&'a [u32]),
@@ -2059,16 +1738,6 @@ mod tests {
 		.unwrap()
 	}
 
-	fn one_row_batch() -> RecordBatch {
-		let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
-		let ages = Int64Array::from(vec![42_i64]);
-		RecordBatch::try_new(schema, vec![Arc::new(ages)]).unwrap()
-	}
-
-	fn identity(fill: u8) -> Identity {
-		Identity::new([fill; 32])
-	}
-
 	#[derive(Clone, Copy)]
 	enum FuzzBatch {
 		Users,
@@ -2082,14 +1751,11 @@ mod tests {
 		UsersAgeGte18,
 		UsersStatusActive,
 		UsersAgeAndStatusProject,
-		PassAllRows,
-		DropAllRows,
 	}
 
 	struct StructuredFuzzCase {
 		batch: FuzzBatch,
 		bytecode: Vec<u8>,
-		context: Option<ExecutionContext>,
 		reference: Option<StructuredReference>,
 	}
 
@@ -2105,19 +1771,16 @@ mod tests {
 			StructuredFuzzCase {
 				batch: FuzzBatch::Users,
 				bytecode: Vec::new(),
-				context: None,
 				reference: Some(StructuredReference::PassThrough),
 			},
 			StructuredFuzzCase {
 				batch: FuzzBatch::Users,
 				bytecode: assemble(&[Instr::Project(&[0])]),
-				context: None,
 				reference: Some(StructuredReference::UsersProjectName),
 			},
 			StructuredFuzzCase {
 				batch: FuzzBatch::Users,
 				bytecode: assemble(&[Instr::PushCol(1), Instr::PushInt(18), Instr::Raw(OP_GTE)]),
-				context: None,
 				reference: Some(StructuredReference::UsersAgeGte18),
 			},
 			StructuredFuzzCase {
@@ -2127,7 +1790,6 @@ mod tests {
 					Instr::PushStr("active"),
 					Instr::Raw(OP_EQ),
 				]),
-				context: None,
 				reference: Some(StructuredReference::UsersStatusActive),
 			},
 			StructuredFuzzCase {
@@ -2143,120 +1805,21 @@ mod tests {
 					Instr::Raw(OP_AND),
 					Instr::Project(&[0, 1]),
 				]),
-				context: None,
 				reference: Some(StructuredReference::UsersAgeAndStatusProject),
 			},
 			StructuredFuzzCase {
 				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushIdentity(identity(0x22).into_bytes()),
-					Instr::Raw(OP_EQ_IDENTITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x22),
-					locality: Locality::new(9),
-				}),
-				reference: Some(StructuredReference::PassAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushIdentity(identity(0x22).into_bytes()),
-					Instr::Raw(OP_EQ_IDENTITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x77),
-					locality: Locality::new(9),
-				}),
-				reference: Some(StructuredReference::DropAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_ROUTE_BY_LOCALITY),
-					Instr::PushLocality(1),
-					Instr::PushLocality(3),
-					Instr::Raw(OP_RANGE_LOCALITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x55),
-					locality: Locality::new(2),
-				}),
-				reference: Some(StructuredReference::PassAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_ROUTE_BY_LOCALITY),
-					Instr::PushLocality(1),
-					Instr::PushLocality(3),
-					Instr::Raw(OP_RANGE_LOCALITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x55),
-					locality: Locality::new(9),
-				}),
-				reference: Some(StructuredReference::DropAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushIdentity(identity(0x11).into_bytes()),
-					Instr::PushIdentity(identity(0x44).into_bytes()),
-					Instr::Raw(OP_HASH_RANGE_IDENTITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x33),
-					locality: Locality::new(1),
-				}),
-				reference: Some(StructuredReference::PassAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushIdentity(identity(0x11).into_bytes()),
-					Instr::PushIdentity(identity(0x44).into_bytes()),
-					Instr::Raw(OP_HASH_RANGE_IDENTITY),
-				]),
-				context: Some(ExecutionContext {
-					identity: identity(0x77),
-					locality: Locality::new(1),
-				}),
-				reference: Some(StructuredReference::DropAllRows),
-			},
-			StructuredFuzzCase {
-				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushLocality(1),
-					Instr::Raw(OP_EQ_IDENTITY),
-				]),
-				context: None,
+				bytecode: vec![0x40],
 				reference: None,
 			},
 			StructuredFuzzCase {
 				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_ROUTE_BY_LOCALITY),
-					Instr::PushIdentity(identity(0x55).into_bytes()),
-					Instr::Raw(OP_RANGE_LOCALITY),
-				]),
-				context: None,
+				bytecode: vec![0x43],
 				reference: None,
 			},
 			StructuredFuzzCase {
 				batch: FuzzBatch::IdentityLocality,
-				bytecode: assemble(&[
-					Instr::Raw(OP_LOAD_IDENTITY),
-					Instr::PushLocality(1),
-					Instr::PushLocality(2),
-					Instr::Raw(OP_RANGE_LOCALITY),
-				]),
-				context: None,
+				bytecode: vec![0x50],
 				reference: None,
 			},
 		]
@@ -2282,8 +1845,6 @@ mod tests {
 					.project(&[0, 1])
 					.unwrap()
 			}
-			StructuredReference::PassAllRows => batch.clone(),
-			StructuredReference::DropAllRows => batch.slice(0, 0),
 		}
 	}
 
@@ -2396,22 +1957,14 @@ mod tests {
 		}
 	}
 
-	fn assert_scalar_vector_parity(
-		bytecode: &[u8],
-		batch: &RecordBatch,
-		context: Option<ExecutionContext>,
-	) {
+	fn assert_scalar_vector_parity(bytecode: &[u8], batch: &RecordBatch) {
 		let program = Program::compile(bytecode).expect("parity bytecode must compile");
-		assert_program_scalar_vector_parity(&program, batch, context);
+		assert_program_scalar_vector_parity(&program, batch);
 	}
 
-	fn assert_program_scalar_vector_parity(
-		program: &Program,
-		batch: &RecordBatch,
-		context: Option<ExecutionContext>,
-	) {
-		let scalar = execute_program_scalar_reference(program, batch, context);
-		let vector = execute_program_with_context(program, batch, context);
+	fn assert_program_scalar_vector_parity(program: &Program, batch: &RecordBatch) {
+		let scalar = execute_program_scalar_reference(program, batch);
+		let vector = execute_program(program, batch);
 		assert_eq!(
 			scalar.is_ok(),
 			vector.is_ok(),
@@ -2465,15 +2018,6 @@ mod tests {
 		bytecode
 	}
 
-	fn random_execution_context(rng: &mut rand::rngs::StdRng) -> ExecutionContext {
-		let mut bytes = [0_u8; 32];
-		rng.fill_bytes(&mut bytes);
-		ExecutionContext {
-			identity: Identity::new(bytes),
-			locality: Locality::new(rng.next_u64()),
-		}
-	}
-
 	fn assert_pbc_fuzz_surface(sample_count: u64, max_bytecode_bytes: usize) {
 		let structured = structured_fuzz_cases();
 		let mutation_seeds = structured
@@ -2491,11 +2035,10 @@ mod tests {
 					Some(reference) => {
 						let program = Program::compile(&case.bytecode)
 							.expect("structured semantic corpus entry must compile");
-						let actual =
-							execute_program_with_context(&program, &batch, case.context).unwrap();
+						let actual = execute_program(&program, &batch).unwrap();
 						let expected = reference_output(&batch, reference);
 						assert_batches_equivalent(&expected, &actual);
-						assert_program_scalar_vector_parity(&program, &batch, case.context);
+						assert_program_scalar_vector_parity(&program, &batch);
 					}
 					None => {
 						assert!(
@@ -2512,7 +2055,6 @@ mod tests {
 			} else {
 				FuzzBatch::IdentityLocality
 			});
-			let context = random_execution_context(&mut rng);
 			let bytecode = if sample % 2 == 0 {
 				let seed = mutation_seeds[(rng.next_u32() as usize) % mutation_seeds.len()];
 				mutate_bytecode(seed, &mut rng, max_bytecode_bytes)
@@ -2523,9 +2065,9 @@ mod tests {
 				bytecode
 			};
 			if let Ok(program) = Program::compile(&bytecode) {
-				assert_program_scalar_vector_parity(&program, &batch, Some(context));
+				assert_program_scalar_vector_parity(&program, &batch);
 			} else {
-				let _ = execute_with_context(&bytecode, &batch, context);
+				let _ = execute(&bytecode, &batch);
 			}
 		}
 	}
@@ -2533,15 +2075,13 @@ mod tests {
 	fn assert_generated_valid_program_fuzz(sample_count: u64) {
 		let mut rng = rand::rngs::StdRng::seed_from_u64(0x005E_D1FF_C0DE_2026);
 		for _ in 0..sample_count {
-			let (batch, bytecode, context) = generated_valid_case(&mut rng);
-			assert_scalar_vector_parity(&bytecode, &batch, context);
+			let (batch, bytecode) = generated_valid_case(&mut rng);
+			assert_scalar_vector_parity(&bytecode, &batch);
 		}
 	}
 
-	fn generated_valid_case(
-		rng: &mut rand::rngs::StdRng,
-	) -> (RecordBatch, Vec<u8>, Option<ExecutionContext>) {
-		match rng.next_u32() % 12 {
+	fn generated_valid_case(rng: &mut rand::rngs::StdRng) -> (RecordBatch, Vec<u8>) {
+		match rng.next_u32() % 10 {
 			0 => (
 				users_batch(),
 				assemble(&[
@@ -2549,7 +2089,6 @@ mod tests {
 					Instr::PushInt((rng.next_u32() % 40) as i64),
 					Instr::Raw(OP_GTE),
 				]),
-				None,
 			),
 			1 => (
 				users_batch(),
@@ -2560,7 +2099,6 @@ mod tests {
 					Instr::PushStr("missing"),
 					Instr::InList(3),
 				]),
-				None,
 			),
 			2 => (
 				users_batch(),
@@ -2574,7 +2112,6 @@ mod tests {
 					Instr::Raw(OP_OR),
 					Instr::Project(&[0, 1]),
 				]),
-				None,
 			),
 			3 => (
 				analytics_batch(),
@@ -2583,7 +2120,6 @@ mod tests {
 					Instr::PushInt(rng.next_u32() as i64 - i32::MAX as i64),
 					Instr::Raw(OP_LT),
 				]),
-				None,
 			),
 			4 => (
 				analytics_batch(),
@@ -2592,7 +2128,6 @@ mod tests {
 					Instr::PushFloat((rng.next_u32() % 12) as f64 - 2.0),
 					Instr::Raw(OP_GTE),
 				]),
-				None,
 			),
 			5 => (
 				analytics_batch(),
@@ -2601,7 +2136,6 @@ mod tests {
 					Instr::PushFloat((rng.next_u32() % 8) as f64),
 					Instr::Raw(OP_LTE),
 				]),
-				None,
 			),
 			6 => (
 				analytics_batch(),
@@ -2610,7 +2144,6 @@ mod tests {
 					Instr::PushTs((rng.next_u32() % 4_000) as i64),
 					Instr::Raw(OP_GTE),
 				]),
-				None,
 			),
 			7 => (
 				analytics_batch(),
@@ -2623,7 +2156,6 @@ mod tests {
 					}),
 					Instr::Raw(OP_EQ),
 				]),
-				None,
 			),
 			8 => (
 				analytics_batch(),
@@ -2633,38 +2165,6 @@ mod tests {
 					Instr::Raw(OP_EQ),
 					Instr::Raw(OP_NOT),
 				]),
-				None,
-			),
-			9 => {
-				let ctx = ExecutionContext {
-					identity: identity(0x22),
-					locality: Locality::new(2),
-				};
-				(
-					identity_locality_batch(),
-					assemble(&[
-						Instr::Raw(OP_LOAD_IDENTITY),
-						Instr::PushIdentity(
-							identity(if rng.next_u32() % 2 == 0 { 0x22 } else { 0x33 })
-								.into_bytes(),
-						),
-						Instr::Raw(OP_EQ_IDENTITY),
-					]),
-					Some(ctx),
-				)
-			}
-			10 => (
-				identity_locality_batch(),
-				assemble(&[
-					Instr::Raw(OP_ROUTE_BY_LOCALITY),
-					Instr::PushLocality(1),
-					Instr::PushLocality(3),
-					Instr::Raw(OP_RANGE_LOCALITY),
-				]),
-				Some(ExecutionContext {
-					identity: identity(0x11),
-					locality: Locality::new(rng.next_u64() % 5),
-				}),
 			),
 			_ => (
 				analytics_batch(),
@@ -2673,7 +2173,6 @@ mod tests {
 					Instr::PushFloat(f64::NAN),
 					Instr::Raw(OP_EQ),
 				]),
-				None,
 			),
 		}
 	}
@@ -2814,91 +2313,14 @@ mod tests {
 	}
 
 	#[test]
-	fn typed_identity_equality_matches_execution_context() {
-		let bytecode = assemble(&[
-			Instr::Raw(OP_LOAD_IDENTITY),
-			Instr::PushIdentity(identity(0x22).into_bytes()),
-			Instr::Raw(OP_EQ_IDENTITY),
-		]);
-		let out = execute_with_context(
-			&bytecode,
-			&one_row_batch(),
-			ExecutionContext {
-				identity: identity(0x22),
-				locality: Locality::new(9),
-			},
-		)
-		.unwrap();
-		assert_eq!(out.num_rows(), 1);
-	}
-
-	#[test]
-	fn typed_locality_range_matches_execution_context() {
-		let bytecode = assemble(&[
-			Instr::Raw(OP_ROUTE_BY_LOCALITY),
-			Instr::PushLocality(10),
-			Instr::PushLocality(20),
-			Instr::Raw(OP_RANGE_LOCALITY),
-		]);
-		let out = execute_with_context(
-			&bytecode,
-			&one_row_batch(),
-			ExecutionContext {
-				identity: identity(0x55),
-				locality: Locality::new(15),
-			},
-		)
-		.unwrap();
-		assert_eq!(out.num_rows(), 1);
-	}
-
-	#[test]
-	fn typed_identity_range_is_lexicographic_and_inclusive() {
-		let target = identity(0x33);
-		let bytecode = assemble(&[
-			Instr::Raw(OP_LOAD_IDENTITY),
-			Instr::PushIdentity(identity(0x11).into_bytes()),
-			Instr::PushIdentity(identity(0x44).into_bytes()),
-			Instr::Raw(OP_HASH_RANGE_IDENTITY),
-		]);
-		let out = execute_with_context(
-			&bytecode,
-			&one_row_batch(),
-			ExecutionContext {
-				identity: target,
-				locality: Locality::from(target),
-			},
-		)
-		.unwrap();
-		assert_eq!(out.num_rows(), 1);
-	}
-
-	#[test]
-	fn mixing_identity_and_locality_families_is_a_compile_error() {
-		let invalid = assemble(&[
-			Instr::Raw(OP_LOAD_IDENTITY),
-			Instr::PushLocality(1),
-			Instr::PushLocality(2),
-			Instr::Raw(OP_RANGE_LOCALITY),
-		]);
-		assert!(Program::compile(&invalid).is_err());
-
-		let invalid_generic = assemble(&[
-			Instr::Raw(OP_ROUTE_BY_LOCALITY),
-			Instr::Raw(OP_LOAD_IDENTITY),
-			Instr::Raw(OP_EQ),
-		]);
-		assert!(Program::compile(&invalid_generic).is_err());
-	}
-
-	#[test]
-	fn null_checks_reject_typed_identity_and_locality_families() {
-		let invalid_identity = assemble(&[Instr::Raw(OP_LOAD_IDENTITY), Instr::Raw(OP_IS_NULL)]);
-		assert!(Program::compile(&invalid_identity).is_err());
-
-		let invalid_locality =
-			assemble(&[Instr::Raw(OP_ROUTE_BY_LOCALITY), Instr::Raw(OP_IS_NOT_NULL)]);
-		assert!(Program::compile(&invalid_locality).is_err());
+	fn storage_metadata_scalar_opcode_family_is_unknown() {
+		for opcode in [0x40_u8, 0x41, 0x42, 0x43, 0x50, 0x51, 0x52] {
+			let err = Program::compile(&[opcode]).unwrap_err();
+			assert!(
+				err.to_string().contains("unknown opcode"),
+				"old storage metadata scalar opcode 0x{opcode:02x} must not compile"
+			);
+		}
 	}
 
 	#[test]
@@ -2906,33 +2328,16 @@ mod tests {
 		let identity_program = assemble(&[Instr::PushCol(0), Instr::Raw(OP_IS_NOT_NULL)]);
 		let err = execute(&identity_program, &identity_locality_batch()).unwrap_err();
 		assert!(
-			err.to_string().contains("LOAD_IDENTITY"),
-			"identity columns should direct callers to typed context opcodes"
+			err.to_string().contains("FixedSizeBinary"),
+			"storage identity-shaped columns are not part of the PBC surface"
 		);
 
 		let locality_program = assemble(&[Instr::PushCol(1), Instr::Raw(OP_IS_NOT_NULL)]);
 		let err = execute(&locality_program, &identity_locality_batch()).unwrap_err();
 		assert!(
-			err.to_string().contains("ROUTE_BY_LOCALITY"),
-			"locality columns should direct callers to typed context opcodes"
+			err.to_string().contains("UInt64"),
+			"storage locality-shaped columns are not part of the PBC surface"
 		);
-	}
-
-	#[test]
-	fn cross_family_bad_corpus_entries_are_rejected() {
-		let invalid_identity_compare = assemble(&[
-			Instr::Raw(OP_LOAD_IDENTITY),
-			Instr::PushLocality(1),
-			Instr::Raw(OP_EQ_IDENTITY),
-		]);
-		assert!(Program::compile(&invalid_identity_compare).is_err());
-
-		let invalid_locality_range = assemble(&[
-			Instr::Raw(OP_ROUTE_BY_LOCALITY),
-			Instr::PushIdentity(identity(0x55).into_bytes()),
-			Instr::Raw(OP_RANGE_LOCALITY),
-		]);
-		assert!(Program::compile(&invalid_locality_range).is_err());
 	}
 
 	#[test]
@@ -2942,7 +2347,7 @@ mod tests {
 				continue;
 			}
 			let batch = batch_for_fuzz_fixture(case.batch);
-			assert_scalar_vector_parity(&case.bytecode, &batch, case.context);
+			assert_scalar_vector_parity(&case.bytecode, &batch);
 		}
 	}
 
@@ -2955,7 +2360,7 @@ mod tests {
 	fn float_nan_comparison_drops_nan_row_without_total_ordering() {
 		let bytecode = assemble(&[Instr::PushCol(1), Instr::PushFloat(0.0), Instr::Raw(OP_GT)]);
 		let batch = analytics_batch();
-		assert_scalar_vector_parity(&bytecode, &batch, None);
+		assert_scalar_vector_parity(&bytecode, &batch);
 		let out = execute(&bytecode, &batch).unwrap();
 		assert_eq!(out.num_rows(), 2);
 	}
@@ -2964,7 +2369,7 @@ mod tests {
 	fn timestamp_int_cross_type_comparison_matches_scalar_semantics() {
 		let bytecode = assemble(&[Instr::PushCol(3), Instr::PushInt(1_000), Instr::Raw(OP_GTE)]);
 		let batch = analytics_batch();
-		assert_scalar_vector_parity(&bytecode, &batch, None);
+		assert_scalar_vector_parity(&bytecode, &batch);
 		let out = execute(&bytecode, &batch).unwrap();
 		assert_eq!(out.num_rows(), 3);
 	}
@@ -2973,7 +2378,7 @@ mod tests {
 	fn int_float_cross_type_comparison_matches_scalar_semantics() {
 		let bytecode = assemble(&[Instr::PushCol(0), Instr::PushFloat(0.5), Instr::Raw(OP_GT)]);
 		let batch = analytics_batch();
-		assert_scalar_vector_parity(&bytecode, &batch, None);
+		assert_scalar_vector_parity(&bytecode, &batch);
 		let out = execute(&bytecode, &batch).unwrap();
 		assert_eq!(out.num_rows(), 3);
 	}
@@ -2987,7 +2392,7 @@ mod tests {
 			Instr::Raw(OP_IS_NULL),
 		]);
 		let batch = users_batch();
-		assert_scalar_vector_parity(&bytecode, &batch, None);
+		assert_scalar_vector_parity(&bytecode, &batch);
 		let out = execute(&bytecode, &batch).unwrap();
 		assert_eq!(out.num_rows(), 1);
 	}
@@ -3015,7 +2420,7 @@ mod tests {
 			Instr::Project(&[0]),
 		]);
 		let batch = users_batch().slice(0, 0);
-		assert_scalar_vector_parity(&bytecode, &batch, None);
+		assert_scalar_vector_parity(&bytecode, &batch);
 		let out = execute(&bytecode, &batch).unwrap();
 		assert_eq!(out.num_rows(), 0);
 		assert_eq!(out.num_columns(), 1);

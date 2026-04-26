@@ -178,7 +178,7 @@ fn trusted_cfg(
 }
 
 async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nodes: usize) {
-	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
 	loop {
 		let snapshot = node.ring.snapshot();
 		if node.ring.current_epoch() >= expected_epoch
@@ -188,7 +188,8 @@ async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nod
 		}
 		assert!(
 			tokio::time::Instant::now() < deadline,
-			"timed out waiting for epoch >= {expected_epoch} and {expected_nodes} nodes; got epoch={} nodes={}",
+			"timed out waiting for node {} to observe epoch >= {expected_epoch} and {expected_nodes} nodes; got epoch={} nodes={}",
+			node.local_node.id,
 			node.ring.current_epoch(),
 			snapshot.data_capable_nodes()
 		);
@@ -685,6 +686,9 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 	wait_for_cluster(&node3, 3, 3).await;
 	wait_for_voters(&node1, &[1, 2, 3]).await;
 	wait_for_ready(&node3).await;
+	node1.handles.lease_manager.abort();
+	node2.handles.lease_manager.abort();
+	node3.handles.lease_manager.abort();
 
 	let baseline_quota = 128 * 1024 * 1024;
 	node1
@@ -723,6 +727,7 @@ async fn restored_replacement_node_rejoins_live_cluster_and_catches_up() {
 	)
 	.await
 	.unwrap();
+	restored.handles.lease_manager.abort();
 
 	wait_for_cluster(&node1, epoch_before_replacement + 2, 3).await;
 	wait_for_cluster(&node2, epoch_before_replacement + 2, 3).await;

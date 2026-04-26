@@ -1,5 +1,6 @@
 use crate::schema::{
-	HybridTimestamp, Identity, Locality, SlabId, TenantId, TenantKekId, TombstoneMetadata,
+	HybridTimestamp, Identity, Locality, RecordRowIndex, SlabId, SupersessionMetadata, TenantId,
+	TenantKekId, TombstoneMetadata,
 };
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
@@ -15,7 +16,7 @@ const RECORDS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("slab_
 /// `is_encrypted` byte. Read-only; one-shot migrated into V2 the
 /// first time a process opens an index that still has V1 rows.
 const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v1");
-/// V2 layout: `payload_hash[32] || flags_byte || [optional metadata] ||
+/// V2 layout: `payload_hash[32] || flags_byte || flags2_byte || [optional metadata] ||
 /// l2_uri_utf8`.
 ///
 /// Flags:
@@ -28,17 +29,20 @@ const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// - bit 6 = earliest tombstone HLC present (16 LE bytes)
 /// - bit 7 = tombstone metadata is tracked
 ///
-/// Older rows only use bit 0 and therefore decode cleanly with
-/// missing tenant / tenant-KEK metadata.
+/// Flags2:
+/// - bit 0 = earliest supersession HLC present (16 LE bytes)
+/// - bit 1 = supersession metadata is tracked
+///
 const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v2");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 
 const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
 const RECORD_VALUE_LEN_V1: usize = 4;
-const RECORD_VALUE_LEN: usize = 4 + 8;
+const RECORD_VALUE_LEN_V2: usize = 4 + 8;
+const RECORD_VALUE_LEN: usize = 4 + 8 + 4;
 const TIERED_POINTER_HASH_LEN: usize = 32;
-const TIERED_POINTER_FLAGS_LEN: usize = 1;
+const TIERED_POINTER_FLAGS_LEN: usize = 2;
 const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
 const TIERED_FLAG_IS_ENCRYPTED: u8 = 0b0000_0001;
 const TIERED_FLAG_HAS_TENANT_ID: u8 = 0b0000_0010;
@@ -56,6 +60,10 @@ const TIERED_FLAG_KNOWN_MASK: u8 = TIERED_FLAG_IS_ENCRYPTED
 	| TIERED_FLAG_HAS_STATS_BLOCK_HASH128
 	| TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC
 	| TIERED_FLAG_TOMBSTONE_METADATA_TRACKED;
+const TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC: u8 = 0b0000_0001;
+const TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED: u8 = 0b0000_0010;
+const TIERED_FLAG2_KNOWN_MASK: u8 =
+	TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC | TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -365,7 +373,8 @@ fn encode_record_key(row: PersistentRecordRow) -> [u8; RECORD_KEY_LEN] {
 fn encode_record_value(row: PersistentRecordRow) -> [u8; RECORD_VALUE_LEN] {
 	let mut bytes = [0u8; RECORD_VALUE_LEN];
 	bytes[..4].copy_from_slice(&row.location.length.to_le_bytes());
-	bytes[4..].copy_from_slice(&row.routing_locality.get().to_le_bytes());
+	bytes[4..12].copy_from_slice(&row.routing_locality.get().to_le_bytes());
+	bytes[12..16].copy_from_slice(&row.location.record_row_index.get().to_le_bytes());
 	bytes
 }
 
@@ -379,11 +388,14 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 			),
 		));
 	}
-	if value.len() != RECORD_VALUE_LEN && value.len() != RECORD_VALUE_LEN_V1 {
+	if value.len() != RECORD_VALUE_LEN
+		&& value.len() != RECORD_VALUE_LEN_V2
+		&& value.len() != RECORD_VALUE_LEN_V1
+	{
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1} or {RECORD_VALUE_LEN}, got {}",
+				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1}, {RECORD_VALUE_LEN_V2}, or {RECORD_VALUE_LEN}, got {}",
 				value.len()
 			),
 		));
@@ -398,12 +410,19 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 	let slab_id = read_u64(key, &mut cursor)?;
 	let offset = read_u64(key, &mut cursor)?;
 	let length = u32::from_le_bytes(value[..4].try_into().expect("validated above"));
-	let routing_locality = if value.len() == RECORD_VALUE_LEN {
+	let routing_locality = if value.len() >= RECORD_VALUE_LEN_V2 {
 		Locality::new(u64::from_le_bytes(
 			value[4..12].try_into().expect("validated above"),
 		))
 	} else {
 		Locality::from(key_identity)
+	};
+	let record_row_index = if value.len() == RECORD_VALUE_LEN {
+		RecordRowIndex::new(u32::from_le_bytes(
+			value[12..16].try_into().expect("validated above"),
+		))
+	} else {
+		RecordRowIndex::ZERO
 	};
 
 	Ok(PersistentRecordRow {
@@ -419,6 +438,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 				logical,
 				node_id,
 			},
+			record_row_index,
 		},
 	})
 }
@@ -427,6 +447,7 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(TIERED_POINTER_PREFIX_LEN + pointer.l2_uri.len());
 	bytes.extend_from_slice(&pointer.payload_hash);
 	let mut flags = 0u8;
+	let mut flags2 = 0u8;
 	if pointer.is_encrypted {
 		flags |= TIERED_FLAG_IS_ENCRYPTED;
 	}
@@ -454,7 +475,18 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 			flags |= TIERED_FLAG_TOMBSTONE_METADATA_TRACKED | TIERED_FLAG_HAS_FIRST_TOMBSTONE_HLC;
 		}
 	}
+	match pointer.supersession_metadata {
+		SupersessionMetadata::Untracked => {}
+		SupersessionMetadata::None => {
+			flags2 |= TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED;
+		}
+		SupersessionMetadata::Earliest(_) => {
+			flags2 |= TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED
+				| TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC;
+		}
+	}
 	bytes.push(flags);
+	bytes.push(flags2);
 	if let Some(tenant_id) = pointer.tenant_id {
 		bytes.extend_from_slice(&tenant_id.get().to_le_bytes());
 	}
@@ -475,6 +507,11 @@ fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 		bytes.extend_from_slice(&tombstone_metadata.logical.to_le_bytes());
 		bytes.extend_from_slice(&tombstone_metadata.node_id.to_le_bytes());
 	}
+	if let SupersessionMetadata::Earliest(supersession_metadata) = pointer.supersession_metadata {
+		bytes.extend_from_slice(&supersession_metadata.physical_ms.to_le_bytes());
+		bytes.extend_from_slice(&supersession_metadata.logical.to_le_bytes());
+		bytes.extend_from_slice(&supersession_metadata.node_id.to_le_bytes());
+	}
 	bytes.extend_from_slice(pointer.l2_uri.as_bytes());
 	bytes
 }
@@ -492,10 +529,17 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	let mut payload_hash = [0u8; TIERED_POINTER_HASH_LEN];
 	payload_hash.copy_from_slice(&value[..TIERED_POINTER_HASH_LEN]);
 	let flags = value[TIERED_POINTER_HASH_LEN];
+	let flags2 = value[TIERED_POINTER_HASH_LEN + 1];
 	if flags & !TIERED_FLAG_KNOWN_MASK != 0 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!("tiered slab value has unknown flags 0x{flags:02x}"),
+		));
+	}
+	if flags2 & !TIERED_FLAG2_KNOWN_MASK != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("tiered slab value has unknown flags2 0x{flags2:02x}"),
 		));
 	}
 	let is_encrypted = (flags & TIERED_FLAG_IS_ENCRYPTED) != 0;
@@ -596,6 +640,25 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 	} else {
 		TombstoneMetadata::Untracked
 	};
+	let supersession_metadata = if (flags2 & TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC) != 0 {
+		let end = cursor.saturating_add(16);
+		let slot = value.get(cursor..end).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tiered slab value truncated while decoding supersession_metadata",
+			)
+		})?;
+		cursor = end;
+		SupersessionMetadata::Earliest(HybridTimestamp {
+			physical_ms: u64::from_le_bytes(slot[0..8].try_into().expect("fixed width")),
+			logical: u32::from_le_bytes(slot[8..12].try_into().expect("fixed width")),
+			node_id: u32::from_le_bytes(slot[12..16].try_into().expect("fixed width")),
+		})
+	} else if (flags2 & TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED) != 0 {
+		SupersessionMetadata::None
+	} else {
+		SupersessionMetadata::Untracked
+	};
 	let l2_uri = std::str::from_utf8(&value[cursor..])
 		.map_err(|err| {
 			Error::new(
@@ -615,6 +678,7 @@ fn decode_tiered_pointer(slab_id: SlabId, value: &[u8]) -> std::io::Result<Tiere
 		stats_block_len,
 		stats_block_hash128,
 		tombstone_metadata,
+		supersession_metadata,
 	})
 }
 
@@ -655,6 +719,7 @@ fn decode_tiered_pointer_v1(slab_id: SlabId, value: &[u8]) -> std::io::Result<Ti
 		stats_block_len: None,
 		stats_block_hash128: None,
 		tombstone_metadata: TombstoneMetadata::Untracked,
+		supersession_metadata: SupersessionMetadata::Untracked,
 	})
 }
 
@@ -715,6 +780,7 @@ mod tests {
 				slab_id: SlabId::new(9),
 				offset: 128,
 				length: 4096,
+				record_row_index: RecordRowIndex::new(7),
 				hlc: HybridTimestamp {
 					physical_ms: 55,
 					logical: 3,
@@ -734,6 +800,20 @@ mod tests {
 	}
 
 	#[test]
+	fn record_row_value_encoding_matches_row_index_golden_bytes() {
+		let value = encode_record_value(row());
+		assert_eq!(value.len(), RECORD_VALUE_LEN);
+		assert_eq!(
+			value,
+			[
+				0x00, 0x10, 0x00, 0x00, // length = 4096
+				0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // locality = 0x8877
+				0x07, 0x00, 0x00, 0x00, // record_row_index = 7
+			]
+		);
+	}
+
+	#[test]
 	fn tiered_pointer_roundtrip_preserves_every_field() {
 		let pointer = TieredSlabPointer {
 			slab_id: SlabId::new(3),
@@ -749,6 +829,11 @@ mod tests {
 				physical_ms: 99,
 				logical: 1,
 				node_id: 2,
+			}),
+			supersession_metadata: SupersessionMetadata::Earliest(HybridTimestamp {
+				physical_ms: 199,
+				logical: 2,
+				node_id: 3,
 			}),
 		};
 		let encoded = encode_tiered_pointer(&pointer);
@@ -772,6 +857,23 @@ mod tests {
 				decode_tiered_pointer(pointer.slab_id, &encode_tiered_pointer(&pointer)).unwrap();
 			assert_eq!(decoded.tombstone_metadata, tombstone_metadata);
 		}
+		for supersession_metadata in [
+			SupersessionMetadata::Untracked,
+			SupersessionMetadata::None,
+			SupersessionMetadata::Earliest(HybridTimestamp {
+				physical_ms: 200,
+				logical: 3,
+				node_id: 4,
+			}),
+		] {
+			let pointer = TieredSlabPointer {
+				supersession_metadata,
+				..pointer.clone()
+			};
+			let decoded =
+				decode_tiered_pointer(pointer.slab_id, &encode_tiered_pointer(&pointer)).unwrap();
+			assert_eq!(decoded.supersession_metadata, supersession_metadata);
+		}
 	}
 
 	#[test]
@@ -787,6 +889,10 @@ mod tests {
 		assert_eq!(decoded.stats_block_len, None);
 		assert_eq!(decoded.stats_block_hash128, None);
 		assert_eq!(decoded.tombstone_metadata, TombstoneMetadata::Untracked);
+		assert_eq!(
+			decoded.supersession_metadata,
+			SupersessionMetadata::Untracked
+		);
 	}
 
 	#[tokio::test]
@@ -805,6 +911,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		let local_row = PersistentRecordRow {
 			location: RecordLocation {
@@ -854,6 +961,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 
 		index

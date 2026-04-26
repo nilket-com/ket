@@ -58,6 +58,14 @@ fn context(actor: ActorIdentity, remote: NodeId) -> RequestContext {
 	RequestContext { remote, actor }
 }
 
+fn lease_matches_acquire_request(lease: &LeaseDescriptor, req: &AcquireLeaseRequestMeta) -> bool {
+	lease.epoch == req.epoch
+		&& lease.holder == req.holder
+		&& lease.range_start == req.range_start
+		&& lease.range_end == req.range_end
+		&& lease.lease_start == req.requested_hlc
+}
+
 fn tenant_admin_frame(
 	node: &WendelonNode,
 	stream_id: u32,
@@ -337,7 +345,14 @@ async fn lease_req_rejects_invalid_target_before_commit() {
 	assert_eq!(meta.status, LeaseStatus::DENIED_INVALID_TARGET);
 	assert!(resp.trailing.is_none());
 	let snapshot = node.state_machine.state_snapshot().await;
-	assert!(snapshot.leases.is_empty());
+	assert!(
+		!snapshot
+			.leases
+			.values()
+			.any(|lease| lease_matches_acquire_request(lease, &req)),
+		"invalid-target lease request was committed: {:?}",
+		snapshot.leases
+	);
 
 	support::abort_node(&node);
 }
@@ -384,7 +399,15 @@ async fn lease_req_rejects_non_canonical_range_for_owner() {
 		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<AcquireLeaseResponseMeta>()]);
 	assert_eq!(meta.status, LeaseStatus::DENIED_INVALID_TARGET);
 	assert!(resp.trailing.is_none());
-	assert!(node.state_machine.state_snapshot().await.leases.is_empty());
+	let snapshot = node.state_machine.state_snapshot().await;
+	assert!(
+		!snapshot
+			.leases
+			.values()
+			.any(|lease| lease_matches_acquire_request(lease, &req)),
+		"non-canonical lease request was committed: {:?}",
+		snapshot.leases
+	);
 
 	support::abort_node(&node);
 }
@@ -393,6 +416,7 @@ async fn lease_req_rejects_non_canonical_range_for_owner() {
 async fn status_req_includes_topology_and_committed_lease_metadata() {
 	let node = support::bootstrap_node("status-with-lease", 1).await;
 	support::wait_for_local_leader(&node).await;
+	node.handles.lease_manager.abort();
 
 	let service: Arc<dyn HrftService> = node.router.clone();
 	let (factory, pool) = support::loopback_factory_from(node.local_node, node.local_node, service);

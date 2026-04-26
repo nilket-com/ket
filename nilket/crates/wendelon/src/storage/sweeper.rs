@@ -73,6 +73,8 @@ use crate::consensus::{
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
+#[cfg(test)]
+use crate::schema::SupersessionMetadata;
 use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
@@ -145,6 +147,7 @@ impl Default for SweeperConfig {
 }
 
 const RETENTION_TIERED_REWRITE_MAX_PER_PASS: usize = 1;
+const SUPERSESSION_METADATA_BACKFILL_MAX_PER_PASS: usize = 64;
 
 /// The sweeper task and everything it needs to do its job.
 ///
@@ -307,6 +310,12 @@ impl SlabSweeper {
 		let mut report = SweepReport::default();
 		let reconcile = self.reconcile_tiered_runtime_state_once().await?;
 		report.failed += reconcile.failed;
+		let supersession_backfill = self
+			.backfill_supersession_metadata_once(SUPERSESSION_METADATA_BACKFILL_MAX_PER_PASS)
+			.await?;
+		report.supersession_metadata_backfilled_tiered = supersession_backfill.backfilled;
+		report.supersession_metadata_backfill_failures = supersession_backfill.failed;
+		report.failed += supersession_backfill.failed;
 		let candidates = self.slab.list_sealed_slabs().await;
 		for candidate in candidates {
 			if candidate.size_bytes < self.config.min_slab_bytes {
@@ -450,6 +459,7 @@ impl SlabSweeper {
 			stats_block_len,
 			stats_block_hash128,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: self.slab.slab_supersession_metadata(info.slab_id),
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
@@ -592,6 +602,7 @@ impl SlabSweeper {
 			stats_block_len,
 			stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -699,6 +710,7 @@ impl SlabSweeper {
 				stats_block_len,
 				stats_block_hash128,
 				tombstone_metadata: pointer.tombstone_metadata,
+				supersession_metadata: pointer.supersession_metadata,
 			};
 			if let Err(error) = self.raft.commit_tier_slab(tier).await {
 				return Err(error);
@@ -753,6 +765,7 @@ impl SlabSweeper {
 			stats_block_len,
 			stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -868,6 +881,7 @@ impl SlabSweeper {
 				encrypted_bytes,
 				payload_hash,
 				tombstone_metadata,
+				supersession_metadata,
 				pruned_versions,
 				reclaimed_bytes,
 			} => {
@@ -914,6 +928,7 @@ impl SlabSweeper {
 					stats_block_len,
 					stats_block_hash128,
 					tombstone_metadata,
+					supersession_metadata,
 				};
 				if let Err(error) = self.raft.commit_tier_slab(tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
@@ -1106,6 +1121,7 @@ impl SlabSweeper {
 			stats_block_len: t.stats_block_len,
 			stats_block_hash128: t.stats_block_hash128,
 			tombstone_metadata: t.tombstone_metadata,
+			supersession_metadata: t.supersession_metadata,
 		})
 	}
 
@@ -1125,6 +1141,7 @@ impl SlabSweeper {
 				stats_block_len: tier.stats_block_len,
 				stats_block_hash128: tier.stats_block_hash128,
 				tombstone_metadata: tier.tombstone_metadata,
+				supersession_metadata: tier.supersession_metadata,
 			})
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
@@ -1260,6 +1277,79 @@ impl SlabSweeper {
 		Ok(report)
 	}
 
+	async fn backfill_supersession_metadata_once(
+		&self,
+		max_slabs: usize,
+	) -> std::io::Result<SupersessionMetadataBackfillReport> {
+		let mut report = SupersessionMetadataBackfillReport::default();
+		if max_slabs == 0 {
+			return Ok(report);
+		}
+		let mut attempted = 0;
+		for pointer in self.slab.list_tiered_slabs().await {
+			if !pointer.supersession_metadata.is_untracked() {
+				continue;
+			}
+			if attempted >= max_slabs {
+				break;
+			}
+			attempted += 1;
+			match self
+				.backfill_one_supersession_metadata_pointer(&pointer)
+				.await
+			{
+				Ok(changed) => {
+					if changed {
+						report.backfilled += 1;
+					}
+				}
+				Err(error) => {
+					report.failed += 1;
+					tracing::warn!(
+						slab_id = pointer.slab_id.get(),
+						l2_uri = %pointer.l2_uri,
+						error = %error,
+						"tiered supersession metadata backfill failed; will retry on next scan"
+					);
+				}
+			}
+		}
+		Ok(report)
+	}
+
+	async fn backfill_one_supersession_metadata_pointer(
+		&self,
+		pointer: &TieredSlabPointer,
+	) -> std::io::Result<bool> {
+		if !pointer.supersession_metadata.is_untracked() {
+			return Ok(false);
+		}
+		let supersession_metadata = self.slab.slab_supersession_metadata(pointer.slab_id);
+		let tier = TieredSlab {
+			slab_id: pointer.slab_id,
+			l2_uri: pointer.l2_uri.clone(),
+			payload_hash: pointer.payload_hash,
+			is_encrypted: pointer.is_encrypted,
+			tenant_id: pointer.tenant_id,
+			tenant_kek_id: pointer.tenant_kek_id,
+			stats_format_version: pointer.stats_format_version,
+			stats_block_len: pointer.stats_block_len,
+			stats_block_hash128: pointer.stats_block_hash128,
+			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata,
+		};
+		self.raft.commit_tier_slab(tier).await?;
+		if let Some(pointer) = self.sm_tier_pointer(pointer.slab_id).await {
+			self.slab.apply_tier_slab(pointer).await?;
+		}
+		tracing::info!(
+			slab_id = pointer.slab_id.get(),
+			supersession_metadata = ?supersession_metadata,
+			"backfilled tiered supersession metadata"
+		);
+		Ok(true)
+	}
+
 	async fn reclaim_tombstoned_ranges_once(
 		&self,
 		max_slabs: usize,
@@ -1372,6 +1462,8 @@ pub struct SweepReport {
 	pub retention_pruned_versions: usize,
 	pub retention_reclaimed_bytes: u64,
 	pub retention_rewrite_failures: usize,
+	pub supersession_metadata_backfilled_tiered: usize,
+	pub supersession_metadata_backfill_failures: usize,
 	pub skipped_rehydration_guard: usize,
 	pub rehydrated_reclaimed: usize,
 	pub reclaimed_slabs: usize,
@@ -1396,6 +1488,12 @@ struct TenantKekRewrapReport {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct TieredStateReconcileReport {
 	reconciled: usize,
+	failed: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SupersessionMetadataBackfillReport {
+	backfilled: usize,
 	failed: usize,
 }
 
@@ -1472,6 +1570,7 @@ impl TierObserver for ManagerTierObserver {
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
 					tombstone_metadata: tier.tombstone_metadata,
+					supersession_metadata: tier.supersession_metadata,
 				},
 				Some(applied_log_index),
 			)
@@ -1623,6 +1722,7 @@ mod tests {
 			stats_block_len: pointer.stats_block_len,
 			stats_block_hash128: pointer.stats_block_hash128,
 			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: pointer.supersession_metadata,
 		})
 		.await;
 	}
@@ -1875,6 +1975,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
@@ -1908,6 +2009,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
@@ -2128,6 +2230,7 @@ mod tests {
 			stats_block_len: None,
 			stats_block_hash128: None,
 			tombstone_metadata: current_pointer.tombstone_metadata,
+			supersession_metadata: current_pointer.supersession_metadata,
 		};
 		manager
 			.apply_tier_slab(metadata_missing_pointer.clone())
@@ -2154,6 +2257,124 @@ mod tests {
 		assert_eq!(third.rewrapped_tiered_deks, 0);
 		assert_eq!(third.backfilled_tenant_kek_metadata_tiered, 0);
 		assert!(third.skipped_current_tenant_kek_tiered >= 1);
+	}
+
+	#[tokio::test]
+	async fn sweeper_backfills_untracked_supersession_metadata() {
+		use crate::storage::core::StorageEngine;
+
+		let l1_dir = fresh_dir("supersession-backfill-l1");
+		let l2_root = fresh_dir("supersession-backfill-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let key = id(0x4242);
+		let old_hlc = hlc_at(10);
+		let superseding_hlc = hlc_at(20);
+		let old_loc = manager
+			.append_durable(tenant(), key, old_hlc, b"old")
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		assert_eq!(old_loc.slab_id, sealed_id);
+		let raw = manager.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = manager.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let old_uri = l2
+			.put(&format!("tier/slab_{sealed_id:016x}.wnd"), &encrypted.bytes)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(
+				manager
+					.encrypted_tiered_footer_summary(&encrypted.bytes)
+					.unwrap()
+					.unwrap()
+					.tenant_kek_id,
+			),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::Untracked,
+		};
+		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
+		manager
+			.append_durable(tenant(), key, superseding_hlc, b"new")
+			.await
+			.unwrap();
+		assert_eq!(
+			manager
+				.tier_pointer(sealed_id)
+				.await
+				.unwrap()
+				.supersession_metadata,
+			SupersessionMetadata::Untracked
+		);
+
+		let sm = WendelonStateMachine::new();
+		seed_state_machine_pointer(&sm, &old_pointer).await;
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm,
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		);
+
+		let report = sweeper.sweep_once().await.unwrap();
+
+		assert_eq!(report.supersession_metadata_backfilled_tiered, 1);
+		assert_eq!(report.supersession_metadata_backfill_failures, 0);
+		assert_eq!(
+			manager
+				.tier_pointer(sealed_id)
+				.await
+				.unwrap()
+				.supersession_metadata,
+			SupersessionMetadata::Earliest(superseding_hlc)
+		);
+		assert_eq!(manager.read(old_loc).await.unwrap(), b"old");
+		assert_eq!(
+			manager
+				.read(manager.lookup(tenant(), key).expect("latest row"))
+				.await
+				.unwrap(),
+			b"new"
+		);
 	}
 
 	#[tokio::test]
@@ -2232,6 +2453,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2361,6 +2583,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		manager
@@ -2512,6 +2735,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2636,6 +2860,7 @@ mod tests {
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
 			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2775,6 +3000,7 @@ mod tests {
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
 				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
 			})
 			.await
 			.unwrap();
