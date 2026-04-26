@@ -18,6 +18,10 @@ fn slab_stats_pruning_only() -> NodeCapabilitySet {
 	NodeCapabilitySet::empty().with(NodeCapability::SlabStatsPruning)
 }
 
+fn aggregate_pushdown_only() -> NodeCapabilitySet {
+	NodeCapabilitySet::empty().with(NodeCapability::PartialAggregatePushdown)
+}
+
 #[test]
 fn mixed_capability_membership_advertises_per_peer() {
 	let membership = membership_of(
@@ -35,6 +39,32 @@ fn mixed_capability_membership_advertises_per_peer() {
 		!peer_advertises(&membership, 2, NodeCapability::SlabStatsPruning),
 		"peer 2 was built with no capabilities; must not appear advertised"
 	);
+}
+
+#[test]
+fn aggregate_pushdown_capability_is_independent_bit() {
+	let membership = membership_of(
+		1,
+		&[
+			(1, aggregate_pushdown_only()),
+			(2, slab_stats_pruning_only()),
+		],
+	);
+	assert!(peer_advertises(
+		&membership,
+		1,
+		NodeCapability::PartialAggregatePushdown
+	));
+	assert!(!peer_advertises(
+		&membership,
+		1,
+		NodeCapability::SlabStatsPruning
+	));
+	assert!(!peer_advertises(
+		&membership,
+		2,
+		NodeCapability::PartialAggregatePushdown
+	));
 }
 
 #[test]

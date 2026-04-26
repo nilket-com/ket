@@ -254,6 +254,18 @@ pub struct TieredSlabPointer {
 	pub stats_block_len: Option<u32>,
 	#[serde(default)]
 	pub stats_block_hash128: Option<[u8; 16]>,
+	/// ADR 040 visibility proof for CSB aggregate answers.
+	#[serde(default)]
+	pub first_tombstone_hlc: Option<HybridTimestamp>,
+}
+
+impl TieredSlabPointer {
+	pub fn record_tombstone_hlc(&mut self, tombstone_hlc: HybridTimestamp) {
+		self.first_tombstone_hlc = crate::storage::aggregate::merge_earliest_tombstone(
+			self.first_tombstone_hlc,
+			tombstone_hlc,
+		);
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3878,6 +3890,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
+			first_tombstone_hlc: None,
 		};
 
 		let stats = mgr
@@ -3973,6 +3986,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(drifted_hash),
+			first_tombstone_hlc: None,
 		};
 		let drift_before = metrics().pbc_slab_stats_pointer_drift_total.get();
 
@@ -4210,6 +4224,7 @@ mod tests {
 			stats_block_hash128: old_encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -4308,6 +4323,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 
 		let err =
@@ -4708,6 +4724,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
+				first_tombstone_hlc: None,
 			})
 			.await
 			.unwrap();

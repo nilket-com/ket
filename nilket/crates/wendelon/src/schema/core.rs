@@ -469,6 +469,8 @@ impl MsgType {
 	pub const TABLE_REPLICATE_RESP: Self = Self(0x2B);
 	pub const TABLE_QUERY_REQ: Self = Self(0x2C);
 	pub const TABLE_QUERY_RESP: Self = Self(0x2D);
+	pub const AGG_REQ: Self = Self(0x32);
+	pub const AGG_RESP: Self = Self(0x33);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);
@@ -784,7 +786,7 @@ pub struct PendingWitnessPullResponseMeta {
 //  Actual key is in the Arrow payload.
 // ============================================================
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
 #[repr(C)]
 pub struct Consistency(pub u8);
 
@@ -1410,6 +1412,8 @@ mod tests {
 	fn query_wire_contract_has_no_stats_or_slab_surface() {
 		assert_eq!(MsgType::QUERY_REQ.0, 0x0B);
 		assert_eq!(MsgType::QUERY_RESP.0, 0x0C);
+		assert_eq!(MsgType::AGG_REQ.0, 0x32);
+		assert_eq!(MsgType::AGG_RESP.0, 0x33);
 		assert_eq!(std::mem::size_of::<QueryRequestMeta>(), 80);
 		assert_eq!(std::mem::offset_of!(QueryRequestMeta, min_hlc), 0);
 		assert_eq!(std::mem::offset_of!(QueryRequestMeta, expected_epoch), 16);

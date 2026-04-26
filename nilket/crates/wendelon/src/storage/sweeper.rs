@@ -448,6 +448,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
+			first_tombstone_hlc: None,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(info.slab_id, &l2_uri)
@@ -589,6 +590,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
+			first_tombstone_hlc: pointer.first_tombstone_hlc,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -695,6 +697,7 @@ impl SlabSweeper {
 				stats_format_version,
 				stats_block_len,
 				stats_block_hash128,
+				first_tombstone_hlc: pointer.first_tombstone_hlc,
 			};
 			if let Err(error) = self.raft.commit_tier_slab(tier).await {
 				return Err(error);
@@ -748,6 +751,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
+			first_tombstone_hlc: pointer.first_tombstone_hlc,
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
 			self.cleanup_uploaded_object_after_failed_commit(pointer.slab_id, &new_uri)
@@ -907,6 +911,7 @@ impl SlabSweeper {
 					stats_format_version,
 					stats_block_len,
 					stats_block_hash128,
+					first_tombstone_hlc: None,
 				};
 				if let Err(error) = self.raft.commit_tier_slab(tier).await {
 					self.cleanup_uploaded_object_after_failed_commit(slab_id, &new_uri)
@@ -1098,6 +1103,7 @@ impl SlabSweeper {
 			stats_format_version: t.stats_format_version,
 			stats_block_len: t.stats_block_len,
 			stats_block_hash128: t.stats_block_hash128,
+			first_tombstone_hlc: t.first_tombstone_hlc,
 		})
 	}
 
@@ -1116,6 +1122,7 @@ impl SlabSweeper {
 				stats_format_version: tier.stats_format_version,
 				stats_block_len: tier.stats_block_len,
 				stats_block_hash128: tier.stats_block_hash128,
+				first_tombstone_hlc: tier.first_tombstone_hlc,
 			})
 			.collect::<Vec<_>>();
 		pointers.sort_by_key(|pointer| pointer.slab_id);
@@ -1462,6 +1469,7 @@ impl TierObserver for ManagerTierObserver {
 					stats_format_version: tier.stats_format_version,
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
+					first_tombstone_hlc: tier.first_tombstone_hlc,
 				},
 				Some(applied_log_index),
 			)
@@ -1601,6 +1609,7 @@ mod tests {
 			stats_format_version: pointer.stats_format_version,
 			stats_block_len: pointer.stats_block_len,
 			stats_block_hash128: pointer.stats_block_hash128,
+			first_tombstone_hlc: pointer.first_tombstone_hlc,
 		})
 		.await;
 	}
@@ -1852,6 +1861,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(ptr.clone()).await.unwrap();
 		// Second apply must not fail even though sealed no longer
@@ -1884,6 +1894,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		assert_eq!(manager.read(loc).await.unwrap(), b"hello-1");
@@ -2103,6 +2114,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
+			first_tombstone_hlc: current_pointer.first_tombstone_hlc,
 		};
 		manager
 			.apply_tier_slab(metadata_missing_pointer.clone())
@@ -2205,6 +2217,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2332,6 +2345,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 		manager
@@ -2482,6 +2496,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2605,6 +2620,7 @@ mod tests {
 			stats_block_hash128: encrypted
 				.stats_locator
 				.map(|locator| locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		};
 		manager.apply_tier_slab(old_pointer.clone()).await.unwrap();
 
@@ -2743,6 +2759,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
+				first_tombstone_hlc: None,
 			})
 			.await
 			.unwrap();

@@ -60,6 +60,10 @@ pub struct TieredSlab {
 	/// ADR 039 advisory: BLAKE3(stats ciphertext)[0..16] when known.
 	#[serde(default)]
 	pub stats_block_hash128: Option<[u8; 16]>,
+	/// ADR 040 visibility proof: earliest tombstone committed
+	/// against any row in this slab, if known.
+	#[serde(default)]
+	pub first_tombstone_hlc: Option<HybridTimestamp>,
 }
 
 /// Payload of a `RetireTieredSlab` Raft entry.

@@ -9,7 +9,7 @@
 //!   0x01..=0x0F  →  Data Ring
 //!   0x10..=0x1F  →  Control Ring core RPCs
 //!   0x20..=0x2F  →  Raft internal, with exact-match Data Ring extensions
-//!   0x30..=0x3F  →  Control/admin extensions
+//!   0x30..=0x3F  →  Exact-match protocol extensions
 //! ```
 //!
 //! The router uses an explicit dispatch table rather than trusting
@@ -149,7 +149,9 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_REPLICATE_REQ.0
 				|| x == MsgType::TABLE_REPLICATE_RESP.0
 				|| x == MsgType::TABLE_QUERY_REQ.0
-				|| x == MsgType::TABLE_QUERY_RESP.0 =>
+				|| x == MsgType::TABLE_QUERY_RESP.0
+				|| x == MsgType::AGG_REQ.0
+				|| x == MsgType::AGG_RESP.0 =>
 			{
 				match &self.data {
 					Some(h) => h.handle_data_frame(context, frame).await,

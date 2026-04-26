@@ -28,8 +28,8 @@ PBC is a versioned physical expression format emitted by Toron for storage-local
 
 3. **Pushdown targetability is a first-class planner property.**
    Toron tracks whether each expression node, not merely each whole query, is:
-   - `WendelonExact`: can execute in PBC with exact semantics
-   - `WendelonApprox`: can execute as an approximate or prefilter operation, such as future vector ANN candidate selection
+   - `PushdownExact`: can execute in PBC with exact semantics
+   - `PushdownApprox`: can execute as an approximate or prefilter operation, such as future vector ANN candidate selection
    - `ToronOnly`: must execute in Toron
    - `Rejected`: not valid under the session, tenant, schema, or safety policy
 
@@ -55,7 +55,7 @@ PBC is a versioned physical expression format emitted by Toron for storage-local
     Predicate/projection bytecode and partial aggregation state machines have different memory, safety, and numerical-stability concerns. The default position is a sibling pushdown protocol for partial aggregates unless a later ADR proves an opcode extension is cleaner.
 
 11. **Targetability diagnostics belong on Toron expression nodes.**
-    The `WendelonExact`/`WendelonApprox`/`ToronOnly`/`Rejected(reason_code)` label is carried per `toron-ir` expression node, not per whole query. Useful plans routinely split: a pushable filter leaf may sit under a Toron-only window, join, or final aggregate. Query-level labels would throw away that optimization space.
+    The `PushdownExact`/`PushdownApprox`/`ToronOnly`/`Rejected(reason_code)` label is carried per `toron-ir` expression node, not per whole query. Useful plans routinely split: a pushable filter leaf may sit under a Toron-only window, join, or final aggregate. Query-level labels would throw away that optimization space.
 
 ## Capability negotiation contract
 
@@ -131,7 +131,7 @@ Bounded implementation-time decisions against this fixed contract. Each becomes 
 
 1. **Exact reason-code set.** The final enum is selected during implementation so it matches the real validation failures without becoming a free-form error channel.
 2. **Capability payload shape.** *Resolved 2026-04-25* in §"Capability negotiation contract" above. Versioned `u8` bitmask (`NodeCapabilitySet`); growth path widens to `u16` when bit 9 is needed.
-3. **Approximate pushdown policy.** `WendelonApprox` exists for future vector and sketch work; its planner and user-visible semantics need a separate ADR before it affects execution.
+3. **Approximate pushdown policy.** `PushdownApprox` exists for future vector and sketch work; its planner and user-visible semantics need a separate ADR before it affects execution.
 
 ## References
 - ADR 005: Decoupling Compute via Pushdown Bytecode (PBC)

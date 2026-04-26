@@ -327,10 +327,15 @@ impl NodeRoleSet {
 pub enum NodeCapability {
 	/// ADR 039 column-statistics pruning for table queries.
 	SlabStatsPruning = 0,
+	/// ADR 040 partial aggregate pushdown.
+	PartialAggregatePushdown = 1,
 }
 
 impl NodeCapability {
-	pub const ALL: [NodeCapability; 1] = [NodeCapability::SlabStatsPruning];
+	pub const ALL: [NodeCapability; 2] = [
+		NodeCapability::SlabStatsPruning,
+		NodeCapability::PartialAggregatePushdown,
+	];
 
 	#[inline]
 	const fn bit(self) -> u8 {
@@ -577,9 +582,12 @@ mod tests {
 
 	#[test]
 	fn node_capability_bits_round_trip() {
-		let set = NodeCapabilitySet::empty().with(NodeCapability::SlabStatsPruning);
-		assert_eq!(set.as_u8(), 0b0000_0001);
+		let set = NodeCapabilitySet::empty()
+			.with(NodeCapability::SlabStatsPruning)
+			.with(NodeCapability::PartialAggregatePushdown);
+		assert_eq!(set.as_u8(), 0b0000_0011);
 		assert!(set.contains(NodeCapability::SlabStatsPruning));
+		assert!(set.contains(NodeCapability::PartialAggregatePushdown));
 		assert_eq!(NodeCapabilitySet::from_u8(set.as_u8()), set);
 	}
 }

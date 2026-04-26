@@ -182,6 +182,10 @@ impl Program {
 			.any(|op| matches!(op, Op::LoadIdentity | Op::RouteByLocality))
 	}
 
+	pub fn has_projection(&self) -> bool {
+		self.project.is_some()
+	}
+
 	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicateV1>> {
 		extract_conjunctive_column_predicates(&self.ops)
 	}

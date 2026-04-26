@@ -58,32 +58,41 @@ use crate::network::pending_finalizations::{
 	pending_finalizations_path,
 };
 use crate::network::pool::BufPool;
-use crate::network::ring::RingRouter;
+use crate::network::ring::{RingRouter, RingState};
 use crate::network::router::DataRingServer;
 use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
-use crate::network::transport::{MembershipEpoch, NodeRole, TransportStream};
+use crate::network::transport::{MembershipEpoch, NodeCapability, NodeRole, TransportStream};
+use crate::network::wire;
 use crate::schema::{
-	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, COLUMN_PROJECTION_RANGE_ARC_BUDGET,
+	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
+	AggregateDiagnostics, AggregateExpressionIndex, AggregateFunction, AggregateRequest,
+	AggregateResponse, AggregateState, AggregateStatus, COLUMN_PROJECTION_RANGE_ARC_BUDGET,
 	ColumnProjectionRangePruning, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker,
 	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality,
-	LocalityPolicyV1, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
-	MsgType, NodeId, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
-	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta,
-	ReplicaWriteStatus, SlabId, StreamFinalizationRequestMeta, TableQueryRequestMeta,
-	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
-	TableWriteValidationError, TenantId, PbcRejectCode, WriteRequestMeta, WriteResponseMeta,
-	WriteStatus, column_projection_predicate_ranges, column_projection_prefix_ranges,
-	migration_record_schema, query_request_stats_pruning_enabled, read_key_schema,
-	table_spread_prefix_ranges, validate_table_write_request_batch, pbc, write_payload_schema,
+	LocalityPolicyV1, LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta,
+	MigrateStatus, MsgType, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
+	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
+	ReadRequestMeta, ReadResponseMeta, ReadStatus, ReplicaAckLevel, ReplicaWriteMeta,
+	ReplicaWriteRespMeta, ReplicaWriteStatus, SlabId, StreamFinalizationRequestMeta,
+	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta,
+	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, column_projection_predicate_ranges,
+	column_projection_prefix_ranges, encode_aggregate_state, migration_record_schema, pbc,
+	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, write_payload_schema,
 };
-use crate::storage::MvccRetentionPolicy;
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
 use crate::storage::stats::{
-	ColumnStatsPrune, ParsedColumnStatsBlock, column_stats_entry_matches_data_type,
-	encode_signed_stat_value, prune_by_encoded_any_of, prune_by_encoded_min_max,
+	COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED,
+	ColumnStatsBlockEntry, ColumnStatsPrune, ParsedColumnStatsBlock,
+	column_stats_entry_matches_data_type, decode_column_stats_payload, encode_signed_stat_value,
+	prune_by_encoded_any_of, prune_by_encoded_min_max,
+};
+use crate::storage::{
+	MvccRetentionPolicy, aggregate_record_batches, merge_aggregate_responses,
+	validate_expression_types,
 };
 use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
@@ -98,7 +107,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
 #[cfg(test)]
@@ -3018,6 +3027,52 @@ impl WendelonDataServer {
 		))
 	}
 
+	async fn handle_aggregate(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+		request: AggregateRequest,
+	) -> std::io::Result<HrftFrame> {
+		metrics().data_ring_query_requests_total.inc();
+		let audit_meta =
+			aggregate_as_range_query(&request, self.admission_snapshot().current_epoch);
+		let span = tracing::info_span!(
+			"data_ring.aggregate.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = request.tenant_id.get(),
+			table_object_id = %format_bytes_hex(request.table_object_id.as_bytes()),
+			schema_generation = request.schema_generation,
+			consistency = request.consistency.0,
+			aggregate_count = request.aggregates.len(),
+		);
+		let response = if actor.role == ActorRole::DataNode {
+			self.execute_aggregate_local(&request)
+				.instrument(span)
+				.await?
+		} else {
+			self.execute_aggregate_with_migration_merge(&request)
+				.instrument(span)
+				.await?
+		};
+		let returned_bytes = response
+			.partials
+			.iter()
+			.map(|partial| partial.state.len() as u64)
+			.sum::<u64>();
+		let audit_response = aggregate_response_as_query_meta(
+			&request,
+			&response,
+			self.local_node,
+			audit_meta.expected_epoch,
+		);
+		self.emit_query_completion_audit(actor, &audit_meta, &audit_response, returned_bytes)?;
+		self.build_aggregate_response_frame(
+			frame.header.stream_id,
+			&response,
+			FRAME_FLAG_STREAM_END,
+		)
+	}
+
 	fn decode_query_request_frame(
 		&self,
 		frame: &HrftFrame,
@@ -3084,6 +3139,25 @@ impl WendelonDataServer {
 		Ok((meta, bytecode))
 	}
 
+	fn decode_aggregate_request_frame(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<AggregateRequest> {
+		if !frame.meta.is_empty() || frame.arrow_payload.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"AGG_REQ must carry only a postcard trailing payload",
+			));
+		}
+		let trailing = frame.trailing.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"AGG_REQ missing postcard trailing payload",
+			)
+		})?;
+		wire::decode::<AggregateRequest>(trailing)
+	}
+
 	fn build_query_response_frame(
 		&self,
 		stream_id: u32,
@@ -3135,6 +3209,49 @@ impl WendelonDataServer {
 			arrow_payload,
 			trailing: None,
 		}
+	}
+
+	fn build_aggregate_response_frame(
+		&self,
+		stream_id: u32,
+		response: &AggregateResponse,
+		flags: u16,
+	) -> std::io::Result<HrftFrame> {
+		let trailing = wire::encode_into(&self.pool, response)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::AGG_RESP.0,
+				flags,
+				stream_id,
+				meta_len: 0,
+				arrow_len: 0,
+				trailing_len: trailing.len() as u32,
+			},
+			meta: self.pool.acquire(),
+			arrow_payload: None,
+			trailing: Some(trailing),
+		})
+	}
+
+	fn aggregate_rejected_response(
+		&self,
+		request: &AggregateRequest,
+		code: AggRejectCode,
+	) -> AggregateResponse {
+		metrics().observe_agg_rejected();
+		AggregateResponse::rejected(request, code)
+	}
+
+	fn aggregate_error_frame(
+		&self,
+		stream_id: u32,
+		request: &AggregateRequest,
+		code: AggRejectCode,
+	) -> std::io::Result<HrftFrame> {
+		let response = self.aggregate_rejected_response(request, code);
+		self.build_aggregate_response_frame(stream_id, &response, FRAME_FLAG_STREAM_END)
 	}
 
 	fn decode_write_request_frame(
@@ -4826,6 +4943,385 @@ impl WendelonDataServer {
 		.await
 	}
 
+	async fn execute_aggregate_with_migration_merge(
+		&self,
+		request: &AggregateRequest,
+	) -> std::io::Result<AggregateResponse> {
+		let prepared = match self
+			.prepare_aggregate_execution_context_with_migration(request)
+			.await?
+		{
+			Ok(prepared) => prepared,
+			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+		};
+		let membership = self.factory.membership_snapshot();
+		let assignments = match aggregate_owner_subranges(
+			&membership,
+			self.router.replication_factor(),
+			&prepared.ranges,
+		) {
+			Ok(assignments) if !assignments.is_empty() => assignments,
+			Ok(_) => {
+				return self.execute_aggregate_local(request).await;
+			}
+			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+		};
+
+		if assignments.len()
+			> usize::try_from(request.budgets.max_locations.get()).unwrap_or(usize::MAX)
+		{
+			return Ok(self.aggregate_rejected_response(request, AggRejectCode::BudgetExceeded));
+		}
+		for target in assignments.keys().copied() {
+			if target == self.local_node {
+				continue;
+			}
+			let has_capability = membership.peers.get(&target).is_some_and(|peer| {
+				peer.capabilities
+					.contains(NodeCapability::PartialAggregatePushdown)
+			});
+			if !has_capability {
+				metrics().agg_skipped_no_capability_total.inc();
+				return Ok(
+					self.aggregate_rejected_response(request, AggRejectCode::CapabilityUnavailable)
+				);
+			}
+		}
+
+		let mut responses = Vec::with_capacity(assignments.len());
+		let mut remote = JoinSet::new();
+		for (target, ranges) in assignments {
+			let mut subrequest = request.clone();
+			subrequest.locality_ranges = ranges;
+			if target == self.local_node {
+				responses.push(self.execute_aggregate_local(&subrequest).await?);
+			} else {
+				let server = self.clone();
+				remote
+					.spawn(async move { server.aggregate_peer_request(target, &subrequest).await });
+			}
+		}
+		while let Some(joined) = remote.join_next().await {
+			match joined {
+				Ok(Ok(response)) => responses.push(response),
+				Ok(Err(err)) => {
+					tracing::warn!(
+						error = %err,
+						"aggregate peer request failed during coordinator merge"
+					);
+					return Ok(
+						self.aggregate_rejected_response(request, AggRejectCode::DeadlineExceeded)
+					);
+				}
+				Err(err) => {
+					tracing::warn!(
+						error = %err,
+						"aggregate peer task failed during coordinator merge"
+					);
+					return Ok(
+						self.aggregate_rejected_response(request, AggRejectCode::DeadlineExceeded)
+					);
+				}
+			}
+		}
+
+		match merge_aggregate_responses(request, &responses) {
+			Ok(response) => Ok(response),
+			Err(code) => Ok(self.aggregate_rejected_response(request, code)),
+		}
+	}
+
+	async fn execute_aggregate_local(
+		&self,
+		request: &AggregateRequest,
+	) -> std::io::Result<AggregateResponse> {
+		let prepared = match self
+			.prepare_aggregate_execution_context_with_migration(request)
+			.await?
+		{
+			Ok(prepared) => prepared,
+			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+		};
+		if let Some(response) = self
+			.try_aggregate_csb_direct_answer(request, &prepared)
+			.await?
+		{
+			return Ok(response);
+		}
+		let plan = plan_query_execution_for_ranges_with_program(
+			&self.slab,
+			self.local_node,
+			&prepared.range_meta,
+			&prepared.program,
+			&prepared.ranges,
+			aggregate_query_budget(&request.budgets),
+			Some(&prepared.descriptor),
+		)
+		.await?;
+		if plan.response.status != ReadStatus::OK
+			&& plan.response.status != ReadStatus::KEY_NOT_FOUND
+		{
+			return Ok(self.aggregate_rejected_response(
+				request,
+				aggregate_reject_from_read_status(plan.response.status),
+			));
+		}
+
+		// The query planner has already applied the predicate while
+		// preserving scalar identity/locality context. Fold the filtered
+		// batches without re-running the bytecode a second time.
+		let mut folded_request = request.clone();
+		folded_request.predicate_program = None;
+		let result = match aggregate_record_batches(
+			&folded_request,
+			if plan.response.status == ReadStatus::KEY_NOT_FOUND {
+				&[]
+			} else {
+				&plan.batches
+			},
+			false,
+		) {
+			Ok(result) => result,
+			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+		};
+		let mut response = result.response;
+		if plan.response.status == ReadStatus::OK {
+			response.max_hlc = plan.response.value_hlc;
+		}
+		response.diagnostics.slabs_consulted = plan.stats_explain.candidate_slabs_before_stats;
+		response.diagnostics.slabs_pruned_by_csb = plan.stats_explain.slabs_pruned_by_stats;
+		response.diagnostics.slabs_stats_unavailable = plan
+			.stats_explain
+			.slabs_scanned_stats_missing
+			.saturating_add(plan.stats_explain.slabs_scanned_stats_unsupported)
+			.saturating_add(plan.stats_explain.slabs_scanned_predicate_unrepresentable)
+			.saturating_add(plan.stats_explain.stats_decrypt_failed_total);
+		Ok(response)
+	}
+
+	async fn try_aggregate_csb_direct_answer(
+		&self,
+		request: &AggregateRequest,
+		prepared: &PreparedAggregateExecution,
+	) -> std::io::Result<Option<AggregateResponse>> {
+		if !aggregate_csb_direct_answer_eligible(request, &prepared.ranges) {
+			return Ok(None);
+		}
+
+		let mut slab_ids = HashSet::new();
+		let mut responses = Vec::new();
+		for range in &prepared.ranges {
+			let scanned = self.slab.scan_as_of_with_identity_and_locality(
+				request.tenant_id,
+				range.start,
+				range.end,
+				request.as_of_hlc,
+			);
+			for (_identity, _locality, location) in scanned {
+				if !slab_ids.insert(location.slab_id) {
+					continue;
+				}
+				let Some(pointer) = self.slab.tier_pointer(location.slab_id).await else {
+					return Ok(None);
+				};
+				if !crate::storage::slab_visibility_complete(
+					location.hlc,
+					pointer.first_tombstone_hlc,
+					request.as_of_hlc,
+				) {
+					return Ok(None);
+				}
+				let stats = match self
+					.slab
+					.load_tiered_column_stats_block(&pointer, &prepared.descriptor)
+					.await?
+				{
+					Some(stats) => stats,
+					None => return Ok(None),
+				};
+				let response =
+					match aggregate_csb_response_for_stats(request, &prepared.descriptor, &stats) {
+						Ok(Some(response)) => response,
+						Ok(None) => return Ok(None),
+						Err(code) => {
+							return Ok(Some(self.aggregate_rejected_response(request, code)));
+						}
+					};
+				responses.push(response);
+			}
+		}
+		if responses.is_empty() {
+			return Ok(None);
+		}
+		let response = merge_aggregate_responses(request, &responses).map_err(|code| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("CSB aggregate partial merge failed: {}", code.as_str()),
+			)
+		})?;
+		metrics().agg_csb_short_circuit_total.inc();
+		Ok(Some(response))
+	}
+
+	async fn prepare_aggregate_execution_context_with_migration(
+		&self,
+		request: &AggregateRequest,
+	) -> std::io::Result<Result<PreparedAggregateExecution, AggRejectCode>> {
+		if let Err(code) = request.validate_envelope(false) {
+			return Ok(Err(code));
+		}
+		let admission = self.admission_snapshot();
+		let current_epoch = admission.current_epoch;
+		let range_meta = aggregate_as_range_query(request, current_epoch);
+		if let Err(status) = self.enforce_read_policy(request.tenant_id).await {
+			return Ok(Err(aggregate_reject_from_read_status(status)));
+		}
+		if request.consistency == Consistency::LINEARIZABLE {
+			let watermark = admission
+				.e_safe_watermarks
+				.get(&current_epoch)
+				.copied()
+				.unwrap_or(HybridTimestamp {
+					physical_ms: 0,
+					logical: 0,
+					node_id: 0,
+				});
+			if watermark < request.min_hlc {
+				return Ok(Err(AggRejectCode::DeadlineExceeded));
+			}
+		}
+		if self.snapshot_request_outside_retention(request.as_of_hlc) {
+			return Ok(Err(AggRejectCode::DeadlineExceeded));
+		}
+
+		let bytecode = request.predicate_program.as_deref().unwrap_or(&[]);
+		let program = match pbc::Program::compile(bytecode) {
+			Ok(program) if !program.has_projection() => program,
+			_ => return Ok(Err(AggRejectCode::ProgramInvalid)),
+		};
+
+		let sm_peek = self.state_machine.state_snapshot().await;
+		let descriptor = match sm_peek.table_schemas.get(
+			request.tenant_id,
+			request.table_object_id,
+			request.schema_generation,
+		) {
+			Some(descriptor) => descriptor.clone(),
+			None => {
+				let code = sm_peek
+					.table_schemas
+					.latest_by_id(request.tenant_id, request.table_object_id)
+					.map(|latest| {
+						if latest.schema_generation > request.schema_generation {
+							AggRejectCode::SchemaStale
+						} else {
+							AggRejectCode::SchemaUnknown
+						}
+					})
+					.unwrap_or(AggRejectCode::SchemaUnknown);
+				return Ok(Err(code));
+			}
+		};
+		if descriptor.schema_fingerprint != request.schema_fingerprint {
+			return Ok(Err(AggRejectCode::SchemaStale));
+		}
+		let schema = match descriptor.arrow_schema() {
+			Ok(schema) => Arc::new(schema),
+			Err(_) => return Ok(Err(AggRejectCode::SchemaUnknown)),
+		};
+		let empty_batch = RecordBatch::new_empty(schema);
+		if let Err(code) = validate_expression_types(&request.aggregates, &empty_batch) {
+			return Ok(Err(code));
+		}
+
+		let ranges = match table_query_scan_ranges(request.tenant_id, &descriptor, Some(&program)) {
+			Ok(ranges) => intersect_aggregate_scan_ranges(ranges, &request.locality_ranges),
+			Err(status) => return Ok(Err(aggregate_reject_from_read_status(status))),
+		};
+		let pending: Vec<MigrationLedgerEntry> = sm_peek
+			.migrations
+			.values()
+			.filter(|e| {
+				e.logical_owner.id == self.local_node.id
+					&& e.state != MigrationState::Completed
+					&& ranges.iter().any(|range| {
+						e.range_start <= range.end.get() && e.range_end >= range.start.get()
+					})
+			})
+			.cloned()
+			.collect();
+		drop(sm_peek);
+
+		for entry in &pending {
+			for range in &ranges {
+				let rs = entry.range_start.max(range.start.get());
+				let re = entry.range_end.min(range.end.get());
+				if rs > re {
+					continue;
+				}
+				if let Err(_e) = self.pull_migration_range(entry, rs, re).await {
+					return Ok(Err(AggRejectCode::DeadlineExceeded));
+				}
+			}
+		}
+
+		Ok(Ok(PreparedAggregateExecution {
+			range_meta,
+			program,
+			descriptor,
+			ranges,
+		}))
+	}
+
+	async fn aggregate_peer_request(
+		&self,
+		target: NodeId,
+		request: &AggregateRequest,
+	) -> std::io::Result<AggregateResponse> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let trailing = wire::encode_into(&self.pool, request)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::AGG_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: 0,
+			arrow_len: 0,
+			trailing_len: trailing.len() as u32,
+		};
+		write_frame(&mut *stream, &header, &[], None, Some(&trailing)).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+
+		let response = read_frame(&mut *stream, &self.pool).await?;
+		if response.header.msg_type != MsgType::AGG_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"expected AGG_RESP, got msg_type=0x{:02x}",
+					response.header.msg_type
+				),
+			));
+		}
+		if !response.meta.is_empty() || response.arrow_payload.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"AGG_RESP must carry only a postcard trailing payload",
+			));
+		}
+		let trailing = response.trailing.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"AGG_RESP missing postcard trailing payload",
+			)
+		})?;
+		wire::decode::<AggregateResponse>(trailing)
+	}
+
 	/// Issue a single `MIGRATE_REQ` to `target` and decode the
 	/// response body into `(meta, records)`. Errors bubble the
 	/// transport failure; logical status bytes (KEY_NOT_FOUND,
@@ -5425,6 +5921,54 @@ impl DataRingServer for WendelonDataServer {
 					}
 				};
 				self.handle_table_query(&context.actor, frame)
+					.await
+					.map(Some)
+			}
+			MsgType::AGG_REQ => {
+				let request = self.decode_aggregate_request_frame(&frame)?;
+				let audit_meta =
+					aggregate_as_range_query(&request, self.admission_snapshot().current_epoch);
+				if let Err(err) = self.authorize_actor_for_data(
+					&context.actor,
+					Some(request.tenant_id),
+					DataOperation::Query,
+				) {
+					self.emit_query_denied_audit(
+						&context.actor,
+						&audit_meta,
+						ReadStatus::AUTHORIZATION_FAILED,
+						err.to_string(),
+					)?;
+					return Ok(Some(self.aggregate_error_frame(
+						frame.header.stream_id,
+						&request,
+						AggRejectCode::CapabilityUnavailable,
+					)?));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(request.tenant_id),
+					DataOperation::Query,
+				)? {
+					Ok(admission) => admission,
+					Err(scope) => {
+						self.emit_query_denied_audit(
+							&context.actor,
+							&audit_meta,
+							ReadStatus::BACKPRESSURED,
+							format!(
+								"post-auth request admission saturated at {}",
+								backpressure_scope_name(scope)
+							),
+						)?;
+						return Ok(Some(self.aggregate_error_frame(
+							frame.header.stream_id,
+							&request,
+							AggRejectCode::BudgetExceeded,
+						)?));
+					}
+				};
+				self.handle_aggregate(&context.actor, frame, request)
 					.await
 					.map(Some)
 			}
@@ -6690,6 +7234,14 @@ struct QueryExecutionPlan {
 	stats_explain: QueryStatsExplainCounters,
 }
 
+#[derive(Clone, Debug)]
+struct PreparedAggregateExecution {
+	range_meta: QueryRequestMeta,
+	program: pbc::Program,
+	descriptor: TableSchemaDescriptorV1,
+	ranges: Vec<QueryScanRange>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QueryRecordLocation {
 	identity: Identity,
@@ -7767,6 +8319,368 @@ fn table_query_as_range_query(meta: &TableQueryRequestMeta) -> QueryRequestMeta 
 	}
 }
 
+fn aggregate_as_range_query(request: &AggregateRequest, expected_epoch: u64) -> QueryRequestMeta {
+	let (locality_range_start, locality_range_end) = if request.locality_ranges.is_empty() {
+		(0, u64::MAX)
+	} else {
+		let start = request
+			.locality_ranges
+			.iter()
+			.map(|range| range.start.get())
+			.min()
+			.unwrap_or(0);
+		let end = request
+			.locality_ranges
+			.iter()
+			.map(|range| range.end.get())
+			.max()
+			.unwrap_or(u64::MAX);
+		(start, end)
+	};
+	QueryRequestMeta {
+		min_hlc: request.min_hlc,
+		expected_epoch,
+		tenant_id: request.tenant_id,
+		consistency: request.consistency,
+		_pad: [0; 7],
+		locality_range_start,
+		locality_range_end,
+		bytecode_len: request
+			.predicate_program
+			.as_ref()
+			.map(|bytecode| bytecode.len() as u32)
+			.unwrap_or(0),
+		_pad2: [0; 4],
+		as_of_hlc: request.as_of_hlc,
+	}
+}
+
+fn aggregate_response_as_query_meta(
+	request: &AggregateRequest,
+	response: &AggregateResponse,
+	local_node: NodeId,
+	epoch: u64,
+) -> QueryResponseMeta {
+	let status = match response.status {
+		AggregateStatus::Success | AggregateStatus::Partial | AggregateStatus::NumericOverflow => {
+			ReadStatus::OK
+		}
+		AggregateStatus::Rejected => response
+			.reject_code
+			.map(aggregate_reject_to_read_status)
+			.unwrap_or(ReadStatus::QUERY_INVALID_PROGRAM),
+	};
+	QueryResponseMeta {
+		status,
+		_pad1: [0; 7],
+		value_hlc: response.max_hlc,
+		epoch,
+		leader_hint: local_node,
+		rows: response.diagnostics.rows_admitted,
+		arrow_len: request.aggregates.len() as u32,
+		_pad2: [0; 4],
+	}
+}
+
+fn intersect_aggregate_scan_ranges(
+	table_ranges: Vec<QueryScanRange>,
+	requested_ranges: &[LocalityRange],
+) -> Vec<QueryScanRange> {
+	if requested_ranges.is_empty() {
+		return table_ranges;
+	}
+	let mut out = Vec::new();
+	for table_range in table_ranges {
+		for requested in requested_ranges {
+			let start = table_range.start.get().max(requested.start.get());
+			let end = table_range.end.get().min(requested.end.get());
+			if start <= end {
+				out.push(QueryScanRange {
+					start: Locality::new(start),
+					end: Locality::new(end),
+				});
+			}
+		}
+	}
+	out
+}
+
+fn aggregate_owner_subranges(
+	membership: &MembershipEpoch,
+	replication_factor: usize,
+	ranges: &[QueryScanRange],
+) -> Result<HashMap<NodeId, Vec<LocalityRange>>, AggRejectCode> {
+	if ranges.is_empty() {
+		return Ok(HashMap::new());
+	}
+	let ring = RingState::build(membership, replication_factor);
+	if ring.data_capable_nodes() == 0 {
+		return Ok(HashMap::new());
+	}
+	let segments = ring.replica_segments();
+	if segments.is_empty() {
+		return Ok(HashMap::new());
+	}
+	let mut assignments: HashMap<NodeId, Vec<LocalityRange>> = HashMap::new();
+	for range in ranges {
+		for segment in &segments {
+			let start = range.start.get().max(segment.start);
+			let end = range.end.get().min(segment.end);
+			if start > end {
+				continue;
+			}
+			let Some(owner) = segment.replicas.first().copied() else {
+				return Err(AggRejectCode::CapabilityUnavailable);
+			};
+			assignments.entry(owner).or_default().push(LocalityRange {
+				start: Locality::new(start),
+				end: Locality::new(end),
+			});
+		}
+	}
+	for ranges in assignments.values_mut() {
+		coalesce_locality_ranges(ranges);
+	}
+	Ok(assignments)
+}
+
+fn coalesce_locality_ranges(ranges: &mut Vec<LocalityRange>) {
+	ranges.sort_by_key(|range| (range.start.get(), range.end.get()));
+	let mut out: Vec<LocalityRange> = Vec::with_capacity(ranges.len());
+	for range in ranges.drain(..) {
+		if let Some(last) = out.last_mut() {
+			if range.start.get() <= last.end.get().saturating_add(1) {
+				if range.end > last.end {
+					last.end = range.end;
+				}
+				continue;
+			}
+		}
+		out.push(range);
+	}
+	*ranges = out;
+}
+
+fn aggregate_csb_direct_answer_eligible(
+	request: &AggregateRequest,
+	ranges: &[QueryScanRange],
+) -> bool {
+	if is_zero_hlc(request.as_of_hlc) {
+		return false;
+	}
+	if request
+		.predicate_program
+		.as_ref()
+		.is_some_and(|bytecode| !bytecode.is_empty())
+	{
+		return false;
+	}
+	if ranges.len() != 1 || ranges[0].start != Locality::ZERO || ranges[0].end != Locality::MAX {
+		return false;
+	}
+	request.aggregates.iter().all(|expression| {
+		matches!(
+			expression.function(),
+			Ok(AggregateFunction::CountStar)
+				| Ok(AggregateFunction::CountNonNull { .. })
+				| Ok(AggregateFunction::Min { .. })
+				| Ok(AggregateFunction::Max { .. })
+		)
+	})
+}
+
+fn aggregate_csb_response_for_stats(
+	request: &AggregateRequest,
+	descriptor: &TableSchemaDescriptorV1,
+	stats: &ParsedColumnStatsBlock,
+) -> Result<Option<AggregateResponse>, AggRejectCode> {
+	if stats.header.table_object_id != request.table_object_id
+		|| stats.header.schema_generation != request.schema_generation
+		|| stats.header.schema_fingerprint != request.schema_fingerprint
+	{
+		return Err(AggRejectCode::PartialCrossbindFailed);
+	}
+	let schema = descriptor
+		.arrow_schema()
+		.map_err(|_| AggRejectCode::SchemaUnknown)?;
+	let mut partials = Vec::with_capacity(request.aggregates.len());
+	let mut partial_bytes = 0_u64;
+	let mut has_truncated_minmax = false;
+	for (index, expression) in request.aggregates.iter().enumerate() {
+		let function = expression.function()?;
+		let state = match function {
+			AggregateFunction::CountStar => AggregateState::Count {
+				value: stats.header.row_count,
+			},
+			AggregateFunction::CountNonNull { column } => {
+				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
+				else {
+					return Ok(None);
+				};
+				let payload = decode_column_stats_payload(entry)
+					.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
+				let Some(value) = payload.non_null_count else {
+					return Ok(None);
+				};
+				AggregateState::Count { value }
+			}
+			AggregateFunction::Min { column } => {
+				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
+				else {
+					return Ok(None);
+				};
+				if entry.stat_flags & COLUMN_STAT_HAS_MIN == 0 {
+					return Ok(None);
+				}
+				let payload = decode_column_stats_payload(entry)
+					.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
+				AggregateState::MinMax {
+					value: payload.min,
+					arrow_type_tag: entry.arrow_type_tag,
+					truncated: entry.stat_flags & COLUMN_STAT_MIN_TRUNCATED != 0,
+				}
+			}
+			AggregateFunction::Max { column } => {
+				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
+				else {
+					return Ok(None);
+				};
+				if entry.stat_flags & COLUMN_STAT_HAS_MAX == 0 {
+					return Ok(None);
+				}
+				let payload = decode_column_stats_payload(entry)
+					.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
+				AggregateState::MinMax {
+					value: payload.max,
+					arrow_type_tag: entry.arrow_type_tag,
+					truncated: entry.stat_flags & COLUMN_STAT_MAX_TRUNCATED != 0,
+				}
+			}
+			_ => return Ok(None),
+		};
+		has_truncated_minmax |= state.has_truncated_minmax();
+		let state_bytes = encode_aggregate_state(expression.tag, &state)
+			.map_err(|_| AggRejectCode::PartialStateTooLarge)?;
+		partial_bytes = partial_bytes.saturating_add(state_bytes.len() as u64);
+		if partial_bytes > request.budgets.max_partial_state_bytes.get() {
+			return Err(AggRejectCode::PartialStateTooLarge);
+		}
+		partials.push(
+			crate::schema::AggregatePartial::new(
+				AggregateExpressionIndex::new(index as u16),
+				expression.tag,
+				state_bytes,
+			)
+			.map_err(|_| AggRejectCode::PartialStateTooLarge)?,
+		);
+	}
+	Ok(Some(AggregateResponse {
+		format_version: request.format_version,
+		request_id: request.request_id,
+		status: if has_truncated_minmax {
+			AggregateStatus::Partial
+		} else {
+			AggregateStatus::Success
+		},
+		reject_code: None,
+		table_object_id: request.table_object_id,
+		schema_generation: request.schema_generation,
+		schema_fingerprint: request.schema_fingerprint,
+		aggregate_expression_digest: request.expression_digest(),
+		as_of_hlc: request.as_of_hlc,
+		max_hlc: request.as_of_hlc,
+		partials,
+		diagnostics: AggregateDiagnostics {
+			slabs_consulted: 1,
+			slabs_answered_from_csb: 1,
+			rows_scanned: stats.header.row_count,
+			rows_admitted: stats.header.row_count,
+			..AggregateDiagnostics::default()
+		},
+	}))
+}
+
+fn aggregate_csb_column_entry<'a>(
+	stats: &'a ParsedColumnStatsBlock,
+	schema: &Schema,
+	column: usize,
+) -> Result<Option<&'a ColumnStatsBlockEntry>, AggRejectCode> {
+	let Some(field) = schema.fields().get(column) else {
+		return Err(AggRejectCode::ColumnUnknown);
+	};
+	let Some(entry) = stats
+		.columns
+		.iter()
+		.find(|entry| entry.column_ordinal as usize == column)
+	else {
+		return Ok(None);
+	};
+	if !column_stats_entry_matches_data_type(entry, field.data_type()) {
+		return Ok(None);
+	}
+	Ok(Some(entry))
+}
+
+fn aggregate_query_budget(budgets: &AggregateBudgets) -> QueryExecutionBudget {
+	let default = QueryExecutionBudget::default();
+	let max_locations = usize::try_from(budgets.max_locations.get())
+		.unwrap_or(usize::MAX)
+		.min(default.max_locations);
+	let max_rows = budgets.max_rows.get().min(default.max_rows);
+	let max_wall_time = if budgets.max_wall_time_millis.get() == u64::MAX {
+		default.max_wall_time
+	} else {
+		Duration::from_millis(budgets.max_wall_time_millis.get()).min(default.max_wall_time)
+	};
+	QueryExecutionBudget {
+		max_locations,
+		max_rows,
+		max_wall_time,
+		stats_pruning_enabled: true,
+	}
+}
+
+fn aggregate_reject_from_read_status(status: ReadStatus) -> AggRejectCode {
+	match status {
+		ReadStatus::QUERY_INVALID_PROGRAM => AggRejectCode::ProgramInvalid,
+		ReadStatus::QUERY_BUDGET_EXCEEDED | ReadStatus::BACKPRESSURED => {
+			AggRejectCode::BudgetExceeded
+		}
+		ReadStatus::EPOCH_STALE => AggRejectCode::SchemaStale,
+		ReadStatus::TENANT_UNAVAILABLE
+		| ReadStatus::AUTHORIZATION_FAILED
+		| ReadStatus::NOT_LEADER
+		| ReadStatus::LEASE_EXPIRED
+		| ReadStatus::INVALID_LEASE_SIGNATURE => AggRejectCode::CapabilityUnavailable,
+		ReadStatus::E_SAFE_BEHIND
+		| ReadStatus::MIGRATION_INCOMPLETE
+		| ReadStatus::RETENTION_EXPIRED => AggRejectCode::DeadlineExceeded,
+		_ => AggRejectCode::BudgetExceeded,
+	}
+}
+
+fn aggregate_reject_to_read_status(code: AggRejectCode) -> ReadStatus {
+	match code {
+		AggRejectCode::ProgramInvalid
+		| AggRejectCode::UnsupportedFunction
+		| AggRejectCode::ColumnUnknown
+		| AggRejectCode::TypeUnsupported
+		| AggRejectCode::SketchParameterInvalid
+		| AggRejectCode::ApproxNotAllowed
+		| AggRejectCode::FormatVersion
+		| AggRejectCode::TooManyAggregates
+		| AggRejectCode::PartialCrossbindFailed
+		| AggRejectCode::PartialStateTooLarge
+		| AggRejectCode::NumericOverflow => ReadStatus::QUERY_INVALID_PROGRAM,
+		AggRejectCode::SchemaStale => ReadStatus::EPOCH_STALE,
+		AggRejectCode::SchemaUnknown | AggRejectCode::CapabilityUnavailable => {
+			ReadStatus::TENANT_UNAVAILABLE
+		}
+		AggRejectCode::BudgetExceeded => ReadStatus::QUERY_BUDGET_EXCEEDED,
+		AggRejectCode::DeadlineExceeded => ReadStatus::E_SAFE_BEHIND,
+	}
+}
+
 fn table_query_scan_ranges(
 	tenant_id: TenantId,
 	descriptor: &TableSchemaDescriptorV1,
@@ -8462,11 +9376,14 @@ mod tests {
 		OP_RANGE_LOCALITY, OP_ROUTE_BY_LOCALITY,
 	};
 	use crate::schema::{
-		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
-		PrimaryKeyDescriptorV1, ProjectionFunctionV1, SchemaEvolutionPolicyV1, SlabRecordHeader,
-		TableObjectId, TableSchemaCatalogV1, column_projection_prefix_ranges,
-		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
-		table_spread_prefix_ranges, write_payload_schema,
+		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
+		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
+		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, LocalityPolicyV1,
+		LocalityRange, LocationCount, PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowCount,
+		SchemaEvolutionPolicyV1, SlabRecordHeader, TableObjectId, TableSchemaCatalogV1,
+		column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
+		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
+		write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
@@ -8500,6 +9417,20 @@ mod tests {
 			&typed_table_schema(),
 			PrimaryKeyDescriptorV1::single("id"),
 			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([id_byte; 16]),
+			3,
+			"analytics",
+			"identity_events",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
@@ -8921,6 +9852,42 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
+			first_tombstone_hlc: None,
+		})
+		.await
+		.unwrap();
+
+		(mgr, descriptor)
+	}
+
+	async fn tier_identity_typed_table_batch_with_stats(
+		l2: Arc<MockObjectStore>,
+		ids: Vec<i64>,
+		object_name: &str,
+	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+		let mgr = make_manager_with_l2(l2.clone()).await;
+		let descriptor = identity_typed_table_descriptor(0x41);
+		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
+
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2.put(object_name, &encrypted.bytes).await.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		})
 		.await
 		.unwrap();
@@ -8951,6 +9918,7 @@ mod tests {
 			stats_format_version: None,
 			stats_block_len: None,
 			stats_block_hash128: None,
+			first_tombstone_hlc: None,
 		})
 		.await
 		.unwrap();
@@ -9942,6 +10910,7 @@ mod tests {
 			stats_format_version: Some(locator.stats_format_version),
 			stats_block_len: Some(locator.stats_block_len),
 			stats_block_hash128: Some(locator.stats_block_hash128),
+			first_tombstone_hlc: None,
 		})
 		.await
 		.unwrap();
@@ -10736,6 +11705,635 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.unwrap();
 		assert_eq!(ids.value(0), 8);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_dispatch_folds_filtered_table_rows() {
+		let dir = bootstrap_tempdir("aggregate-dispatch");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			44,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7, 8]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 58;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch)
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+
+		let mut predicate = Vec::new();
+		predicate.push(OP_PUSH_COL);
+		predicate.extend_from_slice(&0_u32.to_le_bytes());
+		predicate.push(OP_PUSH_INT);
+		predicate.extend_from_slice(&8_i64.to_le_bytes());
+		predicate.push(OP_GTE);
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(99),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(0, 0, 0),
+			as_of_hlc: hlc(0, 0, 0),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: Some(predicate),
+			aggregates: vec![
+				AggregateExpression::count_star(),
+				AggregateExpression {
+					tag: AggregateFunctionTag::SIGNED_SUM,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+			],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		let encoded = wire::encode(&request).unwrap();
+		let mut trailing = node.pool.acquire();
+		trailing.as_mut_vec().extend_from_slice(&encoded);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::AGG_REQ.0,
+				flags: 0,
+				stream_id: 41,
+				meta_len: 0,
+				arrow_len: 0,
+				trailing_len: trailing.len() as u32,
+			},
+			meta: node.pool.acquire(),
+			arrow_payload: None,
+			trailing: Some(trailing),
+		};
+
+		let resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::AGG_RESP.0);
+		let response: AggregateResponse =
+			wire::decode(resp.trailing.as_ref().expect("aggregate response trailing")).unwrap();
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.request_id, request.request_id);
+		assert_eq!(response.partials.len(), 2);
+		assert_eq!(response.diagnostics.rows_admitted, 1);
+		assert_eq!(response.partials[0].state.as_slice(), &1_u64.to_be_bytes());
+		assert_eq!(response.partials[1].state.len(), 17);
+
+		node.handles.abort();
+	}
+
+	async fn aggregate_coordinator_fixture(
+		node_id: u32,
+		peer_capabilities: crate::network::transport::NodeCapabilitySet,
+	) -> (
+		WendelonNode,
+		Arc<WendelonDataServer>,
+		Arc<LoopbackHandlers>,
+		NodeId,
+		AggregateRequest,
+	) {
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			node_id,
+			bootstrap_tempdir(&format!("aggregate-coordinator-{node_id}")),
+			format!("loopback://{node_id}"),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x40; 16]),
+			3,
+			"analytics",
+			"full_scan",
+			&typed_table_schema(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::IdentityProjection,
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let pool = node.pool.clone();
+		let handlers = LoopbackHandlers::new(pool.clone());
+		let loopback_provider: Arc<dyn TransportProvider> = Arc::new(LoopbackProvider {
+			handlers: handlers.clone(),
+			tier: TransportTier::QuicIoUring,
+		});
+		let tiers = TransportTierSet::empty().with(TransportTier::QuicIoUring);
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let peer = n(node_id + 100);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: format!("loopback://{node_id}"),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		peers.insert(
+			peer,
+			PeerCapabilities {
+				address: format!("loopback://{}", node_id + 100),
+				tiers,
+				roles,
+				capabilities: peer_capabilities,
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let mut providers = std::collections::HashMap::new();
+		providers.insert(TransportTier::QuicIoUring, loopback_provider);
+		let factory = TransportProviderFactory::new(tiers, providers, resolver, epoch_rx);
+		let router: Arc<dyn ReplicaRouter> =
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node]));
+		let coordinator = Arc::new(
+			WendelonDataServer::new(
+				node.slab.clone(),
+				node.raft.clone(),
+				node.log_store.clone(),
+				node.state_machine.clone(),
+				node.local_node,
+				node.clock.clone(),
+				router,
+				factory,
+				pool,
+			)
+			.unwrap(),
+		);
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(u128::from(node_id)),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(0, 0, 0),
+			as_of_hlc: hlc(0, 0, 0),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression::count_star()],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(1_024),
+				max_rows: RowCount::new(1_024),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		(node, coordinator, handlers, peer, request)
+	}
+
+	fn aggregate_request_frame(pool: &Arc<BufPool>, request: &AggregateRequest) -> HrftFrame {
+		let encoded = wire::encode(request).unwrap();
+		let mut trailing = pool.acquire();
+		trailing.as_mut_vec().extend_from_slice(&encoded);
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::AGG_REQ.0,
+				flags: 0,
+				stream_id: 45,
+				meta_len: 0,
+				arrow_len: 0,
+				trailing_len: trailing.len() as u32,
+			},
+			meta: pool.acquire(),
+			arrow_payload: None,
+			trailing: Some(trailing),
+		}
+	}
+
+	async fn dispatch_aggregate_request(
+		server: &Arc<WendelonDataServer>,
+		request: &AggregateRequest,
+	) -> AggregateResponse {
+		let frame = aggregate_request_frame(&server.pool, request);
+		let resp = DataRingServer::handle_data_frame(
+			server.as_ref(),
+			RequestContext {
+				remote: server.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		assert_eq!(resp.header.msg_type, MsgType::AGG_RESP.0);
+		wire::decode(resp.trailing.as_ref().expect("aggregate response trailing")).unwrap()
+	}
+
+	struct StaticAggregateService {
+		pool: Arc<BufPool>,
+		count: u64,
+		mismatched_crossbind: bool,
+	}
+
+	#[async_trait::async_trait]
+	impl crate::network::server::HrftService for StaticAggregateService {
+		async fn handle_frame(
+			&self,
+			_context: RequestContext,
+			frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
+			assert_eq!(frame.header.msg_type, MsgType::AGG_REQ.0);
+			let request: AggregateRequest =
+				wire::decode(frame.trailing.as_ref().expect("AGG_REQ trailing")).unwrap();
+			let state = self.count.to_be_bytes().to_vec();
+			let partial = crate::schema::AggregatePartial::new(
+				AggregateExpressionIndex::new(0),
+				AggregateFunctionTag::COUNT_STAR,
+				state,
+			)
+			.unwrap();
+			let response = AggregateResponse {
+				format_version: request.format_version,
+				request_id: if self.mismatched_crossbind {
+					AggregateRequestId::new(request.request_id.get().saturating_add(1))
+				} else {
+					request.request_id
+				},
+				status: AggregateStatus::Success,
+				reject_code: None,
+				table_object_id: request.table_object_id,
+				schema_generation: request.schema_generation,
+				schema_fingerprint: request.schema_fingerprint,
+				aggregate_expression_digest: request.expression_digest(),
+				as_of_hlc: request.as_of_hlc,
+				max_hlc: request.as_of_hlc,
+				partials: vec![partial],
+				diagnostics: AggregateDiagnostics {
+					rows_scanned: self.count,
+					rows_admitted: self.count,
+					..AggregateDiagnostics::default()
+				},
+			};
+			let trailing = wire::encode_into(&self.pool, &response)?;
+			Ok(Some(HrftFrame {
+				header: FrameHeader {
+					magic: HRFT_MAGIC,
+					version: 1,
+					msg_type: MsgType::AGG_RESP.0,
+					flags: FRAME_FLAG_STREAM_END,
+					stream_id: frame.header.stream_id,
+					meta_len: 0,
+					arrow_len: 0,
+					trailing_len: trailing.len() as u32,
+				},
+				meta: self.pool.acquire(),
+				arrow_payload: None,
+				trailing: Some(trailing),
+			}))
+		}
+	}
+
+	#[tokio::test]
+	async fn aggregate_coordinator_rejects_peer_without_partial_capability() {
+		let (node, coordinator, _handlers, _peer, request) = aggregate_coordinator_fixture(
+			45,
+			crate::network::transport::NodeCapabilitySet::empty(),
+		)
+		.await;
+
+		let response = dispatch_aggregate_request(&coordinator, &request).await;
+		assert_eq!(response.status, AggregateStatus::Rejected);
+		assert_eq!(
+			response.reject_code,
+			Some(AggRejectCode::CapabilityUnavailable)
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_coordinator_rejects_remote_failure() {
+		let (node, coordinator, _handlers, _peer, request) = aggregate_coordinator_fixture(
+			46,
+			crate::network::transport::NodeCapabilitySet::empty()
+				.with(NodeCapability::PartialAggregatePushdown),
+		)
+		.await;
+
+		let response = dispatch_aggregate_request(&coordinator, &request).await;
+		assert_eq!(response.status, AggregateStatus::Rejected);
+		assert_eq!(response.reject_code, Some(AggRejectCode::DeadlineExceeded));
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_coordinator_merges_peer_partial_response() {
+		let (node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
+			47,
+			crate::network::transport::NodeCapabilitySet::empty()
+				.with(NodeCapability::PartialAggregatePushdown),
+		)
+		.await;
+		handlers.register(
+			peer,
+			Arc::new(StaticAggregateService {
+				pool: coordinator.pool.clone(),
+				count: 2,
+				mismatched_crossbind: false,
+			}),
+		);
+
+		let response = dispatch_aggregate_request(&coordinator, &request).await;
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.partials.len(), 1);
+		assert_eq!(response.partials[0].state.as_slice(), &2_u64.to_be_bytes());
+		assert_eq!(response.diagnostics.rows_admitted, 2);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_coordinator_rejects_peer_crossbind_mismatch() {
+		let (node, coordinator, handlers, peer, request) = aggregate_coordinator_fixture(
+			48,
+			crate::network::transport::NodeCapabilitySet::empty()
+				.with(NodeCapability::PartialAggregatePushdown),
+		)
+		.await;
+		handlers.register(
+			peer,
+			Arc::new(StaticAggregateService {
+				pool: coordinator.pool.clone(),
+				count: 2,
+				mismatched_crossbind: true,
+			}),
+		);
+
+		let response = dispatch_aggregate_request(&coordinator, &request).await;
+		assert_eq!(response.status, AggregateStatus::Rejected);
+		assert_eq!(
+			response.reject_code,
+			Some(AggRejectCode::PartialCrossbindFailed)
+		);
+
+		node.handles.abort();
+	}
+
+	#[test]
+	fn aggregate_csb_response_marks_truncated_min_partial() {
+		use crate::schema::aggregate::AGG_MIN_MAX_PREFIX_BYTES;
+		use crate::storage::stats::{
+			ARROW_STATS_TAG_LARGE_UTF8, COLUMN_STAT_HAS_MIN, COLUMN_STAT_HAS_NON_NULL_COUNT,
+			COLUMN_STAT_HAS_NULL_COUNT, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsBlockEntry,
+			ColumnStatsBlockHeader, ParsedColumnStatsBlock, encode_length_prefixed_bytes,
+		};
+
+		let descriptor = typed_table_descriptor();
+		let prefix = vec![b'a'; AGG_MIN_MAX_PREFIX_BYTES];
+		let mut payload = Vec::new();
+		encode_length_prefixed_bytes(&mut payload, &prefix).unwrap();
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&1_u64.to_be_bytes());
+		let stats = ParsedColumnStatsBlock {
+			header: ColumnStatsBlockHeader {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				schema_fingerprint: descriptor.schema_fingerprint,
+				row_count: 1,
+				column_block_count: 1,
+			},
+			columns: vec![ColumnStatsBlockEntry {
+				column_ordinal: 1,
+				arrow_type_tag: ARROW_STATS_TAG_LARGE_UTF8,
+				stat_flags: COLUMN_STAT_HAS_MIN
+					| COLUMN_STAT_MIN_TRUNCATED
+					| COLUMN_STAT_HAS_NULL_COUNT
+					| COLUMN_STAT_HAS_NON_NULL_COUNT,
+				payload,
+			}],
+		};
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(491),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc: hlc(99, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression {
+				tag: AggregateFunctionTag::MIN,
+				column_ordinal: 1,
+				parameter_block: Vec::new(),
+			}],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(1),
+				max_rows: RowCount::new(1),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+
+		let response = aggregate_csb_response_for_stats(&request, &descriptor, &stats)
+			.unwrap()
+			.unwrap();
+		assert_eq!(response.status, AggregateStatus::Partial);
+		assert_eq!(
+			&response.partials[0].state[4..4 + prefix.len()],
+			prefix.as_slice()
+		);
+		assert_eq!(response.partials[0].state.last(), Some(&1));
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 1);
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_direct_answer_handles_count_min_and_max() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb.wnd").await;
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			49,
+			bootstrap_tempdir("aggregate-csb-node"),
+			"loopback://49".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://49".into(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap();
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(490),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc: hlc(99, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![
+				AggregateExpression::count_star(),
+				AggregateExpression {
+					tag: AggregateFunctionTag::COUNT_NON_NULL,
+					column_ordinal: 1,
+					parameter_block: Vec::new(),
+				},
+				AggregateExpression {
+					tag: AggregateFunctionTag::MIN,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+				AggregateExpression {
+					tag: AggregateFunctionTag::MAX,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+			],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+
+		let metric_before = metrics().agg_csb_short_circuit_total.get();
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 1);
+		assert_eq!(response.diagnostics.rows_admitted, 2);
+		assert_eq!(
+			metrics().agg_csb_short_circuit_total.get(),
+			metric_before + 1
+		);
+		assert_eq!(response.partials[0].state.as_slice(), &2_u64.to_be_bytes());
+		assert_eq!(response.partials[1].state.as_slice(), &2_u64.to_be_bytes());
+		let min = encode_signed_stat_value(1, 8).unwrap();
+		let max = encode_signed_stat_value(2, 8).unwrap();
+		assert_eq!(&response.partials[2].state[4..12], min.as_slice());
+		assert_eq!(&response.partials[3].state[4..12], max.as_slice());
 
 		node.handles.abort();
 	}

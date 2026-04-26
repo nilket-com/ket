@@ -379,6 +379,30 @@ wire RPC names slab IDs.
     column is known, it just isn't statable — without inventing a
     placeholder encoding that would have to be unwound later.
 
+15a. **ADR 040 amendment: TieredSlab visibility tombstone.**
+    TieredSlab pointers carry an optional
+    `first_tombstone_hlc: Option<HybridTimestamp>` field. The
+    field is not CSB content; it is control-ring pointer metadata
+    used by aggregate CSB direct answers to prove that
+    slab-write-time stats equal the row set visible at a requested
+    `as_of_hlc`.
+
+    Semantics: `None` means no tombstone is known for rows in the
+    slab. When a tombstone at HLC `T` is committed against a row in
+    slab `S`, storage updates the pointer to retain the earliest
+    tombstone timestamp:
+
+    ```rust
+    S.first_tombstone_hlc = match S.first_tombstone_hlc {
+        None         => Some(T),
+        Some(prev_t) => Some(min(prev_t, T)),
+    };
+    ```
+
+    Decoding pre-amendment pointers defaults the field to `None`.
+    Consumers that need a positive visibility proof must still fail
+    closed unless the rest of their proof condition is satisfied.
+
 16. **Per-slab CSB byte budget.** Total CSB ciphertext size is capped
     at `slab_payload_bytes / 256`. Scales with slab
     size: a 64 MiB slab gets 256 KiB cap; a 1 GiB slab gets 4 MiB cap;

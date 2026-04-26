@@ -47,6 +47,12 @@ const PBC_SLAB_STATS_BUCKETS_MICROS: &[u64] = &[
 ];
 const PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS: &[u64] =
 	&[1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304];
+const AGG_EXEC_BUCKETS_MICROS: &[u64] = &[
+	25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000,
+];
+const AGG_PARTIAL_BYTES_BUCKETS: &[u64] = &[
+	8, 32, 128, 512, 2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152,
+];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -694,6 +700,18 @@ pub struct MetricsRegistry {
 	pbc_slab_stats_build_micros: Histogram,
 	pbc_slab_stats_decrypt_micros: Histogram,
 	pbc_slab_stats_block_bytes: Histogram,
+	pub agg_request_total: Counter,
+	pub agg_request_rejected_total: Counter,
+	pub agg_rows_scanned_total: Counter,
+	pub agg_rows_admitted_total: Counter,
+	pub agg_rows_filtered_out_total: Counter,
+	pub agg_partials_merged_total: Counter,
+	pub agg_csb_short_circuit_total: Counter,
+	pub agg_int_overflow_total: Counter,
+	pub agg_skipped_no_capability_total: Counter,
+	agg_partial_bytes: Histogram,
+	agg_exec_micros: Histogram,
+	agg_merge_micros: Histogram,
 
 	pub group_commit_window_seconds: Histogram,
 	pub data_ring_durable_quorum_latency_seconds: Histogram,
@@ -811,6 +829,18 @@ impl Default for MetricsRegistry {
 			pbc_slab_stats_build_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
 			pbc_slab_stats_decrypt_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
 			pbc_slab_stats_block_bytes: Histogram::new(PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS),
+			agg_request_total: Counter::default(),
+			agg_request_rejected_total: Counter::default(),
+			agg_rows_scanned_total: Counter::default(),
+			agg_rows_admitted_total: Counter::default(),
+			agg_rows_filtered_out_total: Counter::default(),
+			agg_partials_merged_total: Counter::default(),
+			agg_csb_short_circuit_total: Counter::default(),
+			agg_int_overflow_total: Counter::default(),
+			agg_skipped_no_capability_total: Counter::default(),
+			agg_partial_bytes: Histogram::new(AGG_PARTIAL_BYTES_BUCKETS),
+			agg_exec_micros: Histogram::new(AGG_EXEC_BUCKETS_MICROS),
+			agg_merge_micros: Histogram::new(AGG_EXEC_BUCKETS_MICROS),
 
 			group_commit_window_seconds: Histogram::new(GROUP_COMMIT_WINDOW_BUCKETS_MICROS),
 			data_ring_durable_quorum_latency_seconds: Histogram::new(
@@ -977,6 +1007,37 @@ impl MetricsRegistry {
 
 	pub fn observe_pbc_slab_stats_block_bytes(&self, bytes: u64) {
 		self.pbc_slab_stats_block_bytes.observe_value(bytes);
+	}
+
+	pub fn observe_agg_execution(
+		&self,
+		rows_scanned: u64,
+		rows_admitted: u64,
+		duration: Duration,
+		partial_bytes: u64,
+		_overflow: bool,
+	) {
+		self.agg_request_total.inc();
+		self.agg_rows_scanned_total.add(rows_scanned);
+		self.agg_rows_admitted_total.add(rows_admitted);
+		self.agg_rows_filtered_out_total
+			.add(rows_scanned.saturating_sub(rows_admitted));
+		self.agg_exec_micros.observe_duration(duration);
+		self.agg_partial_bytes.observe_value(partial_bytes);
+	}
+
+	pub fn observe_agg_rejected(&self) {
+		self.agg_request_total.inc();
+		self.agg_request_rejected_total.inc();
+	}
+
+	pub fn observe_agg_merge(&self, partials: u64, duration: Duration) {
+		self.agg_partials_merged_total.add(partials);
+		self.agg_merge_micros.observe_duration(duration);
+	}
+
+	pub fn observe_agg_int_overflow(&self) {
+		self.agg_int_overflow_total.inc();
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1366,6 +1427,78 @@ impl MetricsRegistry {
 			"wendelon_pbc_slab_stats_block_bytes",
 			"Stats block ciphertext size in bytes.",
 			&self.pbc_slab_stats_block_bytes.snapshot(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_request_total",
+			"Aggregate pushdown requests executed or rejected.",
+			self.agg_request_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_request_rejected_total",
+			"Aggregate pushdown requests rejected before execution.",
+			self.agg_request_rejected_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_rows_scanned_total",
+			"Rows scanned by aggregate pushdown before predicate admission.",
+			self.agg_rows_scanned_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_rows_admitted_total",
+			"Rows admitted into aggregate accumulators after predicate filtering.",
+			self.agg_rows_admitted_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_rows_filtered_out_total",
+			"Rows removed by the aggregate request's embedded PBC predicate.",
+			self.agg_rows_filtered_out_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_partials_merged_total",
+			"Aggregate partial states merged by coordinators.",
+			self.agg_partials_merged_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_csb_short_circuit_total",
+			"Aggregate slab answers derived directly from column statistics blocks.",
+			self.agg_csb_short_circuit_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_int_overflow_total",
+			"Aggregate integer accumulator overflows observed.",
+			self.agg_int_overflow_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_agg_skipped_no_capability_total",
+			"Aggregate requests skipped because a selected peer lacks PartialAggregatePushdown.",
+			self.agg_skipped_no_capability_total.get(),
+		);
+		render_histogram_raw(
+			&mut out,
+			"wendelon_agg_partial_bytes",
+			"Aggregate partial-state bytes returned by storage execution.",
+			&self.agg_partial_bytes.snapshot(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_agg_exec_micros",
+			"Aggregate execution duration in microseconds.",
+			&self.agg_exec_micros.snapshot(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_agg_merge_micros",
+			"Aggregate partial merge duration in microseconds.",
+			&self.agg_merge_micros.snapshot(),
 		);
 		render_histogram(
 			&mut out,
@@ -1898,6 +2031,11 @@ mod tests {
 		registry.observe_pbc_slab_stats_build(Duration::from_micros(70));
 		registry.observe_pbc_slab_stats_decrypt(Duration::from_micros(30));
 		registry.observe_pbc_slab_stats_block_bytes(16_384);
+		registry.observe_agg_execution(20, 12, Duration::from_micros(90), 128, false);
+		registry.observe_agg_merge(2, Duration::from_micros(35));
+		registry.observe_agg_int_overflow();
+		registry.agg_csb_short_circuit_total.inc();
+		registry.agg_skipped_no_capability_total.inc();
 
 		let rendered = registry.render_prometheus();
 		assert!(rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"ok\"} 1"));
@@ -1939,6 +2077,17 @@ mod tests {
 		assert!(rendered.contains("wendelon_pbc_slab_stats_build_micros_bucket{le=\"100\"} 1"));
 		assert!(rendered.contains("wendelon_pbc_slab_stats_decrypt_micros_bucket{le=\"50\"} 1"));
 		assert!(rendered.contains("wendelon_pbc_slab_stats_block_bytes_bucket{le=\"16384\"} 1"));
+		assert!(rendered.contains("wendelon_agg_request_total 1"));
+		assert!(rendered.contains("wendelon_agg_rows_scanned_total 20"));
+		assert!(rendered.contains("wendelon_agg_rows_admitted_total 12"));
+		assert!(rendered.contains("wendelon_agg_rows_filtered_out_total 8"));
+		assert!(rendered.contains("wendelon_agg_partials_merged_total 2"));
+		assert!(rendered.contains("wendelon_agg_csb_short_circuit_total 1"));
+		assert!(rendered.contains("wendelon_agg_int_overflow_total 1"));
+		assert!(rendered.contains("wendelon_agg_skipped_no_capability_total 1"));
+		assert!(rendered.contains("wendelon_agg_partial_bytes_bucket{le=\"128\"} 1"));
+		assert!(rendered.contains("wendelon_agg_exec_micros_bucket{le=\"100\"} 1"));
+		assert!(rendered.contains("wendelon_agg_merge_micros_bucket{le=\"50\"} 1"));
 		assert!(
 			rendered.contains("wendelon_data_ring_write_outcome_total{outcome=\"unknown_250\"} 1")
 		);

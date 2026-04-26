@@ -309,6 +309,15 @@ impl_unit!(SlabId, u64);
 impl_unit!(LogIndex, u64);
 impl_unit!(Epoch, u64);
 impl_unit!(TenantId, u64);
+impl_unit!(AggregateRequestId, u128);
+impl_unit!(AggregateExpressionIndex, u16);
+impl_unit!(KllK, u32);
+impl_unit!(LocationCount, u64);
+impl_unit!(RowCount, u64);
+impl_unit!(DurationMillis, u64);
+impl_unit!(ByteCount, u64);
+impl_unit!(PartialStateLength, u32);
+impl_unit!(OverflowFlag, u8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]

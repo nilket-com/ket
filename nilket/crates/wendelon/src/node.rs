@@ -1314,6 +1314,7 @@ impl WendelonNode {
 					stats_format_version: tier.stats_format_version,
 					stats_block_len: tier.stats_block_len,
 					stats_block_hash128: tier.stats_block_hash128,
+					first_tombstone_hlc: tier.first_tombstone_hlc,
 				},
 				recovered_log_index,
 			)
@@ -2078,7 +2079,9 @@ fn seed_single_node_epoch(
 }
 
 fn advertised_capabilities() -> NodeCapabilitySet {
-	NodeCapabilitySet::empty().with(NodeCapability::SlabStatsPruning)
+	NodeCapabilitySet::empty()
+		.with(NodeCapability::SlabStatsPruning)
+		.with(NodeCapability::PartialAggregatePushdown)
 }
 
 fn transport_tiers_for_provider(provider_tier: TransportTier) -> TransportTierSet {
@@ -2994,6 +2997,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
+				first_tombstone_hlc: None,
 			}))
 			.await
 			.unwrap();
@@ -3104,6 +3108,7 @@ mod tests {
 				stats_block_hash128: encrypted
 					.stats_locator
 					.map(|locator| locator.stats_block_hash128),
+				first_tombstone_hlc: None,
 			}))
 			.await
 			.unwrap();

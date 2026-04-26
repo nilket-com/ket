@@ -49,10 +49,11 @@ one merged envelope.
 CSB drives both predicate pruning during slab admission AND a
 narrow direct-answer short-circuit for `count_star`,
 `count_non_null`, `min`, and `max` under a strict
-visibility-and-predicate proof condition (§5). The proof depends
-on a small extension to ADR 039's TieredSlab pointer: a
-`first_tombstone_hlc: Option<HybridTimestamp>` field, added by
-this ADR's V1 (§"Dependency on ADR 039").
+visibility-and-nonrestrictive-predicate proof condition (§5).
+The proof depends on a small ADR 039 TieredSlab pointer
+extension amended by this ADR:
+`first_tombstone_hlc: Option<HybridTimestamp>` (§"ADR 039
+amendment").
 
 ### Scope and shape
 
@@ -73,7 +74,7 @@ this ADR's V1 (§"Dependency on ADR 039").
    tag   name              input types                        partial state
    ----  ----------------  --------------------------------  ----------------------
    0x01  count_star        (none)                            u64
-   0x02  count_non_null    any allowlisted column            u64
+   0x02  count_non_null    any descriptor column             u64
    0x03  signed_sum        Int{8,16,32,64}                   i128 + overflow_flag
    0x04  unsigned_sum      UInt{8,16,32,64}                  u128 + overflow_flag
    0x05  min               §15-allowlisted column            canonical bytes + flag
@@ -86,6 +87,11 @@ this ADR's V1 (§"Dependency on ADR 039").
    0x0A  quantile_kll      Int{8..64} | UInt{8..64} |        KLL sketch state
                             Timestamp | Date32 | Date64
    ```
+
+   "Any descriptor column" for `count_non_null` means the column
+   resolves at the pinned schema generation; it does not require
+   byte-comparable encoding. `count_non_null` only needs the
+   column's validity bitmap or CSB null/non-null counts.
 
    §15-allowlisted column refers to ADR 039 §15: the canonical
    byte-comparable encoding allowlist (signed/unsigned ints,
@@ -129,8 +135,9 @@ this ADR's V1 (§"Dependency on ADR 039").
 
    **Explicitly not in V1**:
    - Float aggregates (`Float32`, `Float64`).
-   - Decimal SUM and AVG. Decimal MIN/MAX is included via the
-     §15 allowlist.
+   - Decimal aggregates, including Decimal MIN/MAX. ADR 039 §15
+     deliberately gives Decimal opaque CSB entries and does not
+     pin a byte-comparable Decimal encoding in V1.
    - Exact `COUNT(DISTINCT col)`.
    - String/Binary quantiles.
    - Variance, stddev, correlation, covariance, `percentile_cont`.
@@ -155,13 +162,17 @@ this ADR's V1 (§"Dependency on ADR 039").
    2. The slab is **visibility-complete at `as_of_hlc`**:
       `slab.seal_hlc ≤ as_of_hlc` AND
       (`slab.first_tombstone_hlc` is `None` OR > `as_of_hlc`).
-      The `first_tombstone_hlc` field is added to ADR 039's
-      TieredSlab pointer by this ADR's V1; see §"Dependency on
-      ADR 039".
+      The `first_tombstone_hlc` field amends ADR 039's
+      TieredSlab pointer; see §"ADR 039 amendment".
    3. The PBC predicate (if any) is **provably non-restrictive
       for the slab**: every row in the slab satisfies the
-      predicate. Decided by the existing ADR 039
-      predicate-classification helper.
+      predicate. This is *not* ADR 039's pruning proof, which
+      answers the opposite question ("no row can match"). ADR
+      040 defines a separate full-coverage classifier. The V1
+      implementation may start conservatively with only the empty
+      predicate classified as full coverage; more predicate
+      shapes may be added only with tests proving the "every row
+      matches" direction.
 
    When all three hold, the slab contributes to the partial
    without decryption. Counter `agg_csb_short_circuit_total`
@@ -189,8 +200,8 @@ this ADR's V1 (§"Dependency on ADR 039").
    selectivity-only). `quantile_kll` similarly never short-
    circuits — CSB doesn't carry quantile sketches.
 
-6. **Approximate aggregates are tagged `WendelonApprox` at
-   planning time.** ADR 036 §3's `WendelonApprox` targetability
+6. **Approximate aggregates are tagged `PushdownApprox` at
+   planning time.** ADR 036 §3's `PushdownApprox` targetability
    label, idle since the contract was written, becomes
    load-bearing here. `quantile_kll` and `approx_distinct` carry
    documented error bounds; Toron's planner is responsible for
@@ -214,7 +225,7 @@ this ADR's V1 (§"Dependency on ADR 039").
    consistency                   Consistency           linearizable | bounded
    min_hlc                       HybridTimestamp       staleness floor
    as_of_hlc                     HybridTimestamp       read snapshot point
-   locality_ranges               Vec<LocalityRange>    pre-narrowed by Toron
+   locality_ranges               Vec<LocalityRange>    Toron hint, may be pre-narrowed
    predicate_program             Option<PbcProgram>    optional row filter
    aggregate_count               u16 BE                bounded ≤ 64
    aggregates                    AggregateExpression[] see below
@@ -223,6 +234,13 @@ this ADR's V1 (§"Dependency on ADR 039").
 
    `PbcProgram` is the predicate-bytecode type from ADRs
    005/035/036.
+
+   `locality_ranges` is not trusted as a proof. Toron may
+   pre-narrow it from query predicates, but the coordinator still
+   intersects it with descriptor-derived and predicate-derived
+   scan ranges before peer fan-out. The second step is a safety
+   intersection plus ring partitioning, not an attempt to change
+   query semantics.
 
    `AggregateExpression`:
 
@@ -320,13 +338,23 @@ this ADR's V1 (§"Dependency on ADR 039").
                             u32 BE k_parameter ‖
                             u64 BE total_item_count ‖
                             u32 BE level_count ‖
-                            (u32 BE level_size ‖ canonical_bytes[])* ‖
+                            (u32 BE level_item_count ‖ canonical_bytes[])* ‖
                             u32 BE compaction_seed
    ```
 
+   `level_item_count` is an item count, not a byte length. The
+   byte width of each retained item is inferred from
+   `arrow_type_tag`. V1 KLL excludes variable-width Utf8/Binary,
+   so the parser never needs per-item length prefixes; any future
+   variable-width KLL state must use a new tag or versioned state
+   body.
+
    `compaction_seed` for KLL is derived as
    `BLAKE3(tenant_id || table_object_id || request_id)[0..4]`
-   so merges across peers are bit-exact reproducible.
+   so merges across peers are bit-exact reproducible. The input
+   components are fixed-width (`TenantId`, 16-byte
+   `TableObjectId`, `AggregateRequestId`), so raw concatenation
+   is collision-safe for seed-domain framing.
 
    The HLL register array layout matches ADR 039 §14
    byte-for-byte so the same register-merge code path serves
@@ -335,6 +363,24 @@ this ADR's V1 (§"Dependency on ADR 039").
    `overflow_flag` semantics: when local accumulation saturates
    `i128`/`u128`, the flag is set; on merge, an overflow-flagged
    partial poisons the merged result to `AGG_NUMERIC_OVERFLOW`.
+   Overflow is accumulated as a local flag and propagated through
+   merge; storage does not wrap and does not need to abort at the
+   first overflowing row.
+
+   SUM `state_length = 0` is the sole wire signal for "zero
+   non-null rows." Non-null counts for SUM are local accumulator
+   bookkeeping used only to decide whether to emit the empty
+   encoding; they are not serialized and are not merge inputs.
+
+   MIN/MAX merge compares canonical bytes lexicographically. If
+   one candidate wins, its `truncated_flag` is carried. If two
+   candidates compare byte-equal, the merged `truncated_flag` is
+   the OR of both flags. OR is safe for prefix truncation because
+   byte-equal truncated candidates describe value ranges bounded by
+   the same canonical prefix. A final `truncated_flag = 1` means
+   the returned bytes are a prefix-bound, not an exact scalar; the
+   response status is `partial`, and Toron must fall back to the
+   row-query path when exact SQL/Rune semantics are required.
 
    The corresponding in-memory state enum (illustrative,
    non-authoritative; the wire format above is canonical):
@@ -342,8 +388,8 @@ this ADR's V1 (§"Dependency on ADR 039").
    ```rust
    enum AggregateState {
        Count { value: u64 },
-       SignedSum { sum: i128, non_null_count: u64, overflow: bool },
-       UnsignedSum { sum: u128, non_null_count: u64, overflow: bool },
+       SignedSum { sum: i128, non_null_count_local: u64, overflow: bool },
+       UnsignedSum { sum: u128, non_null_count_local: u64, overflow: bool },
        MinMax { value: Option<Vec<u8>>, arrow_type_tag: u8, truncated: bool },
        SignedAverageParts { sum: i128, count: u64, overflow: bool },
        UnsignedAverageParts { sum: u128, count: u64, overflow: bool },
@@ -357,7 +403,8 @@ this ADR's V1 (§"Dependency on ADR 039").
 
 10. **Integer SUM is bit-exact and order-independent.** Signed
     integer inputs accumulate into `i128`; unsigned into `u128`.
-    Overflow → `AGG_NUMERIC_OVERFLOW`, not wrap-around.
+    Overflow sets a poison flag that merges into response status
+    `AGG_NUMERIC_OVERFLOW`; values never wrap around.
 
 11. **MIN, MAX, COUNT, AVG are bit-exact.** No floating-point
     arithmetic in the V1 hot path. AVG returns a `(sum, count)`
@@ -395,8 +442,8 @@ this ADR's V1 (§"Dependency on ADR 039").
     is the *aggregate coordinator*. It:
     1. Validates schema, capability, aggregate expressions,
        PBC program, and budgets.
-    2. Decomposes `locality_ranges` using ADR 038's range
-       narrowing.
+    2. Intersects `locality_ranges` with descriptor/PBC-derived
+       scan ranges and partitions the result by ring primary.
     3. Dispatches subrequests to peer storage nodes that
        advertise `PartialAggregatePushdown`.
     4. Executes its own subranges directly.
@@ -408,6 +455,14 @@ this ADR's V1 (§"Dependency on ADR 039").
     `schema_fingerprint`, aggregate-expression digest, and
     `as_of_hlc`. Mismatches reject before merge with
     `AGG_REJECT_PARTIAL_CROSSBIND_FAILED`.
+
+    V1 does not return `partial` for peer timeout or partial
+    fan-out. Missing, failed, or capability-mismatched peers fail
+    closed with a rejected response (`DEADLINE_EXCEEDED` or
+    `CAPABILITY_UNAVAILABLE`). `partial` is reserved for complete
+    fan-out where every selected storage node responded but at
+    least one final value is semantically incomplete (currently:
+    prefix-truncated MIN/MAX).
 
 18. **Per-storage-node merge first, then coordinator merge.** A
     storage node servicing multiple slabs merges its per-slab
@@ -429,8 +484,12 @@ this ADR's V1 (§"Dependency on ADR 039").
     - The optional PBC program passes ADR 035 / 036 validation.
     - `as_of_hlc ≥ min_hlc`.
     - `budgets.max_locations ≤ MAX_PEER_FANOUT`.
-    - Session's exact-only flag (if set) does not conflict with
-      approximate aggregates — otherwise
+    - Toron's session-level exact-only planning flag (not an AGG
+      wire field) does not conflict with approximate aggregates;
+      if Toron cannot surface approximate semantics, it must not
+      construct an AGG request with approximate tags. Storage
+      validators may enforce the same check for internal callers
+      — otherwise
       `AGG_REJECT_APPROX_NOT_ALLOWED`.
 
 20. **Reject and status codes.** Stable across the version
@@ -508,9 +567,9 @@ this ADR's V1 (§"Dependency on ADR 039").
     carries a targetability label:
     - `count(*)`, `count(col)`, `sum(int_col)`, `sum(uint_col)`,
       `min(col)`, `max(col)`, `avg(int_col)`, `avg(uint_col)`
-      are `WendelonExact` for §15-allowlisted columns.
+      are `PushdownExact` for supported columns.
     - `approx_quantile(col, q)`, `approx_distinct(col)` are
-      `WendelonApprox`.
+      `PushdownApprox`.
     - `sum(float_col)`, `sum(decimal_col)`, `avg(float_col)`,
       `avg(decimal_col)`, exact `count_distinct(col)`, `stddev`,
       `variance`, `corr` are `ToronOnly`.
@@ -570,10 +629,12 @@ this ADR's V1 (§"Dependency on ADR 039").
     References to the predicate bytecode use `PBC` per ADR 041's
     project-name decoupling.
 
-## Dependency on ADR 039: `first_tombstone_hlc` field
+## ADR 039 amendment: `first_tombstone_hlc` field
 
 V1's CSB short-circuit (§5) requires a small extension to ADR
-039's TieredSlab pointer schema:
+039's TieredSlab pointer schema. This ADR amends ADR 039 in
+place; ownership of the field is ADR 039's storage pointer
+contract, while ADR 040 is the first consumer.
 
 ```rust
 // added to TieredSlab pointer (control-ring state):
@@ -611,12 +672,10 @@ write. Both negligible relative to the optimization they unlock
 (chunk-decryption-free MIN/MAX/COUNT for append-only and
 steady-state reads).
 
-The field is added by this ADR's implementation (Phase 0 of the
-companion impl plan). Pre-040 sealed slabs have `None`; CSB
-short-circuit treats absence conservatively as "not eligible"
-until natural compaction populates the field. A future
-039-followup ADR may formalize the field alongside other
-visibility metadata; until then, ADR 040 owns it.
+Pre-amendment sealed slabs have no encoded field; decode defaults
+to `None`. CSB short-circuit treats those slabs conservatively as
+"not eligible" until natural compaction or rewrite produces a
+pointer under the amended schema.
 
 ## Rationale
 
@@ -638,9 +697,11 @@ new types later (e.g., `Decimal`) means appending new tag
 numbers, not adding discriminator values within an existing
 tag — append-only extension matches the catalog-evolution rule.
 
-**Why integer SUM into `i128`/`u128` with hard overflow.** At
-warehouse scale, `i64` SUM overflows are plausible. Hard-reject
-is louder than modular wrap.
+**Why integer SUM into `i128`/`u128` with poisoned overflow.** At
+warehouse scale, `i64` SUM overflows are plausible. A sticky
+overflow flag that poisons the merged response is louder than
+modular wrap while still letting every storage node finish its
+local fold and return diagnostics.
 
 **Why no float aggregates in V1.** ADR 039 §15 deferred float
 canonical encoding. Float SUM has its own design surface (Kahan
@@ -649,9 +710,11 @@ that should land *together with* float canonical encoding for
 stats. Two linked deferrals are cleaner than independently
 rotting halves.
 
-**Why no decimal SUM/AVG in V1.** Same scope-discipline
-reasoning as float; decimal MIN/MAX is fine because it's a
-stable comparison.
+**Why no decimal aggregates in V1.** ADR 039 intentionally
+omits Decimal canonical byte-comparable encoding. Decimal MIN/MAX
+can join once Decimal encoding and scale-normalization semantics
+are pinned with golden tests; Decimal SUM/AVG also need overflow
+and scale rules.
 
 **Why KLL, not t-digest, for quantiles.** V1 rejects float
 inputs; t-digest's centroids are floats; KLL operates on ordered
@@ -720,10 +783,10 @@ into a stability contract it doesn't deserve.
   itself is cheap, but the optimization payoff is
   workload-shaped.
 - **The coordinator becomes a fan-out hot spot.**
-- **`AGG_NUMERIC_OVERFLOW` as a hard reject is operationally
-  noisy.** A legitimate query against a malformed-data tenant
-  could fail closed. Modular wrap was rejected as silently
-  incorrect.
+- **`AGG_NUMERIC_OVERFLOW` as a poisoned response status is
+  operationally noisy.** A legitimate query against a
+  malformed-data tenant could fail closed. Modular wrap was
+  rejected as silently incorrect.
 - **The protocol's wire format is a new compatibility surface.**
   Future aggregates extend the catalog by appending tag bytes;
   renumbering forbidden.
@@ -755,8 +818,9 @@ V1 scope:
 - **`GROUP BY` in V1.** Doubles the design surface.
 - **Float aggregates in V1.** Pinned to land with float
   canonical encoding.
-- **Decimal SUM/AVG in V1.** Same scope-discipline reasoning;
-  decimal MIN/MAX retained.
+- **Decimal aggregates in V1.** Same scope-discipline reasoning;
+  Decimal MIN/MAX joins after ADR 039 pins Decimal canonical
+  encoding.
 - **Exact `COUNT(DISTINCT)` in V1.** Sound implementation blows
   V1 scope; `approx_distinct` is the V1 path.
 - **String/Binary `quantile_kll` in V1.** Prefix-truncation
@@ -849,8 +913,9 @@ atomicity strategy) are tracked alongside the implementation PR.
    well-defined merge semantics (Kahan? ordered? naive?) and
    NaN propagation rules joins this ADR.
 
-3. **Decimal SUM/AVG.** Pinned `Decimal256` overflow and scale
-   contract.
+3. **Decimal aggregates.** Pinned Decimal canonical
+   byte-comparable encoding, then `Decimal256` overflow and scale
+   contract for SUM/AVG.
 
 4. **String/Binary quantiles.** Either drop ADR 039's
    prefix-truncation for KLL inputs (separate full-byte stat),

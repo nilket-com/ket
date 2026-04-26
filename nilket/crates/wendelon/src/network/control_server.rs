@@ -3109,6 +3109,7 @@ mod tests {
 				stats_format_version: None,
 				stats_block_len: None,
 				stats_block_hash128: None,
+				first_tombstone_hlc: None,
 			},
 		);
 		snapshot.tiered_slabs.insert(
@@ -3123,6 +3124,7 @@ mod tests {
 				stats_format_version: None,
 				stats_block_len: None,
 				stats_block_hash128: None,
+				first_tombstone_hlc: None,
 			},
 		);
 
