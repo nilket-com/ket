@@ -539,6 +539,7 @@ async fn build_manager_with_sealed_slabs(
 			io,
 			l2,
 			rehydration: wendelon::storage::RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

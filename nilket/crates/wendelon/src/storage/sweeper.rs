@@ -1777,6 +1777,7 @@ mod tests {
 				io,
 				l2,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2079,6 +2080,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: crypto.clone(),
 			})
@@ -2174,6 +2176,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2274,6 +2277,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2396,6 +2400,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2537,6 +2542,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2674,6 +2680,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2795,6 +2802,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -2957,6 +2965,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})

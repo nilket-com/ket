@@ -157,9 +157,104 @@ impl Program {
 		self.project.is_some()
 	}
 
+	pub fn referenced_columns(&self) -> Vec<u32> {
+		let mut columns = self
+			.ops
+			.iter()
+			.filter_map(|op| match op {
+				Op::PushCol(column) => Some(*column),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		columns.sort_unstable();
+		columns.dedup();
+		columns
+	}
+
+	pub fn project_columns(&self) -> Option<&[usize]> {
+		self.project.as_deref()
+	}
+
+	pub fn remap_columns<F>(&self, mapper: F) -> std::io::Result<Self>
+	where
+		F: FnMut(u32) -> std::io::Result<u32>,
+	{
+		self.remap_columns_with_project(mapper, None)
+	}
+
+	pub fn remap_columns_with_project<F>(
+		&self,
+		mut mapper: F,
+		project_columns: Option<&[u32]>,
+	) -> std::io::Result<Self>
+	where
+		F: FnMut(u32) -> std::io::Result<u32>,
+	{
+		let mut ops = Vec::with_capacity(self.ops.len());
+		for op in &self.ops {
+			ops.push(match op {
+				Op::PushCol(column) => Op::PushCol(mapper(*column)?),
+				Op::PushInt(value) => Op::PushInt(*value),
+				Op::PushStr(bytes) => Op::PushStr(bytes.clone()),
+				Op::PushBool(value) => Op::PushBool(*value),
+				Op::PushFloat(value) => Op::PushFloat(*value),
+				Op::PushTs(value) => Op::PushTs(*value),
+				Op::Eq => Op::Eq,
+				Op::Neq => Op::Neq,
+				Op::Gt => Op::Gt,
+				Op::Lt => Op::Lt,
+				Op::Gte => Op::Gte,
+				Op::Lte => Op::Lte,
+				Op::And => Op::And,
+				Op::Or => Op::Or,
+				Op::Not => Op::Not,
+				Op::InList(count) => Op::InList(*count),
+				Op::IsNull => Op::IsNull,
+				Op::IsNotNull => Op::IsNotNull,
+			});
+		}
+		let project = match project_columns {
+			Some(columns) => Some(remap_project_columns(columns.iter().copied(), &mut mapper)?),
+			None => self.project.as_ref().map_or(Ok(None), |columns| {
+				let columns = columns
+					.iter()
+					.map(|column| {
+						u32::try_from(*column).map_err(|_| {
+							Error::new(
+								ErrorKind::InvalidData,
+								format!("PBC: project column {column} exceeds u32::MAX"),
+							)
+						})
+					})
+					.collect::<std::io::Result<Vec<_>>>()?;
+				remap_project_columns(columns, &mut mapper).map(Some)
+			})?,
+		};
+		let program = Self { ops, project };
+		validate_program(&program)?;
+		Ok(program)
+	}
+
 	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicateV1>> {
 		extract_conjunctive_column_predicates(&self.ops)
 	}
+}
+
+fn remap_project_columns(
+	columns: impl IntoIterator<Item = u32>,
+	mapper: &mut impl FnMut(u32) -> std::io::Result<u32>,
+) -> std::io::Result<Vec<usize>> {
+	columns
+		.into_iter()
+		.map(|column| {
+			usize::try_from(mapper(column)?).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("PBC: remapped project column {column} exceeds usize::MAX"),
+				)
+			})
+		})
+		.collect()
 }
 
 #[derive(Clone, Debug)]

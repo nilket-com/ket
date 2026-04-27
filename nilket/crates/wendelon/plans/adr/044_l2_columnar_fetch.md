@@ -339,9 +339,14 @@ pub struct RecordBufferDirectory {
     /// Indexed by Arrow IPC buffer ordinal (not column ordinal).
     /// Multi-buffer columns (UTF-8, List, etc.) span N entries.
     buffers: SmallVec<[IpcBufferRange; 32]>,
-    /// Maps logical column ordinal → buffer ordinals consumed by
-    /// that column. Derived from the IPC schema message.
+    /// Maps IPC schema column ordinal → buffer ordinals consumed
+    /// by that physical IPC column. Descriptor/user ordinals are
+    /// resolved to IPC ordinals before this map is consulted;
+    /// ADR 042 synthetic columns occupy their appended IPC slots.
     column_to_buffers: SmallVec<[ColumnBufferRange; 16]>,
+    /// Descriptor fingerprint captured from the validated table
+    /// descriptor. Used to reject cross-record/schema mixing when
+    /// a slab-level or query-level plan spans multiple records.
     schema_fingerprint: SchemaFingerprint,
 }
 
@@ -419,10 +424,10 @@ For each admitted record:
   // Cheap bypasses — no Phase A round trip.
   if not config.enabled:
       use whole-record fetch (Disabled).
-  if record_layout == SingleRow:
+  if descriptor.record_layout_policy.is_single_row():
       use whole-record fetch (SingleRow).
   required = ColumnFetchRequirement (§4)
-  if required.is_full(schema):
+  if required.is_full(descriptor_user_schema):
       use whole-record fetch (FullProjection).
   if record.length < config.min_record_bytes:
       use whole-record fetch (SmallRecord).
@@ -447,7 +452,7 @@ For each admitted record:
   use the columnar plan.
 ```
 
-The planner emits a single value of:
+The dispatcher carries a single value of:
 
 ```rust
 pub enum L2FetchStrategy {
@@ -468,6 +473,14 @@ pub enum ColumnarFallbackReason {
     RehydrationAvailable,
 }
 ```
+
+`pick_l2_fetch_strategy` itself returns either
+`Columnar(plan)` or `Fallback(reason)`. `WholeRecord` is
+reserved for dispatcher-level whole-record execution where
+column planning is intentionally not invoked (for example,
+an unencrypted L2 object without ADR 020 chunk/index
+metadata). It is not a fallback reason and therefore does
+not increment the fallback counter.
 
 Authentication failures and invalid-data errors are *not*
 variants of this enum — see §7. Each reason that *is* a
@@ -518,12 +531,11 @@ permanently in columnar cold-read mode.
 
 ### 9. ADR 035 / 036 PBC composition
 
-PBC's contract is unchanged. The executor (`pbc.rs:496`,
-`execute_program_vectorized`) keeps consuming a decoded
-`RecordBatch` and returning a Boolean mask + projected
-output. What changes is *which* `RecordBatch` it sees: one
-materialized only over the columns the program references,
-not the full schema.
+PBC's contract is unchanged. The vectorized executor keeps
+consuming a decoded `RecordBatch` and returning a Boolean
+mask + projected output. What changes is *which*
+`RecordBatch` it sees: one materialized only over the
+columns the program references, not the full schema.
 
 The PBC opcode catalog is unchanged. No new opcode is
 introduced for column projection — the *existing* terminal
@@ -756,18 +768,19 @@ unchanged from ADR 043 §4.
   When admitted records are contiguous, the planner
   coalesces metadata fetches into one larger GET; when they
   are scattered, the round-trip cost is real. Quantified by
-  a new metric (`storage_columnar_metadata_round_trips_total`).
+  a new metric
+  (`storage_l2_column_fetch_phase_a_round_trips_total`).
 - **Planner overhead.** Per-admitted-record selectivity
   decision + chunk-coalescing computation is non-trivial.
   CPU cost is bounded (linear in projected buffer count and
   chunk count), but it is non-zero. Visible in
-  `storage_columnar_plan_micros`.
+  `storage_l2_column_fetch_plan_micros`.
 - **Worse small-record latency.** For records that fall
   below `min_record_bytes`, the whole-record
   path runs as today, but the planner still touches the
   record to make the decision. Bypass is possible (e.g.
   short-circuit on slab-stat-derived average size) and is a
-  Phase-7 implementation refinement.
+  Phase 8 refinement.
 - **Chunk over-fetch.** Buffer-to-chunk alignment means a
   small projected buffer near a chunk boundary still costs
   a full chunk fetch. ADR 020's 64 KiB chunk size is the
@@ -841,7 +854,7 @@ unchanged from ADR 043 §4.
   (nested structs, dictionaries, union types). Tables with
   unsupported layouts fall back to whole-record fetch
   uniformly via `unsupported_arrow_layout`. As partial
-  materializer support broadens in Phase-7+ refinements,
+  materializer support broadens in Phase 4 follow-up work,
   fallback rate should drop. The metric
   `storage_l2_column_fetch_fallback_total{reason="unsupported_arrow_layout"}`
   surfaces what is uncovered.
@@ -956,11 +969,9 @@ council/policy follow-up, or in a follow-on ADR.
    provider-aware.** S3, R2, GCS, B2, RustFS, LocalFs
    have different RTT and per-GET cost characteristics.
    V1 picks one cluster-wide default tuple
-   (256 KiB / 0.67); a follow-up may need per-provider
+   (256 KiB / 0.67). A follow-up may need per-provider
    defaults if Phase-11 metrics show one dominant
-   regime. Open question for the council: ship with
-   one tuple in V1 and revisit, or surface per-provider
-   defaults from day one?
+   regime.
 2. **Initial Arrow-layout coverage.** Should the V1
    partial materializer support every descriptor-supported
    Arrow type, or is `unsupported_arrow_layout` fallback
@@ -982,8 +993,8 @@ council/policy follow-up, or in a follow-on ADR.
 5. **Two-phase batching across records in the same slab.**
    Phase A for N admitted records can be one GET if their
    metadata-window bytes are contiguous on disk. Worth
-   batching in V1, or defer to V2 once round-trip-count
-   metrics are in?
+   batching in this ADR, or defer to a follow-on ADR once
+   round-trip-count metrics are in?
 6. **Whether the column fetch plan should expose its
    chunk-run set to a future Lambda/serverless pushdown
    (Brainstorm 010).** Default keeps it storage-internal;

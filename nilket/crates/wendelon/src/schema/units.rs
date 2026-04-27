@@ -320,8 +320,55 @@ impl_unit!(MaxRowCount, u32);
 impl_unit!(RecordRowIndex, u32);
 impl_unit!(DurationMillis, u64);
 impl_unit!(ByteCount, u64);
+impl_unit!(EncryptedChunkIndex, u64);
+impl_unit!(EncryptedChunkCount, u32);
+impl_unit!(IpcBufferOffset, u64);
+impl_unit!(IpcBufferLength, u64);
+impl_unit!(IpcBufferIndex, u32);
+impl_unit!(RecordBodyByteOffset, u64);
+impl_unit!(RecordBodyByteLen, u64);
 impl_unit!(PartialStateLength, u32);
 impl_unit!(OverflowFlag, u8);
+
+pub const ADR044_RECORD_BODY_BYTE_BOUND: u64 = 8 * 1024 * 1024;
+
+fn validate_adr044_record_body_unit(name: &str, value: u64) -> std::io::Result<()> {
+	if value > ADR044_RECORD_BODY_BYTE_BOUND {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!("{name} must be <= {ADR044_RECORD_BODY_BYTE_BOUND} bytes"),
+		));
+	}
+	Ok(())
+}
+
+impl IpcBufferOffset {
+	pub fn try_new(value: u64) -> std::io::Result<Self> {
+		validate_adr044_record_body_unit("ipc buffer offset", value)?;
+		Ok(Self(value))
+	}
+}
+
+impl IpcBufferLength {
+	pub fn try_new(value: u64) -> std::io::Result<Self> {
+		validate_adr044_record_body_unit("ipc buffer length", value)?;
+		Ok(Self(value))
+	}
+}
+
+impl RecordBodyByteOffset {
+	pub fn try_new(value: u64) -> std::io::Result<Self> {
+		validate_adr044_record_body_unit("record body byte offset", value)?;
+		Ok(Self(value))
+	}
+}
+
+impl RecordBodyByteLen {
+	pub fn try_new(value: u64) -> std::io::Result<Self> {
+		validate_adr044_record_body_unit("record body byte length", value)?;
+		Ok(Self(value))
+	}
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]

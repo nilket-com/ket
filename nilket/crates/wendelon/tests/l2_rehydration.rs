@@ -192,6 +192,7 @@ async fn build_tiered_manager(
 			io,
 			l2: Some(l2_store.clone()),
 			rehydration,
+			l2_column_fetch: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

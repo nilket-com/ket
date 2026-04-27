@@ -55,6 +55,7 @@ const AGG_PARTIAL_BYTES_BUCKETS: &[u64] = &[
 ];
 const MULTIROW_ROWS_PER_RECORD_BUCKETS: &[u64] =
 	&[1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 65536];
+const L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS: &[u64] = &[1, 2, 4, 8, 16, 32, 64];
 const COMPRESSION_RATIO_MILLI_BUCKETS: &[u64] = &[250, 500, 750, 1000, 1250, 1500, 2000];
 
 pub fn global() -> &'static MetricsRegistry {
@@ -281,6 +282,63 @@ impl CompressionCodecHistograms {
 				&[("codec", codec.codec_label())],
 				&self.histogram(codec).snapshot(),
 			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct L2ColumnFetchFallbackCounters {
+	disabled: Counter,
+	single_row: Counter,
+	full_projection: Counter,
+	small_record: Counter,
+	too_many_bytes: Counter,
+	too_many_ranges: Counter,
+	metadata_probe_cap: Counter,
+	unsupported_arrow_layout: Counter,
+	rehydration_available: Counter,
+}
+
+impl L2ColumnFetchFallbackCounters {
+	fn counter(&self, reason: &str) -> Option<&Counter> {
+		match reason {
+			"disabled" => Some(&self.disabled),
+			"single_row" => Some(&self.single_row),
+			"full_projection" => Some(&self.full_projection),
+			"small_record" => Some(&self.small_record),
+			"too_many_bytes" => Some(&self.too_many_bytes),
+			"too_many_ranges" => Some(&self.too_many_ranges),
+			"metadata_probe_cap" => Some(&self.metadata_probe_cap),
+			"unsupported_arrow_layout" => Some(&self.unsupported_arrow_layout),
+			"rehydration_available" => Some(&self.rehydration_available),
+			_ => None,
+		}
+	}
+
+	fn inc(&self, reason: &str) {
+		if let Some(counter) = self.counter(reason) {
+			counter.inc();
+		}
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for reason in [
+			"disabled",
+			"single_row",
+			"full_projection",
+			"small_record",
+			"too_many_bytes",
+			"too_many_ranges",
+			"metadata_probe_cap",
+			"unsupported_arrow_layout",
+			"rehydration_available",
+		] {
+			let value = self
+				.counter(reason)
+				.expect("static L2 column fetch fallback reason")
+				.get();
+			render_counter_with_labels(out, name, &[("reason", reason)], value);
 		}
 	}
 }
@@ -824,6 +882,9 @@ pub struct MetricsRegistry {
 	pub l1_read_latency_seconds: Histogram,
 	pub l2_upload_latency_seconds: Histogram,
 	pub l2_range_read_latency_seconds: Histogram,
+	storage_l2_column_fetch_plan_micros: Histogram,
+	storage_l2_column_fetch_selected_chunk_runs: Histogram,
+	storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters,
 	io_uring_submission_queue_depth: IoUringQueueDepthGauges,
 	io_uring_completion_queue_depth: IoUringQueueDepthGauges,
 	io_uring_errors: IoUringErrorCounters,
@@ -979,6 +1040,11 @@ impl Default for MetricsRegistry {
 			l1_read_latency_seconds: Histogram::new(LOCAL_READ_LATENCY_BUCKETS_MICROS),
 			l2_upload_latency_seconds: Histogram::new(L2_UPLOAD_LATENCY_BUCKETS_MICROS),
 			l2_range_read_latency_seconds: Histogram::new(L2_RANGE_READ_LATENCY_BUCKETS_MICROS),
+			storage_l2_column_fetch_plan_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
+			storage_l2_column_fetch_selected_chunk_runs: Histogram::new(
+				L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS,
+			),
+			storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters::default(),
 			io_uring_submission_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_completion_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_errors: IoUringErrorCounters::default(),
@@ -1214,6 +1280,20 @@ impl MetricsRegistry {
 
 	pub fn observe_storage_multirow_recompact(&self, records: u64) {
 		self.storage_multirow_recompact_total.add(records);
+	}
+
+	pub fn observe_storage_l2_column_fetch_plan(&self, duration: Duration) {
+		self.storage_l2_column_fetch_plan_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_storage_l2_column_fetch_selected_chunk_runs(&self, chunk_runs: u64) {
+		self.storage_l2_column_fetch_selected_chunk_runs
+			.observe_value(chunk_runs);
+	}
+
+	pub fn observe_storage_l2_column_fetch_fallback(&self, reason: &str) {
+		self.storage_l2_column_fetch_fallback.inc(reason);
 	}
 
 	pub fn observe_storage_compression_encode(
@@ -1787,6 +1867,28 @@ impl MetricsRegistry {
 			"wendelon_l2_range_read_latency_seconds",
 			"Storage-side latency for reads served from tiered L2 slabs.",
 			&self.l2_range_read_latency_seconds.snapshot(),
+		);
+		let l2_column_fetch_plan_micros = namespaced_metric("storage_l2_column_fetch_plan_micros");
+		render_histogram_micros(
+			&mut out,
+			&l2_column_fetch_plan_micros,
+			"ADR 044 L2 column fetch strategy planning duration in microseconds.",
+			&self.storage_l2_column_fetch_plan_micros.snapshot(),
+		);
+		let l2_column_fetch_selected_chunk_runs =
+			namespaced_metric("storage_l2_column_fetch_selected_chunk_runs");
+		render_histogram_raw(
+			&mut out,
+			&l2_column_fetch_selected_chunk_runs,
+			"Encrypted chunk runs selected by ADR 044 L2 column fetch plans.",
+			&self.storage_l2_column_fetch_selected_chunk_runs.snapshot(),
+		);
+		let l2_column_fetch_fallback_total =
+			namespaced_metric("storage_l2_column_fetch_fallback_total");
+		self.storage_l2_column_fetch_fallback.render(
+			&mut out,
+			&l2_column_fetch_fallback_total,
+			"ADR 044 L2 column fetch strategy fallbacks by planner reason.",
 		);
 		self.io_uring_submission_queue_depth.render(
 			&mut out,
@@ -2460,6 +2562,28 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{} 1234",
 			namespaced_test_metric("storage_compression_uncompressed_resident_bytes")
+		)));
+	}
+
+	#[test]
+	fn registry_renders_l2_column_fetch_metric_values() {
+		let registry = MetricsRegistry::default();
+		registry.observe_storage_l2_column_fetch_plan(Duration::from_micros(7));
+		registry.observe_storage_l2_column_fetch_selected_chunk_runs(3);
+		registry.observe_storage_l2_column_fetch_fallback("too_many_bytes");
+
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains(&format!(
+			"{}_sum 7",
+			namespaced_test_metric("storage_l2_column_fetch_plan_micros")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum 3",
+			namespaced_test_metric("storage_l2_column_fetch_selected_chunk_runs")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{reason=\"too_many_bytes\"}} 1",
+			namespaced_test_metric("storage_l2_column_fetch_fallback_total")
 		)));
 	}
 

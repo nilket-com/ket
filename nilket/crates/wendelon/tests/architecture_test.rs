@@ -363,6 +363,90 @@ fn test_adr043_storage_compression_surfaces_are_centralized() {
 	}
 }
 
+#[test]
+fn test_adr044_columnar_fetch_stays_read_side_and_provider_neutral() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let descriptor_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	for forbidden in [
+		concat!("column", "_fetch", "_policy"),
+		concat!("Column", "Fetch", "Policy"),
+	] {
+		if descriptor_source.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/table.rs: descriptor surface contains forbidden token '{forbidden}'"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let provider_or_format_forbidden = [
+		concat!("Parque", "t"),
+		concat!("parque", "t"),
+		concat!("OR", "C"),
+		concat!("S3 Selec", "t"),
+		concat!("SelectObjectConten", "t"),
+	];
+	let capability_forbidden = [
+		concat!("Columnar", "L2Fetch"),
+		concat!("L2", "Columnar", "Fetch", "Capability"),
+		concat!("Node", "Capability::", "Column"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in provider_or_format_forbidden
+				.iter()
+				.chain(capability_forbidden.iter())
+				.copied()
+			{
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 044 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+		});
+	}
+
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	if columnar.contains("AuthFailed") || columnar.contains("AuthenticationFailed") {
+		violations.push(
+			"src/storage/columnar.rs: auth failures must not be L2 fetch-strategy fallbacks"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 044 columnar fetch must stay read-side, provider-neutral, and auth-strict:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
 	let mut names = Vec::new();
 	for line in rendered.lines() {

@@ -66,16 +66,17 @@ use crate::network::transport::{MembershipEpoch, NodeCapability, NodeRole, Trans
 use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
-	AggregateDiagnostics, AggregateExpressionIndex, AggregateFunction, AggregateRequest,
-	AggregateResponse, AggregateState, AggregateStatus, COLUMN_PROJECTION_RANGE_ARC_BUDGET,
-	ColumnProjectionRangePruning, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker,
-	FrameHeader, HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality,
-	LocalityPolicyV1, LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta,
-	MigrateStatus, MsgType, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
-	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	SlabId, StreamFinalizationRequestMeta, TableQueryRequestMeta, TableReplicaWriteMeta,
+	AggregateDiagnostics, AggregateExpression, AggregateExpressionIndex, AggregateFunction,
+	AggregateRequest, AggregateResponse, AggregateState, AggregateStatus,
+	COLUMN_PROJECTION_RANGE_ARC_BUDGET, ColumnProjectionRangePruning, Consistency,
+	FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
+	LeaseDescriptor, LeaseStatus, Locality, LocalityPolicyV1, LocalityRange, MigrateRequestKind,
+	MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId, PbcRejectCode,
+	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
+	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, SlabId,
+	StreamFinalizationRequestMeta, TableQueryRequestMeta, TableReplicaWriteMeta,
 	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TableWriteValidationError, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
@@ -84,6 +85,11 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
+use crate::storage::columnar::{
+	ColumnFetchError, ColumnFetchRequirement, ProjectedRecordBatch,
+	analyze_aggregate_query_column_requirement, analyze_pbc_column_requirement,
+	execute_aggregate_projected_record_batch, execute_pbc_projected_record_batch,
+};
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
 use crate::storage::multirow::{
@@ -4941,6 +4947,27 @@ impl WendelonDataServer {
 			}
 		}
 
+		let user_column_count = match descriptor.arrow_schema() {
+			Ok(schema) => schema.fields().len(),
+			Err(_) => {
+				return Ok(query_plan_error(
+					&range_meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					self.local_node,
+				));
+			}
+		};
+		let requirement = match analyze_pbc_column_requirement(&program, user_column_count) {
+			Ok(requirement) => requirement,
+			Err(_) => {
+				return Ok(query_plan_error(
+					&range_meta,
+					ReadStatus::QUERY_INVALID_PROGRAM,
+					self.local_node,
+				));
+			}
+		};
+
 		plan_query_execution_for_ranges_with_program(
 			&self.slab,
 			self.local_node,
@@ -4949,6 +4976,10 @@ impl WendelonDataServer {
 			&ranges,
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement,
+				user_column_count,
+			},
 		)
 		.await
 	}
@@ -5058,6 +5089,16 @@ impl WendelonDataServer {
 		{
 			return Ok(response);
 		}
+		let projected_execution =
+			match aggregate_projected_execution(&self.slab, request, &prepared) {
+				Ok(execution) => execution,
+				Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+			};
+		let mut folded_request =
+			match aggregate_fold_request_for_execution(request, &projected_execution) {
+				Ok(request) => request,
+				Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+			};
 		let plan = plan_query_execution_for_ranges_with_program(
 			&self.slab,
 			self.local_node,
@@ -5066,6 +5107,7 @@ impl WendelonDataServer {
 			&prepared.ranges,
 			aggregate_query_budget(&request.budgets),
 			Some(&prepared.descriptor),
+			projected_execution,
 		)
 		.await?;
 		if plan.response.status != ReadStatus::OK
@@ -5080,7 +5122,6 @@ impl WendelonDataServer {
 		// The query planner has already applied the predicate while
 		// preserving scalar identity/locality context. Fold the filtered
 		// batches without re-running the bytecode a second time.
-		let mut folded_request = request.clone();
 		folded_request.predicate_program = None;
 		let result = match aggregate_record_batches(
 			&folded_request,
@@ -5095,6 +5136,7 @@ impl WendelonDataServer {
 			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
 		};
 		let mut response = result.response;
+		response.aggregate_expression_digest = request.expression_digest();
 		if plan.response.status == ReadStatus::OK {
 			response.max_hlc = plan.response.value_hlc;
 		}
@@ -7304,6 +7346,30 @@ struct RebatchGroup {
 	input_rows: u64,
 }
 
+#[derive(Clone, Debug)]
+enum QueryProjectedExecution {
+	Disabled,
+	Pbc {
+		requirement: ColumnFetchRequirement,
+		user_column_count: usize,
+	},
+	Aggregate {
+		requirement: ColumnFetchRequirement,
+		user_column_count: usize,
+	},
+}
+
+impl QueryProjectedExecution {
+	fn requirement(&self) -> Option<&ColumnFetchRequirement> {
+		match self {
+			Self::Disabled => None,
+			Self::Pbc { requirement, .. } | Self::Aggregate { requirement, .. } => {
+				Some(requirement)
+			}
+		}
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
 struct QueryExecutionBudget {
 	max_locations: usize,
@@ -7365,6 +7431,201 @@ fn snapshot_request_outside_retention(
 
 fn query_deadline_exceeded(deadline: Instant) -> bool {
 	Instant::now() > deadline
+}
+
+fn aggregate_projected_execution(
+	slab: &SlabManager,
+	request: &AggregateRequest,
+	prepared: &PreparedAggregateExecution,
+) -> Result<QueryProjectedExecution, AggRejectCode> {
+	if !slab.l2_column_fetch_enabled() {
+		return Ok(QueryProjectedExecution::Disabled);
+	}
+	let user_column_count = prepared
+		.descriptor
+		.arrow_schema()
+		.map_err(|_| AggRejectCode::SchemaUnknown)?
+		.fields()
+		.len();
+	let requirement = analyze_aggregate_query_column_requirement(
+		&prepared.program,
+		&request.aggregates,
+		user_column_count,
+	)
+	.map_err(|_| AggRejectCode::ProgramInvalid)?;
+	Ok(QueryProjectedExecution::Aggregate {
+		requirement,
+		user_column_count,
+	})
+}
+
+fn aggregate_fold_request_for_execution(
+	request: &AggregateRequest,
+	projected_execution: &QueryProjectedExecution,
+) -> Result<AggregateRequest, AggRejectCode> {
+	let mut folded = request.clone();
+	if let QueryProjectedExecution::Aggregate { requirement, .. } = projected_execution {
+		folded.aggregates =
+			remap_aggregate_expressions_for_projected_inputs(&request.aggregates, requirement)?;
+	}
+	Ok(folded)
+}
+
+fn remap_aggregate_expressions_for_projected_inputs(
+	expressions: &[AggregateExpression],
+	requirement: &ColumnFetchRequirement,
+) -> Result<Vec<AggregateExpression>, AggRejectCode> {
+	expressions
+		.iter()
+		.map(|expression| {
+			let Some(column) = expression.function()?.column() else {
+				return Ok(expression.clone());
+			};
+			let position = requirement
+				.aggregate_columns
+				.iter()
+				.position(|candidate| candidate == u32::from(column))
+				.ok_or(AggRejectCode::ColumnUnknown)?;
+			let column_ordinal =
+				u16::try_from(position).map_err(|_| AggRejectCode::ColumnUnknown)?;
+			Ok(AggregateExpression {
+				column_ordinal,
+				..expression.clone()
+			})
+		})
+		.collect()
+}
+
+async fn read_projected_query_location(
+	slab: &SlabManager,
+	location: RecordLocation,
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Option<RecordBatch>> {
+	let Some(requirement) = projected_execution.requirement() else {
+		return Ok(None);
+	};
+	let projected_read = match slab
+		.read_projected_record(location, descriptor, requirement)
+		.await
+	{
+		Ok(Some(projected_read)) => projected_read,
+		Ok(None) => return Ok(None),
+		Err(err) if projected_query_can_use_whole_record_fallback(&err) => return Ok(None),
+		Err(err) => return Err(err),
+	};
+	let projected =
+		materialize_projected_location_batch(projected_read.projected, location.record_row_index)?;
+	match projected_execution {
+		QueryProjectedExecution::Disabled => Ok(None),
+		QueryProjectedExecution::Pbc {
+			requirement,
+			user_column_count,
+		} => {
+			execute_pbc_projected_record_batch(&projected, program, requirement, *user_column_count)
+				.map(Some)
+		}
+		QueryProjectedExecution::Aggregate { .. } => Ok(None),
+	}
+}
+
+async fn read_aggregate_query_location(
+	slab: &SlabManager,
+	meta: &QueryRequestMeta,
+	location: RecordLocation,
+	key_identity: Identity,
+	locality: Locality,
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	requirement: &ColumnFetchRequirement,
+	user_column_count: usize,
+) -> std::io::Result<Option<RecordBatch>> {
+	match slab
+		.read_projected_record(location, descriptor, requirement)
+		.await
+	{
+		Ok(Some(projected_read)) => {
+			let projected = materialize_projected_location_batch(
+				projected_read.projected,
+				location.record_row_index,
+			)?;
+			return execute_aggregate_projected_record_batch(
+				&projected,
+				program,
+				requirement,
+				user_column_count,
+			)
+			.map(Some);
+		}
+		Ok(None) => {}
+		Err(err) if projected_query_can_use_whole_record_fallback(&err) => {}
+		Err(err) => return Err(err),
+	}
+
+	let bytes = slab.read(location).await?;
+	let decode_started = Instant::now();
+	let storage_batch = decode_batch(&bytes)?;
+	let storage_row_count = storage_batch.num_rows();
+	let was_multirow = has_storage_synthetic_columns(&storage_batch);
+	let batch = materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+	if was_multirow {
+		metrics().observe_storage_multirow_decode(
+			batch.num_rows() as u64,
+			bytes.len() as u64,
+			decode_started.elapsed(),
+		);
+		if storage_row_count <= 1 {
+			metrics()
+				.storage_multirow_uncompacted_row_records_total
+				.inc();
+		}
+	}
+	if !table_record_matches_descriptor(meta, descriptor, key_identity, locality, &batch)? {
+		return Ok(None);
+	}
+	execute_aggregate_full_record_batch(&batch, program, requirement).map(Some)
+}
+
+fn execute_aggregate_full_record_batch(
+	batch: &RecordBatch,
+	program: &pbc::Program,
+	requirement: &ColumnFetchRequirement,
+) -> std::io::Result<RecordBatch> {
+	let aggregate_columns = requirement.aggregate_columns.iter().collect::<Vec<_>>();
+	let remapped =
+		program.remap_columns_with_project(|column| Ok(column), Some(&aggregate_columns))?;
+	pbc::execute_program(&remapped, batch)
+}
+
+fn projected_query_can_use_whole_record_fallback(error: &Error) -> bool {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<ColumnFetchError>())
+		.is_some_and(|error| {
+			matches!(
+				error,
+				ColumnFetchError::SchemaMismatch { .. } | ColumnFetchError::UnsupportedArrowLayout
+			)
+		})
+}
+
+fn materialize_projected_location_batch(
+	projected: ProjectedRecordBatch,
+	record_row_index: RecordRowIndex,
+) -> std::io::Result<ProjectedRecordBatch> {
+	let row = record_row_index.get() as usize;
+	if row >= projected.batch.num_rows() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"record row index {} out of bounds for {}-row projected storage record",
+				row,
+				projected.batch.num_rows()
+			),
+		));
+	}
+	Ok(projected.slice(row, 1))
 }
 
 async fn table_stats_may_match_location(
@@ -7679,7 +7940,14 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		end: Locality::new(meta.locality_range_end),
 	}];
 	plan_query_execution_for_ranges_with_program(
-		slab, local_node, meta, &program, &ranges, budget, None,
+		slab,
+		local_node,
+		meta,
+		&program,
+		&ranges,
+		budget,
+		None,
+		QueryProjectedExecution::Disabled,
 	)
 	.await
 }
@@ -7692,6 +7960,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
+	projected_execution: QueryProjectedExecution,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -7746,6 +8015,72 @@ async fn plan_query_execution_for_ranges_with_program(
 					ReadStatus::QUERY_BUDGET_EXCEEDED,
 					local_node,
 				));
+			}
+			if let Some(descriptor) = table_descriptor {
+				if let QueryProjectedExecution::Aggregate {
+					requirement,
+					user_column_count,
+				} = &projected_execution
+				{
+					if let Some(result) = read_aggregate_query_location(
+						slab,
+						meta,
+						location,
+						key_identity,
+						locality,
+						descriptor,
+						program,
+						requirement,
+						*user_column_count,
+					)
+					.await?
+					{
+						if result.num_rows() == 0 {
+							continue;
+						}
+						let result_rows = result.num_rows() as u64;
+						rows = rows.saturating_add(result_rows);
+						if location.hlc > max_hlc {
+							max_hlc = location.hlc;
+						}
+						if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+							return Ok(query_plan_error(
+								meta,
+								ReadStatus::QUERY_BUDGET_EXCEEDED,
+								local_node,
+							));
+						}
+						batches.push(result);
+					}
+					continue;
+				}
+				if let Some(result) = read_projected_query_location(
+					slab,
+					location,
+					descriptor,
+					program,
+					&projected_execution,
+				)
+				.await?
+				{
+					if result.num_rows() == 0 {
+						continue;
+					}
+					let result_rows = result.num_rows() as u64;
+					rows = rows.saturating_add(result_rows);
+					if location.hlc > max_hlc {
+						max_hlc = location.hlc;
+					}
+					if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+						return Ok(query_plan_error(
+							meta,
+							ReadStatus::QUERY_BUDGET_EXCEEDED,
+							local_node,
+						));
+					}
+					batches.push(result);
+					continue;
+				}
 			}
 			let bytes = slab.read(location).await?;
 			let decode_started = Instant::now();
@@ -9824,6 +10159,7 @@ mod tests {
 				io,
 				l2: None,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -9845,6 +10181,33 @@ mod tests {
 				io,
 				l2: Some(l2),
 				rehydration,
+				l2_column_fetch: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		)
+	}
+
+	async fn make_manager_with_l2_projected_fetch(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
+		let dir = fresh_dir("query-l2-projected");
+		let io = spawn_io_thread(64).unwrap();
+		let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
+		rehydration.promote_after_l2_reads = 0;
+		rehydration.tail_read_window_bytes = 256 + 16;
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+					..Default::default()
+				},
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -11043,6 +11406,7 @@ mod tests {
 			&ranges,
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
 		)
 		.await
 		.unwrap();
@@ -11094,6 +11458,7 @@ mod tests {
 			&ranges,
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
 		)
 		.await
 		.unwrap();
@@ -11145,6 +11510,7 @@ mod tests {
 			}],
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
 		)
 		.await
 		.unwrap();
@@ -11157,8 +11523,35 @@ mod tests {
 	#[tokio::test]
 	async fn table_stats_admit_slab_then_pbc_filters_rows() {
 		let l2 = Arc::new(MockObjectStore::default());
-		let (mgr, descriptor) =
-			tier_typed_table_batch_with_stats(l2, vec![1, 2], "stats-admit-pbc.wnd").await;
+		let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put("stats-admit-pbc.wnd", &encrypted.bytes)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
 
 		let mut bytecode = Vec::new();
 		bytecode.push(OP_PUSH_COL);
@@ -11167,6 +11560,8 @@ mod tests {
 		bytecode.extend_from_slice(&2_i64.to_le_bytes());
 		bytecode.push(OP_GTE);
 		let program = pbc::Program::compile(&bytecode).unwrap();
+		let user_column_count = descriptor.arrow_schema().unwrap().fields().len();
+		let requirement = analyze_pbc_column_requirement(&program, user_column_count).unwrap();
 		let plan = plan_query_execution_for_ranges_with_program(
 			&mgr,
 			n(1),
@@ -11178,6 +11573,10 @@ mod tests {
 			}],
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement,
+				user_column_count,
+			},
 		)
 		.await
 		.unwrap();
@@ -11207,6 +11606,121 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn aggregate_plan_folds_projected_l2_inputs() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+		let descriptor = typed_table_descriptor();
+		let slab_id = append_typed_table_rows(&mgr, &descriptor, vec![1, 2]).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2
+			.put("stats-admit-aggregate.wnd", &encrypted.bytes)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+
+		let mut predicate = Vec::new();
+		predicate.push(OP_PUSH_COL);
+		predicate.extend_from_slice(&0_u32.to_le_bytes());
+		predicate.push(OP_PUSH_INT);
+		predicate.extend_from_slice(&2_i64.to_le_bytes());
+		predicate.push(OP_GTE);
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(144),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(0, 0, 0),
+			as_of_hlc: hlc(0, 0, 0),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: Some(predicate.clone()),
+			aggregates: vec![
+				AggregateExpression::count_star(),
+				AggregateExpression {
+					tag: AggregateFunctionTag::SIGNED_SUM,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+			],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		let program = pbc::Program::compile(&predicate).unwrap();
+		let prepared = PreparedAggregateExecution {
+			range_meta: aggregate_as_range_query(&request, 0),
+			program,
+			descriptor: descriptor.clone(),
+			ranges: vec![QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+		};
+		let projected_execution = aggregate_projected_execution(&mgr, &request, &prepared).unwrap();
+		let mut folded_request =
+			aggregate_fold_request_for_execution(&request, &projected_execution).unwrap();
+		folded_request.predicate_program = None;
+
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&prepared.range_meta,
+			&prepared.program,
+			&prepared.ranges,
+			aggregate_query_budget(&request.budgets),
+			Some(&descriptor),
+			projected_execution,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
+		assert_eq!(plan.batches[0].num_columns(), 1);
+		let result = aggregate_record_batches(&folded_request, &plan.batches, false).unwrap();
+		assert_eq!(result.response.status, AggregateStatus::Success);
+		assert_eq!(
+			result.response.partials[0].state.as_slice(),
+			&1_u64.to_be_bytes()
+		);
+		let expected_sum = encode_aggregate_state(
+			AggregateFunctionTag::SIGNED_SUM,
+			&AggregateState::SignedSum {
+				sum: 2,
+				non_null_count: 1,
+				overflow: false,
+			},
+		)
+		.unwrap();
+		assert_eq!(result.response.partials[1].state, expected_sum);
+	}
+
+	#[tokio::test]
 	async fn table_stats_absence_falls_through_to_full_scan() {
 		let l2 = Arc::new(MockObjectStore::default());
 		let (mgr, descriptor) =
@@ -11230,6 +11744,7 @@ mod tests {
 			}],
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
 		)
 		.await
 		.unwrap();
@@ -11288,6 +11803,7 @@ mod tests {
 			}],
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
 		)
 		.await
 		.unwrap();
@@ -14657,6 +15173,7 @@ mod tests {
 					io: io.clone(),
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
+					l2_column_fetch: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})
@@ -14696,6 +15213,7 @@ mod tests {
 					io: self.io.clone(),
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
+					l2_column_fetch: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})

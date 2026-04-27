@@ -19,7 +19,7 @@ use crate::node::{
 	ObservabilityConfig, SeedNodeConfig, TransportTlsConfig,
 };
 use crate::schema::ProtocolVersionWindow;
-use crate::storage::MvccRetentionPolicy;
+use crate::storage::{L2ColumnFetchConfig, MvccRetentionPolicy};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -117,6 +117,56 @@ struct RawStorageConfig {
 	data_dir: PathBuf,
 	#[serde(default = "default_slab_max_bytes")]
 	slab_max_bytes: u64,
+	#[serde(default)]
+	l2_column_fetch: RawL2ColumnFetchConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawL2ColumnFetchConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	ipc_metadata_initial_window_bytes: Option<u64>,
+	#[serde(default)]
+	max_ipc_metadata_probe_bytes: Option<u64>,
+	#[serde(default)]
+	min_record_bytes: Option<u64>,
+	#[serde(default)]
+	max_selected_fraction_micros: Option<u32>,
+	#[serde(default)]
+	max_ranges_per_record: Option<u32>,
+	#[serde(default)]
+	max_parallel_range_gets: Option<u32>,
+}
+
+impl RawL2ColumnFetchConfig {
+	fn into_runtime_config(self) -> std::io::Result<L2ColumnFetchConfig> {
+		let mut cfg = L2ColumnFetchConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(bytes) = self.ipc_metadata_initial_window_bytes {
+			cfg.ipc_metadata_initial_window_bytes =
+				crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		if let Some(bytes) = self.max_ipc_metadata_probe_bytes {
+			cfg.max_ipc_metadata_probe_bytes = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		if let Some(bytes) = self.min_record_bytes {
+			cfg.min_record_bytes = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		if let Some(fraction) = self.max_selected_fraction_micros {
+			cfg.max_selected_fraction_micros = fraction;
+		}
+		if let Some(count) = self.max_ranges_per_record {
+			cfg.max_ranges_per_record = crate::schema::EncryptedChunkCount::new(count);
+		}
+		if let Some(count) = self.max_parallel_range_gets {
+			cfg.max_parallel_range_gets = crate::schema::EncryptedChunkCount::new(count);
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
 }
 
 #[derive(Debug, Deserialize)]
@@ -479,10 +529,12 @@ impl RawConfig {
 			}),
 		};
 
+		let slab_max_bytes = self.storage.slab_max_bytes;
+		let l2_column_fetch = self.storage.l2_column_fetch.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
 			data_dir,
-			slab_max_bytes: self.storage.slab_max_bytes,
+			slab_max_bytes,
 			group_commit: crate::storage::GroupCommitConfig::default(),
 			rf: self.tuning.rf,
 			wal_io_depth,
@@ -496,6 +548,7 @@ impl RawConfig {
 			l2: None,
 			tiering: crate::storage::SweeperConfig::default(),
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
+			l2_column_fetch,
 			root_kek_provider: self.crypto.root_kek_provider,
 			crypto_cache: CryptoCacheConfig {
 				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,

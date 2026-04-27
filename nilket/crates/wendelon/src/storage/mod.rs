@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod columnar;
 pub mod core;
 pub mod file_ops;
 mod index;
@@ -13,6 +14,7 @@ pub mod stats;
 pub mod sweeper;
 
 pub use aggregate::*;
+pub use columnar::*;
 pub use core::*;
 pub use file_ops::*;
 pub use io_uring::*;

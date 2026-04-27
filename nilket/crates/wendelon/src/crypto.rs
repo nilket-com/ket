@@ -1,6 +1,9 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, AuditSink};
 use crate::metrics::global as metrics;
-use crate::schema::{IdentityPrefix, NodeId, SlabId, TenantId, TenantKekId};
+use crate::schema::{
+	EncryptedChunkCount, EncryptedChunkIndex, IdentityPrefix, NodeId, RecordBodyByteLen,
+	RecordBodyByteOffset, SlabId, TenantId, TenantKekId,
+};
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
@@ -1087,6 +1090,150 @@ pub struct TieredSlabObjectMetadata {
 	pub column_stats_block: Option<TieredColumnStatsBlock>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TieredPlaintextRange {
+	pub start: RecordBodyByteOffset,
+	pub len: RecordBodyByteLen,
+}
+
+impl TieredPlaintextRange {
+	pub fn new(start: RecordBodyByteOffset, len: RecordBodyByteLen) -> Self {
+		Self { start, len }
+	}
+
+	fn from_usize_unchecked(start: usize, len: usize) -> std::io::Result<Self> {
+		let start = u64::try_from(start).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext range start does not fit into u64",
+			)
+		})?;
+		let len = u64::try_from(len).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext range length does not fit into u64",
+			)
+		})?;
+		Ok(Self {
+			start: RecordBodyByteOffset::new(start),
+			len: RecordBodyByteLen::new(len),
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TieredChunkRunReadPlan {
+	first_chunk: EncryptedChunkIndex,
+	chunk_count: EncryptedChunkCount,
+	chunk_range: Range<usize>,
+	base_plaintext_offset: usize,
+	ciphertext_range_in_object: Range<u64>,
+}
+
+impl TieredChunkRunReadPlan {
+	pub fn first_chunk(&self) -> EncryptedChunkIndex {
+		self.first_chunk
+	}
+
+	pub fn chunk_count(&self) -> EncryptedChunkCount {
+		self.chunk_count
+	}
+
+	pub fn ciphertext_range_in_object(&self) -> Range<u64> {
+		self.ciphertext_range_in_object.clone()
+	}
+}
+
+pub struct TieredMultiRangeReadPlan {
+	footer: FooterSummary,
+	tenant_id: TenantId,
+	slab_id: SlabId,
+	slab_format_version: u32,
+	cipher_id: CipherId,
+	plaintext_len: usize,
+	chunk_runs: Vec<TieredChunkRunReadPlan>,
+	requested_plaintext_ranges: Vec<Range<usize>>,
+	prepared_slab_dek: Arc<PreparedSlabDek>,
+}
+
+impl TieredMultiRangeReadPlan {
+	pub fn footer(&self) -> FooterSummary {
+		self.footer
+	}
+
+	pub fn chunk_runs(&self) -> &[TieredChunkRunReadPlan] {
+		self.chunk_runs.as_slice()
+	}
+
+	pub fn ciphertext_ranges_in_object(&self) -> Vec<Range<u64>> {
+		self.chunk_runs
+			.iter()
+			.map(TieredChunkRunReadPlan::ciphertext_range_in_object)
+			.collect()
+	}
+
+	pub fn decrypt<B: AsRef<[u8]>>(&self, ciphertext_runs: &[B]) -> std::io::Result<Vec<Vec<u8>>> {
+		if ciphertext_runs.len() != self.chunk_runs.len() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"tiered multi-range read expected {} ciphertext runs, got {}",
+					self.chunk_runs.len(),
+					ciphertext_runs.len()
+				),
+			));
+		}
+
+		let mut decrypted_runs = Vec::with_capacity(self.chunk_runs.len());
+		for (run, ciphertext) in self.chunk_runs.iter().zip(ciphertext_runs) {
+			let decrypted = decrypt_partial_chunks(
+				self.cipher_id,
+				self.tenant_id,
+				self.slab_id,
+				self.slab_format_version,
+				self.prepared_slab_dek.clone(),
+				self.plaintext_len,
+				ciphertext.as_ref(),
+				run.chunk_range.clone(),
+			)?;
+			decrypted_runs.push(decrypted);
+		}
+
+		let mut out = Vec::with_capacity(self.requested_plaintext_ranges.len());
+		for requested in &self.requested_plaintext_ranges {
+			if requested.is_empty() {
+				out.push(Vec::new());
+				continue;
+			}
+			let Some((run, decrypted)) =
+				self.chunk_runs
+					.iter()
+					.zip(decrypted_runs.iter())
+					.find(|(run, decrypted)| {
+						let run_start = run.base_plaintext_offset;
+						let run_end = run_start + decrypted.len();
+						requested.start >= run_start && requested.end <= run_end
+					})
+			else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"requested plaintext range is not covered by decrypted chunk runs",
+				));
+			};
+			let relative_start = requested.start - run.base_plaintext_offset;
+			let relative_end = requested.end - run.base_plaintext_offset;
+			out.push(decrypted[relative_start..relative_end].to_vec());
+		}
+		Ok(out)
+	}
+}
+
+struct TieredRangePlanningContext {
+	parsed: ParsedEncryptedFooterFields,
+	footer: FooterSummary,
+	prepared_slab_dek: Arc<PreparedSlabDek>,
+}
+
 pub struct TieredRangeReadPlan {
 	footer: FooterSummary,
 	tenant_id: TenantId,
@@ -1839,14 +1986,14 @@ impl CryptoManager {
 		}))
 	}
 
-	pub fn plan_tiered_range_read(
+	fn prepare_tiered_range_read(
 		&self,
 		expected_slab_id: SlabId,
 		object_size_bytes: u64,
 		tail_window: &[u8],
 		additional_metadata: Option<&[u8]>,
-		plaintext_range: Range<usize>,
-	) -> std::io::Result<TieredRangeReadPlan> {
+		indexed_plaintext_range: Range<usize>,
+	) -> std::io::Result<TieredRangePlanningContext> {
 		let parsed = match parse_encrypted_footer_from_tail_window(object_size_bytes, tail_window) {
 			Ok(parsed) => parsed,
 			Err(error) => {
@@ -1877,13 +2024,16 @@ impl CryptoManager {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "footer_parse", &error);
 			return Err(error);
 		}
-		if plaintext_range.start > plaintext_range.end || plaintext_range.end > parsed.plaintext_len
+		if indexed_plaintext_range.start > indexed_plaintext_range.end
+			|| indexed_plaintext_range.end > parsed.plaintext_len
 		{
 			let error = Error::new(
 				ErrorKind::InvalidInput,
 				format!(
 					"requested plaintext range {}..{} is outside slab plaintext length {}",
-					plaintext_range.start, plaintext_range.end, parsed.plaintext_len
+					indexed_plaintext_range.start,
+					indexed_plaintext_range.end,
+					parsed.plaintext_len
 				),
 			);
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
@@ -1907,7 +2057,7 @@ impl CryptoManager {
 		}
 		if let Err(error) = verify_index_contains_range(
 			parsed.index_bytes(additional_metadata)?,
-			plaintext_range.clone(),
+			indexed_plaintext_range.clone(),
 		) {
 			self.emit_decrypt_rejected(expected_slab_id, Some(footer), "range_plan", &error);
 			return Err(error);
@@ -1926,31 +2076,124 @@ impl CryptoManager {
 			}
 		};
 
-		let start_chunk = plaintext_range.start / SLAB_ENCRYPTION_CHUNK_BYTES;
-		let end_chunk = if plaintext_range.start == plaintext_range.end {
-			start_chunk.saturating_add(1)
-		} else {
-			((plaintext_range.end - 1) / SLAB_ENCRYPTION_CHUNK_BYTES).saturating_add(1)
-		};
-		let chunk_range = start_chunk..end_chunk;
-		let base_plaintext_offset =
-			plaintext_bounds_for_chunk(parsed.plaintext_len, chunk_range.start).start;
-		let ciphertext_start = parsed.ciphertext_offset_in_object
-			+ ciphertext_offset_for_chunk(parsed.plaintext_len, chunk_range.start) as u64;
-		let ciphertext_end = parsed.ciphertext_offset_in_object
-			+ ciphertext_offset_for_chunk(parsed.plaintext_len, chunk_range.end) as u64;
-		Ok(TieredRangeReadPlan {
+		Ok(TieredRangePlanningContext {
+			parsed,
 			footer,
-			tenant_id: parsed.tenant_id,
-			slab_id: parsed.slab_id,
-			slab_format_version: parsed.slab_format_version,
-			cipher_id: parsed.cipher_id,
-			plaintext_len: parsed.plaintext_len,
-			chunk_range,
-			base_plaintext_offset,
-			requested_plaintext_range: plaintext_range,
-			ciphertext_range_in_object: ciphertext_start..ciphertext_end,
 			prepared_slab_dek,
+		})
+	}
+
+	pub fn plan_tiered_multi_range_read(
+		&self,
+		expected_slab_id: SlabId,
+		object_size_bytes: u64,
+		tail_window: &[u8],
+		additional_metadata: Option<&[u8]>,
+		record_plaintext_range: Range<usize>,
+		plaintext_ranges: &[TieredPlaintextRange],
+	) -> std::io::Result<TieredMultiRangeReadPlan> {
+		let context = self.prepare_tiered_range_read(
+			expected_slab_id,
+			object_size_bytes,
+			tail_window,
+			additional_metadata,
+			record_plaintext_range.clone(),
+		)?;
+		let requested_plaintext_ranges = record_relative_ranges_to_absolute(
+			record_plaintext_range,
+			plaintext_ranges,
+			context.parsed.plaintext_len,
+		)
+		.map_err(|error| {
+			self.emit_decrypt_rejected(
+				expected_slab_id,
+				Some(context.footer),
+				"range_plan",
+				&error,
+			);
+			error
+		})?;
+		let chunk_runs = chunk_read_runs_for_plaintext_ranges(
+			context.parsed.plaintext_len,
+			context.parsed.ciphertext_offset_in_object,
+			&requested_plaintext_ranges,
+		)
+		.map_err(|error| {
+			self.emit_decrypt_rejected(
+				expected_slab_id,
+				Some(context.footer),
+				"range_plan",
+				&error,
+			);
+			error
+		})?;
+
+		Ok(TieredMultiRangeReadPlan {
+			footer: context.footer,
+			tenant_id: context.parsed.tenant_id,
+			slab_id: context.parsed.slab_id,
+			slab_format_version: context.parsed.slab_format_version,
+			cipher_id: context.parsed.cipher_id,
+			plaintext_len: context.parsed.plaintext_len,
+			chunk_runs,
+			requested_plaintext_ranges,
+			prepared_slab_dek: context.prepared_slab_dek,
+		})
+	}
+
+	pub fn plan_tiered_range_read(
+		&self,
+		expected_slab_id: SlabId,
+		object_size_bytes: u64,
+		tail_window: &[u8],
+		additional_metadata: Option<&[u8]>,
+		plaintext_range: Range<usize>,
+	) -> std::io::Result<TieredRangeReadPlan> {
+		let plaintext_len = plaintext_range
+			.end
+			.checked_sub(plaintext_range.start)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"requested plaintext range start exceeds end",
+				)
+			})?;
+		let relative_range = TieredPlaintextRange::from_usize_unchecked(0, plaintext_len)?;
+		let multi = self.plan_tiered_multi_range_read(
+			expected_slab_id,
+			object_size_bytes,
+			tail_window,
+			additional_metadata,
+			plaintext_range.clone(),
+			&[relative_range],
+		)?;
+		let Some(run) = multi.chunk_runs.first() else {
+			return Ok(TieredRangeReadPlan {
+				footer: multi.footer,
+				tenant_id: multi.tenant_id,
+				slab_id: multi.slab_id,
+				slab_format_version: multi.slab_format_version,
+				cipher_id: multi.cipher_id,
+				plaintext_len: multi.plaintext_len,
+				chunk_range: 0..0,
+				base_plaintext_offset: plaintext_range.start,
+				requested_plaintext_range: plaintext_range,
+				ciphertext_range_in_object: 0..0,
+				prepared_slab_dek: multi.prepared_slab_dek,
+			});
+		};
+		Ok(TieredRangeReadPlan {
+			footer: multi.footer,
+			tenant_id: multi.tenant_id,
+			slab_id: multi.slab_id,
+			slab_format_version: multi.slab_format_version,
+			cipher_id: multi.cipher_id,
+			plaintext_len: multi.plaintext_len,
+			chunk_range: run.chunk_range.clone(),
+			base_plaintext_offset: run.base_plaintext_offset,
+			requested_plaintext_range: plaintext_range,
+			ciphertext_range_in_object: run.ciphertext_range_in_object.clone(),
+			prepared_slab_dek: multi.prepared_slab_dek,
 		})
 	}
 
@@ -3064,6 +3307,160 @@ fn ciphertext_offset_for_chunk(plaintext_len: usize, chunk_index: usize) -> usiz
 		.checked_mul(SLAB_AEAD_TAG_BYTES)
 		.expect("chunk_index bounds checked by caller");
 	plaintext_offset + tag_offset
+}
+
+fn record_relative_ranges_to_absolute(
+	record_plaintext_range: Range<usize>,
+	plaintext_ranges: &[TieredPlaintextRange],
+	slab_plaintext_len: usize,
+) -> std::io::Result<Vec<Range<usize>>> {
+	if record_plaintext_range.start > record_plaintext_range.end
+		|| record_plaintext_range.end > slab_plaintext_len
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"record plaintext range {}..{} is outside slab plaintext length {}",
+				record_plaintext_range.start, record_plaintext_range.end, slab_plaintext_len
+			),
+		));
+	}
+
+	let record_len = record_plaintext_range.end - record_plaintext_range.start;
+	let mut out = Vec::with_capacity(plaintext_ranges.len());
+	let mut previous_start = None;
+	for range in plaintext_ranges {
+		let relative_start = usize::try_from(range.start.get()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext range start does not fit into usize",
+			)
+		})?;
+		let relative_len = usize::try_from(range.len.get()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext range length does not fit into usize",
+			)
+		})?;
+		if previous_start.is_some_and(|previous| relative_start < previous) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext ranges must be sorted by start offset",
+			));
+		}
+		previous_start = Some(relative_start);
+		let relative_end = relative_start.checked_add(relative_len).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered plaintext range end offset overflow",
+			)
+		})?;
+		if relative_end > record_len {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"tiered plaintext range {}..{} exceeds indexed record length {}",
+					relative_start, relative_end, record_len
+				),
+			));
+		}
+		let absolute_start = record_plaintext_range
+			.start
+			.checked_add(relative_start)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"absolute tiered plaintext range start overflow",
+				)
+			})?;
+		let absolute_end = record_plaintext_range
+			.start
+			.checked_add(relative_end)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"absolute tiered plaintext range end overflow",
+				)
+			})?;
+		out.push(absolute_start..absolute_end);
+	}
+	Ok(out)
+}
+
+fn chunk_read_runs_for_plaintext_ranges(
+	plaintext_len: usize,
+	ciphertext_offset_in_object: u64,
+	plaintext_ranges: &[Range<usize>],
+) -> std::io::Result<Vec<TieredChunkRunReadPlan>> {
+	let mut chunk_ranges: Vec<Range<usize>> = Vec::new();
+	for plaintext_range in plaintext_ranges {
+		if plaintext_range.start > plaintext_range.end || plaintext_range.end > plaintext_len {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"requested plaintext range {}..{} is outside slab plaintext length {}",
+					plaintext_range.start, plaintext_range.end, plaintext_len
+				),
+			));
+		}
+		if plaintext_range.is_empty() {
+			continue;
+		}
+		let start_chunk = plaintext_range.start / SLAB_ENCRYPTION_CHUNK_BYTES;
+		let end_chunk = ((plaintext_range.end - 1) / SLAB_ENCRYPTION_CHUNK_BYTES) + 1;
+		if let Some(last) = chunk_ranges.last_mut() {
+			if start_chunk <= last.end {
+				last.end = last.end.max(end_chunk);
+				continue;
+			}
+		}
+		chunk_ranges.push(start_chunk..end_chunk);
+	}
+
+	let mut out = Vec::with_capacity(chunk_ranges.len());
+	for chunk_range in chunk_ranges {
+		let chunk_count = chunk_range
+			.end
+			.checked_sub(chunk_range.start)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "chunk range end precedes start"))?;
+		let chunk_count = u32::try_from(chunk_count).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered chunk run count exceeds u32::MAX",
+			)
+		})?;
+		let first_chunk = u64::try_from(chunk_range.start).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"tiered chunk run start does not fit into u64",
+			)
+		})?;
+		let ciphertext_start = ciphertext_offset_in_object
+			.checked_add(ciphertext_offset_for_chunk(plaintext_len, chunk_range.start) as u64)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"tiered chunk ciphertext start overflow",
+				)
+			})?;
+		let ciphertext_end = ciphertext_offset_in_object
+			.checked_add(ciphertext_offset_for_chunk(plaintext_len, chunk_range.end) as u64)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"tiered chunk ciphertext end overflow",
+				)
+			})?;
+		out.push(TieredChunkRunReadPlan {
+			first_chunk: EncryptedChunkIndex::new(first_chunk),
+			chunk_count: EncryptedChunkCount::new(chunk_count),
+			base_plaintext_offset: plaintext_bounds_for_chunk(plaintext_len, chunk_range.start)
+				.start,
+			chunk_range,
+			ciphertext_range_in_object: ciphertext_start..ciphertext_end,
+		});
+	}
+	Ok(out)
 }
 
 fn push_u32_be(buf: &mut Vec<u8>, value: u32) {
@@ -5420,6 +5817,34 @@ mod tests {
 			.unwrap()
 	}
 
+	fn patterned_plaintext(len: usize) -> Vec<u8> {
+		(0..len).map(|index| (index % 251) as u8).collect()
+	}
+
+	fn rel_range(start: usize, len: usize) -> TieredPlaintextRange {
+		TieredPlaintextRange::new(
+			RecordBodyByteOffset::try_new(start as u64).unwrap(),
+			RecordBodyByteLen::try_new(len as u64).unwrap(),
+		)
+	}
+
+	fn tail_window_for(encrypted: &EncryptedTieredSlab) -> (u64, &[u8]) {
+		let object_size = encrypted.bytes.len() as u64;
+		let tail_start = object_size.saturating_sub(64 * 1024) as usize;
+		(object_size, &encrypted.bytes[tail_start..])
+	}
+
+	fn ciphertext_slices<'a>(bytes: &'a [u8], ranges: &[Range<u64>]) -> Vec<&'a [u8]> {
+		ranges
+			.iter()
+			.map(|range| {
+				let start = usize::try_from(range.start).unwrap();
+				let end = usize::try_from(range.end).unwrap();
+				&bytes[start..end]
+			})
+			.collect()
+	}
+
 	fn footer_stats_locator_suffix(bytes: &[u8]) -> &[u8] {
 		let (footer_len, _, tail_offset) = parse_adr022_tail_anchor(bytes).unwrap();
 		let footer_start = tail_offset - footer_len as usize;
@@ -5517,6 +5942,180 @@ mod tests {
 			.expect("range plan should reject ranges absent from footer index");
 		assert!(
 			err.to_string().contains("footer index"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn adr044_multi_range_matches_single_range_for_one_record_span() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 33);
+		let encrypted =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(440), TenantId::ZERO, &plaintext);
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+		let record_range = 0..plaintext.len();
+
+		let single = crypto
+			.plan_tiered_range_read(
+				SlabId::new(440),
+				object_size,
+				tail_window,
+				None,
+				record_range.clone(),
+			)
+			.unwrap();
+		let multi = crypto
+			.plan_tiered_multi_range_read(
+				SlabId::new(440),
+				object_size,
+				tail_window,
+				None,
+				record_range,
+				&[rel_range(0, plaintext.len())],
+			)
+			.unwrap();
+
+		assert_eq!(multi.chunk_runs().len(), 1);
+		assert_eq!(
+			multi.chunk_runs()[0].ciphertext_range_in_object(),
+			single.ciphertext_range_in_object()
+		);
+		let single_ciphertext =
+			ciphertext_slices(&encrypted.bytes, &[single.ciphertext_range_in_object()]);
+		let multi_ciphertext =
+			ciphertext_slices(&encrypted.bytes, &multi.ciphertext_ranges_in_object());
+		let single_plaintext = single.decrypt(single_ciphertext[0]).unwrap();
+		let multi_plaintext = multi.decrypt(&multi_ciphertext).unwrap();
+		assert_eq!(multi_plaintext, vec![single_plaintext]);
+	}
+
+	#[test]
+	fn adr044_multi_range_coalesces_overlapping_and_adjacent_chunk_runs() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 3 + 17);
+		let encrypted =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(441), TenantId::ZERO, &plaintext);
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+
+		let plan = crypto
+			.plan_tiered_multi_range_read(
+				SlabId::new(441),
+				object_size,
+				tail_window,
+				None,
+				0..plaintext.len(),
+				&[
+					rel_range(10, 40),
+					rel_range(20, 10),
+					rel_range(SLAB_ENCRYPTION_CHUNK_BYTES + 5, 10),
+				],
+			)
+			.unwrap();
+
+		assert_eq!(plan.chunk_runs().len(), 1);
+		assert_eq!(
+			plan.chunk_runs()[0].first_chunk(),
+			EncryptedChunkIndex::new(0)
+		);
+		assert_eq!(
+			plan.chunk_runs()[0].chunk_count(),
+			EncryptedChunkCount::new(2)
+		);
+	}
+
+	#[test]
+	fn adr044_multi_range_keeps_disjoint_runs_separate_and_extracts_windows() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 4 + 99);
+		let encrypted =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(442), TenantId::ZERO, &plaintext);
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+		let first = 3..23;
+		let second = (SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 7)..(SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 31);
+
+		let plan = crypto
+			.plan_tiered_multi_range_read(
+				SlabId::new(442),
+				object_size,
+				tail_window,
+				None,
+				0..plaintext.len(),
+				&[
+					rel_range(first.start, first.len()),
+					rel_range(second.start, second.len()),
+				],
+			)
+			.unwrap();
+
+		assert_eq!(plan.chunk_runs().len(), 2);
+		assert_eq!(
+			plan.chunk_runs()[0].first_chunk(),
+			EncryptedChunkIndex::new(0)
+		);
+		assert_eq!(
+			plan.chunk_runs()[1].first_chunk(),
+			EncryptedChunkIndex::new(2)
+		);
+		let ciphertext = ciphertext_slices(&encrypted.bytes, &plan.ciphertext_ranges_in_object());
+		let decrypted = plan.decrypt(&ciphertext).unwrap();
+		assert_eq!(decrypted[0], plaintext[first]);
+		assert_eq!(decrypted[1], plaintext[second]);
+	}
+
+	#[test]
+	fn adr044_multi_range_rejects_out_of_record_spans() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = patterned_plaintext(128);
+		let encrypted =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(443), TenantId::ZERO, &plaintext);
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+
+		let err = match crypto.plan_tiered_multi_range_read(
+			SlabId::new(443),
+			object_size,
+			tail_window,
+			None,
+			0..plaintext.len(),
+			&[rel_range(120, 16)],
+		) {
+			Ok(_) => panic!("out-of-record range should fail"),
+			Err(error) => error,
+		};
+		assert!(
+			err.to_string().contains("exceeds indexed record length"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn adr044_multi_range_tampered_chunk_fails_aead() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES + 1);
+		let encrypted =
+			encrypt_test_tiered_slab(&crypto, SlabId::new(444), TenantId::ZERO, &plaintext);
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+		let plan = crypto
+			.plan_tiered_multi_range_read(
+				SlabId::new(444),
+				object_size,
+				tail_window,
+				None,
+				0..plaintext.len(),
+				&[rel_range(0, 16)],
+			)
+			.unwrap();
+		let ranges = plan.ciphertext_ranges_in_object();
+		let mut tampered = ciphertext_slices(&encrypted.bytes, &ranges)[0].to_vec();
+		tampered[0] ^= 0x80;
+
+		let err = plan.decrypt(&[tampered]).unwrap_err();
+		assert!(
+			err.to_string().contains("slab chunk decrypt failed"),
 			"unexpected error: {err}"
 		);
 	}

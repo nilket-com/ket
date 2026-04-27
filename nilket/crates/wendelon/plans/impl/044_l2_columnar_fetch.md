@@ -78,9 +78,9 @@ Outputs:
     record body. Validator applies the
     `max_record_bytes` 8 MiB ceiling from ADR 042 §10.
   - `IpcBufferLength(u64)` — paired with
-    `IpcBufferOffset` (matches Codex council); same
-    8 MiB ceiling. Defended-in-depth against future
-    `max_record_bytes` raises.
+    `IpcBufferOffset`; same 8 MiB ceiling.
+    Defended-in-depth against future `max_record_bytes`
+    raises.
   - `IpcBufferIndex(u32)` — Arrow IPC buffer-vector
     ordinal.
   - `RecordBodyByteOffset(u64)` and
@@ -149,9 +149,11 @@ Outputs:
     projected path — bytes-on-disk byte-identical.
   - One sparse-projection fixture (5 of 50 columns).
   - One dense-projection fixture (45 of 50 columns) where
-    the planner picks `WholeRecord`.
+    the planner picks `Fallback(FullProjection)` or
+    `Fallback(TooManyBytes)`, depending on the exact
+    selected-byte ratio.
   - One small-record fixture where the planner picks
-    `WholeRecord` regardless of projection ratio.
+    `Fallback(SmallRecord)` regardless of projection ratio.
   - One UTF-8-heavy slab where projecting one logical
     column fetches all its constituent buffers (data +
     offsets + null buffer).
@@ -215,6 +217,10 @@ Work:
        pub fn user_visible(&self) -> ColumnOrdinalSet;
    }
    ```
+   `is_full` is evaluated against the descriptor's
+   user-visible Arrow schema, not the IPC schema with ADR
+   042 synthetic columns. Storage/synthetic columns never
+   make a requirement "full" by themselves.
 5. Add stub bodies for the Phase 0 helpers.
 
 Tests:
@@ -315,8 +321,15 @@ Work:
    - From `RecordBatch.buffers`, extract the
      `(offset, length)` vector (per-buffer ranges relative
      to the IPC body start).
-   - From the schema, build the `column_to_buffers` map
-     (logical column ordinal → buffer ordinal range).
+   - From the IPC schema, build the `column_to_buffers`
+     map (IPC schema column ordinal → buffer ordinal
+     range). Descriptor/user ordinals are mapped to IPC
+     ordinals before lookup; ADR 042 synthetic columns use
+     their appended IPC slots.
+   - Copy the descriptor schema fingerprint into
+     `RecordBufferDirectory`; callers use it to reject
+     cross-record/schema mixing when a slab-level or
+     query-level plan spans multiple records.
 3. Define `ColumnarParseError`:
    ```rust
    pub enum ColumnarParseError {
@@ -501,18 +514,23 @@ Work:
      `__row_routing_locality__`, or future
      `__row_tombstone__`) — these contribute to the
      `storage_columns` axis, never to user output.
-3. Add `analyze_aggregate_requirement(request:
+3. Re-confirm against ADR 040's accumulator catalog that
+   every accumulator declares its inputs in a walkable
+   form. If any accumulator does not, add an
+   accumulator-specific dispatch table here before landing
+   the walker.
+4. Add `analyze_aggregate_requirement(request:
    &AggregateRequest)` that walks accumulator declarations
    and emits the union of input columns referenced.
-4. Build `ColumnFetchRequirement` as the union of:
+5. Build `ColumnFetchRequirement` as the union of:
    - `predicate_columns` from PBC.
    - `output_columns` from terminal `PROJECT`.
    - `aggregate_columns` from AGG accumulators.
    - `storage_columns` from visibility/HLC/identity needs.
-5. Reject programs that imply a column-ordinal beyond the
+6. Reject programs that imply a column-ordinal beyond the
    active descriptor's schema (defense-in-depth; should
    be caught earlier by ADR 036's contract validation).
-6. Preserve existing PBC reject-code behavior; do not add
+7. Preserve existing PBC reject-code behavior; do not add
    a new opcode.
 
 Tests:
@@ -523,7 +541,8 @@ Tests:
   `output_columns = {col_a, col_c}`.
 - A program with only `PROJECT *` (or no terminal
   `PROJECT`) short-circuits `output_columns` to the full
-  user schema; `is_full(&schema)` returns true.
+  user schema; `is_full(descriptor_user_schema)` returns
+  true.
 - An AGG request with `count_star` only yields the empty
   user-column requirement (count_star needs no value
   columns); `user_visible()` is empty.
@@ -553,12 +572,12 @@ Work:
 1. Implement `build_column_fetch_plan(directory,
    requirement, slab_metadata)` using
    `plan_tiered_multi_range_read` from Phase 2:
-   - Resolve `ColumnFetchRequirement` (descriptor
-     ordinals) → buffer ordinals via
-     `directory.column_to_buffers` (every physical buffer
-     a column needs: validity + offsets + values +
-     dictionary payloads + child buffers + compression
-     metadata).
+   - Resolve `ColumnFetchRequirement` descriptor/user
+     ordinals to IPC schema ordinals, then resolve those
+     IPC ordinals to buffer ordinals via
+     `directory.column_to_buffers` (every physical buffer a
+     column needs: validity + offsets + values + dictionary
+     payloads + child buffers + compression metadata).
    - Map buffer ordinals → IPC body byte ranges via
      `directory.buffers`.
    - Translate IPC body ranges → record-relative
@@ -580,8 +599,10 @@ Work:
    Decision rule (ADR §6) — cheap bypasses run *before*
    Phase A so they do not pay the metadata round trip:
    - `!config.enabled`              → `Fallback(Disabled)`
-   - `record_layout == SingleRow`   → `Fallback(SingleRow)`
-   - `requirement.is_full(schema)`  → `Fallback(FullProjection)`
+   - `descriptor.record_layout_policy.is_single_row()`
+                                    → `Fallback(SingleRow)`
+   - `requirement.is_full(descriptor_user_schema)`
+                                    → `Fallback(FullProjection)`
    - `record.length < min_record_bytes`
                                     → `Fallback(SmallRecord)`
    - rehydration active for record  → `Fallback(RehydrationAvailable)`
@@ -595,8 +616,11 @@ Work:
                                        `Fallback(TooManyBytes)`
    - `plan.chunk_runs.len() > max_ranges_per_record` →
                                        `Fallback(TooManyRanges)`
-   - rehydration hot-path active     → `Fallback(RehydrationAvailable)`
    - otherwise                       → `Columnar(plan)`
+   `record_layout` comes from
+   `descriptor.record_layout_policy` (ADR 042). The
+   `schema` argument is the descriptor's user-visible Arrow
+   schema; `is_full` ignores ADR 042 synthetic columns.
 3. **Authentication failures never enter
    `L2FetchStrategy`.** AEAD-verify or footer-HMAC
    failures surface as `CryptoError` to the caller; the
@@ -646,7 +670,18 @@ Files:
 
 Work:
 
-1. Implement `read_projected_record_from_l2(l2, pointer,
+1. Wire the two-call planner pattern explicitly:
+   - First call `pick_l2_fetch_strategy(...,
+     directory=None, candidate_plan=None, ...)`.
+     If it returns any cheap-bypass `Fallback(*)`, dispatch
+     directly to whole-record fetch and project post-decode.
+   - Otherwise run Phase A and parse the
+     `RecordBufferDirectory`.
+   - Build the multi-range candidate plan, then call
+     `pick_l2_fetch_strategy(..., directory=Some(...),
+     candidate_plan=Some(...), ...)`. Dispatch this
+     second result.
+2. Implement `read_projected_record_from_l2(l2, pointer,
    record_location, requirement, descriptor, config) ->
    Result<ProjectedRecordBatch, _>`:
    ```text
@@ -662,8 +697,9 @@ Work:
             still truncated, return MetadataProbeCap to
             the strategy picker.
 
-   Phase planner: pick_l2_fetch_strategy; on Fallback(*),
-            delegate to existing
+   Post-Phase-A planner: pick_l2_fetch_strategy with the
+            parsed directory and candidate plan; on
+            Fallback(*), delegate to existing
             read_encrypted_record_from_l2 and project
             post-decode.
 
@@ -674,7 +710,7 @@ Work:
             extracts and the directory to
             decode_projected_record_batch.
    ```
-2. **No "sparse IPC body assembly."** The Phase 4
+3. **No "sparse IPC body assembly."** The Phase 4
    `decode_projected_record_batch` consumes
    `(decrypted_plaintext_extracts, directory,
    requirement)` and builds Arrow arrays only for the
@@ -684,11 +720,11 @@ Work:
    through the mapping. This shape side-steps the question
    about whether Arrow's `StreamReader` honours sparse
    plaintext (resolved by the Phase 4 path-discovery test).
-3. `read_from_l2` becomes a dispatcher driven by
+4. `read_from_l2` becomes a dispatcher driven by
    `L2FetchStrategy`:
    ```rust
    fn read_from_l2(...) -> ... {
-       match pick_l2_fetch_strategy(...) {
+       match strategy {
            L2FetchStrategy::Columnar(plan) =>
                read_projected_record_from_l2(plan, ...),
            L2FetchStrategy::WholeRecord
@@ -697,17 +733,22 @@ Work:
        }
    }
    ```
-4. The PBC and AGG handlers in `src/network/data_server.rs`
+   `WholeRecord` is produced only by the dispatcher for a
+   known whole-record path where the column planner is not
+   invoked (for example, an unencrypted L2 object without
+   ADR 020 chunk/index metadata). `pick_l2_fetch_strategy`
+   returns `Columnar(plan)` or `Fallback(reason)`.
+5. The PBC and AGG handlers in `src/network/data_server.rs`
    compute `ColumnFetchRequirement` from the request once
    per slab admission and pass it down.
-5. **CSB pruning is unchanged and remains upstream of the
+6. **CSB pruning is unchanged and remains upstream of the
    strategy picker.** Pruned slabs issue zero record-body
    range GETs.
-6. **Rehydration stays whole-slab.** Column-projected reads
+7. **Rehydration stays whole-slab.** Column-projected reads
    increment existing rehydration heat counters; once
    promotion triggers, the manager fetches and installs
    the full slab as today (ADR 006).
-7. **L1 reads are unchanged.** ADR 044 affects the
+8. **L1 reads are unchanged.** ADR 044 affects the
    tiered-L2 cold path only.
 
 Tests (integration):
@@ -763,12 +804,12 @@ Files:
 
 Work:
 
-1. Short-circuit the metadata round trip when the planner
-   can decide *without* reading the IPC FlatBuffer:
-   - When `record.length < min_record_bytes`,
-     skip Phase A entirely and use whole-record fetch.
-   - When `projection.is_full(&schema)`, skip Phase A
-     entirely.
+1. Extend the cheap-bypass path from Phase 6 / Phase 7
+   with cross-record Phase A batching. Records already
+   classified as disabled, single-row, full projection,
+   small, or rehydration-resident continue to skip Phase A
+   entirely; remaining records can share coalesced
+   metadata-window GETs.
 2. Batch Phase A across multiple admitted records when
    their record-plaintext ranges are contiguous (or
    nearly contiguous within one chunk). One L2 GET serves
@@ -997,46 +1038,43 @@ New under 044:
    small-record + full-projection workloads short-
    circuiting; high rate is *good*, not a regression.
 4. **Plan complexity.**
-   `storage_l2_column_fetch_plan_chunk_runs` distribution.
+   `storage_l2_column_fetch_selected_chunk_runs`
+   distribution.
    Long-tail records with many chunk runs may benefit from
    tighter coalescing (Phase 8 refinement).
-5. **Projection-ratio distribution.**
-   `storage_l2_column_fetch_plan_projection_ratio`. The right
-   tail near 1.0 should be rare on `Auto` tables; the
-   planner should have picked whole-record there.
-6. **Overfetch ratio.**
+5. **Overfetch ratio.**
    `storage_l2_column_fetch_overfetch_bytes_total / fetched_bytes`.
    Lower bound is chunk-boundary alignment (ADR 020 64
    KiB chunks); persistent growth means coalescing
    regressed.
-7. **GET-rate cost.** L2 GETs per query before/after.
+6. **GET-rate cost.** L2 GETs per query before/after.
    On fleets where this dominates byte savings, operator
    may flip `L2ColumnFetchConfig::enabled = false`
    cluster-wide.
-8. **Cold-tier latency.** Cold-tier read p50 / p99
+7. **Cold-tier latency.** Cold-tier read p50 / p99
    before/after on a representative tenant.
-9. **Decode buffer count.**
+8. **Decode buffer count.**
    `storage_l2_column_fetch_decompressed_buffers_total{codec="lz4_frame"}` /
    total buffers. Ratio < 1 means upstream projection is
    working.
-10. **Metadata-parse errors.**
+9. **Metadata-parse errors.**
     `storage_l2_column_fetch_metadata_parse_error_total` should
     be zero in steady state.
-11. **Truncated-window refetch.**
+10. **Truncated-window refetch.**
     `storage_l2_column_fetch_metadata_truncated_refetch_total`
     should be near zero. Non-zero means
     `ipc_metadata_initial_window_bytes` (default 64 KiB)
     is undersized for the workload's typical schema; bump
     closer to `max_ipc_metadata_probe_bytes` (default
     256 KiB).
-12. **Phase A skip ratio.**
+11. **Phase A skip ratio.**
     `storage_l2_column_fetch_phase_a_skipped_total /
      storage_l2_column_fetch_requests_total{strategy="columnar"}`.
     High ratio is *good* — it means cheap bypasses
     (full-projection, small-record, rehydration) are
     catching the no-win cases without paying the
     metadata round trip.
-13. **Architectural-test enforcement.** New guards stay
+12. **Architectural-test enforcement.** New guards stay
     green:
     - No new V1/V2 suffix or brand-prefix on ADR 044
       surfaces.
@@ -1133,12 +1171,7 @@ Items the implementer or Phase-11 benches resolve. None
 block any phase from landing; each phase calls out the
 specific decision its work surfaces.
 
-1. **AGG accumulator-input column derivation** (Phase 5
-   step 3). Re-confirm against ADR 040's accumulator
-   catalog that every accumulator declares its inputs in
-   a walkable form. If not, the derivation walker needs
-   an accumulator-specific dispatch table.
-2. **Initial Arrow-layout coverage in the partial
+1. **Initial Arrow-layout coverage in the partial
    materializer** (Phase 4). V1 scope decision: primitive
    fixed-width + Utf8/Binary only
    (`unsupported_arrow_layout` fallback covers the rest),
@@ -1146,20 +1179,20 @@ specific decision its work surfaces.
    Dictionary / Union? Default V1 is the narrower set with
    fallback for nested / dictionary; bench output drives
    any expansion.
-3. **Phase A batching window size** (Phase 8 step 2). One
+2. **Phase A batching window size** (Phase 8 step 2). One
    chunk? Two chunks? Workload-shape dependent; defer to
    benchmark output.
-4. **Whether `RecordBufferDirectory` interns the schema
+3. **Whether `RecordBufferDirectory` interns the schema
    fingerprint or compares full schemas.** Interning costs
    one hash table; full compare costs schema-size bytes
    per compare. Default is fingerprint compare via the
    existing `SchemaFingerprint` newtype.
-5. **Whether the `__row_tombstone__` synthetic column
+4. **Whether the `__row_tombstone__` synthetic column
    (deferred per ADR 042 §16) gets pre-wired into
    `column_to_buffers` ahead of its ADR.** Default is no —
    wire it in when the row-level tombstone ADR opens
    (convention: no premature backward-compat).
-6. **Whether to surface `bytes_avoided_total` as
+5. **Whether to surface `bytes_avoided_total` as
    gauge-shaped or counter-shaped.** Default is the
    counter shape (the question "what bytes were saved
    this query" is fundamentally counter-shaped); the

@@ -43,7 +43,8 @@
 use crate::consensus::MigratedRangeTombstone;
 use crate::crypto::{
 	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredColumnStatsBlock,
-	TieredOffsetIndexEntry, TieredSlabObjectMetadata,
+	TieredMultiRangeReadPlan, TieredOffsetIndexEntry, TieredPlaintextRange,
+	TieredSlabObjectMetadata,
 };
 use crate::metrics::global as metrics;
 use crate::schema::table::{
@@ -51,8 +52,16 @@ use crate::schema::table::{
 	TableSchemaDescriptorV1, TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordRowIndex, SlabId, SlabRecordHeader,
-	SupersessionMetadata, TenantId, TenantKekId, TombstoneMetadata,
+	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordRowIndex, SlabId, SlabRecordHeader, SupersessionMetadata, TenantId, TenantKekId,
+	TombstoneMetadata,
+};
+use crate::storage::columnar::{
+	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
+	PlaintextByteRange, ProjectedRecordBatch, TieredRecordId, build_column_fetch_plan,
+	decode_projected_record_batch, decode_projected_record_batch_from_plaintext_ranges,
+	initial_metadata_probe_plan, next_metadata_probe_plan, observe_l2_fetch_strategy,
+	parse_record_buffer_directory, pick_l2_fetch_strategy, selected_record_body_ranges,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
@@ -90,6 +99,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
 
@@ -147,6 +157,8 @@ pub struct SlabManagerConfig {
 	/// Policy for promoting hot tiered slabs back into local L1
 	/// storage.
 	pub rehydration: RehydrationPolicy,
+	/// Node-local ADR 044 L2 columnar fetch strategy config.
+	pub l2_column_fetch: L2ColumnFetchConfig,
 	/// ADR 016 data-path group-commit tuning.
 	pub group_commit: GroupCommitConfig,
 	/// ADR 022 slab-object encryption service used for L2 object bytes.
@@ -815,6 +827,7 @@ impl SlabManager {
 	/// shadows the stale copy in an older one.
 	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
 		config.rehydration.validate()?;
+		config.l2_column_fetch.validate()?;
 		if !config.dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -2517,6 +2530,12 @@ enum SlabBacking {
 	Missing,
 }
 
+pub(crate) struct ProjectedL2RecordRead {
+	pub(crate) projected: ProjectedRecordBatch,
+	#[allow(dead_code)]
+	pub(crate) strategy: L2FetchStrategy,
+}
+
 #[async_trait]
 impl StorageEngine for SlabManager {
 	async fn append(
@@ -2583,6 +2602,48 @@ impl StorageEngine for SlabManager {
 }
 
 impl SlabManager {
+	pub(crate) fn l2_column_fetch_enabled(&self) -> bool {
+		self.config.l2_column_fetch.enabled
+	}
+
+	pub(crate) async fn read_projected_record(
+		&self,
+		location: RecordLocation,
+		descriptor: &TableSchemaDescriptorV1,
+		requirement: &ColumnFetchRequirement,
+	) -> std::io::Result<Option<ProjectedL2RecordRead>> {
+		if !self.config.l2_column_fetch.enabled {
+			return Ok(None);
+		}
+		let location = self.relocate_read_location(location);
+		match self.resolve_backing(location.slab_id).await {
+			SlabBacking::Local(_) => Ok(None),
+			SlabBacking::L2(pointer) => {
+				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
+					Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"slab {} is tiered but no L2 object store is configured",
+							location.slab_id
+						),
+					)
+				})?;
+				let started = Instant::now();
+				let result = self
+					.read_projected_record_from_l2(l2, &pointer, location, descriptor, requirement)
+					.await;
+				metrics()
+					.l2_range_read_latency_seconds
+					.observe_duration(started.elapsed());
+				result.map(Some)
+			}
+			SlabBacking::Missing => Err(Error::new(
+				ErrorKind::NotFound,
+				format!("no slab with id {} under this manager", location.slab_id),
+			)),
+		}
+	}
+
 	fn locality_candidates_for_tenant(
 		&self,
 		tenant_id: TenantId,
@@ -3896,6 +3957,291 @@ impl SlabManager {
 		)
 	}
 
+	async fn read_projected_record_from_l2(
+		&self,
+		l2: Arc<dyn ObjectStore>,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+		descriptor: &TableSchemaDescriptorV1,
+		requirement: &ColumnFetchRequirement,
+	) -> std::io::Result<ProjectedL2RecordRead> {
+		if !pointer.is_encrypted {
+			let plaintext = self
+				.fetch_full_tiered_plaintext(l2.as_ref(), pointer)
+				.await?;
+			let frame = extract_record_from_blob(&plaintext, location)?;
+			let projected = decode_full_projected_l2_record(
+				pointer.slab_id,
+				location,
+				descriptor,
+				requirement,
+				&frame,
+			)?;
+			return Ok(ProjectedL2RecordRead {
+				projected,
+				strategy: L2FetchStrategy::WholeRecord,
+			});
+		}
+
+		let planning_started = Instant::now();
+		let body_location = record_body_location(location)?;
+		let whole_record_range = record_plaintext_range_for_l2(location)?;
+		let metadata = l2.head(&pointer.l2_uri).await?;
+		let tail_start = metadata
+			.size_bytes
+			.saturating_sub(self.config.rehydration.tail_read_window_bytes);
+		let tail_window = l2
+			.get_range(&pointer.l2_uri, tail_start..metadata.size_bytes)
+			.await?;
+		let additional_metadata_range = self.config.crypto.additional_tiered_metadata_range(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+		)?;
+		let additional_metadata = match additional_metadata_range {
+			Some(range) => Some(l2.get_range(&pointer.l2_uri, range).await?),
+			None => None,
+		};
+
+		let pre_probe = pick_l2_fetch_strategy(
+			&self.config.l2_column_fetch,
+			descriptor,
+			&body_location,
+			requirement,
+			None,
+			None,
+			false,
+		);
+		if !matches!(
+			pre_probe,
+			L2FetchStrategy::Fallback(ColumnarFallbackReason::MetadataProbeCap)
+		) {
+			observe_l2_fetch_strategy(metrics(), &pre_probe, planning_started.elapsed());
+			let projected = self
+				.read_full_projected_record_from_l2(
+					l2.as_ref(),
+					pointer,
+					location,
+					descriptor,
+					requirement,
+				)
+				.await?;
+			return Ok(ProjectedL2RecordRead {
+				projected,
+				strategy: pre_probe,
+			});
+		}
+
+		let mut probe = initial_metadata_probe_plan(&self.config.l2_column_fetch, &body_location)
+			.map_err(columnar_io_error)?;
+		let header_size = slab_record_header_size_u64()?;
+		let directory = loop {
+			let prefix_len = header_size
+				.checked_add(probe.window_bytes.get())
+				.ok_or_else(|| Error::new(ErrorKind::InvalidData, "metadata prefix overflow"))?;
+			let prefix_range = TieredPlaintextRange::new(
+				RecordBodyByteOffset::new(0),
+				RecordBodyByteLen::try_new(prefix_len).map_err(|err| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("metadata prefix length rejected: {err}"),
+					)
+				})?,
+			);
+			let prefix_plan = self.config.crypto.plan_tiered_multi_range_read(
+				pointer.slab_id,
+				metadata.size_bytes,
+				tail_window.as_ref(),
+				additional_metadata.as_deref(),
+				whole_record_range.clone(),
+				&[prefix_range],
+			)?;
+			let prefix_ciphertext = fetch_tiered_ciphertext_runs(
+				l2.clone(),
+				pointer,
+				&prefix_plan,
+				self.config.l2_column_fetch.max_parallel_range_gets.get() as usize,
+			)
+			.await?;
+			let prefix_plaintext = prefix_plan.decrypt(&prefix_ciphertext)?;
+			let Some(prefix_plaintext) = prefix_plaintext.first() else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"metadata prefix decrypt returned no plaintext",
+				));
+			};
+			let header_size = usize::try_from(header_size).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"slab record header size exceeds usize",
+				)
+			})?;
+			if prefix_plaintext.len() < header_size {
+				return Err(Error::new(
+					ErrorKind::UnexpectedEof,
+					"metadata prefix shorter than slab record header",
+				));
+			}
+			validate_tiered_record_header_tenant(
+				&prefix_plaintext[..header_size],
+				prefix_plan.footer().tenant_id,
+				pointer.slab_id,
+			)?;
+			let metadata_window_bytes = &prefix_plaintext[header_size..];
+			match parse_record_buffer_directory(
+				TieredRecordId {
+					slab_id: pointer.slab_id,
+					record_offset: RecordBodyByteOffset::new(location.offset),
+				},
+				PlaintextByteRange {
+					start: 0,
+					len: u64::from(body_location.length),
+				},
+				metadata_window_bytes,
+				descriptor,
+			) {
+				Ok(directory) => break directory,
+				Err(crate::storage::columnar::ColumnFetchError::MetadataTruncated {
+					needed,
+					..
+				}) => {
+					let next = next_metadata_probe_plan(
+						&self.config.l2_column_fetch,
+						&body_location,
+						probe.window_bytes,
+						needed,
+					)
+					.map_err(columnar_io_error)?;
+					match next {
+						Some(next) => probe = next,
+						None => {
+							let strategy =
+								L2FetchStrategy::Fallback(ColumnarFallbackReason::MetadataProbeCap);
+							observe_l2_fetch_strategy(
+								metrics(),
+								&strategy,
+								planning_started.elapsed(),
+							);
+							let projected = self
+								.read_full_projected_record_from_l2(
+									l2.as_ref(),
+									pointer,
+									location,
+									descriptor,
+									requirement,
+								)
+								.await?;
+							return Ok(ProjectedL2RecordRead {
+								projected,
+								strategy,
+							});
+						}
+					}
+				}
+				Err(crate::storage::columnar::ColumnFetchError::UnsupportedArrowLayout) => {
+					let strategy =
+						L2FetchStrategy::Fallback(ColumnarFallbackReason::UnsupportedArrowLayout);
+					observe_l2_fetch_strategy(metrics(), &strategy, planning_started.elapsed());
+					let projected = self
+						.read_full_projected_record_from_l2(
+							l2.as_ref(),
+							pointer,
+							location,
+							descriptor,
+							requirement,
+						)
+						.await?;
+					return Ok(ProjectedL2RecordRead {
+						projected,
+						strategy,
+					});
+				}
+				Err(err) => return Err(columnar_io_error(err)),
+			}
+		};
+
+		let selected_body_ranges =
+			selected_record_body_ranges(&directory, requirement).map_err(columnar_io_error)?;
+		let selected_record_ranges =
+			record_body_ranges_to_record_ranges(header_size, &selected_body_ranges)?;
+		let tiered_plan = self.config.crypto.plan_tiered_multi_range_read(
+			pointer.slab_id,
+			metadata.size_bytes,
+			tail_window.as_ref(),
+			additional_metadata.as_deref(),
+			whole_record_range,
+			&selected_record_ranges,
+		)?;
+		let candidate_plan = match build_column_fetch_plan(&directory, requirement, &tiered_plan) {
+			Ok(plan) => Some(plan),
+			Err(crate::storage::columnar::ColumnFetchError::UnsupportedArrowLayout) => None,
+			Err(err) => return Err(columnar_io_error(err)),
+		};
+		let strategy = pick_l2_fetch_strategy(
+			&self.config.l2_column_fetch,
+			descriptor,
+			&body_location,
+			requirement,
+			Some(&directory),
+			candidate_plan,
+			false,
+		);
+		observe_l2_fetch_strategy(metrics(), &strategy, planning_started.elapsed());
+		if !matches!(strategy, L2FetchStrategy::Columnar(_)) {
+			let projected = self
+				.read_full_projected_record_from_l2(
+					l2.as_ref(),
+					pointer,
+					location,
+					descriptor,
+					requirement,
+				)
+				.await?;
+			return Ok(ProjectedL2RecordRead {
+				projected,
+				strategy,
+			});
+		}
+
+		let ciphertext_runs = fetch_tiered_ciphertext_runs(
+			l2,
+			pointer,
+			&tiered_plan,
+			self.config.l2_column_fetch.max_parallel_range_gets.get() as usize,
+		)
+		.await?;
+		let plaintext_extracts = tiered_plan.decrypt(&ciphertext_runs)?;
+		let projected = decode_projected_record_batch_from_plaintext_ranges(
+			&directory,
+			requirement,
+			&selected_body_ranges,
+			&plaintext_extracts,
+		)
+		.map_err(arrow_io_error)?;
+		Ok(ProjectedL2RecordRead {
+			projected,
+			strategy,
+		})
+	}
+
+	async fn read_full_projected_record_from_l2(
+		&self,
+		l2: &dyn ObjectStore,
+		pointer: &TieredSlabPointer,
+		location: RecordLocation,
+		descriptor: &TableSchemaDescriptorV1,
+		requirement: &ColumnFetchRequirement,
+	) -> std::io::Result<ProjectedRecordBatch> {
+		let frame = if pointer.is_encrypted {
+			self.read_encrypted_record_from_l2(l2, pointer, location)
+				.await?
+		} else {
+			let plaintext = self.fetch_full_tiered_plaintext(l2, pointer).await?;
+			extract_record_from_blob(&plaintext, location)?
+		};
+		decode_full_projected_l2_record(pointer.slab_id, location, descriptor, requirement, &frame)
+	}
+
 	async fn note_l2_read(&self, slab_id: SlabId) -> bool {
 		let promote_after = self.config.rehydration.promote_after_l2_reads;
 		if promote_after == 0 {
@@ -4165,6 +4511,190 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 		));
 	}
 	Ok(blob[offset + header_size..end].to_vec())
+}
+
+async fn fetch_tiered_ciphertext_runs(
+	l2: Arc<dyn ObjectStore>,
+	pointer: &TieredSlabPointer,
+	plan: &TieredMultiRangeReadPlan,
+	max_parallel_range_gets: usize,
+) -> std::io::Result<Vec<Bytes>> {
+	fetch_l2_ranges_bounded(
+		l2,
+		pointer.l2_uri.clone(),
+		plan.ciphertext_ranges_in_object(),
+		max_parallel_range_gets,
+	)
+	.await
+}
+
+async fn fetch_l2_ranges_bounded(
+	l2: Arc<dyn ObjectStore>,
+	uri: String,
+	ranges: Vec<std::ops::Range<u64>>,
+	max_parallel_range_gets: usize,
+) -> std::io::Result<Vec<Bytes>> {
+	if ranges.is_empty() {
+		return Ok(Vec::new());
+	}
+	let max_parallel = max_parallel_range_gets.max(1).min(ranges.len());
+	if max_parallel == 1 || ranges.len() == 1 {
+		let mut out = Vec::with_capacity(ranges.len());
+		for range in ranges {
+			out.push(l2.get_range(&uri, range).await?);
+		}
+		return Ok(out);
+	}
+
+	let mut out = vec![None; ranges.len()];
+	let mut next = 0usize;
+	let mut join = JoinSet::new();
+	while next < ranges.len() || !join.is_empty() {
+		while next < ranges.len() && join.len() < max_parallel {
+			let l2 = l2.clone();
+			let uri = uri.clone();
+			let range = ranges[next].clone();
+			let index = next;
+			join.spawn(async move {
+				let bytes = l2.get_range(&uri, range).await?;
+				Ok::<_, std::io::Error>((index, bytes))
+			});
+			next += 1;
+		}
+		let Some(joined) = join.join_next().await else {
+			continue;
+		};
+		match joined {
+			Ok(Ok((index, bytes))) => out[index] = Some(bytes),
+			Ok(Err(err)) => return Err(err),
+			Err(err) => {
+				return Err(Error::other(format!(
+					"L2 range fetch task failed before returning ciphertext: {err}"
+				)));
+			}
+		}
+	}
+	out.into_iter()
+		.enumerate()
+		.map(|(index, bytes)| {
+			bytes.ok_or_else(|| Error::other(format!("L2 range fetch {index} did not complete")))
+		})
+		.collect()
+}
+
+fn decode_full_projected_l2_record(
+	slab_id: SlabId,
+	location: RecordLocation,
+	descriptor: &TableSchemaDescriptorV1,
+	requirement: &ColumnFetchRequirement,
+	frame: &[u8],
+) -> std::io::Result<ProjectedRecordBatch> {
+	let directory = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id,
+			record_offset: RecordBodyByteOffset::new(location.offset),
+		},
+		PlaintextByteRange {
+			start: 0,
+			len: frame.len() as u64,
+		},
+		frame,
+		descriptor,
+	)
+	.map_err(columnar_io_error)?;
+	decode_projected_record_batch(frame, &directory, requirement).map_err(arrow_io_error)
+}
+
+fn record_body_location(location: RecordLocation) -> std::io::Result<RecordLocation> {
+	let header_size = slab_record_header_size_u64()?;
+	let body_offset = location.offset.checked_add(header_size).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"record body offset overflows u64 for slab {} at offset {}",
+				location.slab_id, location.offset
+			),
+		)
+	})?;
+	let body_len = u64::from(location.length)
+		.checked_sub(header_size)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "record is shorter than slab header"))?;
+	let body_len = u32::try_from(body_len).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("record body length {body_len} exceeds u32::MAX"),
+		)
+	})?;
+	Ok(RecordLocation {
+		offset: body_offset,
+		length: body_len,
+		..location
+	})
+}
+
+fn record_plaintext_range_for_l2(
+	location: RecordLocation,
+) -> std::io::Result<std::ops::Range<usize>> {
+	let start = usize::try_from(location.offset).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("record offset {} does not fit into usize", location.offset),
+		)
+	})?;
+	let end_u64 = location
+		.offset
+		.checked_add(u64::from(location.length))
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"record range overflows u64 for slab {} at offset {}",
+					location.slab_id, location.offset
+				),
+			)
+		})?;
+	let end = usize::try_from(end_u64).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("record end {end_u64} does not fit into usize"),
+		)
+	})?;
+	Ok(start..end)
+}
+
+fn record_body_ranges_to_record_ranges(
+	header_size: u64,
+	body_ranges: &[TieredPlaintextRange],
+) -> std::io::Result<Vec<TieredPlaintextRange>> {
+	body_ranges
+		.iter()
+		.map(|range| {
+			let start = header_size.checked_add(range.start.get()).ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "record body range start overflow")
+			})?;
+			Ok(TieredPlaintextRange::new(
+				RecordBodyByteOffset::new(start),
+				range.len,
+			))
+		})
+		.collect()
+}
+
+fn slab_record_header_size_u64() -> std::io::Result<u64> {
+	u64::try_from(std::mem::size_of::<SlabRecordHeader>()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"slab record header size does not fit into u64",
+		)
+	})
+}
+
+fn columnar_io_error(error: crate::storage::columnar::ColumnFetchError) -> Error {
+	Error::new(ErrorKind::InvalidData, error)
+}
+
+fn arrow_io_error(error: arrow::error::ArrowError) -> Error {
+	Error::new(ErrorKind::InvalidData, error.to_string())
 }
 
 #[allow(dead_code)]
@@ -4719,6 +5249,116 @@ mod tests {
 		crypto
 	}
 
+	struct CountingRangeStore {
+		bytes: Bytes,
+		in_flight: std::sync::atomic::AtomicUsize,
+		max_seen: std::sync::atomic::AtomicUsize,
+	}
+
+	impl CountingRangeStore {
+		fn new(bytes: Bytes) -> Self {
+			Self {
+				bytes,
+				in_flight: std::sync::atomic::AtomicUsize::new(0),
+				max_seen: std::sync::atomic::AtomicUsize::new(0),
+			}
+		}
+
+		fn max_seen(&self) -> usize {
+			self.max_seen.load(std::sync::atomic::Ordering::SeqCst)
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ObjectStore for CountingRangeStore {
+		async fn put(&self, _key: &str, _bytes: &[u8]) -> std::io::Result<String> {
+			Err(Error::other("put not implemented for CountingRangeStore"))
+		}
+
+		async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+			Ok(crate::storage::l2::ObjectMetadata {
+				key: "counting".to_string(),
+				uri: uri.to_string(),
+				size_bytes: self.bytes.len() as u64,
+			})
+		}
+
+		async fn get_range(
+			&self,
+			_uri: &str,
+			range: std::ops::Range<u64>,
+		) -> std::io::Result<Bytes> {
+			let current = self
+				.in_flight
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+				.saturating_add(1);
+			let mut observed = self.max_seen.load(std::sync::atomic::Ordering::SeqCst);
+			while current > observed {
+				match self.max_seen.compare_exchange(
+					observed,
+					current,
+					std::sync::atomic::Ordering::SeqCst,
+					std::sync::atomic::Ordering::SeqCst,
+				) {
+					Ok(_) => break,
+					Err(next) => observed = next,
+				}
+			}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+			self.in_flight
+				.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+			let start = usize::try_from(range.start)
+				.map_err(|_| Error::new(ErrorKind::InvalidInput, "range start exceeds usize"))?;
+			let end = usize::try_from(range.end)
+				.map_err(|_| Error::new(ErrorKind::InvalidInput, "range end exceeds usize"))?;
+			if start > end || end > self.bytes.len() {
+				return Err(Error::new(ErrorKind::InvalidInput, "range out of bounds"));
+			}
+			Ok(self.bytes.slice(start..end))
+		}
+
+		async fn get_bytes(&self, _uri: &str) -> std::io::Result<Bytes> {
+			Ok(self.bytes.clone())
+		}
+
+		async fn list(
+			&self,
+			_prefix: &str,
+		) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+			Ok(Vec::new())
+		}
+
+		async fn delete(&self, _uri: &str) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	#[tokio::test]
+	async fn bounded_l2_range_fetch_preserves_order_and_parallel_cap() {
+		let store = Arc::new(CountingRangeStore::new(Bytes::from_static(
+			b"abcdefghijklmnopqrstuvwxyz",
+		)));
+		let ranges = vec![0..2, 2..5, 5..9, 9..14, 14..20, 20..26];
+
+		let fetched =
+			fetch_l2_ranges_bounded(store.clone(), "counting://object".to_string(), ranges, 2)
+				.await
+				.unwrap();
+
+		assert_eq!(
+			fetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
+			vec![
+				b"ab".as_slice(),
+				b"cde".as_slice(),
+				b"fghi".as_slice(),
+				b"jklmn".as_slice(),
+				b"opqrst".as_slice(),
+				b"uvwxyz".as_slice(),
+			]
+		);
+		assert_eq!(store.max_seen(), 2);
+	}
+
 	fn encode_test_batch(batch: &RecordBatch) -> Vec<u8> {
 		crate::storage::ipc::encode_record_batch_bytes(
 			batch,
@@ -4879,6 +5519,7 @@ mod tests {
 				io,
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit,
 				crypto: test_crypto(),
 			})
@@ -5292,6 +5933,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -5498,6 +6140,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -5652,6 +6295,7 @@ mod tests {
 				io,
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -6128,6 +6772,7 @@ mod tests {
 				io: spawn_io_thread(64).unwrap(),
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -6185,6 +6830,7 @@ mod tests {
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -6217,6 +6863,7 @@ mod tests {
 				io: spawn_io_thread(64).unwrap(),
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -6440,6 +7087,7 @@ mod tests {
 				io: spawn_io_thread(64).unwrap(),
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -6542,6 +7190,154 @@ mod tests {
 				.get(),
 			resident
 		);
+	}
+
+	#[tokio::test]
+	async fn projected_l2_read_materializes_sparse_multirow_record() {
+		let l1_dir = fresh_dir("projected-l2-l1");
+		let l2_dir = fresh_dir("projected-l2-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let mut fields = vec![Field::new("id", DataType::Int64, false)];
+		for column in 1..16 {
+			fields.push(Field::new(format!("c{column}"), DataType::Int64, false));
+		}
+		let schema = Schema::new(fields);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x72; 16]),
+			1,
+			"analytics",
+			"projected_l2",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(20_000, 20_000, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		let row_count = 20_000_usize;
+		let columns = (0..16)
+			.map(|column| {
+				Arc::new(Int64Array::from_iter_values((0..row_count).map(
+					move |row| i64::try_from(column * 1_000_000 + row).unwrap(),
+				))) as Arc<dyn Array>
+			})
+			.collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(100 + source_row_index as u64),
+				},
+			)
+			.collect::<Vec<_>>();
+		let encoded = encode_multirow_from_survivors_with_policy(
+			&batch,
+			&source_rows,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		)
+		.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("projected-l2/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+		let location = mgr
+			.lookup(tenant(), admission.key_identities[0])
+			.expect("tiered row location");
+		let requirement = ColumnFetchRequirement {
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([15]),
+			..ColumnFetchRequirement::default()
+		};
+
+		let projected = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&requirement,
+			)
+			.await
+			.unwrap();
+		let full_frame = mgr
+			.read_encrypted_record_from_l2(l2.as_ref(), &pointer, location)
+			.await
+			.unwrap();
+		let whole = decode_record_batch(&full_frame).unwrap();
+
+		assert!(matches!(projected.strategy, L2FetchStrategy::Columnar(_)));
+		assert_eq!(projected.projected.batch, whole.project(&[15]).unwrap());
+		assert_eq!(projected.projected.batch.num_columns(), 1);
+		assert_eq!(projected.projected.batch.num_rows(), row_count);
 	}
 
 	#[tokio::test]
@@ -6854,6 +7650,7 @@ mod tests {
 				io: spawn_io_thread(64).unwrap(),
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -6886,6 +7683,7 @@ mod tests {
 			io: spawn_io_thread(64).unwrap(),
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -6962,6 +7760,7 @@ mod tests {
 			io: io.clone(),
 			l2: Some(l2.clone()),
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -7029,6 +7828,7 @@ mod tests {
 			io,
 			l2: Some(l2),
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -7075,6 +7875,7 @@ mod tests {
 				io: io.clone(),
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -7140,6 +7941,7 @@ mod tests {
 			io,
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

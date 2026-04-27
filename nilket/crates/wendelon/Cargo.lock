@@ -4023,6 +4023,7 @@ dependencies = [
  "http",
  "io-uring",
  "libc",
+ "lz4_flex",
  "opendal",
  "openraft",
  "postcard",

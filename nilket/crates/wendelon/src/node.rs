@@ -94,8 +94,8 @@ use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
-	GroupCommitConfig, ManagerTierObserver, MvccRetentionPolicy, RaftCommitter, SlabSweeper,
-	SweeperConfig,
+	GroupCommitConfig, L2ColumnFetchConfig, ManagerTierObserver, MvccRetentionPolicy,
+	RaftCommitter, SlabSweeper, SweeperConfig,
 };
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -195,6 +195,8 @@ pub struct NodeBootstrapConfig {
 	/// Policy governing when hot L2 slabs are promoted back into
 	/// local L1 storage.
 	pub rehydration: RehydrationPolicy,
+	/// Node-local ADR 044 L2 columnar fetch strategy config.
+	pub l2_column_fetch: L2ColumnFetchConfig,
 	/// Root KEK provider used to wrap and unwrap tenant KEKs.
 	pub root_kek_provider: RootKekProviderConfig,
 	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
@@ -253,6 +255,7 @@ impl NodeBootstrapConfig {
 			l2: None,
 			tiering: SweeperConfig::default(),
 			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: L2ColumnFetchConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
@@ -376,6 +379,7 @@ impl NodeBootstrapConfig {
 			));
 		}
 		self.rehydration.validate()?;
+		self.l2_column_fetch.validate()?;
 		if let Some(l2) = &self.l2 {
 			l2.build()?;
 			if self.tiering.scan_interval.is_zero() {
@@ -1256,6 +1260,7 @@ impl WendelonNode {
 				io: slab_io.clone(),
 				l2,
 				rehydration: cfg.rehydration.clone(),
+				l2_column_fetch: cfg.l2_column_fetch.clone(),
 				group_commit: cfg.group_commit.clone(),
 				crypto: crypto.clone(),
 			})
