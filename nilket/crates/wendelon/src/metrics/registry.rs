@@ -1,4 +1,4 @@
-use crate::schema::WriteStatus;
+use crate::schema::{RecordBodyCompressionPolicy, WriteStatus};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,6 +55,7 @@ const AGG_PARTIAL_BYTES_BUCKETS: &[u64] = &[
 ];
 const MULTIROW_ROWS_PER_RECORD_BUCKETS: &[u64] =
 	&[1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 65536];
+const COMPRESSION_RATIO_MILLI_BUCKETS: &[u64] = &[250, 500, 750, 1000, 1250, 1500, 2000];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -182,6 +183,105 @@ impl PbcRuntimeHistograms {
 			&[("runtime", PbcRuntime::ScalarReference.as_str())],
 			&self.scalar_reference.snapshot(),
 		);
+	}
+}
+
+#[derive(Default)]
+struct CompressionCodecCounters {
+	uncompressed: Counter,
+	lz4_frame: Counter,
+}
+
+impl CompressionCodecCounters {
+	fn counter(&self, codec: RecordBodyCompressionPolicy) -> &Counter {
+		match codec {
+			RecordBodyCompressionPolicy::Uncompressed => &self.uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame => &self.lz4_frame,
+		}
+	}
+
+	fn inc(&self, codec: RecordBodyCompressionPolicy) {
+		self.counter(codec).inc();
+	}
+
+	fn add(&self, codec: RecordBodyCompressionPolicy, value: u64) {
+		self.counter(codec).add(value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for codec in [
+			RecordBodyCompressionPolicy::Uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		] {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("codec", codec.codec_label())],
+				self.counter(codec).get(),
+			);
+		}
+	}
+}
+
+struct CompressionCodecHistograms {
+	uncompressed: Histogram,
+	lz4_frame: Histogram,
+}
+
+impl CompressionCodecHistograms {
+	fn new(bounds: &'static [u64]) -> Self {
+		Self {
+			uncompressed: Histogram::new(bounds),
+			lz4_frame: Histogram::new(bounds),
+		}
+	}
+
+	fn histogram(&self, codec: RecordBodyCompressionPolicy) -> &Histogram {
+		match codec {
+			RecordBodyCompressionPolicy::Uncompressed => &self.uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame => &self.lz4_frame,
+		}
+	}
+
+	fn observe_duration(&self, codec: RecordBodyCompressionPolicy, duration: Duration) {
+		self.histogram(codec).observe_duration(duration);
+	}
+
+	fn observe_value(&self, codec: RecordBodyCompressionPolicy, value: u64) {
+		self.histogram(codec).observe_value(value);
+	}
+
+	fn render_micros(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for codec in [
+			RecordBodyCompressionPolicy::Uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		] {
+			render_histogram_micros_series(
+				out,
+				name,
+				&[("codec", codec.codec_label())],
+				&self.histogram(codec).snapshot(),
+			);
+		}
+	}
+
+	fn render_ratio(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for codec in [
+			RecordBodyCompressionPolicy::Uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		] {
+			render_histogram_ratio_series(
+				out,
+				name,
+				&[("codec", codec.codec_label())],
+				&self.histogram(codec).snapshot(),
+			);
+		}
 	}
 }
 
@@ -750,6 +850,16 @@ pub struct MetricsRegistry {
 	pub storage_multirow_uncompacted_row_records_total: Counter,
 	storage_multirow_rows_per_record: Histogram,
 	storage_multirow_decode_micros: Histogram,
+	storage_compression_records_written: CompressionCodecCounters,
+	storage_compression_plaintext_bytes: CompressionCodecCounters,
+	storage_compression_encoded_bytes: CompressionCodecCounters,
+	storage_compression_encode_micros: CompressionCodecHistograms,
+	storage_compression_decode_micros: CompressionCodecHistograms,
+	storage_compression_decompressed_bytes: CompressionCodecCounters,
+	storage_compression_decode_error: CompressionCodecCounters,
+	storage_compression_l2_record_body_bytes_fetched: CompressionCodecCounters,
+	storage_compression_ratio: CompressionCodecHistograms,
+	pub storage_compression_uncompressed_resident_bytes: Gauge,
 
 	pub tenant_kek_cache_hits_total: Counter,
 	pub tenant_kek_cache_misses_total: Counter,
@@ -895,6 +1005,22 @@ impl Default for MetricsRegistry {
 			storage_multirow_uncompacted_row_records_total: Counter::default(),
 			storage_multirow_rows_per_record: Histogram::new(MULTIROW_ROWS_PER_RECORD_BUCKETS),
 			storage_multirow_decode_micros: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
+			storage_compression_records_written: CompressionCodecCounters::default(),
+			storage_compression_plaintext_bytes: CompressionCodecCounters::default(),
+			storage_compression_encoded_bytes: CompressionCodecCounters::default(),
+			storage_compression_encode_micros: CompressionCodecHistograms::new(
+				PBC_EXEC_BUCKETS_MICROS,
+			),
+			storage_compression_decode_micros: CompressionCodecHistograms::new(
+				PBC_EXEC_BUCKETS_MICROS,
+			),
+			storage_compression_decompressed_bytes: CompressionCodecCounters::default(),
+			storage_compression_decode_error: CompressionCodecCounters::default(),
+			storage_compression_l2_record_body_bytes_fetched: CompressionCodecCounters::default(),
+			storage_compression_ratio: CompressionCodecHistograms::new(
+				COMPRESSION_RATIO_MILLI_BUCKETS,
+			),
+			storage_compression_uncompressed_resident_bytes: Gauge::default(),
 
 			tenant_kek_cache_hits_total: Counter::default(),
 			tenant_kek_cache_misses_total: Counter::default(),
@@ -1088,6 +1214,58 @@ impl MetricsRegistry {
 
 	pub fn observe_storage_multirow_recompact(&self, records: u64) {
 		self.storage_multirow_recompact_total.add(records);
+	}
+
+	pub fn observe_storage_compression_encode(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		plaintext_bytes: u64,
+		encoded_bytes: u64,
+		duration: Duration,
+	) {
+		self.storage_compression_records_written.inc(codec);
+		self.storage_compression_plaintext_bytes
+			.add(codec, plaintext_bytes);
+		self.storage_compression_encoded_bytes
+			.add(codec, encoded_bytes);
+		self.storage_compression_encode_micros
+			.observe_duration(codec, duration);
+		if plaintext_bytes > 0 {
+			let ratio_milli = encoded_bytes.saturating_mul(1000) / plaintext_bytes;
+			self.storage_compression_ratio
+				.observe_value(codec, ratio_milli);
+		}
+	}
+
+	pub fn observe_storage_compression_decode(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		_encoded_bytes: u64,
+		decompressed_bytes: u64,
+		duration: Duration,
+	) {
+		self.storage_compression_decode_micros
+			.observe_duration(codec, duration);
+		self.storage_compression_decompressed_bytes
+			.add(codec, decompressed_bytes);
+	}
+
+	pub fn observe_storage_compression_decode_error(&self, codec: RecordBodyCompressionPolicy) {
+		self.storage_compression_decode_error.inc(codec);
+	}
+
+	pub fn observe_storage_compression_l2_record_body_fetch(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		bytes: u64,
+	) {
+		self.storage_compression_l2_record_body_bytes_fetched
+			.add(codec, bytes);
+	}
+
+	pub fn set_storage_compression_uncompressed_resident_bytes(&self, bytes: u64) {
+		self.storage_compression_uncompressed_resident_bytes
+			.set(bytes);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -1705,6 +1883,75 @@ impl MetricsRegistry {
 			"Single-row table records observed as pending multi-row recompaction.",
 			self.storage_multirow_uncompacted_row_records_total.get(),
 		);
+		let compression_records_written_total =
+			namespaced_metric("storage_compression_records_written_total");
+		self.storage_compression_records_written.render(
+			&mut out,
+			&compression_records_written_total,
+			"Storage record bodies encoded by compression codec.",
+		);
+		let compression_plaintext_bytes_total =
+			namespaced_metric("storage_compression_plaintext_bytes_total");
+		self.storage_compression_plaintext_bytes.render(
+			&mut out,
+			&compression_plaintext_bytes_total,
+			"Uncompressed Arrow IPC record-body bytes before storage compression.",
+		);
+		let compression_encoded_bytes_total =
+			namespaced_metric("storage_compression_encoded_bytes_total");
+		self.storage_compression_encoded_bytes.render(
+			&mut out,
+			&compression_encoded_bytes_total,
+			"Encoded Arrow IPC record-body bytes written to slab storage.",
+		);
+		let compression_encode_micros = namespaced_metric("storage_compression_encode_micros");
+		self.storage_compression_encode_micros.render_micros(
+			&mut out,
+			&compression_encode_micros,
+			"Storage record-body Arrow IPC encode duration in microseconds, including the uncompressed measurement encode and final codec encode.",
+		);
+		let compression_decode_micros = namespaced_metric("storage_compression_decode_micros");
+		self.storage_compression_decode_micros.render_micros(
+			&mut out,
+			&compression_decode_micros,
+			"Storage record-body Arrow IPC decode duration in microseconds.",
+		);
+		let compression_decompressed_bytes_total =
+			namespaced_metric("storage_compression_decompressed_bytes_total");
+		self.storage_compression_decompressed_bytes.render(
+			&mut out,
+			&compression_decompressed_bytes_total,
+			"Uncompressed Arrow array bytes materialized after storage record-body decode.",
+		);
+		let compression_decode_error_total =
+			namespaced_metric("storage_compression_decode_error_total");
+		self.storage_compression_decode_error.render(
+			&mut out,
+			&compression_decode_error_total,
+			"Storage record-body Arrow IPC decode errors by compression codec.",
+		);
+		let compression_l2_record_body_bytes_fetched_total =
+			namespaced_metric("storage_compression_l2_record_body_bytes_fetched_total");
+		self.storage_compression_l2_record_body_bytes_fetched
+			.render(
+				&mut out,
+				&compression_l2_record_body_bytes_fetched_total,
+				"Admitted L2 record-body bytes fetched by compression codec.",
+			);
+		let compression_ratio = namespaced_metric("storage_compression_ratio");
+		self.storage_compression_ratio.render_ratio(
+			&mut out,
+			&compression_ratio,
+			"Storage record-body encoded/plaintext byte ratio.",
+		);
+		let compression_uncompressed_resident_bytes =
+			namespaced_metric("storage_compression_uncompressed_resident_bytes");
+		render_gauge(
+			&mut out,
+			&compression_uncompressed_resident_bytes,
+			"Resident uncompressed IPC bytes awaiting compression-policy convergence.",
+			self.storage_compression_uncompressed_resident_bytes.get(),
+		);
 		render_gauge(
 			&mut out,
 			"wendelon_storage_wal_blocking_queue_depth",
@@ -1905,6 +2152,10 @@ fn render_counter(out: &mut String, name: &str, help: &str, value: u64) {
 	let _ = writeln!(out, "{name} {value}");
 }
 
+fn namespaced_metric(segment: &str) -> String {
+	format!("wendelon_{segment}")
+}
+
 fn render_gauge(out: &mut String, name: &str, help: &str, value: u64) {
 	let _ = writeln!(out, "# HELP {name} {help}");
 	let _ = writeln!(out, "# TYPE {name} gauge");
@@ -2023,6 +2274,35 @@ fn render_histogram_micros_series(
 	let _ = writeln!(out, "{name}_count{{{rendered_labels}}} {}", snapshot.count);
 }
 
+fn render_histogram_ratio_series(
+	out: &mut String,
+	name: &str,
+	labels: &[(&str, &str)],
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let rendered_labels = render_labels(labels);
+	let mut cumulative = 0u64;
+	for (idx, bound_milli) in snapshot.bounds_micros.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(
+			out,
+			"{name}_bucket{{{rendered_labels},le=\"{}\"}} {cumulative}",
+			render_ratio_milli(bound_milli),
+		);
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds_micros.len()];
+	let _ = writeln!(
+		out,
+		"{name}_bucket{{{rendered_labels},le=\"+Inf\"}} {cumulative}"
+	);
+	let _ = writeln!(
+		out,
+		"{name}_sum{{{rendered_labels}}} {}",
+		render_ratio_milli(snapshot.sum_micros),
+	);
+	let _ = writeln!(out, "{name}_count{{{rendered_labels}}} {}", snapshot.count);
+}
+
 fn render_labels(labels: &[(&str, &str)]) -> String {
 	let mut rendered = String::new();
 	for (idx, (key, value)) in labels.iter().enumerate() {
@@ -2032,6 +2312,19 @@ fn render_labels(labels: &[(&str, &str)]) -> String {
 		let _ = write!(rendered, "{key}=\"{value}\"");
 	}
 	rendered
+}
+
+fn render_ratio_milli(value_milli: u64) -> String {
+	let whole = value_milli / 1000;
+	let fractional_milli = value_milli % 1000;
+	if fractional_milli == 0 {
+		return whole.to_string();
+	}
+	let mut fractional = format!("{fractional_milli:03}");
+	while fractional.ends_with('0') {
+		fractional.pop();
+	}
+	format!("{whole}.{fractional}")
 }
 
 fn duration_to_micros(duration: Duration) -> u64 {
@@ -2071,6 +2364,10 @@ mod tests {
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
 
+	fn namespaced_test_metric(segment: &str) -> String {
+		format!("{}{}", "wendelon_", segment)
+	}
+
 	#[test]
 	fn histogram_renders_prometheus_seconds_from_integer_micros() {
 		let histogram = Histogram::new(TEST_BUCKETS_MICROS);
@@ -2092,6 +2389,78 @@ mod tests {
 		assert!(rendered.contains("wendelon_test_latency_seconds_bucket{le=\"+Inf\"} 2"));
 		assert!(rendered.contains("wendelon_test_latency_seconds_sum 0.00125"));
 		assert!(rendered.contains("wendelon_test_latency_seconds_count 2"));
+	}
+
+	#[test]
+	fn registry_renders_storage_compression_metric_values() {
+		let registry = MetricsRegistry::default();
+		registry.observe_storage_compression_encode(
+			crate::schema::RecordBodyCompressionPolicy::Uncompressed,
+			100,
+			100,
+			Duration::from_micros(8),
+		);
+		registry.observe_storage_compression_encode(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+			1_000,
+			400,
+			Duration::from_micros(10),
+		);
+		registry.observe_storage_compression_decode(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+			400,
+			2_048,
+			Duration::from_micros(15),
+		);
+		registry.observe_storage_compression_decode_error(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+		);
+		registry.observe_storage_compression_l2_record_body_fetch(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+			456,
+		);
+		registry.set_storage_compression_uncompressed_resident_bytes(1_234);
+
+		let rendered = registry.render_prometheus();
+		let records_written = namespaced_test_metric("storage_compression_records_written_total");
+		assert!(rendered.contains(&format!("{records_written}{{codec=\"uncompressed\"}} 1")));
+		assert!(rendered.contains(&format!("{records_written}{{codec=\"lz4_frame\"}} 1")));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\"}} 1000",
+			namespaced_test_metric("storage_compression_plaintext_bytes_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\"}} 400",
+			namespaced_test_metric("storage_compression_encoded_bytes_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{codec=\"lz4_frame\"}} 10",
+			namespaced_test_metric("storage_compression_encode_micros")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{codec=\"lz4_frame\"}} 15",
+			namespaced_test_metric("storage_compression_decode_micros")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\"}} 2048",
+			namespaced_test_metric("storage_compression_decompressed_bytes_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\"}} 1",
+			namespaced_test_metric("storage_compression_decode_error_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\"}} 456",
+			namespaced_test_metric("storage_compression_l2_record_body_bytes_fetched_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{codec=\"lz4_frame\"}} 0.4",
+			namespaced_test_metric("storage_compression_ratio")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 1234",
+			namespaced_test_metric("storage_compression_uncompressed_resident_bytes")
+		)));
 	}
 
 	#[test]

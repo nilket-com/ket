@@ -21,6 +21,9 @@ Current runbooks:
 - [Audit Sink And Archive Distress](./audit_sink_archive_distress.md)
   - triage for local-chain failure, archive backlog, and audit
     materialization lag
+- [ADR 043 Storage Body Stabilization](./adr043_storage_body_stabilization.md)
+  - post-rollout watch for Arrow IPC body compression density, CPU, L2
+    admitted record-body bytes, and convergence
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

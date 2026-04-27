@@ -391,6 +391,7 @@ storage_compression_encode_micros{codec}             // histogram
 storage_compression_decode_micros{codec}             // histogram
 storage_compression_decompressed_bytes_total{codec}  // counter
 storage_compression_decode_error_total{codec}        // counter
+storage_compression_l2_record_body_bytes_fetched_total{codec} // counter
 storage_compression_ratio{codec}                     // histogram
 storage_compression_uncompressed_resident_bytes      // gauge (unlabeled)
 ```
@@ -407,6 +408,20 @@ metric's filter (descriptor-current = `Lz4Frame`) makes
 "what is still resident now?", not "how many uncompressed
 bytes were ever written?". The gauge decays as natural
 compaction reaches each slab.
+
+An implementation may need to inspect sealed and tiered
+slab bodies to refresh this gauge. That refresh is an
+explicit maintenance / compaction diagnostic and must not
+run from a Prometheus scrape path; doing so would turn the
+gauge into a periodic cold-tier full scan.
+
+The L2 fetched-bytes counter tracks admitted whole
+record-body bytes after the L2 range read has produced a
+record body and the IPC codec has been detected from Arrow
+metadata. It exists to verify ADR 043's cold-tier claim:
+LZ4 reduces L2 bytes only by shrinking admitted record
+bodies, not by adding provider-side filtering or
+column-level Range-GET pushdown.
 
 Core stabilization signals:
 

@@ -47,8 +47,8 @@ use crate::crypto::{
 };
 use crate::metrics::global as metrics;
 use crate::schema::table::{
-	RecordLayoutPolicy, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1,
-	TableWriteRequestMeta, validate_table_write_request_batch,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, TableObjectId, TableSchemaCatalogV1,
+	TableSchemaDescriptorV1, TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordRowIndex, SlabId, SlabRecordHeader,
@@ -63,11 +63,12 @@ use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow, persistent_index_path,
 };
 use crate::storage::io_uring::IoRingHandle;
+use crate::storage::ipc::record_batch_compression_policy_from_ipc;
 use crate::storage::l2::ObjectStore;
 use crate::storage::multirow::{
-	MultiRowSourceRow, decode_batch as decode_record_batch, encode_batch as encode_record_batch,
-	encode_multirow_from_survivors, has_storage_synthetic_columns,
-	materialize_record_location_batch, pack_multirow_source_rows,
+	MultiRowSourceRow, decode_batch as decode_record_batch, encode_batch_with_policy,
+	encode_multirow_from_survivors_with_policy, has_storage_synthetic_columns,
+	materialize_record_location_batch, pack_multirow_source_rows_with_policy,
 };
 use crate::storage::stats::{
 	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
@@ -1085,6 +1086,61 @@ impl SlabManager {
 		}
 		let path = slab_path(&self.config.dir, slab_id);
 		self.file_ops.read_all(&path).await
+	}
+
+	/// Refresh the ADR 043 compression-convergence gauge from
+	/// current slab contents and table descriptors.
+	///
+	/// The gauge counts uncompressed IPC frame bytes in sealed L1
+	/// slabs and tiered slabs where the current table descriptor
+	/// selects LZ4. Active slabs are excluded because their shape is
+	/// still being written.
+	///
+	/// This is an expensive diagnostic refresh: tiered slabs are
+	/// downloaded and decrypted to inspect their record bodies. Do
+	/// not call it from a Prometheus scrape path. Prefer invoking it
+	/// from explicit maintenance or compaction workflows.
+	#[allow(dead_code)]
+	pub(crate) async fn refresh_storage_compression_uncompressed_resident_bytes(
+		&self,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> std::io::Result<u64> {
+		let (sealed_ids, tiered_pointers) = {
+			let state = self.state.lock().await;
+			let mut sealed_ids = state
+				.sealed
+				.iter()
+				.map(|entry| *entry.key())
+				.collect::<Vec<_>>();
+			sealed_ids.sort_unstable();
+			let mut tiered_pointers = state
+				.tiered
+				.iter()
+				.map(|entry| entry.value().clone())
+				.collect::<Vec<_>>();
+			tiered_pointers.sort_by_key(|pointer| pointer.slab_id);
+			(sealed_ids, tiered_pointers)
+		};
+
+		let mut bytes = 0_u64;
+		for slab_id in sealed_ids {
+			let blob = self.read_sealed_raw(slab_id).await?;
+			bytes = bytes.saturating_add(uncompressed_resident_bytes_in_slab(
+				&blob,
+				slab_id,
+				table_schemas,
+			)?);
+		}
+		for pointer in tiered_pointers {
+			let blob = self.tiered_plaintext_from_l2(&pointer).await?;
+			bytes = bytes.saturating_add(uncompressed_resident_bytes_in_slab(
+				&blob,
+				pointer.slab_id,
+				table_schemas,
+			)?);
+		}
+		metrics().set_storage_compression_uncompressed_resident_bytes(bytes);
+		Ok(bytes)
 	}
 
 	/// Encode a sealed slab into the ADR 022 L2 object layout.
@@ -3238,6 +3294,10 @@ impl SlabManager {
 				Err(err) if source_is_multirow => return Err(err),
 				Err(_) => None,
 			};
+			let source_compression_policy = match decoded.as_ref() {
+				Some(_) => Some(record_batch_compression_policy_from_ipc(&frame)?),
+				None => None,
+			};
 			let mut matching_rows = Vec::new();
 			let mut nonmatching_records = Vec::new();
 			for record in group {
@@ -3274,8 +3334,14 @@ impl SlabManager {
 					nonmatching_records.push(*record);
 				}
 			}
-			if !matching_rows.is_empty() && source_is_multirow != target_is_multirow {
-				needs_recluster = true;
+			if !matching_rows.is_empty() {
+				let codec_mismatch = match source_compression_policy {
+					Some(policy) => policy != descriptor.record_body_compression_policy,
+					None => false,
+				};
+				if source_is_multirow != target_is_multirow || codec_mismatch {
+					needs_recluster = true;
+				}
 			}
 			group_plans.push(ReclusterGroupPlan {
 				frame,
@@ -3359,7 +3425,11 @@ impl SlabManager {
 					)
 				});
 				for row in &rows_to_recluster {
-					let frame = encode_record_batch(&row.batch)?;
+					let frame = encode_batch_with_policy(
+						&row.batch,
+						descriptor.record_body_compression_policy,
+					)?
+					.bytes;
 					let new_location = replacement
 						.append(row.tenant_id, row.key_identity, row.row_hlc, &frame)
 						.await?;
@@ -3396,7 +3466,12 @@ impl SlabManager {
 							row_hlc: row.row_hlc,
 						})
 						.collect::<Vec<_>>();
-					for packed in pack_multirow_source_rows(*layout, &batch, &source_rows)? {
+					for packed in pack_multirow_source_rows_with_policy(
+						*layout,
+						&batch,
+						&source_rows,
+						descriptor.record_body_compression_policy,
+					)? {
 						let Some(primary) = packed.encoded.rows.first().copied() else {
 							return Err(Error::new(
 								ErrorKind::InvalidData,
@@ -3736,6 +3811,9 @@ impl SlabManager {
 					"rehydration failed; continuing to serve slab from L2"
 				);
 			}
+		}
+		if let Ok(policy) = record_batch_compression_policy_from_ipc(&frame) {
+			metrics().observe_storage_compression_l2_record_body_fetch(policy, frame.len() as u64);
 		}
 		Ok(frame)
 	}
@@ -4089,6 +4167,77 @@ fn extract_record_from_blob(blob: &[u8], location: RecordLocation) -> std::io::R
 	Ok(blob[offset + header_size..end].to_vec())
 }
 
+#[allow(dead_code)]
+fn uncompressed_resident_bytes_in_slab(
+	blob: &[u8],
+	slab_id: SlabId,
+	table_schemas: &TableSchemaCatalogV1,
+) -> std::io::Result<u64> {
+	let mut entries_by_record: BTreeMap<(u64, u32), Vec<RecoveredSlabEntry>> = BTreeMap::new();
+	for entry in recover_slab_entries_from_blob(blob, slab_id)? {
+		entries_by_record
+			.entry((entry.location.offset, entry.location.length))
+			.or_default()
+			.push(entry);
+	}
+
+	let mut descriptors_by_tenant: HashMap<TenantId, Vec<TableSchemaDescriptorV1>> = HashMap::new();
+	let mut bytes = 0_u64;
+	for entries in entries_by_record.values() {
+		let Some(first) = entries.first().copied() else {
+			continue;
+		};
+		let frame = extract_record_from_blob(blob, first.location)?;
+		let policy = match record_batch_compression_policy_from_ipc(&frame) {
+			Ok(policy) => policy,
+			Err(_) => continue,
+		};
+		if policy != RecordBodyCompressionPolicy::Uncompressed {
+			continue;
+		}
+		let batch = match decode_record_batch(&frame) {
+			Ok(batch) => batch,
+			Err(_) => continue,
+		};
+		let mut matches_lz4_descriptor = false;
+		for entry in entries {
+			let row_batch =
+				materialize_record_location_batch(&batch, entry.location.record_row_index)?;
+			let descriptors = descriptors_by_tenant
+				.entry(entry.tenant_id)
+				.or_insert_with(|| {
+					table_schemas
+						.descriptors_for_tenant(entry.tenant_id)
+						.into_iter()
+						.filter(|descriptor| {
+							descriptor.record_body_compression_policy
+								== RecordBodyCompressionPolicy::Lz4Frame
+						})
+						.collect()
+				});
+			for descriptor in descriptors.iter() {
+				if descriptor_matches_tiered_row(
+					descriptor,
+					entry.tenant_id,
+					entry.key_identity,
+					entry.routing_locality,
+					&row_batch,
+				)? {
+					matches_lz4_descriptor = true;
+					break;
+				}
+			}
+			if matches_lz4_descriptor {
+				break;
+			}
+		}
+		if matches_lz4_descriptor {
+			bytes = bytes.saturating_add(frame.len() as u64);
+		}
+	}
+	Ok(bytes)
+}
+
 fn physical_compaction_groups(
 	records: &[CompactionRecord],
 ) -> BTreeMap<(u64, u32), Vec<CompactionRecord>> {
@@ -4232,7 +4381,8 @@ fn compact_physical_record_frame(
 			row_hlc: record.old_location.hlc,
 		})
 		.collect::<Vec<_>>();
-	let encoded = encode_multirow_from_survivors(&batch, &source_rows)?;
+	let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(frame)?;
+	let encoded = encode_multirow_from_survivors_with_policy(&batch, &source_rows, policy)?;
 	let entries = encoded.rows;
 	if entries.len() != survivors.len() {
 		return Err(Error::new(
@@ -4515,10 +4665,11 @@ mod tests {
 	use crate::schema::NodeId;
 	use crate::schema::table::{
 		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, MultiRowLayoutDescriptor,
-		PrimaryKeyDescriptorV1, RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN,
-		STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
-		default_kv_table_descriptor_v1, encode_table_write_row_count,
+		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
+		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
+		encode_table_write_row_count,
 	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
@@ -4532,7 +4683,6 @@ mod tests {
 		UInt64Array, UInt64Builder,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
-	use arrow::ipc::writer::StreamWriter;
 	use arrow::record_batch::RecordBatch;
 
 	fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -4570,13 +4720,11 @@ mod tests {
 	}
 
 	fn encode_test_batch(batch: &RecordBatch) -> Vec<u8> {
-		let mut buf = Vec::new();
-		{
-			let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
-			writer.write(batch).unwrap();
-			writer.finish().unwrap();
-		}
-		buf
+		crate::storage::ipc::encode_record_batch_bytes(
+			batch,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap()
 	}
 
 	fn test_hlc_storage_bytes(hlc: HybridTimestamp) -> [u8; 16] {
@@ -4646,6 +4794,20 @@ mod tests {
 		)
 		.unwrap();
 		descriptor.record_layout_policy = layout;
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor
+	}
+
+	fn layout_recluster_descriptor_with_codec(
+		object_byte: u8,
+		generation: u64,
+		layout: RecordLayoutPolicy,
+		compression_policy: RecordBodyCompressionPolicy,
+	) -> TableSchemaDescriptorV1 {
+		let mut descriptor = layout_recluster_descriptor(object_byte, generation, layout);
+		descriptor.record_body_compression_policy = compression_policy;
 		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
 		descriptor
 	}
@@ -4679,6 +4841,24 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.unwrap()
 			.value(0)
+	}
+
+	fn storage_compression_l2_fetch_metric_value(codec: RecordBodyCompressionPolicy) -> u64 {
+		let segment = "storage_compression_l2_record_body_bytes_fetched_total";
+		let metric = format!("{}{}", "wendelon_", segment);
+		let label = format!("{{codec=\"{}\"}}", codec.codec_label());
+		metrics()
+			.render_prometheus()
+			.lines()
+			.find_map(|line| {
+				if line.starts_with(&metric) && line.contains(&label) {
+					line.rsplit_once(' ')
+						.and_then(|(_, value)| value.parse::<u64>().ok())
+				} else {
+					None
+				}
+			})
+			.unwrap_or(0)
 	}
 
 	async fn fresh_manager() -> Arc<SlabManager> {
@@ -4863,6 +5043,101 @@ mod tests {
 		assert_eq!(
 			region_stats.small_set,
 			Some(vec![b"eu".to_vec(), b"us".to_vec()])
+		);
+	}
+
+	#[tokio::test]
+	async fn table_stats_are_stable_across_record_body_compression() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::LargeUtf8, true),
+		]));
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x43; 16]),
+			7,
+			"analytics",
+			"events",
+			schema.as_ref(),
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		descriptor.stats_policy = ColumnStatsPolicyV1 {
+			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
+			..ColumnStatsPolicyV1::default()
+		};
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.validate().unwrap();
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int64Array::from(vec![Some(9), Some(1), Some(6)])) as Arc<dyn Array>,
+				Arc::new(LargeStringArray::from(vec![
+					Some("us"),
+					Some("eu"),
+					Some("us"),
+				])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = tenant();
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+
+		let mut plaintexts = Vec::new();
+		for policy in [
+			RecordBodyCompressionPolicy::Uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		] {
+			let mgr = fresh_manager().await;
+			for row in 0..batch.num_rows() {
+				let row_batch = batch.slice(row, 1);
+				let frame = encode_batch_with_policy(&row_batch, policy).unwrap().bytes;
+				mgr.append_durable_with_locality(
+					tenant(),
+					admission.key_identities[row],
+					admission.localities[row],
+					hlc(30 + row as u64),
+					&frame,
+				)
+				.await
+				.unwrap();
+			}
+			let slab_id = force_seal_active(&mgr).await;
+			let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+			let mut catalog = TableSchemaCatalogV1::default();
+			catalog.upsert(tenant(), descriptor.clone()).unwrap();
+			let encrypted = mgr
+				.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+				.unwrap();
+			let stats = mgr
+				.config
+				.crypto
+				.decrypt_tiered_stats_block(slab_id, &encrypted.bytes, descriptor.schema_generation)
+				.unwrap()
+				.expect("stats block");
+			let parsed = parse_column_stats_block(&stats.plaintext).unwrap();
+			assert_eq!(parsed.header.row_count, 3);
+			assert_eq!(parsed.columns[0].arrow_type_tag, ARROW_STATS_TAG_INT64);
+			let id_stats = decode_column_stats_payload(&parsed.columns[0]).unwrap();
+			assert_eq!(id_stats.min, Some(encode_signed_stat_value(1, 8).unwrap()));
+			assert_eq!(id_stats.max, Some(encode_signed_stat_value(9, 8).unwrap()));
+			let region_stats = decode_column_stats_payload(&parsed.columns[1]).unwrap();
+			assert_eq!(
+				region_stats.small_set,
+				Some(vec![b"eu".to_vec(), b"us".to_vec()])
+			);
+			plaintexts.push(stats.plaintext);
+		}
+
+		assert_eq!(
+			plaintexts[0], plaintexts[1],
+			"CSB plaintext should be a function of decoded rows and descriptor, not IPC body codec"
 		);
 	}
 
@@ -5676,6 +5951,596 @@ mod tests {
 			offsets.len(),
 			batch.num_rows(),
 			"multi-row rollback should materialize one physical record per row"
+		);
+	}
+
+	async fn assert_sealed_layout_recluster_updates_multirow_codec(
+		object_byte: u8,
+		from_policy: RecordBodyCompressionPolicy,
+		to_policy: RecordBodyCompressionPolicy,
+	) {
+		let mgr = fresh_manager().await;
+		let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
+		let source_descriptor = layout_recluster_descriptor_with_codec(
+			object_byte,
+			1,
+			RecordLayoutPolicy::MultiRow(layout),
+			from_policy,
+		);
+		let target_descriptor = layout_recluster_descriptor_with_codec(
+			object_byte,
+			2,
+			RecordLayoutPolicy::MultiRow(layout),
+			to_policy,
+		);
+		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
+		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
+		let admission =
+			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(10 + source_row_index as u64),
+				},
+			)
+			.collect::<Vec<_>>();
+		let encoded =
+			encode_multirow_from_survivors_with_policy(&batch, &source_rows, from_policy).unwrap();
+		assert_eq!(
+			crate::storage::ipc::record_batch_compression_policy_from_ipc(&encoded.frame).unwrap(),
+			from_policy
+		);
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let old_slab_id = force_seal_active(&mgr).await;
+
+		let report = mgr
+			.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+			.await
+			.unwrap();
+
+		assert_eq!(report.rewritten_slabs, 1);
+		assert_eq!(report.relocated_rows, batch.num_rows());
+		for (row, expected) in [1, 2, 3, 4].into_iter().enumerate() {
+			let location = mgr
+				.lookup_as_of(tenant(), admission.key_identities[row], hlc(100))
+				.expect("reclustered row");
+			assert_ne!(location.slab_id, old_slab_id);
+			let frame = mgr.read(location).await.unwrap();
+			assert_eq!(
+				crate::storage::ipc::record_batch_compression_policy_from_ipc(&frame).unwrap(),
+				to_policy
+			);
+			let storage_batch = decode_record_batch(&frame).unwrap();
+			assert!(has_storage_synthetic_columns(&storage_batch));
+			let user_batch =
+				materialize_record_location_batch(&storage_batch, location.record_row_index)
+					.unwrap();
+			assert_eq!(first_i64(&user_batch), expected);
+		}
+
+		let second = mgr
+			.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+			.await
+			.unwrap();
+		assert_eq!(second, LayoutReclusterReport::default());
+	}
+
+	#[tokio::test]
+	async fn sealed_layout_recluster_same_layout_updates_multirow_codec() {
+		assert_sealed_layout_recluster_updates_multirow_codec(
+			0x64,
+			RecordBodyCompressionPolicy::Uncompressed,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		)
+		.await;
+		assert_sealed_layout_recluster_updates_multirow_codec(
+			0x65,
+			RecordBodyCompressionPolicy::Lz4Frame,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.await;
+	}
+
+	#[tokio::test]
+	async fn active_slab_reads_mixed_record_body_compression() {
+		let mgr = fresh_manager().await;
+		let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
+			0x66,
+			1,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Uncompressed,
+		);
+		let lz4_descriptor = layout_recluster_descriptor_with_codec(
+			0x66,
+			2,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		);
+
+		let mut inserted = Vec::new();
+		for (descriptor, value, ts) in [
+			(&uncompressed_descriptor, 7_i64, hlc(10)),
+			(&lz4_descriptor, 8_i64, hlc(20)),
+		] {
+			let batch = layout_recluster_batch(&[value]);
+			let meta = layout_recluster_meta(descriptor, batch.num_rows());
+			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
+				.unwrap()
+				.bytes;
+			let location = mgr
+				.append_durable_with_locality(
+					tenant(),
+					admission.key_identities[0],
+					admission.localities[0],
+					ts,
+					&frame,
+				)
+				.await
+				.unwrap();
+			inserted.push((
+				admission.key_identities[0],
+				location,
+				value,
+				descriptor.record_body_compression_policy,
+			));
+		}
+
+		assert_eq!(inserted[0].1.slab_id, inserted[1].1.slab_id);
+		for (key_identity, location, expected_value, expected_policy) in inserted {
+			let found = mgr
+				.lookup_as_of(tenant(), key_identity, hlc(100))
+				.expect("mixed-codec row");
+			assert_eq!(found, location);
+			let frame = mgr.read(found).await.unwrap();
+			assert_eq!(
+				crate::storage::ipc::record_batch_compression_policy_from_ipc(&frame).unwrap(),
+				expected_policy
+			);
+			let batch = decode_record_batch(&frame).unwrap();
+			assert!(!has_storage_synthetic_columns(&batch));
+			assert_eq!(first_i64(&batch), expected_value);
+		}
+	}
+
+	#[tokio::test]
+	async fn recovery_reopens_mixed_record_body_compression_slab() {
+		let dir = fresh_dir("mixed-compression-recovery");
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: dir.clone(),
+				max_slab_bytes: 1024 * 1024,
+				io: spawn_io_thread(64).unwrap(),
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
+			0x68,
+			1,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Uncompressed,
+		);
+		let lz4_descriptor = layout_recluster_descriptor_with_codec(
+			0x68,
+			2,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		);
+
+		let mut inserted = Vec::new();
+		for (descriptor, value, ts) in [
+			(&uncompressed_descriptor, 17_i64, hlc(10)),
+			(&lz4_descriptor, 18_i64, hlc(20)),
+		] {
+			let batch = layout_recluster_batch(&[value]);
+			let meta = layout_recluster_meta(descriptor, batch.num_rows());
+			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
+				.unwrap()
+				.bytes;
+			let location = mgr
+				.append_durable_with_locality(
+					tenant(),
+					admission.key_identities[0],
+					admission.localities[0],
+					ts,
+					&frame,
+				)
+				.await
+				.unwrap();
+			inserted.push((
+				admission.key_identities[0],
+				location,
+				value,
+				descriptor.record_body_compression_policy,
+			));
+		}
+		assert_eq!(inserted[0].1.slab_id, inserted[1].1.slab_id);
+		mgr.fsync_all_local_slabs().await.unwrap();
+		drop(mgr);
+
+		let reopened = SlabManager::open(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1024 * 1024,
+			io: spawn_io_thread(64).unwrap(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap();
+		for (key_identity, location, expected_value, expected_policy) in inserted {
+			let found = reopened
+				.lookup_as_of(tenant(), key_identity, hlc(100))
+				.expect("recovered mixed-codec row");
+			assert_eq!(found, location);
+			let frame = reopened.read(found).await.unwrap();
+			assert_eq!(
+				crate::storage::ipc::record_batch_compression_policy_from_ipc(&frame).unwrap(),
+				expected_policy
+			);
+			let batch = decode_record_batch(&frame).unwrap();
+			assert_eq!(first_i64(&batch), expected_value);
+		}
+	}
+
+	#[tokio::test]
+	async fn l2_reads_mixed_record_body_compression_slab() {
+		let l1_dir = fresh_dir("mixed-compression-l2-l1");
+		let l2_dir = fresh_dir("mixed-compression-l2-objects");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let uncompressed_descriptor = layout_recluster_descriptor_with_codec(
+			0x69,
+			1,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Uncompressed,
+		);
+		let lz4_descriptor = layout_recluster_descriptor_with_codec(
+			0x69,
+			2,
+			RecordLayoutPolicy::SingleRow,
+			RecordBodyCompressionPolicy::Lz4Frame,
+		);
+
+		let mut inserted = Vec::new();
+		for (descriptor, value, ts) in [
+			(&uncompressed_descriptor, 27_i64, hlc(10)),
+			(&lz4_descriptor, 28_i64, hlc(20)),
+		] {
+			let batch = layout_recluster_batch(&[value]);
+			let meta = layout_recluster_meta(descriptor, batch.num_rows());
+			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
+				.unwrap()
+				.bytes;
+			let location = mgr
+				.append_durable_with_locality(
+					tenant(),
+					admission.key_identities[0],
+					admission.localities[0],
+					ts,
+					&frame,
+				)
+				.await
+				.unwrap();
+			inserted.push((
+				admission.key_identities[0],
+				location,
+				value,
+				descriptor.record_body_compression_policy,
+				frame.len() as u64,
+			));
+		}
+		let sealed_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(sealed_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(sealed_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("mixed-compression/slab_{sealed_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id: sealed_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+		assert!(mgr.is_tiered(sealed_id).await);
+		assert!(
+			!slab_path(&l1_dir, sealed_id).exists(),
+			"tiered slab should be unlinked from L1 before L2 reads"
+		);
+
+		let uncompressed_fetch_before =
+			storage_compression_l2_fetch_metric_value(RecordBodyCompressionPolicy::Uncompressed);
+		let lz4_fetch_before =
+			storage_compression_l2_fetch_metric_value(RecordBodyCompressionPolicy::Lz4Frame);
+		let mut expected_uncompressed_fetch_bytes = 0_u64;
+		let mut expected_lz4_fetch_bytes = 0_u64;
+
+		for (key_identity, location, expected_value, expected_policy, expected_frame_bytes) in
+			inserted
+		{
+			let found = mgr
+				.lookup_as_of(tenant(), key_identity, hlc(100))
+				.expect("tiered mixed-codec row");
+			assert_eq!(found, location);
+			let frame = mgr.read(found).await.unwrap();
+			assert_eq!(
+				crate::storage::ipc::record_batch_compression_policy_from_ipc(&frame).unwrap(),
+				expected_policy
+			);
+			let batch = decode_record_batch(&frame).unwrap();
+			assert_eq!(first_i64(&batch), expected_value);
+			match expected_policy {
+				RecordBodyCompressionPolicy::Uncompressed => {
+					expected_uncompressed_fetch_bytes =
+						expected_uncompressed_fetch_bytes.saturating_add(expected_frame_bytes);
+				}
+				RecordBodyCompressionPolicy::Lz4Frame => {
+					expected_lz4_fetch_bytes =
+						expected_lz4_fetch_bytes.saturating_add(expected_frame_bytes);
+				}
+			}
+		}
+		assert!(
+			storage_compression_l2_fetch_metric_value(RecordBodyCompressionPolicy::Uncompressed)
+				>= uncompressed_fetch_before.saturating_add(expected_uncompressed_fetch_bytes)
+		);
+		assert!(
+			storage_compression_l2_fetch_metric_value(RecordBodyCompressionPolicy::Lz4Frame)
+				>= lz4_fetch_before.saturating_add(expected_lz4_fetch_bytes)
+		);
+	}
+
+	#[tokio::test]
+	async fn compression_resident_gauge_tracks_sealed_recluster_convergence() {
+		let mgr = fresh_manager().await;
+		let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
+		let source_descriptor = layout_recluster_descriptor_with_codec(
+			0x67,
+			1,
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Uncompressed,
+		);
+		let target_descriptor = layout_recluster_descriptor_with_codec(
+			0x67,
+			2,
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Lz4Frame,
+		);
+		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
+		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
+		let admission =
+			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(10 + source_row_index as u64),
+				},
+			)
+			.collect::<Vec<_>>();
+		let encoded = encode_multirow_from_survivors_with_policy(
+			&batch,
+			&source_rows,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		force_seal_active(&mgr).await;
+
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), target_descriptor.clone()).unwrap();
+		let resident = mgr
+			.refresh_storage_compression_uncompressed_resident_bytes(&catalog)
+			.await
+			.unwrap();
+		assert_eq!(resident, encoded.frame.len() as u64);
+		assert_eq!(
+			metrics()
+				.storage_compression_uncompressed_resident_bytes
+				.get(),
+			resident
+		);
+
+		let report = mgr
+			.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+			.await
+			.unwrap();
+		assert_eq!(report.rewritten_slabs, 1);
+		let resident = mgr
+			.refresh_storage_compression_uncompressed_resident_bytes(&catalog)
+			.await
+			.unwrap();
+		assert_eq!(resident, 0);
+		assert_eq!(
+			metrics()
+				.storage_compression_uncompressed_resident_bytes
+				.get(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
+		let l1_dir = fresh_dir("compression-gauge-tiered-l1");
+		let l2_dir = fresh_dir("compression-gauge-tiered-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
+		let source_descriptor = layout_recluster_descriptor_with_codec(
+			0x6a,
+			1,
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Uncompressed,
+		);
+		let target_descriptor = layout_recluster_descriptor_with_codec(
+			0x6a,
+			2,
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Lz4Frame,
+		);
+		let batch = layout_recluster_batch(&[31, 32, 33, 34]);
+		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
+		let admission =
+			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(50 + source_row_index as u64),
+				},
+			)
+			.collect::<Vec<_>>();
+		let encoded = encode_multirow_from_survivors_with_policy(
+			&batch,
+			&source_rows,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("compression-gauge/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+		assert!(
+			!slab_path(&l1_dir, slab_id).exists(),
+			"tiered gauge should be reading the L2 object, not the deleted L1 slab"
+		);
+
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), target_descriptor).unwrap();
+		let resident = mgr
+			.refresh_storage_compression_uncompressed_resident_bytes(&catalog)
+			.await
+			.unwrap();
+		assert_eq!(resident, encoded.frame.len() as u64);
+		assert_eq!(
+			metrics()
+				.storage_compression_uncompressed_resident_bytes
+				.get(),
+			resident
 		);
 	}
 

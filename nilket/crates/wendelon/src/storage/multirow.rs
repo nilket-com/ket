@@ -4,21 +4,25 @@ use crate::schema::table::{
 	TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordLayoutPolicy, RecordRowIndex,
-	TableWriteValidationError,
+	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyCompressionPolicy,
+	RecordLayoutPolicy, RecordRowIndex, TableWriteValidationError,
 };
 use crate::storage::core::MultiRowIndexEntry;
+use crate::storage::ipc::{
+	EncodedRecordBatch, encode_record_batch, encode_record_batch_bytes,
+	record_batch_compression_policy_from_ipc,
+};
 use arrow::array::{
 	ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array, UInt64Builder,
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedMultiRowRecord {
@@ -51,6 +55,9 @@ pub struct EncodedMultiRowFrame {
 	pub frame: Vec<u8>,
 	pub rows: Vec<StorageRowMetadata>,
 	pub max_row_hlc: HybridTimestamp,
+	pub plaintext_byte_len: u64,
+	pub encoded_byte_len: u64,
+	pub codec: RecordBodyCompressionPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,27 +133,40 @@ pub fn pack_admitted_record_batch_by_bucket(
 		while cursor < rows.len() {
 			let remaining = rows.len() - cursor;
 			let upper = remaining.min(target_rows).min(max_rows).max(1);
-			let mut low = 1;
-			let mut high = upper;
-			let mut best = None;
-			while low <= high {
-				let mid = (low + high) / 2;
-				let encoded = encode_multirow_from_survivors(batch, &rows[cursor..cursor + mid])
+			let mut take_count = upper;
+			let mut encoded = encode_multirow_from_survivors_with_policy(
+				batch,
+				&rows[cursor..cursor + upper],
+				descriptor.record_body_compression_policy,
+			)
+			.map_err(table_pack_io_error)?;
+			if encoded.plaintext_byte_len > max_record_bytes && upper > 1 {
+				let mut low = 1;
+				let mut high = upper - 1;
+				let mut best = None;
+				while low <= high {
+					let mid = (low + high) / 2;
+					let candidate = encode_multirow_from_survivors_with_policy(
+						batch,
+						&rows[cursor..cursor + mid],
+						descriptor.record_body_compression_policy,
+					)
 					.map_err(table_pack_io_error)?;
-				if encoded.frame.len() as u64 <= max_record_bytes || mid == 1 {
-					best = Some((mid, encoded));
-					low = mid + 1;
-				} else {
-					high = mid.saturating_sub(1);
+					if candidate.plaintext_byte_len <= max_record_bytes || mid == 1 {
+						best = Some((mid, candidate));
+						low = mid + 1;
+					} else {
+						high = mid.saturating_sub(1);
+					}
 				}
+				(take_count, encoded) = best.expect("upper bound is at least one row");
 			}
-			let (take_count, encoded) = best.expect("upper bound is at least one row");
-			if encoded.frame.len() as u64 > max_record_bytes {
+			if encoded.plaintext_byte_len > max_record_bytes {
 				return Err(TableWriteValidationError {
 					code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
 					message: format!(
 						"single multi-row table row exceeds max_record_bytes: row_bytes={} max_record_bytes={max_record_bytes}",
-						encoded.frame.len()
+						encoded.plaintext_byte_len
 					),
 				});
 			}
@@ -161,7 +181,7 @@ pub fn pack_admitted_record_batch_by_bucket(
 					.collect(),
 				key_identity: first.key_identity,
 				row_hlc: encoded.max_row_hlc,
-				charged_bytes: encoded.frame.len() as u64,
+				charged_bytes: encoded.encoded_byte_len,
 				frame_bytes: encoded.frame,
 			});
 			cursor += take_count;
@@ -174,6 +194,18 @@ pub fn pack_admitted_record_batch_by_bucket(
 pub fn encode_multirow_from_survivors(
 	batch: &RecordBatch,
 	survivors: &[MultiRowSourceRow],
+) -> std::io::Result<EncodedMultiRowFrame> {
+	encode_multirow_from_survivors_with_policy(
+		batch,
+		survivors,
+		RecordBodyCompressionPolicy::Uncompressed,
+	)
+}
+
+pub fn encode_multirow_from_survivors_with_policy(
+	batch: &RecordBatch,
+	survivors: &[MultiRowSourceRow],
+	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<EncodedMultiRowFrame> {
 	if survivors.is_empty() {
 		return Err(Error::new(
@@ -201,7 +233,7 @@ pub fn encode_multirow_from_survivors(
 		.collect::<std::io::Result<Vec<_>>>()?;
 	let taken = take_rows(batch, &source_row_indices)?;
 	let storage_batch = append_storage_synthetic_columns_from_rows(&taken, &rows)?;
-	let frame = encode_batch(&storage_batch)?;
+	let encoded = encode_record_batch(&storage_batch, policy)?;
 	let decoded_rows = storage_rows_from_batch(&storage_batch)?;
 	let max_row_hlc = decoded_rows
 		.iter()
@@ -209,9 +241,12 @@ pub fn encode_multirow_from_survivors(
 		.max()
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "empty multi-row metadata"))?;
 	Ok(EncodedMultiRowFrame {
-		frame,
+		frame: encoded.bytes,
 		rows: decoded_rows,
 		max_row_hlc,
+		plaintext_byte_len: encoded.plaintext_byte_len,
+		encoded_byte_len: encoded.encoded_byte_len,
+		codec: encoded.codec,
 	})
 }
 
@@ -220,12 +255,27 @@ pub fn pack_multirow_source_rows(
 	batch: &RecordBatch,
 	rows: &[MultiRowSourceRow],
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
+	pack_multirow_source_rows_with_policy(
+		layout,
+		batch,
+		rows,
+		RecordBodyCompressionPolicy::Uncompressed,
+	)
+}
+
+pub fn pack_multirow_source_rows_with_policy(
+	layout: MultiRowLayoutDescriptor,
+	batch: &RecordBatch,
+	rows: &[MultiRowSourceRow],
+	policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	pack_multirow_source_rows_with_caps(
 		batch,
 		rows,
 		layout.target_rows.get().max(1) as usize,
 		layout.max_rows.get().max(1) as usize,
 		layout.max_record_bytes.get(),
+		policy,
 	)
 }
 
@@ -286,6 +336,7 @@ pub fn merge_multirow_streams(
 		layout_max_rows.max(1),
 		layout_max_rows.max(1),
 		max_record_bytes,
+		RecordBodyCompressionPolicy::Uncompressed,
 	)?
 	.into_iter()
 	.map(|packed| packed.encoded)
@@ -490,25 +541,19 @@ pub(crate) fn storage_index_entries_from_batch(
 }
 
 pub fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
-	let mut buf = Vec::new();
-	{
-		let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).map_err(|err| {
-			Error::new(ErrorKind::InvalidData, format!("arrow stream init: {err}"))
-		})?;
-		writer.write(batch).map_err(|err| {
-			Error::new(ErrorKind::InvalidData, format!("arrow stream write: {err}"))
-		})?;
-		writer.finish().map_err(|err| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("arrow stream finish: {err}"),
-			)
-		})?;
-	}
-	Ok(buf)
+	encode_record_batch_bytes(batch, RecordBodyCompressionPolicy::Uncompressed)
+}
+
+pub fn encode_batch_with_policy(
+	batch: &RecordBatch,
+	policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<EncodedRecordBatch> {
+	encode_record_batch(batch, policy)
 }
 
 pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
+	let policy = record_batch_compression_policy_from_ipc(bytes).ok();
+	let started = Instant::now();
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
 	let batch = match reader.next() {
@@ -522,7 +567,7 @@ pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 			"arrow stream contained no record batch",
 		)),
 	}?;
-	match reader.next() {
+	let result = match reader.next() {
 		Some(Ok(_)) => Err(Error::new(
 			ErrorKind::InvalidData,
 			"arrow stream contained multiple record batches",
@@ -532,7 +577,20 @@ pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 			format!("arrow stream read: {err}"),
 		)),
 		None => Ok(batch),
+	};
+	match (&result, policy) {
+		(Ok(batch), Some(policy)) => crate::metrics::global().observe_storage_compression_decode(
+			policy,
+			bytes.len() as u64,
+			batch.get_array_memory_size() as u64,
+			started.elapsed(),
+		),
+		(Err(_), Some(policy)) => {
+			crate::metrics::global().observe_storage_compression_decode_error(policy)
+		}
+		_ => {}
 	}
+	result
 }
 
 pub fn hlc_storage_bytes(hlc: HybridTimestamp) -> [u8; 16] {
@@ -618,6 +676,7 @@ fn pack_multirow_source_rows_with_caps(
 	target_rows: usize,
 	max_rows: usize,
 	max_record_bytes: u64,
+	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	if rows.is_empty() {
 		return Ok(Vec::new());
@@ -640,8 +699,9 @@ fn pack_multirow_source_rows_with_caps(
 			while low <= high {
 				let mid = (low + high) / 2;
 				let source_rows = &bucket_rows[cursor..cursor + mid];
-				let encoded = encode_multirow_from_survivors(batch, source_rows)?;
-				if encoded.frame.len() as u64 <= max_record_bytes || mid == 1 {
+				let encoded =
+					encode_multirow_from_survivors_with_policy(batch, source_rows, policy)?;
+				if encoded.plaintext_byte_len <= max_record_bytes || mid == 1 {
 					best = Some((mid, encoded));
 					low = mid + 1;
 				} else {
@@ -649,12 +709,12 @@ fn pack_multirow_source_rows_with_caps(
 				}
 			}
 			let (take_count, encoded) = best.expect("upper bound is at least one row");
-			if encoded.frame.len() as u64 > max_record_bytes {
+			if encoded.plaintext_byte_len > max_record_bytes {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					format!(
 						"single multi-row storage row exceeds max_record_bytes: row_bytes={} max_record_bytes={max_record_bytes}",
-						encoded.frame.len()
+						encoded.plaintext_byte_len
 					),
 				));
 			}
@@ -720,11 +780,11 @@ fn table_pack_error(message: impl Into<String>) -> TableWriteValidationError {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordLayoutPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSpreadLocalityDescriptorV1, TenantId,
-		encode_table_write_row_count,
+		LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+		TableSpreadLocalityDescriptorV1, TenantId, encode_table_write_row_count,
 	};
-	use arrow::array::Int64Array;
+	use arrow::array::{Int64Array, LargeStringArray};
 	use std::sync::Arc;
 
 	fn hlc(ms: u64) -> HybridTimestamp {
@@ -753,6 +813,8 @@ mod tests {
 		.unwrap();
 		descriptor.record_layout_policy =
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
 		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
 		descriptor
 	}
@@ -773,6 +835,50 @@ mod tests {
 			vec![Arc::new(Int64Array::from(values))],
 		)
 		.unwrap()
+	}
+
+	fn string_batch(payloads: Vec<&str>) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("payload", DataType::LargeUtf8, false),
+			])),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..payloads.len() as i64).collect::<Vec<_>>(),
+				)) as ArrayRef,
+				Arc::new(LargeStringArray::from(payloads)) as ArrayRef,
+			],
+		)
+		.unwrap()
+	}
+
+	fn string_descriptor(max_record_bytes: u64) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::LargeUtf8, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x51; 16]),
+			1,
+			"analytics",
+			"strings",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+				spread_factor: 1,
+				prefix_bits: 1,
+			}),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_layout_policy = RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(16, 16, max_record_bytes).unwrap(),
+		);
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
+		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor
 	}
 
 	#[test]
@@ -831,6 +937,56 @@ mod tests {
 				190, 182, 14, 43, 167, 44, 237, 216, 202, 227, 192, 107, 154, 92, 84, 203, 87, 145,
 				186, 111, 24, 178, 48, 13, 152, 185, 218, 122, 104, 44, 124, 225,
 			]
+		);
+	}
+
+	#[test]
+	fn lz4_record_batch_carries_arrow_body_compression_metadata_and_roundtrips() {
+		let batch = string_batch(vec!["same-value"; 512]);
+		let raw = encode_batch(&batch).unwrap();
+		let compressed =
+			encode_batch_with_policy(&batch, RecordBodyCompressionPolicy::Lz4Frame).unwrap();
+
+		assert_eq!(
+			crate::storage::ipc::record_batch_compression_policy_from_ipc(&raw).unwrap(),
+			RecordBodyCompressionPolicy::Uncompressed
+		);
+		assert_eq!(
+			crate::storage::ipc::record_batch_compression_policy_from_ipc(&compressed.bytes)
+				.unwrap(),
+			RecordBodyCompressionPolicy::Lz4Frame
+		);
+		assert!(compressed.encoded_byte_len < compressed.plaintext_byte_len);
+		assert_eq!(decode_batch(&compressed.bytes).unwrap(), batch);
+	}
+
+	#[test]
+	fn multirow_max_record_bytes_uses_uncompressed_axis_under_lz4() {
+		let payload = "a".repeat(32 * 1024);
+		let batch = string_batch(vec![payload.as_str()]);
+		let descriptor = string_descriptor(4 * 1024);
+		let meta = meta(&descriptor, batch.num_rows());
+		let source_row = MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity: Identity::new([1; 32]),
+			routing_locality: Locality::new(1),
+			row_hlc: hlc(10),
+		};
+		let encoded = encode_multirow_from_survivors_with_policy(
+			&batch,
+			&[source_row],
+			RecordBodyCompressionPolicy::Lz4Frame,
+		)
+		.unwrap();
+		assert!(encoded.plaintext_byte_len > 4 * 1024);
+		assert!(encoded.encoded_byte_len < 4 * 1024);
+
+		let err = pack_record_batch_by_bucket(&meta, &descriptor, &batch, meta.client_hlc)
+			.expect_err("uncompressed axis must reject");
+		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE);
+		assert!(
+			err.message
+				.contains("single multi-row table row exceeds max_record_bytes")
 		);
 	}
 

@@ -1033,7 +1033,6 @@ mod tests {
 	use crate::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 	use arrow::array::{FixedSizeBinaryBuilder, UInt64Array, UInt64Builder};
 	use arrow::datatypes::{DataType, Field, Schema};
-	use arrow::ipc::writer::StreamWriter;
 	use arrow::record_batch::RecordBatch;
 	use async_trait::async_trait;
 	use std::path::Path;
@@ -1067,13 +1066,11 @@ mod tests {
 	}
 
 	fn encode_batch(batch: &RecordBatch) -> Vec<u8> {
-		let mut out = Vec::new();
-		{
-			let mut writer = StreamWriter::try_new(&mut out, batch.schema().as_ref()).unwrap();
-			writer.write(batch).unwrap();
-			writer.finish().unwrap();
-		}
-		out
+		crate::storage::ipc::encode_record_batch_bytes(
+			batch,
+			crate::schema::RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap()
 	}
 
 	fn multirow_storage_frame(

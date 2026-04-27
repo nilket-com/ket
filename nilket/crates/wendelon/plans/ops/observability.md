@@ -303,6 +303,8 @@ Current high-signal mappings:
 - recovery workflows
   - `plans/ops/runbooks/cluster_restore.md`
   - `plans/ops/runbooks/node_replacement.md`
+- ADR 043 storage-body rollout and stabilization watch
+  - `plans/ops/runbooks/adr043_storage_body_stabilization.md`
 
 Minimum runbook shape:
 

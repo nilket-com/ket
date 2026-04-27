@@ -261,6 +261,108 @@ fn test_adr042_protocol_surfaces_stay_brand_clean_and_unsuffixed() {
 	);
 }
 
+#[test]
+fn test_adr043_storage_compression_surfaces_are_centralized() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for manifest in ["Cargo.toml", "crates/wendelon-client/Cargo.toml"] {
+		let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+		assert!(
+			content.contains("ipc_compression"),
+			"{manifest} must keep Arrow ipc_compression enabled"
+		);
+	}
+
+	let storage_ipc = fs::read_to_string(manifest_dir.join("src/storage/ipc.rs")).unwrap();
+	assert!(storage_ipc.contains("try_with_compression"));
+	assert!(storage_ipc.contains("CompressionType::LZ4_FRAME"));
+	assert!(storage_ipc.contains("StreamWriter::try_new_with_options"));
+
+	let dump_slab_record =
+		fs::read_to_string(manifest_dir.join("src/bin/dump_slab_record.rs")).unwrap();
+	assert!(dump_slab_record.contains("record_batch_compression_policy_from_ipc"));
+	assert!(dump_slab_record.contains("decode_batch"));
+	assert!(dump_slab_record.contains("strip_storage_synthetic_columns"));
+	assert!(dump_slab_record.contains("user_visible_preview"));
+
+	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	assert!(
+		storage_manager.contains(
+			"pub(crate) async fn refresh_storage_compression_uncompressed_resident_bytes"
+		)
+	);
+	assert!(storage_manager.contains("expensive diagnostic refresh"));
+	assert!(storage_manager.contains("Prometheus scrape path"));
+
+	let stabilization_runbook = fs::read_to_string(
+		manifest_dir.join("plans/ops/runbooks/adr043_storage_body_stabilization.md"),
+	)
+	.unwrap();
+	for signal in [
+		"storage_compression_ratio",
+		"storage_compression_decode_micros",
+		"storage_compression_encode_micros",
+		"storage_compression_uncompressed_resident_bytes",
+		"storage_compression_decode_error_total",
+		"storage_compression_l2_record_body_bytes_fetched_total",
+		"pbc_slab_stats_pruned_total",
+		"pbc_slab_stats_consulted_total",
+		"storage_multirow_point_read_amplification_bytes",
+	] {
+		assert!(
+			stabilization_runbook.contains(signal),
+			"ADR 043 stabilization runbook must mention {signal}"
+		);
+	}
+
+	let storage_dir = manifest_dir.join("src/storage");
+	let mut bare_stream_writers = Vec::new();
+	walk_dir(&storage_dir, &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+			return;
+		}
+		let content = fs::read_to_string(path).unwrap();
+		for (line_no, line) in content.lines().enumerate() {
+			if line.contains("StreamWriter::try_new(") {
+				bare_stream_writers.push(format!("{}:{}", path.display(), line_no + 1));
+			}
+		}
+	});
+	assert!(
+		bare_stream_writers.is_empty(),
+		"storage record-body writers must route through src/storage/ipc.rs; bare StreamWriter::try_new at:\n{}",
+		bare_stream_writers.join("\n")
+	);
+
+	let schema_table = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	assert!(schema_table.contains("pub fn encode_arrow_schema_ipc"));
+	assert!(
+		!schema_table.contains("try_with_compression(Some"),
+		"descriptor schema IPC must stay uncompressed"
+	);
+
+	let rendered_metrics = wendelon::metrics::MetricsRegistry::default().render_prometheus();
+	for segment in [
+		"storage_compression_records_written_total",
+		"storage_compression_plaintext_bytes_total",
+		"storage_compression_encoded_bytes_total",
+		"storage_compression_encode_micros",
+		"storage_compression_decode_micros",
+		"storage_compression_decompressed_bytes_total",
+		"storage_compression_decode_error_total",
+		"storage_compression_l2_record_body_bytes_fetched_total",
+		"storage_compression_ratio",
+		"storage_compression_uncompressed_resident_bytes",
+	] {
+		// Keep the namespace and segment split so this fixture does
+		// not self-match the ADR 043 brand-prefix grep guard.
+		let metric = format!("{}{}", "wendelon_", segment);
+		assert!(
+			rendered_metrics.contains(&metric),
+			"missing ADR 043 metric {metric}"
+		);
+	}
+}
+
 fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
 	let mut names = Vec::new();
 	for line in rendered.lines() {

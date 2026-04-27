@@ -371,6 +371,34 @@ impl RecordLayoutPolicy {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordBodyCompressionPolicy {
+	#[default]
+	Uncompressed,
+	Lz4Frame,
+}
+
+impl RecordBodyCompressionPolicy {
+	pub const fn default_for_layout(layout: &RecordLayoutPolicy) -> Self {
+		match layout {
+			RecordLayoutPolicy::SingleRow => Self::Uncompressed,
+			RecordLayoutPolicy::MultiRow(_) => Self::Lz4Frame,
+		}
+	}
+
+	pub const fn codec_label(self) -> &'static str {
+		match self {
+			Self::Uncompressed => "uncompressed",
+			Self::Lz4Frame => "lz4_frame",
+		}
+	}
+
+	pub fn validate(self) -> std::io::Result<()> {
+		Ok(())
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiRowLayoutDescriptor {
 	pub target_rows: TargetRowCount,
@@ -560,10 +588,9 @@ pub struct TableSchemaDescriptorV1 {
 	pub arrow_schema_ipc: Vec<u8>,
 	pub primary_key: PrimaryKeyDescriptorV1,
 	pub locality_policy: LocalityPolicyV1,
-	#[serde(default)]
 	pub stats_policy: ColumnStatsPolicyV1,
-	#[serde(default)]
 	pub record_layout_policy: RecordLayoutPolicy,
+	pub record_body_compression_policy: RecordBodyCompressionPolicy,
 	pub schema_fingerprint: [u8; 32],
 	pub evolution_policy: SchemaEvolutionPolicyV1,
 }
@@ -579,6 +606,32 @@ impl TableSchemaDescriptorV1 {
 		locality_policy: LocalityPolicyV1,
 		evolution_policy: SchemaEvolutionPolicyV1,
 	) -> std::io::Result<Self> {
+		Self::new_with_layout(
+			table_object_id,
+			schema_generation,
+			namespace,
+			table_name,
+			arrow_schema,
+			primary_key,
+			locality_policy,
+			RecordLayoutPolicy::SingleRow,
+			evolution_policy,
+		)
+	}
+
+	pub fn new_with_layout(
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+		namespace: impl Into<String>,
+		table_name: impl Into<String>,
+		arrow_schema: &Schema,
+		primary_key: PrimaryKeyDescriptorV1,
+		locality_policy: LocalityPolicyV1,
+		record_layout_policy: RecordLayoutPolicy,
+		evolution_policy: SchemaEvolutionPolicyV1,
+	) -> std::io::Result<Self> {
+		let record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&record_layout_policy);
 		let mut descriptor = Self {
 			contract_version: TABLE_SCHEMA_DESCRIPTOR_VERSION,
 			table_object_id,
@@ -589,7 +642,8 @@ impl TableSchemaDescriptorV1 {
 			primary_key,
 			locality_policy,
 			stats_policy: ColumnStatsPolicyV1::default(),
-			record_layout_policy: RecordLayoutPolicy::SingleRow,
+			record_layout_policy,
+			record_body_compression_policy,
 			schema_fingerprint: [0; 32],
 			evolution_policy,
 		};
@@ -635,6 +689,7 @@ impl TableSchemaDescriptorV1 {
 		validate_locality_policy(&schema, &self.locality_policy)?;
 		validate_stats_policy(&schema, &self.stats_policy)?;
 		self.record_layout_policy.validate()?;
+		self.record_body_compression_policy.validate()?;
 		Ok(())
 	}
 }
@@ -3128,6 +3183,10 @@ mod tests {
 			descriptor.locality_policy,
 			LocalityPolicyV1::IdentityProjection
 		);
+		assert_eq!(
+			descriptor.record_body_compression_policy,
+			RecordBodyCompressionPolicy::Uncompressed
+		);
 	}
 
 	#[test]
@@ -3140,6 +3199,57 @@ mod tests {
 		let mut tampered = descriptor;
 		tampered.table_name = "other".to_owned();
 		assert!(tampered.validate().is_err());
+	}
+
+	#[test]
+	fn descriptor_compression_policy_defaults_by_layout_and_changes_fingerprint() {
+		let schema = table_schema(DataType::Int64, false);
+		let single = descriptor_for(&schema);
+		assert_eq!(
+			single.record_body_compression_policy,
+			RecordBodyCompressionPolicy::Uncompressed
+		);
+
+		let multi = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([8; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			PrimaryKeyDescriptorV1::single("id"),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		assert_eq!(
+			multi.record_body_compression_policy,
+			RecordBodyCompressionPolicy::Lz4Frame
+		);
+
+		let mut explicit = single.clone();
+		explicit.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		explicit.schema_fingerprint = explicit.compute_schema_fingerprint().unwrap();
+		explicit.validate().unwrap();
+		assert_ne!(single.schema_fingerprint, explicit.schema_fingerprint);
+
+		let encoded = encode_table_schema_descriptor_v1(&explicit).unwrap();
+		let decoded = decode_table_schema_descriptor_v1(&encoded).unwrap();
+		assert_eq!(
+			decoded.record_body_compression_policy,
+			RecordBodyCompressionPolicy::Lz4Frame
+		);
+	}
+
+	#[test]
+	fn compression_ratio_accepts_overhead_and_rejects_non_finite_values() {
+		assert_eq!(
+			crate::schema::CompressionRatio::new(1.25).unwrap().get(),
+			1.25
+		);
+		assert!(crate::schema::CompressionRatio::new(-0.01).is_err());
+		assert!(crate::schema::CompressionRatio::new(f32::NAN).is_err());
+		assert!(crate::schema::CompressionRatio::new(f32::INFINITY).is_err());
 	}
 
 	#[test]
@@ -3442,6 +3552,13 @@ mod tests {
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
 		layout_change.schema_fingerprint = layout_change.compute_schema_fingerprint().unwrap();
 		validate_table_schema_evolution(&previous, &layout_change).unwrap();
+
+		let mut compression_change = next.clone();
+		compression_change.schema_generation = 3;
+		compression_change.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		compression_change.schema_fingerprint =
+			compression_change.compute_schema_fingerprint().unwrap();
+		validate_table_schema_evolution(&previous, &compression_change).unwrap();
 	}
 
 	#[test]

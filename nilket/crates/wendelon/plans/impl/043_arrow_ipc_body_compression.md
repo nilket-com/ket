@@ -146,11 +146,15 @@ Work:
    per the layout-driven default, recomputes
    `schema_fingerprint` over the new shape, and atomically
    swaps the stored descriptor and its fingerprint
-   together. Same discipline ADR 042 used for
-   `record_layout_policy`. (A `#[serde(default)]` shim
-   would default the field on decode but leave the stored
-   fingerprint stale, and `validate()` recomputes the
-   fingerprint on every load — `src/schema/table.rs:626` —
+   together. The same discipline applies to other
+   fingerprinted descriptor fields such as `stats_policy`
+   and `record_layout_policy`: there is no tolerant serde
+   decode shim for missing persisted fields. (A
+   `#[serde(default)]` shim would default the field on
+   decode but leave the stored fingerprint stale, and
+   `validate()` recomputes the fingerprint on every load —
+   `TableSchemaDescriptorV1::validate()` in
+   `src/schema/table.rs` —
    so the next read after upgrade would fail with a
    descriptor-fingerprint-mismatch error.)
 5. Permit explicit policy edits without forcing a layout
@@ -471,6 +475,7 @@ storage_compression_encode_micros{codec}             // histogram
 storage_compression_decode_micros{codec}             // histogram
 storage_compression_decompressed_bytes_total{codec}  // counter
 storage_compression_decode_error_total{codec}        // counter
+storage_compression_l2_record_body_bytes_fetched_total{codec} // counter
 storage_compression_ratio{codec}                     // histogram
 storage_compression_uncompressed_resident_bytes      // gauge (unlabeled)
 ```
@@ -481,6 +486,16 @@ and tiered slabs whose current descriptor selects
 `Lz4Frame`. The codec dimension is omitted because the
 metric's filter (descriptor-current = `Lz4Frame`) makes
 "uncompressed codec" the only meaningful value.
+
+The refresh that derives this gauge may inspect tiered
+slab bodies. It is an explicit maintenance / compaction
+diagnostic and must not run from a Prometheus scrape path.
+
+`storage_compression_l2_record_body_bytes_fetched_total`
+counts admitted whole-record L2 bytes after the record body
+is fetched and its Arrow IPC codec can be read. It is a
+Phase 11 stabilization signal, not a new columnar fetch
+feature.
 
 Architectural tests:
 
@@ -590,6 +605,11 @@ Mirrors ADR 039 / 040 / 042 discipline:
   — convergence signal; should decay monotonically.
 - `storage_compression_decode_error_total` — corruption /
   version drift; expected zero.
+- `storage_compression_l2_record_body_bytes_fetched_total`
+  by codec — whole admitted record-body bytes fetched from
+  L2. This should fall with LZ4 through smaller record
+  bodies only; it is not evidence of provider-side
+  filtering or column-level Range-GET pushdown.
 - AGG / scan latency before-vs-after on representative
   tenants.
 - `pbc_slab_stats_pruned_total /
@@ -609,6 +629,8 @@ Mirrors ADR 039 / 040 / 042 discipline:
 - Architectural-test enforcement: writer call sites,
   encoder exclusions, no envelope `format_version` bumps,
   no brand-prefix surfaces.
+- Operator runbook:
+  `plans/ops/runbooks/adr043_storage_body_stabilization.md`.
 
 ## Verification gate
 

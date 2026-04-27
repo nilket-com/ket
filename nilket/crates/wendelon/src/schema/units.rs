@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::{Error, ErrorKind};
 use std::num::NonZeroU64;
 
 /// Defines a newtype wrapper for a primitive, implementing common traits and
@@ -321,6 +322,39 @@ impl_unit!(DurationMillis, u64);
 impl_unit!(ByteCount, u64);
 impl_unit!(PartialStateLength, u32);
 impl_unit!(OverflowFlag, u8);
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct CompressionRatio(f32);
+
+impl CompressionRatio {
+	pub fn new(value: f32) -> std::io::Result<Self> {
+		let ratio = Self(value);
+		ratio.validate()?;
+		Ok(ratio)
+	}
+
+	pub const fn get(self) -> f32 {
+		self.0
+	}
+
+	pub fn validate(self) -> std::io::Result<()> {
+		if !self.0.is_finite() || self.0 < 0.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"compression ratio must be finite and non-negative",
+			));
+		}
+		Ok(())
+	}
+}
+
+impl fmt::Display for CompressionRatio {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		self.0.fmt(f)
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]

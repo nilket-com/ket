@@ -1,7 +1,7 @@
 use std::hint::black_box;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, Int64Array, UInt64Array};
 use arrow::compute::concat_batches;
@@ -14,12 +14,14 @@ use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, Consistency, DurabilityLevel, HybridTimestamp,
 	LocalityPolicyV1, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-	RecordLayoutPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
-	TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId, encode_table_write_row_count,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId,
+	encode_table_write_row_count,
 };
 use wendelon::storage::{
-	aggregate_record_batches, decode_batch, encode_batch, has_storage_synthetic_columns,
-	pack_record_batch_by_bucket, strip_storage_synthetic_columns, take_rows,
+	LocalFsObjectStore, ObjectStore, aggregate_record_batches, decode_batch, encode_batch,
+	encode_batch_with_policy, has_storage_synthetic_columns, pack_record_batch_by_bucket,
+	strip_storage_synthetic_columns, take_rows,
 };
 
 const DEFAULT_ROWS: usize = 65_536;
@@ -55,14 +57,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let single_descriptor = bench_descriptor(RecordLayoutPolicy::SingleRow)?;
 	let default_multi_layout = MultiRowLayoutDescriptor::default();
 	let multi_descriptor = bench_descriptor(RecordLayoutPolicy::MultiRow(default_multi_layout))?;
+	let multi_uncompressed_descriptor = bench_descriptor_with_policy(
+		RecordLayoutPolicy::MultiRow(default_multi_layout),
+		RecordBodyCompressionPolicy::Uncompressed,
+	)?;
 	let meta = table_meta(&multi_descriptor, batch.num_rows())?;
+	let uncompressed_meta = table_meta(&multi_uncompressed_descriptor, batch.num_rows())?;
 
 	let single_write = bench_write_prep("single-row", WRITE_PREP_ITERS, || {
 		build_single_row_frames(&batch)
 	})?;
+	let multi_uncompressed_write =
+		bench_write_prep("multi-row-uncompressed", WRITE_PREP_ITERS, || {
+			build_multirow_frames(&batch, &uncompressed_meta, &multi_uncompressed_descriptor)
+		})?;
 	let multi_write = bench_write_prep("multi-row-default", WRITE_PREP_ITERS, || {
 		build_multirow_frames(&batch, &meta, &multi_descriptor)
 	})?;
+	print_compression_ratio("multi-row-default", &multi_uncompressed_write, &multi_write);
 	let reduction = single_write.physical_records() as f64 / multi_write.physical_records() as f64;
 	println!(
 		"multi_row_fragments case=record-reduction rows={} single_records={} multi_records={} reduction={reduction:.2}",
@@ -75,9 +87,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	bench_full_scan_pbc("single-row", &single_write)?;
+	bench_full_scan_pbc("multi-row-uncompressed", &multi_uncompressed_write)?;
 	bench_full_scan_pbc("multi-row-default", &multi_write)?;
 	bench_aggregate("single-row", &single_descriptor, &single_write)?;
+	bench_aggregate(
+		"multi-row-uncompressed",
+		&multi_uncompressed_descriptor,
+		&multi_uncompressed_write,
+	)?;
 	bench_aggregate("multi-row-default", &multi_descriptor, &multi_write)?;
+	bench_entropy_fixtures(config.rows.min(16_384), default_multi_layout)?;
+	bench_l2_cold_read("multi-row-uncompressed", &multi_uncompressed_write)?;
+	bench_l2_cold_read("multi-row-default", &multi_write)?;
 
 	for max_record_bytes in [256 * 1024_u64, 1024 * 1024, 8 * 1024 * 1024] {
 		let layout = MultiRowLayoutDescriptor::new(65_536, 65_536, max_record_bytes)?;
@@ -87,9 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	}
 
 	for keep_percent in [10_u32, 50, 90] {
-		bench_retention_rewrite(keep_percent, &multi_write)?;
+		bench_retention_rewrite_with_policy(
+			keep_percent,
+			&multi_write,
+			multi_descriptor.record_body_compression_policy,
+		)?;
 	}
-	bench_presorted_recompact(default_multi_layout, &multi_write)?;
+	bench_presorted_recompact(
+		default_multi_layout,
+		&multi_write,
+		multi_descriptor.record_body_compression_policy,
+	)?;
 
 	Ok(())
 }
@@ -140,6 +169,20 @@ where
 		avg_ns(elapsed, iterations),
 	);
 	Ok(frames)
+}
+
+fn print_compression_ratio(
+	label: &'static str,
+	baseline: &PreparedFrames,
+	encoded: &PreparedFrames,
+) {
+	let ratio = encoded.frame_bytes() as f64 / baseline.frame_bytes().max(1) as f64;
+	println!(
+		"multi_row_fragments case=compression-ratio layout={label} rows={} uncompressed_bytes={} encoded_bytes={} ratio={ratio:.3}",
+		encoded.logical_rows,
+		baseline.frame_bytes(),
+		encoded.frame_bytes(),
+	);
 }
 
 fn bench_full_scan_pbc(label: &'static str, frames: &PreparedFrames) -> std::io::Result<()> {
@@ -248,14 +291,18 @@ fn bench_point_read(max_record_bytes: u64, frames: &PreparedFrames) -> std::io::
 	Ok(())
 }
 
-fn bench_retention_rewrite(keep_percent: u32, frames: &PreparedFrames) -> std::io::Result<()> {
+fn bench_retention_rewrite_with_policy(
+	keep_percent: u32,
+	frames: &PreparedFrames,
+	policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<()> {
 	let mut elapsed = Duration::ZERO;
 	let mut output_records = 0;
 	let mut output_rows = 0;
 	let mut output_bytes = 0;
 	for _ in 0..REWRITE_ITERS {
 		let started = Instant::now();
-		let rewritten = rewrite_survivors(frames, keep_percent)?;
+		let rewritten = rewrite_survivors(frames, keep_percent, policy)?;
 		elapsed += started.elapsed();
 		output_records = rewritten.physical_records();
 		output_rows = rewritten.logical_rows;
@@ -277,13 +324,14 @@ fn bench_retention_rewrite(keep_percent: u32, frames: &PreparedFrames) -> std::i
 fn bench_presorted_recompact(
 	layout: MultiRowLayoutDescriptor,
 	frames: &PreparedFrames,
+	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<()> {
 	let mut elapsed = Duration::ZERO;
 	let mut output_records = 0;
 	let mut output_bytes = 0;
 	for _ in 0..REWRITE_ITERS {
 		let started = Instant::now();
-		let compacted = recompact_presorted_storage_batches(frames, layout)?;
+		let compacted = recompact_presorted_storage_batches(frames, layout, policy)?;
 		elapsed += started.elapsed();
 		output_records = compacted.physical_records();
 		output_bytes = compacted.frame_bytes();
@@ -297,6 +345,70 @@ fn bench_presorted_recompact(
 		REWRITE_ITERS,
 		avg_ns(elapsed, REWRITE_ITERS),
 	);
+	Ok(())
+}
+
+fn bench_l2_cold_read(
+	label: &'static str,
+	frames: &PreparedFrames,
+) -> Result<(), Box<dyn std::error::Error>> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let root = std::env::temp_dir().join(format!(
+		"wendelon-l2-bench-{}-{}",
+		std::process::id(),
+		SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+	));
+	std::fs::create_dir_all(&root)?;
+	let store: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&root)?);
+	let uris = runtime.block_on(async {
+		let mut uris = Vec::with_capacity(frames.physical_records());
+		for (index, frame) in frames.frames.iter().enumerate() {
+			let uri = store
+				.put(&format!("{label}/record_{index:08}.ipc"), frame)
+				.await?;
+			uris.push(uri);
+		}
+		Ok::<Vec<String>, std::io::Error>(uris)
+	})?;
+	let lengths = frames
+		.frames
+		.iter()
+		.map(|frame| frame.len() as u64)
+		.collect::<Vec<_>>();
+
+	let mut elapsed = Duration::ZERO;
+	let mut fetched_record_body_bytes = 0;
+	let mut decoded_rows = 0;
+	for _ in 0..FULL_SCAN_ITERS {
+		let started = Instant::now();
+		fetched_record_body_bytes = 0;
+		decoded_rows = 0;
+		for (uri, length) in uris.iter().zip(lengths.iter().copied()) {
+			let bytes = runtime.block_on(store.get_range(uri, 0..length))?;
+			fetched_record_body_bytes += bytes.len();
+			let decoded = decode_batch(bytes.as_ref())?;
+			let user_batch = strip_storage_synthetic_columns(&decoded)?;
+			decoded_rows += user_batch.num_rows();
+		}
+		elapsed += started.elapsed();
+		black_box((fetched_record_body_bytes, decoded_rows));
+	}
+	println!(
+		"multi_row_fragments case=l2-cold-read layout={label} rows={} physical_records={} fetched_record_body_bytes={} decoded_rows={} iterations={} avg_ns={}",
+		frames.logical_rows,
+		frames.physical_records(),
+		fetched_record_body_bytes,
+		decoded_rows,
+		FULL_SCAN_ITERS,
+		avg_ns(elapsed, FULL_SCAN_ITERS),
+	);
+
+	for uri in uris {
+		runtime.block_on(store.delete(&uri))?;
+	}
+	let _ = std::fs::remove_dir_all(root);
 	Ok(())
 }
 
@@ -331,6 +443,7 @@ fn build_multirow_frames(
 fn rewrite_survivors(
 	frames: &PreparedFrames,
 	keep_percent: u32,
+	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<PreparedFrames> {
 	let mut rewritten = Vec::new();
 	let mut logical_rows = 0;
@@ -344,7 +457,7 @@ fn rewrite_survivors(
 		}
 		let survivor = take_rows(&batch, &keep)?;
 		logical_rows += survivor.num_rows();
-		rewritten.push(encode_batch(&survivor)?);
+		rewritten.push(encode_batch_with_policy(&survivor, policy)?.bytes);
 	}
 	Ok(PreparedFrames {
 		frames: rewritten,
@@ -355,6 +468,7 @@ fn rewrite_survivors(
 fn recompact_presorted_storage_batches(
 	frames: &PreparedFrames,
 	layout: MultiRowLayoutDescriptor,
+	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<PreparedFrames> {
 	let mut batches = Vec::with_capacity(frames.physical_records());
 	for frame in &frames.frames {
@@ -373,7 +487,7 @@ fn recompact_presorted_storage_batches(
 			.min(layout.target_rows.get() as usize)
 			.min(layout.max_rows.get() as usize);
 		let batch = merged.slice(cursor, take);
-		output.push(encode_batch(&batch)?);
+		output.push(encode_batch_with_policy(&batch, policy)?.bytes);
 		cursor += take;
 	}
 	Ok(PreparedFrames {
@@ -428,6 +542,14 @@ fn widest_frame(frames: &PreparedFrames) -> std::io::Result<(&[u8], usize, usize
 fn bench_descriptor(
 	record_layout_policy: RecordLayoutPolicy,
 ) -> std::io::Result<TableSchemaDescriptorV1> {
+	let compression_policy = RecordBodyCompressionPolicy::default_for_layout(&record_layout_policy);
+	bench_descriptor_with_policy(record_layout_policy, compression_policy)
+}
+
+fn bench_descriptor_with_policy(
+	record_layout_policy: RecordLayoutPolicy,
+	compression_policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<TableSchemaDescriptorV1> {
 	let mut descriptor = TableSchemaDescriptorV1::new(
 		TableObjectId::new([0x42; 16]),
 		1,
@@ -442,6 +564,7 @@ fn bench_descriptor(
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?;
 	descriptor.record_layout_policy = record_layout_policy;
+	descriptor.record_body_compression_policy = compression_policy;
 	descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint()?;
 	descriptor.validate()?;
 	Ok(descriptor)
@@ -463,6 +586,62 @@ fn bench_schema() -> Schema {
 }
 
 fn bench_batch(rows: usize) -> std::io::Result<RecordBatch> {
+	bench_batch_with_entropy(rows, EntropyFixture::Medium)
+}
+
+#[derive(Clone, Copy)]
+enum EntropyFixture {
+	Low,
+	Medium,
+	High,
+}
+
+impl EntropyFixture {
+	const fn label(self) -> &'static str {
+		match self {
+			Self::Low => "low",
+			Self::Medium => "medium",
+			Self::High => "high",
+		}
+	}
+}
+
+fn bench_entropy_fixtures(
+	rows: usize,
+	layout: MultiRowLayoutDescriptor,
+) -> Result<(), Box<dyn std::error::Error>> {
+	for fixture in [
+		EntropyFixture::Low,
+		EntropyFixture::Medium,
+		EntropyFixture::High,
+	] {
+		let batch = bench_batch_with_entropy(rows, fixture)?;
+		let uncompressed_descriptor = bench_descriptor_with_policy(
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Uncompressed,
+		)?;
+		let lz4_descriptor = bench_descriptor_with_policy(
+			RecordLayoutPolicy::MultiRow(layout),
+			RecordBodyCompressionPolicy::Lz4Frame,
+		)?;
+		let uncompressed_meta = table_meta(&uncompressed_descriptor, batch.num_rows())?;
+		let lz4_meta = table_meta(&lz4_descriptor, batch.num_rows())?;
+		let uncompressed =
+			build_multirow_frames(&batch, &uncompressed_meta, &uncompressed_descriptor)?;
+		let lz4 = build_multirow_frames(&batch, &lz4_meta, &lz4_descriptor)?;
+		let ratio = lz4.frame_bytes() as f64 / uncompressed.frame_bytes().max(1) as f64;
+		println!(
+			"multi_row_fragments case=compression-entropy entropy={} rows={} uncompressed_bytes={} encoded_bytes={} ratio={ratio:.3}",
+			fixture.label(),
+			rows,
+			uncompressed.frame_bytes(),
+			lz4.frame_bytes(),
+		);
+	}
+	Ok(())
+}
+
+fn bench_batch_with_entropy(rows: usize, fixture: EntropyFixture) -> std::io::Result<RecordBatch> {
 	let mut columns: Vec<ArrayRef> = Vec::with_capacity(10);
 	columns.push(Arc::new(Int64Array::from(
 		(0..rows).map(|idx| idx as i64).collect::<Vec<_>>(),
@@ -475,12 +654,27 @@ fn bench_batch(rows: usize) -> std::io::Result<RecordBatch> {
 	for ordinal in 0..8_u64 {
 		columns.push(Arc::new(UInt64Array::from(
 			(0..rows)
-				.map(|idx| (idx as u64).wrapping_mul(31).wrapping_add(ordinal))
+				.map(|idx| payload_value(fixture, idx as u64, ordinal))
 				.collect::<Vec<_>>(),
 		)) as ArrayRef);
 	}
 	RecordBatch::try_new(Arc::new(bench_schema()), columns)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("bench batch: {err}")))
+}
+
+fn payload_value(fixture: EntropyFixture, row: u64, ordinal: u64) -> u64 {
+	match fixture {
+		EntropyFixture::Low => ordinal,
+		EntropyFixture::Medium => row.wrapping_mul(31).wrapping_add(ordinal),
+		EntropyFixture::High => splitmix64(row ^ ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+	}
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+	value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+	value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+	value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+	value ^ (value >> 31)
 }
 
 fn table_meta(
