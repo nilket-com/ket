@@ -1,19 +1,33 @@
 # Brainstorm 011: Lightweight Columnar Encodings (The "Vortex" Playbook)
 
-## Scope note (post-042 split)
+## Scope note (post-043 split)
 
-The V1.5 step originally bundled into this brainstorm — *enable
-Arrow IPC's native `BodyCompression` (LZ4)* — was promoted out
-as its own candidate ADR (see `plans/wip/roadmap-post-042.md`,
-"ADR 043: Arrow IPC body compression"). It's small surface, big
-cost-axis win, and worth ratifying on its own without waiting on
-the full LCE/COCD design.
+V1.5 — *enable Arrow IPC's native `BodyCompression` (LZ4)* —
+**shipped as ADR 043** (`plans/adr/043_arrow_ipc_body_compression.md`).
+Per-table opt-in, layout-driven default
+(`MultiRow → Lz4Frame`, `SingleRow → Uncompressed`), readers
+trust the Arrow IPC FlatBuffer for format authority, single
+coherent compaction (ADR 042 §13) is the convergence primitive.
 
 This brainstorm now covers only V2 and V3: custom SIMD-optimized
 encodings (FastLanes / ALP / FSST / RLE), encoding cascades, page
 directories for O(1) point reads, and compute-over-compressed-
-data. Those remain a multi-quarter design; pull when the LZ4 ADR
-ships and metrics show the remaining bandwidth/memory headroom.
+data. Those remain a multi-quarter design; pull when ADR 043
+metrics — `storage_compression_ratio`,
+`storage_compression_decode_micros`,
+`storage_compression_uncompressed_resident_bytes` — show the
+remaining bandwidth/memory headroom is worth the design surface.
+
+**Sibling cold-tier ADR (not part of this brainstorm).**
+ADR 044 (proposed) — L2 columnar fetch (sovereign pushdown) —
+is a separate cold-tier ADR that uses ADR 043's per-buffer LZ4
+as substrate (each Arrow column buffer decompresses
+independently from its 64 KiB AEAD chunk). It implements
+column-aware Range-GETs against encrypted L2 objects under
+ADR 020's zero-trust posture, which is a different problem
+from custom encodings. Per-column compression policy belongs
+inside the V2 LCE ADR's column-aware encoding cascades, not as
+an extension to ADR 043 or ADR 044.
 
 ## The Premise
 ADR 042 established the physical layout for analytical tables: `[SlabRecordHeader] [Arrow IPC]`. Arrow IPC gives us zero-copy, vectorized execution in `PbcExecutor` and `AGG`, but it leaves massive amounts of NVMe bandwidth and RAM on the table because it is generally uncompressed (or naively dictionary-compressed).
@@ -50,7 +64,7 @@ Vortex uses cascading encodings. A column isn't just "dictionary encoded". It mi
 2. **The "LCE" Protocol:** To comply with `no-project-name-in-protocols.md`, we name our internal encoding engine `LCE` (Lightweight Columnar Encoding).
 3. **The Format Evolution:**
    - **V1 (ADR 042):** We ship raw Arrow IPC. It is fast, correct, and proves the architecture.
-   - **V1.5 (ADR 043 candidate):** Arrow IPC native `BodyCompression` (LZ4). Promoted out of this brainstorm — see roadmap.
+   - **V1.5 (ADR 043, shipped):** Arrow IPC native `BodyCompression` (LZ4). Per-table opt-in, descriptor-driven, single-coherent-compaction convergence.
    - **V2 (this brainstorm, future ADR):** The packer compresses the Arrow batch into a custom `LCE` payload for even denser, SIMD-optimized encoding (e.g., ALP, FastLanes). The slab reader decompresses the `LCE` payload back into Arrow IPC just-in-time for the `PbcExecutor`.
    - **V3 (this brainstorm, future ADR):** `PbcExecutor` becomes `LCE`-aware, executing predicates directly on the encoded bytes.
 
@@ -60,4 +74,4 @@ Vortex uses cascading encodings. A column isn't just "dictionary encoded". It mi
 - **MVCC Synergy:** We can apply specialized encodings to our synthetic columns. `__row_hlc__` is monotonically increasing—perfect for Delta-encoding. `__row_routing_locality__` is often constant—perfect for RLE.
 
 ## Next Steps
-This remains a brainstorm. ADR 042 stands as-is (shipping raw Arrow IPC to establish the multi-row invariant). When L1 -> L2 compaction metrics show NVMe bottlenecking or memory pressure from bloated analytical slabs, this brainstorm becomes the foundation for the LCE ADR.
+This remains a brainstorm for V2 / V3. ADR 042 ships the multi-row invariant; ADR 043 shipped LZ4 body compression as the V1.5 step. When post-043 metrics — `storage_compression_ratio`, `storage_compression_decode_micros`, `storage_compression_uncompressed_resident_bytes` — show that LZ4 leaves meaningful bandwidth/memory headroom on real workloads, this brainstorm becomes the foundation for the LCE V2 ADR. V3 (COCD) lands with or after V2.

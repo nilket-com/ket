@@ -22,9 +22,9 @@ visible under multi-row).
   ADR pulled when Toron's planner needs them.
 - **No auto-triggered single→multi migration.** Descriptor edits
   drive the transition explicitly in V1.
-- **No row-level DELETE tombstones.** Defers to ADR 044 or
+- **No row-level DELETE tombstones.** Defers to ADR 045 or
   sibling.
-- **No PK-less append-only tables.** ADR 044 territory.
+- **No PK-less append-only tables.** ADR 045 territory.
 - **No per-fragment CSB catalog.** Stats stay per-slab.
 - **No grouped AGG work.** ADR 040 follow-up territory.
 - **No new public HRFT frame family.** Storage-layout only.

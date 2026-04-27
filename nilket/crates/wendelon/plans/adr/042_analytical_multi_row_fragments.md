@@ -43,8 +43,8 @@ point-heavy / OLTP-shaped tables.
 
 ## Non-goals (V1)
 
-- **No PK-less append-only tables.** ADR 044 territory.
-- **No row-level DELETE / row-tombstone model.** Defers to ADR 044
+- **No PK-less append-only tables.** ADR 045 territory.
+- **No row-level DELETE / row-tombstone model.** Defers to ADR 045
   or a sibling.
 - **No per-fragment CSB catalog.** Stats stay per-slab (ADR 039
   unchanged).
@@ -495,7 +495,7 @@ breakdown is irrelevant. ADR 040's `tombstone_metadata` field
 stays at slab granularity.
 
 When row-level deletes (DELETE ... WHERE) eventually land — likely
-ADR 044 (PK-less append-only) or its sibling — they will need
+ADR 045 (PK-less append-only) or its sibling — they will need
 per-row visibility metadata. The natural fit: extend the
 synthetic-column set with `__row_tombstone__: Bool` (or use a
 sentinel value in `__row_hlc__`) so deleted rows can be carried
@@ -839,10 +839,10 @@ sunk cost if a future ADR shifts to per-segment metadata.
 2. **Auto-triggered single→multi migration.** Adopt when manual
    descriptor-edit migration proves operationally noisy.
 3. **Row-level tombstones via synthetic columns.** When row-level
-   DELETE lands (likely ADR 044 or sibling), the natural shape
+   DELETE lands (likely ADR 045 or sibling), the natural shape
    adds `__row_tombstone__: Bool` to the storage-only column set.
-4. **PK-less append-only identity.** ADR 044 territory. A PK-less
-   table can't populate `__row_key_id__` from a PK; ADR 044
+4. **PK-less append-only identity.** ADR 045 territory. A PK-less
+   table can't populate `__row_key_id__` from a PK; ADR 045
    either picks an alternative identity (content hash, ordinal)
    or extends `__row_key_id__` semantics to non-PK identity.
 5. **LSM-style leveled compaction.** Forward-compat analysis
@@ -876,7 +876,15 @@ sunk cost if a future ADR shifts to per-segment metadata.
 - `plans/conventions/no-project-name-in-protocols.md` —
   synthetic-column names, metric segments, and reject prefixes
   are functional, not brand-prefixed.
-- ADR 043 (proposed): secondary indexes — composes with
-  `record_row_index` granularity.
-- ADR 044 (proposed): PK-less append-only — natural composition
+- ADR 043: Arrow IPC body compression (LZ4) — `Lz4Frame` is
+  the layout-driven default for `MultiRow`; coherent
+  compaction (§13) is the convergence primitive for the
+  compression policy migration; the `max_record_bytes`
+  enforcement axis (uncompressed bytes) extends §10.
+- ADR 044 (proposed): L2 columnar fetch (sovereign pushdown)
+  — column-aware Range-GETs preserving zero-trust;
+  composes with `record_row_index` granularity.
+- ADR 045 (proposed): PK-less append-only — natural composition
   with multi-row format on append-only event streams.
+- ADR 046 (proposed): secondary indexes — composes with
+  `record_row_index` granularity.
