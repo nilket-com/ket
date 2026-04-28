@@ -62,8 +62,11 @@ already laid:
 ADR 045 is therefore a small ADR by the substrate's
 standards. It adds an identity policy enum and a write-
 context-derived `__row_key_id__` derivation. It does not
-introduce a new synthetic column, a new replicated state
-surface, or a new wire frame.
+introduce a replicated append state surface or a new wire
+frame. Phase 8.5 adds one storage-only synthetic column,
+`__row_table_object_id__`, as a descriptor-isolation stamp
+on multi-row records; it is not append state and is not part
+of identity synthesis.
 
 ## Non-goals (V1)
 
@@ -85,10 +88,13 @@ surface, or a new wire frame.
   is synthesized from authenticated write context; no
   per-table counter, no replicated state surface, no
   recovery reconciliation.
-- **No new storage-only synthetic column.** The ADR 042
-  trio (`__row_hlc__`, `__row_key_id__`,
-  `__row_routing_locality__`) is sufficient. Recovery
-  rebuilds indexes from those alone.
+- **No stored write-context columns.** `writer_node_id` and
+  `intra_batch_index` are consumed by the identity preimage
+  and are not stored separately. Recovery rebuilds indexes
+  from the stored synthetic identity / HLC / locality
+  columns; `__row_table_object_id__` is only the
+  descriptor-isolation stamp for matchers and projected
+  fetch.
 - **No public point-read API by any append cursor.** The
   write-context tuple is storage-internal. Exposing an
   HLC-rooted or identity-rooted cursor has API
@@ -99,15 +105,20 @@ surface, or a new wire frame.
 - **No CDC streaming protocol.** Brainstorm 004.
 - **No new `RecordLayoutPolicy` variant.** Append-only is
   hard-required to be `MultiRow`.
-- **No new locality policy variant.** All three existing
-  ADR 037 / 038 variants compose unchanged with append-
-  only.
+- **No new locality policy variant.** AppendOnly V1 uses the
+  existing `TableSpreadProjection` shape only. Existing
+  `IdentityProjection` and `ColumnProjection` remain valid
+  for PK-keyed tables, but are rejected for AppendOnly until
+  a future ADR proves retry-stable routing semantics for
+  them.
 - **No new node capability bit.** Append-only is descriptor-
   driven; mixed clusters serve both shapes identically.
 - **No new HRFT frame family.** No new reject-code family.
 - **No `ObjectStore` trait change.**
-- **No envelope `format_version` bump.** On-disk slab shape
-  is unchanged.
+- **No envelope `format_version` bump.** The multi-row IPC
+  storage schema gains `__row_table_object_id__` under the
+  existing envelope; no slab-envelope version or HRFT frame
+  changes.
 - **No project-name-prefixed names.**
 - **No `V1` / `V2` suffixes** on new Rust types.
 - **No reserved-for-V2 enum slots, no `#[serde(default)]`
@@ -353,43 +364,34 @@ redb indexes ADR 042 already requires. Compaction
 preserves those synthetic values exactly per row and never
 recomputes append-only identity for surviving rows.
 
-### 6. Locality policy is unchanged; default is table spread
+### 6. Append-only locality is table-spread only in V1
 
-Append-only tables use existing `LocalityPolicy` variants
-(ADR 037 / 038):
+Append-only tables use existing `LocalityPolicy` machinery,
+but V1 accepts only `LocalityPolicyV1::TableSpreadProjection`.
+The descriptor validator rejects `AppendOnly +
+IdentityProjection` and `AppendOnly + ColumnProjection`.
 
-- **`TableSpreadProjection`** uses the synthesized
-  `key_identity` as its salt input, keeping full-table
-  scans bounded to table arcs (ADR 037 design intent).
-  This is the V1 default when the descriptor omits
-  locality, matching ADR 037's typed-table default
-  (`spread_factor: 4, prefix_bits: 16`).
-- **`ColumnProjection`** is the recommended shape for
-  event-time, tenant, region, or other scan-relevant
-  clustering columns. Tenants whose append-only table has
-  a natural time-locality column should declare it
-  explicitly.
-- **`IdentityProjection`** is valid for write-spread-heavy
-  streams but scatters full scans; explicit opt-in only.
+Reason: append-only identity is rooted in the leader-merged
+`commit_hlc`, which the client cannot know during routing.
+Any locality policy that depends on per-row identity or on a
+row-local computation risks client-preview / server-admission
+divergence. `TableSpreadProjection` composes with §4a because
+the spread seed is the retry-stable request identity
+(`parent_write_id`) and every row in the request receives the
+same locality.
 
-The synthesized `key_identity` is a valid salt input for
-`TableSpreadProjection` — there is no PK dependency to
-resolve. Defaulting append-only locality to the same
-table-spread shape as PK-keyed tables keeps operator-
-visible defaults consistent across identity policies.
-
-The default is a *create-time resolution rule*, not a
+The default remains a *create-time resolution rule*, not a
 `#[serde(default)]` compatibility shim: when an `AppendOnly`
-descriptor omits locality, the create-table path writes
-the resolved `TableSpreadProjection { spread_factor: 4,
-prefix_bits: 16 }` value into the persisted descriptor
-before fingerprinting. Serialized descriptors carry an
-explicit locality policy on the wire and at rest. Schema-
-load decode never silently fills in defaults.
+descriptor omits locality, the create-table path writes the
+resolved `TableSpreadProjection { spread_factor: 4,
+prefix_bits: 16 }` value into the persisted descriptor before
+fingerprinting. Serialized descriptors carry an explicit
+locality policy on the wire and at rest. Schema-load decode
+never silently fills in defaults.
 
-No `AppendOrderProjection` is introduced. Tenants who want
-time-range locality declare an event-time clustering
-column under `ColumnProjection`.
+No `AppendOrderProjection` is introduced. Event-time locality
+for append-only tables is future ADR territory; V1 does not
+silently infer it from column names or `CLUSTER BY` syntax.
 
 ### 7. Deterministic packing keeps ADR 042 order
 
@@ -482,8 +484,11 @@ answer eligible without supersession checks.
 Append-only is the canonical 044 workload. The column-
 fetch planner picks columnar fetch on every typical
 analytical projection. The `ColumnFetchRequirement` is
-unchanged from ADR 044 — the same three synthetic columns
-enter the requirement only when an opcode references
+structurally unchanged from ADR 044. Phase 8.5 adds
+`__row_table_object_id__` to descriptor-filtered projected
+fetch requirements so the fast path can verify table
+isolation before returning; other synthetic columns enter
+the requirement only when storage-internal paths require
 them.
 
 ### 14. Time-travel composition (ADR 013)
@@ -493,7 +498,7 @@ where `__row_hlc__ <= t`. Strictly simpler than PK-keyed
 time-travel because there are no version chains to walk —
 each row is its own independent fact.
 
-### 15. Recovery is descriptor-free for append-only
+### 15. Recovery uses stored synthetic columns
 
 Recovery from raw slab bytes already reads synthetic
 columns directly (ADR 042 §3 / 043 §8). For append-only:
@@ -502,11 +507,14 @@ columns directly (ADR 042 §3 / 043 §8). For append-only:
   canonicalization);
 - `__row_routing_locality__` is read directly (no
   recomputation);
+- `__row_table_object_id__` is read directly when matcher /
+  maintenance paths need descriptor isolation;
 - no append-counter state to reconcile (because none
   exists).
 
 Recovery is, if anything, *easier* than PK-keyed because
-no PK schema knowledge is needed.
+no PK schema knowledge is needed to rebuild the identity and
+locality indexes.
 
 ### 16. Toron-side surface
 
@@ -518,16 +526,17 @@ CREATE TABLE events (
     event_time   TIMESTAMP,
     payload      BINARY,
     ...
-) APPEND ONLY
-  CLUSTER BY (event_time);
+) APPEND ONLY;
 ```
 
 `APPEND ONLY` translates to
 `RowIdentityPolicy::AppendOnly` on the descriptor.
 `PRIMARY KEY` plus `APPEND ONLY` is a parse error.
-`APPEND ONLY` without an explicit `CLUSTER BY` falls back
-to the V1 default (`TableSpreadProjection { spread_factor:
-4, prefix_bits: 16 }`).
+`APPEND ONLY` uses the V1 default table-spread locality
+(`TableSpreadProjection { spread_factor: 4, prefix_bits:
+16 }`). `CLUSTER BY` / `ColumnProjection` for append-only is
+rejected in V1 unless a future ADR proves retry-stable
+routing for it.
 
 Update / upsert / delete-by-key against an append-only
 table are parse errors. V1 ships *insert-only*; row delete
@@ -550,12 +559,14 @@ node:
 3. skips PK presence / null / duplicate-in-batch
    validation;
 4. binds `WriterNodeId` from the authenticated request
-   context, assigns per-row HLCs (ADR 012) and
-   `IntraBatchIndex` values;
+   context, receives the leader-merged request HLC (ADR 012),
+   and assigns per-row `IntraBatchIndex` values;
 5. computes per-row key identities under the V1
    preimage (no payload-hash term);
-6. computes locality from the descriptor;
-7. appends the ADR 042 synthetic columns;
+6. computes request-level table-spread locality from
+   canonical `parent_write_id`;
+7. appends the ADR 042 synthetic trio plus
+   `__row_table_object_id__`;
 8. packs rows into bucket-pure multi-row records sorted
    by the ADR 042 deterministic order.
 
@@ -725,9 +736,9 @@ audit-trail / GDPR sweeps land with the follow-up ADR.
   semantic contract, not an optimization miss.
 - **No PK point reads.** Workloads that need lookup /
   update by a business key use `PrimaryKey(...)` tables.
-  ADR 046 (secondary indexes, deferred) will fill the
-  gap for index-by-non-PK-column queries on append-only
-  tables.
+  A secondary-index follow-up candidate can fill the gap
+  for index-by-non-PK-column queries on append-only tables
+  if council prioritizes that path.
 - **`SchemaEvolutionPolicy` interaction.** ADR 037 §17's
   schema evolution rules apply unchanged to append-only
   tables — appending columns is fine, renaming /
@@ -788,20 +799,24 @@ audit-trail / GDPR sweeps land with the follow-up ADR.
   spends implementation surface on the least-useful
   shape.
 - **Add an `AppendOrderProjection` locality variant.**
-  Rejected: `ColumnProjection` over an event-time column
-  already covers it.
+  Rejected: AppendOnly V1 intentionally has one
+  retry-stable table-spread locality shape. Event-time
+  clustering for append-only needs a future ADR that proves
+  client/server routing convergence.
 - **Default locality = `IdentityProjection`.** Rejected:
   scatters scans across the whole ring, defeats ADR 037's
   table-arc-bounded-scan property when the tenant
   intended a scan-shaped workload.
 - **Explicit-required locality / no default.** Rejected:
   ADR 037's `TableSpreadProjection` default applies
-  cleanly via the synthesized `key_identity` salt; making
-  append-only an exception introduces an inconsistency
-  with PK-keyed tables that doesn't earn its keep.
+  cleanly via the request-derived `parent_write_id` salt;
+  making append-only an exception introduces an
+  inconsistency with PK-keyed tables that doesn't earn its
+  keep.
 - **Forbid `TableSpreadProjection` on append-only.**
-  Rejected: the synthesized `key_identity` is a defined
-  salt input; the spread machinery works unchanged.
+  Rejected: §4a defines a retry-stable request-derived
+  spread salt; the spread machinery works without using
+  HLC-derived identity for client-side routing.
 - **Add a node capability bit
   `NodeCapability::AppendOnly`.** Mixed clusters serve
   both shapes; nothing to negotiate.
@@ -881,9 +896,9 @@ follow-up has a starting point):
 This shape composes with 045 without changing 045's
 contract — the synthetic-column extension appends.
 
-**ADR 046 (secondary indexes).** Append-only tables are
-prime secondary-index targets — wide schemas, no PK,
-scan-heavy lookups. ADR 046's index-entry triple
+**Secondary indexes.** Append-only tables are prime
+secondary-index targets — wide schemas, no PK, scan-heavy
+lookups. The index-entry triple
 `(slab_id, record_location, record_row_index)` works
 identically against append-only and PK-keyed slabs.
 

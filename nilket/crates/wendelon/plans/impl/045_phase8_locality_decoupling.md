@@ -234,17 +234,20 @@ detection. PK-keyed tables avoid this through canonical PK
 re-derivation under `descriptor.table_object_id`; AppendOnly
 needed an equivalent durable binding.
 
-Resolution: AppendOnly records gain a per-row
+Resolution after the Phase 8.5 projected-path follow-up:
+every multi-row record (PK + AppendOnly) gains a per-row
 `__row_table_object_id__: FixedSizeBinary(16)` synthetic
 column, stamped at admission with the descriptor's
 `table_object_id`. The matchers verify equality with the
-candidate descriptor's `table_object_id` for the AppendOnly
-arm; PK rows do not carry the column and matchers ignore
-the slot for the PK arm.
+candidate descriptor's `table_object_id`; for AppendOnly this
+is the descriptor binding, and for PK it is an early
+descriptor-isolation check before any whole-record PK
+re-derivation.
 
-Storage cost: 16 bytes × N rows per record. The column is a
-constant-per-record value, so LZ4 compresses it to dictionary
-overhead — effectively a fixed 16-byte cost per record.
+Storage cost: 16 bytes × N rows per multi-row record before
+compression. The column is a constant-per-record value, so LZ4
+compresses it to dictionary overhead — effectively a fixed
+small cost per record.
 
 Compaction preservation: reclustering re-stamps from the
 descriptor (the descriptor is authoritative for the rows
@@ -254,13 +257,14 @@ unchanged.
 
 Public surface: `MultiRowSourceRow` and `StorageRowMetadata`
 gain `table_object_id: Option<TableObjectId>`. The
-decoder/encoder helpers handle present/absent symmetrically.
-A new helper `storage_row_table_object_id_at(batch,
+decoder/encoder helpers handle present/absent symmetrically
+because single-row records still carry no storage synthetic
+columns. A new helper `storage_row_table_object_id_at(batch,
 record_row_index)` is the matcher's read path.
 
-Tests: cross-tenant cross-descriptor isolation (two
-AppendOnly tables, same tenant, same Arrow schema, distinct
-`table_object_id`s — matcher correctly distinguishes them).
+Tests: same-tenant cross-descriptor isolation (two AppendOnly
+tables, same Arrow schema, distinct `table_object_id`s —
+matcher correctly distinguishes them).
 
 ## Phase 8.5 Addendum — Projected fast path verification
 

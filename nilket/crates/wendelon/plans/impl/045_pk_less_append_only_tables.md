@@ -9,10 +9,11 @@ primary key, no dedupe behavior, and no update / delete-by-key
 semantics. Row identity is synthesized from authenticated write
 context — `(writer_node_id, row_hlc, intra_batch_index)` where
 `row_hlc` is the leader-merged commit HLC — and carried through
-the existing ADR 042 synthetic-column trio. No replicated
-counter. No new storage-only column. Multi-row layout,
-compression, CSB, AGG, and ADR 044 columnar fetch continue to
-work unchanged.
+stored multi-row synthetic columns. No replicated counter. No
+stored writer / intra-batch columns. Phase 8.5 adds
+`__row_table_object_id__` as a descriptor-isolation stamp on
+multi-row records. Multi-row layout, compression, CSB, AGG,
+and ADR 044 columnar fetch continue to work unchanged.
 
 ## Non-goals
 
@@ -20,7 +21,8 @@ work unchanged.
 - No content-hash identity mode.
 - No idempotent-ingest mode.
 - No replicated table-local append counter.
-- No new storage-only synthetic column.
+- No stored write-context synthetic columns
+  (`writer_node_id`, `intra_batch_index`).
 - No public point-read API by HLC or identity.
 - No new PBC opcode.
 - No new HRFT write-frame family.
@@ -98,11 +100,11 @@ Golden fixtures under `tests/fixtures/append_only_v1/`:
   HLC and `intra_batch_index = 0` — distinct identities
   (different `writer_node_id`). Documents the
   cross-writer disambiguation.
-- A `ColumnProjection(event_time)` append-only table.
 - A `TableSpreadProjection(spread_factor=4)` append-only
-  table — spread input is the synthesized `key_identity`.
-- An `IdentityProjection` append-only table — explicit
-  opt-in for write-spread-heavy streams.
+  table — spread input is the retry-stable request identity
+  (`parent_write_id`), not synthesized `key_identity`.
+- Negative fixtures proving `AppendOnly + ColumnProjection`
+  and `AppendOnly + IdentityProjection` reject in V1.
 - A descriptor with omitted locality — confirms the
   `TableSpreadProjection { spread_factor: 4,
   prefix_bits: 16 }` default is resolved before
@@ -110,8 +112,9 @@ Golden fixtures under `tests/fixtures/append_only_v1/`:
   the explicit-spread fixture.
 - Recovery fixture proving no append-counter state is
   required: a sealed slab corpus reconstructs the redb
-  index from `__row_key_id__` / `__row_hlc__` /
-  `__row_routing_locality__` alone.
+  index from stored `__row_key_id__` / `__row_hlc__` /
+  `__row_routing_locality__`; descriptor matching uses
+  stored `__row_table_object_id__`.
 - CSB fixture: a sealed append-only slab is direct-answer
   eligible; `supersession_metadata = tracked None`.
 - Mixed-shape fixture: PK-keyed table + append-only table
@@ -160,11 +163,14 @@ Work:
    - **Reject** `AppendOnly +
      RecordLayoutPolicy::SingleRow`.
    - **Reject** Arrow schema declaring user columns named
-     `__row_hlc__`, `__row_key_id__`, or
-     `__row_routing_locality__` (defense-in-depth).
-   - **Accept** all three existing locality variants
-     (`TableSpreadProjection`, `ColumnProjection`,
-     `IdentityProjection`).
+     `__row_hlc__`, `__row_key_id__`,
+     `__row_routing_locality__`, or
+     `__row_table_object_id__` (defense-in-depth).
+   - **Accept** `TableSpreadProjection`.
+   - **Reject** `IdentityProjection` and
+     `ColumnProjection` for AppendOnly V1 because neither
+     can produce retry-stable routing under HLC-derived
+     identity.
    - **Default** an omitted `LocalityPolicy` to
      `TableSpreadProjection { spread_factor: 4,
      prefix_bits: 16 }` as a *create-time resolution
@@ -192,8 +198,10 @@ Tests:
 
 - Existing PK descriptor tests pass through
   `RowIdentityPolicy::PrimaryKey`.
-- `RowIdentityPolicy::AppendOnly` admitted with all
-  three locality variants and `MultiRow` layout.
+- `RowIdentityPolicy::AppendOnly` admitted with
+  `TableSpreadProjection` and `MultiRow` layout.
+- `AppendOnly + IdentityProjection` and `AppendOnly +
+  ColumnProjection` rejected.
 - `AppendOnly + SingleRow` rejected.
 - `AppendOnly` with user `__row_*` column rejected.
 - `AppendOnly` without explicit locality picks
@@ -326,9 +334,8 @@ Work:
      `IntraBatchIndex` per row.
    - Derive `key_identity` per the ADR §4 preimage.
      **No payload hashing.**
-   - Compute locality from the descriptor's existing
-     `LocalityPolicy` (unchanged math; the salt source
-     for `TableSpreadProjection` is now `key_identity`).
+   - Compute request-level locality from canonical
+     `parent_write_id` under `TableSpreadProjection`.
    - Persist `__row_hlc__ = commit_hlc` — the same value
      used in identity synthesis.
 4. Reject update / upsert / delete-by-key operations
@@ -353,8 +360,9 @@ Tests:
 - PK-table duplicate-in-batch rejection still works.
 - `AppendOnly` update / upsert / delete-by-key
   rejected.
-- Locality calculation works for all three locality
-  variants on append-only tables.
+- Locality calculation is retry-stable for
+  `TableSpreadProjection`; `IdentityProjection` and
+  `ColumnProjection` reject for append-only tables.
 - `IntraBatchIndex` overflow rejects atomically.
 
 Exit:
@@ -386,15 +394,16 @@ Work:
    The `__row_key_id__` tie-breaker is unique with
    overwhelming probability.
 3. Preserve ADR 042 bucket-pure packing.
-4. Write `__row_hlc__`, `__row_key_id__`, and
-   `__row_routing_locality__` for every append-only row.
-   **No new synthetic column.**
-5. Strip all ADR 042 synthetic columns before user-visible
-   decode (existing path; no new stripping rule).
+4. Write `__row_hlc__`, `__row_key_id__`,
+   `__row_routing_locality__`, and
+   `__row_table_object_id__` for every multi-row row.
+5. Strip all storage-only synthetic columns before
+   user-visible decode (existing path; no public leakage).
 6. Recovery reads `__row_key_id__`, `__row_hlc__`, and
    `__row_routing_locality__` directly from the IPC body
-   to rebuild redb indexes. **No append-counter state to
-   reconcile.**
+   to rebuild redb indexes; descriptor matching reads
+   `__row_table_object_id__`. **No append-counter state
+   to reconcile.**
 7. Compaction preserves `__row_key_id__` and `__row_hlc__`
    exactly per row. Architectural test asserts the
    compactor never calls `synthesize_append_only_row_id`.
@@ -406,16 +415,17 @@ Work:
 Tests:
 
 - Encoded append-only IPC contains the ADR 042 synthetic
-  storage columns in the documented order — no new
-  column.
+  storage columns plus `__row_table_object_id__` in the
+  documented order.
 - User-facing reads strip all synthetic columns.
 - Recovery rebuilds the key / locality index without
   consulting any append-counter state — architectural
   test inspects the recovery code path for absence of
   `TableAppendState` / `AppendOrdinal` references.
 - Compaction preserves key identities byte-for-byte.
-- Bucket-pure packing holds for append-only writes
-  spanning multiple locality buckets.
+- AppendOnly packing is bucket-pure with one locality per
+  request; size limits may still split the request into
+  multiple records in that bucket.
 - Stats ignore storage-only columns.
 - Mixed PK-keyed + append-only corpora recover together.
 - Architectural test: compactor source does not call
@@ -699,8 +709,9 @@ Summary of work landed in this phase:
 - `table_record_matches_descriptor` and
   `descriptor_matches_tiered_row` dispatch on
   `RowIdentityPolicy`. PK keeps the existing re-derivation
-  check; AppendOnly verifies schema only and trusts the
-  stored synthetic columns. The `zero_hlc` placeholder is
+  check; AppendOnly verifies schema plus stored
+  `__row_table_object_id__` and trusts the stored synthetic
+  identity / locality columns. The `zero_hlc` placeholder is
   gone from the AppendOnly path.
 - `observe_storage_append_only_batch` is no longer called
   inside admission. The data-server fires it on the success
@@ -808,7 +819,9 @@ Convention guards green:
   family).
 - No new node capability bit.
 - No `ObjectStore` trait break.
-- No new storage-only synthetic column.
+- No stored write-context synthetic columns. The only new
+  storage-only column is the Phase 8.5
+  `__row_table_object_id__` descriptor-isolation stamp.
 
 ## Deferred to bench / implementation discovery / council
 
