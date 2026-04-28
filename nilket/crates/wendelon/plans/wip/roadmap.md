@@ -6,17 +6,31 @@ the tip moves: each ADR that ships shifts the chain by one.
 
 ## Where we are
 
-ADR 045 (PK-less Append-Only Tables) just shipped. Append-only
-tenant tables now derive row identity from authenticated write
-context — `BLAKE3("table.append-row" || tenant_id ||
-table_object_id || writer_node_id || row_hlc ||
-intra_batch_index_be)` — with no replicated counter, no PK
-canonicalization, and no hot-path payload hashing. Locality is
-per-request, derived from `parent_write_id`, so client preview
-and server admission converge byte-for-byte. Phase 8 added
-`__row_table_object_id__` as a fourth synthetic column on every
-multi-row record (PK + AppendOnly), closing the cross-descriptor
-isolation gap on the projected fast path.
+ADR 047 (Row-Level Tombstones on Append-Only Tables) just
+promoted. Append-only tables gain `DeleteRows { row_key_ids }`
+admission, a single new synthetic column `__row_tombstone__`
+on append-only schemas, an `is_tombstone` bit on local /
+persistent index entries, and the `has_row_tombstone_records`
+footer presence flag (subject to Phase 0 footer-slot audit).
+Tombstones share the target row's `__row_key_id__`, making
+deletion an MVCC version-chain operation; the visible
+`StateDigest` cancels via `add_element` /
+`subtract_element` on the same point. ADR 040
+`tombstone_metadata` extends to row tombstones, and CSB
+direct-answer eligibility falls back unchanged. ADR 046's
+`subtract_element` substrate now has its first production
+consumer. Implementation pending (Phases 0–10 in
+`plans/impl/047_row_tombstones_append_only.md`).
+
+ADR 046 (`StateDigest` substrate) is the immediate predecessor
+— the algebra ADR 047 consumes. ADR 045 (PK-Less Append-Only
+Tables) is the identity layer the deletion ADR composes onto;
+its append-row identity preimage and synthetic-column trio
+remain unchanged. Phase 8 of ADR 045 added
+`__row_table_object_id__` as the fourth synthetic column on
+every multi-row record (PK + AppendOnly), closing the cross-
+descriptor isolation gap on the projected fast path; ADR 047
+adds `__row_tombstone__` as the fifth, append-only-only.
 
 ## Prioritization philosophy
 
@@ -69,15 +83,19 @@ Gemini.
 
 ### Lifecycle (validates the algebra)
 
-2. **Row-level tombstones on append-only.** Adds
-   `__row_tombstone__` synthetic column,
-   `DeleteRows { row_key_ids }` request shape, retention floor,
-   compaction GC. Decides tombstone visibility metadata —
-   the ADR 045 `has_tombstones` footer-bit sketch is the
-   starting point, not pre-decided placement. Includes
-   `StateDigest` composition section. Doubles as the first
-   non-speculative validation of the algebra at the deletion
-   layer. *3–5 iterations.*
+2. **Row-level tombstones on append-only.** ADR 047 promoted
+   — see `plans/adr/047_row_tombstones_append_only.md` and
+   `plans/impl/047_row_tombstones_append_only.md`. Tombstones
+   share the target's `__row_key_id__`; one new synthetic
+   column (`__row_tombstone__`); `is_tombstone` bit on index
+   entries; tombstone-only multi-row records (no user
+   columns); reuse ADR 040 `tombstone_metadata`; one footer
+   bit (`has_row_tombstone_records`, subject to Phase-0
+   audit; correctness-equivalent fallback if no clean slot
+   exists); visible-domain `StateDigest` subtraction with no
+   durable placement. First non-speculative validation of
+   ADR 046 `subtract_element` against real storage state.
+   Phases 0–10 impl pending.
 
 3. **Per-table retention policy.** `RETENTION = '90 DAYS'`
    drops rows where `__row_hlc__ < now - 90d` at compaction
