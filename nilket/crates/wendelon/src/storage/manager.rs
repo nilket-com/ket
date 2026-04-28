@@ -48,13 +48,14 @@ use crate::crypto::{
 };
 use crate::metrics::global as metrics;
 use crate::schema::table::{
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, TableObjectId, TableSchemaCatalogV1,
-	TableSchemaDescriptorV1, TableWriteRequestMeta, validate_table_write_request_batch,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, TableObjectId,
+	TableSchemaCatalogV1, TableSchemaDescriptorV1, TableWriteRequestMeta,
+	validate_table_write_request_batch,
 };
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordRowIndex, SlabId, SlabRecordHeader, SupersessionMetadata, TenantId, TenantKekId,
-	TombstoneMetadata,
+	TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
@@ -1323,10 +1324,19 @@ impl SlabManager {
 				));
 			}
 			let frame = extract_record_from_blob(blob, location)?;
-			let batch = match decode_record_batch(&frame) {
-				Ok(batch) => {
-					match materialize_record_location_batch(&batch, location.record_row_index) {
-						Ok(batch) if batch.num_rows() == 1 => batch,
+			let (batch, stored_table_object_id) = match decode_record_batch(&frame) {
+				Ok(decoded) => {
+					// Phase 8.5: surface malformed
+					// `__row_table_object_id__` as storage corruption
+					// rather than silently treating it as PK. `Ok(None)`
+					// means the column is absent (PK row); only fail
+					// when the column is present but unreadable.
+					let table_object_id = crate::storage::multirow::storage_row_table_object_id_at(
+						&decoded,
+						location.record_row_index,
+					)?;
+					match materialize_record_location_batch(&decoded, location.record_row_index) {
+						Ok(batch) if batch.num_rows() == 1 => (batch, table_object_id),
 						_ => {
 							saw_unmatched_row = true;
 							continue;
@@ -1350,6 +1360,7 @@ impl SlabManager {
 					tenant_id,
 					key_identity,
 					routing_locality,
+					stored_table_object_id,
 					&batch,
 				) {
 					Ok(true) => Some(descriptor),
@@ -3365,6 +3376,14 @@ impl SlabManager {
 				let matches_descriptor = match decoded.as_ref() {
 					Some(_) if record.tenant_id != tenant_id => false,
 					Some(batch) => {
+						// Phase 8.5: malformed
+						// `__row_table_object_id__` is storage
+						// corruption, not "treat as PK".
+						let stored_table_object_id =
+							crate::storage::multirow::storage_row_table_object_id_at(
+								batch,
+								record.old_location.record_row_index,
+							)?;
 						let row_batch = materialize_record_location_batch(
 							batch,
 							record.old_location.record_row_index,
@@ -3374,6 +3393,7 @@ impl SlabManager {
 							tenant_id,
 							record.key_identity,
 							record.routing_locality,
+							stored_table_object_id,
 							&row_batch,
 						)? {
 							matching_rows.push(ReclusterLogicalRow {
@@ -3517,6 +3537,12 @@ impl SlabManager {
 							format!("layout recluster row concat failed: {err}"),
 						)
 					})?;
+					// ADR 045 Phase 8: reclustering re-stamps the
+					// table-isolation column from the descriptor — the
+					// descriptor is authoritative for the rows being
+					// reclustered because reclustering operates
+					// per-descriptor.
+					let table_object_id_stamp = Some(descriptor.table_object_id);
 					let source_rows = rows_to_recluster
 						.iter()
 						.enumerate()
@@ -3525,6 +3551,7 @@ impl SlabManager {
 							key_identity: row.key_identity,
 							routing_locality: row.routing_locality,
 							row_hlc: row.row_hlc,
+							table_object_id: table_object_id_stamp,
 						})
 						.collect::<Vec<_>>();
 					for packed in pack_multirow_source_rows_with_policy(
@@ -4731,6 +4758,12 @@ fn uncompressed_resident_bytes_in_slab(
 		};
 		let mut matches_lz4_descriptor = false;
 		for entry in entries {
+			// Phase 8.5: malformed `__row_table_object_id__` is
+			// storage corruption, not "treat as PK".
+			let stored_table_object_id = crate::storage::multirow::storage_row_table_object_id_at(
+				&batch,
+				entry.location.record_row_index,
+			)?;
 			let row_batch =
 				materialize_record_location_batch(&batch, entry.location.record_row_index)?;
 			let descriptors = descriptors_by_tenant
@@ -4751,6 +4784,7 @@ fn uncompressed_resident_bytes_in_slab(
 					entry.tenant_id,
 					entry.key_identity,
 					entry.routing_locality,
+					stored_table_object_id,
 					&row_batch,
 				)? {
 					matches_lz4_descriptor = true;
@@ -4902,13 +4936,24 @@ fn compact_physical_record_frame(
 			record.old_location.record_row_index,
 		)
 	});
+	// ADR 045 Phase 8: preserve the per-row `__row_table_object_id__`
+	// stamp through compaction. AppendOnly rows must keep their
+	// table-isolation binding; PK rows have `None`.
+	let source_metadata = crate::storage::multirow::storage_rows_from_batch(&batch)?;
 	let source_rows = survivors
 		.iter()
-		.map(|record| MultiRowSourceRow {
-			source_row_index: record.old_location.record_row_index.get() as usize,
-			key_identity: record.key_identity,
-			routing_locality: record.routing_locality,
-			row_hlc: record.old_location.hlc,
+		.map(|record| {
+			let row_index = record.old_location.record_row_index.get() as usize;
+			let table_object_id = source_metadata
+				.get(row_index)
+				.and_then(|meta| meta.table_object_id);
+			MultiRowSourceRow {
+				source_row_index: row_index,
+				key_identity: record.key_identity,
+				routing_locality: record.routing_locality,
+				row_hlc: record.old_location.hlc,
+				table_object_id,
+			}
 		})
 		.collect::<Vec<_>>();
 	let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(frame)?;
@@ -4962,22 +5007,61 @@ fn descriptor_matches_tiered_row(
 	tenant_id: TenantId,
 	key_identity: Identity,
 	routing_locality: Locality,
+	stored_table_object_id: Option<TableObjectId>,
 	batch: &RecordBatch,
 ) -> std::io::Result<bool> {
 	if batch.num_rows() != 1 || batch.schema().as_ref() != &descriptor.arrow_schema()? {
 		return Ok(false);
 	}
-	let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
-	table_meta.tenant_id = tenant_id;
-	table_meta.table_object_id = descriptor.table_object_id;
-	table_meta.schema_generation = descriptor.schema_generation;
-	table_meta.row_count = 1;
-	let admission = match validate_table_write_request_batch(&table_meta, batch, descriptor) {
-		Ok(admission) => admission,
-		Err(_) => return Ok(false),
-	};
-	Ok(admission.key_identities.as_slice() == [key_identity]
-		&& admission.localities.as_slice() == [routing_locality])
+	match &descriptor.row_identity_policy {
+		// PK-keyed: re-derive identity / locality from the user
+		// row and compare to the stored synthetic columns. Phase 8
+		// also stamps `__row_table_object_id__` on multi-row PK
+		// rows; when present, it gives us an early fail before
+		// the (more expensive) PK re-derivation.
+		RowIdentityPolicy::PrimaryKey(_) => {
+			if let Some(stored) = stored_table_object_id
+				&& stored != descriptor.table_object_id
+			{
+				return Ok(false);
+			}
+			let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+			table_meta.tenant_id = tenant_id;
+			table_meta.table_object_id = descriptor.table_object_id;
+			table_meta.schema_generation = descriptor.schema_generation;
+			table_meta.row_count = 1;
+			let zero_hlc = HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			};
+			let admission = match validate_table_write_request_batch(
+				&table_meta,
+				batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				zero_hlc,
+			) {
+				Ok(admission) => admission,
+				Err(_) => return Ok(false),
+			};
+			Ok(admission.key_identities.as_slice() == [key_identity]
+				&& admission.localities.as_slice() == [routing_locality])
+		}
+		// AppendOnly: identity is engine-synthesized at write
+		// time from `(writer_node_id, commit_hlc,
+		// intra_batch_index)` (not recoverable from the user
+		// batch alone) and locality is request-level (depends
+		// on `parent_write_id`). Phase 8 binds rows back to
+		// their descriptor via `__row_table_object_id__` —
+		// verify equality with `descriptor.table_object_id` so
+		// table-spread prefix collisions across same-tenant
+		// AppendOnly tables cannot leak rows.
+		RowIdentityPolicy::AppendOnly => {
+			let _ = (tenant_id, key_identity, routing_locality);
+			Ok(stored_table_object_id == Some(descriptor.table_object_id))
+		}
+	}
 }
 
 fn build_tiered_object_metadata(
@@ -5195,7 +5279,7 @@ mod tests {
 	use crate::schema::NodeId;
 	use crate::schema::table::{
 		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, MultiRowLayoutDescriptor,
-		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
 		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
 		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
@@ -5425,7 +5509,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 1,
@@ -5615,7 +5699,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5638,7 +5722,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_test_batch(&row_batch);
@@ -5699,7 +5790,7 @@ mod tests {
 			"analytics",
 			"events",
 			schema.as_ref(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5728,7 +5819,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 
 		let mut plaintexts = Vec::new();
 		for policy in [
@@ -5801,7 +5899,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let frame = encode_test_batch(&batch);
 		mgr.append(tenant(), admission.key_identities[0], hlc(12), &frame)
 			.await
@@ -5838,7 +5943,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5856,7 +5961,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let frame = encode_test_batch(&batch);
 		mgr.append_durable_with_locality(
 			tenant(),
@@ -5893,7 +6005,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5950,7 +6062,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5968,7 +6080,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let frame = encode_test_batch(&batch);
 		mgr.append_durable_with_locality(
 			tenant(),
@@ -6036,7 +6155,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -6059,7 +6178,14 @@ mod tests {
 		meta.table_object_id = descriptor.table_object_id;
 		meta.schema_generation = descriptor.schema_generation;
 		meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_test_batch(&row_batch);
@@ -6157,7 +6283,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -6188,7 +6314,14 @@ mod tests {
 			meta.table_object_id = descriptor.table_object_id;
 			meta.schema_generation = descriptor.schema_generation;
 			meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-			let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				&descriptor,
+				WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap();
 			let frame = encode_test_batch(&batch);
 			mgr.append_durable_with_locality(
 				tenant(),
@@ -6494,8 +6627,14 @@ mod tests {
 		);
 		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
 		let meta = layout_recluster_meta(&single_descriptor, batch.num_rows());
-		let admission =
-			validate_table_write_request_batch(&meta, &batch, &single_descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&single_descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_test_batch(&row_batch);
@@ -6557,10 +6696,22 @@ mod tests {
 		let single_descriptor = layout_recluster_descriptor(0x63, 2, RecordLayoutPolicy::SingleRow);
 		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
 		let meta = layout_recluster_meta(&multi_descriptor, batch.num_rows());
-		let admission =
-			validate_table_write_request_batch(&meta, &batch, &multi_descriptor).unwrap();
-		let packed =
-			pack_record_batch_by_bucket(&meta, &multi_descriptor, &batch, hlc(10)).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&multi_descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&multi_descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			hlc(10),
+		)
+		.unwrap();
 		for record in packed {
 			let entries = storage_multirow_index_entries_from_frame(&record.frame_bytes)
 				.unwrap()
@@ -6619,8 +6770,14 @@ mod tests {
 		);
 		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
 		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
-		let admission =
-			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&source_descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let source_rows = admission
 			.key_identities
 			.iter()
@@ -6632,6 +6789,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(10 + source_row_index as u64),
+					table_object_id: None,
 				},
 			)
 			.collect::<Vec<_>>();
@@ -6723,7 +6881,14 @@ mod tests {
 		] {
 			let batch = layout_recluster_batch(&[value]);
 			let meta = layout_recluster_meta(descriptor, batch.num_rows());
-			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap();
 			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
 				.unwrap()
 				.bytes;
@@ -6799,7 +6964,14 @@ mod tests {
 		] {
 			let batch = layout_recluster_batch(&[value]);
 			let meta = layout_recluster_meta(descriptor, batch.num_rows());
-			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap();
 			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
 				.unwrap()
 				.bytes;
@@ -6890,7 +7062,14 @@ mod tests {
 		] {
 			let batch = layout_recluster_batch(&[value]);
 			let meta = layout_recluster_meta(descriptor, batch.num_rows());
-			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap();
 			let frame = encode_batch_with_policy(&batch, descriptor.record_body_compression_policy)
 				.unwrap()
 				.bytes;
@@ -7010,8 +7189,14 @@ mod tests {
 		);
 		let batch = layout_recluster_batch(&[1, 2, 3, 4]);
 		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
-		let admission =
-			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&source_descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let source_rows = admission
 			.key_identities
 			.iter()
@@ -7023,6 +7208,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(10 + source_row_index as u64),
+					table_object_id: None,
 				},
 			)
 			.collect::<Vec<_>>();
@@ -7109,8 +7295,14 @@ mod tests {
 		);
 		let batch = layout_recluster_batch(&[31, 32, 33, 34]);
 		let meta = layout_recluster_meta(&source_descriptor, batch.num_rows());
-		let admission =
-			validate_table_write_request_batch(&meta, &batch, &source_descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&source_descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let source_rows = admission
 			.key_identities
 			.iter()
@@ -7122,6 +7314,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(50 + source_row_index as u64),
+					table_object_id: None,
 				},
 			)
 			.collect::<Vec<_>>();
@@ -7229,7 +7422,7 @@ mod tests {
 			"analytics",
 			"projected_l2",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(
 				MultiRowLayoutDescriptor::new(20_000, 20_000, 8 * 1024 * 1024).unwrap(),
@@ -7249,7 +7442,14 @@ mod tests {
 			.collect::<Vec<_>>();
 		let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
 		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let source_rows = admission
 			.key_identities
 			.iter()
@@ -7261,6 +7461,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(100 + source_row_index as u64),
+					table_object_id: None,
 				},
 			)
 			.collect::<Vec<_>>();

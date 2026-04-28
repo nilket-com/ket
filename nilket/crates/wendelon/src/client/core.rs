@@ -53,9 +53,9 @@ use crate::schema::{
 	Locality, MsgType, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	TableQueryRequestMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
-	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, column_projection_prefix_ranges,
-	read_key_schema, read_value_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, write_payload_schema,
+	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
+	column_projection_prefix_ranges, read_key_schema, read_value_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
 use arrow::array::{Array, LargeBinaryArray};
 use arrow::ipc::reader::StreamReader;
@@ -428,10 +428,25 @@ impl WendelonClient {
 		&self,
 		request: TableWriteRequest,
 	) -> std::io::Result<TableWriteResult> {
+		// Client-side preview admission: used to pick a routing
+		// target via the first row's locality. Pass `client_hlc` as
+		// the row_hlc and `WriterNodeId::ZERO` as the writer for
+		// the preview — for AppendOnly the resulting identities are
+		// not load-bearing on the client side because locality is
+		// request-level (ADR 045 §4a) and computed from
+		// `(tenant_id, table_object_id, parent_write_id)`, all of
+		// which the client and server see identically. So
+		// preview-admission and server-admission produce the same
+		// `localities[0]` for AppendOnly even though the per-row
+		// identities differ. For PK-keyed tables identity is
+		// HLC-independent, so preview and server agree on identities
+		// too.
 		let admission = validate_table_write_request_batch(
 			&request.meta,
 			&request.payload,
 			&request.descriptor,
+			WriterNodeId::ZERO,
+			request.meta.client_hlc,
 		)
 		.map_err(|err| Error::new(ErrorKind::InvalidInput, err.to_string()))?;
 		let Some(key_locality) = admission.localities.first().copied() else {
@@ -1668,8 +1683,8 @@ mod tests {
 	use crate::network::transport::TransportTier;
 	use crate::schema::{
 		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
-		PrimaryKeyDescriptorV1, ProjectionFunctionV1, SchemaEvolutionPolicyV1, TableObjectId,
-		TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -1724,7 +1739,7 @@ mod tests {
 			"client",
 			"items",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			locality_policy,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

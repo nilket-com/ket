@@ -123,6 +123,26 @@ impl NodeId {
 	}
 }
 
+impl super::units::WriterNodeId {
+	/// Derive a 16-byte ADR 045 `WriterNodeId` from the
+	/// authenticated cluster `NodeId` (ADR 018).
+	///
+	/// Layout: bytes [0..4] hold `NodeId.id` in big-endian
+	/// order; the remaining 12 bytes are zero. The trailing
+	/// padding is reserved so future widening of the
+	/// authenticated identity does not break the ADR 045
+	/// identity preimage.
+	pub const fn from_node_id(node_id: NodeId) -> Self {
+		let id_bytes = node_id.id.to_be_bytes();
+		let mut bytes = [0u8; 16];
+		bytes[0] = id_bytes[0];
+		bytes[1] = id_bytes[1];
+		bytes[2] = id_bytes[2];
+		bytes[3] = id_bytes[3];
+		Self::new(bytes)
+	}
+}
+
 // ============================================================
 //  CLIENT WRITE ID — 32 bytes, fixed
 //
@@ -148,6 +168,26 @@ pub struct ClientWriteId {
 	pub idempotency_ttl_ms: u32,
 	/// Pad to 32-byte alignment
 	pub _pad: u32,
+}
+
+impl ClientWriteId {
+	/// Canonical idempotency identity: the bytes that must agree
+	/// across retries of the same logical write. Matches the
+	/// server-side idempotency cache key
+	/// (`(client_uuid, sequence_no)`) — `idempotency_ttl_ms` is a
+	/// hint, `_pad` is alignment, neither contributes to identity.
+	///
+	/// Anything that needs a retry-stable derivation off
+	/// `ClientWriteId` (e.g., the ADR 045 §4a append-only
+	/// locality preimage) MUST use these bytes — never the raw
+	/// 32-byte struct via `bytemuck::bytes_of`, which would also
+	/// hash TTL / padding and break retry convergence.
+	pub fn canonical_idempotency_bytes(&self) -> [u8; 24] {
+		let mut bytes = [0u8; 24];
+		bytes[..16].copy_from_slice(&self.client_uuid);
+		bytes[16..24].copy_from_slice(&self.sequence_no.to_le_bytes());
+		bytes
+	}
 }
 
 // ============================================================

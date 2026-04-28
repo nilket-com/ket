@@ -330,6 +330,134 @@ impl_unit!(RecordBodyByteLen, u64);
 impl_unit!(PartialStateLength, u32);
 impl_unit!(OverflowFlag, u8);
 
+// ============================================================
+//  ADR 045 — APPEND-ONLY IDENTITY UNITS
+// ============================================================
+
+/// 16-byte writer node identity bound from authenticated mTLS
+/// material (ADR 018) and consumed by ADR 045's append-row
+/// identity preimage.
+///
+/// The 16-byte slot is wider than the existing 8-byte
+/// `NodeId` shape so the preimage layout can survive future
+/// authentication-identity widening without a wire/format
+/// break. V1 derives the bytes from `NodeId` via
+/// `WriterNodeId::from_node_id`; the high 12 bytes are zero.
+#[derive(
+	Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
+)]
+#[repr(transparent)]
+pub struct WriterNodeId([u8; 16]);
+
+impl WriterNodeId {
+	pub const ZERO: Self = Self([0; 16]);
+
+	pub const fn new(bytes: [u8; 16]) -> Self {
+		Self(bytes)
+	}
+
+	pub const fn as_bytes(&self) -> &[u8; 16] {
+		&self.0
+	}
+
+	pub const fn into_bytes(self) -> [u8; 16] {
+		self.0
+	}
+}
+
+impl Default for WriterNodeId {
+	fn default() -> Self {
+		Self::ZERO
+	}
+}
+
+impl fmt::Debug for WriterNodeId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "WriterNodeId(0x")?;
+		for byte in self.as_bytes() {
+			write!(f, "{:02x}", byte)?;
+		}
+		write!(f, ")")
+	}
+}
+
+impl fmt::Display for WriterNodeId {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		for byte in &self.as_bytes()[..8] {
+			write!(f, "{:02x}", byte)?;
+		}
+		write!(f, "...")
+	}
+}
+
+impl From<[u8; 16]> for WriterNodeId {
+	fn from(value: [u8; 16]) -> Self {
+		Self(value)
+	}
+}
+
+impl From<WriterNodeId> for [u8; 16] {
+	fn from(value: WriterNodeId) -> Self {
+		value.0
+	}
+}
+
+/// Per-row position within a single admitted write batch.
+///
+/// Allocated 0-indexed by the admitting node. The constructor
+/// rejects `u32::MAX`, which is reserved as the overflow
+/// sentinel; a write request that would require the sentinel
+/// rejects atomically before any slab append.
+#[derive(
+	Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Pod, Zeroable, Serialize, Deserialize,
+)]
+#[repr(transparent)]
+pub struct IntraBatchIndex(u32);
+
+impl IntraBatchIndex {
+	pub const ZERO: Self = Self(0);
+	pub const MAX_VALID: Self = Self(u32::MAX - 1);
+	const OVERFLOW_SENTINEL: u32 = u32::MAX;
+
+	pub const fn get(self) -> u32 {
+		self.0
+	}
+
+	/// Construct an `IntraBatchIndex` from a raw `u32`.
+	///
+	/// Rejects `u32::MAX` (reserved for overflow detection in
+	/// the per-batch allocator path).
+	pub fn try_new(value: u32) -> std::io::Result<Self> {
+		if value == Self::OVERFLOW_SENTINEL {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"intra-batch index u32::MAX is reserved for overflow detection",
+			));
+		}
+		Ok(Self(value))
+	}
+
+	/// Big-endian `u32` representation.
+	///
+	/// This is the canonical wire/format encoding consumed by
+	/// the ADR 045 BLAKE3 identity preimage. Never change.
+	pub const fn to_be_bytes(self) -> [u8; 4] {
+		self.0.to_be_bytes()
+	}
+}
+
+impl Default for IntraBatchIndex {
+	fn default() -> Self {
+		Self::ZERO
+	}
+}
+
+impl fmt::Display for IntraBatchIndex {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
 pub const ADR044_RECORD_BODY_BYTE_BOUND: u64 = 8 * 1024 * 1024;
 
 fn validate_adr044_record_body_unit(name: &str, value: u64) -> std::io::Result<()> {

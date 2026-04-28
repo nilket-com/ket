@@ -7,11 +7,12 @@ Companion ADR: `plans/adr/045_pk_less_append_only_tables.md`
 Add append-only tenant tables whose rows have no user-declared
 primary key, no dedupe behavior, and no update / delete-by-key
 semantics. Row identity is synthesized from authenticated write
-context — `(writer_node_id, row_hlc, intra_batch_index)` plus
-canonical-payload-hash — and carried through the existing ADR
-042 synthetic-column trio. No replicated counter. No new storage-
-only column. Multi-row layout, compression, CSB, AGG, and ADR
-044 columnar fetch continue to work unchanged.
+context — `(writer_node_id, row_hlc, intra_batch_index)` where
+`row_hlc` is the leader-merged commit HLC — and carried through
+the existing ADR 042 synthetic-column trio. No replicated
+counter. No new storage-only column. Multi-row layout,
+compression, CSB, AGG, and ADR 044 columnar fetch continue to
+work unchanged.
 
 ## Non-goals
 
@@ -58,21 +59,19 @@ Outputs:
   allocator path.
 - Identity preimage contract (locked):
   ```text
-  row_payload_hash = BLAKE3(canonical admitted Arrow row bytes)
-
   key_identity = BLAKE3(
       "table.append-row"
       || tenant_id              // 16 B
       || table_object_id        // 16 B
       || writer_node_id         // 16 B
-      || row_hlc                // 16 B
+      || row_hlc                // 16 B  (= leader-merged commit_hlc)
       || intra_batch_index_be   // u32 big-endian, 4 B
-      || row_payload_hash       // 32 B
   )
   ```
-  Whether the payload hash stays in V1 is the only open
-  question (Open question 1 of the ADR); the BLAKE3 input
-  layout is locked either way.
+  Phase 7 resolved Open question 1 (drop the canonical row
+  payload hash). The BLAKE3 input layout is locked.
+  `row_hlc` is the leader-merged commit HLC and equals the
+  value persisted in `__row_hlc__`.
 - Helper-shape contract:
   ```rust
   pub fn synthesize_append_only_row_id(
@@ -81,8 +80,7 @@ Outputs:
       writer_node_id: WriterNodeId,
       row_hlc: HybridTimestamp,
       intra_batch_index: IntraBatchIndex,
-      row_payload_hash: Hash,
-  ) -> RowKeyId;
+  ) -> Identity;
   ```
 - Toron wire-frame extension: `CreateTable` gains
   `row_identity_policy: RowIdentityPolicy`. No new frame.
@@ -241,10 +239,10 @@ Work:
        writer_node_id: WriterNodeId,
        row_hlc: HybridTimestamp,
        intra_batch_index: IntraBatchIndex,
-       row_payload_hash: Hash,
-   ) -> RowKeyId;
+   ) -> Identity;
    ```
-   Output: 32-byte `RowKeyId` matching ADR 042's slot.
+   Output: 32-byte identity matching ADR 042's
+   `__row_key_id__` slot.
 2. Bind `WriterNodeId` from the authenticated mTLS node
    identity (ADR 018) of the request context. Reuse
    existing node-identity material; do not add a new
@@ -254,13 +252,13 @@ Work:
    would require `IntraBatchIndex(u32::MAX)` rejects the
    write before any slab append. Serialize the value as
    big-endian `u32` in the identity preimage.
-4. Compute canonical row payload hashes through the
-   structured Arrow row encoder — not ad hoc byte slicing.
-   Canonical encoding must match ADR 037's PK
-   canonicalization rules where applicable (NULL
-   handling, integer width, decimal scale, timestamp
-   precision) so that future content-hash mode can reuse
-   the same canonicalization.
+4. The `row_hlc` passed into identity synthesis MUST be
+   the leader-merged commit HLC — the same value the
+   admission path persists in `__row_hlc__`. The leader
+   computes `commit_hlc = hlc_driver.merge(client_hlc)`
+   once per request, before admission, and forwards the
+   single value through admission, packing, and storage.
+   No per-row payload hashing.
 5. Add a small internal audit field with row count and
    writer node identity. Do not log every generated row
    identity.
@@ -270,9 +268,9 @@ Work:
 
 Tests:
 
-- Golden vector: fixed `(writer, hlc, intra_batch_index,
-  payload_hash)` produces a known identity (locks the
-  BLAKE3 preimage layout, including the big-endian
+- Golden vector: fixed `(tenant, table, writer, hlc,
+  intra_batch_index)` produces a known identity (locks
+  the BLAKE3 preimage layout, including the big-endian
   `intra_batch_index` encoding).
 - Two writers with identical payload, HLC, and intra-
   batch index produce distinct identities (different
@@ -281,6 +279,9 @@ Tests:
   intra-batch indexes produces distinct identities.
 - Two identical payloads in separate batches produce
   distinct identities when HLC differs.
+- Identical client_hlc + identical writer + same row idx
+  but distinct *commit_hlc* produce distinct identities
+  (HLC-split correctness regression guard, Phase 7).
 - A batch requiring `IntraBatchIndex(u32::MAX)` rejects
   with the documented reject code; no partial-batch
   admission.
@@ -290,6 +291,9 @@ Tests:
   preimage domain tags differ.
 - Architectural test: compactor source does not call
   `synthesize_append_only_row_id`.
+- Architectural test: nothing in the source tree
+  references `canonical_row_payload_hash` (deleted in
+  Phase 7).
 
 Exit:
 
@@ -316,14 +320,17 @@ Work:
    - Validate Arrow batch against the descriptor's user
      schema.
    - Skip PK validation and duplicate-in-batch checks.
-   - Bind `WriterNodeId`, assign per-row HLCs (ADR 012
-     monotonicity), assign `IntraBatchIndex` per row.
-   - Compute canonical row payload hash per row.
+   - Bind `WriterNodeId`, receive the leader-merged
+     `commit_hlc` from the caller (single HLC per
+     request; ADR 012 monotonicity), assign
+     `IntraBatchIndex` per row.
    - Derive `key_identity` per the ADR §4 preimage.
+     **No payload hashing.**
    - Compute locality from the descriptor's existing
      `LocalityPolicy` (unchanged math; the salt source
      for `TableSpreadProjection` is now `key_identity`).
-   - Assign per-row `__row_hlc__` exactly as today.
+   - Persist `__row_hlc__ = commit_hlc` — the same value
+     used in identity synthesis.
 4. Reject update / upsert / delete-by-key operations
    against `AppendOnly` descriptors with the existing
    schema / write reject machinery, or a narrowly-named
@@ -499,15 +506,18 @@ New metrics (functional segment names; brand-clean per
 ADR 041 / convention):
 
 ```text
-storage_append_only_batches_total{tenant}
-storage_append_only_rows_written_total{tenant}
+storage_append_only_batches_total{tenant}                   // server success path only (Phase 8)
+storage_append_only_rows_written_total{tenant}              // server success path only (Phase 8)
 storage_append_only_multirow_records_written_total{tenant}
-storage_append_only_identity_synthesis_micros               // histogram
-storage_append_only_payload_hash_micros                     // histogram
 storage_append_only_intra_batch_index_exhaustion_total
 storage_append_only_supersession_metadata_skipped_total     // expected nonzero
 storage_descriptor_validation_reject_total{reason}          // extends existing family
 ```
+
+Phase 8 deleted `storage_append_only_identity_synthesis_micros`
+— bench (`benches/append_only_tables.rs`) is the right
+measurement surface for per-row identity CPU, not an always-on
+production histogram.
 
 Architectural tests:
 
@@ -515,6 +525,9 @@ Architectural tests:
   (no `_` catch-all).
 - Compactor source does not call
   `synthesize_append_only_row_id`.
+- Append-only admission does not call
+  `canonical_row_payload_hash`; the symbol does not
+  appear anywhere in `src/` (Phase 7 deletion guard).
 - Descriptor validator rejects the documented invalid
   combos (`AppendOnly + SingleRow`, user `__row_*`
   column).
@@ -610,15 +623,17 @@ Work:
      win is plausible.
    - **Identical-payload append cost** — duplicate rows
      don't trigger any short-circuit; baseline cost.
-   - **Payload-hash CPU share** — visible in
-     `storage_append_only_payload_hash_micros`. If hash
-     dominates ingest CPU on wide-row workloads, surface
-     for council to revisit Open question 1 (drop hash
-     from preimage).
-   - **Identity-synthesis CPU share** — visible in
-     `storage_append_only_identity_synthesis_micros`.
-     BLAKE3 over the 100-byte preimage; expected
-     trivial.
+   - **Payload-size sweep** at admission — rows
+     held constant, payload size varied (0 / 32 / 256 /
+     1024 B). Used in Phase 7 to resolve Open question 1:
+     payload hashing scaled linearly with size while
+     identity synthesis stayed flat, so the canonical
+     row payload hash was dropped from the preimage.
+   - **Identity-synthesis CPU share** — measured by the
+     bench's `case=identity-synthesis` line. BLAKE3 over the
+     84-byte preimage; expected trivial. Phase 8 dropped the
+     production histogram (per-row timer overhead not worth
+     the always-on signal).
    - **Cold-tier scan over a 50-column append-only
      `MultiRow + Lz4Frame` table** with a 5-column
      projection: bytes-fetched matches ADR 044's target
@@ -633,8 +648,6 @@ Work:
      canonicalization, no counter reconciliation).
 4. Stabilization watch (post-merge), mirrors ADR 042 /
    043 / 044 discipline:
-   - Identity-synthesis latency.
-   - Payload-hash CPU share.
    - Rows per multi-row record on append-only tables.
    - CSB direct-answer rate on append-only tables.
    - `supersession_metadata_skipped_total` is nonzero on
@@ -657,6 +670,53 @@ Exit criteria:
   tables.
 - Recovery on a 100M-row append-only corpus completes
   within 10% of PK-keyed baseline.
+
+## Phase 8 — Locality decoupling, writer-identity binding,
+## descriptor-match split, metric hygiene
+
+Companion plan note: `plans/impl/045_phase8_locality_decoupling.md`.
+Triggered by post-Phase 7 review findings (the four issues
+the design note enumerates).
+
+Summary of work landed in this phase:
+
+- ADR §4a added: AppendOnly locality is computed once per
+  request from `(tenant_id, table_object_id, parent_write_id)`
+  under the domain tag `"table.append-locality.v1"`. All rows
+  in a single write request receive the same `Locality`.
+  Bifurcation across replica groups is structurally
+  impossible for AppendOnly.
+- `WriterNodeId` is bound from the admitting server's
+  authenticated `NodeId` (`self.local_node` on the data
+  server), passed explicitly into
+  `validate_table_write_request_batch`,
+  `pack_record_batch_by_bucket`, and `bifurcate_table_write`.
+  No more `meta.proxy_source` derivation.
+- Descriptor validator rejects AppendOnly +
+  `LocalityPolicyV1::IdentityProjection` and AppendOnly +
+  `LocalityPolicyV1::ColumnProjection`. AppendOnly V1 only
+  supports `TableSpreadProjection`.
+- `table_record_matches_descriptor` and
+  `descriptor_matches_tiered_row` dispatch on
+  `RowIdentityPolicy`. PK keeps the existing re-derivation
+  check; AppendOnly verifies schema only and trusts the
+  stored synthetic columns. The `zero_hlc` placeholder is
+  gone from the AppendOnly path.
+- `observe_storage_append_only_batch` is no longer called
+  inside admission. The data-server fires it on the success
+  path only — after lease gate, idempotency replay miss,
+  quota, durable quorum.
+- `storage_append_only_identity_synthesis_micros` deleted.
+  Bench is the right measurement surface.
+
+Tests: see Phase 8 design note §8.5. New regression coverage:
+client-preview / server-admission locality byte-identity for
+AppendOnly; AppendOnly batch passes lease gate when the local
+node is primary for its single locality; descriptor validator
+rejects the two forbidden combinations; descriptor matchers
+admit AppendOnly rows that the Phase 7 `zero_hlc` path would
+have filtered out.
+
 
 ## Verification gate
 
@@ -755,10 +815,15 @@ Convention guards green:
 Items the implementer or Phase-7 benches resolve. None
 block any phase from landing.
 
-1. **Whether the payload hash remains in the identity
-   preimage.** Default V1: yes. Bench-resolvable on
-   wide-row workloads. Drop if BLAKE3-on-row dominates
-   ingest CPU.
+1. ~~**Whether the payload hash remains in the identity
+   preimage.**~~ **Resolved (Phase 7, 2026-04):** dropped.
+   Phase 7 payload-size sweep showed BLAKE3-on-payload
+   dominated wide-row admission CPU (per-row gap scaled
+   linearly with payload size), while identity synthesis
+   stayed flat. `canonical_row_payload_hash` and the
+   `storage_append_only_payload_hash_micros` metric were
+   deleted; an architectural guard test asserts the
+   symbol is not re-introduced.
 2. **Whether `IntraBatchIndex` widens to `u64`
    preemptively.** Default V1: `u32` (4 G rows / writer
    per HLC tick). Council/policy decision.

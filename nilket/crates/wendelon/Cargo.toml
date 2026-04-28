@@ -88,3 +88,7 @@ harness = false
 [[bench]]
 name = "multi_row_fragments"
 harness = false
+
+[[bench]]
+name = "append_only_tables"
+harness = false

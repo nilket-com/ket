@@ -447,6 +447,256 @@ fn test_adr044_columnar_fetch_stays_read_side_and_provider_neutral() {
 	);
 }
 
+/// ADR 045 architectural guards.
+///
+/// Enforce that:
+/// - The compactor / sweeper / multi-row recompaction sources never
+///   re-call `synthesize_append_only_row_id`. Identities for surviving
+///   rows are preserved byte-for-byte from the slab body.
+/// - The retracted V1 counter design (`TableAppendState`,
+///   `AppendOrdinal`, `reserve_append_ordinals`,
+///   `__row_append_ordinal__`) does not reappear under a different
+///   name.
+/// - No descriptor coexistence shim
+///   (`Option<PrimaryKeyDescriptor>` field) survives the Phase 1
+///   rewrite.
+/// - No node capability bit is added for append-only.
+/// - The `__row_tombstone__` synthetic column is deferred to a
+///   follow-up ADR and must not appear in ADR 045 scope.
+/// - `canonical_row_payload_hash` does not reappear in `src/`. Phase 7
+///   resolved Open question 1 by dropping the canonical row payload
+///   hash from the identity preimage on bench evidence; the helper
+///   was deleted and must not be re-introduced.
+/// - Append-only admission must not derive `WriterNodeId` from
+///   `meta.proxy_source`. Phase 8 binds it from the admitting
+///   server's authenticated `self.local_node`; the wire field
+///   `proxy_source` is zeroed on direct SDK writes and is not
+///   the authenticated-admitter contract.
+/// - The `storage_append_only_identity_synthesis_micros` histogram
+///   was deleted in Phase 8. Bench is the measurement surface for
+///   per-row identity CPU.
+/// - AppendOnly descriptor isolation: the matchers
+///   (`table_record_matches_descriptor`,
+///   `descriptor_matches_tiered_row`) accept a
+///   `stored_table_object_id` argument and verify it for
+///   AppendOnly. The schema-only matcher Phase 8 first shipped
+///   was insufficient — same-tenant table-spread prefix
+///   collisions could leak rows. Re-introducing
+///   `RowIdentityPolicy::AppendOnly => Ok(true)` (no
+///   `stored_table_object_id` check) regresses to that bug.
+#[test]
+fn test_adr045_append_only_invariants() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	// Compactor source must not call the append-only identity helper.
+	let compactor_paths = [
+		"src/storage/sweeper.rs",
+		"src/storage/multirow.rs",
+		"src/storage/manager.rs",
+	];
+	for relative in compactor_paths {
+		let path = manifest_dir.join(relative);
+		let content = match fs::read_to_string(&path) {
+			Ok(content) => content,
+			Err(_) => continue,
+		};
+		if content.contains("synthesize_append_only_row_id") {
+			violations.push(format!(
+				"{relative}: compactor / multirow source must not synthesize append-only \
+				identities for existing rows"
+			));
+		}
+	}
+
+	// Retracted V1 counter symbols must not appear anywhere.
+	let scan_roots = ["src", "tests", "benches"];
+	let retracted_symbols = [
+		"TableAppendState",
+		"AppendOrdinal",
+		"reserve_append_ordinals",
+		"__row_append_ordinal__",
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for symbol in retracted_symbols {
+				if content.contains(symbol) {
+					violations.push(format!(
+						"{}: contains retracted ADR 045 V1 counter symbol '{symbol}'",
+						path.display()
+					));
+				}
+			}
+			// Coexistence-shim guard.
+			if content.contains("Option<PrimaryKeyDescriptor") {
+				violations.push(format!(
+					"{}: contains Option<PrimaryKeyDescriptor> coexistence shim \
+					 (forbidden by no-premature-backward-compat.md)",
+					path.display()
+				));
+			}
+			// Tombstone leak guard: ADR 045 must not extend the
+			// `__row_tombstone__` synthetic-column surface. The
+			// pre-existing `StorageColumn::RowTombstone` slot in
+			// `src/storage/columnar.rs` predates ADR 045 and is the
+			// only authorized reference.
+			let is_columnar_predecessor = path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "columnar.rs")
+				&& path
+					.parent()
+					.and_then(|parent| parent.file_name())
+					.and_then(|name| name.to_str())
+					.is_some_and(|name| name == "storage");
+			if !is_columnar_predecessor && content.contains("__row_tombstone__") {
+				violations.push(format!(
+					"{}: __row_tombstone__ is deferred to a follow-up ADR; must not appear in \
+					 ADR 045 scope",
+					path.display()
+				));
+			}
+			// Node capability bit guard.
+			if content.contains("NodeCapability::AppendOnly")
+				|| content.contains("AppendOnlyCapability")
+			{
+				violations.push(format!(
+					"{}: append-only must not introduce a node capability bit; mixed PK \
+					 and append-only fleets are descriptor-driven",
+					path.display()
+				));
+			}
+			// Phase 7 deletion guard. The canonical row payload hash
+			// was dropped from the ADR 045 §4 preimage on Phase 7 bench
+			// evidence (Open question 1, resolved). The helper must not
+			// re-appear under any name.
+			if content.contains("canonical_row_payload_hash") {
+				violations.push(format!(
+					"{}: `canonical_row_payload_hash` was deleted in Phase 7 — append-only \
+					 admission must not reintroduce per-row payload hashing (ADR 045 §4)",
+					path.display()
+				));
+			}
+			// Phase 8 deletion guard. The
+			// `storage_append_only_identity_synthesis_micros` histogram
+			// was removed; bench is the measurement surface. Re-adding
+			// the always-on per-row timer would re-introduce the cost
+			// for a metric that is only useful in bench-grade
+			// comparisons.
+			if content.contains("storage_append_only_identity_synthesis_micros")
+				|| content.contains("observe_storage_append_only_identity_synthesis")
+			{
+				violations.push(format!(
+					"{}: append-only identity-synthesis histogram was deleted in Phase 8 — \
+					 use the `benches/append_only_tables.rs` bench instead of an always-on \
+					 production timer (ADR 045 Phase 8)",
+					path.display()
+				));
+			}
+			// Phase 8 writer-identity guard. Append-only admission
+			// must bind `WriterNodeId` from the admitting server's
+			// authenticated `self.local_node`, not from the wire
+			// field `meta.proxy_source` (which the wire contract
+			// zeros on direct SDK writes).
+			if content.contains("WriterNodeId::from_node_id(meta.proxy_source)") {
+				violations.push(format!(
+					"{}: append-only admission must bind WriterNodeId from the admitting \
+					 server's authenticated `self.local_node`, not `meta.proxy_source` \
+					 (ADR 045 §3 / Phase 8). `proxy_source` is zeroed on direct SDK writes.",
+					path.display()
+				));
+			}
+			// Phase 8 descriptor-isolation guard for AppendOnly
+			// matchers. The schema-only AppendOnly arm Phase 8
+			// first shipped allowed cross-table prefix collisions
+			// to leak rows; the fix is to verify
+			// `stored_table_object_id == Some(descriptor.table_object_id)`.
+			// Re-introducing the schema-only acceptance regresses
+			// to that bug.
+			let is_matcher_file = path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "data_server.rs" || name == "manager.rs");
+			if is_matcher_file
+				&& content.contains("RowIdentityPolicy::AppendOnly => {")
+				&& !content.contains("descriptor.table_object_id")
+			{
+				violations.push(format!(
+					"{}: AppendOnly matcher arm must verify stored_table_object_id == \
+					 Some(descriptor.table_object_id) — schema-only acceptance permits \
+					 cross-table prefix-collision leakage (ADR 045 §5 / Phase 8).",
+					path.display()
+				));
+			}
+			// ADR 045 idempotency-bytes canonicalization. Any
+			// retry-stable derivation off `ClientWriteId` (locality
+			// salts, content hashes, redb keys, parent identities,
+			// etc.) MUST hash only the canonical idempotency
+			// identity (`client_uuid` + `sequence_no`), via
+			// `ClientWriteId::canonical_idempotency_bytes()`.
+			// Hashing the full 32-byte struct also folds in
+			// `idempotency_ttl_ms` (a server-clamped hint) and
+			// `_pad` (alignment), which break retry convergence
+			// when a client re-sends with a drifted TTL after the
+			// idempotency cache eviction or a node restart. The
+			// previously narrow guard (scoped to the
+			// `"table.append-locality"` domain) was widened in the
+			// Phase 8 idempotency-canonicalization pass once the
+			// three pre-existing sites
+			// (`PendingFinalizationId::for_record`,
+			// `encode_write_id_key`,
+			// `table_write_parent_identity`) were canonicalized.
+			let forbidden_write_id_byte_patterns = [
+				"bytemuck::bytes_of(&parent_write_id)",
+				"bytemuck::bytes_of(&meta.parent_write_id)",
+				"bytemuck::bytes_of(&write_id)",
+				"bytemuck::bytes_of(&record.write_id)",
+				"bytemuck::bytes_of(&meta.client_write_id)",
+				"bytemuck::bytes_of(&self.write_id)",
+			];
+			for pattern in forbidden_write_id_byte_patterns {
+				if content.contains(pattern) {
+					violations.push(format!(
+						"{}: forbidden raw-bytes hashing of `ClientWriteId` ({pattern}). \
+						 Retry-stable derivations must use \
+						 `ClientWriteId::canonical_idempotency_bytes()`; the full 32-byte \
+						 struct includes `idempotency_ttl_ms` (a server-clamped hint) and \
+						 `_pad`, which break retry convergence.",
+						path.display()
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 045 architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
 	let mut names = Vec::new();
 	for line in rendered.lines() {

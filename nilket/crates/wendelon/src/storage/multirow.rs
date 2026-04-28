@@ -1,11 +1,12 @@
 use crate::schema::table::{
 	MultiRowLayoutDescriptor, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, TableSchemaDescriptorV1, TableWriteAdmission,
-	TableWriteRequestMeta, validate_table_write_request_batch,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, TableObjectId,
+	TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
+	validate_table_write_request_batch,
 };
 use crate::schema::{
 	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyCompressionPolicy,
-	RecordLayoutPolicy, RecordRowIndex, TableWriteValidationError,
+	RecordLayoutPolicy, RecordRowIndex, TableWriteValidationError, WriterNodeId,
 };
 use crate::storage::core::MultiRowIndexEntry;
 use crate::storage::ipc::{
@@ -13,7 +14,8 @@ use crate::storage::ipc::{
 	record_batch_compression_policy_from_ipc,
 };
 use arrow::array::{
-	ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array, UInt64Builder,
+	Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array,
+	UInt64Builder,
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -40,6 +42,13 @@ pub struct MultiRowSourceRow {
 	pub key_identity: Identity,
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
+	/// ADR 045 Phase 8 — durable per-row binding back to the
+	/// originating descriptor's `table_object_id`. `Some` on
+	/// every multi-row record (PK + AppendOnly); `None` on
+	/// paths that don't stamp it. The encoder stamps
+	/// `__row_table_object_id__` iff every row in a record
+	/// has `Some`; partial stamping is rejected.
+	pub table_object_id: Option<TableObjectId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +57,10 @@ pub struct StorageRowMetadata {
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,
+	/// ADR 045 Phase 8 — `Some` if the stored record carries
+	/// `__row_table_object_id__` (every multi-row record),
+	/// `None` otherwise (single-row records).
+	pub table_object_id: Option<TableObjectId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,9 +102,16 @@ pub fn pack_record_batch_by_bucket(
 	meta: &TableWriteRequestMeta,
 	descriptor: &TableSchemaDescriptorV1,
 	batch: &RecordBatch,
+	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
-	let admission = validate_table_write_request_batch(meta, batch, descriptor)?;
+	// ADR 045: the same `writer_node_id` and `row_hlc` feed both
+	// admission's identity preimage (for AppendOnly) and the
+	// persisted `__row_hlc__` column. The caller MUST pass the
+	// admitting server's authenticated `WriterNodeId` and the
+	// leader-merged commit HLC.
+	let admission =
+		validate_table_write_request_batch(meta, batch, descriptor, writer_node_id, row_hlc)?;
 	pack_admitted_record_batch_by_bucket(meta, descriptor, batch, &admission, row_hlc)
 }
 
@@ -110,6 +130,11 @@ pub fn pack_admitted_record_batch_by_bucket(
 			));
 		}
 	};
+	// ADR 045 Phase 8: stamp `__row_table_object_id__` on every
+	// multi-row record (PK + AppendOnly) so descriptor-filtered fast
+	// paths can verify table-isolation by byte-compare against the
+	// stored column instead of re-deriving identity.
+	let stamped_table_object_id = Some(descriptor.table_object_id);
 	let mut buckets: BTreeMap<Locality, Vec<MultiRowSourceRow>> = BTreeMap::new();
 	for (row, locality) in admission.localities.iter().copied().enumerate() {
 		buckets
@@ -120,6 +145,7 @@ pub fn pack_admitted_record_batch_by_bucket(
 				key_identity: admission.key_identities[row],
 				routing_locality: locality,
 				row_hlc,
+				table_object_id: stamped_table_object_id,
 			});
 	}
 
@@ -326,6 +352,7 @@ pub fn merge_multirow_streams(
 			key_identity: meta.key_identity,
 			routing_locality: meta.routing_locality,
 			row_hlc: meta.row_hlc,
+			table_object_id: meta.table_object_id,
 		})
 		.collect::<Vec<_>>();
 	source_rows.sort_by_key(|row| multirow_sort_key(*row));
@@ -388,6 +415,7 @@ pub fn append_storage_synthetic_columns(
 	row_indices: &[usize],
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
+	table_object_id: Option<TableObjectId>,
 ) -> std::io::Result<RecordBatch> {
 	let source_rows = row_indices
 		.iter()
@@ -403,6 +431,7 @@ pub fn append_storage_synthetic_columns(
 				key_identity: admission.key_identities[*row],
 				routing_locality: admission.localities[*row],
 				row_hlc,
+				table_object_id,
 			})
 		})
 		.collect::<std::io::Result<Vec<_>>>()?;
@@ -460,6 +489,10 @@ pub fn strip_storage_synthetic_columns(batch: &RecordBatch) -> std::io::Result<R
 				STORAGE_ROW_HLC_COLUMN
 					| STORAGE_ROW_KEY_ID_COLUMN
 					| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
+					// ADR 045 Phase 8: optional AppendOnly-only column.
+					// Strip if present so user-facing decode stays
+					// schema-clean.
+					| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
 			))
 			.then_some(index)
 		})
@@ -493,6 +526,41 @@ pub fn materialize_record_location_batch(
 	strip_storage_synthetic_columns(&batch.slice(row, 1))
 }
 
+/// ADR 045 Phase 8 — extract the per-row
+/// `__row_table_object_id__` value at `record_row_index` if the
+/// stored multi-row record carries the column (AppendOnly).
+/// Returns `None` for PK-keyed records (which do not stamp the
+/// column). The matchers
+/// (`table_record_matches_descriptor`,
+/// `descriptor_matches_tiered_row`) feed this into AppendOnly
+/// descriptor verification.
+pub fn storage_row_table_object_id_at(
+	batch: &RecordBatch,
+	record_row_index: RecordRowIndex,
+) -> std::io::Result<Option<TableObjectId>> {
+	let Some(array) = batch.column_by_name(STORAGE_ROW_TABLE_OBJECT_ID_COLUMN) else {
+		return Ok(None);
+	};
+	let array = array
+		.as_any()
+		.downcast_ref::<FixedSizeBinaryArray>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"__row_table_object_id__ column has unexpected Arrow type",
+			)
+		})?;
+	let row = record_row_index.get() as usize;
+	if row >= array.len() {
+		return Ok(None);
+	}
+	Ok(Some(TableObjectId::new(fixed_16_value(
+		array,
+		row,
+		STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	)?)))
+}
+
 pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<StorageRowMetadata>> {
 	if !has_storage_synthetic_columns(batch) {
 		return Err(Error::new(
@@ -512,6 +580,23 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
 		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing storage row locality"))?;
+	// ADR 045 Phase 8 — optional `__row_table_object_id__`
+	// (AppendOnly only). When present, decode the per-row
+	// 16-byte values; otherwise propagate `None`.
+	let table_object_ids = batch
+		.column_by_name(STORAGE_ROW_TABLE_OBJECT_ID_COLUMN)
+		.map(|array| {
+			array
+				.as_any()
+				.downcast_ref::<FixedSizeBinaryArray>()
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"missing storage row table_object_id",
+					)
+				})
+		})
+		.transpose()?;
 	let mut entries = Vec::with_capacity(batch.num_rows());
 	for row in 0..batch.num_rows() {
 		let record_row_index = u32::try_from(row).map_err(|_| {
@@ -520,6 +605,15 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 				"multi-row storage record row index exceeds u32",
 			)
 		})?;
+		let table_object_id = table_object_ids
+			.map(|array| -> std::io::Result<TableObjectId> {
+				Ok(TableObjectId::new(fixed_16_value(
+					array,
+					row,
+					STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+				)?))
+			})
+			.transpose()?;
 		entries.push(StorageRowMetadata {
 			key_identity: Identity::new(fixed_32_value(
 				identities,
@@ -529,6 +623,7 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 			routing_locality: Locality::new(localities.value(row)),
 			row_hlc: decode_storage_hlc(fixed_16_value(row_hlcs, row, STORAGE_ROW_HLC_COLUMN)?),
 			record_row_index: RecordRowIndex::new(record_row_index),
+			table_object_id,
 		});
 	}
 	Ok(entries)
@@ -623,6 +718,27 @@ fn append_storage_synthetic_columns_from_rows(
 			),
 		));
 	}
+	// ADR 045 Phase 8 — `__row_table_object_id__` is all-or-none
+	// per record. Multi-row records (PK + AppendOnly) carry
+	// `Some(descriptor.table_object_id)` on every row; single-
+	// row records and other paths that don't stamp it carry
+	// `None` on every row. A mix is a programming error.
+	let some_table_object_id = rows.iter().find_map(|row| row.table_object_id);
+	if let Some(stamp) = some_table_object_id {
+		if !rows.iter().all(|row| row.table_object_id == Some(stamp)) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"table_object_id stamping must be all-or-none per record \
+				 with a single value (ADR 045 §5 / Phase 8)",
+			));
+		}
+	} else if rows.iter().any(|row| row.table_object_id.is_some()) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"table_object_id stamping must be all-or-none per record \
+			 (ADR 045 §5 / Phase 8)",
+		));
+	}
 	let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
 	fields.push(Arc::new(Field::new(
 		STORAGE_ROW_HLC_COLUMN,
@@ -639,10 +755,19 @@ fn append_storage_synthetic_columns_from_rows(
 		DataType::UInt64,
 		false,
 	)));
+	if some_table_object_id.is_some() {
+		fields.push(Arc::new(Field::new(
+			STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+			DataType::FixedSizeBinary(16),
+			false,
+		)));
+	}
 
 	let mut row_hlc_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
 	let mut row_identity_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 	let mut row_locality_builder = UInt64Builder::with_capacity(rows.len());
+	let mut row_table_object_id_builder =
+		some_table_object_id.map(|_| FixedSizeBinaryBuilder::with_capacity(rows.len(), 16));
 	for row in rows {
 		row_hlc_builder
 			.append_value(hlc_storage_bytes(row.row_hlc))
@@ -656,12 +781,27 @@ fn append_storage_synthetic_columns_from_rows(
 				)
 			})?;
 		row_locality_builder.append_value(row.routing_locality.get());
+		if let (Some(builder), Some(table_object_id)) =
+			(row_table_object_id_builder.as_mut(), row.table_object_id)
+		{
+			builder
+				.append_value(table_object_id.as_bytes())
+				.map_err(|err| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("row table_object_id append: {err}"),
+					)
+				})?;
+		}
 	}
 
 	let mut columns = batch.columns().to_vec();
 	columns.push(Arc::new(row_hlc_builder.finish()) as ArrayRef);
 	columns.push(Arc::new(row_identity_builder.finish()) as ArrayRef);
 	columns.push(Arc::new(row_locality_builder.finish()) as ArrayRef);
+	if let Some(mut builder) = row_table_object_id_builder {
+		columns.push(Arc::new(builder.finish()) as ArrayRef);
+	}
 	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
@@ -781,8 +921,9 @@ mod tests {
 	use super::*;
 	use crate::schema::{
 		LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-		RecordBodyCompressionPolicy, RecordLayoutPolicy, SchemaEvolutionPolicyV1, TableObjectId,
-		TableSpreadLocalityDescriptorV1, TenantId, encode_table_write_row_count,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, TableObjectId, TableSpreadLocalityDescriptorV1, TenantId,
+		encode_table_write_row_count,
 	};
 	use arrow::array::{Int64Array, LargeStringArray};
 	use std::sync::Arc;
@@ -803,7 +944,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 1,
@@ -864,7 +1005,7 @@ mod tests {
 			"analytics",
 			"strings",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 1,
@@ -886,8 +1027,14 @@ mod tests {
 		let descriptor = descriptor();
 		let batch = batch(vec![3, 1, 2]);
 		let meta = meta(&descriptor, batch.num_rows());
-		let packed = pack_record_batch_by_bucket(&meta, &descriptor, &batch, meta.client_hlc)
-			.expect("pack multi-row");
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect("pack multi-row");
 		assert!(!packed.is_empty());
 		let mut logical_rows = 0;
 		for record in packed {
@@ -918,12 +1065,14 @@ mod tests {
 				key_identity: Identity::new([3; 32]),
 				routing_locality: Locality::new(2),
 				row_hlc: hlc(12),
+				table_object_id: None,
 			},
 			MultiRowSourceRow {
 				source_row_index: 0,
 				key_identity: Identity::new([1; 32]),
 				routing_locality: Locality::new(2),
 				row_hlc: hlc(11),
+				table_object_id: None,
 			},
 		];
 		let first = encode_multirow_from_survivors(&batch, &rows).unwrap();
@@ -971,6 +1120,7 @@ mod tests {
 			key_identity: Identity::new([1; 32]),
 			routing_locality: Locality::new(1),
 			row_hlc: hlc(10),
+			table_object_id: None,
 		};
 		let encoded = encode_multirow_from_survivors_with_policy(
 			&batch,
@@ -981,8 +1131,14 @@ mod tests {
 		assert!(encoded.plaintext_byte_len > 4 * 1024);
 		assert!(encoded.encoded_byte_len < 4 * 1024);
 
-		let err = pack_record_batch_by_bucket(&meta, &descriptor, &batch, meta.client_hlc)
-			.expect_err("uncompressed axis must reject");
+		let err = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect_err("uncompressed axis must reject");
 		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE);
 		assert!(
 			err.message
@@ -1001,12 +1157,14 @@ mod tests {
 					key_identity: Identity::new([3; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(30),
+					table_object_id: None,
 				},
 				MultiRowSourceRow {
 					source_row_index: 1,
 					key_identity: Identity::new([1; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(10),
+					table_object_id: None,
 				},
 			],
 		)
@@ -1019,12 +1177,14 @@ mod tests {
 					key_identity: Identity::new([2; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(20),
+					table_object_id: None,
 				},
 				MultiRowSourceRow {
 					source_row_index: 3,
 					key_identity: Identity::new([4; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(40),
+					table_object_id: None,
 				},
 			],
 		)
@@ -1058,5 +1218,111 @@ mod tests {
 				.collect::<Vec<_>>(),
 			vec![10, 20, 30, 40]
 		);
+	}
+
+	// ============================================================
+	//  ADR 045 — APPEND-ONLY MULTIROW PACKING
+	// ============================================================
+
+	fn append_only_descriptor() -> TableSchemaDescriptorV1 {
+		use arrow::datatypes::TimeUnit;
+		let schema = Schema::new(vec![
+			Field::new(
+				"event_time",
+				DataType::Timestamp(TimeUnit::Millisecond, None),
+				false,
+			),
+			Field::new("payload", DataType::LargeBinary, true),
+		]);
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x45; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn append_only_batch(payloads: Vec<Option<&[u8]>>, times: Vec<i64>) -> RecordBatch {
+		use arrow::array::{LargeBinaryArray, TimestampMillisecondArray};
+		use arrow::datatypes::TimeUnit;
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new(
+					"event_time",
+					DataType::Timestamp(TimeUnit::Millisecond, None),
+					false,
+				),
+				Field::new("payload", DataType::LargeBinary, true),
+			])),
+			vec![
+				Arc::new(TimestampMillisecondArray::from(times)) as ArrayRef,
+				Arc::new(LargeBinaryArray::from(payloads)) as ArrayRef,
+			],
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn append_only_packs_into_multirow_with_synthetic_columns() {
+		let descriptor = append_only_descriptor();
+		let batch = append_only_batch(
+			vec![Some(b"a"), Some(b"b"), Some(b"a")],
+			vec![10_000, 20_000, 30_000],
+		);
+		let meta = meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect("append-only multi-row pack");
+		assert!(!packed.is_empty());
+		let mut logical_rows = 0;
+		let mut all_identities = Vec::new();
+		for record in &packed {
+			let decoded = decode_batch(&record.frame_bytes).unwrap();
+			assert!(has_storage_synthetic_columns(&decoded));
+			let rows = storage_rows_from_batch(&decoded).unwrap();
+			for row in &rows {
+				all_identities.push(row.key_identity);
+			}
+			logical_rows += rows.len();
+		}
+		assert_eq!(logical_rows, 3);
+		// Identical-payload rows (rows 0 and 2 share payload "a") still
+		// must produce distinct identities under ADR 045 §4.
+		all_identities.sort();
+		all_identities.dedup();
+		assert_eq!(
+			all_identities.len(),
+			3,
+			"distinct intra-batch positions must yield distinct identities"
+		);
+	}
+
+	#[test]
+	fn append_only_user_decoded_strips_synthetic_columns() {
+		let descriptor = append_only_descriptor();
+		let batch = append_only_batch(vec![Some(b"x")], vec![10_000]);
+		let meta = meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		let decoded = decode_batch(&packed[0].frame_bytes).unwrap();
+		let user = strip_storage_synthetic_columns(&decoded).unwrap();
+		assert_eq!(user.schema().as_ref(), batch.schema().as_ref());
 	}
 }

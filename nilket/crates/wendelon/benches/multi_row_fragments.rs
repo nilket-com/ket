@@ -14,9 +14,9 @@ use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, Consistency, DurabilityLevel, HybridTimestamp,
 	LocalityPolicyV1, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId,
-	encode_table_write_row_count,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta,
+	TenantId, WriterNodeId, encode_table_write_row_count,
 };
 use wendelon::storage::{
 	LocalFsObjectStore, ObjectStore, aggregate_record_batches, decode_batch, encode_batch,
@@ -428,8 +428,9 @@ fn build_multirow_frames(
 	meta: &TableWriteRequestMeta,
 	descriptor: &TableSchemaDescriptorV1,
 ) -> std::io::Result<PreparedFrames> {
-	let records = pack_record_batch_by_bucket(meta, descriptor, batch, meta.client_hlc)
-		.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+	let records =
+		pack_record_batch_by_bucket(meta, descriptor, batch, WriterNodeId::ZERO, meta.client_hlc)
+			.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
 	let frames = records
 		.into_iter()
 		.map(|record| record.frame_bytes)
@@ -556,7 +557,7 @@ fn bench_descriptor_with_policy(
 		"analytics",
 		"events",
 		&bench_schema(),
-		PrimaryKeyDescriptorV1::single("id"),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 		LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 			spread_factor: 1,
 			prefix_bits: 63,

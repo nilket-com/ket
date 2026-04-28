@@ -1749,8 +1749,8 @@ mod tests {
 	use super::*;
 	use crate::schema::table::{
 		BloomBitsPerRow, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision,
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, SmallSetByteCap,
-		SmallSetValueCap,
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		SmallSetByteCap, SmallSetValueCap,
 	};
 	use arrow::array::{Float64Array, Int64Array, LargeStringArray};
 	use arrow::datatypes::{Field, Schema};
@@ -1763,7 +1763,7 @@ mod tests {
 			"analytics",
 			"events",
 			schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

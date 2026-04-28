@@ -911,6 +911,11 @@ pub struct MetricsRegistry {
 	pub storage_multirow_uncompacted_row_records_total: Counter,
 	storage_multirow_rows_per_record: Histogram,
 	storage_multirow_decode_micros: Histogram,
+	// ADR 045 — append-only table metrics.
+	pub storage_append_only_batches_total: Counter,
+	pub storage_append_only_rows_written_total: Counter,
+	pub storage_append_only_intra_batch_index_exhaustion_total: Counter,
+	pub storage_append_only_supersession_metadata_skipped_total: Counter,
 	storage_compression_records_written: CompressionCodecCounters,
 	storage_compression_plaintext_bytes: CompressionCodecCounters,
 	storage_compression_encoded_bytes: CompressionCodecCounters,
@@ -1071,6 +1076,10 @@ impl Default for MetricsRegistry {
 			storage_multirow_uncompacted_row_records_total: Counter::default(),
 			storage_multirow_rows_per_record: Histogram::new(MULTIROW_ROWS_PER_RECORD_BUCKETS),
 			storage_multirow_decode_micros: Histogram::new(PBC_EXEC_BUCKETS_MICROS),
+			storage_append_only_batches_total: Counter::default(),
+			storage_append_only_rows_written_total: Counter::default(),
+			storage_append_only_intra_batch_index_exhaustion_total: Counter::default(),
+			storage_append_only_supersession_metadata_skipped_total: Counter::default(),
 			storage_compression_records_written: CompressionCodecCounters::default(),
 			storage_compression_plaintext_bytes: CompressionCodecCounters::default(),
 			storage_compression_encoded_bytes: CompressionCodecCounters::default(),
@@ -1280,6 +1289,30 @@ impl MetricsRegistry {
 
 	pub fn observe_storage_multirow_recompact(&self, records: u64) {
 		self.storage_multirow_recompact_total.add(records);
+	}
+
+	/// ADR 045 — observe an admitted append-only batch on the
+	/// server's success path.
+	///
+	/// Called by the data-server *after* lease gate, idempotency
+	/// replay, and quota all clear, and after
+	/// `bifurcate_table_write` has succeeded for the request.
+	/// Admission itself is side-effect-free: client-side preview
+	/// admission and aborted server attempts MUST NOT increment
+	/// these counters.
+	pub fn observe_storage_append_only_batch(&self, rows: u64) {
+		self.storage_append_only_batches_total.inc();
+		self.storage_append_only_rows_written_total.add(rows);
+	}
+
+	pub fn observe_storage_append_only_intra_batch_index_exhaustion(&self) {
+		self.storage_append_only_intra_batch_index_exhaustion_total
+			.inc();
+	}
+
+	pub fn observe_storage_append_only_supersession_metadata_skipped(&self) {
+		self.storage_append_only_supersession_metadata_skipped_total
+			.inc();
 	}
 
 	pub fn observe_storage_l2_column_fetch_plan(&self, duration: Duration) {
@@ -1984,6 +2017,33 @@ impl MetricsRegistry {
 			"wendelon_storage_multirow_uncompacted_row_records_total",
 			"Single-row table records observed as pending multi-row recompaction.",
 			self.storage_multirow_uncompacted_row_records_total.get(),
+		);
+		// ADR 045 — append-only table operational metrics.
+		render_counter(
+			&mut out,
+			"wendelon_storage_append_only_batches_total",
+			"Append-only write batches admitted (ADR 045).",
+			self.storage_append_only_batches_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_append_only_rows_written_total",
+			"Logical rows admitted into append-only tables.",
+			self.storage_append_only_rows_written_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_append_only_intra_batch_index_exhaustion_total",
+			"Append-only writes rejected because the IntraBatchIndex u32 capacity was exhausted.",
+			self.storage_append_only_intra_batch_index_exhaustion_total
+				.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_append_only_supersession_metadata_skipped_total",
+			"Sealed append-only slabs whose CSB short-circuit skipped supersession-metadata inspection.",
+			self.storage_append_only_supersession_metadata_skipped_total
+				.get(),
 		);
 		let compression_records_written_total =
 			namespaced_metric("storage_compression_records_written_total");

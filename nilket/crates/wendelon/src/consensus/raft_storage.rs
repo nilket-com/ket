@@ -4905,8 +4905,8 @@ mod schema_state_tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
-		TableSchemaDescriptorV1, encode_table_schema_descriptor_v1,
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptorV1, encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -4924,7 +4924,7 @@ mod schema_state_tests {
 			"analytics",
 			"events",
 			schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5082,7 +5082,7 @@ mod schema_state_tests {
 			"analytics",
 			"events_copy",
 			&table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5201,8 +5201,8 @@ mod recovery_tests {
 	};
 	use crate::schema::{
 		FinalizationMarker, LeaseDescriptor, LocalityPolicyV1, NodeId as SchemaNodeId,
-		PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
-		TenantId, encode_table_schema_descriptor_v1,
+		PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
+		TableSchemaDescriptorV1, TenantId, encode_table_schema_descriptor_v1,
 	};
 	use crate::storage::{
 		AlignedBuf, AsyncFileOps, BlockingFileOps, DirectoryEntry, FaultAction, FaultOp,
@@ -5327,7 +5327,7 @@ mod recovery_tests {
 			"analytics",
 			"events",
 			&recovery_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

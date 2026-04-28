@@ -2,8 +2,9 @@ use crate::schema::pbc::{
 	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
 };
 use crate::schema::{
-	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, Locality, MaxRowCount,
-	NodeId, TargetRowCount, TenantId, WriteResponseMeta, write_payload_schema,
+	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex,
+	Locality, MaxRowCount, NodeId, TargetRowCount, TenantId, WriteResponseMeta, WriterNodeId,
+	write_payload_schema,
 };
 use arrow::array::{
 	Array, BinaryArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -23,6 +24,17 @@ use std::io::{Cursor, Error, ErrorKind};
 const TABLE_ROW_IDENTITY_DOMAIN: &[u8] = b"wendelon.table-row.v1";
 const TABLE_LOCALITY_DOMAIN: &[u8] = b"wendelon.table-locality.v1";
 const TABLE_COLUMN_LOCALITY_HASH_DOMAIN: &[u8] = b"wendelon.table-column-locality.v1";
+/// ADR 045 §4 BLAKE3 domain tag for the append-only row
+/// identity preimage. Distinct from [`TABLE_ROW_IDENTITY_DOMAIN`]
+/// so a constructed PK can never collide with an append-only
+/// `key_identity` at the BLAKE3 input layer.
+const TABLE_APPEND_ROW_DOMAIN: &[u8] = b"table.append-row";
+
+/// ADR 045 §4a — locality domain tag (versioned). The append-only
+/// locality preimage hashes `(tenant_id, table_object_id,
+/// parent_write_id)` under this tag to produce a request-stable
+/// locality the client and server compute identically.
+const TABLE_APPEND_LOCALITY_DOMAIN: &[u8] = b"table.append-locality.v1";
 
 pub const TABLE_SCHEMA_DESCRIPTOR_VERSION: u16 = 1;
 pub const TABLE_SPREAD_DEFAULT_FACTOR: u16 = 4;
@@ -36,6 +48,17 @@ pub const MULTI_ROW_MAX_RECORD_BYTES: u64 = 8 * 1024 * 1024;
 pub const STORAGE_ROW_HLC_COLUMN: &str = "__row_hlc__";
 pub const STORAGE_ROW_KEY_ID_COLUMN: &str = "__row_key_id__";
 pub const STORAGE_ROW_ROUTING_LOCALITY_COLUMN: &str = "__row_routing_locality__";
+/// ADR 045 Phase 8 — durable per-row binding back to the
+/// originating descriptor's `table_object_id`. Stamped on
+/// AppendOnly rows only (PK-keyed identity is already
+/// `(tenant_id, table_object_id)`-bound through the canonical
+/// PK preimage; PK rows do not carry this column). The matchers
+/// (`table_record_matches_descriptor`,
+/// `descriptor_matches_tiered_row`) verify this column equals
+/// the candidate descriptor's `table_object_id`, isolating
+/// AppendOnly rows from cross-table prefix collisions in the
+/// table-spread address space.
+pub const STORAGE_ROW_TABLE_OBJECT_ID_COLUMN: &str = "__row_table_object_id__";
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
 pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
 pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
@@ -270,6 +293,11 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
 	pub const PBC_REJECT_STATS_FINGERPRINT_MISMATCH: Self = Self(0x3909);
 	pub const PBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
+	// ADR 045 reject codes for append-only table operations.
+	pub const PBC_REJECT_APPEND_ONLY_UPDATE: Self = Self(0x3A01);
+	pub const PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY: Self = Self(0x3A02);
+	pub const PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW: Self = Self(0x3A03);
+	pub const PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED: Self = Self(0x3A04);
 
 	pub const fn name(self) -> &'static str {
 		match self.0 {
@@ -304,6 +332,10 @@ impl PbcRejectCode {
 			0x3908 => "PBC_REJECT_STATS_FORMAT_VERSION",
 			0x3909 => "PBC_REJECT_STATS_FINGERPRINT_MISMATCH",
 			0x390A => "PBC_REJECT_STATS_DECRYPT_FAILED",
+			0x3A01 => "PBC_REJECT_APPEND_ONLY_UPDATE",
+			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
+			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
+			0x3A04 => "PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED",
 			_ => "PBC_REJECT_UNKNOWN",
 		}
 	}
@@ -459,10 +491,28 @@ impl MultiRowLayoutDescriptor {
 	}
 }
 
+/// Validate an admitted table write batch and produce the
+/// per-row identity / locality plan.
+///
+/// `row_hlc` is the leader-stamped HLC that will be persisted
+/// into the row's `__row_hlc__` column. For PK-keyed
+/// descriptors it is informational (PK identity is HLC-
+/// independent). For ADR 045 `RowIdentityPolicy::AppendOnly`
+/// descriptors it is **load-bearing**: the
+/// `(writer_node_id, row_hlc, intra_batch_index)` tuple is the
+/// uniqueness root for the synthesized `key_identity`. Callers
+/// MUST pass the same `row_hlc` they pass to
+/// [`pack_admitted_record_batch_by_bucket`] so the persisted
+/// `__row_hlc__` matches the HLC consumed by identity
+/// synthesis. The leader path is responsible for stamping a
+/// unique-per-batch HLC (typically `commit_hlc` from
+/// `HybridLogicalClockDriver::merge`).
 pub fn validate_table_write_request_batch(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
+	writer_node_id: WriterNodeId,
+	row_hlc: HybridTimestamp,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
 	descriptor.validate().map_err(|err| {
 		TableWriteValidationError::new(
@@ -512,7 +562,30 @@ pub fn validate_table_write_request_batch(
 			format!("descriptor Arrow schema cannot be decoded: {err}"),
 		)
 	})?;
-	let primary_key_column = descriptor.primary_key.columns.first().ok_or_else(|| {
+	if batch.schema().as_ref() != &schema {
+		return Err(TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
+			"table write Arrow schema does not match descriptor schema",
+		));
+	}
+
+	match &descriptor.row_identity_policy {
+		RowIdentityPolicy::PrimaryKey(_) => admit_primary_key_write(meta, batch, descriptor),
+		RowIdentityPolicy::AppendOnly => {
+			admit_append_only_write(meta, batch, descriptor, writer_node_id, row_hlc)
+		}
+	}
+}
+
+fn admit_primary_key_write(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<TableWriteAdmission, TableWriteValidationError> {
+	let primary_key_descriptor = descriptor
+		.primary_key_descriptor()
+		.expect("admit_primary_key_write requires PK policy");
+	let primary_key_column = primary_key_descriptor.columns.first().ok_or_else(|| {
 		TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_PK_MISSING,
 			"table descriptor does not declare a primary key column",
@@ -522,12 +595,6 @@ pub fn validate_table_write_request_batch(
 		return Err(TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_PK_MISSING,
 			format!("table write is missing primary key column {primary_key_column:?}"),
-		));
-	}
-	if batch.schema().as_ref() != &schema {
-		return Err(TableWriteValidationError::new(
-			PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
-			"table write Arrow schema does not match descriptor schema",
 		));
 	}
 
@@ -546,26 +613,7 @@ pub fn validate_table_write_request_batch(
 	let mut localities = Vec::with_capacity(canonical_primary_keys.len());
 	for (row, pk) in canonical_primary_keys.iter().enumerate() {
 		let key_identity = table_row_identity(meta.tenant_id, meta.table_object_id, pk);
-		let locality = match descriptor.locality_policy {
-			LocalityPolicyV1::IdentityProjection => Locality::from(key_identity),
-			LocalityPolicyV1::TableSpreadProjection(spread) => {
-				table_spread_locality(meta.tenant_id, meta.table_object_id, key_identity, spread)
-					.map_err(|err| {
-						TableWriteValidationError::new(
-							PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-							format!("table spread locality failed: {err}"),
-						)
-					})?
-			}
-			LocalityPolicyV1::ColumnProjection(ref projection) => column_projection_locality(
-				meta.tenant_id,
-				meta.table_object_id,
-				key_identity,
-				projection,
-				batch,
-				row,
-			)?,
-		};
+		let locality = compute_locality_for_admission(meta, batch, descriptor, key_identity, row)?;
 		key_identities.push(key_identity);
 		localities.push(locality);
 	}
@@ -577,6 +625,179 @@ pub fn validate_table_write_request_batch(
 	})
 }
 
+/// ADR 045 Phase 3 admission path for `RowIdentityPolicy::AppendOnly`.
+///
+/// Skips PK presence / null / duplicate-in-batch checks.
+/// Synthesizes per-row identity from the authenticated write
+/// context (writer node, row HLC, intra-batch index) per the
+/// ADR §4 BLAKE3 preimage. The canonical row payload hash was
+/// dropped from the preimage in Phase 7 (Open question 1
+/// resolved: payload hash dominated wide-row ingest CPU and
+/// uniqueness is fully covered by the write-context tuple
+/// given a unique-per-batch `row_hlc`).
+///
+/// `writer_node_id` is the admitting **server**'s authenticated
+/// `NodeId` (ADR 018), threaded in by the caller. It is not
+/// read from `meta.proxy_source` (which is zero on direct SDK
+/// writes by wire contract).
+///
+/// `row_hlc` is the leader-merged commit HLC the caller passes
+/// in — it MUST be the same HLC that ends up persisted in the
+/// row's `__row_hlc__` column so identity and storage agree.
+///
+/// Locality is **request-level** (Phase 8 / ADR §4a):
+/// `append_only_request_locality` is computed once from
+/// retry-stable write context and applied to every row in the
+/// batch. Per-row locality variation would re-introduce the
+/// client/server divergence the §4a contract eliminates.
+fn admit_append_only_write(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	writer_node_id: WriterNodeId,
+	row_hlc: HybridTimestamp,
+) -> Result<TableWriteAdmission, TableWriteValidationError> {
+	let request_locality = append_only_request_locality_for_descriptor(meta, descriptor)?;
+	let row_count = batch.num_rows();
+	if row_count > (u32::MAX as usize - 1) {
+		crate::metrics::global().observe_storage_append_only_intra_batch_index_exhaustion();
+		return Err(TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED,
+			"append-only write exceeds IntraBatchIndex u32 capacity",
+		));
+	}
+	let mut key_identities = Vec::with_capacity(row_count);
+	let mut localities = Vec::with_capacity(row_count);
+	for row in 0..row_count {
+		let intra_batch_index = IntraBatchIndex::try_new(row as u32).map_err(|err| {
+			crate::metrics::global().observe_storage_append_only_intra_batch_index_exhaustion();
+			TableWriteValidationError::new(
+				PbcRejectCode::PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED,
+				format!("intra-batch index allocation failed: {err}"),
+			)
+		})?;
+		let key_identity = synthesize_append_only_row_id(
+			meta.tenant_id,
+			meta.table_object_id,
+			writer_node_id,
+			row_hlc,
+			intra_batch_index,
+		);
+		key_identities.push(key_identity);
+		localities.push(request_locality);
+	}
+	let _ = batch;
+
+	Ok(TableWriteAdmission {
+		canonical_primary_keys: Vec::new(),
+		key_identities,
+		localities,
+	})
+}
+
+/// ADR 045 §4a — append-only locality preimage.
+///
+/// Locality for AppendOnly is derived from retry-stable
+/// write context (`tenant_id`, `table_object_id`,
+/// `parent_write_id`) so that client-side preview and
+/// server-side admission produce the same value
+/// byte-for-byte. All rows in a single request receive
+/// this locality.
+///
+/// V1 only supports `LocalityPolicyV1::TableSpreadProjection`
+/// for AppendOnly; other variants are rejected at descriptor
+/// validation. The seed feeds the same `jump_consistent_hash`
+/// + prefix/suffix masking the existing table-spread machinery
+/// already uses.
+pub fn append_only_request_locality(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	parent_write_id: ClientWriteId,
+	spread: TableSpreadLocalityDescriptorV1,
+) -> std::io::Result<Locality> {
+	validate_table_spread(spread)?;
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(TABLE_APPEND_LOCALITY_DOMAIN);
+	let mut tenant_bytes = [0u8; 16];
+	tenant_bytes[..8].copy_from_slice(&tenant_id.get().to_le_bytes());
+	hasher.update(&tenant_bytes);
+	hasher.update(table_object_id.as_bytes());
+	// Hash only the canonical idempotency identity
+	// (`client_uuid` + `sequence_no`), not the full 32-byte
+	// `ClientWriteId`. The server-side idempotency cache keys on
+	// the same fields (data_server.rs `idempotency_key_for`); a
+	// retry whose `idempotency_ttl_ms` (or `_pad`) differs but
+	// whose `(client_uuid, sequence_no)` is unchanged is the same
+	// logical write and MUST route to the same locality.
+	hasher.update(&parent_write_id.canonical_idempotency_bytes());
+	let digest = hasher.finalize();
+	let seed = u64::from_le_bytes(digest.as_bytes()[0..8].try_into().unwrap());
+	let bucket = jump_consistent_hash(seed, spread.spread_factor);
+	let table_hash = table_spread_prefix_hash(tenant_id, table_object_id, bucket);
+	let (prefix_mask, suffix_mask) = locality_masks(spread.prefix_bits)?;
+	Ok(Locality::new(
+		(table_hash & prefix_mask) | (seed & suffix_mask),
+	))
+}
+
+fn append_only_request_locality_for_descriptor(
+	meta: &TableWriteRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<Locality, TableWriteValidationError> {
+	match descriptor.locality_policy {
+		LocalityPolicyV1::TableSpreadProjection(spread) => append_only_request_locality(
+			meta.tenant_id,
+			meta.table_object_id,
+			meta.parent_write_id,
+			spread,
+		)
+		.map_err(|err| {
+			TableWriteValidationError::new(
+				PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+				format!("append-only locality computation failed: {err}"),
+			)
+		}),
+		LocalityPolicyV1::IdentityProjection | LocalityPolicyV1::ColumnProjection(_) => {
+			// Defence-in-depth: descriptor validation already rejects
+			// these combinations (ADR 045 §4a). A descriptor that
+			// slips through here is a bug.
+			Err(TableWriteValidationError::new(
+				PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+				"append-only tables require LocalityPolicyV1::TableSpreadProjection (ADR 045 §4a)",
+			))
+		}
+	}
+}
+
+fn compute_locality_for_admission(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	key_identity: Identity,
+	row: usize,
+) -> Result<Locality, TableWriteValidationError> {
+	match descriptor.locality_policy {
+		LocalityPolicyV1::IdentityProjection => Ok(Locality::from(key_identity)),
+		LocalityPolicyV1::TableSpreadProjection(spread) => {
+			table_spread_locality(meta.tenant_id, meta.table_object_id, key_identity, spread)
+				.map_err(|err| {
+					TableWriteValidationError::new(
+						PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+						format!("table spread locality failed: {err}"),
+					)
+				})
+		}
+		LocalityPolicyV1::ColumnProjection(ref projection) => column_projection_locality(
+			meta.tenant_id,
+			meta.table_object_id,
+			key_identity,
+			projection,
+			batch,
+			row,
+		),
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchemaDescriptorV1 {
 	pub contract_version: u16,
@@ -586,7 +807,7 @@ pub struct TableSchemaDescriptorV1 {
 	pub table_name: String,
 	#[serde(with = "serde_bytes")]
 	pub arrow_schema_ipc: Vec<u8>,
-	pub primary_key: PrimaryKeyDescriptorV1,
+	pub row_identity_policy: RowIdentityPolicy,
 	pub locality_policy: LocalityPolicyV1,
 	pub stats_policy: ColumnStatsPolicyV1,
 	pub record_layout_policy: RecordLayoutPolicy,
@@ -602,7 +823,7 @@ impl TableSchemaDescriptorV1 {
 		namespace: impl Into<String>,
 		table_name: impl Into<String>,
 		arrow_schema: &Schema,
-		primary_key: PrimaryKeyDescriptorV1,
+		row_identity_policy: RowIdentityPolicy,
 		locality_policy: LocalityPolicyV1,
 		evolution_policy: SchemaEvolutionPolicyV1,
 	) -> std::io::Result<Self> {
@@ -612,7 +833,7 @@ impl TableSchemaDescriptorV1 {
 			namespace,
 			table_name,
 			arrow_schema,
-			primary_key,
+			row_identity_policy,
 			locality_policy,
 			RecordLayoutPolicy::SingleRow,
 			evolution_policy,
@@ -625,7 +846,7 @@ impl TableSchemaDescriptorV1 {
 		namespace: impl Into<String>,
 		table_name: impl Into<String>,
 		arrow_schema: &Schema,
-		primary_key: PrimaryKeyDescriptorV1,
+		row_identity_policy: RowIdentityPolicy,
 		locality_policy: LocalityPolicyV1,
 		record_layout_policy: RecordLayoutPolicy,
 		evolution_policy: SchemaEvolutionPolicyV1,
@@ -639,7 +860,7 @@ impl TableSchemaDescriptorV1 {
 			namespace: namespace.into(),
 			table_name: table_name.into(),
 			arrow_schema_ipc: encode_arrow_schema_ipc(arrow_schema)?,
-			primary_key,
+			row_identity_policy,
 			locality_policy,
 			stats_policy: ColumnStatsPolicyV1::default(),
 			record_layout_policy,
@@ -654,6 +875,20 @@ impl TableSchemaDescriptorV1 {
 
 	pub fn arrow_schema(&self) -> std::io::Result<Schema> {
 		decode_arrow_schema_ipc(&self.arrow_schema_ipc)
+	}
+
+	/// Read-only access to the embedded `PrimaryKeyDescriptorV1`
+	/// when the policy is PK-keyed; returns `None` for
+	/// append-only tables.
+	pub fn primary_key_descriptor(&self) -> Option<&PrimaryKeyDescriptorV1> {
+		self.row_identity_policy.primary_key()
+	}
+
+	/// Whether this descriptor declares an append-only table
+	/// (ADR 045). Append-only tables hard-require `MultiRow`
+	/// layout and synthesize identity from the write context.
+	pub fn is_append_only(&self) -> bool {
+		self.row_identity_policy.is_append_only()
 	}
 
 	pub fn compute_schema_fingerprint(&self) -> std::io::Result<[u8; 32]> {
@@ -685,8 +920,16 @@ impl TableSchemaDescriptorV1 {
 			));
 		}
 		let schema = self.arrow_schema()?;
-		validate_primary_key(&schema, &self.primary_key)?;
+		validate_row_identity_policy(
+			&schema,
+			&self.row_identity_policy,
+			&self.record_layout_policy,
+		)?;
 		validate_locality_policy(&schema, &self.locality_policy)?;
+		validate_append_only_locality_compatibility(
+			&self.row_identity_policy,
+			&self.locality_policy,
+		)?;
 		validate_stats_policy(&schema, &self.stats_policy)?;
 		self.record_layout_policy.validate()?;
 		self.record_body_compression_policy.validate()?;
@@ -713,6 +956,89 @@ impl PrimaryKeyDescriptorV1 {
 #[serde(rename_all = "snake_case")]
 pub enum PrimaryKeyEncodingV1 {
 	ArrowV1,
+}
+
+/// ADR 045 row identity policy.
+///
+/// `PrimaryKey(...)` preserves ADR 037 semantics: identity is
+/// derived from a user PK column under canonical encoding.
+/// `AppendOnly` rows are insert-only and receive
+/// engine-synthesized identity per ADR 045 §3 / §4 (BLAKE3
+/// over `(tenant_id, table_object_id, writer_node_id, commit_hlc,
+/// intra_batch_index_be)`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowIdentityPolicy {
+	PrimaryKey(PrimaryKeyDescriptorV1),
+	AppendOnly,
+}
+
+impl RowIdentityPolicy {
+	pub const fn is_append_only(&self) -> bool {
+		matches!(self, Self::AppendOnly)
+	}
+
+	pub const fn primary_key(&self) -> Option<&PrimaryKeyDescriptorV1> {
+		match self {
+			Self::PrimaryKey(descriptor) => Some(descriptor),
+			Self::AppendOnly => None,
+		}
+	}
+}
+
+/// ADR 045 §4 helper: synthesize an append-only row's
+/// `__row_key_id__` from the authenticated write context.
+///
+/// Preimage layout (locked, big-endian for `intra_batch_index`):
+///
+/// ```text
+/// key_identity = BLAKE3(
+///     "table.append-row"
+///     || tenant_id              // 16 B (u64 little-endian + 8-byte zero pad)
+///     || table_object_id        // 16 B
+///     || writer_node_id         // 16 B
+///     || row_hlc                // 16 B (HybridTimestamp repr-C bytes)
+///     || intra_batch_index_be   // u32 big-endian, 4 B
+/// )
+/// ```
+///
+/// **Uniqueness root:** `(writer_node_id, row_hlc,
+/// intra_batch_index)`. The caller is responsible for passing
+/// the leader-merged commit HLC as `row_hlc` so two distinct
+/// batches from the same admitting node receive distinct HLCs
+/// (the HLC driver guarantees `merge` is strictly monotonic).
+/// `intra_batch_index` disambiguates rows within a single
+/// batch.
+///
+/// V1 dropped the canonical row payload hash from the preimage
+/// (Phase 7 bench evidence: payload hash dominated wide-row
+/// ingest CPU and was diagnostic-only — uniqueness is fully
+/// covered by the write-context tuple given a unique row HLC).
+///
+/// Output is a 32-byte BLAKE3 digest written into the ADR 042
+/// `__row_key_id__` synthetic column. Compaction must never
+/// call this helper; identities for surviving rows are
+/// preserved byte-for-byte.
+pub fn synthesize_append_only_row_id(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	writer_node_id: WriterNodeId,
+	row_hlc: HybridTimestamp,
+	intra_batch_index: IntraBatchIndex,
+) -> Identity {
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(TABLE_APPEND_ROW_DOMAIN);
+	// tenant_id is u64; pad to 16 bytes for forward compatibility
+	// with future widened tenant identity types. Layout: 8-byte
+	// little-endian value followed by 8 zero bytes.
+	let mut tenant_bytes = [0u8; 16];
+	tenant_bytes[..8].copy_from_slice(&tenant_id.get().to_le_bytes());
+	hasher.update(&tenant_bytes);
+	hasher.update(table_object_id.as_bytes());
+	hasher.update(writer_node_id.as_bytes());
+	hasher.update(bytemuck::bytes_of(&row_hlc));
+	hasher.update(&intra_batch_index.to_be_bytes());
+	Identity::new(*hasher.finalize().as_bytes())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1035,7 +1361,7 @@ pub fn default_kv_table_descriptor_v1() -> std::io::Result<TableSchemaDescriptor
 		"default",
 		"kv",
 		&write_payload_schema(),
-		PrimaryKeyDescriptorV1::single("key"),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key")),
 		LocalityPolicyV1::IdentityProjection,
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
@@ -1088,10 +1414,10 @@ pub fn validate_table_schema_evolution(
 			"table schema alter must advance schema_generation",
 		));
 	}
-	if previous.primary_key != next.primary_key {
+	if previous.row_identity_policy != next.row_identity_policy {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"table schema alter cannot change the primary key in V1",
+			"table schema alter cannot change row_identity_policy in V1",
 		));
 	}
 	if previous.locality_policy != next.locality_policy {
@@ -1630,6 +1956,92 @@ fn validate_descriptor_name(label: &str, value: &str) -> std::io::Result<()> {
 	Ok(())
 }
 
+fn validate_row_identity_policy(
+	schema: &Schema,
+	policy: &RowIdentityPolicy,
+	record_layout_policy: &RecordLayoutPolicy,
+) -> std::io::Result<()> {
+	validate_no_storage_synthetic_user_columns(schema)?;
+	match policy {
+		RowIdentityPolicy::PrimaryKey(descriptor) => validate_primary_key(schema, descriptor),
+		RowIdentityPolicy::AppendOnly => validate_append_only(schema, record_layout_policy),
+	}
+}
+
+/// ADR 045 §5 — every multi-row table (PK + AppendOnly) stamps the
+/// storage-only synthetic columns; the user must not declare a
+/// column with one of these reserved names regardless of identity
+/// policy.
+fn validate_no_storage_synthetic_user_columns(schema: &Schema) -> std::io::Result<()> {
+	for field in schema.fields() {
+		match field.name().as_str() {
+			STORAGE_ROW_HLC_COLUMN
+			| STORAGE_ROW_KEY_ID_COLUMN
+			| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
+			| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"table user schema must not declare storage-only synthetic column {:?}",
+						field.name()
+					),
+				));
+			}
+			_ => {}
+		}
+	}
+	Ok(())
+}
+
+/// ADR 045 §4a — AppendOnly locality compatibility.
+///
+/// V1 supports `LocalityPolicyV1::TableSpreadProjection` only for
+/// AppendOnly tables. `IdentityProjection` cannot be made
+/// retry-stable while identity is `commit_hlc`-derived, and
+/// `ColumnProjection`'s retry-stable routing semantics under
+/// HLC-derived identity are out of scope for V1.
+fn validate_append_only_locality_compatibility(
+	row_identity_policy: &RowIdentityPolicy,
+	locality_policy: &LocalityPolicyV1,
+) -> std::io::Result<()> {
+	if !row_identity_policy.is_append_only() {
+		return Ok(());
+	}
+	match locality_policy {
+		LocalityPolicyV1::TableSpreadProjection(_) => Ok(()),
+		LocalityPolicyV1::IdentityProjection => Err(Error::new(
+			ErrorKind::InvalidData,
+			"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+			 IdentityProjection cannot produce retry-stable routing under \
+			 HLC-derived append-only identity (ADR 045 §4a)",
+		)),
+		LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+			ErrorKind::InvalidData,
+			"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+			 ColumnProjection retry-stable semantics under HLC-derived identity \
+			 are deferred to a future ADR (ADR 045 §4a)",
+		)),
+	}
+}
+
+/// ADR 045 Phase 1 validator for `RowIdentityPolicy::AppendOnly`.
+///
+/// Hard-requires `RecordLayoutPolicy::MultiRow` (ADR 045 §2).
+/// Synthetic-column rejection is shared with PK via
+/// `validate_no_storage_synthetic_user_columns`.
+fn validate_append_only(
+	_schema: &Schema,
+	record_layout_policy: &RecordLayoutPolicy,
+) -> std::io::Result<()> {
+	if !record_layout_policy.is_multi_row() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"append-only tables require RecordLayoutPolicy::MultiRow",
+		));
+	}
+	Ok(())
+}
+
 fn validate_primary_key(
 	schema: &Schema,
 	primary_key: &PrimaryKeyDescriptorV1,
@@ -2159,14 +2571,19 @@ fn canonicalize_primary_key_column(
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
 ) -> Result<Vec<Vec<u8>>, TableWriteValidationError> {
-	if descriptor.primary_key.canonical_encoding != PrimaryKeyEncodingV1::ArrowV1 {
+	let primary_key = descriptor.primary_key_descriptor().ok_or_else(|| {
+		TableWriteValidationError::new(
+			PbcRejectCode::PBC_REJECT_PK_MISSING,
+			"append-only descriptors do not have a primary key column to canonicalize",
+		)
+	})?;
+	if primary_key.canonical_encoding != PrimaryKeyEncodingV1::ArrowV1 {
 		return Err(TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_PK_TYPE_UNSUPPORTED,
 			"unsupported primary key canonical encoding",
 		));
 	}
-	let column_name = descriptor
-		.primary_key
+	let column_name = primary_key
 		.columns
 		.first()
 		.ok_or_else(|| {
@@ -3030,7 +3447,7 @@ mod tests {
 			"analytics",
 			"events",
 			schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -3107,7 +3524,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns,
 				projection,
@@ -3176,8 +3593,8 @@ mod tests {
 		assert_eq!(descriptor.table_object_id, TableObjectId::DEFAULT_KV);
 		assert_eq!(descriptor.arrow_schema().unwrap(), write_payload_schema());
 		assert_eq!(
-			descriptor.primary_key,
-			PrimaryKeyDescriptorV1::single("key")
+			descriptor.row_identity_policy,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key"))
 		);
 		assert_eq!(
 			descriptor.locality_policy,
@@ -3216,7 +3633,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
@@ -3509,7 +3926,7 @@ mod tests {
 			"analytics",
 			"events",
 			&previous_schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			locality.clone(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -3520,7 +3937,7 @@ mod tests {
 			"analytics",
 			"events",
 			&next_schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			locality,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -3533,7 +3950,7 @@ mod tests {
 			"analytics",
 			"events",
 			&next_schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("event_hour", 20)],
 				projection: ProjectionFunctionV1::ZOrder,
@@ -3606,7 +4023,7 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, true),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
@@ -3618,7 +4035,7 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Float64, false),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
@@ -3633,10 +4050,10 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
-			PrimaryKeyDescriptorV1 {
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1 {
 				columns: vec!["id".to_owned(), "name".to_owned()],
 				canonical_encoding: PrimaryKeyEncodingV1::ArrowV1,
-			},
+			}),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
@@ -3681,7 +4098,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![],
 				projection: ProjectionFunctionV1::ZOrder,
@@ -3699,7 +4116,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![
 					cluster_column("id", 1),
@@ -3729,7 +4146,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![
 					cluster_column("event_hour", 4),
@@ -3754,7 +4171,7 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_string_column("name", 2)],
 				projection: ProjectionFunctionV1::ZOrder,
@@ -3776,7 +4193,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("event_hour", 16)],
 				projection: ProjectionFunctionV1::Hilbert,
@@ -3798,7 +4215,7 @@ mod tests {
 			"analytics",
 			"events",
 			&clustered_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("id", 64)],
 				projection: ProjectionFunctionV1::ZOrder,
@@ -3820,7 +4237,7 @@ mod tests {
 			"analytics",
 			"events",
 			&table_schema(DataType::UInt8, false),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("id", 16)],
 				projection: ProjectionFunctionV1::ZOrder,
@@ -3847,7 +4264,7 @@ mod tests {
 				"analytics",
 				"events",
 				&schema_with_clustering_candidate(data_type),
-				PrimaryKeyDescriptorV1::single("id"),
+				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 				LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 					columns: vec![cluster_column("candidate", 8)],
 					projection: ProjectionFunctionV1::ZOrder,
@@ -4205,7 +4622,7 @@ mod tests {
 			"analytics",
 			"events_copy",
 			&table_schema(DataType::Int64, false),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -4252,7 +4669,14 @@ mod tests {
 		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
 		let batch = table_batch(vec![Some(1), Some(2), Some(3)]);
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 
 		assert_eq!(admission.canonical_primary_keys.len(), 3);
 		assert_eq!(
@@ -4288,7 +4712,14 @@ mod tests {
 		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
 		let batch = table_batch(vec![Some(1), Some(1)]);
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let err = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap_err();
+		let err = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap_err();
 		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 	}
 
@@ -4297,7 +4728,14 @@ mod tests {
 		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
 		let batch = table_batch(vec![Some(1), None]);
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let err = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap_err();
+		let err = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap_err();
 		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_PK_NULL);
 	}
 
@@ -4313,7 +4751,14 @@ mod tests {
 		);
 		let batch = clustered_batch();
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		assert_eq!(admission.localities.len(), 3);
 		let projection = match &descriptor.locality_policy {
 			LocalityPolicyV1::ColumnProjection(projection) => projection,
@@ -4368,7 +4813,504 @@ mod tests {
 		);
 		let batch = clustered_batch();
 		let meta = table_meta(&descriptor, batch.num_rows());
-		let admission = validate_table_write_request_batch(&meta, &batch, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		assert_eq!(admission.localities.len(), 3);
+	}
+
+	// ============================================================
+	//  ADR 045 — APPEND-ONLY DESCRIPTOR TESTS
+	// ============================================================
+
+	fn append_only_user_schema() -> Schema {
+		Schema::new(vec![
+			Field::new(
+				"event_time",
+				DataType::Timestamp(TimeUnit::Millisecond, None),
+				false,
+			),
+			Field::new("payload", DataType::LargeBinary, true),
+		])
+	}
+
+	fn append_only_descriptor_with(
+		locality: LocalityPolicyV1,
+		layout: RecordLayoutPolicy,
+	) -> std::io::Result<TableSchemaDescriptorV1> {
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([45; 16]),
+			1,
+			"analytics",
+			"events",
+			&append_only_user_schema(),
+			RowIdentityPolicy::AppendOnly,
+			locality,
+			layout,
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+	}
+
+	#[test]
+	fn append_only_descriptor_accepts_multirow_with_table_spread() {
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.expect("MultiRow + TableSpreadProjection append-only descriptor must validate");
+		assert!(descriptor.is_append_only());
+		assert!(descriptor.primary_key_descriptor().is_none());
+		// ADR 043 layout-driven default: MultiRow → Lz4Frame.
+		assert_eq!(
+			descriptor.record_body_compression_policy,
+			RecordBodyCompressionPolicy::Lz4Frame
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_rejects_identity_projection() {
+		// ADR 045 §4a: AppendOnly identity is HLC-derived and
+		// `LocalityPolicyV1::IdentityProjection` cannot produce
+		// retry-stable client-side routing under that contract.
+		// Phase 8 forbids this combination at descriptor validation.
+		let err = append_only_descriptor_with(
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.expect_err("AppendOnly + IdentityProjection must reject (ADR 045 §4a)");
+		assert!(
+			err.to_string().contains("TableSpreadProjection"),
+			"reject message should explain the §4a constraint: {err}"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_rejects_column_projection() {
+		// ADR 045 §4a: ColumnProjection retry-stable semantics under
+		// HLC-derived identity are out of scope for V1.
+		let projection = ColumnLocalityDescriptorV1 {
+			projection: ProjectionFunctionV1::RandomHash,
+			columns: vec![cluster_column("event_time", 32)],
+			spread_factor: 4,
+			prefix_bits: 16,
+		};
+		let err = append_only_descriptor_with(
+			LocalityPolicyV1::ColumnProjection(projection),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.expect_err("AppendOnly + ColumnProjection must reject (ADR 045 §4a)");
+		assert!(
+			err.to_string().contains("TableSpreadProjection"),
+			"reject message should explain the §4a constraint: {err}"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_rejects_singlerow_layout() {
+		let err = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::SingleRow,
+		)
+		.expect_err("ADR 045 §2 forbids AppendOnly + SingleRow");
+		assert!(
+			err.to_string().contains("MultiRow"),
+			"reject message should mention MultiRow requirement: {err}"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_rejects_user_synthetic_column_collision() {
+		let schema = Schema::new(vec![
+			Field::new(
+				"event_time",
+				DataType::Timestamp(TimeUnit::Millisecond, None),
+				false,
+			),
+			Field::new("__row_hlc__", DataType::LargeBinary, true),
+		]);
+		let err = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([46; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect_err("user column shadowing __row_hlc__ must reject");
+		assert!(
+			err.to_string().contains("synthetic column"),
+			"reject should mention synthetic-column collision: {err}"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_fingerprint_differs_from_pk_descriptor() {
+		let pk_descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([47; 16]),
+			1,
+			"analytics",
+			"events",
+			&Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new(
+					"event_time",
+					DataType::Timestamp(TimeUnit::Millisecond, None),
+					false,
+				),
+			]),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let append_only_descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		assert_ne!(
+			pk_descriptor.schema_fingerprint, append_only_descriptor.schema_fingerprint,
+			"row_identity_policy must contribute to the schema fingerprint"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_round_trips_through_postcard() {
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		let bytes = encode_table_schema_descriptor_v1(&descriptor).unwrap();
+		let decoded = decode_table_schema_descriptor_v1(&bytes).unwrap();
+		assert_eq!(decoded, descriptor);
+		assert!(decoded.is_append_only());
+	}
+
+	fn fixed_writer(byte: u8) -> WriterNodeId {
+		WriterNodeId::new([byte; 16])
+	}
+
+	fn fixed_hlc(ms: u64) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms: ms,
+			logical: 0,
+			node_id: 1,
+		}
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_is_deterministic() {
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let writer = fixed_writer(0xab);
+		let hlc = fixed_hlc(1_700_000_000_000);
+		let idx = IntraBatchIndex::try_new(0).unwrap();
+		let a = synthesize_append_only_row_id(tenant, table, writer, hlc, idx);
+		let b = synthesize_append_only_row_id(tenant, table, writer, hlc, idx);
+		assert_eq!(a, b, "identical inputs must produce identical identity");
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_distinguishes_writers() {
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let hlc = fixed_hlc(1_700_000_000_000);
+		let idx = IntraBatchIndex::try_new(0).unwrap();
+		let writer_a = fixed_writer(0xaa);
+		let writer_b = fixed_writer(0xbb);
+		let a = synthesize_append_only_row_id(tenant, table, writer_a, hlc, idx);
+		let b = synthesize_append_only_row_id(tenant, table, writer_b, hlc, idx);
+		assert_ne!(
+			a, b,
+			"distinct writers admitting at the same HLC must produce distinct identities"
+		);
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_distinguishes_intra_batch_positions() {
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let writer = fixed_writer(0xab);
+		let hlc = fixed_hlc(1_700_000_000_000);
+		let a = synthesize_append_only_row_id(
+			tenant,
+			table,
+			writer,
+			hlc,
+			IntraBatchIndex::try_new(0).unwrap(),
+		);
+		let b = synthesize_append_only_row_id(
+			tenant,
+			table,
+			writer,
+			hlc,
+			IntraBatchIndex::try_new(1).unwrap(),
+		);
+		assert_ne!(
+			a, b,
+			"distinct intra_batch_index positions must produce distinct identities"
+		);
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_distinguishes_hlcs() {
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let writer = fixed_writer(0xab);
+		let idx = IntraBatchIndex::try_new(0).unwrap();
+		let a =
+			synthesize_append_only_row_id(tenant, table, writer, fixed_hlc(1_700_000_000_000), idx);
+		let b =
+			synthesize_append_only_row_id(tenant, table, writer, fixed_hlc(1_700_000_000_001), idx);
+		assert_ne!(a, b, "distinct HLCs must produce distinct identities");
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_distinguishes_commit_hlc_for_identical_client_inputs() {
+		// ADR 045 Phase 7 regression guard: two write batches from the
+		// same admitting node, with identical client-supplied HLC, the
+		// same `intra_batch_index = 0`, but distinct *leader-merged*
+		// `commit_hlc` MUST produce distinct identities. This is the
+		// load-bearing invariant that lets us drop the canonical row
+		// payload hash from the preimage — uniqueness is rooted in
+		// `(writer_node_id, row_hlc, intra_batch_index)` where
+		// `row_hlc` is whatever the leader hands the admission path
+		// (must be unique-per-batch-per-leader).
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let writer = fixed_writer(0xab);
+		let idx = IntraBatchIndex::try_new(0).unwrap();
+		// Both batches have the same client_hlc by construction (e.g.,
+		// two writes within the same wall-clock millisecond from a
+		// client SDK that does not run a HybridLogicalClockDriver).
+		let client_hlc = fixed_hlc(1_700_000_000_000);
+		// The leader's `merge` produces strictly monotonic HLCs.
+		let commit_hlc_a = HybridTimestamp {
+			physical_ms: 1_700_000_000_000,
+			logical: 1,
+			node_id: 1,
+		};
+		let commit_hlc_b = HybridTimestamp {
+			physical_ms: 1_700_000_000_000,
+			logical: 2,
+			node_id: 1,
+		};
+		assert_ne!(commit_hlc_a, commit_hlc_b);
+		let _ = client_hlc; // documentation marker — not in the preimage
+		let a = synthesize_append_only_row_id(tenant, table, writer, commit_hlc_a, idx);
+		let b = synthesize_append_only_row_id(tenant, table, writer, commit_hlc_b, idx);
+		assert_ne!(
+			a, b,
+			"identical client_hlc + distinct commit_hlc MUST produce distinct identities"
+		);
+	}
+
+	#[test]
+	fn synthesize_append_only_row_id_does_not_alias_pk_identity() {
+		// ADR 045 §4: the "table.append-row" domain tag separates
+		// the append-only preimage from ADR 037's PK-derived
+		// `table_row_identity` preimage so the two BLAKE3 input
+		// streams cannot collide for the same tenant + table.
+		let tenant = TenantId::new(7);
+		let table = TableObjectId::new([45; 16]);
+		let writer = fixed_writer(0);
+		let hlc = HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		};
+		let idx = IntraBatchIndex::try_new(0).unwrap();
+		let append_identity = synthesize_append_only_row_id(tenant, table, writer, hlc, idx);
+		// Construct a PK identity over a payload that incidentally
+		// matches the append-only preimage byte stream sans domain.
+		// They MUST NOT collide.
+		let pk_identity = table_row_identity(tenant, table, &[0u8; 52]);
+		assert_ne!(
+			append_identity, pk_identity,
+			"append-only and PK-derived identities must domain-separate"
+		);
+	}
+
+	#[test]
+	fn intra_batch_index_rejects_overflow_sentinel() {
+		assert!(IntraBatchIndex::try_new(u32::MAX).is_err());
+		assert!(IntraBatchIndex::try_new(u32::MAX - 1).is_ok());
+		assert!(IntraBatchIndex::try_new(0).is_ok());
+	}
+
+	#[test]
+	fn intra_batch_index_be_encoding_is_locked() {
+		let idx = IntraBatchIndex::try_new(0x01020304).unwrap();
+		assert_eq!(idx.to_be_bytes(), [0x01, 0x02, 0x03, 0x04]);
+	}
+
+	#[test]
+	fn writer_node_id_from_node_id_is_high_padded() {
+		let node = NodeId {
+			id: 0x01020304,
+			_reserved: 0,
+		};
+		let writer = WriterNodeId::from_node_id(node);
+		// Big-endian id in the first 4 bytes; remaining 12 bytes zero.
+		assert_eq!(
+			writer.as_bytes(),
+			&[0x01, 0x02, 0x03, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+		);
+	}
+
+	fn append_only_event_batch(
+		descriptor: &TableSchemaDescriptorV1,
+		payloads: Vec<Option<&[u8]>>,
+		event_times: Vec<i64>,
+	) -> RecordBatch {
+		let schema = descriptor.arrow_schema().unwrap();
+		RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(TimestampMillisecondArray::from(event_times)) as Arc<dyn Array>,
+				Arc::new(LargeBinaryArray::from(payloads)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn append_only_admit_succeeds_with_distinct_identities_for_distinct_positions() {
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		let batch = append_only_event_batch(
+			&descriptor,
+			vec![Some(b"hello"), Some(b"world")],
+			vec![1_700_000_000_000, 1_700_000_001_000],
+		);
+		let meta = table_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		assert!(admission.canonical_primary_keys.is_empty());
+		assert_eq!(admission.key_identities.len(), 2);
+		assert_eq!(admission.localities.len(), 2);
+		assert_ne!(
+			admission.key_identities[0], admission.key_identities[1],
+			"distinct intra-batch positions must produce distinct identities"
+		);
+	}
+
+	#[test]
+	fn append_only_admit_keeps_identical_payloads_distinct() {
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		// Two rows with identical payload bytes and identical event_time:
+		// the write-context tuple still differs by intra_batch_index.
+		let batch = append_only_event_batch(
+			&descriptor,
+			vec![Some(b"heartbeat"), Some(b"heartbeat")],
+			vec![1_700_000_000_000, 1_700_000_000_000],
+		);
+		let meta = table_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		assert_ne!(
+			admission.key_identities[0], admission.key_identities[1],
+			"identical payloads at distinct write positions must still get distinct identities"
+		);
+	}
+
+	#[test]
+	fn append_only_admit_assigns_one_locality_per_request() {
+		// ADR 045 §4a: AppendOnly admission assigns a single
+		// request-level Locality (derived from
+		// `(tenant_id, table_object_id, parent_write_id)`) to every
+		// row in the batch. Per-row variation would re-introduce
+		// the client/server divergence the §4a contract eliminates.
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		let batch = append_only_event_batch(
+			&descriptor,
+			vec![Some(b"a"), Some(b"b"), Some(b"c")],
+			vec![1_700_000_000_000, 1_700_000_001_000, 1_700_000_002_000],
+		);
+		let meta = table_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		assert_eq!(admission.localities.len(), batch.num_rows());
+		let first = admission.localities[0];
+		for locality in &admission.localities {
+			assert_eq!(*locality, first, "AppendOnly: one locality per request");
+		}
+		// Sanity-check it agrees with the explicit helper.
+		let LocalityPolicyV1::TableSpreadProjection(spread) = descriptor.locality_policy else {
+			panic!("expected default table spread");
+		};
+		let expected = append_only_request_locality(
+			meta.tenant_id,
+			meta.table_object_id,
+			meta.parent_write_id,
+			spread,
+		)
+		.unwrap();
+		assert_eq!(first, expected);
+		// Identities still vary per row.
+		let mut ids = admission.key_identities.clone();
+		ids.sort();
+		ids.dedup();
+		assert_eq!(ids.len(), batch.num_rows());
+	}
+
+	#[test]
+	fn append_only_admit_skips_pk_validation() {
+		// An append-only descriptor has no PK column. The PK admission
+		// path's "missing PK column" reject must NOT fire.
+		let descriptor = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		let batch = append_only_event_batch(&descriptor, vec![Some(b"x")], vec![1_700_000_000_000]);
+		let meta = table_meta(&descriptor, batch.num_rows());
+		validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect("append-only admission must not require a PK column");
 	}
 }

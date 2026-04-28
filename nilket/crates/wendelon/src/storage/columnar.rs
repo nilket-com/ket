@@ -5,8 +5,8 @@ use crate::schema::pbc::{self, Program};
 use crate::schema::{
 	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, RecordBodyByteLen,
 	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN,
-	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaFingerprint, SlabId,
-	TableSchemaDescriptorV1,
+	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, SchemaFingerprint, SlabId, TableSchemaDescriptorV1,
 };
 use crate::storage::core::RecordLocation;
 use arrow::array::{ArrayData, ArrayRef, NullArray, make_array};
@@ -466,6 +466,14 @@ pub enum StorageColumn {
 	RowKeyId,
 	RowRoutingLocality,
 	RowTombstone,
+	/// ADR 045 Phase 8 — per-row binding back to the
+	/// originating descriptor's `table_object_id`. Stamped on
+	/// every multi-row record (PK + AppendOnly). Descriptor-
+	/// filtered query paths fetch this column and verify it
+	/// against `descriptor.table_object_id` to isolate rows
+	/// across cross-table table-spread prefix collisions and
+	/// to avoid PK re-derivation on the projected fast path.
+	RowTableObjectId,
 }
 
 impl StorageColumn {
@@ -475,6 +483,7 @@ impl StorageColumn {
 			STORAGE_ROW_KEY_ID_COLUMN => Some(Self::RowKeyId),
 			STORAGE_ROW_ROUTING_LOCALITY_COLUMN => Some(Self::RowRoutingLocality),
 			"__row_tombstone__" => Some(Self::RowTombstone),
+			STORAGE_ROW_TABLE_OBJECT_ID_COLUMN => Some(Self::RowTableObjectId),
 			_ => None,
 		}
 	}
@@ -1823,8 +1832,8 @@ mod tests {
 	use crate::schema::{
 		AggregateExpression, AggregateFunctionTag, EncryptedChunkIndex, HybridTimestamp,
 		IdentityPrefix, LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-		RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, SchemaEvolutionPolicyV1,
-		TableObjectId, TenantId,
+		RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, TableObjectId, TenantId,
 	};
 	use crate::storage::ipc::encode_record_batch_bytes;
 	use arrow::array::{ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, UInt64Array};
@@ -1838,7 +1847,7 @@ mod tests {
 			"test",
 			"columnar",
 			schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -1852,7 +1861,7 @@ mod tests {
 			"test",
 			"columnar",
 			schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(
 				MultiRowLayoutDescriptor::new(2, 64, 8 * 1024 * 1024).unwrap(),

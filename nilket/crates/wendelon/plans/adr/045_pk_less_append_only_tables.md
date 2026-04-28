@@ -174,48 +174,63 @@ pub struct WriterNodeId([u8; 16]);
 pub struct IntraBatchIndex(u32);
 ```
 
-`WriterNodeId` is bound from the authenticated mTLS
-identity of the node admitting the write (ADR 018);
-`IntraBatchIndex` advances within a single write request,
-0-indexed. `IntraBatchIndex` overflow rejects the entire
-write before any slab append — no wraparound, no
-collision-resolution path. Allocation is local to the
-admitting node and the request scope; no replicated state
-is consulted.
+`WriterNodeId` is bound from the **server's** authenticated
+mTLS `NodeId` (ADR 018) at admission time, threaded
+explicitly into the admission and packing helpers. It is
+not read from `meta.proxy_source` (which is zero on direct
+SDK writes by wire contract). `IntraBatchIndex` advances
+within a single write request, 0-indexed. `IntraBatchIndex`
+overflow rejects the entire write before any slab append —
+no wraparound, no collision-resolution path. Allocation is
+local to the admitting node and the request scope; no
+replicated state is consulted.
 
 For a batch of N rows, row `i` receives:
 
 ```text
 writer_node_id = authenticated writer identity
-row_hlc        = the row's assigned HLC (ADR 012)
+row_hlc        = leader-merged commit_hlc (ADR 012);
+                 the same HLC stored in __row_hlc__
 intra_batch    = i (zero-indexed)
 ```
+
+The leader merges the request's `client_hlc` into its
+local HLC driver before admission; that result is the
+`commit_hlc` used for both identity synthesis and the
+stored `__row_hlc__` column. Because
+`HybridLogicalClockDriver::merge` is strictly monotonic
+per leader, two distinct batches admitted by the same
+node always receive distinct `row_hlc`s — which is the
+load-bearing invariant for §4 uniqueness without a
+payload hash term.
 
 ### 4. `__row_key_id__` is write-context-rooted
 
 For append-only rows:
 
 ```text
-row_payload_hash = BLAKE3(canonical admitted Arrow row bytes)
-
 key_identity = BLAKE3(
     "table.append-row"
     || tenant_id              // 16 B
     || table_object_id        // 16 B
     || writer_node_id         // 16 B
-    || row_hlc                // 16 B
+    || row_hlc                // 16 B  (= leader-merged commit_hlc)
     || intra_batch_index_be   // u32 big-endian, 4 B
-    || row_payload_hash       // 32 B
 )
 ```
 
 The uniqueness root is the
-`(writer_node_id, row_hlc, intra_batch_index)` tuple. The
-payload hash binds the identity to the admitted row bytes
-for diagnostics and defense-in-depth — it is not a dedupe
-signal. Identical payloads at distinct write contexts
-produce distinct identities. Whether to keep the payload
-hash in the preimage is bench-tunable (Open question 1).
+`(writer_node_id, row_hlc, intra_batch_index)` tuple, where
+`row_hlc` is the leader-merged commit HLC the admission
+path receives from the leader (the same HLC stored in the
+row's `__row_hlc__` synthetic column). The HLC driver's
+`merge` is strictly monotonic per leader, so two distinct
+batches from the same admitting node always receive
+distinct `row_hlc`s; identical payloads at distinct write
+contexts therefore produce distinct identities without any
+payload-hash contribution. Open question 1 (whether to
+include the payload hash in the preimage) was resolved
+during Phase 7 — see Rationale below.
 
 The domain tag `"table.append-row"` separates this preimage
 from ADR 037's PK-derived domain so a constructed PK can
@@ -223,32 +238,120 @@ never collide with an append-only key identity at the
 BLAKE3 input layer. `intra_batch_index_be` is the big-
 endian `u32` representation; this is the wire/format
 contract and is unambiguous across implementations.
-`row_payload_hash` is computed through the structured
-Arrow row canonicalizer, not ad hoc byte slicing.
 
 For PK-keyed tables, ADR 037's PK-derived identity remains
 unchanged.
 
-### 5. No new synthetic column is required
+### 4a. Append-only locality is request-derived
 
-Append-only multi-row records use the ADR 042 synthetic
-columns unchanged:
+Append-only locality is **decoupled from per-row identity**.
+Every row in a single write request receives the same
+`Locality`, computed once from retry-stable write context:
+
+```text
+append_locality_seed = BLAKE3(
+    "table.append-locality.v1"
+    || tenant_id              // 16 B
+    || table_object_id        // 16 B
+    || parent_write_id        // 32 B
+)
+
+bucket = jump_consistent_hash(seed_u64, spread_factor)
+prefix = table_spread_prefix_hash(tenant_id, table_object_id, bucket)
+suffix = seed_u64 & suffix_mask
+locality = (prefix & prefix_mask) | suffix
+```
+
+Why decoupled: identity must depend on `commit_hlc` for
+uniqueness, but `commit_hlc` is only known to the leader.
+Client-side routing must therefore depend on something the
+client and server both see in the request meta —
+`parent_write_id` is the natural choice (32 bytes,
+retry-stable by definition, already the request's
+idempotency key). With locality computed identically on both
+sides, client preview and server admission converge by
+construction; the lease gate cannot trip on structural
+client/server disagreement.
+
+A consequence: each AppendOnly batch lands on exactly one
+replica group. Bifurcation across groups is structurally
+impossible for AppendOnly. Per-row distribution within the
+spread bucket comes from the `suffix` term and from the
+spread of distinct `parent_write_id`s across requests.
+
+The stored `__row_routing_locality__` column carries this
+per-request locality on every row. Query scan ranges for
+AppendOnly table-spread continue to cover the full set of
+prefixes returned by `table_spread_prefix_ranges(tenant_id,
+table_object_id, spread)` — queries do not know
+`parent_write_id`s, so pin no narrower than the spread
+prefix space (exactly the existing behavior).
+
+`AppendOnly + LocalityPolicyV1::IdentityProjection` is
+forbidden for V1: locality = identity is not retry-stable
+under HLC-derived identity. `AppendOnly +
+LocalityPolicyV1::ColumnProjection` is also forbidden for
+V1 — its retry-stable routing semantics under append-only
+identity have not been worked out, and the V1 contract
+restricts it accordingly. Descriptor validation rejects
+both combinations.
+
+PK-keyed tables retain ADR 037's per-row locality semantics
+unchanged.
+
+### 5. Multi-row synthetic-column set adds `__row_table_object_id__`
+
+Every multi-row record (PK + AppendOnly) carries the
+ADR 042 synthetic-column trio plus the table-isolation
+stamp:
 
 ```text
 user columns...
 __row_hlc__               FixedSizeBinary(16)
 __row_key_id__            FixedSizeBinary(32)
 __row_routing_locality__  UInt64
+__row_table_object_id__   FixedSizeBinary(16)
 ```
+
+Single-row records continue to carry no synthetic columns
+(ADR 042 / 044 contract); descriptor-filtered queries
+against single-row records use the whole-record matcher
+fallback. The schema validator forbids users from declaring
+a column with any of the synthetic names regardless of
+identity policy.
+
+`__row_table_object_id__` carries the descriptor's
+`table_object_id` stamped on every row of a multi-row
+record. The all-or-none stamping invariant is enforced by
+the encoder: either every row in a record carries the
+column with the same value, or no row does.
+
+The descriptor-match helpers
+(`table_record_matches_descriptor`,
+`descriptor_matches_tiered_row`) verify this column equals
+the candidate descriptor's `table_object_id`. For
+AppendOnly the verification is the only descriptor binding
+(synthesized identity is HLC-derived, so re-derivation
+cannot rule out a sibling AppendOnly table with the same
+schema and a colliding table-spread prefix). For PK the
+column is an early-fail before the (more expensive) PK
+re-derivation. The projected fast path uses a uniform
+byte-compare against this column for both identity
+policies, avoiding PK re-derivation cost for
+descriptor-filtered queries on the projected path.
+
+Without this column, query, reclustering, stats, and LZ4
+candidate-detection paths on AppendOnly tables would let
+same-tenant same-shape descriptors with overlapping
+table-spread prefixes leak rows across descriptors.
 
 The write-context components (`writer_node_id`,
 `intra_batch_index`) are not stored as separate columns.
-Recovery does not need them: it reads `__row_key_id__`,
-`__row_hlc__`, and `__row_routing_locality__` directly
-from the IPC body and rebuilds the same redb indexes
-ADR 042 already requires. Compaction preserves those
-synthetic values exactly per row and never recomputes
-append-only identity for surviving rows.
+Recovery does not need them: it reads the four synthetic
+columns directly from the IPC body and rebuilds the same
+redb indexes ADR 042 already requires. Compaction
+preserves those synthetic values exactly per row and never
+recomputes append-only identity for surviving rows.
 
 ### 6. Locality policy is unchanged; default is table spread
 
@@ -449,8 +552,8 @@ node:
 4. binds `WriterNodeId` from the authenticated request
    context, assigns per-row HLCs (ADR 012) and
    `IntraBatchIndex` values;
-5. computes per-row payload hashes (under the V1
-   preimage) and key identities;
+5. computes per-row key identities under the V1
+   preimage (no payload-hash term);
 6. computes locality from the descriptor;
 7. appends the ADR 042 synthetic columns;
 8. packs rows into bucket-pure multi-row records sorted
@@ -487,24 +590,42 @@ provide (CDC cursor exposure) is recoverable from
 `(__row_hlc__, __row_key_id__)` if a future CDC ADR
 needs it.
 
-**Why include the payload hash in the identity preimage.**
-The write-context tuple is sufficient for uniqueness
-alone. The payload hash binds identity to admitted row
-bytes, giving debugging tools a stable way to explain
-"same write context, different bytes" if request replay
-or HLC assignment ever misbehaves. It is not a dedupe
-signal — identical payloads at distinct write contexts
-still produce distinct identities. The BLAKE3-on-row
-cost is non-trivial for wide rows (Open question 1,
-bench-resolvable).
+**Why the identity preimage excludes the row payload
+hash (resolved during Phase 7).** Earlier drafts folded
+a canonical row payload hash into the BLAKE3 preimage as
+defence-in-depth. Phase 7 benches showed payload hashing
+dominated wide-row admission CPU: per-row admission gap
+between hashed and unhashed paths was ~0.011 µs at 0 B,
+~0.013 µs at 32 B, ~0.229 µs at 256 B, and ~0.879 µs at
+1024 B; identity-synthesis stayed flat at ~0.127 µs.
+Linear scaling with payload size proved BLAKE3-on-payload
+dominated, while the hash itself contributed nothing to
+uniqueness — uniqueness is fully rooted in
+`(writer_node_id, row_hlc, intra_batch_index)` because
+the leader-merged commit HLC is strictly monotonic per
+admitting node (ADR 012). The "diagnostic / replay
+detection" motivation for keeping the hash was outweighed
+by the cost on hot-path ingest, and the same diagnostic
+information is available out-of-band via stored row bytes
+when needed. Open question 1 is closed.
 
-**Why no new storage-only synthetic column.** Once
-identity does not depend on a mutable table counter,
-recovery does not need to reconstruct write-context
-material. The ADR 042 trio is sufficient. Adding a
-column for diagnostic-only purposes would inflate
-steady-state storage cost on every append-only row for
-no operational benefit.
+**Why one new storage-only synthetic column
+(`__row_table_object_id__`).** Once identity does not
+depend on a mutable table counter, recovery does not need
+to reconstruct write-context material — the ADR 042 trio
+suffices for that. Phase 8 added one additional column
+strictly for descriptor isolation against cross-table
+table-spread prefix collisions. Without it, AppendOnly
+identity (HLC-derived) cannot be re-bound to a descriptor
+at query time, and PK descriptor-filtered projected
+queries pay the cost of full PK re-derivation per row.
+Stamping the column on every multi-row record (PK +
+AppendOnly) lets the projected fast path verify
+table-isolation with a 16-byte byte-compare. Constant-
+column compression keeps steady-state storage cost
+negligible (one value repeated across all rows of a
+record). Single-row records carry no synthetic columns
+and fall back to the whole-record matcher.
 
 **Why `MultiRow` is hard-required.** Append-only's read-
 side optimizations (CSB short-circuit, ADR 044 column
@@ -513,18 +634,30 @@ only would need a second recovery / packing branch for
 no workload win. Tenants who want single-row writes have
 PK-keyed tables.
 
-**Why `TableSpreadProjection` is the default locality.**
-ADR 037's typed-table default is
-`TableSpreadProjection { spread_factor: 4,
-prefix_bits: 16 }`; append-only inherits the same
-default. The synthesized `key_identity` is a valid salt
-input regardless of identity policy — the spread
-machinery doesn't care whether the salt came from a
-canonical PK or a write-context tuple. Applying the same
-default keeps operator-visible behavior consistent across
-identity policies. `IdentityProjection` would scatter
-scans across the whole ring, which is the wrong default
-for a table shape that is overwhelmingly scan-read.
+**Why `TableSpreadProjection` is the only allowed locality
+for AppendOnly V1.** ADR 037's typed-table default is
+`TableSpreadProjection { spread_factor: 4, prefix_bits: 16 }`;
+append-only inherits the same defaults. AppendOnly identity
+is `commit_hlc`-derived and therefore not known to the
+client at routing time, so per-row identity-derived locality
+(`IdentityProjection`, `ColumnProjection`) cannot give
+client-side routing a stable answer. AppendOnly resolves
+this by computing locality from retry-stable write context
+(`parent_write_id`) under §4a — a value the client and
+server both see in the request meta. Descriptor validation
+rejects `AppendOnly + IdentityProjection` and
+`AppendOnly + ColumnProjection` for V1; their retry-stable
+routing semantics under HLC-derived identity are out of
+scope for this ADR.
+
+**Why request-level locality, not per-row.** AppendOnly
+ingest is batch-shaped and scan-read; clustering rows of
+one logical write together is the natural shape. The
+spread bucket varies per `parent_write_id`, so distinct
+writes still distribute across the table-spread prefix
+space. Per-row locality variation would re-introduce the
+client/server divergence the §4a contract exists to
+eliminate.
 
 **Why no descriptor-fingerprint split.** ADR 045 changes
 the *logical* schema (a new way of identifying rows).
@@ -579,11 +712,6 @@ audit-trail / GDPR sweeps land with the follow-up ADR.
   HLC column (`__row_hlc__`) is the visible timing
   carrier. Tenants who need timing-independent identity
   use the future content-hash policy.
-- **Payload hash CPU cost on every row.** The write path
-  computes a canonical row hash in addition to the final
-  `key_identity`. For wide event rows (10s of KB) this is
-  measurable. Open question 1 surfaces whether the hash
-  remains in V1.
 - **No low-latency single-row fast path.** V1 forces
   multi-row layout even for one-row flushes. This is the
   right trade for V1; tenants who want low-latency
@@ -636,11 +764,13 @@ audit-trail / GDPR sweeps land with the follow-up ADR.
   reconciliation, and snapshot state for no V1 benefit
   the CDC ADR cannot supply later from `__row_hlc__` /
   `__row_key_id__` alone.
-- **`key_identity = BLAKE3(writer_node_id || row_hlc ||
-  intra_batch_index)` only** (no payload hash). Kept the
-  payload hash for V1 diagnostics; if Phase-7 benches
-  show BLAKE3-on-row dominates ingest CPU, this is the
-  cleanest simplification to revisit.
+- **`key_identity = BLAKE3(... || row_payload_hash)`**
+  (earlier draft kept a canonical row payload hash in
+  the preimage as defence-in-depth). Phase 7 benches
+  showed BLAKE3-on-payload dominated wide-row admission
+  CPU and the hash contributed nothing to uniqueness;
+  the preimage now omits it. See Rationale and Open
+  question 1.
 - **Reuse PK-keyed tables with a synthetic UUID column.**
   Forces users to invent identity at write time; doubles
   row width; doesn't address supersession-doesn't-apply.
@@ -695,12 +825,19 @@ audit-trail / GDPR sweeps land with the follow-up ADR.
 These defer to bench / implementer-discovery / council /
 follow-up ADR. None are contract-level.
 
-1. **Should the payload hash remain in the identity
-   preimage?** Write-context-only identity is cheaper and
-   still correct; the hash binds identity to row bytes
-   for diagnostics. Bench-resolvable — if BLAKE3-on-row
-   CPU dominates ingest on representative wide-row
-   workloads, drop the hash.
+1. ~~**Should the payload hash remain in the identity
+   preimage?**~~ **Resolved (Phase 7, 2026-04):** dropped.
+   Phase 7 benches showed BLAKE3-on-payload dominated
+   wide-row admission CPU (per-row gap scaled linearly
+   with payload size: ~0.011 µs at 0 B → ~0.879 µs at
+   1024 B), while identity-synthesis stayed flat at
+   ~0.127 µs. Payload hash contributed nothing to
+   uniqueness (which is rooted in `(writer_node_id,
+   row_hlc, intra_batch_index)` given monotonic leader
+   commit HLC), so it was removed from the preimage.
+   `canonical_row_payload_hash` and the
+   `storage_append_only_payload_hash_micros` metric were
+   both deleted. See §4 and Rationale.
 2. **Should `IntraBatchIndex` be `u32` or `u64`?** `u32`
    gives 4 G rows per writer per HLC tick — comfortable
    for any plausible workload but a hard ceiling.

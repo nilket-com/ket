@@ -13,15 +13,27 @@ const PENDING_FINALIZATIONS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_v1");
 const PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_by_write_id_v1");
-const WRITE_ID_KEY_LEN: usize = std::mem::size_of::<ClientWriteId>();
+// Secondary-index key shape: canonical idempotency bytes only
+// (`client_uuid` + `sequence_no`), per the contract documented at
+// `src/schema/core.rs`. `idempotency_ttl_ms` and `_pad` are not
+// part of identity and must not be hashed in. The store's existing
+// open-time self-heal (clear `by_write_id` and re-insert from
+// primary) handles the on-disk migration: a redb opened against an
+// older 32-byte-keyed index is rebuilt with the 24-byte shape on
+// the next open without a table-name version bump.
+const WRITE_ID_KEY_LEN: usize = 24;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PendingFinalizationId([u8; 32]);
 
 impl PendingFinalizationId {
 	pub fn for_record(write_id: ClientWriteId, finalization: &TenantFinalization) -> Self {
+		// Hash the canonical idempotency identity only; TTL / pad
+		// are not part of `ClientWriteId` identity (see
+		// `src/schema/core.rs` and the architecture guard).
+		let canonical = write_id.canonical_idempotency_bytes();
 		Self(crate::hash::sha256::digest_many(&[
-			bytemuck::bytes_of(&write_id),
+			&canonical,
 			bytemuck::bytes_of(&finalization.tenant_id),
 			finalization.key_identity.as_bytes(),
 			bytemuck::bytes_of(&finalization.marker),
@@ -207,7 +219,14 @@ impl PendingFinalizationStore {
 				return Ok(None);
 			};
 			let record = decode_pending_finalization_record(value.value())?;
-			if record.write_id != write_id {
+			// Defensive consistency check: secondary index value
+			// must point at a record whose `write_id` shares the
+			// canonical idempotency identity. TTL / pad may drift
+			// across retries (the index is keyed on canonical
+			// bytes only), so do not compare the full struct.
+			if record.write_id.canonical_idempotency_bytes()
+				!= write_id.canonical_idempotency_bytes()
+			{
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					"pending-finalization secondary index returned a mismatched write_id",
@@ -284,11 +303,12 @@ impl PendingFinalizationStore {
 					.map_err(redb_to_io)?
 					.is_some();
 				let replacement_id = if let Some(record) = removed_record.as_ref() {
+					let canonical = record.write_id.canonical_idempotency_bytes();
 					let mut replacement = None;
 					for entry in table.iter().map_err(redb_to_io)? {
 						let (_key, value) = entry.map_err(redb_to_io)?;
 						let candidate = decode_pending_finalization_record(value.value())?;
-						if candidate.write_id == record.write_id {
+						if candidate.write_id.canonical_idempotency_bytes() == canonical {
 							replacement = Some(candidate.id);
 							break;
 						}
@@ -375,9 +395,7 @@ fn decode_pending_finalization_record(bytes: &[u8]) -> std::io::Result<PendingFi
 }
 
 fn encode_write_id_key(write_id: ClientWriteId) -> [u8; WRITE_ID_KEY_LEN] {
-	let mut out = [0u8; WRITE_ID_KEY_LEN];
-	out.copy_from_slice(bytemuck::bytes_of(&write_id));
-	out
+	write_id.canonical_idempotency_bytes()
 }
 
 fn pending_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<PendingFinalizationStore>>> {
@@ -456,6 +474,57 @@ mod tests {
 				.await
 				.unwrap()
 				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn for_record_ignores_idempotency_ttl_and_pad() {
+		// Same canonical identity (`client_uuid`, `sequence_no`),
+		// drifted TTL / pad — must yield the same id. Otherwise a
+		// retry that beats the in-memory idempotency cache (post-
+		// eviction or post-restart) would produce a fresh
+		// finalization id and miss `find_by_write_id`'s replay
+		// path. Pre-canonicalization (Phase 8 follow-up), the id
+		// was hashed off the full 32-byte struct, folding TTL /
+		// pad into the id and breaking retry convergence.
+		let base = ClientWriteId {
+			client_uuid: [9; 16],
+			sequence_no: 7,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		};
+		let drifted = ClientWriteId {
+			idempotency_ttl_ms: 30_000,
+			_pad: 0xDEAD_BEEF,
+			..base
+		};
+		let finalization = record().finalization;
+		assert_eq!(
+			PendingFinalizationId::for_record(base, &finalization),
+			PendingFinalizationId::for_record(drifted, &finalization),
+			"PendingFinalizationId must depend only on the canonical \
+			 idempotency identity (`client_uuid` + `sequence_no`)"
+		);
+	}
+
+	#[tokio::test]
+	async fn find_by_write_id_matches_across_idempotency_ttl_drift() {
+		// Upsert a record with one TTL; look it up with a retry
+		// that carries the same canonical identity but a drifted
+		// TTL. The redb secondary index key shape must depend only
+		// on canonical bytes.
+		let store = PendingFinalizationStore::open(temp_path("ttl-drift")).unwrap();
+		let record = record();
+		store.upsert(record.clone()).await.unwrap();
+		let drifted_write_id = ClientWriteId {
+			idempotency_ttl_ms: 12_345,
+			_pad: 0xAAAA,
+			..record.write_id
+		};
+		assert_eq!(
+			store.find_by_write_id(drifted_write_id).await.unwrap(),
+			Some(record),
+			"find_by_write_id must match across drifted TTL"
 		);
 	}
 

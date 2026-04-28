@@ -75,13 +75,14 @@ use crate::schema::{
 	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
-	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, SlabId,
-	StreamFinalizationRequestMeta, TableQueryRequestMeta, TableReplicaWriteMeta,
+	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy, SlabId,
+	StreamFinalizationRequestMeta, TableObjectId, TableQueryRequestMeta, TableReplicaWriteMeta,
 	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TableWriteValidationError, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
-	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
-	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
+	WriterNodeId, column_projection_predicate_ranges, column_projection_prefix_ranges,
+	encode_aggregate_state, migration_record_schema, pbc, query_request_stats_pruning_enabled,
+	read_key_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
+	write_payload_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -96,6 +97,7 @@ use crate::storage::multirow::{
 	decode_batch, encode_batch, encode_batch_with_policy, has_storage_synthetic_columns,
 	materialize_record_location_batch, pack_admitted_record_batch_by_bucket,
 	replace_storage_row_hlc_column, storage_index_entries_from_batch,
+	storage_row_table_object_id_at,
 };
 use crate::storage::stats::{
 	COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED,
@@ -6593,6 +6595,8 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		mut bifurcated: BifurcatedTableWrite,
 		mut groups: Vec<TableReplicaGroup>,
+		commit_hlc: HybridTimestamp,
+		is_append_only: bool,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
@@ -6660,7 +6664,13 @@ impl WendelonDataServer {
 			}
 		}
 
-		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+		// `commit_hlc` was stamped by the caller (see ADR 045 plumbing
+		// in `table_write`) and already used during admission and
+		// multi-row packing. The restamp call below is now a defensive
+		// idempotent guard — it rewrites `__row_hlc__` to the same HLC
+		// that admission consumed, so it's effectively a no-op for the
+		// table-write path. Kept in place to defend against any future
+		// caller that reaches this function without pre-stamping.
 		let record_body_compression_policy = bifurcated.record_body_compression_policy;
 		restamp_table_write_commit_hlc(
 			&mut bifurcated,
@@ -6828,6 +6838,16 @@ impl WendelonDataServer {
 		}
 		metrics().observe_durable_quorum_latency(durable_quorum_started.elapsed());
 
+		// ADR 045 Phase 8: append-only batch / row counters fire on
+		// the server's success path only — after lease gate,
+		// idempotency replay, quota enforcement, and durable quorum
+		// have all cleared. The earlier idempotency-replay branch
+		// returned early without reaching this point, so a retry
+		// against a cached outcome cannot double-count.
+		if is_append_only {
+			metrics().observe_storage_append_only_batch(meta.decoded_row_count() as u64);
+		}
+
 		let pending = self.pending_finalization_record_for_table(&meta, &bifurcated, commit_hlc);
 		let _pending_claim = self
 			.try_claim_pending_finalization(pending.id)
@@ -6961,19 +6981,35 @@ impl WendelonDataServer {
 			));
 		};
 
-		let bifurcated = match bifurcate_table_write(&meta, &payload, &descriptor) {
-			Ok(bifurcated) => bifurcated,
-			Err(err) => {
-				return Ok((
-					self.table_write_error_response(
-						&meta,
-						table_write_status_for_reject(err.code),
-						err.code,
-					),
-					None,
-				));
-			}
-		};
+		// ADR 045: stamp the leader-merged commit HLC *before*
+		// admission. The HLC driver guarantees `merge` returns a
+		// strictly monotonic HLC per leader call, so two batches
+		// from the same admitting node are guaranteed to receive
+		// distinct row HLCs even when the client supplies
+		// identical `client_hlc` values. This HLC then feeds the
+		// append-only identity preimage AND the persisted
+		// `__row_hlc__` column — they must agree.
+		let commit_hlc = self.merge_commit_hlc(meta.client_hlc);
+		// ADR 045 §4 / Phase 8: bind WriterNodeId from the admitting
+		// server's authenticated NodeId (ADR 018 mTLS). Not from
+		// `meta.proxy_source`, which the wire contract zeros on
+		// direct SDK writes.
+		let writer_node_id = WriterNodeId::from_node_id(self.local_node);
+
+		let bifurcated =
+			match bifurcate_table_write(&meta, &payload, &descriptor, writer_node_id, commit_hlc) {
+				Ok(bifurcated) => bifurcated,
+				Err(err) => {
+					return Ok((
+						self.table_write_error_response(
+							&meta,
+							table_write_status_for_reject(err.code),
+							err.code,
+						),
+						None,
+					));
+				}
+			};
 		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
 			return Ok((
 				self.table_write_error_response(
@@ -6984,8 +7020,9 @@ impl WendelonDataServer {
 				None,
 			));
 		};
+		let is_append_only = descriptor.is_append_only();
 		let (write, trailing) = self
-			.write_table_bifurcated(meta, bifurcated, groups)
+			.write_table_bifurcated(meta, bifurcated, groups, commit_hlc, is_append_only)
 			.await?;
 		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
 	}
@@ -7506,8 +7543,17 @@ async fn read_projected_query_location(
 	let Some(requirement) = projected_execution.requirement() else {
 		return Ok(None);
 	};
+	// ADR 045 §5 / Phase 8.5: descriptor-filtered AppendOnly
+	// queries need `__row_table_object_id__` available in the
+	// projected fetch so the projected fast path can verify the
+	// row's table-isolation binding before returning. Augment the
+	// requirement here; the projected fetch then either includes
+	// the column (if available on disk) or the verification step
+	// below returns `Ok(None)` so the caller falls back to the
+	// whole-record path that runs `table_record_matches_descriptor`.
+	let requirement = augment_requirement_for_descriptor_verification(requirement, descriptor);
 	let projected_read = match slab
-		.read_projected_record(location, descriptor, requirement)
+		.read_projected_record(location, descriptor, &requirement)
 		.await
 	{
 		Ok(Some(projected_read)) => projected_read,
@@ -7517,6 +7563,9 @@ async fn read_projected_query_location(
 	};
 	let projected =
 		materialize_projected_location_batch(projected_read.projected, location.record_row_index)?;
+	if !projected_descriptor_match(descriptor, &projected)? {
+		return Ok(None);
+	}
 	match projected_execution {
 		QueryProjectedExecution::Disabled => Ok(None),
 		QueryProjectedExecution::Pbc {
@@ -7541,8 +7590,14 @@ async fn read_aggregate_query_location(
 	requirement: &ColumnFetchRequirement,
 	user_column_count: usize,
 ) -> std::io::Result<Option<RecordBatch>> {
+	// ADR 045 §5 / Phase 8.5: ensure descriptor-filtered AppendOnly
+	// queries fetch `__row_table_object_id__` so the projected fast
+	// path can verify the row's table-isolation binding. See
+	// `read_projected_query_location` for the same plumbing.
+	let augmented_requirement =
+		augment_requirement_for_descriptor_verification(requirement, descriptor);
 	match slab
-		.read_projected_record(location, descriptor, requirement)
+		.read_projected_record(location, descriptor, &augmented_requirement)
 		.await
 	{
 		Ok(Some(projected_read)) => {
@@ -7550,13 +7605,20 @@ async fn read_aggregate_query_location(
 				projected_read.projected,
 				location.record_row_index,
 			)?;
-			return execute_aggregate_projected_record_batch(
-				&projected,
-				program,
-				requirement,
-				user_column_count,
-			)
-			.map(Some);
+			if !projected_descriptor_match(descriptor, &projected)? {
+				// Verification failed (e.g., AppendOnly row from a
+				// sibling descriptor with a colliding table-spread
+				// prefix). Fall back to the whole-record path which
+				// runs the trusted `table_record_matches_descriptor`.
+			} else {
+				return execute_aggregate_projected_record_batch(
+					&projected,
+					program,
+					requirement,
+					user_column_count,
+				)
+				.map(Some);
+			}
 		}
 		Ok(None) => {}
 		Err(err) if projected_query_can_use_whole_record_fallback(&err) => {}
@@ -7568,6 +7630,15 @@ async fn read_aggregate_query_location(
 	let storage_batch = decode_batch(&bytes)?;
 	let storage_row_count = storage_batch.num_rows();
 	let was_multirow = has_storage_synthetic_columns(&storage_batch);
+	// ADR 045 Phase 8: extract per-row table_object_id from the
+	// unstripped storage batch before materializing the user batch
+	// — needed for AppendOnly descriptor isolation across
+	// table-spread prefix collisions.
+	let stored_table_object_id = if was_multirow {
+		storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
+	} else {
+		None
+	};
 	let batch = materialize_record_location_batch(&storage_batch, location.record_row_index)?;
 	if was_multirow {
 		metrics().observe_storage_multirow_decode(
@@ -7581,7 +7652,14 @@ async fn read_aggregate_query_location(
 				.inc();
 		}
 	}
-	if !table_record_matches_descriptor(meta, descriptor, key_identity, locality, &batch)? {
+	if !table_record_matches_descriptor(
+		meta,
+		descriptor,
+		key_identity,
+		locality,
+		stored_table_object_id,
+		&batch,
+	)? {
 		return Ok(None);
 	}
 	execute_aggregate_full_record_batch(&batch, program, requirement).map(Some)
@@ -7608,6 +7686,85 @@ fn projected_query_can_use_whole_record_fallback(error: &Error) -> bool {
 				ColumnFetchError::SchemaMismatch { .. } | ColumnFetchError::UnsupportedArrowLayout
 			)
 		})
+}
+
+/// ADR 045 §5 / Phase 8.5 — return a `ColumnFetchRequirement`
+/// extended with the synthetic columns the projected fast path
+/// needs to verify a row belongs to the requested descriptor.
+///
+/// All multi-row descriptors (PK + AppendOnly) stamp
+/// `__row_table_object_id__` on every row, so the projected fetch
+/// must include it for descriptor-filtered queries. Single-row
+/// descriptors carry no synthetic columns at all; the augmentation
+/// is a no-op there and `projected_descriptor_match` returns
+/// `Ok(false)` so the caller falls back to the whole-record path.
+fn augment_requirement_for_descriptor_verification(
+	requirement: &ColumnFetchRequirement,
+	descriptor: &TableSchemaDescriptorV1,
+) -> ColumnFetchRequirement {
+	if !descriptor.record_layout_policy.is_multi_row() {
+		return requirement.clone();
+	}
+	let mut augmented = requirement.clone();
+	augmented
+		.storage_columns
+		.insert(crate::storage::columnar::StorageColumn::RowTableObjectId);
+	augmented
+}
+
+/// ADR 045 §5 / Phase 8.5 — verify the projected fast path's
+/// returned row belongs to the requested descriptor.
+///
+/// Confirms the stored `__row_table_object_id__` column equals
+/// `descriptor.table_object_id`. Both PK and AppendOnly multi-row
+/// descriptors stamp this column on every row, so the projected
+/// path can byte-compare instead of re-deriving identity.
+///
+/// If the column is missing (single-row record, which carries no
+/// synthetic columns), returns `Ok(false)` so the caller falls
+/// back to the whole-record path that runs the trusted
+/// `table_record_matches_descriptor`. Single-row PK queries pay
+/// the fallback cost; we can re-add a projected-PK fast path
+/// later if profiling motivates it.
+fn projected_descriptor_match(
+	descriptor: &TableSchemaDescriptorV1,
+	projected: &ProjectedRecordBatch,
+) -> std::io::Result<bool> {
+	let Some(physical) =
+		projected.storage_physical_for(crate::storage::columnar::StorageColumn::RowTableObjectId)
+	else {
+		// Single-row record (no synthetic columns) or otherwise
+		// missing — force whole-record fallback so the trusted
+		// matcher decides.
+		return Ok(false);
+	};
+	let array = projected
+		.batch
+		.column(physical)
+		.as_any()
+		.downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"__row_table_object_id__ column has unexpected Arrow type",
+			)
+		})?;
+	if array.is_empty() {
+		return Ok(false);
+	}
+	let bytes = array.value(0);
+	if bytes.len() != 16 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"__row_table_object_id__ has unexpected width: {}",
+				bytes.len()
+			),
+		));
+	}
+	let mut id_bytes = [0u8; 16];
+	id_bytes.copy_from_slice(bytes);
+	Ok(TableObjectId::new(id_bytes) == descriptor.table_object_id)
 }
 
 fn materialize_projected_location_batch(
@@ -8087,6 +8244,11 @@ async fn plan_query_execution_for_ranges_with_program(
 			let storage_batch = decode_batch(&bytes)?;
 			let storage_row_count = storage_batch.num_rows();
 			let was_multirow = has_storage_synthetic_columns(&storage_batch);
+			let stored_table_object_id = if was_multirow {
+				storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
+			} else {
+				None
+			};
 			let batch =
 				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
 			if was_multirow {
@@ -8114,6 +8276,7 @@ async fn plan_query_execution_for_ranges_with_program(
 					descriptor,
 					key_identity,
 					locality,
+					stored_table_object_id,
 					&batch,
 				)? {
 					continue;
@@ -8222,6 +8385,7 @@ fn table_record_matches_descriptor(
 	descriptor: &TableSchemaDescriptorV1,
 	key_identity: Identity,
 	locality: Locality,
+	stored_table_object_id: Option<TableObjectId>,
 	batch: &RecordBatch,
 ) -> std::io::Result<bool> {
 	if batch.num_rows() != 1 {
@@ -8230,15 +8394,58 @@ fn table_record_matches_descriptor(
 	if batch.schema().as_ref() != &descriptor.arrow_schema()? {
 		return Ok(false);
 	}
-	let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
-	table_meta.tenant_id = meta.tenant_id;
-	table_meta.table_object_id = descriptor.table_object_id;
-	table_meta.schema_generation = descriptor.schema_generation;
-	table_meta.row_count = 1;
-	let admission = validate_table_write_request_batch(&table_meta, batch, descriptor)
-		.map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
-	Ok(admission.key_identities.as_slice() == [key_identity]
-		&& admission.localities.as_slice() == [locality])
+	match &descriptor.row_identity_policy {
+		// PK-keyed: re-derive identity from the user batch and
+		// confirm it matches the stored synthetic columns. PK
+		// identity is `(tenant_id, table_object_id)`-bound through
+		// the canonical PK preimage, so re-derivation gives table
+		// isolation for free. Phase 8 also stamps
+		// `__row_table_object_id__` on multi-row PK rows; when
+		// present, use it for an early fail before the (more
+		// expensive) PK re-derivation.
+		RowIdentityPolicy::PrimaryKey(_) => {
+			if let Some(stored) = stored_table_object_id
+				&& stored != descriptor.table_object_id
+			{
+				return Ok(false);
+			}
+			let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+			table_meta.tenant_id = meta.tenant_id;
+			table_meta.table_object_id = descriptor.table_object_id;
+			table_meta.schema_generation = descriptor.schema_generation;
+			table_meta.row_count = 1;
+			// PK identity does not depend on writer / row_hlc.
+			let zero_hlc = HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			};
+			let admission = validate_table_write_request_batch(
+				&table_meta,
+				batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				zero_hlc,
+			)
+			.map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+			Ok(admission.key_identities.as_slice() == [key_identity]
+				&& admission.localities.as_slice() == [locality])
+		}
+		// AppendOnly: identity is engine-synthesized at write
+		// time from `(writer_node_id, commit_hlc,
+		// intra_batch_index)` and is not recoverable from the
+		// user batch alone. Locality is request-level (§4a) and
+		// depends on `parent_write_id`, which the matcher does
+		// not see. Phase 8 binds rows back to their descriptor
+		// via the per-row `__row_table_object_id__` synthetic
+		// column — verify equality with `descriptor.table_object_id`
+		// so cross-table table-spread prefix collisions cannot
+		// leak rows across descriptors.
+		RowIdentityPolicy::AppendOnly => {
+			let _ = (meta, key_identity, locality);
+			Ok(stored_table_object_id == Some(descriptor.table_object_id))
+		}
+	}
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -9101,7 +9308,10 @@ fn table_write_parent_identity(meta: &TableWriteRequestMeta) -> Identity {
 	hasher.update(b"wendelon.table-write-parent.v1");
 	hasher.update(&meta.tenant_id.get().to_le_bytes());
 	hasher.update(meta.table_object_id.as_bytes());
-	hasher.update(bytemuck::bytes_of(&meta.parent_write_id));
+	// Canonical idempotency bytes only (no TTL / pad). A retry-
+	// stable parent identity must agree across retries with
+	// drifted `idempotency_ttl_ms`.
+	hasher.update(&meta.parent_write_id.canonical_idempotency_bytes());
 	hasher.update(&meta.schema_generation.to_le_bytes());
 	hasher.update(&(meta.decoded_row_count() as u64).to_le_bytes());
 	Identity::new(*hasher.finalize().as_bytes())
@@ -9552,17 +9762,28 @@ fn bifurcate_client_write(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Bifurcate an admitted client table write into per-record
+/// children.
+///
+/// `row_hlc` is the leader-merged commit HLC the caller has
+/// already stamped via `HybridLogicalClockDriver::merge`. ADR
+/// 045 admission feeds it into the append-only identity
+/// preimage; the multi-row packer stamps it into the persisted
+/// `__row_hlc__` column. The two MUST agree.
 fn bifurcate_table_write(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
+	writer_node_id: WriterNodeId,
+	row_hlc: HybridTimestamp,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let observe_encode = matches!(
 		&descriptor.locality_policy,
 		LocalityPolicyV1::ColumnProjection(_)
 	);
 	let encode_started = Instant::now();
-	let admission = validate_table_write_request_batch(meta, batch, descriptor);
+	let admission =
+		validate_table_write_request_batch(meta, batch, descriptor, writer_node_id, row_hlc);
 	if observe_encode {
 		metrics().observe_pbc_locality_encode(encode_started.elapsed());
 	}
@@ -9594,13 +9815,8 @@ fn bifurcate_table_write(
 			}
 		}
 		RecordLayoutPolicy::MultiRow(_) => {
-			let packed = pack_admitted_record_batch_by_bucket(
-				meta,
-				descriptor,
-				batch,
-				&admission,
-				meta.client_hlc,
-			)?;
+			let packed =
+				pack_admitted_record_batch_by_bucket(meta, descriptor, batch, &admission, row_hlc)?;
 			children.reserve(packed.len());
 			for record in packed {
 				let frame_bytes = Arc::new(record.frame_bytes);
@@ -9723,12 +9939,12 @@ mod tests {
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
 		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, LocalityPolicyV1,
 		LocalityRange, LocationCount, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-		ProjectionFunctionV1, RecordLayoutPolicy, RowCount, STORAGE_ROW_HLC_COLUMN,
-		STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1,
-		SlabRecordHeader, TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
-		column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
-		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
-		write_payload_schema,
+		ProjectionFunctionV1, RecordLayoutPolicy, RowCount, RowIdentityPolicy,
+		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+		SchemaEvolutionPolicyV1, SlabRecordHeader, TableObjectId, TableSchemaCatalogV1,
+		TableSpreadLocalityDescriptorV1, column_projection_prefix_ranges,
+		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
+		table_spread_prefix_ranges, write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
@@ -9775,7 +9991,7 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -9805,7 +10021,7 @@ mod tests {
 			"analytics",
 			"identity_events",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -9819,7 +10035,7 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![ClusteringColumnSpecV1 {
 					name: "id".to_owned(),
@@ -9860,7 +10076,14 @@ mod tests {
 		for id in 0_i64..10_000 {
 			let batch = typed_table_batch(vec![id]);
 			let meta = typed_table_meta(descriptor, 1);
-			let admission = validate_table_write_request_batch(&meta, &batch, descriptor).unwrap();
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				meta.client_hlc,
+			)
+			.unwrap();
 			let bucket = admission.localities[0];
 			let ids = buckets.entry(bucket).or_default();
 			ids.push(id);
@@ -10227,8 +10450,14 @@ mod tests {
 		write_meta.table_object_id = descriptor.table_object_id;
 		write_meta.schema_generation = descriptor.schema_generation;
 		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
-			.expect("typed rows should validate");
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.expect("typed rows should validate");
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_batch(&row_batch).unwrap();
@@ -11086,7 +11315,14 @@ mod tests {
 		let descriptor = typed_table_descriptor();
 		let batch = typed_table_batch(vec![7, 8]);
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
-		let bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		let bifurcated = bifurcate_table_write(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 
 		assert_eq!(bifurcated.children.len(), 2);
 		assert_eq!(
@@ -11143,7 +11379,14 @@ mod tests {
 		let source_ids = same_multirow_locality_ids(&descriptor, 3);
 		let batch = typed_table_batch(source_ids.clone());
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
-		let bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		let bifurcated = bifurcate_table_write(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 
 		assert_eq!(bifurcated.children.len(), 1);
 		assert_eq!(bifurcated.record_count, 1);
@@ -11197,9 +11440,22 @@ mod tests {
 
 		let uncompressed_meta = typed_table_meta(&uncompressed_descriptor, batch.num_rows());
 		let lz4_meta = typed_table_meta(&lz4_descriptor, batch.num_rows());
-		let uncompressed =
-			bifurcate_table_write(&uncompressed_meta, &batch, &uncompressed_descriptor).unwrap();
-		let lz4 = bifurcate_table_write(&lz4_meta, &batch, &lz4_descriptor).unwrap();
+		let uncompressed = bifurcate_table_write(
+			&uncompressed_meta,
+			&batch,
+			&uncompressed_descriptor,
+			WriterNodeId::ZERO,
+			uncompressed_meta.client_hlc,
+		)
+		.unwrap();
+		let lz4 = bifurcate_table_write(
+			&lz4_meta,
+			&batch,
+			&lz4_descriptor,
+			WriterNodeId::ZERO,
+			lz4_meta.client_hlc,
+		)
+		.unwrap();
 
 		assert_eq!(
 			uncompressed.charged_bytes,
@@ -11251,7 +11507,7 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(projection.clone()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -11287,7 +11543,7 @@ mod tests {
 			"analytics",
 			"events",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::ColumnProjection(projection.clone()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -11322,8 +11578,14 @@ mod tests {
 		write_meta.table_object_id = descriptor.table_object_id;
 		write_meta.schema_generation = descriptor.schema_generation;
 		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
-			.expect("typed rows should validate");
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.expect("typed rows should validate");
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_batch(&row_batch).unwrap();
@@ -11480,8 +11742,14 @@ mod tests {
 		write_meta.table_object_id = descriptor.table_object_id;
 		write_meta.schema_generation = descriptor.schema_generation;
 		write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
-		let admission = validate_table_write_request_batch(&write_meta, &batch, &descriptor)
-			.expect("typed rows should validate");
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.expect("typed rows should validate");
 		for row in 0..batch.num_rows() {
 			let row_batch = batch.slice(row, 1);
 			let frame = encode_batch(&row_batch).unwrap();
@@ -11944,7 +12212,14 @@ mod tests {
 		let descriptor = typed_table_descriptor();
 		let batch = typed_table_batch(vec![7, 7]);
 		let meta = typed_table_meta(&descriptor, batch.num_rows());
-		let err = bifurcate_table_write(&meta, &batch, &descriptor).unwrap_err();
+		let err = bifurcate_table_write(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap_err();
 		assert_eq!(err.code, PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 	}
 
@@ -12156,7 +12431,14 @@ mod tests {
 		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
 		meta.parent_write_id.sequence_no = 56;
 		meta.await_finalization = 1;
-		let expected_bifurcated = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		let expected_bifurcated = bifurcate_table_write(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		let (resp, trailing) = node
 			.data_server
 			.table_write(meta, batch.clone())
@@ -12533,7 +12815,7 @@ mod tests {
 			"analytics",
 			"full_scan",
 			&typed_table_schema(),
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -13135,8 +13417,14 @@ mod tests {
 		write_meta.table_object_id = descriptor.table_object_id;
 		write_meta.schema_generation = descriptor.schema_generation;
 		write_meta.row_count = encode_table_write_row_count(replacement.num_rows()).unwrap();
-		let admission =
-			validate_table_write_request_batch(&write_meta, &replacement, &descriptor).unwrap();
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&replacement,
+			&descriptor,
+			WriterNodeId::ZERO,
+			write_meta.client_hlc,
+		)
+		.unwrap();
 		let frame = encode_batch(&replacement).unwrap();
 		mgr.append_durable_with_locality(
 			tenant(),
@@ -13320,7 +13608,14 @@ mod tests {
 		let batch = typed_table_batch(vec![7, 8]);
 		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
 		meta.parent_write_id.sequence_no = 58;
-		let expected = bifurcate_table_write(&meta, &batch, &descriptor).unwrap();
+		let expected = bifurcate_table_write(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
 		assert_eq!(expected.children.len(), 2);
 
 		let pool = leader_node.pool.clone();
@@ -16863,5 +17158,337 @@ mod tests {
 		);
 
 		node.handles.abort();
+	}
+
+	// ============================================================
+	//  ADR 045 Phase 8.5 — projected fast path AppendOnly
+	//  table-isolation verification
+	// ============================================================
+
+	#[test]
+	fn augment_requirement_includes_table_object_id_for_append_only() {
+		use crate::schema::TenantId;
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x45; 16]),
+			1,
+			"analytics",
+			"events",
+			&arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+				"value",
+				arrow::datatypes::DataType::Int64,
+				false,
+			)]),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let _ = TenantId::new(7);
+		let req = ColumnFetchRequirement::default();
+		let augmented = augment_requirement_for_descriptor_verification(&req, &descriptor);
+		assert!(
+			augmented
+				.storage_columns
+				.contains(crate::storage::columnar::StorageColumn::RowTableObjectId),
+			"AppendOnly descriptor-filtered fetch must include `__row_table_object_id__`"
+		);
+	}
+
+	#[test]
+	fn augment_requirement_includes_table_object_id_for_pk_multirow() {
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x44; 16]),
+			1,
+			"analytics",
+			"events_pk",
+			&arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+			]),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let req = ColumnFetchRequirement::default();
+		let augmented = augment_requirement_for_descriptor_verification(&req, &descriptor);
+		assert!(
+			augmented
+				.storage_columns
+				.contains(crate::storage::columnar::StorageColumn::RowTableObjectId),
+			"multi-row PK descriptor must pull `__row_table_object_id__` into the projected \
+			 fetch — Phase 8 stamps it on every multi-row record (PK + AppendOnly)"
+		);
+	}
+
+	#[test]
+	fn augment_requirement_unchanged_for_pk_single_row() {
+		let descriptor = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x46; 16]),
+			1,
+			"analytics",
+			"events_pk_single",
+			&arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+			]),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let req = ColumnFetchRequirement::default();
+		let augmented = augment_requirement_for_descriptor_verification(&req, &descriptor);
+		assert!(
+			!augmented
+				.storage_columns
+				.contains(crate::storage::columnar::StorageColumn::RowTableObjectId),
+			"single-row PK records carry no synthetic columns; descriptor-filtered fetch \
+			 must not pull a column that is not on disk"
+		);
+	}
+
+	#[test]
+	fn projected_match_falls_back_when_table_object_id_column_missing() {
+		// AppendOnly descriptor + projected batch without
+		// `__row_table_object_id__` (e.g., a sibling PK record
+		// under a colliding table-spread prefix). The verifier
+		// must return false so the caller falls back to the
+		// whole-record path.
+		use std::collections::BTreeMap;
+		use std::sync::Arc;
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x45; 16]),
+			1,
+			"analytics",
+			"events",
+			&arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+				"value",
+				arrow::datatypes::DataType::Int64,
+				false,
+			)]),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let batch = arrow::record_batch::RecordBatch::try_new(
+			Arc::new(arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+			])),
+			vec![Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef],
+		)
+		.unwrap();
+		let projected = ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: crate::storage::columnar::ColumnOrdinalMapping::default(),
+			storage_mapping: BTreeMap::new(),
+		};
+		let result = projected_descriptor_match(&descriptor, &projected).unwrap();
+		assert!(
+			!result,
+			"AppendOnly projected verifier must force fallback when \
+			 `__row_table_object_id__` is absent from the projected fetch"
+		);
+	}
+
+	#[test]
+	fn projected_match_rejects_mismatched_table_object_id() {
+		use std::collections::BTreeMap;
+		use std::sync::Arc;
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x45; 16]),
+			1,
+			"analytics",
+			"events_a",
+			&arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+				"value",
+				arrow::datatypes::DataType::Int64,
+				false,
+			)]),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		// Stored row's table_object_id stamped from a *different*
+		// AppendOnly table (same tenant, same Arrow schema,
+		// colliding table-spread prefix would put them on the
+		// same range).
+		let stored_id = [0xBB_u8; 16];
+		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
+		id_builder.append_value(&stored_id).unwrap();
+		let id_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
+		let value_array =
+			Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef;
+		let batch = arrow::record_batch::RecordBatch::try_new(
+			Arc::new(arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+				arrow::datatypes::Field::new(
+					"__row_table_object_id__",
+					arrow::datatypes::DataType::FixedSizeBinary(16),
+					false,
+				),
+			])),
+			vec![value_array, id_array],
+		)
+		.unwrap();
+		let mut storage_mapping = BTreeMap::new();
+		storage_mapping.insert(crate::storage::columnar::StorageColumn::RowTableObjectId, 1);
+		let projected = ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: crate::storage::columnar::ColumnOrdinalMapping::default(),
+			storage_mapping,
+		};
+		let result = projected_descriptor_match(&descriptor, &projected).unwrap();
+		assert!(
+			!result,
+			"AppendOnly projected verifier must reject rows stamped with a \
+			 different table_object_id than the candidate descriptor"
+		);
+	}
+
+	#[test]
+	fn projected_match_rejects_pk_multirow_with_mismatched_table_object_id() {
+		use std::collections::BTreeMap;
+		use std::sync::Arc;
+		let schema = arrow::datatypes::Schema::new(vec![
+			arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
+			arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0xAA; 16]),
+			1,
+			"analytics",
+			"events_pk",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		// Row stamped with a sibling PK descriptor's table_object_id.
+		let stored_id = [0xBB_u8; 16];
+		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
+		id_builder.append_value(&stored_id).unwrap();
+		let stamp_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
+		let id_array = Arc::new(arrow::array::LargeBinaryArray::from(vec![&b"k1"[..]]))
+			as arrow::array::ArrayRef;
+		let value_array =
+			Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef;
+		let batch = arrow::record_batch::RecordBatch::try_new(
+			Arc::new(arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+				arrow::datatypes::Field::new(
+					"__row_table_object_id__",
+					arrow::datatypes::DataType::FixedSizeBinary(16),
+					false,
+				),
+			])),
+			vec![id_array, value_array, stamp_array],
+		)
+		.unwrap();
+		let mut storage_mapping = BTreeMap::new();
+		storage_mapping.insert(crate::storage::columnar::StorageColumn::RowTableObjectId, 2);
+		let projected = ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: crate::storage::columnar::ColumnOrdinalMapping::default(),
+			storage_mapping,
+		};
+		let result = projected_descriptor_match(&descriptor, &projected).unwrap();
+		assert!(
+			!result,
+			"PK multi-row projected verifier must reject rows stamped with a \
+			 different table_object_id (Phase 8 PK extension)"
+		);
+	}
+
+	#[test]
+	fn projected_match_accepts_same_table_object_id() {
+		use std::collections::BTreeMap;
+		use std::sync::Arc;
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x45; 16]),
+			1,
+			"analytics",
+			"events_a",
+			&arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+				"value",
+				arrow::datatypes::DataType::Int64,
+				false,
+			)]),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let stored_id = [0x45_u8; 16];
+		let mut id_builder = arrow::array::FixedSizeBinaryBuilder::with_capacity(1, 16);
+		id_builder.append_value(&stored_id).unwrap();
+		let id_array = Arc::new(id_builder.finish()) as arrow::array::ArrayRef;
+		let value_array =
+			Arc::new(arrow::array::Int64Array::from(vec![1])) as arrow::array::ArrayRef;
+		let batch = arrow::record_batch::RecordBatch::try_new(
+			Arc::new(arrow::datatypes::Schema::new(vec![
+				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+				arrow::datatypes::Field::new(
+					"__row_table_object_id__",
+					arrow::datatypes::DataType::FixedSizeBinary(16),
+					false,
+				),
+			])),
+			vec![value_array, id_array],
+		)
+		.unwrap();
+		let mut storage_mapping = BTreeMap::new();
+		storage_mapping.insert(crate::storage::columnar::StorageColumn::RowTableObjectId, 1);
+		let projected = ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: crate::storage::columnar::ColumnOrdinalMapping::default(),
+			storage_mapping,
+		};
+		let result = projected_descriptor_match(&descriptor, &projected).unwrap();
+		assert!(
+			result,
+			"AppendOnly projected verifier must accept rows stamped with the \
+			 same table_object_id as the candidate descriptor"
+		);
+	}
+
+	// ============================================================
+	//  ADR 045 Phase 8 idempotency canonicalization — retry-stable
+	//  derivations off `ClientWriteId` must hash only canonical
+	//  bytes (`client_uuid` + `sequence_no`).
+	// ============================================================
+
+	#[test]
+	fn table_write_parent_identity_ignores_idempotency_ttl_and_pad() {
+		let mut base: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		base.tenant_id = TenantId::new(11);
+		base.table_object_id = TableObjectId::new([0x91; 16]);
+		base.schema_generation = 5;
+		base.row_count = 3;
+		base.parent_write_id = ClientWriteId {
+			client_uuid: [0xAA; 16],
+			sequence_no: 17,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		};
+		let mut drifted = base;
+		drifted.parent_write_id.idempotency_ttl_ms = 12_345;
+		drifted.parent_write_id._pad = 0xDEAD_BEEF;
+		assert_eq!(
+			table_write_parent_identity(&base),
+			table_write_parent_identity(&drifted),
+			"table_write_parent_identity must depend only on the canonical \
+			 idempotency identity (`client_uuid` + `sequence_no`)"
+		);
 	}
 }

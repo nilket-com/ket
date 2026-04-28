@@ -19,11 +19,26 @@ fn main() -> std::io::Result<()> {
 		return Ok(());
 	}
 
+	// ADR 045: optional --storage-identity flag exposes the
+	// ADR 042 synthetic-column trio (`__row_hlc__`,
+	// `__row_key_id__`, `__row_routing_locality__`) to operators
+	// inspecting append-only or PK-keyed slabs. Default output
+	// remains user-column-only.
+	let mut show_storage_identity = false;
+	args.retain(|arg| {
+		if arg == "--storage-identity" {
+			show_storage_identity = true;
+			false
+		} else {
+			true
+		}
+	});
+
 	let (source, header, frame) = if args.first().map(String::as_str) == Some("--slab") {
 		if args.len() != 4 || args.get(2).map(String::as_str) != Some("--offset") {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
-				"expected: dump_slab_record --slab <path> --offset <byte-offset>",
+				"expected: dump_slab_record [--storage-identity] --slab <path> --offset <byte-offset>",
 			));
 		}
 		let path = args.remove(1);
@@ -45,13 +60,20 @@ fn main() -> std::io::Result<()> {
 		(path, None, frame)
 	};
 
-	dump_frame(&source, header, &frame)
+	dump_frame(&source, header, &frame, show_storage_identity)
 }
 
 fn print_usage() {
 	eprintln!("usage:");
-	eprintln!("  dump_slab_record <record-body.ipc>");
-	eprintln!("  dump_slab_record --slab <slab.wnd> --offset <byte-offset>");
+	eprintln!("  dump_slab_record [--storage-identity] <record-body.ipc>");
+	eprintln!("  dump_slab_record [--storage-identity] --slab <slab.wnd> --offset <byte-offset>");
+	eprintln!();
+	eprintln!("flags:");
+	eprintln!("  --storage-identity");
+	eprintln!("        Include the ADR 042 synthetic-column trio");
+	eprintln!("        (__row_hlc__, __row_key_id__,");
+	eprintln!("        __row_routing_locality__) in the row preview.");
+	eprintln!("        Default output is user-column-only.");
 }
 
 fn read_slab_record(path: &Path, offset: u64) -> std::io::Result<(SlabRecordHeader, Vec<u8>)> {
@@ -88,7 +110,12 @@ fn read_slab_record(path: &Path, offset: u64) -> std::io::Result<(SlabRecordHead
 	Ok((header, bytes[frame_start..frame_end].to_vec()))
 }
 
-fn dump_frame(source: &str, header: Option<SlabRecordHeader>, frame: &[u8]) -> std::io::Result<()> {
+fn dump_frame(
+	source: &str,
+	header: Option<SlabRecordHeader>,
+	frame: &[u8],
+	show_storage_identity: bool,
+) -> std::io::Result<()> {
 	let codec = record_batch_compression_policy_from_ipc(frame)?;
 	let batch = decode_batch(frame)?;
 
@@ -130,18 +157,27 @@ fn dump_frame(source: &str, header: Option<SlabRecordHeader>, frame: &[u8]) -> s
 			);
 		}
 	}
-	print_user_visible_preview(&user_batch)?;
+	if show_storage_identity {
+		// Storage-identity view: includes the ADR 042 synthetic
+		// columns alongside user columns.
+		print_record_preview(&batch, "storage_identity")?;
+	} else {
+		// Default user_visible_preview: storage-only synthetic
+		// columns are stripped before formatting so operator
+		// inspection mirrors the user-facing schema.
+		print_record_preview(&user_batch, "user_visible")?;
+	}
 	Ok(())
 }
 
-fn print_user_visible_preview(batch: &RecordBatch) -> std::io::Result<()> {
+fn print_record_preview(batch: &RecordBatch, label: &str) -> std::io::Result<()> {
 	const PREVIEW_ROWS: usize = 8;
-	println!("  user_visible_rows: {}", batch.num_rows());
+	println!("  {label}_rows: {}", batch.num_rows());
 	if batch.num_columns() == 0 || batch.num_rows() == 0 {
 		return Ok(());
 	}
 
-	println!("  user_visible_preview:");
+	println!("  {label}_preview:");
 	let header = batch
 		.schema()
 		.fields()

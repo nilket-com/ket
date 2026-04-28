@@ -49,8 +49,9 @@ pub use wendelon::integration::compute::{
 };
 pub use wendelon::schema::{
 	Consistency as ReadConsistency, DurabilityLevel as DurabilityClass, LocalityPolicyV1,
-	PbcRejectCode, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+	PbcRejectCode, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
+	TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -883,7 +884,7 @@ mod tests {
 			"analytics",
 			"events",
 			&schema,
-			PrimaryKeyDescriptorV1::single("id"),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicyV1::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
