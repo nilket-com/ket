@@ -4,6 +4,7 @@ Author: AI Swarm Council (Claude / Codex / Gemini)
 
 Companion implementation plan: `plans/impl/046_state_digest_substrate.md`
 Companion brainstorm: `plans/brainstorms/014_algebraic_record_identity_ecmh.md`
+Cut-2 bench evidence: `plans/impl/046_state_digest_bench_results.md`
 
 ## Status
 
@@ -82,7 +83,7 @@ path can afford the math.
 
 ### 1. `StateDigest` is a separate algebraic state identity
 
-Wendelon adds a new `StateDigest` abstraction for homomorphic
+The codebase adds a new `StateDigest` abstraction for homomorphic
 state accumulation. **Not a replacement for `Identity`.**
 
 - `Identity` remains the 32-byte BLAKE3 storage coordinate used
@@ -118,9 +119,11 @@ Rationale:
 
 - Ristretto255 gives a dense 32-byte serialized point, matching
   Wendelon's storage-density bias and 256-bit identity posture.
-- LtHash-style accumulators are much faster but materially
-  larger (kilobytes, not bytes), which makes them the wrong
-  default for slab, index-segment, and control-ring metadata.
+- LtHash-style accumulators can be faster than per-element
+  curve accumulation but are materially larger (kilobytes, not
+  bytes), which makes them the wrong default for slab,
+  index-segment, and control-ring metadata. ADR 046's
+  hash-to-scalar batched path is the measured production path.
 - The expensive work is cold-path work. L1 ingestion and
   request admission continue to compute only BLAKE3 identities.
 
@@ -150,11 +153,20 @@ StateDigestElementPoint =
 This intentionally chooses the hash-to-scalar shape from
 Brainstorm 014 rather than a direct hash-to-curve projection.
 The hot path can continue producing BLAKE3-derived identity
-material, while the cold path performs batched scalar
-multiplication during sealing, verification, or future
-reconciliation. Hash-to-scalar composes with dalek's
-`vartime_multiscalar_mul` (or equivalent batched primitive),
-which is structurally faster than per-element hash-to-curve at
+material, while the cold path performs scalar work during
+sealing, verification, or future reconciliation. Because every
+element uses the same Ristretto basepoint, batched accumulation
+uses the single-basepoint identity:
+
+```text
+Σ(s_i * G) == (Σs_i) * G
+```
+
+The implementation may fold reduced scalars in scalar space and
+multiply once by dalek's precomputed `RISTRETTO_BASEPOINT_TABLE`
+(equivalent to multiplying by `RISTRETTO_BASEPOINT_POINT`, but
+faster for the fixed basepoint). That is structurally faster
+than a multiply-per-row loop or per-element hash-to-curve at
 slab-seal cadence.
 
 `RistrettoPoint::from_uniform_bytes(BLAKE3-XOF-512(...))` is a
@@ -194,17 +206,25 @@ fields, enum variants, wire tags, or absent/present slots for
 follow-up ADRs. Versioned domain bytes (`.v1` suffix) are
 allowed because the bytes feed golden vectors and may need
 explicit rotation; versioned Rust type names (`StateDigestV1`)
-are not, per `no-version-suffixes.md`.
+are not, per `no-version-suffixes.md`. The substrate validates
+the current `.v1` suffix; a future `.v2` rotation is a substrate
+contract change, not a consumer-owned inline tag change.
 
 For ADR 046's concrete helper, `table.row.visible` is the only
 row-semantic domain with a pinned current preimage:
 
 ```text
 visible_row_preimage =
-    tenant_id              // 16 B
+    tenant_id_slot         // 16 B = tenant_id_u64_le || 8 zero bytes
     || table_object_id     // 16 B
     || row_key_id          // 32 B (= __row_key_id__)
 ```
+
+`TenantId` is currently a `u64`. The visible-row preimage gives
+it a 16-byte canonical slot to match the surrounding identity
+preimage style: the low 8 bytes are `tenant_id.get()` encoded
+little-endian, and the high 8 bytes are zero. This byte layout is
+part of the `.v1` golden-vector contract.
 
 This proves logical row membership only. It does not prove
 payload equality. A physical row-set digest must include
@@ -348,13 +368,15 @@ those questions makes the footer layout the owner of semantics
 it cannot express.
 
 **Why hash-to-scalar over hash-to-curve.** Composition with
-batched scalar multiplication. The cold path can accumulate via
-`vartime_multiscalar_mul(scalars, [G; n])` (or equivalent
-batched primitives) instead of N independent point operations.
-The hot path stays BLAKE3-only and produces material the cold
-path can reduce-and-multiply efficiently. Hash-to-curve via
-`from_uniform_bytes` removes modulo bias but loses the batched-
-multiplication composition; for digest-only use, the bias is
+single-basepoint scalar folding. The cold path can accumulate
+via `(Σ scalars) * G`, implemented with the precomputed
+`RISTRETTO_BASEPOINT_TABLE`, instead of N independent point
+operations. This is mathematically equivalent to
+`Σ(s_i * G)` because all elements share the same basepoint. The
+hot path stays BLAKE3-only and produces material the cold path
+can reduce-and-multiply efficiently. Hash-to-curve via
+`from_uniform_bytes` removes modulo bias but loses this
+single-basepoint composition; for digest-only use, the bias is
 irrelevant.
 
 **Why define multiple domains now but only implement one.**
@@ -390,10 +412,13 @@ enum migration or exhaustive-match churn. Domain separation is
 preserved because the projection function uses the byte tag,
 not a Rust enum tag.
 
-**Why Ristretto255 over LtHash.** Density. The CPU trade favors
-LtHash but only on the cold path, where Wendelon has spare
-cycles. Phase 4 bench is the load-bearing artifact; LtHash is
-the benchmark-only baseline (not a production alternative).
+**Why Ristretto255 over LtHash.** Density, plus the measured
+single-basepoint batched path. LtHash remains useful as a
+storage-vs-CPU comparison point, but its accumulator is kilobytes
+rather than 32 bytes and the ADR 046 bench did not justify paying
+that metadata cost. Phase 4 bench is the load-bearing artifact;
+LtHash is the benchmark-only baseline (not a production
+alternative).
 
 ## Consequences (the negatives)
 

@@ -25,6 +25,7 @@ blake3 = "1.5"
 bytemuck = { version = "1.15", features = ["derive", "min_const_generics"] }
 bytes = "1.6"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["alloc", "precomputed-tables"] }
 dashmap = "6.1.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 h2 = { version = "0.4", optional = true }
@@ -91,4 +92,8 @@ harness = false
 
 [[bench]]
 name = "append_only_tables"
+harness = false
+
+[[bench]]
+name = "state_digest"
 harness = false

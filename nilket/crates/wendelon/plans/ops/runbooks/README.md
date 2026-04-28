@@ -24,6 +24,9 @@ Current runbooks:
 - [ADR 043 Storage Body Stabilization](./adr043_storage_body_stabilization.md)
   - post-rollout watch for Arrow IPC body compression density, CPU, L2
     admitted record-body bytes, and convergence
+- [ADR 046 StateDigest Substrate](./state_digest_substrate.md)
+  - substrate-only orientation, benchmark interpretation, and guards for
+    absent storage/wire surfaces
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

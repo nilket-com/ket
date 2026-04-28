@@ -697,6 +697,142 @@ fn test_adr045_append_only_invariants() {
 	);
 }
 
+/// ADR 046 architectural guards.
+///
+/// StateDigest is a hash-layer substrate only. It must not leak curve
+/// math into request admission, storage ingestion, network routing, or
+/// any durable/wire surface before a consumer ADR owns that surface.
+#[test]
+fn test_adr046_state_digest_substrate_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	for root in ["src/network", "src/storage"] {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| ext == "rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			if content.contains("curve25519_dalek") {
+				violations.push(format!(
+					"{}: curve25519-dalek must stay out of network/storage hot paths",
+					path.display()
+				));
+			}
+			if content.contains("StateDigest") {
+				violations.push(format!(
+					"{}: StateDigest must not be imported into storage/network durable or \
+					 protocol surfaces in ADR 046",
+					path.display()
+				));
+			}
+		});
+	}
+
+	let src_dir = manifest_dir.join("src");
+	walk_dir(&src_dir, &mut |path| {
+		if !path
+			.extension()
+			.and_then(|ext| ext.to_str())
+			.is_some_and(|ext| ext == "rs")
+		{
+			return;
+		}
+		let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
+		let Ok(content) = fs::read_to_string(path) else {
+			return;
+		};
+
+		if content.contains("__row_tombstone__") {
+			let is_columnar_predecessor = relative == Path::new("src/storage/columnar.rs");
+			if !is_columnar_predecessor {
+				violations.push(format!(
+					"{}: ADR 046 must not introduce the deferred __row_tombstone__ column",
+					relative.display()
+				));
+			}
+		}
+		if content.contains("AppendOnlyContentHash") {
+			violations.push(format!(
+				"{}: content-hash identity is deferred and must not be pre-allocated",
+				relative.display()
+			));
+		}
+		if content.contains("NodeCapability::StateDigest")
+			|| content.contains("NodeCapability::Ecmh")
+			|| content.contains("NodeCapability::ECMH")
+			|| content.contains("StateDigestCapability")
+			|| content.contains("EcmhCapability")
+			|| content.contains("ECMHCapability")
+		{
+			violations.push(format!(
+				"{}: ADR 046 must not add a node capability bit",
+				relative.display()
+			));
+		}
+		let version_suffix_tokens = [
+			concat!("StateDigest", "V1"),
+			concat!("StateDigest", "V2"),
+			concat!("StateDigestDomain", "V1"),
+			concat!("StateDigestDomain", "V2"),
+			concat!("StateDigestAccumulator", "V1"),
+			concat!("StateDigestAccumulator", "V2"),
+			concat!("StateDigestElement", "V1"),
+			concat!("StateDigestElement", "V2"),
+		];
+		if version_suffix_tokens
+			.iter()
+			.any(|token| content.contains(token))
+		{
+			violations.push(format!(
+				"{}: ADR 046 Rust surfaces must not carry V1/V2 suffixes",
+				relative.display()
+			));
+		}
+		if content.contains("b\"table.append-row\"") && content.contains("b\"digest.table.row.") {
+			violations.push(format!(
+				"{}: append-row identity and state-digest row preimages must stay separated",
+				relative.display()
+			));
+		}
+
+		for (line_no, line) in content.lines().enumerate() {
+			if !line.contains("StateDigestDomain(") {
+				continue;
+			}
+			let trimmed = line.trim();
+			let allowed = relative == Path::new("src/hash/state_digest.rs")
+				&& (trimmed.starts_with("pub const DOMAIN_")
+					|| trimmed.starts_with("StateDigestDomain(b\"digest.")
+					|| trimmed.starts_with("pub struct StateDigestDomain(")
+					|| trimmed.starts_with("const MALFORMED_DOMAIN_FOR_TEST:"));
+			if !allowed {
+				violations.push(format!(
+					"{}:{}: StateDigestDomain construction must be a named module constant",
+					relative.display(),
+					line_no + 1
+				));
+			}
+		}
+	});
+
+	assert!(
+		violations.is_empty(),
+		"ADR 046 architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
 	let mut names = Vec::new();
 	for line in rendered.lines() {

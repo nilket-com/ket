@@ -4,6 +4,7 @@ Author: AI Swarm Council (Claude / Codex / Gemini)
 
 Companion ADR: `plans/adr/046_state_digest_substrate.md`
 Companion brainstorm: `plans/brainstorms/014_algebraic_record_identity_ecmh.md`
+Cut-2 bench evidence: `plans/impl/046_state_digest_bench_results.md`
 
 ## Goal
 
@@ -59,7 +60,10 @@ Work:
    present transitively via `ed25519-dalek`; ADR 046 should not
    rely on a transitive for a first-class state primitive. Pin
    a version compatible with Wendelon's other crypto crates.
-   Architectural review for any new transitive surface.
+   Architectural review for any new transitive surface. The
+   selected dependency disables crate defaults and enables only
+   `alloc` plus `precomputed-tables`, keeping the runtime feature
+   surface explicit under both default and FIPS workspace builds.
 2. Confirm chosen crate features compile under default and FIPS
    feature sets. Ristretto255 is outside the FIPS validation
    boundary, like BLAKE3 content identity; document any feature
@@ -99,7 +103,11 @@ Work:
    documented as fallback only if security review rejects
    hash-to-scalar. The Phase 4 bench measures throughput
    against acceptance criteria; it does not pick between
-   candidates unless security review forces a re-bench.
+   candidates unless security review forces a re-bench. The
+   production implementation may use dalek's precomputed
+   `RISTRETTO_BASEPOINT_TABLE`, which is the same fixed
+   basepoint as `RISTRETTO_BASEPOINT_POINT` with faster scalar
+   multiplication.
 6. Produce a short local bench note covering 10k / 100k / 1M
    element batches, including a batched scalar multiplication
    path and an LtHash baseline for scale comparison. LtHash is
@@ -212,11 +220,17 @@ Work:
        scalars: impl IntoIterator<Item = [u8; 32]>,
    ) -> StateDigest;
    ```
-   Internally uses dalek's `vartime_multiscalar_mul` (or
-   equivalent batched primitive) over `[G; n]` and the reduced
-   scalars. The public per-element API stays ergonomic for
-   small consumers; the batched helper proves L2-seal
-   viability at scale.
+   Internally folds the reduced scalars in scalar space and
+   multiplies once by dalek's precomputed Ristretto basepoint
+   table:
+   ```text
+   Σ(s_i * G) == (Σs_i) * G
+   ```
+   This is equivalent to a multiscalar multiplication where
+   every point is the same basepoint, but avoids a
+   multiply-per-row loop. The public per-element API stays
+   ergonomic for small consumers; the batched helper proves
+   L2-seal viability at scale.
 
 Tests:
 
@@ -232,6 +246,10 @@ Tests:
   for any input batch. Critical correctness invariant for
   Phase 4 bench composition.
 - Domain separation golden tests pass.
+- Visible-row preimage tests assert the 16-byte tenant slot is
+  `TenantId`'s current 8-byte little-endian value followed by
+  8 zero bytes; widening `TenantId` requires an explicit
+  substrate contract update.
 
 Exit:
 
@@ -257,7 +275,8 @@ Work:
        row_key_id: Identity,  // = __row_key_id__
    ) -> StateDigestElement {
        let mut preimage = [0u8; 64];
-       preimage[..16].copy_from_slice(tenant_id.as_bytes());
+       preimage[..8].copy_from_slice(&tenant_id.get().to_le_bytes());
+       // bytes 8..16 stay zero; this is the canonical 16-byte tenant slot
        preimage[16..32].copy_from_slice(table_object_id.as_bytes());
        preimage[32..64].copy_from_slice(row_key_id.as_bytes());
        StateDigestElement::project(DOMAIN_TABLE_ROW_VISIBLE, &preimage)
@@ -330,8 +349,8 @@ Architectural tests (added to `tests/architecture_test.rs`):
 - No `V1` / `V2` suffix on ADR 046 surfaces.
 - No project-name prefix on ADR 046 surfaces.
 - **Identity-vs-digest preimage isolation:** no source file
-  contains `b"table.append-row"` and `b"digest.table.row."`
-  in the same function (regression guard for accidental
+  contains both `b"table.append-row"` and
+  `b"digest.table.row."` (regression guard for accidental
   preimage tangling).
 
 Exit:
@@ -342,6 +361,9 @@ Exit:
 - Architectural tests prove ADR 046 stayed a substrate ADR.
 
 ## Phase 4 — Cold-path benchmark with LtHash baseline
+
+Cut-2 status: complete. Results are recorded in
+`plans/impl/046_state_digest_bench_results.md`.
 
 Files:
 
@@ -356,7 +378,9 @@ Work:
 1. Implement an LtHash baseline at the same domain-tag and
    preimage shape as Ristretto255. Accumulates 16-bit modular
    sums into a 1024-element state array (~2 KB). Reference
-   only; `cfg(test)`.
+   only; `cfg(test)`. The manual bench carries its own copy of
+   the tiny baseline because Cargo bench targets do not compile
+   the library with `cfg(test)`.
 2. Add `[[bench]]` for `state_digest`. Use the repo's manual
    benchmark style (`Instant`, `black_box`, stdout
    measurements), consistent with `benches/multi_row_fragments.rs`.
@@ -406,6 +430,14 @@ Exit:
 Optional. Skip if it pulls storage-format changes into ADR 046
 scope.
 
+Cut-3 status: complete as a test-only integration smoke in
+`tests/state_digest_invariants.rs`. The test packs the same
+append-only logical rows under different `MultiRowLayoutDescriptor`
+grouping boundaries, extracts existing stored `__row_key_id__`
+metadata from decoded multi-row frames, and proves the visible-row
+digest is unchanged. No production storage helper, durable field, or
+sealer integration was added.
+
 Files:
 
 - `tests/state_digest_invariants.rs`
@@ -435,6 +467,11 @@ Exit:
   any durable surface.
 
 ## Phase 6 — Promotion: security review + throughput ratification
+
+Cut-2 status: complete for the substrate. Hash-to-scalar review and
+throughput ratification are recorded in
+`plans/impl/046_state_digest_bench_results.md`. Consumer-facing
+storage, protocol, lifecycle, and index semantics remain deferred.
 
 Files:
 

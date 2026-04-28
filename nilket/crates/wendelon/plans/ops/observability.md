@@ -305,6 +305,8 @@ Current high-signal mappings:
   - `plans/ops/runbooks/node_replacement.md`
 - ADR 043 storage-body rollout and stabilization watch
   - `plans/ops/runbooks/adr043_storage_body_stabilization.md`
+- ADR 046 StateDigest substrate promotion and benchmark interpretation
+  - `plans/ops/runbooks/state_digest_substrate.md`
 
 Minimum runbook shape:
 
