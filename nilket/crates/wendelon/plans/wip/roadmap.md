@@ -6,41 +6,66 @@ the tip moves: each ADR that ships shifts the chain by one.
 
 ## Where we are
 
-ADR 048 (Per-Table Retention Policy) just promoted. Per-
-`(tenant_id, table_object_id)` retention lives in a new
-replicated `TableLifecycleCatalog` in the control-ring
-state, never on the descriptor; reads decode at their
-requested schema generation but resolve retention from the
-always-latest catalog. Three modes: `InheritCluster`,
-`Disabled`, `FixedWindow(RetentionWindowMillis)` (1 minute
-to 100 years). Two-phase enforcement: a Phase A logical
-filter at read time (`floor <= __row_hlc__ <= as_of_hlc`)
-plus hard `RETENTION_FLOOR_EXCEEDED` admission reject for
-`as_of < floor`, and Phase B physical eviction at
-compaction pinned to `compaction_start_hlc`. ADR 047 pair-
-GC composes against the table-specific floor; ambiguous
-ownership during reclaim retains the row. CSB direct
-answers are gated by per-slab retention completeness
-(above-floor allowed; below-floor zero; straddle falls
-back to row-level filter). PK-keyed table-specific
-overrides reject (`RETENTION_REJECTED_PK_DISALLOWED`) and
-remain on the cluster MVCC path until roadmap #6.
-Visible-domain `StateDigest` reversal — second production
-consumer of ADR 046 `subtract_element`, monotonic and
-compaction-driven, completing the lifecycle validation
-pass before the topology gate. See
-`plans/adr/048_per_table_retention_policy.md` and
-`plans/impl/048_per_table_retention_policy.md`.
-Implementation pending (Phases 0–8).
+ADR 049 (Content-Hash Row Identity) just promoted. Adds
+`RowIdentityPolicy::AppendOnlyContentHash` — the third
+identity variant, deriving `__row_key_id__` from canonical
+row content rather than write context. Synchronous admission-
+time collapse via row-index lookup keeps ADR 046 §5 visible-
+state semantics intact: duplicate writes are absorbed
+idempotently with no `StateDigest` change; the absorb-vs-store
+distinction is over **current visible membership**, not "key
+ever existed," so re-ingestion after an ADR 047 tombstone or
+ADR 048 retention eviction takes the store path and reinstates
+the row. Sparse type-tagged canonical encoding over logical
+Arrow values (NFC strings, NaN / -0 normalized, decimals as
+precision + scale + unscaled-integer LE, dictionary arrays
+canonicalized by decoded values) makes additive nullable
+schema evolution identity-neutral. `column_tag` is a stable
+assigned column ID (preferred) or stable logical-name hash
+(fallback); physical ordinal rejected. Schema generation and
+descriptor fingerprint excluded from the identity preimage.
+V1 rejects non-NULL-default additive column-add with
+`CONTENT_HASH_REJECTED_NON_NULL_DEFAULT` and decimal precision
+/ scale evolution with `CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION`;
+operators wanting either case use `AppendOnly` or wait for a
+follow-up. `IdentityProjection` enabled (content-hash is the
+first append-only policy where retry-stable identity allows
+this); `ColumnProjection` deferred to a follow-up alongside
+secondary indexes (roadmap #8). Visible-domain `StateDigest`
+auto-content-sensitive via the existing visible-row preimage;
+no new digest domain. See
+`plans/adr/049_content_hash_row_identity.md` and
+`plans/impl/049_content_hash_row_identity.md`. Implementation
+phases pending.
 
-ADR 047 (Row-Level Tombstones on Append-Only Tables) is
-the immediate predecessor — the lifecycle algebra
-ADR 048 composes against (pair-GC under the table floor).
-ADR 046 (`StateDigest` substrate) supplies the algebra.
-ADR 045 (PK-Less Append-Only Tables) supplies the
-identity layer; `__row_table_object_id__` is the
-ownership resolver retention reclaim uses to look up the
-effective floor.
+ADR 048 (Per-Table Retention Policy) is the immediate
+predecessor — replicated `TableLifecycleCatalog` keyed by
+`(tenant_id, table_object_id)`; three modes (`InheritCluster`
+/ `Disabled` / `FixedWindow`); two-phase enforcement (read-
+time logical filter plus hard `as_of < floor` reject;
+compaction-time physical eviction pinned to
+`compaction_start_hlc`); pair-GC composes with ADR 047 under
+the table floor. The topology gate was closed alongside
+ADR 048 with **Outcome B** (opaque `NodeId` retained;
+brainstorm 015 status header carries the closure). Splits to
+brainstorm 018 (FROST-WAL authority) and brainstorm 019
+(Sybil-resistance threat model).
+
+ADR 047 (Row-Level Tombstones on Append-Only Tables) is the
+lifecycle algebra ADR 048 composes against (pair-GC under
+the table floor). ADR 046 (`StateDigest` substrate) supplies
+the algebra. ADR 045 (PK-Less Append-Only Tables) supplies
+the identity layer that ADR 049 complements with content-hash
+identity; `__row_table_object_id__` is the ownership resolver
+retention reclaim uses to look up the effective floor.
+
+The implementation chain through ADR 049 is mostly built but
+not fully bench-shipped. ADR 046 substrate cleared the cut-2
+promotion bench gate (see
+`plans/impl/046_state_digest_bench_results.md`). ADR 047,
+ADR 048, and ADR 049 have quick-smoke or pending bench
+artifacts; full 100k / 1M matrices remain the shipped-
+verification bar before each is declared shipped.
 
 ## Prioritization philosophy
 
@@ -89,7 +114,10 @@ Gemini.
    `StateDigestElement`, domain-separated projection (hash-to-
    scalar over Ristretto255), V1 helper for `table.row.visible`
    only. No durable storage placement; consumer ADRs commit
-   placement when they ship. Phase 0–6 impl pending.
+   placement when they ship. Substrate implementation cleared
+   the cut-2 promotion bench gate; consumer-ADR-driven
+   follow-on tasks remain (durable placement, anti-entropy
+   reader). Brainstorm 014 marked harvested.
 
 ### Lifecycle (validates the algebra)
 
@@ -105,7 +133,8 @@ Gemini.
    exists); visible-domain `StateDigest` subtraction with no
    durable placement. First non-speculative validation of
    ADR 046 `subtract_element` against real storage state.
-   Phases 0–10 impl pending.
+   Implementation in place; full 100k / 1M bench matrix is the
+   remaining shipped-verification gate.
 
 3. **Per-table retention policy.** ADR 048 promoted — see
    `plans/adr/048_per_table_retention_policy.md` and
@@ -123,31 +152,39 @@ Gemini.
    retains. Visible-domain `StateDigest` reversal
    (subtract on data eviction, add on tombstone eviction)
    — no new digest domain. PK-keyed table-specific
-   retention deferred to roadmap #6. Phases 0–8 impl
-   pending.
+   retention deferred to roadmap #6. Implementation in
+   place; full 100k / 1M bench matrix is the remaining
+   shipped-verification gate.
 
-### Topology gate
+### Topology gate (closed)
 
-4. **Algebraic topology** *(brainstorm 015.)* With the algebra
-   validated by two storage-state consumers, the council
-   decides whether to commit the topology layer. Three possible
-   outputs: implement immediately (becomes the implementation
-   ADR; candidate implementation surfaces include curve-derived
-   `NodeId`, proof of partition custody, Sybil-resistant
-   verifiable VNode generation, topology-vs-transport split,
-   and FROST-signed Raft WAL — the gate decides which couple to
-   topology vs. live in their own authority layer); defer with a
-   concrete rework budget every later distributed ADR cites;
-   close the brainstorm. *2–3 iterations as a gate; 5–8 if it
-   rolls into implementation.*
+4. **Algebraic topology** *(brainstorm 015 — closed.)* Closed
+   2026-04-29 with **Outcome B**: opaque `NodeId` is
+   sufficient; Wendelon binds node signing identity through
+   epoch membership state when a real verifier exists, rather
+   than reshaping `NodeId` itself. The closure is durable but
+   not permanent — future ADRs that need cryptographic node
+   identity must cite the rework budget recorded in the
+   brainstorm 015 status header. Splits: brainstorm 018
+   (FROST-WAL authority) and brainstorm 019 (Sybil-resistance
+   threat model). Both are placeholders, off the active queue.
+   Anti-entropy remains deferred until identity / descriptor
+   cleanup (#5–#7) settles.
 
 ### Identity / descriptor cleanup before access patterns
 
-5. **Content-hash identity (`AppendOnlyContentHash`).** Third
-   `RowIdentityPolicy` variant. Canonical Arrow row encoding
-   spec (NULL handling, integer width, decimal scale, timestamp
-   precision, NaN equivalence); position on identical-payload-
-   collapses-vs-rejects. *4–6 iterations.*
+5. **Content-hash identity (`AppendOnlyContentHash`).** ADR 049
+   promoted — see
+   `plans/adr/049_content_hash_row_identity.md` and
+   `plans/impl/049_content_hash_row_identity.md`. Third
+   `RowIdentityPolicy` variant; sparse type-tagged canonical
+   encoding (NFC strings; NaN / -0 normalized; stable column-
+   ID `column_tag`); domain-tagged BLAKE3 preimage excluding
+   schema generation; synchronous admission-time collapse
+   keeping ADR 046 §5 visible-state semantics intact;
+   `IdentityProjection` enabled, `ColumnProjection` deferred;
+   non-NULL-default and decimal-scale-evolution rejected with
+   typed reject codes. Implementation phases pending.
 
 6. **PK-keyed row-delete via supersession.** Tombstone hides
    earlier versions of the same key under supersession
@@ -239,6 +276,14 @@ Gemini.
   runbooks and tests, not as a roadmap feature. Decision-
   enabling measurement (e.g., the `StateDigest` cold-path
   benchmark) belongs inside the owning ADR.
+- **Don't re-open the topology gate without citing the rework
+  budget recorded in brainstorm 015's closure status.**
+  Speculative threat models, aesthetic preferences, and the
+  desire to reuse curve machinery are not sufficient grounds.
+  A re-open requires concrete verifier requirements or
+  operational evidence that opaque-handle plus membership-
+  bound signing forces more rework than a `NodeId`-shape
+  migration.
 
 ## Convergence summary
 
@@ -246,9 +291,9 @@ Gemini.
 StateDigest substrate
   → tombstones (validate algebra @ deletion)
   → retention (validate algebra @ compaction)
-  → topology gate
-  → content-hash identity
-  → PK-keyed row delete
+  → topology gate CLOSED — Outcome B (opaque NodeId)
+  → content-hash identity (ADR 049)
+  → PK-keyed row delete (next: roadmap #6)
   → descriptor fingerprint split
   → secondary indexes
   → wire-frame compression
@@ -259,10 +304,10 @@ StateDigest substrate
   → refinement plumbing
 ```
 
-Implementation tip is now past ADR 048: the lifecycle
-validation pass is complete on the design side. Next is the
-topology gate. ADR 046 / 047 / 048 implementation phases
-remain pending; bench cold-path Ristretto255 against
-existing multi-row / append-only slab batches early so the
-storage-placement decision remains evidence-based for
-consumer ADRs.
+Design tip is past ADR 049 with content-hash identity
+*promoted* (design accepted; impl phases pending). Next ADR
+is PK-keyed row delete via supersession (#6); reuses the
+row-tombstone shape (ADR 047) layered with supersession
+discipline. ADR 046 substrate cleared its bench gate; ADR
+047 / 048 / 049 have quick-smoke or pending bench artifacts
+and need full matrices before declaring shipped.

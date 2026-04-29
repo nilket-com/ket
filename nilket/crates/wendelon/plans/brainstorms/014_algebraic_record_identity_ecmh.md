@@ -1,5 +1,107 @@
 # Brainstorm 014: Algebraic Record Identity and Homomorphic State (ECMH)
 
+## Status: Harvested (2026-04-29) into ADR 046, ADR 047, ADR 048
+
+Brainstorm 014's algebraic-record-identity proposal was harvested
+into the project's lifecycle validation pass:
+
+- **ADR 046 — `StateDigest` substrate.** Extracted commutative
+  state identity as a separate primitive. Did **not** replace
+  row `Identity`. Defined the substrate-only surface: hash-to-
+  scalar projection over Ristretto255, domain-separated digest
+  domains, batched accumulation, compressed 32-byte output,
+  V1 helper for `digest.table.row.visible.v1`.
+- **ADR 047 — Row-level tombstones on append-only.** Validated
+  visible-domain `subtract_element` against real deletion
+  state. First non-speculative consumer of the substrate.
+- **ADR 048 — Per-table retention policy.** Validated the same
+  algebra against compaction-driven monotone reversal.
+  Composes with ADR 047 pair-GC under per-table retention
+  floors. Second consumer.
+
+ADR 046's bench results (`plans/impl/046_state_digest_bench_results.md`,
+2026-04-28) cleared the cut-2 promotion gate: per-element
+Ristretto path 121k–141k/sec/core (above the 45–60k/sec/core
+target), projection-plus-batched 5.4M/sec at 1M rows,
+compressed-validation worst case 2.936 µs. The cut-3 multi-row
+smoke confirmed digest invariance across multi-row repacking.
+
+### What the harvest preserved from 014
+
+- **Hot/cold split.** ADR 046's projection step is exactly the
+  hot-path Scalar / cold-path Point split 014 proposed (§5).
+  L1 ingestion stays on BLAKE3 scalars; cold-path projection
+  to Ristretto points happens at L2-seal-shaped batches.
+- **Order-agnostic accumulation.** `StateDigestAccumulator`
+  exposes commutative / associative add / subtract.
+- **Constant-time deletion algebra.** Visible-domain subtract
+  reflects the logical state instantly, independent of physical
+  compaction (validated by ADR 047 §10 and ADR 048 §12).
+- **Density choice.** Ristretto255 over LtHash, on the bench
+  evidence: faster than per-element Ristretto for the add path,
+  but 2 KiB accumulator state vs 32-byte compressed digest is
+  unacceptable for Wendelon's storage-density posture.
+
+### What 014 did not get (per `no-premature-backward-compat`)
+
+- **No durable placement.** ADR 046 §7 deferred placement until
+  a concrete consumer commits one. ADR 047 §10 and ADR 048 §12
+  reaffirmed this — visible digest is computable on demand from
+  post-compaction slab contents; not persisted to footer,
+  pointer, catalog, local index, durability log, or wire frame.
+  The in-memory cache exception is invalidated on compaction-
+  output replacement.
+- **No event-history digest domain in V1.** ADR 046 §4 reserved
+  the byte tag for a future audit / anti-entropy consumer; ADR
+  048 §12 declined to use it. The reserved tag stays unallocated
+  until a concrete consumer satisfies the deferral test
+  (concrete reader, authentication boundary, invalidation rule).
+
+### Remaining future-consumer surface
+
+The substrate has reserved capacity that future ADRs may pull
+on:
+
+- **Anti-entropy reconciliation** — the marquee 014 use case
+  (O(1) cross-replica set comparison). Not currently scheduled;
+  ADR 048 deferred "anti-entropy retention coordination" as a
+  follow-up. The lifecycle ADRs leave transient visible-digest
+  divergence between replicas at different compaction states
+  as legitimate; anti-entropy is the natural reconciler.
+- **Secondary-index segment digests** (roadmap #8). Index
+  segments would carry `StateDigest` from day one — replica
+  reconciliation becomes O(1) point comparison.
+- **Physical / content row digests after content-hash identity**
+  (roadmap #5). The third `RowIdentityPolicy` variant
+  (`AppendOnlyContentHash`) would project content-canonical
+  bytes into the digest scheme.
+- **Audit / event-history digest domain.** Reserved byte tag,
+  awaiting a concrete consumer ADR.
+- **CDC cursor checkpoint verification** (roadmap #10). CDC
+  consumers may verify cursor checkpoints against partition
+  `StateDigest` points algebraically.
+
+### What 014 explicitly did not become
+
+Brainstorm 015 (algebraic ring topology over Ristretto255) is
+the sister proposal that tried to apply the same "mathematical
+supremacy" framing to `NodeId`. The 2026-04-29 council closed
+015 with **Outcome B** (opaque `NodeId` sufficient) — the
+elegance lives in the data-identity layer; it does not transfer
+to node identity. See the status header in
+`plans/brainstorms/015_algebraic_ring_topology_prime_group.md`.
+
+### References
+
+- ADR 046 (`plans/adr/046_state_digest_substrate.md`) and
+  impl plan + bench results.
+- ADR 047 (`plans/adr/047_row_tombstones_append_only.md`).
+- ADR 048 (`plans/adr/048_per_table_retention_policy.md`).
+- Brainstorm 015 closure (status header in
+  `plans/brainstorms/015_algebraic_ring_topology_prime_group.md`).
+- `plans/wip/roadmap.md` — forward sequence past the lifecycle
+  validation pass.
+
 ## The Premise
 While Brainstorm 015 explored mapping the *routing topology* (`NodeId`) to an algebraic prime group, this brainstorm applies that same "mathematical supremacy" one layer up: to the **Data Identity** itself.
 
