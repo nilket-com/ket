@@ -108,6 +108,131 @@ impl PbcRuntime {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableRetentionMetricPolicy {
+	InheritCluster,
+	Disabled,
+	FixedWindow,
+}
+
+impl TableRetentionMetricPolicy {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::InheritCluster => "inherit_cluster",
+			Self::Disabled => "disabled",
+			Self::FixedWindow => "fixed_window",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableRetentionRowKind {
+	Data,
+	Tombstone,
+}
+
+impl TableRetentionRowKind {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Data => "data",
+			Self::Tombstone => "tombstone",
+		}
+	}
+}
+
+#[derive(Default)]
+struct TableRetentionPolicyCounters {
+	inherit_cluster: Counter,
+	disabled: Counter,
+	fixed_window: Counter,
+}
+
+impl TableRetentionPolicyCounters {
+	fn counter(&self, policy: TableRetentionMetricPolicy) -> &Counter {
+		match policy {
+			TableRetentionMetricPolicy::InheritCluster => &self.inherit_cluster,
+			TableRetentionMetricPolicy::Disabled => &self.disabled,
+			TableRetentionMetricPolicy::FixedWindow => &self.fixed_window,
+		}
+	}
+
+	fn inc(&self, policy: TableRetentionMetricPolicy) {
+		self.counter(policy).inc();
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for policy in [
+			TableRetentionMetricPolicy::InheritCluster,
+			TableRetentionMetricPolicy::Disabled,
+			TableRetentionMetricPolicy::FixedWindow,
+		] {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("policy", policy.as_str())],
+				self.counter(policy).get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct TableRetentionRowKindCounters {
+	data: Counter,
+	tombstone: Counter,
+}
+
+impl TableRetentionRowKindCounters {
+	fn counter(&self, kind: TableRetentionRowKind) -> &Counter {
+		match kind {
+			TableRetentionRowKind::Data => &self.data,
+			TableRetentionRowKind::Tombstone => &self.tombstone,
+		}
+	}
+
+	fn add(&self, kind: TableRetentionRowKind, value: u64) {
+		self.counter(kind).add(value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for kind in [
+			TableRetentionRowKind::Data,
+			TableRetentionRowKind::Tombstone,
+		] {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("kind", kind.as_str())],
+				self.counter(kind).get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct TableRetentionActiveTableGauges {
+	inherit: Gauge,
+	disabled: Gauge,
+	fixed: Gauge,
+}
+
+impl TableRetentionActiveTableGauges {
+	fn set(&self, inherit: u64, disabled: u64, fixed: u64) {
+		self.inherit.set(inherit);
+		self.disabled.set(disabled);
+		self.fixed.set(fixed);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_gauge_family_header(out, name, help);
+		render_gauge_with_labels(out, name, &[("mode", "inherit")], self.inherit.get());
+		render_gauge_with_labels(out, name, &[("mode", "disabled")], self.disabled.get());
+		render_gauge_with_labels(out, name, &[("mode", "fixed")], self.fixed.get());
+	}
+}
+
 #[derive(Default)]
 struct PbcRuntimeCounters {
 	vectorized: Counter,
@@ -916,6 +1041,17 @@ pub struct MetricsRegistry {
 	pub storage_append_only_rows_written_total: Counter,
 	pub storage_append_only_intra_batch_index_exhaustion_total: Counter,
 	pub storage_append_only_supersession_metadata_skipped_total: Counter,
+	storage_table_retention_policy_updates: TableRetentionPolicyCounters,
+	pub storage_table_retention_read_floor_rejects_total: Counter,
+	pub storage_table_retention_read_filtered_rows_total: Counter,
+	storage_table_retention_l1_rows_pruned: TableRetentionRowKindCounters,
+	pub storage_table_retention_l1_bytes_reclaimed_total: Counter,
+	storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters,
+	pub storage_table_retention_l2_bytes_reclaimed_total: Counter,
+	pub storage_table_retention_pair_drops_total: Counter,
+	pub storage_table_retention_ambiguous_rows_retained_total: Counter,
+	pub storage_table_retention_lag_seconds: Gauge,
+	storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges,
 	storage_compression_records_written: CompressionCodecCounters,
 	storage_compression_plaintext_bytes: CompressionCodecCounters,
 	storage_compression_encoded_bytes: CompressionCodecCounters,
@@ -1080,6 +1216,18 @@ impl Default for MetricsRegistry {
 			storage_append_only_rows_written_total: Counter::default(),
 			storage_append_only_intra_batch_index_exhaustion_total: Counter::default(),
 			storage_append_only_supersession_metadata_skipped_total: Counter::default(),
+			storage_table_retention_policy_updates: TableRetentionPolicyCounters::default(),
+			storage_table_retention_read_floor_rejects_total: Counter::default(),
+			storage_table_retention_read_filtered_rows_total: Counter::default(),
+			storage_table_retention_l1_rows_pruned: TableRetentionRowKindCounters::default(),
+			storage_table_retention_l1_bytes_reclaimed_total: Counter::default(),
+			storage_table_retention_l2_rows_pruned: TableRetentionRowKindCounters::default(),
+			storage_table_retention_l2_bytes_reclaimed_total: Counter::default(),
+			storage_table_retention_pair_drops_total: Counter::default(),
+			storage_table_retention_ambiguous_rows_retained_total: Counter::default(),
+			storage_table_retention_lag_seconds: Gauge::default(),
+			storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges::default(
+			),
 			storage_compression_records_written: CompressionCodecCounters::default(),
 			storage_compression_plaintext_bytes: CompressionCodecCounters::default(),
 			storage_compression_encoded_bytes: CompressionCodecCounters::default(),
@@ -1313,6 +1461,78 @@ impl MetricsRegistry {
 	pub fn observe_storage_append_only_supersession_metadata_skipped(&self) {
 		self.storage_append_only_supersession_metadata_skipped_total
 			.inc();
+	}
+
+	pub fn observe_storage_table_retention_policy_update(
+		&self,
+		policy: TableRetentionMetricPolicy,
+	) {
+		self.storage_table_retention_policy_updates.inc(policy);
+	}
+
+	pub fn observe_storage_table_retention_read_floor_reject(&self) {
+		self.storage_table_retention_read_floor_rejects_total.inc();
+	}
+
+	pub fn observe_storage_table_retention_read_filtered_rows(&self, rows: u64) {
+		self.storage_table_retention_read_filtered_rows_total
+			.add(rows);
+	}
+
+	pub fn observe_storage_table_retention_l1_prune(
+		&self,
+		data_rows: u64,
+		tombstone_rows: u64,
+		bytes: u64,
+		pair_drops: u64,
+		ambiguous_rows_retained: u64,
+		max_lag_seconds: u64,
+	) {
+		self.storage_table_retention_l1_rows_pruned
+			.add(TableRetentionRowKind::Data, data_rows);
+		self.storage_table_retention_l1_rows_pruned
+			.add(TableRetentionRowKind::Tombstone, tombstone_rows);
+		self.storage_table_retention_l1_bytes_reclaimed_total
+			.add(bytes);
+		self.storage_table_retention_pair_drops_total
+			.add(pair_drops);
+		self.storage_table_retention_ambiguous_rows_retained_total
+			.add(ambiguous_rows_retained);
+		self.storage_table_retention_lag_seconds
+			.set(max_lag_seconds);
+	}
+
+	pub fn observe_storage_table_retention_l2_prune(
+		&self,
+		data_rows: u64,
+		tombstone_rows: u64,
+		bytes: u64,
+		pair_drops: u64,
+		ambiguous_rows_retained: u64,
+		max_lag_seconds: u64,
+	) {
+		self.storage_table_retention_l2_rows_pruned
+			.add(TableRetentionRowKind::Data, data_rows);
+		self.storage_table_retention_l2_rows_pruned
+			.add(TableRetentionRowKind::Tombstone, tombstone_rows);
+		self.storage_table_retention_l2_bytes_reclaimed_total
+			.add(bytes);
+		self.storage_table_retention_pair_drops_total
+			.add(pair_drops);
+		self.storage_table_retention_ambiguous_rows_retained_total
+			.add(ambiguous_rows_retained);
+		self.storage_table_retention_lag_seconds
+			.set(max_lag_seconds);
+	}
+
+	pub fn set_storage_table_retention_policy_active_tables(
+		&self,
+		inherit: u64,
+		disabled: u64,
+		fixed: u64,
+	) {
+		self.storage_table_retention_policy_active_tables
+			.set(inherit, disabled, fixed);
 	}
 
 	pub fn observe_storage_l2_column_fetch_plan(&self, duration: Duration) {
@@ -2045,6 +2265,69 @@ impl MetricsRegistry {
 			self.storage_append_only_supersession_metadata_skipped_total
 				.get(),
 		);
+		self.storage_table_retention_policy_updates.render(
+			&mut out,
+			"wendelon_storage_table_retention_policy_updates_total",
+			"Per-table retention policy updates accepted through the typed lifecycle mutation surface.",
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_read_floor_rejects_total",
+			"Table reads rejected because the requested snapshot predates the effective retention floor.",
+			self.storage_table_retention_read_floor_rejects_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_read_filtered_rows_total",
+			"Logical rows skipped because they are below the table's logical retention floor.",
+			self.storage_table_retention_read_filtered_rows_total.get(),
+		);
+		self.storage_table_retention_l1_rows_pruned.render(
+			&mut out,
+			"wendelon_storage_table_retention_l1_rows_pruned_total",
+			"Logical row versions pruned by table-aware L1 retention compaction.",
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_l1_bytes_reclaimed_total",
+			"Bytes reclaimed by table-aware L1 retention compaction.",
+			self.storage_table_retention_l1_bytes_reclaimed_total.get(),
+		);
+		self.storage_table_retention_l2_rows_pruned.render(
+			&mut out,
+			"wendelon_storage_table_retention_l2_rows_pruned_total",
+			"Logical row versions pruned by table-aware L2 retention rewrites.",
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_l2_bytes_reclaimed_total",
+			"Bytes reclaimed by table-aware L2 retention rewrites.",
+			self.storage_table_retention_l2_bytes_reclaimed_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_pair_drops_total",
+			"Data/tombstone row pairs jointly dropped after the effective table floor crossed the delete HLC.",
+			self.storage_table_retention_pair_drops_total.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_storage_table_retention_ambiguous_rows_retained_total",
+			"Rows retained because table ownership or lifecycle policy resolution was ambiguous.",
+			self.storage_table_retention_ambiguous_rows_retained_total
+				.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_storage_table_retention_lag_seconds",
+			"Maximum observed age in seconds of rows still physically present below an effective retention floor.",
+			self.storage_table_retention_lag_seconds.get(),
+		);
+		self.storage_table_retention_policy_active_tables.render(
+			&mut out,
+			"wendelon_storage_table_retention_policy_active_tables_total",
+			"Current table lifecycle catalog entries by retention mode.",
+		);
 		let compression_records_written_total =
 			namespaced_metric("storage_compression_records_written_total");
 		self.storage_compression_records_written.render(
@@ -2519,7 +2802,7 @@ fn mask_selectivity(rows_scanned: u64, rows_returned: u64) -> f64 {
 mod tests {
 	use super::{
 		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome, PbcRuntime,
-		PendingFinalizationReplayPath, render_histogram,
+		PendingFinalizationReplayPath, TableRetentionMetricPolicy, render_histogram,
 	};
 	use crate::schema::WriteStatus;
 	use std::time::Duration;
@@ -2644,6 +2927,86 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{}{{reason=\"too_many_bytes\"}} 1",
 			namespaced_test_metric("storage_l2_column_fetch_fallback_total")
+		)));
+	}
+
+	#[test]
+	fn registry_renders_table_retention_metric_values() {
+		let registry = MetricsRegistry::default();
+		registry
+			.observe_storage_table_retention_policy_update(TableRetentionMetricPolicy::FixedWindow);
+		registry
+			.observe_storage_table_retention_policy_update(TableRetentionMetricPolicy::Disabled);
+		registry.observe_storage_table_retention_read_floor_reject();
+		registry.observe_storage_table_retention_read_filtered_rows(3);
+		registry.observe_storage_table_retention_l1_prune(5, 2, 1024, 1, 4, 30);
+		registry.observe_storage_table_retention_l2_prune(7, 3, 2048, 2, 6, 90);
+		registry.set_storage_table_retention_policy_active_tables(11, 12, 13);
+
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains(&format!(
+			"{}{{policy=\"fixed_window\"}} 1",
+			namespaced_test_metric("storage_table_retention_policy_updates_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{policy=\"disabled\"}} 1",
+			namespaced_test_metric("storage_table_retention_policy_updates_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 1",
+			namespaced_test_metric("storage_table_retention_read_floor_rejects_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 3",
+			namespaced_test_metric("storage_table_retention_read_filtered_rows_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{kind=\"data\"}} 5",
+			namespaced_test_metric("storage_table_retention_l1_rows_pruned_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{kind=\"tombstone\"}} 2",
+			namespaced_test_metric("storage_table_retention_l1_rows_pruned_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 1024",
+			namespaced_test_metric("storage_table_retention_l1_bytes_reclaimed_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{kind=\"data\"}} 7",
+			namespaced_test_metric("storage_table_retention_l2_rows_pruned_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{kind=\"tombstone\"}} 3",
+			namespaced_test_metric("storage_table_retention_l2_rows_pruned_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 2048",
+			namespaced_test_metric("storage_table_retention_l2_bytes_reclaimed_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 3",
+			namespaced_test_metric("storage_table_retention_pair_drops_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 10",
+			namespaced_test_metric("storage_table_retention_ambiguous_rows_retained_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{} 90",
+			namespaced_test_metric("storage_table_retention_lag_seconds")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{mode=\"inherit\"}} 11",
+			namespaced_test_metric("storage_table_retention_policy_active_tables_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{mode=\"disabled\"}} 12",
+			namespaced_test_metric("storage_table_retention_policy_active_tables_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{mode=\"fixed\"}} 13",
+			namespaced_test_metric("storage_table_retention_policy_active_tables_total")
 		)));
 	}
 

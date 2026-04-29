@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, LargeBinaryArray, TimestampMillisecondArray};
@@ -5,7 +6,8 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wendelon::hash::state_digest::{
 	DOMAIN_TABLE_ROW_PHYSICAL, DOMAIN_TABLE_ROW_VISIBLE, StateDigest, StateDigestAccumulator,
-	StateDigestElement, accumulate_projected_scalars, projected_scalar_bytes, visible_row_element,
+	StateDigestElement, accumulate_projected_scalars, apply_retention_eviction_to_visible_digest,
+	projected_scalar_bytes, visible_row_element,
 };
 use wendelon::schema::{
 	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, Locality, LocalityPolicyV1,
@@ -14,7 +16,7 @@ use wendelon::schema::{
 	TenantId, WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
 };
 use wendelon::storage::{
-	MultiRowSourceRow, decode_batch, pack_record_batch_by_bucket,
+	MultiRowSourceRow, decode_batch, pack_multirow_source_rows, pack_record_batch_by_bucket,
 	pack_tombstone_multirow_source_rows_with_policy, storage_rows_from_batch,
 };
 
@@ -61,6 +63,28 @@ fn digest_visible_delta(
 	}
 	for row_key_id in subtracts {
 		accumulator.subtract_element(visible_row_element(tenant, table, *row_key_id));
+	}
+	accumulator.finish()
+}
+
+fn digest_after_retention_evictions(
+	tenant: TenantId,
+	table: TableObjectId,
+	adds: &[Identity],
+	tombstones: &[Identity],
+	evictions: &[(Identity, bool)],
+) -> StateDigest {
+	let mut accumulator =
+		StateDigestAccumulator::from_digest(digest_visible_delta(tenant, table, adds, tombstones))
+			.expect("visible digest should decompress");
+	for (row_key_id, is_tombstone) in evictions {
+		apply_retention_eviction_to_visible_digest(
+			&mut accumulator,
+			tenant,
+			table,
+			*row_key_id,
+			*is_tombstone,
+		);
 	}
 	accumulator.finish()
 }
@@ -411,6 +435,193 @@ fn row_tombstone_pair_gc_and_retombstone_noop_preserve_digest() {
 	duplicate_delete.subtract_element(element);
 	duplicate_delete.subtract_element(element);
 	assert_ne!(StateDigest::ZERO, duplicate_delete.finish());
+}
+
+#[test]
+fn retention_data_row_eviction_subtracts_visible_rows() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let rows = row_key_ids(6);
+	let evictions = [(rows[1], false), (rows[4], false)];
+	let survivors = [rows[0], rows[2], rows[3], rows[5]];
+
+	assert_eq!(
+		digest_rows(tenant, table, &survivors),
+		digest_after_retention_evictions(tenant, table, &rows, &[], &evictions)
+	);
+}
+
+#[test]
+fn retention_tombstone_row_eviction_adds_visible_rows_back() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let tombstones = [row_key_id(20), row_key_id(21)];
+	let evictions = [(tombstones[0], true), (tombstones[1], true)];
+
+	assert_eq!(
+		StateDigest::ZERO,
+		digest_after_retention_evictions(tenant, table, &[], &tombstones, &evictions)
+	);
+}
+
+#[test]
+fn retention_pair_eviction_preserves_pair_gc_digest_invariant() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let row = row_key_id(48);
+	let evictions = [(row, false), (row, true)];
+
+	assert_eq!(
+		StateDigest::ZERO,
+		digest_after_retention_evictions(tenant, table, &[row], &[row], &evictions)
+	);
+}
+
+#[test]
+fn retention_eviction_order_is_independent() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let row = row_key_id(49);
+
+	let data_first = [(row, false), (row, true)];
+	let tombstone_first = [(row, true), (row, false)];
+
+	assert_eq!(
+		digest_after_retention_evictions(tenant, table, &[row], &[row], &data_first),
+		digest_after_retention_evictions(tenant, table, &[row], &[row], &tombstone_first)
+	);
+}
+
+#[test]
+fn retention_eviction_matches_multi_slab_survivor_digest() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let slab_a = row_key_ids(4);
+	let slab_b = row_key_ids(8)[4..].to_vec();
+	let mut all_rows = slab_a.clone();
+	all_rows.extend_from_slice(&slab_b);
+	let evictions = [
+		(all_rows[1], false),
+		(all_rows[5], false),
+		(all_rows[6], false),
+	];
+	let survivors = [
+		all_rows[0],
+		all_rows[2],
+		all_rows[3],
+		all_rows[4],
+		all_rows[7],
+	];
+
+	assert_eq!(
+		digest_rows(tenant, table, &survivors),
+		digest_after_retention_evictions(tenant, table, &all_rows, &[], &evictions)
+	);
+}
+
+#[test]
+fn retention_re_eviction_guard_prevents_double_subtract() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let rows = row_key_ids(3);
+	let duplicate_evictions = [(rows[1], false), (rows[1], false)];
+
+	let mut guarded = StateDigestAccumulator::from_digest(digest_rows(tenant, table, &rows))
+		.expect("visible digest should decompress");
+	let mut seen = BTreeSet::new();
+	for (row_key_id, is_tombstone) in duplicate_evictions {
+		if seen.insert((row_key_id, is_tombstone)) {
+			apply_retention_eviction_to_visible_digest(
+				&mut guarded,
+				tenant,
+				table,
+				row_key_id,
+				is_tombstone,
+			);
+		}
+	}
+
+	let expected = digest_rows(tenant, table, &[rows[0], rows[2]]);
+	assert_eq!(expected, guarded.finish());
+	assert_ne!(
+		expected,
+		digest_after_retention_evictions(tenant, table, &rows, &[], &duplicate_evictions)
+	);
+}
+
+#[test]
+fn retention_eviction_helper_matches_real_multirow_survivors() {
+	let tenant = TenantId::new(48);
+	let table = TableObjectId::new([0x48; 16]);
+	let writer = WriterNodeId::new([0x48; 16]);
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 1_700_000_048_000,
+		logical: 0,
+		node_id: 48,
+	};
+	let floor = HybridTimestamp {
+		physical_ms: 1_700_000_048_003,
+		logical: 0,
+		node_id: 48,
+	};
+	let rows = 6usize;
+	let layout = MultiRowLayoutDescriptor::new(2, 64, 1024 * 1024).unwrap();
+	let batch = append_only_batch(rows);
+	let source_rows = (0..rows)
+		.map(|row| {
+			let row_hlc = HybridTimestamp {
+				physical_ms: commit_hlc.physical_ms + row as u64,
+				logical: 0,
+				node_id: 48,
+			};
+			MultiRowSourceRow {
+				source_row_index: row,
+				key_identity: synthesize_append_only_row_id(
+					tenant,
+					table,
+					writer,
+					row_hlc,
+					IntraBatchIndex::try_new(row as u32).unwrap(),
+				),
+				routing_locality: Locality::new((row as u64) + 1),
+				row_hlc,
+				is_tombstone: false,
+				table_object_id: Some(table),
+			}
+		})
+		.collect::<Vec<_>>();
+	let packed =
+		pack_multirow_source_rows(layout, &batch, &source_rows).expect("pack multi-row records");
+
+	let mut storage_rows = Vec::new();
+	for record in &packed {
+		let decoded = decode_batch(&record.encoded.frame).unwrap();
+		storage_rows.extend(storage_rows_from_batch(&decoded).unwrap());
+	}
+	assert_eq!(storage_rows.len(), rows);
+	assert!(storage_rows.iter().all(|row| !row.is_tombstone));
+
+	let all_row_keys = storage_rows
+		.iter()
+		.map(|row| row.key_identity)
+		.collect::<Vec<_>>();
+	let evictions = storage_rows
+		.iter()
+		.filter(|row| row.row_hlc < floor)
+		.map(|row| (row.key_identity, row.is_tombstone))
+		.collect::<Vec<_>>();
+	let survivors = storage_rows
+		.iter()
+		.filter(|row| row.row_hlc >= floor)
+		.map(|row| row.key_identity)
+		.collect::<Vec<_>>();
+	assert!(!evictions.is_empty());
+	assert!(!survivors.is_empty());
+
+	assert_eq!(
+		digest_rows(tenant, table, &survivors),
+		digest_after_retention_evictions(tenant, table, &all_row_keys, &[], &evictions)
+	);
 }
 
 fn append_only_descriptor(

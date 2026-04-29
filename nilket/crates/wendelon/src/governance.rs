@@ -52,6 +52,7 @@ pub enum AdministrativeAction {
 	TenantSuspend,
 	TenantResume,
 	TenantDelete,
+	TableRetentionPolicyUpdate,
 	TenantKekRotate,
 	TenantKekRetire,
 	RevocationList,
@@ -105,7 +106,8 @@ pub fn require_administrative_action(
 		AdministrativeAction::TenantCreate
 		| AdministrativeAction::TenantUpdateQuota
 		| AdministrativeAction::TenantSuspend
-		| AdministrativeAction::TenantResume => {
+		| AdministrativeAction::TenantResume
+		| AdministrativeAction::TableRetentionPolicyUpdate => {
 			authorize_actor(actor, ActorPermission::TenantAdminMutation)
 		}
 		AdministrativeAction::TenantKekRotate | AdministrativeAction::TenantKekRetire => {
@@ -227,6 +229,13 @@ mod tests {
 		assert!(
 			require_administrative_action(&tenant_admin, AdministrativeAction::TenantUpdateQuota)
 				.is_ok()
+		);
+		assert!(
+			require_administrative_action(
+				&tenant_admin,
+				AdministrativeAction::TableRetentionPolicyUpdate,
+			)
+			.is_ok()
 		);
 		assert!(
 			require_administrative_action(&backup_admin, AdministrativeAction::TenantKekRotate)

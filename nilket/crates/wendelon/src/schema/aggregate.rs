@@ -424,6 +424,7 @@ pub enum AggRejectCode {
 	PartialCrossbindFailed = 14,
 	PartialStateTooLarge = 15,
 	NumericOverflow = 16,
+	RetentionExpired = 17,
 }
 
 impl AggRejectCode {
@@ -449,6 +450,7 @@ impl AggRejectCode {
 			Self::PartialCrossbindFailed => "AGG_REJECT_PARTIAL_CROSSBIND_FAILED",
 			Self::PartialStateTooLarge => "AGG_REJECT_PARTIAL_STATE_TOO_LARGE",
 			Self::NumericOverflow => "AGG_NUMERIC_OVERFLOW",
+			Self::RetentionExpired => "AGG_REJECT_RETENTION_EXPIRED",
 		}
 	}
 }
@@ -801,6 +803,7 @@ mod tests {
 		assert_eq!(AggRejectCode::FormatVersion.code(), 1);
 		assert_eq!(AggRejectCode::PartialStateTooLarge.code(), 15);
 		assert_eq!(AggRejectCode::NumericOverflow.code(), 16);
+		assert_eq!(AggRejectCode::RetentionExpired.code(), 17);
 	}
 
 	#[test]

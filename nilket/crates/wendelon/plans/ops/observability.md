@@ -213,6 +213,25 @@ The pilot ships with the following Prometheus/OpenMetrics surface. Metric names 
 | `wendelon_storage_migration_reclaimed_slabs_total` | counter | none | Tombstoned slabs reclaimed after migration |
 | `wendelon_storage_migration_reclaimed_bytes_total` | counter | none | Bytes reclaimed after migration |
 
+#### Table Retention
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `wendelon_storage_table_retention_policy_updates_total` | counter | `policy` (`inherit_cluster`, `disabled`, `fixed_window`) | Accepted typed lifecycle mutations by target policy |
+| `wendelon_storage_table_retention_read_floor_rejects_total` | counter | none | Reads rejected because `as_of_hlc` predates the effective table floor |
+| `wendelon_storage_table_retention_read_filtered_rows_total` | counter | none | Rows hidden by the logical read-time floor before physical compaction catches up |
+| `wendelon_storage_table_retention_l1_rows_pruned_total` | counter | `kind` (`data`, `tombstone`) | Rows pruned from L1 by table-aware retention compaction |
+| `wendelon_storage_table_retention_l1_bytes_reclaimed_total` | counter | none | L1 bytes reclaimed by table-aware retention compaction |
+| `wendelon_storage_table_retention_l2_rows_pruned_total` | counter | `kind` (`data`, `tombstone`) | Rows pruned from L2 by table-aware retention rewrites |
+| `wendelon_storage_table_retention_l2_bytes_reclaimed_total` | counter | none | L2 bytes reclaimed by table-aware retention rewrites |
+| `wendelon_storage_table_retention_pair_drops_total` | counter | none | Data/tombstone pairs jointly reclaimed after the table floor crosses `delete_hlc` |
+| `wendelon_storage_table_retention_ambiguous_rows_retained_total` | counter | none | Rows retained because table ownership or lifecycle resolution was ambiguous |
+| `wendelon_storage_table_retention_lag_seconds` | gauge | none | Maximum observed age of rows still physically present below an effective table floor |
+| `wendelon_storage_table_retention_policy_active_tables_total` | gauge | `mode` (`inherit`, `disabled`, `fixed`) | Current lifecycle catalog entries by retention mode |
+
+These metrics intentionally do not label by tenant or table. Use audit
+events and traces for tenant/table attribution; Prometheus remains a
+bounded-cardinality operational surface.
+
 #### Crypto / Audit
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|

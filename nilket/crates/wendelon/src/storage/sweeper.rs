@@ -79,7 +79,8 @@ use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId, Tomb
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
-	PreparedTieredRetentionRewrite, SealedSlabInfo, SlabManager, TieredSlabPointer,
+	PreparedTieredRetentionRewrite, RetentionCompactionStats, SealedSlabInfo, SlabManager,
+	TieredSlabPointer,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -363,6 +364,19 @@ impl SlabSweeper {
 		report.retention_reclaimed_bytes = retention_rewrites.reclaimed_bytes;
 		report.retention_rewrite_failures = retention_rewrites.failed;
 		report.failed += retention_rewrites.failed;
+		if retention_rewrites.pruned_versions > 0
+			|| retention_rewrites.max_lag_seconds > 0
+			|| retention_rewrites.ambiguous_rows_retained > 0
+		{
+			metrics().observe_storage_table_retention_l2_prune(
+				retention_rewrites.pruned_data_rows as u64,
+				retention_rewrites.pruned_tombstone_rows as u64,
+				retention_rewrites.reclaimed_bytes,
+				retention_rewrites.pair_drops as u64,
+				retention_rewrites.ambiguous_rows_retained as u64,
+				retention_rewrites.max_lag_seconds,
+			);
+		}
 		let reclaim = self.reclaim_tombstoned_ranges_once(1).await?;
 		report.reclaimed_slabs = reclaim.compacted_slabs;
 		report.reclaimed_bytes = reclaim.reclaimed_bytes;
@@ -811,11 +825,11 @@ impl SlabSweeper {
 		Ok(TenantKekRewrapOutcome::Rewrapped)
 	}
 
-	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
+	fn mvcc_retention_floor_hlc_at(&self, now_ms: u64) -> Option<HybridTimestamp> {
 		let window = self.mvcc_retention_policy.window()?;
 		let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
 		Some(HybridTimestamp {
-			physical_ms: self.clock.now_ms().saturating_sub(window_ms),
+			physical_ms: now_ms.saturating_sub(window_ms),
 			logical: 0,
 			node_id: 0,
 		})
@@ -826,23 +840,38 @@ impl SlabSweeper {
 		max_slabs: usize,
 	) -> std::io::Result<TieredRetentionRewriteReport> {
 		let mut report = TieredRetentionRewriteReport::default();
-		let Some(retention_floor) = self.mvcc_retention_floor_hlc() else {
-			return Ok(report);
-		};
 		if max_slabs == 0 {
 			return Ok(report);
 		}
+		let now_ms = self.clock.now_ms();
+		let audit_floor = self
+			.mvcc_retention_floor_hlc_at(now_ms)
+			.unwrap_or(HybridTimestamp {
+				physical_ms: now_ms,
+				logical: 0,
+				node_id: 0,
+			});
 		for pointer in self.slab.list_tiered_slabs().await {
 			if report.rewritten >= max_slabs {
 				break;
 			}
 			match self
-				.rewrite_one_tiered_slab_for_retention(&pointer, retention_floor)
+				.rewrite_one_tiered_slab_for_retention(&pointer, now_ms, audit_floor)
 				.await
 			{
 				Ok(Some(outcome)) => {
-					report.rewritten += 1;
+					if outcome.mutated_slab {
+						report.rewritten += 1;
+					}
 					report.pruned_versions += outcome.pruned_versions;
+					report.pruned_data_rows += outcome.retention_stats.pruned_data_rows;
+					report.pruned_tombstone_rows += outcome.retention_stats.pruned_tombstone_rows;
+					report.pair_drops += outcome.retention_stats.pair_drops;
+					report.ambiguous_rows_retained +=
+						outcome.retention_stats.ambiguous_rows_retained;
+					report.max_lag_seconds = report
+						.max_lag_seconds
+						.max(outcome.retention_stats.max_lag_seconds);
 					report.reclaimed_bytes += outcome.reclaimed_bytes;
 				}
 				Ok(None) => {}
@@ -863,13 +892,20 @@ impl SlabSweeper {
 	async fn rewrite_one_tiered_slab_for_retention(
 		&self,
 		pointer: &TieredSlabPointer,
-		retention_floor: HybridTimestamp,
+		now_ms: u64,
+		audit_floor: HybridTimestamp,
 	) -> std::io::Result<Option<PreparedTieredRetentionOutcome>> {
 		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2RetentionRewrite);
 		let snapshot = self.state_machine.state_snapshot().await;
 		let Some(prepared) = self
 			.slab
-			.prepare_tiered_retention_rewrite(pointer, retention_floor, &snapshot.table_schemas)
+			.prepare_tiered_table_retention_rewrite(
+				pointer,
+				self.mvcc_retention_policy,
+				&snapshot.table_lifecycle,
+				&snapshot.table_schemas,
+				now_ms,
+			)
 			.await?
 		else {
 			return Ok(None);
@@ -883,6 +919,7 @@ impl SlabSweeper {
 				tombstone_metadata,
 				supersession_metadata,
 				pruned_versions,
+				retention_stats,
 				reclaimed_bytes,
 			} => {
 				let key = self.retention_rewritten_key(slab_id);
@@ -963,7 +1000,7 @@ impl SlabSweeper {
 				);
 				self.emit_retention_pruned_audit(
 					slab_id,
-					retention_floor,
+					audit_floor,
 					pruned_versions,
 					reclaimed_bytes,
 					&old_l2_uri,
@@ -971,7 +1008,9 @@ impl SlabSweeper {
 					"rewrite",
 				);
 				Ok(Some(PreparedTieredRetentionOutcome {
+					mutated_slab: true,
 					pruned_versions,
+					retention_stats,
 					reclaimed_bytes,
 				}))
 			}
@@ -979,6 +1018,7 @@ impl SlabSweeper {
 				slab_id,
 				old_l2_uri,
 				pruned_versions,
+				retention_stats,
 				reclaimed_bytes,
 			} => {
 				self.raft.retire_tiered_slab(slab_id).await?;
@@ -1002,7 +1042,7 @@ impl SlabSweeper {
 				);
 				self.emit_retention_pruned_audit(
 					slab_id,
-					retention_floor,
+					audit_floor,
 					pruned_versions,
 					reclaimed_bytes,
 					&old_l2_uri,
@@ -1010,8 +1050,18 @@ impl SlabSweeper {
 					"retire",
 				);
 				Ok(Some(PreparedTieredRetentionOutcome {
+					mutated_slab: true,
 					pruned_versions,
+					retention_stats,
 					reclaimed_bytes,
+				}))
+			}
+			PreparedTieredRetentionRewrite::Observe { retention_stats } => {
+				Ok(Some(PreparedTieredRetentionOutcome {
+					mutated_slab: false,
+					pruned_versions: 0,
+					retention_stats,
+					reclaimed_bytes: 0,
 				}))
 			}
 		}
@@ -1501,13 +1551,20 @@ struct SupersessionMetadataBackfillReport {
 struct TieredRetentionRewriteReport {
 	rewritten: usize,
 	pruned_versions: usize,
+	pruned_data_rows: usize,
+	pruned_tombstone_rows: usize,
+	pair_drops: usize,
+	ambiguous_rows_retained: usize,
+	max_lag_seconds: u64,
 	reclaimed_bytes: u64,
 	failed: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreparedTieredRetentionOutcome {
+	mutated_slab: bool,
 	pruned_versions: usize,
+	retention_stats: RetentionCompactionStats,
 	reclaimed_bytes: u64,
 }
 

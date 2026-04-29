@@ -1,9 +1,9 @@
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
-	ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TenantId, TenantKekId,
-	TombstoneMetadata,
+	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId, PolicyGeneration,
+	ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TableObjectId, TableRetentionPolicy,
+	TenantId, TenantKekId, TombstoneMetadata,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -301,6 +301,15 @@ pub struct UpdateTenantQuota {
 	pub quota_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetTableRetentionPolicy {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub expected_policy_generation: PolicyGeneration,
+	pub new_policy: TableRetentionPolicy,
+	pub updated_at_hlc: HybridTimestamp,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RevokedActorKeyId {
 	pub trust_domain: ActorTrustDomain,
@@ -390,6 +399,10 @@ pub enum WendelonRequest {
 	/// denylist is replicated so transport and observability admission
 	/// do not depend on best-effort local refresh.
 	RevokeActorKey(RevokeActorKey),
+	/// Update per-table lifecycle retention policy through the typed
+	/// engine mutation surface. User-facing policy syntax is resolved
+	/// by client tools before this request is submitted.
+	SetTableRetentionPolicy(SetTableRetentionPolicy),
 }
 
 /// The response returned to the client after a Raft command is committed.

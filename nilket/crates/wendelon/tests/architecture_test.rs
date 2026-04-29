@@ -217,6 +217,157 @@ fn test_no_brand_leaked_pbc_names_in_code_surfaces() {
 }
 
 #[test]
+fn test_adr048_retention_policy_surface_stays_typed_and_brand_clean() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let scan_roots = ["src", "tests", "benches"];
+	let mut violations: Vec<String> = Vec::new();
+	let forbidden_needles = [
+		"RETENTION_REJECTED_BAD_UNIT",
+		"RETENTION_REJECTED_NEGATIVE",
+		"RETENTION_REJECTED_ZERO",
+		"RETENTION_REJECTED_STALE_GENERATION",
+		"TABLE_RETENTION_REQ",
+		"TABLE_RETENTION_RESP",
+		"RETENTION_REQ",
+		"RETENTION_RESP",
+		"parse_retention",
+		"retention_parser",
+		"parse_retention_policy",
+		"parse_table_retention",
+		"ALTER TABLE",
+		"RETENTION =",
+		"WendelonRetention",
+		"wendelon_retention",
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden_needles {
+				if content.contains(needle) {
+					violations.push(format!("{}: contains '{}'", path.display(), needle));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 048 retention policy engine surface must stay typed and brand-clean:\n{}",
+		violations.join("\n")
+	);
+
+	let lifecycle_source =
+		fs::read_to_string(manifest_dir.join("src/schema/lifecycle.rs")).unwrap();
+	assert!(
+		lifecycle_source.contains("pub enum TableRetentionPolicy {\n\tInheritCluster,\n\tDisabled,\n\tFixedWindow(RetentionWindowMillis),\n}"),
+		"TableRetentionPolicy must stay a three-variant typed enum"
+	);
+	assert!(
+		!lifecycle_source.contains("at_generation"),
+		"ADR 048 rejected at_generation retention snapshots"
+	);
+
+	let table_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let descriptor_block = table_source
+		.split_once("pub struct TableSchemaDescriptorV1 {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("TableSchemaDescriptorV1 block should be present");
+	assert!(
+		!descriptor_block.to_ascii_lowercase().contains("retention"),
+		"TableSchemaDescriptorV1 must not carry retention policy fields"
+	);
+
+	let transport_source =
+		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let capability_block = transport_source
+		.split_once("pub enum NodeCapability {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("NodeCapability block should be present");
+	assert!(
+		!capability_block.contains("Retention"),
+		"ADR 048 must not add a retention node capability bit"
+	);
+
+	let raft_storage_source =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	assert!(
+		raft_storage_source.contains("pub table_lifecycle: TableLifecycleCatalog,"),
+		"SmState must keep the table lifecycle catalog explicit"
+	);
+	assert!(
+		!raft_storage_source.contains("#[serde(default)]\n\tpub table_lifecycle"),
+		"ADR 048 forbids a serde default shim on retention state"
+	);
+
+	let state_digest_source =
+		fs::read_to_string(manifest_dir.join("src/hash/state_digest.rs")).unwrap();
+	assert_eq!(
+		state_digest_source
+			.matches("StateDigestDomain(b\"digest.")
+			.count(),
+		5,
+		"ADR 048 must not add a new state-digest domain constant"
+	);
+	assert!(
+		state_digest_source.contains("apply_retention_eviction_to_visible_digest"),
+		"ADR 048 retention must reuse the visible-domain eviction helper"
+	);
+	assert!(
+		!state_digest_source.contains("retention_gc_element"),
+		"ADR 048 must not introduce a retention-specific digest element helper"
+	);
+
+	let data_server_source =
+		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	assert!(
+		data_server_source.contains("aggregate_csb_retention_decision"),
+		"ADR 048 aggregate CSB path must gate retention-active direct answers by slab row-HLC bounds"
+	);
+	assert!(
+		!data_server_source
+			.contains("if prepared.retention_floor.is_some() {\n\t\t\treturn Ok(None);\n\t\t}"),
+		"ADR 048 aggregate CSB path must not disable every retention-active direct answer"
+	);
+
+	let runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/table_retention.md")).unwrap();
+	for signal in [
+		"SetTableRetentionPolicy",
+		"wendelon_storage_table_retention_policy_updates_total",
+		"wendelon_storage_table_retention_read_floor_rejects_total",
+		"table.retention_policy_updated",
+	] {
+		assert!(
+			runbook.contains(signal),
+			"ADR 048 runbook must mention {signal}"
+		);
+	}
+}
+
+#[test]
 fn test_adr042_protocol_surfaces_stay_brand_clean_and_unsuffixed() {
 	let rendered_metrics = wendelon::metrics::MetricsRegistry::default().render_prometheus();
 	let mut violations: Vec<String> = Vec::new();

@@ -264,6 +264,7 @@ pub enum AuditOperation {
 	MvccSnapshotPruned,
 	TenantCreated,
 	TenantQuotaUpdated,
+	TableRetentionPolicyUpdated,
 	TenantSuspended,
 	TenantResumed,
 	TenantDeleteRequested,
@@ -294,6 +295,7 @@ impl AuditOperation {
 			Self::MvccSnapshotPruned => "mvcc.snapshot_pruned",
 			Self::TenantCreated => "tenant.created",
 			Self::TenantQuotaUpdated => "tenant.quota_updated",
+			Self::TableRetentionPolicyUpdated => "table.retention_policy_updated",
 			Self::TenantSuspended => "tenant.suspended",
 			Self::TenantResumed => "tenant.resumed",
 			Self::TenantDeleteRequested => "tenant.delete_requested",
@@ -339,6 +341,7 @@ impl<'de> Deserialize<'de> for AuditOperation {
 			"mvcc.snapshot_pruned" => Ok(Self::MvccSnapshotPruned),
 			"tenant.created" => Ok(Self::TenantCreated),
 			"tenant.quota_updated" => Ok(Self::TenantQuotaUpdated),
+			"table.retention_policy_updated" => Ok(Self::TableRetentionPolicyUpdated),
 			"tenant.suspended" => Ok(Self::TenantSuspended),
 			"tenant.resumed" => Ok(Self::TenantResumed),
 			"tenant.delete_requested" => Ok(Self::TenantDeleteRequested),
@@ -384,6 +387,7 @@ pub enum AdministrativeControlAction {
 	AdvanceEpoch,
 	TenantCreate,
 	TenantQuotaUpdate,
+	TableRetentionPolicyUpdate,
 	TenantSuspend,
 	TenantResume,
 	TenantDeleteRequest,
@@ -399,6 +403,22 @@ pub struct AdministrativeControlSchema {
 	pub target_tenant_id: Option<u64>,
 	#[serde(default)]
 	pub target_tenant_kek_id: Option<u64>,
+	#[serde(default)]
+	pub target_table_object_id: Option<String>,
+	#[serde(default)]
+	pub policy_generation: Option<u64>,
+	#[serde(default)]
+	pub retention_policy: Option<String>,
+	#[serde(default)]
+	pub retention_window_ms: Option<u64>,
+	#[serde(default)]
+	pub previous_retention_policy: Option<String>,
+	#[serde(default)]
+	pub previous_retention_window_ms: Option<u64>,
+	#[serde(default)]
+	pub retention_extends_window: Option<bool>,
+	#[serde(default)]
+	pub retention_extension_restores_history: Option<bool>,
 	#[serde(default)]
 	pub target_role: Option<String>,
 	#[serde(default)]

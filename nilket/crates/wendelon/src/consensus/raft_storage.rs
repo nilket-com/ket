@@ -54,8 +54,8 @@ use crate::audit::{
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
-	TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab, UpdateTenantQuota,
-	WendelonRequest, WendelonResponse, WendelonTypeConfig,
+	SetTableRetentionPolicy, TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab,
+	UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
@@ -65,8 +65,9 @@ use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
-	RaftLogEntryFixed, SlabId, SnapshotHeader, TableSchemaCatalogV1, TenantId, TenantKekId,
-	WALRecordHeader, decode_table_schema_descriptor_v1, validate_table_schema_evolution,
+	RaftLogEntryFixed, RowIdentityPolicy, SlabId, SnapshotHeader, TableLifecycleCatalog,
+	TableRetentionPolicy, TableSchemaCatalogV1, TenantId, TenantKekId, WALRecordHeader,
+	decode_table_schema_descriptor_v1, validate_table_schema_evolution,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -1526,6 +1527,10 @@ pub struct SmState {
 	/// the default descriptor without needing this map populated.
 	#[serde(default)]
 	pub table_schemas: TableSchemaCatalogV1,
+	/// ADR 048 table lifecycle policy keyed by durable table identity.
+	/// Retention is current lifecycle authority and intentionally stays
+	/// outside schema descriptors and schema generations.
+	pub table_lifecycle: TableLifecycleCatalog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2391,6 +2396,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				) {
 					requires_tenant_kek_snapshot_sync = true;
 				}
+				let audit_context = retention_audit_context(&guard.state, &entry);
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
@@ -2415,7 +2421,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					pending_tenant_kek_snapshot = Some(guard.state.tenant_keysets.clone());
 				}
 				if let Some(materializer) = self.audit_materializer.as_ref() {
-					if let Some(event) = raft_audit_event(materializer.local_node, &entry, &resp) {
+					if let Some(event) = raft_audit_event_with_context(
+						materializer.local_node,
+						&entry,
+						&resp,
+						audit_context,
+					) {
 						materializer.tracker.note_authoritative_event();
 						pending_audit_events.push(event);
 					}
@@ -2709,10 +2720,47 @@ fn apply_entry_to_state(
 	}
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RetentionAuditContext {
+	previous_policy: Option<TableRetentionPolicy>,
+}
+
+fn retention_audit_context(
+	state: &SmState,
+	entry: &Entry<WendelonTypeConfig>,
+) -> Option<RetentionAuditContext> {
+	let EntryPayload::Normal(WendelonRequest::SetTableRetentionPolicy(update)) = &entry.payload
+	else {
+		return None;
+	};
+	Some(RetentionAuditContext {
+		previous_policy: state
+			.table_lifecycle
+			.retention_policy(update.tenant_id, update.table_object_id)
+			.copied()
+			.or_else(|| {
+				state
+					.table_schemas
+					.latest_by_id(update.tenant_id, update.table_object_id)
+					.map(|_| TableRetentionPolicy::InheritCluster)
+			}),
+	})
+}
+
+#[cfg(test)]
 fn raft_audit_event(
 	local_node: SchemaNodeId,
 	entry: &Entry<WendelonTypeConfig>,
 	resp: &WendelonResponse,
+) -> Option<AuditEvent> {
+	raft_audit_event_with_context(local_node, entry, resp, None)
+}
+
+fn raft_audit_event_with_context(
+	local_node: SchemaNodeId,
+	entry: &Entry<WendelonTypeConfig>,
+	resp: &WendelonResponse,
+	retention_context: Option<RetentionAuditContext>,
 ) -> Option<AuditEvent> {
 	let EntryPayload::Normal(req) = &entry.payload else {
 		return None;
@@ -2972,6 +3020,71 @@ fn raft_audit_event(
 			})
 			.with_parameters(audit_outcome_parameters(resp)),
 		),
+		WendelonRequest::SetTableRetentionPolicy(update) => {
+			let table_object_id = format_bytes_hex(update.table_object_id.as_bytes());
+			let retention_policy = table_retention_policy_label(update.new_policy);
+			let retention_window_ms = table_retention_policy_window_ms(update.new_policy);
+			let previous_policy = retention_context.and_then(|context| context.previous_policy);
+			let previous_retention_policy = previous_policy.map(table_retention_policy_label);
+			let previous_retention_window_ms =
+				previous_policy.and_then(table_retention_policy_window_ms);
+			let retention_extends_window = previous_policy.is_some_and(|previous| {
+				retention_update_extends_window(previous, update.new_policy)
+			});
+			Some(
+				AuditEvent::new(
+					AuditAuthority::RaftLog,
+					AuditOperation::TableRetentionPolicyUpdated,
+					local_node,
+					format!(
+						"raft_log_index={} raft_term={} tenant_id={} table_object_id={} expected_policy_generation={} previous_retention_policy={} retention_policy={} retention_extends_window={} retention_extension_restores_history=false updated_at_hlc={:?} {}",
+						entry.log_id.index,
+						entry.log_id.leader_id.term,
+						update.tenant_id.get(),
+						table_object_id,
+						update.expected_policy_generation.get(),
+						previous_retention_policy.unwrap_or("unknown"),
+						retention_policy,
+						retention_extends_window,
+						update.updated_at_hlc,
+						audit_outcome_message(resp),
+					),
+				)
+				.with_outcome(outcome)
+				.with_raft_log_index(entry.log_id.index)
+				.with_parameter("raft_term", entry.log_id.leader_id.term)
+				.with_parameter("tenant_id", update.tenant_id.get())
+				.with_parameter("table_object_id", table_object_id.clone())
+				.with_parameter(
+					"expected_policy_generation",
+					update.expected_policy_generation.get(),
+				)
+				.with_parameter(
+					"previous_retention_policy",
+					previous_retention_policy.unwrap_or("unknown"),
+				)
+				.with_parameter("retention_policy", retention_policy)
+				.with_parameter("updated_at_hlc", format!("{:?}", update.updated_at_hlc))
+				.with_parameter("retention_extends_window", retention_extends_window)
+				.with_parameter("retention_extension_restores_history", false)
+				.with_schema(AuditSchema::AdministrativeControl {
+					action: AdministrativeControlAction::TableRetentionPolicyUpdate,
+					detail: AdministrativeControlSchema {
+						target_tenant_id: Some(update.tenant_id.get()),
+						target_table_object_id: Some(table_object_id),
+						policy_generation: Some(update.expected_policy_generation.get()),
+						retention_policy: Some(retention_policy.to_string()),
+						retention_window_ms,
+						previous_retention_policy: previous_retention_policy.map(str::to_string),
+						previous_retention_window_ms,
+						retention_extends_window: Some(retention_extends_window),
+						retention_extension_restores_history: Some(false),
+						..AdministrativeControlSchema::default()
+					},
+				})
+				.with_parameters(audit_outcome_parameters(resp)),
+			)
+		},
 		WendelonRequest::SuspendTenant(tenant_id) => Some(
 			AuditEvent::new(
 				AuditAuthority::RaftLog,
@@ -3074,6 +3187,36 @@ fn audit_outcome_parameters(resp: &WendelonResponse) -> Vec<(&'static str, serde
 			vec![("reason", serde_json::Value::String(format!("{message:?}")))]
 		}
 		_ => Vec::new(),
+	}
+}
+
+fn table_retention_policy_label(policy: TableRetentionPolicy) -> &'static str {
+	match policy {
+		TableRetentionPolicy::InheritCluster => "inherit_cluster",
+		TableRetentionPolicy::Disabled => "disabled",
+		TableRetentionPolicy::FixedWindow(_) => "fixed_window",
+	}
+}
+
+fn table_retention_policy_window_ms(policy: TableRetentionPolicy) -> Option<u64> {
+	match policy {
+		TableRetentionPolicy::FixedWindow(window) => Some(window.get()),
+		TableRetentionPolicy::InheritCluster | TableRetentionPolicy::Disabled => None,
+	}
+}
+
+fn retention_update_extends_window(
+	previous: TableRetentionPolicy,
+	next: TableRetentionPolicy,
+) -> bool {
+	match (previous, next) {
+		(TableRetentionPolicy::FixedWindow(previous), TableRetentionPolicy::FixedWindow(next)) => {
+			next.get() > previous.get()
+		}
+		(TableRetentionPolicy::Disabled, _) => false,
+		(_, TableRetentionPolicy::Disabled) => true,
+		(_, TableRetentionPolicy::InheritCluster) => false,
+		(TableRetentionPolicy::InheritCluster, TableRetentionPolicy::FixedWindow(_)) => false,
 	}
 }
 
@@ -3320,6 +3463,9 @@ fn apply_request(
 		WendelonRequest::RevokeActorKey(revocation) => {
 			(apply_revoke_actor_key(state, revocation), None)
 		}
+		WendelonRequest::SetTableRetentionPolicy(update) => {
+			(apply_set_table_retention_policy(state, update), None)
+		}
 		WendelonRequest::SeedMigration(seed) => {
 			apply_seed_migration(state, seed);
 			(WendelonResponse::Success, None)
@@ -3471,15 +3617,90 @@ fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> 
 					"table schema descriptor object does not match schema envelope".to_owned(),
 				);
 			}
+			let table_object_id = descriptor.table_object_id;
 			state
 				.table_schemas
 				.upsert(envelope.tenant_id, descriptor)
-				.map_err(|err| err.to_string())
+				.map_err(|err| err.to_string())?;
+			if envelope.mutation == SchemaMutationKindV1::Create {
+				state.table_lifecycle.ensure_inherit_cluster(
+					envelope.tenant_id,
+					table_object_id,
+					HybridTimestamp {
+						physical_ms: 0,
+						logical: 0,
+						node_id: 0,
+					},
+				);
+				observe_table_retention_active_tables(&state.table_lifecycle);
+			}
+			Ok(())
 		}
 		SchemaMutationKindV1::Drop => {
 			Err("table schema drops require an explicit data-rewrite migration".to_owned())
 		}
 	}
+}
+
+fn apply_set_table_retention_policy(
+	state: &mut SmState,
+	update: SetTableRetentionPolicy,
+) -> WendelonResponse {
+	match update.new_policy.validate() {
+		Ok(()) => {}
+		Err(err) => return WendelonResponse::Error(err.to_string()),
+	}
+	let Some(tenant) = state.tenants.get(&update.tenant_id) else {
+		return WendelonResponse::Error(format!(
+			"tenant {} does not exist",
+			update.tenant_id.get()
+		));
+	};
+	if tenant.state == TenantLifecycleState::Deleted {
+		return WendelonResponse::Error(format!("tenant {} is deleted", update.tenant_id.get()));
+	}
+	let Some(descriptor) = state
+		.table_schemas
+		.latest_by_id(update.tenant_id, update.table_object_id)
+	else {
+		return WendelonResponse::Error(format!(
+			"table {:?} does not exist for tenant {}",
+			update.table_object_id,
+			update.tenant_id.get()
+		));
+	};
+	if matches!(
+		descriptor.row_identity_policy,
+		RowIdentityPolicy::PrimaryKey(_)
+	) && update.new_policy.is_table_override_disallowed_for_pk()
+	{
+		return WendelonResponse::Error(format!(
+			"{}: PK-keyed tables only accept InheritCluster retention in V1",
+			crate::schema::RetentionRejectCode::RETENTION_REJECTED_PK_DISALLOWED
+		));
+	}
+	match state.table_lifecycle.set_next_generation(
+		update.tenant_id,
+		update.table_object_id,
+		update.expected_policy_generation,
+		update.new_policy,
+		update.updated_at_hlc,
+	) {
+		Ok(_) => {
+			observe_table_retention_active_tables(&state.table_lifecycle);
+			WendelonResponse::Success
+		}
+		Err(err) => WendelonResponse::Error(err.to_string()),
+	}
+}
+
+fn observe_table_retention_active_tables(catalog: &TableLifecycleCatalog) {
+	let counts = catalog.policy_counts();
+	metrics().set_storage_table_retention_policy_active_tables(
+		counts.inherit_cluster as u64,
+		counts.disabled as u64,
+		counts.fixed_window as u64,
+	);
 }
 
 fn apply_tenant_state_transition(
@@ -4586,6 +4807,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 			(LogEntryKind::APPEND, 0)
 		}
 		EntryPayload::Normal(WendelonRequest::RevokeActorKey(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::SetTableRetentionPolicy(_)) => {
+			(LogEntryKind::APPEND, 0)
+		}
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
 			(LogEntryKind::APPEND, s.entry.to_epoch)
 		}
@@ -4899,14 +5123,17 @@ fn _unused_request_type_witness(_r: WendelonRequest, _s: WendelonResponse) {}
 #[cfg(test)]
 mod schema_state_tests {
 	use super::*;
+	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::integration::compute::{
 		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
 		SchemaObjectKind, SchemaObjectRefV1, SchemaUpdateEnvelopeV1,
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1, encode_table_schema_descriptor_v1,
+		LocalityPolicyV1, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1,
+		RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, TableObjectId, TableRetentionPolicy, TableSchemaDescriptorV1,
+		TenantKekId, encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -4933,6 +5160,58 @@ mod schema_state_tests {
 
 	fn table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
 		table_descriptor_for_schema(generation, &table_schema())
+	}
+
+	fn append_only_table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([8; 16]),
+			generation,
+			"analytics",
+			"append_events",
+			&table_schema(),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn create_tenant() -> CreateTenant {
+		let tenant_kek_id = TenantKekId::try_from(1).unwrap();
+		let mut tenant_keyset = TenantKeyset::default();
+		tenant_keyset.active_tenant_kek_id = Some(tenant_kek_id);
+		tenant_keyset.keys.insert(
+			tenant_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![1; 40],
+			},
+		);
+		CreateTenant {
+			tenant_id: TenantId::new(7),
+			quota_bytes: u64::MAX,
+			replication_factor: 1,
+			tenant_keyset,
+		}
+	}
+
+	fn state_with_descriptor(descriptor: &TableSchemaDescriptorV1) -> SmState {
+		let mut state = SmState::default();
+		assert_eq!(
+			apply_create_tenant(&mut state, create_tenant()),
+			WendelonResponse::Success
+		);
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(
+				descriptor,
+				0,
+				descriptor.schema_generation,
+				SchemaMutationKindV1::Create,
+			),
+		)
+		.unwrap();
+		state
 	}
 
 	fn schema_envelope(
@@ -4993,6 +5272,253 @@ mod schema_state_tests {
 				.table_schemas
 				.latest_by_name(TenantId::new(7), "analytics", "events"),
 			Some(&descriptor)
+		);
+		let lifecycle = state
+			.table_lifecycle
+			.get(TenantId::new(7), descriptor.table_object_id)
+			.expect("create should initialize table lifecycle");
+		assert_eq!(lifecycle.policy_generation, PolicyGeneration::ZERO);
+		assert_eq!(lifecycle.retention, TableRetentionPolicy::InheritCluster);
+	}
+
+	#[test]
+	fn set_table_retention_policy_accepts_append_only_fixed_window() {
+		let descriptor = append_only_table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let update = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			expected_policy_generation: PolicyGeneration::ZERO,
+			new_policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 1,
+				node_id: 2,
+			},
+		};
+
+		let (resp, event) =
+			apply_request(&mut state, WendelonRequest::SetTableRetentionPolicy(update));
+
+		assert_eq!(resp, WendelonResponse::Success);
+		assert!(event.is_none());
+		let lifecycle = state
+			.table_lifecycle
+			.get(TenantId::new(7), descriptor.table_object_id)
+			.unwrap();
+		assert_eq!(lifecycle.policy_generation, PolicyGeneration::new(1));
+		assert_eq!(lifecycle.retention, update.new_policy);
+		assert_eq!(lifecycle.updated_at_hlc, update.updated_at_hlc);
+	}
+
+	#[test]
+	fn set_table_retention_policy_rejects_pk_override() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let update = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			expected_policy_generation: PolicyGeneration::ZERO,
+			new_policy: TableRetentionPolicy::Disabled,
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 0,
+				node_id: 2,
+			},
+		};
+
+		let (resp, _) = apply_request(&mut state, WendelonRequest::SetTableRetentionPolicy(update));
+
+		let WendelonResponse::Error(error) = resp else {
+			panic!("expected PK override rejection");
+		};
+		assert!(error.contains(RetentionRejectCode::RETENTION_REJECTED_PK_DISALLOWED.name()));
+		assert_eq!(
+			state
+				.table_lifecycle
+				.current_generation(TenantId::new(7), descriptor.table_object_id),
+			PolicyGeneration::ZERO
+		);
+	}
+
+	#[test]
+	fn set_table_retention_policy_rejects_stale_generation_generically() {
+		let descriptor = append_only_table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let first = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			expected_policy_generation: PolicyGeneration::ZERO,
+			new_policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 0,
+				node_id: 2,
+			},
+		};
+		assert_eq!(
+			apply_request(&mut state, WendelonRequest::SetTableRetentionPolicy(first)).0,
+			WendelonResponse::Success
+		);
+
+		let stale = SetTableRetentionPolicy {
+			expected_policy_generation: PolicyGeneration::ZERO,
+			new_policy: TableRetentionPolicy::Disabled,
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 43,
+				logical: 0,
+				node_id: 2,
+			},
+			..first
+		};
+		let (resp, _) = apply_request(&mut state, WendelonRequest::SetTableRetentionPolicy(stale));
+
+		let WendelonResponse::Error(error) = resp else {
+			panic!("expected stale-generation rejection");
+		};
+		assert!(error.contains("stale policy_generation"));
+		assert!(!error.contains("RETENTION_REJECTED"));
+		assert_eq!(
+			state
+				.table_lifecycle
+				.current_generation(TenantId::new(7), descriptor.table_object_id),
+			PolicyGeneration::new(1)
+		);
+	}
+
+	#[test]
+	fn table_retention_policy_update_is_attempt_audited() {
+		let update = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([8; 16]),
+			expected_policy_generation: PolicyGeneration::new(2),
+			new_policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 1,
+				node_id: 2,
+			},
+		};
+		let entry = Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 0), 11),
+			payload: EntryPayload::Normal(WendelonRequest::SetTableRetentionPolicy(update)),
+		};
+
+		let event = raft_audit_event(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			&entry,
+			&WendelonResponse::Success,
+		)
+		.expect("retention policy update must emit audit");
+
+		assert_eq!(event.operation, AuditOperation::TableRetentionPolicyUpdated);
+		assert_eq!(
+			event
+				.parameters
+				.get("retention_policy")
+				.and_then(|value| value.as_str()),
+			Some("fixed_window")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("expected_policy_generation")
+				.and_then(|value| value.as_u64()),
+			Some(2)
+		);
+		let Some(AuditSchema::AdministrativeControl { action, detail }) = event.schema else {
+			panic!("expected administrative-control audit schema");
+		};
+		assert_eq!(
+			action,
+			AdministrativeControlAction::TableRetentionPolicyUpdate
+		);
+		assert_eq!(detail.target_tenant_id, Some(7));
+		assert_eq!(detail.policy_generation, Some(2));
+		assert_eq!(detail.retention_policy.as_deref(), Some("fixed_window"));
+		assert_eq!(detail.retention_window_ms, Some(90_000));
+	}
+
+	#[test]
+	fn table_retention_policy_update_audit_marks_irreversible_extension() {
+		let update = SetTableRetentionPolicy {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([8; 16]),
+			expected_policy_generation: PolicyGeneration::new(2),
+			new_policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+			updated_at_hlc: HybridTimestamp {
+				physical_ms: 42,
+				logical: 1,
+				node_id: 2,
+			},
+		};
+		let entry = Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 0), 11),
+			payload: EntryPayload::Normal(WendelonRequest::SetTableRetentionPolicy(update)),
+		};
+
+		let event = raft_audit_event_with_context(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			&entry,
+			&WendelonResponse::Success,
+			Some(RetentionAuditContext {
+				previous_policy: Some(TableRetentionPolicy::FixedWindow(
+					RetentionWindowMillis::try_new(60_000).unwrap(),
+				)),
+			}),
+		)
+		.expect("retention policy update must emit audit");
+
+		assert_eq!(
+			event
+				.parameters
+				.get("previous_retention_policy")
+				.and_then(|value| value.as_str()),
+			Some("fixed_window")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("retention_extends_window")
+				.and_then(|value| value.as_bool()),
+			Some(true)
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("retention_extension_restores_history")
+				.and_then(|value| value.as_bool()),
+			Some(false)
+		);
+		let Some(AuditSchema::AdministrativeControl { detail, .. }) = event.schema else {
+			panic!("expected administrative-control audit schema");
+		};
+		assert_eq!(
+			detail.previous_retention_policy.as_deref(),
+			Some("fixed_window")
+		);
+		assert_eq!(detail.previous_retention_window_ms, Some(60_000));
+		assert_eq!(detail.retention_extends_window, Some(true));
+		assert_eq!(detail.retention_extension_restores_history, Some(false));
+		assert!(event.message.contains("retention_extends_window=true"));
+		assert!(
+			event
+				.message
+				.contains("retention_extension_restores_history=false")
 		);
 	}
 

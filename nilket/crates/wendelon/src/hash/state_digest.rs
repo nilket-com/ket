@@ -245,6 +245,25 @@ pub fn visible_row_element(
 	StateDigestElement::project(DOMAIN_TABLE_ROW_VISIBLE, &preimage)
 }
 
+/// ADR 048 retention eviction reversal for the visible row domain.
+///
+/// Data rows add `+K` at admission, so eviction subtracts `K`.
+/// Row tombstones add `-K` at admission, so eviction adds `K` back.
+pub fn apply_retention_eviction_to_visible_digest(
+	accumulator: &mut StateDigestAccumulator,
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	row_key_id: Identity,
+	is_tombstone: bool,
+) {
+	let element = visible_row_element(tenant_id, table_object_id, row_key_id);
+	if is_tombstone {
+		accumulator.add_element(element);
+	} else {
+		accumulator.subtract_element(element);
+	}
+}
+
 fn tenant_id_digest_bytes(tenant_id: TenantId) -> [u8; 16] {
 	let mut bytes = [0u8; 16];
 	bytes[..8].copy_from_slice(&tenant_id.get().to_le_bytes());
@@ -461,5 +480,29 @@ mod tests {
 			accumulate_projected_scalars(scalar_bytes),
 			per_element.finish()
 		);
+	}
+
+	#[test]
+	fn retention_eviction_helper_reverses_visible_row_admission() {
+		let tenant = TenantId::new(48);
+		let table = TableObjectId::new([0x48; 16]);
+		let row = Identity::new([0x48; 32]);
+		let element = visible_row_element(tenant, table, row);
+
+		let mut data_eviction = StateDigestAccumulator::new();
+		data_eviction.add_element(element);
+		apply_retention_eviction_to_visible_digest(&mut data_eviction, tenant, table, row, false);
+		assert_eq!(StateDigest::ZERO, data_eviction.finish());
+
+		let mut tombstone_eviction = StateDigestAccumulator::new();
+		tombstone_eviction.subtract_element(element);
+		apply_retention_eviction_to_visible_digest(
+			&mut tombstone_eviction,
+			tenant,
+			table,
+			row,
+			true,
+		);
+		assert_eq!(StateDigest::ZERO, tombstone_eviction.finish());
 	}
 }

@@ -108,8 +108,9 @@ use crate::storage::stats::{
 	prune_by_encoded_any_of, prune_by_encoded_min_max,
 };
 use crate::storage::{
-	MvccRetentionPolicy, aggregate_record_batches, merge_aggregate_responses,
-	validate_expression_types,
+	EffectiveRetention, MvccRetentionPolicy, aggregate_record_batches,
+	check_read_against_retention, cluster_retention_floor, effective_table_retention,
+	merge_aggregate_responses, validate_expression_types,
 };
 use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
@@ -1507,13 +1508,22 @@ impl WendelonDataServer {
 	}
 
 	fn mvcc_retention_floor_hlc(&self) -> Option<HybridTimestamp> {
-		let window = self.mvcc_retention_policy.window()?;
-		let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
-		Some(HybridTimestamp {
-			physical_ms: self.clock.now_ms().saturating_sub(window_ms),
-			logical: 0,
-			node_id: 0,
-		})
+		cluster_retention_floor(self.mvcc_retention_policy, self.clock.now_ms())
+	}
+
+	fn table_effective_retention_from_state(
+		&self,
+		state: &crate::consensus::raft_storage::SmState,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> EffectiveRetention {
+		effective_table_retention(
+			&self.mvcc_retention_policy,
+			state
+				.table_lifecycle
+				.retention_policy(tenant_id, table_object_id),
+			self.clock.now_ms(),
+		)
 	}
 
 	fn snapshot_request_outside_retention(&self, as_of_hlc: HybridTimestamp) -> bool {
@@ -1524,29 +1534,37 @@ impl WendelonDataServer {
 		&self,
 		max_slabs: usize,
 	) -> std::io::Result<crate::storage::manager::RetentionPruningReport> {
-		let Some(retention_floor) = self.mvcc_retention_floor_hlc() else {
-			return Ok(crate::storage::manager::RetentionPruningReport::default());
-		};
+		let retention_floor = self.mvcc_retention_floor_hlc();
+		let snapshot = self.state_machine.state_snapshot().await;
 		let report = self
 			.slab
-			.prune_versions_older_than(retention_floor, max_slabs)
+			.prune_versions_for_retention(
+				self.mvcc_retention_policy,
+				&snapshot.table_lifecycle,
+				&snapshot.table_schemas,
+				self.clock.now_ms(),
+				max_slabs,
+			)
 			.await?;
 		if report.pruned_versions > 0 {
 			let _permit =
 				authorize_autonomous_action(AutonomousActionSurface::L1MvccRetentionPrune);
+			let retention_floor_ms = retention_floor
+				.map(|floor| floor.physical_ms)
+				.unwrap_or_else(|| self.clock.now_ms());
 			let audit = AuditEvent::new(
 				AuditAuthority::NodeLocal,
 				AuditOperation::MvccSnapshotPruned,
 				self.local_node,
 				format!(
 					"retention_floor_ms={} compacted_slabs={} pruned_versions={} reclaimed_bytes={}",
-					retention_floor.physical_ms,
+					retention_floor_ms,
 					report.compacted_slabs,
 					report.pruned_versions,
 					report.reclaimed_bytes,
 				),
 			)
-			.with_parameter("retention_floor_ms", retention_floor.physical_ms)
+			.with_parameter("retention_floor_ms", retention_floor_ms)
 			.with_parameter("compacted_slabs", report.compacted_slabs as u64)
 			.with_parameter("pruned_versions", report.pruned_versions as u64)
 			.with_parameter("reclaimed_bytes", report.reclaimed_bytes);
@@ -1556,6 +1574,19 @@ impl WendelonDataServer {
 					"mvcc retention prune audit emission failed"
 				);
 			}
+		}
+		if report.pruned_versions > 0
+			|| report.max_lag_seconds > 0
+			|| report.ambiguous_rows_retained > 0
+		{
+			metrics().observe_storage_table_retention_l1_prune(
+				report.pruned_data_rows as u64,
+				report.pruned_tombstone_rows as u64,
+				report.reclaimed_bytes,
+				report.pair_drops as u64,
+				report.ambiguous_rows_retained as u64,
+				report.max_lag_seconds,
+			);
 		}
 		Ok(report)
 	}
@@ -5008,14 +5039,6 @@ impl WendelonDataServer {
 				));
 			}
 		}
-		if self.snapshot_request_outside_retention(meta.as_of_hlc) {
-			return Ok(query_plan_error(
-				&range_meta,
-				ReadStatus::RETENTION_EXPIRED,
-				self.local_node,
-			));
-		}
-
 		let sm_peek = self.state_machine.state_snapshot().await;
 		let Some(descriptor) = sm_peek
 			.table_schemas
@@ -5028,6 +5051,19 @@ impl WendelonDataServer {
 				self.local_node,
 			));
 		};
+		let effective_retention = self.table_effective_retention_from_state(
+			&sm_peek,
+			meta.tenant_id,
+			meta.table_object_id,
+		);
+		if check_read_against_retention(meta.as_of_hlc, &effective_retention).is_err() {
+			metrics().observe_storage_table_retention_read_floor_reject();
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::RETENTION_EXPIRED,
+				self.local_node,
+			));
+		}
 		let program = match pbc::Program::compile(bytecode) {
 			Ok(program) => program,
 			Err(_) => {
@@ -5106,6 +5142,7 @@ impl WendelonDataServer {
 				requirement,
 				user_column_count,
 			},
+			effective_retention.floor,
 		)
 		.await
 	}
@@ -5234,6 +5271,7 @@ impl WendelonDataServer {
 			aggregate_query_budget(&request.budgets),
 			Some(&prepared.descriptor),
 			projected_execution,
+			prepared.retention_floor,
 		)
 		.await?;
 		if plan.response.status != ReadStatus::OK
@@ -5285,9 +5323,8 @@ impl WendelonDataServer {
 		if !aggregate_csb_direct_answer_eligible(request, &prepared.ranges) {
 			return Ok(None);
 		}
-
 		let committed_tombstones = self.state_machine.tombstones_snapshot().await;
-		let mut slab_ids = HashSet::new();
+		let mut candidate_slab_ids = HashSet::new();
 		let mut responses = Vec::new();
 		for range in &prepared.ranges {
 			let scanned = self.slab.scan_as_of_with_identity_and_locality(
@@ -5297,60 +5334,82 @@ impl WendelonDataServer {
 				request.as_of_hlc,
 			);
 			for (_identity, _locality, location) in scanned {
-				if !slab_ids.insert(location.slab_id) {
-					continue;
-				}
-				let Some(pointer) = self.slab.tier_pointer(location.slab_id).await else {
-					return Ok(None);
-				};
-				if pointer.tombstone_metadata.is_untracked() {
-					metrics().observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
-					return Ok(None);
-				}
-				if pointer.supersession_metadata.is_untracked() {
-					metrics()
-						.observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked();
-					return Ok(None);
-				}
-				if self.slab.slab_has_migrated_range_tombstone_at(
-					location.slab_id,
-					request.as_of_hlc,
-					&committed_tombstones,
-				) {
-					return Ok(None);
-				}
-				if self
-					.slab
-					.slab_has_supersession_at(location.slab_id, request.as_of_hlc)
-				{
-					return Ok(None);
-				}
-				if !crate::storage::slab_visibility_complete(
-					location.hlc,
-					pointer.tombstone_metadata,
-					pointer.supersession_metadata,
-					request.as_of_hlc,
-				) {
-					return Ok(None);
-				}
-				let stats = match self
-					.slab
-					.load_tiered_column_stats_block(&pointer, &prepared.descriptor)
-					.await?
-				{
-					Some(stats) => stats,
-					None => return Ok(None),
-				};
-				let response =
-					match aggregate_csb_response_for_stats(request, &prepared.descriptor, &stats) {
-						Ok(Some(response)) => response,
-						Ok(None) => return Ok(None),
-						Err(code) => {
-							return Ok(Some(self.aggregate_rejected_response(request, code)));
-						}
-					};
-				responses.push(response);
+				candidate_slab_ids.insert(location.slab_id);
 			}
+		}
+		let mut slab_ids = candidate_slab_ids.into_iter().collect::<Vec<_>>();
+		slab_ids.sort_by_key(|slab_id| slab_id.get());
+		for slab_id in slab_ids {
+			let Some((min_hlc, max_hlc, rows)) = self.slab.slab_hlc_bounds(slab_id) else {
+				return Ok(None);
+			};
+			let bounds = AggregateCsbSlabBounds::from_parts(min_hlc, max_hlc, rows);
+			if let Some(floor) = prepared.retention_floor {
+				match aggregate_csb_retention_decision(bounds, floor) {
+					AggregateCsbRetentionDecision::Direct => {}
+					AggregateCsbRetentionDecision::ZeroContribution => {
+						let response = match aggregate_csb_zero_response(request, bounds.row_count)
+						{
+							Ok(response) => response,
+							Err(code) => {
+								return Ok(Some(self.aggregate_rejected_response(request, code)));
+							}
+						};
+						responses.push(response);
+						continue;
+					}
+					AggregateCsbRetentionDecision::RowFilter => return Ok(None),
+				}
+			}
+			let Some(pointer) = self.slab.tier_pointer(slab_id).await else {
+				return Ok(None);
+			};
+			if pointer.tombstone_metadata.is_untracked() {
+				metrics().observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
+				return Ok(None);
+			}
+			if pointer.supersession_metadata.is_untracked() {
+				metrics().observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked();
+				return Ok(None);
+			}
+			if self.slab.slab_has_migrated_range_tombstone_at(
+				slab_id,
+				request.as_of_hlc,
+				&committed_tombstones,
+			) {
+				return Ok(None);
+			}
+			if self
+				.slab
+				.slab_has_supersession_at(slab_id, request.as_of_hlc)
+			{
+				return Ok(None);
+			}
+			if !crate::storage::slab_visibility_complete(
+				bounds.max_hlc,
+				pointer.tombstone_metadata,
+				pointer.supersession_metadata,
+				request.as_of_hlc,
+			) {
+				return Ok(None);
+			}
+			let stats = match self
+				.slab
+				.load_tiered_column_stats_block(&pointer, &prepared.descriptor)
+				.await?
+			{
+				Some(stats) => stats,
+				None => return Ok(None),
+			};
+			let response =
+				match aggregate_csb_response_for_stats(request, &prepared.descriptor, &stats) {
+					Ok(Some(response)) => response,
+					Ok(None) => return Ok(None),
+					Err(code) => {
+						return Ok(Some(self.aggregate_rejected_response(request, code)));
+					}
+				};
+			responses.push(response);
 		}
 		if responses.is_empty() {
 			return Ok(None);
@@ -5392,10 +5451,6 @@ impl WendelonDataServer {
 				return Ok(Err(AggRejectCode::DeadlineExceeded));
 			}
 		}
-		if self.snapshot_request_outside_retention(request.as_of_hlc) {
-			return Ok(Err(AggRejectCode::DeadlineExceeded));
-		}
-
 		let bytecode = request.predicate_program.as_deref().unwrap_or(&[]);
 		let program = match pbc::Program::compile(bytecode) {
 			Ok(program) if !program.has_projection() => program,
@@ -5424,6 +5479,15 @@ impl WendelonDataServer {
 				return Ok(Err(code));
 			}
 		};
+		let effective_retention = self.table_effective_retention_from_state(
+			&sm_peek,
+			request.tenant_id,
+			request.table_object_id,
+		);
+		if check_read_against_retention(request.as_of_hlc, &effective_retention).is_err() {
+			metrics().observe_storage_table_retention_read_floor_reject();
+			return Ok(Err(AggRejectCode::RetentionExpired));
+		}
 		if descriptor.schema_fingerprint != request.schema_fingerprint {
 			return Ok(Err(AggRejectCode::SchemaStale));
 		}
@@ -5472,6 +5536,7 @@ impl WendelonDataServer {
 			program,
 			descriptor,
 			ranges,
+			retention_floor: effective_retention.floor,
 		}))
 	}
 
@@ -7831,6 +7896,7 @@ struct PreparedAggregateExecution {
 	program: pbc::Program,
 	descriptor: TableSchemaDescriptorV1,
 	ranges: Vec<QueryScanRange>,
+	retention_floor: Option<HybridTimestamp>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8568,6 +8634,7 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 		budget,
 		None,
 		QueryProjectedExecution::Disabled,
+		None,
 	)
 	.await
 }
@@ -8581,6 +8648,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	budget: QueryExecutionBudget,
 	table_descriptor: Option<&TableSchemaDescriptorV1>,
 	projected_execution: QueryProjectedExecution,
+	logical_retention_floor: Option<HybridTimestamp>,
 ) -> std::io::Result<QueryExecutionPlan> {
 	let budget = QueryExecutionBudget {
 		stats_pruning_enabled: budget.stats_pruning_enabled
@@ -8609,6 +8677,10 @@ async fn plan_query_execution_for_ranges_with_program(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			if logical_retention_floor.is_some_and(|floor| location.hlc < floor) {
+				metrics().observe_storage_table_retention_read_filtered_rows(1);
+				continue;
+			}
 			if started_at.elapsed() > budget.max_wall_time {
 				return Ok(query_plan_error(
 					meta,
@@ -9407,6 +9479,55 @@ fn coalesce_locality_ranges(ranges: &mut Vec<LocalityRange>) {
 	*ranges = out;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AggregateCsbSlabBounds {
+	min_hlc: HybridTimestamp,
+	max_hlc: HybridTimestamp,
+	row_count: u64,
+}
+
+impl AggregateCsbSlabBounds {
+	fn from_parts(min_hlc: HybridTimestamp, max_hlc: HybridTimestamp, row_count: u64) -> Self {
+		Self {
+			min_hlc,
+			max_hlc,
+			row_count,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateCsbRetentionDecision {
+	Direct,
+	ZeroContribution,
+	RowFilter,
+}
+
+fn aggregate_csb_retention_decision(
+	bounds: AggregateCsbSlabBounds,
+	floor: HybridTimestamp,
+) -> AggregateCsbRetentionDecision {
+	if bounds.max_hlc < floor {
+		AggregateCsbRetentionDecision::ZeroContribution
+	} else if bounds.min_hlc >= floor {
+		AggregateCsbRetentionDecision::Direct
+	} else {
+		AggregateCsbRetentionDecision::RowFilter
+	}
+}
+
+fn aggregate_csb_zero_response(
+	request: &AggregateRequest,
+	filtered_rows: u64,
+) -> Result<AggregateResponse, AggRejectCode> {
+	let mut response = aggregate_record_batches(request, &[], false)?.response;
+	response.diagnostics.slabs_consulted = 1;
+	response.diagnostics.slabs_pruned_by_csb = 1;
+	response.diagnostics.rows_scanned = filtered_rows;
+	response.diagnostics.rows_filtered_out = filtered_rows;
+	Ok(response)
+}
+
 fn aggregate_csb_direct_answer_eligible(
 	request: &AggregateRequest,
 	ranges: &[QueryScanRange],
@@ -9598,9 +9719,10 @@ fn aggregate_reject_from_read_status(status: ReadStatus) -> AggRejectCode {
 		| ReadStatus::NOT_LEADER
 		| ReadStatus::LEASE_EXPIRED
 		| ReadStatus::INVALID_LEASE_SIGNATURE => AggRejectCode::CapabilityUnavailable,
-		ReadStatus::E_SAFE_BEHIND
-		| ReadStatus::MIGRATION_INCOMPLETE
-		| ReadStatus::RETENTION_EXPIRED => AggRejectCode::DeadlineExceeded,
+		ReadStatus::E_SAFE_BEHIND | ReadStatus::MIGRATION_INCOMPLETE => {
+			AggRejectCode::DeadlineExceeded
+		}
+		ReadStatus::RETENTION_EXPIRED => AggRejectCode::RetentionExpired,
 		_ => AggRejectCode::BudgetExceeded,
 	}
 }
@@ -9624,6 +9746,7 @@ fn aggregate_reject_to_read_status(code: AggRejectCode) -> ReadStatus {
 		}
 		AggRejectCode::BudgetExceeded => ReadStatus::QUERY_BUDGET_EXCEEDED,
 		AggRejectCode::DeadlineExceeded => ReadStatus::E_SAFE_BEHIND,
+		AggRejectCode::RetentionExpired => ReadStatus::RETENTION_EXPIRED,
 	}
 }
 
@@ -10609,13 +10732,14 @@ mod tests {
 		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
 		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, LocalityPolicyV1,
-		LocalityRange, LocationCount, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-		ProjectionFunctionV1, RecordLayoutPolicy, RowCount, RowIdentityPolicy,
-		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-		SchemaEvolutionPolicyV1, SlabRecordHeader, TableObjectId, TableSchemaCatalogV1,
-		TableSpreadLocalityDescriptorV1, column_projection_prefix_ranges,
-		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
-		table_spread_prefix_ranges, write_payload_schema,
+		LocalityRange, LocationCount, MultiRowLayoutDescriptor, PolicyGeneration,
+		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RecordLayoutPolicy, RetentionWindowMillis,
+		RowCount, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+		STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1, SlabRecordHeader,
+		TableObjectId, TableRetentionPolicy, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
+		column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
+		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
+		write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
@@ -10631,6 +10755,16 @@ mod tests {
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
+	}
+
+	struct FixedClock {
+		now_ms: u64,
+	}
+
+	impl PhysicalClock for FixedClock {
+		fn now_ms(&self) -> u64 {
+			self.now_ms
+		}
 	}
 
 	fn typed_table_schema() -> Schema {
@@ -10824,6 +10958,117 @@ mod tests {
 			payload,
 		};
 		encode_schema_update_envelope_v1(&envelope).unwrap()
+	}
+
+	fn aggregate_count_request(
+		descriptor: &TableSchemaDescriptorV1,
+		request_id: u128,
+		as_of_hlc: HybridTimestamp,
+	) -> AggregateRequest {
+		AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(request_id),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc,
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression::count_star()],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		}
+	}
+
+	fn count_star_partial_value(response: &AggregateResponse) -> u64 {
+		u64::from_be_bytes(
+			response.partials[0]
+				.state
+				.as_slice()
+				.try_into()
+				.expect("count star partial is u64"),
+		)
+	}
+
+	async fn aggregate_csb_test_server(
+		mgr: Arc<SlabManager>,
+		descriptor: &TableSchemaDescriptorV1,
+		node_id: u32,
+		temp_tag: &str,
+		clock: Arc<dyn PhysicalClock>,
+		retention_policy: MvccRetentionPolicy,
+	) -> (WendelonNode, WendelonDataServer) {
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			node_id,
+			bootstrap_tempdir(temp_tag),
+			format!("loopback://{node_id}"),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: format!("loopback://{node_id}"),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			clock,
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap()
+		.with_mvcc_retention_policy(retention_policy);
+
+		(node, server)
 	}
 
 	fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -11540,6 +11785,34 @@ mod tests {
 		assert_eq!(resp.status, ReadStatus::RETENTION_EXPIRED);
 		assert_eq!(resp.rows, 0);
 		assert!(arrow.is_none());
+	}
+
+	#[tokio::test]
+	async fn latest_query_filters_locations_below_logical_retention_floor() {
+		let mgr = make_manager().await;
+		seed_record(&mgr, 1, hlc(70, 0, 1), b"old", b"old-value").await;
+		seed_record(&mgr, 2, hlc(90, 0, 1), b"live", b"live-value").await;
+
+		let program = pbc::Program::compile(&[]).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&base_meta(),
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			None,
+			QueryProjectedExecution::Disabled,
+			Some(hlc(80, 0, 1)),
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
 	}
 
 	#[tokio::test]
@@ -12476,6 +12749,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12528,6 +12802,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12586,6 +12861,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12652,6 +12928,7 @@ mod tests {
 				requirement,
 				user_column_count,
 			},
+			None,
 		)
 		.await
 		.unwrap();
@@ -12755,6 +13032,7 @@ mod tests {
 				start: Locality::ZERO,
 				end: Locality::MAX,
 			}],
+			retention_floor: None,
 		};
 		let projected_execution = aggregate_projected_execution(&mgr, &request, &prepared).unwrap();
 		let mut folded_request =
@@ -12770,6 +13048,7 @@ mod tests {
 			aggregate_query_budget(&request.budgets),
 			Some(&descriptor),
 			projected_execution,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12829,6 +13108,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12852,6 +13132,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -12890,6 +13171,7 @@ mod tests {
 				requirement,
 				user_column_count,
 			},
+			None,
 		)
 		.await
 		.unwrap();
@@ -12961,6 +13243,7 @@ mod tests {
 				start: Locality::ZERO,
 				end: Locality::MAX,
 			}],
+			retention_floor: None,
 		};
 		let projected_execution = aggregate_projected_execution(&mgr, &request, &prepared).unwrap();
 		assert!(matches!(
@@ -12980,6 +13263,7 @@ mod tests {
 			aggregate_query_budget(&request.budgets),
 			Some(&descriptor),
 			projected_execution,
+			None,
 		)
 		.await
 		.unwrap();
@@ -13029,6 +13313,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -13088,6 +13373,7 @@ mod tests {
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
 			QueryProjectedExecution::Disabled,
+			None,
 		)
 		.await
 		.unwrap();
@@ -14350,6 +14636,144 @@ mod tests {
 	}
 
 	#[test]
+	fn aggregate_reject_mapping_preserves_retention_expired() {
+		assert_eq!(
+			aggregate_reject_from_read_status(ReadStatus::RETENTION_EXPIRED),
+			AggRejectCode::RetentionExpired
+		);
+		assert_eq!(
+			aggregate_reject_to_read_status(AggRejectCode::RetentionExpired),
+			ReadStatus::RETENTION_EXPIRED
+		);
+	}
+
+	#[tokio::test]
+	async fn aggregate_retention_floor_reject_uses_retention_expired_code() {
+		let mgr = make_manager().await;
+		let descriptor = append_only_table_descriptor();
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			52,
+			bootstrap_tempdir("aggregate-retention-expired-node"),
+			"loopback://52".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for single-node leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		node.raft
+			.client_write(WendelonRequest::SetTableRetentionPolicy(
+				crate::consensus::SetTableRetentionPolicy {
+					tenant_id: tenant(),
+					table_object_id: descriptor.table_object_id,
+					expected_policy_generation: PolicyGeneration::ZERO,
+					new_policy: TableRetentionPolicy::FixedWindow(
+						RetentionWindowMillis::try_new(60_000).unwrap(),
+					),
+					updated_at_hlc: hlc(1, 0, 1),
+				},
+			))
+			.await
+			.unwrap();
+
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://52".into(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty()
+					.with(NodeCapability::PartialAggregatePushdown),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap();
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(493),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(1, 0, 1),
+			as_of_hlc: hlc(1, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![AggregateExpression::count_star()],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		let floor_rejects_before = metrics()
+			.storage_table_retention_read_floor_rejects_total
+			.get();
+
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+
+		assert_eq!(response.status, AggregateStatus::Rejected);
+		assert_eq!(response.reject_code, Some(AggRejectCode::RetentionExpired));
+		let query_meta = aggregate_response_as_query_meta(
+			&request,
+			&response,
+			node.local_node,
+			node.state_machine
+				.current_admission_snapshot()
+				.current_epoch,
+		);
+		assert_eq!(query_meta.status, ReadStatus::RETENTION_EXPIRED);
+		assert!(
+			metrics()
+				.storage_table_retention_read_floor_rejects_total
+				.get() >= floor_rejects_before + 1,
+			"aggregate retention admission should increment the read-floor reject metric"
+		);
+
+		node.handles.abort();
+	}
+
+	#[test]
 	fn aggregate_csb_response_marks_truncated_min_partial() {
 		use crate::schema::aggregate::AGG_MIN_MAX_PREFIX_BYTES;
 		use crate::storage::stats::{
@@ -14538,6 +14962,107 @@ mod tests {
 		let max = encode_signed_stat_value(2, 8).unwrap();
 		assert_eq!(&response.partials[2].state[4..12], min.as_slice());
 		assert_eq!(&response.partials[3].state[4..12], max.as_slice());
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_retention_floor_below_slab_allows_direct_answer() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) =
+			tier_identity_typed_table_batch_with_stats(l2, vec![1, 2], "agg-csb-retention-ok.wnd")
+				.await;
+		let (node, server) = aggregate_csb_test_server(
+			mgr,
+			&descriptor,
+			53,
+			"aggregate-csb-retention-ok-node",
+			Arc::new(FixedClock { now_ms: 1_000 }),
+			MvccRetentionPolicy::FixedWindow(Duration::from_millis(1_000)),
+		)
+		.await;
+		let request = aggregate_count_request(&descriptor, 494, hlc(99, 0, 1));
+
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 1);
+		assert_eq!(response.diagnostics.rows_admitted, 2);
+		assert_eq!(count_star_partial_value(&response), 2);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_retention_floor_above_slab_returns_zero_contribution() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) = tier_identity_typed_table_batch_with_stats(
+			l2,
+			vec![1, 2],
+			"agg-csb-retention-zero.wnd",
+		)
+		.await;
+		let (node, server) = aggregate_csb_test_server(
+			mgr,
+			&descriptor,
+			54,
+			"aggregate-csb-retention-zero-node",
+			Arc::new(FixedClock { now_ms: 1_000 }),
+			MvccRetentionPolicy::FixedWindow(Duration::from_millis(500)),
+		)
+		.await;
+		let request = aggregate_count_request(&descriptor, 495, hlc(900, 0, 1));
+
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 0);
+		assert_eq!(response.diagnostics.slabs_pruned_by_csb, 1);
+		assert_eq!(response.diagnostics.rows_admitted, 0);
+		assert_eq!(response.diagnostics.rows_filtered_out, 2);
+		assert_eq!(count_star_partial_value(&response), 0);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn aggregate_csb_retention_floor_straddling_slab_falls_back_to_row_filter() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let (mgr, descriptor) = tier_identity_typed_table_batch_with_stats(
+			l2,
+			vec![1, 2],
+			"agg-csb-retention-straddle.wnd",
+		)
+		.await;
+		let (node, server) = aggregate_csb_test_server(
+			mgr,
+			&descriptor,
+			55,
+			"aggregate-csb-retention-straddle-node",
+			Arc::new(FixedClock { now_ms: 1_011 }),
+			MvccRetentionPolicy::FixedWindow(Duration::from_millis(1_000)),
+		)
+		.await;
+		let request = aggregate_count_request(&descriptor, 496, hlc(99, 0, 1));
+		let prepared = server
+			.prepare_aggregate_execution_context_with_migration(&request)
+			.await
+			.unwrap()
+			.unwrap();
+
+		assert!(
+			server
+				.try_aggregate_csb_direct_answer(&request, &prepared)
+				.await
+				.unwrap()
+				.is_none(),
+			"slabs straddling the retention floor must fall back to row filtering"
+		);
+		let response = server.execute_aggregate_local(&request).await.unwrap();
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(response.diagnostics.slabs_answered_from_csb, 0);
+		assert_eq!(response.diagnostics.rows_admitted, 1);
+		assert_eq!(count_star_partial_value(&response), 1);
 
 		node.handles.abort();
 	}

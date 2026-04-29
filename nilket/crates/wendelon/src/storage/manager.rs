@@ -54,8 +54,8 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, SlabId, SlabRecordHeader, SupersessionMetadata, TenantId, TenantKekId,
-	TombstoneMetadata, WriterNodeId,
+	RecordRowIndex, SlabId, SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog,
+	TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
@@ -86,7 +86,8 @@ use crate::storage::stats::{
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
-	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, OpenFlags, write_file,
+	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, MvccRetentionPolicy, OpenFlags,
+	cluster_retention_floor, effective_table_retention, storage_row_table_object_id_at, write_file,
 };
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -335,7 +336,21 @@ pub struct TombstoneCompactionReport {
 pub struct RetentionPruningReport {
 	pub compacted_slabs: usize,
 	pub pruned_versions: usize,
+	pub pruned_data_rows: usize,
+	pub pruned_tombstone_rows: usize,
+	pub pair_drops: usize,
+	pub ambiguous_rows_retained: usize,
+	pub max_lag_seconds: u64,
 	pub reclaimed_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetentionCompactionStats {
+	pub pruned_data_rows: usize,
+	pub pruned_tombstone_rows: usize,
+	pub pair_drops: usize,
+	pub ambiguous_rows_retained: usize,
+	pub max_lag_seconds: u64,
 }
 
 /// Outcome of one explicit table layout recluster pass.
@@ -356,13 +371,18 @@ pub(crate) enum PreparedTieredRetentionRewrite {
 		tombstone_metadata: TombstoneMetadata,
 		supersession_metadata: SupersessionMetadata,
 		pruned_versions: usize,
+		retention_stats: RetentionCompactionStats,
 		reclaimed_bytes: u64,
 	},
 	Retire {
 		slab_id: SlabId,
 		old_l2_uri: String,
 		pruned_versions: usize,
+		retention_stats: RetentionCompactionStats,
 		reclaimed_bytes: u64,
+	},
+	Observe {
+		retention_stats: RetentionCompactionStats,
 	},
 }
 
@@ -2143,6 +2163,29 @@ impl SlabManager {
 		})
 	}
 
+	pub fn slab_hlc_bounds(
+		&self,
+		slab_id: SlabId,
+	) -> Option<(HybridTimestamp, HybridTimestamp, u64)> {
+		let mut bounds: Option<(HybridTimestamp, HybridTimestamp, u64)> = None;
+		for entry in self.key_index.iter() {
+			for location in entry.value().iter() {
+				if location.slab_id != slab_id {
+					continue;
+				}
+				bounds = Some(match bounds {
+					Some((min_hlc, max_hlc, rows)) => (
+						min_hlc.min(location.hlc),
+						max_hlc.max(location.hlc),
+						rows.saturating_add(1),
+					),
+					None => (location.hlc, location.hlc, 1),
+				});
+			}
+		}
+		bounds
+	}
+
 	pub fn slab_supersession_metadata(&self, slab_id: SlabId) -> SupersessionMetadata {
 		let mut earliest: Option<HybridTimestamp> = None;
 		for entry in self.key_index.iter() {
@@ -2540,6 +2583,87 @@ impl SlabManager {
 				.prune_one_sealed_slab(slab_id, slab, retention_floor)
 				.await?
 			{
+				report.compacted_slabs += 1;
+				report.pruned_versions = report
+					.pruned_versions
+					.saturating_add(outcome.reclaimed_records);
+				report.pruned_data_rows = report
+					.pruned_data_rows
+					.saturating_add(outcome.retention_stats.pruned_data_rows);
+				report.pruned_tombstone_rows = report
+					.pruned_tombstone_rows
+					.saturating_add(outcome.retention_stats.pruned_tombstone_rows);
+				report.pair_drops = report
+					.pair_drops
+					.saturating_add(outcome.retention_stats.pair_drops);
+				report.ambiguous_rows_retained = report
+					.ambiguous_rows_retained
+					.saturating_add(outcome.retention_stats.ambiguous_rows_retained);
+				report.max_lag_seconds = report
+					.max_lag_seconds
+					.max(outcome.retention_stats.max_lag_seconds);
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		Ok(report)
+	}
+
+	pub async fn prune_versions_for_retention(
+		&self,
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+		max_slabs: usize,
+	) -> std::io::Result<RetentionPruningReport> {
+		if max_slabs == 0 {
+			return Ok(RetentionPruningReport::default());
+		}
+
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+
+		let mut report = RetentionPruningReport::default();
+		for (slab_id, slab) in sealed {
+			if report.compacted_slabs >= max_slabs {
+				break;
+			}
+			let scan = self
+				.prune_one_sealed_slab_for_retention(
+					slab_id,
+					slab,
+					cluster_policy,
+					table_lifecycle,
+					table_schemas,
+					now_ms,
+				)
+				.await?;
+			report.pruned_data_rows = report
+				.pruned_data_rows
+				.saturating_add(scan.retention_stats.pruned_data_rows);
+			report.pruned_tombstone_rows = report
+				.pruned_tombstone_rows
+				.saturating_add(scan.retention_stats.pruned_tombstone_rows);
+			report.pair_drops = report
+				.pair_drops
+				.saturating_add(scan.retention_stats.pair_drops);
+			report.ambiguous_rows_retained = report
+				.ambiguous_rows_retained
+				.saturating_add(scan.retention_stats.ambiguous_rows_retained);
+			report.max_lag_seconds = report
+				.max_lag_seconds
+				.max(scan.retention_stats.max_lag_seconds);
+			if let Some(outcome) = scan.compaction {
 				report.compacted_slabs += 1;
 				report.pruned_versions = report
 					.pruned_versions
@@ -3186,6 +3310,7 @@ impl SlabManager {
 		.await;
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn prepare_tiered_retention_rewrite(
 		&self,
 		pointer: &TieredSlabPointer,
@@ -3226,12 +3351,15 @@ impl SlabManager {
 					entry.location,
 					retention_floor,
 				),
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
 			})
 			.collect::<Vec<_>>();
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
+		let retention_stats = Self::retention_compaction_stats(&records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
 		if pruned_versions == 0 {
 			return Ok(None);
@@ -3241,6 +3369,7 @@ impl SlabManager {
 				slab_id: pointer.slab_id,
 				old_l2_uri: pointer.l2_uri.clone(),
 				pruned_versions,
+				retention_stats,
 				reclaimed_bytes: old_blob.len() as u64,
 			}));
 		}
@@ -3301,6 +3430,140 @@ impl SlabManager {
 			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
+			retention_stats,
+			encrypted_bytes: encrypted.bytes,
+		}))
+	}
+
+	pub(crate) async fn prepare_tiered_table_retention_rewrite(
+		&self,
+		pointer: &TieredSlabPointer,
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+	) -> std::io::Result<Option<PreparedTieredRetentionRewrite>> {
+		let old_blob = self
+			.config
+			.l2
+			.clone()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"cannot rewrite tiered slab {} without an L2 object store",
+						pointer.slab_id
+					),
+				)
+			})?
+			.get(&pointer.l2_uri)
+			.await?;
+		validate_tiered_blob(pointer, &old_blob)?;
+		let plaintext = Zeroizing::new(decode_tiered_blob(
+			self.config.crypto.as_ref(),
+			pointer,
+			&old_blob,
+		)?);
+		let mut records = recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
+			.into_iter()
+			.map(|entry| CompactionRecord {
+				tenant_id: entry.tenant_id,
+				key_identity: entry.key_identity,
+				routing_locality: self.recovered_entry_routing_locality(&entry),
+				old_location: entry.location,
+				reclaim: false,
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
+			})
+			.collect::<Vec<_>>();
+		self.mark_records_for_table_retention_from_blob(
+			&plaintext,
+			&mut records,
+			cluster_policy,
+			table_lifecycle,
+			table_schemas,
+			now_ms,
+		)?;
+		records.sort_by_key(|record| record.old_location.offset);
+		let physical_groups = physical_compaction_groups(&records);
+		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
+		let retention_stats = Self::retention_compaction_stats(&records);
+		let survivors = records.iter().filter(|record| !record.reclaim).count();
+		if pruned_versions == 0 {
+			if retention_stats.max_lag_seconds > 0 || retention_stats.ambiguous_rows_retained > 0 {
+				return Ok(Some(PreparedTieredRetentionRewrite::Observe {
+					retention_stats,
+				}));
+			}
+			return Ok(None);
+		}
+		if survivors == 0 {
+			return Ok(Some(PreparedTieredRetentionRewrite::Retire {
+				slab_id: pointer.slab_id,
+				old_l2_uri: pointer.l2_uri.clone(),
+				pruned_versions,
+				retention_stats,
+				reclaimed_bytes: old_blob.len() as u64,
+			}));
+		}
+
+		let tmp_path = retention_rewrite_tmp_path(&self.config.dir, pointer.slab_id);
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let mut multirow_recompact_count = 0_u64;
+		let rewrite_result: std::io::Result<Zeroizing<Vec<u8>>> = async {
+			let rewritten = Arc::new(
+				LocalSlabStore::open(
+					&tmp_path,
+					pointer.slab_id,
+					self.file_ops.clone(),
+					self.config.group_commit.clone(),
+				)
+				.await?,
+			);
+			for group in physical_groups.values() {
+				let Some(first) = group.first().copied() else {
+					continue;
+				};
+				let frame =
+					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
+				let Some(compacted) = compact_physical_record_frame(frame.as_ref(), group)? else {
+					continue;
+				};
+				if compacted.was_multirow {
+					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
+				}
+				rewritten
+					.append(
+						compacted.tenant_id,
+						compacted.key_identity,
+						compacted.hlc,
+						&compacted.frame,
+					)
+					.await?;
+			}
+			rewritten.fsync().await?;
+			Ok(Zeroizing::new(self.file_ops.read_all(&tmp_path).await?))
+		}
+		.await;
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		let rewritten_plaintext = rewrite_result?;
+		if multirow_recompact_count > 0 {
+			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
+		}
+		let encrypted = self.encrypt_tiered_object_blob_with_table_stats(
+			pointer.slab_id,
+			rewritten_plaintext.as_ref(),
+			table_schemas,
+		)?;
+		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
+			slab_id: pointer.slab_id,
+			old_l2_uri: pointer.l2_uri.clone(),
+			payload_hash: crate::hash::content::digest(&encrypted.bytes),
+			tombstone_metadata: pointer.tombstone_metadata,
+			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
+			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
+			pruned_versions,
+			retention_stats,
 			encrypted_bytes: encrypted.bytes,
 		}))
 	}
@@ -3337,6 +3600,8 @@ impl SlabManager {
 								&& locality.get() <= tombstone.range_end
 								&& loc.hlc >= tombstone.migration_hlc_floor
 						}),
+						retention_ambiguous: false,
+						retention_lag_seconds: 0,
 					})
 					.collect::<Vec<_>>()
 			})
@@ -3373,6 +3638,8 @@ impl SlabManager {
 							*loc,
 							retention_floor,
 						),
+						retention_ambiguous: false,
+						retention_lag_seconds: 0,
 					})
 					.collect::<Vec<_>>()
 			})
@@ -3382,6 +3649,57 @@ impl SlabManager {
 
 		self.compact_sealed_slab_records(slab_id, slab, &records)
 			.await
+	}
+
+	async fn prune_one_sealed_slab_for_retention(
+		&self,
+		slab_id: SlabId,
+		slab: Arc<LocalSlabStore>,
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+	) -> std::io::Result<RetentionSlabScanOutcome> {
+		let mut records: Vec<CompactionRecord> = slab
+			.index
+			.iter()
+			.flat_map(|entry| {
+				let (tenant_id, key_identity) = *entry.key();
+				let routing_locality = self.routing_locality_for_key(tenant_id, key_identity);
+				entry
+					.value()
+					.iter()
+					.map(move |loc| CompactionRecord {
+						tenant_id,
+						key_identity,
+						routing_locality,
+						old_location: *loc,
+						reclaim: false,
+						retention_ambiguous: false,
+						retention_lag_seconds: 0,
+					})
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		self.mark_records_for_table_retention(
+			&slab,
+			&mut records,
+			cluster_policy,
+			table_lifecycle,
+			table_schemas,
+			now_ms,
+		)
+		.await?;
+		records.sort_by_key(|record| record.old_location.offset);
+		let retention_stats = Self::retention_compaction_stats(&records);
+		let compaction = self
+			.compact_sealed_slab_records(slab_id, slab, &records)
+			.await?;
+
+		Ok(RetentionSlabScanOutcome {
+			compaction,
+			retention_stats,
+		})
 	}
 
 	async fn recluster_one_sealed_slab(
@@ -3407,6 +3725,8 @@ impl SlabManager {
 						routing_locality,
 						old_location: *loc,
 						reclaim: false,
+						retention_ambiguous: false,
+						retention_lag_seconds: 0,
 					})
 					.collect::<Vec<_>>()
 			})
@@ -3755,6 +4075,191 @@ impl SlabManager {
 				.any(|stored| *stored == location)
 	}
 
+	async fn mark_records_for_table_retention(
+		&self,
+		slab: &Arc<LocalSlabStore>,
+		records: &mut [CompactionRecord],
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+	) -> std::io::Result<()> {
+		if records.is_empty() {
+			return Ok(());
+		}
+		let global_floor = cluster_retention_floor(cluster_policy, now_ms);
+		let groups = physical_compaction_group_indices(records);
+		for indices in groups.values() {
+			let Some(first_idx) = indices.first().copied() else {
+				continue;
+			};
+			let first = records[first_idx];
+			let frame = slab.read(first.old_location).await?;
+			self.mark_record_group_for_table_retention(
+				&frame,
+				indices,
+				records,
+				cluster_policy,
+				table_lifecycle,
+				table_schemas,
+				now_ms,
+				global_floor,
+			)?;
+		}
+		Ok(())
+	}
+
+	fn mark_records_for_table_retention_from_blob(
+		&self,
+		plaintext: &[u8],
+		records: &mut [CompactionRecord],
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+	) -> std::io::Result<()> {
+		if records.is_empty() {
+			return Ok(());
+		}
+		let global_floor = cluster_retention_floor(cluster_policy, now_ms);
+		let groups = physical_compaction_group_indices(records);
+		for indices in groups.values() {
+			let Some(first_idx) = indices.first().copied() else {
+				continue;
+			};
+			let first = records[first_idx];
+			let frame = extract_record_from_blob(plaintext, first.old_location)?;
+			self.mark_record_group_for_table_retention(
+				&frame,
+				indices,
+				records,
+				cluster_policy,
+				table_lifecycle,
+				table_schemas,
+				now_ms,
+				global_floor,
+			)?;
+		}
+		Ok(())
+	}
+
+	fn mark_record_group_for_table_retention(
+		&self,
+		frame: &[u8],
+		indices: &[usize],
+		records: &mut [CompactionRecord],
+		cluster_policy: MvccRetentionPolicy,
+		table_lifecycle: &TableLifecycleCatalog,
+		table_schemas: &TableSchemaCatalogV1,
+		now_ms: u64,
+		global_floor: Option<HybridTimestamp>,
+	) -> std::io::Result<()> {
+		if storage_multirow_index_entries_from_frame(frame)?.is_none() {
+			if let Some(floor) = global_floor {
+				for idx in indices {
+					let record = records[*idx];
+					records[*idx].reclaim = self.is_retention_prunable(
+						record.tenant_id,
+						record.key_identity,
+						record.old_location,
+						floor,
+					);
+					Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+				}
+			}
+			return Ok(());
+		}
+
+		let batch = decode_record_batch(frame)?;
+		if !has_storage_synthetic_columns(&batch) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"multi-row retention record decoded without synthetic columns",
+			));
+		}
+		for idx in indices {
+			let record = records[*idx];
+			let stored_table_object_id =
+				storage_row_table_object_id_at(&batch, record.old_location.record_row_index)?;
+			let Some(table_object_id) = stored_table_object_id else {
+				records[*idx].retention_ambiguous = true;
+				records[*idx].reclaim = false;
+				continue;
+			};
+			let Some(descriptor) = table_schemas.latest_by_id(record.tenant_id, table_object_id)
+			else {
+				records[*idx].retention_ambiguous = true;
+				records[*idx].reclaim = false;
+				continue;
+			};
+			if !descriptor.row_identity_policy.is_append_only() {
+				if let Some(floor) = global_floor {
+					records[*idx].reclaim = self.is_retention_prunable(
+						record.tenant_id,
+						record.key_identity,
+						record.old_location,
+						floor,
+					);
+					Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+				}
+				continue;
+			}
+			let effective = effective_table_retention(
+				&cluster_policy,
+				table_lifecycle.retention_policy(record.tenant_id, table_object_id),
+				now_ms,
+			);
+			records[*idx].reclaim = effective.floor.is_some_and(|floor| {
+				self.is_append_only_retention_prunable(
+					record.tenant_id,
+					record.key_identity,
+					record.old_location,
+					floor,
+				)
+			});
+			if let Some(floor) = effective.floor {
+				Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+			}
+		}
+		Ok(())
+	}
+
+	fn record_retention_lag_if_retained(
+		record: &mut CompactionRecord,
+		floor: HybridTimestamp,
+		now_ms: u64,
+	) {
+		if !record.reclaim && record.old_location.hlc < floor {
+			record.retention_lag_seconds =
+				now_ms.saturating_sub(record.old_location.hlc.physical_ms) / 1000;
+		}
+	}
+
+	fn is_append_only_retention_prunable(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+		table_floor: HybridTimestamp,
+	) -> bool {
+		if location.hlc >= table_floor {
+			return false;
+		}
+		if location.is_tombstone {
+			return true;
+		}
+		let Some(versions) = self.key_index.get(&(tenant_id, key_identity)) else {
+			return false;
+		};
+		match versions
+			.iter()
+			.find(|stored| stored.hlc > location.hlc && stored.is_tombstone)
+		{
+			Some(tombstone) if tombstone.hlc >= table_floor => false,
+			_ => true,
+		}
+	}
+
 	fn mark_retention_prunable_row_tombstone_pairs(
 		records: &mut [CompactionRecord],
 		retention_floor: HybridTimestamp,
@@ -3790,6 +4295,32 @@ impl SlabManager {
 		}
 	}
 
+	fn retention_compaction_stats(records: &[CompactionRecord]) -> RetentionCompactionStats {
+		let mut stats = RetentionCompactionStats::default();
+		let mut reclaimed_data_by_key: HashSet<TenantKey> = HashSet::new();
+		let mut reclaimed_tombstones_by_key: HashSet<TenantKey> = HashSet::new();
+		for record in records {
+			if record.retention_ambiguous && !record.reclaim {
+				stats.ambiguous_rows_retained = stats.ambiguous_rows_retained.saturating_add(1);
+			}
+			if !record.reclaim {
+				stats.max_lag_seconds = stats.max_lag_seconds.max(record.retention_lag_seconds);
+				continue;
+			}
+			if record.old_location.is_tombstone {
+				stats.pruned_tombstone_rows = stats.pruned_tombstone_rows.saturating_add(1);
+				reclaimed_tombstones_by_key.insert((record.tenant_id, record.key_identity));
+			} else {
+				stats.pruned_data_rows = stats.pruned_data_rows.saturating_add(1);
+				reclaimed_data_by_key.insert((record.tenant_id, record.key_identity));
+			}
+		}
+		stats.pair_drops = reclaimed_tombstones_by_key
+			.intersection(&reclaimed_data_by_key)
+			.count();
+		stats
+	}
+
 	async fn compact_sealed_slab_records(
 		&self,
 		slab_id: SlabId,
@@ -3802,6 +4333,7 @@ impl SlabManager {
 
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
+		let retention_stats = Self::retention_compaction_stats(records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
 		if survivors == 0 {
 			self.finish_compaction_without_replacement(slab_id, &records)
@@ -3809,6 +4341,7 @@ impl SlabManager {
 			return Ok(Some(CompactionOutcome {
 				reclaimed_bytes: old_bytes,
 				reclaimed_records,
+				retention_stats,
 			}));
 		}
 
@@ -3894,6 +4427,7 @@ impl SlabManager {
 		Ok(Some(CompactionOutcome {
 			reclaimed_bytes: old_bytes.saturating_sub(new_bytes),
 			reclaimed_records,
+			retention_stats,
 		}))
 	}
 
@@ -4476,6 +5010,8 @@ struct CompactionRecord {
 	routing_locality: Locality,
 	old_location: RecordLocation,
 	reclaim: bool,
+	retention_ambiguous: bool,
+	retention_lag_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -4527,6 +5063,13 @@ struct RelocatedRecord {
 struct CompactionOutcome {
 	reclaimed_bytes: u64,
 	reclaimed_records: usize,
+	retention_stats: RetentionCompactionStats,
+}
+
+#[derive(Clone, Copy)]
+struct RetentionSlabScanOutcome {
+	compaction: Option<CompactionOutcome>,
+	retention_stats: RetentionCompactionStats,
 }
 
 #[derive(Clone, Copy)]
@@ -4923,6 +5466,19 @@ fn physical_compaction_groups(
 	groups
 }
 
+fn physical_compaction_group_indices(
+	records: &[CompactionRecord],
+) -> BTreeMap<(u64, u32), Vec<usize>> {
+	let mut groups = BTreeMap::new();
+	for (idx, record) in records.iter().enumerate() {
+		groups
+			.entry((record.old_location.offset, record.old_location.length))
+			.or_insert_with(Vec::new)
+			.push(idx);
+	}
+	groups
+}
+
 async fn append_existing_frame_to_replacement(
 	replacement: &Arc<LocalSlabStore>,
 	frame: &[u8],
@@ -5240,7 +5796,7 @@ fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.retention.tmp", slab_id))
 }
 
-fn parse_retention_rewrite_tmp_filename(name: &str) -> Option<SlabId> {
+fn parse_mvcc_rewrite_tmp_filename(name: &str) -> Option<SlabId> {
 	let rest = name
 		.strip_prefix("slab_")?
 		.strip_suffix(".wnd.retention.tmp")?;
@@ -5262,7 +5818,7 @@ async fn cleanup_retention_rewrite_tmp_files(
 		let Some(name) = entry.file_name.to_str() else {
 			continue;
 		};
-		if parse_retention_rewrite_tmp_filename(name).is_none() {
+		if parse_mvcc_rewrite_tmp_filename(name).is_none() {
 			continue;
 		}
 		unlink_local_file(file_ops, &dir.join(name)).await?;
@@ -5390,14 +5946,16 @@ fn build_locality_index(key_localities: &DashMap<TenantKey, Locality>) -> Tenant
 mod tests {
 	use super::*;
 	use crate::crypto::CryptoManager;
-	use crate::schema::NodeId;
 	use crate::schema::table::{
 		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, MultiRowLayoutDescriptor,
 		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
 		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-		STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
-		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
-		encode_table_write_row_count,
+		STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
+		default_kv_table_descriptor_v1, encode_table_write_row_count,
+	};
+	use crate::schema::{
+		NodeId, RetentionWindowMillis, TableLifecycleCatalog, TableRetentionPolicy,
 	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
@@ -5626,6 +6184,99 @@ mod tests {
 		)
 		.unwrap();
 		encode_test_batch(&batch)
+	}
+
+	fn encode_test_append_only_storage_frame(
+		table_object_id: TableObjectId,
+		rows: &[(Identity, Locality, HybridTimestamp, u64, bool)],
+	) -> Vec<u8> {
+		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+		let mut row_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
+		let mut row_locality = UInt64Builder::with_capacity(rows.len());
+		let mut row_table_object_id = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+		for (identity, locality, hlc, _, _) in rows {
+			row_hlc.append_value(test_hlc_storage_bytes(*hlc)).unwrap();
+			row_identity.append_value(identity.as_bytes()).unwrap();
+			row_locality.append_value(locality.get());
+			row_table_object_id
+				.append_value(table_object_id.as_bytes())
+				.unwrap();
+		}
+		let row_tombstone = BooleanArray::from(
+			rows.iter()
+				.map(|(_, _, _, _, value)| *value)
+				.collect::<Vec<_>>(),
+		);
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("value", DataType::UInt64, false),
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(
+				STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+				DataType::FixedSizeBinary(16),
+				false,
+			),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(UInt64Array::from(
+					rows.iter()
+						.map(|(_, _, _, value, _)| *value)
+						.collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(row_hlc.finish()) as Arc<dyn Array>,
+				Arc::new(row_identity.finish()) as Arc<dyn Array>,
+				Arc::new(row_locality.finish()) as Arc<dyn Array>,
+				Arc::new(row_table_object_id.finish()) as Arc<dyn Array>,
+				Arc::new(row_tombstone) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		encode_test_batch(&batch)
+	}
+
+	fn append_only_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![Field::new("value", DataType::UInt64, false)]);
+		TableSchemaDescriptorV1::new_with_layout(
+			table_object_id,
+			1,
+			"analytics",
+			"append_events",
+			&schema,
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn fixed_table_retention_catalog(
+		descriptor: &TableSchemaDescriptorV1,
+		window_ms: u64,
+	) -> (TableSchemaCatalogV1, TableLifecycleCatalog) {
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), descriptor.clone()).unwrap();
+		let mut lifecycle = TableLifecycleCatalog::default();
+		lifecycle
+			.set_next_generation(
+				tenant(),
+				descriptor.table_object_id,
+				crate::schema::PolicyGeneration::ZERO,
+				TableRetentionPolicy::FixedWindow(
+					RetentionWindowMillis::try_new(window_ms).unwrap(),
+				),
+				hlc(1),
+			)
+			.unwrap();
+		(schemas, lifecycle)
 	}
 
 	fn layout_recluster_descriptor(
@@ -6748,6 +7399,149 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn l1_table_retention_prunes_append_only_rows_when_cluster_retention_disabled() {
+		let mgr = fresh_manager().await;
+		let descriptor = append_only_retention_descriptor(TableObjectId::new([0x48; 16]));
+		let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+		let old_key = id(0x4801);
+		let live_key = id(0x4802);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[
+				(old_key, Locality::new(11), hlc(30_000), 100, false),
+				(live_key, Locality::new(12), hlc(50_000), 200, false),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("append-only storage entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+
+		let old_slab_id = force_seal_active(&mgr).await;
+		let report = mgr
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				100_000,
+				1,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert!(mgr.lookup(tenant(), old_key).is_none());
+		let live_location = mgr.lookup(tenant(), live_key).expect("live row survives");
+		assert_ne!(live_location.slab_id, old_slab_id);
+		let live_frame = mgr.read(live_location).await.unwrap();
+		let live_entries = storage_multirow_index_entries_from_frame(&live_frame)
+			.unwrap()
+			.expect("rewritten live entry");
+		assert_eq!(live_entries.len(), 1);
+		assert_eq!(live_entries[0].key_identity, live_key);
+	}
+
+	#[tokio::test]
+	async fn l1_table_retention_reports_lag_for_retained_rows_below_floor() {
+		let mgr = fresh_manager().await;
+		let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4A; 16]));
+		let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+		let pruned_key = id(0x4A01);
+		let retained_key = id(0x4A02);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[
+				(pruned_key, Locality::new(31), hlc(30_000), 100, false),
+				(retained_key, Locality::new(32), hlc(30_000), 200, false),
+				(retained_key, Locality::new(32), hlc(50_000), 0, true),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("append-only storage entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+
+		force_seal_active(&mgr).await;
+		let report = mgr
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				100_000,
+				1,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert_eq!(report.max_lag_seconds, 70);
+		assert!(mgr.lookup(tenant(), pruned_key).is_none());
+		assert!(
+			!mgr.lookup_as_of(tenant(), retained_key, hlc(30_000))
+				.expect("retained data row below floor")
+				.is_tombstone
+		);
+		assert!(
+			mgr.lookup_as_of(tenant(), retained_key, hlc(50_000))
+				.expect("retained tombstone above floor")
+				.is_tombstone
+		);
+	}
+
+	#[tokio::test]
+	async fn l1_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_tombstone() {
+		let mgr = fresh_manager().await;
+		let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4B; 16]));
+		let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+		let retained_key = id(0x4B01);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[
+				(retained_key, Locality::new(33), hlc(30_000), 200, false),
+				(retained_key, Locality::new(33), hlc(50_000), 0, true),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("append-only storage entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+
+		force_seal_active(&mgr).await;
+		let report = mgr
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				100_000,
+				1,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 0);
+		assert_eq!(report.pruned_versions, 0);
+		assert_eq!(report.max_lag_seconds, 70);
+		assert!(
+			!mgr.lookup_as_of(tenant(), retained_key, hlc(30_000))
+				.expect("retained data row below floor")
+				.is_tombstone
+		);
+		assert!(
+			mgr.lookup_as_of(tenant(), retained_key, hlc(50_000))
+				.expect("retained tombstone above floor")
+				.is_tombstone
+		);
+	}
+
+	#[tokio::test]
 	async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 		let mgr = fresh_manager().await;
 		let key = id(0x4701);
@@ -6930,6 +7724,214 @@ mod tests {
 		assert_eq!(recovered.len(), 1);
 		assert_eq!(recovered[0].key_identity, key_b);
 		assert!(!recovered[0].location.is_tombstone);
+	}
+
+	#[tokio::test]
+	async fn tiered_table_retention_rewrite_prunes_append_only_rows_when_cluster_retention_disabled()
+	 {
+		let l1_dir = fresh_dir("retention-table-l1");
+		let l2_root = fresh_dir("retention-table-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let descriptor = append_only_retention_descriptor(TableObjectId::new([0x49; 16]));
+		let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+		let old_key = id(0x4901);
+		let live_key = id(0x4902);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[
+				(old_key, Locality::new(21), hlc(30_000), 100, false),
+				(live_key, Locality::new(22), hlc(50_000), 200, false),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("append-only storage entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &schemas)
+			.unwrap();
+		let old_footer = mgr
+			.encrypted_tiered_footer_summary(&old_encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer");
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}-table-retention.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_footer.tenant_kek_id),
+			stats_format_version: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_table_retention_rewrite(
+				&old_pointer,
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				100_000,
+			)
+			.await
+			.unwrap()
+			.expect("table retention rewrite");
+		let PreparedTieredRetentionRewrite::Rewrite {
+			encrypted_bytes,
+			pruned_versions,
+			..
+		} = prepared
+		else {
+			panic!("expected rewrite with live row survivor");
+		};
+		assert_eq!(pruned_versions, 1);
+
+		let rewritten_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: "rewritten-table-retention".to_string(),
+			payload_hash: crate::hash::content::digest(&encrypted_bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_footer.tenant_kek_id),
+			stats_format_version: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		let rewritten_plaintext = decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			&rewritten_pointer,
+			&encrypted_bytes,
+		)
+		.unwrap();
+		let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+		assert_eq!(recovered.len(), 1);
+		assert_eq!(recovered[0].key_identity, live_key);
+	}
+
+	#[tokio::test]
+	async fn tiered_table_retention_reports_lag_without_rewrite_for_pair_waiting_on_tombstone() {
+		let l1_dir = fresh_dir("retention-table-lag-l1");
+		let l2_root = fresh_dir("retention-table-lag-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let descriptor = append_only_retention_descriptor(TableObjectId::new([0x4C; 16]));
+		let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+		let retained_key = id(0x4C01);
+		let frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[
+				(retained_key, Locality::new(34), hlc(30_000), 200, false),
+				(retained_key, Locality::new(34), hlc(50_000), 0, true),
+			],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("append-only storage entries");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}-table-retention-lag.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_table_retention_rewrite(
+				&old_pointer,
+				MvccRetentionPolicy::Disabled,
+				&lifecycle,
+				&schemas,
+				100_000,
+			)
+			.await
+			.unwrap()
+			.expect("retention observation");
+		let PreparedTieredRetentionRewrite::Observe { retention_stats } = prepared else {
+			panic!("expected lag-only observation");
+		};
+		assert_eq!(retention_stats.pruned_data_rows, 0);
+		assert_eq!(retention_stats.pruned_tombstone_rows, 0);
+		assert_eq!(retention_stats.max_lag_seconds, 70);
 	}
 
 	#[tokio::test]

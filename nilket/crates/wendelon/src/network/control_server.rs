@@ -17,6 +17,7 @@ use crate::consensus::{
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::integration::compute::decode_schema_update_envelope_v1;
+use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
@@ -34,8 +35,9 @@ use crate::network::transport::{
 use crate::network::wire;
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
-	LeaseDescriptor, LeaseStatus, MsgType, NodeId, ProtocolVersionWindow, ReleaseLeaseRequestMeta,
-	ReleaseLeaseResponseMeta, TenantId, TenantKekId, TransferToken, epoch_entry_var_schema,
+	LeaseDescriptor, LeaseStatus, MsgType, NodeId, PolicyGeneration, ProtocolVersionWindow,
+	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableObjectId, TableRetentionPolicy,
+	TenantId, TenantKekId, TransferToken, epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -151,6 +153,12 @@ pub enum TenantAdminRequestWire {
 		target_tenant_id: TenantId,
 	},
 	List,
+	SetTableRetentionPolicy {
+		target_tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		expected_policy_generation: PolicyGeneration,
+		new_policy: TableRetentionPolicy,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +580,26 @@ impl WendelonControlServer {
 		}
 	}
 
+	fn current_control_hlc(&self) -> HybridTimestamp {
+		let physical_ms = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+			.unwrap_or(0);
+		HybridTimestamp {
+			physical_ms,
+			logical: 0,
+			node_id: self.local_node.id,
+		}
+	}
+
+	fn table_retention_metric_policy(policy: TableRetentionPolicy) -> TableRetentionMetricPolicy {
+		match policy {
+			TableRetentionPolicy::InheritCluster => TableRetentionMetricPolicy::InheritCluster,
+			TableRetentionPolicy::Disabled => TableRetentionMetricPolicy::Disabled,
+			TableRetentionPolicy::FixedWindow(_) => TableRetentionMetricPolicy::FixedWindow,
+		}
+	}
+
 	async fn tenant_admin_success_for_target(
 		&self,
 		stream_id: u32,
@@ -834,6 +862,54 @@ impl WendelonControlServer {
 					frame,
 					CONTROL_REASON_INTERNAL_ERROR,
 					"unexpected LeaseDenied response from tenant mutation",
+					None,
+				),
+			},
+			Err(err) if !self.is_leader().await => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_NOT_LEADER,
+				err.to_string(),
+				self.leader_hint()
+					.await
+					.map(|id| NodeId { id, _reserved: 0 }),
+			),
+			Err(err) => self.tenant_admin_rejection(
+				frame,
+				CONTROL_REASON_INTERNAL_ERROR,
+				err.to_string(),
+				None,
+			),
+		}
+	}
+
+	async fn submit_table_retention_policy_update(
+		&self,
+		frame: &HrftFrame,
+		update: crate::consensus::SetTableRetentionPolicy,
+	) -> std::io::Result<HrftFrame> {
+		let target_tenant_id = update.tenant_id;
+		let metric_policy = Self::table_retention_metric_policy(update.new_policy);
+		match self
+			.raft
+			.client_write(WendelonRequest::SetTableRetentionPolicy(update))
+			.await
+		{
+			Ok(resp) => match resp.data {
+				WendelonResponse::Success => {
+					metrics().observe_storage_table_retention_policy_update(metric_policy);
+					self.tenant_admin_success_for_target(frame.header.stream_id, target_tenant_id)
+						.await
+				}
+				WendelonResponse::Error(message) => self.tenant_admin_rejection(
+					frame,
+					Self::tenant_admin_error_reason(&message),
+					message,
+					None,
+				),
+				WendelonResponse::LeaseDenied => self.tenant_admin_rejection(
+					frame,
+					CONTROL_REASON_INTERNAL_ERROR,
+					"unexpected LeaseDenied response from table retention policy update",
 					None,
 				),
 			},
@@ -1238,6 +1314,35 @@ impl WendelonControlServer {
 				}
 				self.submit_tenant_kek_retirement(&frame, target_tenant_id, tenant_kek_id)
 					.await
+			}
+			TenantAdminRequestWire::SetTableRetentionPolicy {
+				target_tenant_id,
+				table_object_id,
+				expected_policy_generation,
+				new_policy,
+			} => {
+				if let Err(error) = require_administrative_action(
+					&context.actor,
+					AdministrativeAction::TableRetentionPolicyUpdate,
+				) {
+					return self.tenant_admin_rejection(
+						&frame,
+						CONTROL_REASON_AUTHORIZATION_FAILED,
+						error.to_string(),
+						None,
+					);
+				}
+				self.submit_table_retention_policy_update(
+					&frame,
+					crate::consensus::SetTableRetentionPolicy {
+						tenant_id: target_tenant_id,
+						table_object_id,
+						expected_policy_generation,
+						new_policy,
+						updated_at_hlc: self.current_control_hlc(),
+					},
+				)
+				.await
 			}
 			TenantAdminRequestWire::Get { target_tenant_id } => {
 				let snapshot = self.state_machine.state_snapshot().await;
@@ -2972,7 +3077,7 @@ mod tests {
 	use crate::consensus::TieredSlab;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::network::transport::{TransportTier, TransportTierSet};
-	use crate::schema::SlabId;
+	use crate::schema::{RetentionWindowMillis, SlabId};
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -3002,6 +3107,23 @@ mod tests {
 			);
 		}
 		MembershipEpoch { epoch, peers }
+	}
+
+	#[test]
+	fn tenant_admin_table_retention_policy_request_roundtrips() {
+		let request = TenantAdminRequestWire::SetTableRetentionPolicy {
+			target_tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([9; 16]),
+			expected_policy_generation: PolicyGeneration::new(3),
+			new_policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+		};
+
+		let encoded = wire::encode(&request).unwrap();
+		let decoded: TenantAdminRequestWire = wire::decode(&encoded).unwrap();
+
+		assert_eq!(decoded, request);
 	}
 
 	#[test]

@@ -359,31 +359,35 @@ Work:
    ordered.
 
 5. Bootstrap on table create: when `CreateTable` (or its
-   equivalent) applies, the control-ring apply batch also
-   emits a second `SetTableRetentionPolicy`-shaped entry
-   inserting
+   equivalent `SchemaUpdate(Create)`) applies, the same
+   state-machine apply effect initializes
    ```rust
    TableLifecyclePolicy {
        tenant_id, table_object_id,
        policy_generation: PolicyGeneration(0),
        retention: TableRetentionPolicy::InheritCluster,
-       updated_at_hlc: <commit hlc of the schema mutation>,
+       updated_at_hlc: HybridTimestamp {
+           physical_ms: 0,
+           logical: 0,
+           node_id: 0,
+       },
    }
    ```
-   into the lifecycle catalog. The descriptor-create entry
-   and the lifecycle entry are submitted as **two entries
-   applied atomically in the same control-ring apply
-   batch** (one descriptor entry, one lifecycle entry).
-   Replay-safe — catalog operations are idempotent under
-   log-index ordering.
+   into the lifecycle catalog. The implementation uses the
+   all-zero HLC sentinel for this implicit bootstrap row
+   because `SchemaUpdate` carries no lifecycle timestamp and
+   Wendelon's Raft entry metadata is not an HLC. The first
+   explicit `SetTableRetentionPolicy` overwrites this value
+   with the leader-generated / leader-merged `updated_at_hlc`
+   supplied by the typed mutation. Replay-safe — catalog
+   operations are idempotent under log-index ordering.
 
    If the client tool requests a non-default initial policy
    alongside the table create (e.g., the user's DDL
-   specified `RETENTION = '90 DAYS'`), the client submits a
-   `SetTableRetentionPolicy` in the same batch carrying the
-   non-default policy directly instead of `InheritCluster`.
-   For PK-keyed tables, only `InheritCluster` is valid in
-   that second entry.
+   specified `RETENTION = '90 DAYS'`), the client submits the
+   typed `SetTableRetentionPolicy` mutation after the create
+   has committed, using expected generation zero. For PK-
+   keyed tables, only `InheritCluster` is valid.
 
 6. Bootstrap on existing tables (one-time migration): when
    the lifecycle catalog is empty for a known table at
@@ -393,8 +397,11 @@ Work:
    entry. (No legacy decoder needed; absence is the legacy
    shape.)
 
-7. On table drop: remove the lifecycle entry as part of
-   the drop's apply effect.
+7. On table drop: deferred with table drops. The current
+   engine rejects `SchemaMutationKindV1::Drop`; when drops
+   are re-enabled, remove the lifecycle entry before
+   removing the descriptor in the same replay-safe apply
+   effect.
 
 8. Add control-server authorization: tenant-admin
    permission for `SetTableRetentionPolicy`. A stricter
@@ -404,12 +411,15 @@ Tests:
 
 - `CreateTable` installs initial lifecycle policy with
   `policy_generation = 0`, `InheritCluster` in the same
-  control-ring apply batch.
-- `CreateTable + SetTableRetentionPolicy { FixedWindow }`
-  in the same batch (append-only) installs `FixedWindow(...)`
-  directly without an intermediate `InheritCluster` state.
-- `CreateTable + SetTableRetentionPolicy { FixedWindow }`
-  in the same batch (PK-keyed) rejects with
+  schema-create apply effect.
+- `CreateTable` installs initial lifecycle policy with
+  `updated_at_hlc` equal to the all-zero bootstrap sentinel.
+- `CreateTable` followed by
+  `SetTableRetentionPolicy { FixedWindow }` (append-only)
+  installs `FixedWindow(...)`.
+- `CreateTable` followed by
+  `SetTableRetentionPolicy { FixedWindow }` (PK-keyed)
+  rejects with
   `RETENTION_REJECTED_PK_DISALLOWED`.
 - `SetTableRetentionPolicy` for an append-only table
   advances generation, persists policy.
@@ -423,8 +433,8 @@ Tests:
 - `FixedWindow(0)` constructor rejects.
 - Schema descriptor fingerprint is unchanged by policy
   update (architecture guard).
-- `DropTable` removes lifecycle entry; ordering: lifecycle
-  first, then descriptor; replay-safe.
+- Drop-ordering test is deferred until
+  `SchemaMutationKindV1::Drop` is re-enabled.
 - Snapshot encode / decode preserves the catalog.
 - Architecture guard: lifecycle catalog API has no
   generation-keyed lookup.
@@ -749,8 +759,8 @@ Exit:
 Files:
 
 - `src/hash/state_digest.rs` (no new domain helpers)
-- `src/storage/manager.rs` (compaction-time digest update;
-  reuse helper across L1 + L2)
+- `src/storage/manager.rs` (retention survivor sets are
+  sufficient for on-demand digest recomputation)
 - `tests/state_digest_invariants.rs` (extend)
 
 Work:
@@ -782,9 +792,11 @@ Work:
    Internal-only; share between Phase 4 (L1) and Phase 5
    (L2).
 
-4. Compaction-time digest update: at compaction output
-   write, walk evicted rows and apply the reverse of their
-   admission contribution. Result is **not** persisted.
+4. V1 stance: visible digest is recomputed on demand from
+   post-retention slab contents. The helper remains internal,
+   unit-tested, and benched as the algebraic reverse needed by
+   any future in-memory incremental cache, but no V1 durable
+   compaction path maintains a live accumulator.
 
 5. **In-memory cache rule** (inherited from ADR 047 §10):
    any cached visible digest invalidates on compaction-
@@ -923,6 +935,10 @@ Audit:
   policy_generation, updated_at_hlc, actor.
 - Reclaim job: tenant, table when known, floor, pruned
   rows, reclaimed bytes, L1 / L2.
+- Policy-extension audit events include the prior policy
+  when available, whether the update extends the table
+  window, and an explicit
+  `retention_extension_restores_history=false` signal.
 - Read-side `RETENTION_FLOOR_EXCEEDED` rejects emit a
   metric, not an audit event (volume).
 
@@ -1137,9 +1153,12 @@ Engine surface decisions (within Wendelon's scope):
 - `RetentionWindowMillis` bounds: 1 minute to 100 years.
 - New `WendelonRequest::SetTableRetentionPolicy` mutation
   with `policy_generation` CAS.
-- `CREATE TABLE` + initial lifecycle policy: two entries
-  applied atomically in the same control-ring apply batch.
-- Drop-table ordering: lifecycle first, descriptor second.
+- `CREATE TABLE` initializes the default lifecycle policy in
+  the same schema-create apply effect with an all-zero
+  bootstrap HLC sentinel.
+- Drop-table lifecycle cleanup remains deferred until table
+  drops are re-enabled; intended ordering is lifecycle first,
+  descriptor second.
 - Tenant-admin permission for retention updates.
 - PK-keyed table-specific overrides reject; PK reclaim
   stays on the cluster MVCC retention path.

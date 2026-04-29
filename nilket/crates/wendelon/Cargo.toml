@@ -101,3 +101,7 @@ harness = false
 [[bench]]
 name = "row_tombstones"
 harness = false
+
+[[bench]]
+name = "table_retention"
+harness = false

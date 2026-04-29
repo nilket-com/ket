@@ -1,3 +1,4 @@
+use crate::schema::{HybridTimestamp, TableRetentionPolicy};
 use std::io::{Error, ErrorKind};
 use std::time::Duration;
 
@@ -48,10 +49,99 @@ impl MvccRetentionPolicy {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectiveRetention {
+	pub policy: TableRetentionPolicy,
+	pub floor: Option<HybridTimestamp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionReadError {
+	pub as_of_hlc: HybridTimestamp,
+	pub floor: HybridTimestamp,
+}
+
+pub fn cluster_retention_floor(
+	cluster_policy: MvccRetentionPolicy,
+	now_ms: u64,
+) -> Option<HybridTimestamp> {
+	let window = cluster_policy.window()?;
+	let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+	Some(retention_floor_from_window_ms(now_ms, window_ms))
+}
+
+pub fn effective_table_retention(
+	cluster_policy: &MvccRetentionPolicy,
+	table_policy: Option<&TableRetentionPolicy>,
+	now_ms: u64,
+) -> EffectiveRetention {
+	let policy = table_policy
+		.copied()
+		.unwrap_or(TableRetentionPolicy::InheritCluster);
+	let floor = match policy {
+		TableRetentionPolicy::InheritCluster => cluster_retention_floor(*cluster_policy, now_ms),
+		TableRetentionPolicy::Disabled => None,
+		TableRetentionPolicy::FixedWindow(window) => {
+			Some(retention_floor_from_window_ms(now_ms, window.get()))
+		}
+	};
+	EffectiveRetention { policy, floor }
+}
+
+pub fn check_read_against_retention(
+	as_of_hlc: HybridTimestamp,
+	effective: &EffectiveRetention,
+) -> Result<(), RetentionReadError> {
+	let Some(floor) = effective.floor else {
+		return Ok(());
+	};
+	if crate::storage::core::is_zero_hlc(as_of_hlc) || as_of_hlc >= floor {
+		return Ok(());
+	}
+	Err(RetentionReadError { as_of_hlc, floor })
+}
+
+pub fn check_multi_table_read_against_retention<'a>(
+	as_of_hlc: HybridTimestamp,
+	effective_retentions: impl IntoIterator<Item = &'a EffectiveRetention>,
+) -> Result<(), RetentionReadError> {
+	for effective in effective_retentions {
+		check_read_against_retention(as_of_hlc, effective)?;
+	}
+	Ok(())
+}
+
+pub fn row_visible_under_retention(
+	row_hlc: HybridTimestamp,
+	effective: &EffectiveRetention,
+) -> bool {
+	effective.floor.is_none_or(|floor| row_hlc >= floor)
+}
+
+fn retention_floor_from_window_ms(now_ms: u64, window_ms: u64) -> HybridTimestamp {
+	HybridTimestamp {
+		physical_ms: now_ms.saturating_sub(window_ms),
+		logical: 0,
+		node_id: 0,
+	}
+}
+
 #[cfg(test)]
 mod tests {
-	use super::MvccRetentionPolicy;
+	use super::{
+		EffectiveRetention, MvccRetentionPolicy, check_multi_table_read_against_retention,
+		check_read_against_retention, effective_table_retention, row_visible_under_retention,
+	};
+	use crate::schema::{HybridTimestamp, RetentionWindowMillis, TableRetentionPolicy};
 	use std::time::Duration;
+
+	fn hlc(ms: u64) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms: ms,
+			logical: 0,
+			node_id: 0,
+		}
+	}
 
 	#[test]
 	fn optional_window_helpers_preserve_disabled_and_fixed_modes() {
@@ -77,5 +167,65 @@ mod tests {
 				.is_err()
 		);
 		assert!(MvccRetentionPolicy::Disabled.validate().is_ok());
+	}
+
+	#[test]
+	fn effective_table_retention_resolves_three_modes() {
+		let cluster = MvccRetentionPolicy::FixedWindow(Duration::from_secs(30));
+		let now_ms = 100_000;
+		assert_eq!(
+			effective_table_retention(
+				&cluster,
+				Some(&TableRetentionPolicy::InheritCluster),
+				now_ms
+			)
+			.floor,
+			Some(hlc(70_000))
+		);
+		assert_eq!(
+			effective_table_retention(&cluster, Some(&TableRetentionPolicy::Disabled), now_ms)
+				.floor,
+			None
+		);
+		let fixed =
+			TableRetentionPolicy::FixedWindow(RetentionWindowMillis::try_new(60_000).unwrap());
+		assert_eq!(
+			effective_table_retention(&cluster, Some(&fixed), now_ms).floor,
+			Some(hlc(40_000))
+		);
+	}
+
+	#[test]
+	fn read_admission_and_row_filter_use_floor() {
+		let effective = EffectiveRetention {
+			policy: TableRetentionPolicy::InheritCluster,
+			floor: Some(hlc(50)),
+		};
+		assert!(check_read_against_retention(hlc(50), &effective).is_ok());
+		assert!(check_read_against_retention(hlc(49), &effective).is_err());
+		assert!(check_read_against_retention(hlc(0), &effective).is_ok());
+		assert!(!row_visible_under_retention(hlc(49), &effective));
+		assert!(row_visible_under_retention(hlc(50), &effective));
+	}
+
+	#[test]
+	fn multi_table_read_admission_requires_all_tables() {
+		let valid = EffectiveRetention {
+			policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(90_000).unwrap(),
+			),
+			floor: Some(hlc(20)),
+		};
+		let expired = EffectiveRetention {
+			policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(60_000).unwrap(),
+			),
+			floor: Some(hlc(50)),
+		};
+
+		assert!(check_multi_table_read_against_retention(hlc(60), [&valid, &expired]).is_ok());
+		let err = check_multi_table_read_against_retention(hlc(40), [&valid, &expired])
+			.expect_err("one expired table must reject the whole request");
+		assert_eq!(err.floor, hlc(50));
 	}
 }

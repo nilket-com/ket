@@ -846,12 +846,14 @@ a low-frequency administrative operation.
   reclaim).** Rejected: storage cost.
 - **Single-phase physical-only retention (no read filter).**
   Rejected: contract weakens to compaction-timing.
-- **One Raft entry for `CREATE TABLE` + initial lifecycle
-  policy.** Rejected: two entries applied atomically in
-  the same control-ring apply batch (one descriptor entry,
-  one lifecycle entry) is replay-safe and reuses the
-  existing batched-mutation path; one entry would conflate
-  two mutation kinds.
+- **Separate Raft entry for default `CREATE TABLE`
+  lifecycle bootstrap.** Rejected: the default
+  `InheritCluster` lifecycle row is part of the schema-
+  create apply effect, uses the all-zero bootstrap HLC
+  sentinel, and is overwritten by the first explicit typed
+  `SetTableRetentionPolicy` mutation. Non-default initial
+  policy remains a typed lifecycle mutation submitted after
+  create with expected generation zero.
 
 ## Resolved questions
 
@@ -897,10 +899,12 @@ a low-frequency administrative operation.
    arithmetic safety; operators wanting "effectively
    unbounded" use `Disabled` or `InheritCluster`.
 
-10. **`CREATE TABLE` + initial lifecycle policy**: two
-    entries applied atomically in the same control-ring
-    apply batch (one descriptor entry, one lifecycle
-    entry).
+10. **`CREATE TABLE` + initial lifecycle policy**: schema
+    create initializes the default `InheritCluster`
+    lifecycle row in the same state-machine apply effect.
+    The implicit bootstrap row uses an all-zero HLC
+    sentinel; the first explicit typed policy update
+    overwrites it.
 
 11. **Permission model for retention updates**: tenant-
     admin in V1. A stricter data-lifecycle permission is
@@ -914,8 +918,10 @@ a low-frequency administrative operation.
     `max(__row_hlc__)` in the slab summary (open question
     §2).
 
-13. **Drop-table ordering**: lifecycle entry removed first,
-    then descriptor. Replay-safe.
+13. **Drop-table ordering**: deferred until table drops are
+    re-enabled. The intended ordering remains lifecycle
+    entry first, then descriptor, in one replay-safe apply
+    effect.
 
 14. **`SetTableRetentionPolicy` is a new mutation** in the
     existing `WendelonRequest` enum, not a schema-mutation
