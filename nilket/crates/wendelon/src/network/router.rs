@@ -150,6 +150,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_REPLICATE_RESP.0
 				|| x == MsgType::TABLE_QUERY_REQ.0
 				|| x == MsgType::TABLE_QUERY_RESP.0
+				|| x == MsgType::TABLE_DELETE_REQ.0
+				|| x == MsgType::TABLE_DELETE_RESP.0
 				|| x == MsgType::AGG_REQ.0
 				|| x == MsgType::AGG_RESP.0 =>
 			{

@@ -6,7 +6,8 @@ use crate::schema::{
 	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, RecordBodyByteLen,
 	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN,
 	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, SchemaFingerprint, SlabId, TableSchemaDescriptorV1,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaFingerprint, SlabId,
+	TableSchemaDescriptorV1,
 };
 use crate::storage::core::RecordLocation;
 use arrow::array::{ArrayData, ArrayRef, NullArray, make_array};
@@ -482,7 +483,7 @@ impl StorageColumn {
 			STORAGE_ROW_HLC_COLUMN => Some(Self::RowHlc),
 			STORAGE_ROW_KEY_ID_COLUMN => Some(Self::RowKeyId),
 			STORAGE_ROW_ROUTING_LOCALITY_COLUMN => Some(Self::RowRoutingLocality),
-			"__row_tombstone__" => Some(Self::RowTombstone),
+			STORAGE_ROW_TOMBSTONE_COLUMN => Some(Self::RowTombstone),
 			STORAGE_ROW_TABLE_OBJECT_ID_COLUMN => Some(Self::RowTableObjectId),
 			_ => None,
 		}
@@ -1889,6 +1890,7 @@ mod tests {
 				node_id: 0,
 			},
 			record_row_index: RecordRowIndex::new(0),
+			is_tombstone: false,
 		}
 	}
 
@@ -2898,6 +2900,7 @@ mod tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				&bytes,
 			)
@@ -3027,6 +3030,7 @@ mod tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				&bytes,
 			)

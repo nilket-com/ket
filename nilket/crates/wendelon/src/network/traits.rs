@@ -1,7 +1,8 @@
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FinalizationMarker, LeaseDescriptor, NodeId,
 	RaftEpochEntryFixed, ReadRequestMeta, ReadResponseMeta, ReleaseLeaseRequestMeta,
-	ReleaseLeaseResponseMeta, TransferToken, WriteRequestMeta, WriteResponseMeta,
+	ReleaseLeaseResponseMeta, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta,
+	TransferToken, WriteRequestMeta, WriteResponseMeta,
 };
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -74,6 +75,12 @@ pub trait DataRing: Send + Sync {
 		meta: ReadRequestMeta,
 		key: RecordBatch,
 	) -> std::io::Result<(ReadResponseMeta, Option<RecordBatch>)>;
+
+	async fn table_delete(
+		&self,
+		meta: TableDeleteRowsRequestMeta,
+		row_key_ids: Vec<crate::schema::Identity>,
+	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)>;
 
 	async fn stream_finalization(
 		&self,

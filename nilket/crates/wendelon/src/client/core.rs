@@ -52,12 +52,14 @@ use crate::schema::{
 	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
 	Locality, MsgType, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	STORAGE_ROW_KEY_ID_COLUMN, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta,
 	TableQueryRequestMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
 	column_projection_prefix_ranges, read_key_schema, read_value_schema,
 	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
-use arrow::array::{Array, LargeBinaryArray};
+use arrow::array::{Array, FixedSizeBinaryBuilder, LargeBinaryArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -298,6 +300,21 @@ pub struct TableWriteResult {
 	pub finalization: Option<FinalizationMarker>,
 }
 
+/// Client-visible append-only row delete request for ADR 047.
+#[derive(Clone, Debug)]
+pub struct TableDeleteRowsRequest {
+	pub meta: TableDeleteRowsRequestMeta,
+	pub descriptor: TableSchemaDescriptorV1,
+	pub row_key_ids: Vec<Identity>,
+}
+
+/// Result of an append-only row delete.
+#[derive(Clone, Debug)]
+pub struct TableDeleteRowsResult {
+	pub response: TableDeleteRowsResponseMeta,
+	pub finalization: Option<FinalizationMarker>,
+}
+
 /// Client-visible typed table scan request for ADR 037.
 #[derive(Clone, Debug)]
 pub struct TableQueryRequest {
@@ -470,6 +487,36 @@ impl WendelonClient {
 				return Ok(result);
 			}
 			self.prepare_retry(Some(key_locality), retry).await?;
+			preferred_target = retry.preferred_target;
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Issue one `TABLE_DELETE_REQ` over HRFT. The accepting data node
+	/// resolves the row IDs against the local version index and emits
+	/// tombstone-only multi-row records for currently visible rows.
+	pub async fn table_delete(
+		&self,
+		request: TableDeleteRowsRequest,
+	) -> std::io::Result<TableDeleteRowsResult> {
+		validate_table_delete_request(&request)?;
+		let route_locality =
+			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
+		let mut preferred_target = None;
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
+			let result = self.table_delete_once(target, &request).await?;
+			self.observe_write_response(&result.response.write);
+			if result.response.reject_code != PbcRejectCode::NONE.0 {
+				return Ok(result);
+			}
+			let Some(retry) = retry_write_response(&result.response.write) else {
+				return Ok(result);
+			};
+			if attempt + 1 == DATA_RETRY_BUDGET {
+				return Ok(result);
+			}
+			self.prepare_retry(Some(route_locality), retry).await?;
 			preferred_target = retry.preferred_target;
 		}
 		unreachable!("bounded retry loop must return within budget")
@@ -678,6 +725,41 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_write_response_frame(frame)
+	}
+
+	async fn table_delete_once(
+		&self,
+		target: NodeId,
+		request: &TableDeleteRowsRequest,
+	) -> std::io::Result<TableDeleteRowsResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let payload = table_delete_rows_batch(&request.row_key_ids)?;
+		let arrow = encode_batch(&payload)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::TABLE_DELETE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<TableDeleteRowsRequestMeta>() as u32,
+			arrow_len: arrow.len() as u32,
+			trailing_len: 0,
+		};
+		write_frame(
+			&mut *stream,
+			&header,
+			bytemuck::bytes_of(&request.meta),
+			Some(&arrow),
+			None,
+		)
+		.await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		decode_table_delete_response_frame(frame)
 	}
 
 	async fn read_once(
@@ -1470,6 +1552,72 @@ fn decode_table_write_response_frame(
 	})
 }
 
+fn decode_table_delete_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<TableDeleteRowsResult> {
+	if frame.header.msg_type != MsgType::TABLE_DELETE_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected TABLE_DELETE_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() < std::mem::size_of::<TableDeleteRowsResponseMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DELETE_RESP meta too small",
+		));
+	}
+	if frame.arrow_payload.is_some() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DELETE_RESP must not carry an Arrow payload",
+		));
+	}
+	let response: TableDeleteRowsResponseMeta =
+		*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableDeleteRowsResponseMeta>()]);
+	let finalization = match response.write.has_finalization {
+		0 => {
+			if frame.trailing.is_some() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_DELETE_RESP trailing marker present but has_finalization=0",
+				));
+			}
+			None
+		}
+		1 => {
+			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_DELETE_RESP missing FinalizationMarker payload",
+				)
+			})?;
+			if trailing.len() < std::mem::size_of::<FinalizationMarker>() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_DELETE_RESP FinalizationMarker payload too small",
+				));
+			}
+			Some(*bytemuck::from_bytes(
+				&trailing[..std::mem::size_of::<FinalizationMarker>()],
+			))
+		}
+		other => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("TABLE_DELETE_RESP invalid has_finalization value {other}"),
+			));
+		}
+	};
+	Ok(TableDeleteRowsResult {
+		response,
+		finalization,
+	})
+}
+
 fn decode_read_response_frame(
 	frame: crate::network::core::HrftFrame,
 ) -> std::io::Result<ReadResult> {
@@ -1544,6 +1692,69 @@ fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream finish: {e}")))?;
 	}
 	Ok(buf)
+}
+
+fn table_delete_rows_schema() -> Schema {
+	Schema::new(vec![Field::new(
+		STORAGE_ROW_KEY_ID_COLUMN,
+		DataType::FixedSizeBinary(32),
+		false,
+	)])
+}
+
+fn table_delete_rows_batch(row_key_ids: &[Identity]) -> std::io::Result<RecordBatch> {
+	let mut builder = FixedSizeBinaryBuilder::with_capacity(row_key_ids.len(), 32);
+	for row_key_id in row_key_ids {
+		builder
+			.append_value(row_key_id.as_bytes())
+			.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("row key id append: {e}")))?;
+	}
+	RecordBatch::try_new(
+		Arc::new(table_delete_rows_schema()),
+		vec![Arc::new(builder.finish())],
+	)
+	.map_err(|e| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("TABLE_DELETE_REQ payload: {e}"),
+		)
+	})
+}
+
+fn validate_table_delete_request(request: &TableDeleteRowsRequest) -> std::io::Result<()> {
+	request
+		.descriptor
+		.validate()
+		.map_err(|e| Error::new(ErrorKind::InvalidInput, e.to_string()))?;
+	if request.meta.table_object_id != request.descriptor.table_object_id {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_DELETE_REQ table_object_id does not match descriptor",
+		));
+	}
+	if request.meta.schema_generation != request.descriptor.schema_generation {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_DELETE_REQ schema_generation does not match descriptor",
+		));
+	}
+	if request.row_key_ids.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_DELETE_REQ requires at least one row key id",
+		));
+	}
+	if request.row_key_ids.len() != request.meta.row_count as usize {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"TABLE_DELETE_REQ row_count mismatch: meta={} actual={}",
+				request.meta.row_count,
+				request.row_key_ids.len()
+			),
+		));
+	}
+	Ok(())
 }
 
 fn validate_write_request_batch(

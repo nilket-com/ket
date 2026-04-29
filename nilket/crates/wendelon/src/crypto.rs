@@ -46,6 +46,7 @@ pub const SLAB_ENVELOPE_FORMAT_VERSION_WITH_STATS: u32 = 2;
 pub const SLAB_STATS_FORMAT_VERSION_ADR039_V1: u16 = 1;
 pub const DEFAULT_TENANT_KEK_CACHE_MAX_ENTRIES: usize = 2048;
 pub const DEFAULT_SLAB_DEK_CACHE_MAX_ENTRIES: usize = 10_000;
+pub const HAS_ROW_TOMBSTONE_RECORDS_BIT: u8 = 1 << 0;
 
 const _: [(); 8] = [(); std::mem::size_of::<u64>()];
 const ADR_TIERED_SLAB_MAGIC_HEAD: [u8; 8] = *b"WENDSLAB";
@@ -948,6 +949,7 @@ pub struct EncryptedTieredSlab {
 	pub chunk_count: u32,
 	pub slab_format_version: u32,
 	pub stats_locator: Option<TieredStatsBlockLocator>,
+	pub has_row_tombstone_records: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -969,6 +971,7 @@ pub struct FooterSummary {
 	pub cipher_id: CipherId,
 	pub chunk_count: u32,
 	pub stats_locator: Option<TieredStatsBlockLocator>,
+	pub has_row_tombstone_records: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1088,6 +1091,7 @@ pub struct TieredSlabObjectMetadata {
 	pub created_hlc: u64,
 	pub offset_index: Vec<TieredOffsetIndexEntry>,
 	pub column_stats_block: Option<TieredColumnStatsBlock>,
+	pub has_row_tombstone_records: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1636,6 +1640,7 @@ impl CryptoManager {
 			record_count,
 			tenant_kek_id,
 			&encrypted_chunks.wrapped_slab_dek,
+			metadata.has_row_tombstone_records,
 		)?;
 		let stats_locator = metadata
 			.column_stats_block
@@ -1702,6 +1707,7 @@ impl CryptoManager {
 			chunk_count,
 			slab_format_version,
 			stats_locator,
+			has_row_tombstone_records: metadata.has_row_tombstone_records,
 		})
 	}
 
@@ -3479,6 +3485,7 @@ struct ParsedEncryptedFooterFields {
 	cipher_id: CipherId,
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
+	has_row_tombstone_records: bool,
 	plaintext_len: usize,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
@@ -3504,6 +3511,7 @@ struct ParsedEncryptedFooter<'a> {
 	cipher_id: CipherId,
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
+	has_row_tombstone_records: bool,
 	plaintext_len: usize,
 	nonce_version: u32,
 	wrapped_slab_dek: Vec<u8>,
@@ -3535,6 +3543,7 @@ impl ParsedEncryptedFooterFields {
 			cipher_id: self.cipher_id,
 			chunk_count: self.chunk_count,
 			stats_locator: self.stats_locator,
+			has_row_tombstone_records: self.has_row_tombstone_records,
 		}
 	}
 
@@ -3587,6 +3596,7 @@ impl ParsedEncryptedFooter<'_> {
 			cipher_id: self.cipher_id,
 			chunk_count: self.chunk_count,
 			stats_locator: self.stats_locator,
+			has_row_tombstone_records: self.has_row_tombstone_records,
 		}
 	}
 }
@@ -3857,6 +3867,7 @@ fn encode_adr022_footer(
 	record_count: u64,
 	tenant_kek_id: TenantKekId,
 	wrapped_slab_dek: &[u8],
+	has_row_tombstone_records: bool,
 ) -> std::io::Result<[u8; ADR_TIERED_SLAB_FOOTER_BYTES]> {
 	if wrapped_slab_dek.len() != ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES {
 		return Err(Error::new(
@@ -3871,6 +3882,9 @@ fn encode_adr022_footer(
 	let mut footer = [0_u8; ADR_TIERED_SLAB_FOOTER_BYTES];
 	footer[..4].copy_from_slice(&slab_format_version.to_be_bytes());
 	footer[4] = cipher_id.to_wire();
+	if has_row_tombstone_records {
+		footer[5] |= HAS_ROW_TOMBSTONE_RECORDS_BIT;
+	}
 	encode_adr022_u64_slot(&mut footer[8..24], slab_id.get())?;
 	encode_adr022_u64_slot(&mut footer[24..40], tenant_id.get())?;
 	footer[40..48].copy_from_slice(&created_hlc.to_be_bytes());
@@ -4069,12 +4083,14 @@ fn parse_adr022_footer_fields(
 		));
 	}
 	let cipher_id = CipherId::from_wire(footer[4])?;
-	if footer[5..8] != [0, 0, 0] {
+	let footer_flags = footer[5];
+	if footer_flags & !HAS_ROW_TOMBSTONE_RECORDS_BIT != 0 || footer[6..8] != [0, 0] {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"non-zero reserved bytes in ADR 022 footer",
 		));
 	}
+	let has_row_tombstone_records = footer_flags & HAS_ROW_TOMBSTONE_RECORDS_BIT != 0;
 	let slab_id = SlabId::new(decode_adr022_u64_slot(&footer[8..24], "slab_id")?);
 	let tenant_id = TenantId::new(decode_adr022_u64_slot(&footer[24..40], "tenant_id")?);
 	let created_hlc = u64::from_be_bytes(footer[40..48].try_into().expect("slice len"));
@@ -4155,6 +4171,7 @@ fn parse_adr022_footer_fields(
 		cipher_id,
 		chunk_count,
 		stats_locator,
+		has_row_tombstone_records,
 		plaintext_len: 0,
 		nonce_version: SLAB_NONCE_VERSION,
 		wrapped_slab_dek,
@@ -4221,6 +4238,7 @@ fn parse_adr022_encrypted_footer(blob: &[u8]) -> std::io::Result<ParsedEncrypted
 		cipher_id: fields.cipher_id,
 		chunk_count: fields.chunk_count,
 		stats_locator: fields.stats_locator,
+		has_row_tombstone_records: fields.has_row_tombstone_records,
 		plaintext_len: fields.plaintext_len,
 		nonce_version: fields.nonce_version,
 		wrapped_slab_dek: fields.wrapped_slab_dek,
@@ -5811,10 +5829,75 @@ mod tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				plaintext,
 			)
 			.unwrap()
+	}
+
+	#[test]
+	fn adr047_footer_roundtrips_row_tombstone_presence_bit() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(47),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 47,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: 4,
+						flags: 0,
+					}],
+					column_stats_block: None,
+					has_row_tombstone_records: true,
+				},
+				b"rows",
+			)
+			.unwrap();
+		assert!(encrypted.has_row_tombstone_records);
+		let parsed = parse_encrypted_footer(&encrypted.bytes).unwrap();
+		assert!(parsed.has_row_tombstone_records);
+		assert!(parsed.footer_summary().has_row_tombstone_records);
+	}
+
+	#[test]
+	fn adr047_footer_row_tombstone_presence_bit_is_hmac_covered() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(48),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 48,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: 4,
+						flags: 0,
+					}],
+					column_stats_block: None,
+					has_row_tombstone_records: false,
+				},
+				b"rows",
+			)
+			.unwrap();
+		let (footer_len, _, tail_offset) = parse_adr022_tail_anchor(&encrypted.bytes).unwrap();
+		let footer_start = tail_offset - footer_len as usize;
+		let mut tampered = encrypted.bytes.clone();
+		tampered[footer_start + 5] ^= HAS_ROW_TOMBSTONE_RECORDS_BIT;
+
+		let err = crypto
+			.decrypt_tiered_slab(SlabId::new(48), &tampered)
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("footer HMAC failed"),
+			"row tombstone footer bit must be inside footer HMAC scope: {err}"
+		);
 	}
 
 	fn patterned_plaintext(len: usize) -> Vec<u8> {
@@ -5929,6 +6012,7 @@ mod tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)
@@ -6144,6 +6228,7 @@ mod tests {
 						2,
 						0,
 					)),
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)
@@ -6251,6 +6336,7 @@ mod tests {
 						3,
 						ADR039_STATS_FLAG_HAS_SMALL_SET | ADR039_STATS_FLAG_HAS_BLOOM,
 					)),
+					has_row_tombstone_records: false,
 				},
 				b"stats here",
 			)
@@ -6496,6 +6582,7 @@ mod tests {
 						1,
 						0,
 					)),
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)
@@ -6586,6 +6673,7 @@ mod tests {
 						1,
 						0,
 					)),
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)
@@ -6691,6 +6779,7 @@ mod tests {
 						parsed_before.header.column_block_count,
 						0,
 					)),
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)

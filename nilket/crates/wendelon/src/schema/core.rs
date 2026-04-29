@@ -575,6 +575,8 @@ impl MsgType {
 	pub const TABLE_QUERY_RESP: Self = Self(0x2D);
 	pub const AGG_REQ: Self = Self(0x32);
 	pub const AGG_RESP: Self = Self(0x33);
+	pub const TABLE_DELETE_REQ: Self = Self(0x34);
+	pub const TABLE_DELETE_RESP: Self = Self(0x35);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);

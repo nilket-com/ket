@@ -55,15 +55,16 @@
 use crate::metrics::global as metrics;
 use crate::schema::{
 	HybridTimestamp, Identity, Locality, RecordRowIndex, STORAGE_ROW_HLC_COLUMN,
-	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SlabId, SlabRecordHeader,
-	TenantId,
+	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
+	SlabId, SlabRecordHeader, TenantId,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
-use arrow::array::{FixedSizeBinaryArray, UInt64Array};
+use arrow::array::{BooleanArray, FixedSizeBinaryArray, UInt64Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
@@ -83,6 +84,7 @@ pub struct RecordLocation {
 	pub length: u32,
 	pub hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,
+	pub is_tombstone: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +93,7 @@ pub(crate) struct MultiRowIndexEntry {
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,
+	pub is_tombstone: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,6 +494,7 @@ impl StorageEngine for LocalSlabStore {
 			length: payload_size as u32,
 			hlc,
 			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
 		};
 		// DashMap's `entry` API gives us an atomic read-modify-write
 		// on the per-key version chain, so concurrent appends on
@@ -675,6 +679,7 @@ fn recover_slab(
 	let file_size = file.metadata()?.len();
 	let index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
 	let recovered_localities: DashMap<TenantKey, Locality> = DashMap::new();
+	let mut recovered_row_tombstones = HashSet::new();
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	// One page is enough for the header probe — every record
 	// starts on a page boundary and the header occupies only the
@@ -731,8 +736,10 @@ fn recover_slab(
 			length: payload_size as u32,
 			hlc: header.hlc,
 			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
 		};
 		for entry in recover_entries_for_record(&header, base_location, &frame_bytes)? {
+			observe_recovered_row_tombstone(&mut recovered_row_tombstones, &entry)?;
 			index
 				.entry((entry.tenant_id, entry.key_identity))
 				.and_modify(|versions| insert_version_sorted(versions, entry.location))
@@ -754,6 +761,7 @@ pub(crate) fn recover_slab_entries_from_blob(
 ) -> std::io::Result<Vec<RecoveredSlabEntry>> {
 	let header_size = std::mem::size_of::<SlabRecordHeader>();
 	let mut entries = Vec::new();
+	let mut recovered_row_tombstones = HashSet::new();
 	let mut cursor: usize = 0;
 
 	while cursor + DIRECT_IO_ALIGN <= blob.len() {
@@ -784,12 +792,32 @@ pub(crate) fn recover_slab_entries_from_blob(
 			length: payload_size as u32,
 			hlc: header.hlc,
 			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
 		};
-		entries.extend(recover_entries_for_record(&header, base_location, frame)?);
+		for entry in recover_entries_for_record(&header, base_location, frame)? {
+			observe_recovered_row_tombstone(&mut recovered_row_tombstones, &entry)?;
+			entries.push(entry);
+		}
 		cursor += padded;
 	}
 
 	Ok(entries)
+}
+
+fn observe_recovered_row_tombstone(
+	recovered_row_tombstones: &mut HashSet<TenantKey>,
+	entry: &RecoveredSlabEntry,
+) -> std::io::Result<()> {
+	if !entry.location.is_tombstone {
+		return Ok(());
+	}
+	if recovered_row_tombstones.insert((entry.tenant_id, entry.key_identity)) {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		"duplicate row tombstone recovered for the same tenant/key",
+	))
 }
 
 fn recover_entries_for_record(
@@ -816,6 +844,7 @@ fn recover_entries_for_record(
 			location: RecordLocation {
 				hlc: entry.row_hlc,
 				record_row_index: entry.record_row_index,
+				is_tombstone: entry.is_tombstone,
 				..base_location
 			},
 		})
@@ -837,10 +866,11 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 	let has_locality = batch
 		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
 		.is_some();
-	if !(has_hlc || has_identity || has_locality) {
+	let has_tombstone = batch.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN).is_some();
+	if !(has_hlc || has_identity || has_locality || has_tombstone) {
 		return Ok(None);
 	}
-	if !(has_hlc && has_identity && has_locality) {
+	if !(has_hlc && has_identity && has_locality && has_tombstone) {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"multi-row storage record has an incomplete synthetic-column set",
@@ -873,6 +903,15 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 				"multi-row storage record has invalid __row_routing_locality__ column",
 			)
 		})?;
+	let tombstones = batch
+		.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<BooleanArray>())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"multi-row storage record has invalid __row_tombstone__ column",
+			)
+		})?;
 	let mut entries = Vec::with_capacity(batch.num_rows());
 	for row in 0..batch.num_rows() {
 		let record_row_index = u32::try_from(row).map_err(|_| {
@@ -894,6 +933,7 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 				STORAGE_ROW_HLC_COLUMN,
 			)?)?,
 			record_row_index: RecordRowIndex::new(record_row_index),
+			is_tombstone: tombstones.value(row),
 		});
 	}
 	Ok(Some(entries))
@@ -1054,6 +1094,7 @@ mod tests {
 			length: 4096,
 			hlc,
 			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
 		}
 	}
 
@@ -1079,6 +1120,17 @@ mod tests {
 		hlc0: HybridTimestamp,
 		hlc1: HybridTimestamp,
 	) -> Vec<u8> {
+		multirow_storage_frame_with_tombstones(row0, row1, hlc0, hlc1, false, false)
+	}
+
+	fn multirow_storage_frame_with_tombstones(
+		row0: Identity,
+		row1: Identity,
+		hlc0: HybridTimestamp,
+		hlc1: HybridTimestamp,
+		tombstone0: bool,
+		tombstone1: bool,
+	) -> Vec<u8> {
 		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(2, 16);
 		row_hlc.append_value(hlc_bytes(hlc0)).unwrap();
 		row_hlc.append_value(hlc_bytes(hlc1)).unwrap();
@@ -1088,6 +1140,7 @@ mod tests {
 		let mut row_locality = UInt64Builder::with_capacity(2);
 		row_locality.append_value(70);
 		row_locality.append_value(80);
+		let row_tombstone = BooleanArray::from(vec![tombstone0, tombstone1]);
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("value", DataType::UInt64, false),
 			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
@@ -1097,6 +1150,7 @@ mod tests {
 				false,
 			),
 			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
 		]));
 		let batch = RecordBatch::try_new(
 			schema,
@@ -1105,6 +1159,7 @@ mod tests {
 				Arc::new(row_hlc.finish()),
 				Arc::new(row_id.finish()),
 				Arc::new(row_locality.finish()),
+				Arc::new(row_tombstone),
 			],
 		)
 		.unwrap();
@@ -1267,6 +1322,86 @@ mod tests {
 				.map(|entry| *entry.value()),
 			Some(Locality::new(80))
 		);
+	}
+
+	#[tokio::test]
+	async fn recovery_fails_closed_on_duplicate_row_tombstones() {
+		let dir = std::env::temp_dir().join(format!(
+			"wendelon-duplicate-row-tombstone-recovery-{}-{}",
+			std::process::id(),
+			uuid::Uuid::new_v4()
+		));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join("slab_0000000000000000.wnd");
+		let file_ops = Arc::new(BlockingFileOps);
+		let row = Identity::new([3; 32]);
+		let frame_a = multirow_storage_frame_with_tombstones(
+			row,
+			Identity::new([4; 32]),
+			hlc(10, 0),
+			hlc(11, 0),
+			true,
+			false,
+		);
+		let frame_b = multirow_storage_frame_with_tombstones(
+			row,
+			Identity::new([5; 32]),
+			hlc(20, 0),
+			hlc(21, 0),
+			true,
+			false,
+		);
+		{
+			let store = LocalSlabStore::open(
+				&path,
+				SlabId::ZERO,
+				file_ops.clone(),
+				GroupCommitConfig {
+					floor: Duration::ZERO,
+					ceiling: Duration::ZERO,
+					per_write_cost_estimate: Duration::ZERO,
+				},
+			)
+			.await
+			.unwrap();
+			store
+				.append(
+					TenantId::new(7),
+					Identity::new([9; 32]),
+					hlc(99, 0),
+					&frame_a,
+				)
+				.await
+				.unwrap();
+			store
+				.append(
+					TenantId::new(7),
+					Identity::new([8; 32]),
+					hlc(100, 0),
+					&frame_b,
+				)
+				.await
+				.unwrap();
+			store.fsync().await.unwrap();
+		}
+
+		let recovered = LocalSlabStore::open(
+			&path,
+			SlabId::ZERO,
+			file_ops,
+			GroupCommitConfig {
+				floor: Duration::ZERO,
+				ceiling: Duration::ZERO,
+				per_write_cost_estimate: Duration::ZERO,
+			},
+		)
+		.await;
+		let err = match recovered {
+			Ok(_) => panic!("duplicate tombstones must fail recovery"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("duplicate row tombstone"));
 	}
 
 	#[derive(Clone, Default)]

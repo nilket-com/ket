@@ -461,8 +461,6 @@ fn test_adr044_columnar_fetch_stays_read_side_and_provider_neutral() {
 ///   (`Option<PrimaryKeyDescriptor>` field) survives the Phase 1
 ///   rewrite.
 /// - No node capability bit is added for append-only.
-/// - The `__row_tombstone__` synthetic column is deferred to a
-///   follow-up ADR and must not appear in ADR 045 scope.
 /// - `canonical_row_payload_hash` does not reappear in `src/`. Phase 7
 ///   resolved Open question 1 by dropping the canonical row payload
 ///   hash from the identity preimage on bench evidence; the helper
@@ -553,27 +551,6 @@ fn test_adr045_append_only_invariants() {
 				violations.push(format!(
 					"{}: contains Option<PrimaryKeyDescriptor> coexistence shim \
 					 (forbidden by no-premature-backward-compat.md)",
-					path.display()
-				));
-			}
-			// Tombstone leak guard: ADR 045 must not extend the
-			// `__row_tombstone__` synthetic-column surface. The
-			// pre-existing `StorageColumn::RowTombstone` slot in
-			// `src/storage/columnar.rs` predates ADR 045 and is the
-			// only authorized reference.
-			let is_columnar_predecessor = path
-				.file_name()
-				.and_then(|name| name.to_str())
-				.is_some_and(|name| name == "columnar.rs")
-				&& path
-					.parent()
-					.and_then(|parent| parent.file_name())
-					.and_then(|name| name.to_str())
-					.is_some_and(|name| name == "storage");
-			if !is_columnar_predecessor && content.contains("__row_tombstone__") {
-				violations.push(format!(
-					"{}: __row_tombstone__ is deferred to a follow-up ADR; must not appear in \
-					 ADR 045 scope",
 					path.display()
 				));
 			}
@@ -753,15 +730,6 @@ fn test_adr046_state_digest_substrate_boundaries() {
 			return;
 		};
 
-		if content.contains("__row_tombstone__") {
-			let is_columnar_predecessor = relative == Path::new("src/storage/columnar.rs");
-			if !is_columnar_predecessor {
-				violations.push(format!(
-					"{}: ADR 046 must not introduce the deferred __row_tombstone__ column",
-					relative.display()
-				));
-			}
-		}
 		if content.contains("AppendOnlyContentHash") {
 			violations.push(format!(
 				"{}: content-hash identity is deferred and must not be pre-allocated",
@@ -829,6 +797,93 @@ fn test_adr046_state_digest_substrate_boundaries() {
 	assert!(
 		violations.is_empty(),
 		"ADR 046 architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 047 architectural guards.
+///
+/// Row tombstones are now an approved append-only storage fact, but
+/// the ADR intentionally keeps the surface narrow: shared
+/// `__row_key_id__` identity, no target column, no capability bit,
+/// no short footer alias, and no project-prefixed row-delete domain.
+#[test]
+fn test_adr047_row_tombstone_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+	// Scope this guard to source/test/bench code. Plans may quote
+	// rejected peer-draft names while explaining ADR decisions.
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("__row_tombstone", "_target__"),
+		concat!("has_", "tombstones"),
+		concat!("NodeCapability::", "RowTombstone"),
+		concat!("NodeCapability::", "Tombstone"),
+		concat!("NodeCapability::", "DeleteRows"),
+		concat!("RowTombstone", "Capability"),
+		concat!("Tombstone", "Capability"),
+		concat!("DeleteRows", "Capability"),
+		concat!("wendelon.table", ".delete"),
+		concat!("wendelon.table", "-delete"),
+		concat!("TableDeleteRows", "V1"),
+		concat!("TableDeleteRows", "V2"),
+		concat!("DeleteRows", "V1"),
+		concat!("DeleteRows", "V2"),
+	];
+
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 047 row-tombstone token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	let schema = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema.contains("STORAGE_ROW_TOMBSTONE_COLUMN") {
+		violations
+			.push("src/schema/table.rs: missing STORAGE_ROW_TOMBSTONE_COLUMN constant".to_string());
+	}
+	let crypto = fs::read_to_string(manifest_dir.join("src/crypto.rs")).unwrap();
+	if !crypto.contains("HAS_ROW_TOMBSTONE_RECORDS_BIT")
+		|| !crypto.contains("has_row_tombstone_records")
+	{
+		violations.push(
+			"src/crypto.rs: missing ADR 047 has_row_tombstone_records footer bit plumbing"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 047 row-tombstone architectural invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

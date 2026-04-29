@@ -75,14 +75,15 @@ use crate::schema::{
 	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
 	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
-	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy, SlabId,
-	StreamFinalizationRequestMeta, TableObjectId, TableQueryRequestMeta, TableReplicaWriteMeta,
-	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
+	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
+	STORAGE_ROW_KEY_ID_COLUMN, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
+	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
+	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
 	TableWriteValidationError, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
 	WriterNodeId, column_projection_predicate_ranges, column_projection_prefix_ranges,
-	encode_aggregate_state, migration_record_schema, pbc, query_request_stats_pruning_enabled,
-	read_key_schema, table_spread_prefix_ranges, validate_table_write_request_batch,
-	write_payload_schema,
+	encode_aggregate_state, encode_table_write_row_count, migration_record_schema, pbc,
+	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -94,8 +95,9 @@ use crate::storage::columnar::{
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::manager::SlabManager;
 use crate::storage::multirow::{
-	decode_batch, encode_batch, encode_batch_with_policy, has_storage_synthetic_columns,
-	materialize_record_location_batch, pack_admitted_record_batch_by_bucket,
+	MultiRowSourceRow, decode_batch, encode_batch, encode_batch_with_policy,
+	has_storage_synthetic_columns, materialize_record_location_batch,
+	pack_admitted_record_batch_by_bucket, pack_tombstone_multirow_source_rows_with_policy,
 	replace_storage_row_hlc_column, storage_index_entries_from_batch,
 	storage_row_table_object_id_at,
 };
@@ -196,6 +198,12 @@ impl CachedWriteOutcome {
 	fn outcome(self) -> WriteOutcome {
 		self.outcome
 	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedTableDeleteOutcome {
+	response: TableDeleteRowsResponseMeta,
+	trailing: Option<FinalizationMarker>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -715,6 +723,10 @@ pub struct WendelonDataServer {
 	/// finalization marker so duplicate retries can replay the same
 	/// durability receipt the original caller observed.
 	idempotency: Arc<DashMap<IdempotencyKey, CachedWriteOutcome>>,
+	/// Same-process count replay for append-only row deletes. The
+	/// durable write idempotency cache owns commit replay; this cache
+	/// preserves the row-level deleted/already-deleted/not-found counts.
+	table_delete_idempotency: Arc<DashMap<IdempotencyKey, CachedTableDeleteOutcome>>,
 	/// Durable local intent log for writes that passed the data
 	/// quorum but still need their control-branch finalization
 	/// committed through Raft.
@@ -886,6 +898,7 @@ impl Clone for WendelonDataServer {
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
 			idempotency: self.idempotency.clone(),
+			table_delete_idempotency: self.table_delete_idempotency.clone(),
 			pending_finalizations: self.pending_finalizations.clone(),
 			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
@@ -1263,6 +1276,7 @@ impl WendelonDataServer {
 			factory,
 			pool,
 			idempotency: Arc::new(DashMap::new()),
+			table_delete_idempotency: Arc::new(DashMap::new()),
 			pending_finalizations,
 			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
@@ -3318,6 +3332,29 @@ impl WendelonDataServer {
 		Ok((meta, payload))
 	}
 
+	fn decode_table_delete_request_frame(
+		&self,
+		frame: &HrftFrame,
+	) -> std::io::Result<(TableDeleteRowsRequestMeta, Vec<Identity>)> {
+		if frame.meta.len() < std::mem::size_of::<TableDeleteRowsRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_DELETE_REQ meta too small",
+			));
+		}
+		let meta: TableDeleteRowsRequestMeta =
+			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableDeleteRowsRequestMeta>()]);
+		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_DELETE_REQ missing Arrow payload",
+			)
+		})?;
+		let payload = decode_batch(payload_bytes)?;
+		let row_key_ids = decode_table_delete_rows_batch(&meta, &payload)?;
+		Ok((meta, row_key_ids))
+	}
+
 	fn build_write_response_frame(
 		&self,
 		msg_type: MsgType,
@@ -3377,6 +3414,41 @@ impl WendelonDataServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: MsgType::TABLE_WRITE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing,
+		}
+	}
+
+	fn build_table_delete_response_frame(
+		&self,
+		stream_id: u32,
+		resp: TableDeleteRowsResponseMeta,
+		trailing: Option<FinalizationMarker>,
+	) -> HrftFrame {
+		let mut meta_buf = self.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&resp));
+		let trailing = trailing.map(|marker| {
+			let mut buf = self.pool.acquire();
+			buf.as_mut_vec()
+				.extend_from_slice(bytemuck::bytes_of(&marker));
+			buf
+		});
+		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
+
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_DELETE_RESP.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta_buf.len() as u32,
@@ -3502,6 +3574,33 @@ impl WendelonDataServer {
 			}),
 			reject_code: reject_code.0,
 			_pad: [0; 6],
+		}
+	}
+
+	fn table_delete_error_response(
+		&self,
+		meta: &TableDeleteRowsRequestMeta,
+		status: WriteStatus,
+		reject_code: PbcRejectCode,
+	) -> TableDeleteRowsResponseMeta {
+		TableDeleteRowsResponseMeta {
+			write: self.counted_write_response(WriteResponseMeta {
+				status,
+				_pad1: [0; 7],
+				log_index: 0,
+				term: 0,
+				epoch: meta.expected_epoch,
+				commit_hlc: meta.client_hlc,
+				leader_hint: self.local_node,
+				echoed_write_id: meta.parent_write_id,
+				has_finalization: 0,
+				_pad2: [0; 7],
+			}),
+			deleted_count: 0,
+			already_deleted_count: 0,
+			not_found_count: 0,
+			reject_code: reject_code.0,
+			_pad: [0; 10],
 		}
 	}
 
@@ -4039,6 +4138,31 @@ impl WendelonDataServer {
 		);
 		let (resp, trailing) = self.table_write(meta, payload).instrument(span).await?;
 		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, trailing))
+	}
+
+	async fn handle_table_delete(
+		&self,
+		_actor: &ActorIdentity,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		let (meta, row_key_ids) = self.decode_table_delete_request_frame(&frame)?;
+		let span = tracing::info_span!(
+			"data_ring.table_delete.request",
+			stream_id = frame.header.stream_id,
+			tenant_id = meta.tenant_id.get(),
+			expected_epoch = meta.expected_epoch,
+			table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+			schema_generation = meta.schema_generation,
+			row_count = meta.row_count,
+			await_finalization = meta.await_finalization != 0,
+			durability = meta.durability.0,
+			write_sequence = meta.parent_write_id.sequence_no,
+		);
+		let (resp, trailing) = self
+			.table_delete(meta, row_key_ids)
+			.instrument(span)
+			.await?;
+		Ok(self.build_table_delete_response_frame(frame.header.stream_id, resp, trailing))
 	}
 
 	async fn handle_read(
@@ -5786,6 +5910,58 @@ impl DataRingServer for WendelonDataServer {
 					.await
 					.map(Some)
 			}
+			MsgType::TABLE_DELETE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<TableDeleteRowsRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_DELETE_REQ meta too small",
+					));
+				}
+				let meta: TableDeleteRowsRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<TableDeleteRowsRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Write,
+					)
+					.is_err()
+				{
+					let resp = self.table_delete_error_response(
+						&meta,
+						WriteStatus::AUTHORIZATION_FAILED,
+						PbcRejectCode::NONE,
+					);
+					return Ok(Some(self.build_table_delete_response_frame(
+						frame.header.stream_id,
+						resp,
+						None,
+					)));
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Write,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						let resp = self.table_delete_error_response(
+							&meta,
+							WriteStatus::BACKPRESSURED,
+							PbcRejectCode::NONE,
+						);
+						return Ok(Some(self.build_table_delete_response_frame(
+							frame.header.stream_id,
+							resp,
+							None,
+						)));
+					}
+				};
+				self.handle_table_delete(&context.actor, frame)
+					.await
+					.map(Some)
+			}
 			MsgType::TABLE_REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 					return Err(Error::new(
@@ -7026,6 +7202,267 @@ impl WendelonDataServer {
 			.await?;
 		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
 	}
+
+	async fn table_delete(
+		&self,
+		meta: TableDeleteRowsRequestMeta,
+		row_key_ids: Vec<Identity>,
+	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
+		metrics().data_ring_write_requests_total.inc();
+		if row_key_ids.is_empty() || row_key_ids.len() != meta.row_count as usize {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_ROW_COUNT_MISMATCH,
+				),
+				None,
+			));
+		}
+		if row_key_ids.len() > TABLE_WRITE_MAX_ROWS {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::PAYLOAD_TOO_LARGE,
+					PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+				),
+				None,
+			));
+		}
+
+		let current_leader = self.raft.current_leader().await;
+		if current_leader != Some(self.local_node.id) {
+			let mut response = self.table_delete_error_response(
+				&meta,
+				WriteStatus::NOT_LEADER,
+				PbcRejectCode::NONE,
+			);
+			response.write.leader_hint = current_leader
+				.map(|id| NodeId { id, _reserved: 0 })
+				.unwrap_or(self.local_node);
+			return Ok((response, None));
+		}
+
+		let admission = self.admission_snapshot();
+		if meta.expected_epoch < admission.current_epoch {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::EPOCH_STALE,
+					PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
+				),
+				None,
+			));
+		}
+
+		let key = Self::idempotency_key_for(meta.parent_write_id);
+		if let Some(cached) = self
+			.table_delete_idempotency
+			.get(&key)
+			.map(|entry| *entry.value())
+		{
+			return Ok((cached.response, cached.trailing));
+		}
+
+		if self.degraded_reason().is_some() {
+			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
+			let (write, trailing) = self.fenced_write_response(&synthetic).await;
+			return Ok((
+				table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
+				trailing,
+			));
+		}
+
+		let descriptor = {
+			let state = self.state_machine.state_snapshot().await;
+			state
+				.table_schemas
+				.latest_by_id(meta.tenant_id, meta.table_object_id)
+				.cloned()
+		};
+		let Some(descriptor) = descriptor else {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+				),
+				None,
+			));
+		};
+		if descriptor.schema_generation != meta.schema_generation {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::EPOCH_STALE,
+					PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
+				),
+				None,
+			));
+		}
+		if !descriptor.is_append_only() {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY,
+				),
+				None,
+			));
+		}
+		let layout = match descriptor.record_layout_policy {
+			RecordLayoutPolicy::MultiRow(layout) => layout,
+			RecordLayoutPolicy::SingleRow => {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW,
+					),
+					None,
+				));
+			}
+		};
+
+		let delete_hlc = self.merge_commit_hlc(meta.client_hlc);
+		let mut seen = HashSet::with_capacity(row_key_ids.len());
+		let mut tombstone_rows = Vec::new();
+		let mut already_deleted_count = 0_u32;
+		let mut not_found_count = 0_u32;
+		for row_key_id in row_key_ids {
+			if !seen.insert(row_key_id) {
+				continue;
+			}
+			match self
+				.slab
+				.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc)
+			{
+				Some(location) if location.is_tombstone => {
+					already_deleted_count = already_deleted_count.saturating_add(1);
+				}
+				Some(_location) => {
+					let Some(routing_locality) = self
+						.slab
+						.routing_locality_for_existing_key(meta.tenant_id, row_key_id)
+					else {
+						tracing::warn!(
+							tenant_id = meta.tenant_id.get(),
+							row_key_id = %format_bytes_hex(row_key_id.as_bytes()),
+							"append-only row tombstone target is missing cached routing locality"
+						);
+						return Ok((
+							self.table_delete_error_response(
+								&meta,
+								WriteStatus::INTERNAL_ERROR,
+								PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+							),
+							None,
+						));
+					};
+					let source_row_index = tombstone_rows.len();
+					tombstone_rows.push(MultiRowSourceRow {
+						source_row_index,
+						key_identity: row_key_id,
+						routing_locality,
+						row_hlc: delete_hlc,
+						is_tombstone: true,
+						table_object_id: Some(descriptor.table_object_id),
+					});
+				}
+				None => {
+					not_found_count = not_found_count.saturating_add(1);
+				}
+			}
+		}
+		let deleted_count = u32::try_from(tombstone_rows.len()).unwrap_or(u32::MAX);
+		if tombstone_rows.is_empty() {
+			let write = self.counted_write_response(table_delete_noop_write_response(
+				&meta,
+				delete_hlc,
+				self.local_node,
+			));
+			let response = table_delete_rows_response(
+				write,
+				deleted_count,
+				already_deleted_count,
+				not_found_count,
+				PbcRejectCode::NONE,
+			);
+			self.table_delete_idempotency.insert(
+				key,
+				CachedTableDeleteOutcome {
+					response,
+					trailing: None,
+				},
+			);
+			return Ok((response, None));
+		}
+
+		let synthetic_meta = table_delete_synthetic_table_write_meta(&meta, tombstone_rows.len())?;
+		let packed = match pack_tombstone_multirow_source_rows_with_policy(
+			layout,
+			&tombstone_rows,
+			descriptor.record_body_compression_policy,
+		) {
+			Ok(packed) => packed,
+			Err(err) => {
+				tracing::warn!(
+					tenant_id = meta.tenant_id.get(),
+					error = %err,
+					"failed to pack append-only row tombstones"
+				);
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
+					),
+					None,
+				));
+			}
+		};
+		let bifurcated = match bifurcate_table_delete(&meta, &descriptor, packed) {
+			Ok(bifurcated) => bifurcated,
+			Err(err) => {
+				tracing::warn!(
+					tenant_id = meta.tenant_id.get(),
+					error = %err,
+					"failed to bifurcate append-only row tombstones"
+				);
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_TOMBSTONE_PACKING_FAILED,
+					),
+					None,
+				));
+			}
+		};
+		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
+			return Ok((
+				self.table_delete_error_response(
+					&meta,
+					WriteStatus::INTERNAL_ERROR,
+					PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+				),
+				None,
+			));
+		};
+		let (write, trailing) = self
+			.write_table_bifurcated(synthetic_meta, bifurcated, groups, delete_hlc, false)
+			.await?;
+		let response = table_delete_rows_response(
+			write,
+			deleted_count,
+			already_deleted_count,
+			not_found_count,
+			PbcRejectCode::NONE,
+		);
+		self.table_delete_idempotency
+			.insert(key, CachedTableDeleteOutcome { response, trailing });
+		Ok((response, trailing))
+	}
 }
 
 #[async_trait]
@@ -7080,6 +7517,14 @@ impl DataRing for WendelonDataServer {
 		// both the data branch and the control branch.
 		let bifurcated = bifurcate_client_write(&meta, &payload)?;
 		self.write_bifurcated(meta, bifurcated).await
+	}
+
+	async fn table_delete(
+		&self,
+		meta: TableDeleteRowsRequestMeta,
+		row_key_ids: Vec<Identity>,
+	) -> std::io::Result<(TableDeleteRowsResponseMeta, Option<FinalizationMarker>)> {
+		WendelonDataServer::table_delete(self, meta, row_key_ids).await
 	}
 
 	async fn read(
@@ -7188,6 +7633,12 @@ impl DataRing for WendelonDataServer {
 				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)
 			{
 				Some(loc) => {
+					if loc.is_tombstone {
+						return Ok((
+							error_read_response(&meta, ReadStatus::KEY_NOT_FOUND, self.local_node),
+							None,
+						));
+					}
 					let bytes = self.slab.read(loc).await?;
 					(loc, bytes)
 				}
@@ -7201,7 +7652,19 @@ impl DataRing for WendelonDataServer {
 						.try_migrate_point_read(meta.tenant_id, key_identity, meta.as_of_hlc)
 						.await?
 					{
-						PointReadOutcome::Hit(loc, bytes) => (loc, bytes),
+						PointReadOutcome::Hit(loc, bytes) => {
+							if loc.is_tombstone {
+								return Ok((
+									error_read_response(
+										&meta,
+										ReadStatus::KEY_NOT_FOUND,
+										self.local_node,
+									),
+									None,
+								));
+							}
+							(loc, bytes)
+						}
 						PointReadOutcome::AuthoritativeMiss => {
 							return Ok((
 								error_read_response(
@@ -9262,6 +9725,23 @@ fn table_write_response(
 	}
 }
 
+fn table_delete_rows_response(
+	write: WriteResponseMeta,
+	deleted_count: u32,
+	already_deleted_count: u32,
+	not_found_count: u32,
+	reject_code: PbcRejectCode,
+) -> TableDeleteRowsResponseMeta {
+	TableDeleteRowsResponseMeta {
+		write,
+		deleted_count,
+		already_deleted_count,
+		not_found_count,
+		reject_code: reject_code.0,
+		_pad: [0; 10],
+	}
+}
+
 fn table_write_synthetic_meta(
 	meta: &TableWriteRequestMeta,
 	key_identity: Identity,
@@ -9280,6 +9760,73 @@ fn table_write_synthetic_meta(
 		key_identity,
 		key_len: 0,
 		value_len: u32::try_from(charged_bytes).unwrap_or(u32::MAX),
+	}
+}
+
+fn table_delete_synthetic_write_meta(
+	meta: &TableDeleteRowsRequestMeta,
+	key_identity: Identity,
+	charged_bytes: u64,
+) -> WriteRequestMeta {
+	WriteRequestMeta {
+		write_id: meta.parent_write_id,
+		client_hlc: meta.client_hlc,
+		expected_epoch: meta.expected_epoch,
+		tenant_id: meta.tenant_id,
+		proxy_hop: 0,
+		durability: meta.durability,
+		await_finalization: meta.await_finalization,
+		_pad1: [0; 5],
+		proxy_source: NodeId {
+			id: 0,
+			_reserved: 0,
+		},
+		key_identity,
+		key_len: 0,
+		value_len: u32::try_from(charged_bytes).unwrap_or(u32::MAX),
+	}
+}
+
+fn table_delete_synthetic_table_write_meta(
+	meta: &TableDeleteRowsRequestMeta,
+	row_count: usize,
+) -> std::io::Result<TableWriteRequestMeta> {
+	Ok(TableWriteRequestMeta {
+		parent_write_id: meta.parent_write_id,
+		client_hlc: meta.client_hlc,
+		expected_epoch: meta.expected_epoch,
+		tenant_id: meta.tenant_id,
+		table_object_id: meta.table_object_id,
+		schema_generation: meta.schema_generation,
+		child_ordinal_base: 0,
+		proxy_source: NodeId {
+			id: 0,
+			_reserved: 0,
+		},
+		row_count: encode_table_write_row_count(row_count)?,
+		proxy_hop: 0,
+		durability: meta.durability,
+		await_finalization: meta.await_finalization,
+		_pad: [0; 3],
+	})
+}
+
+fn table_delete_noop_write_response(
+	meta: &TableDeleteRowsRequestMeta,
+	commit_hlc: HybridTimestamp,
+	leader_hint: NodeId,
+) -> WriteResponseMeta {
+	WriteResponseMeta {
+		status: WriteStatus::OK,
+		_pad1: [0; 7],
+		log_index: 0,
+		term: 0,
+		epoch: meta.expected_epoch,
+		commit_hlc,
+		leader_hint,
+		echoed_write_id: meta.parent_write_id,
+		has_finalization: 0,
+		_pad2: [0; 7],
 	}
 }
 
@@ -9303,6 +9850,67 @@ fn table_replica_child_schema() -> Schema {
 	])
 }
 
+fn table_delete_rows_schema() -> Schema {
+	Schema::new(vec![Field::new(
+		STORAGE_ROW_KEY_ID_COLUMN,
+		DataType::FixedSizeBinary(32),
+		false,
+	)])
+}
+
+fn decode_table_delete_rows_batch(
+	meta: &TableDeleteRowsRequestMeta,
+	batch: &RecordBatch,
+) -> std::io::Result<Vec<Identity>> {
+	if batch.schema().as_ref() != &table_delete_rows_schema() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DELETE_REQ Arrow payload schema mismatch",
+		));
+	}
+	if batch.num_rows() != meta.row_count as usize {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"TABLE_DELETE_REQ row_count mismatch: meta={} actual={}",
+				meta.row_count,
+				batch.num_rows()
+			),
+		));
+	}
+	if batch.num_rows() == 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DELETE_REQ requires at least one row key id",
+		));
+	}
+	let row_key_ids = batch
+		.column_by_name(STORAGE_ROW_KEY_ID_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<FixedSizeBinaryArray>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing row key id column"))?;
+	if row_key_ids.null_count() != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"TABLE_DELETE_REQ row key ids must not be null",
+		));
+	}
+	(0..batch.num_rows())
+		.map(|row| {
+			if row_key_ids.is_null(row) {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_DELETE_REQ row key ids must not be null",
+				));
+			}
+			Ok(Identity::new(fixed_32_value(
+				row_key_ids,
+				row,
+				STORAGE_ROW_KEY_ID_COLUMN,
+			)?))
+		})
+		.collect()
+}
+
 fn table_write_parent_identity(meta: &TableWriteRequestMeta) -> Identity {
 	let mut hasher = ::blake3::Hasher::new();
 	hasher.update(b"wendelon.table-write-parent.v1");
@@ -9314,6 +9922,17 @@ fn table_write_parent_identity(meta: &TableWriteRequestMeta) -> Identity {
 	hasher.update(&meta.parent_write_id.canonical_idempotency_bytes());
 	hasher.update(&meta.schema_generation.to_le_bytes());
 	hasher.update(&(meta.decoded_row_count() as u64).to_le_bytes());
+	Identity::new(*hasher.finalize().as_bytes())
+}
+
+fn table_delete_parent_identity(meta: &TableDeleteRowsRequestMeta) -> Identity {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"table.delete-parent.v1");
+	hasher.update(&meta.tenant_id.get().to_le_bytes());
+	hasher.update(meta.table_object_id.as_bytes());
+	hasher.update(&meta.parent_write_id.canonical_idempotency_bytes());
+	hasher.update(&meta.schema_generation.to_le_bytes());
+	hasher.update(&meta.row_count.to_le_bytes());
 	Identity::new(*hasher.finalize().as_bytes())
 }
 
@@ -9761,6 +10380,58 @@ fn bifurcate_client_write(
 	})
 }
 
+fn bifurcate_table_delete(
+	meta: &TableDeleteRowsRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+	packed: Vec<crate::storage::multirow::PackedMultiRowStorageFrame>,
+) -> std::io::Result<BifurcatedTableWrite> {
+	if packed.is_empty() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"table delete requires at least one tombstone record",
+		));
+	}
+	let mut children = Vec::with_capacity(packed.len());
+	let mut charged_bytes = 0_u64;
+	for record in packed {
+		let first = record.encoded.rows.first().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"tombstone multi-row record cannot be empty",
+			)
+		})?;
+		let key_identity = first.key_identity;
+		let locality = first.routing_locality;
+		let frame_bytes = Arc::new(record.encoded.frame);
+		let child_charged_bytes = record.encoded.encoded_byte_len;
+		charged_bytes = charged_bytes.saturating_add(child_charged_bytes);
+		children.push(BifurcatedTableChildWrite {
+			child_ordinal: children.len() as u64,
+			key_identity,
+			locality,
+			record_row_index: RecordRowIndex::ZERO,
+			payload_hash: payload_digest(frame_bytes.as_slice()),
+			charged_bytes: child_charged_bytes,
+			frame_bytes,
+		});
+	}
+	let record_count = u32::try_from(children.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"table delete record count exceeds u32",
+		)
+	})?;
+	let payload_hash = table_batch_payload_digest(&children);
+	Ok(BifurcatedTableWrite {
+		parent_key_identity: table_delete_parent_identity(meta),
+		payload_hash,
+		children,
+		charged_bytes,
+		record_count,
+		record_body_compression_policy: descriptor.record_body_compression_policy,
+	})
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 /// Bifurcate an admitted client table write into per-record
 /// children.
@@ -10012,6 +10683,21 @@ mod tests {
 		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
 		descriptor.validate().unwrap();
 		descriptor
+	}
+
+	fn append_only_table_descriptor() -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x47; 16]),
+			3,
+			"analytics",
+			"append_events",
+			&typed_table_schema(),
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
 	}
 
 	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptorV1 {
@@ -10472,6 +11158,127 @@ mod tests {
 			.unwrap();
 		}
 		mgr.force_seal_active_for_test().await
+	}
+
+	async fn append_append_only_rows_for_query(
+		mgr: &SlabManager,
+		descriptor: &TableSchemaDescriptorV1,
+		ids: Vec<i64>,
+		row_hlc: HybridTimestamp,
+	) -> Vec<Identity> {
+		let batch = typed_table_batch(ids);
+		let mut write_meta = typed_table_meta(descriptor, batch.num_rows());
+		write_meta.client_hlc = row_hlc;
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			descriptor,
+			WriterNodeId::ZERO,
+			row_hlc,
+		)
+		.expect("append-only rows should validate");
+		let row_key_ids = admission.key_identities.clone();
+		let bifurcated =
+			bifurcate_table_write(&write_meta, &batch, descriptor, WriterNodeId::ZERO, row_hlc)
+				.expect("append-only rows should bifurcate");
+		append_bifurcated_table_children_durable(
+			mgr,
+			write_meta.tenant_id,
+			row_hlc,
+			&bifurcated.children,
+		)
+		.await
+		.unwrap();
+		row_key_ids
+	}
+
+	async fn append_append_only_tombstones_for_query(
+		mgr: &SlabManager,
+		descriptor: &TableSchemaDescriptorV1,
+		row_key_ids: &[Identity],
+		delete_hlc: HybridTimestamp,
+	) {
+		let layout = match descriptor.record_layout_policy {
+			RecordLayoutPolicy::MultiRow(layout) => layout,
+			RecordLayoutPolicy::SingleRow => {
+				panic!("append-only tombstones require multi-row layout")
+			}
+		};
+		let rows = row_key_ids
+			.iter()
+			.enumerate()
+			.map(|(source_row_index, row_key_id)| MultiRowSourceRow {
+				source_row_index,
+				key_identity: *row_key_id,
+				routing_locality: mgr
+					.routing_locality_for_existing_key(tenant(), *row_key_id)
+					.expect("append-only test row must have cached routing locality"),
+				row_hlc: delete_hlc,
+				is_tombstone: true,
+				table_object_id: Some(descriptor.table_object_id),
+			})
+			.collect::<Vec<_>>();
+		let packed = pack_tombstone_multirow_source_rows_with_policy(
+			layout,
+			&rows,
+			descriptor.record_body_compression_policy,
+		)
+		.expect("row tombstones should pack");
+		for record in packed {
+			let decoded = decode_batch(&record.encoded.frame).unwrap();
+			let entries = storage_index_entries_from_batch(&decoded).unwrap();
+			mgr.append_durable_multirow_with_locality(tenant(), &record.encoded.frame, &entries)
+				.await
+				.unwrap();
+		}
+	}
+
+	async fn tier_active_slab_with_stats_for_query(
+		mgr: &SlabManager,
+		l2: Arc<MockObjectStore>,
+		descriptor: &TableSchemaDescriptorV1,
+		object_name: &str,
+	) -> SlabId {
+		let slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+			.unwrap();
+		let locator = encrypted.stats_locator.expect("stats locator");
+		let l2_uri = l2.put(object_name, &encrypted.bytes).await.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: Some(locator.stats_format_version),
+			stats_block_len: Some(locator.stats_block_len),
+			stats_block_hash128: Some(locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+		slab_id
+	}
+
+	fn sorted_i64_column_values(batches: &[RecordBatch], column: &str) -> Vec<i64> {
+		let mut values = Vec::new();
+		for batch in batches {
+			let ids = batch
+				.column_by_name(column)
+				.unwrap()
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap();
+			values.extend(ids.values().iter().copied());
+		}
+		values.sort_unstable();
+		values
 	}
 
 	async fn tier_typed_table_batch_with_stats(
@@ -11989,6 +12796,215 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn append_only_row_tombstones_are_hidden_from_full_and_projected_queries() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+		let descriptor = append_only_table_descriptor();
+		let row_key_ids =
+			append_append_only_rows_for_query(&mgr, &descriptor, vec![7, 8, 9], hlc(10, 0, 1))
+				.await;
+		let data_slab_id =
+			tier_active_slab_with_stats_for_query(&mgr, l2, &descriptor, "append-delete-query.wnd")
+				.await;
+		append_append_only_tombstones_for_query(
+			&mgr,
+			&descriptor,
+			&[row_key_ids[1]],
+			hlc(20, 0, 1),
+		)
+		.await;
+
+		let mut before_delete_meta = base_meta();
+		before_delete_meta.as_of_hlc = hlc(15, 0, 1);
+		let program = pbc::Program::compile(&[]).unwrap();
+		let before_delete = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&before_delete_meta,
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+		)
+		.await
+		.unwrap();
+		assert_eq!(before_delete.response.status, ReadStatus::OK);
+		assert_eq!(
+			sorted_i64_column_values(&before_delete.batches, "id"),
+			vec![7, 8, 9]
+		);
+
+		let mut after_delete_meta = base_meta();
+		after_delete_meta.as_of_hlc = hlc(99, 0, 1);
+		let full = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&after_delete_meta,
+			&program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+		)
+		.await
+		.unwrap();
+		assert_eq!(full.response.status, ReadStatus::OK);
+		assert_eq!(full.response.rows, 2);
+		assert_eq!(sorted_i64_column_values(&full.batches, "id"), vec![7, 9]);
+
+		let pointer = mgr.tier_pointer(data_slab_id).await.unwrap();
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(20, 0, 1))
+		);
+
+		let mut predicate = Vec::new();
+		predicate.push(OP_PUSH_COL);
+		predicate.extend_from_slice(&0_u32.to_le_bytes());
+		predicate.push(OP_PUSH_INT);
+		predicate.extend_from_slice(&0_i64.to_le_bytes());
+		predicate.push(OP_GTE);
+		let projected_program = pbc::Program::compile(&predicate).unwrap();
+		let user_column_count = descriptor.arrow_schema().unwrap().fields().len();
+		let requirement =
+			analyze_pbc_column_requirement(&projected_program, user_column_count).unwrap();
+		let projected = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&after_delete_meta,
+			&projected_program,
+			&[QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			QueryExecutionBudget::default(),
+			Some(&descriptor),
+			QueryProjectedExecution::Pbc {
+				requirement,
+				user_column_count,
+			},
+		)
+		.await
+		.unwrap();
+		assert_eq!(projected.response.status, ReadStatus::OK);
+		assert_eq!(projected.response.rows, 2);
+		assert_eq!(
+			sorted_i64_column_values(&projected.batches, "id"),
+			vec![7, 9]
+		);
+	}
+
+	#[tokio::test]
+	async fn append_only_row_tombstones_are_hidden_from_projected_aggregate_inputs() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
+		let descriptor = append_only_table_descriptor();
+		let row_key_ids =
+			append_append_only_rows_for_query(&mgr, &descriptor, vec![7, 8, 9], hlc(10, 0, 1))
+				.await;
+		tier_active_slab_with_stats_for_query(&mgr, l2, &descriptor, "append-delete-aggregate.wnd")
+			.await;
+		append_append_only_tombstones_for_query(
+			&mgr,
+			&descriptor,
+			&[row_key_ids[1]],
+			hlc(20, 0, 1),
+		)
+		.await;
+
+		let mut predicate = Vec::new();
+		predicate.push(OP_PUSH_COL);
+		predicate.extend_from_slice(&0_u32.to_le_bytes());
+		predicate.push(OP_PUSH_INT);
+		predicate.extend_from_slice(&0_i64.to_le_bytes());
+		predicate.push(OP_GTE);
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(147),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			schema_fingerprint: descriptor.schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(0, 0, 0),
+			as_of_hlc: hlc(99, 0, 1),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: Some(predicate.clone()),
+			aggregates: vec![
+				AggregateExpression::count_star(),
+				AggregateExpression {
+					tag: AggregateFunctionTag::SIGNED_SUM,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+			],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(16),
+				max_rows: RowCount::new(16),
+				max_wall_time_millis: DurationMillis::new(1_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		let program = pbc::Program::compile(&predicate).unwrap();
+		let prepared = PreparedAggregateExecution {
+			range_meta: aggregate_as_range_query(&request, 0),
+			program,
+			descriptor: descriptor.clone(),
+			ranges: vec![QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+		};
+		let projected_execution = aggregate_projected_execution(&mgr, &request, &prepared).unwrap();
+		assert!(matches!(
+			projected_execution,
+			QueryProjectedExecution::Aggregate { .. }
+		));
+		let mut folded_request =
+			aggregate_fold_request_for_execution(&request, &projected_execution).unwrap();
+		folded_request.predicate_program = None;
+
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&prepared.range_meta,
+			&prepared.program,
+			&prepared.ranges,
+			aggregate_query_budget(&request.budgets),
+			Some(&descriptor),
+			projected_execution,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 2);
+		let result = aggregate_record_batches(&folded_request, &plan.batches, false).unwrap();
+		assert_eq!(result.response.status, AggregateStatus::Success);
+		assert_eq!(
+			result.response.partials[0].state.as_slice(),
+			&2_u64.to_be_bytes()
+		);
+		let expected_sum = encode_aggregate_state(
+			AggregateFunctionTag::SIGNED_SUM,
+			&AggregateState::SignedSum {
+				sum: 16,
+				non_null_count: 2,
+				overflow: false,
+			},
+		)
+		.unwrap();
+		assert_eq!(result.response.partials[1].state, expected_sum);
+	}
+
+	#[tokio::test]
 	async fn table_stats_absence_falls_through_to_full_scan() {
 		let l2 = Arc::new(MockObjectStore::default());
 		let (mgr, descriptor) =
@@ -12390,6 +13406,244 @@ mod tests {
 			assert_eq!(resp.reject_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE.0);
 			assert!(trailing.is_none());
 		}
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_delete_emits_tombstone_and_replays_counts() {
+		let dir = bootstrap_tempdir("table-delete-row-tombstone");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			48,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = append_only_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7, 8, 9]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 470;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+		assert_eq!(write_resp.reject_code, PbcRejectCode::NONE.0);
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::from_node_id(node.local_node),
+			write_resp.write.commit_hlc,
+		)
+		.unwrap();
+		let target = admission.key_identities[1];
+		let missing = Identity::new([0xEE; 32]);
+		let original_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(!original_location.is_tombstone);
+
+		let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		delete_meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x47; 16],
+			sequence_no: 1,
+			idempotency_ttl_ms: 30_000,
+			_pad: 0,
+		};
+		delete_meta.client_hlc = hlc(10, 0, 48);
+		delete_meta.expected_epoch = 1;
+		delete_meta.tenant_id = tenant();
+		delete_meta.table_object_id = descriptor.table_object_id;
+		delete_meta.schema_generation = descriptor.schema_generation;
+		delete_meta.row_count = 3;
+		delete_meta.durability = DurabilityLevel::QUORUM;
+		let row_key_ids = vec![target, target, missing];
+		let (delete_resp, trailing) = node
+			.data_server
+			.table_delete(delete_meta, row_key_ids.clone())
+			.await
+			.unwrap();
+		assert_eq!(delete_resp.write.status, WriteStatus::OK);
+		assert_eq!(delete_resp.reject_code, PbcRejectCode::NONE.0);
+		assert_eq!(delete_resp.deleted_count, 1);
+		assert_eq!(delete_resp.already_deleted_count, 0);
+		assert_eq!(delete_resp.not_found_count, 1);
+		assert!(trailing.is_none());
+
+		let pre_delete = node
+			.slab
+			.lookup_as_of(tenant(), target, write_resp.write.commit_hlc)
+			.unwrap();
+		assert!(!pre_delete.is_tombstone);
+		let tombstone_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(tombstone_location.is_tombstone);
+		assert_eq!(tombstone_location.hlc, delete_resp.write.commit_hlc);
+		let tombstone_frame = node.slab.read(tombstone_location).await.unwrap();
+		let tombstone_batch = decode_batch(&tombstone_frame).unwrap();
+		assert!(
+			crate::storage::multirow::storage_row_is_tombstone_at(
+				&tombstone_batch,
+				tombstone_location.record_row_index,
+			)
+			.unwrap()
+		);
+		assert_eq!(
+			storage_row_table_object_id_at(&tombstone_batch, tombstone_location.record_row_index)
+				.unwrap(),
+			Some(descriptor.table_object_id)
+		);
+		let materialized = materialize_record_location_batch(
+			&tombstone_batch,
+			tombstone_location.record_row_index,
+		)
+		.unwrap();
+		assert_eq!(materialized.num_rows(), 0);
+
+		let (retry_resp, _) = node
+			.data_server
+			.table_delete(delete_meta, row_key_ids)
+			.await
+			.unwrap();
+		assert_eq!(retry_resp.deleted_count, 1);
+		assert_eq!(retry_resp.not_found_count, 1);
+
+		let mut second_delete = delete_meta;
+		second_delete.parent_write_id.sequence_no = 2;
+		second_delete.row_count = 1;
+		let (already_resp, _) = node
+			.data_server
+			.table_delete(second_delete, vec![target])
+			.await
+			.unwrap();
+		assert_eq!(already_resp.deleted_count, 0);
+		assert_eq!(already_resp.already_deleted_count, 1);
+		assert_eq!(already_resp.not_found_count, 0);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_delete_fails_closed_when_target_locality_is_missing() {
+		let dir = bootstrap_tempdir("table-delete-missing-locality");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			49,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = append_only_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 471;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::from_node_id(node.local_node),
+			write_resp.write.commit_hlc,
+		)
+		.unwrap();
+		let target = admission.key_identities[0];
+		let original_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(!original_location.is_tombstone);
+		assert!(
+			node.slab
+				.routing_locality_for_existing_key(tenant(), target)
+				.is_some()
+		);
+
+		node.slab.forget_routing_locality_for_test(tenant(), target);
+		assert!(
+			node.slab
+				.routing_locality_for_existing_key(tenant(), target)
+				.is_none()
+		);
+
+		let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		delete_meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x49; 16],
+			sequence_no: 1,
+			idempotency_ttl_ms: 30_000,
+			_pad: 0,
+		};
+		delete_meta.client_hlc = hlc(10, 0, 49);
+		delete_meta.expected_epoch = 1;
+		delete_meta.tenant_id = tenant();
+		delete_meta.table_object_id = descriptor.table_object_id;
+		delete_meta.schema_generation = descriptor.schema_generation;
+		delete_meta.row_count = 1;
+		delete_meta.durability = DurabilityLevel::QUORUM;
+
+		let (delete_resp, trailing) = node
+			.data_server
+			.table_delete(delete_meta, vec![target])
+			.await
+			.unwrap();
+		assert_eq!(delete_resp.write.status, WriteStatus::INTERNAL_ERROR);
+		assert_eq!(
+			delete_resp.reject_code,
+			PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED.0
+		);
+		assert_eq!(delete_resp.deleted_count, 0);
+		assert_eq!(delete_resp.already_deleted_count, 0);
+		assert_eq!(delete_resp.not_found_count, 0);
+		assert!(trailing.is_none());
+
+		let latest = node.slab.lookup(tenant(), target).unwrap();
+		assert!(!latest.is_tombstone);
+		assert_eq!(latest.hlc, original_location.hlc);
 
 		node.handles.abort();
 	}
@@ -15067,6 +16321,7 @@ mod tests {
 					length: 0,
 					hlc: hlc(10, 2, 3),
 					record_row_index: crate::schema::RecordRowIndex::ZERO,
+					is_tombstone: false,
 				},
 				b"frame-one".to_vec(),
 			),
@@ -15080,6 +16335,7 @@ mod tests {
 					length: 0,
 					hlc: hlc(20, 5, 3),
 					record_row_index: crate::schema::RecordRowIndex::ZERO,
+					is_tombstone: false,
 				},
 				b"frame-two".to_vec(),
 			),

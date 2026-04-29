@@ -20,8 +20,9 @@ Deliverables:
 - One new synthetic column on append-only tables
   (`__row_tombstone__`).
 - One reserved bit in the ADR 022 footer
-  (`has_row_tombstone_records`) — subject to Phase 0 footer-
-  slot audit.
+  (`has_row_tombstone_records`) allocated as
+  `HAS_ROW_TOMBSTONE_RECORDS_BIT = 1 << 0` in the HMAC-covered
+  footer flag byte.
 - One new MsgType pair in the typed-table write family
   (`TABLE_DELETE_REQ` / `TABLE_DELETE_RESP`).
 - Tombstone-only multi-row record shape (no user columns).
@@ -59,10 +60,10 @@ Deliverables:
   but no new retention surface is introduced — per-table
   retention is roadmap #3). No CDC cursor. No secondary-
   index propagation. No anti-entropy.
-- No tolerant decoder for pre-tombstone slabs (the reserved-
-  zero footer bit was already zero — readers see
-  `has_row_tombstone_records = false` and proceed exactly as
-  before).
+- No tolerant decoder for pre-tombstone slab bodies. The
+  persistent local-index decoder's V1/V2 length tolerance
+  pre-existed ADR 047 as ADR 042 index-rebuild compatibility;
+  ADR 047 only adds the V3 `is_tombstone` bit.
 - No `__row_tombstone_target__` column. The target identity
   is the row's shared `__row_key_id__`.
 
@@ -83,26 +84,12 @@ Work:
 
 1. **Audit ADR 022 / ADR 039 footer layout for a clean HMAC-
    covered flag slot** for `has_row_tombstone_records`. The
-   bit must be:
+   audit found the existing HMAC-covered footer flag byte and
+   allocated bit 0. The bit must remain:
    - inside the existing HMAC scope,
    - pinned via a named const
      (`HAS_ROW_TOMBSTONE_RECORDS_BIT`),
    - separable from any visibility-authority field.
-
-   If a clean slot exists, allocate it. If not, raise to
-   council (ADR 047 Open Questions §5) — options are
-   (a) reshape one reserved byte into a flag field (in-scope
-   for this ADR if the reshape is one byte and HMAC-clean) or
-   (b) **drop the presence-bit optimization** and rely on
-   `tombstone_metadata` + index lookup only. Option (b) is
-   correctness-equivalent; the cost is one extra metadata
-   check on the steady-state-no-deletes hot path.
-
-   The plan continues assuming option (a) — bit allocated.
-   If council picks (b), Phase 1 footer plumbing drops, the
-   Phase 5 fast-path rule simplifies to *tombstone_metadata
-   shows no tombstone ≤ as_of_hlc*, and the verification
-   gate's footer-bit grep guards drop.
 
 2. Add the synthetic-column constant:
    ```rust
@@ -146,7 +133,7 @@ Work:
        pub row_count: u32,
        pub durability: DurabilityLevel,
        pub await_finalization: u8,
-       pub _pad: [u8; 3],
+       pub _pad: [u8; 10],
    }
 
    #[repr(C)]
@@ -156,21 +143,29 @@ Work:
        pub already_deleted_count: u32,
        pub not_found_count: u32,
        pub reject_code: u16,
-       pub _pad: [u8; 6],
+       pub _pad: [u8; 10],
    }
    ```
 
+   V1 delete requests are leader-direct. The frozen request meta
+   intentionally omits `proxy_hop` / `proxy_source`; followers
+   return `NOT_LEADER` before target resolution.
+
 6. Allocate `MsgType::TABLE_DELETE_REQ` and
    `MsgType::TABLE_DELETE_RESP` from the typed-table write
-   family allocation table. `0x2E` / `0x2F` is the candidate
-   per ADR 047 Open Questions §1.
+   family allocation table. `0x34` / `0x35` are allocated;
+   `0x2E` / `0x2F` were already occupied by schema-update
+   frames.
 
 7. Lock idempotency semantics:
    - duplicate row IDs deduped within a request;
    - one leader-merged `delete_hlc` per request;
    - latest-as-of-HLC tombstone → no second tombstone;
    - `parent_write_id` retry hits the existing idempotency
-     cache (same path as table writes).
+     cache when still resident;
+   - after restart, durable logical idempotency can report
+     already-deleted counts instead of replaying the original
+     deleted counts.
 
 8. Lock `StateDigest` semantics:
    - data row → `add_element(visible_row_element(t, T, k))`;
@@ -195,6 +190,13 @@ Work:
    - no `has_tombstones` short-name leftover (final symbol is
      `has_row_tombstone_records`; ADR 045 sketch shorthand
      does not survive the migration to source).
+
+   ADR 047's new delete parent domain uses `table.delete-...`
+   without a project-name prefix. The older ADR 045
+   `table_write_parent_identity` tag still carries the legacy
+   `wendelon.` prefix; changing it would alter parent identities
+   and is tracked as ADR 045 protocol cleanup, not part of this
+   row-tombstone landing.
 
 Fixtures under `tests/fixtures/row_tombstones/`:
 
@@ -269,9 +271,9 @@ Work:
    validation.
 
 8. Add footer / summary plumbing for
-   `has_row_tombstone_records` (assuming Phase 0 accepted
-   the bit). Readers use it only to skip tombstone-marker
-   decoding; visibility authority stays with
+   `has_row_tombstone_records` using the Phase 0 allocated
+   HMAC-covered flag bit. Readers use it only to skip
+   tombstone-marker decoding; visibility authority stays with
    `tombstone_metadata` and indexed latest-as-of chains.
 
 Tests:
@@ -308,9 +310,10 @@ Work:
    alongside existing single-bit fields where layout allows.
 
 2. Update the persistent local-index encoding to carry the
-   bit. Pre-launch shape change — no compat shim, no
-   tolerant decoder. Existing index-rebuild path regenerates
-   rows from slab bytes.
+   bit. ADR 047 adds the V3 `is_tombstone` bit to the
+   persistent-index row value. The tolerant V1/V2 record-row
+   decoder is pre-existing ADR 042 index-rebuild compatibility;
+   this ADR does not add a new tombstone-specific compat shim.
 
 3. Index lookup helpers gain a
    `latest_at_or_before(hlc) -> (RecordLocation, bool)`
@@ -345,14 +348,17 @@ Work:
 2. Add `DataRing::table_delete` trait method.
 
 3. Implement `WendelonDataServer::handle_table_delete`:
+   - reject non-leaders with `NOT_LEADER` before target
+     resolution (V1 has no follower proxy fields);
    - validate `tenant_id`, `table_object_id`,
      `schema_generation`;
    - reject if descriptor is not `AppendOnly`;
    - validate payload column shape and row count;
    - dedupe `row_key_ids` within the request;
    - compute `delete_hlc = hlc_driver.merge(client_hlc)`;
-   - consult the `parent_write_id` idempotency cache (same
-     path as table writes).
+   - consult the in-process table-delete count replay cache;
+     durable duplicate prevention still comes from latest-state
+     classification.
 
 Tests:
 
@@ -392,6 +398,11 @@ Work:
    - no location → `not_found`;
    - latest is data → `target_for_deletion`;
    - latest is tombstone → `already_deleted`.
+
+   The resolver must use the target row's stored routing locality
+   for data targets. If that locality is unavailable, fail closed
+   with `PBC_REJECT_LOCALITY_UNSUPPORTED`; append-only table-
+   spread rows must not fall back to identity-derived locality.
 
 2. Construct tombstone source rows:
    ```rust
@@ -569,7 +580,10 @@ Files:
 - `src/storage/manager.rs`
 - `src/storage/sweeper.rs`
 - `src/storage/core.rs`
-- `tests/tombstone_compaction.rs` (new)
+- `src/storage/manager.rs` unit tests for L1/L2 retention pair
+  reclaim and tiered tombstone metadata
+- `src/storage/core.rs` unit tests for recovery duplicate
+  fail-closed behavior
 
 Work:
 
@@ -616,10 +630,9 @@ Work:
      bit.
    - Recompute per-slab `tombstone_metadata` from
      survivors.
-   - Multiple tombstones for one row: fail-closed by
-     default; optional "keep earliest, emit corruption
-     metric" repair mode (council-ratified — ADR 047 Open
-     Questions §3).
+   - Multiple tombstones for one row: fail closed. Optional
+     "keep earliest, emit corruption metric" repair belongs to a
+     future explicit repair mode.
 
 4. Compaction does **not** consult or update digest values.
    The visible-digest invariant under pair GC is algebraic:
@@ -630,6 +643,10 @@ Work:
    path).
 
 Tests:
+
+Implemented in `src/storage/manager.rs` and `src/storage/core.rs`
+rather than a new integration test file, because the relevant APIs
+are internal compaction / recovery helpers.
 
 - In-window pair, retention_floor <= delete_hlc:
   compaction retains both data and tombstone in the output
@@ -667,7 +684,6 @@ Files:
   helpers)
 - `src/storage/multirow.rs` (seal-time digest accumulation)
 - `tests/state_digest_invariants.rs` (extend)
-- `tests/row_tombstone_state_digest.rs` (new)
 
 Work:
 
@@ -718,7 +734,7 @@ Work:
    does not appear in `src/network` or `src/storage`. The
    seal-time digest call goes through `src/hash/...`.
 
-Tests (in `tests/row_tombstone_state_digest.rs`):
+Tests (in `tests/state_digest_invariants.rs`):
 
 - Add then subtract the same `visible_row_element` →
   `StateDigest::ZERO`.
@@ -755,6 +771,10 @@ Files:
 - `Cargo.toml` (`[[bench]]` entry)
 - `plans/impl/047_row_tombstone_bench_results.md` (new,
   populated when the bench runs)
+
+Current code-review coverage is a quick smoke bench. The matrix
+below remains the promotion-to-shipped gate; the quick run alone
+does not satisfy the quantitative thresholds.
 
 Work:
 
@@ -810,13 +830,17 @@ Acceptance criteria before promotion:
   tombstone compaction window of the same byte size.
 
 Bench results documented in
-`plans/impl/047_row_tombstone_bench_results.md`. If
-acceptance criteria fail, council pauses promotion to
-"shipped" and revisits scan-path or admission shape.
+`plans/impl/047_row_tombstone_bench_results.md`. Quick smoke
+results may be recorded for code review, but they are explicitly
+not evidence for the promotion thresholds above. If full-matrix
+acceptance criteria fail, council pauses promotion to "shipped"
+and revisits scan-path or admission shape.
 
 Exit:
 
-- Bench results documented.
+- Quick smoke bench is runnable in CI / local review.
+- Full matrix bench results are documented before ADR 047 is
+  declared shipped.
 - ADR 047 promotion-to-shipped gate satisfied or council
   notified.
 
@@ -927,9 +951,10 @@ Required before declaring ADR 047 shipped:
 ```sh
 cargo test --lib state_digest
 cargo test --test state_digest_invariants
-cargo test --test row_tombstone_state_digest
 cargo test --test architecture_test --quiet
-cargo test --test tombstone_compaction
+cargo test row_tombstone --quiet
+cargo test storage::manager --quiet
+cargo test storage::core --quiet
 cargo test --test metrics_smoke
 cargo bench --bench row_tombstones --no-run
 cargo bench --bench row_tombstones -- --quick

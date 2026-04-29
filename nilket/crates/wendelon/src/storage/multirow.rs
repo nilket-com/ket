@@ -1,8 +1,8 @@
 use crate::schema::table::{
 	MultiRowLayoutDescriptor, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, TableObjectId,
-	TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
-	validate_table_write_request_batch,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaDescriptorV1, TableWriteAdmission,
+	TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
 	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyCompressionPolicy,
@@ -14,13 +14,13 @@ use crate::storage::ipc::{
 	record_batch_compression_policy_from_ipc,
 };
 use arrow::array::{
-	Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, UInt32Array, UInt64Array,
-	UInt64Builder,
+	Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
+	UInt32Array, UInt64Array, UInt64Builder,
 };
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
@@ -42,6 +42,7 @@ pub struct MultiRowSourceRow {
 	pub key_identity: Identity,
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
+	pub is_tombstone: bool,
 	/// ADR 045 Phase 8 — durable per-row binding back to the
 	/// originating descriptor's `table_object_id`. `Some` on
 	/// every multi-row record (PK + AppendOnly); `None` on
@@ -56,6 +57,7 @@ pub struct StorageRowMetadata {
 	pub key_identity: Identity,
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
+	pub is_tombstone: bool,
 	pub record_row_index: RecordRowIndex,
 	/// ADR 045 Phase 8 — `Some` if the stored record carries
 	/// `__row_table_object_id__` (every multi-row record),
@@ -93,6 +95,7 @@ impl From<StorageRowMetadata> for MultiRowIndexEntry {
 			key_identity: row.key_identity,
 			routing_locality: row.routing_locality,
 			row_hlc: row.row_hlc,
+			is_tombstone: row.is_tombstone,
 			record_row_index: row.record_row_index,
 		}
 	}
@@ -145,6 +148,7 @@ pub fn pack_admitted_record_batch_by_bucket(
 				key_identity: admission.key_identities[row],
 				routing_locality: locality,
 				row_hlc,
+				is_tombstone: false,
 				table_object_id: stamped_table_object_id,
 			});
 	}
@@ -305,6 +309,30 @@ pub fn pack_multirow_source_rows_with_policy(
 	)
 }
 
+pub fn pack_tombstone_multirow_source_rows_with_policy(
+	layout: MultiRowLayoutDescriptor,
+	rows: &[MultiRowSourceRow],
+	policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
+	if rows.iter().any(|row| !row.is_tombstone) {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"tombstone-only multi-row packing received a data row",
+		));
+	}
+	let batch = empty_user_batch_with_row_count(rows.len())?;
+	pack_multirow_source_rows_with_policy(layout, &batch, rows, policy)
+}
+
+pub fn empty_user_batch_with_row_count(row_count: usize) -> std::io::Result<RecordBatch> {
+	RecordBatch::try_new_with_options(
+		Arc::new(Schema::empty()),
+		Vec::new(),
+		&RecordBatchOptions::new().with_row_count(Some(row_count)),
+	)
+	.map_err(|err| Error::new(ErrorKind::InvalidData, format!("empty user batch: {err}")))
+}
+
 pub fn decode_multirow_synthetic_only(
 	frame: &[u8],
 ) -> std::io::Result<Option<Vec<StorageRowMetadata>>> {
@@ -317,10 +345,11 @@ pub fn decode_multirow_synthetic_only(
 	let has_locality = batch
 		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
 		.is_some();
-	if !(has_hlc || has_identity || has_locality) {
+	let has_tombstone = batch.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN).is_some();
+	if !(has_hlc || has_identity || has_locality || has_tombstone) {
 		return Ok(None);
 	}
-	if !(has_hlc && has_identity && has_locality) {
+	if !(has_hlc && has_identity && has_locality && has_tombstone) {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"multi-row storage record has an incomplete synthetic-column set",
@@ -352,6 +381,7 @@ pub fn merge_multirow_streams(
 			key_identity: meta.key_identity,
 			routing_locality: meta.routing_locality,
 			row_hlc: meta.row_hlc,
+			is_tombstone: meta.is_tombstone,
 			table_object_id: meta.table_object_id,
 		})
 		.collect::<Vec<_>>();
@@ -385,6 +415,7 @@ pub fn has_storage_synthetic_columns(batch: &RecordBatch) -> bool {
 		&& batch
 			.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
 			.is_some()
+		&& batch.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN).is_some()
 }
 
 pub fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> std::io::Result<RecordBatch> {
@@ -402,6 +433,19 @@ pub fn take_rows(batch: &RecordBatch, row_indices: &[usize]) -> std::io::Result<
 				.map_err(|err| Error::new(ErrorKind::InvalidData, format!("multi-row take: {err}")))
 		})
 		.collect::<std::io::Result<Vec<ArrayRef>>>()?;
+	if columns.is_empty() {
+		return RecordBatch::try_new_with_options(
+			batch.schema(),
+			columns,
+			&RecordBatchOptions::new().with_row_count(Some(row_indices.len())),
+		)
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("multi-row taken batch: {err}"),
+			)
+		});
+	}
 	RecordBatch::try_new(batch.schema(), columns).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
@@ -431,6 +475,7 @@ pub fn append_storage_synthetic_columns(
 				key_identity: admission.key_identities[*row],
 				routing_locality: admission.localities[*row],
 				row_hlc,
+				is_tombstone: false,
 				table_object_id,
 			})
 		})
@@ -493,6 +538,7 @@ pub fn strip_storage_synthetic_columns(batch: &RecordBatch) -> std::io::Result<R
 					// Strip if present so user-facing decode stays
 					// schema-clean.
 					| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
+					| STORAGE_ROW_TOMBSTONE_COLUMN
 			))
 			.then_some(index)
 		})
@@ -523,7 +569,33 @@ pub fn materialize_record_location_batch(
 			),
 		));
 	}
+	if storage_row_is_tombstone_at(batch, record_row_index)? {
+		return strip_storage_synthetic_columns(&batch.slice(row, 0));
+	}
 	strip_storage_synthetic_columns(&batch.slice(row, 1))
+}
+
+pub fn storage_row_is_tombstone_at(
+	batch: &RecordBatch,
+	record_row_index: RecordRowIndex,
+) -> std::io::Result<bool> {
+	let Some(array) = batch.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN) else {
+		return Ok(false);
+	};
+	let array = array
+		.as_any()
+		.downcast_ref::<BooleanArray>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"__row_tombstone__ column has unexpected Arrow type",
+			)
+		})?;
+	let row = record_row_index.get() as usize;
+	if row >= array.len() {
+		return Ok(false);
+	}
+	Ok(array.value(row))
 }
 
 /// ADR 045 Phase 8 — extract the per-row
@@ -580,6 +652,10 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 		.column_by_name(STORAGE_ROW_ROUTING_LOCALITY_COLUMN)
 		.and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
 		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing storage row locality"))?;
+	let tombstones = batch
+		.column_by_name(STORAGE_ROW_TOMBSTONE_COLUMN)
+		.and_then(|array| array.as_any().downcast_ref::<BooleanArray>())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing storage row tombstone"))?;
 	// ADR 045 Phase 8 — optional `__row_table_object_id__`
 	// (AppendOnly only). When present, decode the per-row
 	// 16-byte values; otherwise propagate `None`.
@@ -622,6 +698,7 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 			)?),
 			routing_locality: Locality::new(localities.value(row)),
 			row_hlc: decode_storage_hlc(fixed_16_value(row_hlcs, row, STORAGE_ROW_HLC_COLUMN)?),
+			is_tombstone: tombstones.value(row),
 			record_row_index: RecordRowIndex::new(record_row_index),
 			table_object_id,
 		});
@@ -755,6 +832,11 @@ fn append_storage_synthetic_columns_from_rows(
 		DataType::UInt64,
 		false,
 	)));
+	fields.push(Arc::new(Field::new(
+		STORAGE_ROW_TOMBSTONE_COLUMN,
+		DataType::Boolean,
+		false,
+	)));
 	if some_table_object_id.is_some() {
 		fields.push(Arc::new(Field::new(
 			STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
@@ -766,6 +848,7 @@ fn append_storage_synthetic_columns_from_rows(
 	let mut row_hlc_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
 	let mut row_identity_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 	let mut row_locality_builder = UInt64Builder::with_capacity(rows.len());
+	let mut row_tombstone_builder = BooleanBuilder::with_capacity(rows.len());
 	let mut row_table_object_id_builder =
 		some_table_object_id.map(|_| FixedSizeBinaryBuilder::with_capacity(rows.len(), 16));
 	for row in rows {
@@ -781,6 +864,7 @@ fn append_storage_synthetic_columns_from_rows(
 				)
 			})?;
 		row_locality_builder.append_value(row.routing_locality.get());
+		row_tombstone_builder.append_value(row.is_tombstone);
 		if let (Some(builder), Some(table_object_id)) =
 			(row_table_object_id_builder.as_mut(), row.table_object_id)
 		{
@@ -799,6 +883,7 @@ fn append_storage_synthetic_columns_from_rows(
 	columns.push(Arc::new(row_hlc_builder.finish()) as ArrayRef);
 	columns.push(Arc::new(row_identity_builder.finish()) as ArrayRef);
 	columns.push(Arc::new(row_locality_builder.finish()) as ArrayRef);
+	columns.push(Arc::new(row_tombstone_builder.finish()) as ArrayRef);
 	if let Some(mut builder) = row_table_object_id_builder {
 		columns.push(Arc::new(builder.finish()) as ArrayRef);
 	}
@@ -1065,6 +1150,7 @@ mod tests {
 				key_identity: Identity::new([3; 32]),
 				routing_locality: Locality::new(2),
 				row_hlc: hlc(12),
+				is_tombstone: false,
 				table_object_id: None,
 			},
 			MultiRowSourceRow {
@@ -1072,6 +1158,7 @@ mod tests {
 				key_identity: Identity::new([1; 32]),
 				routing_locality: Locality::new(2),
 				row_hlc: hlc(11),
+				is_tombstone: false,
 				table_object_id: None,
 			},
 		];
@@ -1079,12 +1166,12 @@ mod tests {
 		let second = encode_multirow_from_survivors(&batch, &rows).unwrap();
 		assert_eq!(first.frame, second.frame);
 		assert_eq!(first.rows, second.rows);
-		assert_eq!(first.frame.len(), 1160);
+		assert_eq!(first.frame.len(), 1416);
 		assert_eq!(
 			crate::hash::blake3::digest(&first.frame),
 			[
-				190, 182, 14, 43, 167, 44, 237, 216, 202, 227, 192, 107, 154, 92, 84, 203, 87, 145,
-				186, 111, 24, 178, 48, 13, 152, 185, 218, 122, 104, 44, 124, 225,
+				208, 33, 90, 244, 107, 218, 119, 236, 56, 195, 36, 96, 10, 3, 130, 127, 227, 12, 2,
+				152, 69, 239, 181, 212, 44, 129, 35, 80, 103, 14, 36, 222,
 			]
 		);
 	}
@@ -1120,6 +1207,7 @@ mod tests {
 			key_identity: Identity::new([1; 32]),
 			routing_locality: Locality::new(1),
 			row_hlc: hlc(10),
+			is_tombstone: false,
 			table_object_id: None,
 		};
 		let encoded = encode_multirow_from_survivors_with_policy(
@@ -1157,6 +1245,7 @@ mod tests {
 					key_identity: Identity::new([3; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(30),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 				MultiRowSourceRow {
@@ -1164,6 +1253,7 @@ mod tests {
 					key_identity: Identity::new([1; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(10),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			],
@@ -1177,6 +1267,7 @@ mod tests {
 					key_identity: Identity::new([2; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(20),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 				MultiRowSourceRow {
@@ -1184,6 +1275,7 @@ mod tests {
 					key_identity: Identity::new([4; 32]),
 					routing_locality: Locality::new(7),
 					row_hlc: hlc(40),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			],
@@ -1324,5 +1416,74 @@ mod tests {
 		let decoded = decode_batch(&packed[0].frame_bytes).unwrap();
 		let user = strip_storage_synthetic_columns(&decoded).unwrap();
 		assert_eq!(user.schema().as_ref(), batch.schema().as_ref());
+	}
+
+	#[test]
+	fn append_only_data_rows_decode_with_false_row_tombstone() {
+		let descriptor = append_only_descriptor();
+		let batch = append_only_batch(vec![Some(b"x"), Some(b"y")], vec![10_000, 20_000]);
+		let meta = meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		let decoded = decode_batch(&packed[0].frame_bytes).unwrap();
+		let rows = storage_rows_from_batch(&decoded).unwrap();
+		assert!(rows.iter().all(|row| !row.is_tombstone));
+		for row in 0..rows.len() {
+			assert!(
+				!storage_row_is_tombstone_at(&decoded, RecordRowIndex::new(row as u32)).unwrap()
+			);
+		}
+	}
+
+	#[test]
+	fn tombstone_only_multirow_records_decode_without_user_rows() {
+		let layout = MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap();
+		let table_object_id = TableObjectId::new([0x47; 16]);
+		let rows = vec![
+			MultiRowSourceRow {
+				source_row_index: 0,
+				key_identity: Identity::new([1; 32]),
+				routing_locality: Locality::new(9),
+				row_hlc: hlc(90),
+				is_tombstone: true,
+				table_object_id: Some(table_object_id),
+			},
+			MultiRowSourceRow {
+				source_row_index: 1,
+				key_identity: Identity::new([2; 32]),
+				routing_locality: Locality::new(9),
+				row_hlc: hlc(90),
+				is_tombstone: true,
+				table_object_id: Some(table_object_id),
+			},
+		];
+		let packed = pack_tombstone_multirow_source_rows_with_policy(
+			layout,
+			&rows,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		assert_eq!(packed.len(), 1);
+		let decoded = decode_batch(&packed[0].encoded.frame).unwrap();
+		assert!(has_storage_synthetic_columns(&decoded));
+		assert_eq!(
+			strip_storage_synthetic_columns(&decoded)
+				.unwrap()
+				.num_columns(),
+			0
+		);
+		let decoded_rows = storage_rows_from_batch(&decoded).unwrap();
+		assert_eq!(decoded_rows.len(), 2);
+		assert!(decoded_rows.iter().all(|row| row.is_tombstone));
+		let materialized =
+			materialize_record_location_batch(&decoded, RecordRowIndex::ZERO).unwrap();
+		assert_eq!(materialized.num_columns(), 0);
+		assert_eq!(materialized.num_rows(), 0);
 	}
 }

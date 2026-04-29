@@ -76,8 +76,11 @@ storage fact, not as a mutation of the original row bytes.
 - **No predicate delete, range delete, table truncate, or
   retention syntax.**
 - **No update / upsert semantics.**
-- **No tolerant decoder, no compat shim, no reserved-for-V2
-  field.** Per `no-premature-backward-compat.md`.
+- **No tombstone-specific tolerant decoder, no compat shim, no
+  reserved-for-V2 field.** Per `no-premature-backward-compat.md`.
+  The persistent local-index reader's V1/V2 length tolerance is
+  pre-existing ADR 042 index-rebuild compatibility; ADR 047 only
+  adds the V3 `is_tombstone` bit.
 
 ## Decision
 
@@ -86,7 +89,7 @@ storage fact, not as a mutation of the original row bytes.
 The codebase adds an append-only table operation:
 
 ```rust
-pub struct DeleteRows {
+pub struct DeleteRowsRequest {
     pub tenant_id: TenantId,
     pub table_object_id: TableObjectId,
     pub schema_generation: u64,
@@ -99,9 +102,9 @@ This is the logical request shape. The wire encoding uses a
 fixed metadata struct plus a `FixedSizeBinary(32)` Arrow
 payload, inside the typed-table write family as
 `TABLE_DELETE_REQ` / `TABLE_DELETE_RESP`. Council ratifies the
-exact MsgType numbers from the typed-table allocation table;
-`0x2E` / `0x2F` is the current candidate (see *Open
-questions*).
+exact MsgType numbers from the typed-table allocation table:
+`0x34` / `0x35`. The earlier `0x2E` / `0x2F` candidate was
+already occupied by schema-update frames.
 
 The logical response shape:
 
@@ -201,14 +204,13 @@ records marker-row presence only — it is not the existing
 or roadmap reference to `has_tombstones` as shorthand for the
 same bit.
 
-The presence bit is an **optimization** that can be dropped if
-footer-slot allocation forces it. ADR 022's footer has finite
-reserved-bit space; the implementation plan Phase 0 audit
-confirms whether a clean HMAC-covered flag slot exists. If not,
-the bit drops and the read path falls back to per-slab
-metadata + index lookup (slightly more work in the steady-
-state-no-deletes case, but correctness-equivalent). See *Open
-questions*.
+The presence bit is an **optimization**, not a correctness
+authority. The Phase 0 footer audit found an HMAC-covered
+reserved flag slot in the ADR 022 footer reserved byte; ADR 047
+allocates `HAS_ROW_TOMBSTONE_RECORDS_BIT = 1 << 0` there. If a
+future footer rewrite removes that flag slot, the read path can
+fall back to per-slab metadata + index lookup with the same
+visibility semantics.
 
 ### 4. Tombstones share the target row identity
 
@@ -262,10 +264,19 @@ Delete admission performs these steps:
 6. Treat missing keys and already tombstoned keys as successful
    no-ops and report counts.
 
+`DeleteRows` V1 is leader-direct. The request metadata does not
+carry `proxy_hop` or `proxy_source`; a follower returns
+`NOT_LEADER` before target resolution so classification counts are
+computed by the leader's current state.
+
 The tombstone inherits the target row's stored routing
 locality. That keeps the delete fact in the same replica group
 as the data row and lets the existing table-write bifurcation
 machinery group multi-row tombstone records by locality.
+For append-only table-spread rows, admission must use the stored
+row locality. If that locality cannot be recovered from the
+latest indexed location / locality cache, delete admission fails
+closed; it must not fall back to `Locality::from(row_key_id)`.
 
 If a `DeleteRows` request spans multiple replica groups, the
 accepting node splits tombstone children by inherited locality
@@ -289,6 +300,12 @@ ordinary retries. If a retry bypasses the cache after restart
 or expiry, admission still consults current row state and sees
 the row already tombstoned. It therefore emits no second
 tombstone.
+
+The per-request count replay cache is intentionally in-memory.
+After a leader restart, a retry with the same `parent_write_id`
+may report `already_deleted_count = N` instead of replaying the
+original `deleted_count = N`. The durable invariant is logical
+idempotency: no duplicate tombstone is emitted.
 
 This deliberately preserves the earliest delete HLC. A later
 delete of the same row is also a no-op; it does not move the
@@ -664,10 +681,11 @@ no new HRFT family, no new node capability bit.
   history source of truth until a future event-history digest
   has a concrete consumer.
 - The tombstone-presence bit consumes one HMAC-covered flag
-  slot if Phase 0 confirms such a slot. If the only clean
-  implementation requires a wider footer change, the presence-
-  bit optimization drops and reads fall back to metadata +
-  index lookup.
+  slot in the ADR 022 footer reserved byte.
+- Delete count replay is best-effort across process lifetime:
+  after leader restart, duplicate `parent_write_id` retries can
+  return already-deleted counts while still preserving durable
+  logical idempotency.
 
 ## Rejected alternatives
 
@@ -751,22 +769,20 @@ no new HRFT family, no new node capability bit.
   retention. The row index plus `tombstone_metadata` provides
   the local latest-as-of visibility shape.
 
-## Open questions
+## Resolved questions and follow-ups
 
-1. **MsgType allocation.** `0x2E` / `0x2F` is the current
-   candidate for `TABLE_DELETE_REQ` / `TABLE_DELETE_RESP`.
-   Council ratifies the exact values from the typed-table
-   write family allocation table.
+1. **MsgType allocation.** `0x34` / `0x35` are allocated for
+   `TABLE_DELETE_REQ` / `TABLE_DELETE_RESP`; `0x2E` / `0x2F`
+   were unavailable because they are schema-update frames.
 
 2. **Tombstone-only decoder audit.** Council should review
    the implementation audit list for decoders that currently
    assume every multi-row storage record has user columns.
 
-3. **Recovery duplicate policy.** For multiple tombstones on
-   one row, should recovery fail closed or keep the earliest
-   tombstone and emit a corruption metric? This ADR prefers
-   fail-closed unless implementation evidence shows repair is
-   materially safer.
+3. **Recovery duplicate policy.** Resolved: recovery fails closed
+   on multiple tombstones for the same row key. Keeping the
+   earliest tombstone is deferred to a future explicit repair
+   mode, not the default recovery path.
 
 4. **Cross-window orphan cleanup certainty.** This ADR keeps
    orphaned tombstones and orphaned data rows unless retention
@@ -774,13 +790,9 @@ no new HRFT family, no new node capability bit.
    should decide whether that is enough before the retention
    ADR lands.
 
-5. **Footer presence bit allocation.** If the current footer
-   has no clean HMAC-covered flag slot, should ADR 047
-   reshape a reserved byte as a flag field, or should it drop
-   the presence bit and rely on row-index / tombstone-
-   metadata pruning only? Dropping the bit is correctness-
-   equivalent; it only costs read-path work on steady-state
-   slabs.
+5. **Footer presence bit allocation.** Resolved: ADR 047 uses
+   bit 0 of the existing HMAC-covered footer flag byte for
+   `HAS_ROW_TOMBSTONE_RECORDS_BIT`.
 
 6. **Visible digest cache.** Should slab seal compute an in-
    memory visible digest cache, or should every consumer

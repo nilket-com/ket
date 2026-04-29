@@ -97,3 +97,7 @@ harness = false
 [[bench]]
 name = "state_digest"
 harness = false
+
+[[bench]]
+name = "row_tombstones"
+harness = false

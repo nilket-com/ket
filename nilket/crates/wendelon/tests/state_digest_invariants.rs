@@ -8,12 +8,15 @@ use wendelon::hash::state_digest::{
 	StateDigestElement, accumulate_projected_scalars, projected_scalar_bytes, visible_row_element,
 };
 use wendelon::schema::{
-	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, LocalityPolicyV1,
-	MultiRowLayoutDescriptor, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1, TableWriteRequestMeta, TenantId, WriterNodeId,
-	encode_table_write_row_count, synthesize_append_only_row_id,
+	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, Locality, LocalityPolicyV1,
+	MultiRowLayoutDescriptor, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1, TableWriteRequestMeta,
+	TenantId, WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
 };
-use wendelon::storage::{decode_batch, pack_record_batch_by_bucket, storage_rows_from_batch};
+use wendelon::storage::{
+	MultiRowSourceRow, decode_batch, pack_record_batch_by_bucket,
+	pack_tombstone_multirow_source_rows_with_policy, storage_rows_from_batch,
+};
 
 fn visible_preimage(
 	tenant_id: TenantId,
@@ -42,6 +45,22 @@ fn digest_rows(tenant: TenantId, table: TableObjectId, rows: &[Identity]) -> Sta
 	let mut accumulator = StateDigestAccumulator::new();
 	for row_key_id in rows {
 		accumulator.add_element(visible_row_element(tenant, table, *row_key_id));
+	}
+	accumulator.finish()
+}
+
+fn digest_visible_delta(
+	tenant: TenantId,
+	table: TableObjectId,
+	adds: &[Identity],
+	subtracts: &[Identity],
+) -> StateDigest {
+	let mut accumulator = StateDigestAccumulator::new();
+	for row_key_id in adds {
+		accumulator.add_element(visible_row_element(tenant, table, *row_key_id));
+	}
+	for row_key_id in subtracts {
+		accumulator.subtract_element(visible_row_element(tenant, table, *row_key_id));
 	}
 	accumulator.finish()
 }
@@ -275,6 +294,123 @@ fn visible_digest_survives_multirow_repacking_boundaries() {
 	assert_eq!(large_rows, rows);
 	assert_eq!(small_keys, large_keys);
 	assert_eq!(small_digest, large_digest);
+}
+
+#[test]
+fn row_tombstone_subtracts_visible_row_digest() {
+	let tenant = TenantId::new(47);
+	let table = TableObjectId::new([0x47; 16]);
+	let writer = WriterNodeId::new([0x47; 16]);
+	let commit_hlc = HybridTimestamp {
+		physical_ms: 1_700_000_047_000,
+		logical: 1,
+		node_id: 47,
+	};
+	let delete_hlc = HybridTimestamp {
+		physical_ms: 1_700_000_047_100,
+		logical: 0,
+		node_id: 47,
+	};
+	let layout = MultiRowLayoutDescriptor::new(8, 8, 1024 * 1024).unwrap();
+	let descriptor = append_only_descriptor(table, layout);
+	let batch = append_only_batch(3);
+	let meta = table_meta(tenant, &descriptor, batch.num_rows());
+	let packed = pack_record_batch_by_bucket(&meta, &descriptor, &batch, writer, commit_hlc)
+		.expect("pack data rows");
+	let mut data_rows = Vec::new();
+	for record in &packed {
+		let decoded = decode_batch(&record.frame_bytes).unwrap();
+		data_rows.extend(storage_rows_from_batch(&decoded).unwrap());
+	}
+	data_rows.sort_by_key(|row| row.key_identity);
+	assert_eq!(data_rows.len(), 3);
+	assert!(data_rows.iter().all(|row| !row.is_tombstone));
+
+	let deleted = data_rows[1];
+	let tombstones = pack_tombstone_multirow_source_rows_with_policy(
+		layout,
+		&[MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity: deleted.key_identity,
+			routing_locality: Locality::new(deleted.routing_locality.get()),
+			row_hlc: delete_hlc,
+			is_tombstone: true,
+			table_object_id: Some(table),
+		}],
+		RecordBodyCompressionPolicy::Uncompressed,
+	)
+	.unwrap();
+	let tombstone_batch = decode_batch(&tombstones[0].encoded.frame).unwrap();
+	let tombstone_rows = storage_rows_from_batch(&tombstone_batch).unwrap();
+	assert_eq!(tombstone_rows.len(), 1);
+	assert!(tombstone_rows[0].is_tombstone);
+
+	let mut actual = StateDigestAccumulator::new();
+	for row in &data_rows {
+		actual.add_element(visible_row_element(tenant, table, row.key_identity));
+	}
+	for row in &tombstone_rows {
+		actual.subtract_element(visible_row_element(tenant, table, row.key_identity));
+	}
+	let survivors = vec![data_rows[0].key_identity, data_rows[2].key_identity];
+	assert_eq!(actual.finish(), digest_rows(tenant, table, &survivors));
+}
+
+#[test]
+fn row_tombstone_digest_is_order_independent_and_merge_equivalent() {
+	let tenant = TenantId::new(47);
+	let table = TableObjectId::new([0x47; 16]);
+	let rows = row_key_ids(5);
+	let tombstones = vec![rows[1], rows[3]];
+	let expected = digest_rows(tenant, table, &[rows[0], rows[2], rows[4]]);
+
+	assert_eq!(
+		expected,
+		digest_visible_delta(tenant, table, &rows, &tombstones)
+	);
+
+	let mut interleaved = StateDigestAccumulator::new();
+	interleaved.subtract_element(visible_row_element(tenant, table, rows[3]));
+	interleaved.add_element(visible_row_element(tenant, table, rows[0]));
+	interleaved.add_element(visible_row_element(tenant, table, rows[1]));
+	interleaved.subtract_element(visible_row_element(tenant, table, rows[1]));
+	interleaved.add_element(visible_row_element(tenant, table, rows[2]));
+	interleaved.add_element(visible_row_element(tenant, table, rows[3]));
+	interleaved.add_element(visible_row_element(tenant, table, rows[4]));
+	assert_eq!(expected, interleaved.finish());
+
+	let slab_a = digest_visible_delta(tenant, table, &[rows[0], rows[1]], &[rows[1]]);
+	let slab_b = digest_visible_delta(tenant, table, &[rows[2], rows[3], rows[4]], &[rows[3]]);
+	let mut merged = StateDigestAccumulator::new();
+	merged.merge_digest(slab_a).unwrap();
+	merged.merge_digest(slab_b).unwrap();
+	assert_eq!(expected, merged.finish());
+}
+
+#[test]
+fn row_tombstone_pair_gc_and_retombstone_noop_preserve_digest() {
+	let tenant = TenantId::new(47);
+	let table = TableObjectId::new([0x47; 16]);
+	let row = row_key_id(707);
+	let element = visible_row_element(tenant, table, row);
+
+	let mut pair = StateDigestAccumulator::new();
+	pair.add_element(element);
+	pair.subtract_element(element);
+	assert_eq!(StateDigest::ZERO, pair.finish());
+	assert_eq!(StateDigest::ZERO, StateDigestAccumulator::new().finish());
+
+	let mut first_delete = StateDigestAccumulator::from_digest(digest_rows(tenant, table, &[row]))
+		.expect("live row digest should decompress");
+	first_delete.subtract_element(element);
+	assert_eq!(StateDigest::ZERO, first_delete.finish());
+
+	let mut duplicate_delete =
+		StateDigestAccumulator::from_digest(digest_rows(tenant, table, &[row]))
+			.expect("live row digest should decompress");
+	duplicate_delete.subtract_element(element);
+	duplicate_delete.subtract_element(element);
+	assert_ne!(StateDigest::ZERO, duplicate_delete.finish());
 }
 
 fn append_only_descriptor(

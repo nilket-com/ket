@@ -40,7 +40,9 @@ const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
 const RECORD_VALUE_LEN_V1: usize = 4;
 const RECORD_VALUE_LEN_V2: usize = 4 + 8;
-const RECORD_VALUE_LEN: usize = 4 + 8 + 4;
+const RECORD_VALUE_LEN_V3: usize = 4 + 8 + 4 + 4;
+const RECORD_VALUE_LEN: usize = RECORD_VALUE_LEN_V3;
+const RECORD_FLAG_IS_TOMBSTONE: u32 = 1 << 0;
 const TIERED_POINTER_HASH_LEN: usize = 32;
 const TIERED_POINTER_FLAGS_LEN: usize = 2;
 const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
@@ -375,6 +377,11 @@ fn encode_record_value(row: PersistentRecordRow) -> [u8; RECORD_VALUE_LEN] {
 	bytes[..4].copy_from_slice(&row.location.length.to_le_bytes());
 	bytes[4..12].copy_from_slice(&row.routing_locality.get().to_le_bytes());
 	bytes[12..16].copy_from_slice(&row.location.record_row_index.get().to_le_bytes());
+	let mut flags = 0_u32;
+	if row.location.is_tombstone {
+		flags |= RECORD_FLAG_IS_TOMBSTONE;
+	}
+	bytes[16..20].copy_from_slice(&flags.to_le_bytes());
 	bytes
 }
 
@@ -424,6 +431,17 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 	} else {
 		RecordRowIndex::ZERO
 	};
+	let flags = if value.len() == RECORD_VALUE_LEN {
+		u32::from_le_bytes(value[16..20].try_into().expect("validated above"))
+	} else {
+		0
+	};
+	if flags & !RECORD_FLAG_IS_TOMBSTONE != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("persistent record row has unknown flags 0x{flags:08x}"),
+		));
+	}
 
 	Ok(PersistentRecordRow {
 		tenant_id,
@@ -439,6 +457,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 				node_id,
 			},
 			record_row_index,
+			is_tombstone: flags & RECORD_FLAG_IS_TOMBSTONE != 0,
 		},
 	})
 }
@@ -786,6 +805,7 @@ mod tests {
 					logical: 3,
 					node_id: 11,
 				},
+				is_tombstone: false,
 			},
 		}
 	}
@@ -809,7 +829,23 @@ mod tests {
 				0x00, 0x10, 0x00, 0x00, // length = 4096
 				0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // locality = 0x8877
 				0x07, 0x00, 0x00, 0x00, // record_row_index = 7
+				0x00, 0x00, 0x00, 0x00, // flags
 			]
+		);
+	}
+
+	#[test]
+	fn record_row_value_roundtrips_tombstone_flag() {
+		let mut row = row();
+		row.location.is_tombstone = true;
+		let value = encode_record_value(row);
+		assert_eq!(
+			u32::from_le_bytes(value[16..20].try_into().unwrap()) & RECORD_FLAG_IS_TOMBSTONE,
+			RECORD_FLAG_IS_TOMBSTONE
+		);
+		assert_eq!(
+			decode_record_row(&encode_record_key(row), &value).unwrap(),
+			row
 		);
 	}
 

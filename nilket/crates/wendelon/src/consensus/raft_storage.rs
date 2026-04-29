@@ -6248,6 +6248,7 @@ mod recovery_tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				b"before-snapshot",
 			)

@@ -564,6 +564,27 @@ impl SlabManager {
 			.unwrap_or_else(|| Locality::from(key_identity))
 	}
 
+	/// Strict lookup for admission paths that must inherit an
+	/// existing append-only row's stored routing locality.
+	pub(crate) fn routing_locality_for_existing_key(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) -> Option<Locality> {
+		self.key_localities
+			.get(&(tenant_id, key_identity))
+			.map(|entry| *entry.value())
+	}
+
+	#[cfg(test)]
+	pub(crate) fn forget_routing_locality_for_test(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+	) {
+		self.key_localities.remove(&(tenant_id, key_identity));
+	}
+
 	fn routing_locality_for_identity_any_tenant(&self, key_identity: Identity) -> Locality {
 		// Migration cursors carry identity + HLC, while the scan
 		// order is locality + identity + HLC. Resolve the current
@@ -669,7 +690,9 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
+		let superseded = self
+			.latest_location_before(tenant_id, key_identity, hlc)
+			.filter(|location| !location.is_tombstone);
 		let (slab, location) = self
 			.append_on_target(tenant_id, key_identity, hlc, frame)
 			.await?;
@@ -717,13 +740,19 @@ impl SlabManager {
 			.map(|entry| entry.row_hlc)
 			.max()
 			.unwrap_or(primary.row_hlc);
-		let superseded = entries
-			.iter()
-			.filter_map(|entry| {
+		let mut superseded = Vec::new();
+		let mut tombstoned = Vec::new();
+		for entry in entries {
+			if let Some(previous) =
 				self.latest_location_before(tenant_id, entry.key_identity, entry.row_hlc)
-					.map(|previous| (previous.slab_id, entry.row_hlc))
-			})
-			.collect::<Vec<_>>();
+			{
+				if entry.is_tombstone {
+					tombstoned.push((previous.slab_id, entry.row_hlc));
+				} else if !previous.is_tombstone {
+					superseded.push((previous.slab_id, entry.row_hlc));
+				}
+			}
+		}
 		let (slab, base_location) = self
 			.append_on_target(tenant_id, primary.key_identity, record_hlc, frame)
 			.await?;
@@ -742,6 +771,7 @@ impl SlabManager {
 				location: RecordLocation {
 					hlc: entry.row_hlc,
 					record_row_index: entry.record_row_index,
+					is_tombstone: entry.is_tombstone,
 					..base_location
 				},
 			})
@@ -767,6 +797,11 @@ impl SlabManager {
 		for (slab_id, supersession_hlc) in superseded {
 			let _ = self
 				.record_supersession_for_slab(slab_id, supersession_hlc, None)
+				.await?;
+		}
+		for (slab_id, tombstone_hlc) in tombstoned {
+			let _ = self
+				.record_row_tombstone_for_slab(slab_id, tombstone_hlc, None)
 				.await?;
 		}
 		Ok(base_location)
@@ -1934,6 +1969,9 @@ impl SlabManager {
 				continue;
 			};
 			if let Some(location) = newest_version_as_of(versions.value(), as_of_hlc) {
+				if location.is_tombstone {
+					continue;
+				}
 				let locality = self
 					.key_localities
 					.get(&(tenant_id, key_identity))
@@ -2097,7 +2135,9 @@ impl SlabManager {
 			versions.iter().enumerate().any(|(index, location)| {
 				location.slab_id == slab_id
 					&& versions[index + 1..].iter().any(|newer| {
-						newer.hlc > location.hlc && (unbounded_as_of || newer.hlc <= as_of_hlc)
+						!newer.is_tombstone
+							&& newer.hlc > location.hlc
+							&& (unbounded_as_of || newer.hlc <= as_of_hlc)
 					})
 			})
 		})
@@ -2113,7 +2153,7 @@ impl SlabManager {
 				}
 				if let Some(newer) = versions[index + 1..]
 					.iter()
-					.filter(|newer| newer.hlc > location.hlc)
+					.filter(|newer| !newer.is_tombstone && newer.hlc > location.hlc)
 					.min_by_key(|newer| newer.hlc)
 				{
 					earliest = Some(
@@ -2140,6 +2180,32 @@ impl SlabManager {
 				let before = pointer.supersession_metadata;
 				pointer.record_supersession_hlc(supersession_hlc);
 				if pointer.supersession_metadata != before {
+					changed = Some((*pointer).clone());
+				}
+			}
+		}
+		let Some(pointer) = changed else {
+			return Ok(false);
+		};
+		self.persist_tiered_pointer_strict(pointer.clone(), last_control_log_index)
+			.await?;
+		self.clear_tiered_stats_cache_for_slab(pointer.slab_id);
+		Ok(true)
+	}
+
+	pub async fn record_row_tombstone_for_slab(
+		&self,
+		slab_id: SlabId,
+		tombstone_hlc: HybridTimestamp,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<bool> {
+		let mut changed = None;
+		{
+			let state = self.state.lock().await;
+			if let Some(mut pointer) = state.tiered.get_mut(&slab_id) {
+				let before = pointer.tombstone_metadata;
+				pointer.record_tombstone_hlc(tombstone_hlc);
+				if pointer.tombstone_metadata != before {
 					changed = Some((*pointer).clone());
 				}
 			}
@@ -2307,6 +2373,7 @@ impl SlabManager {
 			return Ok(MigrationIngestOutcome::Inserted(RecordLocation {
 				hlc: requested_entry.row_hlc,
 				record_row_index: requested_entry.record_row_index,
+				is_tombstone: requested_entry.is_tombstone,
 				..base_location
 			}));
 		}
@@ -3161,6 +3228,7 @@ impl SlabManager {
 				),
 			})
 			.collect::<Vec<_>>();
+		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 		let physical_groups = physical_compaction_groups(&records);
 		let pruned_versions = records.iter().filter(|record| record.reclaim).count();
@@ -3309,6 +3377,7 @@ impl SlabManager {
 					.collect::<Vec<_>>()
 			})
 			.collect();
+		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 
 		self.compact_sealed_slab_records(slab_id, slab, &records)
@@ -3551,6 +3620,7 @@ impl SlabManager {
 							key_identity: row.key_identity,
 							routing_locality: row.routing_locality,
 							row_hlc: row.row_hlc,
+							is_tombstone: row.old_location.is_tombstone,
 							table_object_id: table_object_id_stamp,
 						})
 						.collect::<Vec<_>>();
@@ -3593,6 +3663,7 @@ impl SlabManager {
 							if old_row.key_identity != encoded_row.key_identity
 								|| old_row.routing_locality != encoded_row.routing_locality
 								|| old_row.row_hlc != encoded_row.row_hlc
+								|| old_row.old_location.is_tombstone != encoded_row.is_tombstone
 							{
 								return Err(Error::new(
 									ErrorKind::InvalidData,
@@ -3602,6 +3673,7 @@ impl SlabManager {
 							let new_location = RecordLocation {
 								hlc: encoded_row.row_hlc,
 								record_row_index: encoded_row.record_row_index,
+								is_tombstone: encoded_row.is_tombstone,
 								..base_location
 							};
 							replacement.index_location(
@@ -3683,6 +3755,41 @@ impl SlabManager {
 				.any(|stored| *stored == location)
 	}
 
+	fn mark_retention_prunable_row_tombstone_pairs(
+		records: &mut [CompactionRecord],
+		retention_floor: HybridTimestamp,
+	) {
+		if records.is_empty() {
+			return;
+		}
+		let mut ordered = (0..records.len()).collect::<Vec<_>>();
+		ordered.sort_by_key(|idx| {
+			let record = records[*idx];
+			(
+				record.tenant_id,
+				record.key_identity,
+				record.old_location.hlc,
+				record.old_location.offset,
+				record.old_location.record_row_index,
+			)
+		});
+		let mut prior_data_by_key: HashMap<TenantKey, usize> = HashMap::new();
+		for idx in ordered {
+			let record = records[idx];
+			let key = (record.tenant_id, record.key_identity);
+			if record.old_location.is_tombstone {
+				if record.old_location.hlc < retention_floor
+					&& let Some(data_idx) = prior_data_by_key.get(&key).copied()
+				{
+					records[data_idx].reclaim = true;
+					records[idx].reclaim = true;
+				}
+				continue;
+			}
+			prior_data_by_key.insert(key, idx);
+		}
+	}
+
 	async fn compact_sealed_slab_records(
 		&self,
 		slab_id: SlabId,
@@ -3747,6 +3854,7 @@ impl SlabManager {
 				let new_location = RecordLocation {
 					hlc: row.row_hlc,
 					record_row_index: row.record_row_index,
+					is_tombstone: row.old_location.is_tombstone,
 					..base_location
 				};
 				replacement.index_location(row.tenant_id, row.key_identity, new_location);
@@ -4837,6 +4945,7 @@ async fn append_existing_frame_to_replacement(
 		let new_location = RecordLocation {
 			hlc: record.old_location.hlc,
 			record_row_index: record.old_location.record_row_index,
+			is_tombstone: record.old_location.is_tombstone,
 			..base_location
 		};
 		replacement.index_location(record.tenant_id, record.key_identity, new_location);
@@ -4869,6 +4978,7 @@ async fn append_compacted_frame_to_replacement(
 		let new_location = RecordLocation {
 			hlc: row.row_hlc,
 			record_row_index: row.record_row_index,
+			is_tombstone: row.old_location.is_tombstone,
 			..base_location
 		};
 		replacement.index_location(row.tenant_id, row.key_identity, new_location);
@@ -4952,6 +5062,7 @@ fn compact_physical_record_frame(
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
 				row_hlc: record.old_location.hlc,
+				is_tombstone: record.old_location.is_tombstone,
 				table_object_id,
 			}
 		})
@@ -4977,6 +5088,7 @@ fn compact_physical_record_frame(
 		if record.key_identity != entry.key_identity
 			|| record.routing_locality != entry.routing_locality
 			|| record.old_location.hlc != entry.row_hlc
+			|| record.old_location.is_tombstone != entry.is_tombstone
 		{
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -5079,6 +5191,7 @@ fn build_tiered_object_metadata(
 		));
 	};
 	let tenant_id = first_entry.tenant_id;
+	let has_row_tombstone_records = entries.iter().any(|entry| entry.location.is_tombstone);
 	let mut offset_index = Vec::with_capacity(entries.len());
 	for entry in entries {
 		let other_tenant_id = entry.tenant_id;
@@ -5107,6 +5220,7 @@ fn build_tiered_object_metadata(
 		created_hlc: first_entry.location.hlc.physical_ms,
 		offset_index,
 		column_stats_block: None,
+		has_row_tombstone_records,
 	})
 }
 
@@ -5281,7 +5395,7 @@ mod tests {
 		ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicyV1, MultiRowLayoutDescriptor,
 		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
 		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
+		STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaCatalogV1,
 		TableSpreadLocalityDescriptorV1, default_kv_table_descriptor_v1,
 		encode_table_write_row_count,
 	};
@@ -5293,8 +5407,8 @@ mod tests {
 		parse_column_stats_block,
 	};
 	use arrow::array::{
-		Array, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder, LargeStringArray,
-		UInt64Array, UInt64Builder,
+		Array, BooleanArray, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder,
+		LargeStringArray, UInt64Array, UInt64Builder,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
@@ -5462,14 +5576,29 @@ mod tests {
 	fn encode_test_multirow_storage_frame(
 		rows: &[(Identity, Locality, HybridTimestamp, u64)],
 	) -> Vec<u8> {
+		let rows = rows
+			.iter()
+			.map(|(identity, locality, hlc, value)| (*identity, *locality, *hlc, *value, false))
+			.collect::<Vec<_>>();
+		encode_test_multirow_storage_frame_with_tombstones(&rows)
+	}
+
+	fn encode_test_multirow_storage_frame_with_tombstones(
+		rows: &[(Identity, Locality, HybridTimestamp, u64, bool)],
+	) -> Vec<u8> {
 		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
 		let mut row_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
 		let mut row_locality = UInt64Builder::with_capacity(rows.len());
-		for (identity, locality, hlc, _) in rows {
+		for (identity, locality, hlc, _, _) in rows {
 			row_hlc.append_value(test_hlc_storage_bytes(*hlc)).unwrap();
 			row_identity.append_value(identity.as_bytes()).unwrap();
 			row_locality.append_value(locality.get());
 		}
+		let row_tombstone = BooleanArray::from(
+			rows.iter()
+				.map(|(_, _, _, _, value)| *value)
+				.collect::<Vec<_>>(),
+		);
 		let schema = Arc::new(Schema::new(vec![
 			Field::new("value", DataType::UInt64, false),
 			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
@@ -5479,18 +5608,20 @@ mod tests {
 				false,
 			),
 			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
 		]));
 		let batch = RecordBatch::try_new(
 			schema,
 			vec![
 				Arc::new(UInt64Array::from(
 					rows.iter()
-						.map(|(_, _, _, value)| *value)
+						.map(|(_, _, _, value, _)| *value)
 						.collect::<Vec<_>>(),
 				)) as Arc<dyn Array>,
 				Arc::new(row_hlc.finish()) as Arc<dyn Array>,
 				Arc::new(row_identity.finish()) as Arc<dyn Array>,
 				Arc::new(row_locality.finish()) as Arc<dyn Array>,
+				Arc::new(row_tombstone) as Arc<dyn Array>,
 			],
 		)
 		.unwrap();
@@ -6617,6 +6748,191 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
+		let mgr = fresh_manager().await;
+		let key = id(0x4701);
+		let loc = Locality::new(47);
+		let data_frame = encode_test_multirow_storage_frame(&[(key, loc, hlc(10), 100)]);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("data entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let tombstone_frame =
+			encode_test_multirow_storage_frame_with_tombstones(&[(key, loc, hlc(20), 0, true)]);
+		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
+			.unwrap()
+			.expect("tombstone entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+
+		force_seal_active(&mgr).await;
+		let report = mgr.prune_versions_older_than(hlc(30), 1).await.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 2);
+		assert!(mgr.lookup(tenant(), key).is_none());
+		assert!(mgr.lookup_as_of(tenant(), key, hlc(10)).is_none());
+	}
+
+	#[tokio::test]
+	async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
+		let mgr = fresh_manager().await;
+		let key = id(0x4702);
+		let loc = Locality::new(48);
+		let data_frame = encode_test_multirow_storage_frame(&[(key, loc, hlc(10), 100)]);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("data entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let tombstone_frame =
+			encode_test_multirow_storage_frame_with_tombstones(&[(key, loc, hlc(20), 0, true)]);
+		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
+			.unwrap()
+			.expect("tombstone entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+
+		force_seal_active(&mgr).await;
+		let report = mgr.prune_versions_older_than(hlc(20), 1).await.unwrap();
+
+		assert_eq!(report.compacted_slabs, 0);
+		assert_eq!(report.pruned_versions, 0);
+		assert!(
+			!mgr.lookup_as_of(tenant(), key, hlc(10))
+				.expect("data before delete")
+				.is_tombstone
+		);
+		assert!(
+			mgr.lookup_as_of(tenant(), key, hlc(20))
+				.expect("tombstone at delete")
+				.is_tombstone
+		);
+	}
+
+	#[tokio::test]
+	async fn tiered_retention_rewrite_pair_gc_drops_data_and_row_tombstone() {
+		let l1_dir = fresh_dir("retention-tombstone-pair-l1");
+		let l2_root = fresh_dir("retention-tombstone-pair-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let key_a = id(0x4703);
+		let key_b = id(0x4704);
+		let loc_a = Locality::new(49);
+		let loc_b = Locality::new(50);
+		let data_a = encode_test_multirow_storage_frame(&[(key_a, loc_a, hlc(10), 100)]);
+		let entries_a = storage_multirow_index_entries_from_frame(&data_a)
+			.unwrap()
+			.expect("data a entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_a, &entries_a)
+			.await
+			.unwrap();
+		let tombstone_a =
+			encode_test_multirow_storage_frame_with_tombstones(&[(key_a, loc_a, hlc(20), 0, true)]);
+		let tombstone_entries_a = storage_multirow_index_entries_from_frame(&tombstone_a)
+			.unwrap()
+			.expect("tombstone a entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_a, &tombstone_entries_a)
+			.await
+			.unwrap();
+		let data_b = encode_test_multirow_storage_frame(&[(key_b, loc_b, hlc(12), 200)]);
+		let entries_b = storage_multirow_index_entries_from_frame(&data_b)
+			.unwrap()
+			.expect("data b entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_b, &entries_b)
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}-pair.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_retention_rewrite(
+				&old_pointer,
+				hlc(30),
+				&TableSchemaCatalogV1::default(),
+			)
+			.await
+			.unwrap()
+			.expect("retention rewrite");
+		let PreparedTieredRetentionRewrite::Rewrite {
+			encrypted_bytes,
+			pruned_versions,
+			..
+		} = prepared
+		else {
+			panic!("expected rewrite with key_b survivor");
+		};
+		assert_eq!(pruned_versions, 2);
+
+		let rewritten_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: "rewritten-pair".to_string(),
+			payload_hash: crate::hash::content::digest(&encrypted_bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_encrypted.tenant_kek_id),
+			stats_format_version: None,
+			stats_block_len: None,
+			stats_block_hash128: None,
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		let rewritten_plaintext = decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			&rewritten_pointer,
+			&encrypted_bytes,
+		)
+		.unwrap();
+		let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+		assert_eq!(recovered.len(), 1);
+		assert_eq!(recovered[0].key_identity, key_b);
+		assert!(!recovered[0].location.is_tombstone);
+	}
+
+	#[tokio::test]
 	async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
 		let mgr = fresh_manager().await;
 		let single_descriptor = layout_recluster_descriptor(0x62, 1, RecordLayoutPolicy::SingleRow);
@@ -6789,6 +7105,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(10 + source_row_index as u64),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			)
@@ -7208,6 +7525,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(10 + source_row_index as u64),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			)
@@ -7314,6 +7632,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(50 + source_row_index as u64),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			)
@@ -7461,6 +7780,7 @@ mod tests {
 					key_identity: *key_identity,
 					routing_locality: *routing_locality,
 					row_hlc: hlc(100 + source_row_index as u64),
+					is_tombstone: false,
 					table_object_id: None,
 				},
 			)
@@ -7585,6 +7905,7 @@ mod tests {
 						flags: 0,
 					}],
 					column_stats_block: None,
+					has_row_tombstone_records: false,
 				},
 				&plaintext,
 			)
@@ -8276,6 +8597,65 @@ mod tests {
 			hlc(10),
 			TombstoneMetadata::None,
 			pointer.supersession_metadata,
+			hlc(20)
+		));
+	}
+
+	#[tokio::test]
+	async fn post_tier_row_tombstone_updates_tiered_pointer_visibility() {
+		let manager = fresh_manager().await;
+		let key = id(0x5152);
+		let locality = Locality::new(52);
+		let data_frame = encode_test_multirow_storage_frame(&[(key, locality, hlc(10), 100)]);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("data entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: sealed_id,
+				l2_uri: "memory://row-tombstone".into(),
+				payload_hash: [0x56; 32],
+				is_encrypted: false,
+				tenant_id: None,
+				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: TombstoneMetadata::None,
+				supersession_metadata: SupersessionMetadata::None,
+			})
+			.await
+			.unwrap();
+
+		let tombstone_frame = encode_test_multirow_storage_frame_with_tombstones(&[(
+			key,
+			locality,
+			hlc(20),
+			0,
+			true,
+		)]);
+		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
+			.unwrap()
+			.expect("tombstone entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+
+		let pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(20))
+		);
+		assert!(!crate::storage::slab_visibility_complete(
+			hlc(10),
+			pointer.tombstone_metadata,
+			SupersessionMetadata::None,
 			hlc(20)
 		));
 	}

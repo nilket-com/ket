@@ -59,6 +59,10 @@ pub const STORAGE_ROW_ROUTING_LOCALITY_COLUMN: &str = "__row_routing_locality__"
 /// AppendOnly rows from cross-table prefix collisions in the
 /// table-spread address space.
 pub const STORAGE_ROW_TABLE_OBJECT_ID_COLUMN: &str = "__row_table_object_id__";
+/// ADR 047 — storage-only marker for append-only row tombstone
+/// facts. Data rows store `false`; tombstone rows share the
+/// target row's `__row_key_id__` and store `true`.
+pub const STORAGE_ROW_TOMBSTONE_COLUMN: &str = "__row_tombstone__";
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
 pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
 pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
@@ -230,6 +234,53 @@ pub struct TableQueryRequestMeta {
 
 const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 88);
 
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableDeleteRowsRequestMeta {
+	pub parent_write_id: ClientWriteId, // 32 bytes
+	pub client_hlc: HybridTimestamp,    // 16 bytes
+	pub expected_epoch: u64,            //  8 bytes
+	pub tenant_id: TenantId,            //  8 bytes
+	pub table_object_id: TableObjectId, // 16 bytes
+	pub schema_generation: u64,         //  8 bytes
+	pub row_count: u32,                 //  4 bytes
+	pub durability: DurabilityLevel,    //  1 byte
+	pub await_finalization: u8,         //  1 byte
+	pub _pad: [u8; 10],                 // 10 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<TableDeleteRowsRequestMeta>() == 104);
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableDeleteRowsResponseMeta {
+	pub write: WriteResponseMeta,   // 96 bytes
+	pub deleted_count: u32,         //  4 bytes
+	pub already_deleted_count: u32, //  4 bytes
+	pub not_found_count: u32,       //  4 bytes
+	pub reject_code: u16,           //  2 bytes
+	pub _pad: [u8; 10],             // 10 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<TableDeleteRowsResponseMeta>() == 120);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteRowsRequest {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub schema_generation: u64,
+	pub parent_write_id: ClientWriteId,
+	pub row_key_ids: Vec<Identity>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteRowsResponse {
+	pub deleted_count: u32,
+	pub already_deleted_count: u32,
+	pub not_found_count: u32,
+	pub write: WriteResponseMeta,
+}
+
 pub const fn decode_table_write_row_count(row_count: u16) -> usize {
 	// `u16::MAX` is one row short of ADR 037's 65,536-row cap, so
 	// the wire sentinel `0` means max-sized batch. Empty batches are
@@ -272,6 +323,8 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_DUPLICATE_PK_IN_BATCH: Self = Self(0x3707);
 	pub const PBC_REJECT_LOCALITY_UNSUPPORTED: Self = Self(0x3708);
 	pub const PBC_REJECT_BATCH_TOO_LARGE: Self = Self(0x3709);
+	pub const PBC_REJECT_ROW_COUNT_MISMATCH: Self = Self(0x370A);
+	pub const PBC_REJECT_TOMBSTONE_PACKING_FAILED: Self = Self(0x370B);
 	pub const PBC_REJECT_CLUSTERING_TOO_WIDE: Self = Self(0x3801);
 	pub const PBC_REJECT_CLUSTERING_EMPTY: Self = Self(0x3802);
 	pub const PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN: Self = Self(0x3803);
@@ -298,6 +351,7 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY: Self = Self(0x3A02);
 	pub const PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW: Self = Self(0x3A03);
 	pub const PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED: Self = Self(0x3A04);
+	pub const PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY: Self = Self(0x3B01);
 
 	pub const fn name(self) -> &'static str {
 		match self.0 {
@@ -311,6 +365,8 @@ impl PbcRejectCode {
 			0x3707 => "PBC_REJECT_DUPLICATE_PK_IN_BATCH",
 			0x3708 => "PBC_REJECT_LOCALITY_UNSUPPORTED",
 			0x3709 => "PBC_REJECT_BATCH_TOO_LARGE",
+			0x370A => "PBC_REJECT_ROW_COUNT_MISMATCH",
+			0x370B => "PBC_REJECT_TOMBSTONE_PACKING_FAILED",
 			0x3801 => "PBC_REJECT_CLUSTERING_TOO_WIDE",
 			0x3802 => "PBC_REJECT_CLUSTERING_EMPTY",
 			0x3803 => "PBC_REJECT_CLUSTERING_COLUMN_UNKNOWN",
@@ -336,6 +392,7 @@ impl PbcRejectCode {
 			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
 			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
 			0x3A04 => "PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED",
+			0x3B01 => "PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY",
 			_ => "PBC_REJECT_UNKNOWN",
 		}
 	}
@@ -1978,7 +2035,8 @@ fn validate_no_storage_synthetic_user_columns(schema: &Schema) -> std::io::Resul
 			STORAGE_ROW_HLC_COLUMN
 			| STORAGE_ROW_KEY_ID_COLUMN
 			| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
-			| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN => {
+			| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
+			| STORAGE_ROW_TOMBSTONE_COLUMN => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					format!(
@@ -4945,6 +5003,34 @@ mod tests {
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect_err("user column shadowing __row_hlc__ must reject");
+		assert!(
+			err.to_string().contains("synthetic column"),
+			"reject should mention synthetic-column collision: {err}"
+		);
+	}
+
+	#[test]
+	fn append_only_descriptor_rejects_user_row_tombstone_column() {
+		let schema = Schema::new(vec![
+			Field::new(
+				"event_time",
+				DataType::Timestamp(TimeUnit::Millisecond, None),
+				false,
+			),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+		]);
+		let err = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([47; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect_err("user column shadowing __row_tombstone__ must reject");
 		assert!(
 			err.to_string().contains("synthetic column"),
 			"reject should mention synthetic-column collision: {err}"
