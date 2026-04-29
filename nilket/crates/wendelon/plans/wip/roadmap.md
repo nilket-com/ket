@@ -6,31 +6,41 @@ the tip moves: each ADR that ships shifts the chain by one.
 
 ## Where we are
 
-ADR 047 (Row-Level Tombstones on Append-Only Tables) just
-promoted. Append-only tables gain `DeleteRows { row_key_ids }`
-admission, a single new synthetic column `__row_tombstone__`
-on append-only schemas, an `is_tombstone` bit on local /
-persistent index entries, and the `has_row_tombstone_records`
-footer presence flag (subject to Phase 0 footer-slot audit).
-Tombstones share the target row's `__row_key_id__`, making
-deletion an MVCC version-chain operation; the visible
-`StateDigest` cancels via `add_element` /
-`subtract_element` on the same point. ADR 040
-`tombstone_metadata` extends to row tombstones, and CSB
-direct-answer eligibility falls back unchanged. ADR 046's
-`subtract_element` substrate now has its first production
-consumer. Implementation pending (Phases 0–10 in
-`plans/impl/047_row_tombstones_append_only.md`).
+ADR 048 (Per-Table Retention Policy) just promoted. Per-
+`(tenant_id, table_object_id)` retention lives in a new
+replicated `TableLifecycleCatalog` in the control-ring
+state, never on the descriptor; reads decode at their
+requested schema generation but resolve retention from the
+always-latest catalog. Three modes: `InheritCluster`,
+`Disabled`, `FixedWindow(RetentionWindowMillis)` (1 minute
+to 100 years). Two-phase enforcement: a Phase A logical
+filter at read time (`floor <= __row_hlc__ <= as_of_hlc`)
+plus hard `RETENTION_FLOOR_EXCEEDED` admission reject for
+`as_of < floor`, and Phase B physical eviction at
+compaction pinned to `compaction_start_hlc`. ADR 047 pair-
+GC composes against the table-specific floor; ambiguous
+ownership during reclaim retains the row. CSB direct
+answers are gated by per-slab retention completeness
+(above-floor allowed; below-floor zero; straddle falls
+back to row-level filter). PK-keyed table-specific
+overrides reject (`RETENTION_REJECTED_PK_DISALLOWED`) and
+remain on the cluster MVCC path until roadmap #6.
+Visible-domain `StateDigest` reversal — second production
+consumer of ADR 046 `subtract_element`, monotonic and
+compaction-driven, completing the lifecycle validation
+pass before the topology gate. See
+`plans/adr/048_per_table_retention_policy.md` and
+`plans/impl/048_per_table_retention_policy.md`.
+Implementation pending (Phases 0–8).
 
-ADR 046 (`StateDigest` substrate) is the immediate predecessor
-— the algebra ADR 047 consumes. ADR 045 (PK-Less Append-Only
-Tables) is the identity layer the deletion ADR composes onto;
-its append-row identity preimage and synthetic-column trio
-remain unchanged. Phase 8 of ADR 045 added
-`__row_table_object_id__` as the fourth synthetic column on
-every multi-row record (PK + AppendOnly), closing the cross-
-descriptor isolation gap on the projected fast path; ADR 047
-adds `__row_tombstone__` as the fifth, append-only-only.
+ADR 047 (Row-Level Tombstones on Append-Only Tables) is
+the immediate predecessor — the lifecycle algebra
+ADR 048 composes against (pair-GC under the table floor).
+ADR 046 (`StateDigest` substrate) supplies the algebra.
+ADR 045 (PK-Less Append-Only Tables) supplies the
+identity layer; `__row_table_object_id__` is the
+ownership resolver retention reclaim uses to look up the
+effective floor.
 
 ## Prioritization philosophy
 
@@ -97,12 +107,24 @@ Gemini.
    ADR 046 `subtract_element` against real storage state.
    Phases 0–10 impl pending.
 
-3. **Per-table retention policy.** `RETENTION = '90 DAYS'`
-   drops rows where `__row_hlc__ < now - 90d` at compaction
-   time. Composes with row-tombstones (retention-floor GC of
-   pairs) and `StateDigest` subtraction at retention-driven
-   reclaim. Completes the lifecycle validation. *2–3
-   iterations.*
+3. **Per-table retention policy.** ADR 048 promoted — see
+   `plans/adr/048_per_table_retention_policy.md` and
+   `plans/impl/048_per_table_retention_policy.md`.
+   Replicated `TableLifecycleCatalog` keyed by
+   `(tenant_id, table_object_id)`; three modes
+   (`InheritCluster` / `Disabled` /
+   `FixedWindow(RetentionWindowMillis)`); typed
+   `SetTableRetentionPolicy` mutation with monotonic
+   `policy_generation` CAS — no DDL parser in Wendelon.
+   Two-phase: read-time logical filter + hard `as_of <
+   floor` reject; compaction-time physical eviction
+   pinned to `compaction_start_hlc`. ADR 047 pair-GC
+   composes against the table floor; ambiguous ownership
+   retains. Visible-domain `StateDigest` reversal
+   (subtract on data eviction, add on tombstone eviction)
+   — no new digest domain. PK-keyed table-specific
+   retention deferred to roadmap #6. Phases 0–8 impl
+   pending.
 
 ### Topology gate
 
@@ -237,8 +259,10 @@ StateDigest substrate
   → refinement plumbing
 ```
 
-Implementation now starts from ADR 046 and
-`plans/impl/046_state_digest_substrate.md`. Bench cold-path
-Ristretto255 against existing multi-row / append-only slab
-batches early so the storage-placement decision remains
-evidence-based for consumer ADRs.
+Implementation tip is now past ADR 048: the lifecycle
+validation pass is complete on the design side. Next is the
+topology gate. ADR 046 / 047 / 048 implementation phases
+remain pending; bench cold-path Ristretto255 against
+existing multi-row / append-only slab batches early so the
+storage-placement decision remains evidence-based for
+consumer ADRs.
