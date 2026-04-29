@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod columnar;
+pub mod content_hash;
 pub mod core;
 pub mod file_ops;
 mod index;

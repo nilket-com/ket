@@ -78,12 +78,12 @@ use crate::schema::{
 	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
 	STORAGE_ROW_KEY_ID_COLUMN, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
-	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
-	TableWriteValidationError, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus,
-	WriterNodeId, column_projection_predicate_ranges, column_projection_prefix_ranges,
-	encode_aggregate_state, encode_table_write_row_count, migration_record_schema, pbc,
-	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
-	validate_table_write_request_batch, write_payload_schema,
+	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
+	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, WriterNodeId, column_projection_predicate_ranges,
+	column_projection_prefix_ranges, encode_aggregate_state, encode_table_write_row_count,
+	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
+	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -116,7 +116,7 @@ use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
 	UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
 };
-use arrow::compute::concat_batches;
+use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
@@ -133,7 +133,7 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tracing::Instrument;
 
@@ -169,6 +169,9 @@ enum WriteOutcome {
 	FinalizationTerminalFailure {
 		response: WriteResponseMeta,
 	},
+	NoopCommitted {
+		response: WriteResponseMeta,
+	},
 }
 
 impl WriteOutcome {
@@ -178,6 +181,7 @@ impl WriteOutcome {
 			Self::FinalizationCommitted { .. }
 				| Self::FinalizationRecoverablePending { .. }
 				| Self::FinalizationTerminalFailure { .. }
+				| Self::NoopCommitted { .. }
 		)
 	}
 }
@@ -276,6 +280,13 @@ struct BifurcatedTableWrite {
 	charged_bytes: u64,
 	record_count: u32,
 	record_body_compression_policy: RecordBodyCompressionPolicy,
+}
+
+#[derive(Clone, Debug)]
+struct ContentHashBifurcation {
+	bifurcated: Option<BifurcatedTableWrite>,
+	absorbed_rows: u64,
+	stored_rows: u64,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -728,6 +739,11 @@ pub struct WendelonDataServer {
 	/// durable write idempotency cache owns commit replay; this cache
 	/// preserves the row-level deleted/already-deleted/not-found counts.
 	table_delete_idempotency: Arc<DashMap<IdempotencyKey, CachedTableDeleteOutcome>>,
+	/// Per table serialization for ADR 049 content-hash admission.
+	/// The visible-membership lookup and the subsequent store/no-op
+	/// decision must not race with another write to the same table.
+	content_hash_admission_locks:
+		Arc<DashMap<(TenantId, TableObjectId), Arc<tokio::sync::Mutex<()>>>>,
 	/// Durable local intent log for writes that passed the data
 	/// quorum but still need their control-branch finalization
 	/// committed through Raft.
@@ -900,6 +916,7 @@ impl Clone for WendelonDataServer {
 			pool: self.pool.clone(),
 			idempotency: self.idempotency.clone(),
 			table_delete_idempotency: self.table_delete_idempotency.clone(),
+			content_hash_admission_locks: self.content_hash_admission_locks.clone(),
 			pending_finalizations: self.pending_finalizations.clone(),
 			pending_finalization_claims: self.pending_finalization_claims.clone(),
 			pending_finalization_wakeup: self.pending_finalization_wakeup.clone(),
@@ -933,6 +950,21 @@ impl Clone for WendelonDataServer {
 impl WendelonDataServer {
 	fn admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
 		self.admission_snapshot_rx.borrow().clone()
+	}
+
+	async fn content_hash_admission_guard(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> OwnedMutexGuard<()> {
+		let lock = match self
+			.content_hash_admission_locks
+			.entry((tenant_id, table_object_id))
+		{
+			DashEntry::Occupied(entry) => entry.get().clone(),
+			DashEntry::Vacant(entry) => entry.insert(Arc::new(tokio::sync::Mutex::new(()))).clone(),
+		};
+		lock.lock_owned().await
 	}
 
 	fn refresh_pending_finalization_backlog_metric(&self) {
@@ -1278,6 +1310,7 @@ impl WendelonDataServer {
 			pool,
 			idempotency: Arc::new(DashMap::new()),
 			table_delete_idempotency: Arc::new(DashMap::new()),
+			content_hash_admission_locks: Arc::new(DashMap::new()),
 			pending_finalizations,
 			pending_finalization_claims: PendingFinalizationClaims::default(),
 			pending_finalization_wakeup: Arc::new(Notify::new()),
@@ -2028,6 +2061,10 @@ impl WendelonDataServer {
 				(response, trailing)
 			}
 			WriteOutcome::FinalizationTerminalFailure { mut response } => {
+				response.status = WriteStatus::DUPLICATE;
+				(response, None)
+			}
+			WriteOutcome::NoopCommitted { mut response } => {
 				response.status = WriteStatus::DUPLICATE;
 				(response, None)
 			}
@@ -7204,12 +7241,18 @@ impl WendelonDataServer {
 			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
-		let descriptor = {
+		let (descriptor, effective_retention) = {
 			let state = self.state_machine.state_snapshot().await;
-			state
+			let effective_retention = self.table_effective_retention_from_state(
+				&state,
+				meta.tenant_id,
+				meta.table_object_id,
+			);
+			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
-				.cloned()
+				.cloned();
+			(descriptor, effective_retention)
 		};
 		let Some(descriptor) = descriptor else {
 			return Ok((
@@ -7237,20 +7280,70 @@ impl WendelonDataServer {
 		// direct SDK writes.
 		let writer_node_id = WriterNodeId::from_node_id(self.local_node);
 
-		let bifurcated =
-			match bifurcate_table_write(&meta, &payload, &descriptor, writer_node_id, commit_hlc) {
-				Ok(bifurcated) => bifurcated,
-				Err(err) => {
-					return Ok((
-						self.table_write_error_response(
-							&meta,
-							table_write_status_for_reject(err.code),
-							err.code,
-						),
-						None,
-					));
-				}
-			};
+		let _content_hash_guard = if matches!(
+			descriptor.row_identity_policy,
+			RowIdentityPolicy::AppendOnlyContentHash
+		) {
+			Some(
+				self.content_hash_admission_guard(meta.tenant_id, meta.table_object_id)
+					.await,
+			)
+		} else {
+			None
+		};
+
+		let mut content_hash_metrics = None;
+		let bifurcated = match if matches!(
+			descriptor.row_identity_policy,
+			RowIdentityPolicy::AppendOnlyContentHash
+		) {
+			self.bifurcate_content_hash_table_write(
+				&meta,
+				&payload,
+				&descriptor,
+				&effective_retention,
+				commit_hlc,
+			)
+			.map(|outcome| {
+				content_hash_metrics = Some((outcome.absorbed_rows, outcome.stored_rows));
+				outcome.bifurcated
+			})
+		} else {
+			bifurcate_table_write(&meta, &payload, &descriptor, writer_node_id, commit_hlc)
+				.map(Some)
+		} {
+			Ok(bifurcated) => bifurcated,
+			Err(err) => {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						table_write_status_for_reject(err.code),
+						err.code,
+					),
+					None,
+				));
+			}
+		};
+		let Some(bifurcated) = bifurcated else {
+			if let Some((absorbed_rows, stored_rows)) = content_hash_metrics {
+				observe_content_hash_admission_metrics(
+					meta.tenant_id,
+					meta.table_object_id,
+					absorbed_rows,
+					stored_rows,
+				);
+			}
+			let write = self.counted_write_response(table_write_noop_write_response(
+				&meta,
+				commit_hlc,
+				self.local_node,
+			));
+			self.idempotency.insert(
+				key,
+				CachedWriteOutcome::new(WriteOutcome::NoopCommitted { response: write }),
+			);
+			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
+		};
 		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
 			return Ok((
 				self.table_write_error_response(
@@ -7262,10 +7355,97 @@ impl WendelonDataServer {
 			));
 		};
 		let is_append_only = descriptor.is_append_only();
+		let content_hash_metric_tenant = meta.tenant_id;
+		let content_hash_metric_table = meta.table_object_id;
 		let (write, trailing) = self
 			.write_table_bifurcated(meta, bifurcated, groups, commit_hlc, is_append_only)
 			.await?;
+		if matches!(
+			write.status,
+			WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
+		) && let Some((absorbed_rows, stored_rows)) = content_hash_metrics
+		{
+			observe_content_hash_admission_metrics(
+				content_hash_metric_tenant,
+				content_hash_metric_table,
+				absorbed_rows,
+				stored_rows,
+			);
+		}
 		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
+	}
+
+	fn bifurcate_content_hash_table_write(
+		&self,
+		meta: &TableWriteRequestMeta,
+		batch: &RecordBatch,
+		descriptor: &TableSchemaDescriptorV1,
+		effective_retention: &EffectiveRetention,
+		row_hlc: HybridTimestamp,
+	) -> Result<ContentHashBifurcation, TableWriteValidationError> {
+		let admission = validate_table_write_request_batch(
+			meta,
+			batch,
+			descriptor,
+			WriterNodeId::ZERO,
+			row_hlc,
+		)?;
+		let mut store_rows = Vec::with_capacity(batch.num_rows());
+		let mut keys_stored_in_batch = HashSet::with_capacity(batch.num_rows());
+		let mut absorbed = 0_u64;
+		for (row, key_identity) in admission.key_identities.iter().copied().enumerate() {
+			let currently_visible =
+				self.slab
+					.row_currently_visible(meta.tenant_id, key_identity, effective_retention);
+			if currently_visible || !keys_stored_in_batch.insert(key_identity) {
+				absorbed = absorbed.saturating_add(1);
+				continue;
+			}
+			store_rows.push(row);
+		}
+		let stored = store_rows.len() as u64;
+
+		if store_rows.is_empty() {
+			return Ok(ContentHashBifurcation {
+				bifurcated: None,
+				absorbed_rows: absorbed,
+				stored_rows: stored,
+			});
+		}
+		if store_rows.len() == batch.num_rows() {
+			let bifurcated =
+				bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)?;
+			return Ok(ContentHashBifurcation {
+				bifurcated: Some(bifurcated),
+				absorbed_rows: absorbed,
+				stored_rows: stored,
+			});
+		}
+
+		let filtered_batch = filter_record_batch_rows(batch, &store_rows)?;
+		let filtered_admission = TableWriteAdmission {
+			canonical_primary_keys: Vec::new(),
+			key_identities: store_rows
+				.iter()
+				.map(|row| admission.key_identities[*row])
+				.collect(),
+			localities: store_rows
+				.iter()
+				.map(|row| admission.localities[*row])
+				.collect(),
+		};
+		let bifurcated = bifurcate_table_write_with_admission(
+			meta,
+			&filtered_batch,
+			descriptor,
+			&filtered_admission,
+			row_hlc,
+		)?;
+		Ok(ContentHashBifurcation {
+			bifurcated: Some(bifurcated),
+			absorbed_rows: absorbed,
+			stored_rows: stored,
+		})
 	}
 
 	async fn table_delete(
@@ -7365,7 +7545,7 @@ impl WendelonDataServer {
 				None,
 			));
 		}
-		if !descriptor.is_append_only() {
+		if !descriptor.supports_row_tombstones() {
 			return Ok((
 				self.table_delete_error_response(
 					&meta,
@@ -8980,6 +9160,31 @@ fn table_record_matches_descriptor(
 			let _ = (meta, key_identity, locality);
 			Ok(stored_table_object_id == Some(descriptor.table_object_id))
 		}
+		RowIdentityPolicy::AppendOnlyContentHash => {
+			if stored_table_object_id != Some(descriptor.table_object_id) {
+				return Ok(false);
+			}
+			let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+			table_meta.tenant_id = meta.tenant_id;
+			table_meta.table_object_id = descriptor.table_object_id;
+			table_meta.schema_generation = descriptor.schema_generation;
+			table_meta.row_count = 1;
+			let zero_hlc = HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			};
+			let admission = validate_table_write_request_batch(
+				&table_meta,
+				batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				zero_hlc,
+			)
+			.map_err(|err| Error::new(ErrorKind::InvalidData, err.to_string()))?;
+			Ok(admission.key_identities.as_slice() == [key_identity]
+				&& admission.localities.as_slice() == [locality])
+		}
 	}
 }
 
@@ -9953,6 +10158,54 @@ fn table_delete_noop_write_response(
 	}
 }
 
+fn table_write_noop_write_response(
+	meta: &TableWriteRequestMeta,
+	commit_hlc: HybridTimestamp,
+	leader_hint: NodeId,
+) -> WriteResponseMeta {
+	WriteResponseMeta {
+		status: WriteStatus::OK,
+		_pad1: [0; 7],
+		log_index: 0,
+		term: 0,
+		epoch: meta.expected_epoch,
+		commit_hlc,
+		leader_hint,
+		echoed_write_id: meta.parent_write_id,
+		has_finalization: 0,
+		_pad2: [0; 7],
+	}
+}
+
+fn observe_content_hash_admission_metrics(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	absorbed_rows: u64,
+	stored_rows: u64,
+) {
+	if absorbed_rows > 0 {
+		metrics().observe_storage_content_hash_admission(
+			tenant_id,
+			table_object_id,
+			"absorbed",
+			absorbed_rows,
+		);
+		metrics().observe_storage_content_hash_duplicate_absorption(
+			tenant_id,
+			table_object_id,
+			absorbed_rows,
+		);
+	}
+	if stored_rows > 0 {
+		metrics().observe_storage_content_hash_admission(
+			tenant_id,
+			table_object_id,
+			"stored",
+			stored_rows,
+		);
+	}
+}
+
 fn table_write_status_for_reject(code: PbcRejectCode) -> WriteStatus {
 	match code {
 		PbcRejectCode::PBC_REJECT_SCHEMA_STALE => WriteStatus::EPOCH_STALE,
@@ -10582,6 +10835,16 @@ fn bifurcate_table_write(
 		metrics().observe_pbc_locality_encode(encode_started.elapsed());
 	}
 	let admission = admission?;
+	bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)
+}
+
+fn bifurcate_table_write_with_admission(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let mut children = Vec::with_capacity(batch.num_rows());
 	let mut charged_bytes = 0_u64;
 	match &descriptor.record_layout_policy {
@@ -10642,6 +10905,36 @@ fn bifurcate_table_write(
 		charged_bytes,
 		record_count,
 		record_body_compression_policy: descriptor.record_body_compression_policy,
+	})
+}
+
+fn filter_record_batch_rows(
+	batch: &RecordBatch,
+	rows: &[usize],
+) -> Result<RecordBatch, TableWriteValidationError> {
+	let indices = rows
+		.iter()
+		.map(|row| {
+			u32::try_from(*row).map_err(|_| TableWriteValidationError {
+				code: PbcRejectCode::PBC_REJECT_BATCH_TOO_LARGE,
+				message: format!("row index {row} exceeds u32 take index width"),
+			})
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let indices = UInt32Array::from(indices);
+	let columns = batch
+		.columns()
+		.iter()
+		.map(|array| {
+			take(array.as_ref(), &indices, None).map_err(|err| TableWriteValidationError {
+				code: PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
+				message: format!("content-hash row filter failed: {err}"),
+			})
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	RecordBatch::try_new(batch.schema(), columns).map_err(|err| TableWriteValidationError {
+		code: PbcRejectCode::PBC_REJECT_COLUMN_TYPE_MISMATCH,
+		message: format!("content-hash filtered RecordBatch invalid: {err}"),
 	})
 }
 
@@ -10752,6 +11045,7 @@ mod tests {
 	use arrow::datatypes::{DataType, Field};
 	use std::io::{Read, Seek, SeekFrom};
 	use std::panic::AssertUnwindSafe;
+	use std::sync::atomic::{AtomicU64, Ordering};
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -10764,6 +11058,28 @@ mod tests {
 	impl PhysicalClock for FixedClock {
 		fn now_ms(&self) -> u64 {
 			self.now_ms
+		}
+	}
+
+	struct AdjustableClock {
+		now_ms: AtomicU64,
+	}
+
+	impl AdjustableClock {
+		fn new(now_ms: u64) -> Self {
+			Self {
+				now_ms: AtomicU64::new(now_ms),
+			}
+		}
+
+		fn set(&self, now_ms: u64) {
+			self.now_ms.store(now_ms, Ordering::SeqCst);
+		}
+	}
+
+	impl PhysicalClock for AdjustableClock {
+		fn now_ms(&self) -> u64 {
+			self.now_ms.load(Ordering::SeqCst)
 		}
 	}
 
@@ -10834,6 +11150,21 @@ mod tests {
 		.unwrap()
 	}
 
+	fn content_hash_table_descriptor() -> TableSchemaDescriptorV1 {
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x49; 16]),
+			3,
+			"analytics",
+			"content_events",
+			&typed_table_schema(),
+			RowIdentityPolicy::AppendOnlyContentHash,
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
 	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptorV1 {
 		TableSchemaDescriptorV1::new(
 			TableObjectId::new([id_byte; 16]),
@@ -10881,6 +11212,19 @@ mod tests {
 				_ => "gemini",
 			})
 			.collect();
+		RecordBatch::try_new(
+			Arc::new(typed_table_schema()),
+			vec![
+				Arc::new(Int64Array::from(ids)),
+				Arc::new(LargeStringArray::from(names)),
+			],
+		)
+		.unwrap()
+	}
+
+	fn typed_table_batch_with_names(rows: Vec<(i64, &str)>) -> RecordBatch {
+		let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let names = rows.iter().map(|(_, name)| *name).collect::<Vec<_>>();
 		RecordBatch::try_new(
 			Arc::new(typed_table_schema()),
 			vec![
@@ -13581,6 +13925,325 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.unwrap();
 		assert_eq!(ids.value(0), 7);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn content_hash_table_write_absorbs_visible_duplicate_content() {
+		let dir = bootstrap_tempdir("content-hash-table-write-duplicate");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			49,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = content_hash_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch(vec![7]);
+		let mut first_meta = typed_table_meta(&descriptor, batch.num_rows());
+		first_meta.parent_write_id.sequence_no = 490;
+		let admission = validate_table_write_request_batch(
+			&first_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			first_meta.client_hlc,
+		)
+		.unwrap();
+		let key_identity = admission.key_identities[0];
+		assert_eq!(admission.localities[0], Locality::from(key_identity));
+
+		let (first_resp, first_trailing) = node
+			.data_server
+			.table_write(first_meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(
+			first_resp.write.status,
+			WriteStatus::OK,
+			"got resp={first_resp:?}"
+		);
+		assert_eq!(first_resp.reject_code, PbcRejectCode::NONE.0);
+		assert!(first_trailing.is_none());
+		let first_location = node
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("content-hash row should be indexed by content-derived identity");
+		assert!(!first_location.is_tombstone);
+
+		let mut duplicate_meta = typed_table_meta(&descriptor, batch.num_rows());
+		duplicate_meta.parent_write_id.sequence_no = 491;
+		let (duplicate_resp, duplicate_trailing) = node
+			.data_server
+			.table_write(duplicate_meta, batch)
+			.await
+			.unwrap();
+		assert_eq!(
+			duplicate_resp.write.status,
+			WriteStatus::OK,
+			"visible duplicate content should be absorbed as idempotent success"
+		);
+		assert_eq!(duplicate_resp.reject_code, PbcRejectCode::NONE.0);
+		assert_eq!(duplicate_resp.write.log_index, 0);
+		assert!(duplicate_trailing.is_none());
+		assert_eq!(
+			node.slab.lookup(tenant(), key_identity),
+			Some(first_location),
+			"absorbed duplicate must not replace the visible row location"
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn content_hash_table_write_filters_duplicate_rows_within_batch() {
+		let dir = bootstrap_tempdir("content-hash-table-write-in-batch-duplicate");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			50,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = content_hash_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch_with_names(vec![(7, "codex"), (7, "codex")]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 492;
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		assert_eq!(admission.key_identities[0], admission.key_identities[1]);
+		let key_identity = admission.key_identities[0];
+
+		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+		assert_eq!(resp.reject_code, PbcRejectCode::NONE.0);
+		assert!(trailing.is_none());
+
+		let location = node
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("content-hash row should be indexed after filtering in-batch duplicate");
+		assert!(!location.is_tombstone);
+		let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
+		assert_eq!(
+			stored.num_rows(),
+			1,
+			"only one physical row should be packed for duplicate content within the same batch"
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn content_hash_table_reingest_after_logical_retention_floor_stores_new_row() {
+		let dir = bootstrap_tempdir("content-hash-logical-retention-reingest");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			51,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+
+		let descriptor = content_hash_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		node.raft
+			.client_write(WendelonRequest::SetTableRetentionPolicy(
+				crate::consensus::SetTableRetentionPolicy {
+					tenant_id: tenant(),
+					table_object_id: descriptor.table_object_id,
+					expected_policy_generation: PolicyGeneration::ZERO,
+					new_policy: TableRetentionPolicy::FixedWindow(
+						RetentionWindowMillis::try_new(60_000).unwrap(),
+					),
+					updated_at_hlc: hlc(1, 0, 51),
+				},
+			))
+			.await
+			.unwrap();
+
+		let clock = Arc::new(AdjustableClock::new(1_000));
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://51".into(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		let server = WendelonDataServer::new(
+			node.slab.clone(),
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			clock.clone(),
+			Arc::new(FixedReplicaRouter::new(vec![node.local_node])),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap();
+
+		let batch = typed_table_batch_with_names(vec![(7, "codex")]);
+		let mut first_meta = typed_table_meta(&descriptor, batch.num_rows());
+		first_meta.parent_write_id.sequence_no = 493;
+		let admission = validate_table_write_request_batch(
+			&first_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			first_meta.client_hlc,
+		)
+		.unwrap();
+		let key_identity = admission.key_identities[0];
+
+		let (first_resp, _) = server.table_write(first_meta, batch.clone()).await.unwrap();
+		assert_eq!(first_resp.write.status, WriteStatus::OK);
+		assert_ne!(
+			first_resp.write.log_index, 0,
+			"initial content-hash write must store a physical row"
+		);
+		let first_location = server
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("first content-hash row should be indexed");
+		assert!(!first_location.is_tombstone);
+
+		clock.set(121_000);
+		let state = server.state_machine.state_snapshot().await;
+		let effective_retention = server.table_effective_retention_from_state(
+			&state,
+			tenant(),
+			descriptor.table_object_id,
+		);
+		assert!(
+			!server
+				.slab
+				.row_currently_visible(tenant(), key_identity, &effective_retention),
+			"old row must be logically hidden before compaction removes the index entry"
+		);
+		assert_eq!(
+			server.slab.lookup(tenant(), key_identity),
+			Some(first_location),
+			"regression setup requires the expired row to remain physically indexed"
+		);
+
+		let mut reingest_meta = typed_table_meta(&descriptor, batch.num_rows());
+		reingest_meta.parent_write_id.sequence_no = 494;
+		let (reingest_resp, _) = server
+			.table_write(reingest_meta, batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(reingest_resp.write.status, WriteStatus::OK);
+		assert_ne!(
+			reingest_resp.write.log_index, 0,
+			"logically expired content must take the store path, not absorb"
+		);
+		let reingest_location = server
+			.slab
+			.lookup(tenant(), key_identity)
+			.expect("reingested content-hash row should be indexed");
+		assert_ne!(
+			reingest_location, first_location,
+			"reingest after logical retention must write a fresh physical row"
+		);
+		assert!(!reingest_location.is_tombstone);
+		assert!(reingest_location.hlc > first_location.hlc);
+
+		let mut duplicate_meta = typed_table_meta(&descriptor, batch.num_rows());
+		duplicate_meta.parent_write_id.sequence_no = 495;
+		let (duplicate_resp, _) = server.table_write(duplicate_meta, batch).await.unwrap();
+		assert_eq!(duplicate_resp.write.status, WriteStatus::OK);
+		assert_eq!(
+			duplicate_resp.write.log_index, 0,
+			"freshly visible reingested content should absorb subsequent duplicates"
+		);
+		assert_eq!(
+			server.slab.lookup(tenant(), key_identity),
+			Some(reingest_location)
+		);
 
 		node.handles.abort();
 	}

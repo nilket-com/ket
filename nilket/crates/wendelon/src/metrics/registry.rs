@@ -1,4 +1,4 @@
-use crate::schema::{RecordBodyCompressionPolicy, WriteStatus};
+use crate::schema::{RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,6 +230,82 @@ impl TableRetentionActiveTableGauges {
 		render_gauge_with_labels(out, name, &[("mode", "inherit")], self.inherit.get());
 		render_gauge_with_labels(out, name, &[("mode", "disabled")], self.disabled.get());
 		render_gauge_with_labels(out, name, &[("mode", "fixed")], self.fixed.get());
+	}
+}
+
+#[derive(Default)]
+struct ContentHashAdmissionCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
+
+impl ContentHashAdmissionCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, outcome: &str, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("content-hash admission counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				outcome.to_string(),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("content-hash admission counter mutex poisoned");
+		for ((tenant, table, outcome), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("outcome", outcome.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct ContentHashTableCounters(Mutex<BTreeMap<(u64, String), u64>>);
+
+impl ContentHashTableCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("content-hash table counter mutex poisoned");
+		*counters
+			.entry((tenant_id.get(), table_object_id_label(table_object_id)))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("content-hash table counter mutex poisoned");
+		for ((tenant, table), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("tenant", &tenant.to_string()), ("table", table.as_str())],
+				*value,
+			);
+		}
 	}
 }
 
@@ -1041,6 +1117,8 @@ pub struct MetricsRegistry {
 	pub storage_append_only_rows_written_total: Counter,
 	pub storage_append_only_intra_batch_index_exhaustion_total: Counter,
 	pub storage_append_only_supersession_metadata_skipped_total: Counter,
+	storage_content_hash_admissions: ContentHashAdmissionCounters,
+	storage_content_hash_duplicate_absorptions: ContentHashTableCounters,
 	storage_table_retention_policy_updates: TableRetentionPolicyCounters,
 	pub storage_table_retention_read_floor_rejects_total: Counter,
 	pub storage_table_retention_read_filtered_rows_total: Counter,
@@ -1216,6 +1294,8 @@ impl Default for MetricsRegistry {
 			storage_append_only_rows_written_total: Counter::default(),
 			storage_append_only_intra_batch_index_exhaustion_total: Counter::default(),
 			storage_append_only_supersession_metadata_skipped_total: Counter::default(),
+			storage_content_hash_admissions: ContentHashAdmissionCounters::default(),
+			storage_content_hash_duplicate_absorptions: ContentHashTableCounters::default(),
 			storage_table_retention_policy_updates: TableRetentionPolicyCounters::default(),
 			storage_table_retention_read_floor_rejects_total: Counter::default(),
 			storage_table_retention_read_filtered_rows_total: Counter::default(),
@@ -1461,6 +1541,27 @@ impl MetricsRegistry {
 	pub fn observe_storage_append_only_supersession_metadata_skipped(&self) {
 		self.storage_append_only_supersession_metadata_skipped_total
 			.inc();
+	}
+
+	pub fn observe_storage_content_hash_admission(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		outcome: &str,
+		rows: u64,
+	) {
+		self.storage_content_hash_admissions
+			.add(tenant_id, table_object_id, outcome, rows);
+	}
+
+	pub fn observe_storage_content_hash_duplicate_absorption(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		rows: u64,
+	) {
+		self.storage_content_hash_duplicate_absorptions
+			.add(tenant_id, table_object_id, rows);
 	}
 
 	pub fn observe_storage_table_retention_policy_update(
@@ -2265,6 +2366,16 @@ impl MetricsRegistry {
 			self.storage_append_only_supersession_metadata_skipped_total
 				.get(),
 		);
+		self.storage_content_hash_admissions.render(
+			&mut out,
+			"wendelon_storage_content_hash_admissions_total",
+			"Content-hash table rows admitted by outcome.",
+		);
+		self.storage_content_hash_duplicate_absorptions.render(
+			&mut out,
+			"wendelon_storage_content_hash_duplicate_absorptions_total",
+			"Content-hash table duplicate rows absorbed at admission.",
+		);
 		self.storage_table_retention_policy_updates.render(
 			&mut out,
 			"wendelon_storage_table_retention_policy_updates_total",
@@ -2755,6 +2866,14 @@ fn render_labels(labels: &[(&str, &str)]) -> String {
 			rendered.push(',');
 		}
 		let _ = write!(rendered, "{key}=\"{value}\"");
+	}
+	rendered
+}
+
+fn table_object_id_label(table_object_id: TableObjectId) -> String {
+	let mut rendered = String::with_capacity(32);
+	for byte in table_object_id.as_bytes() {
+		let _ = write!(rendered, "{byte:02x}");
 	}
 	rendered
 }

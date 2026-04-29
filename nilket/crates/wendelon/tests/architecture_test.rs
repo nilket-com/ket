@@ -881,12 +881,6 @@ fn test_adr046_state_digest_substrate_boundaries() {
 			return;
 		};
 
-		if content.contains("AppendOnlyContentHash") {
-			violations.push(format!(
-				"{}: content-hash identity is deferred and must not be pre-allocated",
-				relative.display()
-			));
-		}
 		if content.contains("NodeCapability::StateDigest")
 			|| content.contains("NodeCapability::Ecmh")
 			|| content.contains("NodeCapability::ECMH")
@@ -1035,6 +1029,147 @@ fn test_adr047_row_tombstone_boundaries() {
 	assert!(
 		violations.is_empty(),
 		"ADR 047 row-tombstone architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 049 architectural guards.
+///
+/// Content-hash row identity is now an accepted table identity
+/// policy, but its surface stays deliberately narrow: canonical
+/// logical Arrow values only, no raw IPC preimage, no schema
+/// generation/fingerprint in the row key, no new digest domain, and
+/// no version-suffixed Rust identity types.
+#[test]
+fn test_adr049_content_hash_identity_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema_source.contains("AppendOnlyContentHash") {
+		violations.push(
+			"src/schema/table.rs: missing RowIdentityPolicy::AppendOnlyContentHash".to_string(),
+		);
+	}
+	if !schema_source.contains("CONTENT_HASH_REJECTED_NON_NULL_DEFAULT")
+		|| !schema_source.contains("CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION")
+		|| !schema_source.contains("CONTENT_HASH_REJECTED_INVALID_UTF8")
+	{
+		violations.push(
+			"src/schema/table.rs: missing ADR 049 content-hash reject code surface".to_string(),
+		);
+	}
+	if !schema_source.contains("AppendOnlyContentHash rejects LocalityPolicyV1::ColumnProjection") {
+		violations.push(
+			"src/schema/table.rs: content-hash ColumnProjection rejection must stay explicit"
+				.to_string(),
+		);
+	}
+
+	let data_server_source =
+		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	if !data_server_source.contains("bifurcate_content_hash_table_write")
+		|| !data_server_source.contains("content_hash_admission_guard")
+		|| !data_server_source.contains("observe_storage_content_hash_duplicate_absorption")
+		|| !data_server_source.contains("row_currently_visible")
+	{
+		violations.push(
+			"src/network/data_server.rs: missing explicit ADR 049 duplicate absorption path"
+				.to_string(),
+		);
+	}
+	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	if !manager_source.contains("row_currently_visible")
+		|| !manager_source.contains("row_visible_under_retention")
+	{
+		violations.push(
+			"src/storage/manager.rs: ADR 049 visible-membership helper must include ADR 048 retention visibility"
+				.to_string(),
+		);
+	}
+
+	let content_hash_path = manifest_dir.join("src/storage/content_hash.rs");
+	let content_hash_source = fs::read_to_string(&content_hash_path).unwrap();
+	let production_content_hash = content_hash_source
+		.split("#[cfg(test)]")
+		.next()
+		.unwrap_or(&content_hash_source);
+	if !production_content_hash.contains("DOMAIN_CONTENT_HASH_ROW")
+		|| !production_content_hash.contains("b\"table.append-content-row.v1\"")
+	{
+		violations.push(
+			"src/storage/content_hash.rs: missing exact ADR 049 row identity domain".to_string(),
+		);
+	}
+	if !production_content_hash.contains("content_hash_row_key_id") {
+		violations.push("src/storage/content_hash.rs: missing content-hash key helper".to_string());
+	}
+	for needle in [
+		"arrow::ipc",
+		"StreamWriter",
+		"FileWriter",
+		"IpcWriteOptions",
+		"encode_arrow_schema_ipc",
+		"schema_generation",
+		"schema_fingerprint",
+	] {
+		if production_content_hash.contains(needle) {
+			violations.push(format!(
+				"src/storage/content_hash.rs: production encoder/preimage must not contain '{needle}'"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("AppendOnlyContentHash", "V1"),
+		concat!("AppendOnlyContentHash", "V2"),
+		concat!("ContentHashIdentity", "V1"),
+		concat!("ContentHashIdentity", "V2"),
+		concat!("digest.table.row.", "content.v1"),
+		concat!("Wendelon", "ContentHash"),
+		concat!("wendelon", "_content_hash"),
+		concat!("NodeCapability::", "ContentHash"),
+		concat!("ContentHash", "Capability"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 049 content-hash token '{}'",
+						path.display(),
+						needle
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 049 content-hash architectural invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

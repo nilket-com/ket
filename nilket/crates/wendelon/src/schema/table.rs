@@ -352,6 +352,9 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW: Self = Self(0x3A03);
 	pub const PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED: Self = Self(0x3A04);
 	pub const PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY: Self = Self(0x3B01);
+	pub const CONTENT_HASH_REJECTED_NON_NULL_DEFAULT: Self = Self(0x3C01);
+	pub const CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION: Self = Self(0x3C02);
+	pub const CONTENT_HASH_REJECTED_INVALID_UTF8: Self = Self(0x3C03);
 
 	pub const fn name(self) -> &'static str {
 		match self.0 {
@@ -393,6 +396,9 @@ impl PbcRejectCode {
 			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
 			0x3A04 => "PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED",
 			0x3B01 => "PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY",
+			0x3C01 => "CONTENT_HASH_REJECTED_NON_NULL_DEFAULT",
+			0x3C02 => "CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION",
+			0x3C03 => "CONTENT_HASH_REJECTED_INVALID_UTF8",
 			_ => "PBC_REJECT_UNKNOWN",
 		}
 	}
@@ -411,7 +417,7 @@ pub struct TableWriteValidationError {
 }
 
 impl TableWriteValidationError {
-	fn new(code: PbcRejectCode, message: impl Into<String>) -> Self {
+	pub(crate) fn new(code: PbcRejectCode, message: impl Into<String>) -> Self {
 		Self {
 			code,
 			message: message.into(),
@@ -630,6 +636,9 @@ pub fn validate_table_write_request_batch(
 		RowIdentityPolicy::PrimaryKey(_) => admit_primary_key_write(meta, batch, descriptor),
 		RowIdentityPolicy::AppendOnly => {
 			admit_append_only_write(meta, batch, descriptor, writer_node_id, row_hlc)
+		}
+		RowIdentityPolicy::AppendOnlyContentHash => {
+			crate::storage::content_hash::admit_content_hash_write(meta, batch, descriptor)
 		}
 	}
 }
@@ -948,6 +957,10 @@ impl TableSchemaDescriptorV1 {
 		self.row_identity_policy.is_append_only()
 	}
 
+	pub fn supports_row_tombstones(&self) -> bool {
+		self.row_identity_policy.supports_row_tombstones()
+	}
+
 	pub fn compute_schema_fingerprint(&self) -> std::io::Result<[u8; 32]> {
 		let mut canonical = self.clone();
 		canonical.schema_fingerprint = [0; 32];
@@ -1028,6 +1041,7 @@ pub enum PrimaryKeyEncodingV1 {
 pub enum RowIdentityPolicy {
 	PrimaryKey(PrimaryKeyDescriptorV1),
 	AppendOnly,
+	AppendOnlyContentHash,
 }
 
 impl RowIdentityPolicy {
@@ -1035,10 +1049,18 @@ impl RowIdentityPolicy {
 		matches!(self, Self::AppendOnly)
 	}
 
+	pub const fn is_content_hash(&self) -> bool {
+		matches!(self, Self::AppendOnlyContentHash)
+	}
+
+	pub const fn supports_row_tombstones(&self) -> bool {
+		matches!(self, Self::AppendOnly | Self::AppendOnlyContentHash)
+	}
+
 	pub const fn primary_key(&self) -> Option<&PrimaryKeyDescriptorV1> {
 		match self {
 			Self::PrimaryKey(descriptor) => Some(descriptor),
-			Self::AppendOnly => None,
+			Self::AppendOnly | Self::AppendOnlyContentHash => None,
 		}
 	}
 }
@@ -1527,6 +1549,19 @@ pub fn validate_table_schema_evolution(
 			));
 		}
 		if previous_field.data_type() != next_field.data_type() {
+			if previous.row_identity_policy.is_content_hash()
+				&& (is_decimal_type(previous_field.data_type())
+					|| is_decimal_type(next_field.data_type()))
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"{}: content-hash tables reject decimal precision / scale evolution for column {:?}",
+						PbcRejectCode::CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION.name(),
+						previous_field.name()
+					),
+				));
+			}
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(
@@ -1555,6 +1590,18 @@ pub fn validate_table_schema_evolution(
 		}
 	}
 	for field in next_fields.iter().skip(previous_fields.len()) {
+		if previous.row_identity_policy.is_content_hash()
+			&& (!field.is_nullable() || field_has_default(field.as_ref()))
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{}: content-hash tables reject additive column {:?} with a non-NULL default",
+					PbcRejectCode::CONTENT_HASH_REJECTED_NON_NULL_DEFAULT.name(),
+					field.name()
+				),
+			));
+		}
 		if !field.is_nullable() && !field_has_default(field.as_ref()) {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -1583,6 +1630,16 @@ fn field_has_default(field: &arrow::datatypes::Field) -> bool {
 	field
 		.metadata()
 		.contains_key(TABLE_FIELD_DEFAULT_METADATA_KEY)
+}
+
+fn is_decimal_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Decimal32(_, _)
+			| DataType::Decimal64(_, _)
+			| DataType::Decimal128(_, _)
+			| DataType::Decimal256(_, _)
+	)
 }
 
 pub fn encode_arrow_schema_ipc(schema: &Schema) -> std::io::Result<Vec<u8>> {
@@ -2022,6 +2079,9 @@ fn validate_row_identity_policy(
 	match policy {
 		RowIdentityPolicy::PrimaryKey(descriptor) => validate_primary_key(schema, descriptor),
 		RowIdentityPolicy::AppendOnly => validate_append_only(schema, record_layout_policy),
+		RowIdentityPolicy::AppendOnlyContentHash => {
+			validate_content_hash(schema, record_layout_policy)
+		}
 	}
 }
 
@@ -2062,23 +2122,32 @@ fn validate_append_only_locality_compatibility(
 	row_identity_policy: &RowIdentityPolicy,
 	locality_policy: &LocalityPolicyV1,
 ) -> std::io::Result<()> {
-	if !row_identity_policy.is_append_only() {
-		return Ok(());
-	}
-	match locality_policy {
-		LocalityPolicyV1::TableSpreadProjection(_) => Ok(()),
-		LocalityPolicyV1::IdentityProjection => Err(Error::new(
-			ErrorKind::InvalidData,
-			"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
-			 IdentityProjection cannot produce retry-stable routing under \
-			 HLC-derived append-only identity (ADR 045 §4a)",
-		)),
-		LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
-			ErrorKind::InvalidData,
-			"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
-			 ColumnProjection retry-stable semantics under HLC-derived identity \
-			 are deferred to a future ADR (ADR 045 §4a)",
-		)),
+	match row_identity_policy {
+		RowIdentityPolicy::AppendOnly => match locality_policy {
+			LocalityPolicyV1::TableSpreadProjection(_) => Ok(()),
+			LocalityPolicyV1::IdentityProjection => Err(Error::new(
+				ErrorKind::InvalidData,
+				"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+				 IdentityProjection cannot produce retry-stable routing under \
+				 HLC-derived append-only identity (ADR 045 §4a)",
+			)),
+			LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+				ErrorKind::InvalidData,
+				"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+				 ColumnProjection retry-stable semantics under HLC-derived identity \
+				 are deferred to a future ADR (ADR 045 §4a)",
+			)),
+		},
+		RowIdentityPolicy::AppendOnlyContentHash => match locality_policy {
+			LocalityPolicyV1::TableSpreadProjection(_) | LocalityPolicyV1::IdentityProjection => {
+				Ok(())
+			}
+			LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+				ErrorKind::InvalidData,
+				"AppendOnlyContentHash rejects LocalityPolicyV1::ColumnProjection",
+			)),
+		},
+		RowIdentityPolicy::PrimaryKey(_) => Ok(()),
 	}
 }
 
@@ -2095,6 +2164,19 @@ fn validate_append_only(
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"append-only tables require RecordLayoutPolicy::MultiRow",
+		));
+	}
+	Ok(())
+}
+
+fn validate_content_hash(
+	_schema: &Schema,
+	record_layout_policy: &RecordLayoutPolicy,
+) -> std::io::Result<()> {
+	if !record_layout_policy.is_multi_row() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"AppendOnlyContentHash tables require RecordLayoutPolicy::MultiRow",
 		));
 	}
 	Ok(())
@@ -5080,6 +5162,202 @@ mod tests {
 		let decoded = decode_table_schema_descriptor_v1(&bytes).unwrap();
 		assert_eq!(decoded, descriptor);
 		assert!(decoded.is_append_only());
+	}
+
+	// ============================================================
+	//  ADR 049 — CONTENT-HASH DESCRIPTOR TESTS
+	// ============================================================
+
+	fn content_hash_descriptor_with(
+		schema: &Schema,
+		locality: LocalityPolicyV1,
+		layout: RecordLayoutPolicy,
+		generation: u64,
+	) -> std::io::Result<TableSchemaDescriptorV1> {
+		TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([49; 16]),
+			generation,
+			"analytics",
+			"content_events",
+			schema,
+			RowIdentityPolicy::AppendOnlyContentHash,
+			locality,
+			layout,
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+	}
+
+	fn content_hash_descriptor(schema: &Schema, generation: u64) -> TableSchemaDescriptorV1 {
+		content_hash_descriptor_with(
+			schema,
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			generation,
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn content_hash_descriptor_accepts_identity_and_table_spread() {
+		let identity = content_hash_descriptor_with(
+			&append_only_user_schema(),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			1,
+		)
+		.expect("AppendOnlyContentHash + IdentityProjection must validate");
+		assert!(identity.row_identity_policy.is_content_hash());
+		assert!(identity.supports_row_tombstones());
+		assert!(identity.primary_key_descriptor().is_none());
+
+		let spread = content_hash_descriptor_with(
+			&append_only_user_schema(),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			1,
+		)
+		.expect("AppendOnlyContentHash + TableSpreadProjection must validate");
+		assert!(spread.row_identity_policy.is_content_hash());
+	}
+
+	#[test]
+	fn content_hash_descriptor_rejects_column_projection_and_singlerow() {
+		let projection = ColumnLocalityDescriptorV1 {
+			projection: ProjectionFunctionV1::RandomHash,
+			columns: vec![cluster_column("event_time", 32)],
+			spread_factor: 4,
+			prefix_bits: 16,
+		};
+		let err = content_hash_descriptor_with(
+			&append_only_user_schema(),
+			LocalityPolicyV1::ColumnProjection(projection),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			1,
+		)
+		.expect_err("AppendOnlyContentHash + ColumnProjection must reject");
+		assert!(
+			err.to_string().contains("ColumnProjection"),
+			"reject should name the forbidden locality policy: {err}"
+		);
+
+		let err = content_hash_descriptor_with(
+			&append_only_user_schema(),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::SingleRow,
+			1,
+		)
+		.expect_err("AppendOnlyContentHash + SingleRow must reject");
+		assert!(
+			err.to_string().contains("MultiRow"),
+			"reject should mention MultiRow requirement: {err}"
+		);
+	}
+
+	#[test]
+	fn content_hash_descriptor_fingerprint_differs_from_existing_identity_policies() {
+		let schema = append_only_user_schema();
+		let content_hash = content_hash_descriptor(&schema, 1);
+		let append_only = append_only_descriptor_with(
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+		)
+		.unwrap();
+		let pk = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([49; 16]),
+			1,
+			"analytics",
+			"content_events",
+			&Schema::new(vec![
+				Field::new("event_id", DataType::Int64, false),
+				Field::new(
+					"event_time",
+					DataType::Timestamp(TimeUnit::Millisecond, None),
+					false,
+				),
+			]),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("event_id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		assert_ne!(
+			content_hash.schema_fingerprint,
+			append_only.schema_fingerprint
+		);
+		assert_ne!(content_hash.schema_fingerprint, pk.schema_fingerprint);
+	}
+
+	#[test]
+	fn content_hash_evolution_allows_nullable_null_addition_only() {
+		let previous_schema = Schema::new(vec![Field::new("event_id", DataType::Int64, false)]);
+		let previous = content_hash_descriptor(&previous_schema, 1);
+
+		let nullable_next = content_hash_descriptor(
+			&Schema::new(vec![
+				Field::new("event_id", DataType::Int64, false),
+				Field::new("region", DataType::LargeUtf8, true),
+			]),
+			2,
+		);
+		validate_table_schema_evolution(&previous, &nullable_next).unwrap();
+
+		let nullable_default = content_hash_descriptor(
+			&Schema::new(vec![
+				Field::new("event_id", DataType::Int64, false),
+				Field::new("region", DataType::LargeUtf8, true).with_metadata(HashMap::from([(
+					TABLE_FIELD_DEFAULT_METADATA_KEY.to_owned(),
+					"US".to_owned(),
+				)])),
+			]),
+			2,
+		);
+		let err = validate_table_schema_evolution(&previous, &nullable_default).unwrap_err();
+		assert!(
+			err.to_string()
+				.contains(PbcRejectCode::CONTENT_HASH_REJECTED_NON_NULL_DEFAULT.name()),
+			"expected content-hash default reject code: {err}"
+		);
+
+		let non_null = content_hash_descriptor(
+			&Schema::new(vec![
+				Field::new("event_id", DataType::Int64, false),
+				Field::new("region", DataType::LargeUtf8, false),
+			]),
+			2,
+		);
+		let err = validate_table_schema_evolution(&previous, &non_null).unwrap_err();
+		assert!(
+			err.to_string()
+				.contains(PbcRejectCode::CONTENT_HASH_REJECTED_NON_NULL_DEFAULT.name()),
+			"expected content-hash non-null reject code: {err}"
+		);
+	}
+
+	#[test]
+	fn content_hash_evolution_rejects_decimal_precision_or_scale_changes() {
+		let previous = content_hash_descriptor(
+			&Schema::new(vec![Field::new(
+				"amount",
+				DataType::Decimal128(10, 2),
+				false,
+			)]),
+			1,
+		);
+		let next = content_hash_descriptor(
+			&Schema::new(vec![Field::new(
+				"amount",
+				DataType::Decimal128(10, 3),
+				false,
+			)]),
+			2,
+		);
+		let err = validate_table_schema_evolution(&previous, &next).unwrap_err();
+		assert!(
+			err.to_string()
+				.contains(PbcRejectCode::CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION.name()),
+			"expected content-hash decimal evolution reject code: {err}"
+		);
 	}
 
 	fn fixed_writer(byte: u8) -> WriterNodeId {

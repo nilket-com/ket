@@ -283,6 +283,8 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_storage_table_retention_ambiguous_rows_retained_total"));
 	assert!(body.contains("wendelon_storage_table_retention_lag_seconds"));
 	assert!(body.contains("wendelon_storage_table_retention_policy_active_tables_total"));
+	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
+	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
 	assert!(body.contains("wendelon_audit_materialization_lag_entries"));
 	assert!(body.contains("wendelon_audit_emit_total{authority=\"node_local\",outcome=\"ok\"}"));
 	assert!(body.contains("wendelon_group_commit_window_seconds_bucket"));

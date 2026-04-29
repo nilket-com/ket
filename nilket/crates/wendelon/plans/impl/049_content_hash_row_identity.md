@@ -11,7 +11,8 @@ Inherits lifecycle composition:
 `plans/adr/048_per_table_retention_policy.md`
 Bench reference: `plans/impl/046_state_digest_bench_results.md`,
 `plans/impl/047_row_tombstone_bench_results.md`,
-`plans/impl/048_table_retention_bench_results.md`.
+`plans/impl/048_table_retention_bench_results.md`,
+`plans/impl/049_content_hash_bench_results.md`.
 
 ## Goal
 
@@ -612,8 +613,8 @@ run):
 
 Bench results documented in
 `plans/impl/049_content_hash_bench_results.md`. Quick smoke
-is acceptable for code review; full 100k / 1M matrix is the
-ADR 049 promotion-to-shipped gate.
+is acceptable for code review; the 2026-04-29 full 100k / 1M
+matrix satisfies the ADR 049 promotion-to-shipped gate.
 
 ## Phase 7 — Architectural guards, metrics, audit, runbook
 

@@ -202,6 +202,21 @@ fn multiset_semantics_are_not_dedupe_semantics() {
 }
 
 #[test]
+fn retention_floor_reingest_algebra_leaves_one_visible_element() {
+	let tenant = TenantId::new(49);
+	let table = TableObjectId::new([0x49; 16]);
+	let row = row_key_id(49);
+	let element = visible_row_element(tenant, table, row);
+
+	let mut accumulator = StateDigestAccumulator::new();
+	accumulator.add_element(element);
+	accumulator.add_element(element);
+	apply_retention_eviction_to_visible_digest(&mut accumulator, tenant, table, row, false);
+
+	assert_eq!(digest_rows(tenant, table, &[row]), accumulator.finish());
+}
+
+#[test]
 fn domain_isolation_holds_for_identical_preimages() {
 	let tenant = TenantId::new(46);
 	let table = TableObjectId::new([0x46; 16]);

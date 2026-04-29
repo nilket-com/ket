@@ -38,7 +38,8 @@ entry equality.
   field.
 - No HRFT frame, node capability bit, or reject-code family.
 - No `__row_tombstone__` synthetic column.
-- No `AppendOnlyContentHash` identity policy variant.
+- No content-hash identity was allocated by ADR 046 itself; ADR 049
+  owns `AppendOnlyContentHash`.
 - No curve math in `src/network` or `src/storage`.
 
 The architecture test suite enforces these boundaries.

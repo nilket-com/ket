@@ -86,8 +86,9 @@ use crate::storage::stats::{
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
-	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, MvccRetentionPolicy, OpenFlags,
-	cluster_retention_floor, effective_table_retention, storage_row_table_object_id_at, write_file,
+	AsyncFileOps, BlockingFileOps, BlockingIoClass, EffectiveRetention, IoUringFileOps,
+	MvccRetentionPolicy, OpenFlags, cluster_retention_floor, effective_table_retention,
+	row_visible_under_retention, storage_row_table_object_id_at, write_file,
 };
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -2808,6 +2809,19 @@ impl SlabManager {
 		self.config.l2_column_fetch.enabled
 	}
 
+	pub(crate) fn row_currently_visible(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		effective_retention: &EffectiveRetention,
+	) -> bool {
+		self.lookup(tenant_id, key_identity)
+			.is_some_and(|location| {
+				!location.is_tombstone
+					&& row_visible_under_retention(location.hlc, effective_retention)
+			})
+	}
+
 	pub(crate) async fn read_projected_record(
 		&self,
 		location: RecordLocation,
@@ -4192,7 +4206,7 @@ impl SlabManager {
 				records[*idx].reclaim = false;
 				continue;
 			};
-			if !descriptor.row_identity_policy.is_append_only() {
+			if !descriptor.row_identity_policy.supports_row_tombstones() {
 				if let Some(floor) = global_floor {
 					records[*idx].reclaim = self.is_retention_prunable(
 						record.tenant_id,
@@ -5728,6 +5742,33 @@ fn descriptor_matches_tiered_row(
 		RowIdentityPolicy::AppendOnly => {
 			let _ = (tenant_id, key_identity, routing_locality);
 			Ok(stored_table_object_id == Some(descriptor.table_object_id))
+		}
+		RowIdentityPolicy::AppendOnlyContentHash => {
+			if stored_table_object_id != Some(descriptor.table_object_id) {
+				return Ok(false);
+			}
+			let mut table_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+			table_meta.tenant_id = tenant_id;
+			table_meta.table_object_id = descriptor.table_object_id;
+			table_meta.schema_generation = descriptor.schema_generation;
+			table_meta.row_count = 1;
+			let zero_hlc = HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			};
+			let admission = match validate_table_write_request_batch(
+				&table_meta,
+				batch,
+				descriptor,
+				WriterNodeId::ZERO,
+				zero_hlc,
+			) {
+				Ok(admission) => admission,
+				Err(_) => return Ok(false),
+			};
+			Ok(admission.key_identities.as_slice() == [key_identity]
+				&& admission.localities.as_slice() == [routing_locality])
 		}
 	}
 }

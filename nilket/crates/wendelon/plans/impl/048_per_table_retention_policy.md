@@ -897,8 +897,8 @@ run):
 
 Bench results documented in
 `plans/impl/048_table_retention_bench_results.md`. Quick
-smoke is acceptable for code review; full matrix is the
-ADR 048 promotion-to-shipped gate.
+smoke is acceptable for code review; the 2026-04-29 full 100k /
+1M matrix satisfies the ADR 048 promotion-to-shipped gate.
 
 ## Phase 8 — Metrics, audit, runbook, architectural guards
 

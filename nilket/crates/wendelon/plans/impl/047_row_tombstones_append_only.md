@@ -772,9 +772,9 @@ Files:
 - `plans/impl/047_row_tombstone_bench_results.md` (new,
   populated when the bench runs)
 
-Current code-review coverage is a quick smoke bench. The matrix
-below remains the promotion-to-shipped gate; the quick run alone
-does not satisfy the quantitative thresholds.
+The 2026-04-29 full-matrix run is documented in
+`plans/impl/047_row_tombstone_bench_results.md` and satisfies
+the ADR 047 promotion-to-shipped gate.
 
 Work:
 
@@ -831,18 +831,14 @@ Acceptance criteria before promotion:
 
 Bench results documented in
 `plans/impl/047_row_tombstone_bench_results.md`. Quick smoke
-results may be recorded for code review, but they are explicitly
-not evidence for the promotion thresholds above. If full-matrix
-acceptance criteria fail, council pauses promotion to "shipped"
-and revisits scan-path or admission shape.
+results may still be recorded for code review, but the shipped
+evidence is the 2026-04-29 full 100k / 1M matrix.
 
 Exit:
 
 - Quick smoke bench is runnable in CI / local review.
-- Full matrix bench results are documented before ADR 047 is
-  declared shipped.
-- ADR 047 promotion-to-shipped gate satisfied or council
-  notified.
+- Full matrix bench results are documented.
+- ADR 047 promotion-to-shipped gate satisfied.
 
 ## Phase 10 — Metrics, audit, runbook, architectural guards
 

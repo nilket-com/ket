@@ -36,7 +36,9 @@ auto-content-sensitive via the existing visible-row preimage;
 no new digest domain. See
 `plans/adr/049_content_hash_row_identity.md` and
 `plans/impl/049_content_hash_row_identity.md`. Implementation
-phases pending.
+is in place; the full 100k / 1M promotion bench matrix cleared
+on 2026-04-29 in
+`plans/impl/049_content_hash_bench_results.md`.
 
 ADR 048 (Per-Table Retention Policy) is the immediate
 predecessor — replicated `TableLifecycleCatalog` keyed by
@@ -59,13 +61,13 @@ the identity layer that ADR 049 complements with content-hash
 identity; `__row_table_object_id__` is the ownership resolver
 retention reclaim uses to look up the effective floor.
 
-The implementation chain through ADR 049 is mostly built but
-not fully bench-shipped. ADR 046 substrate cleared the cut-2
-promotion bench gate (see
+The implementation chain through ADR 049 is built and bench-
+shipped through the current lifecycle / identity stack. ADR 046
+substrate cleared the cut-2 promotion bench gate (see
 `plans/impl/046_state_digest_bench_results.md`). ADR 047,
-ADR 048, and ADR 049 have quick-smoke or pending bench
-artifacts; full 100k / 1M matrices remain the shipped-
-verification bar before each is declared shipped.
+ADR 048, and ADR 049 cleared their full 100k / 1M promotion
+matrices on 2026-04-29; see the corresponding bench-result
+files under `plans/impl/`.
 
 ## Prioritization philosophy
 
@@ -133,8 +135,8 @@ Gemini.
    exists); visible-domain `StateDigest` subtraction with no
    durable placement. First non-speculative validation of
    ADR 046 `subtract_element` against real storage state.
-   Implementation in place; full 100k / 1M bench matrix is the
-   remaining shipped-verification gate.
+   Implementation in place; full 100k / 1M bench matrix
+   cleared on 2026-04-29.
 
 3. **Per-table retention policy.** ADR 048 promoted — see
    `plans/adr/048_per_table_retention_policy.md` and
@@ -153,8 +155,7 @@ Gemini.
    (subtract on data eviction, add on tombstone eviction)
    — no new digest domain. PK-keyed table-specific
    retention deferred to roadmap #6. Implementation in
-   place; full 100k / 1M bench matrix is the remaining
-   shipped-verification gate.
+   place; full 100k / 1M bench matrix cleared on 2026-04-29.
 
 ### Topology gate (closed)
 
@@ -184,7 +185,8 @@ Gemini.
    keeping ADR 046 §5 visible-state semantics intact;
    `IdentityProjection` enabled, `ColumnProjection` deferred;
    non-NULL-default and decimal-scale-evolution rejected with
-   typed reject codes. Implementation phases pending.
+   typed reject codes. Implementation in place; full 100k /
+   1M bench matrix cleared on 2026-04-29.
 
 6. **PK-keyed row-delete via supersession.** Tombstone hides
    earlier versions of the same key under supersession
@@ -305,9 +307,9 @@ StateDigest substrate
 ```
 
 Design tip is past ADR 049 with content-hash identity
-*promoted* (design accepted; impl phases pending). Next ADR
-is PK-keyed row delete via supersession (#6); reuses the
-row-tombstone shape (ADR 047) layered with supersession
+*promoted* and bench-shipped through the ADR 049 implementation.
+Next ADR is PK-keyed row delete via supersession (#6); reuses
+the row-tombstone shape (ADR 047) layered with supersession
 discipline. ADR 046 substrate cleared its bench gate; ADR
-047 / 048 / 049 have quick-smoke or pending bench artifacts
-and need full matrices before declaring shipped.
+047 / 048 / 049 cleared full 100k / 1M promotion matrices on
+2026-04-29.
