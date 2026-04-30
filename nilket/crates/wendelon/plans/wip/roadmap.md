@@ -6,68 +6,90 @@ the tip moves: each ADR that ships shifts the chain by one.
 
 ## Where we are
 
-ADR 049 (Content-Hash Row Identity) just promoted. Adds
-`RowIdentityPolicy::AppendOnlyContentHash` — the third
-identity variant, deriving `__row_key_id__` from canonical
-row content rather than write context. Synchronous admission-
-time collapse via row-index lookup keeps ADR 046 §5 visible-
-state semantics intact: duplicate writes are absorbed
-idempotently with no `StateDigest` change; the absorb-vs-store
-distinction is over **current visible membership**, not "key
-ever existed," so re-ingestion after an ADR 047 tombstone or
-ADR 048 retention eviction takes the store path and reinstates
-the row. Sparse type-tagged canonical encoding over logical
-Arrow values (NFC strings, NaN / -0 normalized, decimals as
-precision + scale + unscaled-integer LE, dictionary arrays
-canonicalized by decoded values) makes additive nullable
-schema evolution identity-neutral. `column_tag` is a stable
-assigned column ID (preferred) or stable logical-name hash
-(fallback); physical ordinal rejected. Schema generation and
-descriptor fingerprint excluded from the identity preimage.
-V1 rejects non-NULL-default additive column-add with
-`CONTENT_HASH_REJECTED_NON_NULL_DEFAULT` and decimal precision
-/ scale evolution with `CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION`;
-operators wanting either case use `AppendOnly` or wait for a
-follow-up. `IdentityProjection` enabled (content-hash is the
-first append-only policy where retry-stable identity allows
-this); `ColumnProjection` deferred to a follow-up alongside
-secondary indexes (roadmap #8). Visible-domain `StateDigest`
-auto-content-sensitive via the existing visible-row preimage;
-no new digest domain. See
-`plans/adr/049_content_hash_row_identity.md` and
-`plans/impl/049_content_hash_row_identity.md`. Implementation
-is in place; the full 100k / 1M promotion bench matrix cleared
-on 2026-04-29 in
-`plans/impl/049_content_hash_bench_results.md`.
+ADR 050 (PK-Keyed Row Delete via Supersession) just promoted.
+First-class delete operation for `RowIdentityPolicy::PrimaryKey`
+tables: `TableDeleteRows` accepts PK descriptors and emits a
+tombstone version under the target's `__row_key_id__` when the
+key is currently visible at `delete_hlc`. Tombstones reuse
+ADR 047's `__row_tombstone__` synthetic column and tombstone-
+only multi-row record packing **layout-independently** —
+`SingleRow` PK tables emit multi-row tombstone-only frames so
+no fake user-column values pollute stats / PBC / aggregates.
+Supersession is emergent from HLC-ordered version chains:
+`latest-as-of-T(K) = argmax_v(v.hlc | v.hlc ≤ T)`, with
+tombstones as first-class versions. Resurrection is allowed —
+a later data write supersedes a tombstone and re-adds the
+visible-digest element. Synchronous admission-time visible-
+state branching across four outcomes
+(`InsertedNewVisible` / `UpsertedAlreadyVisible` /
+`DeletedSupersedingVisible` / `DeleteAbsorbedNotVisible`)
+keeps ADR 046 §5 visible-state semantics intact across both
+delete *and* the symmetric insert / upsert digest discipline
+(no `+element(K)` on upsert of an already-visible PK; no
+`-element(K)` on delete of a not-visible PK). The visibility
+predicate is identity-policy-aware via
+`row_visible_for_admission`: append-only / content-hash use
+ADR 049's retention-floor predicate; PK uses chain-prefix-
+retention semantics where below-floor boundary versions remain
+visible. CSB metadata composition extends to all admissible
+transitions including the new resurrection case (tombstone →
+data records `supersession_metadata` on the tombstone slab).
+Wire response classification triple
+(`deleted_count` / `already_deleted_count` / `not_found_count`)
+makes idempotent absorb operator-readable. PK retention stays
+on ADR 013 cluster-MVCC prefix retention with conservative
+boundary-tombstone preservation; ADR 048's
+`RETENTION_REJECTED_PK_DISALLOWED` gate remains in force, and
+no full-chain key retirement in V1 (cross-slab evidence proof
+deferred until secondary indexes #8 surface it).
+`PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed as
+unreachable; no new `PK_DELETE_REJECTED_*` family. No new
+on-disk surface, no new HRFT frame family, no new digest
+domain, no `format_version` bump. See
+`plans/adr/050_pk_delete_supersession.md` and
+`plans/impl/050_pk_delete_supersession.md`. Implementation
+phases pending.
 
-ADR 048 (Per-Table Retention Policy) is the immediate
-predecessor — replicated `TableLifecycleCatalog` keyed by
-`(tenant_id, table_object_id)`; three modes (`InheritCluster`
-/ `Disabled` / `FixedWindow`); two-phase enforcement (read-
-time logical filter plus hard `as_of < floor` reject;
-compaction-time physical eviction pinned to
-`compaction_start_hlc`); pair-GC composes with ADR 047 under
-the table floor. The topology gate was closed alongside
-ADR 048 with **Outcome B** (opaque `NodeId` retained;
-brainstorm 015 status header carries the closure). Splits to
-brainstorm 018 (FROST-WAL authority) and brainstorm 019
-(Sybil-resistance threat model).
+ADR 049 (Content-Hash Row Identity) is the immediate
+predecessor — `RowIdentityPolicy::AppendOnlyContentHash`
+deriving `__row_key_id__` from canonical row content, with
+synchronous admission-time collapse and the `row_currently_visible`
+helper that ADR 050 generalizes to `row_visible_for_admission`.
+Sparse type-tagged canonical encoding makes additive nullable
+schema evolution identity-neutral; non-NULL-default and
+decimal-scale-evolution rejected with typed reject codes;
+`IdentityProjection` enabled, `ColumnProjection` deferred. Full
+100k / 1M promotion bench matrix cleared on 2026-04-29.
+
+ADR 048 (Per-Table Retention Policy) — replicated
+`TableLifecycleCatalog`; three modes (`InheritCluster` /
+`Disabled` / `FixedWindow`); two-phase enforcement (read-time
+logical filter plus hard `as_of < floor` reject; compaction-
+time physical eviction). PK-table retention deferral remains
+live (ADR 050 honored; not lifted). The topology gate was
+closed alongside ADR 048 with **Outcome B** (opaque `NodeId`
+retained); splits to brainstorm 018 (FROST-WAL authority) and
+brainstorm 019 (Sybil-resistance threat model).
 
 ADR 047 (Row-Level Tombstones on Append-Only Tables) is the
-lifecycle algebra ADR 048 composes against (pair-GC under
-the table floor). ADR 046 (`StateDigest` substrate) supplies
-the algebra. ADR 045 (PK-Less Append-Only Tables) supplies
-the identity layer that ADR 049 complements with content-hash
-identity; `__row_table_object_id__` is the ownership resolver
-retention reclaim uses to look up the effective floor.
+tombstone shape ADR 050 reuses on the PK chain. ADR 046
+(`StateDigest` substrate) supplies the algebra. ADR 045 (PK-
+Less Append-Only Tables) supplies the identity layer ADR 049
+complements with content-hash identity and ADR 050 complements
+with delete semantics; `__row_table_object_id__` is the
+ownership resolver retention reclaim uses to look up the
+effective floor. ADR 042 supplies `supersession_metadata`,
+which ADR 050 §7 composes against for the resurrection case.
 
 The implementation chain through ADR 049 is built and bench-
-shipped through the current lifecycle / identity stack. ADR 046
-substrate cleared the cut-2 promotion bench gate (see
-`plans/impl/046_state_digest_bench_results.md`). ADR 047,
-ADR 048, and ADR 049 cleared their full 100k / 1M promotion
-matrices on 2026-04-29; see the corresponding bench-result
-files under `plans/impl/`.
+shipped. ADR 046 substrate cleared the cut-2 promotion bench
+gate (see `plans/impl/046_state_digest_bench_results.md`).
+ADR 047, ADR 048, and ADR 049 cleared their full 100k / 1M
+promotion matrices on 2026-04-29; see the corresponding
+bench-result files under `plans/impl/`. ADR 050 design is
+accepted; implementation phases (Phase 0 contract freeze
+through Phase 9 metrics / runbook / arch guards) and full
+100k / 1M bench matrix remain ahead.
 
 ## Prioritization philosophy
 
@@ -154,8 +176,11 @@ Gemini.
    retains. Visible-domain `StateDigest` reversal
    (subtract on data eviction, add on tombstone eviction)
    — no new digest domain. PK-keyed table-specific
-   retention deferred to roadmap #6. Implementation in
-   place; full 100k / 1M bench matrix cleared on 2026-04-29.
+   retention remains deferred (ADR 050 explicitly kept
+   `RETENTION_REJECTED_PK_DISALLOWED` in force; lift is a
+   follow-up after ADR 050 alongside the full-chain
+   key-retirement proof). Implementation in place; full 100k /
+   1M bench matrix cleared on 2026-04-29.
 
 ### Topology gate (closed)
 
@@ -188,10 +213,26 @@ Gemini.
    typed reject codes. Implementation in place; full 100k /
    1M bench matrix cleared on 2026-04-29.
 
-6. **PK-keyed row-delete via supersession.** Tombstone hides
-   earlier versions of the same key under supersession
-   discipline. Reuses the row-tombstone shape but layers
-   supersession on top. *3–4 iterations.*
+6. **PK-keyed row-delete via supersession.** ADR 050 promoted —
+   see `plans/adr/050_pk_delete_supersession.md` and
+   `plans/impl/050_pk_delete_supersession.md`. PK delete reuses
+   `TableDeleteRows` (engine boundary identity-based);
+   tombstones reuse ADR 047 `__row_tombstone__` and multi-row
+   tombstone-only record packing layout-independently;
+   supersession via HLC-ordered version chain (no new index
+   structure); synchronous admission-time visible-state
+   branching for both delete and insert / upsert; policy-aware
+   `row_visible_for_admission` (PK boundary versions remain
+   visible at admission; append-only / content-hash retention
+   semantics from ADR 049 preserved); CSB metadata composition
+   for the resurrection case (tombstone → data records
+   supersession on tombstone slab); PK retention stays on ADR
+   013 cluster-MVCC prefix retention (ADR 048 PK gate remains
+   in force); no full-chain key retirement in V1; conservative
+   boundary-tombstone preservation; classification count
+   triple on the wire response;
+   `PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed.
+   Implementation phases pending.
 
 7. **Logical / physical descriptor fingerprint split.** Splits
    logical schema identity from physical descriptor shape
@@ -295,8 +336,8 @@ StateDigest substrate
   → retention (validate algebra @ compaction)
   → topology gate CLOSED — Outcome B (opaque NodeId)
   → content-hash identity (ADR 049)
-  → PK-keyed row delete (next: roadmap #6)
-  → descriptor fingerprint split
+  → PK-keyed row delete via supersession (ADR 050)
+  → descriptor fingerprint split (next: roadmap #7)
   → secondary indexes
   → wire-frame compression
   → CDC
@@ -306,10 +347,12 @@ StateDigest substrate
   → refinement plumbing
 ```
 
-Design tip is past ADR 049 with content-hash identity
-*promoted* and bench-shipped through the ADR 049 implementation.
-Next ADR is PK-keyed row delete via supersession (#6); reuses
-the row-tombstone shape (ADR 047) layered with supersession
-discipline. ADR 046 substrate cleared its bench gate; ADR
-047 / 048 / 049 cleared full 100k / 1M promotion matrices on
-2026-04-29.
+Design tip is past ADR 050 with PK delete via supersession
+*promoted* (design accepted; implementation phases pending).
+Next ADR is the logical / physical descriptor fingerprint
+split (#7), which inherits a settled PK-delete supersession
+story from ADR 050. ADR 046 substrate cleared its bench gate;
+ADR 047 / 048 / 049 cleared full 100k / 1M promotion matrices
+on 2026-04-29; ADR 050 implementation phases (Phase 0
+contract freeze through Phase 9 metrics / runbook / arch
+guards) and full 100k / 1M bench matrix remain ahead.
