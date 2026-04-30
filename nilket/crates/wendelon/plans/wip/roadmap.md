@@ -19,8 +19,99 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 052 (Secondary Indexes on Non-Clustering Columns) just
+promoted. First non-`__row_key_id__` access path on the
+table: a non-unique ordered scalar index over one user
+column on PK / append-only / content-hash tables. Index
+descriptors live in a replicated `SecondaryIndexCatalog`
+outside `TableSchemaDescriptorV1`; create / drop reuses
+`SchemaUpdateEnvelopeV1` with `SchemaObjectKind::Index` and
+**four `mutation` variants** — `Create` / `Drop` (operator-
+initiated) plus `IndexBackfillComplete` /
+`IndexDropGcComplete` (replica-initiated, lifecycle-
+advancing). Catalog rows carry
+`SecondaryIndexState ∈ {Building, Ready, Dropping}` with a
+linear `absent → Building → Ready → Dropping → absent`
+lifecycle; planner gates on `Ready` only, `Building` and
+`Dropping` route through fingerprint mismatch. Index entries
+bind to ADR 051's `LogicalSchemaFingerprint` so physical
+retunes leave sidecars valid; logical mutations require drop
++ create with a new `IndexObjectId`. Index segments are
+immutable per-source-slab sidecars keyed by
+`(tenant, table, index, logical_fingerprint, source_slab_id)`
+— `slab_id` lives once in the sidecar header. Sort key
+`(encoded_key, row_key_id, row_hlc, record_location,
+record_row_index)` with `record_row_index` widened to `u32`
+(resolves roadmap #14 implicitly). Per-segment `StateDigest`
+consumes the reserved `digest.secondary_index.entry.v1`
+domain (ADR 046) over **logical version-entries**, not
+visible-membership — every data-row write contributes
+exactly one element, including unchanged-value PK upserts,
+so the index has a direct locator to the latest payload.
+Lazy supersession: tombstones emit no entry; every candidate
+is revalidated through six steps — segment fingerprint
+match, row fetch, row-metadata `(row_key_id, row_hlc)`
+equality, `lookup_as_of`, indexed-value recheck (re-encode
+the fetched row's indexed value and compare to the entry's
+`encoded_key`), and full PBC recheck. NULL excluded from V1
+(no sidecar entry; `IS NULL` routes to scan; future variant
+ADR may admit NULL via sentinel encoding when a consumer
+demands it). Backfill is async per-replica and iterates
+**every retained non-tombstone data version** in each source
+slab — not `lookup_as_of(now)` winners — so `as_of_hlc`
+queries reaching a covered slab find the version-entry
+visible at the requested time. The backfill worker acquires
+a read-lease on each source slab to coordinate against
+compaction; on contention compaction wins and backfill
+aborts cleanly. Active-slab admission appends to an in-
+memory buffer bounded by `max_index_buffer_bytes`; on
+overflow the buffer is dropped and the slab is marked
+uncovered without rolling back the data write. Compaction
+rebuilds sidecars for **`Building` and `Ready` indexes
+alike** from survivor data rows on source-slab compaction,
+healing uncovered slabs (and closing the backfill /
+compaction lease race) on the natural compaction cadence
+without retry loops. Two-phase replicated drop GC requires
+**every replica** to confirm local L1/L2 reclaim via its own
+`IndexDropGcComplete` mutation before the catalog row goes
+absent — partial confirmation leaves the row in `Dropping`
+so slow or partitioned replicas do not strand sidecar bytes
+behind a retired descriptor. Reject taxonomy partitioned
+across two namespaces: four lookup / descriptor-validation
+`INDEX_REJECT_*` codes
+(`LOGICAL_FINGERPRINT_MISMATCH`,
+`UNSUPPORTED_COLUMN_TYPE`, `PK_COLUMN`, `SYNTHETIC_COLUMN`)
+plus a separate schema-mutation-layer
+`SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED` for the
+rejected `Alter` mutation — different call-paths, different
+operator audiences. Internal typed lookup executor
+`TableLookupByIndexRequest` with
+`IndexQuery::{PointEqual, Range, InList}`; planner does
+predicate extraction with hybrid fallback over `Ready`-state
+indexes; cost-based optimizer deferred. PK column rejected
+at descriptor validation; `__row_*__` synthetic columns
+rejected; ADR 048's `RETENTION_REJECTED_PK_DISALLOWED`
+remains in force. No table `schema_generation` bump on
+index create / drop; no new HRFT frame family; no new
+digest domain beyond the ADR-046-reserved
+`digest.secondary_index.entry.v1`; no bump on any existing
+`format_version` (the new sidecar header carries its own
+field on a fresh artifact family). Identity-vs-Locality
+framing inherited from `plans/philosophy.md`: V1 sidecars
+preserve the row's existing single locality; range-sharded
+ring projection (a true second locality on indexed value)
+deferred to a future ADR. Visible-membership digest
+deferred to a follow-up consumer if anti-entropy or unique-
+constraint enforcement demands it; ADR 052 ships the
+version-entry digest only. See
+`plans/adr/052_secondary_indexes.md` and
+`plans/impl/052_secondary_indexes.md`. Implementation
+phases pending.
+
 ADR 051 (Logical / Physical Descriptor Fingerprint Split)
-just promoted. `TableSchemaDescriptorV1::schema_fingerprint:
+is the immediate predecessor and the binding ADR 052
+inherits.
+`TableSchemaDescriptorV1::schema_fingerprint:
 [u8; 32]` is replaced by two newtyped fingerprints —
 `LogicalSchemaFingerprint` (over `(table_object_id,
 namespace, table_name, arrow_schema_ipc,
@@ -79,8 +170,10 @@ new digest domain beyond the two listed, no
 `plans/impl/051_descriptor_fingerprint_split.md`.
 Implementation phases pending.
 
-ADR 050 (PK-Keyed Row Delete via Supersession) is the
-immediate predecessor. First-class delete operation for
+ADR 050 (PK-Keyed Row Delete via Supersession) — the
+row-axis tombstone and supersession discipline ADR 052
+revalidation step 4 trusts. First-class delete operation
+for
 `RowIdentityPolicy::PrimaryKey` tables: `TableDeleteRows`
 accepts PK descriptors and emits a tombstone version under
 the target's `__row_key_id__` when the key is currently
@@ -341,12 +434,68 @@ Gemini.
 
 ### Access patterns
 
-8. **Secondary indexes on non-clustering columns.** Index-entry
-   triple `(slab_id, record_location, record_row_index)`.
-   Index segments carry `StateDigest` from day one — replica
-   reconciliation is O(1) point comparison. The ADR
-   distinguishes physical locator entries from logical index
-   membership. *5–7 iterations.*
+8. **Secondary indexes on non-clustering columns.** ADR 052
+   promoted — see `plans/adr/052_secondary_indexes.md` and
+   `plans/impl/052_secondary_indexes.md`. Single-column
+   ordered scalar indexes over non-PK non-synthetic columns
+   on PK / append-only / content-hash tables. Replicated
+   `SecondaryIndexCatalog` outside `TableSchemaDescriptorV1`;
+   create / drop reuses `SchemaUpdateEnvelopeV1` with
+   `SchemaObjectKind::Index` and four `mutation` variants
+   (`Create`, `Drop`, `IndexBackfillComplete`,
+   `IndexDropGcComplete`); catalog rows carry
+   `SecondaryIndexState ∈ {Building, Ready, Dropping}` with
+   linear lifecycle and `Ready`-only planner gating. Index
+   entries bind to ADR 051's `LogicalSchemaFingerprint` and
+   sit in immutable per-source-slab sidecars
+   `(tenant, table, index, logical_fingerprint, source_slab_id)`
+   with sort key
+   `(encoded_key, row_key_id, row_hlc, record_location,
+   record_row_index)` and `record_row_index` widened to
+   `u32`. Per-segment `StateDigest` consumes the reserved
+   `digest.secondary_index.entry.v1` domain (ADR 046) over
+   **logical version-entries** — every data-row write
+   contributes one element including unchanged-value PK
+   upserts so the index has a direct locator to the latest
+   payload; visible-membership digest deferred. Lazy
+   supersession with mandatory six-step candidate
+   revalidation (segment fingerprint match, row fetch, row-
+   metadata equality, `lookup_as_of`, indexed-value recheck,
+   PBC recheck). NULL excluded in V1 (`IS NULL` routes to
+   scan; future variant ADR may admit NULL via sentinel
+   encoding). Async per-replica backfill iterates every
+   retained non-tombstone data version (not `lookup_as_of(now)`
+   winners) so as-of queries on covered slabs find the
+   version visible at the requested time; backfill takes a
+   read-lease on each source slab and aborts cleanly on
+   compaction contention. Active-slab buffer bounded by
+   `max_index_buffer_bytes` — overflow drops the buffer and
+   marks the slab uncovered without rolling back the data
+   write. Compaction rebuilds sidecars for `Building` and
+   `Ready` indexes alike from survivor data rows, healing
+   uncovered slabs and closing the backfill / compaction
+   lease race on the natural compaction cadence. Two-phase
+   replicated drop GC requires every replica to confirm
+   local L1/L2 reclaim via `IndexDropGcComplete` before the
+   catalog row goes absent. Reject taxonomy partitioned
+   across two namespaces: four lookup-time `INDEX_REJECT_*`
+   codes plus a separate
+   `SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED` for the
+   rejected `Alter` mutation. Internal
+   `TableLookupByIndexRequest` / `IndexQuery` lookup
+   executor with `PointEqual` / `Range` / `InList`; minimal
+   planner integration with hybrid fallback over uncovered
+   slabs; cost-based optimizer deferred. ADR 048's
+   `RETENTION_REJECTED_PK_DISALLOWED` remains in force. No
+   table `schema_generation` bump on index create / drop;
+   no new HRFT frame family; no new digest domain; no bump
+   on any existing `format_version` (the new sidecar header
+   carries its own on a fresh artifact family).
+   `record_row_index` widening resolves roadmap #14
+   implicitly. Implementation phases (Phase 0 contract
+   freeze through Phase 10 architectural guards / metrics /
+   audit / runbook) and full 100k / 1M bench matrix remain
+   ahead.
 
 9. **Wire-frame compression (transport-side IPC).** Lands
    before CDC so streaming surfaces inherit transport-side
@@ -438,8 +587,8 @@ StateDigest substrate
   → content-hash identity (ADR 049)
   → PK-keyed row delete via supersession (ADR 050)
   → descriptor fingerprint split (ADR 051)
-  → secondary indexes (next: roadmap #8)
-  → wire-frame compression
+  → secondary indexes (ADR 052)
+  → wire-frame compression (next: roadmap #9)
   → CDC
   → LSM
   → vector embeddings
@@ -447,16 +596,18 @@ StateDigest substrate
   → refinement plumbing
 ```
 
-Design tip is past ADR 051 with the logical / physical
-descriptor fingerprint split *promoted* (design accepted;
-implementation phases pending). Next ADR is secondary
-indexes on non-clustering columns (#8), which inherits a
-settled fingerprint shape from ADR 051: index entries bind
-to logical fingerprint and survive physical retunes. ADR
-046 substrate cleared its bench gate; ADR 047 / 048 / 049
-cleared full 100k / 1M promotion matrices on 2026-04-29;
-ADR 050 implementation is in place with the full 100k / 1M
-bench matrix still ahead; ADR 051 implementation phases
-(Phase 0 contract freeze through Phase 8 metrics / runbook
-/ arch guards) and full 100k / 1M bench matrix remain
-ahead.
+Design tip is past ADR 052 with secondary indexes on non-
+clustering columns *promoted* (design accepted;
+implementation phases pending). Next ADR is wire-frame
+compression (#9), which lands before CDC so streaming
+surfaces inherit transport-side compression instead of
+inventing a stream-local contract. ADR 046 substrate
+cleared its bench gate; ADR 047 / 048 / 049 cleared full
+100k / 1M promotion matrices on 2026-04-29; ADR 050
+implementation is in place with the full 100k / 1M bench
+matrix still ahead; ADR 051 implementation phases (Phase 0
+contract freeze through Phase 8 metrics / runbook / arch
+guards) and full 100k / 1M bench matrix remain ahead;
+ADR 052 implementation phases (Phase 0 contract freeze
+through Phase 10 architectural guards / metrics / audit /
+runbook) and full 100k / 1M bench matrix remain ahead.
