@@ -1,65 +1,135 @@
 # Wendelon Roadmap
 
 The forward sequence. Stable path (`plans/wip/roadmap.md`) —
-git holds the archeology, this file looks forward. Updated when
-the tip moves: each ADR that ships shifts the chain by one.
+git holds the archeology, this file looks forward.
+
+**Update cadence.** The roadmap is rewritten at planning
+sessions, not at implementation commits. The council operates on
+a block-chain rhythm: plan → implement → plan → implement, and
+this file is a snapshot of the most recent plan. Between
+sessions the roadmap lags the code on purpose — an item can read
+"implementation phases pending" while the implementation is
+already merged on `main`, or "full 100k / 1M bench matrix
+remains ahead" while a smoke run has already landed. That is
+expected, not a discrepancy. Don't open a session by flagging
+the gap as if it were news; check `git log` and the relevant
+impl plan / bench-results file for actual status, and roll
+roadmap edits into the next planning session along with the
+forward-sequence rewrite.
 
 ## Where we are
 
-ADR 050 (PK-Keyed Row Delete via Supersession) just promoted.
-First-class delete operation for `RowIdentityPolicy::PrimaryKey`
-tables: `TableDeleteRows` accepts PK descriptors and emits a
-tombstone version under the target's `__row_key_id__` when the
-key is currently visible at `delete_hlc`. Tombstones reuse
-ADR 047's `__row_tombstone__` synthetic column and tombstone-
-only multi-row record packing **layout-independently** —
-`SingleRow` PK tables emit multi-row tombstone-only frames so
-no fake user-column values pollute stats / PBC / aggregates.
-Supersession is emergent from HLC-ordered version chains:
-`latest-as-of-T(K) = argmax_v(v.hlc | v.hlc ≤ T)`, with
-tombstones as first-class versions. Resurrection is allowed —
-a later data write supersedes a tombstone and re-adds the
-visible-digest element. Synchronous admission-time visible-
-state branching across four outcomes
-(`InsertedNewVisible` / `UpsertedAlreadyVisible` /
-`DeletedSupersedingVisible` / `DeleteAbsorbedNotVisible`)
-keeps ADR 046 §5 visible-state semantics intact across both
-delete *and* the symmetric insert / upsert digest discipline
-(no `+element(K)` on upsert of an already-visible PK; no
-`-element(K)` on delete of a not-visible PK). The visibility
-predicate is identity-policy-aware via
-`row_visible_for_admission`: append-only / content-hash use
-ADR 049's retention-floor predicate; PK uses chain-prefix-
-retention semantics where below-floor boundary versions remain
-visible. CSB metadata composition extends to all admissible
-transitions including the new resurrection case (tombstone →
-data records `supersession_metadata` on the tombstone slab).
-Wire response classification triple
-(`deleted_count` / `already_deleted_count` / `not_found_count`)
-makes idempotent absorb operator-readable. PK retention stays
-on ADR 013 cluster-MVCC prefix retention with conservative
-boundary-tombstone preservation; ADR 048's
-`RETENTION_REJECTED_PK_DISALLOWED` gate remains in force, and
-no full-chain key retirement in V1 (cross-slab evidence proof
-deferred until secondary indexes #8 surface it).
-`PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed as
-unreachable; no new `PK_DELETE_REJECTED_*` family. No new
-on-disk surface, no new HRFT frame family, no new digest
-domain, no `format_version` bump. See
-`plans/adr/050_pk_delete_supersession.md` and
-`plans/impl/050_pk_delete_supersession.md`. Implementation
-phases pending.
+ADR 051 (Logical / Physical Descriptor Fingerprint Split)
+just promoted. `TableSchemaDescriptorV1::schema_fingerprint:
+[u8; 32]` is replaced by two newtyped fingerprints —
+`LogicalSchemaFingerprint` (over `(table_object_id,
+namespace, table_name, arrow_schema_ipc,
+row_identity_policy, evolution_policy)`) and
+`PhysicalDescriptorFingerprint` (binds the logical
+fingerprint plus locality / layout / compression / stats
+policy). Domain-tagged BLAKE3 preimages
+(`digest.table.schema.logical.v1`,
+`digest.table.descriptor.physical.v1`); physical preimage
+**stacks** by embedding the logical fingerprint as its first
+byte-string so logical mismatch implies physical mismatch by
+construction (load-bearing for future LSM segment merge
+under additive evolution). `tenant_id`, `contract_version`,
+`schema_generation`, and lifecycle policy state excluded
+from both preimages. Consumer routing: every existing
+fingerprint comparison site (aggregate idempotency,
+aggregate wire envelope, CSB header, CSB compaction
+eligibility, columnar directory) → **logical**; in-memory
+planning caches (layout / compression / stats-builder /
+scan-range) → **physical**; future LSM segment merge
+eligibility → **physical**; future CDC cursor and
+secondary index entries → **logical**. CSB merge / direct-
+answer paths additionally validate parsed payload coverage
+(column ordinal, Arrow stats type tag, `stat_flags`,
+optional payload presence for bloom / HLL / small-set /
+min / max) after descriptor-level logical match — a
+stats-policy retune does not become a descriptor-wide
+physical mismatch; older CSBs remain usable for facts they
+carry, and operations needing absent optional coverage
+fall through to row-level. CSB header on-disk slot is
+reinterpreted as logical fingerprint bytes (slot byte-
+layout unchanged; pre-launch one-time cliff for pre-ADR-
+051 CSBs falls through to row-level until compaction
+rewrites). `PBC_REJECT_STATS_FINGERPRINT_MISMATCH` renamed
+to `PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH`. Tiered
+stats cache keys use logical fingerprint plus existing
+slab locator fields (`stats_format_version`,
+`stats_block_len`, `stats_block_hash128`) so descriptor
+physical retunes do not evict parsed CSBs whose bytes are
+unchanged. `schema_generation` orthogonal and unchanged
+(no `physical_generation`); aggregate cache key keeps
+`(tenant_id, table_object_id, schema_generation,
+logical_schema_fingerprint)`. Identity-vs-Locality framing
+maps onto the split — logical is identity (what a row IS),
+physical is locality (where / how it lives). Identification
+fields are inside identity (catch tampering at validate);
+`tenant_id` sits above the descriptor at the catalog-
+instance layer. Content-hash row identity (ADR 049) and PK
+delete admission (ADR 050) preimages stay fingerprint-free
+(Phase 5 regression audit). No new non-fingerprint
+descriptor fields (the single fingerprint slot is split
+into two newtyped fields), no new HRFT frame family, no
+new digest domain beyond the two listed, no
+`format_version` bump. See
+`plans/adr/051_descriptor_fingerprint_split.md` and
+`plans/impl/051_descriptor_fingerprint_split.md`.
+Implementation phases pending.
 
-ADR 049 (Content-Hash Row Identity) is the immediate
-predecessor — `RowIdentityPolicy::AppendOnlyContentHash`
-deriving `__row_key_id__` from canonical row content, with
-synchronous admission-time collapse and the `row_currently_visible`
-helper that ADR 050 generalizes to `row_visible_for_admission`.
-Sparse type-tagged canonical encoding makes additive nullable
-schema evolution identity-neutral; non-NULL-default and
-decimal-scale-evolution rejected with typed reject codes;
-`IdentityProjection` enabled, `ColumnProjection` deferred. Full
-100k / 1M promotion bench matrix cleared on 2026-04-29.
+ADR 050 (PK-Keyed Row Delete via Supersession) is the
+immediate predecessor. First-class delete operation for
+`RowIdentityPolicy::PrimaryKey` tables: `TableDeleteRows`
+accepts PK descriptors and emits a tombstone version under
+the target's `__row_key_id__` when the key is currently
+visible at `delete_hlc`. Tombstones reuse ADR 047's
+`__row_tombstone__` synthetic column and tombstone-only
+multi-row record packing **layout-independently** —
+`SingleRow` PK tables emit multi-row tombstone-only frames
+so no fake user-column values pollute stats / PBC /
+aggregates. Supersession is emergent from HLC-ordered
+version chains: `latest-as-of-T(K) = argmax_v(v.hlc | v.hlc
+≤ T)`, with tombstones as first-class versions.
+Resurrection is allowed — a later data write supersedes a
+tombstone and re-adds the visible-digest element.
+Synchronous admission-time visible-state branching across
+four outcomes (`InsertedNewVisible` /
+`UpsertedAlreadyVisible` / `DeletedSupersedingVisible` /
+`DeleteAbsorbedNotVisible`) keeps ADR 046 §5 visible-state
+semantics intact across both delete *and* the symmetric
+insert / upsert digest discipline. The visibility predicate
+is identity-policy-aware via `row_visible_for_admission`:
+append-only / content-hash use ADR 049's retention-floor
+predicate; PK uses chain-prefix-retention semantics where
+below-floor boundary versions remain visible. CSB metadata
+composition extends to all admissible transitions including
+resurrection (tombstone → data records
+`supersession_metadata` on the tombstone slab). Wire
+response classification triple (`deleted_count` /
+`already_deleted_count` / `not_found_count`) makes
+idempotent absorb operator-readable. PK retention stays on
+ADR 013 cluster-MVCC prefix retention with conservative
+boundary-tombstone preservation; ADR 048's
+`RETENTION_REJECTED_PK_DISALLOWED` gate remains in force,
+and no full-chain key retirement in V1.
+`PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed as
+unreachable. Implementation in place; full 100k / 1M
+promotion bench matrix remains ahead.
+
+ADR 049 (Content-Hash Row Identity) —
+`RowIdentityPolicy::AppendOnlyContentHash` deriving
+`__row_key_id__` from canonical row content, with
+synchronous admission-time collapse and the
+`row_currently_visible` helper that ADR 050 generalized to
+`row_visible_for_admission`. Sparse type-tagged canonical
+encoding makes additive nullable schema evolution
+identity-neutral; non-NULL-default and decimal-scale-
+evolution rejected with typed reject codes;
+`IdentityProjection` enabled, `ColumnProjection` deferred.
+Full 100k / 1M promotion bench matrix cleared on
+2026-04-29.
 
 ADR 048 (Per-Table Retention Policy) — replicated
 `TableLifecycleCatalog`; three modes (`InheritCluster` /
@@ -86,10 +156,12 @@ shipped. ADR 046 substrate cleared the cut-2 promotion bench
 gate (see `plans/impl/046_state_digest_bench_results.md`).
 ADR 047, ADR 048, and ADR 049 cleared their full 100k / 1M
 promotion matrices on 2026-04-29; see the corresponding
-bench-result files under `plans/impl/`. ADR 050 design is
-accepted; implementation phases (Phase 0 contract freeze
-through Phase 9 metrics / runbook / arch guards) and full
-100k / 1M bench matrix remain ahead.
+bench-result files under `plans/impl/`. ADR 050
+implementation is in place; full 100k / 1M bench matrix
+remains ahead. ADR 051 design is accepted; implementation
+phases (Phase 0 contract freeze through Phase 8 metrics /
+runbook / arch guards) and full 100k / 1M bench matrix
+remain ahead.
 
 ## Prioritization philosophy
 
@@ -234,10 +306,38 @@ Gemini.
    `PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed.
    Implementation phases pending.
 
-7. **Logical / physical descriptor fingerprint split.** Splits
-   logical schema identity from physical descriptor shape
-   before access-pattern ADRs accrete onto the fingerprint.
-   *2–3 iterations.*
+7. **Logical / physical descriptor fingerprint split.** ADR
+   051 promoted — see
+   `plans/adr/051_descriptor_fingerprint_split.md` and
+   `plans/impl/051_descriptor_fingerprint_split.md`. Two
+   newtyped fingerprints (`LogicalSchemaFingerprint`,
+   `PhysicalDescriptorFingerprint`) over domain-tagged
+   BLAKE3 preimages with the physical preimage stacking on
+   the logical fingerprint. Logical preimage covers
+   identification (`table_object_id`, namespace, name) plus
+   Arrow schema, row identity policy, and evolution policy;
+   physical preimage covers locality, layout, compression,
+   stats policy. `tenant_id`, `contract_version`,
+   `schema_generation`, and lifecycle policy excluded from
+   both. Every existing fingerprint comparison site
+   (aggregate idempotency, aggregate wire, CSB header, CSB
+   merge eligibility, columnar directory) routes to logical;
+   in-memory planning caches and future LSM segment merge
+   route to physical. CSB merge / direct-answer paths
+   validate parsed payload coverage (column ordinal, Arrow
+   stats type, `stat_flags`, optional payload presence)
+   after descriptor-level logical match — stats-policy
+   retunes do not become descriptor-wide physical mismatches.
+   CSB header on-disk slot reinterpreted as logical bytes
+   (pre-launch one-time cliff for pre-ADR-051 CSBs).
+   `PBC_REJECT_STATS_FINGERPRINT_MISMATCH` renamed to
+   `_LOGICAL_*`. `schema_generation` orthogonal and
+   unchanged (no `physical_generation`). Identity-vs-
+   Locality framing inherited from `plans/philosophy.md`.
+   Content-hash (ADR 049) and PK delete (ADR 050) preimages
+   stay fingerprint-free (Phase 5 regression audit). No new
+   descriptor field, no new HRFT frame family, no
+   `format_version` bump. Implementation phases pending.
 
 ### Access patterns
 
@@ -337,8 +437,8 @@ StateDigest substrate
   → topology gate CLOSED — Outcome B (opaque NodeId)
   → content-hash identity (ADR 049)
   → PK-keyed row delete via supersession (ADR 050)
-  → descriptor fingerprint split (next: roadmap #7)
-  → secondary indexes
+  → descriptor fingerprint split (ADR 051)
+  → secondary indexes (next: roadmap #8)
   → wire-frame compression
   → CDC
   → LSM
@@ -347,12 +447,16 @@ StateDigest substrate
   → refinement plumbing
 ```
 
-Design tip is past ADR 050 with PK delete via supersession
-*promoted* (design accepted; implementation phases pending).
-Next ADR is the logical / physical descriptor fingerprint
-split (#7), which inherits a settled PK-delete supersession
-story from ADR 050. ADR 046 substrate cleared its bench gate;
-ADR 047 / 048 / 049 cleared full 100k / 1M promotion matrices
-on 2026-04-29; ADR 050 implementation phases (Phase 0
-contract freeze through Phase 9 metrics / runbook / arch
-guards) and full 100k / 1M bench matrix remain ahead.
+Design tip is past ADR 051 with the logical / physical
+descriptor fingerprint split *promoted* (design accepted;
+implementation phases pending). Next ADR is secondary
+indexes on non-clustering columns (#8), which inherits a
+settled fingerprint shape from ADR 051: index entries bind
+to logical fingerprint and survive physical retunes. ADR
+046 substrate cleared its bench gate; ADR 047 / 048 / 049
+cleared full 100k / 1M promotion matrices on 2026-04-29;
+ADR 050 implementation is in place with the full 100k / 1M
+bench matrix still ahead; ADR 051 implementation phases
+(Phase 0 contract freeze through Phase 8 metrics / runbook
+/ arch guards) and full 100k / 1M bench matrix remain
+ahead.
