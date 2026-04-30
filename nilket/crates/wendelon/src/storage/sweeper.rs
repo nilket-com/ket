@@ -73,9 +73,9 @@ use crate::consensus::{
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::global as metrics;
+use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId};
 #[cfg(test)]
-use crate::schema::SupersessionMetadata;
-use crate::schema::{HybridTimestamp, NodeId, SlabId, TenantId, TenantKekId, TombstoneMetadata};
+use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::MvccRetentionPolicy;
 use crate::storage::l2::ObjectStore;
 use crate::storage::manager::{
@@ -472,7 +472,7 @@ impl SlabSweeper {
 			stats_format_version,
 			stats_block_len,
 			stats_block_hash128,
-			tombstone_metadata: TombstoneMetadata::None,
+			tombstone_metadata: self.slab.slab_row_tombstone_metadata(info.slab_id),
 			supersession_metadata: self.slab.slab_supersession_metadata(info.slab_id),
 		};
 		if let Err(error) = self.raft.commit_tier_slab(tier).await {
@@ -1667,9 +1667,19 @@ mod tests {
 	use crate::audit::InMemoryAuditSink;
 	use crate::consensus::monitor::PhysicalClock;
 	use crate::crypto::CryptoManager;
+	use crate::schema::table::{
+		RecordBodyCompressionPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+		STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+		STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId,
+	};
+	use crate::schema::{Identity, Locality};
+	use crate::storage::core::storage_multirow_index_entries_from_frame;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::LocalFsObjectStore;
 	use crate::storage::manager::SlabManagerConfig;
+	use arrow::array::{Array, BooleanArray, FixedSizeBinaryBuilder, UInt64Array, UInt64Builder};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::record_batch::RecordBatch;
 	use std::time::{SystemTime, UNIX_EPOCH};
 	use tokio::sync::Mutex as AsyncMutex;
 
@@ -1814,6 +1824,114 @@ mod tests {
 		crate::schema::NodeId { id, _reserved: 0 }
 	}
 
+	fn encode_test_batch(batch: &RecordBatch) -> Vec<u8> {
+		crate::storage::ipc::encode_record_batch_bytes(
+			batch,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap()
+	}
+
+	fn test_hlc_storage_bytes(hlc: HybridTimestamp) -> [u8; 16] {
+		let mut bytes = [0_u8; 16];
+		bytes[..8].copy_from_slice(&hlc.physical_ms.to_le_bytes());
+		bytes[8..12].copy_from_slice(&hlc.logical.to_le_bytes());
+		bytes[12..16].copy_from_slice(&hlc.node_id.to_le_bytes());
+		bytes
+	}
+
+	fn encode_test_multirow_storage_frame(
+		rows: &[(Identity, Locality, HybridTimestamp, u64, bool)],
+	) -> Vec<u8> {
+		let mut row_hlc = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
+		let mut row_identity = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
+		let mut row_locality = UInt64Builder::with_capacity(rows.len());
+		for (identity, locality, hlc, _, _) in rows {
+			row_hlc.append_value(test_hlc_storage_bytes(*hlc)).unwrap();
+			row_identity.append_value(identity.as_bytes()).unwrap();
+			row_locality.append_value(locality.get());
+		}
+		let row_tombstone = BooleanArray::from(
+			rows.iter()
+				.map(|(_, _, _, _, value)| *value)
+				.collect::<Vec<_>>(),
+		);
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("value", DataType::UInt64, false),
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(UInt64Array::from(
+					rows.iter()
+						.map(|(_, _, _, value, _)| *value)
+						.collect::<Vec<_>>(),
+				)) as Arc<dyn Array>,
+				Arc::new(row_hlc.finish()) as Arc<dyn Array>,
+				Arc::new(row_identity.finish()) as Arc<dyn Array>,
+				Arc::new(row_locality.finish()) as Arc<dyn Array>,
+				Arc::new(row_tombstone) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		encode_test_batch(&batch)
+	}
+
+	fn encode_test_row_tombstone_marker_frame(
+		table_object_id: TableObjectId,
+		key_identity: Identity,
+		routing_locality: Locality,
+		row_hlc: HybridTimestamp,
+	) -> Vec<u8> {
+		let mut row_hlc_builder = FixedSizeBinaryBuilder::with_capacity(1, 16);
+		row_hlc_builder
+			.append_value(test_hlc_storage_bytes(row_hlc))
+			.unwrap();
+		let mut row_identity = FixedSizeBinaryBuilder::with_capacity(1, 32);
+		row_identity.append_value(key_identity.as_bytes()).unwrap();
+		let mut row_locality = UInt64Builder::with_capacity(1);
+		row_locality.append_value(routing_locality.get());
+		let mut row_table_object_id = FixedSizeBinaryBuilder::with_capacity(1, 16);
+		row_table_object_id
+			.append_value(table_object_id.as_bytes())
+			.unwrap();
+		let schema = Arc::new(Schema::new(vec![
+			Field::new(STORAGE_ROW_HLC_COLUMN, DataType::FixedSizeBinary(16), false),
+			Field::new(
+				STORAGE_ROW_KEY_ID_COLUMN,
+				DataType::FixedSizeBinary(32),
+				false,
+			),
+			Field::new(STORAGE_ROW_ROUTING_LOCALITY_COLUMN, DataType::UInt64, false),
+			Field::new(
+				STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+				DataType::FixedSizeBinary(16),
+				false,
+			),
+			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(row_hlc_builder.finish()) as Arc<dyn Array>,
+				Arc::new(row_identity.finish()) as Arc<dyn Array>,
+				Arc::new(row_locality.finish()) as Arc<dyn Array>,
+				Arc::new(row_table_object_id.finish()) as Arc<dyn Array>,
+				Arc::new(BooleanArray::from(vec![true])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		encode_test_batch(&batch)
+	}
+
 	fn test_crypto() -> Arc<CryptoManager> {
 		let crypto = Arc::new(CryptoManager::new_dev());
 		crypto.install_local_only_for_tests(tenant()).unwrap();
@@ -1903,6 +2021,99 @@ mod tests {
 		assert_eq!(manager.tiered_count().await, sealed_before.len());
 		// Sealed count is zero — they all moved to tiered.
 		assert_eq!(manager.sealed_count().await, 0);
+	}
+
+	#[tokio::test]
+	async fn sweeper_tiers_row_tombstone_slab_with_metadata() {
+		let l1_dir = fresh_dir("row-tombstone-tier-l1");
+		let l2_root = fresh_dir("row-tombstone-tier-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let manager = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: crate::storage::manager::RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let key = id(0x5050);
+		let locality = Locality::new(0x5050);
+		let data_hlc = hlc_at(10);
+		let tombstone_hlc = hlc_at(20);
+		let data_frame =
+			encode_test_multirow_storage_frame(&[(key, locality, data_hlc, 100, false)]);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("data entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let tombstone_frame = encode_test_row_tombstone_marker_frame(
+			TableObjectId::new([0x50; 16]),
+			key,
+			locality,
+			tombstone_hlc,
+		);
+		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
+			.unwrap()
+			.expect("tombstone entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+		let sealed_id = manager.force_seal_active_for_test().await;
+		assert_eq!(
+			manager.slab_row_tombstone_metadata(sealed_id),
+			TombstoneMetadata::Earliest(tombstone_hlc)
+		);
+
+		let sm = WendelonStateMachine::new();
+		let observer: Arc<dyn TierObserver> = Arc::new(ManagerTierObserver::new(manager.clone()));
+		let committer: Arc<dyn TierCommitter> =
+			Arc::new(DirectApplyCommitter::ok(sm.clone(), observer));
+		let sweeper = SlabSweeper::new(
+			manager.clone(),
+			l2,
+			committer,
+			sm.clone(),
+			SweeperConfig {
+				scan_interval: Duration::from_millis(10),
+				min_slab_bytes: 0,
+				max_upload_bytes_per_sec: None,
+				key_prefix: "tier/".into(),
+				max_plaintext_rewrites_per_pass: 1,
+				max_dek_rewraps_per_pass: 1,
+			},
+		);
+
+		let report = sweeper.sweep_once().await.unwrap();
+		assert_eq!(report.tiered, 1);
+		assert_eq!(report.failed, 0);
+		assert_eq!(manager.sealed_count().await, 0);
+
+		let local_pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(
+			local_pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(tombstone_hlc)
+		);
+		let snapshot = sm.state_snapshot().await;
+		let committed_pointer = snapshot
+			.tiered_slabs
+			.get(&sealed_id)
+			.expect("state machine committed tier pointer");
+		assert_eq!(
+			committed_pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(tombstone_hlc)
+		);
 	}
 
 	#[tokio::test]

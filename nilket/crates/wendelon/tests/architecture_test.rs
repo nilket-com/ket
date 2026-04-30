@@ -1071,19 +1071,20 @@ fn test_adr049_content_hash_identity_boundaries() {
 	if !data_server_source.contains("bifurcate_content_hash_table_write")
 		|| !data_server_source.contains("content_hash_admission_guard")
 		|| !data_server_source.contains("observe_storage_content_hash_duplicate_absorption")
-		|| !data_server_source.contains("row_currently_visible")
+		|| !data_server_source.contains("row_visible_for_admission")
 	{
 		violations.push(
 			"src/network/data_server.rs: missing explicit ADR 049 duplicate absorption path"
 				.to_string(),
 		);
 	}
-	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
-	if !manager_source.contains("row_currently_visible")
-		|| !manager_source.contains("row_visible_under_retention")
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	if !pk_delete_source.contains("row_visible_for_admission")
+		|| !pk_delete_source.contains("row_visible_under_retention")
 	{
 		violations.push(
-			"src/storage/manager.rs: ADR 049 visible-membership helper must include ADR 048 retention visibility"
+			"src/storage/pk_delete.rs: ADR 049 visible-membership helper must include ADR 048 retention visibility"
 				.to_string(),
 		);
 	}
@@ -1170,6 +1171,166 @@ fn test_adr049_content_hash_identity_boundaries() {
 	assert!(
 		violations.is_empty(),
 		"ADR 049 content-hash architectural invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 050 architectural guards.
+///
+/// PK delete is a supersession behavior on the existing PK version
+/// chain. It reuses the `TableDeleteRows` wire frame, the ADR 047
+/// tombstone marker column, and ADR 049's admission-time visibility
+/// discipline without introducing a new digest domain or reject-code
+/// family.
+#[test]
+fn test_adr050_pk_delete_supersession_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let data_server_source =
+		fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	for needle in [
+		"admit_pk_write_row",
+		"admit_pk_delete_row",
+		"bifurcate_primary_key_table_write",
+		"emit_table_delete_requested_audit",
+		"emit_table_delete_completion_audit",
+		"tombstone_marker_layout",
+		"row_visible_for_admission",
+		"pk_delete_outcome_for_latest",
+		"TableDeleteRowsRequestMeta",
+	] {
+		if !data_server_source.contains(needle) {
+			violations.push(format!(
+				"src/network/data_server.rs: ADR 050 missing required symbol {needle}"
+			));
+		}
+	}
+
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	for needle in [
+		"PkAdmissionOutcome",
+		"admit_pk_write_row",
+		"admit_pk_delete_row",
+		"RowIdentityPolicy::PrimaryKey",
+		"lookup_as_of",
+		"row_visible_under_retention",
+	] {
+		if !pk_delete_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/pk_delete.rs: ADR 050 missing required symbol {needle}"
+			));
+		}
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for needle in [
+		"wendelon_storage_pk_delete_requests_total",
+		"wendelon_storage_pk_delete_rows_deleted_total",
+		"wendelon_storage_pk_delete_rows_already_deleted_total",
+		"wendelon_storage_pk_delete_rows_not_found_total",
+		"wendelon_storage_pk_delete_resurrections_total",
+		"wendelon_storage_pk_delete_tombstone_boundary_versions_retained_total",
+		"wendelon_storage_pk_upsert_no_digest_add_total",
+		"wendelon_storage_pk_admission_visibility_lookup_seconds",
+	] {
+		if !metrics_source.contains(needle) {
+			violations.push(format!(
+				"src/metrics/registry.rs: ADR 050 missing required metric {needle}"
+			));
+		}
+	}
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	if !schema_source.contains("Self::PrimaryKey(_)") {
+		violations.push(
+			"src/schema/table.rs: PrimaryKey must support row tombstone admission".to_string(),
+		);
+	}
+
+	let sweeper_source = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+	if !sweeper_source.contains("slab_row_tombstone_metadata(info.slab_id)") {
+		violations.push(
+			"src/storage/sweeper.rs: fresh tier commits must carry row tombstone metadata"
+				.to_string(),
+		);
+	}
+
+	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	for needle in [
+		"row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref()",
+		"tombstone_metadata: merge_row_tombstone_metadata(",
+	] {
+		if !manager_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/manager.rs: tiered retention rewrites must preserve row tombstone metadata via {needle}"
+			));
+		}
+	}
+
+	let core_source = fs::read_to_string(manifest_dir.join("src/storage/core.rs")).unwrap();
+	for needle in [
+		"validate_recovered_row_tombstone_marker_shape",
+		"row tombstone marker missing __row_table_object_id__",
+		"row tombstone marker recovered with user columns",
+	] {
+		if !core_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/core.rs: ADR 050 recovery must fail closed for ambiguous tombstone markers via {needle}"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("row_currently", "_visible"),
+		concat!("PBC_REJECT_ROW_TOMBSTONES_", "REQUIRE_APPEND_ONLY"),
+		concat!("PK_DELETE_", "REJECTED_"),
+		concat!("PkDelete", "V1"),
+		concat!("PkSupersession", "V1"),
+		concat!("PkAdmissionOutcome", "V1"),
+		concat!("digest.", "table.row.", "p", "k.v1"),
+		concat!("digest.", "table.row.", "de", "lete.v1"),
+		concat!("digest.", "table.row.", "super", "session.v1"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content.contains(needle) {
+					violations.push(format!(
+						"{}: ADR 050 forbidden surface {needle}",
+						path.strip_prefix(manifest_dir).unwrap_or(path).display()
+					));
+				}
+			}
+		});
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 050 PK-delete supersession invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

@@ -67,7 +67,7 @@ use crate::storage::columnar::{
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
 	StorageEngine, insert_version_sorted, newest_version_as_of, recover_slab_entries_from_blob,
-	remove_version_exact, storage_multirow_index_entries_from_frame,
+	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow, persistent_index_path,
@@ -86,9 +86,8 @@ use crate::storage::stats::{
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
-	AsyncFileOps, BlockingFileOps, BlockingIoClass, EffectiveRetention, IoUringFileOps,
-	MvccRetentionPolicy, OpenFlags, cluster_retention_floor, effective_table_retention,
-	row_visible_under_retention, storage_row_table_object_id_at, write_file,
+	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, MvccRetentionPolicy, OpenFlags,
+	cluster_retention_floor, effective_table_retention, storage_row_table_object_id_at, write_file,
 };
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -711,9 +710,7 @@ impl SlabManager {
 		hlc: HybridTimestamp,
 		frame: &[u8],
 	) -> std::io::Result<RecordLocation> {
-		let superseded = self
-			.latest_location_before(tenant_id, key_identity, hlc)
-			.filter(|location| !location.is_tombstone);
+		let superseded = self.latest_location_before(tenant_id, key_identity, hlc);
 		let (slab, location) = self
 			.append_on_target(tenant_id, key_identity, hlc, frame)
 			.await?;
@@ -769,7 +766,7 @@ impl SlabManager {
 			{
 				if entry.is_tombstone {
 					tombstoned.push((previous.slab_id, entry.row_hlc));
-				} else if !previous.is_tombstone {
+				} else {
 					superseded.push((previous.slab_id, entry.row_hlc));
 				}
 			}
@@ -1005,6 +1002,9 @@ impl SlabManager {
 			if key_index.contains_key(&(tenant_id, key_identity)) {
 				key_localities.insert((tenant_id, key_identity), locality);
 			}
+		}
+		for entry in key_index.iter() {
+			validate_row_tombstone_chain(entry.value())?;
 		}
 		let locality_index = build_locality_index(&key_localities);
 
@@ -2211,6 +2211,22 @@ impl SlabManager {
 		earliest.map_or(SupersessionMetadata::None, SupersessionMetadata::Earliest)
 	}
 
+	pub fn slab_row_tombstone_metadata(&self, slab_id: SlabId) -> TombstoneMetadata {
+		let mut earliest: Option<HybridTimestamp> = None;
+		for entry in self.key_index.iter() {
+			for location in entry.value().iter() {
+				if location.slab_id == slab_id && location.is_tombstone {
+					earliest = Some(
+						earliest
+							.map(|current| current.min(location.hlc))
+							.unwrap_or(location.hlc),
+					);
+				}
+			}
+		}
+		earliest.map_or(TombstoneMetadata::None, TombstoneMetadata::Earliest)
+	}
+
 	pub async fn record_supersession_for_slab(
 		&self,
 		slab_id: SlabId,
@@ -2807,19 +2823,6 @@ impl StorageEngine for SlabManager {
 impl SlabManager {
 	pub(crate) fn l2_column_fetch_enabled(&self) -> bool {
 		self.config.l2_column_fetch.enabled
-	}
-
-	pub(crate) fn row_currently_visible(
-		&self,
-		tenant_id: TenantId,
-		key_identity: Identity,
-		effective_retention: &EffectiveRetention,
-	) -> bool {
-		self.lookup(tenant_id, key_identity)
-			.is_some_and(|location| {
-				!location.is_tombstone
-					&& row_visible_under_retention(location.hlc, effective_retention)
-			})
 	}
 
 	pub(crate) async fn read_projected_record(
@@ -3436,11 +3439,16 @@ impl SlabManager {
 			rewritten_plaintext.as_ref(),
 			table_schemas,
 		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
-			tombstone_metadata: pointer.tombstone_metadata,
+			tombstone_metadata: merge_row_tombstone_metadata(
+				pointer.tombstone_metadata,
+				row_tombstone_metadata,
+			),
 			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
@@ -3569,11 +3577,16 @@ impl SlabManager {
 			rewritten_plaintext.as_ref(),
 			table_schemas,
 		)?;
+		let row_tombstone_metadata =
+			row_tombstone_metadata_from_blob(rewritten_plaintext.as_ref(), pointer.slab_id)?;
 		Ok(Some(PreparedTieredRetentionRewrite::Rewrite {
 			slab_id: pointer.slab_id,
 			old_l2_uri: pointer.l2_uri.clone(),
 			payload_hash: crate::hash::content::digest(&encrypted.bytes),
-			tombstone_metadata: pointer.tombstone_metadata,
+			tombstone_metadata: merge_row_tombstone_metadata(
+				pointer.tombstone_metadata,
+				row_tombstone_metadata,
+			),
 			supersession_metadata: self.slab_supersession_metadata(pointer.slab_id),
 			reclaimed_bytes: (old_blob.len() as u64).saturating_sub(encrypted.bytes.len() as u64),
 			pruned_versions,
@@ -4206,33 +4219,47 @@ impl SlabManager {
 				records[*idx].reclaim = false;
 				continue;
 			};
-			if !descriptor.row_identity_policy.supports_row_tombstones() {
-				if let Some(floor) = global_floor {
-					records[*idx].reclaim = self.is_retention_prunable(
-						record.tenant_id,
-						record.key_identity,
-						record.old_location,
-						floor,
-					);
-					Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+			match descriptor.row_identity_policy {
+				RowIdentityPolicy::PrimaryKey(_) => {
+					if let Some(floor) = global_floor {
+						records[*idx].reclaim = self.is_retention_prunable(
+							record.tenant_id,
+							record.key_identity,
+							record.old_location,
+							floor,
+						);
+						Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+						if !records[*idx].reclaim
+							&& record.old_location.is_tombstone
+							&& record.old_location.hlc < floor
+						{
+							metrics()
+								.observe_storage_pk_delete_tombstone_boundary_versions_retained(
+									record.tenant_id,
+									table_object_id,
+									1,
+								);
+						}
+					}
 				}
-				continue;
-			}
-			let effective = effective_table_retention(
-				&cluster_policy,
-				table_lifecycle.retention_policy(record.tenant_id, table_object_id),
-				now_ms,
-			);
-			records[*idx].reclaim = effective.floor.is_some_and(|floor| {
-				self.is_append_only_retention_prunable(
-					record.tenant_id,
-					record.key_identity,
-					record.old_location,
-					floor,
-				)
-			});
-			if let Some(floor) = effective.floor {
-				Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+				RowIdentityPolicy::AppendOnly | RowIdentityPolicy::AppendOnlyContentHash => {
+					let effective = effective_table_retention(
+						&cluster_policy,
+						table_lifecycle.retention_policy(record.tenant_id, table_object_id),
+						now_ms,
+					);
+					records[*idx].reclaim = effective.floor.is_some_and(|floor| {
+						self.is_append_only_retention_prunable(
+							record.tenant_id,
+							record.key_identity,
+							record.old_location,
+							floor,
+						)
+					});
+					if let Some(floor) = effective.floor {
+						Self::record_retention_lag_if_retained(&mut records[*idx], floor, now_ms);
+					}
+				}
 			}
 		}
 		Ok(())
@@ -5821,6 +5848,40 @@ fn build_tiered_object_metadata(
 	})
 }
 
+fn row_tombstone_metadata_from_blob(
+	blob: &[u8],
+	slab_id: SlabId,
+) -> std::io::Result<TombstoneMetadata> {
+	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
+	Ok(row_tombstone_metadata_from_entries(&entries))
+}
+
+fn row_tombstone_metadata_from_entries(entries: &[RecoveredSlabEntry]) -> TombstoneMetadata {
+	let earliest = entries
+		.iter()
+		.filter(|entry| entry.location.is_tombstone)
+		.map(|entry| entry.location.hlc)
+		.min();
+	earliest.map_or(TombstoneMetadata::None, TombstoneMetadata::Earliest)
+}
+
+fn merge_row_tombstone_metadata(
+	current: TombstoneMetadata,
+	rows: TombstoneMetadata,
+) -> TombstoneMetadata {
+	match (current, rows) {
+		(TombstoneMetadata::Untracked, _) => TombstoneMetadata::Untracked,
+		(current, TombstoneMetadata::None) => current,
+		(TombstoneMetadata::None, TombstoneMetadata::Earliest(row_hlc)) => {
+			TombstoneMetadata::Earliest(row_hlc)
+		}
+		(TombstoneMetadata::Earliest(existing), TombstoneMetadata::Earliest(row_hlc)) => {
+			TombstoneMetadata::Earliest(existing.min(row_hlc))
+		}
+		(current, TombstoneMetadata::Untracked) => current,
+	}
+}
+
 fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
 	Ok(build_tiered_object_metadata(blob, slab_id)?.tenant_id)
 }
@@ -6283,6 +6344,74 @@ mod tests {
 		encode_test_batch(&batch)
 	}
 
+	fn encode_test_pk_tombstone_marker_frame(
+		descriptor: &TableSchemaDescriptorV1,
+		key_identity: Identity,
+		routing_locality: Locality,
+		row_hlc: HybridTimestamp,
+	) -> (Vec<u8>, Vec<MultiRowIndexEntry>) {
+		let RecordLayoutPolicy::MultiRow(layout) = descriptor.record_layout_policy else {
+			panic!("pk tombstone marker test requires multi-row layout")
+		};
+		let rows = vec![MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity,
+			routing_locality,
+			row_hlc,
+			is_tombstone: true,
+			table_object_id: Some(descriptor.table_object_id),
+		}];
+		let mut packed = crate::storage::multirow::pack_tombstone_multirow_source_rows_with_policy(
+			layout,
+			&rows,
+			descriptor.record_body_compression_policy,
+		)
+		.unwrap();
+		assert_eq!(packed.len(), 1);
+		let record = packed.remove(0);
+		let entries = record
+			.encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		(record.encoded.frame, entries)
+	}
+
+	fn encode_test_row_tombstone_marker_frame(
+		table_object_id: TableObjectId,
+		key_identity: Identity,
+		routing_locality: Locality,
+		row_hlc: HybridTimestamp,
+	) -> (Vec<u8>, Vec<MultiRowIndexEntry>) {
+		let layout = MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap();
+		let rows = vec![MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity,
+			routing_locality,
+			row_hlc,
+			is_tombstone: true,
+			table_object_id: Some(table_object_id),
+		}];
+		let mut packed = crate::storage::multirow::pack_tombstone_multirow_source_rows_with_policy(
+			layout,
+			&rows,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		assert_eq!(packed.len(), 1);
+		let record = packed.remove(0);
+		let entries = record
+			.encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		(record.encoded.frame, entries)
+	}
+
 	fn append_only_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptorV1 {
 		let schema = Schema::new(vec![Field::new("value", DataType::UInt64, false)]);
 		TableSchemaDescriptorV1::new_with_layout(
@@ -6292,6 +6421,22 @@ mod tests {
 			"append_events",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn pk_retention_descriptor(table_object_id: TableObjectId) -> TableSchemaDescriptorV1 {
+		let schema = Schema::new(vec![Field::new("value", DataType::UInt64, false)]);
+		TableSchemaDescriptorV1::new_with_layout(
+			table_object_id,
+			1,
+			"analytics",
+			"pk_events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("value")),
 			LocalityPolicyV1::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
@@ -6429,6 +6574,27 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				group_commit,
 				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		)
+	}
+
+	async fn open_manager_at_dir(
+		dir: std::path::PathBuf,
+		io: crate::storage::io_uring::IoRingHandle,
+		crypto: Arc<CryptoManager>,
+	) -> Arc<SlabManager> {
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1024 * 1024,
+				io,
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto,
 			})
 			.await
 			.unwrap(),
@@ -7497,13 +7663,21 @@ mod tests {
 			&[
 				(pruned_key, Locality::new(31), hlc(30_000), 100, false),
 				(retained_key, Locality::new(32), hlc(30_000), 200, false),
-				(retained_key, Locality::new(32), hlc(50_000), 0, true),
 			],
 		);
 		let entries = storage_multirow_index_entries_from_frame(&frame)
 			.unwrap()
 			.expect("append-only storage entries");
 		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			descriptor.table_object_id,
+			retained_key,
+			Locality::new(32),
+			hlc(50_000),
+		);
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
 			.unwrap();
 
@@ -7543,15 +7717,21 @@ mod tests {
 		let retained_key = id(0x4B01);
 		let frame = encode_test_append_only_storage_frame(
 			descriptor.table_object_id,
-			&[
-				(retained_key, Locality::new(33), hlc(30_000), 200, false),
-				(retained_key, Locality::new(33), hlc(50_000), 0, true),
-			],
+			&[(retained_key, Locality::new(33), hlc(30_000), 200, false)],
 		);
 		let entries = storage_multirow_index_entries_from_frame(&frame)
 			.unwrap()
 			.expect("append-only storage entries");
 		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			descriptor.table_object_id,
+			retained_key,
+			Locality::new(33),
+			hlc(50_000),
+		);
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
 			.unwrap();
 
@@ -7583,6 +7763,82 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn l1_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
+		let dir = fresh_dir("pk-boundary-tombstone-reopen");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let mgr = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+		let descriptor = pk_retention_descriptor(TableObjectId::new([0x50; 16]));
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), descriptor.clone()).unwrap();
+		let lifecycle = TableLifecycleCatalog::default();
+		let key = id(0x5001);
+		let locality = Locality::new(50);
+		let data_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(10_000), 100, false)],
+		);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("pk data entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(20_000));
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+
+		force_seal_active(&mgr).await;
+		let report = mgr
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::FixedWindow(Duration::from_millis(60_000)),
+				&lifecycle,
+				&schemas,
+				100_000,
+				1,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		assert_eq!(report.pair_drops, 0);
+		assert!(mgr.lookup_as_of(tenant(), key, hlc(10_000)).is_none());
+		assert!(
+			mgr.lookup_as_of(tenant(), key, hlc(20_000))
+				.expect("pk boundary tombstone survives")
+				.is_tombstone
+		);
+		assert!(
+			mgr.lookup(tenant(), key)
+				.expect("latest pk boundary tombstone survives")
+				.is_tombstone
+		);
+		mgr.fsync_all_local_slabs().await.unwrap();
+		drop(mgr);
+
+		let reopened = open_manager_at_dir(dir, io, crypto).await;
+		assert!(
+			reopened.lookup_as_of(tenant(), key, hlc(10_000)).is_none(),
+			"pruned data row should stay absent after reopen"
+		);
+		assert!(
+			reopened
+				.lookup_as_of(tenant(), key, hlc(20_000))
+				.expect("compacted pk boundary tombstone survives reopen")
+				.is_tombstone
+		);
+		assert!(
+			reopened
+				.lookup(tenant(), key)
+				.expect("latest compacted pk tombstone survives reopen")
+				.is_tombstone
+		);
+	}
+
+	#[tokio::test]
 	async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 		let mgr = fresh_manager().await;
 		let key = id(0x4701);
@@ -7594,11 +7850,12 @@ mod tests {
 		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
 			.await
 			.unwrap();
-		let tombstone_frame =
-			encode_test_multirow_storage_frame_with_tombstones(&[(key, loc, hlc(20), 0, true)]);
-		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
-			.unwrap()
-			.expect("tombstone entry");
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			TableObjectId::new([0x47; 16]),
+			key,
+			loc,
+			hlc(20),
+		);
 		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
 			.unwrap();
@@ -7624,11 +7881,12 @@ mod tests {
 		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
 			.await
 			.unwrap();
-		let tombstone_frame =
-			encode_test_multirow_storage_frame_with_tombstones(&[(key, loc, hlc(20), 0, true)]);
-		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
-			.unwrap()
-			.expect("tombstone entry");
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			TableObjectId::new([0x48; 16]),
+			key,
+			loc,
+			hlc(20),
+		);
 		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
 			.unwrap();
@@ -7682,11 +7940,12 @@ mod tests {
 		mgr.append_durable_multirow_with_locality(tenant(), &data_a, &entries_a)
 			.await
 			.unwrap();
-		let tombstone_a =
-			encode_test_multirow_storage_frame_with_tombstones(&[(key_a, loc_a, hlc(20), 0, true)]);
-		let tombstone_entries_a = storage_multirow_index_entries_from_frame(&tombstone_a)
-			.unwrap()
-			.expect("tombstone a entry");
+		let (tombstone_a, tombstone_entries_a) = encode_test_row_tombstone_marker_frame(
+			TableObjectId::new([0x49; 16]),
+			key_a,
+			loc_a,
+			hlc(20),
+		);
 		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_a, &tombstone_entries_a)
 			.await
 			.unwrap();
@@ -7765,6 +8024,143 @@ mod tests {
 		assert_eq!(recovered.len(), 1);
 		assert_eq!(recovered[0].key_identity, key_b);
 		assert!(!recovered[0].location.is_tombstone);
+	}
+
+	#[tokio::test]
+	async fn tiered_table_retention_keeps_pk_boundary_tombstone_under_cluster_floor() {
+		let l1_dir = fresh_dir("retention-pk-boundary-l1");
+		let l2_root = fresh_dir("retention-pk-boundary-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_root).unwrap());
+		let io = spawn_io_thread(64).unwrap();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1 << 20,
+				io,
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let descriptor = pk_retention_descriptor(TableObjectId::new([0x58; 16]));
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), descriptor.clone()).unwrap();
+		let lifecycle = TableLifecycleCatalog::default();
+		let key = id(0x5801);
+		let locality = Locality::new(58);
+		let data_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(10_000), 100, false)],
+		);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("pk data entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(20_000));
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let old_encrypted = mgr
+			.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &schemas)
+			.unwrap();
+		let old_footer = mgr
+			.encrypted_tiered_footer_summary(&old_encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer");
+		let old_uri = l2
+			.put(
+				&format!("tier/slab_{slab_id:016x}-pk-boundary.wnd"),
+				&old_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let old_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: old_uri,
+			payload_hash: crate::hash::content::digest(&old_encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_footer.tenant_kek_id),
+			stats_format_version: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(old_pointer.clone()).await.unwrap();
+
+		let prepared = mgr
+			.prepare_tiered_table_retention_rewrite(
+				&old_pointer,
+				MvccRetentionPolicy::FixedWindow(Duration::from_millis(60_000)),
+				&lifecycle,
+				&schemas,
+				100_000,
+			)
+			.await
+			.unwrap()
+			.expect("pk boundary retention rewrite");
+		let PreparedTieredRetentionRewrite::Rewrite {
+			encrypted_bytes,
+			pruned_versions,
+			retention_stats,
+			tombstone_metadata,
+			..
+		} = prepared
+		else {
+			panic!("expected rewrite retaining pk boundary tombstone");
+		};
+		assert_eq!(pruned_versions, 1);
+		assert_eq!(retention_stats.pruned_data_rows, 1);
+		assert_eq!(retention_stats.pruned_tombstone_rows, 0);
+		assert_eq!(tombstone_metadata, TombstoneMetadata::Earliest(hlc(20_000)));
+
+		let rewritten_pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: "rewritten-pk-boundary".to_string(),
+			payload_hash: crate::hash::content::digest(&encrypted_bytes),
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(old_footer.tenant_kek_id),
+			stats_format_version: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: old_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		let rewritten_plaintext = decode_tiered_blob(
+			mgr.config.crypto.as_ref(),
+			&rewritten_pointer,
+			&encrypted_bytes,
+		)
+		.unwrap();
+		let recovered = recover_slab_entries_from_blob(&rewritten_plaintext, slab_id).unwrap();
+		assert_eq!(recovered.len(), 1);
+		assert_eq!(recovered[0].key_identity, key);
+		assert_eq!(recovered[0].location.hlc, hlc(20_000));
+		assert!(recovered[0].location.is_tombstone);
 	}
 
 	#[tokio::test]
@@ -7919,15 +8315,21 @@ mod tests {
 		let retained_key = id(0x4C01);
 		let frame = encode_test_append_only_storage_frame(
 			descriptor.table_object_id,
-			&[
-				(retained_key, Locality::new(34), hlc(30_000), 200, false),
-				(retained_key, Locality::new(34), hlc(50_000), 0, true),
-			],
+			&[(retained_key, Locality::new(34), hlc(30_000), 200, false)],
 		);
 		let entries = storage_multirow_index_entries_from_frame(&frame)
 			.unwrap()
 			.expect("append-only storage entries");
 		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			descriptor.table_object_id,
+			retained_key,
+			Locality::new(34),
+			hlc(50_000),
+		);
+		mgr.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
 			.unwrap();
 
@@ -8285,6 +8687,163 @@ mod tests {
 			assert!(!has_storage_synthetic_columns(&batch));
 			assert_eq!(first_i64(&batch), expected_value);
 		}
+	}
+
+	#[tokio::test]
+	async fn recovery_reopens_pk_delete_and_resurrection_chain() {
+		let dir = fresh_dir("pk-delete-recovery");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let descriptor = pk_retention_descriptor(TableObjectId::new([0x57; 16]));
+		let key = id(0x5701);
+		let locality = Locality::new(57);
+
+		let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+		let data_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(10), 100, false)],
+		);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("pk data entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(20));
+		manager
+			.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+		manager.fsync_all_local_slabs().await.unwrap();
+		drop(manager);
+
+		let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+		assert_eq!(
+			reopened.routing_locality_for_existing_key(tenant(), key),
+			Some(locality)
+		);
+		assert!(
+			!reopened
+				.lookup_as_of(tenant(), key, hlc(10))
+				.expect("pre-delete data survives reopen")
+				.is_tombstone
+		);
+		assert!(
+			reopened
+				.lookup_as_of(tenant(), key, hlc(20))
+				.expect("delete tombstone survives reopen")
+				.is_tombstone
+		);
+		assert!(
+			reopened
+				.lookup(tenant(), key)
+				.expect("latest delete tombstone survives reopen")
+				.is_tombstone
+		);
+
+		let resurrected_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(30), 200, false)],
+		);
+		let resurrected_entries = storage_multirow_index_entries_from_frame(&resurrected_frame)
+			.unwrap()
+			.expect("pk resurrected data entry");
+		reopened
+			.append_durable_multirow_with_locality(
+				tenant(),
+				&resurrected_frame,
+				&resurrected_entries,
+			)
+			.await
+			.unwrap();
+		reopened.fsync_all_local_slabs().await.unwrap();
+		drop(reopened);
+
+		let reopened = open_manager_at_dir(dir, io, crypto).await;
+		assert!(
+			reopened
+				.lookup_as_of(tenant(), key, hlc(20))
+				.expect("historical delete tombstone survives resurrection reopen")
+				.is_tombstone
+		);
+		let latest = reopened
+			.lookup_as_of(tenant(), key, hlc(30))
+			.expect("resurrected data survives reopen");
+		assert!(!latest.is_tombstone);
+		let frame = reopened.read(latest).await.unwrap();
+		let batch = decode_record_batch(&frame).unwrap();
+		let values = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<UInt64Array>()
+			.unwrap();
+		assert_eq!(values.value(0), 200);
+	}
+
+	#[tokio::test]
+	async fn recovery_fails_closed_on_cross_slab_consecutive_pk_tombstones() {
+		let dir = fresh_dir("pk-consecutive-tombstone-recovery");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let descriptor = pk_retention_descriptor(TableObjectId::new([0x59; 16]));
+		let key = id(0x5901);
+		let locality = Locality::new(59);
+
+		let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+		let data_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(10), 100, false)],
+		);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("pk data entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let (first_tombstone_frame, first_tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(20));
+		manager
+			.append_durable_multirow_with_locality(
+				tenant(),
+				&first_tombstone_frame,
+				&first_tombstone_entries,
+			)
+			.await
+			.unwrap();
+		force_seal_active(&manager).await;
+		let (second_tombstone_frame, second_tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(30));
+		manager
+			.append_durable_multirow_with_locality(
+				tenant(),
+				&second_tombstone_frame,
+				&second_tombstone_entries,
+			)
+			.await
+			.unwrap();
+		manager.fsync_all_local_slabs().await.unwrap();
+		drop(manager);
+
+		let reopened = SlabManager::open(SlabManagerConfig {
+			dir,
+			max_slab_bytes: 1024 * 1024,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto,
+		})
+		.await;
+		let err = match reopened {
+			Ok(_) => panic!("consecutive tombstones across slabs must fail recovery"),
+			Err(err) => err,
+		};
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("duplicate row tombstone"));
 	}
 
 	#[tokio::test]
@@ -9675,16 +10234,12 @@ mod tests {
 			.await
 			.unwrap();
 
-		let tombstone_frame = encode_test_multirow_storage_frame_with_tombstones(&[(
+		let (tombstone_frame, tombstone_entries) = encode_test_row_tombstone_marker_frame(
+			TableObjectId::new([0x51; 16]),
 			key,
 			locality,
 			hlc(20),
-			0,
-			true,
-		)]);
-		let tombstone_entries = storage_multirow_index_entries_from_frame(&tombstone_frame)
-			.unwrap()
-			.expect("tombstone entry");
+		);
 		manager
 			.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
 			.await
@@ -9700,6 +10255,84 @@ mod tests {
 			pointer.tombstone_metadata,
 			SupersessionMetadata::None,
 			hlc(20)
+		));
+	}
+
+	#[tokio::test]
+	async fn tiered_pk_tombstone_slab_records_row_tombstone_and_resurrection_metadata() {
+		let manager = fresh_manager().await;
+		let descriptor = pk_retention_descriptor(TableObjectId::new([0x5A; 16]));
+		let key = id(0x5A01);
+		let locality = Locality::new(0x5A);
+		let data_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(10), 100, false)],
+		);
+		let data_entries = storage_multirow_index_entries_from_frame(&data_frame)
+			.unwrap()
+			.expect("pk data entry");
+		manager
+			.append_durable_multirow_with_locality(tenant(), &data_frame, &data_entries)
+			.await
+			.unwrap();
+		let (tombstone_frame, tombstone_entries) =
+			encode_test_pk_tombstone_marker_frame(&descriptor, key, locality, hlc(20));
+		manager
+			.append_durable_multirow_with_locality(tenant(), &tombstone_frame, &tombstone_entries)
+			.await
+			.unwrap();
+		let sealed_id = force_seal_active(&manager).await;
+		assert_eq!(
+			manager.slab_row_tombstone_metadata(sealed_id),
+			TombstoneMetadata::Earliest(hlc(20))
+		);
+		manager
+			.apply_tier_slab(TieredSlabPointer {
+				slab_id: sealed_id,
+				l2_uri: "memory://pk-row-tombstone".into(),
+				payload_hash: [0x5A; 32],
+				is_encrypted: false,
+				tenant_id: None,
+				tenant_kek_id: None,
+				stats_format_version: None,
+				stats_block_len: None,
+				stats_block_hash128: None,
+				tombstone_metadata: manager.slab_row_tombstone_metadata(sealed_id),
+				supersession_metadata: SupersessionMetadata::None,
+			})
+			.await
+			.unwrap();
+
+		let resurrected_frame = encode_test_append_only_storage_frame(
+			descriptor.table_object_id,
+			&[(key, locality, hlc(30), 200, false)],
+		);
+		let resurrected_entries = storage_multirow_index_entries_from_frame(&resurrected_frame)
+			.unwrap()
+			.expect("pk resurrection entry");
+		manager
+			.append_durable_multirow_with_locality(
+				tenant(),
+				&resurrected_frame,
+				&resurrected_entries,
+			)
+			.await
+			.unwrap();
+
+		let pointer = manager.tier_pointer(sealed_id).await.unwrap();
+		assert_eq!(
+			pointer.tombstone_metadata,
+			TombstoneMetadata::Earliest(hlc(20))
+		);
+		assert_eq!(
+			pointer.supersession_metadata,
+			SupersessionMetadata::Earliest(hlc(30))
+		);
+		assert!(!crate::storage::slab_visibility_complete(
+			hlc(20),
+			pointer.tombstone_metadata,
+			pointer.supersession_metadata,
+			hlc(30)
 		));
 	}
 

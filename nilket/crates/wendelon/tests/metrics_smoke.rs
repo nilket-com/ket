@@ -285,6 +285,15 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_storage_table_retention_policy_active_tables_total"));
 	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
 	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_outcomes_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_requests_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_rows_deleted_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_rows_already_deleted_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_rows_not_found_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_resurrections_total"));
+	assert!(body.contains("wendelon_storage_pk_delete_tombstone_boundary_versions_retained_total"));
+	assert!(body.contains("wendelon_storage_pk_upsert_no_digest_add_total"));
+	assert!(body.contains("wendelon_storage_pk_admission_visibility_lookup_seconds"));
 	assert!(body.contains("wendelon_audit_materialization_lag_entries"));
 	assert!(body.contains("wendelon_audit_emit_total{authority=\"node_local\",outcome=\"ok\"}"));
 	assert!(body.contains("wendelon_group_commit_window_seconds_bucket"));

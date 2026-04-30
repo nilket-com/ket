@@ -71,11 +71,11 @@ use crate::schema::{
 	COLUMN_PROJECTION_RANGE_ARC_BUDGET, ColumnProjectionRangePruning, Consistency,
 	FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
 	LeaseDescriptor, LeaseStatus, Locality, LocalityPolicyV1, LocalityRange, MigrateRequestKind,
-	MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, NodeId, PbcRejectCode,
-	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
-	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
+	MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, MultiRowLayoutDescriptor,
+	NodeId, PbcRejectCode, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
+	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex,
+	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
 	STORAGE_ROW_KEY_ID_COLUMN, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
 	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
@@ -100,6 +100,9 @@ use crate::storage::multirow::{
 	pack_admitted_record_batch_by_bucket, pack_tombstone_multirow_source_rows_with_policy,
 	replace_storage_row_hlc_column, storage_index_entries_from_batch,
 	storage_row_table_object_id_at,
+};
+use crate::storage::pk_delete::{
+	PkAdmissionOutcome, admit_pk_delete_row, admit_pk_write_row, row_visible_for_admission,
 };
 use crate::storage::stats::{
 	COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED,
@@ -287,6 +290,13 @@ struct ContentHashBifurcation {
 	bifurcated: Option<BifurcatedTableWrite>,
 	absorbed_rows: u64,
 	stored_rows: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PrimaryKeyBifurcation {
+	bifurcated: BifurcatedTableWrite,
+	upsert_no_digest_add_rows: u64,
+	resurrected_rows: u64,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1120,6 +1130,109 @@ impl WendelonDataServer {
 			vec![
 				("status", json!(status.as_str())),
 				("reason", json!(reason.into())),
+			],
+		)
+	}
+
+	fn emit_table_delete_requested_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &TableDeleteRowsRequestMeta,
+		distinct_target_count: usize,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			None,
+			AuditOperation::DataWrite,
+			DataAccessKind::Write,
+			DataAccessPhase::Requested,
+			DataAccessSchema {
+				locality: None,
+				locality_end: None,
+				durability: Some(meta.durability.0 as u64),
+				charged_bytes: None,
+				returned_bytes: None,
+				result_count: Some(meta.row_count as u64),
+			},
+			None,
+			"requested table row delete",
+			vec![
+				(
+					"table_object_id",
+					json!(format_bytes_hex(meta.table_object_id.as_bytes())),
+				),
+				("schema_generation", json!(meta.schema_generation)),
+				("expected_epoch", json!(meta.expected_epoch)),
+				("write_sequence", json!(meta.parent_write_id.sequence_no)),
+				("await_finalization", json!(meta.await_finalization != 0)),
+				("row_count", json!(meta.row_count)),
+				("distinct_target_count", json!(distinct_target_count)),
+			],
+		)
+	}
+
+	fn emit_table_delete_completion_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &TableDeleteRowsRequestMeta,
+		response: &TableDeleteRowsResponseMeta,
+		distinct_target_count: usize,
+	) -> std::io::Result<()> {
+		self.emit_data_access_audit(
+			actor,
+			meta.tenant_id,
+			None,
+			AuditOperation::DataWrite,
+			DataAccessKind::Write,
+			DataAccessPhase::Completed,
+			DataAccessSchema {
+				locality: None,
+				locality_end: None,
+				durability: Some(meta.durability.0 as u64),
+				charged_bytes: None,
+				returned_bytes: None,
+				result_count: Some(response.deleted_count as u64),
+			},
+			completed_write_audit_outcome(response.write.status),
+			"completed table row delete",
+			vec![
+				(
+					"table_object_id",
+					json!(format_bytes_hex(meta.table_object_id.as_bytes())),
+				),
+				("schema_generation", json!(meta.schema_generation)),
+				("status", json!(response.write.status.as_str())),
+				(
+					"reject_code",
+					json!(PbcRejectCode(response.reject_code).name()),
+				),
+				("row_count", json!(meta.row_count)),
+				("distinct_target_count", json!(distinct_target_count)),
+				("deleted_count", json!(response.deleted_count)),
+				(
+					"already_deleted_count",
+					json!(response.already_deleted_count),
+				),
+				("not_found_count", json!(response.not_found_count)),
+				("log_index", json!(response.write.log_index)),
+				("term", json!(response.write.term)),
+				(
+					"has_finalization",
+					json!(response.write.has_finalization != 0),
+				),
+				(
+					"commit_hlc_physical_ms",
+					json!(response.write.commit_hlc.physical_ms),
+				),
+				(
+					"commit_hlc_logical",
+					json!(response.write.commit_hlc.logical),
+				),
+				(
+					"commit_hlc_node_id",
+					json!(response.write.commit_hlc.node_id),
+				),
 			],
 		)
 	}
@@ -4210,10 +4323,11 @@ impl WendelonDataServer {
 
 	async fn handle_table_delete(
 		&self,
-		_actor: &ActorIdentity,
+		actor: &ActorIdentity,
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		let (meta, row_key_ids) = self.decode_table_delete_request_frame(&frame)?;
+		let distinct_target_count = row_key_ids.iter().copied().collect::<HashSet<_>>().len();
 		let span = tracing::info_span!(
 			"data_ring.table_delete.request",
 			stream_id = frame.header.stream_id,
@@ -4226,10 +4340,12 @@ impl WendelonDataServer {
 			durability = meta.durability.0,
 			write_sequence = meta.parent_write_id.sequence_no,
 		);
+		self.emit_table_delete_requested_audit(actor, &meta, distinct_target_count)?;
 		let (resp, trailing) = self
 			.table_delete(meta, row_key_ids)
 			.instrument(span)
 			.await?;
+		self.emit_table_delete_completion_audit(actor, &meta, &resp, distinct_target_count)?;
 		Ok(self.build_table_delete_response_frame(frame.header.stream_id, resp, trailing))
 	}
 
@@ -7293,6 +7409,7 @@ impl WendelonDataServer {
 		};
 
 		let mut content_hash_metrics = None;
+		let mut primary_key_metrics = None;
 		let bifurcated = match if matches!(
 			descriptor.row_identity_policy,
 			RowIdentityPolicy::AppendOnlyContentHash
@@ -7307,6 +7424,22 @@ impl WendelonDataServer {
 			.map(|outcome| {
 				content_hash_metrics = Some((outcome.absorbed_rows, outcome.stored_rows));
 				outcome.bifurcated
+			})
+		} else if matches!(
+			descriptor.row_identity_policy,
+			RowIdentityPolicy::PrimaryKey(_)
+		) {
+			self.bifurcate_primary_key_table_write(
+				&meta,
+				&payload,
+				&descriptor,
+				writer_node_id,
+				commit_hlc,
+			)
+			.map(|outcome| {
+				primary_key_metrics =
+					Some((outcome.upsert_no_digest_add_rows, outcome.resurrected_rows));
+				Some(outcome.bifurcated)
 			})
 		} else {
 			bifurcate_table_write(&meta, &payload, &descriptor, writer_node_id, commit_hlc)
@@ -7357,6 +7490,8 @@ impl WendelonDataServer {
 		let is_append_only = descriptor.is_append_only();
 		let content_hash_metric_tenant = meta.tenant_id;
 		let content_hash_metric_table = meta.table_object_id;
+		let primary_key_metric_tenant = meta.tenant_id;
+		let primary_key_metric_table = meta.table_object_id;
 		let (write, trailing) = self
 			.write_table_bifurcated(meta, bifurcated, groups, commit_hlc, is_append_only)
 			.await?;
@@ -7372,7 +7507,76 @@ impl WendelonDataServer {
 				stored_rows,
 			);
 		}
+		if matches!(
+			write.status,
+			WriteStatus::OK | WriteStatus::FINALIZATION_PENDING
+		) && let Some((upsert_no_digest_add_rows, resurrected_rows)) = primary_key_metrics
+		{
+			metrics().observe_storage_pk_upsert_no_digest_add(
+				primary_key_metric_tenant,
+				primary_key_metric_table,
+				upsert_no_digest_add_rows,
+			);
+			metrics().observe_storage_pk_delete_resurrections(
+				primary_key_metric_tenant,
+				primary_key_metric_table,
+				resurrected_rows,
+			);
+		}
 		Ok((table_write_response(write, PbcRejectCode::NONE), trailing))
+	}
+
+	fn bifurcate_primary_key_table_write(
+		&self,
+		meta: &TableWriteRequestMeta,
+		batch: &RecordBatch,
+		descriptor: &TableSchemaDescriptorV1,
+		writer_node_id: WriterNodeId,
+		row_hlc: HybridTimestamp,
+	) -> Result<PrimaryKeyBifurcation, TableWriteValidationError> {
+		let admission =
+			validate_table_write_request_batch(meta, batch, descriptor, writer_node_id, row_hlc)?;
+		let mut upsert_no_digest_add_rows = 0_u64;
+		let mut resurrected_rows = 0_u64;
+		for key_identity in admission.key_identities.iter().copied() {
+			let started = Instant::now();
+			let outcome = admit_pk_write_row(
+				descriptor,
+				meta.tenant_id,
+				key_identity,
+				row_hlc,
+				&self.slab,
+			);
+			metrics().observe_storage_pk_admission_visibility_lookup(
+				meta.tenant_id,
+				meta.table_object_id,
+				started.elapsed(),
+			);
+			match outcome {
+				PkAdmissionOutcome::UpsertedAlreadyVisible => {
+					upsert_no_digest_add_rows = upsert_no_digest_add_rows.saturating_add(1);
+				}
+				PkAdmissionOutcome::InsertedNewVisible {
+					latest_was_tombstone: true,
+				} => {
+					resurrected_rows = resurrected_rows.saturating_add(1);
+				}
+				PkAdmissionOutcome::InsertedNewVisible {
+					latest_was_tombstone: false,
+				} => {}
+				PkAdmissionOutcome::DeletedSupersedingVisible
+				| PkAdmissionOutcome::DeleteAbsorbedNotVisible { .. } => {
+					unreachable!("delete admission outcomes are not produced by PK write admission")
+				}
+			}
+		}
+		let bifurcated =
+			bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)?;
+		Ok(PrimaryKeyBifurcation {
+			bifurcated,
+			upsert_no_digest_add_rows,
+			resurrected_rows,
+		})
 	}
 
 	fn bifurcate_content_hash_table_write(
@@ -7394,9 +7598,14 @@ impl WendelonDataServer {
 		let mut keys_stored_in_batch = HashSet::with_capacity(batch.num_rows());
 		let mut absorbed = 0_u64;
 		for (row, key_identity) in admission.key_identities.iter().copied().enumerate() {
-			let currently_visible =
-				self.slab
-					.row_currently_visible(meta.tenant_id, key_identity, effective_retention);
+			let currently_visible = row_visible_for_admission(
+				descriptor,
+				meta.tenant_id,
+				key_identity,
+				row_hlc,
+				effective_retention,
+				&self.slab,
+			);
 			if currently_visible || !keys_stored_in_batch.insert(key_identity) {
 				absorbed = absorbed.saturating_add(1);
 				continue;
@@ -7518,12 +7727,18 @@ impl WendelonDataServer {
 			));
 		}
 
-		let descriptor = {
+		let (descriptor, effective_retention) = {
 			let state = self.state_machine.state_snapshot().await;
-			state
+			let effective_retention = self.table_effective_retention_from_state(
+				&state,
+				meta.tenant_id,
+				meta.table_object_id,
+			);
+			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
-				.cloned()
+				.cloned();
+			(descriptor, effective_retention)
 		};
 		let Some(descriptor) = descriptor else {
 			return Ok((
@@ -7545,29 +7760,22 @@ impl WendelonDataServer {
 				None,
 			));
 		}
-		if !descriptor.supports_row_tombstones() {
-			return Ok((
-				self.table_delete_error_response(
-					&meta,
-					WriteStatus::INTERNAL_ERROR,
-					PbcRejectCode::PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY,
-				),
-				None,
-			));
-		}
-		let layout = match descriptor.record_layout_policy {
-			RecordLayoutPolicy::MultiRow(layout) => layout,
-			RecordLayoutPolicy::SingleRow => {
+		let layout = match tombstone_marker_layout(&descriptor) {
+			Ok(layout) => layout,
+			Err(code) => {
 				return Ok((
-					self.table_delete_error_response(
-						&meta,
-						WriteStatus::INTERNAL_ERROR,
-						PbcRejectCode::PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW,
-					),
+					self.table_delete_error_response(&meta, WriteStatus::INTERNAL_ERROR, code),
 					None,
 				));
 			}
 		};
+		let is_primary_key_table = matches!(
+			descriptor.row_identity_policy,
+			RowIdentityPolicy::PrimaryKey(_)
+		);
+		if is_primary_key_table {
+			metrics().observe_storage_pk_delete_request(meta.tenant_id, meta.table_object_id);
+		}
 
 		let delete_hlc = self.merge_commit_hlc(meta.client_hlc);
 		let mut seen = HashSet::with_capacity(row_key_ids.len());
@@ -7578,14 +7786,35 @@ impl WendelonDataServer {
 			if !seen.insert(row_key_id) {
 				continue;
 			}
-			match self
-				.slab
-				.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc)
-			{
-				Some(location) if location.is_tombstone => {
+			let outcome = if is_primary_key_table {
+				let started = Instant::now();
+				let outcome = admit_pk_delete_row(
+					&descriptor,
+					meta.tenant_id,
+					row_key_id,
+					delete_hlc,
+					&effective_retention,
+					&self.slab,
+				);
+				metrics().observe_storage_pk_admission_visibility_lookup(
+					meta.tenant_id,
+					meta.table_object_id,
+					started.elapsed(),
+				);
+				outcome
+			} else {
+				let latest = self
+					.slab
+					.lookup_as_of(meta.tenant_id, row_key_id, delete_hlc);
+				crate::storage::pk_delete::pk_delete_outcome_for_latest(latest)
+			};
+			match outcome {
+				PkAdmissionOutcome::DeleteAbsorbedNotVisible {
+					latest_was_tombstone: true,
+				} => {
 					already_deleted_count = already_deleted_count.saturating_add(1);
 				}
-				Some(_location) => {
+				PkAdmissionOutcome::DeletedSupersedingVisible => {
 					let Some(routing_locality) = self
 						.slab
 						.routing_locality_for_existing_key(meta.tenant_id, row_key_id)
@@ -7614,9 +7843,15 @@ impl WendelonDataServer {
 						table_object_id: Some(descriptor.table_object_id),
 					});
 				}
-				None => {
+				PkAdmissionOutcome::DeleteAbsorbedNotVisible {
+					latest_was_tombstone: false,
+				} => {
 					not_found_count = not_found_count.saturating_add(1);
 				}
+				PkAdmissionOutcome::InsertedNewVisible { .. }
+				| PkAdmissionOutcome::UpsertedAlreadyVisible => unreachable!(
+					"write admission outcomes are not produced by delete classification"
+				),
 			}
 		}
 		let deleted_count = u32::try_from(tombstone_rows.len()).unwrap_or(u32::MAX);
@@ -7633,6 +7868,15 @@ impl WendelonDataServer {
 				not_found_count,
 				PbcRejectCode::NONE,
 			);
+			if is_primary_key_table {
+				metrics().observe_storage_pk_delete_outcomes(
+					meta.tenant_id,
+					meta.table_object_id,
+					u64::from(deleted_count),
+					u64::from(already_deleted_count),
+					u64::from(not_found_count),
+				);
+			}
 			self.table_delete_idempotency.insert(
 				key,
 				CachedTableDeleteOutcome {
@@ -7704,6 +7948,15 @@ impl WendelonDataServer {
 			not_found_count,
 			PbcRejectCode::NONE,
 		);
+		if is_primary_key_table {
+			metrics().observe_storage_pk_delete_outcomes(
+				meta.tenant_id,
+				meta.table_object_id,
+				u64::from(deleted_count),
+				u64::from(already_deleted_count),
+				u64::from(not_found_count),
+			);
+		}
 		self.table_delete_idempotency
 			.insert(key, CachedTableDeleteOutcome { response, trailing });
 		Ok((response, trailing))
@@ -10206,6 +10459,25 @@ fn observe_content_hash_admission_metrics(
 	}
 }
 
+fn tombstone_marker_layout(
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<MultiRowLayoutDescriptor, PbcRejectCode> {
+	match descriptor.record_layout_policy {
+		RecordLayoutPolicy::MultiRow(layout) => Ok(layout),
+		RecordLayoutPolicy::SingleRow
+			if matches!(
+				descriptor.row_identity_policy,
+				RowIdentityPolicy::PrimaryKey(_)
+			) =>
+		{
+			Ok(MultiRowLayoutDescriptor::default())
+		}
+		RecordLayoutPolicy::SingleRow => {
+			Err(PbcRejectCode::PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW)
+		}
+	}
+}
+
 fn table_write_status_for_reject(code: PbcRejectCode) -> WriteStatus {
 	match code {
 		PbcRejectCode::PBC_REJECT_SCHEMA_STALE => WriteStatus::EPOCH_STALE,
@@ -11329,6 +11601,35 @@ mod tests {
 				max_partial_state_bytes: ByteCount::new(4_096),
 			},
 		}
+	}
+
+	fn table_query_meta_for_test(
+		descriptor: &TableSchemaDescriptorV1,
+		as_of_hlc: HybridTimestamp,
+		bytecode_len: usize,
+	) -> TableQueryRequestMeta {
+		TableQueryRequestMeta {
+			min_hlc: hlc(0, 0, 0),
+			expected_epoch: 1,
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			consistency: Consistency::SERIALIZABLE,
+			_pad: [0; 7],
+			bytecode_len: bytecode_len as u32,
+			_pad2: [0; 4],
+			as_of_hlc,
+		}
+	}
+
+	fn pk_eq_program(pk: i64) -> Vec<u8> {
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_INT);
+		bytecode.extend_from_slice(&pk.to_le_bytes());
+		bytecode.push(OP_EQ);
+		bytecode
 	}
 
 	fn count_star_partial_value(response: &AggregateResponse) -> u64 {
@@ -14199,9 +14500,14 @@ mod tests {
 			descriptor.table_object_id,
 		);
 		assert!(
-			!server
-				.slab
-				.row_currently_visible(tenant(), key_identity, &effective_retention),
+			!row_visible_for_admission(
+				&descriptor,
+				tenant(),
+				key_identity,
+				first_location.hlc,
+				&effective_retention,
+				&server.slab,
+			),
 			"old row must be logically hidden before compaction removes the index entry"
 		);
 		assert_eq!(
@@ -14355,6 +14661,341 @@ mod tests {
 			assert_eq!(resp.reject_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE.0);
 			assert!(trailing.is_none());
 		}
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn pk_table_delete_supersedes_single_row_and_allows_resurrection() {
+		let dir = bootstrap_tempdir("pk-delete-single-row-supersession");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			52,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let first_batch = typed_table_batch_with_names(vec![(7, "before-delete")]);
+		let mut first_meta = typed_table_meta(&descriptor, first_batch.num_rows());
+		first_meta.parent_write_id.sequence_no = 500;
+		let (first_resp, _) = node
+			.data_server
+			.table_write(first_meta, first_batch.clone())
+			.await
+			.unwrap();
+		assert_eq!(first_resp.write.status, WriteStatus::OK);
+		let first_admission = validate_table_write_request_batch(
+			&first_meta,
+			&first_batch,
+			&descriptor,
+			WriterNodeId::from_node_id(node.local_node),
+			first_resp.write.commit_hlc,
+		)
+		.unwrap();
+		let target = first_admission.key_identities[0];
+		let missing = Identity::new([0x52; 32]);
+		let first_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(!first_location.is_tombstone);
+
+		let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		delete_meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x52; 16],
+			sequence_no: 1,
+			idempotency_ttl_ms: 30_000,
+			_pad: 0,
+		};
+		delete_meta.client_hlc = hlc(20, 0, 52);
+		delete_meta.expected_epoch = 1;
+		delete_meta.tenant_id = tenant();
+		delete_meta.table_object_id = descriptor.table_object_id;
+		delete_meta.schema_generation = descriptor.schema_generation;
+		delete_meta.row_count = 2;
+		delete_meta.durability = DurabilityLevel::QUORUM;
+		let (delete_resp, trailing) = node
+			.data_server
+			.table_delete(delete_meta, vec![target, missing])
+			.await
+			.unwrap();
+		assert_eq!(delete_resp.write.status, WriteStatus::OK);
+		assert_eq!(delete_resp.reject_code, PbcRejectCode::NONE.0);
+		assert_eq!(delete_resp.deleted_count, 1);
+		assert_eq!(delete_resp.already_deleted_count, 0);
+		assert_eq!(delete_resp.not_found_count, 1);
+		assert!(trailing.is_none());
+
+		let tombstone_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(tombstone_location.is_tombstone);
+		assert_eq!(tombstone_location.hlc, delete_resp.write.commit_hlc);
+		let tombstone_frame = node.slab.read(tombstone_location).await.unwrap();
+		let tombstone_batch = decode_batch(&tombstone_frame).unwrap();
+		assert!(
+			crate::storage::multirow::storage_row_is_tombstone_at(
+				&tombstone_batch,
+				tombstone_location.record_row_index,
+			)
+			.unwrap()
+		);
+		assert_eq!(
+			storage_row_table_object_id_at(&tombstone_batch, tombstone_location.record_row_index)
+				.unwrap(),
+			Some(descriptor.table_object_id)
+		);
+		assert_eq!(
+			materialize_record_location_batch(
+				&tombstone_batch,
+				tombstone_location.record_row_index
+			)
+			.unwrap()
+			.num_rows(),
+			0
+		);
+		assert!(
+			!node
+				.slab
+				.lookup_as_of(tenant(), target, first_resp.write.commit_hlc)
+				.unwrap()
+				.is_tombstone
+		);
+
+		let mut already_meta = delete_meta;
+		already_meta.parent_write_id.sequence_no = 2;
+		already_meta.row_count = 1;
+		let (already_resp, _) = node
+			.data_server
+			.table_delete(already_meta, vec![target])
+			.await
+			.unwrap();
+		assert_eq!(already_resp.deleted_count, 0);
+		assert_eq!(already_resp.already_deleted_count, 1);
+		assert_eq!(already_resp.not_found_count, 0);
+
+		let resurrection_batch = typed_table_batch_with_names(vec![(7, "after-delete")]);
+		let mut resurrection_meta = typed_table_meta(&descriptor, resurrection_batch.num_rows());
+		resurrection_meta.parent_write_id.sequence_no = 501;
+		let (resurrection_resp, _) = node
+			.data_server
+			.table_write(resurrection_meta, resurrection_batch)
+			.await
+			.unwrap();
+		assert_eq!(resurrection_resp.write.status, WriteStatus::OK);
+		let latest_location = node.slab.lookup(tenant(), target).unwrap();
+		assert!(!latest_location.is_tombstone);
+		assert!(latest_location.hlc > tombstone_location.hlc);
+		assert!(
+			node.slab
+				.slab_has_supersession_at(tombstone_location.slab_id, latest_location.hlc),
+			"resurrection must mark the tombstone slab as superseded for CSB safety"
+		);
+		let latest_frame = node.slab.read(latest_location).await.unwrap();
+		let latest_batch = decode_batch(&latest_frame).unwrap();
+		let materialized =
+			materialize_record_location_batch(&latest_batch, latest_location.record_row_index)
+				.unwrap();
+		let names = materialized
+			.column_by_name("name")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.unwrap();
+		assert_eq!(names.value(0), "after-delete");
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn pk_delete_read_surfaces_track_tombstone_and_resurrection() {
+		let dir = bootstrap_tempdir("pk-delete-read-surfaces");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			53,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let initial = typed_table_batch_with_names(vec![(1, "keep"), (2, "delete-me")]);
+		let mut initial_meta = typed_table_meta(&descriptor, initial.num_rows());
+		initial_meta.parent_write_id.sequence_no = 530;
+		let (initial_resp, _) = node
+			.data_server
+			.table_write(initial_meta, initial.clone())
+			.await
+			.unwrap();
+		assert_eq!(initial_resp.write.status, WriteStatus::OK);
+		let admission = validate_table_write_request_batch(
+			&initial_meta,
+			&initial,
+			&descriptor,
+			WriterNodeId::from_node_id(node.local_node),
+			initial_resp.write.commit_hlc,
+		)
+		.unwrap();
+		let keep_key = admission.key_identities[0];
+		let deleted_key = admission.key_identities[1];
+
+		let mut delete_meta: TableDeleteRowsRequestMeta = bytemuck::Zeroable::zeroed();
+		delete_meta.parent_write_id = crate::schema::ClientWriteId {
+			client_uuid: [0x53; 16],
+			sequence_no: 1,
+			idempotency_ttl_ms: 30_000,
+			_pad: 0,
+		};
+		delete_meta.client_hlc = hlc(20, 0, 53);
+		delete_meta.expected_epoch = 1;
+		delete_meta.tenant_id = tenant();
+		delete_meta.table_object_id = descriptor.table_object_id;
+		delete_meta.schema_generation = descriptor.schema_generation;
+		delete_meta.row_count = 1;
+		delete_meta.durability = DurabilityLevel::QUORUM;
+		let (delete_resp, _) = node
+			.data_server
+			.table_delete(delete_meta, vec![deleted_key])
+			.await
+			.unwrap();
+		assert_eq!(delete_resp.write.status, WriteStatus::OK);
+		assert_eq!(delete_resp.deleted_count, 1);
+
+		let pre_delete = node
+			.slab
+			.lookup_as_of(tenant(), deleted_key, initial_resp.write.commit_hlc)
+			.expect("deleted key should have a data version before delete");
+		assert!(!pre_delete.is_tombstone);
+		let at_delete = node
+			.slab
+			.lookup_as_of(tenant(), deleted_key, delete_resp.write.commit_hlc)
+			.expect("deleted key should have a tombstone at delete HLC");
+		assert!(at_delete.is_tombstone);
+		let scan_at_delete =
+			node.slab
+				.scan_as_of_with_identity(tenant(), 0, u64::MAX, delete_resp.write.commit_hlc);
+		assert!(scan_at_delete.iter().any(|(key, _)| *key == keep_key));
+		assert!(!scan_at_delete.iter().any(|(key, _)| *key == deleted_key));
+		let versions = node.slab.scan_all_versions(0, u64::MAX, hlc(0, 0, 0));
+		assert!(
+			versions
+				.iter()
+				.any(|(_, key, _, location)| *key == deleted_key && !location.is_tombstone)
+		);
+		assert!(
+			versions
+				.iter()
+				.any(|(_, key, _, location)| *key == deleted_key && location.is_tombstone)
+		);
+
+		let pk_program = pk_eq_program(2);
+		let deleted_query_meta =
+			table_query_meta_for_test(&descriptor, delete_resp.write.commit_hlc, pk_program.len());
+		let deleted_query = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(&deleted_query_meta, &pk_program)
+			.await
+			.unwrap();
+		assert_eq!(deleted_query.response.status, ReadStatus::KEY_NOT_FOUND);
+		assert_eq!(deleted_query.response.rows, 0);
+		let delete_count = node
+			.data_server
+			.execute_aggregate_local(&aggregate_count_request(
+				&descriptor,
+				530,
+				delete_resp.write.commit_hlc,
+			))
+			.await
+			.unwrap();
+		assert_eq!(delete_count.status, AggregateStatus::Success);
+		assert_eq!(count_star_partial_value(&delete_count), 1);
+
+		let resurrection = typed_table_batch_with_names(vec![(2, "back")]);
+		let mut resurrection_meta = typed_table_meta(&descriptor, resurrection.num_rows());
+		resurrection_meta.parent_write_id.sequence_no = 531;
+		let (resurrection_resp, _) = node
+			.data_server
+			.table_write(resurrection_meta, resurrection)
+			.await
+			.unwrap();
+		assert_eq!(resurrection_resp.write.status, WriteStatus::OK);
+		let latest = node
+			.slab
+			.lookup_as_of(tenant(), deleted_key, resurrection_resp.write.commit_hlc)
+			.expect("resurrected key should have a data version");
+		assert!(!latest.is_tombstone);
+
+		let latest_query_meta = table_query_meta_for_test(
+			&descriptor,
+			resurrection_resp.write.commit_hlc,
+			pk_program.len(),
+		);
+		let latest_query = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(&latest_query_meta, &pk_program)
+			.await
+			.unwrap();
+		assert_eq!(latest_query.response.status, ReadStatus::OK);
+		assert_eq!(latest_query.response.rows, 1);
+		let materialized = concat_batches(&Arc::new(typed_table_schema()), &latest_query.batches)
+			.expect("query batches concatenate");
+		let names = materialized
+			.column_by_name("name")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.unwrap();
+		assert_eq!(names.value(0), "back");
+		let resurrected_count = node
+			.data_server
+			.execute_aggregate_local(&aggregate_count_request(
+				&descriptor,
+				531,
+				resurrection_resp.write.commit_hlc,
+			))
+			.await
+			.unwrap();
+		assert_eq!(resurrected_count.status, AggregateStatus::Success);
+		assert_eq!(count_star_partial_value(&resurrected_count), 2);
 
 		node.handles.abort();
 	}

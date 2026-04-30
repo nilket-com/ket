@@ -453,6 +453,39 @@ fn row_tombstone_pair_gc_and_retombstone_noop_preserve_digest() {
 }
 
 #[test]
+fn pk_supersession_digest_counts_visible_membership_once() {
+	let tenant = TenantId::new(50);
+	let table = TableObjectId::new([0x50; 16]);
+	let row = row_key_id(50_001);
+	let element = visible_row_element(tenant, table, row);
+
+	let mut upsert = StateDigestAccumulator::new();
+	upsert.add_element(element);
+	assert_eq!(element.digest(), upsert.finish());
+
+	let duplicate_upsert = StateDigestAccumulator::from_digest(element.digest())
+		.expect("row digest should decompress");
+	assert_eq!(
+		element.digest(),
+		duplicate_upsert.finish(),
+		"upsert of an already-visible PK must not add a second visible element"
+	);
+
+	let mut delete = StateDigestAccumulator::from_digest(element.digest())
+		.expect("row digest should decompress");
+	delete.subtract_element(element);
+	assert_eq!(StateDigest::ZERO, delete.finish());
+
+	let mut resurrect = StateDigestAccumulator::new();
+	resurrect.add_element(element);
+	assert_eq!(
+		element.digest(),
+		resurrect.finish(),
+		"resurrection after a tombstone re-adds the visible PK element exactly once"
+	);
+}
+
+#[test]
 fn retention_data_row_eviction_subtracts_visible_rows() {
 	let tenant = TenantId::new(48);
 	let table = TableObjectId::new([0x48; 16]);

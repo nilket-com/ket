@@ -351,7 +351,6 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY: Self = Self(0x3A02);
 	pub const PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW: Self = Self(0x3A03);
 	pub const PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED: Self = Self(0x3A04);
-	pub const PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY: Self = Self(0x3B01);
 	pub const CONTENT_HASH_REJECTED_NON_NULL_DEFAULT: Self = Self(0x3C01);
 	pub const CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION: Self = Self(0x3C02);
 	pub const CONTENT_HASH_REJECTED_INVALID_UTF8: Self = Self(0x3C03);
@@ -395,7 +394,6 @@ impl PbcRejectCode {
 			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
 			0x3A03 => "PBC_REJECT_APPEND_ONLY_REQUIRES_MULTIROW",
 			0x3A04 => "PBC_REJECT_INTRA_BATCH_INDEX_EXHAUSTED",
-			0x3B01 => "PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY",
 			0x3C01 => "CONTENT_HASH_REJECTED_NON_NULL_DEFAULT",
 			0x3C02 => "CONTENT_HASH_REJECTED_DECIMAL_EVOLUTION",
 			0x3C03 => "CONTENT_HASH_REJECTED_INVALID_UTF8",
@@ -1054,7 +1052,10 @@ impl RowIdentityPolicy {
 	}
 
 	pub const fn supports_row_tombstones(&self) -> bool {
-		matches!(self, Self::AppendOnly | Self::AppendOnlyContentHash)
+		matches!(
+			self,
+			Self::PrimaryKey(_) | Self::AppendOnly | Self::AppendOnlyContentHash
+		)
 	}
 
 	pub const fn primary_key(&self) -> Option<&PrimaryKeyDescriptorV1> {

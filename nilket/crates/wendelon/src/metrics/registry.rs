@@ -57,6 +57,8 @@ const MULTIROW_ROWS_PER_RECORD_BUCKETS: &[u64] =
 	&[1, 2, 4, 8, 16, 32, 64, 128, 256, 1024, 4096, 65536];
 const L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS: &[u64] = &[1, 2, 4, 8, 16, 32, 64];
 const COMPRESSION_RATIO_MILLI_BUCKETS: &[u64] = &[250, 500, 750, 1000, 1250, 1500, 2000];
+const PK_ADMISSION_VISIBILITY_BUCKETS_MICROS: &[u64] =
+	&[1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000];
 
 pub fn global() -> &'static MetricsRegistry {
 	static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
@@ -304,6 +306,115 @@ impl ContentHashTableCounters {
 				name,
 				&[("tenant", &tenant.to_string()), ("table", table.as_str())],
 				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct PkDeleteOutcomeCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
+
+impl PkDeleteOutcomeCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, outcome: &str, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("PK delete outcome counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				outcome.to_string(),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("PK delete outcome counter mutex poisoned");
+		for ((tenant, table, outcome), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("outcome", outcome.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct PkTableCounters(Mutex<BTreeMap<(u64, String), u64>>);
+
+impl PkTableCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self.0.lock().expect("PK table counter mutex poisoned");
+		*counters
+			.entry((tenant_id.get(), table_object_id_label(table_object_id)))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self.0.lock().expect("PK table counter mutex poisoned");
+		for ((tenant, table), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("tenant", &tenant.to_string()), ("table", table.as_str())],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct PkAdmissionVisibilityHistograms(Mutex<BTreeMap<(u64, String), Histogram>>);
+
+impl PkAdmissionVisibilityHistograms {
+	fn observe_duration(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		duration: Duration,
+	) {
+		let mut histograms = self
+			.0
+			.lock()
+			.expect("PK visibility histogram mutex poisoned");
+		histograms
+			.entry((tenant_id.get(), table_object_id_label(table_object_id)))
+			.or_insert_with(|| Histogram::new(PK_ADMISSION_VISIBILITY_BUCKETS_MICROS))
+			.observe_duration(duration);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		let histograms = self
+			.0
+			.lock()
+			.expect("PK visibility histogram mutex poisoned");
+		for ((tenant, table), histogram) in histograms.iter() {
+			let tenant = tenant.to_string();
+			render_histogram_series(
+				out,
+				name,
+				&[("tenant", tenant.as_str()), ("table", table.as_str())],
+				&histogram.snapshot(),
 			);
 		}
 	}
@@ -1119,6 +1230,15 @@ pub struct MetricsRegistry {
 	pub storage_append_only_supersession_metadata_skipped_total: Counter,
 	storage_content_hash_admissions: ContentHashAdmissionCounters,
 	storage_content_hash_duplicate_absorptions: ContentHashTableCounters,
+	storage_pk_delete_outcomes: PkDeleteOutcomeCounters,
+	storage_pk_delete_requests: PkTableCounters,
+	storage_pk_delete_rows_deleted: PkTableCounters,
+	storage_pk_delete_rows_already_deleted: PkTableCounters,
+	storage_pk_delete_rows_not_found: PkTableCounters,
+	storage_pk_delete_resurrections: PkTableCounters,
+	storage_pk_delete_tombstone_boundary_versions_retained: PkTableCounters,
+	storage_pk_upsert_no_digest_add: PkTableCounters,
+	storage_pk_admission_visibility_lookup_seconds: PkAdmissionVisibilityHistograms,
 	storage_table_retention_policy_updates: TableRetentionPolicyCounters,
 	pub storage_table_retention_read_floor_rejects_total: Counter,
 	pub storage_table_retention_read_filtered_rows_total: Counter,
@@ -1296,6 +1416,16 @@ impl Default for MetricsRegistry {
 			storage_append_only_supersession_metadata_skipped_total: Counter::default(),
 			storage_content_hash_admissions: ContentHashAdmissionCounters::default(),
 			storage_content_hash_duplicate_absorptions: ContentHashTableCounters::default(),
+			storage_pk_delete_outcomes: PkDeleteOutcomeCounters::default(),
+			storage_pk_delete_requests: PkTableCounters::default(),
+			storage_pk_delete_rows_deleted: PkTableCounters::default(),
+			storage_pk_delete_rows_already_deleted: PkTableCounters::default(),
+			storage_pk_delete_rows_not_found: PkTableCounters::default(),
+			storage_pk_delete_resurrections: PkTableCounters::default(),
+			storage_pk_delete_tombstone_boundary_versions_retained: PkTableCounters::default(),
+			storage_pk_upsert_no_digest_add: PkTableCounters::default(),
+			storage_pk_admission_visibility_lookup_seconds:
+				PkAdmissionVisibilityHistograms::default(),
 			storage_table_retention_policy_updates: TableRetentionPolicyCounters::default(),
 			storage_table_retention_read_floor_rejects_total: Counter::default(),
 			storage_table_retention_read_filtered_rows_total: Counter::default(),
@@ -1562,6 +1692,84 @@ impl MetricsRegistry {
 	) {
 		self.storage_content_hash_duplicate_absorptions
 			.add(tenant_id, table_object_id, rows);
+	}
+
+	pub fn observe_storage_pk_delete_outcomes(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		deleted: u64,
+		already_deleted: u64,
+		not_found: u64,
+	) {
+		self.storage_pk_delete_outcomes
+			.add(tenant_id, table_object_id, "deleted", deleted);
+		self.storage_pk_delete_rows_deleted
+			.add(tenant_id, table_object_id, deleted);
+		self.storage_pk_delete_outcomes.add(
+			tenant_id,
+			table_object_id,
+			"already_deleted",
+			already_deleted,
+		);
+		self.storage_pk_delete_rows_already_deleted.add(
+			tenant_id,
+			table_object_id,
+			already_deleted,
+		);
+		self.storage_pk_delete_outcomes
+			.add(tenant_id, table_object_id, "not_found", not_found);
+		self.storage_pk_delete_rows_not_found
+			.add(tenant_id, table_object_id, not_found);
+	}
+
+	pub fn observe_storage_pk_delete_request(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_pk_delete_requests
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_pk_delete_resurrections(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		rows: u64,
+	) {
+		self.storage_pk_delete_resurrections
+			.add(tenant_id, table_object_id, rows);
+	}
+
+	pub fn observe_storage_pk_delete_tombstone_boundary_versions_retained(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		rows: u64,
+	) {
+		self.storage_pk_delete_tombstone_boundary_versions_retained
+			.add(tenant_id, table_object_id, rows);
+	}
+
+	pub fn observe_storage_pk_upsert_no_digest_add(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		rows: u64,
+	) {
+		self.storage_pk_upsert_no_digest_add
+			.add(tenant_id, table_object_id, rows);
+	}
+
+	pub fn observe_storage_pk_admission_visibility_lookup(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		duration: Duration,
+	) {
+		self.storage_pk_admission_visibility_lookup_seconds
+			.observe_duration(tenant_id, table_object_id, duration);
 	}
 
 	pub fn observe_storage_table_retention_policy_update(
@@ -2376,6 +2584,52 @@ impl MetricsRegistry {
 			"wendelon_storage_content_hash_duplicate_absorptions_total",
 			"Content-hash table duplicate rows absorbed at admission.",
 		);
+		self.storage_pk_delete_outcomes.render(
+			&mut out,
+			"wendelon_storage_pk_delete_outcomes_total",
+			"PK-keyed table delete rows classified by supersession admission outcome.",
+		);
+		self.storage_pk_delete_requests.render(
+			&mut out,
+			"wendelon_storage_pk_delete_requests_total",
+			"PK-keyed table delete requests admitted to supersession classification.",
+		);
+		self.storage_pk_delete_rows_deleted.render(
+			&mut out,
+			"wendelon_storage_pk_delete_rows_deleted_total",
+			"PK-keyed table delete rows that wrote tombstone supersession markers.",
+		);
+		self.storage_pk_delete_rows_already_deleted.render(
+			&mut out,
+			"wendelon_storage_pk_delete_rows_already_deleted_total",
+			"PK-keyed table delete rows absorbed because the latest version was already a tombstone.",
+		);
+		self.storage_pk_delete_rows_not_found.render(
+			&mut out,
+			"wendelon_storage_pk_delete_rows_not_found_total",
+			"PK-keyed table delete rows absorbed because no version existed at the delete HLC.",
+		);
+		self.storage_pk_delete_resurrections.render(
+			&mut out,
+			"wendelon_storage_pk_delete_resurrections_total",
+			"PK writes that resurrected a row whose latest prior version was a tombstone.",
+		);
+		self.storage_pk_delete_tombstone_boundary_versions_retained
+			.render(
+				&mut out,
+				"wendelon_storage_pk_delete_tombstone_boundary_versions_retained_total",
+				"PK tombstone boundary versions retained by cluster-MVCC prefix retention.",
+			);
+		self.storage_pk_upsert_no_digest_add.render(
+			&mut out,
+			"wendelon_storage_pk_upsert_no_digest_add_total",
+			"PK upsert rows whose visible-row digest add was skipped because the key was already visible.",
+		);
+		self.storage_pk_admission_visibility_lookup_seconds.render(
+			&mut out,
+			"wendelon_storage_pk_admission_visibility_lookup_seconds",
+			"Time spent resolving PK visible membership during write and delete admission.",
+		);
 		self.storage_table_retention_policy_updates.render(
 			&mut out,
 			"wendelon_storage_table_retention_policy_updates_total",
@@ -2764,6 +3018,35 @@ fn render_histogram(out: &mut String, name: &str, help: &str, snapshot: &Histogr
 	let _ = writeln!(out, "{name}_count {}", snapshot.count);
 }
 
+fn render_histogram_series(
+	out: &mut String,
+	name: &str,
+	labels: &[(&str, &str)],
+	snapshot: &HistogramSnapshot<'_>,
+) {
+	let rendered_labels = render_labels(labels);
+	let mut cumulative = 0u64;
+	for (idx, bound_micros) in snapshot.bounds_micros.iter().copied().enumerate() {
+		cumulative += snapshot.bucket_counts[idx];
+		let _ = writeln!(
+			out,
+			"{name}_bucket{{{rendered_labels},le=\"{}\"}} {cumulative}",
+			render_seconds_from_micros(bound_micros),
+		);
+	}
+	cumulative += snapshot.bucket_counts[snapshot.bounds_micros.len()];
+	let _ = writeln!(
+		out,
+		"{name}_bucket{{{rendered_labels},le=\"+Inf\"}} {cumulative}"
+	);
+	let _ = writeln!(
+		out,
+		"{name}_sum{{{rendered_labels}}} {}",
+		render_seconds_from_micros(snapshot.sum_micros)
+	);
+	let _ = writeln!(out, "{name}_count{{{rendered_labels}}} {}", snapshot.count);
+}
+
 fn render_histogram_micros(
 	out: &mut String,
 	name: &str,
@@ -2922,8 +3205,9 @@ mod tests {
 	use super::{
 		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome, PbcRuntime,
 		PendingFinalizationReplayPath, TableRetentionMetricPolicy, render_histogram,
+		table_object_id_label,
 	};
-	use crate::schema::WriteStatus;
+	use crate::schema::{TableObjectId, TenantId, WriteStatus};
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
@@ -3126,6 +3410,71 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{}{{mode=\"fixed\"}} 13",
 			namespaced_test_metric("storage_table_retention_policy_active_tables_total")
+		)));
+	}
+
+	#[test]
+	fn registry_renders_pk_delete_outcome_metric_values() {
+		let registry = MetricsRegistry::default();
+		let table = TableObjectId::new([0x50; 16]);
+		registry.observe_storage_pk_delete_request(TenantId::new(50), table);
+		registry.observe_storage_pk_delete_outcomes(TenantId::new(50), table, 3, 2, 1);
+		registry.observe_storage_pk_delete_resurrections(TenantId::new(50), table, 4);
+		registry.observe_storage_pk_delete_tombstone_boundary_versions_retained(
+			TenantId::new(50),
+			table,
+			5,
+		);
+		registry.observe_storage_pk_upsert_no_digest_add(TenantId::new(50), table, 6);
+		registry.observe_storage_pk_admission_visibility_lookup(
+			TenantId::new(50),
+			table,
+			Duration::from_micros(7),
+		);
+
+		let rendered = registry.render_prometheus();
+		let metric = namespaced_test_metric("storage_pk_delete_outcomes_total");
+		let table_label = table_object_id_label(table);
+		assert!(rendered.contains(&format!(
+			"{metric}{{tenant=\"50\",table=\"{table_label}\",outcome=\"deleted\"}} 3"
+		)));
+		assert!(rendered.contains(&format!(
+			"{metric}{{tenant=\"50\",table=\"{table_label}\",outcome=\"already_deleted\"}} 2"
+		)));
+		assert!(rendered.contains(&format!(
+			"{metric}{{tenant=\"50\",table=\"{table_label}\",outcome=\"not_found\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 1",
+			namespaced_test_metric("storage_pk_delete_requests_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 3",
+			namespaced_test_metric("storage_pk_delete_rows_deleted_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 2",
+			namespaced_test_metric("storage_pk_delete_rows_already_deleted_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 1",
+			namespaced_test_metric("storage_pk_delete_rows_not_found_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 4",
+			namespaced_test_metric("storage_pk_delete_resurrections_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 5",
+			namespaced_test_metric("storage_pk_delete_tombstone_boundary_versions_retained_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"50\",table=\"{table_label}\"}} 6",
+			namespaced_test_metric("storage_pk_upsert_no_digest_add_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{tenant=\"50\",table=\"{table_label}\"}} 0.000007",
+			namespaced_test_metric("storage_pk_admission_visibility_lookup_seconds")
 		)));
 	}
 
