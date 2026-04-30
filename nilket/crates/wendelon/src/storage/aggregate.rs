@@ -133,7 +133,7 @@ pub fn aggregate_record_batches(
 		},
 		table_object_id: request.table_object_id,
 		schema_generation: request.schema_generation,
-		schema_fingerprint: request.schema_fingerprint,
+		logical_schema_fingerprint: request.logical_schema_fingerprint,
 		aggregate_expression_digest: request.expression_digest(),
 		as_of_hlc: request.as_of_hlc,
 		max_hlc: request.as_of_hlc,
@@ -274,7 +274,7 @@ pub fn merge_aggregate_responses(
 		},
 		table_object_id: request.table_object_id,
 		schema_generation: request.schema_generation,
-		schema_fingerprint: request.schema_fingerprint,
+		logical_schema_fingerprint: request.logical_schema_fingerprint,
 		aggregate_expression_digest: request.expression_digest(),
 		as_of_hlc: request.as_of_hlc,
 		max_hlc,
@@ -1361,10 +1361,23 @@ pub fn response_crossbind_matches(
 	request: &AggregateRequest,
 	response: &AggregateResponse,
 ) -> bool {
+	let logical_fingerprint_matches =
+		response.logical_schema_fingerprint == request.logical_schema_fingerprint;
+	if logical_fingerprint_matches {
+		crate::metrics::global().observe_storage_aggregate_cache_logical_fingerprint_hit(
+			request.tenant_id,
+			request.table_object_id,
+		);
+	} else {
+		crate::metrics::global().observe_storage_aggregate_cache_logical_fingerprint_miss(
+			request.tenant_id,
+			request.table_object_id,
+		);
+	}
 	response.request_id == request.request_id
 		&& response.table_object_id == request.table_object_id
 		&& response.schema_generation == request.schema_generation
-		&& response.schema_fingerprint == request.schema_fingerprint
+		&& logical_fingerprint_matches
 		&& response.aggregate_expression_digest == request.expression_digest()
 		&& response.as_of_hlc == request.as_of_hlc
 }
@@ -1408,8 +1421,8 @@ mod tests {
 	use super::*;
 	use crate::schema::aggregate::{AGG_FORMAT_VERSION, AggregateBudgets};
 	use crate::schema::{
-		AggregateRequestId, ByteCount, Consistency, Locality, LocalityRange, RowCount,
-		TableObjectId, TenantId,
+		AggregateRequestId, ByteCount, Consistency, Locality, LocalityRange,
+		LogicalSchemaFingerprint, RowCount, TableObjectId, TenantId,
 	};
 	use arrow::array::{BooleanArray, Int64Array, StringArray, UInt32Array};
 	use arrow::datatypes::{Field, Schema};
@@ -1430,7 +1443,7 @@ mod tests {
 			tenant_id: TenantId::new(2),
 			table_object_id: TableObjectId::new([3; 16]),
 			schema_generation: 1,
-			schema_fingerprint: [4; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([4; 32]),
 			consistency: Consistency::LINEARIZABLE,
 			min_hlc: hlc(1),
 			as_of_hlc: hlc(2),
@@ -1615,6 +1628,44 @@ mod tests {
 		assert_eq!(
 			merge_aggregate_responses(&request, &[response]).unwrap_err(),
 			AggRejectCode::PartialCrossbindFailed
+		);
+	}
+
+	#[test]
+	fn response_crossbind_observes_logical_fingerprint_axis() {
+		let mut request = request(vec![AggregateExpression::count_star()]);
+		request.table_object_id = TableObjectId::new([0xA5; 16]);
+		let mut response = AggregateResponse::rejected(&request, AggRejectCode::ProgramInvalid);
+		let hit_before = crate::metrics::global()
+			.storage_aggregate_cache_logical_fingerprint_hit_total_for_test(
+				request.tenant_id,
+				request.table_object_id,
+			);
+		let miss_before = crate::metrics::global()
+			.storage_aggregate_cache_logical_fingerprint_miss_total_for_test(
+				request.tenant_id,
+				request.table_object_id,
+			);
+
+		assert!(response_crossbind_matches(&request, &response));
+		response.logical_schema_fingerprint = LogicalSchemaFingerprint::from_bytes([0xA6; 32]);
+		assert!(!response_crossbind_matches(&request, &response));
+
+		assert_eq!(
+			crate::metrics::global()
+				.storage_aggregate_cache_logical_fingerprint_hit_total_for_test(
+					request.tenant_id,
+					request.table_object_id,
+				),
+			hit_before + 1
+		);
+		assert_eq!(
+			crate::metrics::global()
+				.storage_aggregate_cache_logical_fingerprint_miss_total_for_test(
+					request.tenant_id,
+					request.table_object_id,
+				),
+			miss_before + 1
 		);
 	}
 

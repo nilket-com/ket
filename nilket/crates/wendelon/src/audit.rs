@@ -265,6 +265,7 @@ pub enum AuditOperation {
 	TenantCreated,
 	TenantQuotaUpdated,
 	TableRetentionPolicyUpdated,
+	TableSchemaDescriptorUpdated,
 	TenantSuspended,
 	TenantResumed,
 	TenantDeleteRequested,
@@ -296,6 +297,7 @@ impl AuditOperation {
 			Self::TenantCreated => "tenant.created",
 			Self::TenantQuotaUpdated => "tenant.quota_updated",
 			Self::TableRetentionPolicyUpdated => "table.retention_policy_updated",
+			Self::TableSchemaDescriptorUpdated => "table.schema_descriptor_updated",
 			Self::TenantSuspended => "tenant.suspended",
 			Self::TenantResumed => "tenant.resumed",
 			Self::TenantDeleteRequested => "tenant.delete_requested",
@@ -342,6 +344,7 @@ impl<'de> Deserialize<'de> for AuditOperation {
 			"tenant.created" => Ok(Self::TenantCreated),
 			"tenant.quota_updated" => Ok(Self::TenantQuotaUpdated),
 			"table.retention_policy_updated" => Ok(Self::TableRetentionPolicyUpdated),
+			"table.schema_descriptor_updated" => Ok(Self::TableSchemaDescriptorUpdated),
 			"tenant.suspended" => Ok(Self::TenantSuspended),
 			"tenant.resumed" => Ok(Self::TenantResumed),
 			"tenant.delete_requested" => Ok(Self::TenantDeleteRequested),
@@ -388,6 +391,7 @@ pub enum AdministrativeControlAction {
 	TenantCreate,
 	TenantQuotaUpdate,
 	TableRetentionPolicyUpdate,
+	TableSchemaDescriptorUpdate,
 	TenantSuspend,
 	TenantResume,
 	TenantDeleteRequest,
@@ -419,6 +423,22 @@ pub struct AdministrativeControlSchema {
 	pub retention_extends_window: Option<bool>,
 	#[serde(default)]
 	pub retention_extension_restores_history: Option<bool>,
+	#[serde(default)]
+	pub schema_mutation: Option<String>,
+	#[serde(default)]
+	pub schema_generation: Option<u64>,
+	#[serde(default)]
+	pub previous_schema_generation: Option<u64>,
+	#[serde(default)]
+	pub descriptor_mutation_axis: Option<String>,
+	#[serde(default)]
+	pub logical_schema_fingerprint: Option<String>,
+	#[serde(default)]
+	pub previous_logical_schema_fingerprint: Option<String>,
+	#[serde(default)]
+	pub physical_descriptor_fingerprint: Option<String>,
+	#[serde(default)]
+	pub previous_physical_descriptor_fingerprint: Option<String>,
 	#[serde(default)]
 	pub target_role: Option<String>,
 	#[serde(default)]

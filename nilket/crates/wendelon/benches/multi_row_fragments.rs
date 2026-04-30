@@ -224,7 +224,7 @@ fn bench_aggregate(
 		tenant_id: tenant(),
 		table_object_id: descriptor.table_object_id,
 		schema_generation: descriptor.schema_generation,
-		schema_fingerprint: descriptor.schema_fingerprint,
+		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 		consistency: Consistency::SERIALIZABLE,
 		min_hlc: hlc(1),
 		as_of_hlc: hlc(2),
@@ -566,7 +566,7 @@ fn bench_descriptor_with_policy(
 	)?;
 	descriptor.record_layout_policy = record_layout_policy;
 	descriptor.record_body_compression_policy = compression_policy;
-	descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint()?;
+	descriptor.refresh_descriptor_fingerprints()?;
 	descriptor.validate()?;
 	Ok(descriptor)
 }

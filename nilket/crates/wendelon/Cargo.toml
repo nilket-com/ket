@@ -114,3 +114,7 @@ harness = false
 [[bench]]
 name = "pk_delete_supersession"
 harness = false
+
+[[bench]]
+name = "descriptor_fingerprint"
+harness = false

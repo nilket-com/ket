@@ -1112,7 +1112,8 @@ fn test_adr049_content_hash_identity_boundaries() {
 		"IpcWriteOptions",
 		"encode_arrow_schema_ipc",
 		"schema_generation",
-		"schema_fingerprint",
+		"logical_schema_fingerprint",
+		"physical_descriptor_fingerprint",
 	] {
 		if production_content_hash.contains(needle) {
 			violations.push(format!(
@@ -1331,6 +1332,274 @@ fn test_adr050_pk_delete_supersession_boundaries() {
 	assert!(
 		violations.is_empty(),
 		"ADR 050 PK-delete supersession invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+/// ADR 051 architectural guards.
+///
+/// Descriptor fingerprints are split into logical schema identity
+/// and physical descriptor shape. Existing aggregate, CSB, columnar,
+/// and tiered-stats cache consumers must stay on the logical axis.
+#[test]
+fn test_adr051_descriptor_fingerprint_split_boundaries() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let fingerprint_source =
+		fs::read_to_string(manifest_dir.join("src/hash/descriptor_fingerprint.rs")).unwrap();
+	for needle in [
+		"pub struct LogicalSchemaFingerprint([u8; 32]);",
+		"pub struct PhysicalDescriptorFingerprint([u8; 32]);",
+		"pub(crate) const fn from_bytes",
+		"pub const fn as_bytes",
+		"b\"digest.table.schema.logical.v1\"",
+		"b\"digest.table.descriptor.physical.v1\"",
+	] {
+		if !fingerprint_source.contains(needle) {
+			violations.push(format!(
+				"src/hash/descriptor_fingerprint.rs: ADR 051 missing required surface {needle}"
+			));
+		}
+	}
+	if fingerprint_source.contains("Pod") || fingerprint_source.contains("Zeroable") {
+		violations.push(
+			"src/hash/descriptor_fingerprint.rs: descriptor fingerprints must not derive Pod/Zeroable"
+				.to_string(),
+		);
+	}
+
+	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
+	let descriptor_block = schema_source
+		.split_once("pub struct TableSchemaDescriptorV1 {")
+		.and_then(|(_, rest)| rest.split_once("\n}"))
+		.map(|(block, _)| block)
+		.unwrap_or("");
+	if !descriptor_block.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !descriptor_block
+			.contains("pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint")
+	{
+		violations.push(
+			"src/schema/table.rs: descriptor must carry both ADR 051 fingerprint fields"
+				.to_string(),
+		);
+	}
+	for needle in [
+		"compute_logical_schema_fingerprint",
+		"compute_physical_descriptor_fingerprint",
+		"refresh_descriptor_fingerprints",
+		"PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH",
+	] {
+		if !schema_source.contains(needle) {
+			violations.push(format!(
+				"src/schema/table.rs: missing ADR 051 symbol {needle}"
+			));
+		}
+	}
+
+	let aggregate_source =
+		fs::read_to_string(manifest_dir.join("src/schema/aggregate.rs")).unwrap();
+	if !aggregate_source.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint") {
+		violations.push(
+			"src/schema/aggregate.rs: aggregate wire must use LogicalSchemaFingerprint".to_string(),
+		);
+	}
+	if aggregate_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/schema/aggregate.rs: aggregate wire must not bind to physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let stats_source = fs::read_to_string(manifest_dir.join("src/storage/stats.rs")).unwrap();
+	for needle in [
+		"pub logical_schema_fingerprint: LogicalSchemaFingerprint",
+		"header.logical_schema_fingerprint.as_bytes()",
+		"LogicalSchemaFingerprint::from_bytes",
+	] {
+		if !stats_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/stats.rs: CSB header must use logical fingerprint via {needle}"
+			));
+		}
+	}
+	if stats_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/stats.rs: CSB eligibility must not compare descriptor physical policy"
+				.to_string(),
+		);
+	}
+
+	let columnar_source = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	if !columnar_source.contains("pub logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !columnar_source.contains("descriptor.logical_schema_fingerprint")
+	{
+		violations.push(
+			"src/storage/columnar.rs: columnar directory must bind logical fingerprint".to_string(),
+		);
+	}
+	if columnar_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/columnar.rs: columnar directory must not bind physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	if !manager_source.contains("logical_schema_fingerprint: LogicalSchemaFingerprint")
+		|| !manager_source.contains("descriptor.logical_schema_fingerprint")
+	{
+		violations.push(
+			"src/storage/manager.rs: tiered stats cache key must bind logical fingerprint"
+				.to_string(),
+		);
+	}
+	if manager_source.contains("physical_descriptor_fingerprint") {
+		violations.push(
+			"src/storage/manager.rs: tiered stats cache key must not bind physical fingerprint"
+				.to_string(),
+		);
+	}
+
+	let content_hash_source =
+		fs::read_to_string(manifest_dir.join("src/storage/content_hash.rs")).unwrap();
+	let content_hash_prod = content_hash_source
+		.split("\n#[cfg(test)]")
+		.next()
+		.unwrap_or(content_hash_source.as_str());
+	for needle in [
+		concat!("logical_schema_", "fingerprint"),
+		concat!("physical_descriptor_", "fingerprint"),
+		concat!("schema_", "fingerprint"),
+	] {
+		if content_hash_prod.contains(needle) {
+			violations.push(format!(
+				"src/storage/content_hash.rs: content-hash row identity production path must stay descriptor-fingerprint-free ({needle})"
+			));
+		}
+	}
+
+	let pk_delete_source =
+		fs::read_to_string(manifest_dir.join("src/storage/pk_delete.rs")).unwrap();
+	for needle in [
+		concat!("logical_schema_", "fingerprint"),
+		concat!("physical_descriptor_", "fingerprint"),
+		concat!("schema_", "fingerprint"),
+	] {
+		if pk_delete_source.contains(needle) {
+			violations.push(format!(
+				"src/storage/pk_delete.rs: PK delete admission must stay descriptor-fingerprint-free ({needle})"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	let forbidden = [
+		concat!("schema", "_fingerprint"),
+		concat!("Schema", "Fingerprint"),
+		concat!("PBC_REJECT_STATS_", "FINGERPRINT_MISMATCH"),
+		concat!("PBC_REJECT_STATS_PHYSICAL_", "FINGERPRINT_MISMATCH"),
+		concat!("LogicalSchemaFingerprint", "V1"),
+		concat!("PhysicalDescriptorFingerprint", "V1"),
+		concat!("DescriptorFingerprint", "V1"),
+	];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| matches!(ext, "rs" | "toml" | "sh"))
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for needle in forbidden {
+				if content
+					.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+					.any(|token| token == needle)
+				{
+					violations.push(format!(
+						"{}: ADR 051 forbidden descriptor fingerprint token {needle}",
+						path.strip_prefix(manifest_dir).unwrap_or(path).display()
+					));
+				}
+			}
+		});
+	}
+
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"descriptor_fingerprint\"") {
+		violations
+			.push("Cargo.toml: ADR 051 descriptor fingerprint bench is not registered".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for needle in [
+		"wendelon_storage_csb_merge_logical_fingerprint_mismatch_total",
+		"wendelon_storage_csb_payload_coverage_fall_through_total",
+		"wendelon_storage_csb_merge_pre_adr_051_cliff_total",
+		"wendelon_storage_aggregate_cache_logical_fingerprint_hit_total",
+		"wendelon_storage_aggregate_cache_logical_fingerprint_miss_total",
+		"wendelon_storage_descriptor_recompute_seconds",
+		"wendelon_storage_descriptor_validate_seconds",
+		"wendelon_storage_descriptor_logical_only_mutations_total",
+		"wendelon_storage_descriptor_physical_only_mutations_total",
+		"wendelon_storage_descriptor_combined_mutations_total",
+	] {
+		if !metrics_source.contains(needle) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 051 metric {needle}"
+			));
+		}
+	}
+
+	if !manifest_dir
+		.join("plans/ops/runbooks/descriptor_fingerprint_split.md")
+		.exists()
+	{
+		violations.push(
+			"plans/ops/runbooks/descriptor_fingerprint_split.md: ADR 051 runbook is missing"
+				.to_string(),
+		);
+	}
+	let runbook_index =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_index.contains("descriptor_fingerprint_split.md") {
+		violations.push("plans/ops/runbooks/README.md: ADR 051 runbook is not listed".to_string());
+	}
+	let runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/descriptor_fingerprint_split.md"))
+			.unwrap();
+	if !runbook.contains("table.schema_descriptor_updated") {
+		violations.push(
+			"plans/ops/runbooks/descriptor_fingerprint_split.md: ADR 051 audit event is not documented"
+				.to_string(),
+		);
+	}
+	let audit_source = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	if !audit_source.contains("table.schema_descriptor_updated")
+		|| !audit_source.contains("TableSchemaDescriptorUpdate")
+	{
+		violations
+			.push("src/audit.rs: ADR 051 descriptor mutation audit surface is missing".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 051 descriptor fingerprint invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

@@ -1041,7 +1041,7 @@ mod tests {
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
 		descriptor.record_body_compression_policy =
 			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor
 	}
 
@@ -1103,7 +1103,7 @@ mod tests {
 		);
 		descriptor.record_body_compression_policy =
 			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor
 	}
 

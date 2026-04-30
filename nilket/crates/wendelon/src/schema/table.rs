@@ -1,3 +1,6 @@
+use crate::hash::descriptor_fingerprint::{
+	self, LogicalSchemaFingerprint, PhysicalDescriptorFingerprint,
+};
 use crate::schema::pbc::{
 	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, Program as PbcProgram,
 };
@@ -344,7 +347,7 @@ impl PbcRejectCode {
 	pub const PBC_REJECT_STATS_BITS_INVALID: Self = Self(0x3906);
 	pub const PBC_REJECT_STATS_SMALLSET_INVALID: Self = Self(0x3907);
 	pub const PBC_REJECT_STATS_FORMAT_VERSION: Self = Self(0x3908);
-	pub const PBC_REJECT_STATS_FINGERPRINT_MISMATCH: Self = Self(0x3909);
+	pub const PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH: Self = Self(0x3909);
 	pub const PBC_REJECT_STATS_DECRYPT_FAILED: Self = Self(0x390A);
 	// ADR 045 reject codes for append-only table operations.
 	pub const PBC_REJECT_APPEND_ONLY_UPDATE: Self = Self(0x3A01);
@@ -388,7 +391,7 @@ impl PbcRejectCode {
 			0x3906 => "PBC_REJECT_STATS_BITS_INVALID",
 			0x3907 => "PBC_REJECT_STATS_SMALLSET_INVALID",
 			0x3908 => "PBC_REJECT_STATS_FORMAT_VERSION",
-			0x3909 => "PBC_REJECT_STATS_FINGERPRINT_MISMATCH",
+			0x3909 => "PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH",
 			0x390A => "PBC_REJECT_STATS_DECRYPT_FAILED",
 			0x3A01 => "PBC_REJECT_APPEND_ONLY_UPDATE",
 			0x3A02 => "PBC_REJECT_APPEND_ONLY_DELETE_BY_KEY",
@@ -876,7 +879,8 @@ pub struct TableSchemaDescriptorV1 {
 	pub stats_policy: ColumnStatsPolicyV1,
 	pub record_layout_policy: RecordLayoutPolicy,
 	pub record_body_compression_policy: RecordBodyCompressionPolicy,
-	pub schema_fingerprint: [u8; 32],
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
 	pub evolution_policy: SchemaEvolutionPolicyV1,
 }
 
@@ -929,10 +933,11 @@ impl TableSchemaDescriptorV1 {
 			stats_policy: ColumnStatsPolicyV1::default(),
 			record_layout_policy,
 			record_body_compression_policy,
-			schema_fingerprint: [0; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0; 32]),
+			physical_descriptor_fingerprint: PhysicalDescriptorFingerprint::from_bytes([0; 32]),
 			evolution_policy,
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint()?;
+		descriptor.refresh_descriptor_fingerprints()?;
 		descriptor.validate()?;
 		Ok(descriptor)
 	}
@@ -959,16 +964,36 @@ impl TableSchemaDescriptorV1 {
 		self.row_identity_policy.supports_row_tombstones()
 	}
 
-	pub fn compute_schema_fingerprint(&self) -> std::io::Result<[u8; 32]> {
-		let mut canonical = self.clone();
-		canonical.schema_fingerprint = [0; 32];
-		let bytes = postcard::to_allocvec(&canonical).map_err(|err| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("failed to encode table schema descriptor: {err}"),
-			)
-		})?;
-		Ok(crate::hash::blake3::digest(&bytes))
+	pub fn compute_logical_schema_fingerprint(&self) -> std::io::Result<LogicalSchemaFingerprint> {
+		descriptor_fingerprint::compute_logical_schema_fingerprint(
+			&self.table_object_id,
+			&self.namespace,
+			&self.table_name,
+			&self.arrow_schema_ipc,
+			&self.row_identity_policy,
+			&self.evolution_policy,
+		)
+	}
+
+	pub fn compute_physical_descriptor_fingerprint(
+		&self,
+		logical: LogicalSchemaFingerprint,
+	) -> std::io::Result<PhysicalDescriptorFingerprint> {
+		descriptor_fingerprint::compute_physical_descriptor_fingerprint(
+			logical,
+			&self.locality_policy,
+			&self.record_layout_policy,
+			&self.record_body_compression_policy,
+			&self.stats_policy,
+		)
+	}
+
+	pub fn refresh_descriptor_fingerprints(&mut self) -> std::io::Result<()> {
+		let logical = self.compute_logical_schema_fingerprint()?;
+		let physical = self.compute_physical_descriptor_fingerprint(logical)?;
+		self.logical_schema_fingerprint = logical;
+		self.physical_descriptor_fingerprint = physical;
+		Ok(())
 	}
 
 	pub fn validate(&self) -> std::io::Result<()> {
@@ -980,11 +1005,18 @@ impl TableSchemaDescriptorV1 {
 		}
 		validate_descriptor_name("namespace", self.namespace.as_str())?;
 		validate_descriptor_name("table name", self.table_name.as_str())?;
-		let expected = self.compute_schema_fingerprint()?;
-		if self.schema_fingerprint != expected {
+		let expected_logical = self.compute_logical_schema_fingerprint()?;
+		if self.logical_schema_fingerprint != expected_logical {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
-				"table schema descriptor fingerprint mismatch",
+				"table schema descriptor logical fingerprint mismatch",
+			));
+		}
+		let expected_physical = self.compute_physical_descriptor_fingerprint(expected_logical)?;
+		if self.physical_descriptor_fingerprint != expected_physical {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"table schema descriptor physical fingerprint mismatch",
 			));
 		}
 		let schema = self.arrow_schema()?;
@@ -3605,7 +3637,7 @@ mod tests {
 	) -> std::io::Result<TableSchemaDescriptorV1> {
 		let mut descriptor = descriptor_for(schema);
 		descriptor.stats_policy = stats_policy;
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint()?;
+		descriptor.refresh_descriptor_fingerprints()?;
 		descriptor.validate()?;
 		Ok(descriptor)
 	}
@@ -3760,7 +3792,77 @@ mod tests {
 	}
 
 	#[test]
-	fn descriptor_compression_policy_defaults_by_layout_and_changes_fingerprint() {
+	fn descriptor_fingerprints_split_logical_and_physical_axes() {
+		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
+
+		let mut compression_retune = descriptor.clone();
+		compression_retune.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		compression_retune
+			.refresh_descriptor_fingerprints()
+			.unwrap();
+		assert_eq!(
+			compression_retune.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_ne!(
+			compression_retune.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+
+		let mut generation_bump = descriptor.clone();
+		generation_bump.schema_generation += 1;
+		generation_bump.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			generation_bump.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_eq!(
+			generation_bump.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+
+		let mut contract_relabel = descriptor.clone();
+		contract_relabel.contract_version += 1;
+		contract_relabel.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			contract_relabel.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_eq!(
+			contract_relabel.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+
+		let mut renamed = descriptor.clone();
+		renamed.table_name = "events_renamed".to_owned();
+		renamed.refresh_descriptor_fingerprints().unwrap();
+		assert_ne!(
+			renamed.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_ne!(
+			renamed.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+	}
+
+	#[test]
+	fn descriptor_physical_fingerprint_stacks_logical_fingerprint() {
+		let descriptor = descriptor_for(&table_schema(DataType::Int64, false));
+		let mut stale_physical = descriptor.clone();
+		stale_physical.table_name = "events_renamed".to_owned();
+		stale_physical.logical_schema_fingerprint =
+			stale_physical.compute_logical_schema_fingerprint().unwrap();
+
+		let err = stale_physical.validate().unwrap_err();
+		assert!(
+			err.to_string().contains("physical fingerprint mismatch"),
+			"stale physical fingerprint should reject after logical-only refresh: {err}"
+		);
+	}
+
+	#[test]
+	fn descriptor_compression_policy_defaults_by_layout_and_changes_physical_fingerprint() {
 		let schema = table_schema(DataType::Int64, false);
 		let single = descriptor_for(&schema);
 		assert_eq!(
@@ -3787,9 +3889,16 @@ mod tests {
 
 		let mut explicit = single.clone();
 		explicit.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
-		explicit.schema_fingerprint = explicit.compute_schema_fingerprint().unwrap();
+		explicit.refresh_descriptor_fingerprints().unwrap();
 		explicit.validate().unwrap();
-		assert_ne!(single.schema_fingerprint, explicit.schema_fingerprint);
+		assert_eq!(
+			single.logical_schema_fingerprint,
+			explicit.logical_schema_fingerprint
+		);
+		assert_ne!(
+			single.physical_descriptor_fingerprint,
+			explicit.physical_descriptor_fingerprint
+		);
 
 		let encoded = encode_table_schema_descriptor_v1(&explicit).unwrap();
 		let decoded = decode_table_schema_descriptor_v1(&encoded).unwrap();
@@ -4108,14 +4217,15 @@ mod tests {
 		layout_change.schema_generation = 3;
 		layout_change.record_layout_policy =
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
-		layout_change.schema_fingerprint = layout_change.compute_schema_fingerprint().unwrap();
+		layout_change.refresh_descriptor_fingerprints().unwrap();
 		validate_table_schema_evolution(&previous, &layout_change).unwrap();
 
 		let mut compression_change = next.clone();
 		compression_change.schema_generation = 3;
 		compression_change.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
-		compression_change.schema_fingerprint =
-			compression_change.compute_schema_fingerprint().unwrap();
+		compression_change
+			.refresh_descriptor_fingerprints()
+			.unwrap();
 		validate_table_schema_evolution(&previous, &compression_change).unwrap();
 	}
 
@@ -5147,7 +5257,8 @@ mod tests {
 		)
 		.unwrap();
 		assert_ne!(
-			pk_descriptor.schema_fingerprint, append_only_descriptor.schema_fingerprint,
+			pk_descriptor.logical_schema_fingerprint,
+			append_only_descriptor.logical_schema_fingerprint,
 			"row_identity_policy must contribute to the schema fingerprint"
 		);
 	}
@@ -5283,10 +5394,13 @@ mod tests {
 		)
 		.unwrap();
 		assert_ne!(
-			content_hash.schema_fingerprint,
-			append_only.schema_fingerprint
+			content_hash.logical_schema_fingerprint,
+			append_only.logical_schema_fingerprint
 		);
-		assert_ne!(content_hash.schema_fingerprint, pk.schema_fingerprint);
+		assert_ne!(
+			content_hash.logical_schema_fingerprint,
+			pk.logical_schema_fingerprint
+		);
 	}
 
 	#[test]

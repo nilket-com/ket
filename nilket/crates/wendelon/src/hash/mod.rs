@@ -1,5 +1,6 @@
 pub mod blake3;
 pub mod content;
+pub mod descriptor_fingerprint;
 pub mod identity;
 #[cfg(test)]
 mod lthash_baseline;

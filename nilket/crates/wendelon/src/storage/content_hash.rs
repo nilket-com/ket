@@ -669,9 +669,9 @@ where
 mod tests {
 	use super::*;
 	use crate::schema::{
-		DurabilityLevel, HybridTimestamp, LocalityPolicyV1, MultiRowLayoutDescriptor, NodeId,
-		RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		encode_table_write_row_count,
+		ColumnBloomSpecV1, ColumnStatsPolicyV1, DurabilityLevel, HybridTimestamp, LocalityPolicyV1,
+		MultiRowLayoutDescriptor, NodeId, RecordLayoutPolicy, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, encode_table_write_row_count,
 	};
 	use arrow::array::{
 		ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int64Array, LargeBinaryArray,
@@ -739,7 +739,7 @@ mod tests {
 		let old_descriptor = descriptor(&old_schema);
 		let mut new_descriptor = descriptor(&new_schema);
 		new_descriptor.schema_generation = 2;
-		new_descriptor.schema_fingerprint = new_descriptor.compute_schema_fingerprint().unwrap();
+		new_descriptor.refresh_descriptor_fingerprints().unwrap();
 		new_descriptor.validate().unwrap();
 
 		let old_batch = RecordBatch::try_new(
@@ -768,6 +768,86 @@ mod tests {
 		assert_eq!(
 			content_hash_row_key_id(tenant, old_descriptor.table_object_id, old_bytes.as_slice()),
 			content_hash_row_key_id(tenant, new_descriptor.table_object_id, new_bytes.as_slice())
+		);
+	}
+
+	#[test]
+	fn content_hash_identity_ignores_descriptor_fingerprint_bytes() {
+		let schema = Schema::new(vec![
+			Field::new("event_id", DataType::Int64, false),
+			Field::new("payload", DataType::LargeBinary, true),
+		]);
+		let descriptor = descriptor(&schema);
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![42_i64])) as ArrayRef,
+				Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_slice())])) as ArrayRef,
+			],
+		)
+		.unwrap();
+		let canonical = encode_row_canonical(&descriptor, &batch, 0).unwrap();
+		let tenant = TenantId::new(7);
+		let expected =
+			content_hash_row_key_id(tenant, descriptor.table_object_id, canonical.as_slice());
+
+		let mut tampered = descriptor.clone();
+		tampered.logical_schema_fingerprint =
+			crate::schema::LogicalSchemaFingerprint::from_bytes([0x51; 32]);
+		tampered.physical_descriptor_fingerprint =
+			crate::schema::PhysicalDescriptorFingerprint::from_bytes([0x52; 32]);
+		let tampered_canonical = encode_row_canonical(&tampered, &batch, 0).unwrap();
+
+		assert_eq!(tampered_canonical, canonical);
+		assert_eq!(
+			content_hash_row_key_id(
+				tenant,
+				tampered.table_object_id,
+				tampered_canonical.as_slice()
+			),
+			expected
+		);
+	}
+
+	#[test]
+	fn content_hash_identity_survives_physical_retune() {
+		let schema = Schema::new(vec![
+			Field::new("event_id", DataType::Int64, false),
+			Field::new("payload", DataType::LargeBinary, true),
+		]);
+		let descriptor = descriptor(&schema);
+		let mut retuned = descriptor.clone();
+		retuned.schema_generation = 2;
+		retuned.stats_policy = ColumnStatsPolicyV1 {
+			bloom_filters: vec![ColumnBloomSpecV1::new("event_id")],
+			..ColumnStatsPolicyV1::default()
+		};
+		retuned.refresh_descriptor_fingerprints().unwrap();
+		retuned.validate().unwrap();
+		assert_eq!(
+			retuned.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_ne!(
+			retuned.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from(vec![42_i64])) as ArrayRef,
+				Arc::new(LargeBinaryArray::from(vec![Some(b"payload".as_slice())])) as ArrayRef,
+			],
+		)
+		.unwrap();
+		let tenant = TenantId::new(7);
+		let before = encode_row_canonical(&descriptor, &batch, 0).unwrap();
+		let after = encode_row_canonical(&retuned, &batch, 0).unwrap();
+
+		assert_eq!(after, before);
+		assert_eq!(
+			content_hash_row_key_id(tenant, descriptor.table_object_id, before.as_slice()),
+			content_hash_row_key_id(tenant, retuned.table_object_id, after.as_slice())
 		);
 	}
 

@@ -213,6 +213,25 @@ The pilot ships with the following Prometheus/OpenMetrics surface. Metric names 
 | `wendelon_storage_migration_reclaimed_slabs_total` | counter | none | Tombstoned slabs reclaimed after migration |
 | `wendelon_storage_migration_reclaimed_bytes_total` | counter | none | Bytes reclaimed after migration |
 
+#### Descriptor Fingerprints / CSB
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `wendelon_storage_csb_merge_logical_fingerprint_mismatch_total` | counter | `tenant`, `table` | CSB direct-answer or merge candidates rejected because logical schema fingerprints differed |
+| `wendelon_storage_csb_payload_coverage_fall_through_total` | counter | `tenant`, `table`, `reason` | Logical-fingerprint matches that fell through because parsed stats payload coverage was insufficient |
+| `wendelon_storage_csb_merge_pre_adr_051_cliff_total` | counter | `tenant`, `table` | CSB candidates whose table and generation matched but whose fingerprint slot did not match the ADR 051 logical fingerprint |
+| `wendelon_storage_aggregate_cache_logical_fingerprint_hit_total` | counter | `tenant`, `table` | Aggregate response cross-bind checks whose logical schema fingerprint matched the request |
+| `wendelon_storage_aggregate_cache_logical_fingerprint_miss_total` | counter | `tenant`, `table` | Aggregate response cross-bind checks whose logical schema fingerprint differed from the request |
+| `wendelon_storage_descriptor_recompute_seconds` | histogram | `tenant`, `table` | Descriptor logical and physical fingerprint recompute duration on schema-update submission |
+| `wendelon_storage_descriptor_validate_seconds` | histogram | `tenant`, `table` | Descriptor validation duration on schema-update submission |
+| `wendelon_storage_descriptor_logical_only_mutations_total` | counter | `tenant`, `table` | Accepted descriptor mutations where only the logical fingerprint changed. Expected zero by ADR 051 stacking; nonzero indicates an invariant breach or future preimage change |
+| `wendelon_storage_descriptor_physical_only_mutations_total` | counter | `tenant`, `table` | Accepted descriptor mutations where only the physical descriptor fingerprint changed |
+| `wendelon_storage_descriptor_combined_mutations_total` | counter | `tenant`, `table` | Accepted descriptor mutations where both descriptor fingerprints changed |
+
+These ADR 051 diagnostics are table-scoped because the first operational
+question is which descriptor axis or stats policy changed. Keep long-term
+dashboards aggregated by job / cluster and use the table labels for
+short-window rollout triage.
+
 #### Table Retention
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|

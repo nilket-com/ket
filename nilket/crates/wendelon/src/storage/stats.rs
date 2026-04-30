@@ -1,3 +1,4 @@
+use crate::schema::LogicalSchemaFingerprint;
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
 	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1,
@@ -68,7 +69,7 @@ pub const ARROW_STATS_TAG_BOOLEAN: u8 = 0x40;
 pub struct ColumnStatsBlockHeader {
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
-	pub schema_fingerprint: [u8; 32],
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 	pub row_count: u64,
 	pub column_block_count: u32,
 }
@@ -77,7 +78,7 @@ pub struct ColumnStatsBlockHeader {
 pub struct ColumnStatsDescriptorIdentity {
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
-	pub schema_fingerprint: [u8; 32],
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 }
 
 impl ColumnStatsDescriptorIdentity {
@@ -85,7 +86,7 @@ impl ColumnStatsDescriptorIdentity {
 		Self {
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 		}
 	}
 
@@ -93,7 +94,7 @@ impl ColumnStatsDescriptorIdentity {
 		Self {
 			table_object_id: header.table_object_id,
 			schema_generation: header.schema_generation,
-			schema_fingerprint: header.schema_fingerprint,
+			logical_schema_fingerprint: header.logical_schema_fingerprint,
 		}
 	}
 }
@@ -165,7 +166,7 @@ pub fn encode_column_stats_block(
 	out.extend_from_slice(&COLUMN_STATS_BLOCK_FORMAT_VERSION.to_be_bytes());
 	out.extend_from_slice(header.table_object_id.as_bytes());
 	out.extend_from_slice(&header.schema_generation.to_be_bytes());
-	out.extend_from_slice(&header.schema_fingerprint);
+	out.extend_from_slice(header.logical_schema_fingerprint.as_bytes());
 	out.extend_from_slice(&header.row_count.to_be_bytes());
 	out.extend_from_slice(&header.column_block_count.to_be_bytes());
 	out.extend_from_slice(&0_u32.to_be_bytes());
@@ -207,8 +208,8 @@ pub fn parse_column_stats_block(bytes: &[u8]) -> std::io::Result<ParsedColumnSta
 	let mut table_object_id = [0_u8; 16];
 	table_object_id.copy_from_slice(&bytes[12..28]);
 	let schema_generation = u64::from_be_bytes(bytes[28..36].try_into().expect("slice len"));
-	let mut schema_fingerprint = [0_u8; 32];
-	schema_fingerprint.copy_from_slice(&bytes[36..68]);
+	let mut logical_schema_fingerprint = [0_u8; 32];
+	logical_schema_fingerprint.copy_from_slice(&bytes[36..68]);
 	let row_count = u64::from_be_bytes(bytes[68..76].try_into().expect("slice len"));
 	let column_block_count = u32::from_be_bytes(bytes[76..80].try_into().expect("slice len"));
 	if bytes[80..84] != [0, 0, 0, 0] {
@@ -285,7 +286,9 @@ pub fn parse_column_stats_block(bytes: &[u8]) -> std::io::Result<ParsedColumnSta
 		header: ColumnStatsBlockHeader {
 			table_object_id: TableObjectId::new(table_object_id),
 			schema_generation,
-			schema_fingerprint,
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes(
+				logical_schema_fingerprint,
+			),
 			row_count,
 			column_block_count: u32::try_from(column_block_count).expect("parsed from u32"),
 		},
@@ -612,7 +615,7 @@ fn build_column_stats_block_internal(
 	let header = ColumnStatsBlockHeader {
 		table_object_id: descriptor.table_object_id,
 		schema_generation: descriptor.schema_generation,
-		schema_fingerprint: descriptor.schema_fingerprint,
+		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 		row_count: u64::try_from(batch.num_rows())
 			.map_err(|_| Error::new(ErrorKind::InvalidInput, "CSB row_count exceeds u64::MAX"))?,
 		column_block_count: u32::try_from(columns.len()).map_err(|_| {
@@ -1775,7 +1778,7 @@ mod tests {
 		let header = ColumnStatsBlockHeader {
 			table_object_id: TableObjectId::new([7; 16]),
 			schema_generation: 42,
-			schema_fingerprint: [0xAB; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0xAB; 32]),
 			row_count: 3,
 			column_block_count: 1,
 		};
@@ -1812,14 +1815,16 @@ mod tests {
 		for (index, byte) in table_object_id.iter_mut().enumerate() {
 			*byte = 0x10 + index as u8;
 		}
-		let mut schema_fingerprint = [0_u8; 32];
-		for (index, byte) in schema_fingerprint.iter_mut().enumerate() {
+		let mut logical_schema_fingerprint = [0_u8; 32];
+		for (index, byte) in logical_schema_fingerprint.iter_mut().enumerate() {
 			*byte = 0xA0 + index as u8;
 		}
 		let header = ColumnStatsBlockHeader {
 			table_object_id: TableObjectId::new(table_object_id),
 			schema_generation: 0x0102_0304_0506_0708,
-			schema_fingerprint,
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes(
+				logical_schema_fingerprint,
+			),
 			row_count: 3,
 			column_block_count: 1,
 		};
@@ -1845,7 +1850,7 @@ mod tests {
 		assert_eq!(&encoded[8..12], &[0, 0, 0, 1]);
 		assert_eq!(&encoded[12..28], table_object_id.as_slice());
 		assert_eq!(&encoded[28..36], &[1, 2, 3, 4, 5, 6, 7, 8]);
-		assert_eq!(&encoded[36..68], schema_fingerprint.as_slice());
+		assert_eq!(&encoded[36..68], logical_schema_fingerprint.as_slice());
 		assert_eq!(&encoded[68..76], &[0, 0, 0, 0, 0, 0, 0, 3]);
 		assert_eq!(&encoded[76..80], &[0, 0, 0, 1]);
 		assert_eq!(&encoded[80..84], &[0, 0, 0, 0]);
@@ -1884,7 +1889,7 @@ mod tests {
 		let header = ColumnStatsBlockHeader {
 			table_object_id: TableObjectId::new([1; 16]),
 			schema_generation: 1,
-			schema_fingerprint: [2; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([2; 32]),
 			row_count: 0,
 			column_block_count: 0,
 		};
@@ -1940,7 +1945,7 @@ mod tests {
 		let header = ColumnStatsBlockHeader {
 			table_object_id: TableObjectId::new([2; 16]),
 			schema_generation: 9,
-			schema_fingerprint: [3; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([3; 32]),
 			row_count: 4,
 			column_block_count: 2,
 		};
@@ -1956,11 +1961,13 @@ mod tests {
 		);
 
 		let mut mismatched = header.clone();
-		mismatched.schema_fingerprint[0] ^= 0xFF;
+		let mut fingerprint = *mismatched.logical_schema_fingerprint.as_bytes();
+		fingerprint[0] ^= 0xFF;
+		mismatched.logical_schema_fingerprint = LogicalSchemaFingerprint::from_bytes(fingerprint);
 		let err = validate_column_stats_compaction_inputs(&[header, mismatched]).unwrap_err();
 		assert!(
 			err.to_string().contains("descriptor identity mismatch"),
-			"schema_fingerprint mismatch must reject as compaction eligibility: {err}"
+			"logical_schema_fingerprint mismatch must reject as compaction eligibility: {err}"
 		);
 	}
 
@@ -2138,7 +2145,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2181,7 +2188,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2245,7 +2252,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2294,7 +2301,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2352,7 +2359,7 @@ mod tests {
 			hll_distincts: vec![hll_spec.clone()],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let mut values = (0..100).map(Some).collect::<Vec<Option<i64>>>();
 		values.extend([Some(3), Some(3), Some(99)]);
 		let batch = RecordBatch::try_new(
@@ -2403,7 +2410,7 @@ mod tests {
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2502,7 +2509,7 @@ mod tests {
 			hll_distincts: vec![ColumnHllSpecV1::new("region")],
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2781,8 +2788,8 @@ mod tests {
 			descriptor.schema_generation
 		);
 		assert_eq!(
-			parsed.header.schema_fingerprint,
-			descriptor.schema_fingerprint
+			parsed.header.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
 		);
 		assert_eq!(parsed.header.row_count, 3);
 		assert_eq!(parsed.columns.len(), 2);
@@ -2935,7 +2942,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -2987,7 +2994,7 @@ mod tests {
 			}],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![

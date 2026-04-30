@@ -123,6 +123,22 @@ async fn set_table_retention_policy_commits_through_control_ring() {
 	assert_eq!(lifecycle.policy_generation, PolicyGeneration::new(1));
 	assert_eq!(lifecycle.retention, policy);
 	assert_eq!(lifecycle.updated_at_hlc, hlc(90));
+	let catalog_descriptor = snapshot
+		.table_schemas
+		.get(
+			TenantId::ZERO,
+			descriptor.table_object_id,
+			descriptor.schema_generation,
+		)
+		.expect("retention updates must not rewrite table descriptor");
+	assert_eq!(
+		catalog_descriptor.logical_schema_fingerprint,
+		descriptor.logical_schema_fingerprint
+	);
+	assert_eq!(
+		catalog_descriptor.physical_descriptor_fingerprint,
+		descriptor.physical_descriptor_fingerprint
+	);
 
 	support::abort_node(&node);
 }

@@ -59,15 +59,16 @@ use crate::consensus::{
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
-	SchemaMutationKindV1, SchemaObjectKind, decode_schema_update_envelope_v1,
+	SchemaMutationKindV1, SchemaObjectKind, SchemaUpdateEnvelopeV1,
+	decode_schema_update_envelope_v1,
 };
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
 	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
 	RaftLogEntryFixed, RowIdentityPolicy, SlabId, SnapshotHeader, TableLifecycleCatalog,
-	TableRetentionPolicy, TableSchemaCatalogV1, TenantId, TenantKekId, WALRecordHeader,
-	decode_table_schema_descriptor_v1, validate_table_schema_evolution,
+	TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptorV1, TenantId, TenantKekId,
+	WALRecordHeader, decode_table_schema_descriptor_v1, validate_table_schema_evolution,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -2396,7 +2397,8 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				) {
 					requires_tenant_kek_snapshot_sync = true;
 				}
-				let audit_context = retention_audit_context(&guard.state, &entry);
+				let retention_audit_context = retention_audit_context(&guard.state, &entry);
+				let schema_audit_context = schema_audit_context(&guard.state, &entry);
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
@@ -2425,7 +2427,8 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						materializer.local_node,
 						&entry,
 						&resp,
-						audit_context,
+						retention_audit_context,
+						schema_audit_context,
 					) {
 						materializer.tracker.note_authoritative_event();
 						pending_audit_events.push(event);
@@ -2725,6 +2728,30 @@ struct RetentionAuditContext {
 	previous_policy: Option<TableRetentionPolicy>,
 }
 
+#[derive(Clone, Debug)]
+struct SchemaAuditContext {
+	envelope: SchemaUpdateEnvelopeV1,
+	descriptor: TableSchemaDescriptorV1,
+	previous_descriptor: Option<TableSchemaDescriptorV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorMutationAxis {
+	LogicalOnly,
+	PhysicalOnly,
+	Combined,
+}
+
+impl DescriptorMutationAxis {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::LogicalOnly => "logical_only",
+			Self::PhysicalOnly => "physical_only",
+			Self::Combined => "combined",
+		}
+	}
+}
+
 fn retention_audit_context(
 	state: &SmState,
 	entry: &Entry<WendelonTypeConfig>,
@@ -2747,13 +2774,44 @@ fn retention_audit_context(
 	})
 }
 
+fn schema_audit_context(
+	state: &SmState,
+	entry: &Entry<WendelonTypeConfig>,
+) -> Option<SchemaAuditContext> {
+	let EntryPayload::Normal(WendelonRequest::SchemaUpdate(bytes)) = &entry.payload else {
+		return None;
+	};
+	let envelope = decode_schema_update_envelope_v1(bytes).ok()?;
+	if envelope.object.kind != SchemaObjectKind::Table
+		|| !matches!(
+			envelope.mutation,
+			SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter
+		) {
+		return None;
+	}
+	let descriptor = decode_table_schema_descriptor_v1(&envelope.payload).ok()?;
+	let previous_descriptor = state
+		.table_schemas
+		.latest_by_name(
+			envelope.tenant_id,
+			envelope.object.namespace.as_str(),
+			envelope.object.name.as_str(),
+		)
+		.cloned();
+	Some(SchemaAuditContext {
+		envelope,
+		descriptor,
+		previous_descriptor,
+	})
+}
+
 #[cfg(test)]
 fn raft_audit_event(
 	local_node: SchemaNodeId,
 	entry: &Entry<WendelonTypeConfig>,
 	resp: &WendelonResponse,
 ) -> Option<AuditEvent> {
-	raft_audit_event_with_context(local_node, entry, resp, None)
+	raft_audit_event_with_context(local_node, entry, resp, None, None)
 }
 
 fn raft_audit_event_with_context(
@@ -2761,6 +2819,7 @@ fn raft_audit_event_with_context(
 	entry: &Entry<WendelonTypeConfig>,
 	resp: &WendelonResponse,
 	retention_context: Option<RetentionAuditContext>,
+	schema_context: Option<SchemaAuditContext>,
 ) -> Option<AuditEvent> {
 	let EntryPayload::Normal(req) = &entry.payload else {
 		return None;
@@ -3085,6 +3144,113 @@ fn raft_audit_event_with_context(
 				.with_parameters(audit_outcome_parameters(resp)),
 			)
 		},
+		WendelonRequest::SchemaUpdate(_) => {
+			let context = schema_context?;
+			let table_object_id = format_bytes_hex(context.descriptor.table_object_id.as_bytes());
+			let schema_mutation = schema_mutation_label(context.envelope.mutation);
+			let descriptor_axis = descriptor_mutation_axis(
+				context.previous_descriptor.as_ref(),
+				&context.descriptor,
+			)
+			.map(DescriptorMutationAxis::as_str)
+			.unwrap_or("unchanged");
+			let logical_schema_fingerprint =
+				format_bytes_hex(context.descriptor.logical_schema_fingerprint.as_bytes());
+			let physical_descriptor_fingerprint =
+				format_bytes_hex(context.descriptor.physical_descriptor_fingerprint.as_bytes());
+			let previous_schema_generation = context
+				.previous_descriptor
+				.as_ref()
+				.map(|descriptor| descriptor.schema_generation);
+			let previous_logical_schema_fingerprint = context
+				.previous_descriptor
+				.as_ref()
+				.map(|descriptor| format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes()));
+			let previous_physical_descriptor_fingerprint =
+				context.previous_descriptor.as_ref().map(|descriptor| {
+					format_bytes_hex(descriptor.physical_descriptor_fingerprint.as_bytes())
+				});
+			Some(
+				AuditEvent::new(
+					AuditAuthority::RaftLog,
+					AuditOperation::TableSchemaDescriptorUpdated,
+					local_node,
+					format!(
+						"raft_log_index={} raft_term={} tenant_id={} table_object_id={} schema_mutation={} expected_generation={} requested_generation={} previous_schema_generation={} schema_generation={} descriptor_mutation_axis={} logical_schema_fingerprint={} physical_descriptor_fingerprint={} {}",
+						entry.log_id.index,
+						entry.log_id.leader_id.term,
+						context.envelope.tenant_id.get(),
+						table_object_id,
+						schema_mutation,
+						context.envelope.expected_generation.get(),
+						context.envelope.requested_generation.get(),
+						previous_schema_generation
+							.map(|generation| generation.to_string())
+							.unwrap_or_else(|| "none".to_string()),
+						context.descriptor.schema_generation,
+						descriptor_axis,
+						logical_schema_fingerprint,
+						physical_descriptor_fingerprint,
+						audit_outcome_message(resp),
+					),
+				)
+				.with_outcome(outcome)
+				.with_raft_log_index(entry.log_id.index)
+				.with_parameter("raft_term", entry.log_id.leader_id.term)
+				.with_parameter("tenant_id", context.envelope.tenant_id.get())
+				.with_parameter("table_object_id", table_object_id.clone())
+				.with_parameter("schema_mutation", schema_mutation)
+				.with_parameter(
+					"expected_generation",
+					context.envelope.expected_generation.get(),
+				)
+				.with_parameter(
+					"requested_generation",
+					context.envelope.requested_generation.get(),
+				)
+				.with_parameter(
+					"previous_schema_generation",
+					previous_schema_generation
+						.map_or(serde_json::Value::Null, serde_json::Value::from),
+				)
+				.with_parameter("schema_generation", context.descriptor.schema_generation)
+				.with_parameter("descriptor_mutation_axis", descriptor_axis)
+				.with_parameter("logical_schema_fingerprint", logical_schema_fingerprint.clone())
+				.with_parameter(
+					"previous_logical_schema_fingerprint",
+					previous_logical_schema_fingerprint
+						.clone()
+						.map_or(serde_json::Value::Null, serde_json::Value::from),
+				)
+				.with_parameter(
+					"physical_descriptor_fingerprint",
+					physical_descriptor_fingerprint.clone(),
+				)
+				.with_parameter(
+					"previous_physical_descriptor_fingerprint",
+					previous_physical_descriptor_fingerprint
+						.clone()
+						.map_or(serde_json::Value::Null, serde_json::Value::from),
+				)
+				.with_schema(AuditSchema::AdministrativeControl {
+					action: AdministrativeControlAction::TableSchemaDescriptorUpdate,
+					detail: AdministrativeControlSchema {
+						target_tenant_id: Some(context.envelope.tenant_id.get()),
+						target_table_object_id: Some(table_object_id),
+						schema_mutation: Some(schema_mutation.to_string()),
+						schema_generation: Some(context.descriptor.schema_generation),
+						previous_schema_generation,
+						descriptor_mutation_axis: Some(descriptor_axis.to_string()),
+						logical_schema_fingerprint: Some(logical_schema_fingerprint),
+						previous_logical_schema_fingerprint,
+						physical_descriptor_fingerprint: Some(physical_descriptor_fingerprint),
+						previous_physical_descriptor_fingerprint,
+						..AdministrativeControlSchema::default()
+					},
+				})
+				.with_parameters(audit_outcome_parameters(resp)),
+			)
+		},
 		WendelonRequest::SuspendTenant(tenant_id) => Some(
 			AuditEvent::new(
 				AuditAuthority::RaftLog,
@@ -3187,6 +3353,32 @@ fn audit_outcome_parameters(resp: &WendelonResponse) -> Vec<(&'static str, serde
 			vec![("reason", serde_json::Value::String(format!("{message:?}")))]
 		}
 		_ => Vec::new(),
+	}
+}
+
+fn schema_mutation_label(mutation: SchemaMutationKindV1) -> &'static str {
+	match mutation {
+		SchemaMutationKindV1::Create => "create",
+		SchemaMutationKindV1::Alter => "alter",
+		SchemaMutationKindV1::Drop => "drop",
+	}
+}
+
+fn descriptor_mutation_axis(
+	previous: Option<&TableSchemaDescriptorV1>,
+	next: &TableSchemaDescriptorV1,
+) -> Option<DescriptorMutationAxis> {
+	let Some(previous) = previous else {
+		return Some(DescriptorMutationAxis::Combined);
+	};
+	let logical_changed = previous.logical_schema_fingerprint != next.logical_schema_fingerprint;
+	let physical_changed =
+		previous.physical_descriptor_fingerprint != next.physical_descriptor_fingerprint;
+	match (logical_changed, physical_changed) {
+		(true, true) => Some(DescriptorMutationAxis::Combined),
+		(true, false) => Some(DescriptorMutationAxis::LogicalOnly),
+		(false, true) => Some(DescriptorMutationAxis::PhysicalOnly),
+		(false, false) => None,
 	}
 }
 
@@ -5130,10 +5322,11 @@ mod schema_state_tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		LocalityPolicyV1, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1,
-		RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableRetentionPolicy, TableSchemaDescriptorV1,
-		TenantKekId, encode_table_schema_descriptor_v1,
+		LocalityPolicyV1, LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration,
+		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+		RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableRetentionPolicy, TableSchemaDescriptorV1, TenantKekId,
+		encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -5449,6 +5642,179 @@ mod schema_state_tests {
 	}
 
 	#[test]
+	fn schema_update_audit_records_descriptor_fingerprints() {
+		let descriptor = table_descriptor(1);
+		let entry = Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 0), 12),
+			payload: EntryPayload::Normal(WendelonRequest::SchemaUpdate(schema_envelope(
+				&descriptor,
+				0,
+				1,
+				SchemaMutationKindV1::Create,
+			))),
+		};
+		let state = SmState::default();
+		let context = schema_audit_context(&state, &entry).expect("schema audit context");
+		let event = raft_audit_event_with_context(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			&entry,
+			&WendelonResponse::Success,
+			None,
+			Some(context),
+		)
+		.expect("schema update must emit audit");
+
+		assert_eq!(
+			event.operation,
+			AuditOperation::TableSchemaDescriptorUpdated
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("schema_mutation")
+				.and_then(|value| value.as_str()),
+			Some("create")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("descriptor_mutation_axis")
+				.and_then(|value| value.as_str()),
+			Some("combined")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("logical_schema_fingerprint")
+				.and_then(|value| value.as_str()),
+			Some(format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes()).as_str())
+		);
+		assert!(
+			event
+				.parameters
+				.get("previous_logical_schema_fingerprint")
+				.is_some_and(serde_json::Value::is_null)
+		);
+		let Some(AuditSchema::AdministrativeControl { action, detail }) = event.schema else {
+			panic!("expected administrative-control audit schema");
+		};
+		assert_eq!(
+			action,
+			AdministrativeControlAction::TableSchemaDescriptorUpdate
+		);
+		assert_eq!(detail.target_tenant_id, Some(7));
+		assert_eq!(
+			detail.target_table_object_id.as_deref(),
+			Some(format_bytes_hex(descriptor.table_object_id.as_bytes()).as_str())
+		);
+		assert_eq!(detail.schema_mutation.as_deref(), Some("create"));
+		assert_eq!(detail.schema_generation, Some(1));
+		assert_eq!(detail.previous_schema_generation, None);
+		assert_eq!(detail.descriptor_mutation_axis.as_deref(), Some("combined"));
+		assert_eq!(
+			detail.logical_schema_fingerprint.as_deref(),
+			Some(format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes()).as_str())
+		);
+		assert_eq!(
+			detail.physical_descriptor_fingerprint.as_deref(),
+			Some(format_bytes_hex(descriptor.physical_descriptor_fingerprint.as_bytes()).as_str())
+		);
+	}
+
+	#[test]
+	fn schema_update_audit_marks_physical_only_descriptor_retune() {
+		let descriptor = table_descriptor(1);
+		let mut state = SmState::default();
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKindV1::Create),
+		)
+		.unwrap();
+		let mut retuned = descriptor.clone();
+		retuned.schema_generation = 2;
+		retuned.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		retuned.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			retuned.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
+		assert_ne!(
+			retuned.physical_descriptor_fingerprint,
+			descriptor.physical_descriptor_fingerprint
+		);
+		let entry = Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 0), 13),
+			payload: EntryPayload::Normal(WendelonRequest::SchemaUpdate(schema_envelope(
+				&retuned,
+				1,
+				2,
+				SchemaMutationKindV1::Alter,
+			))),
+		};
+		let context = schema_audit_context(&state, &entry).expect("schema audit context");
+		let event = raft_audit_event_with_context(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			&entry,
+			&WendelonResponse::Success,
+			None,
+			Some(context),
+		)
+		.expect("schema update must emit audit");
+
+		assert_eq!(
+			event
+				.parameters
+				.get("schema_mutation")
+				.and_then(|value| value.as_str()),
+			Some("alter")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("descriptor_mutation_axis")
+				.and_then(|value| value.as_str()),
+			Some("physical_only")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("previous_schema_generation")
+				.and_then(|value| value.as_u64()),
+			Some(1)
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("previous_physical_descriptor_fingerprint")
+				.and_then(|value| value.as_str()),
+			Some(format_bytes_hex(descriptor.physical_descriptor_fingerprint.as_bytes()).as_str())
+		);
+		let Some(AuditSchema::AdministrativeControl { detail, .. }) = event.schema else {
+			panic!("expected administrative-control audit schema");
+		};
+		assert_eq!(detail.schema_generation, Some(2));
+		assert_eq!(detail.previous_schema_generation, Some(1));
+		assert_eq!(
+			detail.descriptor_mutation_axis.as_deref(),
+			Some("physical_only")
+		);
+		assert_eq!(
+			detail.previous_logical_schema_fingerprint.as_deref(),
+			Some(format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes()).as_str())
+		);
+		assert_eq!(
+			detail.physical_descriptor_fingerprint.as_deref(),
+			Some(format_bytes_hex(retuned.physical_descriptor_fingerprint.as_bytes()).as_str())
+		);
+	}
+
+	#[test]
 	fn table_retention_policy_update_audit_marks_irreversible_extension() {
 		let update = SetTableRetentionPolicy {
 			tenant_id: TenantId::new(7),
@@ -5480,6 +5846,7 @@ mod schema_state_tests {
 					RetentionWindowMillis::try_new(60_000).unwrap(),
 				)),
 			}),
+			None,
 		)
 		.expect("retention policy update must emit audit");
 
@@ -5636,7 +6003,9 @@ mod schema_state_tests {
 	#[test]
 	fn schema_update_rejects_descriptor_fingerprint_corruption() {
 		let mut descriptor = table_descriptor(1);
-		descriptor.schema_fingerprint[0] ^= 0xff;
+		let mut fingerprint = *descriptor.logical_schema_fingerprint.as_bytes();
+		fingerprint[0] ^= 0xff;
+		descriptor.logical_schema_fingerprint = LogicalSchemaFingerprint::from_bytes(fingerprint);
 		let payload = postcard::to_allocvec(&descriptor).unwrap();
 		let envelope = SchemaUpdateEnvelopeV1 {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,

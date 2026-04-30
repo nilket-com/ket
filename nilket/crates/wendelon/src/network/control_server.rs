@@ -16,7 +16,7 @@ use crate::consensus::{
 };
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
-use crate::integration::compute::decode_schema_update_envelope_v1;
+use crate::integration::compute::{SchemaMutationKindV1, decode_schema_update_envelope_v1};
 use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -37,7 +37,8 @@ use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, PolicyGeneration, ProtocolVersionWindow,
 	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableObjectId, TableRetentionPolicy,
-	TenantId, TenantKekId, TransferToken, epoch_entry_var_schema,
+	TableSchemaDescriptorV1, TenantId, TenantKekId, TransferToken,
+	decode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -49,7 +50,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, watch};
 
 pub const CONTROL_REASON_GRANTED: u8 = 0;
@@ -75,6 +76,13 @@ enum ControlOperation {
 	AdvanceEpoch,
 	Join,
 	SchemaUpdate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorMutationMetric {
+	LogicalOnly,
+	PhysicalOnly,
+	Combined,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -600,6 +608,72 @@ impl WendelonControlServer {
 		}
 	}
 
+	fn observe_descriptor_compute_metrics(
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+	) {
+		let recompute_started = Instant::now();
+		if let Ok(logical) = descriptor.compute_logical_schema_fingerprint() {
+			if descriptor
+				.compute_physical_descriptor_fingerprint(logical)
+				.is_ok()
+			{
+				metrics().observe_storage_descriptor_recompute(
+					tenant_id,
+					descriptor.table_object_id,
+					recompute_started.elapsed(),
+				);
+			}
+		}
+		let validate_started = Instant::now();
+		if descriptor.validate().is_ok() {
+			metrics().observe_storage_descriptor_validate(
+				tenant_id,
+				descriptor.table_object_id,
+				validate_started.elapsed(),
+			);
+		}
+	}
+
+	fn descriptor_mutation_metric(
+		previous: Option<&TableSchemaDescriptorV1>,
+		next: &TableSchemaDescriptorV1,
+	) -> Option<DescriptorMutationMetric> {
+		let Some(previous) = previous else {
+			return Some(DescriptorMutationMetric::Combined);
+		};
+		let logical_changed =
+			previous.logical_schema_fingerprint != next.logical_schema_fingerprint;
+		let physical_changed =
+			previous.physical_descriptor_fingerprint != next.physical_descriptor_fingerprint;
+		match (logical_changed, physical_changed) {
+			(true, true) => Some(DescriptorMutationMetric::Combined),
+			(true, false) => Some(DescriptorMutationMetric::LogicalOnly),
+			(false, true) => Some(DescriptorMutationMetric::PhysicalOnly),
+			(false, false) => None,
+		}
+	}
+
+	fn observe_descriptor_mutation_metric(
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		metric: DescriptorMutationMetric,
+	) {
+		match metric {
+			DescriptorMutationMetric::LogicalOnly => {
+				metrics()
+					.observe_storage_descriptor_logical_only_mutation(tenant_id, table_object_id);
+			}
+			DescriptorMutationMetric::PhysicalOnly => {
+				metrics()
+					.observe_storage_descriptor_physical_only_mutation(tenant_id, table_object_id);
+			}
+			DescriptorMutationMetric::Combined => {
+				metrics().observe_storage_descriptor_combined_mutation(tenant_id, table_object_id);
+			}
+		}
+	}
+
 	async fn tenant_admin_success_for_target(
 		&self,
 		stream_id: u32,
@@ -795,21 +869,54 @@ impl WendelonControlServer {
 			);
 		}
 
+		let descriptor_metric = if envelope.object.kind
+			== crate::integration::compute::SchemaObjectKind::Table
+			&& matches!(
+				envelope.mutation,
+				SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter
+			) {
+			match decode_table_schema_descriptor_v1(&envelope.payload) {
+				Ok(descriptor) => {
+					Self::observe_descriptor_compute_metrics(envelope.tenant_id, &descriptor);
+					let snapshot = self.state_machine.state_snapshot().await;
+					let previous = snapshot.table_schemas.latest_by_name(
+						envelope.tenant_id,
+						envelope.object.namespace.as_str(),
+						envelope.object.name.as_str(),
+					);
+					Self::descriptor_mutation_metric(previous, &descriptor)
+						.map(|metric| (envelope.tenant_id, descriptor.table_object_id, metric))
+				}
+				Err(_) => None,
+			}
+		} else {
+			None
+		};
+
 		match self
 			.raft
 			.client_write(WendelonRequest::SchemaUpdate(frame.meta.to_vec()))
 			.await
 		{
 			Ok(resp) => match resp.data {
-				WendelonResponse::Success => self.build_schema_update_frame(
-					frame.header.stream_id,
-					&SchemaUpdateResponseWire {
-						accepted: true,
-						reason_code: CONTROL_REASON_GRANTED,
-						leader_hint: Some(self.local_node.id),
-						message: None,
-					},
-				),
+				WendelonResponse::Success => {
+					if let Some((tenant_id, table_object_id, metric)) = descriptor_metric {
+						Self::observe_descriptor_mutation_metric(
+							tenant_id,
+							table_object_id,
+							metric,
+						);
+					}
+					self.build_schema_update_frame(
+						frame.header.stream_id,
+						&SchemaUpdateResponseWire {
+							accepted: true,
+							reason_code: CONTROL_REASON_GRANTED,
+							leader_hint: Some(self.local_node.id),
+							message: None,
+						},
+					)
+				}
 				WendelonResponse::Error(message) => self.schema_update_rejection(
 					&frame,
 					CONTROL_REASON_INVALID_CONFIG,
@@ -3077,7 +3184,11 @@ mod tests {
 	use crate::consensus::TieredSlab;
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::network::transport::{TransportTier, TransportTierSet};
-	use crate::schema::{RetentionWindowMillis, SlabId};
+	use crate::schema::{
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy,
+		RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId,
+	};
+	use arrow::datatypes::{DataType, Field, Schema};
 
 	fn n(id: u32) -> NodeId {
 		NodeId { id, _reserved: 0 }
@@ -3124,6 +3235,67 @@ mod tests {
 		let decoded: TenantAdminRequestWire = wire::decode(&encoded).unwrap();
 
 		assert_eq!(decoded, request);
+	}
+
+	#[test]
+	fn descriptor_mutation_metric_classifies_axes() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Int64, true),
+		]);
+		let base = TableSchemaDescriptorV1::new(
+			TableObjectId::new([0x71; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		assert_eq!(
+			WendelonControlServer::descriptor_mutation_metric(None, &base),
+			Some(DescriptorMutationMetric::Combined)
+		);
+
+		let mut physical = base.clone();
+		physical.schema_generation = 2;
+		physical.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		physical.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			WendelonControlServer::descriptor_mutation_metric(Some(&base), &physical),
+			Some(DescriptorMutationMetric::PhysicalOnly)
+		);
+
+		let evolved_schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Int64, true),
+			Field::new("region", DataType::LargeUtf8, true),
+		]);
+		let logical = TableSchemaDescriptorV1::new(
+			base.table_object_id,
+			3,
+			"analytics",
+			"events",
+			&evolved_schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		assert_eq!(
+			WendelonControlServer::descriptor_mutation_metric(Some(&base), &logical),
+			Some(DescriptorMutationMetric::Combined)
+		);
+
+		let mut generation_only = base.clone();
+		generation_only.schema_generation = 4;
+		generation_only.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			WendelonControlServer::descriptor_mutation_metric(Some(&base), &generation_only),
+			None
+		);
 	}
 
 	#[test]

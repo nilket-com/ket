@@ -285,6 +285,16 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_storage_table_retention_policy_active_tables_total"));
 	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
 	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
+	assert!(body.contains("wendelon_storage_csb_merge_logical_fingerprint_mismatch_total"));
+	assert!(body.contains("wendelon_storage_csb_payload_coverage_fall_through_total"));
+	assert!(body.contains("wendelon_storage_csb_merge_pre_adr_051_cliff_total"));
+	assert!(body.contains("wendelon_storage_aggregate_cache_logical_fingerprint_hit_total"));
+	assert!(body.contains("wendelon_storage_aggregate_cache_logical_fingerprint_miss_total"));
+	assert!(body.contains("wendelon_storage_descriptor_recompute_seconds"));
+	assert!(body.contains("wendelon_storage_descriptor_validate_seconds"));
+	assert!(body.contains("wendelon_storage_descriptor_logical_only_mutations_total"));
+	assert!(body.contains("wendelon_storage_descriptor_physical_only_mutations_total"));
+	assert!(body.contains("wendelon_storage_descriptor_combined_mutations_total"));
 	assert!(body.contains("wendelon_storage_pk_delete_outcomes_total"));
 	assert!(body.contains("wendelon_storage_pk_delete_requests_total"));
 	assert!(body.contains("wendelon_storage_pk_delete_rows_deleted_total"));

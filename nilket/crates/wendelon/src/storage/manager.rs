@@ -53,9 +53,10 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, IdentityPrefix, Locality, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, SlabId, SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog,
-	TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
+	HybridTimestamp, Identity, IdentityPrefix, Locality, LogicalSchemaFingerprint,
+	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, SlabId, SlabRecordHeader,
+	SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata,
+	WriterNodeId,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
@@ -438,7 +439,7 @@ struct TieredStatsCacheKey {
 	slab_id: SlabId,
 	table_object_id: TableObjectId,
 	schema_generation: u64,
-	schema_fingerprint: [u8; 32],
+	logical_schema_fingerprint: LogicalSchemaFingerprint,
 	stats_format_version: u16,
 	stats_block_len: u32,
 	stats_block_hash128: [u8; 16],
@@ -452,7 +453,7 @@ fn tiered_stats_cache_key(
 		slab_id: pointer.slab_id,
 		table_object_id: descriptor.table_object_id,
 		schema_generation: descriptor.schema_generation,
-		schema_fingerprint: descriptor.schema_fingerprint,
+		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 		stats_format_version: pointer.stats_format_version?,
 		stats_block_len: pointer.stats_block_len?,
 		stats_block_hash128: pointer.stats_block_hash128?,
@@ -1329,9 +1330,24 @@ impl SlabManager {
 			.await?;
 		let stats = plan.decrypt(stats_ciphertext.as_ref(), descriptor.schema_generation)?;
 		let parsed = parse_column_stats_block(&stats.plaintext)?;
-		if ColumnStatsDescriptorIdentity::from_header(&parsed.header)
-			!= ColumnStatsDescriptorIdentity::from_descriptor(descriptor)
-		{
+		let parsed_identity = ColumnStatsDescriptorIdentity::from_header(&parsed.header);
+		let descriptor_identity = ColumnStatsDescriptorIdentity::from_descriptor(descriptor);
+		if parsed_identity != descriptor_identity {
+			if parsed.header.table_object_id == descriptor.table_object_id
+				&& parsed.header.schema_generation == descriptor.schema_generation
+				&& parsed.header.logical_schema_fingerprint != descriptor.logical_schema_fingerprint
+			{
+				if let Some(tenant_id) = pointer.tenant_id {
+					metrics().observe_storage_csb_logical_fingerprint_mismatch(
+						tenant_id,
+						descriptor.table_object_id,
+					);
+					metrics().observe_storage_csb_pre_adr_051_cliff(
+						tenant_id,
+						descriptor.table_object_id,
+					);
+				}
+			}
 			metrics().pbc_slab_stats_pointer_drift_total.inc();
 			return Ok(None);
 		}
@@ -6488,7 +6504,7 @@ mod tests {
 		descriptor.record_layout_policy = layout;
 		descriptor.record_body_compression_policy =
 			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor
 	}
 
@@ -6500,7 +6516,7 @@ mod tests {
 	) -> TableSchemaDescriptorV1 {
 		let mut descriptor = layout_recluster_descriptor(object_byte, generation, layout);
 		descriptor.record_body_compression_policy = compression_policy;
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor
 	}
 
@@ -6697,7 +6713,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -6789,7 +6805,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor.validate().unwrap();
 		let batch = RecordBatch::try_new(
 			schema,
@@ -7153,7 +7169,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let batch = RecordBatch::try_new(
 			Arc::new(schema),
 			vec![
@@ -7281,7 +7297,7 @@ mod tests {
 			small_sets: vec![ColumnSmallSetSpecV1::new("region")],
 			..ColumnStatsPolicyV1::default()
 		};
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let mut catalog = TableSchemaCatalogV1::default();
 		catalog.upsert(tenant(), descriptor.clone()).unwrap();
 
@@ -9352,7 +9368,7 @@ mod tests {
 		)
 		.unwrap();
 		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		let row_count = 20_000_usize;
 		let columns = (0..16)
 			.map(|column| {

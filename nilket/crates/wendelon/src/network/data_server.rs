@@ -5641,7 +5641,7 @@ impl WendelonDataServer {
 			metrics().observe_storage_table_retention_read_floor_reject();
 			return Ok(Err(AggRejectCode::RetentionExpired));
 		}
-		if descriptor.schema_fingerprint != request.schema_fingerprint {
+		if descriptor.logical_schema_fingerprint != request.logical_schema_fingerprint {
 			return Ok(Err(AggRejectCode::SchemaStale));
 		}
 		let schema = match descriptor.arrow_schema() {
@@ -10021,8 +10021,22 @@ fn aggregate_csb_response_for_stats(
 ) -> Result<Option<AggregateResponse>, AggRejectCode> {
 	if stats.header.table_object_id != request.table_object_id
 		|| stats.header.schema_generation != request.schema_generation
-		|| stats.header.schema_fingerprint != request.schema_fingerprint
+		|| stats.header.logical_schema_fingerprint != request.logical_schema_fingerprint
 	{
+		if stats.header.logical_schema_fingerprint != request.logical_schema_fingerprint {
+			metrics().observe_storage_csb_logical_fingerprint_mismatch(
+				request.tenant_id,
+				request.table_object_id,
+			);
+			if stats.header.table_object_id == request.table_object_id
+				&& stats.header.schema_generation == request.schema_generation
+			{
+				metrics().observe_storage_csb_pre_adr_051_cliff(
+					request.tenant_id,
+					request.table_object_id,
+				);
+			}
+		}
 		return Err(AggRejectCode::PartialCrossbindFailed);
 	}
 	let schema = descriptor
@@ -10040,11 +10054,13 @@ fn aggregate_csb_response_for_stats(
 			AggregateFunction::CountNonNull { column } => {
 				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
 				else {
+					observe_aggregate_csb_payload_fall_through(request, "column_uncovered");
 					return Ok(None);
 				};
 				let payload = decode_column_stats_payload(entry)
 					.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
 				let Some(value) = payload.non_null_count else {
+					observe_aggregate_csb_payload_fall_through(request, "missing_count");
 					return Ok(None);
 				};
 				AggregateState::Count { value }
@@ -10052,9 +10068,11 @@ fn aggregate_csb_response_for_stats(
 			AggregateFunction::Min { column } => {
 				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
 				else {
+					observe_aggregate_csb_payload_fall_through(request, "column_uncovered");
 					return Ok(None);
 				};
 				if entry.stat_flags & COLUMN_STAT_HAS_MIN == 0 {
+					observe_aggregate_csb_payload_fall_through(request, "missing_min_max");
 					return Ok(None);
 				}
 				let payload = decode_column_stats_payload(entry)
@@ -10068,9 +10086,11 @@ fn aggregate_csb_response_for_stats(
 			AggregateFunction::Max { column } => {
 				let Some(entry) = aggregate_csb_column_entry(stats, &schema, usize::from(column))?
 				else {
+					observe_aggregate_csb_payload_fall_through(request, "column_uncovered");
 					return Ok(None);
 				};
 				if entry.stat_flags & COLUMN_STAT_HAS_MAX == 0 {
+					observe_aggregate_csb_payload_fall_through(request, "missing_min_max");
 					return Ok(None);
 				}
 				let payload = decode_column_stats_payload(entry)
@@ -10110,7 +10130,7 @@ fn aggregate_csb_response_for_stats(
 		reject_code: None,
 		table_object_id: request.table_object_id,
 		schema_generation: request.schema_generation,
-		schema_fingerprint: request.schema_fingerprint,
+		logical_schema_fingerprint: request.logical_schema_fingerprint,
 		aggregate_expression_digest: request.expression_digest(),
 		as_of_hlc: request.as_of_hlc,
 		max_hlc: request.as_of_hlc,
@@ -10123,6 +10143,14 @@ fn aggregate_csb_response_for_stats(
 			..AggregateDiagnostics::default()
 		},
 	}))
+}
+
+fn observe_aggregate_csb_payload_fall_through(request: &AggregateRequest, reason: &str) {
+	metrics().observe_storage_csb_payload_coverage_fall_through(
+		request.tenant_id,
+		request.table_object_id,
+		reason,
+	);
 }
 
 fn aggregate_csb_column_entry<'a>(
@@ -11402,7 +11430,7 @@ mod tests {
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap());
 		descriptor.record_body_compression_policy =
 			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
-		descriptor.schema_fingerprint = descriptor.compute_schema_fingerprint().unwrap();
+		descriptor.refresh_descriptor_fingerprints().unwrap();
 		descriptor.validate().unwrap();
 		descriptor
 	}
@@ -11587,7 +11615,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc,
@@ -13144,8 +13172,8 @@ mod tests {
 		let mut uncompressed_descriptor = lz4_descriptor.clone();
 		uncompressed_descriptor.record_body_compression_policy =
 			RecordBodyCompressionPolicy::Uncompressed;
-		uncompressed_descriptor.schema_fingerprint = uncompressed_descriptor
-			.compute_schema_fingerprint()
+		uncompressed_descriptor
+			.refresh_descriptor_fingerprints()
 			.unwrap();
 		uncompressed_descriptor.validate().unwrap();
 
@@ -13647,7 +13675,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(0, 0, 0),
 			as_of_hlc: hlc(0, 0, 0),
@@ -13858,7 +13886,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(0, 0, 0),
 			as_of_hlc: hlc(99, 0, 1),
@@ -14067,7 +14095,7 @@ mod tests {
 			header: ColumnStatsBlockHeader {
 				table_object_id: descriptor.table_object_id,
 				schema_generation: descriptor.schema_generation,
-				schema_fingerprint: descriptor.schema_fingerprint,
+				logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 				row_count: 2,
 				column_block_count: 1,
 			},
@@ -14112,7 +14140,7 @@ mod tests {
 			header: ColumnStatsBlockHeader {
 				table_object_id: descriptor.table_object_id,
 				schema_generation: descriptor.schema_generation,
-				schema_fingerprint: descriptor.schema_fingerprint,
+				logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 				row_count: 3,
 				column_block_count: 1,
 			},
@@ -15549,7 +15577,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(0, 0, 0),
 			as_of_hlc: hlc(0, 0, 0),
@@ -15730,7 +15758,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(0, 0, 0),
 			as_of_hlc: hlc(0, 0, 0),
@@ -15822,7 +15850,7 @@ mod tests {
 				reject_code: None,
 				table_object_id: request.table_object_id,
 				schema_generation: request.schema_generation,
-				schema_fingerprint: request.schema_fingerprint,
+				logical_schema_fingerprint: request.logical_schema_fingerprint,
 				aggregate_expression_digest: request.expression_digest(),
 				as_of_hlc: request.as_of_hlc,
 				max_hlc: request.as_of_hlc,
@@ -16036,7 +16064,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc: hlc(1, 0, 1),
@@ -16096,7 +16124,7 @@ mod tests {
 			header: ColumnStatsBlockHeader {
 				table_object_id: descriptor.table_object_id,
 				schema_generation: descriptor.schema_generation,
-				schema_fingerprint: descriptor.schema_fingerprint,
+				logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 				row_count: 1,
 				column_block_count: 1,
 			},
@@ -16116,7 +16144,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc: hlc(99, 0, 1),
@@ -16145,6 +16173,55 @@ mod tests {
 		);
 		assert_eq!(response.partials[0].state.last(), Some(&1));
 		assert_eq!(response.diagnostics.slabs_answered_from_csb, 1);
+	}
+
+	#[test]
+	fn aggregate_csb_logical_slot_cliff_is_observable() {
+		use crate::storage::stats::{ColumnStatsBlockHeader, ParsedColumnStatsBlock};
+
+		let mut descriptor = typed_table_descriptor();
+		descriptor.table_object_id = TableObjectId::new([0xEC; 16]);
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let request = aggregate_count_request(&descriptor, 492, hlc(99, 0, 1));
+		let mismatch_before = metrics()
+			.storage_csb_merge_logical_fingerprint_mismatch_total_for_test(
+				request.tenant_id,
+				request.table_object_id,
+			);
+		let cliff_before = metrics().storage_csb_pre_adr_051_cliff_total_for_test(
+			request.tenant_id,
+			request.table_object_id,
+		);
+		let stats = ParsedColumnStatsBlock {
+			header: ColumnStatsBlockHeader {
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				logical_schema_fingerprint: crate::schema::LogicalSchemaFingerprint::from_bytes(
+					[0xEE; 32],
+				),
+				row_count: 2,
+				column_block_count: 0,
+			},
+			columns: Vec::new(),
+		};
+
+		let err = aggregate_csb_response_for_stats(&request, &descriptor, &stats).unwrap_err();
+
+		assert_eq!(err, AggRejectCode::PartialCrossbindFailed);
+		assert_eq!(
+			metrics().storage_csb_merge_logical_fingerprint_mismatch_total_for_test(
+				request.tenant_id,
+				request.table_object_id,
+			),
+			mismatch_before + 1
+		);
+		assert_eq!(
+			metrics().storage_csb_pre_adr_051_cliff_total_for_test(
+				request.tenant_id,
+				request.table_object_id,
+			),
+			cliff_before + 1
+		);
 	}
 
 	#[tokio::test]
@@ -16219,7 +16296,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc: hlc(99, 0, 1),
@@ -16455,7 +16532,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc: hlc(99, 0, 1),
@@ -16610,7 +16687,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
-			schema_fingerprint: descriptor.schema_fingerprint,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 			consistency: Consistency::SERIALIZABLE,
 			min_hlc: hlc(1, 0, 1),
 			as_of_hlc: hlc(99, 0, 1),

@@ -27,6 +27,9 @@ Current runbooks:
 - [ADR 046 StateDigest Substrate](./state_digest_substrate.md)
   - substrate-only orientation, benchmark interpretation, and guards for
     absent storage/wire surfaces
+- [ADR 051 Descriptor Fingerprint Split](./descriptor_fingerprint_split.md)
+  - logical-vs-physical fingerprint orientation, CSB fall-through metrics,
+    and rollout triage
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

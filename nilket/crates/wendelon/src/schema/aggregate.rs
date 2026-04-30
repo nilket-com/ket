@@ -10,8 +10,8 @@
 use crate::schema::pbc::Program as PbcProgram;
 use crate::schema::{
 	AggregateExpressionIndex, AggregateRequestId, ByteCount, Consistency, DurationMillis,
-	HybridTimestamp, KllK, LocalityRange, LocationCount, PartialStateLength, RowCount,
-	TableObjectId, TenantId,
+	HybridTimestamp, KllK, LocalityRange, LocationCount, LogicalSchemaFingerprint,
+	PartialStateLength, RowCount, TableObjectId, TenantId,
 };
 use crate::schema::{COLUMN_STATS_HLL_MAX_PRECISION, COLUMN_STATS_HLL_MIN_PRECISION, HllPrecision};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,6 @@ pub const AGG_KLL_MIN_K: u32 = 64;
 pub const AGG_KLL_MAX_K: u32 = 2048;
 pub const AGG_MIN_MAX_PREFIX_BYTES: usize = 64;
 
-pub type SchemaFingerprint = [u8; 32];
 pub type PredicateBytecode = Vec<u8>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -336,7 +335,7 @@ pub struct AggregateRequest {
 	pub tenant_id: TenantId,
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
-	pub schema_fingerprint: SchemaFingerprint,
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 	pub consistency: Consistency,
 	pub min_hlc: HybridTimestamp,
 	pub as_of_hlc: HybridTimestamp,
@@ -507,7 +506,7 @@ pub struct AggregateResponse {
 	pub reject_code: Option<AggRejectCode>,
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
-	pub schema_fingerprint: SchemaFingerprint,
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 	pub aggregate_expression_digest: [u8; 32],
 	pub as_of_hlc: HybridTimestamp,
 	pub max_hlc: HybridTimestamp,
@@ -524,7 +523,7 @@ impl AggregateResponse {
 			reject_code: Some(code),
 			table_object_id: request.table_object_id,
 			schema_generation: request.schema_generation,
-			schema_fingerprint: request.schema_fingerprint,
+			logical_schema_fingerprint: request.logical_schema_fingerprint,
 			aggregate_expression_digest: request.expression_digest(),
 			as_of_hlc: request.as_of_hlc,
 			max_hlc: HybridTimestamp {
@@ -762,7 +761,7 @@ mod tests {
 			tenant_id: TenantId::new(1),
 			table_object_id: TableObjectId::new([7; 16]),
 			schema_generation: 3,
-			schema_fingerprint: [4; 32],
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([4; 32]),
 			consistency: Consistency::LINEARIZABLE,
 			min_hlc: HybridTimestamp {
 				physical_ms: 10,

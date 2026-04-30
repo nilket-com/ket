@@ -312,6 +312,133 @@ impl ContentHashTableCounters {
 }
 
 #[derive(Default)]
+struct DescriptorFingerprintTableCounters(Mutex<BTreeMap<(u64, String), u64>>);
+
+impl DescriptorFingerprintTableCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint table counter mutex poisoned");
+		*counters
+			.entry((tenant_id.get(), table_object_id_label(table_object_id)))
+			.or_insert(0) += value;
+	}
+
+	#[cfg(test)]
+	fn get(&self, tenant_id: TenantId, table_object_id: TableObjectId) -> u64 {
+		let counters = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint table counter mutex poisoned");
+		counters
+			.get(&(tenant_id.get(), table_object_id_label(table_object_id)))
+			.copied()
+			.unwrap_or(0)
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint table counter mutex poisoned");
+		for ((tenant, table), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("tenant", &tenant.to_string()), ("table", table.as_str())],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct DescriptorFingerprintReasonCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
+
+impl DescriptorFingerprintReasonCounters {
+	fn add(&self, tenant_id: TenantId, table_object_id: TableObjectId, reason: &str, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint reason counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				reason.to_string(),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint reason counter mutex poisoned");
+		for ((tenant, table, reason), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("reason", reason.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct DescriptorFingerprintTableHistograms(Mutex<BTreeMap<(u64, String), Histogram>>);
+
+impl DescriptorFingerprintTableHistograms {
+	fn observe_duration(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		duration: Duration,
+	) {
+		let mut histograms = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint table histogram mutex poisoned");
+		histograms
+			.entry((tenant_id.get(), table_object_id_label(table_object_id)))
+			.or_insert_with(|| Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS))
+			.observe_duration(duration);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		let histograms = self
+			.0
+			.lock()
+			.expect("descriptor fingerprint table histogram mutex poisoned");
+		for ((tenant, table), histogram) in histograms.iter() {
+			let tenant = tenant.to_string();
+			render_histogram_series(
+				out,
+				name,
+				&[("tenant", tenant.as_str()), ("table", table.as_str())],
+				&histogram.snapshot(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
 struct PkDeleteOutcomeCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
 
 impl PkDeleteOutcomeCounters {
@@ -1181,6 +1308,16 @@ pub struct MetricsRegistry {
 	pub agg_csb_short_circuit_total: Counter,
 	pub agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter,
 	pub agg_csb_short_circuit_skipped_supersession_metadata_untracked_total: Counter,
+	storage_csb_merge_logical_fingerprint_mismatch: DescriptorFingerprintTableCounters,
+	storage_csb_payload_coverage_fall_through: DescriptorFingerprintReasonCounters,
+	storage_csb_merge_pre_adr_051_cliff: DescriptorFingerprintTableCounters,
+	storage_aggregate_cache_logical_fingerprint_hits: DescriptorFingerprintTableCounters,
+	storage_aggregate_cache_logical_fingerprint_misses: DescriptorFingerprintTableCounters,
+	storage_descriptor_recompute_seconds: DescriptorFingerprintTableHistograms,
+	storage_descriptor_validate_seconds: DescriptorFingerprintTableHistograms,
+	storage_descriptor_logical_only_mutations: DescriptorFingerprintTableCounters,
+	storage_descriptor_physical_only_mutations: DescriptorFingerprintTableCounters,
+	storage_descriptor_combined_mutations: DescriptorFingerprintTableCounters,
 	pub agg_int_overflow_total: Counter,
 	pub agg_skipped_no_capability_total: Counter,
 	agg_partial_bytes: Histogram,
@@ -1360,6 +1497,22 @@ impl Default for MetricsRegistry {
 			agg_csb_short_circuit_total: Counter::default(),
 			agg_csb_short_circuit_skipped_tombstone_metadata_untracked_total: Counter::default(),
 			agg_csb_short_circuit_skipped_supersession_metadata_untracked_total: Counter::default(),
+			storage_csb_merge_logical_fingerprint_mismatch:
+				DescriptorFingerprintTableCounters::default(),
+			storage_csb_payload_coverage_fall_through: DescriptorFingerprintReasonCounters::default(
+			),
+			storage_csb_merge_pre_adr_051_cliff: DescriptorFingerprintTableCounters::default(),
+			storage_aggregate_cache_logical_fingerprint_hits:
+				DescriptorFingerprintTableCounters::default(),
+			storage_aggregate_cache_logical_fingerprint_misses:
+				DescriptorFingerprintTableCounters::default(),
+			storage_descriptor_recompute_seconds: DescriptorFingerprintTableHistograms::default(),
+			storage_descriptor_validate_seconds: DescriptorFingerprintTableHistograms::default(),
+			storage_descriptor_logical_only_mutations: DescriptorFingerprintTableCounters::default(
+			),
+			storage_descriptor_physical_only_mutations: DescriptorFingerprintTableCounters::default(
+			),
+			storage_descriptor_combined_mutations: DescriptorFingerprintTableCounters::default(),
 			agg_int_overflow_total: Counter::default(),
 			agg_skipped_no_capability_total: Counter::default(),
 			agg_partial_bytes: Histogram::new(AGG_PARTIAL_BYTES_BUCKETS),
@@ -1629,6 +1782,145 @@ impl MetricsRegistry {
 	pub fn observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked(&self) {
 		self.agg_csb_short_circuit_skipped_supersession_metadata_untracked_total
 			.inc();
+	}
+
+	pub fn observe_storage_csb_logical_fingerprint_mismatch(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_csb_merge_logical_fingerprint_mismatch
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_csb_payload_coverage_fall_through(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		reason: &str,
+	) {
+		self.storage_csb_payload_coverage_fall_through
+			.add(tenant_id, table_object_id, reason, 1);
+	}
+
+	pub fn observe_storage_csb_pre_adr_051_cliff(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_csb_merge_pre_adr_051_cliff
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_aggregate_cache_logical_fingerprint_hit(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_aggregate_cache_logical_fingerprint_hits
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_aggregate_cache_logical_fingerprint_miss(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_aggregate_cache_logical_fingerprint_misses
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_descriptor_recompute(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		duration: Duration,
+	) {
+		self.storage_descriptor_recompute_seconds.observe_duration(
+			tenant_id,
+			table_object_id,
+			duration,
+		);
+	}
+
+	pub fn observe_storage_descriptor_validate(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		duration: Duration,
+	) {
+		self.storage_descriptor_validate_seconds.observe_duration(
+			tenant_id,
+			table_object_id,
+			duration,
+		);
+	}
+
+	#[cfg(test)]
+	pub fn storage_csb_merge_logical_fingerprint_mismatch_total_for_test(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> u64 {
+		self.storage_csb_merge_logical_fingerprint_mismatch
+			.get(tenant_id, table_object_id)
+	}
+
+	#[cfg(test)]
+	pub fn storage_csb_pre_adr_051_cliff_total_for_test(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> u64 {
+		self.storage_csb_merge_pre_adr_051_cliff
+			.get(tenant_id, table_object_id)
+	}
+
+	#[cfg(test)]
+	pub fn storage_aggregate_cache_logical_fingerprint_hit_total_for_test(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> u64 {
+		self.storage_aggregate_cache_logical_fingerprint_hits
+			.get(tenant_id, table_object_id)
+	}
+
+	#[cfg(test)]
+	pub fn storage_aggregate_cache_logical_fingerprint_miss_total_for_test(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> u64 {
+		self.storage_aggregate_cache_logical_fingerprint_misses
+			.get(tenant_id, table_object_id)
+	}
+
+	pub fn observe_storage_descriptor_logical_only_mutation(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_descriptor_logical_only_mutations
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_descriptor_physical_only_mutation(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_descriptor_physical_only_mutations
+			.add(tenant_id, table_object_id, 1);
+	}
+
+	pub fn observe_storage_descriptor_combined_mutation(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) {
+		self.storage_descriptor_combined_mutations
+			.add(tenant_id, table_object_id, 1);
 	}
 
 	pub fn observe_storage_multirow_record_written(&self, rows: u64) {
@@ -2353,6 +2645,57 @@ impl MetricsRegistry {
 			"Aggregate CSB direct-answer attempts skipped because supersession metadata is untracked.",
 			self.agg_csb_short_circuit_skipped_supersession_metadata_untracked_total
 				.get(),
+		);
+		self.storage_csb_merge_logical_fingerprint_mismatch.render(
+			&mut out,
+			"wendelon_storage_csb_merge_logical_fingerprint_mismatch_total",
+			"CSB direct-answer or merge candidates rejected because logical schema fingerprints differed.",
+		);
+		self.storage_csb_payload_coverage_fall_through.render(
+			&mut out,
+			"wendelon_storage_csb_payload_coverage_fall_through_total",
+			"CSB direct-answer candidates that fell through because parsed stats payload coverage was insufficient.",
+		);
+		self.storage_csb_merge_pre_adr_051_cliff.render(
+			&mut out,
+			"wendelon_storage_csb_merge_pre_adr_051_cliff_total",
+			"CSB candidates whose table and generation matched but whose fingerprint slot did not match the ADR 051 logical fingerprint.",
+		);
+		self.storage_aggregate_cache_logical_fingerprint_hits
+			.render(
+				&mut out,
+				"wendelon_storage_aggregate_cache_logical_fingerprint_hit_total",
+				"Aggregate response cross-bind checks whose logical schema fingerprint matched the request.",
+			);
+		self.storage_aggregate_cache_logical_fingerprint_misses.render(
+			&mut out,
+			"wendelon_storage_aggregate_cache_logical_fingerprint_miss_total",
+			"Aggregate response cross-bind checks whose logical schema fingerprint differed from the request.",
+		);
+		self.storage_descriptor_recompute_seconds.render(
+			&mut out,
+			"wendelon_storage_descriptor_recompute_seconds",
+			"Descriptor logical and physical fingerprint recompute duration.",
+		);
+		self.storage_descriptor_validate_seconds.render(
+			&mut out,
+			"wendelon_storage_descriptor_validate_seconds",
+			"Descriptor validation duration on the control schema-update submission path.",
+		);
+		self.storage_descriptor_logical_only_mutations.render(
+			&mut out,
+			"wendelon_storage_descriptor_logical_only_mutations_total",
+			"Accepted descriptor mutations whose logical fingerprint changed while physical fingerprint did not. Expected to stay zero under ADR 051 stacked physical preimages; nonzero indicates an invariant breach or future preimage change.",
+		);
+		self.storage_descriptor_physical_only_mutations.render(
+			&mut out,
+			"wendelon_storage_descriptor_physical_only_mutations_total",
+			"Accepted descriptor mutations whose physical descriptor fingerprint changed while logical fingerprint stayed stable.",
+		);
+		self.storage_descriptor_combined_mutations.render(
+			&mut out,
+			"wendelon_storage_descriptor_combined_mutations_total",
+			"Accepted descriptor mutations whose logical and physical descriptor fingerprints both changed.",
 		);
 		render_counter(
 			&mut out,
@@ -3533,6 +3876,39 @@ mod tests {
 		registry.agg_csb_short_circuit_total.inc();
 		registry.observe_agg_csb_short_circuit_skipped_untracked_tombstone_metadata();
 		registry.observe_agg_csb_short_circuit_skipped_supersession_metadata_untracked();
+		let descriptor_table = TableObjectId::new([0x51; 16]);
+		let descriptor_table_label = table_object_id_label(descriptor_table);
+		registry
+			.observe_storage_csb_logical_fingerprint_mismatch(TenantId::new(9), descriptor_table);
+		registry.observe_storage_csb_payload_coverage_fall_through(
+			TenantId::new(9),
+			descriptor_table,
+			"missing_min_max",
+		);
+		registry.observe_storage_csb_pre_adr_051_cliff(TenantId::new(9), descriptor_table);
+		registry.observe_storage_aggregate_cache_logical_fingerprint_hit(
+			TenantId::new(9),
+			descriptor_table,
+		);
+		registry.observe_storage_aggregate_cache_logical_fingerprint_miss(
+			TenantId::new(9),
+			descriptor_table,
+		);
+		registry.observe_storage_descriptor_recompute(
+			TenantId::new(9),
+			descriptor_table,
+			Duration::from_micros(21),
+		);
+		registry.observe_storage_descriptor_validate(
+			TenantId::new(9),
+			descriptor_table,
+			Duration::from_micros(34),
+		);
+		registry
+			.observe_storage_descriptor_logical_only_mutation(TenantId::new(9), descriptor_table);
+		registry
+			.observe_storage_descriptor_physical_only_mutation(TenantId::new(9), descriptor_table);
+		registry.observe_storage_descriptor_combined_mutation(TenantId::new(9), descriptor_table);
 		registry.agg_skipped_no_capability_total.inc();
 
 		let rendered = registry.render_prometheus();
@@ -3587,6 +3963,36 @@ mod tests {
 		assert!(rendered.contains(
 			"wendelon_agg_csb_short_circuit_skipped_supersession_metadata_untracked_total 1"
 		));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_csb_merge_logical_fingerprint_mismatch_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_csb_payload_coverage_fall_through_total{{tenant=\"9\",table=\"{descriptor_table_label}\",reason=\"missing_min_max\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_csb_merge_pre_adr_051_cliff_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_aggregate_cache_logical_fingerprint_hit_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_aggregate_cache_logical_fingerprint_miss_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_descriptor_recompute_seconds_bucket{{tenant=\"9\",table=\"{descriptor_table_label}\",le=\"0.000025\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_descriptor_validate_seconds_bucket{{tenant=\"9\",table=\"{descriptor_table_label}\",le=\"0.00005\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_descriptor_logical_only_mutations_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_descriptor_physical_only_mutations_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"wendelon_storage_descriptor_combined_mutations_total{{tenant=\"9\",table=\"{descriptor_table_label}\"}} 1"
+		)));
 		assert!(rendered.contains("wendelon_agg_int_overflow_total 1"));
 		assert!(rendered.contains("wendelon_agg_skipped_no_capability_total 1"));
 		assert!(rendered.contains("wendelon_agg_partial_bytes_bucket{le=\"128\"} 1"));

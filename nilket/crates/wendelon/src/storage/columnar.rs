@@ -3,11 +3,11 @@ use crate::metrics::MetricsRegistry;
 use crate::schema::aggregate::AggregateExpression;
 use crate::schema::pbc::{self, Program};
 use crate::schema::{
-	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, RecordBodyByteLen,
-	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN,
-	STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaFingerprint, SlabId,
-	TableSchemaDescriptorV1,
+	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset,
+	LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
+	RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptorV1,
 };
 use crate::storage::core::RecordLocation;
 use arrow::array::{ArrayData, ArrayRef, NullArray, make_array};
@@ -378,7 +378,7 @@ pub struct RecordBufferDirectory {
 	pub column_to_buffers: Vec<ColumnBufferRange>,
 	pub column_null_counts: Vec<usize>,
 	pub storage_column_ordinals: BTreeMap<StorageColumn, u32>,
-	pub schema_fingerprint: SchemaFingerprint,
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1032,7 +1032,7 @@ pub fn parse_record_buffer_directory(
 		column_to_buffers,
 		column_null_counts,
 		storage_column_ordinals,
-		schema_fingerprint: descriptor.schema_fingerprint,
+		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 	})
 }
 
@@ -2440,7 +2440,10 @@ mod tests {
 		assert_eq!(directory.column_to_buffers[0].buffer_count, 2);
 		assert_eq!(directory.column_to_buffers[1].buffer_count, 3);
 		assert_eq!(directory.buffers.len(), 5);
-		assert_eq!(directory.schema_fingerprint, descriptor.schema_fingerprint);
+		assert_eq!(
+			directory.logical_schema_fingerprint,
+			descriptor.logical_schema_fingerprint
+		);
 	}
 
 	#[test]

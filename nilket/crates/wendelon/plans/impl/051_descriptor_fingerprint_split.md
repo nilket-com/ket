@@ -347,8 +347,10 @@ Work:
    fingerprint payload, not the descriptor envelope.
 
 4. Cross-language preimage stability: helpers length-
-   prefix every variable-length input with `u32` LE
-   byte count. Pin golden vectors in
+   prefix every variable-length input with `u64` LE
+   byte count. The 64-bit width keeps Arrow IPC and
+   postcard component sizes unconstrained by the
+   fingerprint format. Pin golden vectors in
    `tests/descriptor_fingerprint.rs`.
 
 5. Defensive constructor visibility: `pub(crate) fn
@@ -933,6 +935,11 @@ The pre-ADR-051 cliff metric is operational visibility
 into the one-time CSB cliff: rises during ramp, decays
 to zero as compaction rewrites old slabs. Stuck-nonzero
 after a soak window is a runbook escalation.
+
+`storage_descriptor_logical_only_mutations_total` is expected
+to stay zero under the stacked physical preimage: any logical
+change should also change the physical fingerprint because the
+logical fingerprint is part of the physical preimage.
 
 The three mutation counters (logical-only, physical-
 only, combined) make the bi-dimensional descriptor

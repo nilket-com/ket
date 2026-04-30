@@ -220,9 +220,11 @@ Physical fingerprint preimage (stacked — see §3):
 ```
 
 Both helpers length-prefix every variable-length component
-with a fixed-width little-endian byte count before feeding
-it to BLAKE3. Canonical postcard bytes behind the length
-prefix make golden vectors stable and cross-language
+with a fixed-width `u64` little-endian byte count before
+feeding it to BLAKE3. The 64-bit width intentionally keeps
+Arrow IPC and postcard component sizes unconstrained by the
+fingerprint format. Canonical postcard bytes behind the
+length prefix make golden vectors stable and cross-language
 reproducible.
 
 Excluded from both preimages:
