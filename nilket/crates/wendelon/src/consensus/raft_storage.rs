@@ -65,10 +65,14 @@ use crate::integration::compute::{
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, Locality, LogEntryKind, NodeId as SchemaNodeId,
-	RaftLogEntryFixed, RowIdentityPolicy, SlabId, SnapshotHeader, TableLifecycleCatalog,
-	TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptorV1, TenantId, TenantKekId,
-	WALRecordHeader, decode_table_schema_descriptor_v1, validate_table_schema_evolution,
+	FinalizationMarker, HybridTimestamp, IndexObjectId, Locality, LogEntryKind,
+	NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
+	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
+	SecondaryIndexState, SlabId, SnapshotHeader, TableLifecycleCatalog, TableRetentionPolicy,
+	TableSchemaCatalogV1, TableSchemaDescriptorV1, TenantId, TenantKekId, WALRecordHeader,
+	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
+	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
+	validate_table_schema_evolution,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -88,7 +92,7 @@ use openraft::{
 	StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -1528,6 +1532,11 @@ pub struct SmState {
 	/// the default descriptor without needing this map populated.
 	#[serde(default)]
 	pub table_schemas: TableSchemaCatalogV1,
+	/// ADR 052 secondary-index descriptors and lifecycle state. Index
+	/// metadata is separate from table descriptors, so index create /
+	/// drop does not mutate table schema generation.
+	#[serde(default)]
+	pub secondary_indexes: SecondaryIndexCatalog,
 	/// ADR 048 table lifecycle policy keyed by durable table identity.
 	/// Retention is current lifecycle authority and intentionally stays
 	/// outside schema descriptors and schema generations.
@@ -2399,7 +2408,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 				}
 				let retention_audit_context = retention_audit_context(&guard.state, &entry);
 				let schema_audit_context = schema_audit_context(&guard.state, &entry);
+				let mut index_schema_audit_context =
+					index_schema_audit_context(&guard.state, &entry);
 				let (resp, tier) = apply_entry_to_state(&mut guard.state, &entry);
+				if let Some(context) = index_schema_audit_context.as_mut() {
+					finalize_index_schema_audit_context(&guard.state, context);
+				}
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
 					Some(prev) if prev > entry.log_id => prev,
@@ -2429,6 +2443,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						&resp,
 						retention_audit_context,
 						schema_audit_context,
+						index_schema_audit_context,
 					) {
 						materializer.tracker.note_authoritative_event();
 						pending_audit_events.push(event);
@@ -2735,6 +2750,18 @@ struct SchemaAuditContext {
 	previous_descriptor: Option<TableSchemaDescriptorV1>,
 }
 
+#[derive(Clone, Debug)]
+struct IndexSchemaAuditContext {
+	envelope: SchemaUpdateEnvelopeV1,
+	index_object_id: IndexObjectId,
+	descriptor: Option<SecondaryIndexDescriptor>,
+	previous_descriptor: Option<SecondaryIndexDescriptor>,
+	previous_state: Option<SecondaryIndexState>,
+	result_descriptor: Option<SecondaryIndexDescriptor>,
+	result_state: Option<SecondaryIndexState>,
+	replica_id: Option<SchemaNodeId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DescriptorMutationAxis {
 	LogicalOnly,
@@ -2805,13 +2832,66 @@ fn schema_audit_context(
 	})
 }
 
+fn index_schema_audit_context(
+	state: &SmState,
+	entry: &Entry<WendelonTypeConfig>,
+) -> Option<IndexSchemaAuditContext> {
+	let EntryPayload::Normal(WendelonRequest::SchemaUpdate(bytes)) = &entry.payload else {
+		return None;
+	};
+	let envelope = decode_schema_update_envelope_v1(bytes).ok()?;
+	if envelope.object.kind != SchemaObjectKind::Index {
+		return None;
+	}
+	let (index_object_id, descriptor, replica_id) = match envelope.mutation {
+		SchemaMutationKindV1::Create => {
+			let descriptor = decode_secondary_index_descriptor(&envelope.payload).ok()?;
+			(descriptor.index_object_id, Some(descriptor), None)
+		}
+		SchemaMutationKindV1::Drop => {
+			let request = decode_secondary_index_drop_request(&envelope.payload).ok()?;
+			(request.index_object_id, None, None)
+		}
+		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload).ok()?;
+			(complete.index_object_id, None, Some(complete.replica_id))
+		}
+		SchemaMutationKindV1::Alter => return None,
+	};
+	let previous = state
+		.secondary_indexes
+		.get(envelope.tenant_id, index_object_id);
+	let previous_descriptor = previous.map(|row| row.descriptor.clone());
+	let previous_state = previous.map(|row| row.state);
+	Some(IndexSchemaAuditContext {
+		envelope,
+		index_object_id,
+		descriptor,
+		previous_descriptor,
+		previous_state,
+		result_descriptor: None,
+		result_state: None,
+		replica_id,
+	})
+}
+
+fn finalize_index_schema_audit_context(state: &SmState, context: &mut IndexSchemaAuditContext) {
+	if let Some(row) = state
+		.secondary_indexes
+		.get(context.envelope.tenant_id, context.index_object_id)
+	{
+		context.result_descriptor = Some(row.descriptor.clone());
+		context.result_state = Some(row.state);
+	}
+}
+
 #[cfg(test)]
 fn raft_audit_event(
 	local_node: SchemaNodeId,
 	entry: &Entry<WendelonTypeConfig>,
 	resp: &WendelonResponse,
 ) -> Option<AuditEvent> {
-	raft_audit_event_with_context(local_node, entry, resp, None, None)
+	raft_audit_event_with_context(local_node, entry, resp, None, None, None)
 }
 
 fn raft_audit_event_with_context(
@@ -2820,6 +2900,7 @@ fn raft_audit_event_with_context(
 	resp: &WendelonResponse,
 	retention_context: Option<RetentionAuditContext>,
 	schema_context: Option<SchemaAuditContext>,
+	index_context: Option<IndexSchemaAuditContext>,
 ) -> Option<AuditEvent> {
 	let EntryPayload::Normal(req) = &entry.payload else {
 		return None;
@@ -3145,111 +3226,232 @@ fn raft_audit_event_with_context(
 			)
 		},
 		WendelonRequest::SchemaUpdate(_) => {
-			let context = schema_context?;
-			let table_object_id = format_bytes_hex(context.descriptor.table_object_id.as_bytes());
-			let schema_mutation = schema_mutation_label(context.envelope.mutation);
-			let descriptor_axis = descriptor_mutation_axis(
-				context.previous_descriptor.as_ref(),
-				&context.descriptor,
-			)
-			.map(DescriptorMutationAxis::as_str)
-			.unwrap_or("unchanged");
-			let logical_schema_fingerprint =
-				format_bytes_hex(context.descriptor.logical_schema_fingerprint.as_bytes());
-			let physical_descriptor_fingerprint =
-				format_bytes_hex(context.descriptor.physical_descriptor_fingerprint.as_bytes());
-			let previous_schema_generation = context
-				.previous_descriptor
-				.as_ref()
-				.map(|descriptor| descriptor.schema_generation);
-			let previous_logical_schema_fingerprint = context
-				.previous_descriptor
-				.as_ref()
-				.map(|descriptor| format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes()));
-			let previous_physical_descriptor_fingerprint =
-				context.previous_descriptor.as_ref().map(|descriptor| {
-					format_bytes_hex(descriptor.physical_descriptor_fingerprint.as_bytes())
-				});
-			Some(
-				AuditEvent::new(
-					AuditAuthority::RaftLog,
-					AuditOperation::TableSchemaDescriptorUpdated,
-					local_node,
-					format!(
-						"raft_log_index={} raft_term={} tenant_id={} table_object_id={} schema_mutation={} expected_generation={} requested_generation={} previous_schema_generation={} schema_generation={} descriptor_mutation_axis={} logical_schema_fingerprint={} physical_descriptor_fingerprint={} {}",
-						entry.log_id.index,
-						entry.log_id.leader_id.term,
-						context.envelope.tenant_id.get(),
-						table_object_id,
-						schema_mutation,
+			if let Some(context) = schema_context {
+				let table_object_id =
+					format_bytes_hex(context.descriptor.table_object_id.as_bytes());
+				let schema_mutation = schema_mutation_label(context.envelope.mutation);
+				let descriptor_axis = descriptor_mutation_axis(
+					context.previous_descriptor.as_ref(),
+					&context.descriptor,
+				)
+				.map(DescriptorMutationAxis::as_str)
+				.unwrap_or("unchanged");
+				let logical_schema_fingerprint =
+					format_bytes_hex(context.descriptor.logical_schema_fingerprint.as_bytes());
+				let physical_descriptor_fingerprint =
+					format_bytes_hex(context.descriptor.physical_descriptor_fingerprint.as_bytes());
+				let previous_schema_generation = context
+					.previous_descriptor
+					.as_ref()
+					.map(|descriptor| descriptor.schema_generation);
+				let previous_logical_schema_fingerprint =
+					context.previous_descriptor.as_ref().map(|descriptor| {
+						format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes())
+					});
+				let previous_physical_descriptor_fingerprint =
+					context.previous_descriptor.as_ref().map(|descriptor| {
+						format_bytes_hex(descriptor.physical_descriptor_fingerprint.as_bytes())
+					});
+				Some(
+					AuditEvent::new(
+						AuditAuthority::RaftLog,
+						AuditOperation::TableSchemaDescriptorUpdated,
+						local_node,
+						format!(
+							"raft_log_index={} raft_term={} tenant_id={} table_object_id={} schema_mutation={} expected_generation={} requested_generation={} previous_schema_generation={} schema_generation={} descriptor_mutation_axis={} logical_schema_fingerprint={} physical_descriptor_fingerprint={} {}",
+							entry.log_id.index,
+							entry.log_id.leader_id.term,
+							context.envelope.tenant_id.get(),
+							table_object_id,
+							schema_mutation,
+							context.envelope.expected_generation.get(),
+							context.envelope.requested_generation.get(),
+							previous_schema_generation
+								.map(|generation| generation.to_string())
+								.unwrap_or_else(|| "none".to_string()),
+							context.descriptor.schema_generation,
+							descriptor_axis,
+							logical_schema_fingerprint,
+							physical_descriptor_fingerprint,
+							audit_outcome_message(resp),
+						),
+					)
+					.with_outcome(outcome)
+					.with_raft_log_index(entry.log_id.index)
+					.with_parameter("raft_term", entry.log_id.leader_id.term)
+					.with_parameter("tenant_id", context.envelope.tenant_id.get())
+					.with_parameter("table_object_id", table_object_id.clone())
+					.with_parameter("schema_mutation", schema_mutation)
+					.with_parameter(
+						"expected_generation",
 						context.envelope.expected_generation.get(),
+					)
+					.with_parameter(
+						"requested_generation",
 						context.envelope.requested_generation.get(),
+					)
+					.with_parameter(
+						"previous_schema_generation",
 						previous_schema_generation
-							.map(|generation| generation.to_string())
-							.unwrap_or_else(|| "none".to_string()),
-						context.descriptor.schema_generation,
-						descriptor_axis,
-						logical_schema_fingerprint,
-						physical_descriptor_fingerprint,
-						audit_outcome_message(resp),
-					),
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter("schema_generation", context.descriptor.schema_generation)
+					.with_parameter("descriptor_mutation_axis", descriptor_axis)
+					.with_parameter(
+						"logical_schema_fingerprint",
+						logical_schema_fingerprint.clone(),
+					)
+					.with_parameter(
+						"previous_logical_schema_fingerprint",
+						previous_logical_schema_fingerprint
+							.clone()
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter(
+						"physical_descriptor_fingerprint",
+						physical_descriptor_fingerprint.clone(),
+					)
+					.with_parameter(
+						"previous_physical_descriptor_fingerprint",
+						previous_physical_descriptor_fingerprint
+							.clone()
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_schema(AuditSchema::AdministrativeControl {
+						action: AdministrativeControlAction::TableSchemaDescriptorUpdate,
+						detail: AdministrativeControlSchema {
+							target_tenant_id: Some(context.envelope.tenant_id.get()),
+							target_table_object_id: Some(table_object_id),
+							schema_mutation: Some(schema_mutation.to_string()),
+							schema_generation: Some(context.descriptor.schema_generation),
+							previous_schema_generation,
+							descriptor_mutation_axis: Some(descriptor_axis.to_string()),
+							logical_schema_fingerprint: Some(logical_schema_fingerprint),
+							previous_logical_schema_fingerprint,
+							physical_descriptor_fingerprint: Some(
+								physical_descriptor_fingerprint,
+							),
+							previous_physical_descriptor_fingerprint,
+							..AdministrativeControlSchema::default()
+						},
+					})
+					.with_parameters(audit_outcome_parameters(resp)),
 				)
-				.with_outcome(outcome)
-				.with_raft_log_index(entry.log_id.index)
-				.with_parameter("raft_term", entry.log_id.leader_id.term)
-				.with_parameter("tenant_id", context.envelope.tenant_id.get())
-				.with_parameter("table_object_id", table_object_id.clone())
-				.with_parameter("schema_mutation", schema_mutation)
-				.with_parameter(
-					"expected_generation",
-					context.envelope.expected_generation.get(),
+			} else {
+				let context = index_context?;
+				let descriptor = context
+					.result_descriptor
+					.as_ref()
+					.or(context.descriptor.as_ref())
+					.or(context.previous_descriptor.as_ref());
+				let index_object_id = format_bytes_hex(context.index_object_id.as_bytes());
+				let table_object_id =
+					descriptor.map(|descriptor| format_bytes_hex(descriptor.table_object_id.as_bytes()));
+				let logical_schema_fingerprint = descriptor.map(|descriptor| {
+					format_bytes_hex(descriptor.logical_schema_fingerprint.as_bytes())
+				});
+				let schema_mutation = schema_mutation_label(context.envelope.mutation);
+				let previous_index_lifecycle_state = context
+					.previous_state
+					.map(secondary_index_state_label)
+					.unwrap_or("absent");
+				let index_lifecycle_state = context
+					.result_state
+					.map(secondary_index_state_label)
+					.unwrap_or("absent");
+				let table_schema_generation =
+					descriptor.map(|descriptor| descriptor.table_schema_generation);
+				let indexed_column = descriptor.map(|descriptor| descriptor.key.column_name.clone());
+				Some(
+					AuditEvent::new(
+						AuditAuthority::RaftLog,
+						AuditOperation::SecondaryIndexCatalogUpdated,
+						local_node,
+						format!(
+							"raft_log_index={} raft_term={} tenant_id={} table_object_id={} index_object_id={} schema_mutation={} previous_index_lifecycle_state={} index_lifecycle_state={} expected_generation={} requested_generation={} {}",
+							entry.log_id.index,
+							entry.log_id.leader_id.term,
+							context.envelope.tenant_id.get(),
+							table_object_id.as_deref().unwrap_or("unknown"),
+							index_object_id,
+							schema_mutation,
+							previous_index_lifecycle_state,
+							index_lifecycle_state,
+							context.envelope.expected_generation.get(),
+							context.envelope.requested_generation.get(),
+							audit_outcome_message(resp),
+						),
+					)
+					.with_outcome(outcome)
+					.with_raft_log_index(entry.log_id.index)
+					.with_parameter("raft_term", entry.log_id.leader_id.term)
+					.with_parameter("tenant_id", context.envelope.tenant_id.get())
+					.with_parameter(
+						"table_object_id",
+						table_object_id
+							.clone()
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter("index_object_id", index_object_id.clone())
+					.with_parameter("schema_mutation", schema_mutation)
+					.with_parameter(
+						"expected_generation",
+						context.envelope.expected_generation.get(),
+					)
+					.with_parameter(
+						"requested_generation",
+						context.envelope.requested_generation.get(),
+					)
+					.with_parameter(
+						"table_schema_generation",
+						table_schema_generation
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter(
+						"logical_schema_fingerprint",
+						logical_schema_fingerprint
+							.clone()
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter(
+						"indexed_column",
+						indexed_column
+							.clone()
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_parameter(
+						"previous_index_lifecycle_state",
+						previous_index_lifecycle_state,
+					)
+					.with_parameter("index_lifecycle_state", index_lifecycle_state)
+					.with_parameter(
+						"index_replica_id",
+						context
+							.replica_id
+							.map(|node_id| node_id.id)
+							.map_or(serde_json::Value::Null, serde_json::Value::from),
+					)
+					.with_schema(AuditSchema::AdministrativeControl {
+						action: AdministrativeControlAction::SecondaryIndexCatalogUpdate,
+						detail: AdministrativeControlSchema {
+							target_tenant_id: Some(context.envelope.tenant_id.get()),
+							target_table_object_id: table_object_id,
+							target_index_object_id: Some(index_object_id),
+							schema_mutation: Some(schema_mutation.to_string()),
+							table_schema_generation,
+							indexed_column,
+							logical_schema_fingerprint,
+							previous_index_lifecycle_state: Some(
+								previous_index_lifecycle_state.to_string(),
+							),
+							index_lifecycle_state: Some(index_lifecycle_state.to_string()),
+							index_replica_id: context.replica_id.map(|node_id| node_id.id),
+							..AdministrativeControlSchema::default()
+						},
+					})
+					.with_parameters(audit_outcome_parameters(resp)),
 				)
-				.with_parameter(
-					"requested_generation",
-					context.envelope.requested_generation.get(),
-				)
-				.with_parameter(
-					"previous_schema_generation",
-					previous_schema_generation
-						.map_or(serde_json::Value::Null, serde_json::Value::from),
-				)
-				.with_parameter("schema_generation", context.descriptor.schema_generation)
-				.with_parameter("descriptor_mutation_axis", descriptor_axis)
-				.with_parameter("logical_schema_fingerprint", logical_schema_fingerprint.clone())
-				.with_parameter(
-					"previous_logical_schema_fingerprint",
-					previous_logical_schema_fingerprint
-						.clone()
-						.map_or(serde_json::Value::Null, serde_json::Value::from),
-				)
-				.with_parameter(
-					"physical_descriptor_fingerprint",
-					physical_descriptor_fingerprint.clone(),
-				)
-				.with_parameter(
-					"previous_physical_descriptor_fingerprint",
-					previous_physical_descriptor_fingerprint
-						.clone()
-						.map_or(serde_json::Value::Null, serde_json::Value::from),
-				)
-				.with_schema(AuditSchema::AdministrativeControl {
-					action: AdministrativeControlAction::TableSchemaDescriptorUpdate,
-					detail: AdministrativeControlSchema {
-						target_tenant_id: Some(context.envelope.tenant_id.get()),
-						target_table_object_id: Some(table_object_id),
-						schema_mutation: Some(schema_mutation.to_string()),
-						schema_generation: Some(context.descriptor.schema_generation),
-						previous_schema_generation,
-						descriptor_mutation_axis: Some(descriptor_axis.to_string()),
-						logical_schema_fingerprint: Some(logical_schema_fingerprint),
-						previous_logical_schema_fingerprint,
-						physical_descriptor_fingerprint: Some(physical_descriptor_fingerprint),
-						previous_physical_descriptor_fingerprint,
-						..AdministrativeControlSchema::default()
-					},
-				})
-				.with_parameters(audit_outcome_parameters(resp)),
-			)
+			}
 		},
 		WendelonRequest::SuspendTenant(tenant_id) => Some(
 			AuditEvent::new(
@@ -3361,6 +3563,8 @@ fn schema_mutation_label(mutation: SchemaMutationKindV1) -> &'static str {
 		SchemaMutationKindV1::Create => "create",
 		SchemaMutationKindV1::Alter => "alter",
 		SchemaMutationKindV1::Drop => "drop",
+		SchemaMutationKindV1::IndexBackfillComplete => "index_backfill_complete",
+		SchemaMutationKindV1::IndexDropGcComplete => "index_drop_gc_complete",
 	}
 }
 
@@ -3744,12 +3948,17 @@ fn apply_update_tenant_quota(state: &mut SmState, update: UpdateTenantQuota) -> 
 
 fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> {
 	let envelope = decode_schema_update_envelope_v1(bytes).map_err(|err| err.to_string())?;
-	if envelope.object.kind != SchemaObjectKind::Table {
-		return Err(format!(
-			"schema object kind {:?} is not implemented",
-			envelope.object.kind
-		));
+	match envelope.object.kind {
+		SchemaObjectKind::Table => apply_table_schema_update(state, envelope),
+		SchemaObjectKind::Index => apply_index_schema_update(state, envelope),
+		other => Err(format!("schema object kind {other:?} is not implemented")),
 	}
+}
+
+fn apply_table_schema_update(
+	state: &mut SmState,
+	envelope: SchemaUpdateEnvelopeV1,
+) -> Result<(), String> {
 	match envelope.mutation {
 		SchemaMutationKindV1::Create | SchemaMutationKindV1::Alter => {
 			let descriptor = decode_table_schema_descriptor_v1(&envelope.payload)
@@ -3831,7 +4040,140 @@ fn apply_schema_update(state: &mut SmState, bytes: &[u8]) -> Result<(), String> 
 		SchemaMutationKindV1::Drop => {
 			Err("table schema drops require an explicit data-rewrite migration".to_owned())
 		}
+		SchemaMutationKindV1::IndexBackfillComplete | SchemaMutationKindV1::IndexDropGcComplete => {
+			Err("table schema does not support secondary-index lifecycle mutations".to_owned())
+		}
 	}
+}
+
+fn apply_index_schema_update(
+	state: &mut SmState,
+	envelope: SchemaUpdateEnvelopeV1,
+) -> Result<(), String> {
+	match envelope.mutation {
+		SchemaMutationKindV1::Create => {
+			let descriptor = decode_secondary_index_descriptor(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			if descriptor.namespace != envelope.object.namespace
+				|| descriptor.index_name != envelope.object.name
+			{
+				return Err(
+					"secondary index descriptor object does not match schema envelope".to_owned(),
+				);
+			}
+			state
+				.secondary_indexes
+				.create(envelope.tenant_id, descriptor.clone(), &state.table_schemas)
+				.map_err(|err| err.to_string())?;
+			metrics().observe_storage_secondary_index_create(
+				envelope.tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+			);
+			Ok(())
+		}
+		SchemaMutationKindV1::Alter => Err(SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED.to_owned()),
+		SchemaMutationKindV1::Drop => {
+			let request = decode_secondary_index_drop_request(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			let existing = state
+				.secondary_indexes
+				.get(envelope.tenant_id, request.index_object_id)
+				.cloned();
+			if let Some(row) = existing.as_ref()
+				&& (row.descriptor.namespace != envelope.object.namespace
+					|| row.descriptor.index_name != envelope.object.name)
+			{
+				return Err("secondary index drop object does not match schema envelope".to_owned());
+			}
+			state
+				.secondary_indexes
+				.mark_dropping(envelope.tenant_id, request.index_object_id)
+				.map_err(|err| err.to_string())?;
+			if let Some(row) = existing {
+				metrics().observe_storage_secondary_index_drop(
+					envelope.tenant_id,
+					row.descriptor.table_object_id,
+					row.descriptor.index_object_id,
+					secondary_index_state_label(row.state),
+				);
+			}
+			Ok(())
+		}
+		SchemaMutationKindV1::IndexBackfillComplete => {
+			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			let before = state
+				.secondary_indexes
+				.get(envelope.tenant_id, complete.index_object_id)
+				.cloned();
+			state
+				.secondary_indexes
+				.mark_backfill_complete(envelope.tenant_id, complete.index_object_id)
+				.map_err(|err| err.to_string())?;
+			if let Some(row) = before
+				&& row.state == SecondaryIndexState::Building
+			{
+				metrics().observe_storage_secondary_index_lifecycle_transition(
+					envelope.tenant_id,
+					row.descriptor.table_object_id,
+					row.descriptor.index_object_id,
+					"building",
+					"ready",
+				);
+			}
+			Ok(())
+		}
+		SchemaMutationKindV1::IndexDropGcComplete => {
+			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
+				.map_err(|err| err.to_string())?;
+			let voters = current_voter_ids(state, complete.replica_id.id);
+			let before = state
+				.secondary_indexes
+				.get(envelope.tenant_id, complete.index_object_id)
+				.cloned();
+			state
+				.secondary_indexes
+				.mark_drop_gc_complete(
+					envelope.tenant_id,
+					complete.index_object_id,
+					complete.replica_id,
+					&voters,
+				)
+				.map_err(|err| err.to_string())?;
+			if let Some(row) = before
+				&& state
+					.secondary_indexes
+					.get(envelope.tenant_id, complete.index_object_id)
+					.is_none()
+			{
+				metrics().observe_storage_secondary_index_lifecycle_transition(
+					envelope.tenant_id,
+					row.descriptor.table_object_id,
+					row.descriptor.index_object_id,
+					"dropping",
+					"absent",
+				);
+			}
+			Ok(())
+		}
+	}
+}
+
+fn secondary_index_state_label(state: SecondaryIndexState) -> &'static str {
+	match state {
+		SecondaryIndexState::Building => "building",
+		SecondaryIndexState::Ready => "ready",
+		SecondaryIndexState::Dropping => "dropping",
+	}
+}
+
+fn current_voter_ids(state: &SmState, fallback_replica_id: u32) -> BTreeSet<u32> {
+	let mut voters: BTreeSet<u32> = state.last_membership.voter_ids().collect();
+	if voters.is_empty() {
+		voters.insert(fallback_replica_id);
+	}
+	voters
 }
 
 fn apply_set_table_retention_policy(
@@ -5322,10 +5664,14 @@ mod schema_state_tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		LocalityPolicyV1, LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration,
+		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, LocalityPolicyV1,
+		LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration,
 		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 		RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableRetentionPolicy, TableSchemaDescriptorV1, TenantKekId,
+		SecondaryIndexDescriptor, SecondaryIndexDropRequest, SecondaryIndexKeyDescriptor,
+		SecondaryIndexLifecycleComplete, SecondaryIndexState, TableObjectId, TableRetentionPolicy,
+		TableSchemaDescriptorV1, TenantKekId, encode_secondary_index_descriptor,
+		encode_secondary_index_drop_request, encode_secondary_index_lifecycle_complete,
 		encode_table_schema_descriptor_v1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -5442,6 +5788,48 @@ mod schema_state_tests {
 			expected_generation: SchemaGeneration::new(expected_generation),
 			requested_generation: SchemaGeneration::new(requested_generation),
 			intent_id: SchemaIntentId::new([9; 16]),
+			mutation,
+			payload,
+		};
+		encode_schema_update_envelope_v1(&envelope).unwrap()
+	}
+
+	fn index_descriptor(table: &TableSchemaDescriptorV1) -> SecondaryIndexDescriptor {
+		SecondaryIndexDescriptor {
+			index_object_id: IndexObjectId::new([0x52; 16]),
+			table_object_id: table.table_object_id,
+			namespace: table.namespace.clone(),
+			index_name: "events_age_idx".to_owned(),
+			table_schema_generation: table.schema_generation,
+			logical_schema_fingerprint: table.logical_schema_fingerprint,
+			key: SecondaryIndexKeyDescriptor {
+				column_name: "age".to_owned(),
+				column_ordinal: 1,
+				arrow_type_tag: IndexArrowTypeTag::Int64,
+				encoding: IndexKeyEncoding::OrderedScalar,
+			},
+		}
+	}
+
+	fn index_schema_envelope(
+		descriptor: &SecondaryIndexDescriptor,
+		expected_generation: u64,
+		requested_generation: u64,
+		mutation: SchemaMutationKindV1,
+		payload: Vec<u8>,
+	) -> Vec<u8> {
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::WendelonOperator,
+			tenant_id: TenantId::new(7),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Index,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.index_name.clone(),
+			},
+			expected_generation: SchemaGeneration::new(expected_generation),
+			requested_generation: SchemaGeneration::new(requested_generation),
+			intent_id: SchemaIntentId::new([0x52; 16]),
 			mutation,
 			payload,
 		};
@@ -5664,6 +6052,7 @@ mod schema_state_tests {
 			&WendelonResponse::Success,
 			None,
 			Some(context),
+			None,
 		)
 		.expect("schema update must emit audit");
 
@@ -5764,6 +6153,7 @@ mod schema_state_tests {
 			&WendelonResponse::Success,
 			None,
 			Some(context),
+			None,
 		)
 		.expect("schema update must emit audit");
 
@@ -5815,6 +6205,95 @@ mod schema_state_tests {
 	}
 
 	#[test]
+	fn secondary_index_schema_update_audit_records_lifecycle_state() {
+		let table = table_descriptor(1);
+		let mut state = state_with_descriptor(&table);
+		let descriptor = index_descriptor(&table);
+		let bytes = index_schema_envelope(
+			&descriptor,
+			0,
+			1,
+			SchemaMutationKindV1::Create,
+			encode_secondary_index_descriptor(&descriptor).unwrap(),
+		);
+		let entry = Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 0), 14),
+			payload: EntryPayload::Normal(WendelonRequest::SchemaUpdate(bytes.clone())),
+		};
+		let mut context =
+			index_schema_audit_context(&state, &entry).expect("index schema audit context");
+		apply_schema_update(&mut state, &bytes).unwrap();
+		finalize_index_schema_audit_context(&state, &mut context);
+
+		let event = raft_audit_event_with_context(
+			SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			&entry,
+			&WendelonResponse::Success,
+			None,
+			None,
+			Some(context),
+		)
+		.expect("index schema update must emit audit");
+
+		assert_eq!(
+			event.operation,
+			AuditOperation::SecondaryIndexCatalogUpdated
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("schema_mutation")
+				.and_then(|value| value.as_str()),
+			Some("create")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("previous_index_lifecycle_state")
+				.and_then(|value| value.as_str()),
+			Some("absent")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("index_lifecycle_state")
+				.and_then(|value| value.as_str()),
+			Some("building")
+		);
+		assert_eq!(
+			event
+				.parameters
+				.get("indexed_column")
+				.and_then(|value| value.as_str()),
+			Some("age")
+		);
+		let Some(AuditSchema::AdministrativeControl { action, detail }) = event.schema else {
+			panic!("expected administrative-control audit schema");
+		};
+		assert_eq!(
+			action,
+			AdministrativeControlAction::SecondaryIndexCatalogUpdate
+		);
+		assert_eq!(
+			detail.target_index_object_id.as_deref(),
+			Some(format_bytes_hex(descriptor.index_object_id.as_bytes()).as_str())
+		);
+		assert_eq!(
+			detail.target_table_object_id.as_deref(),
+			Some(format_bytes_hex(descriptor.table_object_id.as_bytes()).as_str())
+		);
+		assert_eq!(detail.index_lifecycle_state.as_deref(), Some("building"));
+		assert_eq!(
+			detail.previous_index_lifecycle_state.as_deref(),
+			Some("absent")
+		);
+		assert_eq!(detail.indexed_column.as_deref(), Some("age"));
+	}
+
+	#[test]
 	fn table_retention_policy_update_audit_marks_irreversible_extension() {
 		let update = SetTableRetentionPolicy {
 			tenant_id: TenantId::new(7),
@@ -5846,6 +6325,7 @@ mod schema_state_tests {
 					RetentionWindowMillis::try_new(60_000).unwrap(),
 				)),
 			}),
+			None,
 			None,
 		)
 		.expect("retention policy update must emit audit");
@@ -6073,12 +6553,142 @@ mod schema_state_tests {
 			0,
 			1,
 			SchemaMutationKindV1::Create,
-			SchemaObjectKind::Index,
+			SchemaObjectKind::View,
 		);
 		let mut state = SmState::default();
 		let err = apply_schema_update(&mut state, &bytes).unwrap_err();
-		assert!(err.contains("schema object kind Index is not implemented"));
+		assert!(err.contains("schema object kind View is not implemented"));
 		assert!(state.table_schemas.is_empty());
+	}
+
+	#[test]
+	fn schema_update_creates_secondary_index_without_table_generation_bump() {
+		let table = table_descriptor(1);
+		let mut state = state_with_descriptor(&table);
+		let descriptor = index_descriptor(&table);
+		let bytes = index_schema_envelope(
+			&descriptor,
+			0,
+			1,
+			SchemaMutationKindV1::Create,
+			encode_secondary_index_descriptor(&descriptor).unwrap(),
+		);
+
+		apply_schema_update(&mut state, &bytes).unwrap();
+		let row = state
+			.secondary_indexes
+			.get(TenantId::new(7), descriptor.index_object_id)
+			.unwrap();
+		assert_eq!(row.state, SecondaryIndexState::Building);
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_id(TenantId::new(7), table.table_object_id)
+				.unwrap()
+				.schema_generation,
+			1
+		);
+	}
+
+	#[test]
+	fn secondary_index_lifecycle_mutations_are_linear_and_idempotent() {
+		let table = table_descriptor(1);
+		let mut state = state_with_descriptor(&table);
+		let descriptor = index_descriptor(&table);
+		apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&descriptor,
+				0,
+				1,
+				SchemaMutationKindV1::Create,
+				encode_secondary_index_descriptor(&descriptor).unwrap(),
+			),
+		)
+		.unwrap();
+		let complete = SecondaryIndexLifecycleComplete {
+			index_object_id: descriptor.index_object_id,
+			replica_id: SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+		};
+		let complete_bytes = index_schema_envelope(
+			&descriptor,
+			1,
+			2,
+			SchemaMutationKindV1::IndexBackfillComplete,
+			encode_secondary_index_lifecycle_complete(&complete).unwrap(),
+		);
+		apply_schema_update(&mut state, &complete_bytes).unwrap();
+		apply_schema_update(&mut state, &complete_bytes).unwrap();
+		assert_eq!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), descriptor.index_object_id)
+				.unwrap()
+				.state,
+			SecondaryIndexState::Ready
+		);
+
+		let drop = SecondaryIndexDropRequest {
+			index_object_id: descriptor.index_object_id,
+		};
+		apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&descriptor,
+				2,
+				3,
+				SchemaMutationKindV1::Drop,
+				encode_secondary_index_drop_request(&drop).unwrap(),
+			),
+		)
+		.unwrap();
+		assert_eq!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), descriptor.index_object_id)
+				.unwrap()
+				.state,
+			SecondaryIndexState::Dropping
+		);
+		apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&descriptor,
+				3,
+				4,
+				SchemaMutationKindV1::IndexDropGcComplete,
+				encode_secondary_index_lifecycle_complete(&complete).unwrap(),
+			),
+		)
+		.unwrap();
+		assert!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), descriptor.index_object_id)
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn secondary_index_alter_uses_schema_update_reject_namespace() {
+		let table = table_descriptor(1);
+		let mut state = state_with_descriptor(&table);
+		let descriptor = index_descriptor(&table);
+		let err = apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&descriptor,
+				0,
+				1,
+				SchemaMutationKindV1::Alter,
+				encode_secondary_index_descriptor(&descriptor).unwrap(),
+			),
+		)
+		.unwrap_err();
+		assert_eq!(err, SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED);
 	}
 }
 

@@ -118,3 +118,7 @@ harness = false
 [[bench]]
 name = "descriptor_fingerprint"
 harness = false
+
+[[bench]]
+name = "secondary_index"
+harness = false

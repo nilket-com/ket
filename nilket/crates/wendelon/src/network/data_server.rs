@@ -76,7 +76,8 @@ use crate::schema::{
 	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex,
 	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
-	STORAGE_ROW_KEY_ID_COLUMN, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
+	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
+	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
 	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
 	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
@@ -111,9 +112,11 @@ use crate::storage::stats::{
 	prune_by_encoded_any_of, prune_by_encoded_min_max,
 };
 use crate::storage::{
-	EffectiveRetention, MvccRetentionPolicy, aggregate_record_batches,
-	check_read_against_retention, cluster_retention_floor, effective_table_retention,
-	merge_aggregate_responses, validate_expression_types,
+	EffectiveRetention, MvccRetentionPolicy, SecondaryIndexAccessPlan, SecondaryIndexLookupRow,
+	TableLookupByIndexRequest, aggregate_record_batches, check_read_against_retention,
+	cluster_retention_floor, effective_table_retention, merge_aggregate_responses,
+	secondary_index_access_plan_from_program, secondary_index_entry_from_materialized_row,
+	validate_expression_types,
 };
 use arrow::array::{
 	Array, FixedSizeBinaryArray, FixedSizeBinaryBuilder, LargeBinaryArray, LargeBinaryBuilder,
@@ -128,7 +131,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry as DashEntry;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
 #[cfg(test)]
@@ -849,6 +852,7 @@ pub const DEFAULT_PAGE_MAX_RECORDS: u32 = 1024;
 pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const DEFAULT_TENANT_MAX_INFLIGHT_WRITES: u32 = 8;
 pub const DEFAULT_TENANT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+pub const DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Per-subscriber queue depth for committed finalization markers.
 pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 /// Default wake cadence for the background migration sweeper.
@@ -1688,6 +1692,7 @@ impl WendelonDataServer {
 				self.mvcc_retention_policy,
 				&snapshot.table_lifecycle,
 				&snapshot.table_schemas,
+				&snapshot.secondary_indexes,
 				self.clock.now_ms(),
 				max_slabs,
 			)
@@ -5227,6 +5232,14 @@ impl WendelonDataServer {
 				));
 			}
 		};
+		let secondary_index_access_plan = secondary_index_access_plan_from_program(
+			&sm_peek.secondary_indexes,
+			meta.tenant_id,
+			&descriptor,
+			&program,
+		)
+		.ok()
+		.flatten();
 		let ranges = match table_query_scan_ranges(meta.tenant_id, &descriptor, Some(&program)) {
 			Ok(ranges) => ranges,
 			Err(status) => return Ok(query_plan_error(&range_meta, status, self.local_node)),
@@ -5283,7 +5296,53 @@ impl WendelonDataServer {
 			}
 		};
 
-		plan_query_execution_for_ranges_with_program(
+		let projected_execution = QueryProjectedExecution::Pbc {
+			requirement,
+			user_column_count,
+		};
+		if let Some(access_plan) = secondary_index_access_plan.as_ref() {
+			match plan_table_query_execution_by_secondary_index(
+				&self.slab,
+				self.local_node,
+				&range_meta,
+				&program,
+				&ranges,
+				QueryExecutionBudget::default(),
+				&descriptor,
+				&projected_execution,
+				effective_retention.floor,
+				access_plan,
+			)
+			.await
+			{
+				Ok(plan) => {
+					metrics().observe_storage_secondary_index_query_plan(
+						meta.tenant_id,
+						access_plan.descriptor.table_object_id,
+						access_plan.descriptor.index_object_id,
+						"indexed",
+					);
+					return Ok(plan);
+				}
+				Err(err) => {
+					metrics().observe_storage_secondary_index_query_plan(
+						meta.tenant_id,
+						access_plan.descriptor.table_object_id,
+						access_plan.descriptor.index_object_id,
+						"fallback_full_scan",
+					);
+					tracing::warn!(
+						tenant_id = meta.tenant_id.get(),
+						table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+						index_object_id = %format_bytes_hex(access_plan.descriptor.index_object_id.as_bytes()),
+						error = %err,
+						"secondary index table-query execution failed; falling back to full scan"
+					);
+				}
+			}
+		}
+
+		let mut plan = plan_query_execution_for_ranges_with_program(
 			&self.slab,
 			self.local_node,
 			&range_meta,
@@ -5291,13 +5350,12 @@ impl WendelonDataServer {
 			&ranges,
 			QueryExecutionBudget::default(),
 			Some(&descriptor),
-			QueryProjectedExecution::Pbc {
-				requirement,
-				user_column_count,
-			},
+			projected_execution,
 			effective_retention.floor,
 		)
-		.await
+		.await?;
+		plan.secondary_index_access_plan = secondary_index_access_plan;
+		Ok(plan)
 	}
 
 	async fn execute_aggregate_with_migration_merge(
@@ -6984,6 +7042,26 @@ impl WendelonDataServer {
 		Some(groups)
 	}
 
+	fn secondary_index_admission_descriptors(
+		catalog: &SecondaryIndexCatalog,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+	) -> Vec<SecondaryIndexDescriptor> {
+		catalog
+			.for_table(tenant_id, table.table_object_id)
+			.into_iter()
+			.filter(|row| {
+				matches!(
+					row.state,
+					SecondaryIndexState::Building | SecondaryIndexState::Ready
+				) && row.descriptor.table_schema_generation == table.schema_generation
+					&& row.descriptor.logical_schema_fingerprint == table.logical_schema_fingerprint
+					&& row.descriptor.validate_against_table(table).is_ok()
+			})
+			.map(|row| row.descriptor.clone())
+			.collect()
+	}
+
 	async fn write_table_bifurcated(
 		&self,
 		meta: TableWriteRequestMeta,
@@ -6991,6 +7069,7 @@ impl WendelonDataServer {
 		mut groups: Vec<TableReplicaGroup>,
 		commit_hlc: HybridTimestamp,
 		is_append_only: bool,
+		secondary_index_descriptors: Vec<SecondaryIndexDescriptor>,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
@@ -7123,6 +7202,7 @@ impl WendelonDataServer {
 			} else {
 				let slab = self.slab.clone();
 				let tenant_id = meta.tenant_id;
+				let secondary_index_descriptors = secondary_index_descriptors.clone();
 				#[cfg(test)]
 				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
 				Some(tokio::spawn(async move {
@@ -7140,7 +7220,11 @@ impl WendelonDataServer {
 					let mut completed = Vec::with_capacity(local_groups.len());
 					for (index, children) in local_groups {
 						append_bifurcated_table_children_durable(
-							&slab, tenant_id, commit_hlc, &children,
+							&slab,
+							tenant_id,
+							commit_hlc,
+							&children,
+							&secondary_index_descriptors,
 						)
 						.await?;
 						completed.push(index);
@@ -7357,7 +7441,7 @@ impl WendelonDataServer {
 			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
-		let (descriptor, effective_retention) = {
+		let (descriptor, effective_retention, secondary_index_descriptors) = {
 			let state = self.state_machine.state_snapshot().await;
 			let effective_retention = self.table_effective_retention_from_state(
 				&state,
@@ -7368,7 +7452,17 @@ impl WendelonDataServer {
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
 				.cloned();
-			(descriptor, effective_retention)
+			let secondary_index_descriptors = descriptor
+				.as_ref()
+				.map(|descriptor| {
+					Self::secondary_index_admission_descriptors(
+						&state.secondary_indexes,
+						meta.tenant_id,
+						descriptor,
+					)
+				})
+				.unwrap_or_default();
+			(descriptor, effective_retention, secondary_index_descriptors)
 		};
 		let Some(descriptor) = descriptor else {
 			return Ok((
@@ -7493,7 +7587,14 @@ impl WendelonDataServer {
 		let primary_key_metric_tenant = meta.tenant_id;
 		let primary_key_metric_table = meta.table_object_id;
 		let (write, trailing) = self
-			.write_table_bifurcated(meta, bifurcated, groups, commit_hlc, is_append_only)
+			.write_table_bifurcated(
+				meta,
+				bifurcated,
+				groups,
+				commit_hlc,
+				is_append_only,
+				secondary_index_descriptors,
+			)
 			.await?;
 		if matches!(
 			write.status,
@@ -7939,7 +8040,14 @@ impl WendelonDataServer {
 			));
 		};
 		let (write, trailing) = self
-			.write_table_bifurcated(synthetic_meta, bifurcated, groups, delete_hlc, false)
+			.write_table_bifurcated(
+				synthetic_meta,
+				bifurcated,
+				groups,
+				delete_hlc,
+				false,
+				Vec::new(),
+			)
 			.await?;
 		let response = table_delete_rows_response(
 			write,
@@ -8321,6 +8429,7 @@ struct QueryExecutionPlan {
 	batches: Vec<RecordBatch>,
 	deadline: Instant,
 	stats_explain: QueryStatsExplainCounters,
+	secondary_index_access_plan: Option<SecondaryIndexAccessPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -9072,6 +9181,323 @@ async fn plan_query_execution_with_budget_and_retention_floor(
 	.await
 }
 
+async fn plan_table_query_execution_by_secondary_index(
+	slab: &SlabManager,
+	local_node: NodeId,
+	meta: &QueryRequestMeta,
+	program: &pbc::Program,
+	ranges: &[QueryScanRange],
+	budget: QueryExecutionBudget,
+	table_descriptor: &TableSchemaDescriptorV1,
+	projected_execution: &QueryProjectedExecution,
+	logical_retention_floor: Option<HybridTimestamp>,
+	access_plan: &SecondaryIndexAccessPlan,
+) -> std::io::Result<QueryExecutionPlan> {
+	let budget = QueryExecutionBudget {
+		stats_pruning_enabled: budget.stats_pruning_enabled
+			&& query_request_stats_pruning_enabled(meta),
+		..budget
+	};
+	let started_at = Instant::now();
+	let deadline = started_at + budget.max_wall_time;
+	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
+	let mut stats_prune_cache = QueryStatsPruneCache::default();
+	let mut batches = Vec::new();
+	let mut rows = 0u64;
+	let mut scanned_locations = 0usize;
+	let mut max_hlc = HybridTimestamp {
+		physical_ms: 0,
+		logical: 0,
+		node_id: 0,
+	};
+	let mut seen = BTreeSet::new();
+	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
+
+	let request = TableLookupByIndexRequest::from_descriptor(
+		meta.tenant_id,
+		&access_plan.descriptor,
+		access_plan.query.clone(),
+		meta.as_of_hlc,
+	);
+	let lookup = slab
+		.table_lookup_by_index(
+			&request,
+			&access_plan.descriptor,
+			SecondaryIndexState::Ready,
+		)
+		.await?;
+	for row in &lookup.rows {
+		if logical_retention_floor.is_some_and(|floor| row.row_hlc < floor) {
+			metrics().observe_storage_table_retention_read_filtered_rows(1);
+			continue;
+		}
+		if started_at.elapsed() > budget.max_wall_time {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		scanned_locations = scanned_locations.saturating_add(1);
+		if scanned_locations > budget.max_locations {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		let key = secondary_index_result_key(row.row_key_id, row.record_location);
+		if !seen.insert(key) {
+			continue;
+		}
+		let Some(result) = read_secondary_index_query_location(
+			slab,
+			row,
+			table_descriptor,
+			program,
+			projected_execution,
+		)
+		.await?
+		else {
+			continue;
+		};
+		if result.num_rows() == 0 {
+			continue;
+		}
+		if result.num_rows() > max_rows_per_location {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		rows = rows.saturating_add(result.num_rows() as u64);
+		if row.row_hlc > max_hlc {
+			max_hlc = row.row_hlc;
+		}
+		if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+			return Ok(query_plan_error(
+				meta,
+				ReadStatus::QUERY_BUDGET_EXCEEDED,
+				local_node,
+			));
+		}
+		batches.push(result);
+	}
+
+	let tail_source_slabs = slab
+		.secondary_index_tail_source_slabs(meta.tenant_id, &access_plan.descriptor)
+		.await;
+	for range in ranges {
+		let scanned = slab.scan_as_of_with_identity_and_locality(
+			meta.tenant_id,
+			range.start,
+			range.end,
+			meta.as_of_hlc,
+		);
+		for (key_identity, locality, location) in scanned {
+			if !tail_source_slabs.contains(&location.slab_id) {
+				continue;
+			}
+			if logical_retention_floor.is_some_and(|floor| location.hlc < floor) {
+				metrics().observe_storage_table_retention_read_filtered_rows(1);
+				continue;
+			}
+			if started_at.elapsed() > budget.max_wall_time {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			if budget.stats_pruning_enabled
+				&& !table_stats_may_match_location(
+					slab,
+					Some(table_descriptor),
+					program,
+					&mut stats_prune_cache,
+					location,
+				)
+				.await?
+			{
+				continue;
+			}
+			scanned_locations = scanned_locations.saturating_add(1);
+			if scanned_locations > budget.max_locations {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			let key = secondary_index_result_key(key_identity, location);
+			if !seen.insert(key) {
+				continue;
+			}
+			let Some(result) = read_table_query_location(
+				slab,
+				meta,
+				location,
+				key_identity,
+				locality,
+				table_descriptor,
+				program,
+				projected_execution,
+			)
+			.await?
+			else {
+				continue;
+			};
+			if result.num_rows() == 0 {
+				continue;
+			}
+			if result.num_rows() > max_rows_per_location {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			rows = rows.saturating_add(result.num_rows() as u64);
+			if location.hlc > max_hlc {
+				max_hlc = location.hlc;
+			}
+			if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
+				return Ok(query_plan_error(
+					meta,
+					ReadStatus::QUERY_BUDGET_EXCEEDED,
+					local_node,
+				));
+			}
+			batches.push(result);
+		}
+	}
+
+	if batches.is_empty() {
+		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
+		plan.stats_explain = stats_prune_cache.explain;
+		plan.secondary_index_access_plan = Some(access_plan.clone());
+		return Ok(plan);
+	}
+
+	Ok(QueryExecutionPlan {
+		response: QueryResponseMeta {
+			status: ReadStatus::OK,
+			_pad1: [0; 7],
+			value_hlc: max_hlc,
+			epoch: meta.expected_epoch,
+			leader_hint: local_node,
+			rows,
+			arrow_len: 0,
+			_pad2: [0; 4],
+		},
+		batches,
+		deadline,
+		stats_explain: stats_prune_cache.explain,
+		secondary_index_access_plan: Some(access_plan.clone()),
+	})
+}
+
+fn secondary_index_result_key(
+	row_key_id: Identity,
+	location: RecordLocation,
+) -> (Identity, HybridTimestamp, SlabId, u64, u32, RecordRowIndex) {
+	(
+		row_key_id,
+		location.hlc,
+		location.slab_id,
+		location.offset,
+		location.length,
+		location.record_row_index,
+	)
+}
+
+async fn read_secondary_index_query_location(
+	slab: &SlabManager,
+	row: &SecondaryIndexLookupRow,
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Option<RecordBatch>> {
+	if let Some(result) = read_projected_query_location(
+		slab,
+		row.record_location,
+		descriptor,
+		program,
+		projected_execution,
+	)
+	.await?
+	{
+		return Ok(Some(result));
+	}
+	let bytes = slab.read(row.record_location).await?;
+	let storage_batch = decode_batch(&bytes)?;
+	let batch =
+		materialize_record_location_batch(&storage_batch, row.record_location.record_row_index)?;
+	match pbc::execute_program(program, &batch) {
+		Ok(result) => Ok(Some(result)),
+		Err(_) => Err(Error::new(
+			ErrorKind::InvalidData,
+			"secondary index residual PBC evaluation failed",
+		)),
+	}
+}
+
+async fn read_table_query_location(
+	slab: &SlabManager,
+	meta: &QueryRequestMeta,
+	location: RecordLocation,
+	key_identity: Identity,
+	locality: Locality,
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Option<RecordBatch>> {
+	if let Some(result) =
+		read_projected_query_location(slab, location, descriptor, program, projected_execution)
+			.await?
+	{
+		return Ok(Some(result));
+	}
+	let bytes = slab.read(location).await?;
+	let decode_started = Instant::now();
+	let storage_batch = decode_batch(&bytes)?;
+	let storage_row_count = storage_batch.num_rows();
+	let was_multirow = has_storage_synthetic_columns(&storage_batch);
+	let stored_table_object_id = if was_multirow {
+		storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
+	} else {
+		None
+	};
+	let batch = materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+	if was_multirow {
+		metrics().observe_storage_multirow_decode(
+			batch.num_rows() as u64,
+			bytes.len() as u64,
+			decode_started.elapsed(),
+		);
+		if storage_row_count <= 1 {
+			metrics()
+				.storage_multirow_uncompacted_row_records_total
+				.inc();
+		}
+	}
+	if !table_record_matches_descriptor(
+		meta,
+		descriptor,
+		key_identity,
+		locality,
+		stored_table_object_id,
+		&batch,
+	)? {
+		return Ok(None);
+	}
+	match pbc::execute_program(program, &batch) {
+		Ok(result) => Ok(Some(result)),
+		Err(_) => Ok(None),
+	}
+}
+
 async fn plan_query_execution_for_ranges_with_program(
 	slab: &SlabManager,
 	local_node: NodeId,
@@ -9323,6 +9749,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		batches,
 		deadline,
 		stats_explain: stats_prune_cache.explain,
+		secondary_index_access_plan: None,
 	})
 }
 
@@ -9514,6 +9941,7 @@ fn query_plan_error(
 		batches: Vec::new(),
 		deadline: Instant::now(),
 		stats_explain: QueryStatsExplainCounters::default(),
+		secondary_index_access_plan: None,
 	}
 }
 
@@ -10874,30 +11302,166 @@ async fn append_bifurcated_table_children_durable(
 	tenant_id: TenantId,
 	commit_hlc: HybridTimestamp,
 	children: &[BifurcatedTableChildWrite],
+	secondary_index_descriptors: &[SecondaryIndexDescriptor],
 ) -> std::io::Result<()> {
 	for child in children {
 		let decoded = decode_batch(child.frame_bytes.as_slice())?;
 		if has_storage_synthetic_columns(&decoded) {
 			let entries = storage_index_entries_from_batch(&decoded)?;
-			slab.append_durable_multirow_with_locality(
+			let base_location = slab
+				.append_durable_multirow_with_locality(
+					tenant_id,
+					child.frame_bytes.as_slice(),
+					&entries,
+				)
+				.await?;
+			append_secondary_index_active_buffers_for_storage_batch(
+				slab,
 				tenant_id,
-				child.frame_bytes.as_slice(),
-				&entries,
+				secondary_index_descriptors,
+				&decoded,
+				base_location,
 			)
-			.await?;
+			.await;
 			metrics().observe_storage_multirow_record_written(entries.len() as u64);
 		} else {
-			slab.append_durable_with_locality(
+			let location = slab
+				.append_durable_with_locality(
+					tenant_id,
+					child.key_identity,
+					child.locality,
+					commit_hlc,
+					child.frame_bytes.as_slice(),
+				)
+				.await?;
+			append_secondary_index_active_buffers_for_single_row(
+				slab,
 				tenant_id,
+				secondary_index_descriptors,
+				&decoded,
 				child.key_identity,
-				child.locality,
 				commit_hlc,
-				child.frame_bytes.as_slice(),
+				location,
 			)
-			.await?;
+			.await;
 		}
 	}
 	Ok(())
+}
+
+async fn append_secondary_index_active_buffers_for_storage_batch(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	descriptors: &[SecondaryIndexDescriptor],
+	batch: &RecordBatch,
+	base_location: RecordLocation,
+) {
+	if descriptors.is_empty() {
+		return;
+	}
+	for descriptor in descriptors {
+		if let Err(err) = slab
+			.seal_secondary_index_active_buffer_if_source_changed(
+				tenant_id,
+				descriptor,
+				base_location.slab_id,
+			)
+			.await
+		{
+			tracing::warn!(
+				tenant_id = tenant_id.get(),
+				table_object_id = %format_bytes_hex(descriptor.table_object_id.as_bytes()),
+				index_object_id = %format_bytes_hex(descriptor.index_object_id.as_bytes()),
+				source_slab_id = base_location.slab_id.get(),
+				error = %err,
+				"secondary index active-buffer seal failed before moving to the next slab"
+			);
+		}
+		if let Err(err) = slab.append_secondary_index_active_buffer_batch(
+			tenant_id,
+			descriptor,
+			batch,
+			base_location,
+			DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES,
+		) {
+			tracing::warn!(
+				tenant_id = tenant_id.get(),
+				table_object_id = %format_bytes_hex(descriptor.table_object_id.as_bytes()),
+				index_object_id = %format_bytes_hex(descriptor.index_object_id.as_bytes()),
+				error = %err,
+				"secondary index active-buffer admission failed after durable table append"
+			);
+		}
+	}
+}
+
+async fn append_secondary_index_active_buffers_for_single_row(
+	slab: &SlabManager,
+	tenant_id: TenantId,
+	descriptors: &[SecondaryIndexDescriptor],
+	batch: &RecordBatch,
+	row_key_id: Identity,
+	row_hlc: HybridTimestamp,
+	record_location: RecordLocation,
+) {
+	if descriptors.is_empty() {
+		return;
+	}
+	for descriptor in descriptors {
+		if let Err(err) = slab
+			.seal_secondary_index_active_buffer_if_source_changed(
+				tenant_id,
+				descriptor,
+				record_location.slab_id,
+			)
+			.await
+		{
+			tracing::warn!(
+				tenant_id = tenant_id.get(),
+				table_object_id = %format_bytes_hex(descriptor.table_object_id.as_bytes()),
+				index_object_id = %format_bytes_hex(descriptor.index_object_id.as_bytes()),
+				source_slab_id = record_location.slab_id.get(),
+				error = %err,
+				"secondary index active-buffer seal failed before moving to the next slab"
+			);
+		}
+		let entry = match secondary_index_entry_from_materialized_row(
+			descriptor,
+			batch,
+			0,
+			row_key_id,
+			row_hlc,
+			record_location,
+		) {
+			Ok(Some(entry)) => entry,
+			Ok(None) => continue,
+			Err(err) => {
+				tracing::warn!(
+					tenant_id = tenant_id.get(),
+					table_object_id = %format_bytes_hex(descriptor.table_object_id.as_bytes()),
+					index_object_id = %format_bytes_hex(descriptor.index_object_id.as_bytes()),
+					error = %err,
+					"secondary index single-row admission encode failed after durable table append"
+				);
+				continue;
+			}
+		};
+		if let Err(err) = slab.append_secondary_index_active_buffer_entries(
+			tenant_id,
+			descriptor,
+			vec![entry],
+			record_location.slab_id,
+			DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES,
+		) {
+			tracing::warn!(
+				tenant_id = tenant_id.get(),
+				table_object_id = %format_bytes_hex(descriptor.table_object_id.as_bytes()),
+				index_object_id = %format_bytes_hex(descriptor.index_object_id.as_bytes()),
+				error = %err,
+				"secondary index active-buffer admission failed after durable table append"
+			);
+		}
+	}
 }
 
 async fn append_table_children_durable(
@@ -11324,15 +11888,17 @@ mod tests {
 	use crate::schema::{
 		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
-		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, LocalityPolicyV1,
-		LocalityRange, LocationCount, MultiRowLayoutDescriptor, PolicyGeneration,
-		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RecordLayoutPolicy, RetentionWindowMillis,
-		RowCount, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-		STORAGE_ROW_ROUTING_LOCALITY_COLUMN, SchemaEvolutionPolicyV1, SlabRecordHeader,
-		TableObjectId, TableRetentionPolicy, TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1,
-		column_projection_prefix_ranges, encode_table_schema_descriptor_v1,
-		encode_table_write_row_count, table_row_identity, table_spread_prefix_ranges,
-		write_payload_schema,
+		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, IndexArrowTypeTag,
+		IndexKeyEncoding, IndexObjectId, LocalityPolicyV1, LocalityRange, LocationCount,
+		MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1, ProjectionFunctionV1,
+		RecordLayoutPolicy, RetentionWindowMillis, RowCount, RowIdentityPolicy,
+		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+		SchemaEvolutionPolicyV1, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor,
+		SecondaryIndexLifecycleComplete, SlabRecordHeader, TableObjectId, TableRetentionPolicy,
+		TableSchemaCatalogV1, TableSpreadLocalityDescriptorV1, column_projection_prefix_ranges,
+		encode_secondary_index_descriptor, encode_secondary_index_lifecycle_complete,
+		encode_table_schema_descriptor_v1, encode_table_write_row_count, table_row_identity,
+		table_spread_prefix_ranges, write_payload_schema,
 	};
 	use crate::storage::core::StorageEngine;
 	use crate::storage::io_uring::spawn_io_thread;
@@ -11341,6 +11907,7 @@ mod tests {
 		MockObjectStoreOp, ObjectStore,
 	};
 	use crate::storage::manager::{SlabManagerConfig, TieredSlabPointer};
+	use crate::storage::{IndexQuery, SecondaryIndexCoverageKey, SecondaryIndexIdentity};
 	use arrow::array::{Int64Array, LargeStringArray};
 	use arrow::datatypes::{DataType, Field};
 	use std::io::{Read, Seek, SeekFrom};
@@ -11604,6 +12171,72 @@ mod tests {
 		encode_schema_update_envelope_v1(&envelope).unwrap()
 	}
 
+	fn name_secondary_index_descriptor(
+		descriptor: &TableSchemaDescriptorV1,
+	) -> SecondaryIndexDescriptor {
+		SecondaryIndexDescriptor {
+			index_object_id: IndexObjectId::new([0x52; 16]),
+			table_object_id: descriptor.table_object_id,
+			namespace: descriptor.namespace.clone(),
+			index_name: "events_name_idx".to_owned(),
+			table_schema_generation: descriptor.schema_generation,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+			key: SecondaryIndexKeyDescriptor {
+				column_name: "name".to_owned(),
+				column_ordinal: 1,
+				arrow_type_tag: IndexArrowTypeTag::LargeUtf8,
+				encoding: IndexKeyEncoding::OrderedScalar,
+			},
+		}
+	}
+
+	fn secondary_index_schema_update(descriptor: &SecondaryIndexDescriptor) -> Vec<u8> {
+		let payload = encode_secondary_index_descriptor(descriptor).unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::ComputeClient,
+			tenant_id: tenant(),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Index,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.index_name.clone(),
+			},
+			expected_generation: SchemaGeneration::ZERO,
+			requested_generation: SchemaGeneration::new(1),
+			intent_id: SchemaIntentId::new([0x52; 16]),
+			mutation: SchemaMutationKindV1::Create,
+			payload,
+		};
+		encode_schema_update_envelope_v1(&envelope).unwrap()
+	}
+
+	fn secondary_index_backfill_complete_schema_update(
+		descriptor: &SecondaryIndexDescriptor,
+		replica_id: NodeId,
+	) -> Vec<u8> {
+		let payload = encode_secondary_index_lifecycle_complete(&SecondaryIndexLifecycleComplete {
+			index_object_id: descriptor.index_object_id,
+			replica_id,
+		})
+		.unwrap();
+		let envelope = SchemaUpdateEnvelopeV1 {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::WendelonOperator,
+			tenant_id: tenant(),
+			object: SchemaObjectRefV1 {
+				kind: SchemaObjectKind::Index,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.index_name.clone(),
+			},
+			expected_generation: SchemaGeneration::new(1),
+			requested_generation: SchemaGeneration::new(2),
+			intent_id: SchemaIntentId::new([0x53; 16]),
+			mutation: SchemaMutationKindV1::IndexBackfillComplete,
+			payload,
+		};
+		encode_schema_update_envelope_v1(&envelope).unwrap()
+	}
+
 	fn aggregate_count_request(
 		descriptor: &TableSchemaDescriptorV1,
 		request_id: u128,
@@ -11656,6 +12289,17 @@ mod tests {
 		bytecode.extend_from_slice(&0_u32.to_le_bytes());
 		bytecode.push(OP_PUSH_INT);
 		bytecode.extend_from_slice(&pk.to_le_bytes());
+		bytecode.push(OP_EQ);
+		bytecode
+	}
+
+	fn name_eq_program(name: &str) -> Vec<u8> {
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PUSH_COL);
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		bytecode.push(OP_PUSH_STR);
+		bytecode.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		bytecode.extend_from_slice(name.as_bytes());
 		bytecode.push(OP_EQ);
 		bytecode
 	}
@@ -12104,6 +12748,7 @@ mod tests {
 			write_meta.tenant_id,
 			row_hlc,
 			&bifurcated.children,
+			&[],
 		)
 		.await
 		.unwrap();
@@ -15024,6 +15669,363 @@ mod tests {
 			.unwrap();
 		assert_eq!(resurrected_count.status, AggregateStatus::Success);
 		assert_eq!(count_star_partial_value(&resurrected_count), 2);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_query_plan_carries_ready_secondary_index_access_plan() {
+		let dir = bootstrap_tempdir("table-query-secondary-index-plan");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			54,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let index = name_secondary_index_descriptor(&descriptor);
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_schema_update(&index),
+			))
+			.await
+			.unwrap();
+
+		let program = name_eq_program("target");
+		let query_meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), program.len());
+		let building_plan = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.await
+			.unwrap();
+		assert_eq!(building_plan.response.status, ReadStatus::KEY_NOT_FOUND);
+		assert!(building_plan.secondary_index_access_plan.is_none());
+
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_backfill_complete_schema_update(&index, node.local_node),
+			))
+			.await
+			.unwrap();
+		let ready_plan = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.await
+			.unwrap();
+		assert_eq!(ready_plan.response.status, ReadStatus::KEY_NOT_FOUND);
+		let access = ready_plan
+			.secondary_index_access_plan
+			.expect("Ready index should be selected for the name predicate");
+		assert_eq!(access.descriptor, index);
+		assert_eq!(
+			access.query,
+			IndexQuery::PointEqual {
+				encoded_key: b"target".to_vec(),
+			}
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_populates_building_secondary_index_active_buffer() {
+		let dir = bootstrap_tempdir("table-write-secondary-index-active-buffer");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			56,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let index = name_secondary_index_descriptor(&descriptor);
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_schema_update(&index),
+			))
+			.await
+			.unwrap();
+
+		let active_slab_id = node.slab.active_slab_id().await;
+		let batch = typed_table_batch_with_names(vec![(1, "target")]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 560;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch)
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+
+		let coverage_key = SecondaryIndexCoverageKey::from(
+			SecondaryIndexIdentity::from_descriptor(tenant(), &index),
+		);
+		let coverage = node
+			.slab
+			.secondary_index_coverage_snapshot(coverage_key)
+			.expect("secondary index coverage should exist after indexed write");
+		let active = coverage
+			.active_buffer
+			.expect("Building index should receive active-buffer entries");
+		assert_eq!(active.source_slab_id, active_slab_id);
+		assert_eq!(active.entry_count, 1);
+		assert!(coverage.uncovered_slabs.is_empty());
+
+		let info = node
+			.slab
+			.seal_secondary_index_active_buffer(tenant(), &index)
+			.await
+			.unwrap()
+			.expect("active buffer should seal into a sidecar");
+		assert_eq!(info.entry_count, 1);
+		let segment = node
+			.slab
+			.load_secondary_index_segment(&info)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries[0].encoded_key, b"target".to_vec());
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_seals_secondary_index_active_buffer_after_slab_rotation() {
+		let dir = bootstrap_tempdir("table-write-secondary-index-active-buffer-seal");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			57,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let index = name_secondary_index_descriptor(&descriptor);
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_schema_update(&index),
+			))
+			.await
+			.unwrap();
+
+		let first_slab_id = node.slab.active_slab_id().await;
+		let first_batch = typed_table_batch_with_names(vec![(1, "first")]);
+		let mut first_meta = typed_table_meta(&descriptor, first_batch.num_rows());
+		first_meta.parent_write_id.sequence_no = 570;
+		let (first_resp, _) = node
+			.data_server
+			.table_write(first_meta, first_batch)
+			.await
+			.unwrap();
+		assert_eq!(first_resp.write.status, WriteStatus::OK);
+		assert_eq!(node.slab.force_seal_active_for_test().await, first_slab_id);
+		let second_slab_id = node.slab.active_slab_id().await;
+
+		let second_batch = typed_table_batch_with_names(vec![(2, "second")]);
+		let mut second_meta = typed_table_meta(&descriptor, second_batch.num_rows());
+		second_meta.parent_write_id.sequence_no = 571;
+		let (second_resp, _) = node
+			.data_server
+			.table_write(second_meta, second_batch)
+			.await
+			.unwrap();
+		assert_eq!(second_resp.write.status, WriteStatus::OK);
+
+		let coverage_key = SecondaryIndexCoverageKey::from(
+			SecondaryIndexIdentity::from_descriptor(tenant(), &index),
+		);
+		let coverage = node
+			.slab
+			.secondary_index_coverage_snapshot(coverage_key)
+			.expect("secondary index coverage should exist after indexed writes");
+		assert_eq!(coverage.covered_slabs, vec![first_slab_id]);
+		let active = coverage
+			.active_buffer
+			.expect("new active slab should receive its own active buffer");
+		assert_eq!(active.source_slab_id, second_slab_id);
+		assert_eq!(active.entry_count, 1);
+		assert!(coverage.uncovered_slabs.is_empty());
+
+		let segments = node.slab.list_secondary_index_segments(
+			tenant(),
+			index.table_object_id,
+			index.index_object_id,
+			index.logical_schema_fingerprint,
+		);
+		assert_eq!(segments.len(), 1);
+		assert_eq!(segments[0].source_slab_id, first_slab_id);
+		let segment = node
+			.slab
+			.load_secondary_index_segment(&segments[0])
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries.len(), 1);
+		assert_eq!(segment.entries[0].encoded_key, b"first".to_vec());
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_query_secondary_index_execution_returns_sidecar_rows() {
+		let dir = bootstrap_tempdir("table-query-secondary-index-execution");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			55,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+
+		let batch = typed_table_batch_with_names(vec![(1, "target"), (2, "other")]);
+		let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		write_meta.parent_write_id.sequence_no = 550;
+		let (write_resp, _) = node
+			.data_server
+			.table_write(write_meta, batch)
+			.await
+			.unwrap();
+		assert_eq!(write_resp.write.status, WriteStatus::OK);
+		let sealed_slab_id = node.slab.force_seal_active_for_test().await;
+
+		let index = name_secondary_index_descriptor(&descriptor);
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_schema_update(&index),
+			))
+			.await
+			.unwrap();
+		let backfill = node
+			.slab
+			.run_secondary_index_backfill_once(tenant(), &descriptor, &index, 8, 4096)
+			.await
+			.unwrap();
+		assert_eq!(backfill.completed.len(), 1);
+		assert_eq!(
+			backfill.completed[0].candidate.source_slab_id,
+			sealed_slab_id
+		);
+		assert!(backfill.historical_complete);
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(
+				secondary_index_backfill_complete_schema_update(&index, node.local_node),
+			))
+			.await
+			.unwrap();
+
+		let program = name_eq_program("target");
+		let query_meta =
+			table_query_meta_for_test(&descriptor, write_resp.write.commit_hlc, program.len());
+		let plan = node
+			.data_server
+			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.await
+			.unwrap();
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, 1);
+		assert!(plan.secondary_index_access_plan.is_some());
+		let materialized = concat_batches(&Arc::new(typed_table_schema()), &plan.batches)
+			.expect("query batches concatenate");
+		let ids = materialized
+			.column_by_name("id")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		let names = materialized
+			.column_by_name("name")
+			.unwrap()
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.unwrap();
+		assert_eq!(ids.value(0), 1);
+		assert_eq!(names.value(0), "target");
 
 		node.handles.abort();
 	}

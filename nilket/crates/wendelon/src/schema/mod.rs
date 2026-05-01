@@ -2,6 +2,7 @@ pub mod aggregate;
 pub mod core;
 pub mod lifecycle;
 pub mod pbc;
+pub mod secondary_index;
 pub mod table;
 pub mod units;
 
@@ -11,5 +12,6 @@ pub use crate::hash::descriptor_fingerprint::{
 pub use aggregate::*;
 pub use core::*;
 pub use lifecycle::*;
+pub use secondary_index::*;
 pub use table::*;
 pub use units::*;

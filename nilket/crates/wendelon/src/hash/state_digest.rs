@@ -1,4 +1,6 @@
-use crate::schema::{Identity, TableObjectId, TenantId};
+use crate::schema::{
+	HybridTimestamp, Identity, IndexObjectId, LogicalSchemaFingerprint, TableObjectId, TenantId,
+};
 use bytemuck::{Pod, Zeroable};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
@@ -262,6 +264,36 @@ pub fn apply_retention_eviction_to_visible_digest(
 	} else {
 		accumulator.subtract_element(element);
 	}
+}
+
+/// ADR 052 logical secondary-index version-entry helper.
+///
+/// Physical locator fields are intentionally absent: replicas can
+/// rewrite slab placement independently without producing digest
+/// drift for the same logical index entries.
+pub fn secondary_index_entry_element(
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	index_object_id: IndexObjectId,
+	logical_schema_fingerprint: LogicalSchemaFingerprint,
+	column_ordinal: u32,
+	encoded_key: &[u8],
+	row_key_id: Identity,
+	row_hlc: HybridTimestamp,
+) -> StateDigestElement {
+	let mut preimage = Vec::with_capacity(8 + 16 + 16 + 32 + 4 + 8 + encoded_key.len() + 32 + 16);
+	preimage.extend_from_slice(&tenant_id.get().to_le_bytes());
+	preimage.extend_from_slice(table_object_id.as_bytes());
+	preimage.extend_from_slice(index_object_id.as_bytes());
+	preimage.extend_from_slice(logical_schema_fingerprint.as_bytes());
+	preimage.extend_from_slice(&column_ordinal.to_le_bytes());
+	preimage.extend_from_slice(&(encoded_key.len() as u64).to_le_bytes());
+	preimage.extend_from_slice(encoded_key);
+	preimage.extend_from_slice(row_key_id.as_bytes());
+	preimage.extend_from_slice(&row_hlc.physical_ms.to_le_bytes());
+	preimage.extend_from_slice(&row_hlc.logical.to_le_bytes());
+	preimage.extend_from_slice(&row_hlc.node_id.to_le_bytes());
+	StateDigestElement::project(DOMAIN_SECONDARY_INDEX_ENTRY, &preimage)
 }
 
 fn tenant_id_digest_bytes(tenant_id: TenantId) -> [u8; 16] {

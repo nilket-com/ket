@@ -1,6 +1,6 @@
 use crate::schema::{
-	HybridTimestamp, Identity, Locality, RecordRowIndex, SlabId, SupersessionMetadata, TenantId,
-	TenantKekId, TombstoneMetadata,
+	HybridTimestamp, Identity, IndexObjectId, Locality, LogicalSchemaFingerprint, RecordRowIndex,
+	SlabId, SupersessionMetadata, TableObjectId, TenantId, TenantKekId, TombstoneMetadata,
 };
 use crate::storage::RecordLocation;
 use crate::storage::manager::TieredSlabPointer;
@@ -34,6 +34,8 @@ const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// - bit 1 = supersession metadata is tracked
 ///
 const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v2");
+const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("secondary_index_segments_v1");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 
@@ -66,6 +68,10 @@ const TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC: u8 = 0b0000_0001;
 const TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED: u8 = 0b0000_0010;
 const TIERED_FLAG2_KNOWN_MASK: u8 =
 	TIERED_FLAG2_HAS_FIRST_SUPERSESSION_HLC | TIERED_FLAG2_SUPERSESSION_METADATA_TRACKED;
+const SECONDARY_INDEX_SEGMENT_KEY_LEN: usize = 8 + 16 + 16 + 32 + 8;
+const SECONDARY_INDEX_SEGMENT_VALUE_PREFIX_LEN: usize = 32 + 32 + 2 + 8 + 4 + 4;
+const SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI: u32 = 1 << 0;
+const SECONDARY_INDEX_SEGMENT_FLAG_KNOWN_MASK: u32 = SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -75,11 +81,32 @@ pub(crate) struct PersistentRecordRow {
 	pub location: RecordLocation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PersistentSecondaryIndexSegmentKey {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub index_object_id: IndexObjectId,
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
+	pub source_slab_id: SlabId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PersistentSecondaryIndexSegmentRow {
+	pub key: PersistentSecondaryIndexSegmentKey,
+	pub segment_path: String,
+	pub l2_uri: Option<String>,
+	pub payload_hash: [u8; 32],
+	pub state_digest: [u8; 32],
+	pub format_version: u16,
+	pub entry_count: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PersistentIndexSnapshot {
 	pub tiered_slabs: Vec<TieredSlabPointer>,
 	pub tiered_records: Vec<PersistentRecordRow>,
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
+	pub secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -89,6 +116,8 @@ pub(crate) struct PersistentIndexUpdate {
 	pub delete_records: Vec<PersistentRecordRow>,
 	pub put_tiered_slabs: Vec<TieredSlabPointer>,
 	pub delete_tiered_slab_ids: Vec<SlabId>,
+	pub put_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
+	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -111,6 +140,11 @@ impl PersistentLocalIndex {
 			{
 				let _table = write_txn
 					.open_table(TIERED_SLABS_TABLE)
+					.map_err(redb_to_io)?;
+			}
+			{
+				let _table = write_txn
+					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
 					.map_err(redb_to_io)?;
 			}
 			{
@@ -203,6 +237,17 @@ impl PersistentLocalIndex {
 				.collect::<Vec<_>>();
 			record_localities
 				.sort_by_key(|(tenant_id, key_identity, _)| (tenant_id.get(), *key_identity));
+			let secondary_index_segments_table = read_txn
+				.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+				.map_err(redb_to_io)?;
+			let mut secondary_index_segments = Vec::new();
+			for entry in secondary_index_segments_table.iter().map_err(redb_to_io)? {
+				let (key, value) = entry.map_err(redb_to_io)?;
+				secondary_index_segments.push(decode_secondary_index_segment_row(
+					key.value(),
+					value.value(),
+				)?);
+			}
 			let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			let last_control_log_index = meta_table
 				.get(META_LAST_CONTROL_LOG_INDEX)
@@ -213,6 +258,7 @@ impl PersistentLocalIndex {
 				tiered_slabs,
 				tiered_records,
 				record_localities,
+				secondary_index_segments,
 				last_control_log_index,
 			})
 		})
@@ -225,12 +271,34 @@ impl PersistentLocalIndex {
 		tiered_slabs: Vec<TieredSlabPointer>,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
+		let secondary_index_segments = self
+			.load_snapshot()
+			.await
+			.map(|snapshot| snapshot.secondary_index_segments)
+			.unwrap_or_default();
+		self.rebuild_with_secondary_index_segments(
+			rows,
+			tiered_slabs,
+			secondary_index_segments,
+			last_control_log_index,
+		)
+		.await
+	}
+
+	pub(crate) async fn rebuild_with_secondary_index_segments(
+		&self,
+		rows: Vec<PersistentRecordRow>,
+		tiered_slabs: Vec<TieredSlabPointer>,
+		secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
 		let db = self.db.clone();
 		spawn_blocking_io(move || {
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
 			let _ = write_txn.delete_table(RECORDS_TABLE);
 			let _ = write_txn.delete_table(TIERED_SLABS_TABLE);
+			let _ = write_txn.delete_table(SECONDARY_INDEX_SEGMENTS_TABLE);
 			{
 				let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 				for row in rows {
@@ -249,6 +317,18 @@ impl PersistentLocalIndex {
 					let value = encode_tiered_pointer(&pointer);
 					table
 						.insert(&pointer.slab_id.get(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+			}
+			{
+				let mut table = write_txn
+					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				for row in secondary_index_segments {
+					let key = encode_secondary_index_segment_key(row.key);
+					let value = encode_secondary_index_segment_value(&row);
+					table
+						.insert(key.as_slice(), value.as_slice())
 						.map_err(redb_to_io)?;
 				}
 			}
@@ -295,6 +375,22 @@ impl PersistentLocalIndex {
 						.map_err(redb_to_io)?;
 				}
 			}
+			{
+				let mut table = write_txn
+					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
+					.map_err(redb_to_io)?;
+				for key in update.delete_secondary_index_segments {
+					let encoded = encode_secondary_index_segment_key(key);
+					let _ = table.remove(encoded.as_slice()).map_err(redb_to_io)?;
+				}
+				for row in update.put_secondary_index_segments {
+					let key = encode_secondary_index_segment_key(row.key);
+					let value = encode_secondary_index_segment_value(&row);
+					table
+						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+			}
 			if let Some(index) = update.last_control_log_index {
 				let mut meta = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 				let current = meta
@@ -328,6 +424,28 @@ impl PersistentLocalIndex {
 		self.apply(PersistentIndexUpdate {
 			put_tiered_slabs: vec![pointer],
 			last_control_log_index,
+			..Default::default()
+		})
+		.await
+	}
+
+	pub(crate) async fn upsert_secondary_index_segment(
+		&self,
+		row: PersistentSecondaryIndexSegmentRow,
+	) -> std::io::Result<()> {
+		self.apply(PersistentIndexUpdate {
+			put_secondary_index_segments: vec![row],
+			..Default::default()
+		})
+		.await
+	}
+
+	pub(crate) async fn delete_secondary_index_segment(
+		&self,
+		key: PersistentSecondaryIndexSegmentKey,
+	) -> std::io::Result<()> {
+		self.apply(PersistentIndexUpdate {
+			delete_secondary_index_segments: vec![key],
 			..Default::default()
 		})
 		.await
@@ -459,6 +577,137 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 			record_row_index,
 			is_tombstone: flags & RECORD_FLAG_IS_TOMBSTONE != 0,
 		},
+	})
+}
+
+fn encode_secondary_index_segment_key(
+	key: PersistentSecondaryIndexSegmentKey,
+) -> [u8; SECONDARY_INDEX_SEGMENT_KEY_LEN] {
+	let mut bytes = [0u8; SECONDARY_INDEX_SEGMENT_KEY_LEN];
+	let mut cursor = 0;
+	bytes[cursor..cursor + 8].copy_from_slice(&key.tenant_id.get().to_le_bytes());
+	cursor += 8;
+	bytes[cursor..cursor + 16].copy_from_slice(key.table_object_id.as_bytes());
+	cursor += 16;
+	bytes[cursor..cursor + 16].copy_from_slice(key.index_object_id.as_bytes());
+	cursor += 16;
+	bytes[cursor..cursor + 32].copy_from_slice(key.logical_schema_fingerprint.as_bytes());
+	cursor += 32;
+	bytes[cursor..cursor + 8].copy_from_slice(&key.source_slab_id.get().to_le_bytes());
+	bytes
+}
+
+fn encode_secondary_index_segment_value(row: &PersistentSecondaryIndexSegmentRow) -> Vec<u8> {
+	let segment_path = row.segment_path.as_bytes();
+	let l2_uri = row.l2_uri.as_deref().unwrap_or("").as_bytes();
+	let mut flags = 0_u32;
+	if row.l2_uri.is_some() {
+		flags |= SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI;
+	}
+	let mut bytes = Vec::with_capacity(
+		SECONDARY_INDEX_SEGMENT_VALUE_PREFIX_LEN + segment_path.len() + l2_uri.len(),
+	);
+	bytes.extend_from_slice(&row.payload_hash);
+	bytes.extend_from_slice(&row.state_digest);
+	bytes.extend_from_slice(&row.format_version.to_le_bytes());
+	bytes.extend_from_slice(&row.entry_count.to_le_bytes());
+	bytes.extend_from_slice(&(segment_path.len() as u32).to_le_bytes());
+	bytes.extend_from_slice(&flags.to_le_bytes());
+	bytes.extend_from_slice(segment_path);
+	bytes.extend_from_slice(l2_uri);
+	bytes
+}
+
+fn decode_secondary_index_segment_row(
+	key: &[u8],
+	value: &[u8],
+) -> std::io::Result<PersistentSecondaryIndexSegmentRow> {
+	if key.len() != SECONDARY_INDEX_SEGMENT_KEY_LEN {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"secondary index segment key length mismatch: expected {SECONDARY_INDEX_SEGMENT_KEY_LEN}, got {}",
+				key.len()
+			),
+		));
+	}
+	if value.len() < SECONDARY_INDEX_SEGMENT_VALUE_PREFIX_LEN {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"secondary index segment value too short: expected at least {SECONDARY_INDEX_SEGMENT_VALUE_PREFIX_LEN}, got {}",
+				value.len()
+			),
+		));
+	}
+
+	let mut key_cursor = 0;
+	let tenant_id = TenantId::new(read_u64(key, &mut key_cursor)?);
+	let table_object_id = TableObjectId::new(read_array_16(key, &mut key_cursor)?);
+	let index_object_id = IndexObjectId::new(read_array_16(key, &mut key_cursor)?);
+	let logical_schema_fingerprint =
+		LogicalSchemaFingerprint::from_bytes(read_array_32(key, &mut key_cursor)?);
+	let source_slab_id = SlabId::new(read_u64(key, &mut key_cursor)?);
+
+	let mut value_cursor = 0;
+	let payload_hash = read_array_32(value, &mut value_cursor)?;
+	let state_digest = read_array_32(value, &mut value_cursor)?;
+	let format_version = read_u16(value, &mut value_cursor)?;
+	let entry_count = read_u64(value, &mut value_cursor)?;
+	let segment_path_len = read_u32(value, &mut value_cursor)? as usize;
+	let flags = read_u32(value, &mut value_cursor)?;
+	if flags & !SECONDARY_INDEX_SEGMENT_FLAG_KNOWN_MASK != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("secondary index segment row has unknown flags 0x{flags:08x}"),
+		));
+	}
+	let segment_path_end = value_cursor.checked_add(segment_path_len).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"secondary index path length overflows",
+		)
+	})?;
+	let segment_path_bytes = value.get(value_cursor..segment_path_end).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"secondary index segment value truncated while reading segment_path",
+		)
+	})?;
+	let segment_path = std::str::from_utf8(segment_path_bytes)
+		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("segment_path utf8: {err}")))?
+		.to_string();
+	value_cursor = segment_path_end;
+	let remaining = &value[value_cursor..];
+	let l2_uri = if flags & SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI != 0 {
+		Some(
+			std::str::from_utf8(remaining)
+				.map_err(|err| Error::new(ErrorKind::InvalidData, format!("l2_uri utf8: {err}")))?
+				.to_string(),
+		)
+	} else if remaining.is_empty() {
+		None
+	} else {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"secondary index segment row has trailing bytes without l2_uri flag",
+		));
+	};
+
+	Ok(PersistentSecondaryIndexSegmentRow {
+		key: PersistentSecondaryIndexSegmentKey {
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			logical_schema_fingerprint,
+			source_slab_id,
+		},
+		segment_path,
+		l2_uri,
+		payload_hash,
+		state_digest,
+		format_version,
+		entry_count,
 	})
 }
 
@@ -754,6 +1003,18 @@ fn read_u64(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u64> {
 	Ok(u64::from_le_bytes(slice.try_into().expect("fixed width")))
 }
 
+fn read_u16(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u16> {
+	let end = cursor.saturating_add(2);
+	let slice = bytes.get(*cursor..end).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"persistent index row truncated while reading u16",
+		)
+	})?;
+	*cursor = end;
+	Ok(u16::from_le_bytes(slice.try_into().expect("fixed width")))
+}
+
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u32> {
 	let end = cursor.saturating_add(4);
 	let slice = bytes.get(*cursor..end).ok_or_else(|| {
@@ -764,6 +1025,18 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u32> {
 	})?;
 	*cursor = end;
 	Ok(u32::from_le_bytes(slice.try_into().expect("fixed width")))
+}
+
+fn read_array_16(bytes: &[u8], cursor: &mut usize) -> std::io::Result<[u8; 16]> {
+	let end = cursor.saturating_add(16);
+	let slice = bytes.get(*cursor..end).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"persistent index row truncated while reading 16 bytes",
+		)
+	})?;
+	*cursor = end;
+	Ok(slice.try_into().expect("fixed width"))
 }
 
 fn read_array_32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<[u8; 32]> {
@@ -810,6 +1083,24 @@ mod tests {
 		}
 	}
 
+	fn secondary_index_segment_row() -> PersistentSecondaryIndexSegmentRow {
+		PersistentSecondaryIndexSegmentRow {
+			key: PersistentSecondaryIndexSegmentKey {
+				tenant_id: TenantId::new(7),
+				table_object_id: TableObjectId::new([0x10; 16]),
+				index_object_id: IndexObjectId::new([0x52; 16]),
+				logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0x51; 32]),
+				source_slab_id: SlabId::new(41),
+			},
+			segment_path: "secondary_index/7/table/index/0000000000000029.idx".to_owned(),
+			l2_uri: Some("file:///tmp/secondary-index/0000000000000029.idx".to_owned()),
+			payload_hash: [0xAB; 32],
+			state_digest: [0xCD; 32],
+			format_version: crate::storage::SECONDARY_INDEX_SEGMENT_FORMAT_VERSION,
+			entry_count: 17,
+		}
+	}
+
 	#[test]
 	fn record_row_roundtrip_preserves_every_field() {
 		let row = row();
@@ -817,6 +1108,27 @@ mod tests {
 		let value = encode_record_value(row);
 		let decoded = decode_record_row(&key, &value).unwrap();
 		assert_eq!(decoded, row);
+	}
+
+	#[test]
+	fn secondary_index_segment_row_roundtrip_preserves_every_field() {
+		let row = secondary_index_segment_row();
+		let key = encode_secondary_index_segment_key(row.key);
+		let value = encode_secondary_index_segment_value(&row);
+		let decoded = decode_secondary_index_segment_row(&key, &value).unwrap();
+		assert_eq!(decoded, row);
+	}
+
+	#[test]
+	fn secondary_index_segment_row_rejects_trailing_l2_without_flag() {
+		let mut row = secondary_index_segment_row();
+		row.l2_uri = None;
+		let key = encode_secondary_index_segment_key(row.key);
+		let mut value = encode_secondary_index_segment_value(&row);
+		value.extend_from_slice(b"unexpected");
+		let err = decode_secondary_index_segment_row(&key, &value).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("trailing bytes"));
 	}
 
 	#[test]
@@ -929,6 +1241,48 @@ mod tests {
 			decoded.supersession_metadata,
 			SupersessionMetadata::Untracked
 		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_segments_persist_across_snapshot_and_delete() {
+		let index = PersistentLocalIndex::open(temp_path("secondary-index-segment"))
+			.await
+			.unwrap();
+		let row = secondary_index_segment_row();
+		index
+			.upsert_secondary_index_segment(row.clone())
+			.await
+			.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert_eq!(snapshot.secondary_index_segments, vec![row.clone()]);
+
+		index.delete_secondary_index_segment(row.key).await.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert!(snapshot.secondary_index_segments.is_empty());
+	}
+
+	#[tokio::test]
+	async fn rebuild_preserves_existing_secondary_index_segments() {
+		let index = PersistentLocalIndex::open(temp_path("secondary-index-preserve"))
+			.await
+			.unwrap();
+		let segment = secondary_index_segment_row();
+		index
+			.rebuild_with_secondary_index_segments(
+				Vec::new(),
+				Vec::new(),
+				vec![segment.clone()],
+				None,
+			)
+			.await
+			.unwrap();
+		index
+			.rebuild(vec![row()], Vec::new(), Some(33))
+			.await
+			.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert_eq!(snapshot.secondary_index_segments, vec![segment]);
+		assert_eq!(snapshot.last_control_log_index, Some(33));
 	}
 
 	#[tokio::test]

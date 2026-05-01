@@ -92,6 +92,8 @@ pub enum SchemaMutationKindV1 {
 	Create,
 	Alter,
 	Drop,
+	IndexBackfillComplete,
+	IndexDropGcComplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

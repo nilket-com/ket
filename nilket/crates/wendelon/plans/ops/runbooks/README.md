@@ -30,6 +30,9 @@ Current runbooks:
 - [ADR 051 Descriptor Fingerprint Split](./descriptor_fingerprint_split.md)
   - logical-vs-physical fingerprint orientation, CSB fall-through metrics,
     and rollout triage
+- [ADR 052 Secondary Indexes](./secondary_indexes.md)
+  - secondary-index lifecycle, sidecar coverage, fail-closed fallback, and
+    drop-GC triage
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

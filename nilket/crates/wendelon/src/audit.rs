@@ -266,6 +266,7 @@ pub enum AuditOperation {
 	TenantQuotaUpdated,
 	TableRetentionPolicyUpdated,
 	TableSchemaDescriptorUpdated,
+	SecondaryIndexCatalogUpdated,
 	TenantSuspended,
 	TenantResumed,
 	TenantDeleteRequested,
@@ -298,6 +299,7 @@ impl AuditOperation {
 			Self::TenantQuotaUpdated => "tenant.quota_updated",
 			Self::TableRetentionPolicyUpdated => "table.retention_policy_updated",
 			Self::TableSchemaDescriptorUpdated => "table.schema_descriptor_updated",
+			Self::SecondaryIndexCatalogUpdated => "secondary_index.catalog_updated",
 			Self::TenantSuspended => "tenant.suspended",
 			Self::TenantResumed => "tenant.resumed",
 			Self::TenantDeleteRequested => "tenant.delete_requested",
@@ -345,6 +347,7 @@ impl<'de> Deserialize<'de> for AuditOperation {
 			"tenant.quota_updated" => Ok(Self::TenantQuotaUpdated),
 			"table.retention_policy_updated" => Ok(Self::TableRetentionPolicyUpdated),
 			"table.schema_descriptor_updated" => Ok(Self::TableSchemaDescriptorUpdated),
+			"secondary_index.catalog_updated" => Ok(Self::SecondaryIndexCatalogUpdated),
 			"tenant.suspended" => Ok(Self::TenantSuspended),
 			"tenant.resumed" => Ok(Self::TenantResumed),
 			"tenant.delete_requested" => Ok(Self::TenantDeleteRequested),
@@ -392,6 +395,7 @@ pub enum AdministrativeControlAction {
 	TenantQuotaUpdate,
 	TableRetentionPolicyUpdate,
 	TableSchemaDescriptorUpdate,
+	SecondaryIndexCatalogUpdate,
 	TenantSuspend,
 	TenantResume,
 	TenantDeleteRequest,
@@ -409,6 +413,8 @@ pub struct AdministrativeControlSchema {
 	pub target_tenant_kek_id: Option<u64>,
 	#[serde(default)]
 	pub target_table_object_id: Option<String>,
+	#[serde(default)]
+	pub target_index_object_id: Option<String>,
 	#[serde(default)]
 	pub policy_generation: Option<u64>,
 	#[serde(default)]
@@ -429,6 +435,16 @@ pub struct AdministrativeControlSchema {
 	pub schema_generation: Option<u64>,
 	#[serde(default)]
 	pub previous_schema_generation: Option<u64>,
+	#[serde(default)]
+	pub table_schema_generation: Option<u64>,
+	#[serde(default)]
+	pub indexed_column: Option<String>,
+	#[serde(default)]
+	pub index_lifecycle_state: Option<String>,
+	#[serde(default)]
+	pub previous_index_lifecycle_state: Option<String>,
+	#[serde(default)]
+	pub index_replica_id: Option<u32>,
 	#[serde(default)]
 	pub descriptor_mutation_axis: Option<String>,
 	#[serde(default)]

@@ -53,10 +53,11 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, IdentityPrefix, Locality, LogicalSchemaFingerprint,
-	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, SlabId, SlabRecordHeader,
-	SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata,
-	WriterNodeId,
+	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
+	IndexObjectId, Locality, LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordRowIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId,
+	SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId,
+	TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
@@ -71,7 +72,8 @@ use crate::storage::core::{
 	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
 use crate::storage::index::{
-	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow, persistent_index_path,
+	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow,
+	PersistentSecondaryIndexSegmentKey, PersistentSecondaryIndexSegmentRow, persistent_index_path,
 };
 use crate::storage::io_uring::IoRingHandle;
 use crate::storage::ipc::record_batch_compression_policy_from_ipc;
@@ -80,6 +82,21 @@ use crate::storage::multirow::{
 	MultiRowSourceRow, decode_batch as decode_record_batch, encode_batch_with_policy,
 	encode_multirow_from_survivors_with_policy, has_storage_synthetic_columns,
 	materialize_record_location_batch, pack_multirow_source_rows_with_policy,
+};
+use crate::storage::secondary_index::{
+	SecondaryIndexCandidateRejectReason, SecondaryIndexCandidateValidation, SecondaryIndexEntry,
+	SecondaryIndexIdentity, SecondaryIndexLookupReport, SecondaryIndexLookupRow,
+	TableLookupByIndexRequest, encode_secondary_index_key, revalidate_secondary_index_candidate,
+	secondary_index_entry_matches_query, secondary_index_key_range_intersects_query,
+};
+use crate::storage::secondary_index_backfill::{
+	SecondaryIndexActiveBuffer, SecondaryIndexBackfillCandidate, SecondaryIndexBackfillError,
+	SecondaryIndexBackfillErrorReason, SecondaryIndexBackfillFailure, SecondaryIndexBackfillPlan,
+	SecondaryIndexBackfillSuccess, SecondaryIndexBackfillTickReport, SecondaryIndexCoverageKey,
+	SecondaryIndexCoverageSnapshot, SecondaryIndexCoverageTracker,
+};
+use crate::storage::secondary_index_segment::{
+	SecondaryIndexSegment, secondary_index_segment_storage_path,
 };
 use crate::storage::stats::{
 	ColumnStatsDescriptorIdentity, ParsedColumnStatsBlock,
@@ -101,7 +118,7 @@ use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -428,10 +445,120 @@ pub struct SlabManager {
 	/// deletes the old L2 object. The sweeper reconciles this set
 	/// against the committed SM view on the next pass.
 	retired_tiered_cleanup: DashMap<SlabId, TieredSlabPointer>,
+	/// Local per-source-slab secondary-index sidecar metadata.
+	/// The sidecar file bytes live under `config.dir`; this map is
+	/// the runtime catalog recovered from redb on open and updated by
+	/// backfill / compaction / drop-GC surfaces.
+	secondary_index_segments:
+		DashMap<PersistentSecondaryIndexSegmentKey, PersistentSecondaryIndexSegmentRow>,
+	/// Runtime coverage state for secondary-index sidecars.
+	///
+	/// This is derived from persistent sidecar rows on open, then
+	/// updated by the explicit backfill / active-buffer surfaces
+	/// below. The replicated catalog remains authoritative for
+	/// index lifecycle state; this map only tracks local coverage.
+	secondary_index_coverage: DashMap<SecondaryIndexCoverageKey, SecondaryIndexCoverageTracker>,
+	/// Per-source-slab lease used to serialize secondary-index
+	/// backfill reads with compaction retirement of the same source
+	/// slab. Backfill holds a read lease until its sidecar is
+	/// persisted; compaction holds a write lease while removing or
+	/// replacing the source slab.
+	secondary_index_source_slab_leases: DashMap<SlabId, Arc<AsyncRwLock<()>>>,
 	/// Parsed ADR 039 CSBs keyed by slab, descriptor, and footer
 	/// locator identity. This avoids repeated L2 range reads and
 	/// AEAD decrypts for WFRM query bursts over the same cold slab.
 	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecondaryIndexSegmentInfo {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub index_object_id: IndexObjectId,
+	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
+	pub source_slab_id: SlabId,
+	pub segment_path: String,
+	pub l2_uri: Option<String>,
+	pub payload_hash: [u8; 32],
+	pub state_digest: [u8; 32],
+	pub format_version: u16,
+	pub entry_count: u64,
+}
+
+impl SecondaryIndexSegmentInfo {
+	fn key(&self) -> PersistentSecondaryIndexSegmentKey {
+		PersistentSecondaryIndexSegmentKey {
+			tenant_id: self.tenant_id,
+			table_object_id: self.table_object_id,
+			index_object_id: self.index_object_id,
+			logical_schema_fingerprint: self.logical_schema_fingerprint,
+			source_slab_id: self.source_slab_id,
+		}
+	}
+
+	pub fn coverage_key(&self) -> SecondaryIndexCoverageKey {
+		SecondaryIndexCoverageKey {
+			tenant_id: self.tenant_id,
+			table_object_id: self.table_object_id,
+			index_object_id: self.index_object_id,
+			logical_schema_fingerprint: self.logical_schema_fingerprint,
+		}
+	}
+}
+
+impl From<PersistentSecondaryIndexSegmentRow> for SecondaryIndexSegmentInfo {
+	fn from(row: PersistentSecondaryIndexSegmentRow) -> Self {
+		Self {
+			tenant_id: row.key.tenant_id,
+			table_object_id: row.key.table_object_id,
+			index_object_id: row.key.index_object_id,
+			logical_schema_fingerprint: row.key.logical_schema_fingerprint,
+			source_slab_id: row.key.source_slab_id,
+			segment_path: row.segment_path,
+			l2_uri: row.l2_uri,
+			payload_hash: row.payload_hash,
+			state_digest: row.state_digest,
+			format_version: row.format_version,
+			entry_count: row.entry_count,
+		}
+	}
+}
+
+impl From<SecondaryIndexSegmentInfo> for PersistentSecondaryIndexSegmentRow {
+	fn from(info: SecondaryIndexSegmentInfo) -> Self {
+		Self {
+			key: info.key(),
+			segment_path: info.segment_path,
+			l2_uri: info.l2_uri,
+			payload_hash: info.payload_hash,
+			state_digest: info.state_digest,
+			format_version: info.format_version,
+			entry_count: info.entry_count,
+		}
+	}
+}
+
+fn secondary_index_coverage_key_from_persistent(
+	key: &PersistentSecondaryIndexSegmentKey,
+) -> SecondaryIndexCoverageKey {
+	SecondaryIndexCoverageKey {
+		tenant_id: key.tenant_id,
+		table_object_id: key.table_object_id,
+		index_object_id: key.index_object_id,
+		logical_schema_fingerprint: key.logical_schema_fingerprint,
+	}
+}
+
+fn secondary_index_backfill_reason_from_io(
+	err: &std::io::Error,
+) -> SecondaryIndexBackfillErrorReason {
+	match err.kind() {
+		ErrorKind::NotFound => SecondaryIndexBackfillErrorReason::MissingSegment,
+		ErrorKind::InvalidData | ErrorKind::UnexpectedEof => {
+			SecondaryIndexBackfillErrorReason::CorruptSegment
+		}
+		_ => SecondaryIndexBackfillErrorReason::EncodeFailure,
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -906,6 +1033,14 @@ impl SlabManager {
 		let sealed: DashMap<SlabId, Arc<LocalSlabStore>> = DashMap::new();
 		let tiered: DashMap<SlabId, TieredSlabPointer> = DashMap::new();
 		let rehydrated: DashMap<SlabId, RehydratedSlabState> = DashMap::new();
+		let secondary_index_segments: DashMap<
+			PersistentSecondaryIndexSegmentKey,
+			PersistentSecondaryIndexSegmentRow,
+		> = DashMap::new();
+		let secondary_index_coverage: DashMap<
+			SecondaryIndexCoverageKey,
+			SecondaryIndexCoverageTracker,
+		> = DashMap::new();
 
 		let mut recovered_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let (active, next_slab_id) = if existing_ids.is_empty() {
@@ -982,6 +1117,14 @@ impl SlabManager {
 							row.routing_locality,
 						));
 					}
+					for row in snapshot.secondary_index_segments {
+						let coverage_key = secondary_index_coverage_key_from_persistent(&row.key);
+						secondary_index_coverage
+							.entry(coverage_key)
+							.or_insert_with(|| SecondaryIndexCoverageTracker::new(coverage_key))
+							.mark_covered(row.key.source_slab_id);
+						secondary_index_segments.insert(row.key, row);
+					}
 					persistent_key_localities.extend(snapshot.record_localities);
 				}
 				Err(err) => {
@@ -1027,6 +1170,9 @@ impl SlabManager {
 			relocated_reads: DashMap::new(),
 			persistent_index,
 			retired_tiered_cleanup: DashMap::new(),
+			secondary_index_segments,
+			secondary_index_coverage,
+			secondary_index_source_slab_leases: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};
 		manager.rebuild_persistent_index().await;
@@ -1157,6 +1303,1336 @@ impl SlabManager {
 		}
 		let path = slab_path(&self.config.dir, slab_id);
 		self.file_ops.read_all(&path).await
+	}
+
+	pub async fn ensure_secondary_index_coverage(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+		max_buffer_bytes: usize,
+	) -> std::io::Result<SecondaryIndexBackfillPlan> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let (active_slab_id, historical_slabs) = self.secondary_index_source_slabs().await;
+		let mut tracker = self
+			.secondary_index_coverage
+			.get(&key)
+			.map(|entry| entry.value().clone())
+			.unwrap_or_else(|| SecondaryIndexCoverageTracker::new(key));
+
+		for row in self.secondary_index_segments.iter() {
+			if secondary_index_coverage_key_from_persistent(&row.key) == key {
+				tracker.mark_covered(row.key.source_slab_id);
+			}
+		}
+		if tracker.active_buffer().is_none() {
+			tracker.mark_active(SecondaryIndexActiveBuffer::new(
+				identity,
+				active_slab_id,
+				max_buffer_bytes,
+			))?;
+		}
+
+		let active_buffer_slab = tracker
+			.active_buffer()
+			.map(SecondaryIndexActiveBuffer::source_slab_id);
+		let uncovered_slabs = tracker
+			.uncovered_slabs()
+			.map(|(slab_id, _error)| slab_id)
+			.collect::<BTreeSet<_>>();
+		let candidates = historical_slabs
+			.into_iter()
+			.filter(|slab_id| !tracker.is_covered(*slab_id))
+			.filter(|slab_id| Some(*slab_id) != active_buffer_slab)
+			.filter(|slab_id| !uncovered_slabs.contains(slab_id))
+			.map(|source_slab_id| SecondaryIndexBackfillCandidate {
+				key,
+				source_slab_id,
+			})
+			.collect::<Vec<_>>();
+		let snapshot = tracker.snapshot();
+		self.secondary_index_coverage.insert(key, tracker);
+		Ok(SecondaryIndexBackfillPlan {
+			snapshot,
+			candidates,
+		})
+	}
+
+	pub fn secondary_index_coverage_snapshot(
+		&self,
+		key: SecondaryIndexCoverageKey,
+	) -> Option<SecondaryIndexCoverageSnapshot> {
+		self.secondary_index_coverage
+			.get(&key)
+			.map(|entry| entry.value().snapshot())
+	}
+
+	pub async fn secondary_index_tail_source_slabs(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+	) -> BTreeSet<SlabId> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let (active_slab_id, historical_slabs) = self.secondary_index_source_slabs().await;
+		let tracker = self
+			.secondary_index_coverage
+			.get(&key)
+			.map(|entry| entry.value().clone());
+		let covered_slabs = tracker
+			.as_ref()
+			.map(|tracker| tracker.covered_slabs().collect::<BTreeSet<_>>())
+			.unwrap_or_default();
+		let mut tail = BTreeSet::new();
+		// The active slab can receive more writes after any buffered
+		// entries are sealed, so it remains a scan tail until rotation.
+		tail.insert(active_slab_id);
+		for source_slab_id in historical_slabs {
+			if !covered_slabs.contains(&source_slab_id) {
+				tail.insert(source_slab_id);
+			}
+		}
+		if let Some(tracker) = tracker {
+			if let Some(buffer) = tracker.active_buffer() {
+				tail.insert(buffer.source_slab_id());
+			}
+			tail.extend(
+				tracker
+					.uncovered_slabs()
+					.map(|(source_slab_id, _)| source_slab_id),
+			);
+		}
+		tail
+	}
+
+	pub fn list_secondary_index_coverage_snapshots(&self) -> Vec<SecondaryIndexCoverageSnapshot> {
+		let mut out = self
+			.secondary_index_coverage
+			.iter()
+			.map(|entry| entry.value().snapshot())
+			.collect::<Vec<_>>();
+		out.sort_by_key(|snapshot| {
+			(
+				snapshot.key.tenant_id,
+				snapshot.key.table_object_id,
+				snapshot.key.index_object_id,
+			)
+		});
+		out
+	}
+
+	pub fn append_secondary_index_active_buffer_batch(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+		batch: &RecordBatch,
+		base_location: RecordLocation,
+		max_buffer_bytes: usize,
+	) -> std::io::Result<usize> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let mut tracker = self
+			.secondary_index_coverage
+			.entry(key)
+			.or_insert_with(|| SecondaryIndexCoverageTracker::new(key));
+		if tracker
+			.active_buffer()
+			.is_some_and(|buffer| buffer.source_slab_id() != base_location.slab_id)
+		{
+			let old_slab_id = tracker
+				.active_buffer()
+				.expect("checked Some above")
+				.source_slab_id();
+			tracker.mark_uncovered(
+				old_slab_id,
+				SecondaryIndexBackfillError::new(
+					SecondaryIndexBackfillErrorReason::SealFailure,
+					"active buffer moved to a different slab before seal",
+				),
+			);
+		}
+		if tracker.active_buffer().is_none() {
+			tracker.mark_active(SecondaryIndexActiveBuffer::new(
+				identity,
+				base_location.slab_id,
+				max_buffer_bytes,
+			))?;
+		}
+		let result = tracker
+			.active_buffer_mut()
+			.expect("active buffer installed above")
+			.append_storage_batch(descriptor, batch, base_location);
+		if let Err(err) = result {
+			let failure = tracker
+				.active_buffer()
+				.and_then(|buffer| buffer.failure().cloned())
+				.unwrap_or_else(|| {
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::EncodeFailure,
+						err.to_string(),
+					)
+				});
+			metrics().observe_storage_secondary_index_active_buffer_failure(
+				tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				failure.reason.label(),
+			);
+			tracker.mark_uncovered(base_location.slab_id, failure);
+			return Err(err);
+		}
+		result
+	}
+
+	pub fn append_secondary_index_active_buffer_entries(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+		entries: Vec<SecondaryIndexEntry>,
+		source_slab_id: SlabId,
+		max_buffer_bytes: usize,
+	) -> std::io::Result<usize> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let mut tracker = self
+			.secondary_index_coverage
+			.entry(key)
+			.or_insert_with(|| SecondaryIndexCoverageTracker::new(key));
+		if tracker
+			.active_buffer()
+			.is_some_and(|buffer| buffer.source_slab_id() != source_slab_id)
+		{
+			let old_slab_id = tracker
+				.active_buffer()
+				.expect("checked Some above")
+				.source_slab_id();
+			tracker.mark_uncovered(
+				old_slab_id,
+				SecondaryIndexBackfillError::new(
+					SecondaryIndexBackfillErrorReason::SealFailure,
+					"active buffer moved to a different slab before seal",
+				),
+			);
+		}
+		if tracker.active_buffer().is_none() {
+			tracker.mark_active(SecondaryIndexActiveBuffer::new(
+				identity,
+				source_slab_id,
+				max_buffer_bytes,
+			))?;
+		}
+		let result = tracker
+			.active_buffer_mut()
+			.expect("active buffer installed above")
+			.append_entries(descriptor, entries, source_slab_id);
+		if let Err(err) = result {
+			let failure = tracker
+				.active_buffer()
+				.and_then(|buffer| buffer.failure().cloned())
+				.unwrap_or_else(|| {
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::EncodeFailure,
+						err.to_string(),
+					)
+				});
+			metrics().observe_storage_secondary_index_active_buffer_failure(
+				tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				failure.reason.label(),
+			);
+			tracker.mark_uncovered(source_slab_id, failure);
+			return Err(err);
+		}
+		result
+	}
+
+	pub async fn seal_secondary_index_active_buffer(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+	) -> std::io::Result<Option<SecondaryIndexSegmentInfo>> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let buffer = {
+			let mut tracker = self
+				.secondary_index_coverage
+				.entry(key)
+				.or_insert_with(|| SecondaryIndexCoverageTracker::new(key));
+			tracker.take_active_buffer()
+		};
+		let Some(buffer) = buffer else {
+			return Ok(None);
+		};
+		let source_slab_id = buffer.source_slab_id();
+		let segment = match buffer.seal(descriptor) {
+			Ok(segment) => segment,
+			Err(err) => {
+				self.mark_secondary_index_uncovered(
+					key,
+					source_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::SealFailure,
+						err.to_string(),
+					),
+				);
+				metrics().observe_storage_secondary_index_active_buffer_failure(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					SecondaryIndexBackfillErrorReason::SealFailure.label(),
+				);
+				return Err(err);
+			}
+		};
+		match self.persist_secondary_index_segment(&segment).await {
+			Ok(info) => Ok(Some(info)),
+			Err(err) => {
+				self.mark_secondary_index_uncovered(
+					key,
+					source_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::PersistFailure,
+						err.to_string(),
+					),
+				);
+				metrics().observe_storage_secondary_index_segment_failed(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					SecondaryIndexBackfillErrorReason::PersistFailure.label(),
+				);
+				Err(err)
+			}
+		}
+	}
+
+	pub async fn seal_secondary_index_active_buffer_if_source_changed(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+		next_source_slab_id: SlabId,
+	) -> std::io::Result<Option<SecondaryIndexSegmentInfo>> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let should_seal = self
+			.secondary_index_coverage
+			.get(&key)
+			.and_then(|tracker| {
+				tracker
+					.value()
+					.active_buffer()
+					.map(|buffer| buffer.source_slab_id() != next_source_slab_id)
+			})
+			.unwrap_or(false);
+		if should_seal {
+			self.seal_secondary_index_active_buffer(tenant_id, descriptor)
+				.await
+		} else {
+			Ok(None)
+		}
+	}
+
+	pub async fn backfill_secondary_index_source_slab(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		self.backfill_secondary_index_source_slab_inner(
+			tenant_id,
+			table,
+			descriptor,
+			source_slab_id,
+		)
+		.await
+	}
+
+	pub async fn backfill_secondary_index_candidate(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		candidate: &SecondaryIndexBackfillCandidate,
+	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		let expected_key = SecondaryIndexCoverageKey::from(
+			SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor),
+		);
+		if candidate.key != expected_key {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"secondary index backfill candidate does not match descriptor identity",
+			));
+		}
+		self.backfill_secondary_index_source_slab_inner(
+			tenant_id,
+			table,
+			descriptor,
+			candidate.source_slab_id,
+		)
+		.await
+	}
+
+	pub async fn run_secondary_index_backfill_once(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		max_slabs: usize,
+		max_buffer_bytes: usize,
+	) -> std::io::Result<SecondaryIndexBackfillTickReport> {
+		let before = self
+			.ensure_secondary_index_coverage(tenant_id, descriptor, max_buffer_bytes)
+			.await?;
+		let mut completed = Vec::new();
+		let mut failures = Vec::new();
+
+		for candidate in before.candidates.iter().take(max_slabs) {
+			match self
+				.backfill_secondary_index_candidate(tenant_id, table, descriptor, candidate)
+				.await
+			{
+				Ok(info) => completed.push(SecondaryIndexBackfillSuccess {
+					candidate: candidate.clone(),
+					entry_count: info.entry_count,
+				}),
+				Err(err) => failures.push(SecondaryIndexBackfillFailure {
+					candidate: candidate.clone(),
+					error: SecondaryIndexBackfillError::new(
+						secondary_index_backfill_reason_from_io(&err),
+						err.to_string(),
+					),
+				}),
+			}
+		}
+
+		let after = self
+			.ensure_secondary_index_coverage(tenant_id, descriptor, max_buffer_bytes)
+			.await?;
+		let attempted = completed.len() + failures.len();
+		let historical_complete =
+			after.candidates.is_empty() && after.snapshot.uncovered_slabs.is_empty();
+
+		Ok(SecondaryIndexBackfillTickReport {
+			before,
+			after,
+			attempted,
+			completed,
+			failures,
+			historical_complete,
+		})
+	}
+
+	async fn backfill_secondary_index_source_slab_inner(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		let started_at = Instant::now();
+		descriptor.validate_against_table(table)?;
+		let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+			tenant_id, descriptor,
+		));
+		let source_slab_lease = self
+			.acquire_secondary_index_source_slab_read_lease(source_slab_id)
+			.await
+			.map_err(|err| {
+				self.mark_secondary_index_uncovered(
+					key,
+					source_slab_id,
+					SecondaryIndexBackfillError::new(
+						secondary_index_backfill_reason_from_io(&err),
+						err.to_string(),
+					),
+				);
+				err
+			})?;
+		let segment = match self
+			.build_secondary_index_segment_for_source_slab(
+				tenant_id,
+				table,
+				descriptor,
+				source_slab_id,
+			)
+			.await
+		{
+			Ok(segment) => segment,
+			Err(err) => {
+				self.mark_secondary_index_uncovered(
+					key,
+					source_slab_id,
+					SecondaryIndexBackfillError::new(
+						secondary_index_backfill_reason_from_io(&err),
+						err.to_string(),
+					),
+				);
+				metrics().observe_storage_secondary_index_segment_failed(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					secondary_index_backfill_reason_from_io(&err).label(),
+				);
+				return Err(err);
+			}
+		};
+		if let Err(err) = self
+			.ensure_secondary_index_source_slab_available(source_slab_id)
+			.await
+		{
+			self.mark_secondary_index_uncovered(
+				key,
+				source_slab_id,
+				SecondaryIndexBackfillError::new(
+					secondary_index_backfill_reason_from_io(&err),
+					err.to_string(),
+				),
+			);
+			metrics().observe_storage_secondary_index_segment_failed(
+				tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				secondary_index_backfill_reason_from_io(&err).label(),
+			);
+			return Err(err);
+		}
+		let result = match self.persist_secondary_index_segment(&segment).await {
+			Ok(info) => {
+				metrics().observe_storage_secondary_index_backfill_seconds(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					started_at.elapsed(),
+				);
+				Ok(info)
+			}
+			Err(err) => {
+				self.mark_secondary_index_uncovered(
+					key,
+					source_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::PersistFailure,
+						err.to_string(),
+					),
+				);
+				metrics().observe_storage_secondary_index_segment_failed(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					SecondaryIndexBackfillErrorReason::PersistFailure.label(),
+				);
+				Err(err)
+			}
+		};
+		// Held until after sidecar persistence so compaction cannot
+		// retire the source slab underneath a committed sidecar.
+		// Explicitly name the guard for the ADR 052 read-lease grep.
+		drop(source_slab_lease);
+		result
+	}
+
+	pub fn mark_secondary_index_backfill_uncovered(
+		&self,
+		key: SecondaryIndexCoverageKey,
+		source_slab_id: SlabId,
+		error: SecondaryIndexBackfillError,
+	) {
+		self.mark_secondary_index_uncovered(key, source_slab_id, error);
+	}
+
+	pub async fn persist_secondary_index_segment(
+		&self,
+		segment: &SecondaryIndexSegment,
+	) -> std::io::Result<SecondaryIndexSegmentInfo> {
+		let identity = segment.identity();
+		let segment_path = secondary_index_segment_storage_path(
+			segment.header.tenant_id,
+			segment.header.table_object_id,
+			segment.header.index_object_id,
+			segment.header.source_slab_id,
+		);
+		let info = SecondaryIndexSegmentInfo {
+			tenant_id: segment.header.tenant_id,
+			table_object_id: segment.header.table_object_id,
+			index_object_id: segment.header.index_object_id,
+			logical_schema_fingerprint: identity.logical_schema_fingerprint,
+			source_slab_id: segment.header.source_slab_id,
+			segment_path,
+			l2_uri: None,
+			payload_hash: segment.header.payload_hash,
+			state_digest: *segment.header.state_digest.as_bytes(),
+			format_version: segment.header.format_version,
+			entry_count: segment.header.entry_count,
+		};
+		let row = PersistentSecondaryIndexSegmentRow::from(info.clone());
+		let encoded = segment.encode()?;
+		let path = secondary_index_sidecar_path(&self.config.dir, &info.segment_path)?;
+		let tmp_path = secondary_index_sidecar_tmp_path(&path);
+		if let Some(parent) = path.parent() {
+			self.file_ops.create_dir_all(parent).await?;
+		}
+		let _ = unlink_local_file(self.file_ops.as_ref(), &tmp_path).await;
+		self.file_ops.write_all(&tmp_path, &encoded).await?;
+		let tmp = self
+			.file_ops
+			.open(
+				&tmp_path,
+				OpenFlags {
+					read: true,
+					write: true,
+					create: false,
+					create_new: false,
+					truncate: false,
+					direct: false,
+				},
+			)
+			.await?;
+		self.file_ops.fsync(&tmp).await?;
+		self.file_ops.rename(&tmp_path, &path).await?;
+		fsync_parent_dir(self.file_ops.as_ref(), &path).await?;
+		if let Some(index) = &self.persistent_index {
+			if let Err(err) = index.upsert_secondary_index_segment(row.clone()).await {
+				let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
+				return Err(err);
+			}
+		}
+		self.secondary_index_segments.insert(row.key, row);
+		self.mark_secondary_index_covered(info.coverage_key(), info.source_slab_id);
+		metrics().observe_storage_secondary_index_segment_built(
+			info.tenant_id,
+			info.table_object_id,
+			info.index_object_id,
+			info.entry_count,
+		);
+		Ok(info)
+	}
+
+	pub async fn load_secondary_index_segment(
+		&self,
+		key: &SecondaryIndexSegmentInfo,
+	) -> std::io::Result<Option<SecondaryIndexSegment>> {
+		let Some(row) = self
+			.secondary_index_segments
+			.get(&key.key())
+			.map(|entry| entry.value().clone())
+		else {
+			return Ok(None);
+		};
+		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
+		let bytes = match self.file_ops.read_all(&path).await {
+			Ok(bytes) => bytes,
+			Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+			Err(err) => return Err(err),
+		};
+		match SecondaryIndexSegment::decode(&bytes) {
+			Ok(segment) => Ok(Some(segment)),
+			Err(err) => {
+				metrics().observe_storage_secondary_index_corruption_failure(
+					row.key.tenant_id,
+					row.key.table_object_id,
+					row.key.index_object_id,
+				);
+				self.mark_secondary_index_uncovered(
+					secondary_index_coverage_key_from_persistent(&row.key),
+					row.key.source_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::CorruptSegment,
+						err.to_string(),
+					),
+				);
+				Err(err)
+			}
+		}
+	}
+
+	pub async fn delete_secondary_index_segment(
+		&self,
+		key: &SecondaryIndexSegmentInfo,
+	) -> std::io::Result<bool> {
+		let Some(row) = self
+			.secondary_index_segments
+			.get(&key.key())
+			.map(|entry| entry.value().clone())
+		else {
+			return Ok(false);
+		};
+		if let Some(index) = &self.persistent_index {
+			index.delete_secondary_index_segment(row.key).await?;
+		}
+		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
+		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		self.secondary_index_segments.remove(&row.key);
+		self.mark_secondary_index_uncovered(
+			secondary_index_coverage_key_from_persistent(&row.key),
+			row.key.source_slab_id,
+			SecondaryIndexBackfillError::new(
+				SecondaryIndexBackfillErrorReason::MissingSegment,
+				"secondary index sidecar segment deleted",
+			),
+		);
+		Ok(true)
+	}
+
+	pub async fn gc_secondary_index_segments_for_dropping_index(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+	) -> std::io::Result<usize> {
+		let started_at = Instant::now();
+		let segments = self.list_secondary_index_segments(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		);
+		let mut removed = 0usize;
+		for info in segments {
+			if self
+				.retire_secondary_index_segment_for_replaced_slab(&info)
+				.await?
+			{
+				removed = removed.saturating_add(1);
+			}
+		}
+		let coverage_key = SecondaryIndexCoverageKey::from(
+			SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor),
+		);
+		self.secondary_index_coverage.remove(&coverage_key);
+		metrics().set_storage_secondary_index_uncovered_slabs(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			0,
+		);
+		metrics().observe_storage_secondary_index_drop_gc_seconds(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			started_at.elapsed(),
+		);
+		Ok(removed)
+	}
+
+	pub fn list_secondary_index_segments(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		logical_schema_fingerprint: LogicalSchemaFingerprint,
+	) -> Vec<SecondaryIndexSegmentInfo> {
+		let mut out = self
+			.secondary_index_segments
+			.iter()
+			.filter_map(|entry| {
+				let key = entry.key();
+				(key.tenant_id == tenant_id
+					&& key.table_object_id == table_object_id
+					&& key.index_object_id == index_object_id
+					&& key.logical_schema_fingerprint == logical_schema_fingerprint)
+					.then(|| SecondaryIndexSegmentInfo::from(entry.value().clone()))
+			})
+			.collect::<Vec<_>>();
+		out.sort_by_key(|info| info.source_slab_id);
+		out
+	}
+
+	fn list_secondary_index_segments_for_source_slab(
+		&self,
+		source_slab_id: SlabId,
+	) -> Vec<SecondaryIndexSegmentInfo> {
+		let mut out = self
+			.secondary_index_segments
+			.iter()
+			.filter_map(|entry| {
+				(entry.key().source_slab_id == source_slab_id)
+					.then(|| SecondaryIndexSegmentInfo::from(entry.value().clone()))
+			})
+			.collect::<Vec<_>>();
+		out.sort_by(|left, right| {
+			(left.tenant_id, left.table_object_id, left.index_object_id)
+				.cmp(&(
+					right.tenant_id,
+					right.table_object_id,
+					right.index_object_id,
+				))
+				.then_with(|| {
+					left.logical_schema_fingerprint
+						.as_bytes()
+						.cmp(right.logical_schema_fingerprint.as_bytes())
+				})
+		});
+		out
+	}
+
+	fn forget_secondary_index_source_slab(
+		&self,
+		key: SecondaryIndexCoverageKey,
+		source_slab_id: SlabId,
+	) {
+		if let Some(mut tracker) = self.secondary_index_coverage.get_mut(&key) {
+			tracker.forget_slab(source_slab_id);
+			let uncovered = tracker.uncovered_slabs().count() as u64;
+			drop(tracker);
+			self.observe_secondary_index_uncovered_slabs(key, uncovered);
+		}
+	}
+
+	async fn retire_secondary_index_segment_for_replaced_slab(
+		&self,
+		info: &SecondaryIndexSegmentInfo,
+	) -> std::io::Result<bool> {
+		let Some(row) = self
+			.secondary_index_segments
+			.get(&info.key())
+			.map(|entry| entry.value().clone())
+		else {
+			self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
+			return Ok(false);
+		};
+		if let Some(index) = &self.persistent_index {
+			index.delete_secondary_index_segment(row.key).await?;
+		}
+		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
+		unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		self.secondary_index_segments.remove(&row.key);
+		self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
+		Ok(true)
+	}
+
+	async fn secondary_index_table_ids_for_source_slab(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
+		let plaintext = self
+			.secondary_index_source_slab_plaintext(source_slab_id)
+			.await?;
+		let mut table_ids = BTreeSet::new();
+		for recovered in recover_slab_entries_from_blob(&plaintext, source_slab_id)? {
+			let frame = match extract_record_from_blob(&plaintext, recovered.location) {
+				Ok(frame) => frame,
+				Err(_) => continue,
+			};
+			let storage_batch = match decode_record_batch(&frame) {
+				Ok(batch) => batch,
+				Err(_) => continue,
+			};
+			if let Some(table_object_id) =
+				storage_row_table_object_id_at(&storage_batch, recovered.location.record_row_index)?
+			{
+				table_ids.insert((recovered.tenant_id, table_object_id));
+			}
+		}
+		Ok(table_ids)
+	}
+
+	async fn secondary_index_compaction_descriptors_for_source_slab(
+		&self,
+		source_slab_id: SlabId,
+		context: SecondaryIndexCompactionContext<'_>,
+	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptorV1, SecondaryIndexDescriptor)>> {
+		let mut descriptors = Vec::new();
+		for (tenant_id, table_object_id) in self
+			.secondary_index_table_ids_for_source_slab(source_slab_id)
+			.await?
+		{
+			for row in context
+				.secondary_indexes
+				.for_table(tenant_id, table_object_id)
+			{
+				if !matches!(
+					row.state,
+					SecondaryIndexState::Building | SecondaryIndexState::Ready
+				) {
+					continue;
+				}
+				let Some(table) = context.table_schemas.get(
+					tenant_id,
+					row.descriptor.table_object_id,
+					row.descriptor.table_schema_generation,
+				) else {
+					continue;
+				};
+				if row.descriptor.validate_against_table(table).is_ok() {
+					descriptors.push((tenant_id, table.clone(), row.descriptor.clone()));
+				}
+			}
+		}
+		descriptors.sort_by_key(|(tenant_id, _table, descriptor)| {
+			(
+				*tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+			)
+		});
+		descriptors.dedup_by_key(|(tenant_id, _table, descriptor)| {
+			(
+				*tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+			)
+		});
+		Ok(descriptors)
+	}
+
+	async fn reconcile_secondary_index_segments_after_compaction(
+		&self,
+		old_slab_id: SlabId,
+		new_slab_id: Option<SlabId>,
+		context: Option<SecondaryIndexCompactionContext<'_>>,
+		old_descriptors: Vec<(TenantId, TableSchemaDescriptorV1, SecondaryIndexDescriptor)>,
+	) -> usize {
+		let Some(context) = context else {
+			return 0;
+		};
+		let mut retired_keys = HashSet::new();
+		for old_info in self.list_secondary_index_segments_for_source_slab(old_slab_id) {
+			let Some(row) = context
+				.secondary_indexes
+				.get(old_info.tenant_id, old_info.index_object_id)
+			else {
+				continue;
+			};
+			if !matches!(
+				row.state,
+				SecondaryIndexState::Building | SecondaryIndexState::Ready
+			) {
+				continue;
+			}
+			match self
+				.retire_secondary_index_segment_for_replaced_slab(&old_info)
+				.await
+			{
+				Ok(_) => {
+					retired_keys.insert(old_info.coverage_key());
+				}
+				Err(err) => {
+					tracing::warn!(
+						old_slab_id = old_slab_id.get(),
+						index_object_id = ?old_info.index_object_id,
+						error = %err,
+						"failed to retire old secondary index sidecar after compaction"
+					);
+				}
+			}
+		}
+		for (tenant_id, _table, descriptor) in old_descriptors {
+			let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+				tenant_id,
+				&descriptor,
+			));
+			if retired_keys.insert(key) {
+				self.forget_secondary_index_source_slab(key, old_slab_id);
+			}
+		}
+
+		let Some(new_slab_id) = new_slab_id else {
+			return 0;
+		};
+		let descriptors = match self
+			.secondary_index_compaction_descriptors_for_source_slab(new_slab_id, context)
+			.await
+		{
+			Ok(descriptors) => descriptors,
+			Err(err) => {
+				tracing::warn!(
+					old_slab_id = old_slab_id.get(),
+					new_slab_id = new_slab_id.get(),
+					error = %err,
+					"failed to enumerate secondary index descriptors for compacted slab"
+				);
+				return 0;
+			}
+		};
+
+		let mut rebuilt = 0usize;
+		for (tenant_id, table, descriptor) in descriptors {
+			let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+				tenant_id,
+				&descriptor,
+			));
+			if retired_keys.insert(key) {
+				self.forget_secondary_index_source_slab(key, old_slab_id);
+			}
+			let old_info = self
+				.list_secondary_index_segments(
+					tenant_id,
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					descriptor.logical_schema_fingerprint,
+				)
+				.into_iter()
+				.find(|info| info.source_slab_id == old_slab_id);
+			if let Some(old_info) = old_info
+				&& let Err(err) = self
+					.retire_secondary_index_segment_for_replaced_slab(&old_info)
+					.await
+			{
+				tracing::warn!(
+					old_slab_id = old_slab_id.get(),
+					index_object_id = ?descriptor.index_object_id,
+					error = %err,
+					"failed to retire old secondary index sidecar before rebuild"
+				);
+			}
+			let segment = match self
+				.build_secondary_index_segment_for_source_slab(
+					tenant_id,
+					&table,
+					&descriptor,
+					new_slab_id,
+				)
+				.await
+			{
+				Ok(segment) => segment,
+				Err(err) => {
+					self.mark_secondary_index_uncovered(
+						key,
+						new_slab_id,
+						SecondaryIndexBackfillError::new(
+							secondary_index_backfill_reason_from_io(&err),
+							err.to_string(),
+						),
+					);
+					tracing::warn!(
+						new_slab_id = new_slab_id.get(),
+						index_object_id = ?descriptor.index_object_id,
+						error = %err,
+						"failed to rebuild secondary index sidecar after compaction"
+					);
+					continue;
+				}
+			};
+			if let Err(err) = self.persist_secondary_index_segment(&segment).await {
+				self.mark_secondary_index_uncovered(
+					key,
+					new_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::PersistFailure,
+						err.to_string(),
+					),
+				);
+				tracing::warn!(
+					new_slab_id = new_slab_id.get(),
+					index_object_id = ?descriptor.index_object_id,
+					error = %err,
+					"failed to persist rebuilt secondary index sidecar after compaction"
+				);
+				continue;
+			}
+			rebuilt = rebuilt.saturating_add(1);
+		}
+		rebuilt
+	}
+
+	pub async fn table_lookup_by_index(
+		&self,
+		request: &TableLookupByIndexRequest,
+		descriptor: &SecondaryIndexDescriptor,
+		state: SecondaryIndexState,
+	) -> std::io::Result<SecondaryIndexLookupReport> {
+		if state != SecondaryIndexState::Ready
+			|| descriptor.table_object_id != request.table_object_id
+			|| descriptor.index_object_id != request.index_object_id
+			|| descriptor.logical_schema_fingerprint != request.logical_schema_fingerprint
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"{INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH}: secondary index lookup requires a Ready descriptor matching the request",
+				),
+			));
+		}
+
+		let mut report = SecondaryIndexLookupReport::default();
+		let mut seen = BTreeSet::new();
+		for info in self.list_secondary_index_segments(
+			request.tenant_id,
+			request.table_object_id,
+			request.index_object_id,
+			request.logical_schema_fingerprint,
+		) {
+			let Some(segment) = self.load_secondary_index_segment(&info).await? else {
+				return Err(Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"secondary index sidecar for source slab {} disappeared during lookup",
+						info.source_slab_id
+					),
+				));
+			};
+			if !secondary_index_key_range_intersects_query(
+				segment.header.entry_count,
+				&segment.header.min_encoded_key,
+				&segment.header.max_encoded_key,
+				&request.query,
+			) {
+				continue;
+			}
+			report.stats.scanned_segments += 1;
+			let segment_identity = segment.identity();
+			for entry in segment
+				.entries
+				.iter()
+				.filter(|entry| secondary_index_entry_matches_query(entry, &request.query))
+			{
+				report.stats.candidate_count += 1;
+				let frame = self.read(entry.record_location).await?;
+				let fetched_batch = decode_record_batch(&frame)?;
+				let visible_as_of_location =
+					self.lookup_as_of(request.tenant_id, entry.row_key_id, request.as_of_hlc);
+				match revalidate_secondary_index_candidate(
+					descriptor,
+					segment_identity,
+					entry,
+					&fetched_batch,
+					visible_as_of_location,
+				)? {
+					SecondaryIndexCandidateValidation::Accepted => {
+						let key = (
+							entry.row_key_id,
+							entry.row_hlc,
+							entry.record_location.slab_id,
+							entry.record_location.offset,
+							entry.record_location.length,
+							entry.record_location.record_row_index,
+						);
+						if seen.insert(key) {
+							report.stats.visible_count += 1;
+							report.rows.push(SecondaryIndexLookupRow {
+								row_key_id: entry.row_key_id,
+								row_hlc: entry.row_hlc,
+								record_location: entry.record_location,
+							});
+						}
+					}
+					SecondaryIndexCandidateValidation::Rejected(reason) => match reason {
+						SecondaryIndexCandidateRejectReason::NotVisibleAsOf
+						| SecondaryIndexCandidateRejectReason::Tombstone => {
+							report.stats.superseded_count += 1;
+						}
+						SecondaryIndexCandidateRejectReason::NullIndexedValue
+						| SecondaryIndexCandidateRejectReason::IndexedValueMismatch => {
+							report.stats.stale_indexed_value_count += 1;
+						}
+						SecondaryIndexCandidateRejectReason::DescriptorMismatch
+						| SecondaryIndexCandidateRejectReason::RowMetadataMismatch => {
+							report.stats.rejected_count += 1;
+						}
+					},
+				}
+			}
+		}
+		metrics().observe_storage_secondary_index_lookup(
+			request.tenant_id,
+			request.table_object_id,
+			request.index_object_id,
+			report.stats.candidate_count,
+			report.stats.visible_count,
+			report.stats.superseded_count,
+			report.stats.stale_indexed_value_count,
+		);
+		Ok(report)
+	}
+
+	async fn secondary_index_source_slabs(&self) -> (SlabId, Vec<SlabId>) {
+		let state = self.state.lock().await;
+		let active_slab_id = state.active.slab_id();
+		let mut historical = state
+			.sealed
+			.iter()
+			.map(|entry| *entry.key())
+			.chain(state.tiered.iter().map(|entry| *entry.key()))
+			.collect::<Vec<_>>();
+		historical.sort_unstable();
+		historical.dedup();
+		(active_slab_id, historical)
+	}
+
+	fn secondary_index_source_slab_lease(&self, source_slab_id: SlabId) -> Arc<AsyncRwLock<()>> {
+		self.secondary_index_source_slab_leases
+			.entry(source_slab_id)
+			.or_insert_with(|| Arc::new(AsyncRwLock::new(())))
+			.clone()
+	}
+
+	async fn acquire_secondary_index_source_slab_read_lease(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<OwnedRwLockReadGuard<()>> {
+		let source_slab_lease = self.secondary_index_source_slab_lease(source_slab_id);
+		let guard = source_slab_lease.read_owned().await;
+		self.ensure_secondary_index_source_slab_available(source_slab_id)
+			.await?;
+		Ok(guard)
+	}
+
+	async fn acquire_secondary_index_source_slab_compaction_lease(
+		&self,
+		source_slab_id: SlabId,
+	) -> OwnedRwLockWriteGuard<()> {
+		self.secondary_index_source_slab_lease(source_slab_id)
+			.write_owned()
+			.await
+	}
+
+	async fn ensure_secondary_index_source_slab_available(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<()> {
+		let state = self.state.lock().await;
+		if state.active.slab_id() == source_slab_id {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"secondary index backfill source slab is still active",
+			));
+		}
+		if state.sealed.contains_key(&source_slab_id) || state.tiered.contains_key(&source_slab_id)
+		{
+			return Ok(());
+		}
+		Err(Error::new(
+			ErrorKind::NotFound,
+			format!("secondary index backfill source slab {source_slab_id} not found"),
+		))
+	}
+
+	async fn build_secondary_index_segment_for_source_slab(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+	) -> std::io::Result<SecondaryIndexSegment> {
+		let plaintext = self
+			.secondary_index_source_slab_plaintext(source_slab_id)
+			.await?;
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let mut index_entries = Vec::new();
+		for recovered in recover_slab_entries_from_blob(&plaintext, source_slab_id)? {
+			if recovered.tenant_id != tenant_id || recovered.location.is_tombstone {
+				continue;
+			}
+			let frame = extract_record_from_blob(&plaintext, recovered.location)?;
+			let storage_batch = match decode_record_batch(&frame) {
+				Ok(batch) => batch,
+				Err(_) => continue,
+			};
+			let stored_table_object_id = storage_row_table_object_id_at(
+				&storage_batch,
+				recovered.location.record_row_index,
+			)?;
+			let materialized = match materialize_record_location_batch(
+				&storage_batch,
+				recovered.location.record_row_index,
+			) {
+				Ok(batch) if batch.num_rows() == 1 => batch,
+				Ok(_) => continue,
+				Err(err) => return Err(err),
+			};
+			let routing_locality = self.recovered_entry_routing_locality(&recovered);
+			if !descriptor_matches_tiered_row(
+				table,
+				tenant_id,
+				recovered.key_identity,
+				routing_locality,
+				stored_table_object_id,
+				&materialized,
+			)? {
+				continue;
+			}
+			let Some(encoded_key) = encode_secondary_index_key(&materialized, 0, descriptor)?
+			else {
+				continue;
+			};
+			index_entries.push(SecondaryIndexEntry {
+				encoded_key,
+				row_key_id: recovered.key_identity,
+				row_hlc: recovered.location.hlc,
+				record_location: RecordLocation {
+					is_tombstone: false,
+					..recovered.location
+				},
+			});
+		}
+		SecondaryIndexSegment::build(
+			identity,
+			source_slab_id,
+			descriptor.table_schema_generation,
+			descriptor.key.arrow_type_tag,
+			index_entries,
+		)
+	}
+
+	async fn secondary_index_source_slab_plaintext(
+		&self,
+		source_slab_id: SlabId,
+	) -> std::io::Result<Vec<u8>> {
+		let tier_pointer = {
+			let state = self.state.lock().await;
+			if state.active.slab_id() == source_slab_id {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"secondary index backfill source slab is still active",
+				));
+			}
+			if state.sealed.contains_key(&source_slab_id) {
+				None
+			} else if let Some(pointer) = state.tiered.get(&source_slab_id) {
+				Some(pointer.clone())
+			} else {
+				return Err(Error::new(
+					ErrorKind::NotFound,
+					format!("secondary index backfill source slab {source_slab_id} not found"),
+				));
+			}
+		};
+		if let Some(pointer) = tier_pointer {
+			self.tiered_plaintext_from_l2(&pointer).await
+		} else {
+			self.read_sealed_raw(source_slab_id).await
+		}
+	}
+
+	fn mark_secondary_index_covered(&self, key: SecondaryIndexCoverageKey, source_slab_id: SlabId) {
+		let mut tracker = self
+			.secondary_index_coverage
+			.entry(key)
+			.or_insert_with(|| SecondaryIndexCoverageTracker::new(key));
+		tracker.mark_covered(source_slab_id);
+		let uncovered = tracker.uncovered_slabs().count() as u64;
+		drop(tracker);
+		self.observe_secondary_index_uncovered_slabs(key, uncovered);
+	}
+
+	fn mark_secondary_index_uncovered(
+		&self,
+		key: SecondaryIndexCoverageKey,
+		source_slab_id: SlabId,
+		error: SecondaryIndexBackfillError,
+	) {
+		let mut tracker = self
+			.secondary_index_coverage
+			.entry(key)
+			.or_insert_with(|| SecondaryIndexCoverageTracker::new(key));
+		tracker.mark_uncovered(source_slab_id, error);
+		let uncovered = tracker.uncovered_slabs().count() as u64;
+		drop(tracker);
+		self.observe_secondary_index_uncovered_slabs(key, uncovered);
+	}
+
+	fn observe_secondary_index_uncovered_slabs(
+		&self,
+		key: SecondaryIndexCoverageKey,
+		uncovered: u64,
+	) {
+		metrics().set_storage_secondary_index_uncovered_slabs(
+			key.tenant_id,
+			key.table_object_id,
+			key.index_object_id,
+			uncovered,
+		);
 	}
 
 	/// Refresh the ADR 043 compression-convergence gauge from
@@ -2648,6 +4124,7 @@ impl SlabManager {
 		cluster_policy: MvccRetentionPolicy,
 		table_lifecycle: &TableLifecycleCatalog,
 		table_schemas: &TableSchemaCatalogV1,
+		secondary_indexes: &SecondaryIndexCatalog,
 		now_ms: u64,
 		max_slabs: usize,
 	) -> std::io::Result<RetentionPruningReport> {
@@ -2678,6 +4155,7 @@ impl SlabManager {
 					cluster_policy,
 					table_lifecycle,
 					table_schemas,
+					secondary_indexes,
 					now_ms,
 				)
 				.await?;
@@ -3651,7 +5129,7 @@ impl SlabManager {
 			.collect();
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records)
+		self.compact_sealed_slab_records(slab_id, slab, &records, None)
 			.await
 	}
 
@@ -3690,7 +5168,7 @@ impl SlabManager {
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records)
+		self.compact_sealed_slab_records(slab_id, slab, &records, None)
 			.await
 	}
 
@@ -3701,6 +5179,7 @@ impl SlabManager {
 		cluster_policy: MvccRetentionPolicy,
 		table_lifecycle: &TableLifecycleCatalog,
 		table_schemas: &TableSchemaCatalogV1,
+		secondary_indexes: &SecondaryIndexCatalog,
 		now_ms: u64,
 	) -> std::io::Result<RetentionSlabScanOutcome> {
 		let mut records: Vec<CompactionRecord> = slab
@@ -3736,7 +5215,15 @@ impl SlabManager {
 		records.sort_by_key(|record| record.old_location.offset);
 		let retention_stats = Self::retention_compaction_stats(&records);
 		let compaction = self
-			.compact_sealed_slab_records(slab_id, slab, &records)
+			.compact_sealed_slab_records(
+				slab_id,
+				slab,
+				&records,
+				Some(SecondaryIndexCompactionContext {
+					table_schemas,
+					secondary_indexes,
+				}),
+			)
 			.await?;
 
 		Ok(RetentionSlabScanOutcome {
@@ -4383,6 +5870,7 @@ impl SlabManager {
 		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
+		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
 		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
 			return Ok(None);
@@ -4392,9 +5880,33 @@ impl SlabManager {
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
 		let retention_stats = Self::retention_compaction_stats(records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
+		let old_secondary_index_descriptors = match secondary_index_context {
+			Some(context) => match self
+				.secondary_index_compaction_descriptors_for_source_slab(slab_id, context)
+				.await
+			{
+				Ok(descriptors) => descriptors,
+				Err(err) => {
+					tracing::warn!(
+						slab_id = slab_id.get(),
+						error = %err,
+						"failed to enumerate secondary index descriptors before compaction"
+					);
+					Vec::new()
+				}
+			},
+			None => Vec::new(),
+		};
 		if survivors == 0 {
 			self.finish_compaction_without_replacement(slab_id, &records)
 				.await?;
+			self.reconcile_secondary_index_segments_after_compaction(
+				slab_id,
+				None,
+				secondary_index_context,
+				old_secondary_index_descriptors,
+			)
+			.await;
 			return Ok(Some(CompactionOutcome {
 				reclaimed_bytes: old_bytes,
 				reclaimed_records,
@@ -4475,6 +5987,13 @@ impl SlabManager {
 			return Ok(None);
 		}
 
+		self.reconcile_secondary_index_segments_after_compaction(
+			slab_id,
+			Some(replacement_id),
+			secondary_index_context,
+			old_secondary_index_descriptors,
+		)
+		.await;
 		let old_path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
 		if multirow_recompact_count > 0 {
@@ -4493,6 +6012,9 @@ impl SlabManager {
 		slab_id: SlabId,
 		records: &[CompactionRecord],
 	) -> std::io::Result<()> {
+		let source_slab_lease = self
+			.acquire_secondary_index_source_slab_compaction_lease(slab_id)
+			.await;
 		let removed = {
 			let state = self.state.lock().await;
 			state.sealed.remove(&slab_id).is_some()
@@ -4510,6 +6032,8 @@ impl SlabManager {
 		self.delete_persistent_records(records).await;
 		let old_path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		self.secondary_index_source_slab_leases.remove(&slab_id);
+		drop(source_slab_lease);
 		Ok(())
 	}
 
@@ -4521,6 +6045,9 @@ impl SlabManager {
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
 	) -> std::io::Result<bool> {
+		let source_slab_lease = self
+			.acquire_secondary_index_source_slab_compaction_lease(old_slab_id)
+			.await;
 		let state = self.state.lock().await;
 		if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
 			return Ok(false);
@@ -4546,6 +6073,8 @@ impl SlabManager {
 		}
 		drop(state);
 		self.replace_persistent_records(records, relocations).await;
+		self.secondary_index_source_slab_leases.remove(&old_slab_id);
+		drop(source_slab_lease);
 		Ok(true)
 	}
 
@@ -5086,6 +6615,12 @@ struct ReclusterGroupPlan {
 	records: Vec<CompactionRecord>,
 	matching_rows: Vec<ReclusterLogicalRow>,
 	nonmatching_records: Vec<CompactionRecord>,
+}
+
+#[derive(Clone, Copy)]
+struct SecondaryIndexCompactionContext<'a> {
+	table_schemas: &'a TableSchemaCatalogV1,
+	secondary_indexes: &'a SecondaryIndexCatalog,
 }
 
 struct CompactedFrame {
@@ -5914,6 +7449,31 @@ fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.retention.tmp", slab_id))
 }
 
+fn secondary_index_sidecar_path(dir: &Path, relative: &str) -> std::io::Result<PathBuf> {
+	let relative_path = Path::new(relative);
+	if relative_path.is_absolute()
+		|| relative_path.components().any(|component| {
+			matches!(
+				component,
+				std::path::Component::ParentDir
+					| std::path::Component::RootDir
+					| std::path::Component::Prefix(_)
+			)
+		}) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("secondary index sidecar path is not relative-safe: {relative}"),
+		));
+	}
+	Ok(dir.join(relative_path))
+}
+
+fn secondary_index_sidecar_tmp_path(path: &Path) -> PathBuf {
+	let mut tmp = path.as_os_str().to_os_string();
+	tmp.push(".tmp");
+	PathBuf::from(tmp)
+}
+
 fn parse_mvcc_rewrite_tmp_filename(name: &str) -> Option<SlabId> {
 	let rest = name
 		.strip_prefix("slab_")?
@@ -6073,7 +7633,9 @@ mod tests {
 		default_kv_table_descriptor_v1, encode_table_write_row_count,
 	};
 	use crate::schema::{
-		NodeId, RetentionWindowMillis, TableLifecycleCatalog, TableRetentionPolicy,
+		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, NodeId, RetentionWindowMillis,
+		SecondaryIndexCatalog, SecondaryIndexKeyDescriptor, TableLifecycleCatalog,
+		TableRetentionPolicy,
 	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
@@ -6082,6 +7644,7 @@ mod tests {
 		ARROW_STATS_TAG_INT64, decode_column_stats_payload, encode_signed_stat_value,
 		parse_column_stats_block,
 	};
+	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
 		Array, BooleanArray, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder,
 		LargeStringArray, UInt64Array, UInt64Builder,
@@ -6637,6 +8200,692 @@ mod tests {
 		state.sealed.insert(sealed_id, sealed);
 		state.next_slab_id = next_id.saturating_add(1);
 		sealed_id
+	}
+
+	fn secondary_index_table_descriptor_for_test() -> TableSchemaDescriptorV1 {
+		let table_object_id = TableObjectId::new([0x52; 16]);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("age", DataType::Int64, true),
+		]);
+		TableSchemaDescriptorV1::new_with_layout(
+			table_object_id,
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn secondary_index_descriptor_for_test() -> SecondaryIndexDescriptor {
+		let table = secondary_index_table_descriptor_for_test();
+		SecondaryIndexDescriptor {
+			index_object_id: IndexObjectId::new([0x9A; 16]),
+			table_object_id: table.table_object_id,
+			namespace: table.namespace.clone(),
+			index_name: "events_age_idx".to_owned(),
+			table_schema_generation: table.schema_generation,
+			logical_schema_fingerprint: table.logical_schema_fingerprint,
+			key: SecondaryIndexKeyDescriptor {
+				column_name: "age".to_owned(),
+				column_ordinal: 1,
+				arrow_type_tag: IndexArrowTypeTag::Int64,
+				encoding: IndexKeyEncoding::OrderedScalar,
+			},
+		}
+	}
+
+	fn secondary_index_encoded_i64_for_test(value: i64) -> Vec<u8> {
+		((value as u64) ^ 0x8000_0000_0000_0000)
+			.to_be_bytes()
+			.to_vec()
+	}
+
+	fn secondary_index_storage_batch_for_test(
+		ages: Vec<Option<i64>>,
+		row_hlc: HybridTimestamp,
+		identity_byte: u8,
+	) -> RecordBatch {
+		let ids = Int64Array::from_iter_values(0..ages.len() as i64);
+		let ages = Int64Array::from(ages);
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("age", DataType::Int64, true),
+			])),
+			vec![Arc::new(ids), Arc::new(ages)],
+		)
+		.unwrap();
+		crate::storage::append_storage_synthetic_columns(
+			&batch,
+			&(0..batch.num_rows()).collect::<Vec<_>>(),
+			&crate::schema::TableWriteAdmission {
+				canonical_primary_keys: vec![vec![identity_byte]; batch.num_rows()],
+				key_identities: vec![Identity::new([identity_byte; 32]); batch.num_rows()],
+				localities: vec![Locality::new(11); batch.num_rows()],
+			},
+			row_hlc,
+			Some(TableObjectId::new([0x52; 16])),
+		)
+		.unwrap()
+	}
+
+	fn secondary_index_user_batch_for_test(id_value: i64, age: Option<i64>) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![
+				Field::new("id", DataType::Int64, false),
+				Field::new("age", DataType::Int64, true),
+			])),
+			vec![
+				Arc::new(Int64Array::from(vec![id_value])) as Arc<dyn Array>,
+				Arc::new(Int64Array::from(vec![age])) as Arc<dyn Array>,
+			],
+		)
+		.unwrap()
+	}
+
+	async fn append_secondary_index_table_row_for_test(
+		manager: &Arc<SlabManager>,
+		table: &TableSchemaDescriptorV1,
+		id_value: i64,
+		age: Option<i64>,
+		row_hlc: HybridTimestamp,
+	) -> Identity {
+		let batch = secondary_index_user_batch_for_test(id_value, age);
+		let meta = layout_recluster_meta(table, batch.num_rows());
+		let packed =
+			pack_record_batch_by_bucket(&meta, table, &batch, WriterNodeId::ZERO, row_hlc).unwrap();
+		assert_eq!(packed.len(), 1);
+		let record = &packed[0];
+		let entries = storage_multirow_index_entries_from_frame(&record.frame_bytes)
+			.unwrap()
+			.unwrap();
+		let row_identity = entries[0].key_identity;
+		manager
+			.append_durable_multirow_with_locality(tenant(), &record.frame_bytes, &entries)
+			.await
+			.unwrap();
+		row_identity
+	}
+
+	fn secondary_index_segment_for_test(source_slab_id: SlabId) -> SecondaryIndexSegment {
+		let descriptor = secondary_index_descriptor_for_test();
+		SecondaryIndexSegment::build(
+			SecondaryIndexIdentity {
+				tenant_id: tenant(),
+				table_object_id: descriptor.table_object_id,
+				index_object_id: descriptor.index_object_id,
+				logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+				column_ordinal: 1,
+			},
+			source_slab_id,
+			descriptor.table_schema_generation,
+			IndexArrowTypeTag::Int64,
+			vec![SecondaryIndexEntry {
+				encoded_key: ((42_i64 as u64) ^ 0x8000_0000_0000_0000)
+					.to_be_bytes()
+					.to_vec(),
+				row_key_id: id(42),
+				row_hlc: hlc(42),
+				record_location: RecordLocation {
+					slab_id: source_slab_id,
+					offset: 128,
+					length: 256,
+					hlc: hlc(42),
+					record_row_index: RecordRowIndex::ZERO,
+					is_tombstone: false,
+				},
+			}],
+		)
+		.unwrap()
+	}
+
+	#[tokio::test]
+	async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
+		let dir = fresh_dir("secondary-index-sidecar");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let manager = open_manager_at_dir(dir.clone(), io, crypto.clone()).await;
+		let segment = secondary_index_segment_for_test(SlabId::new(41));
+		let info = manager
+			.persist_secondary_index_segment(&segment)
+			.await
+			.unwrap();
+
+		let listed = manager.list_secondary_index_segments(
+			info.tenant_id,
+			info.table_object_id,
+			info.index_object_id,
+			info.logical_schema_fingerprint,
+		);
+		assert_eq!(listed, vec![info.clone()]);
+		let path = dir.join(&info.segment_path);
+		assert!(path.exists());
+		assert_eq!(
+			manager
+				.load_secondary_index_segment(&info)
+				.await
+				.unwrap()
+				.unwrap(),
+			segment
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![info.source_slab_id]);
+		assert!(coverage.uncovered_slabs.is_empty());
+
+		drop(manager);
+		let reopened = open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto).await;
+		assert_eq!(
+			reopened.list_secondary_index_segments(
+				info.tenant_id,
+				info.table_object_id,
+				info.index_object_id,
+				info.logical_schema_fingerprint,
+			),
+			vec![info.clone()]
+		);
+		assert_eq!(
+			reopened
+				.load_secondary_index_segment(&info)
+				.await
+				.unwrap()
+				.unwrap(),
+			segment
+		);
+		let coverage = reopened
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![info.source_slab_id]);
+		assert!(
+			reopened
+				.delete_secondary_index_segment(&info)
+				.await
+				.unwrap()
+		);
+		assert!(!path.exists());
+		assert!(
+			reopened
+				.list_secondary_index_segments(
+					info.tenant_id,
+					info.table_object_id,
+					info.index_object_id,
+					info.logical_schema_fingerprint,
+				)
+				.is_empty()
+		);
+		let coverage = reopened
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert!(coverage.covered_slabs.is_empty());
+		assert_eq!(coverage.uncovered_slabs[0].0, info.source_slab_id);
+		assert_eq!(
+			coverage.uncovered_slabs[0].1.reason,
+			SecondaryIndexBackfillErrorReason::MissingSegment
+		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_corrupt_sidecar_marks_uncovered_and_fails_closed() {
+		let dir = fresh_dir("secondary-index-corrupt-sidecar");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+		let segment = secondary_index_segment_for_test(SlabId::new(41));
+		let info = manager
+			.persist_secondary_index_segment(&segment)
+			.await
+			.unwrap();
+		std::fs::write(
+			dir.join(&info.segment_path),
+			b"not a secondary index segment",
+		)
+		.unwrap();
+
+		let err = manager
+			.load_secondary_index_segment(&info)
+			.await
+			.unwrap_err();
+		assert!(err.to_string().contains("decode secondary index segment"));
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert!(coverage.covered_slabs.is_empty());
+		assert_eq!(coverage.uncovered_slabs[0].0, info.source_slab_id);
+		assert_eq!(
+			coverage.uncovered_slabs[0].1.reason,
+			SecondaryIndexBackfillErrorReason::CorruptSegment
+		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_drop_gc_deletes_sidecars_and_clears_local_coverage() {
+		let dir = fresh_dir("secondary-index-drop-gc");
+		let io = spawn_io_thread(64).unwrap();
+		let crypto = test_crypto();
+		let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+		let descriptor = secondary_index_descriptor_for_test();
+		let first = manager
+			.persist_secondary_index_segment(&secondary_index_segment_for_test(SlabId::new(41)))
+			.await
+			.unwrap();
+		let second = manager
+			.persist_secondary_index_segment(&secondary_index_segment_for_test(SlabId::new(42)))
+			.await
+			.unwrap();
+
+		let removed = manager
+			.gc_secondary_index_segments_for_dropping_index(tenant(), &descriptor)
+			.await
+			.unwrap();
+
+		assert_eq!(removed, 2);
+		assert!(!dir.join(&first.segment_path).exists());
+		assert!(!dir.join(&second.segment_path).exists());
+		assert!(
+			manager
+				.list_secondary_index_segments(
+					tenant(),
+					descriptor.table_object_id,
+					descriptor.index_object_id,
+					descriptor.logical_schema_fingerprint,
+				)
+				.is_empty()
+		);
+		assert!(
+			manager
+				.secondary_index_coverage_snapshot(first.coverage_key())
+				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_source_slab_read_lease_blocks_compaction_claim() {
+		let manager = fresh_manager().await;
+		let source_slab_id = force_seal_active(&manager).await;
+		let source_slab_lease = manager
+			.acquire_secondary_index_source_slab_read_lease(source_slab_id)
+			.await
+			.unwrap();
+
+		let blocked = tokio::time::timeout(
+			Duration::from_millis(20),
+			manager.acquire_secondary_index_source_slab_compaction_lease(source_slab_id),
+		)
+		.await;
+		assert!(
+			blocked.is_err(),
+			"compaction claim should wait while backfill holds the source_slab_lease"
+		);
+
+		drop(source_slab_lease);
+		let compaction_lease = tokio::time::timeout(
+			Duration::from_secs(1),
+			manager.acquire_secondary_index_source_slab_compaction_lease(source_slab_id),
+		)
+		.await
+		.expect("compaction lease should become available after backfill releases");
+		drop(compaction_lease);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_coverage_plan_recovers_covered_and_enqueues_missing_sealed_slabs() {
+		let manager = fresh_manager().await;
+		let first_sealed = force_seal_active(&manager).await;
+		let second_sealed = force_seal_active(&manager).await;
+		let descriptor = secondary_index_descriptor_for_test();
+		let info = manager
+			.persist_secondary_index_segment(&secondary_index_segment_for_test(first_sealed))
+			.await
+			.unwrap();
+
+		let plan = manager
+			.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+			.await
+			.unwrap();
+
+		assert_eq!(plan.snapshot.covered_slabs, vec![info.source_slab_id]);
+		assert_eq!(
+			plan.snapshot.active_buffer.unwrap().source_slab_id,
+			SlabId::new(2)
+		);
+		assert_eq!(
+			plan.candidates,
+			vec![SecondaryIndexBackfillCandidate {
+				key: info.coverage_key(),
+				source_slab_id: second_sealed,
+			}]
+		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_active_buffer_seal_persists_sidecar_and_marks_covered() {
+		let manager = fresh_manager().await;
+		let descriptor = secondary_index_descriptor_for_test();
+		let active_slab_id = manager.active_slab_id().await;
+		let row_hlc = hlc(50);
+		let base_location = RecordLocation {
+			slab_id: active_slab_id,
+			offset: 64,
+			length: 512,
+			hlc: row_hlc,
+			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
+		};
+
+		let appended = manager
+			.append_secondary_index_active_buffer_batch(
+				tenant(),
+				&descriptor,
+				&secondary_index_storage_batch_for_test(vec![Some(42)], row_hlc, 7),
+				base_location,
+				4096,
+			)
+			.unwrap();
+		assert_eq!(appended, 1);
+
+		let info = manager
+			.seal_secondary_index_active_buffer(tenant(), &descriptor)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(info.source_slab_id, active_slab_id);
+		assert_eq!(info.entry_count, 1);
+		let loaded = manager
+			.load_secondary_index_segment(&info)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(loaded.entries.len(), 1);
+		assert_eq!(loaded.entries[0].row_hlc, row_hlc);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![active_slab_id]);
+		assert!(coverage.active_buffer.is_none());
+	}
+
+	#[tokio::test]
+	async fn secondary_index_backfill_source_slab_emits_every_retained_data_version() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		let row_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(42), hlc(10)).await;
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(43), hlc(20)).await,
+			row_identity
+		);
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, None, hlc(30)).await,
+			row_identity
+		);
+		let source_slab_id = force_seal_active(&manager).await;
+		let plan = manager
+			.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+			.await
+			.unwrap();
+		assert_eq!(
+			plan.candidates,
+			vec![SecondaryIndexBackfillCandidate {
+				key: SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+					tenant(),
+					&descriptor,
+				)),
+				source_slab_id,
+			}]
+		);
+
+		let info = manager
+			.backfill_secondary_index_candidate(tenant(), &table, &descriptor, &plan.candidates[0])
+			.await
+			.unwrap();
+		assert_eq!(info.source_slab_id, source_slab_id);
+		assert_eq!(info.entry_count, 2);
+		let segment = manager
+			.load_secondary_index_segment(&info)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries.len(), 2);
+		assert_eq!(segment.entries[0].row_key_id, row_identity);
+		assert_eq!(segment.entries[1].row_key_id, row_identity);
+		assert_eq!(segment.entries[0].row_hlc, hlc(10));
+		assert_eq!(segment.entries[1].row_hlc, hlc(20));
+		assert_eq!(
+			segment.entries[0].encoded_key,
+			((42_i64 as u64) ^ 0x8000_0000_0000_0000)
+				.to_be_bytes()
+				.to_vec()
+		);
+		assert_eq!(
+			segment.entries[1].encoded_key,
+			((43_i64 as u64) ^ 0x8000_0000_0000_0000)
+				.to_be_bytes()
+				.to_vec()
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![source_slab_id]);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_backfill_tick_respects_limit_and_reports_completion() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+
+		append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+		let first = force_seal_active(&manager).await;
+		append_secondary_index_table_row_for_test(&manager, &table, 2, Some(20), hlc(20)).await;
+		let second = force_seal_active(&manager).await;
+
+		let first_tick = manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 1, 4096)
+			.await
+			.unwrap();
+		assert_eq!(first_tick.before.candidates.len(), 2);
+		assert_eq!(first_tick.attempted, 1);
+		assert_eq!(first_tick.completed.len(), 1);
+		assert!(first_tick.failures.is_empty());
+		assert!(!first_tick.historical_complete);
+		assert_eq!(first_tick.completed[0].candidate.source_slab_id, first);
+
+		let second_tick = manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+		assert_eq!(second_tick.before.candidates.len(), 1);
+		assert_eq!(second_tick.attempted, 1);
+		assert_eq!(second_tick.completed.len(), 1);
+		assert!(second_tick.failures.is_empty());
+		assert_eq!(second_tick.completed[0].candidate.source_slab_id, second);
+		assert!(second_tick.historical_complete);
+
+		let listed = manager.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		);
+		assert_eq!(listed.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_compaction_rebuilds_building_sidecar_and_heals_uncovered_slab() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		let row_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(20), hlc(20)).await,
+			row_identity
+		);
+		let old_slab_id = force_seal_active(&manager).await;
+
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), table.clone()).unwrap();
+		let lifecycle = TableLifecycleCatalog::default();
+		let mut secondary_indexes = SecondaryIndexCatalog::default();
+		secondary_indexes
+			.create(tenant(), descriptor.clone(), &schemas)
+			.unwrap();
+		let coverage_key = SecondaryIndexCoverageKey::from(
+			SecondaryIndexIdentity::from_descriptor(tenant(), &descriptor),
+		);
+		manager.mark_secondary_index_backfill_uncovered(
+			coverage_key,
+			old_slab_id,
+			SecondaryIndexBackfillError::new(
+				SecondaryIndexBackfillErrorReason::CompactionRace,
+				"source slab compacted before backfill completed",
+			),
+		);
+
+		let report = manager
+			.prune_versions_for_retention(
+				MvccRetentionPolicy::FixedWindow(Duration::from_millis(60_000)),
+				&lifecycle,
+				&schemas,
+				&secondary_indexes,
+				60_025,
+				1,
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(report.compacted_slabs, 1);
+		assert_eq!(report.pruned_versions, 1);
+		let listed = manager.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		);
+		assert_eq!(listed.len(), 1);
+		let info = &listed[0];
+		assert_ne!(info.source_slab_id, old_slab_id);
+		assert_eq!(info.entry_count, 1);
+		let segment = manager
+			.load_secondary_index_segment(info)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries.len(), 1);
+		assert_eq!(segment.entries[0].row_key_id, row_identity);
+		assert_eq!(segment.entries[0].row_hlc, hlc(20));
+		assert_eq!(
+			segment.entries[0].encoded_key,
+			secondary_index_encoded_i64_for_test(20)
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(coverage_key)
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![info.source_slab_id]);
+		assert!(coverage.uncovered_slabs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn secondary_index_lookup_point_equal_revalidates_sidecar_candidate() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		let first_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+		append_secondary_index_table_row_for_test(&manager, &table, 2, Some(20), hlc(20)).await;
+		force_seal_active(&manager).await;
+		manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+
+		let request = TableLookupByIndexRequest::from_descriptor(
+			tenant(),
+			&descriptor,
+			IndexQuery::PointEqual {
+				encoded_key: secondary_index_encoded_i64_for_test(10),
+			},
+			hlc(99),
+		);
+		let report = manager
+			.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+			.await
+			.unwrap();
+		assert_eq!(report.rows.len(), 1);
+		assert_eq!(report.rows[0].row_key_id, first_identity);
+		assert_eq!(report.rows[0].row_hlc, hlc(10));
+		assert_eq!(report.stats.scanned_segments, 1);
+		assert_eq!(report.stats.candidate_count, 1);
+		assert_eq!(report.stats.visible_count, 1);
+		assert_eq!(report.stats.superseded_count, 0);
+
+		let err = manager
+			.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Building)
+			.await
+			.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains(INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH)
+		);
+	}
+
+	#[tokio::test]
+	async fn secondary_index_lookup_rejects_superseded_candidate_but_honors_as_of() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		let row_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		force_seal_active(&manager).await;
+		manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(20), hlc(20)).await,
+			row_identity
+		);
+
+		let historical_request = TableLookupByIndexRequest::from_descriptor(
+			tenant(),
+			&descriptor,
+			IndexQuery::PointEqual {
+				encoded_key: secondary_index_encoded_i64_for_test(10),
+			},
+			hlc(15),
+		);
+		let historical = manager
+			.table_lookup_by_index(&historical_request, &descriptor, SecondaryIndexState::Ready)
+			.await
+			.unwrap();
+		assert_eq!(historical.rows.len(), 1);
+		assert_eq!(historical.rows[0].row_key_id, row_identity);
+		assert_eq!(historical.stats.visible_count, 1);
+
+		let current_request = TableLookupByIndexRequest::from_descriptor(
+			tenant(),
+			&descriptor,
+			IndexQuery::PointEqual {
+				encoded_key: secondary_index_encoded_i64_for_test(10),
+			},
+			hlc(25),
+		);
+		let current = manager
+			.table_lookup_by_index(&current_request, &descriptor, SecondaryIndexState::Ready)
+			.await
+			.unwrap();
+		assert!(current.rows.is_empty());
+		assert_eq!(current.stats.candidate_count, 1);
+		assert_eq!(current.stats.visible_count, 0);
+		assert_eq!(current.stats.superseded_count, 1);
 	}
 
 	#[tokio::test]
@@ -7648,6 +9897,7 @@ mod tests {
 				MvccRetentionPolicy::Disabled,
 				&lifecycle,
 				&schemas,
+				&SecondaryIndexCatalog::default(),
 				100_000,
 				1,
 			)
@@ -7703,6 +9953,7 @@ mod tests {
 				MvccRetentionPolicy::Disabled,
 				&lifecycle,
 				&schemas,
+				&SecondaryIndexCatalog::default(),
 				100_000,
 				1,
 			)
@@ -7757,6 +10008,7 @@ mod tests {
 				MvccRetentionPolicy::Disabled,
 				&lifecycle,
 				&schemas,
+				&SecondaryIndexCatalog::default(),
 				100_000,
 				1,
 			)
@@ -7812,6 +10064,7 @@ mod tests {
 				MvccRetentionPolicy::FixedWindow(Duration::from_millis(60_000)),
 				&lifecycle,
 				&schemas,
+				&SecondaryIndexCatalog::default(),
 				100_000,
 				1,
 			)

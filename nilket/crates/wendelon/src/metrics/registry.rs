@@ -1,4 +1,6 @@
-use crate::schema::{RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus};
+use crate::schema::{
+	IndexObjectId, RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,6 +234,299 @@ impl TableRetentionActiveTableGauges {
 		render_gauge_with_labels(out, name, &[("mode", "inherit")], self.inherit.get());
 		render_gauge_with_labels(out, name, &[("mode", "disabled")], self.disabled.get());
 		render_gauge_with_labels(out, name, &[("mode", "fixed")], self.fixed.get());
+	}
+}
+
+#[derive(Default)]
+struct SecondaryIndexCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
+
+impl SecondaryIndexCounters {
+	fn add(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		value: u64,
+	) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("secondary-index counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("secondary-index counter mutex poisoned");
+		for ((tenant, table, index), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct SecondaryIndexReasonCounters(Mutex<BTreeMap<(u64, String, String, String), u64>>);
+
+impl SecondaryIndexReasonCounters {
+	fn add(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		reason: &str,
+		value: u64,
+	) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("secondary-index reason counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+				reason.to_string(),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("secondary-index reason counter mutex poisoned");
+		for ((tenant, table, index, reason), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+					("reason", reason.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct SecondaryIndexModeCounters(Mutex<BTreeMap<(u64, String, String, String), u64>>);
+
+impl SecondaryIndexModeCounters {
+	fn add(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		mode: &str,
+		value: u64,
+	) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("secondary-index mode counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+				mode.to_string(),
+			))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("secondary-index mode counter mutex poisoned");
+		for ((tenant, table, index, mode), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+					("mode", mode.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct SecondaryIndexTransitionCounters(
+	Mutex<BTreeMap<(u64, String, String, String, String), u64>>,
+);
+
+impl SecondaryIndexTransitionCounters {
+	fn add(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		from: &str,
+		to: &str,
+	) {
+		let mut counters = self
+			.0
+			.lock()
+			.expect("secondary-index transition counter mutex poisoned");
+		*counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+				from.to_string(),
+				to.to_string(),
+			))
+			.or_insert(0) += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("secondary-index transition counter mutex poisoned");
+		for ((tenant, table, index, from, to), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+					("from", from.as_str()),
+					("to", to.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct SecondaryIndexGauges(Mutex<BTreeMap<(u64, String, String), u64>>);
+
+impl SecondaryIndexGauges {
+	fn set(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		value: u64,
+	) {
+		let mut gauges = self.0.lock().expect("secondary-index gauge mutex poisoned");
+		gauges.insert(
+			(
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+			),
+			value,
+		);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_gauge_family_header(out, name, help);
+		let gauges = self.0.lock().expect("secondary-index gauge mutex poisoned");
+		for ((tenant, table, index), value) in gauges.iter() {
+			render_gauge_with_labels(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+				],
+				*value,
+			);
+		}
+	}
+}
+
+struct SecondaryIndexDurationHistograms(Mutex<BTreeMap<(u64, String, String), Histogram>>);
+
+impl Default for SecondaryIndexDurationHistograms {
+	fn default() -> Self {
+		Self(Mutex::new(BTreeMap::new()))
+	}
+}
+
+impl SecondaryIndexDurationHistograms {
+	fn observe(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		duration: Duration,
+	) {
+		let mut histograms = self
+			.0
+			.lock()
+			.expect("secondary-index duration histogram mutex poisoned");
+		histograms
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+			))
+			.or_insert_with(|| Histogram::new(PBC_EXEC_BUCKETS_MICROS))
+			.observe_duration(duration);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		let histograms = self
+			.0
+			.lock()
+			.expect("secondary-index duration histogram mutex poisoned");
+		render_histogram_family_header(out, name, help);
+		for ((tenant, table, index), histogram) in histograms.iter() {
+			render_histogram_series(
+				out,
+				name,
+				&[
+					("tenant", &tenant.to_string()),
+					("table", table.as_str()),
+					("index", index.as_str()),
+				],
+				&histogram.snapshot(),
+			);
+		}
 	}
 }
 
@@ -1387,6 +1682,24 @@ pub struct MetricsRegistry {
 	pub storage_table_retention_ambiguous_rows_retained_total: Counter,
 	pub storage_table_retention_lag_seconds: Gauge,
 	storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges,
+	storage_secondary_index_create: SecondaryIndexCounters,
+	storage_secondary_index_drop: SecondaryIndexCounters,
+	storage_secondary_index_lifecycle_transitions: SecondaryIndexTransitionCounters,
+	storage_secondary_index_segments_built: SecondaryIndexCounters,
+	storage_secondary_index_segments_failed: SecondaryIndexReasonCounters,
+	storage_secondary_index_entries_indexed: SecondaryIndexCounters,
+	storage_secondary_index_active_buffer_failures: SecondaryIndexReasonCounters,
+	storage_secondary_index_query_plans: SecondaryIndexModeCounters,
+	storage_secondary_index_candidate_rows: SecondaryIndexCounters,
+	storage_secondary_index_visible: SecondaryIndexCounters,
+	storage_secondary_index_superseded: SecondaryIndexCounters,
+	storage_secondary_index_stale_indexed_value: SecondaryIndexCounters,
+	storage_secondary_index_uncovered_slabs: SecondaryIndexGauges,
+	storage_secondary_index_backfill_seconds: SecondaryIndexDurationHistograms,
+	storage_secondary_index_segment_state_digest_mismatch: SecondaryIndexCounters,
+	storage_secondary_index_logical_fingerprint_mismatch: SecondaryIndexCounters,
+	storage_secondary_index_corruption_failures: SecondaryIndexCounters,
+	storage_secondary_index_drop_gc_seconds: SecondaryIndexDurationHistograms,
 	storage_compression_records_written: CompressionCodecCounters,
 	storage_compression_plaintext_bytes: CompressionCodecCounters,
 	storage_compression_encoded_bytes: CompressionCodecCounters,
@@ -1591,6 +1904,26 @@ impl Default for MetricsRegistry {
 			storage_table_retention_lag_seconds: Gauge::default(),
 			storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges::default(
 			),
+			storage_secondary_index_create: SecondaryIndexCounters::default(),
+			storage_secondary_index_drop: SecondaryIndexCounters::default(),
+			storage_secondary_index_lifecycle_transitions:
+				SecondaryIndexTransitionCounters::default(),
+			storage_secondary_index_segments_built: SecondaryIndexCounters::default(),
+			storage_secondary_index_segments_failed: SecondaryIndexReasonCounters::default(),
+			storage_secondary_index_entries_indexed: SecondaryIndexCounters::default(),
+			storage_secondary_index_active_buffer_failures: SecondaryIndexReasonCounters::default(),
+			storage_secondary_index_query_plans: SecondaryIndexModeCounters::default(),
+			storage_secondary_index_candidate_rows: SecondaryIndexCounters::default(),
+			storage_secondary_index_visible: SecondaryIndexCounters::default(),
+			storage_secondary_index_superseded: SecondaryIndexCounters::default(),
+			storage_secondary_index_stale_indexed_value: SecondaryIndexCounters::default(),
+			storage_secondary_index_uncovered_slabs: SecondaryIndexGauges::default(),
+			storage_secondary_index_backfill_seconds: SecondaryIndexDurationHistograms::default(),
+			storage_secondary_index_segment_state_digest_mismatch: SecondaryIndexCounters::default(
+			),
+			storage_secondary_index_logical_fingerprint_mismatch: SecondaryIndexCounters::default(),
+			storage_secondary_index_corruption_failures: SecondaryIndexCounters::default(),
+			storage_secondary_index_drop_gc_seconds: SecondaryIndexDurationHistograms::default(),
 			storage_compression_records_written: CompressionCodecCounters::default(),
 			storage_compression_plaintext_bytes: CompressionCodecCounters::default(),
 			storage_compression_encoded_bytes: CompressionCodecCounters::default(),
@@ -2134,6 +2467,242 @@ impl MetricsRegistry {
 	) {
 		self.storage_table_retention_policy_active_tables
 			.set(inherit, disabled, fixed);
+	}
+
+	pub fn observe_storage_secondary_index_create(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_create
+			.add(tenant_id, table_object_id, index_object_id, 1);
+		self.storage_secondary_index_lifecycle_transitions.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			"absent",
+			"building",
+		);
+	}
+
+	pub fn observe_storage_secondary_index_drop(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		from: &str,
+	) {
+		self.storage_secondary_index_drop
+			.add(tenant_id, table_object_id, index_object_id, 1);
+		self.storage_secondary_index_lifecycle_transitions.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			from,
+			"dropping",
+		);
+	}
+
+	pub fn observe_storage_secondary_index_lifecycle_transition(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		from: &str,
+		to: &str,
+	) {
+		self.storage_secondary_index_lifecycle_transitions.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			from,
+			to,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_segment_built(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		entries: u64,
+	) {
+		self.storage_secondary_index_segments_built.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			1,
+		);
+		self.storage_secondary_index_entries_indexed.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			entries,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_segment_failed(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		reason: &str,
+	) {
+		self.storage_secondary_index_segments_failed.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			reason,
+			1,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_active_buffer_failure(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		reason: &str,
+	) {
+		self.storage_secondary_index_active_buffer_failures.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			reason,
+			1,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_query_plan(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		mode: &str,
+	) {
+		self.storage_secondary_index_query_plans.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			mode,
+			1,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_lookup(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		candidates: u64,
+		visible: u64,
+		superseded: u64,
+		stale_indexed_value: u64,
+	) {
+		self.storage_secondary_index_candidate_rows.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			candidates,
+		);
+		self.storage_secondary_index_visible.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			visible,
+		);
+		self.storage_secondary_index_superseded.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			superseded,
+		);
+		self.storage_secondary_index_stale_indexed_value.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			stale_indexed_value,
+		);
+	}
+
+	pub fn set_storage_secondary_index_uncovered_slabs(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		uncovered: u64,
+	) {
+		self.storage_secondary_index_uncovered_slabs.set(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			uncovered,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_backfill_seconds(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		duration: Duration,
+	) {
+		self.storage_secondary_index_backfill_seconds.observe(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			duration,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_segment_state_digest_mismatch(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_segment_state_digest_mismatch
+			.add(tenant_id, table_object_id, index_object_id, 1);
+	}
+
+	pub fn observe_storage_secondary_index_logical_fingerprint_mismatch(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_logical_fingerprint_mismatch
+			.add(tenant_id, table_object_id, index_object_id, 1);
+	}
+
+	pub fn observe_storage_secondary_index_corruption_failure(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_corruption_failures.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			1,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_drop_gc_seconds(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		duration: Duration,
+	) {
+		self.storage_secondary_index_drop_gc_seconds.observe(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			duration,
+		);
 	}
 
 	pub fn observe_storage_l2_column_fetch_plan(&self, duration: Duration) {
@@ -3036,6 +3605,98 @@ impl MetricsRegistry {
 			"wendelon_storage_table_retention_policy_active_tables_total",
 			"Current table lifecycle catalog entries by retention mode.",
 		);
+		self.storage_secondary_index_create.render(
+			&mut out,
+			"wendelon_storage_secondary_index_create_total",
+			"Secondary indexes accepted through the replicated catalog create path.",
+		);
+		self.storage_secondary_index_drop.render(
+			&mut out,
+			"wendelon_storage_secondary_index_drop_total",
+			"Secondary indexes accepted through the replicated catalog drop path.",
+		);
+		self.storage_secondary_index_lifecycle_transitions.render(
+			&mut out,
+			"wendelon_storage_secondary_index_lifecycle_transitions_total",
+			"Secondary index catalog lifecycle transitions.",
+		);
+		self.storage_secondary_index_segments_built.render(
+			&mut out,
+			"wendelon_storage_secondary_index_segments_built_total",
+			"Secondary index sidecar segments successfully built.",
+		);
+		self.storage_secondary_index_segments_failed.render(
+			&mut out,
+			"wendelon_storage_secondary_index_segments_failed_total",
+			"Secondary index sidecar segment build or persistence failures.",
+		);
+		self.storage_secondary_index_entries_indexed.render(
+			&mut out,
+			"wendelon_storage_secondary_index_entries_indexed_total",
+			"Secondary index entries emitted into sidecar segments.",
+		);
+		self.storage_secondary_index_active_buffer_failures.render(
+			&mut out,
+			"wendelon_storage_secondary_index_active_buffer_failures_total",
+			"Secondary index active-buffer admission failures by reason.",
+		);
+		self.storage_secondary_index_query_plans.render(
+			&mut out,
+			"wendelon_storage_secondary_index_query_plans_total",
+			"Table query plans by secondary-index planner mode.",
+		);
+		self.storage_secondary_index_candidate_rows.render(
+			&mut out,
+			"wendelon_storage_secondary_index_candidate_rows_total",
+			"Secondary-index candidate rows before MVCC and predicate revalidation.",
+		);
+		self.storage_secondary_index_visible.render(
+			&mut out,
+			"wendelon_storage_secondary_index_visible_total",
+			"Secondary-index candidate rows accepted after revalidation.",
+		);
+		self.storage_secondary_index_superseded.render(
+			&mut out,
+			"wendelon_storage_secondary_index_superseded_total",
+			"Secondary-index candidate rows rejected because a newer visible version or tombstone superseded them.",
+		);
+		self.storage_secondary_index_stale_indexed_value.render(
+			&mut out,
+			"wendelon_storage_secondary_index_stale_indexed_value_total",
+			"Secondary-index candidate rows rejected because the indexed column value no longer matches.",
+		);
+		self.storage_secondary_index_uncovered_slabs.render(
+			&mut out,
+			"wendelon_storage_secondary_index_uncovered_slabs_total",
+			"Current uncovered source slabs per local secondary-index coverage tracker.",
+		);
+		self.storage_secondary_index_backfill_seconds.render(
+			&mut out,
+			"wendelon_storage_secondary_index_backfill_seconds",
+			"Duration of local secondary-index backfill work.",
+		);
+		self.storage_secondary_index_segment_state_digest_mismatch
+			.render(
+				&mut out,
+				"wendelon_storage_secondary_index_segment_state_digest_mismatch_total",
+				"Secondary-index sidecar segment state-digest validation failures.",
+			);
+		self.storage_secondary_index_logical_fingerprint_mismatch
+			.render(
+				&mut out,
+				"wendelon_storage_secondary_index_logical_fingerprint_mismatch_total",
+				"Secondary-index descriptor or sidecar logical-fingerprint mismatches.",
+			);
+		self.storage_secondary_index_corruption_failures.render(
+			&mut out,
+			"wendelon_storage_secondary_index_corruption_failures_total",
+			"Secondary-index sidecar corruption failures that force planner fallback.",
+		);
+		self.storage_secondary_index_drop_gc_seconds.render(
+			&mut out,
+			"wendelon_storage_secondary_index_drop_gc_seconds",
+			"Duration of local secondary-index drop-GC cleanup work.",
+		);
 		let compression_records_written_total =
 			namespaced_metric("storage_compression_records_written_total");
 		self.storage_compression_records_written.render(
@@ -3331,6 +3992,11 @@ fn render_gauge_family_header(out: &mut String, name: &str, help: &str) {
 	let _ = writeln!(out, "# TYPE {name} gauge");
 }
 
+fn render_histogram_family_header(out: &mut String, name: &str, help: &str) {
+	let _ = writeln!(out, "# HELP {name} {help}");
+	let _ = writeln!(out, "# TYPE {name} histogram");
+}
+
 fn render_counter_with_labels(out: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
 	let _ = writeln!(out, "{name}{{{}}} {value}", render_labels(labels));
 }
@@ -3504,6 +4170,14 @@ fn table_object_id_label(table_object_id: TableObjectId) -> String {
 	rendered
 }
 
+fn index_object_id_label(index_object_id: IndexObjectId) -> String {
+	let mut rendered = String::with_capacity(32);
+	for byte in index_object_id.as_bytes() {
+		let _ = write!(rendered, "{byte:02x}");
+	}
+	rendered
+}
+
 fn render_ratio_milli(value_milli: u64) -> String {
 	let whole = value_milli / 1000;
 	let fractional_milli = value_milli % 1000;
@@ -3550,7 +4224,7 @@ mod tests {
 		PendingFinalizationReplayPath, TableRetentionMetricPolicy, render_histogram,
 		table_object_id_label,
 	};
-	use crate::schema::{TableObjectId, TenantId, WriteStatus};
+	use crate::schema::{IndexObjectId, TableObjectId, TenantId, WriteStatus};
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
@@ -3753,6 +4427,81 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{}{{mode=\"fixed\"}} 13",
 			namespaced_test_metric("storage_table_retention_policy_active_tables_total")
+		)));
+	}
+
+	#[test]
+	fn registry_renders_secondary_index_metric_values() {
+		let registry = MetricsRegistry::default();
+		let tenant = TenantId::new(52);
+		let table = TableObjectId::new([0x52; 16]);
+		let index = IndexObjectId::new([0x9a; 16]);
+
+		registry.observe_storage_secondary_index_create(tenant, table, index);
+		registry.observe_storage_secondary_index_drop(tenant, table, index, "ready");
+		registry.observe_storage_secondary_index_lifecycle_transition(
+			tenant, table, index, "building", "ready",
+		);
+		registry.observe_storage_secondary_index_segment_built(tenant, table, index, 7);
+		registry.observe_storage_secondary_index_segment_failed(
+			tenant,
+			table,
+			index,
+			"persist_failure",
+		);
+		registry.observe_storage_secondary_index_active_buffer_failure(
+			tenant,
+			table,
+			index,
+			"active_buffer_overflow",
+		);
+		registry.observe_storage_secondary_index_query_plan(tenant, table, index, "indexed");
+		registry.observe_storage_secondary_index_lookup(tenant, table, index, 11, 5, 3, 2);
+		registry.set_storage_secondary_index_uncovered_slabs(tenant, table, index, 4);
+		registry.observe_storage_secondary_index_backfill_seconds(
+			tenant,
+			table,
+			index,
+			Duration::from_millis(9),
+		);
+		registry
+			.observe_storage_secondary_index_segment_state_digest_mismatch(tenant, table, index);
+		registry.observe_storage_secondary_index_logical_fingerprint_mismatch(tenant, table, index);
+		registry.observe_storage_secondary_index_corruption_failure(tenant, table, index);
+		registry.observe_storage_secondary_index_drop_gc_seconds(
+			tenant,
+			table,
+			index,
+			Duration::from_millis(7),
+		);
+
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains(&namespaced_test_metric(
+			"storage_secondary_index_create_total"
+		)));
+		assert!(rendered.contains("from=\"building\",to=\"ready\""));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 7",
+			namespaced_test_metric("storage_secondary_index_entries_indexed_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\",reason=\"active_buffer_overflow\"}} 1",
+			namespaced_test_metric("storage_secondary_index_active_buffer_failures_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\",mode=\"indexed\"}} 1",
+			namespaced_test_metric("storage_secondary_index_query_plans_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 4",
+			namespaced_test_metric("storage_secondary_index_uncovered_slabs_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 0.009",
+			namespaced_test_metric("storage_secondary_index_backfill_seconds")
+		)));
+		assert!(rendered.contains(&namespaced_test_metric(
+			"storage_secondary_index_drop_gc_seconds"
 		)));
 	}
 

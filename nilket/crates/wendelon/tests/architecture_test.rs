@@ -851,13 +851,16 @@ fn test_adr046_state_digest_substrate_boundaries() {
 			let Ok(content) = fs::read_to_string(path) else {
 				return;
 			};
+			let relative = path.strip_prefix(manifest_dir).unwrap_or(path);
 			if content.contains("curve25519_dalek") {
 				violations.push(format!(
 					"{}: curve25519-dalek must stay out of network/storage hot paths",
 					path.display()
 				));
 			}
-			if content.contains("StateDigest") {
+			let adr052_sidecar_digest_surface =
+				relative == Path::new("src/storage/secondary_index_segment.rs");
+			if content.contains("StateDigest") && !adr052_sidecar_digest_surface {
 				violations.push(format!(
 					"{}: StateDigest must not be imported into storage/network durable or \
 					 protocol surfaces in ADR 046",
@@ -1633,6 +1636,201 @@ fn prometheus_metric_names(rendered: &str) -> Vec<&str> {
 	names.sort_unstable();
 	names.dedup();
 	names
+}
+
+#[test]
+fn test_adr052_secondary_index_architecture_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let state_digest = fs::read_to_string(manifest_dir.join("src/hash/state_digest.rs")).unwrap();
+	if !state_digest.contains("DOMAIN_SECONDARY_INDEX_ENTRY")
+		|| !state_digest.contains("digest.secondary_index.entry.v1")
+	{
+		violations.push(
+			"src/hash/state_digest.rs: ADR 052 secondary-index entry digest domain is missing"
+				.to_string(),
+		);
+	}
+
+	let schema_source =
+		fs::read_to_string(manifest_dir.join("src/schema/secondary_index.rs")).unwrap();
+	for required in [
+		"INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH",
+		"INDEX_REJECT_UNSUPPORTED_COLUMN_TYPE",
+		"INDEX_REJECT_PK_COLUMN",
+		"INDEX_REJECT_SYNTHETIC_COLUMN",
+		"SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED",
+		"SCHEMA_UPDATE_REJECT_INDEX_OBJECT_ID_COLLISION",
+		"SCHEMA_UPDATE_REJECT_INDEX_NAME_COLLISION",
+		"SCHEMA_UPDATE_REJECT_INDEX_COLUMN_COLLISION",
+	] {
+		if !schema_source.contains(required) {
+			violations.push(format!(
+				"src/schema/secondary_index.rs: missing ADR 052 reject code {required}"
+			));
+		}
+	}
+
+	let scan_roots = ["src", "tests", "benches"];
+	for root in scan_roots {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| ext == "rs")
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in [
+				concat!("INDEX_REJECT_", "ALTER"),
+				concat!("INDEX_REJECT_", "NULL"),
+				concat!("SecondaryIndexDescriptor", "V1"),
+				concat!("SecondaryIndexEntry", "V1"),
+				concat!("SecondaryIndexCatalog", "V1"),
+				concat!("IndexLogical", "Fingerprint"),
+				concat!("digest.table.index.descriptor", ".logical.v1"),
+				concat!("Wendelon", "Index"),
+				concat!("wendelon", "_index_"),
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 052 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+		});
+	}
+
+	let secondary_index_sources = [
+		"src/schema/secondary_index.rs",
+		"src/storage/secondary_index.rs",
+		"src/storage/secondary_index_segment.rs",
+	];
+	for relative in secondary_index_sources {
+		let content = fs::read_to_string(manifest_dir.join(relative)).unwrap();
+		if content.contains("PhysicalDescriptorFingerprint") {
+			violations.push(format!(
+				"{relative}: ADR 052 index entries must not bind to the physical descriptor fingerprint"
+			));
+		}
+	}
+
+	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !manifest.contains("name = \"secondary_index\"") {
+		violations.push("Cargo.toml: ADR 052 secondary_index benchmark is missing".to_string());
+	}
+	let bench_source = fs::read_to_string(manifest_dir.join("benches/secondary_index.rs")).unwrap();
+	if !bench_source.contains("--full") || !bench_source.contains("1_000_000") {
+		violations.push(
+			"benches/secondary_index.rs: ADR 052 promotion-gate row-count mode is missing"
+				.to_string(),
+		);
+	}
+
+	let runbook_path = manifest_dir.join("plans/ops/runbooks/secondary_indexes.md");
+	if !runbook_path.exists() {
+		violations.push(
+			"plans/ops/runbooks/secondary_indexes.md: ADR 052 operator runbook is missing"
+				.to_string(),
+		);
+	} else {
+		let runbook = fs::read_to_string(&runbook_path).unwrap();
+		for required in [
+			"wendelon_storage_secondary_index_uncovered_slabs_total",
+			"wendelon_storage_secondary_index_corruption_failures_total",
+			"secondary_index.catalog_updated",
+			"IndexDropGcComplete",
+			"SCHEMA_UPDATE_REJECT_INDEX_NAME_COLLISION",
+			"max_index_buffer_bytes",
+			"active_buffer_overflow",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/secondary_indexes.md: missing ADR 052 runbook token {required}"
+				));
+			}
+		}
+	}
+
+	let runbook_catalog =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_catalog.contains("secondary_indexes.md") {
+		violations
+			.push("plans/ops/runbooks/README.md: ADR 052 runbook is not cataloged".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"wendelon_storage_secondary_index_segments_built_total",
+		"wendelon_storage_secondary_index_segments_failed_total",
+		"wendelon_storage_secondary_index_query_plans_total",
+		"wendelon_storage_secondary_index_drop_gc_seconds",
+	] {
+		if !metrics_source.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 052 metric {required}"
+			));
+		}
+	}
+
+	let manager_source = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	for required in [
+		"gc_secondary_index_segments_for_dropping_index",
+		"CorruptSegment",
+		"forget_slab",
+		"observe_storage_secondary_index_corruption_failure",
+		"source_slab_lease",
+		"acquire_secondary_index_source_slab_read_lease",
+	] {
+		if !manager_source.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 052 manager surface {required}"
+			));
+		}
+	}
+
+	let audit_source = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	for required in [
+		"SecondaryIndexCatalogUpdated",
+		"secondary_index.catalog_updated",
+		"SecondaryIndexCatalogUpdate",
+		"target_index_object_id",
+	] {
+		if !audit_source.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 052 audit surface {required}"
+			));
+		}
+	}
+
+	let metrics_smoke = fs::read_to_string(manifest_dir.join("tests/metrics_smoke.rs")).unwrap();
+	if !metrics_smoke.contains("wendelon_storage_secondary_index_drop_gc_seconds") {
+		violations
+			.push("tests/metrics_smoke.rs: ADR 052 metrics smoke coverage is missing".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 052 secondary-index invariants violated:\n{}",
+		violations.join("\n")
+	);
 }
 
 fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {
