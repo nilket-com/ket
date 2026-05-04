@@ -40,6 +40,7 @@
 //! without forcing callers to hand-roll redirect logic.
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
+use crate::metrics::NetworkCompressionPath;
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
@@ -60,13 +61,12 @@ use crate::schema::{
 };
 use arrow::array::{Array, FixedSizeBinaryBuilder, LargeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
-use std::io::{Cursor, Error, ErrorKind};
+use std::io::{Error, ErrorKind};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// Maximum number of client attempts for a single logical data
@@ -1664,33 +1664,36 @@ fn decode_read_response_frame(
 }
 
 fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
-	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {e}")))?;
-	match reader.next() {
-		Some(Ok(batch)) => Ok(batch),
-		Some(Err(e)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {e}"),
-		)),
-		None => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained no record batch",
-		)),
-	}
+	crate::network::ipc::wire_decode_batch(bytes)
 }
 
 fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
 	let mut buf = Vec::new();
+	let started = Instant::now();
+	let options = crate::network::ipc::wire_ipc_write_options().map_err(|err| {
+		crate::network::ipc::observe_wire_encode_error(NetworkCompressionPath::ClientBatch);
+		err
+	})?;
 	{
-		let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream init: {e}")))?;
-		writer
-			.write(batch)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream write: {e}")))?;
-		writer
-			.finish()
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow stream finish: {e}")))?;
+		let mut writer = StreamWriter::try_new_with_options(&mut buf, &batch.schema(), options)
+			.map_err(|e| {
+				crate::network::ipc::observe_wire_encode_error(NetworkCompressionPath::ClientBatch);
+				Error::new(ErrorKind::InvalidData, format!("arrow stream init: {e}"))
+			})?;
+		writer.write(batch).map_err(|e| {
+			crate::network::ipc::observe_wire_encode_error(NetworkCompressionPath::ClientBatch);
+			Error::new(ErrorKind::InvalidData, format!("arrow stream write: {e}"))
+		})?;
+		writer.finish().map_err(|e| {
+			crate::network::ipc::observe_wire_encode_error(NetworkCompressionPath::ClientBatch);
+			Error::new(ErrorKind::InvalidData, format!("arrow stream finish: {e}"))
+		})?;
 	}
+	crate::network::ipc::observe_wire_encode_success(
+		NetworkCompressionPath::ClientBatch,
+		buf.len() as u64,
+		started.elapsed(),
+	);
 	Ok(buf)
 }
 

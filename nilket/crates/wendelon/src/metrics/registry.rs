@@ -130,6 +130,40 @@ impl TableRetentionMetricPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkCompressionPath {
+	ClientBatch,
+	MigrationRecords,
+	QueryResponse,
+	ReadResponse,
+}
+
+impl NetworkCompressionPath {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::ClientBatch => "client_batch",
+			Self::MigrationRecords => "migration_records",
+			Self::QueryResponse => "query_response",
+			Self::ReadResponse => "read_response",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkCompressionResult {
+	Compressed,
+	Error,
+}
+
+impl NetworkCompressionResult {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Compressed => "compressed",
+			Self::Error => "error",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TableRetentionRowKind {
 	Data,
 	Tombstone,
@@ -1021,6 +1055,153 @@ impl CompressionCodecHistograms {
 }
 
 #[derive(Default)]
+struct NetworkCompressionBatchCounters(
+	Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64>>,
+);
+
+impl NetworkCompressionBatchCounters {
+	fn inc(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		path: NetworkCompressionPath,
+		result: NetworkCompressionResult,
+	) {
+		let mut counters = self
+			.0
+			.lock()
+			.expect("network compression batch counter mutex poisoned");
+		*counters
+			.entry((codec.codec_label(), path.as_str(), result.as_str()))
+			.or_insert(0) += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("network compression batch counter mutex poisoned");
+		for ((codec, path, result), value) in counters.iter() {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("codec", *codec), ("path", *path), ("result", *result)],
+				*value,
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct NetworkCompressionCodecPathCounters(Mutex<BTreeMap<(&'static str, &'static str), u64>>);
+
+impl NetworkCompressionCodecPathCounters {
+	fn add(&self, codec: RecordBodyCompressionPolicy, path: NetworkCompressionPath, value: u64) {
+		if value == 0 {
+			return;
+		}
+		let mut counters = self
+			.0
+			.lock()
+			.expect("network compression codec/path counter mutex poisoned");
+		*counters
+			.entry((codec.codec_label(), path.as_str()))
+			.or_insert(0) += value;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let counters = self
+			.0
+			.lock()
+			.expect("network compression codec/path counter mutex poisoned");
+		for ((codec, path), value) in counters.iter() {
+			render_counter_with_labels(out, name, &[("codec", *codec), ("path", *path)], *value);
+		}
+	}
+}
+
+struct NetworkCompressionCodecPathHistograms {
+	bounds: &'static [u64],
+	histograms: Mutex<BTreeMap<(&'static str, &'static str), Histogram>>,
+}
+
+impl NetworkCompressionCodecPathHistograms {
+	fn new(bounds: &'static [u64]) -> Self {
+		Self {
+			bounds,
+			histograms: Mutex::new(BTreeMap::new()),
+		}
+	}
+
+	fn observe_duration(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		path: NetworkCompressionPath,
+		duration: Duration,
+	) {
+		let mut histograms = self
+			.histograms
+			.lock()
+			.expect("network compression codec/path histogram mutex poisoned");
+		histograms
+			.entry((codec.codec_label(), path.as_str()))
+			.or_insert_with(|| Histogram::new(self.bounds))
+			.observe_duration(duration);
+	}
+
+	fn observe_value(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		path: NetworkCompressionPath,
+		value: u64,
+	) {
+		let mut histograms = self
+			.histograms
+			.lock()
+			.expect("network compression codec/path histogram mutex poisoned");
+		histograms
+			.entry((codec.codec_label(), path.as_str()))
+			.or_insert_with(|| Histogram::new(self.bounds))
+			.observe_value(value);
+	}
+
+	fn render_micros(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		let histograms = self
+			.histograms
+			.lock()
+			.expect("network compression codec/path histogram mutex poisoned");
+		for ((codec, path), histogram) in histograms.iter() {
+			render_histogram_micros_series(
+				out,
+				name,
+				&[("codec", *codec), ("path", *path)],
+				&histogram.snapshot(),
+			);
+		}
+	}
+
+	fn render_ratio(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		let histograms = self
+			.histograms
+			.lock()
+			.expect("network compression codec/path histogram mutex poisoned");
+		for ((codec, path), histogram) in histograms.iter() {
+			render_histogram_ratio_series(
+				out,
+				name,
+				&[("codec", *codec), ("path", *path)],
+				&histogram.snapshot(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
 struct L2ColumnFetchFallbackCounters {
 	disabled: Counter,
 	single_row: Counter,
@@ -1710,6 +1891,11 @@ pub struct MetricsRegistry {
 	storage_compression_l2_record_body_bytes_fetched: CompressionCodecCounters,
 	storage_compression_ratio: CompressionCodecHistograms,
 	pub storage_compression_uncompressed_resident_bytes: Gauge,
+	network_compression_batches: NetworkCompressionBatchCounters,
+	network_compression_encoded_bytes: NetworkCompressionCodecPathCounters,
+	network_compression_encode_micros: NetworkCompressionCodecPathHistograms,
+	network_compression_ratio: NetworkCompressionCodecPathHistograms,
+	network_compression_decode_error: CompressionCodecCounters,
 
 	pub tenant_kek_cache_hits_total: Counter,
 	pub tenant_kek_cache_misses_total: Counter,
@@ -1940,6 +2126,15 @@ impl Default for MetricsRegistry {
 				COMPRESSION_RATIO_MILLI_BUCKETS,
 			),
 			storage_compression_uncompressed_resident_bytes: Gauge::default(),
+			network_compression_batches: NetworkCompressionBatchCounters::default(),
+			network_compression_encoded_bytes: NetworkCompressionCodecPathCounters::default(),
+			network_compression_encode_micros: NetworkCompressionCodecPathHistograms::new(
+				PBC_EXEC_BUCKETS_MICROS,
+			),
+			network_compression_ratio: NetworkCompressionCodecPathHistograms::new(
+				COMPRESSION_RATIO_MILLI_BUCKETS,
+			),
+			network_compression_decode_error: CompressionCodecCounters::default(),
 
 			tenant_kek_cache_hits_total: Counter::default(),
 			tenant_kek_cache_misses_total: Counter::default(),
@@ -2769,6 +2964,39 @@ impl MetricsRegistry {
 	pub fn set_storage_compression_uncompressed_resident_bytes(&self, bytes: u64) {
 		self.storage_compression_uncompressed_resident_bytes
 			.set(bytes);
+	}
+
+	pub fn observe_network_compression_encode(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		path: NetworkCompressionPath,
+		encoded_bytes: u64,
+		duration: Duration,
+		ratio_milli: Option<u64>,
+	) {
+		self.network_compression_batches
+			.inc(codec, path, NetworkCompressionResult::Compressed);
+		self.network_compression_encoded_bytes
+			.add(codec, path, encoded_bytes);
+		self.network_compression_encode_micros
+			.observe_duration(codec, path, duration);
+		if let Some(ratio_milli) = ratio_milli {
+			self.network_compression_ratio
+				.observe_value(codec, path, ratio_milli);
+		}
+	}
+
+	pub fn observe_network_compression_encode_error(
+		&self,
+		codec: RecordBodyCompressionPolicy,
+		path: NetworkCompressionPath,
+	) {
+		self.network_compression_batches
+			.inc(codec, path, NetworkCompressionResult::Error);
+	}
+
+	pub fn observe_network_compression_decode_error(&self, codec: RecordBodyCompressionPolicy) {
+		self.network_compression_decode_error.inc(codec);
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -3766,6 +3994,40 @@ impl MetricsRegistry {
 			"Resident uncompressed IPC bytes awaiting compression-policy convergence.",
 			self.storage_compression_uncompressed_resident_bytes.get(),
 		);
+		let network_compression_batches_total =
+			namespaced_metric("network_compression_batches_total");
+		self.network_compression_batches.render(
+			&mut out,
+			&network_compression_batches_total,
+			"Transport Arrow IPC batches encoded by codec, path, and result.",
+		);
+		let network_compression_encoded_bytes_total =
+			namespaced_metric("network_compression_encoded_bytes_total");
+		self.network_compression_encoded_bytes.render(
+			&mut out,
+			&network_compression_encoded_bytes_total,
+			"Transport Arrow IPC encoded body bytes emitted by codec and path.",
+		);
+		let network_compression_encode_micros =
+			namespaced_metric("network_compression_encode_micros");
+		self.network_compression_encode_micros.render_micros(
+			&mut out,
+			&network_compression_encode_micros,
+			"Transport Arrow IPC encode duration in microseconds by codec and path.",
+		);
+		let network_compression_ratio = namespaced_metric("network_compression_ratio");
+		self.network_compression_ratio.render_ratio(
+			&mut out,
+			&network_compression_ratio,
+			"Transport Arrow IPC encoded/plaintext byte ratio when available.",
+		);
+		let network_compression_decode_error_total =
+			namespaced_metric("network_compression_decode_error_total");
+		self.network_compression_decode_error.render(
+			&mut out,
+			&network_compression_decode_error_total,
+			"Transport Arrow IPC decode errors by compression codec.",
+		);
 		render_gauge(
 			&mut out,
 			"wendelon_storage_wal_blocking_queue_depth",
@@ -4220,9 +4482,9 @@ fn mask_selectivity(rows_scanned: u64, rows_returned: u64) -> f64 {
 #[cfg(test)]
 mod tests {
 	use super::{
-		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome, PbcRuntime,
-		PendingFinalizationReplayPath, TableRetentionMetricPolicy, render_histogram,
-		table_object_id_label,
+		Histogram, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
+		NetworkCompressionPath, PbcRuntime, PendingFinalizationReplayPath,
+		TableRetentionMetricPolicy, render_histogram, table_object_id_label,
 	};
 	use crate::schema::{IndexObjectId, TableObjectId, TenantId, WriteStatus};
 	use std::time::Duration;
@@ -4325,6 +4587,59 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{} 1234",
 			namespaced_test_metric("storage_compression_uncompressed_resident_bytes")
+		)));
+	}
+
+	#[test]
+	fn registry_renders_network_compression_metric_values() {
+		let registry = MetricsRegistry::default();
+		registry.observe_network_compression_encode(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+			NetworkCompressionPath::QueryResponse,
+			321,
+			Duration::from_micros(11),
+			Some(650),
+		);
+		registry.observe_network_compression_encode_error(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+			NetworkCompressionPath::ReadResponse,
+		);
+		registry.observe_network_compression_decode_error(
+			crate::schema::RecordBodyCompressionPolicy::Lz4Frame,
+		);
+
+		let rendered = registry.render_prometheus();
+		let batches = namespaced_test_metric("network_compression_batches_total");
+		assert!(rendered.contains(&format!(
+			"{batches}{{codec=\"lz4_frame\",path=\"query_response\",result=\"compressed\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"{batches}{{codec=\"lz4_frame\",path=\"read_response\",result=\"error\"}} 1"
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{codec=\"lz4_frame\",path=\"query_response\"}} 321",
+			namespaced_test_metric("network_compression_encoded_bytes_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{codec=\"lz4_frame\",path=\"query_response\"}} 11",
+			namespaced_test_metric("network_compression_encode_micros")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}_sum{{codec=\"lz4_frame\",path=\"query_response\"}} 0.65",
+			namespaced_test_metric("network_compression_ratio")
+		)));
+		let decode_errors = namespaced_test_metric("network_compression_decode_error_total");
+		assert!(rendered.contains(&format!("{decode_errors}{{codec=\"lz4_frame\"}} 1")));
+		assert!(!rendered.contains(concat!("network_compression_plain", "text_bytes_total")));
+		assert!(!rendered.contains(concat!("network_compression_decode", "_micros")));
+		assert!(!rendered.contains(concat!(
+			"network_compression_batches_total{codec=\"lz4_frame\",path=\"read_response\",result=\"",
+			"uncompressed_",
+			"passthrough\"}"
+		)));
+		assert!(!rendered.contains(concat!(
+			"network_compression_decode_error_total{codec=\"lz4_frame\",",
+			"reason="
 		)));
 	}
 

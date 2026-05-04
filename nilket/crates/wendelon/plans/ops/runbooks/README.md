@@ -33,6 +33,9 @@ Current runbooks:
 - [ADR 052 Secondary Indexes](./secondary_indexes.md)
   - secondary-index lifecycle, sidecar coverage, fail-closed fallback, and
     drop-GC triage
+- [ADR 053 Wire Arrow IPC Body Compression](./wire_arrow_ipc_body_compression.md)
+  - transport-side Arrow IPC LZ4 rollout, metrics, decode-error triage,
+    and frame-flag rejection interpretation
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

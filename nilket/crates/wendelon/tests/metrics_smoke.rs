@@ -301,6 +301,11 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_storage_secondary_index_logical_fingerprint_mismatch_total"));
 	assert!(body.contains("wendelon_storage_secondary_index_corruption_failures_total"));
 	assert!(body.contains("wendelon_storage_secondary_index_drop_gc_seconds"));
+	assert!(body.contains("wendelon_network_compression_batches_total"));
+	assert!(body.contains("wendelon_network_compression_encoded_bytes_total"));
+	assert!(body.contains("wendelon_network_compression_encode_micros"));
+	assert!(body.contains("wendelon_network_compression_ratio"));
+	assert!(body.contains("wendelon_network_compression_decode_error_total"));
 	assert!(body.contains("wendelon_storage_content_hash_admissions_total"));
 	assert!(body.contains("wendelon_storage_content_hash_duplicate_absorptions_total"));
 	assert!(body.contains("wendelon_storage_csb_merge_logical_fingerprint_mismatch_total"));

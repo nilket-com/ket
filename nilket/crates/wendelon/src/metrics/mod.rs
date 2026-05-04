@@ -4,6 +4,7 @@ mod registry;
 pub mod telemetry;
 
 pub use registry::{
-	Counter, Gauge, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome, PbcRuntime,
-	PendingFinalizationReplayPath, TableRetentionMetricPolicy, global,
+	Counter, Gauge, IoUringClass, MetricsRegistry, MigrationProxyReadOutcome,
+	NetworkCompressionPath, PbcRuntime, PendingFinalizationReplayPath, TableRetentionMetricPolicy,
+	global,
 };

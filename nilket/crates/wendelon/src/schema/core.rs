@@ -501,7 +501,7 @@ pub struct FrameHeader {
 	pub version: u8,
 	/// Message type discriminant (see MsgType)
 	pub msg_type: u8,
-	/// Bitfield: bit0=arrow_compressed, bit1=has_trailing
+	/// Bitfield of known HRFT frame flags; see [`FRAME_FLAG_KNOWN_MASK`].
 	pub flags: u16,
 	/// QUIC stream ID or TCP-mux logical stream
 	pub stream_id: u32,
@@ -518,6 +518,7 @@ pub struct FrameHeader {
 /// last `QUERY_RESP` frame so the client can stop without relying
 /// on transport EOF as a framing signal.
 pub const FRAME_FLAG_STREAM_END: u16 = 1 << 2;
+pub const FRAME_FLAG_KNOWN_MASK: u16 = FRAME_FLAG_STREAM_END;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 #[repr(C)]

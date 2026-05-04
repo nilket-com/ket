@@ -49,9 +49,15 @@ use crate::consensus::{
 	WendelonResponse, WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
-use crate::metrics::{MigrationProxyReadOutcome, PendingFinalizationReplayPath, global as metrics};
+use crate::metrics::{
+	MigrationProxyReadOutcome, NetworkCompressionPath, PendingFinalizationReplayPath,
+	global as metrics,
+};
 use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
+use crate::network::ipc::{
+	observe_wire_encode_error, observe_wire_encode_success, wire_encode_batch_for_path,
+};
 use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pending_finalizations::{
 	PendingFinalizationId, PendingFinalizationRecord, PendingFinalizationStore,
@@ -3230,7 +3236,8 @@ impl WendelonDataServer {
 		let schema = plan.batches[0].schema();
 		let concatenated = concat_batches(&schema, &plan.batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("table query concat: {e}")))?;
-		let arrow_bytes = encode_batch(&concatenated)?;
+		let arrow_bytes =
+			wire_encode_batch_for_path(&concatenated, NetworkCompressionPath::QueryResponse)?;
 		let response = QueryResponseMeta {
 			arrow_len: arrow_bytes.len() as u32,
 			..plan.response
@@ -3491,7 +3498,7 @@ impl WendelonDataServer {
 				format!("{label} missing Arrow payload"),
 			)
 		})?;
-		let payload = decode_batch(payload_bytes)?;
+		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
 		validate_write_request_batch(&meta, &payload)?;
 		Ok((meta, payload))
 	}
@@ -3514,7 +3521,7 @@ impl WendelonDataServer {
 				"TABLE_WRITE_REQ missing Arrow payload",
 			)
 		})?;
-		let payload = decode_batch(payload_bytes)?;
+		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
 		Ok((meta, payload))
 	}
 
@@ -3536,7 +3543,7 @@ impl WendelonDataServer {
 				"TABLE_DELETE_REQ missing Arrow payload",
 			)
 		})?;
-		let payload = decode_batch(payload_bytes)?;
+		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
 		let row_key_ids = decode_table_delete_rows_batch(&meta, &payload)?;
 		Ok((meta, row_key_ids))
 	}
@@ -4371,7 +4378,7 @@ impl WendelonDataServer {
 			.arrow_payload
 			.as_ref()
 			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "READ_REQ missing Arrow payload"))?;
-		let key = decode_batch(key_bytes)?;
+		let key = crate::network::ipc::wire_decode_batch(key_bytes)?;
 		validate_read_request_batch(&meta, &key)?;
 
 		let span = tracing::info_span!(
@@ -4384,7 +4391,7 @@ impl WendelonDataServer {
 		let (resp, value_batch) = self.read(meta, key).instrument(span).await?;
 		self.emit_read_completion_audit(actor, &meta, &resp)?;
 		let arrow_payload = value_batch.map(|batch| {
-			let bytes = encode_batch(&batch)?;
+			let bytes = wire_encode_batch_for_path(&batch, NetworkCompressionPath::ReadResponse)?;
 			let mut buf = self.pool.acquire();
 			buf.as_mut_vec().extend_from_slice(&bytes);
 			Ok::<_, std::io::Error>(buf)
@@ -5059,7 +5066,8 @@ impl WendelonDataServer {
 		let schema = batches[0].schema();
 		let concatenated = concat_batches(&schema, &batches)
 			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
-		let arrow_bytes = encode_batch(&concatenated)?;
+		let arrow_bytes =
+			wire_encode_batch_for_path(&concatenated, NetworkCompressionPath::QueryResponse)?;
 		let response = QueryResponseMeta {
 			arrow_len: arrow_bytes.len() as u32,
 			..response
@@ -9766,7 +9774,7 @@ fn encode_query_stream_batches_with_deadline(
 		if query_deadline_exceeded(deadline) {
 			return Ok(None);
 		}
-		let arrow = encode_batch(&batch)?;
+		let arrow = wire_encode_batch_for_path(&batch, NetworkCompressionPath::QueryResponse)?;
 		if query_deadline_exceeded(deadline) {
 			return Ok(None);
 		}
@@ -9923,7 +9931,8 @@ async fn execute_query_plan_with_budget_and_retention_floor(
 	let schema = plan.batches[0].schema();
 	let concatenated = concat_batches(&schema, &plan.batches)
 		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("PBC concat: {e}")))?;
-	let arrow_bytes = encode_batch(&concatenated)?;
+	let arrow_bytes =
+		wire_encode_batch_for_path(&concatenated, NetworkCompressionPath::QueryResponse)?;
 	let response = QueryResponseMeta {
 		arrow_len: arrow_bytes.len() as u32,
 		..plan.response
@@ -10056,16 +10065,31 @@ fn encode_migration_records(
 	.map_err(|e| Error::new(ErrorKind::InvalidData, format!("migration batch: {e}")))?;
 
 	let mut buf = Vec::new();
+	let started = Instant::now();
+	let options = crate::network::ipc::wire_ipc_write_options().map_err(|err| {
+		observe_wire_encode_error(NetworkCompressionPath::MigrationRecords);
+		err
+	})?;
 	{
-		let mut writer = StreamWriter::try_new(&mut buf, &schema)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow init: {e}")))?;
-		writer
-			.write(&batch)
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow write: {e}")))?;
-		writer
-			.finish()
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("arrow finish: {e}")))?;
+		let mut writer =
+			StreamWriter::try_new_with_options(&mut buf, &schema, options).map_err(|e| {
+				observe_wire_encode_error(NetworkCompressionPath::MigrationRecords);
+				Error::new(ErrorKind::InvalidData, format!("arrow init: {e}"))
+			})?;
+		writer.write(&batch).map_err(|e| {
+			observe_wire_encode_error(NetworkCompressionPath::MigrationRecords);
+			Error::new(ErrorKind::InvalidData, format!("arrow write: {e}"))
+		})?;
+		writer.finish().map_err(|e| {
+			observe_wire_encode_error(NetworkCompressionPath::MigrationRecords);
+			Error::new(ErrorKind::InvalidData, format!("arrow finish: {e}"))
+		})?;
 	}
+	observe_wire_encode_success(
+		NetworkCompressionPath::MigrationRecords,
+		buf.len() as u64,
+		started.elapsed(),
+	);
 	Ok(buf)
 }
 
@@ -10073,12 +10097,16 @@ fn encode_migration_records(
 /// stream over [`migration_record_schema`]; any column mismatch or
 /// missing value surfaces as `InvalidData`.
 fn decode_migration_records(bytes: &[u8]) -> std::io::Result<Vec<MigrationRecord>> {
-	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("migrate stream open: {e}")))?;
+	let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| {
+		crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+		Error::new(ErrorKind::InvalidData, format!("migrate stream open: {e}"))
+	})?;
 	let mut out = Vec::new();
 	while let Some(batch) = reader.next() {
-		let batch = batch
-			.map_err(|e| Error::new(ErrorKind::InvalidData, format!("migrate stream read: {e}")))?;
+		let batch = batch.map_err(|e| {
+			crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+			Error::new(ErrorKind::InvalidData, format!("migrate stream read: {e}"))
+		})?;
 		let tenant_col: &UInt64Array = batch
 			.column(0)
 			.as_any()
@@ -19249,6 +19277,8 @@ mod tests {
 			),
 		];
 		let bytes = encode_migration_records(&rows).unwrap();
+		let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(&bytes).unwrap();
+		assert_eq!(policy, RecordBodyCompressionPolicy::Lz4Frame);
 		let decoded = decode_migration_records(&bytes).unwrap();
 		assert_eq!(decoded.len(), 2);
 		assert_eq!(decoded[0].key_identity, id(7));

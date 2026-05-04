@@ -2870,13 +2870,21 @@ fn missing_seed_batch(
 }
 
 fn decode_epoch_batch(bytes: &[u8]) -> std::io::Result<arrow::record_batch::RecordBatch> {
-	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("epoch batch decode: {e}")))?;
+	let mut reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|e| {
+		crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+		Error::new(ErrorKind::InvalidData, format!("epoch batch decode: {e}"))
+	})?;
 	let batch = reader
 		.next()
 		.transpose()
-		.map_err(|e| Error::new(ErrorKind::InvalidData, format!("epoch batch read: {e}")))?
-		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "epoch batch stream is empty"))?;
+		.map_err(|e| {
+			crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+			Error::new(ErrorKind::InvalidData, format!("epoch batch read: {e}"))
+		})?
+		.ok_or_else(|| {
+			crate::network::ipc::observe_wire_decode_error_for_bytes(bytes);
+			Error::new(ErrorKind::InvalidData, "epoch batch stream is empty")
+		})?;
 	Ok(batch)
 }
 

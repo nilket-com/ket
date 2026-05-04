@@ -122,3 +122,7 @@ harness = false
 [[bench]]
 name = "secondary_index"
 harness = false
+
+[[bench]]
+name = "wire_arrow_ipc_body_compression"
+harness = false

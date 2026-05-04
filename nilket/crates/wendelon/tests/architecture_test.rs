@@ -1833,6 +1833,319 @@ fn test_adr052_secondary_index_architecture_guards() {
 	);
 }
 
+#[test]
+fn test_adr053_wire_ipc_compression_architecture_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let network_ipc = fs::read_to_string(manifest_dir.join("src/network/ipc.rs")).unwrap();
+	for required in [
+		"WIRE_BODY_COMPRESSION",
+		"RecordBodyCompressionPolicy::Lz4Frame",
+		"wire_ipc_write_options",
+		"wire_encode_batch",
+		"wire_decode_batch",
+		"wire_encode_batch_for_path",
+		"observe_wire_decode_error_for_bytes",
+		"descriptor-schema: `src/schema/table.rs::encode_arrow_schema_ipc`",
+		"test-or-bench-default",
+	] {
+		if !network_ipc.contains(required) {
+			violations.push(format!(
+				"src/network/ipc.rs: missing ADR 053 wire IPC surface {required}"
+			));
+		}
+	}
+
+	let network_mod = fs::read_to_string(manifest_dir.join("src/network/mod.rs")).unwrap();
+	if !network_mod.contains("pub mod ipc;") || !network_mod.contains("pub use ipc::*;") {
+		violations
+			.push("src/network/mod.rs: ADR 053 network IPC module is not exported".to_string());
+	}
+
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	if !schema_core.contains("FRAME_FLAG_KNOWN_MASK")
+		|| !schema_core.contains("pub const FRAME_FLAG_KNOWN_MASK: u16 = FRAME_FLAG_STREAM_END;")
+	{
+		violations
+			.push("src/schema/core.rs: ADR 053 known HRFT frame flag mask is missing".to_string());
+	}
+	let network_core = fs::read_to_string(manifest_dir.join("src/network/core.rs")).unwrap();
+	if !network_core.contains("header.flags & !FRAME_FLAG_KNOWN_MASK") {
+		violations.push(
+			"src/network/core.rs: ADR 053 unknown frame flag rejection is missing".to_string(),
+		);
+	}
+	if !schema_core.contains("pub const HRFT_ENVELOPE_VERSION: u8 = 1;") {
+		violations
+			.push("src/schema/core.rs: ADR 053 must not bump HRFT_ENVELOPE_VERSION".to_string());
+	}
+	for forbidden in [concat!("arrow_", "compressed"), concat!("has_", "trailing")] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: FrameHeader.flags doc still contains forbidden ADR 053 token {forbidden}"
+			));
+		}
+	}
+
+	let client_core = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
+	if !client_core.contains("NetworkCompressionPath::ClientBatch")
+		|| !client_core.contains("StreamWriter::try_new_with_options")
+		|| client_core.contains("StreamWriter::try_new(")
+	{
+		violations.push(
+			"src/client/core.rs: client batch wire encoder must use compressed IPC options"
+				.to_string(),
+		);
+	}
+
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let production_data_server = data_server
+		.split("\n#[cfg(test)]\nmod tests")
+		.next()
+		.unwrap_or(data_server.as_str());
+	if production_data_server.contains("StreamWriter::try_new(") {
+		violations.push(
+			"src/network/data_server.rs: migration writer must not use bare StreamWriter::try_new"
+				.to_string(),
+		);
+	}
+	for (path, minimum) in [
+		("NetworkCompressionPath::MigrationRecords", 1),
+		("NetworkCompressionPath::QueryResponse", 3),
+		("NetworkCompressionPath::ReadResponse", 1),
+	] {
+		let count = production_data_server.matches(path).count();
+		if count < minimum {
+			violations.push(format!(
+				"src/network/data_server.rs: ADR 053 expected at least {minimum} {path} encoder site(s), found {count}"
+			));
+		}
+	}
+	for forbidden in [
+		"let arrow_bytes = encode_batch(",
+		"let arrow = encode_batch(",
+		"let bytes = encode_batch(",
+	] {
+		if production_data_server.contains(forbidden) {
+			violations.push(format!(
+				"src/network/data_server.rs: production wire response still calls storage multirow encode_batch via `{forbidden}`"
+			));
+		}
+	}
+	for (relative, content) in [
+		("src/client/core.rs", client_core.as_str()),
+		("src/network/data_server.rs", production_data_server),
+	] {
+		if content.contains("StreamWriter::try_new_with_options")
+			&& !content.contains("wire_ipc_write_options")
+		{
+			violations.push(format!(
+				"{relative}: wire-side StreamWriter::try_new_with_options must route through wire_ipc_write_options"
+			));
+		}
+	}
+	let storage_ipc = fs::read_to_string(manifest_dir.join("src/storage/ipc.rs")).unwrap();
+	if !storage_ipc.contains("ipc_write_options_for_policy") {
+		violations
+			.push("src/storage/ipc.rs: ADR 043 storage IPC policy helper is missing".to_string());
+	}
+
+	let metrics_source = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"network_compression_batches_total",
+		"network_compression_encoded_bytes_total",
+		"network_compression_encode_micros",
+		"network_compression_ratio",
+		"network_compression_decode_error_total",
+		"client_batch",
+		"migration_records",
+		"query_response",
+		"read_response",
+		"compressed",
+		"error",
+	] {
+		if !metrics_source.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 053 network compression metric token {required}"
+			));
+		}
+	}
+	let runbook_path = manifest_dir.join("plans/ops/runbooks/wire_arrow_ipc_body_compression.md");
+	if !runbook_path.exists() {
+		violations
+			.push("plans/ops/runbooks/wire_arrow_ipc_body_compression.md is missing".to_string());
+	} else {
+		let runbook = fs::read_to_string(&runbook_path).unwrap();
+		for required in [
+			"wendelon_network_compression_batches_total",
+			"wendelon_network_compression_decode_error_total",
+			"storage_compression_*",
+			"FRAME_FLAG_STREAM_END",
+			"Identity and locality",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/wire_arrow_ipc_body_compression.md: missing ADR 053 runbook token {required}"
+				));
+			}
+		}
+	}
+	let runbook_catalog =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_catalog.contains("wire_arrow_ipc_body_compression.md") {
+		violations
+			.push("plans/ops/runbooks/README.md: ADR 053 runbook is not cataloged".to_string());
+	}
+	let observability =
+		fs::read_to_string(manifest_dir.join("plans/ops/observability.md")).unwrap();
+	for required in [
+		"wendelon_network_compression_batches_total",
+		"wendelon_network_compression_encoded_bytes_total",
+		"wendelon_network_compression_encode_micros",
+		"wendelon_network_compression_ratio",
+		"wendelon_network_compression_decode_error_total",
+	] {
+		if !observability.contains(required) {
+			violations.push(format!(
+				"plans/ops/observability.md: missing ADR 053 metric {required}"
+			));
+		}
+	}
+
+	for root in ["src", "tests", "benches"] {
+		let root_path = manifest_dir.join(root);
+		if !root_path.exists() {
+			continue;
+		}
+		walk_dir(&root_path, &mut |path| {
+			if !path
+				.extension()
+				.and_then(|ext| ext.to_str())
+				.is_some_and(|ext| ext == "rs")
+			{
+				return;
+			}
+			if path
+				.file_name()
+				.and_then(|name| name.to_str())
+				.is_some_and(|name| name == "architecture_test.rs")
+			{
+				return;
+			}
+			let Ok(content) = fs::read_to_string(path) else {
+				return;
+			};
+			for forbidden in [
+				concat!("network_compression_plain", "text_bytes_total"),
+				concat!("network_compression_decode", "_micros"),
+				concat!("uncompressed_", "passthrough"),
+				concat!("network_compression_decode_error_total{codec, ", "reason"),
+				concat!("MsgType::", "ARROW_COMPRESSED_"),
+				concat!("FRAME_FLAG_", "COMPRESS"),
+				concat!("Wire", "Body", "Compression", "Policy"),
+				concat!("Wire", "Compression", "Level"),
+				concat!("Record", "Body", "Compression", "Policy", "V"),
+				concat!("Wire", "Compression", "V"),
+				concat!("Wendelon", "WireCompression"),
+				concat!("wendelon", "_wire_compression_"),
+			] {
+				if content.contains(forbidden) {
+					violations.push(format!(
+						"{}: contains forbidden ADR 053 token '{}'",
+						path.display(),
+						forbidden
+					));
+				}
+			}
+			for line in content.lines() {
+				if line.contains("StreamReader::try_new(") && !line.contains(", None)") {
+					violations.push(format!(
+						"{}: ADR 053 receiver StreamReader must pass projection None: {}",
+						path.display(),
+						line.trim()
+					));
+				}
+			}
+		});
+	}
+
+	for manifest in ["Cargo.toml", "crates/wendelon-client/Cargo.toml"] {
+		let content = fs::read_to_string(manifest_dir.join(manifest)).unwrap();
+		if !content.contains("arrow = {") || !content.contains("\"ipc_compression\"") {
+			violations.push(format!(
+				"{manifest}: ADR 053 requires Arrow ipc_compression feature to stay pinned on"
+			));
+		}
+	}
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"wire_arrow_ipc_body_compression\"") {
+		violations.push("Cargo.toml: ADR 053 wire compression benchmark is missing".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/wire_arrow_ipc_body_compression.rs");
+	if !bench_path.exists() {
+		violations.push(
+			"benches/wire_arrow_ipc_body_compression.rs: ADR 053 bench harness is missing"
+				.to_string(),
+		);
+	} else {
+		let bench = fs::read_to_string(&bench_path).unwrap();
+		for required in [
+			"--quick",
+			"--full",
+			"encode_wire_lz4",
+			"decode_wire_lz4",
+			"wire_arrow_ipc_size",
+			"wire_arrow_ipc_rpc_size",
+			"wire_arrow_ipc_transmit_estimate",
+			"rpc_{rpc}_default_encode_decode",
+			"rpc_{rpc}_wire_lz4_encode_decode",
+			"rpc_read_resp_pass_through_decode_only",
+			"RecordBodyCompressionPolicy::Lz4Frame",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/wire_arrow_ipc_body_compression.rs: missing ADR 053 bench token {required}"
+				));
+			}
+		}
+	}
+	let bench_results =
+		manifest_dir.join("plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md");
+	if !bench_results.exists() {
+		violations.push(
+			"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md is missing"
+				.to_string(),
+		);
+	} else {
+		let bench_results = fs::read_to_string(&bench_results).unwrap();
+		for required in [
+			"2026-05-04 Quick Smoke",
+			"wire_helper_encode_in_timed_path=false",
+			"full promotion matrix",
+		] {
+			if !bench_results.contains(required) {
+				violations.push(format!(
+					"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md: missing ADR 053 bench-results token {required}"
+				));
+			}
+		}
+	}
+	let transport_source =
+		fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	if !transport_source.contains("pub const ALL: [NodeCapability; 2]") {
+		violations.push(
+			"src/network/transport.rs: ADR 053 must not add a node capability bit".to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 053 wire IPC compression invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {
 	let scan_roots = ["src", "tests", "benches"];
 	let forbidden = [

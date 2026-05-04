@@ -194,6 +194,11 @@ The pilot ships with the following Prometheus/OpenMetrics surface. Metric names 
 | `wendelon_data_ring_lease_denials_total` | counter | none | Lease refresh denials |
 | `wendelon_data_ring_lease_errors_total` | counter | none | Lease refresh failures |
 | `wendelon_data_ring_lease_cache_entries` | gauge | none | Cached lease descriptors |
+| `wendelon_network_compression_batches_total` | counter | `codec`, `path`, `result` | Fresh wire-side Arrow IPC encode attempts by codec, bounded path, and result |
+| `wendelon_network_compression_encoded_bytes_total` | counter | `codec`, `path` | Encoded Arrow IPC bytes emitted by fresh wire encoders |
+| `wendelon_network_compression_encode_micros` | histogram | `codec`, `path` | Fresh wire-side Arrow IPC encode duration in microseconds |
+| `wendelon_network_compression_ratio` | histogram | `codec`, `path` | Encoded/plaintext byte ratio when available without production double-encoding |
+| `wendelon_network_compression_decode_error_total` | counter | `codec` | Wire-side Arrow IPC decode failures by codec; reason text stays in logs/spans |
 
 #### Storage / L2
 | Metric | Type | Labels | Use |
@@ -343,6 +348,8 @@ Current high-signal mappings:
   - `plans/ops/runbooks/node_replacement.md`
 - ADR 043 storage-body rollout and stabilization watch
   - `plans/ops/runbooks/adr043_storage_body_stabilization.md`
+- ADR 053 wire Arrow IPC compression rollout and decode-error triage
+  - `plans/ops/runbooks/wire_arrow_ipc_body_compression.md`
 - ADR 046 StateDigest substrate promotion and benchmark interpretation
   - `plans/ops/runbooks/state_digest_substrate.md`
 

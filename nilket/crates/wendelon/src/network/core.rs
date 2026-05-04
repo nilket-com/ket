@@ -17,7 +17,7 @@
 
 use crate::network::pool::{BufPool, PooledBuf};
 use crate::network::wire;
-use crate::schema::FrameHeader;
+use crate::schema::{FRAME_FLAG_KNOWN_MASK, FrameHeader};
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -79,6 +79,15 @@ pub async fn read_frame_header<R: AsyncRead + Unpin + ?Sized>(
 		));
 	}
 	wire::validate_frame_version(header.version)?;
+	if header.flags & !FRAME_FLAG_KNOWN_MASK != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"HRFT frame carries unknown flag bits 0x{:04x}",
+				header.flags & !FRAME_FLAG_KNOWN_MASK
+			),
+		));
+	}
 	check_section_len("meta", header.meta_len)?;
 	check_section_len("arrow", header.arrow_len)?;
 	check_section_len("trailing", header.trailing_len)?;
@@ -168,4 +177,36 @@ fn check_section_len(name: &'static str, len: u32) -> std::io::Result<()> {
 		));
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::schema::{FRAME_FLAG_STREAM_END, HRFT_ENVELOPE_VERSION};
+	use tokio::io::AsyncWriteExt;
+
+	#[tokio::test]
+	async fn read_frame_header_rejects_unknown_flag_bits() {
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: HRFT_ENVELOPE_VERSION,
+			msg_type: 0,
+			flags: FRAME_FLAG_STREAM_END | (1 << 15),
+			stream_id: 7,
+			meta_len: 0,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		let (mut tx, mut rx) = tokio::io::duplex(64);
+		tx.write_all(bytemuck::bytes_of(&header)).await.unwrap();
+		drop(tx);
+
+		let err = read_frame_header(&mut rx).await.unwrap_err();
+
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(
+			err.to_string()
+				.contains("HRFT frame carries unknown flag bits 0x8000")
+		);
+	}
 }
