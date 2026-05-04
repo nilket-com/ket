@@ -19,320 +19,110 @@ forward-sequence rewrite.
 
 ## Where we are
 
-ADR 053 (Wire-Side Arrow IPC Body Compression) just
-promoted. Closes the wire half of the body-compression
-question ADR 043 deferred. Per-buffer LZ4_FRAME via Arrow
-IPC's native `BodyCompression` on every wire-side
-fresh-encode `StreamWriter`, mirroring ADR 043's storage-side
-choice and reusing `RecordBodyCompressionPolicy::Lz4Frame`.
-A single helper `src/network/ipc.rs::wire_ipc_write_options`
-pinned by `WIRE_BODY_COMPRESSION` is the only wire-side
-`IpcWriteOptions` constructor, with `wire_encode_batch` as
-its function-level companion; four wire-side fresh-encoder
-sites flip in V1 — two direct `StreamWriter` sites
-(`src/client/core.rs::encode_batch`,
-`src/network/data_server.rs::encode_migration_records`) and
-two indirect sites that currently route through
-`multirow::encode_batch`
-(`src/network/data_server.rs:3233` `TABLE_QUERY_RESP` and
-`src/network/data_server.rs:4387` `READ_RESP`). One site is
-explicitly excluded
-(`src/schema/table.rs::encode_arrow_schema_ipc` for ADR 043
-§5 boot-time independence). Storage pass-through bytes flow
-verbatim (already self-described under ADR 043). Receivers
-decompress transparently via `StreamReader` plus the
-on-by-default `ipc_compression` Cargo feature; ADR 053
-elevates the feature pin to a mechanical CI guard. No new
-HRFT frame family, no new `MsgType`, no new
-`FRAME_FLAG_*` for compression, no envelope
-`format_version` bump, no node capability bit, no per-RPC
-accept flag, no Cargo feature or dependency change, no per-
-table or per-tenant policy, no kill-switch. The Arrow IPC
-FlatBuffer is the single source of truth for whether bytes
-are compressed — ADR 053 inherits ADR 043 §4's
-self-description discipline on the wire axis. Per-buffer
-choice is load-bearing on three properties: (1) storage
-pass-through composes only with per-buffer (a framing-layer
-envelope would double-compress or need detection logic);
-(2) Arrow's `-1` length-sentinel handles the high-entropy /
-small-buffer fallback automatically; (3) forwarding paths
-flow opaquely, no flag-stripping. Meta and trailing
-sections stay uncompressed for both density (small,
-high-entropy) and CRIME-class side-channel disjointness
-(operator/auth bytes vs tenant Arrow bytes in disjoint
-compression contexts). Compress-then-encrypt order
-preserved by construction (Arrow encode → LZ4 → HRFT
-framing → QUIC mTLS). `MAX_SECTION_BYTES = 5 MiB` cap
-unchanged; applied on encoded (wire) bytes; decoded
-bound owned by `StreamReader`. Side-discipline cleanup:
-`FrameHeader.flags` bit-0 (`arrow_compressed`) and bit-1
-(`has_trailing`) doc reservations are deleted (neither was
-ever read or written); `FRAME_FLAG_KNOWN_MASK = FRAME_FLAG_STREAM_END`
-introduced and `read_frame_header` rejects frames whose
-flags include any bit outside the mask. Identity-vs-Locality
-framing inherited from `plans/philosophy.md`: wire
-compression touches neither — same Arrow `RecordBatch`
-decodes on both sides, identity / locality / fingerprints /
-digests / HLC / Raft / object-store keys / CDC logical
-records all compute over decoded bytes or storage-domain
-bytes, not transient wire bytes. Observability:
-`network_compression_*` family with bounded
-`{codec, path}` labels;
-`path ∈ {client_batch, migration_records, query_response, read_response}`
-initially, architectural-test pinned; `batches_total`
-carries `result ∈ {compressed, error}` (pass-through bytes
-are not counted by `network_compression_*` — they appear
-under `storage_compression_*`); `decode_error_total`
-carries `{codec}` only (diagnostic reason text moves to
-logs/spans to keep label cardinality bounded). No production
-plaintext-byte counter in V1 (avoids ADR 043 §3
-double-encode cost where there is no enforcement axis to
-amortise it); `ratio` populates opportunistically without
-double-encoding; production sees a sparse histogram. No
-decode-latency histogram in V1 (decoding owned by Arrow
-`StreamReader`; ADR 053 introduces no HRFT-layer LZ4
-code). CDC (#10) registers a new `path` label value when
-it lands. See
+ADR 054 (CDC Subscription Substrate) just promoted. Closes
+the cursor / live-tail / catchup / checkpoint / retention
+shape question for change-data capture. Substrate-only
+scope: triggers, PBC filter pushdown, webhooks, and
+continuous historical-plus-live queries are explicit
+follow-up ADRs. Identity-axis logical cursor `(row_hlc:
+Hlc, row_key_id: RowKeyId, record_row_index:
+RecordRowIndex)` matching the data-ring slab seek key
+(zero-write-amplification mandates this — control-log
+finality cursors would force table scans on resume). Event
+grain is the storage version-entry; no `CdcEventKind` /
+`CdcOperation` enum at substrate. In-memory per-locality
+`CdcLiveTailRing` with admission-time staging gated by ADR
+003 `FinalizationCommitted`; pending-finalization cleanup
+discards on terminal failure. Catchup uses **full
+`CdcCursor` tuple bounds** (not HLC ranges, which would
+miss same-HLC suffix) over a safe global cut `snapshot_hlc
+= min(locality_finalized_hlc(l))` at subscribe-open;
+existing storage scan paths, no durable CDC event log.
+Live-tail emission is gated by safe-emission watermark
+`safe_emission_hlc = min(locality_finalized_hlc(l))` so
+the emitted cursor sequence is non-decreasing in
+`CdcCursor` lex order under skewed locality finalization
+(without it, A finalized through 100 could emit A@90
+before B finalizes B@75, violating monotonicity).
+Open-time ring-continuity guard:
+`ring.head_cursor[l] <= (snapshot_hlc, RowKeyId::MAX,
+RecordRowIndex::MAX)` for every non-empty locality ring;
+violation rejects open with
+`CDC_REJECT_RING_OVERFLOW_DURING_CATCHUP` rather than
+silently dropping pre-open evictions. Cold-locality
+heartbeat contract is **locality-scoped, not per-table**:
+exactly one `CdcLocalityHeartbeatWorker` per locality on
+the locality leader emitting at most one no-op control-
+ring finalization marker per quiet interval at cadence
+`cdc_locality_heartbeat_interval_millis` (V1 default
+1000 ms) — `locality_finalized_hlc(l)` is a single
+per-locality value (ADR 016 control ring is locality-
+keyed), so one marker advances the watermark for every
+table whose source localities include `l`. Cluster cost:
+`N_localities / heartbeat_interval`, independent of
+CDC-table count; the worker spawns unconditionally on
+locality-leader startup. Visible-domain `StateDigest`
+checkpoints reuse `digest.table.row.visible.v1` (ADR 046
+V1 helper); no new digest domain. Resume-time digest
+validation via
+`CdcSubscribeRequestMeta::resume_visible_state_digest` +
+`resume_digest_present` rejects mismatched checkpoints at
+open with `CDC_REJECT_CHECKPOINT_DIGEST_MISMATCH` rather
+than waiting for the next checkpoint frame. Visible-state
+digest match plus cursor non-regression cover V1
+integrity; the substrate explicitly does **not** prove
+stream-prefix membership (sparse-cursor comparison cannot
+distinguish "k4 was never emitted" from "k4 was emitted
+and dropped") — a future event-history digest ADR
+(`digest.cdc.event.v1`) can add prefix-membership when a
+consumer demands it. Four new `MsgType` constants
+(`CDC_SUBSCRIBE_REQ` / `CDC_FRAME` / `CDC_CHECKPOINT` /
+`CDC_REJECT`); 8-code `CDC_REJECT_*` taxonomy; sparse
+enums (`CdcSubscribeBound`, `CdcFrameSource`,
+`CdcRejectCode`, `DigestDomain`) carry raw integer fields
+on POD meta with `from_raw` checked accessors (deriving
+`Pod` on sparse enums is unsound — most bit patterns are
+invalid). Reject-code discriminants start at 1 so a zero-
+initialized `CdcRejectMeta` cannot decode as a valid
+reject. `Live` and `SnapshotAtOpen` subscription bounds;
+cross-replica reconnect is a fresh subscription. CDC
+inherits ADR 053's wire helper and registers
+`NetworkCompressionPath::CdcEvent` as the fifth `path`
+label value. Bounded `cdc_*` metrics
+(`source ∈ {ring, catchup}`, `result ∈ {opened, closed,
+rejected, cancelled}`, `code ∈` 8-value enum); no
+tenant / table / subscription labels. V1 default
+`max_cdc_live_tail_bytes_per_locality = 64 MiB` (ADR 030
+deployment-profile-tunable); checkpoint cadence
+`max(1024 events, 1s)` (runbook tunable). No new HRFT
+envelope `format_version` bump, no new `FRAME_FLAG_*`,
+no new `NodeCapability` bit, no Cargo feature change, no
+new digest domain, no on-disk shape change. CDC delivery
+latency is bounded by one-way QUIC RTT plus ring-drain
+wakeup plus encode CPU plus the slowest source
+locality's finalization or heartbeat cadence above the
+emission HLC — the load-bearing cost of preserving
+global cursor monotonicity without exposing
+`LocalityId` on the cursor. See
+`plans/adr/054_cdc_subscription_substrate.md` and
+`plans/impl/054_cdc_subscription_substrate.md`.
+Implementation phases pending.
+
+ADR 053 (Wire-Side Arrow IPC Body Compression) is the
+immediate predecessor and the binding ADR 054 inherits.
+Per-buffer LZ4_FRAME on fresh wire-side Arrow IPC
+encoders via Arrow IPC's native `BodyCompression`,
+mirroring ADR 043 on the wire axis. Single helper
+`wire_ipc_write_options()` pinned by
+`WIRE_BODY_COMPRESSION` with `wire_encode_batch` as its
+function-level companion; four wire-side fresh-encoder
+sites flip in V1; storage pass-through bytes flow
+verbatim. Bounded `network_compression_*` metric family
+with `{codec, path}` labels — CDC adds `cdc_event` as
+the fifth allowed `path` value. See
 `plans/adr/053_wire_arrow_ipc_body_compression.md` and
 `plans/impl/053_wire_arrow_ipc_body_compression.md`.
 Implementation phases pending.
-
-ADR 052 (Secondary Indexes on Non-Clustering Columns) is
-the immediate predecessor. First non-`__row_key_id__` access
-path on the table: a non-unique ordered scalar index over
-one user column on PK / append-only / content-hash tables.
-Index descriptors live in a replicated
-`SecondaryIndexCatalog` outside `TableSchemaDescriptorV1`;
-create / drop reuses `SchemaUpdateEnvelopeV1` with
-`SchemaObjectKind::Index` and **four `mutation` variants**
-— `Create` / `Drop` (operator-initiated) plus
-`IndexBackfillComplete` / `IndexDropGcComplete`
-(replica-initiated, lifecycle-advancing). Catalog rows carry
-`SecondaryIndexState ∈ {Building, Ready, Dropping}` with a
-linear `absent → Building → Ready → Dropping → absent`
-lifecycle; planner gates on `Ready` only, `Building` and
-`Dropping` route through fingerprint mismatch. Index entries
-bind to ADR 051's `LogicalSchemaFingerprint` so physical
-retunes leave sidecars valid; logical mutations require drop
-+ create with a new `IndexObjectId`. Index segments are
-immutable per-source-slab sidecars keyed by
-`(tenant, table, index, logical_fingerprint, source_slab_id)`
-— `slab_id` lives once in the sidecar header. Sort key
-`(encoded_key, row_key_id, row_hlc, record_location,
-record_row_index)` with `record_row_index` widened to `u32`
-(resolves roadmap #14 implicitly). Per-segment `StateDigest`
-consumes the reserved `digest.secondary_index.entry.v1`
-domain (ADR 046) over **logical version-entries**, not
-visible-membership — every data-row write contributes
-exactly one element, including unchanged-value PK upserts,
-so the index has a direct locator to the latest payload.
-Lazy supersession: tombstones emit no entry; every candidate
-is revalidated through six steps — segment fingerprint
-match, row fetch, row-metadata `(row_key_id, row_hlc)`
-equality, `lookup_as_of`, indexed-value recheck (re-encode
-the fetched row's indexed value and compare to the entry's
-`encoded_key`), and full PBC recheck. NULL excluded from V1
-(no sidecar entry; `IS NULL` routes to scan; future variant
-ADR may admit NULL via sentinel encoding when a consumer
-demands it). Backfill is async per-replica and iterates
-**every retained non-tombstone data version** in each source
-slab — not `lookup_as_of(now)` winners — so `as_of_hlc`
-queries reaching a covered slab find the version-entry
-visible at the requested time. The backfill worker acquires
-a read-lease on each source slab to coordinate against
-compaction; on contention compaction wins and backfill
-aborts cleanly. Active-slab admission appends to an in-
-memory buffer bounded by `max_index_buffer_bytes`; on
-overflow the buffer is dropped and the slab is marked
-uncovered without rolling back the data write. Compaction
-rebuilds sidecars for **`Building` and `Ready` indexes
-alike** from survivor data rows on source-slab compaction,
-healing uncovered slabs (and closing the backfill /
-compaction lease race) on the natural compaction cadence
-without retry loops. Two-phase replicated drop GC requires
-**every replica** to confirm local L1/L2 reclaim via its own
-`IndexDropGcComplete` mutation before the catalog row goes
-absent — partial confirmation leaves the row in `Dropping`
-so slow or partitioned replicas do not strand sidecar bytes
-behind a retired descriptor. Reject taxonomy partitioned
-across two namespaces: four lookup / descriptor-validation
-`INDEX_REJECT_*` codes
-(`LOGICAL_FINGERPRINT_MISMATCH`,
-`UNSUPPORTED_COLUMN_TYPE`, `PK_COLUMN`, `SYNTHETIC_COLUMN`)
-plus a separate schema-mutation-layer
-`SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED` for the
-rejected `Alter` mutation — different call-paths, different
-operator audiences. Internal typed lookup executor
-`TableLookupByIndexRequest` with
-`IndexQuery::{PointEqual, Range, InList}`; planner does
-predicate extraction with hybrid fallback over `Ready`-state
-indexes; cost-based optimizer deferred. PK column rejected
-at descriptor validation; `__row_*__` synthetic columns
-rejected; ADR 048's `RETENTION_REJECTED_PK_DISALLOWED`
-remains in force. No table `schema_generation` bump on
-index create / drop; no new HRFT frame family; no new
-digest domain beyond the ADR-046-reserved
-`digest.secondary_index.entry.v1`; no bump on any existing
-`format_version` (the new sidecar header carries its own
-field on a fresh artifact family). Identity-vs-Locality
-framing inherited from `plans/philosophy.md`: V1 sidecars
-preserve the row's existing single locality; range-sharded
-ring projection (a true second locality on indexed value)
-deferred to a future ADR. Visible-membership digest
-deferred to a follow-up consumer if anti-entropy or unique-
-constraint enforcement demands it; ADR 052 ships the
-version-entry digest only. See
-`plans/adr/052_secondary_indexes.md` and
-`plans/impl/052_secondary_indexes.md`. Implementation
-phases pending.
-
-ADR 051 (Logical / Physical Descriptor Fingerprint Split)
-is the immediate predecessor and the binding ADR 052
-inherits.
-`TableSchemaDescriptorV1::schema_fingerprint:
-[u8; 32]` is replaced by two newtyped fingerprints —
-`LogicalSchemaFingerprint` (over `(table_object_id,
-namespace, table_name, arrow_schema_ipc,
-row_identity_policy, evolution_policy)`) and
-`PhysicalDescriptorFingerprint` (binds the logical
-fingerprint plus locality / layout / compression / stats
-policy). Domain-tagged BLAKE3 preimages
-(`digest.table.schema.logical.v1`,
-`digest.table.descriptor.physical.v1`); physical preimage
-**stacks** by embedding the logical fingerprint as its first
-byte-string so logical mismatch implies physical mismatch by
-construction (load-bearing for future LSM segment merge
-under additive evolution). `tenant_id`, `contract_version`,
-`schema_generation`, and lifecycle policy state excluded
-from both preimages. Consumer routing: every existing
-fingerprint comparison site (aggregate idempotency,
-aggregate wire envelope, CSB header, CSB compaction
-eligibility, columnar directory) → **logical**; in-memory
-planning caches (layout / compression / stats-builder /
-scan-range) → **physical**; future LSM segment merge
-eligibility → **physical**; future CDC cursor and
-secondary index entries → **logical**. CSB merge / direct-
-answer paths additionally validate parsed payload coverage
-(column ordinal, Arrow stats type tag, `stat_flags`,
-optional payload presence for bloom / HLL / small-set /
-min / max) after descriptor-level logical match — a
-stats-policy retune does not become a descriptor-wide
-physical mismatch; older CSBs remain usable for facts they
-carry, and operations needing absent optional coverage
-fall through to row-level. CSB header on-disk slot is
-reinterpreted as logical fingerprint bytes (slot byte-
-layout unchanged; pre-launch one-time cliff for pre-ADR-
-051 CSBs falls through to row-level until compaction
-rewrites). `PBC_REJECT_STATS_FINGERPRINT_MISMATCH` renamed
-to `PBC_REJECT_STATS_LOGICAL_FINGERPRINT_MISMATCH`. Tiered
-stats cache keys use logical fingerprint plus existing
-slab locator fields (`stats_format_version`,
-`stats_block_len`, `stats_block_hash128`) so descriptor
-physical retunes do not evict parsed CSBs whose bytes are
-unchanged. `schema_generation` orthogonal and unchanged
-(no `physical_generation`); aggregate cache key keeps
-`(tenant_id, table_object_id, schema_generation,
-logical_schema_fingerprint)`. Identity-vs-Locality framing
-maps onto the split — logical is identity (what a row IS),
-physical is locality (where / how it lives). Identification
-fields are inside identity (catch tampering at validate);
-`tenant_id` sits above the descriptor at the catalog-
-instance layer. Content-hash row identity (ADR 049) and PK
-delete admission (ADR 050) preimages stay fingerprint-free
-(Phase 5 regression audit). No new non-fingerprint
-descriptor fields (the single fingerprint slot is split
-into two newtyped fields), no new HRFT frame family, no
-new digest domain beyond the two listed, no
-`format_version` bump. See
-`plans/adr/051_descriptor_fingerprint_split.md` and
-`plans/impl/051_descriptor_fingerprint_split.md`.
-Implementation phases pending.
-
-ADR 050 (PK-Keyed Row Delete via Supersession) — the
-row-axis tombstone and supersession discipline ADR 052
-revalidation step 4 trusts. First-class delete operation
-for
-`RowIdentityPolicy::PrimaryKey` tables: `TableDeleteRows`
-accepts PK descriptors and emits a tombstone version under
-the target's `__row_key_id__` when the key is currently
-visible at `delete_hlc`. Tombstones reuse ADR 047's
-`__row_tombstone__` synthetic column and tombstone-only
-multi-row record packing **layout-independently** —
-`SingleRow` PK tables emit multi-row tombstone-only frames
-so no fake user-column values pollute stats / PBC /
-aggregates. Supersession is emergent from HLC-ordered
-version chains: `latest-as-of-T(K) = argmax_v(v.hlc | v.hlc
-≤ T)`, with tombstones as first-class versions.
-Resurrection is allowed — a later data write supersedes a
-tombstone and re-adds the visible-digest element.
-Synchronous admission-time visible-state branching across
-four outcomes (`InsertedNewVisible` /
-`UpsertedAlreadyVisible` / `DeletedSupersedingVisible` /
-`DeleteAbsorbedNotVisible`) keeps ADR 046 §5 visible-state
-semantics intact across both delete *and* the symmetric
-insert / upsert digest discipline. The visibility predicate
-is identity-policy-aware via `row_visible_for_admission`:
-append-only / content-hash use ADR 049's retention-floor
-predicate; PK uses chain-prefix-retention semantics where
-below-floor boundary versions remain visible. CSB metadata
-composition extends to all admissible transitions including
-resurrection (tombstone → data records
-`supersession_metadata` on the tombstone slab). Wire
-response classification triple (`deleted_count` /
-`already_deleted_count` / `not_found_count`) makes
-idempotent absorb operator-readable. PK retention stays on
-ADR 013 cluster-MVCC prefix retention with conservative
-boundary-tombstone preservation; ADR 048's
-`RETENTION_REJECTED_PK_DISALLOWED` gate remains in force,
-and no full-chain key retirement in V1.
-`PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed as
-unreachable. Implementation in place; full 100k / 1M
-promotion bench matrix remains ahead.
-
-ADR 049 (Content-Hash Row Identity) —
-`RowIdentityPolicy::AppendOnlyContentHash` deriving
-`__row_key_id__` from canonical row content, with
-synchronous admission-time collapse and the
-`row_currently_visible` helper that ADR 050 generalized to
-`row_visible_for_admission`. Sparse type-tagged canonical
-encoding makes additive nullable schema evolution
-identity-neutral; non-NULL-default and decimal-scale-
-evolution rejected with typed reject codes;
-`IdentityProjection` enabled, `ColumnProjection` deferred.
-Full 100k / 1M promotion bench matrix cleared on
-2026-04-29.
-
-ADR 048 (Per-Table Retention Policy) — replicated
-`TableLifecycleCatalog`; three modes (`InheritCluster` /
-`Disabled` / `FixedWindow`); two-phase enforcement (read-time
-logical filter plus hard `as_of < floor` reject; compaction-
-time physical eviction). PK-table retention deferral remains
-live (ADR 050 honored; not lifted). The topology gate was
-closed alongside ADR 048 with **Outcome B** (opaque `NodeId`
-retained); splits to brainstorm 018 (FROST-WAL authority) and
-brainstorm 019 (Sybil-resistance threat model).
-
-ADR 047 (Row-Level Tombstones on Append-Only Tables) is the
-tombstone shape ADR 050 reuses on the PK chain. ADR 046
-(`StateDigest` substrate) supplies the algebra. ADR 045 (PK-
-Less Append-Only Tables) supplies the identity layer ADR 049
-complements with content-hash identity and ADR 050 complements
-with delete semantics; `__row_table_object_id__` is the
-ownership resolver retention reclaim uses to look up the
-effective floor. ADR 042 supplies `supersession_metadata`,
-which ADR 050 §7 composes against for the resurrection case.
-
-The implementation chain through ADR 049 is built and bench-
-shipped. ADR 046 substrate cleared the cut-2 promotion bench
-gate (see `plans/impl/046_state_digest_bench_results.md`).
-ADR 047, ADR 048, and ADR 049 cleared their full 100k / 1M
-promotion matrices on 2026-04-29; see the corresponding
-bench-result files under `plans/impl/`. ADR 050
-implementation is in place; full 100k / 1M bench matrix
-remains ahead. ADR 051 design is accepted; implementation
-phases (Phase 0 contract freeze through Phase 8 metrics /
-runbook / arch guards) and full 100k / 1M bench matrix
-remain ahead.
 
 ## Prioritization philosophy
 
@@ -356,374 +146,208 @@ on. A feature wants to come *later* when it is a consumer or
 refinement of those surfaces and composes cleanly once they are
 stable.
 
-This does not make secondary indexes, CDC, or LSM compaction
-less important. They remain central warehouse capabilities.
-The sequencing claim is narrower: they should consume the
-algebraic substrate (`StateDigest`), lifecycle layer
-(tombstones, retention), topology decision, and identity /
-descriptor cleanup rather than force those foundations to be
-retrofitted afterward. The trade is real — substantial council
-bandwidth goes to foundation work before the first access-
-pattern ADR opens — but it buys a cleaner final system.
+This does not make LSM compaction, vector embeddings, or
+encoding refinements less important. They remain central
+warehouse capabilities. The sequencing claim is narrower: they
+should consume the algebraic substrate (`StateDigest`),
+lifecycle layer (tombstones, retention), topology decision,
+identity / descriptor cleanup, access-pattern surface
+(secondary indexes), wire-compression policy, and CDC substrate
+rather than force those foundations to be retrofitted
+afterward.
 
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini.
+Gemini. Steps 1–10 are promoted (in `plans/adr/`); the
+forward shape begins at #11.
 
-### Algebraic state foundation
-
-1. **`StateDigest` substrate** *(brainstorm 014, narrowed.)*
-   ADR 046 promoted — see
-   `plans/adr/046_state_digest_substrate.md` and
-   `plans/impl/046_state_digest_substrate.md`. Substrate-only
-   surface: `StateDigest` newtype, `StateDigestAccumulator`,
-   `StateDigestElement`, domain-separated projection (hash-to-
-   scalar over Ristretto255), V1 helper for `table.row.visible`
-   only. No durable storage placement; consumer ADRs commit
-   placement when they ship. Substrate implementation cleared
-   the cut-2 promotion bench gate; consumer-ADR-driven
-   follow-on tasks remain (durable placement, anti-entropy
-   reader). Brainstorm 014 marked harvested.
-
-### Lifecycle (validates the algebra)
-
-2. **Row-level tombstones on append-only.** ADR 047 promoted
-   — see `plans/adr/047_row_tombstones_append_only.md` and
-   `plans/impl/047_row_tombstones_append_only.md`. Tombstones
-   share the target's `__row_key_id__`; one new synthetic
-   column (`__row_tombstone__`); `is_tombstone` bit on index
-   entries; tombstone-only multi-row records (no user
-   columns); reuse ADR 040 `tombstone_metadata`; one footer
-   bit (`has_row_tombstone_records`, subject to Phase-0
-   audit; correctness-equivalent fallback if no clean slot
-   exists); visible-domain `StateDigest` subtraction with no
-   durable placement. First non-speculative validation of
-   ADR 046 `subtract_element` against real storage state.
-   Implementation in place; full 100k / 1M bench matrix
-   cleared on 2026-04-29.
-
-3. **Per-table retention policy.** ADR 048 promoted — see
-   `plans/adr/048_per_table_retention_policy.md` and
-   `plans/impl/048_per_table_retention_policy.md`.
-   Replicated `TableLifecycleCatalog` keyed by
-   `(tenant_id, table_object_id)`; three modes
-   (`InheritCluster` / `Disabled` /
-   `FixedWindow(RetentionWindowMillis)`); typed
-   `SetTableRetentionPolicy` mutation with monotonic
-   `policy_generation` CAS — no DDL parser in Wendelon.
-   Two-phase: read-time logical filter + hard `as_of <
-   floor` reject; compaction-time physical eviction
-   pinned to `compaction_start_hlc`. ADR 047 pair-GC
-   composes against the table floor; ambiguous ownership
-   retains. Visible-domain `StateDigest` reversal
-   (subtract on data eviction, add on tombstone eviction)
-   — no new digest domain. PK-keyed table-specific
-   retention remains deferred (ADR 050 explicitly kept
-   `RETENTION_REJECTED_PK_DISALLOWED` in force; lift is a
-   follow-up after ADR 050 alongside the full-chain
-   key-retirement proof). Implementation in place; full 100k /
-   1M bench matrix cleared on 2026-04-29.
-
-### Topology gate (closed)
-
-4. **Algebraic topology** *(brainstorm 015 — closed.)* Closed
-   2026-04-29 with **Outcome B**: opaque `NodeId` is
-   sufficient; Wendelon binds node signing identity through
-   epoch membership state when a real verifier exists, rather
-   than reshaping `NodeId` itself. The closure is durable but
-   not permanent — future ADRs that need cryptographic node
-   identity must cite the rework budget recorded in the
-   brainstorm 015 status header. Splits: brainstorm 018
-   (FROST-WAL authority) and brainstorm 019 (Sybil-resistance
-   threat model). Both are placeholders, off the active queue.
-   Anti-entropy remains deferred until identity / descriptor
-   cleanup (#5–#7) settles.
-
-### Identity / descriptor cleanup before access patterns
-
-5. **Content-hash identity (`AppendOnlyContentHash`).** ADR 049
-   promoted — see
-   `plans/adr/049_content_hash_row_identity.md` and
-   `plans/impl/049_content_hash_row_identity.md`. Third
-   `RowIdentityPolicy` variant; sparse type-tagged canonical
-   encoding (NFC strings; NaN / -0 normalized; stable column-
-   ID `column_tag`); domain-tagged BLAKE3 preimage excluding
-   schema generation; synchronous admission-time collapse
-   keeping ADR 046 §5 visible-state semantics intact;
-   `IdentityProjection` enabled, `ColumnProjection` deferred;
-   non-NULL-default and decimal-scale-evolution rejected with
-   typed reject codes. Implementation in place; full 100k /
-   1M bench matrix cleared on 2026-04-29.
-
-6. **PK-keyed row-delete via supersession.** ADR 050 promoted —
-   see `plans/adr/050_pk_delete_supersession.md` and
-   `plans/impl/050_pk_delete_supersession.md`. PK delete reuses
-   `TableDeleteRows` (engine boundary identity-based);
-   tombstones reuse ADR 047 `__row_tombstone__` and multi-row
-   tombstone-only record packing layout-independently;
-   supersession via HLC-ordered version chain (no new index
-   structure); synchronous admission-time visible-state
-   branching for both delete and insert / upsert; policy-aware
-   `row_visible_for_admission` (PK boundary versions remain
-   visible at admission; append-only / content-hash retention
-   semantics from ADR 049 preserved); CSB metadata composition
-   for the resurrection case (tombstone → data records
-   supersession on tombstone slab); PK retention stays on ADR
-   013 cluster-MVCC prefix retention (ADR 048 PK gate remains
-   in force); no full-chain key retirement in V1; conservative
-   boundary-tombstone preservation; classification count
-   triple on the wire response;
-   `PBC_REJECT_ROW_TOMBSTONES_REQUIRE_APPEND_ONLY` removed.
-   Implementation phases pending.
-
-7. **Logical / physical descriptor fingerprint split.** ADR
-   051 promoted — see
-   `plans/adr/051_descriptor_fingerprint_split.md` and
-   `plans/impl/051_descriptor_fingerprint_split.md`. Two
-   newtyped fingerprints (`LogicalSchemaFingerprint`,
-   `PhysicalDescriptorFingerprint`) over domain-tagged
-   BLAKE3 preimages with the physical preimage stacking on
-   the logical fingerprint. Logical preimage covers
-   identification (`table_object_id`, namespace, name) plus
-   Arrow schema, row identity policy, and evolution policy;
-   physical preimage covers locality, layout, compression,
-   stats policy. `tenant_id`, `contract_version`,
-   `schema_generation`, and lifecycle policy excluded from
-   both. Every existing fingerprint comparison site
-   (aggregate idempotency, aggregate wire, CSB header, CSB
-   merge eligibility, columnar directory) routes to logical;
-   in-memory planning caches and future LSM segment merge
-   route to physical. CSB merge / direct-answer paths
-   validate parsed payload coverage (column ordinal, Arrow
-   stats type, `stat_flags`, optional payload presence)
-   after descriptor-level logical match — stats-policy
-   retunes do not become descriptor-wide physical mismatches.
-   CSB header on-disk slot reinterpreted as logical bytes
-   (pre-launch one-time cliff for pre-ADR-051 CSBs).
-   `PBC_REJECT_STATS_FINGERPRINT_MISMATCH` renamed to
-   `_LOGICAL_*`. `schema_generation` orthogonal and
-   unchanged (no `physical_generation`). Identity-vs-
-   Locality framing inherited from `plans/philosophy.md`.
-   Content-hash (ADR 049) and PK delete (ADR 050) preimages
-   stay fingerprint-free (Phase 5 regression audit). No new
-   descriptor field, no new HRFT frame family, no
-   `format_version` bump. Implementation phases pending.
-
-### Access patterns
-
-8. **Secondary indexes on non-clustering columns.** ADR 052
-   promoted — see `plans/adr/052_secondary_indexes.md` and
-   `plans/impl/052_secondary_indexes.md`. Single-column
-   ordered scalar indexes over non-PK non-synthetic columns
-   on PK / append-only / content-hash tables. Replicated
-   `SecondaryIndexCatalog` outside `TableSchemaDescriptorV1`;
-   create / drop reuses `SchemaUpdateEnvelopeV1` with
-   `SchemaObjectKind::Index` and four `mutation` variants
-   (`Create`, `Drop`, `IndexBackfillComplete`,
-   `IndexDropGcComplete`); catalog rows carry
-   `SecondaryIndexState ∈ {Building, Ready, Dropping}` with
-   linear lifecycle and `Ready`-only planner gating. Index
-   entries bind to ADR 051's `LogicalSchemaFingerprint` and
-   sit in immutable per-source-slab sidecars
-   `(tenant, table, index, logical_fingerprint, source_slab_id)`
-   with sort key
-   `(encoded_key, row_key_id, row_hlc, record_location,
-   record_row_index)` and `record_row_index` widened to
-   `u32`. Per-segment `StateDigest` consumes the reserved
-   `digest.secondary_index.entry.v1` domain (ADR 046) over
-   **logical version-entries** — every data-row write
-   contributes one element including unchanged-value PK
-   upserts so the index has a direct locator to the latest
-   payload; visible-membership digest deferred. Lazy
-   supersession with mandatory six-step candidate
-   revalidation (segment fingerprint match, row fetch, row-
-   metadata equality, `lookup_as_of`, indexed-value recheck,
-   PBC recheck). NULL excluded in V1 (`IS NULL` routes to
-   scan; future variant ADR may admit NULL via sentinel
-   encoding). Async per-replica backfill iterates every
-   retained non-tombstone data version (not `lookup_as_of(now)`
-   winners) so as-of queries on covered slabs find the
-   version visible at the requested time; backfill takes a
-   read-lease on each source slab and aborts cleanly on
-   compaction contention. Active-slab buffer bounded by
-   `max_index_buffer_bytes` — overflow drops the buffer and
-   marks the slab uncovered without rolling back the data
-   write. Compaction rebuilds sidecars for `Building` and
-   `Ready` indexes alike from survivor data rows, healing
-   uncovered slabs and closing the backfill / compaction
-   lease race on the natural compaction cadence. Two-phase
-   replicated drop GC requires every replica to confirm
-   local L1/L2 reclaim via `IndexDropGcComplete` before the
-   catalog row goes absent. Reject taxonomy partitioned
-   across two namespaces: four lookup-time `INDEX_REJECT_*`
-   codes plus a separate
-   `SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED` for the
-   rejected `Alter` mutation. Internal
-   `TableLookupByIndexRequest` / `IndexQuery` lookup
-   executor with `PointEqual` / `Range` / `InList`; minimal
-   planner integration with hybrid fallback over uncovered
-   slabs; cost-based optimizer deferred. ADR 048's
-   `RETENTION_REJECTED_PK_DISALLOWED` remains in force. No
-   table `schema_generation` bump on index create / drop;
-   no new HRFT frame family; no new digest domain; no bump
-   on any existing `format_version` (the new sidecar header
-   carries its own on a fresh artifact family).
-   `record_row_index` widening resolves roadmap #14
-   implicitly. Implementation phases (Phase 0 contract
-   freeze through Phase 10 architectural guards / metrics /
-   audit / runbook) and full 100k / 1M bench matrix remain
-   ahead.
-
-9. **Wire-side Arrow IPC body compression.** ADR 053
-    promoted — see
-    `plans/adr/053_wire_arrow_ipc_body_compression.md` and
-    `plans/impl/053_wire_arrow_ipc_body_compression.md`.
-    Per-buffer LZ4_FRAME on fresh wire-side Arrow IPC
-    encoders via Arrow IPC's native `BodyCompression`,
-    mirroring ADR 043 on the wire axis and reusing
-    `RecordBodyCompressionPolicy::Lz4Frame`. Single helper
-    `wire_ipc_write_options()` pinned by
-    `WIRE_BODY_COMPRESSION` (with `wire_encode_batch` as its
-    function-level companion); four wire-side fresh-encoder
-    sites flip — two direct
-    (`client/core.rs::encode_batch`,
-    `data_server.rs::encode_migration_records`) and two
-    indirect via `multirow::encode_batch`
-    (`data_server.rs:3233` `TABLE_QUERY_RESP`,
-    `data_server.rs:4387` `READ_RESP`); one excluded
-    (`encode_arrow_schema_ipc` for boot-time independence). Storage pass-through bytes flow
-    verbatim. Receivers decode transparently via
-    `StreamReader` plus the on-by-default
-    `ipc_compression` Cargo feature (architectural guard
-    pins it on). No new HRFT frame family / `MsgType` /
-    `FRAME_FLAG_*` for compression, no envelope
-    `format_version` bump, no node capability bit, no
-    per-RPC accept flag, no Cargo feature change, no
-    per-table or per-tenant policy, no kill-switch.
-    Side-discipline cleanup:
-    `FrameHeader.flags` bit-0 / bit-1 doc reservations
-    deleted; `FRAME_FLAG_KNOWN_MASK` validation hardens
-    framing-layer flag-drift detection.
-    `network_compression_*` metrics with bounded
-    `{codec, path}` labels; production omits
-    plaintext-byte counter and decode-latency histogram in
-    V1. CDC (#10) inherits the wire helper and registers a
-    new `path` value when it lands. Implementation phases
-    pending. *2–3 iterations remain ahead in code.*
-
-10. **CDC + triggers** *(brainstorm 004.)* Append-only is the
-    canonical CDC sink. Cursor surface decision lands here
-    (HLC-derived? `__row_key_id__`-derived? tuple?); consumers
-    verify cursor checkpoints against partition `StateDigest`
-    points algebraically. *Large, multi-ADR.*
+1. **`StateDigest` substrate** — ADR 046 promoted.
+2. **Row-level tombstones on append-only** — ADR 047 promoted.
+3. **Per-table retention policy** — ADR 048 promoted.
+4. **Algebraic topology gate** — closed 2026-04-29 with
+   Outcome B (opaque `NodeId`); see brainstorm 015 closure.
+   Splits to brainstorm 018 (FROST-WAL authority) and
+   brainstorm 019 (Sybil-resistance threat model), both
+   off the active queue.
+5. **Content-hash identity (`AppendOnlyContentHash`)** —
+   ADR 049 promoted.
+6. **PK-keyed row-delete via supersession** — ADR 050
+   promoted.
+7. **Logical / physical descriptor fingerprint split** —
+   ADR 051 promoted.
+8. **Secondary indexes on non-clustering columns** —
+   ADR 052 promoted.
+9. **Wire-side Arrow IPC body compression** — ADR 053
+   promoted.
+10. **CDC subscription substrate** — ADR 054 promoted.
+    Substrate-only; triggers, PBC filter pushdown,
+    webhooks, and continuous historical-plus-live queries
+    are explicit follow-up ADRs (each consumes the
+    substrate). See *Where we are* above.
 
 11. **LSM-style leveled compaction.** The compactor reads
     multi-row segments, drops rows matched by tombstones,
-    generates new secondary index segments, updates
-    `StateDigest` points. Append-only segments are LSM-clean by
-    construction. *Large, multi-ADR.*
+    generates new secondary index segments (rebuilding
+    sidecars per ADR 052 §"Compaction"), and updates
+    `StateDigest` points algebraically (additions for new
+    survivor versions, subtractions for evicted versions).
+    Append-only segments are LSM-clean by construction.
+    Composes against ADR 048 retention floors, ADR 050
+    PK supersession chains, and ADR 052 secondary-index
+    sidecars. CDC's `safe_emission_hlc` watermark
+    interaction with compaction needs explicit treatment
+    (compaction must not advance below any active
+    subscription's `cursor_high_water` when sidecars are
+    being rewritten in-place, or ring-overflow recovery
+    must reject cleanly). *Large, multi-ADR.*
 
-12. **Vector embeddings + vector-form identity/locality PBC
-    opcodes** *(brainstorm 002.)* ANN as a first-class index
-    family, composing on the secondary-index substrate (#8) and
-    LSM (#11). *Large, multi-ADR.*
+12. **CDC follow-up ADRs (consume ADR 054 substrate).**
+    Independent; each ships its own contract surface:
+    - **PBC filter pushdown on subscriptions.** Trailing-
+      section bytecode on `CDC_SUBSCRIBE_REQ`; new
+      `CDC_WATERMARK` MsgType for low-selectivity streams
+      (every emitted event advances the cursor at
+      substrate, but watermarks become load-bearing once
+      filters can drop events without advancing); filter
+      reject taxonomy; budget accounting; no-match
+      checkpoint advancement. Reuses ADR 036 PBC validator
+      family.
+    - **Continuous historical-plus-live queries.** Either
+      composes externally (L2 read at HLC=T plus CDC
+      subscription with cursor matching T) or introduces a
+      dedicated streaming `QUERY_REQ` / `QUERY_RESP` shape.
+    - **Post-commit PBC triggers.** New `TriggerCatalog`
+      (mirroring ADR 052 `SecondaryIndexCatalog` shape),
+      `SchemaObjectKind::Trigger`, trigger worker that runs
+      PBC over CDC events and appends to descriptor-bound
+      append-only sinks; sink-write idempotency; indirect
+      cycle detection; pause-resume operator surface.
+    - **Synchronous PBC triggers at admission.**
+      Admission-time PBC hook with its own CPU budget and
+      failure-domain rules; deterministic PBC requirement.
+    - **Webhook worker + `__webhook_events__` system table
+      (or equivalent).** Internal HTTP retry / DLQ
+      semantics; webhook worker is a CDC consumer.
+    - **Server-side durable cursor commit (consumer-group
+      semantics).** New `CDC_CURSOR_COMMIT_REQ` / `_RESP`
+      MsgType pair; substrate cursor unchanged.
+    - **Exactly-once delivery contract.** Server-side
+      cursor commit + per-frame ack RPC.
+    - **Cross-replica cursor handoff (zero-reconnect
+      failover).** Server-side durable cursor + replica
+      synchronization.
+    - **Multi-table / tenant-firehose subscription scope.**
+      Cursor extends to carry `TableObjectId` explicitly;
+      V1's two-field scope is forward-compatible.
+    - **Before-image CDC payloads.** Adds `before_*`
+      columns to the CDC event row schema; substrate
+      cursor / digest domain unchanged.
+    - **Event-history digest domain
+      (`digest.cdc.event.v1`).** Adds prefix-membership
+      proof when a consumer (e.g., downstream secondary-
+      index replicator) needs it independent of visible
+      state.
+    - **Consumer-friendly higher-level `CdcEventKind`
+      view.** Layered on top of substrate version-entries;
+      derives insert / update / delete / resurrection
+      semantics from row-axis synthetic columns.
+    - **Per-table CDC opt-in / opt-out** (and per-table
+      retention extension beyond source-table retention).
+    *Each is its own ADR; ordering opportunistic.*
 
-### Encoding / compute / durability
+13. **Vector embeddings + vector-form identity / locality
+    PBC opcodes** *(brainstorm 002.)* ANN as a first-class
+    index family, composing on the secondary-index
+    substrate (#8) and LSM (#11). *Large, multi-ADR.*
 
-13. **Encoding, fetch, and distributed compute refinements.**
-    Bundle: LCE V2 / V3 (brainstorm 011 — homerolled SIMD
-    encodings, COCD); mini-page row-group fetch (refines
-    ADR 044 from buffer to row-group level); per-buffer page
-    directory; zstd capacity-tier codec + `CompressionLevel`
-    newtype; serverless PBC L2 (brainstorm 010); L1 inline
-    erasure coding (brainstorm 003). *Multi-quarter, several
-    ADRs.*
+14. **Encoding, fetch, and distributed compute
+    refinements.** Bundle: LCE V2 / V3 (brainstorm 011 —
+    homerolled SIMD encodings, COCD); mini-page row-group
+    fetch (refines ADR 044 from buffer to row-group
+    level); per-buffer page directory; zstd capacity-tier
+    codec + `CompressionLevel` newtype; serverless PBC L2
+    (brainstorm 010); L1 inline erasure coding
+    (brainstorm 003). *Multi-quarter, several ADRs.*
 
-### Refinement plumbing (opportunistic)
-
-14. **Small ADRs, no ordering constraint.** AGG follow-ups
-    (float canonical, Decimal SUM/AVG, GROUP BY *(medium-
-    large)*, string/binary quantiles, exact COUNT(DISTINCT),
-    `COUNT(DISTINCT __row_key_id__)` shortcut, CSB visibility-
-    metadata consolidation). Hilbert locality variant.
-    Append-only `SingleRow` low-latency path. `IntraBatchIndex`
-    widening to u64. Provider-native multi-range API in
-    `ObjectStore`. `RecordBufferDirectory` cache.
+15. **Refinement plumbing (opportunistic, no ordering
+    constraint).** AGG follow-ups (float canonical,
+    Decimal SUM/AVG, GROUP BY *(medium-large)*,
+    string/binary quantiles, exact COUNT(DISTINCT),
+    `COUNT(DISTINCT __row_key_id__)` shortcut, CSB
+    visibility-metadata consolidation). Hilbert locality
+    variant. Append-only `SingleRow` low-latency path.
+    `IntraBatchIndex` widening to u64. Provider-native
+    multi-range API in `ObjectStore`.
+    `RecordBufferDirectory` cache.
 
 ## What not to do next
 
-- **Don't add bytes to the slab footer without first deciding
-  what they mean.** Footer size and HMAC coverage are
-  deliberately constrained; existing locator/hash space and
-  projected-read integrity assumptions punish ill-specified
-  additions. The `StateDigest` ADR settles meaning before
-  placement.
-- **Don't bundle the topology implementation into the
-  `StateDigest` ADR.** They are independent algebra layers;
-  bundling produces a mega-ADR that defers a real decision.
-- **Don't pre-allocate `__row_tombstone__`,
-  `AppendOnlyContentHash`, FROST-signature, or any other
-  follow-up shape into the `StateDigest` ADR's surface.** Per
-  `no-premature-backward-compat.md`, each follow-up lands its
-  own surface.
-- **Don't open secondary indexes before the substrate /
-  lifecycle / topology / identity / descriptor work above
-  lands.** If the council reverses direction, record the new
-  sequence in this roadmap before opening the secondary-index
-  ADR; otherwise stay on the converged ordering.
+- **Don't bundle the CDC follow-up ADRs into one
+  mega-ADR.** Each consumer of the ADR 054 substrate
+  (filters, triggers, webhooks, continuous queries,
+  durable cursor commit, multi-table firehose, before-
+  images, event-history digest) has its own contract
+  surface; bundling defers real decisions behind a larger
+  one. Land them independently against the substrate.
+- **Don't open LSM compaction without first thinking
+  through the CDC live-tail interaction.** ADR 054's
+  safe-emission watermark plus ring-continuity guard
+  assume locality slabs do not get rewritten under an
+  active subscription's catchup ceiling. LSM compaction
+  needs an explicit policy: either compaction yields to
+  active subscriptions, or `RING_OVERFLOW_DURING_CATCHUP`
+  fires cleanly. Decide before shipping.
 - **Don't promote stabilization watch items into roadmap
   items.** Stabilization watch — observability metrics,
-  architectural-test guards, post-merge dashboards — lives in
-  runbooks and tests, not as a roadmap feature. Decision-
-  enabling measurement (e.g., the `StateDigest` cold-path
-  benchmark) belongs inside the owning ADR.
-- **Don't re-open the topology gate without citing the rework
-  budget recorded in brainstorm 015's closure status.**
-  Speculative threat models, aesthetic preferences, and the
-  desire to reuse curve machinery are not sufficient grounds.
-  A re-open requires concrete verifier requirements or
-  operational evidence that opaque-handle plus membership-
-  bound signing forces more rework than a `NodeId`-shape
-  migration.
+  architectural-test guards, post-merge dashboards — lives
+  in runbooks and tests, not as a roadmap feature.
+  Decision-enabling measurement (e.g., the CDC watermark
+  hold-time bench at multiple heartbeat cadences) belongs
+  inside the owning ADR.
+- **Don't re-open the topology gate without citing the
+  rework budget recorded in brainstorm 015's closure
+  status.** Speculative threat models, aesthetic
+  preferences, and the desire to reuse curve machinery
+  are not sufficient grounds. A re-open requires concrete
+  verifier requirements or operational evidence that
+  opaque-handle plus membership-bound signing forces more
+  rework than a `NodeId`-shape migration.
+- **Don't add a `CdcEventKind` enum to the substrate.**
+  Consumer-friendly insert / update / delete / resurrection
+  semantics layer on top in a future higher-level view ADR
+  (#12 sub-bullet). The substrate stays storage-axis-
+  aligned with the version-entry grain.
+- **Don't expose `LocalityId` on the CDC cursor.** The
+  identity-axis cursor is the load-bearing decision; the
+  safe-emission watermark plus heartbeat contract is what
+  makes global cursor monotonicity work without it.
 
 ## Convergence summary
 
 ```text
-StateDigest substrate
-  → tombstones (validate algebra @ deletion)
-  → retention (validate algebra @ compaction)
+StateDigest substrate                         (ADR 046)
+  → tombstones (validate algebra @ deletion)  (ADR 047)
+  → retention (validate algebra @ compaction) (ADR 048)
   → topology gate CLOSED — Outcome B (opaque NodeId)
-  → content-hash identity (ADR 049)
-  → PK-keyed row delete via supersession (ADR 050)
-  → descriptor fingerprint split (ADR 051)
-  → secondary indexes (ADR 052)
-  → wire-side Arrow IPC body compression (ADR 053)
-  → CDC (next: roadmap #10)
-  → LSM
+  → content-hash identity                     (ADR 049)
+  → PK-keyed row delete via supersession      (ADR 050)
+  → descriptor fingerprint split              (ADR 051)
+  → secondary indexes                         (ADR 052)
+  → wire-side Arrow IPC body compression      (ADR 053)
+  → CDC subscription substrate                (ADR 054)  ← here
+  → LSM (next: roadmap #11)
+  → CDC follow-up ADRs (filters, triggers, webhooks, …)
   → vector embeddings
   → encoding / fetch / distributed compute
   → refinement plumbing
 ```
 
-Design tip is past ADR 053 with wire-side Arrow IPC body
-compression *promoted* (design accepted; implementation
-phases pending). Next ADR is CDC + triggers (#10), the
-first multi-ADR streaming surface; CDC emitters are
-wire-side fresh-encoders by construction and inherit ADR
-053's `wire_ipc_write_options()` plus per-buffer LZ4_FRAME
-without a CDC-specific codec decision (CDC registers a new
-`path` label value on the `network_compression_*` family
-when it lands). ADR 046 substrate cleared its bench gate;
-ADR 047 / 048 / 049 cleared full 100k / 1M promotion
-matrices on 2026-04-29; ADR 050 implementation is in place
-with the full 100k / 1M bench matrix still ahead; ADR 051
-implementation phases (Phase 0 contract freeze through
-Phase 8 metrics / runbook / arch guards) and full 100k / 1M
-bench matrix remain ahead; ADR 052 implementation phases
-(Phase 0 contract freeze through Phase 10 architectural
-guards / metrics / audit / runbook) and full 100k / 1M
-bench matrix remain ahead; ADR 053 implementation phases
-(Phase 0 contract freeze through Phase 6 architectural
-guards) and small-edge / small / medium / large bench
-matrix remain ahead.
+Design tip is past ADR 054 with the CDC subscription
+substrate *promoted* (design accepted; implementation
+phases pending). Next ADR is LSM-style leveled compaction
+(#11), the first of the post-CDC large multi-ADR
+sequences; ordering against the CDC follow-up cluster
+(#12) is opportunistic — a CDC consumer ADR can land
+ahead of LSM if the council prefers, since neither
+blocks the other on shape.
