@@ -19,17 +19,95 @@ forward-sequence rewrite.
 
 ## Where we are
 
-ADR 052 (Secondary Indexes on Non-Clustering Columns) just
-promoted. First non-`__row_key_id__` access path on the
-table: a non-unique ordered scalar index over one user
-column on PK / append-only / content-hash tables. Index
-descriptors live in a replicated `SecondaryIndexCatalog`
-outside `TableSchemaDescriptorV1`; create / drop reuses
-`SchemaUpdateEnvelopeV1` with `SchemaObjectKind::Index` and
-**four `mutation` variants** — `Create` / `Drop` (operator-
-initiated) plus `IndexBackfillComplete` /
-`IndexDropGcComplete` (replica-initiated, lifecycle-
-advancing). Catalog rows carry
+ADR 053 (Wire-Side Arrow IPC Body Compression) just
+promoted. Closes the wire half of the body-compression
+question ADR 043 deferred. Per-buffer LZ4_FRAME via Arrow
+IPC's native `BodyCompression` on every wire-side
+fresh-encode `StreamWriter`, mirroring ADR 043's storage-side
+choice and reusing `RecordBodyCompressionPolicy::Lz4Frame`.
+A single helper `src/network/ipc.rs::wire_ipc_write_options`
+pinned by `WIRE_BODY_COMPRESSION` is the only wire-side
+`IpcWriteOptions` constructor, with `wire_encode_batch` as
+its function-level companion; four wire-side fresh-encoder
+sites flip in V1 — two direct `StreamWriter` sites
+(`src/client/core.rs::encode_batch`,
+`src/network/data_server.rs::encode_migration_records`) and
+two indirect sites that currently route through
+`multirow::encode_batch`
+(`src/network/data_server.rs:3233` `TABLE_QUERY_RESP` and
+`src/network/data_server.rs:4387` `READ_RESP`). One site is
+explicitly excluded
+(`src/schema/table.rs::encode_arrow_schema_ipc` for ADR 043
+§5 boot-time independence). Storage pass-through bytes flow
+verbatim (already self-described under ADR 043). Receivers
+decompress transparently via `StreamReader` plus the
+on-by-default `ipc_compression` Cargo feature; ADR 053
+elevates the feature pin to a mechanical CI guard. No new
+HRFT frame family, no new `MsgType`, no new
+`FRAME_FLAG_*` for compression, no envelope
+`format_version` bump, no node capability bit, no per-RPC
+accept flag, no Cargo feature or dependency change, no per-
+table or per-tenant policy, no kill-switch. The Arrow IPC
+FlatBuffer is the single source of truth for whether bytes
+are compressed — ADR 053 inherits ADR 043 §4's
+self-description discipline on the wire axis. Per-buffer
+choice is load-bearing on three properties: (1) storage
+pass-through composes only with per-buffer (a framing-layer
+envelope would double-compress or need detection logic);
+(2) Arrow's `-1` length-sentinel handles the high-entropy /
+small-buffer fallback automatically; (3) forwarding paths
+flow opaquely, no flag-stripping. Meta and trailing
+sections stay uncompressed for both density (small,
+high-entropy) and CRIME-class side-channel disjointness
+(operator/auth bytes vs tenant Arrow bytes in disjoint
+compression contexts). Compress-then-encrypt order
+preserved by construction (Arrow encode → LZ4 → HRFT
+framing → QUIC mTLS). `MAX_SECTION_BYTES = 5 MiB` cap
+unchanged; applied on encoded (wire) bytes; decoded
+bound owned by `StreamReader`. Side-discipline cleanup:
+`FrameHeader.flags` bit-0 (`arrow_compressed`) and bit-1
+(`has_trailing`) doc reservations are deleted (neither was
+ever read or written); `FRAME_FLAG_KNOWN_MASK = FRAME_FLAG_STREAM_END`
+introduced and `read_frame_header` rejects frames whose
+flags include any bit outside the mask. Identity-vs-Locality
+framing inherited from `plans/philosophy.md`: wire
+compression touches neither — same Arrow `RecordBatch`
+decodes on both sides, identity / locality / fingerprints /
+digests / HLC / Raft / object-store keys / CDC logical
+records all compute over decoded bytes or storage-domain
+bytes, not transient wire bytes. Observability:
+`network_compression_*` family with bounded
+`{codec, path}` labels;
+`path ∈ {client_batch, migration_records, query_response, read_response}`
+initially, architectural-test pinned; `batches_total`
+carries `result ∈ {compressed, error}` (pass-through bytes
+are not counted by `network_compression_*` — they appear
+under `storage_compression_*`); `decode_error_total`
+carries `{codec}` only (diagnostic reason text moves to
+logs/spans to keep label cardinality bounded). No production
+plaintext-byte counter in V1 (avoids ADR 043 §3
+double-encode cost where there is no enforcement axis to
+amortise it); `ratio` populates opportunistically without
+double-encoding; production sees a sparse histogram. No
+decode-latency histogram in V1 (decoding owned by Arrow
+`StreamReader`; ADR 053 introduces no HRFT-layer LZ4
+code). CDC (#10) registers a new `path` label value when
+it lands. See
+`plans/adr/053_wire_arrow_ipc_body_compression.md` and
+`plans/impl/053_wire_arrow_ipc_body_compression.md`.
+Implementation phases pending.
+
+ADR 052 (Secondary Indexes on Non-Clustering Columns) is
+the immediate predecessor. First non-`__row_key_id__` access
+path on the table: a non-unique ordered scalar index over
+one user column on PK / append-only / content-hash tables.
+Index descriptors live in a replicated
+`SecondaryIndexCatalog` outside `TableSchemaDescriptorV1`;
+create / drop reuses `SchemaUpdateEnvelopeV1` with
+`SchemaObjectKind::Index` and **four `mutation` variants**
+— `Create` / `Drop` (operator-initiated) plus
+`IndexBackfillComplete` / `IndexDropGcComplete`
+(replica-initiated, lifecycle-advancing). Catalog rows carry
 `SecondaryIndexState ∈ {Building, Ready, Dropping}` with a
 linear `absent → Building → Ready → Dropping → absent`
 lifecycle; planner gates on `Ready` only, `Building` and
@@ -497,10 +575,42 @@ Gemini.
    audit / runbook) and full 100k / 1M bench matrix remain
    ahead.
 
-9. **Wire-frame compression (transport-side IPC).** Lands
-   before CDC so streaming surfaces inherit transport-side
-   compression instead of inventing a stream-local contract.
-   *2–3 iterations.*
+9. **Wire-side Arrow IPC body compression.** ADR 053
+    promoted — see
+    `plans/adr/053_wire_arrow_ipc_body_compression.md` and
+    `plans/impl/053_wire_arrow_ipc_body_compression.md`.
+    Per-buffer LZ4_FRAME on fresh wire-side Arrow IPC
+    encoders via Arrow IPC's native `BodyCompression`,
+    mirroring ADR 043 on the wire axis and reusing
+    `RecordBodyCompressionPolicy::Lz4Frame`. Single helper
+    `wire_ipc_write_options()` pinned by
+    `WIRE_BODY_COMPRESSION` (with `wire_encode_batch` as its
+    function-level companion); four wire-side fresh-encoder
+    sites flip — two direct
+    (`client/core.rs::encode_batch`,
+    `data_server.rs::encode_migration_records`) and two
+    indirect via `multirow::encode_batch`
+    (`data_server.rs:3233` `TABLE_QUERY_RESP`,
+    `data_server.rs:4387` `READ_RESP`); one excluded
+    (`encode_arrow_schema_ipc` for boot-time independence). Storage pass-through bytes flow
+    verbatim. Receivers decode transparently via
+    `StreamReader` plus the on-by-default
+    `ipc_compression` Cargo feature (architectural guard
+    pins it on). No new HRFT frame family / `MsgType` /
+    `FRAME_FLAG_*` for compression, no envelope
+    `format_version` bump, no node capability bit, no
+    per-RPC accept flag, no Cargo feature change, no
+    per-table or per-tenant policy, no kill-switch.
+    Side-discipline cleanup:
+    `FrameHeader.flags` bit-0 / bit-1 doc reservations
+    deleted; `FRAME_FLAG_KNOWN_MASK` validation hardens
+    framing-layer flag-drift detection.
+    `network_compression_*` metrics with bounded
+    `{codec, path}` labels; production omits
+    plaintext-byte counter and decode-latency histogram in
+    V1. CDC (#10) inherits the wire helper and registers a
+    new `path` value when it lands. Implementation phases
+    pending. *2–3 iterations remain ahead in code.*
 
 10. **CDC + triggers** *(brainstorm 004.)* Append-only is the
     canonical CDC sink. Cursor surface decision lands here
@@ -588,26 +698,32 @@ StateDigest substrate
   → PK-keyed row delete via supersession (ADR 050)
   → descriptor fingerprint split (ADR 051)
   → secondary indexes (ADR 052)
-  → wire-frame compression (next: roadmap #9)
-  → CDC
+  → wire-side Arrow IPC body compression (ADR 053)
+  → CDC (next: roadmap #10)
   → LSM
   → vector embeddings
   → encoding / fetch / distributed compute
   → refinement plumbing
 ```
 
-Design tip is past ADR 052 with secondary indexes on non-
-clustering columns *promoted* (design accepted;
-implementation phases pending). Next ADR is wire-frame
-compression (#9), which lands before CDC so streaming
-surfaces inherit transport-side compression instead of
-inventing a stream-local contract. ADR 046 substrate
-cleared its bench gate; ADR 047 / 048 / 049 cleared full
-100k / 1M promotion matrices on 2026-04-29; ADR 050
-implementation is in place with the full 100k / 1M bench
-matrix still ahead; ADR 051 implementation phases (Phase 0
-contract freeze through Phase 8 metrics / runbook / arch
-guards) and full 100k / 1M bench matrix remain ahead;
-ADR 052 implementation phases (Phase 0 contract freeze
-through Phase 10 architectural guards / metrics / audit /
-runbook) and full 100k / 1M bench matrix remain ahead.
+Design tip is past ADR 053 with wire-side Arrow IPC body
+compression *promoted* (design accepted; implementation
+phases pending). Next ADR is CDC + triggers (#10), the
+first multi-ADR streaming surface; CDC emitters are
+wire-side fresh-encoders by construction and inherit ADR
+053's `wire_ipc_write_options()` plus per-buffer LZ4_FRAME
+without a CDC-specific codec decision (CDC registers a new
+`path` label value on the `network_compression_*` family
+when it lands). ADR 046 substrate cleared its bench gate;
+ADR 047 / 048 / 049 cleared full 100k / 1M promotion
+matrices on 2026-04-29; ADR 050 implementation is in place
+with the full 100k / 1M bench matrix still ahead; ADR 051
+implementation phases (Phase 0 contract freeze through
+Phase 8 metrics / runbook / arch guards) and full 100k / 1M
+bench matrix remain ahead; ADR 052 implementation phases
+(Phase 0 contract freeze through Phase 10 architectural
+guards / metrics / audit / runbook) and full 100k / 1M
+bench matrix remain ahead; ADR 053 implementation phases
+(Phase 0 contract freeze through Phase 6 architectural
+guards) and small-edge / small / medium / large bench
+matrix remain ahead.
