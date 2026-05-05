@@ -16,6 +16,7 @@ advertise_address = "127.0.0.1:7001"
 [storage]
 data_dir = "data"
 slab_max_bytes = 67108864
+lsm_compaction_paused = false
 
 [tuning]
 rf = 1
@@ -45,6 +46,9 @@ transfer_signing_secret = "<64 hex chars>"
   validation fails.
 - `slab_max_bytes`, `rf`, `wal_io_depth`, and `slab_io_depth` default to
   `67108864`, `1`, `64`, and `64` respectively when omitted.
+- `lsm_compaction_paused` is a node-local ADR 055 maintenance switch. It
+  defaults to `false`; when set, the LSM compaction task starts but does not
+  launch new jobs until resumed through the node's service control handle.
 - Transport admission defaults to `1024` total inbound connections, `64`
   inbound connections per peer IP, `64` streams per connection, and `4096`
   concurrent stream-handler tasks when the corresponding `[tuning]` fields are

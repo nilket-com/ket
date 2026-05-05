@@ -1,5 +1,6 @@
 use crate::schema::{
-	CdcRejectCode, IndexObjectId, RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus,
+	CdcRejectCode, CompactionLevelIndex, IndexObjectId, RecordBodyCompressionPolicy, TableObjectId,
+	TenantId, WriteStatus,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -184,6 +185,52 @@ impl CdcSubscriptionMetricResult {
 			Self::Closed => "closed",
 			Self::Rejected => "rejected",
 			Self::Cancelled => "cancelled",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LsmCompactionResult {
+	Ok,
+	ManifestRace,
+	SidecarDigestMismatch,
+	VisibleDigestInvariance,
+	Aborted,
+}
+
+impl LsmCompactionResult {
+	pub const ALL: [Self; 5] = [
+		Self::Ok,
+		Self::ManifestRace,
+		Self::SidecarDigestMismatch,
+		Self::VisibleDigestInvariance,
+		Self::Aborted,
+	];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Ok => "ok",
+			Self::ManifestRace => "manifest_race",
+			Self::SidecarDigestMismatch => "sidecar_digest_mismatch",
+			Self::VisibleDigestInvariance => "visible_digest_invariance",
+			Self::Aborted => "aborted",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LsmDigestInvariantKind {
+	VisibleDomain,
+	VersionEntry,
+}
+
+impl LsmDigestInvariantKind {
+	pub const ALL: [Self; 2] = [Self::VisibleDomain, Self::VersionEntry];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::VisibleDomain => "visible_domain",
+			Self::VersionEntry => "version_entry",
 		}
 	}
 }
@@ -1396,6 +1443,140 @@ impl CdcSourceHistograms {
 }
 
 #[derive(Default)]
+struct LsmCompactionCounters(Mutex<BTreeMap<(u8, &'static str), u64>>);
+
+impl LsmCompactionCounters {
+	fn inc(&self, compaction_level: CompactionLevelIndex, result: LsmCompactionResult) {
+		if !compaction_level.is_compaction_source() {
+			return;
+		}
+		let mut values = self
+			.0
+			.lock()
+			.expect("lsm compaction counter mutex poisoned");
+		*values
+			.entry((compaction_level.get(), result.as_str()))
+			.or_default() += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let values = self
+			.0
+			.lock()
+			.expect("lsm compaction counter mutex poisoned");
+		for level in CompactionLevelIndex::COMPACTION_SOURCES {
+			for result in LsmCompactionResult::ALL {
+				render_counter_with_labels(
+					out,
+					name,
+					&[("level", level_label(level)), ("result", result.as_str())],
+					values
+						.get(&(level.get(), result.as_str()))
+						.copied()
+						.unwrap_or(0),
+				);
+			}
+		}
+	}
+}
+
+#[derive(Default)]
+struct LsmSourceLevelGauges(Mutex<BTreeMap<u8, u64>>);
+
+impl LsmSourceLevelGauges {
+	fn set(&self, compaction_level: CompactionLevelIndex, value: u64) {
+		if !compaction_level.is_compaction_source() {
+			return;
+		}
+		self.0
+			.lock()
+			.expect("lsm source-level gauge mutex poisoned")
+			.insert(compaction_level.get(), value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_gauge_family_header(out, name, help);
+		let values = self
+			.0
+			.lock()
+			.expect("lsm source-level gauge mutex poisoned");
+		for level in CompactionLevelIndex::COMPACTION_SOURCES {
+			render_gauge_with_labels(
+				out,
+				name,
+				&[("level", level_label(level))],
+				values.get(&level.get()).copied().unwrap_or(0),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct LsmAllLevelGauges(Mutex<BTreeMap<u8, u64>>);
+
+impl LsmAllLevelGauges {
+	fn set(&self, compaction_level: CompactionLevelIndex, value: u64) {
+		self.0
+			.lock()
+			.expect("lsm level gauge mutex poisoned")
+			.insert(compaction_level.get(), value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_gauge_family_header(out, name, help);
+		let values = self.0.lock().expect("lsm level gauge mutex poisoned");
+		for level in CompactionLevelIndex::ALL {
+			render_gauge_with_labels(
+				out,
+				name,
+				&[("level", level_label(level))],
+				values.get(&level.get()).copied().unwrap_or(0),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct LsmDigestInvariantCounters(Mutex<BTreeMap<&'static str, u64>>);
+
+impl LsmDigestInvariantCounters {
+	fn inc(&self, kind: LsmDigestInvariantKind) {
+		let mut values = self
+			.0
+			.lock()
+			.expect("lsm digest invariant counter mutex poisoned");
+		*values.entry(kind.as_str()).or_default() += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let values = self
+			.0
+			.lock()
+			.expect("lsm digest invariant counter mutex poisoned");
+		for kind in LsmDigestInvariantKind::ALL {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("kind", kind.as_str())],
+				values.get(kind.as_str()).copied().unwrap_or(0),
+			);
+		}
+	}
+}
+
+fn level_label(level: CompactionLevelIndex) -> &'static str {
+	match level {
+		CompactionLevelIndex::L0 => "0",
+		CompactionLevelIndex::L1 => "1",
+		CompactionLevelIndex::L2 => "2",
+		CompactionLevelIndex::L3 => "3",
+		_ => unreachable!("CompactionLevelIndex rejects values outside 0..=3"),
+	}
+}
+
+#[derive(Default)]
 struct L2ColumnFetchFallbackCounters {
 	disabled: Counter,
 	single_row: Counter,
@@ -2057,6 +2238,15 @@ pub struct MetricsRegistry {
 	pub storage_table_retention_ambiguous_rows_retained_total: Counter,
 	pub storage_table_retention_lag_seconds: Gauge,
 	storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges,
+	lsm_compactions: LsmCompactionCounters,
+	lsm_compaction_input_slabs: LsmSourceLevelGauges,
+	lsm_compaction_output_bytes: LsmSourceLevelGauges,
+	lsm_compaction_duration_millis: LsmSourceLevelGauges,
+	lsm_level_slab_count: LsmAllLevelGauges,
+	lsm_level_total_bytes: LsmAllLevelGauges,
+	pub lsm_pending_delete_slabs: Gauge,
+	pub lsm_retired_slab_pinned_bytes: Gauge,
+	lsm_digest_invariance_violations: LsmDigestInvariantCounters,
 	storage_secondary_index_create: SecondaryIndexCounters,
 	storage_secondary_index_drop: SecondaryIndexCounters,
 	storage_secondary_index_lifecycle_transitions: SecondaryIndexTransitionCounters,
@@ -2294,6 +2484,15 @@ impl Default for MetricsRegistry {
 			storage_table_retention_lag_seconds: Gauge::default(),
 			storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges::default(
 			),
+			lsm_compactions: LsmCompactionCounters::default(),
+			lsm_compaction_input_slabs: LsmSourceLevelGauges::default(),
+			lsm_compaction_output_bytes: LsmSourceLevelGauges::default(),
+			lsm_compaction_duration_millis: LsmSourceLevelGauges::default(),
+			lsm_level_slab_count: LsmAllLevelGauges::default(),
+			lsm_level_total_bytes: LsmAllLevelGauges::default(),
+			lsm_pending_delete_slabs: Gauge::default(),
+			lsm_retired_slab_pinned_bytes: Gauge::default(),
+			lsm_digest_invariance_violations: LsmDigestInvariantCounters::default(),
 			storage_secondary_index_create: SecondaryIndexCounters::default(),
 			storage_secondary_index_drop: SecondaryIndexCounters::default(),
 			storage_secondary_index_lifecycle_transitions:
@@ -2878,6 +3077,46 @@ impl MetricsRegistry {
 	) {
 		self.storage_table_retention_policy_active_tables
 			.set(inherit, disabled, fixed);
+	}
+
+	pub fn observe_lsm_compaction(
+		&self,
+		source_level: CompactionLevelIndex,
+		result: LsmCompactionResult,
+		input_slabs: u64,
+		output_bytes: u64,
+		duration: Duration,
+	) {
+		self.lsm_compactions.inc(source_level, result);
+		self.lsm_compaction_input_slabs
+			.set(source_level, input_slabs);
+		self.lsm_compaction_output_bytes
+			.set(source_level, output_bytes);
+		self.lsm_compaction_duration_millis.set(
+			source_level,
+			u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+		);
+	}
+
+	pub fn set_lsm_level_summary(
+		&self,
+		compaction_level: CompactionLevelIndex,
+		slab_count: u64,
+		total_bytes: u64,
+	) {
+		self.lsm_level_slab_count.set(compaction_level, slab_count);
+		self.lsm_level_total_bytes
+			.set(compaction_level, total_bytes);
+	}
+
+	pub fn set_lsm_gc_pressure(&self, pending_delete_slabs: u64, retired_slab_pinned_bytes: u64) {
+		self.lsm_pending_delete_slabs.set(pending_delete_slabs);
+		self.lsm_retired_slab_pinned_bytes
+			.set(retired_slab_pinned_bytes);
+	}
+
+	pub fn observe_lsm_digest_invariance_violation(&self, kind: LsmDigestInvariantKind) {
+		self.lsm_digest_invariance_violations.inc(kind);
 	}
 
 	pub fn observe_storage_secondary_index_create(
@@ -4092,6 +4331,53 @@ impl MetricsRegistry {
 			&mut out,
 			"wendelon_storage_table_retention_policy_active_tables_total",
 			"Current table lifecycle catalog entries by retention mode.",
+		);
+		self.lsm_compactions.render(
+			&mut out,
+			"wendelon_lsm_compactions_total",
+			"ADR 055 LSM compactions by source compaction level and bounded result.",
+		);
+		self.lsm_compaction_input_slabs.render(
+			&mut out,
+			"wendelon_lsm_compaction_input_slabs",
+			"Input slabs selected by the most recent ADR 055 compaction at each source level.",
+		);
+		self.lsm_compaction_output_bytes.render(
+			&mut out,
+			"wendelon_lsm_compaction_output_bytes",
+			"Output bytes written by the most recent ADR 055 compaction at each source level.",
+		);
+		self.lsm_compaction_duration_millis.render(
+			&mut out,
+			"wendelon_lsm_compaction_duration_millis",
+			"Duration in milliseconds of the most recent ADR 055 compaction at each source level.",
+		);
+		self.lsm_level_slab_count.render(
+			&mut out,
+			"wendelon_lsm_level_slab_count",
+			"Live slab count by ADR 055 compaction level.",
+		);
+		self.lsm_level_total_bytes.render(
+			&mut out,
+			"wendelon_lsm_level_total_bytes",
+			"Live slab bytes by ADR 055 compaction level.",
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_lsm_pending_delete_slabs",
+			"Retired ADR 055 slabs that have reached delete-pending state.",
+			self.lsm_pending_delete_slabs.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_lsm_retired_slab_pinned_bytes",
+			"Retired ADR 055 slab bytes still protected by active reader pins.",
+			self.lsm_retired_slab_pinned_bytes.get(),
+		);
+		self.lsm_digest_invariance_violations.render(
+			&mut out,
+			"wendelon_lsm_digest_invariance_violations_total",
+			"ADR 055 digest invariance violations by bounded digest kind.",
 		);
 		self.storage_secondary_index_create.render(
 			&mut out,

@@ -39,6 +39,9 @@ Current runbooks:
 - [ADR 054 CDC Subscription Substrate](./cdc_subscription.md)
   - CDC cursor/reject interpretation, live-tail ring overflow, heartbeat
     stalls, and bounded `cdc_*` metric surface
+- [ADR 055 LSM Compaction](./lsm_compaction.md)
+  - L0 debt, compaction result labels, retired pin pressure, digest invariant
+    alarms, and bounded `lsm_*` metric surface
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

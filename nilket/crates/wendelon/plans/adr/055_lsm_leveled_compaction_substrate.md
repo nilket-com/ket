@@ -242,7 +242,7 @@ ADR 055 ships **only** the leveled compaction
 substrate:
 
 1. per-locality slab manifest extended with
-   `(level, state, successors, hlc_range, byte_size,
+   `(compaction_level, state, successors, hlc_range, byte_size,
    row_count, sidecar_coverage, manifest_epoch)`;
 2. a pure compaction picker over a manifest snapshot +
    config + clock;
@@ -335,9 +335,9 @@ Four levels:
 ```rust
 #[repr(transparent)]
 #[derive(Copy, Clone, Pod, Zeroable, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct LevelIndex(u8);
+pub struct CompactionLevelIndex(u8);
 
-impl LevelIndex {
+impl CompactionLevelIndex {
     pub fn try_new(raw: u8) -> Option<Self> {
         if raw <= 3 { Some(Self(raw)) } else { None }
     }
@@ -351,7 +351,7 @@ A compaction run is a slab plus its manifest summary:
 ```rust
 pub struct LsmRunSummary {
     pub slab_id: SlabId,
-    pub level: LevelIndex,
+    pub compaction_level: CompactionLevelIndex,
     pub state: SlabState,
     pub min_row_hlc: Hlc,
     pub max_row_hlc: Hlc,
@@ -425,6 +425,8 @@ pub struct CompactionCommit {
     pub manifest_epoch_pre: ManifestEpoch,
     pub slabs_to_retire: Vec<SlabId>,
     pub slabs_to_add: Vec<LsmRunSummary>,
+    pub slabs_to_mark_delete_pending: Vec<SlabId>,
+    pub slabs_to_remove: Vec<SlabId>,
     pub sidecar_swaps: Vec<SidecarSwap>,
     pub digest_summary: CompactionDigestSummary,
 }
@@ -435,6 +437,12 @@ pub struct CompactionDigestSummary {
     pub version_entry_delta: StateDigest,
 }
 ```
+
+Regular compaction commits populate
+`slabs_to_retire` / `slabs_to_add`; GC lifecycle
+commits populate exactly one of
+`slabs_to_mark_delete_pending` or `slabs_to_remove`.
+Mixed shapes are rejected.
 
 The control-ring apply path validates:
 
@@ -513,7 +521,7 @@ pub struct LsmConfig {
 
 Primary triggers:
 
-- **`L0 → L1`**: `level_slab_count(L0) >=
+- **`L0 → L1`**: `compaction_level_slab_count(L0) >=
   max_l0_slab_count` AND
   `oldest_l0_slab_age_millis(now) >=
   lsm_l0_max_age_millis`. Job picks the current L0
@@ -857,10 +865,10 @@ Idempotent and restart-safe:
 
 `tests/architecture_test.rs` enforces:
 
-1. exactly one `LevelIndex` newtype-unit definition;
+1. exactly one `CompactionLevelIndex` newtype-unit definition;
 2. exactly one `CompactionJobId`, `ManifestEpoch`
    newtype-unit definitions;
-3. `LevelIndex` accepts only `0..=3`;
+3. `CompactionLevelIndex` accepts only `0..=3`;
 4. exactly one `CompactionMergeKey` definition; not
    imported by any CDC module;
 5. `lsm_*` metric registry contains exactly the
@@ -1151,7 +1159,7 @@ changing its shape:
   artifact.
 - **Cross-replica compaction deduplication** lifts
   the per-replica autonomy assumption.
-- **L4+ extension** raises `LevelIndex` range and
+- **L4+ extension** raises `CompactionLevelIndex` range and
   level-count config.
 - **Vector embeddings (roadmap #13)** compose as
   another sidecar family.

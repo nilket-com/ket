@@ -46,17 +46,18 @@ use crate::crypto::{
 	TieredMultiRangeReadPlan, TieredOffsetIndexEntry, TieredPlaintextRange,
 	TieredSlabObjectMetadata,
 };
-use crate::metrics::global as metrics;
+use crate::metrics::{LsmCompactionResult, LsmDigestInvariantKind, global as metrics};
 use crate::schema::table::{
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, TableObjectId,
 	TableSchemaCatalogV1, TableSchemaDescriptorV1, TableWriteRequestMeta,
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
-	IndexObjectId, Locality, LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId,
-	SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId,
+	ByteCount, CompactionJobId, CompactionLevelIndex, HybridTimestamp,
+	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId, Locality,
+	LogicalSchemaFingerprint, ManifestEpoch, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordRowIndex, RowCount, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	SlabId, SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId,
 	TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
@@ -104,8 +105,14 @@ use crate::storage::stats::{
 	max_column_stats_ciphertext_bytes_for_slab_payload, parse_column_stats_block,
 };
 use crate::storage::{
-	AsyncFileOps, BlockingFileOps, BlockingIoClass, IoUringFileOps, MvccRetentionPolicy, OpenFlags,
-	cluster_retention_floor, effective_table_retention, storage_row_table_object_id_at, write_file,
+	AsyncFileOps, BlockingFileOps, BlockingIoClass, CompactionCommit, CompactionDigestSummary,
+	CompactionFailure, CompactionManifest, CompactionPlan, IoUringFileOps, LsmCompactionDriver,
+	LsmCompactionJobRunner, LsmCompactionWorker, LsmGcDriver, LsmGcWorker, LsmPreparedOutputs,
+	LsmRunSummary, LsmSourceFrame, LsmWrittenOutputRun, ManifestSnapshot, MvccRetentionPolicy,
+	OpenFlags, SlabPinGuard, SlabPinTable, TierCommitter, VersionEntry, VersionLifecycle,
+	VisibleDomainRow, apply_elision, cluster_retention_floor, compaction_visible_domain_summary,
+	effective_table_retention, pick_compaction, required_output_run_count,
+	storage_row_table_object_id_at, survivor_records, write_file,
 };
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -409,6 +416,8 @@ pub struct SlabManager {
 	config: SlabManagerConfig,
 	file_ops: Arc<dyn AsyncFileOps>,
 	state: Mutex<ManagerState>,
+	compaction_manifest: RwLock<CompactionManifest>,
+	slab_pins: Arc<SlabPinTable>,
 	/// Authoritative key → version chain, aggregated across all
 	/// active and sealed slabs. Per ADR 013 the chain stores every
 	/// version sorted ascending by HLC; the tail is the current
@@ -561,6 +570,104 @@ fn secondary_index_backfill_reason_from_io(
 	}
 }
 
+fn lsm_run_summary_from_index(
+	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
+	slab_id: SlabId,
+	size_bytes: u64,
+	manifest_epoch: ManifestEpoch,
+) -> LsmRunSummary {
+	let mut min_row_hlc: Option<HybridTimestamp> = None;
+	let mut max_row_hlc: Option<HybridTimestamp> = None;
+	let mut row_count = 0_u64;
+
+	for entry in key_index.iter() {
+		for location in entry.value() {
+			if location.slab_id != slab_id {
+				continue;
+			}
+			min_row_hlc = Some(
+				min_row_hlc
+					.map(|current| current.min(location.hlc))
+					.unwrap_or(location.hlc),
+			);
+			max_row_hlc = Some(
+				max_row_hlc
+					.map(|current| current.max(location.hlc))
+					.unwrap_or(location.hlc),
+			);
+			row_count = row_count.saturating_add(1);
+		}
+	}
+
+	LsmRunSummary::new(
+		slab_id,
+		CompactionLevelIndex::L0,
+		min_row_hlc.unwrap_or_else(zero_hlc),
+		max_row_hlc.unwrap_or_else(zero_hlc),
+		ByteCount::new(size_bytes),
+		RowCount::new(row_count),
+		manifest_epoch,
+	)
+}
+
+const fn zero_hlc() -> HybridTimestamp {
+	HybridTimestamp {
+		physical_ms: 0,
+		logical: 0,
+		node_id: 0,
+	}
+}
+
+fn refresh_lsm_level_metrics(snapshot: &ManifestSnapshot) {
+	for compaction_level in CompactionLevelIndex::ALL {
+		metrics().set_lsm_level_summary(
+			compaction_level,
+			u64::from(snapshot.compaction_level_slab_count(compaction_level)),
+			snapshot.compaction_level_total_bytes(compaction_level),
+		);
+	}
+}
+
+fn remove_non_live_lsm_rows_from_index(
+	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
+	runs: &[LsmRunSummary],
+) {
+	let non_live_slabs = runs
+		.iter()
+		.filter(|run| !run.state.is_live())
+		.map(|run| run.slab_id)
+		.collect::<HashSet<_>>();
+	if non_live_slabs.is_empty() {
+		return;
+	}
+	let keys = key_index
+		.iter()
+		.map(|entry| *entry.key())
+		.collect::<Vec<_>>();
+	for key in keys {
+		let should_remove_key = if let Some(mut versions) = key_index.get_mut(&key) {
+			versions.retain(|location| !non_live_slabs.contains(&location.slab_id));
+			versions.is_empty()
+		} else {
+			false
+		};
+		if should_remove_key {
+			key_index.remove(&key);
+		}
+	}
+}
+
+fn lsm_compaction_result_from_failure(err: &CompactionFailure) -> LsmCompactionResult {
+	match err {
+		CompactionFailure::ManifestRace => LsmCompactionResult::ManifestRace,
+		CompactionFailure::SidecarDigestMismatch => LsmCompactionResult::SidecarDigestMismatch,
+		CompactionFailure::VisibleDigestInvariance => LsmCompactionResult::VisibleDigestInvariance,
+		CompactionFailure::BackfillRaceLost | CompactionFailure::IoError(_) => {
+			LsmCompactionResult::Aborted
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TieredStatsCacheKey {
 	slab_id: SlabId,
@@ -592,6 +699,12 @@ struct TieredRowRefreshPlan {
 	old_rows: Vec<PersistentRecordRow>,
 	new_rows: Vec<PersistentRecordRow>,
 	relocated_reads: Vec<(RecordLocation, RecordLocation)>,
+}
+
+struct LsmInstalledCompactionOutputs {
+	installed: Vec<(LsmWrittenOutputRun, Arc<LocalSlabStore>)>,
+	removed_rows: Vec<PersistentRecordRow>,
+	inserted_rows: Vec<PersistentRecordRow>,
 }
 
 #[derive(Clone)]
@@ -1026,6 +1139,7 @@ impl SlabManager {
 			BlockingIoClass::SlabMetadata,
 		)?);
 		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
+		cleanup_lsm_compaction_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
 		existing_ids.sort_unstable();
 
@@ -1088,6 +1202,7 @@ impl SlabManager {
 		};
 
 		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
+		let mut recovered_lsm_runs: Vec<LsmRunSummary> = Vec::new();
 		let persistent_index =
 			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
 				Ok(index) => Some(Arc::new(index)),
@@ -1126,6 +1241,7 @@ impl SlabManager {
 						secondary_index_segments.insert(row.key, row);
 					}
 					persistent_key_localities.extend(snapshot.record_localities);
+					recovered_lsm_runs = snapshot.lsm_runs;
 				}
 				Err(err) => {
 					tracing::warn!(
@@ -1136,6 +1252,7 @@ impl SlabManager {
 				}
 			}
 		}
+		remove_non_live_lsm_rows_from_index(&key_index, &recovered_lsm_runs);
 		let key_localities = build_key_localities(&key_index);
 		for (tenant_id, key_identity, locality) in recovered_key_localities {
 			if key_index.contains_key(&(tenant_id, key_identity)) {
@@ -1151,6 +1268,26 @@ impl SlabManager {
 			validate_row_tombstone_chain(entry.value())?;
 		}
 		let locality_index = build_locality_index(&key_localities);
+		let recovered_manifest_epoch = recovered_lsm_runs
+			.iter()
+			.map(|run| run.manifest_epoch)
+			.max()
+			.unwrap_or(ManifestEpoch::ZERO);
+		let mut compaction_manifest = if recovered_lsm_runs.is_empty() {
+			CompactionManifest::new(ManifestEpoch::ZERO)
+		} else {
+			CompactionManifest::from_recovered_runs(recovered_manifest_epoch, recovered_lsm_runs)
+		};
+		for entry in sealed.iter() {
+			if compaction_manifest.get_run(*entry.key()).is_none() {
+				compaction_manifest.insert_live_run(lsm_run_summary_from_index(
+					&key_index,
+					*entry.key(),
+					entry.value().write_cursor(),
+					compaction_manifest.manifest_epoch(),
+				));
+			}
+		}
 
 		let manager = Self {
 			config,
@@ -1164,6 +1301,8 @@ impl SlabManager {
 				rehydrating: HashSet::new(),
 				next_slab_id,
 			}),
+			compaction_manifest: RwLock::new(compaction_manifest),
+			slab_pins: Arc::new(SlabPinTable::default()),
 			key_index,
 			locality_index: RwLock::new(locality_index),
 			key_localities,
@@ -1175,6 +1314,8 @@ impl SlabManager {
 			secondary_index_source_slab_leases: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};
+		let snapshot = manager.compaction_manifest_snapshot();
+		refresh_lsm_level_metrics(&snapshot);
 		manager.rebuild_persistent_index().await;
 		Ok(manager)
 	}
@@ -1193,6 +1334,7 @@ impl SlabManager {
 			.await
 			.expect("force_seal_active_for_test should fsync sealed slab");
 		let sealed_id = sealed.slab_id();
+		let sealed_size = sealed.write_cursor();
 		let next_id = state.next_slab_id;
 		let next = Arc::new(
 			LocalSlabStore::open(
@@ -1207,6 +1349,7 @@ impl SlabManager {
 		state.active = next;
 		state.sealed.insert(sealed_id, sealed);
 		state.next_slab_id = next_id.saturating_add(1);
+		self.record_l0_compaction_run(sealed_id, sealed_size);
 		sealed_id
 	}
 
@@ -1217,6 +1360,42 @@ impl SlabManager {
 	/// Test / diagnostic accessor: number of sealed slabs.
 	pub async fn sealed_count(&self) -> usize {
 		self.state.lock().await.sealed.len()
+	}
+
+	pub async fn reserve_lsm_output_slab_ids(&self, count: usize) -> std::io::Result<Vec<SlabId>> {
+		let count = u64::try_from(count).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"LSM output slab reservation count does not fit in u64",
+			)
+		})?;
+		let mut state = self.state.lock().await;
+		let start = state.next_slab_id.get();
+		let end = start.checked_add(count).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				"LSM output slab reservation would overflow SlabId",
+			)
+		})?;
+		state.next_slab_id = SlabId::new(end);
+		Ok((start..end).map(SlabId::new).collect())
+	}
+
+	fn record_l0_compaction_run(&self, slab_id: SlabId, size_bytes: u64) {
+		let mut manifest = recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+		let summary = lsm_run_summary_from_index(
+			&self.key_index,
+			slab_id,
+			size_bytes,
+			manifest.manifest_epoch(),
+		);
+		if summary.row_count.get() == 0 {
+			return;
+		}
+		manifest.insert_live_run(summary);
+		let snapshot = manifest.snapshot();
+		drop(manifest);
+		refresh_lsm_level_metrics(&snapshot);
 	}
 
 	/// Test / diagnostic accessor: number of slabs currently
@@ -1247,6 +1426,1338 @@ impl SlabManager {
 		}
 		out.sort_by_key(|s| s.slab_id);
 		out
+	}
+
+	pub fn compaction_manifest_snapshot(&self) -> ManifestSnapshot {
+		recover_rwlock_read(&self.compaction_manifest, "compaction_manifest").snapshot()
+	}
+
+	pub fn apply_lsm_manifest_compaction_commit(
+		&self,
+		commit: &CompactionCommit,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		let mut manifest = recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+		let post_epoch = manifest.apply_compaction_commit(commit)?;
+		let snapshot = manifest.snapshot();
+		drop(manifest);
+		self.apply_lsm_pin_state_for_manifest_commit(commit);
+		refresh_lsm_level_metrics(&snapshot);
+		Ok(post_epoch)
+	}
+
+	fn apply_lsm_pin_state_for_manifest_commit(&self, commit: &CompactionCommit) {
+		for slab_id in &commit.slabs_to_mark_delete_pending {
+			self.slab_pins.force_delete_pending(*slab_id);
+		}
+		for slab_id in &commit.slabs_to_remove {
+			self.slab_pins.clear_delete_pending(*slab_id);
+		}
+	}
+
+	pub fn apply_lsm_manifest_planned_compaction_commit(
+		&self,
+		plan: &CompactionPlan,
+		commit: &CompactionCommit,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		let mut manifest = recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+		let post_epoch = manifest.apply_planned_compaction_commit(plan, commit)?;
+		let snapshot = manifest.snapshot();
+		drop(manifest);
+		self.apply_lsm_pin_state_for_manifest_commit(commit);
+		refresh_lsm_level_metrics(&snapshot);
+		Ok(post_epoch)
+	}
+
+	pub async fn install_lsm_compaction_temp_outputs(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		commit: &CompactionCommit,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		let staged = self
+			.stage_lsm_compaction_outputs(plan, prepared, written, commit, false)
+			.await?;
+		let post_epoch = match self.apply_lsm_manifest_planned_compaction_commit(plan, commit) {
+			Ok(post_epoch) => post_epoch,
+			Err(err) => {
+				self.cleanup_lsm_installed_outputs(&staged.installed).await;
+				return Err(err);
+			}
+		};
+		self.complete_lsm_compaction_install(staged, post_epoch)
+			.await
+	}
+
+	pub async fn install_lsm_compaction_temp_outputs_via_control_ring(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		commit: &CompactionCommit,
+		committer: &dyn TierCommitter,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		self.install_lsm_compaction_temp_outputs_via_control_ring_with_context(
+			plan, prepared, written, commit, committer, None,
+		)
+		.await
+	}
+
+	async fn install_lsm_compaction_temp_outputs_via_control_ring_with_context(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		commit: &CompactionCommit,
+		committer: &dyn TierCommitter,
+		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		let staged = self
+			.stage_lsm_compaction_outputs(
+				plan,
+				prepared,
+				written,
+				commit,
+				secondary_index_context.is_some(),
+			)
+			.await?;
+		let prepared_sidecars = match self
+			.prepare_lsm_secondary_index_segments_for_compaction(
+				plan,
+				written,
+				secondary_index_context,
+			)
+			.await
+		{
+			Ok(prepared_sidecars) => prepared_sidecars,
+			Err(err) => {
+				self.cleanup_lsm_installed_outputs(&staged.installed).await;
+				return Err(err);
+			}
+		};
+		let commit_result = committer.commit_lsm_compaction(commit.clone()).await;
+		let Some(post_epoch) = self.lsm_committed_manifest_epoch(commit) else {
+			self.cleanup_lsm_installed_outputs(&staged.installed).await;
+			return match commit_result {
+				Ok(()) => Err(CompactionFailure::ManifestRace),
+				Err(err) => Err(err.into()),
+			};
+		};
+		let post_epoch = self
+			.complete_lsm_compaction_install(staged, post_epoch)
+			.await?;
+		self.publish_prepared_lsm_secondary_index_segments(prepared_sidecars)
+			.await;
+		Ok(post_epoch)
+	}
+
+	async fn stage_lsm_compaction_outputs(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		commit: &CompactionCommit,
+		allow_sidecar_covered_inputs: bool,
+	) -> Result<LsmInstalledCompactionOutputs, CompactionFailure> {
+		self.validate_lsm_written_outputs(plan, prepared, written, commit)?;
+		self.validate_lsm_sidecar_swap_readiness(plan, commit, allow_sidecar_covered_inputs)?;
+		{
+			let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
+			manifest.validate_compaction_commit_against_plan(plan, commit)?;
+		}
+
+		let installed = self.install_lsm_output_files(written).await?;
+		let max_output_slab_id = installed.iter().map(|(run, _)| run.slab_id).max();
+
+		let removed_rows = self.lsm_removed_persistent_rows(prepared);
+		let inserted_rows = self.lsm_inserted_persistent_rows(prepared, written);
+
+		{
+			let state = self.state.lock().await;
+			for (run, _) in &installed {
+				if state.sealed.contains_key(&run.slab_id)
+					|| state.tiered.contains_key(&run.slab_id)
+				{
+					drop(state);
+					self.cleanup_lsm_installed_outputs(&installed).await;
+					return Err(CompactionFailure::ManifestRace);
+				}
+			}
+		}
+		if let Some(max_output_slab_id) = max_output_slab_id {
+			let mut state = self.state.lock().await;
+			if let Err(err) = self
+				.advance_active_after_lsm_outputs(&mut state, max_output_slab_id)
+				.await
+			{
+				drop(state);
+				self.cleanup_lsm_installed_outputs(&installed).await;
+				return Err(err.into());
+			}
+		}
+
+		Ok(LsmInstalledCompactionOutputs {
+			installed,
+			removed_rows,
+			inserted_rows,
+		})
+	}
+
+	async fn complete_lsm_compaction_install(
+		&self,
+		staged: LsmInstalledCompactionOutputs,
+		post_epoch: ManifestEpoch,
+	) -> Result<ManifestEpoch, CompactionFailure> {
+		let lsm_runs = self.compaction_manifest_snapshot().runs().to_vec();
+		let LsmInstalledCompactionOutputs {
+			installed,
+			removed_rows,
+			inserted_rows,
+		} = staged;
+
+		{
+			let state = self.state.lock().await;
+			for (run, slab) in installed {
+				state.sealed.insert(run.slab_id, slab);
+			}
+			for row in &removed_rows {
+				self.rollback_indexed_location(row.tenant_id, row.key_identity, row.location);
+			}
+			for row in &inserted_rows {
+				self.index_appended_location_with_locality(
+					row.tenant_id,
+					row.key_identity,
+					row.routing_locality,
+					row.location,
+				);
+			}
+		}
+
+		self.mirror_persistent_update(
+			PersistentIndexUpdate {
+				delete_records: removed_rows,
+				put_records: inserted_rows,
+				put_lsm_runs: lsm_runs,
+				..Default::default()
+			},
+			"lsm-compaction-install",
+		)
+		.await;
+		Ok(post_epoch)
+	}
+
+	fn lsm_committed_manifest_epoch(&self, commit: &CompactionCommit) -> Option<ManifestEpoch> {
+		let snapshot = self.compaction_manifest_snapshot();
+		let successors = commit
+			.slabs_to_add
+			.iter()
+			.map(|run| run.slab_id)
+			.collect::<Vec<_>>();
+		for slab_id in &commit.slabs_to_retire {
+			let run = snapshot.run(*slab_id)?;
+			if !matches!(&run.state, crate::storage::SlabState::Retired { successors: existing } if existing == &successors)
+			{
+				return None;
+			}
+		}
+		for expected in &commit.slabs_to_add {
+			let run = snapshot.run(expected.slab_id)?;
+			if !run.state.is_live()
+				|| run.compaction_level != expected.compaction_level
+				|| run.min_row_hlc != expected.min_row_hlc
+				|| run.max_row_hlc != expected.max_row_hlc
+				|| run.size_bytes != expected.size_bytes
+				|| run.row_count != expected.row_count
+				|| run.sidecar_coverage != expected.sidecar_coverage
+			{
+				return None;
+			}
+		}
+		Some(snapshot.manifest_epoch)
+	}
+
+	pub async fn run_lsm_compaction_once(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		let started = Instant::now();
+		let source_level = plan.source_level;
+		let input_slabs = plan.touched_slabs().len() as u64;
+		let result = self.run_lsm_compaction_once_inner(worker, plan).await;
+		self.observe_lsm_compaction_result(source_level, input_slabs, started, &result);
+		result
+	}
+
+	pub async fn run_lsm_compaction_once_via_control_ring(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+		committer: &dyn TierCommitter,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		self.run_lsm_compaction_once_via_control_ring_with_context(worker, plan, committer, None)
+			.await
+	}
+
+	async fn run_lsm_compaction_once_via_control_ring_with_context(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+		committer: &dyn TierCommitter,
+		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		let started = Instant::now();
+		let source_level = plan.source_level;
+		let input_slabs = plan.touched_slabs().len() as u64;
+		let result = self
+			.run_lsm_compaction_once_inner_via_control_ring(
+				worker,
+				plan,
+				committer,
+				secondary_index_context,
+			)
+			.await;
+		self.observe_lsm_compaction_result(source_level, input_slabs, started, &result);
+		result
+	}
+
+	fn observe_lsm_compaction_result(
+		&self,
+		source_level: CompactionLevelIndex,
+		input_slabs: u64,
+		started: Instant,
+		result: &Result<crate::storage::lsm::CompactionOutcome, CompactionFailure>,
+	) {
+		match result {
+			Ok(outcome) => metrics().observe_lsm_compaction(
+				source_level,
+				LsmCompactionResult::Ok,
+				input_slabs,
+				outcome.bytes_out,
+				started.elapsed(),
+			),
+			Err(err) => {
+				let metric_result = lsm_compaction_result_from_failure(err);
+				if matches!(metric_result, LsmCompactionResult::VisibleDigestInvariance) {
+					metrics().observe_lsm_digest_invariance_violation(
+						LsmDigestInvariantKind::VisibleDomain,
+					);
+				}
+				metrics().observe_lsm_compaction(
+					source_level,
+					metric_result,
+					input_slabs,
+					0,
+					started.elapsed(),
+				);
+			}
+		}
+	}
+
+	pub fn pick_lsm_compaction_plan(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+	) -> Option<CompactionPlan> {
+		let snapshot = self.compaction_manifest_snapshot();
+		pick_compaction(&snapshot, &worker.config(), now)
+	}
+
+	pub async fn run_lsm_compaction_tick(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+	) -> Result<Option<crate::storage::lsm::CompactionOutcome>, CompactionFailure> {
+		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
+			return Ok(None);
+		};
+		self.run_lsm_compaction_once(worker, plan).await.map(Some)
+	}
+
+	pub async fn run_lsm_compaction_tick_via_control_ring(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+		committer: &dyn TierCommitter,
+	) -> Result<Option<crate::storage::lsm::CompactionOutcome>, CompactionFailure> {
+		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
+			return Ok(None);
+		};
+		self.run_lsm_compaction_once_via_control_ring(worker, plan, committer)
+			.await
+			.map(Some)
+	}
+
+	pub async fn run_lsm_compaction_tick_via_control_ring_with_catalogs(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+		committer: &dyn TierCommitter,
+		table_schemas: &TableSchemaCatalogV1,
+		secondary_indexes: &SecondaryIndexCatalog,
+	) -> Result<Option<crate::storage::lsm::CompactionOutcome>, CompactionFailure> {
+		let Some(plan) = self.pick_lsm_compaction_plan(worker, now) else {
+			return Ok(None);
+		};
+		self.run_lsm_compaction_once_via_control_ring_with_context(
+			worker,
+			plan,
+			committer,
+			Some(SecondaryIndexCompactionContext {
+				table_schemas,
+				secondary_indexes,
+			}),
+		)
+		.await
+		.map(Some)
+	}
+
+	async fn run_lsm_compaction_once_inner(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		let _pins = worker.acquire_plan_pins(&plan)?;
+		let prepared = self.prepare_lsm_compaction_outputs(worker, &plan).await?;
+		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
+		let written = self
+			.write_lsm_compaction_temp_outputs(&plan, &prepared, &source_frames)
+			.await?;
+		let digest_summary =
+			match self.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames) {
+				Ok(digest_summary) => digest_summary,
+				Err(err) => {
+					self.cleanup_lsm_written_outputs(&written).await;
+					return Err(err);
+				}
+			};
+		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let post_epoch = match self
+			.install_lsm_compaction_temp_outputs(&plan, &prepared, &written, &commit)
+			.await
+		{
+			Ok(post_epoch) => post_epoch,
+			Err(err) => {
+				self.cleanup_lsm_written_outputs(&written).await;
+				return Err(err);
+			}
+		};
+		Ok(worker.compaction_outcome_from_commit(&plan, &prepared, &commit, post_epoch))
+	}
+
+	async fn run_lsm_compaction_once_inner_via_control_ring(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+		committer: &dyn TierCommitter,
+		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		let _pins = worker.acquire_plan_pins(&plan)?;
+		let prepared = match secondary_index_context {
+			Some(context) => {
+				self.prepare_lsm_compaction_outputs_with_table_schemas(
+					worker,
+					&plan,
+					context.table_schemas,
+				)
+				.await?
+			}
+			None => self.prepare_lsm_compaction_outputs(worker, &plan).await?,
+		};
+		let source_frames = self.read_lsm_single_row_source_frames(&plan).await?;
+		let written = self
+			.write_lsm_compaction_temp_outputs(&plan, &prepared, &source_frames)
+			.await?;
+		let digest_summary =
+			match self.lsm_single_row_bridge_digest_summary(&prepared, &written, &source_frames) {
+				Ok(digest_summary) => digest_summary,
+				Err(err) => {
+					self.cleanup_lsm_written_outputs(&written).await;
+					return Err(err);
+				}
+			};
+		let commit = worker.build_written_compaction_commit(&plan, &written, digest_summary);
+		let post_epoch = match self
+			.install_lsm_compaction_temp_outputs_via_control_ring_with_context(
+				&plan,
+				&prepared,
+				&written,
+				&commit,
+				committer,
+				secondary_index_context,
+			)
+			.await
+		{
+			Ok(post_epoch) => post_epoch,
+			Err(err) => {
+				self.cleanup_lsm_written_outputs(&written).await;
+				return Err(err);
+			}
+		};
+		Ok(worker.compaction_outcome_from_commit(&plan, &prepared, &commit, post_epoch))
+	}
+
+	fn lsm_single_row_bridge_digest_summary(
+		&self,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		source_frames: &[LsmSourceFrame],
+	) -> Result<CompactionDigestSummary, CompactionFailure> {
+		let survivors = survivor_records(&prepared.decisions);
+		let output_rows = prepared
+			.output_runs
+			.iter()
+			.flat_map(|run| run.rows.iter().cloned())
+			.collect::<Vec<_>>();
+		let output_location_count = written.iter().map(|run| run.locations.len()).sum::<usize>();
+		if survivors != output_rows || output_rows.len() != output_location_count {
+			return Err(CompactionFailure::VisibleDigestInvariance);
+		}
+		let table_by_location = self.lsm_source_frame_table_map(source_frames)?;
+		let mut pre_rows = Vec::with_capacity(prepared.decisions.len());
+		let mut post_rows = Vec::with_capacity(survivors.len());
+		for decision in &prepared.decisions {
+			let record = match decision {
+				crate::storage::SurvivorOrDrop::Survivor(record) => record,
+				crate::storage::SurvivorOrDrop::Drop { record, .. } => record,
+			};
+			let visible_row = self.lsm_visible_domain_row_for_record(record, &table_by_location)?;
+			pre_rows.push(visible_row);
+			if matches!(decision, crate::storage::SurvivorOrDrop::Survivor(_)) {
+				post_rows.push(visible_row);
+			}
+		}
+		let digest_summary = compaction_visible_domain_summary(pre_rows, post_rows);
+		if digest_summary.visible_pre != digest_summary.visible_post {
+			return Err(CompactionFailure::VisibleDigestInvariance);
+		}
+		Ok(digest_summary)
+	}
+
+	fn lsm_source_frame_table_map(
+		&self,
+		source_frames: &[LsmSourceFrame],
+	) -> Result<HashMap<RecordLocation, TableObjectId>, CompactionFailure> {
+		let mut table_by_location = HashMap::with_capacity(source_frames.len());
+		for source in source_frames {
+			table_by_location.insert(
+				source.entry.location,
+				self.lsm_source_frame_table_object_id(source)?,
+			);
+		}
+		Ok(table_by_location)
+	}
+
+	fn lsm_source_frame_table_object_id(
+		&self,
+		source: &LsmSourceFrame,
+	) -> Result<TableObjectId, CompactionFailure> {
+		let batch = match decode_record_batch(&source.frame) {
+			Ok(batch) => batch,
+			Err(_) => return Ok(TableObjectId::DEFAULT_KV),
+		};
+		match storage_row_table_object_id_at(&batch, source.entry.record_row_index)? {
+			Some(table_object_id) => Ok(table_object_id),
+			None => Ok(TableObjectId::DEFAULT_KV),
+		}
+	}
+
+	fn lsm_visible_domain_row_for_record(
+		&self,
+		record: &VersionEntry,
+		table_by_location: &HashMap<RecordLocation, TableObjectId>,
+	) -> Result<VisibleDomainRow, CompactionFailure> {
+		let Some(table_object_id) = table_by_location.get(&record.location).copied() else {
+			return Err(CompactionFailure::VisibleDigestInvariance);
+		};
+		Ok(VisibleDomainRow {
+			tenant_id: record.tenant_id,
+			table_object_id,
+			row_key_id: record.row_key_id,
+			row_hlc: record.row_hlc,
+			is_tombstone: record.location.is_tombstone,
+		})
+	}
+
+	fn validate_lsm_written_outputs(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+		commit: &CompactionCommit,
+	) -> Result<(), CompactionFailure> {
+		if prepared.output_runs.len() != written.len()
+			|| written.len() != commit.slabs_to_add.len()
+			|| commit.job_id != plan.job_id
+			|| commit.manifest_epoch_pre != plan.manifest_epoch_pre
+			|| commit.has_lsm_gc_lifecycle_fields()
+		{
+			return Err(CompactionFailure::ManifestRace);
+		}
+		for ((planned, written), committed) in prepared
+			.output_runs
+			.iter()
+			.zip(written)
+			.zip(&commit.slabs_to_add)
+		{
+			if planned.slab_id != written.slab_id
+				|| planned.slab_id != committed.slab_id
+				|| planned.compaction_level != plan.target_level
+				|| written.compaction_level != plan.target_level
+				|| committed.compaction_level != plan.target_level
+				|| planned.rows.len() != written.locations.len()
+				|| committed.row_count != written.summary.row_count
+				|| committed.size_bytes != written.summary.size_bytes
+				|| committed.min_row_hlc != written.summary.min_row_hlc
+				|| committed.max_row_hlc != written.summary.max_row_hlc
+			{
+				return Err(CompactionFailure::ManifestRace);
+			}
+		}
+		Ok(())
+	}
+
+	fn validate_lsm_sidecar_swap_readiness(
+		&self,
+		plan: &CompactionPlan,
+		commit: &CompactionCommit,
+		allow_sidecar_covered_inputs: bool,
+	) -> Result<(), CompactionFailure> {
+		if !commit.sidecar_swaps.is_empty() {
+			return Err(CompactionFailure::SidecarDigestMismatch);
+		}
+		let manifest = recover_rwlock_read(&self.compaction_manifest, "compaction_manifest");
+		for slab_id in plan.touched_slabs() {
+			let Some(run) = manifest.get_run(slab_id) else {
+				return Err(CompactionFailure::ManifestRace);
+			};
+			let has_sidecar_segments = !self
+				.list_secondary_index_segments_for_source_slab(slab_id)
+				.is_empty();
+			if !allow_sidecar_covered_inputs
+				&& (run.sidecar_coverage != crate::storage::SidecarCoverage::None
+					|| has_sidecar_segments)
+			{
+				return Err(CompactionFailure::SidecarDigestMismatch);
+			}
+		}
+		Ok(())
+	}
+
+	async fn install_lsm_output_files(
+		&self,
+		written: &[LsmWrittenOutputRun],
+	) -> std::io::Result<Vec<(LsmWrittenOutputRun, Arc<LocalSlabStore>)>> {
+		let mut final_paths = Vec::with_capacity(written.len());
+		for run in written {
+			let final_path = slab_path(&self.config.dir, run.slab_id);
+			if self.file_ops.file_len(&final_path).await?.is_some() {
+				return Err(Error::new(
+					ErrorKind::AlreadyExists,
+					format!(
+						"LSM output slab path already exists: {}",
+						final_path.display()
+					),
+				));
+			}
+			final_paths.push(final_path);
+		}
+
+		let mut installed_paths = Vec::with_capacity(written.len());
+		let install_result: std::io::Result<Vec<(LsmWrittenOutputRun, Arc<LocalSlabStore>)>> =
+			async {
+				let mut installed = Vec::with_capacity(written.len());
+				for (run, final_path) in written.iter().zip(&final_paths) {
+					self.file_ops.rename(&run.temp_path, final_path).await?;
+					fsync_parent_dir(self.file_ops.as_ref(), final_path).await?;
+					installed_paths.push(final_path.clone());
+					let slab = Arc::new(
+						LocalSlabStore::open(
+							final_path,
+							run.slab_id,
+							self.file_ops.clone(),
+							self.config.group_commit.clone(),
+						)
+						.await?,
+					);
+					installed.push((run.clone(), slab));
+				}
+				Ok(installed)
+			}
+			.await;
+
+		match install_result {
+			Ok(installed) => Ok(installed),
+			Err(err) => {
+				for path in installed_paths {
+					let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
+				}
+				Err(err)
+			}
+		}
+	}
+
+	async fn cleanup_lsm_written_outputs(&self, written: &[LsmWrittenOutputRun]) {
+		for run in written {
+			let _ = unlink_local_file(self.file_ops.as_ref(), &run.temp_path).await;
+		}
+	}
+
+	async fn cleanup_lsm_installed_outputs(
+		&self,
+		installed: &[(LsmWrittenOutputRun, Arc<LocalSlabStore>)],
+	) {
+		for (run, _) in installed {
+			let final_path = slab_path(&self.config.dir, run.slab_id);
+			let _ = unlink_local_file(self.file_ops.as_ref(), &final_path).await;
+		}
+	}
+
+	fn lsm_removed_persistent_rows(
+		&self,
+		prepared: &LsmPreparedOutputs,
+	) -> Vec<PersistentRecordRow> {
+		let mut rows = prepared
+			.decisions
+			.iter()
+			.map(|decision| match decision {
+				crate::storage::SurvivorOrDrop::Survivor(record) => record,
+				crate::storage::SurvivorOrDrop::Drop { record, .. } => record,
+			})
+			.map(|record| PersistentRecordRow {
+				tenant_id: record.tenant_id,
+				key_identity: record.row_key_id,
+				routing_locality: self
+					.routing_locality_for_key(record.tenant_id, record.row_key_id),
+				location: record.location,
+			})
+			.collect::<Vec<_>>();
+		rows.sort_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+				row.location.record_row_index,
+			)
+		});
+		rows
+	}
+
+	fn lsm_inserted_persistent_rows(
+		&self,
+		prepared: &LsmPreparedOutputs,
+		written: &[LsmWrittenOutputRun],
+	) -> Vec<PersistentRecordRow> {
+		let mut rows = Vec::new();
+		for (planned, written) in prepared.output_runs.iter().zip(written) {
+			for (record, location) in planned.rows.iter().zip(&written.locations) {
+				rows.push(PersistentRecordRow {
+					tenant_id: record.tenant_id,
+					key_identity: record.row_key_id,
+					routing_locality: self
+						.routing_locality_for_key(record.tenant_id, record.row_key_id),
+					location: *location,
+				});
+			}
+		}
+		rows.sort_by_key(|row| {
+			(
+				row.location.slab_id,
+				row.tenant_id,
+				row.key_identity,
+				row.location.hlc,
+				row.location.offset,
+				row.location.record_row_index,
+			)
+		});
+		rows
+	}
+
+	async fn advance_active_after_lsm_outputs(
+		&self,
+		state: &mut ManagerState,
+		max_output_slab_id: SlabId,
+	) -> std::io::Result<()> {
+		if state.active.slab_id() > max_output_slab_id {
+			return Ok(());
+		}
+		let next_id = if state.next_slab_id <= max_output_slab_id {
+			max_output_slab_id.saturating_add(1)
+		} else {
+			state.next_slab_id
+		};
+		let next_path = slab_path(&self.config.dir, next_id);
+		let next_slab = Arc::new(
+			LocalSlabStore::open(
+				&next_path,
+				next_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await?,
+		);
+		let sealed_slab = std::mem::replace(&mut state.active, next_slab);
+		let sealed_id = sealed_slab.slab_id();
+		let sealed_size = sealed_slab.write_cursor();
+		state.sealed.insert(sealed_id, sealed_slab);
+		state.next_slab_id = next_id.saturating_add(1);
+		self.record_l0_compaction_run(sealed_id, sealed_size);
+		Ok(())
+	}
+
+	pub fn slab_pin_table(&self) -> Arc<SlabPinTable> {
+		self.slab_pins.clone()
+	}
+
+	pub fn lsm_version_entries_for_plan(&self, plan: &CompactionPlan) -> Vec<VersionEntry> {
+		let touched_slabs = plan.touched_slabs().into_iter().collect::<BTreeSet<_>>();
+		let mut entries = Vec::new();
+		for entry in self.key_index.iter() {
+			let (tenant_id, row_key_id) = *entry.key();
+			for location in entry.value().iter().copied() {
+				if !touched_slabs.contains(&location.slab_id) {
+					continue;
+				}
+				entries.push(VersionEntry {
+					tenant_id,
+					row_key_id,
+					row_hlc: location.hlc,
+					record_row_index: location.record_row_index,
+					location,
+					lifecycle: VersionLifecycle::AmbiguousTable,
+				});
+			}
+		}
+		entries.sort_by_key(VersionEntry::merge_key);
+		entries
+	}
+
+	async fn lsm_version_entries_for_plan_with_table_schemas(
+		&self,
+		plan: &CompactionPlan,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> Result<Vec<VersionEntry>, CompactionFailure> {
+		let mut entries = self.lsm_version_entries_for_plan(plan);
+		for entry in &mut entries {
+			entry.lifecycle = self
+				.lsm_version_lifecycle_for_entry(entry, table_schemas)
+				.await?;
+		}
+		Ok(entries)
+	}
+
+	async fn lsm_version_lifecycle_for_entry(
+		&self,
+		entry: &VersionEntry,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> Result<VersionLifecycle, CompactionFailure> {
+		let frame = match self.read(entry.location).await {
+			Ok(frame) => frame,
+			Err(err) if err.kind() == ErrorKind::InvalidData => {
+				return Ok(VersionLifecycle::AmbiguousTable);
+			}
+			Err(err) => return Err(err.into()),
+		};
+		let batch = match decode_record_batch(&frame) {
+			Ok(batch) => batch,
+			Err(_) => return Ok(VersionLifecycle::AmbiguousTable),
+		};
+		let Some(table_object_id) =
+			storage_row_table_object_id_at(&batch, entry.location.record_row_index)?
+		else {
+			return Ok(VersionLifecycle::AmbiguousTable);
+		};
+		let Some(table) = table_schemas.latest_by_id(entry.tenant_id, table_object_id) else {
+			return Ok(VersionLifecycle::AmbiguousTable);
+		};
+		let row_batch = materialize_record_location_batch(&batch, entry.location.record_row_index)?;
+		let routing_locality = self.routing_locality_for_key(entry.tenant_id, entry.row_key_id);
+		if !descriptor_matches_tiered_row(
+			table,
+			entry.tenant_id,
+			entry.row_key_id,
+			routing_locality,
+			Some(table_object_id),
+			&row_batch,
+		)? {
+			return Ok(VersionLifecycle::AmbiguousTable);
+		}
+		Ok(match table.row_identity_policy {
+			RowIdentityPolicy::PrimaryKey(_) => VersionLifecycle::PrimaryKey,
+			RowIdentityPolicy::AppendOnly => VersionLifecycle::AppendOnly,
+			RowIdentityPolicy::AppendOnlyContentHash => VersionLifecycle::AppendOnlyContentHash,
+		})
+	}
+
+	pub async fn prepare_lsm_compaction_outputs(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: &CompactionPlan,
+	) -> Result<LsmPreparedOutputs, CompactionFailure> {
+		let entries = self.lsm_version_entries_for_plan(plan);
+		let target_size = worker
+			.config()
+			.output_run_target_bytes(plan.target_level)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"invalid compaction output target level",
+				)
+			})?;
+		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
+		let output_run_count =
+			required_output_run_count(survivor_records(&decisions), target_size)?;
+		let output_slab_ids = self.reserve_lsm_output_slab_ids(output_run_count).await?;
+		worker.plan_survivor_outputs(plan, entries, output_slab_ids)
+	}
+
+	async fn prepare_lsm_compaction_outputs_with_table_schemas(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: &CompactionPlan,
+		table_schemas: &TableSchemaCatalogV1,
+	) -> Result<LsmPreparedOutputs, CompactionFailure> {
+		let entries = self
+			.lsm_version_entries_for_plan_with_table_schemas(plan, table_schemas)
+			.await?;
+		let target_size = worker
+			.config()
+			.output_run_target_bytes(plan.target_level)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"invalid compaction output target level",
+				)
+			})?;
+		let decisions = apply_elision(entries.clone(), plan.retention_floor_snapshot);
+		let output_run_count =
+			required_output_run_count(survivor_records(&decisions), target_size)?;
+		let output_slab_ids = self.reserve_lsm_output_slab_ids(output_run_count).await?;
+		worker.plan_survivor_outputs(plan, entries, output_slab_ids)
+	}
+
+	pub async fn read_lsm_single_row_source_frames(
+		&self,
+		plan: &CompactionPlan,
+	) -> std::io::Result<Vec<LsmSourceFrame>> {
+		let entries = self.lsm_version_entries_for_plan(plan);
+		let mut frames = Vec::with_capacity(entries.len());
+		for entry in entries {
+			let frame = self.read(entry.location).await?;
+			frames.push(LsmSourceFrame { entry, frame });
+		}
+		Ok(frames)
+	}
+
+	pub async fn write_lsm_compaction_temp_outputs(
+		&self,
+		plan: &CompactionPlan,
+		prepared: &LsmPreparedOutputs,
+		source_frames: &[LsmSourceFrame],
+	) -> std::io::Result<Vec<LsmWrittenOutputRun>> {
+		let mut source_frames_by_location = HashMap::with_capacity(source_frames.len());
+		let mut multirow_source_frames_by_key = HashMap::new();
+		for source in source_frames {
+			if let Some(entries) = storage_multirow_index_entries_from_frame(&source.frame)? {
+				let Some(matching_entry) =
+					lsm_multirow_index_entry_for_version(&entries, &source.entry)
+				else {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"LSM source frame does not contain planned multi-row survivor",
+					));
+				};
+				validate_lsm_multirow_source_entry(&source.entry, matching_entry)?;
+				let key = LsmSourceFrameKey::from(source.entry.location);
+				match multirow_source_frames_by_key.entry(key) {
+					std::collections::hash_map::Entry::Vacant(entry) => {
+						entry.insert(LsmMultiRowSourceFrame {
+							frame: source.frame.clone(),
+							entries,
+						});
+					}
+					std::collections::hash_map::Entry::Occupied(entry) => {
+						let existing = entry.get();
+						if existing.frame != source.frame || existing.entries != entries {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"inconsistent LSM source frames for the same physical record",
+							));
+						}
+					}
+				}
+			} else if source_frames_by_location
+				.insert(source.entry.location, source)
+				.is_some()
+			{
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"duplicate LSM source frame location",
+				));
+			}
+		}
+
+		let mut written: Vec<LsmWrittenOutputRun> = Vec::with_capacity(prepared.output_runs.len());
+		for run in &prepared.output_runs {
+			if run.compaction_level != plan.target_level {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"planned LSM output run target level does not match compaction plan",
+				));
+			}
+
+			let temp_path = lsm_compaction_tmp_path(&self.config.dir, plan.job_id, run.slab_id);
+			let _ = unlink_local_file(self.file_ops.as_ref(), &temp_path).await;
+			let output = match LocalSlabStore::open(
+				&temp_path,
+				run.slab_id,
+				self.file_ops.clone(),
+				self.config.group_commit.clone(),
+			)
+			.await
+			{
+				Ok(output) => Arc::new(output),
+				Err(err) => {
+					for previous in &written {
+						let _ =
+							unlink_local_file(self.file_ops.as_ref(), &previous.temp_path).await;
+					}
+					return Err(err);
+				}
+			};
+			let write_result: std::io::Result<Vec<RecordLocation>> = async {
+				let mut locations = vec![None; run.rows.len()];
+				let mut written_multirow_keys = HashSet::new();
+				for (row_index, row) in run.rows.iter().enumerate() {
+					let multirow_key = LsmSourceFrameKey::from(row.location);
+					if let Some(source) = multirow_source_frames_by_key.get(&multirow_key) {
+						if !written_multirow_keys.insert(multirow_key) {
+							continue;
+						}
+						let run_rows_for_source = run
+							.rows
+							.iter()
+							.enumerate()
+							.filter(|(_, candidate)| {
+								LsmSourceFrameKey::from(candidate.location) == multirow_key
+							})
+							.collect::<Vec<_>>();
+						if run_rows_for_source.len() != source.entries.len() {
+							return Err(Error::new(
+								ErrorKind::Unsupported,
+								"LSM temp-output writer does not yet split multi-row frames",
+							));
+						}
+						for entry in &source.entries {
+							if !run_rows_for_source.iter().any(|(_, candidate)| {
+								lsm_multirow_index_entry_matches_version(entry, candidate)
+							}) {
+								return Err(Error::new(
+									ErrorKind::Unsupported,
+									"LSM temp-output writer does not yet partially rewrite multi-row frames",
+								));
+							}
+						}
+						let Some(primary) = source.entries.first() else {
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"LSM multi-row source frame has no index entries",
+							));
+						};
+						let record_hlc = source
+							.entries
+							.iter()
+							.map(|entry| entry.row_hlc)
+							.max()
+							.unwrap_or(primary.row_hlc);
+						let base_location = output
+							.append(
+								row.tenant_id,
+								primary.key_identity,
+								record_hlc,
+								&source.frame,
+							)
+							.await?;
+						output.rollback_index_entry(
+							row.tenant_id,
+							primary.key_identity,
+							base_location,
+						);
+						let mut locations_by_row_index = HashMap::new();
+						for entry in &source.entries {
+							let new_location = RecordLocation {
+								hlc: entry.row_hlc,
+								record_row_index: entry.record_row_index,
+								is_tombstone: entry.is_tombstone,
+								..base_location
+							};
+							output.index_location(row.tenant_id, entry.key_identity, new_location);
+							locations_by_row_index.insert(entry.record_row_index, new_location);
+						}
+						for (position, candidate) in run_rows_for_source {
+							let Some(new_location) = locations_by_row_index
+								.get(&candidate.record_row_index)
+								.copied()
+							else {
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									"LSM multi-row output location missing planned row",
+								));
+							};
+							locations[position] = Some(new_location);
+						}
+						continue;
+					}
+
+					let source = source_frames_by_location
+						.get(&row.location)
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidInput,
+								"missing LSM source frame for planned survivor",
+							)
+						})?;
+					if source.entry != *row {
+						return Err(Error::new(
+							ErrorKind::InvalidInput,
+							"LSM source frame entry does not match planned survivor",
+						));
+					}
+					if storage_multirow_index_entries_from_frame(&source.frame)?.is_some() {
+						return Err(Error::new(
+							ErrorKind::Unsupported,
+							"LSM temp-output writer does not yet split multi-row frames",
+						));
+					}
+					let base_location = output
+						.append(row.tenant_id, row.row_key_id, row.row_hlc, &source.frame)
+						.await?;
+					output.rollback_index_entry(row.tenant_id, row.row_key_id, base_location);
+					let new_location = RecordLocation {
+						hlc: row.row_hlc,
+						record_row_index: row.record_row_index,
+						is_tombstone: row.location.is_tombstone,
+						..base_location
+					};
+					output.index_location(row.tenant_id, row.row_key_id, new_location);
+					locations[row_index] = Some(new_location);
+				}
+				let locations = locations
+					.into_iter()
+					.collect::<Option<Vec<_>>>()
+					.ok_or_else(|| {
+						Error::new(
+							ErrorKind::InvalidData,
+							"LSM output writer did not materialize every planned survivor",
+						)
+					})?;
+				output.fsync().await?;
+				fsync_parent_dir(self.file_ops.as_ref(), &temp_path).await?;
+				Ok(locations)
+			}
+			.await;
+
+			let locations = match write_result {
+				Ok(locations) => locations,
+				Err(err) => {
+					let _ = unlink_local_file(self.file_ops.as_ref(), &temp_path).await;
+					for previous in &written {
+						let _ =
+							unlink_local_file(self.file_ops.as_ref(), &previous.temp_path).await;
+					}
+					return Err(err);
+				}
+			};
+			let mut summary = run.summary(plan.manifest_epoch_pre);
+			summary.size_bytes = ByteCount::new(output.write_cursor());
+			written.push(LsmWrittenOutputRun {
+				slab_id: run.slab_id,
+				compaction_level: run.compaction_level,
+				temp_path,
+				summary,
+				locations,
+			});
+		}
+		Ok(written)
+	}
+
+	pub async fn sweep_lsm_delete_pending_once(
+		&self,
+		gc_worker: &LsmGcWorker,
+	) -> std::io::Result<Vec<SlabId>> {
+		let mut delete_pending_transition = None;
+		{
+			let mut manifest =
+				recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+			let outcome = gc_worker
+				.transition_retired_to_delete_pending_if(&mut manifest, |slab_id| {
+					self.record_rows_for_slab(slab_id).is_empty()
+				});
+			if !outcome.marked_delete_pending.is_empty() {
+				delete_pending_transition = Some(manifest.snapshot());
+			}
+		}
+		if let Some(snapshot) = delete_pending_transition {
+			self.mirror_persistent_update(
+				PersistentIndexUpdate {
+					put_lsm_runs: snapshot.runs().to_vec(),
+					..Default::default()
+				},
+				"lsm-gc-mark-delete-pending",
+			)
+			.await;
+		}
+
+		let mut candidates = self
+			.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.map(|run| run.slab_id)
+			.collect::<Vec<_>>();
+		candidates.sort_unstable();
+		let mut deleted = Vec::new();
+		for slab_id in candidates {
+			if self.slab_pins.pin_count(slab_id) != 0 {
+				continue;
+			}
+			for info in self.list_secondary_index_segments_for_source_slab(slab_id) {
+				self.retire_secondary_index_segment_for_replaced_slab(&info)
+					.await?;
+			}
+			{
+				let mut state = self.state.lock().await;
+				let _old = state.sealed.remove(&slab_id);
+				let _old = state.rehydrated.remove(&slab_id);
+				state.hot_read_counts.remove(&slab_id);
+				state.rehydrating.remove(&slab_id);
+			}
+			let path = slab_path(&self.config.dir, slab_id);
+			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+			let snapshot = {
+				let mut manifest =
+					recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+				gc_worker.complete_delete(&mut manifest, slab_id);
+				manifest.snapshot()
+			};
+			refresh_lsm_level_metrics(&snapshot);
+			self.mirror_persistent_update(
+				PersistentIndexUpdate {
+					delete_lsm_run_ids: vec![slab_id],
+					..Default::default()
+				},
+				"lsm-gc-delete-run",
+			)
+			.await;
+			deleted.push(slab_id);
+		}
+		Ok(deleted)
+	}
+
+	pub async fn sweep_lsm_delete_pending_once_via_control_ring(
+		&self,
+		gc_worker: &LsmGcWorker,
+		committer: &dyn TierCommitter,
+	) -> std::io::Result<Vec<SlabId>> {
+		let snapshot = self.compaction_manifest_snapshot();
+		let sweep_plan = gc_worker.plan_sweep(&snapshot);
+		let mut to_mark_delete_pending = Vec::new();
+		for slab_id in sweep_plan.retired_unpinned_slabs {
+			if !self.record_rows_for_slab(slab_id).is_empty() {
+				continue;
+			}
+			if self.slab_pins.mark_delete_pending(slab_id) {
+				to_mark_delete_pending.push(slab_id);
+			}
+		}
+
+		if !to_mark_delete_pending.is_empty() {
+			let commit = CompactionCommit::gc_mark_delete_pending(
+				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD1, &to_mark_delete_pending),
+				snapshot.manifest_epoch,
+				to_mark_delete_pending,
+			);
+			committer.commit_lsm_compaction(commit).await?;
+			let snapshot = self.compaction_manifest_snapshot();
+			gc_worker.observe_manifest_snapshot(&snapshot);
+			self.mirror_persistent_update(
+				PersistentIndexUpdate {
+					put_lsm_runs: snapshot.runs().to_vec(),
+					..Default::default()
+				},
+				"lsm-gc-mark-delete-pending-control-ring",
+			)
+			.await;
+		}
+
+		let mut candidates = self
+			.compaction_manifest_snapshot()
+			.delete_pending_runs()
+			.map(|run| run.slab_id)
+			.collect::<Vec<_>>();
+		candidates.sort_unstable();
+		let mut deleted = Vec::new();
+		for slab_id in candidates {
+			if self.slab_pins.pin_count(slab_id) != 0 {
+				continue;
+			}
+			for info in self.list_secondary_index_segments_for_source_slab(slab_id) {
+				self.retire_secondary_index_segment_for_replaced_slab(&info)
+					.await?;
+			}
+			{
+				let mut state = self.state.lock().await;
+				let _old = state.sealed.remove(&slab_id);
+				let _old = state.rehydrated.remove(&slab_id);
+				state.hot_read_counts.remove(&slab_id);
+				state.rehydrating.remove(&slab_id);
+			}
+			let path = slab_path(&self.config.dir, slab_id);
+			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+			deleted.push(slab_id);
+		}
+
+		if !deleted.is_empty() {
+			let snapshot = self.compaction_manifest_snapshot();
+			let commit = CompactionCommit::gc_remove(
+				Self::lsm_gc_job_id(snapshot.manifest_epoch, 0xD2, &deleted),
+				snapshot.manifest_epoch,
+				deleted.clone(),
+			);
+			committer.commit_lsm_compaction(commit).await?;
+			let snapshot = self.compaction_manifest_snapshot();
+			gc_worker.observe_manifest_snapshot(&snapshot);
+			self.mirror_persistent_update(
+				PersistentIndexUpdate {
+					delete_lsm_run_ids: deleted.clone(),
+					..Default::default()
+				},
+				"lsm-gc-delete-run-control-ring",
+			)
+			.await;
+		}
+		Ok(deleted)
+	}
+
+	fn lsm_gc_job_id(
+		manifest_epoch: ManifestEpoch,
+		discriminator: u64,
+		slab_ids: &[SlabId],
+	) -> CompactionJobId {
+		let mut value = 0xA55A_0550_0000_0000_u64 ^ discriminator ^ manifest_epoch.get();
+		for slab_id in slab_ids {
+			value = value.rotate_left(7) ^ slab_id.get();
+		}
+		CompactionJobId::new(value)
+	}
+
+	fn pin_lsm_read_location(&self, location: RecordLocation) -> std::io::Result<SlabPinGuard> {
+		self.slab_pins.acquire(&[location.slab_id]).map_err(|_| {
+			Error::new(
+				ErrorKind::NotFound,
+				format!("slab {} is delete-pending for LSM GC", location.slab_id),
+			)
+		})
 	}
 
 	/// Snapshot of every tiered slab that currently also has a
@@ -2101,16 +3612,14 @@ impl SlabManager {
 		Ok(true)
 	}
 
-	async fn secondary_index_table_ids_for_source_slab(
+	fn secondary_index_table_ids_from_plaintext(
 		&self,
 		source_slab_id: SlabId,
+		plaintext: &[u8],
 	) -> std::io::Result<BTreeSet<(TenantId, TableObjectId)>> {
-		let plaintext = self
-			.secondary_index_source_slab_plaintext(source_slab_id)
-			.await?;
 		let mut table_ids = BTreeSet::new();
-		for recovered in recover_slab_entries_from_blob(&plaintext, source_slab_id)? {
-			let frame = match extract_record_from_blob(&plaintext, recovered.location) {
+		for recovered in recover_slab_entries_from_blob(plaintext, source_slab_id)? {
+			let frame = match extract_record_from_blob(plaintext, recovered.location) {
 				Ok(frame) => frame,
 				Err(_) => continue,
 			};
@@ -2132,10 +3641,25 @@ impl SlabManager {
 		source_slab_id: SlabId,
 		context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptorV1, SecondaryIndexDescriptor)>> {
+		let plaintext = self
+			.secondary_index_source_slab_plaintext(source_slab_id)
+			.await?;
+		self.secondary_index_compaction_descriptors_for_plaintext(
+			source_slab_id,
+			&plaintext,
+			context,
+		)
+	}
+
+	fn secondary_index_compaction_descriptors_for_plaintext(
+		&self,
+		source_slab_id: SlabId,
+		plaintext: &[u8],
+		context: SecondaryIndexCompactionContext<'_>,
+	) -> std::io::Result<Vec<(TenantId, TableSchemaDescriptorV1, SecondaryIndexDescriptor)>> {
 		let mut descriptors = Vec::new();
-		for (tenant_id, table_object_id) in self
-			.secondary_index_table_ids_for_source_slab(source_slab_id)
-			.await?
+		for (tenant_id, table_object_id) in
+			self.secondary_index_table_ids_from_plaintext(source_slab_id, plaintext)?
 		{
 			for row in context
 				.secondary_indexes
@@ -2326,6 +3850,242 @@ impl SlabManager {
 		rebuilt
 	}
 
+	async fn prepare_lsm_secondary_index_segments_for_compaction(
+		&self,
+		plan: &CompactionPlan,
+		written: &[LsmWrittenOutputRun],
+		context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> Result<Option<LsmPreparedSecondaryIndexSegments>, CompactionFailure> {
+		let Some(context) = context else {
+			return Ok(None);
+		};
+
+		let mut old_sidecars = Vec::new();
+		let mut old_descriptors = Vec::new();
+		for old_slab_id in plan.touched_slabs() {
+			for old_info in self.list_secondary_index_segments_for_source_slab(old_slab_id) {
+				old_sidecars.push(old_info);
+			}
+			for (tenant_id, _table, descriptor) in self
+				.secondary_index_compaction_descriptors_for_source_slab(old_slab_id, context)
+				.await?
+			{
+				old_descriptors.push((
+					old_slab_id,
+					SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+						tenant_id,
+						&descriptor,
+					)),
+				));
+			}
+		}
+
+		let mut output_segments = Vec::new();
+		for run in written {
+			let path = slab_path(&self.config.dir, run.slab_id);
+			let plaintext = self.file_ops.read_all(&path).await?;
+			for (tenant_id, table, descriptor) in self
+				.secondary_index_compaction_descriptors_for_plaintext(
+					run.slab_id,
+					&plaintext,
+					context,
+				)? {
+				let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+					tenant_id,
+					&descriptor,
+				));
+				let segment = self.build_secondary_index_segment_from_plaintext(
+					tenant_id,
+					&table,
+					&descriptor,
+					run.slab_id,
+					&plaintext,
+				)?;
+				self.verify_lsm_secondary_index_segment_cold_rebuild(
+					&segment,
+					tenant_id,
+					&table,
+					&descriptor,
+					run.slab_id,
+					&plaintext,
+				)?;
+				output_segments.push(LsmPreparedSecondaryIndexSegment {
+					key,
+					output_slab_id: run.slab_id,
+					index_object_id: descriptor.index_object_id,
+					segment,
+				});
+			}
+		}
+
+		Ok(Some(LsmPreparedSecondaryIndexSegments {
+			old_sidecars,
+			old_descriptors,
+			output_segments,
+		}))
+	}
+
+	fn verify_lsm_secondary_index_segment_cold_rebuild(
+		&self,
+		segment: &SecondaryIndexSegment,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+		plaintext: &[u8],
+	) -> Result<(), CompactionFailure> {
+		let cold_rebuild = self.build_secondary_index_segment_from_plaintext(
+			tenant_id,
+			table,
+			descriptor,
+			source_slab_id,
+			plaintext,
+		)?;
+		if &cold_rebuild != segment {
+			return Err(CompactionFailure::SidecarDigestMismatch);
+		}
+		Ok(())
+	}
+
+	async fn publish_prepared_lsm_secondary_index_segments(
+		&self,
+		prepared: Option<LsmPreparedSecondaryIndexSegments>,
+	) -> usize {
+		let Some(prepared) = prepared else {
+			return 0;
+		};
+		let mut coverage_by_slab: BTreeMap<SlabId, (usize, usize)> = BTreeMap::new();
+
+		for old_info in prepared.old_sidecars {
+			if let Err(err) = self
+				.retire_secondary_index_segment_for_replaced_slab(&old_info)
+				.await
+			{
+				tracing::warn!(
+					old_slab_id = old_info.source_slab_id.get(),
+					index_object_id = ?old_info.index_object_id,
+					error = %err,
+					"failed to retire old secondary index sidecar after LSM compaction"
+				);
+			}
+		}
+		for (old_slab_id, key) in prepared.old_descriptors {
+			self.forget_secondary_index_source_slab(key, old_slab_id);
+		}
+
+		let mut rebuilt = 0usize;
+		for prepared_segment in prepared.output_segments {
+			let coverage = coverage_by_slab
+				.entry(prepared_segment.output_slab_id)
+				.or_default();
+			coverage.0 = coverage.0.saturating_add(1);
+			if let Err(err) = self
+				.persist_secondary_index_segment(&prepared_segment.segment)
+				.await
+			{
+				self.mark_secondary_index_uncovered(
+					prepared_segment.key,
+					prepared_segment.output_slab_id,
+					SecondaryIndexBackfillError::new(
+						SecondaryIndexBackfillErrorReason::PersistFailure,
+						err.to_string(),
+					),
+				);
+				tracing::warn!(
+					output_slab_id = prepared_segment.output_slab_id.get(),
+					index_object_id = ?prepared_segment.index_object_id,
+					error = %err,
+					"failed to persist prepared secondary index sidecar after LSM compaction"
+				);
+				continue;
+			}
+			let coverage = coverage_by_slab
+				.entry(prepared_segment.output_slab_id)
+				.or_default();
+			coverage.1 = coverage.1.saturating_add(1);
+			rebuilt = rebuilt.saturating_add(1);
+		}
+		self.update_lsm_sidecar_coverage_after_publish(coverage_by_slab)
+			.await;
+		rebuilt
+	}
+
+	async fn update_lsm_sidecar_coverage_after_publish(
+		&self,
+		coverage_by_slab: BTreeMap<SlabId, (usize, usize)>,
+	) {
+		let updates = coverage_by_slab
+			.into_iter()
+			.filter_map(|(slab_id, (attempted, succeeded))| {
+				if attempted == 0 {
+					return None;
+				}
+				let coverage = if attempted == succeeded {
+					crate::storage::SidecarCoverage::Complete
+				} else {
+					crate::storage::SidecarCoverage::Partial
+				};
+				Some((slab_id, coverage))
+			})
+			.collect::<Vec<_>>();
+		if updates.is_empty() {
+			return;
+		}
+
+		let lsm_runs = {
+			let mut manifest =
+				recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
+			for (slab_id, coverage) in updates {
+				let Some(run) = manifest.get_run(slab_id).cloned() else {
+					continue;
+				};
+				if !run.state.is_live() || run.sidecar_coverage == coverage {
+					continue;
+				}
+				let mut updated = run;
+				updated.sidecar_coverage = coverage;
+				manifest.insert_live_run(updated);
+			}
+			let snapshot = manifest.snapshot();
+			drop(manifest);
+			refresh_lsm_level_metrics(&snapshot);
+			snapshot.runs().to_vec()
+		};
+		self.mirror_persistent_update(
+			PersistentIndexUpdate {
+				put_lsm_runs: lsm_runs,
+				..Default::default()
+			},
+			"lsm-sidecar-coverage-update",
+		)
+		.await;
+	}
+
+	#[allow(dead_code)]
+	async fn reconcile_lsm_secondary_index_segments_after_compaction(
+		&self,
+		plan: &CompactionPlan,
+		written: &[LsmWrittenOutputRun],
+		context: Option<SecondaryIndexCompactionContext<'_>>,
+	) -> usize {
+		match self
+			.prepare_lsm_secondary_index_segments_for_compaction(plan, written, context)
+			.await
+		{
+			Ok(prepared) => {
+				self.publish_prepared_lsm_secondary_index_segments(prepared)
+					.await
+			}
+			Err(err) => {
+				tracing::warn!(
+					error = %err,
+					"failed to prepare secondary index sidecars after LSM compaction"
+				);
+				0
+			}
+		}
+	}
+
 	pub async fn table_lookup_by_index(
 		&self,
 		request: &TableLookupByIndexRequest,
@@ -2508,13 +4268,30 @@ impl SlabManager {
 		let plaintext = self
 			.secondary_index_source_slab_plaintext(source_slab_id)
 			.await?;
+		self.build_secondary_index_segment_from_plaintext(
+			tenant_id,
+			table,
+			descriptor,
+			source_slab_id,
+			&plaintext,
+		)
+	}
+
+	fn build_secondary_index_segment_from_plaintext(
+		&self,
+		tenant_id: TenantId,
+		table: &TableSchemaDescriptorV1,
+		descriptor: &SecondaryIndexDescriptor,
+		source_slab_id: SlabId,
+		plaintext: &[u8],
+	) -> std::io::Result<SecondaryIndexSegment> {
 		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
 		let mut index_entries = Vec::new();
-		for recovered in recover_slab_entries_from_blob(&plaintext, source_slab_id)? {
+		for recovered in recover_slab_entries_from_blob(plaintext, source_slab_id)? {
 			if recovered.tenant_id != tenant_id || recovered.location.is_tombstone {
 				continue;
 			}
-			let frame = extract_record_from_blob(&plaintext, recovered.location)?;
+			let frame = extract_record_from_blob(plaintext, recovered.location)?;
 			let storage_batch = match decode_record_batch(&frame) {
 				Ok(batch) => batch,
 				Err(_) => continue,
@@ -3977,8 +5754,11 @@ impl SlabManager {
 		);
 
 		let sealed_slab = std::mem::replace(&mut state.active, next_slab.clone());
-		state.sealed.insert(sealed_slab.slab_id(), sealed_slab);
+		let sealed_id = sealed_slab.slab_id();
+		let sealed_size = sealed_slab.write_cursor();
+		state.sealed.insert(sealed_id, sealed_slab);
 		state.next_slab_id = next_id.saturating_add(1);
+		self.record_l0_compaction_run(sealed_id, sealed_size);
 
 		Ok(next_slab)
 	}
@@ -4233,6 +6013,35 @@ impl SlabManager {
 	}
 }
 
+#[async_trait]
+impl LsmCompactionJobRunner for SlabManager {
+	async fn run_lsm_compaction_plan(
+		&self,
+		worker: &LsmCompactionWorker,
+		plan: CompactionPlan,
+	) -> Result<crate::storage::lsm::CompactionOutcome, CompactionFailure> {
+		SlabManager::run_lsm_compaction_once(self, worker, plan).await
+	}
+}
+
+#[async_trait]
+impl LsmCompactionDriver for SlabManager {
+	async fn run_lsm_compaction_tick(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: HybridTimestamp,
+	) -> Result<Option<crate::storage::lsm::CompactionOutcome>, CompactionFailure> {
+		SlabManager::run_lsm_compaction_tick(self, worker, now).await
+	}
+}
+
+#[async_trait]
+impl LsmGcDriver for SlabManager {
+	async fn run_lsm_gc_tick(&self, worker: &LsmGcWorker) -> std::io::Result<Vec<SlabId>> {
+		SlabManager::sweep_lsm_delete_pending_once(self, worker).await
+	}
+}
+
 /// Authoritative location for a slab, as observed by the read
 /// path. Keeping it an enum means the "is the file still here?"
 /// question is answered with the same lock acquisition that
@@ -4273,6 +6082,7 @@ impl StorageEngine for SlabManager {
 
 	async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
 		let location = self.relocate_read_location(location);
+		let _pin = self.pin_lsm_read_location(location)?;
 		match self.resolve_backing(location.slab_id).await {
 			SlabBacking::Local(slab) => {
 				let started = Instant::now();
@@ -4329,6 +6139,7 @@ impl SlabManager {
 			return Ok(None);
 		}
 		let location = self.relocate_read_location(location);
+		let _pin = self.pin_lsm_read_location(location)?;
 		match self.resolve_backing(location.slab_id).await {
 			SlabBacking::Local(_) => Ok(None),
 			SlabBacking::L2(pointer) => {
@@ -6623,6 +8434,19 @@ struct SecondaryIndexCompactionContext<'a> {
 	secondary_indexes: &'a SecondaryIndexCatalog,
 }
 
+struct LsmPreparedSecondaryIndexSegments {
+	old_sidecars: Vec<SecondaryIndexSegmentInfo>,
+	old_descriptors: Vec<(SlabId, SecondaryIndexCoverageKey)>,
+	output_segments: Vec<LsmPreparedSecondaryIndexSegment>,
+}
+
+struct LsmPreparedSecondaryIndexSegment {
+	key: SecondaryIndexCoverageKey,
+	output_slab_id: SlabId,
+	index_object_id: IndexObjectId,
+	segment: SecondaryIndexSegment,
+}
+
 struct CompactedFrame {
 	tenant_id: TenantId,
 	key_identity: Identity,
@@ -7449,6 +9273,71 @@ fn retention_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBuf {
 	dir.join(format!("slab_{:016x}.wnd.retention.tmp", slab_id))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LsmSourceFrameKey {
+	slab_id: SlabId,
+	offset: u64,
+	length: u32,
+}
+
+impl From<RecordLocation> for LsmSourceFrameKey {
+	fn from(location: RecordLocation) -> Self {
+		Self {
+			slab_id: location.slab_id,
+			offset: location.offset,
+			length: location.length,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LsmMultiRowSourceFrame {
+	frame: Vec<u8>,
+	entries: Vec<MultiRowIndexEntry>,
+}
+
+fn lsm_multirow_index_entry_matches_version(
+	entry: &MultiRowIndexEntry,
+	version: &VersionEntry,
+) -> bool {
+	entry.key_identity == version.row_key_id
+		&& entry.row_hlc == version.row_hlc
+		&& entry.record_row_index == version.record_row_index
+		&& entry.is_tombstone == version.location.is_tombstone
+}
+
+fn lsm_multirow_index_entry_for_version<'a>(
+	entries: &'a [MultiRowIndexEntry],
+	version: &VersionEntry,
+) -> Option<&'a MultiRowIndexEntry> {
+	entries
+		.iter()
+		.find(|entry| lsm_multirow_index_entry_matches_version(entry, version))
+}
+
+fn validate_lsm_multirow_source_entry(
+	version: &VersionEntry,
+	entry: &MultiRowIndexEntry,
+) -> std::io::Result<()> {
+	if lsm_multirow_index_entry_matches_version(entry, version) {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		"LSM multi-row source entry does not match planned survivor",
+	))
+}
+
+fn lsm_compaction_tmp_path(dir: &Path, job_id: CompactionJobId, slab_id: SlabId) -> PathBuf {
+	dir.join(format!(
+		"compaction-temp-{job_id:016x}-slab_{slab_id:016x}.wnd"
+	))
+}
+
+fn is_lsm_compaction_tmp_filename(name: &str) -> bool {
+	name.starts_with("compaction-temp-")
+}
+
 fn secondary_index_sidecar_path(dir: &Path, relative: &str) -> std::io::Result<PathBuf> {
 	let relative_path = Path::new(relative);
 	if relative_path.is_absolute()
@@ -7507,6 +9396,34 @@ async fn cleanup_retention_rewrite_tmp_files(
 			dir = %dir.display(),
 			removed_tmp_files = removed,
 			"removed stale tiered retention rewrite temp files during open"
+		);
+	}
+	Ok(())
+}
+
+async fn cleanup_lsm_compaction_tmp_files(
+	file_ops: &dyn AsyncFileOps,
+	dir: &Path,
+) -> std::io::Result<()> {
+	let mut removed = 0usize;
+	for entry in file_ops.read_dir(dir).await? {
+		if !entry.is_file {
+			continue;
+		}
+		let Some(name) = entry.file_name.to_str() else {
+			continue;
+		};
+		if !is_lsm_compaction_tmp_filename(name) {
+			continue;
+		}
+		unlink_local_file(file_ops, &dir.join(name)).await?;
+		removed = removed.saturating_add(1);
+	}
+	if removed > 0 {
+		tracing::warn!(
+			dir = %dir.display(),
+			removed_tmp_files = removed,
+			"removed stale LSM compaction temp files during open"
 		);
 	}
 	Ok(())
@@ -8134,6 +10051,63 @@ mod tests {
 
 	async fn fresh_manager() -> Arc<SlabManager> {
 		fresh_manager_with_group_commit(GroupCommitConfig::default()).await
+	}
+
+	struct DirectLsmCommitter {
+		manager: Arc<SlabManager>,
+	}
+
+	#[async_trait]
+	impl TierCommitter for DirectLsmCommitter {
+		async fn commit_tier_slab(
+			&self,
+			_tier: crate::consensus::TieredSlab,
+		) -> std::io::Result<()> {
+			Err(Error::new(
+				ErrorKind::Unsupported,
+				"tier commits are not used by this test committer",
+			))
+		}
+
+		async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+			Err(Error::new(
+				ErrorKind::Unsupported,
+				"tier retirements are not used by this test committer",
+			))
+		}
+
+		async fn commit_lsm_compaction(&self, commit: CompactionCommit) -> std::io::Result<()> {
+			self.manager
+				.apply_lsm_manifest_compaction_commit(&commit)
+				.map(|_| ())
+				.map_err(Error::other)
+		}
+	}
+
+	struct FailingLsmCommitter;
+
+	#[async_trait]
+	impl TierCommitter for FailingLsmCommitter {
+		async fn commit_tier_slab(
+			&self,
+			_tier: crate::consensus::TieredSlab,
+		) -> std::io::Result<()> {
+			Err(Error::new(
+				ErrorKind::Unsupported,
+				"tier commits are not used by this test committer",
+			))
+		}
+
+		async fn retire_tiered_slab(&self, _slab_id: SlabId) -> std::io::Result<()> {
+			Err(Error::new(
+				ErrorKind::Unsupported,
+				"tier retirements are not used by this test committer",
+			))
+		}
+
+		async fn commit_lsm_compaction(&self, _commit: CompactionCommit) -> std::io::Result<()> {
+			Err(Error::other("injected LSM commit failure"))
+		}
 	}
 
 	async fn fresh_manager_with_group_commit(group_commit: GroupCommitConfig) -> Arc<SlabManager> {
@@ -8791,6 +10765,325 @@ mod tests {
 			.unwrap();
 		assert_eq!(coverage.covered_slabs, vec![info.source_slab_id]);
 		assert!(coverage.uncovered_slabs.is_empty());
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_rebuilds_secondary_index_sidecar_with_catalog_context() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		let row_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		let source_slab_id = manager.force_seal_active_for_test().await;
+
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), table.clone()).unwrap();
+		let mut secondary_indexes = SecondaryIndexCatalog::default();
+		secondary_indexes
+			.create(tenant(), descriptor.clone(), &schemas)
+			.unwrap();
+		let tick = manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+		assert_eq!(tick.completed.len(), 1);
+		let old_info = manager
+			.list_secondary_index_segments(
+				tenant(),
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				descriptor.logical_schema_fingerprint,
+			)
+			.into_iter()
+			.find(|info| info.source_slab_id == source_slab_id)
+			.expect("old source sidecar should exist before LSM compaction");
+		assert_eq!(old_info.source_slab_id, source_slab_id);
+
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x5151),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let worker = LsmCompactionWorker::new(
+			crate::storage::LsmConfig::default(),
+			manager.slab_pin_table(),
+		)
+		.unwrap();
+		let committer = DirectLsmCommitter {
+			manager: manager.clone(),
+		};
+
+		let outcome = manager
+			.run_lsm_compaction_once_via_control_ring_with_context(
+				&worker,
+				plan,
+				&committer,
+				Some(SecondaryIndexCompactionContext {
+					table_schemas: &schemas,
+					secondary_indexes: &secondary_indexes,
+				}),
+			)
+			.await
+			.unwrap();
+		let output_slab_id = outcome.output_slabs[0].slab_id;
+
+		assert!(
+			manager
+				.load_secondary_index_segment(&old_info)
+				.await
+				.unwrap()
+				.is_none(),
+			"old sidecar should be retired after LSM compaction"
+		);
+		let listed = manager.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		);
+		assert_eq!(listed.len(), 1);
+		let info = &listed[0];
+		assert_eq!(info.source_slab_id, output_slab_id);
+		assert_eq!(info.entry_count, 1);
+		let segment = manager
+			.load_secondary_index_segment(info)
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(segment.entries.len(), 1);
+		assert_eq!(segment.entries[0].row_key_id, row_identity);
+		assert_eq!(
+			segment.entries[0].encoded_key,
+			secondary_index_encoded_i64_for_test(10)
+		);
+		let coverage = manager
+			.secondary_index_coverage_snapshot(info.coverage_key())
+			.unwrap();
+		assert_eq!(coverage.covered_slabs, vec![output_slab_id]);
+		assert!(coverage.uncovered_slabs.is_empty());
+		assert_eq!(
+			manager
+				.compaction_manifest_snapshot()
+				.run(output_slab_id)
+				.unwrap()
+				.sidecar_coverage,
+			crate::storage::SidecarCoverage::Complete
+		);
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_commit_failure_does_not_publish_prepared_sidecar() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		let source_slab_id = manager.force_seal_active_for_test().await;
+
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), table.clone()).unwrap();
+		let mut secondary_indexes = SecondaryIndexCatalog::default();
+		secondary_indexes
+			.create(tenant(), descriptor.clone(), &schemas)
+			.unwrap();
+		manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x5154),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let worker = LsmCompactionWorker::new(
+			crate::storage::LsmConfig::default(),
+			manager.slab_pin_table(),
+		)
+		.unwrap();
+
+		let err = manager
+			.run_lsm_compaction_once_via_control_ring_with_context(
+				&worker,
+				plan,
+				&FailingLsmCommitter,
+				Some(SecondaryIndexCompactionContext {
+					table_schemas: &schemas,
+					secondary_indexes: &secondary_indexes,
+				}),
+			)
+			.await
+			.unwrap_err();
+
+		assert!(matches!(err, CompactionFailure::IoError(_)));
+		let listed = manager.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		);
+		assert_eq!(listed.len(), 1);
+		assert_eq!(listed[0].source_slab_id, source_slab_id);
+		assert!(
+			manager
+				.compaction_manifest_snapshot()
+				.run(source_slab_id)
+				.unwrap()
+				.state
+				.is_live()
+		);
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_rejects_secondary_index_sidecar_without_catalog_context() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let descriptor = secondary_index_descriptor_for_test();
+		append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		let source_slab_id = manager.force_seal_active_for_test().await;
+
+		manager
+			.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+			.await
+			.unwrap();
+		let old_info = manager
+			.list_secondary_index_segments(
+				tenant(),
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				descriptor.logical_schema_fingerprint,
+			)
+			.into_iter()
+			.find(|info| info.source_slab_id == source_slab_id)
+			.expect("old source sidecar should exist before LSM compaction");
+
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x5152),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let worker = LsmCompactionWorker::new(
+			crate::storage::LsmConfig::default(),
+			manager.slab_pin_table(),
+		)
+		.unwrap();
+		let committer = DirectLsmCommitter {
+			manager: manager.clone(),
+		};
+
+		let err = manager
+			.run_lsm_compaction_once_via_control_ring(&worker, plan, &committer)
+			.await
+			.unwrap_err();
+
+		assert!(matches!(err, CompactionFailure::SidecarDigestMismatch));
+		assert!(
+			manager
+				.load_secondary_index_segment(&old_info)
+				.await
+				.unwrap()
+				.is_some(),
+			"sidecar should remain intact after rejected LSM compaction"
+		);
+		assert!(
+			manager
+				.compaction_manifest_snapshot()
+				.run(source_slab_id)
+				.unwrap()
+				.state
+				.is_live()
+		);
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_elides_non_visible_primary_key_versions_with_catalog_context() {
+		let manager = fresh_manager().await;
+		let table = secondary_index_table_descriptor_for_test();
+		let row_identity =
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(10), hlc(10)).await;
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(20), hlc(20)).await,
+			row_identity
+		);
+		assert_eq!(
+			append_secondary_index_table_row_for_test(&manager, &table, 7, Some(30), hlc(30)).await,
+			row_identity
+		);
+		let source_slab_id = manager.force_seal_active_for_test().await;
+
+		let mut schemas = TableSchemaCatalogV1::default();
+		schemas.upsert(tenant(), table).unwrap();
+		let secondary_indexes = SecondaryIndexCatalog::default();
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x5153),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(25),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let worker = LsmCompactionWorker::new(
+			crate::storage::LsmConfig::default(),
+			manager.slab_pin_table(),
+		)
+		.unwrap();
+		let committer = DirectLsmCommitter {
+			manager: manager.clone(),
+		};
+
+		let outcome = manager
+			.run_lsm_compaction_once_via_control_ring_with_context(
+				&worker,
+				plan,
+				&committer,
+				Some(SecondaryIndexCompactionContext {
+					table_schemas: &schemas,
+					secondary_indexes: &secondary_indexes,
+				}),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(outcome.rows_in, 3);
+		assert_eq!(outcome.rows_out, 2);
+		assert_eq!(outcome.elided_versions, 1);
+		assert!(
+			manager
+				.lookup_as_of(tenant(), row_identity, hlc(15))
+				.is_none()
+		);
+		assert_eq!(
+			manager
+				.lookup_as_of(tenant(), row_identity, hlc(25))
+				.unwrap()
+				.hlc,
+			hlc(20)
+		);
+		assert_eq!(manager.lookup(tenant(), row_identity).unwrap().hlc, hlc(30));
 	}
 
 	#[tokio::test]
@@ -12348,6 +14641,113 @@ mod tests {
 			.lookup(tenant(), survivor_key)
 			.expect("survivor should still be indexed after reopen");
 		assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_rejects_sidecar_covered_source_runs_without_catalog_context() {
+		let manager = fresh_manager().await;
+		manager
+			.append_durable(tenant(), id(0x55CA), hlc(10), b"sidecar-covered")
+			.await
+			.unwrap();
+		let source_slab_id = manager.force_seal_active_for_test().await;
+
+		{
+			let mut manifest =
+				recover_rwlock_write(&manager.compaction_manifest, "compaction_manifest");
+			let mut run = manifest
+				.get_run(source_slab_id)
+				.expect("sealed slab should be present in the LSM manifest")
+				.clone();
+			run.sidecar_coverage = crate::storage::SidecarCoverage::Complete;
+			manifest.insert_live_run(run);
+		}
+
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x55CA),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(20),
+			compaction_start_hlc: hlc(21),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let commit = CompactionCommit {
+			job_id: plan.job_id,
+			manifest_epoch_pre: plan.manifest_epoch_pre,
+			slabs_to_retire: vec![source_slab_id],
+			slabs_to_add: Vec::new(),
+			slabs_to_mark_delete_pending: Vec::new(),
+			slabs_to_remove: Vec::new(),
+			sidecar_swaps: Vec::new(),
+			digest_summary: CompactionDigestSummary::zero(),
+		};
+
+		let err = manager
+			.validate_lsm_sidecar_swap_readiness(&plan, &commit, false)
+			.unwrap_err();
+		assert!(matches!(err, CompactionFailure::SidecarDigestMismatch));
+	}
+
+	#[tokio::test]
+	async fn lsm_compaction_copies_whole_multirow_frame_into_output_run() {
+		let manager = fresh_manager().await;
+		let first_key = id(0x6001);
+		let second_key = id(0x6002);
+		let frame = encode_test_multirow_storage_frame(&[
+			(first_key, Locality::new(0x61), hlc(10), 11),
+			(second_key, Locality::new(0x62), hlc(20), 22),
+		]);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("test frame should be a storage multi-row frame");
+		let source_location = manager
+			.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		let source_slab_id = manager.force_seal_active_for_test().await;
+		assert_eq!(source_location.slab_id, source_slab_id);
+
+		let snapshot = manager.compaction_manifest_snapshot();
+		let plan = CompactionPlan {
+			job_id: CompactionJobId::new(0x6001),
+			source_level: CompactionLevelIndex::L0,
+			target_level: CompactionLevelIndex::L1,
+			manifest_epoch_pre: snapshot.manifest_epoch,
+			input_slabs: vec![source_slab_id],
+			overlapping_slabs: Vec::new(),
+			retention_floor_snapshot: hlc(100),
+			compaction_start_hlc: hlc(101),
+			dominant_reason: crate::storage::DominantReason::Operator,
+		};
+		let worker = LsmCompactionWorker::new(
+			crate::storage::LsmConfig::default(),
+			manager.slab_pin_table(),
+		)
+		.unwrap();
+
+		let outcome = manager
+			.run_lsm_compaction_once(&worker, plan)
+			.await
+			.unwrap();
+
+		assert_eq!(outcome.rows_out, 2);
+		assert_eq!(outcome.output_slabs.len(), 1);
+		let output_slab_id = outcome.output_slabs[0].slab_id;
+		let first = manager.lookup(tenant(), first_key).unwrap();
+		let second = manager.lookup(tenant(), second_key).unwrap();
+		assert_eq!(first.slab_id, output_slab_id);
+		assert_eq!(second.slab_id, output_slab_id);
+		assert_ne!(output_slab_id, source_slab_id);
+		assert_eq!(first.offset, second.offset);
+		assert_eq!(first.length, second.length);
+		assert_eq!(first.record_row_index, RecordRowIndex::ZERO);
+		assert_eq!(second.record_row_index, RecordRowIndex::new(1));
+		assert!(!manager.read(first).await.unwrap().is_empty());
+		assert!(!manager.read(second).await.unwrap().is_empty());
 	}
 
 	#[tokio::test]

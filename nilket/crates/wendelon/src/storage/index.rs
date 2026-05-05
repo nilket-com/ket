@@ -1,8 +1,10 @@
 use crate::schema::{
-	HybridTimestamp, Identity, IndexObjectId, Locality, LogicalSchemaFingerprint, RecordRowIndex,
-	SlabId, SupersessionMetadata, TableObjectId, TenantId, TenantKekId, TombstoneMetadata,
+	ByteCount, CompactionLevelIndex, HybridTimestamp, Identity, IndexObjectId, Locality,
+	LogicalSchemaFingerprint, ManifestEpoch, RecordRowIndex, RowCount, SlabId,
+	SupersessionMetadata, TableObjectId, TenantId, TenantKekId, TombstoneMetadata,
 };
 use crate::storage::RecordLocation;
+use crate::storage::lsm::{LsmRunSummary, SidecarCoverage, SlabState};
 use crate::storage::manager::TieredSlabPointer;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::{HashMap, HashSet};
@@ -36,6 +38,7 @@ const TIERED_SLABS_TABLE_V1: TableDefinition<u64, &[u8]> = TableDefinition::new(
 const TIERED_SLABS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("tiered_slabs_v2");
 const SECONDARY_INDEX_SEGMENTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("secondary_index_segments_v1");
+const LSM_RUNS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("lsm_runs_v1");
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("storage_index_meta_v1");
 const META_LAST_CONTROL_LOG_INDEX: &str = "last_control_log_index";
 
@@ -72,6 +75,13 @@ const SECONDARY_INDEX_SEGMENT_KEY_LEN: usize = 8 + 16 + 16 + 32 + 8;
 const SECONDARY_INDEX_SEGMENT_VALUE_PREFIX_LEN: usize = 32 + 32 + 2 + 8 + 4 + 4;
 const SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI: u32 = 1 << 0;
 const SECONDARY_INDEX_SEGMENT_FLAG_KNOWN_MASK: u32 = SECONDARY_INDEX_SEGMENT_FLAG_HAS_L2_URI;
+const LSM_RUN_VALUE_PREFIX_LEN: usize = 1 + 1 + 1 + 1 + 8 + 16 + 16 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
+const LSM_SLAB_STATE_LIVE: u8 = 0;
+const LSM_SLAB_STATE_RETIRED: u8 = 1;
+const LSM_SLAB_STATE_DELETE_PENDING: u8 = 2;
+const LSM_SIDECAR_COVERAGE_NONE: u8 = 0;
+const LSM_SIDECAR_COVERAGE_PARTIAL: u8 = 1;
+const LSM_SIDECAR_COVERAGE_COMPLETE: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PersistentRecordRow {
@@ -107,6 +117,7 @@ pub(crate) struct PersistentIndexSnapshot {
 	pub tiered_records: Vec<PersistentRecordRow>,
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
 	pub secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
+	pub lsm_runs: Vec<LsmRunSummary>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -118,6 +129,8 @@ pub(crate) struct PersistentIndexUpdate {
 	pub delete_tiered_slab_ids: Vec<SlabId>,
 	pub put_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
 	pub delete_secondary_index_segments: Vec<PersistentSecondaryIndexSegmentKey>,
+	pub put_lsm_runs: Vec<LsmRunSummary>,
+	pub delete_lsm_run_ids: Vec<SlabId>,
 	pub last_control_log_index: Option<u64>,
 }
 
@@ -146,6 +159,9 @@ impl PersistentLocalIndex {
 				let _table = write_txn
 					.open_table(SECONDARY_INDEX_SEGMENTS_TABLE)
 					.map_err(redb_to_io)?;
+			}
+			{
+				let _table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
 			}
 			{
 				let _table = write_txn.open_table(META_TABLE).map_err(redb_to_io)?;
@@ -248,6 +264,15 @@ impl PersistentLocalIndex {
 					value.value(),
 				)?);
 			}
+			let lsm_runs_table = read_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+			let mut lsm_runs = Vec::new();
+			for entry in lsm_runs_table.iter().map_err(redb_to_io)? {
+				let (slab_id, value) = entry.map_err(redb_to_io)?;
+				lsm_runs.push(decode_lsm_run_summary(
+					SlabId::new(slab_id.value()),
+					value.value(),
+				)?);
+			}
 			let meta_table = read_txn.open_table(META_TABLE).map_err(redb_to_io)?;
 			let last_control_log_index = meta_table
 				.get(META_LAST_CONTROL_LOG_INDEX)
@@ -259,6 +284,7 @@ impl PersistentLocalIndex {
 				tiered_records,
 				record_localities,
 				secondary_index_segments,
+				lsm_runs,
 				last_control_log_index,
 			})
 		})
@@ -276,20 +302,50 @@ impl PersistentLocalIndex {
 			.await
 			.map(|snapshot| snapshot.secondary_index_segments)
 			.unwrap_or_default();
-		self.rebuild_with_secondary_index_segments(
+		let lsm_runs = self
+			.load_snapshot()
+			.await
+			.map(|snapshot| snapshot.lsm_runs)
+			.unwrap_or_default();
+		self.rebuild_with_secondary_index_segments_and_lsm_runs(
 			rows,
 			tiered_slabs,
 			secondary_index_segments,
+			lsm_runs,
 			last_control_log_index,
 		)
 		.await
 	}
 
+	#[cfg(test)]
 	pub(crate) async fn rebuild_with_secondary_index_segments(
 		&self,
 		rows: Vec<PersistentRecordRow>,
 		tiered_slabs: Vec<TieredSlabPointer>,
 		secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
+		last_control_log_index: Option<u64>,
+	) -> std::io::Result<()> {
+		let lsm_runs = self
+			.load_snapshot()
+			.await
+			.map(|snapshot| snapshot.lsm_runs)
+			.unwrap_or_default();
+		self.rebuild_with_secondary_index_segments_and_lsm_runs(
+			rows,
+			tiered_slabs,
+			secondary_index_segments,
+			lsm_runs,
+			last_control_log_index,
+		)
+		.await
+	}
+
+	pub(crate) async fn rebuild_with_secondary_index_segments_and_lsm_runs(
+		&self,
+		rows: Vec<PersistentRecordRow>,
+		tiered_slabs: Vec<TieredSlabPointer>,
+		secondary_index_segments: Vec<PersistentSecondaryIndexSegmentRow>,
+		lsm_runs: Vec<LsmRunSummary>,
 		last_control_log_index: Option<u64>,
 	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
@@ -299,6 +355,7 @@ impl PersistentLocalIndex {
 			let _ = write_txn.delete_table(RECORDS_TABLE);
 			let _ = write_txn.delete_table(TIERED_SLABS_TABLE);
 			let _ = write_txn.delete_table(SECONDARY_INDEX_SEGMENTS_TABLE);
+			let _ = write_txn.delete_table(LSM_RUNS_TABLE);
 			{
 				let mut table = write_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
 				for row in rows {
@@ -329,6 +386,15 @@ impl PersistentLocalIndex {
 					let value = encode_secondary_index_segment_value(&row);
 					table
 						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+			}
+			{
+				let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+				for run in lsm_runs {
+					let value = encode_lsm_run_summary(&run)?;
+					table
+						.insert(&run.slab_id.get(), value.as_slice())
 						.map_err(redb_to_io)?;
 				}
 			}
@@ -388,6 +454,18 @@ impl PersistentLocalIndex {
 					let value = encode_secondary_index_segment_value(&row);
 					table
 						.insert(key.as_slice(), value.as_slice())
+						.map_err(redb_to_io)?;
+				}
+			}
+			{
+				let mut table = write_txn.open_table(LSM_RUNS_TABLE).map_err(redb_to_io)?;
+				for slab_id in update.delete_lsm_run_ids {
+					let _ = table.remove(&slab_id.get()).map_err(redb_to_io)?;
+				}
+				for run in update.put_lsm_runs {
+					let value = encode_lsm_run_summary(&run)?;
+					table
+						.insert(&run.slab_id.get(), value.as_slice())
 						.map_err(redb_to_io)?;
 				}
 			}
@@ -711,6 +789,159 @@ fn decode_secondary_index_segment_row(
 	})
 }
 
+fn encode_lsm_run_summary(run: &LsmRunSummary) -> std::io::Result<Vec<u8>> {
+	let mut bytes = Vec::with_capacity(LSM_RUN_VALUE_PREFIX_LEN);
+	bytes.push(run.compaction_level.get());
+	bytes.push(encode_lsm_slab_state_tag(&run.state));
+	bytes.push(encode_lsm_sidecar_coverage(run.sidecar_coverage));
+	bytes.push(0);
+	bytes.extend_from_slice(&run.manifest_epoch.get().to_le_bytes());
+	encode_hlc(&mut bytes, run.min_row_hlc);
+	encode_hlc(&mut bytes, run.max_row_hlc);
+	bytes.extend_from_slice(&run.size_bytes.get().to_le_bytes());
+	bytes.extend_from_slice(&run.row_count.get().to_le_bytes());
+	bytes.extend_from_slice(&run.retention_debt_score.to_le_bytes());
+	bytes.extend_from_slice(&run.tombstone_debt_score.to_le_bytes());
+	bytes.extend_from_slice(&run.index_coverage_debt_score.to_le_bytes());
+	bytes.extend_from_slice(&run.layout_debt_score.to_le_bytes());
+	let successors = match &run.state {
+		SlabState::Retired { successors } => successors.as_slice(),
+		_ => &[],
+	};
+	let successor_count = u32::try_from(successors.len()).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"LSM run successor count does not fit in u32",
+		)
+	})?;
+	bytes.extend_from_slice(&successor_count.to_le_bytes());
+	for successor in successors {
+		bytes.extend_from_slice(&successor.get().to_le_bytes());
+	}
+	Ok(bytes)
+}
+
+fn decode_lsm_run_summary(slab_id: SlabId, value: &[u8]) -> std::io::Result<LsmRunSummary> {
+	if value.len() < LSM_RUN_VALUE_PREFIX_LEN {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"LSM run value too short: expected at least {LSM_RUN_VALUE_PREFIX_LEN}, got {}",
+				value.len()
+			),
+		));
+	}
+	let mut cursor = 0usize;
+	let compaction_level = read_u8(value, &mut cursor).and_then(|raw| {
+		CompactionLevelIndex::try_new(raw).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("LSM run has invalid compaction level {raw}"),
+			)
+		})
+	})?;
+	let state_tag = read_u8(value, &mut cursor)?;
+	let sidecar_coverage = decode_lsm_sidecar_coverage(read_u8(value, &mut cursor)?)?;
+	let reserved = read_u8(value, &mut cursor)?;
+	if reserved != 0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("LSM run reserved byte is non-zero: {reserved}"),
+		));
+	}
+	let manifest_epoch = ManifestEpoch::new(read_u64(value, &mut cursor)?);
+	let min_row_hlc = read_hlc(value, &mut cursor)?;
+	let max_row_hlc = read_hlc(value, &mut cursor)?;
+	let size_bytes = ByteCount::new(read_u64(value, &mut cursor)?);
+	let row_count = RowCount::new(read_u64(value, &mut cursor)?);
+	let retention_debt_score = read_u32(value, &mut cursor)?;
+	let tombstone_debt_score = read_u32(value, &mut cursor)?;
+	let index_coverage_debt_score = read_u32(value, &mut cursor)?;
+	let layout_debt_score = read_u32(value, &mut cursor)?;
+	let successor_count = read_u32(value, &mut cursor)? as usize;
+	let successor_bytes = successor_count
+		.checked_mul(8)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "LSM successor byte count overflows"))?;
+	if value.len() != cursor + successor_bytes {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"LSM run value has truncated or trailing successor bytes",
+		));
+	}
+	let mut successors = Vec::with_capacity(successor_count);
+	for _ in 0..successor_count {
+		successors.push(SlabId::new(read_u64(value, &mut cursor)?));
+	}
+	let state = match state_tag {
+		LSM_SLAB_STATE_LIVE if successors.is_empty() => SlabState::Live,
+		LSM_SLAB_STATE_RETIRED => SlabState::Retired { successors },
+		LSM_SLAB_STATE_DELETE_PENDING if successors.is_empty() => SlabState::DeletePending,
+		_ => {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("LSM run has invalid state tag/successor combination {state_tag}"),
+			));
+		}
+	};
+	Ok(LsmRunSummary {
+		slab_id,
+		compaction_level,
+		state,
+		min_row_hlc,
+		max_row_hlc,
+		size_bytes,
+		row_count,
+		sidecar_coverage,
+		manifest_epoch,
+		retention_debt_score,
+		tombstone_debt_score,
+		index_coverage_debt_score,
+		layout_debt_score,
+	})
+}
+
+fn encode_hlc(bytes: &mut Vec<u8>, hlc: HybridTimestamp) {
+	bytes.extend_from_slice(&hlc.physical_ms.to_le_bytes());
+	bytes.extend_from_slice(&hlc.logical.to_le_bytes());
+	bytes.extend_from_slice(&hlc.node_id.to_le_bytes());
+}
+
+fn read_hlc(bytes: &[u8], cursor: &mut usize) -> std::io::Result<HybridTimestamp> {
+	Ok(HybridTimestamp {
+		physical_ms: read_u64(bytes, cursor)?,
+		logical: read_u32(bytes, cursor)?,
+		node_id: read_u32(bytes, cursor)?,
+	})
+}
+
+fn encode_lsm_slab_state_tag(state: &SlabState) -> u8 {
+	match state {
+		SlabState::Live => LSM_SLAB_STATE_LIVE,
+		SlabState::Retired { .. } => LSM_SLAB_STATE_RETIRED,
+		SlabState::DeletePending => LSM_SLAB_STATE_DELETE_PENDING,
+	}
+}
+
+fn encode_lsm_sidecar_coverage(coverage: SidecarCoverage) -> u8 {
+	match coverage {
+		SidecarCoverage::None => LSM_SIDECAR_COVERAGE_NONE,
+		SidecarCoverage::Partial => LSM_SIDECAR_COVERAGE_PARTIAL,
+		SidecarCoverage::Complete => LSM_SIDECAR_COVERAGE_COMPLETE,
+	}
+}
+
+fn decode_lsm_sidecar_coverage(raw: u8) -> std::io::Result<SidecarCoverage> {
+	match raw {
+		LSM_SIDECAR_COVERAGE_NONE => Ok(SidecarCoverage::None),
+		LSM_SIDECAR_COVERAGE_PARTIAL => Ok(SidecarCoverage::Partial),
+		LSM_SIDECAR_COVERAGE_COMPLETE => Ok(SidecarCoverage::Complete),
+		_ => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("LSM run has invalid sidecar coverage {raw}"),
+		)),
+	}
+}
+
 fn encode_tiered_pointer(pointer: &TieredSlabPointer) -> Vec<u8> {
 	let mut bytes = Vec::with_capacity(TIERED_POINTER_PREFIX_LEN + pointer.l2_uri.len());
 	bytes.extend_from_slice(&pointer.payload_hash);
@@ -1015,6 +1246,17 @@ fn read_u16(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u16> {
 	Ok(u16::from_le_bytes(slice.try_into().expect("fixed width")))
 }
 
+fn read_u8(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u8> {
+	let byte = bytes.get(*cursor).copied().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"persistent index row truncated while reading u8",
+		)
+	})?;
+	*cursor = (*cursor).saturating_add(1);
+	Ok(byte)
+}
+
 fn read_u32(bytes: &[u8], cursor: &mut usize) -> std::io::Result<u32> {
 	let end = cursor.saturating_add(4);
 	let slice = bytes.get(*cursor..end).ok_or_else(|| {
@@ -1101,6 +1343,34 @@ mod tests {
 		}
 	}
 
+	fn lsm_run() -> LsmRunSummary {
+		LsmRunSummary {
+			slab_id: SlabId::new(51),
+			compaction_level: CompactionLevelIndex::L1,
+			state: SlabState::Retired {
+				successors: vec![SlabId::new(71), SlabId::new(72)],
+			},
+			min_row_hlc: HybridTimestamp {
+				physical_ms: 10,
+				logical: 1,
+				node_id: 2,
+			},
+			max_row_hlc: HybridTimestamp {
+				physical_ms: 20,
+				logical: 3,
+				node_id: 4,
+			},
+			size_bytes: ByteCount::new(8192),
+			row_count: RowCount::new(7),
+			sidecar_coverage: SidecarCoverage::Complete,
+			manifest_epoch: ManifestEpoch::new(9),
+			retention_debt_score: 1,
+			tombstone_debt_score: 2,
+			index_coverage_debt_score: 3,
+			layout_debt_score: 4,
+		}
+	}
+
 	#[test]
 	fn record_row_roundtrip_preserves_every_field() {
 		let row = row();
@@ -1117,6 +1387,14 @@ mod tests {
 		let value = encode_secondary_index_segment_value(&row);
 		let decoded = decode_secondary_index_segment_row(&key, &value).unwrap();
 		assert_eq!(decoded, row);
+	}
+
+	#[test]
+	fn lsm_run_summary_roundtrip_preserves_every_field() {
+		let run = lsm_run();
+		let value = encode_lsm_run_summary(&run).unwrap();
+		let decoded = decode_lsm_run_summary(run.slab_id, &value).unwrap();
+		assert_eq!(decoded, run);
 	}
 
 	#[test]
@@ -1259,6 +1537,33 @@ mod tests {
 		index.delete_secondary_index_segment(row.key).await.unwrap();
 		let snapshot = index.load_snapshot().await.unwrap();
 		assert!(snapshot.secondary_index_segments.is_empty());
+	}
+
+	#[tokio::test]
+	async fn lsm_runs_persist_across_snapshot_and_delete() {
+		let index = PersistentLocalIndex::open(temp_path("lsm-runs"))
+			.await
+			.unwrap();
+		let run = lsm_run();
+		index
+			.apply(PersistentIndexUpdate {
+				put_lsm_runs: vec![run.clone()],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert_eq!(snapshot.lsm_runs, vec![run.clone()]);
+
+		index
+			.apply(PersistentIndexUpdate {
+				delete_lsm_run_ids: vec![run.slab_id],
+				..Default::default()
+			})
+			.await
+			.unwrap();
+		let snapshot = index.load_snapshot().await.unwrap();
+		assert!(snapshot.lsm_runs.is_empty());
 	}
 
 	#[tokio::test]

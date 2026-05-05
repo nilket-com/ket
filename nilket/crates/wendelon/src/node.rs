@@ -87,7 +87,9 @@ use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportTier, TransportTierSet,
 };
 use crate::network::wire;
-use crate::schema::{FrameHeader, MsgType, NodeId, ProtocolVersionWindow, TenantId, TenantKekId};
+use crate::schema::{
+	FrameHeader, MsgType, NodeId, ProtocolVersionWindow, SlabId, TenantId, TenantKekId,
+};
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
@@ -95,7 +97,9 @@ use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
 	DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS, GroupCommitConfig, L2ColumnFetchConfig,
-	ManagerTierObserver, MvccRetentionPolicy, RaftCommitter, SlabSweeper, SweeperConfig,
+	LsmCompactionDriver, LsmCompactionService, LsmCompactionServiceControl, LsmCompactionWorker,
+	LsmConfig, LsmGcDriver, LsmGcService, LsmGcWorker, ManagerTierObserver, MvccRetentionPolicy,
+	RaftCommitter, SlabSweeper, SweeperConfig, TierCommitter,
 };
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -192,6 +196,10 @@ pub struct NodeBootstrapConfig {
 	/// Background sweeper policy for L1 -> L2 migration and
 	/// local-cache reclaim. Used only when `l2` is configured.
 	pub tiering: SweeperConfig,
+	/// Node-local maintenance switch for ADR 055 LSM compaction.
+	/// A paused service keeps its task alive but starts no new jobs
+	/// until resumed through the exposed service control.
+	pub lsm_compaction_paused: bool,
 	/// Policy governing when hot L2 slabs are promoted back into
 	/// local L1 storage.
 	pub rehydration: RehydrationPolicy,
@@ -254,6 +262,7 @@ impl NodeBootstrapConfig {
 			cluster: ClusterBootstrapConfig::Bootstrap,
 			l2: None,
 			tiering: SweeperConfig::default(),
+			lsm_compaction_paused: false,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: L2ColumnFetchConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
@@ -623,6 +632,9 @@ pub struct NodeHandles {
 	pub epoch_reconciler: JoinHandle<()>,
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
+	pub lsm_compaction: JoinHandle<()>,
+	pub lsm_compaction_control: LsmCompactionServiceControl,
+	pub lsm_gc: JoinHandle<()>,
 	pub tiering_sweeper: Option<JoinHandle<()>>,
 	pub restore_validation: Option<JoinHandle<()>>,
 	pub audit_chain_root_rollup: JoinHandle<()>,
@@ -642,6 +654,8 @@ impl NodeHandles {
 		self.epoch_reconciler.abort();
 		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
+		self.lsm_compaction.abort();
+		self.lsm_gc.abort();
 		if let Some(handle) = &self.tiering_sweeper {
 			handle.abort();
 		}
@@ -673,6 +687,8 @@ impl NodeHandles {
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
+		await_background_task(self.lsm_compaction, "LSM compaction").await?;
+		await_background_task(self.lsm_gc, "LSM GC").await?;
 		if let Some(handle) = self.tiering_sweeper {
 			await_background_task(handle, "tiering sweeper").await?;
 		}
@@ -1661,12 +1677,33 @@ impl WendelonNode {
 		let eviction_watchdog = spawn_eviction_watchdog(
 			tracker.clone(),
 			clock.clone(),
-			leader,
+			leader.clone(),
 			advancer,
 			epoch_rx.clone(),
 			cfg.rf,
 			EVICTION_CHECK_INTERVAL,
 		);
+		let raft_committer: Arc<dyn TierCommitter> = Arc::new(RaftCommitter::new(raft.clone()));
+		let lsm_worker = LsmCompactionWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
+		let lsm_driver = Arc::new(LeaderGatedLsmCompactionDriver::new(
+			slab.clone(),
+			leader.clone(),
+			raft_committer.clone(),
+			state_machine.clone(),
+		));
+		let lsm_service = LsmCompactionService::new(lsm_driver, lsm_worker);
+		let lsm_compaction_control = lsm_service.control();
+		if cfg.lsm_compaction_paused {
+			lsm_compaction_control.pause();
+		}
+		let lsm_compaction = lsm_service.spawn();
+		let lsm_gc_worker = LsmGcWorker::new(LsmConfig::default(), slab.slab_pin_table())?;
+		let lsm_gc_driver = Arc::new(LeaderGatedLsmGcDriver::new(
+			slab.clone(),
+			leader.clone(),
+			raft_committer.clone(),
+		));
+		let lsm_gc = LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn();
 
 		// 16. Lease manager (plan 018). Runs in the background,
 		//     renews every LEASE_TTL_MS / 3 and on every ring-epoch
@@ -1698,7 +1735,7 @@ impl WendelonNode {
 			SlabSweeper::new(
 				slab.clone(),
 				object_store,
-				Arc::new(RaftCommitter::new(raft.clone())),
+				raft_committer.clone(),
 				state_machine.clone(),
 				cfg.tiering.clone(),
 			)
@@ -1763,6 +1800,9 @@ impl WendelonNode {
 				epoch_reconciler,
 				tenant_policy_reconciler,
 				migration_sweeper,
+				lsm_compaction,
+				lsm_compaction_control,
+				lsm_gc,
 				tiering_sweeper,
 				restore_validation,
 				audit_chain_root_rollup,
@@ -2513,6 +2553,84 @@ impl LeaderStatus for RaftLeaderStatus {
 	}
 }
 
+struct LeaderGatedLsmCompactionDriver {
+	slab: Arc<SlabManager>,
+	leader: Arc<dyn LeaderStatus>,
+	committer: Arc<dyn TierCommitter>,
+	state_machine: WendelonStateMachine,
+}
+
+impl LeaderGatedLsmCompactionDriver {
+	fn new(
+		slab: Arc<SlabManager>,
+		leader: Arc<dyn LeaderStatus>,
+		committer: Arc<dyn TierCommitter>,
+		state_machine: WendelonStateMachine,
+	) -> Self {
+		Self {
+			slab,
+			leader,
+			committer,
+			state_machine,
+		}
+	}
+}
+
+#[async_trait]
+impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver {
+	async fn run_lsm_compaction_tick(
+		&self,
+		worker: &LsmCompactionWorker,
+		now: crate::schema::HybridTimestamp,
+	) -> Result<Option<crate::storage::CompactionOutcome>, crate::storage::CompactionFailure> {
+		if !self.leader.is_leader().await {
+			return Ok(None);
+		}
+		let state = self.state_machine.state_snapshot().await;
+		self.slab
+			.run_lsm_compaction_tick_via_control_ring_with_catalogs(
+				worker,
+				now,
+				self.committer.as_ref(),
+				&state.table_schemas,
+				&state.secondary_indexes,
+			)
+			.await
+	}
+}
+
+struct LeaderGatedLsmGcDriver {
+	slab: Arc<SlabManager>,
+	leader: Arc<dyn LeaderStatus>,
+	committer: Arc<dyn TierCommitter>,
+}
+
+impl LeaderGatedLsmGcDriver {
+	fn new(
+		slab: Arc<SlabManager>,
+		leader: Arc<dyn LeaderStatus>,
+		committer: Arc<dyn TierCommitter>,
+	) -> Self {
+		Self {
+			slab,
+			leader,
+			committer,
+		}
+	}
+}
+
+#[async_trait]
+impl LsmGcDriver for LeaderGatedLsmGcDriver {
+	async fn run_lsm_gc_tick(&self, worker: &LsmGcWorker) -> std::io::Result<Vec<SlabId>> {
+		if !self.leader.is_leader().await {
+			return Ok(Vec::new());
+		}
+		self.slab
+			.sweep_lsm_delete_pending_once_via_control_ring(worker, self.committer.as_ref())
+			.await
+	}
+}
+
 /// Production membership advancer: routes watchdog-triggered epoch
 /// changes through the committed Control Ring workflow rather than
 /// mutating the local watch channel directly.
@@ -2916,14 +3034,14 @@ mod tests {
 			))
 			.await
 			.unwrap();
-		assert_eq!(
+		assert!(
 			node.state_machine
 				.state_snapshot()
 				.await
 				.e_safe_watermarks
 				.get(&99)
-				.copied(),
-			Some(commit_hlc)
+				.copied()
+				.is_some_and(|hlc| hlc >= commit_hlc)
 		);
 
 		node.handles.abort();
@@ -2937,15 +3055,15 @@ mod tests {
 		))
 		.await
 		.unwrap();
-		assert_eq!(
+		assert!(
 			recovered
 				.state_machine
 				.state_snapshot()
 				.await
 				.e_safe_watermarks
 				.get(&99)
-				.copied(),
-			Some(commit_hlc)
+				.copied()
+				.is_some_and(|hlc| hlc >= commit_hlc)
 		);
 		wait_for_default_tenant_kek(&recovered).await;
 

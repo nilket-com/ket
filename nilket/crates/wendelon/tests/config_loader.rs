@@ -61,6 +61,7 @@ advertise_address = "127.0.0.1:4701"
 [storage]
 data_dir = "data"
 slab_max_bytes = 123456
+lsm_compaction_paused = true
 
 [tuning]
 rf = 3
@@ -89,6 +90,7 @@ transfer_signing_secret = "{transfer_secret}"
 	assert_eq!(cfg.node_id, node_id);
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.slab_max_bytes, 123456);
+	assert!(cfg.lsm_compaction_paused);
 	assert_eq!(cfg.rf, 3);
 	assert_eq!(cfg.wal_io_depth, 128);
 	assert_eq!(cfg.slab_io_depth, 128);
@@ -1388,6 +1390,7 @@ fn rendered_example_config_loads_after_writing() {
 	assert_eq!(cfg.node_id, 1);
 	assert_eq!(cfg.data_dir, data_dir);
 	assert_eq!(cfg.advertise_address, "127.0.0.1:7001");
+	assert!(!cfg.lsm_compaction_paused);
 	assert!(matches!(
 		cfg.root_kek_provider,
 		wendelon::crypto::RootKekProviderConfig::DevInsecure

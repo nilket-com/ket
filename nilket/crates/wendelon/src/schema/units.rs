@@ -331,6 +331,95 @@ impl_unit!(RecordBodyByteLen, u64);
 impl_unit!(PartialStateLength, u32);
 impl_unit!(OverflowFlag, u8);
 
+/// ADR 055 LSM compaction level index.
+///
+/// V1 deliberately has exactly four compaction levels, `L0..=L3`. The
+/// private field plus manual serde impl keep invalid compaction levels
+/// out of persisted and control-ring-adjacent surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct CompactionLevelIndex(u8);
+
+impl CompactionLevelIndex {
+	pub const MIN_RAW: u8 = 0;
+	pub const MAX_RAW: u8 = 3;
+
+	pub const L0: Self = Self(0);
+	pub const L1: Self = Self(1);
+	pub const L2: Self = Self(2);
+	pub const L3: Self = Self(3);
+	pub const ALL: [Self; 4] = [Self::L0, Self::L1, Self::L2, Self::L3];
+	pub const COMPACTION_SOURCES: [Self; 3] = [Self::L0, Self::L1, Self::L2];
+
+	pub const fn try_new(raw: u8) -> Option<Self> {
+		if raw <= Self::MAX_RAW {
+			Some(Self(raw))
+		} else {
+			None
+		}
+	}
+
+	pub const fn get(self) -> u8 {
+		self.0
+	}
+
+	pub const fn next(self) -> Option<Self> {
+		Self::try_new(self.0.saturating_add(1))
+	}
+
+	pub const fn is_compaction_source(self) -> bool {
+		self.0 < Self::MAX_RAW
+	}
+}
+
+impl TryFrom<u8> for CompactionLevelIndex {
+	type Error = Error;
+
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
+		Self::try_new(value).ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidInput,
+				format!("LSM compaction level index {value} is outside 0..=3"),
+			)
+		})
+	}
+}
+
+impl From<CompactionLevelIndex> for u8 {
+	fn from(value: CompactionLevelIndex) -> Self {
+		value.0
+	}
+}
+
+impl fmt::Display for CompactionLevelIndex {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl Serialize for CompactionLevelIndex {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: serde::Serializer,
+	{
+		serializer.serialize_u8(self.0)
+	}
+}
+
+impl<'de> Deserialize<'de> for CompactionLevelIndex {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let raw = u8::deserialize(deserializer)?;
+		Self::try_new(raw)
+			.ok_or_else(|| serde::de::Error::custom(format!("invalid LSM compaction level {raw}")))
+	}
+}
+
+impl_unit!(CompactionJobId, u64);
+impl_unit!(ManifestEpoch, u64);
+
 // ============================================================
 //  ADR 045 — APPEND-ONLY IDENTITY UNITS
 // ============================================================

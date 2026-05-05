@@ -5,6 +5,7 @@ use crate::schema::{
 	ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TableObjectId, TableRetentionPolicy,
 	TenantId, TenantKekId, TombstoneMetadata,
 };
+use crate::storage::CompactionCommit;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -360,6 +361,10 @@ pub enum WendelonRequest {
 	/// A previously-tiered slab has become fully reclaimable and its
 	/// L2 pointer should be removed from replicated state.
 	RetireTieredSlab(RetireTieredSlab),
+	/// Commit an ADR 055 LSM manifest transition. The control ring
+	/// carries the compaction digest summary but does not introduce
+	/// any separate digest mutation or eviction marker.
+	CompactionCommit(CompactionCommit),
 	/// Seed a Migration Ledger entry for a reassigned range
 	/// (Plan 019). Idempotent: a replay with the same
 	/// `migration_id` is a no-op.

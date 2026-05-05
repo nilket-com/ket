@@ -20339,10 +20339,14 @@ mod tests {
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 		loop {
 			let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
-			if audit
-				.matches("\"event_type\":\"data.write_finalized\"")
-				.count() == 1
-			{
+			let finalized_user_write_count = audit
+				.lines()
+				.filter(|line| {
+					line.contains("\"event_type\":\"data.write_finalized\"")
+						&& line.contains("\"record_count\":1")
+				})
+				.count();
+			if finalized_user_write_count == 1 {
 				break;
 			}
 			assert!(
@@ -20634,10 +20638,14 @@ mod tests {
 		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 		loop {
 			let audit = std::fs::read_to_string(&audit_path).unwrap_or_default();
-			if audit
-				.matches("\"event_type\":\"data.write_finalized\"")
-				.count() == 1
-			{
+			let finalized_user_write_count = audit
+				.lines()
+				.filter(|line| {
+					line.contains("\"event_type\":\"data.write_finalized\"")
+						&& line.contains("\"record_count\":1")
+				})
+				.count();
+			if finalized_user_write_count == 1 {
 				break;
 			}
 			assert!(

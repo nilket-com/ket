@@ -190,6 +190,20 @@ pub trait TierCommitter: Send + Sync {
 	/// Submit a RetireTieredSlab entry. Returns `Ok(())` only after
 	/// the local state machine has applied the retirement.
 	async fn retire_tiered_slab(&self, slab_id: SlabId) -> std::io::Result<()>;
+
+	/// Submit an ADR 055 LSM CompactionCommit entry. Returns
+	/// `Ok(())` only after the local state machine has applied the
+	/// commit and fired the local storage observer.
+	async fn commit_lsm_compaction(
+		&self,
+		commit: crate::storage::CompactionCommit,
+	) -> std::io::Result<()> {
+		let _ = commit;
+		Err(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"LSM compaction commits are not supported by this committer",
+		))
+	}
 }
 
 /// Production [`TierCommitter`] backed by an openraft [`WendelonRaft`].
@@ -239,6 +253,22 @@ impl TierCommitter for RaftCommitter {
 				std::io::ErrorKind::Other,
 				format!("RetireTieredSlab commit failed: {e}"),
 			)),
+		}
+	}
+
+	async fn commit_lsm_compaction(
+		&self,
+		commit: crate::storage::CompactionCommit,
+	) -> std::io::Result<()> {
+		match self
+			.raft
+			.client_write(WendelonRequest::CompactionCommit(commit))
+			.await
+		{
+			Ok(_) => Ok(()),
+			Err(e) => Err(std::io::Error::other(format!(
+				"CompactionCommit commit failed: {e}"
+			))),
 		}
 	}
 }
@@ -1654,6 +1684,17 @@ impl TierObserver for ManagerTierObserver {
 			.record_migrated_range_tombstone(tombstone, Some(applied_log_index))
 			.await
 			.map(|_| ())
+	}
+
+	async fn on_lsm_compaction_committed(
+		&self,
+		commit: &crate::storage::CompactionCommit,
+		_applied_log_index: u64,
+	) -> std::io::Result<()> {
+		self.slab
+			.apply_lsm_manifest_compaction_commit(commit)
+			.map(|_| ())
+			.map_err(|err| std::io::Error::other(err.to_string()))
 	}
 }
 

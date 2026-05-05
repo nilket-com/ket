@@ -21,6 +21,8 @@ mode = "bootstrap"
 # Resolved relative to the config file location.
 data_dir = "{{DATA_DIR}}"
 slab_max_bytes = {{SLAB_MAX_BYTES}}
+# Node-local ADR 055 maintenance switch. Leave false for ordinary nodes.
+lsm_compaction_paused = false
 
 # ADR 044 L2 columnar fetch is node-local and disabled by default
 # until stabilization benchmarks pass.

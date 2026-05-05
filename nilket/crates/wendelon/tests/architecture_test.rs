@@ -14,6 +14,412 @@ fn walk_dir(dir: &Path, callback: &mut impl FnMut(&Path)) {
 	}
 }
 
+#[test]
+fn test_adr055_lsm_compaction_substrate_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let storage_lsm = fs::read_to_string(manifest_dir.join("src/storage/lsm.rs")).unwrap();
+	let storage_manifest =
+		fs::read_to_string(manifest_dir.join("src/storage/manifest.rs")).unwrap();
+	let storage_worker =
+		fs::read_to_string(manifest_dir.join("src/storage/lsm_worker.rs")).unwrap();
+	let storage_manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let storage_index = fs::read_to_string(manifest_dir.join("src/storage/index.rs")).unwrap();
+	let slab_pins = fs::read_to_string(manifest_dir.join("src/storage/slab_pins.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let consensus_core = fs::read_to_string(manifest_dir.join("src/consensus/core.rs")).unwrap();
+	let raft_storage =
+		fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let storage_sweeper = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let lsm_runbook =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/lsm_compaction.md")).unwrap();
+
+	let mut violations = Vec::new();
+
+	if units.matches("pub struct CompactionLevelIndex").count() != 1 {
+		violations.push(
+			"src/schema/units.rs: expected exactly one CompactionLevelIndex definition".to_string(),
+		);
+	}
+	if units.contains("pub struct LevelIndex") {
+		violations.push(
+			"src/schema/units.rs: bare LevelIndex is ambiguous with L1/L2 storage tiers"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub const MAX_RAW: u8 = 3;",
+		"pub const L0: Self = Self(0);",
+		"pub const L3: Self = Self(3);",
+		"Self::try_new(raw)",
+		"invalid LSM compaction level",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing CompactionLevelIndex range guard token {required}"
+			));
+		}
+	}
+	for required in [
+		"impl_unit!(CompactionJobId, u64);",
+		"impl_unit!(ManifestEpoch, u64);",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 055 unit {required}"
+			));
+		}
+	}
+
+	if storage_lsm.matches("pub struct CompactionMergeKey").count() != 1 {
+		violations.push(
+			"src/storage/lsm.rs: expected exactly one CompactionMergeKey definition".to_string(),
+		);
+	}
+	for cdc_path in [
+		"src/schema/cdc.rs",
+		"src/storage/cdc.rs",
+		"src/network/cdc.rs",
+	] {
+		let content = fs::read_to_string(manifest_dir.join(cdc_path)).unwrap_or_default();
+		if content.contains("CompactionMergeKey") || content.contains("CompactionLevelIndex") {
+			violations.push(format!(
+				"{cdc_path}: CDC must not import LSM compaction key/level types"
+			));
+		}
+	}
+
+	for required in [
+		"pub enum SlabState",
+		"Retired { successors: Vec<SlabId> }",
+		"pub struct LsmRunSummary",
+		"pub compaction_level: CompactionLevelIndex",
+		"pub enum LsmRejectCode",
+		"ManifestRace = 1",
+		"SidecarDigestMismatch = 2",
+		"VisibleDigestInvariance = 3",
+		"pub enum VersionLifecycle",
+		"pub struct LsmSourceFrame",
+		"pub struct VisibleDomainRow",
+		"compaction_visible_domain_summary",
+		"pub fn apply_elision",
+		"pub struct PlannedOutputRun",
+		"pub fn plan_output_runs",
+		"pub struct LsmConfig",
+		"lsm_compaction_concurrency_per_locality: 1",
+		"output_run_target_bytes",
+		"pub fn pick_compaction",
+		"pub fn touched_slabs",
+	] {
+		if !storage_lsm.contains(required) {
+			violations.push(format!(
+				"src/storage/lsm.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct ManifestSnapshot",
+		"slabs_at_compaction_level",
+		"overlapping_slabs",
+		"oldest_l0_slab_age_millis",
+		"compaction_level_total_bytes",
+		"compaction_level_slab_count",
+		"apply_compaction_commit",
+		"validate_compaction_commit_against_plan",
+		"apply_planned_compaction_commit",
+	] {
+		if !storage_manifest.contains(required) {
+			violations.push(format!(
+				"src/storage/manifest.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct SlabPinTable",
+		"pub fn acquire(&self, slabs: &[SlabId])",
+		"pub struct SlabPinGuard",
+		"impl Drop for SlabPinGuard",
+		"SlabAlreadyDeletePending",
+	] {
+		if !slab_pins.contains(required) {
+			violations.push(format!(
+				"src/storage/slab_pins.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+	for required in [
+		"compaction_manifest_snapshot",
+		"reserve_lsm_output_slab_ids",
+		"lsm_version_entries_for_plan",
+		"prepare_lsm_compaction_outputs",
+		"read_lsm_single_row_source_frames",
+		"apply_lsm_manifest_compaction_commit",
+		"apply_lsm_manifest_planned_compaction_commit",
+		"install_lsm_compaction_temp_outputs",
+		"install_lsm_compaction_temp_outputs_via_control_ring",
+		"run_lsm_compaction_once",
+		"pick_lsm_compaction_plan",
+		"run_lsm_compaction_tick",
+		"run_lsm_compaction_tick_via_control_ring",
+		"run_lsm_compaction_tick_via_control_ring_with_catalogs",
+		"reconcile_lsm_secondary_index_segments_after_compaction",
+		"sweep_lsm_delete_pending_once",
+		"sweep_lsm_delete_pending_once_via_control_ring",
+		"cleanup_lsm_compaction_tmp_files",
+		"lsm_source_frame_table_object_id",
+		"compaction-temp-",
+		"slab_pin_table",
+		"pin_lsm_read_location",
+	] {
+		if !storage_manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 055 manager token {required}"
+			));
+		}
+	}
+	for required in [
+		"LSM_RUNS_TABLE",
+		"lsm_runs_v1",
+		"pub lsm_runs: Vec<LsmRunSummary>",
+		"pub put_lsm_runs: Vec<LsmRunSummary>",
+		"pub delete_lsm_run_ids: Vec<SlabId>",
+		"encode_lsm_run_summary",
+		"decode_lsm_run_summary",
+	] {
+		if !storage_index.contains(required) {
+			violations.push(format!(
+				"src/storage/index.rs: missing ADR 055 persisted run token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct LsmCompactionWorker",
+		"TableLifecycleCatalog",
+		"retention_floor_from_catalog",
+		"acquire_plan_pins",
+		"pub struct LsmPreparedOutputs",
+		"plan_survivor_outputs",
+		"pub trait LsmCompactionDriver",
+		"pub trait LsmCompactionJobRunner",
+		"pub struct LsmCompactionService",
+		"pub struct LsmCompactionServiceControl",
+		"pub fn spawn(self) -> JoinHandle<()>",
+		"pub async fn run_one",
+		"build_compaction_commit",
+		"compaction_outcome_from_commit",
+		"pub struct LsmGcWorker",
+		"pub trait LsmGcDriver",
+		"pub struct LsmGcService",
+		"pub struct LsmGcPlan",
+		"transition_retired_to_delete_pending",
+		"transition_retired_to_delete_pending_if",
+	] {
+		if !storage_worker.contains(required) {
+			violations.push(format!(
+				"src/storage/lsm_worker.rs: missing ADR 055 token {required}"
+			));
+		}
+	}
+
+	for required in [
+		"wendelon_lsm_compactions_total",
+		"wendelon_lsm_compaction_input_slabs",
+		"wendelon_lsm_compaction_output_bytes",
+		"wendelon_lsm_compaction_duration_millis",
+		"wendelon_lsm_level_slab_count",
+		"wendelon_lsm_level_total_bytes",
+		"wendelon_lsm_pending_delete_slabs",
+		"wendelon_lsm_retired_slab_pinned_bytes",
+		"wendelon_lsm_digest_invariance_violations_total",
+		"result.as_str()",
+		"kind.as_str()",
+	] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 055 metric token {required}"
+			));
+		}
+	}
+	for forbidden in ["tenant_id", "table_object_id", "subscription_id", "slab_id"] {
+		for line in metrics
+			.lines()
+			.filter(|line| line.contains("wendelon_lsm_"))
+		{
+			if line.contains(forbidden) {
+				violations.push(format!(
+					"src/metrics/registry.rs: LSM metric line carries forbidden high-cardinality label {forbidden}: {line}"
+				));
+			}
+		}
+	}
+
+	for forbidden in [
+		"MsgType::LSM",
+		"MsgType::COMPACTION",
+		"FRAME_FLAG_LSM",
+		"FRAME_FLAG_COMPACTION",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 055 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Lsm",
+		"NodeCapability::Compaction",
+		"NodeCapability::LSM",
+		"NodeCapability::COMPACTION",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 055 capability token {forbidden}"
+			));
+		}
+	}
+
+	for source in [&storage_lsm, &storage_manifest, &storage_worker, &slab_pins] {
+		if source.contains("StorageTier") {
+			violations.push("LSM substrate must not embed StorageTier".to_string());
+		}
+		if source.contains("DigestEvictionMarker") {
+			violations.push("LSM substrate must not add DigestEvictionMarker".to_string());
+		}
+		if source.contains("relocated_reads") {
+			violations.push("LSM substrate must not write or embed relocated_reads".to_string());
+		}
+	}
+	for source in [&consensus_core, &raft_storage] {
+		if source.contains("DigestEvictionMarker") {
+			violations.push("LSM control-ring path must not add DigestEvictionMarker".to_string());
+		}
+	}
+
+	for forbidden in [
+		"LsmV1",
+		"LsmV2",
+		"CompactionV1",
+		"CompactionV2",
+		"WendelonLsm",
+		"WendelonCompaction",
+	] {
+		for source in [
+			&units,
+			&storage_lsm,
+			&storage_manifest,
+			&storage_worker,
+			&slab_pins,
+		] {
+			if source.contains(forbidden) {
+				violations.push(format!("ADR 055 forbidden suffix/prefix token {forbidden}"));
+			}
+		}
+	}
+
+	for required in [
+		"LsmCompactionCommitted",
+		"LsmInvariantViolation",
+		"LsmCompactionPaused",
+		"lsm.compaction_committed",
+		"lsm.invariant_violation",
+		"lsm.compaction_paused",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 055 audit token {required}"
+			));
+		}
+	}
+
+	for required in ["CompactionCommit(CompactionCommit)", "control ring"] {
+		if !consensus_core.contains(required) {
+			violations.push(format!(
+				"src/consensus/core.rs: missing ADR 055 control-ring token {required}"
+			));
+		}
+	}
+	for required in [
+		"WendelonRequest::CompactionCommit",
+		"TierObserverEvent::LsmCompactionCommitted",
+		"on_lsm_compaction_committed",
+		"AuditOperation::LsmCompactionCommitted",
+		"AuditOperation::LsmInvariantViolation",
+	] {
+		if !raft_storage.contains(required) {
+			violations.push(format!(
+				"src/consensus/raft_storage.rs: missing ADR 055 control-ring apply token {required}"
+			));
+		}
+	}
+	for required in [
+		"on_lsm_compaction_committed",
+		"apply_lsm_manifest_compaction_commit(commit)",
+		"commit_lsm_compaction",
+		"WendelonRequest::CompactionCommit(commit)",
+	] {
+		if !storage_sweeper.contains(required) {
+			violations.push(format!(
+				"src/storage/sweeper.rs: missing ADR 055 manager observer token {required}"
+			));
+		}
+	}
+	for required in [
+		"LeaderGatedLsmCompactionDriver",
+		"impl LsmCompactionDriver for LeaderGatedLsmCompactionDriver",
+		"if !self.leader.is_leader().await",
+		"committer: Arc<dyn TierCommitter>",
+		"state_machine: WendelonStateMachine",
+		"run_lsm_compaction_tick_via_control_ring",
+		"run_lsm_compaction_tick_via_control_ring_with_catalogs",
+		"lsm_compaction_paused",
+		"lsm_compaction_control",
+		"LsmCompactionService::new",
+		"LeaderGatedLsmGcDriver",
+		"sweep_lsm_delete_pending_once_via_control_ring",
+		"LsmGcService::new",
+		"lsm_gc",
+		"lsm_compaction",
+	] {
+		if !node.contains(required) {
+			violations.push(format!(
+				"src/node.rs: missing ADR 055 node service token {required}"
+			));
+		}
+	}
+
+	for required in ["[[bench]]", "name = \"lsm_compaction\"", "harness = false"] {
+		if !cargo_toml.contains(required) {
+			violations.push(format!(
+				"Cargo.toml: missing ADR 055 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"wendelon_lsm_compactions_total{level,result}",
+		"wendelon_lsm_retired_slab_pinned_bytes",
+		"sidecar_digest_mismatch",
+		"visible_digest_invariance",
+		"cargo bench --bench lsm_compaction -- --quick",
+	] {
+		if !lsm_runbook.contains(required) {
+			violations.push(format!(
+				"plans/ops/runbooks/lsm_compaction.md: missing ADR 055 runbook token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 055 architecture guard violations:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn collect_mod_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 	walk_dir(dir, &mut |path| {
 		if path.file_name().and_then(|name| name.to_str()) == Some("mod.rs") {
@@ -858,9 +1264,10 @@ fn test_adr046_state_digest_substrate_boundaries() {
 					path.display()
 				));
 			}
-			let adr052_sidecar_digest_surface =
-				relative == Path::new("src/storage/secondary_index_segment.rs");
-			if content.contains("StateDigest") && !adr052_sidecar_digest_surface {
+			let state_digest_storage_surface = relative
+				== Path::new("src/storage/secondary_index_segment.rs")
+				|| relative == Path::new("src/storage/lsm.rs");
+			if content.contains("StateDigest") && !state_digest_storage_surface {
 				violations.push(format!(
 					"{}: StateDigest must not be imported into storage/network durable or \
 					 protocol surfaces in ADR 046",

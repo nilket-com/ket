@@ -33,14 +33,14 @@ The implementation lifts the existing single-slab
 rewrite helpers into a per-locality leveled scheduler
 that:
 
-- one `LevelIndex` newtype-unit (`u8`, range `0..=3`);
+- one `CompactionLevelIndex` newtype-unit (`u8`, range `0..=3`);
 - one `CompactionJobId`, one `ManifestEpoch` newtype-
   unit (`u64` each);
 - one `CompactionMergeKey = (Hlc, RowKeyId,
   RecordRowIndex)`; storage-local; never imported by
   CDC schema;
 - per-locality slab manifest extension carrying
-  `(level, state, successors, hlc_range, byte_size,
+  `(compaction_level, state, successors, hlc_range, byte_size,
   row_count, sidecar_coverage, manifest_epoch)`;
 - `LsmCompactionPicker` (pure function) and
   `LsmCompactionWorker` per locality leader (one
@@ -71,7 +71,7 @@ that:
 
 ## Deliverables
 
-- `LevelIndex`, `CompactionJobId`, `ManifestEpoch`
+- `CompactionLevelIndex`, `CompactionJobId`, `ManifestEpoch`
   newtype-units in `src/schema/units.rs`.
 - `CompactionMergeKey`, `SlabState`, `LsmRunSummary`,
   `CompactionPlan`, `CompactionCommit`,
@@ -81,10 +81,11 @@ that:
   audits actual path).
 - Per-locality slab manifest extension in
   `src/storage/manifest.rs` (or current owner): the
-  fields above plus level-aware queries
-  (`slabs_at_level`, `overlapping_slabs`,
-  `oldest_l0_slab_age_millis`, `level_total_bytes`,
-  `level_slab_count`, `manifest_snapshot`).
+  fields above plus compaction-level-aware queries
+  (`slabs_at_compaction_level`, `overlapping_slabs`,
+  `oldest_l0_slab_age_millis`,
+  `compaction_level_total_bytes`,
+  `compaction_level_slab_count`, `manifest_snapshot`).
 - `LsmCompactionPicker` (pure) in `src/storage/lsm.rs`.
 - `LsmCompactionWorker`, `LsmGcWorker` in
   `src/storage/lsm_worker.rs` (new).
@@ -177,9 +178,9 @@ Work:
 
    ```rust
    #[repr(transparent)]
-   pub struct LevelIndex(u8);
+   pub struct CompactionLevelIndex(u8);
 
-   impl LevelIndex {
+   impl CompactionLevelIndex {
        pub fn try_new(raw: u8) -> Option<Self> {
            if raw <= 3 { Some(Self(raw)) } else { None }
        }
@@ -208,7 +209,7 @@ Work:
 
    pub struct LsmRunSummary {
        pub slab_id: SlabId,
-       pub level: LevelIndex,
+       pub compaction_level: CompactionLevelIndex,
        pub state: SlabState,
        pub min_row_hlc: Hlc,
        pub max_row_hlc: Hlc,
@@ -269,8 +270,8 @@ Work:
 
    pub struct CompactionPlan {
        pub job_id: CompactionJobId,
-       pub source_level: LevelIndex,
-       pub target_level: LevelIndex,
+       pub source_level: CompactionLevelIndex,
+       pub target_level: CompactionLevelIndex,
        pub manifest_epoch_pre: ManifestEpoch,
        pub input_slabs: Vec<SlabId>,
        pub overlapping_slabs: Vec<SlabId>,
@@ -331,6 +332,8 @@ Work:
        pub manifest_epoch_pre: ManifestEpoch,
        pub slabs_to_retire: Vec<SlabId>,
        pub slabs_to_add: Vec<LsmRunSummary>,
+       pub slabs_to_mark_delete_pending: Vec<SlabId>,
+       pub slabs_to_remove: Vec<SlabId>,
        pub sidecar_swaps: Vec<SidecarSwap>,
        pub digest_summary: CompactionDigestSummary,
    }
@@ -342,20 +345,26 @@ Work:
    }
    ```
 
+   Regular compaction commits populate
+   `slabs_to_retire` / `slabs_to_add`; GC lifecycle
+   commits populate exactly one of
+   `slabs_to_mark_delete_pending` or
+   `slabs_to_remove`. Mixed shapes are rejected.
+
    `MutationKind::CompactionCommit(CompactionCommit)`
    added to the existing locality control-ring
    mutation carrier. Phase 0 audits the existing
    allocation table.
 
-10. Freeze the **streaming elision wrapper signature**:
+10. Freeze the **in-memory elision helper signature**:
 
     ```rust
-    pub fn streaming_apply_elision<I>(
+    pub fn apply_elision<I>(
         records: I,
         retention_floor: Hlc,
         lifecycle: &LifecycleSnapshot,
         table_schema: &TableSchemaSnapshot,
-    ) -> impl Iterator<Item = SurvivorOrDrop>
+    ) -> Vec<SurvivorOrDrop>
     where I: Iterator<Item = VersionEntry>;
 
     pub enum SurvivorOrDrop {
@@ -427,10 +436,10 @@ Work:
 
 14. Architectural test stubs (full guards in Phase 12):
 
-    - exactly one `LevelIndex` definition;
+    - exactly one `CompactionLevelIndex` definition;
     - exactly one `CompactionJobId`, `ManifestEpoch`
       definition;
-    - `LevelIndex` accepts only `0..=3`;
+    - `CompactionLevelIndex` accepts only `0..=3`;
     - exactly one `CompactionMergeKey` definition;
     - `CompactionMergeKey` not imported by any CDC
       module;
@@ -515,7 +524,7 @@ Files:
 Work:
 
 1. Extend the per-slab manifest record with:
-   - `level: LevelIndex`;
+   - `compaction_level: CompactionLevelIndex`;
    - `state: SlabState`;
    - `successors: Vec<SlabId>`;
    - HLC interval (`min_row_hlc`, `max_row_hlc`);
@@ -526,11 +535,11 @@ Work:
    `manifest_epoch: ManifestEpoch`.
 
 3. Add level-aware queries:
-   - `slabs_at_level(level)`;
+   - `slabs_at_compaction_level(compaction_level)`;
    - `overlapping_slabs(level, range)`;
    - `oldest_l0_slab_age_millis(now)`;
-   - `level_total_bytes(level)`;
-   - `level_slab_count(level)`;
+   - `compaction_level_total_bytes(compaction_level)`;
+   - `compaction_level_slab_count(compaction_level)`;
    - `manifest_snapshot()` returning
      `Arc<ManifestSnapshot>`.
 
@@ -542,7 +551,7 @@ Work:
 5. Recovery integration: on startup, the local
    manifest mirror rebuilds from finalized control-
    ring mutations + durable slab bytes. Any durable
-   sealed slab missing level metadata after upgrade
+   sealed slab missing compaction-level metadata after upgrade
    is conservatively classified as `(L0, Live)`.
 
 Tests (`tests/lsm_manifest.rs`):
@@ -573,7 +582,7 @@ Work:
 1. Implement `pick_compaction` per Phase 0 §7.
 
 2. `L0 → L1` rule:
-   - require `level_slab_count(L0) >=
+   - require `compaction_level_slab_count(L0) >=
      max_l0_slab_count`;
    - require `oldest_l0_slab_age_millis(now) >=
      lsm_l0_max_age_millis`;
@@ -707,9 +716,10 @@ Work:
 3. Open a min-heap merger over input slabs in
    `(HLC, RowKeyId, RecordRowIndex)` order.
 
-4. Implement `streaming_apply_elision` per Phase 0
-   §10 wrapping existing per-slab elision
-   primitives.
+4. Implement `apply_elision` per Phase 0 §10. This
+   helper may materialize a per-plan working set; the
+   streaming-bounded contract belongs to the cold
+   rebuild over input/output slab views.
 
 5. Apply lifecycle rules in this exact order:
    - retention floor first (ADR 048);
@@ -846,7 +856,7 @@ Work:
    - reject `ManifestRace` if `manifest_epoch_pre`
      differs from current epoch;
    - validate every input slab exists, is `Live`,
-     and matches the plan level;
+     and matches the plan compaction level;
    - validate every output slab ID is fresh;
    - validate sidecar swap digest summaries;
    - validate visible-domain invariance summary
@@ -1159,7 +1169,7 @@ Files:
 
 Guards (per ADR §13):
 
-1. `LevelIndex` exactly-one definition; range
+1. `CompactionLevelIndex` exactly-one definition; range
    `0..=3`.
 2. `CompactionJobId`, `ManifestEpoch` exactly-one
    definitions.
@@ -1213,17 +1223,17 @@ Exit:
 
 ```sh
 cargo test --lib storage::lsm
-cargo test lsm_manifest --quiet
-cargo test lsm_picker --quiet
-cargo test lsm_pins --quiet
-cargo test lsm_survivors --quiet
-cargo test lsm_output --quiet
-cargo test lsm_secondary_index --quiet
-cargo test lsm_commit --quiet
-cargo test lsm_digest --quiet
-cargo test lsm_gc --quiet
-cargo test lsm_cdc --quiet
-cargo test lsm_worker --quiet
+cargo test --test lsm_manifest --quiet
+cargo test --test lsm_picker --quiet
+cargo test --test lsm_pins --quiet
+cargo test --test lsm_survivors --quiet
+cargo test --test lsm_output --quiet
+cargo test --test lsm_secondary_index --quiet
+cargo test --test lsm_commit --quiet
+cargo test --test lsm_digest --quiet
+cargo test --test lsm_gc --quiet
+cargo test --test lsm_cdc --quiet
+cargo test --test lsm_worker --quiet
 cargo test --test architecture_test --quiet
 cargo test --test metrics_smoke --quiet
 cargo bench --bench lsm_compaction --no-run
@@ -1293,7 +1303,7 @@ disjoint partitioning at L1+, slabs as the run
 format. Storage tier (sweeper concern) is
 orthogonal and not part of the LSM substrate. Per-
 locality manifest mirror tracks
-`(level, state, successors, hlc_range, sidecar
+`(compaction_level, state, successors, hlc_range, sidecar
 coverage, manifest_epoch)`; mutations ride the
 existing locality control ring (ADR 016) for atomic
 epoch boundaries replicated to followers. Compaction

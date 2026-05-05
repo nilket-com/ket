@@ -78,8 +78,8 @@ use crate::schema::{
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
-	AsyncFileOps, BlockingFileOps, FileHandle, IoUringFileOps, OpenFlags, fsync_parent_dir,
-	write_file,
+	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
+	fsync_parent_dir, write_file,
 };
 use bytemuck::{Pod, Zeroable};
 use openraft::anyerror::AnyError;
@@ -1694,6 +1694,15 @@ pub trait TierObserver: Send + Sync {
 		let _ = (tombstone, applied_log_index);
 		Ok(())
 	}
+
+	async fn on_lsm_compaction_committed(
+		&self,
+		commit: &CompactionCommit,
+		applied_log_index: u64,
+	) -> std::io::Result<()> {
+		let _ = (commit, applied_log_index);
+		Ok(())
+	}
 }
 
 #[async_trait::async_trait]
@@ -2484,6 +2493,10 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 						.on_migrated_range_tombstone(tombstone, *applied_log_index)
 						.await
 						.map_err(|error| (SlabId::new(0), error)),
+					TierObserverEvent::LsmCompactionCommitted(commit) => observer
+						.on_lsm_compaction_committed(commit, *applied_log_index)
+						.await
+						.map_err(|error| (SlabId::new(0), error)),
 				};
 				if let Err((slab_id, error)) = result {
 					tracing::warn!(
@@ -2715,6 +2728,7 @@ enum TierObserverEvent {
 	Tiered(TieredSlab),
 	Retired(SlabId),
 	MigratedRangeTombstone(MigratedRangeTombstone),
+	LsmCompactionCommitted(CompactionCommit),
 }
 
 /// Fold one committed [`WendelonRequest`] into the SM state.
@@ -2970,6 +2984,57 @@ fn raft_audit_event_with_context(
 			.with_record_identity(finalization.key_identity),
 		),
 		WendelonRequest::TierSlab(_) | WendelonRequest::RetireTieredSlab(_) => None,
+		WendelonRequest::CompactionCommit(commit) => {
+			let op = if is_err {
+				AuditOperation::LsmInvariantViolation
+			} else {
+				AuditOperation::LsmCompactionCommitted
+			};
+			let output_level = commit
+				.slabs_to_add
+				.first()
+				.map(|run| run.compaction_level.get() as u64)
+				.unwrap_or(0);
+			let bytes_out = commit
+				.slabs_to_add
+				.iter()
+				.map(|run| run.size_bytes.get())
+				.sum::<u64>();
+			let rows_out = commit
+				.slabs_to_add
+				.iter()
+				.map(|run| run.row_count.get())
+				.sum::<u64>();
+			Some(
+				AuditEvent::new(
+					AuditAuthority::RaftLog,
+					op,
+					local_node,
+					format!(
+						"raft_log_index={} raft_term={} compaction_job_id={} manifest_epoch_pre={} input_slab_count={} output_slab_count={} output_level={} bytes_out={} rows_out={}",
+						entry.log_id.index,
+						entry.log_id.leader_id.term,
+						commit.job_id.get(),
+						commit.manifest_epoch_pre.get(),
+						commit.slabs_to_retire.len(),
+						commit.slabs_to_add.len(),
+						output_level,
+						bytes_out,
+						rows_out,
+					),
+				)
+				.with_outcome(outcome)
+				.with_raft_log_index(entry.log_id.index)
+				.with_parameter("raft_term", entry.log_id.leader_id.term)
+				.with_parameter("compaction_job_id", commit.job_id.get())
+				.with_parameter("manifest_epoch_pre", commit.manifest_epoch_pre.get())
+				.with_parameter("input_slab_count", commit.slabs_to_retire.len() as u64)
+				.with_parameter("output_slab_count", commit.slabs_to_add.len() as u64)
+				.with_parameter("output_level", output_level)
+				.with_parameter("bytes_out", bytes_out)
+				.with_parameter("rows_out", rows_out),
+			)
+		}
 		WendelonRequest::AdvanceEpoch(record) => Some(
 			AuditEvent::new(
 				AuditAuthority::RaftLog,
@@ -3797,6 +3862,20 @@ fn apply_request(
 				);
 			}
 			(WendelonResponse::Success, None)
+		}
+		WendelonRequest::CompactionCommit(commit) => {
+			if commit.digest_summary.visible_pre != commit.digest_summary.visible_post {
+				return (
+					WendelonResponse::Error(
+						"LSM compaction visible-domain digest changed".to_owned(),
+					),
+					None,
+				);
+			}
+			(
+				WendelonResponse::Success,
+				Some(TierObserverEvent::LsmCompactionCommitted(commit)),
+			)
 		}
 		WendelonRequest::CreateTenant(create) => (apply_create_tenant(state, create), None),
 		WendelonRequest::UpdateTenantQuota(update) => {
@@ -5329,6 +5408,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CompactionCommit(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CreateTenant(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::UpdateTenantQuota(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SuspendTenant(_)) => (LogEntryKind::APPEND, 0),
@@ -8910,6 +8990,45 @@ mod tiered_slab_tests {
 	use super::*;
 	use crate::consensus::RetireTieredSlab;
 
+	fn lsm_commit(visible_digest_byte: u8) -> CompactionCommit {
+		let digest = crate::hash::state_digest::StateDigest::ZERO;
+		let visible_post = if visible_digest_byte == 0 {
+			digest
+		} else {
+			crate::hash::state_digest::StateDigest::new([visible_digest_byte; 32])
+		};
+		CompactionCommit {
+			job_id: crate::schema::CompactionJobId::new(55),
+			manifest_epoch_pre: crate::schema::ManifestEpoch::new(7),
+			slabs_to_retire: vec![SlabId::new(1), SlabId::new(2)],
+			slabs_to_add: vec![crate::storage::LsmRunSummary::new(
+				SlabId::new(10),
+				crate::schema::CompactionLevelIndex::L1,
+				HybridTimestamp {
+					physical_ms: 10,
+					logical: 0,
+					node_id: 1,
+				},
+				HybridTimestamp {
+					physical_ms: 20,
+					logical: 0,
+					node_id: 1,
+				},
+				crate::schema::ByteCount::new(128),
+				crate::schema::RowCount::new(2),
+				crate::schema::ManifestEpoch::new(7),
+			)],
+			slabs_to_mark_delete_pending: Vec::new(),
+			slabs_to_remove: Vec::new(),
+			sidecar_swaps: Vec::new(),
+			digest_summary: crate::storage::CompactionDigestSummary {
+				visible_pre: digest,
+				visible_post,
+				version_entry_delta: digest,
+			},
+		}
+	}
+
 	#[test]
 	fn retire_tiered_slab_removes_pointer_and_is_idempotent() {
 		let mut state = SmState::default();
@@ -8946,6 +9065,36 @@ mod tiered_slab_tests {
 			WendelonRequest::RetireTieredSlab(RetireTieredSlab { slab_id }),
 		);
 		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(event, None);
+	}
+
+	#[test]
+	fn compaction_commit_request_emits_lsm_observer_event() {
+		let mut state = SmState::default();
+		let commit = lsm_commit(0);
+
+		let (resp, event) = apply_request(
+			&mut state,
+			WendelonRequest::CompactionCommit(commit.clone()),
+		);
+
+		assert_eq!(resp, WendelonResponse::Success);
+		assert_eq!(
+			event,
+			Some(TierObserverEvent::LsmCompactionCommitted(commit))
+		);
+	}
+
+	#[test]
+	fn compaction_commit_request_rejects_visible_digest_mismatch() {
+		let mut state = SmState::default();
+
+		let (resp, event) =
+			apply_request(&mut state, WendelonRequest::CompactionCommit(lsm_commit(7)));
+
+		assert!(
+			matches!(resp, WendelonResponse::Error(error) if error.contains("visible-domain digest"))
+		);
 		assert_eq!(event, None);
 	}
 }

@@ -118,6 +118,8 @@ struct RawStorageConfig {
 	#[serde(default = "default_slab_max_bytes")]
 	slab_max_bytes: u64,
 	#[serde(default)]
+	lsm_compaction_paused: bool,
+	#[serde(default)]
 	l2_column_fetch: RawL2ColumnFetchConfig,
 }
 
@@ -547,6 +549,7 @@ impl RawConfig {
 			cluster,
 			l2: None,
 			tiering: crate::storage::SweeperConfig::default(),
+			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,
 			root_kek_provider: self.crypto.root_kek_provider,

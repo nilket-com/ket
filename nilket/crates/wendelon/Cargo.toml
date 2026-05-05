@@ -58,6 +58,7 @@ uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
 wendelon-client = { path = "crates/wendelon-client", default-features = false }
 
 [profile.release]
@@ -129,4 +130,8 @@ harness = false
 
 [[bench]]
 name = "cdc_subscription"
+harness = false
+
+[[bench]]
+name = "lsm_compaction"
 harness = false

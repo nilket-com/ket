@@ -97,6 +97,7 @@ fn bootstrap_cfg(
 		cluster: ClusterBootstrapConfig::Bootstrap,
 		l2: None,
 		tiering: wendelon::storage::SweeperConfig::default(),
+		lsm_compaction_paused: false,
 		rehydration: wendelon::storage::RehydrationPolicy::default(),
 		l2_column_fetch: Default::default(),
 		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
