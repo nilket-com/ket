@@ -19,113 +19,133 @@ forward-sequence rewrite.
 
 ## Where we are
 
-ADR 054 (CDC Subscription Substrate) just promoted. Closes
-the cursor / live-tail / catchup / checkpoint / retention
-shape question for change-data capture. Substrate-only
-scope: triggers, PBC filter pushdown, webhooks, and
-continuous historical-plus-live queries are explicit
-follow-up ADRs. Identity-axis logical cursor `(row_hlc:
-Hlc, row_key_id: RowKeyId, record_row_index:
-RecordRowIndex)` matching the data-ring slab seek key
-(zero-write-amplification mandates this — control-log
-finality cursors would force table scans on resume). Event
-grain is the storage version-entry; no `CdcEventKind` /
-`CdcOperation` enum at substrate. In-memory per-locality
-`CdcLiveTailRing` with admission-time staging gated by ADR
-003 `FinalizationCommitted`; pending-finalization cleanup
-discards on terminal failure. Catchup uses **full
-`CdcCursor` tuple bounds** (not HLC ranges, which would
-miss same-HLC suffix) over a safe global cut `snapshot_hlc
-= min(locality_finalized_hlc(l))` at subscribe-open;
-existing storage scan paths, no durable CDC event log.
-Live-tail emission is gated by safe-emission watermark
-`safe_emission_hlc = min(locality_finalized_hlc(l))` so
-the emitted cursor sequence is non-decreasing in
-`CdcCursor` lex order under skewed locality finalization
-(without it, A finalized through 100 could emit A@90
-before B finalizes B@75, violating monotonicity).
-Open-time ring-continuity guard:
-`ring.head_cursor[l] <= (snapshot_hlc, RowKeyId::MAX,
-RecordRowIndex::MAX)` for every non-empty locality ring;
-violation rejects open with
-`CDC_REJECT_RING_OVERFLOW_DURING_CATCHUP` rather than
-silently dropping pre-open evictions. Cold-locality
-heartbeat contract is **locality-scoped, not per-table**:
-exactly one `CdcLocalityHeartbeatWorker` per locality on
-the locality leader emitting at most one no-op control-
-ring finalization marker per quiet interval at cadence
-`cdc_locality_heartbeat_interval_millis` (V1 default
-1000 ms) — `locality_finalized_hlc(l)` is a single
-per-locality value (ADR 016 control ring is locality-
-keyed), so one marker advances the watermark for every
-table whose source localities include `l`. Cluster cost:
-`N_localities / heartbeat_interval`, independent of
-CDC-table count; the worker spawns unconditionally on
-locality-leader startup. Visible-domain `StateDigest`
-checkpoints reuse `digest.table.row.visible.v1` (ADR 046
-V1 helper); no new digest domain. Resume-time digest
-validation via
-`CdcSubscribeRequestMeta::resume_visible_state_digest` +
-`resume_digest_present` rejects mismatched checkpoints at
-open with `CDC_REJECT_CHECKPOINT_DIGEST_MISMATCH` rather
-than waiting for the next checkpoint frame. Visible-state
-digest match plus cursor non-regression cover V1
-integrity; the substrate explicitly does **not** prove
-stream-prefix membership (sparse-cursor comparison cannot
-distinguish "k4 was never emitted" from "k4 was emitted
-and dropped") — a future event-history digest ADR
-(`digest.cdc.event.v1`) can add prefix-membership when a
-consumer demands it. Four new `MsgType` constants
-(`CDC_SUBSCRIBE_REQ` / `CDC_FRAME` / `CDC_CHECKPOINT` /
-`CDC_REJECT`); 8-code `CDC_REJECT_*` taxonomy; sparse
-enums (`CdcSubscribeBound`, `CdcFrameSource`,
-`CdcRejectCode`, `DigestDomain`) carry raw integer fields
-on POD meta with `from_raw` checked accessors (deriving
-`Pod` on sparse enums is unsound — most bit patterns are
-invalid). Reject-code discriminants start at 1 so a zero-
-initialized `CdcRejectMeta` cannot decode as a valid
-reject. `Live` and `SnapshotAtOpen` subscription bounds;
-cross-replica reconnect is a fresh subscription. CDC
-inherits ADR 053's wire helper and registers
-`NetworkCompressionPath::CdcEvent` as the fifth `path`
-label value. Bounded `cdc_*` metrics
-(`source ∈ {ring, catchup}`, `result ∈ {opened, closed,
-rejected, cancelled}`, `code ∈` 8-value enum); no
-tenant / table / subscription labels. V1 default
-`max_cdc_live_tail_bytes_per_locality = 64 MiB` (ADR 030
-deployment-profile-tunable); checkpoint cadence
-`max(1024 events, 1s)` (runbook tunable). No new HRFT
-envelope `format_version` bump, no new `FRAME_FLAG_*`,
-no new `NodeCapability` bit, no Cargo feature change, no
-new digest domain, no on-disk shape change. CDC delivery
-latency is bounded by one-way QUIC RTT plus ring-drain
-wakeup plus encode CPU plus the slowest source
-locality's finalization or heartbeat cadence above the
-emission HLC — the load-bearing cost of preserving
-global cursor monotonicity without exposing
-`LocalityId` on the cursor. See
+ADR 055 (LSM-Style Leveled Compaction Substrate) just
+promoted. Closes the leveled-merge / manifest / pin /
+elision-floor / digest-invariance shape question for
+physical compaction. Substrate-only scope: size-tiered
+fallback, subcompaction, bloom filters, cross-replica
+deduplication, manual-trigger RPC, and L4+ extension are
+explicit follow-up ADRs. Per-locality compactor on the
+locality leader; four levels (`L0..L3`); HLC-disjoint
+within each level (HLC is the data-ring slab seek key
+per ADR 045 / 050 / 052; partitioning on the seek key
+keeps binary-search-on-manifest cost constant). Internal
+`CompactionMergeKey = (row_hlc, row_key_id,
+record_row_index)` is storage-local and never crosses
+into CDC schema. Per-locality manifest mirror is local
+and rebuildable, but mutations ride a new
+`MutationKind::CompactionCommit` on the existing
+locality control ring (ADR 016) — readers see an atomic
+epoch boundary and followers receive the mutation for
+failover-safe synchronization. Compaction is
+**deterministic** so each replica reproduces the same
+logical output set from its local input slabs;
+cross-replica logical equality holds via determinism
+(visible-state digest matches), physical bytes stay
+local, replication traffic stays bounded to manifest
+mutations. **The elision floor IS ADR 048's retention
+floor** — no separate compaction floor, CDC floor, or
+operator override. Two reachability contracts would
+diverge under operational drift; one floor, one
+contract. Elision rules are inherited verbatim from the
+existing single-slab primitives lifted to a streaming
+multi-slab merger: append-only / content-hash
+data+tombstone pair-GC (ADR 047 / 049), PK prefix
+pruning with **boundary-sentinel retention** (ADR 050
+§7), migrated-range tombstone reclaim, fail-closed on
+ambiguous table ownership. Sidecar rebuild composes via
+ADR 052 §9 — every output slab gets a freshly-built
+sidecar, **replace-by-new** (never in-place rewrite),
+digest-verified before old sidecars retire. CDC catchup
+acquires manifest-snapshot iteration pins at open;
+those pins survive concurrent compaction commits. Live-
+tail handoff reads ADR 054's in-memory ring and does
+not pin slabs. **No `relocated_reads` shim** — pins
+make old and new manifest epochs independently
+readable; sidecars rebuild during compaction so cached
+`RecordLocation` references in old sidecars retire with
+the old sidecars. Subscriptions below retention floor
+reject with the existing
+`CDC_REJECT_BELOW_RETENTION_FLOOR`. **No
+`safe_emission_hlc` coupling** — that watermark gates
+emission from the in-memory live-tail ring (upstream of
+any compaction decision); by the time a version-entry
+reaches a slab eligible for compaction, it's been
+finalized, emitted (or skipped past) the live-tail
+ring, and the ring entry has dropped. The roadmap's
+"compaction must not advance below cursor_high_water
+when sidecars are being rewritten in-place" is
+satisfied by **not rewriting sidecars in place**; the
+"ring overflow rejects cleanly" branch is the existing
+`CDC_REJECT_RING_OVERFLOW_DURING_CATCHUP` (ADR 054).
+Visible-state `StateDigest` invariance audited
+unconditionally at every commit via cold rebuild over
+input/output *manifest views localized to touched
+slabs* — O(input + output bytes), not O(table); ADR
+046's monoidal digest makes the localized comparison
+equivalent to whole-table comparison. Cold rebuild over
+views catches both elision bugs (drops a visible row)
+*and* materialization bugs (synthesizes a visible row);
+streaming `visible_contrib(elision_set) == identity`
+only catches elision and was rejected as the V1 install
+gate. Per-version-entry digest
+(`digest.secondary_index.entry.v1`, ADR 052) updated
+algebraically on the elision stream; sampled cold-
+rebuild verification at
+`lsm_digest_verify_sample_rate`. Mismatch aborts the
+commit, emits `LsmInvariantViolation`, pauses
+compaction on the affected `(locality, table)` scope
+until manual investigation — page-grade. Three V1
+reject codes (`ManifestRace`,
+`SidecarDigestMismatch`, `VisibleDigestInvariance`),
+discriminants start at 1 so a zero-init reject can't
+decode as valid; closed taxonomy. Bounded `lsm_*`
+metrics with `{level, result, kind}` enumerations; no
+tenant / table / subscription / slab_id labels. V1
+defaults: `max_l0_slab_count = 4`,
+`lsm_l0_max_age_millis = 5_000`,
+`lsm_l1_slab_size_target_bytes = 64 MiB`,
+`lsm_size_ratio = 10`, `max_l1_slab_count = 4`,
+`lsm_picker_tick_millis = 100`,
+`lsm_gc_tick_millis = 1_000`,
+`lsm_compaction_concurrency_per_locality = 1` —
+yielding L1 ≤ 256 MiB, L2 ≤ 2.56 GiB, L3 ≤ 25.6 GiB
+per locality. L3 has no next level in V1. Active slab
+is never a compaction input. Pause/resume via existing
+node-local maintenance config, not a new wire
+protocol. No new wire `MsgType`, no new `FRAME_FLAG_*`,
+no new `NodeCapability` bit, no Cargo feature, no new
+digest domain, no `ObjectStore` trait change, no on-
+disk format change beyond the slab-manifest extension
+carried by `CompactionCommit`. No `StorageTier` field
+on the LSM substrate — existing tier sweeper handles
+L1=local / L2=tiered moves orthogonally. See
+`plans/adr/055_lsm_leveled_compaction_substrate.md`
+and `plans/impl/055_lsm_leveled_compaction_substrate.md`.
+Implementation phases pending; full small / medium /
+large bench evidence is the promotion-to-shipped gate.
+
+ADR 054 (CDC Subscription Substrate) is the immediate
+predecessor and the binding ADR 055 inherits.
+Identity-axis logical cursor `(row_hlc, row_key_id,
+record_row_index)` matching the data-ring slab seek
+key; in-memory per-locality `CdcLiveTailRing` with
+admission-time staging gated by ADR 003
+`FinalizationCommitted`; catchup over a safe global
+cut `snapshot_hlc = min(locality_finalized_hlc(l))`
+using full-tuple `CdcCursor` bounds; safe-emission
+watermark gates live-tail emission; locality-scoped
+heartbeat (one worker per locality, one marker per
+quiet interval); visible-domain `StateDigest`
+checkpoints; 8-code `CDC_REJECT_*` taxonomy; bounded
+`cdc_*` metrics; `Live` and `SnapshotAtOpen`
+subscription bounds. See
 `plans/adr/054_cdc_subscription_substrate.md` and
 `plans/impl/054_cdc_subscription_substrate.md`.
-Initial implementation phases have landed behind the substrate
-API. Full small / medium / large bench evidence remains the
-promotion-to-shipped gate; the current smoke artifact lives at
+Initial implementation phases landed; full bench
+evidence remains the promotion-to-shipped gate; smoke
+artifact at
 `plans/impl/054_cdc_subscription_substrate_bench_results.md`.
-
-ADR 053 (Wire-Side Arrow IPC Body Compression) is the
-immediate predecessor and the binding ADR 054 inherits.
-Per-buffer LZ4_FRAME on fresh wire-side Arrow IPC
-encoders via Arrow IPC's native `BodyCompression`,
-mirroring ADR 043 on the wire axis. Single helper
-`wire_ipc_write_options()` pinned by
-`WIRE_BODY_COMPRESSION` with `wire_encode_batch` as its
-function-level companion; four wire-side fresh-encoder
-sites flip in V1; storage pass-through bytes flow
-verbatim. Bounded `network_compression_*` metric family
-with `{codec, path}` labels — CDC adds `cdc_event` as
-the fifth allowed `path` value. See
-`plans/adr/053_wire_arrow_ipc_body_compression.md` and
-`plans/impl/053_wire_arrow_ipc_body_compression.md`.
-Implementation phases pending.
 
 ## Prioritization philosophy
 
@@ -162,8 +182,8 @@ afterward.
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–10 are promoted (in `plans/adr/`); the
-forward shape begins at #11.
+Gemini. Steps 1–11 are promoted (in `plans/adr/`); the
+forward shape begins at #12.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -186,24 +206,14 @@ forward shape begins at #11.
 10. **CDC subscription substrate** — ADR 054 promoted.
     Substrate-only; triggers, PBC filter pushdown,
     webhooks, and continuous historical-plus-live queries
-    are explicit follow-up ADRs (each consumes the
-    substrate). See *Where we are* above.
-
-11. **LSM-style leveled compaction.** The compactor reads
-    multi-row segments, drops rows matched by tombstones,
-    generates new secondary index segments (rebuilding
-    sidecars per ADR 052 §"Compaction"), and updates
-    `StateDigest` points algebraically (additions for new
-    survivor versions, subtractions for evicted versions).
-    Append-only segments are LSM-clean by construction.
-    Composes against ADR 048 retention floors, ADR 050
-    PK supersession chains, and ADR 052 secondary-index
-    sidecars. CDC's `safe_emission_hlc` watermark
-    interaction with compaction needs explicit treatment
-    (compaction must not advance below any active
-    subscription's `cursor_high_water` when sidecars are
-    being rewritten in-place, or ring-overflow recovery
-    must reject cleanly). *Large, multi-ADR.*
+    are explicit follow-up ADRs.
+11. **LSM-style leveled compaction substrate** — ADR 055
+    promoted. Substrate-only; size-tiered fallback,
+    subcompaction, bloom filters, cross-replica
+    deduplication, manual-trigger RPC, L4+ extension,
+    and direct already-tiered compaction are explicit
+    follow-up ADRs (each consumes the substrate). See
+    *Where we are* above.
 
 12. **CDC follow-up ADRs (consume ADR 054 substrate).**
     Independent; each ships its own contract surface:
@@ -293,14 +303,46 @@ forward shape begins at #11.
   images, event-history digest) has its own contract
   surface; bundling defers real decisions behind a larger
   one. Land them independently against the substrate.
-- **Don't open LSM compaction without first thinking
-  through the CDC live-tail interaction.** ADR 054's
-  safe-emission watermark plus ring-continuity guard
-  assume locality slabs do not get rewritten under an
-  active subscription's catchup ceiling. LSM compaction
-  needs an explicit policy: either compaction yields to
-  active subscriptions, or `RING_OVERFLOW_DURING_CATCHUP`
-  fires cleanly. Decide before shipping.
+- **Don't introduce a separate compaction floor.** ADR
+  055 §"Architectural inextricability" pins the elision
+  floor as identical to ADR 048's retention floor. A
+  parallel parameter would diverge under operational
+  drift and create two reachability contracts.
+  Operator-tunable retention is the lever; "compact
+  more aggressively than retention permits" is not a
+  shape V1 supports.
+- **Don't add an LSM `relocated_reads` shim.** ADR 055
+  §7 commits to manifest-snapshot pins as the sole MVCC
+  mechanism; cached `RecordLocation` references retire
+  with the old sidecars (rebuilt out-of-place during
+  compaction). Reintroducing per-row relocation rows
+  for LSM would add chain-management complexity without
+  improving CDC catchup or iterator safety.
+- **Don't replace the cold-rebuild visible-domain audit
+  with a streaming-only check.** ADR 055 §6 / §9 commit
+  to localized cold rebuild over input/output slab
+  views as the V1 install gate — equivalent O(touched
+  bytes) cost, strictly stronger bug-catching (catches
+  materialization, not just elision). Streaming
+  `visible_contrib(elision_set) == identity` is a debug
+  / bench tool, not the gate.
+- **Don't widen `CompactionMergeKey` with locality /
+  tenant / table prefix.** Compaction is per-locality
+  by construction; table ownership is read from row-
+  axis synthetic columns at retention-floor lookup, not
+  from the merge key. The narrow `(HLC, RowKeyId,
+  RecordRowIndex)` matches the data-ring slab seek key
+  exactly.
+- **Don't put `StorageTier` on the LSM substrate.**
+  Tier moves are an orthogonal sweeper concern. Coupling
+  them would force the substrate to coordinate with the
+  sweeper without buying capability.
+- **Don't bundle the LSM follow-up ADRs.** Size-tiered
+  picker, subcompaction, bloom filters, cross-replica
+  deduplication, manual-trigger RPC, L4+ extension, and
+  direct already-tiered compaction each consume the ADR
+  055 substrate independently. Bundling defers real
+  decisions behind a larger one.
 - **Don't promote stabilization watch items into roadmap
   items.** Stabilization watch — observability metrics,
   architectural-test guards, post-merge dashboards — lives
@@ -338,19 +380,25 @@ StateDigest substrate                         (ADR 046)
   → descriptor fingerprint split              (ADR 051)
   → secondary indexes                         (ADR 052)
   → wire-side Arrow IPC body compression      (ADR 053)
-  → CDC subscription substrate                (ADR 054)  ← here
-  → LSM (next: roadmap #11)
+  → CDC subscription substrate                (ADR 054)
+  → LSM-style leveled compaction substrate    (ADR 055)  ← here
   → CDC follow-up ADRs (filters, triggers, webhooks, …)
   → vector embeddings
   → encoding / fetch / distributed compute
   → refinement plumbing
 ```
 
-Design tip is past ADR 054 with the CDC subscription
+Design tip is past ADR 055 with the LSM compaction
 substrate *promoted* (design accepted; implementation
-phases pending). Next ADR is LSM-style leveled compaction
-(#11), the first of the post-CDC large multi-ADR
-sequences; ordering against the CDC follow-up cluster
-(#12) is opportunistic — a CDC consumer ADR can land
-ahead of LSM if the council prefers, since neither
-blocks the other on shape.
+phases pending). The post-CDC / post-LSM cluster (#12)
+is opportunistic — a CDC consumer ADR (filters,
+triggers, webhooks, durable cursor commit, multi-table
+firehose, before-images, event-history digest) can land
+in any order, since each consumes the ADR 054 substrate
+independently and none blocks the others on shape. The
+council's lean on next pickup: a CDC consumer ADR if
+the team has bandwidth for surface design (each is
+independently scoped); vector embeddings (#13) if the
+team prefers to settle the next large algebraic
+substrate (ANN as a sidecar family on top of #8 and
+#11) before the CDC consumer cluster.
