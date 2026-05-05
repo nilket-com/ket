@@ -2146,6 +2146,448 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 	);
 }
 
+#[test]
+fn adr054_cdc_subscription_substrate_contract() {
+	let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let schema_cdc = fs::read_to_string(manifest_dir.join("src/schema/cdc.rs")).unwrap();
+	for required in [
+		"pub struct CdcCursor",
+		"pub row_hlc: Hlc",
+		"pub row_key_id: RowKeyId",
+		"pub record_row_index: RecordRowIndex",
+		"pub struct CdcSubscriptionId(pub u128)",
+		"pub enum CdcSubscribeBound",
+		"pub enum CdcFrameSource",
+		"pub enum CdcRejectCode",
+		"BelowRetentionFloor = 1",
+		"InternalEngineError = 8",
+		"pub struct CdcSubscribeRequestMeta",
+		"resume_visible_state_digest: StateDigest",
+		"pub struct CdcFrameMeta",
+		"frame_low_cursor",
+		"frame_high_cursor",
+		"pub struct CdcCheckpointMeta",
+		"digest_domain_raw: u32",
+		"pub struct CdcRejectMeta",
+		"code_raw: u32",
+		"pub fn cdc_event_batch",
+		"pub fn cdc_tombstone_event_batch",
+		"pub fn cdc_cursor_in_catchup_window",
+		"cursor > start_exclusive && cursor <= upper_inclusive",
+	] {
+		if !schema_cdc.contains(required) {
+			violations.push(format!(
+				"src/schema/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"CdcRejectCode, Pod",
+		"CdcSubscribeBound, Pod",
+		"CdcFrameSource, Pod",
+		concat!("Cdc", "EventKind"),
+		concat!("Cdc", "Operation"),
+	] {
+		if schema_cdc.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/cdc.rs: contains forbidden ADR 054 token {forbidden}"
+			));
+		}
+	}
+
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	for required in [
+		"pub const CDC_SUBSCRIBE_REQ: Self = Self(0x36)",
+		"pub const CDC_FRAME: Self = Self(0x37)",
+		"pub const CDC_CHECKPOINT: Self = Self(0x38)",
+		"pub const CDC_REJECT: Self = Self(0x39)",
+	] {
+		if !schema_core.contains(required) {
+			violations.push(format!(
+				"src/schema/core.rs: missing ADR 054 MsgType {required}"
+			));
+		}
+	}
+	if schema_core.contains(concat!("FRAME_FLAG_", "CDC")) {
+		violations.push("src/schema/core.rs: ADR 054 must not add CDC frame flags".to_string());
+	}
+
+	let network_cdc = fs::read_to_string(manifest_dir.join("src/network/cdc.rs")).unwrap();
+	for required in [
+		"CdcSubscriptionRegistry",
+		"SubscriptionHandle",
+		"cdc_emit_frame",
+		"wire_encode_batch_for_path(batch, NetworkCompressionPath::CdcEvent)",
+		"cdc_emit_checkpoint",
+		"cdc_emit_reject",
+		"pub fn remove",
+	] {
+		if !network_cdc.contains(required) {
+			violations.push(format!(
+				"src/network/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	for required in [
+		"MsgType::CDC_SUBSCRIBE_REQ",
+		"handle_cdc_subscribe_stream",
+		"cdc_registry: Arc<CdcSubscriptionRegistry>",
+		"cdc_live_tail_rings",
+		"cdc_locality_frontiers: Arc<CdcLocalityFrontiers>",
+		"cdc_pending_live_entries: Arc<DashMap<PendingFinalizationId, Vec<CdcStagedEntryRef>>>",
+		"cdc_marker_pending_live_entries: Arc<DashMap<CdcFinalizationKey, Vec<CdcStagedEntryRef>>>",
+		"struct CdcFinalizationKey",
+		"fn from_table_replica_meta(meta: &TableReplicaWriteMeta) -> Self",
+		"spawn_cdc_finalization_release_observer",
+		"cdc_release_pending_finalization_marker",
+		"stage_cdc_table_replica_children",
+		"self.cdc_stage_pending_finalization_marker",
+		"CdcFinalizationKey::from_table_replica_meta(&meta)",
+		"cdc_heartbeat_localities: Arc<DashMap<Locality, ()>>",
+		"cdc_heartbeat_observed_frontiers: Arc<DashMap<Locality, HybridTimestamp>>",
+		"stage_cdc_table_children",
+		".with_finalized(finalized)",
+		"self.cdc_pending_live_entries",
+		"self.cdc_release_pending_finalization(record.id).await",
+		"self.cdc_evict_pending_finalization(pending.id).await",
+		"ring.mark_finalized_entry",
+		"} else {\n\t\t\t\tmetrics().observe_cdc_pending_finalization_evicted();",
+		"metrics().observe_cdc_pending_finalization_evicted()",
+		"cdc_emit_frame",
+		"collect_cdc_catchup_events",
+		"compute_cdc_visible_row_keys_at_cursor",
+		"cdc_open_time_ring_continuity_check",
+		"cdc_safe_emission_hlc",
+		"cdc_capture_snapshot_hlc",
+		"cdc_live_retention_reject_code",
+		"cdc_live_recovery_upper_after",
+		"evicted_cursor_frontier",
+		"emit_cdc_live_recovery_catchup_events",
+		"handle.cursor_high_water.advance_max(recovery_upper)",
+		"CdcFrameSource::Catchup.as_raw()",
+		"cdc_retention_reject_code_for_cursor",
+		"cdc_table_maybe_replicated_here",
+		"cdc_ranges_maybe_replicated_by_local_node",
+		"CdcRejectCode::TableNotReplicatedHere",
+		"emit_cdc_subscription_opened_audit",
+		"emit_cdc_subscription_closed_audit",
+		"AuditOperation::CdcSubscriptionOpened",
+		"AuditOperation::CdcSubscriptionClosed",
+		"cdc_cursor_audit_json",
+		"cdc_reject_audit_reason",
+		"cdc_min_locality_frontier_for_ranges",
+		"cdc_source_localities_for_ranges",
+		"CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET",
+		"cdc_source_localities_from_ranges_and_rings",
+		"register_cdc_heartbeat_localities",
+		"register_cdc_heartbeat_localities_for_primary_ranges",
+		"cdc_heartbeat_localities_for_primary_ranges",
+		"ring.primary_ranges_for(self.local_node)",
+		"self.register_cdc_heartbeat_locality(child.locality);",
+		"spawn_cdc_locality_heartbeat_supervisor",
+		"CdcLocalityHeartbeatWorker::new(locality_id, interval)",
+		"cdc_locality_quiet_since_last_finalization",
+		"emit_cdc_heartbeat_finalization_marker",
+		"cdc_heartbeat_identity",
+		"cdc_heartbeat_payload_hash",
+		"WendelonRequest::Finalize(finalization)",
+		"tenant_id: TenantId::ZERO",
+		"charged_bytes: 0",
+		"record_count: 0",
+		"localities.insert(range.start)",
+		"localities.insert(range.end)",
+		"cdc_locality_frontiers.wait_for_advance",
+		"drain_cdc_ready_live_entries",
+		"pending_live_entries.extend",
+		"let catchup_started = Instant::now()",
+		"metrics().observe_cdc_catchup_to_live_handoff(catchup_started.elapsed())",
+		"handle.cursor_high_water.load()",
+		"pending.dedup_by_key(|entry| entry.cursor)",
+		"CdcRejectCode::BelowRetentionFloor",
+		"self.cdc_registry.remove",
+		"cdc_snapshot_hlc_from_state",
+		"check_read_against_retention(req.start_cursor.row_hlc",
+		"cdc_emit_checkpoint",
+		"CDC_CHECKPOINT_EVENT_CADENCE",
+		"CDC_CHECKPOINT_WALL_CADENCE",
+		"CdcCheckpointCadence",
+		"checkpoint_cadence.note_events(meta.event_count.get())",
+		"checkpoint_cadence.checkpoint_due(now)",
+		"cdc_emit_checkpoint(stream, stream_id, &checkpoint, CdcFrameSource::Ring)",
+		"storage_row_is_tombstone_at",
+		"cdc_tombstone_event_batch",
+		"CatchupSnapshot::new(self.cdc_capture_snapshot_hlc(&source_ranges).await)",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 054 integration token {required}"
+			));
+		}
+	}
+	let cdc_handler_section = data_server
+		.split("async fn handle_cdc_subscribe_stream")
+		.nth(1)
+		.and_then(|tail| tail.split("async fn emit_cdc_catchup_events").next())
+		.unwrap_or("");
+	if cdc_handler_section.contains("cdc_snapshot_hlc_from_state(&state)") {
+		violations.push(
+			"src/network/data_server.rs: CDC subscribe open must capture snapshot through cdc_capture_snapshot_hlc after source_ranges, not directly from state".to_string(),
+		);
+	}
+
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	for required in [
+		"DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS",
+		"cdc_finalization_release_observer: JoinHandle<()>",
+		"cdc_locality_heartbeat: JoinHandle<()>",
+		"spawn_cdc_finalization_release_observer()",
+		"spawn_cdc_locality_heartbeat_supervisor(\n\t\t\tring.clone()",
+		"self.cdc_finalization_release_observer.abort()",
+		"self.cdc_locality_heartbeat.abort()",
+		"await_background_task(\n\t\t\tself.cdc_finalization_release_observer",
+		"await_background_task(self.cdc_locality_heartbeat, \"CDC locality heartbeat\")",
+	] {
+		if !node.contains(required) {
+			violations.push(format!(
+				"src/node.rs: missing ADR 054 heartbeat supervisor token {required}"
+			));
+		}
+	}
+
+	let storage_cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+	for required in [
+		"DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY",
+		"DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS",
+		"pub struct CdcLiveTailRing",
+		"pub struct CdcLiveEntry",
+		"mark_finalized_entry",
+		"eviction_frontiers: HashMap<(TenantId, TableObjectId), CdcCursor>",
+		"pub async fn evicted_cursor_frontier",
+		"pub struct CdcLocalityFrontiers",
+		"min_for_localities",
+		"wait_for_advance",
+		"notify_waiters",
+		"CdcFinalizationObserver",
+		"open_time_ring_continuity_check",
+		"pub struct CdcLocalityHeartbeatWorker",
+		"pub locality_id: Locality",
+	] {
+		if !storage_cdc.contains(required) {
+			violations.push(format!(
+				"src/storage/cdc.rs: missing ADR 054 token {required}"
+			));
+		}
+	}
+	let heartbeat_section = storage_cdc
+		.split("pub struct CdcLocalityHeartbeatWorker")
+		.nth(1)
+		.unwrap_or("");
+	if heartbeat_section.contains("table_object_id") {
+		violations.push(
+			"src/storage/cdc.rs: heartbeat worker must not carry table_object_id".to_string(),
+		);
+	}
+
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"cdc_event",
+		"wendelon_cdc_subscriptions_total",
+		"wendelon_cdc_events_emitted_total",
+		"wendelon_cdc_event_bytes_emitted_total",
+		"wendelon_cdc_checkpoints_emitted_total",
+		"wendelon_cdc_rejects_total",
+		"wendelon_cdc_subscription_lag_micros",
+		"wendelon_cdc_ring_overflow_total",
+		"wendelon_cdc_catchup_to_live_handoff_micros",
+		"wendelon_cdc_staged_entries_in_ring",
+		"wendelon_cdc_pending_finalization_evicted_total",
+		"below_retention_floor",
+		"ring_overflow_during_catchup",
+		"schema_fingerprint_incompatible",
+		"checkpoint_digest_mismatch",
+		"unknown_table",
+		"tenant_auth_denied",
+		"table_not_replicated_here",
+		"internal_engine_error",
+	] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 054 metric token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"cdc_.*tenant_id",
+		"cdc_.*table_object_id",
+		"subscription_id\"",
+		"schema_fingerprint\"",
+	] {
+		if metrics.contains(forbidden) {
+			violations.push(format!(
+				"src/metrics/registry.rs: contains forbidden CDC metric label token {forbidden}"
+			));
+		}
+	}
+
+	let runbook = manifest_dir.join("plans/ops/runbooks/cdc_subscription.md");
+	if !runbook.exists() {
+		violations.push("plans/ops/runbooks/cdc_subscription.md is missing".to_string());
+	} else {
+		let runbook = fs::read_to_string(&runbook).unwrap();
+		for required in [
+			"## Promotion Evidence",
+			"scripts/bench/run_cdc_subscription_acceptance.sh",
+			"measured_one_way_quic_rtt_micros",
+			"promotion_candidate=true",
+			"cdc_acceptance_*",
+			"placeholder RTT",
+		] {
+			if !runbook.contains(required) {
+				violations.push(format!(
+					"plans/ops/runbooks/cdc_subscription.md: missing ADR 054 promotion-evidence token {required}"
+				));
+			}
+		}
+	}
+	let runbook_index =
+		fs::read_to_string(manifest_dir.join("plans/ops/runbooks/README.md")).unwrap();
+	if !runbook_index.contains("cdc_subscription.md") {
+		violations.push("plans/ops/runbooks/README.md: CDC runbook is not cataloged".to_string());
+	}
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	if !cargo_toml.contains("name = \"cdc_subscription\"") {
+		violations.push("Cargo.toml: ADR 054 CDC subscription benchmark is missing".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/cdc_subscription.rs");
+	if !bench_path.exists() {
+		violations
+			.push("benches/cdc_subscription.rs: ADR 054 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for required in [
+			"FULL_MATRIX",
+			"--full",
+			"--acceptance-one-way-quic-rtt-micros",
+			"cdc_live_tail_latency",
+			"cdc_live_tail_fanout",
+			"cdc_catchup_throughput",
+			"cdc_ring_overflow_threshold",
+			"cdc_admission_isolation",
+			"cdc_stage_release_drain",
+			"cdc_safe_emission_watermark_hold",
+			"cdc_acceptance_live_tail_latency",
+			"cdc_acceptance_catchup_throughput",
+			"cdc_acceptance_ring_overflow_nonblocking",
+			"cdc_acceptance_admission_isolation",
+			"CDC acceptance thresholds failed",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/cdc_subscription.rs: missing ADR 054 bench token {required}"
+				));
+			}
+		}
+	}
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/054_cdc_subscription_substrate_bench_results.md"),
+	)
+	.unwrap();
+	for required in [
+		"--acceptance-one-way-quic-rtt-micros",
+		"cdc_acceptance_live_tail_latency",
+		"cdc_acceptance_catchup_throughput",
+		"cdc_acceptance_ring_overflow_nonblocking",
+		"cdc_acceptance_admission_isolation",
+		"representative deployment evidence",
+		"Representative Acceptance Template",
+		"measured one-way QUIC RTT micros",
+		"CPU governor / power profile",
+		"scripts/bench/run_cdc_subscription_acceptance.sh",
+		"promotion_candidate=true",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/054_cdc_subscription_substrate_bench_results.md: missing ADR 054 bench-results token {required}"
+			));
+		}
+	}
+	let acceptance_script = manifest_dir.join("scripts/bench/run_cdc_subscription_acceptance.sh");
+	if !acceptance_script.exists() {
+		violations.push("scripts/bench/run_cdc_subscription_acceptance.sh is missing".to_string());
+	} else {
+		let script = fs::read_to_string(acceptance_script).unwrap();
+		for required in [
+			"CDC_ACCEPTANCE_BENCH_ARGS",
+			"CDC_ACCEPTANCE_MATRIX_ROWS",
+			"--acceptance-one-way-quic-rtt-micros",
+			"cdc_subscription_acceptance.log",
+			"validation_status=pass",
+			"promotion_candidate=true",
+			"cdc_acceptance_live_tail_latency",
+			"cdc_acceptance_catchup_throughput",
+			"cdc_acceptance_ring_overflow_nonblocking",
+			"cdc_acceptance_admission_isolation",
+		] {
+			if !script.contains(required) {
+				violations.push(format!(
+					"scripts/bench/run_cdc_subscription_acceptance.sh: missing ADR 054 acceptance token {required}"
+				));
+			}
+		}
+	}
+	let observability =
+		fs::read_to_string(manifest_dir.join("plans/ops/observability.md")).unwrap();
+	for required in [
+		"#### Change Data Capture",
+		"wendelon_cdc_subscriptions_total",
+		"wendelon_cdc_events_emitted_total",
+		"wendelon_cdc_event_bytes_emitted_total",
+		"wendelon_cdc_checkpoints_emitted_total",
+		"wendelon_cdc_rejects_total",
+		"wendelon_cdc_subscription_lag_micros",
+		"wendelon_cdc_ring_overflow_total",
+		"wendelon_cdc_catchup_to_live_handoff_micros",
+		"wendelon_cdc_staged_entries_in_ring",
+		"wendelon_cdc_pending_finalization_evicted_total",
+		"CDC metrics deliberately do not label tenant, table, subscription id",
+	] {
+		if !observability.contains(required) {
+			violations.push(format!(
+				"plans/ops/observability.md: missing ADR 054 CDC metric token {required}"
+			));
+		}
+	}
+	let fixtures = manifest_dir.join("tests/fixtures/cdc_subscription/README.md");
+	if !fixtures.exists() {
+		violations.push("tests/fixtures/cdc_subscription/README.md is missing".to_string());
+	} else {
+		let fixtures = fs::read_to_string(fixtures).unwrap();
+		for required in [
+			"same_hlc_suffix_catchup",
+			"live_tail_release",
+			"open_time_ring_continuity",
+			"checkpoint_visible_digest",
+			"reject_taxonomy",
+		] {
+			if !fixtures.contains(required) {
+				violations.push(format!(
+					"tests/fixtures/cdc_subscription/README.md: missing fixture case {required}"
+				));
+			}
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 054 CDC subscription invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
 fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<String>) {
 	let scan_roots = ["src", "tests", "benches"];
 	let forbidden = [

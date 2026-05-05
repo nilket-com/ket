@@ -1,5 +1,5 @@
 use crate::schema::{
-	IndexObjectId, RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus,
+	CdcRejectCode, IndexObjectId, RecordBodyCompressionPolicy, TableObjectId, TenantId, WriteStatus,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -135,6 +135,7 @@ pub enum NetworkCompressionPath {
 	MigrationRecords,
 	QueryResponse,
 	ReadResponse,
+	CdcEvent,
 }
 
 impl NetworkCompressionPath {
@@ -144,6 +145,45 @@ impl NetworkCompressionPath {
 			Self::MigrationRecords => "migration_records",
 			Self::QueryResponse => "query_response",
 			Self::ReadResponse => "read_response",
+			Self::CdcEvent => "cdc_event",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdcMetricSource {
+	Ring,
+	Catchup,
+}
+
+impl CdcMetricSource {
+	pub const ALL: [Self; 2] = [Self::Ring, Self::Catchup];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Ring => "ring",
+			Self::Catchup => "catchup",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdcSubscriptionMetricResult {
+	Opened,
+	Closed,
+	Rejected,
+	Cancelled,
+}
+
+impl CdcSubscriptionMetricResult {
+	pub const ALL: [Self; 4] = [Self::Opened, Self::Closed, Self::Rejected, Self::Cancelled];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Opened => "opened",
+			Self::Closed => "closed",
+			Self::Rejected => "rejected",
+			Self::Cancelled => "cancelled",
 		}
 	}
 }
@@ -1202,6 +1242,160 @@ impl NetworkCompressionCodecPathHistograms {
 }
 
 #[derive(Default)]
+struct CdcSubscriptionResultCounters {
+	opened: Counter,
+	closed: Counter,
+	rejected: Counter,
+	cancelled: Counter,
+}
+
+impl CdcSubscriptionResultCounters {
+	fn counter(&self, result: CdcSubscriptionMetricResult) -> &Counter {
+		match result {
+			CdcSubscriptionMetricResult::Opened => &self.opened,
+			CdcSubscriptionMetricResult::Closed => &self.closed,
+			CdcSubscriptionMetricResult::Rejected => &self.rejected,
+			CdcSubscriptionMetricResult::Cancelled => &self.cancelled,
+		}
+	}
+
+	fn inc(&self, result: CdcSubscriptionMetricResult) {
+		self.counter(result).inc();
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for result in CdcSubscriptionMetricResult::ALL {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("result", result.as_str())],
+				self.counter(result).get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct CdcSourceCounters {
+	ring: Counter,
+	catchup: Counter,
+}
+
+impl CdcSourceCounters {
+	fn counter(&self, source: CdcMetricSource) -> &Counter {
+		match source {
+			CdcMetricSource::Ring => &self.ring,
+			CdcMetricSource::Catchup => &self.catchup,
+		}
+	}
+
+	fn inc(&self, source: CdcMetricSource) {
+		self.counter(source).inc();
+	}
+
+	fn add(&self, source: CdcMetricSource, value: u64) {
+		self.counter(source).add(value);
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for source in CdcMetricSource::ALL {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("source", source.as_str())],
+				self.counter(source).get(),
+			);
+		}
+	}
+}
+
+#[derive(Default)]
+struct CdcRejectCounters {
+	below_retention_floor: Counter,
+	ring_overflow_during_catchup: Counter,
+	schema_fingerprint_incompatible: Counter,
+	checkpoint_digest_mismatch: Counter,
+	unknown_table: Counter,
+	tenant_auth_denied: Counter,
+	table_not_replicated_here: Counter,
+	internal_engine_error: Counter,
+}
+
+impl CdcRejectCounters {
+	fn counter(&self, code: CdcRejectCode) -> &Counter {
+		match code {
+			CdcRejectCode::BelowRetentionFloor => &self.below_retention_floor,
+			CdcRejectCode::RingOverflowDuringCatchup => &self.ring_overflow_during_catchup,
+			CdcRejectCode::SchemaFingerprintIncompatible => &self.schema_fingerprint_incompatible,
+			CdcRejectCode::CheckpointDigestMismatch => &self.checkpoint_digest_mismatch,
+			CdcRejectCode::UnknownTable => &self.unknown_table,
+			CdcRejectCode::TenantAuthDenied => &self.tenant_auth_denied,
+			CdcRejectCode::TableNotReplicatedHere => &self.table_not_replicated_here,
+			CdcRejectCode::InternalEngineError => &self.internal_engine_error,
+		}
+	}
+
+	fn inc(&self, code: CdcRejectCode) {
+		self.counter(code).inc();
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		for code in CdcRejectCode::ALL {
+			render_counter_with_labels(
+				out,
+				name,
+				&[("code", code.as_str())],
+				self.counter(code).get(),
+			);
+		}
+	}
+}
+
+struct CdcSourceHistograms {
+	ring: Mutex<Histogram>,
+	catchup: Mutex<Histogram>,
+}
+
+impl CdcSourceHistograms {
+	fn new(bounds: &'static [u64]) -> Self {
+		Self {
+			ring: Mutex::new(Histogram::new(bounds)),
+			catchup: Mutex::new(Histogram::new(bounds)),
+		}
+	}
+
+	fn histogram(&self, source: CdcMetricSource) -> &Mutex<Histogram> {
+		match source {
+			CdcMetricSource::Ring => &self.ring,
+			CdcMetricSource::Catchup => &self.catchup,
+		}
+	}
+
+	fn observe_duration(&self, source: CdcMetricSource, duration: Duration) {
+		self.histogram(source)
+			.lock()
+			.expect("cdc source histogram mutex poisoned")
+			.observe_duration(duration);
+	}
+
+	fn render_micros(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for source in CdcMetricSource::ALL {
+			let guard = self
+				.histogram(source)
+				.lock()
+				.expect("cdc source histogram mutex poisoned");
+			let snapshot = guard.snapshot();
+			render_histogram_micros_series(out, name, &[("source", source.as_str())], &snapshot);
+		}
+	}
+}
+
+#[derive(Default)]
 struct L2ColumnFetchFallbackCounters {
 	disabled: Counter,
 	single_row: Counter,
@@ -1896,6 +2090,16 @@ pub struct MetricsRegistry {
 	network_compression_encode_micros: NetworkCompressionCodecPathHistograms,
 	network_compression_ratio: NetworkCompressionCodecPathHistograms,
 	network_compression_decode_error: CompressionCodecCounters,
+	cdc_subscriptions: CdcSubscriptionResultCounters,
+	cdc_events_emitted: CdcSourceCounters,
+	cdc_event_bytes_emitted: CdcSourceCounters,
+	cdc_checkpoints_emitted: CdcSourceCounters,
+	cdc_rejects: CdcRejectCounters,
+	cdc_subscription_lag_micros: CdcSourceHistograms,
+	pub cdc_ring_overflow_total: Counter,
+	pub cdc_catchup_to_live_handoff_micros: Histogram,
+	pub cdc_staged_entries_in_ring: Gauge,
+	pub cdc_pending_finalization_evicted_total: Counter,
 
 	pub tenant_kek_cache_hits_total: Counter,
 	pub tenant_kek_cache_misses_total: Counter,
@@ -2135,6 +2339,18 @@ impl Default for MetricsRegistry {
 				COMPRESSION_RATIO_MILLI_BUCKETS,
 			),
 			network_compression_decode_error: CompressionCodecCounters::default(),
+			cdc_subscriptions: CdcSubscriptionResultCounters::default(),
+			cdc_events_emitted: CdcSourceCounters::default(),
+			cdc_event_bytes_emitted: CdcSourceCounters::default(),
+			cdc_checkpoints_emitted: CdcSourceCounters::default(),
+			cdc_rejects: CdcRejectCounters::default(),
+			cdc_subscription_lag_micros: CdcSourceHistograms::new(
+				LOCAL_READ_LATENCY_BUCKETS_MICROS,
+			),
+			cdc_ring_overflow_total: Counter::default(),
+			cdc_catchup_to_live_handoff_micros: Histogram::new(LOCAL_READ_LATENCY_BUCKETS_MICROS),
+			cdc_staged_entries_in_ring: Gauge::default(),
+			cdc_pending_finalization_evicted_total: Counter::default(),
 
 			tenant_kek_cache_hits_total: Counter::default(),
 			tenant_kek_cache_misses_total: Counter::default(),
@@ -2997,6 +3213,50 @@ impl MetricsRegistry {
 
 	pub fn observe_network_compression_decode_error(&self, codec: RecordBodyCompressionPolicy) {
 		self.network_compression_decode_error.inc(codec);
+	}
+
+	pub fn observe_cdc_subscription(&self, result: CdcSubscriptionMetricResult) {
+		self.cdc_subscriptions.inc(result);
+	}
+
+	pub fn observe_cdc_event_emitted(
+		&self,
+		source: CdcMetricSource,
+		event_count: u64,
+		encoded_bytes: u64,
+	) {
+		self.cdc_events_emitted.add(source, event_count);
+		self.cdc_event_bytes_emitted.add(source, encoded_bytes);
+	}
+
+	pub fn observe_cdc_checkpoint_emitted(&self, source: CdcMetricSource) {
+		self.cdc_checkpoints_emitted.inc(source);
+	}
+
+	pub fn observe_cdc_reject(&self, code: CdcRejectCode) {
+		self.cdc_rejects.inc(code);
+	}
+
+	pub fn observe_cdc_subscription_lag(&self, source: CdcMetricSource, duration: Duration) {
+		self.cdc_subscription_lag_micros
+			.observe_duration(source, duration);
+	}
+
+	pub fn observe_cdc_ring_overflow(&self) {
+		self.cdc_ring_overflow_total.inc();
+	}
+
+	pub fn observe_cdc_catchup_to_live_handoff(&self, duration: Duration) {
+		self.cdc_catchup_to_live_handoff_micros
+			.observe_duration(duration);
+	}
+
+	pub fn set_cdc_staged_entries_in_ring(&self, value: u64) {
+		self.cdc_staged_entries_in_ring.set(value);
+	}
+
+	pub fn observe_cdc_pending_finalization_evicted(&self) {
+		self.cdc_pending_finalization_evicted_total.inc();
 	}
 
 	pub fn render_prometheus(&self) -> String {
@@ -4027,6 +4287,60 @@ impl MetricsRegistry {
 			&mut out,
 			&network_compression_decode_error_total,
 			"Transport Arrow IPC decode errors by compression codec.",
+		);
+		self.cdc_subscriptions.render(
+			&mut out,
+			"wendelon_cdc_subscriptions_total",
+			"CDC subscription lifecycle transitions by bounded result.",
+		);
+		self.cdc_events_emitted.render(
+			&mut out,
+			"wendelon_cdc_events_emitted_total",
+			"CDC events emitted by source.",
+		);
+		self.cdc_event_bytes_emitted.render(
+			&mut out,
+			"wendelon_cdc_event_bytes_emitted_total",
+			"CDC encoded event bytes emitted by source.",
+		);
+		self.cdc_checkpoints_emitted.render(
+			&mut out,
+			"wendelon_cdc_checkpoints_emitted_total",
+			"CDC checkpoint frames emitted by source.",
+		);
+		self.cdc_rejects.render(
+			&mut out,
+			"wendelon_cdc_rejects_total",
+			"CDC terminal rejects by bounded code.",
+		);
+		self.cdc_subscription_lag_micros.render_micros(
+			&mut out,
+			"wendelon_cdc_subscription_lag_micros",
+			"CDC subscription lag in microseconds by source.",
+		);
+		render_counter(
+			&mut out,
+			"wendelon_cdc_ring_overflow_total",
+			"CDC live-tail ring FIFO overflow events.",
+			self.cdc_ring_overflow_total.get(),
+		);
+		render_histogram_micros(
+			&mut out,
+			"wendelon_cdc_catchup_to_live_handoff_micros",
+			"CDC catchup-to-live handoff duration in microseconds.",
+			&self.cdc_catchup_to_live_handoff_micros.snapshot(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_cdc_staged_entries_in_ring",
+			"CDC staged entries currently retained in live-tail rings.",
+			self.cdc_staged_entries_in_ring.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_cdc_pending_finalization_evicted_total",
+			"CDC staged entries evicted before finalization cleanup observed them.",
+			self.cdc_pending_finalization_evicted_total.get(),
 		);
 		render_gauge(
 			&mut out,

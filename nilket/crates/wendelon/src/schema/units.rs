@@ -86,6 +86,7 @@ pub struct Identity([u8; 32]);
 
 impl Identity {
 	pub const ZERO: Self = Self([0; 32]);
+	pub const MAX: Self = Self([0xff; 32]);
 
 	pub const fn new(bytes: [u8; 32]) -> Self {
 		Self(bytes)

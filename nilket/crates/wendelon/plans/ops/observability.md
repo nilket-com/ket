@@ -200,6 +200,24 @@ The pilot ships with the following Prometheus/OpenMetrics surface. Metric names 
 | `wendelon_network_compression_ratio` | histogram | `codec`, `path` | Encoded/plaintext byte ratio when available without production double-encoding |
 | `wendelon_network_compression_decode_error_total` | counter | `codec` | Wire-side Arrow IPC decode failures by codec; reason text stays in logs/spans |
 
+#### Change Data Capture
+| Metric | Type | Labels | Use |
+|--------|------|--------|-----|
+| `wendelon_cdc_subscriptions_total` | counter | `result` (`opened`, `closed`, `rejected`, `cancelled`) | CDC stream lifecycle outcomes |
+| `wendelon_cdc_events_emitted_total` | counter | `source` (`ring`, `catchup`) | CDC storage-version events emitted by source path |
+| `wendelon_cdc_event_bytes_emitted_total` | counter | `source` (`ring`, `catchup`) | Encoded CDC frame bytes emitted by source path |
+| `wendelon_cdc_checkpoints_emitted_total` | counter | `source` (`ring`, `catchup`) | Visible-state digest checkpoints emitted by source path |
+| `wendelon_cdc_rejects_total` | counter | `code` (`below_retention_floor`, `ring_overflow_during_catchup`, `schema_fingerprint_incompatible`, `checkpoint_digest_mismatch`, `unknown_table`, `tenant_auth_denied`, `table_not_replicated_here`, `internal_engine_error`) | Terminal typed CDC rejects |
+| `wendelon_cdc_subscription_lag_micros` | histogram | `source` (`ring`, `catchup`) | Emit lag from finalized/catchup source to wire frame |
+| `wendelon_cdc_ring_overflow_total` | counter | none | Live-tail ring evictions by capacity pressure |
+| `wendelon_cdc_catchup_to_live_handoff_micros` | histogram | none | Subscribe-open catchup duration before live-tail handoff |
+| `wendelon_cdc_staged_entries_in_ring` | gauge | none | Current staged/live CDC entries resident in the in-memory ring |
+| `wendelon_cdc_pending_finalization_evicted_total` | counter | none | Staged CDC entries evicted or discarded before finalization release |
+
+CDC metrics deliberately do not label tenant, table, subscription id, peer,
+schema fingerprint, cursor, or free-form error strings. Use CDC audit events
+and traces for attribution; keep Prometheus bounded to the enums above.
+
 #### Storage / L2
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|

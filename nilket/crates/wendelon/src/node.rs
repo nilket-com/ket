@@ -94,8 +94,8 @@ use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
 use crate::storage::{
-	GroupCommitConfig, L2ColumnFetchConfig, ManagerTierObserver, MvccRetentionPolicy,
-	RaftCommitter, SlabSweeper, SweeperConfig,
+	DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS, GroupCommitConfig, L2ColumnFetchConfig,
+	ManagerTierObserver, MvccRetentionPolicy, RaftCommitter, SlabSweeper, SweeperConfig,
 };
 use async_trait::async_trait;
 use openraft::{BasicNode, Config as OpenRaftConfig};
@@ -618,6 +618,8 @@ pub struct NodeHandles {
 	pub eviction_watchdog: JoinHandle<()>,
 	pub lease_manager: JoinHandle<()>,
 	pub pending_finalization_reconciler: JoinHandle<()>,
+	pub cdc_finalization_release_observer: JoinHandle<()>,
+	pub cdc_locality_heartbeat: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub tenant_policy_reconciler: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
@@ -635,6 +637,8 @@ impl NodeHandles {
 		self.eviction_watchdog.abort();
 		self.lease_manager.abort();
 		self.pending_finalization_reconciler.abort();
+		self.cdc_finalization_release_observer.abort();
+		self.cdc_locality_heartbeat.abort();
 		self.epoch_reconciler.abort();
 		self.tenant_policy_reconciler.abort();
 		self.migration_sweeper.abort();
@@ -660,6 +664,12 @@ impl NodeHandles {
 			"pending finalization reconciler",
 		)
 		.await?;
+		await_background_task(
+			self.cdc_finalization_release_observer,
+			"CDC finalization release observer",
+		)
+		.await?;
+		await_background_task(self.cdc_locality_heartbeat, "CDC locality heartbeat").await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
@@ -1672,6 +1682,13 @@ impl WendelonNode {
 		let pending_finalization_reconciler = data_server
 			.clone()
 			.spawn_pending_finalization_reconciler(PENDING_FINALIZATION_RETRY_INTERVAL);
+		let cdc_finalization_release_observer = data_server
+			.clone()
+			.spawn_cdc_finalization_release_observer();
+		let cdc_locality_heartbeat = data_server.clone().spawn_cdc_locality_heartbeat_supervisor(
+			ring.clone(),
+			Duration::from_millis(DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS),
+		);
 		let migration_sweeper = data_server.clone().spawn_migration_sweeper(
 			MIGRATION_SWEEP_INTERVAL,
 			MIGRATION_SWEEP_FAILURE_BACKOFF,
@@ -1741,6 +1758,8 @@ impl WendelonNode {
 				eviction_watchdog,
 				lease_manager,
 				pending_finalization_reconciler,
+				cdc_finalization_release_observer,
+				cdc_locality_heartbeat,
 				epoch_reconciler,
 				tenant_policy_reconciler,
 				migration_sweeper,

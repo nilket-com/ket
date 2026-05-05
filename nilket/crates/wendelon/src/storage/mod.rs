@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod cdc;
 pub mod columnar;
 pub mod content_hash;
 pub mod core;
@@ -19,6 +20,7 @@ pub mod stats;
 pub mod sweeper;
 
 pub use aggregate::*;
+pub use cdc::*;
 pub use columnar::*;
 pub use core::*;
 pub use file_ops::*;

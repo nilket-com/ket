@@ -38,7 +38,7 @@ use wendelon::schema::{
 	write_payload_schema,
 };
 
-pub use wendelon::client::{QueryLocalityRange, StreamingQueryResult};
+pub use wendelon::client::{CdcFrame, CdcSubscription, QueryLocalityRange, StreamingQueryResult};
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
 	ComputeTraceContextV1, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
@@ -48,10 +48,10 @@ pub use wendelon::integration::compute::{
 	prepare_query_session_handoff, validate_query_session_audit_attribution, validate_traceparent,
 };
 pub use wendelon::schema::{
-	Consistency as ReadConsistency, DurabilityLevel as DurabilityClass, LocalityPolicyV1,
-	PbcRejectCode, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
-	TableSpreadLocalityDescriptorV1,
+	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
+	DurabilityLevel as DurabilityClass, LocalityPolicyV1, LogicalSchemaFingerprint, PbcRejectCode,
+	PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	StateDigest, TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -768,6 +768,28 @@ impl Client {
 			rows,
 			batches,
 		})
+	}
+
+	pub async fn cdc_subscribe(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		start_cursor: CdcCursor,
+		bound: CdcSubscribeBound,
+		logical_schema_fingerprint: LogicalSchemaFingerprint,
+		resume_digest: Option<StateDigest>,
+	) -> Result<CdcSubscription, ClientError> {
+		Ok(self
+			.inner
+			.cdc_subscribe(
+				tenant_id,
+				table_object_id,
+				start_cursor,
+				bound,
+				logical_schema_fingerprint,
+				resume_digest,
+			)
+			.await?)
 	}
 }
 

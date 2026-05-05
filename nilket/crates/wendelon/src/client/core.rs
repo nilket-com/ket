@@ -50,12 +50,14 @@ use crate::network::transport::{
 	TransportProvider, TransportStream, TransportTier, TransportTierSet,
 };
 use crate::schema::{
-	Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
-	Locality, MsgType, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	STORAGE_ROW_KEY_ID_COLUMN, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta,
-	TableQueryRequestMeta, TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta,
-	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
+	CdcCheckpointMeta, CdcCursor, CdcDecodeError, CdcFrameMeta, CdcRejectMeta, CdcSubscribeBound,
+	CdcSubscribeRequestMeta, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
+	HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint, MsgType, NodeId, PbcRejectCode,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
+	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
+	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
+	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
 	column_projection_prefix_ranges, read_key_schema, read_value_schema,
 	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
@@ -561,6 +563,61 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
+	/// Open a CDC subscription stream for one tenant table.
+	pub async fn cdc_subscribe(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		start_cursor: CdcCursor,
+		bound: CdcSubscribeBound,
+		logical_schema_fingerprint: LogicalSchemaFingerprint,
+		resume_digest: Option<StateDigest>,
+	) -> std::io::Result<CdcSubscription> {
+		let target = match self.leader() {
+			Some(leader) => leader,
+			None => {
+				self.refresh_topology().await?;
+				self.leader().ok_or_else(|| {
+					Error::new(
+						ErrorKind::NotConnected,
+						"CDC subscribe requires a known data-ring leader",
+					)
+				})?
+			}
+		};
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = CdcSubscribeRequestMeta {
+			tenant_id,
+			table_object_id,
+			start_cursor,
+			bound_raw: bound.as_raw(),
+			resume_digest_present: u8::from(resume_digest.is_some()),
+			_pad: [0; 6],
+			logical_schema_fingerprint: *logical_schema_fingerprint.as_bytes(),
+			resume_visible_state_digest: resume_digest.unwrap_or(StateDigest::ZERO),
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::CDC_SUBSCRIBE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<CdcSubscribeRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&meta), None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
+		Ok(CdcSubscription {
+			stream: Some(stream),
+			pool: self.pool.clone(),
+		})
+	}
+
 	/// Issue one `READ_REQ` over HRFT and surface the exact
 	/// `ReadStatus` the server returned. Successful reads carry the
 	/// Arrow value batch in `ReadResult.value`.
@@ -988,6 +1045,110 @@ pub struct StreamingQueryResult {
 	stream: Option<Box<dyn TransportStream>>,
 	pool: Arc<BufPool>,
 	expected_msg_type: MsgType,
+}
+
+pub struct CdcSubscription {
+	stream: Option<Box<dyn TransportStream>>,
+	pool: Arc<BufPool>,
+}
+
+impl std::fmt::Debug for CdcSubscription {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("CdcSubscription")
+			.field("stream_open", &self.stream.is_some())
+			.finish()
+	}
+}
+
+#[derive(Debug)]
+pub enum CdcFrame {
+	Frame {
+		meta: CdcFrameMeta,
+		batch: RecordBatch,
+	},
+	Checkpoint {
+		meta: CdcCheckpointMeta,
+	},
+	Reject {
+		meta: CdcRejectMeta,
+	},
+	End,
+}
+
+impl CdcSubscription {
+	pub async fn next_frame(&mut self) -> std::io::Result<CdcFrame> {
+		let Some(stream) = self.stream.as_mut() else {
+			return Ok(CdcFrame::End);
+		};
+		let frame = read_frame(&mut **stream, &self.pool).await?;
+		match MsgType(frame.header.msg_type) {
+			MsgType::CDC_FRAME => {
+				if frame.meta.len() < std::mem::size_of::<CdcFrameMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_FRAME meta too small",
+					));
+				}
+				let meta: CdcFrameMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CdcFrameMeta>()]);
+				meta.source().map_err(cdc_decode_error)?;
+				if (frame.header.flags & FRAME_FLAG_STREAM_END) != 0
+					&& frame.arrow_payload.is_none()
+				{
+					self.stream = None;
+					return Ok(CdcFrame::End);
+				}
+				let arrow = frame.arrow_payload.as_ref().ok_or_else(|| {
+					Error::new(ErrorKind::InvalidData, "CDC_FRAME missing Arrow payload")
+				})?;
+				Ok(CdcFrame::Frame {
+					meta,
+					batch: decode_batch(&arrow[..])?,
+				})
+			}
+			MsgType::CDC_CHECKPOINT => {
+				if frame.meta.len() < std::mem::size_of::<CdcCheckpointMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_CHECKPOINT meta too small",
+					));
+				}
+				if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_CHECKPOINT must not carry Arrow or trailing payload",
+					));
+				}
+				let meta: CdcCheckpointMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CdcCheckpointMeta>()]);
+				meta.digest_domain().map_err(cdc_decode_error)?;
+				Ok(CdcFrame::Checkpoint { meta })
+			}
+			MsgType::CDC_REJECT => {
+				if frame.meta.len() < std::mem::size_of::<CdcRejectMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_REJECT meta too small",
+					));
+				}
+				if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_REJECT must not carry Arrow or trailing payload",
+					));
+				}
+				let meta: CdcRejectMeta =
+					*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<CdcRejectMeta>()]);
+				meta.code().map_err(cdc_decode_error)?;
+				self.stream = None;
+				Ok(CdcFrame::Reject { meta })
+			}
+			other => Err(Error::new(
+				ErrorKind::InvalidData,
+				format!("unexpected CDC msg_type=0x{:02x}", other.0),
+			)),
+		}
+	}
 }
 
 impl std::fmt::Debug for StreamingQueryResult {
@@ -1665,6 +1826,10 @@ fn decode_read_response_frame(
 
 fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 	crate::network::ipc::wire_decode_batch(bytes)
+}
+
+fn cdc_decode_error(err: CdcDecodeError) -> Error {
+	Error::new(ErrorKind::InvalidData, err)
 }
 
 fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {

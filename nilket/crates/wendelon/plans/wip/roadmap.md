@@ -106,7 +106,10 @@ global cursor monotonicity without exposing
 `LocalityId` on the cursor. See
 `plans/adr/054_cdc_subscription_substrate.md` and
 `plans/impl/054_cdc_subscription_substrate.md`.
-Implementation phases pending.
+Initial implementation phases have landed behind the substrate
+API. Full small / medium / large bench evidence remains the
+promotion-to-shipped gate; the current smoke artifact lives at
+`plans/impl/054_cdc_subscription_substrate_bench_results.md`.
 
 ADR 053 (Wire-Side Arrow IPC Body Compression) is the
 immediate predecessor and the binding ADR 054 inherits.

@@ -260,6 +260,8 @@ pub enum AuditOperation {
 	DataWrite,
 	DataRangeQuery,
 	DataWriteFinalized,
+	CdcSubscriptionOpened,
+	CdcSubscriptionClosed,
 	ControlRingEpochAdvanced,
 	MvccSnapshotPruned,
 	TenantCreated,
@@ -293,6 +295,8 @@ impl AuditOperation {
 			Self::DataWrite => "data.write",
 			Self::DataRangeQuery => "data.range_query",
 			Self::DataWriteFinalized => "data.write_finalized",
+			Self::CdcSubscriptionOpened => "cdc.subscription_opened",
+			Self::CdcSubscriptionClosed => "cdc.subscription_closed",
 			Self::ControlRingEpochAdvanced => "control_ring.epoch_advanced",
 			Self::MvccSnapshotPruned => "mvcc.snapshot_pruned",
 			Self::TenantCreated => "tenant.created",
@@ -341,6 +345,8 @@ impl<'de> Deserialize<'de> for AuditOperation {
 			"data.write" => Ok(Self::DataWrite),
 			"data.range_query" => Ok(Self::DataRangeQuery),
 			"data.write_finalized" => Ok(Self::DataWriteFinalized),
+			"cdc.subscription_opened" => Ok(Self::CdcSubscriptionOpened),
+			"cdc.subscription_closed" => Ok(Self::CdcSubscriptionClosed),
 			"control_ring.epoch_advanced" => Ok(Self::ControlRingEpochAdvanced),
 			"mvcc.snapshot_pruned" => Ok(Self::MvccSnapshotPruned),
 			"tenant.created" => Ok(Self::TenantCreated),
@@ -504,6 +510,7 @@ pub enum DataAccessKind {
 	Read,
 	Write,
 	RangeQuery,
+	CdcSubscribe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

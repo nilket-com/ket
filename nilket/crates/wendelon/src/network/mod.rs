@@ -1,3 +1,4 @@
+pub mod cdc;
 pub mod cert_issuance_policy;
 pub mod control_server;
 pub mod core;
@@ -18,6 +19,7 @@ pub mod transfer_signing;
 pub mod transport;
 pub mod wire;
 
+pub use cdc::*;
 pub use cert_issuance_policy::*;
 pub use control_server::*;
 pub use core::*;

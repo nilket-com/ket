@@ -42,7 +42,7 @@ use crate::audit::{
 	DataAccessKind, DataAccessPhase, DataAccessSchema, NoopAuditSink,
 };
 use crate::consensus::monitor::{NodeTracker, PhysicalClock};
-use crate::consensus::raft_storage::WendelonLogStore;
+use crate::consensus::raft_storage::{SmState, WendelonLogStore};
 use crate::consensus::{
 	AdmissionSnapshot, HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry,
 	MigrationState, TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest,
@@ -52,6 +52,10 @@ use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::{
 	MigrationProxyReadOutcome, NetworkCompressionPath, PendingFinalizationReplayPath,
 	global as metrics,
+};
+use crate::network::cdc::{
+	CdcSubscriptionRegistry, SubscriptionHandle, cdc_emit_checkpoint, cdc_emit_empty_frame,
+	cdc_emit_frame, cdc_emit_reject,
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
 use crate::network::factory::TransportProviderFactory;
@@ -74,23 +78,27 @@ use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
 	AggregateDiagnostics, AggregateExpression, AggregateExpressionIndex, AggregateFunction,
 	AggregateRequest, AggregateResponse, AggregateState, AggregateStatus,
-	COLUMN_PROJECTION_RANGE_ARC_BUDGET, ColumnProjectionRangePruning, Consistency,
-	FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp, Identity,
-	LeaseDescriptor, LeaseStatus, Locality, LocalityPolicyV1, LocalityRange, MigrateRequestKind,
-	MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType, MultiRowLayoutDescriptor,
-	NodeId, PbcRejectCode, PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta,
-	PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex,
-	ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowIdentityPolicy,
-	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
-	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
-	TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission, TableWriteRequestMeta,
-	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
-	WriteResponseMeta, WriteStatus, WriterNodeId, column_projection_predicate_ranges,
-	column_projection_prefix_ranges, encode_aggregate_state, encode_table_write_row_count,
-	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
-	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
+	COLUMN_PROJECTION_RANGE_ARC_BUDGET, CdcCheckpointMeta, CdcCursor, CdcDigestDomain,
+	CdcFrameMeta, CdcFrameSource, CdcRejectCode, CdcRejectMeta, CdcSubscribeBound,
+	CdcSubscribeRequestMeta, CdcSubscriptionId, ColumnProjectionRangePruning, Consistency,
+	DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp,
+	Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicyV1, LocalityRange,
+	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
+	MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
+	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
+	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
+	RowCount, RowIdentityPolicy, STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog,
+	SecondaryIndexDescriptor, SecondaryIndexState, SlabId, StreamFinalizationRequestMeta,
+	TABLE_WRITE_MAX_ROWS, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
+	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission,
+	TableWriteRequestMeta, TableWriteResponseMeta, TableWriteValidationError, TenantId,
+	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId, cdc_cursor_in_catchup_window,
+	cdc_event_batch, cdc_tombstone_event_batch, cdc_visible_rows_digest,
+	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
+	encode_table_write_row_count, migration_record_schema, pbc,
+	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
+	validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -105,7 +113,7 @@ use crate::storage::multirow::{
 	MultiRowSourceRow, decode_batch, encode_batch, encode_batch_with_policy,
 	has_storage_synthetic_columns, materialize_record_location_batch,
 	pack_admitted_record_batch_by_bucket, pack_tombstone_multirow_source_rows_with_policy,
-	replace_storage_row_hlc_column, storage_index_entries_from_batch,
+	replace_storage_row_hlc_column, storage_index_entries_from_batch, storage_row_is_tombstone_at,
 	storage_row_table_object_id_at,
 };
 use crate::storage::pk_delete::{
@@ -116,6 +124,10 @@ use crate::storage::stats::{
 	ColumnStatsBlockEntry, ColumnStatsPrune, ParsedColumnStatsBlock,
 	column_stats_entry_matches_data_type, decode_column_stats_payload, encode_signed_stat_value,
 	prune_by_encoded_any_of, prune_by_encoded_min_max,
+};
+use crate::storage::{
+	CatchupSnapshot, CdcLiveEntry, CdcLiveTailRing, CdcLocalityFrontiers,
+	CdcLocalityHeartbeatWorker, DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY,
 };
 use crate::storage::{
 	EffectiveRetention, MvccRetentionPolicy, SecondaryIndexAccessPlan, SecondaryIndexLookupRow,
@@ -159,10 +171,51 @@ enum DataOperation {
 	Write,
 	Read,
 	Query,
+	CdcSubscribe,
 	Replicate,
 	Migrate,
 	PendingWitnessPull,
 	StreamFinalization,
+}
+
+#[derive(Debug)]
+struct CdcCatchupEvent {
+	cursor: CdcCursor,
+	batch: RecordBatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CdcStagedEntryRef {
+	locality: Locality,
+	cursor: CdcCursor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct CdcFinalizationKey {
+	epoch: u64,
+	commit_hlc: HybridTimestamp,
+	payload_hash: [u8; 32],
+	durability_raw: u8,
+}
+
+impl CdcFinalizationKey {
+	fn from_marker(marker: FinalizationMarker) -> Self {
+		Self {
+			epoch: marker.epoch,
+			commit_hlc: marker.commit_hlc,
+			payload_hash: marker.payload_hash,
+			durability_raw: marker.durability.0,
+		}
+	}
+
+	fn from_table_replica_meta(meta: &TableReplicaWriteMeta) -> Self {
+		Self {
+			epoch: meta.epoch,
+			commit_hlc: meta.commit_hlc,
+			payload_hash: meta.payload_hash,
+			durability_raw: meta.durability.0,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -849,6 +902,32 @@ pub struct WendelonDataServer {
 	/// Max arrow payload bytes per `RANGE_PAGE` pull. Same rationale
 	/// as `page_max_records`.
 	page_max_bytes: Arc<std::sync::atomic::AtomicU32>,
+	/// Node-local ADR 054 CDC subscription registry.
+	cdc_registry: Arc<CdcSubscriptionRegistry>,
+	/// Per-source-locality live-tail rings. Created lazily as local
+	/// table writes finalize on this node.
+	cdc_live_tail_rings: Arc<DashMap<Locality, Arc<CdcLiveTailRing>>>,
+	/// Per-source-locality CDC finalization frontier used as the
+	/// safe-emission watermark for live tail streams.
+	cdc_locality_frontiers: Arc<CdcLocalityFrontiers>,
+	/// Admission-staged CDC rows waiting for the existing ADR 003
+	/// pending finalization record to commit on the control ring.
+	cdc_pending_live_entries: Arc<DashMap<PendingFinalizationId, Vec<CdcStagedEntryRef>>>,
+	/// Replica-staged CDC rows waiting for a parent table finalization
+	/// marker to apply locally. Split table replica frames cannot safely
+	/// persist a parent pending-finalization witness, but they can release
+	/// their local rows once that parent marker appears on the control ring.
+	cdc_marker_pending_live_entries: Arc<DashMap<CdcFinalizationKey, Vec<CdcStagedEntryRef>>>,
+	/// Locality-scoped heartbeat registry. This is intentionally
+	/// keyed only by locality, not by `(locality, table)`: one quiet
+	/// locality marker advances the CDC watermark for every table
+	/// whose source-locality set includes that locality.
+	cdc_heartbeat_localities: Arc<DashMap<Locality, ()>>,
+	/// Last frontier value observed by the heartbeat quiet check.
+	/// If the frontier advances naturally between ticks, the worker
+	/// records the new value and skips the synthetic marker for that
+	/// interval.
+	cdc_heartbeat_observed_frontiers: Arc<DashMap<Locality, HybridTimestamp>>,
 }
 
 /// Default max records a single `RANGE_PAGE` response can emit
@@ -859,6 +938,9 @@ pub const DEFAULT_PAGE_MAX_BYTES: u32 = 4 * 1024 * 1024;
 pub const DEFAULT_TENANT_MAX_INFLIGHT_WRITES: u32 = 8;
 pub const DEFAULT_TENANT_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 pub const DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET: u64 = 1024;
+const CDC_CHECKPOINT_EVENT_CADENCE: u64 = 1024;
+const CDC_CHECKPOINT_WALL_CADENCE: Duration = Duration::from_secs(1);
 /// Per-subscriber queue depth for committed finalization markers.
 pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 /// Default wake cadence for the background migration sweeper.
@@ -919,6 +1001,35 @@ fn recover_rwlock_write<'a, T>(
 	}
 }
 
+#[derive(Debug)]
+struct CdcCheckpointCadence {
+	events_since_checkpoint: u64,
+	last_checkpoint_at: Instant,
+}
+
+impl CdcCheckpointCadence {
+	fn new(now: Instant) -> Self {
+		Self {
+			events_since_checkpoint: 0,
+			last_checkpoint_at: now,
+		}
+	}
+
+	fn note_events(&mut self, event_count: u64) {
+		self.events_since_checkpoint = self.events_since_checkpoint.saturating_add(event_count);
+	}
+
+	fn checkpoint_due(&self, now: Instant) -> bool {
+		self.events_since_checkpoint >= CDC_CHECKPOINT_EVENT_CADENCE
+			|| now.duration_since(self.last_checkpoint_at) >= CDC_CHECKPOINT_WALL_CADENCE
+	}
+
+	fn mark_checkpoint(&mut self, now: Instant) {
+		self.events_since_checkpoint = 0;
+		self.last_checkpoint_at = now;
+	}
+}
+
 impl Clone for WendelonDataServer {
 	fn clone(&self) -> Self {
 		Self {
@@ -963,6 +1074,13 @@ impl Clone for WendelonDataServer {
 			tenant_cache_refresh_interval: self.tenant_cache_refresh_interval,
 			page_max_records: self.page_max_records.clone(),
 			page_max_bytes: self.page_max_bytes.clone(),
+			cdc_registry: self.cdc_registry.clone(),
+			cdc_live_tail_rings: self.cdc_live_tail_rings.clone(),
+			cdc_locality_frontiers: self.cdc_locality_frontiers.clone(),
+			cdc_pending_live_entries: self.cdc_pending_live_entries.clone(),
+			cdc_marker_pending_live_entries: self.cdc_marker_pending_live_entries.clone(),
+			cdc_heartbeat_localities: self.cdc_heartbeat_localities.clone(),
+			cdc_heartbeat_observed_frontiers: self.cdc_heartbeat_observed_frontiers.clone(),
 		}
 	}
 }
@@ -1390,6 +1508,76 @@ impl WendelonDataServer {
 		)
 	}
 
+	fn emit_cdc_subscription_opened_audit(
+		&self,
+		actor: &ActorIdentity,
+		req: &CdcSubscribeRequestMeta,
+		subscription_id: CdcSubscriptionId,
+		bound: CdcSubscribeBound,
+	) -> std::io::Result<()> {
+		let audit = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::CdcSubscriptionOpened,
+			self.local_node,
+			"cdc subscription opened",
+		)
+		.with_actor(actor)
+		.with_tenant(req.tenant_id)
+		.with_parameters(vec![
+			("subscription_id", json!(subscription_id.to_string())),
+			(
+				"table_object_id",
+				json!(format_bytes_hex(req.table_object_id.as_bytes())),
+			),
+			("start_cursor", cdc_cursor_audit_json(req.start_cursor)),
+			("bound", json!(cdc_bound_audit_str(bound))),
+			("opened_at_hlc", cdc_hlc_audit_json(self.cdc_audit_hlc())),
+		]);
+		self.audit_sink
+			.emit(audit)
+			.map_err(|err| Error::other(format!("cdc subscription open audit emit failed: {err}")))
+	}
+
+	fn emit_cdc_subscription_closed_audit(
+		&self,
+		actor: &ActorIdentity,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		subscription_id: CdcSubscriptionId,
+		reason: &'static str,
+		final_cursor: CdcCursor,
+	) -> std::io::Result<()> {
+		let audit = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::CdcSubscriptionClosed,
+			self.local_node,
+			"cdc subscription closed",
+		)
+		.with_actor(actor)
+		.with_tenant(tenant_id)
+		.with_parameters(vec![
+			("subscription_id", json!(subscription_id.to_string())),
+			(
+				"table_object_id",
+				json!(format_bytes_hex(table_object_id.as_bytes())),
+			),
+			("reason", json!(reason)),
+			("final_cursor", cdc_cursor_audit_json(final_cursor)),
+			("closed_at_hlc", cdc_hlc_audit_json(self.cdc_audit_hlc())),
+		]);
+		self.audit_sink
+			.emit(audit)
+			.map_err(|err| Error::other(format!("cdc subscription close audit emit failed: {err}")))
+	}
+
+	fn cdc_audit_hlc(&self) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms: self.clock.now_ms(),
+			logical: 0,
+			node_id: self.local_node.id,
+		}
+	}
+
 	fn apply_local_persistence_runtime_fence(&self) {
 		let runtime = self.raft.runtime_config();
 		runtime.heartbeat(false);
@@ -1466,6 +1654,13 @@ impl WendelonDataServer {
 			tenant_cache_refresh_interval: DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
 			page_max_records: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_RECORDS)),
 			page_max_bytes: Arc::new(std::sync::atomic::AtomicU32::new(DEFAULT_PAGE_MAX_BYTES)),
+			cdc_registry: Arc::new(CdcSubscriptionRegistry::new()),
+			cdc_live_tail_rings: Arc::new(DashMap::new()),
+			cdc_locality_frontiers: Arc::new(CdcLocalityFrontiers::new()),
+			cdc_pending_live_entries: Arc::new(DashMap::new()),
+			cdc_marker_pending_live_entries: Arc::new(DashMap::new()),
+			cdc_heartbeat_localities: Arc::new(DashMap::new()),
+			cdc_heartbeat_observed_frontiers: Arc::new(DashMap::new()),
 		};
 		server.refresh_pending_finalization_backlog_metric();
 		if server.degraded_reason().is_some() {
@@ -2146,6 +2341,7 @@ impl WendelonDataServer {
 			Self::idempotency_key_for(record.write_id),
 			CachedWriteOutcome::new(outcome),
 		);
+		self.cdc_release_pending_finalization(record.id).await;
 		if let Err(err) = self.pending_finalizations.remove(record.id).await {
 			tracing::warn!(
 				pending_id = %format_bytes_hex(record.id.as_bytes()),
@@ -2407,6 +2603,96 @@ impl WendelonDataServer {
 				tokio::select! {
 					_ = ticker.tick() => {}
 					_ = self.pending_finalization_wakeup.notified() => {}
+				}
+			}
+		})
+	}
+
+	pub fn spawn_cdc_finalization_release_observer(self: Arc<Self>) -> JoinHandle<()> {
+		tokio::spawn(async move {
+			let mut finalizations = self.state_machine.subscribe_finalizations();
+			loop {
+				match finalizations.recv().await {
+					Ok(marker) => {
+						self.cdc_release_pending_finalization_marker(marker).await;
+					}
+					Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+						tracing::warn!(
+							skipped,
+							"CDC finalization release observer lagged; affected subscribers must recover through catchup"
+						);
+					}
+					Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+				}
+			}
+		})
+	}
+
+	pub fn spawn_cdc_locality_heartbeat_supervisor(
+		self: Arc<Self>,
+		ring: Arc<RingRouter>,
+		interval: Duration,
+	) -> JoinHandle<()> {
+		tokio::spawn(async move {
+			let mut discovery = tokio::time::interval(interval);
+			discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			let mut spawned = BTreeSet::new();
+			let mut workers = JoinSet::new();
+
+			loop {
+				tokio::select! {
+					_ = discovery.tick() => {
+						self.register_cdc_heartbeat_localities_for_primary_ranges(&ring);
+						for entry in self.cdc_heartbeat_localities.iter() {
+							let locality_id = *entry.key();
+							if !spawned.insert(locality_id) {
+								continue;
+							}
+							let server = self.clone();
+							workers.spawn(async move {
+								let worker = CdcLocalityHeartbeatWorker::new(locality_id, interval);
+								let quiet_server = server.clone();
+								let emit_server = server.clone();
+								let result = worker
+									.run(
+										move |locality_id| {
+											let quiet_server = quiet_server.clone();
+											async move {
+												quiet_server
+													.cdc_locality_quiet_since_last_finalization(locality_id)
+											}
+										},
+										move |locality_id| {
+											let emit_server = emit_server.clone();
+											async move {
+												emit_server
+													.emit_cdc_heartbeat_finalization_marker(locality_id)
+													.await
+											}
+										},
+									)
+									.await;
+								if let Err(err) = result {
+									tracing::warn!(
+										locality = locality_id.get(),
+										error = %err,
+										"CDC locality heartbeat worker stopped"
+									);
+								}
+								locality_id
+							});
+						}
+					}
+					Some(joined) = workers.join_next() => {
+						match joined {
+							Ok(locality_id) => {
+								spawned.remove(&locality_id);
+							}
+							Err(err) => {
+								tracing::warn!(error = %err, "CDC locality heartbeat worker join failed");
+							}
+						}
+					}
 				}
 			}
 		})
@@ -3690,6 +3976,7 @@ impl WendelonDataServer {
 			DataOperation::Write
 			| DataOperation::Read
 			| DataOperation::Query
+			| DataOperation::CdcSubscribe
 			| DataOperation::StreamFinalization => matches!(
 				actor.role,
 				ActorRole::DataNode | ActorRole::Operator | ActorRole::BreakGlassAdmin
@@ -3976,7 +4263,10 @@ impl WendelonDataServer {
 	) -> std::io::Result<Result<DataRequestAdmission, BackpressureScope>> {
 		let claimed_tenant = actor.claimed_tenant_id()?;
 		let tenant_reservation = match op {
-			DataOperation::Write | DataOperation::Read | DataOperation::Query => {
+			DataOperation::Write
+			| DataOperation::Read
+			| DataOperation::Query
+			| DataOperation::CdcSubscribe => {
 				if let Some(tenant_id) = target_tenant {
 					match self.try_admit_tenant_request(tenant_id) {
 						Ok(reservation) => Some(reservation),
@@ -3992,6 +4282,7 @@ impl WendelonDataServer {
 			DataOperation::Write
 			| DataOperation::Read
 			| DataOperation::Query
+			| DataOperation::CdcSubscribe
 			| DataOperation::StreamFinalization => {
 				if claimed_tenant.is_none() {
 					match self.try_admit_actor_request(actor) {
@@ -6005,10 +6296,61 @@ impl WendelonDataServer {
 					.await;
 					match append_result {
 						Ok(()) => {
+							let cdc_staging_ok = if let Some(descriptor) = {
+								let state = self.state_machine.state_snapshot().await;
+								state
+									.table_schemas
+									.latest_by_id(meta.tenant_id, meta.table_object_id)
+									.cloned()
+							} {
+								match self
+									.stage_cdc_table_replica_children(
+										meta.tenant_id,
+										meta.table_object_id,
+										&descriptor,
+										meta.commit_hlc,
+										&children,
+										false,
+									)
+									.await
+								{
+									Ok(staged) => {
+										self.cdc_stage_pending_finalization_marker(
+											CdcFinalizationKey::from_table_replica_meta(&meta),
+											staged,
+										);
+										true
+									}
+									Err(err) => {
+										tracing::error!(
+											write_id = ?meta.parent_write_id,
+											tenant_id = meta.tenant_id.get(),
+											table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+											error = %err,
+											"replica failed to stage CDC rows after durable table append"
+										);
+										self.trip_local_persistence_distrust(format!(
+											"replica CDC staging failed after durable table append: {err}"
+										))
+										.await;
+										false
+									}
+								}
+							} else {
+								tracing::warn!(
+									write_id = ?meta.parent_write_id,
+									tenant_id = meta.tenant_id.get(),
+									table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+									"replica skipped CDC staging because table descriptor is unavailable"
+								);
+								true
+							};
 							// A split table-replication frame is only proof for its child
 							// group; the aggregate pending witness belongs to the coordinator
 							// unless this frame carries the whole parent batch.
-							if meta.group_record_count == meta.record_count
+							if !cdc_staging_ok {
+								(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+							} else if meta.group_record_count == meta.record_count
 								&& meta.group_payload_hash == meta.payload_hash
 							{
 								let pending =
@@ -6703,6 +7045,51 @@ impl DataRingServer for WendelonDataServer {
 				self.handle_query_stream(&context.actor, frame, stream)
 					.await
 			}
+			MsgType::CDC_SUBSCRIBE_REQ => {
+				if frame.meta.len() < std::mem::size_of::<CdcSubscribeRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"CDC_SUBSCRIBE_REQ meta too small",
+					));
+				}
+				let meta: CdcSubscribeRequestMeta = *bytemuck::from_bytes(
+					&frame.meta[..std::mem::size_of::<CdcSubscribeRequestMeta>()],
+				);
+				if self
+					.authorize_actor_for_data(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::CdcSubscribe,
+					)
+					.is_err()
+				{
+					let reject = CdcRejectMeta::new(
+						CdcSubscriptionId::ZERO,
+						CdcRejectCode::TenantAuthDenied,
+					);
+					cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+					stream.finish().await?;
+					return Ok(());
+				}
+				let _admission = match self.try_admit_data_request(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::CdcSubscribe,
+				)? {
+					Ok(admission) => admission,
+					Err(_) => {
+						let reject = CdcRejectMeta::new(
+							CdcSubscriptionId::ZERO,
+							CdcRejectCode::InternalEngineError,
+						);
+						cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+						stream.finish().await?;
+						return Ok(());
+					}
+				};
+				self.handle_cdc_subscribe_stream(&context.actor, frame, meta, stream)
+					.await
+			}
 			MsgType::STREAM_FIN_REQ => {
 				if self
 					.authorize_actor_for_data(
@@ -6744,6 +7131,1160 @@ impl DataRingServer for WendelonDataServer {
 }
 
 impl WendelonDataServer {
+	async fn handle_cdc_subscribe_stream(
+		&self,
+		actor: &ActorIdentity,
+		frame: HrftFrame,
+		req: CdcSubscribeRequestMeta,
+		mut stream: Box<dyn TransportStream>,
+	) -> std::io::Result<()> {
+		let subscription_id = CdcSubscriptionId::new(
+			(u128::from(self.local_node.id) << 64) | u128::from(frame.header.stream_id),
+		);
+		let bound = match req.bound() {
+			Ok(bound) => bound,
+			Err(_) => {
+				let reject =
+					CdcRejectMeta::new(subscription_id, CdcRejectCode::InternalEngineError);
+				cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
+		};
+		let requested_logical_schema_fingerprint = req.decoded_logical_schema_fingerprint();
+		let (descriptor, effective_retention) = {
+			let state = self.state_machine.state_snapshot().await;
+			let descriptor = state
+				.table_schemas
+				.latest_by_id(req.tenant_id, req.table_object_id)
+				.cloned();
+			let retention = self.table_effective_retention_from_state(
+				&state,
+				req.tenant_id,
+				req.table_object_id,
+			);
+			(descriptor, retention)
+		};
+		let Some(descriptor) = descriptor else {
+			let reject = CdcRejectMeta::new(subscription_id, CdcRejectCode::UnknownTable);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		};
+		if descriptor.logical_schema_fingerprint != requested_logical_schema_fingerprint {
+			let reject = CdcRejectMeta::new(
+				subscription_id,
+				CdcRejectCode::SchemaFingerprintIncompatible,
+			);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		}
+		if req.start_cursor != CdcCursor::MIN
+			&& check_read_against_retention(req.start_cursor.row_hlc, &effective_retention).is_err()
+		{
+			let reject = CdcRejectMeta::new(subscription_id, CdcRejectCode::BelowRetentionFloor);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		}
+		let source_ranges = match table_query_scan_ranges(req.tenant_id, &descriptor, None) {
+			Ok(ranges) => ranges,
+			Err(_) => {
+				let reject =
+					CdcRejectMeta::new(subscription_id, CdcRejectCode::InternalEngineError);
+				cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
+		};
+		if !self.cdc_table_maybe_replicated_here(&source_ranges) {
+			let reject = CdcRejectMeta::new(subscription_id, CdcRejectCode::TableNotReplicatedHere);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		}
+		self.register_cdc_heartbeat_localities(&source_ranges);
+		let snapshot = CatchupSnapshot::new(self.cdc_capture_snapshot_hlc(&source_ranges).await);
+		if let Err(code) = self
+			.cdc_open_time_ring_continuity_check(&source_ranges, &snapshot)
+			.await
+		{
+			let reject = CdcRejectMeta::new(subscription_id, code);
+			cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+			stream.finish().await?;
+			return Ok(());
+		}
+		if let Some(resume_digest) = req.resume_digest() {
+			let visible_rows = self
+				.compute_cdc_visible_row_keys_at_cursor(
+					req.tenant_id,
+					&descriptor,
+					&source_ranges,
+					req.start_cursor,
+				)
+				.await?;
+			let visible_digest =
+				cdc_visible_rows_digest(req.tenant_id, descriptor.table_object_id, visible_rows);
+			if visible_digest != resume_digest {
+				let reject =
+					CdcRejectMeta::new(subscription_id, CdcRejectCode::CheckpointDigestMismatch);
+				cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
+		}
+
+		let mut live_registration = if bound == CdcSubscribeBound::Live {
+			Some(self.cdc_registry.register(
+				req.tenant_id,
+				req.table_object_id,
+				snapshot.ceiling(),
+				bound,
+				requested_logical_schema_fingerprint,
+			))
+		} else {
+			None
+		};
+		let stream_subscription_id = live_registration
+			.as_ref()
+			.map(|(handle, _)| handle.subscription_id)
+			.unwrap_or(subscription_id);
+		if let Err(err) =
+			self.emit_cdc_subscription_opened_audit(actor, &req, stream_subscription_id, bound)
+		{
+			if let Some((handle, _)) = &live_registration {
+				self.cdc_registry.unregister(
+					req.tenant_id,
+					req.table_object_id,
+					handle.subscription_id,
+					crate::metrics::CdcSubscriptionMetricResult::Cancelled,
+				);
+			}
+			return Err(err);
+		}
+		let catchup_floor_hlc = if req.start_cursor == CdcCursor::MIN {
+			effective_retention
+				.floor
+				.unwrap_or(req.start_cursor.row_hlc)
+		} else {
+			req.start_cursor.row_hlc
+		};
+		let catchup_started = Instant::now();
+		let catchup_events = match self
+			.collect_cdc_catchup_events(
+				req.tenant_id,
+				&descriptor,
+				&source_ranges,
+				req.start_cursor,
+				snapshot.ceiling(),
+				catchup_floor_hlc,
+			)
+			.await
+		{
+			Ok(events) => events,
+			Err(err) => {
+				if let Some((handle, _)) = &live_registration {
+					self.cdc_registry.unregister(
+						req.tenant_id,
+						req.table_object_id,
+						handle.subscription_id,
+						crate::metrics::CdcSubscriptionMetricResult::Cancelled,
+					);
+				}
+				tracing::warn!(error = ?err, "CDC catchup collection failed");
+				let reject =
+					CdcRejectMeta::new(stream_subscription_id, CdcRejectCode::InternalEngineError);
+				self.emit_cdc_subscription_closed_audit(
+					actor,
+					req.tenant_id,
+					req.table_object_id,
+					stream_subscription_id,
+					"reject_internal_engine_error",
+					req.start_cursor,
+				)?;
+				cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
+		};
+		let checkpoint_visible_rows = self
+			.compute_cdc_visible_row_keys_at_cursor(
+				req.tenant_id,
+				&descriptor,
+				&source_ranges,
+				snapshot.ceiling(),
+			)
+			.await?;
+		let checkpoint_digest = cdc_visible_rows_digest(
+			req.tenant_id,
+			descriptor.table_object_id,
+			checkpoint_visible_rows,
+		);
+
+		match bound {
+			CdcSubscribeBound::SnapshotAtOpen => {
+				self.emit_cdc_catchup_events(
+					&mut *stream,
+					frame.header.stream_id,
+					subscription_id,
+					req.logical_schema_fingerprint,
+					&catchup_events,
+				)
+				.await?;
+				let checkpoint = CdcCheckpointMeta {
+					subscription_id,
+					cursor: snapshot.ceiling(),
+					visible_state_digest: checkpoint_digest,
+					digest_domain_raw: CdcDigestDomain::TableRowVisible.as_raw(),
+					_pad: [0; 4],
+				};
+				cdc_emit_checkpoint(
+					&mut *stream,
+					frame.header.stream_id,
+					&checkpoint,
+					CdcFrameSource::Catchup,
+				)
+				.await?;
+				let end = CdcFrameMeta {
+					subscription_id,
+					frame_low_cursor: snapshot.ceiling(),
+					frame_high_cursor: snapshot.ceiling(),
+					logical_schema_fingerprint: req.logical_schema_fingerprint,
+					event_count: RowCount::ZERO,
+					source_raw: CdcFrameSource::Catchup.as_raw(),
+					_pad: [0; 7],
+				};
+				cdc_emit_empty_frame(&mut *stream, frame.header.stream_id, &end, true).await?;
+				self.emit_cdc_subscription_closed_audit(
+					actor,
+					req.tenant_id,
+					req.table_object_id,
+					subscription_id,
+					"snapshot_complete",
+					snapshot.ceiling(),
+				)?;
+				stream.finish().await?;
+				Ok(())
+			}
+			CdcSubscribeBound::Live => {
+				let Some((handle, mut recv)) = live_registration.take() else {
+					return Ok(());
+				};
+				self.emit_cdc_catchup_events(
+					&mut *stream,
+					frame.header.stream_id,
+					handle.subscription_id,
+					req.logical_schema_fingerprint,
+					&catchup_events,
+				)
+				.await?;
+				let checkpoint = CdcCheckpointMeta {
+					subscription_id: handle.subscription_id,
+					cursor: snapshot.ceiling(),
+					visible_state_digest: checkpoint_digest,
+					digest_domain_raw: CdcDigestDomain::TableRowVisible.as_raw(),
+					_pad: [0; 4],
+				};
+				cdc_emit_checkpoint(
+					&mut *stream,
+					frame.header.stream_id,
+					&checkpoint,
+					CdcFrameSource::Catchup,
+				)
+				.await?;
+				metrics().observe_cdc_catchup_to_live_handoff(catchup_started.elapsed());
+				let mut pending_live_entries = self
+					.cdc_collect_ring_entries_after(
+						req.tenant_id,
+						req.table_object_id,
+						&source_ranges,
+						snapshot.ceiling(),
+					)
+					.await;
+				let mut checkpoint_cadence = CdcCheckpointCadence::new(Instant::now());
+				let mut finalizations = self.state_machine.subscribe_finalizations();
+				let mut finalization_stream_open = true;
+				loop {
+					if let Some(code) = self
+						.cdc_live_retention_reject_code(
+							req.tenant_id,
+							req.table_object_id,
+							handle.cursor_high_water.load(),
+						)
+						.await
+					{
+						let reject = CdcRejectMeta::new(handle.subscription_id, code);
+						let emit =
+							cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject).await;
+						self.cdc_registry.remove(
+							req.tenant_id,
+							req.table_object_id,
+							handle.subscription_id,
+						);
+						self.emit_cdc_subscription_closed_audit(
+							actor,
+							req.tenant_id,
+							req.table_object_id,
+							handle.subscription_id,
+							cdc_reject_audit_reason(code),
+							handle.cursor_high_water.load(),
+						)?;
+						emit?;
+						stream.finish().await?;
+						return Ok(());
+					}
+					let safe_emission_hlc = self.cdc_safe_emission_hlc(&source_ranges).await;
+					if let Some(recovery_upper) = self
+						.cdc_live_recovery_upper_after(
+							req.tenant_id,
+							req.table_object_id,
+							&source_ranges,
+							handle.cursor_high_water.load(),
+							safe_emission_hlc,
+						)
+						.await
+					{
+						let recovery_start = handle.cursor_high_water.load();
+						let scan_floor = self
+							.cdc_catchup_scan_floor_hlc(
+								req.tenant_id,
+								req.table_object_id,
+								recovery_start,
+							)
+							.await;
+						let recovery_events = match self
+							.collect_cdc_catchup_events(
+								req.tenant_id,
+								&descriptor,
+								&source_ranges,
+								recovery_start,
+								recovery_upper,
+								scan_floor,
+							)
+							.await
+						{
+							Ok(events) => events,
+							Err(err) => {
+								tracing::warn!(error = ?err, "CDC live-tail recovery catchup failed");
+								let reject = CdcRejectMeta::new(
+									handle.subscription_id,
+									CdcRejectCode::InternalEngineError,
+								);
+								let emit =
+									cdc_emit_reject(&mut *stream, frame.header.stream_id, &reject)
+										.await;
+								self.cdc_registry.remove(
+									req.tenant_id,
+									req.table_object_id,
+									handle.subscription_id,
+								);
+								self.emit_cdc_subscription_closed_audit(
+									actor,
+									req.tenant_id,
+									req.table_object_id,
+									handle.subscription_id,
+									"reject_internal_engine_error",
+									handle.cursor_high_water.load(),
+								)?;
+								emit?;
+								stream.finish().await?;
+								return Ok(());
+							}
+						};
+						if self
+							.emit_cdc_live_recovery_catchup_events(
+								&mut *stream,
+								frame.header.stream_id,
+								&handle,
+								req.logical_schema_fingerprint,
+								&recovery_events,
+								recovery_upper,
+							)
+							.await
+							.is_err()
+						{
+							self.emit_cdc_subscription_closed_audit(
+								actor,
+								req.tenant_id,
+								req.table_object_id,
+								handle.subscription_id,
+								"client_cancel",
+								handle.cursor_high_water.load(),
+							)?;
+							self.cdc_registry.unregister(
+								req.tenant_id,
+								req.table_object_id,
+								handle.subscription_id,
+								crate::metrics::CdcSubscriptionMetricResult::Cancelled,
+							);
+							return Ok(());
+						}
+					}
+					pending_live_entries.extend(
+						self.cdc_collect_ring_entries_after(
+							req.tenant_id,
+							req.table_object_id,
+							&source_ranges,
+							handle.cursor_high_water.load(),
+						)
+						.await,
+					);
+					if self
+						.drain_cdc_ready_live_entries(
+							&mut *stream,
+							frame.header.stream_id,
+							&handle,
+							req.tenant_id,
+							&descriptor,
+							&source_ranges,
+							&mut pending_live_entries,
+							safe_emission_hlc,
+							&mut checkpoint_cadence,
+						)
+						.await
+						.is_err()
+					{
+						self.emit_cdc_subscription_closed_audit(
+							actor,
+							req.tenant_id,
+							req.table_object_id,
+							handle.subscription_id,
+							"client_cancel",
+							handle.cursor_high_water.load(),
+						)?;
+						self.cdc_registry.unregister(
+							req.tenant_id,
+							req.table_object_id,
+							handle.subscription_id,
+							crate::metrics::CdcSubscriptionMetricResult::Cancelled,
+						);
+						return Ok(());
+					}
+
+					tokio::select! {
+						maybe_entry = recv.recv() => {
+							let Some(entry) = maybe_entry else {
+								break;
+							};
+							pending_live_entries.push(entry);
+						}
+						() = self.cdc_locality_frontiers.wait_for_advance() => {}
+						finalization = finalizations.recv(), if finalization_stream_open => {
+							match finalization {
+								Ok(_) => {}
+								Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+								Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+									finalization_stream_open = false;
+								}
+							}
+						}
+					}
+				}
+				self.cdc_registry.unregister(
+					req.tenant_id,
+					req.table_object_id,
+					handle.subscription_id,
+					crate::metrics::CdcSubscriptionMetricResult::Closed,
+				);
+				self.emit_cdc_subscription_closed_audit(
+					actor,
+					req.tenant_id,
+					req.table_object_id,
+					handle.subscription_id,
+					"closed",
+					handle.cursor_high_water.load(),
+				)?;
+				stream.finish().await?;
+				Ok(())
+			}
+		}
+	}
+
+	async fn emit_cdc_catchup_events(
+		&self,
+		stream: &mut dyn TransportStream,
+		stream_id: u32,
+		subscription_id: CdcSubscriptionId,
+		logical_schema_fingerprint: [u8; 32],
+		events: &[CdcCatchupEvent],
+	) -> std::io::Result<()> {
+		let _ = self;
+		for event in events {
+			let meta = CdcFrameMeta {
+				subscription_id,
+				frame_low_cursor: event.cursor,
+				frame_high_cursor: event.cursor,
+				logical_schema_fingerprint,
+				event_count: RowCount::new(event.batch.num_rows() as u64),
+				source_raw: CdcFrameSource::Catchup.as_raw(),
+				_pad: [0; 7],
+			};
+			cdc_emit_frame(stream, stream_id, &meta, &event.batch, 0).await?;
+		}
+		Ok(())
+	}
+
+	async fn emit_cdc_live_recovery_catchup_events(
+		&self,
+		stream: &mut dyn TransportStream,
+		stream_id: u32,
+		handle: &Arc<SubscriptionHandle>,
+		logical_schema_fingerprint: [u8; 32],
+		events: &[CdcCatchupEvent],
+		recovery_upper: CdcCursor,
+	) -> std::io::Result<()> {
+		let _ = self;
+		for event in events {
+			let meta = CdcFrameMeta {
+				subscription_id: handle.subscription_id,
+				frame_low_cursor: event.cursor,
+				frame_high_cursor: event.cursor,
+				logical_schema_fingerprint,
+				event_count: RowCount::new(event.batch.num_rows() as u64),
+				source_raw: CdcFrameSource::Catchup.as_raw(),
+				_pad: [0; 7],
+			};
+			cdc_emit_frame(stream, stream_id, &meta, &event.batch, 0).await?;
+			handle.cursor_high_water.advance_max(event.cursor);
+		}
+		handle.cursor_high_water.advance_max(recovery_upper);
+		Ok(())
+	}
+
+	async fn drain_cdc_ready_live_entries(
+		&self,
+		stream: &mut dyn TransportStream,
+		stream_id: u32,
+		handle: &Arc<SubscriptionHandle>,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		source_ranges: &[QueryScanRange],
+		pending: &mut Vec<Arc<CdcLiveEntry>>,
+		safe_emission_hlc: HybridTimestamp,
+		checkpoint_cadence: &mut CdcCheckpointCadence,
+	) -> std::io::Result<()> {
+		pending.sort_by_key(|entry| entry.cursor);
+		pending.dedup_by_key(|entry| entry.cursor);
+		while !pending.is_empty() {
+			let entry = pending[0].clone();
+			if entry.cursor <= handle.cursor_high_water.load() {
+				pending.remove(0);
+				continue;
+			}
+			if entry.cursor.row_hlc > safe_emission_hlc {
+				break;
+			}
+			pending.remove(0);
+			let meta = CdcFrameMeta {
+				subscription_id: handle.subscription_id,
+				frame_low_cursor: entry.cursor,
+				frame_high_cursor: entry.cursor,
+				logical_schema_fingerprint: *entry.logical_schema_fingerprint.as_bytes(),
+				event_count: RowCount::new(entry.record_batch.num_rows() as u64),
+				source_raw: CdcFrameSource::Ring.as_raw(),
+				_pad: [0; 7],
+			};
+			cdc_emit_frame(stream, stream_id, &meta, &entry.record_batch, 0).await?;
+			handle.cursor_high_water.advance_max(entry.cursor);
+			checkpoint_cadence.note_events(meta.event_count.get());
+			let now = Instant::now();
+			if checkpoint_cadence.checkpoint_due(now) {
+				let visible_rows = self
+					.compute_cdc_visible_row_keys_at_cursor(
+						tenant_id,
+						descriptor,
+						source_ranges,
+						entry.cursor,
+					)
+					.await?;
+				let checkpoint = CdcCheckpointMeta {
+					subscription_id: handle.subscription_id,
+					cursor: entry.cursor,
+					visible_state_digest: cdc_visible_rows_digest(
+						tenant_id,
+						descriptor.table_object_id,
+						visible_rows,
+					),
+					digest_domain_raw: CdcDigestDomain::TableRowVisible.as_raw(),
+					_pad: [0; 4],
+				};
+				cdc_emit_checkpoint(stream, stream_id, &checkpoint, CdcFrameSource::Ring).await?;
+				checkpoint_cadence.mark_checkpoint(now);
+			}
+		}
+		Ok(())
+	}
+
+	async fn collect_cdc_catchup_events(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		ranges: &[QueryScanRange],
+		start_cursor: CdcCursor,
+		upper_cursor: CdcCursor,
+		scan_hlc_floor: HybridTimestamp,
+	) -> std::io::Result<Vec<CdcCatchupEvent>> {
+		let mut candidates = Vec::new();
+		let mut seen = HashSet::new();
+		for range in ranges {
+			for (row_tenant_id, key_identity, locality, location) in
+				self.slab
+					.scan_all_versions(range.start, range.end, scan_hlc_floor)
+			{
+				if row_tenant_id != tenant_id {
+					continue;
+				}
+				let cursor = CdcCursor::new(location.hlc, key_identity, location.record_row_index);
+				if !cdc_cursor_in_catchup_window(cursor, start_cursor, upper_cursor) {
+					continue;
+				}
+				if seen.insert((row_tenant_id, key_identity, location)) {
+					candidates.push((cursor, key_identity, locality, location));
+				}
+			}
+		}
+		candidates.sort_by_key(|(cursor, _, _, _)| *cursor);
+
+		let query_meta = cdc_descriptor_match_query_meta(tenant_id, upper_cursor.row_hlc);
+		let mut events = Vec::new();
+		for (cursor, key_identity, locality, location) in candidates {
+			let bytes = self.slab.read(location).await?;
+			let storage_batch = decode_batch(&bytes)?;
+			let was_multirow = has_storage_synthetic_columns(&storage_batch);
+			let stored_table_object_id = if was_multirow {
+				storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
+			} else {
+				None
+			};
+			if location.is_tombstone {
+				if stored_table_object_id != Some(descriptor.table_object_id) {
+					continue;
+				}
+				let source_schema = descriptor.arrow_schema()?;
+				let batch = cdc_tombstone_event_batch(
+					descriptor.logical_schema_fingerprint,
+					location.hlc,
+					key_identity,
+					descriptor.table_object_id,
+					Some(locality),
+					location.record_row_index,
+					None,
+					&source_schema,
+				)
+				.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+				events.push(CdcCatchupEvent { cursor, batch });
+				continue;
+			}
+			let materialized =
+				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+			if !table_record_matches_descriptor(
+				&query_meta,
+				descriptor,
+				key_identity,
+				locality,
+				stored_table_object_id,
+				&materialized,
+			)? {
+				continue;
+			}
+			let batch = cdc_event_batch(
+				descriptor.logical_schema_fingerprint,
+				location.hlc,
+				key_identity,
+				descriptor.table_object_id,
+				Some(locality),
+				location.record_row_index,
+				None,
+				&materialized,
+			)
+			.map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+			events.push(CdcCatchupEvent { cursor, batch });
+		}
+		Ok(events)
+	}
+
+	async fn compute_cdc_visible_row_keys_at_cursor(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptorV1,
+		ranges: &[QueryScanRange],
+		as_of_cursor: CdcCursor,
+	) -> std::io::Result<Vec<Identity>> {
+		let mut latest_by_key: HashMap<Identity, (CdcCursor, bool)> = HashMap::new();
+		let mut seen = HashSet::new();
+		let query_meta = cdc_descriptor_match_query_meta(tenant_id, as_of_cursor.row_hlc);
+		for range in ranges {
+			for (row_tenant_id, key_identity, locality, location) in
+				self.slab
+					.scan_all_versions(range.start, range.end, bytemuck::Zeroable::zeroed())
+			{
+				if row_tenant_id != tenant_id {
+					continue;
+				}
+				let cursor = CdcCursor::new(location.hlc, key_identity, location.record_row_index);
+				if cursor > as_of_cursor || !seen.insert((row_tenant_id, key_identity, location)) {
+					continue;
+				}
+				let replace = latest_by_key
+					.get(&key_identity)
+					.is_none_or(|(previous, _)| cursor > *previous);
+				if !replace {
+					continue;
+				}
+				let bytes = self.slab.read(location).await?;
+				let storage_batch = decode_batch(&bytes)?;
+				let was_multirow = has_storage_synthetic_columns(&storage_batch);
+				let stored_table_object_id = if was_multirow {
+					storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
+				} else {
+					None
+				};
+				if location.is_tombstone {
+					if stored_table_object_id == Some(descriptor.table_object_id) {
+						latest_by_key.insert(key_identity, (cursor, false));
+					}
+					continue;
+				}
+				let materialized =
+					materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+				if table_record_matches_descriptor(
+					&query_meta,
+					descriptor,
+					key_identity,
+					locality,
+					stored_table_object_id,
+					&materialized,
+				)? {
+					latest_by_key.insert(key_identity, (cursor, true));
+				}
+			}
+		}
+
+		Ok(latest_by_key
+			.into_iter()
+			.filter_map(|(row_key_id, (_, visible))| visible.then_some(row_key_id))
+			.collect())
+	}
+
+	async fn cdc_open_time_ring_continuity_check(
+		&self,
+		ranges: &[QueryScanRange],
+		snapshot: &CatchupSnapshot,
+	) -> Result<(), CdcRejectCode> {
+		for ring in self.cdc_rings_for_ranges(ranges) {
+			ring.open_time_ring_continuity_check(snapshot).await?;
+		}
+		Ok(())
+	}
+
+	async fn cdc_collect_ring_entries_after(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		ranges: &[QueryScanRange],
+		after: CdcCursor,
+	) -> Vec<Arc<CdcLiveEntry>> {
+		let mut entries = Vec::new();
+		for ring in self.cdc_rings_for_ranges(ranges) {
+			entries.extend(
+				ring.eligible_entries_after(
+					tenant_id,
+					table_object_id,
+					after,
+					CdcCursor::MAX.row_hlc,
+					usize::MAX,
+				)
+				.await,
+			);
+		}
+		entries.sort_by_key(|entry| entry.cursor);
+		entries
+	}
+
+	async fn cdc_live_recovery_upper_after(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		ranges: &[QueryScanRange],
+		after: CdcCursor,
+		safe_emission_hlc: HybridTimestamp,
+	) -> Option<CdcCursor> {
+		let safe_ceiling = CdcCursor::ceiling_for_hlc(safe_emission_hlc);
+		let mut upper = None;
+		for ring in self.cdc_rings_for_ranges(ranges) {
+			let Some(frontier) = ring
+				.evicted_cursor_frontier(tenant_id, table_object_id)
+				.await
+			else {
+				continue;
+			};
+			let capped = frontier.min(safe_ceiling);
+			if capped > after {
+				upper = Some(upper.map_or(capped, |current: CdcCursor| current.max(capped)));
+			}
+		}
+		upper
+	}
+
+	async fn cdc_catchup_scan_floor_hlc(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		start_cursor: CdcCursor,
+	) -> HybridTimestamp {
+		if start_cursor != CdcCursor::MIN {
+			return start_cursor.row_hlc;
+		}
+		let state = self.state_machine.state_snapshot().await;
+		self.table_effective_retention_from_state(&state, tenant_id, table_object_id)
+			.floor
+			.unwrap_or(start_cursor.row_hlc)
+	}
+
+	async fn cdc_safe_emission_hlc(&self, ranges: &[QueryScanRange]) -> HybridTimestamp {
+		if let Some(frontier) = self.cdc_min_locality_frontier_for_ranges(ranges) {
+			return frontier;
+		}
+		let state = self.state_machine.state_snapshot().await;
+		cdc_snapshot_hlc_from_state(&state)
+	}
+
+	async fn cdc_capture_snapshot_hlc(&self, ranges: &[QueryScanRange]) -> HybridTimestamp {
+		if let Some(frontier) = self.cdc_min_locality_frontier_for_ranges(ranges) {
+			return frontier;
+		}
+		let state = self.state_machine.state_snapshot().await;
+		cdc_snapshot_hlc_from_state(&state)
+	}
+
+	async fn cdc_live_retention_reject_code(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		cursor: CdcCursor,
+	) -> Option<CdcRejectCode> {
+		let state = self.state_machine.state_snapshot().await;
+		let effective_retention =
+			self.table_effective_retention_from_state(&state, tenant_id, table_object_id);
+		cdc_retention_reject_code_for_cursor(cursor, &effective_retention)
+	}
+
+	fn cdc_min_locality_frontier_for_ranges(
+		&self,
+		ranges: &[QueryScanRange],
+	) -> Option<HybridTimestamp> {
+		let source_localities = self.cdc_source_localities_for_ranges(ranges);
+		self.cdc_locality_frontiers
+			.min_for_localities(source_localities.iter().copied())
+	}
+
+	fn register_cdc_heartbeat_localities(&self, ranges: &[QueryScanRange]) {
+		for locality_id in self.cdc_source_localities_for_ranges(ranges) {
+			self.register_cdc_heartbeat_locality(locality_id);
+		}
+	}
+
+	fn register_cdc_heartbeat_localities_for_primary_ranges(&self, ring: &RingRouter) {
+		for locality_id in
+			cdc_heartbeat_localities_for_primary_ranges(ring.primary_ranges_for(self.local_node))
+		{
+			self.register_cdc_heartbeat_locality(locality_id);
+		}
+	}
+
+	fn register_cdc_heartbeat_locality(&self, locality_id: Locality) {
+		self.cdc_heartbeat_localities.insert(locality_id, ());
+		if let Some(frontier) = self.cdc_locality_frontiers.get(locality_id) {
+			self.cdc_heartbeat_observed_frontiers
+				.entry(locality_id)
+				.or_insert(frontier);
+		}
+	}
+
+	fn cdc_locality_quiet_since_last_finalization(&self, locality_id: Locality) -> bool {
+		let current = self.cdc_locality_frontiers.get(locality_id);
+		let observed = self
+			.cdc_heartbeat_observed_frontiers
+			.get(&locality_id)
+			.map(|entry| *entry.value());
+		match (observed, current) {
+			(Some(observed), Some(current)) if current > observed => {
+				self.cdc_heartbeat_observed_frontiers
+					.insert(locality_id, current);
+				false
+			}
+			(None, Some(current)) => {
+				self.cdc_heartbeat_observed_frontiers
+					.insert(locality_id, current);
+				false
+			}
+			_ => true,
+		}
+	}
+
+	async fn emit_cdc_heartbeat_finalization_marker(
+		&self,
+		locality_id: Locality,
+	) -> std::io::Result<()> {
+		if self.raft.current_leader().await != Some(self.local_node.id) {
+			return Ok(());
+		}
+		let commit_hlc = self.merge_commit_hlc(HybridTimestamp {
+			physical_ms: 0,
+			logical: 0,
+			node_id: 0,
+		});
+		let epoch = self.admission_snapshot().current_epoch;
+		let finalization = TenantFinalization {
+			marker: FinalizationMarker {
+				log_index: 0,
+				term: 0,
+				epoch,
+				commit_hlc,
+				payload_hash: cdc_heartbeat_payload_hash(locality_id, commit_hlc, epoch),
+				e_safe_index: 0,
+				durability: DurabilityLevel::QUORUM,
+				_pad: [0; 7],
+			},
+			tenant_id: TenantId::ZERO,
+			key_identity: cdc_heartbeat_identity(locality_id),
+			charged_bytes: 0,
+			record_count: 0,
+		};
+		let response = self
+			.raft
+			.client_write(WendelonRequest::Finalize(finalization))
+			.await
+			.map_err(|err| Error::other(format!("cdc heartbeat finalization failed: {err}")))?;
+		self.cdc_locality_frontiers.advance(locality_id, commit_hlc);
+		self.cdc_heartbeat_observed_frontiers
+			.insert(locality_id, commit_hlc);
+		tracing::debug!(
+			locality = locality_id.get(),
+			epoch,
+			log_index = response.log_id.index,
+			"CDC locality heartbeat finalization committed"
+		);
+		Ok(())
+	}
+
+	fn cdc_table_maybe_replicated_here(&self, ranges: &[QueryScanRange]) -> bool {
+		cdc_ranges_maybe_replicated_by_local_node(ranges, self.local_node, |locality| {
+			self.router.replicas_for_locality(locality)
+		})
+	}
+
+	fn cdc_source_localities_for_ranges(&self, ranges: &[QueryScanRange]) -> Vec<Locality> {
+		cdc_source_localities_from_ranges_and_rings(
+			ranges,
+			self.cdc_rings_for_ranges(ranges)
+				.into_iter()
+				.map(|ring| ring.locality_id()),
+		)
+	}
+
+	fn cdc_rings_for_ranges(&self, ranges: &[QueryScanRange]) -> Vec<Arc<CdcLiveTailRing>> {
+		self.cdc_live_tail_rings
+			.iter()
+			.filter_map(|entry| {
+				cdc_locality_in_ranges(*entry.key(), ranges).then(|| entry.value().clone())
+			})
+			.collect()
+	}
+
+	fn cdc_ring_for_locality(&self, locality: Locality) -> Arc<CdcLiveTailRing> {
+		self.cdc_live_tail_rings
+			.entry(locality)
+			.or_insert_with(|| {
+				Arc::new(CdcLiveTailRing::new(
+					locality,
+					DEFAULT_MAX_CDC_LIVE_TAIL_BYTES_PER_LOCALITY,
+				))
+			})
+			.clone()
+	}
+
+	fn cdc_existing_ring_for_locality(&self, locality: Locality) -> Option<Arc<CdcLiveTailRing>> {
+		self.cdc_live_tail_rings
+			.get(&locality)
+			.map(|entry| entry.value().clone())
+	}
+
+	fn cdc_release_finalized_entry(&self, locality: Locality, entry: Arc<CdcLiveEntry>) {
+		self.cdc_locality_frontiers
+			.advance(locality, entry.cursor.row_hlc);
+		self.cdc_registry.fanout_finalized_entry(entry);
+	}
+
+	async fn cdc_release_staged_entries(&self, staged: Vec<CdcStagedEntryRef>) -> usize {
+		let mut released = 0usize;
+		for staged_entry in staged {
+			self.cdc_locality_frontiers
+				.advance(staged_entry.locality, staged_entry.cursor.row_hlc);
+			let Some(ring) = self.cdc_existing_ring_for_locality(staged_entry.locality) else {
+				metrics().observe_cdc_pending_finalization_evicted();
+				continue;
+			};
+			if let Some(entry) = ring.mark_finalized_entry(staged_entry.cursor).await {
+				self.cdc_release_finalized_entry(staged_entry.locality, entry);
+				released = released.saturating_add(1);
+			} else {
+				metrics().observe_cdc_pending_finalization_evicted();
+			}
+		}
+		released
+	}
+
+	async fn cdc_release_pending_finalization(&self, pending_id: PendingFinalizationId) -> usize {
+		let Some((_, staged)) = self.cdc_pending_live_entries.remove(&pending_id) else {
+			return 0;
+		};
+		self.cdc_release_staged_entries(staged).await
+	}
+
+	async fn cdc_release_pending_finalization_marker(&self, marker: FinalizationMarker) -> usize {
+		let key = CdcFinalizationKey::from_marker(marker);
+		let Some((_, staged)) = self.cdc_marker_pending_live_entries.remove(&key) else {
+			return 0;
+		};
+		self.cdc_release_staged_entries(staged).await
+	}
+
+	fn cdc_stage_pending_finalization_marker(
+		&self,
+		key: CdcFinalizationKey,
+		staged: Vec<CdcStagedEntryRef>,
+	) {
+		if staged.is_empty() {
+			return;
+		}
+		self.cdc_marker_pending_live_entries
+			.entry(key)
+			.and_modify(|existing| existing.extend(staged.iter().copied()))
+			.or_insert(staged);
+	}
+
+	#[allow(dead_code)]
+	async fn cdc_evict_pending_finalization(&self, pending_id: PendingFinalizationId) -> usize {
+		let Some((_, staged)) = self.cdc_pending_live_entries.remove(&pending_id) else {
+			return 0;
+		};
+		let mut evicted = 0usize;
+		for staged_entry in staged {
+			let Some(ring) = self.cdc_existing_ring_for_locality(staged_entry.locality) else {
+				evicted = evicted.saturating_add(1);
+				metrics().observe_cdc_pending_finalization_evicted();
+				continue;
+			};
+			let _ = ring.evict_cursor(staged_entry.cursor).await;
+			evicted = evicted.saturating_add(1);
+			metrics().observe_cdc_pending_finalization_evicted();
+		}
+		evicted
+	}
+
+	async fn stage_cdc_table_children(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		descriptor: &TableSchemaDescriptorV1,
+		commit_hlc: HybridTimestamp,
+		children: &[BifurcatedTableChildWrite],
+		finalized: bool,
+	) -> std::io::Result<Vec<CdcStagedEntryRef>> {
+		let mut staged = Vec::with_capacity(children.len());
+		for child in children {
+			self.register_cdc_heartbeat_locality(child.locality);
+			let storage_batch = decode_batch(child.frame_bytes.as_slice())?;
+			let is_tombstone = storage_row_is_tombstone_at(&storage_batch, child.record_row_index)?;
+			let batch = if is_tombstone {
+				let source_schema = descriptor.arrow_schema()?;
+				Arc::new(
+					cdc_tombstone_event_batch(
+						descriptor.logical_schema_fingerprint,
+						commit_hlc,
+						child.key_identity,
+						table_object_id,
+						Some(child.locality),
+						child.record_row_index,
+						None,
+						&source_schema,
+					)
+					.map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
+				)
+			} else {
+				let materialized =
+					materialize_record_location_batch(&storage_batch, child.record_row_index)?;
+				Arc::new(
+					cdc_event_batch(
+						descriptor.logical_schema_fingerprint,
+						commit_hlc,
+						child.key_identity,
+						table_object_id,
+						Some(child.locality),
+						child.record_row_index,
+						None,
+						&materialized,
+					)
+					.map_err(|err| Error::new(ErrorKind::InvalidData, err))?,
+				)
+			};
+			let entry = Arc::new(
+				CdcLiveEntry::new(
+					CdcCursor::new(commit_hlc, child.key_identity, child.record_row_index),
+					tenant_id,
+					table_object_id,
+					descriptor.logical_schema_fingerprint,
+					batch,
+				)
+				.with_finalized(finalized),
+			);
+			let ring = self.cdc_ring_for_locality(child.locality);
+			ring.push_arc(entry.clone()).await;
+			staged.push(CdcStagedEntryRef {
+				locality: child.locality,
+				cursor: CdcCursor::new(commit_hlc, child.key_identity, child.record_row_index),
+			});
+			if finalized {
+				self.cdc_release_finalized_entry(child.locality, entry);
+			}
+		}
+		Ok(staged)
+	}
+
+	async fn stage_cdc_table_replica_children(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		descriptor: &TableSchemaDescriptorV1,
+		commit_hlc: HybridTimestamp,
+		children: &[TableReplicaChildPayload],
+		finalized: bool,
+	) -> std::io::Result<Vec<CdcStagedEntryRef>> {
+		let bifurcated_children = children
+			.iter()
+			.map(|child| BifurcatedTableChildWrite {
+				child_ordinal: child.child_ordinal,
+				key_identity: child.key_identity,
+				locality: child.locality,
+				record_row_index: child.record_row_index,
+				frame_bytes: child.frame_bytes.clone(),
+				payload_hash: child.payload_hash,
+				charged_bytes: child.charged_bytes,
+			})
+			.collect::<Vec<_>>();
+		self.stage_cdc_table_children(
+			tenant_id,
+			table_object_id,
+			descriptor,
+			commit_hlc,
+			&bifurcated_children,
+			finalized,
+		)
+		.await
+	}
+
 	async fn write_bifurcated(
 		&self,
 		meta: WriteRequestMeta,
@@ -7075,6 +8616,7 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		mut bifurcated: BifurcatedTableWrite,
 		mut groups: Vec<TableReplicaGroup>,
+		descriptor: &TableSchemaDescriptorV1,
 		commit_hlc: HybridTimestamp,
 		is_append_only: bool,
 		secondary_index_descriptors: Vec<SecondaryIndexDescriptor>,
@@ -7341,6 +8883,19 @@ impl WendelonDataServer {
 				Error::other("pending finalization for this table write is already being processed")
 			})?;
 		if let Err(err) = self.pending_finalizations.upsert(pending.clone()).await {
+			let cdc_staged = self
+				.stage_cdc_table_children(
+					meta.tenant_id,
+					meta.table_object_id,
+					descriptor,
+					commit_hlc,
+					&bifurcated.children,
+					false,
+				)
+				.await?;
+			if !cdc_staged.is_empty() {
+				self.cdc_pending_live_entries.insert(pending.id, cdc_staged);
+			}
 			tracing::error!(
 				pending_id = %format_bytes_hex(pending.id.as_bytes()),
 				write_id = ?meta.parent_write_id,
@@ -7361,6 +8916,7 @@ impl WendelonDataServer {
 					return committed;
 				}
 				Err(finalize_err) => {
+					self.cdc_evict_pending_finalization(pending.id).await;
 					tracing::error!(
 						pending_id = %format_bytes_hex(pending.id.as_bytes()),
 						write_id = ?meta.parent_write_id,
@@ -7377,6 +8933,19 @@ impl WendelonDataServer {
 			}
 		} else {
 			self.refresh_pending_finalization_backlog_metric();
+		}
+		let cdc_staged = self
+			.stage_cdc_table_children(
+				meta.tenant_id,
+				meta.table_object_id,
+				descriptor,
+				commit_hlc,
+				&bifurcated.children,
+				false,
+			)
+			.await?;
+		if !cdc_staged.is_empty() {
+			self.cdc_pending_live_entries.insert(pending.id, cdc_staged);
 		}
 
 		match self.resolve_pending_finalization(&pending).await {
@@ -7599,6 +9168,7 @@ impl WendelonDataServer {
 				meta,
 				bifurcated,
 				groups,
+				&descriptor,
 				commit_hlc,
 				is_append_only,
 				secondary_index_descriptors,
@@ -8052,6 +9622,7 @@ impl WendelonDataServer {
 				synthetic_meta,
 				bifurcated,
 				groups,
+				&descriptor,
 				delete_hlc,
 				false,
 				Vec::new(),
@@ -8453,6 +10024,149 @@ struct PreparedAggregateExecution {
 struct QueryScanRange {
 	start: Locality,
 	end: Locality,
+}
+
+fn cdc_snapshot_hlc_from_state(state: &SmState) -> HybridTimestamp {
+	state
+		.e_safe_watermarks
+		.values()
+		.copied()
+		.max()
+		.unwrap_or_else(bytemuck::Zeroable::zeroed)
+}
+
+fn cdc_retention_reject_code_for_cursor(
+	cursor: CdcCursor,
+	effective_retention: &EffectiveRetention,
+) -> Option<CdcRejectCode> {
+	check_read_against_retention(cursor.row_hlc, effective_retention)
+		.err()
+		.map(|_| CdcRejectCode::BelowRetentionFloor)
+}
+
+fn cdc_bound_audit_str(bound: CdcSubscribeBound) -> &'static str {
+	match bound {
+		CdcSubscribeBound::Live => "live",
+		CdcSubscribeBound::SnapshotAtOpen => "snapshot_at_open",
+	}
+}
+
+fn cdc_reject_audit_reason(code: CdcRejectCode) -> &'static str {
+	match code {
+		CdcRejectCode::BelowRetentionFloor => "reject_below_retention_floor",
+		CdcRejectCode::RingOverflowDuringCatchup => "reject_ring_overflow_during_catchup",
+		CdcRejectCode::SchemaFingerprintIncompatible => "reject_schema_fingerprint_incompatible",
+		CdcRejectCode::CheckpointDigestMismatch => "reject_checkpoint_digest_mismatch",
+		CdcRejectCode::UnknownTable => "reject_unknown_table",
+		CdcRejectCode::TenantAuthDenied => "reject_tenant_auth_denied",
+		CdcRejectCode::TableNotReplicatedHere => "reject_table_not_replicated_here",
+		CdcRejectCode::InternalEngineError => "reject_internal_engine_error",
+	}
+}
+
+fn cdc_hlc_audit_json(hlc: HybridTimestamp) -> serde_json::Value {
+	json!({
+		"physical_ms": hlc.physical_ms,
+		"logical": hlc.logical,
+		"node_id": hlc.node_id,
+	})
+}
+
+fn cdc_cursor_audit_json(cursor: CdcCursor) -> serde_json::Value {
+	json!({
+		"row_hlc": cdc_hlc_audit_json(cursor.row_hlc),
+		"row_key_id": format_bytes_hex(cursor.row_key_id.as_bytes()),
+		"record_row_index": cursor.record_row_index.get(),
+	})
+}
+
+fn cdc_descriptor_match_query_meta(
+	tenant_id: TenantId,
+	as_of_hlc: HybridTimestamp,
+) -> QueryRequestMeta {
+	QueryRequestMeta {
+		min_hlc: bytemuck::Zeroable::zeroed(),
+		expected_epoch: 0,
+		tenant_id,
+		consistency: Consistency::SERIALIZABLE,
+		_pad: [0; 7],
+		locality_range_start: 0,
+		locality_range_end: u64::MAX,
+		bytecode_len: 0,
+		_pad2: [0; 4],
+		as_of_hlc,
+	}
+}
+
+fn cdc_locality_in_ranges(locality: Locality, ranges: &[QueryScanRange]) -> bool {
+	ranges
+		.iter()
+		.any(|range| locality >= range.start && locality <= range.end)
+}
+
+fn cdc_source_localities_from_ranges_and_rings<I>(
+	ranges: &[QueryScanRange],
+	ring_localities: I,
+) -> Vec<Locality>
+where
+	I: IntoIterator<Item = Locality>,
+{
+	let mut localities = BTreeSet::new();
+	for range in ranges {
+		localities.insert(range.start);
+		localities.insert(range.end);
+		let width = range.end.get().saturating_sub(range.start.get());
+		if width <= CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET {
+			for value in range.start.get()..=range.end.get() {
+				localities.insert(Locality::new(value));
+			}
+		}
+	}
+	for locality in ring_localities {
+		if cdc_locality_in_ranges(locality, ranges) {
+			localities.insert(locality);
+		}
+	}
+	localities.into_iter().collect()
+}
+
+fn cdc_heartbeat_localities_for_primary_ranges<I>(ranges: I) -> Vec<Locality>
+where
+	I: IntoIterator<Item = (u64, u64)>,
+{
+	let ranges = ranges
+		.into_iter()
+		.map(|(start, end)| QueryScanRange {
+			start: Locality::new(start),
+			end: Locality::new(end),
+		})
+		.collect::<Vec<_>>();
+	cdc_source_localities_from_ranges_and_rings(&ranges, std::iter::empty())
+}
+
+fn cdc_ranges_maybe_replicated_by_local_node<F>(
+	ranges: &[QueryScanRange],
+	local_node: NodeId,
+	mut replicas_for_locality: F,
+) -> bool
+where
+	F: FnMut(Locality) -> Vec<NodeId>,
+{
+	for range in ranges {
+		let width = range.end.get().saturating_sub(range.start.get());
+		if width > CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET {
+			return true;
+		}
+		for value in range.start.get()..=range.end.get() {
+			if replicas_for_locality(Locality::new(value))
+				.iter()
+				.any(|node| node.id == local_node.id)
+			{
+				return true;
+			}
+		}
+	}
+	false
 }
 
 struct RebatchGroup {
@@ -11888,6 +13602,29 @@ fn payload_digest(bytes: &[u8]) -> [u8; 32] {
 	crate::hash::content::digest(bytes)
 }
 
+fn cdc_heartbeat_identity(locality_id: Locality) -> Identity {
+	let mut bytes = [0u8; 32];
+	bytes[..8].copy_from_slice(&locality_id.get().to_le_bytes());
+	let domain = b"cdc-heartbeat-locality";
+	bytes[8..8 + domain.len()].copy_from_slice(domain);
+	Identity::new(bytes)
+}
+
+fn cdc_heartbeat_payload_hash(
+	locality_id: Locality,
+	commit_hlc: HybridTimestamp,
+	epoch: u64,
+) -> [u8; 32] {
+	let mut hasher = ::blake3::Hasher::new();
+	hasher.update(b"wendelon.cdc.locality-heartbeat.v1");
+	hasher.update(&locality_id.get().to_le_bytes());
+	hasher.update(&epoch.to_le_bytes());
+	hasher.update(&commit_hlc.physical_ms.to_le_bytes());
+	hasher.update(&commit_hlc.logical.to_le_bytes());
+	hasher.update(&commit_hlc.node_id.to_le_bytes());
+	*hasher.finalize().as_bytes()
+}
+
 fn format_bytes_hex(bytes: &[u8]) -> String {
 	let mut out = String::with_capacity(bytes.len() * 2);
 	for byte in bytes {
@@ -12475,6 +14212,324 @@ mod tests {
 			logical,
 			node_id,
 		}
+	}
+
+	#[test]
+	fn cdc_retention_reject_code_fires_when_cursor_falls_below_floor() {
+		let effective = EffectiveRetention {
+			policy: TableRetentionPolicy::FixedWindow(
+				RetentionWindowMillis::try_new(60_000).unwrap(),
+			),
+			floor: Some(hlc(100, 0, 0)),
+		};
+
+		assert_eq!(
+			cdc_retention_reject_code_for_cursor(
+				CdcCursor::new(hlc(99, 0, 0), Identity::ZERO, RecordRowIndex::ZERO),
+				&effective,
+			),
+			Some(CdcRejectCode::BelowRetentionFloor)
+		);
+		assert_eq!(
+			cdc_retention_reject_code_for_cursor(
+				CdcCursor::new(hlc(100, 0, 0), Identity::ZERO, RecordRowIndex::ZERO),
+				&effective,
+			),
+			None
+		);
+		assert_eq!(
+			cdc_retention_reject_code_for_cursor(CdcCursor::MIN, &effective),
+			None
+		);
+	}
+
+	#[test]
+	fn cdc_heartbeat_identity_projects_to_source_locality() {
+		for locality_id in [
+			Locality::ZERO,
+			Locality::new(42),
+			Locality::new(0xAABB_CCDD_EEFF_0011),
+			Locality::MAX,
+		] {
+			assert_eq!(
+				Locality::from(cdc_heartbeat_identity(locality_id)),
+				locality_id
+			);
+		}
+	}
+
+	#[test]
+	fn cdc_heartbeat_payload_hash_is_locality_and_hlc_scoped() {
+		let base = cdc_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 3);
+		assert_ne!(
+			base,
+			cdc_heartbeat_payload_hash(Locality::new(8), hlc(100, 0, 1), 3)
+		);
+		assert_ne!(
+			base,
+			cdc_heartbeat_payload_hash(Locality::new(7), hlc(101, 0, 1), 3)
+		);
+		assert_ne!(
+			base,
+			cdc_heartbeat_payload_hash(Locality::new(7), hlc(100, 0, 1), 4)
+		);
+	}
+
+	#[test]
+	fn cdc_checkpoint_cadence_fires_on_event_count_and_wall_time() {
+		let start = Instant::now();
+		let mut cadence = CdcCheckpointCadence::new(start);
+		cadence.note_events(CDC_CHECKPOINT_EVENT_CADENCE - 1);
+		assert!(!cadence.checkpoint_due(start));
+		cadence.note_events(1);
+		assert!(cadence.checkpoint_due(start));
+		cadence.mark_checkpoint(start);
+		assert!(!cadence.checkpoint_due(start));
+		assert!(cadence.checkpoint_due(start + CDC_CHECKPOINT_WALL_CADENCE));
+	}
+
+	#[test]
+	fn cdc_finalization_key_ignores_applied_log_coordinates() {
+		let pending_marker = FinalizationMarker {
+			log_index: 0,
+			term: 0,
+			epoch: 7,
+			commit_hlc: hlc(900, 1, 2),
+			payload_hash: [0x5A; 32],
+			e_safe_index: 0,
+			durability: DurabilityLevel::QUORUM,
+			_pad: [0; 7],
+		};
+		let applied_marker = FinalizationMarker {
+			log_index: 42,
+			term: 11,
+			e_safe_index: 42,
+			..pending_marker
+		};
+		assert_eq!(
+			CdcFinalizationKey::from_marker(pending_marker),
+			CdcFinalizationKey::from_marker(applied_marker)
+		);
+
+		let mut different_payload = applied_marker;
+		different_payload.payload_hash = [0xA5; 32];
+		assert_ne!(
+			CdcFinalizationKey::from_marker(applied_marker),
+			CdcFinalizationKey::from_marker(different_payload)
+		);
+	}
+
+	#[test]
+	fn cdc_audit_helpers_pin_lifecycle_reason_and_cursor_shape() {
+		assert_eq!(
+			cdc_reject_audit_reason(CdcRejectCode::BelowRetentionFloor),
+			"reject_below_retention_floor"
+		);
+		assert_eq!(cdc_bound_audit_str(CdcSubscribeBound::Live), "live");
+
+		let cursor = CdcCursor::new(hlc(123, 4, 5), Identity::ZERO, RecordRowIndex::new(7));
+		let value = cdc_cursor_audit_json(cursor);
+		assert_eq!(value["row_hlc"]["physical_ms"], 123);
+		assert_eq!(value["row_hlc"]["logical"], 4);
+		assert_eq!(value["row_hlc"]["node_id"], 5);
+		assert_eq!(value["record_row_index"], 7);
+		assert_eq!(
+			value["row_key_id"],
+			"0000000000000000000000000000000000000000000000000000000000000000"
+		);
+	}
+
+	#[test]
+	fn cdc_source_localities_include_cold_exact_ranges_without_rings() {
+		let ranges = [
+			QueryScanRange {
+				start: Locality::new(100),
+				end: Locality::new(100),
+			},
+			QueryScanRange {
+				start: Locality::new(200),
+				end: Locality::new(202),
+			},
+		];
+
+		assert_eq!(
+			cdc_source_localities_from_ranges_and_rings(&ranges, [Locality::new(101)]),
+			vec![
+				Locality::new(100),
+				Locality::new(200),
+				Locality::new(201),
+				Locality::new(202),
+			]
+		);
+	}
+
+	#[test]
+	fn cdc_source_localities_keep_wide_ranges_bounded_and_include_live_rings() {
+		let ranges = [QueryScanRange {
+			start: Locality::new(10),
+			end: Locality::new(10 + CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET + 10),
+		}];
+
+		assert_eq!(
+			cdc_source_localities_from_ranges_and_rings(
+				&ranges,
+				[Locality::new(11), Locality::new(999_999)],
+			),
+			vec![
+				Locality::new(10),
+				Locality::new(11),
+				Locality::new(10 + CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET + 10),
+			]
+		);
+	}
+
+	#[test]
+	fn cdc_heartbeat_primary_ranges_use_bounded_locality_set() {
+		assert_eq!(
+			cdc_heartbeat_localities_for_primary_ranges([
+				(100, 102),
+				(1_000, 1_000 + CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET + 10),
+			]),
+			vec![
+				Locality::new(100),
+				Locality::new(101),
+				Locality::new(102),
+				Locality::new(1_000),
+				Locality::new(1_000 + CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET + 10),
+			]
+		);
+	}
+
+	#[test]
+	fn cdc_replicated_here_rejects_only_when_bounded_ranges_exclude_local_node() {
+		let local = n(7);
+		let remote = n(8);
+		let ranges = [QueryScanRange {
+			start: Locality::new(20),
+			end: Locality::new(22),
+		}];
+
+		assert!(!cdc_ranges_maybe_replicated_by_local_node(
+			&ranges,
+			local,
+			|_| vec![remote]
+		));
+		assert!(cdc_ranges_maybe_replicated_by_local_node(
+			&ranges,
+			local,
+			|locality| if locality == Locality::new(21) {
+				vec![remote, local]
+			} else {
+				vec![remote]
+			}
+		));
+	}
+
+	#[test]
+	fn cdc_replicated_here_accepts_wide_ranges_conservatively() {
+		let local = n(7);
+		let remote = n(8);
+		let ranges = [QueryScanRange {
+			start: Locality::new(20),
+			end: Locality::new(20 + CDC_SOURCE_LOCALITY_ENUMERATION_BUDGET + 1),
+		}];
+
+		assert!(cdc_ranges_maybe_replicated_by_local_node(
+			&ranges,
+			local,
+			|_| vec![remote]
+		));
+	}
+
+	#[tokio::test]
+	async fn cdc_live_recovery_upper_is_table_scoped_and_safe_gated() {
+		let dir = bootstrap_tempdir("cdc-live-recovery-upper");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			46,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let locality = Locality::new(10);
+		let descriptor = typed_table_descriptor();
+		let target_table = descriptor.table_object_id;
+		let other_table = TableObjectId::new([0x99; 16]);
+		let ranges = [QueryScanRange {
+			start: locality,
+			end: locality,
+		}];
+		let ring = Arc::new(CdcLiveTailRing::new(locality, 1));
+		node.data_server
+			.cdc_live_tail_rings
+			.insert(locality, ring.clone());
+
+		ring.push(CdcLiveEntry::new(
+			CdcCursor::new(
+				hlc(80, 0, 46),
+				Identity::new([0x80; 32]),
+				RecordRowIndex::ZERO,
+			),
+			tenant(),
+			other_table,
+			descriptor.logical_schema_fingerprint,
+			Arc::new(typed_table_batch(vec![80])),
+		))
+		.await;
+		assert_eq!(
+			node.data_server
+				.cdc_live_recovery_upper_after(
+					tenant(),
+					target_table,
+					&ranges,
+					CdcCursor::MIN,
+					hlc(100, 0, 46),
+				)
+				.await,
+			None,
+			"other-table ring overflow must not force target-table recovery"
+		);
+
+		let target_cursor = CdcCursor::new(
+			hlc(90, 0, 46),
+			Identity::new([0x90; 32]),
+			RecordRowIndex::ZERO,
+		);
+		ring.push(CdcLiveEntry::new(
+			target_cursor,
+			tenant(),
+			target_table,
+			descriptor.logical_schema_fingerprint,
+			Arc::new(typed_table_batch(vec![90])),
+		))
+		.await;
+		assert_eq!(
+			node.data_server
+				.cdc_live_recovery_upper_after(
+					tenant(),
+					target_table,
+					&ranges,
+					CdcCursor::ceiling_for_hlc(hlc(80, 0, 46)),
+					hlc(50, 0, 46),
+				)
+				.await,
+			None,
+			"recovery must not emit beyond the safe-emission watermark"
+		);
+		assert_eq!(
+			node.data_server
+				.cdc_live_recovery_upper_after(
+					tenant(),
+					target_table,
+					&ranges,
+					CdcCursor::ceiling_for_hlc(hlc(80, 0, 46)),
+					hlc(100, 0, 46),
+				)
+				.await,
+			Some(target_cursor)
+		);
+
+		node.handles.abort();
 	}
 
 	fn kv_batch(key: &[u8], value: &[u8]) -> RecordBatch {
@@ -16397,6 +18452,257 @@ mod tests {
 				.unwrap();
 			assert_eq!(ids.value(0), id_value);
 		}
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_cdc_releases_when_pending_intent_persistence_fails_but_finalize_commits() {
+		let dir = bootstrap_tempdir("table-cdc-pending-upsert-fail-finalize-ok");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			43,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		node.data_server
+			.pending_finalizations
+			.fail_next_upsert_for_test("cdc-table-upsert-fail-finalize-ok");
+
+		let batch = typed_table_batch(vec![700]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 700;
+		meta.await_finalization = 1;
+
+		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(resp.write.status, WriteStatus::OK, "got resp={resp:?}");
+		assert!(trailing.is_some());
+		assert_eq!(
+			node.data_server.degraded_reason().as_deref(),
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+		);
+
+		let source_ranges =
+			table_query_scan_ranges(meta.tenant_id, &descriptor, None).expect("table ranges");
+		let entries = node
+			.data_server
+			.cdc_collect_ring_entries_after(
+				meta.tenant_id,
+				meta.table_object_id,
+				&source_ranges,
+				CdcCursor::MIN,
+			)
+			.await;
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].cursor.row_hlc, resp.write.commit_hlc);
+		assert!(entries[0].is_finalized());
+		assert!(
+			node.data_server.cdc_pending_live_entries.is_empty(),
+			"immediate finalization success must release the pending CDC staging record"
+		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_write_cdc_evicts_when_pending_intent_persistence_and_finalize_fail() {
+		let dir = bootstrap_tempdir("table-cdc-pending-upsert-finalize-fail");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			44,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+
+		let descriptor = typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		node.data_server
+			.pending_finalizations
+			.fail_next_upsert_for_test("cdc-table-upsert-and-finalize-fail");
+		node.raft.shutdown().await.unwrap();
+
+		let batch = typed_table_batch(vec![701]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 701;
+		meta.await_finalization = 1;
+
+		let (resp, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+		assert_eq!(
+			resp.write.status,
+			WriteStatus::INTERNAL_ERROR,
+			"got resp={resp:?}"
+		);
+		assert!(trailing.is_none());
+		assert_eq!(
+			node.data_server.degraded_reason().as_deref(),
+			Some(LOCAL_PERSISTENCE_DISTRUST_REASON)
+		);
+
+		let source_ranges =
+			table_query_scan_ranges(meta.tenant_id, &descriptor, None).expect("table ranges");
+		let entries = node
+			.data_server
+			.cdc_collect_ring_entries_after(
+				meta.tenant_id,
+				meta.table_object_id,
+				&source_ranges,
+				CdcCursor::MIN,
+			)
+			.await;
+		assert!(
+			entries.is_empty(),
+			"terminal immediate-finalization failure must evict staged CDC rows"
+		);
+		assert!(node.data_server.cdc_pending_live_entries.is_empty());
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn table_replica_cdc_releases_when_parent_finalization_marker_applies() {
+		let dir = bootstrap_tempdir("table-replica-cdc-marker-release");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			45,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+
+		let descriptor = typed_table_descriptor();
+		let batch = typed_table_batch(vec![800]);
+		let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+		meta.parent_write_id.sequence_no = 800;
+		let commit_hlc = hlc(800, 0, node.local_node.id);
+		let bifurcated =
+			bifurcate_table_write(&meta, &batch, &descriptor, WriterNodeId::ZERO, commit_hlc)
+				.unwrap();
+		let replica_meta = table_replica_meta(&meta, &bifurcated, &bifurcated.children, commit_hlc);
+		let replica_children = bifurcated
+			.children
+			.iter()
+			.map(|child| TableReplicaChildPayload {
+				child_ordinal: child.child_ordinal,
+				key_identity: child.key_identity,
+				locality: child.locality,
+				record_row_index: child.record_row_index,
+				frame_bytes: child.frame_bytes.clone(),
+				payload_hash: child.payload_hash,
+				charged_bytes: child.charged_bytes,
+			})
+			.collect::<Vec<_>>();
+		let staged = node
+			.data_server
+			.stage_cdc_table_replica_children(
+				meta.tenant_id,
+				meta.table_object_id,
+				&descriptor,
+				commit_hlc,
+				&replica_children,
+				false,
+			)
+			.await
+			.unwrap();
+		assert_eq!(staged.len(), 1);
+		node.data_server.cdc_stage_pending_finalization_marker(
+			CdcFinalizationKey::from_table_replica_meta(&replica_meta),
+			staged,
+		);
+
+		let source_ranges =
+			table_query_scan_ranges(meta.tenant_id, &descriptor, None).expect("table ranges");
+		assert!(
+			node.data_server
+				.cdc_collect_ring_entries_after(
+					meta.tenant_id,
+					meta.table_object_id,
+					&source_ranges,
+					CdcCursor::MIN,
+				)
+				.await
+				.is_empty(),
+			"replica CDC row must not be visible before the parent finalization applies"
+		);
+
+		let applied_marker = FinalizationMarker {
+			log_index: 88,
+			term: 2,
+			epoch: meta.expected_epoch,
+			commit_hlc,
+			payload_hash: bifurcated.payload_hash,
+			e_safe_index: 88,
+			durability: meta.durability,
+			_pad: [0; 7],
+		};
+		assert_eq!(
+			node.data_server
+				.cdc_release_pending_finalization_marker(applied_marker)
+				.await,
+			1
+		);
+		assert!(node.data_server.cdc_marker_pending_live_entries.is_empty());
+		assert_eq!(
+			node.data_server
+				.cdc_locality_frontiers
+				.min_for_localities([bifurcated.children[0].locality]),
+			Some(commit_hlc)
+		);
+
+		let entries = node
+			.data_server
+			.cdc_collect_ring_entries_after(
+				meta.tenant_id,
+				meta.table_object_id,
+				&source_ranges,
+				CdcCursor::MIN,
+			)
+			.await;
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].cursor.row_hlc, commit_hlc);
+		assert!(entries[0].is_finalized());
 
 		node.handles.abort();
 	}

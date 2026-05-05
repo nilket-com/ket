@@ -578,6 +578,13 @@ impl MsgType {
 	pub const AGG_RESP: Self = Self(0x33);
 	pub const TABLE_DELETE_REQ: Self = Self(0x34);
 	pub const TABLE_DELETE_RESP: Self = Self(0x35);
+	// CDC subscription substrate (ADR 054). Values 0x36..0x39
+	// are the next unused Data Ring protocol slots after
+	// TABLE_DELETE_RESP.
+	pub const CDC_SUBSCRIBE_REQ: Self = Self(0x36);
+	pub const CDC_FRAME: Self = Self(0x37);
+	pub const CDC_CHECKPOINT: Self = Self(0x38);
+	pub const CDC_REJECT: Self = Self(0x39);
 
 	// control ring
 	pub const TRANSFER_REQ: Self = Self(0x10);

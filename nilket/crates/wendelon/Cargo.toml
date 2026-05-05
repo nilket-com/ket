@@ -126,3 +126,7 @@ harness = false
 [[bench]]
 name = "wire_arrow_ipc_body_compression"
 harness = false
+
+[[bench]]
+name = "cdc_subscription"
+harness = false

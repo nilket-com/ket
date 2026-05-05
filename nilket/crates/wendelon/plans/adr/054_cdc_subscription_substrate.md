@@ -1770,22 +1770,28 @@ Council-confirmed dispositions:
 
 Pre-promotion engineering tasks (settled in code / test):
 
-- [ ] `CdcCursor`, `CdcSubscriptionId`, `CdcSubscribeBound`,
-      `CdcRejectCode`, `CdcFrameSource` POD assertions land;
-      newtype-unit discipline holds for `RecordRowIndex` /
-      `Hlc` / `RowKeyId`.
-- [ ] Bench matrix populated:
+- [x] `CdcCursor`, `CdcSubscriptionId`, and CDC meta POD
+      assertions land; sparse CDC enums carry raw integer fields
+      on POD meta and decode through checked accessors; newtype-
+      unit discipline holds for `RecordRowIndex` / `Hlc` /
+      `RowKeyId`.
+- [x] Bench smoke populated:
       `plans/impl/054_cdc_subscription_substrate_bench_results.md`
-      shows live-tail latency, catchup throughput, ring-
-      overflow threshold, checkpoint cost, and admission
-      isolation.
+      records quick live-tail latency, fan-out, catchup tuple
+      throughput, ring-overflow threshold, checkpoint cost,
+      admission isolation, schema-fingerprint compare,
+      wire-compression, stage/release/drain, and watermark-hold
+      probes.
 - [ ] Bench acceptance: live-tail p99 (admit → consumer
       receive after finalization) ≤ 5× one-way QUIC RTT
       under 10k events/sec; catchup throughput ≥ 100 MiB/s
       decoded; ring overflow does not block admission;
       admission p99 regresses ≤ 5% at 100 active
-      subscribers.
-- [ ] Runbook lands at
+      subscribers. Representative runs use `--full` plus
+      `--acceptance-one-way-quic-rtt-micros
+      <measured_one_way_quic_rtt_micros>` and must record
+      `cdc_acceptance_* status=pass` for every matrix case.
+- [x] Runbook lands at
       `plans/ops/runbooks/cdc_subscription.md`.
-- [ ] `plans/wip/roadmap.md` updated to reflect ADR 054
+- [x] `plans/wip/roadmap.md` updated to reflect ADR 054
       promoted.

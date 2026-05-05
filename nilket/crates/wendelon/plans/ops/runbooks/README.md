@@ -36,6 +36,9 @@ Current runbooks:
 - [ADR 053 Wire Arrow IPC Body Compression](./wire_arrow_ipc_body_compression.md)
   - transport-side Arrow IPC LZ4 rollout, metrics, decode-error triage,
     and frame-flag rejection interpretation
+- [ADR 054 CDC Subscription Substrate](./cdc_subscription.md)
+  - CDC cursor/reject interpretation, live-tail ring overflow, heartbeat
+    stalls, and bounded `cdc_*` metric surface
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

@@ -1665,6 +1665,13 @@ Bench results in
 Quick smoke acceptable for code review; full
 small / medium / large matrix with end-to-end latency under
 fan-out is the ADR 054 promotion-to-shipped gate.
+Representative promotion runs pass
+`--acceptance-one-way-quic-rtt-micros
+<measured_one_way_quic_rtt_micros>` so the harness emits
+`cdc_acceptance_*` lines and exits nonzero on threshold failure.
+Use `scripts/bench/run_cdc_subscription_acceptance.sh` to capture
+the representative environment metadata, raw output, validation log,
+and promotion-candidate summary.
 
 ## Phase 10 — Architectural lockdown
 
@@ -1834,6 +1841,8 @@ cargo test --test architecture_test --quiet
 cargo test --test metrics_smoke --quiet
 cargo bench --bench cdc_subscription --no-run
 cargo bench --bench cdc_subscription -- --quick
+cargo bench --bench cdc_subscription -- --quick --acceptance-one-way-quic-rtt-micros 1000
+CDC_ACCEPTANCE_BENCH_ARGS=--quick CDC_ACCEPTANCE_MATRIX_ROWS=1024 scripts/bench/run_cdc_subscription_acceptance.sh /tmp/wendelon-cdc-acceptance-smoke 1000
 git diff --check
 cargo fmt --check
 ```

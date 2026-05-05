@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod cdc;
 pub mod core;
 pub mod lifecycle;
 pub mod pbc;
@@ -9,7 +10,9 @@ pub mod units;
 pub use crate::hash::descriptor_fingerprint::{
 	LogicalSchemaFingerprint, PhysicalDescriptorFingerprint,
 };
+pub use crate::hash::state_digest::StateDigest;
 pub use aggregate::*;
+pub use cdc::*;
 pub use core::*;
 pub use lifecycle::*;
 pub use secondary_index::*;
