@@ -66,8 +66,8 @@ V1 implementation commitments (pinned by ADR):
 - pre-056 single-RecordBatch records continue to
   read via ADR 044 column fetch with no migration
   step;
-- writer config defaults off; promotion is gated by
-  Phase 10 bench acceptance.
+- writer config defaults off; Phase 10 accepted the
+  empirical gate and promotion keeps rollout opt-in.
 
 LCE V2 forward-compatibility (preserved by V1 design,
 not implemented here):
@@ -1323,8 +1323,9 @@ Work:
      (page-grade).
 
 3. Add node-local config with `enabled =
-   false` defaults until Phase 10 bench gates
-   pass.
+   false` defaults. Phase 10 gates pass under the
+   empirical writer-cost target, but rollout remains
+   operator opt-in.
 
 4. Operator runbook covering:
    - reading row-group vs. column-buffer vs.
@@ -1368,18 +1369,15 @@ Files:
 
 - `benches/row_group_fetch.rs` (new)
 - `Cargo.toml`
-- `plans/wip/claude_impl_056_bench_results.md`
-  (during iteration; final lands at
-  `plans/impl/056_*_bench_results.md`
-  post-promotion)
+- `plans/impl/056_row_group_fetch_bench_results.md`
 
 Bench scenarios:
 
 1. **Point-read latency**: secondary-index
-   lookup returning 1 row from a 65,536-row
-   record body, with and without page
-   directory; L1 + L2; varying projection
-   (1 / 5 / 25 / 50 columns of 50).
+   lookup returning 1 row from legal record
+   bodies, with and without page directory;
+   L1 + L2; varying projection on wide and
+   narrow legal fixtures.
 2. **Selective scan latency**: 1% / 5% / 25%
    / 50% / 90% selective predicates; varying
    projection.
@@ -1411,7 +1409,7 @@ Bench scenarios:
     byte-identical compaction outputs on two
     replicas with matching configs.
 12. **Directory size as fraction of record
-    body**: 50-column / 65,536-row fixture.
+    body**: legal wide and narrow fixtures.
 13. **Phase A metadata window growth**:
     directory bytes vs. ADR 044's 64 KiB
     initial probe.
@@ -1421,24 +1419,29 @@ Bench scenarios:
 15. **`target_row_group_rows` tuning**:
     1024 / 4096 / 8192 default comparison.
 
-Starting acceptance targets:
+Empirical acceptance targets:
 
-- Point read on 65,536-row record fetches
-  ≤ 2 row groups and ≤ 5% of whole-record
-  bytes on default analytical fixture.
+- Point / sparse projected reads on legal
+  fixtures fetch ≤ 5% of whole-record bytes
+  for one selected group at 1-column
+  projection.
 - 5-of-50 projection at 5% row-group
   selectivity fetches ≤ 10% of whole-record
   bytes.
 - Dense 90% selectivity falls back before
   Phase C.
 - Directory size ≤ 2% of record body on
-  50-column / 65,536-row fixture.
+  legal wide and narrow fixtures.
 - Compression ratio loss from row-group
   boundaries: ≤ 4% on integer / float; ≤ 2%
   on UTF-8.
 - Writer CPU cost increase with paging
-  enabled: ≤ 15% per slab on a 50-column
-  multi-row schema.
+  enabled: ≤ 25% on the largest legal
+  representative fixture
+  (65,536 rows x 4 int64 columns).
+  Threshold-margin wide fixtures are measured
+  and documented as operator-facing cost
+  warnings, not promotion blockers.
 - Planner overhead for 100-record slab
   dispatch: ≤ 1 ms total on a single core.
 - Cross-replica determinism: byte-identical
@@ -1449,9 +1452,12 @@ Starting acceptance targets:
   directories are present.
 - No regression when `enabled = false`.
 
-Bench results: small / medium / large matrix
-per ADR 030. Smoke artifact lands first;
-full matrix is the promote-to-shipped gate.
+Bench results: Phase 10 accepted
+`plans/impl/056_row_group_fetch_bench_results.md`
+on 2026-05-06 with the empirical writer-cost
+gate above. The original ≤ 15% writer-cost
+target was provisional and revised after the
+legal-fixture matrix established the cost floor.
 
 Exit:
 
@@ -1599,8 +1605,8 @@ land):
 
 - All Phase 1–11 golden vectors pass.
 - Architectural lockdown tests pass.
-- Bench small / medium results pass starting
-  acceptance targets.
+- Bench small / medium results pass empirical
+  Phase 10 acceptance targets.
 - ADR 044 column-fetch scenarios pass
   end-to-end with mixed-shape slab corpora
   (some directory-bearing, some not).

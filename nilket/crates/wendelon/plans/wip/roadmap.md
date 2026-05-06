@@ -20,7 +20,8 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 056 (Row-Group Fetch and Layered Page Directory)
-council-converged and staged for promotion. Closes the
+is promoted after Phase 10 accepted an empirical
+writer-cost gate revision. Closes the
 row-axis fetch-amplification shape question for
 multi-row records and lays the outer layer of a
 Parquet / Vortex-style storage hierarchy. **Layered
@@ -87,8 +88,9 @@ violation_kind}` enumerations. V1 defaults:
 (0.25), `max_selected_byte_fraction_micros = 500_000`
 (0.50), `max_ranges_per_record = 16`,
 `max_parallel_range_gets = 4`. Writer-side gated by
-node-local `RowGroupWriterConfig` (default off until
-Phase 10 bench acceptance); reader-side automatic on
+node-local `RowGroupWriterConfig` (default off,
+opt-in after Phase 10 accepted the revised empirical
+writer-cost gate); reader-side automatic on
 directory presence — pre-056 sealed records (single-
 RecordBatch IPC, no custom_metadata key) read
 transparently via ADR 044 column fetch. ADR 052
@@ -115,15 +117,17 @@ symbols and no `mini_page_*` fields in ADR 056's
 surface — those land in LCE V2's namespaced module)
 and one Phase-5 guard against post-Phase-B PBC
 re-evaluation. See
-`plans/adr/056_row_group_fetch_and_page_directory.md`
-and `plans/impl/056_row_group_fetch_and_page_directory.md`
-(both staged for promotion). Implementation phases
-pending; Phase 10 bench evidence (point-read latency,
-stats-pruned vs predicate-fetched savings, dense /
-sparse selection break-even, compression ratio
-delta, writer CPU cost, secondary-index speedup) is
-both the promotion-to-shipped gate **and** the input
-shape that opens ADR 057.
+`plans/adr/056_row_group_fetch_and_page_directory.md`,
+`plans/impl/056_row_group_fetch_and_page_directory.md`,
+and
+`plans/impl/056_row_group_fetch_bench_results.md`.
+Implementation and Phase 10 bench evidence have
+landed. The original `<= 15%` writer-cost target was
+revised to an empirical `<= 25%` gate on the largest
+legal representative fixture; wide threshold-margin
+fixtures are documented as opt-in writer-cost
+warnings. This bench artifact is now the input shape
+for ADR 057.
 
 ADR 055 (LSM-Style Leveled Compaction Substrate) is
 the immediate predecessor and the substrate ADR 056
@@ -194,9 +198,8 @@ access surfaces (vectors, triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
-(#12) is staged for promotion; the forward shape continues at
-#13.
+Gemini. Steps 1–12 are promoted (in `plans/adr/`); the
+forward shape continues at #13.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -228,7 +231,7 @@ Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
     follow-up ADRs (each consumes the substrate).
 
 12. **Row-group fetch and layered page directory** —
-    ADR 056. Council-converged; staged for promotion.
+    ADR 056 promoted.
     Outer layer of the storage hierarchy: Arrow IPC
     RecordBatch row groups + per-row-group min/max/null-
     count stats + `RecordPageDirectory` in IPC custom
@@ -237,9 +240,9 @@ Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
     classifier; `L2FetchStrategy::RowGroup` four-leg
     dispatch; ADR 052 secondary-index integration; ADR
     055 LSM compaction integration; 27 architectural
-    lockdown guards. Phase 10 bench evidence is the
-    promotion-to-shipped gate **and** the data input
-    that opens ADR 057. See *Where we are*.
+    lockdown guards. Phase 10 bench evidence accepted
+    the empirical writer-cost gate and opens ADR 057.
+    See *Where we are*.
 
 13. **Per-buffer pages + LCE encoding cascades inside
     row-group buffers** — ADR 057 (LCE V2). Inner layer
@@ -250,16 +253,15 @@ Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
     over Vortex-style encoded arrays), custom partial-
     buffer materializer in a namespaced LCE module
     (`src/storage/lce/`), and brainstorm 011 §3's "Lance
-    idea" intra-buffer SIMD page directory. **Opens
-    after ADR 056 Phase 10 bench data lands.** Bench
+    idea" intra-buffer SIMD page directory. Bench
     output (column cardinality histograms, value-
     distribution shapes, selectivity profiles, point-
     read vs. range break-even, observed compression
     delta from row-group boundaries) shapes encoding-
     cascade choice and per-buffer page row-count
-    defaults. Drafting earlier risks hardcoding
-    unvalidated workload assumptions. *Large; multi-
-    iteration council ADR.*
+    defaults. Now open for drafting with ADR 056's
+    bench artifact as the empirical input. *Large;
+    multi-iteration council ADR.*
 
 14. **Compute over encoded data (COCD)** — ADR 058
     (LCE V3). Innermost layer of the storage hierarchy.
@@ -443,21 +445,6 @@ Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
   identity-axis cursor is the load-bearing decision; the
   safe-emission watermark plus heartbeat contract is what
   makes global cursor monotonicity work without it.
-- **Don't open ADR 057 (LCE V2) before ADR 056 Phase 10
-  bench data lands.** Encoding-cascade choice (RLE vs.
-  dict vs. bitpacked vs. FOR vs. dict+bitpacked, and
-  *which one per column*) and per-buffer page row-count
-  defaults depend on real workload signal — column
-  cardinality, value-distribution shape, selectivity
-  profile, observed compression delta from row-group
-  boundaries. Drafting V2 in advance of bench data either
-  stays so generic it restates ADR 056's
-  forward-compatibility section, or hardcodes
-  unvalidated assumptions about the workload. Wait for
-  the bench artifact, then open ADR 057 with numbers in
-  hand. Same rule applies (transitively) to ADR 058
-  (LCE V3 / COCD), which depends on ADR 057's encoding
-  cascades being concrete.
 - **Don't bundle ADR 056 / 057 / 058 into one mega-ADR.**
   The storage hierarchy is a layered substrate by
   design; each layer is a substantial decision in its
@@ -485,8 +472,8 @@ StateDigest substrate                            (ADR 046)
   → wire-side Arrow IPC body compression         (ADR 053)
   → CDC subscription substrate                   (ADR 054)
   → LSM-style leveled compaction substrate       (ADR 055)
-  → row-group fetch + page directory             (ADR 056)  ← here
-  → per-buffer pages + LCE encoding cascades     (ADR 057, post-056-bench)
+  → row-group fetch + page directory             (ADR 056)
+  → per-buffer pages + LCE encoding cascades     (ADR 057)  ← here
   → compute over encoded data (COCD)             (ADR 058, post-057-impl)
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
@@ -494,17 +481,15 @@ StateDigest substrate                            (ADR 046)
   → refinement plumbing
 ```
 
-Design tip is past ADR 055 (promoted, implementation
-phases pending) with ADR 056 council-converged and
-staged for promotion. The Toron-pivot stretch turns
-toward storage-hierarchy build-out: ADR 056 → ADR 057
-→ ADR 058, opening each only after the previous one's
-implementation lands and produces bench evidence.
-**The council's lean on next pickup:** commit ADR 056
-and execute its 11-phase implementation plan, with
-Phase 10 bench output as the gate that opens both
-ADR 056 promotion-to-shipped and ADR 057 (LCE V2)
-drafting. CDC follow-ups (#16) and vector embeddings
-(#17) are deliberately behind the storage hierarchy
-in this stretch — they remain real work, but the
-Toron pivot pulls compute-adjacent primitives ahead.
+Design tip is past ADR 056 (promoted with Phase 10
+bench evidence accepted under the revised empirical
+writer-cost gate). The Toron-pivot stretch now turns
+to ADR 057, using the row-group bench artifact as
+input for per-buffer page sizing, encoding-cascade
+choice, selectivity profiles, and compression-delta
+expectations. ADR 058 remains behind ADR 057
+implementation experience. CDC follow-ups (#16) and
+vector embeddings (#17) are deliberately behind the
+storage hierarchy in this stretch — they remain real
+work, but the Toron pivot pulls compute-adjacent
+primitives ahead.

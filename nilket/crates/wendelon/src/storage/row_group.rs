@@ -22,7 +22,11 @@ use arrow::array::{
 	UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::compute;
-use arrow::datatypes::{DataType, Schema, TimeUnit};
+use arrow::datatypes::{
+	DataType, Date32Type, Date64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit,
+	TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, UInt8Type,
+	UInt16Type, UInt32Type, UInt64Type,
+};
 use arrow::error::ArrowError;
 use arrow::ipc::{BodyCompressionMethod, CompressionType, MessageHeader, root_as_message};
 use arrow::record_batch::RecordBatch;
@@ -1774,25 +1778,33 @@ fn canonical_min_max(
 	let Some(tag) = arrow_stats_type_tag(data_type) else {
 		return Ok(None);
 	};
-	let mut min = None::<Vec<u8>>;
-	let mut max = None::<Vec<u8>>;
-	for_each_encoded_value(data_type, array, |value| {
-		if min
-			.as_deref()
-			.map(|current| value.as_slice() < current)
-			.unwrap_or(true)
-		{
-			min = Some(value.clone());
+	let (min, max) = match data_type {
+		DataType::Int8 => signed_min_max::<Int8Array, Int8Type>(array, 1)?,
+		DataType::Int16 => signed_min_max::<Int16Array, Int16Type>(array, 2)?,
+		DataType::Int32 => signed_min_max::<Int32Array, Int32Type>(array, 4)?,
+		DataType::Int64 => signed_min_max::<Int64Array, Int64Type>(array, 8)?,
+		DataType::UInt8 => unsigned_min_max::<UInt8Array, UInt8Type>(array, 1)?,
+		DataType::UInt16 => unsigned_min_max::<UInt16Array, UInt16Type>(array, 2)?,
+		DataType::UInt32 => unsigned_min_max::<UInt32Array, UInt32Type>(array, 4)?,
+		DataType::UInt64 => unsigned_min_max::<UInt64Array, UInt64Type>(array, 8)?,
+		DataType::Timestamp(TimeUnit::Millisecond, _) => {
+			signed_min_max::<TimestampMillisecondArray, TimestampMillisecondType>(array, 8)?
 		}
-		if max
-			.as_deref()
-			.map(|current| value.as_slice() > current)
-			.unwrap_or(true)
-		{
-			max = Some(value);
+		DataType::Timestamp(TimeUnit::Microsecond, _) => {
+			signed_min_max::<TimestampMicrosecondArray, TimestampMicrosecondType>(array, 8)?
 		}
-		Ok(())
-	})?;
+		DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+			signed_min_max::<TimestampNanosecondArray, TimestampNanosecondType>(array, 8)?
+		}
+		DataType::Date32 => signed_min_max::<Date32Array, Date32Type>(array, 4)?,
+		DataType::Date64 => signed_min_max::<Date64Array, Date64Type>(array, 8)?,
+		DataType::Boolean => bool_min_max(array)?,
+		DataType::Utf8 => string_min_max(array)?,
+		DataType::LargeUtf8 => large_string_min_max(array)?,
+		DataType::Binary => binary_min_max(array)?,
+		DataType::LargeBinary => large_binary_min_max(array)?,
+		_ => return Ok(None),
+	};
 	let (min, min_truncated) = maybe_truncate_stat(data_type, min);
 	let (max, max_truncated) = maybe_truncate_stat(data_type, max);
 	Ok(Some((
@@ -1809,6 +1821,104 @@ fn canonical_min_max(
 	)))
 }
 
+fn signed_min_max<A, T>(
+	array: &dyn Array,
+	byte_width: usize,
+) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)>
+where
+	A: Array + 'static,
+	T: arrow::datatypes::ArrowNumericType,
+	T::Native: Into<i64> + PartialOrd,
+{
+	let array = downcast::<A>(array)?;
+	let array = array
+		.as_any()
+		.downcast_ref::<arrow::array::PrimitiveArray<T>>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"row-group stats primitive downcast failed",
+			)
+		})?;
+	Ok((
+		compute::min::<T>(array)
+			.map(|value| encode_signed_stat_value(value.into(), byte_width))
+			.transpose()?,
+		compute::max::<T>(array)
+			.map(|value| encode_signed_stat_value(value.into(), byte_width))
+			.transpose()?,
+	))
+}
+
+fn unsigned_min_max<A, T>(
+	array: &dyn Array,
+	byte_width: usize,
+) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)>
+where
+	A: Array + 'static,
+	T: arrow::datatypes::ArrowNumericType,
+	T::Native: Into<u64> + PartialOrd,
+{
+	let array = downcast::<A>(array)?;
+	let array = array
+		.as_any()
+		.downcast_ref::<arrow::array::PrimitiveArray<T>>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"row-group stats primitive downcast failed",
+			)
+		})?;
+	Ok((
+		compute::min::<T>(array)
+			.map(|value| encode_unsigned_stat_value(value.into(), byte_width))
+			.transpose()?,
+		compute::max::<T>(array)
+			.map(|value| encode_unsigned_stat_value(value.into(), byte_width))
+			.transpose()?,
+	))
+}
+
+fn bool_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+	let array = downcast::<BooleanArray>(array)?;
+	Ok((
+		compute::min_boolean(array).map(|value| encode_bool_stat_value(value).to_vec()),
+		compute::max_boolean(array).map(|value| encode_bool_stat_value(value).to_vec()),
+	))
+}
+
+fn string_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+	let array = downcast::<StringArray>(array)?;
+	Ok((
+		compute::min_string(array).map(|value| value.as_bytes().to_vec()),
+		compute::max_string(array).map(|value| value.as_bytes().to_vec()),
+	))
+}
+
+fn large_string_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+	let array = downcast::<LargeStringArray>(array)?;
+	Ok((
+		compute::min_string(array).map(|value| value.as_bytes().to_vec()),
+		compute::max_string(array).map(|value| value.as_bytes().to_vec()),
+	))
+}
+
+fn binary_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+	let array = downcast::<BinaryArray>(array)?;
+	Ok((
+		compute::min_binary(array).map(|value| value.to_vec()),
+		compute::max_binary(array).map(|value| value.to_vec()),
+	))
+}
+
+fn large_binary_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+	let array = downcast::<LargeBinaryArray>(array)?;
+	Ok((
+		compute::min_binary(array).map(|value| value.to_vec()),
+		compute::max_binary(array).map(|value| value.to_vec()),
+	))
+}
+
 fn maybe_truncate_stat(data_type: &DataType, value: Option<Vec<u8>>) -> (Option<Vec<u8>>, bool) {
 	let uses_prefix = matches!(
 		data_type,
@@ -1823,162 +1933,6 @@ fn maybe_truncate_stat(data_type: &DataType, value: Option<Vec<u8>>) -> (Option<
 	} else {
 		(Some(value), false)
 	}
-}
-
-fn for_each_encoded_value<F>(
-	data_type: &DataType,
-	array: &dyn Array,
-	mut emit: F,
-) -> std::io::Result<()>
-where
-	F: FnMut(Vec<u8>) -> std::io::Result<()>,
-{
-	match data_type {
-		DataType::Int8 => {
-			emit_signed::<Int8Array, _>(array, 1, |array, row| array.value(row).into(), &mut emit)
-		}
-		DataType::Int16 => {
-			emit_signed::<Int16Array, _>(array, 2, |array, row| array.value(row).into(), &mut emit)
-		}
-		DataType::Int32 => {
-			emit_signed::<Int32Array, _>(array, 4, |array, row| array.value(row).into(), &mut emit)
-		}
-		DataType::Int64 => {
-			emit_signed::<Int64Array, _>(array, 8, |array, row| array.value(row), &mut emit)
-		}
-		DataType::UInt8 => emit_unsigned::<UInt8Array, _>(
-			array,
-			1,
-			|array, row| array.value(row).into(),
-			&mut emit,
-		),
-		DataType::UInt16 => emit_unsigned::<UInt16Array, _>(
-			array,
-			2,
-			|array, row| array.value(row).into(),
-			&mut emit,
-		),
-		DataType::UInt32 => emit_unsigned::<UInt32Array, _>(
-			array,
-			4,
-			|array, row| array.value(row).into(),
-			&mut emit,
-		),
-		DataType::UInt64 => {
-			emit_unsigned::<UInt64Array, _>(array, 8, |array, row| array.value(row), &mut emit)
-		}
-		DataType::Timestamp(TimeUnit::Millisecond, _) => {
-			emit_signed::<TimestampMillisecondArray, _>(
-				array,
-				8,
-				|array, row| array.value(row),
-				&mut emit,
-			)
-		}
-		DataType::Timestamp(TimeUnit::Microsecond, _) => {
-			emit_signed::<TimestampMicrosecondArray, _>(
-				array,
-				8,
-				|array, row| array.value(row),
-				&mut emit,
-			)
-		}
-		DataType::Timestamp(TimeUnit::Nanosecond, _) => emit_signed::<TimestampNanosecondArray, _>(
-			array,
-			8,
-			|array, row| array.value(row),
-			&mut emit,
-		),
-		DataType::Date32 => {
-			emit_signed::<Date32Array, _>(array, 4, |array, row| array.value(row).into(), &mut emit)
-		}
-		DataType::Date64 => {
-			emit_signed::<Date64Array, _>(array, 8, |array, row| array.value(row), &mut emit)
-		}
-		DataType::Boolean => {
-			let array = downcast::<BooleanArray>(array)?;
-			for row in 0..array.len() {
-				if array.is_valid(row) {
-					emit(encode_bool_stat_value(array.value(row)).to_vec())?;
-				}
-			}
-			Ok(())
-		}
-		DataType::Utf8 => {
-			emit_bytes::<StringArray, _>(array, |array, row| array.value(row).as_bytes(), &mut emit)
-		}
-		DataType::LargeUtf8 => emit_bytes::<LargeStringArray, _>(
-			array,
-			|array, row| array.value(row).as_bytes(),
-			&mut emit,
-		),
-		DataType::Binary => {
-			emit_bytes::<BinaryArray, _>(array, |array, row| array.value(row), &mut emit)
-		}
-		DataType::LargeBinary => {
-			emit_bytes::<LargeBinaryArray, _>(array, |array, row| array.value(row), &mut emit)
-		}
-		_ => Ok(()),
-	}
-}
-
-fn emit_signed<A, F>(
-	array: &dyn Array,
-	byte_width: usize,
-	value_at: impl Fn(&A, usize) -> i64,
-	emit: &mut F,
-) -> std::io::Result<()>
-where
-	A: Array + 'static,
-	F: FnMut(Vec<u8>) -> std::io::Result<()>,
-{
-	let array = downcast::<A>(array)?;
-	for row in 0..array.len() {
-		if array.is_valid(row) {
-			emit(encode_signed_stat_value(value_at(array, row), byte_width)?)?;
-		}
-	}
-	Ok(())
-}
-
-fn emit_unsigned<A, F>(
-	array: &dyn Array,
-	byte_width: usize,
-	value_at: impl Fn(&A, usize) -> u64,
-	emit: &mut F,
-) -> std::io::Result<()>
-where
-	A: Array + 'static,
-	F: FnMut(Vec<u8>) -> std::io::Result<()>,
-{
-	let array = downcast::<A>(array)?;
-	for row in 0..array.len() {
-		if array.is_valid(row) {
-			emit(encode_unsigned_stat_value(
-				value_at(array, row),
-				byte_width,
-			)?)?;
-		}
-	}
-	Ok(())
-}
-
-fn emit_bytes<A, F>(
-	array: &dyn Array,
-	value_at: impl Fn(&A, usize) -> &[u8],
-	emit: &mut F,
-) -> std::io::Result<()>
-where
-	A: Array + 'static,
-	F: FnMut(Vec<u8>) -> std::io::Result<()>,
-{
-	let array = downcast::<A>(array)?;
-	for row in 0..array.len() {
-		if array.is_valid(row) {
-			emit(value_at(array, row).to_vec())?;
-		}
-	}
-	Ok(())
 }
 
 fn downcast<A: Array + 'static>(array: &dyn Array) -> std::io::Result<&A> {
