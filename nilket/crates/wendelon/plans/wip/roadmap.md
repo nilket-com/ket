@@ -19,133 +19,131 @@ forward-sequence rewrite.
 
 ## Where we are
 
-ADR 055 (LSM-Style Leveled Compaction Substrate) just
-promoted. Closes the leveled-merge / manifest / pin /
-elision-floor / digest-invariance shape question for
-physical compaction. Substrate-only scope: size-tiered
-fallback, subcompaction, bloom filters, cross-replica
-deduplication, manual-trigger RPC, and L4+ extension are
-explicit follow-up ADRs. Per-locality compactor on the
-locality leader; four levels (`L0..L3`); HLC-disjoint
-within each level (HLC is the data-ring slab seek key
-per ADR 045 / 050 / 052; partitioning on the seek key
-keeps binary-search-on-manifest cost constant). Internal
-`CompactionMergeKey = (row_hlc, row_key_id,
-record_row_index)` is storage-local and never crosses
-into CDC schema. Per-locality manifest mirror is local
-and rebuildable, but mutations ride a new
-`MutationKind::CompactionCommit` on the existing
-locality control ring (ADR 016) — readers see an atomic
-epoch boundary and followers receive the mutation for
-failover-safe synchronization. Compaction is
-**deterministic** so each replica reproduces the same
-logical output set from its local input slabs;
-cross-replica logical equality holds via determinism
-(visible-state digest matches), physical bytes stay
-local, replication traffic stays bounded to manifest
-mutations. **The elision floor IS ADR 048's retention
-floor** — no separate compaction floor, CDC floor, or
-operator override. Two reachability contracts would
-diverge under operational drift; one floor, one
-contract. Elision rules are inherited verbatim from the
-existing single-slab primitives lifted to a streaming
-multi-slab merger: append-only / content-hash
-data+tombstone pair-GC (ADR 047 / 049), PK prefix
-pruning with **boundary-sentinel retention** (ADR 050
-§7), migrated-range tombstone reclaim, fail-closed on
-ambiguous table ownership. Sidecar rebuild composes via
-ADR 052 §9 — every output slab gets a freshly-built
-sidecar, **replace-by-new** (never in-place rewrite),
-digest-verified before old sidecars retire. CDC catchup
-acquires manifest-snapshot iteration pins at open;
-those pins survive concurrent compaction commits. Live-
-tail handoff reads ADR 054's in-memory ring and does
-not pin slabs. **No `relocated_reads` shim** — pins
-make old and new manifest epochs independently
-readable; sidecars rebuild during compaction so cached
-`RecordLocation` references in old sidecars retire with
-the old sidecars. Subscriptions below retention floor
-reject with the existing
-`CDC_REJECT_BELOW_RETENTION_FLOOR`. **No
-`safe_emission_hlc` coupling** — that watermark gates
-emission from the in-memory live-tail ring (upstream of
-any compaction decision); by the time a version-entry
-reaches a slab eligible for compaction, it's been
-finalized, emitted (or skipped past) the live-tail
-ring, and the ring entry has dropped. The roadmap's
-"compaction must not advance below cursor_high_water
-when sidecars are being rewritten in-place" is
-satisfied by **not rewriting sidecars in place**; the
-"ring overflow rejects cleanly" branch is the existing
-`CDC_REJECT_RING_OVERFLOW_DURING_CATCHUP` (ADR 054).
-Visible-state `StateDigest` invariance audited
-unconditionally at every commit via cold rebuild over
-input/output *manifest views localized to touched
-slabs* — O(input + output bytes), not O(table); ADR
-046's monoidal digest makes the localized comparison
-equivalent to whole-table comparison. Cold rebuild over
-views catches both elision bugs (drops a visible row)
-*and* materialization bugs (synthesizes a visible row);
-streaming `visible_contrib(elision_set) == identity`
-only catches elision and was rejected as the V1 install
-gate. Per-version-entry digest
-(`digest.secondary_index.entry.v1`, ADR 052) updated
-algebraically on the elision stream; sampled cold-
-rebuild verification at
-`lsm_digest_verify_sample_rate`. Mismatch aborts the
-commit, emits `LsmInvariantViolation`, pauses
-compaction on the affected `(locality, table)` scope
-until manual investigation — page-grade. Three V1
-reject codes (`ManifestRace`,
-`SidecarDigestMismatch`, `VisibleDigestInvariance`),
-discriminants start at 1 so a zero-init reject can't
-decode as valid; closed taxonomy. Bounded `lsm_*`
-metrics with `{level, result, kind}` enumerations; no
-tenant / table / subscription / slab_id labels. V1
-defaults: `max_l0_slab_count = 4`,
-`lsm_l0_max_age_millis = 5_000`,
-`lsm_l1_slab_size_target_bytes = 64 MiB`,
-`lsm_size_ratio = 10`, `max_l1_slab_count = 4`,
-`lsm_picker_tick_millis = 100`,
-`lsm_gc_tick_millis = 1_000`,
-`lsm_compaction_concurrency_per_locality = 1` —
-yielding L1 ≤ 256 MiB, L2 ≤ 2.56 GiB, L3 ≤ 25.6 GiB
-per locality. L3 has no next level in V1. Active slab
-is never a compaction input. Pause/resume via existing
-node-local maintenance config, not a new wire
-protocol. No new wire `MsgType`, no new `FRAME_FLAG_*`,
-no new `NodeCapability` bit, no Cargo feature, no new
-digest domain, no `ObjectStore` trait change, no on-
-disk format change beyond the slab-manifest extension
-carried by `CompactionCommit`. No `StorageTier` field
-on the LSM substrate — existing tier sweeper handles
-L1=local / L2=tiered moves orthogonally. See
-`plans/adr/055_lsm_leveled_compaction_substrate.md`
+ADR 056 (Row-Group Fetch and Layered Page Directory)
+council-converged and staged for promotion. Closes the
+row-axis fetch-amplification shape question for
+multi-row records and lays the outer layer of a
+Parquet / Vortex-style storage hierarchy. **Layered
+substrate sequencing committed**: ADR 056 V1 = row
+groups + per-row-group min/max/null-count stats; LCE
+V2 (future ADR 057) = per-buffer pages + encoding
+cascades inside each row-group RecordBatch's encoded
+buffers; LCE V3 (future ADR 058) = compute over
+encoded representation (COCD). The layers are equal
+priority; ordering is software-development driven —
+row groups establish the outer contract under which
+per-buffer pages can safely nest, so they ship first.
+Row groups are Arrow IPC RecordBatches: one
+qualifying `MultiRow` record body becomes one IPC
+stream with one schema message followed by N dense
+row-group RecordBatch messages over the same physical
+schema. **Paging engages only when both thresholds
+are met**: `row_count >= min_paged_record_rows`
+**AND** estimated bytes `>= min_paged_record_bytes`;
+fall below either, single-batch encoding stands.
+**`RecordPageDirectory` lives in IPC schema
+`custom_metadata`** under literal key
+`storage.row_group_directory` — encrypted with the
+record body, authenticated by ADR 020 chunk AEAD; not
+in the ADR 022 footer (cleartext leakage), not a
+synthetic Arrow column (false row semantics).
+Directory carries `RowGroupDirectoryEntry` per row
+group, `BufferPageDirectoryEntry` per
+`(row_group_index, ipc_column_ordinal,
+ipc_buffer_ordinal)` triple — the V1 per-buffer
+addressing surface — and `RowGroupColumnStats` per
+row group for ADR 039-supported types.
+**Three-phase fetch planner** extends ADR 044's two
+phases: Phase A (metadata + directory probe), Phase
+B (stats prune; predicate-column fetch when stats
+insufficient → derive per-group survival masks),
+Phase C (projected fetch over surviving groups,
+zip Phase B columns + Phase C columns by IPC
+ordinal, apply per-group mask, emit dense filtered
+batch — PBC is **never re-evaluated** post-Phase-B).
+**Conservative PBC predicate classifier** with
+asymmetric AND/OR rule: conjunction skips when *any*
+branch proves disjoint (unsupported sibling branches
+do not block); disjunction skips only when *every*
+branch proves disjoint; LIKE / IN / BETWEEN-with-cast
+keep the group at top level, collapse to Keep
+without blocking siblings under conjunction.
+**`L2FetchStrategy`** four-leg dispatch:
+`RowGroup(RowGroupFetchPlan) | Columnar(plan) |
+WholeRecord | Fallback(reason)`. Closed 3-code
+`RowGroupRejectCode` taxonomy
+(`PageDirectoryParseError`,
+`RowGroupRangeOverflow`, `LayoutUnsupported`);
+authentication / parse / decode failures route to
+storage errors, never the `Fallback(...)` branch.
+Bounded `storage_l2_row_group_fetch_*` metric family
+with `{strategy, reason, decision, kind,
+violation_kind}` enumerations. V1 defaults:
+`target_row_group_rows = 4_096`,
+`max_row_group_rows = 8_192`,
+`min_paged_record_rows = 8_192`,
+`min_paged_record_bytes = 512 KiB`,
+`max_selected_row_group_fraction_micros = 250_000`
+(0.25), `max_selected_byte_fraction_micros = 500_000`
+(0.50), `max_ranges_per_record = 16`,
+`max_parallel_range_gets = 4`. Writer-side gated by
+node-local `RowGroupWriterConfig` (default off until
+Phase 10 bench acceptance); reader-side automatic on
+directory presence — pre-056 sealed records (single-
+RecordBatch IPC, no custom_metadata key) read
+transparently via ADR 044 column fetch. ADR 052
+secondary-index hits map `RecordRowIndex` → row group
+via the directory; identity-axis sidecar shape
+unchanged. ADR 055 LSM compaction inherits via
+out-of-place sidecar rebuild and per-output-slab
+directory recomputation under matching writer config
+— cross-replica byte-equality holds, visible-state
+digest invariant. CDC, recovery, rehydration are
+byte-neutral (whole IPC stream decode). No new wire
+`MsgType`, no new `FRAME_FLAG_*`, no new
+`NodeCapability` bit, no Cargo feature, no new digest
+domain, no `ObjectStore` trait change, no envelope
+`format_version` bump, no ADR 022 footer extension,
+no descriptor field, no synthetic Arrow column for
+the directory, no LZ4 frame block-independence
+mutation, no custom partial-buffer materializer
+(stock Arrow IPC reader handles row-group decode).
+**27 architectural lockdown guards** in
+`tests/architecture_test.rs`, including two
+LCE-V2-scoped guards (no `partial_buffer_materialize`
+symbols and no `mini_page_*` fields in ADR 056's
+surface — those land in LCE V2's namespaced module)
+and one Phase-5 guard against post-Phase-B PBC
+re-evaluation. See
+`plans/adr/056_row_group_fetch_and_page_directory.md`
+and `plans/impl/056_row_group_fetch_and_page_directory.md`
+(both staged for promotion). Implementation phases
+pending; Phase 10 bench evidence (point-read latency,
+stats-pruned vs predicate-fetched savings, dense /
+sparse selection break-even, compression ratio
+delta, writer CPU cost, secondary-index speedup) is
+both the promotion-to-shipped gate **and** the input
+shape that opens ADR 057.
+
+ADR 055 (LSM-Style Leveled Compaction Substrate) is
+the immediate predecessor and the substrate ADR 056
+inherits for compaction-aware writers. Per-locality
+compactor; four levels (`L0..L3`); HLC-disjoint
+within each level; deterministic compaction so
+replicas reproduce the same logical output set;
+elision floor IS ADR 048's retention floor (no
+separate compaction floor); manifest-snapshot pins
+as the sole MVCC mechanism (no `relocated_reads`
+shim); sidecar rebuild composes via ADR 052 §9
+(replace-by-new); cold-rebuild visible-domain audit
+over localized manifest views as the V1 install
+gate; three V1 reject codes (`ManifestRace`,
+`SidecarDigestMismatch`, `VisibleDigestInvariance`).
+See `plans/adr/055_lsm_leveled_compaction_substrate.md`
 and `plans/impl/055_lsm_leveled_compaction_substrate.md`.
 Implementation phases pending; full small / medium /
-large bench evidence is the promotion-to-shipped gate.
-
-ADR 054 (CDC Subscription Substrate) is the immediate
-predecessor and the binding ADR 055 inherits.
-Identity-axis logical cursor `(row_hlc, row_key_id,
-record_row_index)` matching the data-ring slab seek
-key; in-memory per-locality `CdcLiveTailRing` with
-admission-time staging gated by ADR 003
-`FinalizationCommitted`; catchup over a safe global
-cut `snapshot_hlc = min(locality_finalized_hlc(l))`
-using full-tuple `CdcCursor` bounds; safe-emission
-watermark gates live-tail emission; locality-scoped
-heartbeat (one worker per locality, one marker per
-quiet interval); visible-domain `StateDigest`
-checkpoints; 8-code `CDC_REJECT_*` taxonomy; bounded
-`cdc_*` metrics; `Live` and `SnapshotAtOpen`
-subscription bounds. See
-`plans/adr/054_cdc_subscription_substrate.md` and
-`plans/impl/054_cdc_subscription_substrate.md`.
-Initial implementation phases landed; full bench
-evidence remains the promotion-to-shipped gate; smoke
-artifact at
-`plans/impl/054_cdc_subscription_substrate_bench_results.md`.
+large bench evidence is the promotion-to-shipped
+gate.
 
 ## Prioritization philosophy
 
@@ -179,11 +177,26 @@ identity / descriptor cleanup, access-pattern surface
 rather than force those foundations to be retrofitted
 afterward.
 
+**Toron-pivot stretch (current).** Past the ADR 055 milestone the
+roadmap turns toward compute-adjacent storage primitives in
+preparation for the Toron compute layer. The ordering goal in
+this stretch is to land the storage hierarchy that
+analytical-scan workloads (BigQuery-killer territory) need
+before opening Toron-side surface. Concretely: row-group fetch
++ page directory (ADR 056), then per-buffer pages + encoding
+cascades (LCE V2 / ADR 057), then compute-over-encoded-data
+(LCE V3 / ADR 058). CDC follow-up ADRs and vector embeddings
+are deliberately deferred behind the storage hierarchy in this
+stretch — not because they are smaller, but because the Toron
+pivot pulls compute-adjacent primitives ahead of OLTP-shaped
+access surfaces (vectors, triggers, webhooks).
+
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–11 are promoted (in `plans/adr/`); the
-forward shape begins at #12.
+Gemini. Steps 1–11 are promoted (in `plans/adr/`); ADR 056
+(#12) is staged for promotion; the forward shape continues at
+#13.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -212,11 +225,77 @@ forward shape begins at #12.
     subcompaction, bloom filters, cross-replica
     deduplication, manual-trigger RPC, L4+ extension,
     and direct already-tiered compaction are explicit
-    follow-up ADRs (each consumes the substrate). See
-    *Where we are* above.
+    follow-up ADRs (each consumes the substrate).
 
-12. **CDC follow-up ADRs (consume ADR 054 substrate).**
+12. **Row-group fetch and layered page directory** —
+    ADR 056. Council-converged; staged for promotion.
+    Outer layer of the storage hierarchy: Arrow IPC
+    RecordBatch row groups + per-row-group min/max/null-
+    count stats + `RecordPageDirectory` in IPC custom
+    metadata; three-phase fetch planner with Phase B/C
+    survival-mask handoff; asymmetric AND/OR predicate
+    classifier; `L2FetchStrategy::RowGroup` four-leg
+    dispatch; ADR 052 secondary-index integration; ADR
+    055 LSM compaction integration; 27 architectural
+    lockdown guards. Phase 10 bench evidence is the
+    promotion-to-shipped gate **and** the data input
+    that opens ADR 057. See *Where we are*.
+
+13. **Per-buffer pages + LCE encoding cascades inside
+    row-group buffers** — ADR 057 (LCE V2). Inner layer
+    of the storage hierarchy. Adds intra-buffer page
+    directory entries (sibling to ADR 056's row-group
+    entries), per-column encoding cascade choice
+    (brainstorm 011 §1: e.g. `RLE(BitPacked(Dictionary))`
+    over Vortex-style encoded arrays), custom partial-
+    buffer materializer in a namespaced LCE module
+    (`src/storage/lce/`), and brainstorm 011 §3's "Lance
+    idea" intra-buffer SIMD page directory. **Opens
+    after ADR 056 Phase 10 bench data lands.** Bench
+    output (column cardinality histograms, value-
+    distribution shapes, selectivity profiles, point-
+    read vs. range break-even, observed compression
+    delta from row-group boundaries) shapes encoding-
+    cascade choice and per-buffer page row-count
+    defaults. Drafting earlier risks hardcoding
+    unvalidated workload assumptions. *Large; multi-
+    iteration council ADR.*
+
+14. **Compute over encoded data (COCD)** — ADR 058
+    (LCE V3). Innermost layer of the storage hierarchy.
+    Evaluates PBC opcodes directly over LCE V2 encoded
+    representations without full-fidelity decode —
+    `RLE(BitPacked(...))` runs answer equality / range
+    / null-count predicates and aggregates without
+    materializing a dense Arrow array. Depends on ADR
+    057's cascade choices being concrete; opening
+    earlier is premature. *Large; depends on ADR 057
+    implementation experience for opcode shape.*
+
+15. **Capacity-tier compression + serverless / erasure-
+    coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
+    - **zstd capacity-tier codec + `CompressionLevel`
+      newtype.** Codec-catalog extension; ADR 053 / 043
+      wire vs. body composition; new
+      `CompressionLevel(u8)` newtype-unit. Composes
+      orthogonally with the row-group / per-buffer-page
+      hierarchy.
+    - **Serverless PBC at L2** *(brainstorm 010.)*
+      Lambda-like remote PBC executor; consumes the same
+      chunk-aligned authenticated range-read substrate
+      ADR 044 / 056 surfaces.
+    - **L1 inline erasure coding** *(brainstorm 003.)*
+      Reed-Solomon / Cauchy across L1 NVMe replicas;
+      composes with the LSM-tier sweeper boundary
+      (ADR 055 §"No StorageTier on the substrate").
+    *Each is its own ADR; ordering opportunistic and
+    independent of #13 / #14 sequencing.*
+
+16. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+    deferred behind the storage hierarchy in the Toron-
+    pivot stretch. Independent; each ships its own
+    contract surface:
     - **PBC filter pushdown on subscriptions.** Trailing-
       section bytecode on `CDC_SUBSCRIBE_REQ`; new
       `CDC_WATERMARK` MsgType for low-selectivity streams
@@ -269,21 +348,18 @@ forward shape begins at #12.
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-13. **Vector embeddings + vector-form identity / locality
+17. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
-    substrate (#8) and LSM (#11). *Large, multi-ADR.*
+    substrate (#8) and LSM (#11). **Set aside in the
+    Toron-pivot stretch** — OLAP focus pulls
+    compute-adjacent primitives ahead. Reopen after the
+    storage hierarchy (ADR 056 / 057 / 058) is in
+    production use and Toron compute-layer requirements
+    surface concrete vector workload signals. *Large,
+    multi-ADR.*
 
-14. **Encoding, fetch, and distributed compute
-    refinements.** Bundle: LCE V2 / V3 (brainstorm 011 —
-    homerolled SIMD encodings, COCD); mini-page row-group
-    fetch (refines ADR 044 from buffer to row-group
-    level); per-buffer page directory; zstd capacity-tier
-    codec + `CompressionLevel` newtype; serverless PBC L2
-    (brainstorm 010); L1 inline erasure coding
-    (brainstorm 003). *Multi-quarter, several ADRs.*
-
-15. **Refinement plumbing (opportunistic, no ordering
+18. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -367,38 +443,68 @@ forward shape begins at #12.
   identity-axis cursor is the load-bearing decision; the
   safe-emission watermark plus heartbeat contract is what
   makes global cursor monotonicity work without it.
+- **Don't open ADR 057 (LCE V2) before ADR 056 Phase 10
+  bench data lands.** Encoding-cascade choice (RLE vs.
+  dict vs. bitpacked vs. FOR vs. dict+bitpacked, and
+  *which one per column*) and per-buffer page row-count
+  defaults depend on real workload signal — column
+  cardinality, value-distribution shape, selectivity
+  profile, observed compression delta from row-group
+  boundaries. Drafting V2 in advance of bench data either
+  stays so generic it restates ADR 056's
+  forward-compatibility section, or hardcodes
+  unvalidated assumptions about the workload. Wait for
+  the bench artifact, then open ADR 057 with numbers in
+  hand. Same rule applies (transitively) to ADR 058
+  (LCE V3 / COCD), which depends on ADR 057's encoding
+  cascades being concrete.
+- **Don't bundle ADR 056 / 057 / 058 into one mega-ADR.**
+  The storage hierarchy is a layered substrate by
+  design; each layer is a substantial decision in its
+  own right (V1 = row groups + stats; V2 = per-buffer
+  pages + encoding cascades + custom partial-buffer
+  materializer; V3 = compute over encoded data).
+  Bundling them defers each layer's review behind the
+  next, weakens the lockdown story (ADR 056's
+  V1-scoped guards depend on a clean V2 boundary), and
+  loses the Parquet / Vortex precedent of evolving
+  inner layers across multiple specs. Each layer ships
+  as its own ADR.
 
 ## Convergence summary
 
 ```text
-StateDigest substrate                         (ADR 046)
-  → tombstones (validate algebra @ deletion)  (ADR 047)
-  → retention (validate algebra @ compaction) (ADR 048)
+StateDigest substrate                            (ADR 046)
+  → tombstones (validate algebra @ deletion)     (ADR 047)
+  → retention (validate algebra @ compaction)    (ADR 048)
   → topology gate CLOSED — Outcome B (opaque NodeId)
-  → content-hash identity                     (ADR 049)
-  → PK-keyed row delete via supersession      (ADR 050)
-  → descriptor fingerprint split              (ADR 051)
-  → secondary indexes                         (ADR 052)
-  → wire-side Arrow IPC body compression      (ADR 053)
-  → CDC subscription substrate                (ADR 054)
-  → LSM-style leveled compaction substrate    (ADR 055)  ← here
-  → CDC follow-up ADRs (filters, triggers, webhooks, …)
-  → vector embeddings
-  → encoding / fetch / distributed compute
+  → content-hash identity                        (ADR 049)
+  → PK-keyed row delete via supersession         (ADR 050)
+  → descriptor fingerprint split                 (ADR 051)
+  → secondary indexes                            (ADR 052)
+  → wire-side Arrow IPC body compression         (ADR 053)
+  → CDC subscription substrate                   (ADR 054)
+  → LSM-style leveled compaction substrate       (ADR 055)
+  → row-group fetch + page directory             (ADR 056)  ← here
+  → per-buffer pages + LCE encoding cascades     (ADR 057, post-056-bench)
+  → compute over encoded data (COCD)             (ADR 058, post-057-impl)
+  → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
+  → CDC follow-up ADRs (deferred this stretch)
+  → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is past ADR 055 with the LSM compaction
-substrate *promoted* (design accepted; implementation
-phases pending). The post-CDC / post-LSM cluster (#12)
-is opportunistic — a CDC consumer ADR (filters,
-triggers, webhooks, durable cursor commit, multi-table
-firehose, before-images, event-history digest) can land
-in any order, since each consumes the ADR 054 substrate
-independently and none blocks the others on shape. The
-council's lean on next pickup: a CDC consumer ADR if
-the team has bandwidth for surface design (each is
-independently scoped); vector embeddings (#13) if the
-team prefers to settle the next large algebraic
-substrate (ANN as a sidecar family on top of #8 and
-#11) before the CDC consumer cluster.
+Design tip is past ADR 055 (promoted, implementation
+phases pending) with ADR 056 council-converged and
+staged for promotion. The Toron-pivot stretch turns
+toward storage-hierarchy build-out: ADR 056 → ADR 057
+→ ADR 058, opening each only after the previous one's
+implementation lands and produces bench evidence.
+**The council's lean on next pickup:** commit ADR 056
+and execute its 11-phase implementation plan, with
+Phase 10 bench output as the gate that opens both
+ADR 056 promotion-to-shipped and ADR 057 (LCE V2)
+drafting. CDC follow-ups (#16) and vector embeddings
+(#17) are deliberately behind the storage hierarchy
+in this stretch — they remain real work, but the
+Toron pivot pulls compute-adjacent primitives ahead.
