@@ -95,6 +95,7 @@ use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
+use crate::storage::row_group::{L2RowGroupFetchConfig, RowGroupWriterConfig};
 use crate::storage::{
 	DEFAULT_CDC_LOCALITY_HEARTBEAT_INTERVAL_MILLIS, GroupCommitConfig, L2ColumnFetchConfig,
 	LsmCompactionDriver, LsmCompactionService, LsmCompactionServiceControl, LsmCompactionWorker,
@@ -205,6 +206,10 @@ pub struct NodeBootstrapConfig {
 	pub rehydration: RehydrationPolicy,
 	/// Node-local ADR 044 L2 columnar fetch strategy config.
 	pub l2_column_fetch: L2ColumnFetchConfig,
+	/// Deployment-wide ADR 056 row-group writer config.
+	pub row_group_writer: RowGroupWriterConfig,
+	/// Node-local ADR 056 L2 row-group fetch strategy config.
+	pub l2_row_group_fetch: L2RowGroupFetchConfig,
 	/// Root KEK provider used to wrap and unwrap tenant KEKs.
 	pub root_kek_provider: RootKekProviderConfig,
 	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
@@ -265,6 +270,8 @@ impl NodeBootstrapConfig {
 			lsm_compaction_paused: false,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: L2ColumnFetchConfig::default(),
+			row_group_writer: RowGroupWriterConfig::default(),
+			l2_row_group_fetch: L2RowGroupFetchConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
@@ -389,6 +396,8 @@ impl NodeBootstrapConfig {
 		}
 		self.rehydration.validate()?;
 		self.l2_column_fetch.validate()?;
+		self.row_group_writer.validate()?;
+		self.l2_row_group_fetch.validate()?;
 		if let Some(l2) = &self.l2 {
 			l2.build()?;
 			if self.tiering.scan_interval.is_zero() {
@@ -1287,6 +1296,8 @@ impl WendelonNode {
 				l2,
 				rehydration: cfg.rehydration.clone(),
 				l2_column_fetch: cfg.l2_column_fetch.clone(),
+				row_group_writer: cfg.row_group_writer.clone(),
+				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
 				group_commit: cfg.group_commit.clone(),
 				crypto: crypto.clone(),
 			})

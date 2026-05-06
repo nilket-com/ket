@@ -103,7 +103,7 @@ use crate::schema::{
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::columnar::{
-	ColumnFetchError, ColumnFetchRequirement, ProjectedRecordBatch,
+	ColumnFetchError, ColumnFetchRequirement, L2FetchStrategy, ProjectedRecordBatch,
 	analyze_aggregate_query_column_requirement, analyze_pbc_column_requirement,
 	execute_aggregate_projected_record_batch, execute_pbc_projected_record_batch,
 };
@@ -112,13 +112,14 @@ use crate::storage::manager::SlabManager;
 use crate::storage::multirow::{
 	MultiRowSourceRow, decode_batch, encode_batch, encode_batch_with_policy,
 	has_storage_synthetic_columns, materialize_record_location_batch,
-	pack_admitted_record_batch_by_bucket, pack_tombstone_multirow_source_rows_with_policy,
-	replace_storage_row_hlc_column, storage_index_entries_from_batch, storage_row_is_tombstone_at,
-	storage_row_table_object_id_at,
+	pack_admitted_record_batch_by_bucket_with_row_group_config,
+	pack_tombstone_multirow_source_rows_with_policy, replace_storage_row_hlc_column,
+	storage_index_entries_from_batch, storage_row_is_tombstone_at, storage_row_table_object_id_at,
 };
 use crate::storage::pk_delete::{
 	PkAdmissionOutcome, admit_pk_delete_row, admit_pk_write_row, row_visible_for_admission,
 };
+use crate::storage::row_group::RowGroupWriterConfig;
 use crate::storage::stats::{
 	COLUMN_STAT_HAS_MAX, COLUMN_STAT_HAS_MIN, COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED,
 	ColumnStatsBlockEntry, ColumnStatsPrune, ParsedColumnStatsBlock,
@@ -1475,6 +1476,77 @@ impl WendelonDataServer {
 				("value_hlc_node_id", json!(response.value_hlc.node_id)),
 			],
 		)
+	}
+
+	fn emit_row_group_fetch_sampled_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &QueryRequestMeta,
+		counters: &RowGroupFetchAuditCounters,
+	) -> std::io::Result<()> {
+		if !counters.used_row_group() {
+			return Ok(());
+		}
+		let event = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::RowGroupFetchSampled,
+			self.local_node,
+			"sampled row-group fetch",
+		)
+		.with_actor(actor)
+		.with_tenant(meta.tenant_id)
+		.with_parameters(vec![
+			("tier", json!("l2")),
+			("row_group_fetches", json!(counters.row_group_fetches)),
+			(
+				"columnar_buffer_fetches",
+				json!(counters.columnar_buffer_fetches),
+			),
+			("whole_record_fetches", json!(counters.whole_record_fetches)),
+			("fallback_fetches", json!(counters.fallback_fetches)),
+			("row_groups_fetched", json!(counters.row_groups_fetched)),
+			("row_groups_total", json!(counters.row_groups_total)),
+			(
+				"predicate_fetched_groups",
+				json!(counters.predicate_fetched_groups),
+			),
+			("dominant_strategy", json!(counters.dominant_strategy())),
+		]);
+		self.audit_sink.emit(event).map_err(|err| {
+			Error::other(format!("row-group fetch sampled audit emit failed: {err}"))
+		})
+	}
+
+	fn emit_row_group_invariant_audit_for_error(
+		&self,
+		actor: &ActorIdentity,
+		tenant_id: TenantId,
+		error: &Error,
+		context: &'static str,
+	) -> std::io::Result<()> {
+		let Some(violation_kind) = row_group_invariant_violation_kind(error) else {
+			return Ok(());
+		};
+		let event = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::RowGroupInvariantViolation,
+			self.local_node,
+			"row-group invariant violation",
+		)
+		.with_actor(actor)
+		.with_tenant(tenant_id)
+		.with_outcome(AuditOutcome::Denied)
+		.with_parameters(vec![
+			("tier", json!("l2")),
+			("context", json!(context)),
+			("violation_kind", json!(violation_kind)),
+			("error", json!(error.to_string())),
+		]);
+		self.audit_sink.emit(event).map_err(|err| {
+			Error::other(format!(
+				"row-group invariant violation audit emit failed: {err}"
+			))
+		})
 	}
 
 	fn emit_query_denied_audit(
@@ -3466,10 +3538,22 @@ impl WendelonDataServer {
 			expected_epoch = meta.expected_epoch,
 			consistency = meta.consistency.0,
 		);
-		let (resp_meta, arrow_bytes) = self
+		let (resp_meta, arrow_bytes) = match self
 			.execute_query_with_migration_merge(&meta, &bytecode)
 			.instrument(span)
-			.await?;
+			.await
+		{
+			Ok(result) => result,
+			Err(err) => {
+				self.emit_row_group_invariant_audit_for_error(
+					actor,
+					meta.tenant_id,
+					&err,
+					"query",
+				)?;
+				return Err(err);
+			}
+		};
 		self.emit_query_completion_audit(
 			actor,
 			&meta,
@@ -3504,12 +3588,29 @@ impl WendelonDataServer {
 			expected_epoch = meta.expected_epoch,
 			consistency = meta.consistency.0,
 		);
-		let plan = self
+		let plan = match self
 			.prepare_table_query_execution_plan_with_migration(&meta, &bytecode)
 			.instrument(span)
-			.await?;
+			.await
+		{
+			Ok(plan) => plan,
+			Err(err) => {
+				self.emit_row_group_invariant_audit_for_error(
+					actor,
+					meta.tenant_id,
+					&err,
+					"table_query",
+				)?;
+				return Err(err);
+			}
+		};
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 			self.emit_query_completion_audit(actor, &audit_meta, &plan.response, 0)?;
+			self.emit_row_group_fetch_sampled_audit(
+				actor,
+				&audit_meta,
+				&plan.row_group_fetch_audit,
+			)?;
 			return Ok(self.build_query_response_frame_with_type(
 				MsgType::TABLE_QUERY_RESP,
 				frame.header.stream_id,
@@ -3529,6 +3630,7 @@ impl WendelonDataServer {
 			..plan.response
 		};
 		self.emit_query_completion_audit(actor, &audit_meta, &response, arrow_bytes.len() as u64)?;
+		self.emit_row_group_fetch_sampled_audit(actor, &audit_meta, &plan.row_group_fetch_audit)?;
 		Ok(self.build_query_response_frame_with_type(
 			MsgType::TABLE_QUERY_RESP,
 			frame.header.stream_id,
@@ -3556,14 +3658,26 @@ impl WendelonDataServer {
 			consistency = request.consistency.0,
 			aggregate_count = request.aggregates.len(),
 		);
-		let response = if actor.role == ActorRole::DataNode {
+		let response_result = if actor.role == ActorRole::DataNode {
 			self.execute_aggregate_local(&request)
 				.instrument(span)
-				.await?
+				.await
 		} else {
 			self.execute_aggregate_with_migration_merge(&request)
 				.instrument(span)
-				.await?
+				.await
+		};
+		let response = match response_result {
+			Ok(response) => response,
+			Err(err) => {
+				self.emit_row_group_invariant_audit_for_error(
+					actor,
+					request.tenant_id,
+					&err,
+					"aggregate",
+				)?;
+				return Err(err);
+			}
 		};
 		let returned_bytes = response
 			.partials
@@ -4422,10 +4536,22 @@ impl WendelonDataServer {
 			expected_epoch = meta.expected_epoch,
 			consistency = meta.consistency.0,
 		);
-		let plan = self
+		let plan = match self
 			.prepare_query_execution_plan_with_migration(&meta, &bytecode)
 			.instrument(span)
-			.await?;
+			.await
+		{
+			Ok(plan) => plan,
+			Err(err) => {
+				self.emit_row_group_invariant_audit_for_error(
+					actor,
+					meta.tenant_id,
+					&err,
+					"query_stream",
+				)?;
+				return Err(err);
+			}
+		};
 
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 			self.emit_query_completion_audit(actor, &meta, &plan.response, 0)?;
@@ -9113,8 +9239,15 @@ impl WendelonDataServer {
 				Some(outcome.bifurcated)
 			})
 		} else {
-			bifurcate_table_write(&meta, &payload, &descriptor, writer_node_id, commit_hlc)
-				.map(Some)
+			bifurcate_table_write_with_row_group_config(
+				&meta,
+				&payload,
+				&descriptor,
+				writer_node_id,
+				commit_hlc,
+				self.slab.row_group_writer_config(),
+			)
+			.map(Some)
 		} {
 			Ok(bifurcated) => bifurcated,
 			Err(err) => {
@@ -9249,8 +9382,14 @@ impl WendelonDataServer {
 				}
 			}
 		}
-		let bifurcated =
-			bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)?;
+		let bifurcated = bifurcate_table_write_with_admission_and_row_group_config(
+			meta,
+			batch,
+			descriptor,
+			&admission,
+			row_hlc,
+			self.slab.row_group_writer_config(),
+		)?;
 		Ok(PrimaryKeyBifurcation {
 			bifurcated,
 			upsert_no_digest_add_rows,
@@ -9301,8 +9440,14 @@ impl WendelonDataServer {
 			});
 		}
 		if store_rows.len() == batch.num_rows() {
-			let bifurcated =
-				bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)?;
+			let bifurcated = bifurcate_table_write_with_admission_and_row_group_config(
+				meta,
+				batch,
+				descriptor,
+				&admission,
+				row_hlc,
+				self.slab.row_group_writer_config(),
+			)?;
 			return Ok(ContentHashBifurcation {
 				bifurcated: Some(bifurcated),
 				absorbed_rows: absorbed,
@@ -9322,12 +9467,13 @@ impl WendelonDataServer {
 				.map(|row| admission.localities[*row])
 				.collect(),
 		};
-		let bifurcated = bifurcate_table_write_with_admission(
+		let bifurcated = bifurcate_table_write_with_admission_and_row_group_config(
 			meta,
 			&filtered_batch,
 			descriptor,
 			&filtered_admission,
 			row_hlc,
+			self.slab.row_group_writer_config(),
 		)?;
 		Ok(ContentHashBifurcation {
 			bifurcated: Some(bifurcated),
@@ -10009,6 +10155,96 @@ struct QueryExecutionPlan {
 	deadline: Instant,
 	stats_explain: QueryStatsExplainCounters,
 	secondary_index_access_plan: Option<SecondaryIndexAccessPlan>,
+	row_group_fetch_audit: RowGroupFetchAuditCounters,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectedQueryLocationRead {
+	batch: RecordBatch,
+	row_group_fetch_audit: RowGroupFetchAuditCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RowGroupFetchAuditCounters {
+	row_group_fetches: u64,
+	columnar_buffer_fetches: u64,
+	whole_record_fetches: u64,
+	fallback_fetches: u64,
+	row_groups_fetched: u64,
+	row_groups_total: u64,
+	predicate_fetched_groups: u64,
+}
+
+impl RowGroupFetchAuditCounters {
+	fn from_l2_strategy(strategy: &L2FetchStrategy) -> Self {
+		let mut counters = Self::default();
+		counters.observe_l2_strategy(strategy);
+		counters
+	}
+
+	fn observe_l2_strategy(&mut self, strategy: &L2FetchStrategy) {
+		match strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				self.row_group_fetches = self.row_group_fetches.saturating_add(1);
+				self.row_groups_fetched = self
+					.row_groups_fetched
+					.saturating_add(plan.surviving_groups.len() as u64);
+				self.row_groups_total = self
+					.row_groups_total
+					.saturating_add(plan.directory.row_groups.len() as u64);
+				self.predicate_fetched_groups = self
+					.predicate_fetched_groups
+					.saturating_add(plan.predicate_fetched_groups.len() as u64);
+			}
+			L2FetchStrategy::Columnar(_) => {
+				self.columnar_buffer_fetches = self.columnar_buffer_fetches.saturating_add(1);
+			}
+			L2FetchStrategy::WholeRecord => {
+				self.whole_record_fetches = self.whole_record_fetches.saturating_add(1);
+			}
+			L2FetchStrategy::Fallback(_) => {
+				self.fallback_fetches = self.fallback_fetches.saturating_add(1);
+			}
+		}
+	}
+
+	fn merge(&mut self, other: Self) {
+		self.row_group_fetches = self
+			.row_group_fetches
+			.saturating_add(other.row_group_fetches);
+		self.columnar_buffer_fetches = self
+			.columnar_buffer_fetches
+			.saturating_add(other.columnar_buffer_fetches);
+		self.whole_record_fetches = self
+			.whole_record_fetches
+			.saturating_add(other.whole_record_fetches);
+		self.fallback_fetches = self.fallback_fetches.saturating_add(other.fallback_fetches);
+		self.row_groups_fetched = self
+			.row_groups_fetched
+			.saturating_add(other.row_groups_fetched);
+		self.row_groups_total = self.row_groups_total.saturating_add(other.row_groups_total);
+		self.predicate_fetched_groups = self
+			.predicate_fetched_groups
+			.saturating_add(other.predicate_fetched_groups);
+	}
+
+	fn used_row_group(&self) -> bool {
+		self.row_group_fetches > 0
+	}
+
+	fn dominant_strategy(&self) -> &'static str {
+		let candidates = [
+			("row_group", self.row_group_fetches),
+			("columnar_buffer", self.columnar_buffer_fetches),
+			("whole_record", self.whole_record_fetches),
+			("fallback", self.fallback_fetches),
+		];
+		candidates
+			.into_iter()
+			.max_by_key(|(_, count)| *count)
+			.map(|(strategy, _)| strategy)
+			.unwrap_or("row_group")
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -10332,7 +10568,7 @@ async fn read_projected_query_location(
 	descriptor: &TableSchemaDescriptorV1,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
-) -> std::io::Result<Option<RecordBatch>> {
+) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
 	let Some(requirement) = projected_execution.requirement() else {
 		return Ok(None);
 	};
@@ -10346,7 +10582,7 @@ async fn read_projected_query_location(
 	// whole-record path that runs `table_record_matches_descriptor`.
 	let requirement = augment_requirement_for_descriptor_verification(requirement, descriptor);
 	let projected_read = match slab
-		.read_projected_record(location, descriptor, &requirement)
+		.read_projected_record(location, descriptor, &requirement, Some(program))
 		.await
 	{
 		Ok(Some(projected_read)) => projected_read,
@@ -10354,8 +10590,19 @@ async fn read_projected_query_location(
 		Err(err) if projected_query_can_use_whole_record_fallback(&err) => return Ok(None),
 		Err(err) => return Err(err),
 	};
-	let projected =
-		materialize_projected_location_batch(projected_read.projected, location.record_row_index)?;
+	let row_group_fetch_audit =
+		RowGroupFetchAuditCounters::from_l2_strategy(&projected_read.strategy);
+	if projected_read.projected.batch.num_rows() == 0 {
+		return Ok(Some(ProjectedQueryLocationRead {
+			batch: projected_read.projected.batch,
+			row_group_fetch_audit,
+		}));
+	}
+	let projected = materialize_projected_location_batch(
+		projected_read.projected,
+		projected_read.projected_first_record_row_index,
+		location.record_row_index,
+	)?;
 	if !projected_descriptor_match(descriptor, &projected)? {
 		return Ok(None);
 	}
@@ -10366,7 +10613,12 @@ async fn read_projected_query_location(
 			user_column_count,
 		} => {
 			execute_pbc_projected_record_batch(&projected, program, requirement, *user_column_count)
-				.map(Some)
+				.map(|batch| {
+					Some(ProjectedQueryLocationRead {
+						batch,
+						row_group_fetch_audit,
+					})
+				})
 		}
 		QueryProjectedExecution::Aggregate { .. } => Ok(None),
 	}
@@ -10382,7 +10634,7 @@ async fn read_aggregate_query_location(
 	program: &pbc::Program,
 	requirement: &ColumnFetchRequirement,
 	user_column_count: usize,
-) -> std::io::Result<Option<RecordBatch>> {
+) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
 	// ADR 045 §5 / Phase 8.5: ensure descriptor-filtered AppendOnly
 	// queries fetch `__row_table_object_id__` so the projected fast
 	// path can verify the row's table-isolation binding. See
@@ -10390,12 +10642,21 @@ async fn read_aggregate_query_location(
 	let augmented_requirement =
 		augment_requirement_for_descriptor_verification(requirement, descriptor);
 	match slab
-		.read_projected_record(location, descriptor, &augmented_requirement)
+		.read_projected_record(location, descriptor, &augmented_requirement, Some(program))
 		.await
 	{
 		Ok(Some(projected_read)) => {
+			let row_group_fetch_audit =
+				RowGroupFetchAuditCounters::from_l2_strategy(&projected_read.strategy);
+			if projected_read.projected.batch.num_rows() == 0 {
+				return Ok(Some(ProjectedQueryLocationRead {
+					batch: projected_read.projected.batch,
+					row_group_fetch_audit,
+				}));
+			}
 			let projected = materialize_projected_location_batch(
 				projected_read.projected,
+				projected_read.projected_first_record_row_index,
 				location.record_row_index,
 			)?;
 			if !projected_descriptor_match(descriptor, &projected)? {
@@ -10410,7 +10671,12 @@ async fn read_aggregate_query_location(
 					requirement,
 					user_column_count,
 				)
-				.map(Some);
+				.map(|batch| {
+					Some(ProjectedQueryLocationRead {
+						batch,
+						row_group_fetch_audit,
+					})
+				});
 			}
 		}
 		Ok(None) => {}
@@ -10455,7 +10721,12 @@ async fn read_aggregate_query_location(
 	)? {
 		return Ok(None);
 	}
-	execute_aggregate_full_record_batch(&batch, program, requirement).map(Some)
+	execute_aggregate_full_record_batch(&batch, program, requirement).map(|batch| {
+		Some(ProjectedQueryLocationRead {
+			batch,
+			row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
+		})
+	})
 }
 
 fn execute_aggregate_full_record_batch(
@@ -10479,6 +10750,14 @@ fn projected_query_can_use_whole_record_fallback(error: &Error) -> bool {
 				ColumnFetchError::SchemaMismatch { .. } | ColumnFetchError::UnsupportedArrowLayout
 			)
 		})
+}
+
+fn row_group_invariant_violation_kind(error: &Error) -> Option<&'static str> {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<ColumnFetchError>())
+		.and_then(|error| error.row_group_reject_code())
+		.map(|code| code.as_str())
 }
 
 /// ADR 045 §5 / Phase 8.5 — return a `ColumnFetchRequirement`
@@ -10562,15 +10841,29 @@ fn projected_descriptor_match(
 
 fn materialize_projected_location_batch(
 	projected: ProjectedRecordBatch,
+	projected_first_record_row_index: RecordRowIndex,
 	record_row_index: RecordRowIndex,
 ) -> std::io::Result<ProjectedRecordBatch> {
-	let row = record_row_index.get() as usize;
+	let row = record_row_index
+		.get()
+		.checked_sub(projected_first_record_row_index.get())
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"record row index {} precedes projected batch base {}",
+					record_row_index.get(),
+					projected_first_record_row_index.get()
+				),
+			)
+		})? as usize;
 	if row >= projected.batch.num_rows() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"record row index {} out of bounds for {}-row projected storage record",
-				row,
+				"record row index {} out of bounds for projected storage record base {} row_count {}",
+				record_row_index.get(),
+				projected_first_record_row_index.get(),
 				projected.batch.num_rows()
 			),
 		));
@@ -10932,6 +11225,7 @@ async fn plan_table_query_execution_by_secondary_index(
 		logical: 0,
 		node_id: 0,
 	};
+	let mut row_group_fetch_audit = RowGroupFetchAuditCounters::default();
 	let mut seen = BTreeSet::new();
 	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
 
@@ -10948,6 +11242,7 @@ async fn plan_table_query_execution_by_secondary_index(
 			SecondaryIndexState::Ready,
 		)
 		.await?;
+	let mut indexed_rows = Vec::new();
 	for row in &lookup.rows {
 		if logical_retention_floor.is_some_and(|floor| row.row_hlc < floor) {
 			metrics().observe_storage_table_retention_read_filtered_rows(1);
@@ -10972,17 +11267,19 @@ async fn plan_table_query_execution_by_secondary_index(
 		if !seen.insert(key) {
 			continue;
 		}
-		let Some(result) = read_secondary_index_query_location(
-			slab,
-			row,
-			table_descriptor,
-			program,
-			projected_execution,
-		)
-		.await?
-		else {
-			continue;
-		};
+		indexed_rows.push(row.clone());
+	}
+	for (row, result) in read_secondary_index_query_locations(
+		slab,
+		&indexed_rows,
+		table_descriptor,
+		program,
+		projected_execution,
+	)
+	.await?
+	{
+		row_group_fetch_audit.merge(result.row_group_fetch_audit);
+		let result = result.batch;
 		if result.num_rows() == 0 {
 			continue;
 		}
@@ -11070,6 +11367,8 @@ async fn plan_table_query_execution_by_secondary_index(
 			else {
 				continue;
 			};
+			row_group_fetch_audit.merge(result.row_group_fetch_audit);
+			let result = result.batch;
 			if result.num_rows() == 0 {
 				continue;
 			}
@@ -11099,6 +11398,7 @@ async fn plan_table_query_execution_by_secondary_index(
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.secondary_index_access_plan = Some(access_plan.clone());
+		plan.row_group_fetch_audit = row_group_fetch_audit;
 		return Ok(plan);
 	}
 
@@ -11117,6 +11417,7 @@ async fn plan_table_query_execution_by_secondary_index(
 		deadline,
 		stats_explain: stats_prune_cache.explain,
 		secondary_index_access_plan: Some(access_plan.clone()),
+		row_group_fetch_audit,
 	})
 }
 
@@ -11134,13 +11435,305 @@ fn secondary_index_result_key(
 	)
 }
 
+fn secondary_index_record_fetch_key(location: RecordLocation) -> (SlabId, u64, u32, bool) {
+	(
+		location.slab_id,
+		location.offset,
+		location.length,
+		location.is_tombstone,
+	)
+}
+
+async fn read_secondary_index_query_locations(
+	slab: &SlabManager,
+	rows: &[SecondaryIndexLookupRow],
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
+	let Some(requirement) = projected_execution.requirement() else {
+		return read_secondary_index_query_locations_one_by_one(
+			slab,
+			rows,
+			descriptor,
+			program,
+			projected_execution,
+		)
+		.await;
+	};
+	let augmented_requirement =
+		augment_requirement_for_descriptor_verification(requirement, descriptor);
+	let mut group_order = Vec::new();
+	let mut groups: HashMap<(SlabId, u64, u32, bool), Vec<usize>> = HashMap::new();
+	for (index, row) in rows.iter().enumerate() {
+		let key = secondary_index_record_fetch_key(row.record_location);
+		if !groups.contains_key(&key) {
+			group_order.push(key);
+		}
+		groups.entry(key).or_default().push(index);
+	}
+
+	let group_inputs = group_order
+		.into_iter()
+		.map(|key| groups.remove(&key).unwrap_or_default())
+		.collect::<Vec<_>>();
+	let max_parallel = slab.row_group_fetch_parallelism().clamp(1, 4);
+	let mut out = Vec::new();
+	for chunk in group_inputs.chunks(max_parallel) {
+		match chunk.len() {
+			0 => {}
+			1 => out.extend(
+				read_secondary_index_query_location_group(
+					slab,
+					rows,
+					&chunk[0],
+					descriptor,
+					program,
+					projected_execution,
+					&augmented_requirement,
+				)
+				.await?,
+			),
+			2 => {
+				let (a, b) = tokio::join!(
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[0],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[1],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					)
+				);
+				out.extend(a?);
+				out.extend(b?);
+			}
+			3 => {
+				let (a, b, c) = tokio::join!(
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[0],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[1],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[2],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					)
+				);
+				out.extend(a?);
+				out.extend(b?);
+				out.extend(c?);
+			}
+			_ => {
+				let (a, b, c, d) = tokio::join!(
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[0],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[1],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[2],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					),
+					read_secondary_index_query_location_group(
+						slab,
+						rows,
+						&chunk[3],
+						descriptor,
+						program,
+						projected_execution,
+						&augmented_requirement,
+					)
+				);
+				out.extend(a?);
+				out.extend(b?);
+				out.extend(c?);
+				out.extend(d?);
+			}
+		}
+	}
+	Ok(out)
+}
+
+async fn read_secondary_index_query_location_group(
+	slab: &SlabManager,
+	rows: &[SecondaryIndexLookupRow],
+	indices: &[usize],
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+	augmented_requirement: &ColumnFetchRequirement,
+) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
+	let locations = indices
+		.iter()
+		.map(|index| rows[*index].record_location)
+		.collect::<Vec<_>>();
+	match slab
+		.read_projected_indexed_rows(&locations, descriptor, augmented_requirement)
+		.await
+	{
+		Ok(Some(projected_read)) => {
+			if projected_read.projected.batch.num_rows() != indices.len() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"projected indexed row fetch returned {} rows for {} hits",
+						projected_read.projected.batch.num_rows(),
+						indices.len()
+					),
+				));
+			}
+			let mut out = Vec::new();
+			let mut audit = RowGroupFetchAuditCounters::from_l2_strategy(&projected_read.strategy);
+			for (position, index) in indices.iter().enumerate() {
+				let row = rows[*index].clone();
+				let projected = projected_read.projected.slice(position, 1);
+				let result = if projected_descriptor_match(descriptor, &projected)? {
+					execute_secondary_index_projected_row(projected, program, projected_execution)?
+				} else {
+					read_secondary_index_query_location(
+						slab,
+						&row,
+						descriptor,
+						program,
+						projected_execution,
+					)
+					.await?
+				};
+				if let Some(mut result) = result {
+					result.row_group_fetch_audit.merge(audit);
+					audit = RowGroupFetchAuditCounters::default();
+					out.push((row, result));
+				}
+			}
+			Ok(out)
+		}
+		Ok(None) => {
+			let fallback_rows = indices
+				.iter()
+				.map(|index| rows[*index].clone())
+				.collect::<Vec<_>>();
+			read_secondary_index_query_locations_one_by_one(
+				slab,
+				&fallback_rows,
+				descriptor,
+				program,
+				projected_execution,
+			)
+			.await
+		}
+		Err(err) if projected_query_can_use_whole_record_fallback(&err) => {
+			let fallback_rows = indices
+				.iter()
+				.map(|index| rows[*index].clone())
+				.collect::<Vec<_>>();
+			read_secondary_index_query_locations_one_by_one(
+				slab,
+				&fallback_rows,
+				descriptor,
+				program,
+				projected_execution,
+			)
+			.await
+		}
+		Err(err) => Err(err),
+	}
+}
+
+async fn read_secondary_index_query_locations_one_by_one(
+	slab: &SlabManager,
+	rows: &[SecondaryIndexLookupRow],
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
+	let mut out = Vec::new();
+	for row in rows {
+		if let Some(result) =
+			read_secondary_index_query_location(slab, row, descriptor, program, projected_execution)
+				.await?
+		{
+			out.push((row.clone(), result));
+		}
+	}
+	Ok(out)
+}
+
+fn execute_secondary_index_projected_row(
+	projected: ProjectedRecordBatch,
+	program: &pbc::Program,
+	projected_execution: &QueryProjectedExecution,
+) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
+	match projected_execution {
+		QueryProjectedExecution::Pbc {
+			requirement,
+			user_column_count,
+		} => {
+			execute_pbc_projected_record_batch(&projected, program, requirement, *user_column_count)
+				.map(|batch| {
+					Some(ProjectedQueryLocationRead {
+						batch,
+						row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
+					})
+				})
+		}
+		QueryProjectedExecution::Disabled | QueryProjectedExecution::Aggregate { .. } => Ok(None),
+	}
+}
+
 async fn read_secondary_index_query_location(
 	slab: &SlabManager,
 	row: &SecondaryIndexLookupRow,
 	descriptor: &TableSchemaDescriptorV1,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
-) -> std::io::Result<Option<RecordBatch>> {
+) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
 	if let Some(result) = read_projected_query_location(
 		slab,
 		row.record_location,
@@ -11157,7 +11750,10 @@ async fn read_secondary_index_query_location(
 	let batch =
 		materialize_record_location_batch(&storage_batch, row.record_location.record_row_index)?;
 	match pbc::execute_program(program, &batch) {
-		Ok(result) => Ok(Some(result)),
+		Ok(batch) => Ok(Some(ProjectedQueryLocationRead {
+			batch,
+			row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
+		})),
 		Err(_) => Err(Error::new(
 			ErrorKind::InvalidData,
 			"secondary index residual PBC evaluation failed",
@@ -11174,7 +11770,7 @@ async fn read_table_query_location(
 	descriptor: &TableSchemaDescriptorV1,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
-) -> std::io::Result<Option<RecordBatch>> {
+) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
 	if let Some(result) =
 		read_projected_query_location(slab, location, descriptor, program, projected_execution)
 			.await?
@@ -11215,7 +11811,10 @@ async fn read_table_query_location(
 		return Ok(None);
 	}
 	match pbc::execute_program(program, &batch) {
-		Ok(result) => Ok(Some(result)),
+		Ok(batch) => Ok(Some(ProjectedQueryLocationRead {
+			batch,
+			row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
+		})),
 		Err(_) => Ok(None),
 	}
 }
@@ -11247,6 +11846,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		logical: 0,
 		node_id: 0,
 	};
+	let mut row_group_fetch_audit = RowGroupFetchAuditCounters::default();
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
 	let mut rebatch_groups: Vec<RebatchGroup> = Vec::new();
 	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
@@ -11308,6 +11908,8 @@ async fn plan_query_execution_for_ranges_with_program(
 					)
 					.await?
 					{
+						row_group_fetch_audit.merge(result.row_group_fetch_audit);
+						let result = result.batch;
 						if result.num_rows() == 0 {
 							continue;
 						}
@@ -11336,6 +11938,8 @@ async fn plan_query_execution_for_ranges_with_program(
 				)
 				.await?
 				{
+					row_group_fetch_audit.merge(result.row_group_fetch_audit);
+					let result = result.batch;
 					if result.num_rows() == 0 {
 						continue;
 					}
@@ -11454,6 +12058,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	if batches.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		plan.stats_explain = stats_prune_cache.explain;
+		plan.row_group_fetch_audit = row_group_fetch_audit;
 		return Ok(plan);
 	}
 
@@ -11472,6 +12077,7 @@ async fn plan_query_execution_for_ranges_with_program(
 		deadline,
 		stats_explain: stats_prune_cache.explain,
 		secondary_index_access_plan: None,
+		row_group_fetch_audit,
 	})
 }
 
@@ -11665,6 +12271,7 @@ fn query_plan_error(
 		deadline: Instant::now(),
 		stats_explain: QueryStatsExplainCounters::default(),
 		secondary_index_access_plan: None,
+		row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
 	}
 }
 
@@ -13430,6 +14037,24 @@ fn bifurcate_table_write(
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
+	bifurcate_table_write_with_row_group_config(
+		meta,
+		batch,
+		descriptor,
+		writer_node_id,
+		row_hlc,
+		&RowGroupWriterConfig::default(),
+	)
+}
+
+fn bifurcate_table_write_with_row_group_config(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	writer_node_id: WriterNodeId,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
+) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let observe_encode = matches!(
 		&descriptor.locality_policy,
 		LocalityPolicyV1::ColumnProjection(_)
@@ -13441,15 +14066,41 @@ fn bifurcate_table_write(
 		metrics().observe_pbc_locality_encode(encode_started.elapsed());
 	}
 	let admission = admission?;
-	bifurcate_table_write_with_admission(meta, batch, descriptor, &admission, row_hlc)
+	bifurcate_table_write_with_admission_and_row_group_config(
+		meta,
+		batch,
+		descriptor,
+		&admission,
+		row_hlc,
+		row_group_config,
+	)
 }
 
+#[allow(dead_code)]
 fn bifurcate_table_write_with_admission(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
+) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
+	bifurcate_table_write_with_admission_and_row_group_config(
+		meta,
+		batch,
+		descriptor,
+		admission,
+		row_hlc,
+		&RowGroupWriterConfig::default(),
+	)
+}
+
+fn bifurcate_table_write_with_admission_and_row_group_config(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let mut children = Vec::with_capacity(batch.num_rows());
 	let mut charged_bytes = 0_u64;
@@ -13478,8 +14129,14 @@ fn bifurcate_table_write_with_admission(
 			}
 		}
 		RecordLayoutPolicy::MultiRow(_) => {
-			let packed =
-				pack_admitted_record_batch_by_bucket(meta, descriptor, batch, &admission, row_hlc)?;
+			let packed = pack_admitted_record_batch_by_bucket_with_row_group_config(
+				meta,
+				descriptor,
+				batch,
+				admission,
+				row_hlc,
+				row_group_config,
+			)?;
 			children.reserve(packed.len());
 			for record in packed {
 				let frame_bytes = Arc::new(record.frame_bytes);
@@ -14714,6 +15371,8 @@ mod tests {
 				l2: None,
 				rehydration: crate::storage::manager::RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14736,6 +15395,8 @@ mod tests {
 				l2: Some(l2),
 				rehydration,
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14762,6 +15423,8 @@ mod tests {
 					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
 					..Default::default()
 				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -21977,6 +22640,8 @@ mod tests {
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 					l2_column_fetch: Default::default(),
+					row_group_writer: Default::default(),
+					l2_row_group_fetch: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})
@@ -22017,6 +22682,8 @@ mod tests {
 					l2: None,
 					rehydration: crate::storage::manager::RehydrationPolicy::default(),
 					l2_column_fetch: Default::default(),
+					row_group_writer: Default::default(),
+					l2_row_group_fetch: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})
@@ -23178,6 +23845,48 @@ mod tests {
 			before_bytes,
 			"failed local-chain emission must reject the write before any payload bytes append"
 		);
+
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn row_group_corrupt_directory_error_emits_invariant_audit_event() {
+		let dir = bootstrap_tempdir("row-group-invariant-audit");
+		let audit_path = dir.join("audit.ndjson");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			35,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let error = Error::new(
+			ErrorKind::InvalidData,
+			crate::storage::columnar::ColumnFetchError::RowGroupRejected(
+				crate::storage::row_group::RowGroupRejectCode::PageDirectoryParseError,
+			),
+		);
+
+		node.data_server
+			.emit_row_group_invariant_audit_for_error(
+				&actor(ActorRole::Operator, None),
+				TenantId::new(35),
+				&error,
+				"corrupt_directory_read",
+			)
+			.unwrap();
+
+		let audit = wait_for_audit_log(
+			&audit_path,
+			&[
+				"\"event_type\":\"row_group.invariant_violation\"",
+				"\"tenant_id\":35",
+				"\"context\":\"corrupt_directory_read\"",
+				"\"violation_kind\":\"page_directory_parse_error\"",
+			],
+		)
+		.await;
+		assert!(audit.contains("\"outcome\":\"denied\""));
 
 		node.handles.abort();
 	}

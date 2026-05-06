@@ -65,23 +65,44 @@ pub fn encode_record_batch_bytes(
 	batch: &RecordBatch,
 	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<Vec<u8>> {
+	encode_record_batches_bytes(std::slice::from_ref(batch), policy)
+}
+
+pub fn encode_record_batches_bytes(
+	batches: &[RecordBatch],
+	policy: RecordBodyCompressionPolicy,
+) -> std::io::Result<Vec<u8>> {
+	let Some(first) = batches.first() else {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"arrow stream writer requires at least one record batch",
+		));
+	};
 	let options = ipc_write_options_for_policy(policy)?;
 	let mut buf = Vec::new();
 	{
 		let mut writer =
-			StreamWriter::try_new_with_options(&mut buf, batch.schema().as_ref(), options)
+			StreamWriter::try_new_with_options(&mut buf, first.schema().as_ref(), options)
 				.map_err(|err| {
 					Error::new(
 						ErrorKind::InvalidData,
 						format!("arrow stream init for {}: {err}", policy.codec_label()),
 					)
 				})?;
-		writer.write(batch).map_err(|err| {
-			Error::new(
-				ErrorKind::InvalidData,
-				format!("arrow stream write for {}: {err}", policy.codec_label()),
-			)
-		})?;
+		for batch in batches {
+			if batch.schema().as_ref() != first.schema().as_ref() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"arrow stream row groups must share one schema",
+				));
+			}
+			writer.write(batch).map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("arrow stream write for {}: {err}", policy.codec_label()),
+				)
+			})?;
+		}
 		writer.finish().map_err(|err| {
 			Error::new(
 				ErrorKind::InvalidData,

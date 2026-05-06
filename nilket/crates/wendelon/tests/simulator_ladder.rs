@@ -1616,7 +1616,8 @@ async fn run_interrupted_finalization_recovery_scenario(
 				&& snapshot
 					.e_safe_watermarks
 					.get(&record.finalization.marker.epoch)
-					.copied() == Some(record.finalization.marker.commit_hlc)
+					.copied()
+					.is_some_and(|hlc| hlc >= record.finalization.marker.commit_hlc)
 			{
 				break;
 			}

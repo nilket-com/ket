@@ -66,6 +66,7 @@ use crate::storage::columnar::{
 	decode_projected_record_batch, decode_projected_record_batch_from_plaintext_ranges,
 	initial_metadata_probe_plan, next_metadata_probe_plan, observe_l2_fetch_strategy,
 	parse_record_buffer_directory, pick_l2_fetch_strategy, selected_record_body_ranges,
+	survival_mask_projected_record_batch,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
@@ -80,9 +81,10 @@ use crate::storage::io_uring::IoRingHandle;
 use crate::storage::ipc::record_batch_compression_policy_from_ipc;
 use crate::storage::l2::ObjectStore;
 use crate::storage::multirow::{
-	MultiRowSourceRow, decode_batch as decode_record_batch, encode_batch_with_policy,
-	encode_multirow_from_survivors_with_policy, has_storage_synthetic_columns,
-	materialize_record_location_batch, pack_multirow_source_rows_with_policy,
+	MultiRowSourceRow, StorageRowMetadata, decode_batch as decode_record_batch,
+	encode_batch_with_policy, encode_multirow_from_survivors_with_policy,
+	encode_multirow_from_survivors_with_row_group_config, has_storage_synthetic_columns,
+	materialize_record_location_batch, pack_multirow_source_rows_with_policy_and_row_group_config,
 };
 use crate::storage::secondary_index::{
 	SecondaryIndexCandidateRejectReason, SecondaryIndexCandidateValidation, SecondaryIndexEntry,
@@ -114,6 +116,7 @@ use crate::storage::{
 	effective_table_retention, pick_compaction, required_output_run_count,
 	storage_row_table_object_id_at, survivor_records, write_file,
 };
+use arrow::array::Array;
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -186,6 +189,10 @@ pub struct SlabManagerConfig {
 	pub rehydration: RehydrationPolicy,
 	/// Node-local ADR 044 L2 columnar fetch strategy config.
 	pub l2_column_fetch: L2ColumnFetchConfig,
+	/// Deployment-wide ADR 056 row-group writer config.
+	pub row_group_writer: crate::storage::row_group::RowGroupWriterConfig,
+	/// Node-local ADR 056 L2 row-group fetch strategy config.
+	pub l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig,
 	/// ADR 016 data-path group-commit tuning.
 	pub group_commit: GroupCommitConfig,
 	/// ADR 022 slab-object encryption service used for L2 object bytes.
@@ -1123,6 +1130,8 @@ impl SlabManager {
 	pub async fn open(config: SlabManagerConfig) -> std::io::Result<Self> {
 		config.rehydration.validate()?;
 		config.l2_column_fetch.validate()?;
+		config.row_group_writer.validate()?;
+		config.l2_row_group_fetch.validate()?;
 		if !config.dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -6054,6 +6063,7 @@ enum SlabBacking {
 
 pub(crate) struct ProjectedL2RecordRead {
 	pub(crate) projected: ProjectedRecordBatch,
+	pub(crate) projected_first_record_row_index: RecordRowIndex,
 	#[allow(dead_code)]
 	pub(crate) strategy: L2FetchStrategy,
 }
@@ -6126,7 +6136,21 @@ impl StorageEngine for SlabManager {
 
 impl SlabManager {
 	pub(crate) fn l2_column_fetch_enabled(&self) -> bool {
-		self.config.l2_column_fetch.enabled
+		self.config.l2_column_fetch.enabled || self.config.l2_row_group_fetch.enabled
+	}
+
+	pub(crate) fn row_group_writer_config(
+		&self,
+	) -> &crate::storage::row_group::RowGroupWriterConfig {
+		&self.config.row_group_writer
+	}
+
+	pub(crate) fn row_group_fetch_parallelism(&self) -> usize {
+		self.config
+			.l2_row_group_fetch
+			.max_parallel_range_gets
+			.get()
+			.max(1) as usize
 	}
 
 	pub(crate) async fn read_projected_record(
@@ -6134,8 +6158,9 @@ impl SlabManager {
 		location: RecordLocation,
 		descriptor: &TableSchemaDescriptorV1,
 		requirement: &ColumnFetchRequirement,
+		predicate: Option<&crate::schema::pbc::Program>,
 	) -> std::io::Result<Option<ProjectedL2RecordRead>> {
-		if !self.config.l2_column_fetch.enabled {
+		if !self.config.l2_column_fetch.enabled && !self.config.l2_row_group_fetch.enabled {
 			return Ok(None);
 		}
 		let location = self.relocate_read_location(location);
@@ -6154,7 +6179,15 @@ impl SlabManager {
 				})?;
 				let started = Instant::now();
 				let result = self
-					.read_projected_record_from_l2(l2, &pointer, location, descriptor, requirement)
+					.read_projected_record_from_l2(
+						l2,
+						&pointer,
+						location,
+						descriptor,
+						requirement,
+						predicate,
+						None,
+					)
 					.await;
 				metrics()
 					.l2_range_read_latency_seconds
@@ -6164,6 +6197,76 @@ impl SlabManager {
 			SlabBacking::Missing => Err(Error::new(
 				ErrorKind::NotFound,
 				format!("no slab with id {} under this manager", location.slab_id),
+			)),
+		}
+	}
+
+	pub(crate) async fn read_projected_indexed_rows(
+		&self,
+		locations: &[RecordLocation],
+		descriptor: &TableSchemaDescriptorV1,
+		requirement: &ColumnFetchRequirement,
+	) -> std::io::Result<Option<ProjectedL2RecordRead>> {
+		if locations.is_empty()
+			|| (!self.config.l2_column_fetch.enabled && !self.config.l2_row_group_fetch.enabled)
+		{
+			return Ok(None);
+		}
+		let relocated = locations
+			.iter()
+			.map(|location| self.relocate_read_location(*location))
+			.collect::<Vec<_>>();
+		let first = relocated[0];
+		for location in &relocated {
+			if indexed_record_fetch_key(*location) != indexed_record_fetch_key(first) {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"projected indexed row fetch requires one physical record",
+				));
+			}
+		}
+		let _pin = self.pin_lsm_read_location(first)?;
+		match self.resolve_backing(first.slab_id).await {
+			SlabBacking::Local(_) => Ok(None),
+			SlabBacking::L2(pointer) => {
+				let l2 = self.config.l2.as_ref().cloned().ok_or_else(|| {
+					Error::new(
+						ErrorKind::NotFound,
+						format!(
+							"slab {} is tiered but no L2 object store is configured",
+							first.slab_id
+						),
+					)
+				})?;
+				let started = Instant::now();
+				let record_rows = relocated
+					.iter()
+					.map(|location| location.record_row_index)
+					.collect::<Vec<_>>();
+				let read = self
+					.read_projected_record_from_l2(
+						l2,
+						&pointer,
+						first,
+						descriptor,
+						requirement,
+						None,
+						Some(&record_rows),
+					)
+					.await?;
+				metrics()
+					.l2_range_read_latency_seconds
+					.observe_duration(started.elapsed());
+				let projected = take_projected_indexed_rows(&read, &record_rows)?;
+				Ok(Some(ProjectedL2RecordRead {
+					projected,
+					projected_first_record_row_index: RecordRowIndex::ZERO,
+					strategy: read.strategy,
+				}))
+			}
+			SlabBacking::Missing => Err(Error::new(
+				ErrorKind::NotFound,
+				format!("slab {} is not available for read", first.slab_id),
 			)),
 		}
 	}
@@ -6715,7 +6818,13 @@ impl SlabManager {
 				};
 				let frame =
 					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
-				let Some(compacted) = compact_physical_record_frame(frame.as_ref(), group)? else {
+				let Some(compacted) = compact_physical_record_frame(
+					frame.as_ref(),
+					group,
+					Some(table_schemas),
+					&self.config.row_group_writer,
+				)?
+				else {
 					continue;
 				};
 				if compacted.was_multirow {
@@ -6853,7 +6962,13 @@ impl SlabManager {
 				};
 				let frame =
 					Zeroizing::new(extract_record_from_blob(&plaintext, first.old_location)?);
-				let Some(compacted) = compact_physical_record_frame(frame.as_ref(), group)? else {
+				let Some(compacted) = compact_physical_record_frame(
+					frame.as_ref(),
+					group,
+					Some(table_schemas),
+					&self.config.row_group_writer,
+				)?
+				else {
 					continue;
 				};
 				if compacted.was_multirow {
@@ -7214,7 +7329,12 @@ impl SlabManager {
 					..*record
 				})
 				.collect::<Vec<_>>();
-			if let Some(compacted) = compact_physical_record_frame(&plan.frame, &partial)? {
+			if let Some(compacted) = compact_physical_record_frame(
+				&plan.frame,
+				&partial,
+				None,
+				&self.config.row_group_writer,
+			)? {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
 				}
@@ -7285,11 +7405,13 @@ impl SlabManager {
 							table_object_id: table_object_id_stamp,
 						})
 						.collect::<Vec<_>>();
-					for packed in pack_multirow_source_rows_with_policy(
+					for packed in pack_multirow_source_rows_with_policy_and_row_group_config(
 						*layout,
 						&batch,
 						&source_rows,
+						Some(descriptor),
 						descriptor.record_body_compression_policy,
+						&self.config.row_group_writer,
 					)? {
 						let Some(primary) = packed.encoded.rows.first().copied() else {
 							return Err(Error::new(
@@ -7744,7 +7866,9 @@ impl SlabManager {
 				continue;
 			};
 			let frame = slab.read(first.old_location).await?;
-			let Some(compacted) = compact_physical_record_frame(&frame, group)? else {
+			let Some(compacted) =
+				compact_physical_record_frame(&frame, group, None, &self.config.row_group_writer)?
+			else {
 				continue;
 			};
 			if compacted.was_multirow {
@@ -8030,6 +8154,8 @@ impl SlabManager {
 		location: RecordLocation,
 		descriptor: &TableSchemaDescriptorV1,
 		requirement: &ColumnFetchRequirement,
+		predicate: Option<&crate::schema::pbc::Program>,
+		selected_record_rows: Option<&[RecordRowIndex]>,
 	) -> std::io::Result<ProjectedL2RecordRead> {
 		if !pointer.is_encrypted {
 			let plaintext = self
@@ -8045,6 +8171,7 @@ impl SlabManager {
 			)?;
 			return Ok(ProjectedL2RecordRead {
 				projected,
+				projected_first_record_row_index: RecordRowIndex::ZERO,
 				strategy: L2FetchStrategy::WholeRecord,
 			});
 		}
@@ -8081,7 +8208,8 @@ impl SlabManager {
 		if !matches!(
 			pre_probe,
 			L2FetchStrategy::Fallback(ColumnarFallbackReason::MetadataProbeCap)
-		) {
+		) && !self.config.l2_row_group_fetch.enabled
+		{
 			observe_l2_fetch_strategy(metrics(), &pre_probe, planning_started.elapsed());
 			let projected = self
 				.read_full_projected_record_from_l2(
@@ -8094,6 +8222,7 @@ impl SlabManager {
 				.await?;
 			return Ok(ProjectedL2RecordRead {
 				projected,
+				projected_first_record_row_index: RecordRowIndex::ZERO,
 				strategy: pre_probe,
 			});
 		}
@@ -8199,6 +8328,7 @@ impl SlabManager {
 								.await?;
 							return Ok(ProjectedL2RecordRead {
 								projected,
+								projected_first_record_row_index: RecordRowIndex::ZERO,
 								strategy,
 							});
 						}
@@ -8219,12 +8349,444 @@ impl SlabManager {
 						.await?;
 					return Ok(ProjectedL2RecordRead {
 						projected,
+						projected_first_record_row_index: RecordRowIndex::ZERO,
 						strategy,
 					});
 				}
 				Err(err) => return Err(columnar_io_error(err)),
 			}
 		};
+
+		if let Some(page_directory) = directory.page_directory.clone() {
+			if !self.config.l2_row_group_fetch.enabled {
+				let strategy = L2FetchStrategy::Fallback(ColumnarFallbackReason::Disabled);
+				observe_l2_row_group_fetch_strategy(
+					metrics(),
+					&strategy,
+					planning_started.elapsed(),
+				);
+				let projected = self
+					.read_full_projected_record_from_l2(
+						l2.as_ref(),
+						pointer,
+						location,
+						descriptor,
+						requirement,
+					)
+					.await?;
+				return Ok(ProjectedL2RecordRead {
+					projected,
+					projected_first_record_row_index: RecordRowIndex::ZERO,
+					strategy,
+				});
+			}
+			let Some(group) = crate::storage::row_group::row_group_for_record_row(
+				&page_directory,
+				location.record_row_index,
+			) else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"record row index {} is not covered by row-group directory",
+						location.record_row_index.get()
+					),
+				));
+			};
+			let selected_groups = match selected_record_rows {
+				Some(rows) if !rows.is_empty() => {
+					crate::storage::row_group::row_groups_for_record_rows(&page_directory, rows)?
+				}
+				_ => vec![group.row_group_index],
+			};
+			let point_read = selected_record_rows.is_none();
+			let mut predicate_fetched_groups = Vec::new();
+			let mut phase_b_fetch = None;
+			let mut phase_b_requirement_for_zip = ColumnFetchRequirement::default();
+			let mut phase_b_projected_by_group = HashMap::new();
+			let mut phase_b_outcome = crate::storage::row_group::PhaseBOutcome::default();
+			let mut selected_groups = selected_groups;
+			if let Some(predicate) = predicate {
+				let predicate_kind = crate::storage::row_group::classify_pbc_for_row_group_pruning(
+					predicate,
+					&directory.ipc_schema,
+				);
+				let classifications = crate::storage::row_group::classify_row_groups(
+					&page_directory,
+					&predicate_kind,
+					&self.config.l2_row_group_fetch,
+				)
+				.into_iter()
+				.collect::<HashMap<_, _>>();
+				selected_groups.retain(|group_index| {
+					classifications
+						.get(group_index)
+						.copied()
+						.unwrap_or(crate::storage::row_group::RowGroupClassification::Keep)
+						!= crate::storage::row_group::RowGroupClassification::Skip
+				});
+				predicate_fetched_groups = selected_groups
+					.iter()
+					.copied()
+					.filter(|group_index| {
+						classifications
+							.get(group_index)
+							.copied()
+							.unwrap_or(crate::storage::row_group::RowGroupClassification::Keep)
+							== crate::storage::row_group::RowGroupClassification::NeedsPredicateFetch
+					})
+					.collect();
+				if selected_groups.is_empty() {
+					let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
+						record_id: page_directory.record_id,
+						directory: page_directory.clone(),
+						surviving_groups: Vec::new(),
+						predicate_fetched_groups: Vec::new(),
+						phase_b_fetch: None,
+						phase_c_fetch: crate::storage::row_group::RowGroupRangeFetchPlan::default(),
+						logical_schema_fingerprint: page_directory.logical_schema_fingerprint,
+					};
+					let strategy = L2FetchStrategy::RowGroup(row_group_plan);
+					observe_l2_row_group_fetch_strategy(
+						metrics(),
+						&strategy,
+						planning_started.elapsed(),
+					);
+					let projected = crate::storage::row_group::materialize_row_groups_from_batches(
+						&[],
+						&page_directory,
+						requirement,
+						&[],
+					)?;
+					return Ok(ProjectedL2RecordRead {
+						projected,
+						projected_first_record_row_index: group.first_record_row_index,
+						strategy,
+					});
+				}
+				if !predicate_fetched_groups.is_empty() {
+					let phase_b_requirement = ColumnFetchRequirement {
+						predicate_columns: requirement.predicate_columns.clone(),
+						storage_columns: requirement.storage_columns.clone(),
+						..ColumnFetchRequirement::default()
+					};
+					if !phase_b_requirement.user_visible().is_empty()
+						|| !phase_b_requirement.storage_columns.is_empty()
+					{
+						let phase_b_body_byte_ranges =
+							crate::storage::row_group::selected_row_group_record_body_ranges(
+								&directory,
+								&page_directory,
+								&phase_b_requirement,
+								&selected_groups,
+							)
+							.map_err(columnar_io_error)?;
+						let phase_b_body_ranges = phase_b_body_byte_ranges
+							.iter()
+							.map(|range| TieredPlaintextRange::new(range.start, range.len))
+							.collect::<Vec<_>>();
+						let phase_b_record_ranges =
+							record_body_ranges_to_record_ranges(header_size, &phase_b_body_ranges)?;
+						let phase_b_tiered_plan = self.config.crypto.plan_tiered_multi_range_read(
+							pointer.slab_id,
+							metadata.size_bytes,
+							tail_window.as_ref(),
+							additional_metadata.as_deref(),
+							whole_record_range.clone(),
+							&phase_b_record_ranges,
+						)?;
+						phase_b_fetch = Some(
+							crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
+								&phase_b_tiered_plan,
+								&phase_b_body_byte_ranges,
+							),
+						);
+						let phase_b_ciphertext = fetch_tiered_ciphertext_runs(
+							l2.clone(),
+							pointer,
+							&phase_b_tiered_plan,
+							self.config.l2_row_group_fetch.max_parallel_range_gets.get() as usize,
+						)
+						.await?;
+						let phase_b_plaintext = phase_b_tiered_plan.decrypt(&phase_b_ciphertext)?;
+						let user_column_count = descriptor.arrow_schema()?.fields().len();
+						let predicate_fetched_set = predicate_fetched_groups
+							.iter()
+							.copied()
+							.collect::<BTreeSet<_>>();
+						for group_index in &selected_groups {
+							let phase_b_projected =
+							crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
+								&directory,
+								&page_directory,
+								&phase_b_requirement,
+								&phase_b_body_ranges,
+								&phase_b_plaintext,
+									&[*group_index],
+							)
+							.map_err(arrow_io_error)?;
+							if predicate_fetched_set.contains(group_index) {
+								let survival_mask = survival_mask_projected_record_batch(
+									&phase_b_projected,
+									predicate,
+									user_column_count,
+								)?;
+								phase_b_outcome
+									.decoded_predicate_batches
+									.insert(*group_index, phase_b_projected.batch.clone());
+								phase_b_outcome
+									.survival_masks
+									.insert(*group_index, survival_mask);
+							}
+							phase_b_projected_by_group.insert(*group_index, phase_b_projected);
+						}
+						if point_read && predicate_fetched_set.contains(&group.row_group_index) {
+							let survival_mask = phase_b_outcome
+								.survival_masks
+								.get(&group.row_group_index)
+								.ok_or_else(|| {
+									Error::new(
+										ErrorKind::InvalidData,
+										format!(
+											"Phase B survival mask missing for target row group {}",
+											group.row_group_index.get()
+										),
+									)
+								})?;
+							let row_offset = location
+								.record_row_index
+								.get()
+								.checked_sub(group.first_record_row_index.get())
+								.ok_or_else(|| {
+									Error::new(
+										ErrorKind::InvalidData,
+										format!(
+											"record row index {} precedes row group {} base {}",
+											location.record_row_index.get(),
+											group.row_group_index.get(),
+											group.first_record_row_index.get()
+										),
+									)
+								})? as usize;
+							if row_offset >= survival_mask.len() {
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									format!(
+										"record row index {} maps outside Phase B mask length {} for row group {}",
+										location.record_row_index.get(),
+										survival_mask.len(),
+										group.row_group_index.get()
+									),
+								));
+							}
+							if !survival_mask.is_valid(row_offset)
+								|| !survival_mask.value(row_offset)
+							{
+								let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
+									record_id: page_directory.record_id,
+									directory: page_directory.clone(),
+									surviving_groups: Vec::new(),
+									predicate_fetched_groups,
+									phase_b_fetch,
+									phase_c_fetch:
+										crate::storage::row_group::RowGroupRangeFetchPlan::default(),
+									logical_schema_fingerprint: page_directory
+										.logical_schema_fingerprint,
+								};
+								let strategy = L2FetchStrategy::RowGroup(row_group_plan);
+								observe_l2_row_group_fetch_strategy(
+									metrics(),
+									&strategy,
+									planning_started.elapsed(),
+								);
+								let projected =
+									crate::storage::row_group::materialize_row_groups_from_batches(
+										&[],
+										&page_directory,
+										requirement,
+										&[],
+									)?;
+								return Ok(ProjectedL2RecordRead {
+									projected,
+									projected_first_record_row_index: group.first_record_row_index,
+									strategy,
+								});
+							}
+						}
+						phase_b_requirement_for_zip = phase_b_requirement;
+					}
+				}
+			}
+			let phase_c_requirement = if phase_b_fetch.is_some() {
+				requirement.excluding(&phase_b_requirement_for_zip)
+			} else {
+				requirement.clone()
+			};
+			let phase_c_requirement_empty = phase_c_requirement.user_visible().is_empty()
+				&& phase_c_requirement.storage_columns.is_empty();
+			let selected_body_byte_ranges = if phase_c_requirement_empty {
+				Vec::new()
+			} else {
+				crate::storage::row_group::selected_row_group_record_body_ranges(
+					&directory,
+					&page_directory,
+					&phase_c_requirement,
+					&selected_groups,
+				)
+				.map_err(columnar_io_error)?
+			};
+			let selected_body_ranges = selected_body_byte_ranges
+				.iter()
+				.map(|range| TieredPlaintextRange::new(range.start, range.len))
+				.collect::<Vec<_>>();
+			let selected_record_ranges =
+				record_body_ranges_to_record_ranges(header_size, &selected_body_ranges)?;
+			let tiered_plan = self.config.crypto.plan_tiered_multi_range_read(
+				pointer.slab_id,
+				metadata.size_bytes,
+				tail_window.as_ref(),
+				additional_metadata.as_deref(),
+				whole_record_range.clone(),
+				&selected_record_ranges,
+			)?;
+			let phase_c_fetch = crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
+				&tiered_plan,
+				&selected_body_byte_ranges,
+			);
+			let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
+				record_id: page_directory.record_id,
+				directory: page_directory.clone(),
+				surviving_groups: selected_groups.to_vec(),
+				predicate_fetched_groups,
+				phase_b_fetch,
+				phase_c_fetch,
+				logical_schema_fingerprint: page_directory.logical_schema_fingerprint,
+			};
+			let strategy = pick_point_row_group_fetch_strategy(
+				&self.config.l2_row_group_fetch,
+				&body_location,
+				&page_directory,
+				row_group_plan,
+			);
+			observe_l2_row_group_fetch_strategy(metrics(), &strategy, planning_started.elapsed());
+			let L2FetchStrategy::RowGroup(row_group_plan) = strategy else {
+				let projected = self
+					.read_full_projected_record_from_l2(
+						l2.as_ref(),
+						pointer,
+						location,
+						descriptor,
+						requirement,
+					)
+					.await?;
+				return Ok(ProjectedL2RecordRead {
+					projected,
+					projected_first_record_row_index: RecordRowIndex::ZERO,
+					strategy,
+				});
+			};
+			let projected = if phase_b_projected_by_group.is_empty() {
+				if phase_c_requirement_empty {
+					crate::storage::row_group::empty_projected_row_group(
+						group.row_count.get() as usize
+					)?
+				} else {
+					let ciphertext_runs = fetch_tiered_ciphertext_runs(
+						l2,
+						pointer,
+						&tiered_plan,
+						self.config.l2_row_group_fetch.max_parallel_range_gets.get() as usize,
+					)
+					.await?;
+					let plaintext_extracts = tiered_plan.decrypt(&ciphertext_runs)?;
+					crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
+						&directory,
+						&page_directory,
+						&phase_c_requirement,
+						&selected_body_ranges,
+						&plaintext_extracts,
+						&selected_groups,
+					)
+					.map_err(arrow_io_error)?
+				}
+			} else {
+				let plaintext_extracts = if phase_c_requirement_empty {
+					Vec::new()
+				} else {
+					let ciphertext_runs = fetch_tiered_ciphertext_runs(
+						l2,
+						pointer,
+						&tiered_plan,
+						self.config.l2_row_group_fetch.max_parallel_range_gets.get() as usize,
+					)
+					.await?;
+					tiered_plan.decrypt(&ciphertext_runs)?
+				};
+				let mut projected_groups = Vec::new();
+				for group_index in &selected_groups {
+					let group_entry = page_directory
+						.row_groups
+						.iter()
+						.find(|candidate| candidate.row_group_index == *group_index)
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								format!(
+									"selected row group {} missing from page directory",
+									group_index.get()
+								),
+							)
+						})?;
+					let phase_c_projected = if phase_c_requirement_empty {
+						crate::storage::row_group::empty_projected_row_group(
+							group_entry.row_count.get() as usize,
+						)?
+					} else {
+						crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
+							&directory,
+							&page_directory,
+							&phase_c_requirement,
+							&selected_body_ranges,
+							&plaintext_extracts,
+							&[*group_index],
+						)
+						.map_err(arrow_io_error)?
+					};
+					let Some(phase_b_projected) = phase_b_projected_by_group.get(group_index)
+					else {
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"Phase B projected batch missing for selected row group {}",
+								group_index.get()
+							),
+						));
+					};
+					let zipped =
+						crate::storage::row_group::zip_phase_b_and_phase_c_projected_row_group(
+							phase_b_projected,
+							&phase_c_projected,
+							requirement,
+						)?;
+					projected_groups.push((*group_index, zipped));
+				}
+				let mask_groups = if point_read {
+					&[][..]
+				} else {
+					row_group_plan.predicate_fetched_groups.as_slice()
+				};
+				crate::storage::row_group::apply_phase_b_masks_to_projected_row_groups(
+					projected_groups,
+					&phase_b_outcome,
+					mask_groups,
+					&page_directory,
+				)?
+			};
+			return Ok(ProjectedL2RecordRead {
+				projected,
+				projected_first_record_row_index: group.first_record_row_index,
+				strategy: L2FetchStrategy::RowGroup(row_group_plan),
+			});
+		}
 
 		let selected_body_ranges =
 			selected_record_body_ranges(&directory, requirement).map_err(columnar_io_error)?;
@@ -8265,6 +8827,7 @@ impl SlabManager {
 				.await?;
 			return Ok(ProjectedL2RecordRead {
 				projected,
+				projected_first_record_row_index: RecordRowIndex::ZERO,
 				strategy,
 			});
 		}
@@ -8286,6 +8849,7 @@ impl SlabManager {
 		.map_err(arrow_io_error)?;
 		Ok(ProjectedL2RecordRead {
 			projected,
+			projected_first_record_row_index: RecordRowIndex::ZERO,
 			strategy,
 		})
 	}
@@ -8696,7 +9260,116 @@ fn decode_full_projected_l2_record(
 		descriptor,
 	)
 	.map_err(columnar_io_error)?;
+	if directory.page_directory.is_some() {
+		let batch = crate::storage::multirow::decode_batch(frame)?;
+		return crate::storage::row_group::project_record_batch_for_requirement(
+			&batch,
+			requirement,
+		);
+	}
 	decode_projected_record_batch(frame, &directory, requirement).map_err(arrow_io_error)
+}
+
+fn indexed_record_fetch_key(location: RecordLocation) -> (SlabId, u64, u32, bool) {
+	(
+		location.slab_id,
+		location.offset,
+		location.length,
+		location.is_tombstone,
+	)
+}
+
+fn take_projected_indexed_rows(
+	read: &ProjectedL2RecordRead,
+	record_rows: &[RecordRowIndex],
+) -> std::io::Result<ProjectedRecordBatch> {
+	if record_rows.is_empty() {
+		return read.projected.take_rows(&[]);
+	}
+	if let L2FetchStrategy::RowGroup(plan) = &read.strategy {
+		if plan.surviving_groups.is_empty() {
+			return Ok(read.projected.slice(0, 0));
+		}
+		let mut group_offsets = HashMap::new();
+		let mut projected_offset = 0usize;
+		for group_index in &plan.surviving_groups {
+			let group = plan
+				.directory
+				.row_groups
+				.iter()
+				.find(|group| group.row_group_index == *group_index)
+				.copied()
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"row-group strategy selected missing group {}",
+							group_index.get()
+						),
+					)
+				})?;
+			group_offsets.insert(*group_index, (projected_offset, group));
+			projected_offset = projected_offset.saturating_add(group.row_count.get() as usize);
+		}
+		let mut offsets = Vec::with_capacity(record_rows.len());
+		for row in record_rows {
+			let group = crate::storage::row_group::row_group_for_record_row(&plan.directory, *row)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"indexed record row {} is not covered by row-group directory",
+							row.get()
+						),
+					)
+				})?;
+			let Some((base_offset, selected_group)) = group_offsets.get(&group.row_group_index)
+			else {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"indexed record row {} maps to row group {} that was not fetched",
+						row.get(),
+						group.row_group_index.get()
+					),
+				));
+			};
+			let within_group = row
+				.get()
+				.checked_sub(selected_group.first_record_row_index.get())
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"indexed record row {} precedes row group {} base {}",
+							row.get(),
+							selected_group.row_group_index.get(),
+							selected_group.first_record_row_index.get()
+						),
+					)
+				})? as usize;
+			offsets.push(base_offset.saturating_add(within_group));
+		}
+		return read.projected.take_rows(&offsets);
+	}
+	let base = read.projected_first_record_row_index.get();
+	let offsets = record_rows
+		.iter()
+		.map(|row| {
+			row.get().checked_sub(base).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"indexed record row {} precedes projected base {}",
+						row.get(),
+						base
+					),
+				)
+			})
+		})
+		.map(|result| result.map(|offset| offset as usize))
+		.collect::<std::io::Result<Vec<_>>>()?;
+	read.projected.take_rows(&offsets)
 }
 
 fn record_body_location(location: RecordLocation) -> std::io::Result<RecordLocation> {
@@ -8772,6 +9445,131 @@ fn record_body_ranges_to_record_ranges(
 			))
 		})
 		.collect()
+}
+
+fn pick_point_row_group_fetch_strategy(
+	config: &crate::storage::row_group::L2RowGroupFetchConfig,
+	record_location: &RecordLocation,
+	page_directory: &crate::storage::row_group::RecordPageDirectory,
+	plan: crate::storage::row_group::RowGroupFetchPlan,
+) -> L2FetchStrategy {
+	if !config.enabled {
+		return L2FetchStrategy::Fallback(ColumnarFallbackReason::Disabled);
+	}
+	if plan.surviving_groups.is_empty() {
+		return L2FetchStrategy::RowGroup(plan);
+	}
+	let selected_group_scaled = (plan.surviving_groups.len() as u64).saturating_mul(u64::from(
+		crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR,
+	));
+	let allowed_group_scaled = (page_directory.row_groups.len() as u64)
+		.saturating_mul(u64::from(config.max_selected_row_group_fraction_micros));
+	if selected_group_scaled > allowed_group_scaled {
+		return L2FetchStrategy::Fallback(ColumnarFallbackReason::TooManyRowGroups);
+	}
+	let selected_ciphertext_bytes = plan
+		.phase_b_fetch
+		.as_ref()
+		.map(|phase_b| phase_b.fetched_ciphertext_bytes)
+		.unwrap_or(0)
+		.saturating_add(plan.phase_c_fetch.fetched_ciphertext_bytes);
+	let selected_byte_scaled = selected_ciphertext_bytes.saturating_mul(u64::from(
+		crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR,
+	));
+	let allowed_byte_scaled = u64::from(record_location.length)
+		.saturating_mul(u64::from(config.max_selected_byte_fraction_micros));
+	if selected_byte_scaled > allowed_byte_scaled {
+		return L2FetchStrategy::Fallback(ColumnarFallbackReason::TooManyBytes);
+	}
+	let selected_ranges = plan
+		.phase_b_fetch
+		.as_ref()
+		.map(|phase_b| phase_b.chunk_runs.len())
+		.unwrap_or(0)
+		.saturating_add(plan.phase_c_fetch.chunk_runs.len());
+	if selected_ranges > config.max_ranges_per_record.get() as usize {
+		return L2FetchStrategy::Fallback(ColumnarFallbackReason::TooManyRanges);
+	}
+	L2FetchStrategy::RowGroup(plan)
+}
+
+fn observe_l2_row_group_fetch_strategy(
+	metrics: &crate::metrics::MetricsRegistry,
+	strategy: &L2FetchStrategy,
+	planning_duration: Duration,
+) {
+	metrics.observe_storage_l2_row_group_fetch_plan(planning_duration);
+	match strategy {
+		L2FetchStrategy::RowGroup(plan) => {
+			metrics.observe_storage_l2_row_group_fetch_request("row_group");
+			let kept = plan.surviving_groups.len() as u64;
+			let total = plan.directory.row_groups.len() as u64;
+			if kept == 0 {
+				metrics.observe_storage_l2_row_group_fetch_row_groups("no_survivors", total);
+			} else {
+				metrics.observe_storage_l2_row_group_fetch_row_groups("keep", kept);
+				metrics.observe_storage_l2_row_group_fetch_row_groups(
+					"predicate_fetch",
+					plan.predicate_fetched_groups.len() as u64,
+				);
+				metrics.observe_storage_l2_row_group_fetch_row_groups(
+					"skip",
+					total.saturating_sub(kept),
+				);
+			}
+			metrics.observe_storage_l2_row_group_fetch_bytes(
+				"phase_b",
+				plan.phase_b_fetch
+					.as_ref()
+					.map(|phase_b| phase_b.fetched_ciphertext_bytes)
+					.unwrap_or(0),
+			);
+			metrics.observe_storage_l2_row_group_fetch_bytes(
+				"phase_c",
+				plan.phase_c_fetch.fetched_ciphertext_bytes,
+			);
+			metrics.observe_storage_l2_row_group_fetch_selected_ranges(
+				plan.phase_c_fetch.chunk_runs.len().saturating_add(
+					plan.phase_b_fetch
+						.as_ref()
+						.map(|phase_b| phase_b.chunk_runs.len())
+						.unwrap_or(0),
+				) as u64,
+			);
+			let selected_plaintext_bytes = plan
+				.phase_c_fetch
+				.selected_plaintext_ranges
+				.iter()
+				.map(|range| range.len.get())
+				.sum::<u64>();
+			let total_row_group_bytes = plan
+				.directory
+				.row_groups
+				.iter()
+				.map(|group| {
+					group
+						.metadata_range
+						.len
+						.get()
+						.saturating_add(group.body_range.len.get())
+				})
+				.sum::<u64>();
+			metrics.observe_storage_l2_row_group_fetch_bytes(
+				"avoided",
+				total_row_group_bytes.saturating_sub(selected_plaintext_bytes),
+			);
+		}
+		L2FetchStrategy::Fallback(reason) => {
+			metrics.observe_storage_l2_row_group_fetch_request("whole_record");
+			metrics.observe_storage_l2_row_group_fetch_fallback(reason.as_str());
+		}
+		L2FetchStrategy::Columnar(_) => {
+			metrics.observe_storage_l2_row_group_fetch_request("columnar_buffer");
+		}
+		L2FetchStrategy::WholeRecord => {
+			metrics.observe_storage_l2_row_group_fetch_request("whole_record");
+		}
+	}
 }
 
 fn slab_record_header_size_u64() -> std::io::Result<u64> {
@@ -8968,6 +9766,8 @@ async fn append_compacted_frame_to_replacement(
 fn compact_physical_record_frame(
 	frame: &[u8],
 	records: &[CompactionRecord],
+	table_schemas: Option<&TableSchemaCatalogV1>,
+	row_group_config: &crate::storage::row_group::RowGroupWriterConfig,
 ) -> std::io::Result<Option<CompactedFrame>> {
 	let mut survivors = records
 		.iter()
@@ -9022,6 +9822,12 @@ fn compact_physical_record_frame(
 	// stamp through compaction. AppendOnly rows must keep their
 	// table-isolation binding; PK rows have `None`.
 	let source_metadata = crate::storage::multirow::storage_rows_from_batch(&batch)?;
+	let descriptor = compaction_row_group_descriptor(
+		table_schemas,
+		row_group_config,
+		&survivors,
+		&source_metadata,
+	);
 	let source_rows = survivors
 		.iter()
 		.map(|record| {
@@ -9040,7 +9846,16 @@ fn compact_physical_record_frame(
 		})
 		.collect::<Vec<_>>();
 	let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(frame)?;
-	let encoded = encode_multirow_from_survivors_with_policy(&batch, &source_rows, policy)?;
+	let encoded = match descriptor {
+		Some(descriptor) => encode_multirow_from_survivors_with_row_group_config(
+			&batch,
+			&source_rows,
+			descriptor,
+			policy,
+			row_group_config,
+		)?,
+		None => encode_multirow_from_survivors_with_policy(&batch, &source_rows, policy)?,
+	};
 	let entries = encoded.rows;
 	if entries.len() != survivors.len() {
 		return Err(Error::new(
@@ -9084,6 +9899,36 @@ fn compact_physical_record_frame(
 		was_multirow: true,
 		rows,
 	}))
+}
+
+fn compaction_row_group_descriptor<'a>(
+	table_schemas: Option<&'a TableSchemaCatalogV1>,
+	row_group_config: &crate::storage::row_group::RowGroupWriterConfig,
+	survivors: &[CompactionRecord],
+	source_metadata: &[StorageRowMetadata],
+) -> Option<&'a TableSchemaDescriptorV1> {
+	if !row_group_config.enabled {
+		return None;
+	}
+	let table_schemas = table_schemas?;
+	let first = survivors.first()?;
+	let mut table_object_id = None;
+	for record in survivors {
+		if record.tenant_id != first.tenant_id {
+			return None;
+		}
+		let metadata = source_metadata.get(record.old_location.record_row_index.get() as usize)?;
+		match (table_object_id, metadata.table_object_id) {
+			(None, Some(value)) => table_object_id = Some(value),
+			(Some(expected), Some(value)) if expected == value => {}
+			_ => return None,
+		}
+	}
+	let descriptor = table_schemas.latest_by_id(first.tenant_id, table_object_id?)?;
+	descriptor
+		.record_layout_policy
+		.is_multi_row()
+		.then_some(descriptor)
 }
 
 fn descriptor_matches_tiered_row(
@@ -9551,8 +10396,8 @@ mod tests {
 	};
 	use crate::schema::{
 		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, NodeId, RetentionWindowMillis,
-		SecondaryIndexCatalog, SecondaryIndexKeyDescriptor, TableLifecycleCatalog,
-		TableRetentionPolicy,
+		RowGroupRowCount, SecondaryIndexCatalog, SecondaryIndexKeyDescriptor,
+		TableLifecycleCatalog, TableRetentionPolicy,
 	};
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
@@ -10125,6 +10970,8 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit,
 				crypto: test_crypto(),
 			})
@@ -10146,6 +10993,8 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto,
 			})
@@ -11593,6 +12442,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -11814,6 +12665,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -11976,6 +12829,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12484,6 +13339,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12602,6 +13459,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12740,6 +13599,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12866,6 +13727,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13396,6 +14259,8 @@ mod tests {
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto,
 		})
@@ -13419,6 +14284,8 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13484,6 +14351,8 @@ mod tests {
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -13517,6 +14386,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13756,6 +14627,8 @@ mod tests {
 				l2: Some(l2.clone()),
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13888,6 +14761,8 @@ mod tests {
 					min_record_bytes: RecordBodyByteLen::new(1),
 					..L2ColumnFetchConfig::default()
 				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14010,6 +14885,8 @@ mod tests {
 				location,
 				&descriptor,
 				&requirement,
+				None,
+				None,
 			)
 			.await
 			.unwrap();
@@ -14023,6 +14900,606 @@ mod tests {
 		assert_eq!(projected.projected.batch, whole.project(&[15]).unwrap());
 		assert_eq!(projected.projected.batch.num_columns(), 1);
 		assert_eq!(projected.projected.batch.num_rows(), row_count);
+	}
+
+	#[tokio::test]
+	async fn row_group_l2_point_read_materializes_projected_group() {
+		let l1_dir = fresh_dir("row-group-l2-l1");
+		let l2_dir = fresh_dir("row-group-l2-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x73; 16]),
+			1,
+			"analytics",
+			"row_group_l2",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(20_000, 20_000, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Lz4Frame;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let row_count = 20_000_usize;
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| 10_000_000_i64 + row as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(200 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: None,
+				},
+			)
+			.collect::<Vec<_>>();
+		let writer_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			stats_supported_types: std::collections::BTreeSet::new(),
+			..Default::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Lz4Frame,
+				&writer_config,
+			)
+			.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("row-group-l2/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+		let target = encoded
+			.rows
+			.iter()
+			.find(|row| row.record_row_index == RecordRowIndex::new(10_000))
+			.expect("target storage row");
+		let location = mgr
+			.lookup(tenant(), target.key_identity)
+			.expect("tiered row location");
+		let requirement = ColumnFetchRequirement {
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
+			..ColumnFetchRequirement::default()
+		};
+		let predicate_requirement = ColumnFetchRequirement {
+			predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([0]),
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
+			..ColumnFetchRequirement::default()
+		};
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		bytecode.extend_from_slice(&50_000_i64.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_GT);
+		let disjoint_program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+
+		let pruned = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&predicate_requirement,
+				Some(&disjoint_program),
+				None,
+			)
+			.await
+			.unwrap();
+		assert_eq!(pruned.projected.batch.num_rows(), 0);
+		let target_group = crate::schema::RowGroupIndex::new(2);
+		match &pruned.strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				assert!(plan.surviving_groups.is_empty());
+				assert_eq!(plan.predicate_fetched_groups, vec![target_group]);
+				assert!(plan.phase_b_fetch.is_some());
+				assert!(plan.phase_c_fetch.selected_plaintext_ranges.is_empty());
+			}
+			other => panic!("expected row-group no-survivors strategy, got {other:?}"),
+		}
+
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		bytecode.extend_from_slice(&0_i64.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_GTE);
+		let phase_b_pass_program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let phase_b_pass = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&predicate_requirement,
+				Some(&phase_b_pass_program),
+				None,
+			)
+			.await
+			.unwrap();
+		match &phase_b_pass.strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				assert_eq!(plan.surviving_groups, vec![target_group]);
+				assert_eq!(plan.predicate_fetched_groups, vec![target_group]);
+				let phase_b_fetch = plan.phase_b_fetch.as_ref().expect("Phase B fetch plan");
+				for page in &plan.directory.buffer_pages {
+					if page.row_group_index != target_group || page.range.len.get() == 0 {
+						continue;
+					}
+					if page.ipc_column_ordinal == crate::schema::IpcColumnOrdinal::new(0) {
+						assert!(body_ranges_cover(
+							&phase_b_fetch.selected_plaintext_ranges,
+							page.range
+						));
+						assert!(!body_ranges_cover(
+							&plan.phase_c_fetch.selected_plaintext_ranges,
+							page.range
+						));
+					}
+					if page.ipc_column_ordinal == crate::schema::IpcColumnOrdinal::new(1) {
+						assert!(body_ranges_cover(
+							&plan.phase_c_fetch.selected_plaintext_ranges,
+							page.range
+						));
+					}
+				}
+			}
+			other => panic!("expected row-group Phase B strategy, got {other:?}"),
+		}
+		let predicate_only_requirement = ColumnFetchRequirement {
+			predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([0]),
+			..ColumnFetchRequirement::default()
+		};
+		let predicate_only = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&predicate_only_requirement,
+				Some(&phase_b_pass_program),
+				None,
+			)
+			.await
+			.unwrap();
+		match &predicate_only.strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				assert_eq!(plan.surviving_groups, vec![target_group]);
+				assert_eq!(plan.predicate_fetched_groups, vec![target_group]);
+				assert!(plan.phase_b_fetch.is_some());
+				assert!(plan.phase_c_fetch.selected_plaintext_ranges.is_empty());
+			}
+			other => panic!("expected predicate-only row-group Phase B strategy, got {other:?}"),
+		}
+		assert_eq!(predicate_only.projected.batch.num_rows(), 4096);
+		assert!(predicate_only.projected.physical_for(0).is_some());
+
+		let full_frame = mgr
+			.read_encrypted_record_from_l2(l2.as_ref(), &pointer, location)
+			.await
+			.unwrap();
+		let whole = decode_record_batch(&full_frame).unwrap();
+		let expected_id_payload = whole.project(&[0, 1]).unwrap().slice(8192, 4096);
+		assert_eq!(phase_b_pass.projected.batch.num_rows(), 4096);
+		let id_values = phase_b_pass
+			.projected
+			.batch
+			.column(phase_b_pass.projected.physical_for(0).expect("id physical"))
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		let payload_values = phase_b_pass
+			.projected
+			.batch
+			.column(
+				phase_b_pass
+					.projected
+					.physical_for(1)
+					.expect("payload physical"),
+			)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("payload column");
+		let expected_ids = expected_id_payload.column(0);
+		let expected_ids = expected_ids
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("expected id column");
+		let expected_payloads = expected_id_payload.column(1);
+		let expected_payloads = expected_payloads
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("expected payload column");
+		assert_eq!(id_values.values(), expected_ids.values());
+		assert_eq!(payload_values.values(), expected_payloads.values());
+
+		let indexed_locations = [
+			RecordRowIndex::new(10_000),
+			RecordRowIndex::new(10_001),
+			RecordRowIndex::new(13_000),
+		]
+		.into_iter()
+		.map(|record_row_index| {
+			let row = encoded
+				.rows
+				.iter()
+				.find(|row| row.record_row_index == record_row_index)
+				.expect("indexed source row");
+			mgr.lookup(tenant(), row.key_identity)
+				.expect("indexed row location")
+		})
+		.collect::<Vec<_>>();
+		let indexed_projected = mgr
+			.read_projected_indexed_rows(&indexed_locations, &descriptor, &requirement)
+			.await
+			.unwrap()
+			.expect("projected indexed rows");
+		match &indexed_projected.strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				assert_eq!(
+					plan.surviving_groups,
+					vec![
+						crate::schema::RowGroupIndex::new(2),
+						crate::schema::RowGroupIndex::new(3)
+					]
+				);
+				assert!(plan.phase_b_fetch.is_none());
+			}
+			other => panic!("expected coalesced row-group indexed fetch, got {other:?}"),
+		}
+		let indexed_values = indexed_projected.projected.batch.column(0);
+		let indexed_values = indexed_values
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("indexed payload column");
+		let whole_payload = whole.column(1);
+		let whole_payload = whole_payload
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("whole payload column");
+		for (position, location) in indexed_locations.iter().enumerate() {
+			assert_eq!(
+				indexed_values.value(position),
+				whole_payload.value(location.record_row_index.get() as usize)
+			);
+		}
+
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		bytecode.extend_from_slice(&12_000_i64.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_GT);
+		let multi_group_program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let indexed_record_rows = indexed_locations
+			.iter()
+			.map(|location| location.record_row_index)
+			.collect::<Vec<_>>();
+		let multi_group_masked = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&predicate_requirement,
+				Some(&multi_group_program),
+				Some(&indexed_record_rows),
+			)
+			.await
+			.unwrap();
+		match &multi_group_masked.strategy {
+			L2FetchStrategy::RowGroup(plan) => {
+				assert_eq!(
+					plan.surviving_groups,
+					vec![
+						crate::schema::RowGroupIndex::new(2),
+						crate::schema::RowGroupIndex::new(3)
+					]
+				);
+				assert_eq!(plan.predicate_fetched_groups, plan.surviving_groups);
+				assert!(plan.phase_b_fetch.is_some());
+			}
+			other => panic!("expected multi-group Phase B row-group strategy, got {other:?}"),
+		}
+		let masked_ids = multi_group_masked
+			.projected
+			.batch
+			.column(
+				multi_group_masked
+					.projected
+					.physical_for(0)
+					.expect("id physical"),
+			)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("masked id column");
+		let masked_payloads = multi_group_masked
+			.projected
+			.batch
+			.column(
+				multi_group_masked
+					.projected
+					.physical_for(1)
+					.expect("payload physical"),
+			)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("masked payload column");
+		let selected_whole = arrow::compute::concat_batches(
+			&whole.project(&[0, 1]).unwrap().schema(),
+			&[
+				whole.project(&[0, 1]).unwrap().slice(8192, 4096),
+				whole.project(&[0, 1]).unwrap().slice(12288, 4096),
+			],
+		)
+		.unwrap();
+		let expected_masked =
+			crate::schema::pbc::execute_program(&multi_group_program, &selected_whole).unwrap();
+		let expected_ids = expected_masked
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("expected masked ids");
+		let expected_payloads = expected_masked
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("expected masked payloads");
+		assert_eq!(masked_ids.values(), expected_ids.values());
+		assert_eq!(masked_payloads.values(), expected_payloads.values());
+
+		let projected = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&requirement,
+				None,
+				None,
+			)
+			.await
+			.unwrap();
+		let expected = whole.project(&[1]).unwrap().slice(8192, 4096);
+
+		assert!(matches!(projected.strategy, L2FetchStrategy::RowGroup(_)));
+		assert_eq!(
+			projected.projected_first_record_row_index,
+			RecordRowIndex::new(8192)
+		);
+		assert_eq!(projected.projected.batch.num_rows(), expected.num_rows());
+		let actual_values = projected.projected.batch.column(0);
+		let actual_values = actual_values
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("actual payload column");
+		let expected_values = expected.column(0);
+		let expected_values = expected_values
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("expected payload column");
+		assert_eq!(actual_values.values(), expected_values.values());
+	}
+
+	fn body_ranges_cover(
+		ranges: &[crate::storage::row_group::RecordBodyByteRange],
+		candidate: crate::storage::row_group::RecordBodyByteRange,
+	) -> bool {
+		let Ok(candidate_end) = candidate.end() else {
+			return false;
+		};
+		ranges.iter().any(|range| {
+			range.start.get() <= candidate.start.get()
+				&& range
+					.end()
+					.is_ok_and(|range_end| range_end >= candidate_end)
+		})
+	}
+
+	#[test]
+	fn compaction_rewrites_table_bound_multirow_frame_with_row_group_directory() {
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let table_object_id = TableObjectId::new([0x88; 16]);
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			table_object_id,
+			1,
+			"analytics",
+			"row_group_compaction",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(10, 10, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let mut catalog = TableSchemaCatalogV1::default();
+		catalog.upsert(tenant(), descriptor.clone()).unwrap();
+		let row_count = 10_usize;
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| 1_000_i64 + row as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|row| MultiRowSourceRow {
+				source_row_index: row,
+				key_identity: id(row as u64),
+				routing_locality: Locality::new(7),
+				row_hlc: hlc(300 + row as u64),
+				is_tombstone: false,
+				table_object_id: Some(table_object_id),
+			})
+			.collect::<Vec<_>>();
+		let old = encode_multirow_from_survivors_with_policy(
+			&batch,
+			&source_rows,
+			RecordBodyCompressionPolicy::Uncompressed,
+		)
+		.unwrap();
+		let records = old
+			.rows
+			.iter()
+			.map(|row| CompactionRecord {
+				tenant_id: tenant(),
+				key_identity: row.key_identity,
+				routing_locality: row.routing_locality,
+				old_location: RecordLocation {
+					slab_id: SlabId::new(77),
+					offset: 0,
+					length: old.frame.len() as u32,
+					hlc: row.row_hlc,
+					record_row_index: row.record_row_index,
+					is_tombstone: row.is_tombstone,
+				},
+				reclaim: false,
+				retention_ambiguous: false,
+				retention_lag_seconds: 0,
+			})
+			.collect::<Vec<_>>();
+		let writer_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			target_row_group_rows: RowGroupRowCount::new(4),
+			max_row_group_rows: RowGroupRowCount::new(4),
+			min_paged_record_rows: RowCount::new(8),
+			min_paged_record_bytes: RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let compacted =
+			compact_physical_record_frame(&old.frame, &records, Some(&catalog), &writer_config)
+				.unwrap()
+				.expect("compacted frame");
+		let compacted_again =
+			compact_physical_record_frame(&old.frame, &records, Some(&catalog), &writer_config)
+				.unwrap()
+				.expect("compacted frame");
+		let parsed = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::new(77),
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: compacted.frame.len() as u64,
+			},
+			&compacted.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = parsed.page_directory.expect("row-group directory");
+
+		assert_eq!(compacted.frame, compacted_again.frame);
+		assert_eq!(page_directory.row_groups.len(), 3);
+		assert_eq!(page_directory.row_count.get(), row_count as u64);
+		assert_eq!(
+			decode_record_batch(&compacted.frame).unwrap().num_rows(),
+			row_count
+		);
 	}
 
 	#[tokio::test]
@@ -14337,6 +15814,8 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14370,6 +15849,8 @@ mod tests {
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -14447,6 +15928,8 @@ mod tests {
 			l2: Some(l2.clone()),
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -14515,6 +15998,8 @@ mod tests {
 			l2: Some(l2),
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -14562,6 +16047,8 @@ mod tests {
 				l2: None,
 				rehydration: RehydrationPolicy::default(),
 				l2_column_fetch: Default::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14628,6 +16115,8 @@ mod tests {
 			l2: None,
 			rehydration: RehydrationPolicy::default(),
 			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

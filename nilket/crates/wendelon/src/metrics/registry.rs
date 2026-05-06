@@ -1633,6 +1633,67 @@ impl L2ColumnFetchFallbackCounters {
 	}
 }
 
+#[derive(Default)]
+struct StaticLabelCounters(Mutex<BTreeMap<&'static str, u64>>);
+
+impl StaticLabelCounters {
+	fn add(&self, label: &'static str, value: u64) {
+		let mut values = self.0.lock().expect("static label counter mutex poisoned");
+		*values.entry(label).or_default() += value;
+	}
+
+	fn inc(&self, label: &'static str) {
+		self.add(label, 1);
+	}
+
+	fn render(
+		&self,
+		out: &mut String,
+		name: &str,
+		help: &str,
+		label_name: &str,
+		labels: &[&'static str],
+	) {
+		render_counter_family_header(out, name, help);
+		let values = self.0.lock().expect("static label counter mutex poisoned");
+		for label in labels {
+			render_counter_with_labels(
+				out,
+				name,
+				&[(label_name, label)],
+				values.get(label).copied().unwrap_or(0),
+			);
+		}
+	}
+}
+
+const ROW_GROUP_FETCH_STRATEGIES: &[&str] = &["row_group", "columnar_buffer", "whole_record"];
+const ROW_GROUP_FETCH_FALLBACK_REASONS: &[&str] = &[
+	"disabled",
+	"single_row",
+	"full_projection",
+	"small_record",
+	"too_few_rows",
+	"too_many_row_groups",
+	"too_many_bytes",
+	"too_many_ranges",
+	"metadata_probe_cap",
+	"unsupported_arrow_layout",
+	"rehydration_available",
+	"unpaged_record",
+];
+const ROW_GROUP_FETCH_DECISIONS: &[&str] = &["skip", "keep", "predicate_fetch", "no_survivors"];
+const ROW_GROUP_FETCH_BYTE_KINDS: &[&str] = &["directory", "phase_b", "phase_c", "avoided"];
+const ROW_GROUP_INVARIANT_KINDS: &[&str] = &[
+	"page_directory_parse_error",
+	"row_group_range_overflow",
+	"layout_unsupported",
+];
+
+fn bounded_row_group_label(value: &str, labels: &[&'static str]) -> Option<&'static str> {
+	labels.iter().copied().find(|label| *label == value)
+}
+
 pub struct Histogram {
 	bounds_micros: &'static [u64],
 	state: Mutex<HistogramState>,
@@ -2185,6 +2246,14 @@ pub struct MetricsRegistry {
 	storage_l2_column_fetch_plan_micros: Histogram,
 	storage_l2_column_fetch_selected_chunk_runs: Histogram,
 	storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters,
+	storage_l2_row_group_fetch_requests: StaticLabelCounters,
+	storage_l2_row_group_fetch_fallback: StaticLabelCounters,
+	storage_l2_row_group_fetch_row_groups: StaticLabelCounters,
+	storage_l2_row_group_fetch_bytes: StaticLabelCounters,
+	storage_l2_row_group_fetch_plan_micros: Histogram,
+	storage_l2_row_group_fetch_selected_ranges: Histogram,
+	storage_l2_row_group_fetch_directory_bytes: Histogram,
+	storage_l2_row_group_fetch_invariant_violations: StaticLabelCounters,
 	io_uring_submission_queue_depth: IoUringQueueDepthGauges,
 	io_uring_completion_queue_depth: IoUringQueueDepthGauges,
 	io_uring_errors: IoUringErrorCounters,
@@ -2430,6 +2499,18 @@ impl Default for MetricsRegistry {
 				L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS,
 			),
 			storage_l2_column_fetch_fallback: L2ColumnFetchFallbackCounters::default(),
+			storage_l2_row_group_fetch_requests: StaticLabelCounters::default(),
+			storage_l2_row_group_fetch_fallback: StaticLabelCounters::default(),
+			storage_l2_row_group_fetch_row_groups: StaticLabelCounters::default(),
+			storage_l2_row_group_fetch_bytes: StaticLabelCounters::default(),
+			storage_l2_row_group_fetch_plan_micros: Histogram::new(PBC_SLAB_STATS_BUCKETS_MICROS),
+			storage_l2_row_group_fetch_selected_ranges: Histogram::new(
+				L2_COLUMN_FETCH_CHUNK_RUN_BUCKETS,
+			),
+			storage_l2_row_group_fetch_directory_bytes: Histogram::new(
+				PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS,
+			),
+			storage_l2_row_group_fetch_invariant_violations: StaticLabelCounters::default(),
 			io_uring_submission_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_completion_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_errors: IoUringErrorCounters::default(),
@@ -3369,6 +3450,52 @@ impl MetricsRegistry {
 		self.storage_l2_column_fetch_fallback.inc(reason);
 	}
 
+	pub fn observe_storage_l2_row_group_fetch_request(&self, strategy: &str) {
+		if let Some(label) = bounded_row_group_label(strategy, ROW_GROUP_FETCH_STRATEGIES) {
+			self.storage_l2_row_group_fetch_requests.inc(label);
+		}
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_fallback(&self, reason: &str) {
+		if let Some(label) = bounded_row_group_label(reason, ROW_GROUP_FETCH_FALLBACK_REASONS) {
+			self.storage_l2_row_group_fetch_fallback.inc(label);
+		}
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_row_groups(&self, decision: &str, value: u64) {
+		if let Some(label) = bounded_row_group_label(decision, ROW_GROUP_FETCH_DECISIONS) {
+			self.storage_l2_row_group_fetch_row_groups.add(label, value);
+		}
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_bytes(&self, kind: &str, value: u64) {
+		if let Some(label) = bounded_row_group_label(kind, ROW_GROUP_FETCH_BYTE_KINDS) {
+			self.storage_l2_row_group_fetch_bytes.add(label, value);
+		}
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_plan(&self, duration: Duration) {
+		self.storage_l2_row_group_fetch_plan_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_selected_ranges(&self, ranges: u64) {
+		self.storage_l2_row_group_fetch_selected_ranges
+			.observe_value(ranges);
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_directory_bytes(&self, bytes: u64) {
+		self.storage_l2_row_group_fetch_directory_bytes
+			.observe_value(bytes);
+	}
+
+	pub fn observe_storage_l2_row_group_fetch_invariant_violation(&self, violation_kind: &str) {
+		if let Some(label) = bounded_row_group_label(violation_kind, ROW_GROUP_INVARIANT_KINDS) {
+			self.storage_l2_row_group_fetch_invariant_violations
+				.inc(label);
+		}
+	}
+
 	pub fn observe_storage_compression_encode(
 		&self,
 		codec: RecordBodyCompressionPolicy,
@@ -4090,6 +4217,70 @@ impl MetricsRegistry {
 			&mut out,
 			&l2_column_fetch_fallback_total,
 			"ADR 044 L2 column fetch strategy fallbacks by planner reason.",
+		);
+		let row_group_requests = namespaced_metric("storage_l2_row_group_fetch_requests_total");
+		self.storage_l2_row_group_fetch_requests.render(
+			&mut out,
+			&row_group_requests,
+			"ADR 056 L2 row-group fetch requests by selected strategy.",
+			"strategy",
+			ROW_GROUP_FETCH_STRATEGIES,
+		);
+		let row_group_fallback = namespaced_metric("storage_l2_row_group_fetch_fallback_total");
+		self.storage_l2_row_group_fetch_fallback.render(
+			&mut out,
+			&row_group_fallback,
+			"ADR 056 L2 row-group fetch fallbacks by planner reason.",
+			"reason",
+			ROW_GROUP_FETCH_FALLBACK_REASONS,
+		);
+		let row_group_decisions = namespaced_metric("storage_l2_row_group_fetch_row_groups_total");
+		self.storage_l2_row_group_fetch_row_groups.render(
+			&mut out,
+			&row_group_decisions,
+			"ADR 056 row groups classified by planner decision.",
+			"decision",
+			ROW_GROUP_FETCH_DECISIONS,
+		);
+		let row_group_bytes = namespaced_metric("storage_l2_row_group_fetch_bytes_total");
+		self.storage_l2_row_group_fetch_bytes.render(
+			&mut out,
+			&row_group_bytes,
+			"ADR 056 row-group fetch bytes by bounded kind.",
+			"kind",
+			ROW_GROUP_FETCH_BYTE_KINDS,
+		);
+		let row_group_plan = namespaced_metric("storage_l2_row_group_fetch_plan_micros");
+		render_histogram_micros(
+			&mut out,
+			&row_group_plan,
+			"ADR 056 row-group fetch strategy planning duration in microseconds.",
+			&self.storage_l2_row_group_fetch_plan_micros.snapshot(),
+		);
+		let row_group_selected_ranges =
+			namespaced_metric("storage_l2_row_group_fetch_selected_ranges");
+		render_histogram_raw(
+			&mut out,
+			&row_group_selected_ranges,
+			"ADR 056 row-group fetch selected L2 range count.",
+			&self.storage_l2_row_group_fetch_selected_ranges.snapshot(),
+		);
+		let row_group_directory_bytes =
+			namespaced_metric("storage_l2_row_group_fetch_directory_bytes");
+		render_histogram_raw(
+			&mut out,
+			&row_group_directory_bytes,
+			"ADR 056 row-group page-directory metadata bytes.",
+			&self.storage_l2_row_group_fetch_directory_bytes.snapshot(),
+		);
+		let row_group_invariants =
+			namespaced_metric("storage_l2_row_group_fetch_invariant_violations_total");
+		self.storage_l2_row_group_fetch_invariant_violations.render(
+			&mut out,
+			&row_group_invariants,
+			"ADR 056 row-group invariant violations by bounded kind.",
+			"violation_kind",
+			ROW_GROUP_INVARIANT_KINDS,
 		);
 		self.io_uring_submission_queue_depth.render(
 			&mut out,

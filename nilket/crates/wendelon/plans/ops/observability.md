@@ -235,6 +235,14 @@ and traces for attribution; keep Prometheus bounded to the enums above.
 | `wendelon_storage_rehydrated_reclaims_total` | counter | none | Rehydrated slabs reclaimed after cooling |
 | `wendelon_storage_migration_reclaimed_slabs_total` | counter | none | Tombstoned slabs reclaimed after migration |
 | `wendelon_storage_migration_reclaimed_bytes_total` | counter | none | Bytes reclaimed after migration |
+| `wendelon_storage_l2_row_group_fetch_requests_total` | counter | `strategy` (`row_group`, `columnar_buffer`, `whole_record`) | ADR 056 row-group projected-read strategy selection |
+| `wendelon_storage_l2_row_group_fetch_fallback_total` | counter | `reason` (`disabled`, `single_row`, `full_projection`, `small_record`, `too_few_rows`, `too_many_row_groups`, `too_many_bytes`, `too_many_ranges`, `metadata_probe_cap`, `unsupported_arrow_layout`, `rehydration_available`, `unpaged_record`) | ADR 056 economic fallback distribution |
+| `wendelon_storage_l2_row_group_fetch_row_groups_total` | counter | `decision` (`skip`, `keep`, `predicate_fetch`, `no_survivors`) | Row-group pruning decisions |
+| `wendelon_storage_l2_row_group_fetch_bytes_total` | counter | `kind` (`directory`, `phase_b`, `phase_c`, `avoided`) | Row-group fetch bytes and savings accounting |
+| `wendelon_storage_l2_row_group_fetch_plan_micros` | histogram | none | ADR 056 planning time |
+| `wendelon_storage_l2_row_group_fetch_selected_ranges` | histogram | none | Encrypted chunk-run count selected by row-group fetch |
+| `wendelon_storage_l2_row_group_fetch_directory_bytes` | histogram | none | Parsed row-group directory size |
+| `wendelon_storage_l2_row_group_fetch_invariant_violations_total` | counter | `violation_kind` (`page_directory_parse_error`, `row_group_range_overflow`, `layout_unsupported`) | Fail-closed ADR 056 corruption/invariant signal |
 
 #### Descriptor Fingerprints / CSB
 | Metric | Type | Labels | Use |

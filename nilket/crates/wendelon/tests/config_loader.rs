@@ -180,6 +180,77 @@ transfer_signing_secret = "{transfer_secret}"
 }
 
 #[test]
+fn loads_row_group_tuning() {
+	let root = fresh_dir("row-group-tuning");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 45u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4715"
+
+[storage]
+data_dir = "data"
+
+[storage.row_group_writer]
+enabled = true
+target_row_group_rows = 2048
+max_row_group_rows = 4096
+min_paged_record_rows = 4096
+min_paged_record_bytes = 131072
+
+[storage.l2_row_group_fetch]
+enabled = true
+max_selected_row_group_fraction_micros = 200000
+max_selected_byte_fraction_micros = 400000
+max_ranges_per_record = 12
+max_parallel_range_gets = 3
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert!(cfg.row_group_writer.enabled);
+	assert_eq!(cfg.row_group_writer.target_row_group_rows.get(), 2048);
+	assert_eq!(cfg.row_group_writer.max_row_group_rows.get(), 4096);
+	assert_eq!(cfg.row_group_writer.min_paged_record_rows.get(), 4096);
+	assert_eq!(cfg.row_group_writer.min_paged_record_bytes.get(), 131072);
+	assert!(cfg.l2_row_group_fetch.enabled);
+	assert_eq!(
+		cfg.l2_row_group_fetch
+			.max_selected_row_group_fraction_micros,
+		200000
+	);
+	assert_eq!(
+		cfg.l2_row_group_fetch.max_selected_byte_fraction_micros,
+		400000
+	);
+	assert_eq!(cfg.l2_row_group_fetch.max_ranges_per_record.get(), 12);
+	assert_eq!(cfg.l2_row_group_fetch.max_parallel_range_gets.get(), 3);
+}
+
+#[test]
 fn loads_transport_admission_tuning() {
 	let root = fresh_dir("transport-admission");
 	std::fs::create_dir_all(root.join("data")).unwrap();

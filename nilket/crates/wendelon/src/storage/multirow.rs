@@ -5,13 +5,19 @@ use crate::schema::table::{
 	TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
-	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyCompressionPolicy,
-	RecordLayoutPolicy, RecordRowIndex, TableWriteValidationError, WriterNodeId,
+	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyByteOffset,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, SlabId,
+	TableWriteValidationError, WriterNodeId,
 };
+use crate::storage::columnar::TieredRecordId;
 use crate::storage::core::MultiRowIndexEntry;
 use crate::storage::ipc::{
 	EncodedRecordBatch, encode_record_batch, encode_record_batch_bytes,
-	record_batch_compression_policy_from_ipc,
+	encode_record_batches_bytes, record_batch_compression_policy_from_ipc,
+};
+use crate::storage::row_group::{
+	ROW_GROUP_DIRECTORY_METADATA_KEY, RowGroupWriterConfig, build_page_directory_for_ipc_stream,
+	serialize_page_directory_value,
 };
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
@@ -22,6 +28,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::io::{Cursor, Error, ErrorKind};
 use std::sync::Arc;
 use std::time::Instant;
@@ -125,6 +132,25 @@ pub fn pack_admitted_record_batch_by_bucket(
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
 ) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
+	let row_group_config = RowGroupWriterConfig::default();
+	pack_admitted_record_batch_by_bucket_with_row_group_config(
+		meta,
+		descriptor,
+		batch,
+		admission,
+		row_hlc,
+		&row_group_config,
+	)
+}
+
+pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
+	meta: &TableWriteRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+	batch: &RecordBatch,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
+) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
 	let layout = match &descriptor.record_layout_policy {
 		RecordLayoutPolicy::MultiRow(layout) => *layout,
 		RecordLayoutPolicy::SingleRow => {
@@ -164,10 +190,12 @@ pub fn pack_admitted_record_batch_by_bucket(
 			let remaining = rows.len() - cursor;
 			let upper = remaining.min(target_rows).min(max_rows).max(1);
 			let mut take_count = upper;
-			let mut encoded = encode_multirow_from_survivors_with_policy(
+			let mut encoded = encode_multirow_from_survivors_with_row_group_config(
 				batch,
 				&rows[cursor..cursor + upper],
+				descriptor,
 				descriptor.record_body_compression_policy,
+				row_group_config,
 			)
 			.map_err(table_pack_io_error)?;
 			if encoded.plaintext_byte_len > max_record_bytes && upper > 1 {
@@ -176,10 +204,12 @@ pub fn pack_admitted_record_batch_by_bucket(
 				let mut best = None;
 				while low <= high {
 					let mid = (low + high) / 2;
-					let candidate = encode_multirow_from_survivors_with_policy(
+					let candidate = encode_multirow_from_survivors_with_row_group_config(
 						batch,
 						&rows[cursor..cursor + mid],
+						descriptor,
 						descriptor.record_body_compression_policy,
+						row_group_config,
 					)
 					.map_err(table_pack_io_error)?;
 					if candidate.plaintext_byte_len <= max_record_bytes || mid == 1 {
@@ -237,6 +267,38 @@ pub fn encode_multirow_from_survivors_with_policy(
 	survivors: &[MultiRowSourceRow],
 	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<EncodedMultiRowFrame> {
+	encode_multirow_from_survivors_with_optional_row_groups(
+		batch,
+		survivors,
+		policy,
+		None,
+		&RowGroupWriterConfig::default(),
+	)
+}
+
+pub fn encode_multirow_from_survivors_with_row_group_config(
+	batch: &RecordBatch,
+	survivors: &[MultiRowSourceRow],
+	descriptor: &TableSchemaDescriptorV1,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<EncodedMultiRowFrame> {
+	encode_multirow_from_survivors_with_optional_row_groups(
+		batch,
+		survivors,
+		policy,
+		Some(descriptor),
+		row_group_config,
+	)
+}
+
+fn encode_multirow_from_survivors_with_optional_row_groups(
+	batch: &RecordBatch,
+	survivors: &[MultiRowSourceRow],
+	policy: RecordBodyCompressionPolicy,
+	descriptor: Option<&TableSchemaDescriptorV1>,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<EncodedMultiRowFrame> {
 	if survivors.is_empty() {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -263,7 +325,12 @@ pub fn encode_multirow_from_survivors_with_policy(
 		.collect::<std::io::Result<Vec<_>>>()?;
 	let taken = take_rows(batch, &source_row_indices)?;
 	let storage_batch = append_storage_synthetic_columns_from_rows(&taken, &rows)?;
-	let encoded = encode_record_batch(&storage_batch, policy)?;
+	let encoded = encode_storage_batch_with_optional_row_groups(
+		&storage_batch,
+		descriptor,
+		policy,
+		row_group_config,
+	)?;
 	let decoded_rows = storage_rows_from_batch(&storage_batch)?;
 	let max_row_hlc = decoded_rows
 		.iter()
@@ -278,6 +345,146 @@ pub fn encode_multirow_from_survivors_with_policy(
 		encoded_byte_len: encoded.encoded_byte_len,
 		codec: encoded.codec,
 	})
+}
+
+fn encode_storage_batch_with_optional_row_groups(
+	storage_batch: &RecordBatch,
+	descriptor: Option<&TableSchemaDescriptorV1>,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<EncodedRecordBatch> {
+	let single = encode_record_batch(storage_batch, policy)?;
+	let Some(descriptor) = descriptor else {
+		return Ok(single);
+	};
+	row_group_config.validate()?;
+	if !row_group_config.should_page(storage_batch.num_rows(), single.plaintext_byte_len) {
+		return Ok(single);
+	}
+	let batches = split_row_group_batches(storage_batch, row_group_config)?;
+	if batches.len() <= 1 {
+		return Ok(single);
+	}
+	encode_row_group_batches_with_directory(&batches, descriptor, policy, row_group_config)
+}
+
+fn split_row_group_batches(
+	storage_batch: &RecordBatch,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<Vec<RecordBatch>> {
+	let target = row_group_config.target_row_group_rows.get() as usize;
+	let mut batches = Vec::new();
+	let mut offset = 0_usize;
+	while offset < storage_batch.num_rows() {
+		let len = target.min(storage_batch.num_rows() - offset);
+		batches.push(storage_batch.slice(offset, len));
+		offset += len;
+	}
+	Ok(batches)
+}
+
+fn encode_row_group_batches_with_directory(
+	base_batches: &[RecordBatch],
+	descriptor: &TableSchemaDescriptorV1,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<EncodedRecordBatch> {
+	let mut directory_value = String::new();
+	for _ in 0..8 {
+		let batches = batches_with_row_group_metadata(base_batches, &directory_value)?;
+		let bytes = encode_record_batches_bytes(&batches, policy)?;
+		let directory = build_page_directory_for_ipc_stream(
+			TieredRecordId {
+				slab_id: SlabId::ZERO,
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			&bytes,
+			&batches,
+			descriptor.logical_schema_fingerprint,
+			&row_group_config.stats_supported_types,
+		)?;
+		let next_value = serialize_page_directory_value(&directory)?;
+		if next_value == directory_value {
+			return encoded_row_group_batches_from_bytes(&batches, policy, bytes);
+		}
+		directory_value = next_value;
+	}
+	crate::metrics::global()
+		.observe_storage_l2_row_group_fetch_invariant_violation("page_directory_parse_error");
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		"row-group directory fixed-point encoding did not converge",
+	))
+}
+
+fn encoded_row_group_batches_from_bytes(
+	batches: &[RecordBatch],
+	policy: RecordBodyCompressionPolicy,
+	bytes: Vec<u8>,
+) -> std::io::Result<EncodedRecordBatch> {
+	let started = Instant::now();
+	let plaintext_byte_len = if policy == RecordBodyCompressionPolicy::Uncompressed {
+		bytes.len() as u64
+	} else {
+		encode_record_batches_bytes(batches, RecordBodyCompressionPolicy::Uncompressed)?.len()
+			as u64
+	};
+	let encoded_byte_len = bytes.len() as u64;
+	crate::metrics::global().observe_storage_compression_encode(
+		policy,
+		plaintext_byte_len,
+		encoded_byte_len,
+		started.elapsed(),
+	);
+	Ok(EncodedRecordBatch {
+		bytes,
+		plaintext_byte_len,
+		encoded_byte_len,
+		codec: policy,
+	})
+}
+
+fn batches_with_row_group_metadata(
+	base_batches: &[RecordBatch],
+	directory_value: &str,
+) -> std::io::Result<Vec<RecordBatch>> {
+	let Some(first) = base_batches.first() else {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"row-group writer requires at least one batch",
+		));
+	};
+	let mut metadata: HashMap<String, String> = first.schema().metadata().clone();
+	metadata.insert(
+		ROW_GROUP_DIRECTORY_METADATA_KEY.to_string(),
+		directory_value.to_string(),
+	);
+	let schema = Arc::new(Schema::new_with_metadata(
+		first.schema().fields().iter().cloned().collect::<Vec<_>>(),
+		metadata,
+	));
+	base_batches
+		.iter()
+		.map(|batch| {
+			if batch.schema().fields() != first.schema().fields() {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					"row-group writer batches must share fields",
+				));
+			}
+			RecordBatch::try_new_with_options(
+				schema.clone(),
+				batch.columns().to_vec(),
+				&RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+			)
+			.map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("row-group writer schema attach: {err}"),
+				)
+			})
+		})
+		.collect()
 }
 
 pub fn pack_multirow_source_rows(
@@ -299,13 +506,33 @@ pub fn pack_multirow_source_rows_with_policy(
 	rows: &[MultiRowSourceRow],
 	policy: RecordBodyCompressionPolicy,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
+	pack_multirow_source_rows_with_policy_and_row_group_config(
+		layout,
+		batch,
+		rows,
+		None,
+		policy,
+		&RowGroupWriterConfig::default(),
+	)
+}
+
+pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
+	layout: MultiRowLayoutDescriptor,
+	batch: &RecordBatch,
+	rows: &[MultiRowSourceRow],
+	descriptor: Option<&TableSchemaDescriptorV1>,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	pack_multirow_source_rows_with_caps(
 		batch,
 		rows,
 		layout.target_rows.get().max(1) as usize,
 		layout.max_rows.get().max(1) as usize,
 		layout.max_record_bytes.get(),
+		descriptor,
 		policy,
+		row_group_config,
 	)
 }
 
@@ -393,7 +620,9 @@ pub fn merge_multirow_streams(
 		layout_max_rows.max(1),
 		layout_max_rows.max(1),
 		max_record_bytes,
+		None,
 		RecordBodyCompressionPolicy::Uncompressed,
+		&RowGroupWriterConfig::default(),
 	)?
 	.into_iter()
 	.map(|packed| packed.encoded)
@@ -728,27 +957,38 @@ pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
 	let started = Instant::now();
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
-	let batch = match reader.next() {
-		Some(Ok(batch)) => Ok(batch),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Err(Error::new(
+	let mut batches = Vec::new();
+	for next in reader.by_ref() {
+		match next {
+			Ok(batch) => batches.push(batch),
+			Err(err) => {
+				let result = Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("arrow stream read: {err}"),
+				));
+				if let Some(policy) = policy {
+					crate::metrics::global().observe_storage_compression_decode_error(policy);
+				}
+				return result;
+			}
+		}
+	}
+	let result = match batches.as_slice() {
+		[] => Err(Error::new(
 			ErrorKind::InvalidData,
 			"arrow stream contained no record batch",
 		)),
-	}?;
-	let result = match reader.next() {
-		Some(Ok(_)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained multiple record batches",
-		)),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Ok(batch),
+		[batch] => Ok(batch.clone()),
+		[first, ..] => concat_batches(
+			&first.schema(),
+			&batches.iter().map(Clone::clone).collect::<Vec<_>>(),
+		)
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("arrow stream row-group concat: {err}"),
+			)
+		}),
 	};
 	match (&result, policy) {
 		(Ok(batch), Some(policy)) => crate::metrics::global().observe_storage_compression_decode(
@@ -901,7 +1141,9 @@ fn pack_multirow_source_rows_with_caps(
 	target_rows: usize,
 	max_rows: usize,
 	max_record_bytes: u64,
+	descriptor: Option<&TableSchemaDescriptorV1>,
 	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	if rows.is_empty() {
 		return Ok(Vec::new());
@@ -924,8 +1166,16 @@ fn pack_multirow_source_rows_with_caps(
 			while low <= high {
 				let mid = (low + high) / 2;
 				let source_rows = &bucket_rows[cursor..cursor + mid];
-				let encoded =
-					encode_multirow_from_survivors_with_policy(batch, source_rows, policy)?;
+				let encoded = match descriptor {
+					Some(descriptor) => encode_multirow_from_survivors_with_row_group_config(
+						batch,
+						source_rows,
+						descriptor,
+						policy,
+						row_group_config,
+					)?,
+					None => encode_multirow_from_survivors_with_policy(batch, source_rows, policy)?,
+				};
 				if encoded.plaintext_byte_len <= max_record_bytes || mid == 1 {
 					best = Some((mid, encoded));
 					low = mid + 1;

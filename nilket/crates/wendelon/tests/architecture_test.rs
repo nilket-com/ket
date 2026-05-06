@@ -3049,3 +3049,241 @@ fn forbidden_protocol_tokens_in_code(manifest_dir: &Path, violations: &mut Vec<S
 		});
 	}
 }
+
+#[test]
+fn test_adr056_row_group_fetch_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for unit in [
+		"impl_unit!(IpcColumnOrdinal, u32);",
+		"impl_unit!(RowGroupIndex, u32);",
+		"impl_unit!(RowGroupRowCount, u32);",
+	] {
+		if !units.contains(unit) {
+			violations.push(format!("src/schema/units.rs: missing ADR 056 unit {unit}"));
+		}
+	}
+	for definition in [
+		"pub struct RecordPageDirectory",
+		"pub struct RowGroupDirectoryEntry",
+		"pub struct BufferPageDirectoryEntry",
+		"pub struct RowGroupColumnStats",
+		"pub struct RowGroupFetchPlan",
+		"pub struct PhaseBOutcome",
+	] {
+		if row_group.matches(definition).count() != 1 {
+			violations.push(format!(
+				"src/storage/row_group.rs: expected exactly one {definition}"
+			));
+		}
+	}
+	for required in [
+		"pub enum RowGroupRejectCode",
+		"PageDirectoryParseError = 1",
+		"RowGroupRangeOverflow = 2",
+		"LayoutUnsupported = 3",
+		"pub enum RowGroupFallbackReason",
+		"TooFewRows",
+		"TooManyRowGroups",
+		"UnpagedRecord",
+		"pub struct RowGroupWriterConfig",
+		"pub struct L2RowGroupFetchConfig",
+		"storage.row_group_directory",
+		"phase_b_fetch",
+		"phase_c_fetch",
+		"logical_schema_fingerprint",
+		"predicate_fetched_groups",
+		"apply_phase_b_masks_to_projected_row_groups",
+	] {
+		if !row_group.contains(required) {
+			violations.push(format!(
+				"src/storage/row_group.rs: missing ADR 056 token {required}"
+			));
+		}
+	}
+	if !columnar.contains("RowGroup(RowGroupFetchPlan)") {
+		violations.push("src/storage/columnar.rs: L2FetchStrategy::RowGroup missing".to_string());
+	}
+	if !columnar.contains("page_directory: Option<RecordPageDirectory>") {
+		violations.push(
+			"src/storage/columnar.rs: RecordBufferDirectory page_directory missing".to_string(),
+		);
+	}
+	if !multirow.contains("RowGroupWriterConfig")
+		|| !multirow.contains("encode_record_batches_bytes")
+	{
+		violations.push("src/storage/multirow.rs: row-group writer path is not wired".to_string());
+	}
+	for metric in [
+		"storage_l2_row_group_fetch_requests_total",
+		"storage_l2_row_group_fetch_fallback_total",
+		"storage_l2_row_group_fetch_row_groups_total",
+		"storage_l2_row_group_fetch_bytes_total",
+		"storage_l2_row_group_fetch_plan_micros",
+		"storage_l2_row_group_fetch_selected_ranges",
+		"storage_l2_row_group_fetch_directory_bytes",
+		"storage_l2_row_group_fetch_invariant_violations_total",
+		"violation_kind",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 056 metric token {metric}"
+			));
+		}
+	}
+	for forbidden in [
+		"__row_group_directory__",
+		"SyntheticColumn::RowGroupDirectory",
+		"partial_buffer_materialize",
+		"slice_compressed_buffer",
+		"intra_buffer_page_decode",
+		"mini_page_",
+	] {
+		for (path, content) in [
+			("src/storage/row_group.rs", &row_group),
+			("src/storage/columnar.rs", &columnar),
+			("src/storage/multirow.rs", &multirow),
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{path}: forbidden ADR 056 V1 token {forbidden}"));
+			}
+		}
+	}
+	for forbidden in [
+		"MsgType::ROW_GROUP",
+		"MsgType::PAGE_DIRECTORY",
+		"FRAME_FLAG_ROW_GROUP",
+		"FRAME_FLAG_PAGE_DIRECTORY",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 056 token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::RowGroup",
+		"NodeCapability::PageDirectory",
+		"NodeCapability::ROW_GROUP",
+		"NodeCapability::PAGE_DIRECTORY",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 056 capability {forbidden}"
+			));
+		}
+	}
+	if cdc.contains("RecordPageDirectory") || cdc.contains("RowGroupFetchPlan") {
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 056 internals".to_string());
+	}
+	for token in [
+		"RowGroupFetchSampled",
+		"row_group.fetch_sampled",
+		"RowGroupInvariantViolation",
+		"row_group.invariant_violation",
+	] {
+		if !audit.contains(token) {
+			violations.push(format!("src/audit.rs: missing ADR 056 audit token {token}"));
+		}
+	}
+	for token in [
+		"emit_row_group_fetch_sampled_audit",
+		"emit_row_group_invariant_audit_for_error",
+		"AuditOperation::RowGroupFetchSampled",
+		"AuditOperation::RowGroupInvariantViolation",
+		"row_groups_fetched",
+		"predicate_fetched_groups",
+		"dominant_strategy",
+	] {
+		if !data_server.contains(token) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 056 audit emission token {token}"
+			));
+		}
+	}
+	if data_server
+		.matches("emit_row_group_invariant_audit_for_error(")
+		.count()
+		< 2
+	{
+		violations.push(
+			"src/network/data_server.rs: RowGroupInvariantViolation audit helper must have at least one production call site"
+				.to_string(),
+		);
+	}
+	if !manager.contains("apply_phase_b_masks_to_projected_row_groups(") {
+		violations.push(
+			"src/storage/manager.rs: Phase B mask materializer must be called by production storage code"
+				.to_string(),
+		);
+	}
+	if !columnar.contains("observe_storage_l2_row_group_fetch_invariant_violation(")
+		&& !multirow.contains("observe_storage_l2_row_group_fetch_invariant_violation(")
+	{
+		violations.push(
+			"row-group invariant metric must be emitted outside src/metrics/registry.rs"
+				.to_string(),
+		);
+	}
+	if row_group.contains("execute_program(") {
+		violations
+			.push("src/storage/row_group.rs: Phase 5 materializer must not re-run PBC".to_string());
+	}
+	if !cargo.contains("name = \"row_group_fetch\"") || !cargo.contains("harness = false") {
+		violations.push("Cargo.toml: ADR 056 row_group_fetch bench is not registered".to_string());
+	}
+	let bench_path = manifest_dir.join("benches/row_group_fetch.rs");
+	if !bench_path.exists() {
+		violations.push("benches/row_group_fetch.rs: ADR 056 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for token in [
+			"writer",
+			"planner_one_group",
+			"phase_b_mask",
+			"masked_materialization",
+			"--quick",
+		] {
+			if !bench.contains(token) {
+				violations.push(format!(
+					"benches/row_group_fetch.rs: missing ADR 056 bench token {token}"
+				));
+			}
+		}
+	}
+	for forbidden in [
+		"RowGroupV1",
+		"RowGroupV2",
+		"PageDirectoryV1",
+		"PageDirectoryV2",
+		"WendelonRowGroup",
+		"WendelonPageDirectory",
+	] {
+		if row_group.contains(forbidden)
+			|| columnar.contains(forbidden)
+			|| multirow.contains(forbidden)
+		{
+			violations.push(format!("ADR 056 forbidden suffix/prefix token {forbidden}"));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 056 row-group fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}

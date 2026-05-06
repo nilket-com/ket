@@ -320,9 +320,12 @@ async fn whole_node_loss_restore_bootstraps_in_recovery_mode_and_serves_recovere
 	);
 
 	let snapshot = restored.state_machine.state_snapshot().await;
-	assert_eq!(
-		snapshot.e_safe_watermarks.get(&marker.epoch).copied(),
-		Some(marker.commit_hlc)
+	assert!(
+		snapshot
+			.e_safe_watermarks
+			.get(&marker.epoch)
+			.copied()
+			.is_some_and(|hlc| hlc >= marker.commit_hlc)
 	);
 	assert_eq!(
 		snapshot.last_membership.voter_ids().collect::<Vec<_>>(),

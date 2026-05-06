@@ -36,6 +36,23 @@ lsm_compaction_paused = false
 # max_ranges_per_record = 8
 # max_parallel_range_gets = 4
 
+# ADR 056 row-group writer/fetch are independently rolled out and
+# disabled by default.
+#
+# [storage.row_group_writer]
+# enabled = false
+# target_row_group_rows = 4096
+# max_row_group_rows = 8192
+# min_paged_record_rows = 8192
+# min_paged_record_bytes = 524288
+#
+# [storage.l2_row_group_fetch]
+# enabled = false
+# max_selected_row_group_fraction_micros = 250000
+# max_selected_byte_fraction_micros = 500000
+# max_ranges_per_record = 16
+# max_parallel_range_gets = 4
+
 [tuning]
 rf = {{RF}}
 wal_io_depth = {{WAL_IO_DEPTH}}

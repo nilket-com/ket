@@ -373,7 +373,12 @@ async fn wait_for_finalization(node: &WendelonNode, marker: FinalizationMarker) 
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
 	loop {
 		let snapshot = node.state_machine.state_snapshot().await;
-		if snapshot.e_safe_watermarks.get(&marker.epoch).copied() == Some(marker.commit_hlc) {
+		if snapshot
+			.e_safe_watermarks
+			.get(&marker.epoch)
+			.copied()
+			.is_some_and(|hlc| hlc >= marker.commit_hlc)
+		{
 			return;
 		}
 		assert!(

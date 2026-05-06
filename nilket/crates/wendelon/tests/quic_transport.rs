@@ -329,6 +329,8 @@ fn bootstrap_cfg(
 		lsm_compaction_paused: false,
 		rehydration: wendelon::storage::RehydrationPolicy::default(),
 		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
 		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
 		crypto_cache: wendelon::crypto::CryptoCacheConfig::default(),
 		protocol: wendelon::schema::ProtocolVersionWindow::default(),

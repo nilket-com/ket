@@ -42,6 +42,9 @@ Current runbooks:
 - [ADR 055 LSM Compaction](./lsm_compaction.md)
   - L0 debt, compaction result labels, retired pin pressure, digest invariant
     alarms, and bounded `lsm_*` metric surface
+- [ADR 056 Row-Group Fetch](./row_group_fetch.md)
+  - row-group strategy mix, fallback reasons, savings metrics, tuning knobs,
+    and emergency disable procedure
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

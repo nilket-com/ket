@@ -1039,27 +1039,34 @@ fn has_plausible_arrow_stream_prefix(frame: &[u8]) -> bool {
 fn decode_recovery_batch(frame: &[u8]) -> std::io::Result<arrow::record_batch::RecordBatch> {
 	let mut reader = StreamReader::try_new(Cursor::new(frame), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
-	let batch = match reader.next() {
-		Some(Ok(batch)) => Ok(batch),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Err(Error::new(
+	let mut batches = Vec::new();
+	for next in reader.by_ref() {
+		match next {
+			Ok(batch) => batches.push(batch),
+			Err(err) => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!("arrow stream read: {err}"),
+				));
+			}
+		}
+	}
+	match batches.as_slice() {
+		[] => Err(Error::new(
 			ErrorKind::InvalidData,
 			"arrow stream contained no record batch",
 		)),
-	}?;
-	match reader.next() {
-		Some(Ok(_)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			"arrow stream contained multiple record batches",
-		)),
-		Some(Err(err)) => Err(Error::new(
-			ErrorKind::InvalidData,
-			format!("arrow stream read: {err}"),
-		)),
-		None => Ok(batch),
+		[batch] => Ok(batch.clone()),
+		[first, ..] => arrow::compute::concat_batches(
+			&first.schema(),
+			&batches.iter().map(Clone::clone).collect::<Vec<_>>(),
+		)
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("arrow stream row-group concat: {err}"),
+			)
+		}),
 	}
 }
 

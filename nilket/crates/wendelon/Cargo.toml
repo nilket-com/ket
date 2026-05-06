@@ -135,3 +135,7 @@ harness = false
 [[bench]]
 name = "lsm_compaction"
 harness = false
+
+[[bench]]
+name = "row_group_fetch"
+harness = false

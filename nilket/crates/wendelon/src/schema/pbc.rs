@@ -139,6 +139,17 @@ pub enum ColumnPredicateLiteralV1 {
 	List(Vec<ColumnPredicateLiteralV1>),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum PredicateTreeV1 {
+	Comparison(ColumnPredicateV1),
+	IsNull { column_index: usize },
+	IsNotNull { column_index: usize },
+	And(Vec<PredicateTreeV1>),
+	Or(Vec<PredicateTreeV1>),
+	AlwaysTrue,
+	Unsupported,
+}
+
 impl Program {
 	pub fn compile(bytecode: &[u8]) -> std::io::Result<Self> {
 		if bytecode.len() > MAX_BYTECODE_BYTES {
@@ -238,6 +249,10 @@ impl Program {
 	pub fn conjunctive_column_predicates(&self) -> Option<Vec<ColumnPredicateV1>> {
 		extract_conjunctive_column_predicates(&self.ops)
 	}
+
+	pub fn predicate_tree(&self) -> PredicateTreeV1 {
+		extract_predicate_tree(&self.ops)
+	}
 }
 
 fn remap_project_columns(
@@ -264,6 +279,204 @@ enum PredicateExpr {
 	Predicates(Vec<ColumnPredicateV1>),
 	True,
 	Unsupported,
+}
+
+#[derive(Clone, Debug)]
+enum PredicateTreeExpr {
+	Column(usize),
+	Literal(ColumnPredicateLiteralV1),
+	Predicate(PredicateTreeV1),
+	AlwaysTrue,
+	Unsupported,
+}
+
+fn extract_predicate_tree(ops: &[Op]) -> PredicateTreeV1 {
+	if ops.is_empty() {
+		return PredicateTreeV1::AlwaysTrue;
+	}
+	let mut stack = Vec::with_capacity(STACK_DEPTH_LIMIT);
+	for op in ops {
+		match op {
+			Op::PushCol(column) => stack.push(PredicateTreeExpr::Column(*column as usize)),
+			Op::PushInt(value) => stack.push(PredicateTreeExpr::Literal(
+				ColumnPredicateLiteralV1::Int(*value),
+			)),
+			Op::PushStr(bytes) => stack.push(PredicateTreeExpr::Literal(
+				ColumnPredicateLiteralV1::Str(bytes.clone()),
+			)),
+			Op::PushBool(value) => {
+				if *value {
+					stack.push(PredicateTreeExpr::AlwaysTrue);
+				} else {
+					stack.push(PredicateTreeExpr::Unsupported);
+				}
+			}
+			Op::PushFloat(value) => stack.push(PredicateTreeExpr::Literal(
+				ColumnPredicateLiteralV1::Float(*value),
+			)),
+			Op::PushTs(value) => stack.push(PredicateTreeExpr::Literal(
+				ColumnPredicateLiteralV1::Ts(*value),
+			)),
+			Op::Eq | Op::Gt | Op::Lt | Op::Gte | Op::Lte => {
+				let Some(rhs) = stack.pop() else {
+					return PredicateTreeV1::Unsupported;
+				};
+				let Some(lhs) = stack.pop() else {
+					return PredicateTreeV1::Unsupported;
+				};
+				stack.push(predicate_tree_from_comparison(lhs, rhs, op));
+			}
+			Op::IsNull | Op::IsNotNull => {
+				let Some(value) = stack.pop() else {
+					return PredicateTreeV1::Unsupported;
+				};
+				stack.push(predicate_tree_from_null_check(
+					value,
+					matches!(op, Op::IsNotNull),
+				));
+			}
+			Op::And | Op::Or => {
+				let Some(rhs) = stack.pop() else {
+					return PredicateTreeV1::Unsupported;
+				};
+				let Some(lhs) = stack.pop() else {
+					return PredicateTreeV1::Unsupported;
+				};
+				stack.push(predicate_tree_from_logical(lhs, rhs, matches!(op, Op::Or)));
+			}
+			Op::Neq => {
+				if stack.pop().is_none() || stack.pop().is_none() {
+					return PredicateTreeV1::Unsupported;
+				}
+				stack.push(PredicateTreeExpr::Unsupported);
+			}
+			Op::Not => {
+				if stack.pop().is_none() {
+					return PredicateTreeV1::Unsupported;
+				}
+				stack.push(PredicateTreeExpr::Unsupported);
+			}
+			Op::InList(count) => {
+				let count = *count as usize;
+				if stack.len() < count + 1 {
+					return PredicateTreeV1::Unsupported;
+				}
+				let split = stack.len() - count;
+				stack.drain(split..);
+				stack.pop();
+				stack.push(PredicateTreeExpr::Unsupported);
+			}
+		}
+		if stack.len() > STACK_DEPTH_LIMIT {
+			return PredicateTreeV1::Unsupported;
+		}
+	}
+	match stack.as_slice() {
+		[PredicateTreeExpr::Predicate(predicate)] => predicate.clone(),
+		[PredicateTreeExpr::AlwaysTrue] => PredicateTreeV1::AlwaysTrue,
+		_ => PredicateTreeV1::Unsupported,
+	}
+}
+
+fn predicate_tree_from_comparison(
+	lhs: PredicateTreeExpr,
+	rhs: PredicateTreeExpr,
+	op: &Op,
+) -> PredicateTreeExpr {
+	let predicate = match (lhs, rhs) {
+		(PredicateTreeExpr::Column(column_index), PredicateTreeExpr::Literal(literal)) => {
+			predicate_comparison(op).map(|comparison| ColumnPredicateV1 {
+				column_index,
+				comparison,
+				literal,
+			})
+		}
+		(PredicateTreeExpr::Literal(literal), PredicateTreeExpr::Column(column_index)) => {
+			predicate_comparison_reversed(op).map(|comparison| ColumnPredicateV1 {
+				column_index,
+				comparison,
+				literal,
+			})
+		}
+		_ => None,
+	};
+	predicate
+		.map(PredicateTreeV1::Comparison)
+		.map(PredicateTreeExpr::Predicate)
+		.unwrap_or(PredicateTreeExpr::Unsupported)
+}
+
+fn predicate_tree_from_null_check(
+	value: PredicateTreeExpr,
+	is_not_null: bool,
+) -> PredicateTreeExpr {
+	match value {
+		PredicateTreeExpr::Column(column_index) if is_not_null => {
+			PredicateTreeExpr::Predicate(PredicateTreeV1::IsNotNull { column_index })
+		}
+		PredicateTreeExpr::Column(column_index) => {
+			PredicateTreeExpr::Predicate(PredicateTreeV1::IsNull { column_index })
+		}
+		_ => PredicateTreeExpr::Unsupported,
+	}
+}
+
+fn predicate_tree_from_logical(
+	lhs: PredicateTreeExpr,
+	rhs: PredicateTreeExpr,
+	is_or: bool,
+) -> PredicateTreeExpr {
+	let left = predicate_tree_expr_to_predicate(lhs);
+	let right = predicate_tree_expr_to_predicate(rhs);
+	let predicate = if is_or {
+		PredicateTreeV1::Or(flatten_predicate_tree_or(left, right))
+	} else {
+		PredicateTreeV1::And(flatten_predicate_tree_and(left, right))
+	};
+	PredicateTreeExpr::Predicate(predicate)
+}
+
+fn predicate_tree_expr_to_predicate(expr: PredicateTreeExpr) -> PredicateTreeV1 {
+	match expr {
+		PredicateTreeExpr::Predicate(predicate) => predicate,
+		PredicateTreeExpr::AlwaysTrue => PredicateTreeV1::AlwaysTrue,
+		_ => PredicateTreeV1::Unsupported,
+	}
+}
+
+fn flatten_predicate_tree_and(
+	left: PredicateTreeV1,
+	right: PredicateTreeV1,
+) -> Vec<PredicateTreeV1> {
+	let mut out = Vec::new();
+	push_and_branch(&mut out, left);
+	push_and_branch(&mut out, right);
+	out
+}
+
+fn flatten_predicate_tree_or(
+	left: PredicateTreeV1,
+	right: PredicateTreeV1,
+) -> Vec<PredicateTreeV1> {
+	let mut out = Vec::new();
+	push_or_branch(&mut out, left);
+	push_or_branch(&mut out, right);
+	out
+}
+
+fn push_and_branch(out: &mut Vec<PredicateTreeV1>, predicate: PredicateTreeV1) {
+	match predicate {
+		PredicateTreeV1::And(branches) => out.extend(branches),
+		PredicateTreeV1::AlwaysTrue => {}
+		other => out.push(other),
+	}
+}
+
+fn push_or_branch(out: &mut Vec<PredicateTreeV1>, predicate: PredicateTreeV1) {
+	match predicate {
+		PredicateTreeV1::Or(branches) => out.extend(branches),
+		other => out.push(other),
+	}
 }
 
 fn extract_conjunctive_column_predicates(ops: &[Op]) -> Option<Vec<ColumnPredicateV1>> {
@@ -586,6 +799,19 @@ pub fn execute(bytecode: &[u8], batch: &RecordBatch) -> std::io::Result<RecordBa
 pub fn execute_program(program: &Program, batch: &RecordBatch) -> std::io::Result<RecordBatch> {
 	validate_program_against_batch(program, batch)?;
 	execute_program_vectorized(program, batch)
+}
+
+pub fn survival_mask(program: &Program, batch: &RecordBatch) -> std::io::Result<BooleanArray> {
+	validate_program_against_batch(program, batch)?;
+	let mut stats = VectorExecStats::default();
+	match evaluate_program_vectorized(program, batch, &mut stats) {
+		Ok(Some(mask)) => Ok(mask),
+		Ok(None) => Ok(BooleanArray::from(vec![true; batch.num_rows()])),
+		Err(err) => {
+			tracing::debug!(error = %err, "PBC vector runtime trap normalized to false survival mask");
+			Ok(BooleanArray::from(vec![false; batch.num_rows()]))
+		}
+	}
 }
 
 fn execute_program_vectorized(

@@ -19,7 +19,9 @@ use crate::node::{
 	ObservabilityConfig, SeedNodeConfig, TransportTlsConfig,
 };
 use crate::schema::ProtocolVersionWindow;
-use crate::storage::{L2ColumnFetchConfig, MvccRetentionPolicy};
+use crate::storage::{
+	L2ColumnFetchConfig, L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
+};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -121,6 +123,10 @@ struct RawStorageConfig {
 	lsm_compaction_paused: bool,
 	#[serde(default)]
 	l2_column_fetch: RawL2ColumnFetchConfig,
+	#[serde(default)]
+	row_group_writer: RawRowGroupWriterConfig,
+	#[serde(default)]
+	l2_row_group_fetch: RawL2RowGroupFetchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,6 +165,80 @@ impl RawL2ColumnFetchConfig {
 		}
 		if let Some(fraction) = self.max_selected_fraction_micros {
 			cfg.max_selected_fraction_micros = fraction;
+		}
+		if let Some(count) = self.max_ranges_per_record {
+			cfg.max_ranges_per_record = crate::schema::EncryptedChunkCount::new(count);
+		}
+		if let Some(count) = self.max_parallel_range_gets {
+			cfg.max_parallel_range_gets = crate::schema::EncryptedChunkCount::new(count);
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRowGroupWriterConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	target_row_group_rows: Option<u32>,
+	#[serde(default)]
+	max_row_group_rows: Option<u32>,
+	#[serde(default)]
+	min_paged_record_rows: Option<u64>,
+	#[serde(default)]
+	min_paged_record_bytes: Option<u64>,
+}
+
+impl RawRowGroupWriterConfig {
+	fn into_runtime_config(self) -> std::io::Result<RowGroupWriterConfig> {
+		let mut cfg = RowGroupWriterConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(rows) = self.target_row_group_rows {
+			cfg.target_row_group_rows = crate::schema::RowGroupRowCount::new(rows);
+		}
+		if let Some(rows) = self.max_row_group_rows {
+			cfg.max_row_group_rows = crate::schema::RowGroupRowCount::new(rows);
+		}
+		if let Some(rows) = self.min_paged_record_rows {
+			cfg.min_paged_record_rows = crate::schema::RowCount::new(rows);
+		}
+		if let Some(bytes) = self.min_paged_record_bytes {
+			cfg.min_paged_record_bytes = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawL2RowGroupFetchConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	max_selected_row_group_fraction_micros: Option<u32>,
+	#[serde(default)]
+	max_selected_byte_fraction_micros: Option<u32>,
+	#[serde(default)]
+	max_ranges_per_record: Option<u32>,
+	#[serde(default)]
+	max_parallel_range_gets: Option<u32>,
+}
+
+impl RawL2RowGroupFetchConfig {
+	fn into_runtime_config(self) -> std::io::Result<L2RowGroupFetchConfig> {
+		let mut cfg = L2RowGroupFetchConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(fraction) = self.max_selected_row_group_fraction_micros {
+			cfg.max_selected_row_group_fraction_micros = fraction;
+		}
+		if let Some(fraction) = self.max_selected_byte_fraction_micros {
+			cfg.max_selected_byte_fraction_micros = fraction;
 		}
 		if let Some(count) = self.max_ranges_per_record {
 			cfg.max_ranges_per_record = crate::schema::EncryptedChunkCount::new(count);
@@ -533,6 +613,8 @@ impl RawConfig {
 
 		let slab_max_bytes = self.storage.slab_max_bytes;
 		let l2_column_fetch = self.storage.l2_column_fetch.into_runtime_config()?;
+		let row_group_writer = self.storage.row_group_writer.into_runtime_config()?;
+		let l2_row_group_fetch = self.storage.l2_row_group_fetch.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
 			data_dir,
@@ -552,6 +634,8 @@ impl RawConfig {
 			lsm_compaction_paused: self.storage.lsm_compaction_paused,
 			rehydration: crate::storage::manager::RehydrationPolicy::default(),
 			l2_column_fetch,
+			row_group_writer,
+			l2_row_group_fetch,
 			root_kek_provider: self.crypto.root_kek_provider,
 			crypto_cache: CryptoCacheConfig {
 				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,

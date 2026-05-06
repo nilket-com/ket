@@ -354,15 +354,20 @@ async fn property_pending_finalization_restart_recovers_without_losing_value() {
 	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
 	loop {
 		let audit = fs::read_to_string(&audit_path).unwrap_or_default();
-		if audit
-			.matches("\"event_type\":\"data.write_finalized\"")
-			.count() == 1
-		{
+		let finalized_user_write_count = audit
+			.lines()
+			.filter(|line| {
+				line.contains("\"event_type\":\"data.write_finalized\"")
+					&& line.contains("\"record_count\":1")
+			})
+			.count();
+		if finalized_user_write_count == 1 {
 			break;
 		}
 		assert!(
 			tokio::time::Instant::now() < deadline,
-			"timed out waiting for finalization audit evidence"
+			"timed out waiting for finalization audit evidence; current log: {}",
+			audit
 		);
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}

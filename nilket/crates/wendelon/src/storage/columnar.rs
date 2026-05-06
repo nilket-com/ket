@@ -10,7 +10,12 @@ use crate::schema::{
 	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptorV1,
 };
 use crate::storage::core::RecordLocation;
-use arrow::array::{ArrayData, ArrayRef, NullArray, make_array};
+use crate::storage::row_group::{
+	ROW_GROUP_DIRECTORY_METADATA_KEY, RecordPageDirectory, RowGroupFallbackReason,
+	RowGroupFetchPlan, RowGroupRejectCode, deserialize_page_directory_value,
+	validate_page_directory,
+};
+use arrow::array::{ArrayData, ArrayRef, BooleanArray, NullArray, UInt32Array, make_array};
 use arrow::buffer::Buffer;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
@@ -379,6 +384,7 @@ pub struct RecordBufferDirectory {
 	pub column_null_counts: Vec<usize>,
 	pub storage_column_ordinals: BTreeMap<StorageColumn, u32>,
 	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
+	pub page_directory: Option<RecordPageDirectory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -500,6 +506,12 @@ impl StorageColumnSet {
 		Self::default()
 	}
 
+	pub fn from_columns(columns: impl IntoIterator<Item = StorageColumn>) -> Self {
+		Self {
+			columns: columns.into_iter().collect(),
+		}
+	}
+
 	pub fn insert(&mut self, column: StorageColumn) -> bool {
 		self.columns.insert(column)
 	}
@@ -559,6 +571,32 @@ impl ColumnFetchRequirement {
 		out.extend(&self.output_columns);
 		out.extend(&self.aggregate_columns);
 		out
+	}
+
+	pub fn excluding(&self, excluded: &ColumnFetchRequirement) -> Self {
+		let excluded_visible = excluded.user_visible();
+		Self {
+			predicate_columns: ColumnOrdinalSet::from_columns(
+				self.predicate_columns
+					.iter()
+					.filter(|column| !excluded_visible.contains(*column)),
+			),
+			output_columns: ColumnOrdinalSet::from_columns(
+				self.output_columns
+					.iter()
+					.filter(|column| !excluded_visible.contains(*column)),
+			),
+			aggregate_columns: ColumnOrdinalSet::from_columns(
+				self.aggregate_columns
+					.iter()
+					.filter(|column| !excluded_visible.contains(*column)),
+			),
+			storage_columns: StorageColumnSet::from_columns(
+				self.storage_columns
+					.iter()
+					.filter(|column| !excluded.storage_columns.contains(*column)),
+			),
+		}
 	}
 }
 
@@ -730,51 +768,33 @@ fn classify_requirement_column(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum L2FetchStrategy {
+	RowGroup(RowGroupFetchPlan),
 	WholeRecord,
 	Columnar(ColumnarRecordFetchPlan),
-	Fallback(ColumnarFallbackReason),
+	Fallback(RowGroupFallbackReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ColumnarFallbackReason {
-	Disabled,
-	SingleRow,
-	FullProjection,
-	SmallRecord,
-	TooManyBytes,
-	TooManyRanges,
-	MetadataProbeCap,
-	UnsupportedArrowLayout,
-	RehydrationAvailable,
-}
-
-impl ColumnarFallbackReason {
-	pub fn as_str(self) -> &'static str {
-		match self {
-			Self::Disabled => "disabled",
-			Self::SingleRow => "single_row",
-			Self::FullProjection => "full_projection",
-			Self::SmallRecord => "small_record",
-			Self::TooManyBytes => "too_many_bytes",
-			Self::TooManyRanges => "too_many_ranges",
-			Self::MetadataProbeCap => "metadata_probe_cap",
-			Self::UnsupportedArrowLayout => "unsupported_arrow_layout",
-			Self::RehydrationAvailable => "rehydration_available",
-		}
-	}
-}
+pub type ColumnarFallbackReason = RowGroupFallbackReason;
 
 impl L2FetchStrategy {
-	pub fn fallback_reason(&self) -> Option<ColumnarFallbackReason> {
+	pub fn fallback_reason(&self) -> Option<RowGroupFallbackReason> {
 		match self {
 			Self::Fallback(reason) => Some(*reason),
-			Self::WholeRecord | Self::Columnar(_) => None,
+			Self::RowGroup(_) | Self::WholeRecord | Self::Columnar(_) => None,
 		}
 	}
 
 	pub fn selected_chunk_runs(&self) -> Option<u64> {
 		match self {
 			Self::Columnar(plan) => Some(plan.chunk_runs.len() as u64),
+			Self::RowGroup(plan) => Some(
+				plan.phase_c_fetch.chunk_runs.len().saturating_add(
+					plan.phase_b_fetch
+						.as_ref()
+						.map(|phase_b| phase_b.chunk_runs.len())
+						.unwrap_or(0),
+				) as u64,
+			),
 			Self::WholeRecord | Self::Fallback(_) => None,
 		}
 	}
@@ -868,6 +888,53 @@ impl ProjectedRecordBatch {
 			storage_mapping: self.storage_mapping.clone(),
 		}
 	}
+
+	pub fn take_rows(&self, row_indices: &[usize]) -> std::io::Result<Self> {
+		let indices = UInt32Array::from(
+			row_indices
+				.iter()
+				.map(|row| {
+					u32::try_from(*row).map_err(|_| {
+						Error::new(
+							ErrorKind::InvalidData,
+							format!("projected row index {row} exceeds u32::MAX"),
+						)
+					})
+				})
+				.collect::<std::io::Result<Vec<_>>>()?,
+		);
+		let columns = self
+			.batch
+			.columns()
+			.iter()
+			.map(|column| {
+				arrow::compute::take(column.as_ref(), &indices, None).map_err(|err| {
+					Error::new(ErrorKind::InvalidData, format!("projected row take: {err}"))
+				})
+			})
+			.collect::<std::io::Result<Vec<_>>>()?;
+		let batch = if columns.is_empty() {
+			RecordBatch::try_new_with_options(
+				self.batch.schema(),
+				columns,
+				&arrow::record_batch::RecordBatchOptions::new()
+					.with_row_count(Some(row_indices.len())),
+			)
+		} else {
+			RecordBatch::try_new(self.batch.schema(), columns)
+		}
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("projected row take batch failed: {err}"),
+			)
+		})?;
+		Ok(Self {
+			batch,
+			ordinal_mapping: self.ordinal_mapping.clone(),
+			storage_mapping: self.storage_mapping.clone(),
+		})
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -898,8 +965,19 @@ pub enum ColumnFetchError {
 	SchemaMismatch { record_id: TieredRecordId },
 	#[error("columnar range invalid: {0}")]
 	InvalidRange(String),
+	#[error("row-group page directory rejected: {0:?}")]
+	RowGroupRejected(RowGroupRejectCode),
 	#[error("unsupported arrow layout for columnar materialization")]
 	UnsupportedArrowLayout,
+}
+
+impl ColumnFetchError {
+	pub fn row_group_reject_code(&self) -> Option<RowGroupRejectCode> {
+		match self {
+			Self::RowGroupRejected(code) => Some(*code),
+			_ => None,
+		}
+	}
 }
 
 pub fn parse_record_buffer_directory(
@@ -1022,6 +1100,29 @@ pub fn parse_record_buffer_directory(
 		)));
 	}
 
+	let page_directory = match ipc_schema.metadata().get(ROW_GROUP_DIRECTORY_METADATA_KEY) {
+		Some(value) => {
+			crate::metrics::global()
+				.observe_storage_l2_row_group_fetch_directory_bytes(value.len() as u64);
+			let mut page_directory =
+				deserialize_page_directory_value(value).map_err(row_group_reject_error)?;
+			if page_directory.record_id.slab_id == SlabId::ZERO
+				&& page_directory.record_id.record_offset == RecordBodyByteOffset::ZERO
+			{
+				page_directory.record_id = record_id;
+			}
+			validate_page_directory(
+				&page_directory,
+				record_len,
+				&ipc_schema,
+				descriptor.logical_schema_fingerprint,
+			)
+			.map_err(row_group_reject_error)?;
+			Some(page_directory)
+		}
+		None => None,
+	};
+
 	Ok(RecordBufferDirectory {
 		record_id,
 		record_plaintext_range,
@@ -1033,7 +1134,13 @@ pub fn parse_record_buffer_directory(
 		column_null_counts,
 		storage_column_ordinals,
 		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+		page_directory,
 	})
+}
+
+fn row_group_reject_error(code: RowGroupRejectCode) -> ColumnFetchError {
+	crate::metrics::global().observe_storage_l2_row_group_fetch_invariant_violation(code.as_str());
+	ColumnFetchError::RowGroupRejected(code)
 }
 
 pub fn selected_record_body_ranges(
@@ -1594,6 +1701,18 @@ pub fn execute_aggregate_projected_record_batch(
 		&requirement.aggregate_columns,
 		user_column_count,
 	)
+}
+
+pub fn survival_mask_projected_record_batch(
+	projected: &ProjectedRecordBatch,
+	program: &Program,
+	user_column_count: usize,
+) -> std::io::Result<BooleanArray> {
+	let remapped = program.remap_columns_with_project(
+		|column| map_projected_pbc_column(projected, column, user_column_count),
+		Some(&[]),
+	)?;
+	pbc::survival_mask(&remapped, &projected.batch)
 }
 
 fn execute_projected_record_batch_with_outputs(
