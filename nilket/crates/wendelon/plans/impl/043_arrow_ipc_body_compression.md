@@ -25,7 +25,7 @@ L2.
 
 ## Non-goals (V1)
 
-- No homerolled lightweight columnar encodings (Brainstorm
+- No homerolled encoding cascades (Brainstorm
   011 V2 / V3).
 - No per-buffer page directory for O(1) point-read
   decompression.

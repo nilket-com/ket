@@ -20,7 +20,8 @@ use crate::node::{
 };
 use crate::schema::ProtocolVersionWindow;
 use crate::storage::{
-	L2ColumnFetchConfig, L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
+	EncodingCascadeKind, EncodingWriterConfig, L2ColumnFetchConfig, L2EncodingFetchConfig,
+	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -127,6 +128,10 @@ struct RawStorageConfig {
 	row_group_writer: RawRowGroupWriterConfig,
 	#[serde(default)]
 	l2_row_group_fetch: RawL2RowGroupFetchConfig,
+	#[serde(default)]
+	encoding_writer: RawEncodingWriterConfig,
+	#[serde(default)]
+	l2_encoding_fetch: RawL2EncodingFetchConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -245,6 +250,79 @@ impl RawL2RowGroupFetchConfig {
 		}
 		if let Some(count) = self.max_parallel_range_gets {
 			cfg.max_parallel_range_gets = crate::schema::EncryptedChunkCount::new(count);
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawEncodingWriterConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	target_simd_page_values: Option<u32>,
+	#[serde(default)]
+	cascade_sample_rows: Option<u32>,
+	#[serde(default)]
+	min_buffer_bytes_for_encoding: Option<u64>,
+	#[serde(default)]
+	enabled_cascades: Option<Vec<String>>,
+}
+
+impl RawEncodingWriterConfig {
+	fn into_runtime_config(self) -> std::io::Result<EncodingWriterConfig> {
+		let mut cfg = EncodingWriterConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(values) = self.target_simd_page_values {
+			cfg.target_simd_page_values = crate::schema::SimdPageValueCount::new(values);
+		}
+		if let Some(rows) = self.cascade_sample_rows {
+			cfg.cascade_sample_rows = crate::schema::SampleRowCount::new(rows);
+		}
+		if let Some(bytes) = self.min_buffer_bytes_for_encoding {
+			cfg.min_buffer_bytes_for_encoding = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		if let Some(cascades) = self.enabled_cascades {
+			cfg.enabled_cascades.clear();
+			for cascade in cascades {
+				let Some(kind) = EncodingCascadeKind::from_label(cascade.as_str()) else {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!("unknown Encoding cascade label {cascade:?}"),
+					));
+				};
+				cfg.enabled_cascades.insert(kind);
+			}
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawL2EncodingFetchConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	max_simd_pages_per_record: Option<u32>,
+	#[serde(default)]
+	max_parallel_materialize_tasks: Option<u32>,
+}
+
+impl RawL2EncodingFetchConfig {
+	fn into_runtime_config(self) -> std::io::Result<L2EncodingFetchConfig> {
+		let mut cfg = L2EncodingFetchConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(count) = self.max_simd_pages_per_record {
+			cfg.max_simd_pages_per_record = crate::schema::EncodingPageCount::new(count);
+		}
+		if let Some(count) = self.max_parallel_materialize_tasks {
+			cfg.max_parallel_materialize_tasks = crate::schema::TaskCount::new(count);
 		}
 		cfg.validate()?;
 		Ok(cfg)
@@ -615,6 +693,8 @@ impl RawConfig {
 		let l2_column_fetch = self.storage.l2_column_fetch.into_runtime_config()?;
 		let row_group_writer = self.storage.row_group_writer.into_runtime_config()?;
 		let l2_row_group_fetch = self.storage.l2_row_group_fetch.into_runtime_config()?;
+		let encoding_writer = self.storage.encoding_writer.into_runtime_config()?;
+		let l2_encoding_fetch = self.storage.l2_encoding_fetch.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
 			data_dir,
@@ -636,6 +716,8 @@ impl RawConfig {
 			l2_column_fetch,
 			row_group_writer,
 			l2_row_group_fetch,
+			encoding_writer,
+			l2_encoding_fetch,
 			root_kek_provider: self.crypto.root_kek_provider,
 			crypto_cache: CryptoCacheConfig {
 				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,

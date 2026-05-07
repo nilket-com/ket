@@ -11,6 +11,11 @@ use crate::schema::{
 };
 use crate::storage::columnar::TieredRecordId;
 use crate::storage::core::MultiRowIndexEntry;
+use crate::storage::encoding::directory::{
+	build_encoding_directory_for_ipc_stream, compact_encoding_ipc_stream,
+	serialize_encoding_directory_value,
+};
+use crate::storage::encoding::{ENCODING_DIRECTORY_METADATA_KEY, EncodingWriterConfig};
 use crate::storage::ipc::{
 	EncodedRecordBatch, encode_record_batch, encode_record_batch_bytes,
 	encode_record_batches_bytes, record_batch_compression_policy_from_ipc,
@@ -151,6 +156,26 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 ) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
+	pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
+		meta,
+		descriptor,
+		batch,
+		admission,
+		row_hlc,
+		row_group_config,
+		&EncodingWriterConfig::default(),
+	)
+}
+
+pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
+	meta: &TableWriteRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+	batch: &RecordBatch,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
 	let layout = match &descriptor.record_layout_policy {
 		RecordLayoutPolicy::MultiRow(layout) => *layout,
 		RecordLayoutPolicy::SingleRow => {
@@ -198,6 +223,17 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 				row_group_config,
 			)
 			.map_err(table_pack_io_error)?;
+			if encoding_config.enabled {
+				encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+					batch,
+					&rows[cursor..cursor + upper],
+					descriptor,
+					descriptor.record_body_compression_policy,
+					row_group_config,
+					encoding_config,
+				)
+				.map_err(table_pack_io_error)?;
+			}
 			if encoded.plaintext_byte_len > max_record_bytes && upper > 1 {
 				let mut low = 1;
 				let mut high = upper - 1;
@@ -212,6 +248,19 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 						row_group_config,
 					)
 					.map_err(table_pack_io_error)?;
+					let candidate = if encoding_config.enabled {
+						encode_multirow_from_survivors_with_row_group_and_encoding_config(
+							batch,
+							&rows[cursor..cursor + mid],
+							descriptor,
+							descriptor.record_body_compression_policy,
+							row_group_config,
+							encoding_config,
+						)
+						.map_err(table_pack_io_error)?
+					} else {
+						candidate
+					};
 					if candidate.plaintext_byte_len <= max_record_bytes || mid == 1 {
 						best = Some((mid, candidate));
 						low = mid + 1;
@@ -273,6 +322,7 @@ pub fn encode_multirow_from_survivors_with_policy(
 		policy,
 		None,
 		&RowGroupWriterConfig::default(),
+		&EncodingWriterConfig::default(),
 	)
 }
 
@@ -289,6 +339,25 @@ pub fn encode_multirow_from_survivors_with_row_group_config(
 		policy,
 		Some(descriptor),
 		row_group_config,
+		&EncodingWriterConfig::default(),
+	)
+}
+
+pub fn encode_multirow_from_survivors_with_row_group_and_encoding_config(
+	batch: &RecordBatch,
+	survivors: &[MultiRowSourceRow],
+	descriptor: &TableSchemaDescriptorV1,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+) -> std::io::Result<EncodedMultiRowFrame> {
+	encode_multirow_from_survivors_with_optional_row_groups(
+		batch,
+		survivors,
+		policy,
+		Some(descriptor),
+		row_group_config,
+		encoding_config,
 	)
 }
 
@@ -298,6 +367,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 	policy: RecordBodyCompressionPolicy,
 	descriptor: Option<&TableSchemaDescriptorV1>,
 	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<EncodedMultiRowFrame> {
 	if survivors.is_empty() {
 		return Err(Error::new(
@@ -330,6 +400,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 		descriptor,
 		policy,
 		row_group_config,
+		encoding_config,
 	)?;
 	let decoded_rows = storage_rows_from_batch(&storage_batch)?;
 	let max_row_hlc = decoded_rows
@@ -352,6 +423,7 @@ fn encode_storage_batch_with_optional_row_groups(
 	descriptor: Option<&TableSchemaDescriptorV1>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<EncodedRecordBatch> {
 	let single = encode_record_batch(storage_batch, policy)?;
 	let Some(descriptor) = descriptor else {
@@ -365,7 +437,13 @@ fn encode_storage_batch_with_optional_row_groups(
 	if batches.len() <= 1 {
 		return Ok(single);
 	}
-	encode_row_group_batches_with_directory(&batches, descriptor, policy, row_group_config)
+	encode_row_group_batches_with_directory(
+		&batches,
+		descriptor,
+		policy,
+		row_group_config,
+		encoding_config,
+	)
 }
 
 fn split_row_group_batches(
@@ -388,10 +466,16 @@ fn encode_row_group_batches_with_directory(
 	descriptor: &TableSchemaDescriptorV1,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<EncodedRecordBatch> {
 	let mut directory_value = String::new();
+	let mut encoding_directory_value = String::new();
 	for _ in 0..8 {
-		let batches = batches_with_row_group_metadata(base_batches, &directory_value)?;
+		let batches = batches_with_storage_metadata(
+			base_batches,
+			&directory_value,
+			&encoding_directory_value,
+		)?;
 		let bytes = encode_record_batches_bytes(&batches, policy)?;
 		let directory = build_page_directory_for_ipc_stream(
 			TieredRecordId {
@@ -403,11 +487,54 @@ fn encode_row_group_batches_with_directory(
 			descriptor.logical_schema_fingerprint,
 			&row_group_config.stats_supported_types,
 		)?;
-		let next_value = serialize_page_directory_value(&directory)?;
-		if next_value == directory_value {
-			return encoded_row_group_batches_from_bytes(&batches, policy, bytes);
+		let (physical_bytes, physical_directory, physical_encoding_directory) =
+			if encoding_config.enabled && policy == RecordBodyCompressionPolicy::Uncompressed {
+				let (encoding_directory, applied) = build_encoding_directory_for_ipc_stream(
+					TieredRecordId {
+						slab_id: SlabId::ZERO,
+						record_offset: RecordBodyByteOffset::ZERO,
+					},
+					&bytes,
+					&directory,
+					&batches,
+					encoding_config,
+				)?;
+				match encoding_directory {
+					Some(encoding_directory) => {
+						let compacted = compact_encoding_ipc_stream(
+							&bytes,
+							&directory,
+							&encoding_directory,
+							&applied,
+						)?;
+						(
+							compacted.bytes,
+							compacted.page_directory,
+							Some(compacted.encoding_directory),
+						)
+					}
+					None => (bytes.clone(), directory.clone(), None),
+				}
+			} else {
+				(bytes.clone(), directory.clone(), None)
+			};
+		let next_value = serialize_page_directory_value(&physical_directory)?;
+		let next_encoding_value = match physical_encoding_directory {
+			Some(encoding_directory) => {
+				let value = serialize_encoding_directory_value(&encoding_directory)?;
+				if !value.is_empty() {
+					crate::metrics::global()
+						.observe_storage_l2_encoding_directory_bytes(value.len() as u64);
+				};
+				value
+			}
+			None => String::new(),
+		};
+		if next_value == directory_value && next_encoding_value == encoding_directory_value {
+			return encoded_row_group_batches_from_bytes(&batches, policy, physical_bytes);
 		}
 		directory_value = next_value;
+		encoding_directory_value = next_encoding_value;
 	}
 	crate::metrics::global()
 		.observe_storage_l2_row_group_fetch_invariant_violation("page_directory_parse_error");
@@ -444,9 +571,10 @@ fn encoded_row_group_batches_from_bytes(
 	})
 }
 
-fn batches_with_row_group_metadata(
+fn batches_with_storage_metadata(
 	base_batches: &[RecordBatch],
 	directory_value: &str,
+	encoding_directory_value: &str,
 ) -> std::io::Result<Vec<RecordBatch>> {
 	let Some(first) = base_batches.first() else {
 		return Err(Error::new(
@@ -459,6 +587,14 @@ fn batches_with_row_group_metadata(
 		ROW_GROUP_DIRECTORY_METADATA_KEY.to_string(),
 		directory_value.to_string(),
 	);
+	if !encoding_directory_value.is_empty() {
+		metadata.insert(
+			ENCODING_DIRECTORY_METADATA_KEY.to_string(),
+			encoding_directory_value.to_string(),
+		);
+	} else {
+		metadata.remove(ENCODING_DIRECTORY_METADATA_KEY);
+	}
 	let schema = Arc::new(Schema::new_with_metadata(
 		first.schema().fields().iter().cloned().collect::<Vec<_>>(),
 		metadata,
@@ -524,6 +660,26 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
+	pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
+		layout,
+		batch,
+		rows,
+		descriptor,
+		policy,
+		row_group_config,
+		&EncodingWriterConfig::default(),
+	)
+}
+
+pub fn pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
+	layout: MultiRowLayoutDescriptor,
+	batch: &RecordBatch,
+	rows: &[MultiRowSourceRow],
+	descriptor: Option<&TableSchemaDescriptorV1>,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	pack_multirow_source_rows_with_caps(
 		batch,
 		rows,
@@ -533,6 +689,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
 		descriptor,
 		policy,
 		row_group_config,
+		encoding_config,
 	)
 }
 
@@ -623,6 +780,7 @@ pub fn merge_multirow_streams(
 		None,
 		RecordBodyCompressionPolicy::Uncompressed,
 		&RowGroupWriterConfig::default(),
+		&EncodingWriterConfig::default(),
 	)?
 	.into_iter()
 	.map(|packed| packed.encoded)
@@ -953,6 +1111,15 @@ pub fn encode_batch_with_policy(
 }
 
 pub fn decode_batch(bytes: &[u8]) -> std::io::Result<RecordBatch> {
+	let materialized;
+	let bytes =
+		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(bytes) {
+			materialized =
+				crate::storage::encoding::materialize::materialize_encoding_ipc_stream(bytes)?;
+			materialized.as_slice()
+		} else {
+			bytes
+		};
 	let policy = record_batch_compression_policy_from_ipc(bytes).ok();
 	let started = Instant::now();
 	let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
@@ -1144,6 +1311,7 @@ fn pack_multirow_source_rows_with_caps(
 	descriptor: Option<&TableSchemaDescriptorV1>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	if rows.is_empty() {
 		return Ok(Vec::new());
@@ -1167,13 +1335,16 @@ fn pack_multirow_source_rows_with_caps(
 				let mid = (low + high) / 2;
 				let source_rows = &bucket_rows[cursor..cursor + mid];
 				let encoded = match descriptor {
-					Some(descriptor) => encode_multirow_from_survivors_with_row_group_config(
-						batch,
-						source_rows,
-						descriptor,
-						policy,
-						row_group_config,
-					)?,
+					Some(descriptor) => {
+						encode_multirow_from_survivors_with_row_group_and_encoding_config(
+							batch,
+							source_rows,
+							descriptor,
+							policy,
+							row_group_config,
+							encoding_config,
+						)?
+					}
 					None => encode_multirow_from_survivors_with_policy(batch, source_rows, policy)?,
 				};
 				if encoded.plaintext_byte_len <= max_record_bytes || mid == 1 {

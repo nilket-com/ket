@@ -92,6 +92,7 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
+use crate::storage::encoding::{EncodingWriterConfig, L2EncodingFetchConfig};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
@@ -210,6 +211,10 @@ pub struct NodeBootstrapConfig {
 	pub row_group_writer: RowGroupWriterConfig,
 	/// Node-local ADR 056 L2 row-group fetch strategy config.
 	pub l2_row_group_fetch: L2RowGroupFetchConfig,
+	/// Deployment-wide ADR 057 Encoding writer config.
+	pub encoding_writer: EncodingWriterConfig,
+	/// Node-local ADR 057 L2 Encoding materialization config.
+	pub l2_encoding_fetch: L2EncodingFetchConfig,
 	/// Root KEK provider used to wrap and unwrap tenant KEKs.
 	pub root_kek_provider: RootKekProviderConfig,
 	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
@@ -272,6 +277,8 @@ impl NodeBootstrapConfig {
 			l2_column_fetch: L2ColumnFetchConfig::default(),
 			row_group_writer: RowGroupWriterConfig::default(),
 			l2_row_group_fetch: L2RowGroupFetchConfig::default(),
+			encoding_writer: EncodingWriterConfig::default(),
+			l2_encoding_fetch: L2EncodingFetchConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
@@ -398,6 +405,8 @@ impl NodeBootstrapConfig {
 		self.l2_column_fetch.validate()?;
 		self.row_group_writer.validate()?;
 		self.l2_row_group_fetch.validate()?;
+		self.encoding_writer.validate()?;
+		self.l2_encoding_fetch.validate()?;
 		if let Some(l2) = &self.l2 {
 			l2.build()?;
 			if self.tiering.scan_interval.is_zero() {
@@ -1298,6 +1307,8 @@ impl WendelonNode {
 				l2_column_fetch: cfg.l2_column_fetch.clone(),
 				row_group_writer: cfg.row_group_writer.clone(),
 				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
+				encoding_writer: cfg.encoding_writer.clone(),
+				l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
 				group_commit: cfg.group_commit.clone(),
 				crypto: crypto.clone(),
 			})

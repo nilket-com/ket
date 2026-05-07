@@ -885,12 +885,63 @@ pub fn selected_row_group_record_body_ranges_excluding_requirement(
 				&& selected_buffers.contains(&page.ipc_buffer_ordinal.get())
 				&& page.range.len.get() > 0
 			{
-				ranges.push(page.range);
+				ranges.push(encoding_fetch_range_for_buffer_page(
+					record_directory,
+					page,
+				)?);
 			}
 		}
 	}
 	coalesce_record_body_ranges(&mut ranges)?;
 	Ok(ranges)
+}
+
+fn encoding_fetch_range_for_buffer_page(
+	record_directory: &RecordBufferDirectory,
+	page: &BufferPageDirectoryEntry,
+) -> Result<RecordBodyByteRange, ColumnFetchError> {
+	let Some(encoding_directory) = record_directory.encoding_directory.as_ref() else {
+		return Ok(page.range);
+	};
+	let Some(encoding) = encoding_directory.buffers.iter().find(|encoding| {
+		encoding.row_group_index == page.row_group_index
+			&& encoding.ipc_column_ordinal == page.ipc_column_ordinal
+			&& encoding.ipc_buffer_ordinal == page.ipc_buffer_ordinal
+	}) else {
+		return Ok(page.range);
+	};
+	let encoded_start = u64::from(encoding.encoded_range.start.get());
+	let encoded_end = encoding
+		.encoded_range
+		.end()
+		.map_err(|err| ColumnFetchError::InvalidRange(format!("Encoding range: {err}")))?;
+	if encoded_end > page.range.len.get() {
+		return Err(ColumnFetchError::InvalidRange(format!(
+			"Encoding range {}..{} exceeds decoded buffer length {}",
+			encoded_start,
+			encoded_end,
+			page.range.len.get()
+		)));
+	}
+	if let Some(cascade) = encoding_directory
+		.cascades
+		.get(encoding.cascade_index.get() as usize)
+	{
+		crate::metrics::global().observe_storage_l2_encoding_simd_pages_fetched(
+			cascade.kind().as_str(),
+			encoding.page_end_offsets.len() as u64,
+		);
+	}
+	let start = page
+		.range
+		.start
+		.get()
+		.checked_add(encoded_start)
+		.ok_or_else(|| ColumnFetchError::InvalidRange("Encoding range start overflows".into()))?;
+	Ok(RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(start),
+		len: encoding.encoded_range.len,
+	})
 }
 
 pub fn row_group_phase_record_body_ranges(
@@ -1622,6 +1673,7 @@ fn scoped_record_directory_for_row_group(
 		storage_column_ordinals: record_directory.storage_column_ordinals.clone(),
 		logical_schema_fingerprint: record_directory.logical_schema_fingerprint,
 		page_directory: Some(page_directory.clone()),
+		encoding_directory: record_directory.encoding_directory.clone(),
 	})
 }
 

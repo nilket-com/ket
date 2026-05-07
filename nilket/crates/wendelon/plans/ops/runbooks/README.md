@@ -45,6 +45,9 @@ Current runbooks:
 - [ADR 056 Row-Group Fetch](./row_group_fetch.md)
   - row-group strategy mix, fallback reasons, savings metrics, tuning knobs,
     and emergency disable procedure
+- [ADR 057 Encoding](./encoding.md)
+  - per-buffer cascade mix, materialization latency, invariant rejects, and
+    cascade-specific rollback
 
 These runbooks complement, but do not replace, the deeper implementation notes
 in the durable H support contracts under `plans/ops/runbooks/` and `plans/ops/`.

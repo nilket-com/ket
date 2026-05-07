@@ -1,5 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use proc_macro2::{TokenStream, TokenTree};
 
 fn walk_dir(dir: &Path, callback: &mut impl FnMut(&Path)) {
 	if let Ok(entries) = fs::read_dir(dir) {
@@ -12,6 +15,29 @@ fn walk_dir(dir: &Path, callback: &mut impl FnMut(&Path)) {
 			}
 		}
 	}
+}
+
+fn rust_identifiers_from_source(source_name: &str, source: &str) -> Vec<String> {
+	let tokens = TokenStream::from_str(source).unwrap_or_else(|err| {
+		panic!("{source_name}: Rust tokenization failed: {err}");
+	});
+	let mut identifiers = Vec::new();
+	collect_identifiers(tokens, &mut identifiers);
+	identifiers
+}
+
+fn collect_identifiers(tokens: TokenStream, identifiers: &mut Vec<String>) {
+	for token in tokens {
+		match token {
+			TokenTree::Ident(ident) => identifiers.push(ident.to_string()),
+			TokenTree::Group(group) => collect_identifiers(group.stream(), identifiers),
+			TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+		}
+	}
+}
+
+fn has_rust_identifier(identifiers: &[String], ident: &str) -> bool {
+	identifiers.iter().any(|candidate| candidate == ident)
 }
 
 #[test]
@@ -3058,9 +3084,9 @@ fn test_adr056_row_group_fetch_guards() {
 	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
 	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
 	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
-	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
-	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
 	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
@@ -3284,6 +3310,429 @@ fn test_adr056_row_group_fetch_guards() {
 	assert!(
 		violations.is_empty(),
 		"ADR 056 row-group fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr057_encoding_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let encoding_directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let encoding_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/materialize.rs")).unwrap();
+	let encoding_select =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let encoding_sample =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sample.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let cargo = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for unit in [
+		"impl_unit!(BitsPerValue, u8);",
+		"impl_unit!(BaseValue, i128);",
+		"impl_unit!(RunCount, u32);",
+		"impl_unit!(DictValueCount, u32);",
+		"impl_unit!(Exponent, i16);",
+		"impl_unit!(Factor, i64);",
+		"impl_unit!(ExceptionCount, u32);",
+		"impl_unit!(EncodingPageIndex, u32);",
+		"impl_unit!(EncodingPageByteOffset, u32);",
+		"impl_unit!(EncodingCascadeIndex, u16);",
+		"impl_unit!(BufferValueIndex, u32);",
+		"impl_unit!(BufferValueCount, u32);",
+		"impl_unit!(SimdPageValueCount, u32);",
+		"impl_unit!(SampleRowCount, u32);",
+		"impl_unit!(EncodingPageCount, u32);",
+		"impl_unit!(TaskCount, u32);",
+	] {
+		if !units.contains(unit) {
+			violations.push(format!("src/schema/units.rs: missing ADR 057 unit {unit}"));
+		}
+	}
+
+	for definition in [
+		"pub enum EncodingCascadeKind",
+		"pub enum EncodingLeafCascade",
+		"pub enum EncodingCascade {",
+		"pub struct EncodingDirectory",
+		"pub struct BufferEncoding",
+		"pub struct EncodingPageDescriptor",
+		"pub enum EncodingRejectCode",
+		"pub enum EncodingFallbackReason",
+		"pub struct EncodingWriterConfig",
+		"pub struct L2EncodingFetchConfig",
+	] {
+		if encoding_mod.matches(definition).count() != 1 {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: expected exactly one {definition}"
+			));
+		}
+	}
+	for required in [
+		"Plain = 1",
+		"Lz4Frame = 2",
+		"BitPacked = 3",
+		"Rle = 4",
+		"Dictionary = 5",
+		"Delta = 6",
+		"Fsst = 7",
+		"Alp = 8",
+		"pub const ALL: [Self; 8]",
+		"storage.encoding_directory",
+		"cascades: Vec<EncodingCascade>",
+		"cascade_index: EncodingCascadeIndex",
+		"page_end_offsets: Vec<EncodingPageByteOffset>",
+		"EncodingDirectoryParseError = 1",
+		"BufferEncodingMismatch = 2",
+		"PageRangeOverflow = 3",
+		"CascadeUnsupported = 4",
+		"DecodedLengthMismatch = 5",
+		"enabled_cascades: BTreeSet<EncodingCascadeKind>",
+	] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 057 token {required}"
+			));
+		}
+	}
+	if encoding_mod.contains("Reserved") {
+		violations.push(
+			"src/storage/encoding/types.rs: cascade catalog must not reserve variants".into(),
+		);
+	}
+	for required in [
+		"build_encoding_directory_for_ipc_stream",
+		"serialize_encoding_directory_value",
+		"deserialize_encoding_directory_value",
+		"validate_encoding_directory",
+		"apply_encoding_buffers_in_place",
+		"page_end_offsets",
+		"seen.insert((",
+	] {
+		if !encoding_directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 057 token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"Vec<EncodingSimdPageEntry>",
+		"pub struct EncodingSimdPageEntry",
+		"simd_pages:",
+		"per_page_rows",
+	] {
+		if encoding_directory.contains(forbidden) || encoding_mod.contains(forbidden) {
+			violations.push(format!(
+				"ADR 057 compact directory forbidden token {forbidden}"
+			));
+		}
+	}
+	for module in [
+		"plain.rs",
+		"lz4.rs",
+		"bitpacked.rs",
+		"rle.rs",
+		"dict.rs",
+		"delta.rs",
+		"fsst.rs",
+		"alp.rs",
+	] {
+		if !manifest_dir
+			.join("src/storage/encoding/cascade")
+			.join(module)
+			.exists()
+		{
+			violations.push(format!("src/storage/encoding/cascade/{module}: missing"));
+		}
+	}
+	for required in [
+		"select_and_encode_buffer",
+		"cascade_enabled",
+		"sample_buffer",
+		"cascade_sample_rows",
+		"observe_storage_l2_encoding_cascade_select",
+	] {
+		if !encoding_select.contains(required)
+			&& !encoding_sample.contains(required)
+			&& !encoding_directory.contains(required)
+		{
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 057 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct ColumnSample",
+		"deterministic_sample_indices",
+		"distinct_count_estimate",
+		"run_count_estimate",
+		"is_monotonic",
+		"fsst_compressible",
+		"alp_candidate",
+	] {
+		if !encoding_sample.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sample.rs: missing ADR 057 sample token {required}"
+			));
+		}
+	}
+	for required in [
+		"materialize_encoding_buffer",
+		"materialize_encoding_ipc_stream",
+		"find_buffer_encoding",
+		"row_group_index",
+		"observe_storage_l2_encoding_materialize",
+	] {
+		if !encoding_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/materialize.rs: missing ADR 057 materializer token {required}"
+			));
+		}
+	}
+	for required in [
+		"encoding_directory: Option<EncodingDirectory>",
+		"EncodingRejected(EncodingRejectCode)",
+		"ENCODING_DIRECTORY_METADATA_KEY",
+		"validate_encoding_directory",
+		"materialize_encoding_buffer",
+		"encoding_for_ipc_body_buffer",
+	] {
+		if !columnar.contains(required) {
+			violations.push(format!(
+				"src/storage/columnar.rs: missing ADR 057 columnar token {required}"
+			));
+		}
+	}
+	for required in [
+		"encode_multirow_from_survivors_with_row_group_and_encoding_config",
+		"build_encoding_directory_for_ipc_stream",
+		"compact_encoding_ipc_stream",
+		"serialize_encoding_directory_value",
+		"materialize_encoding_ipc_stream",
+	] {
+		if !multirow.contains(required) {
+			violations.push(format!(
+				"src/storage/multirow.rs: missing ADR 057 writer token {required}"
+			));
+		}
+	}
+	if !manager.contains("pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config")
+		|| !manager.contains("&self.config.encoding_writer")
+	{
+		violations.push(
+			"src/storage/manager.rs: compaction/admission paths must pass Encoding writer config"
+				.to_string(),
+		);
+	}
+	for required in [
+		"!self.config.l2_encoding_fetch.enabled",
+		"observe_storage_l2_encoding_fallback(\"reader_disabled\")",
+		"try_read_encoding_indexed_pages_from_l2",
+		"build_encoding_indexed_page_plan",
+		"materialize_encoding_indexed_pages",
+		"indexed_rows_materialized",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 057 L2 Encoding reader gate token {required}"
+			));
+		}
+	}
+	if !row_group.contains("encoding_fetch_range_for_buffer_page")
+		|| !row_group.contains("observe_storage_l2_encoding_simd_pages_fetched")
+	{
+		violations.push(
+			"src/storage/row_group.rs: selected row-group ranges must narrow to Encoding encoded_range"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encoding_writer: RawEncodingWriterConfig",
+		"l2_encoding_fetch: RawL2EncodingFetchConfig",
+		"enabled_cascades",
+		"target_simd_page_values",
+		"max_parallel_materialize_tasks",
+	] {
+		if !config.contains(required) {
+			violations.push(format!(
+				"src/config.rs: missing ADR 057 config token {required}"
+			));
+		}
+	}
+	if !node.contains("pub encoding_writer: EncodingWriterConfig")
+		|| !node.contains("pub l2_encoding_fetch: L2EncodingFetchConfig")
+	{
+		violations.push("src/node.rs: NodeBootstrapConfig missing ADR 057 configs".to_string());
+	}
+	for metric in [
+		"storage_l2_encoding_buffer_encodings_total",
+		"storage_l2_encoding_materialize_micros",
+		"storage_l2_encoding_simd_pages_fetched_total",
+		"storage_l2_encoding_compression_ratio",
+		"storage_l2_encoding_cascade_select_micros",
+		"storage_l2_encoding_directory_bytes",
+		"storage_l2_encoding_fallback_total",
+		"storage_l2_encoding_bytes_total",
+		"storage_l2_encoding_invariant_violations_total",
+		"cascade",
+		"reason",
+		"violation_kind",
+		"EncodingCascadeHistograms",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 057 metric token {metric}"
+			));
+		}
+	}
+	for required in [
+		"EncodingMaterializeSampled",
+		"encoding.materialize_sampled",
+		"EncodingInvariantViolation",
+		"encoding.invariant_violation",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 057 audit token {required}"
+			));
+		}
+	}
+	for required in [
+		"emit_encoding_materialize_sampled_audit",
+		"AuditOperation::EncodingMaterializeSampled",
+		"emit_encoding_invariant_audit_for_error",
+		"encoding_invariant_violation_kind",
+		"AuditOperation::EncodingInvariantViolation",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 057 audit token {required}"
+			));
+		}
+	}
+	if data_server
+		.matches("emit_encoding_materialize_sampled_audit(")
+		.count()
+		< 2
+	{
+		violations.push(
+			"src/network/data_server.rs: EncodingMaterializeSampled audit helper must have at least one production call site"
+				.to_string(),
+		);
+	}
+	if let Some(execute_aggregate_local) =
+		data_server.split("async fn execute_aggregate_local").nth(1)
+	{
+		let csb_pos = execute_aggregate_local.find(".try_aggregate_csb_direct_answer");
+		let projected_pos = execute_aggregate_local.find("aggregate_projected_execution");
+		let plan_pos = execute_aggregate_local.find("plan_query_execution_for_ranges_with_program");
+		match (csb_pos, projected_pos, plan_pos) {
+			(Some(csb_pos), Some(projected_pos), Some(plan_pos))
+				if csb_pos < projected_pos && csb_pos < plan_pos => {}
+			_ => violations.push(
+				"src/network/data_server.rs: aggregate CSB direct answer must bypass projected-read and Encoding planner paths"
+					.to_string(),
+			),
+		}
+	} else {
+		violations.push(
+			"src/network/data_server.rs: missing execute_aggregate_local for CSB/Encoding ordering guard"
+				.to_string(),
+		);
+	}
+	if !cargo.contains("name = \"encoding\"") || !cargo.contains("harness = false") {
+		violations.push("Cargo.toml: ADR 057 encoding bench is not registered".to_string());
+	}
+	for test_file in [
+		"encoding_cascade.rs",
+		"encoding_select.rs",
+		"encoding_directory.rs",
+		"encoding_materialize.rs",
+		"encoding_simd_page.rs",
+		"encoding_planner.rs",
+		"encoding_secondary_index.rs",
+		"encoding_lsm.rs",
+		"encoding_neutral.rs",
+	] {
+		if !manifest_dir.join("tests").join(test_file).exists() {
+			violations.push(format!("tests/{test_file}: ADR 057 test file is missing"));
+		}
+	}
+	let bench_path = manifest_dir.join("benches/encoding.rs");
+	if !bench_path.exists() {
+		violations.push("benches/encoding.rs: ADR 057 bench harness is missing".to_string());
+	} else {
+		let bench = fs::read_to_string(bench_path).unwrap();
+		for token in [
+			"writer_encoding_enabled",
+			"full_materialize",
+			"cascade_encode",
+			"cascade_decode",
+			"directory_size",
+			"--quick",
+		] {
+			if !bench.contains(token) {
+				violations.push(format!(
+					"benches/encoding.rs: missing ADR 057 bench token {token}"
+				));
+			}
+		}
+	}
+	if !manifest_dir.join("plans/ops/runbooks/encoding.md").exists() {
+		violations.push("plans/ops/runbooks/encoding.md: ADR 057 runbook is missing".to_string());
+	}
+	for forbidden in [
+		"MsgType::Encoding",
+		"MsgType::EncodingCascade",
+		"FRAME_FLAG_ENCODING",
+		"FRAME_FLAG_ENCODING_CASCADE",
+		"FRAME_FLAG_SIMD_PAGE",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 057 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Encoding",
+		"NodeCapability::EncodingDirectory",
+		"NodeCapability::EncodingCascade",
+		"NodeCapability::SimdPage",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 057 capability {forbidden}"
+			));
+		}
+	}
+	let cdc_identifiers = rust_identifiers_from_source("src/storage/cdc.rs", &cdc);
+	if has_rust_identifier(&cdc_identifiers, "EncodingCascade")
+		|| has_rust_identifier(&cdc_identifiers, "EncodingDirectory")
+	{
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 057 internals".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 057 Encoding invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

@@ -45,13 +45,13 @@ surface change with disproportionate cost-axis return:
 Brainstorm 011 (the "Vortex" playbook) originally bundled
 this as the V1.5 step before homerolled lightweight
 columnar encodings. Promoting it out lets the cost-axis
-win land on its own schedule and lets V2/V3 LCE/COCD
+win land on its own schedule and lets V2/V3 encoding-cascade/COCD
 design proceed as a measured next step, not a speculative
 one.
 
 ## Non-goals (V1)
 
-- **No homerolled lightweight columnar encodings (LCE).**
+- **No homerolled encoding cascades.**
   FastLanes bit-packing, ALP for floats, FSST for strings,
   encoding cascades — all Brainstorm 011 V2 territory.
 - **No compute-over-compressed-data (COCD).** PBC continues
@@ -555,7 +555,7 @@ read path; zstd becomes interesting if and when L2
 capacity cost dominates L1 read-bandwidth cost — that is a
 measured signal, not a speculative one.
 
-**Why not jump to LCE.** Brainstorm 011 V2/V3 is real
+**Why not jump to encoding cascades.** Brainstorm 011 V2/V3 is real
 work, but its value depends on evidence that LZ4 leaves
 meaningful headroom. Custom encodings would need page
 directories, cascade selection, SIMD decode paths,
@@ -621,7 +621,7 @@ tombstone reclaim, and layout migration; tacking
 compression policy onto the existing re-emit is free.
 
 **Why no per-buffer page directory in V1.** Brainstorm 011
-V2 covers it as part of a coherent LCE design. The
+V2 covers it as part of a coherent encoding-cascade design. The
 page-directory piece is genuinely valuable but genuinely
 complex; bundling it into 043 stretches a small ADR into a
 multi-week design surface.
@@ -670,8 +670,8 @@ policy discipline, and forward-compat story. An amendment
 would either bury it as a configuration knob or expand 042
 retroactively.
 
-**Why this is its own ADR rather than waiting for the LCE
-ADR.** LCE V2/V3 is multi-quarter design. LZ4
+**Why this is its own ADR rather than waiting for the encoding cascades
+ADR.** encoding-cascade/COCD is multi-quarter design. LZ4
 BodyCompression is a few-day implementation surface that
 captures most of the bandwidth/memory headroom Brainstorm
 011 identified.
@@ -788,7 +788,7 @@ captures most of the bandwidth/memory headroom Brainstorm
 - **Per-column compression policy.** Arrow IPC's
   `BodyCompression` is per-buffer; in principle this is
   expressible. In practice, per-column policy is a
-  policy-surface explosion and the V2 LCE story does
+  policy-surface explosion and the V2 encoding-cascade story does
   column-aware encoding cascades better.
 - **Auto-tune compression on / off based on per-record
   measured ratio.** Adds writer-side branching and a
@@ -870,13 +870,13 @@ buffer LZ4 (not record-level zstd) is the load-bearing
 codec choice — buffer independence is the property the
 future ADR depends on.
 
-**LCE V2** can add a new `RecordBodyCompressionPolicy`
+**ADR 057 encoding cascades** can add a new `RecordBodyCompressionPolicy`
 variant when a custom encoding format is pulled by
 measurements. The writer and reader dispatch points
 introduced here become the natural place for that
 extension.
 
-**LCE V3 / compute-over-compressed-data** remains a PBC
+**COCD / compute-over-compressed-data** remains a PBC
 executor change. LZ4 buffers are not predicate-friendly,
 so this ADR does not complicate the future opcode design.
 
@@ -908,11 +908,11 @@ accumulate. ADR 043 does not adopt the split.
    multi-row records, ADR 035 column projection in the
    PBC executor, and ADR 043's per-buffer LZ4.
    **High-priority** post-043 pickup.
-2. **LCE V2: homerolled SIMD encodings.** Brainstorm 011
+2. **ADR 057 encoding cascades: homerolled SIMD encodings.** Brainstorm 011
    V2. Pulled when post-043 metrics show the bandwidth /
    memory headroom remaining is worth the multi-quarter
    design surface.
-3. **LCE V3: compute-over-compressed-data.** Brainstorm
+3. **COCD: compute-over-compressed-data.** Brainstorm
    011 V3. Pulled with or after V2.
 4. **Per-buffer page directory for O(1) point-read
    decompression.** Brainstorm 011 V2 sub-piece; may land
@@ -921,7 +921,7 @@ accumulate. ADR 043 does not adopt the split.
 5. **zstd codec for capacity-tier L2.** When and if
    measured L2 capacity cost dominates L1 bandwidth cost
    on real workloads.
-6. **Per-column compression policy.** When the LCE V2 ADR
+6. **Per-column compression policy.** When the ADR 057 encoding cascades ADR
    opens, designed coherently with column-aware encoding
    cascades.
 7. **Wire-frame compression** (control-server schema
@@ -965,8 +965,8 @@ accumulate. ADR 043 does not adopt the split.
   compaction (ADR 042 §13) is the convergence primitive;
   `max_record_bytes` enforcement axis (§3) extends ADR 042
   §10.
-- Brainstorm 011: lightweight columnar encodings (Vortex
-  playbook) — LCE V2/V3 compose by replacing the codec at
+- Brainstorm 011: encoding cascades (Vortex
+  playbook) — encoding-cascade/COCD compose by replacing the codec at
   the same descriptor field.
 - `plans/conventions/newtype-units.md` — `CompressionRatio`.
 - `plans/conventions/no-premature-backward-compat.md` — no

@@ -21,12 +21,12 @@ design:
    row groups + per-row-group min / max / null-count
    stats. Outer hierarchy layer; macro pruning for
    analytical scans.
-2. **LCE V2 (future ADR)** — per-buffer pages +
+2. **ADR 057 encoding cascades (future ADR)** — per-buffer pages +
    encoding cascades **inside each row group
    RecordBatch's encoded buffers**. Inner hierarchy
    layer; fine random access, per-column encoding
    choice (Vortex-style).
-3. **LCE V3 (future ADR)** — compute over encoded
+3. **COCD (future ADR)** — compute over encoded
    representation (COCD).
 
 Row groups ship first as a construction-order choice,
@@ -259,10 +259,10 @@ would have to live at sub-buffer grain — finer than
 the predicate evaluation grain and harder to reason
 about.
 
-**LCE V2 layers cleanly on top.** Brainstorm 011 §3's
+**ADR 057 encoding cascades layers cleanly on top.** Brainstorm 011 §3's
 intra-buffer "Lance idea" SIMD pages are a refinement
 INSIDE each row-group RecordBatch's buffers. ADR 056
-V1 ships row-group RecordBatches; LCE V2 adds intra-
+V1 ships row-group RecordBatches; ADR 057 encoding cascades adds intra-
 buffer SIMD pages with their own page directory inside
 the encoded buffers. The two compose hierarchically:
 record → row-group RecordBatch → buffer → intra-buffer
@@ -329,12 +329,12 @@ substrate:
 It deliberately does **not** ship:
 
 - intra-buffer SIMD mini-pages or sub-row-group
-  page directories (LCE V2 territory);
-- variable per-buffer mini-page row count (LCE V2);
-- byte-budgeted (vs. row-aligned) row groups (LCE
+  page directories (ADR 057 encoding cascades territory);
+- variable per-buffer mini-page row count (ADR 057 encoding cascades);
+- byte-budgeted (vs. row-aligned) row groups (encoding cascades
   V2);
-- homerolled SIMD encodings (LCE V2 / V3);
-- compute-over-compressed-data (LCE V3);
+- homerolled SIMD encodings (ADR 057 encoding cascades / V3);
+- compute-over-compressed-data (COCD);
 - a `RecordPageDirectory` cache across queries;
 - bulk pre-fetch of all directories in a slab in one
   GET;
@@ -381,7 +381,7 @@ It deliberately does **not** ship:
   Phase B uses existing PBC opcodes against fetched
   row-group batches.
 - **No intra-buffer mini-pages or sub-row-group page
-  directory.** LCE V2 territory.
+  directory.** ADR 057 encoding cascades territory.
 - **No synthetic Arrow column for the directory.**
 - **No sparse Arrow arrays with nulls for unfetched
   row groups.**
@@ -512,7 +512,7 @@ The "per-buffer page directory" wording from the
 roadmap is satisfied by `BufferPageDirectoryEntry` —
 one entry per `(row_group_index, ipc_buffer_ordinal)`
 pair. The per-buffer axis lives in the directory shape;
-intra-buffer slicing is LCE V2 territory.
+intra-buffer slicing is ADR 057 encoding cascades territory.
 
 **Layout invariants enforced at parse time:**
 
@@ -1082,7 +1082,7 @@ ADR 056 V1 ships the outer layer first because row
 groups establish the outer contract — row partition,
 stats, fetch planner, index mapping, compaction /
 recovery rules, and failure taxonomy — under which
-LCE V2's per-buffer pages can safely nest inside each
+ADR 057 encoding cascades's per-buffer pages can safely nest inside each
 row-group RecordBatch's encoded buffers without
 re-architecting V1. The arguments traded across
 iterations are preserved in council git history;
@@ -1093,7 +1093,7 @@ the shape question was the wrong frame.
 §"Why row groups as RecordBatches, not intra-buffer
 mini-pages" gives the seven-axis argument: stock Arrow
 decode (no custom materializer); no LZ4 frame change;
-row-group stats are natural; LCE V2 layers cleanly on
+row-group stats are natural; ADR 057 encoding cascades layers cleanly on
 top; per-buffer page directory wording satisfied via
 `(row_group, buffer)` entries; whole-record decode
 trivial; ADR 044 substrate continuity.
@@ -1269,9 +1269,9 @@ Parallel to ADR 044's `storage_l2_column_fetch_*`.
   bitmap bit alignment, decompressed-length
   validation), LZ4 frame flag change, codec-
   catalog-adjacent surface. Intra-buffer SIMD pages
-  are LCE V2 territory per brainstorm 011 §3 ("LCE
+  are ADR 057 encoding cascades territory per brainstorm 011 §3 ("encoding cascades
   payload's internal Page Directory"); V1 substrate
-  ADR ships RecordBatch-grain row groups, LCE V2
+  ADR ships RecordBatch-grain row groups, ADR 057 encoding cascades
   adds intra-buffer pages inside each RecordBatch's
   buffers.
 - **Page directory in the ADR 022 unencrypted
@@ -1291,12 +1291,12 @@ Parallel to ADR 044's `storage_l2_column_fetch_*`.
   column fetch. Phase B with stats prune skips most
   fetches entirely on selective workloads.
 - **Three-tier mini-pages: row-group → mini-page →
-  buffer (intra-buffer SIMD batch).** LCE V2
+  buffer (intra-buffer SIMD batch).** ADR 057 encoding cascades
   territory.
-- **Variable per-buffer mini-page row count.** LCE
+- **Variable per-buffer mini-page row count.** encoding cascades
   V2.
 - **Byte-budgeted row groups.** Variable row count;
-  LCE V2.
+  ADR 057 encoding cascades.
 - **PBC opcode for row-group fetch
   (`PROJECT_ROW_GROUPS`).** Storage derives selection
   from existing PBC opcodes + row-group stats. New
@@ -1343,7 +1343,7 @@ follow-up ADRs.
 1. **Default `target_row_group_rows`.** 4096 (V1
    default, Parquet) vs. 8192 (Lance) vs. 1024
    (Vortex SIMD-aligned). Smaller maximizes future
-   LCE V2 SIMD alignment but inflates directory
+   ADR 057 encoding cascades SIMD alignment but inflates directory
    size.
 2. **Default `min_paged_record_rows` /
    `min_paged_record_bytes`.** 8192 / 512 KiB (V1,
@@ -1402,15 +1402,15 @@ follow-up ADRs.
 
 The substrate evolution is a **committed layered
 hierarchy**, not just a forward-compatible direction.
-Both axes ship; ADR 056 is the outer layer, LCE V2 is
+Both axes ship; ADR 056 is the outer layer, ADR 057 encoding cascades is
 the inner layer:
 
 ```text
 record body
   └─ row-group RecordBatch                  (ADR 056 V1 — outer layer, this ADR)
-       └─ encoded column buffer              (LCE V2 cascade — inner layer)
-            └─ intra-buffer SIMD page         (LCE V2 page directory — inner layer)
-                 └─ encoded run                (LCE V3 COCD — innermost layer)
+       └─ encoded column buffer              (ADR 057 encoding cascades cascade — inner layer)
+            └─ intra-buffer SIMD page         (ADR 057 encoding cascades page directory — inner layer)
+                 └─ encoded run                (COCD COCD — innermost layer)
 ```
 
 This mirrors Parquet's row-group + column-chunk + page
@@ -1419,49 +1419,49 @@ model — the convergent design every modern OLAP engine
 arrives at. The layers are equal priority; ordering is
 software-development driven. ADR 056 V1 lands the outer
 layer first because row groups establish the outer
-contract under which LCE V2's per-buffer pages can
-safely nest. LCE V2 will land the inner layer next,
+contract under which ADR 057 encoding cascades's per-buffer pages can
+safely nest. ADR 057 encoding cascades will land the inner layer next,
 providing fine random access, per-column encoding
 cascades, and SIMD-friendly compute. The two compose
 without rework: each row group RecordBatch is a complete
-unit of the outer layer; LCE V2's per-buffer pages and
+unit of the outer layer; ADR 057 encoding cascades's per-buffer pages and
 SIMD blocks live inside its encoded column buffers.
 
-### LCE V2 mechanics under this hierarchy
+### ADR 057 encoding cascades mechanics under this hierarchy
 
-**LCE V2 (homerolled SIMD encodings).** LCE V2's
+**ADR 057 encoding cascades (homerolled SIMD encodings).** ADR 057 encoding cascades's
 encoding cascade (per brainstorm 011 §1: e.g.
 `RLE(BitPacked(Dictionary(Strings)))`) is applied
 per-column-per-record. Under ADR 056's RecordBatch
-shape, LCE V2 applies the cascade to each
+shape, ADR 057 encoding cascades applies the cascade to each
 `(row_group, column)` pair the same way it would
 apply to a single-batch record's column buffer — the
 cascade decision and encoding mechanics are unchanged;
 just the buffer instances multiply by row-group count.
 
-**LCE V2 sub-piece (intra-buffer SIMD pages /
+**ADR 057 encoding cascades sub-piece (intra-buffer SIMD pages /
 per-buffer pages).** Brainstorm 011 §3's "Lance
 idea" — decompress only the 64-value SIMD block
 containing a target row — lands inside each row-group
 RecordBatch's encoded buffer as an intra-buffer page
 directory. This is the inner layer of the hierarchy:
-ADR 056 row groups outside, LCE V2 per-buffer pages
+ADR 056 row groups outside, ADR 057 encoding cascades per-buffer pages
 inside.
 
 ADR 056's directory shape is forward-compatible.
-LCE V2 may add a sibling
+ADR 057 encoding cascades may add a sibling
 `buffer_simd_pages: Vec<...>` field on
 `BufferPageDirectoryEntry` (or a sibling
-custom_metadata key like `lce.simd_page_directory.v1`)
+custom_metadata key like `encoding.simd_page_directory.v1`)
 pointing inside each encoded buffer.
 
-**LCE V2 sub-piece (variable per-buffer mini-page row
+**ADR 057 encoding cascades sub-piece (variable per-buffer mini-page row
 count).** Would extend `BufferPageDirectoryEntry` to
 carry per-buffer row counts. ADR 056's invariant
 (uniform `row_count` per row group) relaxes per-buffer;
 forward-compatible extension.
 
-**LCE V3 (compute-over-compressed-data).** PBC opcodes
+**COCD (compute-over-compressed-data).** PBC opcodes
 that evaluate over encoded bytes consume row-group
 RecordBatches; codec-agnostic at the buffer level.
 
@@ -1492,14 +1492,14 @@ directories regardless of input tier; layer-agnostic.
 ## Deferred to follow-up ADRs
 
 1. **Intra-buffer SIMD mini-pages (sub-row-group).**
-   LCE V2; brainstorm 011 §3 Lance idea ships inside
-   the LCE payload.
-2. **Variable per-buffer mini-page row count.** LCE
+   ADR 057 encoding cascades; brainstorm 011 §3 Lance idea ships inside
+   the encoding-cascade payload.
+2. **Variable per-buffer mini-page row count.** encoding cascades
    V2.
 3. **`RecordPageDirectory` cache across queries.**
 4. **Bulk slab-level page-directory pre-fetch.**
 5. **Compute-over-compressed-data (COCD) at row-
-   group grain.** LCE V3.
+   group grain.** COCD.
 6. **Per-row-group DEK rotation.** Future ADR 020
    extension.
 7. **Wire-tier row-group fetch (ADR 053
@@ -1507,7 +1507,7 @@ directories regardless of input tier; layer-agnostic.
 8. **Public Toron `PROJECT_ROWS` opcode** (or
    equivalent surface).
 9. **Variable row-group byte budget (hybrid byte-
-   and-row).** LCE V2.
+   and-row).** ADR 057 encoding cascades.
 10. **Cross-record / cross-slab row-group
     abstractions.** LSM-level sort orders.
 11. **Per-row-group encryption-domain isolation.**
@@ -1565,8 +1565,8 @@ directories regardless of input tier; layer-agnostic.
   — compaction outputs include directories under
   writer config; cross-replica logical equality
   preserved.
-- `plans/brainstorms/011_lightweight_columnar_encodings_vortex.md`
-  §3 — "Lance idea" intra-buffer page directory; LCE
+- `plans/brainstorms/011_encoding_cascades_vortex.md`
+  §3 — "Lance idea" intra-buffer page directory; encoding cascades
   V2 territory, ADR 056 V1 ships row-group
   RecordBatches.
 - `plans/conventions/newtype-units.md`,

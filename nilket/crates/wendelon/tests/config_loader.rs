@@ -251,6 +251,72 @@ transfer_signing_secret = "{transfer_secret}"
 }
 
 #[test]
+fn loads_encoding_tuning() {
+	let root = fresh_dir("encoding-tuning");
+	std::fs::create_dir_all(root.join("data")).unwrap();
+
+	let node_id = 46u32;
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	let config_path = write_config(
+		&root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4716"
+
+[storage]
+data_dir = "data"
+
+[storage.encoding_writer]
+enabled = true
+target_simd_page_values = 512
+cascade_sample_rows = 128
+min_buffer_bytes_for_encoding = 2048
+enabled_cascades = ["plain", "bit_packed", "rle"]
+
+[storage.l2_encoding_fetch]
+enabled = true
+max_simd_pages_per_record = 17
+max_parallel_materialize_tasks = 5
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert!(cfg.encoding_writer.enabled);
+	assert_eq!(cfg.encoding_writer.target_simd_page_values.get(), 512);
+	assert_eq!(cfg.encoding_writer.cascade_sample_rows.get(), 128);
+	assert_eq!(
+		cfg.encoding_writer.min_buffer_bytes_for_encoding.get(),
+		2048
+	);
+	assert_eq!(cfg.encoding_writer.enabled_cascades.len(), 3);
+	assert!(cfg.l2_encoding_fetch.enabled);
+	assert_eq!(cfg.l2_encoding_fetch.max_simd_pages_per_record.get(), 17);
+	assert_eq!(
+		cfg.l2_encoding_fetch.max_parallel_materialize_tasks.get(),
+		5
+	);
+}
+
+#[test]
 fn loads_transport_admission_tuning() {
 	let root = fresh_dir("transport-admission");
 	std::fs::create_dir_all(root.join("data")).unwrap();

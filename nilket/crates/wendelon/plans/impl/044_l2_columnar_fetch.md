@@ -39,7 +39,7 @@ admission (ADR 038 + 039 + CSB short-circuit ADR 040 + 042)
 
 ## Non-goals (V1)
 
-- No homerolled lightweight columnar encodings.
+- No homerolled encoding cascades.
 - No mini-page or row-group granularity.
 - No per-buffer page directory.
 - No `RecordBufferDirectory` cache.

@@ -42,10 +42,10 @@ hierarchy (per ADR §Status):
 1. **ADR 056 V1 (this plan)** — RecordBatch row
    groups + per-row-group stats. Outer macro-pruning
    layer.
-2. **LCE V2 (future ADR / plan)** — per-buffer pages
+2. **ADR 057 encoding cascades (future ADR / plan)** — per-buffer pages
    + encoding cascades inside each row group
    RecordBatch's encoded buffers. Inner layer.
-3. **LCE V3 (future ADR / plan)** — compute over
+3. **COCD (future ADR / plan)** — compute over
    encoded representation (COCD).
 
 V1 implementation commitments (pinned by ADR):
@@ -69,17 +69,17 @@ V1 implementation commitments (pinned by ADR):
 - writer config defaults off; Phase 10 accepted the
   empirical gate and promotion keeps rollout opt-in.
 
-LCE V2 forward-compatibility (preserved by V1 design,
+ADR 057 encoding cascades forward-compatibility (preserved by V1 design,
 not implemented here):
 
-- `BufferPageDirectoryEntry` is extensible — LCE V2
+- `BufferPageDirectoryEntry` is extensible — ADR 057 encoding cascades
   may add a sibling `buffer_simd_pages: Vec<...>`
   field for intra-buffer page entries inside each
   encoded buffer, or a sibling custom_metadata key;
 - the lockdown guards forbidding
   `partial_buffer_materialize` symbols and
   `mini_page_*` fields are scoped to ADR 056's V1
-  surface, not project-wide; LCE V2 will introduce
+  surface, not project-wide; ADR 057 encoding cascades will introduce
   these inside its own namespaced module without
   violating the guards.
 
@@ -199,7 +199,7 @@ The implementation:
 ## Non-goals
 
 - No intra-buffer SIMD mini-pages or sub-row-group
-  page directory (LCE V2 territory).
+  page directory (ADR 057 encoding cascades territory).
 - No new compression codec or LZ4 frame flag change
   (row-group RecordBatch boundaries provide
   independence; ADR 043 codec catalog unchanged).
@@ -242,7 +242,7 @@ Phase 0 freeze PR is the explicit decision point at
 which the V1 substrate becomes locked — once merged,
 Phases 1–11 may not reintroduce a partial-buffer
 materializer or `mini_page_*` config knobs. Those
-land in LCE V2 inside their own namespaced module.
+land in ADR 057 encoding cascades inside their own namespaced module.
 The Phase 11 lockdown guards 25-26 enforce this
 post-freeze.
 
@@ -1540,10 +1540,10 @@ Guards (per ADR §17):
     `src/storage/row_group.rs` or
     `src/storage/columnar.rs`; if present,
     the substrate has drifted and the test
-    fails closed. LCE V2 introduces
+    fails closed. ADR 057 encoding cascades introduces
     intra-buffer page decode inside its
     own namespaced module
-    (e.g. `src/storage/lce/`) — this guard
+    (e.g. `src/storage/encoding/`) — this guard
     is scoped to keep that capability out
     of ADR 056's surface, not project-wide.
 26. No `mini_page_*` field on
@@ -1551,12 +1551,12 @@ Guards (per ADR §17):
     `L2RowGroupFetchConfig`, or any
     `RecordPageDirectory` /
     `BufferPageDirectoryEntry` field in
-    ADR 056's directory shape. LCE V2 will
+    ADR 056's directory shape. ADR 057 encoding cascades will
     add a sibling
     `buffer_simd_pages: Vec<...>` field on
     `BufferPageDirectoryEntry` (or a
     sibling custom_metadata key like
-    `lce.simd_page_directory.v1`) per ADR
+    `encoding.simd_page_directory.v1`) per ADR
     056 §"Forward-compatibility analysis";
     that extension lands in a future ADR.
 27. The Phase 5 materializer MUST NOT
@@ -1751,24 +1751,24 @@ ADR 056 ships the row-group fetch substrate:
   guards keeping partial-buffer
   materializer modules and `mini_page_*`
   config fields out of ADR 056's surface
-  — those land in LCE V2's namespaced
+  — those land in ADR 057 encoding cascades's namespaced
   module).
 - **Intra-buffer SIMD pages deferred to
-  LCE V2** — brainstorm 011 §3 Lance idea
-  ships inside the LCE payload.
+  ADR 057 encoding cascades** — brainstorm 011 §3 Lance idea
+  ships inside the encoding-cascade payload.
 
 ## Deferred to follow-up ADRs
 
 - Intra-buffer SIMD mini-pages (sub-row-
-  group) (LCE V2; brainstorm 011 §3 Lance
+  group) (ADR 057 encoding cascades; brainstorm 011 §3 Lance
   idea).
 - Variable per-buffer mini-page row count
-  (LCE V2).
+  (ADR 057 encoding cascades).
 - `RecordPageDirectory` cache across
   queries.
 - Bulk slab-level page-directory pre-fetch.
 - Compute-over-compressed-data (COCD) at
-  row-group grain (LCE V3).
+  row-group grain (COCD).
 - Per-row-group DEK rotation.
 - Wire-tier row-group fetch (ADR 053
   extension).

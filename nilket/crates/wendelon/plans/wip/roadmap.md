@@ -20,39 +20,39 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 057 (Per-Buffer Pages and Encoding Cascades)
-council-converged across five iterations and staged
-for promotion. Inner layer of the
+council-converged across five iterations and promoted
+after implementation plus Phase 10 bench evidence. Inner layer of the
 Parquet / Vortex-style storage hierarchy ADR 056
 opened. **Closed 8-variant cascade catalog**: `Plain`,
 `Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`,
 `Fsst`, `Alp` with one-level composition via
-`Box<LceLeafCascade>` (`LceLeafCascade ∈ {Plain,
+`Box<EncodingLeafCascade>` (`EncodingLeafCascade ∈ {Plain,
 Lz4Frame, BitPacked}`); arbitrary-depth nesting
 rejected. **Activation via node-local
-`LceWriterConfig`** (deployment-wide for cross-replica
+`EncodingWriterConfig`** (deployment-wide for cross-replica
 byte-equality), not via
-`RecordBodyCompressionPolicy::Lce` descriptor variant;
-LCE doesn't change logical schema or table semantics,
+`RecordBodyCompressionPolicy::EncodingCascade` descriptor variant;
+Encoding cascades do not change logical schema or table semantics,
 so descriptor churn is unwarranted.
-**`LceEncodingDirectory` lives in IPC schema
+**`EncodingDirectory` lives in IPC schema
 `custom_metadata`** under literal key
-`storage.lce_encoding_directory` — sibling to ADR 056's
+`storage.encoding_directory` — sibling to ADR 056's
 `storage.row_group_directory`, encrypted with the
 record body, authenticated by ADR 020 chunk AEAD.
 **Compact directory shape** is the council's iter
 3→4 win: cascades deduped once in
-`cascades: Vec<LceCascade>`; one `LceBufferEncoding`
+`cascades: Vec<EncodingCascade>`; one `BufferEncoding`
 per `(row_group_index, ipc_column_ordinal,
 ipc_buffer_ordinal)` triple referencing a cascade by
-`LceCascadeIndex`; page-grain bytes captured as
-`page_end_offsets: Vec<LcePageByteOffset>` prefix
+`EncodingCascadeIndex`; page-grain bytes captured as
+`page_end_offsets: Vec<EncodingPageByteOffset>` prefix
 array per buffer — not as one serialized row per page
 (per-page rows would explode metadata on wide
 schemas; ADR 056 directories already use 22–26% of
 ADR 044's 64 KiB initial probe).
-`LcePageDescriptor` is transient planner-only —
+`EncodingPageDescriptor` is transient planner-only —
 expanded from prefix offsets in memory, never
-serialized. **Buffer-relative byte offsets** mean LCE
+serialized. **Buffer-relative byte offsets** mean Encoding
 metadata is invariant under any compaction or rewrite
 that shifts the buffer's absolute position but
 preserves its internal encoded layout; ADR 056
@@ -62,29 +62,29 @@ locates the buffer, ADR 057 slices pages within it.
 `page_end_offsets` and decode at full-buffer grain in
 V1. **Phase D extension** to ADR 056's three-phase
 plan (Phase A metadata → B stats prune → C projected
-fetch → **D LCE materialization**); internal to the
+fetch → **D Encoding materialization**); internal to the
 `L2FetchStrategy::RowGroup(plan)` leg, no fifth
 strategy variant. **Custom partial-buffer
-materializer** lives in `src/storage/lce/`,
+materializer** lives in `src/storage/encoding/`,
 satisfying ADR 056's V1-scope guards 25–26 (the
 sanctioned home for `partial_buffer_materialize` and
 `mini_page_*` symbols ADR 056 explicitly kept out of
 its surface). **Decode-only V1** — PBC continues to
 evaluate against materialized dense Arrow batches;
-compute-over-encoded-data is ADR 058 (LCE V3)
-territory. **Closed 5-code `LceRejectCode`
+compute-over-encoded-data is ADR 058 (COCD)
+territory. **Closed 5-code `EncodingRejectCode`
 taxonomy** (`EncodingDirectoryParseError`,
 `BufferEncodingMismatch`, `PageRangeOverflow`,
 `CascadeUnsupported`, `DecodedLengthMismatch`);
 authentication / parse / decode failures route to
 storage errors, never silent fallback. **Closed
-7-variant `LceFallbackReason` enum** for planner
-metric labels. Bounded `storage_l2_lce_*` metric
+7-variant `EncodingFallbackReason` enum** for planner
+metric labels. Bounded `storage_l2_encoding_*` metric
 family with `{cascade, decision, reason, kind,
 violation_kind}` enumerations. V1 defaults:
 `target_simd_page_values = 1_024`,
 `cascade_sample_rows = 256`,
-`min_buffer_bytes_for_lce = 4_096`,
+`min_buffer_bytes_for_encoding = 4_096`,
 `max_simd_pages_per_record = 64`,
 `max_parallel_materialize_tasks = 4`. **Writer-cost
 gate ≤ 75%** as starting target on the largest legal
@@ -107,13 +107,18 @@ guards** in `tests/architecture_test.rs`. See
 `plans/adr/057_per_buffer_pages_and_encoding_cascades.md`
 and
 `plans/impl/057_per_buffer_pages_and_encoding_cascades.md`
-(both staged for promotion). Implementation phases
-pending; Phase 10 bench evidence (per-cascade
-compression ratios, point-read latency, materializer
-cost, writer-cost-vs-compression-vs-read-wins
-defense, cross-replica determinism) is both the
-promotion-to-shipped gate **and** the input shape
-that opens ADR 058.
+plus `plans/impl/057_per_buffer_pages_bench_results.md`.
+Implementation and Phase 10 evidence have landed:
+representative writer gate passes on repeated full
+bench runs after bounding multi-page variable-width
+Dictionary selection; typed compression targets pass;
+point-read selected bytes are ≥16x smaller than the
+ADR 056 row-group-buffer baseline; materialization is
+faster than ADR 056-only on all representative fixtures;
+metadata stays inside the 64 KiB initial probe; and
+cross-replica determinism passes. ADR 058 is now
+unblocked for drafting from concrete cascade-distribution
+and page-grain evidence.
 
 ADR 056 (Row-Group Fetch and Layered Page Directory)
 is the immediate predecessor and the substrate ADR
@@ -122,12 +127,11 @@ empirical writer-cost gate revision. Closes the
 row-axis fetch-amplification shape question for
 multi-row records and lays the outer layer of a
 Parquet / Vortex-style storage hierarchy. **Layered
-substrate sequencing committed**: ADR 056 V1 = row
-groups + per-row-group min/max/null-count stats; ADR
-057 (LCE V2) = per-buffer pages + encoding
-cascades inside each row-group RecordBatch's encoded
-buffers (this round); ADR 058 (LCE V3) = compute
-over encoded representation (COCD). The layers are
+substrate sequencing committed**: ADR 056 is the outer
+row-group + per-row-group stats layer; ADR 057 is the
+inner per-buffer pages + encoding-cascades layer inside
+each row-group RecordBatch's encoded buffers; ADR 058 is
+compute over encoded representation (COCD). The layers are
 equal priority; ordering is software-development
 driven — row groups establish the outer contract
 under which per-buffer pages can safely nest, so they
@@ -210,9 +214,9 @@ mutation, no custom partial-buffer materializer
 (stock Arrow IPC reader handles row-group decode).
 **27 architectural lockdown guards** in
 `tests/architecture_test.rs`, including two
-LCE-V2-scoped guards (no `partial_buffer_materialize`
+ADR-057-scoped guards (no `partial_buffer_materialize`
 symbols and no `mini_page_*` fields in ADR 056's
-surface — those land in LCE V2's namespaced module)
+surface — those land in the encoding module)
 and one Phase-5 guard against post-Phase-B PBC
 re-evaluation. See
 `plans/adr/056_row_group_fetch_and_page_directory.md`,
@@ -286,8 +290,8 @@ this stretch is to land the storage hierarchy that
 analytical-scan workloads (BigQuery-killer territory) need
 before opening Toron-side surface. Concretely: row-group fetch
 + page directory (ADR 056), then per-buffer pages + encoding
-cascades (LCE V2 / ADR 057), then compute-over-encoded-data
-(LCE V3 / ADR 058). CDC follow-up ADRs and vector embeddings
+cascades (ADR 057), then compute-over-encoded-data
+(ADR 058 / COCD). CDC follow-up ADRs and vector embeddings
 are deliberately deferred behind the storage hierarchy in this
 stretch — not because they are smaller, but because the Toron
 pivot pulls compute-adjacent primitives ahead of OLTP-shaped
@@ -296,9 +300,8 @@ access surfaces (vectors, triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–12 are promoted (in `plans/adr/`); ADR 057
-(#13) is staged for promotion; the forward shape continues
-at #14.
+Gemini. Steps 1–13 are promoted (in `plans/adr/`);
+the forward shape continues at #14.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -343,45 +346,45 @@ at #14.
     the empirical writer-cost gate and opens ADR 057.
     See *Where we are*.
 
-13. **Per-buffer pages + LCE encoding cascades inside
-    row-group buffers** — ADR 057. Council-converged;
-    staged for promotion. Inner layer of the storage
+13. **Per-buffer pages + encoding cascades inside
+    row-group buffers** — ADR 057 promoted.
+    Council-converged and implemented. Inner layer of the storage
     hierarchy. Closed 8-variant cascade catalog
     (`Plain`, `Lz4Frame`, `BitPacked`, `Rle`,
     `Dictionary`, `Delta`, `Fsst`, `Alp`) with
-    one-level composition via `LceLeafCascade`;
-    `LceEncodingDirectory` in IPC custom_metadata under
-    key `storage.lce_encoding_directory`, sibling to
+    one-level composition via `EncodingLeafCascade`;
+    `EncodingDirectory` in IPC custom_metadata under
+    key `storage.encoding_directory`, sibling to
     ADR 056's row-group directory; compact directory
     shape with cascade dedup and per-buffer
     `page_end_offsets` prefix array (no per-page
-    serialized rows); `LcePageDescriptor` is transient
+    serialized rows); `EncodingPageDescriptor` is transient
     planner-only; buffer-relative byte offsets;
     page emission required for `BitPacked`, `Rle`,
     `Dictionary`; Phase D materialization step internal
     to `L2FetchStrategy::RowGroup(plan)` leg; custom
-    partial-buffer materializer in `src/storage/lce/`;
+    partial-buffer materializer in `src/storage/encoding/`;
     ADR 052 secondary-index integration via SIMD-page
     fast path; ADR 055 LSM compaction recomputes
     cascades deterministically; node-local
-    `LceWriterConfig` activation (no
-    `RecordBodyCompressionPolicy::Lce` descriptor
-    variant); 5-code `LceRejectCode` taxonomy; ~30
+    `EncodingWriterConfig` activation (no
+    `RecordBodyCompressionPolicy::EncodingCascade` descriptor
+    variant); 5-code `EncodingRejectCode` taxonomy; ~30
     architectural lockdown guards. Decode-only V1;
     compute-over-encoded-data deferred to ADR 058.
-    Phase 10 bench evidence (per-cascade compression
+    Phase 10 bench evidence accepted: per-cascade compression
     ratios on int / float / low-card UTF-8 / mixed,
     point-read latency reduction via SIMD-page fast
     path, full-buffer materialization cost vs. ADR 056,
-    writer-cost-defended-by-compression-and-read-wins
-    bench artifact, cross-replica determinism, mixed
-    legacy / LCE slab read throughput) is the
-    promotion-to-shipped gate **and** the input shape
-    that opens ADR 058. See *Where we are*.
+    writer-cost defended by compression and read-side
+    wins, cross-replica determinism, mixed legacy /
+    Encoding slab read throughput, secondary-index page
+    fast path, and CSB bypass evidence. This opens ADR
+    058. See *Where we are*.
 
-14. **Compute over encoded data (COCD)** — ADR 058
-    (LCE V3). Innermost layer of the storage hierarchy.
-    Evaluates PBC opcodes directly over LCE V2 encoded
+14. **Compute over encoded data (COCD)** — ADR 058.
+    Innermost layer of the storage hierarchy.
+    Evaluates PBC opcodes directly over ADR 057 encoded
     representations without full-fidelity decode —
     `RLE(BitPacked(...))` runs answer equality / range
     / null-count predicates and aggregates without
@@ -564,32 +567,27 @@ at #14.
 - **Don't bundle ADR 056 / 057 / 058 into one mega-ADR.**
   The storage hierarchy is a layered substrate by
   design; each layer is a substantial decision in its
-  own right (V1 = row groups + stats; V2 = per-buffer
-  pages + encoding cascades + custom partial-buffer
-  materializer; V3 = compute over encoded data).
-  Bundling them defers each layer's review behind the
-  next, weakens the lockdown story (ADR 056's
-  V1-scoped guards depend on a clean V2 boundary), and
-  loses the Parquet / Vortex precedent of evolving
-  inner layers across multiple specs. Each layer ships
-  as its own ADR.
-- **Don't open ADR 058 (LCE V3 / COCD) before ADR
-  057 implementation lands and produces bench data.**
-  Same layering argument ADR 056 used for ADR 057:
-  COCD's PBC-opcode dispatch design (`EVAL_DICT`,
-  `EVAL_RLE`, `EVAL_BITPACKED_RANGE`) depends on real
-  cascade-distribution evidence — which cascades the
-  workload-driven selector actually picks at scale,
-  which encoded-grain operations are worth lifting
-  from materialized-batch grain, and which cascade
-  composition shapes (e.g., RLE-of-BitPacked vs.
-  Dictionary-of-BitPacked) dominate. Drafting ADR 058
-  before ADR 057 implementation experience either
-  pre-decides COCD opcode shape on assumptions or
-  forces ADR 058 to be cascade-agnostic and lose the
-  wins. Wait for ADR 057 Phase 10 bench artifact;
-  open ADR 058 with cascade-distribution numbers in
-  hand.
+  own right: ADR 056 is row groups + stats, ADR 057 is
+  per-buffer pages + encoding cascades + custom partial-
+  buffer materializer, and ADR 058 is compute over
+  encoded data. Bundling them defers each layer's review
+  behind the next, weakens the lockdown story (ADR 056's
+  scoped guards depend on a clean ADR 057 boundary), and
+  loses the Parquet / Vortex precedent of evolving inner
+  layers across multiple specs. Each layer ships as its
+  own ADR.
+- **Don't design ADR 058 (COCD) without
+  grounding it in ADR 057 bench evidence.** COCD's
+  PBC-opcode dispatch design (`EVAL_DICT`, `EVAL_RLE`,
+  `EVAL_BITPACKED_RANGE`) depends on real cascade-
+  distribution evidence — which cascades the workload-
+  driven selector actually picks at scale, which encoded-
+  grain operations are worth lifting from materialized-
+  batch grain, and which cascade composition shapes
+  dominate. The prerequisite is now satisfied by
+  `plans/impl/057_per_buffer_pages_bench_results.md`;
+  ADR 058 should use that artifact rather than pre-057
+  assumptions.
 - **Don't ship ADR 057 with `Constant` or
   `FrameOfReference` cascade variants.** Iter 2 of
   the council ADR 057 process surfaced these as
@@ -605,18 +603,18 @@ at #14.
   council-converged set; new variants require a
   follow-up ADR.
 - **Don't open ADR 057 with descriptor-policy
-  activation (`RecordBodyCompressionPolicy::Lce`).**
+  activation (`RecordBodyCompressionPolicy::EncodingCascade`).**
   The activation surface was the load-bearing fork
   across iters 1–4 of the ADR 057 council process.
-  Iter 4 converged on node-local `LceWriterConfig`
-  for principled reasons: LCE doesn't change logical
+  Iter 4 converged on node-local `EncodingWriterConfig`
+  for principled reasons: encoding cascades do not change logical
   rows, table semantics, PBC programs, or Toron
   contracts; a descriptor field would make a physical
   deployment choice look like logical schema policy;
   cross-replica byte-equality is already enforced
   via deployment-wide config; readers auto-detect
   via directory presence. Reopening this with a
-  `RecordBodyCompressionPolicy::Lce` variant requires
+  `RecordBodyCompressionPolicy::EncodingCascade` variant requires
   a re-vote with documented evidence that the
   descriptor framing buys capability the node-local
   shape doesn't.
@@ -636,28 +634,25 @@ StateDigest substrate                            (ADR 046)
   → CDC subscription substrate                   (ADR 054)
   → LSM-style leveled compaction substrate       (ADR 055)
   → row-group fetch + page directory             (ADR 056)
-  → per-buffer pages + LCE encoding cascades     (ADR 057, staged for promotion)  ← here
-  → compute over encoded data (COCD)             (ADR 058, post-057-impl)
+  → per-buffer pages + encoding cascades     (ADR 057)
+  → compute over encoded data (COCD)             (ADR 058)  ← here
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is past ADR 056 (promoted with Phase 10
-bench evidence accepted under the revised empirical
-writer-cost gate) and at ADR 057 (council-converged
-across five iterations, staged for promotion). The
-Toron-pivot stretch holds: ADR 057 implementation
-next, using ADR 056's bench artifact as the empirical
-input for per-buffer page sizing, encoding-cascade
-choice, selectivity profiles, and compression-delta
-expectations. ADR 058 remains behind ADR 057
-implementation experience. **The council's lean on
-next pickup:** commit ADR 057 plan and execute its
-phased implementation, with Phase 10 bench output as
-the gate that opens both ADR 057 promotion-to-shipped
-and ADR 058 (LCE V3 / COCD) drafting. CDC follow-ups
+Design tip is past ADR 057: ADR 056 promoted with
+Phase 10 bench evidence accepted under the revised
+empirical writer-cost gate, and ADR 057 promoted after
+implementation plus Phase 10 evidence under the ≤75%
+representative writer gate. The Toron-pivot stretch
+holds: ADR 058 can now draft against real Encoding
+cascade choices, page sizing, selectivity profiles,
+and compression-delta evidence from
+`plans/impl/057_per_buffer_pages_bench_results.md`.
+**The council's lean on next pickup:** open ADR 058
+(COCD) drafting. CDC follow-ups
 (#16) and vector embeddings (#17) are deliberately
 behind the storage hierarchy in this stretch — they
 remain real work, but the Toron pivot pulls

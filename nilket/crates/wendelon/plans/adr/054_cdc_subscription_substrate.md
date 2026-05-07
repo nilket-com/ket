@@ -1621,7 +1621,7 @@ doesn't depend on storage layout).
 ordinary admissions; CDC observes them like any other write.
 Cursor shape unchanged.
 
-**Roadmap #13 encoding refinements.** LCE V2 / V3 and column
+**Roadmap #13 encoding refinements.** ADR 057 encoding cascades / V3 and column
 projection are pluggable on storage / wire axes; CDC events
 inherit ADR 053's wire compression; column projection on CDC
 is a follow-up that composes with per-buffer LZ4.

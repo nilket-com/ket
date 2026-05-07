@@ -933,9 +933,9 @@ the storage axis (ADR 043 / future). Wire-side ANN responses
 (k-NN result Arrow batches) inherit ADR 053.
 
 **Roadmap #13 encoding / fetch / distributed compute
-refinements.** LCE V2 / V3 (homerolled SIMD encodings, COCD)
+refinements.** ADR 057 encoding cascades / V3 (homerolled SIMD encodings, COCD)
 target the storage axis. Wire-side density is amenable to
-LCE encodings inside Arrow buffers as a future option, but
+encoding cascades inside Arrow buffers as a future option, but
 ADR 053 does not pre-allocate the surface.
 
 **Future zstd codec for capacity-tier CDC replay.** A

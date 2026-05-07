@@ -62,7 +62,7 @@ ADR 044 fills exactly that gap.
 
 ## Non-goals (V1)
 
-- **No homerolled lightweight columnar encodings.**
+- **No homerolled encoding cascades.**
   FastLanes / ALP / FSST / RLE / encoding cascades —
   Brainstorm 011 V2/V3 territory. ADR 043's per-buffer LZ4
   remains the codec.
@@ -947,7 +947,7 @@ unchanged from ADR 043 §4.
   ADR 044 needs.
 - **Per-column compression-policy descriptor field.**
   Arrow IPC's `BodyCompression` is per-buffer, but ADR 043
-  §1 deferred per-column policy to LCE V2 explicitly. ADR
+  §1 deferred per-column policy to ADR 057 encoding cascades explicitly. ADR
   044 is fetch-side only and does not touch policy.
 - **Project-name-prefixed type names** (per
   `plans/conventions/no-project-name-in-protocols.md`).
@@ -1025,7 +1025,7 @@ council/policy follow-up, or in a follow-on ADR.
 ## Forward-compatibility analysis
 
 **Brainstorm 011 V2 (homerolled SIMD encodings).** ADR 044's
-fetch planner consumes per-buffer Arrow IPC offsets; LCE V2's
+fetch planner consumes per-buffer Arrow IPC offsets; ADR 057 encoding cascades's
 homerolled encodings still expose buffers (or page-directories
 that decompose to buffers). The planner surface stays.
 
@@ -1126,7 +1126,7 @@ lands for other reasons, ADR 044 does not pre-empt it.
   reads via IPC FlatBuffer authority.
 - Brainstorm 010 — serverless PBC L2 (node-pushdown) — uses
   the same chunk-aligned authenticated range-read primitive.
-- Brainstorm 011 — lightweight columnar encodings — V2/V3
+- Brainstorm 011 — encoding cascades — V2/V3
   refines decode but not fetch planning.
 - `plans/conventions/newtype-units.md` —
   `IpcBufferOffset`, `IpcBufferLength`,

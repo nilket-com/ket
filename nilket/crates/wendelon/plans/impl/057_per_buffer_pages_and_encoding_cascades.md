@@ -28,67 +28,68 @@ Inherits row-group + page-directory substrate:
 
 ## Status
 
-Council-converged; staged for promotion. Inner layer of the
+Council-converged and promoted after implementation plus Phase
+10 bench evidence. Inner layer of the
 storage hierarchy. Opens on top of ADR 056's accepted Phase
 10 bench artifact.
 
 Implementation contract is locked at the council level: 8
 cascades, compact directory with cascade dedup and
 `page_end_offsets` prefix array, 5-code reject taxonomy,
-node-local `LceWriterConfig` activation (no descriptor
+node-local `EncodingWriterConfig` activation (no descriptor
 policy), Phase D internal to `RowGroup` leg, ≤ 75% writer-
 cost gate as starting target with mandatory compression +
 read-side wins, decode-only V1, COCD deferred to ADR 058.
 
 V1 implementation commitments (pinned by the companion ADR):
 
-- decode-only LCE substrate; compute-over-encoded-data is
+- decode-only Encoding substrate; compute-over-encoded-data is
   ADR 058 territory;
 - closed cascade catalog: `Plain`, `Lz4Frame`, `BitPacked`,
   `Rle`, `Dictionary`, `Delta`, `Fsst`, `Alp`. Composition
-  one level deep via `Box<LceLeafCascade>`;
-- node-local `LceWriterConfig` is the activation surface;
+  one level deep via `Box<EncodingLeafCascade>`;
+- node-local `EncodingWriterConfig` is the activation surface;
   deployment-wide for cross-replica byte-equality;
-- `LceEncodingDirectory` carried in IPC schema custom
+- `EncodingDirectory` carried in IPC schema custom
   metadata under literal key
-  `storage.lce_encoding_directory`;
+  `storage.encoding_directory`;
 - writer cascade-selection heuristic is closed and rule-
   based, not ML;
 - planner Phase D materialization layered on ADR 056's
   three-phase plan;
-- pre-057 records (no `lce_encoding_directory` key) read
+- pre-057 records (no `encoding_directory` key) read
   via ADR 056 / ADR 044 paths transparently;
 - promotion gated by Phase 10 bench acceptance.
 
 ## Goal
 
-Land the LCE substrate as a self-contained module under
-`src/storage/lce/`. Cascades, page directory, materializer,
+Land the Encoding substrate as a self-contained module under
+`src/storage/encoding/`. Cascades, page directory, materializer,
 writer cascade-selection, and Phase D planner extension all
-live inside the LCE module; ADR 056's row-group module stays
+live inside the Encoding module; ADR 056's row-group module stays
 unchanged.
 
 The implementation:
 
 - 16 newtype-units in `src/schema/units.rs`;
-- `LceEncodingDirectory`, `LceBufferEncoding`,
-  `LcePageDescriptor`, `LceCascade`, `LceLeafCascade`,
-  `LceCascadeKind`, `LceWriterConfig`, `L2LceFetchConfig`,
-  `LceRejectCode`, `LceFallbackReason` in
-  `src/storage/lce/mod.rs` and submodules;
+- `EncodingDirectory`, `BufferEncoding`,
+  `EncodingPageDescriptor`, `EncodingCascade`, `EncodingLeafCascade`,
+  `EncodingCascadeKind`, `EncodingWriterConfig`, `L2EncodingFetchConfig`,
+  `EncodingRejectCode`, `EncodingFallbackReason` in
+  `src/storage/encoding/mod.rs` and submodules;
 - per-cascade encoder + decoder modules
-  (`src/storage/lce/cascade/{plain,lz4,bitpacked,rle,dict,
+  (`src/storage/encoding/cascade/{plain,lz4,bitpacked,rle,dict,
   delta,fsst,alp}.rs`);
 - cascade-selection heuristic in
-  `src/storage/lce/select.rs`;
+  `src/storage/encoding/select.rs`;
 - directory serializer + parser in
-  `src/storage/lce/directory.rs`;
+  `src/storage/encoding/directory.rs`;
 - materializer entry point in
-  `src/storage/lce/materialize.rs`;
+  `src/storage/encoding/materialize.rs`;
 - planner Phase D extension in `src/storage/columnar.rs`;
 - ADR 052 secondary-index `fetch_indexed_rows` extension;
-- bounded `storage_l2_lce_*` metric family;
-- 5-code `LceRejectCode` taxonomy;
+- bounded `storage_l2_encoding_*` metric family;
+- 5-code `EncodingRejectCode` taxonomy;
 - audit lifecycle events;
 - bench matrix per ADR §"Open questions" Phase-10 list.
 
@@ -97,45 +98,45 @@ The implementation:
 - 16 newtype-units in `src/schema/units.rs`:
   `BitsPerValue`, `BaseValue`, `RunCount`,
   `DictValueCount`, `Exponent`, `Factor`,
-  `ExceptionCount`, `LcePageIndex`,
-  `LcePageByteOffset`, `LceCascadeIndex`,
+  `ExceptionCount`, `EncodingPageIndex`,
+  `EncodingPageByteOffset`, `EncodingCascadeIndex`,
   `BufferValueIndex`, `BufferValueCount`,
   `SimdPageValueCount`, `SampleRowCount`,
-  `LcePageCount`, `TaskCount`.
-- `src/storage/lce/mod.rs` (new) — top-level types and
+  `EncodingPageCount`, `TaskCount`.
+- `src/storage/encoding/mod.rs` (new) — top-level types and
   module exports.
-- `src/storage/lce/cascade/{plain,lz4,bitpacked,rle,dict,
+- `src/storage/encoding/cascade/{plain,lz4,bitpacked,rle,dict,
   delta,fsst,alp}.rs` (new) — eight per-cascade
   encoder + decoder modules.
-- `src/storage/lce/select.rs` (new) — cascade selection
+- `src/storage/encoding/select.rs` (new) — cascade selection
   heuristic.
-- `src/storage/lce/directory.rs` (new) — directory
+- `src/storage/encoding/directory.rs` (new) — directory
   serializer + parser + invariant validation.
-- `src/storage/lce/materialize.rs` (new) — Phase D
+- `src/storage/encoding/materialize.rs` (new) — Phase D
   materializer entry point.
-- `src/storage/lce/scratch.rs` (new) — scratch buffer pool.
-- `src/storage/lce/page.rs` (new) — SIMD page helpers.
+- `src/storage/encoding/scratch.rs` (new) — scratch buffer pool.
+- `src/storage/encoding/page.rs` (new) — SIMD page helpers.
 - `src/storage/columnar.rs` — extend planner with Phase D
   step.
-- `src/storage/multirow.rs` — writer side dispatches LCE
-  encoding when `LceWriterConfig.enabled`.
+- `src/storage/multirow.rs` — writer side dispatches Encoding
+  encoding when `EncodingWriterConfig.enabled`.
 - `src/storage/secondary_index.rs` — page-aware
   `fetch_indexed_rows`.
-- `src/storage/lsm_worker.rs` — `LceWriterConfig`
+- `src/storage/lsm_worker.rs` — `EncodingWriterConfig`
   plumbing.
-- `src/config.rs` — `LceWriterConfig`, `L2LceFetchConfig`.
+- `src/config.rs` — `EncodingWriterConfig`, `L2EncodingFetchConfig`.
 - `src/metrics/registry.rs` — metric family.
 - `src/audit/events.rs` — audit events.
 - `tests/architecture_test.rs` — Phase 11 guards.
-- 9 new test files (`tests/lce_*.rs`).
-- `benches/lce.rs` (new).
-- `plans/ops/runbooks/lce.md` (new).
+- 9 new test files (`tests/encoding_*.rs`).
+- `benches/encoding.rs` (new).
+- `plans/ops/runbooks/encoding.md` (new).
 
 ## Non-goals
 
 - No compute-over-encoded-data path (ADR 058 territory).
 - No arbitrary-depth cascade nesting.
-- No `RecordBodyCompressionPolicy::Lce` descriptor variant.
+- No `RecordBodyCompressionPolicy::EncodingCascade` descriptor variant.
 - No nested / list / struct Arrow type encoding in V1.
 - No page-level min/max/null stats.
 - No per-tenant cascade tuning surface.
@@ -146,16 +147,18 @@ The implementation:
 - No new envelope `format_version`.
 - No ADR 022 footer extension.
 - No `SlabRecordHeader` change.
-- No new `MsgType` containing `LCE` or `CASCADE`.
+- No new `MsgType` containing `Encoding` or `CASCADE`.
 - No new `FRAME_FLAG_*`.
 - No new `NodeCapability` bit.
 - No `ObjectStore` trait change.
 - No public Toron-visible PBC opcode addition.
 - No reserved cascade slots, compatibility shims, or
-  `V1` / `V2` Rust type suffixes.
+  numeric-version Rust type suffixes.
 - No project-name prefix on new symbols.
 - No high-cardinality metric labels.
-- No new Cargo feature or external dependency.
+- No new Cargo feature or external codec dependency. The
+  implementation may name the Arrow IPC stack's existing
+  `flatbuffers` crate directly when rewriting RecordBatch metadata.
 
 ## Phase 0 — Contract freeze and module layout
 
@@ -169,15 +172,15 @@ V1 defaults before invasive storage edits begin.
 Files:
 
 - `src/schema/units.rs`
-- `src/storage/lce/mod.rs` (new)
-- `src/storage/lce/cascade/mod.rs` (new — dispatch table)
+- `src/storage/encoding/mod.rs` (new)
+- `src/storage/encoding/cascade/mod.rs` (new — dispatch table)
 - `src/storage/columnar.rs` (extension intent)
 - `src/storage/multirow.rs` (writer extension intent)
 - `src/storage/secondary_index.rs` (extension intent)
 - `src/storage/lsm_worker.rs` (config plumbing)
 - `src/config.rs`
 - `src/metrics/registry.rs`
-- `tests/fixtures/lce/` (new)
+- `tests/fixtures/encoding/` (new)
 - `tests/architecture_test.rs`
 
 Work:
@@ -187,7 +190,7 @@ Work:
    planner four-leg dispatch, secondary-index adapter,
    compaction worker config plumbing).
 
-2. Decide LCE directory serialization. Reuse the same
+2. Decide Encoding directory serialization. Reuse the same
    serializer-flavor choice ADR 056 made (Phase 0 audits;
    document in ADR §3 and update before promotion).
 
@@ -210,11 +213,11 @@ Work:
    #[repr(transparent)]
    pub struct ExceptionCount(u32);
    #[repr(transparent)]
-   pub struct LcePageIndex(u32);
+   pub struct EncodingPageIndex(u32);
    #[repr(transparent)]
-   pub struct LcePageByteOffset(u32);
+   pub struct EncodingPageByteOffset(u32);
    #[repr(transparent)]
-   pub struct LceCascadeIndex(u16);
+   pub struct EncodingCascadeIndex(u16);
    #[repr(transparent)]
    pub struct BufferValueIndex(u32);
    #[repr(transparent)]
@@ -224,7 +227,7 @@ Work:
    #[repr(transparent)]
    pub struct SampleRowCount(u32);
    #[repr(transparent)]
-   pub struct LcePageCount(u32);
+   pub struct EncodingPageCount(u32);
    #[repr(transparent)]
    pub struct TaskCount(u32);
    ```
@@ -240,7 +243,7 @@ Work:
 
    ```rust
    #[repr(u8)]
-   pub enum LceCascadeKind {
+   pub enum EncodingCascadeKind {
        Plain      = 1,
        Lz4Frame   = 2,
        BitPacked  = 3,
@@ -251,65 +254,65 @@ Work:
        Alp        = 8,
    }
 
-   pub enum LceLeafCascade {
+   pub enum EncodingLeafCascade {
        Plain,
        Lz4Frame,
        BitPacked { bits: BitsPerValue, base: BaseValue },
    }
 
-   pub enum LceCascade {
+   pub enum EncodingCascade {
        Plain,
        Lz4Frame,
        BitPacked  { bits: BitsPerValue, base: BaseValue },
        Rle        { run_count: RunCount,
-                    inner: Box<LceLeafCascade> },
+                    inner: Box<EncodingLeafCascade> },
        Dictionary { dict_byte_len: BufferByteLen,
                     dict_value_count: DictValueCount,
-                    inner: Box<LceLeafCascade> },
+                    inner: Box<EncodingLeafCascade> },
        Delta      { base: BaseValue,
-                    inner: Box<LceLeafCascade> },
+                    inner: Box<EncodingLeafCascade> },
        Fsst       { symbol_table_byte_len: BufferByteLen },
        Alp        { exponent: Exponent, factor: Factor,
                     exception_count: ExceptionCount,
-                    inner: Box<LceLeafCascade> },
+                    inner: Box<EncodingLeafCascade> },
    }
    ```
 
-   Architectural guard: `LceCascadeKind` discriminants
-   1..=8 stable; `LceLeafCascade` discriminants 1..=3
-   stable; non-leaf variants carry `Box<LceLeafCascade>`,
-   never `Box<LceCascade>`.
+   Architectural guard: `EncodingCascadeKind` discriminants
+   1..=8 stable; `EncodingLeafCascade` discriminants 1..=3
+   stable; non-leaf variants carry `Box<EncodingLeafCascade>`,
+   never `Box<EncodingCascade>`.
 
 5. Freeze directory shapes (compact form — cascade dedup +
    per-buffer page prefix-end offsets):
 
    ```rust
-   pub struct LceEncodingDirectory {
+   pub struct EncodingDirectory {
        pub record_id: TieredRecordId,
        pub row_count: RowCount,
        pub logical_schema_fingerprint: LogicalSchemaFingerprint,
        pub target_simd_page_values: SimdPageValueCount,
-       pub cascades: Vec<LceCascade>,
-       pub buffers: Vec<LceBufferEncoding>,
+       pub cascades: Vec<EncodingCascade>,
+       pub buffers: Vec<BufferEncoding>,
    }
 
-   pub struct LceBufferEncoding {
+   pub struct BufferEncoding {
        pub row_group_index: RowGroupIndex,
        pub ipc_column_ordinal: IpcColumnOrdinal,
        pub ipc_buffer_ordinal: IpcBufferIndex,
-       pub cascade_index: LceCascadeIndex,
+       pub cascade_index: EncodingCascadeIndex,
        pub decoded_byte_len: BufferByteLen,
        pub decoded_value_count: BufferValueCount,
        pub encoded_range: BufferByteRange,
        pub page_value_count: SimdPageValueCount,
-       pub page_end_offsets: Vec<LcePageByteOffset>,
+       pub page_end_offsets: Vec<EncodingPageByteOffset>,
    }
 
    /// Transient planner-only structure; NOT serialized.
-   /// Expanded from `LceBufferEncoding.page_end_offsets`
+   /// Expanded from `BufferEncoding.page_end_offsets`
    /// during planning.
-   pub struct LcePageDescriptor {
-       pub page_index: LcePageIndex,
+   pub struct EncodingPageDescriptor {
+       pub page_index: EncodingPageIndex,
        pub first_value_index: BufferValueIndex,
        pub value_count: BufferValueCount,
        pub byte_range: BufferByteRange,
@@ -324,7 +327,7 @@ Work:
 
    ```rust
    #[repr(u32)]
-   pub enum LceRejectCode {
+   pub enum EncodingRejectCode {
        EncodingDirectoryParseError = 1,
        BufferEncodingMismatch      = 2,
        PageRangeOverflow           = 3,
@@ -332,7 +335,7 @@ Work:
        DecodedLengthMismatch       = 5,
    }
 
-   pub enum LceFallbackReason {
+   pub enum EncodingFallbackReason {
        ReaderDisabled,
        DirectoryMissing,
        UnsupportedArrowLayout,
@@ -346,41 +349,41 @@ Work:
 7. Freeze writer + reader configs:
 
    ```rust
-   pub struct LceWriterConfig {
+   pub struct EncodingWriterConfig {
        pub enabled: bool,                                  // false
        pub target_simd_page_values: SimdPageValueCount,    // 1_024
        pub cascade_sample_rows: SampleRowCount,            // 256
-       pub min_buffer_bytes_for_lce: BufferByteLen,        // 4_096
-       pub enabled_cascades: BTreeSet<LceCascadeKind>,     // all by default
+       pub min_buffer_bytes_for_encoding: BufferByteLen,        // 4_096
+       pub enabled_cascades: BTreeSet<EncodingCascadeKind>,     // all by default
    }
 
-   pub struct L2LceFetchConfig {
+   pub struct L2EncodingFetchConfig {
        pub enabled: bool,                                  // false
-       pub max_simd_pages_per_record: LcePageCount,       // 64
+       pub max_simd_pages_per_record: EncodingPageCount,       // 64
        pub max_parallel_materialize_tasks: TaskCount,      // 4
    }
    ```
 
-   `LceWriterConfig` is **deployment-wide** in V1 — applied
+   `EncodingWriterConfig` is **deployment-wide** in V1 — applied
    uniformly across locality replicas to preserve
    cross-replica byte-equality (mirroring ADR 056 §13).
 
 8. Freeze the IPC `Schema.custom_metadata` key: literal
-   string `storage.lce_encoding_directory`. Architectural
+   string `storage.encoding_directory`. Architectural
    guard checks the key.
 
 9. Freeze metric shapes per ADR §13:
 
    ```text
-   storage_l2_lce_buffer_encodings_total{cascade}
-   storage_l2_lce_materialize_micros{cascade}
-   storage_l2_lce_simd_pages_fetched_total{cascade}
-   storage_l2_lce_compression_ratio{cascade}
-   storage_l2_lce_cascade_select_micros
-   storage_l2_lce_directory_bytes
-   storage_l2_lce_fallback_total{reason}
-   storage_l2_lce_bytes_total{kind}
-   storage_l2_lce_invariant_violations_total{violation_kind}
+   storage_l2_encoding_buffer_encodings_total{cascade}
+   storage_l2_encoding_materialize_micros{cascade}
+   storage_l2_encoding_simd_pages_fetched_total{cascade}
+   storage_l2_encoding_compression_ratio{cascade}
+   storage_l2_encoding_cascade_select_micros
+   storage_l2_encoding_directory_bytes
+   storage_l2_encoding_fallback_total{reason}
+   storage_l2_encoding_bytes_total{kind}
+   storage_l2_encoding_invariant_violations_total{violation_kind}
    ```
 
    Pinned label enumerations:
@@ -402,13 +405,14 @@ Work:
 
 10. Freeze fixtures:
     - small `MultiRow` record below ADR 056 paging
-      thresholds (no LCE expected — falls through);
-    - paged record with LCE writer disabled (LCE not
+      thresholds (no Encoding expected — falls through);
+    - paged record with Encoding writer disabled (Encoding not
       engaged — ADR 056 path);
     - paged record with all int64 columns selecting
       `BitPacked`;
-    - paged record with low-cardinality strings selecting
-      `Dictionary`;
+    - paged record with one-page low-cardinality strings selecting
+      `Dictionary`, and multi-page variable-width strings avoiding
+      `Dictionary` by default;
     - paged record with monotonic `__row_hlc__` selecting
       `Delta`;
     - paged record with constant
@@ -428,40 +432,40 @@ Work:
       `Lz4Frame`;
     - paged record mixing all V1 cascade kinds across
       different columns;
-    - paged record with corrupted LCE directory (invalid
+    - paged record with corrupted Encoding directory (invalid
       cascade parameters, mismatched buffer ordinal,
       truncated bytes);
-    - pre-057 record (no `lce_encoding_directory` key);
+    - pre-057 record (no `encoding_directory` key);
     - record with cascade variant disabled in
       `enabled_cascades` (writer falls back to the next
       eligible cascade).
 
 11. Architectural test stubs (full guards in Phase 11):
     - exactly one definition each of
-      `LceEncodingDirectory`, `LceBufferEncoding`,
-      `LcePageDescriptor`, `LceCascade`, `LceLeafCascade`,
-      `LceCascadeKind`;
+      `EncodingDirectory`, `BufferEncoding`,
+      `EncodingPageDescriptor`, `EncodingCascade`, `EncodingLeafCascade`,
+      `EncodingCascadeKind`;
     - newtype-unit definitions for cascade parameters;
     - cascade composition is one level deep
-      (`LceCascade::Rle.inner: LceLeafCascade`,
+      (`EncodingCascade::Rle.inner: EncodingLeafCascade`,
       never recursive);
     - exactly one materializer entry point in
-      `src/storage/lce/materialize.rs`;
+      `src/storage/encoding/materialize.rs`;
     - CDC, recovery, rehydration code paths do not
-      import LCE-specific types directly;
-    - no `Lce*V[0-9]` / `Cascade*V[0-9]` Rust type
+      import Encoding-specific types directly;
+    - no `Encoding*V[0-9]` / `Cascade*V[0-9]` Rust type
       names;
-    - no `Wendelon`-prefixed LCE symbols;
+    - no `Wendelon`-prefixed Encoding symbols;
     - `Schema.custom_metadata` key literal is
-      `storage.lce_encoding_directory`;
-    - writer reads from `LceWriterConfig` only, not from
+      `storage.encoding_directory`;
+    - writer reads from `EncodingWriterConfig` only, not from
       a descriptor field;
-    - no `RecordBodyCompressionPolicy::Lce` variant;
+    - no `RecordBodyCompressionPolicy::EncodingCascade` variant;
     - no envelope `format_version` bump; no ADR 022
       footer field addition;
-    - no synthetic Arrow column for LCE metadata;
+    - no synthetic Arrow column for Encoding metadata;
     - no PBC opcode addition or PBC executor call from
-      inside `src/storage/lce/`.
+      inside `src/storage/encoding/`.
 
 Exit:
 
@@ -472,16 +476,16 @@ Exit:
 
 Files:
 
-- `src/storage/lce/cascade/mod.rs`
-- `src/storage/lce/cascade/plain.rs`
-- `src/storage/lce/cascade/lz4.rs`
-- `src/storage/lce/cascade/bitpacked.rs`
-- `src/storage/lce/cascade/rle.rs`
-- `src/storage/lce/cascade/dict.rs`
-- `src/storage/lce/cascade/delta.rs`
-- `src/storage/lce/cascade/fsst.rs`
-- `src/storage/lce/cascade/alp.rs`
-- `tests/lce_cascade.rs` (new)
+- `src/storage/encoding/cascade/mod.rs`
+- `src/storage/encoding/cascade/plain.rs`
+- `src/storage/encoding/cascade/lz4.rs`
+- `src/storage/encoding/cascade/bitpacked.rs`
+- `src/storage/encoding/cascade/rle.rs`
+- `src/storage/encoding/cascade/dict.rs`
+- `src/storage/encoding/cascade/delta.rs`
+- `src/storage/encoding/cascade/fsst.rs`
+- `src/storage/encoding/cascade/alp.rs`
+- `tests/encoding_cascade.rs` (new)
 
 Work:
 
@@ -562,7 +566,7 @@ Work:
     `DecodedLengthMismatch` (output exceeds
     `expected_byte_len`).
 
-Tests (`tests/lce_cascade.rs`):
+Tests (`tests/encoding_cascade.rs`):
 
 - Round-trip per cascade per dtype: encode → decode →
   byte-identical input.
@@ -592,9 +596,9 @@ Exit:
 
 Files:
 
-- `src/storage/lce/select.rs` (new)
-- `src/storage/lce/sample.rs` (new)
-- `tests/lce_select.rs` (new)
+- `src/storage/encoding/select.rs` (new)
+- `src/storage/encoding/sample.rs` (new)
+- `tests/encoding_select.rs` (new)
 
 Work:
 
@@ -631,35 +635,43 @@ Work:
    ```rust
    pub fn select_cascade(
        sample: &ColumnSample,
-       config: &LceWriterConfig,
+       config: &EncodingWriterConfig,
        buffer_bytes: BufferByteLen,
-   ) -> LceCascade;
+   ) -> EncodingCascade;
    ```
 
    Each rule branch checks `config.enabled_cascades`;
    falls through to the next eligible cascade if
    disabled.
 
-3. Sub-`min_buffer_bytes_for_lce` columns return `Plain`
+3. Sub-`min_buffer_bytes_for_encoding` columns return `Plain`
    immediately.
 
 4. Bound heuristic CPU. Architectural test asserts via
-   `storage_l2_lce_cascade_select_micros`.
+   `storage_l2_encoding_cascade_select_micros`.
 
-Tests (`tests/lce_select.rs`):
+Tests (`tests/encoding_select.rs`):
 
 - Constant column → `Rle { run_count: 1, ... }`.
 - Low-cardinality int → `Dictionary(BitPacked)`.
 - Monotonic int (e.g., `__row_hlc__`) → `Delta(BitPacked)`.
 - Bounded-range int → `BitPacked` with non-zero base.
 - High-run-length int → `Rle(BitPacked)`.
-- Random int → `Lz4Frame`.
-- Low-cardinality short string → `Dictionary(BitPacked)`.
+- Random int → `Plain` when `Plain` is enabled; `Lz4Frame`
+  when `Plain` is removed from `enabled_cascades`.
+- One-page low-cardinality short string →
+  `Dictionary(BitPacked)`.
+- Multi-page variable-width string → `Fsst` when the sample is
+  compressible, otherwise the normal `Plain` / `Lz4Frame`
+  fallback. This avoids the multi-page Dictionary writer-cost
+  spike measured in Phase 10.
 - High-cardinality UTF-8 → `Fsst` or `Lz4Frame` per
   sample.
-- Random binary → `Lz4Frame`.
+- Random binary → `Plain` when `Plain` is enabled; `Lz4Frame`
+  when `Plain` is removed from `enabled_cascades`.
 - Restricted-exponent float → `Alp(BitPacked)`.
-- Random float → `Lz4Frame`.
+- Random float → `Plain` when `Plain` is enabled; `Lz4Frame`
+  when `Plain` is removed from `enabled_cascades`.
 - Sub-threshold buffer → `Plain`.
 - Disabled cascade kind in `enabled_cascades` falls
   through to next eligible.
@@ -677,8 +689,8 @@ Exit:
 
 Files:
 
-- `src/storage/lce/directory.rs` (new)
-- `tests/lce_directory.rs` (new)
+- `src/storage/encoding/directory.rs` (new)
+- `tests/encoding_directory.rs` (new)
 
 Work:
 
@@ -697,18 +709,18 @@ Work:
 3. Parser:
 
    ```rust
-   pub fn parse_lce_directory(
+   pub fn parse_encoding_directory(
        custom_metadata_value: &[u8],
-   ) -> Result<LceEncodingDirectory, LceRejectCode>;
+   ) -> Result<EncodingDirectory, EncodingRejectCode>;
    ```
 
    Validates magic, format_version, length-prefixed
    entries.
 
-4. `validate_lce_directory(directory, row_group_directory,
+4. `validate_encoding_directory(directory, row_group_directory,
    schema, expected_fingerprint)` enforces:
    - `logical_schema_fingerprint` matches descriptor;
-   - every `LceBufferEncoding` triple matches an entry
+   - every `BufferEncoding` triple matches an entry
      in ADR 056's `BufferPageDirectoryEntry` set;
    - no duplicate `(row_group, column, buffer)` entries;
    - `page_end_offsets` strictly increasing, last entry
@@ -724,28 +736,28 @@ Work:
 
 5. ADR 056 Phase A parser extension:
    - look up
-     `Schema.custom_metadata["storage.lce_encoding_directory"]`;
+     `Schema.custom_metadata["storage.encoding_directory"]`;
    - if absent: ADR 057 reads via ADR 056 path
      transparently;
    - if present: parse and attach to
-     `RecordBufferDirectory.lce_directory: Option<LceEncodingDirectory>`.
+     `RecordBufferDirectory.encoding_directory: Option<EncodingDirectory>`.
 
 6. On validation failure: `EncodingDirectoryParseError`,
    `BufferEncodingMismatch`, or `CascadeUnsupported` —
    never silent fallback.
 
-Tests (`tests/lce_directory.rs`):
+Tests (`tests/encoding_directory.rs`):
 
 - Pre-057 record (no key) parses with
-  `lce_directory: None`, no error.
+  `encoding_directory: None`, no error.
 - Well-formed directory parses cleanly.
 - Roundtrip writer → reader → byte-identical
-  `LceEncodingDirectory` for every fixture.
+  `EncodingDirectory` for every fixture.
 - Corrupted directory (bad magic, truncated entry,
   invalid cascade parameter, recursive cascade
   composition, out-of-range cascade discriminant) fails
   closed with appropriate reject code.
-- LCE entry referencing a buffer not in ADR 056
+- Encoding entry referencing a buffer not in ADR 056
   directory → `BufferEncodingMismatch`.
 - non-empty `page_end_offsets` on non-page cascade
   (`Plain`, `Lz4Frame`, `Delta`, `Fsst`, `Alp`) →
@@ -755,16 +767,16 @@ Tests (`tests/lce_directory.rs`):
 
 Exit:
 
-- Directory parser recognizes LCE-paged vs. legacy
+- Directory parser recognizes Encoding-paged vs. legacy
   records; rejects malformed closed.
 
 ## Phase 4 — Custom partial-buffer materializer
 
 Files:
 
-- `src/storage/lce/materialize.rs` (new)
-- `src/storage/lce/scratch.rs` (new)
-- `tests/lce_materialize.rs` (new)
+- `src/storage/encoding/materialize.rs` (new)
+- `src/storage/encoding/scratch.rs` (new)
+- `tests/encoding_materialize.rs` (new)
 
 Work:
 
@@ -773,9 +785,9 @@ Work:
    ```rust
    pub fn materialize_buffer(
        encoded_bytes: &[u8],
-       encoding: &LceBufferEncoding,
+       encoding: &BufferEncoding,
        scratch: &mut ScratchBufferPool,
-   ) -> Result<MaterializedBuffer, LceRejectCode>;
+   ) -> Result<MaterializedBuffer, EncodingRejectCode>;
    ```
 
    Walks cascade outer-to-inner, returns dense Arrow-
@@ -786,11 +798,11 @@ Work:
    ```rust
    pub fn materialize_simd_page(
        page_bytes: &[u8],
-       page_index: LcePageIndex,
+       page_index: EncodingPageIndex,
        page_value_count: BufferValueCount,
-       encoding: &LceBufferEncoding,
+       encoding: &BufferEncoding,
        scratch: &mut ScratchBufferPool,
-   ) -> Result<MaterializedPage, LceRejectCode>;
+   ) -> Result<MaterializedPage, EncodingRejectCode>;
    ```
 
 3. Scratch buffer pool bounded by config; fail-closed on
@@ -803,9 +815,9 @@ Work:
    pub fn materialize_row_group(
        row_group_index: RowGroupIndex,
        fetched_buffers: &[(IpcColumnOrdinal, IpcBufferIndex, &[u8])],
-       directory: &LceEncodingDirectory,
+       directory: &EncodingDirectory,
        scratch: &mut ScratchBufferPool,
-   ) -> Result<MaterializedRowGroup, LceRejectCode>;
+   ) -> Result<MaterializedRowGroup, EncodingRejectCode>;
    ```
 
 5. Hand materialized buffers to Arrow IPC reader. Reader
@@ -815,7 +827,7 @@ Work:
 6. Architectural test: materializer code path does NOT
    call into PBC executor or AGG fold.
 
-Tests (`tests/lce_materialize.rs`):
+Tests (`tests/encoding_materialize.rs`):
 
 - Round-trip per fixture: materialized buffer ==
   original input buffer (Arrow comparison kernels).
@@ -845,10 +857,10 @@ Exit:
 
 Files:
 
-- `src/storage/lce/page.rs` (new)
-- `src/storage/lce/cascade/{bitpacked,rle,dict}.rs`
+- `src/storage/encoding/page.rs` (new)
+- `src/storage/encoding/cascade/{bitpacked,rle,dict}.rs`
   (extend with page emission)
-- `tests/lce_simd_page.rs` (new)
+- `tests/encoding_simd_page.rs` (new)
 
 Work:
 
@@ -863,12 +875,12 @@ Work:
    enforces.
 
 3. Expand prefix offsets into transient
-   `LcePageDescriptor` values during planning:
+   `EncodingPageDescriptor` values during planning:
 
    ```rust
    pub fn expand_pages(
-       encoding: &LceBufferEncoding,
-   ) -> Vec<LcePageDescriptor>;
+       encoding: &BufferEncoding,
+   ) -> Vec<EncodingPageDescriptor>;
    ```
 
 4. Point-read coordinator:
@@ -876,9 +888,9 @@ Work:
    ```rust
    pub fn map_row_to_page(
        row_within_group: RecordRowIndex,
-       encoding: &LceBufferEncoding,
-       pages: &[LcePageDescriptor],
-   ) -> Option<(LcePageIndex, BufferValueIndex)>;
+       encoding: &BufferEncoding,
+       pages: &[EncodingPageDescriptor],
+   ) -> Option<(EncodingPageIndex, BufferValueIndex)>;
    ```
 
    Returns `None` when the buffer's cascade has no
@@ -890,7 +902,7 @@ Work:
    row_within_page)` for projected buffers, fetches only
    page bytes, materializes one page.
 
-Tests (`tests/lce_simd_page.rs`):
+Tests (`tests/encoding_simd_page.rs`):
 
 - Page boundaries are deterministic.
 - Each page decodes independently.
@@ -911,18 +923,19 @@ Exit:
 Files:
 
 - `src/storage/columnar.rs`
-- `src/storage/lce/planner.rs` (new)
+- `src/storage/encoding/planner.rs` (new)
 - `src/storage/manager.rs`
-- `tests/lce_planner.rs` (new)
+- `tests/encoding_planner.rs` (new)
 
 Work:
 
 1. Extend `RecordBufferDirectory` with optional
-   `lce_directory: Option<LceEncodingDirectory>`. ADR
-   056 directory remains primary; LCE is sibling.
+   `encoding_directory: Option<EncodingDirectory>`. ADR
+   056 directory remains primary; the encoding directory is
+   a sibling.
 
 2. Extend `RowGroupFetchPlan` with optional
-   `lce_materialization: Option<LceMaterializationStep>`.
+   `encoding_materialization: Option<EncodingMaterializationStep>`.
 
 3. Extend the planner to add Phase D (per ADR §5).
    Phase D is internal to the `RowGroup(plan)` strategy
@@ -931,36 +944,36 @@ Work:
 4. Materialization step structure:
 
    ```rust
-   pub struct LceMaterializationStep {
-       pub buffer_decodes: Vec<LceBufferDecodePlan>,
-       pub simd_page_decodes: Vec<LcePageDecodePlan>,
+   pub struct EncodingMaterializationStep {
+       pub buffer_decodes: Vec<EncodingBufferDecodePlan>,
+       pub simd_page_decodes: Vec<EncodingPageDecodePlan>,
    }
 
-   pub struct LceBufferDecodePlan {
+   pub struct EncodingBufferDecodePlan {
        pub row_group_index: RowGroupIndex,
        pub ipc_column_ordinal: IpcColumnOrdinal,
        pub ipc_buffer_ordinal: IpcBufferIndex,
        pub byte_range: BufferByteRange,
    }
 
-   pub struct LcePageDecodePlan {
+   pub struct EncodingPageDecodePlan {
        pub row_group_index: RowGroupIndex,
        pub ipc_column_ordinal: IpcColumnOrdinal,
        pub ipc_buffer_ordinal: IpcBufferIndex,
-       pub page_index: LcePageIndex,
+       pub page_index: EncodingPageIndex,
        pub byte_range: BufferByteRange,
    }
    ```
 
 5. Executor integration: after Phase C bytes arrive,
    walk Phase D's `buffer_decodes` and
-   `simd_page_decodes`, materialize each via the LCE
+   `simd_page_decodes`, materialize each via the Encoding
    materializer, hand to Arrow IPC reader.
 
 6. Strategy ladder unchanged from ADR 056:
 
    ```text
-   row-group(+lce-pages) → row-group(no-lce, ADR 056) →
+   row-group(+encoding-pages) → row-group(no-encoding, ADR 056) →
    column-buffer (ADR 044) → whole-record
    ```
 
@@ -969,9 +982,9 @@ Work:
    `max_simd_pages_per_record`,
    `max_parallel_materialize_tasks`.
 
-Tests (`tests/lce_planner.rs`):
+Tests (`tests/encoding_planner.rs`):
 
-- Query against LCE-paged record uses RowGroup(plan)
+- Query against Encoding-paged record uses RowGroup(plan)
   with Phase D step attached.
 - Query against pre-057 record (ADR 056 only) has no
   Phase D step.
@@ -987,7 +1000,7 @@ Tests (`tests/lce_planner.rs`):
 
 Exit:
 
-- Production read path exercises LCE materialization on
+- Production read path exercises Encoding materialization on
   directory presence.
 
 ## Phase 7 — ADR 052 secondary-index integration
@@ -995,29 +1008,29 @@ Exit:
 Files:
 
 - `src/storage/secondary_index.rs`
-- `src/storage/lce/page.rs`
-- `tests/lce_secondary_index.rs` (new)
+- `src/storage/encoding/page.rs`
+- `tests/encoding_secondary_index.rs` (new)
 
 Work:
 
 1. Extend `fetch_indexed_rows`:
 
    - group hits by `(SlabId, RecordLocation)`;
-   - for each record, if LCE directory present AND SIMD
+   - for each record, if Encoding directory present AND SIMD
      pages cover all projected buffers AND hit count
      small (≤ `max_simd_pages_per_record`):
      emit page-grain fetch + materialize plan;
    - else: ADR 056 row-group fetch + materialize plan.
 
-2. Pre-057 / non-LCE records fall through to ADR 056
+2. Pre-057 / non-Encoding records fall through to ADR 056
    row-group point-read path.
 
 3. Hit coalescing: within a record, hits in the same
    page coalesce to one fetch.
 
-Tests (`tests/lce_secondary_index.rs`):
+Tests (`tests/encoding_secondary_index.rs`):
 
-- Single hit on LCE-paged record fetches one SIMD page,
+- Single hit on Encoding-paged record fetches one SIMD page,
   materializes one page, returns one row.
 - Multiple hits in same page coalesce.
 - Hits across pages within a row group fetch multiple
@@ -1039,26 +1052,26 @@ Files:
 - `src/storage/lsm_worker.rs`
 - `src/storage/manager.rs`
 - `src/storage/lsm.rs`
-- `src/storage/cdc.rs` (no LCE imports)
+- `src/storage/cdc.rs` (no Encoding imports)
 - `src/storage/recovery.rs`
 - `src/storage/rehydration.rs`
-- `tests/lce_lsm.rs` (new)
-- `tests/lce_neutral.rs` (new)
+- `tests/encoding_lsm.rs` (new)
+- `tests/encoding_neutral.rs` (new)
 
 Work:
 
-1. Plumb `LceWriterConfig` through admission writes and
+1. Plumb `EncodingWriterConfig` through admission writes and
    LSM compaction writes (ADR 055 §5). Compaction has no
    separate override.
 
 2. Determinism: identical input bytes + identical config
-   produce byte-identical LCE-encoded compaction outputs.
+   produce byte-identical Encoding-encoded compaction outputs.
 
 3. Compaction recomputes cascades; never copies input
    cascade choices (architectural guard 18).
 
 4. Pre-056 → post-057 first-pass compaction produces
-   fully-paged LCE-encoded output even from unpaged
+   fully-paged Encoding-encoded output even from unpaged
    uncompressed input.
 
 5. Visible-state digest invariance (ADR 055 §6) preserved.
@@ -1073,29 +1086,29 @@ Work:
    version entries.
 
 9. Recovery decodes the IPC stream, parses both
-   directories, materializes LCE buffers via Phase D,
+   directories, materializes Encoding buffers via Phase D,
    rebuilds redb indexes.
 
 10. Rehydration installs whole slab bytes; subsequent L1
     reads use Phase D automatically.
 
-Tests (`tests/lce_lsm.rs`):
+Tests (`tests/encoding_lsm.rs`):
 
-- LCE-disabled compaction produces no LCE directory.
-- LCE-enabled compaction rewrites paged-non-LCE input
-  into paged-LCE output.
+- Encoding-disabled compaction produces no Encoding directory.
+- Encoding-enabled compaction rewrites paged-non-Encoding input
+  into paged-Encoding output.
 - Compaction recomputes cascades.
 - Determinism: two replicas with identical config
   produce byte-identical outputs.
 - Visible-state digest unchanged.
-- Secondary-index lookup against LCE-compacted output
+- Secondary-index lookup against Encoding-compacted output
   fetches via SIMD-page fast path.
 
-Tests (`tests/lce_neutral.rs`):
+Tests (`tests/encoding_neutral.rs`):
 
-- CDC subscription on LCE-paged slab emits the same
-  events as on non-LCE slab.
-- Recovery from LCE-paged slab rebuilds redb indexes
+- CDC subscription on Encoding-paged slab emits the same
+  events as on non-Encoding slab.
+- Recovery from Encoding-paged slab rebuilds redb indexes
   byte-identically.
 - Rehydrated L1 reads use Phase D automatically.
 
@@ -1112,44 +1125,44 @@ Files:
 - `src/audit/events.rs`
 - `src/config.rs`
 - `examples/wendelon.toml.example`
-- `plans/ops/runbooks/lce.md` (new)
+- `plans/ops/runbooks/encoding.md` (new)
 - `plans/ops/runbooks/README.md`
 - `plans/ops/observability.md`
 - `tests/metrics_smoke.rs`
 
 Work:
 
-1. Register `storage_l2_lce_*` metrics per Phase 0 §9 /
+1. Register `storage_l2_encoding_*` metrics per Phase 0 §9 /
    ADR §13.
 
 2. Add audit events:
-   - `LceMaterializeSampled { cascade,
+   - `EncodingMaterializeSampled { cascade,
      buffer_bytes_in, buffer_bytes_out }` (sampled,
      debug-grade);
-   - `LceInvariantViolation { kind }` (page-grade).
+   - `EncodingInvariantViolation { kind }` (page-grade).
 
-3. Add `LceWriterConfig` and `L2LceFetchConfig` to
+3. Add `EncodingWriterConfig` and `L2EncodingFetchConfig` to
    `src/config.rs` with V1 defaults (both
    `enabled = false`).
 
 4. Operator runbook covering:
-   - reading LCE cascade distribution per
-     `storage_l2_lce_buffer_encodings_total`;
+   - reading Encoding cascade distribution per
+     `storage_l2_encoding_buffer_encodings_total`;
    - per-cascade compression ratio;
    - SIMD-page fetch hit rate vs. row-group buffer
      fetch;
    - tuning `target_simd_page_values`,
-     `min_buffer_bytes_for_lce`,
+     `min_buffer_bytes_for_encoding`,
      `cascade_sample_rows`;
    - disabling a cascade kind via `enabled_cascades`
      in response to a decode bug;
-   - recognizing `LceInvariantViolation` as fail-
+   - recognizing `EncodingInvariantViolation` as fail-
      closed corruption (not fallback);
    - cross-replica byte-equality reconciliation;
-   - rolling out LCE writer config across the cluster
+   - rolling out Encoding writer config across the cluster
      in waves;
    - turning the writer config off as a cluster-wide
-     LCE disable.
+     Encoding disable.
 
 5. Index runbook in `plans/ops/runbooks/README.md`.
 
@@ -1164,14 +1177,14 @@ Tests:
 
 Exit:
 
-- Operators can see LCE engagement, per-cascade
+- Operators can see Encoding engagement, per-cascade
   compression, fetch hit rate, and corruption signals.
 
 ## Phase 10 — Bench
 
 Files:
 
-- `benches/lce.rs` (new)
+- `benches/encoding.rs` (new)
 - `Cargo.toml`
 - `plans/wip/057_per_buffer_pages_bench_results.md`
   during iteration; final lands at
@@ -1200,7 +1213,7 @@ Bench scenarios:
    target, **defended by mandatory compression + read-side
    wins** in the same bench artifact. ADR 056's ≤ 15%
    gate set without empirical data missed by 28× on
-   threshold-margin fixtures; setting ≤ 25% for LCE risks
+   threshold-margin fixtures; setting ≤ 25% for Encoding risks
    repeating the mistake. If Phase 10 evidence shows a
    tighter bar is achievable, the gate tightens
    (Provisional discipline).
@@ -1217,13 +1230,13 @@ Bench scenarios:
    cost on dense projections.
 10. **Directory size** as fraction of record body.
 11. **64 KiB metadata probe pressure**. Verify combined
-    row-group + LCE directory fits inside initial
+    row-group + Encoding directory fits inside initial
     probe.
 12. **Cross-replica determinism**: byte-identical
     compaction outputs under matching configs.
 13. **Pre-057 / post-057 mixed-slab read** throughput.
 14. **First-pass compaction byte cost**: ADR 056-only
-    → ADR 057-LCE compaction output size delta.
+    → ADR 057-Encoding compaction output size delta.
     Expected 30–60% reduction on
     int / low-cardinality / timestamp columns.
 15. **`enabled_cascades` ablation**: writer with each
@@ -1236,7 +1249,7 @@ Bench scenarios:
     bimodal distributions, null-heavy strings).
 18. **L2 GET-rate cost**: page ranges before and after
     coalescing, 1000 hits across 100 records.
-19. **CSB short-circuit interaction**: confirm LCE
+19. **CSB short-circuit interaction**: confirm Encoding
     planner is bypassed when CSB skips the slab.
 
 Starting acceptance targets:
@@ -1256,16 +1269,16 @@ Starting acceptance targets:
   vs. ADR 056 row-group decode for page-capable
   cascades, and reduce selected L2 bytes ≥ 10× when the
   selected cascade materially compresses.
-- Combined row-group + LCE directory ≤ 2% of record
+- Combined row-group + Encoding directory ≤ 2% of record
   body on the largest legal representative fixture.
 - Combined metadata fits inside ADR 044's 64 KiB initial
   probe on representative legal fixtures and 256 KiB cap
   on all legal fixtures.
 - Cross-replica determinism: byte-identical compaction
   outputs.
-- PBC / AGG result equality against pre-LCE
+- PBC / AGG result equality against pre-Encoding
   materialized batches across all fixtures.
-- No regression when `LceWriterConfig.enabled = false`.
+- No regression when `EncodingWriterConfig.enabled = false`.
 
 Bench results: small / medium / large matrix per ADR
 030. Smoke artifact lands first; full matrix is the
@@ -1286,51 +1299,51 @@ Files:
 Guards (per ADR §15; ~30 guards):
 
 1. Exactly one definition each of
-   `LceEncodingDirectory`, `LceBufferEncoding`,
-   `LcePageDescriptor`, `LceCascade`, `LceLeafCascade`,
-   `LceCascadeKind`.
+   `EncodingDirectory`, `BufferEncoding`,
+   `EncodingPageDescriptor`, `EncodingCascade`, `EncodingLeafCascade`,
+   `EncodingCascadeKind`.
 2. Newtype-units for cascade parameters, page indices,
    value counts, sample sizes, task caps (16 newtypes
    per Phase 0 §3).
-3. `LceCascade` non-leaf variants (Rle, Dictionary,
-   Delta, Alp) carry `inner: Box<LceLeafCascade>`,
-   never `Box<LceCascade>`.
+3. `EncodingCascade` non-leaf variants (Rle, Dictionary,
+   Delta, Alp) carry `inner: Box<EncodingLeafCascade>`,
+   never `Box<EncodingCascade>`.
 4. Exactly one materializer entry point in
-   `src/storage/lce/materialize.rs`.
+   `src/storage/encoding/materialize.rs`.
 5. CDC, recovery, rehydration code paths do not
-   import LCE-specific types directly.
-6. `LceRejectCode` taxonomy closed to **five** V1 codes;
+   import Encoding-specific types directly.
+6. `EncodingRejectCode` taxonomy closed to **five** V1 codes;
    discriminants 1..=5 stable.
 7. Authentication / parse / decode failures cannot
    reach any silent fallback branch.
-8. `storage_l2_lce_*` metrics carry exactly the
+8. `storage_l2_encoding_*` metrics carry exactly the
    bounded labels.
-9. No new `MsgType` containing `LCE` or `CASCADE`.
+9. No new `MsgType` containing `Encoding` or `CASCADE`.
 10. No new `FRAME_FLAG_*`.
 11. No new `NodeCapability` variant.
 12. No `ObjectStore` trait method addition.
-13. No table descriptor field for LCE policy. No
-    `RecordBodyCompressionPolicy::Lce` variant.
-14. No synthetic Arrow column for LCE metadata.
+13. No table descriptor field for Encoding policy. No
+    `RecordBodyCompressionPolicy::EncodingCascade` variant.
+14. No synthetic Arrow column for Encoding metadata.
 15. No envelope `format_version` bump; no ADR 022
     footer field addition.
 16. `Schema.custom_metadata` key literal is
-    `storage.lce_encoding_directory`.
-17. Writer reads from `LceWriterConfig` only.
+    `storage.encoding_directory`.
+17. Writer reads from `EncodingWriterConfig` only.
 18. Compaction writer recomputes cascades; never
     copies input cascade choices.
-19. No `Wendelon`-prefixed LCE identifiers.
-20. No `Lce*V[0-9]` / `Cascade*V[0-9]` Rust type
+19. No `Wendelon`-prefixed Encoding identifiers.
+20. No `Encoding*V[0-9]` / `Cascade*V[0-9]` Rust type
     suffixes.
 21. CDC, recovery, rehydration code paths do not
-    import LCE-specific types directly.
+    import Encoding-specific types directly.
 22. No PBC opcode addition or PBC executor call from
-    inside `src/storage/lce/`.
-23. `LceCascade` discriminants 1..=8 stable.
-24. `LceLeafCascade` discriminants 1..=3 stable.
+    inside `src/storage/encoding/`.
+23. `EncodingCascade` discriminants 1..=8 stable.
+24. `EncodingLeafCascade` discriminants 1..=3 stable.
 25. Cascade selection heuristic is not exposed as a
     plug-in / trait.
-26. `LceBufferEncoding.encoded_range` and
+26. `BufferEncoding.encoded_range` and
     `page_end_offsets` are buffer-relative, never
     record-relative.
 27. `page_end_offsets` (when non-empty) cover
@@ -1345,36 +1358,36 @@ Guards (per ADR §15; ~30 guards):
 31. Directory's `logical_schema_fingerprint` validates
     against the descriptor's current logical
     fingerprint (ADR 051) at parse time.
-32. Serialized `LceEncodingDirectory` does not carry
-    one row per page; `LcePageDescriptor` is a
+32. Serialized `EncodingDirectory` does not carry
+    one row per page; `EncodingPageDescriptor` is a
     transient planner-only type derived from
     `page_end_offsets`.
 33. Cascade dedup discipline:
-    `LceEncodingDirectory.cascades` stored once;
-    `LceBufferEncoding.cascade_index` references by
+    `EncodingDirectory.cascades` stored once;
+    `BufferEncoding.cascade_index` references by
     index; cascade is never inlined per buffer entry.
 
 Exit:
 
-- Future LCE edits cannot drift the substrate silently.
+- Future Encoding edits cannot drift the substrate silently.
 
 ## Verification gate
 
 ```sh
-cargo test --lib storage::lce
-cargo test --test lce_cascade --quiet
-cargo test --test lce_select --quiet
-cargo test --test lce_directory --quiet
-cargo test --test lce_materialize --quiet
-cargo test --test lce_simd_page --quiet
-cargo test --test lce_planner --quiet
-cargo test --test lce_secondary_index --quiet
-cargo test --test lce_lsm --quiet
-cargo test --test lce_neutral --quiet
+cargo test --lib storage::encoding
+cargo test --test encoding_cascade --quiet
+cargo test --test encoding_select --quiet
+cargo test --test encoding_directory --quiet
+cargo test --test encoding_materialize --quiet
+cargo test --test encoding_simd_page --quiet
+cargo test --test encoding_planner --quiet
+cargo test --test encoding_secondary_index --quiet
+cargo test --test encoding_lsm --quiet
+cargo test --test encoding_neutral --quiet
 cargo test --test architecture_test --quiet
 cargo test --test metrics_smoke --quiet
-cargo bench --bench lce --no-run
-cargo bench --bench lce -- --quick
+cargo bench --bench encoding --no-run
+cargo bench --bench encoding -- --quick
 cargo check --quiet
 cargo check --benches --quiet
 git diff --check
@@ -1389,7 +1402,7 @@ Promotion-to-shipped gate (after Phase 1–11 land):
   targets (or council explicitly revises them from
   evidence per Provisional discipline).
 - ADR 056 Phase 10 bench scenarios still pass with
-  `LceWriterConfig.enabled = false` (regression check).
+  `EncodingWriterConfig.enabled = false` (regression check).
 - ADR 044 column-fetch scenarios pass end-to-end with
   mixed-shape slab corpora.
 - ADR 052 secondary-index point-reads served via
@@ -1399,7 +1412,7 @@ Promotion-to-shipped gate (after Phase 1–11 land):
   per-version-entry digests invariant.
 - CDC, recovery, rehydration tests confirm
   byte-neutrality.
-- Operator runbook `plans/ops/runbooks/lce.md`
+- Operator runbook `plans/ops/runbooks/encoding.md`
   finalized.
 
 ## File-by-file expected edits
@@ -1408,31 +1421,31 @@ Promotion-to-shipped gate (after Phase 1–11 land):
 
 - `src/schema/units.rs` — extend (~150 LOC for 16
   newtype-units).
-- `src/storage/lce/mod.rs` — new (~350 LOC).
-- `src/storage/lce/cascade/mod.rs` — new (~120 LOC:
+- `src/storage/encoding/mod.rs` — new (~350 LOC).
+- `src/storage/encoding/cascade/mod.rs` — new (~120 LOC:
   dispatch table).
-- `src/storage/lce/cascade/plain.rs` — new (~40 LOC).
-- `src/storage/lce/cascade/lz4.rs` — new (~100 LOC).
-- `src/storage/lce/cascade/bitpacked.rs` — new (~600
+- `src/storage/encoding/cascade/plain.rs` — new (~40 LOC).
+- `src/storage/encoding/cascade/lz4.rs` — new (~100 LOC).
+- `src/storage/encoding/cascade/bitpacked.rs` — new (~600
   LOC: encoder, decoder, page emission, FOR base
   parameter).
-- `src/storage/lce/cascade/rle.rs` — new (~400 LOC).
-- `src/storage/lce/cascade/dict.rs` — new (~500 LOC).
-- `src/storage/lce/cascade/delta.rs` — new (~250 LOC).
-- `src/storage/lce/cascade/fsst.rs` — new (~700 LOC:
+- `src/storage/encoding/cascade/rle.rs` — new (~400 LOC).
+- `src/storage/encoding/cascade/dict.rs` — new (~500 LOC).
+- `src/storage/encoding/cascade/delta.rs` — new (~250 LOC).
+- `src/storage/encoding/cascade/fsst.rs` — new (~700 LOC:
   symbol table build, encoder, decoder).
-- `src/storage/lce/cascade/alp.rs` — new (~500 LOC:
+- `src/storage/encoding/cascade/alp.rs` — new (~500 LOC:
   exponent search, exception handling).
-- `src/storage/lce/select.rs` — new (~300 LOC).
-- `src/storage/lce/sample.rs` — new (~200 LOC).
-- `src/storage/lce/directory.rs` — new (~400 LOC).
-- `src/storage/lce/materialize.rs` — new (~350 LOC).
-- `src/storage/lce/scratch.rs` — new (~150 LOC).
-- `src/storage/lce/page.rs` — new (~250 LOC).
-- `src/storage/lce/planner.rs` — new (~250 LOC).
+- `src/storage/encoding/select.rs` — new (~300 LOC).
+- `src/storage/encoding/sample.rs` — new (~200 LOC).
+- `src/storage/encoding/directory.rs` — new (~400 LOC).
+- `src/storage/encoding/materialize.rs` — new (~350 LOC).
+- `src/storage/encoding/scratch.rs` — new (~150 LOC).
+- `src/storage/encoding/page.rs` — new (~250 LOC).
+- `src/storage/encoding/planner.rs` — new (~250 LOC).
 - `src/storage/columnar.rs` — extend (~150 LOC for
   Phase D wiring).
-- `src/storage/multirow.rs` — extend (~120 LOC for LCE
+- `src/storage/multirow.rs` — extend (~120 LOC for Encoding
   dispatch on writer config).
 - `src/storage/secondary_index.rs` — extend (~100 LOC).
 - `src/storage/lsm_worker.rs` — touched (~30 LOC for
@@ -1447,31 +1460,31 @@ Promotion-to-shipped gate (after Phase 1–11 land):
 - `tests/architecture_test.rs` — extend (~280 LOC,
   ~30 guards).
 - 9 new test files (~250–500 LOC each).
-- `benches/lce.rs` — new (~700 LOC).
-- `plans/ops/runbooks/lce.md` — new (~200 lines).
+- `benches/encoding.rs` — new (~700 LOC).
+- `plans/ops/runbooks/encoding.md` — new (~200 lines).
 
-Total ≈ 7500 LOC. Mostly net-new in `src/storage/lce/`;
+Total ≈ 7500 LOC. Mostly net-new in `src/storage/encoding/`;
 existing surfaces touched lightly to wire Phase D, point-
 read fast path, LSM config plumbing.
 
 ## V1 design summary
 
-ADR 057 ships the LCE substrate:
+ADR 057 ships the Encoding substrate:
 
-- **Node-local `LceWriterConfig`** as activation
+- **Node-local `EncodingWriterConfig`** as activation
   surface; deployment-wide for cross-replica byte-
   equality.
 - **Closed cascade catalog**: `Plain`, `Lz4Frame`,
   `BitPacked`, `Rle`, `Dictionary`, `Delta`, `Fsst`,
   `Alp`. Composition one level deep via
-  `LceLeafCascade`.
-- **`LceEncodingDirectory` in IPC schema custom
-  metadata** under key `storage.lce_encoding_directory`
+  `EncodingLeafCascade`.
+- **`EncodingDirectory` in IPC schema custom
+  metadata** under key `storage.encoding_directory`
   — sibling to ADR 056's `storage.row_group_directory`.
 - **Compact directory shape**: cascade dedup via
-  `LceCascadeIndex`, per-buffer `page_end_offsets` prefix
+  `EncodingCascadeIndex`, per-buffer `page_end_offsets` prefix
   array. No per-page serialized rows.
-- **`LcePageDescriptor`** transient planner-only type
+- **`EncodingPageDescriptor`** transient planner-only type
   expanded from prefix offsets at planning time.
 - **Per-row-group-buffer cascade choice** via closed
   rule-based heuristic over sampled column stats.
@@ -1481,17 +1494,17 @@ ADR 057 ships the LCE substrate:
   three-phase plan; produces dense Arrow buffers
   consumed by stock Arrow IPC reader.
 - **Custom partial-buffer materializer** lives in
-  `src/storage/lce/materialize.rs`.
+  `src/storage/encoding/materialize.rs`.
 - **Decode-only V1**. PBC continues to evaluate against
   materialized dense batches. Compute-over-encoded-data
   is ADR 058 territory.
 - **Activation via node-local config**, not descriptor
-  policy. No `RecordBodyCompressionPolicy::Lce` variant.
+  policy. No `RecordBodyCompressionPolicy::EncodingCascade` variant.
 - **ADR 056 substrate reused** unchanged.
 - **ADR 052 secondary-index point reads accelerated**
   via SIMD-page fast path.
 - **ADR 055 LSM compaction integration**: compaction
-  outputs match deployment-wide `LceWriterConfig`;
+  outputs match deployment-wide `EncodingWriterConfig`;
   deterministic across replicas; visible-state digest
   invariant.
 - **CDC, recovery, rehydration byte-neutral**.
@@ -1499,7 +1512,7 @@ ADR 057 ships the LCE substrate:
   error path**, never silent fallback.
 - **Architectural lockdown** ~30 guards.
 - **Compute-over-encoded-data deferred to ADR 058 /
-  brainstorm 011 §V3.**
+  brainstorm 011.**
 
 ## Deferred to follow-up ADRs
 
@@ -1509,10 +1522,10 @@ ADR 057 ships the LCE substrate:
 - Cross-row-group dictionary sharing.
 - Arbitrary-depth cascade composition.
 - Per-row partial materialization within SIMD pages.
-- `LceEncodingDirectory` cache across queries.
-- Bulk slab-level LCE-directory pre-fetch.
+- `EncodingDirectory` cache across queries.
+- Bulk slab-level Encoding-directory pre-fetch.
 - Cascade-aware AGG short-circuit.
-- LCE on wire-tier transport (ADR 053 extension).
+- Encoding on wire-tier transport (ADR 053 extension).
 - Per-cascade DEK rotation.
 - Public Toron-visible cascade-hint opcode.
 - Adaptive cascade re-selection.

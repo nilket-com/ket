@@ -53,6 +53,20 @@ lsm_compaction_paused = false
 # max_ranges_per_record = 16
 # max_parallel_range_gets = 4
 
+# ADR 057 Encoding writer/fetch are opt-in and require row-group records.
+#
+# [storage.encoding_writer]
+# enabled = false
+# target_simd_page_values = 1024
+# cascade_sample_rows = 256
+# min_buffer_bytes_for_encoding = 4096
+# enabled_cascades = ["plain", "lz4_frame", "bit_packed", "rle", "dictionary", "delta", "fsst", "alp"]
+#
+# [storage.l2_encoding_fetch]
+# enabled = false
+# max_simd_pages_per_record = 64
+# max_parallel_materialize_tasks = 4
+
 [tuning]
 rf = {{RF}}
 wal_io_depth = {{WAL_IO_DEPTH}}

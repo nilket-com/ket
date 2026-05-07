@@ -54,24 +54,32 @@ use crate::schema::table::{
 };
 use crate::schema::{
 	ByteCount, CompactionJobId, CompactionLevelIndex, HybridTimestamp,
-	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId, Locality,
+	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
+	IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal, Locality,
 	LogicalSchemaFingerprint, ManifestEpoch, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, RowCount, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
-	SlabId, SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog, TenantId, TenantKekId,
-	TombstoneMetadata, WriterNodeId,
+	RecordRowIndex, RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor,
+	SecondaryIndexState, SlabId, SlabRecordHeader, SupersessionMetadata, TableLifecycleCatalog,
+	TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
-	ColumnFetchRequirement, ColumnarFallbackReason, L2ColumnFetchConfig, L2FetchStrategy,
-	PlaintextByteRange, ProjectedRecordBatch, TieredRecordId, build_column_fetch_plan,
-	decode_projected_record_batch, decode_projected_record_batch_from_plaintext_ranges,
-	initial_metadata_probe_plan, next_metadata_probe_plan, observe_l2_fetch_strategy,
-	parse_record_buffer_directory, pick_l2_fetch_strategy, selected_record_body_ranges,
-	survival_mask_projected_record_batch,
+	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnarFallbackReason, IpcBufferRange,
+	L2ColumnFetchConfig, L2FetchStrategy, PlaintextByteRange, ProjectedRecordBatch,
+	ProjectedRecordBufferSet, RecordBufferDirectory, TieredRecordId, build_column_fetch_plan,
+	decode_projected_record_batch, decode_projected_record_batch_from_buffers,
+	decode_projected_record_batch_from_plaintext_ranges, initial_metadata_probe_plan,
+	next_metadata_probe_plan, observe_l2_fetch_strategy, parse_record_buffer_directory,
+	pick_l2_fetch_strategy, selected_record_body_ranges, survival_mask_projected_record_batch,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
 	StorageEngine, insert_version_sorted, newest_version_as_of, recover_slab_entries_from_blob,
 	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
+};
+use crate::storage::encoding::cascade::decode_page;
+use crate::storage::encoding::page::expand_page_descriptors;
+use crate::storage::encoding::{
+	BufferEncoding, EncodingCascade, EncodingDirectory, EncodingFallbackReason,
+	EncodingPageDescriptor, EncodingRejectCode, EncodingWriterConfig, L2EncodingFetchConfig,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow,
@@ -83,8 +91,9 @@ use crate::storage::l2::ObjectStore;
 use crate::storage::multirow::{
 	MultiRowSourceRow, StorageRowMetadata, decode_batch as decode_record_batch,
 	encode_batch_with_policy, encode_multirow_from_survivors_with_policy,
-	encode_multirow_from_survivors_with_row_group_config, has_storage_synthetic_columns,
-	materialize_record_location_batch, pack_multirow_source_rows_with_policy_and_row_group_config,
+	encode_multirow_from_survivors_with_row_group_and_encoding_config,
+	has_storage_synthetic_columns, materialize_record_location_batch,
+	pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config,
 };
 use crate::storage::secondary_index::{
 	SecondaryIndexCandidateRejectReason, SecondaryIndexCandidateValidation, SecondaryIndexEntry,
@@ -193,6 +202,10 @@ pub struct SlabManagerConfig {
 	pub row_group_writer: crate::storage::row_group::RowGroupWriterConfig,
 	/// Node-local ADR 056 L2 row-group fetch strategy config.
 	pub l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig,
+	/// Deployment-wide ADR 057 Encoding writer config.
+	pub encoding_writer: EncodingWriterConfig,
+	/// Node-local ADR 057 L2 Encoding materialization config.
+	pub l2_encoding_fetch: L2EncodingFetchConfig,
 	/// ADR 016 data-path group-commit tuning.
 	pub group_commit: GroupCommitConfig,
 	/// ADR 022 slab-object encryption service used for L2 object bytes.
@@ -1132,6 +1145,8 @@ impl SlabManager {
 		config.l2_column_fetch.validate()?;
 		config.row_group_writer.validate()?;
 		config.l2_row_group_fetch.validate()?;
+		config.encoding_writer.validate()?;
+		config.l2_encoding_fetch.validate()?;
 		if !config.dir.is_dir() {
 			return Err(Error::new(
 				ErrorKind::NotFound,
@@ -6064,8 +6079,65 @@ enum SlabBacking {
 pub(crate) struct ProjectedL2RecordRead {
 	pub(crate) projected: ProjectedRecordBatch,
 	pub(crate) projected_first_record_row_index: RecordRowIndex,
+	pub(crate) indexed_rows_materialized: bool,
+	pub(crate) encoding_materialize_audit: Vec<EncodingMaterializeAuditSample>,
 	#[allow(dead_code)]
 	pub(crate) strategy: L2FetchStrategy,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EncodingMaterializeAuditSample {
+	pub(crate) cascade: &'static str,
+	pub(crate) buffer_bytes_in: u64,
+	pub(crate) buffer_bytes_out: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct EncodingIndexedPageKey {
+	row_group_index: RowGroupIndex,
+	page_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct EncodingIndexedBufferPageKey {
+	row_group_index: RowGroupIndex,
+	ipc_column_ordinal: IpcColumnOrdinal,
+	ipc_buffer_ordinal: IpcBufferIndex,
+	page_index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct EncodingIndexedColumnPlan {
+	physical_ordinal: usize,
+	null_buffer_ordinal: IpcBufferIndex,
+	value_buffer_ordinal: IpcBufferIndex,
+	bytes_per_value: usize,
+	data_type: arrow::datatypes::DataType,
+}
+
+#[derive(Clone, Debug)]
+struct EncodingIndexedBufferPageFetch {
+	key: EncodingIndexedBufferPageKey,
+	page_key: EncodingIndexedPageKey,
+	body_range: crate::storage::row_group::RecordBodyByteRange,
+	cascade: EncodingCascade,
+	page: EncodingPageDescriptor,
+	bytes_per_value: usize,
+	data_type: arrow::datatypes::DataType,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EncodingIndexedRowPage {
+	page_key: EncodingIndexedPageKey,
+	row_offset_in_page: usize,
+}
+
+#[derive(Clone, Debug)]
+struct EncodingIndexedPagePlan {
+	selected_groups: Vec<RowGroupIndex>,
+	row_pages: Vec<EncodingIndexedRowPage>,
+	columns: Vec<EncodingIndexedColumnPlan>,
+	fetches: Vec<EncodingIndexedBufferPageFetch>,
 }
 
 #[async_trait]
@@ -6143,6 +6215,10 @@ impl SlabManager {
 		&self,
 	) -> &crate::storage::row_group::RowGroupWriterConfig {
 		&self.config.row_group_writer
+	}
+
+	pub(crate) fn encoding_writer_config(&self) -> &EncodingWriterConfig {
+		&self.config.encoding_writer
 	}
 
 	pub(crate) fn row_group_fetch_parallelism(&self) -> usize {
@@ -6257,11 +6333,17 @@ impl SlabManager {
 				metrics()
 					.l2_range_read_latency_seconds
 					.observe_duration(started.elapsed());
-				let projected = take_projected_indexed_rows(&read, &record_rows)?;
+				let projected = if read.indexed_rows_materialized {
+					read.projected.clone()
+				} else {
+					take_projected_indexed_rows(&read, &record_rows)?
+				};
 				Ok(Some(ProjectedL2RecordRead {
 					projected,
 					projected_first_record_row_index: RecordRowIndex::ZERO,
-					strategy: read.strategy,
+					indexed_rows_materialized: read.indexed_rows_materialized,
+					encoding_materialize_audit: read.encoding_materialize_audit,
+					strategy: read.strategy.clone(),
 				}))
 			}
 			SlabBacking::Missing => Err(Error::new(
@@ -6823,6 +6905,7 @@ impl SlabManager {
 					group,
 					Some(table_schemas),
 					&self.config.row_group_writer,
+					&self.config.encoding_writer,
 				)?
 				else {
 					continue;
@@ -6967,6 +7050,7 @@ impl SlabManager {
 					group,
 					Some(table_schemas),
 					&self.config.row_group_writer,
+					&self.config.encoding_writer,
 				)?
 				else {
 					continue;
@@ -7334,6 +7418,7 @@ impl SlabManager {
 				&partial,
 				None,
 				&self.config.row_group_writer,
+				&self.config.encoding_writer,
 			)? {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
@@ -7405,14 +7490,16 @@ impl SlabManager {
 							table_object_id: table_object_id_stamp,
 						})
 						.collect::<Vec<_>>();
-					for packed in pack_multirow_source_rows_with_policy_and_row_group_config(
-						*layout,
-						&batch,
-						&source_rows,
-						Some(descriptor),
-						descriptor.record_body_compression_policy,
-						&self.config.row_group_writer,
-					)? {
+					for packed in
+						pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
+							*layout,
+							&batch,
+							&source_rows,
+							Some(descriptor),
+							descriptor.record_body_compression_policy,
+							&self.config.row_group_writer,
+							&self.config.encoding_writer,
+						)? {
 						let Some(primary) = packed.encoded.rows.first().copied() else {
 							return Err(Error::new(
 								ErrorKind::InvalidData,
@@ -7866,8 +7953,13 @@ impl SlabManager {
 				continue;
 			};
 			let frame = slab.read(first.old_location).await?;
-			let Some(compacted) =
-				compact_physical_record_frame(&frame, group, None, &self.config.row_group_writer)?
+			let Some(compacted) = compact_physical_record_frame(
+				&frame,
+				group,
+				None,
+				&self.config.row_group_writer,
+				&self.config.encoding_writer,
+			)?
 			else {
 				continue;
 			};
@@ -8147,6 +8239,140 @@ impl SlabManager {
 		)
 	}
 
+	async fn try_read_encoding_indexed_pages_from_l2(
+		&self,
+		l2: Arc<dyn ObjectStore>,
+		pointer: &TieredSlabPointer,
+		object_size_bytes: u64,
+		tail_window: &[u8],
+		additional_metadata: Option<&[u8]>,
+		whole_record_range: std::ops::Range<usize>,
+		body_location: &RecordLocation,
+		header_size: u64,
+		record_directory: &RecordBufferDirectory,
+		page_directory: &crate::storage::row_group::RecordPageDirectory,
+		descriptor: &TableSchemaDescriptorV1,
+		requirement: &ColumnFetchRequirement,
+		selected_record_rows: &[RecordRowIndex],
+		selected_groups: &[RowGroupIndex],
+		planning_started: Instant,
+	) -> std::io::Result<Option<ProjectedL2RecordRead>> {
+		let Some(encoding_directory) = record_directory.encoding_directory.as_ref() else {
+			return Ok(None);
+		};
+		if selected_record_rows.is_empty() || !self.config.l2_encoding_fetch.enabled {
+			return Ok(None);
+		}
+		let plan = match build_encoding_indexed_page_plan(
+			record_directory,
+			page_directory,
+			encoding_directory,
+			requirement,
+			selected_record_rows,
+			selected_groups,
+		) {
+			Ok(Some(plan)) => plan,
+			Ok(None) => return Ok(None),
+			Err(reason) => {
+				metrics().observe_storage_l2_encoding_fallback(reason.as_str());
+				return Ok(None);
+			}
+		};
+		if plan.fetches.len()
+			> self
+				.config
+				.l2_encoding_fetch
+				.max_simd_pages_per_record
+				.get() as usize
+		{
+			metrics().observe_storage_l2_encoding_fallback(
+				EncodingFallbackReason::TooManyPages.as_str(),
+			);
+			return Ok(None);
+		}
+
+		let mut selected_body_byte_ranges = plan
+			.fetches
+			.iter()
+			.map(|fetch| fetch.body_range)
+			.collect::<Vec<_>>();
+		coalesce_manager_record_body_ranges(&mut selected_body_byte_ranges)?;
+		let selected_body_ranges = selected_body_byte_ranges
+			.iter()
+			.map(|range| TieredPlaintextRange::new(range.start, range.len))
+			.collect::<Vec<_>>();
+		let selected_record_ranges =
+			record_body_ranges_to_record_ranges(header_size, &selected_body_ranges)?;
+		let tiered_plan = self.config.crypto.plan_tiered_multi_range_read(
+			pointer.slab_id,
+			object_size_bytes,
+			tail_window,
+			additional_metadata,
+			whole_record_range,
+			&selected_record_ranges,
+		)?;
+		let phase_c_fetch = crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
+			&tiered_plan,
+			&selected_body_byte_ranges,
+		);
+		let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
+			record_id: page_directory.record_id,
+			directory: page_directory.clone(),
+			surviving_groups: plan.selected_groups.clone(),
+			predicate_fetched_groups: Vec::new(),
+			phase_b_fetch: None,
+			phase_c_fetch,
+			logical_schema_fingerprint: page_directory.logical_schema_fingerprint,
+		};
+		let strategy = pick_point_row_group_fetch_strategy(
+			&self.config.l2_row_group_fetch,
+			body_location,
+			page_directory,
+			row_group_plan,
+		);
+		let L2FetchStrategy::RowGroup(row_group_plan) = strategy else {
+			metrics().observe_storage_l2_encoding_fallback(
+				EncodingFallbackReason::DenseSelection.as_str(),
+			);
+			return Ok(None);
+		};
+		observe_l2_row_group_fetch_strategy(
+			metrics(),
+			&L2FetchStrategy::RowGroup(row_group_plan.clone()),
+			planning_started.elapsed(),
+		);
+
+		let plaintext_extracts = if selected_record_ranges.is_empty() {
+			Vec::new()
+		} else {
+			let ciphertext_runs = fetch_tiered_ciphertext_runs(
+				l2,
+				pointer,
+				&tiered_plan,
+				self.config.l2_row_group_fetch.max_parallel_range_gets.get() as usize,
+			)
+			.await?;
+			tiered_plan.decrypt(&ciphertext_runs)?
+		};
+		let projected = materialize_encoding_indexed_pages(
+			record_directory,
+			requirement,
+			&plan,
+			&selected_body_ranges,
+			&plaintext_extracts,
+			selected_record_rows.len(),
+			descriptor,
+		)
+		.map_err(arrow_io_error)?;
+		Ok(Some(ProjectedL2RecordRead {
+			projected,
+			projected_first_record_row_index: RecordRowIndex::ZERO,
+			indexed_rows_materialized: true,
+			encoding_materialize_audit: encoding_materialize_audit_for_indexed_plan(&plan),
+			strategy: L2FetchStrategy::RowGroup(row_group_plan),
+		}))
+	}
+
 	async fn read_projected_record_from_l2(
 		&self,
 		l2: Arc<dyn ObjectStore>,
@@ -8172,6 +8398,8 @@ impl SlabManager {
 			return Ok(ProjectedL2RecordRead {
 				projected,
 				projected_first_record_row_index: RecordRowIndex::ZERO,
+				indexed_rows_materialized: false,
+				encoding_materialize_audit: Vec::new(),
 				strategy: L2FetchStrategy::WholeRecord,
 			});
 		}
@@ -8223,6 +8451,8 @@ impl SlabManager {
 			return Ok(ProjectedL2RecordRead {
 				projected,
 				projected_first_record_row_index: RecordRowIndex::ZERO,
+				indexed_rows_materialized: false,
+				encoding_materialize_audit: Vec::new(),
 				strategy: pre_probe,
 			});
 		}
@@ -8329,6 +8559,8 @@ impl SlabManager {
 							return Ok(ProjectedL2RecordRead {
 								projected,
 								projected_first_record_row_index: RecordRowIndex::ZERO,
+								indexed_rows_materialized: false,
+								encoding_materialize_audit: Vec::new(),
 								strategy,
 							});
 						}
@@ -8350,6 +8582,8 @@ impl SlabManager {
 					return Ok(ProjectedL2RecordRead {
 						projected,
 						projected_first_record_row_index: RecordRowIndex::ZERO,
+						indexed_rows_materialized: false,
+						encoding_materialize_audit: Vec::new(),
 						strategy,
 					});
 				}
@@ -8358,6 +8592,31 @@ impl SlabManager {
 		};
 
 		if let Some(page_directory) = directory.page_directory.clone() {
+			if directory.encoding_directory.is_some() && !self.config.l2_encoding_fetch.enabled {
+				metrics().observe_storage_l2_encoding_fallback("reader_disabled");
+				let strategy = L2FetchStrategy::Fallback(ColumnarFallbackReason::Disabled);
+				observe_l2_row_group_fetch_strategy(
+					metrics(),
+					&strategy,
+					planning_started.elapsed(),
+				);
+				let projected = self
+					.read_full_projected_record_from_l2(
+						l2.as_ref(),
+						pointer,
+						location,
+						descriptor,
+						requirement,
+					)
+					.await?;
+				return Ok(ProjectedL2RecordRead {
+					projected,
+					projected_first_record_row_index: RecordRowIndex::ZERO,
+					indexed_rows_materialized: false,
+					encoding_materialize_audit: Vec::new(),
+					strategy,
+				});
+			}
 			if !self.config.l2_row_group_fetch.enabled {
 				let strategy = L2FetchStrategy::Fallback(ColumnarFallbackReason::Disabled);
 				observe_l2_row_group_fetch_strategy(
@@ -8377,6 +8636,8 @@ impl SlabManager {
 				return Ok(ProjectedL2RecordRead {
 					projected,
 					projected_first_record_row_index: RecordRowIndex::ZERO,
+					indexed_rows_materialized: false,
+					encoding_materialize_audit: Vec::new(),
 					strategy,
 				});
 			}
@@ -8398,6 +8659,32 @@ impl SlabManager {
 				}
 				_ => vec![group.row_group_index],
 			};
+			if predicate.is_none() {
+				if let Some(rows) = selected_record_rows {
+					if let Some(read) = self
+						.try_read_encoding_indexed_pages_from_l2(
+							l2.clone(),
+							pointer,
+							metadata.size_bytes,
+							tail_window.as_ref(),
+							additional_metadata.as_deref(),
+							whole_record_range.clone(),
+							&body_location,
+							header_size,
+							&directory,
+							&page_directory,
+							descriptor,
+							requirement,
+							rows,
+							selected_groups.as_slice(),
+							planning_started,
+						)
+						.await?
+					{
+						return Ok(read);
+					}
+				}
+			}
 			let point_read = selected_record_rows.is_none();
 			let mut predicate_fetched_groups = Vec::new();
 			let mut phase_b_fetch = None;
@@ -8460,6 +8747,8 @@ impl SlabManager {
 					return Ok(ProjectedL2RecordRead {
 						projected,
 						projected_first_record_row_index: group.first_record_row_index,
+						indexed_rows_materialized: false,
+						encoding_materialize_audit: Vec::new(),
 						strategy,
 					});
 				}
@@ -8608,6 +8897,8 @@ impl SlabManager {
 								return Ok(ProjectedL2RecordRead {
 									projected,
 									projected_first_record_row_index: group.first_record_row_index,
+									indexed_rows_materialized: false,
+									encoding_materialize_audit: Vec::new(),
 									strategy,
 								});
 							}
@@ -8681,6 +8972,8 @@ impl SlabManager {
 				return Ok(ProjectedL2RecordRead {
 					projected,
 					projected_first_record_row_index: RecordRowIndex::ZERO,
+					indexed_rows_materialized: false,
+					encoding_materialize_audit: Vec::new(),
 					strategy,
 				});
 			};
@@ -8784,6 +9077,8 @@ impl SlabManager {
 			return Ok(ProjectedL2RecordRead {
 				projected,
 				projected_first_record_row_index: group.first_record_row_index,
+				indexed_rows_materialized: false,
+				encoding_materialize_audit: Vec::new(),
 				strategy: L2FetchStrategy::RowGroup(row_group_plan),
 			});
 		}
@@ -8828,6 +9123,8 @@ impl SlabManager {
 			return Ok(ProjectedL2RecordRead {
 				projected,
 				projected_first_record_row_index: RecordRowIndex::ZERO,
+				indexed_rows_materialized: false,
+				encoding_materialize_audit: Vec::new(),
 				strategy,
 			});
 		}
@@ -8850,6 +9147,8 @@ impl SlabManager {
 		Ok(ProjectedL2RecordRead {
 			projected,
 			projected_first_record_row_index: RecordRowIndex::ZERO,
+			indexed_rows_materialized: false,
+			encoding_materialize_audit: Vec::new(),
 			strategy,
 		})
 	}
@@ -9372,6 +9671,540 @@ fn take_projected_indexed_rows(
 	read.projected.take_rows(&offsets)
 }
 
+fn build_encoding_indexed_page_plan(
+	record_directory: &RecordBufferDirectory,
+	page_directory: &crate::storage::row_group::RecordPageDirectory,
+	encoding_directory: &EncodingDirectory,
+	requirement: &ColumnFetchRequirement,
+	selected_record_rows: &[RecordRowIndex],
+	selected_groups: &[RowGroupIndex],
+) -> Result<Option<EncodingIndexedPagePlan>, EncodingFallbackReason> {
+	let physical_ordinals =
+		required_encoding_indexed_physical_ordinals(record_directory, requirement)?;
+	if physical_ordinals.is_empty() {
+		return Ok(Some(EncodingIndexedPagePlan {
+			selected_groups: selected_groups.to_vec(),
+			row_pages: selected_record_rows
+				.iter()
+				.map(|row| {
+					let group =
+						crate::storage::row_group::row_group_for_record_row(page_directory, *row)
+							.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+					Ok(EncodingIndexedRowPage {
+						page_key: EncodingIndexedPageKey {
+							row_group_index: group.row_group_index,
+							page_index: 0,
+						},
+						row_offset_in_page: 0,
+					})
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+			columns: Vec::new(),
+			fetches: Vec::new(),
+		}));
+	}
+
+	let mut columns = Vec::with_capacity(physical_ordinals.len());
+	for physical_ordinal in physical_ordinals {
+		let field = record_directory
+			.ipc_schema
+			.fields()
+			.get(physical_ordinal)
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		if record_directory
+			.column_null_counts
+			.get(physical_ordinal)
+			.copied()
+			.unwrap_or(usize::MAX)
+			!= 0
+		{
+			return Err(EncodingFallbackReason::UnsupportedArrowLayout);
+		}
+		let bytes_per_value = fixed_width_value_bytes(field.data_type())
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		let mapping = record_directory
+			.column_to_buffers
+			.get(physical_ordinal)
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		if mapping.buffer_count != 2 {
+			return Err(EncodingFallbackReason::UnsupportedArrowLayout);
+		}
+		let null_buffer_ordinal = mapping.first_buffer_ordinal;
+		let value_buffer_ordinal = IpcBufferIndex::new(
+			mapping
+				.first_buffer_ordinal
+				.get()
+				.checked_add(1)
+				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?,
+		);
+		columns.push(EncodingIndexedColumnPlan {
+			physical_ordinal,
+			null_buffer_ordinal,
+			value_buffer_ordinal,
+			bytes_per_value,
+			data_type: field.data_type().clone(),
+		});
+	}
+
+	let first_column = columns
+		.first()
+		.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+	let mut row_pages = Vec::with_capacity(selected_record_rows.len());
+	let mut fetches_by_key =
+		BTreeMap::<EncodingIndexedBufferPageKey, EncodingIndexedBufferPageFetch>::new();
+	for row in selected_record_rows {
+		let group = crate::storage::row_group::row_group_for_record_row(page_directory, *row)
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		let row_within_group = row
+			.get()
+			.checked_sub(group.first_record_row_index.get())
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		let mut page_key = None;
+		for column in &columns {
+			let column_page = page_directory
+				.buffer_pages
+				.iter()
+				.find(|page| {
+					page.row_group_index == group.row_group_index
+						&& page.ipc_column_ordinal
+							== IpcColumnOrdinal::new(column.physical_ordinal as u32)
+						&& page.ipc_buffer_ordinal == column.value_buffer_ordinal
+						&& page.range.len.get() > 0
+				})
+				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+			let encoding = encoding_directory
+				.buffers
+				.iter()
+				.find(|encoding| {
+					encoding.row_group_index == group.row_group_index
+						&& encoding.ipc_column_ordinal == column_page.ipc_column_ordinal
+						&& encoding.ipc_buffer_ordinal == column.value_buffer_ordinal
+						&& !encoding.page_end_offsets.is_empty()
+				})
+				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+			let pages = expand_page_descriptors(encoding)
+				.map_err(|_| EncodingFallbackReason::UnsupportedArrowLayout)?;
+			let page = pages
+				.into_iter()
+				.find(|page| {
+					let start = page.first_value_index.get();
+					let end = start.saturating_add(page.value_count.get());
+					row_within_group >= start && row_within_group < end
+				})
+				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+			let candidate_page_key = EncodingIndexedPageKey {
+				row_group_index: group.row_group_index,
+				page_index: page.page_index.get(),
+			};
+			if column.physical_ordinal == first_column.physical_ordinal {
+				let row_offset = row_within_group
+					.checked_sub(page.first_value_index.get())
+					.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?
+					as usize;
+				page_key = Some((candidate_page_key, row_offset));
+			} else if Some(candidate_page_key) != page_key.map(|(key, _)| key) {
+				return Err(EncodingFallbackReason::UnsupportedArrowLayout);
+			}
+			let cascade = encoding_directory
+				.cascades
+				.get(encoding.cascade_index.get() as usize)
+				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?
+				.clone();
+			let fetch_key = EncodingIndexedBufferPageKey {
+				row_group_index: group.row_group_index,
+				ipc_column_ordinal: column_page.ipc_column_ordinal,
+				ipc_buffer_ordinal: column.value_buffer_ordinal,
+				page_index: page.page_index.get(),
+			};
+			fetches_by_key.entry(fetch_key).or_insert_with(|| {
+				metrics()
+					.observe_storage_l2_encoding_simd_pages_fetched(cascade.kind().as_str(), 1);
+				EncodingIndexedBufferPageFetch {
+					key: fetch_key,
+					page_key: candidate_page_key,
+					body_range: encoding_indexed_page_body_range(column_page.range, encoding, page),
+					cascade,
+					page,
+					bytes_per_value: column.bytes_per_value,
+					data_type: column.data_type.clone(),
+				}
+			});
+		}
+		let Some((page_key, row_offset_in_page)) = page_key else {
+			return Err(EncodingFallbackReason::UnsupportedArrowLayout);
+		};
+		row_pages.push(EncodingIndexedRowPage {
+			page_key,
+			row_offset_in_page,
+		});
+	}
+
+	let fetches = fetches_by_key.into_values().collect::<Vec<_>>();
+	if fetches.is_empty() && !columns.is_empty() {
+		return Ok(None);
+	}
+	Ok(Some(EncodingIndexedPagePlan {
+		selected_groups: selected_groups.to_vec(),
+		row_pages,
+		columns,
+		fetches,
+	}))
+}
+
+fn required_encoding_indexed_physical_ordinals(
+	directory: &RecordBufferDirectory,
+	requirement: &ColumnFetchRequirement,
+) -> Result<Vec<usize>, EncodingFallbackReason> {
+	let user_physical_ordinals = directory
+		.ipc_schema
+		.fields()
+		.iter()
+		.enumerate()
+		.filter_map(|(physical, field)| {
+			crate::storage::columnar::StorageColumn::from_name(field.name())
+				.is_none()
+				.then_some(physical)
+		})
+		.collect::<Vec<_>>();
+	let mut out = Vec::new();
+	for descriptor_ordinal in requirement.user_visible().iter() {
+		let physical = *user_physical_ordinals
+			.get(descriptor_ordinal as usize)
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		out.push(physical);
+	}
+	for storage_column in requirement.storage_columns.iter() {
+		let physical = directory
+			.storage_column_ordinals
+			.get(&storage_column)
+			.copied()
+			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
+		out.push(physical as usize);
+	}
+	out.sort_unstable();
+	out.dedup();
+	Ok(out)
+}
+
+fn encoding_materialize_audit_for_indexed_plan(
+	plan: &EncodingIndexedPagePlan,
+) -> Vec<EncodingMaterializeAuditSample> {
+	let mut by_cascade = BTreeMap::<&'static str, (u64, u64)>::new();
+	for fetch in &plan.fetches {
+		let decoded =
+			u64::from(fetch.page.value_count.get()).saturating_mul(fetch.bytes_per_value as u64);
+		let entry = by_cascade
+			.entry(fetch.cascade.kind().as_str())
+			.or_insert((0, 0));
+		entry.0 = entry.0.saturating_add(fetch.body_range.len.get());
+		entry.1 = entry.1.saturating_add(decoded);
+	}
+	by_cascade
+		.into_iter()
+		.map(
+			|(cascade, (buffer_bytes_in, buffer_bytes_out))| EncodingMaterializeAuditSample {
+				cascade,
+				buffer_bytes_in,
+				buffer_bytes_out,
+			},
+		)
+		.collect()
+}
+
+fn fixed_width_value_bytes(data_type: &arrow::datatypes::DataType) -> Option<usize> {
+	use arrow::datatypes::DataType;
+	match data_type {
+		DataType::Int8 | DataType::UInt8 => Some(1),
+		DataType::Int16 | DataType::UInt16 => Some(2),
+		DataType::Int32
+		| DataType::UInt32
+		| DataType::Float32
+		| DataType::Date32
+		| DataType::Time32(_) => Some(4),
+		DataType::Int64
+		| DataType::UInt64
+		| DataType::Float64
+		| DataType::Date64
+		| DataType::Time64(_)
+		| DataType::Duration(_)
+		| DataType::Timestamp(_, _) => Some(8),
+		DataType::FixedSizeBinary(width) if *width > 0 => usize::try_from(*width).ok(),
+		DataType::Decimal128(_, _) => Some(16),
+		DataType::Decimal256(_, _) => Some(32),
+		_ => None,
+	}
+}
+
+fn encoding_indexed_page_body_range(
+	buffer_range: crate::storage::row_group::RecordBodyByteRange,
+	encoding: &BufferEncoding,
+	page: EncodingPageDescriptor,
+) -> crate::storage::row_group::RecordBodyByteRange {
+	let encoded_start = u64::from(encoding.encoded_range.start.get());
+	let page_start = u64::from(page.byte_range.start.get());
+	crate::storage::row_group::RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(
+			buffer_range
+				.start
+				.get()
+				.saturating_add(encoded_start)
+				.saturating_add(page_start),
+		),
+		len: page.byte_range.len,
+	}
+}
+
+fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
+	record_directory: &RecordBufferDirectory,
+	requirement: &ColumnFetchRequirement,
+	plan: &EncodingIndexedPagePlan,
+	selected_ranges: &[TieredPlaintextRange],
+	plaintext_extracts: &[B],
+	selected_row_count: usize,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	if plan.columns.is_empty() {
+		return projected_batch_for_empty_indexed_rows(
+			record_directory,
+			selected_row_count,
+			descriptor,
+		);
+	}
+	let mut decoded_pages = HashMap::<EncodingIndexedBufferPageKey, Vec<u8>>::new();
+	for fetch in &plan.fetches {
+		let encoded =
+			extract_record_body_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
+		let expected_bytes = fetch
+			.page
+			.value_count
+			.get()
+			.checked_mul(fetch.bytes_per_value as u32)
+			.ok_or_else(|| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed page decoded byte length overflow".into(),
+				)
+			})?;
+		let decoded = decode_page(
+			&encoded,
+			&fetch.data_type,
+			&fetch.cascade,
+			RecordBodyByteLen::new(u64::from(expected_bytes)),
+			fetch.page.value_count,
+		)
+		.map_err(encoding_reject_arrow_error)?;
+		decoded_pages.insert(fetch.key, decoded);
+	}
+
+	let mut page_batches = HashMap::<EncodingIndexedPageKey, ProjectedRecordBatch>::new();
+	for page_key in plan.row_pages.iter().map(|row| row.page_key) {
+		if page_batches.contains_key(&page_key) {
+			continue;
+		}
+		let page_fetch = plan
+			.fetches
+			.iter()
+			.find(|fetch| fetch.page_key == page_key)
+			.ok_or_else(|| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed page batch missing fetch".into(),
+				)
+			})?;
+		let mut buffers = vec![
+			IpcBufferRange {
+				offset_in_record: IpcBufferOffset::ZERO,
+				length: IpcBufferLength::ZERO,
+			};
+			record_directory.buffers.len()
+		];
+		let mut buffer_set = ProjectedRecordBufferSet::new();
+		for column in &plan.columns {
+			buffers[column.null_buffer_ordinal.get() as usize] = IpcBufferRange {
+				offset_in_record: IpcBufferOffset::ZERO,
+				length: IpcBufferLength::ZERO,
+			};
+			let key = EncodingIndexedBufferPageKey {
+				row_group_index: page_key.row_group_index,
+				ipc_column_ordinal: IpcColumnOrdinal::new(column.physical_ordinal as u32),
+				ipc_buffer_ordinal: column.value_buffer_ordinal,
+				page_index: page_key.page_index,
+			};
+			let decoded = decoded_pages.get(&key).ok_or_else(|| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed decoded page missing for projected column".into(),
+				)
+			})?;
+			buffers[column.value_buffer_ordinal.get() as usize] = IpcBufferRange {
+				offset_in_record: IpcBufferOffset::ZERO,
+				length: IpcBufferLength::new(decoded.len() as u64),
+			};
+			buffer_set.insert(column.value_buffer_ordinal, decoded.clone());
+		}
+		let mut column_null_counts = record_directory.column_null_counts.clone();
+		for column in &plan.columns {
+			if let Some(null_count) = column_null_counts.get_mut(column.physical_ordinal) {
+				*null_count = 0;
+			}
+		}
+		let scoped = RecordBufferDirectory {
+			record_id: record_directory.record_id,
+			record_plaintext_range: record_directory.record_plaintext_range,
+			row_count: page_fetch.page.value_count.get() as usize,
+			record_body_compression: RecordBodyCompressionPolicy::Uncompressed,
+			ipc_schema: record_directory.ipc_schema.clone(),
+			buffers,
+			column_to_buffers: record_directory.column_to_buffers.clone(),
+			column_null_counts,
+			storage_column_ordinals: record_directory.storage_column_ordinals.clone(),
+			logical_schema_fingerprint: record_directory.logical_schema_fingerprint,
+			page_directory: None,
+			encoding_directory: None,
+		};
+		let page_batch =
+			decode_projected_record_batch_from_buffers(&scoped, requirement, &buffer_set)?;
+		page_batches.insert(page_key, page_batch);
+	}
+
+	let mut rows = Vec::with_capacity(plan.row_pages.len());
+	for row_page in &plan.row_pages {
+		let page_batch = page_batches.get(&row_page.page_key).ok_or_else(|| {
+			arrow::error::ArrowError::SchemaError(
+				"Encoding indexed page batch missing for selected row".into(),
+			)
+		})?;
+		rows.push(
+			page_batch
+				.take_rows(&[row_page.row_offset_in_page])
+				.map_err(|err| arrow::error::ArrowError::ExternalError(Box::new(err)))?,
+		);
+	}
+	concat_projected_record_batches(rows)
+}
+
+fn projected_batch_for_empty_indexed_rows(
+	record_directory: &RecordBufferDirectory,
+	row_count: usize,
+	descriptor: &TableSchemaDescriptorV1,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	let schema = std::sync::Arc::new(arrow::datatypes::Schema::empty());
+	let batch = arrow::record_batch::RecordBatch::try_new_with_options(
+		schema,
+		Vec::new(),
+		&arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_count)),
+	)?;
+	let descriptor_len = descriptor
+		.arrow_schema()
+		.map(|schema| schema.fields().len())
+		.unwrap_or_else(|_| record_directory.ipc_schema.fields().len());
+	Ok(ProjectedRecordBatch {
+		batch,
+		ordinal_mapping: ColumnOrdinalMapping::new(vec![None; descriptor_len]),
+		storage_mapping: BTreeMap::new(),
+	})
+}
+
+fn concat_projected_record_batches(
+	batches: Vec<ProjectedRecordBatch>,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	let Some(first) = batches.first() else {
+		return Err(arrow::error::ArrowError::InvalidArgumentError(
+			"Encoding indexed page materialization produced no batches".into(),
+		));
+	};
+	let schema = first.batch.schema();
+	let raw = batches
+		.iter()
+		.map(|batch| batch.batch.clone())
+		.collect::<Vec<_>>();
+	let batch = arrow::compute::concat_batches(&schema, &raw)?;
+	Ok(ProjectedRecordBatch {
+		batch,
+		ordinal_mapping: first.ordinal_mapping.clone(),
+		storage_mapping: first.storage_mapping.clone(),
+	})
+}
+
+fn extract_record_body_bytes<B: AsRef<[u8]>>(
+	range: crate::storage::row_group::RecordBodyByteRange,
+	selected_ranges: &[TieredPlaintextRange],
+	plaintext_extracts: &[B],
+) -> Result<Vec<u8>, arrow::error::ArrowError> {
+	if selected_ranges.len() != plaintext_extracts.len() {
+		return Err(arrow::error::ArrowError::InvalidArgumentError(format!(
+			"Encoding indexed page expected {} plaintext extracts, got {}",
+			selected_ranges.len(),
+			plaintext_extracts.len()
+		)));
+	}
+	let start = range.start.get();
+	let end = range
+		.end()
+		.map_err(|err| arrow::error::ArrowError::SchemaError(err.to_string()))?;
+	for (candidate, extract) in selected_ranges.iter().zip(plaintext_extracts.iter()) {
+		let candidate_start = candidate.start.get();
+		let candidate_end = candidate_start
+			.checked_add(candidate.len.get())
+			.ok_or_else(|| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed plaintext range overflow".into(),
+				)
+			})?;
+		if start >= candidate_start && end <= candidate_end {
+			let relative_start = usize::try_from(start - candidate_start).map_err(|_| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed relative page start exceeds usize".into(),
+				)
+			})?;
+			let relative_end = usize::try_from(end - candidate_start).map_err(|_| {
+				arrow::error::ArrowError::SchemaError(
+					"Encoding indexed relative page end exceeds usize".into(),
+				)
+			})?;
+			let extract = extract.as_ref();
+			if relative_end > extract.len() {
+				return Err(arrow::error::ArrowError::SchemaError(
+					"Encoding indexed page range exceeds plaintext extract".into(),
+				));
+			}
+			return Ok(extract[relative_start..relative_end].to_vec());
+		}
+	}
+	Err(arrow::error::ArrowError::SchemaError(
+		"Encoding indexed page range was not fetched".into(),
+	))
+}
+
+fn coalesce_manager_record_body_ranges(
+	ranges: &mut Vec<crate::storage::row_group::RecordBodyByteRange>,
+) -> std::io::Result<()> {
+	ranges.sort_by_key(|range| range.start.get());
+	let mut coalesced = Vec::with_capacity(ranges.len());
+	for range in ranges.drain(..) {
+		if range.len.get() == 0 {
+			continue;
+		}
+		let Some(last): Option<&mut crate::storage::row_group::RecordBodyByteRange> =
+			coalesced.last_mut()
+		else {
+			coalesced.push(range);
+			continue;
+		};
+		let last_end = last.end()?;
+		let range_end = range.end()?;
+		if range.start.get() <= last_end {
+			last.len = RecordBodyByteLen::new(range_end.max(last_end) - last.start.get());
+		} else {
+			coalesced.push(range);
+		}
+	}
+	*ranges = coalesced;
+	Ok(())
+}
+
+fn encoding_reject_arrow_error(code: EncodingRejectCode) -> arrow::error::ArrowError {
+	metrics().observe_storage_l2_encoding_invariant_violation(code.as_str());
+	arrow::error::ArrowError::SchemaError(format!("Encoding indexed page rejected: {code:?}"))
+}
+
 fn record_body_location(location: RecordLocation) -> std::io::Result<RecordLocation> {
 	let header_size = slab_record_header_size_u64()?;
 	let body_offset = location.offset.checked_add(header_size).ok_or_else(|| {
@@ -9768,6 +10601,7 @@ fn compact_physical_record_frame(
 	records: &[CompactionRecord],
 	table_schemas: Option<&TableSchemaCatalogV1>,
 	row_group_config: &crate::storage::row_group::RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<Option<CompactedFrame>> {
 	let mut survivors = records
 		.iter()
@@ -9847,12 +10681,13 @@ fn compact_physical_record_frame(
 		.collect::<Vec<_>>();
 	let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(frame)?;
 	let encoded = match descriptor {
-		Some(descriptor) => encode_multirow_from_survivors_with_row_group_config(
+		Some(descriptor) => encode_multirow_from_survivors_with_row_group_and_encoding_config(
 			&batch,
 			&source_rows,
 			descriptor,
 			policy,
 			row_group_config,
+			encoding_config,
 		)?,
 		None => encode_multirow_from_survivors_with_policy(&batch, &source_rows, policy)?,
 	};
@@ -10409,7 +11244,7 @@ mod tests {
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
 		Array, BooleanArray, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder,
-		LargeStringArray, UInt64Array, UInt64Builder,
+		LargeStringArray, UInt8Array, UInt64Array, UInt64Builder,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
@@ -10972,6 +11807,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit,
 				crypto: test_crypto(),
 			})
@@ -10995,6 +11832,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto,
 			})
@@ -12444,6 +13283,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12667,6 +13508,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -12831,6 +13674,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13341,6 +14186,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13461,6 +14308,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13601,6 +14450,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -13729,6 +14580,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14261,6 +15114,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto,
 		})
@@ -14286,6 +15141,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14353,6 +15210,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -14388,6 +15247,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14629,6 +15490,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14763,6 +15626,8 @@ mod tests {
 				},
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -14929,6 +15794,8 @@ mod tests {
 						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
 					..Default::default()
 				},
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -15377,6 +16244,275 @@ mod tests {
 		assert_eq!(actual_values.values(), expected_values.values());
 	}
 
+	#[tokio::test]
+	async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
+		let l1_dir = fresh_dir("encoding-index-l1");
+		let l2_dir = fresh_dir("encoding-index-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::UInt8, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x83; 16]),
+			1,
+			"analytics",
+			"encoding_index",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(4096, 4096, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Uncompressed;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let row_count = 4096_usize;
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(UInt8Array::from_iter_values((0..row_count).map(|_| 7_u8)))
+					as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let meta = layout_recluster_meta(&descriptor, batch.num_rows());
+		let admission = validate_table_write_request_batch(
+			&meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.unwrap();
+		let source_rows = admission
+			.key_identities
+			.iter()
+			.zip(admission.localities.iter())
+			.enumerate()
+			.map(
+				|(source_row_index, (key_identity, routing_locality))| MultiRowSourceRow {
+					source_row_index,
+					key_identity: *key_identity,
+					routing_locality: *routing_locality,
+					row_hlc: hlc(500 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: None,
+				},
+			)
+			.collect::<Vec<_>>();
+		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			min_paged_record_rows: RowCount::new(1024),
+			min_paged_record_bytes: RecordBodyByteLen::new(1),
+			stats_supported_types: std::collections::BTreeSet::new(),
+		};
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let encoded =
+				crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+					&batch,
+					&source_rows,
+					&descriptor,
+					RecordBodyCompressionPolicy::Uncompressed,
+					&row_group_config,
+					&encoding_config,
+				)
+				.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("encoding-index/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+		let indexed_locations = [
+			RecordRowIndex::new(300),
+			RecordRowIndex::new(301),
+			RecordRowIndex::new(900),
+		]
+		.into_iter()
+		.map(|record_row_index| {
+			let row = encoded
+				.rows
+				.iter()
+				.find(|row| row.record_row_index == record_row_index)
+				.expect("indexed source row");
+			mgr.lookup(tenant(), row.key_identity)
+				.expect("indexed row location")
+		})
+		.collect::<Vec<_>>();
+		let requirement = ColumnFetchRequirement {
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
+			..ColumnFetchRequirement::default()
+		};
+
+		let indexed = mgr
+			.read_projected_indexed_rows(&indexed_locations, &descriptor, &requirement)
+			.await
+			.unwrap()
+			.expect("projected indexed rows");
+		assert!(indexed.indexed_rows_materialized);
+		assert_eq!(indexed.projected.batch.num_rows(), indexed_locations.len());
+		let L2FetchStrategy::RowGroup(plan) = &indexed.strategy else {
+			panic!(
+				"expected encoding indexed row-group strategy, got {:?}",
+				indexed.strategy
+			);
+		};
+		assert_eq!(
+			plan.surviving_groups,
+			vec![crate::schema::RowGroupIndex::ZERO]
+		);
+		assert!(plan.phase_b_fetch.is_none());
+
+		let full_frame = mgr
+			.read_encrypted_record_from_l2(l2.as_ref(), &pointer, indexed_locations[0])
+			.await
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id,
+				record_offset: RecordBodyByteOffset::new(indexed_locations[0].offset),
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: full_frame.len() as u64,
+			},
+			&full_frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = directory.page_directory.as_ref().unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let payload_encoding = encoding_directory
+			.buffers
+			.iter()
+			.find(|encoding| {
+				encoding.row_group_index == crate::schema::RowGroupIndex::ZERO
+					&& encoding.ipc_column_ordinal == crate::schema::IpcColumnOrdinal::new(1)
+					&& encoding.page_end_offsets.len() > 1
+					&& encoding.encoded_range.len < encoding.decoded_byte_len
+			})
+			.expect("payload value buffer should be page-encoded");
+		let payload_page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == payload_encoding.row_group_index
+					&& page.ipc_column_ordinal == payload_encoding.ipc_column_ordinal
+					&& page.ipc_buffer_ordinal == payload_encoding.ipc_buffer_ordinal
+			})
+			.unwrap();
+		let full_encoded_range = crate::storage::row_group::RecordBodyByteRange {
+			start: RecordBodyByteOffset::new(
+				payload_page.range.start.get()
+					+ u64::from(payload_encoding.encoded_range.start.get()),
+			),
+			len: payload_encoding.encoded_range.len,
+		};
+		assert!(
+			!body_ranges_cover(
+				&plan.phase_c_fetch.selected_plaintext_ranges,
+				full_encoded_range
+			),
+			"SIMD-page fast path should not fetch the whole encoded buffer"
+		);
+		let selected_bytes = plan
+			.phase_c_fetch
+			.selected_plaintext_ranges
+			.iter()
+			.map(|range| range.len.get())
+			.sum::<u64>();
+		assert!(
+			plan.phase_c_fetch.selected_plaintext_ranges.len() < indexed_locations.len(),
+			"Encoding indexed L2 plan should deduplicate multiple selected rows on the same SIMD page"
+		);
+		assert!(selected_bytes < full_encoded_range.len.get());
+
+		let values = indexed.projected.batch.column(0);
+		let values = values
+			.as_any()
+			.downcast_ref::<UInt8Array>()
+			.expect("indexed payload column");
+		assert_eq!(values.values(), &[7, 7, 7]);
+	}
+
 	fn body_ranges_cover(
 		ranges: &[crate::storage::row_group::RecordBodyByteRange],
 		candidate: crate::storage::row_group::RecordBodyByteRange,
@@ -15470,14 +16606,24 @@ mod tests {
 			min_paged_record_bytes: RecordBodyByteLen::new(1),
 			..Default::default()
 		};
-		let compacted =
-			compact_physical_record_frame(&old.frame, &records, Some(&catalog), &writer_config)
-				.unwrap()
-				.expect("compacted frame");
-		let compacted_again =
-			compact_physical_record_frame(&old.frame, &records, Some(&catalog), &writer_config)
-				.unwrap()
-				.expect("compacted frame");
+		let compacted = compact_physical_record_frame(
+			&old.frame,
+			&records,
+			Some(&catalog),
+			&writer_config,
+			&EncodingWriterConfig::default(),
+		)
+		.unwrap()
+		.expect("compacted frame");
+		let compacted_again = compact_physical_record_frame(
+			&old.frame,
+			&records,
+			Some(&catalog),
+			&writer_config,
+			&EncodingWriterConfig::default(),
+		)
+		.unwrap()
+		.expect("compacted frame");
 		let parsed = parse_record_buffer_directory(
 			TieredRecordId {
 				slab_id: SlabId::new(77),
@@ -15816,6 +16962,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -15851,6 +16999,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -15930,6 +17080,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -16000,6 +17152,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: crypto.clone(),
 		})
@@ -16049,6 +17203,8 @@ mod tests {
 				l2_column_fetch: Default::default(),
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: Default::default(),
 				group_commit: GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -16117,6 +17273,8 @@ mod tests {
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

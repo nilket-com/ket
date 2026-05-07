@@ -1689,6 +1689,33 @@ const ROW_GROUP_INVARIANT_KINDS: &[&str] = &[
 	"row_group_range_overflow",
 	"layout_unsupported",
 ];
+const ENCODING_CASCADE_LABELS: &[&str] = &[
+	"plain",
+	"lz4_frame",
+	"bit_packed",
+	"rle",
+	"dictionary",
+	"delta",
+	"fsst",
+	"alp",
+];
+const ENCODING_FALLBACK_REASONS: &[&str] = &[
+	"reader_disabled",
+	"directory_missing",
+	"unsupported_arrow_layout",
+	"too_many_pages",
+	"too_many_bytes",
+	"dense_selection",
+	"plain_buffer",
+];
+const ENCODING_BYTE_KINDS: &[&str] = &["page", "buffer", "avoided"];
+const ENCODING_INVARIANT_KINDS: &[&str] = &[
+	"encoding_directory_parse",
+	"buffer_encoding_mismatch",
+	"page_range_overflow",
+	"cascade_unsupported",
+	"decoded_length_mismatch",
+];
 
 fn bounded_row_group_label(value: &str, labels: &[&'static str]) -> Option<&'static str> {
 	labels.iter().copied().find(|label| *label == value)
@@ -2145,6 +2172,63 @@ impl Histogram {
 	}
 }
 
+struct EncodingCascadeHistograms {
+	histograms: [Histogram; 8],
+}
+
+impl EncodingCascadeHistograms {
+	fn new(bounds: &'static [u64]) -> Self {
+		Self {
+			histograms: std::array::from_fn(|_| Histogram::new(bounds)),
+		}
+	}
+
+	fn histogram(&self, cascade: &str) -> Option<&Histogram> {
+		ENCODING_CASCADE_LABELS
+			.iter()
+			.position(|label| *label == cascade)
+			.map(|index| &self.histograms[index])
+	}
+
+	fn observe_duration(&self, cascade: &str, duration: Duration) {
+		if let Some(histogram) = self.histogram(cascade) {
+			histogram.observe_duration(duration);
+		}
+	}
+
+	fn observe_value(&self, cascade: &str, value: u64) {
+		if let Some(histogram) = self.histogram(cascade) {
+			histogram.observe_value(value);
+		}
+	}
+
+	fn render_micros(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for (index, cascade) in ENCODING_CASCADE_LABELS.iter().enumerate() {
+			render_histogram_micros_series(
+				out,
+				name,
+				&[("cascade", *cascade)],
+				&self.histograms[index].snapshot(),
+			);
+		}
+	}
+
+	fn render_ratio(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for (index, cascade) in ENCODING_CASCADE_LABELS.iter().enumerate() {
+			render_histogram_ratio_series(
+				out,
+				name,
+				&[("cascade", *cascade)],
+				&self.histograms[index].snapshot(),
+			);
+		}
+	}
+}
+
 pub struct MetricsRegistry {
 	pub metrics_scrapes_total: Counter,
 
@@ -2254,6 +2338,15 @@ pub struct MetricsRegistry {
 	storage_l2_row_group_fetch_selected_ranges: Histogram,
 	storage_l2_row_group_fetch_directory_bytes: Histogram,
 	storage_l2_row_group_fetch_invariant_violations: StaticLabelCounters,
+	storage_l2_encoding_buffer_encodings: StaticLabelCounters,
+	storage_l2_encoding_materialize_micros: EncodingCascadeHistograms,
+	storage_l2_encoding_simd_pages_fetched: StaticLabelCounters,
+	storage_l2_encoding_compression_ratio: EncodingCascadeHistograms,
+	storage_l2_encoding_cascade_select_micros: Histogram,
+	storage_l2_encoding_directory_bytes: Histogram,
+	storage_l2_encoding_fallback: StaticLabelCounters,
+	storage_l2_encoding_bytes: StaticLabelCounters,
+	storage_l2_encoding_invariant_violations: StaticLabelCounters,
 	io_uring_submission_queue_depth: IoUringQueueDepthGauges,
 	io_uring_completion_queue_depth: IoUringQueueDepthGauges,
 	io_uring_errors: IoUringErrorCounters,
@@ -2511,6 +2604,21 @@ impl Default for MetricsRegistry {
 				PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS,
 			),
 			storage_l2_row_group_fetch_invariant_violations: StaticLabelCounters::default(),
+			storage_l2_encoding_buffer_encodings: StaticLabelCounters::default(),
+			storage_l2_encoding_materialize_micros: EncodingCascadeHistograms::new(
+				PBC_SLAB_STATS_BUCKETS_MICROS,
+			),
+			storage_l2_encoding_simd_pages_fetched: StaticLabelCounters::default(),
+			storage_l2_encoding_compression_ratio: EncodingCascadeHistograms::new(
+				COMPRESSION_RATIO_MILLI_BUCKETS,
+			),
+			storage_l2_encoding_cascade_select_micros: Histogram::new(
+				PBC_SLAB_STATS_BUCKETS_MICROS,
+			),
+			storage_l2_encoding_directory_bytes: Histogram::new(PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS),
+			storage_l2_encoding_fallback: StaticLabelCounters::default(),
+			storage_l2_encoding_bytes: StaticLabelCounters::default(),
+			storage_l2_encoding_invariant_violations: StaticLabelCounters::default(),
 			io_uring_submission_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_completion_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_errors: IoUringErrorCounters::default(),
@@ -3496,6 +3604,66 @@ impl MetricsRegistry {
 		}
 	}
 
+	pub fn observe_storage_l2_encoding_buffer_encoding(&self, cascade: &str) {
+		if let Some(label) = bounded_row_group_label(cascade, ENCODING_CASCADE_LABELS) {
+			self.storage_l2_encoding_buffer_encodings.inc(label);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_materialize(&self, cascade: &str, duration: Duration) {
+		self.storage_l2_encoding_materialize_micros
+			.observe_duration(cascade, duration);
+	}
+
+	pub fn observe_storage_l2_encoding_simd_pages_fetched(&self, cascade: &str, pages: u64) {
+		if let Some(label) = bounded_row_group_label(cascade, ENCODING_CASCADE_LABELS) {
+			self.storage_l2_encoding_simd_pages_fetched
+				.add(label, pages);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_compression_ratio(
+		&self,
+		cascade: &str,
+		decoded: u64,
+		encoded: u64,
+	) {
+		if decoded == 0 {
+			return;
+		}
+		let ratio_milli = encoded.saturating_mul(1000) / decoded;
+		self.storage_l2_encoding_compression_ratio
+			.observe_value(cascade, ratio_milli);
+	}
+
+	pub fn observe_storage_l2_encoding_cascade_select(&self, duration: Duration) {
+		self.storage_l2_encoding_cascade_select_micros
+			.observe_duration(duration);
+	}
+
+	pub fn observe_storage_l2_encoding_directory_bytes(&self, bytes: u64) {
+		self.storage_l2_encoding_directory_bytes
+			.observe_value(bytes);
+	}
+
+	pub fn observe_storage_l2_encoding_fallback(&self, reason: &str) {
+		if let Some(label) = bounded_row_group_label(reason, ENCODING_FALLBACK_REASONS) {
+			self.storage_l2_encoding_fallback.inc(label);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_bytes(&self, kind: &str, bytes: u64) {
+		if let Some(label) = bounded_row_group_label(kind, ENCODING_BYTE_KINDS) {
+			self.storage_l2_encoding_bytes.add(label, bytes);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_invariant_violation(&self, violation_kind: &str) {
+		if let Some(label) = bounded_row_group_label(violation_kind, ENCODING_INVARIANT_KINDS) {
+			self.storage_l2_encoding_invariant_violations.inc(label);
+		}
+	}
+
 	pub fn observe_storage_compression_encode(
 		&self,
 		codec: RecordBodyCompressionPolicy,
@@ -4281,6 +4449,74 @@ impl MetricsRegistry {
 			"ADR 056 row-group invariant violations by bounded kind.",
 			"violation_kind",
 			ROW_GROUP_INVARIANT_KINDS,
+		);
+		let encoding_buffer_encodings =
+			namespaced_metric("storage_l2_encoding_buffer_encodings_total");
+		self.storage_l2_encoding_buffer_encodings.render(
+			&mut out,
+			&encoding_buffer_encodings,
+			"ADR 057 Encoding buffer encodings by cascade.",
+			"cascade",
+			ENCODING_CASCADE_LABELS,
+		);
+		let encoding_materialize = namespaced_metric("storage_l2_encoding_materialize_micros");
+		self.storage_l2_encoding_materialize_micros.render_micros(
+			&mut out,
+			&encoding_materialize,
+			"ADR 057 Encoding materialization duration in microseconds.",
+		);
+		let encoding_pages = namespaced_metric("storage_l2_encoding_simd_pages_fetched_total");
+		self.storage_l2_encoding_simd_pages_fetched.render(
+			&mut out,
+			&encoding_pages,
+			"ADR 057 Encoding SIMD pages fetched by cascade.",
+			"cascade",
+			ENCODING_CASCADE_LABELS,
+		);
+		let encoding_ratio = namespaced_metric("storage_l2_encoding_compression_ratio");
+		self.storage_l2_encoding_compression_ratio.render_ratio(
+			&mut out,
+			&encoding_ratio,
+			"ADR 057 Encoding encoded/decoded byte ratio in thousandths.",
+		);
+		let encoding_select = namespaced_metric("storage_l2_encoding_cascade_select_micros");
+		render_histogram_micros(
+			&mut out,
+			&encoding_select,
+			"ADR 057 Encoding cascade selection duration in microseconds.",
+			&self.storage_l2_encoding_cascade_select_micros.snapshot(),
+		);
+		let encoding_directory_bytes = namespaced_metric("storage_l2_encoding_directory_bytes");
+		render_histogram_raw(
+			&mut out,
+			&encoding_directory_bytes,
+			"ADR 057 Encoding directory metadata bytes.",
+			&self.storage_l2_encoding_directory_bytes.snapshot(),
+		);
+		let encoding_fallback = namespaced_metric("storage_l2_encoding_fallback_total");
+		self.storage_l2_encoding_fallback.render(
+			&mut out,
+			&encoding_fallback,
+			"ADR 057 Encoding reader fallbacks by bounded reason.",
+			"reason",
+			ENCODING_FALLBACK_REASONS,
+		);
+		let encoding_bytes = namespaced_metric("storage_l2_encoding_bytes_total");
+		self.storage_l2_encoding_bytes.render(
+			&mut out,
+			&encoding_bytes,
+			"ADR 057 Encoding bytes by bounded kind.",
+			"kind",
+			ENCODING_BYTE_KINDS,
+		);
+		let encoding_invariants =
+			namespaced_metric("storage_l2_encoding_invariant_violations_total");
+		self.storage_l2_encoding_invariant_violations.render(
+			&mut out,
+			&encoding_invariants,
+			"ADR 057 Encoding invariant violations by bounded kind.",
+			"violation_kind",
+			ENCODING_INVARIANT_KINDS,
 		);
 		self.io_uring_submission_queue_depth.render(
 			&mut out,

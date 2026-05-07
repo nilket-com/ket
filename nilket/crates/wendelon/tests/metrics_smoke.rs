@@ -188,6 +188,8 @@ async fn build_manager_with_sealed_slabs(
 			l2_column_fetch: Default::default(),
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_encoding_fetch: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -329,6 +331,15 @@ async fn scrape_endpoint_exposes_data_ring_and_storage_metrics() {
 	assert!(body.contains("wendelon_storage_pk_delete_tombstone_boundary_versions_retained_total"));
 	assert!(body.contains("wendelon_storage_pk_upsert_no_digest_add_total"));
 	assert!(body.contains("wendelon_storage_pk_admission_visibility_lookup_seconds"));
+	assert!(body.contains("wendelon_storage_l2_encoding_buffer_encodings_total"));
+	assert!(body.contains("wendelon_storage_l2_encoding_materialize_micros"));
+	assert!(body.contains("wendelon_storage_l2_encoding_simd_pages_fetched_total"));
+	assert!(body.contains("wendelon_storage_l2_encoding_compression_ratio"));
+	assert!(body.contains("wendelon_storage_l2_encoding_cascade_select_micros"));
+	assert!(body.contains("wendelon_storage_l2_encoding_directory_bytes"));
+	assert!(body.contains("wendelon_storage_l2_encoding_fallback_total"));
+	assert!(body.contains("wendelon_storage_l2_encoding_bytes_total"));
+	assert!(body.contains("wendelon_storage_l2_encoding_invariant_violations_total"));
 	assert!(body.contains("wendelon_audit_materialization_lag_entries"));
 	assert!(body.contains("wendelon_audit_emit_total{authority=\"node_local\",outcome=\"ok\"}"));
 	assert!(body.contains("wendelon_group_commit_window_seconds_bucket"));

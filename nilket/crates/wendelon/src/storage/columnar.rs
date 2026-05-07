@@ -10,6 +10,13 @@ use crate::schema::{
 	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptorV1,
 };
 use crate::storage::core::RecordLocation;
+use crate::storage::encoding::directory::{
+	deserialize_encoding_directory_value, validate_encoding_directory,
+};
+use crate::storage::encoding::materialize::{find_buffer_encoding, materialize_encoding_buffer};
+use crate::storage::encoding::{
+	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodingDirectory, EncodingRejectCode,
+};
 use crate::storage::row_group::{
 	ROW_GROUP_DIRECTORY_METADATA_KEY, RecordPageDirectory, RowGroupFallbackReason,
 	RowGroupFetchPlan, RowGroupRejectCode, deserialize_page_directory_value,
@@ -385,6 +392,7 @@ pub struct RecordBufferDirectory {
 	pub storage_column_ordinals: BTreeMap<StorageColumn, u32>,
 	pub logical_schema_fingerprint: LogicalSchemaFingerprint,
 	pub page_directory: Option<RecordPageDirectory>,
+	pub encoding_directory: Option<EncodingDirectory>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -967,6 +975,8 @@ pub enum ColumnFetchError {
 	InvalidRange(String),
 	#[error("row-group page directory rejected: {0:?}")]
 	RowGroupRejected(RowGroupRejectCode),
+	#[error("Encoding encoding directory rejected: {0:?}")]
+	EncodingRejected(EncodingRejectCode),
 	#[error("unsupported arrow layout for columnar materialization")]
 	UnsupportedArrowLayout,
 }
@@ -975,6 +985,13 @@ impl ColumnFetchError {
 	pub fn row_group_reject_code(&self) -> Option<RowGroupRejectCode> {
 		match self {
 			Self::RowGroupRejected(code) => Some(*code),
+			_ => None,
+		}
+	}
+
+	pub fn encoding_reject_code(&self) -> Option<EncodingRejectCode> {
+		match self {
+			Self::EncodingRejected(code) => Some(*code),
 			_ => None,
 		}
 	}
@@ -1122,6 +1139,33 @@ pub fn parse_record_buffer_directory(
 		}
 		None => None,
 	};
+	let encoding_directory = match ipc_schema.metadata().get(ENCODING_DIRECTORY_METADATA_KEY) {
+		Some(value) => {
+			crate::metrics::global()
+				.observe_storage_l2_encoding_directory_bytes(value.len() as u64);
+			let mut encoding_directory =
+				deserialize_encoding_directory_value(value).map_err(encoding_reject_error)?;
+			if encoding_directory.record_id.slab_id == SlabId::ZERO
+				&& encoding_directory.record_id.record_offset == RecordBodyByteOffset::ZERO
+			{
+				encoding_directory.record_id = record_id;
+			}
+			let Some(page_directory) = page_directory.as_ref() else {
+				return Err(ColumnFetchError::EncodingRejected(
+					EncodingRejectCode::BufferEncodingMismatch,
+				));
+			};
+			validate_encoding_directory(
+				&encoding_directory,
+				page_directory,
+				&ipc_schema,
+				descriptor.logical_schema_fingerprint,
+			)
+			.map_err(encoding_reject_error)?;
+			Some(encoding_directory)
+		}
+		None => None,
+	};
 
 	Ok(RecordBufferDirectory {
 		record_id,
@@ -1135,12 +1179,18 @@ pub fn parse_record_buffer_directory(
 		storage_column_ordinals,
 		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
 		page_directory,
+		encoding_directory,
 	})
 }
 
 fn row_group_reject_error(code: RowGroupRejectCode) -> ColumnFetchError {
 	crate::metrics::global().observe_storage_l2_row_group_fetch_invariant_violation(code.as_str());
 	ColumnFetchError::RowGroupRejected(code)
+}
+
+fn encoding_reject_error(code: EncodingRejectCode) -> ColumnFetchError {
+	crate::metrics::global().observe_storage_l2_encoding_invariant_violation(code.as_str());
+	ColumnFetchError::EncodingRejected(code)
 }
 
 pub fn selected_record_body_ranges(
@@ -1380,9 +1430,25 @@ pub fn record_buffer_set_from_plaintext_ranges<B: AsRef<[u8]>>(
 			buffers.insert(buffer_index, Vec::new());
 			continue;
 		}
-		let start = buffer.offset_in_record.get();
-		let end = buffer.end().map_err(|err| {
-			ArrowError::SchemaError(format!("buffer ordinal {buffer_ordinal} range: {err}"))
+		let encoding = encoding_for_ipc_body_buffer(directory, buffer_index, buffer);
+		let start = buffer
+			.offset_in_record
+			.get()
+			.checked_add(
+				encoding
+					.map(|encoding| u64::from(encoding.encoded_range.start.get()))
+					.unwrap_or(0),
+			)
+			.ok_or_else(|| {
+				ArrowError::SchemaError(format!(
+					"buffer ordinal {buffer_ordinal} Encoding start overflows"
+				))
+			})?;
+		let len = encoding
+			.map(|encoding| encoding.encoded_range.len.get())
+			.unwrap_or_else(|| buffer.length.get());
+		let end = start.checked_add(len).ok_or_else(|| {
+			ArrowError::SchemaError(format!("buffer ordinal {buffer_ordinal} range overflows"))
 		})?;
 		let mut matched = None;
 		for (range, extract) in plaintext_ranges.iter().zip(plaintext_extracts.iter()) {
@@ -1407,7 +1473,21 @@ pub fn record_buffer_set_from_plaintext_ranges<B: AsRef<[u8]>>(
 						"buffer ordinal {buffer_ordinal} range exceeds plaintext extract"
 					)));
 				}
-				matched = Some(extract[relative_start..relative_end].to_vec());
+				let mut bytes = extract[relative_start..relative_end].to_vec();
+				if let Some(encoding) = encoding {
+					let prefix_len =
+						usize::try_from(encoding.encoded_range.start.get()).map_err(|_| {
+							ArrowError::SchemaError(format!(
+								"buffer ordinal {buffer_ordinal} Encoding prefix exceeds usize"
+							))
+						})?;
+					if prefix_len > 0 {
+						let mut padded = vec![0_u8; prefix_len];
+						padded.extend_from_slice(&bytes);
+						bytes = padded;
+					}
+				}
+				matched = Some(bytes);
 				break;
 			}
 		}
@@ -1419,6 +1499,35 @@ pub fn record_buffer_set_from_plaintext_ranges<B: AsRef<[u8]>>(
 		buffers.insert(buffer_index, bytes);
 	}
 	Ok(buffers)
+}
+
+fn encoding_for_ipc_body_buffer<'a>(
+	directory: &'a RecordBufferDirectory,
+	buffer_ordinal: IpcBufferIndex,
+	buffer: &IpcBufferRange,
+) -> Option<&'a BufferEncoding> {
+	let encoding_directory = directory.encoding_directory.as_ref()?;
+	let body_range = crate::storage::row_group::RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(buffer.offset_in_record.get()),
+		len: RecordBodyByteLen::new(buffer.length.get()),
+	};
+	let row_group_index = directory
+		.page_directory
+		.as_ref()
+		.and_then(|page_directory| {
+			page_directory.buffer_pages.iter().find_map(|page| {
+				(page.ipc_buffer_ordinal == buffer_ordinal
+					&& page.range.start == body_range.start
+					&& page.range.len == body_range.len)
+					.then_some(page.row_group_index)
+			})
+		})?;
+	find_buffer_encoding(
+		encoding_directory,
+		row_group_index,
+		buffer_ordinal,
+		body_range,
+	)
 }
 
 pub fn decode_projected_record_batch_from_buffers(
@@ -1622,6 +1731,36 @@ fn materialize_ipc_body_buffer(
 			buffer_ordinal.get()
 		))
 	})?;
+	if let Some(encoding_directory) = directory.encoding_directory.as_ref() {
+		if let Some(encoding) = encoding_for_ipc_body_buffer(directory, buffer_ordinal, ipc_range) {
+			let field = directory
+				.column_to_buffers
+				.iter()
+				.enumerate()
+				.find_map(|(ordinal, mapping)| {
+					let first = mapping.first_buffer_ordinal.get();
+					let end = first.saturating_add(mapping.buffer_count);
+					(buffer_ordinal.get() >= first && buffer_ordinal.get() < end)
+						.then_some(directory.ipc_schema.field(ordinal))
+				})
+				.ok_or_else(|| {
+					ArrowError::SchemaError(format!(
+						"buffer ordinal {} is not mapped to an IPC field",
+						buffer_ordinal.get()
+					))
+				})?;
+			let decoded =
+				materialize_encoding_buffer(bytes, field.data_type(), encoding_directory, encoding)
+					.map_err(|code| {
+						crate::metrics::global()
+							.observe_storage_l2_encoding_invariant_violation(code.as_str());
+						ArrowError::SchemaError(format!(
+							"Encoding materialization rejected: {code:?}"
+						))
+					})?;
+			return Ok(Buffer::from_vec(decoded));
+		}
+	}
 	let body_bytes = decode_ipc_body_buffer(bytes, directory.record_body_compression)?;
 	Ok(Buffer::from_vec(body_bytes))
 }

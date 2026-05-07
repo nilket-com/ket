@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use uuid::Uuid;
-use wendelon::audit::AuditSinksConfig;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, TopologySource, WendelonClient, WendelonClientConfig,
 	WriteRequest,
@@ -310,43 +309,21 @@ fn bootstrap_cfg(
 			wendelon::network::transfer_verifying_key_bytes(transfer_secret),
 		);
 	}
-	NodeBootstrapConfig {
-		node_id,
-		data_dir: fresh_dir(tag),
-		slab_max_bytes: 64 * 1024 * 1024,
-		group_commit: wendelon::storage::GroupCommitConfig::default(),
-		rf,
-		wal_io_depth: 64,
-		slab_io_depth: 64,
-		advertise_address,
-		lease_signing_secret,
-		trusted_lease_signers,
-		transfer_signing_secret,
-		trusted_transfer_signers,
-		cluster,
-		l2: None,
-		tiering: wendelon::storage::SweeperConfig::default(),
-		lsm_compaction_paused: false,
-		rehydration: wendelon::storage::RehydrationPolicy::default(),
-		l2_column_fetch: Default::default(),
-		row_group_writer: Default::default(),
-		l2_row_group_fetch: Default::default(),
-		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
-		crypto_cache: wendelon::crypto::CryptoCacheConfig::default(),
-		protocol: wendelon::schema::ProtocolVersionWindow::default(),
-		transport_tls: Some(TransportTlsConfig {
-			cert_path: cert_path.to_path_buf(),
-			key_path: key_path.to_path_buf(),
-			node_ca_path: node_ca_path.to_path_buf(),
-			operator_ca_path: operator_ca_path.to_path_buf(),
-			cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
-		}),
-		transport_admission: wendelon::network::ServerAdmissionConfig::default(),
-		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
-		mvcc_retention_policy: wendelon::storage::MvccRetentionPolicy::Disabled,
-		observability: None,
-		audit: AuditSinksConfig::default(),
-	}
+	let mut cfg = NodeBootstrapConfig::dev(node_id, fresh_dir(tag), advertise_address);
+	cfg.rf = rf;
+	cfg.lease_signing_secret = lease_signing_secret;
+	cfg.trusted_lease_signers = trusted_lease_signers;
+	cfg.transfer_signing_secret = transfer_signing_secret;
+	cfg.trusted_transfer_signers = trusted_transfer_signers;
+	cfg.cluster = cluster;
+	cfg.transport_tls = Some(TransportTlsConfig {
+		cert_path: cert_path.to_path_buf(),
+		key_path: key_path.to_path_buf(),
+		node_ca_path: node_ca_path.to_path_buf(),
+		operator_ca_path: operator_ca_path.to_path_buf(),
+		cluster_domain: tls_pki::CLUSTER_DOMAIN.into(),
+	});
+	cfg
 }
 
 async fn wait_for_cluster(node: &WendelonNode, expected_epoch: u64, expected_nodes: usize) {

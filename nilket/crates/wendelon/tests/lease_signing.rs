@@ -5,13 +5,12 @@ use arrow::array::LargeBinaryBuilder;
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use wendelon::audit::AuditSinksConfig;
 use wendelon::network::traits::DataRing;
 use wendelon::network::{
 	LeaseAuthority, dev_lease_signing_secret, dev_transfer_signing_secret,
 	lease_verifying_key_bytes, transfer_verifying_key_bytes,
 };
-use wendelon::node::{ClusterBootstrapConfig, NodeBootstrapConfig, WendelonNode};
+use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	ClientWriteId, HybridTimestamp, Identity, LeaseDescriptor, TenantId, WriteRequestMeta,
 	WriteStatus, write_payload_schema,
@@ -81,37 +80,12 @@ fn bootstrap_cfg(
 		node_id,
 		transfer_verifying_key_bytes(transfer_signing_secret),
 	);
-	NodeBootstrapConfig {
-		node_id,
-		data_dir: support::tempdir(tag),
-		slab_max_bytes: 64 * 1024 * 1024,
-		group_commit: wendelon::storage::GroupCommitConfig::default(),
-		rf: 1,
-		wal_io_depth: 64,
-		slab_io_depth: 64,
-		advertise_address: "127.0.0.1:0".into(),
-		lease_signing_secret: secret,
-		trusted_lease_signers,
-		transfer_signing_secret,
-		trusted_transfer_signers,
-		cluster: ClusterBootstrapConfig::Bootstrap,
-		l2: None,
-		tiering: wendelon::storage::SweeperConfig::default(),
-		lsm_compaction_paused: false,
-		rehydration: wendelon::storage::RehydrationPolicy::default(),
-		l2_column_fetch: Default::default(),
-		row_group_writer: Default::default(),
-		l2_row_group_fetch: Default::default(),
-		root_kek_provider: wendelon::crypto::RootKekProviderConfig::DevInsecure,
-		crypto_cache: wendelon::crypto::CryptoCacheConfig::default(),
-		protocol: wendelon::schema::ProtocolVersionWindow::default(),
-		transport_tls: None,
-		transport_admission: wendelon::network::ServerAdmissionConfig::default(),
-		drift_max_offset_ms: wendelon::consensus::MAX_OFFSET_MS,
-		mvcc_retention_policy: wendelon::storage::MvccRetentionPolicy::Disabled,
-		observability: None,
-		audit: AuditSinksConfig::default(),
-	}
+	let mut cfg = NodeBootstrapConfig::dev(node_id, support::tempdir(tag), "127.0.0.1:0".into());
+	cfg.lease_signing_secret = secret;
+	cfg.trusted_lease_signers = trusted_lease_signers;
+	cfg.transfer_signing_secret = transfer_signing_secret;
+	cfg.trusted_transfer_signers = trusted_transfer_signers;
+	cfg
 }
 
 fn unsigned_lease(node: &WendelonNode) -> LeaseDescriptor {

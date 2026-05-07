@@ -1037,6 +1037,15 @@ fn has_plausible_arrow_stream_prefix(frame: &[u8]) -> bool {
 }
 
 fn decode_recovery_batch(frame: &[u8]) -> std::io::Result<arrow::record_batch::RecordBatch> {
+	let materialized;
+	let frame =
+		if crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(frame) {
+			materialized =
+				crate::storage::encoding::materialize::materialize_encoding_ipc_stream(frame)?;
+			materialized.as_slice()
+		} else {
+			frame
+		};
 	let mut reader = StreamReader::try_new(Cursor::new(frame), None)
 		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("arrow stream open: {err}")))?;
 	let mut batches = Vec::new();

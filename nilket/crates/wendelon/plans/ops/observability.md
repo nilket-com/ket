@@ -243,6 +243,15 @@ and traces for attribution; keep Prometheus bounded to the enums above.
 | `wendelon_storage_l2_row_group_fetch_selected_ranges` | histogram | none | Encrypted chunk-run count selected by row-group fetch |
 | `wendelon_storage_l2_row_group_fetch_directory_bytes` | histogram | none | Parsed row-group directory size |
 | `wendelon_storage_l2_row_group_fetch_invariant_violations_total` | counter | `violation_kind` (`page_directory_parse_error`, `row_group_range_overflow`, `layout_unsupported`) | Fail-closed ADR 056 corruption/invariant signal |
+| `wendelon_storage_l2_encoding_buffer_encodings_total` | counter | `cascade` (`plain`, `lz4_frame`, `bit_packed`, `rle`, `dictionary`, `delta`, `fsst`, `alp`) | ADR 057 cascade distribution for encoded row-group buffers |
+| `wendelon_storage_l2_encoding_materialize_micros` | histogram | `cascade` (`plain`, `lz4_frame`, `bit_packed`, `rle`, `dictionary`, `delta`, `fsst`, `alp`) | Per-cascade Encoding materialization CPU |
+| `wendelon_storage_l2_encoding_simd_pages_fetched_total` | counter | `cascade` (`plain`, `lz4_frame`, `bit_packed`, `rle`, `dictionary`, `delta`, `fsst`, `alp`) | SIMD-page fetch count by cascade |
+| `wendelon_storage_l2_encoding_compression_ratio` | histogram | `cascade` (`plain`, `lz4_frame`, `bit_packed`, `rle`, `dictionary`, `delta`, `fsst`, `alp`) | Encoded/decoded Encoding byte ratio |
+| `wendelon_storage_l2_encoding_cascade_select_micros` | histogram | none | Writer-side cascade selection time |
+| `wendelon_storage_l2_encoding_directory_bytes` | histogram | none | Parsed/written Encoding directory metadata bytes |
+| `wendelon_storage_l2_encoding_fallback_total` | counter | `reason` (`reader_disabled`, `directory_missing`, `unsupported_arrow_layout`, `too_many_pages`, `too_many_bytes`, `dense_selection`, `plain_buffer`) | Encoding economic fallback distribution |
+| `wendelon_storage_l2_encoding_bytes_total` | counter | `kind` (`page`, `buffer`, `avoided`) | Encoding byte accounting |
+| `wendelon_storage_l2_encoding_invariant_violations_total` | counter | `violation_kind` (`encoding_directory_parse`, `buffer_encoding_mismatch`, `page_range_overflow`, `cascade_unsupported`, `decoded_length_mismatch`) | Fail-closed ADR 057 corruption/invariant signal |
 
 #### Descriptor Fingerprints / CSB
 | Metric | Type | Labels | Use |
