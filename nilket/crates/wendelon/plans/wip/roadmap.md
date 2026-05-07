@@ -20,10 +20,17 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 058 (Compute Over Encoded Data, COCD)
-council-converged across six iterations and design-promoted.
-Implementation phases pending; full small / medium / large
-bench evidence is the promotion-to-shipped gate. Innermost
-layer of the storage hierarchy ADR 056 / ADR 057 established.
+council-converged across six iterations, implemented, and
+promoted after Phase 8 substrate bench evidence. Native
+per-cascade kernels (BitPacked SIMD, Rle run-grain, Dictionary
+match-set + index walk, Delta prefix-sum) and the ≥ 2x CPU
+promote-to-default gate remain the kernel-promotion artifact's
+follow-up scope; the substrate ships disabled by default and
+correctness-first under V1, awaiting the kernel-promotion
+artifact at
+`plans/impl/058_compute_over_encoded_data_kernel_bench_results.md`.
+Innermost layer of the storage hierarchy ADR 056 / ADR 057
+established.
 **Closed 6-variant predicate evaluator catalog**: `BitPacked`,
 `RlePlain`, `RleBitPacked`, `DictionaryPlain`,
 `DictionaryBitPacked`, `Delta` (full atom set, full-buffer
@@ -478,8 +485,9 @@ forward shape continues at #15.
     058. See *Where we are*.
 
 14. **Compute over encoded data (COCD)** — ADR 058
-    promoted. Council-converged across six iterations and
-    design-promoted; implementation phases pending.
+    promoted after Phase 8 substrate bench evidence.
+    Council-converged across six iterations, implemented,
+    and disabled by default under V1.
     Innermost layer of the storage hierarchy. Closed
     6-variant predicate evaluator catalog (`BitPacked`,
     `RlePlain`, `RleBitPacked`, `DictionaryPlain`,
@@ -507,8 +515,14 @@ forward shape continues at #15.
     surface change required) vs. not-yet-in-ADR-040
     (exact `count_distinct`, float / decimal aggregates,
     time/timestamp sum/avg, GROUP BY — each requires an
-    ADR 040 expansion first). Reader-CPU bench gate is
-    the promotion-to-shipped gate. See *Where we are*.
+    ADR 040 expansion first). Phase 8 substrate bench
+    artifact landed at
+    `plans/impl/058_compute_over_encoded_data_bench_results.md`;
+    native per-cascade kernels and the >= 2x CPU
+    promote-to-default gate are the kernel-promotion
+    artifact's follow-up scope at
+    `plans/impl/058_compute_over_encoded_data_kernel_bench_results.md`.
+    See *Where we are*.
 
 15. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
@@ -806,17 +820,21 @@ StateDigest substrate                            (ADR 046)
 ```
 
 Design tip is past ADR 058: the storage hierarchy is
-design-complete (ADR 056 row groups, ADR 057 per-buffer
-pages + encoding cascades, ADR 058 compute over encoded
-data). ADR 056 and ADR 057 are shipped with Phase 10 bench
-evidence; ADR 058 is design-promoted with implementation
-phases pending. The Toron-pivot stretch closes its primary
-storage-hierarchy goal once ADR 058 implementation +
-Phase 8 bench evidence land. **The council's lean on next
-pickup:** ADR 058 implementation iterations against the
-locked design contract — the substrate, dispatch table,
-plan modes, and acceptance gates are all settled at the
-council level; Phase 0 audit through Phase 9 architectural
-lockdown should follow the impl plan's phase ordering. CDC
-follow-ups (#16) and vector embeddings (#17) remain
-deferred behind the storage hierarchy in this stretch.
+shipped (ADR 056 row groups, ADR 057 per-buffer pages +
+encoding cascades, ADR 058 compute over encoded data
+substrate). All three layers carry Phase 10 / Phase 8 bench
+evidence under `plans/impl/`. The Toron-pivot stretch closed
+its primary storage-hierarchy goal with ADR 058's substrate
+promotion; the COCD substrate ships disabled by default
+under V1, awaiting native per-cascade kernel work and the
+>= 2x CPU promote-to-default artifact at
+`plans/impl/058_compute_over_encoded_data_kernel_bench_results.md`.
+**The council's lean on next pickup:** native per-cascade
+COCD kernels (BitPacked SIMD, Rle run-grain, Dictionary
+match-set + index walk, Delta prefix-sum) plus the kernel-
+promotion bench artifact, OR the next Toron-adjacent
+follow-up (sparse Phase-C narrowing, page-level min/max/null
+stats, FSST evaluator) — both are fair game now that the
+substrate hierarchy is in place. CDC follow-ups (#16) and
+vector embeddings (#17) remain deferred behind the storage
+hierarchy in this stretch.

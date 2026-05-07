@@ -56,20 +56,18 @@ pub fn evaluator_kind_for_cascade(
 	match cascade {
 		EncodingCascade::BitPacked { .. } => Some(EncodingComputeEvaluatorKind::BitPacked),
 		EncodingCascade::Rle { inner, .. } => match inner.as_ref() {
-			EncodingLeafCascade::Plain | EncodingLeafCascade::Lz4Frame => {
-				Some(EncodingComputeEvaluatorKind::RlePlain)
-			}
+			EncodingLeafCascade::Plain => Some(EncodingComputeEvaluatorKind::RlePlain),
 			EncodingLeafCascade::BitPacked { .. } => {
 				Some(EncodingComputeEvaluatorKind::RleBitPacked)
 			}
+			EncodingLeafCascade::Lz4Frame => None,
 		},
 		EncodingCascade::Dictionary { inner, .. } => match inner.as_ref() {
-			EncodingLeafCascade::Plain | EncodingLeafCascade::Lz4Frame => {
-				Some(EncodingComputeEvaluatorKind::DictionaryPlain)
-			}
+			EncodingLeafCascade::Plain => Some(EncodingComputeEvaluatorKind::DictionaryPlain),
 			EncodingLeafCascade::BitPacked { .. } => {
 				Some(EncodingComputeEvaluatorKind::DictionaryBitPacked)
 			}
+			EncodingLeafCascade::Lz4Frame => None,
 		},
 		EncodingCascade::Delta { .. } => Some(EncodingComputeEvaluatorKind::Delta),
 		EncodingCascade::Plain

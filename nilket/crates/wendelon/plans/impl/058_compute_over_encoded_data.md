@@ -474,7 +474,8 @@ Work:
       `Dictionary { inner: BitPacked }` (fixed-width →
       Exact);
     - PBC predicate equality / range against
-      `Delta { inner: BitPacked }` (full-buffer grain);
+      `Delta { .. }` (any inner; full-buffer grain — encoder
+      ignores Delta inner per `encode_delta_bytes`);
     - PBC predicate against `Plain` int column
       (DenseFallback);
     - PBC predicate against `Lz4Frame` UTF-8 column

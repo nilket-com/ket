@@ -14,12 +14,14 @@ use wendelon::schema::{
 	TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
 };
 use wendelon::storage::encoding::cascade::encode_buffer;
+use wendelon::schema::{DictValueCount, RunCount};
 use wendelon::storage::encoding::{
 	BufferEncoding, EncodedAggregateContext, EncodedAggregateKind, EncodedPredicateNode,
 	EncodedRowMask, EncodingCascade, EncodingComputeConfig, EncodingComputeEvaluatorKind,
-	EncodingComputePlanMode, EncodingComputeRejectCode, PredicateAtom, PredicateAtomOp,
-	aggregate_kind_for_tag, coerce_literal, encoded_predicate_node_from_tree, evaluate,
-	evaluate_validity_bitmap, route_selectivity, try_fold_encoded_aggregate_request,
+	EncodingComputePlanMode, EncodingComputeRejectCode, EncodingLeafCascade, PredicateAtom,
+	PredicateAtomOp, aggregate_kind_for_tag, coerce_literal, encoded_predicate_node_from_tree,
+	evaluate, evaluate_validity_bitmap, evaluator_kind_for_cascade, route_selectivity,
+	try_fold_encoded_aggregate_request,
 };
 
 #[test]
@@ -68,6 +70,163 @@ fn encoded_row_mask_validates_and_round_trips() {
 	};
 	assert_eq!(mask.and(&all).unwrap(), mask);
 	assert_eq!(mask.or(&inverted).unwrap(), all);
+}
+
+#[test]
+fn evaluator_kind_for_cascade_routes_unsupported_inners_to_dense_fallback() {
+	let bp = EncodingCascade::BitPacked {
+		bits: BitsPerValue::new(8),
+		base: BaseValue::new(0),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&bp),
+		Some(EncodingComputeEvaluatorKind::BitPacked)
+	);
+
+	let rle_plain = EncodingCascade::Rle {
+		run_count: RunCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&rle_plain),
+		Some(EncodingComputeEvaluatorKind::RlePlain)
+	);
+
+	let rle_bp = EncodingCascade::Rle {
+		run_count: RunCount::new(1),
+		inner: Box::new(EncodingLeafCascade::BitPacked {
+			bits: BitsPerValue::new(4),
+			base: BaseValue::new(0),
+		}),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&rle_bp),
+		Some(EncodingComputeEvaluatorKind::RleBitPacked)
+	);
+
+	let rle_lz4 = EncodingCascade::Rle {
+		run_count: RunCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Lz4Frame),
+	};
+	assert_eq!(evaluator_kind_for_cascade(&rle_lz4), None);
+
+	let dict_plain = EncodingCascade::Dictionary {
+		dict_byte_len: RecordBodyByteLen::new(16),
+		dict_value_count: DictValueCount::new(4),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&dict_plain),
+		Some(EncodingComputeEvaluatorKind::DictionaryPlain)
+	);
+
+	let dict_bp = EncodingCascade::Dictionary {
+		dict_byte_len: RecordBodyByteLen::new(16),
+		dict_value_count: DictValueCount::new(4),
+		inner: Box::new(EncodingLeafCascade::BitPacked {
+			bits: BitsPerValue::new(2),
+			base: BaseValue::new(0),
+		}),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&dict_bp),
+		Some(EncodingComputeEvaluatorKind::DictionaryBitPacked)
+	);
+
+	let dict_lz4 = EncodingCascade::Dictionary {
+		dict_byte_len: RecordBodyByteLen::new(16),
+		dict_value_count: DictValueCount::new(4),
+		inner: Box::new(EncodingLeafCascade::Lz4Frame),
+	};
+	assert_eq!(evaluator_kind_for_cascade(&dict_lz4), None);
+
+	let delta_bp = EncodingCascade::Delta {
+		base: BaseValue::new(0),
+		inner: Box::new(EncodingLeafCascade::BitPacked {
+			bits: BitsPerValue::new(8),
+			base: BaseValue::new(0),
+		}),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&delta_bp),
+		Some(EncodingComputeEvaluatorKind::Delta)
+	);
+
+	// Delta inner is byte-irrelevant at the encoder
+	// (encode_delta_bytes / decode_delta_bytes ignore inner; Delta
+	// dispatch is full-buffer grain regardless of inner). All three
+	// variants route to the Delta evaluator.
+	let delta_plain = EncodingCascade::Delta {
+		base: BaseValue::new(0),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&delta_plain),
+		Some(EncodingComputeEvaluatorKind::Delta)
+	);
+
+	let delta_lz4 = EncodingCascade::Delta {
+		base: BaseValue::new(0),
+		inner: Box::new(EncodingLeafCascade::Lz4Frame),
+	};
+	assert_eq!(
+		evaluator_kind_for_cascade(&delta_lz4),
+		Some(EncodingComputeEvaluatorKind::Delta)
+	);
+
+	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Plain), None);
+	assert_eq!(
+		evaluator_kind_for_cascade(&EncodingCascade::Lz4Frame),
+		None
+	);
+}
+
+#[test]
+fn delta_inner_variants_produce_byte_identical_encoded_frames() {
+	// The COCD evaluator catalog accepts any Delta inner because the
+	// encoder ignores the inner field (encode_delta_bytes does not take
+	// inner) and Delta dispatch is full-buffer grain regardless. This
+	// guard pins the byte-equivalence invariant: if the encoder ever
+	// starts differentiating Delta variants by inner, this test fires
+	// and forces a council review of the catalog change.
+	let rows = 256_usize;
+	let mut decoded = Vec::with_capacity(rows * 8);
+	for row in 0..rows {
+		let value = (row as i64) * 7;
+		decoded.extend_from_slice(&value.to_le_bytes());
+	}
+	let inners = [
+		EncodingLeafCascade::Plain,
+		EncodingLeafCascade::BitPacked {
+			bits: BitsPerValue::new(8),
+			base: BaseValue::new(0),
+		},
+		EncodingLeafCascade::Lz4Frame,
+	];
+	let mut prior: Option<Vec<u8>> = None;
+	for inner in inners {
+		let cascade = EncodingCascade::Delta {
+			base: BaseValue::new(0),
+			inner: Box::new(inner),
+		};
+		let encoded = encode_buffer(
+			&decoded,
+			&DataType::Int64,
+			cascade,
+			BufferValueCount::new(rows as u32),
+			SimdPageValueCount::new(256),
+		)
+		.expect("delta encode");
+		if let Some(reference) = prior.as_ref() {
+			assert_eq!(
+				&encoded.bytes, reference,
+				"Delta encoded bytes must be inner-irrelevant; \
+				 if this fires, the COCD catalog needs council review"
+			);
+		} else {
+			prior = Some(encoded.bytes);
+		}
+	}
 }
 
 #[test]

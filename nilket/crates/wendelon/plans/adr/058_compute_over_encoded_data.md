@@ -38,7 +38,7 @@ V1 substrate commitments:
 - **closed predicate evaluator catalog (6 kinds)**:
   `BitPacked`, `Rle { inner: Plain | BitPacked }`,
   `Dictionary { inner: Plain | BitPacked }`,
-  `Delta { inner: BitPacked }` (full atom set, full-buffer
+  `Delta { .. }` (any inner; full atom set, full-buffer
   grain). `Plain`, `Lz4Frame`, `Fsst`, `Alp` cascades fall
   back to materialize-then-evaluate;
 - **closed predicate-atom catalog**: `Eq`, `Neq`, `Gt`,
@@ -249,8 +249,12 @@ ADR 058 ships **only** the COCD substrate:
      buffer-grain; range atoms accepted on fixed-width only;
    - `Dictionary { inner: BitPacked }` — full atom set,
      page-grain; range atoms accepted on fixed-width only;
-   - `Delta { inner: BitPacked }` — full atom set,
-     full-buffer grain (no page emission for Delta).
+   - `Delta { .. }` (any inner) — full atom set, full-buffer
+     grain (no page emission for Delta). The inner field is
+     byte-irrelevant for Delta — `encode_delta_bytes` /
+     `decode_delta_bytes` ignore it — and dispatch grain is
+     always full-buffer, so the catalog accepts any inner
+     uniformly.
 
 2. Closed predicate-atom catalog:
    `Eq`, `Neq`, `Gt`, `Gte`, `Lt`, `Lte`, `InList`, `IsNull`,
@@ -415,8 +419,7 @@ Rle { inner: Lz4Frame }            → DenseFallback
 Dictionary { inner: Plain }        → DictionaryPlain      (buffer-grain)
 Dictionary { inner: BitPacked }    → DictionaryBitPacked  (page-grain)
 Dictionary { inner: Lz4Frame }     → DenseFallback
-Delta { inner: BitPacked }         → Delta                (full-buffer)
-Delta { inner: Plain | Lz4Frame }  → DenseFallback
+Delta { .. } (any inner)           → Delta                (full-buffer)
 Fsst                               → DenseFallback
 Alp                                → DenseFallback
 ```
