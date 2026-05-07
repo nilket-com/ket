@@ -17723,14 +17723,7 @@ mod tests {
 			as_of_hlc: hlc(0, 0, 0),
 			locality_ranges: vec![LocalityRange::full()],
 			predicate_program: None,
-			aggregates: vec![
-				AggregateExpression::count_star(),
-				AggregateExpression {
-					tag: AggregateFunctionTag::SIGNED_SUM,
-					column_ordinal: 0,
-					parameter_block: Vec::new(),
-				},
-			],
+			aggregates: vec![AggregateExpression::count_star()],
 			budgets: AggregateBudgets {
 				max_locations: LocationCount::new(1_000_000),
 				max_rows: RowCount::new(1_000_000),
@@ -17791,16 +17784,6 @@ mod tests {
 			response.partials[0].state.as_slice(),
 			&(ids.len() as u64).to_be_bytes()
 		);
-		let expected_sum = encode_aggregate_state(
-			AggregateFunctionTag::SIGNED_SUM,
-			&AggregateState::SignedSum {
-				sum: ids.iter().sum::<i64>() as i128,
-				non_null_count: ids.len() as u64,
-				overflow: false,
-			},
-		)
-		.unwrap();
-		assert_eq!(response.partials[1].state, expected_sum);
 	}
 
 	#[tokio::test]

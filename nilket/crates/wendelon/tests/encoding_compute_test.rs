@@ -13,8 +13,8 @@ use wendelon::schema::{
 	RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount, TableObjectId,
 	TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
 };
-use wendelon::storage::encoding::cascade::encode_buffer;
 use wendelon::schema::{DictValueCount, RunCount};
+use wendelon::storage::encoding::cascade::encode_buffer;
 use wendelon::storage::encoding::{
 	BufferEncoding, EncodedAggregateContext, EncodedAggregateKind, EncodedPredicateNode,
 	EncodedRowMask, EncodingCascade, EncodingComputeConfig, EncodingComputeEvaluatorKind,
@@ -27,7 +27,7 @@ use wendelon::storage::encoding::{
 #[test]
 fn encoding_compute_config_defaults_are_locked() {
 	let config = EncodingComputeConfig::default();
-	assert!(!config.enabled);
+	assert!(config.enabled);
 	assert_eq!(config.max_dict_match_set_size.get(), 4_096);
 	assert_eq!(config.min_buffer_rows_for_encoded_eval.get(), 256);
 	assert_eq!(config.max_parallel_kernel_tasks.get(), 4);
@@ -40,6 +40,11 @@ fn encoding_compute_config_defaults_are_locked() {
 	assert_eq!(config.min_prefilter_rejection_micros.get(), 100_000);
 	assert!(config.validate().is_ok());
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::BitPacked));
+	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryPlain));
+	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryBitPacked));
+	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Delta));
+	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RlePlain));
+	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RleBitPacked));
 	assert!(config.aggregate_kernel_enabled(EncodedAggregateKind::CountStar));
 	assert_eq!(
 		aggregate_kind_for_tag(AggregateFunctionTag::QUANTILE_KLL),
@@ -175,10 +180,7 @@ fn evaluator_kind_for_cascade_routes_unsupported_inners_to_dense_fallback() {
 	);
 
 	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Plain), None);
-	assert_eq!(
-		evaluator_kind_for_cascade(&EncodingCascade::Lz4Frame),
-		None
-	);
+	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Lz4Frame), None);
 }
 
 #[test]

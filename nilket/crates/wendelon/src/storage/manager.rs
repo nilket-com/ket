@@ -79,10 +79,11 @@ use crate::storage::core::{
 use crate::storage::encoding::cascade::decode_page;
 use crate::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedPredicateNode, EncodedRowMask, EncodingComputeFallbackReason,
-	EncodingComputeRejectCode, PredicateAtom, aggregate_kind_for_tag, coerce_literal,
-	decode_encoded_buffer, encoded_leaf_selectivity_allowed, encoded_predicate_node_from_tree,
-	evaluate as evaluate_encoded_predicate, evaluate_validity_bitmap, evaluator_kind_for_cascade,
-	try_fold_encoded_aggregate_request,
+	EncodingComputeRejectCode, NativeEvaluationEligibility, PredicateAtom, aggregate_kind_for_tag,
+	coerce_literal, decode_encoded_buffer, encoded_leaf_selectivity_allowed,
+	encoded_predicate_node_from_tree, evaluate as evaluate_encoded_predicate,
+	evaluate_validity_bitmap, evaluator_kind_for_cascade, native_aggregate_cascade_eligible,
+	native_evaluation_eligibility, try_fold_encoded_aggregate_request,
 };
 use crate::storage::encoding::materialize::find_buffer_encoding;
 use crate::storage::encoding::page::expand_page_descriptors;
@@ -8840,7 +8841,7 @@ impl SlabManager {
 					)
 				})?;
 				context = context
-					.with_encoded_column(
+					.with_native_encoded_column(
 						fetch.column,
 						fetch.data_type.clone(),
 						&encoded,
@@ -10616,7 +10617,9 @@ fn build_encoding_compute_phase_b_plan(
 		for (leaf_index, leaf) in leaves.iter().enumerate() {
 			match leaf {
 				EncodingComputePhaseBLeaf::Encoded {
+					atom,
 					column_index,
+					data_type,
 					physical_ordinal,
 					..
 				} => {
@@ -10650,6 +10653,15 @@ fn build_encoding_compute_phase_b_plan(
 					let evaluator = evaluator_kind_for_cascade(cascade)
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
 					if !config.predicate_evaluator_enabled(evaluator) {
+						return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+					}
+					let Some(coercion) = coerce_literal(atom.literal.as_ref(), data_type) else {
+						return Err(EncodingComputeFallbackReason::UnsupportedProgram);
+					};
+					if matches!(
+						native_evaluation_eligibility(cascade, atom, &coercion),
+						NativeEvaluationEligibility::DecodeScalarFallback
+					) {
 						return Err(EncodingComputeFallbackReason::UnsupportedCascade);
 					}
 					encoded_pages =
@@ -10823,6 +10835,9 @@ fn build_encoding_compute_aggregate_plan(
 			.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
 		if evaluator_kind_for_cascade(cascade).is_none() {
 			return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+		}
+		if !native_aggregate_cascade_eligible(&function, field.data_type(), Some(cascade)) {
+			return Err(EncodingComputeFallbackReason::AggregateUnsupported);
 		}
 		pages_fetched = pages_fetched.saturating_add(encoding.page_end_offsets.len().max(1) as u64);
 		if pages_fetched > u64::from(config.max_encoded_pages_per_record.get()) {

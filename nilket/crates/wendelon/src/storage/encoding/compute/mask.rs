@@ -85,12 +85,21 @@ impl EncodedRowMask {
 			Self::All { rows } => rows.get(),
 			Self::None { .. } => 0,
 			Self::Bitmap { rows, bytes } => {
-				let mut selected = 0_u64;
 				let rows = rows_as_usize(*rows)?;
-				for row in 0..rows {
-					if bitmap_get(bytes, row) {
-						selected = selected.saturating_add(1);
-					}
+				let full_bytes = rows / 8;
+				let mut selected = bytes
+					.get(..full_bytes)
+					.ok_or(EncodingComputeRejectCode::MaskLengthMismatch)?
+					.iter()
+					.map(|byte| u64::from(byte.count_ones()))
+					.sum::<u64>();
+				let tail_bits = rows % 8;
+				if tail_bits != 0 {
+					let Some(byte) = bytes.get(full_bytes) else {
+						return Err(EncodingComputeRejectCode::MaskLengthMismatch);
+					};
+					let mask = (1_u8 << tail_bits) - 1;
+					selected = selected.saturating_add(u64::from((byte & mask).count_ones()));
 				}
 				selected
 			}
@@ -122,8 +131,14 @@ impl EncodedRowMask {
 			Self::Bitmap { rows, bytes } => {
 				let rows = rows_as_usize(*rows)?;
 				let mut out = Vec::with_capacity(rows);
-				for row in 0..rows {
-					out.push(bitmap_get(bytes, row));
+				for byte in bytes {
+					let remaining = rows.saturating_sub(out.len());
+					if remaining == 0 {
+						break;
+					}
+					for bit in 0..remaining.min(8) {
+						out.push(byte & (1_u8 << bit) != 0);
+					}
 				}
 				Ok(out)
 			}
@@ -177,14 +192,40 @@ impl EncodedRowMask {
 	}
 
 	pub fn and(&self, rhs: &Self) -> Result<Self, EncodingComputeRejectCode> {
-		self.combine(rhs, |left, right| left && right)
+		self.same_rows(rhs)?;
+		match (self, rhs) {
+			(Self::None { rows }, _) | (_, Self::None { rows }) => Ok(Self::None { rows: *rows }),
+			(Self::All { .. }, other) | (other, Self::All { .. }) => Ok(other.clone()),
+			(Self::Bitmap { rows, bytes: left }, Self::Bitmap { bytes: right, .. }) => {
+				self.combine_bitmap(*rows, left, right, |left, right| left & right)
+			}
+			_ => self.combine_bool(rhs, |left, right| left && right),
+		}
 	}
 
 	pub fn or(&self, rhs: &Self) -> Result<Self, EncodingComputeRejectCode> {
-		self.combine(rhs, |left, right| left || right)
+		self.same_rows(rhs)?;
+		match (self, rhs) {
+			(Self::All { rows }, _) | (_, Self::All { rows }) => Ok(Self::All { rows: *rows }),
+			(Self::None { .. }, other) | (other, Self::None { .. }) => Ok(other.clone()),
+			(Self::Bitmap { rows, bytes: left }, Self::Bitmap { bytes: right, .. }) => {
+				self.combine_bitmap(*rows, left, right, |left, right| left | right)
+			}
+			_ => self.combine_bool(rhs, |left, right| left || right),
+		}
 	}
 
 	pub fn not(&self) -> Result<Self, EncodingComputeRejectCode> {
+		match self {
+			Self::All { rows } => return Ok(Self::None { rows: *rows }),
+			Self::None { rows } => return Ok(Self::All { rows: *rows }),
+			Self::Bitmap { rows, bytes } => {
+				let mut bytes = bytes.iter().map(|byte| !byte).collect::<Vec<_>>();
+				mask_tail_bits(*rows, &mut bytes)?;
+				return bitmap_mask(*rows, bytes);
+			}
+			Self::Runs { .. } => {}
+		}
 		let values = self
 			.to_bool_vec()?
 			.into_iter()
@@ -193,14 +234,39 @@ impl EncodedRowMask {
 		Ok(Self::from_bool_slice(&values))
 	}
 
-	fn combine(
+	fn same_rows(&self, rhs: &Self) -> Result<(), EncodingComputeRejectCode> {
+		if self.rows() != rhs.rows() {
+			return Err(EncodingComputeRejectCode::MaskLengthMismatch);
+		}
+		Ok(())
+	}
+
+	fn combine_bitmap(
+		&self,
+		rows: RowCount,
+		left: &[u8],
+		right: &[u8],
+		op: impl Fn(u8, u8) -> u8,
+	) -> Result<Self, EncodingComputeRejectCode> {
+		let expected = bitmap_byte_len(rows)?;
+		if left.len() != expected || right.len() != expected {
+			return Err(EncodingComputeRejectCode::MaskLengthMismatch);
+		}
+		let mut bytes = left
+			.iter()
+			.zip(right)
+			.map(|(left, right)| op(*left, *right))
+			.collect::<Vec<_>>();
+		mask_tail_bits(rows, &mut bytes)?;
+		bitmap_mask(rows, bytes)
+	}
+
+	fn combine_bool(
 		&self,
 		rhs: &Self,
 		op: impl Fn(bool, bool) -> bool,
 	) -> Result<Self, EncodingComputeRejectCode> {
-		if self.rows() != rhs.rows() {
-			return Err(EncodingComputeRejectCode::MaskLengthMismatch);
-		}
+		self.same_rows(rhs)?;
 		let left = self.to_bool_vec()?;
 		let right = rhs.to_bool_vec()?;
 		let values = left
@@ -230,4 +296,37 @@ fn bitmap_set(bytes: &mut [u8], row: usize) {
 	let byte = &mut bytes[row / 8];
 	let bit = row % 8;
 	*byte |= 1_u8 << bit;
+}
+
+fn bitmap_mask(
+	rows: RowCount,
+	bytes: Vec<u8>,
+) -> Result<EncodedRowMask, EncodingComputeRejectCode> {
+	let rows_usize = rows_as_usize(rows)?;
+	let mut any = false;
+	let mut all = true;
+	for row in 0..rows_usize {
+		let selected = bitmap_get(&bytes, row);
+		any |= selected;
+		all &= selected;
+	}
+	Ok(if all {
+		EncodedRowMask::All { rows }
+	} else if !any {
+		EncodedRowMask::None { rows }
+	} else {
+		EncodedRowMask::Bitmap { rows, bytes }
+	})
+}
+
+fn mask_tail_bits(rows: RowCount, bytes: &mut [u8]) -> Result<(), EncodingComputeRejectCode> {
+	let rows_usize = rows_as_usize(rows)?;
+	let tail_bits = rows_usize % 8;
+	if tail_bits == 0 {
+		return Ok(());
+	}
+	if let Some(last) = bytes.last_mut() {
+		*last &= (1_u8 << tail_bits) - 1;
+	}
+	Ok(())
 }

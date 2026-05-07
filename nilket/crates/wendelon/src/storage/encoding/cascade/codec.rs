@@ -18,6 +18,195 @@ pub struct EncodedBuffer {
 	pub page_end_offsets: Vec<EncodingPageByteOffset>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BitPackedFrame<'a> {
+	pub encoded: &'a [u8],
+	pub bits: u8,
+	pub base: u128,
+	pub value_width: usize,
+	pub value_count: usize,
+	pub decoded_byte_len: usize,
+}
+
+impl BitPackedFrame<'_> {
+	pub(crate) fn unpack_values(&self) -> Result<Vec<u128>, EncodingRejectCode> {
+		let mask = if self.bits == 64 {
+			u128::from(u64::MAX)
+		} else {
+			(1_u128 << self.bits) - 1
+		};
+		let mut out = Vec::with_capacity(self.value_count);
+		let mut acc = 0_u128;
+		let mut acc_bits = 0_u8;
+		let mut cursor = 0_usize;
+		while out.len() < self.value_count {
+			while acc_bits < self.bits {
+				let Some(byte) = self.encoded.get(cursor) else {
+					return Err(EncodingRejectCode::DecodedLengthMismatch);
+				};
+				acc |= u128::from(*byte) << acc_bits;
+				acc_bits += 8;
+				cursor += 1;
+			}
+			out.push(self.base.saturating_add(acc & mask));
+			acc >>= self.bits;
+			acc_bits -= self.bits;
+		}
+		Ok(out)
+	}
+
+	pub(crate) fn decode_bytes(&self) -> Result<Vec<u8>, EncodingRejectCode> {
+		let values = self.unpack_values()?;
+		let mut out = Vec::with_capacity(self.decoded_byte_len);
+		for value in values {
+			write_low_u128_bytes(&mut out, value, self.value_width);
+		}
+		Ok(out)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DictionaryIndexEncoding {
+	Plain { width: usize },
+	BitPacked { bits: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FixedWidthDictionaryFrame<'a> {
+	pub value_width: usize,
+	pub value_count: usize,
+	pub dict_count: usize,
+	pub dictionary: &'a [u8],
+	pub index_encoding: DictionaryIndexEncoding,
+	pub index_payload: &'a [u8],
+}
+
+impl FixedWidthDictionaryFrame<'_> {
+	pub(crate) fn indices(&self) -> Result<Vec<usize>, EncodingRejectCode> {
+		match self.index_encoding {
+			DictionaryIndexEncoding::BitPacked { bits } => {
+				unpack_dictionary_indices(self.index_payload, self.value_count, bits)
+			}
+			DictionaryIndexEncoding::Plain { width } => {
+				let expected = self
+					.value_count
+					.checked_mul(width)
+					.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+				if self.index_payload.len() != expected {
+					return Err(EncodingRejectCode::DecodedLengthMismatch);
+				}
+				let mut indices = Vec::with_capacity(self.value_count);
+				for bytes in self.index_payload.chunks_exact(width) {
+					indices.push(read_dictionary_index(bytes, width)?);
+				}
+				Ok(indices)
+			}
+		}
+	}
+
+	pub(crate) fn decode_bytes(&self) -> Result<Vec<u8>, EncodingRejectCode> {
+		let indices = self.indices()?;
+		let mut out = Vec::with_capacity(
+			self.value_count
+				.checked_mul(self.value_width)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?,
+		);
+		for index in indices {
+			let start = index
+				.checked_mul(self.value_width)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+			let end = start
+				.checked_add(self.value_width)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+			let Some(value) = self.dictionary.get(start..end) else {
+				return Err(EncodingRejectCode::DecodedLengthMismatch);
+			};
+			out.extend_from_slice(value);
+		}
+		Ok(out)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeltaFrame<'a> {
+	pub value_width: usize,
+	pub delta_width: usize,
+	pub value_count: usize,
+	pub first_value: i128,
+	pub deltas: &'a [u8],
+}
+
+impl DeltaFrame<'_> {
+	pub(crate) fn values(&self) -> Result<Vec<i128>, EncodingRejectCode> {
+		let mut values = Vec::with_capacity(self.value_count);
+		values.push(self.first_value);
+		let mut value = self.first_value;
+		for delta_bytes in self.deltas.chunks_exact(self.delta_width) {
+			let delta = read_signed_delta(delta_bytes, self.delta_width)?;
+			value = value
+				.checked_add(delta)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+			values.push(value);
+		}
+		if values.len() != self.value_count {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		Ok(values)
+	}
+
+	pub(crate) fn decode_bytes(&self) -> Result<Vec<u8>, EncodingRejectCode> {
+		let values = self.values()?;
+		let mut out = Vec::with_capacity(
+			self.value_count
+				.checked_mul(self.value_width)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?,
+		);
+		for value in values {
+			write_low_bytes(&mut out, value, self.value_width);
+		}
+		Ok(out)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RleByteRun {
+	pub run_len: usize,
+	pub byte: u8,
+}
+
+pub(crate) struct RleByteRunIter<'a> {
+	encoded: &'a [u8],
+	cursor: usize,
+}
+
+impl<'a> RleByteRunIter<'a> {
+	pub(crate) fn new(encoded: &'a [u8]) -> Self {
+		Self { encoded, cursor: 0 }
+	}
+}
+
+impl Iterator for RleByteRunIter<'_> {
+	type Item = Result<RleByteRun, EncodingRejectCode>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.cursor == self.encoded.len() {
+			return None;
+		}
+		if self.encoded.len().saturating_sub(self.cursor) < 5 {
+			self.cursor = self.encoded.len();
+			return Some(Err(EncodingRejectCode::DecodedLengthMismatch));
+		}
+		let run_len = u32::from_be_bytes(
+			self.encoded[self.cursor..self.cursor + 4]
+				.try_into()
+				.expect("fixed width"),
+		) as usize;
+		let byte = self.encoded[self.cursor + 4];
+		self.cursor += 5;
+		Some(Ok(RleByteRun { run_len, byte }))
+	}
+}
+
 impl EncodedBuffer {
 	pub fn encoded_range(&self) -> EncodedBufferByteRange {
 		EncodedBufferByteRange {
@@ -542,23 +731,19 @@ fn decode_rle_bytes(
 	let expected = usize::try_from(expected_byte_len.get())
 		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
 	let mut out = Vec::with_capacity(expected);
-	let mut cursor = 0_usize;
-	while cursor < encoded.len() {
-		if encoded.len().saturating_sub(cursor) < 5 {
-			return Err(EncodingRejectCode::DecodedLengthMismatch);
-		}
-		let run = u32::from_be_bytes(encoded[cursor..cursor + 4].try_into().expect("fixed width"))
-			as usize;
-		let byte = encoded[cursor + 4];
-		cursor += 5;
+	for run in RleByteRunIter::new(encoded) {
+		let run = run?;
 		let end = out
 			.len()
-			.checked_add(run)
+			.checked_add(run.run_len)
 			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
 		if end > expected {
 			return Err(EncodingRejectCode::DecodedLengthMismatch);
 		}
-		out.resize(end, byte);
+		out.resize(end, run.byte);
+	}
+	if out.len() != expected {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
 	Ok(out)
 }
@@ -976,12 +1161,102 @@ fn decode_dictionary_bytes(
 	decode_byte_dictionary_bytes(encoded, expected_byte_len)
 }
 
+pub(crate) fn parse_fixed_width_dictionary_frame<'a>(
+	encoded: &'a [u8],
+	expected_byte_len: RecordBodyByteLen,
+	expected_value_count: BufferValueCount,
+	inner: &EncodingLeafCascade,
+) -> Result<FixedWidthDictionaryFrame<'a>, EncodingRejectCode> {
+	if encoded.len() < 14 {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let bitpacked = encoded.starts_with(b"WDB2");
+	if !bitpacked && !encoded.starts_with(b"WDD1") {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let value_width = encoded[4] as usize;
+	let index_width_or_bits = encoded[5] as usize;
+	if !matches!(value_width, 1 | 2 | 4 | 8) {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let index_encoding = if bitpacked {
+		if !matches!(inner, EncodingLeafCascade::BitPacked { .. }) {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		if !(1..=32).contains(&index_width_or_bits) {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		DictionaryIndexEncoding::BitPacked {
+			bits: index_width_or_bits as u8,
+		}
+	} else {
+		if !matches!(inner, EncodingLeafCascade::Plain) {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		if !matches!(index_width_or_bits, 1 | 2 | 4) {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		DictionaryIndexEncoding::Plain {
+			width: index_width_or_bits,
+		}
+	};
+	let expected = usize::try_from(expected_byte_len.get())
+		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
+	let value_count = u32::from_be_bytes(encoded[6..10].try_into().expect("fixed width")) as usize;
+	let dict_count = u32::from_be_bytes(encoded[10..14].try_into().expect("fixed width")) as usize;
+	if value_count != expected_value_count.get() as usize
+		|| value_count.checked_mul(value_width) != Some(expected)
+	{
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let dict_byte_len = dict_count
+		.checked_mul(value_width)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	let dict_start = 14_usize;
+	let dict_end = dict_start
+		.checked_add(dict_byte_len)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if dict_end > encoded.len() {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let index_payload = &encoded[dict_end..];
+	let expected_index_len = match index_encoding {
+		DictionaryIndexEncoding::BitPacked { bits } => value_count
+			.checked_mul(bits as usize)
+			.map(|bits| bits.div_ceil(8))
+			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?,
+		DictionaryIndexEncoding::Plain { width } => value_count
+			.checked_mul(width)
+			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?,
+	};
+	if index_payload.len() != expected_index_len {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	Ok(FixedWidthDictionaryFrame {
+		value_width,
+		value_count,
+		dict_count,
+		dictionary: &encoded[dict_start..dict_end],
+		index_encoding,
+		index_payload,
+	})
+}
+
 fn decode_fixed_width_dictionary_bytes(
 	encoded: &[u8],
 	expected_byte_len: RecordBodyByteLen,
 	expected_value_count: BufferValueCount,
 	inner: &EncodingLeafCascade,
 ) -> Result<Vec<u8>, EncodingRejectCode> {
+	if encoded.starts_with(b"WDD1") || encoded.starts_with(b"WDB2") {
+		return parse_fixed_width_dictionary_frame(
+			encoded,
+			expected_byte_len,
+			expected_value_count,
+			inner,
+		)?
+		.decode_bytes();
+	}
 	if encoded.len() < 14 {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
@@ -1279,54 +1554,68 @@ fn encode_delta_bytes(
 	Ok(out)
 }
 
-fn decode_delta_bytes(
+pub(crate) fn parse_delta_frame(
 	encoded: &[u8],
 	expected_byte_len: RecordBodyByteLen,
-) -> Result<Vec<u8>, EncodingRejectCode> {
+) -> Result<DeltaFrame<'_>, EncodingRejectCode> {
 	let expected = usize::try_from(expected_byte_len.get())
 		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
 	if expected == 0 {
-		return Ok(Vec::new());
+		if encoded.is_empty() {
+			return Ok(DeltaFrame {
+				value_width: 1,
+				delta_width: 1,
+				value_count: 0,
+				first_value: 0,
+				deltas: &[],
+			});
+		}
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
 	if encoded.len() < 26 || &encoded[..4] != b"WDL1" {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	let width = encoded[4] as usize;
+	let value_width = encoded[4] as usize;
 	let delta_width = encoded[5] as usize;
-	if !matches!(width, 1 | 2 | 4 | 8) || !matches!(delta_width, 1 | 2 | 4 | 8 | 16) {
+	if !matches!(value_width, 1 | 2 | 4 | 8) || !matches!(delta_width, 1 | 2 | 4 | 8 | 16) {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	if expected % width != 0 {
+	if expected % value_width != 0 {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	let count = u32::from_be_bytes(encoded[6..10].try_into().expect("fixed width")) as usize;
-	if count != expected / width {
+	let value_count = u32::from_be_bytes(encoded[6..10].try_into().expect("fixed width")) as usize;
+	if value_count != expected / value_width {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	let mut cursor = 10_usize;
-	let mut value = i128::from_le_bytes(
-		encoded[cursor..cursor + 16]
-			.try_into()
-			.expect("fixed width"),
-	);
-	cursor += 16;
-	let mut out = Vec::with_capacity(expected);
-	write_low_bytes(&mut out, value, width);
-	for _ in 1..count {
-		if encoded.len().saturating_sub(cursor) < delta_width {
-			return Err(EncodingRejectCode::DecodedLengthMismatch);
-		}
-		let delta = read_signed_delta(&encoded[cursor..cursor + delta_width], delta_width)?;
-		cursor += delta_width;
-		value = value
-			.checked_add(delta)
-			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
-		write_low_bytes(&mut out, value, width);
-	}
-	if cursor != encoded.len() || out.len() != expected {
+	let deltas_len = value_count
+		.saturating_sub(1)
+		.checked_mul(delta_width)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	let deltas_start = 26_usize;
+	let deltas_end = deltas_start
+		.checked_add(deltas_len)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if deltas_end != encoded.len() {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	Ok(out)
+	let first_value = i128::from_le_bytes(encoded[10..26].try_into().expect("fixed width"));
+	Ok(DeltaFrame {
+		value_width,
+		delta_width,
+		value_count,
+		first_value,
+		deltas: &encoded[deltas_start..deltas_end],
+	})
+}
+
+fn decode_delta_bytes(
+	encoded: &[u8],
+	expected_byte_len: RecordBodyByteLen,
+) -> Result<Vec<u8>, EncodingRejectCode> {
+	if expected_byte_len.get() == 0 {
+		return Ok(Vec::new());
+	}
+	parse_delta_frame(encoded, expected_byte_len)?.decode_bytes()
 }
 
 fn read_unsigned_le_as_i128(bytes: &[u8]) -> i128 {
@@ -1430,6 +1719,57 @@ fn encode_bitpacked_bytes(
 	Ok(out)
 }
 
+pub(crate) fn parse_bitpacked_frame<'a>(
+	encoded: &'a [u8],
+	bits: BitsPerValue,
+	base: BaseValue,
+	expected_byte_len: RecordBodyByteLen,
+	expected_value_count: BufferValueCount,
+) -> Result<BitPackedFrame<'a>, EncodingRejectCode> {
+	let decoded_byte_len = usize::try_from(expected_byte_len.get())
+		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
+	let bits = bits.get();
+	if bits == 0 || bits > 64 {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let value_count = expected_value_count.get() as usize;
+	if value_count == 0 {
+		if encoded.is_empty() && decoded_byte_len == 0 {
+			return Ok(BitPackedFrame {
+				encoded,
+				bits,
+				base: u128::try_from(base.get()).unwrap_or(0),
+				value_width: 1,
+				value_count,
+				decoded_byte_len,
+			});
+		}
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	if decoded_byte_len % value_count != 0 {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let value_width = decoded_byte_len / value_count;
+	if !matches!(value_width, 1 | 2 | 4 | 8) {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let expected_encoded_len = value_count
+		.checked_mul(bits as usize)
+		.map(|bits| bits.div_ceil(8))
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if encoded.len() != expected_encoded_len {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	Ok(BitPackedFrame {
+		encoded,
+		bits,
+		base: u128::try_from(base.get()).unwrap_or(0),
+		value_width,
+		value_count,
+		decoded_byte_len,
+	})
+}
+
 fn decode_bitpacked_bytes(
 	encoded: &[u8],
 	bits: BitsPerValue,
@@ -1470,31 +1810,14 @@ fn decode_bitpacked_bytes(
 	if encoded.len() != expected_encoded_len {
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
-	let mask = if bits == 64 {
-		u128::from(u64::MAX)
-	} else {
-		(1_u128 << bits) - 1
-	};
-	let base = u128::try_from(base.get()).unwrap_or(0);
-	let mut out = Vec::with_capacity(expected);
-	let mut acc = 0_u128;
-	let mut acc_bits = 0_u8;
-	let mut cursor = 0_usize;
-	while out.len() < expected {
-		while acc_bits < bits {
-			let Some(byte) = encoded.get(cursor) else {
-				return Err(EncodingRejectCode::DecodedLengthMismatch);
-			};
-			acc |= u128::from(*byte) << acc_bits;
-			acc_bits += 8;
-			cursor += 1;
-		}
-		let value = base.saturating_add(acc & mask);
-		write_low_u128_bytes(&mut out, value, width);
-		acc >>= bits;
-		acc_bits -= bits;
-	}
-	Ok(out)
+	parse_bitpacked_frame(
+		encoded,
+		BitsPerValue::new(bits),
+		base,
+		expected_byte_len,
+		expected_value_count,
+	)?
+	.decode_bytes()
 }
 
 fn read_unsigned_le_as_u128(bytes: &[u8]) -> u128 {
@@ -1523,5 +1846,185 @@ fn write_low_u128_bytes(out: &mut Vec<u8>, value: u128, width: usize) {
 			let bytes = value.to_le_bytes();
 			out.extend_from_slice(&bytes[..width]);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bitpacked_frame_parser_matches_decoder() {
+		for bits in [1_u8, 2, 4, 7, 8, 12, 16, 31, 32, 63, 64] {
+			let mask = if bits == 64 {
+				u64::MAX
+			} else {
+				(1_u64 << bits) - 1
+			};
+			let values = (0..64_u64).map(|value| value & mask).collect::<Vec<_>>();
+			let decoded = values
+				.iter()
+				.flat_map(|value| value.to_le_bytes())
+				.collect::<Vec<_>>();
+			let encoded = encode_bitpacked_bytes(
+				&decoded,
+				BitsPerValue::new(bits),
+				BaseValue::ZERO,
+				BufferValueCount::new(values.len() as u32),
+			)
+			.expect("bitpacked encode");
+			let frame = parse_bitpacked_frame(
+				&encoded,
+				BitsPerValue::new(bits),
+				BaseValue::ZERO,
+				RecordBodyByteLen::new(decoded.len() as u64),
+				BufferValueCount::new(values.len() as u32),
+			)
+			.expect("bitpacked frame");
+			assert_eq!(frame.decode_bytes().expect("frame decode"), decoded);
+			assert_eq!(
+				decode_bitpacked_bytes(
+					&encoded,
+					BitsPerValue::new(bits),
+					BaseValue::ZERO,
+					RecordBodyByteLen::new(decoded.len() as u64),
+					BufferValueCount::new(values.len() as u32),
+				)
+				.expect("decode"),
+				decoded
+			);
+		}
+	}
+
+	#[test]
+	fn fixed_width_dictionary_frame_parser_matches_decoder() {
+		let values = [7_u32, 9, 7, 11, 9, 13, 7, 13];
+		let decoded = values
+			.iter()
+			.flat_map(|value| value.to_le_bytes())
+			.collect::<Vec<_>>();
+		let plain = encode_fixed_width_dictionary_bytes(
+			&decoded,
+			4,
+			BufferValueCount::new(values.len() as u32),
+			&EncodingLeafCascade::Plain,
+		)
+		.expect("plain dictionary encode");
+		let frame = parse_fixed_width_dictionary_frame(
+			&plain,
+			RecordBodyByteLen::new(decoded.len() as u64),
+			BufferValueCount::new(values.len() as u32),
+			&EncodingLeafCascade::Plain,
+		)
+		.expect("plain dictionary frame");
+		assert_eq!(frame.value_width, 4);
+		assert_eq!(frame.value_count, values.len());
+		assert_eq!(frame.dict_count, 4);
+		assert_eq!(frame.indices().expect("plain indices").len(), values.len());
+		assert_eq!(frame.decode_bytes().expect("plain decode"), decoded);
+
+		let bitpacked_inner = EncodingLeafCascade::BitPacked {
+			bits: BitsPerValue::new(2),
+			base: BaseValue::ZERO,
+		};
+		let bitpacked = encode_fixed_width_dictionary_bytes(
+			&decoded,
+			4,
+			BufferValueCount::new(values.len() as u32),
+			&bitpacked_inner,
+		)
+		.expect("bitpacked dictionary encode");
+		let frame = parse_fixed_width_dictionary_frame(
+			&bitpacked,
+			RecordBodyByteLen::new(decoded.len() as u64),
+			BufferValueCount::new(values.len() as u32),
+			&bitpacked_inner,
+		)
+		.expect("bitpacked dictionary frame");
+		assert!(matches!(
+			frame.index_encoding,
+			DictionaryIndexEncoding::BitPacked { bits: 2 }
+		));
+		assert_eq!(frame.decode_bytes().expect("bitpacked decode"), decoded);
+
+		let truncated = &plain[..plain.len() - 1];
+		assert_eq!(
+			parse_fixed_width_dictionary_frame(
+				truncated,
+				RecordBodyByteLen::new(decoded.len() as u64),
+				BufferValueCount::new(values.len() as u32),
+				&EncodingLeafCascade::Plain,
+			)
+			.unwrap_err(),
+			EncodingRejectCode::DecodedLengthMismatch
+		);
+	}
+
+	#[test]
+	fn delta_frame_parser_matches_decoder() {
+		let values = [10_i64, 13, 12, 20, 20];
+		let decoded = values
+			.iter()
+			.flat_map(|value| value.to_le_bytes())
+			.collect::<Vec<_>>();
+		let encoded = encode_delta_bytes(&decoded, BufferValueCount::new(values.len() as u32))
+			.expect("delta encode");
+		let frame = parse_delta_frame(&encoded, RecordBodyByteLen::new(decoded.len() as u64))
+			.expect("delta frame");
+		assert_eq!(frame.value_width, 8);
+		assert_eq!(frame.value_count, values.len());
+		assert_eq!(
+			frame.values().expect("delta values"),
+			values
+				.iter()
+				.map(|value| i128::from(*value))
+				.collect::<Vec<_>>()
+		);
+		assert_eq!(frame.decode_bytes().expect("delta decode"), decoded);
+		assert_eq!(
+			parse_delta_frame(
+				&encoded[..encoded.len() - 1],
+				RecordBodyByteLen::new(decoded.len() as u64)
+			)
+			.unwrap_err(),
+			EncodingRejectCode::DecodedLengthMismatch
+		);
+	}
+
+	#[test]
+	fn rle_byte_run_iterator_matches_decoder() {
+		let decoded = [1_u8, 1, 1, 2, 2, 3];
+		let encoded = encode_rle_bytes(&decoded).expect("rle encode");
+		let runs = RleByteRunIter::new(&encoded)
+			.collect::<Result<Vec<_>, _>>()
+			.expect("rle runs");
+		assert_eq!(
+			runs,
+			vec![
+				RleByteRun {
+					run_len: 3,
+					byte: 1
+				},
+				RleByteRun {
+					run_len: 2,
+					byte: 2
+				},
+				RleByteRun {
+					run_len: 1,
+					byte: 3
+				},
+			]
+		);
+		assert_eq!(
+			decode_rle_bytes(&encoded, RecordBodyByteLen::new(decoded.len() as u64))
+				.expect("rle decode"),
+			decoded
+		);
+		assert_eq!(
+			RleByteRunIter::new(&[0_u8, 1, 2])
+				.collect::<Result<Vec<_>, _>>()
+				.unwrap_err(),
+			EncodingRejectCode::DecodedLengthMismatch
+		);
 	}
 }

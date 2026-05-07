@@ -7,10 +7,16 @@ Companion implementation plan:
 
 ## Status
 
-Council-converged and design-promoted. Implementation
-phases pending; full Phase 10 bench evidence at
+Council-converged, implemented, and promoted to shipped.
+Full Phase 10 bench evidence at
 `plans/impl/059_native_cocd_kernels_bench_results.md`
-is the promotion-to-shipped gate.
+clears the promotion-to-shipped gate for the narrowed
+default evaluator set. Phase 12 flips
+`EncodingComputeConfig::default().enabled = true`, omits
+`RlePlain` / `RleBitPacked` from the default predicate
+allow-list, and relies on pre-kernel eligibility for
+non-byte-aligned BitPacked, higher-cardinality Dictionary,
+and cascade-grain aggregate exclusions.
 
 Closes ADR 058's promote-to-default follow-up. Opens on
 top of ADR 058's Phase 8 substrate bench artifact
@@ -148,16 +154,17 @@ catalog; `EncodedRowMask` tagged enum (`All` / `None` /
 fallback-reason enum; bounded
 `storage_l2_encoding_compute_*` metric family; ADR 052
 secondary-index COCD confirm-step; ~27 architectural
-lockdown guards. Substrate ships disabled by default
-under V1 because the V1 evaluator decodes through
-ADR 057's deterministic decoder and runs a scalar
-predicate / fold loop with `EncodedRowMask` allocation
-on top — i.e., the substrate currently *pays* the
-materialize cost ADR 058 was designed to skip, plus the
-overhead of running encoded-mask bookkeeping on top.
-The result is correct, byte-neutral, and architecture-
-locked; it is also slower than dense micro on the
-representative cascade matrix.
+lockdown guards. The substrate initially shipped disabled
+by default because the V1 evaluator decoded through ADR
+057's deterministic decoder and ran a scalar predicate /
+fold loop with `EncodedRowMask` allocation on top — i.e.,
+it paid the materialize cost ADR 058 was designed to skip,
+plus the overhead of running encoded-mask bookkeeping on
+top. The Phase 8 substrate result was correct, byte-neutral,
+and architecture-locked; it was also slower than dense micro
+on the representative cascade matrix. ADR 059's Phase 10
+evidence is the promotion artifact that flips the narrowed
+native set on by default.
 
 The per-cascade kernel modules
 (`src/storage/encoding/compute/kernels/{bitpacked, rle,
@@ -176,11 +183,13 @@ The promote-to-default gate that ADR 058 pinned
 `BitPacked` / `Rle` / `Dictionary` fixtures at low
 selectivity, plus ≥ 2× vs dense AGG on representative
 aggregate fixtures, plus ≤ 5% dense-fallback overhead)
-is the load-bearing artifact ADR 059 produces. Until
-that gate clears, `enabled = false` is the right
-default, and any future Toron-adjacent work composes
-more cleanly on top of an enabled-by-default COCD
-substrate than alongside a disabled-by-default one.
+is the load-bearing artifact ADR 059 produces. The gate
+cleared for a narrowed default set: BitPacked `UInt8`,
+low-cardinality Dictionary, and Delta predicate paths;
+RLE and non-promoted sublanes remain behind the allow-list
+and pre-kernel eligibility layers. Future Toron-adjacent
+work now composes on top of an enabled-by-default COCD
+substrate for that measured set.
 
 Constraints carry forward unchanged: ADR 003, ADR 016,
 ADR 020, ADR 022, ADR 029, ADR 030, ADR 035, ADR 036,
@@ -651,33 +660,20 @@ default-on decision; revision requires bench evidence
 and explicit council disposition recorded in the bench
 artifact.
 
-## Open questions
+## Bench-Settled Questions
 
-Two empirical questions remain live; they settle on
-Phase bench evidence rather than design.
+Two empirical questions were intentionally left to Phase 10
+bench evidence rather than settled by design preference.
 
-**1. RLE byte-run native viability.** Can native
-streaming over the existing byte-run RLE frame meet the
-2× gate? Phase 6 implementation lands the byte-run
-streaming kernel; Phase 10 bench evidence settles. If
-gate misses substantially, the `RlePlain` /
-`RleBitPacked` evaluator kinds are omitted from the
-default `enabled_predicate_evaluators` allow-list; a
-separate follow-up ADR considers an ADR 057 value-run
-format change. ADR 059 does not pre-commit to either
-branch; the bench artifact is the input to the
-decision.
+**1. RLE byte-run native viability.** Native streaming over
+the existing byte-run RLE frame did not meet the 2x gate.
+`RlePlain` / `RleBitPacked` are omitted from the default
+`enabled_predicate_evaluators` allow-list, and RLE value-run
+format work remains a separate follow-up ADR candidate.
 
-**2. Delta default-set inclusion.** Non-monotonic Delta
-streams have no short-circuit advantage; substrate-
-relative speedup comes only from avoiding the
-intermediate decoded buffer, which may not clear 2× on
-its own. Phase 5 implementation lands; Phase 10 bench
-answers. If Delta misses substantially, Delta evaluator
-ships disabled by default via the §8 mechanism;
-readers continue to dispatch Delta through the
-substrate decode-then-scalar path even with
-`enabled = true` for the other cascades.
+**2. Delta default-set inclusion.** Delta predicate kernels
+cleared the 2x predicate gate across the measured tiers and
+remain in the default predicate allow-list.
 
 A residual placement preference from the council
 process: Gemini iter 3 preferred the bench artifact at
@@ -774,12 +770,12 @@ promotion commit to point at the landed bench file.
 ## Convergence summary
 
 ```text
-ADR 058 substrate (decode-then-scan, disabled by default)
-  → native per-cascade kernels + promotion gate    (ADR 059)  ← here
-  → enabled-by-default on representative cascades
+ADR 058 substrate (decode-then-scan, initially disabled)
+  → native per-cascade kernels + promotion gate    (ADR 059)
+  → enabled-by-default on the narrowed native set   ← here
   → next Toron-adjacent follow-up (sparse Phase-C narrowing,
     page-level min/max stats, FSST evaluator, RLE value-run
-    format if Open Q1 lands that way) — own ADRs
+    format after Phase 10 miss evidence) — own ADRs
   → capacity-tier compression / serverless / EC     (rest of #15)
 ```
 
@@ -807,5 +803,6 @@ ADR 059 promotes from design-promoted to shipped when:
    follow-up).
 6. Architectural lockdown guards land per §11.
 
-Until those criteria land, ADR 059 is design-promoted
-with implementation phases pending.
+Those criteria landed in the ADR 059 promotion changeset;
+ADR 059 is shipped/default-enabled for the narrowed default
+set documented in the bench artifact.

@@ -181,7 +181,7 @@ pub struct EncodingComputeConfig {
 impl Default for EncodingComputeConfig {
 	fn default() -> Self {
 		Self {
-			enabled: false,
+			enabled: true,
 			max_dict_match_set_size: DictMatchSetSize::new(
 				ENCODING_COMPUTE_MAX_DICT_MATCH_SET_SIZE_DEFAULT,
 			),
@@ -203,7 +203,14 @@ impl Default for EncodingComputeConfig {
 			min_prefilter_rejection_micros: SelectivityFractionMicros::new(
 				ENCODING_COMPUTE_MIN_PREFILTER_REJECTION_MICROS_DEFAULT,
 			),
-			enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL.into_iter().collect(),
+			enabled_predicate_evaluators: [
+				EncodingComputeEvaluatorKind::BitPacked,
+				EncodingComputeEvaluatorKind::DictionaryPlain,
+				EncodingComputeEvaluatorKind::DictionaryBitPacked,
+				EncodingComputeEvaluatorKind::Delta,
+			]
+			.into_iter()
+			.collect(),
 			enabled_aggregate_kernels: EncodedAggregateKind::ALL.into_iter().collect(),
 		}
 	}

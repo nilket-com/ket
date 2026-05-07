@@ -1,7 +1,7 @@
 //! ADR 058 compute-over-encoded-data benchmark harness.
 //!
-//! `cargo bench --bench encoding_compute` for the full small / medium /
-//! large cascade matrix; `--quick` for a single 8,192-row pass against
+//! `cargo bench --bench encoding_compute` for the full 8K / 65K / 1M
+//! cascade matrix; `--quick` for a single 8,192-row pass against
 //! the substrate floor.
 //!
 //! Layout: each fixture wraps an encoded buffer plus its dense decoded
@@ -27,6 +27,7 @@ use arrow::record_batch::RecordBatch;
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use wendelon::crypto::TieredPlaintextRange;
 use wendelon::schema::aggregate::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 };
@@ -35,10 +36,10 @@ use wendelon::schema::{
 	AggregateRequest, AggregateRequestId, BaseValue, BitsPerValue, BufferValueCount, Consistency,
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, Identity, IpcBufferIndex,
 	IpcColumnOrdinal, Locality, LocalityPolicyV1, LogicalSchemaFingerprint,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
-	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount,
-	RowGroupIndex, RowGroupRowCount, RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1,
-	SimdPageValueCount, SlabId, TableObjectId, TableSchemaDescriptorV1, TenantId,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
+	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
+	TableObjectId, TableSchemaDescriptorV1, TenantId,
 };
 use wendelon::storage::encoding::cascade::{decode_buffer, decode_page, encode_buffer};
 use wendelon::storage::encoding::compute::{
@@ -55,7 +56,6 @@ use wendelon::storage::{
 	encode_multirow_from_survivors_with_row_group_and_encoding_config,
 	parse_record_buffer_directory, selected_row_group_record_body_ranges,
 };
-use wendelon::crypto::TieredPlaintextRange;
 
 const PAGE_VALUES: u32 = 256;
 
@@ -114,7 +114,7 @@ impl BenchConfig {
 			}
 		} else {
 			Self {
-				rows: vec![8_192, 65_536, 262_144],
+				rows: vec![8_192, 65_536, 1_048_576],
 				iterations: 200,
 			}
 		}
@@ -569,8 +569,8 @@ fn bench_mixed_prefilter(config: &BenchConfig, fixture: &Fixture) -> std::io::Re
 		("low_reject", 240_i64, "~95%"),
 	] {
 		let atom_a = int_atom(PredicateAtomOp::Lt, lt_literal);
-		let coercion_a = coerce_literal(atom_a.literal.as_ref(), &fixture.data_type)
-			.expect("bench coerce A");
+		let coercion_a =
+			coerce_literal(atom_a.literal.as_ref(), &fixture.data_type).expect("bench coerce A");
 		let elapsed = bench(config.iterations, || {
 			let mask_a = evaluate(
 				black_box(&fixture.encoded),
@@ -611,11 +611,11 @@ fn bench_mixed_dense_fallback(config: &BenchConfig, fixture: &Fixture) -> std::i
 	// rows, then boolean combine. Plus the (A OR B) DenseFallback
 	// shape, which encoded-narrowing of A cannot help safely.
 	let atom_a = int_atom(PredicateAtomOp::Lt, 13_i64);
-	let coercion_a = coerce_literal(atom_a.literal.as_ref(), &fixture.data_type)
-		.expect("bench coerce A");
+	let coercion_a =
+		coerce_literal(atom_a.literal.as_ref(), &fixture.data_type).expect("bench coerce A");
 	let atom_b = int_atom(PredicateAtomOp::Gte, 100_i64);
-	let coercion_b = coerce_literal(atom_b.literal.as_ref(), &fixture.data_type)
-		.expect("bench coerce B");
+	let coercion_b =
+		coerce_literal(atom_b.literal.as_ref(), &fixture.data_type).expect("bench coerce B");
 	for (label, op_label, op) in [
 		("mixed_dense_fallback_and", "AND", true),
 		("mixed_dense_fallback_or", "OR", false),
@@ -764,9 +764,7 @@ fn bench_config_kernel_disabled(config: &BenchConfig, fixture: &Fixture) -> std:
 	let elapsed = bench(config.iterations, || {
 		let kind = evaluator_kind_for_cascade(black_box(&fixture.cascade));
 		let allowed = kind
-			.map(|k| {
-				black_box(&config_disabled).predicate_evaluator_enabled(black_box(k))
-			})
+			.map(|k| black_box(&config_disabled).predicate_evaluator_enabled(black_box(k)))
 			.unwrap_or(false);
 		let coercion = coerce_literal(
 			black_box(fixture.atom.literal.as_ref()),
@@ -933,8 +931,14 @@ fn bench_mask_algebra(config: &BenchConfig, fixtures: &[Fixture]) -> std::io::Re
 		.find(|f| f.name == "bp_u8")
 		.expect("bp_u8 fixture present");
 	let bp_coercion = coerce_literal(bp.atom.literal.as_ref(), &bp.data_type).expect("coerce");
-	let bitmap_a = evaluate(&bp.encoded, &bp.encoding, &bp.cascade, &bp.atom, &bp_coercion)
-		.expect("bench bp mask");
+	let bitmap_a = evaluate(
+		&bp.encoded,
+		&bp.encoding,
+		&bp.cascade,
+		&bp.atom,
+		&bp_coercion,
+	)
+	.expect("bench bp mask");
 	let bitmap_b = bitmap_a.not().expect("bench bp not");
 	let bp_rows = bp.rows;
 	let all_mask = EncodedRowMask::All {
@@ -1090,7 +1094,9 @@ fn bench_aggregate_value_kernel(config: &BenchConfig, fixture: &Fixture) -> std:
 		.aggregate_kind
 		.expect("aggregate_value_kernel requires aggregate_kind");
 	let (label, tag) = match kind {
-		AggregateKind::UnsignedSum => ("aggregate_unsigned_sum", AggregateFunctionTag::UNSIGNED_SUM),
+		AggregateKind::UnsignedSum => {
+			("aggregate_unsigned_sum", AggregateFunctionTag::UNSIGNED_SUM)
+		}
 		AggregateKind::SignedSum => ("aggregate_signed_sum", AggregateFunctionTag::SIGNED_SUM),
 	};
 	let request = aggregate_request_count_star_plus(tag);
@@ -1196,11 +1202,33 @@ fn bench_selectivity_sweep(config: &BenchConfig, rows: usize) -> std::io::Result
 }
 
 fn aggregate_context_for(fixture: &Fixture) -> EncodedAggregateContext {
-	EncodedAggregateContext::new(RowCount::new(fixture.rows as u64)).with_decoded_column(
-		0,
-		fixture.aggregate_column_dtype.clone(),
-		fixture.decoded.clone(),
-	)
+	let context = EncodedAggregateContext::new(RowCount::new(fixture.rows as u64));
+	if matches!(
+		fixture.cascade,
+		EncodingCascade::BitPacked { .. }
+			| EncodingCascade::Dictionary { .. }
+			| EncodingCascade::Delta { .. }
+			| EncodingCascade::Rle { .. }
+	) {
+		return context
+			.with_native_encoded_column(
+				0,
+				fixture.aggregate_column_dtype.clone(),
+				&fixture.encoded,
+				&fixture.encoding,
+				&fixture.cascade,
+			)
+			.expect("bench aggregate native encoded context");
+	}
+	context
+		.with_encoded_column(
+			0,
+			fixture.aggregate_column_dtype.clone(),
+			&fixture.encoded,
+			&fixture.encoding,
+			&fixture.cascade,
+		)
+		.expect("bench aggregate decoded context")
 }
 
 fn aggregate_request_count_star() -> AggregateRequest {
@@ -1528,9 +1556,9 @@ fn build_pipeline_fixture_shape(
 
 fn bench_pipeline(config: &BenchConfig, rows: usize) -> std::io::Result<()> {
 	// The MultiRow layout caps records at 8 MiB; the pipeline fixture's
-	// dual-Int64 schema at 262_144 rows overflows that. The bench hits
+	// dual-Int64 schema at 1M rows overflows that. The bench hits
 	// 8K and 65K for end-to-end shape; the per-fixture predicate /
-	// mask / aggregate rows already cover 262K for substrate floor.
+	// mask / aggregate rows already cover 1M for substrate floor.
 	if rows > 65_536 {
 		return Ok(());
 	}
@@ -1823,6 +1851,9 @@ fn bench_provider_leak(fixture: &PipelineFixture) -> std::io::Result<()> {
 }
 
 fn bench(iterations: usize, mut f: impl FnMut()) -> Duration {
+	for _ in 0..iterations.min(5) {
+		f();
+	}
 	let started = Instant::now();
 	for _ in 0..iterations {
 		f();

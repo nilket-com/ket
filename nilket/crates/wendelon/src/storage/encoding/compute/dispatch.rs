@@ -1,8 +1,12 @@
 use crate::schema::{BufferValueCount, RecordBodyByteLen};
 use crate::storage::encoding::cascade::decode_buffer;
+use crate::storage::encoding::compute::kernels::scalar::{
+	MaskBuilder, read_unsigned_le_as_u128, signed_predicate, signed_value_from_le_bytes,
+	unsigned_predicate,
+};
 use crate::storage::encoding::compute::{
 	EncodedRowMask, EncodingComputeEvaluatorKind, EncodingComputeRejectCode, LiteralCoercion,
-	LiteralValue, PredicateAtom, PredicateAtomOp,
+	LiteralValue, PredicateAtom, PredicateAtomOp, kernels,
 };
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::{
@@ -12,6 +16,57 @@ use arrow::datatypes::DataType;
 use std::cmp::Ordering;
 
 pub fn evaluate(
+	encoded_bytes: &[u8],
+	encoding: &BufferEncoding,
+	cascade: &EncodingCascade,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> Result<EncodedRowMask, EncodingComputeRejectCode> {
+	if encoding.decoded_value_count.get() == 0 {
+		return evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion);
+	}
+	match native_evaluation_eligibility(cascade, atom, coercion) {
+		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::BitPacked) => {
+			let EncodingCascade::BitPacked { bits, base } = cascade else {
+				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+			};
+			kernels::bitpacked::evaluate_predicate(
+				encoded_bytes,
+				encoding,
+				*bits,
+				*base,
+				atom,
+				coercion,
+			)
+		}
+		NativeEvaluationEligibility::Eligible(
+			EncodingComputeEvaluatorKind::DictionaryPlain
+			| EncodingComputeEvaluatorKind::DictionaryBitPacked,
+		) => {
+			let EncodingCascade::Dictionary { inner, .. } = cascade else {
+				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+			};
+			kernels::dictionary::evaluate_predicate(
+				encoded_bytes,
+				encoding,
+				inner.as_ref(),
+				atom,
+				coercion,
+			)
+		}
+		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::Delta) => {
+			kernels::delta::evaluate_predicate(encoded_bytes, encoding, atom, coercion)
+		}
+		NativeEvaluationEligibility::Eligible(
+			EncodingComputeEvaluatorKind::RlePlain | EncodingComputeEvaluatorKind::RleBitPacked,
+		) => kernels::rle::evaluate_predicate(encoded_bytes, encoding, atom, coercion),
+		NativeEvaluationEligibility::DecodeScalarFallback => {
+			evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion)
+		}
+	}
+}
+
+pub fn evaluate_decode_scalar(
 	encoded_bytes: &[u8],
 	encoding: &BufferEncoding,
 	cascade: &EncodingCascade,
@@ -42,12 +97,145 @@ pub fn evaluate_decoded(
 		.literal
 		.as_ref()
 		.ok_or(EncodingComputeRejectCode::KernelDecodedLengthMismatch)?;
+	if let Some(mask) = evaluate_decoded_fixed_width_integer(
+		decoded_bytes,
+		rows,
+		&coercion.data_type,
+		atom,
+		literal,
+	)? {
+		return Ok(mask);
+	}
 	let values = decoded_scalars(decoded_bytes, rows, &coercion.data_type)?;
 	let selected = values
 		.iter()
 		.map(|value| evaluate_scalar(value, atom.op, literal))
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok(EncodedRowMask::from_bool_slice(&selected))
+}
+
+fn evaluate_decoded_fixed_width_integer(
+	decoded_bytes: &[u8],
+	rows: usize,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	literal: &LiteralValue,
+) -> Result<Option<EncodedRowMask>, EncodingComputeRejectCode> {
+	let Some(width) = fixed_width_integer_bytes(data_type) else {
+		return Ok(None);
+	};
+	if decoded_bytes.len()
+		!= rows
+			.checked_mul(width)
+			.ok_or(EncodingComputeRejectCode::KernelDecodedLengthMismatch)?
+	{
+		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+	}
+	let mut selected = MaskBuilder::with_rows(rows);
+	if fixed_width_integer_is_unsigned(data_type) {
+		let predicate = unsigned_predicate(atom.op, literal)?;
+		push_unsigned_decoded_mask(decoded_bytes, width, &predicate, &mut selected)?;
+		return selected.finish().map(Some);
+	}
+	let predicate = signed_predicate(atom.op, literal)?;
+	push_signed_decoded_mask(decoded_bytes, width, data_type, &predicate, &mut selected)?;
+	selected.finish().map(Some)
+}
+
+fn push_unsigned_decoded_mask(
+	decoded_bytes: &[u8],
+	width: usize,
+	predicate: &crate::storage::encoding::compute::kernels::scalar::UnsignedPredicate,
+	selected: &mut MaskBuilder,
+) -> Result<(), EncodingComputeRejectCode> {
+	let mut cursor = 0_usize;
+	while cursor < decoded_bytes.len() && selected.len() % 8 != 0 {
+		selected.push(predicate.evaluate(read_unsigned_le_as_u128(
+			&decoded_bytes[cursor..cursor + width],
+		)))?;
+		cursor += width;
+	}
+	while cursor + (8 * width) <= decoded_bytes.len() {
+		let mut mask = 0_u8;
+		for lane in 0..8 {
+			let start = cursor + lane * width;
+			if predicate.evaluate(read_unsigned_le_as_u128(
+				&decoded_bytes[start..start + width],
+			)) {
+				mask |= 1_u8 << lane;
+			}
+		}
+		selected.push_aligned_bitmap_byte(mask, 8)?;
+		cursor += 8 * width;
+	}
+	while cursor < decoded_bytes.len() {
+		selected.push(predicate.evaluate(read_unsigned_le_as_u128(
+			&decoded_bytes[cursor..cursor + width],
+		)))?;
+		cursor += width;
+	}
+	Ok(())
+}
+
+fn push_signed_decoded_mask(
+	decoded_bytes: &[u8],
+	width: usize,
+	data_type: &DataType,
+	predicate: &crate::storage::encoding::compute::kernels::scalar::SignedPredicate,
+	selected: &mut MaskBuilder,
+) -> Result<(), EncodingComputeRejectCode> {
+	let mut cursor = 0_usize;
+	while cursor < decoded_bytes.len() && selected.len() % 8 != 0 {
+		selected.push(predicate.evaluate(signed_value_from_le_bytes(
+			&decoded_bytes[cursor..cursor + width],
+			data_type,
+		)?))?;
+		cursor += width;
+	}
+	while cursor + (8 * width) <= decoded_bytes.len() {
+		let mut mask = 0_u8;
+		for lane in 0..8 {
+			let start = cursor + lane * width;
+			if predicate.evaluate(signed_value_from_le_bytes(
+				&decoded_bytes[start..start + width],
+				data_type,
+			)?) {
+				mask |= 1_u8 << lane;
+			}
+		}
+		selected.push_aligned_bitmap_byte(mask, 8)?;
+		cursor += 8 * width;
+	}
+	while cursor < decoded_bytes.len() {
+		selected.push(predicate.evaluate(signed_value_from_le_bytes(
+			&decoded_bytes[cursor..cursor + width],
+			data_type,
+		)?))?;
+		cursor += width;
+	}
+	Ok(())
+}
+
+fn fixed_width_integer_bytes(data_type: &DataType) -> Option<usize> {
+	match data_type {
+		DataType::Int8 | DataType::UInt8 => Some(1),
+		DataType::Int16 | DataType::UInt16 => Some(2),
+		DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Time32(_) => Some(4),
+		DataType::Int64
+		| DataType::UInt64
+		| DataType::Date64
+		| DataType::Time64(_)
+		| DataType::Timestamp(_, _)
+		| DataType::Duration(_) => Some(8),
+		_ => None,
+	}
+}
+
+fn fixed_width_integer_is_unsigned(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+	)
 }
 
 pub fn evaluator_kind_for_cascade(
@@ -74,6 +262,61 @@ pub fn evaluator_kind_for_cascade(
 		| EncodingCascade::Lz4Frame
 		| EncodingCascade::Fsst { .. }
 		| EncodingCascade::Alp { .. } => None,
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeEvaluationEligibility {
+	Eligible(EncodingComputeEvaluatorKind),
+	DecodeScalarFallback,
+}
+
+pub(crate) fn native_evaluation_eligibility(
+	cascade: &EncodingCascade,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> NativeEvaluationEligibility {
+	if matches!(
+		atom.op,
+		PredicateAtomOp::IsNull | PredicateAtomOp::IsNotNull
+	) || coercion.literal.is_none()
+	{
+		return NativeEvaluationEligibility::DecodeScalarFallback;
+	}
+	let Some(kind) = evaluator_kind_for_cascade(cascade) else {
+		return NativeEvaluationEligibility::DecodeScalarFallback;
+	};
+	if !native_value_type_supported(&coercion.data_type) {
+		return NativeEvaluationEligibility::DecodeScalarFallback;
+	}
+	if !native_predicate_cascade_eligible(cascade, &coercion.data_type) {
+		return NativeEvaluationEligibility::DecodeScalarFallback;
+	}
+	NativeEvaluationEligibility::Eligible(kind)
+}
+
+fn native_predicate_cascade_eligible(cascade: &EncodingCascade, data_type: &DataType) -> bool {
+	match cascade {
+		EncodingCascade::BitPacked { bits, .. } => {
+			matches!(data_type, DataType::UInt8) && bits.get() == 8
+		}
+		EncodingCascade::Dictionary {
+			dict_value_count,
+			inner,
+			..
+		} => {
+			dict_value_count.get() <= 4
+				&& match inner.as_ref() {
+					EncodingLeafCascade::Plain => true,
+					EncodingLeafCascade::BitPacked { bits, .. } => bits.get() <= 2,
+					EncodingLeafCascade::Lz4Frame => false,
+				}
+		}
+		EncodingCascade::Delta { .. } | EncodingCascade::Rle { .. } => true,
+		EncodingCascade::Plain
+		| EncodingCascade::Lz4Frame
+		| EncodingCascade::Fsst { .. }
+		| EncodingCascade::Alp { .. } => false,
 	}
 }
 
@@ -140,6 +383,26 @@ fn decoded_fixed_width_bytes_per_value(encoding: &BufferEncoding) -> Option<usiz
 		return None;
 	}
 	Some(bytes / values)
+}
+
+fn native_value_type_supported(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+			| DataType::Date32
+			| DataType::Date64
+			| DataType::Time32(_)
+			| DataType::Time64(_)
+			| DataType::Timestamp(_, _)
+			| DataType::Duration(_)
+	)
 }
 
 #[derive(Clone, Debug, PartialEq)]

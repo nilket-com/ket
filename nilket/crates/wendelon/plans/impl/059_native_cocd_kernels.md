@@ -16,10 +16,16 @@ Inherits ADR 058 Phase 8 substrate floor evidence:
 
 ## Status
 
-Council-converged and design-promoted. Implementation
-phases pending; full Phase 10 bench evidence at
-`plans/impl/059_native_cocd_kernels_bench_results.md` is
-the promotion-to-shipped gate.
+Council-converged, implemented, and promoted to shipped.
+Full Phase 10 bench evidence at
+`plans/impl/059_native_cocd_kernels_bench_results.md`
+clears the promotion-to-shipped gate for the narrowed
+default evaluator set. Phase 12 flips
+`EncodingComputeConfig::default().enabled = true`, omits
+`RlePlain` / `RleBitPacked` from the default predicate
+allow-list, and relies on pre-kernel eligibility for
+non-byte-aligned BitPacked, higher-cardinality Dictionary,
+and cascade-grain aggregate exclusions.
 
 Implementation contract locked at the council level:
 4 native predicate kernel families (BitPacked, Rle,
@@ -584,11 +590,11 @@ Bench rows:
 - row-aligned vs non-row-aligned byte-run cases.
 
 **Exit gate:** RLE kernel passes property suite.
-Bench evidence settles ADR Open Question 1. If gate
-misses substantially: the default `enabled_predicate_evaluators`
-allow-list omits `RlePlain` and/or `RleBitPacked`; a
-separate ADR considers ADR 057 value-run format
-follow-up.
+Bench evidence settles ADR Open Question 1. Phase 10
+evidence missed substantially, so the default
+`enabled_predicate_evaluators` allow-list omits both
+`RlePlain` and `RleBitPacked`; a separate ADR considers
+ADR 057 value-run format follow-up.
 
 ## Phase 7 — Mask algebra specialization
 
@@ -1043,16 +1049,17 @@ pins the import boundary). `std::arch` reserved as
 second-tier escalation.
 
 **RLE byte-run misses gate substantially.** Default
-`enabled_predicate_evaluators` omits `RlePlain` and/or
-`RleBitPacked`; follow-up ADR considers ADR 057
+`enabled_predicate_evaluators` omits both `RlePlain`
+and `RleBitPacked`; follow-up ADR considers ADR 057
 value-run format change. ADR 059 does not block on this;
-the substrate hierarchy still gains BitPacked +
-Dictionary (+ possibly Delta) speedups.
+the substrate hierarchy still gains BitPacked,
+Dictionary, and Delta predicate speedups.
 
-**Delta misses gate substantially.** Same shape —
-Delta disabled by default; non-monotonic Delta is the
-harder case; monotonic Delta (HLC-shape) is the more
-important workload.
+**Delta default inclusion.** Phase 10 evidence clears
+the predicate gate for Delta; it remains in the default
+predicate allow-list. Non-monotonic Delta remains the
+harder shape, and signed value aggregates are not part
+of the default aggregate route.
 
 **Property suite reveals byte-mismatch.** Substrate
 remains the oracle; native kernel iterates until

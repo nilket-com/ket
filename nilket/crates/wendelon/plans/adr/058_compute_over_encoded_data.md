@@ -7,9 +7,14 @@ Companion implementation plan:
 
 ## Status
 
-Council-converged and design-promoted. Implementation
-phases pending; full small / medium / large bench evidence
-is the promotion-to-shipped gate.
+Council-converged, implemented, and promoted after Phase 8
+substrate bench evidence at
+`plans/impl/058_compute_over_encoded_data_bench_results.md`.
+The COCD substrate now ships enabled by default for ADR 059's
+narrowed native-kernel set; RLE and non-promoted sublanes are
+excluded by the default predicate allow-list and pre-kernel
+eligibility. Native per-cascade promotion evidence lives at
+`plans/impl/059_native_cocd_kernels_bench_results.md`.
 
 Innermost layer of the storage hierarchy that ADR 056 (row
 groups) and ADR 057 (per-buffer pages + encoding cascades)
@@ -374,8 +379,9 @@ pub struct EncodingComputeConfig {
 }
 ```
 
-V1 deployment: ships with `enabled = false`; flipped on after
-Phase 8 bench acceptance. Cross-replica determinism (mask +
+V1 substrate initially shipped with `enabled = false`; ADR 059
+flips the default on for its narrowed native-kernel set after
+kernel-promotion bench acceptance. Cross-replica determinism (mask +
 aggregate-partial byte-equality given identical config +
 identical encoded bytes) holds trivially under deployment-
 wide config.
@@ -1217,12 +1223,12 @@ distinct regression cases:
   must reject enough rows to amortize the coordination
   cost of narrowing residual materialization.
 
-Aggregate folding has neither gate — the mask is the input,
-folding the mask + cascade values is strictly cheaper than
-materializing then folding. Aggregate folding has its own
-Phase 8 benchmark evidence and promotion-to-default gate
-(≥ 2× faster than dense AGG on representative fixtures once
-specialized kernels land).
+Aggregate folding has neither predicate gate — the mask is the
+input, folding the mask + cascade values is strictly cheaper
+than materializing then folding in the substrate model.
+Aggregate folding has its own promotion-to-default gate
+(≥ 2× faster than dense AGG on representative fixtures) under
+ADR 059's native-kernel evidence.
 
 ### Why Delta full atom set, full-buffer grain
 

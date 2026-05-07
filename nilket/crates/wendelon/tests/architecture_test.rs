@@ -4040,3 +4040,264 @@ fn test_adr058_encoding_compute_guards() {
 		violations.join("\n")
 	);
 }
+
+#[test]
+fn test_adr059_native_cocd_kernel_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let aggregate =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/aggregate.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let kernels_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/mod.rs"))
+			.unwrap();
+	let bitpacked =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/bitpacked.rs"))
+			.unwrap();
+	let dictionary =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/dictionary.rs"))
+			.unwrap();
+	let delta =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/delta.rs"))
+			.unwrap();
+	let rle = fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/rle.rs"))
+		.unwrap();
+	let validity =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/validity.rs"))
+			.unwrap();
+	let scalar =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/scalar.rs"))
+			.unwrap();
+	let mask =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mask.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let bench = fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let bench_artifact = fs::read_to_string(
+		manifest_dir.join("plans/impl/059_native_cocd_kernels_bench_results.md"),
+	)
+	.unwrap_or_default();
+
+	for required in [
+		"pub(crate) struct BitPackedFrame",
+		"pub(crate) struct FixedWidthDictionaryFrame",
+		"pub(crate) struct DeltaFrame",
+		"pub(crate) struct RleByteRun",
+		"pub(crate) fn parse_bitpacked_frame",
+		"pub(crate) fn parse_fixed_width_dictionary_frame",
+		"pub(crate) fn parse_delta_frame",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 059 parser token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub fn evaluate(",
+		"pub fn evaluate_decode_scalar",
+		"NativeEvaluationEligibility",
+		"kernels::bitpacked::evaluate_predicate",
+		"kernels::dictionary::evaluate_predicate",
+		"kernels::delta::evaluate_predicate",
+		"kernels::rle::evaluate_predicate",
+		"native_predicate_cascade_eligible",
+		"evaluate_decoded_fixed_width_integer",
+	] {
+		if !dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 059 dispatch token {required}"
+			));
+		}
+	}
+	if !compute_types.contains("enabled: true")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::BitPacked")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::DictionaryPlain")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::DictionaryBitPacked")
+		|| !compute_types.contains("EncodingComputeEvaluatorKind::Delta")
+		|| compute_types.contains("enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL")
+	{
+		violations.push(
+			"src/storage/encoding/compute/types.rs: ADR 059 promoted default must enable only the narrowed predicate allow-list"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub mod bitpacked;",
+		"pub mod delta;",
+		"pub mod dictionary;",
+		"pub mod rle;",
+		"pub mod scalar;",
+		"pub mod validity;",
+	] {
+		if !kernels_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/mod.rs: missing ADR 059 module token {required}"
+			));
+		}
+	}
+	for (path, source, required) in [
+		(
+			"bitpacked.rs",
+			bitpacked.as_str(),
+			[
+				"parse_bitpacked_frame",
+				"unsigned_predicate",
+				"signed_predicate",
+				"evaluate_u8_frame",
+				"chunks_exact",
+				"read_unsigned_le_as_u128",
+			]
+			.as_slice(),
+		),
+		(
+			"dictionary.rs",
+			dictionary.as_str(),
+			[
+				"parse_fixed_width_dictionary_frame",
+				"dictionary_matches",
+				"DictionaryIndexEncoding",
+				"push_index_match",
+			]
+			.as_slice(),
+		),
+		(
+			"delta.rs",
+			delta.as_str(),
+			[
+				"parse_delta_frame",
+				"try_push_monotonic_signed_range",
+				"checked_add",
+				"read_signed_delta",
+				"signed_value_from_u128",
+			]
+			.as_slice(),
+		),
+		(
+			"rle.rs",
+			rle.as_str(),
+			[
+				"RleByteRunIter",
+				"push_many",
+				"evaluate_lane",
+				"signed_value_from_le_bytes",
+			]
+			.as_slice(),
+		),
+	] {
+		for token in required {
+			if !source.contains(token) {
+				violations.push(format!(
+					"src/storage/encoding/compute/kernels/{path}: missing ADR 059 token {token}"
+				));
+			}
+		}
+	}
+	for required in [
+		"SignedPredicate",
+		"UnsignedPredicate",
+		"push_many",
+		"push_aligned_bitmap_byte",
+		"signed_value_from_le_bytes",
+		"unsigned_predicate",
+	] {
+		if !scalar.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/scalar.rs: missing ADR 059 scalar token {required}"
+			));
+		}
+	}
+	for required in [
+		"compose_value_mask_with_validity",
+		"evaluate_validity_bitmap",
+		"validity_bit",
+	] {
+		if !validity.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/validity.rs: missing ADR 059 validity token {required}"
+			));
+		}
+	}
+	for required in ["combine_bitmap", "mask_tail_bits", "combine_bool"] {
+		if !mask.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/mask.rs: missing ADR 059 mask algebra token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodedAggregateSource",
+		"fold_native_signed_sum",
+		"fold_native_unsigned_sum",
+		"fold_native_min_max",
+		"fold_signed_encoded_values",
+		"fold_unsigned_encoded_values",
+		"fold_signed_min_max_encoded_values",
+		"fold_unsigned_min_max_encoded_values",
+		"with_native_encoded_column",
+		"fold_unsigned_sum_no_validity",
+		"try_fold_native_masked_aggregate_request",
+		"AggregateMaskSelection",
+		"count_masked_dictionary_indices",
+		"for_selected_rows_in_page",
+		"bitpacked_value_at",
+		"dictionary_index_at",
+		"native_aggregate_cascade_eligible",
+		"native_unsigned_aggregate_cascade_eligible",
+	] {
+		if !aggregate.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/aggregate.rs: missing ADR 059 aggregate token {required}"
+			));
+		}
+	}
+	for required in [
+		"native_aggregate_cascade_eligible(&function, field.data_type(), Some(cascade))",
+		"native_evaluation_eligibility(cascade, atom, &coercion)",
+		"with_native_encoded_column",
+		"EncodingComputeFallbackReason::AggregateUnsupported",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 059 aggregate eligibility token {required}"
+			));
+		}
+	}
+	for required in [
+		"rows: vec![8_192, 65_536, 1_048_576]",
+		"cargo bench --bench encoding_compute",
+		"predicate_selectivity_sweep",
+		"aggregate_{kind_label}_selectivity_sweep",
+		"for _ in 0..iterations.min(5)",
+	] {
+		if !bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 059 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"default-set promotion gate **passed**",
+		"Promote ADR 059 to default-enabled with a narrowed default set.",
+		"RlePlain",
+		"native_aggregate_cascade_eligible(...)",
+		"cargo bench --bench encoding_compute",
+	] {
+		if !bench_artifact.contains(required) {
+			violations.push(format!(
+				"plans/impl/059_native_cocd_kernels_bench_results.md: missing ADR 059 evidence token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 059 native COCD kernel invariants violated:\n{}",
+		violations.join("\n")
+	);
+}

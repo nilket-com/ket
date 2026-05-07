@@ -20,42 +20,45 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 059 (Native Per-Cascade COCD Kernels)
-council-converged across four iterations and design-promoted.
-Closes ADR 058's promote-to-default follow-up. Implementation
-phases pending; full Phase 10 bench evidence at
-`plans/impl/059_native_cocd_kernels_bench_results.md` is the
-promotion-to-shipped gate. **Native predicate kernels** for
-the ADR 058 evaluator catalog (`BitPacked`, `Rle`,
-`Dictionary`, `Delta`) replace the substrate decode-then-scan
-body with cascade-aware specialization that operates directly
-on encoded bytes. **BitPacked**: byte-aligned fast path for
-`bits ∈ {8, 16, 32, 64}` (chunked little-endian
-`from_le_bytes` lane loads + auto-vec; no raw typed-
-slice cast — alignment- / endian-unsafe) and
-non-aligned packed-bit reader (32/64-value stack chunks).
-**Rle**: byte-run streaming over the existing ADR 057
-`(byte_run_len: u32, byte: u8)` format — no value-run format
-change inside ADR 059. **Dictionary**: WDD1 / WDB2 frame
-parse + match-set compilation + index walk; bounded
-membership bitmap by dictionary index for `4 < |S| ≤ 4_096`.
+council-converged, implemented, and promoted to shipped.
+Closes ADR 058's promote-to-default follow-up. Full Phase 10
+bench evidence at
+`plans/impl/059_native_cocd_kernels_bench_results.md`
+clears the narrowed default-set promotion gate. **Native
+predicate kernels** for the ADR 058 evaluator catalog
+(`BitPacked`, `Rle`, `Dictionary`, `Delta`) replace the
+substrate decode-then-scan body with cascade-aware
+specialization that operates directly on encoded bytes.
+**BitPacked**: byte-aligned `UInt8` fast path with aligned
+bitmap-byte emission for the default route; legal
+non-byte-aligned BitPacked sublanes remain behind pre-kernel
+eligibility and fall back to the fixed-width decode-scalar
+oracle unless explicitly enabled later. **Rle**: byte-run
+streaming over the existing ADR 057 `(byte_run_len: u32,
+byte: u8)` format landed, but Phase 10 evidence missed the
+2x default-inclusion gate; `RlePlain` / `RleBitPacked` are
+omitted from the default predicate allow-list. **Dictionary**:
+WDD1 / WDB2 frame parse + match-set compilation + index walk;
+low-cardinality Dictionary predicates clear the gate, while
+higher-cardinality sublanes fall back before kernel entry.
 **Delta**: WDL1 prefix-sum walk with monotonic-shape short-
-circuits derived from delta bytes (no ADR 057 directory
-extension). **Native aggregate fold for every (cascade × kind)
-pair ADR 058 already admits** — full coverage filtered by
-ADR 058's existing logical-type restrictions, zero new
-deferrals. **Closed-catalog discipline applies recursively**:
+circuits clears the predicate gate and remains in the default
+predicate allow-list. **Native aggregate folds** are
+implemented and oracle-checked, but default aggregate routing
+is narrowed by cascade-grain eligibility: count kernels remain
+enabled, and unsigned value aggregates default-route only for
+byte-aligned BitPacked `UInt8` and plain low-cardinality
+Dictionary. **Closed-catalog discipline applies recursively**:
 no new `EncodingComputeEvaluatorKind` /
 `EncodedAggregateKind` / `EncodingComputeRejectCode` /
 `EncodingComputeFallbackReason` / `PredicateAtomOp` /
 `EncodedRowMask` variants. **Two-step dispatch discipline**:
-pre-kernel eligibility may route legal-but-not-yet-native
-sublanes to the decode-then-scalar oracle; once a native
-kernel begins parsing encoded bytes, any invariant failure
-returns through ADR 058's existing reject taxonomy (fail-
-closed, no silent fallback). **Decode-then-scalar oracle**
-stays in production as the test oracle, the pre-kernel
-fallback for legal-but-not-yet-native sublanes, and the
-kill-switch target. **Central validity composition** in
+pre-kernel eligibility routes legal-but-not-promoted sublanes
+to the decode-then-scalar oracle; once a native kernel begins
+parsing encoded bytes, invariant failures return through ADR
+058's existing reject taxonomy. **Decode-then-scalar oracle**
+stays in production as the test oracle, fixed-width fallback,
+and kill-switch target. **Central validity composition** in
 `kernels/validity.rs`; kernel-local 3VL implementations
 rejected. **Specialized `EncodedRowMask` algebra** (no enum
 changes; bytewise `Bitmap` AND/OR/NOT, `Runs` merge/flip,
@@ -64,42 +67,20 @@ partial invariant** under `cargo test` for every (cascade ×
 atom × dtype × selectivity) combination. **SIMD strategy**:
 stable rustc; auto-vectorization via tight loops + block-
 unrolling + stack scratch; escalation route on bench miss is
-small SIMD helper crate first (e.g., `wide`, scoped to the
-affected kernel only) and target-feature `std::arch` second
-— no nightly, no Cargo feature gate, no operator-visible
-knob. Phase 4 (Dictionary) is the most-likely escalation
-trigger given indirect access patterns in bit-packed index
-walks. **Default evaluator set** encoded in two existing
-surfaces: pre-kernel eligibility (cascade grain;
-includes cascade-grain aggregate exclusion since
-`enabled_aggregate_kernels` is keyed by aggregate kind,
-not cascade) + the existing
-`enabled_predicate_evaluators` allow-list in
-`EncodingComputeConfig` (predicate-kind grain). No
-per-cascade `enabled_*` flag, no new operator surface.
-**Promotion gate**: ≥ 2× CPU vs end-to-end ADR 057 dense
-PBC (Phase B + C + D) on representative low-selectivity
-`BitPacked` / `Rle` / `Dictionary` fixtures (predicate);
-≥ 2× vs dense AGG on representative aggregate fixtures;
-≤ 5% dense-fallback overhead; mask + aggregate-partial
-byte-equality on every fixture; cross-replica determinism
-byte-identical; bench tiers 8K / 65K / 1M (1M mandatory);
-no native row slower than ADR 058 Phase 8 substrate floor
-(dense-micro shape) without documented council disposition.
-**Promotion flip**: `EncodingComputeConfig::default()` flips
-`enabled = true` in a dedicated commit alongside the bench
-artifact; any predicate-evaluator kind that missed the gate
-is omitted from the default
-`enabled_predicate_evaluators` allow-list, cascade-grain
-aggregate misses enforced by the eligibility layer; ADR 058
-§"Where we are" amends to point at the landed bench file in
-the same commit. Two empirical questions live: RLE byte-run
-viability and Delta default-set inclusion — both settle on
-Phase 10 bench, not pre-Phase planning. If RLE / Delta miss
-the gate substantially, those evaluator kinds are omitted
-from the default `enabled_predicate_evaluators` allow-list;
-a separate ADR considers ADR 057 RLE value-run format
-follow-up. See `plans/adr/059_native_cocd_kernels.md` and
+small SIMD helper crate first and target-feature `std::arch`
+second — no nightly, no Cargo feature gate, no operator-
+visible knob. **Default evaluator set** is encoded in two
+existing surfaces: pre-kernel eligibility (cascade grain;
+includes cascade-grain aggregate exclusion because
+`enabled_aggregate_kernels` is keyed by aggregate kind, not
+cascade) plus the existing `enabled_predicate_evaluators`
+allow-list in `EncodingComputeConfig` (predicate-kind grain).
+No per-cascade `enabled_*` flag, no new operator surface.
+**Promotion flip landed**: `EncodingComputeConfig::default()`
+now sets `enabled = true`; the default predicate allow-list
+contains `BitPacked`, `DictionaryPlain`,
+`DictionaryBitPacked`, and `Delta`, and omits RLE. See
+`plans/adr/059_native_cocd_kernels.md` and
 `plans/impl/059_native_cocd_kernels.md`.
 
 ADR 058 (Compute Over Encoded Data, COCD)
@@ -108,9 +89,10 @@ promoted after Phase 8 substrate bench evidence. Native
 per-cascade kernels (BitPacked SIMD, Rle run-grain, Dictionary
 match-set + index walk, Delta prefix-sum) and the ≥ 2x CPU
 promote-to-default gate are now the **ADR 059** follow-up
-scope; the substrate ships disabled by default and
-correctness-first under V1, awaiting the kernel-promotion
-artifact at
+scope; ADR 059's narrowed native set is now enabled by default,
+with RLE and non-promoted sublanes excluded by the predicate
+allow-list and pre-kernel eligibility. Kernel-promotion evidence
+landed at
 `plans/impl/059_native_cocd_kernels_bench_results.md`.
 Innermost layer of the storage hierarchy ADR 056 / ADR 057
 established.
@@ -572,7 +554,8 @@ forward shape continues at #16.
 14. **Compute over encoded data (COCD)** — ADR 058
     promoted after Phase 8 substrate bench evidence.
     Council-converged across six iterations, implemented,
-    and disabled by default under V1.
+    and now enabled by default for ADR 059's narrowed
+    native-kernel set.
     Innermost layer of the storage hierarchy. Closed
     6-variant predicate evaluator catalog (`BitPacked`,
     `RlePlain`, `RleBitPacked`, `DictionaryPlain`,
@@ -610,25 +593,28 @@ forward shape continues at #16.
     See *Where we are*.
 
 15. **Native per-cascade COCD kernels** — ADR 059
-    council-converged across four iterations and design-
-    promoted. Closes ADR 058's promote-to-default
-    follow-up. Implementation phases pending; full Phase 10
-    bench evidence at
+    council-converged, implemented, and promoted to shipped.
+    Closes ADR 058's promote-to-default follow-up. Full
+    Phase 10 bench evidence at
     `plans/impl/059_native_cocd_kernels_bench_results.md`
-    is the promotion-to-shipped gate. Replaces the
+    clears the narrowed default-set promotion gate. Replaces the
     substrate decode-then-scan body with native cascade-
-    aware specialization for `BitPacked` (byte-aligned
-    fast path + non-aligned packed-bit reader), `Rle`
-    (byte-run streaming over existing ADR 057 format —
-    no value-run change inside ADR 059), `Dictionary`
-    (WDD1/WDB2 match-set + index walk; bounded
-    membership bitmap by dictionary index for
-    `4 < |S| ≤ 4_096`), `Delta` (WDL1 prefix-sum walk
-    with monotonic-shape short-circuits derived from
-    delta bytes). Native aggregate fold for every
-    (cascade × kind) pair ADR 058 already admits —
-    closed-catalog discipline applies recursively, zero
-    new deferrals. Two-step dispatch discipline (pre-
+    aware specialization for `BitPacked` (default-routed
+    byte-aligned `UInt8` fast path plus non-promoted
+    legal sublanes behind fallback eligibility), `Rle`
+    (byte-run streaming over existing ADR 057 format,
+    omitted from the default predicate allow-list after
+    Phase 10 miss), `Dictionary` (WDD1/WDB2 match-set +
+    index walk; low-cardinality default route; higher-
+    cardinality fallback before kernel entry), and `Delta`
+    (WDL1 prefix-sum walk with monotonic-shape short-
+    circuits, default-routed for predicates). Native
+    aggregate folds landed and are oracle-checked, with
+    default aggregate routing narrowed by cascade-grain
+    eligibility to count plus unsigned value aggregates
+    for byte-aligned BitPacked `UInt8` and plain low-
+    cardinality Dictionary. Closed-catalog discipline
+    applies recursively. Two-step dispatch discipline (pre-
     kernel eligibility may fall back to oracle; in-
     kernel reject is fail-closed); decode-scalar oracle
     stays in production as test oracle + pre-kernel
@@ -649,19 +635,18 @@ forward shape continues at #16.
     eligibility because `enabled_aggregate_kernels` is
     keyed by aggregate kind, not cascade. No per-
     cascade flag.
-    Promotion gate: ≥ 2× CPU vs end-to-end ADR 057
-    dense PBC on representative low-selectivity
-    fixtures (predicate); ≥ 2× vs dense AGG on
-    representative fixtures (aggregate); ≤ 5% dense
-    fallback overhead; bench tiers 8K / 65K / 1M (1M
-    mandatory). No new public PBC opcodes, no new
+    Promotion outcome: `EncodingComputeConfig::default()`
+    now sets `enabled = true`; the default predicate
+    allow-list contains `BitPacked`, `DictionaryPlain`,
+    `DictionaryBitPacked`, and `Delta`, while `RlePlain`
+    and `RleBitPacked` remain opt-in. Dense fallback
+    overhead stays within the ≤ 5% gate across 8K / 65K /
+    1M tiers. No new public PBC opcodes, no new
     evaluator kinds, no descriptor field, no
     `NodeCapability` bit, no Cargo feature, no envelope
     `format_version` bump, no ADR 057 directory shape
-    extension. Two empirical questions live: RLE
-    byte-run viability and Delta default-set inclusion
-    — both settle on Phase 10 bench evidence. See
-    *Where we are*.
+    extension. RLE value-run format work remains a
+    separate follow-up candidate. See *Where we are*.
 
 16. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
@@ -923,11 +908,11 @@ forward shape continues at #16.
   `(byte_run_len: u32, byte: u8)`, not value-run. ADR
   059's RLE kernel streams the existing byte-run format
   into a stack buffer; it does not change ADR 057's
-  encoded bytes. If Phase 10 evidence shows byte-run
-  cannot meet the 2× gate, the default
-  `enabled_predicate_evaluators` allow-list omits
-  `RlePlain` and/or `RleBitPacked`, and a separate ADR
-  considers value-run.
+  encoded bytes. Phase 10 evidence shows byte-run
+  cannot meet the 2× gate, so the default
+  `enabled_predicate_evaluators` allow-list omits both
+  `RlePlain` and `RleBitPacked`; a separate ADR considers
+  value-run.
   Format-change-to-rescue-gate is not a shape ADR 059
   supports.
 - **Don't ship ADR 059 with a `simd_strategy` /
@@ -1013,26 +998,21 @@ StateDigest substrate                            (ADR 046)
   → refinement plumbing
 ```
 
-Design tip is at ADR 059: the storage hierarchy is shipped
+Design tip is just past ADR 059: the storage hierarchy is shipped
 (ADR 056 row groups, ADR 057 per-buffer pages + encoding
 cascades, ADR 058 compute over encoded data substrate); ADR 059
-council-converged across four iterations and design-promoted as
-the kernel-promotion follow-up that flips the substrate from
-correctness-first to enabled-by-default. ADR 056 / 057 / 058
-carry Phase 10 / Phase 8 bench evidence under `plans/impl/`.
+council-converged, implemented, and promoted as the kernel-
+promotion follow-up that flips the substrate from correctness-
+first to enabled-by-default for the narrowed native set. ADR
+056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench evidence
+under `plans/impl/`.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion; ADR 059 closes the
-kernel-promotion follow-up via design convergence and stages
-implementation. The COCD substrate ships disabled by default
-under V1, awaiting Phase 10 bench evidence at
-`plans/impl/059_native_cocd_kernels_bench_results.md`.
-**The council's lean on next pickup:** ADR 059 implementation
-phases (parser/oracle infrastructure → validity helper →
-BitPacked → Dictionary → Delta → RLE → mask algebra →
-aggregate folds → dispatch wiring → bench → lockdown →
-promotion flip), OR the next Toron-adjacent follow-up
-(sparse Phase-C narrowing, page-level min/max/null stats,
-FSST evaluator, RLE value-run format if Phase 10 evidence
-motivates it) — both are fair game. CDC follow-ups (#17)
-and vector embeddings (#18) remain deferred behind the
-storage hierarchy in this stretch.
+kernel-promotion follow-up with a narrowed default-enabled set.
+**The council's lean on next pickup:** the next Toron-adjacent
+follow-up (sparse Phase-C narrowing, page-level min/max/null
+stats, FSST evaluator, or RLE value-run format after the Phase
+10 miss), or capacity-tier compression / serverless PBC /
+erasure-coding work from the remaining old #14 bundle. CDC
+follow-ups (#17) and vector embeddings (#18) remain deferred
+behind the storage hierarchy in this stretch.

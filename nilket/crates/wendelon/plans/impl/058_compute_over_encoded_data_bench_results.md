@@ -27,8 +27,8 @@ Mask, aggregate-partial, and metric parity gates pass; ADR 056
 with `EncodingComputeConfig.enabled = false` (the V1 default).
 Native per-cascade kernel work and the runtime-measured
 `MockObjectStore` GET counter remain promote-to-default
-follow-ups (kernel-promotion artifact scope, see iteration-7
-backlog).
+follow-ups. The kernel-promotion artifact is tracked by
+ADR 059.
 
 Promotion-to-default 2x CPU targets remain deferred behind the
 native per-cascade kernel pass: the V1 evaluator decodes through
@@ -37,9 +37,8 @@ fold loop with `EncodedRowMask` allocation. The numbers below
 are the substrate floor, not the promotion ceiling.
 
 This is the promoted substrate bench artifact. Native-kernel
-promote-to-default evidence will land separately at
-`plans/impl/058_compute_over_encoded_data_kernel_bench_results.md`
-once specialized kernels exist.
+promote-to-default evidence lands separately at
+`plans/impl/059_native_cocd_kernels_bench_results.md`.
 
 Command:
 
@@ -1000,14 +999,14 @@ gates the impl plan §Phase 8 names are met:
   the dense baseline.
 
 Promotion-to-default gate (≥ 2× CPU vs. ADR 057 dense PBC)
-remains the kernel-promotion artifact's responsibility. Native
-per-cascade kernels (BitPacked SIMD, Rle run-grain, Dictionary
-match-set + index walk, Delta prefix-sum) replace the V1
-correctness-first decode-then-scalar dispatch path; the kernel-
-promotion artifact at
-`plans/impl/058_compute_over_encoded_data_kernel_bench_results.md`
-will measure against this substrate-shipped baseline and decide
-default enablement.
+remains the ADR 059 kernel-promotion artifact's
+responsibility. Native per-cascade kernels (BitPacked SIMD,
+Rle run-grain, Dictionary match-set + index walk, Delta
+prefix-sum) replace the V1 correctness-first decode-then-
+scalar dispatch path; the kernel-promotion artifact at
+`plans/impl/059_native_cocd_kernels_bench_results.md` measures
+against this substrate-shipped baseline and decides default
+enablement.
 
 Iteration-7 backlog (kernel-promotion artifact scope):
 

@@ -35,9 +35,14 @@ Inherits encoding cascade catalog + page directory:
 
 ## Status
 
-Council-converged and design-promoted. Implementation
-phases pending; full small / medium / large bench evidence
-is the promotion-to-shipped gate.
+Council-converged, implemented, and promoted after Phase 8
+substrate bench evidence at
+`plans/impl/058_compute_over_encoded_data_bench_results.md`.
+The COCD substrate now ships enabled by default for ADR 059's
+narrowed native-kernel set; RLE and non-promoted sublanes are
+excluded by the default predicate allow-list and pre-kernel
+eligibility. Native per-cascade promotion evidence lives at
+`plans/impl/059_native_cocd_kernels_bench_results.md`.
 
 Implementation contract locked at the council level: 6
 predicate evaluators, 8 aggregate kernels, 9 predicate atoms,
@@ -1245,11 +1250,13 @@ Starting acceptance targets:
 
 - **Correctness V1 ship gate**: mask byte-equality,
   aggregate-partial byte-equality, cross-replica determinism,
-  and architecture guards pass with COCD disabled by default.
+  and architecture guards pass with the ADR 058 substrate
+  initially disabled by default; ADR 059 later flips the
+  narrowed native set on by default after bench acceptance.
 - **Promotion-to-default CPU gate**: Predicate-only Exact COCD
   ≥ 2× faster than ADR 057 dense PBC at low selectivity on
   representative `BitPacked` / `Rle` / `Dictionary` fixtures
-  after specialized kernels land.
+  under ADR 059's native-kernel evidence.
 - **Encoded Prefilter wins only when it removes ≥ 10%
   rows**, or council revises the gate from evidence.
 - **Aggregate kernels ≥ 2× faster than dense AGG** on
@@ -1405,9 +1412,8 @@ Promotion-to-shipped gate (after Phase 1–9 land):
 - Bench small / medium results pass starting acceptance
   targets (or council explicitly revises them per
   Provisional discipline).
-- ADR 057 Phase 10 bench scenarios still pass with
-  `EncodingComputeConfig.enabled = false` (regression
-  check).
+- ADR 057 Phase 10 bench scenarios still pass with ADR 059's
+  default-enabled narrowed native-kernel set (regression check).
 - ADR 056 Phase 10 bench scenarios still pass.
 - ADR 044 column-fetch scenarios pass end-to-end with
   mixed-shape slab corpora.
