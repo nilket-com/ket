@@ -19,6 +19,100 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 058 (Compute Over Encoded Data, COCD)
+council-converged across six iterations and design-promoted.
+Implementation phases pending; full small / medium / large
+bench evidence is the promotion-to-shipped gate. Innermost
+layer of the storage hierarchy ADR 056 / ADR 057 established.
+**Closed 6-variant predicate evaluator catalog**: `BitPacked`,
+`RlePlain`, `RleBitPacked`, `DictionaryPlain`,
+`DictionaryBitPacked`, `Delta` (full atom set, full-buffer
+grain). `Plain`, `Lz4Frame`, `Fsst`, `Alp` cascades fall back
+to materialize-then-evaluate. **Closed 8-kernel aggregate
+catalog**: `count_star`, `count_non_null`, `min`, `max`,
+`signed_sum`, `unsigned_sum`, `signed_avg`, `unsigned_avg`.
+`min`/`max` target fixed-width integer / time / Boolean and
+fixed-width Dictionary cascades; sum/avg are integer-only
+(Int8/16/32/64 for signed, UInt8/16/32/64 for unsigned),
+matching ADR 040 dense aggregate validation. Runs after
+ADR 040 CSB direct-answer ordering. COCD kernels never
+exceed ADR 040 dense validation; dense-supported shapes
+that COCD does not yet fold (Utf8 / Binary `min`/`max`,
+`APPROX_DISTINCT`, `QUANTILE_KLL`) fall back to dense AGG
+via the all-or-nothing mixed-request policy. **No new public PBC opcodes** — Toron-visible PBC
+contract (ADR 035 / ADR 036) byte-identical; COCD is internal
+executor dispatch, not a Toron-facing opcode extension.
+**Activation via node-local `EncodingComputeConfig`**
+(deployment-wide for cross-replica determinism), sibling to
+ADR 057's `EncodingWriterConfig` / `L2EncodingFetchConfig`;
+no descriptor field, no `NodeCapability` bit. **Exact /
+Prefilter / DenseFallback predicate plan modes**: Exact when
+every leaf has an encoded kernel (PBC tree composes via mask
+algebra; PBC executor not invoked post-Phase-B); Prefilter
+when a conjunction has at least one encoded and one residual
+leaf (encoded leaves drop rows; original PBC re-runs against
+survivors); DenseFallback for unsupported shapes (existing
+ADR 057 path). **Dual economic gates**: leaf-level
+selectivity gate at 0.25 (every encoded predicate leaf
+including Exact-mode requires CSB-estimated row-group
+selectivity ≤ 0.25; selectivity > 0.25 routes to dense
+materialize-then-evaluate, which wins by reusing one fetch as
+predicate + projection input) plus secondary Prefilter
+rejection gate at 0.10 (encoded leaves must reject ≥ 10% of
+rows to amortize residual narrowing). Aggregate folding is
+ungated by predicate selectivity. **`EncodedRowMask` tagged
+enum** (`All { rows }` / `None { rows }` /
+`Bitmap { rows, bytes }` / `Runs { rows, runs }`):
+RLE-friendly fixtures stay compact, all/none short-circuits
+remove O(N) work on common Dictionary cases, mask byte
+allocation bounded by `max_mask_bytes_per_record`. **Page-
+grain dispatch default** for page-emitting cascades
+(`BitPacked`, `Rle { inner: BitPacked }`,
+`Dictionary { inner: BitPacked }`); buffer-grain for
+`Rle { inner: Plain }`, `Dictionary { inner: Plain }`;
+full-buffer grain for `Delta` (no page emission in ADR 057).
+**Closed 5-code `EncodingComputeRejectCode` taxonomy**
+(`MaskLengthMismatch`, `EncodedValueOverflow`,
+`KernelDecodedLengthMismatch`, `AggregateOverflowMismatch`,
+`SelectionRangeOverflow`); authentication / parse / decode
+failures route to storage errors, never silent fallback.
+**Closed 9-variant `EncodingComputeFallbackReason` enum** for
+planner metric labels. Bounded `storage_l2_encoding_compute_*`
+metric family with `{decision, reason, kernel, cascade, kind,
+aggregate, violation_kind}` enumerations. V1 defaults:
+`max_dict_match_set_size = 4_096`,
+`min_buffer_rows_for_encoded_eval = 256`,
+`max_parallel_kernel_tasks = 4`,
+`max_mask_bytes_per_record = 256 KiB`,
+`max_encoded_pages_per_record = 256`,
+`min_selectivity_for_encoded_eval_micros = 250_000`,
+`min_prefilter_rejection_micros = 100_000`. **Reader-CPU
+bench gate** as starting target: predicate-only Exact COCD
+≥ 2× faster than ADR 057 dense PBC on representative
+`BitPacked` / `Rle` / `Dictionary` fixtures at low
+selectivity; aggregate kernels ≥ 2× faster than dense AGG on
+representative `Rle` / `BitPacked` fixtures; dense-selection
+overhead ≤ 5% vs. ADR 057 dense path when COCD economically
+falls back. Provisional discipline applies (revisable on
+Phase 8 evidence). ADR 052 secondary-index point reads gain a
+COCD confirm-step for COCD-supported cascades. ADR 055 LSM
+compaction, ADR 054 CDC subscription, recovery, and
+rehydration are byte-neutral to COCD. **~27 architectural
+lockdown guards** in `tests/architecture_test.rs`. ADR 057
+directory shape unchanged — COCD reads the existing
+`BufferEncoding` / `EncodingCascade` shape. No new wire
+`MsgType`, no new `FRAME_FLAG_*`, no new `NodeCapability`
+bit, no Cargo feature, no new digest domain, no `ObjectStore`
+trait change, no envelope `format_version` bump, no ADR 022
+footer extension, no descriptor surface change, no public
+Toron-visible PBC opcode addition, no ADR 057 cascade catalog
+extension. `Fsst` / `Alp` cascade encoded evaluation deferred
+(own kernel proofs); aggregate push-into-encoded for
+`approx_distinct` / KLL / HLL / `count_distinct` / float /
+decimal / GROUP BY all deferred to follow-up ADRs. See
+`plans/adr/058_compute_over_encoded_data.md` and
+`plans/impl/058_compute_over_encoded_data.md`.
+
 ADR 057 (Per-Buffer Pages and Encoding Cascades)
 council-converged across five iterations and promoted
 after implementation plus Phase 10 bench evidence. Inner layer of the
@@ -300,8 +394,9 @@ access surfaces (vectors, triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–13 are promoted (in `plans/adr/`);
-the forward shape continues at #14.
+Gemini. Steps 1–14 are promoted (in `plans/adr/`); step #14
+is design-promoted with implementation phases pending. The
+forward shape continues at #15.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -382,16 +477,38 @@ the forward shape continues at #14.
     fast path, and CSB bypass evidence. This opens ADR
     058. See *Where we are*.
 
-14. **Compute over encoded data (COCD)** — ADR 058.
-    Innermost layer of the storage hierarchy.
-    Evaluates PBC opcodes directly over ADR 057 encoded
-    representations without full-fidelity decode —
-    `RLE(BitPacked(...))` runs answer equality / range
-    / null-count predicates and aggregates without
-    materializing a dense Arrow array. Depends on ADR
-    057's cascade choices being concrete; opening
-    earlier is premature. *Large; depends on ADR 057
-    implementation experience for opcode shape.*
+14. **Compute over encoded data (COCD)** — ADR 058
+    promoted. Council-converged across six iterations and
+    design-promoted; implementation phases pending.
+    Innermost layer of the storage hierarchy. Closed
+    6-variant predicate evaluator catalog (`BitPacked`,
+    `RlePlain`, `RleBitPacked`, `DictionaryPlain`,
+    `DictionaryBitPacked`, `Delta`) and closed 8-kernel
+    aggregate catalog (`count_star`, `count_non_null`,
+    `min`, `max`, `signed_sum`, `unsigned_sum`,
+    `signed_avg`, `unsigned_avg`); no new public PBC
+    opcodes (Toron contract byte-identical); node-local
+    `EncodingComputeConfig` activation (no descriptor
+    field, no `NodeCapability` bit); Exact / Prefilter /
+    DenseFallback predicate plan modes; `EncodedRowMask`
+    tagged enum (`All` / `None` / `Bitmap` / `Runs`);
+    page-grain dispatch default for page-emitting
+    cascades; dual economic gates (0.25 leaf-level
+    selectivity + 0.10 Prefilter rejection); aggregate
+    folding ungated by predicate selectivity and runs
+    after ADR 040 CSB direct-answer ordering; 5-code
+    reject taxonomy; ADR 052 secondary-index confirm-
+    step; ADR 057 directory shape unchanged; ~27
+    architectural lockdown guards. `Fsst` / `Alp`
+    encoded evaluation deferred. Two aggregate-deferral
+    classes: dense-supported but COCD-deferred (Utf8 /
+    Binary `min`/`max`, `APPROX_DISTINCT`,
+    `QUANTILE_KLL` — fall back to dense AGG, no ADR 040
+    surface change required) vs. not-yet-in-ADR-040
+    (exact `count_distinct`, float / decimal aggregates,
+    time/timestamp sum/avg, GROUP BY — each requires an
+    ADR 040 expansion first). Reader-CPU bench gate is
+    the promotion-to-shipped gate. See *Where we are*.
 
 15. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
@@ -576,18 +693,64 @@ the forward shape continues at #14.
   loses the Parquet / Vortex precedent of evolving inner
   layers across multiple specs. Each layer ships as its
   own ADR.
-- **Don't design ADR 058 (COCD) without
-  grounding it in ADR 057 bench evidence.** COCD's
-  PBC-opcode dispatch design (`EVAL_DICT`, `EVAL_RLE`,
-  `EVAL_BITPACKED_RANGE`) depends on real cascade-
-  distribution evidence — which cascades the workload-
-  driven selector actually picks at scale, which encoded-
-  grain operations are worth lifting from materialized-
-  batch grain, and which cascade composition shapes
-  dominate. The prerequisite is now satisfied by
-  `plans/impl/057_per_buffer_pages_bench_results.md`;
-  ADR 058 should use that artifact rather than pre-057
-  assumptions.
+- **Don't reopen ADR 058 with public PBC opcodes
+  (`EVAL_DICT`, `EVAL_RLE`, `EVAL_BITPACKED_RANGE`).**
+  Brainstorm 011 §2 framed COCD as opcode extensions; the
+  council convergence at iter 6 rejects this uniformly.
+  ADR 036 §7 ("PBC capability negotiation becomes
+  mandatory before new opcodes") and §11 ("targetability
+  diagnostics belong on Toron expression nodes") together
+  say: new public opcodes are a Toron contract concern,
+  not a storage optimization concern. Toron does not need
+  to know whether Wendelon evaluated against a dictionary
+  or against a materialized array — the answer is byte-
+  identical. The dispatch happens internally; the opcode
+  does not. Reopening requires concrete Toron-side
+  evidence that the dispatch decision needs to be
+  controllable from the query session, plus full ADR 036
+  capability-negotiation work.
+- **Don't ship ADR 058 without aggregate folding in V1.**
+  Codex iter-1 deferred aggregates and iter-2 retreated
+  again, but the iter-3 reasoning carried: mask
+  infrastructure is the load-bearing substrate, and the
+  common exact AGG operations reuse the same encoded
+  scans (`count_star` is mask popcount, `count_non_null`
+  is mask plus validity, `min`/`max`/`sum`/`avg` walk the
+  cascade once with the mask filtering). Splitting
+  predicate and aggregate substrates would force a
+  near-immediate ADR 040 follow-up that reopens the same
+  mask and cascade correctness questions. Council
+  convergence at iter 5 / iter 6: aggregates ship with the
+  predicate substrate.
+- **Don't ship ADR 058 with a single economic gate or no
+  gate.** The iter-3 / iter-4 oscillation (blanket gate →
+  no gate → Prefilter-only gate → dual gates) settled on
+  dual gates because they handle distinct regression
+  cases. The leaf-level selectivity gate at 0.25 defends
+  against high-selectivity Exact regressions (encoded eval
+  produces a mostly-true mask while the projection fetch
+  still pulls most rows; dense materialize wins by reusing
+  one fetch). The Prefilter rejection gate at 0.10 defends
+  against unprofitable mixed-conjunction narrowing
+  (encoded leaves must drop ≥ 10% of rows to amortize
+  residual narrowing). Aggregate folding has neither gate
+  — the mask is the input, folding is strictly cheaper
+  than materializing then folding.
+- **Don't open ADR 058 with descriptor-policy
+  activation.** Same physical-deployment-knob argument
+  ADR 057 §"Why node-local writer config" makes: COCD
+  does not change logical rows, table semantics, PBC
+  programs, or Toron contracts. A descriptor field would
+  make a physical deployment knob look like logical
+  schema policy. Deployment-wide `EncodingComputeConfig`
+  is the council-converged shape.
+- **Don't extend ADR 057's directory shape for COCD.**
+  COCD reads existing `BufferEncoding` /
+  `EncodingCascade` metadata; no new fields, no per-page
+  prefix-sum side tables for Delta range, no page-level
+  min/max/null stats. Those additions are follow-up ADR
+  territory and require their own bench-driven
+  motivation.
 - **Don't ship ADR 057 with `Constant` or
   `FrameOfReference` cascade variants.** Iter 2 of
   the council ADR 057 process surfaced these as
@@ -635,25 +798,25 @@ StateDigest substrate                            (ADR 046)
   → LSM-style leveled compaction substrate       (ADR 055)
   → row-group fetch + page directory             (ADR 056)
   → per-buffer pages + encoding cascades     (ADR 057)
-  → compute over encoded data (COCD)             (ADR 058)  ← here
-  → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
+  → compute over encoded data (COCD)             (ADR 058)
+  → capacity-tier compression / serverless / EC  (rest of old #14 bundle)  ← here
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is past ADR 057: ADR 056 promoted with
-Phase 10 bench evidence accepted under the revised
-empirical writer-cost gate, and ADR 057 promoted after
-implementation plus Phase 10 evidence under the ≤75%
-representative writer gate. The Toron-pivot stretch
-holds: ADR 058 can now draft against real Encoding
-cascade choices, page sizing, selectivity profiles,
-and compression-delta evidence from
-`plans/impl/057_per_buffer_pages_bench_results.md`.
-**The council's lean on next pickup:** open ADR 058
-(COCD) drafting. CDC follow-ups
-(#16) and vector embeddings (#17) are deliberately
-behind the storage hierarchy in this stretch — they
-remain real work, but the Toron pivot pulls
-compute-adjacent primitives ahead.
+Design tip is past ADR 058: the storage hierarchy is
+design-complete (ADR 056 row groups, ADR 057 per-buffer
+pages + encoding cascades, ADR 058 compute over encoded
+data). ADR 056 and ADR 057 are shipped with Phase 10 bench
+evidence; ADR 058 is design-promoted with implementation
+phases pending. The Toron-pivot stretch closes its primary
+storage-hierarchy goal once ADR 058 implementation +
+Phase 8 bench evidence land. **The council's lean on next
+pickup:** ADR 058 implementation iterations against the
+locked design contract — the substrate, dispatch table,
+plan modes, and acceptance gates are all settled at the
+council level; Phase 0 audit through Phase 9 architectural
+lockdown should follow the impl plan's phase ordering. CDC
+follow-ups (#16) and vector embeddings (#17) remain
+deferred behind the storage hierarchy in this stretch.
