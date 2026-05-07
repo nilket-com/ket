@@ -109,7 +109,9 @@ use crate::storage::columnar::{
 };
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
 use crate::storage::encoding::EncodingWriterConfig;
-use crate::storage::manager::{EncodingMaterializeAuditSample, SlabManager};
+use crate::storage::manager::{
+	EncodedAggregateL2RecordRead, EncodingMaterializeAuditSample, SlabManager,
+};
 use crate::storage::multirow::{
 	MultiRowSourceRow, decode_batch, encode_batch, encode_batch_with_policy,
 	has_storage_synthetic_columns, materialize_record_location_batch,
@@ -1608,6 +1610,63 @@ impl WendelonDataServer {
 		self.audit_sink.emit(event).map_err(|err| {
 			Error::other(format!(
 				"Encoding invariant violation audit emit failed: {err}"
+			))
+		})
+	}
+
+	#[allow(dead_code)]
+	fn emit_encoding_compute_sampled_audit(
+		&self,
+		actor: &ActorIdentity,
+		meta: &QueryRequestMeta,
+		kernel: &'static str,
+		rows_scanned: u64,
+		rows_selected: u64,
+	) -> std::io::Result<()> {
+		let event = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::EncodingComputeSampled,
+			self.local_node,
+			"sampled Encoding compute",
+		)
+		.with_actor(actor)
+		.with_tenant(meta.tenant_id)
+		.with_parameters(vec![
+			("tier", json!("l2")),
+			("kernel", json!(kernel)),
+			("rows_scanned", json!(rows_scanned)),
+			("rows_selected", json!(rows_selected)),
+		]);
+		self.audit_sink.emit(event).map_err(|err| {
+			Error::other(format!("Encoding compute sampled audit emit failed: {err}"))
+		})
+	}
+
+	#[allow(dead_code)]
+	fn emit_encoding_compute_invariant_audit(
+		&self,
+		actor: &ActorIdentity,
+		tenant_id: TenantId,
+		violation_kind: &'static str,
+		context: &'static str,
+	) -> std::io::Result<()> {
+		let event = AuditEvent::new(
+			AuditAuthority::NodeLocal,
+			AuditOperation::EncodingComputeInvariantViolation,
+			self.local_node,
+			"Encoding compute invariant violation",
+		)
+		.with_actor(actor)
+		.with_tenant(tenant_id)
+		.with_outcome(AuditOutcome::Denied)
+		.with_parameters(vec![
+			("tier", json!("l2")),
+			("context", json!(context)),
+			("violation_kind", json!(violation_kind)),
+		]);
+		self.audit_sink.emit(event).map_err(|err| {
+			Error::other(format!(
+				"Encoding compute invariant violation audit emit failed: {err}"
 			))
 		})
 	}
@@ -6031,21 +6090,34 @@ impl WendelonDataServer {
 		// preserving scalar identity/locality context. Fold the filtered
 		// batches without re-running the bytecode a second time.
 		folded_request.predicate_program = None;
-		let result = match aggregate_record_batches(
-			&folded_request,
-			if plan.response.status == ReadStatus::KEY_NOT_FOUND {
-				&[]
-			} else {
-				&plan.batches
-			},
-			false,
-		) {
-			Ok(result) => result,
+		let mut responses = plan.aggregate_responses.clone();
+		if plan.response.status == ReadStatus::KEY_NOT_FOUND
+			|| (!plan.batches.is_empty() || responses.is_empty())
+		{
+			let result = match aggregate_record_batches(
+				&folded_request,
+				if plan.response.status == ReadStatus::KEY_NOT_FOUND {
+					&[]
+				} else {
+					&plan.batches
+				},
+				false,
+			) {
+				Ok(result) => result,
+				Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
+			};
+			let mut dense_response = result.response;
+			dense_response.aggregate_expression_digest = request.expression_digest();
+			if plan.response.status == ReadStatus::OK && !plan.batches.is_empty() {
+				dense_response.max_hlc = plan.response.value_hlc;
+			}
+			responses.push(dense_response);
+		}
+		let mut response = match merge_aggregate_responses(request, &responses) {
+			Ok(response) => response,
 			Err(code) => return Ok(self.aggregate_rejected_response(request, code)),
 		};
-		let mut response = result.response;
-		response.aggregate_expression_digest = request.expression_digest();
-		if plan.response.status == ReadStatus::OK {
+		if plan.response.status == ReadStatus::OK && response.max_hlc < plan.response.value_hlc {
 			response.max_hlc = plan.response.value_hlc;
 		}
 		response.diagnostics.slabs_consulted = plan.stats_explain.candidate_slabs_before_stats;
@@ -10265,6 +10337,7 @@ impl DataRing for WendelonDataServer {
 struct QueryExecutionPlan {
 	response: QueryResponseMeta,
 	batches: Vec<RecordBatch>,
+	aggregate_responses: Vec<AggregateResponse>,
 	deadline: Instant,
 	stats_explain: QueryStatsExplainCounters,
 	secondary_index_access_plan: Option<SecondaryIndexAccessPlan>,
@@ -10277,6 +10350,15 @@ struct ProjectedQueryLocationRead {
 	batch: RecordBatch,
 	row_group_fetch_audit: RowGroupFetchAuditCounters,
 	encoding_materialize_audit: Vec<EncodingMaterializeAuditSample>,
+}
+
+#[derive(Clone, Debug)]
+enum AggregateQueryLocationRead {
+	Dense(ProjectedQueryLocationRead),
+	Encoded {
+		response: AggregateResponse,
+		row_group_fetch_audit: RowGroupFetchAuditCounters,
+	},
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10537,6 +10619,7 @@ enum QueryProjectedExecution {
 	Aggregate {
 		requirement: ColumnFetchRequirement,
 		user_column_count: usize,
+		request: AggregateRequest,
 	},
 }
 
@@ -10637,6 +10720,7 @@ fn aggregate_projected_execution(
 	Ok(QueryProjectedExecution::Aggregate {
 		requirement,
 		user_column_count,
+		request: request.clone(),
 	})
 }
 
@@ -10742,8 +10826,94 @@ async fn read_projected_query_location(
 	}
 }
 
+async fn try_read_encoded_aggregate_query_location(
+	slab: &SlabManager,
+	request: &AggregateRequest,
+	location: RecordLocation,
+	descriptor: &TableSchemaDescriptorV1,
+	program: &pbc::Program,
+) -> std::io::Result<Option<AggregateQueryLocationRead>> {
+	if !descriptor.record_layout_policy.is_multi_row() {
+		return Ok(None);
+	}
+	let verification_requirement = augment_requirement_for_descriptor_verification(
+		&ColumnFetchRequirement::default(),
+		descriptor,
+	);
+	if verification_requirement.storage_columns.is_empty() {
+		return Ok(None);
+	}
+	let Some(verification_read) = slab
+		.read_projected_record(location, descriptor, &verification_requirement, None)
+		.await?
+	else {
+		return Ok(None);
+	};
+	let mut row_group_fetch_audit =
+		RowGroupFetchAuditCounters::from_l2_strategy(&verification_read.strategy);
+	if verification_read.projected.batch.num_rows() == 0 {
+		return Ok(None);
+	}
+	let projected = materialize_projected_location_batch(
+		verification_read.projected,
+		verification_read.projected_first_record_row_index,
+		location.record_row_index,
+	)?;
+	if !projected_descriptor_match(descriptor, &projected)? {
+		return Ok(None);
+	}
+	let Some(encoded) = slab
+		.read_encoded_aggregate_record(location, descriptor, request, program)
+		.await?
+	else {
+		return Ok(None);
+	};
+	row_group_fetch_audit.merge(RowGroupFetchAuditCounters::from_l2_strategy(
+		&encoded.strategy,
+	));
+	let response = encoded_aggregate_location_response(request, location, encoded);
+	Ok(Some(AggregateQueryLocationRead::Encoded {
+		response,
+		row_group_fetch_audit,
+	}))
+}
+
+fn encoded_aggregate_location_response(
+	request: &AggregateRequest,
+	location: RecordLocation,
+	encoded: EncodedAggregateL2RecordRead,
+) -> AggregateResponse {
+	AggregateResponse {
+		format_version: request.format_version,
+		request_id: request.request_id,
+		status: AggregateStatus::Success,
+		reject_code: None,
+		table_object_id: request.table_object_id,
+		schema_generation: request.schema_generation,
+		logical_schema_fingerprint: request.logical_schema_fingerprint,
+		aggregate_expression_digest: request.expression_digest(),
+		as_of_hlc: request.as_of_hlc,
+		max_hlc: if encoded.rows_admitted == 0 {
+			HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			}
+		} else {
+			location.hlc
+		},
+		partials: encoded.partials,
+		diagnostics: AggregateDiagnostics {
+			rows_scanned: encoded.rows_admitted,
+			rows_admitted: encoded.rows_admitted,
+			..AggregateDiagnostics::default()
+		},
+	}
+}
+
 async fn read_aggregate_query_location(
 	slab: &SlabManager,
+	request: &AggregateRequest,
 	meta: &QueryRequestMeta,
 	location: RecordLocation,
 	key_identity: Identity,
@@ -10752,7 +10922,13 @@ async fn read_aggregate_query_location(
 	program: &pbc::Program,
 	requirement: &ColumnFetchRequirement,
 	user_column_count: usize,
-) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
+) -> std::io::Result<Option<AggregateQueryLocationRead>> {
+	if let Some(encoded) =
+		try_read_encoded_aggregate_query_location(slab, request, location, descriptor, program)
+			.await?
+	{
+		return Ok(Some(encoded));
+	}
 	// ADR 045 §5 / Phase 8.5: ensure descriptor-filtered AppendOnly
 	// queries fetch `__row_table_object_id__` so the projected fast
 	// path can verify the row's table-isolation binding. See
@@ -10768,11 +10944,13 @@ async fn read_aggregate_query_location(
 				RowGroupFetchAuditCounters::from_l2_strategy(&projected_read.strategy);
 			let encoding_materialize_audit = projected_read.encoding_materialize_audit.clone();
 			if projected_read.projected.batch.num_rows() == 0 {
-				return Ok(Some(ProjectedQueryLocationRead {
-					batch: projected_read.projected.batch,
-					row_group_fetch_audit,
-					encoding_materialize_audit,
-				}));
+				return Ok(Some(AggregateQueryLocationRead::Dense(
+					ProjectedQueryLocationRead {
+						batch: projected_read.projected.batch,
+						row_group_fetch_audit,
+						encoding_materialize_audit,
+					},
+				)));
 			}
 			let projected = materialize_projected_location_batch(
 				projected_read.projected,
@@ -10792,11 +10970,13 @@ async fn read_aggregate_query_location(
 					user_column_count,
 				)
 				.map(|batch| {
-					Some(ProjectedQueryLocationRead {
-						batch,
-						row_group_fetch_audit,
-						encoding_materialize_audit,
-					})
+					Some(AggregateQueryLocationRead::Dense(
+						ProjectedQueryLocationRead {
+							batch,
+							row_group_fetch_audit,
+							encoding_materialize_audit,
+						},
+					))
 				});
 			}
 		}
@@ -10843,11 +11023,13 @@ async fn read_aggregate_query_location(
 		return Ok(None);
 	}
 	execute_aggregate_full_record_batch(&batch, program, requirement).map(|batch| {
-		Some(ProjectedQueryLocationRead {
-			batch,
-			row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
-			encoding_materialize_audit: Vec::new(),
-		})
+		Some(AggregateQueryLocationRead::Dense(
+			ProjectedQueryLocationRead {
+				batch,
+				row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
+				encoding_materialize_audit: Vec::new(),
+			},
+		))
 	})
 }
 
@@ -11548,6 +11730,7 @@ async fn plan_table_query_execution_by_secondary_index(
 			_pad2: [0; 4],
 		},
 		batches,
+		aggregate_responses: Vec::new(),
 		deadline,
 		stats_explain: stats_prune_cache.explain,
 		secondary_index_access_plan: Some(access_plan.clone()),
@@ -11979,6 +12162,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	};
 	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
 	let mut batches = Vec::new();
+	let mut aggregate_responses = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
 	let started_at = Instant::now();
@@ -12036,10 +12220,12 @@ async fn plan_query_execution_for_ranges_with_program(
 				if let QueryProjectedExecution::Aggregate {
 					requirement,
 					user_column_count,
+					request,
 				} = &projected_execution
 				{
 					if let Some(result) = read_aggregate_query_location(
 						slab,
+						request,
 						meta,
 						location,
 						key_identity,
@@ -12051,25 +12237,53 @@ async fn plan_query_execution_for_ranges_with_program(
 					)
 					.await?
 					{
-						row_group_fetch_audit.merge(result.row_group_fetch_audit);
-						encoding_materialize_audit.extend(result.encoding_materialize_audit);
-						let result = result.batch;
-						if result.num_rows() == 0 {
-							continue;
+						match result {
+							AggregateQueryLocationRead::Dense(result) => {
+								row_group_fetch_audit.merge(result.row_group_fetch_audit);
+								encoding_materialize_audit
+									.extend(result.encoding_materialize_audit);
+								let result = result.batch;
+								if result.num_rows() == 0 {
+									continue;
+								}
+								let result_rows = result.num_rows() as u64;
+								rows = rows.saturating_add(result_rows);
+								if location.hlc > max_hlc {
+									max_hlc = location.hlc;
+								}
+								if rows > budget.max_rows
+									|| started_at.elapsed() > budget.max_wall_time
+								{
+									return Ok(query_plan_error(
+										meta,
+										ReadStatus::QUERY_BUDGET_EXCEEDED,
+										local_node,
+									));
+								}
+								batches.push(result);
+							}
+							AggregateQueryLocationRead::Encoded {
+								response,
+								row_group_fetch_audit: audit,
+							} => {
+								row_group_fetch_audit.merge(audit);
+								let result_rows = response.diagnostics.rows_admitted;
+								rows = rows.saturating_add(result_rows);
+								if response.max_hlc > max_hlc {
+									max_hlc = response.max_hlc;
+								}
+								if rows > budget.max_rows
+									|| started_at.elapsed() > budget.max_wall_time
+								{
+									return Ok(query_plan_error(
+										meta,
+										ReadStatus::QUERY_BUDGET_EXCEEDED,
+										local_node,
+									));
+								}
+								aggregate_responses.push(response);
+							}
 						}
-						let result_rows = result.num_rows() as u64;
-						rows = rows.saturating_add(result_rows);
-						if location.hlc > max_hlc {
-							max_hlc = location.hlc;
-						}
-						if rows > budget.max_rows || started_at.elapsed() > budget.max_wall_time {
-							return Ok(query_plan_error(
-								meta,
-								ReadStatus::QUERY_BUDGET_EXCEEDED,
-								local_node,
-							));
-						}
-						batches.push(result);
 					}
 					continue;
 				}
@@ -12200,7 +12414,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	// 4. Empty result is a legitimate answer. Clients map
 	// KEY_NOT_FOUND to an empty batch on the receive side, so we
 	// avoid the cost of encoding a zero-row stream.
-	if batches.is_empty() {
+	if batches.is_empty() && aggregate_responses.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.row_group_fetch_audit = row_group_fetch_audit;
@@ -12220,6 +12434,7 @@ async fn plan_query_execution_for_ranges_with_program(
 			_pad2: [0; 4],
 		},
 		batches,
+		aggregate_responses,
 		deadline,
 		stats_explain: stats_prune_cache.explain,
 		secondary_index_access_plan: None,
@@ -12415,6 +12630,7 @@ fn query_plan_error(
 	QueryExecutionPlan {
 		response: query_error_meta(meta, status, local_node),
 		batches: Vec::new(),
+		aggregate_responses: Vec::new(),
 		deadline: Instant::now(),
 		stats_explain: QueryStatsExplainCounters::default(),
 		secondary_index_access_plan: None,
@@ -15565,6 +15781,7 @@ mod tests {
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
 				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -15591,6 +15808,7 @@ mod tests {
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
 				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -15621,6 +15839,61 @@ mod tests {
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
 				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: crate::storage::GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		)
+	}
+
+	async fn make_manager_with_l2_encoded_compute(l2: Arc<dyn ObjectStore>) -> Arc<SlabManager> {
+		let dir = fresh_dir("query-l2-encoded-compute");
+		let io = spawn_io_thread(64).unwrap();
+		let mut rehydration = crate::storage::manager::RehydrationPolicy::default();
+		rehydration.promote_after_l2_reads = 0;
+		rehydration.tail_read_window_bytes = 256 + 16;
+		Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1 << 30,
+				io,
+				l2: Some(l2),
+				rehydration,
+				l2_column_fetch: crate::storage::columnar::L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
+					..Default::default()
+				},
+				row_group_writer: crate::storage::row_group::RowGroupWriterConfig {
+					enabled: true,
+					target_row_group_rows: crate::schema::RowGroupRowCount::new(4),
+					max_row_group_rows: crate::schema::RowGroupRowCount::new(8),
+					min_paged_record_rows: RowCount::new(1),
+					min_paged_record_bytes: crate::schema::RecordBodyByteLen::new(1),
+					..Default::default()
+				},
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: EncodingWriterConfig {
+					enabled: true,
+					target_simd_page_values: crate::schema::SimdPageValueCount::new(4),
+					min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
+					..Default::default()
+				},
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				encoding_compute: crate::storage::encoding::EncodingComputeConfig {
+					enabled: true,
+					..Default::default()
+				},
 				group_commit: crate::storage::GroupCommitConfig::default(),
 				crypto: test_crypto(),
 			})
@@ -17305,7 +17578,12 @@ mod tests {
 			&prepared.range_meta,
 			&prepared.program,
 			&prepared.ranges,
-			aggregate_query_budget(&request.budgets),
+			QueryExecutionBudget {
+				max_locations: 1_000_000,
+				max_rows: 1_000_000,
+				max_wall_time: Duration::from_secs(600),
+				stats_pruning_enabled: true,
+			},
 			Some(&descriptor),
 			projected_execution,
 			None,
@@ -17332,6 +17610,197 @@ mod tests {
 		)
 		.unwrap();
 		assert_eq!(result.response.partials[1].state, expected_sum);
+	}
+
+	#[tokio::test]
+	async fn aggregate_plan_uses_encoded_l2_partials_when_supported() {
+		let l2 = Arc::new(MockObjectStore::default());
+		let mgr = make_manager_with_l2_encoded_compute(l2.clone()).await;
+		let mut descriptor = typed_table_descriptor();
+		descriptor.locality_policy =
+			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+				spread_factor: 1,
+				prefix_bits: 63,
+			});
+		descriptor.record_layout_policy = RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(256, 256, 1024 * 1024).unwrap(),
+		);
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Uncompressed;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor.validate().unwrap();
+		let ids = same_multirow_locality_ids(&descriptor, 256);
+		let batch = typed_table_batch(ids.clone());
+		let write_meta = typed_table_meta(&descriptor, batch.num_rows());
+		let row_hlc = hlc(50, 0, 1);
+		let admission = validate_table_write_request_batch(
+			&write_meta,
+			&batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			row_hlc,
+		)
+		.unwrap();
+		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			target_row_group_rows: crate::schema::RowGroupRowCount::new(128),
+			max_row_group_rows: crate::schema::RowGroupRowCount::new(128),
+			min_paged_record_rows: RowCount::new(1),
+			min_paged_record_bytes: crate::schema::RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let encoding_config = EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: crate::schema::SimdPageValueCount::new(128),
+			min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let bifurcated = bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
+			&write_meta,
+			&batch,
+			&descriptor,
+			&admission,
+			row_hlc,
+			&row_group_config,
+			&encoding_config,
+		)
+		.unwrap();
+		assert!(
+			bifurcated.children.iter().all(|child| {
+				crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory(
+					child.frame_bytes.as_slice(),
+				)
+			}),
+			"every fixture child must carry an ADR 057 encoding directory; children={}",
+			bifurcated.children.len()
+		);
+		append_bifurcated_table_children_durable(
+			&mgr,
+			write_meta.tenant_id,
+			row_hlc,
+			&bifurcated.children,
+			&[],
+		)
+		.await
+		.unwrap();
+		let slab_id = mgr.force_seal_active_for_test().await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let l2_uri = l2
+			.put("encoded-aggregate.wnd", &encrypted.bytes)
+			.await
+			.unwrap();
+		mgr.apply_tier_slab(TieredSlabPointer {
+			slab_id,
+			l2_uri,
+			payload_hash: payload_digest(&encrypted.bytes),
+			is_encrypted: true,
+			tenant_id: Some(encrypted.tenant_id),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		})
+		.await
+		.unwrap();
+
+		let request = AggregateRequest {
+			format_version: AGG_FORMAT_VERSION,
+			request_id: AggregateRequestId::new(145),
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+			consistency: Consistency::SERIALIZABLE,
+			min_hlc: hlc(0, 0, 0),
+			as_of_hlc: hlc(0, 0, 0),
+			locality_ranges: vec![LocalityRange::full()],
+			predicate_program: None,
+			aggregates: vec![
+				AggregateExpression::count_star(),
+				AggregateExpression {
+					tag: AggregateFunctionTag::SIGNED_SUM,
+					column_ordinal: 0,
+					parameter_block: Vec::new(),
+				},
+			],
+			budgets: AggregateBudgets {
+				max_locations: LocationCount::new(1_000_000),
+				max_rows: RowCount::new(1_000_000),
+				max_wall_time_millis: DurationMillis::new(600_000),
+				max_partial_state_bytes: ByteCount::new(4_096),
+			},
+		};
+		let program = pbc::Program::compile(&[]).unwrap();
+		let prepared = PreparedAggregateExecution {
+			range_meta: aggregate_as_range_query(&request, 0),
+			program,
+			descriptor: descriptor.clone(),
+			ranges: vec![QueryScanRange {
+				start: Locality::ZERO,
+				end: Locality::MAX,
+			}],
+			retention_floor: None,
+		};
+		let first_location = mgr.lookup(tenant(), admission.key_identities[0]).unwrap();
+		let direct_encoded = mgr
+			.read_encoded_aggregate_record(first_location, &descriptor, &request, &prepared.program)
+			.await
+			.unwrap();
+		assert!(
+			direct_encoded.is_some(),
+			"manager should be able to fold a supported encoded aggregate location"
+		);
+		let projected_execution = aggregate_projected_execution(&mgr, &request, &prepared).unwrap();
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&prepared.range_meta,
+			&prepared.program,
+			&prepared.ranges,
+			QueryExecutionBudget {
+				max_locations: 1_000_000,
+				max_rows: 1_000_000,
+				max_wall_time: Duration::from_secs(600),
+				stats_pruning_enabled: true,
+			},
+			Some(&descriptor),
+			projected_execution,
+			None,
+		)
+		.await
+		.unwrap();
+
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(plan.response.rows, ids.len() as u64);
+		assert!(
+			plan.batches.is_empty(),
+			"supported COCD aggregate should avoid dense aggregate batches"
+		);
+		assert_eq!(plan.aggregate_responses.len(), ids.len());
+		let response = merge_aggregate_responses(&request, &plan.aggregate_responses).unwrap();
+		assert_eq!(response.status, AggregateStatus::Success);
+		assert_eq!(
+			response.partials[0].state.as_slice(),
+			&(ids.len() as u64).to_be_bytes()
+		);
+		let expected_sum = encode_aggregate_state(
+			AggregateFunctionTag::SIGNED_SUM,
+			&AggregateState::SignedSum {
+				sum: ids.iter().sum::<i64>() as i128,
+				non_null_count: ids.len() as u64,
+				overflow: false,
+			},
+		)
+		.unwrap();
+		assert_eq!(response.partials[1].state, expected_sum);
 	}
 
 	#[tokio::test]
@@ -22840,6 +23309,7 @@ mod tests {
 					l2_row_group_fetch: Default::default(),
 					encoding_writer: Default::default(),
 					l2_encoding_fetch: Default::default(),
+					encoding_compute: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})
@@ -22884,6 +23354,7 @@ mod tests {
 					l2_row_group_fetch: Default::default(),
 					encoding_writer: Default::default(),
 					l2_encoding_fetch: Default::default(),
+					encoding_compute: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
 					crypto: test_crypto(),
 				})

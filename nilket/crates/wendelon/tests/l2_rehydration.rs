@@ -197,6 +197,7 @@ async fn build_tiered_manager(
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
 			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

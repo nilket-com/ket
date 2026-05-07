@@ -77,7 +77,7 @@ V1 substrate commitments:
     (0.25). Every encoded predicate leaf, including Exact-
     mode leaves, requires CSB-estimated row-group
     selectivity ≤ 0.25. Above the gate (selectivity >
-    0.25), the leaf routes to `MaterializeThenEval`
+    0.25), the leaf routes to `DenseFallback`
     because dense reuses the predicate fetch as
     projection input.
   - **Secondary Prefilter rejection gate**:
@@ -108,15 +108,15 @@ V1 substrate commitments:
 - bounded `storage_l2_encoding_compute_*` metric family
   with `{decision, reason, kernel, cascade, kind,
   aggregate, violation_kind}` enumerations;
-- **reader-CPU bench gate**: predicate-only Exact COCD ≥ 2×
-  faster than ADR 057 dense PBC on representative
-  `BitPacked` / `Rle` / `Dictionary` fixtures at low
-  selectivity; aggregate kernels ≥ 2× faster than dense AGG
-  on representative `Rle` / `BitPacked` fixtures;
-  dense-selection overhead ≤ 5% vs. ADR 057 dense path
-  when COCD economically falls back. Provisional discipline
-  applies (ADR 056's ≤ 15% miss codified the lesson; ADR
-  057's ≤ 75% inheritance preserved it);
+- **reader-CPU evidence gate before default enablement**:
+  the checked-in bench harness must report predicate-only,
+  mask-algebra, and aggregate-fold timings. The disabled V1
+  ship gate is correctness and byte-equality; ≥ 2× CPU wins
+  on representative `BitPacked` / `Rle` / `Dictionary`
+  fixtures are the promotion-to-default bar for specialized
+  cascade kernels. Provisional discipline still applies (ADR
+  056's ≤ 15% miss codified the lesson; ADR 057's ≤ 75%
+  inheritance preserved it);
 - pinned V1 defaults: `max_dict_match_set_size = 4_096`,
   `min_buffer_rows_for_encoded_eval = 256`,
   `max_parallel_kernel_tasks = 4`,
@@ -406,19 +406,19 @@ pub enum EncodingComputeEvaluatorKind {
 Cascade-shape → evaluator-kind mapping:
 
 ```text
-Plain                              → MaterializeThenEval
-Lz4Frame                           → MaterializeThenEval
+Plain                              → DenseFallback
+Lz4Frame                           → DenseFallback
 BitPacked                          → BitPacked            (page-grain)
 Rle { inner: Plain }               → RlePlain             (buffer-grain)
 Rle { inner: BitPacked }           → RleBitPacked         (page-grain)
-Rle { inner: Lz4Frame }            → MaterializeThenEval
+Rle { inner: Lz4Frame }            → DenseFallback
 Dictionary { inner: Plain }        → DictionaryPlain      (buffer-grain)
 Dictionary { inner: BitPacked }    → DictionaryBitPacked  (page-grain)
-Dictionary { inner: Lz4Frame }     → MaterializeThenEval
+Dictionary { inner: Lz4Frame }     → DenseFallback
 Delta { inner: BitPacked }         → Delta                (full-buffer)
-Delta { inner: Plain | Lz4Frame }  → MaterializeThenEval
-Fsst                               → MaterializeThenEval
-Alp                                → MaterializeThenEval
+Delta { inner: Plain | Lz4Frame }  → DenseFallback
+Fsst                               → DenseFallback
+Alp                                → DenseFallback
 ```
 
 Predicate-atom support:
@@ -651,7 +651,7 @@ Per-leaf routing (within the encoded subset of the tree):
 
 1. Look up `BufferEncoding` for the predicate column.
 2. Apply rules:
-   - Config disabled → `MaterializeThenEval` (entire tree
+   - Config disabled → `DenseFallback` (entire tree
      becomes DenseFallback).
    - Cascade unsupported → leaf is residual.
    - Buffer rows < `min_buffer_rows_for_encoded_eval` →
@@ -730,12 +730,31 @@ pub enum PredicateAtomOp {
 `PredicateAtom` is **derived from**
 `PredicateTreeV1::Comparison` / `IsNull` / `IsNotNull`
 leaves at classifier time — it is not a new wire shape.
+The runtime dispatch is bifurcated:
+
+- value atoms (`Eq`, `Neq`, range, `InList`) go through the
+  cascade value evaluator and then combine with the column
+  validity mask when the row group has nulls;
+- validity atoms (`IsNull`, `IsNotNull`) bypass the value
+  evaluator and read the validity buffer / row-group null-count
+  metadata directly.
+
+The value-evaluator `evaluate(...)` entry must reject
+`IsNull` / `IsNotNull`; those atoms are only correct through
+the validity path.
 
 `LiteralCoercion` carries the pre-computed literal in the
 encoded-domain representation. Computed once per query, not
 per row.
 
 #### Per-evaluator sketches
+
+V1 ships a correctness-first value evaluator: decode the
+encoded buffer with ADR 057's deterministic decoder and run the
+scalar predicate loop, then combine with validity. The
+per-cascade sketches below are the specialization backlog for
+promotion-to-default; they are not required for the disabled
+correctness V1.
 
 **BitPacked.** Lift literal to packed domain
 (`literal - base`), bounds-check fits in `bits`. SIMD
@@ -805,20 +824,18 @@ Phase D: Encoding materialization (unchanged from ADR 057)
   - materialize projection columns only.
 ```
 
-The `RowGroupFetchPlan` extension is internal to the
+The predicate planner shape is internal to the
 `L2FetchStrategy::RowGroup(plan)` leg; no fifth strategy
-variant.
+variant and no wire-visible plan field is added. In V1 the
+manager builds the predicate Phase-B fetch plan locally from
+the parsed row-group + encoding directories, then records only
+the realized `PhaseBOutcome` / fetch audit already carried by
+the row-group read path.
 
 ```rust
-pub struct RowGroupFetchPlan {
-    // ADR 056 / ADR 057 fields...
-    pub encoded_compute: Option<EncodingComputePlan>,
-}
-
 pub struct EncodingComputePlan {
-    pub predicate: Option<EncodingComputePredicatePlan>,
-    pub aggregate: Option<EncodedAggregatePlan>,
-    pub residual: EncodedResidualMode,
+    pub predicate_plan: EncodingComputePredicatePlan,
+    pub residual_mode: EncodedResidualMode,
 }
 
 pub enum EncodedResidualMode {
@@ -828,18 +845,24 @@ pub enum EncodedResidualMode {
 }
 ```
 
+Aggregates are planned separately in the manager as a private
+per-row-group fetch plan and folded through
+`try_fold_encoded_aggregate_request`; there is no public
+`EncodedAggregatePlan` type in V1.
+
 ### 8. Aggregate fold integration
 
 ```rust
-pub fn try_fold_encoded_aggregate(
+pub fn try_fold_encoded_aggregate_request(
     request: &AggregateRequest,
     context: &EncodedAggregateContext,
     mask: Option<&EncodedRowMask>,
-) -> Result<Option<AggregatePartial>, EncodingComputeRejectCode>;
+) -> Result<Option<Vec<AggregatePartial>>, EncodingComputeRejectCode>;
 ```
 
-`Ok(Some(partial))` — encoded path produced the same partial
-the dense AGG path would have produced.
+`Ok(Some(partials))` — encoded path produced the same partial
+sequence the dense AGG path would have produced for the whole
+request.
 `Ok(None)` — valid economic fallback to dense AGG (see
 mixed-request policy below).
 `Err(code)` — kernel invariant violation or corruption
@@ -854,7 +877,7 @@ row_group.row_count }`.
 folds the request only when **every** expression is
 COCD-supported under the cascade-shape and column-type
 checks above; if any single expression is unsupported,
-`try_fold_encoded_aggregate` returns `Ok(None)` and the
+`try_fold_encoded_aggregate_request` returns `Ok(None)` and the
 entire request falls back to dense AGG. This keeps
 `AggregatePartial` assembly byte-identical to the dense AGG
 path (one partial per request, expressions in declared
@@ -1104,7 +1127,7 @@ list pinned in Phase 9 of the impl plan):
     (mask byte-equality and partial byte-equality vs.
     materialize-then-evaluate / dense AGG).
 26. Mixed-aggregate-request policy is all-or-nothing in
-    V1: `try_fold_encoded_aggregate` returns `Ok(None)`
+    V1: `try_fold_encoded_aggregate_request` returns `Ok(None)`
     if any single expression in the request is
     COCD-unsupported.
 27. COCD aggregate kernels enforce ADR 040's integer-only
@@ -1194,8 +1217,9 @@ distinct regression cases:
 Aggregate folding has neither gate — the mask is the input,
 folding the mask + cascade values is strictly cheaper than
 materializing then folding. Aggregate folding has its own
-Phase 8 bench gate (≥ 2× faster than dense AGG on
-representative fixtures).
+Phase 8 benchmark evidence and promotion-to-default gate
+(≥ 2× faster than dense AGG on representative fixtures once
+specialized kernels land).
 
 ### Why Delta full atom set, full-buffer grain
 
@@ -1231,9 +1255,15 @@ COCD does not change logical rows, table semantics, PBC
 programs, or Toron contracts. A descriptor field would make
 a physical deployment knob look like logical schema policy.
 
-### Why reader-CPU bench gate
+### Why reader-CPU evidence gate
 
-Provisional starting targets:
+Disabled V1 is allowed to ship as a correctness-first
+decode-then-scalar implementation. The benchmark harness is
+still mandatory because it establishes the baseline for the
+specialized-kernel follow-up and prevents promotion-to-default
+without measured evidence.
+
+Promotion-to-default targets:
 
 - **Exact COCD ≥ 2× faster than ADR 057 dense PBC** at low
   selectivity on representative `BitPacked` / `Rle` /
@@ -1243,8 +1273,8 @@ Provisional starting targets:
 - **Dense-selection overhead ≤ 5%** vs. ADR 057 dense path
   when COCD economically falls back.
 
-If Phase 8 evidence shows tighter bars are achievable, the
-gate tightens.
+If evidence shows tighter bars are achievable, the gate
+tightens.
 
 ## Consequences
 
@@ -1421,7 +1451,7 @@ fold layer.
 
 New evaluator kinds append to `EncodingComputeEvaluatorKind`
 (discriminants 7, 8, ...). Existing dispatchers fall
-through to `MaterializeThenEval` for unknown discriminants;
+through to `DenseFallback` for unknown discriminants;
 pre-add slabs remain readable.
 
 ### Future aggregate kernel additions

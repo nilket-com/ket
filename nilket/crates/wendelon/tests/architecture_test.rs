@@ -3736,3 +3736,307 @@ fn test_adr057_encoding_guards() {
 		violations.join("\n")
 	);
 }
+
+#[test]
+fn test_adr058_encoding_compute_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let compute_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mod.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let compute_mask =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/mask.rs")).unwrap();
+	let compute_dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let compute_aggregate =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/aggregate.rs")).unwrap();
+	let compute_planner =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/planner.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let audit = fs::read_to_string(manifest_dir.join("src/audit.rs")).unwrap();
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let schema_core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let cdc = fs::read_to_string(manifest_dir.join("src/storage/cdc.rs")).unwrap();
+	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
+	let bench_path = manifest_dir.join("benches/encoding_compute.rs");
+	let bench = fs::read_to_string(&bench_path).unwrap_or_default();
+
+	for required in [
+		"impl_unit!(DictMatchSetSize, u32)",
+		"impl_unit!(PredicateLeafIndex, u16)",
+		"impl_unit!(SelectivityFractionMicros, u32)",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 058 unit {required}"
+			));
+		}
+	}
+	for module in [
+		"aggregate.rs",
+		"coerce.rs",
+		"dispatch.rs",
+		"index.rs",
+		"kernels/mod.rs",
+		"mask.rs",
+		"null.rs",
+		"planner.rs",
+		"predicate.rs",
+		"types.rs",
+	] {
+		if !manifest_dir
+			.join("src/storage/encoding/compute")
+			.join(module)
+			.exists()
+		{
+			violations.push(format!(
+				"src/storage/encoding/compute/{module}: missing ADR 058 module"
+			));
+		}
+	}
+	if !compute_mod.contains("pub mod types;") || !compute_mod.contains("pub use types::*;") {
+		violations.push(
+			"src/storage/encoding/compute/mod.rs: compute manifest must re-export types"
+				.to_string(),
+		);
+	}
+	for required in [
+		"BitPacked = 1",
+		"RlePlain = 2",
+		"RleBitPacked = 3",
+		"DictionaryPlain = 4",
+		"DictionaryBitPacked = 5",
+		"Delta = 6",
+		"CountStar = 1",
+		"CountNonNull = 2",
+		"SignedAvg = 7",
+		"UnsignedAvg = 8",
+		"MaskLengthMismatch = 1",
+		"SelectionRangeOverflow = 5",
+		"pub max_dict_match_set_size: DictMatchSetSize",
+		"pub min_selectivity_for_encoded_eval_micros: SelectivityFractionMicros",
+		"ENCODING_COMPUTE_MAX_MASK_BYTES_PER_RECORD_DEFAULT: u64 = 256 * 1024",
+		"ENCODING_COMPUTE_MIN_SELECTIVITY_FOR_ENCODED_EVAL_MICROS_DEFAULT: u32 = 250_000",
+		"ENCODING_COMPUTE_MIN_PREFILTER_REJECTION_MICROS_DEFAULT: u32 = 100_000",
+	] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 058 token {required}"
+			));
+		}
+	}
+	if compute_types.contains("Reserved") || compute_types.contains("V1") {
+		violations.push(
+			"src/storage/encoding/compute/types.rs: ADR 058 types must not reserve variants or use V1 suffixes"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub enum EncodedRowMask",
+		"All",
+		"None",
+		"Bitmap",
+		"bytes: Vec<u8>",
+		"Runs",
+		"runs: Vec<SelectionRun>",
+		"pub fn to_arrow_boolean_array",
+		"pub fn from_arrow_boolean_array",
+		"SelectionRangeOverflow",
+	] {
+		if !compute_mask.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/mask.rs: missing ADR 058 mask token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub fn evaluate(",
+		"evaluator_kind_for_cascade",
+		"EncodingComputeEvaluatorKind::BitPacked",
+		"EncodingComputeEvaluatorKind::RlePlain",
+		"EncodingComputeEvaluatorKind::DictionaryBitPacked",
+		"EncodingComputeEvaluatorKind::Delta",
+		"decode_buffer(",
+		"expand_page_descriptors",
+		"KernelDecodedLengthMismatch",
+	] {
+		if !compute_dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 058 dispatch token {required}"
+			));
+		}
+	}
+	for required in [
+		"try_fold_encoded_aggregate_request",
+		"with_encoded_column",
+		"with_validity_mask",
+		"decode_encoded_buffer",
+		"AggregateFunction::CountStar",
+		"return Ok(None)",
+		"AggregateOverflowMismatch",
+		"aggregate_kind_for_tag",
+	] {
+		if !compute_aggregate.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/aggregate.rs: missing ADR 058 aggregate token {required}"
+			));
+		}
+	}
+	if !compute_planner
+		.contains("selectivity.get() <= config.min_selectivity_for_encoded_eval_micros.get()")
+		|| !compute_planner.contains("EncodingComputePlanMode::DenseFallback")
+	{
+		violations.push(
+			"src/storage/encoding/compute/planner.rs: selectivity boundary must be <= 0.25 else DenseFallback"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encoding_compute: RawEncodingComputeConfig",
+		"enabled_predicate_evaluators",
+		"enabled_aggregate_kernels",
+		"RawEncodingComputeConfig",
+	] {
+		if !config.contains(required) {
+			violations.push(format!(
+				"src/config.rs: missing ADR 058 config token {required}"
+			));
+		}
+	}
+	if !node.contains("pub encoding_compute: EncodingComputeConfig")
+		|| !manager.contains("pub encoding_compute: EncodingComputeConfig")
+	{
+		violations.push("node/manager configs must carry EncodingComputeConfig".to_string());
+	}
+	for required in [
+		"try_read_encoding_compute_phase_b_from_l2",
+		"build_encoding_compute_phase_b_plan",
+		"read_encoded_aggregate_record",
+		"build_encoding_compute_aggregate_plan",
+		"try_fold_encoded_aggregate_request",
+		"phase_b_point_read_survives",
+		"evaluate_encoded_predicate",
+		"observe_storage_l2_encoding_compute_plan(\"exact\", \"none\")",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 058 runtime hook token {required}"
+			));
+		}
+	}
+	for metric in [
+		"storage_l2_encoding_compute_plan_total",
+		"storage_l2_encoding_compute_kernel_micros",
+		"storage_l2_encoding_compute_rows_total",
+		"storage_l2_encoding_compute_mask_bytes",
+		"storage_l2_encoding_compute_pages_fetched_total",
+		"storage_l2_encoding_compute_aggregate_total",
+		"storage_l2_encoding_compute_invariant_violations_total",
+		"ENCODING_COMPUTE_FALLBACK_REASONS",
+		"ENCODING_COMPUTE_KERNEL_LABELS",
+		"ENCODING_COMPUTE_INVARIANT_KINDS",
+	] {
+		if !metrics.contains(metric) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 058 metric token {metric}"
+			));
+		}
+	}
+	if !example.contains("[storage.encoding_compute]")
+		|| !example.contains("min_selectivity_for_encoded_eval_micros = 250000")
+	{
+		violations.push(
+			"examples/wendelon.toml.example: missing ADR 058 encoding_compute example config"
+				.to_string(),
+		);
+	}
+	if !cargo_toml.contains("name = \"encoding_compute\"")
+		|| !cargo_toml.contains("harness = false")
+	{
+		violations.push("Cargo.toml: ADR 058 encoding_compute bench is not registered".to_string());
+	}
+	if !bench_path.exists() {
+		violations
+			.push("benches/encoding_compute.rs: ADR 058 bench harness is missing".to_string());
+	} else {
+		for required in [
+			"encoding_compute_bench",
+			"predicate_exact",
+			"mask_algebra",
+			"aggregate_fold",
+			"try_fold_encoded_aggregate_request",
+		] {
+			if !bench.contains(required) {
+				violations.push(format!(
+					"benches/encoding_compute.rs: missing ADR 058 bench token {required}"
+				));
+			}
+		}
+	}
+	for required in [
+		"EncodingComputeSampled",
+		"encoding_compute.sampled",
+		"EncodingComputeInvariantViolation",
+		"encoding_compute.invariant_violation",
+	] {
+		if !audit.contains(required) {
+			violations.push(format!(
+				"src/audit.rs: missing ADR 058 audit token {required}"
+			));
+		}
+	}
+	for required in [
+		"emit_encoding_compute_sampled_audit",
+		"AuditOperation::EncodingComputeSampled",
+		"emit_encoding_compute_invariant_audit",
+		"AuditOperation::EncodingComputeInvariantViolation",
+		"try_read_encoded_aggregate_query_location",
+		"aggregate_responses",
+	] {
+		if !data_server.contains(required) {
+			violations.push(format!(
+				"src/network/data_server.rs: missing ADR 058 audit token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"MsgType::Cocd",
+		"MsgType::EncodingCompute",
+		"FRAME_FLAG_ENCODING_COMPUTE",
+		"FRAME_FLAG_COCD",
+	] {
+		if schema_core.contains(forbidden) {
+			violations.push(format!(
+				"src/schema/core.rs: forbidden ADR 058 wire token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"NodeCapability::Cocd",
+		"NodeCapability::EncodingCompute",
+		"NodeCapability::EncodedAggregate",
+	] {
+		if transport.contains(forbidden) {
+			violations.push(format!(
+				"src/network/transport.rs: forbidden ADR 058 capability {forbidden}"
+			));
+		}
+	}
+	if cdc.contains("EncodingCompute") {
+		violations.push("src/storage/cdc.rs: CDC must not import ADR 058 internals".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 058 Encoding compute invariants violated:\n{}",
+		violations.join("\n")
+	);
+}

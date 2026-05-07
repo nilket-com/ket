@@ -1716,6 +1716,46 @@ const ENCODING_INVARIANT_KINDS: &[&str] = &[
 	"cascade_unsupported",
 	"decoded_length_mismatch",
 ];
+const ENCODING_COMPUTE_PLAN_DECISIONS: &[&str] = &["exact", "prefilter", "dense_fallback"];
+const ENCODING_COMPUTE_FALLBACK_REASONS: &[&str] = &[
+	"none",
+	"reader_disabled",
+	"directory_missing",
+	"unsupported_program",
+	"unsupported_cascade",
+	"unsupported_arrow_layout",
+	"dense_selection",
+	"too_many_mask_bytes",
+	"too_many_pages",
+	"aggregate_unsupported",
+];
+const ENCODING_COMPUTE_KERNEL_LABELS: &[&str] = &[
+	"bit_packed",
+	"rle_plain",
+	"rle_bit_packed",
+	"dictionary_plain",
+	"dictionary_bit_packed",
+	"delta",
+];
+const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] = &["bit_packed", "rle", "dictionary", "delta"];
+const ENCODING_COMPUTE_ROW_KINDS: &[&str] = &["scanned", "selected", "avoided", "materialized"];
+const ENCODING_COMPUTE_AGGREGATES: &[&str] = &[
+	"count_star",
+	"count_non_null",
+	"min",
+	"max",
+	"signed_sum",
+	"unsigned_sum",
+	"signed_avg",
+	"unsigned_avg",
+];
+const ENCODING_COMPUTE_INVARIANT_KINDS: &[&str] = &[
+	"mask_length_mismatch",
+	"encoded_value_overflow",
+	"kernel_decoded_length_mismatch",
+	"aggregate_overflow_mismatch",
+	"selection_range_overflow",
+];
 
 fn bounded_row_group_label(value: &str, labels: &[&'static str]) -> Option<&'static str> {
 	labels.iter().copied().find(|label| *label == value)
@@ -2229,6 +2269,124 @@ impl EncodingCascadeHistograms {
 	}
 }
 
+#[derive(Default)]
+struct EncodingComputePlanCounters(Mutex<BTreeMap<(&'static str, &'static str), u64>>);
+
+impl EncodingComputePlanCounters {
+	fn inc(&self, decision: &'static str, reason: &'static str) {
+		let mut values = self
+			.0
+			.lock()
+			.expect("Encoding compute plan counter mutex poisoned");
+		*values.entry((decision, reason)).or_default() += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let values = self
+			.0
+			.lock()
+			.expect("Encoding compute plan counter mutex poisoned");
+		for decision in ENCODING_COMPUTE_PLAN_DECISIONS {
+			for reason in ENCODING_COMPUTE_FALLBACK_REASONS {
+				render_counter_with_labels(
+					out,
+					name,
+					&[("decision", decision), ("reason", reason)],
+					values.get(&(*decision, *reason)).copied().unwrap_or(0),
+				);
+			}
+		}
+	}
+}
+
+struct EncodingComputeKernelHistograms {
+	histograms: Vec<Histogram>,
+}
+
+impl EncodingComputeKernelHistograms {
+	fn new(bounds: &'static [u64]) -> Self {
+		let len = ENCODING_COMPUTE_KERNEL_LABELS.len() * ENCODING_COMPUTE_CASCADE_LABELS.len();
+		Self {
+			histograms: (0..len).map(|_| Histogram::new(bounds)).collect(),
+		}
+	}
+
+	fn index(kernel: &str, cascade: &str) -> Option<usize> {
+		let kernel = ENCODING_COMPUTE_KERNEL_LABELS
+			.iter()
+			.position(|label| *label == kernel)?;
+		let cascade = ENCODING_COMPUTE_CASCADE_LABELS
+			.iter()
+			.position(|label| *label == cascade)?;
+		Some(kernel * ENCODING_COMPUTE_CASCADE_LABELS.len() + cascade)
+	}
+
+	fn observe_duration(&self, kernel: &str, cascade: &str, duration: Duration) {
+		if let Some(index) = Self::index(kernel, cascade) {
+			self.histograms[index].observe_duration(duration);
+		}
+	}
+
+	fn render_micros(&self, out: &mut String, name: &str, help: &str) {
+		let _ = writeln!(out, "# HELP {name} {help}");
+		let _ = writeln!(out, "# TYPE {name} histogram");
+		for (kernel_index, kernel) in ENCODING_COMPUTE_KERNEL_LABELS.iter().enumerate() {
+			for (cascade_index, cascade) in ENCODING_COMPUTE_CASCADE_LABELS.iter().enumerate() {
+				let index = kernel_index * ENCODING_COMPUTE_CASCADE_LABELS.len() + cascade_index;
+				render_histogram_micros_series(
+					out,
+					name,
+					&[("kernel", *kernel), ("cascade", *cascade)],
+					&self.histograms[index].snapshot(),
+				);
+			}
+		}
+	}
+}
+
+#[derive(Default)]
+struct EncodingComputeAggregateCounters(
+	Mutex<BTreeMap<(&'static str, &'static str, &'static str), u64>>,
+);
+
+impl EncodingComputeAggregateCounters {
+	fn inc(&self, aggregate: &'static str, decision: &'static str, reason: &'static str) {
+		let mut values = self
+			.0
+			.lock()
+			.expect("Encoding compute aggregate counter mutex poisoned");
+		*values.entry((aggregate, decision, reason)).or_default() += 1;
+	}
+
+	fn render(&self, out: &mut String, name: &str, help: &str) {
+		render_counter_family_header(out, name, help);
+		let values = self
+			.0
+			.lock()
+			.expect("Encoding compute aggregate counter mutex poisoned");
+		for aggregate in ENCODING_COMPUTE_AGGREGATES {
+			for decision in ENCODING_COMPUTE_PLAN_DECISIONS {
+				for reason in ENCODING_COMPUTE_FALLBACK_REASONS {
+					render_counter_with_labels(
+						out,
+						name,
+						&[
+							("aggregate", aggregate),
+							("decision", decision),
+							("reason", reason),
+						],
+						values
+							.get(&(*aggregate, *decision, *reason))
+							.copied()
+							.unwrap_or(0),
+					);
+				}
+			}
+		}
+	}
+}
+
 pub struct MetricsRegistry {
 	pub metrics_scrapes_total: Counter,
 
@@ -2347,6 +2505,13 @@ pub struct MetricsRegistry {
 	storage_l2_encoding_fallback: StaticLabelCounters,
 	storage_l2_encoding_bytes: StaticLabelCounters,
 	storage_l2_encoding_invariant_violations: StaticLabelCounters,
+	storage_l2_encoding_compute_plan: EncodingComputePlanCounters,
+	storage_l2_encoding_compute_kernel_micros: EncodingComputeKernelHistograms,
+	storage_l2_encoding_compute_rows: StaticLabelCounters,
+	storage_l2_encoding_compute_mask_bytes: Histogram,
+	storage_l2_encoding_compute_pages_fetched: StaticLabelCounters,
+	storage_l2_encoding_compute_aggregate: EncodingComputeAggregateCounters,
+	storage_l2_encoding_compute_invariant_violations: StaticLabelCounters,
 	io_uring_submission_queue_depth: IoUringQueueDepthGauges,
 	io_uring_completion_queue_depth: IoUringQueueDepthGauges,
 	io_uring_errors: IoUringErrorCounters,
@@ -2619,6 +2784,17 @@ impl Default for MetricsRegistry {
 			storage_l2_encoding_fallback: StaticLabelCounters::default(),
 			storage_l2_encoding_bytes: StaticLabelCounters::default(),
 			storage_l2_encoding_invariant_violations: StaticLabelCounters::default(),
+			storage_l2_encoding_compute_plan: EncodingComputePlanCounters::default(),
+			storage_l2_encoding_compute_kernel_micros: EncodingComputeKernelHistograms::new(
+				PBC_SLAB_STATS_BUCKETS_MICROS,
+			),
+			storage_l2_encoding_compute_rows: StaticLabelCounters::default(),
+			storage_l2_encoding_compute_mask_bytes: Histogram::new(
+				PBC_SLAB_STATS_BLOCK_BYTES_BUCKETS,
+			),
+			storage_l2_encoding_compute_pages_fetched: StaticLabelCounters::default(),
+			storage_l2_encoding_compute_aggregate: EncodingComputeAggregateCounters::default(),
+			storage_l2_encoding_compute_invariant_violations: StaticLabelCounters::default(),
 			io_uring_submission_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_completion_queue_depth: IoUringQueueDepthGauges::default(),
 			io_uring_errors: IoUringErrorCounters::default(),
@@ -3664,6 +3840,68 @@ impl MetricsRegistry {
 		}
 	}
 
+	pub fn observe_storage_l2_encoding_compute_plan(&self, decision: &str, reason: &str) {
+		if let (Some(decision), Some(reason)) = (
+			bounded_row_group_label(decision, ENCODING_COMPUTE_PLAN_DECISIONS),
+			bounded_row_group_label(reason, ENCODING_COMPUTE_FALLBACK_REASONS),
+		) {
+			self.storage_l2_encoding_compute_plan.inc(decision, reason);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_compute_kernel(
+		&self,
+		kernel: &str,
+		cascade: &str,
+		duration: Duration,
+	) {
+		self.storage_l2_encoding_compute_kernel_micros
+			.observe_duration(kernel, cascade, duration);
+	}
+
+	pub fn observe_storage_l2_encoding_compute_rows(&self, kind: &str, rows: u64) {
+		if let Some(label) = bounded_row_group_label(kind, ENCODING_COMPUTE_ROW_KINDS) {
+			self.storage_l2_encoding_compute_rows.add(label, rows);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_compute_mask_bytes(&self, bytes: u64) {
+		self.storage_l2_encoding_compute_mask_bytes
+			.observe_value(bytes);
+	}
+
+	pub fn observe_storage_l2_encoding_compute_pages_fetched(&self, kind: &str, pages: u64) {
+		if let Some(label) = bounded_row_group_label(kind, ENCODING_COMPUTE_ROW_KINDS) {
+			self.storage_l2_encoding_compute_pages_fetched
+				.add(label, pages);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_compute_aggregate(
+		&self,
+		aggregate: &str,
+		decision: &str,
+		reason: &str,
+	) {
+		if let (Some(aggregate), Some(decision), Some(reason)) = (
+			bounded_row_group_label(aggregate, ENCODING_COMPUTE_AGGREGATES),
+			bounded_row_group_label(decision, ENCODING_COMPUTE_PLAN_DECISIONS),
+			bounded_row_group_label(reason, ENCODING_COMPUTE_FALLBACK_REASONS),
+		) {
+			self.storage_l2_encoding_compute_aggregate
+				.inc(aggregate, decision, reason);
+		}
+	}
+
+	pub fn observe_storage_l2_encoding_compute_invariant_violation(&self, violation_kind: &str) {
+		if let Some(label) =
+			bounded_row_group_label(violation_kind, ENCODING_COMPUTE_INVARIANT_KINDS)
+		{
+			self.storage_l2_encoding_compute_invariant_violations
+				.inc(label);
+		}
+	}
+
 	pub fn observe_storage_compression_encode(
 		&self,
 		codec: RecordBodyCompressionPolicy,
@@ -4518,6 +4756,62 @@ impl MetricsRegistry {
 			"violation_kind",
 			ENCODING_INVARIANT_KINDS,
 		);
+		let encoding_compute_plan = namespaced_metric("storage_l2_encoding_compute_plan_total");
+		self.storage_l2_encoding_compute_plan.render(
+			&mut out,
+			&encoding_compute_plan,
+			"ADR 058 Encoding compute planner decisions by bounded reason.",
+		);
+		let encoding_compute_kernel =
+			namespaced_metric("storage_l2_encoding_compute_kernel_micros");
+		self.storage_l2_encoding_compute_kernel_micros
+			.render_micros(
+				&mut out,
+				&encoding_compute_kernel,
+				"ADR 058 Encoding compute kernel duration in microseconds.",
+			);
+		let encoding_compute_rows = namespaced_metric("storage_l2_encoding_compute_rows_total");
+		self.storage_l2_encoding_compute_rows.render(
+			&mut out,
+			&encoding_compute_rows,
+			"ADR 058 Encoding compute rows by bounded kind.",
+			"kind",
+			ENCODING_COMPUTE_ROW_KINDS,
+		);
+		let encoding_compute_mask_bytes =
+			namespaced_metric("storage_l2_encoding_compute_mask_bytes");
+		render_histogram_raw(
+			&mut out,
+			&encoding_compute_mask_bytes,
+			"ADR 058 Encoding compute mask bytes.",
+			&self.storage_l2_encoding_compute_mask_bytes.snapshot(),
+		);
+		let encoding_compute_pages =
+			namespaced_metric("storage_l2_encoding_compute_pages_fetched_total");
+		self.storage_l2_encoding_compute_pages_fetched.render(
+			&mut out,
+			&encoding_compute_pages,
+			"ADR 058 Encoding compute pages fetched by bounded kind.",
+			"kind",
+			ENCODING_COMPUTE_ROW_KINDS,
+		);
+		let encoding_compute_aggregate =
+			namespaced_metric("storage_l2_encoding_compute_aggregate_total");
+		self.storage_l2_encoding_compute_aggregate.render(
+			&mut out,
+			&encoding_compute_aggregate,
+			"ADR 058 Encoding compute aggregate decisions by bounded reason.",
+		);
+		let encoding_compute_invariants =
+			namespaced_metric("storage_l2_encoding_compute_invariant_violations_total");
+		self.storage_l2_encoding_compute_invariant_violations
+			.render(
+				&mut out,
+				&encoding_compute_invariants,
+				"ADR 058 Encoding compute invariant violations by bounded kind.",
+				"violation_kind",
+				ENCODING_COMPUTE_INVARIANT_KINDS,
+			);
 		self.io_uring_submission_queue_depth.render(
 			&mut out,
 			"wendelon_io_uring_submission_queue_depth",

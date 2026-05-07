@@ -20,8 +20,9 @@ use crate::node::{
 };
 use crate::schema::ProtocolVersionWindow;
 use crate::storage::{
-	EncodingCascadeKind, EncodingWriterConfig, L2ColumnFetchConfig, L2EncodingFetchConfig,
-	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
+	EncodedAggregateKind, EncodingCascadeKind, EncodingComputeConfig, EncodingComputeEvaluatorKind,
+	EncodingWriterConfig, L2ColumnFetchConfig, L2EncodingFetchConfig, L2RowGroupFetchConfig,
+	MvccRetentionPolicy, RowGroupWriterConfig,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -132,6 +133,8 @@ struct RawStorageConfig {
 	encoding_writer: RawEncodingWriterConfig,
 	#[serde(default)]
 	l2_encoding_fetch: RawL2EncodingFetchConfig,
+	#[serde(default)]
+	encoding_compute: RawEncodingComputeConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -323,6 +326,89 @@ impl RawL2EncodingFetchConfig {
 		}
 		if let Some(count) = self.max_parallel_materialize_tasks {
 			cfg.max_parallel_materialize_tasks = crate::schema::TaskCount::new(count);
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawEncodingComputeConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	max_dict_match_set_size: Option<u32>,
+	#[serde(default)]
+	min_buffer_rows_for_encoded_eval: Option<u32>,
+	#[serde(default)]
+	max_parallel_kernel_tasks: Option<u32>,
+	#[serde(default)]
+	max_mask_bytes_per_record: Option<u64>,
+	#[serde(default)]
+	max_encoded_pages_per_record: Option<u32>,
+	#[serde(default)]
+	min_selectivity_for_encoded_eval_micros: Option<u32>,
+	#[serde(default)]
+	min_prefilter_rejection_micros: Option<u32>,
+	#[serde(default)]
+	enabled_predicate_evaluators: Option<Vec<String>>,
+	#[serde(default)]
+	enabled_aggregate_kernels: Option<Vec<String>>,
+}
+
+impl RawEncodingComputeConfig {
+	fn into_runtime_config(self) -> std::io::Result<EncodingComputeConfig> {
+		let mut cfg = EncodingComputeConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(count) = self.max_dict_match_set_size {
+			cfg.max_dict_match_set_size = crate::schema::DictMatchSetSize::new(count);
+		}
+		if let Some(rows) = self.min_buffer_rows_for_encoded_eval {
+			cfg.min_buffer_rows_for_encoded_eval = crate::schema::BufferValueCount::new(rows);
+		}
+		if let Some(tasks) = self.max_parallel_kernel_tasks {
+			cfg.max_parallel_kernel_tasks = crate::schema::TaskCount::new(tasks);
+		}
+		if let Some(bytes) = self.max_mask_bytes_per_record {
+			cfg.max_mask_bytes_per_record = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		}
+		if let Some(pages) = self.max_encoded_pages_per_record {
+			cfg.max_encoded_pages_per_record = crate::schema::EncodingPageCount::new(pages);
+		}
+		if let Some(selectivity) = self.min_selectivity_for_encoded_eval_micros {
+			cfg.min_selectivity_for_encoded_eval_micros =
+				crate::schema::SelectivityFractionMicros::new(selectivity);
+		}
+		if let Some(rejection) = self.min_prefilter_rejection_micros {
+			cfg.min_prefilter_rejection_micros =
+				crate::schema::SelectivityFractionMicros::new(rejection);
+		}
+		if let Some(evaluators) = self.enabled_predicate_evaluators {
+			cfg.enabled_predicate_evaluators.clear();
+			for evaluator in evaluators {
+				let Some(kind) = EncodingComputeEvaluatorKind::from_label(evaluator.as_str())
+				else {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!("unknown Encoding compute evaluator label {evaluator:?}"),
+					));
+				};
+				cfg.enabled_predicate_evaluators.insert(kind);
+			}
+		}
+		if let Some(kernels) = self.enabled_aggregate_kernels {
+			cfg.enabled_aggregate_kernels.clear();
+			for kernel in kernels {
+				let Some(kind) = EncodedAggregateKind::from_label(kernel.as_str()) else {
+					return Err(Error::new(
+						ErrorKind::InvalidInput,
+						format!("unknown encoded aggregate kernel label {kernel:?}"),
+					));
+				};
+				cfg.enabled_aggregate_kernels.insert(kind);
+			}
 		}
 		cfg.validate()?;
 		Ok(cfg)
@@ -695,6 +781,7 @@ impl RawConfig {
 		let l2_row_group_fetch = self.storage.l2_row_group_fetch.into_runtime_config()?;
 		let encoding_writer = self.storage.encoding_writer.into_runtime_config()?;
 		let l2_encoding_fetch = self.storage.l2_encoding_fetch.into_runtime_config()?;
+		let encoding_compute = self.storage.encoding_compute.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
 			node_id: self.node.node_id,
 			data_dir,
@@ -718,6 +805,7 @@ impl RawConfig {
 			l2_row_group_fetch,
 			encoding_writer,
 			l2_encoding_fetch,
+			encoding_compute,
 			root_kek_provider: self.crypto.root_kek_provider,
 			crypto_cache: CryptoCacheConfig {
 				tenant_kek_cache_max_entries: self.crypto.tenant_kek_cache_max_entries,

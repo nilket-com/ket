@@ -92,7 +92,9 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
-use crate::storage::encoding::{EncodingWriterConfig, L2EncodingFetchConfig};
+use crate::storage::encoding::{
+	EncodingComputeConfig, EncodingWriterConfig, L2EncodingFetchConfig,
+};
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
 use crate::storage::manager::{RehydrationPolicy, SlabManager, SlabManagerConfig};
@@ -215,6 +217,8 @@ pub struct NodeBootstrapConfig {
 	pub encoding_writer: EncodingWriterConfig,
 	/// Node-local ADR 057 L2 Encoding materialization config.
 	pub l2_encoding_fetch: L2EncodingFetchConfig,
+	/// Node-local ADR 058 compute-over-encoded-data executor config.
+	pub encoding_compute: EncodingComputeConfig,
 	/// Root KEK provider used to wrap and unwrap tenant KEKs.
 	pub root_kek_provider: RootKekProviderConfig,
 	/// Bounds for the in-process tenant-KEK and slab-DEK caches.
@@ -279,6 +283,7 @@ impl NodeBootstrapConfig {
 			l2_row_group_fetch: L2RowGroupFetchConfig::default(),
 			encoding_writer: EncodingWriterConfig::default(),
 			l2_encoding_fetch: L2EncodingFetchConfig::default(),
+			encoding_compute: EncodingComputeConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
 			crypto_cache: CryptoCacheConfig::default(),
 			protocol: ProtocolVersionWindow::default(),
@@ -407,6 +412,7 @@ impl NodeBootstrapConfig {
 		self.l2_row_group_fetch.validate()?;
 		self.encoding_writer.validate()?;
 		self.l2_encoding_fetch.validate()?;
+		self.encoding_compute.validate()?;
 		if let Some(l2) = &self.l2 {
 			l2.build()?;
 			if self.tiering.scan_interval.is_zero() {
@@ -1309,6 +1315,7 @@ impl WendelonNode {
 				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
 				encoding_writer: cfg.encoding_writer.clone(),
 				l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
+				encoding_compute: cfg.encoding_compute.clone(),
 				group_commit: cfg.group_commit.clone(),
 				crypto: crypto.clone(),
 			})

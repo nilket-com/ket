@@ -104,6 +104,7 @@ async fn sealed_slabs_enter_compaction_manifest_as_l0_live() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -150,6 +151,7 @@ async fn open_removes_stale_lsm_compaction_temp_files() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -173,6 +175,7 @@ async fn lsm_output_slab_id_reservation_advances_manager_sequence() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -209,6 +212,7 @@ async fn lsm_version_entries_for_plan_come_from_manager_key_index() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -260,6 +264,7 @@ async fn manager_prepares_lsm_outputs_from_extracted_entries_and_reserved_ids() 
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -316,6 +321,7 @@ async fn manager_reads_lsm_single_row_source_frames_for_plan() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -369,6 +375,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -459,6 +466,7 @@ async fn manager_writes_lsm_temp_output_slabs_without_installing_them() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -481,6 +489,7 @@ async fn manager_installs_lsm_temp_outputs_into_manifest_and_lookup_index() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -578,6 +587,7 @@ async fn manager_runs_single_lsm_compaction_job_end_to_end() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -648,6 +658,7 @@ async fn manager_runs_lsm_compaction_job_through_control_ring_committer() {
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
 			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})
@@ -730,6 +741,7 @@ async fn manager_picker_tick_runs_l0_compaction_when_threshold_met() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -807,6 +819,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -853,6 +866,7 @@ async fn manager_reopens_with_persisted_lsm_manifest_filtering_retired_inputs() 
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -893,6 +907,7 @@ async fn manager_install_rejects_bad_digest_before_manifest_apply() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -978,6 +993,7 @@ async fn manager_install_rejects_explicit_lsm_sidecar_swaps() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -1056,6 +1072,7 @@ async fn manager_removes_lsm_temp_output_on_missing_source_frame() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -1117,6 +1134,7 @@ async fn point_read_refuses_lsm_delete_pending_slab() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -1155,6 +1173,7 @@ async fn manager_applies_lsm_manifest_compaction_commit() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -1229,6 +1248,7 @@ async fn manager_lsm_gc_waits_for_authoritative_index_rewrite() {
 		l2_row_group_fetch: Default::default(),
 		encoding_writer: Default::default(),
 		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
 		group_commit: wendelon::storage::GroupCommitConfig::default(),
 		crypto: test_crypto(),
 	})
@@ -1316,6 +1336,7 @@ async fn manager_lsm_gc_lifecycle_commits_through_control_ring() {
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
 			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
 			group_commit: wendelon::storage::GroupCommitConfig::default(),
 			crypto: test_crypto(),
 		})

@@ -148,3 +148,7 @@ harness = false
 [[bench]]
 name = "encoding"
 harness = false
+
+[[bench]]
+name = "encoding_compute"
+harness = false

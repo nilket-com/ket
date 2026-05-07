@@ -243,21 +243,20 @@ Work:
    ordering hook — COCD aggregate fold runs after CSB
    direct-answer, before dense AGG materialization.
 
-5. Decide whether `EncodingComputePlan` /
+5. `EncodingComputePlan` /
    `EncodingComputePredicatePlan` live in
-   `src/storage/encoding/compute/mod.rs` or are threaded
-   through `RowGroupFetchPlan`. Default: live in the
-   compute module; `RowGroupFetchPlan` carries
-   `Option<EncodingComputePlan>`. Architectural guard
-   ensures `EncodingComputePlan` is never serialized.
+   `src/storage/encoding/compute/mod.rs` as internal planner
+   types. V1 does not thread `EncodingComputePlan` through a
+   serialized `RowGroupFetchPlan` field. Architectural guard
+   ensures COCD remains internal and never adds a wire shape.
 
 6. Freeze newtype-units:
 
-   ```rust
-   impl_unit!(DictMatchSetSize, u32);            // V1 cap 4_096
-   impl_unit!(PredicateLeafIndex, u32);
-   impl_unit!(SelectivityFractionMicros, u32);   // 1_000_000 = 1.0
-   ```
+	   ```rust
+	   impl_unit!(DictMatchSetSize, u32);            // V1 cap 4_096
+	   impl_unit!(PredicateLeafIndex, u16);
+	   impl_unit!(SelectivityFractionMicros, u32);   // 1_000_000 = 1.0
+	   ```
 
    Reuse `RowGroupIndex`, `IpcColumnOrdinal`,
    `IpcBufferIndex`, `BufferValueCount`, `BufferByteRange`,
@@ -382,19 +381,19 @@ Work:
     the predicate literal in encoded domain. Computed once
     at classifier time.
 
-13. Freeze aggregate-fold entry signature:
+13. Freeze aggregate-fold request entry signature:
 
     ```rust
-    pub fn try_fold_encoded_aggregate(
+    pub fn try_fold_encoded_aggregate_request(
         request: &AggregateRequest,
         context: &EncodedAggregateContext,
         mask: Option<&EncodedRowMask>,
-    ) -> Result<Option<AggregatePartial>,
+    ) -> Result<Option<Vec<AggregatePartial>>,
                 EncodingComputeRejectCode>;
     ```
 
-    `Ok(Some(partial))` — encoded path produced same
-    partial as dense AGG.
+    `Ok(Some(partials))` — encoded path produced the same
+    declared-order partial sequence as dense AGG.
     `Ok(None)` — valid economic fallback.
     `Err(...)` — hard reject; fail closed.
 
@@ -589,7 +588,7 @@ Work:
 5. Densification: a `Runs` mask whose serialized bitmap
    would exceed an internal cap converts to `Bitmap`; if
    `Bitmap` cap is also exceeded, the planner falls back to
-   `MaterializeThenEval` for that leaf.
+   `DenseFallback` for that leaf.
 
 Tests (`tests/encoding_compute_mask.rs`):
 
@@ -622,16 +621,24 @@ Files:
 
 Work:
 
-1. Each evaluator module exposes the uniform
-   `evaluate(...)` entry per Phase 0 §12.
+1. V1 ships a correctness-first value evaluator in
+   `dispatch.rs`: decode the encoded buffer with ADR 057's
+   deterministic decoder, run the scalar predicate loop, and
+   combine with validity when needed. Per-cascade files are
+   label / module anchors in V1; native SIMD / run-grain /
+   dictionary-match-set kernels are follow-up optimization
+   work before enabling COCD by default.
 
 2. **Validity helper** (`null.rs`):
    - Reads validity buffers for `IsNull` / `IsNotNull`.
    - Uses row-group null count for all-null / all-valid
      short-circuits (`All`/`None` masks).
    - Combines with predicate-result mask under 3VL.
+   - `IsNull` / `IsNotNull` bypass value `evaluate(...)`;
+     the value evaluator rejects those atoms with
+     `KernelDecodedLengthMismatch`.
 
-3. **`BitPacked`** (`bitpacked.rs`):
+3. **Deferred specialized `BitPacked`** (`bitpacked.rs`):
    - Lift literal to packed domain (`literal - base`),
      bounds-check fits in `bits`. Out-of-range literal
      short-circuits to `All` (Neq) or `None` (Eq).
@@ -643,7 +650,7 @@ Work:
    - Mask length validation at exit
      (`MaskLengthMismatch`).
 
-4. **`RlePlain` / `RleBitPacked`** (`rle.rs`):
+4. **Deferred specialized `RlePlain` / `RleBitPacked`** (`rle.rs`):
    - Walk encoded run array; for each
      `(run_value, run_length)`, evaluate atom against
      `run_value` once.
@@ -654,7 +661,7 @@ Work:
      `RleBitPacked`.
    - Mask length validation.
 
-5. **`DictionaryPlain` / `DictionaryBitPacked`**
+5. **Deferred specialized `DictionaryPlain` / `DictionaryBitPacked`**
    (`dictionary.rs`):
    - Step 1: `coerce::dict_match_set` produces match set
      `S` of dict indices satisfying the atom.
@@ -676,7 +683,7 @@ Work:
      for `DictionaryPlain`.
    - Mask length validation.
 
-6. **`Delta`** (`delta.rs`):
+6. **Deferred specialized `Delta`** (`delta.rs`):
    - Stream-reconstruct values from `base` plus `BitPacked`
      deltas; evaluate atom against each reconstructed
      value.
@@ -781,7 +788,7 @@ Work:
 
    Aggregate folding is **not** gated by predicate
    selectivity — it has its own kernel-support checks and
-   Phase 8 bench gate.
+   Phase 8 benchmark evidence / promotion-to-default gate.
 
    Pre-computes `LiteralCoercion` for encoded leaves;
    threads into `EncodedPredicateNode`.
@@ -943,25 +950,28 @@ Files:
 
 Work:
 
-1. Extend `RowGroupFetchPlan` with:
+1. Keep the predicate planner internal to the row-group L2
+   reader. V1 does not add a serialized or wire-visible
+   `RowGroupFetchPlan::encoded_compute` field; the manager
+   builds the Phase-B fetch plan from the parsed row-group +
+   encoding directories and records only the realized
+   `PhaseBOutcome` / fetch audit on the existing row-group
+   read path.
 
    ```rust
-   pub struct RowGroupFetchPlan {
-       // ADR 056 / 057 fields...
-       pub encoded_compute: Option<EncodingComputePlan>,
-   }
-
    pub struct EncodingComputePlan {
-       pub predicate: Option<EncodingComputePredicatePlan>,
-       pub aggregate: Option<EncodedAggregatePlan>,
-       pub residual: EncodedResidualMode,
+       pub predicate_plan: EncodingComputePredicatePlan,
+       pub residual_mode: EncodedResidualMode,
    }
    ```
 
-2. Extend `columnar::plan_row_group_fetch`:
+   Aggregates use a private manager-side row-group fetch plan
+   and fold through `try_fold_encoded_aggregate_request`;
+   there is no public `EncodedAggregatePlan` type in V1.
+
+2. Implement manager-side row-group Phase-B planning:
    - call classifier to derive
      `EncodingComputePredicatePlan`;
-   - record plan on `RowGroupFetchPlan`;
    - for `Exact`: emit fetch steps for encoded predicate
      buffers only;
    - for `Prefilter`: emit fetch steps for encoded
@@ -970,18 +980,18 @@ Work:
      after Phase B);
    - for `DenseFallback`: existing ADR 057 path.
 
-3. **Phase-B execution flow** in
-   `manager::execute_row_group_plan`:
+3. **Phase-B execution flow** in the manager L2 row-group
+   read path:
 
    ```text
    for each surviving row group:
-     match encoded_compute.predicate:
-       Some(Exact(node)):
+     match runtime predicate plan:
+       Exact(node):
          fetch encoded predicate bytes;
          mask = dispatch_evaluate(node, context);
          if mask is None → skip row group;
          continue with mask for Phase C;
-       Some(Prefilter { encoded, residual_program }):
+       Prefilter { encoded, residual_program }:
          fetch encoded predicate bytes;
          prefilter_mask = dispatch_evaluate(encoded, context);
          if prefilter_mask is None → skip row group;
@@ -1232,13 +1242,18 @@ Bench scenarios:
 
 Starting acceptance targets:
 
-- **Predicate-only Exact COCD ≥ 2× faster than ADR 057
-  dense PBC** at low selectivity on representative
-  `BitPacked` / `Rle` / `Dictionary` fixtures.
+- **Correctness V1 ship gate**: mask byte-equality,
+  aggregate-partial byte-equality, cross-replica determinism,
+  and architecture guards pass with COCD disabled by default.
+- **Promotion-to-default CPU gate**: Predicate-only Exact COCD
+  ≥ 2× faster than ADR 057 dense PBC at low selectivity on
+  representative `BitPacked` / `Rle` / `Dictionary` fixtures
+  after specialized kernels land.
 - **Encoded Prefilter wins only when it removes ≥ 10%
   rows**, or council revises the gate from evidence.
 - **Aggregate kernels ≥ 2× faster than dense AGG** on
-  representative `Rle` / `BitPacked` fixtures.
+  representative `Rle` / `BitPacked` fixtures before
+  promotion-to-default.
 - **Dense-selection overhead ≤ 5%** vs. ADR 057 dense
   path when COCD economically falls back.
 - **Mask byte-equality** vs. materialize-then-evaluate on
@@ -1340,7 +1355,7 @@ Guards (per ADR §16; ~27 guards):
     (mask byte-equality and partial byte-equality vs.
     materialize-then-evaluate / dense AGG).
 26. Mixed-aggregate-request policy is all-or-nothing in
-    V1: `try_fold_encoded_aggregate` returns `Ok(None)`
+    V1: `try_fold_encoded_aggregate_request` returns `Ok(None)`
     if any single expression in the request is
     COCD-unsupported. Test fixture exercises a request
     mixing one supported and one unsupported expression
@@ -1424,13 +1439,13 @@ Promotion-to-shipped gate (after Phase 1–9 land):
 - `src/storage/encoding/compute/kernels/validity.rs` —
   new (~150 LOC).
 - `src/storage/encoding/compute/kernels/bitpacked.rs` —
-  new (~450 LOC).
+  new V1 label shim; specialized SIMD kernel deferred.
 - `src/storage/encoding/compute/kernels/rle.rs` — new
-  (~350 LOC).
+  V1 label shim; specialized run-grain kernel deferred.
 - `src/storage/encoding/compute/kernels/dictionary.rs` —
-  new (~550 LOC).
+  new V1 label shim; specialized match-set kernel deferred.
 - `src/storage/encoding/compute/kernels/delta.rs` — new
-  (~280 LOC: prefix-sum walk, full atom set).
+  V1 label shim; specialized prefix-sum kernel deferred.
 - `src/storage/encoding/compute/aggregate.rs` — new (~600
   LOC: 8 kernels × supported cascades).
 - `src/storage/encoding/compute/planner.rs` — new (~250
@@ -1491,12 +1506,12 @@ ADR 058 ships the COCD substrate:
   0.25 (every encoded predicate leaf, including Exact-
   mode leaves, requires CSB-estimated row-group
   selectivity ≤ 0.25; selectivity > 0.25 routes to
-  `MaterializeThenEval`) plus secondary Prefilter
+  `DenseFallback`) plus secondary Prefilter
   rejection gate at 0.10 (encoded leaves must reject
   ≥ 10% of rows for Prefilter mode to engage).
 - **Aggregate folding is not gated by predicate
   selectivity** — has its own kernel-support checks and
-  Phase 8 bench gate.
+  Phase 8 benchmark evidence / promotion-to-default gate.
 - **CSB direct-answer ordering preserved** ahead of COCD
   aggregate fold.
 - **ADR 057 directory unchanged**: COCD reads existing
