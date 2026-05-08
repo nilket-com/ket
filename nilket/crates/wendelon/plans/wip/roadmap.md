@@ -19,6 +19,75 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 061 (Page-Aligned Authenticated Chunks with
+Macro-Block Read Coalescing) council-converged
+across Claude / Codex / Gemini after five council
+iterations; implementation phases pending per
+`plans/impl/061_page_aligned_authenticated_chunk_layout.md`.
+Closes ADR 060's recorded-not-gated ciphertext
+follow-up. **Two-layer decoupling**: AEAD
+authentication boundary and physical network read
+unit are independent layers optimized for
+different forces. **Layer 1 — AEAD chunks**:
+small per-slab `chunk_size_bytes` from a closed
+set `{4, 8, 16, 32, 64} KiB`; default 16 KiB for
+slabs with an `EncodingDirectory`, 64 KiB legacy
+elsewhere. **Buffer starts** align to chunk
+boundaries via opaque pad bytes in IPC body slack
+*between* adjacent buffers (no intra-buffer
+pad — ADR 057's contiguous `page_end_offsets` is
+a prefix-end array and cannot represent intra-
+buffer gaps; the directory shape is unchanged).
+Pad cost ≤ 5%; pad bytes AEAD-authenticated by
+the enclosing chunk's existing tag, never enter
+the page-decode path. **Layer 2 — network GETs**:
+ADR 044's existing `TieredMultiRangeReadPlan`
+coalescer merges contiguous AEAD chunks into
+multi-MiB `get_range` calls; warehouse-scale
+dense paths produce p50 ≥ 1 MiB GETs even with
+16 KiB chunks underneath. **Closed surface**: no
+new on-disk shape, no new directory, no new
+metadata surface, no new wire / descriptor /
+PBC / capability / `ObjectStore` trait change.
+ADR 022 §3's existing `chunk_size_bytes` u32
+field carries the per-slab value — Open Question
+4 explicitly anticipated this. **No-directory
+discipline**: Phase 0 formally proves that ADR
+022 `chunk_size_bytes` + ADR 056 / 057
+directories suffice; if Phase 0 fails,
+implementation stops and the council produces a
+revised ADR/impl pair as a separate decision —
+no silent reshape under this plan. **ADR 060
+ciphertext floor**: drops from 64 KiB → 16 KiB
+on default geometry, yielding 4× ciphertext
+narrowing on clustered fixtures; analytics
+dense throughput preserved by the macro-block
+coalescer (verified by load-bearing Phase 5
+four-sub-property test: single dense GET, AEAD
+CPU bounded < 1%, clustered sparse coalesce,
+anti-clustered sparse cap). **Cost arithmetic
+verified**: at 16 KiB AEAD chunks + macro-block
+coalescing, a 100 GiB analytic scan issues
+~few hundred GETs (~$0.0001 in S3 request cost),
+not millions of GETs (~$2.62 in request cost
+alone — the rejection shape ADR 061 forbids).
+**V2 promotion path**: variable buffer-aligned
+chunks via encrypted `AuthenticatedChunkDirectory`
+deferred with explicit gate — post-V1 evidence
+that ADR 044 column-fetch over-fetch (~3% at
+warehouse scale) becomes a measurable bottleneck
+on operational query workloads. **Cross-replica
+determinism**: writer selector pure-deterministic
+over directory + config; slab-byte equality
+across replicas. **No new fallback / reject /
+catalog variant**; only
+`SlabFormatError::UnsupportedChunkSize` on bad
+`chunk_size_bytes` (slab-format error family,
+not a fallback event). See
+`plans/adr/061_page_aligned_authenticated_chunk_layout.md`
+and
+`plans/impl/061_page_aligned_authenticated_chunk_layout.md`.
+
 ADR 060 (Sparse Projection Fetch Narrowing)
 council-converged across Claude / Codex / Gemini,
 implemented, and promoted to shipped. Full Phase 7
@@ -550,8 +619,9 @@ triggers, webhooks).
 
 Decided across multiple iterations between Claude, Codex, and
 Gemini. Steps 1–16 are promoted and shipped (in `plans/adr/`
-with implementation merged). The forward shape continues at
-#17 and the encoded-fetch sparse follow-up family.
+with implementation merged). Step 17 (ADR 061) is council-
+converged with implementation phases pending. The forward shape
+continues at #18.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -795,7 +865,50 @@ with implementation merged). The forward shape continues at
     accepted RLE default-off and clears the revised
     promotion gate. See *Where we are*.
 
-17. **Capacity-tier compression + serverless / erasure-
+17. **Page-aligned authenticated chunks with macro-block
+    read coalescing** —
+    ADR 061 council-converged across Claude / Codex /
+    Gemini after five council iterations; implementation
+    phases pending. Closes ADR 060's recorded-not-gated
+    ciphertext follow-up. **Two-layer decoupling**: AEAD
+    authentication boundary and physical network read unit
+    are independent layers optimized for different forces.
+    Layer 1 — small AEAD chunks from a closed set
+    `{4, 8, 16, 32, 64} KiB`, default 16 KiB for slabs with
+    an `EncodingDirectory` (V1 promoted floor; 4 KiB and
+    8 KiB remain in the closed set for Phase 9 diagnostic
+    rows but are not selectable by the V1 selector). Layer
+    2 — ADR 044's existing `TieredMultiRangeReadPlan`
+    coalescer merges contiguous AEAD chunks into multi-MiB
+    `get_range` calls; warehouse-scale dense paths produce
+    p50 ≥ 1 MiB GETs. **Buffer starts** align to chunk
+    boundaries via opaque pad bytes in IPC body slack
+    *between* adjacent buffers (no intra-buffer pad —
+    ADR 057's contiguous `page_end_offsets` is a prefix-end
+    array and cannot represent intra-buffer gaps; the
+    directory shape is unchanged); pad cost ≤ 5%; pad bytes
+    AEAD-authenticated, never enter the page-decode path.
+    No new on-disk shape, no new directory, no new metadata
+    surface, no new wire / descriptor / PBC / capability /
+    `ObjectStore` trait change; ADR 022 §3's existing
+    `chunk_size_bytes` field carries the per-slab value
+    (Open Question 4 explicitly anticipated this). At 16 KiB
+    chunks ADR 060's ciphertext floor drops 4× on clustered
+    fixtures; ADR 044 column-fetch composition stays
+    comfortably within its 67% selected-fraction gate
+    (per-record fraction ≈ 2.3% on a 1-of-50 projection
+    with buffer-start alignment). Phase 0 no-directory
+    feasibility check + Phase 5 four-sub-property macro-
+    block coalescing test are the two load-bearing gates;
+    if Phase 0 fails, implementation stops and the council
+    produces a revised ADR/impl pair as a separate decision
+    (no silent reshape). Variable buffer-aligned chunks via
+    encrypted `AuthenticatedChunkDirectory` deferred to V2
+    with explicit promotion gate (post-V1 evidence that
+    ADR 044 over-fetch becomes a measurable bottleneck on
+    operational query workloads). See *Where we are*.
+
+18. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
     - **zstd capacity-tier codec + `CompressionLevel`
@@ -807,14 +920,9 @@ with implementation merged). The forward shape continues at
     - **Serverless PBC at L2** *(brainstorm 010.)*
       Lambda-like remote PBC executor; consumes the same
       chunk-aligned authenticated range-read substrate
-      ADR 044 / 056 surfaces.
-    - **Page-aligned authenticated chunk layout for
-      ciphertext-byte narrowing.** Own ADR. ADR 060
-      records that selected plaintext pages can narrow
-      decode work while ADR 044 chunk granularity bounds
-      encrypted ciphertext-byte ratios; material
-      ciphertext narrowing needs chunk-layout work, not
-      ADR 060 replumbing.
+      ADR 044 / 056 surfaces; composes with ADR 061's
+      per-slab `chunk_size_bytes` for sub-record decrypt
+      grain.
     - **L1 inline erasure coding** *(brainstorm 003.)*
       Reed-Solomon / Cauchy across L1 NVMe replicas;
       composes with the LSM-tier sweeper boundary
@@ -822,7 +930,7 @@ with implementation merged). The forward shape continues at
     *Each is its own ADR; ordering opportunistic and
     independent of #13 / #14 sequencing.*
 
-18. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+19. **CDC follow-up ADRs (consume ADR 054 substrate)** —
     deferred behind the storage hierarchy in the Toron-
     pivot stretch. Independent; each ships its own
     contract surface:
@@ -878,18 +986,18 @@ with implementation merged). The forward shape continues at
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-19. **Vector embeddings + vector-form identity / locality
+20. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
     substrate (#8) and LSM (#11). **Set aside in the
     Toron-pivot stretch** — OLAP focus pulls
     compute-adjacent primitives ahead. Reopen after the
-    storage hierarchy (ADR 056 / 057 / 058 / 059 / 060)
-    is in production use and Toron compute-layer
+    storage hierarchy (ADR 056 / 057 / 058 / 059 / 060 /
+    061) is in production use and Toron compute-layer
     requirements surface concrete vector workload
     signals. *Large, multi-ADR.*
 
-20. **Refinement plumbing (opportunistic, no ordering
+21. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -1247,35 +1355,48 @@ StateDigest substrate                            (ADR 046)
   → per-buffer pages + encoding cascades     (ADR 057)
   → compute over encoded data (COCD)             (ADR 058)
   → native per-cascade COCD kernels              (ADR 059)
-  → sparse projection fetch narrowing            (ADR 060)  ← here
+  → sparse projection fetch narrowing            (ADR 060)
+  → page-aligned authenticated chunks            (ADR 061)  ← here
+    + macro-block read coalescing
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is just past ADR 060: the storage hierarchy is shipped
-(ADR 056 row groups, ADR 057 per-buffer pages + encoding
-cascades, ADR 058 compute over encoded data substrate, ADR 059
-native per-cascade kernels, ADR 060 sparse projection fetch
-narrowing). ADR 060 converts exact-COCD survival masks into per-
-row-group selected-page sets so projection fetch reads only the
-encoded pages whose row spans intersect surviving rows. ADR 056 /
-057 / 058 / 059 carry Phase 10 / Phase 8 bench evidence under
-`plans/impl/`; ADR 060's Phase 7 artifact records the revised
-plaintext-byte gate, ciphertext-byte floor, and RLE default-off
-disposition.
+Design tip is at ADR 061 (council-converged, implementation
+pending). The storage hierarchy is shipped through ADR 060 (row
+groups, per-buffer pages + encoding cascades, compute over
+encoded data substrate, native per-cascade kernels, sparse
+projection fetch narrowing). ADR 061 closes ADR 060's recorded-
+not-gated ciphertext follow-up via a two-layer decoupling: small
+AEAD chunks (closed set `{4, 8, 16, 32, 64} KiB`, default 16 KiB)
+for ADR 060 fine-grain decrypt leverage + ADR 044's existing
+`TieredMultiRangeReadPlan` coalescer producing multi-MiB GETs
+for analytics throughput. No new on-disk shape, no new
+directory, no new metadata surface; ADR 022 §3's existing
+`chunk_size_bytes` field carries the per-slab value. Variable
+buffer-aligned chunks via encrypted directory deferred to V2
+with explicit promotion gate.
+ADR 056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench
+evidence under `plans/impl/`; ADR 060's Phase 7 artifact records
+the revised plaintext-byte gate, ciphertext-byte floor, and RLE
+default-off disposition; ADR 061's Phase 9 evidence pending
+implementation.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
-default-enabled native-kernel set; ADR 060 closes the encoded-
+default-enabled native-kernel set; ADR 060 closed the encoded-
 fetch follow-up with internal reader dispatch, no public surface
-change, and a strict plan-time byte-comparison gate.
-**The council's lean on next pickup:** the next Toron-adjacent
-follow-up (page-level min/max/null stats, FSST evaluator, RLE
-value-run format, sparse predicate-column fetch, dense predicate-
-zip with sparse projection, nullable sparse projection — each its
-own ADR), page-aligned authenticated chunk layout for ciphertext-
-byte narrowing, or capacity-tier compression / serverless PBC /
-erasure-coding work from the remaining old #14 bundle. CDC
-follow-ups (#18) and vector embeddings (#19) remain deferred
-behind the storage hierarchy in this stretch.
+change, and a strict plan-time byte-comparison gate; ADR 061
+closes the ciphertext-floor follow-up via the AEAD/network
+two-layer decoupling, with the macro-block coalescing test as
+the load-bearing empirical gate.
+**The council's lean on next pickup:** ADR 061 implementation
+phases, then either the next Toron-adjacent follow-up (page-
+level min/max/null stats, FSST evaluator, RLE value-run format,
+sparse predicate-column fetch, dense predicate-zip with sparse
+projection, nullable sparse projection — each its own ADR), or
+capacity-tier compression / serverless PBC / erasure-coding
+work from the remaining old #14 bundle. CDC follow-ups (#19)
+and vector embeddings (#20) remain deferred behind the storage
+hierarchy in this stretch.
