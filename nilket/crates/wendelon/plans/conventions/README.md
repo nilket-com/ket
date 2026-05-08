@@ -14,6 +14,7 @@ ADR; flag violations in code review.
 
 - [newtype-units.md](newtype-units.md) — wrap fundamental quantities as distinct newtypes; never pass raw `u64` / `[u8; N]` across module boundaries.
 - [no-version-suffixes.md](no-version-suffixes.md) — drop `V1` / `V2` / `V3` suffixes from Rust types; reserve version bytes for actual wire-protocol envelopes only.
+- [no-planning-phase-names.md](no-planning-phase-names.md) — no `phase_a` / `phase_b` / `iter2` / `wip_*` etc. in code identifiers; name by what the thing does, not by where it sat in someone's writeup.
 - [no-premature-backward-compat.md](no-premature-backward-compat.md) — no compat structs, tolerant decoders, legacy-decode tests, or spec-level "future ADR" hedges.
 - [capability-vs-feature-naming.md](capability-vs-feature-naming.md) — code uses "capability" precisely; "feature" is for marketing or casual prose.
 - [no-project-name-in-protocols.md](no-project-name-in-protocols.md) — keep the project's brand name out of protocol acronyms, reject codes, metric prefixes, module names, and struct prefixes; brand lives at the cargo crate / repo / README level only.

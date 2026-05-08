@@ -19,6 +19,112 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 060 (Sparse Projection Fetch Narrowing)
+council-converged across Claude / Codex / Gemini.
+Implementation phases pending; full Phase 7 bench
+evidence at
+`plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
+is the promotion-to-shipped gate (matches the
+ADR 055 / 056 / 057 cadence: ADR-document
+promotion first, shipped status after
+implementation + bench evidence). **Internal
+reader optimization**: when predicate evaluation
+produces an exact-COCD `EncodedRowMask` for a
+surviving row group, the projection-fetch stage
+converts the mask into a selected encoding-page
+set per projected buffer and fetches only the byte
+ranges spanning those pages — generalizing ADR
+052's secondary-index point-read SIMD-page fast
+path from named point rows to mask survivors under
+clustered selectivity. **Closed surface**: no new
+`L2FetchStrategy` variant, no wire / descriptor /
+PBC / capability surface, no IPC `custom_metadata`
+key, no public Toron-visible hint, no ADR 056 /
+057 directory shape change, no `EncodedRowMask` /
+catalog variants, no new
+`L2EncodingFetchConfig` / `L2RowGroupFetchConfig` /
+`EncodingComputeConfig` field. **V1 page-
+materializable cascade set**: `BitPacked`,
+`Dictionary { inner: Plain | BitPacked }`, `Rle`.
+RLE is correctness-eligible because
+`BufferEncoding.page_value_count` records rows-
+per-page for byte-run RLE the same as for
+BitPacked / Dictionary; row→page mapping is
+deterministic from directory metadata regardless
+of byte-length variance per page. RLE default
+routing is bench-settled and **non-blocking for
+BitPacked / Dictionary promotion**. **Per-row-
+group decision grain** with cross-column page-
+geometry agreement; mixed sparse / dense
+projected columns within one materialization pass
+deferred. **V1 engages only for exact-COCD
+masks** (`decoded_predicate_batches` empty); dense
+predicate-zip with sparse projection deferred.
+**Fixed-width + non-null** projection only;
+nullable + variable-width route to dense.
+**Activation** is implicit on the existing pair of
+toggles (`l2_row_group_fetch.enabled` AND
+`l2_encoding_fetch.enabled`); no new flag.
+**Economic gating**: strict plan-time sparse_bytes
+< dense_bytes comparison, capped by
+`max_simd_pages_per_record` /
+`max_ranges_per_record` / selected-byte-fraction
+plus an internal `MAX_SPARSE_RANGES_PER_BUFFER`
+helper-local `const` for per-buffer fragmentation
+(distinct from the record-grain
+`max_ranges_per_record` because record-grain caps
+do not constrain per-buffer pathology). **Two-
+module split**: `src/storage/encoding/page_materialize.rs`
+hosts shared encoded-page decode + assembly
+helpers (extracted from `manager.rs`'s ADR 052
+secondary-index path; both named-row and mask-
+driven paths consume it);
+`src/storage/encoding/sparse_projection_fetch.rs`
+hosts the active planner + decision + economic
+logic with internal `RowToPageMap`, `ActivePageSet`,
+`SparseProjectionFetchPlan`,
+`SparseProjectionFetchDecision`, and
+`SparseProjectionFetchDecline` types. **Internal
+decline discipline**: decline reasons
+(`AllRowsMask`, `MissingExactCocdMask`,
+`DensePredicateBatchPresent`,
+`PageGeometryMismatchAcrossColumns`,
+`ByteEstimateNotSparse`,
+`PerBufferFragmentationCapExceeded`, ...) live
+entirely inside the planner module and never
+become metric labels, fallback variants, or
+reject codes — they are plan-time routing facts
+internal to the reader. **No new metric labels**:
+existing
+`storage_l2_row_group_fetch_bytes_total` /
+`storage_l2_encoding_simd_pages_fetched` /
+`storage_l2_row_group_fetch_selected_ranges`
+families absorb sparse decisions. **Closed
+reject taxonomy**: ADR 057's existing
+`EncodingRejectCode` variants
+(`EncodingDirectoryParseError`,
+`BufferEncodingMismatch`, `PageRangeOverflow`,
+`CascadeUnsupported`, `DecodedLengthMismatch`)
+cover invariant failures after sparse fetch
+begins. **Bench gate** (provisional, revisable
+on Phase 7 evidence): clustered 1% / 5% masks
+fetch ≥ 3× fewer ciphertext bytes than full-row-
+group projection fetch, wall-clock ≥ 1.5× faster
+after multi-range RTT overhead, dense-fallback
+overhead ≤ 5%, byte-identical projected-batch
+invariant, cross-replica determinism, 1M tier
+mandatory; RLE rows record pass / miss
+explicitly. **No-planning-phase-names
+convention** applied: new identifiers use
+`SparseProjectionFetch*` / `RowToPageMap` /
+`ActivePageSet`, not `SparsePhaseC*`. Existing
+leaks (`phase_c_fetch`,
+`apply_phase_b_masks_to_projected_row_groups`,
+`PhaseBOutcome`) are slated for the broader
+convention sweep — ADR 060 must not extend them.
+See `plans/adr/060_sparse_projection_fetch_narrowing.md`
+and `plans/impl/060_sparse_projection_fetch_narrowing.md`.
+
 ADR 059 (Native Per-Cascade COCD Kernels)
 council-converged, implemented, and promoted to shipped.
 Closes ADR 058's promote-to-default follow-up. Full Phase 10
@@ -459,18 +565,23 @@ before opening Toron-side surface. Concretely: row-group fetch
 cascades (ADR 057), then compute-over-encoded-data substrate
 (ADR 058 / COCD), then native per-cascade COCD kernels
 (ADR 059) that flip the substrate from correctness-first to
-enabled-by-default. CDC follow-up ADRs and vector embeddings
-are deliberately deferred behind the storage hierarchy in this
-stretch — not because they are smaller, but because the Toron
-pivot pulls compute-adjacent primitives ahead of OLTP-shaped
-access surfaces (vectors, triggers, webhooks).
+enabled-by-default, then sparse projection fetch narrowing
+(ADR 060) that converts exact-COCD survival masks into per-
+row-group selected-page fetches so projection bytes scale with
+clustered selectivity rather than row-group size. CDC follow-up
+ADRs and vector embeddings are deliberately deferred behind the
+storage hierarchy in this stretch — not because they are
+smaller, but because the Toron pivot pulls compute-adjacent
+primitives ahead of OLTP-shaped access surfaces (vectors,
+triggers, webhooks).
 
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–14 are promoted (in `plans/adr/`); step #15
-is design-promoted with implementation phases pending. The
-forward shape continues at #16.
+Gemini. Steps 1–15 are promoted and shipped (in `plans/adr/`
+with implementation merged); step #16 (ADR 060) is design-
+promoted with implementation phases pending and is the next
+pickup. The forward shape continues at #17.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -648,7 +759,70 @@ forward shape continues at #16.
     extension. RLE value-run format work remains a
     separate follow-up candidate. See *Where we are*.
 
-16. **Capacity-tier compression + serverless / erasure-
+16. **Sparse projection fetch narrowing** —
+    ADR 060 council-converged across Claude /
+    Codex / Gemini; implementation phases pending.
+    Composes the ADR 058 / 059 exact-COCD survival
+    mask with ADR 057's `BufferEncoding` page
+    metadata to fetch only the encoded pages whose
+    row spans intersect surviving rows, generalizing
+    ADR 052's secondary-index point-read fast path
+    from named point rows to mask survivors under
+    clustered selectivity. Internal reader
+    dispatch — no new `L2FetchStrategy` variant, no
+    wire / descriptor / PBC / capability surface,
+    no new config field, no new metric label, no
+    ADR 057 directory shape change. V1 page-
+    materializable cascade set: `BitPacked`,
+    `Dictionary { inner: Plain | BitPacked }`,
+    `Rle` (RLE correctness-eligible per codec
+    verification at
+    `src/storage/encoding/types.rs:185` +
+    `src/storage/encoding/page.rs:21`; default
+    routing settled by Phase 7 bench evidence,
+    non-blocking for BitPacked / Dictionary
+    promotion). Per-row-group uniform decision with
+    cross-column page-geometry agreement; mixed
+    sparse / dense projected columns within one
+    materialization pass deferred. V1 engages only
+    for exact-COCD masks
+    (`decoded_predicate_batches` empty); dense
+    predicate-zip with sparse projection deferred.
+    Fixed-width + non-null projection only;
+    nullable + variable-width route to dense.
+    Two-module split:
+    `src/storage/encoding/page_materialize.rs`
+    (passive decode + assembly helpers, shared
+    with ADR 052 named-row path) +
+    `src/storage/encoding/sparse_projection_fetch.rs`
+    (active planner + decision + economic logic
+    with internal `RowToPageMap` /
+    `ActivePageSet` / `SparseProjectionFetchPlan`
+    / `SparseProjectionFetchDecline` types).
+    Strict plan-time sparse_bytes < dense_bytes
+    comparison, capped by existing
+    `max_simd_pages_per_record` /
+    `max_ranges_per_record` / selected byte
+    fraction plus an internal
+    `MAX_SPARSE_RANGES_PER_BUFFER` helper-local
+    `const` for per-buffer fragmentation. Internal
+    decline reasons stay inside the planner
+    module — never become metric labels, fallback
+    variants, or reject codes. ADR 057's existing
+    `EncodingRejectCode` variants cover invariant
+    failures after sparse fetch begins. Provisional
+    bench gate: clustered 1% / 5% masks fetch ≥ 3×
+    fewer ciphertext bytes, wall-clock ≥ 1.5×
+    faster after multi-range RTT overhead, dense-
+    fallback overhead ≤ 5%, byte-identical
+    projected-batch invariant, cross-replica
+    determinism, 1M tier mandatory. Phase 7 bench
+    artifact at
+    `plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
+    is the promotion-to-shipped gate. See *Where
+    we are*.
+
+17. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
     - **zstd capacity-tier codec + `CompressionLevel`
@@ -668,7 +842,7 @@ forward shape continues at #16.
     *Each is its own ADR; ordering opportunistic and
     independent of #13 / #14 sequencing.*
 
-17. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+18. **CDC follow-up ADRs (consume ADR 054 substrate)** —
     deferred behind the storage hierarchy in the Toron-
     pivot stretch. Independent; each ships its own
     contract surface:
@@ -724,18 +898,18 @@ forward shape continues at #16.
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-18. **Vector embeddings + vector-form identity / locality
+19. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
     substrate (#8) and LSM (#11). **Set aside in the
     Toron-pivot stretch** — OLAP focus pulls
     compute-adjacent primitives ahead. Reopen after the
-    storage hierarchy (ADR 056 / 057 / 058 / 059) is in
-    production use and Toron compute-layer requirements
-    surface concrete vector workload signals. *Large,
-    multi-ADR.*
+    storage hierarchy (ADR 056 / 057 / 058 / 059 / 060)
+    is in production use and Toron compute-layer
+    requirements surface concrete vector workload
+    signals. *Large, multi-ADR.*
 
-19. **Refinement plumbing (opportunistic, no ordering
+20. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -973,6 +1147,98 @@ forward shape continues at #16.
   a re-vote with documented evidence that the
   descriptor framing buys capability the node-local
   shape doesn't.
+- **Don't add a fifth `L2FetchStrategy` variant for
+  sparse projection fetch.** ADR 060 is internal
+  dispatch inside the existing `RowGroup` strategy
+  leg. A new top-level variant would split the
+  planner's decision matrix and create path-
+  dependent physical plans on the same logical
+  query. `RowGroupFetchPlan.surviving_groups`
+  remains row-group grain; the fact that the
+  projection-fetch field carries sparse byte ranges
+  is internal planner state, not a strategy shape.
+- **Don't extend ADR 057's directory for ADR 060.**
+  Per-page row counts already exist in
+  `BufferEncoding.page_value_count`
+  (`src/storage/encoding/types.rs:185`, consumed at
+  `src/storage/encoding/page.rs:21`). ADR 060
+  reads it. Iter-2 council framing of "byte-run RLE
+  has variable rows per page" was factually wrong;
+  RLE row→page mapping is deterministic from
+  directory metadata. Don't reopen with new
+  per-page fields.
+- **Don't make BitPacked / Dictionary promotion
+  depend on RLE bench result.** ADR 060 keeps RLE
+  in the V1 page-materializable eligibility set
+  but bench-settles default routing as
+  non-blocking: pass → RLE default-on; miss →
+  RLE default-off via eligibility-layer cascade
+  exclusion (matching ADR 059's narrowed-default-
+  set pattern). Coupling BitPacked / Dictionary
+  promotion to RLE bench evidence creates risk and
+  blocks the cleaner wins. RLE outcome records
+  pass / miss explicitly in the bench artifact.
+- **Don't add operator-visible sparse config in
+  ADR 060 V1.** Existing economic caps
+  (`max_simd_pages_per_record` /
+  `max_ranges_per_record` / selected byte
+  fraction / selected ciphertext byte fraction)
+  plus the internal helper-local
+  `MAX_SPARSE_RANGES_PER_BUFFER` `const` are
+  sufficient. `enable_sparse_projection_fetch` /
+  `min_sparse_byte_fraction` / per-cascade allow-
+  list flags are explicitly rejected for V1.
+  Promotion of the per-buffer fragmentation budget
+  to operator config requires a revised ADR
+  decision with operational pressure evidence.
+- **Don't ship ADR 060 with mixed sparse / dense
+  projected columns within one row-group
+  materialization pass.** Per-row-group uniform
+  decision with cross-column page-geometry
+  agreement keeps the byte-equality oracle tight.
+  Per-column mixing is a follow-up if benches show
+  wins on the table; council convergence locks
+  uniform-per-row-group for V1.
+- **Don't surface ADR 060's internal decline
+  reasons via metric labels or fallback variants.**
+  `AllRowsMask`, `MissingExactCocdMask`,
+  `DensePredicateBatchPresent`,
+  `PageGeometryMismatchAcrossColumns`,
+  `ByteEstimateNotSparse`,
+  `PerBufferFragmentationCapExceeded`, and the
+  rest are plan-time routing facts that live
+  entirely inside
+  `src/storage/encoding/sparse_projection_fetch.rs`.
+  They never become new `EncodingFallbackReason` /
+  `RowGroupFallbackReason` variants, never become
+  metric label values, and never escape via wire /
+  descriptor / capability surface. The
+  architectural-test boundary pin is the load-
+  bearing guard.
+- **Don't ship ADR 060 V1 with dense predicate-
+  zip with sparse projection.** V1 engages only
+  for exact-COCD masks where
+  `decoded_predicate_batches` is empty. Page-
+  sliced zipping of dense predicate batches with
+  sparse projected batches has its own row-
+  alignment correctness story without a clean
+  byte-equality oracle. Reopening this for V1
+  requires a re-vote with concrete dense-
+  predicate-source evidence that page-sliced zip
+  buys capability the V1-deferred form doesn't —
+  follow-up ADR otherwise.
+- **Don't bundle ADR 060 with the encoded-fetch
+  follow-up family.** Page-level min/max/null
+  stats, sparse predicate-column fetch, dense
+  predicate-zip with sparse projection, nullable
+  sparse projection, variable-width sparse
+  projection, FSST / ALP sparse paths, RLE
+  value-run format work, and mixed
+  named-row + mask-driven projection composition
+  each consume the ADR 060 substrate
+  independently. Each ships its own contract
+  surface; bundling defers each decision behind
+  the next.
 
 ## Convergence summary
 
@@ -991,28 +1257,38 @@ StateDigest substrate                            (ADR 046)
   → row-group fetch + page directory             (ADR 056)
   → per-buffer pages + encoding cascades     (ADR 057)
   → compute over encoded data (COCD)             (ADR 058)
-  → native per-cascade COCD kernels              (ADR 059)  ← here
+  → native per-cascade COCD kernels              (ADR 059)
+  → sparse projection fetch narrowing            (ADR 060)  ← here
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is just past ADR 059: the storage hierarchy is shipped
+Design tip is just past ADR 060: the storage hierarchy is shipped
 (ADR 056 row groups, ADR 057 per-buffer pages + encoding
-cascades, ADR 058 compute over encoded data substrate); ADR 059
-council-converged, implemented, and promoted as the kernel-
-promotion follow-up that flips the substrate from correctness-
-first to enabled-by-default for the narrowed native set. ADR
-056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench evidence
-under `plans/impl/`.
+cascades, ADR 058 compute over encoded data substrate, ADR 059
+native per-cascade kernels) and ADR 060 council-converged as the
+encoded-fetch sparse follow-up — converting exact-COCD survival
+masks into per-row-group selected-page sets so projection fetch
+reads only the encoded pages whose row spans intersect surviving
+rows. ADR 056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench
+evidence under `plans/impl/`; ADR 060's Phase 7 bench evidence is
+the promotion-to-shipped gate for the encoded-fetch sparse
+contract.
 The Toron-pivot stretch closed its primary storage-hierarchy
-goal with ADR 058's substrate promotion; ADR 059 closes the
-kernel-promotion follow-up with a narrowed default-enabled set.
-**The council's lean on next pickup:** the next Toron-adjacent
-follow-up (sparse Phase-C narrowing, page-level min/max/null
-stats, FSST evaluator, or RLE value-run format after the Phase
-10 miss), or capacity-tier compression / serverless PBC /
-erasure-coding work from the remaining old #14 bundle. CDC
-follow-ups (#17) and vector embeddings (#18) remain deferred
-behind the storage hierarchy in this stretch.
+goal with ADR 058's substrate promotion and ADR 059's narrowed
+default-enabled native-kernel set; ADR 060 closes the encoded-
+fetch follow-up with internal reader dispatch, no public surface
+change, and a strict plan-time byte-comparison gate.
+**The council's lean on next pickup:** ADR 060 implementation
+phases (helper extraction from `manager.rs`, planner module,
+sparse fetch + materialize, COCD integration, architectural
+lockdown, Phase 7 bench), then the next Toron-adjacent follow-up
+(page-level min/max/null stats, FSST evaluator, RLE value-run
+format, sparse predicate-column fetch, dense predicate-zip with
+sparse projection, nullable sparse projection — each its own
+ADR), or capacity-tier compression / serverless PBC / erasure-
+coding work from the remaining old #14 bundle. CDC follow-ups
+(#18) and vector embeddings (#19) remain deferred behind the
+storage hierarchy in this stretch.
