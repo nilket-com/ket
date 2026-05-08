@@ -21,15 +21,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use wendelon::crypto::{
-	TieredOffsetIndexEntry, TieredPlaintextRange, TieredSlabObjectMetadata,
-	test_support::seeded_dev_crypto_manager,
+	SLAB_AEAD_TAG_BYTES, SLAB_ENCRYPTION_CHUNK_SIZES, TieredOffsetIndexEntry, TieredPlaintextRange,
+	TieredSlabObjectMetadata, test_support::seeded_dev_crypto_manager,
 };
 use wendelon::schema::pbc::{OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
-	BufferValueCount, HybridTimestamp, Identity, IdentityPrefix, Locality, LocalityPolicyV1,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId, TenantId,
+	BufferValueCount, ChunkSizeBytes, HybridTimestamp, Identity, IdentityPrefix, Locality,
+	LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
+	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex,
+	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId, TenantId,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
@@ -77,6 +77,7 @@ fn main() -> std::io::Result<()> {
 	bench_sparse_projection_runtime_fragmentation(&config)?;
 	bench_sparse_projection_runtime_point_read(&config)?;
 	bench_sparse_projection_runtime_determinism(&config)?;
+	bench_adr061_chunk_layout_matrix(&config)?;
 	Ok(())
 }
 
@@ -2438,6 +2439,7 @@ fn sparse_runtime_encrypted_dataset(
 	let metadata = TieredSlabObjectMetadata {
 		tenant_id: TenantId::ZERO,
 		created_hlc: 0,
+		chunk_size_bytes: wendelon::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records: false,
@@ -3066,6 +3068,190 @@ fn bench_sparse_projection_planner(config: &BenchConfig) -> std::io::Result<()> 
 		started.elapsed().as_secs_f64() * 1_000.0,
 	);
 	Ok(())
+}
+
+fn bench_adr061_chunk_layout_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	bench_adr061_macro_block_runtime(config)?;
+	bench_adr061_warehouse_model();
+	Ok(())
+}
+
+fn bench_adr061_macro_block_runtime(config: &BenchConfig) -> std::io::Result<()> {
+	const PLAINTEXT_BYTES: usize = 100 * 1024 * 1024;
+	const REQUEST_BYTES: usize = 8 * 1024 * 1024;
+	const WAREHOUSE_RUNTIME_ROWS: usize = 16_777_216;
+	let plaintext = vec![0x5a; PLAINTEXT_BYTES];
+	let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let requested = contiguous_plaintext_ranges(PLAINTEXT_BYTES, REQUEST_BYTES);
+
+	for chunk_size in SLAB_ENCRYPTION_CHUNK_SIZES {
+		let chunk_size_bytes = ChunkSizeBytes::new(chunk_size as u32);
+		let slab_id = SlabId::new(61_000 + chunk_size as u64);
+		let started = Instant::now();
+		let encrypted = crypto.encrypt_tiered_slab_object(
+			slab_id,
+			&TieredSlabObjectMetadata {
+				tenant_id: TenantId::ZERO,
+				created_hlc: 61,
+				chunk_size_bytes,
+				offset_index: vec![TieredOffsetIndexEntry {
+					key_locator: IdentityPrefix::ZERO,
+					byte_offset: 0,
+					byte_length: PLAINTEXT_BYTES as u32,
+					flags: 0,
+				}],
+				column_stats_block: None,
+				has_row_tombstone_records: false,
+			},
+			&plaintext,
+		)?;
+		let encrypt_elapsed = started.elapsed();
+		let object_size = encrypted.bytes.len() as u64;
+		let tail_start = encrypted.bytes.len().saturating_sub(64 * 1024);
+		let plan = crypto.plan_tiered_multi_range_read(
+			slab_id,
+			object_size,
+			&encrypted.bytes[tail_start..],
+			None,
+			0..PLAINTEXT_BYTES,
+			&requested,
+		)?;
+		let ciphertext_ranges = plan.ciphertext_ranges_in_object();
+		let range_lengths = ciphertext_ranges
+			.iter()
+			.map(|range| range.end.saturating_sub(range.start))
+			.collect::<Vec<_>>();
+		let ciphertext = ciphertext_ranges
+			.iter()
+			.map(|range| &encrypted.bytes[range.start as usize..range.end as usize])
+			.collect::<Vec<_>>();
+		let started = Instant::now();
+		let decrypted = plan.decrypt(&ciphertext)?;
+		let decrypt_elapsed = started.elapsed();
+		verify_decrypted_segments(&plaintext, &decrypted)?;
+		let p50_get_bytes = percentile_u64(range_lengths.clone(), 50);
+		let p95_get_bytes = percentile_u64(range_lengths, 95);
+		let dense_get_range_bytes = ciphertext_ranges
+			.iter()
+			.map(|range| range.end.saturating_sub(range.start))
+			.sum::<u64>();
+		println!(
+			"row_group_fetch_measure scenario=adr061_macro_block_runtime rows={} records=1 columns=50 shape=warehouse_100mib chunk_size={} chunk_count={} plaintext_bytes={} requested_ranges={} chunk_runs={} dense_get_ranges={} dense_get_range_bytes={} p50_get_bytes={} p95_get_bytes={} encrypt_ms={:.3} decrypt_ms={:.3} aead_calls={} iterations={}",
+			WAREHOUSE_RUNTIME_ROWS,
+			chunk_size,
+			encrypted.chunk_count,
+			PLAINTEXT_BYTES,
+			requested.len(),
+			plan.chunk_runs().len(),
+			ciphertext_ranges.len(),
+			dense_get_range_bytes,
+			p50_get_bytes,
+			p95_get_bytes,
+			encrypt_elapsed.as_secs_f64() * 1_000.0,
+			decrypt_elapsed.as_secs_f64() * 1_000.0,
+			encrypted.chunk_count,
+			config.iterations
+		);
+	}
+	Ok(())
+}
+
+fn bench_adr061_warehouse_model() {
+	const ROW_GROUP_ROWS: usize = 65_536;
+	const RECORD_BYTES: usize = 4 * 1024 * 1024;
+	const SELECTED_PAGE_BYTES: usize = 4 * 1024;
+	const BASELINE_CHUNK_BYTES: usize = 64 * 1024;
+	for rows in [16_777_216_usize, 100_000_000] {
+		let records = rows.div_ceil(ROW_GROUP_ROWS);
+		for projection_columns in [1_usize, 4, 16] {
+			let baseline_sparse_ciphertext = projection_columns as u64
+				* chunk_floor_fetch_bytes(SELECTED_PAGE_BYTES, BASELINE_CHUNK_BYTES);
+			for chunk_size in SLAB_ENCRYPTION_CHUNK_SIZES {
+				let clustered_sparse_ciphertext = projection_columns as u64
+					* chunk_floor_fetch_bytes(SELECTED_PAGE_BYTES, chunk_size);
+				let dense_get_bytes = chunk_floor_fetch_bytes(RECORD_BYTES, chunk_size);
+				println!(
+					"row_group_fetch_measure scenario=adr061_warehouse_model rows={} records={} row_group_rows={} record_bytes={} projection_columns={} mask_shape=clustered_first_page route=sparse chunk_size={} dense_p50_get_bytes={} dense_p95_get_bytes={} clustered_sparse_ciphertext_bytes={} baseline_sparse_ciphertext_bytes={} sparse_reduction_micros={} get_count_regression_micros=1000000",
+					rows,
+					records,
+					ROW_GROUP_ROWS,
+					RECORD_BYTES,
+					projection_columns,
+					chunk_size,
+					dense_get_bytes,
+					dense_get_bytes,
+					clustered_sparse_ciphertext,
+					baseline_sparse_ciphertext,
+					fraction_micros(baseline_sparse_ciphertext, clustered_sparse_ciphertext)
+				);
+				println!(
+					"row_group_fetch_measure scenario=adr061_warehouse_model rows={} records={} row_group_rows={} record_bytes={} projection_columns={} mask_shape=random_1p route=dense_decline chunk_size={} dense_p50_get_bytes={} dense_p95_get_bytes={} clustered_sparse_ciphertext_bytes=0 baseline_sparse_ciphertext_bytes=0 sparse_reduction_micros=1000000 get_count_regression_micros=1000000",
+					rows,
+					records,
+					ROW_GROUP_ROWS,
+					RECORD_BYTES,
+					projection_columns,
+					chunk_size,
+					dense_get_bytes,
+					dense_get_bytes,
+				);
+			}
+		}
+	}
+}
+
+fn contiguous_plaintext_ranges(len: usize, step: usize) -> Vec<TieredPlaintextRange> {
+	let mut out = Vec::new();
+	let mut offset = 0_usize;
+	while offset < len {
+		let range_len = step.min(len - offset);
+		out.push(TieredPlaintextRange::new(
+			RecordBodyByteOffset::new(offset as u64),
+			RecordBodyByteLen::new(range_len as u64),
+		));
+		offset += range_len;
+	}
+	out
+}
+
+fn verify_decrypted_segments(expected: &[u8], segments: &[Vec<u8>]) -> std::io::Result<()> {
+	let mut cursor = 0_usize;
+	for segment in segments {
+		let end = cursor.saturating_add(segment.len());
+		if end > expected.len() || segment.as_slice() != &expected[cursor..end] {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"ADR 061 macro-block runtime decrypted bytes differ from plaintext",
+			));
+		}
+		cursor = end;
+	}
+	if cursor != expected.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 061 macro-block runtime decrypted byte count mismatch",
+		));
+	}
+	Ok(())
+}
+
+fn percentile_u64(mut values: Vec<u64>, percentile: u64) -> u64 {
+	if values.is_empty() {
+		return 0;
+	}
+	values.sort_unstable();
+	let index = (values.len() as u64)
+		.saturating_mul(percentile)
+		.saturating_add(99)
+		.saturating_div(100)
+		.saturating_sub(1)
+		.min(values.len().saturating_sub(1) as u64) as usize;
+	values[index]
+}
+
+fn chunk_floor_fetch_bytes(plaintext_bytes: usize, chunk_size: usize) -> u64 {
+	let chunk_count = plaintext_bytes.div_ceil(chunk_size);
+	chunk_count as u64 * (chunk_size as u64 + SLAB_AEAD_TAG_BYTES as u64)
 }
 
 fn split_batches(batch: &RecordBatch, target_rows: usize) -> Vec<RecordBatch> {

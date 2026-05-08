@@ -15,7 +15,10 @@ use crate::storage::encoding::directory::{
 	build_encoding_directory_for_ipc_stream, compact_encoding_ipc_stream,
 	serialize_encoding_directory_value,
 };
-use crate::storage::encoding::{ENCODING_DIRECTORY_METADATA_KEY, EncodingWriterConfig};
+use crate::storage::encoding::{
+	ENCODING_DIRECTORY_METADATA_KEY, EncodingWriterConfig, L2ChunkLayoutConfig,
+	choose_chunk_size_bytes,
+};
 use crate::storage::ipc::{
 	EncodedRecordBatch, encode_record_batch, encode_record_batch_bytes,
 	encode_record_batches_bytes, record_batch_compression_policy_from_ipc,
@@ -156,7 +159,7 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 ) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
-	pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
+	pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config(
 		meta,
 		descriptor,
 		batch,
@@ -164,6 +167,7 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 		row_hlc,
 		row_group_config,
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
@@ -175,6 +179,28 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
+	pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config(
+		meta,
+		descriptor,
+		batch,
+		admission,
+		row_hlc,
+		row_group_config,
+		encoding_config,
+		&L2ChunkLayoutConfig::default(),
+	)
+}
+
+pub fn pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config(
+	meta: &TableWriteRequestMeta,
+	descriptor: &TableSchemaDescriptorV1,
+	batch: &RecordBatch,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> Result<Vec<PackedMultiRowRecord>, TableWriteValidationError> {
 	let layout = match &descriptor.record_layout_policy {
 		RecordLayoutPolicy::MultiRow(layout) => *layout,
@@ -224,15 +250,17 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
 			)
 			.map_err(table_pack_io_error)?;
 			if encoding_config.enabled {
-				encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
-					batch,
-					&rows[cursor..cursor + upper],
-					descriptor,
-					descriptor.record_body_compression_policy,
-					row_group_config,
-					encoding_config,
-				)
-				.map_err(table_pack_io_error)?;
+				encoded =
+					encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
+						batch,
+						&rows[cursor..cursor + upper],
+						descriptor,
+						descriptor.record_body_compression_policy,
+						row_group_config,
+						encoding_config,
+						chunk_layout_config,
+					)
+					.map_err(table_pack_io_error)?;
 			}
 			if encoded.plaintext_byte_len > max_record_bytes && upper > 1 {
 				let mut low = 1;
@@ -249,13 +277,14 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
 					)
 					.map_err(table_pack_io_error)?;
 					let candidate = if encoding_config.enabled {
-						encode_multirow_from_survivors_with_row_group_and_encoding_config(
+						encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
 							batch,
 							&rows[cursor..cursor + mid],
 							descriptor,
 							descriptor.record_body_compression_policy,
 							row_group_config,
 							encoding_config,
+							chunk_layout_config,
 						)
 						.map_err(table_pack_io_error)?
 					} else {
@@ -323,6 +352,7 @@ pub fn encode_multirow_from_survivors_with_policy(
 		None,
 		&RowGroupWriterConfig::default(),
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
@@ -340,6 +370,7 @@ pub fn encode_multirow_from_survivors_with_row_group_config(
 		Some(descriptor),
 		row_group_config,
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
@@ -351,6 +382,26 @@ pub fn encode_multirow_from_survivors_with_row_group_and_encoding_config(
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<EncodedMultiRowFrame> {
+	encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
+		batch,
+		survivors,
+		descriptor,
+		policy,
+		row_group_config,
+		encoding_config,
+		&L2ChunkLayoutConfig::default(),
+	)
+}
+
+pub fn encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
+	batch: &RecordBatch,
+	survivors: &[MultiRowSourceRow],
+	descriptor: &TableSchemaDescriptorV1,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
+) -> std::io::Result<EncodedMultiRowFrame> {
 	encode_multirow_from_survivors_with_optional_row_groups(
 		batch,
 		survivors,
@@ -358,6 +409,7 @@ pub fn encode_multirow_from_survivors_with_row_group_and_encoding_config(
 		Some(descriptor),
 		row_group_config,
 		encoding_config,
+		chunk_layout_config,
 	)
 }
 
@@ -368,6 +420,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 	descriptor: Option<&TableSchemaDescriptorV1>,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<EncodedMultiRowFrame> {
 	if survivors.is_empty() {
 		return Err(Error::new(
@@ -401,6 +454,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 		policy,
 		row_group_config,
 		encoding_config,
+		chunk_layout_config,
 	)?;
 	let decoded_rows = storage_rows_from_batch(&storage_batch)?;
 	let max_row_hlc = decoded_rows
@@ -424,6 +478,7 @@ fn encode_storage_batch_with_optional_row_groups(
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<EncodedRecordBatch> {
 	let single = encode_record_batch(storage_batch, policy)?;
 	let Some(descriptor) = descriptor else {
@@ -443,6 +498,7 @@ fn encode_storage_batch_with_optional_row_groups(
 		policy,
 		row_group_config,
 		encoding_config,
+		chunk_layout_config,
 	)
 }
 
@@ -467,6 +523,7 @@ fn encode_row_group_batches_with_directory(
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<EncodedRecordBatch> {
 	let mut directory_value = String::new();
 	let mut encoding_directory_value = String::new();
@@ -501,11 +558,14 @@ fn encode_row_group_batches_with_directory(
 				)?;
 				match encoding_directory {
 					Some(encoding_directory) => {
+						let chunk_size_bytes =
+							choose_chunk_size_bytes(Some(&encoding_directory), chunk_layout_config);
 						let compacted = compact_encoding_ipc_stream(
 							&bytes,
 							&directory,
 							&encoding_directory,
 							&applied,
+							chunk_size_bytes,
 						)?;
 						(
 							compacted.bytes,
@@ -660,7 +720,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
-	pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
+	pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config(
 		layout,
 		batch,
 		rows,
@@ -668,6 +728,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
 		policy,
 		row_group_config,
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
@@ -680,6 +741,28 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
+	pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config(
+		layout,
+		batch,
+		rows,
+		descriptor,
+		policy,
+		row_group_config,
+		encoding_config,
+		&L2ChunkLayoutConfig::default(),
+	)
+}
+
+pub fn pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config(
+	layout: MultiRowLayoutDescriptor,
+	batch: &RecordBatch,
+	rows: &[MultiRowSourceRow],
+	descriptor: Option<&TableSchemaDescriptorV1>,
+	policy: RecordBodyCompressionPolicy,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
+) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	pack_multirow_source_rows_with_caps(
 		batch,
 		rows,
@@ -690,6 +773,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
 		policy,
 		row_group_config,
 		encoding_config,
+		chunk_layout_config,
 	)
 }
 
@@ -781,6 +865,7 @@ pub fn merge_multirow_streams(
 		RecordBodyCompressionPolicy::Uncompressed,
 		&RowGroupWriterConfig::default(),
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)?
 	.into_iter()
 	.map(|packed| packed.encoded)
@@ -1312,6 +1397,7 @@ fn pack_multirow_source_rows_with_caps(
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
 	if rows.is_empty() {
 		return Ok(Vec::new());
@@ -1336,13 +1422,14 @@ fn pack_multirow_source_rows_with_caps(
 				let source_rows = &bucket_rows[cursor..cursor + mid];
 				let encoded = match descriptor {
 					Some(descriptor) => {
-						encode_multirow_from_survivors_with_row_group_and_encoding_config(
+						encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
 							batch,
 							source_rows,
 							descriptor,
 							policy,
 							row_group_config,
 							encoding_config,
+							chunk_layout_config,
 						)?
 					}
 					None => encode_multirow_from_survivors_with_policy(batch, source_rows, policy)?,

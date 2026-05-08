@@ -15,7 +15,10 @@ chosen default scope: `BitPacked` and `Dictionary`
 sparse projection fetch are default-engaged when
 the plan-time economics choose them; RLE remains
 default-off after Phase 7 evidence and is recorded
-as follow-up ADR territory.
+as follow-up ADR territory. The recorded-not-gated
+ciphertext-ratio follow-up is closed by ADR 061's shipped
+per-slab chunk-size selection and bench evidence at
+`plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md`.
 
 ## Context
 
@@ -1037,7 +1040,8 @@ when:
    demonstrates the revised promotion gates for
    the council-chosen default scope, including RLE
    Q1 default-off resolution and recorded-not-gated
-   ciphertext ratios.
+   ciphertext ratios; ADR 061 subsequently closes the
+   ciphertext-ratio follow-up with shipped chunk-size evidence.
 5. ADR 056 / 057 §"Where we are" amendments
    point at the landed bench artifact.
 6. Architectural lockdown guards land per §11.

@@ -42,9 +42,9 @@
 
 use crate::consensus::MigratedRangeTombstone;
 use crate::crypto::{
-	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary, TieredColumnStatsBlock,
-	TieredMultiRangeReadPlan, TieredOffsetIndexEntry, TieredPlaintextRange,
-	TieredSlabObjectMetadata,
+	CryptoManager, DecryptedTieredSlab, EncryptedTieredSlab, FooterSummary,
+	SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE, TieredColumnStatsBlock, TieredMultiRangeReadPlan,
+	TieredOffsetIndexEntry, TieredPlaintextRange, TieredSlabObjectMetadata,
 };
 use crate::metrics::{LsmCompactionResult, LsmDigestInvariantKind, global as metrics};
 use crate::schema::table::{
@@ -83,6 +83,7 @@ use crate::storage::encoding::compute::{
 	native_evaluation_eligibility, try_fold_encoded_aggregate_request,
 };
 use crate::storage::encoding::materialize::find_buffer_encoding;
+use crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory;
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
@@ -95,8 +96,9 @@ use crate::storage::encoding::sparse_projection_fetch::{
 	decide_sparse_projection_fetch,
 };
 use crate::storage::encoding::{
-	BufferEncoding, EncodingCascade, EncodingComputeConfig, EncodingDirectory,
-	EncodingFallbackReason, EncodingRejectCode, EncodingWriterConfig, L2EncodingFetchConfig,
+	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodingCascade, EncodingComputeConfig,
+	EncodingDirectory, EncodingFallbackReason, EncodingRejectCode, EncodingWriterConfig,
+	L2ChunkLayoutConfig, L2EncodingFetchConfig, choose_chunk_size_bytes_for_directories,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow,
@@ -108,9 +110,9 @@ use crate::storage::l2::ObjectStore;
 use crate::storage::multirow::{
 	MultiRowSourceRow, StorageRowMetadata, decode_batch as decode_record_batch,
 	encode_batch_with_policy, encode_multirow_from_survivors_with_policy,
-	encode_multirow_from_survivors_with_row_group_and_encoding_config,
+	encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config,
 	has_storage_synthetic_columns, materialize_record_location_batch,
-	pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config,
+	pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config,
 };
 use crate::storage::secondary_index::{
 	SecondaryIndexCandidateRejectReason, SecondaryIndexCandidateValidation, SecondaryIndexEntry,
@@ -145,13 +147,14 @@ use crate::storage::{
 use arrow::array::Array;
 use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
+use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Error, ErrorKind};
+use std::io::{Cursor, Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -222,6 +225,8 @@ pub struct SlabManagerConfig {
 	pub l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig,
 	/// Deployment-wide ADR 057 Encoding writer config.
 	pub encoding_writer: EncodingWriterConfig,
+	/// Deployment-wide ADR 061 authenticated chunk layout writer config.
+	pub l2_chunk_layout: L2ChunkLayoutConfig,
 	/// Node-local ADR 057 L2 Encoding materialization config.
 	pub l2_encoding_fetch: L2EncodingFetchConfig,
 	/// Node-local ADR 058 compute-over-encoded-data executor config.
@@ -1166,6 +1171,7 @@ impl SlabManager {
 		config.row_group_writer.validate()?;
 		config.l2_row_group_fetch.validate()?;
 		config.encoding_writer.validate()?;
+		config.l2_chunk_layout.validate()?;
 		config.l2_encoding_fetch.validate()?;
 		config.encoding_compute.validate()?;
 		if !config.dir.is_dir() {
@@ -4520,7 +4526,8 @@ impl SlabManager {
 		slab_id: SlabId,
 		plaintext_blob: &[u8],
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let metadata = build_tiered_object_metadata(plaintext_blob, slab_id)?;
+		let metadata =
+			build_tiered_object_metadata(plaintext_blob, slab_id, &self.config.l2_chunk_layout)?;
 		self.config
 			.crypto
 			.encrypt_tiered_slab_object(slab_id, &metadata, plaintext_blob)
@@ -4532,7 +4539,8 @@ impl SlabManager {
 		plaintext_blob: &[u8],
 		table_schemas: &TableSchemaCatalogV1,
 	) -> std::io::Result<EncryptedTieredSlab> {
-		let mut metadata = build_tiered_object_metadata(plaintext_blob, slab_id)?;
+		let mut metadata =
+			build_tiered_object_metadata(plaintext_blob, slab_id, &self.config.l2_chunk_layout)?;
 		metadata.column_stats_block = self.build_tiered_column_stats_block(
 			plaintext_blob,
 			slab_id,
@@ -6299,6 +6307,10 @@ impl SlabManager {
 		&self.config.encoding_writer
 	}
 
+	pub(crate) fn l2_chunk_layout_config(&self) -> &L2ChunkLayoutConfig {
+		&self.config.l2_chunk_layout
+	}
+
 	pub(crate) fn row_group_fetch_parallelism(&self) -> usize {
 		self.config
 			.l2_row_group_fetch
@@ -7042,6 +7054,7 @@ impl SlabManager {
 					Some(table_schemas),
 					&self.config.row_group_writer,
 					&self.config.encoding_writer,
+					&self.config.l2_chunk_layout,
 				)?
 				else {
 					continue;
@@ -7187,6 +7200,7 @@ impl SlabManager {
 					Some(table_schemas),
 					&self.config.row_group_writer,
 					&self.config.encoding_writer,
+					&self.config.l2_chunk_layout,
 				)?
 				else {
 					continue;
@@ -7555,6 +7569,7 @@ impl SlabManager {
 				None,
 				&self.config.row_group_writer,
 				&self.config.encoding_writer,
+				&self.config.l2_chunk_layout,
 			)? {
 				if compacted.was_multirow {
 					multirow_recompact_count = multirow_recompact_count.saturating_add(1);
@@ -7627,7 +7642,7 @@ impl SlabManager {
 						})
 						.collect::<Vec<_>>();
 					for packed in
-						pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
+						pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config(
 							*layout,
 							&batch,
 							&source_rows,
@@ -7635,6 +7650,7 @@ impl SlabManager {
 							descriptor.record_body_compression_policy,
 							&self.config.row_group_writer,
 							&self.config.encoding_writer,
+							&self.config.l2_chunk_layout,
 						)? {
 						let Some(primary) = packed.encoded.rows.first().copied() else {
 							return Err(Error::new(
@@ -8095,6 +8111,7 @@ impl SlabManager {
 				None,
 				&self.config.row_group_writer,
 				&self.config.encoding_writer,
+				&self.config.l2_chunk_layout,
 			)?
 			else {
 				continue;
@@ -12294,6 +12311,7 @@ fn compact_physical_record_frame(
 	table_schemas: Option<&TableSchemaCatalogV1>,
 	row_group_config: &crate::storage::row_group::RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<Option<CompactedFrame>> {
 	let mut survivors = records
 		.iter()
@@ -12373,14 +12391,17 @@ fn compact_physical_record_frame(
 		.collect::<Vec<_>>();
 	let policy = crate::storage::ipc::record_batch_compression_policy_from_ipc(frame)?;
 	let encoded = match descriptor {
-		Some(descriptor) => encode_multirow_from_survivors_with_row_group_and_encoding_config(
-			&batch,
-			&source_rows,
-			descriptor,
-			policy,
-			row_group_config,
-			encoding_config,
-		)?,
+		Some(descriptor) => {
+			encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
+				&batch,
+				&source_rows,
+				descriptor,
+				policy,
+				row_group_config,
+				encoding_config,
+				chunk_layout_config,
+			)?
+		}
 		None => encode_multirow_from_survivors_with_policy(&batch, &source_rows, policy)?,
 	};
 	let entries = encoded.rows;
@@ -12550,6 +12571,7 @@ fn descriptor_matches_tiered_row(
 fn build_tiered_object_metadata(
 	blob: &[u8],
 	slab_id: SlabId,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<TieredSlabObjectMetadata> {
 	let entries = recover_slab_entries_from_blob(blob, slab_id)?;
 	let Some(first_entry) = entries.first().copied() else {
@@ -12589,10 +12611,65 @@ fn build_tiered_object_metadata(
 	Ok(TieredSlabObjectMetadata {
 		tenant_id,
 		created_hlc: first_entry.location.hlc.physical_ms,
+		chunk_size_bytes: choose_tiered_object_chunk_size(blob, slab_id, chunk_layout_config)?,
 		offset_index,
 		column_stats_block: None,
 		has_row_tombstone_records,
 	})
+}
+
+fn choose_tiered_object_chunk_size(
+	blob: &[u8],
+	slab_id: SlabId,
+	chunk_layout_config: &L2ChunkLayoutConfig,
+) -> std::io::Result<crate::schema::ChunkSizeBytes> {
+	if !chunk_layout_config.enabled {
+		return Ok(SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE);
+	}
+	let directories = encoding_directories_from_slab_blob(blob, slab_id)?;
+	Ok(choose_chunk_size_bytes_for_directories(
+		directories.iter(),
+		chunk_layout_config,
+	))
+}
+
+fn encoding_directories_from_slab_blob(
+	blob: &[u8],
+	slab_id: SlabId,
+) -> std::io::Result<Vec<EncodingDirectory>> {
+	let mut out = Vec::new();
+	let mut seen_records = BTreeSet::new();
+	for entry in recover_slab_entries_from_blob(blob, slab_id)? {
+		if !seen_records.insert((entry.location.offset, entry.location.length)) {
+			continue;
+		}
+		let frame = extract_record_from_blob(blob, entry.location)?;
+		if !ipc_stream_contains_encoding_directory(&frame) {
+			continue;
+		}
+		let reader = StreamReader::try_new(Cursor::new(frame), None).map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("arrow stream open for chunk-size selection: {err}"),
+			)
+		})?;
+		let schema = reader.schema();
+		let Some(value) = schema.metadata().get(ENCODING_DIRECTORY_METADATA_KEY) else {
+			continue;
+		};
+		let directory =
+			crate::storage::encoding::directory::deserialize_encoding_directory_value(value)
+				.map_err(|code| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"Encoding directory rejected during chunk-size selection: {code:?}"
+						),
+					)
+				})?;
+		out.push(directory);
+	}
+	Ok(out)
 }
 
 fn row_tombstone_metadata_from_blob(
@@ -12630,7 +12707,7 @@ fn merge_row_tombstone_metadata(
 }
 
 fn single_tenant_id_from_plain_slab(blob: &[u8], slab_id: SlabId) -> std::io::Result<TenantId> {
-	Ok(build_tiered_object_metadata(blob, slab_id)?.tenant_id)
+	Ok(build_tiered_object_metadata(blob, slab_id, &L2ChunkLayoutConfig::default())?.tenant_id)
 }
 
 fn slab_path(dir: &Path, slab_id: SlabId) -> PathBuf {
@@ -13590,6 +13667,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit,
@@ -13616,6 +13694,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -15068,6 +15147,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -15294,6 +15374,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -15461,6 +15542,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -15974,6 +16056,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -16097,6 +16180,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -16240,6 +16324,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -16371,6 +16456,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -16906,6 +16992,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
@@ -16934,6 +17021,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -17004,6 +17092,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
@@ -17042,6 +17131,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -17286,6 +17376,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -17423,6 +17514,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -17592,6 +17684,7 @@ mod tests {
 					..Default::default()
 				},
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -18075,6 +18168,7 @@ mod tests {
 					..Default::default()
 				},
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
 					enabled: true,
 					..Default::default()
@@ -18415,6 +18509,172 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
+		let dir = fresh_dir("adr061-chunk-layout");
+		let chunk_layout_config = crate::storage::encoding::L2ChunkLayoutConfig {
+			enabled: true,
+			..Default::default()
+		};
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir,
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: None,
+				rehydration: RehydrationPolicy::default(),
+				l2_column_fetch: L2ColumnFetchConfig::default(),
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: Default::default(),
+				encoding_writer: Default::default(),
+				l2_chunk_layout: chunk_layout_config.clone(),
+				l2_encoding_fetch: Default::default(),
+				encoding_compute: Default::default(),
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("payload", DataType::UInt8, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x61; 16]),
+			1,
+			"analytics",
+			"adr061_chunk_layout",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(4096, 4096, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Uncompressed;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let row_count = 4096_usize;
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(UInt8Array::from_iter_values(
+					(0..row_count).map(|row| row as u8),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(610 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: None,
+				}
+			})
+			.collect::<Vec<_>>();
+		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			min_paged_record_rows: RowCount::new(1024),
+			min_paged_record_bytes: RecordBodyByteLen::new(1),
+			stats_supported_types: std::collections::BTreeSet::new(),
+		};
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let encoded = crate::storage::multirow::encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
+			&batch,
+			&source_rows,
+			&descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&row_group_config,
+			&encoding_config,
+			&chunk_layout_config,
+		)
+		.unwrap();
+		let parsed = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::ZERO,
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: encoded.frame.len() as u64,
+			},
+			&encoded.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = parsed.page_directory.as_ref().unwrap();
+		let encoding_directory = parsed.encoding_directory.as_ref().unwrap();
+		for encoding in &encoding_directory.buffers {
+			if !crate::storage::encoding::chunk_layout::default_sparse_engaged_key(
+				encoding_directory,
+				encoding.row_group_index,
+				encoding.ipc_column_ordinal,
+				encoding.ipc_buffer_ordinal,
+			) {
+				continue;
+			}
+			let page = page_directory
+				.buffer_pages
+				.iter()
+				.find(|page| {
+					page.row_group_index == encoding.row_group_index
+						&& page.ipc_column_ordinal == encoding.ipc_column_ordinal
+						&& page.ipc_buffer_ordinal == encoding.ipc_buffer_ordinal
+				})
+				.unwrap();
+			let physical_start =
+				page.range.start.get() + u64::from(encoding.encoded_range.start.get());
+			assert_eq!(
+				physical_start % u64::from(16 * 1024_u32),
+				0,
+				"default-engaged encoded buffer should start on the selected chunk boundary"
+			);
+		}
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		assert_eq!(
+			encrypted.chunk_size_bytes,
+			crate::schema::ChunkSizeBytes::new(16 * 1024)
+		);
+		let footer = mgr
+			.encrypted_tiered_footer_summary(&encrypted.bytes)
+			.unwrap()
+			.expect("encrypted footer");
+		assert_eq!(footer.chunk_size_bytes, encrypted.chunk_size_bytes);
+		let decrypted = mgr
+			.config
+			.crypto
+			.decrypt_tiered_slab(slab_id, &encrypted.bytes)
+			.unwrap();
+		assert_eq!(decrypted.plaintext, raw);
+	}
+
+	#[tokio::test]
 	async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 		let l1_dir = fresh_dir("encoding-index-l1");
 		let l2_dir = fresh_dir("encoding-index-l2");
@@ -18442,6 +18702,7 @@ mod tests {
 					..Default::default()
 				},
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
 					enabled: true,
 					..Default::default()
@@ -18783,6 +19044,7 @@ mod tests {
 			Some(&catalog),
 			&writer_config,
 			&EncodingWriterConfig::default(),
+			&L2ChunkLayoutConfig::default(),
 		)
 		.unwrap()
 		.expect("compacted frame");
@@ -18792,6 +19054,7 @@ mod tests {
 			Some(&catalog),
 			&writer_config,
 			&EncodingWriterConfig::default(),
+			&L2ChunkLayoutConfig::default(),
 		)
 		.unwrap()
 		.expect("compacted frame");
@@ -18856,6 +19119,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: mismatched_tenant,
 					created_hlc: 10,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -19134,6 +19398,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -19172,6 +19437,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
@@ -19254,6 +19520,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
@@ -19327,6 +19594,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),
@@ -19379,6 +19647,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: GroupCommitConfig::default(),
@@ -19450,6 +19719,7 @@ mod tests {
 			row_group_writer: Default::default(),
 			l2_row_group_fetch: Default::default(),
 			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
 			l2_encoding_fetch: Default::default(),
 			encoding_compute: Default::default(),
 			group_commit: GroupCommitConfig::default(),

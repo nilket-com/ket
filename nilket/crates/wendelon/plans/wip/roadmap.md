@@ -22,8 +22,9 @@ forward-sequence rewrite.
 ADR 061 (Page-Aligned Authenticated Chunks with
 Macro-Block Read Coalescing) council-converged
 across Claude / Codex / Gemini after five council
-iterations; implementation phases pending per
-`plans/impl/061_page_aligned_authenticated_chunk_layout.md`.
+iterations, implemented, and promoted to shipped with
+bench evidence at
+`plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md`.
 Closes ADR 060's recorded-not-gated ciphertext
 follow-up. **Two-layer decoupling**: AEAD
 authentication boundary and physical network read
@@ -31,7 +32,7 @@ unit are independent layers optimized for
 different forces. **Layer 1 — AEAD chunks**:
 small per-slab `chunk_size_bytes` from a closed
 set `{4, 8, 16, 32, 64} KiB`; default 16 KiB for
-slabs with an `EncodingDirectory`, 64 KiB legacy
+slabs with an `EncodingDirectory`, 64 KiB baseline
 elsewhere. **Buffer starts** align to chunk
 boundaries via opaque pad bytes in IPC body slack
 *between* adjacent buffers (no intra-buffer
@@ -618,9 +619,9 @@ triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–16 are promoted and shipped (in `plans/adr/`
-with implementation merged). Step 17 (ADR 061) is council-
-converged with implementation phases pending. The forward shape
+Gemini. Steps 1–17 are promoted and shipped (in `plans/adr/`
+with implementation merged). ADR 061 closes the current storage-
+hierarchy ciphertext-floor follow-up. The forward shape
 continues at #18.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
@@ -697,7 +698,7 @@ continues at #18.
     point-read latency reduction via SIMD-page fast
     path, full-buffer materialization cost vs. ADR 056,
     writer-cost defended by compression and read-side
-    wins, cross-replica determinism, mixed legacy /
+    wins, cross-replica determinism, mixed baseline /
     Encoding slab read throughput, secondary-index page
     fast path, and CSB bypass evidence. This opens ADR
     058. See *Where we are*.
@@ -868,16 +869,16 @@ continues at #18.
 17. **Page-aligned authenticated chunks with macro-block
     read coalescing** —
     ADR 061 council-converged across Claude / Codex /
-    Gemini after five council iterations; implementation
-    phases pending. Closes ADR 060's recorded-not-gated
+    Gemini after five council iterations, implemented,
+    and promoted to shipped. Closes ADR 060's recorded-not-gated
     ciphertext follow-up. **Two-layer decoupling**: AEAD
     authentication boundary and physical network read unit
     are independent layers optimized for different forces.
     Layer 1 — small AEAD chunks from a closed set
     `{4, 8, 16, 32, 64} KiB`, default 16 KiB for slabs with
     an `EncodingDirectory` (V1 promoted floor; 4 KiB and
-    8 KiB remain in the closed set for Phase 9 diagnostic
-    rows but are not selectable by the V1 selector). Layer
+    8 KiB remain in the closed set for diagnostic rows but
+    are not selectable by the V1 selector). Layer
     2 — ADR 044's existing `TieredMultiRangeReadPlan`
     coalescer merges contiguous AEAD chunks into multi-MiB
     `get_range` calls; warehouse-scale dense paths produce
@@ -1364,8 +1365,8 @@ StateDigest substrate                            (ADR 046)
   → refinement plumbing
 ```
 
-Design tip is at ADR 061 (council-converged, implementation
-pending). The storage hierarchy is shipped through ADR 060 (row
+Design tip is at ADR 061 (council-converged, implemented, and
+promoted to shipped). The storage hierarchy is shipped through ADR 061 (row
 groups, per-buffer pages + encoding cascades, compute over
 encoded data substrate, native per-cascade kernels, sparse
 projection fetch narrowing). ADR 061 closes ADR 060's recorded-
@@ -1381,8 +1382,8 @@ with explicit promotion gate.
 ADR 056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench
 evidence under `plans/impl/`; ADR 060's Phase 7 artifact records
 the revised plaintext-byte gate, ciphertext-byte floor, and RLE
-default-off disposition; ADR 061's Phase 9 evidence pending
-implementation.
+default-off disposition; ADR 061's Phase 9 artifact closes the
+ciphertext floor and macro-block coalescing gates.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
 default-enabled native-kernel set; ADR 060 closed the encoded-
@@ -1391,8 +1392,8 @@ change, and a strict plan-time byte-comparison gate; ADR 061
 closes the ciphertext-floor follow-up via the AEAD/network
 two-layer decoupling, with the macro-block coalescing test as
 the load-bearing empirical gate.
-**The council's lean on next pickup:** ADR 061 implementation
-phases, then either the next Toron-adjacent follow-up (page-
+**The council's lean on next pickup:** either the next
+Toron-adjacent follow-up (page-
 level min/max/null stats, FSST evaluator, RLE value-run format,
 sparse predicate-column fetch, dense predicate-zip with sparse
 projection, nullable sparse projection — each its own ADR), or

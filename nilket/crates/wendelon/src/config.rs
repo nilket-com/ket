@@ -21,8 +21,8 @@ use crate::node::{
 use crate::schema::ProtocolVersionWindow;
 use crate::storage::{
 	EncodedAggregateKind, EncodingCascadeKind, EncodingComputeConfig, EncodingComputeEvaluatorKind,
-	EncodingWriterConfig, L2ColumnFetchConfig, L2EncodingFetchConfig, L2RowGroupFetchConfig,
-	MvccRetentionPolicy, RowGroupWriterConfig,
+	EncodingWriterConfig, L2ChunkLayoutConfig, L2ColumnFetchConfig, L2EncodingFetchConfig,
+	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -131,6 +131,8 @@ struct RawStorageConfig {
 	l2_row_group_fetch: RawL2RowGroupFetchConfig,
 	#[serde(default)]
 	encoding_writer: RawEncodingWriterConfig,
+	#[serde(default)]
+	l2_chunk_layout: RawL2ChunkLayoutConfig,
 	#[serde(default)]
 	l2_encoding_fetch: RawL2EncodingFetchConfig,
 	#[serde(default)]
@@ -299,6 +301,28 @@ impl RawEncodingWriterConfig {
 				};
 				cfg.enabled_cascades.insert(kind);
 			}
+		}
+		cfg.validate()?;
+		Ok(cfg)
+	}
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawL2ChunkLayoutConfig {
+	#[serde(default)]
+	enabled: Option<bool>,
+	#[serde(default)]
+	max_pad_inflation_micros: Option<u32>,
+}
+
+impl RawL2ChunkLayoutConfig {
+	fn into_runtime_config(self) -> std::io::Result<L2ChunkLayoutConfig> {
+		let mut cfg = L2ChunkLayoutConfig::default();
+		if let Some(enabled) = self.enabled {
+			cfg.enabled = enabled;
+		}
+		if let Some(micros) = self.max_pad_inflation_micros {
+			cfg.max_pad_inflation_micros = crate::schema::SelectivityFractionMicros::new(micros);
 		}
 		cfg.validate()?;
 		Ok(cfg)
@@ -780,6 +804,7 @@ impl RawConfig {
 		let row_group_writer = self.storage.row_group_writer.into_runtime_config()?;
 		let l2_row_group_fetch = self.storage.l2_row_group_fetch.into_runtime_config()?;
 		let encoding_writer = self.storage.encoding_writer.into_runtime_config()?;
+		let l2_chunk_layout = self.storage.l2_chunk_layout.into_runtime_config()?;
 		let l2_encoding_fetch = self.storage.l2_encoding_fetch.into_runtime_config()?;
 		let encoding_compute = self.storage.encoding_compute.into_runtime_config()?;
 		let cfg = NodeBootstrapConfig {
@@ -804,6 +829,7 @@ impl RawConfig {
 			row_group_writer,
 			l2_row_group_fetch,
 			encoding_writer,
+			l2_chunk_layout,
 			l2_encoding_fetch,
 			encoding_compute,
 			root_kek_provider: self.crypto.root_kek_provider,

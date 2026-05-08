@@ -108,14 +108,14 @@ use crate::storage::columnar::{
 	execute_aggregate_projected_record_batch, execute_pbc_projected_record_batch,
 };
 use crate::storage::core::{RecordLocation, StorageEngine, is_zero_hlc};
-use crate::storage::encoding::EncodingWriterConfig;
+use crate::storage::encoding::{EncodingWriterConfig, L2ChunkLayoutConfig};
 use crate::storage::manager::{
 	EncodedAggregateL2RecordRead, EncodingMaterializeAuditSample, SlabManager,
 };
 use crate::storage::multirow::{
 	MultiRowSourceRow, decode_batch, encode_batch, encode_batch_with_policy,
 	has_storage_synthetic_columns, materialize_record_location_batch,
-	pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config,
+	pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config,
 	pack_tombstone_multirow_source_rows_with_policy, replace_storage_row_hlc_column,
 	storage_index_entries_from_batch, storage_row_is_tombstone_at, storage_row_table_object_id_at,
 };
@@ -9419,7 +9419,7 @@ impl WendelonDataServer {
 				Some(outcome.bifurcated)
 			})
 		} else {
-			bifurcate_table_write_with_row_group_and_encoding_config(
+			bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 				&meta,
 				&payload,
 				&descriptor,
@@ -9427,6 +9427,7 @@ impl WendelonDataServer {
 				commit_hlc,
 				self.slab.row_group_writer_config(),
 				self.slab.encoding_writer_config(),
+				self.slab.l2_chunk_layout_config(),
 			)
 			.map(Some)
 		} {
@@ -9563,15 +9564,17 @@ impl WendelonDataServer {
 				}
 			}
 		}
-		let bifurcated = bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
-			meta,
-			batch,
-			descriptor,
-			&admission,
-			row_hlc,
-			self.slab.row_group_writer_config(),
-			self.slab.encoding_writer_config(),
-		)?;
+		let bifurcated =
+			bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
+				meta,
+				batch,
+				descriptor,
+				&admission,
+				row_hlc,
+				self.slab.row_group_writer_config(),
+				self.slab.encoding_writer_config(),
+				self.slab.l2_chunk_layout_config(),
+			)?;
 		Ok(PrimaryKeyBifurcation {
 			bifurcated,
 			upsert_no_digest_add_rows,
@@ -9623,7 +9626,7 @@ impl WendelonDataServer {
 		}
 		if store_rows.len() == batch.num_rows() {
 			let bifurcated =
-				bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
+				bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 					meta,
 					batch,
 					descriptor,
@@ -9631,6 +9634,7 @@ impl WendelonDataServer {
 					row_hlc,
 					self.slab.row_group_writer_config(),
 					self.slab.encoding_writer_config(),
+					self.slab.l2_chunk_layout_config(),
 				)?;
 			return Ok(ContentHashBifurcation {
 				bifurcated: Some(bifurcated),
@@ -9651,15 +9655,17 @@ impl WendelonDataServer {
 				.map(|row| admission.localities[*row])
 				.collect(),
 		};
-		let bifurcated = bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
-			meta,
-			&filtered_batch,
-			descriptor,
-			&filtered_admission,
-			row_hlc,
-			self.slab.row_group_writer_config(),
-			self.slab.encoding_writer_config(),
-		)?;
+		let bifurcated =
+			bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
+				meta,
+				&filtered_batch,
+				descriptor,
+				&filtered_admission,
+				row_hlc,
+				self.slab.row_group_writer_config(),
+				self.slab.encoding_writer_config(),
+				self.slab.l2_chunk_layout_config(),
+			)?;
 		Ok(ContentHashBifurcation {
 			bifurcated: Some(bifurcated),
 			absorbed_rows: absorbed,
@@ -14419,7 +14425,7 @@ fn bifurcate_table_write_with_row_group_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
-	bifurcate_table_write_with_row_group_and_encoding_config(
+	bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 		meta,
 		batch,
 		descriptor,
@@ -14427,10 +14433,11 @@ fn bifurcate_table_write_with_row_group_config(
 		row_hlc,
 		row_group_config,
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
-fn bifurcate_table_write_with_row_group_and_encoding_config(
+fn bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
 	descriptor: &TableSchemaDescriptorV1,
@@ -14438,6 +14445,7 @@ fn bifurcate_table_write_with_row_group_and_encoding_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let observe_encode = matches!(
 		&descriptor.locality_policy,
@@ -14450,7 +14458,7 @@ fn bifurcate_table_write_with_row_group_and_encoding_config(
 		metrics().observe_pbc_locality_encode(encode_started.elapsed());
 	}
 	let admission = admission?;
-	bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
+	bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 		meta,
 		batch,
 		descriptor,
@@ -14458,6 +14466,7 @@ fn bifurcate_table_write_with_row_group_and_encoding_config(
 		row_hlc,
 		row_group_config,
 		encoding_config,
+		chunk_layout_config,
 	)
 }
 
@@ -14487,7 +14496,7 @@ fn bifurcate_table_write_with_admission_and_row_group_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
-	bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
+	bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 		meta,
 		batch,
 		descriptor,
@@ -14495,9 +14504,11 @@ fn bifurcate_table_write_with_admission_and_row_group_config(
 		row_hlc,
 		row_group_config,
 		&EncodingWriterConfig::default(),
+		&L2ChunkLayoutConfig::default(),
 	)
 }
 
+#[cfg(test)]
 fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
@@ -14506,6 +14517,28 @@ fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
+) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
+	bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
+		meta,
+		batch,
+		descriptor,
+		admission,
+		row_hlc,
+		row_group_config,
+		encoding_config,
+		&L2ChunkLayoutConfig::default(),
+	)
+}
+
+fn bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
+	meta: &TableWriteRequestMeta,
+	batch: &RecordBatch,
+	descriptor: &TableSchemaDescriptorV1,
+	admission: &TableWriteAdmission,
+	row_hlc: HybridTimestamp,
+	row_group_config: &RowGroupWriterConfig,
+	encoding_config: &EncodingWriterConfig,
+	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let mut children = Vec::with_capacity(batch.num_rows());
 	let mut charged_bytes = 0_u64;
@@ -14534,7 +14567,8 @@ fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 			}
 		}
 		RecordLayoutPolicy::MultiRow(_) => {
-			let packed = pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
+			let packed =
+				pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config(
 				meta,
 				descriptor,
 				batch,
@@ -14542,6 +14576,7 @@ fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 				row_hlc,
 				row_group_config,
 				encoding_config,
+				chunk_layout_config,
 			)?;
 			children.reserve(packed.len());
 			for record in packed {
@@ -15780,6 +15815,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
@@ -15807,6 +15843,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
@@ -15838,6 +15875,7 @@ mod tests {
 				row_group_writer: Default::default(),
 				l2_row_group_fetch: Default::default(),
 				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: Default::default(),
 				encoding_compute: Default::default(),
 				group_commit: crate::storage::GroupCommitConfig::default(),
@@ -15886,6 +15924,7 @@ mod tests {
 					min_buffer_bytes_for_encoding: crate::schema::RecordBodyByteLen::new(1),
 					..Default::default()
 				},
+				l2_chunk_layout: Default::default(),
 				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
 					enabled: true,
 					..Default::default()
@@ -23291,6 +23330,7 @@ mod tests {
 					row_group_writer: Default::default(),
 					l2_row_group_fetch: Default::default(),
 					encoding_writer: Default::default(),
+					l2_chunk_layout: Default::default(),
 					l2_encoding_fetch: Default::default(),
 					encoding_compute: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),
@@ -23336,6 +23376,7 @@ mod tests {
 					row_group_writer: Default::default(),
 					l2_row_group_fetch: Default::default(),
 					encoding_writer: Default::default(),
+					l2_chunk_layout: Default::default(),
 					l2_encoding_fetch: Default::default(),
 					encoding_compute: Default::default(),
 					group_commit: crate::storage::GroupCommitConfig::default(),

@@ -9,8 +9,8 @@ fn lsm_and_compaction_paths_recompute_encoding_from_writer_config() {
 	for token in [
 		"pub encoding_writer: EncodingWriterConfig",
 		"&self.config.encoding_writer",
-		"encode_multirow_from_survivors_with_row_group_and_encoding_config",
-		"pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config",
+		"encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config",
+		"pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config",
 	] {
 		assert!(
 			manager.contains(token),

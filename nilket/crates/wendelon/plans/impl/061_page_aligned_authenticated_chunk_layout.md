@@ -36,12 +36,14 @@ Inherits substrate:
 
 ## Status
 
-Council-converged across Claude / Codex / Gemini.
-Implementation phases pending. Promotion to shipped follows
-after Phase 9 bench evidence clears the gates. Phase 0 no-
-directory feasibility check and Phase 5 macro-block coalescing
-test are the two load-bearing gates that must pass before the
-writer enables small chunks by default.
+Council-converged across Claude / Codex / Gemini,
+implemented, and promoted to shipped. Full Phase 9 bench
+evidence at
+`plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md`
+clears the shipped-status gate. Phase 0 no-directory
+feasibility, Phase 5 macro-block coalescing, and the full
+verification gate all passed before enabling small chunks by
+default.
 
 Implementation contract — council-converged:
 
@@ -54,10 +56,9 @@ Implementation contract — council-converged:
   off maximum per-page byte size in default-engaged buffers,
   with a V1 promoted floor of 16 KiB
   (`max(max_page_bytes, PROMOTED_FLOOR)`); 4 KiB and 8 KiB
-  remain in the closed set as architecturally permitted but
-  are not selectable in V1 until Phase 9 evidence promotes
-  them;
-- default selection: 16 KiB for encoded slabs, 64 KiB legacy;
+  remain in the closed set as architecturally permitted and
+  diagnostic values, but are not selectable by the V1 selector;
+- default selection: 16 KiB for encoded slabs, 64 KiB baseline;
 - buffer-start alignment to chunk boundaries via opaque pad
   bytes in IPC body slack *between* buffers (no intra-buffer
   pad — ADR 057's contiguous `page_end_offsets` cannot
@@ -144,10 +145,10 @@ EncodingDirectory + L2ChunkLayoutConfig
 
 ## Deliverables
 
-- `src/crypto.rs` — replace `SLAB_ENCRYPTION_CHUNK_BYTES`
-  constant uses with per-slab values:
-  - rename existing constant to
-    `SLAB_ENCRYPTION_LEGACY_CHUNK_BYTES = 65_536`;
+- `src/crypto.rs` — replace fixed 64 KiB chunk-size constant
+  uses with per-slab values:
+  - retain the current default as
+    `SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES = 65_536`;
   - introduce
     `SLAB_ENCRYPTION_CHUNK_SIZES: [usize; 5] =
         [4096, 8192, 16384, 32768, 65536]`;
@@ -202,8 +203,8 @@ EncodingDirectory + L2ChunkLayoutConfig
   cases at small chunk sizes.
 - `tests/encoding_secondary_index.rs` — verify ADR 052 point-
   read SIMD-page fast path at every chunk size.
-- `tests/l2_remote.rs` / `tests/l2_rehydration.rs` — legacy
-  64 KiB slabs read identically; new slabs at smaller chunk
+- `tests/l2_remote.rs` / `tests/l2_rehydration.rs` — 64 KiB
+  baseline slabs read identically; new slabs at smaller chunk
   sizes round-trip.
 - `benches/row_group_fetch.rs` — extended with chunk-size
   matrix axis + warehouse-scale fixtures (16M+ row runtime,
@@ -242,7 +243,7 @@ EncodingDirectory + L2ChunkLayoutConfig
 - No `ObjectStore` trait change.
 - No envelope `format_version` bump; ADR 022 byte layout
   unchanged.
-- No retirement of the legacy 64 KiB chunk path.
+- No retirement of the current/default 64 KiB chunk path.
 - No migration sweeper for existing slabs; ADR 055 LSM
   compaction picks up smaller chunk sizes on natural recompacts.
 - No Toron-visible contract change.
@@ -319,7 +320,7 @@ Work:
    from a hard-coded constant.
 5. Pin the closed set: `[4096, 8192, 16384, 32768, 65536]`.
 6. Pin the V1 default policy:
-   - `enabled = false` until Phase 9 evidence;
+   - `enabled = true` after Phase 9 evidence;
    - `max_pad_inflation_micros = 50_000` (5%);
    - default chunk size: 16 KiB for slabs with
      `EncodingDirectory`; 64 KiB for slabs without.
@@ -395,8 +396,8 @@ Files:
 
 - `src/schema/units.rs` — add `ChunkSizeBytes` via `impl_unit!`.
 - `src/crypto.rs` —
-  rename `SLAB_ENCRYPTION_CHUNK_BYTES` →
-  `SLAB_ENCRYPTION_LEGACY_CHUNK_BYTES`; add
+  replace the old fixed chunk-size constant with
+  `SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES`; add
   `SLAB_ENCRYPTION_CHUNK_SIZES: [usize; 5]`; replace every
   internal use of the constant with a function parameter /
   slab-metadata read; add slab-footer parse validation.
@@ -407,9 +408,9 @@ Files:
   passes the slab's metadata; verify the chunk size flows
   through.
 - `tests/architecture_test.rs` — guard that
-  `SLAB_ENCRYPTION_LEGACY_CHUNK_BYTES` is referenced only in
-  slab-format-version validation contexts, never as the chunk-
-  arithmetic value.
+  `SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES` is not used as the
+  chunk-arithmetic value on read/decrypt/plan paths that must
+  consume slab metadata.
 
 Work:
 
@@ -457,15 +458,15 @@ Files:
   impl Default for L2ChunkLayoutConfig {
       fn default() -> Self {
           Self {
-              enabled: false,                              // Phase 8 flips
+              enabled: true,                               // shipped default
               max_pad_inflation_micros: 50_000,            // 5%
           }
       }
   }
 
   // V1 promoted floor. 4 KiB and 8 KiB members of the closed
-  // set are architecturally permitted but not selectable in V1
-  // until Phase 9 evidence promotes them.
+  // set are architecturally permitted and diagnostic values,
+  // but not selectable by the V1 selector.
   pub(crate) const PROMOTED_FLOOR: ChunkSizeBytes =
       ChunkSizeBytes::new_unchecked(16_384);
 
@@ -473,15 +474,15 @@ Files:
       encoding_directory: Option<&EncodingDirectory>,
       config:             &L2ChunkLayoutConfig,
   ) -> ChunkSizeBytes {
-      const LEGACY: ChunkSizeBytes = ChunkSizeBytes::new_unchecked(65_536);
+      const DEFAULT: ChunkSizeBytes = ChunkSizeBytes::new_unchecked(65_536);
       // ... selector body per ADR draft §V1 scope §3:
-      //   if !config.enabled or directory is None: return LEGACY
+      //   if !config.enabled or directory is None: return DEFAULT
       //   max_page_bytes = max page byte size across default-
       //     engaged buffers
       //   threshold = max(max_page_bytes, PROMOTED_FLOOR.get())
       //   candidates = SLAB_ENCRYPTION_CHUNK_SIZES filter |c| c >= threshold
       //   chosen = candidates.first()  // smallest passing member
-      //   if pad_inflation(chosen) > config.cap: return LEGACY
+      //   if pad_inflation(chosen) > config.cap: return DEFAULT
       //   chosen
   }
 
@@ -496,7 +497,7 @@ Work:
    requires every replica's config agree.
 2. Implement `choose_chunk_size_bytes(...)` per the selector
    pseudocode in ADR §V1 scope §3:
-   - returns 64 KiB legacy when `enabled = false` or no
+   - returns the 64 KiB baseline when `enabled = false` or no
      encoding directory;
    - computes
      `threshold = max(max_page_bytes_in_default_engaged_buffers,
@@ -504,7 +505,7 @@ Work:
      where `PROMOTED_FLOOR = 16 KiB` for V1;
    - picks the **smallest** chunk size in the closed set that
      is ≥ `threshold`;
-   - falls back to 64 KiB legacy when no closed-set member is
+   - falls back to the 64 KiB baseline when no closed-set member is
      ≥ `threshold` or when pad inflation exceeds
      `config.max_pad_inflation_micros`.
    The PROMOTED_FLOOR is what keeps 4 KiB and 8 KiB out of V1
@@ -690,7 +691,7 @@ Work:
    selector for a chunk size.
 2. If selector returns < 64 KiB, the writer applies page
    alignment (Phase 3) and encrypts with the chosen chunk size.
-3. If selector returns 64 KiB, the writer follows the legacy
+3. If selector returns 64 KiB, the writer follows the baseline
    path byte-identically.
 4. The chosen chunk size is recorded in `slab_header[48..52]`
    and `slab_footer[48..52]` per ADR 022 §3 / §5.
@@ -699,9 +700,9 @@ Tests:
 
 - end-to-end writer test with `enabled = true` and analytics
   geometry produces 16 KiB-chunk slab;
-- end-to-end writer test with default `enabled = false`
-  produces 64 KiB-chunk slab byte-identical to pre-061;
-- mixed slab corpora (some legacy 64 KiB, some new small):
+- end-to-end writer test with explicit `enabled = false`
+  produces 64 KiB-chunk slab byte-identical to the baseline;
+- mixed slab corpora (some 64 KiB baseline, some new small):
   reader produces byte-identical output.
 
 **Exit gate:** Writer can emit small-chunk slabs in production
@@ -916,8 +917,9 @@ Guards (per ADR draft §"Architectural lockdown"):
    array; no `Vec`, no operator-tunable runtime extension.
 2. Closed-set values are exactly `{4096, 8192, 16384, 32768,
    65536}`.
-3. `SLAB_ENCRYPTION_LEGACY_CHUNK_BYTES = 65536`; references
-   appear only in slab-format-version validation contexts.
+3. `SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES = 65536`; references
+   stay in default/config/test contexts, not slab read/decrypt
+   chunk arithmetic.
 4. `L2ChunkLayoutConfig` exists with the two pinned fields.
 5. `choose_chunk_size_bytes(...)` is pure-deterministic.
 6. **Macro-block coalescing test exists** at
@@ -982,7 +984,7 @@ cargo bench --bench row_group_fetch
 Bench matrix:
 
 - **Chunk size:** {4 KiB, 8 KiB, 16 KiB, 32 KiB, 64 KiB}.
-  64 KiB is the legacy baseline.
+  64 KiB is the baseline.
 - **Fixture sizes (warehouse-scale mandate):**
   - 1M-row × 16-record × 64 KiB (continuity smoke; ADR 060
     fixture);
@@ -1081,9 +1083,8 @@ Files:
 - `plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md`
   (lands).
 - `plans/adr/061_page_aligned_authenticated_chunk_layout.md` —
-  §"Status" amendment from "Council-converged. Implementation
-  phases pending." to "Council-converged, implemented, and
-  promoted to shipped." (matching the ADR 059 / 060 pattern).
+  §"Status" amended to "Council-converged, implemented, and
+  promoted to shipped" (matching the ADR 059 / 060 pattern).
 - `plans/adr/060_sparse_projection_fetch_narrowing.md` —
   §"Where we are" amendment closing the recorded-not-gated
   ciphertext-ratio follow-up.
@@ -1095,11 +1096,11 @@ Files:
 
 Work:
 
-1. Confirm Phase 9 bench artifact passes promotion gates.
-2. Flip ADR 061 §"Status" to "Council-converged, implemented,
+1. Phase 9 bench artifact passes promotion gates.
+2. ADR 061 §"Status" says "Council-converged, implemented,
    and promoted to shipped."
-3. Default `L2ChunkLayoutConfig::enabled = true`.
-4. Roadmap updates at the planning-cadence boundary.
+3. `L2ChunkLayoutConfig::enabled = true` by default.
+4. Roadmap updated at the planning-cadence boundary.
 
 **Exit gate:** ADR 061 marked shipped because code, tests,
 and bench evidence landed together with recorded council
@@ -1223,8 +1224,8 @@ to operator surface requires its own ADR.
 Mitigation: architectural guard prohibits pad-byte references
 outside `chunk_layout.rs` / `directory.rs`.
 
-**Migration burden for existing 64 KiB slabs.** Mitigation:
-legacy slabs continue at 64 KiB indefinitely; ADR 055 LSM
+**Rewrite burden for existing 64 KiB slabs.** Mitigation:
+existing 64 KiB slabs continue at 64 KiB indefinitely; ADR 055 LSM
 compaction picks up smaller chunk sizes on natural recompacts.
 
 **AEAD setup overhead at small chunk sizes.** Concern raised
@@ -1284,8 +1285,8 @@ BitPacked, Dictionary plain / bitpacked low-card) all select
 16 KiB because the V1 PROMOTED_FLOOR pulls the threshold to
 16 KiB. Fixtures with pages > 16 KiB but ≤ 32 KiB select
 32 KiB. Fixtures with pages > 32 KiB but ≤ 64 KiB select
-64 KiB. Fixtures with pages > 64 KiB stay at the legacy
-64 KiB (the closed set has no member large enough).
+64 KiB. Fixtures with pages > 64 KiB stay at the 64 KiB
+baseline (the closed set has no member large enough).
 
 ## Deferred (matches ADR)
 

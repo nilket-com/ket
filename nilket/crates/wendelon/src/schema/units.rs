@@ -323,6 +323,7 @@ impl_unit!(DurationMillis, u64);
 impl_unit!(ByteCount, u64);
 impl_unit!(EncryptedChunkIndex, u64);
 impl_unit!(EncryptedChunkCount, u32);
+impl_unit!(ChunkSizeBytes, u32);
 impl_unit!(IpcBufferOffset, u64);
 impl_unit!(IpcBufferLength, u64);
 impl_unit!(IpcBufferIndex, u32);

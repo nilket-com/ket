@@ -3533,8 +3533,9 @@ fn test_adr057_encoding_guards() {
 			));
 		}
 	}
-	if !manager.contains("pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config")
-		|| !manager.contains("&self.config.encoding_writer")
+	if !manager.contains(
+		"pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout_config",
+	) || !manager.contains("&self.config.encoding_writer")
 	{
 		violations.push(
 			"src/storage/manager.rs: compaction/admission paths must pass Encoding writer config"
@@ -4446,6 +4447,178 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	assert!(
 		violations.is_empty(),
 		"ADR 060 sparse projection fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr061_authenticated_chunk_layout_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let crypto = fs::read_to_string(manifest_dir.join("src/crypto.rs")).unwrap();
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/mod.rs")).unwrap();
+	let chunk_layout =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/chunk_layout.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let macro_block_test =
+		fs::read_to_string(manifest_dir.join("tests/crypto_macro_block_coalescing.rs")).unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir
+			.join("plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md"),
+	)
+	.unwrap();
+
+	for required in [
+		"pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES: usize = 64 * 1024;",
+		"pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE: ChunkSizeBytes",
+		"pub const SLAB_ENCRYPTION_CHUNK_SIZES: [usize; 5]",
+		"4 * 1024",
+		"8 * 1024",
+		"16 * 1024",
+		"32 * 1024",
+		"64 * 1024",
+		"pub chunk_size_bytes: ChunkSizeBytes",
+		"validate_slab_chunk_size(chunk_size_bytes)?",
+		"chunk_size_bytes.get().to_be_bytes()",
+		"ChunkSizeBytes::new(u32::from_be_bytes",
+	] {
+		if !crypto.contains(required) {
+			violations.push(format!("src/crypto.rs: missing ADR 061 token {required}"));
+		}
+	}
+	if !units.contains("impl_unit!(ChunkSizeBytes, u32);") {
+		violations.push("src/schema/units.rs: missing ChunkSizeBytes unit".to_string());
+	}
+	for forbidden in [
+		concat!("SLAB_ENCRYPTION_", "LEGACY_", "CHUNK_BYTES"),
+		concat!("SLAB_ENCRYPTION_", "CHUNK_BYTES"),
+		"AuthenticatedChunkDirectory",
+		"base_chunk_index",
+	] {
+		if crypto.contains(forbidden)
+			|| units.contains(forbidden)
+			|| encoding_mod.contains(forbidden)
+			|| chunk_layout.contains(forbidden)
+			|| directory.contains(forbidden)
+			|| manager.contains(forbidden)
+			|| node.contains(forbidden)
+			|| config.contains(forbidden)
+		{
+			violations.push(format!(
+				"ADR 061 forbidden implementation token {forbidden}"
+			));
+		}
+	}
+	for required in ["pub mod chunk_layout;", "pub use chunk_layout::*;"] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/mod.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct L2ChunkLayoutConfig",
+		"pub enabled: bool",
+		"pub max_pad_inflation_micros: SelectivityFractionMicros",
+		"enabled: true",
+		"PROMOTED_FLOOR: ChunkSizeBytes = ChunkSizeBytes::new(16 * 1024)",
+		"pub fn choose_chunk_size_bytes",
+		"pub fn choose_chunk_size_bytes_for_directories",
+		"pub fn estimate_pad_inflation",
+		"pub fn align_buffers_to_chunks",
+		"default_sparse_engaged_cascade",
+		"EncodingCascade::Dictionary",
+		"EncodingLeafCascade::Plain | EncodingLeafCascade::BitPacked",
+	] {
+		if !chunk_layout.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/chunk_layout.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	if chunk_layout.contains("matches!(cascade, EncodingCascade::Rle") {
+		violations
+			.push("ADR 061 must not put Rle in the default sparse engagement set".to_string());
+	}
+	for required in [
+		"chunk_size_bytes: ChunkSizeBytes",
+		"default_sparse_engaged_key",
+		"body.resize(new_len, 0)",
+		"chunk_alignment_pad_bytes",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub l2_chunk_layout: L2ChunkLayoutConfig",
+		"choose_tiered_object_chunk_size",
+		"choose_chunk_size_bytes_for_directories",
+		"l2_chunk_layout_config",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub l2_chunk_layout: L2ChunkLayoutConfig",
+		"self.l2_chunk_layout.validate()?",
+		"l2_chunk_layout: cfg.l2_chunk_layout.clone()",
+	] {
+		if !node.contains(required) {
+			violations.push(format!("src/node.rs: missing ADR 061 token {required}"));
+		}
+	}
+	for required in [
+		"l2_chunk_layout: RawL2ChunkLayoutConfig",
+		"struct RawL2ChunkLayoutConfig",
+		"max_pad_inflation_micros",
+		"l2_chunk_layout,",
+	] {
+		if !config.contains(required) {
+			violations.push(format!("src/config.rs: missing ADR 061 token {required}"));
+		}
+	}
+	for required in [
+		"100 * 1024 * 1024",
+		"ChunkSizeBytes::new(16 * 1024)",
+		"ranges.len()",
+		"1,",
+		"coalesce_per_region",
+		"plan.decrypt",
+	] {
+		if !macro_block_test.contains(required) {
+			violations.push(format!(
+				"tests/crypto_macro_block_coalescing.rs: missing ADR 061 token {required}"
+			));
+		}
+	}
+	for required in [
+		"cargo bench --bench row_group_fetch > /tmp/row_group_fetch_061_full_final.out",
+		"Full-run evidence supports the ADR 061 V1 default of 16 KiB",
+		"| 16 KiB | 6,400 | 1 | 1 |",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md: missing ADR 061 token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 061 authenticated chunk layout invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

@@ -1,8 +1,8 @@
 use crate::audit::{AuditAuthority, AuditEvent, AuditOperation, AuditOutcome, AuditSink};
 use crate::metrics::global as metrics;
 use crate::schema::{
-	EncryptedChunkCount, EncryptedChunkIndex, IdentityPrefix, NodeId, RecordBodyByteLen,
-	RecordBodyByteOffset, SlabId, TenantId, TenantKekId,
+	ChunkSizeBytes, EncryptedChunkCount, EncryptedChunkIndex, IdentityPrefix, NodeId,
+	RecordBodyByteLen, RecordBodyByteOffset, SlabId, TenantId, TenantKekId,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -35,7 +35,11 @@ use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const SLAB_MAX_BYTES_HARD_CEILING: u64 = 1 << 35;
-pub const SLAB_ENCRYPTION_CHUNK_BYTES: usize = 64 * 1024;
+pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
+pub const SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE: ChunkSizeBytes =
+	ChunkSizeBytes::new(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES as u32);
+pub const SLAB_ENCRYPTION_CHUNK_SIZES: [usize; 5] =
+	[4 * 1024, 8 * 1024, 16 * 1024, 32 * 1024, 64 * 1024];
 pub const SLAB_AEAD_TAG_BYTES: usize = 16;
 pub const SLAB_AAD_BYTES: usize = 48;
 pub const SLAB_STATS_AAD_BYTES: usize = 64;
@@ -61,7 +65,6 @@ const ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES: usize = 40;
 const ADR_TIERED_SLAB_HMAC_OFFSET: usize = 192;
 const ADR_TIERED_SLAB_HMAC_BYTES: usize = 32;
 const ADR_TIERED_SLAB_RESERVED_SUFFIX_BYTES: usize = 32;
-const ADR_TIERED_SLAB_CHUNK_SIZE_BYTES: u32 = SLAB_ENCRYPTION_CHUNK_BYTES as u32;
 const ADR039_STATS_LOCATOR_OFFSET: usize = 224;
 const ADR039_STATS_LOCATOR_BYTES: usize = 32;
 const ADR039_STATS_FLAG_PRESENT_AND_ENCRYPTED: u16 = 1 << 0;
@@ -946,6 +949,7 @@ pub struct EncryptedTieredSlab {
 	pub tenant_id: TenantId,
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
+	pub chunk_size_bytes: ChunkSizeBytes,
 	pub chunk_count: u32,
 	pub slab_format_version: u32,
 	pub stats_locator: Option<TieredStatsBlockLocator>,
@@ -959,6 +963,7 @@ pub struct DecryptedTieredSlab {
 	pub slab_id: SlabId,
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
+	pub chunk_size_bytes: ChunkSizeBytes,
 	pub chunk_count: u32,
 }
 
@@ -969,6 +974,7 @@ pub struct FooterSummary {
 	pub slab_id: SlabId,
 	pub tenant_kek_id: TenantKekId,
 	pub cipher_id: CipherId,
+	pub chunk_size_bytes: ChunkSizeBytes,
 	pub chunk_count: u32,
 	pub stats_locator: Option<TieredStatsBlockLocator>,
 	pub has_row_tombstone_records: bool,
@@ -1089,6 +1095,7 @@ pub struct TieredSlabObjectMetadata {
 	pub tenant_id: TenantId,
 	/// Transitional until the slab footer carries the full in-memory HLC.
 	pub created_hlc: u64,
+	pub chunk_size_bytes: ChunkSizeBytes,
 	pub offset_index: Vec<TieredOffsetIndexEntry>,
 	pub column_stats_block: Option<TieredColumnStatsBlock>,
 	pub has_row_tombstone_records: bool,
@@ -1154,6 +1161,7 @@ pub struct TieredMultiRangeReadPlan {
 	slab_id: SlabId,
 	slab_format_version: u32,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext_len: usize,
 	chunk_runs: Vec<TieredChunkRunReadPlan>,
 	requested_plaintext_ranges: Vec<Range<usize>>,
@@ -1196,6 +1204,7 @@ impl TieredMultiRangeReadPlan {
 				self.slab_id,
 				self.slab_format_version,
 				self.prepared_slab_dek.clone(),
+				self.chunk_size_bytes,
 				self.plaintext_len,
 				ciphertext.as_ref(),
 				run.chunk_range.clone(),
@@ -1244,6 +1253,7 @@ pub struct TieredRangeReadPlan {
 	slab_id: SlabId,
 	slab_format_version: u32,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext_len: usize,
 	chunk_range: Range<usize>,
 	base_plaintext_offset: usize,
@@ -1279,6 +1289,7 @@ impl TieredRangeReadPlan {
 			self.slab_id,
 			self.slab_format_version,
 			self.prepared_slab_dek.clone(),
+			self.chunk_size_bytes,
 			self.plaintext_len,
 			ciphertext,
 			self.chunk_range.clone(),
@@ -1593,12 +1604,14 @@ impl CryptoManager {
 		} else {
 			SLAB_ENVELOPE_FORMAT_VERSION
 		};
-		let chunk_count = chunk_count_for_len(plaintext.len())?;
+		validate_slab_chunk_size(metadata.chunk_size_bytes)?;
+		let chunk_count = chunk_count_for_len(plaintext.len(), metadata.chunk_size_bytes)?;
 		let encrypted_chunks = encrypt_chunks(
 			cipher_id,
 			metadata.tenant_id,
 			slab_format_version,
 			wrapped_slab_dek,
+			metadata.chunk_size_bytes,
 			chunk_count,
 			plaintext,
 		)?;
@@ -1608,6 +1621,7 @@ impl CryptoManager {
 			metadata.tenant_id,
 			metadata.created_hlc,
 			cipher_id,
+			metadata.chunk_size_bytes,
 			chunk_count,
 		)?;
 		let index_bytes = encode_adr022_offset_index(&metadata.offset_index, plaintext.len())?;
@@ -1636,6 +1650,7 @@ impl CryptoManager {
 			metadata.tenant_id,
 			metadata.created_hlc,
 			cipher_id,
+			metadata.chunk_size_bytes,
 			chunk_count,
 			record_count,
 			tenant_kek_id,
@@ -1704,6 +1719,7 @@ impl CryptoManager {
 			tenant_id: metadata.tenant_id,
 			tenant_kek_id,
 			cipher_id,
+			chunk_size_bytes: metadata.chunk_size_bytes,
 			chunk_count,
 			slab_format_version,
 			stats_locator,
@@ -1781,6 +1797,7 @@ impl CryptoManager {
 			parsed.slab_id,
 			parsed.slab_format_version,
 			slab_dek,
+			parsed.chunk_size_bytes,
 			parsed.chunk_count,
 			parsed.plaintext_len,
 			parsed.ciphertext,
@@ -1797,6 +1814,7 @@ impl CryptoManager {
 			slab_id: parsed.slab_id,
 			tenant_kek_id: parsed.tenant_kek_id,
 			cipher_id: parsed.cipher_id,
+			chunk_size_bytes: parsed.chunk_size_bytes,
 			chunk_count: parsed.chunk_count,
 		})
 	}
@@ -2121,6 +2139,7 @@ impl CryptoManager {
 		})?;
 		let chunk_runs = chunk_read_runs_for_plaintext_ranges(
 			context.parsed.plaintext_len,
+			context.parsed.chunk_size_bytes,
 			context.parsed.ciphertext_offset_in_object,
 			&requested_plaintext_ranges,
 		)
@@ -2140,6 +2159,7 @@ impl CryptoManager {
 			slab_id: context.parsed.slab_id,
 			slab_format_version: context.parsed.slab_format_version,
 			cipher_id: context.parsed.cipher_id,
+			chunk_size_bytes: context.parsed.chunk_size_bytes,
 			plaintext_len: context.parsed.plaintext_len,
 			chunk_runs,
 			requested_plaintext_ranges,
@@ -2180,6 +2200,7 @@ impl CryptoManager {
 				slab_id: multi.slab_id,
 				slab_format_version: multi.slab_format_version,
 				cipher_id: multi.cipher_id,
+				chunk_size_bytes: multi.chunk_size_bytes,
 				plaintext_len: multi.plaintext_len,
 				chunk_range: 0..0,
 				base_plaintext_offset: plaintext_range.start,
@@ -2194,6 +2215,7 @@ impl CryptoManager {
 			slab_id: multi.slab_id,
 			slab_format_version: multi.slab_format_version,
 			cipher_id: multi.cipher_id,
+			chunk_size_bytes: multi.chunk_size_bytes,
 			plaintext_len: multi.plaintext_len,
 			chunk_range: run.chunk_range.clone(),
 			base_plaintext_offset: run.base_plaintext_offset,
@@ -2827,17 +2849,22 @@ fn encrypt_chunk_range(
 	tenant_id: TenantId,
 	slab_id: SlabId,
 	slab_format_version: u32,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext: &[u8],
 	chunk_range: std::ops::Range<usize>,
 	out: &mut [u8],
 ) -> std::io::Result<()> {
-	let base_ciphertext_offset = ciphertext_offset_for_chunk(plaintext.len(), chunk_range.start);
+	let base_ciphertext_offset =
+		ciphertext_offset_for_chunk(plaintext.len(), chunk_size_bytes, chunk_range.start);
 	for chunk_index in chunk_range {
-		let plaintext_bounds = plaintext_bounds_for_chunk(plaintext.len(), chunk_index);
+		let plaintext_bounds =
+			plaintext_bounds_for_chunk(plaintext.len(), chunk_size_bytes, chunk_index);
 		let local_cipher_start =
-			ciphertext_offset_for_chunk(plaintext.len(), chunk_index) - base_ciphertext_offset;
+			ciphertext_offset_for_chunk(plaintext.len(), chunk_size_bytes, chunk_index)
+				- base_ciphertext_offset;
 		let local_cipher_end =
-			ciphertext_offset_for_chunk(plaintext.len(), chunk_index + 1) - base_ciphertext_offset;
+			ciphertext_offset_for_chunk(plaintext.len(), chunk_size_bytes, chunk_index + 1)
+				- base_ciphertext_offset;
 		let (chunk_buf, tag_buf) =
 			out[local_cipher_start..local_cipher_end].split_at_mut(plaintext_bounds.len());
 		chunk_buf.copy_from_slice(&plaintext[plaintext_bounds.clone()]);
@@ -2869,6 +2896,7 @@ fn encrypt_chunks(
 	tenant_id: TenantId,
 	slab_format_version: u32,
 	dek: WrappedSlabDek,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 	plaintext: &[u8],
 ) -> std::io::Result<EncryptedChunks> {
@@ -2895,6 +2923,7 @@ fn encrypt_chunks(
 			tenant_id,
 			slab_id,
 			slab_format_version,
+			chunk_size_bytes,
 			plaintext,
 			0..chunk_count,
 			out.as_mut_slice(),
@@ -2906,8 +2935,10 @@ fn encrypt_chunks(
 			let mut tail = out.as_mut_slice();
 			let mut consumed = 0_usize;
 			for range in ranges {
-				let region_start = ciphertext_offset_for_chunk(plaintext.len(), range.start);
-				let region_end = ciphertext_offset_for_chunk(plaintext.len(), range.end);
+				let region_start =
+					ciphertext_offset_for_chunk(plaintext.len(), chunk_size_bytes, range.start);
+				let region_end =
+					ciphertext_offset_for_chunk(plaintext.len(), chunk_size_bytes, range.end);
 				debug_assert_eq!(region_start, consumed);
 				let (worker_out, rest) = tail.split_at_mut(region_end - consumed);
 				tail = rest;
@@ -2920,6 +2951,7 @@ fn encrypt_chunks(
 						tenant_id,
 						slab_id,
 						slab_format_version,
+						chunk_size_bytes,
 						plaintext,
 						range,
 						worker_out,
@@ -2948,17 +2980,23 @@ fn decrypt_chunk_range(
 	tenant_id: TenantId,
 	slab_id: SlabId,
 	slab_format_version: u32,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 	chunk_range: std::ops::Range<usize>,
 	out: &mut [u8],
 ) -> std::io::Result<()> {
-	let base_plaintext_offset = plaintext_bounds_for_chunk(plaintext_len, chunk_range.start).start;
-	let mut scratch = vec![0_u8; SLAB_ENCRYPTION_CHUNK_BYTES + SLAB_AEAD_TAG_BYTES];
+	let chunk_size = chunk_size_usize(chunk_size_bytes);
+	let base_plaintext_offset =
+		plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.start).start;
+	let mut scratch = vec![0_u8; chunk_size + SLAB_AEAD_TAG_BYTES];
 	for chunk_index in chunk_range {
-		let plaintext_bounds = plaintext_bounds_for_chunk(plaintext_len, chunk_index);
-		let ciphertext_start = ciphertext_offset_for_chunk(plaintext_len, chunk_index);
-		let ciphertext_end = ciphertext_offset_for_chunk(plaintext_len, chunk_index + 1);
+		let plaintext_bounds =
+			plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_index);
+		let ciphertext_start =
+			ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_index);
+		let ciphertext_end =
+			ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_index + 1);
 		let encrypted_len = ciphertext_end - ciphertext_start;
 		scratch[..encrypted_len].copy_from_slice(&ciphertext[ciphertext_start..ciphertext_end]);
 		// Safety: decrypt mirrors the same nonce discipline as encrypt: one DEK
@@ -2990,11 +3028,14 @@ fn decrypt_chunks(
 	slab_id: SlabId,
 	slab_format_version: u32,
 	prepared: Arc<PreparedSlabDek>,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-	if ciphertext_offset_for_chunk(plaintext_len, chunk_count as usize) != ciphertext.len() {
+	if ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_count as usize)
+		!= ciphertext.len()
+	{
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"ciphertext length disagrees with slab footer chunk layout",
@@ -3010,6 +3051,7 @@ fn decrypt_chunks(
 			tenant_id,
 			slab_id,
 			slab_format_version,
+			chunk_size_bytes,
 			plaintext_len,
 			ciphertext,
 			0..chunk_count,
@@ -3022,8 +3064,10 @@ fn decrypt_chunks(
 			let mut tail = plaintext.as_mut_slice();
 			let mut consumed = 0_usize;
 			for range in ranges {
-				let region_start = plaintext_bounds_for_chunk(plaintext_len, range.start).start;
-				let region_end = plaintext_bounds_for_chunk(plaintext_len, range.end).start;
+				let region_start =
+					plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, range.start).start;
+				let region_end =
+					plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, range.end).start;
 				debug_assert_eq!(region_start, consumed);
 				let (worker_out, rest) = tail.split_at_mut(region_end - consumed);
 				tail = rest;
@@ -3036,6 +3080,7 @@ fn decrypt_chunks(
 						tenant_id,
 						slab_id,
 						slab_format_version,
+						chunk_size_bytes,
 						plaintext_len,
 						ciphertext,
 						range,
@@ -3061,20 +3106,27 @@ fn decrypt_chunk_range_from_slice(
 	tenant_id: TenantId,
 	slab_id: SlabId,
 	slab_format_version: u32,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 	chunk_range: Range<usize>,
 	out: &mut [u8],
 ) -> std::io::Result<()> {
-	let base_plaintext_offset = plaintext_bounds_for_chunk(plaintext_len, chunk_range.start).start;
-	let base_ciphertext_offset = ciphertext_offset_for_chunk(plaintext_len, chunk_range.start);
-	let mut scratch = vec![0_u8; SLAB_ENCRYPTION_CHUNK_BYTES + SLAB_AEAD_TAG_BYTES];
+	let chunk_size = chunk_size_usize(chunk_size_bytes);
+	let base_plaintext_offset =
+		plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.start).start;
+	let base_ciphertext_offset =
+		ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.start);
+	let mut scratch = vec![0_u8; chunk_size + SLAB_AEAD_TAG_BYTES];
 	for chunk_index in chunk_range {
-		let plaintext_bounds = plaintext_bounds_for_chunk(plaintext_len, chunk_index);
+		let plaintext_bounds =
+			plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_index);
 		let ciphertext_start =
-			ciphertext_offset_for_chunk(plaintext_len, chunk_index) - base_ciphertext_offset;
+			ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_index)
+				- base_ciphertext_offset;
 		let ciphertext_end =
-			ciphertext_offset_for_chunk(plaintext_len, chunk_index + 1) - base_ciphertext_offset;
+			ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_index + 1)
+				- base_ciphertext_offset;
 		let encrypted_len = ciphertext_end - ciphertext_start;
 		scratch[..encrypted_len].copy_from_slice(&ciphertext[ciphertext_start..ciphertext_end]);
 		let opened = prepared
@@ -3104,6 +3156,7 @@ fn decrypt_partial_chunks(
 	slab_id: SlabId,
 	slab_format_version: u32,
 	prepared: Arc<PreparedSlabDek>,
+	chunk_size_bytes: ChunkSizeBytes,
 	plaintext_len: usize,
 	ciphertext: &[u8],
 	chunk_range: Range<usize>,
@@ -3111,20 +3164,24 @@ fn decrypt_partial_chunks(
 	if chunk_range.is_empty() {
 		return Ok(Vec::new());
 	}
-	let expected_ciphertext_len = ciphertext_offset_for_chunk(plaintext_len, chunk_range.end)
-		.checked_sub(ciphertext_offset_for_chunk(
-			plaintext_len,
-			chunk_range.start,
-		))
-		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ciphertext range underflow"))?;
+	let expected_ciphertext_len =
+		ciphertext_offset_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.end)
+			.checked_sub(ciphertext_offset_for_chunk(
+				plaintext_len,
+				chunk_size_bytes,
+				chunk_range.start,
+			))
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ciphertext range underflow"))?;
 	if expected_ciphertext_len != ciphertext.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"ciphertext length disagrees with requested chunk range",
 		));
 	}
-	let base_plaintext_offset = plaintext_bounds_for_chunk(plaintext_len, chunk_range.start).start;
-	let end_plaintext_offset = plaintext_bounds_for_chunk(plaintext_len, chunk_range.end).start;
+	let base_plaintext_offset =
+		plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.start).start;
+	let end_plaintext_offset =
+		plaintext_bounds_for_chunk(plaintext_len, chunk_size_bytes, chunk_range.end).start;
 	let mut plaintext = vec![0_u8; end_plaintext_offset.saturating_sub(base_plaintext_offset)];
 	decrypt_chunk_range_from_slice(
 		prepared.as_ref(),
@@ -3132,6 +3189,7 @@ fn decrypt_partial_chunks(
 		tenant_id,
 		slab_id,
 		slab_format_version,
+		chunk_size_bytes,
 		plaintext_len,
 		ciphertext,
 		chunk_range,
@@ -3248,8 +3306,23 @@ fn random_tenant_kek_id(context: &str) -> std::io::Result<TenantKekId> {
 	}
 }
 
-fn chunk_count_for_len(len: usize) -> std::io::Result<u32> {
-	let chunks = len.div_ceil(SLAB_ENCRYPTION_CHUNK_BYTES);
+pub fn validate_slab_chunk_size(chunk_size_bytes: ChunkSizeBytes) -> std::io::Result<()> {
+	if SLAB_ENCRYPTION_CHUNK_SIZES.contains(&(chunk_size_bytes.get() as usize)) {
+		return Ok(());
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		format!("unsupported ADR 022 chunk size {}", chunk_size_bytes.get()),
+	))
+}
+
+fn chunk_size_usize(chunk_size_bytes: ChunkSizeBytes) -> usize {
+	chunk_size_bytes.get() as usize
+}
+
+fn chunk_count_for_len(len: usize, chunk_size_bytes: ChunkSizeBytes) -> std::io::Result<u32> {
+	validate_slab_chunk_size(chunk_size_bytes)?;
+	let chunks = len.div_ceil(chunk_size_usize(chunk_size_bytes));
 	u32::try_from(chunks).map_err(|_| {
 		Error::new(
 			ErrorKind::InvalidInput,
@@ -3293,20 +3366,28 @@ fn parallel_chunk_ranges(chunk_count: usize, workers: usize) -> Vec<std::ops::Ra
 	ranges
 }
 
-fn plaintext_bounds_for_chunk(plaintext_len: usize, chunk_index: usize) -> std::ops::Range<usize> {
+fn plaintext_bounds_for_chunk(
+	plaintext_len: usize,
+	chunk_size_bytes: ChunkSizeBytes,
+	chunk_index: usize,
+) -> std::ops::Range<usize> {
+	let chunk_size = chunk_size_usize(chunk_size_bytes);
 	let start = chunk_index
-		.checked_mul(SLAB_ENCRYPTION_CHUNK_BYTES)
+		.checked_mul(chunk_size)
 		.expect("chunk_index bounds checked by caller")
 		.min(plaintext_len);
-	let end = start
-		.saturating_add(SLAB_ENCRYPTION_CHUNK_BYTES)
-		.min(plaintext_len);
+	let end = start.saturating_add(chunk_size).min(plaintext_len);
 	start..end
 }
 
-fn ciphertext_offset_for_chunk(plaintext_len: usize, chunk_index: usize) -> usize {
+fn ciphertext_offset_for_chunk(
+	plaintext_len: usize,
+	chunk_size_bytes: ChunkSizeBytes,
+	chunk_index: usize,
+) -> usize {
+	let chunk_size = chunk_size_usize(chunk_size_bytes);
 	let plaintext_offset = chunk_index
-		.checked_mul(SLAB_ENCRYPTION_CHUNK_BYTES)
+		.checked_mul(chunk_size)
 		.expect("chunk_index bounds checked by caller")
 		.min(plaintext_len);
 	let tag_offset = chunk_index
@@ -3395,9 +3476,12 @@ fn record_relative_ranges_to_absolute(
 
 fn chunk_read_runs_for_plaintext_ranges(
 	plaintext_len: usize,
+	chunk_size_bytes: ChunkSizeBytes,
 	ciphertext_offset_in_object: u64,
 	plaintext_ranges: &[Range<usize>],
 ) -> std::io::Result<Vec<TieredChunkRunReadPlan>> {
+	validate_slab_chunk_size(chunk_size_bytes)?;
+	let chunk_size = chunk_size_usize(chunk_size_bytes);
 	let mut chunk_ranges: Vec<Range<usize>> = Vec::new();
 	for plaintext_range in plaintext_ranges {
 		if plaintext_range.start > plaintext_range.end || plaintext_range.end > plaintext_len {
@@ -3412,8 +3496,8 @@ fn chunk_read_runs_for_plaintext_ranges(
 		if plaintext_range.is_empty() {
 			continue;
 		}
-		let start_chunk = plaintext_range.start / SLAB_ENCRYPTION_CHUNK_BYTES;
-		let end_chunk = ((plaintext_range.end - 1) / SLAB_ENCRYPTION_CHUNK_BYTES) + 1;
+		let start_chunk = plaintext_range.start / chunk_size;
+		let end_chunk = ((plaintext_range.end - 1) / chunk_size) + 1;
 		if let Some(last) = chunk_ranges.last_mut() {
 			if start_chunk <= last.end {
 				last.end = last.end.max(end_chunk);
@@ -3442,7 +3526,11 @@ fn chunk_read_runs_for_plaintext_ranges(
 			)
 		})?;
 		let ciphertext_start = ciphertext_offset_in_object
-			.checked_add(ciphertext_offset_for_chunk(plaintext_len, chunk_range.start) as u64)
+			.checked_add(ciphertext_offset_for_chunk(
+				plaintext_len,
+				chunk_size_bytes,
+				chunk_range.start,
+			) as u64)
 			.ok_or_else(|| {
 				Error::new(
 					ErrorKind::InvalidInput,
@@ -3450,7 +3538,11 @@ fn chunk_read_runs_for_plaintext_ranges(
 				)
 			})?;
 		let ciphertext_end = ciphertext_offset_in_object
-			.checked_add(ciphertext_offset_for_chunk(plaintext_len, chunk_range.end) as u64)
+			.checked_add(ciphertext_offset_for_chunk(
+				plaintext_len,
+				chunk_size_bytes,
+				chunk_range.end,
+			) as u64)
 			.ok_or_else(|| {
 				Error::new(
 					ErrorKind::InvalidInput,
@@ -3460,8 +3552,12 @@ fn chunk_read_runs_for_plaintext_ranges(
 		out.push(TieredChunkRunReadPlan {
 			first_chunk: EncryptedChunkIndex::new(first_chunk),
 			chunk_count: EncryptedChunkCount::new(chunk_count),
-			base_plaintext_offset: plaintext_bounds_for_chunk(plaintext_len, chunk_range.start)
-				.start,
+			base_plaintext_offset: plaintext_bounds_for_chunk(
+				plaintext_len,
+				chunk_size_bytes,
+				chunk_range.start,
+			)
+			.start,
 			chunk_range,
 			ciphertext_range_in_object: ciphertext_start..ciphertext_end,
 		});
@@ -3483,6 +3579,7 @@ struct ParsedEncryptedFooterFields {
 	tenant_id: TenantId,
 	tenant_kek_id: TenantKekId,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
 	has_row_tombstone_records: bool,
@@ -3509,6 +3606,7 @@ struct ParsedEncryptedFooter<'a> {
 	tenant_id: TenantId,
 	tenant_kek_id: TenantKekId,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 	stats_locator: Option<TieredStatsBlockLocator>,
 	has_row_tombstone_records: bool,
@@ -3530,7 +3628,11 @@ struct ParsedEncryptedFooter<'a> {
 
 impl ParsedEncryptedFooterFields {
 	fn finalize_from_ciphertext_len(mut self, ciphertext_len: usize) -> std::io::Result<Self> {
-		self.plaintext_len = plaintext_len_from_ciphertext_len(ciphertext_len, self.chunk_count)?;
+		self.plaintext_len = plaintext_len_from_ciphertext_len(
+			ciphertext_len,
+			self.chunk_count,
+			self.chunk_size_bytes,
+		)?;
 		Ok(self)
 	}
 
@@ -3541,6 +3643,7 @@ impl ParsedEncryptedFooterFields {
 			slab_id: self.slab_id,
 			tenant_kek_id: self.tenant_kek_id,
 			cipher_id: self.cipher_id,
+			chunk_size_bytes: self.chunk_size_bytes,
 			chunk_count: self.chunk_count,
 			stats_locator: self.stats_locator,
 			has_row_tombstone_records: self.has_row_tombstone_records,
@@ -3594,6 +3697,7 @@ impl ParsedEncryptedFooter<'_> {
 			slab_id: self.slab_id,
 			tenant_kek_id: self.tenant_kek_id,
 			cipher_id: self.cipher_id,
+			chunk_size_bytes: self.chunk_size_bytes,
 			chunk_count: self.chunk_count,
 			stats_locator: self.stats_locator,
 			has_row_tombstone_records: self.has_row_tombstone_records,
@@ -3836,8 +3940,10 @@ fn encode_adr022_header(
 	tenant_id: TenantId,
 	created_hlc: u64,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 ) -> std::io::Result<[u8; ADR_TIERED_SLAB_HEADER_BYTES]> {
+	validate_slab_chunk_size(chunk_size_bytes)?;
 	let mut header = [0_u8; ADR_TIERED_SLAB_HEADER_BYTES];
 	header[..4].copy_from_slice(&slab_format_version.to_be_bytes());
 	header[4] = cipher_id.to_wire();
@@ -3850,7 +3956,7 @@ fn encode_adr022_header(
 		tenant_id.get(),
 	)?;
 	header[40..48].copy_from_slice(&created_hlc.to_be_bytes());
-	header[48..52].copy_from_slice(&ADR_TIERED_SLAB_CHUNK_SIZE_BYTES.to_be_bytes());
+	header[48..52].copy_from_slice(&chunk_size_bytes.get().to_be_bytes());
 	header[52..56].copy_from_slice(&chunk_count.to_be_bytes());
 	let header_crc = u64::from(crc32c(&header[..56]));
 	header[56..64].copy_from_slice(&header_crc.to_be_bytes());
@@ -3863,12 +3969,14 @@ fn encode_adr022_footer(
 	tenant_id: TenantId,
 	created_hlc: u64,
 	cipher_id: CipherId,
+	chunk_size_bytes: ChunkSizeBytes,
 	chunk_count: u32,
 	record_count: u64,
 	tenant_kek_id: TenantKekId,
 	wrapped_slab_dek: &[u8],
 	has_row_tombstone_records: bool,
 ) -> std::io::Result<[u8; ADR_TIERED_SLAB_FOOTER_BYTES]> {
+	validate_slab_chunk_size(chunk_size_bytes)?;
 	if wrapped_slab_dek.len() != ADR_TIERED_SLAB_WRAPPED_DEK_PREFIX_BYTES {
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
@@ -3888,7 +3996,7 @@ fn encode_adr022_footer(
 	encode_adr022_u64_slot(&mut footer[8..24], slab_id.get())?;
 	encode_adr022_u64_slot(&mut footer[24..40], tenant_id.get())?;
 	footer[40..48].copy_from_slice(&created_hlc.to_be_bytes());
-	footer[48..52].copy_from_slice(&ADR_TIERED_SLAB_CHUNK_SIZE_BYTES.to_be_bytes());
+	footer[48..52].copy_from_slice(&chunk_size_bytes.get().to_be_bytes());
 	footer[52..56].copy_from_slice(&chunk_count.to_be_bytes());
 	footer[56..64].copy_from_slice(&record_count.to_be_bytes());
 	encode_adr022_u64_slot(&mut footer[64..96], tenant_kek_id.get())?;
@@ -4000,6 +4108,7 @@ fn crc32c(bytes: &[u8]) -> u32 {
 fn plaintext_len_from_ciphertext_len(
 	ciphertext_len: usize,
 	chunk_count: u32,
+	chunk_size_bytes: ChunkSizeBytes,
 ) -> std::io::Result<usize> {
 	let tag_bytes = (chunk_count as usize)
 		.checked_mul(SLAB_AEAD_TAG_BYTES)
@@ -4010,7 +4119,7 @@ fn plaintext_len_from_ciphertext_len(
 			"tiered slab ciphertext shorter than chunk authentication tags",
 		)
 	})?;
-	if chunk_count_for_len(plaintext_len)? != chunk_count {
+	if chunk_count_for_len(plaintext_len, chunk_size_bytes)? != chunk_count {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			"tiered slab chunk_count disagrees with ciphertext length",
@@ -4094,15 +4203,10 @@ fn parse_adr022_footer_fields(
 	let slab_id = SlabId::new(decode_adr022_u64_slot(&footer[8..24], "slab_id")?);
 	let tenant_id = TenantId::new(decode_adr022_u64_slot(&footer[24..40], "tenant_id")?);
 	let created_hlc = u64::from_be_bytes(footer[40..48].try_into().expect("slice len"));
-	let chunk_size = u32::from_be_bytes(footer[48..52].try_into().expect("slice len"));
-	if chunk_size != ADR_TIERED_SLAB_CHUNK_SIZE_BYTES {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"unsupported ADR 022 chunk size {chunk_size}; expected {ADR_TIERED_SLAB_CHUNK_SIZE_BYTES}",
-			),
-		));
-	}
+	let chunk_size_bytes = ChunkSizeBytes::new(u32::from_be_bytes(
+		footer[48..52].try_into().expect("slice len"),
+	));
+	validate_slab_chunk_size(chunk_size_bytes)?;
 	let chunk_count = u32::from_be_bytes(footer[52..56].try_into().expect("slice len"));
 	let record_count = u64::from_be_bytes(footer[56..64].try_into().expect("slice len"));
 	if index_len_u32 as usize % ADR_TIERED_SLAB_INDEX_ENTRY_BYTES != 0 {
@@ -4160,6 +4264,7 @@ fn parse_adr022_footer_fields(
 		tenant_id,
 		created_hlc,
 		cipher_id,
+		chunk_size_bytes,
 		chunk_count,
 	)?
 	.to_vec();
@@ -4169,6 +4274,7 @@ fn parse_adr022_footer_fields(
 		tenant_id,
 		tenant_kek_id,
 		cipher_id,
+		chunk_size_bytes,
 		chunk_count,
 		stats_locator,
 		has_row_tombstone_records,
@@ -4236,6 +4342,7 @@ fn parse_adr022_encrypted_footer(blob: &[u8]) -> std::io::Result<ParsedEncrypted
 		tenant_id: fields.tenant_id,
 		tenant_kek_id: fields.tenant_kek_id,
 		cipher_id: fields.cipher_id,
+		chunk_size_bytes: fields.chunk_size_bytes,
 		chunk_count: fields.chunk_count,
 		stats_locator: fields.stats_locator,
 		has_row_tombstone_records: fields.has_row_tombstone_records,
@@ -5821,6 +5928,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id,
 					created_hlc: 0,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -5846,6 +5954,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 47,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -5874,6 +5983,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 48,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6005,6 +6115,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 11,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 4,
@@ -6031,10 +6142,97 @@ mod tests {
 	}
 
 	#[test]
+	fn adr061_chunk_size_roundtrips_and_drives_range_planning() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let chunk_size = ChunkSizeBytes::new(16 * 1024);
+		let plaintext = patterned_plaintext(chunk_size.get() as usize * 3 + 19);
+		let encrypted = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(610),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 61,
+					chunk_size_bytes: chunk_size,
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: plaintext.len().try_into().unwrap(),
+						flags: 0,
+					}],
+					column_stats_block: None,
+					has_row_tombstone_records: false,
+				},
+				&plaintext,
+			)
+			.unwrap();
+		assert_eq!(encrypted.chunk_size_bytes, chunk_size);
+		let parsed = parse_encrypted_footer(&encrypted.bytes).unwrap();
+		assert_eq!(parsed.chunk_size_bytes, chunk_size);
+		assert_eq!(parsed.footer_summary().chunk_size_bytes, chunk_size);
+
+		let (object_size, tail_window) = tail_window_for(&encrypted);
+		let range = rel_range(chunk_size.get() as usize + 7, 11);
+		let plan = crypto
+			.plan_tiered_multi_range_read(
+				SlabId::new(610),
+				object_size,
+				tail_window,
+				None,
+				0..plaintext.len(),
+				&[range],
+			)
+			.unwrap();
+		assert_eq!(plan.chunk_runs().len(), 1);
+		assert_eq!(plan.chunk_runs()[0].first_chunk().get(), 1);
+		assert_eq!(plan.chunk_runs()[0].chunk_count().get(), 1);
+		let ciphertext_ranges = plan.ciphertext_ranges_in_object();
+		let selected_ciphertext = ciphertext_slices(&encrypted.bytes, &ciphertext_ranges);
+		let selected_plaintext = plan.decrypt(&selected_ciphertext).unwrap();
+		assert_eq!(
+			selected_plaintext,
+			vec![
+				plaintext[range.start.get() as usize
+					..range.start.get() as usize + range.len.get() as usize]
+					.to_vec()
+			]
+		);
+	}
+
+	#[test]
+	fn adr061_writer_rejects_unsupported_chunk_size() {
+		let crypto = CryptoManager::new_dev();
+		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
+		let err = crypto
+			.encrypt_tiered_slab_object(
+				SlabId::new(611),
+				&TieredSlabObjectMetadata {
+					tenant_id: TenantId::ZERO,
+					created_hlc: 61,
+					chunk_size_bytes: ChunkSizeBytes::new(12 * 1024),
+					offset_index: vec![TieredOffsetIndexEntry {
+						key_locator: IdentityPrefix::ZERO,
+						byte_offset: 0,
+						byte_length: 4,
+						flags: 0,
+					}],
+					column_stats_block: None,
+					has_row_tombstone_records: false,
+				},
+				b"rows",
+			)
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("unsupported ADR 022 chunk size"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
 	fn adr044_multi_range_matches_single_range_for_one_record_span() {
 		let crypto = CryptoManager::new_dev();
 		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
-		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 33);
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES * 2 + 33);
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(440), TenantId::ZERO, &plaintext);
 		let (object_size, tail_window) = tail_window_for(&encrypted);
@@ -6078,7 +6276,7 @@ mod tests {
 	fn adr044_multi_range_coalesces_overlapping_and_adjacent_chunk_runs() {
 		let crypto = CryptoManager::new_dev();
 		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
-		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 3 + 17);
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES * 3 + 17);
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(441), TenantId::ZERO, &plaintext);
 		let (object_size, tail_window) = tail_window_for(&encrypted);
@@ -6093,7 +6291,7 @@ mod tests {
 				&[
 					rel_range(10, 40),
 					rel_range(20, 10),
-					rel_range(SLAB_ENCRYPTION_CHUNK_BYTES + 5, 10),
+					rel_range(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES + 5, 10),
 				],
 			)
 			.unwrap();
@@ -6113,12 +6311,13 @@ mod tests {
 	fn adr044_multi_range_keeps_disjoint_runs_separate_and_extracts_windows() {
 		let crypto = CryptoManager::new_dev();
 		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
-		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES * 4 + 99);
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES * 4 + 99);
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(442), TenantId::ZERO, &plaintext);
 		let (object_size, tail_window) = tail_window_for(&encrypted);
 		let first = 3..23;
-		let second = (SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 7)..(SLAB_ENCRYPTION_CHUNK_BYTES * 2 + 31);
+		let second = (SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES * 2 + 7)
+			..(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES * 2 + 31);
 
 		let plan = crypto
 			.plan_tiered_multi_range_read(
@@ -6179,7 +6378,7 @@ mod tests {
 	fn adr044_multi_range_tampered_chunk_fails_aead() {
 		let crypto = CryptoManager::new_dev();
 		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
-		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_CHUNK_BYTES + 1);
+		let plaintext = patterned_plaintext(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES + 1);
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(444), TenantId::ZERO, &plaintext);
 		let (object_size, tail_window) = tail_window_for(&encrypted);
@@ -6216,6 +6415,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 12,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6270,7 +6470,11 @@ mod tests {
 
 		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			+ ADR_TIERED_SLAB_HEADER_BYTES
-			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+			+ ciphertext_offset_for_chunk(
+				plaintext.len(),
+				encrypted.chunk_size_bytes,
+				encrypted.chunk_count as usize,
+			);
 		let mut stats_tampered = encrypted.bytes.clone();
 		stats_tampered[stats_start] ^= 0x80;
 		assert_eq!(
@@ -6324,6 +6528,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 14,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6575,6 +6780,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 13,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: offset_index.clone(),
 					column_stats_block: Some(TieredColumnStatsBlock::plaintext(
 						stats_plaintext.clone(),
@@ -6591,7 +6797,11 @@ mod tests {
 		let expected_index = encode_adr022_offset_index(&offset_index, plaintext.len()).unwrap();
 		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			+ ADR_TIERED_SLAB_HEADER_BYTES
-			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+			+ ciphertext_offset_for_chunk(
+				plaintext.len(),
+				encrypted.chunk_size_bytes,
+				encrypted.chunk_count as usize,
+			);
 		let stats_end = stats_start + locator.stats_block_len as usize;
 		let (footer_len, index_len, tail_offset) =
 			parse_adr022_tail_anchor(&encrypted.bytes).unwrap();
@@ -6661,6 +6871,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 13,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6687,7 +6898,11 @@ mod tests {
 		);
 		let stats_start = ADR_TIERED_SLAB_MAGIC_HEAD.len()
 			+ ADR_TIERED_SLAB_HEADER_BYTES
-			+ ciphertext_offset_for_chunk(plaintext.len(), encrypted.chunk_count as usize);
+			+ ciphertext_offset_for_chunk(
+				plaintext.len(),
+				encrypted.chunk_size_bytes,
+				encrypted.chunk_count as usize,
+			);
 		let stats_end = stats_start + locator.stats_block_len as usize;
 		assert_ne!(
 			&encrypted.bytes[stats_start..stats_start + stats_plaintext.len()],
@@ -6767,6 +6982,7 @@ mod tests {
 				&TieredSlabObjectMetadata {
 					tenant_id: TenantId::ZERO,
 					created_hlc: 14,
+					chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 					offset_index: vec![TieredOffsetIndexEntry {
 						key_locator: IdentityPrefix::ZERO,
 						byte_offset: 0,
@@ -6821,7 +7037,7 @@ mod tests {
 		let crypto = CryptoManager::new_dev();
 		crypto.install_local_only_for_tests(TenantId::ZERO).unwrap();
 		let chunk_count = PARALLEL_CHUNK_CRYPTO_MIN_CHUNKS + 3;
-		let plaintext = vec![0x5a; chunk_count * SLAB_ENCRYPTION_CHUNK_BYTES + 17];
+		let plaintext = vec![0x5a; chunk_count * SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES + 17];
 		let encrypted =
 			encrypt_test_tiered_slab(&crypto, SlabId::new(17), TenantId::ZERO, &plaintext);
 		let decrypted = crypto

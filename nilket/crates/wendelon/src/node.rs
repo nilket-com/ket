@@ -93,7 +93,7 @@ use crate::schema::{
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::encoding::{
-	EncodingComputeConfig, EncodingWriterConfig, L2EncodingFetchConfig,
+	EncodingComputeConfig, EncodingWriterConfig, L2ChunkLayoutConfig, L2EncodingFetchConfig,
 };
 use crate::storage::io_uring::{IoRingHandle, spawn_io_thread_named_for_class};
 use crate::storage::l2::ObjectStoreConfig;
@@ -215,6 +215,8 @@ pub struct NodeBootstrapConfig {
 	pub l2_row_group_fetch: L2RowGroupFetchConfig,
 	/// Deployment-wide ADR 057 Encoding writer config.
 	pub encoding_writer: EncodingWriterConfig,
+	/// Deployment-wide ADR 061 authenticated chunk layout writer config.
+	pub l2_chunk_layout: L2ChunkLayoutConfig,
 	/// Node-local ADR 057 L2 Encoding materialization config.
 	pub l2_encoding_fetch: L2EncodingFetchConfig,
 	/// Node-local ADR 058 compute-over-encoded-data executor config.
@@ -282,6 +284,7 @@ impl NodeBootstrapConfig {
 			row_group_writer: RowGroupWriterConfig::default(),
 			l2_row_group_fetch: L2RowGroupFetchConfig::default(),
 			encoding_writer: EncodingWriterConfig::default(),
+			l2_chunk_layout: L2ChunkLayoutConfig::default(),
 			l2_encoding_fetch: L2EncodingFetchConfig::default(),
 			encoding_compute: EncodingComputeConfig::default(),
 			root_kek_provider: RootKekProviderConfig::DevInsecure,
@@ -411,6 +414,7 @@ impl NodeBootstrapConfig {
 		self.row_group_writer.validate()?;
 		self.l2_row_group_fetch.validate()?;
 		self.encoding_writer.validate()?;
+		self.l2_chunk_layout.validate()?;
 		self.l2_encoding_fetch.validate()?;
 		self.encoding_compute.validate()?;
 		if let Some(l2) = &self.l2 {
@@ -1314,6 +1318,7 @@ impl WendelonNode {
 				row_group_writer: cfg.row_group_writer.clone(),
 				l2_row_group_fetch: cfg.l2_row_group_fetch.clone(),
 				encoding_writer: cfg.encoding_writer.clone(),
+				l2_chunk_layout: cfg.l2_chunk_layout.clone(),
 				l2_encoding_fetch: cfg.l2_encoding_fetch.clone(),
 				encoding_compute: cfg.encoding_compute.clone(),
 				group_commit: cfg.group_commit.clone(),

@@ -3,6 +3,8 @@ use super::{
 	EncodedBufferByteRange, EncodingCascade, EncodingCascadeKind, EncodingDirectory,
 	EncodingLeafCascade, EncodingRejectCode, EncodingWriterConfig,
 };
+use crate::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE;
+use crate::schema::ChunkSizeBytes;
 use crate::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, DictValueCount, EncodingCascadeIndex,
 	EncodingPageByteOffset, ExceptionCount, Exponent, Factor, IpcBufferIndex, IpcColumnOrdinal,
@@ -10,6 +12,7 @@ use crate::schema::{
 	RunCount, SimdPageValueCount, SlabId,
 };
 use crate::storage::columnar::TieredRecordId;
+use crate::storage::encoding::chunk_layout::{chunk_pad_for_cursor, default_sparse_engaged_key};
 use crate::storage::encoding::select::select_and_encode_buffer_with_value_offsets;
 use crate::storage::row_group::{
 	BufferPageDirectoryEntry, RecordBodyByteRange, RecordPageDirectory, RowGroupDirectoryEntry,
@@ -309,6 +312,20 @@ pub struct CompactedEncodingIpcStream {
 	pub bytes: Vec<u8>,
 	pub page_directory: RecordPageDirectory,
 	pub encoding_directory: EncodingDirectory,
+	pub chunk_alignment_pad_bytes: usize,
+}
+
+struct PendingCompactBuffer<'a> {
+	ipc_column_ordinal: IpcColumnOrdinal,
+	ipc_buffer_ordinal: IpcBufferIndex,
+	physical_bytes: &'a [u8],
+}
+
+struct BuiltCompactBody {
+	body: Vec<u8>,
+	rewritten_buffers: Vec<FbBuffer>,
+	pending_pages: Vec<(IpcColumnOrdinal, IpcBufferIndex, usize, usize)>,
+	chunk_alignment_pad_bytes: usize,
 }
 
 pub fn compact_encoding_ipc_stream(
@@ -316,6 +333,7 @@ pub fn compact_encoding_ipc_stream(
 	page_directory: &RecordPageDirectory,
 	encoding_directory: &EncodingDirectory,
 	applied: &[AppliedEncodingBuffer],
+	chunk_size_bytes: ChunkSizeBytes,
 ) -> std::io::Result<CompactedEncodingIpcStream> {
 	let applied_by_key = applied
 		.iter()
@@ -379,6 +397,9 @@ pub fn compact_encoding_ipc_stream(
 	out.extend_from_slice(&ipc_bytes[schema_message.prefix_start..schema_message.body_end]);
 	let mut physical_row_groups = Vec::with_capacity(page_directory.row_groups.len());
 	let mut physical_buffer_pages = Vec::with_capacity(page_directory.buffer_pages.len());
+	let align_chunk_starts = chunk_size_bytes != SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE;
+	let chunk_size = chunk_size_bytes.get() as usize;
+	let mut chunk_alignment_pad_bytes = 0_usize;
 	for group in &page_directory.row_groups {
 		let message = read_compact_ipc_message(ipc_bytes, &mut offset)?.ok_or_else(|| {
 			std::io::Error::new(
@@ -404,9 +425,7 @@ pub fn compact_encoding_ipc_stream(
 				"Encoding compact record batch missing buffers",
 			)
 		})?;
-		let mut body = Vec::with_capacity(message.body_len);
-		let mut rewritten_buffers = Vec::with_capacity(flat_buffers.len());
-		let mut pending_pages = Vec::with_capacity(flat_buffers.len());
+		let mut pending_buffers = Vec::with_capacity(flat_buffers.len());
 		for (buffer_ordinal, buffer) in flat_buffers.iter().enumerate() {
 			let buffer_ordinal =
 				IpcBufferIndex::new(u32::try_from(buffer_ordinal).map_err(|_| {
@@ -466,7 +485,6 @@ pub fn compact_encoding_ipc_stream(
 					"Encoding compact row-group directory does not match dense IPC buffers",
 				));
 			}
-			let physical_offset = body.len();
 			let key = (
 				group.row_group_index,
 				page.ipc_column_ordinal,
@@ -483,54 +501,66 @@ pub fn compact_encoding_ipc_stream(
 			} else {
 				&ipc_bytes[dense_start..dense_end]
 			};
-			body.extend_from_slice(physical_bytes);
-			let physical_len = physical_bytes.len();
-			rewritten_buffers.push(FbBuffer::new(
-				i64::try_from(physical_offset).map_err(|_| {
-					std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"physical IPC buffer offset exceeds i64",
-					)
-				})?,
-				i64::try_from(physical_len).map_err(|_| {
-					std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						"physical IPC buffer length exceeds i64",
-					)
-				})?,
-			));
-			pending_pages.push((
-				page.ipc_column_ordinal,
-				buffer_ordinal,
-				physical_offset,
-				physical_len,
-			));
-			pad_to_8(&mut body);
+			pending_buffers.push(PendingCompactBuffer {
+				ipc_column_ordinal: page.ipc_column_ordinal,
+				ipc_buffer_ordinal: buffer_ordinal,
+				physical_bytes,
+			});
 		}
-
-		let metadata = build_record_batch_message(
-			&message,
-			batch,
-			&rewritten_buffers,
-			i64::try_from(body.len()).map_err(|_| {
-				std::io::Error::new(
-					std::io::ErrorKind::InvalidData,
-					"physical IPC body length exceeds i64",
-				)
-			})?,
-		)?;
 		let prefix_start = out.len();
-		let metadata_len = aligned_metadata_len(metadata.len())?;
-		let body_start = prefix_start
-			.checked_add(8)
-			.and_then(|start| start.checked_add(metadata_len))
+		let mut body_start_hint = message.body_start;
+		let mut stabilized = None;
+		for _ in 0..8 {
+			let built = build_compact_body_for_record_batch(
+				&pending_buffers,
+				&physical_encoding_directory,
+				group.row_group_index,
+				align_chunk_starts,
+				chunk_size,
+				body_start_hint,
+			)?;
+			let metadata = build_record_batch_message(
+				&message,
+				batch,
+				&built.rewritten_buffers,
+				i64::try_from(built.body.len()).map_err(|_| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"physical IPC body length exceeds i64",
+					)
+				})?,
+			)?;
+			let metadata_len = aligned_metadata_len(metadata.len())?;
+			let body_start = prefix_start
+				.checked_add(8)
+				.and_then(|start| start.checked_add(metadata_len))
+				.ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"physical IPC body start overflow",
+					)
+				})?;
+			if !align_chunk_starts || body_start == body_start_hint {
+				stabilized = Some((built, metadata, body_start));
+				break;
+			}
+			body_start_hint = body_start;
+		}
+		let Some((built, metadata, body_start)) = stabilized else {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding compact chunk-aligned body start did not stabilize",
+			));
+		};
+		chunk_alignment_pad_bytes = chunk_alignment_pad_bytes
+			.checked_add(built.chunk_alignment_pad_bytes)
 			.ok_or_else(|| {
 				std::io::Error::new(
 					std::io::ErrorKind::InvalidData,
-					"physical IPC body start overflow",
+					"Encoding compact chunk-alignment pad total overflow",
 				)
 			})?;
-		append_ipc_message(&mut out, &metadata, &body)?;
+		append_ipc_message(&mut out, &metadata, &built.body)?;
 		physical_row_groups.push(RowGroupDirectoryEntry {
 			metadata_range: RecordBodyByteRange {
 				start: RecordBodyByteOffset::try_new(prefix_start as u64)?,
@@ -538,11 +568,12 @@ pub fn compact_encoding_ipc_stream(
 			},
 			body_range: RecordBodyByteRange {
 				start: RecordBodyByteOffset::try_new(body_start as u64)?,
-				len: RecordBodyByteLen::try_new(body.len() as u64)?,
+				len: RecordBodyByteLen::try_new(built.body.len() as u64)?,
 			},
 			..*group
 		});
-		for (ipc_column_ordinal, ipc_buffer_ordinal, physical_offset, physical_len) in pending_pages
+		for (ipc_column_ordinal, ipc_buffer_ordinal, physical_offset, physical_len) in
+			built.pending_pages
 		{
 			let start = body_start.checked_add(physical_offset).ok_or_else(|| {
 				std::io::Error::new(
@@ -573,6 +604,83 @@ pub fn compact_encoding_ipc_stream(
 			logical_schema_fingerprint: page_directory.logical_schema_fingerprint,
 		},
 		encoding_directory: physical_encoding_directory,
+		chunk_alignment_pad_bytes,
+	})
+}
+
+fn build_compact_body_for_record_batch(
+	pending_buffers: &[PendingCompactBuffer<'_>],
+	physical_encoding_directory: &EncodingDirectory,
+	row_group_index: RowGroupIndex,
+	align_chunk_starts: bool,
+	chunk_size: usize,
+	output_body_start: usize,
+) -> std::io::Result<BuiltCompactBody> {
+	let mut body = Vec::new();
+	let mut rewritten_buffers = Vec::with_capacity(pending_buffers.len());
+	let mut pending_pages = Vec::with_capacity(pending_buffers.len());
+	let mut chunk_alignment_pad_bytes = 0_usize;
+	for buffer in pending_buffers {
+		if align_chunk_starts
+			&& default_sparse_engaged_key(
+				physical_encoding_directory,
+				row_group_index,
+				buffer.ipc_column_ordinal,
+				buffer.ipc_buffer_ordinal,
+			) {
+			let cursor = output_body_start.checked_add(body.len()).ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Encoding compact chunk-alignment cursor overflow",
+				)
+			})?;
+			let pad = chunk_pad_for_cursor(cursor, chunk_size);
+			chunk_alignment_pad_bytes =
+				chunk_alignment_pad_bytes.checked_add(pad).ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidData,
+						"Encoding compact chunk-alignment pad total overflow",
+					)
+				})?;
+			let new_len = body.len().checked_add(pad).ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Encoding compact chunk-alignment body overflow",
+				)
+			})?;
+			body.resize(new_len, 0);
+		}
+		let physical_offset = body.len();
+		body.extend_from_slice(buffer.physical_bytes);
+		let physical_len = buffer.physical_bytes.len();
+		rewritten_buffers.push(FbBuffer::new(
+			i64::try_from(physical_offset).map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"physical IPC buffer offset exceeds i64",
+				)
+			})?,
+			i64::try_from(physical_len).map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"physical IPC buffer length exceeds i64",
+				)
+			})?,
+		));
+		pending_pages.push((
+			buffer.ipc_column_ordinal,
+			buffer.ipc_buffer_ordinal,
+			physical_offset,
+			physical_len,
+		));
+		pad_to_8(&mut body);
+	}
+
+	Ok(BuiltCompactBody {
+		body,
+		rewritten_buffers,
+		pending_pages,
+		chunk_alignment_pad_bytes,
 	})
 }
 

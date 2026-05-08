@@ -2,8 +2,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use wendelon::crypto::{
-	CryptoManager, EncryptedTieredSlab, SLAB_ENCRYPTION_CHUNK_BYTES, TieredOffsetIndexEntry,
-	TieredSlabObjectMetadata, test_support,
+	CryptoManager, EncryptedTieredSlab, SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES,
+	SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE, TieredOffsetIndexEntry, TieredSlabObjectMetadata,
+	test_support,
 };
 use wendelon::schema::{IdentityPrefix, SlabId, TenantId};
 
@@ -30,6 +31,7 @@ fn encrypt_bench_tiered_slab(
 		&TieredSlabObjectMetadata {
 			tenant_id: TenantId::ZERO,
 			created_hlc: 0,
+			chunk_size_bytes: SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
 			offset_index: vec![TieredOffsetIndexEntry {
 				key_locator: IdentityPrefix::ZERO,
 				byte_offset: 0,
@@ -55,19 +57,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		BenchCase {
 			label: "serial-64-chunks",
 			slab_id: SlabId::new(10_001),
-			bytes: 64 * SLAB_ENCRYPTION_CHUNK_BYTES,
+			bytes: 64 * SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES,
 			iterations: 64,
 		},
 		BenchCase {
 			label: "threshold-128-chunks",
 			slab_id: SlabId::new(10_002),
-			bytes: 128 * SLAB_ENCRYPTION_CHUNK_BYTES,
+			bytes: 128 * SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES,
 			iterations: 32,
 		},
 		BenchCase {
 			label: "parallel-512-chunks",
 			slab_id: SlabId::new(10_003),
-			bytes: 512 * SLAB_ENCRYPTION_CHUNK_BYTES,
+			bytes: 512 * SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES,
 			iterations: 8,
 		},
 	];
@@ -77,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		.unwrap_or(1);
 	println!(
 		"slab_crypto chunk_bytes={} available_parallelism={available_parallelism}",
-		SLAB_ENCRYPTION_CHUNK_BYTES,
+		SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES,
 	);
 
 	for case in cases {
@@ -138,7 +140,7 @@ fn bench_decrypt_warm_cache(
 }
 
 fn print_measurement(case: &BenchCase, measurement: &BenchMeasurement) {
-	let chunk_count = case.bytes.div_ceil(SLAB_ENCRYPTION_CHUNK_BYTES);
+	let chunk_count = case.bytes.div_ceil(SLAB_ENCRYPTION_DEFAULT_CHUNK_BYTES);
 	let avg_ns = measurement.elapsed.as_nanos() / measurement.iterations as u128;
 	let throughput_mib_per_s = (case.bytes * measurement.iterations) as f64
 		/ (1024.0 * 1024.0)

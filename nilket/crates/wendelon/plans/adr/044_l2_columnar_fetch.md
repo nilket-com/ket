@@ -28,8 +28,10 @@ closes it.
 The infrastructure for chunk-aligned authenticated range
 reads from L2 is already in place:
 
-- ADR 020 §2 fixes the per-slab DEK + 64 KiB chunked AEAD
-  discipline. Nonces are deterministic
+- ADR 020 §2 fixes the per-slab DEK + chunked AEAD
+  discipline. ADR 061 later promotes per-slab chunk-size
+  selection while preserving the same authenticated-chunk
+  arithmetic. Nonces are deterministic
   (`version(u32be) || chunk_index(u64be)`), AAD is the 48-byte
   fixed tuple `tenant_id || slab_id || chunk_index || slab_format_version || cipher_id || reserved`,
   and `crypto::plan_tiered_range_read(plaintext_range)`
@@ -169,11 +171,11 @@ Phase B (column fetch):
 `metadata_window` is the prefix size sufficient to carry
 the IPC FlatBuffer schema + RecordBatch message metadata
 (empirically a few KiB for typical analytical schemas).
-The V1 default starts at one chunk = 64 KiB and grows by
+The V1 default starts at one current slab chunk (64 KiB on the
+baseline chunk layout; smaller on ADR 061 slabs) and grows by
 one chunk at a time until either the metadata parses or
-`max_ipc_metadata_probe_bytes` (default 256 KiB) is
-reached — at which point the record falls back to whole-
-record fetch (§7).
+`max_ipc_metadata_probe_bytes` (default 256 KiB) is reached —
+at which point the record falls back to whole-record fetch (§7).
 
 The "extra round trip" framing slightly oversells the
 cost: if the projection touches *any* column whose buffers
@@ -795,9 +797,9 @@ unchanged from ADR 043 §4.
   decode error during column materialization, not as an
   AEAD-verify failure. The corrupted-body case is rare and
   surfaces on any read path; it is not new under ADR 044.
-- **Mixed legacy / new fetch shape during rollout.** Until
-  a build is fully ADR 044-aware, some nodes serve whole-
-  record fetches and others column-projected fetches. Query
+- **Mixed whole-record / column-projected fetch shape during
+  rollout.** Until a build is fully ADR 044-aware, some nodes
+  serve whole-record fetches and others column-projected fetches. Query
   *results* are byte-identical, but cold-tier byte-fetched
   metrics will show two populations.
 - **Increased L2 GET count.** Even with chunk coalescing,
