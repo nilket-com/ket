@@ -4301,3 +4301,151 @@ fn test_adr059_native_cocd_kernel_guards() {
 		violations.join("\n")
 	);
 }
+
+#[test]
+fn test_adr060_sparse_projection_fetch_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let encoding_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/mod.rs")).unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let schema_pbc = fs::read_to_string(manifest_dir.join("src/schema/pbc.rs")).unwrap();
+	let transport = fs::read_to_string(manifest_dir.join("src/network/transport.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+
+	for required in [
+		"pub mod page_materialize;",
+		"pub mod sparse_projection_fetch;",
+	] {
+		if !encoding_mod.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/mod.rs: missing ADR 060 token {required}"
+			));
+		}
+	}
+	for required in [
+		"PageMaterializeKey",
+		"PageMaterializeBufferKey",
+		"PageMaterializeColumn",
+		"PageMaterializeFetch",
+		"decode_page_fetch",
+		"projected_page_batch_from_decoded_buffers",
+		"extract_record_body_bytes",
+		"empty_projected_batch_for_row_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 060 helper token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"SparseProjectionFetchDecision",
+		"SparseProjectionFetchDecline",
+		"decide_sparse_projection_fetch",
+		"MAX_SPARSE_RANGES_PER_BUFFER",
+	] {
+		if page_materialize.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: helper module must not own planner token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) const MAX_SPARSE_RANGES_PER_BUFFER",
+		"pub(crate) struct RowToPageMap",
+		"pub(crate) enum ActivePageSet",
+		"pub(crate) struct SparseProjectionFetchPlan",
+		"pub(crate) enum SparseProjectionFetchDecision",
+		"pub(crate) enum SparseProjectionFetchDecline",
+		"pub(crate) fn decide_sparse_projection_fetch",
+		"mask_to_active_pages",
+		"projection_cascade_eligible",
+		"ByteEstimateNotSparse",
+		"PerBufferFragmentationCapExceeded",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 060 planner token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"decode_page_fetch(",
+		"projected_page_batch_from_decoded_buffers(",
+		"pub struct Config",
+		"sparse_phase",
+		"SparsePhase",
+		"phase_c",
+	] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: forbidden ADR 060 token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"decide_sparse_projection_fetch(SparseProjectionFetchInput",
+		"materialize_sparse_projection_pages",
+		"dense_predicate_batches_present",
+		"predicate_outcome: &phase_b_outcome",
+		"observe_storage_l2_encoding_simd_pages_fetched",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 060 runtime token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"L2FetchStrategy::Sparse",
+		"RowGroupFallbackReason::Sparse",
+		"EncodingFallbackReason::Sparse",
+		"EncodingRejectCode::Sparse",
+		"EncodedRowMask::Sparse",
+		"sparse_projection_fetch_",
+	] {
+		if columnar.contains(forbidden)
+			|| row_group.contains(forbidden)
+			|| encoding_types.contains(forbidden)
+			|| compute_types.contains(forbidden)
+			|| config.contains(forbidden)
+			|| schema_pbc.contains(forbidden)
+			|| transport.contains(forbidden)
+			|| metrics.contains(forbidden)
+		{
+			violations.push(format!("ADR 060 forbidden public/config token {forbidden}"));
+		}
+	}
+	if !row_group.contains("pub struct RowGroupFetchPlan")
+		|| !row_group.contains("phase_c_fetch")
+		|| !columnar.contains("RowGroup(RowGroupFetchPlan)")
+	{
+		violations.push(
+			"ADR 060 must reuse the existing row-group fetch strategy and projection-fetch plan field"
+				.to_string(),
+		);
+	}
+	if metrics.contains("sparse_projection") || metrics.contains("sparse_projection_fetch") {
+		violations.push("ADR 060 must not add sparse-specific metric labels".to_string());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 060 sparse projection fetch invariants violated:\n{}",
+		violations.join("\n")
+	);
+}

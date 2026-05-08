@@ -31,6 +31,29 @@ at the inner layer (encoded buffers + page directory +
 custom materializer) just as ADR 056 matched it at the outer
 layer (row-group RecordBatches + per-row-group stats).
 
+## Where we are
+
+ADR 060 sparse projection fetch narrowing is now
+implemented and promoted to shipped. Its Phase 7
+bench artifact at
+`plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
+confirms ADR 057's per-buffer page metadata is
+sufficient for mask-driven projection fetch:
+`BufferEncoding.page_value_count` provides
+deterministic row-to-page mapping, selected
+BitPacked / Dictionary pages materialize byte-
+identically to the dense projection oracle, and no
+ADR 057 directory shape change is required.
+
+RLE remains correctness-eligible by page metadata,
+but ADR 060 V1 routes RLE projection sparse fetch
+default-off after Phase 7 evidence. RLE value-run
+format work remains a separate ADR. ADR 060 also
+records ciphertext-byte narrowing as bounded by ADR
+044 chunk granularity; page-aligned authenticated
+chunk layout is follow-up territory, not an ADR 057
+directory extension.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-row-group-buffer encoding

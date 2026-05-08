@@ -43,27 +43,26 @@ Inherits substrate:
 
 ## Status
 
-Council-converged. ADR document and this
-implementation plan landed at their final paths in
-the convergence changeset; **implementation phases
-1–7 are the next pickup**, and full Phase 7 bench
-evidence at
+Council-converged, implemented, and promoted to
+shipped. Full Phase 7 bench evidence at
 `plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
-gates Phase 8's shipped-status flip (matching the
-ADR 055 / 056 / 057 / 059 two-step cadence:
-document landing first, shipped-status flip after
-implementation + bench acceptance).
+clears the shipped-status gate for the council-
+chosen default scope: `BitPacked` and `Dictionary`
+sparse projection fetch are default-engaged when
+the plan-time economics choose them; RLE remains
+default-off after Phase 7 evidence and is recorded
+as follow-up ADR territory.
 
 Implementation contract — council-converged:
 
 - per-row-group decision grain with cross-column
   geometry agreement;
-- V1 page-materializable cascade set: `BitPacked`,
-  `Dictionary { inner: Plain | BitPacked }`, `Rle`
-  (RLE correctness-eligible per codec verification;
-  default routing settled by the bench artifact,
-  non-blocking for `BitPacked` / `Dictionary`
-  promotion);
+- V1 default sparse projection engagement set:
+  `BitPacked`, `Dictionary { inner: Plain | BitPacked }`;
+  RLE is correctness-eligible per codec
+  verification but remains default-off by Phase 7
+  disposition, non-blocking for `BitPacked` /
+  `Dictionary` promotion;
 - V1 engages only for exact-COCD masks
   (`decoded_predicate_batches` empty);
 - no new config fields, no new metric labels;
@@ -187,7 +186,7 @@ planner + decision live in their own module.
   `tests/row_group_secondary_index.rs` — guard
   extracted helper reuse; existing tests pass
   byte-identical post-extraction.
-- `tests/row_group_fetch_test.rs` /
+- `tests/row_group_fetch_plan.rs` /
   `tests/row_group_materialization.rs` —
   extension cases for sparse decisions.
 - `tests/architecture_test.rs` — incremental
@@ -345,10 +344,11 @@ Work:
 5. Record V1 conservative eligibility:
    - fixed-width projection columns only;
    - non-null projected columns only;
-   - V1 page-materializable cascade set:
+   - V1 default sparse projection engagement set:
      `BitPacked`,
-     `Dictionary { inner: Plain | BitPacked }`,
-     `Rle`;
+     `Dictionary { inner: Plain | BitPacked }`;
+     RLE row→page mapping is correctness-eligible
+     but default-off after Phase 7 evidence;
    - selected page geometry must match across
      every required value buffer in a row
      group;
@@ -364,7 +364,8 @@ Work:
 not mutate ADR 056 / 057 / 058 / 059 public
 surfaces. Pre-060 surface inventory recorded;
 per-row-group + exact-COCD-only V1 scope
-locked; RLE inclusion verified at code level.
+locked; RLE row→page mapping verified at code
+level.
 
 ## Phase 1 — Extract encoded page materialization helpers
 
@@ -575,7 +576,7 @@ pub(crate) enum SparseProjectionFetchDecline {
     MissingExactCocdMask,
     DensePredicateBatchPresent,
     CascadeNotPageEmitting,
-    CascadeNotProjectionEligible, // Fsst / Alp / etc., or RLE if Phase 7 misses
+    CascadeNotProjectionEligible, // Fsst / Alp / etc., plus RLE in V1 default-off routing
     NullableProjectedColumn,
     VariableWidthProjectedColumn,
     PageGeometryMismatchAcrossColumns,
@@ -587,9 +588,8 @@ pub(crate) enum SparseProjectionFetchDecline {
     Disabled,
 }
 
-const MAX_SPARSE_RANGES_PER_BUFFER: u32 = 8;
-// Phase 7 bench tunes; starting value is a
-// council-recommended placeholder. Helper-
+const MAX_SPARSE_RANGES_PER_BUFFER: usize = 8;
+// Phase 7 bench-selected starting value. Helper-
 // local; not a Config field.
 ```
 
@@ -683,10 +683,11 @@ Tests:
 - BitPacked + Runs spanning every other page →
   `Decline(PerBufferFragmentationCapExceeded)`
   if budget exceeded.
-- RLE byte-run + clustered Runs **with default
-  V1 routing** → `Sparse` if Phase 7 cleared
-  RLE; `Decline(CascadeNotProjectionEligible)`
-  if Phase 7 missed.
+- RLE byte-run + clustered Runs with default V1
+  routing →
+  `Decline(CascadeNotProjectionEligible)`. RLE
+  page mapping is correctness-eligible, but Phase
+  7 settles the default route as off.
 - Plain cascade →
   `Decline(CascadeNotPageEmitting)`.
 - Mixed projection (BitPacked + Plain in same
@@ -859,8 +860,9 @@ Tests:
   projection fetch followed by
   `apply_phase_b_masks_to_projected_row_groups(...)`
   byte-for-byte for every BitPacked +
-  Dictionary fixture; RLE fixtures pass when
-  Phase 7 has cleared RLE.
+  Dictionary fixture; RLE fixtures verify the
+  default-off eligibility route plus `None` mask
+  short-circuit behavior.
 - Sparse execution does not double-apply the
   survival mask.
 - First / middle / last page selections
@@ -1037,11 +1039,10 @@ Bench matrix:
 - **Projected-column cascades:** BitPacked
   `UInt8` / `UInt16` / `UInt32`, Dictionary
   plain low-card, Dictionary bitpacked low-
-  card, **RLE byte-run (default routing
-  settled by this matrix)**, Plain (dense
-  control), Delta (dense control), Lz4Frame
-  (dense control), nullable BitPacked (dense
-  control).
+  card, **RLE byte-run (default-off after
+  Phase 7 evidence)**, Plain (dense control),
+  Delta (dense control), Lz4Frame (dense
+  control), nullable BitPacked (dense control).
 - **Projected-column count:** 1 / 4 / 16 /
   64.
 - **Three-way per-cell measurement:** sparse
@@ -1065,13 +1066,24 @@ Bench matrix:
 Acceptance gates:
 
 - Clustered 1% / 5% masks reduce projection-
-  fetch ciphertext bytes by **≥ 3×** vs
+  fetched **plaintext** bytes by **≥ 3×** vs
   full-row-group on representative
   `BitPacked` and `Dictionary` projected
-  fixtures.
+  fixtures. This is the byte quantity the
+  plan-time sparse_bytes < dense_bytes
+  economic gate estimates.
 - Clustered 1% / 5% masks improve end-to-end
   read CPU or wall time by **≥ 1.5×** after
   multi-range RTT overhead.
+- Encrypted ciphertext-byte ratios are recorded
+  but **not gated** in ADR 060 V1. ADR 044's
+  chunk-aligned authenticated range-read
+  substrate rounds selected plaintext ranges out
+  to chunk boundaries, creating the observed
+  1.0×–1.1× floor on representative 1M
+  fixtures. Substantial ciphertext-byte
+  narrowing requires a separate page-aligned
+  authenticated-chunk layout ADR.
 - Sparse plans stay within the chosen
   `MAX_SPARSE_RANGES_PER_BUFFER`.
 - Random 1% masks decline sparse or stay
@@ -1089,14 +1101,12 @@ Acceptance gates:
 - No fixture row slower than dense
   projection-fetch baseline on any cascade
   without documented council disposition.
-- **RLE Q1 settles here**: RLE fixtures
-  either clear ≥ 3× / ≥ 1.5× → RLE default-
-  on; or miss with stable margin → RLE
+- **RLE Q1 settles here**: RLE fixtures record
   default-off via eligibility-layer cascade
-  exclusion. **Either decision is byte-
-  correct and recorded in the V1
-  changeset**; non-blocking for BitPacked /
-  Dictionary promotion.
+  exclusion. The decision is byte-correct and
+  recorded in the V1 changeset; non-blocking for
+  BitPacked / Dictionary promotion. RLE value-run
+  format work remains a separate ADR.
 
 Bench artifact follows ADR 056 / 057 / 058 /
 059 shape: command, fixture matrix table,
@@ -1114,7 +1124,7 @@ Reports per row:
 - sparse projection-fetch selected page
   bytes and time;
 - tiered ciphertext bytes after range
-  coalescing;
+  coalescing (recorded, not promotion-gated);
 - selected range count;
 - max per-buffer sparse range count;
 - per-buffer fragmentation budget value
@@ -1127,8 +1137,9 @@ Reports per row:
 - output equality status.
 
 **Exit gate:** Bench artifact records pass /
-fail for every gate. Council decides RLE
-default routing (Q1) and finalizes
+fail for every gate, the recorded-not-gated
+ciphertext ratios, the RLE default-off Q1
+disposition, and the finalized
 `MAX_SPARSE_RANGES_PER_BUFFER` constant.
 Empirical, not prescriptive.
 
@@ -1139,22 +1150,20 @@ are already at their final paths
 (`plans/adr/060_sparse_projection_fetch_narrowing.md`,
 `plans/impl/060_sparse_projection_fetch_narrowing.md`)
 from the council-convergence promotion
-changeset. Phase 8 is the *shipped*-status
-flip after Phase 7 bench acceptance — it does
-not republish the ADR or impl plan.
+changeset. Phase 8 is now complete: Phase 7
+bench evidence accepted the revised plaintext-
+byte gate, recorded ciphertext bytes as an ADR
+044 chunk-granularity floor, accepted RLE
+default-off, and flipped ADR 060 to shipped.
 
 Files:
 
 - `plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
-  (new, lands in the shipped-promotion
-  changeset).
+  (landed in the shipped-promotion changeset).
 - `plans/adr/060_sparse_projection_fetch_narrowing.md` —
-  §"Status" amendment from "Council-converged;
-  implementation phases pending; full Phase 7
-  bench evidence is the promotion-to-shipped
-  gate" to "Council-converged, implemented,
-  and promoted to shipped" (matching the ADR
-  059 §"Status" pattern).
+  §"Status" amended to "Council-converged,
+  implemented, and promoted to shipped" (matching
+  the ADR 059 §"Status" pattern).
 - `plans/adr/056_row_group_fetch_and_page_directory.md` —
   §"Where we are" amendment pointing at the
   landed bench artifact.
@@ -1170,14 +1179,14 @@ Files:
   path (already true post-convergence; this
   is a verification, not a rename).
 
-Work:
+Work completed:
 
-1. Confirm Phase 7 bench artifact passes
-   promotion gates on the ship-class machine
-   for the council-chosen default scope
-   (including RLE Q1 routing decision and
-   `MAX_SPARSE_RANGES_PER_BUFFER` final
-   value).
+1. Confirm Phase 7 bench artifact passes the
+   revised promotion gates for the council-
+   chosen default scope: plaintext-byte
+   reduction ≥ 3×, wall-clock ≥ 1.5×, recorded-
+   not-gated ciphertext ratios, RLE default-off,
+   and `MAX_SPARSE_RANGES_PER_BUFFER = 8`.
 2. Land the bench-results artifact at the
    path above.
 3. Flip ADR 060 §"Status" to "Council-
@@ -1192,12 +1201,12 @@ Work:
    boundary (matches the ADR 057 / 058 / 059
    shipped-status pattern).
 
-**Exit gate:** ADR 060 marked shipped only
-when code, tests, and bench evidence land
-together. `git log` carries one commit per
-phase 1–7, plus one promotion commit at
-phase 8. Total: ~8–10 commits matching ADR
-057 / 058 / 059 cadence.
+**Exit gate:** ADR 060 is marked shipped because
+code, tests, and bench evidence landed together
+with the recorded council disposition. Commit
+granularity remains the repository's normal review
+concern; the load-bearing Phase 8 requirement is
+the artifact-backed status flip.
 
 ## Verification gate
 
@@ -1206,7 +1215,7 @@ Required before promotion:
 ```sh
 cargo test --test row_group_sparse_projection_fetch
 cargo test --test row_group_materialization
-cargo test --test row_group_fetch_test
+cargo test --test row_group_fetch_plan
 cargo test --test row_group_secondary_index
 cargo test --test encoding_secondary_index
 cargo test --test encoding_compute_test
@@ -1220,14 +1229,16 @@ cargo bench --bench row_group_fetch -- --quick
 cargo bench --bench row_group_fetch
 cargo bench --bench encoding_compute -- --quick
 git diff --check
+git diff --cached --check
 ```
 
 Promotion requires:
 
 - all tests above green;
-- bench artifact meets Phase 7 gates for the
-  council-chosen default scope (including RLE
-  Q1 resolution);
+- bench artifact meets revised Phase 7 gates for
+  the council-chosen default scope, including RLE
+  Q1 default-off resolution and recorded-not-gated
+  ciphertext ratios;
 - ADR 060 ships **without** any new config
   field;
 - ADR 056 + ADR 057 §"Where we are" amended in
@@ -1266,8 +1277,8 @@ Promotion requires:
   (Phase 1).
 - `tests/row_group_materialization.rs` —
   dense-vs-sparse oracle tests (Phase 5).
-- `tests/row_group_fetch_test.rs` — sparse
-  mixed cases (Phase 4).
+- `tests/row_group_fetch_plan.rs` — existing
+  row-group fetch planner regression target.
 - `tests/architecture_test.rs` — ADR 060
   guards (Phase 6).
 - `benches/row_group_fetch.rs` — sparse vs
@@ -1293,11 +1304,13 @@ group.
 **Multi-range RTT overhead eats byte
 savings.** Mitigation: existing
 `max_ranges_per_record` cap plus selected
-ciphertext byte fraction gate after
-coalescing, plus
+byte-fraction economics after coalescing, plus
 `MAX_SPARSE_RANGES_PER_BUFFER` internal
 budget. Bench reports post-coalesce
-ciphertext bytes plus wall-clock.
+plaintext bytes, ciphertext bytes, and wall-clock.
+Ciphertext-byte ratios are recorded as an ADR 044
+chunk-granularity floor, not ADR 060's shipped
+gate.
 
 **Per-buffer fragmentation pathology.**
 Mitigation: `MAX_SPARSE_RANGES_PER_BUFFER`
@@ -1329,10 +1342,10 @@ after fixed-width non-null path is proven
 Mitigation: codec verification confirms
 row→page mapping is deterministic via
 `page_value_count`; this is an economic
-question, not correctness blocker. Default-on
-if Phase 7 clears ≥ 3× / ≥ 1.5× gates with
-stable margin; default-off via eligibility-
-layer cascade exclusion otherwise (Q1).
+question, not correctness blocker. Phase 7
+settles V1 as default-off via eligibility-layer
+cascade exclusion (Q1); RLE value-run format work
+remains a separate ADR.
 
 **Manager grows harder to maintain.**
 Mitigation: two-module split —
@@ -1383,11 +1396,13 @@ Phase 0 guess.
 - Sparse projection fetch for `Plain` /
   `Lz4Frame` / `Delta` / `Fsst` / `Alp`
   projected buffers.
-- RLE default-on if Phase 7 misses (Q1;
-  bench-settled).
+- RLE default-on promotion after V1; Phase 7
+  settled current V1 routing as default-off (Q1).
 - Operator-visible per-buffer fragmentation
   knob (V1 ships internal `const`).
 - ADR 057 RLE value-run format follow-up.
+- Page-aligned authenticated chunk layout for
+  ciphertext-byte narrowing (own ADR).
 - Page-level min/max stats (own ADR).
 - Page-level null counts (own ADR).
 - Delta prefix-sum side table (own ADR).
@@ -1408,11 +1423,13 @@ Phase 0 guess.
 Mirror ADR 060 resolved questions:
 
 1. **RLE byte-run projection default routing** —
-   bench-settled, non-blocking. Phase 7 evidence
-   decides default-on or default-off; either
-   decision is byte-correct and recorded in the
-   V1 changeset. Non-blocking for `BitPacked` /
-   `Dictionary` promotion.
+   default-off, non-blocking. Phase 7 evidence
+   records RLE as default-off via eligibility-
+   layer cascade exclusion. The decision is byte-
+   correct and recorded in the V1 changeset.
+   Non-blocking for `BitPacked` / `Dictionary`
+   promotion; RLE value-run format work remains a
+   separate ADR.
 2. **Nullable fixed-width support** — deferred to
    follow-up ADR. V1 routes nullable projected
    columns to dense via the

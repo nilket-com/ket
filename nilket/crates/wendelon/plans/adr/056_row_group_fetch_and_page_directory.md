@@ -45,6 +45,28 @@ hierarchy rather than alternatives. Resolved 2026-05-05
 by user direction. Iters 6–7 land the final converged
 text.
 
+## Where we are
+
+ADR 060 sparse projection fetch narrowing is now
+implemented and promoted to shipped. Its Phase 7
+bench artifact at
+`plans/impl/060_sparse_projection_fetch_narrowing_bench_results.md`
+closes the encoded-fetch sparse follow-up on top of
+ADR 056's row-group planner: exact-COCD survival
+masks can narrow projection fetches to selected ADR
+057 pages for clustered BitPacked / Dictionary
+fixtures, while preserving ADR 056's public
+`L2FetchStrategy::RowGroup` shape and fallback full-
+row-group projection path.
+
+ADR 060's gate revision records that ADR 056 / 044
+chunk-aligned authenticated range reads bound
+ciphertext-byte reduction in V1. ADR 060 therefore
+promotes on selected plaintext projection-byte
+reduction plus wall-clock improvement, with
+ciphertext ratios recorded as evidence for a future
+page-aligned authenticated chunk-layout ADR.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-record `RecordPageDirectory`

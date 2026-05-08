@@ -6,29 +6,45 @@
 //! promotion matrix: writer overhead, page-directory planning, Phase B
 //! survival-mask evaluation, and masked Phase C materialization.
 
-use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{
+	Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt16Array, UInt32Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::io::{Error, ErrorKind};
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use wendelon::crypto::{
+	TieredOffsetIndexEntry, TieredPlaintextRange, TieredSlabObjectMetadata,
+	test_support::seeded_dev_crypto_manager,
+};
 use wendelon::schema::pbc::{OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
-	HybridTimestamp, Identity, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
-	RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, SlabId, TableObjectId,
+	BufferValueCount, HybridTimestamp, Identity, IdentityPrefix, Locality, LocalityPolicyV1,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
+	RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId, TenantId,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
-	ColumnFetchRequirement, ColumnOrdinalSet, PhaseBOutcome, PlaintextByteRange,
-	RecordBufferDirectory, RowGroupWriterConfig, TieredRecordId,
+	ColumnFetchRequirement, ColumnOrdinalSet, EncodingPageDescriptor, PhaseBOutcome,
+	PlaintextByteRange, RecordBufferDirectory, RowGroupWriterConfig, TieredRecordId,
 	apply_phase_b_masks_to_projected_row_groups, build_page_directory_for_ipc_stream,
-	default_stats_supported_types, encode_multirow_from_survivors_with_row_group_config,
-	encode_record_batches_bytes, parse_record_buffer_directory,
-	project_record_batch_for_requirement, row_group_stats_for_batch,
+	decode_projected_row_groups_from_plaintext_ranges, default_stats_supported_types,
+	encode_multirow_from_survivors_with_row_group_and_encoding_config,
+	encode_multirow_from_survivors_with_row_group_config, encode_record_batches_bytes,
+	parse_record_buffer_directory, project_record_batch_for_requirement, row_group_stats_for_batch,
 	selected_row_group_record_body_ranges, serialize_page_directory_value,
+};
+use wendelon::storage::{
+	EncodingCascade, EncodingCascadeKind, EncodingWriterConfig, MockObjectStore,
+	MockObjectStoreConfig, ObjectMetadata, ObjectStore, RecordBodyByteRange,
 };
 
 fn main() -> std::io::Result<()> {
@@ -54,6 +70,13 @@ fn main() -> std::io::Result<()> {
 		bench_masked_materialization(&config, case, &batch, &fixture.directory)?;
 	}
 	bench_compression_ratio(&config)?;
+	bench_sparse_projection_planner(&config)?;
+	bench_sparse_projection_runtime(&config)?;
+	bench_sparse_projection_runtime_projection_counts(&config)?;
+	bench_sparse_projection_runtime_mixed_cascade(&config)?;
+	bench_sparse_projection_runtime_fragmentation(&config)?;
+	bench_sparse_projection_runtime_point_read(&config)?;
+	bench_sparse_projection_runtime_determinism(&config)?;
 	Ok(())
 }
 
@@ -249,6 +272,146 @@ fn source_rows(rows: usize) -> Vec<MultiRowSourceRow> {
 			table_object_id: Some(TableObjectId::new([0x56; 16])),
 		})
 		.collect()
+}
+
+fn ordered_source_rows(rows: usize) -> Vec<MultiRowSourceRow> {
+	(0..rows)
+		.map(|row| {
+			let mut key = [0_u8; 32];
+			key[..8].copy_from_slice(&(row as u64).to_be_bytes());
+			MultiRowSourceRow {
+				source_row_index: row,
+				key_identity: Identity::new(key),
+				routing_locality: Locality::ZERO,
+				row_hlc: HybridTimestamp {
+					physical_ms: 60,
+					logical: row as u32,
+					node_id: 1,
+				},
+				is_tombstone: false,
+				table_object_id: Some(TableObjectId::new([0x60; 16])),
+			}
+		})
+		.collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SparseProjectionCascadeFixture {
+	BitPacked,
+	Dictionary,
+	Rle,
+	Plain,
+	Delta,
+	BitPackedPlusPlain,
+}
+
+impl SparseProjectionCascadeFixture {
+	const ALL: [Self; 5] = [
+		Self::BitPacked,
+		Self::Dictionary,
+		Self::Rle,
+		Self::Plain,
+		Self::Delta,
+	];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::BitPacked => "bit_packed",
+			Self::Dictionary => "dictionary",
+			Self::Rle => "rle",
+			Self::Plain => "plain",
+			Self::Delta => "delta",
+			Self::BitPackedPlusPlain => "bit_packed_plus_plain",
+		}
+	}
+
+	fn enabled_cascades(self) -> BTreeSet<EncodingCascadeKind> {
+		let cascades = match self {
+			Self::BitPacked => vec![EncodingCascadeKind::Plain, EncodingCascadeKind::BitPacked],
+			Self::Dictionary => vec![EncodingCascadeKind::Plain, EncodingCascadeKind::Dictionary],
+			Self::Rle => vec![EncodingCascadeKind::Plain, EncodingCascadeKind::Rle],
+			Self::Plain => vec![EncodingCascadeKind::Plain, EncodingCascadeKind::Plain],
+			Self::Delta => vec![EncodingCascadeKind::Plain, EncodingCascadeKind::Delta],
+			Self::BitPackedPlusPlain => {
+				vec![EncodingCascadeKind::Plain, EncodingCascadeKind::BitPacked]
+			}
+		};
+		cascades.into_iter().collect()
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SparseProjectionMaskShape {
+	SingleFirstRow,
+	ClusteredFirstPage,
+	ClusteredMiddleOnePercent,
+	ClusteredFivePercent,
+	ClusteredTwentyFivePercent,
+	RandomOnePercent,
+	All,
+	None,
+}
+
+impl SparseProjectionMaskShape {
+	const ALL: [Self; 7] = [
+		Self::ClusteredFirstPage,
+		Self::ClusteredMiddleOnePercent,
+		Self::ClusteredFivePercent,
+		Self::ClusteredTwentyFivePercent,
+		Self::RandomOnePercent,
+		Self::All,
+		Self::None,
+	];
+
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::SingleFirstRow => "single_first_row",
+			Self::ClusteredFirstPage => "clustered_first_page",
+			Self::ClusteredMiddleOnePercent => "clustered_middle_1p",
+			Self::ClusteredFivePercent => "clustered_5p",
+			Self::ClusteredTwentyFivePercent => "clustered_25p",
+			Self::RandomOnePercent => "random_1p",
+			Self::All => "all",
+			Self::None => "none",
+		}
+	}
+}
+
+fn sparse_projection_bench_batch(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+) -> std::io::Result<RecordBatch> {
+	let schema = Schema::new(vec![
+		Field::new("c0", DataType::Int64, false),
+		Field::new("c1", DataType::Int64, false),
+		Field::new("c2", DataType::Int64, false),
+	]);
+	let payload = (0..rows)
+		.map(|row| match cascade {
+			SparseProjectionCascadeFixture::BitPacked => (row % 1024) as i64,
+			SparseProjectionCascadeFixture::Dictionary => (row % 4) as i64,
+			SparseProjectionCascadeFixture::Rle => 0,
+			SparseProjectionCascadeFixture::Plain => {
+				let mixed = (row as u64)
+					.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+					.rotate_left(17);
+				i64::from_le_bytes(mixed.to_le_bytes())
+			}
+			SparseProjectionCascadeFixture::BitPackedPlusPlain => 7,
+			SparseProjectionCascadeFixture::Delta => row as i64,
+		})
+		.collect::<Vec<_>>();
+	RecordBatch::try_new(
+		Arc::new(schema),
+		vec![
+			Arc::new(Int64Array::from_iter_values(0..rows as i64)) as ArrayRef,
+			Arc::new(Int64Array::from_iter_values(
+				(0..rows).map(|row| row as i64),
+			)) as ArrayRef,
+			Arc::new(Int64Array::from_iter_values(payload)) as ArrayRef,
+		],
+	)
+	.map_err(|err| Error::new(ErrorKind::InvalidData, format!("sparse bench batch: {err}")))
 }
 
 fn row_group_config_for(
@@ -708,6 +871,2200 @@ fn bench_compression_ratio(config: &BenchConfig) -> std::io::Result<()> {
 			loss_micros,
 		);
 	}
+	Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct SparseProjectionEncodedFixture {
+	row_group_rows: usize,
+	dense_bytes: u64,
+	pages: Vec<EncodingPageDescriptor>,
+	actual_cascade: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SparseProjectionEstimate {
+	sparse_bytes: u64,
+	sparse_ranges: usize,
+	selected_simd_pages: usize,
+	sparse_selected: bool,
+	decline: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BenchObjectStoreSnapshot {
+	get_range_calls: usize,
+	get_range_bytes: u64,
+	get_bytes_calls: usize,
+	get_bytes_bytes: u64,
+}
+
+impl BenchObjectStoreSnapshot {
+	fn delta_since(self, earlier: Self) -> Self {
+		Self {
+			get_range_calls: self.get_range_calls.saturating_sub(earlier.get_range_calls),
+			get_range_bytes: self.get_range_bytes.saturating_sub(earlier.get_range_bytes),
+			get_bytes_calls: self.get_bytes_calls.saturating_sub(earlier.get_bytes_calls),
+			get_bytes_bytes: self.get_bytes_bytes.saturating_sub(earlier.get_bytes_bytes),
+		}
+	}
+}
+
+struct CountingBenchObjectStore {
+	inner: Arc<dyn ObjectStore>,
+	get_range_calls: AtomicUsize,
+	get_range_bytes: AtomicU64,
+	get_bytes_calls: AtomicUsize,
+	get_bytes_bytes: AtomicU64,
+}
+
+impl CountingBenchObjectStore {
+	fn new(inner: Arc<dyn ObjectStore>) -> Self {
+		Self {
+			inner,
+			get_range_calls: AtomicUsize::new(0),
+			get_range_bytes: AtomicU64::new(0),
+			get_bytes_calls: AtomicUsize::new(0),
+			get_bytes_bytes: AtomicU64::new(0),
+		}
+	}
+
+	fn snapshot(&self) -> BenchObjectStoreSnapshot {
+		BenchObjectStoreSnapshot {
+			get_range_calls: self.get_range_calls.load(Ordering::Relaxed),
+			get_range_bytes: self.get_range_bytes.load(Ordering::Relaxed),
+			get_bytes_calls: self.get_bytes_calls.load(Ordering::Relaxed),
+			get_bytes_bytes: self.get_bytes_bytes.load(Ordering::Relaxed),
+		}
+	}
+}
+
+#[async_trait]
+impl ObjectStore for CountingBenchObjectStore {
+	async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+		self.inner.put(key, bytes).await
+	}
+
+	async fn head(&self, uri: &str) -> std::io::Result<ObjectMetadata> {
+		self.inner.head(uri).await
+	}
+
+	async fn get_range(&self, uri: &str, range: Range<u64>) -> std::io::Result<Bytes> {
+		self.get_range_calls.fetch_add(1, Ordering::Relaxed);
+		self.get_range_bytes
+			.fetch_add(range.end.saturating_sub(range.start), Ordering::Relaxed);
+		self.inner.get_range(uri, range).await
+	}
+
+	async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+		let bytes = self.inner.get_bytes(uri).await?;
+		self.get_bytes_calls.fetch_add(1, Ordering::Relaxed);
+		self.get_bytes_bytes
+			.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+		Ok(bytes)
+	}
+
+	async fn list(&self, prefix: &str) -> std::io::Result<Vec<ObjectMetadata>> {
+		self.inner.list(prefix).await
+	}
+
+	async fn delete(&self, uri: &str) -> std::io::Result<()> {
+		self.inner.delete(uri).await
+	}
+}
+
+struct SparseProjectionRuntimeFixture {
+	row_group_rows: usize,
+	record_plaintext_range: Range<usize>,
+	frame: Vec<u8>,
+	directory: RecordBufferDirectory,
+	batch: RecordBatch,
+	requirement: ColumnFetchRequirement,
+	payload_columns: Vec<SparseProjectionRuntimeColumn>,
+}
+
+struct SparseProjectionRuntimeColumn {
+	physical_ordinal: usize,
+	buffer_range: RecordBodyByteRange,
+	encoding: Option<wendelon::storage::BufferEncoding>,
+	cascade: Option<EncodingCascade>,
+	pages: Vec<EncodingPageDescriptor>,
+}
+
+struct SparseProjectionRuntimeDataset {
+	rows: usize,
+	plaintext: Vec<u8>,
+	fixtures: Vec<SparseProjectionRuntimeFixture>,
+}
+
+struct SparseProjectionRuntimeOutcome {
+	elapsed: Duration,
+	output_rows: usize,
+	get_range_calls: usize,
+	get_range_bytes: u64,
+	get_bytes_calls: usize,
+	projection_plaintext_bytes: u64,
+	projection_ciphertext_bytes: u64,
+	selected_ranges: usize,
+	selected_simd_pages: usize,
+}
+
+impl SparseProjectionRuntimeOutcome {
+	fn accumulate(&mut self, other: Self) {
+		self.elapsed = self.elapsed.saturating_add(other.elapsed);
+		self.output_rows = self.output_rows.saturating_add(other.output_rows);
+		self.get_range_calls = self.get_range_calls.saturating_add(other.get_range_calls);
+		self.get_range_bytes = self.get_range_bytes.saturating_add(other.get_range_bytes);
+		self.get_bytes_calls = self.get_bytes_calls.saturating_add(other.get_bytes_calls);
+		self.projection_plaintext_bytes = self
+			.projection_plaintext_bytes
+			.saturating_add(other.projection_plaintext_bytes);
+		self.projection_ciphertext_bytes = self
+			.projection_ciphertext_bytes
+			.saturating_add(other.projection_ciphertext_bytes);
+		self.selected_ranges = self.selected_ranges.saturating_add(other.selected_ranges);
+		self.selected_simd_pages = self
+			.selected_simd_pages
+			.saturating_add(other.selected_simd_pages);
+	}
+}
+
+impl Default for SparseProjectionRuntimeOutcome {
+	fn default() -> Self {
+		Self {
+			elapsed: Duration::ZERO,
+			output_rows: 0,
+			get_range_calls: 0,
+			get_range_bytes: 0,
+			get_bytes_calls: 0,
+			projection_plaintext_bytes: 0,
+			projection_ciphertext_bytes: 0,
+			selected_ranges: 0,
+			selected_simd_pages: 0,
+		}
+	}
+}
+
+const SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES: usize = 4;
+const SPARSE_PROJECTION_RUNTIME_RECORD_ROWS: usize = 65_536;
+
+fn sparse_projection_descriptor(
+	schema: &Schema,
+) -> std::io::Result<wendelon::schema::TableSchemaDescriptorV1> {
+	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+		TableObjectId::new([0x60; 16]),
+		1,
+		"bench",
+		"sparse_projection_fetch",
+		schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
+		LocalityPolicyV1::IdentityProjection,
+		RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("sparse bench multi-row layout rejected: {err}"),
+				)
+			})?,
+		),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!("sparse bench descriptor rejected: {err}"),
+		)
+	})
+}
+
+fn sparse_projection_encoded_fixture(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+) -> std::io::Result<SparseProjectionEncodedFixture> {
+	let batch = sparse_projection_bench_batch(rows, cascade)?;
+	let descriptor = sparse_projection_descriptor(batch.schema().as_ref())?;
+	let row_group_rows = 1_024.min(rows);
+	let row_group_config = RowGroupWriterConfig {
+		enabled: true,
+		target_row_group_rows: RowGroupRowCount::new(1_024),
+		max_row_group_rows: RowGroupRowCount::new(1_024),
+		min_paged_record_rows: RowCount::new(1_024),
+		min_paged_record_bytes: RecordBodyByteLen::new(1),
+		stats_supported_types: BTreeSet::new(),
+	};
+	let encoding_config = EncodingWriterConfig {
+		enabled: true,
+		target_simd_page_values: wendelon::schema::SimdPageValueCount::new(256),
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: cascade.enabled_cascades(),
+		..EncodingWriterConfig::default()
+	};
+	let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+		&batch,
+		&ordered_source_rows(rows),
+		&descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+		&encoding_config,
+	)?;
+	let directory = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(60),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		PlaintextByteRange {
+			start: 0,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&descriptor,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("sparse bench directory parse: {err}"),
+		)
+	})?;
+	let page_directory = directory.page_directory.as_ref().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"sparse bench missing page directory",
+		)
+	})?;
+	let encoding_directory = directory.encoding_directory.as_ref();
+	let requirement = ColumnFetchRequirement {
+		output_columns: ColumnOrdinalSet::from_columns([2]),
+		..ColumnFetchRequirement::default()
+	};
+	let selected_groups = [RowGroupIndex::ZERO];
+	let dense_body_ranges = selected_row_group_record_body_ranges(
+		&directory,
+		page_directory,
+		&requirement,
+		&selected_groups,
+	)
+	.map_err(|err| Error::new(ErrorKind::InvalidData, format!("sparse bench dense: {err}")))?;
+	let dense_bytes = dense_body_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let Some(encoding_directory) = encoding_directory else {
+		return Ok(SparseProjectionEncodedFixture {
+			row_group_rows,
+			dense_bytes,
+			pages: Vec::new(),
+			actual_cascade: "plain",
+		});
+	};
+	let value_buffer_ordinal = directory
+		.column_to_buffers
+		.get(2)
+		.and_then(|mapping| mapping.first_buffer_ordinal.get().checked_add(1))
+		.map(wendelon::schema::IpcBufferIndex::new)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "sparse bench payload buffer"))?;
+	let payload_page = page_directory
+		.buffer_pages
+		.iter()
+		.find(|page| {
+			page.row_group_index == RowGroupIndex::ZERO
+				&& page.ipc_column_ordinal == wendelon::schema::IpcColumnOrdinal::new(2)
+				&& page.ipc_buffer_ordinal == value_buffer_ordinal
+				&& page.range.len.get() > 0
+		})
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "sparse bench payload page"))?;
+	let payload_encoding = wendelon::storage::encoding::materialize::find_buffer_encoding(
+		encoding_directory,
+		RowGroupIndex::ZERO,
+		value_buffer_ordinal,
+		payload_page.range,
+	);
+	let Some(payload_encoding) = payload_encoding else {
+		return Ok(SparseProjectionEncodedFixture {
+			row_group_rows,
+			dense_bytes,
+			pages: Vec::new(),
+			actual_cascade: "plain",
+		});
+	};
+	let pages = wendelon::storage::encoding::page::expand_page_descriptors(payload_encoding)
+		.map_err(|code| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("sparse bench page expansion rejected: {code:?}"),
+			)
+		})?;
+	let actual_cascade = encoding_directory
+		.cascades
+		.get(payload_encoding.cascade_index.get() as usize)
+		.map(|cascade| cascade.kind().as_str())
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "sparse bench payload cascade"))?;
+	Ok(SparseProjectionEncodedFixture {
+		row_group_rows,
+		dense_bytes,
+		pages,
+		actual_cascade,
+	})
+}
+
+fn sparse_projection_runtime_batch(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	projection_columns: usize,
+) -> std::io::Result<RecordBatch> {
+	let mut fields = vec![
+		Field::new("c0", DataType::UInt16, false),
+		Field::new("c1", DataType::UInt16, false),
+	];
+	fields.extend(
+		(0..projection_columns)
+			.map(|index| Field::new(format!("c{}", index + 2), DataType::UInt32, false)),
+	);
+	let schema = Schema::new(fields);
+	let mut columns = vec![
+		Arc::new(UInt16Array::from_iter_values(
+			(0..rows).map(|row| (row % 251) as u16),
+		)) as ArrayRef,
+		Arc::new(UInt16Array::from_iter_values(
+			(0..rows).map(|row| (row % 251) as u16),
+		)) as ArrayRef,
+	];
+	for projection_index in 0..projection_columns {
+		let payload = (0..rows)
+			.map(|row| sparse_projection_runtime_payload_value(row, projection_index, cascade))
+			.collect::<Vec<_>>();
+		columns.push(Arc::new(UInt32Array::from_iter_values(payload)) as ArrayRef);
+	}
+	RecordBatch::try_new(Arc::new(schema), columns).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("sparse runtime batch: {err}"),
+		)
+	})
+}
+
+fn sparse_projection_runtime_payload_value(
+	row: usize,
+	projection_index: usize,
+	cascade: SparseProjectionCascadeFixture,
+) -> u32 {
+	match cascade {
+		SparseProjectionCascadeFixture::BitPacked => {
+			((row + projection_index.saturating_mul(17)) % 1024) as u32
+		}
+		SparseProjectionCascadeFixture::BitPackedPlusPlain if projection_index == 0 => {
+			(row % 1024) as u32
+		}
+		SparseProjectionCascadeFixture::Dictionary => ((row + projection_index) % 4) as u32,
+		SparseProjectionCascadeFixture::Rle => projection_index as u32,
+		SparseProjectionCascadeFixture::BitPackedPlusPlain => (row as u64)
+			.wrapping_mul(37)
+			.wrapping_add((projection_index as u64).wrapping_mul(101))
+			.rotate_left(11) as u32,
+		SparseProjectionCascadeFixture::Plain => (row as u64)
+			.wrapping_mul(37)
+			.wrapping_add((projection_index as u64).wrapping_mul(101))
+			.rotate_left(11) as u32,
+		SparseProjectionCascadeFixture::Delta => row.wrapping_add(projection_index) as u32,
+	}
+}
+
+fn sparse_projection_runtime_fixture_at(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	projection_columns: usize,
+	record_plaintext_start: usize,
+) -> std::io::Result<SparseProjectionRuntimeFixture> {
+	let batch = sparse_projection_runtime_batch(rows, cascade, projection_columns)?;
+	let descriptor = sparse_projection_descriptor(batch.schema().as_ref())?;
+	let row_group_rows = 1_024.min(rows);
+	let row_group_config = RowGroupWriterConfig {
+		enabled: true,
+		target_row_group_rows: RowGroupRowCount::new(1_024),
+		max_row_group_rows: RowGroupRowCount::new(1_024),
+		min_paged_record_rows: RowCount::new(1_024),
+		min_paged_record_bytes: RecordBodyByteLen::new(1),
+		stats_supported_types: BTreeSet::new(),
+	};
+	let encoding_config = EncodingWriterConfig {
+		enabled: true,
+		target_simd_page_values: wendelon::schema::SimdPageValueCount::new(256),
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: cascade.enabled_cascades(),
+		..EncodingWriterConfig::default()
+	};
+	let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+		&batch,
+		&ordered_source_rows(rows),
+		&descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+		&encoding_config,
+	)?;
+	let record_plaintext_start_u64 = u64::try_from(record_plaintext_start).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"sparse runtime record plaintext start exceeds u64",
+		)
+	})?;
+	let directory = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(61),
+			record_offset: RecordBodyByteOffset::new(record_plaintext_start_u64),
+		},
+		PlaintextByteRange {
+			start: record_plaintext_start_u64,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&descriptor,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("sparse runtime directory parse: {err}"),
+		)
+	})?;
+	let page_directory = directory.page_directory.as_ref().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"sparse runtime missing page directory",
+		)
+	})?;
+	let encoding_directory = directory.encoding_directory.as_ref().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"sparse runtime missing encoding directory",
+		)
+	})?;
+	let output_columns = (2..2 + projection_columns)
+		.map(|column| {
+			u32::try_from(column).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"sparse runtime projection column exceeds u32",
+				)
+			})
+		})
+		.collect::<std::io::Result<Vec<_>>>()?;
+	let requirement = ColumnFetchRequirement {
+		output_columns: ColumnOrdinalSet::from_columns(output_columns.iter().copied()),
+		..ColumnFetchRequirement::default()
+	};
+	let mut payload_columns = Vec::with_capacity(projection_columns);
+	for physical_ordinal in 2..2 + projection_columns {
+		let value_buffer_ordinal = directory
+			.column_to_buffers
+			.get(physical_ordinal)
+			.and_then(|mapping| mapping.first_buffer_ordinal.get().checked_add(1))
+			.map(wendelon::schema::IpcBufferIndex::new)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "sparse runtime payload buffer"))?;
+		let ipc_column_ordinal = wendelon::schema::IpcColumnOrdinal::new(
+			u32::try_from(physical_ordinal).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"sparse runtime physical ordinal exceeds u32",
+				)
+			})?,
+		);
+		let payload_page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == RowGroupIndex::ZERO
+					&& page.ipc_column_ordinal == ipc_column_ordinal
+					&& page.ipc_buffer_ordinal == value_buffer_ordinal
+					&& page.range.len.get() > 0
+			})
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "sparse runtime payload page"))?;
+		let payload_encoding = wendelon::storage::encoding::materialize::find_buffer_encoding(
+			encoding_directory,
+			RowGroupIndex::ZERO,
+			value_buffer_ordinal,
+			payload_page.range,
+		);
+		let (encoding, cascade, pages) = if let Some(payload_encoding) = payload_encoding {
+			let payload_cascade = encoding_directory
+				.cascades
+				.get(payload_encoding.cascade_index.get() as usize)
+				.cloned()
+				.ok_or_else(|| {
+					Error::new(ErrorKind::InvalidData, "sparse runtime payload cascade")
+				})?;
+			let pages =
+				wendelon::storage::encoding::page::expand_page_descriptors(payload_encoding)
+					.map_err(|code| {
+						Error::new(
+							ErrorKind::InvalidData,
+							format!("sparse runtime page expansion rejected: {code:?}"),
+						)
+					})?;
+			(Some(payload_encoding.clone()), Some(payload_cascade), pages)
+		} else {
+			(None, None, Vec::new())
+		};
+		payload_columns.push(SparseProjectionRuntimeColumn {
+			physical_ordinal,
+			buffer_range: payload_page.range,
+			encoding,
+			cascade,
+			pages,
+		});
+	}
+	Ok(SparseProjectionRuntimeFixture {
+		row_group_rows,
+		record_plaintext_range: record_plaintext_start
+			..record_plaintext_start.saturating_add(encoded.frame.len()),
+		frame: encoded.frame,
+		directory,
+		batch,
+		requirement,
+		payload_columns,
+	})
+}
+
+fn sparse_projection_runtime_dataset(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	projection_columns: usize,
+) -> std::io::Result<SparseProjectionRuntimeDataset> {
+	let mut remaining = rows;
+	let mut plaintext = Vec::new();
+	let mut fixtures = Vec::new();
+	while remaining > 0 {
+		let record_rows = remaining.min(SPARSE_PROJECTION_RUNTIME_RECORD_ROWS);
+		let fixture = sparse_projection_runtime_fixture_at(
+			record_rows,
+			cascade,
+			projection_columns,
+			plaintext.len(),
+		)?;
+		plaintext.extend_from_slice(&fixture.frame);
+		fixtures.push(fixture);
+		remaining -= record_rows;
+	}
+	Ok(SparseProjectionRuntimeDataset {
+		rows,
+		plaintext,
+		fixtures,
+	})
+}
+
+fn sparse_projection_mask(shape: SparseProjectionMaskShape, rows: usize) -> BooleanArray {
+	BooleanArray::from_iter((0..rows).map(|row| match shape {
+		SparseProjectionMaskShape::SingleFirstRow => row == 0,
+		SparseProjectionMaskShape::ClusteredFirstPage => row < 256.min(rows),
+		SparseProjectionMaskShape::ClusteredMiddleOnePercent => {
+			let selected = rows.div_ceil(100);
+			let start = rows.saturating_sub(selected) / 2;
+			row >= start && row < start.saturating_add(selected)
+		}
+		SparseProjectionMaskShape::ClusteredFivePercent => {
+			row < rows.saturating_mul(5).div_ceil(100)
+		}
+		SparseProjectionMaskShape::ClusteredTwentyFivePercent => {
+			row < rows.saturating_mul(25).div_ceil(100)
+		}
+		SparseProjectionMaskShape::RandomOnePercent => row % 100 == 0,
+		SparseProjectionMaskShape::All => true,
+		SparseProjectionMaskShape::None => false,
+	}))
+}
+
+fn encoded_page_body_range(
+	buffer_range: RecordBodyByteRange,
+	encoding: &wendelon::storage::BufferEncoding,
+	page: EncodingPageDescriptor,
+) -> RecordBodyByteRange {
+	RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(
+			buffer_range
+				.start
+				.get()
+				.saturating_add(u64::from(encoding.encoded_range.start.get()))
+				.saturating_add(u64::from(page.byte_range.start.get())),
+		),
+		len: page.byte_range.len,
+	}
+}
+
+fn coalesce_body_ranges(ranges: &mut Vec<RecordBodyByteRange>) -> std::io::Result<()> {
+	ranges.sort_by_key(|range| range.start.get());
+	let mut coalesced = Vec::<RecordBodyByteRange>::with_capacity(ranges.len());
+	for range in ranges.drain(..) {
+		if range.len.get() == 0 {
+			continue;
+		}
+		let Some(last) = coalesced.last_mut() else {
+			coalesced.push(range);
+			continue;
+		};
+		let last_end = last.end()?;
+		let range_end = range.end()?;
+		if range.start.get() <= last_end {
+			last.len = RecordBodyByteLen::new(range_end.max(last_end) - last.start.get());
+		} else {
+			coalesced.push(range);
+		}
+	}
+	*ranges = coalesced;
+	Ok(())
+}
+
+fn extract_from_plaintext_ranges<B: AsRef<[u8]>>(
+	range: RecordBodyByteRange,
+	selected_ranges: &[TieredPlaintextRange],
+	plaintext_extracts: &[B],
+) -> std::io::Result<Vec<u8>> {
+	for (candidate, extract) in selected_ranges.iter().zip(plaintext_extracts.iter()) {
+		let start = range.start.get();
+		let end = range.end()?;
+		let candidate_start = candidate.start.get();
+		let candidate_end = candidate_start.saturating_add(candidate.len.get());
+		if start >= candidate_start && end <= candidate_end {
+			let relative_start = usize::try_from(start - candidate_start).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"sparse runtime relative start exceeds usize",
+				)
+			})?;
+			let relative_end = usize::try_from(end - candidate_start).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"sparse runtime relative end exceeds usize",
+				)
+			})?;
+			let extract = extract.as_ref();
+			if relative_end > extract.len() {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"sparse runtime page exceeds plaintext extract",
+				));
+			}
+			return Ok(extract[relative_start..relative_end].to_vec());
+		}
+	}
+	Err(Error::new(
+		ErrorKind::InvalidData,
+		"sparse runtime page range was not fetched",
+	))
+}
+
+fn sparse_projection_page_selected(
+	shape: SparseProjectionMaskShape,
+	page: &EncodingPageDescriptor,
+	rows: usize,
+) -> bool {
+	let page_start = page.first_value_index.get() as usize;
+	let page_end = page_start.saturating_add(page.value_count.get() as usize);
+	match shape {
+		SparseProjectionMaskShape::SingleFirstRow => page_start == 0,
+		SparseProjectionMaskShape::ClusteredFirstPage => page_start < 256,
+		SparseProjectionMaskShape::ClusteredMiddleOnePercent => {
+			let selected = rows.div_ceil(100);
+			let start = rows.saturating_sub(selected) / 2;
+			let end = start.saturating_add(selected);
+			page_start < end && page_end > start
+		}
+		SparseProjectionMaskShape::ClusteredFivePercent => {
+			page_start < rows.saturating_mul(5).div_ceil(100)
+		}
+		SparseProjectionMaskShape::ClusteredTwentyFivePercent => {
+			page_start < rows.saturating_mul(25).div_ceil(100)
+		}
+		SparseProjectionMaskShape::RandomOnePercent => {
+			let mut row = page_start.div_ceil(100) * 100;
+			while row < page_end.min(rows) {
+				if row % 100 == 0 {
+					return true;
+				}
+				row = row.saturating_add(100);
+			}
+			false
+		}
+		SparseProjectionMaskShape::All => true,
+		SparseProjectionMaskShape::None => false,
+	}
+}
+
+fn coalesced_sparse_range_count(pages: &[&EncodingPageDescriptor]) -> usize {
+	let mut ranges = pages
+		.iter()
+		.map(|page| {
+			let start = u64::from(page.byte_range.start.get());
+			let end = start.saturating_add(page.byte_range.len.get());
+			(start, end)
+		})
+		.collect::<Vec<_>>();
+	ranges.sort_unstable_by_key(|(start, _)| *start);
+	let mut count = 0_usize;
+	let mut current_end = 0_u64;
+	for (start, end) in ranges {
+		if count == 0 || start > current_end {
+			count = count.saturating_add(1);
+			current_end = end;
+		} else {
+			current_end = current_end.max(end);
+		}
+	}
+	count
+}
+
+fn estimate_sparse_projection(
+	fixture: &SparseProjectionEncodedFixture,
+	_rows: usize,
+	shape: SparseProjectionMaskShape,
+	projection_columns: usize,
+	per_buffer_range_cap: usize,
+) -> SparseProjectionEstimate {
+	let rows = fixture.row_group_rows;
+	let scale = projection_columns as u64;
+	if matches!(shape, SparseProjectionMaskShape::None) {
+		return SparseProjectionEstimate {
+			sparse_bytes: 0,
+			sparse_ranges: 0,
+			selected_simd_pages: 0,
+			sparse_selected: true,
+			decline: "none_mask_short_circuit",
+		};
+	}
+	if matches!(shape, SparseProjectionMaskShape::All) {
+		return SparseProjectionEstimate {
+			sparse_bytes: fixture.dense_bytes.saturating_mul(scale),
+			sparse_ranges: projection_columns,
+			selected_simd_pages: fixture.pages.len().saturating_mul(projection_columns),
+			sparse_selected: false,
+			decline: "all_rows_mask",
+		};
+	}
+	if !matches!(fixture.actual_cascade, "bit_packed" | "dictionary") {
+		return SparseProjectionEstimate {
+			sparse_bytes: fixture.dense_bytes.saturating_mul(scale),
+			sparse_ranges: projection_columns,
+			selected_simd_pages: fixture.pages.len().saturating_mul(projection_columns),
+			sparse_selected: false,
+			decline: "cascade_not_projection_eligible",
+		};
+	}
+	let selected_pages = fixture
+		.pages
+		.iter()
+		.filter(|page| sparse_projection_page_selected(shape, page, rows))
+		.collect::<Vec<_>>();
+	let sparse_bytes = selected_pages
+		.iter()
+		.map(|page| page.byte_range.len.get())
+		.sum::<u64>();
+	let sparse_ranges =
+		coalesced_sparse_range_count(&selected_pages).saturating_mul(projection_columns);
+	let selected_simd_pages = selected_pages.len().saturating_mul(projection_columns);
+	let sparse_bytes = sparse_bytes.saturating_mul(scale);
+	let dense_bytes = fixture.dense_bytes.saturating_mul(scale);
+	let (sparse_selected, decline) = if selected_pages.len() > per_buffer_range_cap {
+		(false, "per_buffer_fragmentation_cap_exceeded")
+	} else if selected_simd_pages > 64 {
+		(false, "simd_page_cap_exceeded")
+	} else if sparse_ranges > 16 {
+		(false, "range_cap_exceeded")
+	} else if sparse_bytes >= dense_bytes {
+		(false, "byte_estimate_not_sparse")
+	} else {
+		(true, "none")
+	};
+	SparseProjectionEstimate {
+		sparse_bytes,
+		sparse_ranges,
+		selected_simd_pages,
+		sparse_selected,
+		decline,
+	}
+}
+
+fn runtime_plaintext_ranges(ranges: &[RecordBodyByteRange]) -> Vec<TieredPlaintextRange> {
+	ranges
+		.iter()
+		.map(|range| TieredPlaintextRange::new(range.start, range.len))
+		.collect()
+}
+
+fn runtime_tail_range(object_size: u64) -> Range<u64> {
+	object_size.saturating_sub(64 * 1024)..object_size
+}
+
+fn runtime_fetch_and_decrypt(
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+	record_plaintext_range: Range<usize>,
+	body_ranges: &[RecordBodyByteRange],
+) -> std::io::Result<(Vec<TieredPlaintextRange>, Vec<Vec<u8>>, u64)> {
+	let plaintext_ranges = runtime_plaintext_ranges(body_ranges);
+	let tail_range = runtime_tail_range(object_size);
+	let tail_window = runtime.block_on(store.get_range(uri, tail_range))?;
+	let additional_metadata_range =
+		crypto.additional_tiered_metadata_range(slab_id, object_size, tail_window.as_ref())?;
+	let additional_metadata = match additional_metadata_range {
+		Some(range) => Some(runtime.block_on(store.get_range(uri, range))?),
+		None => None,
+	};
+	let tiered_plan = crypto.plan_tiered_multi_range_read(
+		slab_id,
+		object_size,
+		tail_window.as_ref(),
+		additional_metadata.as_deref(),
+		record_plaintext_range,
+		&plaintext_ranges,
+	)?;
+	let projection_ciphertext_bytes = tiered_plan
+		.ciphertext_ranges_in_object()
+		.into_iter()
+		.map(|range| range.end.saturating_sub(range.start))
+		.sum::<u64>();
+	let ciphertext_runs = runtime.block_on(async {
+		let mut out = Vec::new();
+		for range in tiered_plan.ciphertext_ranges_in_object() {
+			out.push(store.get_range(uri, range).await?);
+		}
+		Ok::<_, std::io::Error>(out)
+	})?;
+	let plaintext_extracts = tiered_plan.decrypt(&ciphertext_runs)?;
+	Ok((
+		plaintext_ranges,
+		plaintext_extracts,
+		projection_ciphertext_bytes,
+	))
+}
+
+fn dense_projection_runtime(
+	fixture: &SparseProjectionRuntimeFixture,
+	mask: &BooleanArray,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<SparseProjectionRuntimeOutcome> {
+	let page_directory = fixture.directory.page_directory.as_ref().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"sparse runtime missing page directory",
+		)
+	})?;
+	let selected_groups = [RowGroupIndex::ZERO];
+	let dense_ranges = selected_row_group_record_body_ranges(
+		&fixture.directory,
+		page_directory,
+		&fixture.requirement,
+		&selected_groups,
+	)
+	.map_err(|err| Error::new(ErrorKind::InvalidData, format!("dense ranges: {err}")))?;
+	let projection_plaintext_bytes = dense_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let before = store.snapshot();
+	let started = Instant::now();
+	let (plaintext_ranges, plaintext_extracts, projection_ciphertext_bytes) =
+		runtime_fetch_and_decrypt(
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+			fixture.record_plaintext_range.clone(),
+			&dense_ranges,
+		)?;
+	let dense = decode_projected_row_groups_from_plaintext_ranges(
+		&fixture.directory,
+		page_directory,
+		&fixture.requirement,
+		&plaintext_ranges,
+		&plaintext_extracts,
+		&selected_groups,
+	)
+	.map_err(|err| Error::new(ErrorKind::InvalidData, format!("dense decode: {err}")))?;
+	let mut outcome = PhaseBOutcome::default();
+	outcome.decoded_predicate_batches.insert(
+		RowGroupIndex::ZERO,
+		fixture.batch.slice(0, fixture.row_group_rows),
+	);
+	outcome
+		.survival_masks
+		.insert(RowGroupIndex::ZERO, mask.clone());
+	let filtered = apply_phase_b_masks_to_projected_row_groups(
+		vec![(RowGroupIndex::ZERO, dense)],
+		&outcome,
+		&selected_groups,
+		page_directory,
+	)?;
+	let elapsed = started.elapsed();
+	let delta = store.snapshot().delta_since(before);
+	Ok(SparseProjectionRuntimeOutcome {
+		elapsed,
+		output_rows: filtered.batch.num_rows(),
+		get_range_calls: delta.get_range_calls,
+		get_range_bytes: delta.get_range_bytes,
+		get_bytes_calls: delta.get_bytes_calls,
+		projection_plaintext_bytes,
+		projection_ciphertext_bytes,
+		selected_ranges: dense_ranges.len(),
+		selected_simd_pages: fixture
+			.payload_columns
+			.iter()
+			.map(|column| column.pages.len())
+			.sum(),
+	})
+}
+
+fn sparse_projection_runtime(
+	fixture: &SparseProjectionRuntimeFixture,
+	mask: &BooleanArray,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(SparseProjectionRuntimeOutcome, Vec<u8>)> {
+	if fixture
+		.payload_columns
+		.iter()
+		.any(|column| column.encoding.is_none() || column.cascade.is_none())
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"sparse runtime requested for dense-only projected column",
+		));
+	}
+	let selected_pages_by_column = fixture
+		.payload_columns
+		.iter()
+		.map(|column| {
+			column
+				.pages
+				.iter()
+				.copied()
+				.filter(|page| sparse_projection_page_selected(shape, page, mask.len()))
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+	let selected_simd_pages = selected_pages_by_column.iter().map(Vec::len).sum();
+	let mut sparse_ranges = fixture
+		.payload_columns
+		.iter()
+		.zip(selected_pages_by_column.iter())
+		.flat_map(|(column, selected_pages)| {
+			let encoding = column
+				.encoding
+				.as_ref()
+				.expect("sparse runtime prechecked projected column encoding");
+			selected_pages
+				.iter()
+				.map(move |page| encoded_page_body_range(column.buffer_range, encoding, *page))
+		})
+		.collect::<Vec<_>>();
+	coalesce_body_ranges(&mut sparse_ranges)?;
+	let projection_plaintext_bytes = sparse_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let before = store.snapshot();
+	let started = Instant::now();
+	let (plaintext_ranges, plaintext_extracts, projection_ciphertext_bytes) =
+		runtime_fetch_and_decrypt(
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+			fixture.record_plaintext_range.clone(),
+			&sparse_ranges,
+		)?;
+	let mut values = Vec::new();
+	for (column, selected_pages) in fixture
+		.payload_columns
+		.iter()
+		.zip(selected_pages_by_column.iter())
+	{
+		let encoding = column
+			.encoding
+			.as_ref()
+			.expect("sparse runtime prechecked projected column encoding");
+		let cascade = column
+			.cascade
+			.as_ref()
+			.expect("sparse runtime prechecked projected column cascade");
+		for page in selected_pages {
+			let body_range = encoded_page_body_range(column.buffer_range, encoding, *page);
+			let encoded =
+				extract_from_plaintext_ranges(body_range, &plaintext_ranges, &plaintext_extracts)?;
+			let expected_bytes = u64::from(page.value_count.get());
+			let decoded = wendelon::storage::encoding::cascade::decode_page(
+				&encoded,
+				&DataType::UInt32,
+				cascade,
+				RecordBodyByteLen::new(
+					expected_bytes.saturating_mul(SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES as u64),
+				),
+				BufferValueCount::new(page.value_count.get()),
+			)
+			.map_err(|code| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("sparse runtime page decode rejected: {code:?}"),
+				)
+			})?;
+			let start = page.first_value_index.get() as usize;
+			for (offset, value) in decoded
+				.chunks_exact(SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES)
+				.enumerate()
+			{
+				let row = start + offset;
+				if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+					values.extend_from_slice(value);
+				}
+			}
+		}
+	}
+	let elapsed = started.elapsed();
+	let delta = store.snapshot().delta_since(before);
+	Ok((
+		SparseProjectionRuntimeOutcome {
+			elapsed,
+			output_rows: values.len()
+				/ SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES
+				/ fixture.payload_columns.len().max(1),
+			get_range_calls: delta.get_range_calls,
+			get_range_bytes: delta.get_range_bytes,
+			get_bytes_calls: delta.get_bytes_calls,
+			projection_plaintext_bytes,
+			projection_ciphertext_bytes,
+			selected_ranges: sparse_ranges.len(),
+			selected_simd_pages,
+		},
+		values,
+	))
+}
+
+fn dense_projection_values(
+	fixture: &SparseProjectionRuntimeFixture,
+	mask: &BooleanArray,
+) -> std::io::Result<Vec<u8>> {
+	let mut out = Vec::new();
+	let group_rows = fixture.row_group_rows;
+	for column in &fixture.payload_columns {
+		let payload = fixture
+			.batch
+			.column(column.physical_ordinal)
+			.as_any()
+			.downcast_ref::<UInt32Array>()
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "expected UInt32 payload"))?;
+		for row in 0..group_rows {
+			if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+				out.extend_from_slice(&payload.value(row).to_le_bytes());
+			}
+		}
+	}
+	Ok(out)
+}
+
+fn dense_projection_dataset_values(
+	dataset: &SparseProjectionRuntimeDataset,
+	shape: SparseProjectionMaskShape,
+) -> std::io::Result<Vec<u8>> {
+	let mut out = Vec::new();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		out.extend(dense_projection_values(fixture, &mask)?);
+	}
+	Ok(out)
+}
+
+fn dense_projection_dataset_runtime(
+	dataset: &SparseProjectionRuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<SparseProjectionRuntimeOutcome> {
+	let mut total = SparseProjectionRuntimeOutcome::default();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		total.accumulate(dense_projection_runtime(
+			fixture,
+			&mask,
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+		)?);
+	}
+	Ok(total)
+}
+
+fn sparse_projection_dataset_runtime(
+	dataset: &SparseProjectionRuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(SparseProjectionRuntimeOutcome, Vec<u8>)> {
+	let mut total = SparseProjectionRuntimeOutcome::default();
+	let mut values = Vec::new();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let (outcome, record_values) = sparse_projection_runtime(
+			fixture,
+			&mask,
+			shape,
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+		)?;
+		total.accumulate(outcome);
+		values.extend(record_values);
+	}
+	Ok((total, values))
+}
+
+fn sparse_projection_matrix_rows(config: &BenchConfig) -> &'static [usize] {
+	if config.iterations <= 25 {
+		&[8_192]
+	} else {
+		&[8_192, 65_536]
+	}
+}
+
+fn sparse_projection_projection_counts(config: &BenchConfig) -> &'static [usize] {
+	if config.iterations <= 25 {
+		&[1]
+	} else {
+		&[1, 4, 16, 64]
+	}
+}
+
+fn sparse_projection_runtime_rows(config: &BenchConfig) -> &'static [usize] {
+	if config.iterations <= 25 {
+		&[8_192]
+	} else {
+		&[8_192, 65_536, 1_000_000]
+	}
+}
+
+fn sparse_projection_runtime_shapes(config: &BenchConfig) -> &'static [SparseProjectionMaskShape] {
+	if config.iterations <= 25 {
+		&[
+			SparseProjectionMaskShape::ClusteredFirstPage,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+			SparseProjectionMaskShape::All,
+			SparseProjectionMaskShape::None,
+		]
+	} else {
+		&[
+			SparseProjectionMaskShape::ClusteredFirstPage,
+			SparseProjectionMaskShape::ClusteredMiddleOnePercent,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+			SparseProjectionMaskShape::ClusteredTwentyFivePercent,
+			SparseProjectionMaskShape::RandomOnePercent,
+			SparseProjectionMaskShape::All,
+			SparseProjectionMaskShape::None,
+		]
+	}
+}
+
+fn sparse_projection_runtime_cascades(
+	config: &BenchConfig,
+) -> &'static [SparseProjectionCascadeFixture] {
+	if config.iterations <= 25 {
+		&[
+			SparseProjectionCascadeFixture::BitPacked,
+			SparseProjectionCascadeFixture::Dictionary,
+		]
+	} else {
+		&[
+			SparseProjectionCascadeFixture::BitPacked,
+			SparseProjectionCascadeFixture::Dictionary,
+			SparseProjectionCascadeFixture::Rle,
+		]
+	}
+}
+
+fn sparse_projection_runtime_iterations(config: &BenchConfig, rows: usize) -> usize {
+	if rows >= 1_000_000 {
+		config.iterations.min(3).max(1)
+	} else {
+		config.iterations.min(10).max(1)
+	}
+}
+
+fn sparse_projection_runtime_sparse_enabled(cascade: SparseProjectionCascadeFixture) -> bool {
+	matches!(
+		cascade,
+		SparseProjectionCascadeFixture::BitPacked | SparseProjectionCascadeFixture::Dictionary
+	)
+}
+
+fn sparse_projection_runtime_actual_cascade(
+	dataset: &SparseProjectionRuntimeDataset,
+) -> &'static str {
+	fn column_cascade(column: &SparseProjectionRuntimeColumn) -> &'static str {
+		column
+			.cascade
+			.as_ref()
+			.map(|cascade| cascade.kind().as_str())
+			.unwrap_or("plain")
+	}
+
+	let Some(first_column) = dataset
+		.fixtures
+		.first()
+		.and_then(|fixture| fixture.payload_columns.first())
+	else {
+		return "none";
+	};
+	let first = column_cascade(first_column);
+	if dataset.fixtures.iter().all(|fixture| {
+		fixture
+			.payload_columns
+			.iter()
+			.all(|column| column_cascade(column) == first)
+	}) {
+		first
+	} else {
+		"mixed"
+	}
+}
+
+fn sparse_projection_runtime_projection_columns(dataset: &SparseProjectionRuntimeDataset) -> usize {
+	dataset
+		.fixtures
+		.first()
+		.map(|fixture| fixture.payload_columns.len())
+		.unwrap_or(1)
+		.max(1)
+}
+
+fn sparse_projection_runtime_selected_pages_per_column(
+	dataset: &SparseProjectionRuntimeDataset,
+	shape: SparseProjectionMaskShape,
+) -> usize {
+	dataset
+		.fixtures
+		.first()
+		.and_then(|fixture| {
+			fixture
+				.payload_columns
+				.iter()
+				.find(|column| !column.pages.is_empty())
+				.map(|column| (fixture, column))
+		})
+		.map(|(fixture, column)| {
+			column
+				.pages
+				.iter()
+				.filter(|page| sparse_projection_page_selected(shape, page, fixture.row_group_rows))
+				.count()
+		})
+		.unwrap_or(0)
+}
+
+fn sparse_projection_runtime_route(
+	dataset: &SparseProjectionRuntimeDataset,
+	cascade_sparse_enabled: bool,
+	shape: SparseProjectionMaskShape,
+	per_buffer_range_cap: usize,
+) -> &'static str {
+	if matches!(shape, SparseProjectionMaskShape::All) {
+		return "dense_decline_all";
+	}
+	if matches!(shape, SparseProjectionMaskShape::None) {
+		return "sparse_none_short_circuit";
+	}
+	if !cascade_sparse_enabled {
+		return "dense_decline_cascade";
+	}
+	let projection_columns = sparse_projection_runtime_projection_columns(dataset);
+	let selected_pages = sparse_projection_runtime_selected_pages_per_column(dataset, shape);
+	if selected_pages > per_buffer_range_cap {
+		return "dense_decline_fragmentation_cap";
+	}
+	let sparse_ranges = selected_pages.saturating_mul(projection_columns);
+	if sparse_ranges > 16 {
+		return "dense_decline_range_cap";
+	}
+	let selected_simd_pages = selected_pages.saturating_mul(projection_columns);
+	if selected_simd_pages > 64 {
+		return "dense_decline_simd_page_cap";
+	}
+	"sparse"
+}
+
+struct SparseProjectionRuntimeMeasurement {
+	dense: SparseProjectionRuntimeOutcome,
+	sparse: SparseProjectionRuntimeOutcome,
+	route: &'static str,
+	expected_rows: usize,
+}
+
+struct SparseProjectionRuntimeEnv<'a> {
+	runtime: &'a tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &'a str,
+	crypto: &'a wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+}
+
+fn measure_sparse_projection_runtime_case(
+	dataset: &SparseProjectionRuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	iterations: usize,
+	env: &SparseProjectionRuntimeEnv<'_>,
+	cascade_sparse_enabled: bool,
+	per_buffer_range_cap: usize,
+) -> std::io::Result<SparseProjectionRuntimeMeasurement> {
+	let expected = dense_projection_dataset_values(dataset, shape)?;
+	let expected_rows = expected.len()
+		/ SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES
+		/ sparse_projection_runtime_projection_columns(dataset);
+	let mut last_dense = None;
+	let dense_elapsed = bench(iterations, || {
+		let outcome = dense_projection_dataset_runtime(
+			black_box(dataset),
+			black_box(shape),
+			env.runtime,
+			env.store.clone(),
+			env.uri,
+			env.crypto,
+			env.slab_id,
+			env.object_size,
+		)
+		.expect("dense projection runtime");
+		last_dense = Some(outcome);
+	});
+	let mut dense = last_dense.expect("dense runtime outcome");
+	dense.elapsed = dense_elapsed;
+	let route = sparse_projection_runtime_route(
+		dataset,
+		cascade_sparse_enabled,
+		shape,
+		per_buffer_range_cap,
+	);
+	let (sparse, sparse_values) = match route {
+		"sparse" => {
+			let mut last_sparse = None;
+			let sparse_elapsed = bench(iterations, || {
+				let (outcome, values) = sparse_projection_dataset_runtime(
+					black_box(dataset),
+					black_box(shape),
+					env.runtime,
+					env.store.clone(),
+					env.uri,
+					env.crypto,
+					env.slab_id,
+					env.object_size,
+				)
+				.expect("sparse projection runtime");
+				last_sparse = Some((outcome, values));
+			});
+			let (mut outcome, values) = last_sparse.expect("sparse runtime outcome");
+			outcome.elapsed = sparse_elapsed;
+			(outcome, values)
+		}
+		"sparse_none_short_circuit" => (
+			SparseProjectionRuntimeOutcome {
+				elapsed: Duration::ZERO,
+				output_rows: 0,
+				get_range_calls: 0,
+				get_range_bytes: 0,
+				get_bytes_calls: 0,
+				projection_plaintext_bytes: 0,
+				projection_ciphertext_bytes: 0,
+				selected_ranges: 0,
+				selected_simd_pages: 0,
+			},
+			Vec::new(),
+		),
+		_ => (
+			SparseProjectionRuntimeOutcome {
+				elapsed: dense.elapsed,
+				output_rows: dense.output_rows,
+				get_range_calls: dense.get_range_calls,
+				get_range_bytes: dense.get_range_bytes,
+				get_bytes_calls: dense.get_bytes_calls,
+				projection_plaintext_bytes: dense.projection_plaintext_bytes,
+				projection_ciphertext_bytes: dense.projection_ciphertext_bytes,
+				selected_ranges: dense.selected_ranges,
+				selected_simd_pages: dense.selected_simd_pages,
+			},
+			expected.clone(),
+		),
+	};
+	if dense.output_rows != expected_rows
+		|| sparse.output_rows != expected_rows
+		|| sparse_values != expected
+	{
+		let mismatch = sparse_values
+			.iter()
+			.zip(expected.iter())
+			.position(|(left, right)| left != right)
+			.unwrap_or_else(|| sparse_values.len().min(expected.len()));
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"sparse runtime output mismatch rows={} shape={} route={} dense_rows={} sparse_rows={} expected_rows={} sparse_bytes={} expected_bytes={} first_mismatch={}",
+				dataset.rows,
+				shape.as_str(),
+				route,
+				dense.output_rows,
+				sparse.output_rows,
+				expected_rows,
+				sparse_values.len(),
+				expected.len(),
+				mismatch
+			),
+		));
+	}
+	Ok(SparseProjectionRuntimeMeasurement {
+		dense,
+		sparse,
+		route,
+		expected_rows,
+	})
+}
+
+fn sparse_projection_speedup_micros(
+	dense: &SparseProjectionRuntimeOutcome,
+	sparse: &SparseProjectionRuntimeOutcome,
+) -> u64 {
+	let dense_micros = dense.elapsed.as_secs_f64() * 1_000_000.0;
+	let sparse_micros = sparse.elapsed.as_secs_f64() * 1_000_000.0;
+	if sparse_micros > 0.0 {
+		(dense_micros / sparse_micros * 1_000_000.0) as u64
+	} else if dense_micros > 0.0 {
+		u64::MAX
+	} else {
+		1_000_000
+	}
+}
+
+fn print_sparse_projection_runtime_measure(
+	scenario: &str,
+	dataset: &SparseProjectionRuntimeDataset,
+	actual_cascade: &str,
+	projected_cascade: &str,
+	shape: SparseProjectionMaskShape,
+	iterations: usize,
+	measurement: &SparseProjectionRuntimeMeasurement,
+	extra: &str,
+) {
+	println!(
+		"row_group_fetch_measure scenario={} rows={} records={} columns={} shape=uint32_payload_clustered projected_cascade={} actual_cascade={} mask_shape={} route={} output_rows={} equality=true iterations={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_plaintext_bytes={} sparse_projection_plaintext_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} sparse_selected_simd_pages={} get_bytes_calls={}{}",
+		scenario,
+		dataset.rows,
+		dataset.fixtures.len(),
+		sparse_projection_runtime_projection_columns(dataset).saturating_add(2),
+		projected_cascade,
+		actual_cascade,
+		shape.as_str(),
+		measurement.route,
+		measurement.expected_rows,
+		iterations,
+		measurement.dense.elapsed.as_secs_f64() * 1_000.0,
+		measurement.sparse.elapsed.as_secs_f64() * 1_000.0,
+		sparse_projection_speedup_micros(&measurement.dense, &measurement.sparse),
+		measurement.dense.get_range_calls,
+		measurement.sparse.get_range_calls,
+		measurement.dense.get_range_bytes,
+		measurement.sparse.get_range_bytes,
+		measurement.dense.projection_plaintext_bytes,
+		measurement.sparse.projection_plaintext_bytes,
+		measurement.dense.projection_ciphertext_bytes,
+		measurement.sparse.projection_ciphertext_bytes,
+		measurement.dense.selected_ranges,
+		measurement.sparse.selected_ranges,
+		measurement.sparse.selected_simd_pages,
+		measurement
+			.dense
+			.get_bytes_calls
+			.saturating_add(measurement.sparse.get_bytes_calls),
+		extra,
+	);
+}
+
+fn sparse_runtime_encrypted_dataset(
+	dataset: &SparseProjectionRuntimeDataset,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+) -> std::io::Result<wendelon::crypto::EncryptedTieredSlab> {
+	let mut offset_index = Vec::with_capacity(dataset.fixtures.len());
+	for (index, fixture) in dataset.fixtures.iter().enumerate() {
+		let mut key = [0x60; 32];
+		key[31] = u8::try_from(index % 256).unwrap_or(0);
+		offset_index.push(TieredOffsetIndexEntry {
+			key_locator: IdentityPrefix::from(Identity::new(key)),
+			byte_offset: u64::try_from(fixture.record_plaintext_range.start).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"sparse runtime record offset exceeds u64",
+				)
+			})?,
+			byte_length: u32::try_from(fixture.frame.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"sparse runtime frame exceeds tiered offset index u32 length",
+				)
+			})?,
+			flags: 0,
+		});
+	}
+	let metadata = TieredSlabObjectMetadata {
+		tenant_id: TenantId::ZERO,
+		created_hlc: 0,
+		offset_index,
+		column_stats_block: None,
+		has_row_tombstone_records: false,
+	};
+	crypto.encrypt_tiered_slab_object(slab_id, &metadata, &dataset.plaintext)
+}
+
+fn bench_sparse_projection_runtime(config: &BenchConfig) -> std::io::Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let mut emitted = 0_usize;
+	for rows in sparse_projection_runtime_rows(config) {
+		let iterations = sparse_projection_runtime_iterations(config, *rows);
+		for cascade in sparse_projection_runtime_cascades(config) {
+			let dataset = sparse_projection_runtime_dataset(*rows, *cascade, 1)?;
+			let slab_id = SlabId::new(6_000 + *rows as u64 + (*cascade as u64) * 1_000_000);
+			let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+			let encrypted = sparse_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+			let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+				MockObjectStore::new(MockObjectStoreConfig::default()),
+			)));
+			let uri = runtime.block_on(store.put(
+				&format!("sparse-runtime/{}_{}.wnd", rows, cascade.as_str()),
+				&encrypted.bytes,
+			))?;
+			let object_size = encrypted.bytes.len() as u64;
+			let actual_cascade = sparse_projection_runtime_actual_cascade(&dataset);
+			for shape in sparse_projection_runtime_shapes(config) {
+				let expected = dense_projection_dataset_values(&dataset, *shape)?;
+				let expected_rows = expected.len()
+					/ SPARSE_PROJECTION_RUNTIME_PAYLOAD_BYTES
+					/ dataset
+						.fixtures
+						.first()
+						.map(|fixture| fixture.payload_columns.len())
+						.unwrap_or(1)
+						.max(1);
+				let mut last_dense = None;
+				let dense_elapsed = bench(iterations, || {
+					let outcome = dense_projection_dataset_runtime(
+						black_box(&dataset),
+						black_box(*shape),
+						&runtime,
+						store.clone(),
+						&uri,
+						&crypto,
+						slab_id,
+						object_size,
+					)
+					.expect("dense projection runtime");
+					last_dense = Some(outcome);
+				});
+				let mut dense = last_dense.expect("dense runtime outcome");
+				dense.elapsed = dense_elapsed;
+				let (sparse, sparse_values, route) =
+					if matches!(shape, SparseProjectionMaskShape::All) {
+						(
+							SparseProjectionRuntimeOutcome {
+								elapsed: dense.elapsed,
+								output_rows: dense.output_rows,
+								get_range_calls: dense.get_range_calls,
+								get_range_bytes: dense.get_range_bytes,
+								get_bytes_calls: dense.get_bytes_calls,
+								projection_plaintext_bytes: dense.projection_plaintext_bytes,
+								projection_ciphertext_bytes: dense.projection_ciphertext_bytes,
+								selected_ranges: dense.selected_ranges,
+								selected_simd_pages: dense.selected_simd_pages,
+							},
+							expected.clone(),
+							"dense_decline_all",
+						)
+					} else if matches!(shape, SparseProjectionMaskShape::None) {
+						(
+							SparseProjectionRuntimeOutcome {
+								elapsed: Duration::ZERO,
+								output_rows: 0,
+								get_range_calls: 0,
+								get_range_bytes: 0,
+								get_bytes_calls: 0,
+								projection_plaintext_bytes: 0,
+								projection_ciphertext_bytes: 0,
+								selected_ranges: 0,
+								selected_simd_pages: 0,
+							},
+							Vec::new(),
+							"sparse_none_short_circuit",
+						)
+					} else if !sparse_projection_runtime_sparse_enabled(*cascade) {
+						(
+							SparseProjectionRuntimeOutcome {
+								elapsed: dense.elapsed,
+								output_rows: dense.output_rows,
+								get_range_calls: dense.get_range_calls,
+								get_range_bytes: dense.get_range_bytes,
+								get_bytes_calls: dense.get_bytes_calls,
+								projection_plaintext_bytes: dense.projection_plaintext_bytes,
+								projection_ciphertext_bytes: dense.projection_ciphertext_bytes,
+								selected_ranges: dense.selected_ranges,
+								selected_simd_pages: dense.selected_simd_pages,
+							},
+							expected.clone(),
+							"dense_decline_cascade",
+						)
+					} else {
+						let mut last_sparse = None;
+						let sparse_elapsed = bench(iterations, || {
+							let (outcome, values) = sparse_projection_dataset_runtime(
+								black_box(&dataset),
+								black_box(*shape),
+								&runtime,
+								store.clone(),
+								&uri,
+								&crypto,
+								slab_id,
+								object_size,
+							)
+							.expect("sparse projection runtime");
+							last_sparse = Some((outcome, values));
+						});
+						let (mut outcome, values) = last_sparse.expect("sparse runtime outcome");
+						outcome.elapsed = sparse_elapsed;
+						(outcome, values, "sparse")
+					};
+				if dense.output_rows != expected_rows
+					|| sparse.output_rows != expected_rows
+					|| sparse_values != expected
+				{
+					let mismatch = sparse_values
+						.iter()
+						.zip(expected.iter())
+						.position(|(left, right)| left != right)
+						.unwrap_or_else(|| sparse_values.len().min(expected.len()));
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"sparse runtime output mismatch rows={} cascade={} shape={} dense_rows={} sparse_rows={} expected_rows={} sparse_bytes={} expected_bytes={} first_mismatch={}",
+							rows,
+							cascade.as_str(),
+							shape.as_str(),
+							dense.output_rows,
+							sparse.output_rows,
+							expected_rows,
+							sparse_values.len(),
+							expected.len(),
+							mismatch
+						),
+					));
+				}
+				let dense_micros = dense.elapsed.as_secs_f64() * 1_000_000.0;
+				let sparse_micros = sparse.elapsed.as_secs_f64() * 1_000_000.0;
+				let speedup_micros = if sparse_micros > 0.0 {
+					(dense_micros / sparse_micros * 1_000_000.0) as u64
+				} else if dense_micros > 0.0 {
+					u64::MAX
+				} else {
+					1_000_000
+				};
+				println!(
+					"row_group_fetch_measure scenario=sparse_projection_runtime rows={} records={} columns=3 shape=uint32_payload_clustered projected_cascade={} actual_cascade={} mask_shape={} route={} output_rows={} equality=true iterations={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_plaintext_bytes={} sparse_projection_plaintext_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} sparse_selected_simd_pages={} get_bytes_calls={}",
+					dataset.rows,
+					dataset.fixtures.len(),
+					cascade.as_str(),
+					actual_cascade,
+					shape.as_str(),
+					route,
+					expected_rows,
+					iterations,
+					dense.elapsed.as_secs_f64() * 1_000.0,
+					sparse.elapsed.as_secs_f64() * 1_000.0,
+					speedup_micros,
+					dense.get_range_calls,
+					sparse.get_range_calls,
+					dense.get_range_bytes,
+					sparse.get_range_bytes,
+					dense.projection_plaintext_bytes,
+					sparse.projection_plaintext_bytes,
+					dense.projection_ciphertext_bytes,
+					sparse.projection_ciphertext_bytes,
+					dense.selected_ranges,
+					sparse.selected_ranges,
+					sparse.selected_simd_pages,
+					dense.get_bytes_calls.saturating_add(sparse.get_bytes_calls),
+				);
+				emitted = emitted.saturating_add(1);
+			}
+		}
+	}
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime rows=mixed columns=3 shape=uint32_payload_clustered matrix_rows={} emitted_rows={} iterations=max10_1m3",
+		sparse_projection_runtime_rows(config)
+			.iter()
+			.map(|rows| rows.to_string())
+			.collect::<Vec<_>>()
+			.join(","),
+		emitted,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_runtime_projection_counts(config: &BenchConfig) -> std::io::Result<()> {
+	if config.iterations <= 25 {
+		return Ok(());
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let rows = 8_192;
+	let iterations = sparse_projection_runtime_iterations(config, rows);
+	let mut emitted = 0_usize;
+	for cascade in [
+		SparseProjectionCascadeFixture::BitPacked,
+		SparseProjectionCascadeFixture::Dictionary,
+	] {
+		for projection_columns in [1_usize, 4, 16, 64] {
+			let dataset = sparse_projection_runtime_dataset(rows, cascade, projection_columns)?;
+			let slab_id =
+				SlabId::new(7_000 + rows as u64 + projection_columns as u64 + cascade as u64);
+			let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+			let encrypted = sparse_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+			let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+				MockObjectStore::new(MockObjectStoreConfig::default()),
+			)));
+			let uri = runtime.block_on(store.put(
+				&format!(
+					"sparse-runtime-projection-count/{}_{}_{}.wnd",
+					rows,
+					cascade.as_str(),
+					projection_columns
+				),
+				&encrypted.bytes,
+			))?;
+			let env = SparseProjectionRuntimeEnv {
+				runtime: &runtime,
+				store,
+				uri: &uri,
+				crypto: &crypto,
+				slab_id,
+				object_size: encrypted.bytes.len() as u64,
+			};
+			let measurement = measure_sparse_projection_runtime_case(
+				&dataset,
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				iterations,
+				&env,
+				sparse_projection_runtime_sparse_enabled(cascade),
+				8,
+			)?;
+			let extra = format!(
+				" projection_columns={} per_buffer_range_cap=8",
+				projection_columns
+			);
+			print_sparse_projection_runtime_measure(
+				"sparse_projection_runtime_projection_count",
+				&dataset,
+				sparse_projection_runtime_actual_cascade(&dataset),
+				cascade.as_str(),
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				iterations,
+				&measurement,
+				&extra,
+			);
+			emitted = emitted.saturating_add(1);
+		}
+	}
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime_projection_count rows={} emitted_rows={} iterations={}",
+		rows, emitted, iterations,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_runtime_mixed_cascade(config: &BenchConfig) -> std::io::Result<()> {
+	if config.iterations <= 25 {
+		return Ok(());
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let rows = 8_192;
+	let iterations = sparse_projection_runtime_iterations(config, rows);
+	let dataset = sparse_projection_runtime_dataset(
+		rows,
+		SparseProjectionCascadeFixture::BitPackedPlusPlain,
+		2,
+	)?;
+	let slab_id = SlabId::new(7_500 + rows as u64);
+	let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let encrypted = sparse_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+	let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let uri = runtime.block_on(store.put(
+		&format!("sparse-runtime-mixed-cascade/{}.wnd", rows),
+		&encrypted.bytes,
+	))?;
+	let env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store,
+		uri: &uri,
+		crypto: &crypto,
+		slab_id,
+		object_size: encrypted.bytes.len() as u64,
+	};
+	let measurement = measure_sparse_projection_runtime_case(
+		&dataset,
+		SparseProjectionMaskShape::ClusteredFirstPage,
+		iterations,
+		&env,
+		false,
+		8,
+	)?;
+	print_sparse_projection_runtime_measure(
+		"sparse_projection_runtime_mixed_cascade",
+		&dataset,
+		sparse_projection_runtime_actual_cascade(&dataset),
+		SparseProjectionCascadeFixture::BitPackedPlusPlain.as_str(),
+		SparseProjectionMaskShape::ClusteredFirstPage,
+		iterations,
+		&measurement,
+		" projection_columns=2 per_buffer_range_cap=8",
+	);
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime_mixed_cascade rows={} emitted_rows=1 iterations={}",
+		rows, iterations,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_runtime_fragmentation(config: &BenchConfig) -> std::io::Result<()> {
+	if config.iterations <= 25 {
+		return Ok(());
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let rows = 8_192;
+	let iterations = sparse_projection_runtime_iterations(config, rows);
+	let dataset =
+		sparse_projection_runtime_dataset(rows, SparseProjectionCascadeFixture::BitPacked, 1)?;
+	let slab_id = SlabId::new(8_000 + rows as u64);
+	let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let encrypted = sparse_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+	let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let uri = runtime.block_on(store.put(
+		&format!("sparse-runtime-fragmentation/{}.wnd", rows),
+		&encrypted.bytes,
+	))?;
+	let env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store,
+		uri: &uri,
+		crypto: &crypto,
+		slab_id,
+		object_size: encrypted.bytes.len() as u64,
+	};
+	let mut emitted = 0_usize;
+	for cap in [2_usize, 4, 8, 16] {
+		let measurement = measure_sparse_projection_runtime_case(
+			&dataset,
+			SparseProjectionMaskShape::RandomOnePercent,
+			iterations,
+			&env,
+			true,
+			cap,
+		)?;
+		let extra = format!(" projection_columns=1 per_buffer_range_cap={}", cap);
+		print_sparse_projection_runtime_measure(
+			"sparse_projection_runtime_fragmentation_budget",
+			&dataset,
+			sparse_projection_runtime_actual_cascade(&dataset),
+			SparseProjectionCascadeFixture::BitPacked.as_str(),
+			SparseProjectionMaskShape::RandomOnePercent,
+			iterations,
+			&measurement,
+			&extra,
+		);
+		emitted = emitted.saturating_add(1);
+	}
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime_fragmentation_budget rows={} emitted_rows={} iterations={}",
+		rows, emitted, iterations,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_runtime_point_read(config: &BenchConfig) -> std::io::Result<()> {
+	if config.iterations <= 25 {
+		return Ok(());
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let rows = 8_192;
+	let iterations = sparse_projection_runtime_iterations(config, rows);
+	let mut emitted = 0_usize;
+	for cascade in [
+		SparseProjectionCascadeFixture::BitPacked,
+		SparseProjectionCascadeFixture::Dictionary,
+	] {
+		let dataset = sparse_projection_runtime_dataset(rows, cascade, 1)?;
+		let slab_id = SlabId::new(9_000 + rows as u64 + cascade as u64);
+		let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+		let encrypted = sparse_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+		let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+			MockObjectStore::new(MockObjectStoreConfig::default()),
+		)));
+		let uri = runtime.block_on(store.put(
+			&format!(
+				"sparse-runtime-point-read/{}_{}.wnd",
+				rows,
+				cascade.as_str()
+			),
+			&encrypted.bytes,
+		))?;
+		let env = SparseProjectionRuntimeEnv {
+			runtime: &runtime,
+			store,
+			uri: &uri,
+			crypto: &crypto,
+			slab_id,
+			object_size: encrypted.bytes.len() as u64,
+		};
+		let measurement = measure_sparse_projection_runtime_case(
+			&dataset,
+			SparseProjectionMaskShape::SingleFirstRow,
+			iterations,
+			&env,
+			true,
+			8,
+		)?;
+		print_sparse_projection_runtime_measure(
+			"sparse_projection_runtime_point_read_comparator",
+			&dataset,
+			sparse_projection_runtime_actual_cascade(&dataset),
+			cascade.as_str(),
+			SparseProjectionMaskShape::SingleFirstRow,
+			iterations,
+			&measurement,
+			" projection_columns=1 comparator=adr052_simd_page_lower_bound",
+		);
+		emitted = emitted.saturating_add(1);
+	}
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime_point_read_comparator rows={} emitted_rows={} iterations={}",
+		rows, emitted, iterations,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_runtime_determinism(config: &BenchConfig) -> std::io::Result<()> {
+	if config.iterations <= 25 {
+		return Ok(());
+	}
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let rows = 8_192;
+	let iterations = 1;
+	let shape = SparseProjectionMaskShape::ClusteredFivePercent;
+	let left =
+		sparse_projection_runtime_dataset(rows, SparseProjectionCascadeFixture::BitPacked, 1)?;
+	let right =
+		sparse_projection_runtime_dataset(rows, SparseProjectionCascadeFixture::BitPacked, 1)?;
+	let left_crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let right_crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let left_slab = SlabId::new(10_000 + rows as u64);
+	let right_slab = SlabId::new(10_100 + rows as u64);
+	let left_encrypted = sparse_runtime_encrypted_dataset(&left, &left_crypto, left_slab)?;
+	let right_encrypted = sparse_runtime_encrypted_dataset(&right, &right_crypto, right_slab)?;
+	let left_store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let right_store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let left_uri = runtime.block_on(left_store.put(
+		&format!("sparse-runtime-determinism/left_{}.wnd", rows),
+		&left_encrypted.bytes,
+	))?;
+	let right_uri = runtime.block_on(right_store.put(
+		&format!("sparse-runtime-determinism/right_{}.wnd", rows),
+		&right_encrypted.bytes,
+	))?;
+	let left_env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store: left_store,
+		uri: &left_uri,
+		crypto: &left_crypto,
+		slab_id: left_slab,
+		object_size: left_encrypted.bytes.len() as u64,
+	};
+	let right_env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store: right_store,
+		uri: &right_uri,
+		crypto: &right_crypto,
+		slab_id: right_slab,
+		object_size: right_encrypted.bytes.len() as u64,
+	};
+	let left_measure =
+		measure_sparse_projection_runtime_case(&left, shape, iterations, &left_env, true, 8)?;
+	let right_measure =
+		measure_sparse_projection_runtime_case(&right, shape, iterations, &right_env, true, 8)?;
+	let deterministic = left_measure.route == right_measure.route
+		&& left_measure.expected_rows == right_measure.expected_rows
+		&& left_measure.sparse.projection_plaintext_bytes
+			== right_measure.sparse.projection_plaintext_bytes
+		&& left_measure.sparse.selected_ranges == right_measure.sparse.selected_ranges
+		&& left_measure.sparse.selected_simd_pages == right_measure.sparse.selected_simd_pages;
+	print_sparse_projection_runtime_measure(
+		"sparse_projection_runtime_cross_replica_determinism",
+		&left,
+		sparse_projection_runtime_actual_cascade(&left),
+		SparseProjectionCascadeFixture::BitPacked.as_str(),
+		shape,
+		iterations,
+		&left_measure,
+		if deterministic {
+			" projection_columns=1 deterministic=true"
+		} else {
+			" projection_columns=1 deterministic=false"
+		},
+	);
+	if !deterministic {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"sparse runtime cross-replica determinism mismatch",
+		));
+	}
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_runtime_cross_replica_determinism rows={} emitted_rows=1 iterations={}",
+		rows, iterations,
+	);
+	Ok(())
+}
+
+fn bench_sparse_projection_planner(config: &BenchConfig) -> std::io::Result<()> {
+	let started = Instant::now();
+	let mut emitted = 0_usize;
+	for rows in sparse_projection_matrix_rows(config) {
+		for cascade in SparseProjectionCascadeFixture::ALL {
+			let fixture = sparse_projection_encoded_fixture(*rows, cascade)?;
+			for projection_columns in sparse_projection_projection_counts(config) {
+				for shape in SparseProjectionMaskShape::ALL {
+					let estimate =
+						estimate_sparse_projection(&fixture, *rows, shape, *projection_columns, 8);
+					println!(
+						"row_group_fetch_measure scenario=sparse_projection_page_estimate rows={} columns=3 shape=int64_clustered projected_cascade={} actual_cascade={} projection_columns={} mask_shape={} selected_groups={} dense_projection_bytes={} sparse_projection_bytes={} sparse_ranges={} selected_simd_pages={} per_buffer_range_cap=8 sparse_selected={} decline={}",
+						rows,
+						cascade.as_str(),
+						fixture.actual_cascade,
+						projection_columns,
+						shape.as_str(),
+						if matches!(shape, SparseProjectionMaskShape::None) {
+							0
+						} else {
+							1
+						},
+						fixture
+							.dense_bytes
+							.saturating_mul(*projection_columns as u64),
+						estimate.sparse_bytes,
+						estimate.sparse_ranges,
+						estimate.selected_simd_pages,
+						estimate.sparse_selected,
+						estimate.decline,
+					);
+					emitted = emitted.saturating_add(1);
+				}
+			}
+		}
+		let eligible =
+			sparse_projection_encoded_fixture(*rows, SparseProjectionCascadeFixture::BitPacked)?;
+		let dense_only =
+			sparse_projection_encoded_fixture(*rows, SparseProjectionCascadeFixture::Plain)?;
+		let dense_bytes = eligible.dense_bytes.saturating_add(dense_only.dense_bytes);
+		println!(
+			"row_group_fetch_measure scenario=sparse_projection_mixed_cascade rows={} columns=3 shape=int64_clustered projected_cascade=bit_packed_plus_plain actual_cascade=bit_packed,plain projection_columns=2 mask_shape=clustered_first_page selected_groups=1 dense_projection_bytes={} sparse_projection_bytes={} sparse_ranges=2 selected_simd_pages={} per_buffer_range_cap=8 sparse_selected=false decline=cascade_not_projection_eligible",
+			rows,
+			dense_bytes,
+			dense_bytes,
+			eligible.pages.len().saturating_add(dense_only.pages.len()),
+		);
+		emitted = emitted.saturating_add(1);
+		for per_buffer_range_cap in [2_usize, 4, 8, 16] {
+			let estimate = estimate_sparse_projection(
+				&eligible,
+				*rows,
+				SparseProjectionMaskShape::RandomOnePercent,
+				1,
+				per_buffer_range_cap,
+			);
+			println!(
+				"row_group_fetch_measure scenario=sparse_projection_fragmentation_budget rows={} columns=3 shape=int64_clustered projected_cascade=bit_packed actual_cascade={} projection_columns=1 mask_shape=random_1p selected_groups=1 dense_projection_bytes={} sparse_projection_bytes={} sparse_ranges={} selected_simd_pages={} per_buffer_range_cap={} sparse_selected={} decline={}",
+				rows,
+				eligible.actual_cascade,
+				eligible.dense_bytes,
+				estimate.sparse_bytes,
+				estimate.sparse_ranges,
+				estimate.selected_simd_pages,
+				per_buffer_range_cap,
+				estimate.sparse_selected,
+				estimate.decline,
+			);
+			emitted = emitted.saturating_add(1);
+		}
+	}
+	let elapsed = bench(config.iterations, || {
+		black_box(emitted);
+	});
+	let micros_per_op = elapsed.as_secs_f64() * 1_000_000.0 / config.iterations as f64;
+	println!(
+		"row_group_fetch_bench scenario=sparse_projection_page_estimate rows=mixed columns=3 shape=int64_clustered matrix_rows={} emitted_rows={} iterations={} total_ms={:.3} micros_per_op={:.3} wall_ms={:.3}",
+		sparse_projection_matrix_rows(config)
+			.iter()
+			.map(|rows| rows.to_string())
+			.collect::<Vec<_>>()
+			.join(","),
+		emitted,
+		config.iterations,
+		elapsed.as_secs_f64() * 1_000.0,
+		micros_per_op,
+		started.elapsed().as_secs_f64() * 1_000.0,
+	);
 	Ok(())
 }
 

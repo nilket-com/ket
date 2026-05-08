@@ -55,18 +55,16 @@ use crate::schema::table::{
 use crate::schema::{
 	AggregatePartial, AggregateRequest, ByteCount, CompactionJobId, CompactionLevelIndex,
 	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
-	IndexObjectId, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal, Locality,
-	LogicalSchemaFingerprint, ManifestEpoch, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordRowIndex, RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SelectivityFractionMicros, SlabId, SlabRecordHeader, SupersessionMetadata,
+	IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint,
+	ManifestEpoch, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount,
+	RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	SelectivityFractionMicros, SlabId, SlabRecordHeader, SupersessionMetadata,
 	TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
-	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnarFallbackReason, IpcBufferRange,
-	L2ColumnFetchConfig, L2FetchStrategy, PlaintextByteRange, ProjectedRecordBatch,
-	ProjectedRecordBufferSet, RecordBufferDirectory, StorageColumn, TieredRecordId,
-	build_column_fetch_plan, decode_projected_record_batch,
-	decode_projected_record_batch_from_buffers,
+	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnarFallbackReason, L2ColumnFetchConfig,
+	L2FetchStrategy, PlaintextByteRange, ProjectedRecordBatch, RecordBufferDirectory,
+	StorageColumn, TieredRecordId, build_column_fetch_plan, decode_projected_record_batch,
 	decode_projected_record_batch_from_plaintext_ranges, initial_metadata_probe_plan,
 	next_metadata_probe_plan, observe_l2_fetch_strategy, parse_record_buffer_directory,
 	pick_l2_fetch_strategy, selected_record_body_ranges, survival_mask_projected_record_batch,
@@ -76,7 +74,6 @@ use crate::storage::core::{
 	StorageEngine, insert_version_sorted, newest_version_as_of, recover_slab_entries_from_blob,
 	remove_version_exact, storage_multirow_index_entries_from_frame, validate_row_tombstone_chain,
 };
-use crate::storage::encoding::cascade::decode_page;
 use crate::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedPredicateNode, EncodedRowMask, EncodingComputeFallbackReason,
 	EncodingComputeRejectCode, NativeEvaluationEligibility, PredicateAtom, aggregate_kind_for_tag,
@@ -87,10 +84,19 @@ use crate::storage::encoding::compute::{
 };
 use crate::storage::encoding::materialize::find_buffer_encoding;
 use crate::storage::encoding::page::expand_page_descriptors;
+use crate::storage::encoding::page_materialize::{
+	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
+	decode_page_fetch, empty_projected_batch_for_requirement, encoded_page_body_range,
+	extract_record_body_bytes as extract_encoded_page_bytes, fixed_width_non_null_value_column,
+	projected_page_batch_from_decoded_buffers, required_projected_physical_ordinals,
+};
+use crate::storage::encoding::sparse_projection_fetch::{
+	SparseProjectionFetchDecision, SparseProjectionFetchInput, SparseProjectionFetchPlan,
+	decide_sparse_projection_fetch,
+};
 use crate::storage::encoding::{
 	BufferEncoding, EncodingCascade, EncodingComputeConfig, EncodingDirectory,
-	EncodingFallbackReason, EncodingPageDescriptor, EncodingRejectCode, EncodingWriterConfig,
-	L2EncodingFetchConfig,
+	EncodingFallbackReason, EncodingRejectCode, EncodingWriterConfig, L2EncodingFetchConfig,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow,
@@ -6114,43 +6120,9 @@ pub(crate) struct EncodingMaterializeAuditSample {
 	pub(crate) buffer_bytes_out: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct EncodingIndexedPageKey {
-	row_group_index: RowGroupIndex,
-	page_index: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct EncodingIndexedBufferPageKey {
-	row_group_index: RowGroupIndex,
-	ipc_column_ordinal: IpcColumnOrdinal,
-	ipc_buffer_ordinal: IpcBufferIndex,
-	page_index: u32,
-}
-
-#[derive(Clone, Debug)]
-struct EncodingIndexedColumnPlan {
-	physical_ordinal: usize,
-	null_buffer_ordinal: IpcBufferIndex,
-	value_buffer_ordinal: IpcBufferIndex,
-	bytes_per_value: usize,
-	data_type: arrow::datatypes::DataType,
-}
-
-#[derive(Clone, Debug)]
-struct EncodingIndexedBufferPageFetch {
-	key: EncodingIndexedBufferPageKey,
-	page_key: EncodingIndexedPageKey,
-	body_range: crate::storage::row_group::RecordBodyByteRange,
-	cascade: EncodingCascade,
-	page: EncodingPageDescriptor,
-	bytes_per_value: usize,
-	data_type: arrow::datatypes::DataType,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct EncodingIndexedRowPage {
-	page_key: EncodingIndexedPageKey,
+	page_key: PageMaterializeKey,
 	row_offset_in_page: usize,
 }
 
@@ -6158,8 +6130,8 @@ struct EncodingIndexedRowPage {
 struct EncodingIndexedPagePlan {
 	selected_groups: Vec<RowGroupIndex>,
 	row_pages: Vec<EncodingIndexedRowPage>,
-	columns: Vec<EncodingIndexedColumnPlan>,
-	fetches: Vec<EncodingIndexedBufferPageFetch>,
+	columns: Vec<PageMaterializeColumn>,
+	fetches: Vec<PageMaterializeFetch>,
 }
 
 #[derive(Clone, Debug)]
@@ -9770,7 +9742,7 @@ impl SlabManager {
 			};
 			let phase_c_requirement_empty = phase_c_requirement.user_visible().is_empty()
 				&& phase_c_requirement.storage_columns.is_empty();
-			let selected_body_byte_ranges = if phase_c_requirement_empty {
+			let dense_phase_c_body_byte_ranges = if phase_c_requirement_empty {
 				Vec::new()
 			} else {
 				crate::storage::row_group::selected_row_group_record_body_ranges(
@@ -9780,6 +9752,47 @@ impl SlabManager {
 					&selected_groups,
 				)
 				.map_err(columnar_io_error)?
+			};
+			let mut sparse_projection_plan = None;
+			let mut projection_groups = selected_groups.clone();
+			let selected_body_byte_ranges = if !point_read
+				&& !phase_c_requirement_empty
+				&& phase_b_projected_by_group.is_empty()
+				&& !phase_b_outcome.survival_masks.is_empty()
+			{
+				if let Some(encoding_directory) = directory.encoding_directory.as_ref() {
+					let dense_predicate_batches_present = phase_b_outcome
+						.decoded_predicate_batches
+						.values()
+						.any(|batch| batch.num_columns() > 0);
+					match decide_sparse_projection_fetch(SparseProjectionFetchInput {
+						record_directory: &directory,
+						page_directory: &page_directory,
+						encoding_directory,
+						requirement: &phase_c_requirement,
+						predicate_outcome: &phase_b_outcome,
+						selected_groups: &selected_groups,
+						dense_body_ranges: &dense_phase_c_body_byte_ranges,
+						row_group_config: &self.config.l2_row_group_fetch,
+						encoding_config: &self.config.l2_encoding_fetch,
+						dense_predicate_batches_present,
+					}) {
+						SparseProjectionFetchDecision::Sparse(plan) => {
+							projection_groups = plan.selected_groups.clone();
+							let ranges = plan.selected_body_ranges.clone();
+							sparse_projection_plan = Some(plan);
+							ranges
+						}
+						SparseProjectionFetchDecision::Decline(reason) => {
+							let _ = reason;
+							dense_phase_c_body_byte_ranges.clone()
+						}
+					}
+				} else {
+					dense_phase_c_body_byte_ranges.clone()
+				}
+			} else {
+				dense_phase_c_body_byte_ranges.clone()
 			};
 			let selected_body_ranges = selected_body_byte_ranges
 				.iter()
@@ -9802,7 +9815,7 @@ impl SlabManager {
 			let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
 				record_id: page_directory.record_id,
 				directory: page_directory.clone(),
-				surviving_groups: selected_groups.to_vec(),
+				surviving_groups: projection_groups.to_vec(),
 				predicate_fetched_groups,
 				phase_b_fetch,
 				phase_c_fetch,
@@ -9833,6 +9846,42 @@ impl SlabManager {
 					strategy,
 				});
 			};
+			if let Some(sparse_projection_plan) = sparse_projection_plan.as_ref() {
+				for fetch in &sparse_projection_plan.fetches {
+					metrics().observe_storage_l2_encoding_simd_pages_fetched(
+						fetch.cascade.kind().as_str(),
+						1,
+					);
+				}
+				let plaintext_extracts = if selected_record_ranges.is_empty() {
+					Vec::new()
+				} else {
+					let ciphertext_runs = fetch_tiered_ciphertext_runs(
+						l2,
+						pointer,
+						&tiered_plan,
+						self.config.l2_row_group_fetch.max_parallel_range_gets.get() as usize,
+					)
+					.await?;
+					tiered_plan.decrypt(&ciphertext_runs)?
+				};
+				let projected = materialize_sparse_projection_pages(
+					&directory,
+					&phase_c_requirement,
+					sparse_projection_plan,
+					&selected_body_ranges,
+					&plaintext_extracts,
+					&phase_b_outcome,
+				)
+				.map_err(arrow_io_error)?;
+				return Ok(ProjectedL2RecordRead {
+					projected,
+					projected_first_record_row_index: group.first_record_row_index,
+					indexed_rows_materialized: false,
+					encoding_materialize_audit: Vec::new(),
+					strategy: L2FetchStrategy::RowGroup(row_group_plan),
+				});
+			}
 			let projected = if phase_b_projected_by_group.is_empty() {
 				if phase_b_outcome.survival_masks.is_empty() || point_read {
 					if phase_c_requirement_empty {
@@ -11410,8 +11459,8 @@ fn build_encoding_indexed_page_plan(
 	selected_record_rows: &[RecordRowIndex],
 	selected_groups: &[RowGroupIndex],
 ) -> Result<Option<EncodingIndexedPagePlan>, EncodingFallbackReason> {
-	let physical_ordinals =
-		required_encoding_indexed_physical_ordinals(record_directory, requirement)?;
+	let physical_ordinals = required_projected_physical_ordinals(record_directory, requirement)
+		.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
 	if physical_ordinals.is_empty() {
 		return Ok(Some(EncodingIndexedPagePlan {
 			selected_groups: selected_groups.to_vec(),
@@ -11422,7 +11471,7 @@ fn build_encoding_indexed_page_plan(
 						crate::storage::row_group::row_group_for_record_row(page_directory, *row)
 							.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
 					Ok(EncodingIndexedRowPage {
-						page_key: EncodingIndexedPageKey {
+						page_key: PageMaterializeKey {
 							row_group_index: group.row_group_index,
 							page_index: 0,
 						},
@@ -11437,52 +11486,16 @@ fn build_encoding_indexed_page_plan(
 
 	let mut columns = Vec::with_capacity(physical_ordinals.len());
 	for physical_ordinal in physical_ordinals {
-		let field = record_directory
-			.ipc_schema
-			.fields()
-			.get(physical_ordinal)
+		let column = fixed_width_non_null_value_column(record_directory, physical_ordinal)
 			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-		if record_directory
-			.column_null_counts
-			.get(physical_ordinal)
-			.copied()
-			.unwrap_or(usize::MAX)
-			!= 0
-		{
-			return Err(EncodingFallbackReason::UnsupportedArrowLayout);
-		}
-		let bytes_per_value = fixed_width_value_bytes(field.data_type())
-			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-		let mapping = record_directory
-			.column_to_buffers
-			.get(physical_ordinal)
-			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-		if mapping.buffer_count != 2 {
-			return Err(EncodingFallbackReason::UnsupportedArrowLayout);
-		}
-		let null_buffer_ordinal = mapping.first_buffer_ordinal;
-		let value_buffer_ordinal = IpcBufferIndex::new(
-			mapping
-				.first_buffer_ordinal
-				.get()
-				.checked_add(1)
-				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?,
-		);
-		columns.push(EncodingIndexedColumnPlan {
-			physical_ordinal,
-			null_buffer_ordinal,
-			value_buffer_ordinal,
-			bytes_per_value,
-			data_type: field.data_type().clone(),
-		});
+		columns.push(column);
 	}
 
 	let first_column = columns
 		.first()
 		.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
 	let mut row_pages = Vec::with_capacity(selected_record_rows.len());
-	let mut fetches_by_key =
-		BTreeMap::<EncodingIndexedBufferPageKey, EncodingIndexedBufferPageFetch>::new();
+	let mut fetches_by_key = BTreeMap::<PageMaterializeBufferKey, PageMaterializeFetch>::new();
 	for row in selected_record_rows {
 		let group = crate::storage::row_group::row_group_for_record_row(page_directory, *row)
 			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
@@ -11523,7 +11536,7 @@ fn build_encoding_indexed_page_plan(
 					row_within_group >= start && row_within_group < end
 				})
 				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-			let candidate_page_key = EncodingIndexedPageKey {
+			let candidate_page_key = PageMaterializeKey {
 				row_group_index: group.row_group_index,
 				page_index: page.page_index.get(),
 			};
@@ -11541,7 +11554,7 @@ fn build_encoding_indexed_page_plan(
 				.get(encoding.cascade_index.get() as usize)
 				.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?
 				.clone();
-			let fetch_key = EncodingIndexedBufferPageKey {
+			let fetch_key = PageMaterializeBufferKey {
 				row_group_index: group.row_group_index,
 				ipc_column_ordinal: column_page.ipc_column_ordinal,
 				ipc_buffer_ordinal: column.value_buffer_ordinal,
@@ -11550,10 +11563,9 @@ fn build_encoding_indexed_page_plan(
 			fetches_by_key.entry(fetch_key).or_insert_with(|| {
 				metrics()
 					.observe_storage_l2_encoding_simd_pages_fetched(cascade.kind().as_str(), 1);
-				EncodingIndexedBufferPageFetch {
+				PageMaterializeFetch {
 					key: fetch_key,
-					page_key: candidate_page_key,
-					body_range: encoding_indexed_page_body_range(column_page.range, encoding, page),
+					body_range: encoded_page_body_range(column_page.range, encoding, page),
 					cascade,
 					page,
 					bytes_per_value: column.bytes_per_value,
@@ -11582,41 +11594,6 @@ fn build_encoding_indexed_page_plan(
 	}))
 }
 
-fn required_encoding_indexed_physical_ordinals(
-	directory: &RecordBufferDirectory,
-	requirement: &ColumnFetchRequirement,
-) -> Result<Vec<usize>, EncodingFallbackReason> {
-	let user_physical_ordinals = directory
-		.ipc_schema
-		.fields()
-		.iter()
-		.enumerate()
-		.filter_map(|(physical, field)| {
-			crate::storage::columnar::StorageColumn::from_name(field.name())
-				.is_none()
-				.then_some(physical)
-		})
-		.collect::<Vec<_>>();
-	let mut out = Vec::new();
-	for descriptor_ordinal in requirement.user_visible().iter() {
-		let physical = *user_physical_ordinals
-			.get(descriptor_ordinal as usize)
-			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-		out.push(physical);
-	}
-	for storage_column in requirement.storage_columns.iter() {
-		let physical = directory
-			.storage_column_ordinals
-			.get(&storage_column)
-			.copied()
-			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
-		out.push(physical as usize);
-	}
-	out.sort_unstable();
-	out.dedup();
-	Ok(out)
-}
-
 fn encoding_materialize_audit_for_indexed_plan(
 	plan: &EncodingIndexedPagePlan,
 ) -> Vec<EncodingMaterializeAuditSample> {
@@ -11642,47 +11619,86 @@ fn encoding_materialize_audit_for_indexed_plan(
 		.collect()
 }
 
-fn fixed_width_value_bytes(data_type: &arrow::datatypes::DataType) -> Option<usize> {
-	use arrow::datatypes::DataType;
-	match data_type {
-		DataType::Int8 | DataType::UInt8 => Some(1),
-		DataType::Int16 | DataType::UInt16 => Some(2),
-		DataType::Int32
-		| DataType::UInt32
-		| DataType::Float32
-		| DataType::Date32
-		| DataType::Time32(_) => Some(4),
-		DataType::Int64
-		| DataType::UInt64
-		| DataType::Float64
-		| DataType::Date64
-		| DataType::Time64(_)
-		| DataType::Duration(_)
-		| DataType::Timestamp(_, _) => Some(8),
-		DataType::FixedSizeBinary(width) if *width > 0 => usize::try_from(*width).ok(),
-		DataType::Decimal128(_, _) => Some(16),
-		DataType::Decimal256(_, _) => Some(32),
-		_ => None,
+fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
+	record_directory: &RecordBufferDirectory,
+	requirement: &ColumnFetchRequirement,
+	plan: &SparseProjectionFetchPlan,
+	selected_ranges: &[TieredPlaintextRange],
+	plaintext_extracts: &[B],
+	predicate_outcome: &crate::storage::row_group::PhaseBOutcome,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	if plan.selected_groups.is_empty() {
+		return empty_projected_batch_for_requirement(record_directory, requirement, 0);
 	}
-}
+	let mut decoded_pages = BTreeMap::<PageMaterializeBufferKey, Vec<u8>>::new();
+	for fetch in &plan.fetches {
+		let encoded =
+			extract_encoded_page_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
+		let decoded = decode_page_fetch(fetch, &encoded)?;
+		decoded_pages.insert(fetch.key, decoded);
+	}
 
-fn encoding_indexed_page_body_range(
-	buffer_range: crate::storage::row_group::RecordBodyByteRange,
-	encoding: &BufferEncoding,
-	page: EncodingPageDescriptor,
-) -> crate::storage::row_group::RecordBodyByteRange {
-	let encoded_start = u64::from(encoding.encoded_range.start.get());
-	let page_start = u64::from(page.byte_range.start.get());
-	crate::storage::row_group::RecordBodyByteRange {
-		start: RecordBodyByteOffset::new(
-			buffer_range
-				.start
-				.get()
-				.saturating_add(encoded_start)
-				.saturating_add(page_start),
-		),
-		len: page.byte_range.len,
+	let mut filtered = Vec::new();
+	let mut template = None;
+	for group in &plan.group_pages {
+		let mask = predicate_outcome
+			.survival_masks
+			.get(&group.row_group_index)
+			.ok_or_else(|| {
+				arrow::error::ArrowError::SchemaError(format!(
+					"Sparse projection mask missing for row group {}",
+					group.row_group_index.get()
+				))
+			})?;
+		for page in &group.selected_pages {
+			let page_key = PageMaterializeKey {
+				row_group_index: group.row_group_index,
+				page_index: page.page_index.get(),
+			};
+			let page_batch = projected_page_batch_from_decoded_buffers(
+				record_directory,
+				requirement,
+				&plan.columns,
+				page_key,
+				page.value_count.get() as usize,
+				&decoded_pages,
+			)?;
+			template.get_or_insert_with(|| page_batch.clone());
+			let start = page.first_value_index.get() as usize;
+			let len = page.value_count.get() as usize;
+			if start.checked_add(len).is_none_or(|end| end > mask.len()) {
+				return Err(arrow::error::ArrowError::SchemaError(format!(
+					"Sparse projection page mask range {}..{} exceeds mask length {}",
+					start,
+					start.saturating_add(len),
+					mask.len()
+				)));
+			}
+			let local_mask = arrow::array::BooleanArray::from_iter(
+				(start..start + len).map(|row| Some(mask.is_valid(row) && mask.value(row))),
+			);
+			if local_mask.true_count() == 0 {
+				continue;
+			}
+			if local_mask.null_count() == 0 && local_mask.true_count() == local_mask.len() {
+				filtered.push(page_batch);
+				continue;
+			}
+			let batch = arrow::compute::filter_record_batch(&page_batch.batch, &local_mask)?;
+			filtered.push(ProjectedRecordBatch {
+				batch,
+				ordinal_mapping: page_batch.ordinal_mapping,
+				storage_mapping: page_batch.storage_mapping,
+			});
+		}
 	}
+	if filtered.is_empty() {
+		if let Some(template) = template {
+			return Ok(template.slice(0, 0));
+		}
+		return empty_projected_batch_for_requirement(record_directory, requirement, 0);
+	}
+	concat_projected_record_batches(filtered)
 }
 
 fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
@@ -11701,32 +11717,15 @@ fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
 			descriptor,
 		);
 	}
-	let mut decoded_pages = HashMap::<EncodingIndexedBufferPageKey, Vec<u8>>::new();
+	let mut decoded_pages = BTreeMap::<PageMaterializeBufferKey, Vec<u8>>::new();
 	for fetch in &plan.fetches {
 		let encoded =
-			extract_record_body_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
-		let expected_bytes = fetch
-			.page
-			.value_count
-			.get()
-			.checked_mul(fetch.bytes_per_value as u32)
-			.ok_or_else(|| {
-				arrow::error::ArrowError::SchemaError(
-					"Encoding indexed page decoded byte length overflow".into(),
-				)
-			})?;
-		let decoded = decode_page(
-			&encoded,
-			&fetch.data_type,
-			&fetch.cascade,
-			RecordBodyByteLen::new(u64::from(expected_bytes)),
-			fetch.page.value_count,
-		)
-		.map_err(encoding_reject_arrow_error)?;
+			extract_encoded_page_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
+		let decoded = decode_page_fetch(fetch, &encoded)?;
 		decoded_pages.insert(fetch.key, decoded);
 	}
 
-	let mut page_batches = HashMap::<EncodingIndexedPageKey, ProjectedRecordBatch>::new();
+	let mut page_batches = BTreeMap::<PageMaterializeKey, ProjectedRecordBatch>::new();
 	for page_key in plan.row_pages.iter().map(|row| row.page_key) {
 		if page_batches.contains_key(&page_key) {
 			continue;
@@ -11734,64 +11733,23 @@ fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
 		let page_fetch = plan
 			.fetches
 			.iter()
-			.find(|fetch| fetch.page_key == page_key)
+			.find(|fetch| {
+				fetch.key.row_group_index == page_key.row_group_index
+					&& fetch.key.page_index == page_key.page_index
+			})
 			.ok_or_else(|| {
 				arrow::error::ArrowError::SchemaError(
 					"Encoding indexed page batch missing fetch".into(),
 				)
 			})?;
-		let mut buffers = vec![
-			IpcBufferRange {
-				offset_in_record: IpcBufferOffset::ZERO,
-				length: IpcBufferLength::ZERO,
-			};
-			record_directory.buffers.len()
-		];
-		let mut buffer_set = ProjectedRecordBufferSet::new();
-		for column in &plan.columns {
-			buffers[column.null_buffer_ordinal.get() as usize] = IpcBufferRange {
-				offset_in_record: IpcBufferOffset::ZERO,
-				length: IpcBufferLength::ZERO,
-			};
-			let key = EncodingIndexedBufferPageKey {
-				row_group_index: page_key.row_group_index,
-				ipc_column_ordinal: IpcColumnOrdinal::new(column.physical_ordinal as u32),
-				ipc_buffer_ordinal: column.value_buffer_ordinal,
-				page_index: page_key.page_index,
-			};
-			let decoded = decoded_pages.get(&key).ok_or_else(|| {
-				arrow::error::ArrowError::SchemaError(
-					"Encoding indexed decoded page missing for projected column".into(),
-				)
-			})?;
-			buffers[column.value_buffer_ordinal.get() as usize] = IpcBufferRange {
-				offset_in_record: IpcBufferOffset::ZERO,
-				length: IpcBufferLength::new(decoded.len() as u64),
-			};
-			buffer_set.insert(column.value_buffer_ordinal, decoded.clone());
-		}
-		let mut column_null_counts = record_directory.column_null_counts.clone();
-		for column in &plan.columns {
-			if let Some(null_count) = column_null_counts.get_mut(column.physical_ordinal) {
-				*null_count = 0;
-			}
-		}
-		let scoped = RecordBufferDirectory {
-			record_id: record_directory.record_id,
-			record_plaintext_range: record_directory.record_plaintext_range,
-			row_count: page_fetch.page.value_count.get() as usize,
-			record_body_compression: RecordBodyCompressionPolicy::Uncompressed,
-			ipc_schema: record_directory.ipc_schema.clone(),
-			buffers,
-			column_to_buffers: record_directory.column_to_buffers.clone(),
-			column_null_counts,
-			storage_column_ordinals: record_directory.storage_column_ordinals.clone(),
-			logical_schema_fingerprint: record_directory.logical_schema_fingerprint,
-			page_directory: None,
-			encoding_directory: None,
-		};
-		let page_batch =
-			decode_projected_record_batch_from_buffers(&scoped, requirement, &buffer_set)?;
+		let page_batch = projected_page_batch_from_decoded_buffers(
+			record_directory,
+			requirement,
+			&plan.columns,
+			page_key,
+			page_fetch.page.value_count.get() as usize,
+			&decoded_pages,
+		)?;
 		page_batches.insert(page_key, page_batch);
 	}
 
@@ -11929,11 +11887,6 @@ fn coalesce_manager_record_body_ranges(
 	}
 	*ranges = coalesced;
 	Ok(())
-}
-
-fn encoding_reject_arrow_error(code: EncodingRejectCode) -> arrow::error::ArrowError {
-	metrics().observe_storage_l2_encoding_invariant_violation(code.as_str());
-	arrow::error::ArrowError::SchemaError(format!("Encoding indexed page rejected: {code:?}"))
 }
 
 fn encoding_compute_decode_error(code: EncodingRejectCode) -> std::io::Error {
@@ -13103,6 +13056,96 @@ mod tests {
 
 		async fn delete(&self, _uri: &str) -> std::io::Result<()> {
 			Ok(())
+		}
+	}
+
+	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+	struct ObjectStoreCallSnapshot {
+		get_range_calls: usize,
+		get_range_bytes: u64,
+		get_bytes_calls: usize,
+		get_bytes_bytes: u64,
+	}
+
+	struct CountingObjectStore {
+		inner: Arc<dyn ObjectStore>,
+		get_range_calls: std::sync::atomic::AtomicUsize,
+		get_range_bytes: std::sync::atomic::AtomicU64,
+		get_bytes_calls: std::sync::atomic::AtomicUsize,
+		get_bytes_bytes: std::sync::atomic::AtomicU64,
+	}
+
+	impl CountingObjectStore {
+		fn new(inner: Arc<dyn ObjectStore>) -> Self {
+			Self {
+				inner,
+				get_range_calls: std::sync::atomic::AtomicUsize::new(0),
+				get_range_bytes: std::sync::atomic::AtomicU64::new(0),
+				get_bytes_calls: std::sync::atomic::AtomicUsize::new(0),
+				get_bytes_bytes: std::sync::atomic::AtomicU64::new(0),
+			}
+		}
+
+		fn snapshot(&self) -> ObjectStoreCallSnapshot {
+			ObjectStoreCallSnapshot {
+				get_range_calls: self
+					.get_range_calls
+					.load(std::sync::atomic::Ordering::SeqCst),
+				get_range_bytes: self
+					.get_range_bytes
+					.load(std::sync::atomic::Ordering::SeqCst),
+				get_bytes_calls: self
+					.get_bytes_calls
+					.load(std::sync::atomic::Ordering::SeqCst),
+				get_bytes_bytes: self
+					.get_bytes_bytes
+					.load(std::sync::atomic::Ordering::SeqCst),
+			}
+		}
+	}
+
+	#[async_trait::async_trait]
+	impl ObjectStore for CountingObjectStore {
+		async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<String> {
+			self.inner.put(key, bytes).await
+		}
+
+		async fn head(&self, uri: &str) -> std::io::Result<crate::storage::l2::ObjectMetadata> {
+			self.inner.head(uri).await
+		}
+
+		async fn get_range(
+			&self,
+			uri: &str,
+			range: std::ops::Range<u64>,
+		) -> std::io::Result<Bytes> {
+			self.get_range_calls
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			self.get_range_bytes.fetch_add(
+				range.end.saturating_sub(range.start),
+				std::sync::atomic::Ordering::SeqCst,
+			);
+			self.inner.get_range(uri, range).await
+		}
+
+		async fn get_bytes(&self, uri: &str) -> std::io::Result<Bytes> {
+			let bytes = self.inner.get_bytes(uri).await?;
+			self.get_bytes_calls
+				.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			self.get_bytes_bytes
+				.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::SeqCst);
+			Ok(bytes)
+		}
+
+		async fn list(
+			&self,
+			prefix: &str,
+		) -> std::io::Result<Vec<crate::storage::l2::ObjectMetadata>> {
+			self.inner.list(prefix).await
+		}
+
+		async fn delete(&self, uri: &str) -> std::io::Result<()> {
+			self.inner.delete(uri).await
 		}
 	}
 
@@ -17997,6 +18040,378 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.expect("expected payload column");
 		assert_eq!(actual_values.values(), expected_values.values());
+	}
+
+	#[tokio::test]
+	async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
+		let l1_dir = fresh_dir("sparse-projection-l1");
+		let l2_dir = fresh_dir("sparse-projection-l2");
+		let l2_counter = Arc::new(CountingObjectStore::new(Arc::new(
+			LocalFsObjectStore::new(&l2_dir).unwrap(),
+		)));
+		let l2: Arc<dyn ObjectStore> = l2_counter.clone();
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir.clone(),
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					max_selected_byte_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: Default::default(),
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
+					min_selectivity_for_encoded_eval_micros:
+						crate::schema::SelectivityFractionMicros::new(1_000_000),
+					..Default::default()
+				},
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("selector", DataType::Int64, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x84; 16]),
+			1,
+			"analytics",
+			"sparse_projection",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(4096, 4096, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Uncompressed;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let row_count = 4096_usize;
+		let selector = (0..row_count).map(|row| row as i64).collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(selector.iter().copied())) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| (row % 128) as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(600 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: None,
+				}
+			})
+			.collect::<Vec<_>>();
+		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
+			enabled: true,
+			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
+			min_paged_record_rows: RowCount::new(1024),
+			min_paged_record_bytes: RecordBodyByteLen::new(1),
+			stats_supported_types: std::collections::BTreeSet::new(),
+		};
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			..Default::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Uncompressed,
+				&row_group_config,
+				&encoding_config,
+			)
+			.unwrap();
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("sparse-projection/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+		let target = encoded
+			.rows
+			.iter()
+			.find(|row| row.record_row_index == RecordRowIndex::new(300))
+			.expect("target storage row");
+		let location = mgr
+			.lookup(tenant(), target.key_identity)
+			.expect("tiered row location");
+		// V1 sparse projection fetch consumes the exact COCD mask but
+		// does not page-slice dense predicate columns.
+		let requirement = ColumnFetchRequirement {
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([2]),
+			..ColumnFetchRequirement::default()
+		};
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		bytecode.extend_from_slice(&256_i64.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_LT);
+		let predicate = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let selected_rows = [RecordRowIndex::new(300)];
+
+		let counter_before_sparse = l2_counter.snapshot();
+		let sparse = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&requirement,
+				Some(&predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let counter_after_sparse = l2_counter.snapshot();
+		assert_eq!(counter_after_sparse.get_bytes_calls, 0);
+		assert_eq!(counter_after_sparse.get_bytes_bytes, 0);
+		assert!(
+			counter_after_sparse.get_range_calls > counter_before_sparse.get_range_calls,
+			"sparse projection read must use L2 range GETs"
+		);
+		let sparse_get_range_bytes = counter_after_sparse
+			.get_range_bytes
+			.saturating_sub(counter_before_sparse.get_range_bytes);
+		let L2FetchStrategy::RowGroup(plan) = &sparse.strategy else {
+			panic!(
+				"expected row-group sparse projection strategy, got {:?}",
+				sparse.strategy
+			);
+		};
+		assert_eq!(
+			plan.surviving_groups,
+			vec![crate::schema::RowGroupIndex::ZERO]
+		);
+		assert_eq!(plan.predicate_fetched_groups, plan.surviving_groups);
+		assert!(plan.phase_b_fetch.is_some());
+		assert!(
+			sparse_get_range_bytes >= plan.phase_c_fetch.fetched_ciphertext_bytes,
+			"runtime range GET counter should cover sparse projection ciphertext bytes"
+		);
+
+		let full_frame = mgr
+			.read_encrypted_record_from_l2(l2.as_ref(), &pointer, location)
+			.await
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id,
+				record_offset: RecordBodyByteOffset::new(location.offset),
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: full_frame.len() as u64,
+			},
+			&full_frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = directory.page_directory.as_ref().unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let payload_encoding = encoding_directory
+			.buffers
+			.iter()
+			.find(|encoding| {
+				encoding.row_group_index == crate::schema::RowGroupIndex::ZERO
+					&& encoding.ipc_column_ordinal == crate::schema::IpcColumnOrdinal::new(2)
+					&& encoding.page_end_offsets.len() > 1
+					&& encoding.encoded_range.len < encoding.decoded_byte_len
+			})
+			.expect("payload value buffer should be page-encoded");
+		let payload_page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == payload_encoding.row_group_index
+					&& page.ipc_column_ordinal == payload_encoding.ipc_column_ordinal
+					&& page.ipc_buffer_ordinal == payload_encoding.ipc_buffer_ordinal
+			})
+			.unwrap();
+		let full_payload_range = crate::storage::row_group::RecordBodyByteRange {
+			start: RecordBodyByteOffset::new(
+				payload_page.range.start.get()
+					+ u64::from(payload_encoding.encoded_range.start.get()),
+			),
+			len: payload_encoding.encoded_range.len,
+		};
+		assert!(
+			!body_ranges_cover(
+				&plan.phase_c_fetch.selected_plaintext_ranges,
+				full_payload_range
+			),
+			"sparse projection should not fetch the whole projected payload buffer"
+		);
+		let selected_projection_bytes = plan
+			.phase_c_fetch
+			.selected_plaintext_ranges
+			.iter()
+			.map(|range| range.len.get())
+			.sum::<u64>();
+		assert!(
+			selected_projection_bytes < full_payload_range.len.get(),
+			"sparse projection bytes {selected_projection_bytes} should stay below full payload range {}",
+			full_payload_range.len.get()
+		);
+
+		let expected = crate::schema::pbc::execute_program(&predicate, &batch)
+			.unwrap()
+			.project(&[2])
+			.unwrap();
+		assert_eq!(sparse.projected.batch, expected);
+
+		let mut all_bytecode = Vec::new();
+		all_bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		all_bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		all_bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		all_bytecode.extend_from_slice(&(row_count as i64).to_le_bytes());
+		all_bytecode.push(crate::schema::pbc::OP_LT);
+		let all_predicate = crate::schema::pbc::Program::compile(&all_bytecode).unwrap();
+		let all = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&requirement,
+				Some(&all_predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(all_plan) = &all.strategy else {
+			panic!(
+				"expected row-group dense projection strategy for all mask, got {:?}",
+				all.strategy
+			);
+		};
+		assert!(all_plan.phase_b_fetch.is_some());
+		assert_eq!(
+			all_plan.surviving_groups,
+			vec![crate::schema::RowGroupIndex::ZERO]
+		);
+		assert!(
+			body_ranges_cover(
+				&all_plan.phase_c_fetch.selected_plaintext_ranges,
+				full_payload_range
+			),
+			"all-mask sparse decline should route to the dense projection range"
+		);
+		let all_expected = batch.slice(0, row_group_config.target_row_group_rows.get() as usize);
+		let all_expected = crate::schema::pbc::execute_program(&all_predicate, &all_expected)
+			.unwrap()
+			.project(&[2])
+			.unwrap();
+		assert_eq!(all.projected.batch, all_expected);
+
+		let mut none_bytecode = Vec::new();
+		none_bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		none_bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		none_bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		none_bytecode.extend_from_slice(&0_i64.to_le_bytes());
+		none_bytecode.push(crate::schema::pbc::OP_LT);
+		let none_predicate = crate::schema::pbc::Program::compile(&none_bytecode).unwrap();
+		let none = mgr
+			.read_projected_record_from_l2(
+				l2,
+				&pointer,
+				location,
+				&descriptor,
+				&requirement,
+				Some(&none_predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(none_plan) = &none.strategy else {
+			panic!(
+				"expected row-group sparse projection strategy for none mask, got {:?}",
+				none.strategy
+			);
+		};
+		assert!(none_plan.phase_b_fetch.is_some());
+		assert!(none_plan.surviving_groups.is_empty());
+		assert!(none_plan.phase_c_fetch.selected_plaintext_ranges.is_empty());
+		let none_expected = crate::schema::pbc::execute_program(&none_predicate, &batch)
+			.unwrap()
+			.project(&[2])
+			.unwrap();
+		assert_eq!(none.projected.batch, none_expected);
 	}
 
 	#[tokio::test]
