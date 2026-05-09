@@ -41,6 +41,9 @@ lsm_compaction_paused = false
 #
 # [storage.row_group_writer]
 # enabled = false
+# profile = "point_read" # "point_read" (default) or "scan"
+# Numeric fields are PointRead-only overrides; they are ignored with a
+# warning when profile = "scan".
 # target_row_group_rows = 4096
 # max_row_group_rows = 8192
 # min_paged_record_rows = 8192

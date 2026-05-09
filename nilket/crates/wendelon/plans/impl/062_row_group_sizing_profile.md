@@ -26,10 +26,9 @@ Inherits substrate:
 
 ## Status
 
-Council-converged across Claude / Codex / Gemini after five
-council iterations. Implementation phases pending; Phase 7
-warehouse-scale bench evidence is the promotion-to-shipped
-gate.
+Implemented and promoted to shipped. Bench evidence is recorded
+at `plans/impl/062_row_group_sizing_profile_bench_results.md`;
+the final `Scan` target is pinned at 65,536 rows.
 
 Implementation contract — council-converged:
 

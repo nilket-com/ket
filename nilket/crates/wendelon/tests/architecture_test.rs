@@ -3315,6 +3315,134 @@ fn test_adr056_row_group_fetch_guards() {
 }
 
 #[test]
+fn test_adr062_row_group_sizing_profile_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let row_group = fs::read_to_string(manifest_dir.join("src/storage/row_group.rs")).unwrap();
+	let multirow = fs::read_to_string(manifest_dir.join("src/storage/multirow.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
+	let adr056 = fs::read_to_string(
+		manifest_dir.join("plans/adr/056_row_group_fetch_and_page_directory.md"),
+	)
+	.unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/062_row_group_sizing_profile_bench_results.md"),
+	)
+	.unwrap();
+
+	let mut violations = Vec::new();
+
+	for required in [
+		"pub enum RowGroupSizingProfile {\n\tPointRead,\n\tScan,\n}",
+		"pub profile: RowGroupSizingProfile",
+		"sizing: RowGroupSizingValues",
+		"ROW_GROUP_POINT_READ_TARGET_ROWS: u32 = 4_096",
+		"ROW_GROUP_POINT_READ_MAX_ROWS: u32 = 8_192",
+		"ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS: u64 = 8_192",
+		"ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_BYTES: u64 = 512 * 1024",
+		"ROW_GROUP_SCAN_TARGET_ROWS: u32 = 65_536",
+		"ROW_GROUP_SCAN_MAX_ROWS: u32 = 131_072",
+		"ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS: u64 = 65_536",
+		"ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES: u64 = 1024 * 1024",
+		"pub fn target_row_group_rows(&self) -> RowGroupRowCount",
+		"pub fn max_row_group_rows(&self) -> RowGroupRowCount",
+		"pub fn min_paged_record_rows(&self) -> RowCount",
+		"pub fn min_paged_record_bytes(&self) -> RecordBodyByteLen",
+	] {
+		if !row_group.contains(required) {
+			violations.push(format!(
+				"src/storage/row_group.rs: missing ADR 062 token {required}"
+			));
+		}
+	}
+
+	for forbidden in [
+		"pub target_row_group_rows: RowGroupRowCount",
+		"pub max_row_group_rows: RowGroupRowCount",
+		"pub min_paged_record_rows: RowCount",
+		"pub min_paged_record_bytes: RecordBodyByteLen",
+	] {
+		if row_group.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/row_group.rs: ADR 062 profile-derived sizing field is public: {forbidden}"
+			));
+		}
+	}
+
+	for required in [
+		"profile: Option<String>",
+		"None | Some(\"point_read\") => RowGroupSizingProfile::PointRead",
+		"Some(\"scan\") => RowGroupSizingProfile::Scan",
+		"unknown storage.row_group_writer profile",
+		"apply_point_read_overrides(",
+		"tracing::warn!",
+		"profile = \\\"scan\\\"",
+	] {
+		if !config.contains(required) {
+			violations.push(format!("src/config.rs: missing ADR 062 token {required}"));
+		}
+	}
+
+	for required in [
+		"RowGroupSizingProfile",
+		"row_group_config.profile != RowGroupSizingProfile::Scan",
+		"row_group_config.target_row_group_rows().get()",
+	] {
+		if !multirow.contains(required) {
+			violations.push(format!(
+				"src/storage/multirow.rs: missing ADR 062 token {required}"
+			));
+		}
+	}
+
+	if !example.contains("profile = \"point_read\" # \"point_read\" (default) or \"scan\"") {
+		violations
+			.push("examples/wendelon.toml.example: missing ADR 062 profile example".to_string());
+	}
+
+	if !adr056.contains("ADR 062 row-group sizing profile is now implemented and") {
+		violations.push("plans/adr/056_row_group_fetch_and_page_directory.md: missing ADR 062 amendment reference".to_string());
+	}
+
+	for required in [
+		"ADR 062 Row-Group Sizing Profile Bench Results",
+		"scenario=adr062_writer_cost",
+		"scenario=adr062_scan_profile_directory",
+		"scenario=adr062_scan_boundary",
+		"writer-cost gate passes",
+		"ADR 062 is promoted with `Scan` target `65_536`",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/062_row_group_sizing_profile_bench_results.md: missing ADR 062 bench token {required}"
+			));
+		}
+	}
+
+	for forbidden in [
+		"choose_row_group_sizing_profile",
+		"RecordBodyCompressionPolicy::ScanProfile",
+		"L2FetchStrategy::ScanRowGroup",
+	] {
+		for (path, content) in [
+			("src/storage/row_group.rs", &row_group),
+			("src/storage/multirow.rs", &multirow),
+			("src/config.rs", &config),
+		] {
+			if content.contains(forbidden) {
+				violations.push(format!("{path}: forbidden ADR 062 token {forbidden}"));
+			}
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 062 row-group sizing profile invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
 fn test_adr057_encoding_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();

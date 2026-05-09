@@ -104,25 +104,23 @@ fn source_rows(row_count: usize) -> Vec<MultiRowSourceRow> {
 }
 
 fn row_group_config() -> RowGroupWriterConfig {
-	RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(12),
-		max_row_group_rows: RowGroupRowCount::new(12),
-		min_paged_record_rows: RowCount::new(8),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	}
+	RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(12),
+		RowGroupRowCount::new(12),
+		RowCount::new(8),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true)
 }
 
 fn large_row_group_config() -> RowGroupWriterConfig {
-	RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(1024),
-		max_row_group_rows: RowGroupRowCount::new(1024),
-		min_paged_record_rows: RowCount::new(8),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	}
+	RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(1024),
+		RowGroupRowCount::new(1024),
+		RowCount::new(8),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true)
 }
 
 fn encoding_config() -> EncodingWriterConfig {

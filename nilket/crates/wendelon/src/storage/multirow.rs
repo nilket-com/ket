@@ -24,8 +24,8 @@ use crate::storage::ipc::{
 	encode_record_batches_bytes, record_batch_compression_policy_from_ipc,
 };
 use crate::storage::row_group::{
-	ROW_GROUP_DIRECTORY_METADATA_KEY, RowGroupWriterConfig, build_page_directory_for_ipc_stream,
-	serialize_page_directory_value,
+	ROW_GROUP_DIRECTORY_METADATA_KEY, RowGroupSizingProfile, RowGroupWriterConfig,
+	build_page_directory_for_ipc_stream, serialize_page_directory_value,
 };
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
@@ -480,17 +480,32 @@ fn encode_storage_batch_with_optional_row_groups(
 	encoding_config: &EncodingWriterConfig,
 	chunk_layout_config: &L2ChunkLayoutConfig,
 ) -> std::io::Result<EncodedRecordBatch> {
-	let single = encode_record_batch(storage_batch, policy)?;
 	let Some(descriptor) = descriptor else {
-		return Ok(single);
+		return encode_record_batch(storage_batch, policy);
 	};
 	row_group_config.validate()?;
-	if !row_group_config.should_page(storage_batch.num_rows(), single.plaintext_byte_len) {
-		return Ok(single);
+	if !row_group_config.enabled
+		|| (storage_batch.num_rows() as u64) < row_group_config.min_paged_record_rows().get()
+	{
+		return encode_record_batch(storage_batch, policy);
 	}
+	let single = if row_group_config.profile == RowGroupSizingProfile::Scan {
+		if estimate_record_batch_data_bytes(storage_batch)
+			< row_group_config.min_paged_record_bytes().get()
+		{
+			return encode_record_batch(storage_batch, policy);
+		}
+		None
+	} else {
+		let single = encode_record_batch(storage_batch, policy)?;
+		if single.plaintext_byte_len < row_group_config.min_paged_record_bytes().get() {
+			return Ok(single);
+		}
+		Some(single)
+	};
 	let batches = split_row_group_batches(storage_batch, row_group_config)?;
-	if batches.len() <= 1 {
-		return Ok(single);
+	if batches.len() <= 1 && row_group_config.profile != RowGroupSizingProfile::Scan {
+		return Ok(single.expect("PointRead preflight encode must be present"));
 	}
 	encode_row_group_batches_with_directory(
 		&batches,
@@ -502,11 +517,19 @@ fn encode_storage_batch_with_optional_row_groups(
 	)
 }
 
+fn estimate_record_batch_data_bytes(storage_batch: &RecordBatch) -> u64 {
+	storage_batch
+		.columns()
+		.iter()
+		.map(|column| column.get_array_memory_size() as u64)
+		.sum()
+}
+
 fn split_row_group_batches(
 	storage_batch: &RecordBatch,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<Vec<RecordBatch>> {
-	let target = row_group_config.target_row_group_rows.get() as usize;
+	let target = row_group_config.target_row_group_rows().get() as usize;
 	let mut batches = Vec::new();
 	let mut offset = 0_usize;
 	while offset < storage_batch.num_rows() {
@@ -573,10 +596,10 @@ fn encode_row_group_batches_with_directory(
 							Some(compacted.encoding_directory),
 						)
 					}
-					None => (bytes.clone(), directory.clone(), None),
+					None => (bytes, directory, None),
 				}
 			} else {
-				(bytes.clone(), directory.clone(), None)
+				(bytes, directory, None)
 			};
 		let next_value = serialize_page_directory_value(&physical_directory)?;
 		let next_encoding_value = match physical_encoding_directory {

@@ -22,7 +22,7 @@ use crate::schema::ProtocolVersionWindow;
 use crate::storage::{
 	EncodedAggregateKind, EncodingCascadeKind, EncodingComputeConfig, EncodingComputeEvaluatorKind,
 	EncodingWriterConfig, L2ChunkLayoutConfig, L2ColumnFetchConfig, L2EncodingFetchConfig,
-	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupWriterConfig,
+	L2RowGroupFetchConfig, MvccRetentionPolicy, RowGroupSizingProfile, RowGroupWriterConfig,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -192,6 +192,8 @@ struct RawRowGroupWriterConfig {
 	#[serde(default)]
 	enabled: Option<bool>,
 	#[serde(default)]
+	profile: Option<String>,
+	#[serde(default)]
 	target_row_group_rows: Option<u32>,
 	#[serde(default)]
 	max_row_group_rows: Option<u32>,
@@ -203,21 +205,41 @@ struct RawRowGroupWriterConfig {
 
 impl RawRowGroupWriterConfig {
 	fn into_runtime_config(self) -> std::io::Result<RowGroupWriterConfig> {
-		let mut cfg = RowGroupWriterConfig::default();
+		let profile = match self.profile.as_deref() {
+			None | Some("point_read") => RowGroupSizingProfile::PointRead,
+			Some("scan") => RowGroupSizingProfile::Scan,
+			Some(profile) => {
+				return Err(Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"unknown storage.row_group_writer profile {profile:?}; expected \"point_read\" or \"scan\""
+					),
+				));
+			}
+		};
+		let mut cfg = RowGroupWriterConfig::with_profile(profile);
 		if let Some(enabled) = self.enabled {
 			cfg.enabled = enabled;
 		}
-		if let Some(rows) = self.target_row_group_rows {
-			cfg.target_row_group_rows = crate::schema::RowGroupRowCount::new(rows);
-		}
-		if let Some(rows) = self.max_row_group_rows {
-			cfg.max_row_group_rows = crate::schema::RowGroupRowCount::new(rows);
-		}
-		if let Some(rows) = self.min_paged_record_rows {
-			cfg.min_paged_record_rows = crate::schema::RowCount::new(rows);
-		}
-		if let Some(bytes) = self.min_paged_record_bytes {
-			cfg.min_paged_record_bytes = crate::schema::RecordBodyByteLen::try_new(bytes)?;
+		let has_numeric_override = self.target_row_group_rows.is_some()
+			|| self.max_row_group_rows.is_some()
+			|| self.min_paged_record_rows.is_some()
+			|| self.min_paged_record_bytes.is_some();
+		match profile {
+			RowGroupSizingProfile::PointRead if has_numeric_override => {
+				cfg.apply_point_read_overrides(
+					self.target_row_group_rows,
+					self.max_row_group_rows,
+					self.min_paged_record_rows,
+					self.min_paged_record_bytes,
+				)?;
+			}
+			RowGroupSizingProfile::Scan if has_numeric_override => {
+				tracing::warn!(
+					"storage.row_group_writer numeric sizing fields are PointRead-only and ignored when profile = \"scan\""
+				);
+			}
+			RowGroupSizingProfile::PointRead | RowGroupSizingProfile::Scan => {}
 		}
 		cfg.validate()?;
 		Ok(cfg)

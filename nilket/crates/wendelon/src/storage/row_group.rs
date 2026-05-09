@@ -40,10 +40,20 @@ pub const ROW_GROUP_DIRECTORY_METADATA_KEY: &str = "storage.row_group_directory"
 pub const ROW_GROUP_DIRECTORY_MAGIC: [u8; 8] = *b"WNDRGPD1";
 pub const ROW_GROUP_DIRECTORY_FORMAT_VERSION: u32 = 1;
 
-pub const ROW_GROUP_TARGET_ROWS_DEFAULT: u32 = 4_096;
-pub const ROW_GROUP_MAX_ROWS_DEFAULT: u32 = 8_192;
-pub const ROW_GROUP_MIN_PAGED_RECORD_ROWS_DEFAULT: u64 = 8_192;
-pub const ROW_GROUP_MIN_PAGED_RECORD_BYTES_DEFAULT: u64 = 512 * 1024;
+pub const ROW_GROUP_POINT_READ_TARGET_ROWS: u32 = 4_096;
+pub const ROW_GROUP_POINT_READ_MAX_ROWS: u32 = 8_192;
+pub const ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS: u64 = 8_192;
+pub const ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_BYTES: u64 = 512 * 1024;
+pub const ROW_GROUP_SCAN_TARGET_ROWS: u32 = 65_536;
+pub const ROW_GROUP_SCAN_MAX_ROWS: u32 = 131_072;
+pub const ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS: u64 = 65_536;
+pub const ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES: u64 = 1024 * 1024;
+
+pub const ROW_GROUP_TARGET_ROWS_DEFAULT: u32 = ROW_GROUP_POINT_READ_TARGET_ROWS;
+pub const ROW_GROUP_MAX_ROWS_DEFAULT: u32 = ROW_GROUP_POINT_READ_MAX_ROWS;
+pub const ROW_GROUP_MIN_PAGED_RECORD_ROWS_DEFAULT: u64 = ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS;
+pub const ROW_GROUP_MIN_PAGED_RECORD_BYTES_DEFAULT: u64 =
+	ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_BYTES;
 pub const L2_ROW_GROUP_FETCH_SELECTED_ROW_GROUP_FRACTION_MICROS_DEFAULT: u32 = 250_000;
 pub const L2_ROW_GROUP_FETCH_SELECTED_BYTE_FRACTION_MICROS_DEFAULT: u32 = 500_000;
 pub const L2_ROW_GROUP_FETCH_MAX_RANGES_PER_RECORD_DEFAULT: u32 = 16;
@@ -161,58 +171,177 @@ impl RowGroupFallbackReason {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowGroupSizingProfile {
+	PointRead,
+	Scan,
+}
+
+impl RowGroupSizingProfile {
+	pub const fn as_str(self) -> &'static str {
+		match self {
+			Self::PointRead => "point_read",
+			Self::Scan => "scan",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowGroupSizingValues {
+	target_row_group_rows: RowGroupRowCount,
+	max_row_group_rows: RowGroupRowCount,
+	min_paged_record_rows: RowCount,
+	min_paged_record_bytes: RecordBodyByteLen,
+}
+
+const fn point_read_row_group_sizing_values() -> RowGroupSizingValues {
+	RowGroupSizingValues {
+		target_row_group_rows: RowGroupRowCount::new(ROW_GROUP_POINT_READ_TARGET_ROWS),
+		max_row_group_rows: RowGroupRowCount::new(ROW_GROUP_POINT_READ_MAX_ROWS),
+		min_paged_record_rows: RowCount::new(ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS),
+		min_paged_record_bytes: RecordBodyByteLen::new(ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_BYTES),
+	}
+}
+
+const fn scan_row_group_sizing_values() -> RowGroupSizingValues {
+	RowGroupSizingValues {
+		target_row_group_rows: RowGroupRowCount::new(ROW_GROUP_SCAN_TARGET_ROWS),
+		max_row_group_rows: RowGroupRowCount::new(ROW_GROUP_SCAN_MAX_ROWS),
+		min_paged_record_rows: RowCount::new(ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS),
+		min_paged_record_bytes: RecordBodyByteLen::new(ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES),
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RowGroupWriterConfig {
 	pub enabled: bool,
-	pub target_row_group_rows: RowGroupRowCount,
-	pub max_row_group_rows: RowGroupRowCount,
-	pub min_paged_record_rows: RowCount,
-	pub min_paged_record_bytes: RecordBodyByteLen,
+	pub profile: RowGroupSizingProfile,
+	sizing: RowGroupSizingValues,
 	pub stats_supported_types: BTreeSet<DataType>,
 }
 
 impl Default for RowGroupWriterConfig {
 	fn default() -> Self {
-		Self {
-			enabled: false,
-			target_row_group_rows: RowGroupRowCount::new(ROW_GROUP_TARGET_ROWS_DEFAULT),
-			max_row_group_rows: RowGroupRowCount::new(ROW_GROUP_MAX_ROWS_DEFAULT),
-			min_paged_record_rows: RowCount::new(ROW_GROUP_MIN_PAGED_RECORD_ROWS_DEFAULT),
-			min_paged_record_bytes: RecordBodyByteLen::new(
-				ROW_GROUP_MIN_PAGED_RECORD_BYTES_DEFAULT,
-			),
-			stats_supported_types: default_stats_supported_types(),
-		}
+		Self::point_read()
 	}
 }
 
 impl RowGroupWriterConfig {
+	pub fn with_profile(profile: RowGroupSizingProfile) -> Self {
+		let sizing = match profile {
+			RowGroupSizingProfile::PointRead => point_read_row_group_sizing_values(),
+			RowGroupSizingProfile::Scan => scan_row_group_sizing_values(),
+		};
+		Self {
+			enabled: false,
+			profile,
+			sizing,
+			stats_supported_types: default_stats_supported_types(),
+		}
+	}
+
+	pub fn point_read() -> Self {
+		Self::with_profile(RowGroupSizingProfile::PointRead)
+	}
+
+	pub fn scan() -> Self {
+		Self::with_profile(RowGroupSizingProfile::Scan)
+	}
+
+	pub fn point_read_with_overrides(
+		target_row_group_rows: RowGroupRowCount,
+		max_row_group_rows: RowGroupRowCount,
+		min_paged_record_rows: RowCount,
+		min_paged_record_bytes: RecordBodyByteLen,
+	) -> Self {
+		Self {
+			enabled: false,
+			profile: RowGroupSizingProfile::PointRead,
+			sizing: RowGroupSizingValues {
+				target_row_group_rows,
+				max_row_group_rows,
+				min_paged_record_rows,
+				min_paged_record_bytes,
+			},
+			stats_supported_types: default_stats_supported_types(),
+		}
+	}
+
+	pub fn with_enabled(mut self, enabled: bool) -> Self {
+		self.enabled = enabled;
+		self
+	}
+
+	pub(crate) fn apply_point_read_overrides(
+		&mut self,
+		target_row_group_rows: Option<u32>,
+		max_row_group_rows: Option<u32>,
+		min_paged_record_rows: Option<u64>,
+		min_paged_record_bytes: Option<u64>,
+	) -> std::io::Result<()> {
+		if self.profile != RowGroupSizingProfile::PointRead {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"row group numeric overrides are only valid for the point_read profile",
+			));
+		}
+		if let Some(rows) = target_row_group_rows {
+			self.sizing.target_row_group_rows = RowGroupRowCount::new(rows);
+		}
+		if let Some(rows) = max_row_group_rows {
+			self.sizing.max_row_group_rows = RowGroupRowCount::new(rows);
+		}
+		if let Some(rows) = min_paged_record_rows {
+			self.sizing.min_paged_record_rows = RowCount::new(rows);
+		}
+		if let Some(bytes) = min_paged_record_bytes {
+			self.sizing.min_paged_record_bytes = RecordBodyByteLen::try_new(bytes)?;
+		}
+		Ok(())
+	}
+
+	pub fn target_row_group_rows(&self) -> RowGroupRowCount {
+		self.sizing.target_row_group_rows
+	}
+
+	pub fn max_row_group_rows(&self) -> RowGroupRowCount {
+		self.sizing.max_row_group_rows
+	}
+
+	pub fn min_paged_record_rows(&self) -> RowCount {
+		self.sizing.min_paged_record_rows
+	}
+
+	pub fn min_paged_record_bytes(&self) -> RecordBodyByteLen {
+		self.sizing.min_paged_record_bytes
+	}
+
 	pub fn validate(&self) -> std::io::Result<()> {
-		if self.target_row_group_rows.get() == 0 {
+		if self.target_row_group_rows().get() == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"row group target rows must be greater than zero",
 			));
 		}
-		if self.max_row_group_rows.get() == 0 {
+		if self.max_row_group_rows().get() == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"row group max rows must be greater than zero",
 			));
 		}
-		if self.max_row_group_rows < self.target_row_group_rows {
+		if self.max_row_group_rows() < self.target_row_group_rows() {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"row group max rows must not be below target rows",
 			));
 		}
-		if self.min_paged_record_rows.get() == 0 {
+		if self.min_paged_record_rows().get() == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"row group min paged record rows must be greater than zero",
 			));
 		}
-		if self.min_paged_record_bytes.get() == 0 {
+		if self.min_paged_record_bytes().get() == 0 {
 			return Err(Error::new(
 				ErrorKind::InvalidInput,
 				"row group min paged record bytes must be greater than zero",
@@ -223,8 +352,8 @@ impl RowGroupWriterConfig {
 
 	pub fn should_page(&self, row_count: usize, estimated_body_bytes: u64) -> bool {
 		self.enabled
-			&& row_count as u64 >= self.min_paged_record_rows.get()
-			&& estimated_body_bytes >= self.min_paged_record_bytes.get()
+			&& row_count as u64 >= self.min_paged_record_rows().get()
+			&& estimated_body_bytes >= self.min_paged_record_bytes().get()
 	}
 }
 

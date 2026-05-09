@@ -17749,11 +17749,9 @@ mod tests {
 				},
 			)
 			.collect::<Vec<_>>();
-		let writer_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			stats_supported_types: std::collections::BTreeSet::new(),
-			..Default::default()
-		};
+		let mut writer_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read().with_enabled(true);
+		writer_config.stats_supported_types = std::collections::BTreeSet::new();
 		let encoded =
 			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_config(
 				&batch,
@@ -18232,14 +18230,15 @@ mod tests {
 				}
 			})
 			.collect::<Vec<_>>();
-		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			min_paged_record_rows: RowCount::new(1024),
-			min_paged_record_bytes: RecordBodyByteLen::new(1),
-			stats_supported_types: std::collections::BTreeSet::new(),
-		};
+		let mut row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				crate::schema::RowGroupRowCount::new(1024),
+				crate::schema::RowGroupRowCount::new(1024),
+				RowCount::new(1024),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		row_group_config.stats_supported_types = std::collections::BTreeSet::new();
 		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
 			enabled: true,
 			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
@@ -18466,7 +18465,7 @@ mod tests {
 			),
 			"all-mask sparse decline should route to the dense projection range"
 		);
-		let all_expected = batch.slice(0, row_group_config.target_row_group_rows.get() as usize);
+		let all_expected = batch.slice(0, row_group_config.target_row_group_rows().get() as usize);
 		let all_expected = crate::schema::pbc::execute_program(&all_predicate, &all_expected)
 			.unwrap()
 			.project(&[2])
@@ -18580,14 +18579,15 @@ mod tests {
 				}
 			})
 			.collect::<Vec<_>>();
-		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			min_paged_record_rows: RowCount::new(1024),
-			min_paged_record_bytes: RecordBodyByteLen::new(1),
-			stats_supported_types: std::collections::BTreeSet::new(),
-		};
+		let mut row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				crate::schema::RowGroupRowCount::new(1024),
+				crate::schema::RowGroupRowCount::new(1024),
+				RowCount::new(1024),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		row_group_config.stats_supported_types = std::collections::BTreeSet::new();
 		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
 			enabled: true,
 			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
@@ -18769,14 +18769,15 @@ mod tests {
 				},
 			)
 			.collect::<Vec<_>>();
-		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			target_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			max_row_group_rows: crate::schema::RowGroupRowCount::new(1024),
-			min_paged_record_rows: RowCount::new(1024),
-			min_paged_record_bytes: RecordBodyByteLen::new(1),
-			stats_supported_types: std::collections::BTreeSet::new(),
-		};
+		let mut row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				crate::schema::RowGroupRowCount::new(1024),
+				crate::schema::RowGroupRowCount::new(1024),
+				RowCount::new(1024),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		row_group_config.stats_supported_types = std::collections::BTreeSet::new();
 		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
 			enabled: true,
 			target_simd_page_values: crate::schema::SimdPageValueCount::new(256),
@@ -19030,14 +19031,14 @@ mod tests {
 				retention_lag_seconds: 0,
 			})
 			.collect::<Vec<_>>();
-		let writer_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			target_row_group_rows: RowGroupRowCount::new(4),
-			max_row_group_rows: RowGroupRowCount::new(4),
-			min_paged_record_rows: RowCount::new(8),
-			min_paged_record_bytes: RecordBodyByteLen::new(1),
-			..Default::default()
-		};
+		let writer_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				RowGroupRowCount::new(4),
+				RowGroupRowCount::new(4),
+				RowCount::new(8),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
 		let compacted = compact_physical_record_frame(
 			&old.frame,
 			&records,

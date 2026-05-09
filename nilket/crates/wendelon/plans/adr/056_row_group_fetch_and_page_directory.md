@@ -67,6 +67,20 @@ reduction plus wall-clock improvement, with
 ciphertext ratios recorded as evidence for a future
 page-aligned authenticated chunk-layout ADR.
 
+ADR 062 row-group sizing profile is now implemented and
+promoted as an ADR 056 amendment. `RowGroupSizingProfile`
+is a closed two-variant catalog: `PointRead` preserves
+the ADR 056 V1 defaults byte-identically, while `Scan`
+pins `target_row_group_rows = 65_536`,
+`max_row_group_rows = 131_072`,
+`min_paged_record_rows = 65_536`, and
+`min_paged_record_bytes = 1 MiB` for warehouse scan
+deployments. The amendment does not change the page
+directory substrate, fetch planner, reject taxonomy,
+descriptor / wire / capability surfaces, or `ObjectStore`
+trait. Bench evidence is recorded at
+`plans/impl/062_row_group_sizing_profile_bench_results.md`.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-record `RecordPageDirectory`

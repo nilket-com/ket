@@ -12,8 +12,9 @@ use wendelon::schema::{
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
-	PlaintextByteRange, RowGroupWriterConfig, TieredRecordId, decode_batch,
-	encode_multirow_from_survivors_with_row_group_config, parse_record_buffer_directory,
+	PlaintextByteRange, ROW_GROUP_SCAN_TARGET_ROWS, RowGroupWriterConfig, TieredRecordId,
+	decode_batch, encode_multirow_from_survivors_with_row_group_config,
+	parse_record_buffer_directory,
 };
 
 fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
@@ -68,14 +69,13 @@ fn source_rows(row_count: usize) -> Vec<MultiRowSourceRow> {
 }
 
 fn row_group_config(enabled: bool) -> RowGroupWriterConfig {
-	RowGroupWriterConfig {
-		enabled,
-		target_row_group_rows: RowGroupRowCount::new(4),
-		max_row_group_rows: RowGroupRowCount::new(4),
-		min_paged_record_rows: RowCount::new(8),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	}
+	RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(4),
+		RowGroupRowCount::new(4),
+		RowCount::new(8),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(enabled)
 }
 
 #[test]
@@ -147,4 +147,90 @@ fn large_multirow_record_emits_multiple_batches_and_directory() {
 	assert!(!page_directory.buffer_pages.is_empty());
 	assert!(!page_directory.row_group_stats.is_empty());
 	assert_eq!(decode_batch(&encoded.frame).unwrap().num_rows(), 10);
+}
+
+#[test]
+fn scan_profile_emits_one_entry_directory_at_exact_target() {
+	let row_count = ROW_GROUP_SCAN_TARGET_ROWS as usize;
+	let batch = batch(row_count);
+	let descriptor = descriptor(batch.schema().as_ref());
+	let row_group_config = RowGroupWriterConfig::scan().with_enabled(true);
+	let encoded = encode_multirow_from_survivors_with_row_group_config(
+		&batch,
+		&source_rows(row_count),
+		&descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+	)
+	.unwrap();
+	let reader = StreamReader::try_new(Cursor::new(&encoded.frame), None).unwrap();
+	let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+	let parsed = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(56),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		PlaintextByteRange {
+			start: 0,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&descriptor,
+	)
+	.unwrap();
+	let page_directory = parsed.page_directory.expect("scan row-group directory");
+
+	assert_eq!(batches.len(), 1);
+	assert_eq!(page_directory.row_groups.len(), 1);
+	assert_eq!(
+		page_directory.row_groups[0].row_count.get(),
+		ROW_GROUP_SCAN_TARGET_ROWS
+	);
+	assert_eq!(
+		page_directory.row_count.get(),
+		ROW_GROUP_SCAN_TARGET_ROWS as u64
+	);
+}
+
+#[test]
+fn scan_profile_target_plus_one_keeps_tail_as_second_directory_entry() {
+	let row_count = ROW_GROUP_SCAN_TARGET_ROWS as usize + 1;
+	let batch = batch(row_count);
+	let descriptor = descriptor(batch.schema().as_ref());
+	let row_group_config = RowGroupWriterConfig::scan().with_enabled(true);
+	let encoded = encode_multirow_from_survivors_with_row_group_config(
+		&batch,
+		&source_rows(row_count),
+		&descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+	)
+	.unwrap();
+	let reader = StreamReader::try_new(Cursor::new(&encoded.frame), None).unwrap();
+	let batches = reader.collect::<Result<Vec<_>, _>>().unwrap();
+	let parsed = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(56),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		PlaintextByteRange {
+			start: 0,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&descriptor,
+	)
+	.unwrap();
+	let page_directory = parsed.page_directory.expect("scan row-group directory");
+
+	assert_eq!(batches.len(), 2);
+	assert_eq!(batches[0].num_rows(), ROW_GROUP_SCAN_TARGET_ROWS as usize);
+	assert_eq!(batches[1].num_rows(), 1);
+	assert_eq!(page_directory.row_groups.len(), 2);
+	assert_eq!(
+		page_directory.row_groups[0].row_count.get(),
+		ROW_GROUP_SCAN_TARGET_ROWS
+	);
+	assert_eq!(page_directory.row_groups[1].row_count.get(), 1);
+	assert_eq!(page_directory.row_count.get(), row_count as u64);
 }

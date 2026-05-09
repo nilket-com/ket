@@ -34,9 +34,11 @@ use wendelon::schema::{
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
 	ColumnFetchRequirement, ColumnOrdinalSet, EncodingPageDescriptor, PhaseBOutcome,
-	PlaintextByteRange, RecordBufferDirectory, RowGroupWriterConfig, TieredRecordId,
-	apply_phase_b_masks_to_projected_row_groups, build_page_directory_for_ipc_stream,
-	decode_projected_row_groups_from_plaintext_ranges, default_stats_supported_types,
+	PlaintextByteRange, ROW_GROUP_POINT_READ_TARGET_ROWS, ROW_GROUP_SCAN_MAX_ROWS,
+	ROW_GROUP_SCAN_TARGET_ROWS, RecordBufferDirectory, RowGroupSizingProfile, RowGroupWriterConfig,
+	TieredRecordId, apply_phase_b_masks_to_projected_row_groups,
+	build_page_directory_for_ipc_stream, decode_projected_row_groups_from_plaintext_ranges,
+	default_stats_supported_types,
 	encode_multirow_from_survivors_with_row_group_and_encoding_config,
 	encode_multirow_from_survivors_with_row_group_config, encode_record_batches_bytes,
 	parse_record_buffer_directory, project_record_batch_for_requirement, row_group_stats_for_batch,
@@ -78,6 +80,7 @@ fn main() -> std::io::Result<()> {
 	bench_sparse_projection_runtime_point_read(&config)?;
 	bench_sparse_projection_runtime_determinism(&config)?;
 	bench_adr061_chunk_layout_matrix(&config)?;
+	bench_adr062_row_group_sizing_profile_matrix(&config)?;
 	Ok(())
 }
 
@@ -420,18 +423,49 @@ fn row_group_config_for(
 	target_row_group_rows: u32,
 	stats_enabled: bool,
 ) -> RowGroupWriterConfig {
+	let defaults = RowGroupWriterConfig::point_read();
+	row_group_config_for_values(
+		enabled,
+		target_row_group_rows,
+		defaults.min_paged_record_rows(),
+		defaults.min_paged_record_bytes(),
+		stats_enabled,
+	)
+}
+
+fn row_group_config_for_values(
+	enabled: bool,
+	target_row_group_rows: u32,
+	min_paged_record_rows: RowCount,
+	min_paged_record_bytes: RecordBodyByteLen,
+	stats_enabled: bool,
+) -> RowGroupWriterConfig {
 	let stats_supported_types = if stats_enabled {
 		default_stats_supported_types()
 	} else {
 		Default::default()
 	};
-	RowGroupWriterConfig {
-		enabled,
-		target_row_group_rows: RowGroupRowCount::new(target_row_group_rows),
-		max_row_group_rows: RowGroupRowCount::new(target_row_group_rows),
-		stats_supported_types,
-		..RowGroupWriterConfig::default()
+	let mut config = RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(target_row_group_rows),
+		RowGroupRowCount::new(target_row_group_rows),
+		min_paged_record_rows,
+		min_paged_record_bytes,
+	)
+	.with_enabled(enabled);
+	config.stats_supported_types = stats_supported_types;
+	config
+}
+
+fn row_group_profile_config_for(
+	profile: RowGroupSizingProfile,
+	enabled: bool,
+	stats_enabled: bool,
+) -> RowGroupWriterConfig {
+	let mut config = RowGroupWriterConfig::with_profile(profile).with_enabled(enabled);
+	if !stats_enabled {
+		config.stats_supported_types = BTreeSet::new();
 	}
+	config
 }
 
 fn forced_row_group_config_for(
@@ -439,11 +473,13 @@ fn forced_row_group_config_for(
 	target_row_group_rows: u32,
 	stats_enabled: bool,
 ) -> RowGroupWriterConfig {
-	RowGroupWriterConfig {
-		min_paged_record_rows: RowCount::new(4_096),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..row_group_config_for(enabled, target_row_group_rows, stats_enabled)
-	}
+	row_group_config_for_values(
+		enabled,
+		target_row_group_rows,
+		RowCount::new(4_096),
+		RecordBodyByteLen::new(1),
+		stats_enabled,
+	)
 }
 
 fn bench_writer(
@@ -1085,14 +1121,14 @@ fn sparse_projection_encoded_fixture(
 	let batch = sparse_projection_bench_batch(rows, cascade)?;
 	let descriptor = sparse_projection_descriptor(batch.schema().as_ref())?;
 	let row_group_rows = 1_024.min(rows);
-	let row_group_config = RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(1_024),
-		max_row_group_rows: RowGroupRowCount::new(1_024),
-		min_paged_record_rows: RowCount::new(1_024),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		stats_supported_types: BTreeSet::new(),
-	};
+	let mut row_group_config = RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(1_024),
+		RowGroupRowCount::new(1_024),
+		RowCount::new(1_024),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true);
+	row_group_config.stats_supported_types = BTreeSet::new();
 	let encoding_config = EncodingWriterConfig {
 		enabled: true,
 		target_simd_page_values: wendelon::schema::SimdPageValueCount::new(256),
@@ -1278,14 +1314,14 @@ fn sparse_projection_runtime_fixture_at(
 	let batch = sparse_projection_runtime_batch(rows, cascade, projection_columns)?;
 	let descriptor = sparse_projection_descriptor(batch.schema().as_ref())?;
 	let row_group_rows = 1_024.min(rows);
-	let row_group_config = RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(1_024),
-		max_row_group_rows: RowGroupRowCount::new(1_024),
-		min_paged_record_rows: RowCount::new(1_024),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		stats_supported_types: BTreeSet::new(),
-	};
+	let mut row_group_config = RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(1_024),
+		RowGroupRowCount::new(1_024),
+		RowCount::new(1_024),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true);
+	row_group_config.stats_supported_types = BTreeSet::new();
 	let encoding_config = EncodingWriterConfig {
 		enabled: true,
 		target_simd_page_values: wendelon::schema::SimdPageValueCount::new(256),
@@ -3073,6 +3109,419 @@ fn bench_sparse_projection_planner(config: &BenchConfig) -> std::io::Result<()> 
 fn bench_adr061_chunk_layout_matrix(config: &BenchConfig) -> std::io::Result<()> {
 	bench_adr061_macro_block_runtime(config)?;
 	bench_adr061_warehouse_model();
+	Ok(())
+}
+
+fn bench_adr062_row_group_sizing_profile_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	bench_adr062_candidate_sweep();
+	bench_adr062_scan_profile_actual(config)?;
+	bench_adr062_scan_scale_model();
+	bench_adr062_sparse_projection_model();
+	bench_adr062_stats_prune_model();
+	bench_adr062_compression_loss(config)?;
+	bench_adr062_cross_replica_determinism()?;
+	Ok(())
+}
+
+fn adr062_schema_cases() -> [BenchCase; 4] {
+	[
+		BenchCase {
+			rows: 8_192,
+			columns: 50,
+			shape: BenchDataShape::Int64,
+		},
+		BenchCase {
+			rows: 16_384,
+			columns: 50,
+			shape: BenchDataShape::Int64,
+		},
+		BenchCase {
+			rows: ROW_GROUP_SCAN_TARGET_ROWS as usize,
+			columns: 4,
+			shape: BenchDataShape::Int64,
+		},
+		BenchCase {
+			rows: ROW_GROUP_SCAN_TARGET_ROWS as usize,
+			columns: 4,
+			shape: BenchDataShape::Mixed,
+		},
+	]
+}
+
+fn model_record_body_bytes(case: BenchCase) -> u64 {
+	let bytes_per_row = match case.shape {
+		BenchDataShape::Int64 | BenchDataShape::Float64 => case.columns as u64 * 8,
+		BenchDataShape::Utf8 => case.columns as u64 * 24,
+		BenchDataShape::Mixed => (0..case.columns)
+			.map(|column| match column % 4 {
+				0 | 1 => 8_u64,
+				2 => 24_u64,
+				_ => 1_u64,
+			})
+			.sum(),
+	};
+	case.rows as u64 * bytes_per_row
+}
+
+fn bench_adr062_candidate_sweep() {
+	for case in adr062_schema_cases() {
+		let record_bytes = model_record_body_bytes(case);
+		for target in [4_096_usize, 8_192, 16_384, 32_768, 65_536, 131_072] {
+			let row_groups = if case.rows >= target && record_bytes >= 1024 * 1024 {
+				case.rows.div_ceil(target)
+			} else {
+				0
+			};
+			let row_group_plaintext_bytes = if row_groups == 0 {
+				0
+			} else {
+				record_bytes.div_ceil(row_groups as u64)
+			};
+			println!(
+				"row_group_fetch_measure scenario=adr062_scan_target_candidate profile=scan_candidate rows={} columns={} shape={} target_row_group_rows={} max_row_group_rows={} min_paged_record_rows={} record_bytes={} row_groups={} row_group_plaintext_bytes={} exact_one_entry_candidate={}",
+				case.rows,
+				case.columns,
+				case.shape.as_str(),
+				target,
+				target * 2,
+				target,
+				record_bytes,
+				row_groups,
+				row_group_plaintext_bytes,
+				row_groups == 1 && case.rows == target
+			);
+		}
+	}
+}
+
+fn bench_adr062_scan_profile_actual(config: &BenchConfig) -> std::io::Result<()> {
+	let case = BenchCase {
+		rows: ROW_GROUP_SCAN_TARGET_ROWS as usize,
+		columns: 4,
+		shape: BenchDataShape::Int64,
+	};
+	let batch = bench_batch(case.rows, case.columns, case.shape)?;
+	let table_descriptor = descriptor(batch.schema().as_ref(), case.columns)?;
+	let source_rows = source_rows(case.rows);
+	let disabled = row_group_profile_config_for(RowGroupSizingProfile::PointRead, false, false);
+	let scan = row_group_profile_config_for(RowGroupSizingProfile::Scan, true, true);
+	let point_read = row_group_profile_config_for(RowGroupSizingProfile::PointRead, true, true);
+
+	for (profile, row_group_config) in [
+		("disabled", &disabled),
+		("point_read", &point_read),
+		("scan", &scan),
+	] {
+		let elapsed = bench(config.iterations, || {
+			let encoded = encode_multirow_from_survivors_with_row_group_config(
+				black_box(&batch),
+				black_box(&source_rows),
+				black_box(&table_descriptor),
+				RecordBodyCompressionPolicy::Uncompressed,
+				black_box(row_group_config),
+			)
+			.expect("ADR 062 writer-cost encode");
+			black_box(encoded.frame.len());
+		});
+		let micros_per_op = elapsed.as_secs_f64() * 1_000_000.0 / config.iterations as f64;
+		let fixture = encoded_fixture(
+			case.rows,
+			&batch,
+			&table_descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			row_group_config,
+		)?;
+		let row_groups = fixture
+			.directory
+			.page_directory
+			.as_ref()
+			.map(|directory| directory.row_groups.len())
+			.unwrap_or(0);
+		println!(
+			"row_group_fetch_bench scenario=adr062_writer_cost profile={} rows={} columns={} shape={} row_groups={} iterations={} total_ms={:.3} micros_per_op={:.3}",
+			profile,
+			case.rows,
+			case.columns,
+			case.shape.as_str(),
+			row_groups,
+			config.iterations,
+			elapsed.as_secs_f64() * 1_000.0,
+			micros_per_op,
+		);
+	}
+
+	let fixture = encoded_fixture(
+		case.rows,
+		&batch,
+		&table_descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&scan,
+	)?;
+	let page_directory = fixture
+		.directory
+		.page_directory
+		.as_ref()
+		.expect("Scan profile should emit one-entry page directory");
+	let row_group_plaintext_lengths = page_directory
+		.row_groups
+		.iter()
+		.map(|entry| entry.body_range.len.get())
+		.collect::<Vec<_>>();
+	let p50_plaintext = percentile_u64(row_group_plaintext_lengths.clone(), 50);
+	let p95_plaintext = percentile_u64(row_group_plaintext_lengths, 95);
+	let dense_p50_get_bytes = chunk_floor_fetch_bytes(p50_plaintext as usize, 16 * 1024);
+	let dense_p95_get_bytes = chunk_floor_fetch_bytes(p95_plaintext as usize, 16 * 1024);
+	println!(
+		"row_group_fetch_measure scenario=adr062_scan_profile_directory profile=scan rows={} columns={} shape={} target_row_group_rows={} max_row_group_rows={} row_groups={} buffer_pages={} stats={} record_bytes={} plaintext_bytes={} directory_value_bytes={} directory_fraction_micros={} dense_p50_get_bytes={} dense_p95_get_bytes={}",
+		case.rows,
+		case.columns,
+		case.shape.as_str(),
+		ROW_GROUP_SCAN_TARGET_ROWS,
+		ROW_GROUP_SCAN_MAX_ROWS,
+		page_directory.row_groups.len(),
+		page_directory.buffer_pages.len(),
+		page_directory.row_group_stats.len(),
+		fixture.encoded_bytes,
+		fixture.plaintext_bytes,
+		fixture.directory_value_bytes,
+		fraction_micros(
+			fixture.directory_value_bytes as u64,
+			fixture.encoded_bytes.max(1)
+		),
+		dense_p50_get_bytes,
+		dense_p95_get_bytes,
+	);
+
+	let requirement = ColumnFetchRequirement {
+		output_columns: ColumnOrdinalSet::from_columns([0]),
+		..ColumnFetchRequirement::default()
+	};
+	let selected_groups = vec![RowGroupIndex::new(0)];
+	let ranges = selected_row_group_record_body_ranges(
+		&fixture.directory,
+		page_directory,
+		&requirement,
+		&selected_groups,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 062 selected bytes: {err}"),
+		)
+	})?;
+	let selected_bytes = ranges.iter().map(|range| range.len.get()).sum::<u64>();
+	println!(
+		"row_group_fetch_measure scenario=adr062_secondary_index_point_read_selected_bytes profile=scan rows={} columns={} shape={} selected_groups=1 total_groups={} selected_ranges={} selected_bytes={} record_bytes={} selected_fraction_micros={}",
+		case.rows,
+		case.columns,
+		case.shape.as_str(),
+		page_directory.row_groups.len(),
+		ranges.len(),
+		selected_bytes,
+		fixture.encoded_bytes,
+		fraction_micros(selected_bytes, fixture.encoded_bytes.max(1)),
+	);
+
+	for rows in [
+		ROW_GROUP_POINT_READ_TARGET_ROWS as usize,
+		(ROW_GROUP_SCAN_TARGET_ROWS - 1) as usize,
+		ROW_GROUP_SCAN_TARGET_ROWS as usize,
+		(ROW_GROUP_SCAN_TARGET_ROWS + 1) as usize,
+	] {
+		let boundary_case = BenchCase {
+			rows,
+			columns: 4,
+			shape: BenchDataShape::Int64,
+		};
+		let boundary_batch = bench_batch(rows, boundary_case.columns, boundary_case.shape)?;
+		let boundary_descriptor =
+			descriptor(boundary_batch.schema().as_ref(), boundary_case.columns)?;
+		let boundary_fixture = encoded_fixture(
+			rows,
+			&boundary_batch,
+			&boundary_descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&scan,
+		)?;
+		let row_groups = boundary_fixture
+			.directory
+			.page_directory
+			.as_ref()
+			.map(|directory| directory.row_groups.len())
+			.unwrap_or(0);
+		println!(
+			"row_group_fetch_measure scenario=adr062_scan_boundary profile=scan rows={} columns={} shape={} target_row_group_rows={} row_groups={} directory_present={} record_bytes={} directory_value_bytes={}",
+			rows,
+			boundary_case.columns,
+			boundary_case.shape.as_str(),
+			ROW_GROUP_SCAN_TARGET_ROWS,
+			row_groups,
+			boundary_fixture.directory.page_directory.is_some(),
+			boundary_fixture.encoded_bytes,
+			boundary_fixture.directory_value_bytes,
+		);
+	}
+	Ok(())
+}
+
+fn bench_adr062_scan_scale_model() {
+	const RECORD_BYTES: usize = 4 * 1024 * 1024;
+	for rows in [16_777_216_usize, 100_000_000] {
+		let records = rows.div_ceil(ROW_GROUP_SCAN_TARGET_ROWS as usize);
+		for chunk_size in SLAB_ENCRYPTION_CHUNK_SIZES {
+			let dense_get_bytes = chunk_floor_fetch_bytes(RECORD_BYTES, chunk_size);
+			println!(
+				"row_group_fetch_measure scenario=adr062_scan_scale_model profile=scan rows={} records={} row_group_rows={} record_bytes={} chunk_size={} dense_get_ranges=1 dense_p50_get_bytes={} dense_p95_get_bytes={} get_count_regression_micros=1000000",
+				rows,
+				records,
+				ROW_GROUP_SCAN_TARGET_ROWS,
+				RECORD_BYTES,
+				chunk_size,
+				dense_get_bytes,
+				dense_get_bytes,
+			);
+		}
+	}
+}
+
+fn bench_adr062_sparse_projection_model() {
+	const RECORD_BYTES: usize = 4 * 1024 * 1024;
+	const SELECTED_PAGE_BYTES: usize = 4 * 1024;
+	const BASELINE_CHUNK_BYTES: usize = 64 * 1024;
+	for selectivity in [1_u64, 5] {
+		let selected_pages = selectivity;
+		let baseline_sparse_ciphertext =
+			selected_pages * chunk_floor_fetch_bytes(SELECTED_PAGE_BYTES, BASELINE_CHUNK_BYTES);
+		let scan_sparse_ciphertext =
+			selected_pages * chunk_floor_fetch_bytes(SELECTED_PAGE_BYTES, 16 * 1024);
+		println!(
+			"row_group_fetch_measure scenario=adr062_sparse_projection_model profile=scan rows={} row_group_rows={} record_bytes={} mask_shape=clustered_{}p route=sparse chunk_size=16384 scan_sparse_ciphertext_bytes={} baseline_64k_sparse_ciphertext_bytes={} sparse_reduction_micros={} wall_clock_regression_micros=1000000",
+			ROW_GROUP_SCAN_TARGET_ROWS,
+			ROW_GROUP_SCAN_TARGET_ROWS,
+			RECORD_BYTES,
+			selectivity,
+			scan_sparse_ciphertext,
+			baseline_sparse_ciphertext,
+			fraction_micros(baseline_sparse_ciphertext, scan_sparse_ciphertext),
+		);
+	}
+}
+
+fn bench_adr062_stats_prune_model() {
+	let point_read_groups = (ROW_GROUP_SCAN_TARGET_ROWS / ROW_GROUP_POINT_READ_TARGET_ROWS) as u64;
+	for (predicate, point_read_survivors, scan_survivors) in [
+		("clustered_broad_75p", point_read_groups * 3 / 4, 1_u64),
+		("sorted_broad_75p", point_read_groups * 3 / 4, 1_u64),
+		("random_uniform_recorded", point_read_groups, 1_u64),
+	] {
+		let point_read_survival_micros = fraction_micros(point_read_survivors, point_read_groups);
+		let scan_survival_micros = fraction_micros(scan_survivors, 1);
+		println!(
+			"row_group_fetch_measure scenario=adr062_stats_prune_model predicate={} point_read_groups={} point_read_survivors={} point_read_survival_micros={} scan_groups=1 scan_survivors={} scan_survival_micros={} scan_vs_point_read_survival_ratio_micros={}",
+			predicate,
+			point_read_groups,
+			point_read_survivors,
+			point_read_survival_micros,
+			scan_survivors,
+			scan_survival_micros,
+			fraction_micros(scan_survival_micros, point_read_survival_micros),
+		);
+	}
+}
+
+fn bench_adr062_compression_loss(config: &BenchConfig) -> std::io::Result<()> {
+	for shape in [
+		BenchDataShape::Int64,
+		BenchDataShape::Float64,
+		BenchDataShape::Utf8,
+		BenchDataShape::Mixed,
+	] {
+		let case = BenchCase {
+			rows: ROW_GROUP_SCAN_TARGET_ROWS as usize,
+			columns: 4,
+			shape,
+		};
+		let batch = bench_batch(case.rows, case.columns, case.shape)?;
+		let descriptor = descriptor(batch.schema().as_ref(), case.columns)?;
+		let disabled = row_group_profile_config_for(RowGroupSizingProfile::PointRead, false, false);
+		let scan = row_group_profile_config_for(RowGroupSizingProfile::Scan, true, true);
+		let single = encode_multirow_from_survivors_with_row_group_config(
+			&batch,
+			&source_rows(case.rows),
+			&descriptor,
+			RecordBodyCompressionPolicy::Lz4Frame,
+			&disabled,
+		)?;
+		let row_group = encode_multirow_from_survivors_with_row_group_config(
+			&batch,
+			&source_rows(case.rows),
+			&descriptor,
+			RecordBodyCompressionPolicy::Lz4Frame,
+			&scan,
+		)?;
+		let loss_micros = if single.encoded_byte_len == 0 {
+			0
+		} else {
+			((row_group.encoded_byte_len as i128 - single.encoded_byte_len as i128) * 1_000_000
+				/ single.encoded_byte_len as i128) as i64
+		};
+		println!(
+			"row_group_fetch_measure scenario=adr062_scan_compression_loss profile=scan rows={} columns={} shape={} iterations={} single_lz4_bytes={} scan_lz4_bytes={} single_plaintext_bytes={} scan_plaintext_bytes={} scan_loss_micros={}",
+			case.rows,
+			case.columns,
+			case.shape.as_str(),
+			config.iterations,
+			single.encoded_byte_len,
+			row_group.encoded_byte_len,
+			single.plaintext_byte_len,
+			row_group.plaintext_byte_len,
+			loss_micros,
+		);
+	}
+	Ok(())
+}
+
+fn bench_adr062_cross_replica_determinism() -> std::io::Result<()> {
+	let case = BenchCase {
+		rows: ROW_GROUP_SCAN_TARGET_ROWS as usize,
+		columns: 4,
+		shape: BenchDataShape::Int64,
+	};
+	let batch = bench_batch(case.rows, case.columns, case.shape)?;
+	let descriptor = descriptor(batch.schema().as_ref(), case.columns)?;
+	let rows = source_rows(case.rows);
+	for profile in [
+		RowGroupSizingProfile::PointRead,
+		RowGroupSizingProfile::Scan,
+	] {
+		let config = row_group_profile_config_for(profile, true, true);
+		let left = encode_multirow_from_survivors_with_row_group_config(
+			&batch,
+			&rows,
+			&descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&config,
+		)?;
+		let right = encode_multirow_from_survivors_with_row_group_config(
+			&batch,
+			&rows,
+			&descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&config,
+		)?;
+		let equal = left.frame == right.frame;
+		let digest = blake3::hash(&left.frame).to_hex().to_string();
+		println!(
+			"row_group_fetch_measure scenario=adr062_cross_replica_determinism profile={} rows={} columns={} shape={} byte_equal={} digest={} bytes={}",
+			profile.as_str(),
+			case.rows,
+			case.columns,
+			case.shape.as_str(),
+			equal,
+			digest,
+			left.frame.len(),
+		);
+	}
 	Ok(())
 }
 

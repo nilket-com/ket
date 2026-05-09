@@ -69,14 +69,13 @@ fn source_rows(row_count: usize) -> Vec<MultiRowSourceRow> {
 }
 
 fn row_group_config() -> RowGroupWriterConfig {
-	RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(4),
-		max_row_group_rows: RowGroupRowCount::new(4),
-		min_paged_record_rows: RowCount::new(8),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	}
+	RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(4),
+		RowGroupRowCount::new(4),
+		RowCount::new(8),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true)
 }
 
 fn parsed_directory() -> RecordBufferDirectory {

@@ -72,14 +72,13 @@ fn fixture_directory() -> wendelon::storage::RecordPageDirectory {
 			table_object_id: Some(TableObjectId::new([0x57; 16])),
 		})
 		.collect::<Vec<_>>();
-	let writer_config = RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(4),
-		max_row_group_rows: RowGroupRowCount::new(4),
-		min_paged_record_rows: RowCount::new(8),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	};
+	let writer_config = RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(4),
+		RowGroupRowCount::new(4),
+		RowCount::new(8),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true);
 	let descriptor = descriptor();
 	let encoded = encode_multirow_from_survivors_with_row_group_config(
 		&batch,

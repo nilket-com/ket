@@ -1513,14 +1513,13 @@ fn build_pipeline_fixture_shape(
 			table_object_id: Some(TableObjectId::new([0x58; 16])),
 		})
 		.collect();
-	let row_group_config = RowGroupWriterConfig {
-		enabled: true,
-		target_row_group_rows: RowGroupRowCount::new(1024),
-		max_row_group_rows: RowGroupRowCount::new(1024),
-		min_paged_record_rows: RowCount::new(1024),
-		min_paged_record_bytes: RecordBodyByteLen::new(1),
-		..RowGroupWriterConfig::default()
-	};
+	let row_group_config = RowGroupWriterConfig::point_read_with_overrides(
+		RowGroupRowCount::new(1024),
+		RowGroupRowCount::new(1024),
+		RowCount::new(1024),
+		RecordBodyByteLen::new(1),
+	)
+	.with_enabled(true);
 	let encoding_config = EncodingWriterConfig {
 		enabled: true,
 		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),

@@ -9,6 +9,10 @@ use wendelon::network::{
 	transfer_verifying_key_bytes,
 };
 use wendelon::node::{ClusterBootstrapConfig, WendelonNode};
+use wendelon::storage::{
+	ROW_GROUP_SCAN_MAX_ROWS, ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES,
+	ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS, ROW_GROUP_SCAN_TARGET_ROWS, RowGroupSizingProfile,
+};
 
 fn fresh_dir(tag: &str) -> PathBuf {
 	let dir = std::env::temp_dir().join(format!(
@@ -39,6 +43,48 @@ fn write_config(dir: &Path, body: &str) -> PathBuf {
 	let path = dir.join("wendelon.toml");
 	std::fs::write(&path, body).unwrap();
 	path
+}
+
+fn write_config_with_row_group_writer(
+	root: &Path,
+	node_id: u32,
+	row_group_writer: &str,
+) -> PathBuf {
+	std::fs::create_dir_all(root.join("data")).unwrap();
+	let lease_secret = dev_lease_signing_secret(node_id);
+	let transfer_secret = dev_transfer_signing_secret(node_id);
+	write_config(
+		root,
+		&format!(
+			r#"
+[node]
+node_id = {node_id}
+advertise_address = "127.0.0.1:4715"
+
+[storage]
+data_dir = "data"
+
+[storage.row_group_writer]
+{row_group_writer}
+
+[identity]
+lease_signing_secret = "{lease_secret}"
+transfer_signing_secret = "{transfer_secret}"
+
+[identity.trusted_lease_signers]
+"{node_id}" = "{lease_vk}"
+
+[identity.trusted_transfer_signers]
+"{node_id}" = "{transfer_vk}"
+"#,
+			node_id = node_id,
+			row_group_writer = row_group_writer,
+			lease_secret = hex(lease_secret),
+			transfer_secret = hex(transfer_secret),
+			lease_vk = hex(lease_verifying_key_bytes(lease_secret)),
+			transfer_vk = hex(transfer_verifying_key_bytes(transfer_secret)),
+		),
+	)
 }
 
 #[test]
@@ -232,10 +278,14 @@ transfer_signing_secret = "{transfer_secret}"
 
 	let cfg = load_node_bootstrap_config(&config_path).unwrap();
 	assert!(cfg.row_group_writer.enabled);
-	assert_eq!(cfg.row_group_writer.target_row_group_rows.get(), 2048);
-	assert_eq!(cfg.row_group_writer.max_row_group_rows.get(), 4096);
-	assert_eq!(cfg.row_group_writer.min_paged_record_rows.get(), 4096);
-	assert_eq!(cfg.row_group_writer.min_paged_record_bytes.get(), 131072);
+	assert_eq!(
+		cfg.row_group_writer.profile,
+		RowGroupSizingProfile::PointRead
+	);
+	assert_eq!(cfg.row_group_writer.target_row_group_rows().get(), 2048);
+	assert_eq!(cfg.row_group_writer.max_row_group_rows().get(), 4096);
+	assert_eq!(cfg.row_group_writer.min_paged_record_rows().get(), 4096);
+	assert_eq!(cfg.row_group_writer.min_paged_record_bytes().get(), 131072);
 	assert!(cfg.l2_row_group_fetch.enabled);
 	assert_eq!(
 		cfg.l2_row_group_fetch
@@ -248,6 +298,88 @@ transfer_signing_secret = "{transfer_secret}"
 	);
 	assert_eq!(cfg.l2_row_group_fetch.max_ranges_per_record.get(), 12);
 	assert_eq!(cfg.l2_row_group_fetch.max_parallel_range_gets.get(), 3);
+}
+
+#[test]
+fn loads_scan_row_group_profile() {
+	let root = fresh_dir("scan-row-group-profile");
+	let config_path = write_config_with_row_group_writer(
+		&root,
+		145,
+		r#"enabled = true
+profile = "scan""#,
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert!(cfg.row_group_writer.enabled);
+	assert_eq!(cfg.row_group_writer.profile, RowGroupSizingProfile::Scan);
+	assert_eq!(
+		cfg.row_group_writer.target_row_group_rows().get(),
+		ROW_GROUP_SCAN_TARGET_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.max_row_group_rows().get(),
+		ROW_GROUP_SCAN_MAX_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.min_paged_record_rows().get(),
+		ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.min_paged_record_bytes().get(),
+		ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES
+	);
+}
+
+#[test]
+fn scan_row_group_profile_ignores_numeric_overrides() {
+	let root = fresh_dir("scan-row-group-profile-numeric-overrides");
+	let config_path = write_config_with_row_group_writer(
+		&root,
+		146,
+		r#"enabled = true
+profile = "scan"
+target_row_group_rows = 2048
+max_row_group_rows = 4096
+min_paged_record_rows = 4096
+min_paged_record_bytes = 131072"#,
+	);
+
+	let cfg = load_node_bootstrap_config(&config_path).unwrap();
+	assert_eq!(cfg.row_group_writer.profile, RowGroupSizingProfile::Scan);
+	assert_eq!(
+		cfg.row_group_writer.target_row_group_rows().get(),
+		ROW_GROUP_SCAN_TARGET_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.max_row_group_rows().get(),
+		ROW_GROUP_SCAN_MAX_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.min_paged_record_rows().get(),
+		ROW_GROUP_SCAN_MIN_PAGED_RECORD_ROWS
+	);
+	assert_eq!(
+		cfg.row_group_writer.min_paged_record_bytes().get(),
+		ROW_GROUP_SCAN_MIN_PAGED_RECORD_BYTES
+	);
+}
+
+#[test]
+fn rejects_unknown_row_group_profile() {
+	let root = fresh_dir("unknown-row-group-profile");
+	let config_path = write_config_with_row_group_writer(
+		&root,
+		147,
+		r#"enabled = true
+profile = "bulk""#,
+	);
+
+	let err = load_node_bootstrap_config(&config_path).unwrap_err();
+	assert!(
+		err.to_string()
+			.contains("unknown storage.row_group_writer profile")
+	);
 }
 
 #[test]

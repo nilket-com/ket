@@ -19,11 +19,10 @@ forward-sequence rewrite.
 
 ## Where we are
 
-ADR 062 (Row-Group Sizing Profile) council-converged
-across Claude / Codex / Gemini after five council
-iterations. Implementation phases pending; Phase 7
-warehouse-scale bench evidence is the promotion-to-
-shipped gate. Amends ADR 056 with a closed two-variant
+ADR 062 (Row-Group Sizing Profile) is implemented and
+promoted to shipped with bench evidence at
+`plans/impl/062_row_group_sizing_profile_bench_results.md`.
+Amends ADR 056 with a closed two-variant
 `RowGroupSizingProfile { PointRead, Scan }` catalog and
 deployment-wide profile selection. **`PointRead`**
 preserves ADR 056 V1 defaults byte-identically (4K-row
@@ -962,11 +961,10 @@ continues at #19.
     operational query workloads). See *Where we are*.
 
 18. **Row-group sizing profile** —
-    ADR 062 council-converged across Claude / Codex /
-    Gemini after five council iterations. Implementation
-    phases pending; Phase 7 warehouse-scale bench evidence
-    is the promotion-to-shipped gate. Amends ADR 056 with
-    a closed two-variant
+    ADR 062 is implemented and promoted to shipped with
+    bench evidence at
+    `plans/impl/062_row_group_sizing_profile_bench_results.md`.
+    Amends ADR 056 with a closed two-variant
     `RowGroupSizingProfile { PointRead, Scan }` catalog
     and deployment-wide profile selection. `PointRead`
     preserves ADR 056 V1 defaults byte-identically (4K /
@@ -1484,9 +1482,8 @@ closed the ciphertext-floor follow-up via the AEAD/network
 two-layer decoupling; ADR 062 closes the warehouse throughput
 follow-up that ADR 061 deferred to row-group sizing, via a
 deployment-wide access-pattern profile.
-**The council's lean on next pickup:** implement ADR 062 to
-shipped status (Phase 7 warehouse-scale bench evidence is the
-gate), then pick from the next Toron-adjacent follow-up family
+**The council's lean on next pickup:** ADR 062 is now shipped;
+pick from the next Toron-adjacent follow-up family
 (page-level min/max/null stats, FSST evaluator, RLE value-run
 format, sparse predicate-column fetch, dense predicate-zip with
 sparse projection, nullable sparse projection — each its own

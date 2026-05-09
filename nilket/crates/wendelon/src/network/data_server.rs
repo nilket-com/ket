@@ -15904,14 +15904,14 @@ mod tests {
 					min_record_bytes: crate::schema::RecordBodyByteLen::try_new(1).unwrap(),
 					..Default::default()
 				},
-				row_group_writer: crate::storage::row_group::RowGroupWriterConfig {
-					enabled: true,
-					target_row_group_rows: crate::schema::RowGroupRowCount::new(4),
-					max_row_group_rows: crate::schema::RowGroupRowCount::new(8),
-					min_paged_record_rows: RowCount::new(1),
-					min_paged_record_bytes: crate::schema::RecordBodyByteLen::new(1),
-					..Default::default()
-				},
+				row_group_writer:
+					crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+						crate::schema::RowGroupRowCount::new(4),
+						crate::schema::RowGroupRowCount::new(8),
+						RowCount::new(1),
+						crate::schema::RecordBodyByteLen::new(1),
+					)
+					.with_enabled(true),
 				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
 					enabled: true,
 					max_selected_row_group_fraction_micros:
@@ -17679,14 +17679,14 @@ mod tests {
 			row_hlc,
 		)
 		.unwrap();
-		let row_group_config = crate::storage::row_group::RowGroupWriterConfig {
-			enabled: true,
-			target_row_group_rows: crate::schema::RowGroupRowCount::new(128),
-			max_row_group_rows: crate::schema::RowGroupRowCount::new(128),
-			min_paged_record_rows: RowCount::new(1),
-			min_paged_record_bytes: crate::schema::RecordBodyByteLen::new(1),
-			..Default::default()
-		};
+		let row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				crate::schema::RowGroupRowCount::new(128),
+				crate::schema::RowGroupRowCount::new(128),
+				RowCount::new(1),
+				crate::schema::RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
 		let encoding_config = EncodingWriterConfig {
 			enabled: true,
 			target_simd_page_values: crate::schema::SimdPageValueCount::new(128),
