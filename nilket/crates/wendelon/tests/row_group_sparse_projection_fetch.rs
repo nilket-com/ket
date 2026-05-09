@@ -13,7 +13,6 @@ fn sparse_projection_fetch_target_binds_planner_unit_matrix() {
 		"pub(crate) fn decide_sparse_projection_fetch",
 		"pub(crate) enum SparseProjectionFetchDecline",
 		"MissingExactCocdMask",
-		"DensePredicateBatchPresent",
 		"CascadeNotPageEmitting",
 		"CascadeNotProjectionEligible",
 		"EncodedValidityBufferUnsupported",

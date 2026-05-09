@@ -91,8 +91,9 @@ use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
 	PageValidityBitmap, decode_page_fetch, empty_projected_batch_for_requirement,
 	encoded_page_body_range, extract_record_body_bytes as extract_encoded_page_bytes,
-	fixed_width_encoding_indexed_value_column, projected_page_batch_from_decoded_buffers,
-	rebase_validity_bitmap, required_projected_physical_ordinals,
+	filtered_predicate_page_batch, fixed_width_encoding_indexed_value_column,
+	projected_page_batch_from_decoded_buffers, rebase_validity_bitmap,
+	required_projected_physical_ordinals,
 };
 use crate::storage::encoding::predicate_page_fetch::{
 	PagePredicateClassification, PredicatePageFetchPlan, PredicatePageMaskSlice,
@@ -152,7 +153,7 @@ use crate::storage::{
 	effective_table_retention, pick_compaction, required_output_run_count,
 	storage_row_table_object_id_at, survivor_records, write_file,
 };
-use arrow::array::Array;
+use arrow::array::{Array, BooleanArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::DataType;
 use arrow::ipc::reader::StreamReader;
@@ -10021,6 +10022,10 @@ impl SlabManager {
 			let projection_fetch_requirement_empty =
 				projection_fetch_requirement.user_visible().is_empty()
 					&& projection_fetch_requirement.storage_columns.is_empty();
+			let predicate_output_overlap = predicate_fetched_requirement
+				.predicate_columns
+				.iter()
+				.any(|column| requirement.output_columns.contains(column));
 			let dense_projection_body_byte_ranges = if projection_fetch_requirement_empty {
 				Vec::new()
 			} else {
@@ -10036,14 +10041,9 @@ impl SlabManager {
 			let mut projection_groups = selected_groups.clone();
 			let selected_body_byte_ranges = if !point_read
 				&& !projection_fetch_requirement_empty
-				&& predicate_projection_by_group.is_empty()
 				&& !predicate_outcome.survival_masks.is_empty()
 			{
 				if let Some(encoding_directory) = directory.encoding_directory.as_ref() {
-					let dense_predicate_batches_present = predicate_outcome
-						.decoded_predicate_batches
-						.values()
-						.any(|batch| batch.num_columns() > 0);
 					match decide_sparse_projection_fetch(SparseProjectionFetchInput {
 						record_directory: &directory,
 						page_directory: &page_directory,
@@ -10054,7 +10054,6 @@ impl SlabManager {
 						dense_body_ranges: &dense_projection_body_byte_ranges,
 						row_group_config: &self.config.l2_row_group_fetch,
 						encoding_config: &self.config.l2_encoding_fetch,
-						dense_predicate_batches_present,
 					}) {
 						SparseProjectionFetchDecision::Sparse(plan) => {
 							projection_groups = plan.selected_groups.clone();
@@ -10145,15 +10144,80 @@ impl SlabManager {
 					.await?;
 					tiered_plan.decrypt(&ciphertext_runs)?
 				};
-				let projected = materialize_sparse_projection_pages(
-					&directory,
-					&projection_fetch_requirement,
-					sparse_projection_plan,
-					&selected_body_ranges,
-					&plaintext_extracts,
-					&predicate_outcome,
-				)
-				.map_err(arrow_io_error)?;
+				let projected = if predicate_projection_by_group.is_empty() {
+					materialize_sparse_projection_pages(
+						&directory,
+						&projection_fetch_requirement,
+						sparse_projection_plan,
+						&selected_body_ranges,
+						&plaintext_extracts,
+						&predicate_outcome,
+					)
+					.map_err(arrow_io_error)?
+				} else {
+					let sparse_page_batches = materialize_sparse_projection_page_batches(
+						&directory,
+						&projection_fetch_requirement,
+						sparse_projection_plan,
+						&selected_body_ranges,
+						&plaintext_extracts,
+						&predicate_outcome,
+					)
+					.map_err(arrow_io_error)?;
+					if !predicate_output_overlap {
+						concat_sparse_projection_page_batches(
+							&directory,
+							&projection_fetch_requirement,
+							sparse_page_batches,
+						)
+						.map_err(arrow_io_error)?
+					} else {
+						let mut zipped_pages = Vec::new();
+						for page_batch in sparse_page_batches {
+							let Some(predicate_projection) =
+								predicate_projection_by_group.get(&page_batch.row_group_index)
+							else {
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									format!(
+										"predicate projection batch missing for sparse projection row group {}",
+										page_batch.row_group_index.get()
+									),
+								));
+							};
+							let predicate_page = filtered_predicate_page_batch(
+								predicate_projection,
+								page_batch.page,
+								&page_batch.local_mask,
+							)
+							.map_err(arrow_io_error)?;
+							if predicate_page.batch.num_rows() != page_batch.batch.batch.num_rows()
+							{
+								return Err(Error::new(
+									ErrorKind::InvalidData,
+									format!(
+										"predicate page row count {} does not match sparse projection row count {}",
+										predicate_page.batch.num_rows(),
+										page_batch.batch.batch.num_rows()
+									),
+								));
+							}
+							zipped_pages.push(
+								crate::storage::row_group::zip_predicate_and_projection_columns(
+									&predicate_page,
+									&page_batch.batch,
+									requirement,
+								)?,
+							);
+						}
+						if zipped_pages.is_empty() {
+							empty_projected_batch_for_requirement(&directory, requirement, 0)
+								.map_err(arrow_io_error)?
+						} else {
+							concat_projected_record_batches(zipped_pages).map_err(arrow_io_error)?
+						}
+					}
+				};
 				return Ok(ProjectedL2RecordRead {
 					projected,
 					projected_first_record_row_index: group.first_record_row_index,
@@ -10292,12 +10356,11 @@ impl SlabManager {
 							),
 						));
 					};
-					let zipped =
-						crate::storage::row_group::zip_phase_b_and_phase_c_projected_row_group(
-							predicate_projection,
-							&projection_projected,
-							requirement,
-						)?;
+					let zipped = crate::storage::row_group::zip_predicate_and_projection_columns(
+						predicate_projection,
+						&projection_projected,
+						requirement,
+					)?;
 					projected_groups.push((*group_index, zipped));
 				}
 				let mask_groups = if point_read {
@@ -12246,6 +12309,14 @@ fn encoding_materialize_audit_for_indexed_plan(
 		.collect()
 }
 
+#[derive(Clone, Debug)]
+struct SparseProjectionPageBatch {
+	row_group_index: RowGroupIndex,
+	page: crate::storage::encoding::EncodingPageDescriptor,
+	local_mask: BooleanArray,
+	batch: ProjectedRecordBatch,
+}
+
 fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 	record_directory: &RecordBufferDirectory,
 	requirement: &ColumnFetchRequirement,
@@ -12254,8 +12325,27 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 	plaintext_extracts: &[B],
 	predicate_outcome: &crate::storage::row_group::PhaseBOutcome,
 ) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	let page_batches = materialize_sparse_projection_page_batches(
+		record_directory,
+		requirement,
+		plan,
+		selected_ranges,
+		plaintext_extracts,
+		predicate_outcome,
+	)?;
+	concat_sparse_projection_page_batches(record_directory, requirement, page_batches)
+}
+
+fn materialize_sparse_projection_page_batches<B: AsRef<[u8]>>(
+	record_directory: &RecordBufferDirectory,
+	requirement: &ColumnFetchRequirement,
+	plan: &SparseProjectionFetchPlan,
+	selected_ranges: &[TieredPlaintextRange],
+	plaintext_extracts: &[B],
+	predicate_outcome: &crate::storage::row_group::PhaseBOutcome,
+) -> Result<Vec<SparseProjectionPageBatch>, arrow::error::ArrowError> {
 	if plan.selected_groups.is_empty() {
-		return empty_projected_batch_for_requirement(record_directory, requirement, 0);
+		return Ok(Vec::new());
 	}
 	let mut decoded_pages = BTreeMap::<PageMaterializeBufferKey, Vec<u8>>::new();
 	for fetch in &plan.fetches {
@@ -12285,7 +12375,6 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 	}
 
 	let mut filtered = Vec::new();
-	let mut template = None;
 	for group in &plan.group_pages {
 		let mask = predicate_outcome
 			.survival_masks
@@ -12311,7 +12400,6 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 				&decoded_validity_pages,
 				&plan.all_valid_nullable_pages,
 			)?;
-			template.get_or_insert_with(|| page_batch.clone());
 			let start = page.first_value_index.get() as usize;
 			let len = page.value_count.get() as usize;
 			if start.checked_add(len).is_none_or(|end| end > mask.len()) {
@@ -12329,24 +12417,44 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 				continue;
 			}
 			if local_mask.null_count() == 0 && local_mask.true_count() == local_mask.len() {
-				filtered.push(page_batch);
+				filtered.push(SparseProjectionPageBatch {
+					row_group_index: group.row_group_index,
+					page: *page,
+					local_mask,
+					batch: page_batch,
+				});
 				continue;
 			}
 			let batch = arrow::compute::filter_record_batch(&page_batch.batch, &local_mask)?;
-			filtered.push(ProjectedRecordBatch {
-				batch,
-				ordinal_mapping: page_batch.ordinal_mapping,
-				storage_mapping: page_batch.storage_mapping,
+			filtered.push(SparseProjectionPageBatch {
+				row_group_index: group.row_group_index,
+				page: *page,
+				local_mask,
+				batch: ProjectedRecordBatch {
+					batch,
+					ordinal_mapping: page_batch.ordinal_mapping,
+					storage_mapping: page_batch.storage_mapping,
+				},
 			});
 		}
 	}
-	if filtered.is_empty() {
-		if let Some(template) = template {
-			return Ok(template.slice(0, 0));
-		}
+	Ok(filtered)
+}
+
+fn concat_sparse_projection_page_batches(
+	record_directory: &RecordBufferDirectory,
+	requirement: &ColumnFetchRequirement,
+	page_batches: Vec<SparseProjectionPageBatch>,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	if page_batches.is_empty() {
 		return empty_projected_batch_for_requirement(record_directory, requirement, 0);
 	}
-	concat_projected_record_batches(filtered)
+	concat_projected_record_batches(
+		page_batches
+			.into_iter()
+			.map(|page_batch| page_batch.batch)
+			.collect(),
+	)
 }
 
 fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
@@ -13648,7 +13756,7 @@ mod tests {
 	use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
 	use arrow::array::{
 		Array, BooleanArray, FixedSizeBinaryBuilder, Int64Array, LargeBinaryBuilder,
-		LargeStringArray, UInt8Array, UInt64Array, UInt64Builder,
+		LargeStringArray, StringArray, UInt8Array, UInt64Array, UInt64Builder,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
@@ -19056,6 +19164,7 @@ mod tests {
 			Field::new("id", DataType::Int64, false),
 			Field::new("selector", DataType::Int64, false),
 			Field::new("payload", DataType::Int64, true),
+			Field::new("tag", DataType::Utf8, false),
 		]);
 		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
 			TableObjectId::new([0x84; 16]),
@@ -19082,6 +19191,9 @@ mod tests {
 				Arc::new(Int64Array::from_iter_values(selector.iter().copied())) as Arc<dyn Array>,
 				Arc::new(Int64Array::from_iter(
 					(0..row_count).map(|row| (row % 11 != 0).then_some((row % 128) as i64)),
+				)) as Arc<dyn Array>,
+				Arc::new(StringArray::from_iter_values(
+					(0..row_count).map(|row| if row < 256 { "hit" } else { "miss" }),
 				)) as Arc<dyn Array>,
 			],
 		)
@@ -19393,6 +19505,230 @@ mod tests {
 			.project(&[2])
 			.unwrap();
 		assert_eq!(none.projected.batch, none_expected);
+
+		let scalar_l1_dir = fresh_dir("sparse-projection-scalar-l1");
+		let scalar_l2_dir = fresh_dir("sparse-projection-scalar-l2");
+		let scalar_l2_counter = Arc::new(CountingObjectStore::new(Arc::new(
+			LocalFsObjectStore::new(&scalar_l2_dir).unwrap(),
+		)));
+		let scalar_l2: Arc<dyn ObjectStore> = scalar_l2_counter.clone();
+		let scalar_mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: scalar_l1_dir,
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(scalar_l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					max_selected_byte_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				encoding_compute: crate::storage::encoding::compute::EncodingComputeConfig {
+					enabled: false,
+					..Default::default()
+				},
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+		scalar_mgr
+			.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let scalar_slab_id = force_seal_active(&scalar_mgr).await;
+		let scalar_raw = scalar_mgr.read_sealed_raw(scalar_slab_id).await.unwrap();
+		let scalar_encrypted = scalar_mgr
+			.encrypt_tiered_object_blob(scalar_slab_id, &scalar_raw)
+			.unwrap();
+		let scalar_payload_hash = crate::hash::content::digest(&scalar_encrypted.bytes);
+		let scalar_uri = scalar_l2
+			.put(
+				&format!("sparse-projection-scalar/slab_{scalar_slab_id:016x}.wnd"),
+				&scalar_encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let scalar_pointer = TieredSlabPointer {
+			slab_id: scalar_slab_id,
+			l2_uri: scalar_uri,
+			payload_hash: scalar_payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(scalar_encrypted.tenant_kek_id),
+			stats_format_version: scalar_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: scalar_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: scalar_encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		scalar_mgr
+			.apply_tier_slab(scalar_pointer.clone())
+			.await
+			.unwrap();
+		let scalar_target = encoded
+			.rows
+			.iter()
+			.find(|row| row.record_row_index == RecordRowIndex::new(300))
+			.expect("scalar target storage row");
+		let scalar_location = scalar_mgr
+			.lookup(tenant(), scalar_target.key_identity)
+			.expect("scalar tiered row location");
+		let no_overlap_requirement = ColumnFetchRequirement {
+			predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([2]),
+			..ColumnFetchRequirement::default()
+		};
+		let no_overlap_before = scalar_l2_counter.snapshot();
+		let no_overlap = scalar_mgr
+			.read_projected_record_from_l2(
+				scalar_l2.clone(),
+				&scalar_pointer,
+				scalar_location,
+				&descriptor,
+				&no_overlap_requirement,
+				Some(&predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let no_overlap_after = scalar_l2_counter.snapshot();
+		let L2FetchStrategy::RowGroup(no_overlap_plan) = &no_overlap.strategy else {
+			panic!(
+				"expected scalar no-overlap row-group strategy, got {:?}",
+				no_overlap.strategy
+			);
+		};
+		assert!(no_overlap_plan.phase_b_fetch.is_some());
+		assert!(
+			!body_ranges_cover(
+				&no_overlap_plan.phase_c_fetch.selected_plaintext_ranges,
+				full_payload_range
+			),
+			"no-overlap scalar predicate decode should keep projection-side sparse ranges"
+		);
+		assert!(
+			no_overlap_after.get_range_calls > no_overlap_before.get_range_calls,
+			"no-overlap scalar predicate decode should fetch L2 ranges"
+		);
+		let no_overlap_expected = crate::schema::pbc::execute_program(&predicate, &batch)
+			.unwrap()
+			.project(&[2])
+			.unwrap();
+		assert_eq!(no_overlap.projected.batch, no_overlap_expected);
+
+		let overlap_requirement = ColumnFetchRequirement {
+			predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1]),
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([1, 2]),
+			..ColumnFetchRequirement::default()
+		};
+		let overlap_zip = scalar_mgr
+			.read_projected_record_from_l2(
+				scalar_l2.clone(),
+				&scalar_pointer,
+				scalar_location,
+				&descriptor,
+				&overlap_requirement,
+				Some(&predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(overlap_plan) = &overlap_zip.strategy else {
+			panic!(
+				"expected scalar overlap row-group strategy, got {:?}",
+				overlap_zip.strategy
+			);
+		};
+		assert!(overlap_plan.phase_b_fetch.is_some());
+		assert!(
+			!body_ranges_cover(
+				&overlap_plan.phase_c_fetch.selected_plaintext_ranges,
+				full_payload_range
+			),
+			"overlap scalar predicate decode should zip dense predicate pages with sparse projection pages"
+		);
+		let overlap_expected = crate::schema::pbc::execute_program(&predicate, &batch)
+			.unwrap()
+			.project(&[1, 2])
+			.unwrap();
+		assert_eq!(overlap_zip.projected.batch, overlap_expected);
+
+		let mut string_bytecode = Vec::new();
+		string_bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		string_bytecode.extend_from_slice(&3_u32.to_le_bytes());
+		string_bytecode.push(crate::schema::pbc::OP_PUSH_STR);
+		string_bytecode.extend_from_slice(&3_u16.to_le_bytes());
+		string_bytecode.extend_from_slice(b"hit");
+		string_bytecode.push(crate::schema::pbc::OP_EQ);
+		let string_predicate = crate::schema::pbc::Program::compile(&string_bytecode).unwrap();
+		let variable_width_overlap_requirement = ColumnFetchRequirement {
+			predicate_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([3]),
+			output_columns: crate::storage::columnar::ColumnOrdinalSet::from_columns([2, 3]),
+			..ColumnFetchRequirement::default()
+		};
+		let variable_width_overlap = scalar_mgr
+			.read_projected_record_from_l2(
+				scalar_l2,
+				&scalar_pointer,
+				scalar_location,
+				&descriptor,
+				&variable_width_overlap_requirement,
+				Some(&string_predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(variable_width_plan) = &variable_width_overlap.strategy
+		else {
+			panic!(
+				"expected variable-width scalar overlap row-group strategy, got {:?}",
+				variable_width_overlap.strategy
+			);
+		};
+		assert!(variable_width_plan.phase_b_fetch.is_some());
+		assert!(
+			!body_ranges_cover(
+				&variable_width_plan.phase_c_fetch.selected_plaintext_ranges,
+				full_payload_range
+			),
+			"variable-width scalar predicate overlap should keep projection-side sparse ranges"
+		);
+		let variable_width_expected =
+			crate::schema::pbc::execute_program(&string_predicate, &batch)
+				.unwrap()
+				.project(&[2, 3])
+				.unwrap();
+		assert_eq!(
+			variable_width_overlap.projected.batch,
+			variable_width_expected
+		);
 	}
 
 	#[tokio::test]

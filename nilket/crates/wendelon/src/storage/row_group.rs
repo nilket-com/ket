@@ -1295,6 +1295,14 @@ pub fn zip_phase_b_and_phase_c_projected_row_group(
 	})
 }
 
+pub fn zip_predicate_and_projection_columns(
+	predicate_projection: &ProjectedRecordBatch,
+	projection: &ProjectedRecordBatch,
+	requirement: &ColumnFetchRequirement,
+) -> std::io::Result<ProjectedRecordBatch> {
+	zip_phase_b_and_phase_c_projected_row_group(predicate_projection, projection, requirement)
+}
+
 fn projected_descriptor_column(
 	phase_b: &ProjectedRecordBatch,
 	phase_c: &ProjectedRecordBatch,

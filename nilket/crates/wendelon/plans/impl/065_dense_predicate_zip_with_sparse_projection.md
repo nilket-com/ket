@@ -49,18 +49,24 @@ Inherits substrate:
 
 ## Status
 
-Council-converged 2026-05-09. Phase 0 read-only audit
-completed. Implementation pending. Phase 7 bench evidence
-will land at
-`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`
-at promotion.
+Shipped 2026-05-09 after implementation, focused
+verification, quick row-group bench evidence, and promotion
+doc amendments landed together. Phase 8 promotion evidence is
+recorded at
+`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+The three-axis gate passed: clustered 5% representative rows
+clear the remaining-projection plaintext-byte, total-query
+plaintext-byte, and wall-clock thresholds. The V1 Case B/C
+engagement catalog is the scalar dense-decode branch only;
+encoding-compute paths, including ADR 063 Maybe-page dense
+COCD, remain Case A mask-only sparse projection.
 
 Implementation contract:
 
 - `src/storage/encoding/sparse_projection_fetch.rs`
   continues to own the active sparse projection planner
-  and private decline reasons; planner extends in place
-  (no new module).
+  and existing private decline taxonomy; planner extends
+  in place (no new module).
 - `src/storage/encoding/page_materialize.rs` continues to
   own passive page decode and ADR 064 validity rebase;
   gains `filtered_predicate_page_batch` for page-grain
@@ -97,9 +103,11 @@ Implementation contract:
 - ADR 063 `ExactMatch`-routed row groups bypass dense
   decode entirely; ADR 065 not engaged for those row
   groups.
-- Maybe-mask survivors that did not reach an exact dense
-  decode decline with a private `MaybeMaskSurvivor`
-  reason.
+- V1 does not add planner-level private decline variants
+  for Maybe-mask survivors or predicate-batch page-span
+  invariants. The planner consumes exact Arrow survival
+  masks only; manager-side page slicing and row-count
+  checks fail closed with existing storage / Arrow errors.
 - Page-grain row-span slicing only; row-group-grain
   assembly rejected; filler-based full-row-group
   reconstruction rejected.
@@ -145,12 +153,9 @@ read side:
              economic gate clears → engage sparse
              projection (Case B or Case C decided
              manager-side)
-           - mask not exact (Maybe survivors remain) →
-             decline (private MaybeMaskSurvivor)
-           - row-group-split predicate batch → decline
-             (private PredicateBatchRowGroupSplit)
-           - row-span slicing infeasible → decline
-             (private PredicateBatchRowSpanMismatch)
+           - page-span and row-count invariant failures
+             are manager-side fail-closed errors after
+             sparse fetch begins
            - mask-first short-circuit (None / All)
              unchanged
   Stage D (encoding materialization): three-case manager
@@ -184,9 +189,6 @@ read side:
   - retire active use of
     `SparseProjectionFetchDecline::DensePredicateBatchPresent`
     (line 65);
-  - add private decline reasons (`MaybeMaskSurvivor`,
-    `PredicateBatchRowSpanMismatch`,
-    `PredicateBatchRowGroupSplit`);
   - planner inspects mask exactness + remaining
     projection requirement only; consumes survival masks
     and projection metadata, no decoded Arrow batches;
@@ -205,9 +207,10 @@ read side:
   - dispatch Case A (mask-only concat), Case B (overlap
     zip), Case C (no-overlap concat) on
     `predicate_projection_by_group` populated-ness AND the
-    derived `predicate_output_overlap` set
+    derived `predicate_output_overlap` bool
     (`predicate_fetched_requirement.predicate_columns ∩
-    requirement.output_columns`); Case A applies when
+    requirement.output_columns` is non-empty); Case A
+    applies when
     `predicate_projection_by_group` is empty, Case B when
     populated AND `predicate_output_overlap` non-empty,
     Case C when populated AND `predicate_output_overlap`
@@ -235,7 +238,6 @@ read side:
     `dense_predicate_batches_decline_sparse_projection`
     test;
   - add dense-predicate-zip engagement / decline tests;
-  - add Maybe-survivor decline test;
   - add ADR 063 control tests confirming `Maybe`-driven
     dense COCD continues to engage Case A mask-only
     sparse projection (encoding-compute branch emits
@@ -262,8 +264,8 @@ read side:
     fallback fixture (regression-stable across native-
     evaluator widening) + ADR 063 `Maybe`-driven dense
     fixture (separate row from `ExactMatch`-driven) +
-    ADR 064 nullable-zip fixture + Maybe-survivor decline
-    control + page-boundary fixture (1,025 rows/page) +
+    ADR 064 nullable-zip fixture + page-boundary fixture
+    (1,025 rows/page) +
     variable-width predicate + sparse projection fixture
     + 16-column wide-table diagnostic + clustered-50%
     diagnostic mask shape.
@@ -508,15 +510,15 @@ Work:
    pub(crate) fn filtered_predicate_page_batch(
        predicate_batch: &ProjectedRecordBatch,
        page: EncodingPageDescriptor,
-       page_local_survivors: &EncodedRowMask,
+       local_mask: &BooleanArray,
    ) -> Result<ProjectedRecordBatch, ArrowError>;
    ```
 
    - slices each predicate Arrow column to
      `[page.first_value_index, page.first_value_index +
      page.value_count)` via O(1) Arrow array slicing;
-   - applies the page-local survivor mask using existing
-     dense mask-filter helpers;
+   - applies the already-derived page-local Arrow
+     `BooleanArray` survivor mask using Arrow filtering;
    - returns a page-local predicate-only
      `ProjectedRecordBatch` whose row count equals the
      survivor count for that page.
@@ -708,16 +710,13 @@ Work:
      `predicate_projection_by_group`; the manager-side
      execution selects the case);
    - mask exact + remaining projection empty (predicate-
-     only query) → no sparse projection planning needed;
-   - mask not exact (any Maybe survivors remain) →
-     decline with private `MaybeMaskSurvivor` reason;
-   - decoded predicate batch covers multiple row groups
-     → decline with private
-     `PredicateBatchRowGroupSplit` reason (defensive
-     guard);
-   - decoded predicate batch row-span slicing infeasible
-     → decline with private
-     `PredicateBatchRowSpanMismatch` reason.
+     only query) → no sparse projection planning needed.
+     V1 does not add planner-level private decline
+     variants for Maybe survivors or predicate-batch page
+     span checks. Maybe handling remains upstream in the
+     encoding-compute path; manager-side page span and
+     row-count invariants fail closed with storage /
+     Arrow errors if violated after sparse fetch begins.
 2. Preserve existing declines for:
    - variable-width sparse-projection columns;
    - non-page-emitting value cascades;
@@ -740,11 +739,9 @@ Work:
    (line 65). Keep the variant for transitional test-
    fixture compatibility if needed; remove if all
    fixtures migrate cleanly.
-5. Keep `SparseProjectionFetchDecline` private. New
-   private reasons (`MaybeMaskSurvivor`,
-   `PredicateBatchRowSpanMismatch`,
-   `PredicateBatchRowGroupSplit`) do not surface in
-   metrics or public fallbacks.
+5. Keep `SparseProjectionFetchDecline` private. ADR 065
+   does not add public fallback / reject taxonomy and does
+   not add unused private decline variants.
 6. Preserve mask-first behavior:
    - `None` mask returns an empty sparse plan before
      zip checks;
@@ -760,13 +757,7 @@ Work:
 
 Tests:
 
-- `dense_predicate_zip_engages_with_exact_mask`.
-- `dense_predicate_zip_declines_maybe_survivor` (private
-  reason).
-- `dense_predicate_zip_declines_predicate_batch_row_span_mismatch`
-  (private reason).
-- `dense_predicate_zip_declines_predicate_batch_row_group_split`
-  (private reason).
+- `dense_predicate_batch_does_not_decline_sparse_projection`.
 - `dense_predicate_zip_declines_when_remaining_projection_ineligible`.
 - `dense_predicate_zip_declines_when_economic_gate_fails`.
 - `dense_predicate_zip_none_mask_zero_projection_fetch`.
@@ -804,15 +795,14 @@ Work:
 3. After a sparse plan is selected, dispatch on the
    case triple:
    First compute the `predicate_output_overlap` derived
-   set:
+   bool:
 
    ```rust
-   let predicate_output_overlap: ColumnOrdinalSet =
+   let predicate_output_overlap =
        predicate_fetched_requirement
            .predicate_columns
-           .intersection(&requirement.output_columns)
-           .copied()
-           .collect();
+           .iter()
+           .any(|column| requirement.output_columns.contains(column));
    ```
 
    This is **the** Case B/C discriminator. (Note:
@@ -847,10 +837,10 @@ Work:
        the row-group survival mask;
      - call `filtered_predicate_page_batch` (Phase 1)
        using the same `local_mask` to slice + filter
-       the dense predicate batch (only columns named in
-       `predicate_output_overlap`; predicate columns
-       fetched but not in output are discarded at
-       slice time);
+       the dense predicate batch. `predicate_output_overlap`
+       is reduced to a bool for dispatch; column selection
+       is delegated to `zip_predicate_and_projection_columns`
+       using the full `ColumnFetchRequirement`;
      - call `zip_predicate_and_projection_columns`
        (Phase 3) to assemble the page-local
        `ProjectedRecordBatch` in
@@ -961,8 +951,6 @@ Guards:
   `src/storage/row_group.rs`.
 - `SparseProjectionFetchDecline` remains private to the
   planner module.
-- Maybe-survivor decline reason exists, is private, and
-  routes the row group to dense.
 - Row-group-grain assembly path absent; page-grain
   only.
 - Filler-based full-row-group sparse reconstruction
@@ -991,9 +979,7 @@ Guards:
 - New helper names avoid planning-phase identifiers and
   version suffixes (`zip_predicate_and_projection_columns`,
   `filtered_predicate_page_batch`,
-  `SparseProjectionPageBatch`, `MaybeMaskSurvivor`,
-  `PredicateBatchRowSpanMismatch`,
-  `PredicateBatchRowGroupSplit` are semantic).
+  `SparseProjectionPageBatch` are semantic).
 - No project-name-prefixed protocol identifiers.
 - ADR 020 §2 AAD layout, ADR 022 §3 / §5 byte layouts,
   ADR 056 / 057 / 063 directory shapes, ADR 058 / 059
@@ -1037,12 +1023,6 @@ Required coverage:
 - planner accepts row groups with non-empty
   `predicate_projection_by_group` when mask is exact and
   remaining projection eligible;
-- planner declines Maybe-survivor row groups with
-  private reason;
-- planner declines predicate-batch-row-group-split row
-  groups with private reason;
-- planner declines predicate-batch-row-span-mismatch row
-  groups with private reason;
 - planner preserves `None` and `All` mask behavior;
 - predicate-batch row-span slicing handles non-byte-
   aligned page starts and tail pages;
@@ -1149,9 +1129,6 @@ Bench dimensions:
     V2 work).
 - ADR 064 composability: nullable predicate column +
   nullable projection column zip.
-- Maybe-survivor decline control: a fixture where
-  Maybe-mask slices remain after upstream evaluation,
-  declining with the private reason.
 - Case C no-overlap dense-fallback control.
 
 Rows record:
@@ -1231,8 +1208,6 @@ Acceptance gates (three axes):
   existing envelopes.
 - Cross-replica determinism on representative dense-zip
   fixtures.
-- Maybe-survivor decline control row records the
-  private decline reason and routes to dense.
 - Sub-byte page-boundary correctness on row counts not
   divisible by 8.
 - `PointRead` rows record outcome; promotion does not
@@ -1244,6 +1219,9 @@ Acceptance gates (three axes):
 for council promotion or explicit revision.
 
 ## Phase 9 — Promotion
+
+Completed 2026-05-09. ADR 065 promoted as a narrow ADR 060 /
+063 / 064 amendment with no public protocol surface change.
 
 Promotion happens only after implementation, focused
 tests, architecture guards, and bench evidence land
@@ -1332,14 +1310,14 @@ cargo bench --bench row_group_fetch
 
 ## Risks and mitigations
 
-**Maybe-survivor decline misses target rows.**
-Mitigation: Phase 0 audited the frequency of Maybe
-survivors across the dense-predicate-decode catalog;
-all catalog members produce exact masks via decode-
-then-scan or decode-then-COCD. If post-implementation
-production evidence reveals Maybe survivors that should
-engage, council weighs bundling predicate-side
-widening into a follow-up ADR.
+**Non-exact predicate masks accidentally enter the zip path.**
+Mitigation: ADR 065 V1 engages only after the reader has
+an exact Arrow survival mask in `PhaseBOutcome`. ADR 063
+Maybe-page dense COCD remains in the encoding-compute
+branch and emits mask-only exact outcomes for V1. If a
+future predicate path exposes Maybe survivors directly to
+sparse projection planning, that path must add explicit
+planner declines or exact-mask conversion in its own ADR.
 
 **Page-grain row-span slicing fails on non-byte-aligned
 page starts.** Mitigation: Phase 1 helper-level tests
@@ -1382,11 +1360,14 @@ dense predicate decode entirely; the resulting
 mask-only path engages, not ADR 065. Architectural
 guard pins this.
 
-**Predicate batch covers multiple row groups.**
-Mitigation: defensive private decline reason
-(`PredicateBatchRowGroupSplit`); fail closed if the
-writer ever produces a batch spanning row groups
-(should not occur but pinned).
+**Predicate batch page-span or row-count invariant fails.**
+Mitigation: V1 enforces these as manager-side runtime
+invariants. `filtered_predicate_page_batch` rejects page
+spans outside the dense predicate batch, and the manager
+rejects predicate/projection row-count mismatches before
+zipping. These fail closed through existing storage /
+Arrow errors after sparse fetch begins; V1 does not add
+planner-level private decline variants for these checks.
 
 **Double mask filtering.** Mitigation: ADR 065 Case B
 zipped output and Case C sparse-only output bypass
@@ -1455,9 +1436,9 @@ scope for V1.
 
 **Manager-side case dispatch confuses Cases B and C.**
 Mitigation: Phase 5 dispatches on the derived
-`predicate_output_overlap` set
+`predicate_output_overlap` bool
 (`predicate_fetched_requirement.predicate_columns ∩
-requirement.output_columns`), not on
+requirement.output_columns` is non-empty), not on
 `predicate_fetched_requirement.is_empty()`. The latter
 would misclassify a query whose predicate column is
 fetched dense but not in the SELECT list (i.e., real

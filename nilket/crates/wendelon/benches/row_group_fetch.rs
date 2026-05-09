@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 use std::io::{Error, ErrorKind};
 use std::ops::Range;
@@ -47,16 +47,18 @@ use wendelon::storage::encoding::predicate_page_fetch::{
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::stats::fixed_width_page_stats_supported_type;
 use wendelon::storage::{
-	ColumnFetchRequirement, ColumnOrdinalSet, EncodingPageDescriptor, PhaseBOutcome,
-	PlaintextByteRange, ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS,
-	ROW_GROUP_POINT_READ_TARGET_ROWS, ROW_GROUP_SCAN_MAX_ROWS, ROW_GROUP_SCAN_TARGET_ROWS,
-	RecordBufferDirectory, RowGroupSizingProfile, RowGroupWriterConfig, TieredRecordId,
+	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, EncodingPageDescriptor,
+	PhaseBOutcome, PlaintextByteRange, ProjectedRecordBatch,
+	ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS, ROW_GROUP_POINT_READ_TARGET_ROWS,
+	ROW_GROUP_SCAN_MAX_ROWS, ROW_GROUP_SCAN_TARGET_ROWS, RecordBufferDirectory,
+	RowGroupSizingProfile, RowGroupWriterConfig, TieredRecordId,
 	apply_phase_b_masks_to_projected_row_groups, build_page_directory_for_ipc_stream,
 	decode_projected_row_groups_from_plaintext_ranges, default_stats_supported_types,
 	encode_multirow_from_survivors_with_row_group_and_encoding_config,
 	encode_multirow_from_survivors_with_row_group_config, encode_record_batches_bytes,
 	parse_record_buffer_directory, project_record_batch_for_requirement, row_group_stats_for_batch,
 	selected_row_group_record_body_ranges, serialize_page_directory_value,
+	zip_predicate_and_projection_columns,
 };
 use wendelon::storage::{
 	EncodingCascade, EncodingCascadeKind, EncodingLeafCascade, EncodingWriterConfig,
@@ -97,6 +99,7 @@ fn main() -> std::io::Result<()> {
 	bench_adr062_row_group_sizing_profile_matrix(&config)?;
 	bench_adr063_page_level_predicate_stats_matrix(&config)?;
 	bench_adr064_nullable_sparse_projection_matrix(&config)?;
+	bench_adr065_dense_predicate_zip_matrix(&config)?;
 	Ok(())
 }
 
@@ -4398,6 +4401,318 @@ fn sparse_projection_speedup_micros_adr064(
 	} else {
 		1_000_000
 	}
+}
+
+fn adr065_zip_requirement(dataset: &Adr064RuntimeDataset) -> ColumnFetchRequirement {
+	let output_columns = std::iter::once(1_u32)
+		.chain((2..2 + dataset.shape.projection_columns()).map(|column| column as u32));
+	ColumnFetchRequirement {
+		output_columns: ColumnOrdinalSet::from_columns(output_columns),
+		..ColumnFetchRequirement::default()
+	}
+}
+
+fn adr065_projected_batch_for_columns(
+	fixture: &Adr064RuntimeFixture,
+	columns: &[usize],
+	mask: &BooleanArray,
+) -> std::io::Result<ProjectedRecordBatch> {
+	let mut fields = Vec::with_capacity(columns.len());
+	let mut arrays = Vec::with_capacity(columns.len());
+	let mut mapping = vec![None; columns.iter().copied().max().unwrap_or(0).saturating_add(1)];
+	for (physical, descriptor_ordinal) in columns.iter().copied().enumerate() {
+		fields.push(fixture.batch.schema().field(descriptor_ordinal).clone());
+		arrays.push(fixture.batch.column(descriptor_ordinal).clone());
+		mapping[descriptor_ordinal] = Some(physical);
+	}
+	let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 065 projected source batch: {err}"),
+		)
+	})?;
+	let filtered = if mask.true_count() == 0 {
+		batch.slice(0, 0)
+	} else if mask.null_count() == 0 && mask.true_count() == mask.len() {
+		batch
+	} else {
+		arrow::compute::filter_record_batch(&batch, mask).map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 065 projected source filter: {err}"),
+			)
+		})?
+	};
+	Ok(ProjectedRecordBatch {
+		batch: filtered,
+		ordinal_mapping: ColumnOrdinalMapping::new(mapping),
+		storage_mapping: BTreeMap::new(),
+	})
+}
+
+fn adr065_dense_oracle_batch(
+	fixture: &Adr064RuntimeFixture,
+	dataset: &Adr064RuntimeDataset,
+	mask: &BooleanArray,
+) -> std::io::Result<RecordBatch> {
+	let columns = std::iter::once(1_usize)
+		.chain((2..2 + dataset.shape.projection_columns()).map(|column| column as usize))
+		.collect::<Vec<_>>();
+	adr065_projected_batch_for_columns(fixture, &columns, mask)?
+		.user_visible()
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 065 dense oracle projection: {err}"),
+			)
+		})
+}
+
+fn adr065_predicate_filter_runtime(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+) -> std::io::Result<(usize, String)> {
+	let mut digest = blake3::Hasher::new();
+	let mut output_rows = 0_usize;
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let predicate = adr065_projected_batch_for_columns(fixture, &[1], &mask)?;
+		output_rows = output_rows.saturating_add(predicate.batch.num_rows());
+		let visible = predicate.user_visible().map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 065 predicate visible projection: {err}"),
+			)
+		})?;
+		for column in visible.columns() {
+			digest.update(&column.get_array_memory_size().to_le_bytes());
+		}
+	}
+	Ok((output_rows, digest.finalize().to_hex().to_string()))
+}
+
+fn adr065_zip_runtime(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+) -> std::io::Result<(usize, String)> {
+	let requirement = adr065_zip_requirement(dataset);
+	let mut digest = blake3::Hasher::new();
+	let mut output_rows = 0_usize;
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let predicate = adr065_projected_batch_for_columns(fixture, &[1], &mask)?;
+		let projection_columns = (2..2 + dataset.shape.projection_columns())
+			.map(|column| column as usize)
+			.collect::<Vec<_>>();
+		let projection = adr065_projected_batch_for_columns(fixture, &projection_columns, &mask)?;
+		let zipped = zip_predicate_and_projection_columns(&predicate, &projection, &requirement)?;
+		let dense_oracle = adr065_dense_oracle_batch(fixture, dataset, &mask)?;
+		let visible = zipped.user_visible().map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 065 zipped visible projection: {err}"),
+			)
+		})?;
+		if visible != dense_oracle {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"ADR 065 dense predicate zip output mismatch",
+			));
+		}
+		output_rows = output_rows.saturating_add(visible.num_rows());
+		for column in visible.columns() {
+			digest.update(&column.get_array_memory_size().to_le_bytes());
+		}
+	}
+	Ok((output_rows, digest.finalize().to_hex().to_string()))
+}
+
+fn adr065_dense_predicate_plaintext_bytes(dataset: &Adr064RuntimeDataset) -> std::io::Result<u64> {
+	let mut bytes = 0_u64;
+	for fixture in &dataset.fixtures {
+		let page_directory = fixture.directory.page_directory.as_ref().ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"ADR 065 dense predicate missing page directory",
+			)
+		})?;
+		let requirement = ColumnFetchRequirement {
+			output_columns: ColumnOrdinalSet::from_columns([1]),
+			..ColumnFetchRequirement::default()
+		};
+		let ranges = selected_row_group_record_body_ranges(
+			&fixture.directory,
+			page_directory,
+			&requirement,
+			&[RowGroupIndex::ZERO],
+		)
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 065 dense predicate ranges: {err}"),
+			)
+		})?;
+		bytes = bytes.saturating_add(ranges.iter().map(|range| range.len.get()).sum::<u64>());
+	}
+	Ok(bytes)
+}
+
+fn adr065_ratio_micros(numerator: u64, denominator: u64) -> u64 {
+	if denominator == 0 {
+		u64::MAX
+	} else {
+		(numerator as f64 / denominator as f64 * 1_000_000.0) as u64
+	}
+}
+
+fn bench_adr065_dense_predicate_zip_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let mut emitted = 0_usize;
+	for rows in adr064_nullable_sparse_projection_rows(config) {
+		let profile = if *rows == ROW_GROUP_SCAN_TARGET_ROWS as usize {
+			RowGroupSizingProfile::Scan
+		} else {
+			RowGroupSizingProfile::PointRead
+		};
+		let iterations = adr064_runtime_iterations(config, *rows);
+		let dataset = adr064_nullable_runtime_dataset(
+			*rows,
+			SparseProjectionCascadeFixture::BitPacked,
+			Adr064ProjectionShape::FourNullable,
+			Adr064NullDistribution::Alternating,
+			256,
+			profile,
+		)?;
+		let slab_id = SlabId::new(68_000 + *rows as u64);
+		let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+		let encrypted = adr064_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+		let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+			MockObjectStore::new(MockObjectStoreConfig::default()),
+		)));
+		let uri = runtime.block_on(store.put(
+			&format!("adr065-dense-predicate-zip/{}.wnd", rows),
+			&encrypted.bytes,
+		))?;
+		let env = SparseProjectionRuntimeEnv {
+			runtime: &runtime,
+			store,
+			uri: &uri,
+			crypto: &crypto,
+			slab_id,
+			object_size: encrypted.bytes.len() as u64,
+		};
+		let measurement = measure_adr064_runtime_case(
+			&dataset,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+			Adr064PredicateSource::ExactMask,
+			iterations,
+			&env,
+			true,
+			false,
+		)?;
+		let mut predicate_rows = 0_usize;
+		let mut predicate_digest = String::new();
+		let predicate_elapsed = bench(iterations, || {
+			let (rows, digest) = adr065_predicate_filter_runtime(
+				black_box(&dataset),
+				black_box(SparseProjectionMaskShape::ClusteredFivePercent),
+			)
+			.expect("ADR 065 predicate filter runtime");
+			predicate_rows = rows;
+			predicate_digest = digest;
+		});
+		let mut zip_rows = 0_usize;
+		let mut zip_digest = String::new();
+		let zip_elapsed = bench(iterations, || {
+			let (rows, digest) = adr065_zip_runtime(
+				black_box(&dataset),
+				black_box(SparseProjectionMaskShape::ClusteredFivePercent),
+			)
+			.expect("ADR 065 zip runtime");
+			zip_rows = rows;
+			zip_digest = digest;
+		});
+		if predicate_rows != measurement.sparse.output_rows
+			|| zip_rows != measurement.sparse.output_rows
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 065 row mismatch predicate_rows={} zip_rows={} sparse_rows={}",
+					predicate_rows, zip_rows, measurement.sparse.output_rows
+				),
+			));
+		}
+		let dense_predicate_plaintext_bytes = adr065_dense_predicate_plaintext_bytes(&dataset)?;
+		let total_dense_query_plaintext_bytes = dense_predicate_plaintext_bytes
+			.saturating_add(measurement.dense.projection_plaintext_bytes);
+		let total_sparse_query_plaintext_bytes = dense_predicate_plaintext_bytes
+			.saturating_add(measurement.sparse.projection_plaintext_bytes);
+		let dense_elapsed = predicate_elapsed.saturating_add(measurement.dense.elapsed);
+		let sparse_elapsed = predicate_elapsed
+			.saturating_add(measurement.sparse.elapsed)
+			.saturating_add(zip_elapsed);
+		let dense_micros = dense_elapsed.as_secs_f64() * 1_000_000.0;
+		let sparse_micros = sparse_elapsed.as_secs_f64() * 1_000_000.0;
+		let speedup_micros = if sparse_micros > 0.0 {
+			(dense_micros / sparse_micros * 1_000_000.0) as u64
+		} else {
+			u64::MAX
+		};
+		println!(
+			"row_group_fetch_measure scenario=adr065_dense_predicate_zip profile={} rows={} records={} page_values={} predicate_source=scalar_dense_decode route=case_b_sparse_zip output_rows={} equality={} null_count_equal={} iterations={} dense_predicate_plaintext_bytes={} dense_remaining_projection_plaintext_bytes={} sparse_value_plaintext_bytes={} sparse_validity_plaintext_bytes={} sparse_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} total_sparse_query_plaintext_bytes={} remaining_projection_reduction_micros={} total_query_reduction_micros={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} selected_value_pages={} selected_validity_ranges={} get_bytes_calls={} predicate_digest={} zip_digest={}",
+			dataset.profile.as_str(),
+			dataset.rows,
+			dataset.fixtures.len(),
+			dataset.page_values,
+			measurement.sparse.output_rows,
+			measurement.equality,
+			measurement.null_count_equal,
+			iterations,
+			dense_predicate_plaintext_bytes,
+			measurement.dense.projection_plaintext_bytes,
+			measurement.sparse.value_plaintext_bytes,
+			measurement.sparse.validity_plaintext_bytes,
+			measurement.sparse.projection_plaintext_bytes,
+			total_dense_query_plaintext_bytes,
+			total_sparse_query_plaintext_bytes,
+			adr065_ratio_micros(
+				measurement.dense.projection_plaintext_bytes,
+				measurement.sparse.projection_plaintext_bytes
+			),
+			adr065_ratio_micros(
+				total_dense_query_plaintext_bytes,
+				total_sparse_query_plaintext_bytes
+			),
+			dense_elapsed.as_secs_f64() * 1_000.0,
+			sparse_elapsed.as_secs_f64() * 1_000.0,
+			speedup_micros,
+			measurement.dense.get_range_calls,
+			measurement.sparse.get_range_calls,
+			measurement.dense.get_range_bytes,
+			measurement.sparse.get_range_bytes,
+			measurement.dense.projection_ciphertext_bytes,
+			measurement.sparse.projection_ciphertext_bytes,
+			measurement.dense.selected_ranges,
+			measurement.sparse.selected_ranges,
+			measurement.sparse.selected_value_pages,
+			measurement.sparse.selected_validity_ranges,
+			measurement
+				.dense
+				.get_bytes_calls
+				.saturating_add(measurement.sparse.get_bytes_calls),
+			predicate_digest,
+			zip_digest,
+		);
+		emitted = emitted.saturating_add(1);
+	}
+	println!(
+		"row_group_fetch_bench scenario=adr065_dense_predicate_zip rows=mixed emitted_rows={} iterations=max10_1m3",
+		emitted,
+	);
+	Ok(())
 }
 
 fn adr064_runtime_encrypted_dataset(

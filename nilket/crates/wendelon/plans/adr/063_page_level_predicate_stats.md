@@ -59,6 +59,18 @@ ExactMatch page can reduce predicate bytes to zero while
 ADR 064 still fetches selected projection value bytes plus
 validity bits for the surviving row span.
 
+ADR 065 (Dense Predicate-Zip with Sparse Projection) is now
+shipped as a downstream projection-side composition. The V1
+boundary is narrow: ADR 063's encoding-compute path still
+returns mask-only `PhaseBOutcome` and does not populate
+`predicate_projection_by_group`, so ADR 063 ExactMatch and
+Maybe-driven dense COCD rows engage ADR 060 / 064 Case A, not
+ADR 065 Case B/C zip. ADR 065 Case B/C applies only to the
+separate scalar dense-decode branch that already materializes
+decoded predicate projection batches. Bench evidence is
+recorded at
+`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+
 ## Context
 
 ADR 056 ships per-row-group min/max/null stats in
@@ -283,9 +295,10 @@ ADR 063 ships:
 11. **Phase B output is mask-only on the narrowed path.**
     `PhaseBOutcome` carries the composed survival mask; no
     dense predicate batches. ADR 060 sparse projection fetch
-    can engage downstream because the mask is exact.
-    Dense-predicate-zip with sparse projection remains an
-    explicit V1 deferral.
+    can engage downstream because the mask is exact. ADR 065
+    later adds dense-predicate zip for the separate scalar
+    dense-decode branch; ADR 063's narrowed path remains
+    mask-only in V1.
 
 12. **Phase 0 metadata size-model gate is the sole V1
     discipline.** Pre-code modeling on representative
@@ -376,9 +389,9 @@ stats reduce predicate bytes before mask construction.
 
 **3. V1 stays mask-only.** The narrowed predicate path returns
 exact survival masks, not dense predicate batches. This
-preserves ADR 060's sparse projection path. Dense predicate-
-zip with sparse projection has a separate row-alignment
-correctness story and is V1-deferred.
+preserves ADR 060's sparse projection path. ADR 065 closes
+dense predicate-zip for the scalar dense-decode branch only;
+it does not change ADR 063's mask-only output contract.
 
 **4. ExactMatch short-circuit is conservative.** If stats
 prove a page fully matches without requiring null-position
@@ -757,11 +770,12 @@ ADR 063 deliberately does **not** ship:
   **V2 promotion path:** dedicated cascade-evaluator ADRs
   (FSST evaluator, ALP evaluator) extend page-stat emission
   as their kernels land.
-- **Dense predicate-zip with sparse projection.** ADR 060 V1
-  deferred this; ADR 063 V1 narrowed-path is mask-only and
-  intentionally leaves `decoded_predicate_batches` empty.
-  **V2 promotion path:** a dedicated row-alignment ADR for
-  page-sliced predicate-projection zip.
+- **Dense predicate-zip with sparse projection.** Closed by
+  ADR 065 for the scalar dense-decode branch. ADR 063 V1
+  narrowed-path remains mask-only and intentionally leaves
+  `decoded_predicate_batches` empty; multiplicative ADR 063 +
+  ADR 065 Case B zip is future work if the encoding-compute
+  branch ever materializes predicate projections.
 - **Sparse predicate fetch for non-COCD predicates.** V1
   narrows only exact-COCD-compatible predicate paths. Dense
   PBC page-sliced evaluation has a separate materialization
@@ -1003,11 +1017,12 @@ council-revisable gate).
   `Scan`-only profile predicate baked into the writer is
   a static eligibility gate, not a runtime fallback.)
 - **Don't bundle 063 with RLE value-run / FSST evaluator /
-  ALP evaluator / dense predicate-zip / nullable sparse
-  projection / variable-width sparse projection / sparse
+  ALP evaluator / nullable sparse projection / dense
+  predicate-zip / variable-width sparse projection / sparse
   predicate fetch for non-COCD predicates / page-level
   aggregate short-circuit / page-level Bloom filters.** Each
-  is its own ADR.
+  is its own ADR; ADR 064 and ADR 065 later closed their
+  respective items independently.
 - **Don't change ADR 057's RLE byte-run format inside
   ADR 063.**
 - **Don't add a fifth `L2FetchStrategy` variant.**
@@ -1062,10 +1077,11 @@ ADR 056 row-group fetch + per-row-group stats + page directory
      preserves ADR 060; Phase 0 size-model + profile-emission
      gate is the sole budget discipline; no runtime fallback
      in V1)  ← here
+  → nullable sparse projection                   (ADR 064)
+  → dense predicate-zip with sparse projection   (ADR 065)
   → next Toron-adjacent follow-ups (RLE value-run; FSST
-    evaluator; ALP evaluator; nullable sparse projection;
-    variable-width sparse projection; dense predicate-zip
-    with sparse projection; ADR 061 V2)
+    evaluator; ALP evaluator; variable-width sparse
+    projection; sparse predicate-column fetch; ADR 061 V2)
   → capacity-tier compression / serverless / EC bundle
 ```
 

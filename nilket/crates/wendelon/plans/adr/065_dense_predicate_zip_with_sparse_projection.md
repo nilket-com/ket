@@ -7,6 +7,20 @@ Companion implementation plan:
 
 ## Status
 
+Shipped 2026-05-09 after council convergence,
+implementation, focused verification, and Phase 8 promotion
+evidence landed together. Bench evidence is recorded at
+`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+The promotion gate passed on all three axes: clustered 5%
+representative rows keep at least 1.5x remaining-projection
+plaintext-byte reduction, at least 1.25x total-query
+plaintext-byte reduction, and at least 1.2x wall-clock
+improvement. V1 engagement is narrowed to the scalar
+dense-decode branch that populates
+`predicate_projection_by_group`; ADR 063 encoding-compute
+paths remain Case A mask-only sparse projection because they
+do not populate decoded predicate projection batches.
+
 Council-converged 2026-05-09 after six iterations across
 Claude / Codex / Gemini. Phase 0 read-only audit of
 `src/storage/manager.rs`,
@@ -44,15 +58,12 @@ Claude / Codex / Gemini. Phase 0 read-only audit of
 slated for the broader convention sweep flagged by ADR 060.
 ADR 065 does not extend the leak: new identifiers it
 introduces (`filtered_predicate_page_batch`,
-`SparseProjectionPageBatch`, `MaybeMaskSurvivor`,
-`PredicateBatchRowSpanMismatch`,
-`PredicateBatchRowGroupSplit`) are semantic; it references
+`SparseProjectionPageBatch`) are semantic; it references
 the existing phase-named symbols by current name only for
 accuracy where they are unavoidable.
 
-Implementation pending. Bench evidence will land at
-`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`
-at promotion.
+Implementation is complete. ADR 060 / 063 / 064 status text
+and the forward roadmap have been amended at promotion.
 
 ## Context
 
@@ -252,9 +263,11 @@ manager-side execution selects one of three cases.
      produces mask-only `PhaseBOutcome` and does not
      populate this map).
    - `predicate_output_overlap` — derived at dispatch time
-     as `predicate_fetched_requirement.predicate_columns ∩
-     requirement.output_columns` (the predicate columns
-     that *also* appear in the user's SELECT-list output).
+     as a bool: whether
+     `predicate_fetched_requirement.predicate_columns ∩
+     requirement.output_columns` is non-empty (some
+     predicate columns also appear in the user's SELECT-
+     list output).
      This is **not** the same as
      `predicate_fetched_requirement.is_empty()`:
      `predicate_fetched_requirement` is built from
@@ -518,11 +531,12 @@ trivial against current writer output. Key findings:
   so it is **not** the Case B/C discriminator.
 - `predicate_output_overlap` (introduced by ADR 065 as a
   derived dispatch quantity) is computed at dispatch time
-  as `predicate_fetched_requirement.predicate_columns ∩
-  requirement.output_columns`. Case B engages when this
-  set is non-empty (predicate columns are also in the
+  as a bool: whether
+  `predicate_fetched_requirement.predicate_columns ∩
+  requirement.output_columns` is non-empty. Case B engages
+  when the bool is true (predicate columns are also in the
   user's SELECT-list output); Case C engages when it is
-  empty (predicate fetched dense for evaluation only;
+  false (predicate fetched dense for evaluation only;
   predicate columns not in output).
   `predicate_fetched_requirement` retains its current
   production role for the projection-fetch exclusion at
@@ -552,7 +566,7 @@ trivial against current writer output. Key findings:
 pub(crate) fn filtered_predicate_page_batch(
     predicate_batch: &ProjectedRecordBatch,
     page: EncodingPageDescriptor,
-    page_local_survivors: &EncodedRowMask,
+    local_mask: &BooleanArray,
 ) -> Result<ProjectedRecordBatch, ArrowError>;
 ```
 
@@ -638,7 +652,7 @@ wrapper.
 
 `sparse_projection_fetch.rs` lifts the
 `dense_predicate_batches_present` decline. The planner now
-inspects only the survival mask and projection metadata:
+inspects only exact survival masks and projection metadata:
 
 - mask exact + remaining projection requirement non-empty
   + remaining projection eligible → engage sparse
@@ -648,21 +662,16 @@ inspects only the survival mask and projection metadata:
 - mask exact + remaining projection empty (predicate-only
   query) → no sparse projection planning needed (existing
   dense path handles trivially);
-- mask not exact (Maybe survivors remain) → decline with
-  private `MaybeMaskSurvivor` reason;
-- decoded predicate batch covers multiple row groups →
-  decline with private `PredicateBatchRowGroupSplit`
-  reason (defensive guard);
-- predicate-batch row span insufficient for page slicing →
-  decline with private `PredicateBatchRowSpanMismatch`
-  reason.
+- predicate-batch page-span and row-count invariant
+  failures are manager-side fail-closed runtime errors
+  after sparse fetch begins. V1 does not add planner-level
+  private decline variants for these checks.
 
 The `dense_predicate_batches_present` field is removed
 from `SparseProjectionFetchInput` (decisive removal, not
 rename). The `DensePredicateBatchPresent` variant of
-`SparseProjectionFetchDecline` is removed from active use
-(retained as a deprecated variant only if any test
-fixture depends on it; otherwise removed).
+`SparseProjectionFetchDecline` is removed rather than
+replaced with unused private variants.
 
 Decline reasons remain private; no public taxonomy
 change.
@@ -780,11 +789,9 @@ Incremental guards in `tests/architecture_test.rs`:
   guard).
 - `zip_predicate_and_projection_columns` lives in
   `src/storage/row_group.rs`.
-- `SparseProjectionFetchDecline` remains private; new
-  private decline reasons (`MaybeMaskSurvivor`,
-  `PredicateBatchRowSpanMismatch`,
-  `PredicateBatchRowGroupSplit`) do not surface in metrics
-  or public fallbacks.
+- `SparseProjectionFetchDecline` remains private; ADR 065
+  adds no public fallback / reject taxonomy and no unused
+  private decline variants.
 - Sparse projection planner consumes only survival masks
   and projection metadata; no decoded Arrow batches reach
   the planner.
@@ -813,9 +820,7 @@ Incremental guards in `tests/architecture_test.rs`:
 - No version suffix or planning-phase identifier on new
   symbols. (`zip_predicate_and_projection_columns`,
   `filtered_predicate_page_batch`,
-  `SparseProjectionPageBatch`, `MaybeMaskSurvivor`,
-  `PredicateBatchRowSpanMismatch`,
-  `PredicateBatchRowGroupSplit` are semantic.)
+  `SparseProjectionPageBatch` are semantic.)
 - No project-name prefix.
 - ADR 020 §2 AAD layout, ADR 022 §3 / §5 byte layouts,
   ADR 056 / 057 / 063 directory shapes, ADR 058 / 059
@@ -892,9 +897,6 @@ cadence):
 - predicate batch row-span slicing correctness on byte-
   aligned and non-byte-aligned page boundaries (1,025-
   rows-per-page fixture);
-- Maybe-survivor decline control: a fixture where Maybe-
-  mask slices remain after upstream evaluation, declining
-  with the private `MaybeMaskSurvivor` reason;
 - Case C no-overlap dense fallback control;
 - composability with ADR 061 (p50 / p95 GET payload
   unchanged on dense-zip fixtures);
@@ -941,8 +943,9 @@ ADR 065 does not ship:
 - **Mixed sparse / dense projected columns within one
   materialization pass.** Inherited ADR 060 deferral.
 - **Re-evaluating predicates after a Maybe slice
-  survives.** ADR 065 declines on Maybe survivors;
-  predicate re-evaluation is upstream.
+  survives.** Predicate re-evaluation is upstream. ADR
+  065 V1 engages after exact masks are available and adds
+  no Maybe-specific sparse-projection decline variant.
 - **Row-group-grain assembly.** Explicit architectural
   rejection; page-grain only.
 - **Filler-based full-row-group sparse reconstruction.**
@@ -1138,8 +1141,9 @@ ADR 065 promotes from council-converged → shipped when:
    `ProjectedRecordBatch` via
    `empty_projected_batch_for_requirement`.
 5. `All` masks route to dense.
-6. Maybe-mask survivors decline with the private
-   `MaybeMaskSurvivor` reason.
+6. ADR 065 adds no unused private sparse-projection
+   decline variants; non-exact predicate masks remain an
+   upstream encoding-compute concern in V1.
 7. Page-grain row-span slicing is correct for byte-aligned
    and non-byte-aligned page boundaries (including 1,025-
    rows-per-page fixture).
@@ -1163,9 +1167,9 @@ ADR 065 promotes from council-converged → shipped when:
 11. ADR 064 nullable sparse projection composes (nullable
     predicate column + nullable projected column); shared
     helper retained.
-12. Predicate-batch row-group-split and row-span-mismatch
-    fixtures (if constructible) decline with the private
-    decline reasons.
+12. Predicate-batch row-span and row-count invariant
+    fixtures fail closed through manager-side storage /
+    Arrow errors when constructible.
 13. ADR 063 ExactMatch and Maybe-driven dense COCD
     fixtures both produce mask-only `PhaseBOutcome` and
     engage Case A (regression confirmation: the encoding-

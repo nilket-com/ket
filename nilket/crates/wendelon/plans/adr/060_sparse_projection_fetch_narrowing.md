@@ -29,10 +29,9 @@ predicate-column pages as `Disjoint`, `ExactMatch`, or
 `Maybe`; the engaged narrowed path returns a mask-only
 `PhaseBOutcome` and leaves `decoded_predicate_batches` empty.
 That exact mask feeds ADR 060's sparse projection planner
-unchanged. Dense predicate-zip with sparse projection remains
-deferred; ADR 063 narrows predicate bytes before mask
-construction rather than mixing dense predicate batches into
-projection fetch.
+unchanged. ADR 063 still emits mask-only `PhaseBOutcome` in
+V1; it narrows predicate bytes before mask construction and
+does not populate decoded predicate projection batches.
 
 ADR 064 (Nullable Sparse Projection) is now implemented and
 promoted, lifting ADR 060's
@@ -47,7 +46,7 @@ behind a private planner reason. Row groups with
 `column_null_counts == 0` for nullable Arrow fields stay on
 the existing all-valid sparse path with zero validity-byte
 fetches. Mask-first ordering preserved (`None` /
-`All` / `decoded_predicate_batches` declines unchanged). The
+`All` ordering unchanged). The
 bench artifact at
 `plans/impl/064_nullable_sparse_projection_bench_results.md`
 records 5.36x-19.98x plaintext-byte reduction and
@@ -55,8 +54,27 @@ records 5.36x-19.98x plaintext-byte reduction and
 BitPacked and Dictionary fixtures, with explicit
 ExactMatch-driven and Maybe-driven projection page rows
 documenting the multiplicative composition with ADR 063.
+
+ADR 065 (Dense Predicate-Zip with Sparse Projection) is now
+implemented and promoted. It lifts ADR 060's former dense-
+predicate-batch cliff for the scalar dense-decode branch: when
+`predicate_projection_by_group` is populated and the survival
+mask is exact, the sparse projection planner still engages for
+the remaining projection requirement. Case B zips page-local
+dense predicate batches with sparse-projected pages when
+predicate/output overlap exists; Case C skips zip and keeps
+projection-side sparse fetch when the dense predicate columns
+are not user-visible output. Predicate bytes are sunk; ADR 060
+projection economics remain
+`sparse_projection_plaintext_bytes <
+dense_projection_plaintext_bytes`. Encoding-compute paths
+from ADR 058 / 059 / 063 remain Case A mask-only sparse
+projection in V1. Bench evidence is recorded at
+`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+
 Encoded-validity page decoding, variable-width sparse
-projection, all-null page-skip, and dense predicate-zip
+projection, all-null page-skip, sparse predicate-column fetch,
+and native FSST / ALP / RLE-value-run / float evaluators
 remain V2.
 
 ## Context
@@ -920,25 +938,20 @@ recorded in the V1 changeset, and **non-blocking
 for BitPacked / Dictionary promotion**. RLE value-
 run format work remains a separate ADR.
 
-**Nullable fixed-width support — deferred.**
+**Nullable fixed-width support — closed by ADR 064.**
 
-V1 routes nullable projected columns to dense.
-Adding sparse support requires fetching the
-validity-bitmap pages alongside the value pages
-and slicing both. Implementation cost is real
-but bounded; deferred to a follow-up ADR after V1
-validates the non-null path. Council consensus.
+ADR 064 lifts the nullable projected-column decline for raw
+byte-addressable validity buffers. Encoded-validity page
+decoding remains a separate follow-up.
 
-**Dense predicate-zip with sparse projection —
-deferred.**
+**Dense predicate-zip with sparse projection — closed by
+ADR 065.**
 
-V1 engages only for exact-COCD predicate-
-evaluation masks where
-`decoded_predicate_batches` is empty. Including
-dense predicate-column zip would require page-
-sliced zipping with its own row-alignment
-correctness story. Deferred to a follow-up ADR.
-Council consensus.
+ADR 065 lifts the dense-predicate-batch sparse-projection
+cliff for the scalar dense-decode branch while keeping the
+planner metadata-only and the projection economic gate
+unchanged. Sparse predicate-column fetch and page-sliced PBC
+evaluation remain separate follow-up ADRs.
 
 ## What not to do
 

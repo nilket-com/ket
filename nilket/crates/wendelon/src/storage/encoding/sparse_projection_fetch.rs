@@ -62,7 +62,6 @@ pub(crate) enum SparseProjectionFetchDecision {
 pub(crate) enum SparseProjectionFetchDecline {
 	AllRowsMask,
 	MissingExactCocdMask,
-	DensePredicateBatchPresent,
 	CascadeNotPageEmitting,
 	CascadeNotProjectionEligible,
 	EncodedValidityBufferUnsupported,
@@ -88,7 +87,6 @@ pub(crate) struct SparseProjectionFetchInput<'a> {
 	pub dense_body_ranges: &'a [RecordBodyByteRange],
 	pub row_group_config: &'a L2RowGroupFetchConfig,
 	pub encoding_config: &'a L2EncodingFetchConfig,
-	pub dense_predicate_batches_present: bool,
 }
 
 impl RowToPageMap {
@@ -116,11 +114,6 @@ pub(crate) fn decide_sparse_projection_fetch(
 ) -> SparseProjectionFetchDecision {
 	if !input.row_group_config.enabled || !input.encoding_config.enabled {
 		return SparseProjectionFetchDecision::Decline(SparseProjectionFetchDecline::Disabled);
-	}
-	if input.dense_predicate_batches_present {
-		return SparseProjectionFetchDecision::Decline(
-			SparseProjectionFetchDecline::DensePredicateBatchPresent,
-		);
 	}
 	let Some(physical_ordinals) =
 		required_projected_physical_ordinals(input.record_directory, input.requirement)
@@ -785,38 +778,15 @@ mod tests {
 			outcome: &PhaseBOutcome,
 			dense_ranges: &[RecordBodyByteRange],
 		) -> SparseProjectionFetchDecision {
-			self.decide_for_groups_with_dense_predicate_batches(
-				requirement,
-				outcome,
-				dense_ranges,
-				&[RowGroupIndex::ZERO],
-				false,
-			)
+			self.decide_for_groups(requirement, outcome, dense_ranges, &[RowGroupIndex::ZERO])
 		}
 
-		fn decide_with_dense_predicate_batches(
-			&self,
-			requirement: &ColumnFetchRequirement,
-			outcome: &PhaseBOutcome,
-			dense_ranges: &[RecordBodyByteRange],
-			dense_predicate_batches_present: bool,
-		) -> SparseProjectionFetchDecision {
-			self.decide_for_groups_with_dense_predicate_batches(
-				requirement,
-				outcome,
-				dense_ranges,
-				&[RowGroupIndex::ZERO],
-				dense_predicate_batches_present,
-			)
-		}
-
-		fn decide_for_groups_with_dense_predicate_batches(
+		fn decide_for_groups(
 			&self,
 			requirement: &ColumnFetchRequirement,
 			outcome: &PhaseBOutcome,
 			dense_ranges: &[RecordBodyByteRange],
 			selected_groups: &[RowGroupIndex],
-			dense_predicate_batches_present: bool,
 		) -> SparseProjectionFetchDecision {
 			decide_sparse_projection_fetch(SparseProjectionFetchInput {
 				record_directory: &self.record_directory,
@@ -828,7 +798,6 @@ mod tests {
 				dense_body_ranges: dense_ranges,
 				row_group_config: &self.row_group_config,
 				encoding_config: &self.encoding_config,
-				dense_predicate_batches_present,
 			})
 		}
 	}
@@ -1020,17 +989,31 @@ mod tests {
 	}
 
 	#[test]
-	fn dense_predicate_batch_declines_sparse_projection() {
+	fn dense_predicate_batch_does_not_decline_sparse_projection() {
 		let fixture = PlannerFixture::new(16, 4, 32, 0);
-		assert_decline(
-			fixture.decide_with_dense_predicate_batches(
-				&output_requirement(),
-				&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
-				&[dense_range()],
-				true,
-			),
-			SparseProjectionFetchDecline::DensePredicateBatchPresent,
+		let mut outcome = outcome(BooleanArray::from_iter((0..16).map(|row| row == 1)));
+		outcome.decoded_predicate_batches.insert(
+			RowGroupIndex::ZERO,
+			arrow::record_batch::RecordBatch::try_new(
+				std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+					arrow::datatypes::Field::new(
+						"predicate",
+						arrow::datatypes::DataType::Int64,
+						false,
+					),
+				])),
+				vec![std::sync::Arc::new(
+					arrow::array::Int64Array::from_iter_values(0..16),
+				)],
+			)
+			.unwrap(),
 		);
+		let SparseProjectionFetchDecision::Sparse(plan) =
+			fixture.decide(&output_requirement(), &outcome, &[dense_range()])
+		else {
+			panic!("dense predicate batch must not decline sparse projection");
+		};
+		assert_eq!(plan.selected_groups, vec![RowGroupIndex::ZERO]);
 	}
 
 	#[test]
@@ -1304,12 +1287,11 @@ mod tests {
 			)]),
 			..PhaseBOutcome::default()
 		};
-		let decision = fixture.decide_for_groups_with_dense_predicate_batches(
+		let decision = fixture.decide_for_groups(
 			&output_requirement(),
 			&outcome,
 			&[dense_range()],
 			&[group_one],
-			false,
 		);
 		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
 			panic!("expected row-group-local raw validity path, got {decision:?}");

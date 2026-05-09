@@ -4543,7 +4543,10 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	for required in [
 		"decide_sparse_projection_fetch(SparseProjectionFetchInput",
 		"materialize_sparse_projection_pages",
-		"dense_predicate_batches_present",
+		"materialize_sparse_projection_page_batches",
+		"predicate_output_overlap",
+		"filtered_predicate_page_batch",
+		"zip_predicate_and_projection_columns",
 		"predicate_outcome: &predicate_outcome",
 		"plan.validity_fetches",
 		"rebase_validity_bitmap",

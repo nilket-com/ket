@@ -20,9 +20,10 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 065 (Dense Predicate-Zip with Sparse Projection) is
-council-converged across Claude / Codex / Gemini after six
-iterations; plan-stage commit pending implementation. Phase
-0 read-only audit completed against
+implemented and promoted to shipped with bench evidence at
+`plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+Council-converged across Claude / Codex / Gemini after six
+iterations. Phase 0 read-only audit completed against
 `src/storage/manager.rs`,
 `src/storage/encoding/sparse_projection_fetch.rs`, and
 `src/storage/row_group.rs`; engagement surface confirmed
@@ -75,26 +76,26 @@ sparse projection side stays ADR 064 fixed-width nullable.
 **Predicate bytes are sunk** in the projection economic
 gate (`sparse_projection_plaintext_bytes <
 dense_projection_plaintext_bytes`); bench artifact records
-total-query bytes on a separate axis. **Three-axis
-promotion gate**: clustered 5% rows ≥ 1.5× remaining-
-projection plaintext bytes AND ≥ 1.25× total query
-plaintext bytes AND ≥ 1.2× wall-clock improvement; ≥ 3×
-recorded as headline diagnostic, not gating. Phase 0 pre-
-modeling shows 1.25× achievable (4.8× on representative
-wide-table fixtures at clustered 5%). Synthetic always-
-dense-fallback bench fixture as drift-resistant regression
-baseline across future native-evaluator widening (FSST /
-ALP / RLE-value-run / float). **Architectural
+total-query bytes on a separate axis. **Promotion passed on
+three axes**: clustered 5% representative rows clear ≥ 1.5×
+remaining-projection plaintext bytes, ≥ 1.25× total-query
+plaintext bytes, and ≥ 1.2× wall-clock improvement; ≥ 3×
+remaining-projection reduction recorded as headline
+diagnostic. Synthetic always-dense-fallback bench fixture
+remains the drift-resistant regression baseline across
+future native-evaluator widening (FSST / ALP / RLE-value-
+run / float). **Architectural
 inextricability**: mask must be exact before zip engages;
 predicate and projection filtered with same page-local
 mask; dense predicate fetch is not sparse predicate fetch;
 sparse zip output bypasses
 `apply_phase_b_masks_to_projected_row_groups` (already
 page-filtered); page-local assembly invariant (no filler
-reconstruction). Private decline reasons
-(`MaybeMaskSurvivor`, `PredicateBatchRowSpanMismatch`,
-`PredicateBatchRowGroupSplit`) stay internal. **Naming
-reconciliation per
+reconstruction). V1 does not add planner-level private
+decline variants for Maybe-mask survivors or predicate-batch
+page-span / row-count invariants; manager-side checks fail
+closed via existing storage / Arrow errors after sparse fetch
+begins. **Naming reconciliation per
 `plans/conventions/no-planning-phase-names.md`**: ADR 065
 uses semantic names throughout; production already has
 semantic locals; residual phase-named identifiers
@@ -141,9 +142,10 @@ nullable Arrow fields stay on the existing all-valid sparse
 path. Page-local validity rebase
 (`rebase_validity_bitmap` in `page_materialize.rs`) handles
 byte-aligned and non-byte-aligned page starts. Mask-first
-ordering preserved (`None` / `All` / `decoded_predicate_batches`
-declines all unchanged). Mask-only Phase B contract preserved;
-dense predicate-zip remains a separate ADR.
+ordering preserved (`None` / `All` unchanged). ADR 065 later
+lifts the dense-predicate-batch decline for the scalar dense-
+decode branch while keeping ADR 064's nullable projection
+catalog unchanged.
 **Composability with ADR 063 multiplicative**: ADR 063
 narrows predicate bytes, ADR 064 narrows projection bytes;
 the bench artifact records ExactMatch-driven and Maybe-driven
@@ -1299,9 +1301,10 @@ deferral. The forward shape continues at #21.
     (`rebase_validity_bitmap` helper in
     `page_materialize.rs`) handles byte-aligned and non-byte-
     aligned page starts. Mask-first ordering preserved
-    (`None` / `All` / `decoded_predicate_batches` declines
-    unchanged). Mask-only Phase B contract preserved; dense
-    predicate-zip remains a separate ADR. **Composability
+    (`None` / `All` unchanged). ADR 065 later lifts the
+    dense-predicate-batch decline for the scalar dense-decode
+    branch while leaving ADR 064's nullable projection catalog
+    unchanged. **Composability
     with ADR 063 multiplicative**: ADR 063 narrows predicate
     bytes, ADR 064 narrows projection bytes; bench artifact
     records ExactMatch-driven and Maybe-driven projection
@@ -1335,9 +1338,11 @@ deferral. The forward shape continues at #21.
     `plans/impl/064_nullable_sparse_projection_bench_results.md`.
 
 21. **Dense predicate-zip with sparse projection** — ADR 065
-    council-converged across Claude / Codex / Gemini after
-    six iterations; plan-stage commit pending implementation.
-    Phase 0 read-only audit completed against
+    implemented and promoted to shipped with bench evidence
+    at
+    `plans/impl/065_dense_predicate_zip_with_sparse_projection_bench_results.md`.
+    Council-converged across Claude / Codex / Gemini after
+    six iterations. Phase 0 read-only audit completed against
     `src/storage/manager.rs`,
     `src/storage/encoding/sparse_projection_fetch.rs`, and
     `src/storage/row_group.rs`; engagement surface confirmed
@@ -1387,23 +1392,24 @@ deferral. The forward shape continues at #21.
     dense_projection_plaintext_bytes` unchanged from ADR
     060 / 064. Bench artifact records total query bytes
     (predicate decode + projection) on a separate axis.
-    **Three-axis promotion gate**: clustered 5% rows ≥
-    1.5× remaining-projection plaintext bytes AND ≥ 1.25×
-    total query plaintext bytes AND ≥ 1.2× wall-clock
-    improvement. Phase 0 pre-modeling shows 1.25× is
-    achievable (4.8× on representative wide-table fixtures).
-    Synthetic always-dense-fallback bench fixture as
-    regression-stable baseline across future native-
-    evaluator widening (FSST / ALP / RLE-value-run / float).
+    **Three-axis promotion gate passed**: clustered 5% rows
+    clear ≥ 1.5× remaining-projection plaintext bytes, ≥
+    1.25× total-query plaintext bytes, and ≥ 1.2× wall-clock
+    improvement. Synthetic always-dense-fallback bench fixture
+    remains the regression-stable baseline across future
+    native-evaluator widening (FSST / ALP / RLE-value-run /
+    float).
     **Architectural inextricability**: mask must be exact
     before zip engages; predicate and projection filtered
     with same page-local mask; dense predicate fetch is not
     sparse predicate fetch; sparse zip output bypasses
     `apply_phase_b_masks_to_projected_row_groups` (already
     page-filtered); page-local assembly invariant (no filler
-    reconstruction). Private decline reasons
-    (`MaybeMaskSurvivor`, `PredicateBatchRowSpanMismatch`,
-    `PredicateBatchRowGroupSplit`) stay internal.
+    reconstruction). V1 does not add planner-level private
+    decline variants for Maybe-mask survivors or predicate-
+    batch page-span / row-count invariants; manager-side
+    checks fail closed via existing storage / Arrow errors
+    after sparse fetch begins.
     **Naming reconciliation per
     `plans/conventions/no-planning-phase-names.md`**: ADR
     065 uses semantic names throughout; production already
@@ -1889,20 +1895,24 @@ StateDigest substrate                            (ADR 046)
   → nullable sparse projection                   (ADR 064)
     (raw byte-addressable validity only;                   (shipped)
      ADR 060 nullable extension)
+  → dense predicate-zip with sparse projection    (ADR 065)
+    (scalar dense-decode branch only;                       (shipped)
+     ADR 063 encoding-compute paths stay Case A)
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle) ← here
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is past ADR 063 (implemented and promoted to
+Design tip is past ADR 065 (implemented and promoted to
 shipped with bench evidence). The storage hierarchy is shipped
-through ADR 063 (row groups, per-buffer
+through ADR 065 (row groups, per-buffer
 pages + encoding cascades, compute over encoded data substrate,
 native per-cascade kernels, sparse projection fetch narrowing,
 page-aligned AEAD chunks, deployment-wide row-group sizing
 profile, page-level predicate stats, predicate-fetch
-narrowing). ADR 063 amends ADR 057 with an additive
+narrowing, nullable sparse projection, and dense predicate-
+zip with sparse projection). ADR 063 amends ADR 057 with an additive
 `BufferEncoding.page_stats` field (format-version bump, no
 compat decoder) and adds an internal predicate-page fetch
 planner that narrows Phase B predicate fetch to surviving
@@ -1930,7 +1940,11 @@ default-off disposition; ADR 061's Phase 9 artifact closes
 the ciphertext floor and macro-block coalescing gates;
 ADR 062's bench evidence pinned the `Scan` target at
 65,536 rows; ADR 063's bench evidence records the predicate-
-fetch narrowing gates and metadata envelope.
+fetch narrowing gates and metadata envelope; ADR 064's bench
+evidence records nullable value+validity sparse projection;
+ADR 065's bench evidence records scalar dense-predicate zip
+with sparse projection and the narrowed V1 boundary where ADR
+063 encoding-compute paths remain Case A mask-only.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
 default-enabled native-kernel set; ADR 060 closed the encoded-
@@ -1944,12 +1958,13 @@ predicate-fetch-narrowing follow-up that ADR 062's `Scan`
 profile makes load-bearing (65K-row groups × ~64 pages per
 buffer make page-grain pruning a 5–10× predicate-fetch byte
 reduction on clustered low-selectivity workloads).
-**The council's lean on next pickup:** ADR 064 nullable
-sparse projection (#20) is shipped. Pick from the remaining
-Toron-adjacent follow-up family (FSST evaluator, RLE
-value-run format, sparse predicate-column fetch, dense
-predicate-zip with sparse projection, encoded-validity page
-decoding, all-null page-skip — each its own ADR); or
-capacity-tier compression / serverless PBC / erasure-coding
-work (#21). CDC follow-ups (#22) and vector embeddings (#23)
-remain deferred behind the storage hierarchy in this stretch.
+**The council's lean on next pickup:** ADR 065 dense
+predicate-zip with sparse projection (#21) is shipped. Pick
+from the remaining Toron-adjacent follow-up family (FSST
+evaluator, ALP evaluator, RLE value-run format, sparse
+predicate-column fetch, variable-width sparse projection,
+encoded-validity page decoding, all-null page-skip — each its
+own ADR); or capacity-tier compression / serverless PBC /
+erasure-coding work (#22). CDC follow-ups (#23) and vector
+embeddings (#24) remain deferred behind the storage hierarchy
+in this stretch.

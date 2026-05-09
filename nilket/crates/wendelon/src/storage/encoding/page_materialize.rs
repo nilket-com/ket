@@ -11,7 +11,7 @@ use crate::storage::columnar::{
 use crate::storage::encoding::cascade::decode_page;
 use crate::storage::encoding::{BufferEncoding, EncodingCascade, EncodingPageDescriptor};
 use crate::storage::row_group::RecordBodyByteRange;
-use arrow::array::new_null_array;
+use arrow::array::{Array, BooleanArray, new_null_array};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatchOptions;
 use std::collections::{BTreeMap, BTreeSet};
@@ -545,6 +545,46 @@ pub(crate) fn empty_projected_batch_for_requirement(
 	})
 }
 
+pub(crate) fn filtered_predicate_page_batch(
+	predicate_batch: &ProjectedRecordBatch,
+	page: EncodingPageDescriptor,
+	local_mask: &BooleanArray,
+) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
+	let start = page.first_value_index.get() as usize;
+	let len = page.value_count.get() as usize;
+	if local_mask.len() != len {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"predicate page mask length {} does not match page row count {}",
+			local_mask.len(),
+			len
+		)));
+	}
+	if start
+		.checked_add(len)
+		.is_none_or(|end| end > predicate_batch.batch.num_rows())
+	{
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"predicate page row span {}..{} exceeds predicate batch row count {}",
+			start,
+			start.saturating_add(len),
+			predicate_batch.batch.num_rows()
+		)));
+	}
+	let page_batch = predicate_batch.slice(start, len);
+	if local_mask.true_count() == 0 {
+		return Ok(page_batch.slice(0, 0));
+	}
+	if local_mask.null_count() == 0 && local_mask.true_count() == local_mask.len() {
+		return Ok(page_batch);
+	}
+	let batch = arrow::compute::filter_record_batch(&page_batch.batch, local_mask)?;
+	Ok(ProjectedRecordBatch {
+		batch,
+		ordinal_mapping: page_batch.ordinal_mapping,
+		storage_mapping: page_batch.storage_mapping,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -553,6 +593,9 @@ mod tests {
 		RecordBodyByteLen, RecordBodyByteOffset,
 	};
 	use crate::storage::encoding::EncodedBufferByteRange;
+	use arrow::array::{ArrayRef, Int64Array, StringArray};
+	use arrow::datatypes::Field;
+	use arrow::record_batch::RecordBatch;
 
 	fn page(first_value_index: u32, value_count: u32) -> EncodingPageDescriptor {
 		EncodingPageDescriptor {
@@ -564,6 +607,150 @@ mod tests {
 				len: RecordBodyByteLen::ZERO,
 			},
 		}
+	}
+
+	fn projected_i64_batch(values: std::ops::Range<i64>) -> ProjectedRecordBatch {
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new(
+				"selector",
+				DataType::Int64,
+				false,
+			)])),
+			vec![Arc::new(Int64Array::from_iter_values(values)) as ArrayRef],
+		)
+		.unwrap();
+		ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: ColumnOrdinalMapping::new(vec![Some(0)]),
+			storage_mapping: BTreeMap::new(),
+		}
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_slices_and_filters_page_rows() {
+		let predicate = projected_i64_batch(0..12);
+		let filtered = filtered_predicate_page_batch(
+			&predicate,
+			page(4, 4),
+			&BooleanArray::from(vec![true, false, true, false]),
+		)
+		.unwrap();
+		let values = filtered
+			.batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(values.values(), &[4, 6]);
+		assert_eq!(filtered.ordinal_mapping, predicate.ordinal_mapping);
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_keeps_all_true_page_slice() {
+		let predicate = projected_i64_batch(0..12);
+		let filtered = filtered_predicate_page_batch(
+			&predicate,
+			page(8, 4),
+			&BooleanArray::from(vec![true, true, true, true]),
+		)
+		.unwrap();
+		let values = filtered
+			.batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(values.values(), &[8, 9, 10, 11]);
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_handles_non_byte_aligned_page_start() {
+		let predicate = projected_i64_batch(0..12);
+		let filtered = filtered_predicate_page_batch(
+			&predicate,
+			page(5, 4),
+			&BooleanArray::from(vec![false, true, false, true]),
+		)
+		.unwrap();
+		let values = filtered
+			.batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(values.values(), &[6, 8]);
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_preserves_zero_survivor_schema() {
+		let predicate = projected_i64_batch(0..12);
+		let filtered = filtered_predicate_page_batch(
+			&predicate,
+			page(4, 4),
+			&BooleanArray::from(vec![false, false, false, false]),
+		)
+		.unwrap();
+		assert_eq!(filtered.batch.num_rows(), 0);
+		assert_eq!(filtered.batch.schema(), predicate.batch.schema());
+		assert_eq!(filtered.ordinal_mapping, predicate.ordinal_mapping);
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_slices_variable_width_predicate_column() {
+		let batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("tag", DataType::Utf8, false)])),
+			vec![Arc::new(StringArray::from_iter_values([
+				"a", "b", "c", "d", "e", "f",
+			])) as ArrayRef],
+		)
+		.unwrap();
+		let predicate = ProjectedRecordBatch {
+			batch,
+			ordinal_mapping: ColumnOrdinalMapping::new(vec![Some(0)]),
+			storage_mapping: BTreeMap::new(),
+		};
+		let filtered = filtered_predicate_page_batch(
+			&predicate,
+			page(1, 4),
+			&BooleanArray::from(vec![true, false, true, true]),
+		)
+		.unwrap();
+		let values = filtered
+			.batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.unwrap();
+		assert_eq!(values.value(0), "b");
+		assert_eq!(values.value(1), "d");
+		assert_eq!(values.value(2), "e");
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_rejects_bad_page_mask_length() {
+		let predicate = projected_i64_batch(0..12);
+		let err = filtered_predicate_page_batch(
+			&predicate,
+			page(4, 4),
+			&BooleanArray::from(vec![true, false]),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("does not match page row count"));
+	}
+
+	#[test]
+	fn filtered_predicate_page_batch_rejects_page_span_outside_predicate_batch() {
+		let predicate = projected_i64_batch(0..12);
+		let err = filtered_predicate_page_batch(
+			&predicate,
+			page(10, 4),
+			&BooleanArray::from(vec![true, true, true, true]),
+		)
+		.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("exceeds predicate batch row count")
+		);
 	}
 
 	#[test]

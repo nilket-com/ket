@@ -49,8 +49,17 @@ buffers with `EncodingDirectory` entries decline to dense
 behind a private planner reason. No implementation-time
 scope expansion.
 
-This ADR intentionally does not touch dense predicate-zip
-with sparse projection, sparse predicate-column fetch,
+ADR 065 is now shipped and composes with ADR 064 for the
+scalar dense-decode branch: nullable fixed-width projection
+columns can remain on the sparse projection path while dense
+predicate columns are page-sliced and zipped from
+`predicate_projection_by_group`. ADR 065 does not broaden ADR
+064's projection catalog; sparse projected columns remain
+fixed-width with raw byte-addressable validity in V1, and ADR
+063 encoding-compute rows remain Case A mask-only sparse
+projection.
+
+This ADR still does not touch sparse predicate-column fetch,
 encoded-validity page decoding, RLE value-run, FSST / ALP
 evaluators, variable-width sparse projection, all-null
 page-skip optimization, or any public protocol surface.
@@ -125,7 +134,10 @@ shape; just one more byte range per nullable column.
 
 - **No lift of ADR 060 / ADR 063's mask-only Phase B
   contract.** Sparse projection still engages only when
-  `phase_b_outcome.decoded_predicate_batches` is empty.
+  `phase_b_outcome.decoded_predicate_batches` is empty in
+  ADR 064 itself. ADR 065 later lifts this for the scalar
+  dense-decode branch without changing ADR 064's nullable
+  projection catalog.
 - **No variable-width nullable.** Separate ADR.
 - **No new format version.** ADR 057's `EncodingDirectory`
   byte layout is unchanged.
@@ -637,8 +649,10 @@ ADR 064 does not ship:
   catalog in V1.
 - **Mixed sparse / dense projected columns within one
   materialization pass.** Inherited deferral from ADR 060.
-- **Dense predicate-zip with sparse projection.** **V2:**
-  dense predicate-zip ADR.
+- **Dense predicate-zip with sparse projection.** Closed by
+  ADR 065 for scalar dense-decode predicates. Encoding-
+  compute materialization into predicate projection batches
+  remains future work.
 - **Sparse predicate-column fetch for non-COCD
   predicates.** Different correctness story; separate ADR.
 - **RLE value-run / FSST / ALP / Delta sparse
@@ -758,9 +772,9 @@ ADR 056 row-group fetch + per-row-group stats + page directory
     counts not used to skip validity fetches; V1 type
     catalog mirrors ADR 060's actual current catalog)
     ← here
+  → dense predicate-zip with sparse projection (ADR 065)
   → next Toron-adjacent follow-ups (FSST evaluator,
     RLE value-run, sparse predicate-column fetch,
-    dense predicate-zip with sparse projection,
     variable-width nullable sparse projection,
     encoded-validity page decoding, all-null
     page-skip optimization)
