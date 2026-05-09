@@ -4544,7 +4544,7 @@ fn test_adr060_sparse_projection_fetch_guards() {
 		"decide_sparse_projection_fetch(SparseProjectionFetchInput",
 		"materialize_sparse_projection_pages",
 		"dense_predicate_batches_present",
-		"predicate_outcome: &phase_b_outcome",
+		"predicate_outcome: &predicate_outcome",
 		"plan.validity_fetches",
 		"rebase_validity_bitmap",
 		"observe_storage_l2_encoding_simd_pages_fetched",

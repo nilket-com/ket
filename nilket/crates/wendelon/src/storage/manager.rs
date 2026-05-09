@@ -9720,10 +9720,10 @@ impl SlabManager {
 			}
 			let point_read = selected_record_rows.is_none();
 			let mut predicate_fetched_groups = Vec::new();
-			let mut phase_b_fetch = None;
-			let mut phase_b_requirement_for_zip = ColumnFetchRequirement::default();
-			let mut phase_b_projected_by_group = HashMap::new();
-			let mut phase_b_outcome = crate::storage::row_group::PhaseBOutcome::default();
+			let mut predicate_fetch = None;
+			let mut predicate_fetched_requirement = ColumnFetchRequirement::default();
+			let mut predicate_projection_by_group = HashMap::new();
+			let mut predicate_outcome = crate::storage::row_group::PhaseBOutcome::default();
 			let mut selected_groups = selected_groups;
 			if let Some(predicate) = predicate {
 				let predicate_kind = crate::storage::row_group::classify_pbc_for_row_group_pruning(
@@ -9786,7 +9786,7 @@ impl SlabManager {
 					});
 				}
 				if !predicate_fetched_groups.is_empty() {
-					if let Some(encoded_phase_b) = self
+					if let Some(encoded_predicate_read) = self
 						.try_read_encoding_compute_phase_b_from_l2(
 							l2.clone(),
 							pointer,
@@ -9803,8 +9803,8 @@ impl SlabManager {
 						)
 						.await?
 					{
-						phase_b_fetch = Some(encoded_phase_b.phase_b_fetch);
-						phase_b_outcome = encoded_phase_b.outcome;
+						predicate_fetch = Some(encoded_predicate_read.phase_b_fetch);
+						predicate_outcome = encoded_predicate_read.outcome;
 						let predicate_fetched_set = predicate_fetched_groups
 							.iter()
 							.copied()
@@ -9812,7 +9812,7 @@ impl SlabManager {
 						if point_read
 							&& predicate_fetched_set.contains(&group.row_group_index)
 							&& !phase_b_point_read_survives(
-								&phase_b_outcome,
+								&predicate_outcome,
 								group,
 								location.record_row_index,
 							)? {
@@ -9821,7 +9821,7 @@ impl SlabManager {
 								directory: page_directory.clone(),
 								surviving_groups: Vec::new(),
 								predicate_fetched_groups,
-								phase_b_fetch,
+								phase_b_fetch: predicate_fetch,
 								phase_c_fetch:
 									crate::storage::row_group::RowGroupRangeFetchPlan::default(),
 								logical_schema_fingerprint: page_directory
@@ -9849,97 +9849,98 @@ impl SlabManager {
 							});
 						}
 					}
-					if phase_b_fetch.is_none() {
-						let phase_b_requirement = ColumnFetchRequirement {
+					if predicate_fetch.is_none() {
+						let predicate_fetch_requirement = ColumnFetchRequirement {
 							predicate_columns: requirement.predicate_columns.clone(),
 							storage_columns: requirement.storage_columns.clone(),
 							..ColumnFetchRequirement::default()
 						};
-						if !phase_b_requirement.user_visible().is_empty()
-							|| !phase_b_requirement.storage_columns.is_empty()
+						if !predicate_fetch_requirement.user_visible().is_empty()
+							|| !predicate_fetch_requirement.storage_columns.is_empty()
 						{
-							let phase_b_body_byte_ranges =
+							let predicate_body_byte_ranges =
 								crate::storage::row_group::selected_row_group_record_body_ranges(
 									&directory,
 									&page_directory,
-									&phase_b_requirement,
+									&predicate_fetch_requirement,
 									&selected_groups,
 								)
 								.map_err(columnar_io_error)?;
-							let phase_b_body_ranges = phase_b_body_byte_ranges
+							let predicate_body_ranges = predicate_body_byte_ranges
 								.iter()
 								.map(|range| TieredPlaintextRange::new(range.start, range.len))
 								.collect::<Vec<_>>();
-							let phase_b_record_ranges = record_body_ranges_to_record_ranges(
+							let predicate_record_ranges = record_body_ranges_to_record_ranges(
 								header_size,
-								&phase_b_body_ranges,
+								&predicate_body_ranges,
 							)?;
-							let phase_b_tiered_plan =
+							let predicate_tiered_plan =
 								self.config.crypto.plan_tiered_multi_range_read(
 									pointer.slab_id,
 									metadata.size_bytes,
 									tail_window.as_ref(),
 									additional_metadata.as_deref(),
 									whole_record_range.clone(),
-									&phase_b_record_ranges,
+									&predicate_record_ranges,
 								)?;
-							phase_b_fetch = Some(
+							predicate_fetch = Some(
 								crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
-									&phase_b_tiered_plan,
-									&phase_b_body_byte_ranges,
+									&predicate_tiered_plan,
+									&predicate_body_byte_ranges,
 								),
 							);
-							let phase_b_ciphertext = fetch_tiered_ciphertext_runs(
+							let predicate_ciphertext = fetch_tiered_ciphertext_runs(
 								l2.clone(),
 								pointer,
-								&phase_b_tiered_plan,
+								&predicate_tiered_plan,
 								self.config.l2_row_group_fetch.max_parallel_range_gets.get()
 									as usize,
 							)
 							.await?;
-							let phase_b_plaintext =
-								phase_b_tiered_plan.decrypt(&phase_b_ciphertext)?;
+							let predicate_plaintext =
+								predicate_tiered_plan.decrypt(&predicate_ciphertext)?;
 							let user_column_count = descriptor.arrow_schema()?.fields().len();
 							let predicate_fetched_set = predicate_fetched_groups
 								.iter()
 								.copied()
 								.collect::<BTreeSet<_>>();
 							for group_index in &selected_groups {
-								let phase_b_projected =
+								let predicate_projection =
 							crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
 								&directory,
 								&page_directory,
-								&phase_b_requirement,
-								&phase_b_body_ranges,
-								&phase_b_plaintext,
+								&predicate_fetch_requirement,
+								&predicate_body_ranges,
+								&predicate_plaintext,
 									&[*group_index],
 							)
 							.map_err(arrow_io_error)?;
 								if predicate_fetched_set.contains(group_index) {
 									let survival_mask = survival_mask_projected_record_batch(
-										&phase_b_projected,
+										&predicate_projection,
 										predicate,
 										user_column_count,
 									)?;
-									phase_b_outcome
+									predicate_outcome
 										.decoded_predicate_batches
-										.insert(*group_index, phase_b_projected.batch.clone());
-									phase_b_outcome
+										.insert(*group_index, predicate_projection.batch.clone());
+									predicate_outcome
 										.survival_masks
 										.insert(*group_index, survival_mask);
 								}
-								phase_b_projected_by_group.insert(*group_index, phase_b_projected);
+								predicate_projection_by_group
+									.insert(*group_index, predicate_projection);
 							}
 							if point_read && predicate_fetched_set.contains(&group.row_group_index)
 							{
-								let survival_mask = phase_b_outcome
+								let survival_mask = predicate_outcome
 									.survival_masks
 									.get(&group.row_group_index)
 									.ok_or_else(|| {
 										Error::new(
 											ErrorKind::InvalidData,
 											format!(
-												"Phase B survival mask missing for target row group {}",
+												"predicate survival mask missing for target row group {}",
 												group.row_group_index.get()
 											),
 										)
@@ -9963,7 +9964,7 @@ impl SlabManager {
 									return Err(Error::new(
 										ErrorKind::InvalidData,
 										format!(
-											"record row index {} maps outside Phase B mask length {} for row group {}",
+											"record row index {} maps outside predicate survival mask length {} for row group {}",
 											location.record_row_index.get(),
 											survival_mask.len(),
 											group.row_group_index.get()
@@ -9978,7 +9979,7 @@ impl SlabManager {
 									directory: page_directory.clone(),
 									surviving_groups: Vec::new(),
 									predicate_fetched_groups,
-									phase_b_fetch,
+									phase_b_fetch: predicate_fetch,
 									phase_c_fetch:
 										crate::storage::row_group::RowGroupRangeFetchPlan::default(),
 									logical_schema_fingerprint: page_directory
@@ -10007,25 +10008,26 @@ impl SlabManager {
 									});
 								}
 							}
-							phase_b_requirement_for_zip = phase_b_requirement;
+							predicate_fetched_requirement = predicate_fetch_requirement;
 						}
 					}
 				}
 			}
-			let phase_c_requirement = if phase_b_fetch.is_some() {
-				requirement.excluding(&phase_b_requirement_for_zip)
+			let projection_fetch_requirement = if predicate_fetch.is_some() {
+				requirement.excluding(&predicate_fetched_requirement)
 			} else {
 				requirement.clone()
 			};
-			let phase_c_requirement_empty = phase_c_requirement.user_visible().is_empty()
-				&& phase_c_requirement.storage_columns.is_empty();
-			let dense_phase_c_body_byte_ranges = if phase_c_requirement_empty {
+			let projection_fetch_requirement_empty =
+				projection_fetch_requirement.user_visible().is_empty()
+					&& projection_fetch_requirement.storage_columns.is_empty();
+			let dense_projection_body_byte_ranges = if projection_fetch_requirement_empty {
 				Vec::new()
 			} else {
 				crate::storage::row_group::selected_row_group_record_body_ranges(
 					&directory,
 					&page_directory,
-					&phase_c_requirement,
+					&projection_fetch_requirement,
 					&selected_groups,
 				)
 				.map_err(columnar_io_error)?
@@ -10033,12 +10035,12 @@ impl SlabManager {
 			let mut sparse_projection_plan = None;
 			let mut projection_groups = selected_groups.clone();
 			let selected_body_byte_ranges = if !point_read
-				&& !phase_c_requirement_empty
-				&& phase_b_projected_by_group.is_empty()
-				&& !phase_b_outcome.survival_masks.is_empty()
+				&& !projection_fetch_requirement_empty
+				&& predicate_projection_by_group.is_empty()
+				&& !predicate_outcome.survival_masks.is_empty()
 			{
 				if let Some(encoding_directory) = directory.encoding_directory.as_ref() {
-					let dense_predicate_batches_present = phase_b_outcome
+					let dense_predicate_batches_present = predicate_outcome
 						.decoded_predicate_batches
 						.values()
 						.any(|batch| batch.num_columns() > 0);
@@ -10046,10 +10048,10 @@ impl SlabManager {
 						record_directory: &directory,
 						page_directory: &page_directory,
 						encoding_directory,
-						requirement: &phase_c_requirement,
-						predicate_outcome: &phase_b_outcome,
+						requirement: &projection_fetch_requirement,
+						predicate_outcome: &predicate_outcome,
 						selected_groups: &selected_groups,
-						dense_body_ranges: &dense_phase_c_body_byte_ranges,
+						dense_body_ranges: &dense_projection_body_byte_ranges,
 						row_group_config: &self.config.l2_row_group_fetch,
 						encoding_config: &self.config.l2_encoding_fetch,
 						dense_predicate_batches_present,
@@ -10062,14 +10064,14 @@ impl SlabManager {
 						}
 						SparseProjectionFetchDecision::Decline(reason) => {
 							let _ = reason;
-							dense_phase_c_body_byte_ranges.clone()
+							dense_projection_body_byte_ranges.clone()
 						}
 					}
 				} else {
-					dense_phase_c_body_byte_ranges.clone()
+					dense_projection_body_byte_ranges.clone()
 				}
 			} else {
-				dense_phase_c_body_byte_ranges.clone()
+				dense_projection_body_byte_ranges.clone()
 			};
 			let selected_body_ranges = selected_body_byte_ranges
 				.iter()
@@ -10085,17 +10087,18 @@ impl SlabManager {
 				whole_record_range.clone(),
 				&selected_record_ranges,
 			)?;
-			let phase_c_fetch = crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
-				&tiered_plan,
-				&selected_body_byte_ranges,
-			);
+			let projection_fetch =
+				crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
+					&tiered_plan,
+					&selected_body_byte_ranges,
+				);
 			let row_group_plan = crate::storage::row_group::RowGroupFetchPlan {
 				record_id: page_directory.record_id,
 				directory: page_directory.clone(),
 				surviving_groups: projection_groups.to_vec(),
 				predicate_fetched_groups,
-				phase_b_fetch,
-				phase_c_fetch,
+				phase_b_fetch: predicate_fetch,
+				phase_c_fetch: projection_fetch,
 				logical_schema_fingerprint: page_directory.logical_schema_fingerprint,
 			};
 			let strategy = pick_point_row_group_fetch_strategy(
@@ -10144,11 +10147,11 @@ impl SlabManager {
 				};
 				let projected = materialize_sparse_projection_pages(
 					&directory,
-					&phase_c_requirement,
+					&projection_fetch_requirement,
 					sparse_projection_plan,
 					&selected_body_ranges,
 					&plaintext_extracts,
-					&phase_b_outcome,
+					&predicate_outcome,
 				)
 				.map_err(arrow_io_error)?;
 				return Ok(ProjectedL2RecordRead {
@@ -10159,9 +10162,9 @@ impl SlabManager {
 					strategy: L2FetchStrategy::RowGroup(row_group_plan),
 				});
 			}
-			let projected = if phase_b_projected_by_group.is_empty() {
-				if phase_b_outcome.survival_masks.is_empty() || point_read {
-					if phase_c_requirement_empty {
+			let projected = if predicate_projection_by_group.is_empty() {
+				if predicate_outcome.survival_masks.is_empty() || point_read {
+					if projection_fetch_requirement_empty {
 						crate::storage::row_group::empty_projected_row_group(
 							group.row_count.get() as usize
 						)?
@@ -10177,7 +10180,7 @@ impl SlabManager {
 						crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
 							&directory,
 							&page_directory,
-							&phase_c_requirement,
+							&projection_fetch_requirement,
 							&selected_body_ranges,
 							&plaintext_extracts,
 							&selected_groups,
@@ -10185,7 +10188,7 @@ impl SlabManager {
 						.map_err(arrow_io_error)?
 					}
 				} else {
-					let plaintext_extracts = if phase_c_requirement_empty {
+					let plaintext_extracts = if projection_fetch_requirement_empty {
 						Vec::new()
 					} else {
 						let ciphertext_runs = fetch_tiered_ciphertext_runs(
@@ -10212,7 +10215,7 @@ impl SlabManager {
 									),
 								)
 							})?;
-						let projected = if phase_c_requirement_empty {
+						let projected = if projection_fetch_requirement_empty {
 							crate::storage::row_group::empty_projected_row_group(
 								group_entry.row_count.get() as usize,
 							)?
@@ -10220,7 +10223,7 @@ impl SlabManager {
 							crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
 								&directory,
 								&page_directory,
-								&phase_c_requirement,
+								&projection_fetch_requirement,
 								&selected_body_ranges,
 								&plaintext_extracts,
 								&[*group_index],
@@ -10231,13 +10234,13 @@ impl SlabManager {
 					}
 					crate::storage::row_group::apply_phase_b_masks_to_projected_row_groups(
 						projected_groups,
-						&phase_b_outcome,
+						&predicate_outcome,
 						row_group_plan.predicate_fetched_groups.as_slice(),
 						&page_directory,
 					)?
 				}
 			} else {
-				let plaintext_extracts = if phase_c_requirement_empty {
+				let plaintext_extracts = if projection_fetch_requirement_empty {
 					Vec::new()
 				} else {
 					let ciphertext_runs = fetch_tiered_ciphertext_runs(
@@ -10264,7 +10267,7 @@ impl SlabManager {
 								),
 							)
 						})?;
-					let phase_c_projected = if phase_c_requirement_empty {
+					let projection_projected = if projection_fetch_requirement_empty {
 						crate::storage::row_group::empty_projected_row_group(
 							group_entry.row_count.get() as usize,
 						)?
@@ -10272,27 +10275,27 @@ impl SlabManager {
 						crate::storage::row_group::decode_projected_row_groups_from_plaintext_ranges(
 							&directory,
 							&page_directory,
-							&phase_c_requirement,
+							&projection_fetch_requirement,
 							&selected_body_ranges,
 							&plaintext_extracts,
 							&[*group_index],
 						)
 						.map_err(arrow_io_error)?
 					};
-					let Some(phase_b_projected) = phase_b_projected_by_group.get(group_index)
+					let Some(predicate_projection) = predicate_projection_by_group.get(group_index)
 					else {
 						return Err(Error::new(
 							ErrorKind::InvalidData,
 							format!(
-								"Phase B projected batch missing for selected row group {}",
+								"predicate projection batch missing for selected row group {}",
 								group_index.get()
 							),
 						));
 					};
 					let zipped =
 						crate::storage::row_group::zip_phase_b_and_phase_c_projected_row_group(
-							phase_b_projected,
-							&phase_c_projected,
+							predicate_projection,
+							&projection_projected,
 							requirement,
 						)?;
 					projected_groups.push((*group_index, zipped));
@@ -10304,7 +10307,7 @@ impl SlabManager {
 				};
 				crate::storage::row_group::apply_phase_b_masks_to_projected_row_groups(
 					projected_groups,
-					&phase_b_outcome,
+					&predicate_outcome,
 					mask_groups,
 					&page_directory,
 				)?
