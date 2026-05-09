@@ -499,6 +499,7 @@ fn encoding_for(
 		encoded_range: encoded.encoded_range(),
 		page_value_count: SimdPageValueCount::new(PAGE_VALUES),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	}
 }
 

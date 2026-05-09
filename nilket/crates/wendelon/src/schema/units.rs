@@ -345,6 +345,7 @@ impl_unit!(BufferValueCount, u32);
 impl_unit!(SimdPageValueCount, u32);
 impl_unit!(SampleRowCount, u32);
 impl_unit!(EncodingPageCount, u32);
+impl_unit!(PageNullCount, u32);
 impl_unit!(DictMatchSetSize, u32);
 impl_unit!(PredicateLeafIndex, u16);
 impl_unit!(SelectivityFractionMicros, u32);

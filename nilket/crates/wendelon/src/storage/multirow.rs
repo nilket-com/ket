@@ -578,6 +578,7 @@ fn encode_row_group_batches_with_directory(
 					&directory,
 					&batches,
 					encoding_config,
+					row_group_config,
 				)?;
 				match encoding_directory {
 					Some(encoding_directory) => {

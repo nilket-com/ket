@@ -567,6 +567,7 @@ fn buffer_encoding(encoded: &EncodedBuffer) -> BufferEncoding {
 		encoded_range: encoded.encoded_range(),
 		page_value_count: SimdPageValueCount::new(4),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	}
 }
 

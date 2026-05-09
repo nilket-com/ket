@@ -65,6 +65,7 @@ fn directory_with_cascades(
 					.copied()
 					.map(EncodingPageByteOffset::new)
 					.collect(),
+				page_stats: Vec::new(),
 			})
 			.collect(),
 	}

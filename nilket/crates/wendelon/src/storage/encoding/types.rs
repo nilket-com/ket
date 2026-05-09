@@ -2,17 +2,18 @@ use crate::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, BufferValueIndex, DictValueCount,
 	EncodingCascadeIndex, EncodingPageByteOffset, EncodingPageCount, EncodingPageIndex,
 	ExceptionCount, Exponent, Factor, IpcBufferIndex, IpcColumnOrdinal, LogicalSchemaFingerprint,
-	RecordBodyByteLen, RecordBodyByteOffset, RowCount, RowGroupIndex, RunCount, SampleRowCount,
-	SimdPageValueCount, SlabId, TaskCount,
+	PageNullCount, RecordBodyByteLen, RecordBodyByteOffset, RowCount, RowGroupIndex, RunCount,
+	SampleRowCount, SimdPageValueCount, SlabId, TaskCount,
 };
 use crate::storage::columnar::TieredRecordId;
+use crate::storage::stats::CanonicalScalar;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{Error, ErrorKind};
 
 pub const ENCODING_DIRECTORY_METADATA_KEY: &str = "storage.encoding_directory";
 pub const ENCODING_DIRECTORY_MAGIC: [u8; 8] = *b"WNDENC01";
-pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 1;
+pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 2;
 
 pub const ENCODING_TARGET_SIMD_PAGE_VALUES_DEFAULT: u32 = 1_024;
 pub const ENCODING_CASCADE_SAMPLE_ROWS_DEFAULT: u32 = 256;
@@ -184,6 +185,14 @@ pub struct BufferEncoding {
 	pub encoded_range: EncodedBufferByteRange,
 	pub page_value_count: SimdPageValueCount,
 	pub page_end_offsets: Vec<EncodingPageByteOffset>,
+	pub page_stats: Vec<EncodingPageStats>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodingPageStats {
+	pub null_count: PageNullCount,
+	pub min: Option<CanonicalScalar>,
+	pub max: Option<CanonicalScalar>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

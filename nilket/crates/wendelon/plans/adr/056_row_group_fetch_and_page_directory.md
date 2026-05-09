@@ -81,6 +81,19 @@ descriptor / wire / capability surfaces, or `ObjectStore`
 trait. Bench evidence is recorded at
 `plans/impl/062_row_group_sizing_profile_bench_results.md`.
 
+ADR 063 page-level predicate stats is now implemented and
+promoted as a Phase B row-group planner refinement. ADR 056's
+row-group-grain min / max / null-count prune remains the
+outer macro-prune; ADR 063 adds a page-grain predicate prune
+inside surviving encoded row groups by consulting
+`BufferEncoding.page_stats` before issuing dense predicate
+fetch. The narrowed path returns a mask-only `PhaseBOutcome`
+and preserves the public `L2FetchStrategy::RowGroup` shape,
+row-group directory shape, reject taxonomy, descriptor / wire
+/ capability surfaces, and `ObjectStore` trait. Bench evidence
+is recorded at
+`plans/impl/063_page_level_predicate_stats_bench_results.md`.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-record `RecordPageDirectory`

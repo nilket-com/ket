@@ -4750,3 +4750,165 @@ fn test_adr061_authenticated_chunk_layout_guards() {
 		violations.join("\n")
 	);
 }
+
+#[test]
+fn test_adr063_page_level_predicate_stats_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let units = fs::read_to_string(manifest_dir.join("src/schema/units.rs")).unwrap();
+	let stats = fs::read_to_string(manifest_dir.join("src/storage/stats.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let encoding_directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let predicate_page_fetch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/predicate_page_fetch.rs"))
+			.unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+
+	for required in [
+		"impl_unit!(PageNullCount, u32)",
+		"impl_unit!(EncodingPageCount, u32)",
+	] {
+		if !units.contains(required) {
+			violations.push(format!(
+				"src/schema/units.rs: missing ADR 063 unit {required}"
+			));
+		}
+	}
+	for required in [
+		"pub struct CanonicalScalar",
+		"pub struct CanonicalStatsValues",
+		"canonical_stats_for_array_slice",
+		"fixed_width_page_stats_supported_type",
+		"DataType::Timestamp(TimeUnit::Millisecond, None)",
+	] {
+		if !stats.contains(required) {
+			violations.push(format!(
+				"src/storage/stats.rs: missing ADR 063 shared stats token {required}"
+			));
+		}
+	}
+	for required in [
+		"ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 2",
+		"pub struct EncodingPageStats",
+		"pub page_stats: Vec<EncodingPageStats>",
+		"pub null_count: PageNullCount",
+	] {
+		if !encoding_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 063 directory shape token {required}"
+			));
+		}
+	}
+	for required in [
+		"page_stats_cascade_eligible",
+		"EncodingComputeConfig::default()",
+		"enabled_predicate_evaluators",
+		"cascade.emits_pages_in_v1()",
+		"validate_page_stats",
+		"write_canonical_scalar",
+		"read_canonical_scalar",
+	] {
+		if !encoding_directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 063 writer/validation token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub enum PagePredicateClassification",
+		"PredicatePageFetchPlan",
+		"enum PredicatePageFetchDecline",
+		"stitch_predicate_page_mask",
+		"classify_page_stats_for_atom",
+		"PagePredicateClassification::ExactMatch",
+		"PagePredicateClassification::Disjoint",
+		"PagePredicateClassification::Maybe",
+	] {
+		if !predicate_page_fetch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/predicate_page_fetch.rs: missing ADR 063 classifier token {required}"
+			));
+		}
+	}
+	for required in [
+		"build_encoding_predicate_page_plan",
+		"EncodingPredicatePageDecision",
+		"page_fallback",
+		"page_exact",
+		"classify_page_stats_for_atom",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 063 predicate-page narrowing token {required}"
+			));
+		}
+	}
+
+	use arrow::datatypes::{DataType, TimeUnit};
+	use wendelon::storage::encoding::compute::EncodingComputeEvaluatorKind;
+	use wendelon::storage::encoding::directory::page_stats_cascade_eligible;
+	use wendelon::storage::encoding::{EncodingCascade, EncodingLeafCascade};
+	use wendelon::storage::stats::fixed_width_page_stats_supported_type;
+	let bitpacked = EncodingCascade::BitPacked {
+		bits: wendelon::schema::BitsPerValue::new(8),
+		base: wendelon::schema::BaseValue::new(0),
+	};
+	let dictionary_plain = EncodingCascade::Dictionary {
+		dict_byte_len: wendelon::schema::RecordBodyByteLen::new(8),
+		dict_value_count: wendelon::schema::DictValueCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	let dictionary_bitpacked = EncodingCascade::Dictionary {
+		dict_byte_len: wendelon::schema::RecordBodyByteLen::new(8),
+		dict_value_count: wendelon::schema::DictValueCount::new(1),
+		inner: Box::new(EncodingLeafCascade::BitPacked {
+			bits: wendelon::schema::BitsPerValue::new(1),
+			base: wendelon::schema::BaseValue::new(0),
+		}),
+	};
+	let rle = EncodingCascade::Rle {
+		run_count: wendelon::schema::RunCount::new(1),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	let delta = EncodingCascade::Delta {
+		base: wendelon::schema::BaseValue::new(0),
+		inner: Box::new(EncodingLeafCascade::Plain),
+	};
+	for cascade in [&bitpacked, &dictionary_plain, &dictionary_bitpacked] {
+		if !page_stats_cascade_eligible(cascade) {
+			violations.push(format!(
+				"ADR 063 V1 cascade intersection unexpectedly excluded {cascade:?}"
+			));
+		}
+	}
+	for cascade in [&rle, &delta] {
+		if page_stats_cascade_eligible(cascade) {
+			violations.push(format!(
+				"ADR 063 V1 cascade intersection unexpectedly included {cascade:?}"
+			));
+		}
+	}
+	if !fixed_width_page_stats_supported_type(&DataType::Int64)
+		|| !fixed_width_page_stats_supported_type(&DataType::Timestamp(TimeUnit::Nanosecond, None))
+		|| fixed_width_page_stats_supported_type(&DataType::Float64)
+		|| fixed_width_page_stats_supported_type(&DataType::Utf8)
+	{
+		violations.push(
+			"ADR 063 fixed-width page stat type subset drifted from the approved V1 set"
+				.to_string(),
+		);
+	}
+	if !format!("{:?}", EncodingComputeEvaluatorKind::Delta).contains("Delta") {
+		violations
+			.push("ADR 063 architecture guard failed to reach compute evaluator types".into());
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 063 page-level predicate stats invariants violated:\n{}",
+		violations.join("\n")
+	);
+}

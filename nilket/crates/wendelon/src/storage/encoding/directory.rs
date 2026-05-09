@@ -1,21 +1,27 @@
 use super::{
 	BufferEncoding, ENCODING_DIRECTORY_FORMAT_VERSION, ENCODING_DIRECTORY_MAGIC,
 	EncodedBufferByteRange, EncodingCascade, EncodingCascadeKind, EncodingDirectory,
-	EncodingLeafCascade, EncodingRejectCode, EncodingWriterConfig,
+	EncodingLeafCascade, EncodingPageStats, EncodingRejectCode, EncodingWriterConfig,
 };
 use crate::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE;
 use crate::schema::ChunkSizeBytes;
 use crate::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, DictValueCount, EncodingCascadeIndex,
 	EncodingPageByteOffset, ExceptionCount, Exponent, Factor, IpcBufferIndex, IpcColumnOrdinal,
-	LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset, RowCount, RowGroupIndex,
-	RunCount, SimdPageValueCount, SlabId,
+	LogicalSchemaFingerprint, PageNullCount, RecordBodyByteLen, RecordBodyByteOffset, RowCount,
+	RowGroupIndex, RunCount, SimdPageValueCount, SlabId,
 };
-use crate::storage::columnar::TieredRecordId;
+use crate::storage::columnar::{StorageColumn, TieredRecordId};
 use crate::storage::encoding::chunk_layout::{chunk_pad_for_cursor, default_sparse_engaged_key};
+use crate::storage::encoding::compute::{EncodingComputeConfig, evaluator_kind_for_cascade};
 use crate::storage::encoding::select::select_and_encode_buffer_with_value_offsets;
 use crate::storage::row_group::{
 	BufferPageDirectoryEntry, RecordBodyByteRange, RecordPageDirectory, RowGroupDirectoryEntry,
+	RowGroupWriterConfig,
+};
+use crate::storage::stats::{
+	CanonicalScalar, arrow_stats_type_tag, canonical_stats_for_array_slice,
+	fixed_width_page_stats_supported_type, read_canonical_scalar, write_canonical_scalar,
 };
 use arrow::datatypes::Schema;
 use arrow::ipc::r#gen::Message::{
@@ -46,6 +52,7 @@ pub fn build_encoding_directory_for_ipc_stream(
 	page_directory: &RecordPageDirectory,
 	batches: &[RecordBatch],
 	config: &EncodingWriterConfig,
+	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
 	config.validate()?;
 	if !config.enabled {
@@ -152,6 +159,19 @@ pub fn build_encoding_directory_for_ipc_stream(
 				"Encoding cascade index exceeds u16",
 			)
 		})?;
+		let page_stats = build_page_stats_for_buffer(
+			page_directory,
+			batches,
+			page,
+			group,
+			field.name(),
+			field.data_type(),
+			&encoded.cascade,
+			decoded_value_count,
+			config.target_simd_page_values,
+			&encoded.page_end_offsets,
+			row_group_config,
+		)?;
 		buffers.push(BufferEncoding {
 			row_group_index: page.row_group_index,
 			ipc_column_ordinal: page.ipc_column_ordinal,
@@ -162,6 +182,7 @@ pub fn build_encoding_directory_for_ipc_stream(
 			encoded_range: encoded.encoded_range(),
 			page_value_count: config.target_simd_page_values,
 			page_end_offsets: encoded.page_end_offsets.clone(),
+			page_stats,
 		});
 		applied.push(AppliedEncodingBuffer {
 			row_group_index: page.row_group_index,
@@ -294,6 +315,138 @@ fn variable_width_offset_width(data_type: &arrow::datatypes::DataType) -> Option
 		arrow::datatypes::DataType::LargeUtf8 | arrow::datatypes::DataType::LargeBinary => Some(8),
 		_ => None,
 	}
+}
+
+fn build_page_stats_for_buffer(
+	page_directory: &RecordPageDirectory,
+	batches: &[RecordBatch],
+	page: &BufferPageDirectoryEntry,
+	group: &RowGroupDirectoryEntry,
+	field_name: &str,
+	data_type: &arrow::datatypes::DataType,
+	cascade: &EncodingCascade,
+	decoded_value_count: BufferValueCount,
+	page_value_count: SimdPageValueCount,
+	page_end_offsets: &[EncodingPageByteOffset],
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<Vec<EncodingPageStats>> {
+	if page_end_offsets.is_empty()
+		|| StorageColumn::from_name(field_name).is_some()
+		|| !row_group_config.stats_supported_types.contains(data_type)
+		|| !fixed_width_page_stats_supported_type(data_type)
+		|| !page_stats_cascade_eligible(cascade)
+		|| !is_fixed_width_value_buffer(page_directory, page)
+	{
+		return Ok(Vec::new());
+	}
+	let batch_index = usize::try_from(page.row_group_index.get()).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Encoding page-stats row group index exceeds usize",
+		)
+	})?;
+	let Some(batch) = batches.get(batch_index) else {
+		return Ok(Vec::new());
+	};
+	if batch.num_rows() != group.row_count.get() as usize {
+		return Ok(Vec::new());
+	}
+	let column_index = page.ipc_column_ordinal.get() as usize;
+	if column_index >= batch.num_columns() {
+		return Ok(Vec::new());
+	}
+	let column = batch.column(column_index);
+	let page_rows = page_value_count.get();
+	if page_rows == 0 {
+		return Ok(Vec::new());
+	}
+	let mut stats = Vec::with_capacity(page_end_offsets.len());
+	for page_index in 0..page_end_offsets.len() {
+		let page_index = u32::try_from(page_index).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding page-stats page index exceeds u32",
+			)
+		})?;
+		let first_row = u64::from(page_index)
+			.checked_mul(u64::from(page_rows))
+			.ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Encoding page-stats row offset overflow",
+				)
+			})?;
+		let remaining = u64::from(decoded_value_count.get()).saturating_sub(first_row);
+		if remaining == 0 {
+			return Ok(Vec::new());
+		}
+		let len = remaining.min(u64::from(page_rows));
+		let first_row = usize::try_from(first_row).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding page-stats row offset exceeds usize",
+			)
+		})?;
+		let len = usize::try_from(len).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding page-stats row count exceeds usize",
+			)
+		})?;
+		let Some(values) =
+			canonical_stats_for_array_slice(data_type, column.as_ref(), first_row, len)?
+		else {
+			return Ok(Vec::new());
+		};
+		let null_count = u32::try_from(values.null_count).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding page-stats null count exceeds u32",
+			)
+		})?;
+		stats.push(EncodingPageStats {
+			null_count: PageNullCount::new(null_count),
+			min: values.min,
+			max: values.max,
+		});
+	}
+	Ok(stats)
+}
+
+fn is_fixed_width_value_buffer(
+	page_directory: &RecordPageDirectory,
+	page: &BufferPageDirectoryEntry,
+) -> bool {
+	first_buffer_ordinal_for_column(page_directory, page)
+		.map(|first| page.ipc_buffer_ordinal.get() == first.saturating_add(1))
+		.unwrap_or(false)
+}
+
+fn first_buffer_ordinal_for_column(
+	page_directory: &RecordPageDirectory,
+	page: &BufferPageDirectoryEntry,
+) -> Option<u32> {
+	page_directory
+		.buffer_pages
+		.iter()
+		.filter(|candidate| {
+			candidate.row_group_index == page.row_group_index
+				&& candidate.ipc_column_ordinal == page.ipc_column_ordinal
+		})
+		.map(|candidate| candidate.ipc_buffer_ordinal.get())
+		.min()
+}
+
+pub fn page_stats_cascade_eligible(cascade: &EncodingCascade) -> bool {
+	if !cascade.emits_pages_in_v1() {
+		return false;
+	}
+	let Some(kind) = evaluator_kind_for_cascade(cascade) else {
+		return false;
+	};
+	EncodingComputeConfig::default()
+		.enabled_predicate_evaluators
+		.contains(&kind)
 }
 
 pub fn apply_encoding_buffers_in_place(ipc_bytes: &mut [u8], applied: &[AppliedEncodingBuffer]) {
@@ -714,6 +867,12 @@ pub fn serialize_encoding_directory_value(
 		for offset in &buffer.page_end_offsets {
 			write_u32(&mut out, offset.get());
 		}
+		write_u32(&mut out, checked_len(buffer.page_stats.len())?);
+		for stat in &buffer.page_stats {
+			write_u32(&mut out, stat.null_count.get());
+			write_canonical_scalar(&mut out, stat.min.as_ref())?;
+			write_canonical_scalar(&mut out, stat.max.as_ref())?;
+		}
 	}
 	Ok(BASE64.encode(out))
 }
@@ -764,6 +923,15 @@ pub fn deserialize_encoding_directory_value(
 		for _ in 0..page_count {
 			page_end_offsets.push(EncodingPageByteOffset::new(read_u32(&bytes, &mut cursor)?));
 		}
+		let page_stats_count = read_count(&bytes, &mut cursor)?;
+		let mut page_stats = Vec::with_capacity(page_stats_count);
+		for _ in 0..page_stats_count {
+			page_stats.push(EncodingPageStats {
+				null_count: PageNullCount::new(read_u32(&bytes, &mut cursor)?),
+				min: read_encoding_scalar(&bytes, &mut cursor)?,
+				max: read_encoding_scalar(&bytes, &mut cursor)?,
+			});
+		}
 		buffers.push(BufferEncoding {
 			row_group_index,
 			ipc_column_ordinal,
@@ -774,6 +942,7 @@ pub fn deserialize_encoding_directory_value(
 			encoded_range: EncodedBufferByteRange { start, len },
 			page_value_count,
 			page_end_offsets,
+			page_stats,
 		});
 	}
 	if cursor != bytes.len() {
@@ -825,6 +994,10 @@ pub fn validate_encoding_directory(
 		if buffer.ipc_column_ordinal.get() as usize >= schema.fields().len() {
 			return Err(EncodingRejectCode::BufferEncodingMismatch);
 		}
+		let field = schema
+			.fields()
+			.get(buffer.ipc_column_ordinal.get() as usize)
+			.ok_or(EncodingRejectCode::BufferEncodingMismatch)?;
 		let Some(page) = page_directory.buffer_pages.iter().find(|page| {
 			page.row_group_index == buffer.row_group_index
 				&& page.ipc_column_ordinal == buffer.ipc_column_ordinal
@@ -845,6 +1018,12 @@ pub fn validate_encoding_directory(
 		validate_page_offsets(
 			buffer,
 			&directory.cascades[buffer.cascade_index.get() as usize],
+		)?;
+		validate_page_stats(
+			buffer,
+			&directory.cascades[buffer.cascade_index.get() as usize],
+			field.data_type(),
+			page_directory,
 		)?;
 	}
 	Ok(())
@@ -874,6 +1053,112 @@ fn validate_page_offsets(
 		return Err(EncodingRejectCode::EncodingDirectoryParseError);
 	}
 	Ok(())
+}
+
+fn validate_page_stats(
+	buffer: &BufferEncoding,
+	cascade: &EncodingCascade,
+	data_type: &arrow::datatypes::DataType,
+	page_directory: &RecordPageDirectory,
+) -> Result<(), EncodingRejectCode> {
+	if buffer.page_stats.is_empty() {
+		return Ok(());
+	}
+	if buffer.page_stats.len() != buffer.page_end_offsets.len()
+		|| buffer.page_end_offsets.is_empty()
+	{
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	if buffer.page_value_count.get() == 0
+		|| !fixed_width_page_stats_supported_type(data_type)
+		|| !page_stats_cascade_eligible(cascade)
+	{
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	let Some(page) = page_directory.buffer_pages.iter().find(|page| {
+		page.row_group_index == buffer.row_group_index
+			&& page.ipc_column_ordinal == buffer.ipc_column_ordinal
+			&& page.ipc_buffer_ordinal == buffer.ipc_buffer_ordinal
+	}) else {
+		return Err(EncodingRejectCode::BufferEncodingMismatch);
+	};
+	if !is_fixed_width_value_buffer(page_directory, page) {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	let Some(tag) = arrow_stats_type_tag(data_type) else {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	};
+	for (page_index, stat) in buffer.page_stats.iter().enumerate() {
+		let row_count = page_stats_row_count(buffer, page_index)?;
+		if row_count == 0 || stat.null_count.get() > row_count {
+			return Err(EncodingRejectCode::EncodingDirectoryParseError);
+		}
+		let non_null_count = row_count - stat.null_count.get();
+		match (non_null_count == 0, stat.min.as_ref(), stat.max.as_ref()) {
+			(true, None, None) => {}
+			(true, _, _) => return Err(EncodingRejectCode::EncodingDirectoryParseError),
+			(false, Some(min), Some(max)) => {
+				validate_page_stat_scalar(min, tag)?;
+				validate_page_stat_scalar(max, tag)?;
+				if min.bytes > max.bytes {
+					return Err(EncodingRejectCode::EncodingDirectoryParseError);
+				}
+			}
+			(false, _, _) => return Err(EncodingRejectCode::EncodingDirectoryParseError),
+		}
+	}
+	Ok(())
+}
+
+fn page_stats_row_count(
+	buffer: &BufferEncoding,
+	page_index: usize,
+) -> Result<u32, EncodingRejectCode> {
+	let page_value_count = u64::from(buffer.page_value_count.get());
+	let page_index =
+		u64::try_from(page_index).map_err(|_| EncodingRejectCode::EncodingDirectoryParseError)?;
+	let first_value = page_index
+		.checked_mul(page_value_count)
+		.ok_or(EncodingRejectCode::EncodingDirectoryParseError)?;
+	let decoded_value_count = u64::from(buffer.decoded_value_count.get());
+	if first_value >= decoded_value_count {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	u32::try_from((decoded_value_count - first_value).min(page_value_count))
+		.map_err(|_| EncodingRejectCode::EncodingDirectoryParseError)
+}
+
+fn validate_page_stat_scalar(scalar: &CanonicalScalar, tag: u8) -> Result<(), EncodingRejectCode> {
+	if scalar.arrow_type_tag != tag || scalar.truncated {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	let Some(width) = fixed_width_stat_byte_len(tag) else {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	};
+	if scalar.bytes.len() != width {
+		return Err(EncodingRejectCode::EncodingDirectoryParseError);
+	}
+	Ok(())
+}
+
+fn fixed_width_stat_byte_len(tag: u8) -> Option<usize> {
+	match tag {
+		crate::storage::stats::ARROW_STATS_TAG_INT8
+		| crate::storage::stats::ARROW_STATS_TAG_UINT8
+		| crate::storage::stats::ARROW_STATS_TAG_BOOLEAN => Some(1),
+		crate::storage::stats::ARROW_STATS_TAG_INT16
+		| crate::storage::stats::ARROW_STATS_TAG_UINT16 => Some(2),
+		crate::storage::stats::ARROW_STATS_TAG_INT32
+		| crate::storage::stats::ARROW_STATS_TAG_UINT32
+		| crate::storage::stats::ARROW_STATS_TAG_DATE32 => Some(4),
+		crate::storage::stats::ARROW_STATS_TAG_INT64
+		| crate::storage::stats::ARROW_STATS_TAG_UINT64
+		| crate::storage::stats::ARROW_STATS_TAG_TIMESTAMP_MILLISECOND
+		| crate::storage::stats::ARROW_STATS_TAG_TIMESTAMP_MICROSECOND
+		| crate::storage::stats::ARROW_STATS_TAG_TIMESTAMP_NANOSECOND
+		| crate::storage::stats::ARROW_STATS_TAG_DATE64 => Some(8),
+		_ => None,
+	}
 }
 
 fn write_cascade(out: &mut Vec<u8>, cascade: &EncodingCascade) -> std::io::Result<()> {
@@ -1087,6 +1372,14 @@ fn read_i128(bytes: &[u8], cursor: &mut usize) -> Result<i128, EncodingRejectCod
 			.try_into()
 			.expect("fixed width"),
 	))
+}
+
+fn read_encoding_scalar(
+	bytes: &[u8],
+	cursor: &mut usize,
+) -> Result<Option<CanonicalScalar>, EncodingRejectCode> {
+	read_canonical_scalar(bytes, cursor)
+		.map_err(|_| EncodingRejectCode::EncodingDirectoryParseError)
 }
 
 fn read_count(bytes: &[u8], cursor: &mut usize) -> Result<usize, EncodingRejectCode> {

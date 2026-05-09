@@ -53,12 +53,13 @@ use crate::schema::table::{
 	validate_table_write_request_batch,
 };
 use crate::schema::{
-	AggregatePartial, AggregateRequest, ByteCount, CompactionJobId, CompactionLevelIndex,
-	HybridTimestamp, INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix,
-	IndexObjectId, IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint,
-	ManifestEpoch, RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount,
-	RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
-	SelectivityFractionMicros, SlabId, SlabRecordHeader, SupersessionMetadata,
+	AggregatePartial, AggregateRequest, BufferValueCount, ByteCount, CompactionJobId,
+	CompactionLevelIndex, EncodingPageByteOffset, HybridTimestamp,
+	INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH, Identity, IdentityPrefix, IndexObjectId,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LogicalSchemaFingerprint, ManifestEpoch,
+	RecordBodyByteLen, RecordBodyByteOffset, RecordRowIndex, RowCount, RowGroupIndex,
+	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState,
+	SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader, SupersessionMetadata,
 	TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
@@ -82,6 +83,7 @@ use crate::storage::encoding::compute::{
 	evaluate_validity_bitmap, evaluator_kind_for_cascade, native_aggregate_cascade_eligible,
 	native_evaluation_eligibility, try_fold_encoded_aggregate_request,
 };
+use crate::storage::encoding::directory::page_stats_cascade_eligible;
 use crate::storage::encoding::materialize::find_buffer_encoding;
 use crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory;
 use crate::storage::encoding::page::expand_page_descriptors;
@@ -91,14 +93,19 @@ use crate::storage::encoding::page_materialize::{
 	extract_record_body_bytes as extract_encoded_page_bytes, fixed_width_non_null_value_column,
 	projected_page_batch_from_decoded_buffers, required_projected_physical_ordinals,
 };
+use crate::storage::encoding::predicate_page_fetch::{
+	PagePredicateClassification, PredicatePageFetchPlan, PredicatePageMaskSlice,
+	classify_page_stats_for_atom, stitch_predicate_page_mask,
+};
 use crate::storage::encoding::sparse_projection_fetch::{
 	SparseProjectionFetchDecision, SparseProjectionFetchInput, SparseProjectionFetchPlan,
 	decide_sparse_projection_fetch,
 };
 use crate::storage::encoding::{
-	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodingCascade, EncodingComputeConfig,
-	EncodingDirectory, EncodingFallbackReason, EncodingRejectCode, EncodingWriterConfig,
-	L2ChunkLayoutConfig, L2EncodingFetchConfig, choose_chunk_size_bytes_for_directories,
+	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodedBufferByteRange, EncodingCascade,
+	EncodingComputeConfig, EncodingDirectory, EncodingFallbackReason, EncodingRejectCode,
+	EncodingWriterConfig, L2ChunkLayoutConfig, L2EncodingFetchConfig,
+	choose_chunk_size_bytes_for_directories,
 };
 use crate::storage::index::{
 	PersistentIndexUpdate, PersistentLocalIndex, PersistentRecordRow,
@@ -6159,6 +6166,42 @@ struct EncodingComputePhaseBPlan {
 }
 
 #[derive(Clone, Debug)]
+struct EncodingPredicatePagePlan {
+	node: EncodingComputePhaseBNode,
+	leaves: Vec<EncodingComputePhaseBLeaf>,
+	decisions: Vec<EncodingPredicatePageDecision>,
+	fetches: Vec<EncodingPredicatePageFetch>,
+	record_body_ranges: Vec<crate::storage::row_group::RecordBodyByteRange>,
+	body_ranges: Vec<TieredPlaintextRange>,
+	record_ranges: Vec<TieredPlaintextRange>,
+}
+
+#[derive(Clone, Debug)]
+struct EncodingPredicatePageDecision {
+	row_group_index: RowGroupIndex,
+	leaf_index: usize,
+	first_row: u32,
+	row_count: u32,
+	classification: EncodingPredicatePageDecisionKind,
+}
+
+#[derive(Clone, Debug)]
+enum EncodingPredicatePageDecisionKind {
+	Disjoint,
+	ExactMatch,
+	Maybe { fetch_index: usize },
+}
+
+#[derive(Clone, Debug)]
+struct EncodingPredicatePageFetch {
+	body_range: crate::storage::row_group::RecordBodyByteRange,
+	encoding: BufferEncoding,
+	cascade: EncodingCascade,
+	data_type: DataType,
+	atom: PredicateAtom,
+}
+
+#[derive(Clone, Debug)]
 enum EncodingComputePhaseBNode {
 	Leaf(usize),
 	And(Vec<EncodingComputePhaseBNode>),
@@ -8908,6 +8951,226 @@ impl SlabManager {
 			observe_fallback(EncodingComputeFallbackReason::UnsupportedProgram);
 			return Ok(None);
 		};
+		let observe_page_fallback = |reason: EncodingComputeFallbackReason| {
+			metrics().observe_storage_l2_encoding_compute_plan("page_fallback", reason.as_str());
+		};
+		match build_encoding_predicate_page_plan(
+			record_directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			selected_groups,
+			predicate_fetched_groups,
+			&self.config.encoding_compute,
+			header_size,
+		) {
+			Ok(plan) => {
+				let tiered_plan = self.config.crypto.plan_tiered_multi_range_read(
+					pointer.slab_id,
+					object_size_bytes,
+					tail_window,
+					additional_metadata,
+					whole_record_range,
+					&plan.record_ranges,
+				)?;
+				let phase_b_fetch =
+					crate::storage::row_group::row_group_range_fetch_plan_from_tiered(
+						&tiered_plan,
+						&plan.record_body_ranges,
+					);
+				let plaintext = if plan.record_ranges.is_empty() {
+					Vec::new()
+				} else {
+					let ciphertext = fetch_tiered_ciphertext_runs(
+						l2.clone(),
+						pointer,
+						&tiered_plan,
+						self.config
+							.l2_row_group_fetch
+							.max_parallel_range_gets
+							.get()
+							.max(1) as usize,
+					)
+					.await?;
+					tiered_plan.decrypt(&ciphertext)?
+				};
+				let mut outcome = crate::storage::row_group::PhaseBOutcome::default();
+				let mut total_mask_bytes = 0_u64;
+				let mut rows_scanned = 0_u64;
+				let mut rows_selected = 0_u64;
+				let predicate_fetched = predicate_fetched_groups
+					.iter()
+					.copied()
+					.collect::<BTreeSet<_>>();
+				for group_index in selected_groups {
+					if !predicate_fetched.contains(group_index) {
+						continue;
+					}
+					let group = page_directory
+						.row_groups
+						.iter()
+						.find(|group| group.row_group_index == *group_index)
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								format!(
+									"Encoding predicate page selected row group {} missing",
+									group_index.get()
+								),
+							)
+						})?;
+					let row_count = RowCount::new(u64::from(group.row_count.get()));
+					let mut leaf_slices =
+						vec![Vec::<PredicatePageMaskSlice>::new(); plan.leaves.len()];
+					for decision in plan
+						.decisions
+						.iter()
+						.filter(|decision| decision.row_group_index == *group_index)
+					{
+						let leaf = leaf_slices.get_mut(decision.leaf_index).ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								"Encoding predicate page decision leaf out of range",
+							)
+						})?;
+						match decision.classification {
+							EncodingPredicatePageDecisionKind::Disjoint => {
+								leaf.push(PredicatePageMaskSlice::Disjoint {
+									first_row: RecordRowIndex::new(decision.first_row),
+									row_count: RowCount::new(u64::from(decision.row_count)),
+								});
+							}
+							EncodingPredicatePageDecisionKind::ExactMatch => {
+								leaf.push(PredicatePageMaskSlice::ExactMatch {
+									first_row: RecordRowIndex::new(decision.first_row),
+									row_count: RowCount::new(u64::from(decision.row_count)),
+								});
+							}
+							EncodingPredicatePageDecisionKind::Maybe { fetch_index } => {
+								let fetch = plan.fetches.get(fetch_index).ok_or_else(|| {
+									Error::new(
+										ErrorKind::InvalidData,
+										"Encoding predicate page fetch index out of range",
+									)
+								})?;
+								let fetched = match extract_record_body_bytes(
+									fetch.body_range,
+									&plan.body_ranges,
+									&plaintext,
+								) {
+									Ok(encoded) => encoded,
+									Err(_) => {
+										observe_page_fallback(
+											EncodingComputeFallbackReason::UnsupportedArrowLayout,
+										);
+										return Ok(None);
+									}
+								};
+								let Some(coercion) =
+									coerce_literal(fetch.atom.literal.as_ref(), &fetch.data_type)
+								else {
+									observe_page_fallback(
+										EncodingComputeFallbackReason::UnsupportedProgram,
+									);
+									return Ok(None);
+								};
+								let evaluator = evaluator_kind_for_cascade(&fetch.cascade)
+									.ok_or_else(|| {
+										Error::new(
+											ErrorKind::InvalidData,
+											"Encoding predicate page fetch carried unsupported cascade",
+										)
+									})?;
+								let started = Instant::now();
+								let mask = match evaluate_encoded_predicate(
+									&fetched,
+									&fetch.encoding,
+									&fetch.cascade,
+									&fetch.atom,
+									&coercion,
+								) {
+									Ok(mask) => mask,
+									Err(_) => {
+										observe_page_fallback(
+											EncodingComputeFallbackReason::UnsupportedCascade,
+										);
+										return Ok(None);
+									}
+								};
+								metrics().observe_storage_l2_encoding_compute_kernel(
+									evaluator.as_str(),
+									fetch.cascade.kind().as_str(),
+									started.elapsed(),
+								);
+								if mask.rows() != RowCount::new(u64::from(decision.row_count)) {
+									return Err(encoding_compute_invariant_error(
+										EncodingComputeRejectCode::MaskLengthMismatch,
+									));
+								}
+								leaf.push(PredicatePageMaskSlice::Maybe {
+									first_row: RecordRowIndex::new(decision.first_row),
+									mask,
+								});
+							}
+						}
+					}
+					let mut leaf_masks = Vec::with_capacity(plan.leaves.len());
+					for slices in leaf_slices {
+						let mask = stitch_predicate_page_mask(&PredicatePageFetchPlan {
+							row_count,
+							slices,
+						})
+						.map_err(encoding_compute_invariant_error)?;
+						if !encoding_compute_mask_selectivity_allowed(
+							&mask,
+							&self.config.encoding_compute,
+						)
+						.map_err(encoding_compute_invariant_error)?
+						{
+							observe_page_fallback(EncodingComputeFallbackReason::DenseSelection);
+							return Ok(None);
+						}
+						leaf_masks.push(mask);
+					}
+					let mask = encoding_compute_eval_node(&plan.node, &leaf_masks)
+						.map_err(encoding_compute_invariant_error)?;
+					let selected = mask
+						.popcount()
+						.map_err(encoding_compute_invariant_error)?
+						.get();
+					total_mask_bytes = total_mask_bytes.saturating_add(mask.byte_len() as u64);
+					if total_mask_bytes
+						> self.config.encoding_compute.max_mask_bytes_per_record.get()
+					{
+						observe_page_fallback(EncodingComputeFallbackReason::TooManyMaskBytes);
+						return Ok(None);
+					}
+					rows_scanned = rows_scanned.saturating_add(row_count.get());
+					rows_selected = rows_selected.saturating_add(selected);
+					let boolean_mask = mask
+						.to_arrow_boolean_array()
+						.map_err(encoding_compute_invariant_error)?;
+					outcome.survival_masks.insert(*group_index, boolean_mask);
+				}
+				metrics().observe_storage_l2_encoding_compute_plan("page_exact", "none");
+				metrics().observe_storage_l2_encoding_compute_rows("scanned", rows_scanned);
+				metrics().observe_storage_l2_encoding_compute_rows("selected", rows_selected);
+				metrics().observe_storage_l2_encoding_compute_rows(
+					"avoided",
+					rows_scanned.saturating_sub(rows_selected),
+				);
+				metrics().observe_storage_l2_encoding_compute_mask_bytes(total_mask_bytes);
+				metrics().observe_storage_l2_encoding_compute_pages_fetched(
+					"selected",
+					plan.fetches.len() as u64,
+				);
+				return Ok(Some(EncodingComputePhaseBRead {
+					outcome,
+					phase_b_fetch,
+				}));
+			}
+			Err(reason) => observe_page_fallback(reason),
+		}
 		let plan = match build_encoding_compute_phase_b_plan(
 			record_directory,
 			page_directory,
@@ -9115,10 +9378,6 @@ impl SlabManager {
 			let boolean_mask = mask
 				.to_arrow_boolean_array()
 				.map_err(encoding_compute_invariant_error)?;
-			outcome.decoded_predicate_batches.insert(
-				*group_index,
-				encoding_compute_empty_predicate_batch(group.row_count.get() as usize)?,
-			);
 			outcome.survival_masks.insert(*group_index, boolean_mask);
 		}
 		let pages_fetched = plan
@@ -10810,6 +11069,367 @@ fn build_encoding_compute_phase_b_plan(
 	})
 }
 
+fn build_encoding_predicate_page_plan(
+	record_directory: &RecordBufferDirectory,
+	page_directory: &crate::storage::row_group::RecordPageDirectory,
+	encoding_directory: &EncodingDirectory,
+	encoded_predicate: &EncodedPredicateNode,
+	selected_groups: &[RowGroupIndex],
+	predicate_fetched_groups: &[RowGroupIndex],
+	config: &EncodingComputeConfig,
+	header_size: u64,
+) -> Result<EncodingPredicatePagePlan, EncodingComputeFallbackReason> {
+	let mut builder = EncodingComputePhaseBPlanBuilder {
+		record_directory,
+		leaves: Vec::new(),
+	};
+	let node = builder.build_node(encoded_predicate)?;
+	let leaves = builder.leaves;
+	let predicate_fetched = predicate_fetched_groups
+		.iter()
+		.copied()
+		.collect::<BTreeSet<_>>();
+	let mut decisions = Vec::new();
+	let mut fetches = Vec::new();
+	let mut selected_value_bytes = 0_u64;
+	let mut dense_value_bytes = 0_u64;
+	let mut encoded_pages = 0_u64;
+	for group_index in selected_groups {
+		if !predicate_fetched.contains(group_index) {
+			continue;
+		}
+		let group = page_directory
+			.row_groups
+			.iter()
+			.find(|group| group.row_group_index == *group_index)
+			.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+		if group.row_count.get() < config.min_buffer_rows_for_encoded_eval.get() {
+			return Err(EncodingComputeFallbackReason::DenseSelection);
+		}
+		for (leaf_index, leaf) in leaves.iter().enumerate() {
+			match leaf {
+				EncodingComputePhaseBLeaf::Encoded {
+					atom,
+					column_index,
+					data_type,
+					..
+				} => {
+					let (physical_ordinal, value_buffer_ordinal) =
+						encoding_compute_value_buffer(record_directory, *column_index)?;
+					build_encoding_predicate_page_leaf_decisions(
+						page_directory,
+						encoding_directory,
+						group,
+						leaf_index,
+						physical_ordinal,
+						value_buffer_ordinal,
+						data_type,
+						atom,
+						config,
+						&mut decisions,
+						&mut fetches,
+						&mut selected_value_bytes,
+						&mut dense_value_bytes,
+						&mut encoded_pages,
+					)?;
+				}
+				EncodingComputePhaseBLeaf::Validity {
+					physical_ordinal,
+					selected_when_no_nulls,
+				} => {
+					let mapping = record_directory
+						.column_to_buffers
+						.get(*physical_ordinal)
+						.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+					if mapping.buffer_count != 2 {
+						return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
+					}
+					let value_buffer_ordinal = IpcBufferIndex::new(
+						mapping
+							.first_buffer_ordinal
+							.get()
+							.checked_add(1)
+							.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?,
+					);
+					let field = record_directory
+						.ipc_schema
+						.fields()
+						.get(*physical_ordinal)
+						.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+					let atom = if *selected_when_no_nulls {
+						PredicateAtom::is_not_null()
+					} else {
+						PredicateAtom::is_null()
+					};
+					build_encoding_predicate_page_leaf_decisions(
+						page_directory,
+						encoding_directory,
+						group,
+						leaf_index,
+						*physical_ordinal,
+						value_buffer_ordinal,
+						field.data_type(),
+						&atom,
+						config,
+						&mut decisions,
+						&mut fetches,
+						&mut selected_value_bytes,
+						&mut dense_value_bytes,
+						&mut encoded_pages,
+					)?;
+				}
+			}
+		}
+	}
+	if selected_value_bytes >= dense_value_bytes {
+		return Err(EncodingComputeFallbackReason::DenseSelection);
+	}
+	let mut record_body_ranges = fetches
+		.iter()
+		.map(|fetch| fetch.body_range)
+		.collect::<Vec<_>>();
+	coalesce_manager_record_body_ranges(&mut record_body_ranges)
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let body_ranges = record_body_ranges
+		.iter()
+		.map(|range| TieredPlaintextRange::new(range.start, range.len))
+		.collect::<Vec<_>>();
+	let record_ranges = record_body_ranges_to_record_ranges(header_size, &body_ranges)
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	Ok(EncodingPredicatePagePlan {
+		node,
+		leaves,
+		decisions,
+		fetches,
+		record_body_ranges,
+		body_ranges,
+		record_ranges,
+	})
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_encoding_predicate_page_leaf_decisions(
+	page_directory: &crate::storage::row_group::RecordPageDirectory,
+	encoding_directory: &EncodingDirectory,
+	group: &crate::storage::row_group::RowGroupDirectoryEntry,
+	leaf_index: usize,
+	physical_ordinal: usize,
+	value_buffer_ordinal: IpcBufferIndex,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	config: &EncodingComputeConfig,
+	decisions: &mut Vec<EncodingPredicatePageDecision>,
+	fetches: &mut Vec<EncodingPredicatePageFetch>,
+	selected_value_bytes: &mut u64,
+	dense_value_bytes: &mut u64,
+	encoded_pages: &mut u64,
+) -> Result<(), EncodingComputeFallbackReason> {
+	let page = page_directory
+		.buffer_pages
+		.iter()
+		.find(|page| {
+			page.row_group_index == group.row_group_index
+				&& page.ipc_column_ordinal == IpcColumnOrdinal::new(physical_ordinal as u32)
+				&& page.ipc_buffer_ordinal == value_buffer_ordinal
+				&& page.range.len.get() > 0
+		})
+		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let encoding = find_buffer_encoding(
+		encoding_directory,
+		group.row_group_index,
+		value_buffer_ordinal,
+		page.range,
+	)
+	.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+	if encoding.decoded_value_count.get() != group.row_count.get()
+		|| encoding.page_stats.is_empty()
+		|| encoding.page_stats.len() != encoding.page_end_offsets.len()
+	{
+		return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+	}
+	let cascade = encoding_directory
+		.cascades
+		.get(encoding.cascade_index.get() as usize)
+		.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+	if !page_stats_cascade_eligible(cascade) {
+		return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+	}
+	let evaluator = evaluator_kind_for_cascade(cascade)
+		.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+	if !config.predicate_evaluator_enabled(evaluator) {
+		return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+	}
+	if !matches!(
+		atom.op,
+		crate::storage::encoding::compute::PredicateAtomOp::IsNull
+			| crate::storage::encoding::compute::PredicateAtomOp::IsNotNull
+	) {
+		let Some(coercion) = coerce_literal(atom.literal.as_ref(), data_type) else {
+			return Err(EncodingComputeFallbackReason::UnsupportedProgram);
+		};
+		if matches!(
+			native_evaluation_eligibility(cascade, atom, &coercion),
+			NativeEvaluationEligibility::DecodeScalarFallback
+		) {
+			return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+		}
+	}
+	*dense_value_bytes = dense_value_bytes.saturating_add(
+		encoding_compute_fetch_range_for_buffer_page(page.range, encoding)?
+			.len
+			.get(),
+	);
+	let pages = expand_page_descriptors(encoding)
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let bytes_per_value = decoded_bytes_per_encoded_value(encoding).ok();
+	for (page_descriptor, stat) in pages.iter().zip(&encoding.page_stats) {
+		let classification =
+			classify_page_stats_for_atom(stat, page_descriptor.value_count.get(), data_type, atom)
+				.ok_or(EncodingComputeFallbackReason::UnsupportedProgram)?;
+		let first_row = page_descriptor.first_value_index.get();
+		let row_count = page_descriptor.value_count.get();
+		match classification {
+			PagePredicateClassification::Disjoint => {
+				decisions.push(EncodingPredicatePageDecision {
+					row_group_index: group.row_group_index,
+					leaf_index,
+					first_row,
+					row_count,
+					classification: EncodingPredicatePageDecisionKind::Disjoint,
+				});
+			}
+			PagePredicateClassification::ExactMatch => {
+				decisions.push(EncodingPredicatePageDecision {
+					row_group_index: group.row_group_index,
+					leaf_index,
+					first_row,
+					row_count,
+					classification: EncodingPredicatePageDecisionKind::ExactMatch,
+				});
+			}
+			PagePredicateClassification::Maybe => {
+				if stat.null_count.get() != 0
+					|| matches!(
+						atom.op,
+						crate::storage::encoding::compute::PredicateAtomOp::IsNull
+							| crate::storage::encoding::compute::PredicateAtomOp::IsNotNull
+					) {
+					return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+				}
+				let Some(bytes_per_value) = bytes_per_value else {
+					return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
+				};
+				*encoded_pages = encoded_pages.saturating_add(1);
+				if *encoded_pages > u64::from(config.max_encoded_pages_per_record.get()) {
+					return Err(EncodingComputeFallbackReason::TooManyPages);
+				}
+				let body_range = encoding_compute_fetch_range_for_encoded_page(
+					page.range,
+					encoding,
+					page_descriptor.byte_range,
+				)?;
+				*selected_value_bytes = selected_value_bytes.saturating_add(body_range.len.get());
+				let fetch_index = fetches.len();
+				fetches.push(EncodingPredicatePageFetch {
+					body_range,
+					encoding: encoding_for_predicate_page(
+						encoding,
+						row_count,
+						bytes_per_value,
+						page_descriptor.byte_range.len,
+						stat.clone(),
+					)?,
+					cascade: cascade.clone(),
+					data_type: data_type.clone(),
+					atom: atom.clone(),
+				});
+				decisions.push(EncodingPredicatePageDecision {
+					row_group_index: group.row_group_index,
+					leaf_index,
+					first_row,
+					row_count,
+					classification: EncodingPredicatePageDecisionKind::Maybe { fetch_index },
+				});
+			}
+		}
+	}
+	Ok(())
+}
+
+fn decoded_bytes_per_encoded_value(
+	encoding: &BufferEncoding,
+) -> Result<usize, EncodingComputeFallbackReason> {
+	let values = usize::try_from(encoding.decoded_value_count.get())
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let bytes = usize::try_from(encoding.decoded_byte_len.get())
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	if values == 0 || bytes == 0 || bytes % values != 0 {
+		return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
+	}
+	Ok(bytes / values)
+}
+
+fn encoding_compute_fetch_range_for_encoded_page(
+	buffer_range: crate::storage::row_group::RecordBodyByteRange,
+	encoding: &BufferEncoding,
+	page_range: EncodedBufferByteRange,
+) -> Result<crate::storage::row_group::RecordBodyByteRange, EncodingComputeFallbackReason> {
+	let relative_start = u64::from(encoding.encoded_range.start.get())
+		.checked_add(u64::from(page_range.start.get()))
+		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let relative_end = relative_start
+		.checked_add(page_range.len.get())
+		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let encoded_end = encoding
+		.encoded_range
+		.end()
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	if relative_end > encoded_end || encoded_end > buffer_range.len.get() {
+		return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
+	}
+	let start = buffer_range
+		.start
+		.get()
+		.checked_add(relative_start)
+		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	Ok(crate::storage::row_group::RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(start),
+		len: page_range.len,
+	})
+}
+
+fn encoding_for_predicate_page(
+	encoding: &BufferEncoding,
+	row_count: u32,
+	bytes_per_value: usize,
+	encoded_len: RecordBodyByteLen,
+	stat: crate::storage::encoding::EncodingPageStats,
+) -> Result<BufferEncoding, EncodingComputeFallbackReason> {
+	let decoded_byte_len = u64::from(row_count)
+		.checked_mul(
+			u64::try_from(bytes_per_value)
+				.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?,
+		)
+		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	let encoded_len_u32 = u32::try_from(encoded_len.get())
+		.map_err(|_| EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+	Ok(BufferEncoding {
+		row_group_index: encoding.row_group_index,
+		ipc_column_ordinal: encoding.ipc_column_ordinal,
+		ipc_buffer_ordinal: encoding.ipc_buffer_ordinal,
+		cascade_index: encoding.cascade_index,
+		decoded_byte_len: RecordBodyByteLen::new(decoded_byte_len),
+		decoded_value_count: BufferValueCount::new(row_count),
+		encoded_range: EncodedBufferByteRange {
+			start: EncodingPageByteOffset::ZERO,
+			len: encoded_len,
+		},
+		page_value_count: SimdPageValueCount::new(row_count),
+		page_end_offsets: vec![EncodingPageByteOffset::new(encoded_len_u32)],
+		page_stats: vec![stat],
+	})
+}
+
 fn build_encoding_compute_aggregate_plan(
 	record_directory: &RecordBufferDirectory,
 	page_directory: &crate::storage::row_group::RecordPageDirectory,
@@ -11399,20 +12019,6 @@ fn encoding_compute_eval_node(
 			encoding_compute_eval_node(branch, leaf_masks)?.not()
 		}
 	}
-}
-
-fn encoding_compute_empty_predicate_batch(row_count: usize) -> std::io::Result<RecordBatch> {
-	RecordBatch::try_new_with_options(
-		Arc::new(arrow::datatypes::Schema::empty()),
-		Vec::new(),
-		&arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_count)),
-	)
-	.map_err(|err| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("Encoding compute empty predicate batch failed: {err}"),
-		)
-	})
 }
 
 fn encoding_compute_invariant_error(code: EncodingComputeRejectCode) -> std::io::Error {
@@ -18131,6 +18737,241 @@ mod tests {
 			.downcast_ref::<Int64Array>()
 			.expect("expected payload column");
 		assert_eq!(actual_values.values(), expected_values.values());
+	}
+
+	#[test]
+	fn encoding_predicate_page_plan_narrows_clustered_scan_pages() {
+		let row_count = crate::storage::row_group::ROW_GROUP_SCAN_TARGET_ROWS as usize;
+		let column_count = 17_usize;
+		let schema = Schema::new(
+			(0..column_count)
+				.map(|column| Field::new(format!("c{column}"), DataType::UInt8, false))
+				.collect::<Vec<_>>(),
+		);
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x63; 16]),
+			1,
+			"analytics",
+			"adr063_page_plan",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(
+					crate::storage::row_group::ROW_GROUP_SCAN_TARGET_ROWS,
+					crate::storage::row_group::ROW_GROUP_SCAN_TARGET_ROWS,
+					8 * 1024 * 1024,
+				)
+				.unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let predicate_values = (0..row_count)
+			.map(|row| {
+				let page = row / 1_024;
+				if page == 0 {
+					0
+				} else if page == 1 {
+					1
+				} else if page == 2 {
+					if row % 2 == 0 { 1 } else { 3 }
+				} else {
+					3
+				}
+			})
+			.collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			(0..column_count)
+				.map(|column| {
+					if column == 0 {
+						Arc::new(UInt8Array::from_iter_values(
+							predicate_values.iter().copied(),
+						)) as Arc<dyn Array>
+					} else {
+						Arc::new(UInt8Array::from_iter_values(
+							(0..row_count).map(|row| ((row + column) % 4) as u8),
+						)) as Arc<dyn Array>
+					}
+				})
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(63),
+					is_tombstone: false,
+					table_object_id: Some(descriptor.table_object_id),
+				}
+			})
+			.collect::<Vec<_>>();
+		let row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::scan().with_enabled(true);
+		let encoding_config = EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: crate::schema::SimdPageValueCount::new(1_024),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			enabled_cascades: [
+				crate::storage::EncodingCascadeKind::Plain,
+				crate::storage::EncodingCascadeKind::Dictionary,
+			]
+			.into_iter()
+			.collect(),
+			..EncodingWriterConfig::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Uncompressed,
+				&row_group_config,
+				&encoding_config,
+			)
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::new(63),
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: encoded.frame.len() as u64,
+			},
+			&encoded.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = directory.page_directory.as_ref().unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&0_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_INT);
+		bytecode.extend_from_slice(&2_i64.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_LT);
+		let program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let encoded_predicate = encoded_predicate_node_from_tree(&program.predicate_tree())
+			.expect("clustered predicate should be page-plannable");
+		let predicate_atom = PredicateAtom {
+			op: crate::storage::encoding::compute::PredicateAtomOp::Lt,
+			literal: Some(crate::schema::pbc::ColumnPredicateLiteralV1::Int(2)),
+		};
+		let (physical_ordinal, value_buffer_ordinal) =
+			encoding_compute_value_buffer(&directory, 0).unwrap();
+		let value_page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == RowGroupIndex::ZERO
+					&& page.ipc_column_ordinal == IpcColumnOrdinal::new(physical_ordinal as u32)
+					&& page.ipc_buffer_ordinal == value_buffer_ordinal
+					&& page.range.len.get() > 0
+			})
+			.expect("predicate value page");
+		let value_encoding = find_buffer_encoding(
+			encoding_directory,
+			RowGroupIndex::ZERO,
+			value_buffer_ordinal,
+			value_page.range,
+		)
+		.expect("predicate value encoding");
+		let cascade = encoding_directory
+			.cascades
+			.get(value_encoding.cascade_index.get() as usize)
+			.expect("predicate cascade");
+		assert_eq!(value_encoding.page_stats.len(), 64);
+		assert!(page_stats_cascade_eligible(cascade), "{cascade:?}");
+		let coercion = coerce_literal(predicate_atom.literal.as_ref(), &DataType::UInt8).unwrap();
+		assert!(
+			matches!(
+				native_evaluation_eligibility(cascade, &predicate_atom, &coercion),
+				NativeEvaluationEligibility::Eligible(_)
+			),
+			"{cascade:?}"
+		);
+		let selected_groups = page_directory
+			.row_groups
+			.iter()
+			.map(|group| group.row_group_index)
+			.collect::<Vec<_>>();
+		let compute_config = EncodingComputeConfig::default();
+		let page_plan = build_encoding_predicate_page_plan(
+			&directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			&selected_groups,
+			&selected_groups,
+			&compute_config,
+			0,
+		)
+		.expect("clustered predicate should build a page-level plan");
+		let dense_plan = build_encoding_compute_phase_b_plan(
+			&directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			&selected_groups,
+			&selected_groups,
+			&compute_config,
+			0,
+		)
+		.expect("clustered predicate should also build a dense plan");
+		let page_bytes = page_plan
+			.record_body_ranges
+			.iter()
+			.map(|range| range.len.get())
+			.sum::<u64>();
+		let dense_bytes = dense_plan
+			.record_body_ranges
+			.iter()
+			.map(|range| range.len.get())
+			.sum::<u64>();
+		let disjoint_pages = page_plan
+			.decisions
+			.iter()
+			.filter(|decision| {
+				matches!(
+					decision.classification,
+					EncodingPredicatePageDecisionKind::Disjoint
+				)
+			})
+			.count();
+		let exact_pages = page_plan
+			.decisions
+			.iter()
+			.filter(|decision| {
+				matches!(
+					decision.classification,
+					EncodingPredicatePageDecisionKind::ExactMatch
+				)
+			})
+			.count();
+		let maybe_pages = page_plan
+			.decisions
+			.iter()
+			.filter(|decision| {
+				matches!(
+					decision.classification,
+					EncodingPredicatePageDecisionKind::Maybe { .. }
+				)
+			})
+			.count();
+
+		assert_eq!(page_plan.fetches.len(), 1);
+		assert_eq!((disjoint_pages, exact_pages, maybe_pages), (61, 2, 1));
+		assert!(
+			page_bytes * 10 < dense_bytes,
+			"page plan bytes {page_bytes} should be materially smaller than dense bytes {dense_bytes}"
+		);
 	}
 
 	#[tokio::test]

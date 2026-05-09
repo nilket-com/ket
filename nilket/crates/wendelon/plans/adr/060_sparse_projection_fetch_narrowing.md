@@ -20,6 +20,20 @@ ciphertext-ratio follow-up is closed by ADR 061's shipped
 per-slab chunk-size selection and bench evidence at
 `plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md`.
 
+## Where we are
+
+ADR 063 page-level predicate stats is now implemented and
+promoted as an upstream exact-mask source for ADR 060. Before
+dense predicate fetch, the row-group path can classify
+predicate-column pages as `Disjoint`, `ExactMatch`, or
+`Maybe`; the engaged narrowed path returns a mask-only
+`PhaseBOutcome` and leaves `decoded_predicate_batches` empty.
+That exact mask feeds ADR 060's sparse projection planner
+unchanged. Dense predicate-zip with sparse projection remains
+deferred; ADR 063 narrows predicate bytes before mask
+construction rather than mixing dense predicate batches into
+projection fetch.
+
 ## Context
 
 The Toron-pivot stretch shipped a four-layer storage

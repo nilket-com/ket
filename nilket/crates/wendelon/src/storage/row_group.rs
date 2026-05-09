@@ -12,21 +12,13 @@ use crate::storage::columnar::{
 	decode_projected_record_batch_from_plaintext_ranges,
 };
 use crate::storage::stats::{
-	COLUMN_STATS_DEFAULT_PREFIX_BYTES, arrow_stats_type_tag, encode_bool_stat_value,
-	encode_signed_stat_value, encode_unsigned_stat_value,
+	CanonicalScalar, arrow_stats_type_tag, canonical_stats_for_array_slice, encode_bool_stat_value,
+	encode_signed_stat_value, encode_unsigned_stat_value, read_canonical_scalar,
+	write_canonical_scalar,
 };
-use arrow::array::{
-	Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Int8Array, Int16Array,
-	Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-	TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, UInt8Array,
-	UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute;
-use arrow::datatypes::{
-	DataType, Date32Type, Date64Type, Int8Type, Int16Type, Int32Type, Int64Type, Schema, TimeUnit,
-	TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType, UInt8Type,
-	UInt16Type, UInt32Type, UInt64Type,
-};
+use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::ipc::{BodyCompressionMethod, CompressionType, MessageHeader, root_as_message};
 use arrow::record_batch::RecordBatch;
@@ -109,13 +101,6 @@ pub struct RowGroupColumnStats {
 	pub null_count: RowCount,
 	pub min: Option<CanonicalScalar>,
 	pub max: Option<CanonicalScalar>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CanonicalScalar {
-	pub arrow_type_tag: u8,
-	pub bytes: Vec<u8>,
-	pub truncated: bool,
 }
 
 #[repr(u32)]
@@ -707,8 +692,13 @@ pub fn row_group_stats_for_batch(
 		if !stats_supported_types.contains(field.data_type()) {
 			continue;
 		}
-		let Some((min, max)) =
-			canonical_min_max(field.data_type(), batch.column(ordinal).as_ref())?
+		let column = batch.column(ordinal);
+		let Some(values) = canonical_stats_for_array_slice(
+			field.data_type(),
+			column.as_ref(),
+			0,
+			batch.num_rows(),
+		)?
 		else {
 			continue;
 		};
@@ -721,9 +711,9 @@ pub fn row_group_stats_for_batch(
 		stats.push(RowGroupColumnStats {
 			row_group_index,
 			ipc_column_ordinal: IpcColumnOrdinal::new(ordinal),
-			null_count: RowCount::new(batch.column(ordinal as usize).null_count() as u64),
-			min,
-			max,
+			null_count: RowCount::new(values.null_count),
+			min: values.min,
+			max: values.max,
 		});
 	}
 	Ok(stats)
@@ -1176,15 +1166,6 @@ pub fn apply_phase_b_masks_to_projected_row_groups(
 		if !predicate_fetched.contains(&group) {
 			filtered.push(projected);
 			continue;
-		}
-		if !phase_b.decoded_predicate_batches.contains_key(&group) {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				format!(
-					"Phase B predicate batch missing for row group {}",
-					group.get()
-				),
-			));
 		}
 		let mask = phase_b.survival_masks.get(&group).ok_or_else(|| {
 			Error::new(
@@ -1952,182 +1933,6 @@ fn stats_for<'a>(
 	})
 }
 
-fn canonical_min_max(
-	data_type: &DataType,
-	array: &dyn Array,
-) -> std::io::Result<Option<(Option<CanonicalScalar>, Option<CanonicalScalar>)>> {
-	let Some(tag) = arrow_stats_type_tag(data_type) else {
-		return Ok(None);
-	};
-	let (min, max) = match data_type {
-		DataType::Int8 => signed_min_max::<Int8Array, Int8Type>(array, 1)?,
-		DataType::Int16 => signed_min_max::<Int16Array, Int16Type>(array, 2)?,
-		DataType::Int32 => signed_min_max::<Int32Array, Int32Type>(array, 4)?,
-		DataType::Int64 => signed_min_max::<Int64Array, Int64Type>(array, 8)?,
-		DataType::UInt8 => unsigned_min_max::<UInt8Array, UInt8Type>(array, 1)?,
-		DataType::UInt16 => unsigned_min_max::<UInt16Array, UInt16Type>(array, 2)?,
-		DataType::UInt32 => unsigned_min_max::<UInt32Array, UInt32Type>(array, 4)?,
-		DataType::UInt64 => unsigned_min_max::<UInt64Array, UInt64Type>(array, 8)?,
-		DataType::Timestamp(TimeUnit::Millisecond, _) => {
-			signed_min_max::<TimestampMillisecondArray, TimestampMillisecondType>(array, 8)?
-		}
-		DataType::Timestamp(TimeUnit::Microsecond, _) => {
-			signed_min_max::<TimestampMicrosecondArray, TimestampMicrosecondType>(array, 8)?
-		}
-		DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-			signed_min_max::<TimestampNanosecondArray, TimestampNanosecondType>(array, 8)?
-		}
-		DataType::Date32 => signed_min_max::<Date32Array, Date32Type>(array, 4)?,
-		DataType::Date64 => signed_min_max::<Date64Array, Date64Type>(array, 8)?,
-		DataType::Boolean => bool_min_max(array)?,
-		DataType::Utf8 => string_min_max(array)?,
-		DataType::LargeUtf8 => large_string_min_max(array)?,
-		DataType::Binary => binary_min_max(array)?,
-		DataType::LargeBinary => large_binary_min_max(array)?,
-		_ => return Ok(None),
-	};
-	let (min, min_truncated) = maybe_truncate_stat(data_type, min);
-	let (max, max_truncated) = maybe_truncate_stat(data_type, max);
-	Ok(Some((
-		min.map(|bytes| CanonicalScalar {
-			arrow_type_tag: tag,
-			bytes,
-			truncated: min_truncated,
-		}),
-		max.map(|bytes| CanonicalScalar {
-			arrow_type_tag: tag,
-			bytes,
-			truncated: max_truncated,
-		}),
-	)))
-}
-
-fn signed_min_max<A, T>(
-	array: &dyn Array,
-	byte_width: usize,
-) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)>
-where
-	A: Array + 'static,
-	T: arrow::datatypes::ArrowNumericType,
-	T::Native: Into<i64> + PartialOrd,
-{
-	let array = downcast::<A>(array)?;
-	let array = array
-		.as_any()
-		.downcast_ref::<arrow::array::PrimitiveArray<T>>()
-		.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				"row-group stats primitive downcast failed",
-			)
-		})?;
-	Ok((
-		compute::min::<T>(array)
-			.map(|value| encode_signed_stat_value(value.into(), byte_width))
-			.transpose()?,
-		compute::max::<T>(array)
-			.map(|value| encode_signed_stat_value(value.into(), byte_width))
-			.transpose()?,
-	))
-}
-
-fn unsigned_min_max<A, T>(
-	array: &dyn Array,
-	byte_width: usize,
-) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)>
-where
-	A: Array + 'static,
-	T: arrow::datatypes::ArrowNumericType,
-	T::Native: Into<u64> + PartialOrd,
-{
-	let array = downcast::<A>(array)?;
-	let array = array
-		.as_any()
-		.downcast_ref::<arrow::array::PrimitiveArray<T>>()
-		.ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				"row-group stats primitive downcast failed",
-			)
-		})?;
-	Ok((
-		compute::min::<T>(array)
-			.map(|value| encode_unsigned_stat_value(value.into(), byte_width))
-			.transpose()?,
-		compute::max::<T>(array)
-			.map(|value| encode_unsigned_stat_value(value.into(), byte_width))
-			.transpose()?,
-	))
-}
-
-fn bool_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-	let array = downcast::<BooleanArray>(array)?;
-	Ok((
-		compute::min_boolean(array).map(|value| encode_bool_stat_value(value).to_vec()),
-		compute::max_boolean(array).map(|value| encode_bool_stat_value(value).to_vec()),
-	))
-}
-
-fn string_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-	let array = downcast::<StringArray>(array)?;
-	Ok((
-		compute::min_string(array).map(|value| value.as_bytes().to_vec()),
-		compute::max_string(array).map(|value| value.as_bytes().to_vec()),
-	))
-}
-
-fn large_string_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-	let array = downcast::<LargeStringArray>(array)?;
-	Ok((
-		compute::min_string(array).map(|value| value.as_bytes().to_vec()),
-		compute::max_string(array).map(|value| value.as_bytes().to_vec()),
-	))
-}
-
-fn binary_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-	let array = downcast::<BinaryArray>(array)?;
-	Ok((
-		compute::min_binary(array).map(|value| value.to_vec()),
-		compute::max_binary(array).map(|value| value.to_vec()),
-	))
-}
-
-fn large_binary_min_max(array: &dyn Array) -> std::io::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-	let array = downcast::<LargeBinaryArray>(array)?;
-	Ok((
-		compute::min_binary(array).map(|value| value.to_vec()),
-		compute::max_binary(array).map(|value| value.to_vec()),
-	))
-}
-
-fn maybe_truncate_stat(data_type: &DataType, value: Option<Vec<u8>>) -> (Option<Vec<u8>>, bool) {
-	let uses_prefix = matches!(
-		data_type,
-		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
-	);
-	let Some(mut value) = value else {
-		return (None, false);
-	};
-	if uses_prefix && value.len() > COLUMN_STATS_DEFAULT_PREFIX_BYTES {
-		value.truncate(COLUMN_STATS_DEFAULT_PREFIX_BYTES);
-		(Some(value), true)
-	} else {
-		(Some(value), false)
-	}
-}
-
-fn downcast<A: Array + 'static>(array: &dyn Array) -> std::io::Result<&A> {
-	array.as_any().downcast_ref::<A>().ok_or_else(|| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!(
-				"row-group stats Arrow downcast failed: expected {}",
-				std::any::type_name::<A>()
-			),
-		)
-	})
-}
-
 fn validate_range_inside_record(
 	range: RecordBodyByteRange,
 	record_body_len: u64,
@@ -2180,16 +1985,7 @@ fn write_range(out: &mut Vec<u8>, range: RecordBodyByteRange) {
 }
 
 fn write_scalar(out: &mut Vec<u8>, scalar: Option<&CanonicalScalar>) -> std::io::Result<()> {
-	let Some(scalar) = scalar else {
-		out.push(0);
-		return Ok(());
-	};
-	out.push(1);
-	out.push(scalar.arrow_type_tag);
-	out.push(u8::from(scalar.truncated));
-	write_u32(out, checked_len(scalar.bytes.len(), "scalar length")?);
-	out.extend_from_slice(&scalar.bytes);
-	Ok(())
+	write_canonical_scalar(out, scalar)
 }
 
 fn read_exact<'a>(
@@ -2239,22 +2035,7 @@ fn read_scalar(
 	bytes: &[u8],
 	cursor: &mut usize,
 ) -> Result<Option<CanonicalScalar>, RowGroupRejectCode> {
-	let present = *read_exact(bytes, cursor, 1)?.first().expect("one byte");
-	if present == 0 {
-		return Ok(None);
-	}
-	if present != 1 {
-		return Err(RowGroupRejectCode::PageDirectoryParseError);
-	}
-	let arrow_type_tag = *read_exact(bytes, cursor, 1)?.first().expect("one byte");
-	let truncated = *read_exact(bytes, cursor, 1)?.first().expect("one byte") != 0;
-	let len = read_count(bytes, cursor)?;
-	let value = read_exact(bytes, cursor, len)?.to_vec();
-	Ok(Some(CanonicalScalar {
-		arrow_type_tag,
-		bytes: value,
-		truncated,
-	}))
+	read_canonical_scalar(bytes, cursor).map_err(|_| RowGroupRejectCode::PageDirectoryParseError)
 }
 
 struct IpcMessageMetadata<'a> {

@@ -54,6 +54,19 @@ records ciphertext-byte narrowing as bounded by ADR
 chunk layout is follow-up territory, not an ADR 057
 directory extension.
 
+ADR 063 page-level predicate stats is now implemented and
+promoted as an additive ADR 057 directory amendment. The
+encoding directory format version is bumped and
+`BufferEncoding` gains `page_stats: Vec<EncodingPageStats>`,
+with length `0` or `page_end_offsets.len()`. V1 emits page
+stats only for fixed-width predicate value buffers whose
+cascade is in the intersection of ADR 059's default predicate
+allow-list and `EncodingCascade::emits_pages_in_v1()`:
+`BitPacked`, `DictionaryPlain`, and `DictionaryBitPacked`.
+`Delta` remains allow-listed but not page-emitting in V1, RLE
+byte-run remains page-emitting but not allow-listed, and both
+carry empty `page_stats`.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-row-group-buffer encoding

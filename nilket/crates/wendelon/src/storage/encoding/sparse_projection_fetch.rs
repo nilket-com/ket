@@ -597,6 +597,7 @@ mod tests {
 					},
 					page_value_count: SimdPageValueCount::new(page_value_count),
 					page_end_offsets,
+					page_stats: Vec::new(),
 				}],
 			};
 			Self {
@@ -665,6 +666,7 @@ mod tests {
 				.copied()
 				.map(EncodingPageByteOffset::new)
 				.collect(),
+			page_stats: Vec::new(),
 		}
 	}
 

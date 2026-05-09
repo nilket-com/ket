@@ -37,7 +37,15 @@ Inherits substrate:
 
 ## Status
 
-Council-converged. Implementation phases pending.
+Shipped 2026-05-09. Implementation, tests, architecture
+guards, and quick bench evidence landed together. Evidence is
+recorded at
+`plans/impl/063_page_level_predicate_stats_bench_results.md`.
+The Phase 0 profile-emission decision keeps both `PointRead`
+and `Scan` in V1: quick clustered 5% predicate bytes drop
+`9,153 -> 144` for `Scan` (63.56x) and `1,145 -> 144` for
+`PointRead` (7.95x), with combined metadata inside ADR 044's
+64 KiB initial-probe envelope.
 
 Implementation contract:
 

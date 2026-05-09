@@ -280,6 +280,7 @@ fn bitpacked_predicate_evaluator_matches_decoded_values() {
 		encoded_range: encoded.encoded_range(),
 		page_value_count: SimdPageValueCount::new(1024),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	};
 
 	let literal = ColumnPredicateLiteralV1::Int(5);
@@ -340,6 +341,7 @@ fn value_dispatch_rejects_null_atoms_without_validity_bitmap() {
 		encoded_range: encoded.encoded_range(),
 		page_value_count: SimdPageValueCount::new(1024),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	};
 	let coercion = coerce_literal(None, &data_type).unwrap();
 	for op in [PredicateAtomOp::IsNull, PredicateAtomOp::IsNotNull] {
@@ -611,6 +613,7 @@ fn aggregate_context_decodes_encoded_column_bytes() {
 		encoded_range: encoded.encoded_range(),
 		page_value_count: SimdPageValueCount::new(4),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	};
 	let context = EncodedAggregateContext::new(RowCount::new(values.len() as u64))
 		.with_encoded_column(0, DataType::UInt8, &encoded.bytes, &encoding, &cascade)

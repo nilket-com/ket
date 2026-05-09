@@ -149,6 +149,20 @@ pub enum ColumnStatsPrune {
 	CannotMatch,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalScalar {
+	pub arrow_type_tag: u8,
+	pub bytes: Vec<u8>,
+	pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalStatsValues {
+	pub null_count: u64,
+	pub min: Option<CanonicalScalar>,
+	pub max: Option<CanonicalScalar>,
+}
+
 pub fn encode_column_stats_block(
 	header: &ColumnStatsBlockHeader,
 	columns: &[ColumnStatsBlockEntry],
@@ -507,6 +521,119 @@ pub fn encode_length_prefixed_bytes(out: &mut Vec<u8>, value: &[u8]) -> std::io:
 	out.extend_from_slice(&len.to_be_bytes());
 	out.extend_from_slice(value);
 	Ok(())
+}
+
+pub fn fixed_width_page_stats_supported_type(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+			| DataType::Timestamp(TimeUnit::Millisecond, None)
+			| DataType::Timestamp(TimeUnit::Microsecond, None)
+			| DataType::Timestamp(TimeUnit::Nanosecond, None)
+			| DataType::Date32
+			| DataType::Date64
+			| DataType::Boolean
+	)
+}
+
+pub fn canonical_stats_for_array_slice(
+	data_type: &DataType,
+	array: &dyn Array,
+	offset: usize,
+	len: usize,
+) -> std::io::Result<Option<CanonicalStatsValues>> {
+	let Some(tag) = arrow_stats_type_tag(data_type) else {
+		return Ok(None);
+	};
+	let end = offset.checked_add(len).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"canonical stats array slice range overflow",
+		)
+	})?;
+	if end > array.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"canonical stats array slice exceeds array length",
+		));
+	}
+	let sliced = array.slice(offset, len);
+	let stats = collect_column_stats_in_one_pass(
+		data_type,
+		sliced.as_ref(),
+		tag,
+		COLUMN_STATS_DEFAULT_PREFIX_BYTES,
+		None,
+		None,
+		None,
+	)?;
+	Ok(Some(CanonicalStatsValues {
+		null_count: stats.null_count,
+		min: stats.min.map(|bytes| CanonicalScalar {
+			arrow_type_tag: tag,
+			bytes,
+			truncated: stats.min_truncated,
+		}),
+		max: stats.max.map(|bytes| CanonicalScalar {
+			arrow_type_tag: tag,
+			bytes,
+			truncated: stats.max_truncated,
+		}),
+	}))
+}
+
+pub fn write_canonical_scalar(
+	out: &mut Vec<u8>,
+	scalar: Option<&CanonicalScalar>,
+) -> std::io::Result<()> {
+	let Some(scalar) = scalar else {
+		out.push(0);
+		return Ok(());
+	};
+	out.push(1);
+	out.push(scalar.arrow_type_tag);
+	out.push(u8::from(scalar.truncated));
+	encode_length_prefixed_bytes(out, &scalar.bytes)?;
+	Ok(())
+}
+
+pub fn read_canonical_scalar(
+	bytes: &[u8],
+	cursor: &mut usize,
+) -> std::io::Result<Option<CanonicalScalar>> {
+	let present = read_canonical_exact(bytes, cursor, 1, "canonical scalar present")?[0];
+	if present == 0 {
+		return Ok(None);
+	}
+	if present != 1 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"canonical scalar present flag must be 0 or 1",
+		));
+	}
+	let arrow_type_tag = read_canonical_exact(bytes, cursor, 1, "canonical scalar type tag")?[0];
+	let truncated = read_canonical_exact(bytes, cursor, 1, "canonical scalar truncation flag")?[0];
+	if truncated > 1 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"canonical scalar truncation flag must be 0 or 1",
+		));
+	}
+	let len_bytes = read_canonical_exact(bytes, cursor, 4, "canonical scalar length")?;
+	let len = u32::from_be_bytes(len_bytes.try_into().expect("slice len")) as usize;
+	let value = read_canonical_exact(bytes, cursor, len, "canonical scalar value")?.to_vec();
+	Ok(Some(CanonicalScalar {
+		arrow_type_tag,
+		bytes: value,
+		truncated: truncated != 0,
+	}))
 }
 
 pub fn build_always_on_column_stats_block(
@@ -1645,6 +1772,28 @@ fn downcast_array<A: Array + 'static>(array: &dyn Array) -> std::io::Result<&A> 
 			),
 		)
 	})
+}
+
+fn read_canonical_exact<'a>(
+	bytes: &'a [u8],
+	cursor: &mut usize,
+	len: usize,
+	field: &str,
+) -> std::io::Result<&'a [u8]> {
+	let end = cursor.checked_add(len).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("canonical scalar cursor overflow while reading {field}"),
+		)
+	})?;
+	let value = bytes.get(*cursor..end).ok_or_else(|| {
+		Error::new(
+			ErrorKind::UnexpectedEof,
+			format!("canonical scalar truncated while reading {field}"),
+		)
+	})?;
+	*cursor = end;
+	Ok(value)
 }
 
 fn read_length_prefixed_bytes(bytes: &[u8], cursor: &mut usize) -> std::io::Result<Vec<u8>> {

@@ -24,6 +24,7 @@ fn page_descriptors_expand_prefix_end_offsets_without_serialized_rows() {
 			EncodingPageByteOffset::new(7),
 			EncodingPageByteOffset::new(10),
 		],
+		page_stats: Vec::new(),
 	};
 
 	let pages = expand_page_descriptors(&encoding).unwrap();

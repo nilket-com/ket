@@ -7,9 +7,10 @@
 //! survival-mask evaluation, and masked Phase C materialization.
 
 use arrow::array::{
-	Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt16Array, UInt32Array,
+	Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt8Array, UInt16Array,
+	UInt32Array,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,29 +25,42 @@ use wendelon::crypto::{
 	SLAB_AEAD_TAG_BYTES, SLAB_ENCRYPTION_CHUNK_SIZES, TieredOffsetIndexEntry, TieredPlaintextRange,
 	TieredSlabObjectMetadata, test_support::seeded_dev_crypto_manager,
 };
-use wendelon::schema::pbc::{OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
+use wendelon::schema::pbc::{ColumnPredicateLiteralV1, OP_GT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
-	BufferValueCount, ChunkSizeBytes, HybridTimestamp, Identity, IdentityPrefix, Locality,
-	LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
-	RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex,
-	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId, TenantId,
+	BaseValue, BitsPerValue, BufferValueCount, ChunkSizeBytes, DictValueCount, HybridTimestamp,
+	Identity, IdentityPrefix, IpcBufferIndex, IpcColumnOrdinal, Locality, LocalityPolicyV1,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
+	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
+	TableObjectId, TenantId,
+};
+use wendelon::storage::encoding::compute::{
+	EncodingComputeConfig, PredicateAtom, PredicateAtomOp, evaluator_kind_for_cascade,
+};
+use wendelon::storage::encoding::directory::{
+	page_stats_cascade_eligible, serialize_encoding_directory_value,
+};
+use wendelon::storage::encoding::page::expand_page_descriptors;
+use wendelon::storage::encoding::predicate_page_fetch::{
+	PagePredicateClassification, classify_page_stats_for_atom,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
+use wendelon::storage::stats::fixed_width_page_stats_supported_type;
 use wendelon::storage::{
 	ColumnFetchRequirement, ColumnOrdinalSet, EncodingPageDescriptor, PhaseBOutcome,
-	PlaintextByteRange, ROW_GROUP_POINT_READ_TARGET_ROWS, ROW_GROUP_SCAN_MAX_ROWS,
-	ROW_GROUP_SCAN_TARGET_ROWS, RecordBufferDirectory, RowGroupSizingProfile, RowGroupWriterConfig,
-	TieredRecordId, apply_phase_b_masks_to_projected_row_groups,
-	build_page_directory_for_ipc_stream, decode_projected_row_groups_from_plaintext_ranges,
-	default_stats_supported_types,
+	PlaintextByteRange, ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS,
+	ROW_GROUP_POINT_READ_TARGET_ROWS, ROW_GROUP_SCAN_MAX_ROWS, ROW_GROUP_SCAN_TARGET_ROWS,
+	RecordBufferDirectory, RowGroupSizingProfile, RowGroupWriterConfig, TieredRecordId,
+	apply_phase_b_masks_to_projected_row_groups, build_page_directory_for_ipc_stream,
+	decode_projected_row_groups_from_plaintext_ranges, default_stats_supported_types,
 	encode_multirow_from_survivors_with_row_group_and_encoding_config,
 	encode_multirow_from_survivors_with_row_group_config, encode_record_batches_bytes,
 	parse_record_buffer_directory, project_record_batch_for_requirement, row_group_stats_for_batch,
 	selected_row_group_record_body_ranges, serialize_page_directory_value,
 };
 use wendelon::storage::{
-	EncodingCascade, EncodingCascadeKind, EncodingWriterConfig, MockObjectStore,
-	MockObjectStoreConfig, ObjectMetadata, ObjectStore, RecordBodyByteRange,
+	EncodingCascade, EncodingCascadeKind, EncodingLeafCascade, EncodingWriterConfig,
+	MockObjectStore, MockObjectStoreConfig, ObjectMetadata, ObjectStore, RecordBodyByteRange,
 };
 
 fn main() -> std::io::Result<()> {
@@ -81,6 +95,7 @@ fn main() -> std::io::Result<()> {
 	bench_sparse_projection_runtime_determinism(&config)?;
 	bench_adr061_chunk_layout_matrix(&config)?;
 	bench_adr062_row_group_sizing_profile_matrix(&config)?;
+	bench_adr063_page_level_predicate_stats_matrix(&config)?;
 	Ok(())
 }
 
@@ -3121,6 +3136,755 @@ fn bench_adr062_row_group_sizing_profile_matrix(config: &BenchConfig) -> std::io
 	bench_adr062_compression_loss(config)?;
 	bench_adr062_cross_replica_determinism()?;
 	Ok(())
+}
+
+fn bench_adr063_page_level_predicate_stats_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	bench_adr063_predicate_selectivity_matrix()?;
+	bench_adr063_boundary_matrix()?;
+	bench_adr063_type_gate_matrix();
+	bench_adr063_cascade_gate_matrix();
+	bench_adr063_writer_cost(config)?;
+	bench_adr063_cross_replica_determinism()?;
+	Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Adr063Distribution {
+	Clustered,
+	RandomUniform,
+	AllDisjoint,
+	AllExact,
+}
+
+impl Adr063Distribution {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Clustered => "clustered",
+			Self::RandomUniform => "random_uniform",
+			Self::AllDisjoint => "all_disjoint",
+			Self::AllExact => "all_exact",
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default)]
+struct Adr063PageStatsAnalysis {
+	row_group_directory_bytes: usize,
+	encoding_directory_bytes_without_page_stats: usize,
+	encoding_directory_bytes_with_page_stats: usize,
+	combined_metadata_bytes: usize,
+	page_stats_bytes: usize,
+	page_stats_count: usize,
+	page_count: usize,
+	dense_predicate_plaintext_bytes: u64,
+	narrowed_predicate_plaintext_bytes: u64,
+	narrowed_predicate_ciphertext_bytes: u64,
+	dense_predicate_ciphertext_bytes: u64,
+	selected_range_count: usize,
+	disjoint_pages: usize,
+	exact_pages: usize,
+	maybe_pages: usize,
+	exact_match_rows: u64,
+	actual_cascade: &'static str,
+}
+
+fn bench_adr063_predicate_selectivity_matrix() -> std::io::Result<()> {
+	for profile in [
+		RowGroupSizingProfile::Scan,
+		RowGroupSizingProfile::PointRead,
+	] {
+		let rows = match profile {
+			RowGroupSizingProfile::Scan => ROW_GROUP_SCAN_TARGET_ROWS as usize,
+			RowGroupSizingProfile::PointRead => ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS as usize,
+		};
+		for (distribution, selectivity) in [
+			(Adr063Distribution::Clustered, 1_u64),
+			(Adr063Distribution::Clustered, 5),
+			(Adr063Distribution::Clustered, 10),
+			(Adr063Distribution::Clustered, 25),
+			(Adr063Distribution::RandomUniform, 1),
+			(Adr063Distribution::RandomUniform, 5),
+			(Adr063Distribution::RandomUniform, 10),
+			(Adr063Distribution::RandomUniform, 25),
+		] {
+			let fixture = adr063_fixture(rows, 1, distribution, selectivity, profile, true)?;
+			let atom = PredicateAtom {
+				op: PredicateAtomOp::Eq,
+				literal: Some(ColumnPredicateLiteralV1::Int(1)),
+			};
+			let analysis = adr063_analyze_predicate_pages(&fixture.directory, &atom)?;
+			adr063_print_predicate_analysis(
+				"profile_selectivity",
+				profile,
+				rows,
+				1,
+				distribution,
+				selectivity,
+				&analysis,
+			);
+		}
+		for (distribution, atom) in [
+			(
+				Adr063Distribution::AllDisjoint,
+				PredicateAtom {
+					op: PredicateAtomOp::Eq,
+					literal: Some(ColumnPredicateLiteralV1::Int(1)),
+				},
+			),
+			(
+				Adr063Distribution::AllExact,
+				PredicateAtom {
+					op: PredicateAtomOp::Eq,
+					literal: Some(ColumnPredicateLiteralV1::Int(1)),
+				},
+			),
+		] {
+			let fixture = adr063_fixture(rows, 1, distribution, 100, profile, true)?;
+			let analysis = adr063_analyze_predicate_pages(&fixture.directory, &atom)?;
+			adr063_print_predicate_analysis(
+				"boundary_classification",
+				profile,
+				rows,
+				1,
+				distribution,
+				100,
+				&analysis,
+			);
+		}
+	}
+	Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adr063_print_predicate_analysis(
+	scenario_suffix: &str,
+	profile: RowGroupSizingProfile,
+	rows: usize,
+	columns: usize,
+	distribution: Adr063Distribution,
+	selectivity: u64,
+	analysis: &Adr063PageStatsAnalysis,
+) {
+	let route = if analysis.narrowed_predicate_plaintext_bytes
+		>= analysis.dense_predicate_plaintext_bytes
+		&& analysis.dense_predicate_plaintext_bytes != 0
+	{
+		"dense_fallback"
+	} else {
+		"page_narrowed"
+	};
+	let reduction_micros = fraction_micros(
+		analysis.dense_predicate_plaintext_bytes,
+		analysis.narrowed_predicate_plaintext_bytes,
+	);
+	println!(
+		"row_group_fetch_measure scenario=adr063_{} profile={} rows={} columns={} distribution={} selectivity_percent={} cascade={} route={} page_stats={} page_count={} disjoint_pages={} exact_pages={} maybe_pages={} exact_match_rows={} selected_ranges={} dense_predicate_plaintext_bytes={} narrowed_predicate_plaintext_bytes={} dense_predicate_ciphertext_bytes={} narrowed_predicate_ciphertext_bytes={} predicate_byte_reduction_micros={} row_group_directory_bytes={} encoding_directory_bytes_before_page_stats={} encoding_directory_bytes_after_page_stats={} page_stats_bytes={} combined_metadata_bytes={} probe_64k_fit={}",
+		scenario_suffix,
+		profile.as_str(),
+		rows,
+		columns,
+		distribution.as_str(),
+		selectivity,
+		analysis.actual_cascade,
+		route,
+		analysis.page_stats_count,
+		analysis.page_count,
+		analysis.disjoint_pages,
+		analysis.exact_pages,
+		analysis.maybe_pages,
+		analysis.exact_match_rows,
+		analysis.selected_range_count,
+		analysis.dense_predicate_plaintext_bytes,
+		analysis.narrowed_predicate_plaintext_bytes,
+		analysis.dense_predicate_ciphertext_bytes,
+		analysis.narrowed_predicate_ciphertext_bytes,
+		reduction_micros,
+		analysis.row_group_directory_bytes,
+		analysis.encoding_directory_bytes_without_page_stats,
+		analysis.encoding_directory_bytes_with_page_stats,
+		analysis.page_stats_bytes,
+		analysis.combined_metadata_bytes,
+		analysis.combined_metadata_bytes <= 64 * 1024,
+	);
+}
+
+fn bench_adr063_boundary_matrix() -> std::io::Result<()> {
+	for (profile, rows) in [
+		(
+			RowGroupSizingProfile::PointRead,
+			ROW_GROUP_POINT_READ_TARGET_ROWS as usize,
+		),
+		(
+			RowGroupSizingProfile::Scan,
+			(ROW_GROUP_SCAN_TARGET_ROWS - 1) as usize,
+		),
+		(
+			RowGroupSizingProfile::Scan,
+			ROW_GROUP_SCAN_TARGET_ROWS as usize,
+		),
+		(
+			RowGroupSizingProfile::Scan,
+			(ROW_GROUP_SCAN_TARGET_ROWS + 1) as usize,
+		),
+	] {
+		let fixture = adr063_fixture(rows, 1, Adr063Distribution::Clustered, 5, profile, true)?;
+		let page_directory = fixture.directory.page_directory.as_ref();
+		let page_stats_count = fixture
+			.directory
+			.encoding_directory
+			.as_ref()
+			.map(|directory| {
+				directory
+					.buffers
+					.iter()
+					.map(|buffer| buffer.page_stats.len())
+					.sum::<usize>()
+			})
+			.unwrap_or(0);
+		println!(
+			"row_group_fetch_measure scenario=adr063_boundary profile={} rows={} columns=1 distribution={} row_groups={} directory_present={} encoding_directory_present={} page_stats={} record_bytes={} plaintext_bytes={} row_group_directory_bytes={}",
+			profile.as_str(),
+			rows,
+			Adr063Distribution::Clustered.as_str(),
+			page_directory
+				.map(|directory| directory.row_groups.len())
+				.unwrap_or(0),
+			page_directory.is_some(),
+			fixture.directory.encoding_directory.is_some(),
+			page_stats_count,
+			fixture.encoded_bytes,
+			fixture.plaintext_bytes,
+			fixture.directory_value_bytes,
+		);
+	}
+	Ok(())
+}
+
+fn bench_adr063_type_gate_matrix() {
+	let cases = [
+		("int8", DataType::Int8),
+		("int16", DataType::Int16),
+		("int32", DataType::Int32),
+		("int64", DataType::Int64),
+		("uint8", DataType::UInt8),
+		("uint16", DataType::UInt16),
+		("uint32", DataType::UInt32),
+		("uint64", DataType::UInt64),
+		(
+			"timestamp_ms",
+			DataType::Timestamp(TimeUnit::Millisecond, None),
+		),
+		(
+			"timestamp_us",
+			DataType::Timestamp(TimeUnit::Microsecond, None),
+		),
+		(
+			"timestamp_ns",
+			DataType::Timestamp(TimeUnit::Nanosecond, None),
+		),
+		("date32", DataType::Date32),
+		("date64", DataType::Date64),
+		("boolean", DataType::Boolean),
+		("float64", DataType::Float64),
+		("utf8", DataType::Utf8),
+	];
+	for (label, data_type) in cases {
+		println!(
+			"row_group_fetch_measure scenario=adr063_type_gate type={} fixed_width_page_stats_supported={}",
+			label,
+			fixed_width_page_stats_supported_type(&data_type),
+		);
+	}
+}
+
+fn bench_adr063_cascade_gate_matrix() {
+	let cascades = [
+		(
+			"bit_packed",
+			EncodingCascade::BitPacked {
+				bits: BitsPerValue::new(8),
+				base: BaseValue::ZERO,
+			},
+		),
+		(
+			"dictionary_plain",
+			EncodingCascade::Dictionary {
+				dict_byte_len: RecordBodyByteLen::new(16),
+				dict_value_count: DictValueCount::new(2),
+				inner: Box::new(EncodingLeafCascade::Plain),
+			},
+		),
+		(
+			"dictionary_bit_packed",
+			EncodingCascade::Dictionary {
+				dict_byte_len: RecordBodyByteLen::new(16),
+				dict_value_count: DictValueCount::new(2),
+				inner: Box::new(EncodingLeafCascade::BitPacked {
+					bits: BitsPerValue::new(1),
+					base: BaseValue::ZERO,
+				}),
+			},
+		),
+		(
+			"rle_plain",
+			EncodingCascade::Rle {
+				run_count: RunCount::new(4),
+				inner: Box::new(EncodingLeafCascade::Plain),
+			},
+		),
+		(
+			"delta",
+			EncodingCascade::Delta {
+				base: BaseValue::ZERO,
+				inner: Box::new(EncodingLeafCascade::Plain),
+			},
+		),
+		("plain", EncodingCascade::Plain),
+		("lz4_frame", EncodingCascade::Lz4Frame),
+	];
+	let default_compute = EncodingComputeConfig::default();
+	for (label, cascade) in cascades {
+		let evaluator = evaluator_kind_for_cascade(&cascade);
+		let allow_listed = evaluator
+			.map(|kind| default_compute.predicate_evaluator_enabled(kind))
+			.unwrap_or(false);
+		println!(
+			"row_group_fetch_measure scenario=adr063_cascade_gate cascade={} evaluator={} allow_listed={} emits_pages_in_v1={} page_stats_cascade_eligible={}",
+			label,
+			evaluator.map(|kind| kind.as_str()).unwrap_or("none"),
+			allow_listed,
+			cascade.emits_pages_in_v1(),
+			page_stats_cascade_eligible(&cascade),
+		);
+	}
+}
+
+fn bench_adr063_writer_cost(config: &BenchConfig) -> std::io::Result<()> {
+	let rows = ROW_GROUP_SCAN_TARGET_ROWS as usize;
+	let columns = 1;
+	let iterations = config.iterations.min(10).max(1);
+	let batch = adr063_bench_batch(rows, columns, Adr063Distribution::Clustered, 5)?;
+	let table_descriptor = descriptor(batch.schema().as_ref(), columns)?;
+	let source_rows = ordered_source_rows(rows);
+	let encoding_config = adr063_encoding_config();
+	for stats_enabled in [false, true] {
+		let row_group_config =
+			row_group_profile_config_for(RowGroupSizingProfile::Scan, true, stats_enabled);
+		let elapsed = bench(iterations, || {
+			let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				black_box(&batch),
+				black_box(&source_rows),
+				black_box(&table_descriptor),
+				RecordBodyCompressionPolicy::Uncompressed,
+				black_box(&row_group_config),
+				black_box(&encoding_config),
+			)
+			.expect("ADR 063 writer-cost encode");
+			black_box(encoded.frame.len());
+		});
+		let fixture = adr063_fixture(
+			rows,
+			columns,
+			Adr063Distribution::Clustered,
+			5,
+			RowGroupSizingProfile::Scan,
+			stats_enabled,
+		)?;
+		let page_stats_count = fixture
+			.directory
+			.encoding_directory
+			.as_ref()
+			.map(|directory| {
+				directory
+					.buffers
+					.iter()
+					.map(|buffer| buffer.page_stats.len())
+					.sum::<usize>()
+			})
+			.unwrap_or(0);
+		println!(
+			"row_group_fetch_bench scenario=adr063_writer_cost profile=scan rows={} columns={} distribution={} stats_enabled={} page_stats={} iterations={} total_ms={:.3} micros_per_op={:.3} record_bytes={} plaintext_bytes={}",
+			rows,
+			columns,
+			Adr063Distribution::Clustered.as_str(),
+			stats_enabled,
+			page_stats_count,
+			iterations,
+			elapsed.as_secs_f64() * 1_000.0,
+			elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64,
+			fixture.encoded_bytes,
+			fixture.plaintext_bytes,
+		);
+	}
+	Ok(())
+}
+
+fn bench_adr063_cross_replica_determinism() -> std::io::Result<()> {
+	for profile in [
+		RowGroupSizingProfile::PointRead,
+		RowGroupSizingProfile::Scan,
+	] {
+		let rows = match profile {
+			RowGroupSizingProfile::PointRead => ROW_GROUP_POINT_READ_MIN_PAGED_RECORD_ROWS as usize,
+			RowGroupSizingProfile::Scan => ROW_GROUP_SCAN_TARGET_ROWS as usize,
+		};
+		let columns = 1;
+		let batch = adr063_bench_batch(rows, columns, Adr063Distribution::Clustered, 5)?;
+		let table_descriptor = descriptor(batch.schema().as_ref(), columns)?;
+		let source_rows = ordered_source_rows(rows);
+		let row_group_config = row_group_profile_config_for(profile, true, true);
+		let encoding_config = adr063_encoding_config();
+		let left = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+			&batch,
+			&source_rows,
+			&table_descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&row_group_config,
+			&encoding_config,
+		)?;
+		let right = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+			&batch,
+			&source_rows,
+			&table_descriptor,
+			RecordBodyCompressionPolicy::Uncompressed,
+			&row_group_config,
+			&encoding_config,
+		)?;
+		let fixture = adr063_fixture(
+			rows,
+			columns,
+			Adr063Distribution::Clustered,
+			5,
+			profile,
+			true,
+		)?;
+		let page_stats_count = fixture
+			.directory
+			.encoding_directory
+			.as_ref()
+			.map(|directory| {
+				directory
+					.buffers
+					.iter()
+					.map(|buffer| buffer.page_stats.len())
+					.sum::<usize>()
+			})
+			.unwrap_or(0);
+		println!(
+			"row_group_fetch_measure scenario=adr063_cross_replica_determinism profile={} rows={} columns={} distribution={} page_stats={} byte_equal={} digest={} bytes={}",
+			profile.as_str(),
+			rows,
+			columns,
+			Adr063Distribution::Clustered.as_str(),
+			page_stats_count,
+			left.frame == right.frame,
+			blake3::hash(&left.frame).to_hex(),
+			left.frame.len(),
+		);
+	}
+	Ok(())
+}
+
+fn adr063_fixture(
+	rows: usize,
+	columns: usize,
+	distribution: Adr063Distribution,
+	selectivity: u64,
+	profile: RowGroupSizingProfile,
+	stats_enabled: bool,
+) -> std::io::Result<EncodedFixture> {
+	let batch = adr063_bench_batch(rows, columns, distribution, selectivity)?;
+	let table_descriptor = descriptor(batch.schema().as_ref(), columns)?;
+	let row_group_config = row_group_profile_config_for(profile, true, stats_enabled);
+	let encoding_config = adr063_encoding_config();
+	let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+		&batch,
+		&ordered_source_rows(rows),
+		&table_descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+		&encoding_config,
+	)?;
+	let directory = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(63),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		PlaintextByteRange {
+			start: 0,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&table_descriptor,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 063 directory parse: {err}"),
+		)
+	})?;
+	let directory_value_bytes = directory
+		.page_directory
+		.as_ref()
+		.map(serialize_page_directory_value)
+		.transpose()?
+		.map(|value| value.len())
+		.unwrap_or(0);
+	Ok(EncodedFixture {
+		directory,
+		encoded_bytes: encoded.encoded_byte_len,
+		plaintext_bytes: encoded.plaintext_byte_len,
+		directory_value_bytes,
+	})
+}
+
+fn adr063_encoding_config() -> EncodingWriterConfig {
+	EncodingWriterConfig {
+		enabled: true,
+		target_simd_page_values: SimdPageValueCount::new(1_024),
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: [EncodingCascadeKind::Plain, EncodingCascadeKind::Dictionary]
+			.into_iter()
+			.collect(),
+		..EncodingWriterConfig::default()
+	}
+}
+
+fn adr063_bench_batch(
+	rows: usize,
+	columns: usize,
+	distribution: Adr063Distribution,
+	selectivity: u64,
+) -> std::io::Result<RecordBatch> {
+	let fields = (0..columns)
+		.map(|column| {
+			let data_type = if column == 0 {
+				DataType::UInt8
+			} else {
+				DataType::Utf8
+			};
+			Field::new(format!("c{column}"), data_type, false)
+		})
+		.collect::<Vec<_>>();
+	let arrays = (0..columns)
+		.map(|column| {
+			if column == 0 {
+				let values = (0..rows)
+					.map(|row| adr063_value_for_row(row, rows, distribution, selectivity))
+					.collect::<Vec<_>>();
+				Arc::new(UInt8Array::from(values)) as ArrayRef
+			} else {
+				let values = (0..rows)
+					.map(|row| format!("p{:02}-{:08}-{:05}", column, row, row % 100_000))
+					.collect::<Vec<_>>();
+				Arc::new(StringArray::from(values)) as ArrayRef
+			}
+		})
+		.collect::<Vec<_>>();
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+		.map_err(|err| Error::new(ErrorKind::InvalidData, format!("ADR 063 batch: {err}")))
+}
+
+fn adr063_value_for_row(
+	row: usize,
+	rows: usize,
+	distribution: Adr063Distribution,
+	selectivity: u64,
+) -> u8 {
+	let selected_rows = rows
+		.saturating_mul(selectivity.min(100) as usize)
+		.saturating_add(99)
+		/ 100;
+	match distribution {
+		Adr063Distribution::RandomUniform => {
+			let mixed = (row as u64)
+				.wrapping_mul(6_364_136_223_846_793_005)
+				.wrapping_add(1_442_695_040_888_963_407)
+				.rotate_left(17);
+			u8::from(mixed % 100 < selectivity.min(100))
+		}
+		Adr063Distribution::Clustered => u8::from(row < selected_rows),
+		Adr063Distribution::AllDisjoint => 0,
+		Adr063Distribution::AllExact => 1,
+	}
+}
+
+fn adr063_analyze_predicate_pages(
+	directory: &RecordBufferDirectory,
+	atom: &PredicateAtom,
+) -> std::io::Result<Adr063PageStatsAnalysis> {
+	let page_directory = directory
+		.page_directory
+		.as_ref()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 missing page directory"))?;
+	let encoding_directory = directory
+		.encoding_directory
+		.as_ref()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 missing encoding directory"))?;
+	let encoding_directory_bytes_with_page_stats =
+		serialize_encoding_directory_value(encoding_directory)?.len();
+	let mut without_page_stats = encoding_directory.clone();
+	for buffer in &mut without_page_stats.buffers {
+		buffer.page_stats.clear();
+	}
+	let encoding_directory_bytes_without_page_stats =
+		serialize_encoding_directory_value(&without_page_stats)?.len();
+	let row_group_directory_bytes = serialize_page_directory_value(page_directory)?.len();
+	let (physical_ordinal, value_buffer_ordinal) = adr063_value_buffer_ordinal(directory, 0)?;
+	let mut analysis = Adr063PageStatsAnalysis {
+		row_group_directory_bytes,
+		encoding_directory_bytes_without_page_stats,
+		encoding_directory_bytes_with_page_stats,
+		combined_metadata_bytes: row_group_directory_bytes
+			+ encoding_directory_bytes_with_page_stats,
+		page_stats_bytes: encoding_directory_bytes_with_page_stats
+			.saturating_sub(encoding_directory_bytes_without_page_stats),
+		..Adr063PageStatsAnalysis::default()
+	};
+	let mut selected_ranges = Vec::<RecordBodyByteRange>::new();
+	for group in &page_directory.row_groups {
+		let page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == group.row_group_index
+					&& page.ipc_column_ordinal == IpcColumnOrdinal::new(physical_ordinal as u32)
+					&& page.ipc_buffer_ordinal == value_buffer_ordinal
+					&& page.range.len.get() > 0
+			})
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 value page missing"))?;
+		let encoding = wendelon::storage::encoding::materialize::find_buffer_encoding(
+			encoding_directory,
+			group.row_group_index,
+			value_buffer_ordinal,
+			page.range,
+		)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 value encoding missing"))?;
+		let cascade = encoding_directory
+			.cascades
+			.get(encoding.cascade_index.get() as usize)
+			.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 cascade missing"))?;
+		analysis.actual_cascade = adr063_cascade_label(cascade);
+		analysis.dense_predicate_plaintext_bytes = analysis
+			.dense_predicate_plaintext_bytes
+			.saturating_add(encoding.encoded_range.len.get());
+		analysis.page_stats_count = analysis
+			.page_stats_count
+			.saturating_add(encoding.page_stats.len());
+		let pages = expand_page_descriptors(encoding).map_err(|code| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("ADR 063 page expansion rejected: {code:?}"),
+			)
+		})?;
+		analysis.page_count = analysis.page_count.saturating_add(pages.len());
+		for (page_descriptor, stat) in pages.iter().zip(&encoding.page_stats) {
+			let classification = classify_page_stats_for_atom(
+				stat,
+				page_descriptor.value_count.get(),
+				&DataType::UInt8,
+				atom,
+			)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"ADR 063 predicate page classification unsupported",
+				)
+			})?;
+			match classification {
+				PagePredicateClassification::Disjoint => {
+					analysis.disjoint_pages = analysis.disjoint_pages.saturating_add(1);
+				}
+				PagePredicateClassification::ExactMatch => {
+					analysis.exact_pages = analysis.exact_pages.saturating_add(1);
+					analysis.exact_match_rows = analysis
+						.exact_match_rows
+						.saturating_add(u64::from(page_descriptor.value_count.get()));
+				}
+				PagePredicateClassification::Maybe => {
+					analysis.maybe_pages = analysis.maybe_pages.saturating_add(1);
+					analysis.narrowed_predicate_plaintext_bytes = analysis
+						.narrowed_predicate_plaintext_bytes
+						.saturating_add(page_descriptor.byte_range.len.get());
+					selected_ranges.push(adr063_record_body_range_for_page(
+						page.range,
+						encoding.encoded_range.start.get(),
+						page_descriptor,
+					)?);
+				}
+			}
+		}
+	}
+	coalesce_body_ranges(&mut selected_ranges)?;
+	analysis.selected_range_count = selected_ranges.len();
+	analysis.dense_predicate_ciphertext_bytes =
+		chunk_floor_fetch_bytes(analysis.dense_predicate_plaintext_bytes as usize, 16 * 1024);
+	analysis.narrowed_predicate_ciphertext_bytes = selected_ranges
+		.iter()
+		.map(|range| chunk_floor_fetch_bytes(range.len.get() as usize, 16 * 1024))
+		.sum();
+	Ok(analysis)
+}
+
+fn adr063_record_body_range_for_page(
+	buffer_range: RecordBodyByteRange,
+	encoded_start: u32,
+	page: &EncodingPageDescriptor,
+) -> std::io::Result<RecordBodyByteRange> {
+	let start = buffer_range
+		.start
+		.get()
+		.checked_add(u64::from(encoded_start))
+		.and_then(|start| start.checked_add(u64::from(page.byte_range.start.get())))
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 page range overflow"))?;
+	Ok(RecordBodyByteRange {
+		start: RecordBodyByteOffset::new(start),
+		len: page.byte_range.len,
+	})
+}
+
+fn adr063_value_buffer_ordinal(
+	directory: &RecordBufferDirectory,
+	physical_ordinal: usize,
+) -> std::io::Result<(usize, IpcBufferIndex)> {
+	let mapping = directory
+		.column_to_buffers
+		.get(physical_ordinal)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 column buffers missing"))?;
+	if mapping.buffer_count != 2 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 063 fixed-width value buffer mapping changed",
+		));
+	}
+	let value_buffer = mapping
+		.first_buffer_ordinal
+		.get()
+		.checked_add(1)
+		.map(IpcBufferIndex::new)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 063 buffer ordinal overflow"))?;
+	Ok((physical_ordinal, value_buffer))
+}
+
+fn adr063_cascade_label(cascade: &EncodingCascade) -> &'static str {
+	match cascade {
+		EncodingCascade::Plain => "plain",
+		EncodingCascade::Lz4Frame => "lz4_frame",
+		EncodingCascade::BitPacked { .. } => "bit_packed",
+		EncodingCascade::Rle { inner, .. } => match inner.as_ref() {
+			EncodingLeafCascade::Plain => "rle_plain",
+			EncodingLeafCascade::Lz4Frame => "rle_lz4_frame",
+			EncodingLeafCascade::BitPacked { .. } => "rle_bit_packed",
+		},
+		EncodingCascade::Dictionary { inner, .. } => match inner.as_ref() {
+			EncodingLeafCascade::Plain => "dictionary_plain",
+			EncodingLeafCascade::Lz4Frame => "dictionary_lz4_frame",
+			EncodingLeafCascade::BitPacked { .. } => "dictionary_bit_packed",
+		},
+		EncodingCascade::Delta { .. } => "delta",
+		EncodingCascade::Fsst { .. } => "fsst",
+		EncodingCascade::Alp { .. } => "alp",
+	}
 }
 
 fn adr062_schema_cases() -> [BenchCase; 4] {

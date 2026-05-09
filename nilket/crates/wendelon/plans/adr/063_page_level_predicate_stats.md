@@ -7,14 +7,24 @@ Companion implementation plan:
 
 ## Status
 
-Council-converged after five iterations across
-Claude / Codex / Gemini, with post-merge corrections from
-Codex's docs/design review (type-catalog narrowing to
-ADR 056's actual fixed-width support; cascade eligibility
-narrowed to the intersection of ADR 059's allow-list AND
-`EncodingCascade::emits_pages_in_v1()`, dropping `Delta`
-from V1 emission; profile-emission decision moved entirely
-into Phase 0). Implementation phases pending.
+Shipped 2026-05-09 after implementation, full `cargo test`,
+`cargo check --benches`, and quick bench evidence landed
+together. Bench evidence is recorded at
+`plans/impl/063_page_level_predicate_stats_bench_results.md`.
+The Phase 0 profile-emission gate kept both `PointRead` and
+`Scan` in V1: quick clustered 5% predicate bytes drop
+`9,153 -> 144` for `Scan` (63.56x) and `1,145 -> 144` for
+`PointRead` (7.95x), while combined metadata stays inside
+ADR 044's 64 KiB initial-probe envelope.
+
+The shipped design is the council-converged result after five
+iterations across Claude / Codex / Gemini, with post-merge
+corrections from Codex's docs/design review (type-catalog
+narrowing to ADR 056's actual fixed-width support; cascade
+eligibility narrowed to the intersection of ADR 059's
+allow-list AND `EncodingCascade::emits_pages_in_v1()`,
+dropping `Delta` from V1 emission; profile-emission decision
+moved entirely into Phase 0).
 
 Amends ADR 057 (Per-Buffer Pages and Encoding Cascades) with
 an additive `BufferEncoding.page_stats` field and an

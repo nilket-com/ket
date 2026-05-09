@@ -320,6 +320,7 @@ mod tests {
 					.copied()
 					.map(EncodingPageByteOffset::new)
 					.collect(),
+				page_stats: Vec::new(),
 			}],
 		}
 	}

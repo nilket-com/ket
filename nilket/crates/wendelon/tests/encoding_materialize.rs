@@ -70,6 +70,7 @@ fn materializer_decodes_buffer_relative_encoded_range() {
 		},
 		page_value_count: SimdPageValueCount::new(1024),
 		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
 	};
 	assert!(encoding.page_end_offsets.len() > 1);
 

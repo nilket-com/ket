@@ -85,7 +85,6 @@ fn projected_output() -> ProjectedRecordBatch {
 fn phase_b_mask_filters_projected_phase_c_batch_without_rerunning_pbc() {
 	let group = RowGroupIndex::new(0);
 	let mut phase_b = PhaseBOutcome::default();
-	phase_b.decoded_predicate_batches.insert(group, batch());
 	phase_b
 		.survival_masks
 		.insert(group, BooleanArray::from(vec![true, false, true, false]));
@@ -111,7 +110,6 @@ fn phase_b_mask_filters_projected_phase_c_batch_without_rerunning_pbc() {
 fn zero_phase_b_mask_preserves_projected_schema() {
 	let group = RowGroupIndex::new(0);
 	let mut phase_b = PhaseBOutcome::default();
-	phase_b.decoded_predicate_batches.insert(group, batch());
 	phase_b
 		.survival_masks
 		.insert(group, BooleanArray::from(vec![false, false, false, false]));
@@ -133,7 +131,6 @@ fn zero_phase_b_mask_preserves_projected_schema() {
 fn phase_b_mask_length_must_cover_full_row_group() {
 	let group = RowGroupIndex::new(0);
 	let mut phase_b = PhaseBOutcome::default();
-	phase_b.decoded_predicate_batches.insert(group, batch());
 	phase_b
 		.survival_masks
 		.insert(group, BooleanArray::from(vec![true, false]));
