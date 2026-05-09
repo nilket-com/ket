@@ -19,6 +19,57 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 062 (Row-Group Sizing Profile) council-converged
+across Claude / Codex / Gemini after five council
+iterations. Implementation phases pending; Phase 7
+warehouse-scale bench evidence is the promotion-to-
+shipped gate. Amends ADR 056 with a closed two-variant
+`RowGroupSizingProfile { PointRead, Scan }` catalog and
+deployment-wide profile selection. **`PointRead`**
+preserves ADR 056 V1 defaults byte-identically (4K-row
+target, 8K-row max, 8K-row paging-rows gate, 512 KiB
+paging-bytes gate); tuned for ADR 052 secondary-index
+point reads and OLTP-shape access. **`Scan`** lifts
+sizing for analytical scan deployments: 65,536-row
+target, 131,072-row max (= 2 × target slack headroom
+matching ADR 056 convention), 65,536-row paging-rows
+gate (= target, enables one-entry directories), 1 MiB
+paging-bytes gate. Tuned for ADR 061 macro-block
+coalescer economics on warehouse-scale records.
+**Deployment-wide selection** via
+`RowGroupWriterConfig.profile`; operator-declared in
+node-local config, replicated identically across
+deployment replicas. Per-record geometry-keyed selection
+deferred to V2 with explicit promotion gate (operational
+evidence of mixed-shape deployments). **Operator config
+escape hatch**: `profile = "point_read"` (default)
+accepts numeric overrides for non-breaking migration;
+`profile = "scan"` strictly ignores numeric overrides
+with a config-load warning. **One-entry `Scan`
+directory accepted**: when a `Scan`-profile record at
+exactly the target row count produces 1 row group, the
+writer emits a one-entry `RecordPageDirectory` rather
+than today's `batches.len() <= 1` single-batch
+fallback; preserves ADR 057 / 060 leverage on boundary
+records. `PointRead` profile retains today's
+single-batch fallback unchanged. **Closed surface**: no
+new on-disk shape, no new directory, no new metadata
+surface, no new wire / descriptor / PBC / capability /
+`ObjectStore` trait change; no new
+`RowGroupRejectCode` / `RowGroupFallbackReason` /
+`L2FetchStrategy` / `EncodedRowMask` variant. ADR 022 /
+ADR 056 directory shapes unchanged. **`enabled = false`
+default** — ADR 062 is sizing, not rollout; flipping
+default-on is a separate operational ADR. **Naming
+rationale**: `PointRead` / `Scan` describe what the
+profile optimizes for (access pattern), not the
+deployment hardware envelope (which is ADR 030
+territory — `Commodity / Premium / Hardened`
+describes hardware support envelopes, orthogonal to ADR
+062's access-pattern shape). See
+`plans/adr/062_row_group_sizing_profile.md` and
+`plans/impl/062_row_group_sizing_profile.md`.
+
 ADR 061 (Page-Aligned Authenticated Chunks with
 Macro-Block Read Coalescing) council-converged
 across Claude / Codex / Gemini after five council
@@ -621,8 +672,9 @@ triggers, webhooks).
 Decided across multiple iterations between Claude, Codex, and
 Gemini. Steps 1–17 are promoted and shipped (in `plans/adr/`
 with implementation merged). ADR 061 closes the current storage-
-hierarchy ciphertext-floor follow-up. The forward shape
-continues at #18.
+hierarchy ciphertext-floor follow-up. ADR 062 is council-
+converged with implementation phases pending. The forward shape
+continues at #19.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -909,7 +961,40 @@ continues at #18.
     ADR 044 over-fetch becomes a measurable bottleneck on
     operational query workloads). See *Where we are*.
 
-18. **Capacity-tier compression + serverless / erasure-
+18. **Row-group sizing profile** —
+    ADR 062 council-converged across Claude / Codex /
+    Gemini after five council iterations. Implementation
+    phases pending; Phase 7 warehouse-scale bench evidence
+    is the promotion-to-shipped gate. Amends ADR 056 with
+    a closed two-variant
+    `RowGroupSizingProfile { PointRead, Scan }` catalog
+    and deployment-wide profile selection. `PointRead`
+    preserves ADR 056 V1 defaults byte-identically (4K /
+    8K / 8K-rows / 512 KiB-bytes); tuned for OLTP-shape
+    access and ADR 052 secondary-index point reads.
+    `Scan` lifts sizing for analytical scan deployments
+    (65K / 131K / 65K-rows / 1 MiB-bytes; max = 2 ×
+    target matches ADR 056 slack-headroom convention;
+    `min_paged_record_rows = target` enables one-entry
+    directories). Tuned for ADR 061 macro-block coalescer
+    economics on warehouse-scale records. Operator config
+    exposes `profile` plus `PointRead`-only numeric
+    overrides as a non-breaking-migration escape hatch;
+    `Scan` + numeric overrides emits config-load warning
+    and ignores numeric values. One-entry `Scan`
+    directory accepted (preserves ADR 057 / 060 leverage
+    on boundary records); `PointRead` retains today's
+    `batches.len() <= 1` single-batch fallback unchanged.
+    Per-record geometry-keyed selector deferred to V2
+    with explicit promotion gate. `enabled = false` stays
+    default (sizing, not rollout). No directory / wire /
+    descriptor / PBC / capability / `ObjectStore` trait /
+    fallback / reject / catalog variant change. Naming
+    avoids ADR 030 deployment-vocabulary mismatch (ADR
+    030 describes hardware support envelopes; ADR 062
+    describes access-pattern shape). See *Where we are*.
+
+19. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
     - **zstd capacity-tier codec + `CompressionLevel`
@@ -931,7 +1016,7 @@ continues at #18.
     *Each is its own ADR; ordering opportunistic and
     independent of #13 / #14 sequencing.*
 
-19. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+20. **CDC follow-up ADRs (consume ADR 054 substrate)** —
     deferred behind the storage hierarchy in the Toron-
     pivot stretch. Independent; each ships its own
     contract surface:
@@ -987,7 +1072,7 @@ continues at #18.
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-20. **Vector embeddings + vector-form identity / locality
+21. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
     substrate (#8) and LSM (#11). **Set aside in the
@@ -998,7 +1083,7 @@ continues at #18.
     requirements surface concrete vector workload
     signals. *Large, multi-ADR.*
 
-21. **Refinement plumbing (opportunistic, no ordering
+22. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -1357,47 +1442,55 @@ StateDigest substrate                            (ADR 046)
   → compute over encoded data (COCD)             (ADR 058)
   → native per-cascade COCD kernels              (ADR 059)
   → sparse projection fetch narrowing            (ADR 060)
-  → page-aligned authenticated chunks            (ADR 061)  ← here
+  → page-aligned authenticated chunks            (ADR 061)
     + macro-block read coalescing
+  → row-group sizing profile                     (ADR 062)  ← here
+    PointRead / Scan                                       (council-converged;
+                                                            implementation
+                                                            phases pending)
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is at ADR 061 (council-converged, implemented, and
-promoted to shipped). The storage hierarchy is shipped through ADR 061 (row
-groups, per-buffer pages + encoding cascades, compute over
-encoded data substrate, native per-cascade kernels, sparse
-projection fetch narrowing). ADR 061 closes ADR 060's recorded-
-not-gated ciphertext follow-up via a two-layer decoupling: small
-AEAD chunks (closed set `{4, 8, 16, 32, 64} KiB`, default 16 KiB)
-for ADR 060 fine-grain decrypt leverage + ADR 044's existing
-`TieredMultiRangeReadPlan` coalescer producing multi-MiB GETs
-for analytics throughput. No new on-disk shape, no new
-directory, no new metadata surface; ADR 022 §3's existing
-`chunk_size_bytes` field carries the per-slab value. Variable
-buffer-aligned chunks via encrypted directory deferred to V2
-with explicit promotion gate.
-ADR 056 / 057 / 058 / 059 carry Phase 10 / Phase 8 bench
-evidence under `plans/impl/`; ADR 060's Phase 7 artifact records
-the revised plaintext-byte gate, ciphertext-byte floor, and RLE
-default-off disposition; ADR 061's Phase 9 artifact closes the
-ciphertext floor and macro-block coalescing gates.
+Design tip is at ADR 062 (council-converged across five
+iterations; implementation phases pending). The storage
+hierarchy is shipped through ADR 061 (row groups, per-buffer
+pages + encoding cascades, compute over encoded data substrate,
+native per-cascade kernels, sparse projection fetch narrowing,
+page-aligned AEAD chunks). ADR 062 amends ADR 056 with a closed
+two-variant `RowGroupSizingProfile { PointRead, Scan }` catalog
+and deployment-wide profile selection: `PointRead` preserves
+ADR 056 V1 defaults byte-identically (4K-row target tuned for
+ADR 052 point reads); `Scan` lifts sizing to 65K-row target +
+131K-row max + 1 MiB paging-bytes gate, tuned for ADR 061
+macro-block coalescer economics on warehouse-scale records.
+Per-record geometry-keyed selection deferred to V2 with explicit
+promotion gate. No directory / wire / descriptor / PBC /
+capability / `ObjectStore` trait / fallback / reject / catalog
+variant change. ADR 056 / 057 / 058 / 059 carry Phase 10 /
+Phase 8 bench evidence under `plans/impl/`; ADR 060's Phase 7
+artifact records the revised plaintext-byte gate, ciphertext-
+byte floor, and RLE default-off disposition; ADR 061's Phase 9
+artifact closes the ciphertext floor and macro-block coalescing
+gates.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
 default-enabled native-kernel set; ADR 060 closed the encoded-
 fetch follow-up with internal reader dispatch, no public surface
 change, and a strict plan-time byte-comparison gate; ADR 061
-closes the ciphertext-floor follow-up via the AEAD/network
-two-layer decoupling, with the macro-block coalescing test as
-the load-bearing empirical gate.
-**The council's lean on next pickup:** either the next
-Toron-adjacent follow-up (page-
-level min/max/null stats, FSST evaluator, RLE value-run format,
-sparse predicate-column fetch, dense predicate-zip with sparse
-projection, nullable sparse projection — each its own ADR), or
-capacity-tier compression / serverless PBC / erasure-coding
-work from the remaining old #14 bundle. CDC follow-ups (#19)
-and vector embeddings (#20) remain deferred behind the storage
-hierarchy in this stretch.
+closed the ciphertext-floor follow-up via the AEAD/network
+two-layer decoupling; ADR 062 closes the warehouse throughput
+follow-up that ADR 061 deferred to row-group sizing, via a
+deployment-wide access-pattern profile.
+**The council's lean on next pickup:** implement ADR 062 to
+shipped status (Phase 7 warehouse-scale bench evidence is the
+gate), then pick from the next Toron-adjacent follow-up family
+(page-level min/max/null stats, FSST evaluator, RLE value-run
+format, sparse predicate-column fetch, dense predicate-zip with
+sparse projection, nullable sparse projection — each its own
+ADR), or capacity-tier compression / serverless PBC / erasure-
+coding work from the remaining old #14 bundle. CDC follow-ups
+(#20) and vector embeddings (#21) remain deferred behind the
+storage hierarchy in this stretch.
