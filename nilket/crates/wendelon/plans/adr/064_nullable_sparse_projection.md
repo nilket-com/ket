@@ -7,10 +7,34 @@ Companion implementation plan:
 
 ## Status
 
-Council-converged across Claude / Codex / Gemini after six
-iterations. Ready for Phase 0 audit and implementation. Will
-promote to "shipped" after code, tests, architecture guards,
-and bench evidence land together.
+Shipped 2026-05-09 after implementation, full `cargo test`,
+`cargo check --benches`, and bench evidence landed together.
+Bench evidence is recorded at
+`plans/impl/064_nullable_sparse_projection_bench_results.md`.
+The Phase 0 fork-resolution audit confirmed raw byte-
+addressable validity is a non-no-op V1 engagement path
+against current writer output. Headline bench result:
+clustered 5% nullable sparse projection passed across
+BitPacked and Dictionary fixtures with 5.36x-19.98x
+plaintext-byte reduction (value + validity combined) and
+1.50x-5.45x wall-clock speedup — substantially exceeding
+both the 1.5x plaintext-byte promotion gate and the 3x
+headline diagnostic, plus the 1.2x wall-clock gate.
+
+The shipped design is the council-converged result after
+six iterations across Claude / Codex / Gemini. Post-review
+corrections landed before promotion: per-row-group
+`column_null_counts` consultation (the all-valid sparse
+short-circuit applies per row group, not per record);
+ADR 052 single-source guard and architectural guards for
+`NullableProjectedColumn` removal + all-null page-skip
+sneak-in; expanded rebase coverage for non-trivial bit
+offsets, alternating nulls, and clustered nulls; ADR 063
+exact-mask composition tests for `IS NULL`, `IS NOT NULL`,
+and nullable value-comparison masks; legacy
+`fixed_width_non_null_value_column` removed and replaced
+with `fixed_width_encoding_indexed_value_column` for the
+ADR 052 path.
 
 ADR 064 is a narrow amendment to ADR 060. It lifts ADR 060's
 `SparseProjectionFetchDecline::NullableProjectedColumn`
@@ -22,10 +46,8 @@ dense row-group buffers.
 
 The V1 cut is raw byte-addressable validity only. Validity
 buffers with `EncodingDirectory` entries decline to dense
-behind a private planner reason. Phase 0 is a fork-resolution
-gate: raw-only proceeds; mixed raw / encoded validity declines
-on encoded; encoded-only revises the ADR pre-code. No
-implementation-time scope expansion.
+behind a private planner reason. No implementation-time
+scope expansion.
 
 This ADR intentionally does not touch dense predicate-zip
 with sparse projection, sparse predicate-column fetch,

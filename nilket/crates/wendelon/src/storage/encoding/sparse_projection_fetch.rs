@@ -5,9 +5,10 @@ use crate::storage::columnar::{ColumnFetchRequirement, RecordBufferDirectory};
 use crate::storage::encoding::materialize::find_buffer_encoding;
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
-	PageMaterializeColumn, PageMaterializeFetch, encoded_page_body_range,
-	fixed_width_non_null_value_column, fixed_width_value_bytes,
-	required_projected_physical_ordinals,
+	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch,
+	PageMaterializeValidityFetch, encoded_page_body_range, fixed_width_sparse_projection_column,
+	fixed_width_value_bytes, required_projected_physical_ordinals,
+	validity_bitmap_body_range_for_page,
 };
 use crate::storage::encoding::{
 	BufferEncoding, EncodingCascade, EncodingDirectory, EncodingPageDescriptor, EncodingRejectCode,
@@ -40,6 +41,8 @@ pub(crate) struct SparseProjectionFetchPlan {
 	pub group_pages: Vec<SparseProjectionFetchGroup>,
 	pub columns: Vec<PageMaterializeColumn>,
 	pub fetches: Vec<PageMaterializeFetch>,
+	pub validity_fetches: Vec<PageMaterializeValidityFetch>,
+	pub all_valid_nullable_pages: BTreeSet<PageMaterializeBufferKey>,
 	pub selected_body_ranges: Vec<RecordBodyByteRange>,
 }
 
@@ -62,7 +65,9 @@ pub(crate) enum SparseProjectionFetchDecline {
 	DensePredicateBatchPresent,
 	CascadeNotPageEmitting,
 	CascadeNotProjectionEligible,
-	NullableProjectedColumn,
+	EncodedValidityBufferUnsupported,
+	ValidityBufferRangeMissing,
+	NullableTypeNotInCatalog,
 	VariableWidthProjectedColumn,
 	PageGeometryMismatchAcrossColumns,
 	ByteEstimateNotSparse,
@@ -130,6 +135,8 @@ pub(crate) fn decide_sparse_projection_fetch(
 			group_pages: Vec::new(),
 			columns: Vec::new(),
 			fetches: Vec::new(),
+			validity_fetches: Vec::new(),
+			all_valid_nullable_pages: BTreeSet::new(),
 			selected_body_ranges: Vec::new(),
 		});
 	}
@@ -157,6 +164,8 @@ pub(crate) fn decide_sparse_projection_fetch(
 			group_pages: Vec::new(),
 			columns: Vec::new(),
 			fetches: Vec::new(),
+			validity_fetches: Vec::new(),
+			all_valid_nullable_pages: BTreeSet::new(),
 			selected_body_ranges: Vec::new(),
 		});
 	}
@@ -173,6 +182,8 @@ pub(crate) fn decide_sparse_projection_fetch(
 	let mut selected_groups = Vec::new();
 	let mut group_pages = Vec::new();
 	let mut fetches = Vec::new();
+	let mut validity_fetches = Vec::new();
+	let mut all_valid_nullable_pages = BTreeSet::new();
 	let mut per_buffer_ranges =
 		BTreeMap::<(RowGroupIndex, IpcColumnOrdinal, IpcBufferIndex), usize>::new();
 	for (group_index, mask) in active_masks {
@@ -222,6 +233,89 @@ pub(crate) fn decide_sparse_projection_fetch(
 			selected_pages: pages.clone(),
 		});
 		for (column, buffer_page, encoding, cascade, pages) in column_pages {
+			if column.nullable {
+				if row_group_column_may_have_nulls(
+					input.record_directory,
+					input.page_directory,
+					group_index,
+					column,
+				) {
+					let validity_page = input
+						.page_directory
+						.buffer_pages
+						.iter()
+						.find(|page| {
+							page.row_group_index == group_index
+								&& page.ipc_column_ordinal
+									== IpcColumnOrdinal::new(column.physical_ordinal as u32)
+								&& page.ipc_buffer_ordinal == column.null_buffer_ordinal
+								&& page.range.len.get() > 0
+						})
+						.ok_or(SparseProjectionFetchDecline::ValidityBufferRangeMissing);
+					let validity_page = match validity_page {
+						Ok(page) => page,
+						Err(reason) => return SparseProjectionFetchDecision::Decline(reason),
+					};
+					if find_buffer_encoding(
+						input.encoding_directory,
+						group_index,
+						column.null_buffer_ordinal,
+						validity_page.range,
+					)
+					.is_some()
+					{
+						return SparseProjectionFetchDecision::Decline(
+							SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+						);
+					}
+					let per_buffer_key = (
+						group_index,
+						validity_page.ipc_column_ordinal,
+						validity_page.ipc_buffer_ordinal,
+					);
+					let counter = per_buffer_ranges.entry(per_buffer_key).or_insert(0);
+					*counter = counter.saturating_add(pages.len());
+					if *counter > MAX_SPARSE_RANGES_PER_BUFFER {
+						return SparseProjectionFetchDecision::Decline(
+							SparseProjectionFetchDecline::PerBufferFragmentationCapExceeded,
+						);
+					}
+					for page in &pages {
+						let (body_range, bit_offset) =
+							match validity_bitmap_body_range_for_page(validity_page.range, *page) {
+								Ok(range) => range,
+								Err(_) => {
+									return SparseProjectionFetchDecision::Decline(
+										SparseProjectionFetchDecline::ValidityBufferRangeMissing,
+									);
+								}
+							};
+						validity_fetches.push(PageMaterializeValidityFetch {
+							key: PageMaterializeBufferKey {
+								row_group_index: group_index,
+								ipc_column_ordinal: validity_page.ipc_column_ordinal,
+								ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
+								page_index: page.page_index.get(),
+							},
+							body_range,
+							page: *page,
+							bit_offset,
+							page_row_count: RowGroupRowCount::new(page.value_count.get()),
+						});
+					}
+				} else {
+					for page in &pages {
+						all_valid_nullable_pages.insert(PageMaterializeBufferKey {
+							row_group_index: group_index,
+							ipc_column_ordinal: IpcColumnOrdinal::new(
+								column.physical_ordinal as u32,
+							),
+							ipc_buffer_ordinal: column.null_buffer_ordinal,
+							page_index: page.page_index.get(),
+						});
+					}
+				}
+			}
 			let per_buffer_key = (
 				group_index,
 				buffer_page.ipc_column_ordinal,
@@ -236,7 +330,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 			}
 			for page in pages {
 				fetches.push(PageMaterializeFetch {
-					key: crate::storage::encoding::page_materialize::PageMaterializeBufferKey {
+					key: PageMaterializeBufferKey {
 						row_group_index: group_index,
 						ipc_column_ordinal: buffer_page.ipc_column_ordinal,
 						ipc_buffer_ordinal: buffer_page.ipc_buffer_ordinal,
@@ -252,7 +346,9 @@ pub(crate) fn decide_sparse_projection_fetch(
 		}
 	}
 
-	if fetches.len() > input.encoding_config.max_simd_pages_per_record.get() as usize {
+	if fetches.len().saturating_add(validity_fetches.len())
+		> input.encoding_config.max_simd_pages_per_record.get() as usize
+	{
 		return SparseProjectionFetchDecision::Decline(
 			SparseProjectionFetchDecline::SimdPageCapExceeded,
 		);
@@ -261,6 +357,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 		.iter()
 		.map(|fetch| fetch.body_range)
 		.collect::<Vec<_>>();
+	selected_body_ranges.extend(validity_fetches.iter().map(|fetch| fetch.body_range));
 	if coalesce_record_body_ranges(&mut selected_body_ranges).is_err() {
 		return SparseProjectionFetchDecision::Decline(
 			SparseProjectionFetchDecline::PageGeometryMismatchAcrossColumns,
@@ -305,8 +402,30 @@ pub(crate) fn decide_sparse_projection_fetch(
 		group_pages,
 		columns,
 		fetches,
+		validity_fetches,
+		all_valid_nullable_pages,
 		selected_body_ranges,
 	})
+}
+
+fn row_group_column_may_have_nulls(
+	record_directory: &RecordBufferDirectory,
+	page_directory: &RecordPageDirectory,
+	group_index: RowGroupIndex,
+	column: &PageMaterializeColumn,
+) -> bool {
+	let ipc_column_ordinal = IpcColumnOrdinal::new(column.physical_ordinal as u32);
+	if let Some(stat) = page_directory.row_group_stats.iter().find(|stat| {
+		stat.row_group_index == group_index && stat.ipc_column_ordinal == ipc_column_ordinal
+	}) {
+		return stat.null_count.get() != 0;
+	}
+	record_directory
+		.column_null_counts
+		.get(column.physical_ordinal)
+		.copied()
+		.unwrap_or(usize::MAX)
+		!= 0
 }
 
 fn projection_column_pages<'a>(
@@ -369,20 +488,18 @@ fn projection_column_candidate(
 	let Some(field) = record_directory.ipc_schema.fields().get(physical_ordinal) else {
 		return Err(SparseProjectionFetchDecline::PageGeometryMismatchAcrossColumns);
 	};
-	if record_directory
-		.column_null_counts
-		.get(physical_ordinal)
-		.copied()
-		.unwrap_or(usize::MAX)
-		!= 0
-	{
-		return Err(SparseProjectionFetchDecline::NullableProjectedColumn);
-	}
 	if fixed_width_value_bytes(field.data_type()).is_none() {
 		return Err(SparseProjectionFetchDecline::VariableWidthProjectedColumn);
 	}
-	fixed_width_non_null_value_column(record_directory, physical_ordinal)
-		.ok_or(SparseProjectionFetchDecline::PageGeometryMismatchAcrossColumns)
+	if record_directory
+		.column_null_counts
+		.get(physical_ordinal)
+		.is_none()
+	{
+		return Err(SparseProjectionFetchDecline::PageGeometryMismatchAcrossColumns);
+	}
+	fixed_width_sparse_projection_column(record_directory, physical_ordinal)
+		.ok_or(SparseProjectionFetchDecline::NullableTypeNotInCatalog)
 }
 
 pub(crate) fn mask_to_active_pages(
@@ -470,10 +587,13 @@ mod tests {
 		ColumnBufferRange, ColumnOrdinalSet, IpcBufferRange, PlaintextByteRange, TieredRecordId,
 	};
 	use crate::storage::encoding::{EncodedBufferByteRange, EncodingLeafCascade};
-	use crate::storage::row_group::{BufferPageDirectoryEntry, RowGroupDirectoryEntry};
+	use crate::storage::row_group::{
+		BufferPageDirectoryEntry, RowGroupColumnStats, RowGroupDirectoryEntry,
+	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::HashMap;
 
+	const NULL_BUFFER_BODY_START: u64 = 128;
 	const VALUE_BUFFER_BODY_START: u64 = 256;
 
 	struct PlannerFixture {
@@ -507,13 +627,36 @@ mod tests {
 			column_null_count: usize,
 			data_type: DataType,
 		) -> Self {
+			Self::new_with_data_type_and_nullable(
+				row_count,
+				page_value_count,
+				page_byte_len,
+				column_null_count,
+				data_type,
+				column_null_count != 0,
+			)
+		}
+
+		fn new_with_data_type_and_nullable(
+			row_count: u32,
+			page_value_count: u32,
+			page_byte_len: u32,
+			column_null_count: usize,
+			data_type: DataType,
+			field_nullable: bool,
+		) -> Self {
 			let page_count = row_count.div_ceil(page_value_count);
 			let total_encoded_bytes = u64::from(page_count.saturating_mul(page_byte_len));
+			let null_buffer_bytes = if column_null_count == 0 {
+				0
+			} else {
+				u64::from(row_count).div_ceil(8)
+			};
 			let record_id = TieredRecordId {
 				slab_id: SlabId::new(60),
 				record_offset: RecordBodyByteOffset::ZERO,
 			};
-			let schema = Schema::new(vec![Field::new("value", data_type, column_null_count != 0)]);
+			let schema = Schema::new(vec![Field::new("value", data_type, field_nullable)]);
 			let fingerprint = LogicalSchemaFingerprint::from_bytes([0x60; 32]);
 			let record_directory = RecordBufferDirectory {
 				record_id,
@@ -526,8 +669,12 @@ mod tests {
 				ipc_schema: schema,
 				buffers: vec![
 					IpcBufferRange {
-						offset_in_record: IpcBufferOffset::ZERO,
-						length: IpcBufferLength::ZERO,
+						offset_in_record: if null_buffer_bytes == 0 {
+							IpcBufferOffset::ZERO
+						} else {
+							IpcBufferOffset::new(NULL_BUFFER_BODY_START)
+						},
+						length: IpcBufferLength::new(null_buffer_bytes),
 					},
 					IpcBufferRange {
 						offset_in_record: IpcBufferOffset::new(VALUE_BUFFER_BODY_START),
@@ -560,15 +707,30 @@ mod tests {
 						len: RecordBodyByteLen::new(8 * 1024),
 					},
 				}],
-				buffer_pages: vec![BufferPageDirectoryEntry {
-					row_group_index: RowGroupIndex::ZERO,
-					ipc_column_ordinal: IpcColumnOrdinal::ZERO,
-					ipc_buffer_ordinal: IpcBufferIndex::new(1),
-					range: RecordBodyByteRange {
-						start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START),
-						len: RecordBodyByteLen::new(total_encoded_bytes),
+				buffer_pages: vec![
+					BufferPageDirectoryEntry {
+						row_group_index: RowGroupIndex::ZERO,
+						ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+						ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+						range: RecordBodyByteRange {
+							start: if null_buffer_bytes == 0 {
+								RecordBodyByteOffset::ZERO
+							} else {
+								RecordBodyByteOffset::new(NULL_BUFFER_BODY_START)
+							},
+							len: RecordBodyByteLen::new(null_buffer_bytes),
+						},
 					},
-				}],
+					BufferPageDirectoryEntry {
+						row_group_index: RowGroupIndex::ZERO,
+						ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+						ipc_buffer_ordinal: IpcBufferIndex::new(1),
+						range: RecordBodyByteRange {
+							start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START),
+							len: RecordBodyByteLen::new(total_encoded_bytes),
+						},
+					},
+				],
 				row_group_stats: Vec::new(),
 				logical_schema_fingerprint: fingerprint,
 			};
@@ -623,7 +785,13 @@ mod tests {
 			outcome: &PhaseBOutcome,
 			dense_ranges: &[RecordBodyByteRange],
 		) -> SparseProjectionFetchDecision {
-			self.decide_with_dense_predicate_batches(requirement, outcome, dense_ranges, false)
+			self.decide_for_groups_with_dense_predicate_batches(
+				requirement,
+				outcome,
+				dense_ranges,
+				&[RowGroupIndex::ZERO],
+				false,
+			)
 		}
 
 		fn decide_with_dense_predicate_batches(
@@ -633,13 +801,30 @@ mod tests {
 			dense_ranges: &[RecordBodyByteRange],
 			dense_predicate_batches_present: bool,
 		) -> SparseProjectionFetchDecision {
+			self.decide_for_groups_with_dense_predicate_batches(
+				requirement,
+				outcome,
+				dense_ranges,
+				&[RowGroupIndex::ZERO],
+				dense_predicate_batches_present,
+			)
+		}
+
+		fn decide_for_groups_with_dense_predicate_batches(
+			&self,
+			requirement: &ColumnFetchRequirement,
+			outcome: &PhaseBOutcome,
+			dense_ranges: &[RecordBodyByteRange],
+			selected_groups: &[RowGroupIndex],
+			dense_predicate_batches_present: bool,
+		) -> SparseProjectionFetchDecision {
 			decide_sparse_projection_fetch(SparseProjectionFetchInput {
 				record_directory: &self.record_directory,
 				page_directory: &self.page_directory,
 				encoding_directory: &self.encoding_directory,
 				requirement,
 				predicate_outcome: outcome,
-				selected_groups: &[RowGroupIndex::ZERO],
+				selected_groups,
 				dense_body_ranges: dense_ranges,
 				row_group_config: &self.row_group_config,
 				encoding_config: &self.encoding_config,
@@ -666,6 +851,24 @@ mod tests {
 				.copied()
 				.map(EncodingPageByteOffset::new)
 				.collect(),
+			page_stats: Vec::new(),
+		}
+	}
+
+	fn encoded_validity_buffer(row_group_index: RowGroupIndex, row_count: u32) -> BufferEncoding {
+		BufferEncoding {
+			row_group_index,
+			ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+			ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+			cascade_index: EncodingCascadeIndex::ZERO,
+			decoded_byte_len: RecordBodyByteLen::new(u64::from(row_count).div_ceil(8)),
+			decoded_value_count: BufferValueCount::new(row_count),
+			encoded_range: EncodedBufferByteRange {
+				start: EncodingPageByteOffset::ZERO,
+				len: RecordBodyByteLen::new(u64::from(row_count).div_ceil(8)),
+			},
+			page_value_count: SimdPageValueCount::new(4),
+			page_end_offsets: Vec::new(),
 			page_stats: Vec::new(),
 		}
 	}
@@ -739,6 +942,21 @@ mod tests {
 		assert_eq!(actual, expected);
 	}
 
+	fn assert_nullable_exact_mask_engages_sparse_projection(
+		mask: BooleanArray,
+	) -> SparseProjectionFetchPlan {
+		let fixture = PlannerFixture::new(16, 4, 32, 1);
+		let decision = fixture.decide(&output_requirement(), &outcome(mask), &[dense_range()]);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected nullable sparse projection plan, got {decision:?}");
+		};
+		assert!(plan.columns[0].nullable);
+		assert!(!plan.fetches.is_empty());
+		assert_eq!(plan.fetches.len(), plan.validity_fetches.len());
+		assert!(plan.all_valid_nullable_pages.is_empty());
+		plan
+	}
+
 	#[test]
 	fn none_mask_short_circuits_before_projection_column_eligibility() {
 		let fixture = PlannerFixture::new(16, 4, 32, 1);
@@ -753,6 +971,7 @@ mod tests {
 		assert!(plan.selected_groups.is_empty());
 		assert!(plan.group_pages.is_empty());
 		assert!(plan.fetches.is_empty());
+		assert!(plan.validity_fetches.is_empty());
 		assert!(plan.selected_body_ranges.is_empty());
 	}
 
@@ -770,6 +989,7 @@ mod tests {
 		};
 		assert!(plan.selected_groups.is_empty());
 		assert!(plan.fetches.is_empty());
+		assert!(plan.validity_fetches.is_empty());
 		assert!(plan.selected_body_ranges.is_empty());
 	}
 
@@ -828,15 +1048,280 @@ mod tests {
 	}
 
 	#[test]
-	fn nullable_active_projection_column_declines_sparse_projection() {
+	fn adr063_is_null_exact_mask_drives_nullable_sparse_projection() {
+		let plan = assert_nullable_exact_mask_engages_sparse_projection(BooleanArray::from_iter(
+			(0..16).map(|row| matches!(row, 1 | 9)),
+		));
+		assert_eq!(plan.group_pages[0].selected_pages.len(), 2);
+	}
+
+	#[test]
+	fn adr063_is_not_null_exact_mask_drives_nullable_sparse_projection() {
+		let plan = assert_nullable_exact_mask_engages_sparse_projection(BooleanArray::from_iter(
+			(0..16).map(|row| row % 4 == 0),
+		));
+		assert_eq!(plan.group_pages[0].selected_pages.len(), 4);
+	}
+
+	#[test]
+	fn adr063_nullable_value_comparison_exact_mask_drives_sparse_projection() {
+		let plan = assert_nullable_exact_mask_engages_sparse_projection(BooleanArray::from_iter(
+			(0..16).map(|row| row > 10),
+		));
+		assert_eq!(plan.group_pages[0].selected_pages.len(), 2);
+	}
+
+	#[test]
+	fn nullable_active_projection_column_fetches_page_validity_bitmap() {
 		let fixture = PlannerFixture::new(16, 4, 32, 1);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected nullable sparse projection plan, got {decision:?}");
+		};
+		assert!(plan.columns[0].nullable);
+		assert_eq!(plan.fetches.len(), 1);
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert!(plan.all_valid_nullable_pages.is_empty());
+		assert_eq!(
+			plan.validity_fetches[0].body_range,
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(NULL_BUFFER_BODY_START),
+				len: RecordBodyByteLen::new(1),
+			}
+		);
+		assert_eq!(plan.validity_fetches[0].bit_offset, 0);
+		assert_eq!(
+			plan.validity_fetches[0].page_row_count,
+			RowGroupRowCount::new(4)
+		);
+		assert_eq!(plan.selected_body_ranges.len(), 2);
+		assert_eq!(
+			plan.selected_body_ranges,
+			vec![
+				RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(NULL_BUFFER_BODY_START),
+					len: RecordBodyByteLen::new(1),
+				},
+				RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START),
+					len: RecordBodyByteLen::new(32),
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn nullable_row_group_zero_null_count_skips_validity_fetch_when_record_has_nulls() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 1);
+		let group_one = RowGroupIndex::new(1);
+		fixture
+			.page_directory
+			.row_groups
+			.push(RowGroupDirectoryEntry {
+				row_group_index: group_one,
+				first_record_row_index: RecordRowIndex::new(16),
+				row_count: RowGroupRowCount::new(16),
+				metadata_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(512),
+					len: RecordBodyByteLen::new(64),
+				},
+				body_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(512),
+					len: RecordBodyByteLen::new(8 * 1024),
+				},
+			});
+		fixture.page_directory.row_group_stats = vec![
+			RowGroupColumnStats {
+				row_group_index: RowGroupIndex::ZERO,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				null_count: RowCount::new(0),
+				min: None,
+				max: None,
+			},
+			RowGroupColumnStats {
+				row_group_index: group_one,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				null_count: RowCount::new(1),
+				min: None,
+				max: None,
+			},
+		];
+
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected nullable all-valid row-group sparse plan, got {decision:?}");
+		};
+		assert!(plan.columns[0].nullable);
+		assert_eq!(plan.fetches.len(), 1);
+		assert!(plan.validity_fetches.is_empty());
+		assert_eq!(plan.all_valid_nullable_pages.len(), 1);
+		assert!(
+			plan.all_valid_nullable_pages
+				.contains(&PageMaterializeBufferKey {
+					row_group_index: RowGroupIndex::ZERO,
+					ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+					ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+					page_index: 0,
+				})
+		);
+		assert_eq!(
+			plan.selected_body_ranges,
+			vec![RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START),
+				len: RecordBodyByteLen::new(32),
+			}]
+		);
+	}
+
+	#[test]
+	fn nullable_field_with_zero_null_count_uses_all_valid_sparse_path() {
+		let fixture =
+			PlannerFixture::new_with_data_type_and_nullable(16, 4, 32, 0, DataType::Int64, true);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected all-valid sparse projection plan, got {decision:?}");
+		};
+		assert!(!plan.columns[0].nullable);
+		assert_eq!(plan.fetches.len(), 1);
+		assert!(plan.validity_fetches.is_empty());
+		assert!(plan.all_valid_nullable_pages.is_empty());
+		assert_eq!(
+			plan.selected_body_ranges,
+			vec![RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START),
+				len: RecordBodyByteLen::new(32),
+			}]
+		);
+	}
+
+	#[test]
+	fn encoded_validity_buffer_declines_sparse_projection() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 1);
+		fixture
+			.encoding_directory
+			.buffers
+			.push(encoded_validity_buffer(RowGroupIndex::ZERO, 16));
 		assert_decline(
 			fixture.decide(
 				&output_requirement(),
 				&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
 				&[dense_range()],
 			),
-			SparseProjectionFetchDecline::NullableProjectedColumn,
+			SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+		);
+	}
+
+	#[test]
+	fn nullable_projection_declines_when_validity_range_is_missing() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 1);
+		fixture
+			.page_directory
+			.buffer_pages
+			.retain(|page| page.ipc_buffer_ordinal != IpcBufferIndex::ZERO);
+		assert_decline(
+			fixture.decide(
+				&output_requirement(),
+				&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+				&[dense_range()],
+			),
+			SparseProjectionFetchDecline::ValidityBufferRangeMissing,
+		);
+	}
+
+	#[test]
+	fn encoded_validity_detection_for_one_row_group_does_not_poison_another() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 1);
+		let group_one = RowGroupIndex::new(1);
+		let group_one_null_start = 512;
+		let group_one_value_start = 640;
+		fixture
+			.page_directory
+			.row_groups
+			.push(RowGroupDirectoryEntry {
+				row_group_index: group_one,
+				first_record_row_index: RecordRowIndex::new(16),
+				row_count: RowGroupRowCount::new(16),
+				metadata_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(448),
+					len: RecordBodyByteLen::new(64),
+				},
+				body_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(448),
+					len: RecordBodyByteLen::new(8 * 1024),
+				},
+			});
+		fixture
+			.page_directory
+			.buffer_pages
+			.push(BufferPageDirectoryEntry {
+				row_group_index: group_one,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+				range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(group_one_null_start),
+					len: RecordBodyByteLen::new(2),
+				},
+			});
+		fixture
+			.page_directory
+			.buffer_pages
+			.push(BufferPageDirectoryEntry {
+				row_group_index: group_one,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				ipc_buffer_ordinal: IpcBufferIndex::new(1),
+				range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(group_one_value_start),
+					len: RecordBodyByteLen::new(128),
+				},
+			});
+		let mut group_one_value_encoding = fixture.encoding_directory.buffers[0].clone();
+		group_one_value_encoding.row_group_index = group_one;
+		fixture
+			.encoding_directory
+			.buffers
+			.push(group_one_value_encoding);
+		fixture
+			.encoding_directory
+			.buffers
+			.push(encoded_validity_buffer(RowGroupIndex::ZERO, 16));
+
+		let outcome = PhaseBOutcome {
+			survival_masks: HashMap::from([(
+				group_one,
+				BooleanArray::from_iter((0..16).map(|row| row == 1)),
+			)]),
+			..PhaseBOutcome::default()
+		};
+		let decision = fixture.decide_for_groups_with_dense_predicate_batches(
+			&output_requirement(),
+			&outcome,
+			&[dense_range()],
+			&[group_one],
+			false,
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected row-group-local raw validity path, got {decision:?}");
+		};
+		assert_eq!(plan.selected_groups, vec![group_one]);
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert_eq!(
+			plan.validity_fetches[0].body_range,
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(group_one_null_start),
+				len: RecordBodyByteLen::new(1),
+			}
 		);
 	}
 
@@ -888,6 +1373,7 @@ mod tests {
 		assert_eq!(plan.group_pages[0].selected_pages.len(), 1);
 		assert_eq!(plan.group_pages[0].selected_pages[0].page_index.get(), 1);
 		assert_eq!(plan.fetches.len(), 1);
+		assert!(plan.validity_fetches.is_empty());
 		assert_eq!(plan.selected_body_ranges.len(), 1);
 		assert_eq!(
 			plan.selected_body_ranges[0],

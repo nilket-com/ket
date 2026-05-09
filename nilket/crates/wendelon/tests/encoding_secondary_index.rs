@@ -45,6 +45,7 @@ fn secondary_index_path_uses_encoding_page_fast_path_before_row_take() {
 		"decode_page",
 		"decode_page_fetch",
 		"projected_page_batch_from_decoded_buffers",
+		"rebase_validity_bitmap",
 		"take_projected_indexed_rows",
 		"row_groups_for_record_rows",
 		"record_row_index",

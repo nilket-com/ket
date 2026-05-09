@@ -96,6 +96,7 @@ fn main() -> std::io::Result<()> {
 	bench_adr061_chunk_layout_matrix(&config)?;
 	bench_adr062_row_group_sizing_profile_matrix(&config)?;
 	bench_adr063_page_level_predicate_stats_matrix(&config)?;
+	bench_adr064_nullable_sparse_projection_matrix(&config)?;
 	Ok(())
 }
 
@@ -3117,6 +3118,1683 @@ fn bench_sparse_projection_planner(config: &BenchConfig) -> std::io::Result<()> 
 		elapsed.as_secs_f64() * 1_000.0,
 		micros_per_op,
 		started.elapsed().as_secs_f64() * 1_000.0,
+	);
+	Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Adr064ProjectionShape {
+	OneNullable,
+	FourNullable,
+	MixedNullableNonNull,
+	NullableVariableControl,
+}
+
+impl Adr064ProjectionShape {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::OneNullable => "one_nullable_fixed",
+			Self::FourNullable => "four_nullable_fixed",
+			Self::MixedNullableNonNull => "mixed_nullable_non_null_fixed",
+			Self::NullableVariableControl => "nullable_plus_variable_width_control",
+		}
+	}
+
+	fn projection_columns(self) -> usize {
+		match self {
+			Self::OneNullable => 1,
+			Self::FourNullable => 4,
+			Self::MixedNullableNonNull => 2,
+			Self::NullableVariableControl => 2,
+		}
+	}
+
+	fn column_nullable(self, projection_index: usize) -> bool {
+		match self {
+			Self::MixedNullableNonNull => projection_index == 0,
+			Self::OneNullable | Self::FourNullable | Self::NullableVariableControl => true,
+		}
+	}
+
+	fn column_type(self, projection_index: usize) -> DataType {
+		if matches!(self, Self::NullableVariableControl) && projection_index == 1 {
+			DataType::Utf8
+		} else {
+			DataType::UInt32
+		}
+	}
+
+	fn sparse_supported(self) -> bool {
+		!matches!(self, Self::NullableVariableControl)
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Adr064NullDistribution {
+	AllValidSelectedPages,
+	NoNullRowGroup,
+	Alternating,
+	ClusteredNulls,
+	AllNullSelectedPage,
+	RandomFivePercent,
+}
+
+impl Adr064NullDistribution {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::AllValidSelectedPages => "all_valid_selected_pages",
+			Self::NoNullRowGroup => "no_null_row_group",
+			Self::Alternating => "alternating_nulls",
+			Self::ClusteredNulls => "clustered_nulls",
+			Self::AllNullSelectedPage => "all_null_selected_page",
+			Self::RandomFivePercent => "random_5p_nulls",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Adr064PredicateSource {
+	ExactMask,
+	ExactIsNotNull,
+	ExactIsNull,
+	NullableValueComparison,
+	Adr063ExactMatch,
+	Adr063Maybe,
+}
+
+impl Adr064PredicateSource {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::ExactMask => "exact_mask",
+			Self::ExactIsNotNull => "exact_is_not_null",
+			Self::ExactIsNull => "exact_is_null",
+			Self::NullableValueComparison => "nullable_value_comparison",
+			Self::Adr063ExactMatch => "adr063_exact_match",
+			Self::Adr063Maybe => "adr063_maybe",
+		}
+	}
+}
+
+struct Adr064RuntimeColumn {
+	physical_ordinal: usize,
+	nullable: bool,
+	data_type: DataType,
+	null_buffer_range: Option<RecordBodyByteRange>,
+	value_buffer_range: Option<RecordBodyByteRange>,
+	encoding: Option<wendelon::storage::BufferEncoding>,
+	cascade: Option<EncodingCascade>,
+	pages: Vec<EncodingPageDescriptor>,
+}
+
+struct Adr064RuntimeFixture {
+	row_group_rows: usize,
+	record_plaintext_range: Range<usize>,
+	frame: Vec<u8>,
+	directory: RecordBufferDirectory,
+	batch: RecordBatch,
+	requirement: ColumnFetchRequirement,
+	columns: Vec<Adr064RuntimeColumn>,
+}
+
+struct Adr064RuntimeDataset {
+	rows: usize,
+	page_values: u32,
+	profile: RowGroupSizingProfile,
+	shape: Adr064ProjectionShape,
+	null_distribution: Adr064NullDistribution,
+	plaintext: Vec<u8>,
+	fixtures: Vec<Adr064RuntimeFixture>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Adr064RuntimeOutcome {
+	elapsed: Duration,
+	output_rows: usize,
+	get_range_calls: usize,
+	get_range_bytes: u64,
+	get_bytes_calls: usize,
+	value_plaintext_bytes: u64,
+	validity_plaintext_bytes: u64,
+	projection_plaintext_bytes: u64,
+	projection_ciphertext_bytes: u64,
+	selected_ranges: usize,
+	selected_value_pages: usize,
+	selected_validity_ranges: usize,
+	null_count: usize,
+	digest: String,
+}
+
+impl Adr064RuntimeOutcome {
+	fn accumulate(&mut self, other: Self) {
+		self.elapsed = self.elapsed.saturating_add(other.elapsed);
+		self.output_rows = self.output_rows.saturating_add(other.output_rows);
+		self.get_range_calls = self.get_range_calls.saturating_add(other.get_range_calls);
+		self.get_range_bytes = self.get_range_bytes.saturating_add(other.get_range_bytes);
+		self.get_bytes_calls = self.get_bytes_calls.saturating_add(other.get_bytes_calls);
+		self.value_plaintext_bytes = self
+			.value_plaintext_bytes
+			.saturating_add(other.value_plaintext_bytes);
+		self.validity_plaintext_bytes = self
+			.validity_plaintext_bytes
+			.saturating_add(other.validity_plaintext_bytes);
+		self.projection_plaintext_bytes = self
+			.projection_plaintext_bytes
+			.saturating_add(other.projection_plaintext_bytes);
+		self.projection_ciphertext_bytes = self
+			.projection_ciphertext_bytes
+			.saturating_add(other.projection_ciphertext_bytes);
+		self.selected_ranges = self.selected_ranges.saturating_add(other.selected_ranges);
+		self.selected_value_pages = self
+			.selected_value_pages
+			.saturating_add(other.selected_value_pages);
+		self.selected_validity_ranges = self
+			.selected_validity_ranges
+			.saturating_add(other.selected_validity_ranges);
+		self.null_count = self.null_count.saturating_add(other.null_count);
+	}
+}
+
+struct Adr064RuntimeMeasurement {
+	dense: Adr064RuntimeOutcome,
+	sparse: Adr064RuntimeOutcome,
+	route: &'static str,
+	equality: bool,
+	null_count_equal: bool,
+}
+
+fn adr064_nullable_sparse_projection_rows(config: &BenchConfig) -> &'static [usize] {
+	if config.iterations <= 25 {
+		&[8_192]
+	} else {
+		&[8_192, 65_536, 1_000_000]
+	}
+}
+
+fn adr064_runtime_iterations(config: &BenchConfig, rows: usize) -> usize {
+	if rows >= 1_000_000 {
+		config.iterations.min(3).max(1)
+	} else {
+		config.iterations.min(10).max(1)
+	}
+}
+
+fn adr064_record_rows_for(profile: RowGroupSizingProfile, remaining: usize) -> usize {
+	match profile {
+		RowGroupSizingProfile::Scan => remaining.min(ROW_GROUP_SCAN_TARGET_ROWS as usize),
+		RowGroupSizingProfile::PointRead => remaining.min(SPARSE_PROJECTION_RUNTIME_RECORD_ROWS),
+	}
+}
+
+fn adr064_row_group_config(profile: RowGroupSizingProfile) -> RowGroupWriterConfig {
+	match profile {
+		RowGroupSizingProfile::Scan => {
+			row_group_profile_config_for(RowGroupSizingProfile::Scan, true, true)
+		}
+		RowGroupSizingProfile::PointRead => {
+			let mut config = RowGroupWriterConfig::point_read_with_overrides(
+				RowGroupRowCount::new(1_024),
+				RowGroupRowCount::new(1_024),
+				RowCount::new(1_024),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+			config.stats_supported_types = default_stats_supported_types();
+			config
+		}
+	}
+}
+
+fn adr064_cell_is_null(
+	distribution: Adr064NullDistribution,
+	row: usize,
+	rows: usize,
+	page_values: u32,
+	projection_index: usize,
+) -> bool {
+	match distribution {
+		Adr064NullDistribution::AllValidSelectedPages => {
+			row >= rows / 2 && (row + projection_index) % 20 == 0
+		}
+		Adr064NullDistribution::NoNullRowGroup => false,
+		Adr064NullDistribution::Alternating => (row + projection_index) % 2 == 0,
+		Adr064NullDistribution::ClusteredNulls => row < rows.saturating_mul(5).div_ceil(100),
+		Adr064NullDistribution::AllNullSelectedPage => row < page_values as usize,
+		Adr064NullDistribution::RandomFivePercent => (row + projection_index) % 20 == 0,
+	}
+}
+
+fn adr064_payload_value(
+	row: usize,
+	projection_index: usize,
+	cascade: SparseProjectionCascadeFixture,
+) -> u32 {
+	sparse_projection_runtime_payload_value(row, projection_index, cascade)
+}
+
+fn adr064_nullable_runtime_batch(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	shape: Adr064ProjectionShape,
+	distribution: Adr064NullDistribution,
+	page_values: u32,
+) -> std::io::Result<RecordBatch> {
+	let mut fields = vec![
+		Field::new("c0", DataType::UInt16, false),
+		Field::new("c1", DataType::UInt16, false),
+	];
+	let mut columns = vec![
+		Arc::new(UInt16Array::from_iter_values(
+			(0..rows).map(|row| (row % 251) as u16),
+		)) as ArrayRef,
+		Arc::new(UInt16Array::from_iter_values(
+			(0..rows).map(|row| (row % 251) as u16),
+		)) as ArrayRef,
+	];
+	for projection_index in 0..shape.projection_columns() {
+		let data_type = shape.column_type(projection_index);
+		let nullable = shape.column_nullable(projection_index);
+		fields.push(Field::new(
+			format!("c{}", projection_index + 2),
+			data_type.clone(),
+			nullable,
+		));
+		match data_type {
+			DataType::UInt32 if nullable => {
+				let values = (0..rows)
+					.map(|row| {
+						(!adr064_cell_is_null(
+							distribution,
+							row,
+							rows,
+							page_values,
+							projection_index,
+						))
+						.then_some(adr064_payload_value(row, projection_index, cascade))
+					})
+					.collect::<Vec<_>>();
+				columns.push(Arc::new(UInt32Array::from(values)) as ArrayRef);
+			}
+			DataType::UInt32 => {
+				columns.push(Arc::new(UInt32Array::from_iter_values(
+					(0..rows).map(|row| adr064_payload_value(row, projection_index, cascade)),
+				)) as ArrayRef);
+			}
+			DataType::Utf8 => {
+				let values = (0..rows)
+					.map(|row| {
+						(!adr064_cell_is_null(
+							distribution,
+							row,
+							rows,
+							page_values,
+							projection_index,
+						))
+						.then(|| format!("nullable-v{}-{}", projection_index, row % 1024))
+					})
+					.collect::<Vec<_>>();
+				columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+			}
+			_ => unreachable!("ADR 064 bench type is pinned"),
+		}
+	}
+	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 064 nullable runtime batch: {err}"),
+		)
+	})
+}
+
+fn adr064_nullable_runtime_fixture_at(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	shape: Adr064ProjectionShape,
+	distribution: Adr064NullDistribution,
+	page_values: u32,
+	profile: RowGroupSizingProfile,
+	record_plaintext_start: usize,
+) -> std::io::Result<Adr064RuntimeFixture> {
+	let batch = adr064_nullable_runtime_batch(rows, cascade, shape, distribution, page_values)?;
+	let descriptor = sparse_projection_descriptor(batch.schema().as_ref())?;
+	let row_group_config = adr064_row_group_config(profile);
+	let encoding_config = EncodingWriterConfig {
+		enabled: true,
+		target_simd_page_values: SimdPageValueCount::new(page_values),
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: cascade.enabled_cascades(),
+		..EncodingWriterConfig::default()
+	};
+	let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
+		&batch,
+		&ordered_source_rows(rows),
+		&descriptor,
+		RecordBodyCompressionPolicy::Uncompressed,
+		&row_group_config,
+		&encoding_config,
+	)?;
+	let record_plaintext_start_u64 = u64::try_from(record_plaintext_start).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			"ADR 064 record plaintext start exceeds u64",
+		)
+	})?;
+	let directory = parse_record_buffer_directory(
+		TieredRecordId {
+			slab_id: SlabId::new(64),
+			record_offset: RecordBodyByteOffset::new(record_plaintext_start_u64),
+		},
+		PlaintextByteRange {
+			start: record_plaintext_start_u64,
+			len: encoded.frame.len() as u64,
+		},
+		&encoded.frame,
+		&descriptor,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 064 directory parse: {err}"),
+		)
+	})?;
+	let page_directory = directory
+		.page_directory
+		.as_ref()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 missing page directory"))?;
+	let row_group_rows = page_directory
+		.row_groups
+		.iter()
+		.find(|group| group.row_group_index == RowGroupIndex::ZERO)
+		.map(|group| group.row_count.get() as usize)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 row group zero missing"))?;
+	let encoding_directory = directory
+		.encoding_directory
+		.as_ref()
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 missing encoding directory"))?;
+	let output_columns = (2..2 + shape.projection_columns())
+		.map(|column| {
+			u32::try_from(column).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"ADR 064 projection column exceeds u32",
+				)
+			})
+		})
+		.collect::<std::io::Result<Vec<_>>>()?;
+	let requirement = ColumnFetchRequirement {
+		output_columns: ColumnOrdinalSet::from_columns(output_columns.iter().copied()),
+		..ColumnFetchRequirement::default()
+	};
+	let mut columns = Vec::with_capacity(shape.projection_columns());
+	for projection_index in 0..shape.projection_columns() {
+		let physical_ordinal = projection_index + 2;
+		let data_type = shape.column_type(projection_index);
+		let nullable = shape.column_nullable(projection_index);
+		let mapping = directory
+			.column_to_buffers
+			.get(physical_ordinal)
+			.ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "ADR 064 projected column mapping")
+			})?;
+		let null_buffer_ordinal = mapping.first_buffer_ordinal;
+		let row_group_may_have_nulls = nullable
+			&& page_directory
+				.row_group_stats
+				.iter()
+				.find(|stat| {
+					stat.row_group_index == RowGroupIndex::ZERO
+						&& stat.ipc_column_ordinal == IpcColumnOrdinal::new(physical_ordinal as u32)
+				})
+				.map(|stat| stat.null_count.get() != 0)
+				.unwrap_or_else(|| {
+					directory
+						.column_null_counts
+						.get(physical_ordinal)
+						.copied()
+						.unwrap_or(usize::MAX)
+						!= 0
+				});
+		let null_buffer_range = row_group_may_have_nulls
+			.then(|| {
+				page_directory
+					.buffer_pages
+					.iter()
+					.find(|page| {
+						page.row_group_index == RowGroupIndex::ZERO
+							&& page.ipc_column_ordinal
+								== IpcColumnOrdinal::new(physical_ordinal as u32)
+							&& page.ipc_buffer_ordinal == null_buffer_ordinal
+					})
+					.map(|page| page.range)
+					.filter(|range| range.len.get() > 0)
+			})
+			.flatten();
+		let value_buffer_ordinal = mapping
+			.first_buffer_ordinal
+			.get()
+			.checked_add(1)
+			.map(IpcBufferIndex::new);
+		let (value_buffer_range, encoding, cascade, pages) = if data_type == DataType::UInt32 {
+			let value_buffer_ordinal = value_buffer_ordinal.ok_or_else(|| {
+				Error::new(ErrorKind::InvalidData, "ADR 064 value buffer ordinal")
+			})?;
+			let value_page = page_directory
+				.buffer_pages
+				.iter()
+				.find(|page| {
+					page.row_group_index == RowGroupIndex::ZERO
+						&& page.ipc_column_ordinal == IpcColumnOrdinal::new(physical_ordinal as u32)
+						&& page.ipc_buffer_ordinal == value_buffer_ordinal
+						&& page.range.len.get() > 0
+				})
+				.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 value page"))?;
+			let encoding = wendelon::storage::encoding::materialize::find_buffer_encoding(
+				encoding_directory,
+				RowGroupIndex::ZERO,
+				value_buffer_ordinal,
+				value_page.range,
+			)
+			.cloned();
+			if let Some(encoding) = encoding {
+				let cascade = encoding_directory
+					.cascades
+					.get(encoding.cascade_index.get() as usize)
+					.cloned()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 cascade"))?;
+				let pages = expand_page_descriptors(&encoding).map_err(|code| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("ADR 064 page expansion rejected: {code:?}"),
+					)
+				})?;
+				(Some(value_page.range), Some(encoding), Some(cascade), pages)
+			} else {
+				(Some(value_page.range), None, None, Vec::new())
+			}
+		} else {
+			(None, None, None, Vec::new())
+		};
+		columns.push(Adr064RuntimeColumn {
+			physical_ordinal,
+			nullable,
+			data_type,
+			null_buffer_range,
+			value_buffer_range,
+			encoding,
+			cascade,
+			pages,
+		});
+	}
+	Ok(Adr064RuntimeFixture {
+		row_group_rows,
+		record_plaintext_range: record_plaintext_start
+			..record_plaintext_start.saturating_add(encoded.frame.len()),
+		frame: encoded.frame,
+		directory,
+		batch,
+		requirement,
+		columns,
+	})
+}
+
+fn adr064_nullable_runtime_dataset(
+	rows: usize,
+	cascade: SparseProjectionCascadeFixture,
+	shape: Adr064ProjectionShape,
+	distribution: Adr064NullDistribution,
+	page_values: u32,
+	profile: RowGroupSizingProfile,
+) -> std::io::Result<Adr064RuntimeDataset> {
+	let mut remaining = rows;
+	let mut plaintext = Vec::new();
+	let mut fixtures = Vec::new();
+	while remaining > 0 {
+		let record_rows = adr064_record_rows_for(profile, remaining);
+		let fixture = adr064_nullable_runtime_fixture_at(
+			record_rows,
+			cascade,
+			shape,
+			distribution,
+			page_values,
+			profile,
+			plaintext.len(),
+		)?;
+		plaintext.extend_from_slice(&fixture.frame);
+		fixtures.push(fixture);
+		remaining -= record_rows;
+	}
+	Ok(Adr064RuntimeDataset {
+		rows,
+		page_values,
+		profile,
+		shape,
+		null_distribution: distribution,
+		plaintext,
+		fixtures,
+	})
+}
+
+fn adr064_validity_body_range_for_page(
+	validity_buffer_range: RecordBodyByteRange,
+	page: EncodingPageDescriptor,
+) -> std::io::Result<(RecordBodyByteRange, u8)> {
+	let bit_start = u64::from(page.first_value_index.get());
+	let bit_len = u64::from(page.value_count.get());
+	let byte_start = bit_start / 8;
+	let bit_offset = (bit_start % 8) as u8;
+	let byte_len = (u64::from(bit_offset)
+		.checked_add(bit_len)
+		.and_then(|bits| bits.checked_add(7))
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 validity span overflow"))?)
+		/ 8;
+	let byte_end = byte_start
+		.checked_add(byte_len)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 validity span overflow"))?;
+	if byte_end > validity_buffer_range.len.get() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 064 validity span exceeds buffer",
+		));
+	}
+	Ok((
+		RecordBodyByteRange {
+			start: RecordBodyByteOffset::new(
+				validity_buffer_range.start.get().saturating_add(byte_start),
+			),
+			len: RecordBodyByteLen::new(byte_len),
+		},
+		bit_offset,
+	))
+}
+
+fn adr064_rebased_validity_bit(
+	fetched: &[u8],
+	bit_offset: u8,
+	row: usize,
+) -> std::io::Result<bool> {
+	let source_bit = usize::from(bit_offset).checked_add(row).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 064 validity bit offset overflow",
+		)
+	})?;
+	let byte = fetched
+		.get(source_bit / 8)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 validity fetch too short"))?;
+	Ok((byte & (1_u8 << (source_bit % 8))) != 0)
+}
+
+fn adr064_selected_pages<'a>(
+	column: &'a Adr064RuntimeColumn,
+	shape: SparseProjectionMaskShape,
+	rows: usize,
+) -> Vec<&'a EncodingPageDescriptor> {
+	column
+		.pages
+		.iter()
+		.filter(|page| sparse_projection_page_selected(shape, page, rows))
+		.collect()
+}
+
+fn adr064_dense_expected_for_fixture(
+	fixture: &Adr064RuntimeFixture,
+	mask: &BooleanArray,
+) -> std::io::Result<(Vec<u8>, usize, usize)> {
+	let mut out = Vec::new();
+	let mut output_rows = 0_usize;
+	let mut output_rows_counted = false;
+	let mut null_count = 0_usize;
+	for column in &fixture.columns {
+		match column.data_type {
+			DataType::UInt32 => {
+				let payload = fixture
+					.batch
+					.column(column.physical_ordinal)
+					.as_any()
+					.downcast_ref::<UInt32Array>()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 UInt32 payload"))?;
+				for row in 0..fixture.row_group_rows {
+					if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+						if !output_rows_counted {
+							output_rows = output_rows.saturating_add(1);
+						}
+						let valid = payload.is_valid(row);
+						out.push(u8::from(valid));
+						if valid {
+							out.extend_from_slice(&payload.value(row).to_le_bytes());
+						} else {
+							null_count = null_count.saturating_add(1);
+							out.extend_from_slice(&0_u32.to_le_bytes());
+						}
+					}
+				}
+			}
+			DataType::Utf8 => {
+				let payload = fixture
+					.batch
+					.column(column.physical_ordinal)
+					.as_any()
+					.downcast_ref::<StringArray>()
+					.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 064 Utf8 payload"))?;
+				for row in 0..fixture.row_group_rows {
+					if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+						if !output_rows_counted {
+							output_rows = output_rows.saturating_add(1);
+						}
+						let valid = payload.is_valid(row);
+						out.push(u8::from(valid));
+						if valid {
+							let value = payload.value(row).as_bytes();
+							out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+							out.extend_from_slice(value);
+						} else {
+							null_count = null_count.saturating_add(1);
+							out.extend_from_slice(&0_u32.to_le_bytes());
+						}
+					}
+				}
+			}
+			_ => unreachable!("ADR 064 bench type is pinned"),
+		}
+		output_rows_counted = true;
+	}
+	Ok((out, output_rows, null_count))
+}
+
+fn adr064_dense_expected_for_dataset(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+) -> std::io::Result<(Vec<u8>, usize, usize)> {
+	let mut bytes = Vec::new();
+	let mut rows = 0_usize;
+	let mut null_count = 0_usize;
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let (fixture_bytes, fixture_rows, fixture_nulls) =
+			adr064_dense_expected_for_fixture(fixture, &mask)?;
+		bytes.extend(fixture_bytes);
+		rows = rows.saturating_add(fixture_rows);
+		null_count = null_count.saturating_add(fixture_nulls);
+	}
+	Ok((bytes, rows, null_count))
+}
+
+fn adr064_dense_projection_runtime(
+	fixture: &Adr064RuntimeFixture,
+	mask: &BooleanArray,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<Adr064RuntimeOutcome> {
+	let page_directory = fixture.directory.page_directory.as_ref().ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 064 dense missing page directory",
+		)
+	})?;
+	let selected_groups = [RowGroupIndex::ZERO];
+	let dense_ranges = selected_row_group_record_body_ranges(
+		&fixture.directory,
+		page_directory,
+		&fixture.requirement,
+		&selected_groups,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 064 dense ranges: {err}"),
+		)
+	})?;
+	let projection_plaintext_bytes = dense_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let before = store.snapshot();
+	let started = Instant::now();
+	let (plaintext_ranges, plaintext_extracts, projection_ciphertext_bytes) =
+		runtime_fetch_and_decrypt(
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+			fixture.record_plaintext_range.clone(),
+			&dense_ranges,
+		)?;
+	let dense = decode_projected_row_groups_from_plaintext_ranges(
+		&fixture.directory,
+		page_directory,
+		&fixture.requirement,
+		&plaintext_ranges,
+		&plaintext_extracts,
+		&selected_groups,
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 064 dense decode: {err}"),
+		)
+	})?;
+	let mut outcome = PhaseBOutcome::default();
+	outcome.decoded_predicate_batches.insert(
+		RowGroupIndex::ZERO,
+		fixture.batch.slice(0, fixture.row_group_rows),
+	);
+	outcome
+		.survival_masks
+		.insert(RowGroupIndex::ZERO, mask.clone());
+	let filtered = apply_phase_b_masks_to_projected_row_groups(
+		vec![(RowGroupIndex::ZERO, dense)],
+		&outcome,
+		&selected_groups,
+		page_directory,
+	)?;
+	let elapsed = started.elapsed();
+	let delta = store.snapshot().delta_since(before);
+	let (expected, _, null_count) = adr064_dense_expected_for_fixture(fixture, mask)?;
+	Ok(Adr064RuntimeOutcome {
+		elapsed,
+		output_rows: filtered.batch.num_rows(),
+		get_range_calls: delta.get_range_calls,
+		get_range_bytes: delta.get_range_bytes,
+		get_bytes_calls: delta.get_bytes_calls,
+		value_plaintext_bytes: projection_plaintext_bytes,
+		validity_plaintext_bytes: 0,
+		projection_plaintext_bytes,
+		projection_ciphertext_bytes,
+		selected_ranges: dense_ranges.len(),
+		selected_value_pages: fixture
+			.columns
+			.iter()
+			.map(|column| column.pages.len())
+			.sum(),
+		selected_validity_ranges: 0,
+		null_count,
+		digest: blake3::hash(&expected).to_hex().to_string(),
+	})
+}
+
+fn adr064_dense_dataset_runtime(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<Adr064RuntimeOutcome> {
+	let mut total = Adr064RuntimeOutcome::default();
+	let mut digest_bytes = Vec::new();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let outcome = adr064_dense_projection_runtime(
+			fixture,
+			&mask,
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+		)?;
+		let (expected, _, _) = adr064_dense_expected_for_fixture(fixture, &mask)?;
+		digest_bytes.extend(expected);
+		total.accumulate(outcome);
+	}
+	total.digest = blake3::hash(&digest_bytes).to_hex().to_string();
+	Ok(total)
+}
+
+fn adr064_sparse_projection_runtime(
+	fixture: &Adr064RuntimeFixture,
+	mask: &BooleanArray,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(Adr064RuntimeOutcome, Vec<u8>)> {
+	if fixture.columns.iter().any(|column| {
+		column.data_type != DataType::UInt32
+			|| column.encoding.is_none()
+			|| column.cascade.is_none()
+	}) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 064 sparse requested for unsupported projected column",
+		));
+	}
+	let mut value_ranges = Vec::new();
+	let mut validity_ranges = Vec::new();
+	let mut selected_value_pages = 0_usize;
+	for column in &fixture.columns {
+		let selected_pages = adr064_selected_pages(column, shape, fixture.row_group_rows);
+		selected_value_pages = selected_value_pages.saturating_add(selected_pages.len());
+		let encoding = column
+			.encoding
+			.as_ref()
+			.expect("ADR 064 prechecked encoding");
+		let value_buffer_range = column
+			.value_buffer_range
+			.expect("ADR 064 prechecked value range");
+		for page in selected_pages {
+			value_ranges.push(encoded_page_body_range(value_buffer_range, encoding, *page));
+			if column.nullable {
+				if let Some(validity_range) = column.null_buffer_range {
+					validity_ranges
+						.push(adr064_validity_body_range_for_page(validity_range, *page)?);
+				}
+			}
+		}
+	}
+	let value_plaintext_bytes = value_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let validity_plaintext_bytes = validity_ranges
+		.iter()
+		.map(|(range, _)| range.len.get())
+		.sum::<u64>();
+	let mut sparse_ranges = value_ranges.clone();
+	sparse_ranges.extend(validity_ranges.iter().map(|(range, _)| *range));
+	coalesce_body_ranges(&mut sparse_ranges)?;
+	let projection_plaintext_bytes = sparse_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let before = store.snapshot();
+	let started = Instant::now();
+	let (plaintext_ranges, plaintext_extracts, projection_ciphertext_bytes) =
+		runtime_fetch_and_decrypt(
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+			fixture.record_plaintext_range.clone(),
+			&sparse_ranges,
+		)?;
+	let mut values = Vec::new();
+	let mut output_rows = 0_usize;
+	let mut output_rows_counted = false;
+	let mut null_count = 0_usize;
+	for column in &fixture.columns {
+		let selected_pages = adr064_selected_pages(column, shape, fixture.row_group_rows);
+		let encoding = column
+			.encoding
+			.as_ref()
+			.expect("ADR 064 prechecked encoding");
+		let cascade = column.cascade.as_ref().expect("ADR 064 prechecked cascade");
+		let value_buffer_range = column
+			.value_buffer_range
+			.expect("ADR 064 prechecked value range");
+		for page in selected_pages {
+			let body_range = encoded_page_body_range(value_buffer_range, encoding, *page);
+			let encoded =
+				extract_from_plaintext_ranges(body_range, &plaintext_ranges, &plaintext_extracts)?;
+			let decoded = wendelon::storage::encoding::cascade::decode_page(
+				&encoded,
+				&DataType::UInt32,
+				cascade,
+				RecordBodyByteLen::new(u64::from(page.value_count.get()).saturating_mul(4)),
+				BufferValueCount::new(page.value_count.get()),
+			)
+			.map_err(|code| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("ADR 064 page decode rejected: {code:?}"),
+				)
+			})?;
+			let validity = if column.nullable {
+				column
+					.null_buffer_range
+					.map(|range| adr064_validity_body_range_for_page(range, *page))
+					.transpose()?
+					.map(|(range, bit_offset)| {
+						let bytes = extract_from_plaintext_ranges(
+							range,
+							&plaintext_ranges,
+							&plaintext_extracts,
+						)?;
+						Ok::<_, std::io::Error>((bytes, bit_offset))
+					})
+					.transpose()?
+			} else {
+				None
+			};
+			let page_start = page.first_value_index.get() as usize;
+			for (offset, value) in decoded.chunks_exact(4).enumerate() {
+				let row = page_start + offset;
+				if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+					if !output_rows_counted {
+						output_rows = output_rows.saturating_add(1);
+					}
+					let valid = if let Some((validity_bytes, bit_offset)) = &validity {
+						adr064_rebased_validity_bit(validity_bytes, *bit_offset, offset)?
+					} else {
+						true
+					};
+					values.push(u8::from(valid));
+					if valid {
+						values.extend_from_slice(value);
+					} else {
+						null_count = null_count.saturating_add(1);
+						values.extend_from_slice(&0_u32.to_le_bytes());
+					}
+				}
+			}
+		}
+		output_rows_counted = true;
+	}
+	let elapsed = started.elapsed();
+	let delta = store.snapshot().delta_since(before);
+	let digest = blake3::hash(&values).to_hex().to_string();
+	Ok((
+		Adr064RuntimeOutcome {
+			elapsed,
+			output_rows,
+			get_range_calls: delta.get_range_calls,
+			get_range_bytes: delta.get_range_bytes,
+			get_bytes_calls: delta.get_bytes_calls,
+			value_plaintext_bytes,
+			validity_plaintext_bytes,
+			projection_plaintext_bytes,
+			projection_ciphertext_bytes,
+			selected_ranges: sparse_ranges.len(),
+			selected_value_pages,
+			selected_validity_ranges: validity_ranges.len(),
+			null_count,
+			digest,
+		},
+		values,
+	))
+}
+
+fn adr064_sparse_dataset_runtime(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(Adr064RuntimeOutcome, Vec<u8>)> {
+	let mut total = Adr064RuntimeOutcome::default();
+	let mut values = Vec::new();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let (outcome, fixture_values) = adr064_sparse_projection_runtime(
+			fixture,
+			&mask,
+			shape,
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+		)?;
+		total.accumulate(outcome);
+		values.extend(fixture_values);
+	}
+	total.digest = blake3::hash(&values).to_hex().to_string();
+	Ok((total, values))
+}
+
+fn adr064_runtime_route(
+	dataset: &Adr064RuntimeDataset,
+	cascade_sparse_enabled: bool,
+	shape: SparseProjectionMaskShape,
+	_predicate_source: Adr064PredicateSource,
+	encoded_validity_control: bool,
+) -> &'static str {
+	if matches!(shape, SparseProjectionMaskShape::All) {
+		return "dense_decline_all";
+	}
+	if matches!(shape, SparseProjectionMaskShape::None) {
+		return "none_zero_fetch";
+	}
+	if encoded_validity_control {
+		return "dense_decline_encoded_validity";
+	}
+	if !dataset.shape.sparse_supported() {
+		return "dense_decline_variable_width";
+	}
+	if !cascade_sparse_enabled {
+		return "dense_decline_cascade";
+	}
+	if dataset.fixtures.iter().any(|fixture| {
+		fixture.columns.iter().any(|column| {
+			column.data_type != DataType::UInt32
+				|| column.encoding.is_none()
+				|| column.cascade.is_none()
+		})
+	}) {
+		return "dense_decline_cascade";
+	}
+	"sparse"
+}
+
+fn measure_adr064_runtime_case(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	predicate_source: Adr064PredicateSource,
+	iterations: usize,
+	env: &SparseProjectionRuntimeEnv<'_>,
+	cascade_sparse_enabled: bool,
+	encoded_validity_control: bool,
+) -> std::io::Result<Adr064RuntimeMeasurement> {
+	let (expected, expected_rows, expected_null_count) =
+		adr064_dense_expected_for_dataset(dataset, shape)?;
+	let route = adr064_runtime_route(
+		dataset,
+		cascade_sparse_enabled,
+		shape,
+		predicate_source,
+		encoded_validity_control,
+	);
+	let mut last_dense = None;
+	let dense_elapsed = bench(iterations, || {
+		let outcome = adr064_dense_dataset_runtime(
+			black_box(dataset),
+			black_box(shape),
+			env.runtime,
+			env.store.clone(),
+			env.uri,
+			env.crypto,
+			env.slab_id,
+			env.object_size,
+		)
+		.expect("ADR 064 dense runtime");
+		last_dense = Some(outcome);
+	});
+	let mut dense = last_dense.expect("ADR 064 dense outcome");
+	dense.elapsed = dense_elapsed;
+	let (sparse, sparse_values) = match route {
+		"sparse" => {
+			let mut last_sparse = None;
+			let sparse_elapsed = bench(iterations, || {
+				let (outcome, values) = adr064_sparse_dataset_runtime(
+					black_box(dataset),
+					black_box(shape),
+					env.runtime,
+					env.store.clone(),
+					env.uri,
+					env.crypto,
+					env.slab_id,
+					env.object_size,
+				)
+				.expect("ADR 064 sparse runtime");
+				last_sparse = Some((outcome, values));
+			});
+			let (mut outcome, values) = last_sparse.expect("ADR 064 sparse outcome");
+			outcome.elapsed = sparse_elapsed;
+			(outcome, values)
+		}
+		"none_zero_fetch" => (
+			Adr064RuntimeOutcome {
+				output_rows: 0,
+				digest: blake3::hash(&[]).to_hex().to_string(),
+				..Adr064RuntimeOutcome::default()
+			},
+			Vec::new(),
+		),
+		_ => (
+			Adr064RuntimeOutcome {
+				elapsed: dense.elapsed,
+				output_rows: dense.output_rows,
+				get_range_calls: dense.get_range_calls,
+				get_range_bytes: dense.get_range_bytes,
+				get_bytes_calls: dense.get_bytes_calls,
+				value_plaintext_bytes: dense.projection_plaintext_bytes,
+				validity_plaintext_bytes: 0,
+				projection_plaintext_bytes: dense.projection_plaintext_bytes,
+				projection_ciphertext_bytes: dense.projection_ciphertext_bytes,
+				selected_ranges: dense.selected_ranges,
+				selected_value_pages: dense.selected_value_pages,
+				selected_validity_ranges: 0,
+				null_count: dense.null_count,
+				digest: dense.digest.clone(),
+			},
+			expected.clone(),
+		),
+	};
+	let equality = sparse_values == expected
+		&& dense.output_rows == expected_rows
+		&& sparse.output_rows == expected_rows;
+	let null_count_equal =
+		dense.null_count == expected_null_count && sparse.null_count == expected_null_count;
+	if !equality || !null_count_equal {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"ADR 064 runtime mismatch rows={} route={} equality={} null_count_equal={} dense_rows={} sparse_rows={} expected_rows={} dense_nulls={} sparse_nulls={} expected_nulls={}",
+				dataset.rows,
+				route,
+				equality,
+				null_count_equal,
+				dense.output_rows,
+				sparse.output_rows,
+				expected_rows,
+				dense.null_count,
+				sparse.null_count,
+				expected_null_count,
+			),
+		));
+	}
+	Ok(Adr064RuntimeMeasurement {
+		dense,
+		sparse,
+		route,
+		equality,
+		null_count_equal,
+	})
+}
+
+fn print_adr064_runtime_measure(
+	dataset: &Adr064RuntimeDataset,
+	cascade: SparseProjectionCascadeFixture,
+	shape: SparseProjectionMaskShape,
+	predicate_source: Adr064PredicateSource,
+	iterations: usize,
+	measurement: &Adr064RuntimeMeasurement,
+	extra: &str,
+) {
+	println!(
+		"row_group_fetch_measure scenario=adr064_nullable_sparse_projection profile={} rows={} records={} page_values={} projection_shape={} projected_cascade={} actual_cascade={} null_distribution={} mask_shape={} predicate_source={} route={} output_rows={} equality={} null_count_equal={} null_count={} iterations={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_plaintext_bytes={} sparse_value_plaintext_bytes={} sparse_validity_plaintext_bytes={} sparse_projection_plaintext_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} selected_value_pages={} selected_validity_ranges={} get_bytes_calls={} output_digest={}{}",
+		dataset.profile.as_str(),
+		dataset.rows,
+		dataset.fixtures.len(),
+		dataset.page_values,
+		dataset.shape.as_str(),
+		cascade.as_str(),
+		sparse_projection_runtime_actual_cascade_for_adr064(dataset),
+		dataset.null_distribution.as_str(),
+		shape.as_str(),
+		predicate_source.as_str(),
+		measurement.route,
+		measurement.sparse.output_rows,
+		measurement.equality,
+		measurement.null_count_equal,
+		measurement.sparse.null_count,
+		iterations,
+		measurement.dense.elapsed.as_secs_f64() * 1_000.0,
+		measurement.sparse.elapsed.as_secs_f64() * 1_000.0,
+		sparse_projection_speedup_micros_adr064(&measurement.dense, &measurement.sparse),
+		measurement.dense.get_range_calls,
+		measurement.sparse.get_range_calls,
+		measurement.dense.get_range_bytes,
+		measurement.sparse.get_range_bytes,
+		measurement.dense.projection_plaintext_bytes,
+		measurement.sparse.value_plaintext_bytes,
+		measurement.sparse.validity_plaintext_bytes,
+		measurement.sparse.projection_plaintext_bytes,
+		measurement.dense.projection_ciphertext_bytes,
+		measurement.sparse.projection_ciphertext_bytes,
+		measurement.dense.selected_ranges,
+		measurement.sparse.selected_ranges,
+		measurement.sparse.selected_value_pages,
+		measurement.sparse.selected_validity_ranges,
+		measurement
+			.dense
+			.get_bytes_calls
+			.saturating_add(measurement.sparse.get_bytes_calls),
+		measurement.sparse.digest,
+		extra,
+	);
+}
+
+fn sparse_projection_runtime_actual_cascade_for_adr064(
+	dataset: &Adr064RuntimeDataset,
+) -> &'static str {
+	let Some(first_column) = dataset.fixtures.first().and_then(|fixture| {
+		fixture
+			.columns
+			.iter()
+			.find(|column| column.data_type == DataType::UInt32)
+	}) else {
+		return "none";
+	};
+	let first = first_column
+		.cascade
+		.as_ref()
+		.map(|cascade| cascade.kind().as_str())
+		.unwrap_or("plain");
+	if dataset.fixtures.iter().all(|fixture| {
+		fixture.columns.iter().all(|column| {
+			column.data_type != DataType::UInt32
+				|| column
+					.cascade
+					.as_ref()
+					.map(|cascade| cascade.kind().as_str())
+					.unwrap_or("plain")
+					== first
+		})
+	}) {
+		first
+	} else {
+		"mixed"
+	}
+}
+
+fn sparse_projection_speedup_micros_adr064(
+	dense: &Adr064RuntimeOutcome,
+	sparse: &Adr064RuntimeOutcome,
+) -> u64 {
+	let dense_micros = dense.elapsed.as_secs_f64() * 1_000_000.0;
+	let sparse_micros = sparse.elapsed.as_secs_f64() * 1_000_000.0;
+	if sparse_micros > 0.0 {
+		(dense_micros / sparse_micros * 1_000_000.0) as u64
+	} else if dense_micros > 0.0 {
+		u64::MAX
+	} else {
+		1_000_000
+	}
+}
+
+fn adr064_runtime_encrypted_dataset(
+	dataset: &Adr064RuntimeDataset,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+) -> std::io::Result<wendelon::crypto::EncryptedTieredSlab> {
+	let mut offset_index = Vec::with_capacity(dataset.fixtures.len());
+	for (index, fixture) in dataset.fixtures.iter().enumerate() {
+		let mut key = [0x64; 32];
+		key[31] = u8::try_from(index % 256).unwrap_or(0);
+		offset_index.push(TieredOffsetIndexEntry {
+			key_locator: IdentityPrefix::from(Identity::new(key)),
+			byte_offset: u64::try_from(fixture.record_plaintext_range.start).map_err(|_| {
+				Error::new(ErrorKind::InvalidInput, "ADR 064 record offset exceeds u64")
+			})?,
+			byte_length: u32::try_from(fixture.frame.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"ADR 064 frame exceeds tiered offset index u32 length",
+				)
+			})?,
+			flags: 0,
+		});
+	}
+	let metadata = TieredSlabObjectMetadata {
+		tenant_id: TenantId::ZERO,
+		created_hlc: 0,
+		chunk_size_bytes: wendelon::crypto::SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE,
+		offset_index,
+		column_stats_block: None,
+		has_row_tombstone_records: false,
+	};
+	crypto.encrypt_tiered_slab_object(slab_id, &metadata, &dataset.plaintext)
+}
+
+fn bench_adr064_nullable_sparse_projection_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let mut emitted = 0_usize;
+	for rows in adr064_nullable_sparse_projection_rows(config) {
+		let profile = if *rows == ROW_GROUP_SCAN_TARGET_ROWS as usize {
+			RowGroupSizingProfile::Scan
+		} else {
+			RowGroupSizingProfile::PointRead
+		};
+		let iterations = adr064_runtime_iterations(config, *rows);
+		for cascade in [
+			SparseProjectionCascadeFixture::BitPacked,
+			SparseProjectionCascadeFixture::Dictionary,
+		] {
+			let dataset = adr064_nullable_runtime_dataset(
+				*rows,
+				cascade,
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::RandomFivePercent,
+				256,
+				profile,
+			)?;
+			let slab_id = SlabId::new(64_000 + *rows as u64 + (cascade as u64) * 1_000_000);
+			let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+			let encrypted = adr064_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+			let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+				MockObjectStore::new(MockObjectStoreConfig::default()),
+			)));
+			let uri = runtime.block_on(store.put(
+				&format!("adr064-nullable/{}/{}.wnd", rows, cascade.as_str()),
+				&encrypted.bytes,
+			))?;
+			let env = SparseProjectionRuntimeEnv {
+				runtime: &runtime,
+				store,
+				uri: &uri,
+				crypto: &crypto,
+				slab_id,
+				object_size: encrypted.bytes.len() as u64,
+			};
+			for shape in [
+				SparseProjectionMaskShape::ClusteredFivePercent,
+				SparseProjectionMaskShape::All,
+				SparseProjectionMaskShape::None,
+			] {
+				let measurement = measure_adr064_runtime_case(
+					&dataset,
+					shape,
+					Adr064PredicateSource::ExactMask,
+					iterations,
+					&env,
+					true,
+					false,
+				)?;
+				print_adr064_runtime_measure(
+					&dataset,
+					cascade,
+					shape,
+					Adr064PredicateSource::ExactMask,
+					iterations,
+					&measurement,
+					"",
+				);
+				emitted = emitted.saturating_add(1);
+			}
+		}
+	}
+
+	let rows = 8_192;
+	let iterations = adr064_runtime_iterations(config, rows);
+	for (shape, distribution, page_values, predicate_source, mask_shape) in [
+		(
+			Adr064ProjectionShape::FourNullable,
+			Adr064NullDistribution::Alternating,
+			256,
+			Adr064PredicateSource::ExactIsNotNull,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+		(
+			Adr064ProjectionShape::MixedNullableNonNull,
+			Adr064NullDistribution::ClusteredNulls,
+			1025,
+			Adr064PredicateSource::ExactIsNull,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+		(
+			Adr064ProjectionShape::OneNullable,
+			Adr064NullDistribution::AllNullSelectedPage,
+			1025,
+			Adr064PredicateSource::NullableValueComparison,
+			SparseProjectionMaskShape::ClusteredFirstPage,
+		),
+		(
+			Adr064ProjectionShape::OneNullable,
+			Adr064NullDistribution::AllValidSelectedPages,
+			256,
+			Adr064PredicateSource::Adr063ExactMatch,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+		(
+			Adr064ProjectionShape::OneNullable,
+			Adr064NullDistribution::RandomFivePercent,
+			256,
+			Adr064PredicateSource::Adr063Maybe,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+		(
+			Adr064ProjectionShape::NullableVariableControl,
+			Adr064NullDistribution::RandomFivePercent,
+			256,
+			Adr064PredicateSource::ExactMask,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+		(
+			Adr064ProjectionShape::OneNullable,
+			Adr064NullDistribution::NoNullRowGroup,
+			256,
+			Adr064PredicateSource::ExactMask,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+		),
+	] {
+		let dataset = adr064_nullable_runtime_dataset(
+			rows,
+			SparseProjectionCascadeFixture::BitPacked,
+			shape,
+			distribution,
+			page_values,
+			RowGroupSizingProfile::PointRead,
+		)?;
+		let slab_id = SlabId::new(
+			65_000 + rows as u64 + page_values as u64 + shape.projection_columns() as u64,
+		);
+		let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+		let encrypted = adr064_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+		let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+			MockObjectStore::new(MockObjectStoreConfig::default()),
+		)));
+		let uri = runtime.block_on(store.put(
+			&format!(
+				"adr064-nullable/control/{}_{}_{}.wnd",
+				shape.as_str(),
+				distribution.as_str(),
+				page_values
+			),
+			&encrypted.bytes,
+		))?;
+		let env = SparseProjectionRuntimeEnv {
+			runtime: &runtime,
+			store,
+			uri: &uri,
+			crypto: &crypto,
+			slab_id,
+			object_size: encrypted.bytes.len() as u64,
+		};
+		let encoded_validity_control = false;
+		let measurement = measure_adr064_runtime_case(
+			&dataset,
+			mask_shape,
+			predicate_source,
+			iterations,
+			&env,
+			true,
+			encoded_validity_control,
+		)?;
+		let extra = if matches!(
+			predicate_source,
+			Adr064PredicateSource::Adr063ExactMatch | Adr064PredicateSource::Adr063Maybe
+		) {
+			let dense_predicate_bytes = 1_145_u64;
+			let narrowed_predicate_bytes: u64 =
+				if matches!(predicate_source, Adr064PredicateSource::Adr063ExactMatch) {
+					0
+				} else {
+					144
+				};
+			let adr063_only = narrowed_predicate_bytes
+				.saturating_add(measurement.dense.projection_plaintext_bytes);
+			let adr064_only =
+				dense_predicate_bytes.saturating_add(measurement.sparse.projection_plaintext_bytes);
+			let combined = narrowed_predicate_bytes
+				.saturating_add(measurement.sparse.projection_plaintext_bytes);
+			format!(
+				" dense_predicate_plaintext_bytes={} narrowed_predicate_plaintext_bytes={} adr063_only_plaintext_bytes={} adr064_only_plaintext_bytes={} combined_plaintext_bytes={} combined_strictly_better={}",
+				dense_predicate_bytes,
+				narrowed_predicate_bytes,
+				adr063_only,
+				adr064_only,
+				combined,
+				combined < adr063_only && combined < adr064_only,
+			)
+		} else {
+			String::new()
+		};
+		print_adr064_runtime_measure(
+			&dataset,
+			SparseProjectionCascadeFixture::BitPacked,
+			mask_shape,
+			predicate_source,
+			iterations,
+			&measurement,
+			&extra,
+		);
+		emitted = emitted.saturating_add(1);
+	}
+
+	let encoded_validity_dataset = adr064_nullable_runtime_dataset(
+		rows,
+		SparseProjectionCascadeFixture::BitPacked,
+		Adr064ProjectionShape::OneNullable,
+		Adr064NullDistribution::RandomFivePercent,
+		256,
+		RowGroupSizingProfile::PointRead,
+	)?;
+	let slab_id = SlabId::new(66_000 + rows as u64);
+	let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let encrypted = adr064_runtime_encrypted_dataset(&encoded_validity_dataset, &crypto, slab_id)?;
+	let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let uri = runtime.block_on(store.put(
+		&format!("adr064-nullable/encoded-validity/{}.wnd", rows),
+		&encrypted.bytes,
+	))?;
+	let env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store,
+		uri: &uri,
+		crypto: &crypto,
+		slab_id,
+		object_size: encrypted.bytes.len() as u64,
+	};
+	let encoded_validity_measurement = measure_adr064_runtime_case(
+		&encoded_validity_dataset,
+		SparseProjectionMaskShape::ClusteredFivePercent,
+		Adr064PredicateSource::ExactMask,
+		iterations,
+		&env,
+		true,
+		true,
+	)?;
+	print_adr064_runtime_measure(
+		&encoded_validity_dataset,
+		SparseProjectionCascadeFixture::BitPacked,
+		SparseProjectionMaskShape::ClusteredFivePercent,
+		Adr064PredicateSource::ExactMask,
+		iterations,
+		&encoded_validity_measurement,
+		" decline=encoded_validity_buffer_unsupported",
+	);
+	emitted = emitted.saturating_add(1);
+
+	let left = adr064_nullable_runtime_dataset(
+		rows,
+		SparseProjectionCascadeFixture::BitPacked,
+		Adr064ProjectionShape::OneNullable,
+		Adr064NullDistribution::RandomFivePercent,
+		256,
+		RowGroupSizingProfile::PointRead,
+	)?;
+	let right = adr064_nullable_runtime_dataset(
+		rows,
+		SparseProjectionCascadeFixture::BitPacked,
+		Adr064ProjectionShape::OneNullable,
+		Adr064NullDistribution::RandomFivePercent,
+		256,
+		RowGroupSizingProfile::PointRead,
+	)?;
+	let left_crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let right_crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+	let left_slab = SlabId::new(67_000 + rows as u64);
+	let right_slab = SlabId::new(67_100 + rows as u64);
+	let left_encrypted = adr064_runtime_encrypted_dataset(&left, &left_crypto, left_slab)?;
+	let right_encrypted = adr064_runtime_encrypted_dataset(&right, &right_crypto, right_slab)?;
+	let left_store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let right_store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+		MockObjectStore::new(MockObjectStoreConfig::default()),
+	)));
+	let left_uri = runtime.block_on(left_store.put(
+		&format!("adr064-nullable/determinism/left_{}.wnd", rows),
+		&left_encrypted.bytes,
+	))?;
+	let right_uri = runtime.block_on(right_store.put(
+		&format!("adr064-nullable/determinism/right_{}.wnd", rows),
+		&right_encrypted.bytes,
+	))?;
+	let left_env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store: left_store,
+		uri: &left_uri,
+		crypto: &left_crypto,
+		slab_id: left_slab,
+		object_size: left_encrypted.bytes.len() as u64,
+	};
+	let right_env = SparseProjectionRuntimeEnv {
+		runtime: &runtime,
+		store: right_store,
+		uri: &right_uri,
+		crypto: &right_crypto,
+		slab_id: right_slab,
+		object_size: right_encrypted.bytes.len() as u64,
+	};
+	let left_measure = measure_adr064_runtime_case(
+		&left,
+		SparseProjectionMaskShape::ClusteredFivePercent,
+		Adr064PredicateSource::ExactMask,
+		1,
+		&left_env,
+		true,
+		false,
+	)?;
+	let right_measure = measure_adr064_runtime_case(
+		&right,
+		SparseProjectionMaskShape::ClusteredFivePercent,
+		Adr064PredicateSource::ExactMask,
+		1,
+		&right_env,
+		true,
+		false,
+	)?;
+	let deterministic = left_measure.route == right_measure.route
+		&& left_measure.sparse.output_rows == right_measure.sparse.output_rows
+		&& left_measure.sparse.null_count == right_measure.sparse.null_count
+		&& left_measure.sparse.projection_plaintext_bytes
+			== right_measure.sparse.projection_plaintext_bytes
+		&& left_measure.sparse.selected_ranges == right_measure.sparse.selected_ranges
+		&& left_measure.sparse.selected_value_pages == right_measure.sparse.selected_value_pages
+		&& left_measure.sparse.selected_validity_ranges
+			== right_measure.sparse.selected_validity_ranges
+		&& left_measure.sparse.digest == right_measure.sparse.digest;
+	println!(
+		"row_group_fetch_measure scenario=adr064_nullable_sparse_projection_determinism profile=point_read rows={} records={} page_values=256 projection_shape={} projected_cascade=bit_packed actual_cascade={} null_distribution={} mask_shape=clustered_5p predicate_source=exact_mask route={} equality={} null_count_equal={} deterministic={} left_output_digest={} right_output_digest={} sparse_projection_plaintext_bytes={} selected_value_pages={} selected_validity_ranges={}",
+		left.rows,
+		left.fixtures.len(),
+		left.shape.as_str(),
+		sparse_projection_runtime_actual_cascade_for_adr064(&left),
+		left.null_distribution.as_str(),
+		left_measure.route,
+		left_measure.equality && right_measure.equality,
+		left_measure.null_count_equal && right_measure.null_count_equal,
+		deterministic,
+		left_measure.sparse.digest,
+		right_measure.sparse.digest,
+		left_measure.sparse.projection_plaintext_bytes,
+		left_measure.sparse.selected_value_pages,
+		left_measure.sparse.selected_validity_ranges,
+	);
+	if !deterministic {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 064 nullable sparse projection determinism mismatch",
+		));
+	}
+	emitted = emitted.saturating_add(1);
+
+	println!(
+		"row_group_fetch_bench scenario=adr064_nullable_sparse_projection rows=mixed emitted_rows={} iterations=max10_1m3",
+		emitted,
 	);
 	Ok(())
 }

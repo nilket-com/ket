@@ -42,6 +42,23 @@ distinct null-position correctness rules, a new internal
 predicate-page fetch planner module, and its own bench-driven
 promotion gates and architectural lockdown guards.
 
+ADR 064 (Nullable Sparse Projection) is now shipped and
+composes multiplicatively with ADR 063 on byte economy. When
+ADR 063's predicate-page planner produces an exact-COCD
+survival mask on a nullable predicate column (`IS NULL` /
+`IS NOT NULL` / value-comparison `Maybe`), ADR 064's sparse
+projection planner consumes that mask and narrows projection
+fetch on nullable columns. Page null counts are *not* used to
+skip ADR 064 validity fetches — that would couple projection
+nullability to ADR 063's fixed-width page-stat catalog. The
+ADR 064 bench artifact at
+`plans/impl/064_nullable_sparse_projection_bench_results.md`
+records ExactMatch-driven and Maybe-driven projection pages
+as separate rows, documenting the asymmetry: an ADR 063
+ExactMatch page can reduce predicate bytes to zero while
+ADR 064 still fetches selected projection value bytes plus
+validity bits for the surviving row span.
+
 ## Context
 
 ADR 056 ships per-row-group min/max/null stats in

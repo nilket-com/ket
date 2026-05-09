@@ -34,6 +34,31 @@ deferred; ADR 063 narrows predicate bytes before mask
 construction rather than mixing dense predicate batches into
 projection fetch.
 
+ADR 064 (Nullable Sparse Projection) is now implemented and
+promoted, lifting ADR 060's
+`SparseProjectionFetchDecline::NullableProjectedColumn`
+decline for fixed-width projection columns. The planner
+fetches and re-bases raw Arrow validity bitmap slices
+alongside selected value pages; the page materializer
+assembles nullable Arrow arrays without using dense row-group
+buffers. V1 is raw byte-addressable validity only — validity
+buffers with `EncodingDirectory` entries decline to dense
+behind a private planner reason. Row groups with
+`column_null_counts == 0` for nullable Arrow fields stay on
+the existing all-valid sparse path with zero validity-byte
+fetches. Mask-first ordering preserved (`None` /
+`All` / `decoded_predicate_batches` declines unchanged). The
+bench artifact at
+`plans/impl/064_nullable_sparse_projection_bench_results.md`
+records 5.36x-19.98x plaintext-byte reduction and
+1.50x-5.45x wall-clock speedup at clustered 5% across
+BitPacked and Dictionary fixtures, with explicit
+ExactMatch-driven and Maybe-driven projection page rows
+documenting the multiplicative composition with ADR 063.
+Encoded-validity page decoding, variable-width sparse
+projection, all-null page-skip, and dense predicate-zip
+remain V2.
+
 ## Context
 
 The Toron-pivot stretch shipped a four-layer storage

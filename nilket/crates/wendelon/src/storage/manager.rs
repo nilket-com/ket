@@ -89,9 +89,10 @@ use crate::storage::encoding::materialize::ipc_stream_contains_encoding_director
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
-	decode_page_fetch, empty_projected_batch_for_requirement, encoded_page_body_range,
-	extract_record_body_bytes as extract_encoded_page_bytes, fixed_width_non_null_value_column,
-	projected_page_batch_from_decoded_buffers, required_projected_physical_ordinals,
+	PageValidityBitmap, decode_page_fetch, empty_projected_batch_for_requirement,
+	encoded_page_body_range, extract_record_body_bytes as extract_encoded_page_bytes,
+	fixed_width_encoding_indexed_value_column, projected_page_batch_from_decoded_buffers,
+	rebase_validity_bitmap, required_projected_physical_ordinals,
 };
 use crate::storage::encoding::predicate_page_fetch::{
 	PagePredicateClassification, PredicatePageFetchPlan, PredicatePageMaskSlice,
@@ -12109,7 +12110,7 @@ fn build_encoding_indexed_page_plan(
 
 	let mut columns = Vec::with_capacity(physical_ordinals.len());
 	for physical_ordinal in physical_ordinals {
-		let column = fixed_width_non_null_value_column(record_directory, physical_ordinal)
+		let column = fixed_width_encoding_indexed_value_column(record_directory, physical_ordinal)
 			.ok_or(EncodingFallbackReason::UnsupportedArrowLayout)?;
 		columns.push(column);
 	}
@@ -12260,6 +12261,25 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 		let decoded = decode_page_fetch(fetch, &encoded)?;
 		decoded_pages.insert(fetch.key, decoded);
 	}
+	let mut decoded_validity_pages =
+		BTreeMap::<PageMaterializeBufferKey, PageValidityBitmap>::new();
+	for fetch in &plan.validity_fetches {
+		if fetch.page.value_count.get() != fetch.page_row_count.get() {
+			return Err(arrow::error::ArrowError::SchemaError(format!(
+				"sparse projection validity fetch page row count {} disagrees with page descriptor {}",
+				fetch.page_row_count.get(),
+				fetch.page.value_count.get()
+			)));
+		}
+		let fetched =
+			extract_encoded_page_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
+		let validity = rebase_validity_bitmap(
+			&fetched,
+			fetch.bit_offset,
+			fetch.page_row_count.get() as usize,
+		)?;
+		decoded_validity_pages.insert(fetch.key, validity);
+	}
 
 	let mut filtered = Vec::new();
 	let mut template = None;
@@ -12285,6 +12305,8 @@ fn materialize_sparse_projection_pages<B: AsRef<[u8]>>(
 				page_key,
 				page.value_count.get() as usize,
 				&decoded_pages,
+				&decoded_validity_pages,
+				&plan.all_valid_nullable_pages,
 			)?;
 			template.get_or_insert_with(|| page_batch.clone());
 			let start = page.first_value_index.get() as usize;
@@ -12347,6 +12369,8 @@ fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
 		let decoded = decode_page_fetch(fetch, &encoded)?;
 		decoded_pages.insert(fetch.key, decoded);
 	}
+	let decoded_validity_pages = BTreeMap::<PageMaterializeBufferKey, PageValidityBitmap>::new();
+	let all_valid_nullable_pages = BTreeSet::<PageMaterializeBufferKey>::new();
 
 	let mut page_batches = BTreeMap::<PageMaterializeKey, ProjectedRecordBatch>::new();
 	for page_key in plan.row_pages.iter().map(|row| row.page_key) {
@@ -12372,6 +12396,8 @@ fn materialize_encoding_indexed_pages<B: AsRef<[u8]>>(
 			page_key,
 			page_fetch.page.value_count.get() as usize,
 			&decoded_pages,
+			&decoded_validity_pages,
+			&all_valid_nullable_pages,
 		)?;
 		page_batches.insert(page_key, page_batch);
 	}
@@ -19026,7 +19052,7 @@ mod tests {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("selector", DataType::Int64, false),
-			Field::new("payload", DataType::Int64, false),
+			Field::new("payload", DataType::Int64, true),
 		]);
 		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
 			TableObjectId::new([0x84; 16]),
@@ -19051,8 +19077,8 @@ mod tests {
 			vec![
 				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
 				Arc::new(Int64Array::from_iter_values(selector.iter().copied())) as Arc<dyn Array>,
-				Arc::new(Int64Array::from_iter_values(
-					(0..row_count).map(|row| (row % 128) as i64),
+				Arc::new(Int64Array::from_iter(
+					(0..row_count).map(|row| (row % 11 != 0).then_some((row % 128) as i64)),
 				)) as Arc<dyn Array>,
 			],
 		)
@@ -19228,6 +19254,24 @@ mod tests {
 					&& encoding.encoded_range.len < encoding.decoded_byte_len
 			})
 			.expect("payload value buffer should be page-encoded");
+		let payload_null_ordinal = directory.column_to_buffers[2].first_buffer_ordinal;
+		let payload_null_page = page_directory
+			.buffer_pages
+			.iter()
+			.find(|page| {
+				page.row_group_index == payload_encoding.row_group_index
+					&& page.ipc_column_ordinal == payload_encoding.ipc_column_ordinal
+					&& page.ipc_buffer_ordinal == payload_null_ordinal
+					&& page.range.len.get() > 0
+			})
+			.expect("payload validity buffer page");
+		assert!(
+			body_ranges_overlap(
+				&plan.phase_c_fetch.selected_plaintext_ranges,
+				payload_null_page.range
+			),
+			"sparse projection should fetch the projected nullable column validity bitmap"
+		);
 		let payload_page = page_directory
 			.buffer_pages
 			.iter()
@@ -19799,6 +19843,21 @@ mod tests {
 				&& range
 					.end()
 					.is_ok_and(|range_end| range_end >= candidate_end)
+		})
+	}
+
+	fn body_ranges_overlap(
+		ranges: &[crate::storage::row_group::RecordBodyByteRange],
+		candidate: crate::storage::row_group::RecordBodyByteRange,
+	) -> bool {
+		let Ok(candidate_end) = candidate.end() else {
+			return false;
+		};
+		ranges.iter().any(|range| {
+			let Ok(range_end) = range.end() else {
+				return false;
+			};
+			range.start.get() < candidate_end && candidate.start.get() < range_end
 		})
 	}
 

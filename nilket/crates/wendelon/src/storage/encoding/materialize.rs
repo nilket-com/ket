@@ -125,10 +125,15 @@ pub fn find_buffer_encoding<'a>(
 	directory: &'a EncodingDirectory,
 	row_group_index: RowGroupIndex,
 	buffer_ordinal: IpcBufferIndex,
-	_buffer_range: RecordBodyByteRange,
+	buffer_range: RecordBodyByteRange,
 ) -> Option<&'a BufferEncoding> {
 	directory.buffers.iter().find(|encoding| {
-		encoding.row_group_index == row_group_index && encoding.ipc_buffer_ordinal == buffer_ordinal
+		encoding.row_group_index == row_group_index
+			&& encoding.ipc_buffer_ordinal == buffer_ordinal
+			&& encoding
+				.encoded_range
+				.end()
+				.is_ok_and(|encoded_end| encoded_end <= buffer_range.len.get())
 	})
 }
 

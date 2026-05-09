@@ -38,10 +38,17 @@ Inherits substrate:
 
 ## Status
 
-Council-converged across Claude / Codex / Gemini after six
-iterations. Ready for Phase 0 audit and implementation.
-Phase 0 is a fork-resolution gate, not an implementation-
-time scope expansion.
+Shipped 2026-05-09. Implementation, tests, architecture
+guards, and bench evidence landed together. Evidence is
+recorded at
+`plans/impl/064_nullable_sparse_projection_bench_results.md`.
+Phase 0 fork-resolution audit confirmed raw byte-
+addressable validity is a non-no-op V1 engagement path
+against current writer output. Headline bench result:
+clustered 5% nullable sparse projection 5.36x-19.98x
+plaintext-byte reduction (value + validity combined),
+1.50x-5.45x wall-clock speedup across BitPacked and
+Dictionary fixtures.
 
 Implementation contract:
 

@@ -16,7 +16,9 @@ fn sparse_projection_fetch_target_binds_planner_unit_matrix() {
 		"DensePredicateBatchPresent",
 		"CascadeNotPageEmitting",
 		"CascadeNotProjectionEligible",
-		"NullableProjectedColumn",
+		"EncodedValidityBufferUnsupported",
+		"ValidityBufferRangeMissing",
+		"NullableTypeNotInCatalog",
 		"VariableWidthProjectedColumn",
 		"PageGeometryMismatchAcrossColumns",
 		"ByteEstimateNotSparse",
@@ -27,6 +29,8 @@ fn sparse_projection_fetch_target_binds_planner_unit_matrix() {
 		"Disabled",
 		"none_mask_short_circuits_before_projection_column_eligibility",
 		"clustered_mask_selects_only_touched_projection_pages",
+		"nullable_projection_declines_when_validity_range_is_missing",
+		"encoded_validity_detection_for_one_row_group_does_not_poison_another",
 		"fragmented_mask_declines_before_tiered_range_planning",
 	] {
 		assert!(
@@ -65,7 +69,10 @@ fn sparse_projection_fetch_target_binds_helper_split() {
 		"decode_page_fetch",
 		"projected_page_batch_from_decoded_buffers",
 		"required_projected_physical_ordinals",
-		"fixed_width_non_null_value_column",
+		"fixed_width_sparse_projection_column",
+		"fixed_width_encoding_indexed_value_column",
+		"validity_bitmap_body_range_for_page",
+		"rebase_validity_bitmap",
 	] {
 		assert!(
 			helper.contains(required),

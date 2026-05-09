@@ -1,7 +1,7 @@
 use crate::crypto::TieredPlaintextRange;
 use crate::schema::{
 	IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal, RecordBodyByteLen,
-	RecordBodyByteOffset, RowGroupIndex,
+	RecordBodyByteOffset, RowGroupIndex, RowGroupRowCount,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, IpcBufferRange, ProjectedRecordBatch,
@@ -14,7 +14,7 @@ use crate::storage::row_group::RecordBodyByteRange;
 use arrow::array::new_null_array;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatchOptions;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,6 +38,7 @@ pub(crate) struct PageMaterializeColumn {
 	pub value_buffer_ordinal: IpcBufferIndex,
 	pub bytes_per_value: usize,
 	pub data_type: DataType,
+	pub nullable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,21 @@ pub(crate) struct PageMaterializeFetch {
 	pub page: EncodingPageDescriptor,
 	pub bytes_per_value: usize,
 	pub data_type: DataType,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PageMaterializeValidityFetch {
+	pub key: PageMaterializeBufferKey,
+	pub body_range: RecordBodyByteRange,
+	pub page: EncodingPageDescriptor,
+	pub bit_offset: u8,
+	pub page_row_count: RowGroupRowCount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PageValidityBitmap {
+	pub bytes: Vec<u8>,
+	pub null_count: usize,
 }
 
 pub(crate) fn fixed_width_value_bytes(data_type: &DataType) -> Option<usize> {
@@ -105,20 +121,17 @@ pub(crate) fn required_projected_physical_ordinals(
 	Some(out)
 }
 
-pub(crate) fn fixed_width_non_null_value_column(
+pub(crate) fn fixed_width_sparse_projection_column(
 	directory: &RecordBufferDirectory,
 	physical_ordinal: usize,
 ) -> Option<PageMaterializeColumn> {
 	let field = directory.ipc_schema.fields().get(physical_ordinal)?;
-	if directory
+	let nullable = directory
 		.column_null_counts
 		.get(physical_ordinal)
 		.copied()
 		.unwrap_or(usize::MAX)
-		!= 0
-	{
-		return None;
-	}
+		!= 0;
 	let bytes_per_value = fixed_width_value_bytes(field.data_type())?;
 	let mapping = directory.column_to_buffers.get(physical_ordinal)?;
 	if mapping.buffer_count != 2 {
@@ -133,7 +146,26 @@ pub(crate) fn fixed_width_non_null_value_column(
 		value_buffer_ordinal,
 		bytes_per_value,
 		data_type: field.data_type().clone(),
+		nullable,
 	})
+}
+
+pub(crate) fn fixed_width_encoding_indexed_value_column(
+	directory: &RecordBufferDirectory,
+	physical_ordinal: usize,
+) -> Option<PageMaterializeColumn> {
+	if directory
+		.column_null_counts
+		.get(physical_ordinal)
+		.copied()
+		.unwrap_or(usize::MAX)
+		!= 0
+	{
+		return None;
+	}
+	let mut column = fixed_width_sparse_projection_column(directory, physical_ordinal)?;
+	column.nullable = false;
+	Some(column)
 }
 
 pub(crate) fn encoded_page_body_range(
@@ -153,6 +185,82 @@ pub(crate) fn encoded_page_body_range(
 		),
 		len: page.byte_range.len,
 	}
+}
+
+pub(crate) fn validity_bitmap_body_range_for_page(
+	validity_buffer_range: RecordBodyByteRange,
+	page: EncodingPageDescriptor,
+) -> Result<(RecordBodyByteRange, u8), arrow::error::ArrowError> {
+	let bit_start = u64::from(page.first_value_index.get());
+	let bit_len = u64::from(page.value_count.get());
+	let byte_start = bit_start / 8;
+	let bit_offset = (bit_start % 8) as u8;
+	let byte_len = (u64::from(bit_offset)
+		.checked_add(bit_len)
+		.and_then(|bits| bits.checked_add(7))
+		.ok_or_else(|| {
+			arrow::error::ArrowError::SchemaError("validity bitmap byte span overflow".into())
+		})?) / 8;
+	let byte_end = byte_start.checked_add(byte_len).ok_or_else(|| {
+		arrow::error::ArrowError::SchemaError("validity bitmap byte span overflow".into())
+	})?;
+	if byte_end > validity_buffer_range.len.get() {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"validity bitmap span {}..{} exceeds buffer length {}",
+			byte_start,
+			byte_end,
+			validity_buffer_range.len.get()
+		)));
+	}
+	let start = validity_buffer_range
+		.start
+		.get()
+		.checked_add(byte_start)
+		.ok_or_else(|| {
+			arrow::error::ArrowError::SchemaError("validity bitmap body range overflow".into())
+		})?;
+	Ok((
+		RecordBodyByteRange {
+			start: RecordBodyByteOffset::new(start),
+			len: RecordBodyByteLen::new(byte_len),
+		},
+		bit_offset,
+	))
+}
+
+pub(crate) fn rebase_validity_bitmap(
+	fetched: &[u8],
+	bit_offset: u8,
+	rows: usize,
+) -> Result<PageValidityBitmap, arrow::error::ArrowError> {
+	if bit_offset >= 8 {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"validity bitmap bit offset {bit_offset} is out of range"
+		)));
+	}
+	let required_bits = usize::from(bit_offset).checked_add(rows).ok_or_else(|| {
+		arrow::error::ArrowError::SchemaError("validity bitmap bit count overflow".into())
+	})?;
+	let required_bytes = required_bits.div_ceil(8);
+	if fetched.len() < required_bytes {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"validity bitmap fetched {} bytes but {} required",
+			fetched.len(),
+			required_bytes
+		)));
+	}
+	let mut bytes = vec![0_u8; rows.div_ceil(8)];
+	let mut null_count = 0_usize;
+	for row in 0..rows {
+		let source_bit = usize::from(bit_offset) + row;
+		let valid = (fetched[source_bit / 8] & (1_u8 << (source_bit % 8))) != 0;
+		if valid {
+			bytes[row / 8] |= 1_u8 << (row % 8);
+		} else {
+			null_count = null_count.saturating_add(1);
+		}
+	}
+	Ok(PageValidityBitmap { bytes, null_count })
 }
 
 pub(crate) fn decode_page_fetch(
@@ -189,6 +297,8 @@ pub(crate) fn projected_page_batch_from_decoded_buffers(
 	page_key: PageMaterializeKey,
 	page_row_count: usize,
 	decoded_pages: &BTreeMap<PageMaterializeBufferKey, Vec<u8>>,
+	decoded_validity_pages: &BTreeMap<PageMaterializeBufferKey, PageValidityBitmap>,
+	all_valid_nullable_pages: &BTreeSet<PageMaterializeBufferKey>,
 ) -> Result<ProjectedRecordBatch, arrow::error::ArrowError> {
 	let mut buffers = vec![
 		IpcBufferRange {
@@ -223,7 +333,36 @@ pub(crate) fn projected_page_batch_from_decoded_buffers(
 	let mut column_null_counts = record_directory.column_null_counts.clone();
 	for column in columns {
 		if let Some(null_count) = column_null_counts.get_mut(column.physical_ordinal) {
-			*null_count = 0;
+			if column.nullable {
+				let key = PageMaterializeBufferKey {
+					row_group_index: page_key.row_group_index,
+					ipc_column_ordinal: IpcColumnOrdinal::new(column.physical_ordinal as u32),
+					ipc_buffer_ordinal: column.null_buffer_ordinal,
+					page_index: page_key.page_index,
+				};
+				if let Some(validity) = decoded_validity_pages.get(&key) {
+					*null_count = validity.null_count;
+					if validity.null_count > 0 {
+						buffers[column.null_buffer_ordinal.get() as usize] = IpcBufferRange {
+							offset_in_record: IpcBufferOffset::ZERO,
+							length: IpcBufferLength::new(validity.bytes.len() as u64),
+						};
+						buffer_set.insert(column.null_buffer_ordinal, validity.bytes.clone());
+					}
+				} else if all_valid_nullable_pages.contains(&key) {
+					*null_count = 0;
+					buffers[column.null_buffer_ordinal.get() as usize] = IpcBufferRange {
+						offset_in_record: IpcBufferOffset::ZERO,
+						length: IpcBufferLength::ZERO,
+					};
+				} else {
+					return Err(arrow::error::ArrowError::SchemaError(
+						"decoded validity page missing for projected column".into(),
+					));
+				}
+			} else {
+				*null_count = 0;
+			}
 		}
 	}
 	let scoped = RecordBufferDirectory {
@@ -404,4 +543,114 @@ pub(crate) fn empty_projected_batch_for_requirement(
 		ordinal_mapping: ColumnOrdinalMapping::new(descriptor_to_physical),
 		storage_mapping,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::schema::{
+		BufferValueCount, BufferValueIndex, EncodingPageByteOffset, EncodingPageIndex,
+		RecordBodyByteLen, RecordBodyByteOffset,
+	};
+	use crate::storage::encoding::EncodedBufferByteRange;
+
+	fn page(first_value_index: u32, value_count: u32) -> EncodingPageDescriptor {
+		EncodingPageDescriptor {
+			page_index: EncodingPageIndex::ZERO,
+			first_value_index: BufferValueIndex::new(first_value_index),
+			value_count: BufferValueCount::new(value_count),
+			byte_range: EncodedBufferByteRange {
+				start: EncodingPageByteOffset::ZERO,
+				len: RecordBodyByteLen::ZERO,
+			},
+		}
+	}
+
+	#[test]
+	fn validity_body_range_handles_non_byte_aligned_page_start() {
+		let (range, bit_offset) = validity_bitmap_body_range_for_page(
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(100),
+				len: RecordBodyByteLen::new(300),
+			},
+			page(1025, 1025),
+		)
+		.unwrap();
+		assert_eq!(bit_offset, 1);
+		assert_eq!(
+			range,
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(228),
+				len: RecordBodyByteLen::new(129),
+			}
+		);
+	}
+
+	#[test]
+	fn validity_body_range_rejects_span_past_buffer_end() {
+		let err = validity_bitmap_body_range_for_page(
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(100),
+				len: RecordBodyByteLen::new(1),
+			},
+			page(8, 1),
+		)
+		.unwrap_err();
+		assert!(err.to_string().contains("exceeds buffer length"));
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_shifts_to_page_local_zero() {
+		let bitmap = rebase_validity_bitmap(&[0b0010_1101], 1, 4).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b0000_0110]);
+		assert_eq!(bitmap.null_count, 2);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_handles_byte_aligned_mixed_page() {
+		let bitmap = rebase_validity_bitmap(&[0b0000_0101], 0, 4).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b0000_0101]);
+		assert_eq!(bitmap.null_count, 2);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_preserves_all_valid_page() {
+		let bitmap = rebase_validity_bitmap(&[0b1111_1111], 3, 4).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b0000_1111]);
+		assert_eq!(bitmap.null_count, 0);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_counts_all_null_page() {
+		let bitmap = rebase_validity_bitmap(&[0], 0, 4).unwrap();
+		assert_eq!(bitmap.bytes, vec![0]);
+		assert_eq!(bitmap.null_count, 4);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_handles_bit_offset_seven_tail_page() {
+		let bitmap = rebase_validity_bitmap(&[0b1000_0000, 0b0000_0010], 7, 3).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b0000_0101]);
+		assert_eq!(bitmap.null_count, 1);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_handles_alternating_nulls() {
+		let bitmap = rebase_validity_bitmap(&[0b0101_0101], 0, 8).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b0101_0101]);
+		assert_eq!(bitmap.null_count, 4);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_handles_clustered_nulls() {
+		let bitmap = rebase_validity_bitmap(&[0b1111_0000], 0, 8).unwrap();
+		assert_eq!(bitmap.bytes, vec![0b1111_0000]);
+		assert_eq!(bitmap.null_count, 4);
+	}
+
+	#[test]
+	fn rebase_validity_bitmap_rejects_short_fetch() {
+		let err = rebase_validity_bitmap(&[], 1, 1).unwrap_err();
+		assert!(err.to_string().contains("required"));
+	}
 }

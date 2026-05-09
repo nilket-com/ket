@@ -4470,9 +4470,15 @@ fn test_adr060_sparse_projection_fetch_guards() {
 		"PageMaterializeBufferKey",
 		"PageMaterializeColumn",
 		"PageMaterializeFetch",
+		"PageMaterializeValidityFetch",
+		"PageValidityBitmap",
 		"decode_page_fetch",
 		"projected_page_batch_from_decoded_buffers",
 		"extract_record_body_bytes",
+		"fixed_width_sparse_projection_column",
+		"fixed_width_encoding_indexed_value_column",
+		"validity_bitmap_body_range_for_page",
+		"rebase_validity_bitmap",
 		"empty_projected_batch_for_row_count",
 	] {
 		if !page_materialize.contains(required) {
@@ -4503,6 +4509,11 @@ fn test_adr060_sparse_projection_fetch_guards() {
 		"pub(crate) fn decide_sparse_projection_fetch",
 		"mask_to_active_pages",
 		"projection_cascade_eligible",
+		"validity_fetches",
+		"EncodedValidityBufferUnsupported",
+		"ValidityBufferRangeMissing",
+		"NullableTypeNotInCatalog",
+		"all_valid_nullable_pages",
 		"ByteEstimateNotSparse",
 		"PerBufferFragmentationCapExceeded",
 	] {
@@ -4515,6 +4526,9 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	for forbidden in [
 		"decode_page_fetch(",
 		"projected_page_batch_from_decoded_buffers(",
+		"AllNull",
+		"all_null_page",
+		"all_null",
 		"pub struct Config",
 		"sparse_phase",
 		"SparsePhase",
@@ -4531,6 +4545,8 @@ fn test_adr060_sparse_projection_fetch_guards() {
 		"materialize_sparse_projection_pages",
 		"dense_predicate_batches_present",
 		"predicate_outcome: &phase_b_outcome",
+		"plan.validity_fetches",
+		"rebase_validity_bitmap",
 		"observe_storage_l2_encoding_simd_pages_fetched",
 	] {
 		if !manager.contains(required) {
@@ -4570,6 +4586,12 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	}
 	if metrics.contains("sparse_projection") || metrics.contains("sparse_projection_fetch") {
 		violations.push("ADR 060 must not add sparse-specific metric labels".to_string());
+	}
+	if page_materialize.contains("NullableProjectedColumn")
+		|| sparse_projection.contains("NullableProjectedColumn")
+		|| manager.contains("NullableProjectedColumn")
+	{
+		violations.push("ADR 064 must not restore NullableProjectedColumn".to_string());
 	}
 
 	assert!(
