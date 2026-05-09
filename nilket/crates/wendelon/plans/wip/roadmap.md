@@ -19,6 +19,83 @@ forward-sequence rewrite.
 
 ## Where we are
 
+ADR 063 (Page-Level Predicate Stats + Predicate-Fetch
+Narrowing) is council-converged across Claude / Codex /
+Gemini after five council iterations. Implementation phases
+pending. Amends ADR 057 with an additive
+`BufferEncoding.page_stats: Vec<EncodingPageStats>` field and
+an `ENCODING_DIRECTORY_FORMAT_VERSION` bump (no compat
+decoder per `no-premature-backward-compat.md`). Adds an
+internal predicate-page fetch planner inside
+`L2FetchStrategy::RowGroup`'s Phase B that narrows encoded
+predicate fetch to surviving pages before survival-mask
+construction. **Three-state classification**: `Disjoint`
+(stats prove false → `EncodedRowMask::None` slice),
+`ExactMatch` (stats prove true for every row, with
+null-position-conservative correctness → `EncodedRowMask::All`
+slice), `Maybe` (fetch + COCD evaluate). For value
+comparisons, `ExactMatch` requires `null_count == 0`; for
+null predicates, `IS NULL` requires
+`null_count == page_value_count` and `IS NOT NULL` requires
+`null_count == 0`. **Cascade eligibility = intersection of ADR 059's default
+predicate allow-list AND `EncodingCascade::emits_pages_in_v1()`**:
+the V1 intersection is `BitPacked`, `DictionaryPlain`,
+`DictionaryBitPacked`. `Delta` is allow-listed but does not
+emit pages in V1 (would require an ADR 057 amendment); RLE
+byte-run is page-emitting but not allow-listed (Phase 10
+evidence missed the gate); both carry empty `page_stats`.
+**Type catalog = fixed-width subset of ADR 056's
+`default_stats_supported_types`**: Int8/16/32/64,
+UInt8/16/32/64, Timestamp(ms/us/ns), Date32/64, Boolean.
+Float and `Time` types are out of scope (not in ADR 056
+support). UTF-8 / LargeUtf8 / Binary / LargeBinary continue
+to receive ADR 056 row-group stats but no page stats in V1. **Shared
+`CanonicalScalar`**: row-group `CanonicalScalar` helpers
+move to `src/storage/stats.rs`; row-group + page stats use
+the same encoding path (single-source architectural-test
+guard). **Predicate-page planner**: lives at
+`src/storage/encoding/predicate_page_fetch.rs` (sibling to
+ADR 060's `sparse_projection_fetch.rs`); production read
+path consults it before issuing dense predicate fetch;
+declines fall through to existing dense path; engaged narrowed
+plan returns mask-only `PhaseBOutcome` with no dense predicate
+batches. **Phase 0 size-model + profile-emission gate is the sole
+V1 budget discipline**: pre-code modeling on representative
+fixtures must show (1) combined directory bytes fit ADR
+044's 64 KiB initial-probe envelope with page-stats fraction
+≤ 4% of record body, AND (2) `PointRead`-profile win/cost
+ratio justifies emission (≥ 1.5× modeled clustered-5%
+reduction) — otherwise the ADR is revised pre-code to
+narrow scope (e.g., `Scan`-only emission, narrower type
+catalog, or further cascade narrowing). The profile-emission
+scope is fixed in Phase 0 and not revisited at promotion. V1
+does **not** add a runtime per-record budget fallback,
+profile-keyed runtime omission, partial per-column
+heuristic, operator knob, metric label, or public fallback
+variant — Wendelon V1 house style is gate-driven (matching
+ADR 062 deterministic profile emission, ADR 060 plan-time
+decline). **Writer eligibility ≠ reader narrowing**: a
+buffer may carry stats and still see its predicate-page
+planner decline at plan time (additional COCD/predicate/
+economic gates); that is not a writer misconfiguration.
+**Composability with ADR 060**: page-stat-narrowed
+predicate fetch becomes an additional upstream source of
+exact masks for ADR 060's sparse projection planner. **Closed
+surface**: no new on-disk shape (one additive directory
+field), no new IPC custom_metadata key, no new wire /
+descriptor / PBC / capability / `ObjectStore` trait change;
+no new `RowGroupRejectCode` / `RowGroupFallbackReason` /
+`EncodingRejectCode` / `EncodingFallbackReason` /
+`EncodingComputeRejectCode` /
+`EncodingComputeFallbackReason` / `L2FetchStrategy` /
+`EncodedRowMask` / `EncodingCascadeKind` /
+`EncodingComputeEvaluatorKind` / `EncodedAggregateKind` /
+`PredicateAtomOp` variant. ADR 022 / ADR 056 directory
+shapes unchanged. **`enabled = false` writer default**
+carried forward from ADR 056 / 062. See
+`plans/adr/063_page_level_predicate_stats.md` and
+`plans/impl/063_page_level_predicate_stats.md`.
+
 ADR 062 (Row-Group Sizing Profile) is implemented and
 promoted to shipped with bench evidence at
 `plans/impl/062_row_group_sizing_profile_bench_results.md`.
@@ -669,11 +746,11 @@ triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–17 are promoted and shipped (in `plans/adr/`
-with implementation merged). ADR 061 closes the current storage-
-hierarchy ciphertext-floor follow-up. ADR 062 is council-
-converged with implementation phases pending. The forward shape
-continues at #19.
+Gemini. Steps 1–18 are promoted and shipped (in `plans/adr/`
+with implementation merged). ADR 062 closes the row-group
+sizing question opened by ADR 061. ADR 063 is council-
+converged with implementation phases pending. The forward
+shape continues at #20.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -992,7 +1069,54 @@ continues at #19.
     030 describes hardware support envelopes; ADR 062
     describes access-pattern shape). See *Where we are*.
 
-19. **Capacity-tier compression + serverless / erasure-
+19. **Page-level predicate stats + predicate-fetch
+    narrowing** — ADR 063 council-converged across Claude
+    / Codex / Gemini after five council iterations.
+    Implementation phases pending. Amends ADR 057 with an
+    additive `BufferEncoding.page_stats:
+    Vec<EncodingPageStats>` field and an
+    `ENCODING_DIRECTORY_FORMAT_VERSION` bump (no compat
+    decoder per `no-premature-backward-compat.md`). Adds an
+    internal predicate-page fetch planner inside
+    `L2FetchStrategy::RowGroup`'s Phase B that narrows
+    encoded predicate fetch to surviving pages before
+    survival-mask construction. Three-state classification
+    `Disjoint` / `ExactMatch` / `Maybe` with null-position-
+    conservative `ExactMatch` correctness (value comparisons
+    require `null_count == 0`; null predicates use
+    `null_count` directly). Cascade eligibility = intersection
+    of ADR 059's default predicate allow-list AND
+    `EncodingCascade::emits_pages_in_v1()` — V1 set is
+    `BitPacked`, `DictionaryPlain`, `DictionaryBitPacked`;
+    `Delta` is allow-listed but not page-emitting in V1, RLE
+    byte-run is page-emitting but not allow-listed, both carry
+    empty `page_stats`. Type catalog = fixed-width subset of
+    ADR 056's `default_stats_supported_types` (Int8-64 /
+    UInt8-64 / Timestamp(ms/us/ns) / Date32/64 / Boolean);
+    UTF-8 / Binary / LargeUtf8 / LargeBinary remain ADR 056
+    row-group-stats-only. Shared `CanonicalScalar` via
+    `src/storage/stats.rs`; row-group stat byte layout
+    unchanged. Predicate-page planner at
+    `src/storage/encoding/predicate_page_fetch.rs` (sibling
+    to ADR 060's `sparse_projection_fetch.rs`); production
+    read path consults it before dense predicate fetch;
+    engaged narrowed plan returns mask-only `PhaseBOutcome`,
+    preserving ADR 060 sparse projection downstream. Phase 0
+    size-model + profile-emission gate is the sole V1 budget
+    discipline; profile-emission scope (`PointRead` + `Scan`
+    or `Scan`-only) is decided in Phase 0 and not revisited
+    at promotion. If representative legal fixtures miss the
+    ADR 044 64 KiB initial-probe envelope or `PointRead`
+    win/cost is < 1.5×, ADR 063 is revised before code lands.
+    No runtime metadata-budget fallback in V1 (Wendelon V1
+    house style: gate-driven, not runtime-fallback-driven).
+    Closed surface: no new IPC custom_metadata key, no new
+    wire / descriptor / PBC / capability / `ObjectStore`
+    trait change; no new fallback / reject / catalog variant.
+    `enabled = false` writer default carried forward. See
+    *Where we are*.
+
+20. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
     - **zstd capacity-tier codec + `CompressionLevel`
@@ -1014,7 +1138,7 @@ continues at #19.
     *Each is its own ADR; ordering opportunistic and
     independent of #13 / #14 sequencing.*
 
-20. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+21. **CDC follow-up ADRs (consume ADR 054 substrate)** —
     deferred behind the storage hierarchy in the Toron-
     pivot stretch. Independent; each ships its own
     contract surface:
@@ -1070,18 +1194,18 @@ continues at #19.
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-21. **Vector embeddings + vector-form identity / locality
+22. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
     substrate (#8) and LSM (#11). **Set aside in the
     Toron-pivot stretch** — OLAP focus pulls
     compute-adjacent primitives ahead. Reopen after the
     storage hierarchy (ADR 056 / 057 / 058 / 059 / 060 /
-    061) is in production use and Toron compute-layer
-    requirements surface concrete vector workload
-    signals. *Large, multi-ADR.*
+    061 / 062 / 063) is in production use and Toron
+    compute-layer requirements surface concrete vector
+    workload signals. *Large, multi-ADR.*
 
-22. **Refinement plumbing (opportunistic, no ordering
+23. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -1442,8 +1566,10 @@ StateDigest substrate                            (ADR 046)
   → sparse projection fetch narrowing            (ADR 060)
   → page-aligned authenticated chunks            (ADR 061)
     + macro-block read coalescing
-  → row-group sizing profile                     (ADR 062)  ← here
-    PointRead / Scan                                       (council-converged;
+  → row-group sizing profile                     (ADR 062)
+    PointRead / Scan
+  → page-level predicate stats                   (ADR 063)  ← here
+    + predicate-fetch narrowing                            (council-converged;
                                                             implementation
                                                             phases pending)
   → capacity-tier compression / serverless / EC  (rest of old #14 bundle)
@@ -1452,42 +1578,59 @@ StateDigest substrate                            (ADR 046)
   → refinement plumbing
 ```
 
-Design tip is at ADR 062 (council-converged across five
+Design tip is at ADR 063 (council-converged across five
 iterations; implementation phases pending). The storage
-hierarchy is shipped through ADR 061 (row groups, per-buffer
+hierarchy is shipped through ADR 062 (row groups, per-buffer
 pages + encoding cascades, compute over encoded data substrate,
 native per-cascade kernels, sparse projection fetch narrowing,
-page-aligned AEAD chunks). ADR 062 amends ADR 056 with a closed
-two-variant `RowGroupSizingProfile { PointRead, Scan }` catalog
-and deployment-wide profile selection: `PointRead` preserves
-ADR 056 V1 defaults byte-identically (4K-row target tuned for
-ADR 052 point reads); `Scan` lifts sizing to 65K-row target +
-131K-row max + 1 MiB paging-bytes gate, tuned for ADR 061
-macro-block coalescer economics on warehouse-scale records.
-Per-record geometry-keyed selection deferred to V2 with explicit
-promotion gate. No directory / wire / descriptor / PBC /
-capability / `ObjectStore` trait / fallback / reject / catalog
-variant change. ADR 056 / 057 / 058 / 059 carry Phase 10 /
-Phase 8 bench evidence under `plans/impl/`; ADR 060's Phase 7
-artifact records the revised plaintext-byte gate, ciphertext-
-byte floor, and RLE default-off disposition; ADR 061's Phase 9
-artifact closes the ciphertext floor and macro-block coalescing
-gates.
+page-aligned AEAD chunks, deployment-wide row-group sizing
+profile). ADR 063 amends ADR 057 with an additive
+`BufferEncoding.page_stats` field (format-version bump, no
+compat decoder) and adds an internal predicate-page fetch
+planner that narrows Phase B predicate fetch to surviving
+pages before survival-mask construction. Three-state
+classification `Disjoint` / `ExactMatch` / `Maybe` with
+null-position-conservative `ExactMatch` correctness for value
+comparisons. Cascade eligibility = ADR 059 default predicate
+allow-list ∩ `EncodingCascade::emits_pages_in_v1()` — V1
+intersection is `BitPacked` + `DictionaryPlain` +
+`DictionaryBitPacked` (Delta is allow-listed but not
+page-emitting; RLE byte-run is page-emitting but not
+allow-listed; both excluded V1). Type catalog = fixed-width
+subset of ADR 056's stats support (no floats, no `Time`).
+Phase 0 size-model + profile-emission gate is the sole V1
+budget discipline; the `PointRead` vs `Scan`-only emission
+scope is fixed in Phase 0, not revisited at promotion (no
+runtime fallback per Wendelon V1 gate-driven house style). No new
+wire / descriptor / PBC / capability / `ObjectStore` trait /
+fallback / reject / catalog variant change. ADR 056 / 057 /
+058 / 059 carry Phase 10 / Phase 8 bench evidence under
+`plans/impl/`; ADR 060's Phase 7 artifact records the revised
+plaintext-byte gate, ciphertext-byte floor, and RLE
+default-off disposition; ADR 061's Phase 9 artifact closes
+the ciphertext floor and macro-block coalescing gates;
+ADR 062's bench evidence pinned the `Scan` target at
+65,536 rows.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
 default-enabled native-kernel set; ADR 060 closed the encoded-
 fetch follow-up with internal reader dispatch, no public surface
 change, and a strict plan-time byte-comparison gate; ADR 061
 closed the ciphertext-floor follow-up via the AEAD/network
-two-layer decoupling; ADR 062 closes the warehouse throughput
-follow-up that ADR 061 deferred to row-group sizing, via a
-deployment-wide access-pattern profile.
-**The council's lean on next pickup:** ADR 062 is now shipped;
-pick from the next Toron-adjacent follow-up family
-(page-level min/max/null stats, FSST evaluator, RLE value-run
-format, sparse predicate-column fetch, dense predicate-zip with
-sparse projection, nullable sparse projection — each its own
-ADR), or capacity-tier compression / serverless PBC / erasure-
+two-layer decoupling; ADR 062 closed the warehouse throughput
+follow-up that ADR 061 deferred to row-group sizing via a
+deployment-wide access-pattern profile; ADR 063 closes the
+predicate-fetch-narrowing follow-up that ADR 062's `Scan`
+profile makes load-bearing (65K-row groups × ~64 pages per
+buffer make page-grain pruning a 5–10× predicate-fetch byte
+reduction on clustered low-selectivity workloads).
+**The council's lean on next pickup:** ADR 063 implementation
+phases (Phase 0 size-model gate first, Phase 8 bench artifact
+last); or pick from the remaining Toron-adjacent follow-up
+family (FSST evaluator, RLE value-run format, sparse
+predicate-column fetch, dense predicate-zip with sparse
+projection, nullable sparse projection — each its own ADR);
+or capacity-tier compression / serverless PBC / erasure-
 coding work from the remaining old #14 bundle. CDC follow-ups
-(#20) and vector embeddings (#21) remain deferred behind the
+(#21) and vector embeddings (#22) remain deferred behind the
 storage hierarchy in this stretch.
