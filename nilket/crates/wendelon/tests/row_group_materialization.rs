@@ -1,4 +1,4 @@
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -115,6 +115,32 @@ fn page_directory() -> RecordPageDirectory {
 	}
 }
 
+fn page_directory_for_schema(schema: &Schema, rows: u64) -> RecordPageDirectory {
+	RecordPageDirectory {
+		record_id: TieredRecordId {
+			slab_id: SlabId::new(66),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		row_count: RowCount::new(rows),
+		row_groups: vec![RowGroupDirectoryEntry {
+			row_group_index: RowGroupIndex::new(0),
+			first_record_row_index: RecordRowIndex::ZERO,
+			row_count: RowGroupRowCount::new(rows as u32),
+			metadata_range: RecordBodyByteRange {
+				start: RecordBodyByteOffset::ZERO,
+				len: RecordBodyByteLen::new(1),
+			},
+			body_range: RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(1),
+				len: RecordBodyByteLen::new(1),
+			},
+		}],
+		buffer_pages: Vec::new(),
+		row_group_stats: Vec::new(),
+		logical_schema_fingerprint: descriptor(schema).logical_schema_fingerprint,
+	}
+}
+
 fn projected_output() -> ProjectedRecordBatch {
 	project_record_batch_for_requirement(&batch(), &output_requirement()).unwrap()
 }
@@ -196,6 +222,61 @@ fn phase_b_mask_filters_projected_phase_c_batch_without_rerunning_pbc() {
 	)
 	.unwrap();
 
+	let values = output
+		.batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.unwrap();
+	assert_eq!(values.values(), &[10, 30]);
+}
+
+#[test]
+fn fsst_mask_only_phase_b_filters_fixed_width_projection() {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("url", DataType::Utf8, false),
+		Field::new("value", DataType::Int64, false),
+	]));
+	let source = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+			Arc::new(StringArray::from(vec![
+				"/target", "/other", "/target", "/other",
+			])) as ArrayRef,
+			Arc::new(Int64Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+		],
+	)
+	.unwrap();
+	let fsst_requirement = ColumnFetchRequirement {
+		predicate_columns: ColumnOrdinalSet::from_columns([1]),
+		output_columns: ColumnOrdinalSet::from_columns([2]),
+		..ColumnFetchRequirement::default()
+	};
+	let phase_c_requirement = ColumnFetchRequirement {
+		output_columns: fsst_requirement.output_columns.clone(),
+		..ColumnFetchRequirement::default()
+	};
+	let projection = project_record_batch_for_requirement(&source, &phase_c_requirement).unwrap();
+	assert!(
+		projection.physical_for(1).is_none(),
+		"FSST Case A1 projection must not carry predicate column"
+	);
+	let group = RowGroupIndex::new(0);
+	let mut phase_b = PhaseBOutcome::default();
+	phase_b
+		.survival_masks
+		.insert(group, BooleanArray::from(vec![true, false, true, false]));
+	let output = apply_phase_b_masks_to_projected_row_groups(
+		vec![(group, projection)],
+		&phase_b,
+		&[group],
+		&page_directory_for_schema(schema.as_ref(), 4),
+	)
+	.unwrap();
+	assert_eq!(output.batch.num_columns(), 1);
+	assert_eq!(output.batch.schema().field(0).name(), "value");
 	let values = output
 		.batch
 		.column(0)

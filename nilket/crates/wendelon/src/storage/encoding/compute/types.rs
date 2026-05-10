@@ -24,16 +24,18 @@ pub enum EncodingComputeEvaluatorKind {
 	DictionaryPlain = 4,
 	DictionaryBitPacked = 5,
 	Delta = 6,
+	Fsst = 7,
 }
 
 impl EncodingComputeEvaluatorKind {
-	pub const ALL: [Self; 6] = [
+	pub const ALL: [Self; 7] = [
 		Self::BitPacked,
 		Self::RlePlain,
 		Self::RleBitPacked,
 		Self::DictionaryPlain,
 		Self::DictionaryBitPacked,
 		Self::Delta,
+		Self::Fsst,
 	];
 
 	pub const fn as_str(self) -> &'static str {
@@ -44,6 +46,7 @@ impl EncodingComputeEvaluatorKind {
 			Self::DictionaryPlain => "dictionary_plain",
 			Self::DictionaryBitPacked => "dictionary_bit_packed",
 			Self::Delta => "delta",
+			Self::Fsst => "fsst",
 		}
 	}
 
@@ -55,6 +58,7 @@ impl EncodingComputeEvaluatorKind {
 			"dictionary_plain" => Some(Self::DictionaryPlain),
 			"dictionary_bit_packed" => Some(Self::DictionaryBitPacked),
 			"delta" => Some(Self::Delta),
+			"fsst" => Some(Self::Fsst),
 			_ => None,
 		}
 	}

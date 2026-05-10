@@ -4432,6 +4432,115 @@ fn test_adr059_native_cocd_kernel_guards() {
 }
 
 #[test]
+fn test_adr066_fsst_evaluator_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let kernels_mod =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/mod.rs"))
+			.unwrap();
+	let fsst_kernel =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
+			.unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+
+	for required in ["Fsst = 7", "Self::Fsst", "\"fsst\" => Some(Self::Fsst)"] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 066 token {required}"
+			));
+		}
+	}
+	if compute_types.contains("EncodingComputeEvaluatorKind::Fsst,")
+		&& compute_types.contains("enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL")
+	{
+		violations.push(
+			"src/storage/encoding/compute/types.rs: Fsst must not be default-enabled by ALL"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub mod fsst;",
+		"parse_fsst_frame",
+		"decode_offsets",
+		"evaluate_fsst_equality",
+		"FsstDecodedByteReader",
+	] {
+		if !kernels_mod.contains(required) && !fsst_kernel.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: missing ADR 066 token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodingCascade::Fsst { .. } => Some(EncodingComputeEvaluatorKind::Fsst)",
+		"evaluate_fsst_predicate",
+		"PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList",
+		"string_like_data_type_supported",
+	] {
+		if !dispatch.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/dispatch.rs: missing ADR 066 dispatch token {required}"
+			));
+		}
+	}
+	for required in [
+		"FsstValues",
+		"FsstOffsets",
+		"offsets_buffer_ordinal",
+		"output_columns.contains(*column_index as u32)",
+		"EncodingComputeEvaluatorKind::Fsst",
+		"evaluate_fsst_predicate(",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 066 manager token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"symbol_table_byte_len",
+		"materialize_encoding_buffer",
+		"pre_encoded",
+		"encoded_literal",
+	] {
+		if fsst_kernel.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: forbidden ADR 066 token {forbidden}"
+			));
+		}
+	}
+	for required in ["\"fsst\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 066 metric token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("Fsst {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,")
+		|| !encoding_types.contains("Fsst = 7")
+	{
+		violations.push(
+			"src/storage/encoding/types.rs: ADR 057 FSST cascade layout must remain unchanged"
+				.to_string(),
+		);
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 066 FSST evaluator invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
 fn test_adr060_sparse_projection_fetch_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let mut violations = Vec::new();

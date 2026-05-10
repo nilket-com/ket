@@ -1736,8 +1736,10 @@ const ENCODING_COMPUTE_KERNEL_LABELS: &[&str] = &[
 	"dictionary_plain",
 	"dictionary_bit_packed",
 	"delta",
+	"fsst",
 ];
-const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] = &["bit_packed", "rle", "dictionary", "delta"];
+const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] =
+	&["bit_packed", "rle", "dictionary", "delta", "fsst"];
 const ENCODING_COMPUTE_ROW_KINDS: &[&str] = &["scanned", "selected", "avoided", "materialized"];
 const ENCODING_COMPUTE_AGGREGATES: &[&str] = &[
 	"count_star",

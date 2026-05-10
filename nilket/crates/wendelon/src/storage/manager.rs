@@ -63,12 +63,13 @@ use crate::schema::{
 	TableLifecycleCatalog, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
 };
 use crate::storage::columnar::{
-	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnarFallbackReason, L2ColumnFetchConfig,
-	L2FetchStrategy, PlaintextByteRange, ProjectedRecordBatch, RecordBufferDirectory,
-	StorageColumn, TieredRecordId, build_column_fetch_plan, decode_projected_record_batch,
-	decode_projected_record_batch_from_plaintext_ranges, initial_metadata_probe_plan,
-	next_metadata_probe_plan, observe_l2_fetch_strategy, parse_record_buffer_directory,
-	pick_l2_fetch_strategy, selected_record_body_ranges, survival_mask_projected_record_batch,
+	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
+	L2ColumnFetchConfig, L2FetchStrategy, PlaintextByteRange, ProjectedRecordBatch,
+	RecordBufferDirectory, StorageColumn, TieredRecordId, build_column_fetch_plan,
+	decode_projected_record_batch, decode_projected_record_batch_from_plaintext_ranges,
+	initial_metadata_probe_plan, next_metadata_probe_plan, observe_l2_fetch_strategy,
+	parse_record_buffer_directory, pick_l2_fetch_strategy, selected_record_body_ranges,
+	survival_mask_projected_record_batch,
 };
 use crate::storage::core::{
 	GroupCommitConfig, LocalSlabStore, MultiRowIndexEntry, RecordLocation, RecoveredSlabEntry,
@@ -80,8 +81,9 @@ use crate::storage::encoding::compute::{
 	EncodingComputeRejectCode, NativeEvaluationEligibility, PredicateAtom, aggregate_kind_for_tag,
 	coerce_literal, decode_encoded_buffer, encoded_leaf_selectivity_allowed,
 	encoded_predicate_node_from_tree, evaluate as evaluate_encoded_predicate,
-	evaluate_validity_bitmap, evaluator_kind_for_cascade, native_aggregate_cascade_eligible,
-	native_evaluation_eligibility, try_fold_encoded_aggregate_request,
+	evaluate_fsst_predicate, evaluate_validity_bitmap, evaluator_kind_for_cascade,
+	native_aggregate_cascade_eligible, native_evaluation_eligibility,
+	try_fold_encoded_aggregate_request,
 };
 use crate::storage::encoding::directory::page_stats_cascade_eligible;
 use crate::storage::encoding::materialize::find_buffer_encoding;
@@ -6216,6 +6218,8 @@ enum EncodingComputePhaseBLeaf {
 	Encoded {
 		column_index: usize,
 		physical_ordinal: usize,
+		value_buffer_ordinal: IpcBufferIndex,
+		offsets_buffer_ordinal: Option<IpcBufferIndex>,
 		atom: PredicateAtom,
 		data_type: DataType,
 	},
@@ -6239,10 +6243,32 @@ enum EncodingComputePhaseBFetchKind {
 		encoding: BufferEncoding,
 		cascade: EncodingCascade,
 	},
+	FsstValues {
+		encoding: BufferEncoding,
+		cascade: EncodingCascade,
+	},
+	FsstOffsets {
+		encoding: Option<BufferEncoding>,
+		cascade: Option<EncodingCascade>,
+	},
 	Validity {
 		encoding: Option<BufferEncoding>,
 		cascade: Option<EncodingCascade>,
 	},
+}
+
+#[derive(Clone, Debug)]
+struct EncodingComputeFsstValueBytes {
+	bytes: Vec<u8>,
+	encoding: BufferEncoding,
+	cascade: EncodingCascade,
+}
+
+#[derive(Clone, Debug)]
+struct EncodingComputeFsstOffsetBytes {
+	bytes: Vec<u8>,
+	encoding: Option<BufferEncoding>,
+	cascade: Option<EncodingCascade>,
 }
 
 #[derive(Clone, Debug)]
@@ -8739,6 +8765,7 @@ impl SlabManager {
 			};
 			let selected_groups = [group.row_group_index];
 			predicate_fetched_groups.push(group.row_group_index);
+			let output_columns = ColumnOrdinalSet::new();
 			let Some(encoded_phase_b) = self
 				.try_read_encoding_compute_phase_b_from_l2(
 					l2.clone(),
@@ -8751,6 +8778,7 @@ impl SlabManager {
 					&directory,
 					page_directory,
 					predicate,
+					&output_columns,
 					&selected_groups,
 					&predicate_fetched_groups,
 				)
@@ -8931,6 +8959,7 @@ impl SlabManager {
 		record_directory: &RecordBufferDirectory,
 		page_directory: &crate::storage::row_group::RecordPageDirectory,
 		predicate: &crate::schema::pbc::Program,
+		output_columns: &ColumnOrdinalSet,
 		selected_groups: &[RowGroupIndex],
 		predicate_fetched_groups: &[RowGroupIndex],
 	) -> std::io::Result<Option<EncodingComputePhaseBRead>> {
@@ -8961,6 +8990,7 @@ impl SlabManager {
 			page_directory,
 			encoding_directory,
 			&encoded_predicate,
+			output_columns,
 			selected_groups,
 			predicate_fetched_groups,
 			&self.config.encoding_compute,
@@ -9178,6 +9208,7 @@ impl SlabManager {
 			page_directory,
 			encoding_directory,
 			&encoded_predicate,
+			output_columns,
 			selected_groups,
 			predicate_fetched_groups,
 			&self.config.encoding_compute,
@@ -9245,6 +9276,8 @@ impl SlabManager {
 			let row_count = RowCount::new(u64::from(group.row_count.get()));
 			let mut value_masks = vec![None::<EncodedRowMask>; plan.leaves.len()];
 			let mut validity_masks = vec![None::<EncodedRowMask>; plan.leaves.len()];
+			let mut fsst_values = vec![None::<EncodingComputeFsstValueBytes>; plan.leaves.len()];
+			let mut fsst_offsets = vec![None::<EncodingComputeFsstOffsetBytes>; plan.leaves.len()];
 			for fetch in plan
 				.fetches
 				.iter()
@@ -9300,6 +9333,20 @@ impl SlabManager {
 						);
 						value_masks[fetch.leaf_index] = Some(mask);
 					}
+					EncodingComputePhaseBFetchKind::FsstValues { encoding, cascade } => {
+						fsst_values[fetch.leaf_index] = Some(EncodingComputeFsstValueBytes {
+							bytes: fetched,
+							encoding: encoding.clone(),
+							cascade: cascade.clone(),
+						});
+					}
+					EncodingComputePhaseBFetchKind::FsstOffsets { encoding, cascade } => {
+						fsst_offsets[fetch.leaf_index] = Some(EncodingComputeFsstOffsetBytes {
+							bytes: fetched,
+							encoding: encoding.clone(),
+							cascade: cascade.clone(),
+						});
+					}
 					EncodingComputePhaseBFetchKind::Validity { encoding, cascade } => {
 						let match_nulls = match &plan.leaves[fetch.leaf_index] {
 							EncodingComputePhaseBLeaf::Encoded { .. } => false,
@@ -9326,6 +9373,48 @@ impl SlabManager {
 						validity_masks[fetch.leaf_index] = Some(mask);
 					}
 				}
+			}
+			for (leaf_index, value) in fsst_values.iter_mut().enumerate() {
+				let Some(value) = value.take() else {
+					continue;
+				};
+				let offsets = fsst_offsets[leaf_index].take().ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"Encoding compute FSST leaf missing offsets fetch",
+					)
+				})?;
+				let EncodingComputePhaseBLeaf::Encoded {
+					atom, data_type, ..
+				} = &plan.leaves[leaf_index]
+				else {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"Encoding compute FSST fetch targeted non-value leaf",
+					));
+				};
+				let Some(coercion) = coerce_literal(atom.literal.as_ref(), data_type) else {
+					observe_fallback(EncodingComputeFallbackReason::UnsupportedProgram);
+					return Ok(None);
+				};
+				let started = Instant::now();
+				let mask = evaluate_fsst_predicate(
+					&value.bytes,
+					&value.encoding,
+					&offsets.bytes,
+					offsets.encoding.as_ref(),
+					offsets.cascade.as_ref(),
+					data_type,
+					atom,
+					&coercion,
+				)
+				.map_err(encoding_compute_invariant_error)?;
+				metrics().observe_storage_l2_encoding_compute_kernel(
+					crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst.as_str(),
+					value.cascade.kind().as_str(),
+					started.elapsed(),
+				);
+				value_masks[leaf_index] = Some(mask);
 			}
 			let mut leaf_masks = Vec::with_capacity(plan.leaves.len());
 			for (leaf_index, leaf) in plan.leaves.iter().enumerate() {
@@ -9389,6 +9478,10 @@ impl SlabManager {
 				EncodingComputePhaseBFetchKind::Encoded { encoding, .. } => {
 					encoding.page_end_offsets.len().max(1) as u64
 				}
+				EncodingComputePhaseBFetchKind::FsstValues { encoding, .. } => {
+					encoding.page_end_offsets.len().max(1) as u64
+				}
+				EncodingComputePhaseBFetchKind::FsstOffsets { .. } => 1,
 				EncodingComputePhaseBFetchKind::Validity { .. } => 1,
 			})
 			.sum::<u64>();
@@ -9799,6 +9892,7 @@ impl SlabManager {
 							&directory,
 							&page_directory,
 							predicate,
+							&requirement.output_columns,
 							&selected_groups,
 							&predicate_fetched_groups,
 						)
@@ -9806,6 +9900,15 @@ impl SlabManager {
 					{
 						predicate_fetch = Some(encoded_predicate_read.phase_b_fetch);
 						predicate_outcome = encoded_predicate_read.outcome;
+						predicate_fetched_requirement = ColumnFetchRequirement {
+							predicate_columns: ColumnOrdinalSet::from_columns(
+								requirement
+									.predicate_columns
+									.iter()
+									.filter(|column| !requirement.output_columns.contains(*column)),
+							),
+							..ColumnFetchRequirement::default()
+						};
 						let predicate_fetched_set = predicate_fetched_groups
 							.iter()
 							.copied()
@@ -10977,6 +11080,7 @@ fn build_encoding_compute_phase_b_plan(
 	page_directory: &crate::storage::row_group::RecordPageDirectory,
 	encoding_directory: &EncodingDirectory,
 	encoded_predicate: &EncodedPredicateNode,
+	output_columns: &ColumnOrdinalSet,
 	selected_groups: &[RowGroupIndex],
 	predicate_fetched_groups: &[RowGroupIndex],
 	config: &EncodingComputeConfig,
@@ -11013,10 +11117,10 @@ fn build_encoding_compute_phase_b_plan(
 					column_index,
 					data_type,
 					physical_ordinal,
+					value_buffer_ordinal,
+					offsets_buffer_ordinal,
 					..
 				} => {
-					let (_, value_buffer_ordinal) =
-						encoding_compute_value_buffer(record_directory, *column_index)?;
 					let page = page_directory
 						.buffer_pages
 						.iter()
@@ -11024,14 +11128,14 @@ fn build_encoding_compute_phase_b_plan(
 							page.row_group_index == *group_index
 								&& page.ipc_column_ordinal
 									== IpcColumnOrdinal::new(*physical_ordinal as u32)
-								&& page.ipc_buffer_ordinal == value_buffer_ordinal
+								&& page.ipc_buffer_ordinal == *value_buffer_ordinal
 								&& page.range.len.get() > 0
 						})
 						.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
 					let encoding = find_buffer_encoding(
 						encoding_directory,
 						*group_index,
-						value_buffer_ordinal,
+						*value_buffer_ordinal,
 						page.range,
 					)
 					.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
@@ -11044,6 +11148,17 @@ fn build_encoding_compute_phase_b_plan(
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
 					let evaluator = evaluator_kind_for_cascade(cascade)
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+					if evaluator
+						== crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+						&& output_columns.contains(*column_index as u32)
+					{
+						return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+					}
+					if !encoding_compute_predicate_data_type_supported_for_evaluator(
+						data_type, evaluator,
+					) {
+						return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
+					}
 					if !config.predicate_evaluator_enabled(evaluator) {
 						return Err(EncodingComputeFallbackReason::UnsupportedCascade);
 					}
@@ -11061,17 +11176,79 @@ fn build_encoding_compute_phase_b_plan(
 					if encoded_pages > u64::from(config.max_encoded_pages_per_record.get()) {
 						return Err(EncodingComputeFallbackReason::TooManyPages);
 					}
-					fetches.push(EncodingComputePhaseBFetch {
-						leaf_index,
-						row_group_index: *group_index,
-						body_range: encoding_compute_fetch_range_for_buffer_page(
-							page.range, encoding,
-						)?,
-						kind: EncodingComputePhaseBFetchKind::Encoded {
-							encoding: encoding.clone(),
-							cascade: cascade.clone(),
-						},
-					});
+					if evaluator
+						== crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+					{
+						let offsets_buffer_ordinal = offsets_buffer_ordinal
+							.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+						let offsets_page = page_directory
+							.buffer_pages
+							.iter()
+							.find(|page| {
+								page.row_group_index == *group_index
+									&& page.ipc_column_ordinal
+										== IpcColumnOrdinal::new(*physical_ordinal as u32)
+									&& page.ipc_buffer_ordinal == offsets_buffer_ordinal
+									&& page.range.len.get() > 0
+							})
+							.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
+						let offsets_encoding = find_buffer_encoding(
+							encoding_directory,
+							*group_index,
+							offsets_buffer_ordinal,
+							offsets_page.range,
+						);
+						let (offsets_body_range, offsets_encoding, offsets_cascade) =
+							match offsets_encoding {
+								Some(offsets_encoding) => {
+									let offsets_cascade = encoding_directory
+										.cascades
+										.get(offsets_encoding.cascade_index.get() as usize)
+										.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+									(
+										encoding_compute_fetch_range_for_buffer_page(
+											offsets_page.range,
+											offsets_encoding,
+										)?,
+										Some(offsets_encoding.clone()),
+										Some(offsets_cascade.clone()),
+									)
+								}
+								None => (offsets_page.range, None, None),
+							};
+						fetches.push(EncodingComputePhaseBFetch {
+							leaf_index,
+							row_group_index: *group_index,
+							body_range: encoding_compute_fetch_range_for_buffer_page(
+								page.range, encoding,
+							)?,
+							kind: EncodingComputePhaseBFetchKind::FsstValues {
+								encoding: encoding.clone(),
+								cascade: cascade.clone(),
+							},
+						});
+						fetches.push(EncodingComputePhaseBFetch {
+							leaf_index,
+							row_group_index: *group_index,
+							body_range: offsets_body_range,
+							kind: EncodingComputePhaseBFetchKind::FsstOffsets {
+								encoding: offsets_encoding,
+								cascade: offsets_cascade,
+							},
+						});
+					} else {
+						fetches.push(EncodingComputePhaseBFetch {
+							leaf_index,
+							row_group_index: *group_index,
+							body_range: encoding_compute_fetch_range_for_buffer_page(
+								page.range, encoding,
+							)?,
+							kind: EncodingComputePhaseBFetchKind::Encoded {
+								encoding: encoding.clone(),
+								cascade: cascade.clone(),
+							},
+						});
+					}
 					if let Some(validity_fetch) = encoding_compute_validity_page_for_row_group(
 						record_directory,
 						page_directory,
@@ -11141,6 +11318,7 @@ fn build_encoding_predicate_page_plan(
 	page_directory: &crate::storage::row_group::RecordPageDirectory,
 	encoding_directory: &EncodingDirectory,
 	encoded_predicate: &EncodedPredicateNode,
+	_output_columns: &ColumnOrdinalSet,
 	selected_groups: &[RowGroupIndex],
 	predicate_fetched_groups: &[RowGroupIndex],
 	config: &EncodingComputeConfig,
@@ -11723,7 +11901,7 @@ fn encoding_compute_validity_page_for_row_group(
 		.column_to_buffers
 		.get(physical_ordinal)
 		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
-	if mapping.buffer_count != 2 {
+	if !matches!(mapping.buffer_count, 2 | 3) {
 		return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
 	}
 	if page_directory
@@ -11899,15 +12077,14 @@ impl EncodingComputePhaseBPlanBuilder<'_> {
 		column_index: usize,
 		atom: PredicateAtom,
 	) -> Result<EncodingComputePhaseBNode, EncodingComputeFallbackReason> {
-		let (physical_ordinal, _) =
-			encoding_compute_value_buffer(self.record_directory, column_index)?;
+		let buffers = encoding_compute_column_buffers(self.record_directory, column_index)?;
 		let field = self
 			.record_directory
 			.ipc_schema
 			.fields()
-			.get(physical_ordinal)
+			.get(buffers.physical_ordinal)
 			.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
-		if !encoding_compute_predicate_data_type_supported(field.data_type()) {
+		if !encoding_compute_predicate_data_type_candidate_supported(field.data_type()) {
 			return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
 		}
 		if coerce_literal(atom.literal.as_ref(), field.data_type()).is_none() {
@@ -11916,7 +12093,9 @@ impl EncodingComputePhaseBPlanBuilder<'_> {
 		let leaf_index = self.leaves.len();
 		self.leaves.push(EncodingComputePhaseBLeaf::Encoded {
 			column_index,
-			physical_ordinal,
+			physical_ordinal: buffers.physical_ordinal,
+			value_buffer_ordinal: buffers.value_buffer_ordinal,
+			offsets_buffer_ordinal: buffers.offsets_buffer_ordinal,
 			atom,
 			data_type: field.data_type().clone(),
 		});
@@ -11937,6 +12116,13 @@ impl EncodingComputePhaseBPlanBuilder<'_> {
 		});
 		Ok(EncodingComputePhaseBNode::Leaf(leaf_index))
 	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EncodingComputeColumnBuffers {
+	physical_ordinal: usize,
+	value_buffer_ordinal: IpcBufferIndex,
+	offsets_buffer_ordinal: Option<IpcBufferIndex>,
 }
 
 fn encoding_compute_physical_user_column_ordinal(
@@ -11964,26 +12150,63 @@ fn encoding_compute_value_buffer(
 	directory: &RecordBufferDirectory,
 	descriptor_ordinal: usize,
 ) -> Result<(usize, IpcBufferIndex), EncodingComputeFallbackReason> {
+	let buffers = encoding_compute_column_buffers(directory, descriptor_ordinal)?;
+	Ok((buffers.physical_ordinal, buffers.value_buffer_ordinal))
+}
+
+fn encoding_compute_column_buffers(
+	directory: &RecordBufferDirectory,
+	descriptor_ordinal: usize,
+) -> Result<EncodingComputeColumnBuffers, EncodingComputeFallbackReason> {
 	let physical_ordinal =
 		encoding_compute_physical_user_column_ordinal(directory, descriptor_ordinal)?;
 	let mapping = directory
 		.column_to_buffers
 		.get(physical_ordinal)
 		.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
-	if mapping.buffer_count != 2 {
-		return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout);
-	}
+	let first = mapping.first_buffer_ordinal.get();
+	let (offsets_buffer_ordinal, value_offset) = match mapping.buffer_count {
+		2 => (None, 1),
+		3 => (
+			Some(IpcBufferIndex::new(first.checked_add(1).ok_or(
+				EncodingComputeFallbackReason::UnsupportedArrowLayout,
+			)?)),
+			2,
+		),
+		_ => return Err(EncodingComputeFallbackReason::UnsupportedArrowLayout),
+	};
 	let value_buffer_ordinal = IpcBufferIndex::new(
-		mapping
-			.first_buffer_ordinal
-			.get()
-			.checked_add(1)
+		first
+			.checked_add(value_offset)
 			.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?,
 	);
-	Ok((physical_ordinal, value_buffer_ordinal))
+	Ok(EncodingComputeColumnBuffers {
+		physical_ordinal,
+		value_buffer_ordinal,
+		offsets_buffer_ordinal,
+	})
+}
+
+fn encoding_compute_predicate_data_type_candidate_supported(data_type: &DataType) -> bool {
+	encoding_compute_predicate_data_type_supported(data_type)
+		|| encoding_compute_fsst_predicate_data_type_supported(data_type)
+}
+
+fn encoding_compute_predicate_data_type_supported_for_evaluator(
+	data_type: &DataType,
+	evaluator: crate::storage::encoding::compute::EncodingComputeEvaluatorKind,
+) -> bool {
+	if evaluator == crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst {
+		return encoding_compute_fsst_predicate_data_type_supported(data_type);
+	}
+	encoding_compute_fixed_width_predicate_data_type_supported(data_type)
 }
 
 fn encoding_compute_predicate_data_type_supported(data_type: &DataType) -> bool {
+	encoding_compute_fixed_width_predicate_data_type_supported(data_type)
+}
+
+fn encoding_compute_fixed_width_predicate_data_type_supported(data_type: &DataType) -> bool {
 	matches!(
 		data_type,
 		DataType::Boolean
@@ -12004,6 +12227,13 @@ fn encoding_compute_predicate_data_type_supported(data_type: &DataType) -> bool 
 			| DataType::Timestamp(_, _)
 			| DataType::Duration(_)
 			| DataType::FixedSizeBinary(_)
+	)
+}
+
+fn encoding_compute_fsst_predicate_data_type_supported(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
 	)
 }
 
@@ -18877,6 +19107,502 @@ mod tests {
 	}
 
 	#[test]
+	fn fsst_phase_b_plan_fetches_values_and_offsets_and_declines_overlap() {
+		let row_count = 512_usize;
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("url", DataType::Utf8, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x66; 16]),
+			1,
+			"analytics",
+			"fsst_phase_b_plan",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(row_count as u32, row_count as u32, 8 * 1024 * 1024)
+					.unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let urls = (0..row_count)
+			.map(|row| format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/path/{row:04}"))
+			.collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(StringArray::from_iter_values(
+					urls.iter().map(String::as_str),
+				)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| (row % 17) as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(660 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: Some(descriptor.table_object_id),
+				}
+			})
+			.collect::<Vec<_>>();
+		let row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				RowGroupRowCount::new(256),
+				RowGroupRowCount::new(256),
+				RowCount::new(1),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: SimdPageValueCount::new(1024),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			enabled_cascades: [
+				crate::storage::encoding::EncodingCascadeKind::Plain,
+				crate::storage::encoding::EncodingCascadeKind::Fsst,
+			]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Uncompressed,
+				&row_group_config,
+				&encoding_config,
+			)
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::new(66),
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: encoded.frame.len() as u64,
+			},
+			&encoded.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = directory.page_directory.as_ref().unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let (_, value_buffer_ordinal) = encoding_compute_value_buffer(&directory, 1).unwrap();
+		let value_encoding = encoding_directory
+			.buffers
+			.iter()
+			.find(|encoding| {
+				encoding.row_group_index == RowGroupIndex::ZERO
+					&& encoding.ipc_buffer_ordinal == value_buffer_ordinal
+			})
+			.expect("FSST url value encoding");
+		let cascade = encoding_directory
+			.cascades
+			.get(value_encoding.cascade_index.get() as usize)
+			.expect("FSST cascade");
+		assert!(
+			matches!(cascade, EncodingCascade::Fsst { .. }),
+			"{cascade:?}"
+		);
+
+		let target = urls[7].as_bytes();
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_STR);
+		bytecode.extend_from_slice(&(target.len() as u16).to_le_bytes());
+		bytecode.extend_from_slice(target);
+		bytecode.push(crate::schema::pbc::OP_EQ);
+		let program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let encoded_predicate =
+			encoded_predicate_node_from_tree(&program.predicate_tree()).unwrap();
+		let selected_groups = page_directory
+			.row_groups
+			.iter()
+			.map(|group| group.row_group_index)
+			.collect::<Vec<_>>();
+		let mut compute_config = EncodingComputeConfig::default();
+		compute_config
+			.enabled_predicate_evaluators
+			.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst);
+		let no_overlap = ColumnOrdinalSet::from_columns([2]);
+		let plan = build_encoding_compute_phase_b_plan(
+			&directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			&no_overlap,
+			&selected_groups,
+			&selected_groups,
+			&compute_config,
+			0,
+		)
+		.expect("FSST no-overlap predicate should build encoded Phase B plan");
+		assert_eq!(
+			plan.fetches
+				.iter()
+				.filter(|fetch| matches!(
+					fetch.kind,
+					EncodingComputePhaseBFetchKind::FsstValues { .. }
+				))
+				.count(),
+			selected_groups.len()
+		);
+		assert_eq!(
+			plan.fetches
+				.iter()
+				.filter(|fetch| matches!(
+					fetch.kind,
+					EncodingComputePhaseBFetchKind::FsstOffsets { .. }
+				))
+				.count(),
+			selected_groups.len()
+		);
+
+		assert_eq!(
+			build_encoding_compute_phase_b_plan(
+				&directory,
+				page_directory,
+				encoding_directory,
+				&encoded_predicate,
+				&no_overlap,
+				&selected_groups,
+				&selected_groups,
+				&EncodingComputeConfig::default(),
+				0,
+			)
+			.unwrap_err(),
+			EncodingComputeFallbackReason::UnsupportedCascade
+		);
+		let overlap = ColumnOrdinalSet::from_columns([1, 2]);
+		assert_eq!(
+			build_encoding_compute_phase_b_plan(
+				&directory,
+				page_directory,
+				encoding_directory,
+				&encoded_predicate,
+				&overlap,
+				&selected_groups,
+				&selected_groups,
+				&compute_config,
+				0,
+			)
+			.unwrap_err(),
+			EncodingComputeFallbackReason::UnsupportedCascade
+		);
+	}
+
+	#[tokio::test]
+	async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
+		let l1_dir = fresh_dir("fsst-phase-b-l2-l1");
+		let l2_dir = fresh_dir("fsst-phase-b-l2-l2");
+		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
+		let mut encoding_compute = EncodingComputeConfig::default();
+		encoding_compute
+			.enabled_predicate_evaluators
+			.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst);
+		let mgr = Arc::new(
+			SlabManager::open(SlabManagerConfig {
+				dir: l1_dir,
+				max_slab_bytes: 1024 * 1024 * 16,
+				io: spawn_io_thread(64).unwrap(),
+				l2: Some(l2.clone()),
+				rehydration: RehydrationPolicy {
+					promote_after_l2_reads: 0,
+					..RehydrationPolicy::default()
+				},
+				l2_column_fetch: L2ColumnFetchConfig {
+					enabled: true,
+					min_record_bytes: RecordBodyByteLen::new(1),
+					..L2ColumnFetchConfig::default()
+				},
+				row_group_writer: Default::default(),
+				l2_row_group_fetch: crate::storage::row_group::L2RowGroupFetchConfig {
+					enabled: true,
+					max_selected_row_group_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					max_selected_byte_fraction_micros:
+						crate::storage::row_group::L2_ROW_GROUP_FETCH_FRACTION_DENOMINATOR - 1,
+					..Default::default()
+				},
+				encoding_writer: Default::default(),
+				l2_chunk_layout: Default::default(),
+				l2_encoding_fetch: crate::storage::encoding::L2EncodingFetchConfig {
+					enabled: true,
+					..Default::default()
+				},
+				encoding_compute,
+				group_commit: GroupCommitConfig::default(),
+				crypto: test_crypto(),
+			})
+			.await
+			.unwrap(),
+		);
+
+		let row_count = 4_096_usize;
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("url", DataType::Utf8, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let mut descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x66; 16]),
+			2,
+			"analytics",
+			"fsst_phase_b_l2",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024).unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_body_compression_policy = RecordBodyCompressionPolicy::Uncompressed;
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		let urls = (0..row_count)
+			.map(|row| format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/path/{row:04}"))
+			.collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(StringArray::from_iter_values(
+					urls.iter().map(String::as_str),
+				)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| 900_000_i64 + row as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(700 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: Some(descriptor.table_object_id),
+				}
+			})
+			.collect::<Vec<_>>();
+		let mut row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				RowGroupRowCount::new(1024),
+				RowGroupRowCount::new(1024),
+				RowCount::new(1),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		row_group_config.stats_supported_types = std::collections::BTreeSet::new();
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: SimdPageValueCount::new(1024),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			enabled_cascades: [
+				crate::storage::encoding::EncodingCascadeKind::Plain,
+				crate::storage::encoding::EncodingCascadeKind::Fsst,
+			]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Uncompressed,
+				&row_group_config,
+				&encoding_config,
+			)
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::new(66),
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: encoded.frame.len() as u64,
+			},
+			&encoded.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let (_, url_value_buffer_ordinal) = encoding_compute_value_buffer(&directory, 1).unwrap();
+		let value_encoding = encoding_directory
+			.buffers
+			.iter()
+			.find(|encoding| encoding.ipc_buffer_ordinal == url_value_buffer_ordinal)
+			.expect("FSST url value encoding");
+		let cascade = encoding_directory
+			.cascades
+			.get(value_encoding.cascade_index.get() as usize)
+			.expect("FSST url value cascade");
+		assert!(
+			matches!(cascade, EncodingCascade::Fsst { .. }),
+			"{cascade:?}"
+		);
+
+		let encoded_entries = encoded
+			.rows
+			.iter()
+			.copied()
+			.map(Into::into)
+			.collect::<Vec<_>>();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &encoded_entries)
+			.await
+			.unwrap();
+		let slab_id = force_seal_active(&mgr).await;
+		let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+		let encrypted = mgr.encrypt_tiered_object_blob(slab_id, &raw).unwrap();
+		let payload_hash = crate::hash::content::digest(&encrypted.bytes);
+		let uri = l2
+			.put(
+				&format!("fsst-phase-b-l2/slab_{slab_id:016x}.wnd"),
+				&encrypted.bytes,
+			)
+			.await
+			.unwrap();
+		let pointer = TieredSlabPointer {
+			slab_id,
+			l2_uri: uri,
+			payload_hash,
+			is_encrypted: true,
+			tenant_id: Some(tenant()),
+			tenant_kek_id: Some(encrypted.tenant_kek_id),
+			stats_format_version: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_format_version),
+			stats_block_len: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_len),
+			stats_block_hash128: encrypted
+				.stats_locator
+				.map(|locator| locator.stats_block_hash128),
+			tombstone_metadata: TombstoneMetadata::None,
+			supersession_metadata: SupersessionMetadata::None,
+		};
+		mgr.apply_tier_slab(pointer.clone()).await.unwrap();
+
+		let target_row = 333_usize;
+		let target = encoded
+			.rows
+			.iter()
+			.find(|row| row.record_row_index == RecordRowIndex::new(target_row as u32))
+			.expect("target storage row");
+		let location = mgr
+			.lookup(tenant(), target.key_identity)
+			.expect("tiered FSST row location");
+		let selected_rows = [RecordRowIndex::new(target_row as u32)];
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_STR);
+		bytecode.extend_from_slice(&(urls[target_row].len() as u16).to_le_bytes());
+		bytecode.extend_from_slice(urls[target_row].as_bytes());
+		bytecode.push(crate::schema::pbc::OP_EQ);
+		let predicate = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+
+		let a1_requirement = ColumnFetchRequirement {
+			predicate_columns: ColumnOrdinalSet::from_columns([1]),
+			output_columns: ColumnOrdinalSet::from_columns([2]),
+			..ColumnFetchRequirement::default()
+		};
+		let a1 = mgr
+			.read_projected_record_from_l2(
+				l2.clone(),
+				&pointer,
+				location,
+				&descriptor,
+				&a1_requirement,
+				Some(&predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(a1_plan) = &a1.strategy else {
+			panic!("expected FSST A1 row-group strategy, got {:?}", a1.strategy);
+		};
+		assert!(a1_plan.phase_b_fetch.is_some());
+		assert!(
+			a1.projected.physical_for(1).is_none(),
+			"FSST A1 must not carry the predicate column into Phase C projection"
+		);
+		let a1_expected = crate::schema::pbc::execute_program(&predicate, &batch)
+			.unwrap()
+			.project(&[2])
+			.unwrap();
+		let a1_payload_physical = a1.projected.physical_for(2).expect("payload physical");
+		assert_eq!(
+			a1.projected.batch.project(&[a1_payload_physical]).unwrap(),
+			a1_expected
+		);
+
+		let a2_requirement = ColumnFetchRequirement {
+			predicate_columns: ColumnOrdinalSet::from_columns([1]),
+			output_columns: ColumnOrdinalSet::from_columns([1, 2]),
+			..ColumnFetchRequirement::default()
+		};
+		let a2 = mgr
+			.read_projected_record_from_l2(
+				l2,
+				&pointer,
+				location,
+				&descriptor,
+				&a2_requirement,
+				Some(&predicate),
+				Some(&selected_rows),
+			)
+			.await
+			.unwrap();
+		let L2FetchStrategy::RowGroup(a2_plan) = &a2.strategy else {
+			panic!(
+				"expected FSST A2 dense row-group strategy, got {:?}",
+				a2.strategy
+			);
+		};
+		assert!(a2_plan.phase_b_fetch.is_some());
+		let a2_expected = crate::schema::pbc::execute_program(&predicate, &batch)
+			.unwrap()
+			.project(&[1, 2])
+			.unwrap();
+		let a2_url_physical = a2.projected.physical_for(1).expect("url physical");
+		let a2_payload_physical = a2.projected.physical_for(2).expect("payload physical");
+		assert_eq!(
+			a2.projected
+				.batch
+				.project(&[a2_url_physical, a2_payload_physical])
+				.unwrap(),
+			a2_expected
+		);
+	}
+
+	#[test]
 	fn encoding_predicate_page_plan_narrows_clustered_scan_pages() {
 		let row_count = crate::storage::row_group::ROW_GROUP_SCAN_TARGET_ROWS as usize;
 		let column_count = 17_usize;
@@ -19040,11 +19766,13 @@ mod tests {
 			.map(|group| group.row_group_index)
 			.collect::<Vec<_>>();
 		let compute_config = EncodingComputeConfig::default();
+		let output_columns = ColumnOrdinalSet::new();
 		let page_plan = build_encoding_predicate_page_plan(
 			&directory,
 			page_directory,
 			encoding_directory,
 			&encoded_predicate,
+			&output_columns,
 			&selected_groups,
 			&selected_groups,
 			&compute_config,
@@ -19056,6 +19784,7 @@ mod tests {
 			page_directory,
 			encoding_directory,
 			&encoded_predicate,
+			&output_columns,
 			&selected_groups,
 			&selected_groups,
 			&compute_config,

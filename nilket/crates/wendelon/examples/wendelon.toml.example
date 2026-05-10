@@ -82,7 +82,7 @@ lsm_compaction_paused = false
 # max_encoded_pages_per_record = 256
 # min_selectivity_for_encoded_eval_micros = 250000
 # min_prefilter_rejection_micros = 100000
-# enabled_predicate_evaluators = ["bit_packed", "rle_plain", "rle_bit_packed", "dictionary_plain", "dictionary_bit_packed", "delta"]
+# enabled_predicate_evaluators = ["bit_packed", "rle_plain", "rle_bit_packed", "dictionary_plain", "dictionary_bit_packed", "delta", "fsst"]
 # enabled_aggregate_kernels = ["count_star", "count_non_null", "min", "max", "signed_sum", "unsigned_sum", "signed_avg", "unsigned_avg"]
 
 [tuning]

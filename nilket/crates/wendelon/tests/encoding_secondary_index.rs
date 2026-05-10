@@ -58,3 +58,32 @@ fn secondary_index_path_uses_encoding_page_fast_path_before_row_take() {
 		);
 	}
 }
+
+#[test]
+fn secondary_index_adr066_fsst_confirm_step_status_is_explicit() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manager = rust_identifiers(root, "src/storage/manager.rs");
+	let impl_plan = fs::read_to_string(root.join("plans/impl/066_fsst_evaluator.md")).unwrap();
+
+	for token in [
+		"fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap",
+		"read_projected_record_from_l2",
+		"EncodingComputeEvaluatorKind",
+		"Fsst",
+	] {
+		assert!(
+			has_identifier(&manager, token),
+			"missing ADR 066 FSST confirm-step related identifier {token}"
+		);
+	}
+	for required in [
+		"ADR 052 confirm-step row",
+		"conditional per",
+		"if not feasible, document as Phase 4",
+	] {
+		assert!(
+			impl_plan.contains(required),
+			"ADR 066 secondary-index confirm-step status is missing text {required}"
+		);
+	}
+}

@@ -57,6 +57,9 @@ pub fn evaluate(
 		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::Delta) => {
 			kernels::delta::evaluate_predicate(encoded_bytes, encoding, atom, coercion)
 		}
+		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::Fsst) => {
+			evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion)
+		}
 		NativeEvaluationEligibility::Eligible(
 			EncodingComputeEvaluatorKind::RlePlain | EncodingComputeEvaluatorKind::RleBitPacked,
 		) => kernels::rle::evaluate_predicate(encoded_bytes, encoding, atom, coercion),
@@ -76,6 +79,74 @@ pub fn evaluate_decode_scalar(
 	let decoded = decode_encoded_buffer(encoded_bytes, &coercion.data_type, cascade, encoding)
 		.map_err(map_decode_reject)?;
 	evaluate_decoded(&decoded, encoding.decoded_value_count, atom, coercion)
+}
+
+pub fn evaluate_fsst_predicate(
+	value_bytes: &[u8],
+	value_encoding: &BufferEncoding,
+	offset_bytes: &[u8],
+	offset_encoding: Option<&BufferEncoding>,
+	offset_cascade: Option<&EncodingCascade>,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> Result<EncodedRowMask, EncodingComputeRejectCode> {
+	if !matches!(
+		atom.op,
+		PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList
+	) || !kernels::fsst::string_like_data_type_supported(data_type)
+	{
+		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+	}
+	let frame = kernels::fsst::parse_fsst_frame(value_bytes, value_encoding.decoded_byte_len)?;
+	let offsets = kernels::fsst::decode_offsets(
+		offset_bytes,
+		data_type,
+		value_encoding.decoded_value_count,
+		RecordBodyByteLen::new(frame.expected_decoded_byte_len() as u64),
+		offset_encoding,
+		offset_cascade,
+	)?;
+	with_fsst_literal_bytes(coercion, |literals| {
+		kernels::fsst::evaluate_fsst_equality(&frame, &offsets, literals, atom.op)
+	})
+}
+
+pub fn evaluate_fsst_predicate_with_stats(
+	value_bytes: &[u8],
+	value_encoding: &BufferEncoding,
+	offset_bytes: &[u8],
+	offset_encoding: Option<&BufferEncoding>,
+	offset_cascade: Option<&EncodingCascade>,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> Result<
+	(
+		EncodedRowMask,
+		crate::storage::encoding::compute::kernels::fsst::FsstEvaluationStats,
+	),
+	EncodingComputeRejectCode,
+> {
+	if !matches!(
+		atom.op,
+		PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList
+	) || !kernels::fsst::string_like_data_type_supported(data_type)
+	{
+		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+	}
+	let frame = kernels::fsst::parse_fsst_frame(value_bytes, value_encoding.decoded_byte_len)?;
+	let offsets = kernels::fsst::decode_offsets(
+		offset_bytes,
+		data_type,
+		value_encoding.decoded_value_count,
+		RecordBodyByteLen::new(frame.expected_decoded_byte_len() as u64),
+		offset_encoding,
+		offset_cascade,
+	)?;
+	with_fsst_literal_bytes(coercion, |literals| {
+		kernels::fsst::evaluate_fsst_equality_with_stats(&frame, &offsets, literals, atom.op)
+	})
 }
 
 pub fn evaluate_decoded(
@@ -258,10 +329,8 @@ pub fn evaluator_kind_for_cascade(
 			EncodingLeafCascade::Lz4Frame => None,
 		},
 		EncodingCascade::Delta { .. } => Some(EncodingComputeEvaluatorKind::Delta),
-		EncodingCascade::Plain
-		| EncodingCascade::Lz4Frame
-		| EncodingCascade::Fsst { .. }
-		| EncodingCascade::Alp { .. } => None,
+		EncodingCascade::Fsst { .. } => Some(EncodingComputeEvaluatorKind::Fsst),
+		EncodingCascade::Plain | EncodingCascade::Lz4Frame | EncodingCascade::Alp { .. } => None,
 	}
 }
 
@@ -286,6 +355,12 @@ pub(crate) fn native_evaluation_eligibility(
 	let Some(kind) = evaluator_kind_for_cascade(cascade) else {
 		return NativeEvaluationEligibility::DecodeScalarFallback;
 	};
+	if kind == EncodingComputeEvaluatorKind::Fsst {
+		if fsst_native_evaluation_eligible(atom, coercion) {
+			return NativeEvaluationEligibility::Eligible(kind);
+		}
+		return NativeEvaluationEligibility::DecodeScalarFallback;
+	}
 	if !native_value_type_supported(&coercion.data_type) {
 		return NativeEvaluationEligibility::DecodeScalarFallback;
 	}
@@ -317,6 +392,53 @@ fn native_predicate_cascade_eligible(cascade: &EncodingCascade, data_type: &Data
 		| EncodingCascade::Lz4Frame
 		| EncodingCascade::Fsst { .. }
 		| EncodingCascade::Alp { .. } => false,
+	}
+}
+
+fn fsst_native_evaluation_eligible(atom: &PredicateAtom, coercion: &LiteralCoercion) -> bool {
+	matches!(
+		atom.op,
+		PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList
+	) && kernels::fsst::string_like_data_type_supported(&coercion.data_type)
+		&& fsst_literal_bytes_supported(coercion)
+}
+
+fn with_fsst_literal_bytes<'a, R>(
+	coercion: &'a LiteralCoercion,
+	evaluate: impl FnOnce(&[kernels::fsst::LiteralBytes<'a>]) -> Result<R, EncodingComputeRejectCode>,
+) -> Result<R, EncodingComputeRejectCode> {
+	let literal = coercion
+		.literal
+		.as_ref()
+		.ok_or(EncodingComputeRejectCode::KernelDecodedLengthMismatch)?;
+	match literal {
+		LiteralValue::Bytes(bytes) => {
+			let literals = [kernels::fsst::LiteralBytes::new(bytes.as_slice())];
+			evaluate(&literals)
+		}
+		LiteralValue::List(values) => {
+			let literals = values
+				.iter()
+				.map(|value| match value {
+					LiteralValue::Bytes(bytes) => {
+						Ok(kernels::fsst::LiteralBytes::new(bytes.as_slice()))
+					}
+					_ => Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch),
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			evaluate(&literals)
+		}
+		_ => Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch),
+	}
+}
+
+fn fsst_literal_bytes_supported(coercion: &LiteralCoercion) -> bool {
+	match coercion.literal.as_ref() {
+		Some(LiteralValue::Bytes(_)) => true,
+		Some(LiteralValue::List(values)) => values
+			.iter()
+			.all(|value| matches!(value, LiteralValue::Bytes(_))),
+		_ => false,
 	}
 }
 

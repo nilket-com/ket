@@ -44,7 +44,8 @@ use wendelon::schema::{
 use wendelon::storage::encoding::cascade::{decode_buffer, decode_page, encode_buffer};
 use wendelon::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedRowMask, EncodingComputeConfig, EncodingComputeEvaluatorKind,
-	PredicateAtom, PredicateAtomOp, coerce_literal, evaluate, evaluator_kind_for_cascade,
+	PredicateAtom, PredicateAtomOp, coerce_literal, evaluate, evaluate_fsst_predicate,
+	evaluate_fsst_predicate_with_stats, evaluator_kind_for_cascade,
 	try_fold_encoded_aggregate_request,
 };
 use wendelon::storage::encoding::page::expand_page_descriptors;
@@ -69,6 +70,9 @@ fn main() -> std::io::Result<()> {
 			bench_predicate_classify_then_fallback(&config, fixture)?;
 		}
 		bench_mask_algebra(&config, &fixtures)?;
+		bench_fsst_predicate_matrix(&config, rows)?;
+		bench_fsst_declined_paths(&config, rows)?;
+		bench_fsst_cross_replica_determinism(&config, rows)?;
 		for fixture in &fixtures {
 			bench_aggregate_count_star(&config, fixture)?;
 			if fixture.aggregate_kind.is_some() {
@@ -139,6 +143,20 @@ struct Fixture {
 	atom: PredicateAtom,
 	aggregate_kind: Option<AggregateKind>,
 	aggregate_column_dtype: DataType,
+}
+
+#[derive(Clone, Debug)]
+struct FsstFixture {
+	name: &'static str,
+	rows: usize,
+	cascade: EncodingCascade,
+	encoding: BufferEncoding,
+	encoded: Vec<u8>,
+	decoded: Vec<u8>,
+	offsets: Vec<i32>,
+	offset_bytes: Vec<u8>,
+	data_type: DataType,
+	atom: PredicateAtom,
 }
 
 fn build_fixtures(rows: usize) -> std::io::Result<Vec<Fixture>> {
@@ -510,6 +528,138 @@ fn int_atom(op: PredicateAtomOp, literal: i64) -> PredicateAtom {
 	}
 }
 
+fn string_atom(op: PredicateAtomOp, literal: &[u8]) -> PredicateAtom {
+	PredicateAtom {
+		op,
+		literal: Some(ColumnPredicateLiteralV1::Str(literal.to_vec())),
+	}
+}
+
+fn string_list_atom(op: PredicateAtomOp, literals: &[Vec<u8>]) -> PredicateAtom {
+	PredicateAtom {
+		op,
+		literal: Some(ColumnPredicateLiteralV1::List(
+			literals
+				.iter()
+				.map(|literal| ColumnPredicateLiteralV1::Str(literal.clone()))
+				.collect(),
+		)),
+	}
+}
+
+fn fsst_repeated_prefix_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	fsst_fixture(rows, "fsst_url_repeated_prefix", |row| {
+		format!("/tenant/alpha/catalog/product/{row:06}/details")
+	})
+}
+
+fn fsst_url_eq_5p_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	let selected_rows = rows.saturating_div(20).max(1);
+	let hot = b"/tenant/alpha/catalog/product/000000/details".to_vec();
+	let mut fixture = fsst_fixture(rows, "fsst_url_eq_5p", |row| {
+		if row < selected_rows {
+			"/tenant/alpha/catalog/product/000000/details".to_string()
+		} else {
+			format!(
+				"/tenant/alpha/catalog/product/{:06}/details",
+				100_000 + row % 900_000
+			)
+		}
+	})?;
+	fixture.atom = string_atom(PredicateAtomOp::Eq, &hot);
+	Ok(fixture)
+}
+
+fn fsst_url_inlist4_5p_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	let selected_rows = rows.saturating_div(20).max(1);
+	let literals = (0..4)
+		.map(|value| format!("/tenant/alpha/catalog/product/{value:06}/details").into_bytes())
+		.collect::<Vec<_>>();
+	let mut fixture = fsst_fixture(rows, "fsst_url_inlist4_5p", |row| {
+		if row < selected_rows {
+			format!(
+				"/tenant/alpha/catalog/product/{:06}/details",
+				row % literals.len()
+			)
+		} else {
+			format!(
+				"/tenant/alpha/catalog/product/{:06}/details",
+				100_000 + row % 900_000
+			)
+		}
+	})?;
+	fixture.atom = string_list_atom(PredicateAtomOp::InList, &literals);
+	Ok(fixture)
+}
+
+fn fsst_short_string_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	fsst_fixture(rows, "fsst_short_string_diag", |row| {
+		format!("{:02x}", row % 256)
+	})
+}
+
+fn fsst_weak_compression_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	fsst_fixture(rows, "fsst_weak_compression_diag", |row| {
+		let mixed = (row as u64)
+			.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+			.rotate_left((row % 31) as u32);
+		format!("{mixed:016x}{:08x}", row as u32 ^ 0xa5a5_5a5a)
+	})
+}
+
+fn fsst_disjoint_length_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	let mut fixture = fsst_fixture(rows, "fsst_disjoint_length_prefilter", |row| {
+		format!("/tenant/alpha/catalog/product/{row:06}/details")
+	})?;
+	fixture.atom = string_atom(PredicateAtomOp::Eq, b"x");
+	Ok(fixture)
+}
+
+fn fsst_fixture(
+	rows: usize,
+	name: &'static str,
+	mut value_for_row: impl FnMut(usize) -> String,
+) -> std::io::Result<FsstFixture> {
+	let mut decoded = Vec::new();
+	let mut offsets = Vec::with_capacity(rows.saturating_add(1));
+	offsets.push(0_i32);
+	for row in 0..rows {
+		let value = value_for_row(row);
+		decoded.extend_from_slice(value.as_bytes());
+		offsets.push(i32::try_from(decoded.len()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"FSST bench offset exceeds i32",
+			)
+		})?);
+	}
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_value_count_buffer(&decoded, &DataType::Utf8, &cascade, rows)?;
+	let encoding = encoding_for(&decoded, &encoded, rows);
+	let target_row = rows.saturating_div(3).min(rows.saturating_sub(1));
+	let start = offsets[target_row] as usize;
+	let end = offsets[target_row + 1] as usize;
+	let target_literal = decoded[start..end].to_vec();
+	let offset_bytes = offsets
+		.iter()
+		.flat_map(|offset| offset.to_le_bytes())
+		.collect::<Vec<_>>();
+	Ok(FsstFixture {
+		name,
+		rows,
+		cascade,
+		encoding,
+		encoded: encoded.bytes,
+		decoded,
+		offsets,
+		offset_bytes,
+		data_type: DataType::Utf8,
+		atom: string_atom(PredicateAtomOp::Eq, &target_literal),
+	})
+}
+
 fn bench_predicate_cocd(config: &BenchConfig, fixture: &Fixture) -> std::io::Result<()> {
 	let coercion = coerce_literal(fixture.atom.literal.as_ref(), &fixture.data_type)
 		.expect("bench literal coerce");
@@ -531,6 +681,240 @@ fn bench_predicate_cocd(config: &BenchConfig, fixture: &Fixture) -> std::io::Res
 		fixture.encoded.len() as u64,
 		config.iterations,
 		elapsed,
+	);
+	Ok(())
+}
+
+fn bench_fsst_predicate_matrix(config: &BenchConfig, rows: usize) -> std::io::Result<()> {
+	let fixtures = [
+		fsst_repeated_prefix_fixture(rows)?,
+		fsst_url_eq_5p_fixture(rows)?,
+		fsst_url_inlist4_5p_fixture(rows)?,
+		fsst_short_string_fixture(rows)?,
+		fsst_weak_compression_fixture(rows)?,
+		fsst_disjoint_length_fixture(rows)?,
+	];
+	for fixture in &fixtures {
+		let coercion = coerce_literal(fixture.atom.literal.as_ref(), &fixture.data_type)
+			.expect("bench FSST literal coerce");
+		let kernel_elapsed = bench(config.iterations, || {
+			let mask = evaluate_fsst_predicate(
+				black_box(&fixture.encoded),
+				black_box(&fixture.encoding),
+				black_box(&fixture.offset_bytes),
+				None,
+				None,
+				black_box(&fixture.data_type),
+				black_box(&fixture.atom),
+				black_box(&coercion),
+			)
+			.expect("bench FSST kernel");
+			black_box(mask);
+		});
+		let (stats_mask, kernel_stats) = evaluate_fsst_predicate_with_stats(
+			black_box(&fixture.encoded),
+			black_box(&fixture.encoding),
+			black_box(&fixture.offset_bytes),
+			None,
+			None,
+			black_box(&fixture.data_type),
+			black_box(&fixture.atom),
+			black_box(&coercion),
+		)
+		.expect("bench FSST stats");
+		black_box(stats_mask);
+		emit_row(
+			"fsst_kernel_case_a1",
+			fixture.name,
+			fixture.rows,
+			fixture.encoded.len() as u64,
+			config.iterations,
+			kernel_elapsed,
+		);
+		let dense_elapsed = bench(config.iterations, || {
+			let decoded = dense_decode(
+				black_box(&fixture.encoded),
+				black_box(&fixture.data_type),
+				black_box(&fixture.cascade),
+				black_box(&fixture.encoding),
+			)
+			.expect("bench FSST dense decode");
+			let selected = fsst_dense_string_compare(&decoded, &fixture.offsets, &fixture.atom);
+			black_box(selected);
+		});
+		emit_row(
+			"fsst_dense_fallback",
+			fixture.name,
+			fixture.rows,
+			fixture.encoded.len() as u64,
+			config.iterations,
+			dense_elapsed,
+		);
+		let encoded_payload_ratio_micros =
+			ratio_micros(fixture.encoded.len() as u64, fixture.decoded.len() as u64);
+		let kernel_vs_dense_cpu_micros = duration_ratio_micros(kernel_elapsed, dense_elapsed);
+		println!(
+			"encoding_compute_bench scenario=fsst_recorded_diagnostic fixture={} rows={} iterations={} encoded_payload_bytes={} decoded_plaintext_bytes={} encoded_payload_ratio_micros={} kernel_vs_dense_cpu_micros={} length_match_rows={} length_mismatch_rows={} length_prefilter_elimination_micros={} fsst_byte_comparisons={} decoded_bytes_walked={} decoded_bytes_skipped={}",
+			fixture.name,
+			fixture.rows,
+			config.iterations,
+			fixture.encoded.len(),
+			fixture.decoded.len(),
+			encoded_payload_ratio_micros,
+			kernel_vs_dense_cpu_micros,
+			kernel_stats.length_match_rows,
+			kernel_stats.length_mismatch_rows,
+			ratio_micros(
+				kernel_stats.length_mismatch_rows as u64,
+				kernel_stats.rows as u64
+			),
+			kernel_stats.byte_comparisons,
+			kernel_stats.decoded_bytes_walked,
+			kernel_stats.decoded_bytes_skipped,
+		);
+	}
+	Ok(())
+}
+
+fn bench_fsst_declined_paths(config: &BenchConfig, rows: usize) -> std::io::Result<()> {
+	let fixture = fsst_repeated_prefix_fixture(rows)?;
+	let iterations = config.iterations.max(200);
+	let target_literal = match fixture.atom.literal.as_ref().expect("bench FSST literal") {
+		ColumnPredicateLiteralV1::Str(value) => value.clone(),
+		_ => unreachable!("FSST fixture uses string literal"),
+	};
+	let cases = [
+		(
+			"dense_fallback_atom_unsupported",
+			DataType::Utf8,
+			string_atom(PredicateAtomOp::Lt, &target_literal),
+		),
+		(
+			"dense_fallback_type_unsupported_utf8_view",
+			DataType::Utf8View,
+			string_atom(PredicateAtomOp::Eq, &target_literal),
+		),
+		(
+			"dense_fallback_type_unsupported_binary_view",
+			DataType::BinaryView,
+			string_atom(PredicateAtomOp::Eq, &target_literal),
+		),
+	];
+	let mut enabled_config = EncodingComputeConfig::default();
+	enabled_config.enabled = true;
+	enabled_config
+		.enabled_predicate_evaluators
+		.insert(EncodingComputeEvaluatorKind::Fsst);
+	for (route, data_type, atom) in cases {
+		let coercion = coerce_literal(atom.literal.as_ref(), &data_type)
+			.expect("bench FSST declined literal coerce");
+		let dense_elapsed = bench(iterations, || {
+			let decoded = dense_decode(
+				black_box(&fixture.encoded),
+				black_box(&data_type),
+				black_box(&fixture.cascade),
+				black_box(&fixture.encoding),
+			)
+			.expect("bench FSST declined dense decode");
+			let selected = fsst_dense_string_compare(&decoded, &fixture.offsets, &atom);
+			black_box(selected);
+		});
+		emit_row(
+			"fsst_declined_dense_baseline",
+			route,
+			fixture.rows,
+			fixture.encoded.len() as u64,
+			iterations,
+			dense_elapsed,
+		);
+		let declined_elapsed = bench(iterations, || {
+			let kind = evaluator_kind_for_cascade(black_box(&fixture.cascade));
+			let allowed = kind
+				.map(|kind| black_box(&enabled_config).predicate_evaluator_enabled(black_box(kind)))
+				.unwrap_or(false);
+			let decline = evaluate_fsst_predicate(
+				black_box(&fixture.encoded),
+				black_box(&fixture.encoding),
+				black_box(&fixture.offset_bytes),
+				None,
+				None,
+				black_box(&data_type),
+				black_box(&atom),
+				black_box(&coercion),
+			)
+			.is_err();
+			black_box((kind, allowed, decline));
+			let decoded = dense_decode(
+				black_box(&fixture.encoded),
+				black_box(&data_type),
+				black_box(&fixture.cascade),
+				black_box(&fixture.encoding),
+			)
+			.expect("bench FSST declined dense decode");
+			let selected = fsst_dense_string_compare(&decoded, &fixture.offsets, &atom);
+			black_box(selected);
+		});
+		emit_row(
+			"fsst_declined_dense_fallback",
+			route,
+			fixture.rows,
+			fixture.encoded.len() as u64,
+			iterations,
+			declined_elapsed,
+		);
+		println!(
+			"encoding_compute_bench scenario=fsst_declined_path_diagnostic route={} rows={} iterations={} dense_fallback_overhead_micros={} declined_vs_dense_cpu_micros={}",
+			route,
+			fixture.rows,
+			iterations,
+			duration_overhead_micros(declined_elapsed, dense_elapsed),
+			duration_ratio_micros(declined_elapsed, dense_elapsed),
+		);
+	}
+	Ok(())
+}
+
+fn bench_fsst_cross_replica_determinism(config: &BenchConfig, rows: usize) -> std::io::Result<()> {
+	let left = fsst_repeated_prefix_fixture(rows)?;
+	let right = fsst_repeated_prefix_fixture(rows)?;
+	let left_coercion = coerce_literal(left.atom.literal.as_ref(), &left.data_type)
+		.expect("bench FSST left literal coerce");
+	let right_coercion = coerce_literal(right.atom.literal.as_ref(), &right.data_type)
+		.expect("bench FSST right literal coerce");
+	let left_mask = evaluate_fsst_predicate(
+		&left.encoded,
+		&left.encoding,
+		&left.offset_bytes,
+		None,
+		None,
+		&left.data_type,
+		&left.atom,
+		&left_coercion,
+	)
+	.expect("bench FSST left deterministic mask");
+	let right_mask = evaluate_fsst_predicate(
+		&right.encoded,
+		&right.encoding,
+		&right.offset_bytes,
+		None,
+		None,
+		&right.data_type,
+		&right.atom,
+		&right_coercion,
+	)
+	.expect("bench FSST right deterministic mask");
+	let left_digest = encoded_mask_digest(&left_mask);
+	let right_digest = encoded_mask_digest(&right_mask);
+	println!(
+		"encoding_compute_bench scenario=fsst_cross_replica_determinism fixture={} rows={} iterations={} mask_equal={} encoded_equal={} left_digest={} right_digest={} encoded_bytes={}",
+		left.name,
+		rows,
+		config.iterations,
+		left_digest == right_digest,
+		left.encoded == right.encoded && left.offset_bytes == right.offset_bytes,
+		left_digest,
+		right_digest,
+		left.encoded.len(),
 	);
 	Ok(())
 }
@@ -1306,6 +1690,39 @@ fn scalar_compare(
 	out
 }
 
+fn fsst_dense_string_compare(decoded: &[u8], offsets: &[i32], atom: &PredicateAtom) -> Vec<bool> {
+	let literal = atom.literal.as_ref().expect("FSST atom literal");
+	let literal_values = match literal {
+		ColumnPredicateLiteralV1::Str(value) => vec![value.as_slice()],
+		ColumnPredicateLiteralV1::List(values) => values
+			.iter()
+			.map(|value| match value {
+				ColumnPredicateLiteralV1::Str(value) => value.as_slice(),
+				_ => panic!("FSST dense baseline supports string lists only"),
+			})
+			.collect::<Vec<_>>(),
+		_ => panic!("FSST dense baseline supports string literals only"),
+	};
+	offsets
+		.windows(2)
+		.map(|window| {
+			let start = window[0] as usize;
+			let end = window[1] as usize;
+			let value = &decoded[start..end];
+			match atom.op {
+				PredicateAtomOp::Eq => value == literal_values[0],
+				PredicateAtomOp::Neq => value != literal_values[0],
+				PredicateAtomOp::InList => literal_values.iter().any(|literal| value == *literal),
+				PredicateAtomOp::Lt => value < literal_values[0],
+				PredicateAtomOp::Lte => value <= literal_values[0],
+				PredicateAtomOp::Gt => value > literal_values[0],
+				PredicateAtomOp::Gte => value >= literal_values[0],
+				_ => panic!("FSST dense baseline supports value diagnostics only"),
+			}
+		})
+		.collect()
+}
+
 fn value_byte_width(data_type: &DataType) -> usize {
 	match data_type {
 		DataType::UInt8 | DataType::Int8 => 1,
@@ -1314,6 +1731,36 @@ fn value_byte_width(data_type: &DataType) -> usize {
 		DataType::UInt64 | DataType::Int64 => 8,
 		_ => 1,
 	}
+}
+
+fn ratio_micros(numerator: u64, denominator: u64) -> u64 {
+	if denominator == 0 {
+		u64::MAX
+	} else {
+		(numerator as f64 / denominator as f64 * 1_000_000.0) as u64
+	}
+}
+
+fn duration_ratio_micros(numerator: Duration, denominator: Duration) -> u64 {
+	let denominator = denominator.as_secs_f64();
+	if denominator == 0.0 {
+		u64::MAX
+	} else {
+		(numerator.as_secs_f64() / denominator * 1_000_000.0) as u64
+	}
+}
+
+fn duration_overhead_micros(numerator: Duration, denominator: Duration) -> u64 {
+	duration_ratio_micros(numerator, denominator).saturating_sub(1_000_000)
+}
+
+fn encoded_mask_digest(mask: &EncodedRowMask) -> String {
+	let values = mask.to_bool_vec().expect("bench mask digest");
+	let mut hasher = blake3::Hasher::new();
+	for value in values {
+		hasher.update(&[u8::from(value)]);
+	}
+	hasher.finalize().to_hex().to_string()
 }
 
 fn read_signed_le(chunk: &[u8], data_type: &DataType) -> i64 {

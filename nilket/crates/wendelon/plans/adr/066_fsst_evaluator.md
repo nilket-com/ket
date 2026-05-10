@@ -8,7 +8,9 @@ Companion implementation plan:
 ## Status
 
 Council-converged 2026-05-09 after four iterations across
-Claude / Codex / Gemini. Implementation pending.
+Claude / Codex / Gemini. V1 implementation is staged
+default-off; local Phase 7 evidence is recorded and default-on
+promotion remains blocked pending council review and cleared gates.
 
 V1 contract:
 
@@ -76,9 +78,10 @@ Phase 0 audit pins the FSST cascade encoding shape, the
 offsets-buffer encoding shape, the dense-fallback site,
 and constructs the boundary-crossing-symbol and
 no-compressed-row-slice regression fixtures. Bench
-evidence will land at
-`plans/impl/066_fsst_evaluator_bench_results.md` at
-promotion.
+diagnostic evidence, including full local encoding-compute and
+row-group matrices, is recorded at
+`plans/impl/066_fsst_evaluator_bench_results.md`; default-on
+promotion remains pending cleared gates.
 
 ## Context
 
@@ -462,9 +465,10 @@ DenseFallback).
 
    Anything else routes to dense via the existing
    `EncodingComputeFallbackReason::UnsupportedProgram`
-   path (atom mismatch) or via the manager's outer
-   dispatch keeping today's ADR 065 Case B path
-   (predicate-output overlap on the FSST column).
+   path (atom mismatch) or via the planner declining
+   to `EncodingComputeFallbackReason::UnsupportedCascade`
+   on FSST + predicate-output overlap, which falls
+   through to today's ADR 065 Case B path.
 
 10. **No plan-time fetch-byte economics gate in V1.**
     Earlier drafts proposed comparing
@@ -534,18 +538,19 @@ DenseFallback).
       ADR 060 / 064 cannot materialize a variable-
       width column via sparse projection (variable-
       width sparse projection is V2-deferred per ADR
-      060 / 064). The manager's outer dispatch
-      detects this overlap and routes through the
-      existing ADR 065 Case B path: the predicate
-      path falls back to dense decode-then-scan for
-      the FSST column (today's ADR 065 Case B
-      behavior). The FSST kernel does not engage in
-      this sub-case in V1; engagement is gated by
-      the manager's overlap check before kernel
-      dispatch. Variable-width sparse projection
-      (V2) would later unblock kernel engagement in
-      Sub-case A2 by allowing the FSST column itself
-      to materialize at survivor grain.
+      060 / 064). The encoding-compute planner
+      detects this overlap and declines to
+      `EncodingComputeFallbackReason::UnsupportedCascade`,
+      which falls through to today's ADR 065 Case B
+      path: the predicate path uses dense decode-
+      then-scan for the FSST column (today's ADR 065
+      Case B behavior). The FSST kernel does not
+      engage in this sub-case in V1; engagement is
+      gated by the planner's overlap check before
+      kernel dispatch. Variable-width sparse
+      projection (V2) would later unblock kernel
+      engagement in Sub-case A2 by allowing the FSST
+      column itself to materialize at survivor grain.
 
     Sub-case A2 means ADR 066's V1 win is scoped to
     queries where the FSST predicate column is *not*
@@ -583,7 +588,7 @@ all unchanged.
 
 ## Architectural inextricability
 
-Seven design choices are physically inseparable in V1.
+Six design choices are physically inseparable in V1.
 
 **1. Multi-buffer leaf is the new planner shape.** ADR
 058's existing native evaluators all consume a single
@@ -674,10 +679,11 @@ holds.
 
 ## V1 scope
 
-### 0. Phase 0 audit
+### 0. Phase 0 audit (as-built)
 
-Before implementation iteration 1, the council audits
-read-only:
+Phase 0 audit ran read-only against the staged
+substrate; the section below records the pinned
+contract:
 
 **FSST cascade and frame:**
 
@@ -946,7 +952,7 @@ new reject code.
 ## Composability
 
 **ADR 058 / 059 evaluator catalog.** ADR 066 extends
-the catalog by one. Existing five evaluators
+the catalog by one. Existing six evaluators
 unchanged; existing default allow-list extends by
 `Fsst` if Phase 7 evidence clears the council's
 gates. Two-step dispatch discipline applies

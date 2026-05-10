@@ -1,4 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema};
+use std::fs;
+use std::path::Path;
 use wendelon::schema::pbc::ColumnPredicateLiteralV1;
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
@@ -460,6 +462,50 @@ fn mask_algebra_specializations_match_bool_oracle() {
 				.into_iter()
 				.map(|selected| !selected)
 				.collect::<Vec<_>>()
+		);
+	}
+}
+
+#[test]
+fn fsst_kernel_invariants_are_locked_to_streaming_multi_buffer_shape() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let fsst_kernel =
+		fs::read_to_string(root.join("src/storage/encoding/compute/kernels/fsst.rs")).unwrap();
+	let manager = fs::read_to_string(root.join("src/storage/manager.rs")).unwrap();
+	for required in [
+		"FsstDecodedByteReader",
+		"reader.skip(row_len)?",
+		"by_len.get(&row_len)",
+		"decode_offsets",
+		"offset < previous",
+		"offsets.last().copied() != Some(expected_final)",
+	] {
+		assert!(
+			fsst_kernel.contains(required),
+			"FSST kernel invariant guard is missing token {required}"
+		);
+	}
+	for forbidden in [
+		"symbol_table_byte_len",
+		"decode_fsst_bytes",
+		"materialize_encoding_buffer",
+		"StringArray",
+	] {
+		assert!(
+			!fsst_kernel.contains(forbidden),
+			"FSST kernel must stay streaming and header-authoritative; forbidden token {forbidden}"
+		);
+	}
+	for required in [
+		"FsstValues",
+		"FsstOffsets",
+		"offsets_buffer_ordinal",
+		"max_encoded_pages_per_record",
+		"output_columns.contains(*column_index as u32)",
+	] {
+		assert!(
+			manager.contains(required),
+			"FSST manager invariant guard is missing token {required}"
 		);
 	}
 }

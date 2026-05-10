@@ -57,10 +57,11 @@ Inherits substrate:
 ## Status
 
 Council-converged 2026-05-09 across Claude / Codex /
-Gemini. Implementation pending. Phase 7 bench evidence
-will land at
-`plans/impl/066_fsst_evaluator_bench_results.md` at
-promotion.
+Gemini. V1 implementation is staged default-off. Phase 7
+diagnostic evidence, including full local encoding-compute and
+row-group matrices, is recorded at
+`plans/impl/066_fsst_evaluator_bench_results.md`; default-on
+promotion remains blocked pending council review and cleared gates.
 
 Implementation contract:
 
@@ -109,12 +110,13 @@ Implementation contract:
   for the remaining projection requirement (Sub-case
   A1 only — FSST predicate column not in output).
 - **Sub-case A2 (FSST predicate column in output,
-  predicate-output overlap)**: the manager's outer
-  dispatch detects overlap and routes through the
-  existing ADR 065 Case B path; kernel does not
-  engage in V1 (variable-width sparse projection
-  needed for kernel engagement here is V2-deferred
-  per ADR 060 / 064).
+  predicate-output overlap)**: the encoding-compute
+  planner detects overlap and declines to
+  `EncodingComputeFallbackReason::UnsupportedCascade`,
+  which falls through to the existing ADR 065 Case B
+  path; kernel does not engage in V1 (variable-width
+  sparse projection needed for kernel engagement here
+  is V2-deferred per ADR 060 / 064).
 - FSST predicates that decline kernel eligibility
   (atom mismatch, type mismatch, literal coercion
   failure) continue to populate
@@ -161,9 +163,9 @@ sparse projection. **Sub-case A2 queries** (FSST
 predicate column in output, predicate-output overlap)
 stay on the existing ADR 065 Case B path in V1
 because variable-width sparse projection is V2-
-deferred per ADR 060 / 064 — the manager's outer
-dispatch detects the overlap and skips kernel
-engagement. `IsNull` / `IsNotNull` continue on the
+deferred per ADR 060 / 064 — the encoding-compute
+planner detects the overlap and declines, falling
+through to the dense path with no kernel engagement. `IsNull` / `IsNotNull` continue on the
 existing ADR 059 validity-only path with no FSST
 kernel engagement. ADR 065 Case B/C remains
 reachable for non-V1 atoms (range / future LIKE /
@@ -285,70 +287,60 @@ read side:
   - decline non-V1 atoms / types / coercions via
     existing fallback paths.
 - ADR 058 row-group predicate planner +
-  surrounding manager helpers (concrete sites
-  pinned in Phase 0; today single-buffer fixed-
-  width-only):
-  - **`src/storage/manager.rs:11910`
-    `push_encoded_leaf`** currently rejects via
-    `encoding_compute_predicate_data_type_supported`
-    which excludes `Utf8` / `LargeUtf8` /
-    `Binary` / `LargeBinary`. Either extend that
-    helper to accept the variable-width types
-    when the chosen evaluator is `Fsst`, or
-    introduce a cascade-aware variant
-    (`encoding_compute_predicate_data_type_supported_for_evaluator(data_type, kind)`
-    or equivalent) so non-FSST evaluator kinds
-    do not inherit UTF-8 / Binary support.
-  - **`src/storage/manager.rs:11963`
-    `encoding_compute_value_buffer`** currently
-    asserts `mapping.buffer_count != 2` and
-    rejects otherwise. Variable-width FSST
-    leaves have `buffer_count == 3` (validity +
-    offsets + values). Extend the helper to
-    return all three buffer ordinals (validity
-    optional) for FSST cascade leaves; non-FSST
-    cascades keep the existing two-buffer
-    behavior.
-  - **`EncodingComputePhaseBLeaf::Encoded`**
-    (the per-leaf record built in
-    `push_encoded_leaf`) currently carries a
-    single `physical_ordinal`. For FSST
-    variable-width leaves it must carry the
-    triple `(validity_ordinal,
-    offsets_ordinal, values_ordinal)` (or an
-    equivalent shape that captures all three).
-    Either extend the existing variant with
-    optional offsets/validity ordinals or add a
-    parallel variant for variable-width leaves.
+  surrounding manager helpers (as-built in the
+  staged tree; line numbers move as the file
+  evolves — current pins below):
+  - **`encoding_compute_column_buffers`**
+    (`src/storage/manager.rs:12157`) is the new
+    helper that returns
+    `(physical_ordinal, value_buffer_ordinal,
+    offsets_buffer_ordinal: Option<…>)` and
+    accepts both `buffer_count == 2` (fixed-
+    width / no offsets) and `buffer_count == 3`
+    (variable-width FSST: validity + offsets +
+    values). The legacy
+    `encoding_compute_value_buffer`
+    (`:12149`) is now a thin wrapper around it
+    for the two-ordinal callers.
+  - **`push_encoded_leaf`**
+    (`src/storage/manager.rs:12075`) builds each
+    `EncodingComputePhaseBLeaf::Encoded` carrying
+    `physical_ordinal`,
+    `value_buffer_ordinal`, **and**
+    `offsets_buffer_ordinal: Option<IpcBufferIndex>`
+    (the offsets-aware shape).
+    Type eligibility runs through
+    `encoding_compute_predicate_data_type_candidate_supported`
+    (`:12190`), which delegates to the cascade-
+    aware
+    `encoding_compute_predicate_data_type_supported_for_evaluator`
+    (`:12195`) — non-FSST evaluator kinds do
+    not inherit UTF-8 / Binary support.
   - **`build_encoding_compute_phase_b_plan`**
-    (`src/storage/manager.rs:10975`) currently
-    builds fetch ranges from a single buffer
-    ordinal per leaf; extend it to fetch
-    validity + offsets + values together for
-    FSST leaves and to count each FSST leaf as
-    **one** logical encoded chunk for the
-    existing
+    (`src/storage/manager.rs:11078`) takes
+    `output_columns: &ColumnOrdinalSet` (`:11083`)
+    and gates Sub-case A2 directly: if the
+    chosen evaluator is `Fsst` and the predicate
+    column is in `output_columns`, the planner
+    returns
+    `EncodingComputeFallbackReason::UnsupportedCascade`
+    (`:11151-11156`), which falls through to
+    today's ADR 065 Case B path. The planner
+    fetches validity + offsets + values together
+    for FSST leaves and counts each FSST leaf as
+    **one** logical encoded chunk for the existing
     `EncodingComputeConfig.max_encoded_pages_per_record`
     cap (the multi-buffer fetch is one logical
     leaf, not three).
-  - **Sub-case A2 gating signature change**:
-    `try_read_encoding_compute_phase_b_from_l2`
-    (`src/storage/manager.rs:8922`) and
-    `build_encoding_compute_phase_b_plan` do
-    not currently receive the projection
-    requirement. ADR 066 plumbs either
-    `&ColumnFetchRequirement` (so the planner
-    can compute predicate-output overlap on
-    FSST cascade columns) or a derived
-    `predicate_output_overlap_columns:
-    BTreeSet<ColumnDescriptorOrdinal>` set into
-    these signatures. The planner uses that
-    information to decline FSST kernel
-    engagement when the FSST predicate column
-    is in the output (Sub-case A2 routes to
-    today's ADR 065 Case B path; kernel does
-    not engage in V1).
-  - non-FSST cascades unchanged.
+  - **`try_read_encoding_compute_phase_b_from_l2`**
+    (`src/storage/manager.rs:8950`) plumbs
+    `output_columns: &ColumnOrdinalSet`
+    (`:8962`) through to the planner, so Sub-
+    case A2 gating fires before kernel
+    invocation.
+  - non-FSST cascades unchanged (planner returns
+    the existing two-ordinal shape with
+    `offsets_buffer_ordinal == None`).
 - `src/storage/encoding/compute/config.rs` (or
   equivalent):
   - update `EncodingComputeConfig::default()`'s
@@ -483,11 +475,14 @@ read side:
 
 ## Phase 0 — Contract audit
 
-Read-only audit. Findings will land here at
-implementation iteration 1.
+Read-only audit. The audit landed during
+implementation; this section records the as-built
+contract — what the staged tree pins. (Phases 1–5
+that follow describe the shipped implementation in
+the same as-built tense.)
 
-Pin the following (placeholder symbols; iteration 1
-substitutes real file paths and line numbers):
+Pinned sites (line numbers move as `manager.rs`
+evolves; current pins below):
 
 **FSST cascade and frame:**
 
@@ -631,17 +626,17 @@ streaming reader's surface), implementation
 escalates to a separate ADR 057 amendment first.
 ADR 066 V1 does not silently expand scope.
 
-**Exit gate:** Phase 0 audit findings recorded in
-implementation iteration 1; council confirms the
-kernel is implementable without an ADR 057
-amendment and that the WFS1 header is a sufficient
-source of truth for the symbol table.
+**Exit gate (as-built):** Phase 0 audit findings
+recorded in this section; the kernel is
+implementable without an ADR 057 amendment and the
+WFS1 header is a sufficient source of truth for the
+symbol table.
 
 ## Phase 1 — FSST frame and offset readers
 
-Add the passive helpers in `kernels/fsst.rs`. No
-dispatch wiring yet; this phase makes the FSST
-framing addressable from the kernel side.
+Passive helpers landed in `kernels/fsst.rs`; no
+dispatch wiring yet. The shape below is the as-built
+contract.
 
 Files:
 - `src/storage/encoding/compute/kernels/fsst.rs`
@@ -749,8 +744,9 @@ slicing. No dispatch wiring yet.
 
 ## Phase 2 — Equality kernel
 
-Add the buffer-grain equality walker (Strategy A
-only).
+Buffer-grain equality walker (Strategy A only)
+landed in `kernels/fsst.rs`. The shape below is the
+as-built contract.
 
 Files:
 - `src/storage/encoding/compute/kernels/fsst.rs`
@@ -873,13 +869,15 @@ regression fixtures.
 
 ## Phase 3 — Dispatch and planning
 
-Wire the kernel into ADR 058's dispatch and extend
-the row-group planner. The kernel reads the FSST
-symbol table from the WFS1 header authoritatively;
-no cascade-record changes. V1 ships without a plan-
-time fetch-byte economics gate (kernel and dense
-fallback fetch the same encoded payload); CPU-cost
-adversarial cases are policed by the Phase 7 bench.
+The kernel is wired into ADR 058's dispatch and the
+row-group planner is extended for FSST leaves. The
+kernel reads the FSST symbol table from the WFS1
+header authoritatively; no cascade-record changes.
+V1 ships without a plan-time fetch-byte economics
+gate (kernel and dense fallback fetch the same
+encoded payload); CPU-cost adversarial cases are
+policed by the Phase 7 bench. The shape below is
+the as-built contract.
 
 Files:
 - `src/storage/encoding/compute/types.rs` (catalog)
@@ -921,9 +919,12 @@ Work:
        see ADR 066 Decision §12). Sub-case A2
        (predicate-output overlap on the FSST
        column) routes through the existing ADR 065
-       Case B path with no kernel engagement; this
-       check happens at the manager's outer
-       dispatch before the kernel is invoked.
+       Case B path with no kernel engagement; the
+       overlap check fires inside
+       `build_encoding_compute_phase_b_plan`, which
+       declines to `UnsupportedCascade` and falls
+       through to the dense path before the kernel
+       is invoked.
    - decline non-V1 atoms / types / coercions via
      existing `UnsupportedProgram` fallback path
      (no new fallback variant). Sub-case A2 is not
@@ -986,7 +987,8 @@ reads symbol table from WFS1 header.
 
 ## Phase 4 — ADR 060 / 064 / 065 composition
 
-Verify composition paths.
+Composition paths verified end-to-end. The shape
+below is the as-built contract.
 
 Files:
 - `tests/row_group_sparse_projection_fetch.rs`
@@ -1004,9 +1006,10 @@ Work:
 
 2. **Sub-case A2 tests** (FSST predicate column
    in output, predicate-output overlap on the
-   FSST column): the manager's outer dispatch
-   detects overlap, skips kernel engagement, and
-   routes through the existing ADR 065 Case B
+   FSST column): `build_encoding_compute_phase_b_plan`
+   detects overlap, declines to
+   `UnsupportedCascade`, and the read pipeline
+   falls through to the existing ADR 065 Case B
    path (dense decode-then-scan; populates
    `predicate_projection_by_group`). Verify the
    path is byte-identical to today's behavior
@@ -1021,7 +1024,7 @@ Work:
    **not** route to ADR 065 Case B/C dense
    fallback).
 
-3. Verify ADR 052 secondary-index point reads on
+4. Verify ADR 052 secondary-index point reads on
    FSST-keyed columns gain kernel coverage
    through the existing confirm-step dispatch
    (no ADR 052 code changes; new path coverage
@@ -1031,16 +1034,16 @@ Work:
    052; if not feasible, document as Phase 4
    gap and defer to a separate follow-up.
 
-4. Verify ADR 065 zip output path remains
+5. Verify ADR 065 zip output path remains
    untouched on FSST declines (no double-filter
    regression).
 
-5. End-to-end fixture: FSST predicate engages
+6. End-to-end fixture: FSST predicate engages
    kernel → Case A sparse projection on
    remaining columns → output equals full-dense
    oracle byte-for-byte.
 
-6. **Boundary-crossing-symbol regression in the
+7. **Boundary-crossing-symbol regression in the
    composition test**: end-to-end fixture
    includes a row pair where a symbol spans the
    boundary; verify the full pipeline produces
@@ -1054,8 +1057,8 @@ covered end-to-end.
 
 ## Phase 5 — Architecture guards
 
-Land ADR 066 lockdown guards in
-`tests/architecture_test.rs`:
+ADR 066 lockdown guards landed in
+`tests/architecture_test.rs`. The guard set:
 
 - `EncodingComputeEvaluatorKind` count = previous
   + 1 (exactly one new variant `Fsst`).
@@ -1418,7 +1421,7 @@ cargo test --test encoding_secondary_index
 cargo test --test encoding_chunk_layout
 cargo test --test l2_remote
 cargo test --test l2_rehydration
-cargo test --test multirow
+cargo test multirow
 cargo test --test config_loader
 cargo check
 cargo check --benches
@@ -1541,9 +1544,9 @@ bounded. Phase 7 records allocation count if
 regression suspected.
 
 **`enabled_predicate_evaluators` shape doesn't
-admit a clean extension.** Phase 0 confirms
-shape. If extension requires config-format
-change, implementation iteration 1 escalates.
+admit a clean extension.** Phase 0 confirmed the
+shape admits the `Fsst` addition without a config-
+format change.
 
 **Multi-buffer planner regression.** Extending
 the row-group predicate planner's encoded-leaf

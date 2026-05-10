@@ -7,21 +7,22 @@ use wendelon::schema::pbc::{
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, AggregateState, BaseValue, BitsPerValue,
-	BufferValueCount, Consistency, EncodingCascadeIndex, HybridTimestamp, IpcBufferIndex,
-	IpcColumnOrdinal, Locality, LocalityPolicyV1, LocalityRange, MultiRowLayoutDescriptor,
-	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordLayoutPolicy, RowCount, RowGroupIndex,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount, TableObjectId,
-	TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
+	BufferValueCount, Consistency, EncodingCascadeIndex, EncodingPageByteOffset, HybridTimestamp,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LocalityPolicyV1, LocalityRange,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordLayoutPolicy,
+	RowCount, RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount,
+	TableObjectId, TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
 };
 use wendelon::schema::{DictValueCount, RunCount};
 use wendelon::storage::encoding::cascade::encode_buffer;
 use wendelon::storage::encoding::{
-	BufferEncoding, EncodedAggregateContext, EncodedAggregateKind, EncodedPredicateNode,
-	EncodedRowMask, EncodingCascade, EncodingComputeConfig, EncodingComputeEvaluatorKind,
-	EncodingComputePlanMode, EncodingComputeRejectCode, EncodingLeafCascade, PredicateAtom,
-	PredicateAtomOp, aggregate_kind_for_tag, coerce_literal, encoded_predicate_node_from_tree,
-	evaluate, evaluate_validity_bitmap, evaluator_kind_for_cascade, route_selectivity,
-	try_fold_encoded_aggregate_request,
+	BufferEncoding, EncodedAggregateContext, EncodedAggregateKind, EncodedBufferByteRange,
+	EncodedPredicateNode, EncodedRowMask, EncodingCascade, EncodingComputeConfig,
+	EncodingComputeEvaluatorKind, EncodingComputePlanMode, EncodingComputeRejectCode,
+	EncodingLeafCascade, PredicateAtom, PredicateAtomOp, aggregate_kind_for_tag, coerce_literal,
+	encoded_predicate_node_from_tree, evaluate, evaluate_fsst_predicate,
+	evaluate_fsst_predicate_with_stats, evaluate_validity_bitmap, evaluator_kind_for_cascade,
+	route_selectivity, try_fold_encoded_aggregate_request,
 };
 
 #[test]
@@ -43,6 +44,7 @@ fn encoding_compute_config_defaults_are_locked() {
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryPlain));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryBitPacked));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Delta));
+	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Fsst));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RlePlain));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RleBitPacked));
 	assert!(config.aggregate_kernel_enabled(EncodedAggregateKind::CountStar));
@@ -181,6 +183,12 @@ fn evaluator_kind_for_cascade_routes_unsupported_inners_to_dense_fallback() {
 
 	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Plain), None);
 	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Lz4Frame), None);
+	assert_eq!(
+		evaluator_kind_for_cascade(&EncodingCascade::Fsst {
+			symbol_table_byte_len: RecordBodyByteLen::ZERO,
+		}),
+		Some(EncodingComputeEvaluatorKind::Fsst)
+	);
 }
 
 #[test]
@@ -309,6 +317,428 @@ fn bitpacked_predicate_evaluator_matches_decoded_values() {
 		mask.to_bool_vec().unwrap(),
 		vec![false, true, false, false, false, true, false, false]
 	);
+}
+
+#[test]
+fn fsst_predicate_evaluator_matches_decoded_string_oracle() {
+	let data_type = DataType::Utf8;
+	let values: &[&[u8]] = &[
+		b"/checkout/confirm",
+		b"/cart/view",
+		b"/checkout/confirm",
+		b"",
+		b"/account/settings",
+		b"/checkout/confirm",
+	];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		&decoded,
+		&data_type,
+		cascade.clone(),
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	let encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(decoded.len() as u64),
+		decoded_value_count: BufferValueCount::new(values.len() as u32),
+		encoded_range: encoded.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	let offset_bytes = offsets_i32_bytes(&offsets);
+
+	let eq_literal = ColumnPredicateLiteralV1::Str(b"/checkout/confirm".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(eq_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&eq_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value == b"/checkout/confirm")
+			.collect::<Vec<_>>()
+	);
+
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Neq,
+		literal: Some(eq_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&eq_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value != b"/checkout/confirm")
+			.collect::<Vec<_>>()
+	);
+
+	let list_literal = ColumnPredicateLiteralV1::List(vec![
+		ColumnPredicateLiteralV1::Str(b"/cart/view".to_vec()),
+		ColumnPredicateLiteralV1::Str(Vec::new()),
+	]);
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::InList,
+		literal: Some(list_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&list_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value == b"/cart/view" || value.is_empty())
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn fsst_length_prefilter_records_zero_byte_comparisons_for_disjoint_lengths() {
+	let data_type = DataType::Utf8;
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"gamma", b"delta"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	let encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(decoded.len() as u64),
+		decoded_value_count: BufferValueCount::new(values.len() as u32),
+		encoded_range: encoded.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	let literal = ColumnPredicateLiteralV1::Str(b"x".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	let (mask, stats) = evaluate_fsst_predicate_with_stats(
+		&encoded.bytes,
+		&encoding,
+		&offsets_i32_bytes(&offsets),
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(mask.to_bool_vec().unwrap(), vec![false; values.len()]);
+	assert_eq!(stats.rows, values.len());
+	assert_eq!(stats.length_mismatch_rows, values.len());
+	assert_eq!(stats.length_match_rows, 0);
+	assert_eq!(stats.byte_comparisons, 0);
+	assert_eq!(stats.decoded_bytes_walked, decoded.len());
+	assert_eq!(stats.decoded_bytes_skipped, decoded.len());
+}
+
+#[test]
+fn fsst_streaming_reader_handles_symbol_crossing_row_boundary() {
+	let data_type = DataType::Utf8;
+	let values: &[&[u8]] = &[b"A", b"B", b"AB", b"AB", b"AB"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	assert!(
+		encoded.bytes.contains(&(0x80_u8)),
+		"fixture should encode the row-boundary AB pair as an FSST symbol"
+	);
+	let encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(decoded.len() as u64),
+		decoded_value_count: BufferValueCount::new(values.len() as u32),
+		encoded_range: encoded.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	let literal = ColumnPredicateLiteralV1::Str(b"B".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	let mask = evaluate_fsst_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offsets_i32_bytes(&offsets),
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		vec![false, true, false, false, false]
+	);
+}
+
+#[test]
+fn fsst_offset_corruption_fails_closed() {
+	let data_type = DataType::Utf8;
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"gamma"];
+	let (decoded, mut offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	let encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(decoded.len() as u64),
+		decoded_value_count: BufferValueCount::new(values.len() as u32),
+		encoded_range: encoded.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	offsets[2] = 1;
+	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	assert_eq!(
+		evaluate_fsst_predicate(
+			&encoded.bytes,
+			&encoding,
+			&offsets_i32_bytes(&offsets),
+			None,
+			None,
+			&data_type,
+			&atom,
+			&coercion,
+		)
+		.unwrap_err(),
+		EncodingComputeRejectCode::KernelDecodedLengthMismatch
+	);
+}
+
+#[test]
+fn fsst_malformed_frames_fail_closed() {
+	let data_type = DataType::Utf8;
+	let literal = ColumnPredicateLiteralV1::Str(b"A".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	let offset_bytes = offsets_i32_bytes(&[0, 1]);
+	for frame in [
+		b"BAD!".to_vec(),
+		b"WFS1\x01A".to_vec(),
+		b"WFS1\x00\x80".to_vec(),
+		b"WFS1\x00\xff".to_vec(),
+	] {
+		let encoding = fsst_test_encoding(1, 1, frame.len());
+		assert_eq!(
+			evaluate_fsst_predicate(
+				&frame,
+				&encoding,
+				&offset_bytes,
+				None,
+				None,
+				&data_type,
+				&atom,
+				&coercion,
+			)
+			.unwrap_err(),
+			EncodingComputeRejectCode::KernelDecodedLengthMismatch
+		);
+	}
+}
+
+#[test]
+fn fsst_large_and_binary_types_match_decoded_oracle() {
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"alpha", b"", b"\xff-bin"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	for data_type in [DataType::LargeUtf8, DataType::Binary, DataType::LargeBinary] {
+		let cascade = EncodingCascade::Fsst {
+			symbol_table_byte_len: RecordBodyByteLen::ZERO,
+		};
+		let encoded = encode_buffer(
+			&decoded,
+			&data_type,
+			cascade,
+			BufferValueCount::new(values.len() as u32),
+			SimdPageValueCount::new(1024),
+		)
+		.unwrap();
+		let encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
+		let offset_bytes = if matches!(data_type, DataType::LargeUtf8 | DataType::LargeBinary) {
+			offsets_i64_bytes(
+				&offsets
+					.iter()
+					.map(|offset| i64::from(*offset))
+					.collect::<Vec<_>>(),
+			)
+		} else {
+			offsets_i32_bytes(&offsets)
+		};
+		let atom = PredicateAtom {
+			op: PredicateAtomOp::Eq,
+			literal: Some(literal.clone()),
+		};
+		let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+		let mask = evaluate_fsst_predicate(
+			&encoded.bytes,
+			&encoding,
+			&offset_bytes,
+			None,
+			None,
+			&data_type,
+			&atom,
+			&coercion,
+		)
+		.unwrap();
+		assert_eq!(
+			mask.to_bool_vec().unwrap(),
+			values
+				.iter()
+				.map(|value| *value == b"alpha")
+				.collect::<Vec<_>>()
+		);
+	}
+}
+
+#[test]
+fn fsst_decodes_encoded_offsets_buffer() {
+	let data_type = DataType::Utf8;
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"alpha"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	let value_encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
+	let dense_offsets = offsets_i32_bytes(&offsets);
+	let offset_cascade = EncodingCascade::Lz4Frame;
+	let encoded_offsets = encode_buffer(
+		&dense_offsets,
+		&DataType::Int32,
+		offset_cascade.clone(),
+		BufferValueCount::new(offsets.len() as u32),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+	let offset_encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(1),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(dense_offsets.len() as u64),
+		decoded_value_count: BufferValueCount::new(offsets.len() as u32),
+		encoded_range: encoded_offsets.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded_offsets.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	let mask = evaluate_fsst_predicate(
+		&encoded.bytes,
+		&value_encoding,
+		&encoded_offsets.bytes,
+		Some(&offset_encoding),
+		Some(&offset_cascade),
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(mask.to_bool_vec().unwrap(), vec![true, false, true]);
 }
 
 #[test]
@@ -681,6 +1111,49 @@ fn encoding_compute_metrics_render_bounded_labels() {
 			rendered.contains(expected),
 			"missing metric output: {expected}"
 		);
+	}
+}
+
+fn variable_width_payload(values: &[&[u8]]) -> (Vec<u8>, Vec<i32>) {
+	let mut decoded = Vec::new();
+	let mut offsets = Vec::with_capacity(values.len() + 1);
+	offsets.push(0_i32);
+	for value in values {
+		decoded.extend_from_slice(value);
+		offsets.push(i32::try_from(decoded.len()).expect("test offset fits i32"));
+	}
+	(decoded, offsets)
+}
+
+fn offsets_i32_bytes(offsets: &[i32]) -> Vec<u8> {
+	offsets
+		.iter()
+		.flat_map(|offset| offset.to_le_bytes())
+		.collect()
+}
+
+fn offsets_i64_bytes(offsets: &[i64]) -> Vec<u8> {
+	offsets
+		.iter()
+		.flat_map(|offset| offset.to_le_bytes())
+		.collect()
+}
+
+fn fsst_test_encoding(decoded_len: usize, rows: usize, encoded_len: usize) -> BufferEncoding {
+	BufferEncoding {
+		row_group_index: RowGroupIndex::new(0),
+		ipc_column_ordinal: IpcColumnOrdinal::new(0),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::new(0),
+		decoded_byte_len: RecordBodyByteLen::new(decoded_len as u64),
+		decoded_value_count: BufferValueCount::new(rows as u32),
+		encoded_range: EncodedBufferByteRange {
+			start: EncodingPageByteOffset::ZERO,
+			len: RecordBodyByteLen::new(encoded_len as u64),
+		},
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: Vec::new(),
+		page_stats: Vec::new(),
 	}
 }
 

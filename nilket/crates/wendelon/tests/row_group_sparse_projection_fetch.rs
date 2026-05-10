@@ -58,6 +58,37 @@ fn sparse_projection_fetch_target_binds_runtime_dense_oracle() {
 }
 
 #[test]
+fn adr066_fsst_case_a_binds_sparse_projection_composition() {
+	let manager = source("src/storage/manager.rs");
+	let bench = source("benches/row_group_fetch.rs");
+	for required in [
+		"fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap",
+		"read_projected_record_from_l2",
+		"phase_b_fetch.is_some()",
+		"FSST A1 must not carry the predicate column into Phase C projection",
+		"execute_program(&predicate, &batch)",
+	] {
+		assert!(
+			manager.contains(required),
+			"manager FSST composition coverage is missing ADR 066 token {required}"
+		);
+	}
+	for required in [
+		"bench_adr066_fsst_row_group_fetch_matrix",
+		"scenario=adr066_fsst_row_group_fetch",
+		"route=case_a_after_fsst",
+		"route=dense_case_b_overlap_a2",
+		"kernel_engaged=false",
+		"fsst_kernel_vs_dense_cpu_micros",
+	] {
+		assert!(
+			bench.contains(required),
+			"row_group_fetch bench is missing ADR 066 token {required}"
+		);
+	}
+}
+
+#[test]
 fn sparse_projection_fetch_target_binds_helper_split() {
 	let mod_rs = source("src/storage/encoding/mod.rs");
 	let helper = source("src/storage/encoding/page_materialize.rs");
