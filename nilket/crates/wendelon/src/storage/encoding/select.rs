@@ -1,4 +1,6 @@
-use crate::schema::{BaseValue, BitsPerValue, BufferValueCount, RecordBodyByteLen, RunCount};
+use crate::schema::{
+	BaseValue, BitsPerValue, BufferValueCount, RecordBodyByteLen, RunCount, SimdPageValueCount,
+};
 use crate::storage::encoding::cascade::{
 	EncodedBuffer, encode_buffer, encode_buffer_with_value_offsets, fixed_width_bytes_per_value,
 };
@@ -126,13 +128,14 @@ fn select_candidate_cascade(
 		}
 	}
 
-	if config.cascade_enabled(EncodingCascadeKind::Fsst)
+	if (config.cascade_enabled(EncodingCascadeKind::Fsst)
+		|| config.cascade_enabled(EncodingCascadeKind::FsstRowSafe))
 		&& is_variable_width_candidate_type(data_type)
 		&& sample.fsst_compressible
+		&& let Some(candidate) =
+			select_fsst_candidate(input, data_type, decoded_value_count, config, value_offsets)?
 	{
-		return Ok(EncodingCascade::Fsst {
-			symbol_table_byte_len: RecordBodyByteLen::new(0),
-		});
+		return Ok(candidate);
 	}
 
 	if config.cascade_enabled(EncodingCascadeKind::Dictionary)
@@ -191,6 +194,55 @@ fn select_candidate_cascade(
 	}
 
 	Ok(plain_or_lz4(config))
+}
+
+fn select_fsst_candidate(
+	input: &[u8],
+	data_type: &DataType,
+	decoded_value_count: BufferValueCount,
+	config: &EncodingWriterConfig,
+	value_offsets: Option<&[u64]>,
+) -> std::io::Result<Option<EncodingCascade>> {
+	let fsst_enabled = config.cascade_enabled(EncodingCascadeKind::Fsst);
+	let row_safe_enabled = config.cascade_enabled(EncodingCascadeKind::FsstRowSafe);
+	let fsst = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::new(0),
+	};
+	if row_safe_enabled && let Some(offsets) = value_offsets {
+		let row_safe = EncodingCascade::FsstRowSafe {
+			symbol_table_byte_len: RecordBodyByteLen::new(0),
+		};
+		let row_safe_encoded = encode_buffer_with_value_offsets(
+			input,
+			data_type,
+			row_safe.clone(),
+			decoded_value_count,
+			SimdPageValueCount::new(decoded_value_count.get().max(1)),
+			Some(offsets),
+		)?;
+		let row_safe_len = row_safe_encoded.bytes.len();
+		let plaintext_guard = row_safe_len <= input.len();
+		let wfs1_guard = if fsst_enabled {
+			let fsst_encoded = encode_buffer_with_value_offsets(
+				input,
+				data_type,
+				fsst.clone(),
+				decoded_value_count,
+				SimdPageValueCount::new(decoded_value_count.get().max(1)),
+				value_offsets,
+			)?;
+			row_safe_len <= fsst_encoded.bytes.len().saturating_mul(11).div_ceil(10)
+		} else {
+			true
+		};
+		if plaintext_guard && wfs1_guard {
+			return Ok(Some(row_safe));
+		}
+	}
+	if fsst_enabled {
+		return Ok(Some(fsst));
+	}
+	Ok(None)
 }
 
 fn plain_or_lz4(config: &EncodingWriterConfig) -> EncodingCascade {

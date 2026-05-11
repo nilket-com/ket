@@ -81,6 +81,110 @@ fn encoding_cascades_roundtrip_byte_buffers() {
 }
 
 #[test]
+fn fsst_wfs1_known_fixture_remains_byte_stable() {
+	let input = b"ABABAB";
+	let cascade = EncodingCascade::Fsst {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer(
+		input,
+		&DataType::Binary,
+		cascade,
+		BufferValueCount::new(3),
+		SimdPageValueCount::new(1024),
+	)
+	.unwrap();
+
+	assert_eq!(encoded.bytes, b"WFS1\x01AB\x80\x80\x80");
+}
+
+#[test]
+fn fsst_row_safe_roundtrips_and_does_not_train_across_rows() {
+	let values: &[&[u8]] = &[b"A", b"B", b"A", b"B", b"A", b"B"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&decoded,
+		&DataType::Binary,
+		cascade.clone(),
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+		Some(&offsets),
+	)
+	.unwrap();
+
+	assert!(encoded.bytes.starts_with(b"WFS2"));
+	assert_eq!(
+		encoded.bytes[4], 0,
+		"row-safe training must not see AB across row boundaries"
+	);
+	let decoded_roundtrip = decode_buffer(
+		&encoded.bytes,
+		&DataType::Binary,
+		&cascade,
+		RecordBodyByteLen::new(decoded.len() as u64),
+		BufferValueCount::new(values.len() as u32),
+	)
+	.unwrap();
+	assert_eq!(decoded_roundtrip, decoded);
+}
+
+#[test]
+fn fsst_row_safe_handles_empty_rows_and_high_bit_literals() {
+	let values: &[&[u8]] = &[b"", b"\xff-bin", b"\x80\x81", b""];
+	let (decoded, offsets) = variable_width_payload(values);
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&decoded,
+		&DataType::Binary,
+		cascade.clone(),
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+		Some(&offsets),
+	)
+	.unwrap();
+	let decoded_roundtrip = decode_buffer(
+		&encoded.bytes,
+		&DataType::Binary,
+		&cascade,
+		RecordBodyByteLen::new(decoded.len() as u64),
+		BufferValueCount::new(values.len() as u32),
+	)
+	.unwrap();
+
+	assert_eq!(decoded_roundtrip, decoded);
+}
+
+#[test]
+fn malformed_fsst_row_safe_frame_fails_dense_decode() {
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let bad_frames = [
+		b"WFS2\x00\x01\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+		b"WFS2\x00\x01\x00\x00\x00\x00\x00\x00\x00x".to_vec(),
+		b"WFS2\x01AB\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x81".to_vec(),
+	];
+	for frame in bad_frames {
+		assert_eq!(
+			decode_buffer(
+				&frame,
+				&DataType::Binary,
+				&cascade,
+				RecordBodyByteLen::new(1),
+				BufferValueCount::new(1),
+			)
+			.unwrap_err(),
+			wendelon::storage::encoding::EncodingRejectCode::DecodedLengthMismatch
+		);
+	}
+}
+
+#[test]
 fn delta_cascade_roundtrips_fixed_width_monotonic_values() {
 	let values = u64_bytes((0..4096).map(|value| 10_000_u64 + value));
 	let cascade = EncodingCascade::Delta {
@@ -106,6 +210,17 @@ fn delta_cascade_roundtrips_fixed_width_monotonic_values() {
 	)
 	.unwrap();
 	assert_eq!(decoded, values);
+}
+
+fn variable_width_payload(values: &[&[u8]]) -> (Vec<u8>, Vec<u64>) {
+	let mut decoded = Vec::new();
+	let mut offsets = Vec::with_capacity(values.len() + 1);
+	offsets.push(0_u64);
+	for value in values {
+		decoded.extend_from_slice(value);
+		offsets.push(decoded.len() as u64);
+	}
+	(decoded, offsets)
 }
 
 #[test]

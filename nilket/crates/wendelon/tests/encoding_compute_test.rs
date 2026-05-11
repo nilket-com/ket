@@ -14,15 +14,16 @@ use wendelon::schema::{
 	TableObjectId, TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
 };
 use wendelon::schema::{DictValueCount, RunCount};
-use wendelon::storage::encoding::cascade::encode_buffer;
+use wendelon::storage::encoding::cascade::{encode_buffer, encode_buffer_with_value_offsets};
 use wendelon::storage::encoding::{
 	BufferEncoding, EncodedAggregateContext, EncodedAggregateKind, EncodedBufferByteRange,
 	EncodedPredicateNode, EncodedRowMask, EncodingCascade, EncodingComputeConfig,
 	EncodingComputeEvaluatorKind, EncodingComputePlanMode, EncodingComputeRejectCode,
 	EncodingLeafCascade, PredicateAtom, PredicateAtomOp, aggregate_kind_for_tag, coerce_literal,
 	encoded_predicate_node_from_tree, evaluate, evaluate_fsst_predicate,
-	evaluate_fsst_predicate_with_stats, evaluate_validity_bitmap, evaluator_kind_for_cascade,
-	route_selectivity, try_fold_encoded_aggregate_request,
+	evaluate_fsst_predicate_with_stats, evaluate_fsst_row_safe_predicate,
+	evaluate_fsst_row_safe_predicate_with_stats, evaluate_validity_bitmap,
+	evaluator_kind_for_cascade, route_selectivity, try_fold_encoded_aggregate_request,
 };
 
 #[test]
@@ -45,6 +46,7 @@ fn encoding_compute_config_defaults_are_locked() {
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryBitPacked));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Delta));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Fsst));
+	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::FsstRowSafe));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RlePlain));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RleBitPacked));
 	assert!(config.aggregate_kernel_enabled(EncodedAggregateKind::CountStar));
@@ -188,6 +190,20 @@ fn evaluator_kind_for_cascade_routes_unsupported_inners_to_dense_fallback() {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		}),
 		Some(EncodingComputeEvaluatorKind::Fsst)
+	);
+	assert_eq!(
+		evaluator_kind_for_cascade(&EncodingCascade::FsstRowSafe {
+			symbol_table_byte_len: RecordBodyByteLen::ZERO,
+		}),
+		Some(EncodingComputeEvaluatorKind::FsstRowSafe)
+	);
+	assert_eq!(
+		EncodingComputeEvaluatorKind::FsstRowSafe.as_str(),
+		"fsst_row_safe"
+	);
+	assert_eq!(
+		EncodingComputeEvaluatorKind::from_label("fsst_row_safe"),
+		Some(EncodingComputeEvaluatorKind::FsstRowSafe)
 	);
 }
 
@@ -742,6 +758,201 @@ fn fsst_decodes_encoded_offsets_buffer() {
 }
 
 #[test]
+fn fsst_row_safe_predicate_evaluator_matches_encoded_literal_oracle() {
+	let data_type = DataType::Binary;
+	let values: &[&[u8]] = &[
+		b"/checkout/confirm",
+		b"/cart/view",
+		b"/checkout/confirm",
+		b"",
+		b"\xff-bin",
+		b"/checkout/confirm",
+	];
+	let (decoded, offsets) = variable_width_payload(values);
+	let offsets_u64 = offsets_as_u64(&offsets);
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+		Some(&offsets_u64),
+	)
+	.unwrap();
+	let encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
+	let offset_bytes = offsets_i32_bytes(&offsets);
+
+	let eq_literal = ColumnPredicateLiteralV1::Str(b"/checkout/confirm".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(eq_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&eq_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_row_safe_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value == b"/checkout/confirm")
+			.collect::<Vec<_>>()
+	);
+
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Neq,
+		literal: Some(eq_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&eq_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_row_safe_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value != b"/checkout/confirm")
+			.collect::<Vec<_>>()
+	);
+
+	let list_literal = ColumnPredicateLiteralV1::List(vec![
+		ColumnPredicateLiteralV1::Str(b"/cart/view".to_vec()),
+		ColumnPredicateLiteralV1::Str(Vec::new()),
+		ColumnPredicateLiteralV1::Str(b"\xff-bin".to_vec()),
+	]);
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::InList,
+		literal: Some(list_literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&list_literal), &data_type).unwrap();
+	let mask = evaluate_fsst_row_safe_predicate(
+		&encoded.bytes,
+		&encoding,
+		&offset_bytes,
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(
+		mask.to_bool_vec().unwrap(),
+		values
+			.iter()
+			.map(|value| *value == b"/cart/view" || value.is_empty() || *value == b"\xff-bin")
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn fsst_row_safe_length_prefilter_records_zero_encoded_comparisons() {
+	let data_type = DataType::Binary;
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"gamma", b"delta"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let offsets_u64 = offsets_as_u64(&offsets);
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+		Some(&offsets_u64),
+	)
+	.unwrap();
+	let encoding = fsst_test_encoding(decoded.len(), values.len(), encoded.bytes.len());
+	let literal = ColumnPredicateLiteralV1::Str(b"x".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	let (mask, stats) = evaluate_fsst_row_safe_predicate_with_stats(
+		&encoded.bytes,
+		&encoding,
+		&offsets_i32_bytes(&offsets),
+		None,
+		None,
+		&data_type,
+		&atom,
+		&coercion,
+	)
+	.unwrap();
+	assert_eq!(mask.to_bool_vec().unwrap(), vec![false; values.len()]);
+	assert_eq!(stats.rows, values.len());
+	assert_eq!(stats.decoded_length_mismatch_rows, values.len());
+	assert_eq!(stats.decoded_length_match_rows, 0);
+	assert_eq!(stats.encoded_bytes_compared, 0);
+}
+
+#[test]
+fn fsst_row_safe_corrupt_metadata_fails_closed() {
+	let data_type = DataType::Binary;
+	let values: &[&[u8]] = &[b"alpha", b"beta", b"alpha"];
+	let (decoded, offsets) = variable_width_payload(values);
+	let offsets_u64 = offsets_as_u64(&offsets);
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&decoded,
+		&data_type,
+		cascade,
+		BufferValueCount::new(values.len() as u32),
+		SimdPageValueCount::new(1024),
+		Some(&offsets_u64),
+	)
+	.unwrap();
+	let mut corrupt = encoded.bytes;
+	let symbol_count = corrupt[4] as usize;
+	let first_offset = 5 + symbol_count * 2 + 4;
+	corrupt[first_offset] = 1;
+	let encoding = fsst_test_encoding(decoded.len(), values.len(), corrupt.len());
+	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
+	let atom = PredicateAtom {
+		op: PredicateAtomOp::Eq,
+		literal: Some(literal.clone()),
+	};
+	let coercion = coerce_literal(Some(&literal), &data_type).unwrap();
+	assert_eq!(
+		evaluate_fsst_row_safe_predicate(
+			&corrupt,
+			&encoding,
+			&offsets_i32_bytes(&offsets),
+			None,
+			None,
+			&data_type,
+			&atom,
+			&coercion,
+		)
+		.unwrap_err(),
+		EncodingComputeRejectCode::KernelDecodedLengthMismatch
+	);
+}
+
+#[test]
 fn value_dispatch_rejects_null_atoms_without_validity_bitmap() {
 	let data_type = DataType::Int32;
 	let values = [0_i32, 1, 2, 3];
@@ -1136,6 +1347,13 @@ fn offsets_i64_bytes(offsets: &[i64]) -> Vec<u8> {
 	offsets
 		.iter()
 		.flat_map(|offset| offset.to_le_bytes())
+		.collect()
+}
+
+fn offsets_as_u64(offsets: &[i32]) -> Vec<u64> {
+	offsets
+		.iter()
+		.map(|offset| u64::try_from(*offset).expect("test offset is non-negative"))
 		.collect()
 }
 

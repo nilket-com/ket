@@ -1188,6 +1188,9 @@ fn write_cascade(out: &mut Vec<u8>, cascade: &EncodingCascade) -> std::io::Resul
 		}
 		EncodingCascade::Fsst {
 			symbol_table_byte_len,
+		}
+		| EncodingCascade::FsstRowSafe {
+			symbol_table_byte_len,
 		} => {
 			write_u64(out, symbol_table_byte_len.get());
 		}
@@ -1250,6 +1253,10 @@ fn read_cascade(bytes: &[u8], cursor: &mut usize) -> Result<EncodingCascade, Enc
 			factor: Factor::new(read_i64(bytes, cursor)?),
 			exception_count: ExceptionCount::new(read_u32(bytes, cursor)?),
 			inner: Box::new(read_leaf_cascade(bytes, cursor)?),
+		}),
+		9 => Ok(EncodingCascade::FsstRowSafe {
+			symbol_table_byte_len: RecordBodyByteLen::try_new(read_u64(bytes, cursor)?)
+				.map_err(|_| EncodingRejectCode::PageRangeOverflow)?,
 		}),
 		_ => Err(EncodingRejectCode::CascadeUnsupported),
 	}

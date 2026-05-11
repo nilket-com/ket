@@ -57,9 +57,9 @@ pub fn evaluate(
 		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::Delta) => {
 			kernels::delta::evaluate_predicate(encoded_bytes, encoding, atom, coercion)
 		}
-		NativeEvaluationEligibility::Eligible(EncodingComputeEvaluatorKind::Fsst) => {
-			evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion)
-		}
+		NativeEvaluationEligibility::Eligible(
+			EncodingComputeEvaluatorKind::Fsst | EncodingComputeEvaluatorKind::FsstRowSafe,
+		) => evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion),
 		NativeEvaluationEligibility::Eligible(
 			EncodingComputeEvaluatorKind::RlePlain | EncodingComputeEvaluatorKind::RleBitPacked,
 		) => kernels::rle::evaluate_predicate(encoded_bytes, encoding, atom, coercion),
@@ -112,6 +112,41 @@ pub fn evaluate_fsst_predicate(
 	})
 }
 
+pub fn evaluate_fsst_row_safe_predicate(
+	value_bytes: &[u8],
+	value_encoding: &BufferEncoding,
+	offset_bytes: &[u8],
+	offset_encoding: Option<&BufferEncoding>,
+	offset_cascade: Option<&EncodingCascade>,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> Result<EncodedRowMask, EncodingComputeRejectCode> {
+	if !matches!(
+		atom.op,
+		PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList
+	) || !kernels::fsst::string_like_data_type_supported(data_type)
+	{
+		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+	}
+	let frame = kernels::fsst::parse_fsst_row_safe_frame(
+		value_bytes,
+		value_encoding.decoded_byte_len,
+		value_encoding.decoded_value_count,
+	)?;
+	let offsets = kernels::fsst::decode_offsets(
+		offset_bytes,
+		data_type,
+		value_encoding.decoded_value_count,
+		RecordBodyByteLen::new(frame.expected_decoded_byte_len() as u64),
+		offset_encoding,
+		offset_cascade,
+	)?;
+	with_fsst_literal_bytes(coercion, |literals| {
+		kernels::fsst::evaluate_fsst_row_safe_equality(&frame, &offsets, literals, atom.op)
+	})
+}
+
 pub fn evaluate_fsst_predicate_with_stats(
 	value_bytes: &[u8],
 	value_encoding: &BufferEncoding,
@@ -146,6 +181,49 @@ pub fn evaluate_fsst_predicate_with_stats(
 	)?;
 	with_fsst_literal_bytes(coercion, |literals| {
 		kernels::fsst::evaluate_fsst_equality_with_stats(&frame, &offsets, literals, atom.op)
+	})
+}
+
+pub fn evaluate_fsst_row_safe_predicate_with_stats(
+	value_bytes: &[u8],
+	value_encoding: &BufferEncoding,
+	offset_bytes: &[u8],
+	offset_encoding: Option<&BufferEncoding>,
+	offset_cascade: Option<&EncodingCascade>,
+	data_type: &DataType,
+	atom: &PredicateAtom,
+	coercion: &LiteralCoercion,
+) -> Result<
+	(
+		EncodedRowMask,
+		crate::storage::encoding::compute::kernels::fsst::FsstRowSafeEvaluationStats,
+	),
+	EncodingComputeRejectCode,
+> {
+	if !matches!(
+		atom.op,
+		PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList
+	) || !kernels::fsst::string_like_data_type_supported(data_type)
+	{
+		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
+	}
+	let frame = kernels::fsst::parse_fsst_row_safe_frame(
+		value_bytes,
+		value_encoding.decoded_byte_len,
+		value_encoding.decoded_value_count,
+	)?;
+	let offsets = kernels::fsst::decode_offsets(
+		offset_bytes,
+		data_type,
+		value_encoding.decoded_value_count,
+		RecordBodyByteLen::new(frame.expected_decoded_byte_len() as u64),
+		offset_encoding,
+		offset_cascade,
+	)?;
+	with_fsst_literal_bytes(coercion, |literals| {
+		kernels::fsst::evaluate_fsst_row_safe_equality_with_stats(
+			&frame, &offsets, literals, atom.op,
+		)
 	})
 }
 
@@ -330,6 +408,7 @@ pub fn evaluator_kind_for_cascade(
 		},
 		EncodingCascade::Delta { .. } => Some(EncodingComputeEvaluatorKind::Delta),
 		EncodingCascade::Fsst { .. } => Some(EncodingComputeEvaluatorKind::Fsst),
+		EncodingCascade::FsstRowSafe { .. } => Some(EncodingComputeEvaluatorKind::FsstRowSafe),
 		EncodingCascade::Plain | EncodingCascade::Lz4Frame | EncodingCascade::Alp { .. } => None,
 	}
 }
@@ -355,7 +434,10 @@ pub(crate) fn native_evaluation_eligibility(
 	let Some(kind) = evaluator_kind_for_cascade(cascade) else {
 		return NativeEvaluationEligibility::DecodeScalarFallback;
 	};
-	if kind == EncodingComputeEvaluatorKind::Fsst {
+	if matches!(
+		kind,
+		EncodingComputeEvaluatorKind::Fsst | EncodingComputeEvaluatorKind::FsstRowSafe
+	) {
 		if fsst_native_evaluation_eligible(atom, coercion) {
 			return NativeEvaluationEligibility::Eligible(kind);
 		}
@@ -391,6 +473,7 @@ fn native_predicate_cascade_eligible(cascade: &EncodingCascade, data_type: &Data
 		EncodingCascade::Plain
 		| EncodingCascade::Lz4Frame
 		| EncodingCascade::Fsst { .. }
+		| EncodingCascade::FsstRowSafe { .. }
 		| EncodingCascade::Alp { .. } => false,
 	}
 }

@@ -81,8 +81,8 @@ use crate::storage::encoding::compute::{
 	EncodingComputeRejectCode, NativeEvaluationEligibility, PredicateAtom, aggregate_kind_for_tag,
 	coerce_literal, decode_encoded_buffer, encoded_leaf_selectivity_allowed,
 	encoded_predicate_node_from_tree, evaluate as evaluate_encoded_predicate,
-	evaluate_fsst_predicate, evaluate_validity_bitmap, evaluator_kind_for_cascade,
-	native_aggregate_cascade_eligible, native_evaluation_eligibility,
+	evaluate_fsst_predicate, evaluate_fsst_row_safe_predicate, evaluate_validity_bitmap,
+	evaluator_kind_for_cascade, native_aggregate_cascade_eligible, native_evaluation_eligibility,
 	try_fold_encoded_aggregate_request,
 };
 use crate::storage::encoding::directory::page_stats_cascade_eligible;
@@ -9397,20 +9397,41 @@ impl SlabManager {
 					observe_fallback(EncodingComputeFallbackReason::UnsupportedProgram);
 					return Ok(None);
 				};
+				let evaluator = evaluator_kind_for_cascade(&value.cascade).ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"Encoding compute FSST fetch carried unsupported cascade",
+					)
+				})?;
 				let started = Instant::now();
-				let mask = evaluate_fsst_predicate(
-					&value.bytes,
-					&value.encoding,
-					&offsets.bytes,
-					offsets.encoding.as_ref(),
-					offsets.cascade.as_ref(),
-					data_type,
-					atom,
-					&coercion,
-				)
+				let mask = if evaluator
+					== crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
+				{
+					evaluate_fsst_row_safe_predicate(
+						&value.bytes,
+						&value.encoding,
+						&offsets.bytes,
+						offsets.encoding.as_ref(),
+						offsets.cascade.as_ref(),
+						data_type,
+						atom,
+						&coercion,
+					)
+				} else {
+					evaluate_fsst_predicate(
+						&value.bytes,
+						&value.encoding,
+						&offsets.bytes,
+						offsets.encoding.as_ref(),
+						offsets.cascade.as_ref(),
+						data_type,
+						atom,
+						&coercion,
+					)
+				}
 				.map_err(encoding_compute_invariant_error)?;
 				metrics().observe_storage_l2_encoding_compute_kernel(
-					crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst.as_str(),
+					evaluator.as_str(),
 					value.cascade.kind().as_str(),
 					started.elapsed(),
 				);
@@ -11148,9 +11169,11 @@ fn build_encoding_compute_phase_b_plan(
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
 					let evaluator = evaluator_kind_for_cascade(cascade)
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
-					if evaluator
-						== crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
-						&& output_columns.contains(*column_index as u32)
+					if matches!(
+						evaluator,
+						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+							| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
+					) && output_columns.contains(*column_index as u32)
 					{
 						return Err(EncodingComputeFallbackReason::UnsupportedCascade);
 					}
@@ -11176,9 +11199,11 @@ fn build_encoding_compute_phase_b_plan(
 					if encoded_pages > u64::from(config.max_encoded_pages_per_record.get()) {
 						return Err(EncodingComputeFallbackReason::TooManyPages);
 					}
-					if evaluator
-						== crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
-					{
+					if matches!(
+						evaluator,
+						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+							| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
+					) {
 						let offsets_buffer_ordinal = offsets_buffer_ordinal
 							.ok_or(EncodingComputeFallbackReason::UnsupportedArrowLayout)?;
 						let offsets_page = page_directory
@@ -12196,7 +12221,11 @@ fn encoding_compute_predicate_data_type_supported_for_evaluator(
 	data_type: &DataType,
 	evaluator: crate::storage::encoding::compute::EncodingComputeEvaluatorKind,
 ) -> bool {
-	if evaluator == crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst {
+	if matches!(
+		evaluator,
+		crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+			| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
+	) {
 		return encoding_compute_fsst_predicate_data_type_supported(data_type);
 	}
 	encoding_compute_fixed_width_predicate_data_type_supported(data_type)
@@ -19291,6 +19320,215 @@ mod tests {
 			.unwrap_err(),
 			EncodingComputeFallbackReason::UnsupportedCascade
 		);
+		let overlap = ColumnOrdinalSet::from_columns([1, 2]);
+		assert_eq!(
+			build_encoding_compute_phase_b_plan(
+				&directory,
+				page_directory,
+				encoding_directory,
+				&encoded_predicate,
+				&overlap,
+				&selected_groups,
+				&selected_groups,
+				&compute_config,
+				0,
+			)
+			.unwrap_err(),
+			EncodingComputeFallbackReason::UnsupportedCascade
+		);
+	}
+
+	#[test]
+	fn fsst_row_safe_phase_b_plan_uses_strategy_b_and_declines_overlap() {
+		let row_count = 512_usize;
+		let schema = Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("url", DataType::Utf8, false),
+			Field::new("payload", DataType::Int64, false),
+		]);
+		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+			TableObjectId::new([0x67; 16]),
+			1,
+			"analytics",
+			"fsst_row_safe_phase_b_plan",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicyV1::IdentityProjection,
+			RecordLayoutPolicy::MultiRow(
+				MultiRowLayoutDescriptor::new(row_count as u32, row_count as u32, 8 * 1024 * 1024)
+					.unwrap(),
+			),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap();
+		let prefix = "a".repeat(120);
+		let urls = (0..row_count)
+			.map(|row| format!("{prefix}/path/{row:04}"))
+			.collect::<Vec<_>>();
+		let batch = RecordBatch::try_new(
+			Arc::new(schema),
+			vec![
+				Arc::new(Int64Array::from_iter_values(0..row_count as i64)) as Arc<dyn Array>,
+				Arc::new(StringArray::from_iter_values(
+					urls.iter().map(String::as_str),
+				)) as Arc<dyn Array>,
+				Arc::new(Int64Array::from_iter_values(
+					(0..row_count).map(|row| (row % 17) as i64),
+				)) as Arc<dyn Array>,
+			],
+		)
+		.unwrap();
+		let source_rows = (0..row_count)
+			.map(|source_row_index| {
+				let mut key = [0_u8; 32];
+				key[..8].copy_from_slice(&(source_row_index as u64).to_be_bytes());
+				MultiRowSourceRow {
+					source_row_index,
+					key_identity: Identity::new(key),
+					routing_locality: Locality::ZERO,
+					row_hlc: hlc(670 + source_row_index as u64),
+					is_tombstone: false,
+					table_object_id: Some(descriptor.table_object_id),
+				}
+			})
+			.collect::<Vec<_>>();
+		let row_group_config =
+			crate::storage::row_group::RowGroupWriterConfig::point_read_with_overrides(
+				RowGroupRowCount::new(256),
+				RowGroupRowCount::new(256),
+				RowCount::new(1),
+				RecordBodyByteLen::new(1),
+			)
+			.with_enabled(true);
+		let encoding_config = crate::storage::encoding::EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: SimdPageValueCount::new(1024),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			enabled_cascades: [
+				crate::storage::encoding::EncodingCascadeKind::Plain,
+				crate::storage::encoding::EncodingCascadeKind::Fsst,
+				crate::storage::encoding::EncodingCascadeKind::FsstRowSafe,
+			]
+			.into_iter()
+			.collect(),
+			..Default::default()
+		};
+		let encoded =
+			crate::storage::multirow::encode_multirow_from_survivors_with_row_group_and_encoding_config(
+				&batch,
+				&source_rows,
+				&descriptor,
+				RecordBodyCompressionPolicy::Uncompressed,
+				&row_group_config,
+				&encoding_config,
+			)
+			.unwrap();
+		let directory = parse_record_buffer_directory(
+			TieredRecordId {
+				slab_id: SlabId::new(67),
+				record_offset: RecordBodyByteOffset::ZERO,
+			},
+			PlaintextByteRange {
+				start: 0,
+				len: encoded.frame.len() as u64,
+			},
+			&encoded.frame,
+			&descriptor,
+		)
+		.unwrap();
+		let page_directory = directory.page_directory.as_ref().unwrap();
+		let encoding_directory = directory.encoding_directory.as_ref().unwrap();
+		let (_, value_buffer_ordinal) = encoding_compute_value_buffer(&directory, 1).unwrap();
+		let value_encoding = encoding_directory
+			.buffers
+			.iter()
+			.find(|encoding| {
+				encoding.row_group_index == RowGroupIndex::ZERO
+					&& encoding.ipc_buffer_ordinal == value_buffer_ordinal
+			})
+			.expect("row-safe FSST url value encoding");
+		let cascade = encoding_directory
+			.cascades
+			.get(value_encoding.cascade_index.get() as usize)
+			.expect("row-safe FSST cascade");
+		assert!(
+			matches!(cascade, EncodingCascade::FsstRowSafe { .. }),
+			"{cascade:?}"
+		);
+
+		let target = urls[7].as_bytes();
+		let mut bytecode = Vec::new();
+		bytecode.push(crate::schema::pbc::OP_PUSH_COL);
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		bytecode.push(crate::schema::pbc::OP_PUSH_STR);
+		bytecode.extend_from_slice(&(target.len() as u16).to_le_bytes());
+		bytecode.extend_from_slice(target);
+		bytecode.push(crate::schema::pbc::OP_EQ);
+		let program = crate::schema::pbc::Program::compile(&bytecode).unwrap();
+		let encoded_predicate =
+			encoded_predicate_node_from_tree(&program.predicate_tree()).unwrap();
+		let selected_groups = page_directory
+			.row_groups
+			.iter()
+			.map(|group| group.row_group_index)
+			.collect::<Vec<_>>();
+		// ADR 067 Phase 8 promotion: FsstRowSafe is now in
+		// EncodingComputeConfig::default().enabled_predicate_evaluators.
+		// Construct an explicit compute_config to remain test-self-contained
+		// against future default changes.
+		let mut compute_config = EncodingComputeConfig::default();
+		compute_config
+			.enabled_predicate_evaluators
+			.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe);
+		let no_overlap = ColumnOrdinalSet::from_columns([2]);
+		let plan = build_encoding_compute_phase_b_plan(
+			&directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			&no_overlap,
+			&selected_groups,
+			&selected_groups,
+			&compute_config,
+			0,
+		)
+		.expect("row-safe FSST no-overlap predicate should build encoded Phase B plan");
+		assert_eq!(
+			plan.fetches
+				.iter()
+				.filter(|fetch| matches!(
+					fetch.kind,
+					EncodingComputePhaseBFetchKind::FsstValues { .. }
+				))
+				.count(),
+			selected_groups.len()
+		);
+		assert_eq!(
+			plan.fetches
+				.iter()
+				.filter(|fetch| matches!(
+					fetch.kind,
+					EncodingComputePhaseBFetchKind::FsstOffsets { .. }
+				))
+				.count(),
+			selected_groups.len()
+		);
+		// Default-config no-overlap plan: post-ADR-067-promotion, this now
+		// succeeds (Sub-case A1 / Strategy B) and mirrors the explicit-config
+		// plan above.
+		let default_plan = build_encoding_compute_phase_b_plan(
+			&directory,
+			page_directory,
+			encoding_directory,
+			&encoded_predicate,
+			&no_overlap,
+			&selected_groups,
+			&selected_groups,
+			&EncodingComputeConfig::default(),
+			0,
+		)
+		.expect("row-safe FSST default-config no-overlap predicate should build encoded Phase B plan");
+		assert_eq!(default_plan.fetches.len(), plan.fetches.len());
 		let overlap = ColumnOrdinalSet::from_columns([1, 2]);
 		assert_eq!(
 			build_encoding_compute_phase_b_plan(

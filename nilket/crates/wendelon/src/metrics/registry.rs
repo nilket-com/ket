@@ -1698,6 +1698,7 @@ const ENCODING_CASCADE_LABELS: &[&str] = &[
 	"delta",
 	"fsst",
 	"alp",
+	"fsst_row_safe",
 ];
 const ENCODING_FALLBACK_REASONS: &[&str] = &[
 	"reader_disabled",
@@ -1737,9 +1738,16 @@ const ENCODING_COMPUTE_KERNEL_LABELS: &[&str] = &[
 	"dictionary_bit_packed",
 	"delta",
 	"fsst",
+	"fsst_row_safe",
 ];
-const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] =
-	&["bit_packed", "rle", "dictionary", "delta", "fsst"];
+const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] = &[
+	"bit_packed",
+	"rle",
+	"dictionary",
+	"delta",
+	"fsst",
+	"fsst_row_safe",
+];
 const ENCODING_COMPUTE_ROW_KINDS: &[&str] = &["scanned", "selected", "avoided", "materialized"];
 const ENCODING_COMPUTE_AGGREGATES: &[&str] = &[
 	"count_star",
@@ -2215,7 +2223,7 @@ impl Histogram {
 }
 
 struct EncodingCascadeHistograms {
-	histograms: [Histogram; 8],
+	histograms: [Histogram; 9],
 }
 
 impl EncodingCascadeHistograms {

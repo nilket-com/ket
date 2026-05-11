@@ -20,113 +20,88 @@ forward-sequence rewrite.
 ## Where we are
 
 ADR 067 (Row-Canonical FSST Framing and Strategy B
-Predicate Evaluator) is council-converged across
-Claude / Codex / Gemini after five iterations;
-plan-stage commit pending implementation. Structural
-follow-up to ADR 066's V1 perf-iteration post-mortem,
-which proved Strategy A's streaming token decode
-cannot beat dense Arrow's vectorized equality scan
-at small/medium row counts — the per-byte branched
-decode-and-compare loop is the algorithmic ceiling.
-ADR 067 ships a row-canonical FSST writer amendment
-+ Strategy B predicate evaluator that **avoids
-decode entirely on the predicate path**. **Writer
-amendment**: new on-disk frame `WFS2` (magic
-`b"WFS2"`) and new cascade variant
-`EncodingCascade::FsstRowSafe` (discriminant 9,
-label `"fsst_row_safe"`). The encoder (a) trains
-symbol pairs only over within-row byte pairs,
-(b) never emits a symbol pair spanning a row
-boundary, (c) follows a deterministic canonical
-algorithm so that two encoders fed the same row
-bytes + symbol table produce byte-identical output.
-**Row-canonical contract**: stricter than just
-"row-safe" — writer and reader's literal pre-encoder
-use the same canonical algorithm so encoded byte
-equality is a sound proxy for decoded value
-equality. **Encoded-offsets-in-frame**: WFS2 embeds
-a per-row encoded-byte-offsets table (32-bit LE)
-between the symbol table and the encoded payload;
-keeps the multi-buffer shape identical to ADR 066
-(validity + decoded offsets + values). **Strategy
-B reader**: pre-encode each literal once per buffer
-using the canonical algorithm, then per row do
-(a) decoded-length pre-filter, (b) encoded-length
-pre-filter, (c) memcmp against pre-encoded literal
-bytes. No streaming token decode on the predicate
-path. **Per-buffer actual-size writer guard**:
-`wfs2_len ≤ ceil(wfs1_len * 1.10) AND wfs2_len ≤
-decoded_plaintext_len`. Runtime per-buffer check,
-not just a bench-fixture gate; falls back to `Fsst`
-when the guard rejects (typical for short-row
-workloads where 4-byte-per-row offset overhead
-dominates). **Fast corruption boundary**:
-structural WFS2 metadata fails closed via
-`EncodingComputeRejectCode`; compared encoded
-ranges fail closed if not valid canonical
-encodings; bytes outside compared ranges trust the
-ADR 020 AEAD upstream — full token-stream
-validation is the dense-decode path's job, not
-Strategy B's. **Dense WFS2 decode ships first** as
-the correctness oracle before Strategy B may
-engage. **Backwards compatibility**: existing
-`EncodingCascade::Fsst` (WFS1) buffers stay
-readable via ADR 066 V1 Strategy A reader
-indefinitely; no implicit migration; new writes
-default to `FsstRowSafe` when the actual-size
-guard clears. **Format version bumps** by one
-(`ENCODING_DIRECTORY_FORMAT_VERSION`); rollout is
-reader-before-writer. **Stricter promotion gates
-than ADR 066** (Strategy B's structural elimination
-of decode produces the headroom): ≥2.0× predicate
-wall-clock at clustered 5% (vs ADR 066's ≥1.5×),
-≥1.5× end-to-end through ADR 065 → ADR 060 / 064
-Case A (vs ADR 066's ≥1.2×), ≤5% dense-fallback
-overhead, ≤10% compression-ratio loss vs `Fsst`
-cascade on representative warehouse fixtures
-(new gate), cross-replica deterministic masks,
-writer-cost budget within ADR 057 budget.
-**Recorded diagnostics (not gating)**: ≥5× CPU
-speedup target on `Eq` fixtures (Strategy B avoids
-decode entirely); ADR 065 Case B/C engagement-
-surface reduction; ADR 052 secondary-index
-confirm-step behavior on `FsstRowSafe`-keyed
-indexes; Strategy A vs Strategy B wall-clock
-delta on the same input encoded under both.
-**Boundary-crossing-symbol fixture** is repurposed
-from ADR 066: now verifies the WFS2 writer
-correctly does NOT produce cross-row symbols on
-input where such pairs are frequent. **No-
-compressed-row-slice regression fixture** carries
-forward as hardening. **Sub-case A1** (FSST
-predicate column not in output) migrates to
-ADR 060 / 064 Case A mask-only sparse projection.
-**Sub-case A2** (overlap) remains on ADR 065
-Case B path via planner decline. Closed surface:
-no new `EncodingComputeRejectCode` /
-`EncodingComputeFallbackReason` /
-`PredicateAtomOp` / `EncodedRowMask` variant; no
-IPC `custom_metadata` key, no wire `MsgType` /
-`FRAME_FLAG_*` / digest domain / `ObjectStore`
-trait method; no Cargo feature, no operator-
-visible knob beyond `enabled_cascades` and
-`enabled_predicate_evaluators`. WFS1 and
-`EncodingCascade::Fsst` remain byte-for-byte
-unchanged. ADR 020 / 022 / 056 / 058 / 059 / 060 /
-061 / 062 / 063 / 064 / 065 surfaces unchanged.
-V1 deferred (with explicit V2 promotion paths):
-64-bit encoded offsets (decline-to-dense for
-buffers >4 GiB encoded), page-grain row-safe
-FSST, range / `LIKE` / regex / substring on FSST,
-FSST aggregate folds, sparse projection
-eligibility for FSST, process-wide symbol-table
-or pre-encoded-literal cache, operator-visible
-compression-loss tunable, migration policy for
-existing `Fsst` buffers, removal of
-`symbol_table_byte_len` cascade field (separate
-trivial follow-up). See
-`plans/adr/067_row_canonical_fsst.md` and
-`plans/impl/067_row_canonical_fsst.md`.
+Predicate Evaluator) shipped 2026-05-10, **default-
+on**. Structural follow-up to ADR 066's V1 perf-
+iteration post-mortem: Strategy A's streaming token
+decode could not beat dense Arrow's vectorized
+equality scan at small/medium row counts. ADR 067
+landed a row-canonical FSST writer amendment +
+Strategy B predicate evaluator that **avoids decode
+entirely on the predicate path** — per row: decoded-
+length pre-filter, encoded-length pre-filter, memcmp
+against a once-per-buffer pre-encoded literal.
+
+**On-disk frame**: new `WFS2` magic + new cascade
+variant `EncodingCascade::FsstRowSafe` (discriminant
+9) + new evaluator `EncodingComputeEvaluatorKind::
+FsstRowSafe` (discriminant 8). `ENCODING_DIRECTORY_
+FORMAT_VERSION` bumped by one. Existing `WFS1` /
+`Fsst` buffers remain readable indefinitely via ADR
+066 Strategy A; new writes default to `FsstRowSafe`.
+
+**V2 frame-layout amendment landed pre-promotion**:
+the original `(N+1) × u32` encoded-offsets table was
+replaced by a per-256-row `(payload_offset: u32,
+exception_index: u32)` `block_offsets` pair table +
+per-row `u8` `encoded_lengths` (with `255` sentinel)
++ `exception_lengths` table for rows encoding to
+≥ 255 bytes. Metadata overhead dropped from ~4 B/row
+to ~1.03 B/row, which is what made the ≤ 10%
+compression-loss guard pass on representative URL
+and weak-compression warehouse fixtures.
+
+**Phase 7 promotion-evidence sweep** at 8K / 65K /
+1M rows (`plans/impl/067_row_canonical_fsst_bench_
+results.md`):
+
+- Predicate wall-clock 3.0–11.7× vs dense WFS1
+  (speedups grow with row count).
+- Strategy B vs ADR 066 Strategy A: 4.3–9.2× across
+  warehouse fixtures × tiers.
+- End-to-end query wall-clock 1.81–5.43× through
+  ADR 065 → ADR 060 / 064 Case A.
+- Compression-loss ≤ 8.7% on warehouse fixtures
+  (short-string adversarial correctly declines to
+  `Fsst`).
+- Dense-fallback overhead ≤ 3.1% across routes ×
+  tiers.
+- Cross-replica deterministic masks confirmed.
+- Mask byte-identical to dense WFS2 oracle AND ADR
+  066 Strategy A on every fixture × tier.
+
+**Council waived the ADR 057 ≤ 75% writer-cost
+gate** (observed ~140% overhead for V1's eager
+dual-encode). Waiver rationale: transformative
+read-side wins, offline writer cost, warehouse
+read-heavy workload focus per the Toron-pivot
+roadmap. Tracked V2 follow-up: sample-based writer
+estimator to bring writer cost back inside budget.
+
+**Surfaces unchanged**: no new
+`EncodingComputeRejectCode` / `EncodingComputeFallback
+Reason` / `PredicateAtomOp` / `EncodedRowMask`
+variant; no IPC `custom_metadata` key, no wire
+`MsgType` / `FRAME_FLAG_*` / digest domain /
+`ObjectStore` trait method; no Cargo feature. ADR
+020 / 022 / 056 / 060 / 061 / 062 / 063 / 064 / 065
+surfaces unchanged. ADR 057 + 058 + 066 §"Where
+we are" / Status amended to record the catalog
+extension and Strategy A's role going forward.
+
+**V2 deferred**: 64-bit block payload offsets
+(decline-to-dense for buffers >4 GiB encoded for
+now); page-grain row-safe FSST; range / `LIKE` /
+regex / substring on FSST; FSST aggregate folds;
+sparse projection eligibility for FSST; process-
+wide symbol-table or pre-encoded-literal cache;
+operator-visible compression-loss tunable;
+migration policy for existing `Fsst` buffers;
+sample-based writer estimator (tracked above);
+removal of `symbol_table_byte_len` cascade field
+(separate trivial follow-up). See
+`plans/adr/067_row_canonical_fsst.md`,
+`plans/impl/067_row_canonical_fsst.md`, and
+`plans/impl/067_row_canonical_fsst_bench_results.md`.
 
 ADR 066 (FSST Predicate Evaluator) is council-converged
 across Claude / Codex / Gemini after four iterations;

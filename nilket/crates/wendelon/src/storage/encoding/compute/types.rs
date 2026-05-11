@@ -25,10 +25,11 @@ pub enum EncodingComputeEvaluatorKind {
 	DictionaryBitPacked = 5,
 	Delta = 6,
 	Fsst = 7,
+	FsstRowSafe = 8,
 }
 
 impl EncodingComputeEvaluatorKind {
-	pub const ALL: [Self; 7] = [
+	pub const ALL: [Self; 8] = [
 		Self::BitPacked,
 		Self::RlePlain,
 		Self::RleBitPacked,
@@ -36,6 +37,7 @@ impl EncodingComputeEvaluatorKind {
 		Self::DictionaryBitPacked,
 		Self::Delta,
 		Self::Fsst,
+		Self::FsstRowSafe,
 	];
 
 	pub const fn as_str(self) -> &'static str {
@@ -47,6 +49,7 @@ impl EncodingComputeEvaluatorKind {
 			Self::DictionaryBitPacked => "dictionary_bit_packed",
 			Self::Delta => "delta",
 			Self::Fsst => "fsst",
+			Self::FsstRowSafe => "fsst_row_safe",
 		}
 	}
 
@@ -59,6 +62,7 @@ impl EncodingComputeEvaluatorKind {
 			"dictionary_bit_packed" => Some(Self::DictionaryBitPacked),
 			"delta" => Some(Self::Delta),
 			"fsst" => Some(Self::Fsst),
+			"fsst_row_safe" => Some(Self::FsstRowSafe),
 			_ => None,
 		}
 	}
@@ -212,6 +216,7 @@ impl Default for EncodingComputeConfig {
 				EncodingComputeEvaluatorKind::DictionaryPlain,
 				EncodingComputeEvaluatorKind::DictionaryBitPacked,
 				EncodingComputeEvaluatorKind::Delta,
+				EncodingComputeEvaluatorKind::FsstRowSafe,
 			]
 			.into_iter()
 			.collect(),

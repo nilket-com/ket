@@ -122,7 +122,10 @@ implementer.
   on the predicate path. The encoded payload is
   untouched except for bytes inside length-matching
   encoded ranges (and only via memcmp). Length-
-  mismatch rows are skipped via the offsets table
+  mismatch rows are skipped by reading the row's
+  encoded length from the `u8` `encoded_lengths`
+  array (or the `exception_lengths` table on the
+  255 sentinel) and advancing a running offset,
   without touching encoded bytes at all.
   Architectural guard pins this.
 - Per-buffer pre-encoded literal cache, bounded:
@@ -141,7 +144,10 @@ implementer.
   structural metadata fails closed via existing
   `EncodingComputeRejectCode` (bad magic, impossible
   `symbol_count`, row-count mismatch, non-monotonic
-  encoded offsets, offsets outside payload). The
+  `block_offsets` payload pointers or exception
+  indices, `exception_count` not equal to the
+  number of `255` sentinels in `encoded_lengths`,
+  running offset overshooting payload). The
   kernel does not interpret encoded bytes on the
   predicate path, so it cannot detect a corrupted
   compared range that decodes to invalid plaintext —
@@ -172,7 +178,10 @@ write side:
        - train symbol table within row boundaries only
        - canonical greedy encoding (no cross-row symbols)
        - emit WFS2 frame: magic + symbol table +
-         row count + encoded offsets + payload
+         row count + block_offsets pair table +
+         encoded_lengths (u8 per row, 255 = sentinel)
+         + exception_count + exception_lengths +
+         payload
     -> per-buffer actual-size guard:
        wfs2_len <= decoded_plaintext_len
        AND wfs2_len <= ceil(wfs1_len * 1.10)
@@ -183,14 +192,23 @@ write side:
 read side, predicate path (Strategy B):
   WFS2 frame + Arrow decoded offsets + validity
     -> parse WFS2 metadata (magic, symbol table,
-       row count, encoded offsets)
+       row count, block_offsets pair table,
+       encoded_lengths, exception_count,
+       exception_lengths)
     -> coerce predicate literal (existing path)
     -> pre-encode literal once per buffer using the
        canonical encoder + this buffer's symbol table
+    -> seed (current_offset, exception_index) from
+       block_offsets[0] = (0, 0)
     -> per row:
          decoded length pre-filter (decoded offsets)
-         encoded length pre-filter (WFS2 offsets)
-         memcmp on length-matching encoded byte range
+         encoded length pre-filter:
+           raw = encoded_lengths[row]
+           encoded_len = raw if raw != 255
+                         else exception_lengths[exc_idx++]
+         memcmp on encoded_payload[current_offset
+                       .. current_offset + encoded_len]
+         current_offset += encoded_len
        -> exact mask-only PhaseBOutcome
     -> downstream: Sub-case A1 -> Case A sparse
        projection; Sub-case A2 -> ADR 065 Case B
@@ -259,9 +277,15 @@ read side, dense path:
   - `decode_fsst_row_safe_bytes(encoded, expected_byte_len,
     expected_value_count) -> Result<Vec<u8>, _>`: full
     dense decode that validates magic, symbol count,
-    row count, offset table monotonicity, payload
-    length, and decoded length cross-check. This is
-    the correctness oracle.
+    row count, `block_offsets` pair-table
+    monotonicity (both `payload_offset` and
+    `exception_index` non-decreasing), `block_offsets[0] ==
+    (0, 0)`, `encoded_lengths.len() == row_count`,
+    `exception_count` equal to the number of `255`
+    sentinels in `encoded_lengths`, the final
+    running offset equals `payload_byte_len`, and
+    the decoded length cross-check. This is the
+    correctness oracle.
   - WFS1 helpers (`encode_fsst_bytes` /
     `decode_fsst_bytes`) behaviorally unchanged;
     factoring may share private helpers but external
@@ -367,7 +391,11 @@ read side, dense path:
       → writer falls back to `Fsst`;
     - WFS2 dense-decode corruption fixtures (bad
       magic, impossible symbol count, non-monotonic
-      offsets, offset overflow, decoded-length
+      `block_offsets` pair entries, `block_offsets[0]
+      != (0, 0)`, `exception_count` not equal to
+      the count of `255` sentinels in
+      `encoded_lengths`, running offset
+      overshooting payload, decoded-length
       mismatch).
   - `tests/encoding_compute_test.rs`:
     - Strategy B kernel correctness across `Eq` /
@@ -387,7 +415,9 @@ read side, dense path:
       length matches no row length; expect zero
       memcmp work);
     - corruption fixtures (malformed WFS2 frame,
-      non-monotonic encoded offsets, decoded-length
+      non-monotonic `block_offsets` pairs, mis-sized
+      `encoded_lengths`, exception-count mismatch,
+      running-offset overshoot, decoded-length
       cross-check failure — fail-closed via
       `EncodingComputeRejectCode`);
     - InList scratch-bound exhaustion fixture
@@ -501,8 +531,10 @@ read side, dense path:
 - No process-wide pre-encoded-literal cache (per-
   buffer cache only).
 - No process-wide symbol-table cache.
-- No 64-bit encoded offsets in V1 (decline-to-dense
-  for buffers exceeding 4 GiB encoded payload).
+- No 64-bit block payload offsets in V1
+  (`block_offsets[*].payload_offset` is `u32`;
+  decline-to-dense for buffers exceeding 4 GiB
+  encoded payload).
 - No page-grain WFS2 (buffer-grain only).
 - No new `EncodingComputeRejectCode` /
   `EncodingComputeFallbackReason` / `PredicateAtomOp`
@@ -582,16 +614,30 @@ implementation pass after this plan promotes to
 
 **WFS2 frame design:**
 
-- pin offset width: 32-bit covers buffers ≤ 4 GiB
-  encoded payload (V1 scope); decline-to-dense for
-  larger buffers.
+- pin `block_offsets[*].payload_offset` width: 32-
+  bit covers buffers ≤ 4 GiB encoded payload (V1
+  scope); decline-to-dense for larger buffers.
+  `block_offsets[*].exception_index` is also u32
+  (exception count cannot exceed row count, and
+  row count is u32-bounded).
+- pin block size: 256 rows. Each `block_offsets`
+  entry seeds `(current_offset, exception_index)`
+  for the start of its block, enabling O(1) random
+  access into any block.
 - pin offset relative-to-frame vs relative-to-
-  payload: relative to start of `encoded_payload`
-  (matches Codex's draft; consistent with WFS1's
-  payload-relative cursor semantics).
-- pin row-count storage: u32 (matches offset
-  width; row counts > 4 G in a single buffer are
-  out of scope).
+  payload: `block_offsets[*].payload_offset` is
+  relative to start of `encoded_payload`
+  (consistent with WFS1's payload-relative cursor
+  semantics).
+- pin row-count storage: u32 (row counts > 4 G in
+  a single buffer are out of scope).
+- pin encoded-length storage: per-row `u8`; value
+  `255` is a sentinel meaning "actual length lives
+  in `exception_lengths[exception_index]`, advance
+  `exception_index`". For rows with encoded length
+  in `[0, 254]`, the `u8` value is the length
+  directly. Rows with encoded length ≥ 255 cost
+  one extra `u32` each in `exception_lengths`.
 
 **Writer integration:**
 
@@ -733,20 +779,47 @@ written.
      `decoded_value_count + 1`, monotonic, final
      offset = input length);
    - builds row-boundary-aware symbol table;
-   - emits frame header: magic (`b"WFS2"`),
-     symbol_count, symbol pairs, row_count (u32 LE),
-     encoded offsets (u32 LE per row + sentinel);
    - encodes each row via `encode_fsst_canonical_row`,
-     recording start offsets;
-   - validates final encoded length fits u32 (else
-     returns error → caller declines `FsstRowSafe`).
+     accumulating per-row encoded lengths and the
+     running payload byte position;
+   - on each row boundary that crosses a 256-row
+     block, records `(payload_offset_at_block_start,
+     exception_index_at_block_start)` into
+     `block_offsets`;
+   - for each row's encoded length: writes `length`
+     into the `u8` `encoded_lengths` array if
+     `length < 255`; else writes `255` sentinel
+     and appends the actual `u32` length to
+     `exception_lengths`;
+   - emits frame: magic (`b"WFS2"`), symbol_count,
+     symbol pairs, row_count (u32 LE), block_offsets
+     (`ceil(row_count / 256) * 8` bytes of
+     `(payload_offset: u32 LE, exception_index: u32
+     LE)`), encoded_lengths (`row_count` bytes,
+     u8), exception_count (u32 LE), exception_lengths
+     (`exception_count * 4` bytes, u32 LE), payload;
+   - validates final payload byte length fits u32
+     (else returns error → caller declines
+     `FsstRowSafe`).
 
 3. **WFS2 dense decode** (`decode_fsst_row_safe_bytes`):
-   - validates magic, symbol_count ≤ 127, row_count,
-     offset table monotonicity, final offset =
-     payload length;
+   - validates magic, symbol_count ≤ 127, row_count
+     matches expected, `block_offsets[0] == (0, 0)`,
+     `block_offsets[*].payload_offset` monotonically
+     non-decreasing, `block_offsets[*].exception_index`
+     monotonically non-decreasing,
+     `encoded_lengths.len() == row_count`,
+     `exception_count` equal to the count of `255`
+     sentinels in `encoded_lengths`, and the final
+     running payload offset (after summing all
+     per-row encoded lengths) equals
+     `payload_byte_len`;
    - decodes the entire token stream into a
-     `Vec<u8>` of size `expected_byte_len`;
+     `Vec<u8>` of size `expected_byte_len`,
+     advancing one row at a time using
+     `encoded_lengths[i]` (or
+     `exception_lengths[exc_idx++]` on the 255
+     sentinel) to bound each row's decode;
    - cross-checks: each row's decoded byte count
      equals
      `decoded_offsets[i+1] - decoded_offsets[i]`
@@ -817,8 +890,13 @@ written.
      selection falls back to `Fsst`.
    - Malformed WFS2 dense decode: bad magic, short
      header, impossible symbol count, unterminated
-     escape, non-monotonic offsets, final offset
-     mismatch, decoded-length mismatch — all return
+     escape, non-monotonic `block_offsets` (either
+     field), `block_offsets[0] != (0, 0)`,
+     `exception_count` not equal to the count of
+     `255` sentinels in `encoded_lengths`, running
+     offset overshooting payload, final running
+     offset mismatch, decoded-length mismatch —
+     all return
      `EncodingRejectCode::DecodedLengthMismatch`.
    - WFS1 regression: existing FSST fixtures
      produce byte-identical output to pre-Phase-2
@@ -848,10 +926,22 @@ encoding.
 1. **`parse_fsst_row_safe_frame`** — frame
    metadata parser. Validates magic, symbol_count,
    row_count vs `BufferEncoding.decoded_value_count`,
-   offset table shape, final offset = payload
-   length. Returns `FsstRowSafeFrame` carrying the
-   symbol table, encoded offsets slice, and encoded
-   payload slice.
+   `block_offsets` pair-table shape and
+   monotonicity (both `payload_offset` and
+   `exception_index` non-decreasing,
+   `block_offsets[0] == (0, 0)`),
+   `encoded_lengths.len() == row_count`,
+   `exception_count` equal to the count of `255`
+   sentinels in `encoded_lengths`, and the sum of
+   per-row encoded lengths (resolved through the
+   sentinel/exception path) equals
+   `payload_byte_len`. Returns `FsstRowSafeFrame`
+   carrying the symbol table, `block_offsets`
+   slice, `encoded_lengths` slice,
+   `exception_lengths` slice, and encoded payload
+   slice. The sum-of-lengths invariant is verified
+   once at parse time; the Strategy B loop trusts
+   it from there on.
 
 2. **`pre_encode_literal`** — calls the shared
    `encode_fsst_canonical_row` helper from
@@ -881,26 +971,61 @@ encoding.
    per ADR 066's Phase A pattern:
 
    ```text
+   # Seed running state from block_offsets[0] = (0, 0).
+   # (Or, for a future random-access entry into block B,
+   # seed from block_offsets[B].)
+   current_offset = 0
+   exc_idx = 0
+
    for row in 0..rows:
      decoded_len_row = decoded_offsets[i+1] -
                        decoded_offsets[i]
+
+     # Resolve this row's encoded length once,
+     # regardless of whether the row will be skipped:
+     # we must advance current_offset / exc_idx for
+     # every row to keep the running state coherent.
+     raw_len = encoded_lengths[row]
+     if raw_len != 255:
+       encoded_len_row = raw_len as u32
+     else:
+       encoded_len_row = exception_lengths[exc_idx]
+       exc_idx += 1
+
      if decoded_len_row != decoded_len_literal (single)
         OR no literal of decoded_len_row (multi):
        row_matches = false
        (no encoded-byte read at all)
      else:
-       encoded_len_row = encoded_offsets[i+1] -
-                         encoded_offsets[i]
        if encoded_len_row != encoded_len_literal:
          row_matches = false
        else:
-         row_matches = encoded_payload[encoded_offsets[i]
-                          ..encoded_offsets[i+1]]
+         row_matches = encoded_payload[current_offset
+                          .. current_offset + encoded_len_row]
                        == literal.encoded_bytes
        (multi: iterate length-matching literals)
+
+     current_offset += encoded_len_row
      bit = row_matches if !invert else !row_matches
      selected.push(bit)?
    ```
+
+   Notes:
+   - The `current_offset += encoded_len_row` step
+     runs unconditionally — both length-matching
+     and length-mismatching rows advance the
+     cursor. Without this, a single mismatched row
+     would desynchronize every subsequent row.
+   - `exc_idx` advances only on the `255` sentinel,
+     which keeps the exception table read pointer
+     synchronized with the per-row sentinel
+     density.
+   - For non-sequential entry into block `B`
+     (currently unused on the predicate path but
+     supported for future use), seed
+     `(current_offset, exc_idx)` from
+     `block_offsets[B]` and start the loop at
+     `row = B * 256`.
 
 5. **Validity composition** via `kernels/validity.rs`
    (unchanged from ADR 066).
@@ -961,8 +1086,9 @@ encoding.
    - InList scratch-budget exhaustion fixture →
      decline to dense.
    - Corruption: malformed WFS2 frame, non-
-     monotonic encoded offsets, decoded-length
-     cross-check failure → fail-closed via
+     monotonic `block_offsets`, exception-count
+     mismatch, running-offset overshoot, decoded-
+     length cross-check failure → fail-closed via
      `EncodingComputeRejectCode`.
 
 **Exit gate:** Strategy B kernel produces byte-
@@ -1260,7 +1386,9 @@ promotion in
   `fsst_row_safe_writer_selected`,
   `fsst_row_safe_writer_declined_to_fsst`).
 - WFS2 encoded payload bytes per buffer.
-- WFS2 encoded-offset table bytes per buffer.
+- WFS2 metadata bytes per buffer (block_offsets +
+  encoded_lengths + exception_lengths + 4-byte
+  exception_count).
 - WFS2 vs WFS1 compression ratio.
 - Pre-encoded literal cache bytes (per buffer per
   literal).
@@ -1311,7 +1439,8 @@ headroom):**
 4. **Compression-ratio loss ≤ 10%** on
    representative warehouse fixtures vs `Fsst`
    cascade on the same input (full WFS2 bytes
-   including encoded-offset table).
+   including block_offsets + encoded_lengths +
+   exception_lengths metadata).
 5. **Cross-replica deterministic masks** on
    representative WFS2 fixtures (Codex's iteration-
    2 addition; the canonical-encoder contract
@@ -1357,8 +1486,10 @@ Correctness gates:
   decoded offsets.
 - Length pre-filter zero memcmp work on Disjoint-
   length fixtures.
-- Corrupt WFS2 frames and corrupt encoded offsets
-  fail closed; no partial masks.
+- Corrupt WFS2 frames (bad magic, malformed
+  `block_offsets`, mis-sized `encoded_lengths`,
+  exception-count mismatch, running-offset
+  overshoot) fail closed; no partial masks.
 - ADR 060 / 064 mask-only composition byte-
   identical on engagement fixtures.
 - ADR 065 Case B/C reachable for `FsstRowSafe`
@@ -1527,10 +1658,13 @@ fixtures; per-buffer scratch-budget cap declines
 the kernel to dense for unbounded cases; council
 can adjust the budget based on Phase 7 evidence.
 
-**Encoded-offset table dominates short-row
-buffers.** 4 bytes per row offset overhead is
-significant for ≤16-byte rows. Mitigation: per-
-buffer actual-size guard (`wfs2_len ≤
+**Metadata overhead dominates short-row buffers.**
+With `block_offsets` + `encoded_lengths` +
+`exception_lengths` totaling ~1 byte per row plus
+8 bytes per 256-row block, overhead is still
+significant for ≤16-byte rows (encoded payload is
+small relative to the metadata floor). Mitigation:
+per-buffer actual-size guard (`wfs2_len ≤
 ceil(wfs1_len * 1.10)`) catches this case and
 falls back to `Fsst`. Bench fixtures verify the
 fallback fires correctly.

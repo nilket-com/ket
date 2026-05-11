@@ -3522,7 +3522,9 @@ fn test_adr057_encoding_guards() {
 		"Delta = 6",
 		"Fsst = 7",
 		"Alp = 8",
-		"pub const ALL: [Self; 8]",
+		"FsstRowSafe = 9",
+		"pub const ALL: [Self; 9]",
+		"pub const DEFAULT_ENABLED: [Self; 9]",
 		"storage.encoding_directory",
 		"cascades: Vec<EncodingCascade>",
 		"cascade_index: EncodingCascadeIndex",
@@ -4541,6 +4543,187 @@ fn test_adr066_fsst_evaluator_guards() {
 }
 
 #[test]
+fn test_adr067_row_safe_fsst_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let compute_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/types.rs")).unwrap();
+	let dispatch =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/dispatch.rs")).unwrap();
+	let fsst_kernel =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/compute/kernels/fsst.rs"))
+			.unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let row_group_fetch_bench =
+		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
+	let bench_results =
+		fs::read_to_string(manifest_dir.join("plans/impl/067_row_canonical_fsst_bench_results.md"))
+			.unwrap_or_default();
+
+	for required in [
+		"FsstRowSafe = 9",
+		"Self::FsstRowSafe => \"fsst_row_safe\"",
+		"\"fsst_row_safe\" => Some(Self::FsstRowSafe)",
+		"pub const DEFAULT_ENABLED: [Self; 9]",
+		"enabled_cascades: EncodingCascadeKind::DEFAULT_ENABLED.into_iter().collect()",
+		"FsstRowSafe {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,",
+	] {
+		if !encoding_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/types.rs: missing ADR 067 token {required}"
+			));
+		}
+	}
+	// Post-promotion (ADR 067 Phase 8): FsstRowSafe is now in DEFAULT_ENABLED.
+	// The original Phase 1 architecture guard pinned the opposite (kept it
+	// out of defaults pending Phase 7 evidence); the council promoted it
+	// default-on per the Phase 7 promotion-gate evidence in
+	// plans/impl/067_row_canonical_fsst_bench_results.md.
+	if !encoding_types.contains("Self::FsstRowSafe,\n\t];")
+		&& !encoding_types.contains("Self::FsstRowSafe,\r\n\t];")
+	{
+		violations.push(
+			"src/storage/encoding/types.rs: DEFAULT_ENABLED must list FsstRowSafe last (post-promotion contract)"
+				.to_string(),
+		);
+	}
+	for required in [
+		"encode_fsst_row_safe_bytes",
+		"decode_fsst_row_safe_bytes",
+		"b\"WFS2\"",
+		"value_offsets.windows(2)",
+		"row_count as u32).to_le_bytes()",
+		"FSST_ROW_SAFE_BLOCK_ROWS: usize = 256",
+		"FSST_ROW_SAFE_LENGTH_SENTINEL: u8 = 255",
+		"block_offsets",
+		"encoded_lengths",
+		"exception_lengths",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 067 WFS2 token {required}"
+			));
+		}
+	}
+	for required in [
+		"EncodingCascadeKind::FsstRowSafe",
+		"EncodingCascade::FsstRowSafe",
+		"saturating_mul(11).div_ceil(10)",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 067 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"FsstRowSafe = 8",
+		"Self::FsstRowSafe => \"fsst_row_safe\"",
+		"\"fsst_row_safe\" => Some(Self::FsstRowSafe)",
+	] {
+		if !compute_types.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/compute/types.rs: missing ADR 067 evaluator token {required}"
+			));
+		}
+	}
+	for required in [
+		"evaluate_fsst_row_safe_predicate",
+		"parse_fsst_row_safe_frame",
+		"evaluate_fsst_row_safe_equality",
+		"EncodingCascade::FsstRowSafe { .. } =>",
+	] {
+		if !dispatch.contains(required) && !fsst_kernel.contains(required) {
+			violations.push(format!(
+				"ADR 067 dispatch/kernel token missing from dispatch or fsst kernel: {required}"
+			));
+		}
+	}
+	for required in [
+		"evaluate_fsst_row_safe_predicate",
+		"EncodingComputeEvaluatorKind::FsstRowSafe",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 067 manager token {required}"
+			));
+		}
+	}
+	for required in ["\"fsst_row_safe\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: missing ADR 067 metric token {required}"
+			));
+		}
+	}
+	for required in [
+		"fsst_row_safe_recorded_diagnostic",
+		"fsst_row_safe_writer_selected",
+		"fsst_row_safe_dense_fallback_atom_unsupported",
+		"fsst_row_safe_cross_replica_determinism",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 067 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"adr067_fsst_row_safe_row_group_fetch",
+		"fsst_row_safe_kernel_case_a1",
+		"fsst_row_safe_dense_case_b_overlap_a2",
+	] {
+		if !row_group_fetch_bench.contains(required) {
+			violations.push(format!(
+				"benches/row_group_fetch.rs: missing ADR 067 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"ADR 067 Row-Canonical FSST Bench Results",
+		"Promotion-gate summary",
+		"EncodingCascadeKind::DEFAULT_ENABLED",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/067_row_canonical_fsst_bench_results.md: missing ADR 067 evidence token {required}"
+			));
+		}
+	}
+	let row_safe_impl = fsst_kernel
+		.split("fn evaluate_fsst_row_safe_equality_impl")
+		.nth(1)
+		.and_then(|tail| tail.split("struct EncodedRowSafeLiteral").next())
+		.unwrap_or_default();
+	for forbidden in [
+		"FsstDecodedByteReader",
+		"decode_buffer(",
+		"evaluate_fsst_equality_impl",
+	] {
+		if row_safe_impl.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/compute/kernels/fsst.rs: row-safe Strategy B path used forbidden token {forbidden}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 067 row-safe FSST invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
 fn test_adr060_sparse_projection_fetch_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let mut violations = Vec::new();
@@ -4925,7 +5108,7 @@ fn test_adr063_page_level_predicate_stats_guards() {
 		}
 	}
 	for required in [
-		"ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 2",
+		"ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3",
 		"pub struct EncodingPageStats",
 		"pub page_stats: Vec<EncodingPageStats>",
 		"pub null_count: PageNullCount",

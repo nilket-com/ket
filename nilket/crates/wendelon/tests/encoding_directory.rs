@@ -15,8 +15,9 @@ use wendelon::storage::encoding::directory::{
 	validate_encoding_directory,
 };
 use wendelon::storage::encoding::{
-	BufferEncoding, ENCODING_DIRECTORY_MAGIC, EncodedBufferByteRange, EncodingCascade,
-	EncodingDirectory, EncodingLeafCascade, EncodingPageStats,
+	BufferEncoding, ENCODING_DIRECTORY_FORMAT_VERSION, ENCODING_DIRECTORY_MAGIC,
+	EncodedBufferByteRange, EncodingCascade, EncodingDirectory, EncodingLeafCascade,
+	EncodingPageStats,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
@@ -343,6 +344,40 @@ fn encoding_directory_roundtrips_validates_and_decode_batch_materializes() {
 		descriptor.logical_schema_fingerprint,
 	)
 	.unwrap();
+}
+
+#[test]
+fn encoding_directory_serializes_fsst_row_safe_cascade_with_bumped_version() {
+	let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+	let descriptor = descriptor(&schema);
+	let directory = EncodingDirectory {
+		record_id: TieredRecordId {
+			slab_id: SlabId::new(67),
+			record_offset: RecordBodyByteOffset::ZERO,
+		},
+		row_count: RowCount::new(0),
+		logical_schema_fingerprint: descriptor.logical_schema_fingerprint,
+		target_simd_page_values: wendelon::schema::SimdPageValueCount::new(1024),
+		cascades: vec![EncodingCascade::FsstRowSafe {
+			symbol_table_byte_len: RecordBodyByteLen::ZERO,
+		}],
+		buffers: Vec::new(),
+	};
+
+	let value = serialize_encoding_directory_value(&directory).unwrap();
+	let bytes = BASE64.decode(&value).unwrap();
+	assert_eq!(
+		u32::from_be_bytes(
+			bytes[ENCODING_DIRECTORY_MAGIC.len()..ENCODING_DIRECTORY_MAGIC.len() + 4]
+				.try_into()
+				.unwrap()
+		),
+		ENCODING_DIRECTORY_FORMAT_VERSION
+	);
+	assert_eq!(
+		deserialize_encoding_directory_value(&value).unwrap(),
+		directory
+	);
 }
 
 #[test]

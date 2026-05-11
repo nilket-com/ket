@@ -7,13 +7,32 @@ Companion implementation plan:
 
 ## Status
 
-Council-converged 2026-05-10 after five iterations
-across Claude / Codex / Gemini. V1 implementation is
-not yet staged; this ADR + companion impl plan are
-the planning artifact. The structural follow-up to
-ADR 066's V1 perf-iteration post-mortem; default
-enablement of the new cascade and evaluator is gated
-on Phase 7 bench evidence per ADR 059 cadence.
+Shipped 2026-05-10 after five council iterations
+across Claude / Codex / Gemini, one V2 frame-layout
+amendment, and Phase 7 promotion-evidence sweep at
+8K / 65K / 1M rows. V1 implementation and Phase 7
+evidence: `plans/impl/067_row_canonical_fsst.md` and
+`plans/impl/067_row_canonical_fsst_bench_results.md`.
+Default-on for `EncodingCascadeKind::FsstRowSafe` and
+`EncodingComputeEvaluatorKind::FsstRowSafe`.
+
+The V2 frame-layout amendment landed pre-promotion:
+the original `(N+1) × u32` encoded-offsets table was
+replaced by a per-256-row `(payload_offset: u32,
+exception_index: u32)` `block_offsets` pair table plus
+a per-row `u8` `encoded_lengths` array (with `255`
+sentinel) and an `exception_lengths` table for rows
+encoding to ≥ 255 bytes. Metadata overhead dropped
+from ~4 B/row to ~1.03 B/row, which is what made the
+≤ 10% compression-loss guard pass on representative
+URL and weak-compression warehouse fixtures.
+
+Council waived the ADR 057 ≤ 75% writer-cost gate
+(observed ~140% writer overhead for the eager
+dual-encode strategy) given the transformative
+read-side wins on a read-heavy warehouse workload.
+Rationale and follow-up path documented in the
+bench-results artifact §"Writer-cost gate waiver".
 
 Anchored on ADR 066 V1 perf-iteration post-mortem
 (`plans/impl/066_fsst_evaluator_bench_results.md`
@@ -337,22 +356,37 @@ byte ranges directly.
    - `2 × symbol_count` bytes of symbol-table pair
      entries (same shape as WFS1).
    - 4-byte row_count.
-   - `(row_count + 1) × 4` bytes of encoded byte
-     offsets (32-bit little-endian, monotonic non-
-     decreasing; offsets[0] == 0; offsets[row_count]
-     == encoded_payload_byte_len). 64-bit offsets
-     reserved for V2 if any single buffer's encoded
-     payload exceeds 4 GiB; V1 declines to dense for
-     such buffers.
+   - `block_offsets`: `ceil(row_count / 256) * 8` bytes.
+     (Note: `block_count` is derived, not stored).
+     Each entry is a 32-bit little-endian pair
+     `(payload_offset, exception_index)` providing
+     O(1) random access into any 256-row block.
+   - `encoded_lengths`: `row_count` bytes (u8).
+     Stores the encoded byte length of each row.
+     A value of `255` is a sentinel indicating the
+     actual length is stored in `exception_lengths`.
+   - 4-byte exception_count (u32 little-endian).
+   - `exception_lengths`: `exception_count * 4` bytes
+     (32-bit little-endian lengths for rows ≥ 255 bytes).
    - Encoded payload: same byte semantics as WFS1
      (literal `< 0x80`, escape `0xff`, symbol `≥ 0x80`
      with high bit clearing to 7-bit symbol index).
-     The writer guarantees that for every row i, the
-     encoded byte range
-     `[offsets[i], offsets[i+1])` decodes
+     
+     If `row_count == 0`: zero blocks, zero lengths,
+     zero exceptions, empty payload.
+     If `row_count % 256 != 0`: the final block
+     has 1-255 lengths.
+     The writer guarantees that for every row i,
+     the encoded byte range `[current_offset_i,
+     current_offset_i + encoded_len_i)` (where
+     `current_offset_i` is the sum of all prior
+     rows' encoded lengths, seedable from
+     `block_offsets[i / 256]`, and `encoded_len_i`
+     is `encoded_lengths[i]` if `< 255` else
+     `exception_lengths[exc_idx_at_row_i]`) decodes
      independently from a fresh state into exactly
-     the row's decoded bytes. **No symbol pair spans
-     any row boundary.**
+     the row's decoded bytes. **No symbol pair
+     spans any row boundary.**
 
 3. **Writer-side row-canonical encoding is the load-
    bearing contract.** The encoder accepts the values
@@ -425,16 +459,25 @@ byte ranges directly.
        (encoded_bytes, encoded_len, decoded_len)
        triple in a small per-buffer scratch
        structure.
-   Per row:
+   Per row (seed `(current_offset, exc_idx) =
+   block_offsets[0] = (0, 0)` once before the loop):
    - `decoded_len_row = decoded_offsets[i+1] - decoded_offsets[i]` (length pre-filter on
      decoded length).
-   - `encoded_len_row = encoded_offsets[i+1] - encoded_offsets[i]` (length pre-filter on
-     encoded length).
+   - `encoded_len_row = encoded_lengths[i] as u32`
+     if `encoded_lengths[i] != 255`; else
+     `encoded_len_row = exception_lengths[exc_idx]; exc_idx += 1`
+     (length pre-filter on encoded length).
    - For the relevant literal(s) of matching decoded
      length: compare `encoded_len_row ==
      encoded_len_literal`; if yes, memcmp the row's
-     encoded byte range against the literal's
-     encoded bytes.
+     encoded byte range
+     `encoded_payload[current_offset
+     .. current_offset + encoded_len_row]` against
+     the literal's encoded bytes.
+   - Advance unconditionally:
+     `current_offset += encoded_len_row` (both
+     length-matching and length-mismatching rows
+     advance, to keep the running state coherent).
    - `row_matches_any_literal = …` per ADR 066
      §"Decision §3" semantics.
    - Apply op-specific inversion: bit = matches for
@@ -500,8 +543,14 @@ byte ranges directly.
      Triggers: bad WFS2 magic, impossible
      `symbol_count`, `row_count` mismatch with
      `BufferEncoding.decoded_value_count`,
-     non-monotonic encoded offsets, encoded offsets
-     outside the payload, malformed Arrow decoded
+     non-monotonic `block_offsets` (either
+     `payload_offset` or `exception_index`),
+     `block_offsets[0] != (0, 0)`,
+     `encoded_lengths.len() != row_count`,
+     `exception_count` not equal to the count of
+     `255` sentinels in `encoded_lengths`, the
+     final running offset not equal to the
+     payload byte length, malformed Arrow decoded
      offsets.
 
    - **Compared ranges are validated only by
@@ -787,7 +836,11 @@ Modify `encode_fsst_bytes` (or introduce a sibling
   for symbol promotion, never let the pair span a row
   boundary.
 - Emit the WFS2 frame: magic + symbol count + symbol
-  table + row count + encoded offsets + encoded
+  table + row count + block_offsets (pair of
+  `(payload_offset: u32, exception_index: u32)` per
+  256-row block) + encoded_lengths (u8 per row;
+  `255` = sentinel) + exception_count +
+  exception_lengths (u32 per exception) + encoded
   payload.
 
 The encoder builds the symbol table by scanning the
@@ -821,13 +874,22 @@ The parser validates:
 
 - Magic `b"WFS2"`.
 - Symbol count ≤ 127.
-- Encoded-offsets table monotonicity, last offset
-  matches encoded payload length.
+- `block_offsets[0] == (0, 0)`,
+  `block_offsets[*].payload_offset` monotonically
+  non-decreasing, `block_offsets[*].exception_index`
+  monotonically non-decreasing.
+- `encoded_lengths.len() == row_count`.
+- `exception_count` equal to the count of `255`
+  sentinels in `encoded_lengths`.
+- Sum of per-row encoded lengths (resolved through
+  the sentinel/exception path) equals encoded
+  payload byte length.
 - Encoded payload byte count matches header.
 
 Returns an opaque `FsstRowSafeFrame` carrying the
-symbol table, encoded offsets slice, and encoded
-payload slice.
+symbol table, `block_offsets` slice,
+`encoded_lengths` slice, `exception_lengths`
+slice, and encoded payload slice.
 
 ### 3. Per-buffer literal pre-encoding
 
@@ -1090,9 +1152,10 @@ Bench artifact records (matching ADR 060 / 063 / 064
   - empty-string fixtures.
 - length-pre-filter Disjoint fixture (literal
   length matches no row length; expect zero
-  byte-comparison work via length pre-filter; no
-  encoded-offset table walk past pre-filter
-  rejection).
+  byte-comparison work via length pre-filter;
+  the `encoded_lengths` scan and `current_offset`
+  advance still run for every row, but no encoded
+  payload byte is read past pre-filter rejection).
 - ADR 060 / 064 composability rows (Strategy B
   predicate engages kernel → mask-only
   `PhaseBOutcome` → sparse projection on
@@ -1109,7 +1172,11 @@ Bench artifact records (matching ADR 060 / 063 / 064
   existing test harness ability per ADR 066's
   composability discussion).
 - Corruption fixtures (malformed WFS2 frame, non-
-  monotonic encoded offsets, encoded-length
+  monotonic `block_offsets` pair entries (either
+  field), `block_offsets[0] != (0, 0)`,
+  `exception_count` not equal to the count of
+  `255` sentinels in `encoded_lengths`, running
+  offset overshoot, encoded-length pre-filter
   mismatch, decoded-length cross-check failure —
   expect fail-closed via
   `EncodingComputeRejectCode`).
@@ -1188,9 +1255,11 @@ Correctness gates:
   decoded offsets.
 - Length pre-filter zero byte-comparison work on
   Disjoint-length fixtures.
-- Corrupt WFS2 frames and corrupt encoded offsets
-  fail closed through `EncodingComputeRejectCode`;
-  no partial masks.
+- Corrupt WFS2 frames (bad magic, malformed
+  `block_offsets`, mis-sized `encoded_lengths`,
+  exception-count mismatch, running-offset
+  overshoot) fail closed through
+  `EncodingComputeRejectCode`; no partial masks.
 - ADR 060 / 064 mask-only composition byte-
   identical on engagement fixtures.
 - ADR 065 Case B/C reachable for `FsstRowSafe`
@@ -1202,10 +1271,11 @@ Correctness gates:
 
 ADR 067 does not ship:
 
-- **64-bit encoded offsets.** V1 declines to dense
-  for buffers exceeding 4 GiB encoded payload.
-  **V2:** trivial offset-width amendment if such
-  buffers materialize.
+- **64-bit block payload offsets.** V1 declines to
+  dense for buffers exceeding 4 GiB encoded
+  payload (since `block_offsets[*].payload_offset`
+  is `u32`). **V2:** trivial pair-table width
+  amendment if such buffers materialize.
 - **Page-grain row-safe FSST.** Buffer-grain only.
   **V2:** dedicated ADR coupled with ADR 057
   page-emission.
@@ -1249,27 +1319,46 @@ ADR 067 does not ship:
   addition.
 - **Insert per-row sentinel bytes in WFS1
   payload.** Cross-row sentinels add 1 byte per
-  row of overhead; doesn't help the reader find
+  row of overhead AND don't help the reader find
   encoded byte ranges without parsing through
-  them. The encoded-offsets table is a smaller
-  total cost.
+  them. The chosen `encoded_lengths` table costs
+  ~1 byte per row (matching the sentinel
+  approach's overhead) but supports O(1) random
+  access via `block_offsets`, no payload parsing
+  required.
 - **Encode each row as an independent WFS1 frame.**
   Per-row symbol-table overhead is prohibitive
   for short rows (16-byte UUIDs would have
   bigger headers than payloads).
-- **Split encoded offsets into a separate buffer
-  alongside validity + decoded offsets + values.**
-  Requires manager.rs to handle 4-buffer leaves
-  (currently 2 or 3). In-frame keeps the buffer
-  count at 3 (validity + decoded offsets +
-  values) and the WFS2 frame self-contained.
-  Phase 0 audit can revisit if frame parse cost
-  proves prohibitive.
-- **Use 64-bit encoded offsets in V1.** 32-bit
-  covers buffers ≤ 4 GiB encoded payload, which
+- **Split WFS2 metadata (block_offsets +
+  encoded_lengths + exception_lengths) into a
+  separate buffer alongside validity + decoded
+  offsets + values.** Requires manager.rs to
+  handle 4-buffer leaves (currently 2 or 3). In-
+  frame keeps the buffer count at 3 (validity +
+  decoded offsets + values) and the WFS2 frame
+  self-contained. Phase 0 audit can revisit if
+  frame parse cost proves prohibitive.
+- **Use 64-bit block payload offsets in V1.** 32-
+  bit `block_offsets[*].payload_offset` covers
+  buffers ≤ 4 GiB encoded payload, which
   dominates V1 workloads. V2 reserves 64-bit for
   unusually large buffers; V1 declines those to
   dense.
+- **Use a (N+1) × u32 absolute encoded-offsets
+  table instead of u8 lengths + block index.**
+  The Phase 7 smoke benches with the u32 layout
+  failed the 10% compression-loss guard on URL
+  (18.6%) and weak-compression (28.5%) fixtures
+  because the 4 B/row overhead dominates short-
+  row buffers. The u8-lengths + per-256-row pair
+  table chosen here is ~1 B/row, drops both
+  fixtures under the 10% guard, and preserves
+  O(1) random access into any block. The u32-
+  offsets alternative buys O(1) random access at
+  the row level — unused by V1 callers (Strategy
+  B is sequential, dense decode is sequential,
+  ADR 064/065 operate on dense Arrow offsets).
 - **Migrate existing `Fsst` buffers to
   `FsstRowSafe` automatically.** Implicit data
   migration violates ADR 057 row-group rewrite
@@ -1532,9 +1621,11 @@ drafts converged on the same answer.
    offsets + values); a 4th buffer would leak
    cascade-private structure into manager fetch
    planning.
-2. **32-bit encoded offsets in V1; decline-to-dense
-   for buffers >4 GiB encoded** (all aligned). 64-
-   bit reserved for V2 if such buffers materialize.
+2. **32-bit block payload offsets in V1; decline-
+   to-dense for buffers >4 GiB encoded** (all
+   aligned). `block_offsets[*].payload_offset` is
+   `u32`. 64-bit reserved for V2 if such buffers
+   materialize.
 3. **New cascade variant `FsstRowSafe` (discriminant
    9, label `"fsst_row_safe"`) + new on-disk frame
    magic `WFS2`** (Codex; all aligned). Reusing

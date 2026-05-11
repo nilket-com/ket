@@ -67,6 +67,25 @@ allow-list and `EncodingCascade::emits_pages_in_v1()`:
 byte-run remains page-emitting but not allow-listed, and both
 carry empty `page_stats`.
 
+ADR 067 row-canonical FSST is now implemented and promoted.
+The cascade catalog extends by one to nine variants: `Plain`,
+`Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`, `Fsst`,
+`Alp`, `FsstRowSafe`. The `FsstRowSafe` cascade introduces the
+`WFS2` on-disk frame (magic `b"WFS2"`, `block_offsets` pair table
+keyed every 256 rows, per-row `u8` `encoded_lengths` with `255`
+sentinel, `exception_lengths` table, encoded payload) and
+emits buffer-grain (no page emission in V1). The `Fsst` cascade
+shape is unchanged for back-compat; existing `Fsst` buffers
+remain readable indefinitely. The encoding directory format
+version bumped by one for the `FsstRowSafe` variant addition.
+Default enablement is on (`EncodingCascadeKind::DEFAULT_ENABLED`
+includes `FsstRowSafe`) per Phase 7 evidence in
+`plans/impl/067_row_canonical_fsst_bench_results.md`; council
+waived the ≤ 75% writer-cost gate explicitly given the
+transformative read-side wins (3.0–11.7× predicate, 1.8–5.4×
+end-to-end) and the offline nature of writer cost on warehouse
+workloads. Roll-out discipline is reader-before-writer.
+
 V1 substrate commitments (council-converged):
 
 - substrate-only scope: per-row-group-buffer encoding

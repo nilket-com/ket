@@ -321,6 +321,15 @@ fn encode_payload(
 		EncodingCascade::Plain => input.to_vec(),
 		EncodingCascade::Lz4Frame => encode_lz4_frame(input)?,
 		EncodingCascade::Fsst { .. } => encode_fsst_bytes(input)?,
+		EncodingCascade::FsstRowSafe { .. } => {
+			let offsets = value_offsets.ok_or_else(|| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Encoding FSST row-safe requires variable-width value offsets",
+				)
+			})?;
+			encode_fsst_row_safe_bytes(input, decoded_value_count, offsets)?
+		}
 		EncodingCascade::Alp { .. } => encode_alp_bytes(input, data_type, decoded_value_count)?,
 		EncodingCascade::BitPacked { bits, base } => {
 			encode_bitpacked_bytes(input, *bits, *base, decoded_value_count)?
@@ -411,6 +420,9 @@ pub fn decode_buffer(
 		EncodingCascade::Plain => encoded.to_vec(),
 		EncodingCascade::Lz4Frame => decode_lz4_frame(encoded, expected_byte_len)?,
 		EncodingCascade::Fsst { .. } => decode_fsst_bytes(encoded, expected_byte_len)?,
+		EncodingCascade::FsstRowSafe { .. } => {
+			decode_fsst_row_safe_bytes(encoded, expected_byte_len, expected_value_count)?
+		}
 		EncodingCascade::Alp { .. } => {
 			decode_alp_bytes(encoded, data_type, expected_byte_len, expected_value_count)?
 		}
@@ -491,14 +503,136 @@ fn decode_lz4_frame(
 	Ok(out)
 }
 
+const FSST_SYMBOL_LIMIT: usize = 127;
+const FSST_SYMBOL_MAP_MISSING: u16 = u16::MAX;
+
 fn encode_fsst_bytes(input: &[u8]) -> std::io::Result<Vec<u8>> {
 	if input.is_empty() {
 		return Ok(Vec::new());
 	}
+	let (symbols, pair_to_symbol) = build_fsst_symbol_table(input, None)?;
+	let mut out = Vec::with_capacity(input.len());
+	out.extend_from_slice(b"WFS1");
+	out.push(symbols.len() as u8);
+	for (left, right) in &symbols {
+		out.push(*left);
+		out.push(*right);
+	}
+	encode_fsst_payload_with_symbol_map(input, &pair_to_symbol, &mut out)
+		.map_err(map_fsst_literal_encode_error)?;
+	Ok(out)
+}
+
+pub(crate) const FSST_ROW_SAFE_BLOCK_ROWS: usize = 256;
+pub(crate) const FSST_ROW_SAFE_LENGTH_SENTINEL: u8 = 255;
+
+fn encode_fsst_row_safe_bytes(
+	input: &[u8],
+	decoded_value_count: BufferValueCount,
+	value_offsets: &[u64],
+) -> std::io::Result<Vec<u8>> {
+	let row_count = decoded_value_count.get() as usize;
+	validate_fsst_row_offsets(input, row_count, value_offsets)?;
+	let (symbols, pair_to_symbol) = build_fsst_symbol_table(input, Some(value_offsets))?;
+	let block_count = row_count.div_ceil(FSST_ROW_SAFE_BLOCK_ROWS);
+	let mut payload = Vec::with_capacity(input.len());
+	let mut encoded_lengths = Vec::with_capacity(row_count);
+	let mut exception_lengths = Vec::<u32>::new();
+	let mut block_offsets = Vec::<(u32, u32)>::with_capacity(block_count);
+	let mut payload_at_row_start = 0_u32;
+	for (row_index, pair) in value_offsets.windows(2).enumerate() {
+		if row_index % FSST_ROW_SAFE_BLOCK_ROWS == 0 {
+			let exc_idx = u32::try_from(exception_lengths.len()).map_err(|_| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					"Encoding FSST row-safe exception index exceeds u32",
+				)
+			})?;
+			block_offsets.push((payload_at_row_start, exc_idx));
+		}
+		let start = pair[0] as usize;
+		let end = pair[1] as usize;
+		encode_fsst_payload_with_symbol_map(&input[start..end], &pair_to_symbol, &mut payload)
+			.map_err(map_fsst_literal_encode_error)?;
+		let payload_after = u32::try_from(payload.len()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding FSST row-safe payload offset exceeds u32",
+			)
+		})?;
+		let row_encoded_len = payload_after - payload_at_row_start;
+		if row_encoded_len < FSST_ROW_SAFE_LENGTH_SENTINEL as u32 {
+			encoded_lengths.push(row_encoded_len as u8);
+		} else {
+			encoded_lengths.push(FSST_ROW_SAFE_LENGTH_SENTINEL);
+			exception_lengths.push(row_encoded_len);
+		}
+		payload_at_row_start = payload_after;
+	}
+	let exception_count = u32::try_from(exception_lengths.len()).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Encoding FSST row-safe exception count exceeds u32",
+		)
+	})?;
+	let block_offset_bytes = block_count.saturating_mul(8);
+	let exception_bytes = exception_lengths.len().saturating_mul(4);
+	let header_len = 5_usize
+		.checked_add(symbols.len().saturating_mul(2))
+		.and_then(|len| len.checked_add(4)) // row_count
+		.and_then(|len| len.checked_add(block_offset_bytes))
+		.and_then(|len| len.checked_add(row_count))
+		.and_then(|len| len.checked_add(4)) // exception_count
+		.and_then(|len| len.checked_add(exception_bytes))
+		.ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding FSST row-safe header length overflow",
+			)
+		})?;
+	let mut out = Vec::with_capacity(header_len.saturating_add(payload.len()));
+	out.extend_from_slice(b"WFS2");
+	out.push(symbols.len() as u8);
+	for (left, right) in &symbols {
+		out.push(*left);
+		out.push(*right);
+	}
+	out.extend_from_slice(&(row_count as u32).to_le_bytes());
+	for (payload_offset, exc_idx) in &block_offsets {
+		out.extend_from_slice(&payload_offset.to_le_bytes());
+		out.extend_from_slice(&exc_idx.to_le_bytes());
+	}
+	out.extend_from_slice(&encoded_lengths);
+	out.extend_from_slice(&exception_count.to_le_bytes());
+	for length in &exception_lengths {
+		out.extend_from_slice(&length.to_le_bytes());
+	}
+	out.extend_from_slice(&payload);
+	Ok(out)
+}
+
+fn build_fsst_symbol_table(
+	input: &[u8],
+	row_offsets: Option<&[u64]>,
+) -> std::io::Result<(Vec<(u8, u8)>, Vec<u16>)> {
 	let mut counts = vec![0_u32; 65_536];
-	for pair in input.windows(2) {
-		let key = ((pair[0] as usize) << 8) | pair[1] as usize;
-		counts[key] = counts[key].saturating_add(1);
+	match row_offsets {
+		Some(offsets) => {
+			for pair in offsets.windows(2) {
+				let start = pair[0] as usize;
+				let end = pair[1] as usize;
+				for adjacent in input[start..end].windows(2) {
+					let key = ((adjacent[0] as usize) << 8) | adjacent[1] as usize;
+					counts[key] = counts[key].saturating_add(1);
+				}
+			}
+		}
+		None => {
+			for pair in input.windows(2) {
+				let key = ((pair[0] as usize) << 8) | pair[1] as usize;
+				counts[key] = counts[key].saturating_add(1);
+			}
+		}
 	}
 	let mut pairs = counts
 		.iter()
@@ -510,26 +644,62 @@ fn encode_fsst_bytes(input: &[u8]) -> std::io::Result<Vec<u8>> {
 			.cmp(left_count)
 			.then_with(|| left_key.cmp(right_key))
 	});
-	let symbol_count = pairs.len().min(127);
-	let mut pair_to_symbol = vec![u16::MAX; 65_536];
+	let symbol_count = pairs.len().min(FSST_SYMBOL_LIMIT);
+	let mut pair_to_symbol = vec![FSST_SYMBOL_MAP_MISSING; 65_536];
 	let mut symbols = Vec::with_capacity(symbol_count);
 	for (symbol, (key, _)) in pairs.into_iter().take(symbol_count).enumerate() {
 		pair_to_symbol[key] = symbol as u16;
 		symbols.push(((key >> 8) as u8, (key & 0xff) as u8));
 	}
-	let mut out = Vec::with_capacity(input.len());
-	out.extend_from_slice(b"WFS1");
-	out.push(symbol_count as u8);
-	for (left, right) in &symbols {
-		out.push(*left);
-		out.push(*right);
+	Ok((symbols, pair_to_symbol))
+}
+
+fn validate_fsst_row_offsets(
+	input: &[u8],
+	row_count: usize,
+	value_offsets: &[u64],
+) -> std::io::Result<()> {
+	if value_offsets.len() != row_count.saturating_add(1) {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Encoding FSST row-safe offset count mismatch",
+		));
+	}
+	let mut previous = 0_u64;
+	for offset in value_offsets {
+		if *offset < previous || *offset > input.len() as u64 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding FSST row-safe offset range invalid",
+			));
+		}
+		previous = *offset;
+	}
+	if value_offsets.first().copied() != Some(0)
+		|| value_offsets.last().copied() != Some(input.len() as u64)
+	{
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Encoding FSST row-safe final offset mismatch",
+		));
+	}
+	Ok(())
+}
+
+pub fn encode_fsst_payload_with_symbol_map(
+	input: &[u8],
+	pair_to_symbol: &[u16],
+	out: &mut Vec<u8>,
+) -> Result<(), EncodingRejectCode> {
+	if pair_to_symbol.len() != 65_536 {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
 	let mut cursor = 0_usize;
 	while cursor < input.len() {
 		if cursor + 1 < input.len() {
 			let key = ((input[cursor] as usize) << 8) | input[cursor + 1] as usize;
 			let symbol = pair_to_symbol[key];
-			if symbol != u16::MAX {
+			if symbol != FSST_SYMBOL_MAP_MISSING {
 				out.push(0x80 | symbol as u8);
 				cursor += 2;
 				continue;
@@ -544,7 +714,14 @@ fn encode_fsst_bytes(input: &[u8]) -> std::io::Result<Vec<u8>> {
 		}
 		cursor += 1;
 	}
-	Ok(out)
+	Ok(())
+}
+
+fn map_fsst_literal_encode_error(error: EncodingRejectCode) -> std::io::Error {
+	std::io::Error::new(
+		std::io::ErrorKind::InvalidData,
+		format!("Encoding FSST literal encode failed: {}", error.as_str()),
+	)
 }
 
 fn decode_fsst_bytes(
@@ -558,6 +735,9 @@ fn decode_fsst_bytes(
 		return Err(EncodingRejectCode::DecodedLengthMismatch);
 	}
 	let symbol_count = encoded[4] as usize;
+	if symbol_count > FSST_SYMBOL_LIMIT {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
 	let symbol_bytes = symbol_count
 		.checked_mul(2)
 		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
@@ -571,14 +751,159 @@ fn decode_fsst_bytes(
 	let expected = usize::try_from(expected_byte_len.get())
 		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
 	let mut out = Vec::with_capacity(expected);
-	while cursor < encoded.len() {
-		let byte = encoded[cursor];
-		cursor += 1;
+	decode_fsst_payload(
+		encoded,
+		symbols,
+		&mut cursor,
+		encoded.len(),
+		expected,
+		&mut out,
+	)?;
+	Ok(out)
+}
+
+fn decode_fsst_row_safe_bytes(
+	encoded: &[u8],
+	expected_byte_len: RecordBodyByteLen,
+	expected_value_count: BufferValueCount,
+) -> Result<Vec<u8>, EncodingRejectCode> {
+	if encoded.len() < 13 || &encoded[..4] != b"WFS2" {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let symbol_count = encoded[4] as usize;
+	if symbol_count > FSST_SYMBOL_LIMIT {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let symbol_bytes = symbol_count
+		.checked_mul(2)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	let mut cursor = 5_usize
+		.checked_add(symbol_bytes)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if cursor > encoded.len() {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let symbols = &encoded[5..cursor];
+	let row_count = read_le_u32(encoded, &mut cursor)? as usize;
+	if row_count != expected_value_count.get() as usize {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let block_count = row_count.div_ceil(FSST_ROW_SAFE_BLOCK_ROWS);
+	let mut block_offsets = Vec::<(u32, u32)>::with_capacity(block_count);
+	for index in 0..block_count {
+		let payload_offset = read_le_u32(encoded, &mut cursor)?;
+		let exception_index = read_le_u32(encoded, &mut cursor)?;
+		if index == 0 && (payload_offset != 0 || exception_index != 0) {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		if let Some((prev_payload, prev_exc)) = block_offsets.last()
+			&& (payload_offset < *prev_payload || exception_index < *prev_exc)
+		{
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		block_offsets.push((payload_offset, exception_index));
+	}
+	let lengths_end = cursor
+		.checked_add(row_count)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if lengths_end > encoded.len() {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let encoded_lengths = &encoded[cursor..lengths_end];
+	cursor = lengths_end;
+	let exception_count = read_le_u32(encoded, &mut cursor)? as usize;
+	let sentinel_count = encoded_lengths
+		.iter()
+		.filter(|&&len| len == FSST_ROW_SAFE_LENGTH_SENTINEL)
+		.count();
+	if sentinel_count != exception_count {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let exceptions_end = cursor
+		.checked_add(exception_count.saturating_mul(4))
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	if exceptions_end > encoded.len() {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let mut exception_lengths = Vec::<u32>::with_capacity(exception_count);
+	for _ in 0..exception_count {
+		exception_lengths.push(read_le_u32(encoded, &mut cursor)?);
+	}
+	let payload_start = cursor;
+	let payload_len = encoded.len().saturating_sub(payload_start);
+	let expected = usize::try_from(expected_byte_len.get())
+		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
+	let mut out = Vec::with_capacity(expected);
+	let mut current_offset = 0_usize;
+	let mut exc_idx = 0_usize;
+	for row_index in 0..row_count {
+		if row_index % FSST_ROW_SAFE_BLOCK_ROWS == 0 {
+			let block_index = row_index / FSST_ROW_SAFE_BLOCK_ROWS;
+			let (expected_payload_offset, expected_exc_idx) = block_offsets[block_index];
+			if expected_payload_offset as usize != current_offset
+				|| expected_exc_idx as usize != exc_idx
+			{
+				return Err(EncodingRejectCode::DecodedLengthMismatch);
+			}
+		}
+		let raw_len = encoded_lengths[row_index];
+		let row_encoded_len = if raw_len != FSST_ROW_SAFE_LENGTH_SENTINEL {
+			raw_len as usize
+		} else {
+			let length = *exception_lengths
+				.get(exc_idx)
+				.ok_or(EncodingRejectCode::DecodedLengthMismatch)? as usize;
+			exc_idx += 1;
+			length
+		};
+		let row_start = payload_start
+			.checked_add(current_offset)
+			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+		let row_end = row_start
+			.checked_add(row_encoded_len)
+			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+		if row_end > encoded.len() {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		let mut row_cursor = row_start;
+		decode_fsst_payload(
+			encoded,
+			symbols,
+			&mut row_cursor,
+			row_end,
+			expected,
+			&mut out,
+		)?;
+		if row_cursor != row_end {
+			return Err(EncodingRejectCode::DecodedLengthMismatch);
+		}
+		current_offset = current_offset
+			.checked_add(row_encoded_len)
+			.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	}
+	if current_offset != payload_len {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	if exc_idx != exception_count {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	Ok(out)
+}
+
+fn decode_fsst_payload(
+	encoded: &[u8],
+	symbols: &[u8],
+	cursor: &mut usize,
+	end: usize,
+	expected: usize,
+	out: &mut Vec<u8>,
+) -> Result<(), EncodingRejectCode> {
+	while *cursor < end {
+		let byte = encoded[*cursor];
+		*cursor += 1;
 		if byte < 0x80 {
 			out.push(byte);
-			continue;
-		}
-		if byte != 0xff {
+		} else if byte != 0xff {
 			let index = usize::from(byte & 0x7f)
 				.checked_mul(2)
 				.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
@@ -586,18 +911,30 @@ fn decode_fsst_bytes(
 				return Err(EncodingRejectCode::DecodedLengthMismatch);
 			};
 			out.extend_from_slice(pair);
-			continue;
+		} else {
+			if *cursor >= end {
+				return Err(EncodingRejectCode::DecodedLengthMismatch);
+			}
+			let code = encoded[*cursor];
+			*cursor += 1;
+			out.push(code);
 		}
-		let Some(code) = encoded.get(cursor).copied() else {
-			return Err(EncodingRejectCode::DecodedLengthMismatch);
-		};
-		cursor += 1;
-		out.push(code);
 		if out.len() > expected {
 			return Err(EncodingRejectCode::DecodedLengthMismatch);
 		}
 	}
-	Ok(out)
+	Ok(())
+}
+
+fn read_le_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, EncodingRejectCode> {
+	let end = cursor
+		.checked_add(4)
+		.ok_or(EncodingRejectCode::DecodedLengthMismatch)?;
+	let Some(raw) = bytes.get(*cursor..end) else {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	};
+	*cursor = end;
+	Ok(u32::from_le_bytes(raw.try_into().expect("u32 width")))
 }
 
 fn encode_alp_bytes(

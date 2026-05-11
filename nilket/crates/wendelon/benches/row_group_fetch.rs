@@ -34,10 +34,10 @@ use wendelon::schema::{
 	RowCount, RowGroupIndex, RowGroupRowCount, RowIdentityPolicy, RunCount,
 	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId, TenantId,
 };
-use wendelon::storage::encoding::cascade::encode_buffer;
+use wendelon::storage::encoding::cascade::{encode_buffer, encode_buffer_with_value_offsets};
 use wendelon::storage::encoding::compute::{
 	EncodingComputeConfig, PredicateAtom, PredicateAtomOp, coerce_literal, evaluate_fsst_predicate,
-	evaluator_kind_for_cascade,
+	evaluate_fsst_row_safe_predicate, evaluator_kind_for_cascade,
 };
 use wendelon::storage::encoding::directory::{
 	page_stats_cascade_eligible, serialize_encoding_directory_value,
@@ -104,6 +104,7 @@ fn main() -> std::io::Result<()> {
 	bench_adr064_nullable_sparse_projection_matrix(&config)?;
 	bench_adr065_dense_predicate_zip_matrix(&config)?;
 	bench_adr066_fsst_row_group_fetch_matrix(&config)?;
+	bench_adr067_fsst_row_safe_row_group_fetch_matrix(&config)?;
 	Ok(())
 }
 
@@ -4723,6 +4724,7 @@ struct Adr066FsstPredicateFixture {
 	values: Vec<String>,
 	decoded: Vec<u8>,
 	offsets: Vec<i32>,
+	offsets_u64: Vec<u64>,
 	offset_bytes: Vec<u8>,
 	encoded: wendelon::storage::encoding::cascade::EncodedBuffer,
 	encoding: BufferEncoding,
@@ -4737,6 +4739,8 @@ struct Adr066FsstPredicateMeasurement {
 	decoded_plaintext_bytes: u64,
 	encoded_payload_bytes: u64,
 	offsets_plaintext_bytes: u64,
+	wfs2_metadata_bytes: u64,
+	wfs2_payload_bytes: u64,
 	mask_equal: bool,
 	mask_digest: String,
 }
@@ -4755,7 +4759,9 @@ fn adr066_fsst_predicate_fixture(rows: usize) -> std::io::Result<Adr066FsstPredi
 		.collect::<Vec<_>>();
 	let mut decoded = Vec::new();
 	let mut offsets = Vec::with_capacity(rows.saturating_add(1));
+	let mut offsets_u64 = Vec::with_capacity(rows.saturating_add(1));
 	offsets.push(0);
+	offsets_u64.push(0);
 	for value in &values {
 		decoded.extend_from_slice(value.as_bytes());
 		let offset = i32::try_from(decoded.len()).map_err(|_| {
@@ -4765,6 +4771,7 @@ fn adr066_fsst_predicate_fixture(rows: usize) -> std::io::Result<Adr066FsstPredi
 			)
 		})?;
 		offsets.push(offset);
+		offsets_u64.push(offset as u64);
 	}
 	let offset_bytes = offsets
 		.iter()
@@ -4806,11 +4813,49 @@ fn adr066_fsst_predicate_fixture(rows: usize) -> std::io::Result<Adr066FsstPredi
 		values,
 		decoded,
 		offsets,
+		offsets_u64,
 		offset_bytes,
 		encoded,
 		encoding,
 		atom,
 	})
+}
+
+fn adr067_fsst_row_safe_predicate_fixture(
+	rows: usize,
+) -> std::io::Result<Adr066FsstPredicateFixture> {
+	let mut fixture = adr066_fsst_predicate_fixture(rows)?;
+	let cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let encoded = encode_buffer_with_value_offsets(
+		&fixture.decoded,
+		&DataType::Utf8,
+		cascade,
+		BufferValueCount::new(rows as u32),
+		SimdPageValueCount::new(1024),
+		Some(&fixture.offsets_u64),
+	)
+	.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("ADR 067 RowSafe FSST encode: {err}"),
+		)
+	})?;
+	fixture.encoding = BufferEncoding {
+		row_group_index: RowGroupIndex::ZERO,
+		ipc_column_ordinal: IpcColumnOrdinal::new(1),
+		ipc_buffer_ordinal: IpcBufferIndex::new(2),
+		cascade_index: EncodingCascadeIndex::ZERO,
+		decoded_byte_len: encoded.decoded_byte_len,
+		decoded_value_count: encoded.decoded_value_count,
+		encoded_range: encoded.encoded_range(),
+		page_value_count: SimdPageValueCount::new(1024),
+		page_end_offsets: encoded.page_end_offsets.clone(),
+		page_stats: Vec::new(),
+	};
+	fixture.encoded = encoded;
+	Ok(fixture)
 }
 
 fn adr066_hash_mask(selected: impl IntoIterator<Item = bool>) -> (usize, String) {
@@ -4899,6 +4944,201 @@ fn adr066_measure_fsst_predicate(
 			.iter()
 			.map(|fixture| fixture.offset_bytes.len() as u64)
 			.sum(),
+		wfs2_metadata_bytes: 0,
+		wfs2_payload_bytes: 0,
+		mask_equal: dense_digest == kernel_digest,
+		mask_digest: kernel_digest,
+	})
+}
+
+fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64)> {
+	if encoded.len() < 13 || &encoded[..4] != b"WFS2" {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 magic missing",
+		));
+	}
+	let symbol_count = encoded[4] as usize;
+	let row_count_offset = 5_usize
+		.checked_add(symbol_count.checked_mul(2).ok_or_else(|| {
+			Error::new(ErrorKind::InvalidData, "ADR 067 WFS2 symbol table overflow")
+		})?)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 067 WFS2 row count overflow"))?;
+	let row_count_end = row_count_offset.checked_add(4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 row count end overflow",
+		)
+	})?;
+	if encoded.len() < row_count_end {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 row count truncated",
+		));
+	}
+	let row_count = u32::from_le_bytes(
+		encoded[row_count_offset..row_count_end]
+			.try_into()
+			.expect("slice length checked"),
+	) as usize;
+	if row_count != rows {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 row count mismatch",
+		));
+	}
+	const FSST_ROW_SAFE_BLOCK_ROWS: usize = 256;
+	let block_count = row_count.div_ceil(FSST_ROW_SAFE_BLOCK_ROWS);
+	let block_offset_bytes = block_count.checked_mul(8).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 block_offsets overflow",
+		)
+	})?;
+	let lengths_start = row_count_end.checked_add(block_offset_bytes).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 block_offsets end overflow",
+		)
+	})?;
+	let exception_count_start = lengths_start.checked_add(row_count).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 lengths end overflow",
+		)
+	})?;
+	let exception_count_end = exception_count_start.checked_add(4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 exception_count end overflow",
+		)
+	})?;
+	if encoded.len() < exception_count_end {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 metadata truncated",
+		));
+	}
+	let exception_count = u32::from_le_bytes(
+		encoded[exception_count_start..exception_count_end]
+			.try_into()
+			.expect("slice length checked"),
+	) as usize;
+	let exception_bytes = exception_count.checked_mul(4).ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 exception_lengths overflow",
+		)
+	})?;
+	let payload_start = exception_count_end
+		.checked_add(exception_bytes)
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"ADR 067 WFS2 payload start overflow",
+			)
+		})?;
+	if payload_start > encoded.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 067 WFS2 metadata truncated",
+		));
+	}
+	// metadata = block_offsets + encoded_lengths + 4-byte exception_count + exception_lengths
+	let metadata_bytes = (block_offset_bytes
+		.saturating_add(row_count)
+		.saturating_add(4)
+		.saturating_add(exception_bytes)) as u64;
+	Ok((metadata_bytes, (encoded.len() - payload_start) as u64))
+}
+
+fn adr067_measure_fsst_row_safe_predicate(
+	fixtures: &[Adr066FsstPredicateFixture],
+	iterations: usize,
+) -> std::io::Result<Adr066FsstPredicateMeasurement> {
+	let mut dense_rows = 0_usize;
+	let mut dense_digest = String::new();
+	let dense_elapsed = bench(iterations, || {
+		let mut all_selected = Vec::new();
+		for fixture in fixtures {
+			let target = match fixture.atom.literal.as_ref() {
+				Some(ColumnPredicateLiteralV1::Str(bytes)) => bytes.as_slice(),
+				_ => panic!("ADR 067 fixture literal is pinned to string bytes"),
+			};
+			all_selected.extend(
+				fixture
+					.values
+					.iter()
+					.map(|value| value.as_bytes() == target),
+			);
+		}
+		(dense_rows, dense_digest) = adr066_hash_mask(all_selected);
+	});
+
+	let mut kernel_rows = 0_usize;
+	let mut kernel_digest = String::new();
+	let kernel_elapsed = bench(iterations, || {
+		let mut all_selected = Vec::new();
+		for fixture in fixtures {
+			let coercion = coerce_literal(fixture.atom.literal.as_ref(), &DataType::Utf8)
+				.expect("ADR 067 fixture literal should coerce");
+			let mask = evaluate_fsst_row_safe_predicate(
+				&fixture.encoded.bytes,
+				&fixture.encoding,
+				&fixture.offset_bytes,
+				None,
+				None,
+				&DataType::Utf8,
+				&fixture.atom,
+				&coercion,
+			)
+			.expect("ADR 067 RowSafe FSST predicate should evaluate");
+			all_selected.extend(mask.to_bool_vec().expect("ADR 067 mask bools"));
+		}
+		(kernel_rows, kernel_digest) = adr066_hash_mask(all_selected);
+	});
+
+	let expected_rows = fixtures
+		.iter()
+		.map(|fixture| fixture.offsets.len().saturating_sub(1))
+		.map(|rows| rows.saturating_mul(5).div_ceil(100))
+		.sum::<usize>();
+	if dense_rows != expected_rows || kernel_rows != expected_rows {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"ADR 067 RowSafe mask row mismatch dense={} kernel={} expected={}",
+				dense_rows, kernel_rows, expected_rows
+			),
+		));
+	}
+	let mut wfs2_metadata_bytes = 0_u64;
+	let mut wfs2_payload_bytes = 0_u64;
+	for fixture in fixtures {
+		let (offset_bytes, payload_bytes) =
+			adr067_wfs2_lengths(&fixture.encoded.bytes, fixture.offsets.len() - 1)?;
+		wfs2_metadata_bytes =
+			wfs2_metadata_bytes.saturating_add(offset_bytes);
+		wfs2_payload_bytes = wfs2_payload_bytes.saturating_add(payload_bytes);
+	}
+	Ok(Adr066FsstPredicateMeasurement {
+		dense_elapsed,
+		kernel_elapsed,
+		selected_rows: kernel_rows,
+		decoded_plaintext_bytes: fixtures
+			.iter()
+			.map(|fixture| fixture.decoded.len() as u64)
+			.sum(),
+		encoded_payload_bytes: fixtures
+			.iter()
+			.map(|fixture| fixture.encoded.bytes.len() as u64)
+			.sum(),
+		offsets_plaintext_bytes: fixtures
+			.iter()
+			.map(|fixture| fixture.offset_bytes.len() as u64)
+			.sum(),
+		wfs2_metadata_bytes,
+		wfs2_payload_bytes,
 		mask_equal: dense_digest == kernel_digest,
 		mask_digest: kernel_digest,
 	})
@@ -5099,6 +5339,198 @@ fn bench_adr066_fsst_row_group_fetch_matrix(config: &BenchConfig) -> std::io::Re
 	}
 	println!(
 		"row_group_fetch_bench scenario=adr066_fsst_row_group_fetch rows=mixed emitted_rows={} iterations=max10_1m3",
+		emitted,
+	);
+	Ok(())
+}
+
+fn bench_adr067_fsst_row_safe_row_group_fetch_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let mut emitted = 0_usize;
+	for rows in adr064_nullable_sparse_projection_rows(config) {
+		let profile = if *rows == ROW_GROUP_SCAN_TARGET_ROWS as usize {
+			RowGroupSizingProfile::Scan
+		} else {
+			RowGroupSizingProfile::PointRead
+		};
+		let iterations = adr064_runtime_iterations(config, *rows);
+		let dataset = adr064_nullable_runtime_dataset(
+			*rows,
+			SparseProjectionCascadeFixture::BitPacked,
+			Adr064ProjectionShape::FourNullable,
+			Adr064NullDistribution::Alternating,
+			256,
+			profile,
+		)?;
+		let fsst_fixtures = dataset
+			.fixtures
+			.iter()
+			.map(|fixture| adr067_fsst_row_safe_predicate_fixture(fixture.row_group_rows))
+			.collect::<std::io::Result<Vec<_>>>()?;
+		let predicate = adr067_measure_fsst_row_safe_predicate(&fsst_fixtures, iterations)?;
+		let slab_id = SlabId::new(67_000 + *rows as u64);
+		let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+		let encrypted = adr064_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+		let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+			MockObjectStore::new(MockObjectStoreConfig::default()),
+		)));
+		let uri = runtime.block_on(store.put(
+			&format!("adr067-fsst-row-safe-row-group-fetch/{}.wnd", rows),
+			&encrypted.bytes,
+		))?;
+		let env = SparseProjectionRuntimeEnv {
+			runtime: &runtime,
+			store,
+			uri: &uri,
+			crypto: &crypto,
+			slab_id,
+			object_size: encrypted.bytes.len() as u64,
+		};
+		let projection = measure_adr064_runtime_case(
+			&dataset,
+			SparseProjectionMaskShape::ClusteredFivePercent,
+			Adr064PredicateSource::ExactMask,
+			iterations,
+			&env,
+			true,
+			false,
+		)?;
+		if predicate.selected_rows != projection.sparse.output_rows {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 067 RowSafe predicate/projection row mismatch predicate={} projection={}",
+					predicate.selected_rows, projection.sparse.output_rows
+				),
+			));
+		}
+		let dense_elapsed = predicate
+			.dense_elapsed
+			.saturating_add(projection.dense.elapsed);
+		let sparse_elapsed = predicate
+			.kernel_elapsed
+			.saturating_add(projection.sparse.elapsed);
+		let total_dense_query_plaintext_bytes = predicate
+			.decoded_plaintext_bytes
+			.saturating_add(projection.dense.projection_plaintext_bytes);
+		let total_sparse_query_plaintext_bytes = predicate
+			.encoded_payload_bytes
+			.saturating_add(predicate.offsets_plaintext_bytes)
+			.saturating_add(projection.sparse.projection_plaintext_bytes);
+		println!(
+			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_kernel_case_a1 output_rows={} equality={} mask_equal={} null_count_equal={} null_count={} iterations={} dense_predicate_plaintext_bytes={} wfs2_encoded_bytes={} wfs2_payload_bytes={} wfs2_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} strategy_b_vs_dense_cpu_micros={} dense_projection_plaintext_bytes={} sparse_value_plaintext_bytes={} sparse_validity_plaintext_bytes={} sparse_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} total_sparse_query_plaintext_bytes={} total_query_reduction_micros={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} selected_value_pages={} selected_validity_ranges={} get_bytes_calls={} mask_digest={} output_digest={}",
+			dataset.profile.as_str(),
+			dataset.rows,
+			dataset.fixtures.len(),
+			dataset.page_values,
+			projection.sparse.output_rows,
+			projection.equality,
+			predicate.mask_equal,
+			projection.null_count_equal,
+			projection.sparse.null_count,
+			iterations,
+			predicate.decoded_plaintext_bytes,
+			predicate.encoded_payload_bytes,
+			predicate.wfs2_payload_bytes,
+			predicate.wfs2_metadata_bytes,
+			predicate.offsets_plaintext_bytes,
+			adr065_ratio_micros(
+				predicate.encoded_payload_bytes,
+				predicate.decoded_plaintext_bytes,
+			),
+			duration_ratio_micros(predicate.kernel_elapsed, predicate.dense_elapsed),
+			projection.dense.projection_plaintext_bytes,
+			projection.sparse.value_plaintext_bytes,
+			projection.sparse.validity_plaintext_bytes,
+			projection.sparse.projection_plaintext_bytes,
+			total_dense_query_plaintext_bytes,
+			total_sparse_query_plaintext_bytes,
+			adr065_ratio_micros(
+				total_dense_query_plaintext_bytes,
+				total_sparse_query_plaintext_bytes,
+			),
+			dense_elapsed.as_secs_f64() * 1_000.0,
+			sparse_elapsed.as_secs_f64() * 1_000.0,
+			duration_ratio_micros(dense_elapsed, sparse_elapsed),
+			projection.dense.get_range_calls,
+			projection.sparse.get_range_calls,
+			projection.dense.get_range_bytes,
+			projection.sparse.get_range_bytes,
+			projection.dense.projection_ciphertext_bytes,
+			projection.sparse.projection_ciphertext_bytes,
+			projection.dense.selected_ranges,
+			projection.sparse.selected_ranges,
+			projection.sparse.selected_value_pages,
+			projection.sparse.selected_validity_ranges,
+			projection
+				.dense
+				.get_bytes_calls
+				.saturating_add(projection.sparse.get_bytes_calls),
+			predicate.mask_digest,
+			projection.sparse.digest,
+		);
+
+		let mut a2_rows = 0_usize;
+		let mut a2_digest = String::new();
+		let a2_zip_elapsed = bench(iterations, || {
+			let (rows, digest) = adr065_zip_runtime(
+				black_box(&dataset),
+				black_box(SparseProjectionMaskShape::ClusteredFivePercent),
+			)
+			.expect("ADR 067 A2 dense Case B zip runtime");
+			a2_rows = rows;
+			a2_digest = digest;
+		});
+		if a2_rows != predicate.selected_rows {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"ADR 067 A2 row mismatch predicate={} zipped={}",
+					predicate.selected_rows, a2_rows
+				),
+			));
+		}
+		let a2_elapsed = predicate
+			.dense_elapsed
+			.saturating_add(projection.dense.elapsed)
+			.saturating_add(a2_zip_elapsed);
+		println!(
+			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_dense_case_b_overlap_a2 kernel_engaged=false output_rows={} equality={} mask_equal={} null_count_equal={} iterations={} dense_predicate_plaintext_bytes={} dense_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} dense_total_ms={:.3} case_b_zip_ms={:.3} wfs2_encoded_bytes={} wfs2_payload_bytes={} wfs2_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} get_range_calls={} get_range_bytes={} selected_ranges={} get_bytes_calls={} mask_digest={} zip_digest={}",
+			dataset.profile.as_str(),
+			dataset.rows,
+			dataset.fixtures.len(),
+			dataset.page_values,
+			a2_rows,
+			projection.equality,
+			predicate.mask_equal,
+			projection.null_count_equal,
+			iterations,
+			predicate.decoded_plaintext_bytes,
+			projection.dense.projection_plaintext_bytes,
+			total_dense_query_plaintext_bytes,
+			a2_elapsed.as_secs_f64() * 1_000.0,
+			a2_zip_elapsed.as_secs_f64() * 1_000.0,
+			predicate.encoded_payload_bytes,
+			predicate.wfs2_payload_bytes,
+			predicate.wfs2_metadata_bytes,
+			predicate.offsets_plaintext_bytes,
+			adr065_ratio_micros(
+				predicate.encoded_payload_bytes,
+				predicate.decoded_plaintext_bytes,
+			),
+			projection.dense.get_range_calls,
+			projection.dense.get_range_bytes,
+			projection.dense.selected_ranges,
+			projection.dense.get_bytes_calls,
+			predicate.mask_digest,
+			a2_digest,
+		);
+		emitted = emitted.saturating_add(1);
+	}
+	println!(
+		"row_group_fetch_bench scenario=adr067_fsst_row_safe_row_group_fetch rows=mixed emitted_rows={} iterations=max10_1m3",
 		emitted,
 	);
 	Ok(())
@@ -6266,6 +6698,7 @@ fn adr063_cascade_label(cascade: &EncodingCascade) -> &'static str {
 		EncodingCascade::Delta { .. } => "delta",
 		EncodingCascade::Fsst { .. } => "fsst",
 		EncodingCascade::Alp { .. } => "alp",
+		EncodingCascade::FsstRowSafe { .. } => "fsst_row_safe",
 	}
 }
 

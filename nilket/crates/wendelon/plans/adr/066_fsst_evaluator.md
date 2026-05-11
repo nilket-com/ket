@@ -12,6 +12,16 @@ Claude / Codex / Gemini. V1 implementation is staged
 default-off; local Phase 7 evidence is recorded and default-on
 promotion remains blocked pending council review and cleared gates.
 
+ADR 067 (row-canonical FSST + Strategy B) shipped 2026-05-10 and
+supersedes Strategy A as the default predicate path for FSST-
+encoded variable-width buffers. Strategy A (this ADR's V1 reader
+implementation) remains in the catalog default-off for existing
+`Fsst` cascade buffers; new writes default to `FsstRowSafe` +
+Strategy B, which posted 3.0–11.7× predicate wall-clock vs dense
+WFS1 against this ADR's V1 Strategy A at 4.3–9.2× on the same
+fixtures. The Strategy A code path is preserved indefinitely for
+back-compat reads of pre-ADR-067 `Fsst` buffers.
+
 V1 contract:
 
 - **Streaming token decode (Strategy A)** is the V1 byte-

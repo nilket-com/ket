@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 use arrow::datatypes::DataType;
 use wendelon::schema::{BufferValueCount, RecordBodyByteLen, SampleRowCount};
 use wendelon::storage::encoding::sample::sample_buffer;
-use wendelon::storage::encoding::select::select_and_encode_buffer;
+use wendelon::storage::encoding::select::{
+	select_and_encode_buffer, select_and_encode_buffer_with_value_offsets,
+};
 use wendelon::storage::{EncodingCascade, EncodingCascadeKind, EncodingWriterConfig};
 
 #[test]
@@ -69,6 +71,79 @@ fn selection_respects_disabled_writer_and_cascade_allow_list() {
 }
 
 #[test]
+fn default_writer_cascades_include_fsst_row_safe_after_promotion() {
+	let config = EncodingWriterConfig::default();
+	assert!(config.enabled_cascades.contains(&EncodingCascadeKind::Fsst));
+	assert!(
+		config
+			.enabled_cascades
+			.contains(&EncodingCascadeKind::FsstRowSafe)
+	);
+	assert!(EncodingCascadeKind::ALL.contains(&EncodingCascadeKind::FsstRowSafe));
+	assert!(EncodingCascadeKind::DEFAULT_ENABLED.contains(&EncodingCascadeKind::FsstRowSafe));
+	assert_eq!(EncodingCascadeKind::FsstRowSafe.as_str(), "fsst_row_safe");
+	assert_eq!(
+		EncodingCascadeKind::from_label("fsst_row_safe"),
+		Some(EncodingCascadeKind::FsstRowSafe)
+	);
+}
+
+#[test]
+fn selection_chooses_fsst_row_safe_only_when_enabled_and_size_guard_clears() {
+	let row = vec![b'a'; 128];
+	let values = vec![row.as_slice(); 16];
+	let (input, offsets) = variable_width_payload(&values);
+	let config = EncodingWriterConfig {
+		enabled: true,
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: BTreeSet::from([
+			EncodingCascadeKind::Plain,
+			EncodingCascadeKind::Fsst,
+			EncodingCascadeKind::FsstRowSafe,
+		]),
+		..EncodingWriterConfig::default()
+	};
+
+	let encoded = select_and_encode_buffer_with_value_offsets(
+		&input,
+		&DataType::Utf8,
+		BufferValueCount::new(values.len() as u32),
+		&config,
+		Some(&offsets),
+	)
+	.unwrap();
+
+	assert!(matches!(
+		encoded.cascade,
+		EncodingCascade::FsstRowSafe { .. }
+	));
+	assert!(encoded.bytes.starts_with(b"WFS2"));
+}
+
+#[test]
+fn selection_falls_back_when_fsst_row_safe_only_size_guard_fails() {
+	let values = vec![b"ab".as_slice(); 32];
+	let (input, offsets) = variable_width_payload(&values);
+	let config = EncodingWriterConfig {
+		enabled: true,
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: BTreeSet::from([EncodingCascadeKind::FsstRowSafe]),
+		..EncodingWriterConfig::default()
+	};
+
+	let encoded = select_and_encode_buffer_with_value_offsets(
+		&input,
+		&DataType::Utf8,
+		BufferValueCount::new(values.len() as u32),
+		&config,
+		Some(&offsets),
+	)
+	.unwrap();
+
+	assert!(matches!(encoded.cascade, EncodingCascade::Plain));
+}
+
+#[test]
 fn selection_chooses_delta_for_monotonic_fixed_width_values() {
 	let mut input = Vec::new();
 	for value in 0..4096_u64 {
@@ -91,6 +166,17 @@ fn selection_chooses_delta_for_monotonic_fixed_width_values() {
 
 	assert!(matches!(encoded.cascade, EncodingCascade::Delta { .. }));
 	assert!(encoded.bytes.len() < input.len());
+}
+
+fn variable_width_payload(values: &[&[u8]]) -> (Vec<u8>, Vec<u64>) {
+	let mut input = Vec::new();
+	let mut offsets = Vec::with_capacity(values.len() + 1);
+	offsets.push(0_u64);
+	for value in values {
+		input.extend_from_slice(value);
+		offsets.push(input.len() as u64);
+	}
+	(input, offsets)
 }
 
 #[test]

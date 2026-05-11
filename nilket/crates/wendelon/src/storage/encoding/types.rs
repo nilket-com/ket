@@ -13,7 +13,7 @@ use std::io::{Error, ErrorKind};
 
 pub const ENCODING_DIRECTORY_METADATA_KEY: &str = "storage.encoding_directory";
 pub const ENCODING_DIRECTORY_MAGIC: [u8; 8] = *b"WNDENC01";
-pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 2;
+pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3;
 
 pub const ENCODING_TARGET_SIMD_PAGE_VALUES_DEFAULT: u32 = 1_024;
 pub const ENCODING_CASCADE_SAMPLE_ROWS_DEFAULT: u32 = 256;
@@ -32,10 +32,11 @@ pub enum EncodingCascadeKind {
 	Delta = 6,
 	Fsst = 7,
 	Alp = 8,
+	FsstRowSafe = 9,
 }
 
 impl EncodingCascadeKind {
-	pub const ALL: [Self; 8] = [
+	pub const ALL: [Self; 9] = [
 		Self::Plain,
 		Self::Lz4Frame,
 		Self::BitPacked,
@@ -44,6 +45,19 @@ impl EncodingCascadeKind {
 		Self::Delta,
 		Self::Fsst,
 		Self::Alp,
+		Self::FsstRowSafe,
+	];
+
+	pub const DEFAULT_ENABLED: [Self; 9] = [
+		Self::Plain,
+		Self::Lz4Frame,
+		Self::BitPacked,
+		Self::Rle,
+		Self::Dictionary,
+		Self::Delta,
+		Self::Fsst,
+		Self::Alp,
+		Self::FsstRowSafe,
 	];
 
 	pub fn as_str(self) -> &'static str {
@@ -56,6 +70,7 @@ impl EncodingCascadeKind {
 			Self::Delta => "delta",
 			Self::Fsst => "fsst",
 			Self::Alp => "alp",
+			Self::FsstRowSafe => "fsst_row_safe",
 		}
 	}
 
@@ -69,6 +84,7 @@ impl EncodingCascadeKind {
 			"delta" => Some(Self::Delta),
 			"fsst" => Some(Self::Fsst),
 			"alp" => Some(Self::Alp),
+			"fsst_row_safe" => Some(Self::FsstRowSafe),
 			_ => None,
 		}
 	}
@@ -115,6 +131,9 @@ pub enum EncodingCascade {
 	Fsst {
 		symbol_table_byte_len: RecordBodyByteLen,
 	},
+	FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen,
+	},
 	Alp {
 		exponent: Exponent,
 		factor: Factor,
@@ -133,6 +152,7 @@ impl EncodingCascade {
 			Self::Dictionary { .. } => EncodingCascadeKind::Dictionary,
 			Self::Delta { .. } => EncodingCascadeKind::Delta,
 			Self::Fsst { .. } => EncodingCascadeKind::Fsst,
+			Self::FsstRowSafe { .. } => EncodingCascadeKind::FsstRowSafe,
 			Self::Alp { .. } => EncodingCascadeKind::Alp,
 		}
 	}
@@ -270,7 +290,7 @@ impl Default for EncodingWriterConfig {
 			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(
 				ENCODING_MIN_BUFFER_BYTES_DEFAULT,
 			),
-			enabled_cascades: EncodingCascadeKind::ALL.into_iter().collect(),
+			enabled_cascades: EncodingCascadeKind::DEFAULT_ENABLED.into_iter().collect(),
 		}
 	}
 }

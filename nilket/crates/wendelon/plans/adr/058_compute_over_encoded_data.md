@@ -16,6 +16,19 @@ excluded by the default predicate allow-list and pre-kernel
 eligibility. Native per-cascade promotion evidence lives at
 `plans/impl/059_native_cocd_kernels_bench_results.md`.
 
+ADR 067 row-canonical FSST evaluator promoted default-on. The
+evaluator catalog extends by one to nine variants, including
+`FsstRowSafe` (discriminant 8, label `"fsst_row_safe"`), which
+runs Strategy B (pre-encoded literal memcmp against the WFS2
+canonical encoding) on `FsstRowSafe` cascade buffers. ADR 066's
+`Fsst` evaluator (Strategy A streaming token decode) remains in
+the catalog default-off; existing `Fsst` cascade buffers route
+through the dense path unchanged. Phase 7 evidence in
+`plans/impl/067_row_canonical_fsst_bench_results.md` recorded
+3.0–11.7× predicate wall-clock and 1.8–5.4× end-to-end
+speedups; default enablement reflected in
+`EncodingComputeConfig::default().enabled_predicate_evaluators`.
+
 Innermost layer of the storage hierarchy that ADR 056 (row
 groups) and ADR 057 (per-buffer pages + encoding cascades)
 established. Opens on top of ADR 057's Phase 10 bench
