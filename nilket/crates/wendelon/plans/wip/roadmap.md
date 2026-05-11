@@ -31,12 +31,12 @@ entirely on the predicate path** — per row: decoded-
 length pre-filter, encoded-length pre-filter, memcmp
 against a once-per-buffer pre-encoded literal.
 
-**On-disk frame**: new `WFS2` magic + new cascade
+**On-disk frame**: new row-safe FSST magic + new cascade
 variant `EncodingCascade::FsstRowSafe` (discriminant
 9) + new evaluator `EncodingComputeEvaluatorKind::
 FsstRowSafe` (discriminant 8). `ENCODING_DIRECTORY_
-FORMAT_VERSION` bumped by one. Existing `WFS1` /
-`Fsst` buffers remain readable indefinitely via ADR
+FORMAT_VERSION` bumped by one. Existing whole-buffer FSST /
+`FsstWholeBuffer` buffers remain readable indefinitely via ADR
 066 Strategy A; new writes default to `FsstRowSafe`.
 
 **V2 frame-layout amendment landed pre-promotion**:
@@ -54,7 +54,7 @@ and weak-compression warehouse fixtures.
 1M rows (`plans/impl/067_row_canonical_fsst_bench_
 results.md`):
 
-- Predicate wall-clock 3.0–11.7× vs dense WFS1
+- Predicate wall-clock 3.0–11.7× vs dense whole-buffer FSST
   (speedups grow with row count).
 - Strategy B vs ADR 066 Strategy A: 4.3–9.2× across
   warehouse fixtures × tiers.
@@ -62,11 +62,11 @@ results.md`):
   ADR 065 → ADR 060 / 064 Case A.
 - Compression-loss ≤ 8.7% on warehouse fixtures
   (short-string adversarial correctly declines to
-  `Fsst`).
+  `FsstWholeBuffer`).
 - Dense-fallback overhead ≤ 3.1% across routes ×
   tiers.
 - Cross-replica deterministic masks confirmed.
-- Mask byte-identical to dense WFS2 oracle AND ADR
+- Mask byte-identical to dense row-safe FSST oracle AND ADR
   066 Strategy A on every fixture × tier.
 
 **Council waived the ADR 057 ≤ 75% writer-cost
@@ -95,7 +95,7 @@ regex / substring on FSST; FSST aggregate folds;
 sparse projection eligibility for FSST; process-
 wide symbol-table or pre-encoded-literal cache;
 operator-visible compression-loss tunable;
-migration policy for existing `Fsst` buffers;
+migration policy for existing `FsstWholeBuffer` buffers;
 sample-based writer estimator (tracked above);
 removal of `symbol_table_byte_len` cascade field
 (separate trivial follow-up). See
@@ -103,83 +103,27 @@ removal of `symbol_table_byte_len` cascade field
 `plans/impl/067_row_canonical_fsst.md`, and
 `plans/impl/067_row_canonical_fsst_bench_results.md`.
 
-ADR 066 (FSST Predicate Evaluator) is council-converged
-across Claude / Codex / Gemini after four iterations;
-plan-stage commit pending implementation. Adds a native
-FSST predicate evaluator extending ADR 058's catalog by
-one variant (`Fsst`, label `"fsst"`); kernel evaluates
-`Eq` / `Neq` / `InList` over FSST-encoded `Utf8` /
-`LargeUtf8` / `Binary` / `LargeBinary` columns and
-produces mask-only `PhaseBOutcome`. **First multi-buffer
-variable-width native predicate path**: the row-group
-predicate planner extends in place to fetch validity +
-offsets + values together for FSST leaves; non-FSST
-cascades unchanged. **Streaming token decode (Strategy
-A)** is V1: the current `WFS1` encoder compresses the
-entire values buffer as one stream and FSST symbols may
-span Arrow value boundaries, making pre-encoded literal
-compare structurally unsafe; Strategy B is V2 work gated
-on a writer amendment that enforces row-safe FSST
-framing. **Arrow offsets are decoded byte positions**,
-not encoded byte ranges; the kernel walks the encoded
-WFS1 payload from byte 0 and uses offsets only as decoded
-row boundaries — deriving per-row compressed slices from
-Arrow offsets is a correctness violation pinned by an
-architectural guard. **Decoded-length pre-filter** via
-`offsets[i+1] − offsets[i]` is the primary economic
-lever for `InList` and length-mismatch rows; saves byte-
-comparison and scratch-copy work, not stream-walk work.
-**No plan-time fetch-byte economics gate in V1**: the
-dense FSST fallback already substitutes encoded byte
-ranges via `encoding_fetch_range_for_buffer_page`, so
-kernel and fallback fetch the same encoded payload; the
-kernel's win is CPU economics. Short-string / weak-
-compression adversarial fixtures **engage** the kernel
-in V1; the Phase 7 bench records kernel-vs-dense CPU
-overhead per fixture as a recorded diagnostic (no V1
-numeric threshold); a CPU-cost gate is V2 if Phase 7
-surfaces a dense-faster regime. **WFS1 header authoritative** for the symbol
-table; the kernel
-does not consult
-`EncodingCascade::Fsst { symbol_table_byte_len }` —
-cascade-field disposition (currently populated as zero;
-unused by kernel path) is out of scope per ADR 066's
-evaluator-only scope discipline; cleanup belongs in a
-separate (trivial) directory-layout follow-up. FSST
-predicates that engage the kernel migrate from ADR 065
-Case B/C dense-zip to ADR 060 / 064 Case A mask-only
-sparse projection; declined predicates (range / future
-LIKE / atom mismatch) and Sub-case A2 overlap keep ADR
-065 Case B/C reachable. **Promotion gates**: ≥1.5×
-predicate wall-clock at clustered 5% on representative
-FSST-compressible UTF-8 fixtures, ≥1.2× end-to-end
-through ADR 065 → ADR 060 / 064 Case A, ≤5% dense-
-fallback overhead on truly declined paths (range /
-future LIKE / ineligible atoms / types / layouts).
-**Recorded diagnostics (not gating)**: ADR 059's 2×
-CPU speedup; kernel-vs-dense CPU overhead on short-
-string and weak-compression adversarial fixtures
-(kernel engages; no V1 numeric threshold; informs V2
-CPU-cost gate decision). **Boundary-crossing-
-symbol fixture** (a frequent two-byte symbol spans
-adjacent Arrow values) and **no-compressed-row-slice
-regression fixture** (token crosses a row boundary AND
-the matching row begins inside that token) are load-
-bearing correctness fixtures across Phase 1 / 2 / 4 / 7.
-Closed surface: no new on-disk shape, no new
-`L2FetchStrategy` / `EncodedRowMask` / fallback /
-reject variant (the only catalog addition is the
-`Fsst` evaluator kind itself); no IPC custom_metadata
-key, no `ENCODING_DIRECTORY_FORMAT_VERSION` bump, no
-wire / descriptor / PBC / capability / `ObjectStore`
-trait change; no Cargo feature, no metric label, no
-operator knob. ADR 022 / ADR 056 / ADR 057 / ADR 063
-directory shapes unchanged. ADR 060 / 064 sparse
-projection eligibility unchanged. **Evaluator-aware
-type eligibility**: `encoding_compute_predicate_data_type_supported`
-admits UTF-8 / Binary types only through the `Fsst`
-evaluator path. See `plans/adr/066_fsst_evaluator.md`
-and `plans/impl/066_fsst_evaluator.md`.
+ADR 066 (FSST Predicate Evaluator) shipped the Strategy
+A reader for existing `EncodingCascade::FsstWholeBuffer` / whole-buffer FSST
+buffers. It extended ADR 058's evaluator catalog by one
+variant (`FsstWholeBuffer`, label `"fsst"`) and proved the first
+multi-buffer variable-width native predicate path:
+validity + decoded offsets + values are fetched together
+for FSST leaves, and the kernel evaluates `Eq` / `Neq` /
+`InList` over `Utf8` / `LargeUtf8` / `Binary` /
+`LargeBinary` while producing the same mask-only
+`PhaseBOutcome` consumed by ADR 060 / 064 sparse
+projection. ADR 066's post-mortem established the
+streaming-token-decode ceiling that ADR 067 then
+addressed. After ADR 067 promotion, `FsstWholeBuffer` Strategy A is
+preserved indefinitely for back-compat reads of pre-ADR-
+067 buffers but is default-off; new writes default to
+`FsstRowSafe` + Strategy B when the writer's size guard
+clears. The unused
+`EncodingCascade::FsstWholeBuffer { symbol_table_byte_len }` field
+remains an explicit, separate directory-cleanup follow-up.
+See `plans/adr/066_fsst_evaluator.md` and
+`plans/impl/066_fsst_evaluator.md`.
 
 ADR 065 (Dense Predicate-Zip with Sparse Projection) is
 implemented and promoted to shipped with bench evidence at
@@ -690,7 +634,7 @@ established.
 **Closed 6-variant predicate evaluator catalog**: `BitPacked`,
 `RlePlain`, `RleBitPacked`, `DictionaryPlain`,
 `DictionaryBitPacked`, `Delta` (full atom set, full-buffer
-grain). `Plain`, `Lz4Frame`, `Fsst`, `Alp` cascades fall back
+grain). `Plain`, `Lz4Frame`, `FsstWholeBuffer`, `Alp` cascades fall back
 to materialize-then-evaluate. **Closed 8-kernel aggregate
 catalog**: `count_star`, `count_non_null`, `min`, `max`,
 `signed_sum`, `unsigned_sum`, `signed_avg`, `unsigned_avg`.
@@ -769,7 +713,7 @@ bit, no Cargo feature, no new digest domain, no `ObjectStore`
 trait change, no envelope `format_version` bump, no ADR 022
 footer extension, no descriptor surface change, no public
 Toron-visible PBC opcode addition, no ADR 057 cascade catalog
-extension. `Fsst` / `Alp` cascade encoded evaluation deferred
+extension. `FsstWholeBuffer` / `Alp` cascade encoded evaluation deferred
 (own kernel proofs); aggregate push-into-encoded for
 `approx_distinct` / KLL / HLL / `count_distinct` / float /
 decimal / GROUP BY all deferred to follow-up ADRs. See
@@ -782,7 +726,7 @@ after implementation plus Phase 10 bench evidence. Inner layer of the
 Parquet / Vortex-style storage hierarchy ADR 056
 opened. **Closed 8-variant cascade catalog**: `Plain`,
 `Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`,
-`Fsst`, `Alp` with one-level composition via
+`FsstWholeBuffer`, `Alp` with one-level composition via
 `Box<EncodingLeafCascade>` (`EncodingLeafCascade ∈ {Plain,
 Lz4Frame, BitPacked}`); arbitrary-depth nesting
 rejected. **Activation via node-local
@@ -1063,12 +1007,13 @@ triggers, webhooks).
 ## Forward sequence (council-converged)
 
 Decided across multiple iterations between Claude, Codex, and
-Gemini. Steps 1–20 are promoted and shipped (in `plans/adr/`
+Gemini. Steps 1–23 are promoted and shipped (in `plans/adr/`
 with implementation merged). ADR 062 closes the row-group
 sizing question opened by ADR 061; ADR 063 closes the
 predicate-fetch-narrowing follow-up that ADR 062 made
 load-bearing; ADR 064 closes ADR 060's nullable-projection
-deferral. The forward shape continues at #21.
+deferral; ADR 067 closes ADR 066's Strategy B follow-up.
+The forward shape continues at #24.
 
 1. **`StateDigest` substrate** — ADR 046 promoted.
 2. **Row-level tombstones on append-only** — ADR 047 promoted.
@@ -1118,7 +1063,7 @@ deferral. The forward shape continues at #21.
     Council-converged and implemented. Inner layer of the storage
     hierarchy. Closed 8-variant cascade catalog
     (`Plain`, `Lz4Frame`, `BitPacked`, `Rle`,
-    `Dictionary`, `Delta`, `Fsst`, `Alp`) with
+    `Dictionary`, `Delta`, `FsstWholeBuffer`, `Alp`) with
     one-level composition via `EncodingLeafCascade`;
     `EncodingDirectory` in IPC custom_metadata under
     key `storage.encoding_directory`, sibling to
@@ -1173,7 +1118,7 @@ deferral. The forward shape continues at #21.
     after ADR 040 CSB direct-answer ordering; 5-code
     reject taxonomy; ADR 052 secondary-index confirm-
     step; ADR 057 directory shape unchanged; ~27
-    architectural lockdown guards. `Fsst` / `Alp`
+    architectural lockdown guards. `FsstWholeBuffer` / `Alp`
     encoded evaluation deferred. Two aggregate-deferral
     classes: dense-supported but COCD-deferred (Utf8 /
     Binary `min`/`max`, `APPROX_DISTINCT`,
@@ -1600,80 +1545,91 @@ deferral. The forward shape continues at #21.
     and
     `plans/impl/065_dense_predicate_zip_with_sparse_projection.md`.
 
-22. **FSST predicate evaluator** — ADR 066 council-
-    converged across Claude / Codex / Gemini after four
-    iterations; plan-stage commit pending implementation.
-    Adds `EncodingComputeEvaluatorKind::Fsst` (label
-    `"fsst"`) extending ADR 058's catalog by one variant;
-    kernel evaluates `Eq` / `Neq` / `InList` over FSST-
-    encoded `Utf8` / `LargeUtf8` / `Binary` /
-    `LargeBinary` columns and produces mask-only
-    `PhaseBOutcome`. **First multi-buffer variable-width
-    native predicate path**: row-group predicate planner
-    extends in place to fetch validity + offsets + values
-    together for FSST leaves; non-FSST cascades unchanged;
-    one FSST leaf counts as one logical encoded chunk
-    for the existing encoded-page cap. **Streaming token
-    decode (Strategy A)** is V1: the current `WFS1`
-    encoder compresses the entire values buffer as one
-    stream and FSST symbols may span Arrow value
-    boundaries, making pre-encoded literal compare
-    structurally unsafe; Strategy B is V2 work gated on
-    a writer amendment. **Arrow offsets are decoded
-    byte positions, not encoded byte ranges**: kernel
-    walks the encoded WFS1 payload from byte 0 and uses
-    offsets only as decoded row boundaries; deriving
-    per-row compressed slices from offsets is a
-    correctness violation pinned by an architectural
-    guard. **Decoded-length pre-filter** via
-    `offsets[i+1] − offsets[i]` saves byte-comparison and
-    scratch-copy work, not stream-walk work. **No plan-
-    time fetch-byte economics gate in V1**: dense FSST
-    fallback already substitutes encoded byte ranges, so
-    kernel and fallback fetch the same encoded payload;
-    short-string / weak-compression adversarial fixtures
-    are policed by the Phase 7 bench (kernel engages on
-    these fixtures and the bench records kernel-vs-dense
-    CPU overhead with no V1 numeric threshold; CPU-cost
-    gate is V2 if Phase 7 surfaces a dense-faster
-    regime).
-    **WFS1 header authoritative** for symbol table; the
-    kernel does not consult
-    `EncodingCascade::Fsst { symbol_table_byte_len }` —
-    cascade-field disposition is out of scope per ADR
-    066's evaluator-only scope discipline; cleanup is a
-    separate trivial directory-layout follow-up. FSST
-    predicates that engage the kernel migrate from ADR
-    065 Case B/C to ADR 060 / 064 Case A; declined
-    predicates keep ADR 065 Case B/C reachable.
-    **Promotion gates**: ≥1.5× predicate wall-clock at
-    clustered 5% on representative FSST-compressible
-    UTF-8 fixtures, ≥1.2× end-to-end through ADR 065 →
-    ADR 060 / 064 Case A, ≤5% dense-fallback overhead on
-    truly declined paths (range / future LIKE /
-    ineligible atoms / types / layouts). **Recorded
-    diagnostics (not gating)**: ADR 059's 2× CPU speedup;
-    kernel-vs-dense CPU overhead on short-string and
-    weak-compression adversarial fixtures (kernel
-    engages; no V1 numeric threshold; informs V2 CPU-
-    cost gate decision). **Boundary-crossing-
-    symbol** and **no-compressed-row-slice** correctness
-    fixtures are load-bearing across Phase 1 / 2 / 4 / 7.
-    Closed surface: no new on-disk shape, no new
-    `L2FetchStrategy` / `EncodedRowMask` / fallback /
-    reject variant (the only catalog addition is the
-    `Fsst` evaluator kind itself); no IPC
-    custom_metadata key, no
-    `ENCODING_DIRECTORY_FORMAT_VERSION` bump, no
-    wire / descriptor / PBC / capability /
-    `ObjectStore` trait change; no Cargo feature, no
-    metric label, no operator knob. Evaluator-aware
-    type eligibility ensures UTF-8 / Binary types are
-    admitted only through the `Fsst` evaluator path.
-    See `plans/adr/066_fsst_evaluator.md` and
+22. **FSST predicate evaluator** — ADR 066 implemented
+    and promoted to shipped. Adds
+    `EncodingComputeEvaluatorKind::FsstWholeBuffer` (label `"fsst"`)
+    extending ADR 058's catalog by one variant. Strategy
+    A streams the whole-buffer FSST token payload, uses Arrow offsets
+    only as decoded byte positions, and produces mask-only
+    `PhaseBOutcome`. ADR 066 remains the back-compat read
+    path for existing `EncodingCascade::FsstWholeBuffer` buffers, but
+    its Phase 7 post-mortem showed streaming decode cannot
+    beat dense Arrow equality scans at small/medium row
+    counts. After ADR 067, `FsstWholeBuffer` stays in the evaluator
+    catalog default-off; new writes default to
+    `FsstRowSafe` + Strategy B when the writer guard
+    clears. See `plans/adr/066_fsst_evaluator.md` and
     `plans/impl/066_fsst_evaluator.md`.
 
-23. **Capacity-tier compression + serverless / erasure-
+23. **Row-canonical FSST framing + Strategy B predicate
+    evaluator** — ADR 067 implemented and promoted to
+    shipped, default-on, with bench evidence at
+    `plans/impl/067_row_canonical_fsst_bench_results.md`.
+    Adds `EncodingCascade::FsstRowSafe` (discriminant 9,
+    label `"fsst_row_safe"`), the row-safe FSST on-disk frame
+    (`block_offsets` pair table + per-row `encoded_lengths`
+    + `exception_lengths`), and
+    `EncodingComputeEvaluatorKind::FsstRowSafe`
+    (discriminant 8). Strategy B pre-encodes literals once
+    per buffer and then applies decoded-length pre-filter,
+    encoded-length pre-filter, and memcmp against row-
+    canonical encoded byte ranges; it does not decode on
+    the predicate path. Promotion evidence passed
+    predicate wall-clock, end-to-end, dense-fallback,
+    compression-loss, and cross-replica deterministic-mask
+    gates; the ADR 057 writer-cost gate was explicitly
+    waived for V1 eager dual-encode. Tracked follow-up:
+    sample-based writer estimator to reduce writer CPU
+    without changing row-safe FSST's read-side contract. Existing
+    whole-buffer FSST / `FsstWholeBuffer` buffers remain readable via ADR 066
+    Strategy A indefinitely.
+
+24. **Sample-based `FsstRowSafe` writer estimator** —
+    proposed ADR 068, council-converged 2026-05-10
+    after eight iterations across Claude / Codex /
+    Gemini. See `plans/adr/068_fsst_row_safe_writer_
+    estimator.md` and `plans/impl/068_fsst_row_safe_
+    writer_estimator.md`. Baseline is an exact-guard-
+    preserving estimator: cheaply early-decline
+    obvious row-safe FSST losers to whole-buffer-FSST-
+    only, while any row-safe FSST emission still
+    dual-encodes and applies ADR 067's exact per-
+    buffer guard. Three decline mechanisms: cost-free
+    metadata floor (pre-training), trained metadata
+    floor (post-training, pre-sample-encode), and
+    sample confidence (post-sample-encode). A
+    stronger estimator-authorized row-safe-FSST-only
+    path is an explicit guard amendment, not the
+    baseline; it requires false-positive gates and
+    separate promotion evidence if Phase 0/7 shows
+    the exact-guard-preserving version cannot reduce
+    the writer-cost delta enough. Promotion artifact
+    should set expectations that the conservative
+    baseline may reduce the ADR 067 writer overhead
+    without fully returning it under the ADR 057
+    ≤75% target. Implementation is preceded by the
+    naming-vocabulary `feat:` commit (`Fsst` →
+    `FsstWholeBuffer`, `b"WFS1"`/`b"WFS2"` →
+    `b"WBFS"`/`b"RSFS"`).
+
+25. **Encoded-validity page decoding for sparse
+    projection** — proposed ADR 069. Extends ADR 064 by
+    lifting the raw byte-addressable-validity restriction
+    for sparse projection. Capability lift: fetch and
+    decode only selected validity pages when projection
+    columns have encoded validity buffers, preserving the
+    mask-first sparse projection contract and keeping all-
+    null value-fetch elision out of scope.
+
+26. **All-null page-skip for nullable sparse projection**
+    — proposed ADR 070. Separate from encoded-validity
+    decoding because it has a different economic claim:
+    skip projection value fetches entirely when the exact
+    survival mask intersects only null rows for a page.
+    This ADR owns removal of ADR 064's all-null deferral
+    guard and its own correctness / byte-savings fixtures.
+
+27. **Capacity-tier compression + serverless / erasure-
     coded follow-ups (rest of the old #14 bundle).**
     Independent; each ships its own contract surface:
     - **zstd capacity-tier codec + `CompressionLevel`
@@ -1695,7 +1651,7 @@ deferral. The forward shape continues at #21.
     *Each is its own ADR; ordering opportunistic and
     independent of #13 / #14 sequencing.*
 
-24. **CDC follow-up ADRs (consume ADR 054 substrate)** —
+28. **CDC follow-up ADRs (consume ADR 054 substrate)** —
     deferred behind the storage hierarchy in the Toron-
     pivot stretch. Independent; each ships its own
     contract surface:
@@ -1751,18 +1707,18 @@ deferral. The forward shape continues at #21.
       retention extension beyond source-table retention).
     *Each is its own ADR; ordering opportunistic.*
 
-25. **Vector embeddings + vector-form identity / locality
+29. **Vector embeddings + vector-form identity / locality
     PBC opcodes** *(brainstorm 002.)* ANN as a first-class
     index family, composing on the secondary-index
     substrate (#8) and LSM (#11). **Set aside in the
     Toron-pivot stretch** — OLAP focus pulls
     compute-adjacent primitives ahead. Reopen after the
     storage hierarchy (ADR 056 / 057 / 058 / 059 / 060 /
-    061 / 062 / 063 / 064 / 065 / 066) is in production
+    061 / 062 / 063 / 064 / 065 / 066 / 067) is in production
     use and Toron compute-layer requirements surface
     concrete vector workload signals. *Large, multi-ADR.*
 
-26. **Refinement plumbing (opportunistic, no ordering
+30. **Refinement plumbing (opportunistic, no ordering
     constraint).** AGG follow-ups (float canonical,
     Decimal SUM/AVG, GROUP BY *(medium-large)*,
     string/binary quantiles, exact COUNT(DISTINCT),
@@ -1981,7 +1937,7 @@ deferral. The forward shape continues at #21.
   Frame-of-Reference offset; the variant split was a
   category mistake. The 8-cascade catalog
   (`Plain`, `Lz4Frame`, `BitPacked`, `Rle`,
-  `Dictionary`, `Delta`, `Fsst`, `Alp`) is the
+  `Dictionary`, `Delta`, `FsstWholeBuffer`, `Alp`) is the
   council-converged set; new variants require a
   follow-up ADR.
 - **Don't open ADR 057 with descriptor-policy
@@ -2134,50 +2090,56 @@ StateDigest substrate                            (ADR 046)
     (scalar dense-decode branch only;                       (shipped)
      ADR 063 encoding-compute paths stay Case A)
   → FSST predicate evaluator                      (ADR 066)
-    (first multi-buffer variable-width native       (council-converged;
-     predicate path; streaming token decode;          plan-stage commit
-     Arrow offsets are decoded byte positions;        pending implementation)
+    (first multi-buffer variable-width native                  (shipped)
+     predicate path; Strategy A streaming token
+     decode; Arrow offsets are decoded byte
+     positions; default-off after ADR 067)
      decoded-length pre-filter; no plan-time
      fetch-byte economics gate (kernel and dense
-     fallback fetch same encoded payload); WFS1
+     fallback fetch same encoded payload); whole-buffer FSST
      header authoritative; cascade-field
      disposition out of scope)
   → row-canonical FSST framing + Strategy B       (ADR 067)
-    (writer amendment + Strategy B reader avoids   (council-converged;
-     decode entirely on predicate path; new         plan-stage commit
-     WFS2 frame with in-frame 32-bit encoded        pending implementation)
-     offsets; new EncodingCascade::FsstRowSafe
+    (writer amendment + Strategy B reader avoids               (shipped)
+     decode entirely on predicate path; new
+     row-safe FSST frame with in-frame block_offsets +
+     encoded_lengths + exception_lengths; new EncodingCascade::FsstRowSafe
      cascade variant (discriminant 9, label
      "fsst_row_safe"); row-canonical contract
      (writer + literal pre-encoder produce byte-
      identical output); per-buffer actual-size
-     guard wfs2_len ≤ ceil(wfs1_len * 1.10) AND
+     guard fsst_row_safe_encoded_len ≤ ceil(fsst_whole_buffer_encoded_len * 1.10) AND
      ≤ decoded_plaintext_len; fast corruption
      boundary (structural metadata + AEAD upstream;
      dense decode is full-validation oracle); dense
-     WFS2 decode ships first; ADR 066 V1 Strategy A
-     stays for Fsst cascade buffers indefinitely;
+     row-safe FSST decode ships first; ADR 066 V1 Strategy A
+     stays for FsstWholeBuffer cascade buffers indefinitely;
      stricter promotion gates: ≥2.0× predicate,
      ≥1.5× end-to-end, ≤10% compression loss,
      cross-replica deterministic masks; 32-bit
      encoded offsets in V1; ENCODING_DIRECTORY_FORMAT_VERSION
-     bump; rollout reader-before-writer)
-  → capacity-tier compression / serverless / EC  (rest of old #14 bundle) ← here
+     bump; writer-cost gate explicitly waived)
+  → sample-based FsstRowSafe writer estimator     (ADR 068 proposed)  ← here
+  → encoded-validity page decoding                (ADR 069 candidate)
+  → all-null page-skip                            (ADR 070 candidate)
+  → capacity-tier compression / serverless / EC   (rest of old #14 bundle)
   → CDC follow-up ADRs (deferred this stretch)
   → vector embeddings (set aside this stretch)
   → refinement plumbing
 ```
 
-Design tip is at ADR 066 (council-converged across
-Claude / Codex / Gemini after four iterations; plan-stage
-commit pending implementation). The storage hierarchy is
-shipped through ADR 065 (row groups, per-buffer
-pages + encoding cascades, compute over encoded data substrate,
-native per-cascade kernels, sparse projection fetch narrowing,
-page-aligned AEAD chunks, deployment-wide row-group sizing
-profile, page-level predicate stats, predicate-fetch
-narrowing, nullable sparse projection, and dense predicate-
-zip with sparse projection). ADR 063 amends ADR 057 with an additive
+Design tip is at ADR 068 proposed scope: sample-based
+`FsstRowSafe` writer estimator, exact-guard-preserving
+baseline first (council-converged 2026-05-10; entering
+Phase 0 audit + calibration). The storage hierarchy is shipped through
+ADR 067 (row groups, per-buffer pages + encoding cascades,
+compute over encoded data substrate, native per-cascade
+kernels, sparse projection fetch narrowing, page-aligned
+AEAD chunks, deployment-wide row-group sizing profile,
+page-level predicate stats, predicate-fetch narrowing,
+nullable sparse projection, dense predicate-zip with sparse
+projection, FSST Strategy A reader, and row-canonical FSST
+Strategy B). ADR 063 amends ADR 057 with an additive
 `BufferEncoding.page_stats` field (format-version bump, no
 compat decoder) and adds an internal predicate-page fetch
 planner that narrows Phase B predicate fetch to surviving
@@ -2209,17 +2171,18 @@ fetch narrowing gates and metadata envelope; ADR 064's bench
 evidence records nullable value+validity sparse projection;
 ADR 065's bench evidence records scalar dense-predicate zip
 with sparse projection and the narrowed V1 boundary where ADR
-063 encoding-compute paths remain Case A mask-only. ADR 066
-council-converged after four iterations as the first
-variable-width native predicate path in ADR 058's catalog;
-implementation pending Phase 0 audit and Phase 7 bench
-evidence will narrow ADR 065's V1 engagement surface
-further as FSST `Eq` / `Neq` / `InList` Sub-case A1
-predicates (FSST predicate column not in output) migrate
-from Case B/C to Case A. Sub-case A2 (overlap) stays on
-Case B in V1 because variable-width sparse projection is
-V2-deferred; null predicates stay on the ADR 059
-validity-only path.
+063 encoding-compute paths remain Case A mask-only. ADR 066's
+bench evidence records Strategy A's streaming-token-decode
+ceiling. ADR 067's bench evidence records Strategy B's
+default-on promotion: 3.0–11.7× predicate wall-clock vs dense
+whole-buffer FSST, 4.3–9.2× vs Strategy A, 1.81–5.43× end-to-end
+speedups, ≤8.7% compression loss on warehouse fixtures,
+≤3.1% dense-fallback overhead, and deterministic masks. ADR
+067 also narrows ADR 065's V1 engagement surface as
+`FsstRowSafe` Sub-case A1 predicates migrate to Case A;
+Sub-case A2 overlap stays on Case B in V1 because variable-
+width sparse projection is still deferred; null predicates
+stay on the ADR 059 validity-only path.
 The Toron-pivot stretch closed its primary storage-hierarchy
 goal with ADR 058's substrate promotion and ADR 059's narrowed
 default-enabled native-kernel set; ADR 060 closed the encoded-
@@ -2232,17 +2195,23 @@ deployment-wide access-pattern profile; ADR 063 closes the
 predicate-fetch-narrowing follow-up that ADR 062's `Scan`
 profile makes load-bearing (65K-row groups × ~64 pages per
 buffer make page-grain pruning a 5–10× predicate-fetch byte
-reduction on clustered low-selectivity workloads).
-**The council's lean on next pickup:** ADR 066 FSST
-predicate evaluator (#22) is council-converged; next
-session implements Phase 0 audit + kernel + dispatch +
-composition tests, lands Phase 7 bench evidence, and
-promotes. After ADR 066, pick from the remaining Toron-
-adjacent follow-up family (ALP evaluator, RLE value-run
-format, page-grain FSST, sparse predicate-column fetch,
-variable-width sparse projection, encoded-validity page
-decoding, all-null page-skip, range FSST, FSST aggregate
-folds — each its own ADR); or capacity-tier compression /
-serverless PBC / erasure-coding work (#23). CDC follow-
-ups (#24) and vector embeddings (#25) remain deferred
-behind the storage hierarchy in this stretch.
+reduction on clustered low-selectivity workloads); ADR 067
+closed the FSST decode-avoidance follow-up while explicitly
+recording a writer-cost waiver.
+**ADR 068 is now proposed and council-converged**
+(2026-05-10): sample-based `FsstRowSafe` writer estimator
+with an exact-guard-preserving baseline and an explicit
+escalation path only if evidence shows row-safe-FSST-only
+estimator authorization is needed. Implementation is
+preceded by the naming-vocabulary `feat:` commit (`Fsst`
+→ `FsstWholeBuffer`, magic-byte rename) and then enters
+Phase 0 audit + calibration. After ADR 068 ships, ADR 069
+encoded-validity page decoding and ADR 070 all-null page-
+skip are the next ordered Toron-adjacent capability lifts. Remaining items — cascade-field cleanup,
+variable-width sparse projection, sparse predicate-column
+fetch, page-grain FSST, range FSST, FSST aggregate folds, ALP
+evaluator, and RLE value-run format — are opportunistic and
+should remain separate ADRs. Capacity-tier compression /
+serverless PBC / erasure-coding work (#27), CDC follow-ups
+(#28), and vector embeddings (#29) remain behind this storage-
+hierarchy stretch.
