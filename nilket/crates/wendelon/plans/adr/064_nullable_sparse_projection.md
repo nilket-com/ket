@@ -59,10 +59,23 @@ fixed-width with raw byte-addressable validity in V1, and ADR
 063 encoding-compute rows remain Case A mask-only sparse
 projection.
 
-This ADR still does not touch sparse predicate-column fetch,
-encoded-validity page decoding, RLE value-run, FSST / ALP
-evaluators, variable-width sparse projection, all-null
-page-skip optimization, or any public protocol surface.
+ADR 069 closed this ADR's encoded-validity page-decoding
+follow-up for the page-aligned `Rle { inner: Plain }` validity
+catalog member. This ADR still does not touch sparse predicate-
+column fetch, RLE value-run, FSST / ALP evaluators, variable-
+width sparse projection, all-null page-skip optimization, or any
+public protocol surface.
+
+### Where we are after ADR 069
+
+ADR 064 shipped raw byte-addressable validity for nullable sparse
+projection. ADR 069 adds the encoded-validity producer and reader
+for page-local RLE validity bitmaps and narrows
+`SparseProjectionFetchDecline::EncodedValidityBufferUnsupported`
+to unsupported encoded-validity shapes. Remaining nullable sparse
+projection deferrals are variable-width / nested nullable
+projection, all-null page-skip, page-stat-assisted validity
+skipping, and non-V1 validity cascades.
 
 ## Context
 
@@ -144,10 +157,10 @@ shape; just one more byte range per nullable column.
 - **No expansion of the V1 type or cascade catalog.** A
   nullable projected column is eligible only if the same
   column would already pass ADR 060's non-null eligibility.
-- **No encoded-validity page decoding.** V1 declines if the
-  selected nullable column's validity buffer has its own
-  `BufferEncoding` entry. Encoded-validity decode is a
-  follow-up ADR.
+- **No encoded-validity page decoding in ADR 064 itself.** V1
+  declined if the selected nullable column's validity buffer had
+  its own `BufferEncoding` entry. ADR 069 later closes the
+  page-aligned RLE encoded-validity follow-up.
 - **No all-null page-skip optimization.** Selected nullable
   pages fetch the value page and the validity bits, then
   materialization marks null rows.
@@ -638,9 +651,10 @@ ADR 064 does not ship:
   variable-width ADR.
 - **Nested-type nullable sparse projection.** **V2:**
   dedicated nested-type ADR.
-- **Encoded-validity page decoding.** **V2:** if
-  production evidence shows it's load-bearing, follow-up
-  ADR.
+- **Encoded-validity page decoding.** Closed by ADR 069 for
+  page-aligned `Rle { inner: Plain }` validity buffers. Non-V1
+  encoded-validity cascades still decline and require their own
+  follow-up ADR.
 - **All-null page-skip optimization.** **V2:** focused
   page-skip ADR.
 - **Page-stat-assisted validity-fetch skipping.** **V2:**
@@ -765,7 +779,7 @@ ADR 056 row-group fetch + per-row-group stats + page directory
   → ADR 064 nullable sparse projection (this ADR;
     fixed-width nullable extension of ADR 060;
     raw byte-addressable validity only;
-    encoded-validity declines to dense in V1;
+    encoded-validity deferred here and later closed by ADR 069;
     page-local bit-offset rebase; mask-first ordering
     preserved; mask-only Phase B contract preserved;
     ADR 063 composes multiplicatively but page null
@@ -776,8 +790,7 @@ ADR 056 row-group fetch + per-row-group stats + page directory
   → next Toron-adjacent follow-ups (FSST evaluator,
     RLE value-run, sparse predicate-column fetch,
     variable-width nullable sparse projection,
-    encoded-validity page decoding, all-null
-    page-skip optimization)
+    all-null page-skip optimization)
   → capacity-tier compression / serverless / EC bundle
 ```
 

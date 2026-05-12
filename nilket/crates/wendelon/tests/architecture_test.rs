@@ -4923,6 +4923,301 @@ fn test_adr068_fsst_row_safe_estimator_guards() {
 }
 
 #[test]
+fn test_adr069_encoded_validity_sparse_projection_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/materialize.rs")).unwrap();
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let columnar = fs::read_to_string(manifest_dir.join("src/storage/columnar.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/069_encoded_validity_sparse_projection_bench_results.md"),
+	)
+	.unwrap_or_default();
+	let adr064 =
+		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+			.unwrap();
+	let roadmap = fs::read_to_string(manifest_dir.join("plans/wip/roadmap.md")).unwrap();
+
+	let mut violations = Vec::new();
+
+	for required in [
+		"pub(crate) enum WriterValidityCascadeRouting",
+		"Disabled",
+		"Enabled",
+		"pub(crate) const VALIDITY_RLE_BYTE_SAVING_FRACTION",
+		"pub(crate) const MIN_VALIDITY_ENCODE_BYTES",
+		"pub(crate) struct ValidityRleEncodingPlan",
+		"pub(crate) struct ValuePageRowSpan",
+		"pub(crate) fn select_validity_cascade",
+		"run_count: RunCount",
+		"EncodingCascade::Rle",
+		"inner: Box::new(EncodingLeafCascade::Plain)",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 069 selection token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub enum WriterValidityCascadeRouting",
+		"pub fn select_validity_cascade",
+		"pub struct ValidityRleEncodingPlan",
+		"pub struct ValuePageRowSpan",
+	] {
+		if select.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: ADR 069 helper escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"WriterValidityCascadeRouting::Disabled",
+		"WriterValidityCascadeRouting::Enabled",
+		"pub(crate) fn build_encoding_directory_for_ipc_stream_with_validity_for_bench",
+		"select_validity_cascade",
+		"is_validity_buffer",
+		"cascade_index_for",
+		"page_value_count: value_page_value_count",
+		"decoded_value_count: BufferValueCount::new(group.row_count.get())",
+		"decoded_byte_len: RecordBodyByteLen::new(plan.raw_byte_len as u64)",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 069 writer token {required}"
+			));
+		}
+	}
+	if directory.contains("pub fn build_encoding_directory_for_ipc_stream_with_validity_for_bench")
+	{
+		violations.push(
+			"src/storage/encoding/directory.rs: ADR 069 validity writer bench route must remain crate-private"
+				.to_string(),
+		);
+	}
+	let production_writer_route = directory
+		.split("pub fn build_encoding_directory_for_ipc_stream(")
+		.nth(1)
+		.and_then(|tail| tail.split("#[doc(hidden)]").next())
+		.unwrap_or_default();
+	if !production_writer_route.contains("WriterValidityCascadeRouting::Enabled") {
+		violations.push(
+			"src/storage/encoding/directory.rs: promoted ADR 069 production writer route must initialize validity routing Enabled"
+				.to_string(),
+		);
+	}
+	if production_writer_route.contains("WriterValidityCascadeRouting::Disabled") {
+		violations.push(
+			"src/storage/encoding/directory.rs: promoted ADR 069 production writer route must not initialize validity routing Disabled"
+				.to_string(),
+		);
+	}
+	for required in [
+		"pub(crate) enum PageMaterializeValiditySource",
+		"Raw { bit_offset: u8 }",
+		"Encoded { cascade: EncodingCascadeIndex }",
+		"pub(crate) fn validity_page_decoded_byte_len",
+		"pub(crate) fn decode_rle_validity_page",
+		"pub(crate) fn stitch_validity_pages_into_row_group_bitmap",
+		"RleByteRunIter::new",
+		"validity_null_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 069 bitmap token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) fn materialize_encoding_validity_buffer",
+		"pub(crate) fn decode_encoded_validity_buffer",
+		"pub(crate) fn encoded_validity_cascade_supported",
+		"stitch_validity_pages_into_row_group_bitmap",
+		"materialize_ipc_page_is_validity_buffer",
+	] {
+		if !materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/materialize.rs: missing ADR 069 materialize token {required}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) enum EncodedValiditySparseEligibility",
+		"Eligible",
+		"Decline(EncodedValidityDeclineReason)",
+		"pub(crate) enum EncodedValidityDeclineReason",
+		"UnsupportedCascade",
+		"MissingPageMetadata",
+		"PageGeometryMismatch",
+		"RowGroupRowCountMismatch",
+		"DecodedByteLenMismatch",
+		"CorruptPageDescriptor",
+		"pub(crate) fn encoded_validity_sparse_eligibility",
+		"encoded_validity_cascade_supported",
+		"PageMaterializeValiditySource::Encoded",
+		"PageMaterializeValiditySource::Raw",
+		"EncodedValidityBufferUnsupported",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 069 planner token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"ValidityV1Eligibility",
+		"validity_v1_eligibility",
+		"pub enum EncodedValiditySparseEligibility",
+		"pub enum EncodedValidityDeclineReason",
+		"pub fn encoded_validity_sparse_eligibility",
+	] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: ADR 069 planner helper escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"PageMaterializeValiditySource::Raw { bit_offset }",
+		"PageMaterializeValiditySource::Encoded { cascade }",
+		"decode_rle_validity_page",
+		"decode_encoded_validity_buffer",
+		"encoded_validity_cascade_supported",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 069 runtime token {required}"
+			));
+		}
+	}
+	for required in [
+		"materialize_encoding_validity_buffer",
+		"buffer_ordinal == mapping.first_buffer_ordinal",
+	] {
+		if !columnar.contains(required) {
+			violations.push(format!(
+				"src/storage/columnar.rs: missing ADR 069 full-buffer role-dispatch token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3;") {
+		violations.push("ADR 069 must not bump ENCODING_DIRECTORY_FORMAT_VERSION".to_string());
+	}
+	for forbidden in [
+		"EncodedValidity",
+		"ValidityRle",
+		"WriterValidityCascadeRouting",
+		"VALIDITY_RLE_BYTE_SAVING_FRACTION",
+		"MIN_VALIDITY_ENCODE_BYTES",
+	] {
+		if encoding_types.contains(forbidden) || config.contains(forbidden) {
+			violations.push(format!(
+				"ADR 069 must not expose encoded-validity through public/config surfaces, found {forbidden}"
+			));
+		}
+	}
+	for forbidden in ["encoded_validity", "encoded-validity", "validity_rle"] {
+		if metrics.contains(forbidden) {
+			violations.push(format!(
+				"ADR 069 must not add public metric labels, found {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"--encoded-validity-only",
+		"--rows=",
+		"encoded_validity_sparse_projection",
+		"selected_validity_raw_bytes",
+		"selected_validity_encoded_bytes",
+		"deterministic={}",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 069 bench token {required}"
+			));
+		}
+	}
+	for required in [
+		"Status: promoted",
+		"Prompt-to-artifact checklist",
+		"Phase 0 pins",
+		"Hard gates",
+		"Soft gates",
+		"cargo bench --bench encoding_compute -- --quick --encoded-validity-only --rows=8192,65536,1048576",
+		"Writer wall-clock percentage overhead is not bounded by the original",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/069_encoded_validity_sparse_projection_bench_results.md: missing ADR 069 evidence token {required}"
+			));
+		}
+	}
+	for required in [
+		"Where we are after ADR 069",
+		"ADR 069 adds the encoded-validity producer and reader",
+		"Closed by ADR 069 for",
+	] {
+		if !adr064.contains(required) {
+			violations.push(format!(
+				"plans/adr/064_nullable_sparse_projection.md: missing ADR 069 closure token {required}"
+			));
+		}
+	}
+	for required in [
+		"plans/impl/069_encoded_validity_sparse_projection_bench_results.md",
+		"Shipped and promoted",
+		"now initializes `Enabled`",
+		"RowGroupRowCountMismatch",
+	] {
+		if !roadmap.contains(required) {
+			violations.push(format!(
+				"plans/wip/roadmap.md: missing ADR 069 promotion token {required}"
+			));
+		}
+	}
+	if page_materialize.contains("decode_page(")
+		&& page_materialize.contains("decode_rle_validity_page")
+		&& manager.contains("PageMaterializeValiditySource::Encoded")
+		&& !manager.contains("decode_page_fetch(fetch, &fetched)")
+	{
+		// The existing value-page decoder can remain in the helper module, but encoded
+		// validity materialization must take the RLE bitmap path in manager.rs.
+	} else if manager.contains("PageMaterializeValiditySource::Encoded")
+		&& manager.contains("decode_page_fetch(fetch, &fetched)")
+	{
+		violations.push(
+			"src/storage/manager.rs: encoded validity must not reuse fixed-width page decoder"
+				.to_string(),
+		);
+	}
+	if manager.contains("all_null") || manager.contains("AllNull") {
+		violations.push(
+			"src/storage/manager.rs: ADR 069 must not implement all-null value page elision"
+				.to_string(),
+		);
+	}
+	assert!(
+		violations.is_empty(),
+		"ADR 069 encoded-validity sparse projection invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
 fn test_adr060_sparse_projection_fetch_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let mut violations = Vec::new();

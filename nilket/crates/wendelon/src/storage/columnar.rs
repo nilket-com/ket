@@ -13,7 +13,9 @@ use crate::storage::core::RecordLocation;
 use crate::storage::encoding::directory::{
 	deserialize_encoding_directory_value, validate_encoding_directory,
 };
-use crate::storage::encoding::materialize::{find_buffer_encoding, materialize_encoding_buffer};
+use crate::storage::encoding::materialize::{
+	find_buffer_encoding, materialize_encoding_buffer, materialize_encoding_validity_buffer,
+};
 use crate::storage::encoding::{
 	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodingDirectory, EncodingRejectCode,
 };
@@ -1733,7 +1735,7 @@ fn materialize_ipc_body_buffer(
 	})?;
 	if let Some(encoding_directory) = directory.encoding_directory.as_ref() {
 		if let Some(encoding) = encoding_for_ipc_body_buffer(directory, buffer_ordinal, ipc_range) {
-			let field = directory
+			let (physical_ordinal, field) = directory
 				.column_to_buffers
 				.iter()
 				.enumerate()
@@ -1741,7 +1743,7 @@ fn materialize_ipc_body_buffer(
 					let first = mapping.first_buffer_ordinal.get();
 					let end = first.saturating_add(mapping.buffer_count);
 					(buffer_ordinal.get() >= first && buffer_ordinal.get() < end)
-						.then_some(directory.ipc_schema.field(ordinal))
+						.then_some((ordinal, directory.ipc_schema.field(ordinal)))
 				})
 				.ok_or_else(|| {
 					ArrowError::SchemaError(format!(
@@ -1749,15 +1751,22 @@ fn materialize_ipc_body_buffer(
 						buffer_ordinal.get()
 					))
 				})?;
-			let decoded =
+			let mapping = directory.column_to_buffers[physical_ordinal];
+			let decoded = if buffer_ordinal == mapping.first_buffer_ordinal {
+				materialize_encoding_validity_buffer(
+					bytes,
+					encoding_directory,
+					encoding,
+					directory.row_count,
+				)
+			} else {
 				materialize_encoding_buffer(bytes, field.data_type(), encoding_directory, encoding)
-					.map_err(|code| {
-						crate::metrics::global()
-							.observe_storage_l2_encoding_invariant_violation(code.as_str());
-						ArrowError::SchemaError(format!(
-							"Encoding materialization rejected: {code:?}"
-						))
-					})?;
+			}
+			.map_err(|code| {
+				crate::metrics::global()
+					.observe_storage_l2_encoding_invariant_violation(code.as_str());
+				ArrowError::SchemaError(format!("Encoding materialization rejected: {code:?}"))
+			})?;
 			return Ok(Buffer::from_vec(decoded));
 		}
 	}

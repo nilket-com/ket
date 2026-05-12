@@ -1,5 +1,6 @@
 use crate::schema::{
-	BaseValue, BitsPerValue, BufferValueCount, IpcColumnOrdinal, RecordBodyByteLen, RunCount,
+	BaseValue, BitsPerValue, BufferValueCount, BufferValueIndex, EncodingPageByteOffset,
+	IpcColumnOrdinal, RecordBodyByteLen, RunCount,
 };
 use crate::storage::encoding::cascade::estimator::{
 	FsstRowSafeEstimatorDecision, FsstRowSafeEstimatorRouting, FsstRowSafeExactLengths,
@@ -12,6 +13,7 @@ use crate::storage::encoding::cascade::{
 	fsst_whole_buffer_encoded_len_with_table, train_fsst_row_safe_and_whole_buffer_symbol_tables,
 	train_fsst_row_safe_symbol_table,
 };
+use crate::storage::encoding::page_materialize::validity_page_decoded_byte_len;
 use crate::storage::encoding::sample::{ColumnSample, sample_buffer, sample_fsst_compressible};
 use crate::storage::encoding::{
 	EncodingCascade, EncodingCascadeKind, EncodingLeafCascade, EncodingWriterConfig,
@@ -28,6 +30,29 @@ pub(crate) struct WriterCascadeContext {
 pub(crate) struct ColumnFsstSymbolTableCache {
 	row_safe_table: FsstSymbolTable,
 	whole_buffer_table: Option<FsstSymbolTable>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum WriterValidityCascadeRouting {
+	Disabled,
+	Enabled,
+}
+
+pub(crate) const VALIDITY_RLE_BYTE_SAVING_FRACTION: (usize, usize) = (1, 4);
+pub(crate) const MIN_VALIDITY_ENCODE_BYTES: usize = 256;
+
+pub(crate) struct ValidityRleEncodingPlan {
+	pub(crate) encoded_bytes: Vec<u8>,
+	pub(crate) page_end_offsets: Vec<EncodingPageByteOffset>,
+	pub(crate) run_count: RunCount,
+	pub(crate) raw_byte_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ValuePageRowSpan {
+	pub(crate) first_value_index: BufferValueIndex,
+	pub(crate) value_count: BufferValueCount,
 }
 
 struct FsstCurrentBufferExactCandidate {
@@ -131,6 +156,114 @@ pub(crate) fn select_and_encode_buffer_with_value_offsets_and_context(
 		page_rows,
 		value_offsets,
 	)
+}
+
+pub(crate) fn select_validity_cascade(
+	raw_validity_bytes: &[u8],
+	value_page_row_spans: &[ValuePageRowSpan],
+	column_null_count: usize,
+) -> Option<ValidityRleEncodingPlan> {
+	if column_null_count == 0
+		|| value_page_row_spans.is_empty()
+		|| raw_validity_bytes.len() < MIN_VALIDITY_ENCODE_BYTES
+	{
+		return None;
+	}
+	let mut encoded_bytes = Vec::new();
+	let mut page_end_offsets = Vec::with_capacity(value_page_row_spans.len());
+	let mut run_count = 0_usize;
+	let page_table_bytes = value_page_row_spans
+		.len()
+		.checked_mul(std::mem::size_of::<u32>())?;
+	let (saving_numerator, saving_denominator) = VALIDITY_RLE_BYTE_SAVING_FRACTION;
+	if saving_numerator >= saving_denominator || saving_denominator == 0 {
+		return None;
+	}
+	let saving_rhs = raw_validity_bytes
+		.len()
+		.checked_mul(saving_denominator.checked_sub(saving_numerator)?)?;
+	for (page_index, span) in value_page_row_spans.iter().enumerate() {
+		let page = extract_page_local_validity(raw_validity_bytes, *span)?;
+		let (encoded_page, page_run_count) = encode_validity_rle_page(&page)?;
+		run_count = run_count.checked_add(page_run_count)?;
+		encoded_bytes.extend_from_slice(&encoded_page);
+		page_end_offsets.push(EncodingPageByteOffset::new(
+			u32::try_from(encoded_bytes.len()).ok()?,
+		));
+		let remaining_pages = value_page_row_spans
+			.len()
+			.checked_sub(page_index)?
+			.checked_sub(1)?;
+		let best_possible_remaining_payload = remaining_pages.checked_mul(5)?;
+		let lower_bound_total = encoded_bytes
+			.len()
+			.checked_add(best_possible_remaining_payload)?
+			.checked_add(page_table_bytes)?;
+		if lower_bound_total.checked_mul(saving_denominator)? >= saving_rhs {
+			return None;
+		}
+	}
+	let encoded_total = encoded_bytes.len().checked_add(page_table_bytes)?;
+	if !validity_rle_strictly_beats_raw(encoded_total, raw_validity_bytes.len())? {
+		return None;
+	}
+	Some(ValidityRleEncodingPlan {
+		encoded_bytes,
+		page_end_offsets,
+		run_count: RunCount::new(u32::try_from(run_count).ok()?),
+		raw_byte_len: raw_validity_bytes.len(),
+	})
+}
+
+fn extract_page_local_validity(
+	raw_validity_bytes: &[u8],
+	span: ValuePageRowSpan,
+) -> Option<Vec<u8>> {
+	let first = span.first_value_index.get() as usize;
+	let value_count = span.value_count.get() as usize;
+	if value_count == 0 {
+		return None;
+	}
+	let end = first.checked_add(value_count)?;
+	if end > raw_validity_bytes.len().checked_mul(8)? {
+		return None;
+	}
+	let mut out = vec![0_u8; validity_page_decoded_byte_len(value_count)];
+	for row in 0..value_count {
+		let source = first + row;
+		if (raw_validity_bytes[source / 8] & (1_u8 << (source % 8))) != 0 {
+			out[row / 8] |= 1_u8 << (row % 8);
+		}
+	}
+	Some(out)
+}
+
+fn encode_validity_rle_page(input: &[u8]) -> Option<(Vec<u8>, usize)> {
+	let mut out = Vec::new();
+	let mut cursor = 0_usize;
+	let mut runs = 0_usize;
+	while cursor < input.len() {
+		let byte = input[cursor];
+		let mut run = 1_usize;
+		while cursor + run < input.len() && input[cursor + run] == byte && run < u32::MAX as usize {
+			run += 1;
+		}
+		out.extend_from_slice(&u32::try_from(run).ok()?.to_be_bytes());
+		out.push(byte);
+		cursor += run;
+		runs = runs.checked_add(1)?;
+	}
+	Some((out, runs))
+}
+
+fn validity_rle_strictly_beats_raw(encoded_total: usize, raw_total: usize) -> Option<bool> {
+	let (numerator, denominator) = VALIDITY_RLE_BYTE_SAVING_FRACTION;
+	if numerator >= denominator || denominator == 0 {
+		return None;
+	}
+	let lhs = encoded_total.checked_mul(denominator)?;
+	let rhs = raw_total.checked_mul(denominator.checked_sub(numerator)?)?;
+	Some(lhs < rhs)
 }
 
 fn select_candidate_cascade(
@@ -824,6 +957,94 @@ mod tests {
 			offsets.push(input.len() as u64);
 		}
 		(input, offsets)
+	}
+
+	fn validity_bitmap(rows: usize, mut is_valid: impl FnMut(usize) -> bool) -> Vec<u8> {
+		let mut bytes = vec![0_u8; rows.div_ceil(8)];
+		for row in 0..rows {
+			if is_valid(row) {
+				bytes[row / 8] |= 1_u8 << (row % 8);
+			}
+		}
+		bytes
+	}
+
+	#[test]
+	fn select_validity_cascade_emits_page_local_rle_for_clustered_bitmap() {
+		let raw = validity_bitmap(4096, |row| row < 2048);
+		let spans = (0..4)
+			.map(|page| ValuePageRowSpan {
+				first_value_index: BufferValueIndex::new(page * 1024),
+				value_count: BufferValueCount::new(1024),
+			})
+			.collect::<Vec<_>>();
+		let plan = select_validity_cascade(&raw, &spans, 2048).unwrap();
+		assert_eq!(plan.raw_byte_len, 512);
+		assert_eq!(
+			plan.page_end_offsets
+				.iter()
+				.map(|offset| offset.get())
+				.collect::<Vec<_>>(),
+			vec![5, 10, 15, 20]
+		);
+		assert_eq!(plan.run_count, RunCount::new(4));
+		assert_eq!(plan.encoded_bytes.len(), 20);
+	}
+
+	#[test]
+	fn select_validity_cascade_declines_all_valid_and_small_raw_buffers() {
+		let raw = validity_bitmap(4096, |_| true);
+		let spans = [ValuePageRowSpan {
+			first_value_index: BufferValueIndex::ZERO,
+			value_count: BufferValueCount::new(4096),
+		}];
+		assert!(select_validity_cascade(&raw, &spans, 0).is_none());
+		assert!(select_validity_cascade(&raw[..255], &spans, 1).is_none());
+	}
+
+	#[test]
+	fn select_validity_cascade_declines_random_nullity() {
+		let rows = 4096;
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let raw = validity_bitmap(rows, |_| {
+			state = state
+				.wrapping_mul(6_364_136_223_846_793_005)
+				.wrapping_add(1);
+			(state >> 63) != 0
+		});
+		let spans = (0..4)
+			.map(|page| ValuePageRowSpan {
+				first_value_index: BufferValueIndex::new(page * 1024),
+				value_count: BufferValueCount::new(1024),
+			})
+			.collect::<Vec<_>>();
+		let null_count = rows
+			- raw
+				.iter()
+				.map(|byte| byte.count_ones() as usize)
+				.sum::<usize>();
+		assert!(null_count > 0);
+		assert!(select_validity_cascade(&raw, &spans, null_count).is_none());
+	}
+
+	#[test]
+	fn validity_rle_economics_declines_threshold_equality() {
+		assert_eq!(validity_rle_strictly_beats_raw(383, 512), Some(true));
+		assert_eq!(validity_rle_strictly_beats_raw(384, 512), Some(false));
+	}
+
+	#[test]
+	fn validity_page_extraction_rebases_non_byte_aligned_span() {
+		let raw = validity_bitmap(32, |row| matches!(row, 3 | 4 | 7 | 11));
+		let page = extract_page_local_validity(
+			&raw,
+			ValuePageRowSpan {
+				first_value_index: BufferValueIndex::new(3),
+				value_count: BufferValueCount::new(9),
+			},
+		)
+		.unwrap();
+		assert_eq!(page, vec![0b0001_0011, 0b0000_0001]);
 	}
 
 	fn encode_with_routing(

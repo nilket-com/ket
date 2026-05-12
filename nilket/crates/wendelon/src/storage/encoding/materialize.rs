@@ -5,8 +5,13 @@ use crate::storage::encoding::directory::{
 	deserialize_encoding_directory_value, validate_encoding_directory,
 };
 use crate::storage::encoding::page::expand_page_descriptors;
+use crate::storage::encoding::page_materialize::{
+	decode_rle_validity_page, stitch_validity_pages_into_row_group_bitmap,
+	validity_page_decoded_byte_len,
+};
 use crate::storage::encoding::{
-	BufferEncoding, EncodingCascade, EncodingDirectory, EncodingRejectCode, EncodingWriterConfig,
+	BufferEncoding, EncodingCascade, EncodingDirectory, EncodingLeafCascade, EncodingRejectCode,
+	EncodingWriterConfig,
 };
 use crate::storage::row_group::RecordBodyByteRange;
 use crate::storage::row_group::{
@@ -63,6 +68,93 @@ pub fn materialize_encoding_buffer(
 			.observe_storage_l2_encoding_materialize(cascade_label, started.elapsed());
 	}
 	decoded
+}
+
+pub(crate) fn materialize_encoding_validity_buffer(
+	encoded_buffer_bytes: &[u8],
+	directory: &EncodingDirectory,
+	encoding: &BufferEncoding,
+	row_group_row_count: usize,
+) -> Result<Vec<u8>, EncodingRejectCode> {
+	let cascade = directory
+		.cascades
+		.get(encoding.cascade_index.get() as usize)
+		.ok_or(EncodingRejectCode::CascadeUnsupported)?;
+	let start = usize::try_from(encoding.encoded_range.start.get())
+		.map_err(|_| EncodingRejectCode::PageRangeOverflow)?;
+	let len = usize::try_from(encoding.encoded_range.len.get())
+		.map_err(|_| EncodingRejectCode::PageRangeOverflow)?;
+	let end = start
+		.checked_add(len)
+		.ok_or(EncodingRejectCode::PageRangeOverflow)?;
+	if end > encoded_buffer_bytes.len() {
+		return Err(EncodingRejectCode::PageRangeOverflow);
+	}
+	let encoded = &encoded_buffer_bytes[start..end];
+	decode_encoded_validity_buffer(encoded, cascade, encoding, row_group_row_count)
+}
+
+pub(crate) fn decode_encoded_validity_buffer(
+	encoded: &[u8],
+	cascade: &EncodingCascade,
+	encoding: &BufferEncoding,
+	row_group_row_count: usize,
+) -> Result<Vec<u8>, EncodingRejectCode> {
+	if !encoded_validity_cascade_supported(cascade) {
+		return Err(EncodingRejectCode::CascadeUnsupported);
+	}
+	if encoding.decoded_value_count.get() as usize != row_group_row_count {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	if encoding.decoded_byte_len.get() as usize
+		!= validity_page_decoded_byte_len(row_group_row_count)
+	{
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	if encoded.len() as u64 != encoding.encoded_range.len.get() {
+		return Err(EncodingRejectCode::PageRangeOverflow);
+	}
+	if encoding.page_end_offsets.is_empty() && row_group_row_count != 0 {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	let pages = expand_page_descriptors(encoding)?;
+	let mut decoded_pages = Vec::with_capacity(pages.len());
+	for page in pages {
+		let start = usize::try_from(page.byte_range.start.get())
+			.map_err(|_| EncodingRejectCode::PageRangeOverflow)?;
+		let len = usize::try_from(page.byte_range.len.get())
+			.map_err(|_| EncodingRejectCode::PageRangeOverflow)?;
+		let end = start
+			.checked_add(len)
+			.ok_or(EncodingRejectCode::PageRangeOverflow)?;
+		if end > encoded.len() {
+			return Err(EncodingRejectCode::PageRangeOverflow);
+		}
+		let validity =
+			decode_rle_validity_page(&encoded[start..end], page.value_count.get() as usize)
+				.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
+		decoded_pages.push((page, validity));
+	}
+	let stitched = stitch_validity_pages_into_row_group_bitmap(&decoded_pages, row_group_row_count)
+		.map_err(|_| EncodingRejectCode::DecodedLengthMismatch)?;
+	if stitched.len() as u64 != encoding.decoded_byte_len.get() {
+		return Err(EncodingRejectCode::DecodedLengthMismatch);
+	}
+	Ok(stitched)
+}
+
+pub(crate) fn encoded_validity_cascade_supported(cascade: &EncodingCascade) -> bool {
+	match cascade {
+		EncodingCascade::Rle { inner, .. } => matches!(inner.as_ref(), EncodingLeafCascade::Plain),
+		EncodingCascade::Plain
+		| EncodingCascade::Lz4Frame
+		| EncodingCascade::BitPacked { .. }
+		| EncodingCascade::Dictionary { .. }
+		| EncodingCascade::Delta { .. }
+		| EncodingCascade::FsstWholeBuffer { .. }
+		| EncodingCascade::FsstRowSafe { .. }
+		| EncodingCascade::Alp { .. } => false,
+	}
 }
 
 fn decode_encoding_pages(
@@ -295,12 +387,21 @@ pub fn materialize_encoding_ipc_stream(bytes: &[u8]) -> std::io::Result<Vec<u8>>
 							"Encoding column ordinal out of range",
 						)
 					})?;
-				let decoded = materialize_encoding_buffer(
-					&bytes[start..end],
-					field.data_type(),
-					&encoding_directory,
-					encoding,
-				)
+				let decoded = if materialize_ipc_page_is_validity_buffer(&page_directory, page) {
+					materialize_encoding_validity_buffer(
+						&bytes[start..end],
+						&encoding_directory,
+						encoding,
+						group.row_count.get() as usize,
+					)
+				} else {
+					materialize_encoding_buffer(
+						&bytes[start..end],
+						field.data_type(),
+						&encoding_directory,
+						encoding,
+					)
+				}
 				.map_err(|code| {
 					Error::new(
 						ErrorKind::InvalidData,
@@ -347,6 +448,22 @@ pub fn materialize_encoding_ipc_stream(bytes: &[u8]) -> std::io::Result<Vec<u8>>
 	}
 	append_ipc_stream_end(&mut out);
 	Ok(out)
+}
+
+fn materialize_ipc_page_is_validity_buffer(
+	page_directory: &crate::storage::row_group::RecordPageDirectory,
+	page: &crate::storage::row_group::BufferPageDirectoryEntry,
+) -> bool {
+	page_directory
+		.buffer_pages
+		.iter()
+		.filter(|candidate| {
+			candidate.row_group_index == page.row_group_index
+				&& candidate.ipc_column_ordinal == page.ipc_column_ordinal
+		})
+		.map(|candidate| candidate.ipc_buffer_ordinal.get())
+		.min()
+		.is_some_and(|first| page.ipc_buffer_ordinal.get() == first)
 }
 
 struct IpcMessageMetadata<'a> {

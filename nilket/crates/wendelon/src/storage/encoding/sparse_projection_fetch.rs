@@ -2,13 +2,15 @@ use crate::schema::{
 	EncodingPageIndex, IpcBufferIndex, IpcColumnOrdinal, RowGroupIndex, RowGroupRowCount,
 };
 use crate::storage::columnar::{ColumnFetchRequirement, RecordBufferDirectory};
-use crate::storage::encoding::materialize::find_buffer_encoding;
+use crate::storage::encoding::materialize::{
+	encoded_validity_cascade_supported, find_buffer_encoding,
+};
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch,
-	PageMaterializeValidityFetch, encoded_page_body_range, fixed_width_sparse_projection_column,
-	fixed_width_value_bytes, required_projected_physical_ordinals,
-	validity_bitmap_body_range_for_page,
+	PageMaterializeValidityFetch, PageMaterializeValiditySource, encoded_page_body_range,
+	fixed_width_sparse_projection_column, fixed_width_value_bytes,
+	required_projected_physical_ordinals, validity_bitmap_body_range_for_page,
 };
 use crate::storage::encoding::{
 	BufferEncoding, EncodingCascade, EncodingDirectory, EncodingPageDescriptor, EncodingRejectCode,
@@ -75,6 +77,22 @@ pub(crate) enum SparseProjectionFetchDecline {
 	PerBufferFragmentationCapExceeded,
 	SelectedByteFractionExceeded,
 	Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EncodedValidityDeclineReason {
+	UnsupportedCascade,
+	MissingPageMetadata,
+	PageGeometryMismatch,
+	RowGroupRowCountMismatch,
+	DecodedByteLenMismatch,
+	CorruptPageDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EncodedValiditySparseEligibility {
+	Eligible,
+	Decline(EncodedValidityDeclineReason),
 }
 
 pub(crate) struct SparseProjectionFetchInput<'a> {
@@ -249,18 +267,6 @@ pub(crate) fn decide_sparse_projection_fetch(
 						Ok(page) => page,
 						Err(reason) => return SparseProjectionFetchDecision::Decline(reason),
 					};
-					if find_buffer_encoding(
-						input.encoding_directory,
-						group_index,
-						column.null_buffer_ordinal,
-						validity_page.range,
-					)
-					.is_some()
-					{
-						return SparseProjectionFetchDecision::Decline(
-							SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
-						);
-					}
 					let per_buffer_key = (
 						group_index,
 						validity_page.ipc_column_ordinal,
@@ -273,9 +279,80 @@ pub(crate) fn decide_sparse_projection_fetch(
 							SparseProjectionFetchDecline::PerBufferFragmentationCapExceeded,
 						);
 					}
-					for page in &pages {
-						let (body_range, bit_offset) =
-							match validity_bitmap_body_range_for_page(validity_page.range, *page) {
+					let validity_encoding = find_buffer_encoding(
+						input.encoding_directory,
+						group_index,
+						column.null_buffer_ordinal,
+						validity_page.range,
+					);
+					if let Some(validity_encoding) = validity_encoding {
+						let Some(validity_cascade) = input
+							.encoding_directory
+							.cascades
+							.get(validity_encoding.cascade_index.get() as usize)
+						else {
+							return SparseProjectionFetchDecision::Decline(
+								SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+							);
+						};
+						match encoded_validity_sparse_eligibility(
+							validity_encoding,
+							validity_cascade,
+							&pages,
+							group.row_count,
+						) {
+							EncodedValiditySparseEligibility::Eligible => {}
+							EncodedValiditySparseEligibility::Decline(_) => {
+								return SparseProjectionFetchDecision::Decline(
+									SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+								);
+							}
+						}
+						let validity_pages = match expand_page_descriptors(validity_encoding) {
+							Ok(pages) => pages,
+							Err(_) => {
+								return SparseProjectionFetchDecision::Decline(
+									SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+								);
+							}
+						};
+						for page in &pages {
+							let Some(validity_descriptor) = validity_pages
+								.iter()
+								.copied()
+								.find(|candidate| candidate.page_index == page.page_index)
+							else {
+								return SparseProjectionFetchDecision::Decline(
+									SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+								);
+							};
+							validity_fetches.push(PageMaterializeValidityFetch {
+								key: PageMaterializeBufferKey {
+									row_group_index: group_index,
+									ipc_column_ordinal: validity_page.ipc_column_ordinal,
+									ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
+									page_index: validity_descriptor.page_index.get(),
+								},
+								body_range: encoded_page_body_range(
+									validity_page.range,
+									validity_encoding,
+									validity_descriptor,
+								),
+								page: validity_descriptor,
+								source: PageMaterializeValiditySource::Encoded {
+									cascade: validity_encoding.cascade_index,
+								},
+								page_row_count: RowGroupRowCount::new(
+									validity_descriptor.value_count.get(),
+								),
+							});
+						}
+					} else {
+						for page in &pages {
+							let (body_range, bit_offset) = match validity_bitmap_body_range_for_page(
+								validity_page.range,
+								*page,
+							) {
 								Ok(range) => range,
 								Err(_) => {
 									return SparseProjectionFetchDecision::Decline(
@@ -283,18 +360,19 @@ pub(crate) fn decide_sparse_projection_fetch(
 									);
 								}
 							};
-						validity_fetches.push(PageMaterializeValidityFetch {
-							key: PageMaterializeBufferKey {
-								row_group_index: group_index,
-								ipc_column_ordinal: validity_page.ipc_column_ordinal,
-								ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
-								page_index: page.page_index.get(),
-							},
-							body_range,
-							page: *page,
-							bit_offset,
-							page_row_count: RowGroupRowCount::new(page.value_count.get()),
-						});
+							validity_fetches.push(PageMaterializeValidityFetch {
+								key: PageMaterializeBufferKey {
+									row_group_index: group_index,
+									ipc_column_ordinal: validity_page.ipc_column_ordinal,
+									ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
+									page_index: page.page_index.get(),
+								},
+								body_range,
+								page: *page,
+								source: PageMaterializeValiditySource::Raw { bit_offset },
+								page_row_count: RowGroupRowCount::new(page.value_count.get()),
+							});
+						}
 					}
 				} else {
 					for page in &pages {
@@ -493,6 +571,62 @@ fn projection_column_candidate(
 	}
 	fixed_width_sparse_projection_column(record_directory, physical_ordinal)
 		.ok_or(SparseProjectionFetchDecline::NullableTypeNotInCatalog)
+}
+
+pub(crate) fn encoded_validity_sparse_eligibility(
+	validity_buf: &BufferEncoding,
+	validity_cascade: &EncodingCascade,
+	selected_value_pages: &[EncodingPageDescriptor],
+	row_group_row_count: RowGroupRowCount,
+) -> EncodedValiditySparseEligibility {
+	if !encoded_validity_cascade_supported(validity_cascade) {
+		return EncodedValiditySparseEligibility::Decline(
+			EncodedValidityDeclineReason::UnsupportedCascade,
+		);
+	}
+	if validity_buf.page_end_offsets.is_empty() {
+		return EncodedValiditySparseEligibility::Decline(
+			EncodedValidityDeclineReason::MissingPageMetadata,
+		);
+	}
+	if validity_buf.decoded_value_count.get() != row_group_row_count.get() {
+		return EncodedValiditySparseEligibility::Decline(
+			EncodedValidityDeclineReason::RowGroupRowCountMismatch,
+		);
+	}
+	if validity_buf.decoded_byte_len.get()
+		!= u64::from(validity_buf.decoded_value_count.get()).div_ceil(8)
+	{
+		return EncodedValiditySparseEligibility::Decline(
+			EncodedValidityDeclineReason::DecodedByteLenMismatch,
+		);
+	}
+	let validity_pages = match expand_page_descriptors(validity_buf) {
+		Ok(pages) => pages,
+		Err(_) => {
+			return EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::CorruptPageDescriptor,
+			);
+		}
+	};
+	for selected in selected_value_pages {
+		let Some(validity_page) = validity_pages
+			.iter()
+			.find(|page| page.page_index == selected.page_index)
+		else {
+			return EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::PageGeometryMismatch,
+			);
+		};
+		if validity_page.first_value_index != selected.first_value_index
+			|| validity_page.value_count != selected.value_count
+		{
+			return EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::PageGeometryMismatch,
+			);
+		}
+	}
+	EncodedValiditySparseEligibility::Eligible
 }
 
 pub(crate) fn mask_to_active_pages(
@@ -842,6 +976,34 @@ mod tests {
 		}
 	}
 
+	fn encoded_validity_buffer_with_pages(
+		row_group_index: RowGroupIndex,
+		row_count: u32,
+		page_value_count: u32,
+		cascade_index: EncodingCascadeIndex,
+		page_end_offsets: &[u32],
+	) -> BufferEncoding {
+		BufferEncoding {
+			row_group_index,
+			ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+			ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+			cascade_index,
+			decoded_byte_len: RecordBodyByteLen::new(u64::from(row_count).div_ceil(8)),
+			decoded_value_count: BufferValueCount::new(row_count),
+			encoded_range: EncodedBufferByteRange {
+				start: EncodingPageByteOffset::ZERO,
+				len: RecordBodyByteLen::new(u64::from(*page_end_offsets.last().unwrap_or(&0))),
+			},
+			page_value_count: SimdPageValueCount::new(page_value_count),
+			page_end_offsets: page_end_offsets
+				.iter()
+				.copied()
+				.map(EncodingPageByteOffset::new)
+				.collect(),
+			page_stats: Vec::new(),
+		}
+	}
+
 	#[test]
 	fn row_to_page_map_handles_partial_last_page() {
 		let map = RowToPageMap::from_buffer_encoding(&encoding(10, 4, &[4, 8, 10])).unwrap();
@@ -1076,7 +1238,10 @@ mod tests {
 				len: RecordBodyByteLen::new(1),
 			}
 		);
-		assert_eq!(plan.validity_fetches[0].bit_offset, 0);
+		assert!(matches!(
+			plan.validity_fetches[0].source,
+			PageMaterializeValiditySource::Raw { bit_offset: 0 }
+		));
 		assert_eq!(
 			plan.validity_fetches[0].page_row_count,
 			RowGroupRowCount::new(4)
@@ -1203,6 +1368,164 @@ mod tests {
 				&[dense_range()],
 			),
 			SparseProjectionFetchDecline::EncodedValidityBufferUnsupported,
+		);
+	}
+
+	#[test]
+	fn encoded_validity_sparse_eligibility_reports_decline_reasons() {
+		let supported_cascade = EncodingCascade::Rle {
+			run_count: RunCount::new(4),
+			inner: Box::new(EncodingLeafCascade::Plain),
+		};
+		let selected_pages =
+			expand_page_descriptors(&encoding(4096, 1024, &[128, 256, 384, 512])).unwrap();
+		let valid_buffer = encoded_validity_buffer_with_pages(
+			RowGroupIndex::ZERO,
+			4096,
+			1024,
+			EncodingCascadeIndex::new(1),
+			&[5, 10, 15, 20],
+		);
+
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&valid_buffer,
+				&EncodingCascade::Plain,
+				&selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::UnsupportedCascade
+			)
+		);
+
+		let missing_pages = encoded_validity_buffer(RowGroupIndex::ZERO, 4096);
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&missing_pages,
+				&supported_cascade,
+				&selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::MissingPageMetadata
+			)
+		);
+
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&valid_buffer,
+				&supported_cascade,
+				&selected_pages,
+				RowGroupRowCount::new(4095),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::RowGroupRowCountMismatch
+			)
+		);
+
+		let mut decoded_len_mismatch = valid_buffer.clone();
+		decoded_len_mismatch.decoded_byte_len = RecordBodyByteLen::new(999);
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&decoded_len_mismatch,
+				&supported_cascade,
+				&selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::DecodedByteLenMismatch
+			)
+		);
+
+		let mut corrupt_descriptor = valid_buffer.clone();
+		corrupt_descriptor.page_end_offsets = vec![
+			EncodingPageByteOffset::new(5),
+			EncodingPageByteOffset::new(4),
+		];
+		corrupt_descriptor.encoded_range.len = RecordBodyByteLen::new(4);
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&corrupt_descriptor,
+				&supported_cascade,
+				&selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::CorruptPageDescriptor
+			)
+		);
+
+		let mismatched_selected_pages =
+			expand_page_descriptors(&encoding(4096, 2048, &[256, 512])).unwrap();
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&valid_buffer,
+				&supported_cascade,
+				&mismatched_selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Decline(
+				EncodedValidityDeclineReason::PageGeometryMismatch
+			)
+		);
+
+		assert_eq!(
+			encoded_validity_sparse_eligibility(
+				&valid_buffer,
+				&supported_cascade,
+				&selected_pages,
+				RowGroupRowCount::new(4096),
+			),
+			EncodedValiditySparseEligibility::Eligible
+		);
+	}
+
+	#[test]
+	fn rle_plain_encoded_validity_buffer_fetches_selected_validity_page() {
+		let mut fixture = PlannerFixture::new(4096, 1024, 32, 1);
+		fixture
+			.encoding_directory
+			.cascades
+			.push(EncodingCascade::Rle {
+				run_count: RunCount::new(4),
+				inner: Box::new(EncodingLeafCascade::Plain),
+			});
+		fixture
+			.encoding_directory
+			.buffers
+			.push(encoded_validity_buffer_with_pages(
+				RowGroupIndex::ZERO,
+				4096,
+				1024,
+				EncodingCascadeIndex::new(1),
+				&[5, 10, 15, 20],
+			));
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..4096).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected encoded-validity sparse projection plan, got {decision:?}");
+		};
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert_eq!(
+			plan.validity_fetches[0].body_range,
+			RecordBodyByteRange {
+				start: RecordBodyByteOffset::new(NULL_BUFFER_BODY_START),
+				len: RecordBodyByteLen::new(5),
+			}
+		);
+		assert!(matches!(
+			plan.validity_fetches[0].source,
+			PageMaterializeValiditySource::Encoded {
+				cascade: EncodingCascadeIndex(1)
+			}
+		));
+		assert_eq!(
+			plan.validity_fetches[0].page_row_count,
+			RowGroupRowCount::new(1024)
 		);
 	}
 

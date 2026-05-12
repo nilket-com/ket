@@ -7,9 +7,10 @@ Companion implementation plan:
 
 ## Status
 
-Proposed 2026-05-11. Council-converged across Claude / Codex /
-Gemini after four iterations under `plans/wip/`. All substantive
-design decisions are settled; Phase 0 audit pending.
+Shipped after implementation and promotion evidence landed in
+`plans/impl/069_encoded_validity_sparse_projection_bench_results.md`.
+Council-converged across Claude / Codex / Gemini after four
+iterations under `plans/wip/`.
 
 This ADR is the tracked V2 follow-up to ADR 064's deferred
 encoded-validity scope. ADR 064 §"V2 deferrals" explicitly
@@ -32,15 +33,12 @@ decline to admit exactly one validity cascade.
 
 ## V1 contract summary
 
-- **Integrated writer + reader, subject to Phase 0 P-fork
-  resolution.** Current production emits no encoded validity
-  buffers (the writer's `is_fixed_width_value_buffer` filter at
-  `src/storage/encoding/directory.rs:466-473` excludes validity
-  ordinal 0 from cascade selection). ADR 064's decline is forward-
-  proof code with no producer. ADR 069 creates the producer and
-  the sparse reader together. Phase 0 P-fork formally confirms;
-  if it unexpectedly finds an existing producer, V1 narrows to
-  reader-only.
+- **Integrated writer + reader.** Before ADR 069, production
+  emitted no encoded validity buffers (the value-buffer writer
+  path excluded validity ordinal 0 from cascade selection). ADR
+  064's decline was forward-proof code with no producer. ADR 069
+  creates the producer and sparse reader together, and promotion
+  enabled the production writer route.
 
 - **V1 encoded-validity catalog = exactly one member.** Validity-
   buffer encoding extends from `{Plain}` (today, unchanged — no
@@ -354,30 +352,33 @@ Replace the unconditional decline at
 dispatch lives at the call site (the planner already calls
 `find_buffer_encoding(...)` to detect encoded validity); the
 eligibility helper handles only the encoded case so its
-signature requires a `&BufferEncoding`:
+signature requires the encoded buffer, its cascade, selected
+value pages, and the row-group row count:
 
 ```rust
 match find_buffer_encoding(input.encoding_directory, group_index,
                           column.null_buffer_ordinal,
                           validity_page.range) {
     None => { /* ADR 064 raw-validity path */ }
-    Some(buf) => match validity_v1_eligibility(
-        buf, selected_value_pages,
+    Some(buf) => match encoded_validity_sparse_eligibility(
+        buf, validity_cascade, selected_value_pages, group.row_count,
     ) {
-        ValidityV1Eligibility::EncodedSparse => { /* new path */ }
-        ValidityV1Eligibility::Decline(_)    => {
+        EncodedValiditySparseEligibility::Eligible => { /* new path */ }
+        EncodedValiditySparseEligibility::Decline(_) => {
             return Decline(EncodedValidityBufferUnsupported);
         }
     }
 }
 
-fn validity_v1_eligibility(
+fn encoded_validity_sparse_eligibility(
     validity_buf: &BufferEncoding,
+    validity_cascade: &EncodingCascade,
     selected_value_pages: &[EncodingPageDescriptor],
-) -> ValidityV1Eligibility;
+    row_group_row_count: RowGroupRowCount,
+) -> EncodedValiditySparseEligibility;
 
-enum ValidityV1Eligibility {
-    EncodedSparse,
+enum EncodedValiditySparseEligibility {
+    Eligible,
     Decline(EncodedValidityDeclineReason),
 }
 
@@ -385,6 +386,7 @@ enum EncodedValidityDeclineReason {
     UnsupportedCascade,
     MissingPageMetadata,
     PageGeometryMismatch,
+    RowGroupRowCountMismatch,
     DecodedByteLenMismatch,
     CorruptPageDescriptor,
 }
@@ -442,12 +444,12 @@ bitmap-specific decode helper. Naming is semantic per
 ### 8. Writer routing toggle
 
 Crate-private `WriterValidityCascadeRouting { Disabled, Enabled }`,
-mirroring ADR 068's `FsstRowSafeEstimatorRouting` pattern.
-Production initialization starts `Disabled`. Test/bench helpers
-can pass either. The Phase 7 promotion commit is a single flip
-to `Enabled`. The directory-builder helper carrying both ADR
-068's FSST routing and ADR 069's validity routing is
-`build_encoding_directory_for_ipc_stream_with_routing`.
+mirroring ADR 068's `FsstRowSafeEstimatorRouting` pattern. The
+pre-promotion production route started `Disabled`; promotion
+flipped the standard writer entry point to `Enabled`. Test/bench
+helpers retain a disabled baseline for comparison. The directory-
+builder helper carrying both ADR 068's FSST routing and ADR 069's
+validity routing is `build_encoding_directory_for_ipc_stream_with_routing`.
 
 ### 9. Closed-catalog and decline-taxonomy discipline
 
@@ -689,14 +691,13 @@ fail and still promote with explicit recorded justification.
     ≤ 10% on eligible workloads (where the gate engages), or
     the artifact explicitly justifies different thresholds.
 
-If hard gates pass, the Phase 7 promotion commit flips
-production initialization from `Disabled` to `Enabled` for the
-writer-routing toggle and lands the decline-narrow + reader
-decode helper as production. The routing enum stays in the
+The Phase 7 promotion evidence passed hard gates and explicitly
+justified soft-gate deviations, so production initialization is
+`Enabled` for the writer-routing toggle and the decline-narrow +
+reader decode helper is production. The routing enum stays in the
 codebase for bench/test comparison after promotion. ADR 064
-§"Where we are" / §"V2 deferrals" is amended to record the
-closing of the encoded-validity follow-up. Roadmap entry #25
-is updated.
+§"Where we are" / §"V2 deferrals" records the closing of the
+encoded-validity follow-up. Roadmap entry #25 is updated.
 
 If a hard gate fails, the artifact records the gap. Council
 decides among three explicit paths: revise V1 (adjust economic
@@ -788,8 +789,10 @@ Compact archival summary. Iteration history lives in git on
     { cascade }` iter-1, walked back iter-2. Settled iter-3.
 11. **Crate-private `WriterValidityCascadeRouting { Disabled,
     Enabled }`.** Mirrors ADR 068's
-    `FsstRowSafeEstimatorRouting` pattern. Production starts
-    `Disabled`; promotion flips to `Enabled`. Settled iter-1.
+    `FsstRowSafeEstimatorRouting` pattern. Production started
+    `Disabled` before promotion and now initializes `Enabled`;
+    the disabled route remains for bench/test comparison.
+    Settled iter-1.
 12. **No `ENCODING_DIRECTORY_FORMAT_VERSION` bump.** Clean-
     break cross-version compatibility per
     `plans/conventions/no-premature-backward-compat.md`; ADR

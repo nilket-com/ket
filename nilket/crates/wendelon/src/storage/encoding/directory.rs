@@ -15,8 +15,10 @@ use crate::storage::columnar::{StorageColumn, TieredRecordId};
 use crate::storage::encoding::cascade::estimator::FsstRowSafeEstimatorRouting;
 use crate::storage::encoding::chunk_layout::{chunk_pad_for_cursor, default_sparse_engaged_key};
 use crate::storage::encoding::compute::{EncodingComputeConfig, evaluator_kind_for_cascade};
+use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::select::{
-	WriterCascadeContext, select_and_encode_buffer_with_value_offsets_and_context,
+	ValuePageRowSpan, WriterCascadeContext, WriterValidityCascadeRouting,
+	select_and_encode_buffer_with_value_offsets_and_context, select_validity_cascade,
 };
 use crate::storage::row_group::{
 	BufferPageDirectoryEntry, RecordBodyByteRange, RecordPageDirectory, RowGroupDirectoryEntry,
@@ -65,6 +67,7 @@ pub fn build_encoding_directory_for_ipc_stream(
 		config,
 		row_group_config,
 		FsstRowSafeEstimatorRouting::Estimator,
+		WriterValidityCascadeRouting::Enabled,
 	)
 }
 
@@ -85,6 +88,29 @@ pub fn build_encoding_directory_for_ipc_stream_exact_fsst_for_bench(
 		config,
 		row_group_config,
 		FsstRowSafeEstimatorRouting::ExactOnly,
+		WriterValidityCascadeRouting::Disabled,
+	)
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) fn build_encoding_directory_for_ipc_stream_with_validity_for_bench(
+	record_id: TieredRecordId,
+	ipc_bytes: &[u8],
+	page_directory: &RecordPageDirectory,
+	batches: &[RecordBatch],
+	config: &EncodingWriterConfig,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
+	build_encoding_directory_for_ipc_stream_with_fsst_routing(
+		record_id,
+		ipc_bytes,
+		page_directory,
+		batches,
+		config,
+		row_group_config,
+		FsstRowSafeEstimatorRouting::Estimator,
+		WriterValidityCascadeRouting::Enabled,
 	)
 }
 
@@ -96,6 +122,7 @@ fn build_encoding_directory_for_ipc_stream_with_fsst_routing(
 	config: &EncodingWriterConfig,
 	row_group_config: &RowGroupWriterConfig,
 	fsst_routing: FsstRowSafeEstimatorRouting,
+	validity_routing: WriterValidityCascadeRouting,
 ) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
 	config.validate()?;
 	if !config.enabled {
@@ -121,6 +148,9 @@ fn build_encoding_directory_for_ipc_stream_with_fsst_routing(
 			continue;
 		};
 		if page.range.len.get() == 0 {
+			continue;
+		}
+		if is_validity_buffer(page_directory, page) {
 			continue;
 		}
 		let Some(field) = schema.fields().get(page.ipc_column_ordinal.get() as usize) else {
@@ -243,6 +273,18 @@ fn build_encoding_directory_for_ipc_stream_with_fsst_routing(
 			encoded_bytes: encoded.bytes,
 		});
 	}
+	if matches!(validity_routing, WriterValidityCascadeRouting::Enabled)
+		&& config.cascade_enabled(EncodingCascadeKind::Rle)
+	{
+		encode_validity_buffers(
+			ipc_bytes,
+			page_directory,
+			batches,
+			&mut cascades,
+			&mut buffers,
+			&mut applied,
+		)?;
+	}
 	if buffers.is_empty() {
 		return Ok((None, Vec::new()));
 	}
@@ -260,6 +302,170 @@ fn build_encoding_directory_for_ipc_stream_with_fsst_routing(
 		}),
 		applied,
 	))
+}
+
+fn encode_validity_buffers(
+	ipc_bytes: &[u8],
+	page_directory: &RecordPageDirectory,
+	batches: &[RecordBatch],
+	cascades: &mut Vec<EncodingCascade>,
+	buffers: &mut Vec<BufferEncoding>,
+	applied: &mut Vec<AppliedEncodingBuffer>,
+) -> std::io::Result<()> {
+	for validity_page in page_directory
+		.buffer_pages
+		.iter()
+		.filter(|page| page.range.len.get() > 0 && is_validity_buffer(page_directory, page))
+	{
+		let Some(group) = page_directory
+			.row_groups
+			.iter()
+			.find(|group| group.row_group_index == validity_page.row_group_index)
+		else {
+			continue;
+		};
+		let batch_index = usize::try_from(validity_page.row_group_index.get()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding validity row group index exceeds usize",
+			)
+		})?;
+		let Some(batch) = batches.get(batch_index) else {
+			continue;
+		};
+		let column_index = validity_page.ipc_column_ordinal.get() as usize;
+		let Some(column) = batch.columns().get(column_index) else {
+			continue;
+		};
+		let column_null_count = column.null_count();
+		if column_null_count == 0 {
+			continue;
+		}
+		let Some(first_buffer_ordinal) =
+			first_buffer_ordinal_for_column(page_directory, validity_page)
+		else {
+			continue;
+		};
+		let value_buffer_ordinal = IpcBufferIndex::new(first_buffer_ordinal.saturating_add(1));
+		let Some(value_encoding) = buffers.iter().find(|encoding| {
+			encoding.row_group_index == validity_page.row_group_index
+				&& encoding.ipc_column_ordinal == validity_page.ipc_column_ordinal
+				&& encoding.ipc_buffer_ordinal == value_buffer_ordinal
+				&& !encoding.page_end_offsets.is_empty()
+				&& encoding.decoded_value_count.get() == group.row_count.get()
+		}) else {
+			continue;
+		};
+		let value_page_value_count = value_encoding.page_value_count;
+		let value_pages = expand_page_descriptors(value_encoding).map_err(|code| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("Encoding validity value page descriptors rejected: {code:?}"),
+			)
+		})?;
+		let value_page_row_spans = value_pages
+			.iter()
+			.map(|page| ValuePageRowSpan {
+				first_value_index: page.first_value_index,
+				value_count: page.value_count,
+			})
+			.collect::<Vec<_>>();
+		let start = usize::try_from(validity_page.range.start.get()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding validity source buffer start exceeds usize",
+			)
+		})?;
+		let len = usize::try_from(validity_page.range.len.get()).map_err(|_| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding validity source buffer length exceeds usize",
+			)
+		})?;
+		let end = start.checked_add(len).ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding validity source buffer overflow",
+			)
+		})?;
+		if end > ipc_bytes.len() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"Encoding validity source buffer exceeds IPC stream bytes",
+			));
+		}
+		let Some(plan) = select_validity_cascade(
+			&ipc_bytes[start..end],
+			&value_page_row_spans,
+			column_null_count,
+		) else {
+			continue;
+		};
+		let cascade = EncodingCascade::Rle {
+			run_count: plan.run_count,
+			inner: Box::new(EncodingLeafCascade::Plain),
+		};
+		let cascade_index = cascade_index_for(cascades, &cascade)?;
+		let cascade_label = cascade.kind().as_str();
+		crate::metrics::global().observe_storage_l2_encoding_buffer_encoding(cascade_label);
+		crate::metrics::global().observe_storage_l2_encoding_compression_ratio(
+			cascade_label,
+			plan.raw_byte_len as u64,
+			plan.encoded_bytes.len() as u64,
+		);
+		crate::metrics::global()
+			.observe_storage_l2_encoding_bytes("buffer", plan.raw_byte_len as u64);
+		crate::metrics::global()
+			.observe_storage_l2_encoding_bytes("page", plan.encoded_bytes.len() as u64);
+		crate::metrics::global().observe_storage_l2_encoding_bytes(
+			"avoided",
+			plan.raw_byte_len.saturating_sub(plan.encoded_bytes.len()) as u64,
+		);
+		buffers.push(BufferEncoding {
+			row_group_index: validity_page.row_group_index,
+			ipc_column_ordinal: validity_page.ipc_column_ordinal,
+			ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
+			cascade_index,
+			decoded_byte_len: RecordBodyByteLen::new(plan.raw_byte_len as u64),
+			decoded_value_count: BufferValueCount::new(group.row_count.get()),
+			encoded_range: EncodedBufferByteRange {
+				start: EncodingPageByteOffset::ZERO,
+				len: RecordBodyByteLen::new(plan.encoded_bytes.len() as u64),
+			},
+			page_value_count: value_page_value_count,
+			page_end_offsets: plan.page_end_offsets,
+			page_stats: Vec::new(),
+		});
+		applied.push(AppliedEncodingBuffer {
+			row_group_index: validity_page.row_group_index,
+			ipc_column_ordinal: validity_page.ipc_column_ordinal,
+			ipc_buffer_ordinal: validity_page.ipc_buffer_ordinal,
+			absolute_start: start,
+			decoded_len: len,
+			encoded_bytes: plan.encoded_bytes,
+		});
+	}
+	Ok(())
+}
+
+fn cascade_index_for(
+	cascades: &mut Vec<EncodingCascade>,
+	cascade: &EncodingCascade,
+) -> std::io::Result<EncodingCascadeIndex> {
+	let index = match cascades.iter().position(|candidate| candidate == cascade) {
+		Some(index) => index,
+		None => {
+			cascades.push(cascade.clone());
+			cascades.len() - 1
+		}
+	};
+	let index = u16::try_from(index).map_err(|_| {
+		std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Encoding cascade index exceeds u16",
+		)
+	})?;
+	Ok(EncodingCascadeIndex::new(index))
 }
 
 fn variable_width_value_offsets(
@@ -469,6 +675,15 @@ fn is_fixed_width_value_buffer(
 ) -> bool {
 	first_buffer_ordinal_for_column(page_directory, page)
 		.map(|first| page.ipc_buffer_ordinal.get() == first.saturating_add(1))
+		.unwrap_or(false)
+}
+
+fn is_validity_buffer(
+	page_directory: &RecordPageDirectory,
+	page: &BufferPageDirectoryEntry,
+) -> bool {
+	first_buffer_ordinal_for_column(page_directory, page)
+		.map(|first| page.ipc_buffer_ordinal.get() == first)
 		.unwrap_or(false)
 }
 
@@ -1644,4 +1859,207 @@ fn pad_to_8(bytes: &mut Vec<u8>) {
 
 fn align_to_8(value: usize) -> usize {
 	(value + 7) & !7
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::schema::{RecordRowIndex, RowGroupRowCount, SimdPageValueCount};
+	use arrow::array::{ArrayRef, Int64Array};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc;
+
+	fn validity_bitmap(rows: usize, is_valid: impl Fn(usize) -> bool) -> Vec<u8> {
+		let mut bytes = vec![0_u8; rows.div_ceil(8)];
+		for row in 0..rows {
+			if is_valid(row) {
+				bytes[row / 8] |= 1_u8 << (row % 8);
+			}
+		}
+		bytes
+	}
+
+	fn repeated_i64_value_bytes(rows: usize, value: i64) -> Vec<u8> {
+		let mut bytes = Vec::with_capacity(rows * std::mem::size_of::<i64>());
+		for _ in 0..rows {
+			bytes.extend_from_slice(&value.to_le_bytes());
+		}
+		bytes
+	}
+
+	fn validity_writer_fixture() -> (
+		TieredRecordId,
+		Vec<u8>,
+		RecordPageDirectory,
+		Vec<RecordBatch>,
+		EncodingWriterConfig,
+		RowGroupWriterConfig,
+	) {
+		let rows = 4096_usize;
+		let null_bytes = validity_bitmap(rows, |row| row < 2048);
+		let value_bytes = repeated_i64_value_bytes(rows, 0);
+		let value_start = null_bytes.len() as u64;
+		let mut ipc_bytes = null_bytes.clone();
+		ipc_bytes.extend_from_slice(&value_bytes);
+		let record_id = TieredRecordId {
+			slab_id: SlabId::new(69),
+			record_offset: RecordBodyByteOffset::ZERO,
+		};
+		let fingerprint = LogicalSchemaFingerprint::from_bytes([0x69; 32]);
+		let page_directory = RecordPageDirectory {
+			record_id,
+			row_count: RowCount::new(rows as u64),
+			row_groups: vec![RowGroupDirectoryEntry {
+				row_group_index: RowGroupIndex::ZERO,
+				first_record_row_index: RecordRowIndex::ZERO,
+				row_count: RowGroupRowCount::new(rows as u32),
+				metadata_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::ZERO,
+					len: RecordBodyByteLen::new(64),
+				},
+				body_range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::ZERO,
+					len: RecordBodyByteLen::new(ipc_bytes.len() as u64),
+				},
+			}],
+			buffer_pages: vec![
+				BufferPageDirectoryEntry {
+					row_group_index: RowGroupIndex::ZERO,
+					ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+					ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+					range: RecordBodyByteRange {
+						start: RecordBodyByteOffset::ZERO,
+						len: RecordBodyByteLen::new(null_bytes.len() as u64),
+					},
+				},
+				BufferPageDirectoryEntry {
+					row_group_index: RowGroupIndex::ZERO,
+					ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+					ipc_buffer_ordinal: IpcBufferIndex::new(1),
+					range: RecordBodyByteRange {
+						start: RecordBodyByteOffset::new(value_start),
+						len: RecordBodyByteLen::new(value_bytes.len() as u64),
+					},
+				},
+			],
+			row_group_stats: Vec::new(),
+			logical_schema_fingerprint: fingerprint,
+		};
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"value",
+			DataType::Int64,
+			true,
+		)]));
+		let values = (0..rows)
+			.map(|row| (row < 2048).then_some(0_i64))
+			.collect::<Vec<_>>();
+		let batch =
+			RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+				.unwrap();
+		let config = EncodingWriterConfig {
+			enabled: true,
+			target_simd_page_values: SimdPageValueCount::new(1024),
+			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+			enabled_cascades: [EncodingCascadeKind::Plain, EncodingCascadeKind::Rle]
+				.into_iter()
+				.collect(),
+			..EncodingWriterConfig::default()
+		};
+		(
+			record_id,
+			ipc_bytes,
+			page_directory,
+			vec![batch],
+			config,
+			RowGroupWriterConfig::default(),
+		)
+	}
+
+	#[test]
+	fn production_writer_routing_emits_promoted_validity_buffer() {
+		let (record_id, ipc_bytes, page_directory, batches, config, row_group_config) =
+			validity_writer_fixture();
+		let (directory, _applied) = build_encoding_directory_for_ipc_stream(
+			record_id,
+			&ipc_bytes,
+			&page_directory,
+			&batches,
+			&config,
+			&row_group_config,
+		)
+		.unwrap();
+		let directory = directory.expect("value buffer encoding should be emitted");
+		assert!(directory.buffers.iter().any(|encoding| {
+			encoding.ipc_buffer_ordinal == IpcBufferIndex::new(1)
+				&& !encoding.page_end_offsets.is_empty()
+		}));
+		let validity = directory
+			.buffers
+			.iter()
+			.find(|encoding| encoding.ipc_buffer_ordinal == IpcBufferIndex::ZERO)
+			.expect("promoted production route should emit validity encoding");
+		let cascade = directory
+			.cascades
+			.get(validity.cascade_index.get() as usize)
+			.expect("validity cascade");
+		assert!(matches!(
+			cascade,
+			EncodingCascade::Rle { inner, .. }
+				if matches!(inner.as_ref(), EncodingLeafCascade::Plain)
+		));
+		assert_eq!(
+			validity
+				.page_end_offsets
+				.iter()
+				.map(|offset| offset.get())
+				.collect::<Vec<_>>(),
+			vec![5, 10, 15, 20]
+		);
+	}
+
+	#[test]
+	fn bench_routing_emits_page_aligned_rle_validity_buffer() {
+		let (record_id, ipc_bytes, page_directory, batches, config, row_group_config) =
+			validity_writer_fixture();
+		let (directory, applied) = build_encoding_directory_for_ipc_stream_with_validity_for_bench(
+			record_id,
+			&ipc_bytes,
+			&page_directory,
+			&batches,
+			&config,
+			&row_group_config,
+		)
+		.unwrap();
+		let directory = directory.expect("value and validity encodings should be emitted");
+		let validity = directory
+			.buffers
+			.iter()
+			.find(|encoding| encoding.ipc_buffer_ordinal == IpcBufferIndex::ZERO)
+			.expect("validity encoding");
+		let cascade = directory
+			.cascades
+			.get(validity.cascade_index.get() as usize)
+			.expect("validity cascade");
+		assert!(matches!(
+			cascade,
+			EncodingCascade::Rle { inner, .. }
+				if matches!(inner.as_ref(), EncodingLeafCascade::Plain)
+		));
+		assert_eq!(validity.decoded_byte_len, RecordBodyByteLen::new(512));
+		assert_eq!(validity.decoded_value_count, BufferValueCount::new(4096));
+		assert_eq!(validity.page_value_count, SimdPageValueCount::new(1024));
+		assert_eq!(
+			validity
+				.page_end_offsets
+				.iter()
+				.map(|offset| offset.get())
+				.collect::<Vec<_>>(),
+			vec![5, 10, 15, 20]
+		);
+		assert!(applied.iter().any(|buffer| {
+			buffer.ipc_buffer_ordinal == IpcBufferIndex::ZERO
+				&& buffer.encoded_bytes.len() == 20
+				&& buffer.decoded_len == 512
+		}));
+	}
 }

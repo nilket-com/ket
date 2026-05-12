@@ -4,7 +4,7 @@ Author: AI Swarm Council (Claude / Codex / Gemini)
 
 Companion ADR: `plans/adr/069_encoded_validity_sparse_projection.md`
 
-Bench-results artifact (created at promotion):
+Bench-results artifact:
 `plans/impl/069_encoded_validity_sparse_projection_bench_results.md`
 
 Inherits substrate:
@@ -41,7 +41,8 @@ Inherits substrate:
 ## Status
 
 Council-converged across Claude / Codex / Gemini after four
-iterations under `plans/wip/`. Pre-Phase 0; lands no code yet.
+iterations under `plans/wip/`. Implemented and promoted; production
+writer routing now initializes encoded-validity routing `Enabled`.
 
 ## Implementation contract
 
@@ -244,8 +245,9 @@ identical.
 
 ### Phase 2 — Writer page-local validity emission
 
-Lands the writer integration behind crate-private routing.
-Production stays disabled until Phase 7 promotion.
+Lands the writer integration behind crate-private routing. During
+this phase production stayed disabled; Phase 7 promotion later
+flipped the standard writer entry point to `Enabled`.
 
 - Add `WriterValidityCascadeRouting { Disabled, Enabled }` as a
   crate-private enum, mirroring
@@ -337,21 +339,23 @@ Production stays disabled until Phase 7 promotion.
 
 ### Phase 3 — Sparse-projection planner extension
 
-Narrows the existing encoded-validity decline. Production
-routing is still `Disabled`, so this phase doesn't change
-production behavior.
+Narrows the existing encoded-validity decline. At this phase in
+the rollout, production routing was still `Disabled`, so the phase
+didn't change production behavior until Phase 7 promotion.
 
-- Add `validity_v1_eligibility` helper in
+- Add `encoded_validity_sparse_eligibility` helper in
   `src/storage/encoding/sparse_projection_fetch.rs`:
 
   ```rust
-  fn validity_v1_eligibility(
+  fn encoded_validity_sparse_eligibility(
       validity_buf: &BufferEncoding,
+      validity_cascade: &EncodingCascade,
       selected_value_pages: &[EncodingPageDescriptor],
-  ) -> ValidityV1Eligibility;
+      row_group_row_count: RowGroupRowCount,
+  ) -> EncodedValiditySparseEligibility;
 
-  pub(crate) enum ValidityV1Eligibility {
-      EncodedSparse,
+  pub(crate) enum EncodedValiditySparseEligibility {
+      Eligible,
       Decline(EncodedValidityDeclineReason),
   }
 
@@ -359,19 +363,22 @@ production behavior.
       UnsupportedCascade,
       MissingPageMetadata,
       PageGeometryMismatch,
+      RowGroupRowCountMismatch,
       DecodedByteLenMismatch,
       CorruptPageDescriptor,
   }
   ```
 
-  The helper reads `validity_buf.cascade_index` internally; the
-  raw-vs-encoded dispatch is done by the caller (a
-  `BufferEncoding` would not be available for raw validity).
+  The caller resolves `validity_buf.cascade_index` to an
+  `EncodingCascade` before calling the helper; the raw-vs-
+  encoded dispatch is done by the caller (a `BufferEncoding`
+  would not be available for raw validity).
 
-  - `EncodedSparse`: cascade is `Rle { run_count, inner:
+  - `Eligible`: cascade is `Rle { run_count, inner:
     Box::new(Plain) }` + 1:1 alignment with selected value
     pages + `decoded_byte_len == ceil(decoded_value_count / 8)`
-    + non-empty `page_end_offsets` → new encoded-validity path.
+    + `decoded_value_count == row_group_row_count` + non-empty
+    `page_end_offsets` → new encoded-validity path.
   - `Decline(reason)`: collapses to
     `SparseProjectionFetchDecline::EncodedValidityBufferUnsupported`
     at the planner boundary.
@@ -384,16 +391,18 @@ production behavior.
                             column.null_buffer_ordinal,
                             validity_page.range) {
       None => { /* ADR 064 raw-validity path */ }
-      Some(buf) => match validity_v1_eligibility(buf, selected_value_pages) {
-          ValidityV1Eligibility::EncodedSparse => { /* new path */ }
-          ValidityV1Eligibility::Decline(_) => {
+      Some(buf) => match encoded_validity_sparse_eligibility(
+          buf, validity_cascade, selected_value_pages, group.row_count,
+      ) {
+          EncodedValiditySparseEligibility::Eligible => { /* new path */ }
+          EncodedValiditySparseEligibility::Decline(_) => {
               return Decline(EncodedValidityBufferUnsupported);
           }
       }
   }
   ```
 
-- For `EncodedSparse`: resolve the selected value-page index k
+- For `Eligible`: resolve the selected value-page index k
   to validity-page index k (1:1 alignment), compute the
   validity page's encoded byte range as
   `[validity_buf.encoded_range.start + prev_end,
@@ -486,7 +495,8 @@ Extend `tests/architecture_test.rs`. Required guards:
 - `select_validity_cascade`, `decode_rle_validity_page`,
   `stitch_validity_pages_into_row_group_bitmap`,
   `materialize_encoding_validity_buffer`,
-  `validity_v1_eligibility`, `ValidityV1Eligibility`,
+  `encoded_validity_sparse_eligibility`,
+  `EncodedValiditySparseEligibility`,
   `EncodedValidityDeclineReason`, and
   `PageMaterializeValiditySource` are all `pub(crate)`.
 - `SparseProjectionFetchDecline::EncodedValidityBufferUnsupported`
@@ -639,9 +649,6 @@ Implementation:
   `VALIDITY_RLE_BYTE_SAVING_FRACTION`,
   `MIN_VALIDITY_ENCODE_BYTES`, `ValidityRleEncodingPlan`,
   `ValuePageRowSpan`.
-- `src/storage/encoding/cascade/validity.rs` (new, pending
-  Phase 0 P6) — alternative location for the validity-cascade
-  helper.
 - `src/storage/encoding/directory.rs` —
   `build_encoding_directory_for_ipc_stream_with_routing`
   helper; validity-buffer `BufferEncoding` emission when
@@ -655,10 +662,10 @@ Implementation:
   integration in `materialize_sparse_projection_page_batches`
   and `projected_page_batch_from_decoded_buffers`.
 - `src/storage/encoding/sparse_projection_fetch.rs` —
-  `validity_v1_eligibility` helper; narrowed
+  `encoded_validity_sparse_eligibility` helper; narrowed
   `EncodedValidityBufferUnsupported` decline;
-  `ValidityV1Eligibility` / `EncodedValidityDeclineReason`
-  enums.
+  `EncodedValiditySparseEligibility` /
+  `EncodedValidityDeclineReason` enums.
 - `src/storage/encoding/materialize.rs` (and / or
   `src/storage/encoding/compute/dispatch.rs`) — full-buffer
   Boolean / validity page-stitch decode (Phase 0 P9 audit
@@ -671,7 +678,7 @@ Implementation:
 - `benches/row_group_fetch.rs` and/or
   `benches/encoding_compute.rs` — bench matrix per Phase 7.
 
-Planning / evidence (created at promotion):
+Planning / evidence:
 
 - `plans/adr/069_encoded_validity_sparse_projection.md`
 - `plans/impl/069_encoded_validity_sparse_projection.md`
@@ -753,7 +760,8 @@ Out of scope:
   `decode_rle_validity_page`,
   `stitch_validity_pages_into_row_group_bitmap`,
   `materialize_encoding_validity_buffer`,
-  `validity_v1_eligibility`,
+  `encoded_validity_sparse_eligibility`,
+  `EncodedValiditySparseEligibility`,
   `EncodedValidityDeclineReason`,
   `PageMaterializeValiditySource`, and
   `WriterValidityCascadeRouting` all land as `pub(crate)`.

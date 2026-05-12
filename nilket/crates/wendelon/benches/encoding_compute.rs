@@ -38,9 +38,9 @@ use wendelon::schema::{
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, Identity, IpcBufferIndex,
 	IpcColumnOrdinal, Locality, LocalityPolicyV1, LogicalSchemaFingerprint,
 	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
-	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
-	TableObjectId, TableSchemaDescriptorV1, TenantId,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
+	RowGroupRowCount, RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount,
+	SlabId, TableObjectId, TableSchemaDescriptorV1, TenantId,
 };
 use wendelon::storage::encoding::cascade::{
 	decode_buffer, decode_page, encode_buffer, encode_buffer_with_value_offsets,
@@ -60,11 +60,12 @@ use wendelon::storage::encoding::directory::{
 use wendelon::storage::encoding::page::expand_page_descriptors;
 use wendelon::storage::encoding::select::select_and_encode_buffer_with_value_offsets;
 use wendelon::storage::encoding::{
-	BufferEncoding, EncodingCascade, EncodingCascadeKind, EncodingLeafCascade,
+	BufferEncoding, EncodingCascade, EncodingCascadeKind, EncodingDirectory, EncodingLeafCascade,
 };
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
-	ColumnFetchRequirement, ColumnOrdinalSet, EncodingWriterConfig, PlaintextByteRange,
+	BufferPageDirectoryEntry, ColumnFetchRequirement, ColumnOrdinalSet, EncodingWriterConfig,
+	PlaintextByteRange, RecordBodyByteRange, RecordPageDirectory, RowGroupDirectoryEntry,
 	RowGroupWriterConfig, TieredRecordId, build_page_directory_for_ipc_stream,
 	decode_projected_row_groups_from_plaintext_ranges,
 	encode_multirow_from_survivors_with_row_group_and_encoding_config, encode_record_batches_bytes,
@@ -79,6 +80,10 @@ const WRITER_COLUMN_CACHE_IPC_STREAM_ROW_TARGET: usize = 65_536;
 
 fn main() -> std::io::Result<()> {
 	let config = BenchConfig::from_args();
+	if config.encoded_validity_only {
+		bench_encoded_validity_sparse_projection_matrix(&config)?;
+		return Ok(());
+	}
 	for rows in config.rows.iter().copied() {
 		if config.writer_column_cache_only {
 			bench_fsst_row_safe_writer_column_cache_matrix(&config, rows)?;
@@ -139,6 +144,7 @@ struct BenchConfig {
 	writer_column_cache_only: bool,
 	writer_column_cache_fixture: Option<String>,
 	fsst_writer_only: bool,
+	encoded_validity_only: bool,
 }
 
 impl BenchConfig {
@@ -147,15 +153,17 @@ impl BenchConfig {
 		let writer_column_cache_only =
 			std::env::args().any(|arg| arg == "--writer-column-cache-only");
 		let fsst_writer_only = std::env::args().any(|arg| arg == "--fsst-writer-only");
+		let encoded_validity_only = std::env::args().any(|arg| arg == "--encoded-validity-only");
 		let writer_column_cache_fixture = std::env::args().find_map(|arg| {
 			arg.strip_prefix("--writer-column-cache-fixture=")
 				.map(str::to_owned)
 		});
-		let writer_column_cache_rows = std::env::args().find_map(|arg| {
-			arg.strip_prefix("--writer-column-cache-rows=")
+		let explicit_rows = std::env::args().find_map(|arg| {
+			arg.strip_prefix("--rows=")
+				.or_else(|| arg.strip_prefix("--writer-column-cache-rows="))
 				.map(str::to_owned)
 		});
-		let rows = writer_column_cache_rows
+		let rows = explicit_rows
 			.as_deref()
 			.map(|rows| {
 				rows.split(',')
@@ -171,6 +179,7 @@ impl BenchConfig {
 					writer_column_cache_only,
 					writer_column_cache_fixture,
 					fsst_writer_only,
+					encoded_validity_only,
 				}
 			} else {
 				Self {
@@ -179,6 +188,7 @@ impl BenchConfig {
 					writer_column_cache_only,
 					writer_column_cache_fixture,
 					fsst_writer_only,
+					encoded_validity_only,
 				}
 			}
 		} else if let Some(rows) = rows {
@@ -188,6 +198,7 @@ impl BenchConfig {
 				writer_column_cache_only,
 				writer_column_cache_fixture,
 				fsst_writer_only,
+				encoded_validity_only,
 			}
 		} else {
 			Self {
@@ -196,6 +207,7 @@ impl BenchConfig {
 				writer_column_cache_only,
 				writer_column_cache_fixture,
 				fsst_writer_only,
+				encoded_validity_only,
 			}
 		}
 	}
@@ -3588,6 +3600,308 @@ fn bench_provider_leak(fixture: &PipelineFixture) -> std::io::Result<()> {
 		cascades_summary,
 	);
 	Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EncodedValidityNullShape {
+	Clustered5,
+	Clustered1,
+	AllValid,
+	AllNull,
+	Random50,
+	AlternatingBit,
+}
+
+impl EncodedValidityNullShape {
+	fn name(self) -> &'static str {
+		match self {
+			Self::Clustered5 => "clustered_5p",
+			Self::Clustered1 => "clustered_1p",
+			Self::AllValid => "all_valid",
+			Self::AllNull => "all_null",
+			Self::Random50 => "random_50p",
+			Self::AlternatingBit => "alternating_bit",
+		}
+	}
+
+	fn is_valid(self, row: usize, rows: usize) -> bool {
+		match self {
+			Self::Clustered5 => row >= rows / 20,
+			Self::Clustered1 => row >= rows / 100,
+			Self::AllValid => true,
+			Self::AllNull => false,
+			Self::Random50 => {
+				let mixed = (row as u64)
+					.wrapping_mul(6_364_136_223_846_793_005)
+					.wrapping_add(0x9e37_79b9_7f4a_7c15);
+				(mixed >> 63) != 0
+			}
+			Self::AlternatingBit => row % 2 == 0,
+		}
+	}
+}
+
+struct EncodedValidityFixture {
+	record_id: TieredRecordId,
+	ipc_bytes: Vec<u8>,
+	page_directory: RecordPageDirectory,
+	batches: Vec<RecordBatch>,
+	writer_config: EncodingWriterConfig,
+	row_group_config: RowGroupWriterConfig,
+	raw_validity_bytes: usize,
+	first_page_raw_validity_bytes: usize,
+}
+
+fn bench_encoded_validity_sparse_projection_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	for rows in config.rows.iter().copied() {
+		for shape in [
+			EncodedValidityNullShape::Clustered5,
+			EncodedValidityNullShape::Clustered1,
+			EncodedValidityNullShape::AllValid,
+			EncodedValidityNullShape::AllNull,
+			EncodedValidityNullShape::Random50,
+			EncodedValidityNullShape::AlternatingBit,
+		] {
+			let fixture = encoded_validity_fixture(rows, shape)?;
+			let disabled = encoded_validity_directory_summary(&fixture, false)?;
+			let enabled = encoded_validity_directory_summary(&fixture, true)?;
+			let enabled_again = encoded_validity_directory_summary(&fixture, true)?;
+			let deterministic = enabled.validity_page_end_offsets
+				== enabled_again.validity_page_end_offsets
+				&& enabled.validity_encoded_bytes == enabled_again.validity_encoded_bytes;
+			let disabled_elapsed = bench(config.iterations, || {
+				let result = build_encoding_directory_for_ipc_stream_exact_fsst_for_bench(
+					fixture.record_id,
+					&fixture.ipc_bytes,
+					&fixture.page_directory,
+					&fixture.batches,
+					&fixture.writer_config,
+					&fixture.row_group_config,
+				)
+				.expect("encoded-validity disabled bench writer");
+				black_box(result);
+			});
+			let enabled_elapsed = bench(config.iterations, || {
+				let result = build_encoding_directory_for_ipc_stream(
+					fixture.record_id,
+					&fixture.ipc_bytes,
+					&fixture.page_directory,
+					&fixture.batches,
+					&fixture.writer_config,
+					&fixture.row_group_config,
+				)
+				.expect("encoded-validity enabled bench writer");
+				black_box(result);
+			});
+			println!(
+				"encoding_compute_bench scenario=encoded_validity_sparse_projection fixture={} rows={} iterations={} raw_validity_bytes={} disabled_validity_encoded={} enabled_validity_encoded={} enabled_validity_payload_bytes={} enabled_validity_page_table_bytes={} selected_validity_raw_bytes={} selected_validity_encoded_bytes={} deterministic={} disabled_writer_micros_per_op={:.3} enabled_writer_micros_per_op={:.3}",
+				shape.name(),
+				rows,
+				config.iterations,
+				fixture.raw_validity_bytes,
+				disabled.validity_buffer_encoded,
+				enabled.validity_buffer_encoded,
+				enabled.validity_payload_bytes,
+				enabled.validity_page_table_bytes,
+				fixture.first_page_raw_validity_bytes,
+				enabled.first_page_encoded_bytes,
+				deterministic,
+				disabled_elapsed.as_secs_f64() * 1_000_000.0 / config.iterations.max(1) as f64,
+				enabled_elapsed.as_secs_f64() * 1_000_000.0 / config.iterations.max(1) as f64,
+			);
+		}
+	}
+	Ok(())
+}
+
+fn encoded_validity_fixture(
+	rows: usize,
+	shape: EncodedValidityNullShape,
+) -> std::io::Result<EncodedValidityFixture> {
+	let page_values = PAGE_VALUES as usize;
+	let null_bytes = validity_bitmap_bytes(rows, |row| shape.is_valid(row, rows));
+	let mut value_bytes = Vec::with_capacity(rows * std::mem::size_of::<i64>());
+	for _ in 0..rows {
+		value_bytes.extend_from_slice(&0_i64.to_le_bytes());
+	}
+	let value_start = null_bytes.len() as u64;
+	let mut ipc_bytes = null_bytes.clone();
+	ipc_bytes.extend_from_slice(&value_bytes);
+	let record_id = TieredRecordId {
+		slab_id: SlabId::new(69),
+		record_offset: RecordBodyByteOffset::ZERO,
+	};
+	let page_directory = RecordPageDirectory {
+		record_id,
+		row_count: RowCount::new(rows as u64),
+		row_groups: vec![RowGroupDirectoryEntry {
+			row_group_index: RowGroupIndex::ZERO,
+			first_record_row_index: RecordRowIndex::ZERO,
+			row_count: RowGroupRowCount::new(rows as u32),
+			metadata_range: RecordBodyByteRange {
+				start: RecordBodyByteOffset::ZERO,
+				len: RecordBodyByteLen::new(64),
+			},
+			body_range: RecordBodyByteRange {
+				start: RecordBodyByteOffset::ZERO,
+				len: RecordBodyByteLen::new(ipc_bytes.len() as u64),
+			},
+		}],
+		buffer_pages: vec![
+			BufferPageDirectoryEntry {
+				row_group_index: RowGroupIndex::ZERO,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				ipc_buffer_ordinal: IpcBufferIndex::ZERO,
+				range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::ZERO,
+					len: RecordBodyByteLen::new(null_bytes.len() as u64),
+				},
+			},
+			BufferPageDirectoryEntry {
+				row_group_index: RowGroupIndex::ZERO,
+				ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+				ipc_buffer_ordinal: IpcBufferIndex::new(1),
+				range: RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(value_start),
+					len: RecordBodyByteLen::new(value_bytes.len() as u64),
+				},
+			},
+		],
+		row_group_stats: Vec::new(),
+		logical_schema_fingerprint: bench_logical_fingerprint(),
+	};
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"value",
+		DataType::Int64,
+		true,
+	)]));
+	let values = (0..rows)
+		.map(|row| shape.is_valid(row, rows).then_some(0_i64))
+		.collect::<Vec<_>>();
+	let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values)) as ArrayRef])
+		.map_err(|err| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("encoded-validity bench batch: {err}"),
+			)
+		})?;
+	let writer_config = EncodingWriterConfig {
+		enabled: true,
+		target_simd_page_values: SimdPageValueCount::new(page_values as u32),
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: [EncodingCascadeKind::Plain, EncodingCascadeKind::Rle]
+			.into_iter()
+			.collect(),
+		..EncodingWriterConfig::default()
+	};
+	Ok(EncodedValidityFixture {
+		record_id,
+		ipc_bytes,
+		page_directory,
+		batches: vec![batch],
+		writer_config,
+		row_group_config: RowGroupWriterConfig::default(),
+		raw_validity_bytes: null_bytes.len(),
+		first_page_raw_validity_bytes: rows.min(page_values).div_ceil(8),
+	})
+}
+
+fn validity_bitmap_bytes(rows: usize, mut is_valid: impl FnMut(usize) -> bool) -> Vec<u8> {
+	let mut bytes = vec![0_u8; rows.div_ceil(8)];
+	for row in 0..rows {
+		if is_valid(row) {
+			bytes[row / 8] |= 1_u8 << (row % 8);
+		}
+	}
+	bytes
+}
+
+#[derive(Clone, Debug)]
+struct EncodedValidityDirectorySummary {
+	validity_buffer_encoded: bool,
+	validity_payload_bytes: usize,
+	validity_page_table_bytes: usize,
+	first_page_encoded_bytes: usize,
+	validity_page_end_offsets: Vec<u32>,
+	validity_encoded_bytes: Vec<u8>,
+}
+
+fn encoded_validity_directory_summary(
+	fixture: &EncodedValidityFixture,
+	enabled: bool,
+) -> std::io::Result<EncodedValidityDirectorySummary> {
+	let (directory, applied) = if enabled {
+		build_encoding_directory_for_ipc_stream(
+			fixture.record_id,
+			&fixture.ipc_bytes,
+			&fixture.page_directory,
+			&fixture.batches,
+			&fixture.writer_config,
+			&fixture.row_group_config,
+		)?
+	} else {
+		build_encoding_directory_for_ipc_stream_exact_fsst_for_bench(
+			fixture.record_id,
+			&fixture.ipc_bytes,
+			&fixture.page_directory,
+			&fixture.batches,
+			&fixture.writer_config,
+			&fixture.row_group_config,
+		)?
+	};
+	let Some(directory) = directory else {
+		return Ok(EncodedValidityDirectorySummary {
+			validity_buffer_encoded: false,
+			validity_payload_bytes: 0,
+			validity_page_table_bytes: 0,
+			first_page_encoded_bytes: 0,
+			validity_page_end_offsets: Vec::new(),
+			validity_encoded_bytes: Vec::new(),
+		});
+	};
+	Ok(encoded_validity_summary_from_directory(&directory, applied))
+}
+
+fn encoded_validity_summary_from_directory(
+	directory: &EncodingDirectory,
+	applied: Vec<wendelon::storage::encoding::directory::AppliedEncodingBuffer>,
+) -> EncodedValidityDirectorySummary {
+	let validity = directory
+		.buffers
+		.iter()
+		.find(|encoding| encoding.ipc_buffer_ordinal == IpcBufferIndex::ZERO);
+	let Some(validity) = validity else {
+		return EncodedValidityDirectorySummary {
+			validity_buffer_encoded: false,
+			validity_payload_bytes: 0,
+			validity_page_table_bytes: 0,
+			first_page_encoded_bytes: 0,
+			validity_page_end_offsets: Vec::new(),
+			validity_encoded_bytes: Vec::new(),
+		};
+	};
+	let validity_page_end_offsets = validity
+		.page_end_offsets
+		.iter()
+		.map(|offset| offset.get())
+		.collect::<Vec<_>>();
+	let first_page_encoded_bytes = validity_page_end_offsets
+		.first()
+		.copied()
+		.unwrap_or_default() as usize;
+	let validity_encoded_bytes = applied
+		.into_iter()
+		.find(|buffer| buffer.ipc_buffer_ordinal == IpcBufferIndex::ZERO)
+		.map(|buffer| buffer.encoded_bytes)
+		.unwrap_or_default();
+	EncodedValidityDirectorySummary {
+		validity_buffer_encoded: true,
+		validity_payload_bytes: validity_encoded_bytes.len(),
+		validity_page_table_bytes: validity.page_end_offsets.len() * std::mem::size_of::<u32>(),
+		first_page_encoded_bytes,
+		validity_page_end_offsets,
+		validity_encoded_bytes,
+	}
 }
 
 fn bench(iterations: usize, mut f: impl FnMut()) -> Duration {

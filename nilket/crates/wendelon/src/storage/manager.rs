@@ -79,23 +79,25 @@ use crate::storage::core::{
 use crate::storage::encoding::compute::{
 	EncodedAggregateContext, EncodedPredicateNode, EncodedRowMask, EncodingComputeFallbackReason,
 	EncodingComputeRejectCode, NativeEvaluationEligibility, PredicateAtom, aggregate_kind_for_tag,
-	coerce_literal, decode_encoded_buffer, encoded_leaf_selectivity_allowed,
-	encoded_predicate_node_from_tree, evaluate as evaluate_encoded_predicate,
-	evaluate_fsst_predicate, evaluate_fsst_row_safe_predicate, evaluate_validity_bitmap,
-	evaluator_kind_for_cascade, native_aggregate_cascade_eligible, native_evaluation_eligibility,
+	coerce_literal, encoded_leaf_selectivity_allowed, encoded_predicate_node_from_tree,
+	evaluate as evaluate_encoded_predicate, evaluate_fsst_predicate,
+	evaluate_fsst_row_safe_predicate, evaluate_validity_bitmap, evaluator_kind_for_cascade,
+	native_aggregate_cascade_eligible, native_evaluation_eligibility,
 	try_fold_encoded_aggregate_request,
 };
 use crate::storage::encoding::directory::page_stats_cascade_eligible;
-use crate::storage::encoding::materialize::find_buffer_encoding;
-use crate::storage::encoding::materialize::ipc_stream_contains_encoding_directory;
+use crate::storage::encoding::materialize::{
+	decode_encoded_validity_buffer, encoded_validity_cascade_supported, find_buffer_encoding,
+	ipc_stream_contains_encoding_directory,
+};
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
-	PageValidityBitmap, decode_page_fetch, empty_projected_batch_for_requirement,
-	encoded_page_body_range, extract_record_body_bytes as extract_encoded_page_bytes,
-	filtered_predicate_page_batch, fixed_width_encoding_indexed_value_column,
-	projected_page_batch_from_decoded_buffers, rebase_validity_bitmap,
-	required_projected_physical_ordinals,
+	PageMaterializeValiditySource, PageValidityBitmap, decode_page_fetch, decode_rle_validity_page,
+	empty_projected_batch_for_requirement, encoded_page_body_range,
+	extract_record_body_bytes as extract_encoded_page_bytes, filtered_predicate_page_batch,
+	fixed_width_encoding_indexed_value_column, projected_page_batch_from_decoded_buffers,
+	rebase_validity_bitmap, required_projected_physical_ordinals,
 };
 use crate::storage::encoding::predicate_page_fetch::{
 	PagePredicateClassification, PredicatePageFetchPlan, PredicatePageMaskSlice,
@@ -8872,8 +8874,13 @@ impl SlabManager {
 							"Encoding compute aggregate validity fetch missing cascade",
 						)
 					})?;
-					decode_encoded_buffer(&validity, &DataType::Boolean, cascade, encoding)
-						.map_err(encoding_compute_decode_error)?
+					decode_encoded_validity_buffer(
+						&validity,
+						cascade,
+						encoding,
+						group.row_count.get() as usize,
+					)
+					.map_err(encoding_compute_decode_error)?
 				} else {
 					validity
 				};
@@ -9362,8 +9369,13 @@ impl SlabManager {
 									"Encoding compute validity fetch missing cascade",
 								)
 							})?;
-							decode_encoded_buffer(&fetched, &DataType::Boolean, cascade, encoding)
-								.map_err(encoding_compute_decode_error)?
+							decode_encoded_validity_buffer(
+								&fetched,
+								cascade,
+								encoding,
+								group.row_count.get() as usize,
+							)
+							.map_err(encoding_compute_decode_error)?
 						} else {
 							fetched
 						};
@@ -11983,6 +11995,9 @@ fn encoding_compute_validity_page_for_row_group(
 					.cascades
 					.get(encoding.cascade_index.get() as usize)
 					.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
+				if !encoded_validity_cascade_supported(cascade) {
+					return Err(EncodingComputeFallbackReason::UnsupportedCascade);
+				}
 				(Some(encoding.clone()), Some(cascade.clone()))
 			}
 			None => (None, None),
@@ -12625,11 +12640,15 @@ fn materialize_sparse_projection_page_batches<B: AsRef<[u8]>>(
 		}
 		let fetched =
 			extract_encoded_page_bytes(fetch.body_range, selected_ranges, plaintext_extracts)?;
-		let validity = rebase_validity_bitmap(
-			&fetched,
-			fetch.bit_offset,
-			fetch.page_row_count.get() as usize,
-		)?;
+		let validity = match fetch.source {
+			PageMaterializeValiditySource::Raw { bit_offset } => {
+				rebase_validity_bitmap(&fetched, bit_offset, fetch.page_row_count.get() as usize)?
+			}
+			PageMaterializeValiditySource::Encoded { cascade } => {
+				let _ = cascade;
+				decode_rle_validity_page(&fetched, fetch.page_row_count.get() as usize)?
+			}
+		};
 		decoded_validity_pages.insert(fetch.key, validity);
 	}
 

@@ -1616,11 +1616,13 @@ The forward shape continues at #24.
     Claude / Codex / Gemini after four iterations. Plans at
     `plans/adr/069_encoded_validity_sparse_projection.md` and
     `plans/impl/069_encoded_validity_sparse_projection.md`;
-    bench-results artifact created at promotion. Pre-Phase 0;
-    Phase 0 P-fork (writer scope) essentially confirmed by iter-0
-    Explore evidence — the writer's `is_fixed_width_value_buffer`
-    filter excludes validity ordinal 0 from cascade selection,
-    so no production encoded-validity producer exists today.
+    bench-results artifact at
+    `plans/impl/069_encoded_validity_sparse_projection_bench_results.md`.
+    Shipped and promoted. Phase 0 P-fork (writer scope) closed:
+    before ADR 069, the writer's value-buffer route excluded
+    validity ordinal 0, so there was no production encoded-validity
+    producer; ADR 069 adds the separate validity route and
+    promotion enables it.
     **Integrated writer + reader scope** because reader-only has
     no production consumer: adds a minimum writer extension that
     emits page-aligned, page-local RLE-encoded validity bitmaps
@@ -1646,16 +1648,17 @@ The forward shape continues at #24.
     pattern to pay). **Crate-private
     `WriterValidityCascadeRouting { Disabled, Enabled }`** mirrors
     ADR 068's `FsstRowSafeEstimatorRouting` pattern; production
-    starts `Disabled` and the Phase 7 promotion commit flips to
-    `Enabled` via a new
+    now initializes `Enabled` after Phase 7 promotion while the
+    disabled route remains available for bench/test comparison via a
     `build_encoding_directory_for_ipc_stream_with_routing`
     directory-builder helper. The decline narrows but persists as
     fail-closed planner state with internal
     `EncodedValidityDeclineReason` diagnostics
     (`UnsupportedCascade` / `MissingPageMetadata` /
-    `PageGeometryMismatch` / `DecodedByteLenMismatch` /
-    `CorruptPageDescriptor`) that collapse to the existing public
-    variant at the planner boundary. Mask-first sparse projection
+    `PageGeometryMismatch` / `RowGroupRowCountMismatch` /
+    `DecodedByteLenMismatch` / `CorruptPageDescriptor`) that
+    collapse to the existing public variant at the planner
+    boundary. Mask-first sparse projection
     preserved; all-null value-fetch elision remains ADR 070's
     scope with an architecture guard pinning the boundary.
     **Closed surface**: no new on-disk shape, no new

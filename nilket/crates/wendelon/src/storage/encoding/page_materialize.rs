@@ -1,14 +1,14 @@
 use crate::crypto::TieredPlaintextRange;
 use crate::schema::{
-	IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal, RecordBodyByteLen,
-	RecordBodyByteOffset, RowGroupIndex, RowGroupRowCount,
+	EncodingCascadeIndex, IpcBufferIndex, IpcBufferLength, IpcBufferOffset, IpcColumnOrdinal,
+	RecordBodyByteLen, RecordBodyByteOffset, RowGroupIndex, RowGroupRowCount,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, IpcBufferRange, ProjectedRecordBatch,
 	ProjectedRecordBufferSet, RecordBufferDirectory, StorageColumn,
 	decode_projected_record_batch_from_buffers,
 };
-use crate::storage::encoding::cascade::decode_page;
+use crate::storage::encoding::cascade::{RleByteRunIter, decode_page};
 use crate::storage::encoding::{BufferEncoding, EncodingCascade, EncodingPageDescriptor};
 use crate::storage::row_group::RecordBodyByteRange;
 use arrow::array::{Array, BooleanArray, new_null_array};
@@ -56,14 +56,24 @@ pub(crate) struct PageMaterializeValidityFetch {
 	pub key: PageMaterializeBufferKey,
 	pub body_range: RecordBodyByteRange,
 	pub page: EncodingPageDescriptor,
-	pub bit_offset: u8,
+	pub source: PageMaterializeValiditySource,
 	pub page_row_count: RowGroupRowCount,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PageMaterializeValiditySource {
+	Raw { bit_offset: u8 },
+	Encoded { cascade: EncodingCascadeIndex },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PageValidityBitmap {
 	pub bytes: Vec<u8>,
 	pub null_count: usize,
+}
+
+pub(crate) fn validity_page_decoded_byte_len(page_value_count: usize) -> usize {
+	page_value_count.div_ceil(8)
 }
 
 pub(crate) fn fixed_width_value_bytes(data_type: &DataType) -> Option<usize> {
@@ -261,6 +271,117 @@ pub(crate) fn rebase_validity_bitmap(
 		}
 	}
 	Ok(PageValidityBitmap { bytes, null_count })
+}
+
+pub(crate) fn decode_rle_validity_page(
+	encoded_page: &[u8],
+	page_value_count: usize,
+) -> Result<PageValidityBitmap, arrow::error::ArrowError> {
+	let expected = validity_page_decoded_byte_len(page_value_count);
+	let mut bytes = Vec::with_capacity(expected);
+	for run in RleByteRunIter::new(encoded_page) {
+		let run = run.map_err(|code| {
+			arrow::error::ArrowError::SchemaError(format!(
+				"encoded validity RLE page rejected: {code:?}"
+			))
+		})?;
+		let end = bytes.len().checked_add(run.run_len).ok_or_else(|| {
+			arrow::error::ArrowError::SchemaError(
+				"encoded validity decoded byte length overflow".into(),
+			)
+		})?;
+		if end > expected {
+			return Err(arrow::error::ArrowError::SchemaError(format!(
+				"encoded validity decoded {} bytes but {} expected",
+				end, expected
+			)));
+		}
+		bytes.resize(end, run.byte);
+	}
+	if bytes.len() != expected {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"encoded validity decoded {} bytes but {} expected",
+			bytes.len(),
+			expected
+		)));
+	}
+	let null_count = validity_null_count(&bytes, page_value_count)?;
+	Ok(PageValidityBitmap { bytes, null_count })
+}
+
+pub(crate) fn stitch_validity_pages_into_row_group_bitmap(
+	pages: &[(EncodingPageDescriptor, PageValidityBitmap)],
+	row_group_row_count: usize,
+) -> Result<Vec<u8>, arrow::error::ArrowError> {
+	let mut ordered = pages.iter().collect::<Vec<_>>();
+	ordered.sort_by_key(|(page, _)| page.first_value_index.get());
+	let mut out = vec![0_u8; validity_page_decoded_byte_len(row_group_row_count)];
+	let mut expected_next = 0_usize;
+	for (page, validity) in ordered {
+		let start = page.first_value_index.get() as usize;
+		let len = page.value_count.get() as usize;
+		if start != expected_next {
+			return Err(arrow::error::ArrowError::SchemaError(format!(
+				"encoded validity page span starts at {start}, expected {expected_next}"
+			)));
+		}
+		let end = start.checked_add(len).ok_or_else(|| {
+			arrow::error::ArrowError::SchemaError("encoded validity row span overflow".into())
+		})?;
+		if end > row_group_row_count {
+			return Err(arrow::error::ArrowError::SchemaError(format!(
+				"encoded validity page span {start}..{end} exceeds row group row count {row_group_row_count}"
+			)));
+		}
+		let expected_len = validity_page_decoded_byte_len(len);
+		if validity.bytes.len() != expected_len {
+			return Err(arrow::error::ArrowError::SchemaError(format!(
+				"encoded validity page has {} bytes but {} expected",
+				validity.bytes.len(),
+				expected_len
+			)));
+		}
+		if len == 0 && row_group_row_count != 0 {
+			return Err(arrow::error::ArrowError::SchemaError(
+				"encoded validity page has zero rows".into(),
+			));
+		}
+		for row in 0..len {
+			let valid = (validity.bytes[row / 8] & (1_u8 << (row % 8))) != 0;
+			if valid {
+				let target = start + row;
+				out[target / 8] |= 1_u8 << (target % 8);
+			}
+		}
+		expected_next = end;
+	}
+	if expected_next != row_group_row_count {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"encoded validity stitched {expected_next} rows but {row_group_row_count} expected"
+		)));
+	}
+	Ok(out)
+}
+
+fn validity_null_count(
+	bytes: &[u8],
+	page_value_count: usize,
+) -> Result<usize, arrow::error::ArrowError> {
+	if bytes.len() != validity_page_decoded_byte_len(page_value_count) {
+		return Err(arrow::error::ArrowError::SchemaError(format!(
+			"validity bitmap has {} bytes but {} expected for {} rows",
+			bytes.len(),
+			validity_page_decoded_byte_len(page_value_count),
+			page_value_count
+		)));
+	}
+	let mut null_count = 0_usize;
+	for row in 0..page_value_count {
+		if (bytes[row / 8] & (1_u8 << (row % 8))) == 0 {
+			null_count = null_count.saturating_add(1);
+		}
+	}
+	Ok(null_count)
 }
 
 pub(crate) fn decode_page_fetch(
@@ -624,6 +745,126 @@ mod tests {
 			ordinal_mapping: ColumnOrdinalMapping::new(vec![Some(0)]),
 			storage_mapping: BTreeMap::new(),
 		}
+	}
+
+	fn validity_bytes(rows: usize, is_valid: impl Fn(usize) -> bool) -> Vec<u8> {
+		let mut bytes = vec![0_u8; validity_page_decoded_byte_len(rows)];
+		for row in 0..rows {
+			if is_valid(row) {
+				bytes[row / 8] |= 1_u8 << (row % 8);
+			}
+		}
+		bytes
+	}
+
+	fn rle_bytes(input: &[u8]) -> Vec<u8> {
+		let mut out = Vec::new();
+		let mut cursor = 0_usize;
+		while cursor < input.len() {
+			let byte = input[cursor];
+			let mut run = 1_usize;
+			while cursor + run < input.len() && input[cursor + run] == byte {
+				run += 1;
+			}
+			out.extend_from_slice(&(run as u32).to_be_bytes());
+			out.push(byte);
+			cursor += run;
+		}
+		out
+	}
+
+	#[test]
+	fn decode_rle_validity_page_counts_only_live_bits() {
+		for rows in [1_usize, 7, 8, 9, 13, 16, 64, 256, 1027] {
+			let all_valid = validity_bytes(rows, |_| true);
+			let decoded = decode_rle_validity_page(&rle_bytes(&all_valid), rows).unwrap();
+			assert_eq!(decoded.bytes, all_valid, "all-valid rows={rows}");
+			assert_eq!(decoded.null_count, 0, "all-valid rows={rows}");
+
+			let all_null = validity_bytes(rows, |_| false);
+			let decoded = decode_rle_validity_page(&rle_bytes(&all_null), rows).unwrap();
+			assert_eq!(decoded.bytes, all_null, "all-null rows={rows}");
+			assert_eq!(decoded.null_count, rows, "all-null rows={rows}");
+		}
+	}
+
+	#[test]
+	fn decode_rle_validity_page_rejects_corrupt_payload() {
+		let err = decode_rle_validity_page(&[0, 0, 0, 2], 8).unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("encoded validity RLE page rejected")
+		);
+	}
+
+	#[test]
+	fn stitch_validity_pages_rebases_page_local_bits() {
+		let left_page = page(0, 13);
+		let right_page = page(13, 5);
+		let left = PageValidityBitmap {
+			bytes: validity_bytes(13, |row| matches!(row, 0 | 4 | 12)),
+			null_count: 10,
+		};
+		let right = PageValidityBitmap {
+			bytes: validity_bytes(5, |row| matches!(row, 0 | 3)),
+			null_count: 3,
+		};
+		let stitched = stitch_validity_pages_into_row_group_bitmap(
+			&[(right_page, right), (left_page, left)],
+			18,
+		)
+		.unwrap();
+		assert_eq!(
+			stitched,
+			validity_bytes(18, |row| matches!(row, 0 | 4 | 12 | 13 | 16))
+		);
+	}
+
+	#[test]
+	fn stitch_validity_pages_rejects_gaps_and_overlaps() {
+		let gap = stitch_validity_pages_into_row_group_bitmap(
+			&[
+				(
+					page(0, 8),
+					PageValidityBitmap {
+						bytes: validity_bytes(8, |_| true),
+						null_count: 0,
+					},
+				),
+				(
+					page(9, 4),
+					PageValidityBitmap {
+						bytes: validity_bytes(4, |_| true),
+						null_count: 0,
+					},
+				),
+			],
+			13,
+		)
+		.unwrap_err();
+		assert!(gap.to_string().contains("expected 8"));
+
+		let overlap = stitch_validity_pages_into_row_group_bitmap(
+			&[
+				(
+					page(0, 8),
+					PageValidityBitmap {
+						bytes: validity_bytes(8, |_| true),
+						null_count: 0,
+					},
+				),
+				(
+					page(7, 4),
+					PageValidityBitmap {
+						bytes: validity_bytes(4, |_| true),
+						null_count: 0,
+					},
+				),
+			],
+			11,
+		)
+		.unwrap_err();
+		assert!(overlap.to_string().contains("expected 8"));
 	}
 
 	#[test]
