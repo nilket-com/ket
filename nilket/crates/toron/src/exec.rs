@@ -4,7 +4,7 @@ use arrow::compute::kernels::cmp::{eq, neq, lt, lt_eq, gt, gt_eq};
 use arrow::compute::kernels::boolean::{and, or, not, is_null, is_not_null};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
-use crate::ir::{Expr, LogicalPlan, ScalarValue, AggregateFunction};
+use crate::ir::{Expr, LogicalPlan, ScalarValue, AggregateFunction, MorselId};
 use crate::storage::{StorageScan, ScanRequest, TenantId, HlcBound};
 
 #[derive(Debug)]
@@ -14,16 +14,16 @@ pub enum ExecutionError {
     NotImplemented(String),
 }
 
-pub struct Executor<'a> {
-    storage: &'a dyn StorageScan,
+pub struct Executor {
+    storage: Arc<dyn StorageScan>,
 }
 
-impl<'a> Executor<'a> {
-    pub fn new(storage: &'a dyn StorageScan) -> Self {
+impl Executor {
+    pub fn new(storage: Arc<dyn StorageScan>) -> Self {
         Self { storage }
     }
 
-    pub fn execute<'b>(&'b self, plan: &'b LogicalPlan) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>> {
+    pub fn execute<'b>(&'b self, plan: &'b LogicalPlan, morsel: Option<(MorselId, u32)>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>> {
         Box::pin(async move {
             match plan {
                 LogicalPlan::Scan { table, projection } => {
@@ -34,13 +34,14 @@ impl<'a> Executor<'a> {
                         projected_columns: projection.clone(),
                         pbc_predicate: None, // PBC lowering deferred to M2
                         profile_hint: None,
+                        morsel,
                     };
                     let stream = self.storage.scan(req).await
                         .map_err(|e| ExecutionError::Storage(format!("{:?}", e)))?;
                     Ok(stream.batches)
                 }
                 LogicalPlan::Filter { input, predicate } => {
-                    let input_batches = self.execute(input).await?;
+                    let input_batches = self.execute(input, morsel).await?;
                     let mut output = Vec::new();
                     for batch in input_batches {
                         let mask = self.evaluate_expr(predicate, &batch)?;
@@ -53,7 +54,7 @@ impl<'a> Executor<'a> {
                     Ok(output)
                 }
                 LogicalPlan::Project { input, exprs } => {
-                    let input_batches = self.execute(input).await?;
+                    let input_batches = self.execute(input, morsel).await?;
                     let mut output = Vec::new();
                     for batch in input_batches {
                         let mut cols = Vec::new();
@@ -76,7 +77,7 @@ impl<'a> Executor<'a> {
                     Ok(output)
                 }
                 LogicalPlan::Aggregate { input, aggr_expr } => {
-                    let input_batches = self.execute(input).await?;
+                    let input_batches = self.execute(input, morsel).await?;
                     match aggr_expr {
                         AggregateFunction::CountAll => {
                             let mut total: i64 = 0;

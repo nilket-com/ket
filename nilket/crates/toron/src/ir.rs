@@ -3,6 +3,12 @@ use arrow::datatypes::DataType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TableId(pub u64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StageId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MorselId(pub u32);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarValue {
     Boolean(Option<bool>),

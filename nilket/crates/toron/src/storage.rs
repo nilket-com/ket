@@ -1,4 +1,4 @@
-use crate::ir::TableId;
+use crate::ir::{TableId, MorselId};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ pub enum QueryProfileHint {
     Scan,
 }
 
+#[derive(Debug, Clone)]
 pub struct ScanRequest {
     pub tenant_id: TenantId,
     pub table_id: TableId,
@@ -22,6 +23,7 @@ pub struct ScanRequest {
     pub projected_columns: Option<Vec<String>>,
     pub pbc_predicate: Option<Vec<u8>>, // Mocked PBC program payload
     pub profile_hint: Option<QueryProfileHint>,
+    pub morsel: Option<(MorselId, u32)>, // (MorselId, total_morsels)
 }
 
 pub struct ScanStream {
@@ -47,11 +49,22 @@ pub struct InMemoryStorageScan {
 #[async_trait::async_trait]
 impl StorageScan for InMemoryStorageScan {
     async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-        // M1 simplified scan logic: return the full table, 
-        // rely on Executor to do filtering/projection if PBC is not pushed down.
-        // We will pass the full batch back as a stream.
         let mut batch = self.table_data.clone();
         
+        // M4: deterministic morsel splitting
+        if let Some((morsel_id, total_morsels)) = request.morsel {
+            let total_rows = batch.num_rows();
+            let rows_per_morsel = (total_rows + total_morsels as usize - 1) / total_morsels as usize;
+            let start_row = (morsel_id.0 as usize) * rows_per_morsel;
+            let end_row = std::cmp::min(start_row + rows_per_morsel, total_rows);
+            
+            if start_row < total_rows {
+                batch = batch.slice(start_row, end_row - start_row);
+            } else {
+                batch = batch.slice(0, 0); // Empty batch for out of bounds morsels
+            }
+        }
+
         // Naive projection pushdown simulation for M1:
         if let Some(cols) = request.projected_columns {
             let schema = batch.schema();

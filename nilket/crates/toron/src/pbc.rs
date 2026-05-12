@@ -264,9 +264,9 @@ mod tests {
             }),
         };
 
-        let storage = InMemoryStorageScan { table_data: batch.clone() };
-        let executor = Executor::new(&storage);
-        let executor_results = executor.execute(&plan).await.unwrap();
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch.clone() });
+        let executor = Executor::new(storage);
+        let executor_results = executor.execute(&plan, None).await.unwrap();
         let executor_result_batch = &executor_results[0];
 
         // 2. Wendelon PBC Engine

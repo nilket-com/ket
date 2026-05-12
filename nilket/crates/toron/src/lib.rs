@@ -11,7 +11,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     
-    use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId};
+    use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId, MorselId};
     use crate::storage::InMemoryStorageScan;
     use crate::exec::Executor;
 
@@ -37,8 +37,8 @@ mod tests {
             ],
         ).unwrap();
 
-        let storage = InMemoryStorageScan { table_data: batch };
-        let executor = Executor::new(&storage);
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+        let executor = Executor::new(storage);
 
         // Construct IR manually: SELECT COUNT(*) WHERE amount > 100 AND status = 'active'
         // Scan -> Filter -> Aggregate
@@ -64,7 +64,7 @@ mod tests {
         };
 
         // Execute
-        let results = executor.execute(&plan).await.expect("Execution failed");
+        let results = executor.execute(&plan, None).await.expect("Execution failed");
         
         // Assert output
         assert_eq!(results.len(), 1);
@@ -97,8 +97,8 @@ mod tests {
         let amount_array = Int32Array::from(vec![Some(50), None, Some(100)]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(amount_array)]).unwrap();
 
-        let storage = InMemoryStorageScan { table_data: batch };
-        let executor = Executor::new(&storage);
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+        let executor = Executor::new(storage);
 
         // Filter: IsNull(amount) -> should yield 1 row
         let plan_null = LogicalPlan::Aggregate {
@@ -109,7 +109,7 @@ mod tests {
             }),
         };
 
-        let results_null = executor.execute(&plan_null).await.unwrap();
+        let results_null = executor.execute(&plan_null, None).await.unwrap();
         let count_null = results_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(count_null, 1);
 
@@ -122,8 +122,67 @@ mod tests {
             }),
         };
 
-        let results_not_null = executor.execute(&plan_not_null).await.unwrap();
+        let results_not_null = executor.execute(&plan_not_null, None).await.unwrap();
         let count_not_null = results_not_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(count_not_null, 2);
+    }
+
+    #[tokio::test]
+    async fn test_m4_morsel_determinism() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Int32, false),
+        ]));
+
+        // 100 rows
+        let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+        let executor = Arc::new(Executor::new(storage));
+
+        let plan = LogicalPlan::Aggregate {
+            aggr_expr: AggregateFunction::CountAll,
+            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
+        };
+
+        // 1. Single execution (no morsels)
+        let single_results = executor.execute(&plan, None).await.unwrap();
+        let single_count = single_results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        assert_eq!(single_count, 100);
+
+        // 2. Morsel splitting (4 morsels) - run sequentially
+        let total_morsels = 4;
+        let mut sequential_sum = 0;
+        for i in 0..total_morsels {
+            let res = executor.execute(&plan, Some((MorselId(i), total_morsels))).await.unwrap();
+            sequential_sum += res[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        }
+        assert_eq!(sequential_sum, 100);
+
+        // 3. Concurrent morsel execution (multi-thread determinism)
+        let mut tasks = Vec::new();
+        for i in 0..total_morsels {
+            let exec_clone = executor.clone();
+            let plan_clone = plan.clone();
+            tasks.push(tokio::spawn(async move {
+                let res = exec_clone.execute(&plan_clone, Some((MorselId(i), total_morsels))).await.unwrap();
+                res[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0)
+            }));
+        }
+        let mut concurrent_sum = 0;
+        for task in tasks {
+            concurrent_sum += task.await.unwrap();
+        }
+        assert_eq!(concurrent_sum, 100);
+
+        // 4. Idempotent morsel retry
+        let res1 = executor.execute(&plan, Some((MorselId(2), total_morsels))).await.unwrap();
+        let val1 = res1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        
+        let res2 = executor.execute(&plan, Some((MorselId(2), total_morsels))).await.unwrap();
+        let val2 = res2[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        
+        assert_eq!(val1, val2);
+        assert_eq!(val1, 25); // 100 rows / 4 morsels = 25
     }
 }

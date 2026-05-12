@@ -35,7 +35,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 - **Scope:** Implement `WendelonStorageScan` wrapping `wendelon-client`, pass tenant id and PBC predicate, receive Arrow batches.
 - **Tests:** In-process Wendelon fixtures, live local cluster integration.
 
-### M4: Single-Process Morsels
+### M4: Single-Process Morsels (Completed)
 - **Scope:** Introduce `MorselId`, `StageId`, split scans into deterministic morsels, merge `CountAll` results.
 - **Tests:** Single-thread vs multi-thread determinism, idempotent morsel retry.
 
