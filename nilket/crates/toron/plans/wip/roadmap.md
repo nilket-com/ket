@@ -18,14 +18,14 @@ Implementation is starting at M0.
 - **M4: Single-Process Morsels** — Parallel unit before distribution.
 - **M5: Coordinator / Worker Boundary** — QUIC incremental Arrow result streaming.
 - **M6: First Shuffle** — Hash partition exchange over QUIC.
+- **M7: Rune Authoring Surface** — Typed DataFrame API, sandboxed execution.
 
 ## Forward Sequence
 
-1. **M7: Rune Authoring Surface** — Typed DataFrame API, fuel-limited sandbox.
-2. **M8: SQL Compatibility** — Parser lowered to handwritten IR.
-3. **M9: RDMA / RoCEv2 Transport** — Zero-copy high-speed fabric integration.
-4. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
-5. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+1. **M8: SQL Compatibility** — Parser lowered to handwritten IR.
+2. **M9: RDMA / RoCEv2 Transport** — Zero-copy high-speed fabric integration.
+3. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
+4. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
 
 
 ## What Not To Do Next

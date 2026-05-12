@@ -5,6 +5,7 @@ pub mod storage;
 pub mod pbc;
 pub mod server;
 pub mod wire;
+pub mod rune_engine;
 
 #[cfg(test)]
 mod tests {
@@ -280,9 +281,43 @@ mod tests {
         w2_handle.await.unwrap();
         
         // 3. Verification
-        // Just asserting that the exchange logic didn't crash and processed the batches.
-        // In M6 we verify the P2P message framing and hash splitting works.
         assert!(w1_partitions.len() >= 1);
         assert!(w2_partitions.len() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_m7_rune_authoring_surface() {
+        let engine = crate::rune_engine::RuneEngine::new().unwrap();
+        
+        let script = r#"
+            pub fn main(ctx) {
+                ctx.table("sales")
+                   .filter(col("amount").gt(lit(100)))
+                   .count()
+            }
+        "#;
+        
+        let plan = engine.execute_script(script, 1000).await.expect("Rune execution failed");
+        
+        // Verify the plan
+        match plan {
+            crate::ir::LogicalPlan::Aggregate { input, group_expr, aggr_expr } => {
+                assert!(group_expr.is_empty());
+                assert_eq!(aggr_expr.len(), 1);
+                assert!(matches!(aggr_expr[0].0, crate::ir::AggregateFunction::CountAll));
+                
+                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = *input {
+                    if let crate::ir::Expr::Gt(left, right) = predicate {
+                        assert!(matches!(*left, crate::ir::Expr::Column(ref c) if c == "amount"));
+                        assert!(matches!(*right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
+                    } else {
+                        panic!("Expected Gt predicate, got {:?}", predicate);
+                    }
+                } else {
+                    panic!("Expected Filter plan, got {:?}", input);
+                }
+            }
+            _ => panic!("Expected Aggregate plan, got {:?}", plan),
+        }
     }
 }
