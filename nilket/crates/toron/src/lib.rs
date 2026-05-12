@@ -3,6 +3,8 @@ pub mod planner;
 pub mod exec;
 pub mod storage;
 pub mod pbc;
+pub mod server;
+pub mod wire;
 
 #[cfg(test)]
 mod tests {
@@ -14,6 +16,7 @@ mod tests {
     use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId, MorselId};
     use crate::storage::InMemoryStorageScan;
     use crate::exec::Executor;
+    use crate::server::{ToronWorker, ToronCoordinator};
 
     #[tokio::test]
     async fn test_m1_single_process_ir_execution() {
@@ -184,5 +187,39 @@ mod tests {
         
         assert_eq!(val1, val2);
         assert_eq!(val1, 25); // 100 rows / 4 morsels = 25
+    }
+
+    #[tokio::test]
+    async fn test_m5_coordinator_worker_boundary() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+        let worker = Arc::new(ToronWorker::new(storage));
+        let coordinator = ToronCoordinator::new();
+
+        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024 * 1024);
+
+        // Spawn worker handle
+        let worker_handle = tokio::spawn(async move {
+            worker.handle_connection(&mut server_stream).await.unwrap();
+        });
+
+        let plan = LogicalPlan::Aggregate {
+            aggr_expr: AggregateFunction::CountAll,
+            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
+        };
+
+        // Coordinator executes morsel on worker via duplex stream
+        let results = coordinator.execute_morsel_on_worker(&mut client_stream, plan, Some((MorselId(0), 1))).await.unwrap();
+        
+        assert_eq!(results.len(), 1);
+        let count = results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        assert_eq!(count, 100);
+
+        worker_handle.await.unwrap();
     }
 }
