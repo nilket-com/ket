@@ -704,8 +704,8 @@ fn bench_cascades(config: &BenchConfig) -> std::io::Result<()> {
 			mixed.len(),
 		),
 		(
-			"fsst",
-			EncodingCascade::Fsst {
+			"fsst_whole_buffer",
+			EncodingCascade::FsstWholeBuffer {
 				symbol_table_byte_len: RecordBodyByteLen::ZERO,
 			},
 			fsst_input.as_slice(),
@@ -835,7 +835,7 @@ fn bench_phase10_compression_ratios() -> std::io::Result<()> {
 		&high_card_text,
 		DataType::Utf8,
 		high_card_text.len(),
-		EncodingCascade::Fsst {
+		EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		},
 	)?;

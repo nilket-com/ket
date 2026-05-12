@@ -1585,9 +1585,8 @@ The forward shape continues at #24.
     Strategy A indefinitely.
 
 24. **Sample-based `FsstRowSafe` writer estimator** —
-    proposed ADR 068, council-converged 2026-05-10
-    after eight iterations across Claude / Codex /
-    Gemini. See `plans/adr/068_fsst_row_safe_writer_
+    ADR 068 is implemented and promoted (directory-writer column-cache path).
+    See `plans/adr/068_fsst_row_safe_writer_
     estimator.md` and `plans/impl/068_fsst_row_safe_
     writer_estimator.md`. Baseline is an exact-guard-
     preserving estimator: cheaply early-decline
@@ -2128,9 +2127,9 @@ StateDigest substrate                            (ADR 046)
   → refinement plumbing
 ```
 
-Design tip is at ADR 068 proposed scope: sample-based
+Design tip is at ADR 068 promoted scope: sample-based
 `FsstRowSafe` writer estimator, exact-guard-preserving
-baseline first (council-converged 2026-05-10; entering
+baseline (promoted; directory-writer column-cache path).
 Phase 0 audit + calibration). The storage hierarchy is shipped through
 ADR 067 (row groups, per-buffer pages + encoding cascades,
 compute over encoded data substrate, native per-cascade
@@ -2198,8 +2197,8 @@ buffer make page-grain pruning a 5–10× predicate-fetch byte
 reduction on clustered low-selectivity workloads); ADR 067
 closed the FSST decode-avoidance follow-up while explicitly
 recording a writer-cost waiver.
-**ADR 068 is now proposed and council-converged**
-(2026-05-10): sample-based `FsstRowSafe` writer estimator
+**ADR 068 is now implemented and promoted**:
+sample-based `FsstRowSafe` writer estimator
 with an exact-guard-preserving baseline and an explicit
 escalation path only if evidence shows row-safe-FSST-only
 estimator authorization is needed. Implementation is

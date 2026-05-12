@@ -4739,8 +4739,8 @@ struct Adr066FsstPredicateMeasurement {
 	decoded_plaintext_bytes: u64,
 	encoded_payload_bytes: u64,
 	offsets_plaintext_bytes: u64,
-	wfs2_metadata_bytes: u64,
-	wfs2_payload_bytes: u64,
+	fsst_row_safe_metadata_bytes: u64,
+	fsst_row_safe_payload_bytes: u64,
 	mask_equal: bool,
 	mask_digest: String,
 }
@@ -4777,7 +4777,7 @@ fn adr066_fsst_predicate_fixture(rows: usize) -> std::io::Result<Adr066FsstPredi
 		.iter()
 		.flat_map(|offset| offset.to_le_bytes())
 		.collect::<Vec<_>>();
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -4944,36 +4944,36 @@ fn adr066_measure_fsst_predicate(
 			.iter()
 			.map(|fixture| fixture.offset_bytes.len() as u64)
 			.sum(),
-		wfs2_metadata_bytes: 0,
-		wfs2_payload_bytes: 0,
+		fsst_row_safe_metadata_bytes: 0,
+		fsst_row_safe_payload_bytes: 0,
 		mask_equal: dense_digest == kernel_digest,
 		mask_digest: kernel_digest,
 	})
 }
 
-fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64)> {
-	if encoded.len() < 13 || &encoded[..4] != b"WFS2" {
+fn adr067_fsst_row_safe_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64)> {
+	if encoded.len() < 13 || &encoded[..4] != b"RSFS" {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 magic missing",
+			"ADR 067 RSFS magic missing",
 		));
 	}
 	let symbol_count = encoded[4] as usize;
 	let row_count_offset = 5_usize
 		.checked_add(symbol_count.checked_mul(2).ok_or_else(|| {
-			Error::new(ErrorKind::InvalidData, "ADR 067 WFS2 symbol table overflow")
+			Error::new(ErrorKind::InvalidData, "ADR 067 RSFS symbol table overflow")
 		})?)
-		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 067 WFS2 row count overflow"))?;
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 067 RSFS row count overflow"))?;
 	let row_count_end = row_count_offset.checked_add(4).ok_or_else(|| {
 		Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 row count end overflow",
+			"ADR 067 RSFS row count end overflow",
 		)
 	})?;
 	if encoded.len() < row_count_end {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 row count truncated",
+			"ADR 067 RSFS row count truncated",
 		));
 	}
 	let row_count = u32::from_le_bytes(
@@ -4984,7 +4984,7 @@ fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64
 	if row_count != rows {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 row count mismatch",
+			"ADR 067 RSFS row count mismatch",
 		));
 	}
 	const FSST_ROW_SAFE_BLOCK_ROWS: usize = 256;
@@ -4992,31 +4992,30 @@ fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64
 	let block_offset_bytes = block_count.checked_mul(8).ok_or_else(|| {
 		Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 block_offsets overflow",
+			"ADR 067 RSFS block_offsets overflow",
 		)
 	})?;
-	let lengths_start = row_count_end.checked_add(block_offset_bytes).ok_or_else(|| {
-		Error::new(
-			ErrorKind::InvalidData,
-			"ADR 067 WFS2 block_offsets end overflow",
-		)
-	})?;
-	let exception_count_start = lengths_start.checked_add(row_count).ok_or_else(|| {
-		Error::new(
-			ErrorKind::InvalidData,
-			"ADR 067 WFS2 lengths end overflow",
-		)
-	})?;
+	let lengths_start = row_count_end
+		.checked_add(block_offset_bytes)
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"ADR 067 RSFS block_offsets end overflow",
+			)
+		})?;
+	let exception_count_start = lengths_start
+		.checked_add(row_count)
+		.ok_or_else(|| Error::new(ErrorKind::InvalidData, "ADR 067 RSFS lengths end overflow"))?;
 	let exception_count_end = exception_count_start.checked_add(4).ok_or_else(|| {
 		Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 exception_count end overflow",
+			"ADR 067 RSFS exception_count end overflow",
 		)
 	})?;
 	if encoded.len() < exception_count_end {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 metadata truncated",
+			"ADR 067 RSFS metadata truncated",
 		));
 	}
 	let exception_count = u32::from_le_bytes(
@@ -5027,7 +5026,7 @@ fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64
 	let exception_bytes = exception_count.checked_mul(4).ok_or_else(|| {
 		Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 exception_lengths overflow",
+			"ADR 067 RSFS exception_lengths overflow",
 		)
 	})?;
 	let payload_start = exception_count_end
@@ -5035,13 +5034,13 @@ fn adr067_wfs2_lengths(encoded: &[u8], rows: usize) -> std::io::Result<(u64, u64
 		.ok_or_else(|| {
 			Error::new(
 				ErrorKind::InvalidData,
-				"ADR 067 WFS2 payload start overflow",
+				"ADR 067 RSFS payload start overflow",
 			)
 		})?;
 	if payload_start > encoded.len() {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
-			"ADR 067 WFS2 metadata truncated",
+			"ADR 067 RSFS metadata truncated",
 		));
 	}
 	// metadata = block_offsets + encoded_lengths + 4-byte exception_count + exception_lengths
@@ -5112,14 +5111,13 @@ fn adr067_measure_fsst_row_safe_predicate(
 			),
 		));
 	}
-	let mut wfs2_metadata_bytes = 0_u64;
-	let mut wfs2_payload_bytes = 0_u64;
+	let mut fsst_row_safe_metadata_bytes = 0_u64;
+	let mut fsst_row_safe_payload_bytes = 0_u64;
 	for fixture in fixtures {
 		let (offset_bytes, payload_bytes) =
-			adr067_wfs2_lengths(&fixture.encoded.bytes, fixture.offsets.len() - 1)?;
-		wfs2_metadata_bytes =
-			wfs2_metadata_bytes.saturating_add(offset_bytes);
-		wfs2_payload_bytes = wfs2_payload_bytes.saturating_add(payload_bytes);
+			adr067_fsst_row_safe_lengths(&fixture.encoded.bytes, fixture.offsets.len() - 1)?;
+		fsst_row_safe_metadata_bytes = fsst_row_safe_metadata_bytes.saturating_add(offset_bytes);
+		fsst_row_safe_payload_bytes = fsst_row_safe_payload_bytes.saturating_add(payload_bytes);
 	}
 	Ok(Adr066FsstPredicateMeasurement {
 		dense_elapsed,
@@ -5137,8 +5135,8 @@ fn adr067_measure_fsst_row_safe_predicate(
 			.iter()
 			.map(|fixture| fixture.offset_bytes.len() as u64)
 			.sum(),
-		wfs2_metadata_bytes,
-		wfs2_payload_bytes,
+		fsst_row_safe_metadata_bytes,
+		fsst_row_safe_payload_bytes,
 		mask_equal: dense_digest == kernel_digest,
 		mask_digest: kernel_digest,
 	})
@@ -5420,7 +5418,7 @@ fn bench_adr067_fsst_row_safe_row_group_fetch_matrix(config: &BenchConfig) -> st
 			.saturating_add(predicate.offsets_plaintext_bytes)
 			.saturating_add(projection.sparse.projection_plaintext_bytes);
 		println!(
-			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_kernel_case_a1 output_rows={} equality={} mask_equal={} null_count_equal={} null_count={} iterations={} dense_predicate_plaintext_bytes={} wfs2_encoded_bytes={} wfs2_payload_bytes={} wfs2_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} strategy_b_vs_dense_cpu_micros={} dense_projection_plaintext_bytes={} sparse_value_plaintext_bytes={} sparse_validity_plaintext_bytes={} sparse_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} total_sparse_query_plaintext_bytes={} total_query_reduction_micros={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} selected_value_pages={} selected_validity_ranges={} get_bytes_calls={} mask_digest={} output_digest={}",
+			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_kernel_case_a1 output_rows={} equality={} mask_equal={} null_count_equal={} null_count={} iterations={} dense_predicate_plaintext_bytes={} fsst_row_safe_encoded_bytes={} fsst_row_safe_payload_bytes={} fsst_row_safe_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} strategy_b_vs_dense_cpu_micros={} dense_projection_plaintext_bytes={} sparse_value_plaintext_bytes={} sparse_validity_plaintext_bytes={} sparse_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} total_sparse_query_plaintext_bytes={} total_query_reduction_micros={} dense_total_ms={:.3} sparse_total_ms={:.3} speedup_micros={} dense_get_range_calls={} sparse_get_range_calls={} dense_get_range_bytes={} sparse_get_range_bytes={} dense_projection_ciphertext_bytes={} sparse_projection_ciphertext_bytes={} dense_selected_ranges={} sparse_selected_ranges={} selected_value_pages={} selected_validity_ranges={} get_bytes_calls={} mask_digest={} output_digest={}",
 			dataset.profile.as_str(),
 			dataset.rows,
 			dataset.fixtures.len(),
@@ -5433,8 +5431,8 @@ fn bench_adr067_fsst_row_safe_row_group_fetch_matrix(config: &BenchConfig) -> st
 			iterations,
 			predicate.decoded_plaintext_bytes,
 			predicate.encoded_payload_bytes,
-			predicate.wfs2_payload_bytes,
-			predicate.wfs2_metadata_bytes,
+			predicate.fsst_row_safe_payload_bytes,
+			predicate.fsst_row_safe_metadata_bytes,
 			predicate.offsets_plaintext_bytes,
 			adr065_ratio_micros(
 				predicate.encoded_payload_bytes,
@@ -5497,7 +5495,7 @@ fn bench_adr067_fsst_row_safe_row_group_fetch_matrix(config: &BenchConfig) -> st
 			.saturating_add(projection.dense.elapsed)
 			.saturating_add(a2_zip_elapsed);
 		println!(
-			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_dense_case_b_overlap_a2 kernel_engaged=false output_rows={} equality={} mask_equal={} null_count_equal={} iterations={} dense_predicate_plaintext_bytes={} dense_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} dense_total_ms={:.3} case_b_zip_ms={:.3} wfs2_encoded_bytes={} wfs2_payload_bytes={} wfs2_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} get_range_calls={} get_range_bytes={} selected_ranges={} get_bytes_calls={} mask_digest={} zip_digest={}",
+			"row_group_fetch_measure scenario=adr067_fsst_row_safe_row_group_fetch profile={} rows={} records={} page_values={} predicate_source=fsst_row_safe_eq route=fsst_row_safe_dense_case_b_overlap_a2 kernel_engaged=false output_rows={} equality={} mask_equal={} null_count_equal={} iterations={} dense_predicate_plaintext_bytes={} dense_projection_plaintext_bytes={} total_dense_query_plaintext_bytes={} dense_total_ms={:.3} case_b_zip_ms={:.3} fsst_row_safe_encoded_bytes={} fsst_row_safe_payload_bytes={} fsst_row_safe_metadata_bytes={} fsst_offsets_plaintext_bytes={} encoded_payload_ratio_micros={} get_range_calls={} get_range_bytes={} selected_ranges={} get_bytes_calls={} mask_digest={} zip_digest={}",
 			dataset.profile.as_str(),
 			dataset.rows,
 			dataset.fixtures.len(),
@@ -5513,8 +5511,8 @@ fn bench_adr067_fsst_row_safe_row_group_fetch_matrix(config: &BenchConfig) -> st
 			a2_elapsed.as_secs_f64() * 1_000.0,
 			a2_zip_elapsed.as_secs_f64() * 1_000.0,
 			predicate.encoded_payload_bytes,
-			predicate.wfs2_payload_bytes,
-			predicate.wfs2_metadata_bytes,
+			predicate.fsst_row_safe_payload_bytes,
+			predicate.fsst_row_safe_metadata_bytes,
 			predicate.offsets_plaintext_bytes,
 			adr065_ratio_micros(
 				predicate.encoded_payload_bytes,
@@ -6696,7 +6694,7 @@ fn adr063_cascade_label(cascade: &EncodingCascade) -> &'static str {
 			EncodingLeafCascade::BitPacked { .. } => "dictionary_bit_packed",
 		},
 		EncodingCascade::Delta { .. } => "delta",
-		EncodingCascade::Fsst { .. } => "fsst",
+		EncodingCascade::FsstWholeBuffer { .. } => "fsst_whole_buffer",
 		EncodingCascade::Alp { .. } => "alp",
 		EncodingCascade::FsstRowSafe { .. } => "fsst_row_safe",
 	}

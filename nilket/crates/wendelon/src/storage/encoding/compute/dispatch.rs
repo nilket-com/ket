@@ -58,7 +58,8 @@ pub fn evaluate(
 			kernels::delta::evaluate_predicate(encoded_bytes, encoding, atom, coercion)
 		}
 		NativeEvaluationEligibility::Eligible(
-			EncodingComputeEvaluatorKind::Fsst | EncodingComputeEvaluatorKind::FsstRowSafe,
+			EncodingComputeEvaluatorKind::FsstWholeBuffer
+			| EncodingComputeEvaluatorKind::FsstRowSafe,
 		) => evaluate_decode_scalar(encoded_bytes, encoding, cascade, atom, coercion),
 		NativeEvaluationEligibility::Eligible(
 			EncodingComputeEvaluatorKind::RlePlain | EncodingComputeEvaluatorKind::RleBitPacked,
@@ -407,7 +408,9 @@ pub fn evaluator_kind_for_cascade(
 			EncodingLeafCascade::Lz4Frame => None,
 		},
 		EncodingCascade::Delta { .. } => Some(EncodingComputeEvaluatorKind::Delta),
-		EncodingCascade::Fsst { .. } => Some(EncodingComputeEvaluatorKind::Fsst),
+		EncodingCascade::FsstWholeBuffer { .. } => {
+			Some(EncodingComputeEvaluatorKind::FsstWholeBuffer)
+		}
 		EncodingCascade::FsstRowSafe { .. } => Some(EncodingComputeEvaluatorKind::FsstRowSafe),
 		EncodingCascade::Plain | EncodingCascade::Lz4Frame | EncodingCascade::Alp { .. } => None,
 	}
@@ -436,7 +439,7 @@ pub(crate) fn native_evaluation_eligibility(
 	};
 	if matches!(
 		kind,
-		EncodingComputeEvaluatorKind::Fsst | EncodingComputeEvaluatorKind::FsstRowSafe
+		EncodingComputeEvaluatorKind::FsstWholeBuffer | EncodingComputeEvaluatorKind::FsstRowSafe
 	) {
 		if fsst_native_evaluation_eligible(atom, coercion) {
 			return NativeEvaluationEligibility::Eligible(kind);
@@ -472,7 +475,7 @@ fn native_predicate_cascade_eligible(cascade: &EncodingCascade, data_type: &Data
 		EncodingCascade::Delta { .. } | EncodingCascade::Rle { .. } => true,
 		EncodingCascade::Plain
 		| EncodingCascade::Lz4Frame
-		| EncodingCascade::Fsst { .. }
+		| EncodingCascade::FsstWholeBuffer { .. }
 		| EncodingCascade::FsstRowSafe { .. }
 		| EncodingCascade::Alp { .. } => false,
 	}

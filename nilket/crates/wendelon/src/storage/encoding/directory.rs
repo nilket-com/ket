@@ -12,9 +12,12 @@ use crate::schema::{
 	RowGroupIndex, RunCount, SimdPageValueCount, SlabId,
 };
 use crate::storage::columnar::{StorageColumn, TieredRecordId};
+use crate::storage::encoding::cascade::estimator::FsstRowSafeEstimatorRouting;
 use crate::storage::encoding::chunk_layout::{chunk_pad_for_cursor, default_sparse_engaged_key};
 use crate::storage::encoding::compute::{EncodingComputeConfig, evaluator_kind_for_cascade};
-use crate::storage::encoding::select::select_and_encode_buffer_with_value_offsets;
+use crate::storage::encoding::select::{
+	WriterCascadeContext, select_and_encode_buffer_with_value_offsets_and_context,
+};
 use crate::storage::row_group::{
 	BufferPageDirectoryEntry, RecordBodyByteRange, RecordPageDirectory, RowGroupDirectoryEntry,
 	RowGroupWriterConfig,
@@ -54,6 +57,46 @@ pub fn build_encoding_directory_for_ipc_stream(
 	config: &EncodingWriterConfig,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
+	build_encoding_directory_for_ipc_stream_with_fsst_routing(
+		record_id,
+		ipc_bytes,
+		page_directory,
+		batches,
+		config,
+		row_group_config,
+		FsstRowSafeEstimatorRouting::Estimator,
+	)
+}
+
+#[doc(hidden)]
+pub fn build_encoding_directory_for_ipc_stream_exact_fsst_for_bench(
+	record_id: TieredRecordId,
+	ipc_bytes: &[u8],
+	page_directory: &RecordPageDirectory,
+	batches: &[RecordBatch],
+	config: &EncodingWriterConfig,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
+	build_encoding_directory_for_ipc_stream_with_fsst_routing(
+		record_id,
+		ipc_bytes,
+		page_directory,
+		batches,
+		config,
+		row_group_config,
+		FsstRowSafeEstimatorRouting::ExactOnly,
+	)
+}
+
+fn build_encoding_directory_for_ipc_stream_with_fsst_routing(
+	record_id: TieredRecordId,
+	ipc_bytes: &[u8],
+	page_directory: &RecordPageDirectory,
+	batches: &[RecordBatch],
+	config: &EncodingWriterConfig,
+	row_group_config: &RowGroupWriterConfig,
+	fsst_routing: FsstRowSafeEstimatorRouting,
+) -> std::io::Result<(Option<EncodingDirectory>, Vec<AppliedEncodingBuffer>)> {
 	config.validate()?;
 	if !config.enabled {
 		return Ok((None, Vec::new()));
@@ -65,6 +108,10 @@ pub fn build_encoding_directory_for_ipc_stream(
 	let mut cascades = Vec::<EncodingCascade>::new();
 	let mut buffers = Vec::new();
 	let mut applied = Vec::new();
+	let mut writer_context = match fsst_routing {
+		FsstRowSafeEstimatorRouting::Estimator => Some(WriterCascadeContext::default()),
+		FsstRowSafeEstimatorRouting::ExactOnly => None,
+	};
 	for page in &page_directory.buffer_pages {
 		let Some(group) = page_directory
 			.row_groups
@@ -111,13 +158,16 @@ pub fn build_encoding_directory_for_ipc_stream(
 			field.data_type(),
 			group,
 		)?;
+		let context_column = writer_context.as_ref().map(|_| page.ipc_column_ordinal);
 		let select_started = Instant::now();
-		let encoded = select_and_encode_buffer_with_value_offsets(
+		let encoded = select_and_encode_buffer_with_value_offsets_and_context(
 			&ipc_bytes[start..end],
 			field.data_type(),
 			decoded_value_count,
 			config,
 			value_offsets.as_deref(),
+			writer_context.as_mut(),
+			context_column,
 		)?;
 		crate::metrics::global()
 			.observe_storage_l2_encoding_cascade_select(select_started.elapsed());
@@ -1186,7 +1236,7 @@ fn write_cascade(out: &mut Vec<u8>, cascade: &EncodingCascade) -> std::io::Resul
 			write_i128(out, base.get());
 			write_leaf_cascade(out, inner)?;
 		}
-		EncodingCascade::Fsst {
+		EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len,
 		}
 		| EncodingCascade::FsstRowSafe {
@@ -1244,7 +1294,7 @@ fn read_cascade(bytes: &[u8], cursor: &mut usize) -> Result<EncodingCascade, Enc
 			base: BaseValue::new(read_i128(bytes, cursor)?),
 			inner: Box::new(read_leaf_cascade(bytes, cursor)?),
 		}),
-		7 => Ok(EncodingCascade::Fsst {
+		7 => Ok(EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::try_new(read_u64(bytes, cursor)?)
 				.map_err(|_| EncodingRejectCode::PageRangeOverflow)?,
 		}),

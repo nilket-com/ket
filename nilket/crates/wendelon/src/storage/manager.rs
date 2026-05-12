@@ -11171,7 +11171,7 @@ fn build_encoding_compute_phase_b_plan(
 						.ok_or(EncodingComputeFallbackReason::UnsupportedCascade)?;
 					if matches!(
 						evaluator,
-						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer
 							| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
 					) && output_columns.contains(*column_index as u32)
 					{
@@ -11201,7 +11201,7 @@ fn build_encoding_compute_phase_b_plan(
 					}
 					if matches!(
 						evaluator,
-						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+						crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer
 							| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
 					) {
 						let offsets_buffer_ordinal = offsets_buffer_ordinal
@@ -12223,7 +12223,7 @@ fn encoding_compute_predicate_data_type_supported_for_evaluator(
 ) -> bool {
 	if matches!(
 		evaluator,
-		crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst
+		crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer
 			| crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstRowSafe
 	) {
 		return encoding_compute_fsst_predicate_data_type_supported(data_type);
@@ -19202,7 +19202,7 @@ mod tests {
 			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
 			enabled_cascades: [
 				crate::storage::encoding::EncodingCascadeKind::Plain,
-				crate::storage::encoding::EncodingCascadeKind::Fsst,
+				crate::storage::encoding::EncodingCascadeKind::FsstWholeBuffer,
 			]
 			.into_iter()
 			.collect(),
@@ -19247,7 +19247,7 @@ mod tests {
 			.get(value_encoding.cascade_index.get() as usize)
 			.expect("FSST cascade");
 		assert!(
-			matches!(cascade, EncodingCascade::Fsst { .. }),
+			matches!(cascade, EncodingCascade::FsstWholeBuffer { .. }),
 			"{cascade:?}"
 		);
 
@@ -19268,9 +19268,9 @@ mod tests {
 			.map(|group| group.row_group_index)
 			.collect::<Vec<_>>();
 		let mut compute_config = EncodingComputeConfig::default();
-		compute_config
-			.enabled_predicate_evaluators
-			.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst);
+		compute_config.enabled_predicate_evaluators.insert(
+			crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer,
+		);
 		let no_overlap = ColumnOrdinalSet::from_columns([2]);
 		let plan = build_encoding_compute_phase_b_plan(
 			&directory,
@@ -19406,7 +19406,7 @@ mod tests {
 			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
 			enabled_cascades: [
 				crate::storage::encoding::EncodingCascadeKind::Plain,
-				crate::storage::encoding::EncodingCascadeKind::Fsst,
+				crate::storage::encoding::EncodingCascadeKind::FsstWholeBuffer,
 				crate::storage::encoding::EncodingCascadeKind::FsstRowSafe,
 			]
 			.into_iter()
@@ -19527,7 +19527,9 @@ mod tests {
 			&EncodingComputeConfig::default(),
 			0,
 		)
-		.expect("row-safe FSST default-config no-overlap predicate should build encoded Phase B plan");
+		.expect(
+			"row-safe FSST default-config no-overlap predicate should build encoded Phase B plan",
+		);
 		assert_eq!(default_plan.fetches.len(), plan.fetches.len());
 		let overlap = ColumnOrdinalSet::from_columns([1, 2]);
 		assert_eq!(
@@ -19553,9 +19555,9 @@ mod tests {
 		let l2_dir = fresh_dir("fsst-phase-b-l2-l2");
 		let l2: Arc<dyn ObjectStore> = Arc::new(LocalFsObjectStore::new(&l2_dir).unwrap());
 		let mut encoding_compute = EncodingComputeConfig::default();
-		encoding_compute
-			.enabled_predicate_evaluators
-			.insert(crate::storage::encoding::compute::EncodingComputeEvaluatorKind::Fsst);
+		encoding_compute.enabled_predicate_evaluators.insert(
+			crate::storage::encoding::compute::EncodingComputeEvaluatorKind::FsstWholeBuffer,
+		);
 		let mgr = Arc::new(
 			SlabManager::open(SlabManagerConfig {
 				dir: l1_dir,
@@ -19661,7 +19663,7 @@ mod tests {
 			min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
 			enabled_cascades: [
 				crate::storage::encoding::EncodingCascadeKind::Plain,
-				crate::storage::encoding::EncodingCascadeKind::Fsst,
+				crate::storage::encoding::EncodingCascadeKind::FsstWholeBuffer,
 			]
 			.into_iter()
 			.collect(),
@@ -19702,7 +19704,7 @@ mod tests {
 			.get(value_encoding.cascade_index.get() as usize)
 			.expect("FSST url value cascade");
 		assert!(
-			matches!(cascade, EncodingCascade::Fsst { .. }),
+			matches!(cascade, EncodingCascade::FsstWholeBuffer { .. }),
 			"{cascade:?}"
 		);
 

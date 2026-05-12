@@ -42,10 +42,7 @@ impl FsstRowSafeFrame<'_> {
 		self.row_count
 	}
 
-	fn block_seed(
-		&self,
-		block_index: usize,
-	) -> Result<(usize, usize), EncodingComputeRejectCode> {
+	fn block_seed(&self, block_index: usize) -> Result<(usize, usize), EncodingComputeRejectCode> {
 		let (payload_offset, exception_index) = *self
 			.block_offsets
 			.get(block_index)
@@ -193,7 +190,7 @@ pub fn parse_fsst_frame(
 		}
 		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
 	}
-	if buffer_bytes.len() < 5 || &buffer_bytes[..4] != b"WFS1" {
+	if buffer_bytes.len() < 5 || &buffer_bytes[..4] != b"WBFS" {
 		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
 	}
 	let symbol_count = buffer_bytes[4] as usize;
@@ -223,7 +220,7 @@ pub fn parse_fsst_row_safe_frame(
 ) -> Result<FsstRowSafeFrame<'_>, EncodingComputeRejectCode> {
 	let expected_decoded_byte_len = usize::try_from(expected_byte_len.get())
 		.map_err(|_| EncodingComputeRejectCode::KernelDecodedLengthMismatch)?;
-	if buffer_bytes.len() < 13 || &buffer_bytes[..4] != b"WFS2" {
+	if buffer_bytes.len() < 13 || &buffer_bytes[..4] != b"RSFS" {
 		return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
 	}
 	let symbol_count = buffer_bytes[4] as usize;
@@ -306,8 +303,7 @@ pub fn parse_fsst_row_safe_frame(
 		} else {
 			let length = *exception_lengths
 				.get(exc_idx)
-				.ok_or(EncodingComputeRejectCode::KernelDecodedLengthMismatch)?
-				as u64;
+				.ok_or(EncodingComputeRejectCode::KernelDecodedLengthMismatch)? as u64;
 			exc_idx += 1;
 			length
 		};

@@ -69,7 +69,7 @@ fn secondary_index_adr066_fsst_confirm_step_status_is_explicit() {
 		"fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap",
 		"read_projected_record_from_l2",
 		"EncodingComputeEvaluatorKind",
-		"Fsst",
+		"FsstWholeBuffer",
 	] {
 		assert!(
 			has_identifier(&manager, token),

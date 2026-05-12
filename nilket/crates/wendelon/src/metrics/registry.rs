@@ -1696,7 +1696,7 @@ const ENCODING_CASCADE_LABELS: &[&str] = &[
 	"rle",
 	"dictionary",
 	"delta",
-	"fsst",
+	"fsst_whole_buffer",
 	"alp",
 	"fsst_row_safe",
 ];
@@ -1737,7 +1737,7 @@ const ENCODING_COMPUTE_KERNEL_LABELS: &[&str] = &[
 	"dictionary_plain",
 	"dictionary_bit_packed",
 	"delta",
-	"fsst",
+	"fsst_whole_buffer",
 	"fsst_row_safe",
 ];
 const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] = &[
@@ -1745,7 +1745,7 @@ const ENCODING_COMPUTE_CASCADE_LABELS: &[&str] = &[
 	"rle",
 	"dictionary",
 	"delta",
-	"fsst",
+	"fsst_whole_buffer",
 	"fsst_row_safe",
 ];
 const ENCODING_COMPUTE_ROW_KINDS: &[&str] = &["scanned", "selected", "avoided", "materialized"];

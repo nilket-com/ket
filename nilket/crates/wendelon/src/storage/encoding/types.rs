@@ -30,7 +30,7 @@ pub enum EncodingCascadeKind {
 	Rle = 4,
 	Dictionary = 5,
 	Delta = 6,
-	Fsst = 7,
+	FsstWholeBuffer = 7,
 	Alp = 8,
 	FsstRowSafe = 9,
 }
@@ -43,7 +43,7 @@ impl EncodingCascadeKind {
 		Self::Rle,
 		Self::Dictionary,
 		Self::Delta,
-		Self::Fsst,
+		Self::FsstWholeBuffer,
 		Self::Alp,
 		Self::FsstRowSafe,
 	];
@@ -55,7 +55,7 @@ impl EncodingCascadeKind {
 		Self::Rle,
 		Self::Dictionary,
 		Self::Delta,
-		Self::Fsst,
+		Self::FsstWholeBuffer,
 		Self::Alp,
 		Self::FsstRowSafe,
 	];
@@ -68,7 +68,7 @@ impl EncodingCascadeKind {
 			Self::Rle => "rle",
 			Self::Dictionary => "dictionary",
 			Self::Delta => "delta",
-			Self::Fsst => "fsst",
+			Self::FsstWholeBuffer => "fsst_whole_buffer",
 			Self::Alp => "alp",
 			Self::FsstRowSafe => "fsst_row_safe",
 		}
@@ -82,7 +82,7 @@ impl EncodingCascadeKind {
 			"rle" => Some(Self::Rle),
 			"dictionary" => Some(Self::Dictionary),
 			"delta" => Some(Self::Delta),
-			"fsst" => Some(Self::Fsst),
+			"fsst_whole_buffer" => Some(Self::FsstWholeBuffer),
 			"alp" => Some(Self::Alp),
 			"fsst_row_safe" => Some(Self::FsstRowSafe),
 			_ => None,
@@ -128,7 +128,7 @@ pub enum EncodingCascade {
 		base: BaseValue,
 		inner: Box<EncodingLeafCascade>,
 	},
-	Fsst {
+	FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen,
 	},
 	FsstRowSafe {
@@ -151,7 +151,7 @@ impl EncodingCascade {
 			Self::Rle { .. } => EncodingCascadeKind::Rle,
 			Self::Dictionary { .. } => EncodingCascadeKind::Dictionary,
 			Self::Delta { .. } => EncodingCascadeKind::Delta,
-			Self::Fsst { .. } => EncodingCascadeKind::Fsst,
+			Self::FsstWholeBuffer { .. } => EncodingCascadeKind::FsstWholeBuffer,
 			Self::FsstRowSafe { .. } => EncodingCascadeKind::FsstRowSafe,
 			Self::Alp { .. } => EncodingCascadeKind::Alp,
 		}

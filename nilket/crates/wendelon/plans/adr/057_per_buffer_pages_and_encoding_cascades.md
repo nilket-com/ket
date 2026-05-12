@@ -69,14 +69,19 @@ carry empty `page_stats`.
 
 ADR 067 row-canonical FSST is now implemented and promoted.
 The cascade catalog extends by one to nine variants: `Plain`,
-`Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`, `Fsst`,
+`Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`, `FsstWholeBuffer`,
 `Alp`, `FsstRowSafe`. The `FsstRowSafe` cascade introduces the
-`WFS2` on-disk frame (magic `b"WFS2"`, `block_offsets` pair table
+`RSFS` on-disk frame (magic `b"RSFS"`, `block_offsets` pair table
 keyed every 256 rows, per-row `u8` `encoded_lengths` with `255`
 sentinel, `exception_lengths` table, encoded payload) and
-emits buffer-grain (no page emission in V1). The `Fsst` cascade
-shape is unchanged for back-compat; existing `Fsst` buffers
-remain readable indefinitely. The encoding directory format
+emits buffer-grain (no page emission in V1). The `FsstWholeBuffer` cascade
+discriminant is unchanged at 7, but the on-disk magic byte prefix was
+renamed to `b"WBFS"` as part of the naming-prerequisite commit landed
+alongside ADR 068. The pre-rename magic is not accepted by new readers
+per `plans/conventions/no-premature-backward-compat.md` — Wendelon is
+pre-launch, no deployed state, so the magic cut is a clean break, not
+a back-compat seam. Whole-buffer FSST buffers written before the rename
+must be re-encoded under the new magic. The encoding directory format
 version bumped by one for the `FsstRowSafe` variant addition.
 Default enablement is on (`EncodingCascadeKind::DEFAULT_ENABLED`
 includes `FsstRowSafe`) per Phase 7 evidence in
@@ -85,6 +90,18 @@ waived the ≤ 75% writer-cost gate explicitly given the
 transformative read-side wins (3.0–11.7× predicate, 1.8–5.4×
 end-to-end) and the offline nature of writer cost on warehouse
 workloads. Roll-out discipline is reader-before-writer.
+
+ADR 068 sample-based `FsstRowSafe` writer estimator is now
+implemented and promoted. It mitigates ADR 067's ~140%
+writer-cost overhead by early-declining buffers unlikely to
+pass the per-buffer exact size guard. A writer column-cache
+amortizes symbol-training cost across row groups during an
+encoding pass. The estimator achieves ≥ 1.5× writer speedup
+on declined short-string buffers with ≤ 5% overhead on
+plausible winners. It completely eliminates the worst-case
+dual-encode cliffs without risking false declines. The remaining
+partial writer-cost delta will be addressed in a V2 follow-up
+(estimator-authorized emission without the exact guard).
 
 V1 substrate commitments (council-converged):
 
@@ -96,7 +113,7 @@ V1 substrate commitments (council-converged):
   territory and explicitly out of scope here;
 - **closed 8-variant cascade catalog**: `Plain`,
   `Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`,
-  `Fsst`, `Alp`. Cascade composition is one level deep via
+  `FsstWholeBuffer`, `Alp`. Cascade composition is one level deep via
   `Box<EncodingLeafCascade>` (`EncodingLeafCascade ∈ {Plain,
   Lz4Frame, BitPacked}`); arbitrary-depth nesting rejected
   in V1;
@@ -121,7 +138,7 @@ V1 substrate commitments (council-converged):
   serialized;
 - **page emission** required for `BitPacked`, `Rle`,
   `Dictionary` cascades; `Plain`, `Lz4Frame`, `Delta`,
-  `Fsst`, `Alp` carry empty `page_end_offsets` and decode
+  `FsstWholeBuffer`, `Alp` carry empty `page_end_offsets` and decode
   at full-buffer grain in V1;
 - **buffer-relative byte offsets** in `encoded_range` and
   `page_end_offsets` — ADR 056 fetch planner locates the
@@ -298,7 +315,7 @@ The encoding substrate is **identity-axis**:
 ADR 057 ships **only** the Encoding substrate:
 
 1. Closed cascade catalog: `Plain`, `Lz4Frame`, `BitPacked`,
-   `Rle`, `Dictionary`, `Delta`, `Fsst`, `Alp`. Cascade
+   `Rle`, `Dictionary`, `Delta`, `FsstWholeBuffer`, `Alp`. Cascade
    composition one level deep.
 2. `EncodingDirectory` carried in IPC
    `Schema.custom_metadata["storage.encoding_directory"]`
@@ -349,7 +366,7 @@ It deliberately does **not** ship:
 - compaction-time elision of Encoding cascade choices
   (compaction recomputes; never copies input cascades);
 - SIMD-page emission for `Plain`, `Lz4Frame`, `Delta`,
-  `Fsst`, `Alp` cascades (those decode at full-buffer grain
+  `FsstWholeBuffer`, `Alp` cascades (those decode at full-buffer grain
   in V1; future ADR may add page-grain support if bench
   data justifies).
 
@@ -447,7 +464,7 @@ pub enum EncodingCascadeKind {
     Rle        = 4,
     Dictionary = 5,
     Delta      = 6,
-    Fsst       = 7,
+    FsstWholeBuffer = 7,
     Alp        = 8,
 }
 
@@ -468,7 +485,7 @@ pub enum EncodingCascade {
                  inner: Box<EncodingLeafCascade> },
     Delta      { base: BaseValue,
                  inner: Box<EncodingLeafCascade> },
-    Fsst       { symbol_table_byte_len: BufferByteLen },
+    FsstWholeBuffer { symbol_table_byte_len: BufferByteLen },
     Alp        { exponent: Exponent, factor: Factor,
                  exception_count: ExceptionCount,
                  inner: Box<EncodingLeafCascade> },
@@ -477,7 +494,7 @@ pub enum EncodingCascade {
 
 Composition rules pinned in V1:
 
-- `Plain`, `Lz4Frame`, and `Fsst` are leaf-only (no inner
+- `Plain`, `Lz4Frame`, and `FsstWholeBuffer` are leaf-only (no inner
   parameter).
 - `BitPacked` is a leaf with `{ bits, base }` parameters;
   the `base` field captures Frame-of-Reference (a constant
@@ -500,7 +517,7 @@ Cascade applicability by Arrow type (V1):
 - **Signed/unsigned integers / Date / Timestamp**: `Plain`,
   `Lz4Frame`, `BitPacked`, `Rle`, `Dictionary`, `Delta`.
 - **UTF-8 / Binary** (offsets + values buffers): `Plain`,
-  `Lz4Frame`, `Dictionary`, `Fsst`. Dictionary indices use
+  `Lz4Frame`, `Dictionary`, `FsstWholeBuffer`. Dictionary indices use
   `BitPacked` inner.
 - **Float32 / Float64**: `Plain`, `Lz4Frame`, `Alp`.
 - **Storage-only synthetic columns** (`__row_hlc__`,
@@ -596,7 +613,7 @@ Layout invariants enforced at parse time:
   `encoded_range.len`;
 - page offsets cover `0..decoded_value_count` exactly for
   page-capable buffers (`BitPacked`, `Rle`, `Dictionary`);
-- `Plain`, `Lz4Frame`, `Delta`, `Fsst`, `Alp` buffers carry
+- `Plain`, `Lz4Frame`, `Delta`, `FsstWholeBuffer`, `Alp` buffers carry
   empty `page_end_offsets` (architectural guard);
 - cascade composition is one level deep;
 - cascade parameters validate (`BitsPerValue` 1..=64,
@@ -707,7 +724,7 @@ for each (row_group, column, buffer):
             cascade = Lz4Frame
     elif column.dtype is UTF-8 / Binary:
         if sample.fsst_compressible:
-            cascade = Fsst { symbol_table_byte_len }
+            cascade = FsstWholeBuffer { symbol_table_byte_len }
         elif decoded_value_count <= target_simd_page_values
              and sample.distinct_count <= 1024
              and sample.avg_length < 64:
@@ -735,7 +752,7 @@ an explicit denser LZ4 fallback mode.
 Phase 10 also resolves the low-cardinality UTF-8 default:
 variable-width `Dictionary` is selected only when the buffer fits
 within one `target_simd_page_values` page. Multi-page variable-width
-buffers use `Fsst` when the sample is compressible and otherwise fall
+buffers use `FsstWholeBuffer` when the sample is compressible and otherwise fall
 through to the normal `Plain` / `Lz4Frame` fallback. This keeps
 `Dictionary` available for small dense buffers while avoiding the
 multi-page writer-cost spike the representative ablation exposed.
@@ -890,7 +907,8 @@ Pinned label enumerations:
 
 ```text
 cascade        = plain | lz4_frame | bit_packed | rle
-              | dictionary | delta | fsst | alp
+              | dictionary | delta | fsst_whole_buffer | alp
+              | fsst_row_safe
 reason         = reader_disabled | directory_missing
               | unsupported_arrow_layout
               | too_many_pages | too_many_bytes
@@ -1027,11 +1045,11 @@ list pinned in Phase 11 of the impl plan):
     `0..decoded_value_count` exactly for buffers with
     pages; empty entirely for buffers without pages — not
     partially populated.
-28. `Plain`, `Lz4Frame`, `Delta`, `Fsst`, `Alp` cascade
+28. `Plain`, `Lz4Frame`, `Delta`, `FsstWholeBuffer`, `Alp` cascade
     buffers carry empty `page_end_offsets` (V1 page-emission
     scope).
 29. No inline FSST symbol-table sharing across separate
-    buffer entries (each Fsst cascade carries its own
+    buffer entries (each FsstWholeBuffer cascade carries its own
     symbol table inline).
 30. Materializer code path does not call back into PBC
     executor or AGG fold.
@@ -1085,8 +1103,8 @@ identified.
   non-zero base — the `base` field IS the FOR offset.
 
 Council convergence on the 8-variant set is council
-median of Codex's iter 1 / 2 catalogs and Gemini's. Fsst
-and Alp are kept (council majority); their substantial
+median of Codex's iter 1 / 2 catalogs and Gemini's.
+FsstWholeBuffer and Alp are kept (council majority); their substantial
 implementation surface (~700 / ~500 LOC) is the price of
 covering high-cardinality strings and floats in V1.
 
@@ -1236,7 +1254,7 @@ because it's empirically grounded.
   time per record.
 - **CDC paths unaffected** at contract level; catchup
   decode cost rises by Phase D per emitted version entry.
-- **Variable-width string encodings** (Dictionary, Fsst)
+- **Variable-width string encodings** (Dictionary, FsstWholeBuffer)
   are a correctness hotspot — offsets, dict order, null
   semantics, FSST symbol tables must round-trip
   byte-identically at the Arrow level. Heavy test
@@ -1285,7 +1303,7 @@ because it's empirically grounded.
 - **Include `FrameOfReference` cascade variant.** Iter 2
   had this; council convergence drops it as subsumed by
   `BitPacked { bits, base }` with non-zero base.
-- **SIMD page emission for `Delta`, `Fsst`, `Alp` in V1.**
+- **SIMD page emission for `Delta`, `FsstWholeBuffer`, `Alp` in V1.**
   Deferred — those cascades are not naturally page-grain
   decodable without additional metadata; future ADR may
   add page-grain support if bench data justifies.
@@ -1334,7 +1352,7 @@ Bench-resolved (Phase 10):
    high-entropy buffers. Phase 10 chooses `Plain` by default
    and leaves `Lz4Frame` as the explicit fallback when `Plain`
    is removed from `enabled_cascades`.
-7. **Whether `Delta`, `Fsst`, `Alp` need SIMD-page
+7. **Whether `Delta`, `FsstWholeBuffer`, `Alp` need SIMD-page
    emission immediately** or can stay full-buffer in V1.
 8. **Directory size pressure.** ADR 056 directories are
    already ~22–26% of the 64 KiB initial probe; Encoding
@@ -1362,7 +1380,7 @@ Architectural (deferred to follow-up ADRs):
 15. **SIMD-block-grain page directory** (64-value pages
     instead of 1024-value). Defer until bench data
     justifies the metadata expansion.
-16. **Page emission for Delta / Fsst / Alp.**
+16. **Page emission for Delta / FsstWholeBuffer / Alp.**
 
 ## Forward-compatibility analysis
 
@@ -1439,7 +1457,7 @@ itself does not touch wire surface.
 13. **Adaptive cascade re-selection.**
 14. **SIMD-block-grain page directory** (64-value
     pages).
-15. **Page emission for Delta / Fsst / Alp.**
+15. **Page emission for Delta / FsstWholeBuffer / Alp.**
 16. **ML-based cascade selection.**
 
 ## References

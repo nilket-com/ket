@@ -45,7 +45,7 @@ fn encoding_compute_config_defaults_are_locked() {
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryPlain));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::DictionaryBitPacked));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Delta));
-	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::Fsst));
+	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::FsstWholeBuffer));
 	assert!(config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::FsstRowSafe));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RlePlain));
 	assert!(!config.predicate_evaluator_enabled(EncodingComputeEvaluatorKind::RleBitPacked));
@@ -186,10 +186,10 @@ fn evaluator_kind_for_cascade_routes_unsupported_inners_to_dense_fallback() {
 	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Plain), None);
 	assert_eq!(evaluator_kind_for_cascade(&EncodingCascade::Lz4Frame), None);
 	assert_eq!(
-		evaluator_kind_for_cascade(&EncodingCascade::Fsst {
+		evaluator_kind_for_cascade(&EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		}),
-		Some(EncodingComputeEvaluatorKind::Fsst)
+		Some(EncodingComputeEvaluatorKind::FsstWholeBuffer)
 	);
 	assert_eq!(
 		evaluator_kind_for_cascade(&EncodingCascade::FsstRowSafe {
@@ -347,7 +347,7 @@ fn fsst_predicate_evaluator_matches_decoded_string_oracle() {
 		b"/checkout/confirm",
 	];
 	let (decoded, offsets) = variable_width_payload(values);
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -455,7 +455,7 @@ fn fsst_length_prefilter_records_zero_byte_comparisons_for_disjoint_lengths() {
 	let data_type = DataType::Utf8;
 	let values: &[&[u8]] = &[b"alpha", b"beta", b"gamma", b"delta"];
 	let (decoded, offsets) = variable_width_payload(values);
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -509,7 +509,7 @@ fn fsst_streaming_reader_handles_symbol_crossing_row_boundary() {
 	let data_type = DataType::Utf8;
 	let values: &[&[u8]] = &[b"A", b"B", b"AB", b"AB", b"AB"];
 	let (decoded, offsets) = variable_width_payload(values);
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -564,7 +564,7 @@ fn fsst_offset_corruption_fails_closed() {
 	let data_type = DataType::Utf8;
 	let values: &[&[u8]] = &[b"alpha", b"beta", b"gamma"];
 	let (decoded, mut offsets) = variable_width_payload(values);
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -622,9 +622,9 @@ fn fsst_malformed_frames_fail_closed() {
 	let offset_bytes = offsets_i32_bytes(&[0, 1]);
 	for frame in [
 		b"BAD!".to_vec(),
-		b"WFS1\x01A".to_vec(),
-		b"WFS1\x00\x80".to_vec(),
-		b"WFS1\x00\xff".to_vec(),
+		b"WBFS\x01A".to_vec(),
+		b"WBFS\x00\x80".to_vec(),
+		b"WBFS\x00\xff".to_vec(),
 	] {
 		let encoding = fsst_test_encoding(1, 1, frame.len());
 		assert_eq!(
@@ -650,7 +650,7 @@ fn fsst_large_and_binary_types_match_decoded_oracle() {
 	let (decoded, offsets) = variable_width_payload(values);
 	let literal = ColumnPredicateLiteralV1::Str(b"alpha".to_vec());
 	for data_type in [DataType::LargeUtf8, DataType::Binary, DataType::LargeBinary] {
-		let cascade = EncodingCascade::Fsst {
+		let cascade = EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		};
 		let encoded = encode_buffer(
@@ -703,7 +703,7 @@ fn fsst_decodes_encoded_offsets_buffer() {
 	let data_type = DataType::Utf8;
 	let values: &[&[u8]] = &[b"alpha", b"beta", b"alpha"];
 	let (decoded, offsets) = variable_width_payload(values);
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(

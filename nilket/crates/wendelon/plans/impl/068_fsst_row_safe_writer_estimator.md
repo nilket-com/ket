@@ -35,17 +35,26 @@ Inherits substrate:
 
 Council-converged 2026-05-10 across Claude / Codex /
 Gemini after eight iterations under `plans/wip/`.
-Entering Phase 0 audit + calibration.
+Phase 0 found symbol-table training above the P5
+threshold. Iter 9 / 10 amended the plan to writer
+column-cache amortization:
+column-scoped amortization across row groups within
+one encoding-directory writer pass.
 
 The plan is sequenced so the cost-free metadata floor
 (Phase 2) lands before any sampling or training work
-(Phase 3). The decline mechanisms ship in escalating-
-work order so the cheapest exact arm is in place
-before the heavier sample-encode arm gates land.
-Architecture guards (Phase 5) lock down that the
-estimator's `Decline` branches cannot reach
-`FsstRowSafe` emission before bench measurement
-begins.
+(Phase 3). Writer column-cache adds a crate-private
+`WriterCascadeContext` whose FSST symbol-table cache
+is keyed by `IpcColumnOrdinal` and scoped to one
+`build_encoding_directory_for_ipc_stream` invocation.
+Architecture guards (Phase 5) lock down that cached
+tables are decline-only evidence and cannot reach
+`FsstRowSafe` emission without a current-buffer exact
+guard. Current production routing engages the estimator
+only on the directory-writer column-cache path where both
+`WriterCascadeContext` and `IpcColumnOrdinal` are
+available; no-context single-buffer selection remains
+exact.
 
 ## Implementation contract
 
@@ -101,22 +110,35 @@ begins.
   `RequireExactGuard` and the existing dual-encode
   path runs unchanged.
 
+- Writer column-cache state is crate-private and writer-pass
+  scoped. `build_encoding_directory_for_ipc_stream`
+  creates a fresh `WriterCascadeContext` for each
+  invocation. The stabilization loop in
+  `encode_row_group_batches_with_directory` naturally
+  drops the context between iterations because it calls
+  the directory builder again after synthetic metadata
+  bytes change.
+
 - Phase 1-6 staging uses crate-private
   `FsstRowSafeEstimatorRouting { ExactOnly,
   Estimator }`. Production
-  `select_fsst_candidate` calls
-  `select_fsst_candidate_with_routing(...,
-  FsstRowSafeEstimatorRouting::ExactOnly)` during
-  Phase 1-6. Tests and benches call with either
-  routing for comparison. Phase 7 promotion is a
-  single commit that flips the production call site
-  to `FsstRowSafeEstimatorRouting::Estimator`. No
-  operator-visible config field, no `TOML` knob, no
+  `select_fsst_candidate` calls the exact route during
+  Phase 1-6. Tests and benches call with either routing
+  for comparison. The writer column-cache production promotion routes
+  only context-bearing directory-writer calls to
+  `FsstRowSafeEstimatorRouting::Estimator`; no-context
+  calls stay on `FsstRowSafeEstimatorRouting::ExactOnly`.
+  No operator-visible config field, no `TOML` knob, no
   Cargo feature.
 
 - Estimator-authorized `FsstRowSafe`-only emission
   (option 2) is out of scope. Architecture guards
   enforce it.
+
+- Cached-table `RequireExactGuard` never carries
+  exact lengths. Only symbol tables trained on the
+  current buffer can produce exact lengths that allow
+  `FsstRowSafe` selection.
 
 - No new on-disk structure, format-version bump,
   `EncodingCascade` / `EncodingComputeEvaluatorKind`
@@ -165,10 +187,11 @@ items. No estimator code lands in this phase.
   the estimator is trying to avoid). If training
   alone exceeds 25 % of full-buffer greedy encode
   wall-clock on representative warehouse fixtures,
-  council reconvenes (P5). Training will naturally
-  dominate estimator wall-clock since the estimator
-  encodes only a small sample; the gate denominator
-  is the avoided cost, not estimator wall-clock.
+  council reconvenes (P5). Phase 0 hit this branch:
+  iter 10 selected writer column-cache amortization. The
+  gate denominator remains full-buffer greedy encode
+  wall-clock; the numerator becomes the amortized
+  training share per warm evaluated buffer.
 - Pick estimator module location: `cascade/estimator.rs`
   sibling vs co-located in `select.rs` (P6).
 - Pick bench-internal counter shape: `AtomicUsize` vs
@@ -229,11 +252,19 @@ work.
   usize) -> Option<usize>` per ADR §"V1 contract
   summary §1". Uses checked arithmetic; returns
   `None` on overflow.
+- Add
+  `fsst_row_safe_metadata_payload_floor_bytes(row_count,
+  decoded_plaintext_len, value_offsets) -> Option<usize>`.
+  This cost-free helper adds a one-byte minimum payload
+  for each non-empty row. It is exact for row-safe FSST
+  and catches short non-empty rows before training or
+  sampling.
 - In `FsstRowSafeEstimatorRouting::Estimator`:
-  compute the floor; if it exceeds
+  compute the floors; if either exceeds
   `decoded_plaintext_len`, return
-  `Decline(MetadataFloorExceedsPlaintext)`. `None`
-  routes to `RequireExactGuard`.
+  `Decline(MetadataFloorExceedsPlaintext)` or
+  `Decline(MetadataPayloadFloorExceedsPlaintext)`.
+  `None` routes to `RequireExactGuard`.
 - Add focused unit tests for boundary conditions
   (row counts at 0, 1, 255, 256, 257, very large).
 
@@ -258,7 +289,17 @@ trained metadata alone disqualifies row-safe FSST.
   existing ADR 066 / 067 training entry points;
   the codec boundary may need a small refactor to
   expose them at the estimator's call site.
-- After training, before sampling: compute the
+- Add `WriterCascadeContext` and
+  `ColumnFsstSymbolTableCache` as crate-private
+  selection types. The context is keyed by
+  `IpcColumnOrdinal` and is passed only by the
+  encoding-directory writer path.
+- Cold writer-column-cache misses run the current-buffer exact
+  route and opportunistically warm or refresh the
+  column cache from symbol tables already trained for
+  that exact guard. They do not train solely for
+  priming.
+- After current-buffer training, before sampling: compute the
   trained metadata floor with the actual full-
   buffer-trained row-safe FSST symbol count and
   zero exceptions. If it exceeds
@@ -271,7 +312,16 @@ trained metadata alone disqualifies row-safe FSST.
   producing on-disk bytes.
 - If P4 confirmed table reuse, plumb the trained
   symbol tables into a private reusable handle
-  passed through `RequireExactGuard`.
+  passed through `RequireExactGuard` only when the
+  tables were trained on the current buffer. Warm writer-column-cache
+  cache hits that return `RequireExactGuard` must
+  fall back to the current-buffer exact route.
+  Cross-buffer cached tables must not produce trained-
+  floor or sample-confidence declines; a 1M weak-
+  compression run showed cross-buffer table-dependent
+  declines can lose exact row-safe winners. Warm cached
+  evidence is therefore cost-free-floor-only until a
+  future ADR proves a safe table-dependent rule.
 
 ### Phase 4 — Projection logic and sample-confidence decline
 
@@ -326,6 +376,11 @@ estimator emission of `FsstRowSafe` cannot leak.
     `FsstRowSafeEstimatorDecision`,
     `FsstRowSafeEstimatorDecline`, or
     `FsstRowSafeEstimatorStats`.
+  - `WriterCascadeContext` and
+    `ColumnFsstSymbolTableCache` remain
+    crate-private.
+  - Cached-table estimator paths cannot return
+    current-buffer exact lengths.
   - `EncodingWriterConfig` has no
     `estimator_enabled` field (or any equivalent
     name).
@@ -354,6 +409,11 @@ estimator emission of `FsstRowSafe` cannot leak.
   buffer twice in the same process and across two
   process invocations; assert byte-equal cascade
   selection and emitted bytes for both routings.
+- **Writer column-cache provenance** — assert that a cold exact
+  route warms the `IpcColumnOrdinal` cache, and that
+  a warm cached-table `RequireExactGuard` does not
+  expose exact lengths or emit `FsstRowSafe` without
+  re-running current-buffer exact selection.
 - **Decline-arm coverage** — synthesize fixtures
   that fire each of the four
   `FsstRowSafeEstimatorDecline` variants exactly,
@@ -379,18 +439,20 @@ Lives in
 `plans/impl/068_fsst_row_safe_writer_estimator_bench_results.md`.
 
 - Extend `benches/encoding_compute.rs` to invoke
-  `select_fsst_candidate_with_routing` with both
-  routings on each fixture × tier and record:
+  the directory writer path with writer-column-cache row-group-count
+  tiers (1 / 2 / 4 / 8 / 16) and both exact /
+  estimator routings on each fixture × tier. Record:
   - per-buffer cascade choice;
   - per-buffer on-disk bytes;
-  - writer wall-clock per buffer (split: training
-    nanos + sampled-encode nanos + dual-encode
-    nanos + total);
+  - cache misses, cache hits, and warm-hit decline
+    rate;
+  - writer wall-clock per buffer (split where the
+    harness can attribute it: cold exact, warm
+    estimator, fallback exact, total);
   - decline reason (when `Decline`);
-  - whether the dual-encode reused trained tables
-    (when `RequireExactGuard` and P4 was
-    confirmed).
-- Fixture matrix at 8K / 65K / 1M rows:
+  - whether `RequireExactGuard` came from current-
+    buffer tables or cross-buffer cached tables.
+- Fixture matrix by row-group-count tier:
   - **Warehouse winners (zero-false-decline gate):**
     URL equality, URL `InList`, long repeated pair,
     weak-compression warehouse diagnostic, free-
@@ -428,11 +490,14 @@ Lives in
 If all hard gates (1-7) pass and the soft gate (8)
 either passes or is explicitly justified:
 
-- **Promotion commit (single commit):** flip the
-  production `select_fsst_candidate` call site to
-  `FsstRowSafeEstimatorRouting::Estimator`. The
-  routing enum stays in the codebase for
-  bench/test comparison after promotion.
+- **Promotion commit (single commit):** route the
+  production directory-writer column-cache path through
+  `FsstRowSafeEstimatorRouting::Estimator` when a
+  `WriterCascadeContext` and `IpcColumnOrdinal` are
+  present. No-context selection remains exact unless a
+  separate evidence pass proves cold single-buffer
+  overhead is acceptable. The routing enum stays in the
+  codebase for bench/test comparison after promotion.
 - Amend `plans/adr/067_row_canonical_fsst.md`
   §"Status" to record the new writer-cost delta and
   the closing of the V2 follow-up.
@@ -459,7 +524,10 @@ Implementation (in scope for this ADR):
 
 - `src/storage/encoding/select.rs` — hook site,
   `select_fsst_candidate_with_routing` wrapper,
-  `FsstRowSafeEstimatorRouting`.
+  `FsstRowSafeEstimatorRouting`, writer column-cache
+  `WriterCascadeContext`, and column-cache plumbing.
+- `src/storage/encoding/directory.rs` — writer-pass
+  context lifetime for encoding-directory builds.
 - `src/storage/encoding/cascade/estimator.rs` (new,
   pending P6) — estimator types, sampling helper,
   metadata helpers, projection arithmetic, decision
@@ -494,18 +562,19 @@ commit):
   The main new risk per the opportunity-loss
   framing. *Mitigations:* conservative V1 safety
   multiplier (1.20×); zero false-decline hard gate
-  on warehouse winners; cost-free metadata floor
+  on warehouse winners; cost-free row-safe floor
   avoids any sampling work on the most adversarial
   workloads (cheapest first cut); Phase 0 sample-
   shape pick tunes projection error before Phase 1
   hardens.
 - **R2 — Estimator overhead exceeds savings.**
   *Mitigations:* ≤ 5 % plausible-winner overhead
-  hard gate; symbol-table reuse on
-  `RequireExactGuard` (P4) amortizes training cost
-  on the winner path; trained metadata-floor arm
-  skips sample-encode CPU on a separate class of
-  losers.
+  hard gate; cost-free row-safe floor avoids current-
+  buffer training on short-row decline checks; warm
+  `RequireExactGuard` still retrains the current buffer
+  and is measured explicitly; current-buffer trained
+  metadata-floor arm skips sample-encode CPU on a
+  separate class of losers.
 - **R3 — Trained-floor arithmetic drifts from frame
   layout.** A rename of an ADR 067 frame field could
   break the metadata floor's exactness silently.
@@ -527,26 +596,29 @@ commit):
   encoder which already enforces deterministic
   output.
 - **R5 — Symbol-table training cost is the new
-  floor.** Even on declined buffers the estimator
-  trains full-buffer symbol tables. *Mitigations:*
-  Phase 0 measures training cost against the cost it
-  is replacing — full-buffer greedy encode wall-clock
-  (P5); if training alone exceeds 25 % of full-buffer
-  greedy encode wall-clock, council reconvenes; cost-
-  free metadata-floor arm catches the most
-  adversarial workloads before training even runs.
+  floor.** Phase 0 confirmed per-buffer training
+  cannot meet P5. *Mitigations:* writer column-cache keeps
+  the writer-context routing surface scoped to one
+  writer pass; cold misses warm the cache from current-
+  buffer exact work only; cross-buffer cached tables no
+  longer drive table-dependent declines after 1M false-
+  decline evidence; cost-free row-safe floor catches the
+  most adversarial workloads before training even runs.
 
 ## Definition of done
 
 - All eight Phase 0 pins recorded in the bench-
   results artifact.
+- Writer column-cache lifetime, column keying, and exact-length
+  provenance covered by focused tests and architecture
+  guards.
 - All four `FsstRowSafeEstimatorDecline` variants
   exercised by focused tests.
 - All seven hard promotion gates passing.
 - Soft mixed-workload gate either passing or
   explicitly justified in the artifact.
-- Promotion commit lands flipping production to
-  `FsstRowSafeEstimatorRouting::Estimator`.
+- Promotion commit lands routing production directory-writer
+  column-cache calls to `FsstRowSafeEstimatorRouting::Estimator`.
 - ADR 067 §"Status" and ADR 057 §"Where we are"
   amended with the new writer-cost delta.
 - Roadmap entry #24 updated to record promotion.

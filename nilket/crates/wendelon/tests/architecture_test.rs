@@ -3520,7 +3520,7 @@ fn test_adr057_encoding_guards() {
 		"Rle = 4",
 		"Dictionary = 5",
 		"Delta = 6",
-		"Fsst = 7",
+		"FsstWholeBuffer = 7",
 		"Alp = 8",
 		"FsstRowSafe = 9",
 		"pub const ALL: [Self; 9]",
@@ -4453,14 +4453,18 @@ fn test_adr066_fsst_evaluator_guards() {
 	let encoding_types =
 		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
 
-	for required in ["Fsst = 7", "Self::Fsst", "\"fsst\" => Some(Self::Fsst)"] {
+	for required in [
+		"FsstWholeBuffer = 7",
+		"Self::FsstWholeBuffer",
+		"\"fsst_whole_buffer\" => Some(Self::FsstWholeBuffer)",
+	] {
 		if !compute_types.contains(required) {
 			violations.push(format!(
 				"src/storage/encoding/compute/types.rs: missing ADR 066 token {required}"
 			));
 		}
 	}
-	if compute_types.contains("EncodingComputeEvaluatorKind::Fsst,")
+	if compute_types.contains("EncodingComputeEvaluatorKind::FsstWholeBuffer,")
 		&& compute_types.contains("enabled_predicate_evaluators: EncodingComputeEvaluatorKind::ALL")
 	{
 		violations.push(
@@ -4482,7 +4486,8 @@ fn test_adr066_fsst_evaluator_guards() {
 		}
 	}
 	for required in [
-		"EncodingCascade::Fsst { .. } => Some(EncodingComputeEvaluatorKind::Fsst)",
+		"EncodingCascade::FsstWholeBuffer { .. } =>",
+		"Some(EncodingComputeEvaluatorKind::FsstWholeBuffer)",
 		"evaluate_fsst_predicate",
 		"PredicateAtomOp::Eq | PredicateAtomOp::Neq | PredicateAtomOp::InList",
 		"string_like_data_type_supported",
@@ -4498,7 +4503,7 @@ fn test_adr066_fsst_evaluator_guards() {
 		"FsstOffsets",
 		"offsets_buffer_ordinal",
 		"output_columns.contains(*column_index as u32)",
-		"EncodingComputeEvaluatorKind::Fsst",
+		"EncodingComputeEvaluatorKind::FsstWholeBuffer",
 		"evaluate_fsst_predicate(",
 	] {
 		if !manager.contains(required) {
@@ -4519,18 +4524,18 @@ fn test_adr066_fsst_evaluator_guards() {
 			));
 		}
 	}
-	for required in ["\"fsst\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
+	for required in ["\"fsst_whole_buffer\"", "ENCODING_COMPUTE_KERNEL_LABELS"] {
 		if !metrics.contains(required) {
 			violations.push(format!(
 				"src/metrics/registry.rs: missing ADR 066 metric token {required}"
 			));
 		}
 	}
-	if !encoding_types.contains("Fsst {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,")
-		|| !encoding_types.contains("Fsst = 7")
+	if !encoding_types.contains("FsstWholeBuffer {\n\t\tsymbol_table_byte_len: RecordBodyByteLen,")
+		|| !encoding_types.contains("FsstWholeBuffer = 7")
 	{
 		violations.push(
-			"src/storage/encoding/types.rs: ADR 057 FSST cascade layout must remain unchanged"
+			"src/storage/encoding/types.rs: ADR 068 prerequisite must keep whole-buffer FSST discriminant/layout stable"
 				.to_string(),
 		);
 	}
@@ -4599,7 +4604,7 @@ fn test_adr067_row_safe_fsst_guards() {
 	for required in [
 		"encode_fsst_row_safe_bytes",
 		"decode_fsst_row_safe_bytes",
-		"b\"WFS2\"",
+		"b\"RSFS\"",
 		"value_offsets.windows(2)",
 		"row_count as u32).to_le_bytes()",
 		"FSST_ROW_SAFE_BLOCK_ROWS: usize = 256",
@@ -4610,7 +4615,7 @@ fn test_adr067_row_safe_fsst_guards() {
 	] {
 		if !codec.contains(required) {
 			violations.push(format!(
-				"src/storage/encoding/cascade/codec.rs: missing ADR 067 WFS2 token {required}"
+				"src/storage/encoding/cascade/codec.rs: missing ADR 067 RSFS token {required}"
 			));
 		}
 	}
@@ -4719,6 +4724,200 @@ fn test_adr067_row_safe_fsst_guards() {
 	assert!(
 		violations.is_empty(),
 		"ADR 067 row-safe FSST invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr068_fsst_row_safe_estimator_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let estimator =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/estimator.rs")).unwrap();
+	let select = fs::read_to_string(manifest_dir.join("src/storage/encoding/select.rs")).unwrap();
+	let codec =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/cascade/codec.rs")).unwrap();
+	let directory =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/directory.rs")).unwrap();
+	let encoding_compute_bench =
+		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+
+	for required in [
+		"pub(crate) enum FsstRowSafeEstimatorDecision",
+		"pub(crate) enum FsstRowSafeEstimatorDecline",
+		"pub(crate) enum FsstRowSafeEstimatorRouting",
+		"pub(crate) struct FsstRowSafeEstimatorStats",
+		"pub(crate) enum FsstRowSafeEstimatorTableSource",
+		"FsstRowSafeEstimatorTableSource::CrossBufferCached => None",
+		"pub(crate) fn estimate_fsst_row_safe_cost_free_decline",
+		"pub(crate) fn estimate_fsst_row_safe_with_cached_tables",
+		"MetadataFloorExceedsPlaintext",
+		"MetadataPayloadFloorExceedsPlaintext",
+		"TrainedMetadataFloorExceedsPlaintext",
+		"SampledRowSafeExceedsPlaintext",
+		"SampledRowSafeExceedsWholeBufferGuard",
+		"FsstRowSafeEstimatorSampleShape::DeterministicSpread",
+		"deterministic_spread_sample_shape_bounds_prefix_projection_error",
+		"CROSS_BUFFER_SAMPLE_FLOOR_PRESSURE_DENOMINATOR",
+		"fsst_symbol_training_cost_probe",
+		"cached_tables_do_not_decline_from_cross_buffer_sample",
+		"EARLY_DECLINE_SAFETY_MULTIPLIER_NUMERATOR: usize = 6",
+		"EARLY_DECLINE_SAFETY_MULTIPLIER_DENOMINATOR: usize = 5",
+	] {
+		if !estimator.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/estimator.rs: missing ADR 068 token {required}"
+			));
+		}
+	}
+	for required in [
+		"fsst_row_safe_metadata_floor_bytes",
+		"fsst_row_safe_metadata_payload_floor_bytes",
+		"fsst_row_safe_metadata_bytes",
+		"FSST_ROW_SAFE_FIXED_HEADER_BYTES: usize = 13",
+		"train_fsst_whole_buffer_symbol_table",
+		"train_fsst_row_safe_symbol_table",
+		"fsst_whole_buffer_encoded_len_with_table",
+		"fsst_row_safe_encoded_len_with_table",
+	] {
+		if !codec.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/codec.rs: missing ADR 068 codec token {required}"
+			));
+		}
+	}
+	for required in [
+		"select_fsst_candidate_with_routing",
+		"pub(crate) fn select_fsst_candidate_with_routing",
+		"pub(crate) fn select_fsst_candidate_with_routing_and_context",
+		"pub(crate) struct WriterCascadeContext",
+		"pub(crate) struct ColumnFsstSymbolTableCache",
+		"pub(crate) fn select_and_encode_buffer_with_value_offsets_and_context",
+		"FsstRowSafeEstimatorRouting::Estimator",
+		"FsstRowSafeEstimatorRouting::ExactOnly",
+		"writer_context.is_some() && ipc_column_ordinal.is_some()",
+		"FsstRowSafeEstimatorDecision::Decline(_) => {}",
+		"FsstRowSafeExactLengths::CurrentBuffer",
+		"fsst_writer_context_warms_column_cache_from_exact_route",
+		"row_safe_exact_guard(",
+		"fsst_estimator_route_emits_exact_bytes_on_warehouse_winner_matrix_8k",
+		"fsst_estimator_route_emits_exact_bytes_on_warehouse_winner_matrix_all_tiers",
+		"fsst_estimator_route_emits_byte_identical_predicate_masks_on_warehouse_winner_matrix_8k",
+		"fsst_estimator_route_emits_byte_identical_predicate_masks_on_warehouse_winner_matrix_all_tiers",
+	] {
+		if !select.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: missing ADR 068 selection token {required}"
+			));
+		}
+	}
+	for required in [
+		"WriterCascadeContext::default()",
+		"build_encoding_directory_for_ipc_stream_exact_fsst_for_bench",
+		"FsstRowSafeEstimatorRouting::ExactOnly",
+		"select_and_encode_buffer_with_value_offsets_and_context",
+		"writer_context.as_mut()",
+		"context_column",
+	] {
+		if !directory.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/directory.rs: missing ADR 068 writer column-cache context token {required}"
+			));
+		}
+	}
+	for required in [
+		"fn fsst_log_line_eq_5p_fixture",
+		"fn fsst_metadata_floor_decline_fixture",
+		"fsst_metadata_floor_decline_diag",
+		"fsst_log_line_eq_5p",
+		"fsst_row_safe_log_line_eq_5p",
+		"encoding_compute_bench scenario=fsst_row_safe_writer route={}",
+		"encoding_compute_bench scenario=fsst_row_safe_writer_column_cache_matrix",
+		"--writer-column-cache-only",
+		"--writer-column-cache-rows=",
+		"--writer-column-cache-fixture=",
+		"--fsst-writer-only",
+		"selected_writer_ms",
+		"selected_vs_dual_cpu_micros",
+		"exact_writer_ms",
+		"writer_vs_exact_cpu_micros",
+		"exact_vs_writer_cpu_micros",
+	] {
+		if !encoding_compute_bench.contains(required) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: missing ADR 068 free-text/log-line fixture token {required}"
+			));
+		}
+	}
+	for forbidden in [
+		"AtomicUsize",
+		"fsst_row_safe_estimator_total",
+		"fsst_row_safe_estimator_decline",
+		"--d2-",
+		"d2_only",
+		"d2_fixture",
+		"d2_rows",
+		"prepare_d2",
+		"D2_",
+		"fsst_row_safe_writer_d2_matrix",
+	] {
+		if encoding_compute_bench.contains(forbidden) {
+			violations.push(format!(
+				"benches/encoding_compute.rs: ADR 068 bench diagnostics must stay stdout-row based and semantic-named, found forbidden token {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub enum FsstRowSafeEstimatorRouting",
+		"pub enum FsstRowSafeEstimatorDecision",
+		"pub enum FsstRowSafeEstimatorDecline",
+		"pub enum FsstRowSafeEstimatorTableSource",
+		"pub struct FsstRowSafeEstimatorStats",
+		"pub sampled_rows",
+		"pub estimated_fsst_whole_buffer_encoded_len",
+		"pub estimated_fsst_row_safe_encoded_len",
+		"pub decision",
+		"pub payload_len",
+		"pub exception_count",
+	] {
+		if estimator.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/cascade/estimator.rs: ADR 068 estimator type escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"pub struct WriterCascadeContext",
+		"pub struct ColumnFsstSymbolTableCache",
+		"pub fsst_tables_by_column",
+		"pub row_safe_table",
+		"pub whole_buffer_table",
+	] {
+		if select.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/select.rs: ADR 068 writer column-cache context escaped crate-private visibility via {forbidden}"
+			));
+		}
+	}
+	for forbidden in [
+		"estimator_enabled",
+		"fsst_row_safe_estimator_enabled",
+		"row_safe_estimator_enabled",
+	] {
+		if encoding_types.contains(forbidden) || config.contains(forbidden) {
+			violations.push(format!(
+				"encoding writer config exposed forbidden ADR 068 estimator knob {forbidden}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 068 row-safe FSST estimator invariants violated:\n{}",
 		violations.join("\n")
 	);
 }

@@ -24,7 +24,7 @@ pub enum EncodingComputeEvaluatorKind {
 	DictionaryPlain = 4,
 	DictionaryBitPacked = 5,
 	Delta = 6,
-	Fsst = 7,
+	FsstWholeBuffer = 7,
 	FsstRowSafe = 8,
 }
 
@@ -36,7 +36,7 @@ impl EncodingComputeEvaluatorKind {
 		Self::DictionaryPlain,
 		Self::DictionaryBitPacked,
 		Self::Delta,
-		Self::Fsst,
+		Self::FsstWholeBuffer,
 		Self::FsstRowSafe,
 	];
 
@@ -48,7 +48,7 @@ impl EncodingComputeEvaluatorKind {
 			Self::DictionaryPlain => "dictionary_plain",
 			Self::DictionaryBitPacked => "dictionary_bit_packed",
 			Self::Delta => "delta",
-			Self::Fsst => "fsst",
+			Self::FsstWholeBuffer => "fsst_whole_buffer",
 			Self::FsstRowSafe => "fsst_row_safe",
 		}
 	}
@@ -61,7 +61,7 @@ impl EncodingComputeEvaluatorKind {
 			"dictionary_plain" => Some(Self::DictionaryPlain),
 			"dictionary_bit_packed" => Some(Self::DictionaryBitPacked),
 			"delta" => Some(Self::Delta),
-			"fsst" => Some(Self::Fsst),
+			"fsst_whole_buffer" => Some(Self::FsstWholeBuffer),
 			"fsst_row_safe" => Some(Self::FsstRowSafe),
 			_ => None,
 		}

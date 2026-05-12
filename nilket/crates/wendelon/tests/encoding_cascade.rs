@@ -73,7 +73,7 @@ fn encoding_cascades_roundtrip_byte_buffers() {
 		&mixed,
 	);
 	roundtrip(
-		EncodingCascade::Fsst {
+		EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		},
 		&mixed,
@@ -81,9 +81,9 @@ fn encoding_cascades_roundtrip_byte_buffers() {
 }
 
 #[test]
-fn fsst_wfs1_known_fixture_remains_byte_stable() {
+fn fsst_fsst_whole_buffer_known_fixture_remains_byte_stable() {
 	let input = b"ABABAB";
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -95,7 +95,7 @@ fn fsst_wfs1_known_fixture_remains_byte_stable() {
 	)
 	.unwrap();
 
-	assert_eq!(encoded.bytes, b"WFS1\x01AB\x80\x80\x80");
+	assert_eq!(encoded.bytes, b"WBFS\x01AB\x80\x80\x80");
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn fsst_row_safe_roundtrips_and_does_not_train_across_rows() {
 	)
 	.unwrap();
 
-	assert!(encoded.bytes.starts_with(b"WFS2"));
+	assert!(encoded.bytes.starts_with(b"RSFS"));
 	assert_eq!(
 		encoded.bytes[4], 0,
 		"row-safe training must not see AB across row boundaries"
@@ -165,9 +165,9 @@ fn malformed_fsst_row_safe_frame_fails_dense_decode() {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let bad_frames = [
-		b"WFS2\x00\x01\x00\x00\x00\x00\x00\x00\x00".to_vec(),
-		b"WFS2\x00\x01\x00\x00\x00\x00\x00\x00\x00x".to_vec(),
-		b"WFS2\x01AB\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x81".to_vec(),
+		b"RSFS\x00\x01\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+		b"RSFS\x00\x01\x00\x00\x00\x00\x00\x00\x00x".to_vec(),
+		b"RSFS\x01AB\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x81".to_vec(),
 	];
 	for frame in bad_frames {
 		assert_eq!(
@@ -406,7 +406,7 @@ fn dictionary_cascade_bitpacks_variable_width_indices() {
 #[test]
 fn fsst_cascade_uses_symbol_table_codec_for_repeated_string_bytes() {
 	let input = "segment-segment-segment-".repeat(512).into_bytes();
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_buffer(
@@ -427,7 +427,7 @@ fn fsst_cascade_uses_symbol_table_codec_for_repeated_string_bytes() {
 	.unwrap();
 
 	assert_eq!(decoded, input);
-	assert!(encoded.bytes.starts_with(b"WFS1"));
+	assert!(encoded.bytes.starts_with(b"WBFS"));
 	assert!(encoded.bytes.len() < input.len());
 }
 

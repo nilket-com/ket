@@ -9,7 +9,13 @@ Companion implementation plan:
 
 Proposed 2026-05-10. Council-converged across Claude /
 Codex / Gemini after eight iterations under
-`plans/wip/`. Entering Phase 0 audit + calibration.
+`plans/wip/`. Phase 0 found symbol-table training
+cost above the P5 threshold; iter 9 / 10 amended V1
+to writer column-cache amortization before production
+promotion. The implemented production route engages
+the estimator only for directory-writer calls carrying
+`WriterCascadeContext` and `IpcColumnOrdinal`; cold
+no-context single-buffer selection remains exact.
 
 This ADR is the tracked V2 follow-up to ADR 067's
 explicit waiver of the ADR 057 ≤ 75 % writer-cost
@@ -27,6 +33,11 @@ that early-declines obvious row-safe FSST losers
 without amending ADR 067's per-buffer exact guard.
 Buffers the estimator does not early-decline fall
 through to ADR 067's existing dual-encode path.
+After the writer column-cache amendment, trained estimator arms may
+reuse a same-writer-pass column cache across row
+groups. Cached tables are decline-only evidence;
+they never satisfy the exact guard for `FsstRowSafe`
+emission.
 
 **Naming-vocabulary prerequisite.** This ADR is
 written in the council's settled vocabulary
@@ -63,7 +74,7 @@ rename lands.
   promotion evidence.
 
 - **Three decline mechanisms.**
-  1. **Cost-free metadata-floor decline (pre-training).**
+  1. **Cost-free row-safe floor decline (pre-training).**
      Row-safe FSST structural metadata has a computable
      lower bound from `row_count` alone, with zero
      symbol-table bytes and zero exception entries:
@@ -76,13 +87,26 @@ rename lands.
 
      If this lower bound exceeds `decoded_plaintext_len`,
      row-safe FSST cannot pass ADR 067's plaintext half-
-     guard. Decline immediately with no symbol-table
-     training, sampling, or full encode work.
-  2. **Trained metadata-floor decline (post-training,
-     pre-sample-encode).** After full-buffer symbol-
-     table training and **before** sampled payload
-     encoding, recompute the row-safe FSST metadata
-     floor using the **actual** full-buffer-trained
+     guard. A second cost-free exact lower bound adds
+     `non_empty_row_count`, because every non-empty row
+     contributes at least one payload byte under the
+     row-safe FSST payload encoder:
+
+     ```text
+     fixed_fsst_row_safe_header_bytes
+       + 8 * ceil(row_count / 256)
+       + row_count
+       + non_empty_row_count
+     ```
+
+     If either lower bound exceeds
+     `decoded_plaintext_len`, decline immediately with no
+     symbol-table training, sampling, or row-safe full
+     encode work.
+  2. **Trained metadata-floor decline (post-training
+     / warm-cache, pre-sample-encode).** After full-
+     buffer symbol-table training on the current buffer,
+     recompute the row-safe FSST metadata floor using the
      row-safe FSST symbol count and zero exceptions.
      If this trained floor alone exceeds
      `decoded_plaintext_len`, row-safe FSST cannot
@@ -94,13 +118,18 @@ rename lands.
   3. **Sample confidence decline (post-sample-encode).**
      Deterministically sample rows using ADR 057's
      existing `cascade_sample_rows` budget, encode the
-     sample under the **full-buffer-trained** whole-
-     buffer + row-safe FSST symbol tables (sample-
-     trained tables are forbidden — they predict a
-     different codec), project full-buffer sizes from
-     the sample, and decline only when the projection
-     exceeds the exact guard by a council-pinned
-     conservative safety margin.
+     sample under full-buffer-trained whole-buffer +
+     row-safe FSST symbol tables. In the original
+     per-buffer path those tables are trained on the
+     current buffer. Sample-trained tables remain
+     forbidden because they predict a different codec.
+     Cross-buffer cached tables are no longer allowed to
+     produce table-dependent declines after 1M weak-
+     compression evidence showed a false decline under
+     cross-buffer tables. The estimator projects full-
+     buffer sizes from the sample and declines only
+     when the projection exceeds the exact guard by a
+     council-pinned conservative safety margin.
 
 - **Determinism is load-bearing.** Writer cascade
   selection determines on-disk bytes. The estimator
@@ -110,14 +139,25 @@ rename lands.
   wall-clock / random / hash-map-iteration / CPU-
   capability input.
 
-- **Surfaces unchanged.** No new on-disk structure,
-  format-version bump, `EncodingCascade` /
+- **Surfaces unchanged by the estimator.** ADR 068
+  introduces no new on-disk structure, format-version
+  bump, `EncodingCascade` /
   `EncodingComputeEvaluatorKind` variant, IPC
   `custom_metadata` key, wire / descriptor / PBC /
-  capability / digest / `ObjectStore` surface, Cargo
-  feature, metric label, or operator-visible
-  configuration. Phase 1-6 staging happens via
-  crate-private `FsstRowSafeEstimatorRouting`
+  capability / digest / `ObjectStore` surface, or Cargo
+  feature. The naming-prerequisite commit landed
+  alongside ADR 068 does rename the cascade label,
+  predicate-evaluator label, and the FSST metric label
+  (`fsst` → `fsst_whole_buffer`), per its enumerated
+  rename scope. That rename is a pre-launch clean break
+  per `plans/conventions/no-premature-backward-compat.md`,
+  and operator config files referencing the pre-rename
+  label and dashboards keyed on it must be updated.
+  Writer column-cache adds only crate-private writer
+  context state (`WriterCascadeContext` /
+  `ColumnFsstSymbolTableCache`) scoped to one
+  encoding-directory build pass. Phase 1-6 staging
+  happens via crate-private `FsstRowSafeEstimatorRouting`
   (`ExactOnly` / `Estimator`) reachable only from
   test/bench helpers. Phase 7 promotion is a single
   commit that flips the production
@@ -197,23 +237,30 @@ Detailed shape:
    fixtures; V1 hardens exactly one shape as a
    crate-private constant.
 
-3. **Symbol-table training.** Both whole-buffer FSST
-   and row-safe FSST symbol tables are trained on the
-   **full buffer**. Sample-trained tables are
-   forbidden because they estimate a different codec
-   than the writer would emit. The Phase 0 audit
-   measures training cost vs the **full-buffer greedy
-   encode cost** (the cost the estimator is trying to
-   avoid); if training alone exceeds 25 % of full-
-   buffer greedy encode wall-clock on representative
-   warehouse fixtures, council reconvenes before
-   Phase 1 hardens. The denominator is the avoided
-   cost, not estimator wall-clock — this estimator
-   trains on the full buffer but encodes only a small
-   sample, so training will naturally dominate
-   estimator wall-clock; that is acceptable as long
-   as training stays cheap relative to the work it
-   replaces.
+3. **Symbol-table training and writer column-cache amortization.**
+   Both whole-buffer FSST and row-safe FSST symbol
+   tables are trained on a **full buffer**. Sample-
+   trained tables are forbidden because they estimate
+   a different codec than the writer would emit.
+   Phase 0 measured training cost vs the
+   **full-buffer greedy encode cost** and found
+   per-buffer training exceeded the 25 % P5 gate on
+   all probed fixtures. Iter 9 / 10 therefore
+   amended V1 to writer column-cache amortization:
+
+   ```text
+   cache key: IpcColumnOrdinal
+   cache lifetime: one build_encoding_directory_for_ipc_stream pass
+   cold miss: exact route, then opportunistic cache warm
+   warm hit: cost-free floor only; table-dependent cached declines disabled
+   ```
+
+   The P5 denominator remains full-buffer greedy
+   encode wall-clock. Writer column-cache changes the numerator to the
+   amortized training share of warm evaluated buffers.
+   Cached tables may not prove either "decline" or
+   "emit row-safe FSST"; any table-dependent decision
+   falls back to current-buffer exact selection.
 
 4. **Projection arithmetic.** Integer-only, with
    saturating arithmetic. `Option<usize>` returns
@@ -242,13 +289,16 @@ Detailed shape:
    decline-path saving the per-guard threshold shape
    would have produced (V2 evidence, not a V1 toggle).
 
-6. **Symbol-table reuse on `RequireExactGuard`.** If
-   Phase 0 confirms ADR 067's exact dual-encode path
-   can accept pre-trained symbol tables,
-   `RequireExactGuard` carries a private reusable-
-   training handle and the dual-encode skips
-   retraining. If not, V1 retrains and the plausible-
-   winner overhead promotion gate measures the cost.
+6. **Exact-length provenance on `RequireExactGuard`.**
+   `RequireExactGuard` may short-circuit to
+   `FsstRowSafe` only when exact lengths came from
+   symbol tables trained on the current buffer.
+   Cross-buffer cached tables never populate
+   current-buffer exact lengths. A warm-cache
+   estimator that cannot safely decline falls back to
+   the current-buffer exact route, which retrains and
+   refreshes the column cache from already-paid exact
+   work.
 
 7. **Estimator types (private to encoding module).**
 
@@ -275,6 +325,10 @@ Detailed shape:
        Estimator,
    }
 
+   pub(crate) struct WriterCascadeContext { ... }
+
+   pub(crate) struct ColumnFsstSymbolTableCache { ... }
+
    pub(crate) struct FsstRowSafeSampleParts {
        pub payload_len: usize,
        pub exception_count: usize,
@@ -300,6 +354,10 @@ metadata. Replacing the whole-buffer-FSST side with a
 sample estimate is a semantic change — possibly the
 right next step, but not one to make before seeing
 how much cost the conservative pre-check recovers.
+Writer column-cache keeps that boundary: cached tables are allowed to
+decline only. They cannot authorize `FsstRowSafe`
+emission because they were trained on another row
+group's values buffer.
 
 ### Early decline targets the waste, not the read win
 
@@ -368,13 +426,13 @@ iteration / CPU-capability input.
   the residual delta and serves as the explicit
   motivation for an option-2 escalation ADR if
   warranted.
-- **Symbol-table training cost is the new floor.**
-  Even on declined buffers, the estimator trains
-  full-buffer symbol tables. If Phase 0 confirms
-  table reuse on `RequireExactGuard`, the marginal
-  cost on the winner path is one greedy encode round;
-  if not, the winner path retrains and the plausible-
-  winner overhead gate measures it.
+- **Symbol-table training cost is amortized, not
+  erased.** Cold column-cache misses route through
+  current-buffer exact selection and warm or refresh
+  the cache from tables that exact selection already
+  trained. Warm hits avoid current-buffer training
+  for decline checks, but warm `RequireExactGuard`
+  still retrains the current buffer before emission.
 - **Estimator complexity is internal.** No operator
   surface, no on-disk impact, no protocol surface.
   The cost is one new internal module and the
@@ -421,16 +479,15 @@ deliberation questions. None are council-blocking.
   reusable-training handle. If no, V1 retrains and
   the plausible-winner overhead gate measures it.
 - **P5: Symbol-training cost vs avoided full encode.**
-  Training wall-clock measured against **full-buffer
-  greedy encode wall-clock** (the cost the estimator
-  is trying to avoid), not against estimator wall-
-  clock. If training alone exceeds 25 % of full-buffer
-  greedy encode wall-clock on representative warehouse
-  fixtures, council reconvenes to consider amortization
-  shapes (per-page table cache, etc.) before Phase 1
-  hardens. Training will naturally dominate estimator
-  wall-clock since the estimator encodes only a small
-  sample; that is acceptable.
+  Phase 0 measured training wall-clock against
+  **full-buffer greedy encode wall-clock** (the cost
+  the estimator is trying to avoid), not against
+  estimator wall-clock. Training exceeded 25 % on all
+  probed warehouse fixtures, so council reconvened.
+  Iter 10 selected writer column-cache amortization. The
+  P5 denominator remains full-buffer greedy encode
+  wall-clock; the numerator becomes the amortized
+  training share per warm evaluated buffer.
 - **P6: Estimator module location.** New
   `cascade/estimator.rs` sibling vs co-located in
   `select.rs`, picked on file size and call-site
@@ -461,14 +518,16 @@ promote with explicit recorded justification.
    (`FsstRowSafeEstimatorRouting::Estimator`) match
    exact-route bytes
    (`FsstRowSafeEstimatorRouting::ExactOnly`)
-   byte-for-byte on every warehouse winner fixture.
+   byte-for-byte on every warehouse winner fixture,
+   including writer column-cache warm-cache directory-writer runs.
 3. **Hard — zero false declines on warehouse
    winners.** On representative ADR 067
-   `FsstRowSafe`-winner fixtures across 8K / 65K /
-   1M rows: URL equality, URL `InList`, long repeated
-   pair, weak-compression warehouse diagnostic, and
-   free-text / log-line if added in Phase 0. The
-   estimator must not early-decline any of these.
+   `FsstRowSafe`-winner fixtures across row-group
+   count tiers 1 / 2 / 4 / 8 / 16: URL equality, URL
+   `InList`, long repeated pair, weak-compression
+   warehouse diagnostic, and free-text / log-line if
+   added in Phase 0. The estimator must not early-
+   decline any of these.
 4. **Hard — decline-path writer speedup.** ≥ 1.5×
    speedup over ADR 067 eager dual-encode on decline
    fixtures, selecting the identical final cascade
@@ -480,7 +539,8 @@ promote with explicit recorded justification.
 6. **Hard — cross-replica determinism.** Cascade
    selection and emitted bytes are byte-equal on
    representative fixtures across two writer runs
-   with the same input and config.
+   with the same input and config, including cache-
+   warm row-group sequences.
 7. **Hard — read-side invariants unchanged.**
    Existing ADR 067 `FsstRowSafe` predicate masks
    remain byte-identical on fixtures where
@@ -497,12 +557,15 @@ promote with explicit recorded justification.
    target.
 
 If gates pass, Phase 7 promotion is a single commit
-that flips production `select_fsst_candidate` to
-`FsstRowSafeEstimatorRouting::Estimator`; the
-routing enum stays in the codebase for bench/test
-comparison after promotion. ADR 067 §"Status" and
-ADR 057 §"Where we are" are amended to record the
-new writer-cost delta.
+that routes production directory-writer column-cache calls
+through `FsstRowSafeEstimatorRouting::Estimator`
+when writer context and column ordinal are present;
+the routing enum stays in the codebase for bench/test
+comparison after promotion. Cold no-context selection
+remains exact unless a separate evidence pass proves
+that overhead is acceptable. ADR 067 §"Status" and
+ADR 057 §"Where we are" are amended to record the new
+writer-cost delta.
 
 If gates fail, the artifact records the gap. Council
 decides whether to revise V1 (adjust safety
@@ -581,3 +644,15 @@ the user clears them).
     `wfs1_*`/`wfs2_*` → `fsst_whole_buffer_*` /
     `fsst_row_safe_*`. ADR 068 implementation begins
     after that rename lands. Settled iter 5.
+13. **Writer column-cache amortization after P5 failure.**
+    Per-buffer training exceeded the Phase 0 P5
+    threshold after micro-optimization. The final V1
+    shape uses a writer-pass-local cache keyed by
+    `IpcColumnOrdinal` across row groups. Cold misses
+    run current-buffer exact selection and warm the
+    cache; warm hits run only cost-free estimator arms;
+    warm `RequireExactGuard` retrains the current
+    buffer before any `FsstRowSafe` emission. Initial
+    iter 10 cross-buffer table-dependent declines were
+    narrowed after 1M weak-compression evidence produced
+    a false decline.

@@ -1176,7 +1176,7 @@ fn fold_signed_encoded_values(
 			}
 			EncodingCascade::Plain
 			| EncodingCascade::Lz4Frame
-			| EncodingCascade::Fsst { .. }
+			| EncodingCascade::FsstWholeBuffer { .. }
 			| EncodingCascade::FsstRowSafe { .. }
 			| EncodingCascade::Alp { .. } => {
 				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
@@ -1278,7 +1278,7 @@ fn fold_unsigned_encoded_values(
 			}
 			EncodingCascade::Plain
 			| EncodingCascade::Lz4Frame
-			| EncodingCascade::Fsst { .. }
+			| EncodingCascade::FsstWholeBuffer { .. }
 			| EncodingCascade::FsstRowSafe { .. }
 			| EncodingCascade::Alp { .. } => {
 				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
@@ -1980,7 +1980,7 @@ fn fold_signed_min_max_encoded_values(
 			}
 			EncodingCascade::Plain
 			| EncodingCascade::Lz4Frame
-			| EncodingCascade::Fsst { .. }
+			| EncodingCascade::FsstWholeBuffer { .. }
 			| EncodingCascade::FsstRowSafe { .. }
 			| EncodingCascade::Alp { .. } => {
 				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);
@@ -2077,7 +2077,7 @@ fn fold_unsigned_min_max_encoded_values(
 			}
 			EncodingCascade::Plain
 			| EncodingCascade::Lz4Frame
-			| EncodingCascade::Fsst { .. }
+			| EncodingCascade::FsstWholeBuffer { .. }
 			| EncodingCascade::FsstRowSafe { .. }
 			| EncodingCascade::Alp { .. } => {
 				return Err(EncodingComputeRejectCode::KernelDecodedLengthMismatch);

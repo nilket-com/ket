@@ -34,6 +34,16 @@ read-side wins on a read-heavy warehouse workload.
 Rationale and follow-up path documented in the
 bench-results artifact §"Writer-cost gate waiver".
 
+The V2 follow-up (ADR 068) is now implemented and
+promoted. ADR 068 introduced a sample-based writer
+estimator with column-cache amortization, achieving
+≥ 1.5× writer speedup on declined buffers while adding
+≤ 5% overhead to plausible winners. This completely
+eliminates the worst-case dual-encode cliffs. The remaining
+overhead on plausible winners will be addressed by a
+subsequent V2 option-2 escalation ADR (estimator-authorized
+emission without the exact guard).
+
 Anchored on ADR 066 V1 perf-iteration post-mortem
 (`plans/impl/066_fsst_evaluator_bench_results.md`
 §"V1 Perf Iteration 1") which proved Strategy A's
@@ -57,21 +67,22 @@ archival record.
 ADR 067 V1 contract:
 
 - **Writer amendment (row-canonical)**: introduce a
-  row-aligned FSST frame (`WFS2`) where the encoder
+  row-aligned FSST frame (`RSFS`) where the encoder
   (a) trains symbol pairs only over within-row byte
   pairs, (b) never emits a symbol pair spanning a row
   boundary, and (c) follows a deterministic canonical
   algorithm so that two encoders fed the same row
   bytes + symbol table produce byte-identical output.
-- **Encoded-offsets-in-frame**: the `WFS2` frame embeds
+- **Encoded-offsets-in-frame**: the `RSFS` frame embeds
   a per-row encoded-byte-offsets table after the symbol
   table and before the encoded payload. Reader
   identifies row N's encoded byte range by a single
   table lookup.
 - **New cascade variant**: `EncodingCascade::FsstRowSafe`
   (discriminant 9, label `"fsst_row_safe"`) extends
-  ADR 057's leaf cascade catalog by one. Existing
-  `EncodingCascade::Fsst` buffers stay readable via
+  ADR 057's leaf cascade catalog by one. Post-rename
+  `EncodingCascade::FsstWholeBuffer` buffers (those
+  carrying the `b"WBFS"` magic) stay readable via
   Strategy A (ADR 066 V1 reader); new writes default
   to `FsstRowSafe` when the per-buffer actual-size
   guard clears.
@@ -82,16 +93,16 @@ ADR 067 V1 contract:
   the row's encoded byte range against the pre-encoded
   literal. No streaming token decode on the predicate
   path.
-- **Dense WFS2 decode**: full token-stream decode that
+- **Dense RSFS decode**: full token-stream decode that
   produces the original values bytes. Required for
   evaluator-disabled reads, unsupported atoms,
   Sub-case A2 overlap paths, and as the correctness
   oracle for Strategy B.
 - **Per-buffer writer size guard**: row-safe candidate
-  is selected only when both (a) `wfs2_len ≤
+  is selected only when both (a) `fsst_row_safe_len ≤
   decoded_plaintext_len` (compression actually
-  positive) and (b) `wfs2_len ≤ ceil(wfs1_len * 1.10)`
-  (compression-loss budget vs. existing `Fsst`).
+  positive) and (b) `fsst_row_safe_len ≤ ceil(fsst_whole_buffer_len * 1.10)`
+  (compression-loss budget vs. existing `FsstWholeBuffer`).
 - **`ENCODING_DIRECTORY_FORMAT_VERSION` bump** required:
   the cascade catalog grows by one variant. Old readers
   encountering `FsstRowSafe` fail closed via the
@@ -104,21 +115,34 @@ ADR 067 V1 contract:
   `enabled_predicate_evaluators` and the existing
   `enabled_cascades`.
 - **No removal of ADR 066 V1 reader**. Strategy A
-  remains the path for `EncodingCascade::Fsst` buffers
-  (back-compat). New buffers under `FsstRowSafe` use
-  Strategy B.
+  remains the path for `EncodingCascade::FsstWholeBuffer`
+  buffers. The cascade discriminant (7) is unchanged, but
+  the on-disk magic byte prefix was renamed to `b"WBFS"`
+  as part of the naming-prerequisite commit landed
+  alongside ADR 068. The pre-rename magic is not accepted
+  by new readers per
+  `plans/conventions/no-premature-backward-compat.md` —
+  pre-launch, no deployed state, so the magic cut is a
+  clean break, not a back-compat seam. New buffers under
+  `FsstRowSafe` use Strategy B. **Scope note for the rest
+  of this ADR**: all subsequent references to "existing /
+  old whole-buffer FSST buffers," "old `FsstWholeBuffer` /
+  `FsstWholeBuffer` cascade buffers," or
+  "indefinitely-readable" are scoped to post-rename
+  buffers (those carrying the `b"WBFS"` magic prefix).
+  Pre-rename buffers are not readable by new binaries.
 - **Promotion gates**: ≥2.0× predicate wall-clock at
   clustered 5%, ≥1.5× end-to-end through ADR 065 →
   ADR 060 / 064 Case A, ≤5% dense-fallback overhead
   on declined paths, ≤10% compression-ratio loss on
   representative warehouse fixtures vs. existing
-  `Fsst` cascade. Headline diagnostic (recorded, not
+  `FsstWholeBuffer` cascade. Headline diagnostic (recorded, not
   gating): ≥5× CPU speedup target on representative
   `Eq` fixtures (much higher than ADR 066's 2× because
   Strategy B avoids decode entirely on the predicate
   path).
 
-Phase 0 audit pins the existing WFS1 codec, the FSST
+Phase 0 audit pins the existing WBFS codec, the FSST
 encoder's symbol-table selection, the manager's cascade
 dispatch site, and the writer's row-boundary signaling
 (currently the encoder runs over the entire values
@@ -165,7 +189,7 @@ on the predicate path**. That is Strategy B: pre-encode
 the literal once, then compare its encoded byte
 sequence against each row's encoded byte range.
 
-Strategy B is correctness-unsafe under the current WFS1
+Strategy B is correctness-unsafe under the current WBFS
 encoder because FSST's greedy encoding does not respect
 Arrow row boundaries. A two-byte symbol can span the
 boundary between row N and row N+1, contributing
@@ -186,12 +210,12 @@ plaintext. Pre-encoded literal compare becomes
 correctness-safe.
 
 This is an ADR 057-adjacent change. ADR 057 ships the
-cascade catalog and the WFS1 frame; ADR 067 extends the
+cascade catalog and the WBFS frame; ADR 067 extends the
 catalog by one variant (`FsstRowSafe`) and ships the
-new WFS2 frame format alongside the existing WFS1.
-Existing FSST buffers stay readable via Strategy A.
-New writes default to row-safe encoding; readers
-dispatch on cascade variant.
+new RSFS frame format alongside WBFS. Post-rename
+whole-buffer FSST buffers (those carrying the `b"WBFS"`
+magic) stay readable via Strategy A. New writes default
+to row-safe encoding; readers dispatch on cascade variant.
 
 ### Five forces
 
@@ -238,40 +262,44 @@ loss is more proportional but still bounded. Phase 7
 bench measures this empirically; the council's
 promotion gate caps acceptable compression loss at 10%.
 
-**5. Existing WFS1 compatibility is preserved.** WFS2
-is explicitly *not* backwards-compatible with old
-readers — Decision §10 covers the version-mismatch
-rollout — but the forward direction is additive. ADR
-057's cascade catalog is closed-by-design but extends
-by addition. Old `EncodingCascade::Fsst` (WFS1)
-buffers stay readable via Strategy A (ADR 066 V1
-reader path is unchanged), indefinitely, by new
-binaries. The new `EncodingCascade::FsstRowSafe`
-(WFS2) variant is dispatched via the existing
-`evaluator_kind_for_cascade` site to a new evaluator
-kind (`EncodingComputeEvaluatorKind::FsstRowSafe`)
-that runs Strategy B. Two-step dispatch discipline
-applies recursively. No data migration required; new
-writes opt in.
+**5. Post-rename whole-buffer FSST compatibility is
+preserved.** RSFS is explicitly *not* backwards-compatible
+with old readers — Decision §10 covers the version-mismatch
+rollout — but within the post-rename vocabulary the
+forward direction is additive. ADR 057's cascade catalog
+is closed-by-design but extends by addition. Post-rename
+`EncodingCascade::FsstWholeBuffer` buffers (those carrying
+the `b"WBFS"` magic) stay readable via Strategy A (ADR
+066 V1 reader path is unchanged) by new binaries. The
+new `EncodingCascade::FsstRowSafe` (RSFS) variant is
+dispatched via the existing `evaluator_kind_for_cascade`
+site to a new evaluator kind
+(`EncodingComputeEvaluatorKind::FsstRowSafe`) that runs
+Strategy B. Two-step dispatch discipline applies
+recursively. No data migration required for post-rename
+buffers; new writes opt in. Pre-rename buffers are not
+readable per the V1 contract clean break above.
 
 ### What this ADR does not propose
 
-- **No retirement of the existing `EncodingCascade::Fsst`
-  cascade variant.** Old buffers stay readable via ADR
-  066 V1's Strategy A path indefinitely. If operators
-  want to migrate, they re-encode (ADR 057 substrate
-  already supports re-encoding via row-group rewrite).
-- **No silent migration of existing WFS1 buffers.** Re-
-  encoding is an explicit row-group rewrite operation;
-  there is no implicit / on-the-fly conversion.
-- **No old-binary read compatibility for WFS2.** New
-  binaries read both WFS1 and WFS2; old binaries reject
+- **No retirement of the `EncodingCascade::FsstWholeBuffer`
+  cascade variant.** Post-rename buffers (those carrying
+  the `b"WBFS"` magic) stay readable via ADR 066 V1's
+  Strategy A path. If operators want to migrate to
+  `FsstRowSafe`, they re-encode (ADR 057 substrate already
+  supports re-encoding via row-group rewrite). Pre-rename
+  buffers are not readable per the V1 contract clean break.
+- **No silent migration of post-rename whole-buffer FSST
+  buffers.** Re-encoding is an explicit row-group rewrite
+  operation; there is no implicit / on-the-fly conversion.
+- **No old-binary read compatibility for RSFS.** New
+  binaries read both WBFS and RSFS; old binaries reject
   the bumped `ENCODING_DIRECTORY_FORMAT_VERSION`
   before they can inspect cascades. The compatibility
   guarantee is one-way: new readers continue reading
-  old WFS1 data. Rollout is reader-before-writer.
+  old WBFS data. Rollout is reader-before-writer.
 - **No retirement of the ADR 066 V1 Strategy A reader.**
-  It remains the dispatch target for `EncodingCascade::Fsst`
+  It remains the dispatch target for `EncodingCascade::FsstWholeBuffer`
   cascade buffers.
 - **No new `PredicateAtomOp` variant.** Strategy B
   evaluates the same closed atom set as ADR 066 V1:
@@ -317,8 +345,8 @@ ADR 003, 016, 019, 020, 022, 029, 030, 035, 036, 037,
 039, 040, 042, 043, 044, 052, 053, 054, 055, 056, 058,
 059, 060, 061, 062, 063, 064, 065, 066. **ADR 057
 extends by one cascade variant (`FsstRowSafe`) and one
-new on-disk frame magic (`WFS2`); the existing `Fsst`
-cascade and `WFS1` frame remain unchanged.** ADR 058's
+new on-disk frame magic (`RSFS`); the existing `FsstWholeBuffer`
+cascade and `WBFS` frame remain unchanged.** ADR 058's
 evaluator catalog extends by one (`FsstRowSafe`); the
 existing seven (after ADR 066) remain shipped. ADR 059
 default predicate allow-list extends by `FsstRowSafe`
@@ -328,33 +356,33 @@ promotion gates.
 ## Decision
 
 ADR 067 ships a row-aligned FSST writer amendment
-(`WFS2` frame, `EncodingCascade::FsstRowSafe`) and a
+(`RSFS` frame, `EncodingCascade::FsstRowSafe`) and a
 matching Strategy B predicate evaluator
 (`EncodingComputeEvaluatorKind::FsstRowSafe`). The
 amendment is a pure addition to ADR 057's cascade
-catalog; it does not modify the existing `Fsst`
-variant or `WFS1` frame. Strategy B avoids per-row
+catalog; it does not modify the existing `FsstWholeBuffer`
+variant or `WBFS` frame. Strategy B avoids per-row
 decode entirely on the predicate path by pre-encoding
 each literal once per buffer and comparing encoded
 byte ranges directly.
 
 1. **`EncodingCascade::FsstRowSafe` is the new cascade
    variant.** Concrete discriminant numbering (per
-   Phase 0 of Codex's audit): `Fsst = 7` (existing),
+   Phase 0 of Codex's audit): `FsstWholeBuffer = 7` (existing),
    `Alp = 8` (existing), **`FsstRowSafe = 9`** (new).
    Carries the same `symbol_table_byte_len: RecordBodyByteLen`
-   field as `EncodingCascade::Fsst` for parallel-shape
+   field as `EncodingCascade::FsstWholeBuffer` for parallel-shape
    reasons; cascade-field disposition for both variants
    is the same out-of-scope question (separate trivial
    directory-layout follow-up ADR).
 
-2. **`WFS2` is the new on-disk frame.** Layout:
-   - 4-byte magic `b"WFS2"`.
+2. **`RSFS` is the new on-disk frame.** Layout:
+   - 4-byte magic `b"RSFS"`.
    - 1-byte symbol_count (≤127, same encoder cap as
-     WFS1 per the existing 7-bit symbol-vs-literal
+     WBFS per the existing 7-bit symbol-vs-literal
      flag).
    - `2 × symbol_count` bytes of symbol-table pair
-     entries (same shape as WFS1).
+     entries (same shape as WBFS).
    - 4-byte row_count.
    - `block_offsets`: `ceil(row_count / 256) * 8` bytes.
      (Note: `block_count` is derived, not stored).
@@ -368,7 +396,7 @@ byte ranges directly.
    - 4-byte exception_count (u32 little-endian).
    - `exception_lengths`: `exception_count * 4` bytes
      (32-bit little-endian lengths for rows ≥ 255 bytes).
-   - Encoded payload: same byte semantics as WFS1
+   - Encoded payload: same byte semantics as WBFS
      (literal `< 0x80`, escape `0xff`, symbol `≥ 0x80`
      with high bit clearing to 7-bit symbol index).
      
@@ -408,7 +436,7 @@ byte ranges directly.
 
    - **Encoded row indexing (offsets table).** For
      every row, the encoder records the encoded byte
-     position at the row's start in the WFS2 frame's
+     position at the row's start in the RSFS frame's
      encoded-offsets table. Reader can find row N's
      encoded byte range by a single table lookup.
 
@@ -433,7 +461,7 @@ byte ranges directly.
      bytes when the pair is in the table and both
      bytes are inside the same row; (iv) otherwise
      emit one literal byte (or escape + high byte for
-     bytes ≥ 0x80). Step (i) and (ii) match WFS1's
+     bytes ≥ 0x80). Step (i) and (ii) match WBFS's
      existing symbol-table construction; only step
      (iii)'s row-boundary check differs.
 
@@ -447,7 +475,7 @@ byte ranges directly.
    `EncodingComputeEvaluatorKind::FsstRowSafe` (label
    `"fsst_row_safe"`) registers the new evaluator.
    Per-buffer setup:
-   - Parse the WFS2 frame: extract symbol table,
+   - Parse the RSFS frame: extract symbol table,
      row_count, encoded-offsets table, encoded
      payload.
    - For each literal (typically 1 for `Eq`, up to N
@@ -540,7 +568,7 @@ byte ranges directly.
      time** via existing `EncodingComputeRejectCode`
      (`KernelDecodedLengthMismatch` /
      `EncodedValueOverflow` / `MaskLengthMismatch`).
-     Triggers: bad WFS2 magic, impossible
+     Triggers: bad RSFS magic, impossible
      `symbol_count`, `row_count` mismatch with
      `BufferEncoding.decoded_value_count`,
      non-monotonic `block_offsets` (either
@@ -581,7 +609,7 @@ byte ranges directly.
      pass; arbitrary mid-payload corruption inside an
      authenticated chunk is structurally impossible.
 
-   - **Dense WFS2 decode is the full-validation
+   - **Dense RSFS decode is the full-validation
      path.** Reads that don't go through Strategy B
      (evaluator-disabled, unsupported atom, Sub-case
      A2 overlap) run dense decode, which validates
@@ -609,12 +637,12 @@ byte ranges directly.
     bump. Old readers reject the bumped directory at
     version-check time, before they reach cascade
     inspection — they never see the new cascade tag
-    or attempt to decode WFS2 bytes. Rollout
+    or attempt to decode RSFS bytes. Rollout
     discipline is therefore reader-before-writer:
     deploy new readers that understand the bumped
-    version + `FsstRowSafe` + WFS2 everywhere first,
+    version + `FsstRowSafe` + RSFS everywhere first,
     then enable writers to emit `FsstRowSafe`.
-    Existing WFS1 / `Fsst` cascade buffers remain
+    Existing WBFS / `FsstWholeBuffer` cascade buffers remain
     readable by new binaries indefinitely; the
     compatibility guarantee is one-way.
 
@@ -628,19 +656,19 @@ byte ranges directly.
 
     ```text
     select FsstRowSafe iff:
-      wfs2_len <= decoded_plaintext_len
-      AND wfs2_len <= ceil(wfs1_len * 1.10)
+      fsst_row_safe_len <= decoded_plaintext_len
+      AND fsst_row_safe_len <= ceil(fsst_whole_buffer_len * 1.10)
     ```
 
     The guard is a **per-buffer runtime check**, not
     a bench-fixture promotion gate alone. The writer
-    encodes both WFS1 and WFS2 candidates for FSST-
-    eligible variable-width buffers and selects WFS2
+    encodes both WBFS and RSFS candidates for FSST-
+    eligible variable-width buffers and selects RSFS
     only when both conditions hold. If the encoded
-    WFS2 frame exceeds the budget (typical for
+    RSFS frame exceeds the budget (typical for
     short-row workloads where the 4-bytes-per-row
     encoded-offsets overhead dominates), the writer
-    falls back to the existing `Fsst` cascade for
+    falls back to the existing `FsstWholeBuffer` cascade for
     that buffer. The 10% threshold is a draft value
     subject to council convergence based on Phase 0
     micro-bench evidence; the structural point is
@@ -649,7 +677,7 @@ byte ranges directly.
     inferred from sample shape.
 
     Operators can override via `enabled_cascades`
-    config (disable `FsstRowSafe` to force `Fsst`,
+    config (disable `FsstRowSafe` to force `FsstWholeBuffer`,
     or vice versa) but the default behavior is
     "prefer row-safe with the safety net."
 
@@ -698,11 +726,11 @@ encoded-offsets table is the bridge from row index to
 encoded byte range.
 
 **3. New cascade variant separates old from new.**
-Reusing `EncodingCascade::Fsst` with a flag would
+Reusing `EncodingCascade::FsstWholeBuffer` with a flag would
 violate ADR 057's closed-catalog discipline and
 require runtime branches in every cascade decode site.
 A new variant is the clean addition. Old buffers stay
-on `Fsst` (Strategy A); new writes use `FsstRowSafe`
+on `FsstWholeBuffer` (Strategy A); new writes use `FsstRowSafe`
 (Strategy B).
 
 **4. Per-buffer pre-encoding amortizes correctly.**
@@ -760,9 +788,10 @@ audits read-only:
   buffer as one stream).
 - `src/storage/encoding/select.rs` — pin the cascade
   selection logic that constructs
-  `EncodingCascade::Fsst { symbol_table_byte_len: RecordBodyByteLen::new(0) }`
-  (line 133-135). Confirm where row-offsets are
-  available at write time.
+  `EncodingCascade::FsstWholeBuffer { symbol_table_byte_len: RecordBodyByteLen::new(0) }`
+  via `select_fsst_candidate_exact` / the FSST branch of
+  `select_candidate_cascade`. Confirm where row-offsets
+  are available at write time.
 - the writer's access to Arrow row offsets at the
   point where FSST encoding fires. If row offsets
   are not threaded through to the encoder, escalate
@@ -776,25 +805,26 @@ audits read-only:
   one variant is clean (no `#[non_exhaustive]`
   blockers, discriminant numbering, serde shape).
 - `src/storage/encoding/directory.rs` — cascade
-  serialization (lines 1189, 1244 currently handle
-  `EncodingCascade::Fsst`); verify how to add a new
-  variant cleanly.
+  serialization (`write_cascade` / `read_cascade`
+  currently handle `EncodingCascade::FsstWholeBuffer`);
+  verify how to add a new variant cleanly.
 - `ENCODING_DIRECTORY_FORMAT_VERSION` constant
   location and bump procedure.
 
 **Reader-side dispatch:**
 
 - `src/storage/encoding/compute/dispatch.rs` —
-  current `evaluator_kind_for_cascade` (line 332
-  for `Fsst → Some(EncodingComputeEvaluatorKind::Fsst)`); add `FsstRowSafe → Some(EncodingComputeEvaluatorKind::FsstRowSafe)`.
+  current `evaluator_kind_for_cascade` maps
+  `FsstWholeBuffer → Some(EncodingComputeEvaluatorKind::FsstWholeBuffer)`;
+  add `FsstRowSafe → Some(EncodingComputeEvaluatorKind::FsstRowSafe)`.
 - `src/storage/encoding/compute/types.rs`
   `EncodingComputeEvaluatorKind` extends by one
   variant.
 - ADR 058's pre-kernel eligibility — extends to
   admit `FsstRowSafe` cascades on the same V1
-  atom × type matrix as `Fsst`.
+  atom × type matrix as `FsstWholeBuffer`.
 
-**WFS2 frame design:**
+**RSFS frame design:**
 
 - pin the encoded-offsets-in-frame layout (as opposed
   to a separate offsets buffer): trade-off is fewer
@@ -810,7 +840,7 @@ audits read-only:
 - `benches/encoding_compute.rs` — current FSST
   fixtures (URL, log-line, free-form, identifier,
   JSON-key) become V2 fixtures unchanged. Add
-  compression-ratio measurement (`Fsst` vs
+  compression-ratio measurement (`FsstWholeBuffer` vs
   `FsstRowSafe` on the same input).
 - `benches/row_group_fetch.rs` — end-to-end
   composition row for `FsstRowSafe`.
@@ -835,7 +865,7 @@ Modify `encode_fsst_bytes` (or introduce a sibling
   independently: when looking up the next-2-byte pair
   for symbol promotion, never let the pair span a row
   boundary.
-- Emit the WFS2 frame: magic + symbol count + symbol
+- Emit the RSFS frame: magic + symbol count + symbol
   table + row count + block_offsets (pair of
   `(payload_offset: u32, exception_index: u32)` per
   256-row block) + encoded_lengths (u8 per row;
@@ -855,15 +885,15 @@ Phase 1 deliverables:
 - Cascade selection in `select.rs` opts into
   `FsstRowSafe` for variable-width string columns
   by default.
-- Round-trip tests: encoded → WFS2 frame parse →
+- Round-trip tests: encoded → RSFS frame parse →
   decoded matches input.
 - Compression-ratio measurement: encoded byte length
-  vs. existing `Fsst` cascade on the same fixtures.
+  vs. existing `FsstWholeBuffer` cascade on the same fixtures.
 - Architectural guard: writer never emits a symbol
   pair spanning a row boundary (verified by frame
   inspection on representative fixtures).
 
-### 2. WFS2 frame parser
+### 2. RSFS frame parser
 
 Add `parse_fsst_row_safe_frame(buffer_bytes,
 expected_byte_len) -> Result<FsstRowSafeFrame, _>` in
@@ -872,7 +902,7 @@ expected_byte_len) -> Result<FsstRowSafeFrame, _>` in
 
 The parser validates:
 
-- Magic `b"WFS2"`.
+- Magic `b"RSFS"`.
 - Symbol count ≤ 127.
 - `block_offsets[0] == (0, 0)`,
   `block_offsets[*].payload_offset` monotonically
@@ -923,7 +953,7 @@ guard asserts this.
 
 Extend ADR 058's pre-kernel eligibility to admit
 `FsstRowSafe` cascades on the same V1 atom × type
-matrix as `Fsst`:
+matrix as `FsstWholeBuffer`:
 
 - Atom `Eq` / `Neq` / `InList`.
 - Type `Utf8` / `LargeUtf8` / `Binary` /
@@ -951,11 +981,11 @@ Bump `ENCODING_DIRECTORY_FORMAT_VERSION` by one.
 Old readers reject the bumped directory at
 version-check time, before they reach cascade
 inspection — they never see the new cascade tag
-or attempt to decode WFS2 bytes. Rollout
+or attempt to decode RSFS bytes. Rollout
 discipline is therefore reader-before-writer:
 deploy new readers everywhere first, then enable
 writers to emit `FsstRowSafe`. New readers handle
-both `Fsst` (WFS1) and `FsstRowSafe` (WFS2)
+both `FsstWholeBuffer` (WBFS) and `FsstRowSafe` (RSFS)
 cascades indefinitely.
 
 ### 8. Default enablement is Phase-7-evidence-gated
@@ -969,11 +999,11 @@ clearing the council's gates.
 
 **ADR 057 cascade catalog.** ADR 067 extends ADR 057
 by one variant (`FsstRowSafe`) and one new on-disk
-frame magic (`WFS2`). The existing `Fsst` cascade and
-`WFS1` frame remain unchanged. ADR 057's selection
+frame magic (`RSFS`). The existing `FsstWholeBuffer` cascade and
+`WBFS` frame remain unchanged. ADR 057's selection
 logic in `select.rs` is amended to opt into
 `FsstRowSafe` by default for variable-width string
-columns; operators can downgrade to `Fsst` via
+columns; operators can downgrade to `FsstWholeBuffer` via
 configuration if needed.
 
 **ADR 058 / 059 evaluator catalog.** ADR 067 extends
@@ -990,13 +1020,13 @@ Case B. No surface change.
 
 **ADR 063 page stats.** `FsstRowSafe` is buffer-grain,
 not page-grain. `emits_pages_in_v1()` is unchanged
-for both `Fsst` and `FsstRowSafe`. Page-grain support
+for both `FsstWholeBuffer` and `FsstRowSafe`. Page-grain support
 is a separate ADR coupled with ADR 057 page-emission
 for FSST.
 
 **ADR 065 dense predicate-zip.** ADR 067 reduces ADR
 065's V1 engagement surface further: `FsstRowSafe`
-buffers on Sub-case A1 migrate to Case A. `Fsst`
+buffers on Sub-case A1 migrate to Case A. `FsstWholeBuffer`
 buffers (existing data) continue to use Strategy A
 (ADR 066 V1) and migrate per ADR 066's rules. Sub-
 case A2 stays on Case B for both variants.
@@ -1008,7 +1038,7 @@ reads on row-safe-FSST-keyed secondary indexes gain
 the additional CPU win.
 
 **ADR 066 V1 reader.** The Strategy A path remains the
-dispatch target for `EncodingCascade::Fsst` cascade
+dispatch target for `EncodingCascade::FsstWholeBuffer` cascade
 buffers (existing data). No interaction with Strategy
 B's path beyond shared evaluator-catalog and
 dispatch infrastructure.
@@ -1021,7 +1051,7 @@ Incremental guards in `tests/architecture_test.rs`:
   (`FsstRowSafe`); existing variants unchanged.
 - `EncodingComputeEvaluatorKind` extends by exactly
   one variant (`FsstRowSafe`); existing seven
-  unchanged (after ADR 066's `Fsst` addition).
+  unchanged (after ADR 066's `FsstWholeBuffer` addition).
 - `evaluator_kind_for_cascade` maps `FsstRowSafe →
   EncodingComputeEvaluatorKind::FsstRowSafe`.
 - `encoding_compute_predicate_data_type_supported_for_evaluator`
@@ -1059,14 +1089,14 @@ Incremental guards in `tests/architecture_test.rs`:
 - **Per-buffer actual-size guard fires before
   `FsstRowSafe` selection**: writer rejects
   `FsstRowSafe` on a buffer-by-buffer basis if
-  `wfs2_len > ceil(wfs1_len * 1.10)` or
-  `wfs2_len > decoded_plaintext_len` (verified by
+  `fsst_row_safe_len > ceil(fsst_whole_buffer_len * 1.10)` or
+  `fsst_row_safe_len > decoded_plaintext_len` (verified by
   selection guard on representative short-row and
   long-row fixtures).
 - Pre-encoded literal cache is per-buffer-per-
   literal, not per-row.
 - The boundary-crossing-symbol fixture is
-  repurposed: it now verifies that the WFS2 writer
+  repurposed: it now verifies that the RSFS writer
   correctly DOES NOT produce cross-row symbols, even
   on input where such pairs are frequent. The
   fixture stays load-bearing for writer correctness.
@@ -1087,7 +1117,7 @@ Incremental guards in `tests/architecture_test.rs`:
   three-case dispatch, ADR 066 V1 reader: all
   unchanged.
 - Cross-replica byte-equal mask output across two
-  writers with the same WFS2 fixture and same
+  writers with the same RSFS fixture and same
   predicate.
 - ADR 060 / 064 mask-only sparse projection byte-
   identical pre / post on shared fixtures (mask
@@ -1165,13 +1195,13 @@ Bench artifact records (matching ADR 060 / 063 / 064
   Strategy B engagement to record byte savings via
   Case A migration).
 - ADR 066 V1 (Strategy A) baseline rows on the
-  same fixtures encoded under `Fsst` (existing
+  same fixtures encoded under `FsstWholeBuffer` (existing
   data path); record kernel-vs-Strategy-B delta.
 - ADR 052 confirm-step row (FsstRowSafe-keyed
   secondary-index point read; conditional on
   existing test harness ability per ADR 066's
   composability discussion).
-- Corruption fixtures (malformed WFS2 frame, non-
+- Corruption fixtures (malformed RSFS frame, non-
   monotonic `block_offsets` pair entries (either
   field), `block_offsets[0] != (0, 0)`,
   `exception_count` not equal to the count of
@@ -1183,7 +1213,7 @@ Bench artifact records (matching ADR 060 / 063 / 064
 - Cross-replica determinism on representative
   fixtures.
 - **Compression-ratio rows**: encoded byte length
-  ratio of `FsstRowSafe` vs `Fsst` on the same
+  ratio of `FsstRowSafe` vs `FsstWholeBuffer` on the same
   input, for each warehouse fixture. **Promotion
   gate: ≤10% compression loss.**
 
@@ -1209,9 +1239,9 @@ cadence)**:
    atoms / types / layouts).
 4. **Compression-ratio loss ≤ 10%** on
    representative warehouse fixtures vs. existing
-   `Fsst` cascade. **New gate.** Workloads where
+   `FsstWholeBuffer` cascade. **New gate.** Workloads where
    the loss exceeds 10% are noted; operators can
-   explicitly downgrade to `Fsst` cascade for
+   explicitly downgrade to `FsstWholeBuffer` cascade for
    those workloads.
 
 Headline diagnostics (recorded, not gating):
@@ -1227,7 +1257,7 @@ Headline diagnostics (recorded, not gating):
   any byte comparison).
 - Total query plaintext byte reduction across the
   dense baseline vs. Strategy B kernel path.
-- WFS1 vs. WFS2 compression ratio per fixture.
+- WBFS vs. RSFS compression ratio per fixture.
 - **ADR 065 Case B/C surface reduction** as
   `FsstRowSafe` Sub-case A1 predicates migrate to
   Case A — quantifies the engagement-surface
@@ -1235,9 +1265,9 @@ Headline diagnostics (recorded, not gating):
 - **ADR 052 secondary-index confirm-step
   behavior** when the indexed predicate uses
   `FsstRowSafe` — point-read latency delta vs.
-  `Fsst` cascade.
+  `FsstWholeBuffer` cascade.
 - Strategy A vs. Strategy B wall-clock delta on
-  the same input encoded under both `Fsst` and
+  the same input encoded under both `FsstWholeBuffer` and
   `FsstRowSafe` — quantifies the Strategy B win
   over Strategy A.
 
@@ -1255,7 +1285,7 @@ Correctness gates:
   decoded offsets.
 - Length pre-filter zero byte-comparison work on
   Disjoint-length fixtures.
-- Corrupt WFS2 frames (bad magic, malformed
+- Corrupt RSFS frames (bad magic, malformed
   `block_offsets`, mis-sized `encoded_lengths`,
   exception-count mismatch, running-offset
   overshoot) fail closed through
@@ -1298,11 +1328,11 @@ ADR 067 does not ship:
   V1 always row-aligns. V2 if Phase 7 evidence
   reveals workloads where row-alignment is too
   expensive.
-- **Migration path for existing `Fsst` buffers.**
+- **Migration path for existing `FsstWholeBuffer` buffers.**
   V1 leaves them on Strategy A indefinitely.
   Operators can re-encode via row-group rewrite
   if they want to gain Strategy B.
-- **Removal of `EncodingCascade::Fsst` cascade
+- **Removal of `EncodingCascade::FsstWholeBuffer` cascade
   field's `symbol_table_byte_len`.** Same out-of-
   scope follow-up as ADR 066's V1 deferred. ADR
   067 carries the same zero-population pattern
@@ -1312,12 +1342,12 @@ ADR 067 does not ship:
 
 ## Rejected alternatives
 
-- **Reuse `EncodingCascade::Fsst` with a `row_safe:
+- **Reuse `EncodingCascade::FsstWholeBuffer` with a `row_safe:
   bool` flag.** Violates ADR 057's closed-catalog
   discipline and adds runtime branches at every
   cascade dispatch site. New variant is the clean
   addition.
-- **Insert per-row sentinel bytes in WFS1
+- **Insert per-row sentinel bytes in WBFS
   payload.** Cross-row sentinels add 1 byte per
   row of overhead AND don't help the reader find
   encoded byte ranges without parsing through
@@ -1326,17 +1356,17 @@ ADR 067 does not ship:
   approach's overhead) but supports O(1) random
   access via `block_offsets`, no payload parsing
   required.
-- **Encode each row as an independent WFS1 frame.**
+- **Encode each row as an independent WBFS frame.**
   Per-row symbol-table overhead is prohibitive
   for short rows (16-byte UUIDs would have
   bigger headers than payloads).
-- **Split WFS2 metadata (block_offsets +
+- **Split RSFS metadata (block_offsets +
   encoded_lengths + exception_lengths) into a
   separate buffer alongside validity + decoded
   offsets + values.** Requires manager.rs to
   handle 4-buffer leaves (currently 2 or 3). In-
   frame keeps the buffer count at 3 (validity +
-  decoded offsets + values) and the WFS2 frame
+  decoded offsets + values) and the RSFS frame
   self-contained. Phase 0 audit can revisit if
   frame parse cost proves prohibitive.
 - **Use 64-bit block payload offsets in V1.** 32-
@@ -1359,12 +1389,12 @@ ADR 067 does not ship:
   the row level — unused by V1 callers (Strategy
   B is sequential, dense decode is sequential,
   ADR 064/065 operate on dense Arrow offsets).
-- **Migrate existing `Fsst` buffers to
+- **Migrate existing `FsstWholeBuffer` buffers to
   `FsstRowSafe` automatically.** Implicit data
   migration violates ADR 057 row-group rewrite
   discipline. Operators re-encode explicitly if
   they want to migrate.
-- **Remove the existing `Fsst` cascade variant
+- **Remove the existing `FsstWholeBuffer` cascade variant
   after `FsstRowSafe` ships.** Existing on-disk
   data depends on the variant; removing it
   breaks readers. Closed-by-addition discipline
@@ -1391,7 +1421,7 @@ ADR 067 does not ship:
 - **Don't add a new `EncodingComputeRejectCode` /
   `EncodingComputeFallbackReason` /
   `PredicateAtomOp` / `EncodedRowMask` variant.**
-- **Don't change ADR 057 `Fsst` cascade byte
+- **Don't change ADR 057 `FsstWholeBuffer` cascade byte
   layout** or existing `BufferEncoding` /
   `EncodingDirectory` shape. Add `FsstRowSafe`
   as a new variant alongside.
@@ -1404,7 +1434,7 @@ ADR 067 does not ship:
 - **Don't introduce planning-phase identifiers,
   version suffixes, or project-name prefixes** on
   new symbols. (`FsstRowSafe` is structural, not
-  a version suffix; the on-disk magic `WFS2` is
+  a version suffix; the on-disk magic `RSFS` is
   a format-version marker which is acceptable
   for on-disk magic bytes per industry
   convention.)
@@ -1419,13 +1449,13 @@ ADR 067 does not ship:
 - **Don't introduce a process-wide pre-encoded-
   literal cache.**
 - **Don't assume `FsstRowSafe` preserves byte-
-  lexicographic order.** Same as `Fsst`; range
+  lexicographic order.** Same as `FsstWholeBuffer`; range
   predicates decline to dense.
 - **Don't decode any encoded byte on the
   predicate path.** Strategy B's structural
   inversion of Strategy A is the entire point.
 - **Don't slice the encoded values buffer by
-  Arrow decoded offsets.** Use the WFS2
+  Arrow decoded offsets.** Use the RSFS
   encoded-offsets table.
 - **Don't pre-encode literals per row.** Pre-
   encode once per buffer per literal.
@@ -1433,26 +1463,26 @@ ADR 067 does not ship:
   decoded offsets + values are all fetchable for
   the FSST leaf.** Same multi-buffer planner
   shape as ADR 066.
-- **Don't migrate existing `Fsst` buffers
+- **Don't migrate existing `FsstWholeBuffer` buffers
   implicitly to `FsstRowSafe`.** Re-encoding is
   an explicit operator action.
 
 ## Convergence summary
 
 ```text
-ADR 057 per-buffer pages + cascades (Fsst cascade
+ADR 057 per-buffer pages + cascades (FsstWholeBuffer cascade
   decode-only; multi-buffer values+offsets+validity
   layout for variable-width)
-  → ADR 058 substrate COCD (Fsst not in evaluator
+  → ADR 058 substrate COCD (FsstWholeBuffer not in evaluator
     catalog; single-buffer fixed-width planner shape)
-  → ADR 059 native COCD kernels (Fsst not native)
-  → ADR 060 sparse projection (Fsst not eligible;
+  → ADR 059 native COCD kernels (FsstWholeBuffer not native)
+  → ADR 060 sparse projection (FsstWholeBuffer not eligible;
     variable-width)
-  → ADR 063 page-level predicate stats (Fsst not
+  → ADR 063 page-level predicate stats (FsstWholeBuffer not
     page-emitting)
-  → ADR 064 nullable sparse projection (Fsst not
+  → ADR 064 nullable sparse projection (FsstWholeBuffer not
     eligible)
-  → ADR 065 dense predicate-zip (Fsst predicates
+  → ADR 065 dense predicate-zip (FsstWholeBuffer predicates
     route Case B/C via dense fallback)
   → ADR 066 FSST predicate evaluator V1 (Strategy A
     streaming token decode; reader-only;
@@ -1461,7 +1491,7 @@ ADR 057 per-buffer pages + cascades (Fsst cascade
   → ADR 067 row-safe FSST framing + Strategy B
     (this ADR; writer amendment + Strategy B
     reader; new EncodingCascade::FsstRowSafe
-    variant + new WFS2 frame magic; encoded-
+    variant + new RSFS frame magic; encoded-
     offsets-in-frame; pre-encoded literal compare
     avoids decode entirely on predicate path;
     ADR 057 cascade catalog extends by one;
@@ -1470,12 +1500,11 @@ ADR 057 per-buffer pages + cascades (Fsst cascade
     gates stricter than ADR 066 V1 because
     Strategy B's structural elimination of
     decode produces larger headroom; ≤10%
-    compression-ratio-loss gate; existing
-    Fsst buffers stay readable via Strategy A
-    indefinitely)
+    compression-ratio-loss gate; post-rename
+    FsstWholeBuffer buffers stay readable via Strategy A)
     ← here
   → next Toron-adjacent follow-ups (cascade-field
-    removal directory cleanup for both Fsst and
+    removal directory cleanup for both FsstWholeBuffer and
     FsstRowSafe, page-grain FsstRowSafe, sparse
     predicate-column fetch, variable-width sparse
     projection, encoded-validity page decoding,
@@ -1492,7 +1521,7 @@ ADR 067 promotes from council-converged → shipped
 when:
 
 1. Phase 0 audit pinned the existing FSST writer,
-   the WFS1 codec, the cascade catalog extension
+   the WBFS codec, the cascade catalog extension
    site, the format version bump procedure, and
    confirmed row-aligned encoding is achievable
    without an ADR 057 amendment beyond the
@@ -1503,7 +1532,7 @@ when:
 3. `EncodingComputeEvaluatorKind` extended by
    exactly one variant (`FsstRowSafe`, label
    `"fsst_row_safe"`); existing seven unchanged
-   (after ADR 066 added `Fsst`).
+   (after ADR 066 added `FsstWholeBuffer`).
    `evaluator_kind_for_cascade` and
    `encoding_compute_predicate_data_type_supported_for_evaluator`
    updated.
@@ -1513,7 +1542,7 @@ when:
    never emits a symbol pair spanning a row
    boundary (architectural guard via frame
    inspection on representative fixtures).
-6. WFS2 frame parser correctness: round-trip
+6. RSFS frame parser correctness: round-trip
    through writer + parser produces byte-
    identical decoded output to the input.
 7. Pre-encoded literal cache: per-buffer-per-
@@ -1548,9 +1577,9 @@ when:
       - dense-fallback overhead ≤ 5% on truly
         declined paths.
       - compression-ratio loss ≤ 10% vs.
-        existing `Fsst` cascade.
+        existing `FsstWholeBuffer` cascade.
       - cross-replica deterministic masks pass
-        on representative WFS2 fixtures (Codex's
+        on representative RSFS fixtures (Codex's
         iteration-2 addition; ADR 020 +
         canonical-encoder contract demand it).
       - writer overhead within ADR 057 writer-
@@ -1567,7 +1596,7 @@ when:
       - encoded-byte-range memcmp throughput
         vs. dense Arrow eq throughput.
       - per-fixture compression-ratio
-        comparison `Fsst` vs `FsstRowSafe`.
+        comparison `FsstWholeBuffer` vs `FsstRowSafe`.
 15. Default-enablement decision: if Phase 7 clears
     the council's gates, `FsstRowSafe` joins ADR
     059's default predicate allow-list AND
@@ -1579,7 +1608,7 @@ when:
 16. Architectural lockdown guards land per
     §"Architectural lockdown".
 17. ADR 057 §"Where we are" amended: `FsstRowSafe`
-    in cascade catalog; new WFS2 frame; format
+    in cascade catalog; new RSFS frame; format
     version bumped; default cascade for variable-
     width string columns updated per Phase 7
     outcome.
@@ -1597,7 +1626,7 @@ when:
     to Case A; ADR 065 V1 engagement surface
     narrows further.
 22. ADR 066 §"Where we are" amended: V1 Strategy
-    A path remains for `Fsst` cascade buffers
+    A path remains for `FsstWholeBuffer` cascade buffers
     indefinitely; new writes default to
     `FsstRowSafe` with Strategy B (ADR 067).
 23. ADR 020 / 022 / 056 / 057 / 058 / 059 / 060 /
@@ -1628,8 +1657,8 @@ drafts converged on the same answer.
    materialize.
 3. **New cascade variant `FsstRowSafe` (discriminant
    9, label `"fsst_row_safe"`) + new on-disk frame
-   magic `WFS2`** (Codex; all aligned). Reusing
-   `Fsst` with a flag would put format branching
+   magic `RSFS`** (Codex; all aligned). Reusing
+   `FsstWholeBuffer` with a flag would put format branching
    into every dispatch site and blur the proof
    boundary.
 
@@ -1644,15 +1673,15 @@ drafts converged on the same answer.
    "row-canonical" additionally guarantees
    determinism (sufficient).
 5. **Per-buffer actual-size writer guard** (Codex;
-   all aligned): `wfs2_len ≤
-   ceil(wfs1_len * 1.10)` AND `wfs2_len ≤
+   all aligned): `fsst_row_safe_len ≤
+   ceil(fsst_whole_buffer_len * 1.10)` AND `fsst_row_safe_len ≤
    decoded_plaintext_len`. Per-buffer runtime
    check, not just a bench-fixture gate. Prevents
    silent compression regression on shapes the
    fixture set missed.
 6. **Default cascade selection prefers
    `FsstRowSafe` when the guard clears**, falls
-   back to `Fsst` otherwise (Codex's guard formula
+   back to `FsstWholeBuffer` otherwise (Codex's guard formula
    reconciles Gemini's "default-on" with Codex's
    "evidence-gated promotion": once Phase 7
    evidence clears the gates, the guard becomes
@@ -1674,7 +1703,7 @@ drafts converged on the same answer.
    path's job, not Strategy B's. If the council
    later requires per-query full validation,
    that's a separate ADR + benchmark.
-9. **Dense WFS2 decode required and ships before
+9. **Dense RSFS decode required and ships before
    Strategy B may engage** (Codex; all aligned).
    Dense decode is the correctness oracle.
 
@@ -1684,11 +1713,11 @@ drafts converged on the same answer.
     in one ADR** (all aligned). Per ADR 066's
     commitment, and because each half is useless
     without the other.
-11. **No implicit migration of existing `Fsst`
+11. **No implicit migration of existing `FsstWholeBuffer`
     buffers** (all aligned). Re-encoding remains
     an explicit row-group rewrite operation; ADR
     066 V1 Strategy A reader stays the dispatch
-    target for `Fsst` cascade buffers
+    target for `FsstWholeBuffer` cascade buffers
     indefinitely.
 
 **Promotion gates:**
@@ -1698,11 +1727,11 @@ drafts converged on the same answer.
     predicate wall-clock + ≥1.5× end-to-end
     **as gates** (vs ADR 066's ≥1.5× / ≥1.2×).
     ≤5% dense-fallback overhead (carry-forward).
-    ≤10% compression-ratio loss vs `Fsst` on
+    ≤10% compression-ratio loss vs `FsstWholeBuffer` on
     representative warehouse fixtures (new gate;
     threshold may adjust based on Phase 0
     evidence). Cross-replica deterministic masks
-    on representative WFS2 fixtures (Codex's
+    on representative RSFS fixtures (Codex's
     iteration-2 addition). Writer-cost budget
     within ADR 057 budget. ≥5× CPU speedup is a
     recorded headline diagnostic, not a gate.

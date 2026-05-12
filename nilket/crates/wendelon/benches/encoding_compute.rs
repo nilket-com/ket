@@ -21,7 +21,7 @@
 //!   decision. The (classify_then_fallback - dense_micro) /
 //!   dense_micro ratio is the real "<= 5%" gate evidence.
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::collections::BTreeSet;
@@ -53,6 +53,10 @@ use wendelon::storage::encoding::compute::{
 	evaluate_fsst_row_safe_predicate_with_stats, evaluator_kind_for_cascade,
 	try_fold_encoded_aggregate_request,
 };
+use wendelon::storage::encoding::directory::{
+	build_encoding_directory_for_ipc_stream,
+	build_encoding_directory_for_ipc_stream_exact_fsst_for_bench,
+};
 use wendelon::storage::encoding::page::expand_page_descriptors;
 use wendelon::storage::encoding::select::select_and_encode_buffer_with_value_offsets;
 use wendelon::storage::encoding::{
@@ -61,16 +65,29 @@ use wendelon::storage::encoding::{
 use wendelon::storage::multirow::MultiRowSourceRow;
 use wendelon::storage::{
 	ColumnFetchRequirement, ColumnOrdinalSet, EncodingWriterConfig, PlaintextByteRange,
-	RowGroupWriterConfig, TieredRecordId, decode_projected_row_groups_from_plaintext_ranges,
-	encode_multirow_from_survivors_with_row_group_and_encoding_config,
+	RowGroupWriterConfig, TieredRecordId, build_page_directory_for_ipc_stream,
+	decode_projected_row_groups_from_plaintext_ranges,
+	encode_multirow_from_survivors_with_row_group_and_encoding_config, encode_record_batches_bytes,
 	parse_record_buffer_directory, selected_row_group_record_body_ranges,
 };
 
 const PAGE_VALUES: u32 = 256;
+const WRITER_COLUMN_CACHE_VALUE_BUFFER_BYTE_TARGET: usize = 1024 * 1024;
+const WRITER_COLUMN_CACHE_IPC_STREAM_VALUE_BYTE_TARGET: usize = 4 * 1024 * 1024;
+const WRITER_COLUMN_CACHE_ROW_GROUP_ROW_TARGET: usize = 65_536;
+const WRITER_COLUMN_CACHE_IPC_STREAM_ROW_TARGET: usize = 65_536;
 
 fn main() -> std::io::Result<()> {
 	let config = BenchConfig::from_args();
 	for rows in config.rows.iter().copied() {
+		if config.writer_column_cache_only {
+			bench_fsst_row_safe_writer_column_cache_matrix(&config, rows)?;
+			continue;
+		}
+		if config.fsst_writer_only {
+			bench_fsst_row_safe_writer_matrix(&config, rows)?;
+			continue;
+		}
 		let fixtures = build_fixtures(rows)?;
 		for fixture in &fixtures {
 			bench_predicate_cocd(&config, fixture)?;
@@ -82,6 +99,7 @@ fn main() -> std::io::Result<()> {
 		bench_fsst_row_safe_predicate_matrix(&config, rows)?;
 		bench_fsst_row_safe_declined_paths(&config, rows)?;
 		bench_fsst_row_safe_writer_matrix(&config, rows)?;
+		bench_fsst_row_safe_writer_column_cache_matrix(&config, rows)?;
 		bench_fsst_row_safe_cross_replica_determinism(&config, rows)?;
 		bench_fsst_declined_paths(&config, rows)?;
 		bench_fsst_cross_replica_determinism(&config, rows)?;
@@ -118,20 +136,66 @@ fn main() -> std::io::Result<()> {
 struct BenchConfig {
 	rows: Vec<usize>,
 	iterations: usize,
+	writer_column_cache_only: bool,
+	writer_column_cache_fixture: Option<String>,
+	fsst_writer_only: bool,
 }
 
 impl BenchConfig {
 	fn from_args() -> Self {
 		let quick = std::env::args().any(|arg| arg == "--quick");
+		let writer_column_cache_only =
+			std::env::args().any(|arg| arg == "--writer-column-cache-only");
+		let fsst_writer_only = std::env::args().any(|arg| arg == "--fsst-writer-only");
+		let writer_column_cache_fixture = std::env::args().find_map(|arg| {
+			arg.strip_prefix("--writer-column-cache-fixture=")
+				.map(str::to_owned)
+		});
+		let writer_column_cache_rows = std::env::args().find_map(|arg| {
+			arg.strip_prefix("--writer-column-cache-rows=")
+				.map(str::to_owned)
+		});
+		let rows = writer_column_cache_rows
+			.as_deref()
+			.map(|rows| {
+				rows.split(',')
+					.filter_map(|row| row.parse::<usize>().ok())
+					.collect::<Vec<_>>()
+			})
+			.filter(|rows| !rows.is_empty());
 		if quick {
+			if let Some(rows) = rows {
+				Self {
+					rows,
+					iterations: 50,
+					writer_column_cache_only,
+					writer_column_cache_fixture,
+					fsst_writer_only,
+				}
+			} else {
+				Self {
+					rows: vec![8_192],
+					iterations: 50,
+					writer_column_cache_only,
+					writer_column_cache_fixture,
+					fsst_writer_only,
+				}
+			}
+		} else if let Some(rows) = rows {
 			Self {
-				rows: vec![8_192],
-				iterations: 50,
+				rows,
+				iterations: 200,
+				writer_column_cache_only,
+				writer_column_cache_fixture,
+				fsst_writer_only,
 			}
 		} else {
 			Self {
 				rows: vec![8_192, 65_536, 1_048_576],
 				iterations: 200,
+				writer_column_cache_only,
+				writer_column_cache_fixture,
+				fsst_writer_only,
 			}
 		}
 	}
@@ -624,9 +688,35 @@ fn fsst_long_pair_eq_5p_fixture(rows: usize) -> std::io::Result<FsstFixture> {
 	Ok(fixture)
 }
 
+fn fsst_log_line_eq_5p_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	let selected_rows = rows.saturating_div(20).max(1);
+	let hot =
+		b"level=error service=checkout region=us-east-1 status=500 message=payment_authorization_timeout"
+			.to_vec();
+	let mut fixture = fsst_fixture(rows, "fsst_log_line_eq_5p", |row| {
+		if row < selected_rows {
+			"level=error service=checkout region=us-east-1 status=500 message=payment_authorization_timeout"
+				.to_string()
+		} else {
+			format!(
+				"level=info service=checkout region=us-east-1 status=200 request_id={row:08} message=completed_cart_checkout user={:06}",
+				row % 100_000
+			)
+		}
+	})?;
+	fixture.atom = string_atom(PredicateAtomOp::Eq, &hot);
+	Ok(fixture)
+}
+
 fn fsst_short_string_fixture(rows: usize) -> std::io::Result<FsstFixture> {
 	fsst_fixture(rows, "fsst_short_string_diag", |row| {
 		format!("{:02x}", row % 256)
+	})
+}
+
+fn fsst_metadata_floor_decline_fixture(rows: usize) -> std::io::Result<FsstFixture> {
+	fsst_fixture(rows, "fsst_metadata_floor_decline_diag", |_row| {
+		"a".to_string()
 	})
 }
 
@@ -669,7 +759,7 @@ fn fsst_fixture(
 		offsets.push(offset);
 		offsets_u64.push(offset as u64);
 	}
-	let cascade = EncodingCascade::Fsst {
+	let cascade = EncodingCascade::FsstWholeBuffer {
 		symbol_table_byte_len: RecordBodyByteLen::ZERO,
 	};
 	let encoded = encode_value_count_buffer(&decoded, &DataType::Utf8, &cascade, rows)?;
@@ -758,6 +848,7 @@ fn bench_fsst_predicate_matrix(config: &BenchConfig, rows: usize) -> std::io::Re
 		fsst_repeated_prefix_fixture(rows)?,
 		fsst_url_eq_5p_fixture(rows)?,
 		fsst_url_inlist4_5p_fixture(rows)?,
+		fsst_log_line_eq_5p_fixture(rows)?,
 		fsst_short_string_fixture(rows)?,
 		fsst_weak_compression_fixture(rows)?,
 		fsst_disjoint_length_fixture(rows)?,
@@ -855,35 +946,35 @@ fn fsst_row_safe_frame_lengths(
 	encoded: &[u8],
 	rows: usize,
 ) -> std::io::Result<FsstRowSafeFrameLengths> {
-	if encoded.len() < 13 || &encoded[..4] != b"WFS2" {
+	if encoded.len() < 13 || &encoded[..4] != b"RSFS" {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 frame header missing",
+			"RSFS frame header missing",
 		));
 	}
 	let symbol_count = encoded[4] as usize;
 	let symbol_table_bytes = symbol_count.checked_mul(2).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 symbol table overflow",
+			"RSFS symbol table overflow",
 		)
 	})?;
 	let row_count_offset = 5_usize.checked_add(symbol_table_bytes).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 row-count offset overflow",
+			"RSFS row-count offset overflow",
 		)
 	})?;
 	let row_count_end = row_count_offset.checked_add(4).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 row-count end overflow",
+			"RSFS row-count end overflow",
 		)
 	})?;
 	if encoded.len() < row_count_end {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 row-count field truncated",
+			"RSFS row-count field truncated",
 		));
 	}
 	let row_count = u32::from_le_bytes(
@@ -894,7 +985,7 @@ fn fsst_row_safe_frame_lengths(
 	if row_count != rows {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 row count mismatch",
+			"RSFS row count mismatch",
 		));
 	}
 	const FSST_ROW_SAFE_BLOCK_ROWS: usize = 256;
@@ -902,31 +993,33 @@ fn fsst_row_safe_frame_lengths(
 	let block_offset_bytes = block_count.checked_mul(8).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 block_offsets table overflow",
+			"RSFS block_offsets table overflow",
 		)
 	})?;
-	let lengths_start = row_count_end.checked_add(block_offset_bytes).ok_or_else(|| {
-		std::io::Error::new(
-			std::io::ErrorKind::InvalidData,
-			"WFS2 block_offsets end overflow",
-		)
-	})?;
+	let lengths_start = row_count_end
+		.checked_add(block_offset_bytes)
+		.ok_or_else(|| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"RSFS block_offsets end overflow",
+			)
+		})?;
 	let exception_count_start = lengths_start.checked_add(row_count).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 encoded_lengths end overflow",
+			"RSFS encoded_lengths end overflow",
 		)
 	})?;
 	let exception_count_end = exception_count_start.checked_add(4).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 exception_count end overflow",
+			"RSFS exception_count end overflow",
 		)
 	})?;
 	if encoded.len() < exception_count_end {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 metadata truncated",
+			"RSFS metadata truncated",
 		));
 	}
 	let exception_count = u32::from_le_bytes(
@@ -937,7 +1030,7 @@ fn fsst_row_safe_frame_lengths(
 	let exception_bytes = exception_count.checked_mul(4).ok_or_else(|| {
 		std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 exception_lengths overflow",
+			"RSFS exception_lengths overflow",
 		)
 	})?;
 	let payload_start = exception_count_end
@@ -945,13 +1038,13 @@ fn fsst_row_safe_frame_lengths(
 		.ok_or_else(|| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
-				"WFS2 payload start overflow",
+				"RSFS payload start overflow",
 			)
 		})?;
 	if payload_start > encoded.len() {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 metadata table truncated",
+			"RSFS metadata table truncated",
 		));
 	}
 	// metadata = block_offsets + encoded_lengths + 4-byte exception_count + exception_lengths
@@ -984,10 +1077,10 @@ fn fsst_row_safe_literal_cache_bytes(
 	encoded: &[u8],
 	atom: &PredicateAtom,
 ) -> std::io::Result<usize> {
-	if encoded.len() < 13 || &encoded[..4] != b"WFS2" {
+	if encoded.len() < 13 || &encoded[..4] != b"RSFS" {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 frame header missing",
+			"RSFS frame header missing",
 		));
 	}
 	let symbol_count = encoded[4] as usize;
@@ -995,19 +1088,19 @@ fn fsst_row_safe_literal_cache_bytes(
 		.checked_add(symbol_count.checked_mul(2).ok_or_else(|| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
-				"WFS2 symbol table overflow",
+				"RSFS symbol table overflow",
 			)
 		})?)
 		.ok_or_else(|| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
-				"WFS2 symbol table end overflow",
+				"RSFS symbol table end overflow",
 			)
 		})?;
 	if symbol_table_end > encoded.len() {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
-			"WFS2 symbol table truncated",
+			"RSFS symbol table truncated",
 		));
 	}
 	let mut pair_to_symbol = vec![u16::MAX; 65_536];
@@ -1021,7 +1114,7 @@ fn fsst_row_safe_literal_cache_bytes(
 		encode_fsst_payload_with_symbol_map(literal, &pair_to_symbol, &mut out).map_err(|err| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidData,
-				format!("WFS2 literal pre-encode failed: {err:?}"),
+				format!("RSFS literal pre-encode failed: {err:?}"),
 			)
 		})?;
 		total = total.saturating_add(out.len());
@@ -1051,6 +1144,10 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 		(
 			fsst_long_pair_eq_5p_fixture(rows)?,
 			"fsst_row_safe_long_pair_eq_5p",
+		),
+		(
+			fsst_log_line_eq_5p_fixture(rows)?,
+			"fsst_row_safe_log_line_eq_5p",
 		),
 		(
 			fsst_short_string_fixture(rows)?,
@@ -1106,14 +1203,14 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 			strategy_b_elapsed,
 		);
 
-		let dense_wfs2_elapsed = bench(config.iterations, || {
+		let dense_fsst_row_safe_elapsed = bench(config.iterations, || {
 			let decoded = dense_decode(
 				black_box(&row_safe_fixture.encoded),
 				black_box(&row_safe_fixture.data_type),
 				black_box(&row_safe_fixture.cascade),
 				black_box(&row_safe_fixture.encoding),
 			)
-			.expect("bench RowSafe dense WFS2 decode");
+			.expect("bench RowSafe dense RSFS decode");
 			let selected = fsst_dense_string_compare(
 				&decoded,
 				&row_safe_fixture.offsets,
@@ -1122,12 +1219,12 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 			black_box(selected);
 		});
 		emit_row(
-			"fsst_row_safe_dense_wfs2",
+			"fsst_row_safe_dense_fsst_row_safe",
 			row_safe_fixture.name,
 			row_safe_fixture.rows,
 			row_safe_fixture.encoded.len() as u64,
 			config.iterations,
-			dense_wfs2_elapsed,
+			dense_fsst_row_safe_elapsed,
 		);
 
 		let strategy_a_coercion =
@@ -1156,25 +1253,25 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 			strategy_a_elapsed,
 		);
 
-		let dense_wfs1_elapsed = bench(config.iterations, || {
+		let dense_fsst_whole_buffer_elapsed = bench(config.iterations, || {
 			let decoded = dense_decode(
 				black_box(&fsst_fixture.encoded),
 				black_box(&fsst_fixture.data_type),
 				black_box(&fsst_fixture.cascade),
 				black_box(&fsst_fixture.encoding),
 			)
-			.expect("bench FSST dense WFS1 decode");
+			.expect("bench FSST dense WBFS decode");
 			let selected =
 				fsst_dense_string_compare(&decoded, &fsst_fixture.offsets, &fsst_fixture.atom);
 			black_box(selected);
 		});
 		emit_row(
-			"fsst_dense_wfs1_baseline",
+			"fsst_dense_fsst_whole_buffer_baseline",
 			fsst_fixture.name,
 			fsst_fixture.rows,
 			fsst_fixture.encoded.len() as u64,
 			config.iterations,
-			dense_wfs1_elapsed,
+			dense_fsst_whole_buffer_elapsed,
 		);
 
 		let dense_decoded = dense_decode(
@@ -1183,7 +1280,7 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 			&row_safe_fixture.cascade,
 			&row_safe_fixture.encoding,
 		)
-		.expect("bench RowSafe dense WFS2 oracle");
+		.expect("bench RowSafe dense RSFS oracle");
 		let dense_digest = bool_mask_digest(&fsst_dense_string_compare(
 			&dense_decoded,
 			&row_safe_fixture.offsets,
@@ -1206,7 +1303,7 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 		let literal_cache_bytes =
 			fsst_row_safe_literal_cache_bytes(&row_safe_fixture.encoded, &row_safe_fixture.atom)?;
 		println!(
-			"encoding_compute_bench scenario=fsst_row_safe_recorded_diagnostic route=fsst_row_safe_kernel_case_a1 fixture={} rows={} iterations={} wfs2_encoded_bytes={} wfs2_payload_bytes={} wfs2_symbol_table_bytes={} wfs2_metadata_bytes={} wfs1_encoded_bytes={} decoded_plaintext_bytes={} wfs2_vs_wfs1_ratio_micros={} strategy_b_vs_dense_wfs2_cpu_micros={} strategy_b_vs_dense_wfs1_cpu_micros={} strategy_b_vs_strategy_a_cpu_micros={} speedup_vs_dense_wfs2_micros={} speedup_vs_dense_wfs1_micros={} speedup_vs_strategy_a_micros={} mask_equal_dense={} mask_equal_strategy_a={} preencoded_literal_cache_bytes={} decoded_length_match_rows={} decoded_length_mismatch_rows={} encoded_length_match_rows={} encoded_length_mismatch_rows={} encoded_payload_memcmp_bytes={} decoded_prefilter_elimination_micros={} encoded_prefilter_elimination_micros={}",
+			"encoding_compute_bench scenario=fsst_row_safe_recorded_diagnostic route=fsst_row_safe_kernel_case_a1 fixture={} rows={} iterations={} fsst_row_safe_encoded_bytes={} fsst_row_safe_payload_bytes={} fsst_row_safe_symbol_table_bytes={} fsst_row_safe_metadata_bytes={} fsst_whole_buffer_encoded_bytes={} decoded_plaintext_bytes={} fsst_row_safe_vs_fsst_whole_buffer_ratio_micros={} strategy_b_vs_dense_fsst_row_safe_cpu_micros={} strategy_b_vs_dense_fsst_whole_buffer_cpu_micros={} strategy_b_vs_strategy_a_cpu_micros={} speedup_vs_dense_fsst_row_safe_micros={} speedup_vs_dense_fsst_whole_buffer_micros={} speedup_vs_strategy_a_micros={} mask_equal_dense={} mask_equal_strategy_a={} preencoded_literal_cache_bytes={} decoded_length_match_rows={} decoded_length_mismatch_rows={} encoded_length_match_rows={} encoded_length_mismatch_rows={} encoded_payload_memcmp_bytes={} decoded_prefilter_elimination_micros={} encoded_prefilter_elimination_micros={}",
 			row_safe_fixture.name,
 			row_safe_fixture.rows,
 			config.iterations,
@@ -1220,11 +1317,11 @@ fn bench_fsst_row_safe_predicate_matrix(config: &BenchConfig, rows: usize) -> st
 				row_safe_fixture.encoded.len() as u64,
 				fsst_fixture.encoded.len() as u64
 			),
-			duration_ratio_micros(strategy_b_elapsed, dense_wfs2_elapsed),
-			duration_ratio_micros(strategy_b_elapsed, dense_wfs1_elapsed),
+			duration_ratio_micros(strategy_b_elapsed, dense_fsst_row_safe_elapsed),
+			duration_ratio_micros(strategy_b_elapsed, dense_fsst_whole_buffer_elapsed),
 			duration_ratio_micros(strategy_b_elapsed, strategy_a_elapsed),
-			duration_ratio_micros(dense_wfs2_elapsed, strategy_b_elapsed),
-			duration_ratio_micros(dense_wfs1_elapsed, strategy_b_elapsed),
+			duration_ratio_micros(dense_fsst_row_safe_elapsed, strategy_b_elapsed),
+			duration_ratio_micros(dense_fsst_whole_buffer_elapsed, strategy_b_elapsed),
 			duration_ratio_micros(strategy_a_elapsed, strategy_b_elapsed),
 			row_safe_digest == dense_digest,
 			row_safe_digest == strategy_a_digest,
@@ -1366,7 +1463,7 @@ fn bench_fsst_row_safe_declined_paths(config: &BenchConfig, rows: usize) -> std:
 	});
 	emit_row(
 		"fsst_row_safe_corruption_fail_closed",
-		"wfs2_magic",
+		"fsst_row_safe_magic",
 		fixture.rows,
 		fixture.encoded.len() as u64,
 		iterations,
@@ -1379,6 +1476,7 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 	let fixtures = [
 		fsst_long_pair_eq_5p_fixture(rows)?,
 		fsst_repeated_prefix_fixture(rows)?,
+		fsst_log_line_eq_5p_fixture(rows)?,
 		fsst_short_string_fixture(rows)?,
 		fsst_weak_compression_fixture(rows)?,
 	];
@@ -1387,19 +1485,19 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
 		enabled_cascades: BTreeSet::from([
 			EncodingCascadeKind::Plain,
-			EncodingCascadeKind::Fsst,
+			EncodingCascadeKind::FsstWholeBuffer,
 			EncodingCascadeKind::FsstRowSafe,
 		]),
 		..EncodingWriterConfig::default()
 	};
 	for fixture in &fixtures {
-		let fsst_cascade = EncodingCascade::Fsst {
+		let fsst_cascade = EncodingCascade::FsstWholeBuffer {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		};
 		let row_safe_cascade = EncodingCascade::FsstRowSafe {
 			symbol_table_byte_len: RecordBodyByteLen::ZERO,
 		};
-		let wfs1_elapsed = bench(config.iterations, || {
+		let fsst_whole_buffer_elapsed = bench(config.iterations, || {
 			let encoded = encode_buffer_with_value_offsets(
 				black_box(&fixture.decoded),
 				black_box(&fixture.data_type),
@@ -1408,11 +1506,11 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 				SimdPageValueCount::new(PAGE_VALUES),
 				Some(black_box(&fixture.offsets_u64)),
 			)
-			.expect("bench WFS1 writer");
+			.expect("bench WBFS writer");
 			black_box(encoded);
 		});
 		let dual_elapsed = bench(config.iterations, || {
-			let wfs1 = encode_buffer_with_value_offsets(
+			let fsst_whole_buffer = encode_buffer_with_value_offsets(
 				black_box(&fixture.decoded),
 				black_box(&fixture.data_type),
 				black_box(fsst_cascade.clone()),
@@ -1420,8 +1518,8 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 				SimdPageValueCount::new(PAGE_VALUES),
 				Some(black_box(&fixture.offsets_u64)),
 			)
-			.expect("bench WFS1 writer");
-			let wfs2 = encode_buffer_with_value_offsets(
+			.expect("bench WBFS writer");
+			let fsst_row_safe = encode_buffer_with_value_offsets(
 				black_box(&fixture.decoded),
 				black_box(&fixture.data_type),
 				black_box(row_safe_cascade.clone()),
@@ -1429,8 +1527,19 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 				SimdPageValueCount::new(PAGE_VALUES),
 				Some(black_box(&fixture.offsets_u64)),
 			)
-			.expect("bench WFS2 writer");
-			black_box((wfs1, wfs2));
+			.expect("bench RSFS writer");
+			black_box((fsst_whole_buffer, fsst_row_safe));
+		});
+		let selected_elapsed = bench(config.iterations, || {
+			let selected = select_and_encode_buffer_with_value_offsets(
+				black_box(&fixture.decoded),
+				black_box(&fixture.data_type),
+				BufferValueCount::new(fixture.rows as u32),
+				black_box(&writer_config),
+				Some(black_box(&fixture.offsets_u64)),
+			)
+			.expect("bench production FSST writer selection");
+			black_box(selected);
 		});
 		let selected = select_and_encode_buffer_with_value_offsets(
 			&fixture.decoded,
@@ -1442,18 +1551,20 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 		let row_safe = fsst_row_safe_fixture_from(fixture, "fsst_row_safe_writer_probe")?;
 		let route = match selected.cascade {
 			EncodingCascade::FsstRowSafe { .. } => "fsst_row_safe_writer_selected",
-			EncodingCascade::Fsst { .. } => "fsst_row_safe_writer_declined_to_fsst",
+			EncodingCascade::FsstWholeBuffer { .. } => "fsst_row_safe_writer_declined_to_fsst",
 			_ => "fsst_row_safe_writer_declined_to_plain",
 		};
 		println!(
-			"encoding_compute_bench scenario=fsst_row_safe_writer route={} fixture={} rows={} iterations={} wfs1_writer_ms={:.3} dual_writer_ms={:.3} dual_vs_wfs1_cpu_micros={} wfs1_encoded_bytes={} wfs2_encoded_bytes={} selected_cascade={} selected_encoded_bytes={} wfs2_vs_wfs1_ratio_micros={}",
+			"encoding_compute_bench scenario=fsst_row_safe_writer route={} fixture={} rows={} iterations={} fsst_whole_buffer_writer_ms={:.3} dual_writer_ms={:.3} selected_writer_ms={:.3} dual_vs_fsst_whole_buffer_cpu_micros={} selected_vs_dual_cpu_micros={} fsst_whole_buffer_encoded_bytes={} fsst_row_safe_encoded_bytes={} selected_cascade={} selected_encoded_bytes={} fsst_row_safe_vs_fsst_whole_buffer_ratio_micros={}",
 			route,
 			fixture.name,
 			fixture.rows,
 			config.iterations,
-			wfs1_elapsed.as_secs_f64() * 1_000.0,
+			fsst_whole_buffer_elapsed.as_secs_f64() * 1_000.0,
 			dual_elapsed.as_secs_f64() * 1_000.0,
-			duration_ratio_micros(dual_elapsed, wfs1_elapsed),
+			selected_elapsed.as_secs_f64() * 1_000.0,
+			duration_ratio_micros(dual_elapsed, fsst_whole_buffer_elapsed),
+			duration_ratio_micros(selected_elapsed, dual_elapsed),
 			fixture.encoded.len(),
 			row_safe.encoded.len(),
 			selected.cascade.kind().as_str(),
@@ -1462,6 +1573,450 @@ fn bench_fsst_row_safe_writer_matrix(config: &BenchConfig, rows: usize) -> std::
 		);
 	}
 	Ok(())
+}
+
+fn bench_fsst_row_safe_writer_column_cache_matrix(
+	config: &BenchConfig,
+	rows: usize,
+) -> std::io::Result<()> {
+	let fixtures = [
+		fsst_url_eq_5p_fixture(rows)?,
+		fsst_url_inlist4_5p_fixture(rows)?,
+		fsst_long_pair_eq_5p_fixture(rows)?,
+		fsst_weak_compression_fixture(rows)?,
+		fsst_log_line_eq_5p_fixture(rows)?,
+		fsst_short_string_fixture(rows)?,
+	];
+	let metadata_floor_decline = fsst_metadata_floor_decline_fixture(rows)?;
+	let writer_config = EncodingWriterConfig {
+		enabled: true,
+		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
+		enabled_cascades: BTreeSet::from([
+			EncodingCascadeKind::Plain,
+			EncodingCascadeKind::FsstWholeBuffer,
+			EncodingCascadeKind::FsstRowSafe,
+		]),
+		..EncodingWriterConfig::default()
+	};
+	let row_group_config = RowGroupWriterConfig::scan().with_enabled(true);
+	let record_id = TieredRecordId {
+		slab_id: SlabId::new(68),
+		record_offset: RecordBodyByteOffset::ZERO,
+	};
+	let selected_fixtures =
+		if config.writer_column_cache_fixture.as_deref() == Some(metadata_floor_decline.name) {
+			vec![&metadata_floor_decline]
+		} else {
+			fixtures
+				.iter()
+				.filter(
+					|fixture| match config.writer_column_cache_fixture.as_deref() {
+						Some(filter) => fixture.name == filter,
+						None => true,
+					},
+				)
+				.collect::<Vec<_>>()
+		};
+	for fixture in selected_fixtures {
+		for requested_row_groups in [1_usize, 2, 4, 8, 16] {
+			let group_count = requested_row_groups.min(rows.max(1));
+			let rows_per_group = rows.div_ceil(group_count);
+			let values = fsst_fixture_strings(fixture)?;
+			let prepared_shards = prepare_writer_column_cache_string_shards(
+				&values,
+				rows_per_group,
+				record_id,
+				&row_group_config,
+			)?;
+			let actual_row_groups = prepared_shards
+				.iter()
+				.map(|shard| shard.batches.len())
+				.sum::<usize>();
+			let elapsed = bench(config.iterations, || {
+				for shard in &prepared_shards {
+					let result = build_encoding_directory_for_ipc_stream(
+						record_id,
+						black_box(&shard.ipc_bytes),
+						black_box(&shard.page_directory),
+						black_box(&shard.batches),
+						black_box(&writer_config),
+						black_box(&row_group_config),
+					)
+					.expect("bench writer column-cache encoding directory");
+					black_box(result);
+				}
+			});
+			let exact_elapsed = bench(config.iterations, || {
+				for shard in &prepared_shards {
+					let result = build_encoding_directory_for_ipc_stream_exact_fsst_for_bench(
+						record_id,
+						black_box(&shard.ipc_bytes),
+						black_box(&shard.page_directory),
+						black_box(&shard.batches),
+						black_box(&writer_config),
+						black_box(&row_group_config),
+					)
+					.expect("bench exact FSST encoding directory");
+					black_box(result);
+				}
+			});
+			let mut observed_value_buffers = 0_usize;
+			let mut cache_miss_estimate = 0_usize;
+			let mut cache_hit_estimate = 0_usize;
+			let mut exact_row_safe_winners = 0_usize;
+			let mut actual_row_safe_selected = 0_usize;
+			let mut false_declines = 0_usize;
+			let mut cascade_matches = 0_usize;
+			let mut byte_len_matches = 0_usize;
+			let mut selected_bytes = 0_usize;
+			let mut exact_bytes = 0_usize;
+			for shard in &prepared_shards {
+				let mut shard_observed_value_buffers = 0_usize;
+				let (encoding_directory, applied) = build_encoding_directory_for_ipc_stream(
+					record_id,
+					&shard.ipc_bytes,
+					&shard.page_directory,
+					&shard.batches,
+					&writer_config,
+					&row_group_config,
+				)?;
+				let Some(encoding_directory) = encoding_directory else {
+					continue;
+				};
+				for group in &shard.page_directory.row_groups {
+					let Some(value_buffer_ordinal) = value_buffer_ordinal_for_column(
+						&shard.page_directory,
+						group.row_group_index,
+						1,
+					) else {
+						continue;
+					};
+					let Some(buffer) = encoding_directory.buffers.iter().find(|buffer| {
+						buffer.row_group_index == group.row_group_index
+							&& buffer.ipc_column_ordinal == IpcColumnOrdinal::new(1)
+							&& buffer.ipc_buffer_ordinal == value_buffer_ordinal
+					}) else {
+						continue;
+					};
+					let Some(applied_buffer) = applied.iter().find(|applied| {
+						applied.row_group_index == group.row_group_index
+							&& applied.ipc_column_ordinal == IpcColumnOrdinal::new(1)
+							&& applied.ipc_buffer_ordinal == value_buffer_ordinal
+					}) else {
+						continue;
+					};
+					let cascade = &encoding_directory.cascades[buffer.cascade_index.get() as usize];
+					let group_start = shard.start_row + group.first_record_row_index.get() as usize;
+					let group_rows = group.row_count.get() as usize;
+					let oracle = exact_fsst_oracle_for_group(fixture, group_start, group_rows)?;
+					observed_value_buffers = observed_value_buffers.saturating_add(1);
+					shard_observed_value_buffers = shard_observed_value_buffers.saturating_add(1);
+					if oracle.row_safe_selected {
+						exact_row_safe_winners = exact_row_safe_winners.saturating_add(1);
+					}
+					if matches!(cascade, EncodingCascade::FsstRowSafe { .. }) {
+						actual_row_safe_selected = actual_row_safe_selected.saturating_add(1);
+					}
+					if oracle.row_safe_selected
+						&& !matches!(cascade, EncodingCascade::FsstRowSafe { .. })
+					{
+						false_declines = false_declines.saturating_add(1);
+					}
+					if cascade.kind() == oracle.cascade_kind {
+						cascade_matches = cascade_matches.saturating_add(1);
+					}
+					if applied_buffer.encoded_bytes.len() == oracle.encoded_len {
+						byte_len_matches = byte_len_matches.saturating_add(1);
+					}
+					selected_bytes =
+						selected_bytes.saturating_add(applied_buffer.encoded_bytes.len());
+					exact_bytes = exact_bytes.saturating_add(oracle.encoded_len);
+				}
+				if shard_observed_value_buffers > 0 {
+					cache_miss_estimate = cache_miss_estimate.saturating_add(1);
+					cache_hit_estimate = cache_hit_estimate
+						.saturating_add(shard_observed_value_buffers.saturating_sub(1));
+				}
+			}
+			if observed_value_buffers == 0 {
+				println!(
+					"encoding_compute_bench scenario=fsst_row_safe_writer_column_cache_matrix route=no_encoding fixture={} rows={} requested_row_groups={} actual_row_groups={} observed_value_buffers=0 iterations={} writer_ms={:.3} exact_writer_ms={:.3} writer_vs_exact_cpu_micros={} exact_vs_writer_cpu_micros={}",
+					fixture.name,
+					fixture.rows,
+					requested_row_groups,
+					actual_row_groups,
+					config.iterations,
+					elapsed.as_secs_f64() * 1_000.0,
+					exact_elapsed.as_secs_f64() * 1_000.0,
+					duration_ratio_micros(elapsed, exact_elapsed),
+					duration_ratio_micros(exact_elapsed, elapsed),
+				);
+				continue;
+			}
+			println!(
+				"encoding_compute_bench scenario=fsst_row_safe_writer_column_cache_matrix route=public_vs_exact fixture={} rows={} requested_row_groups={} actual_row_groups={} observed_value_buffers={} cache_miss_estimate={} cache_hit_estimate={} iterations={} writer_ms={:.3} exact_writer_ms={:.3} writer_vs_exact_cpu_micros={} exact_vs_writer_cpu_micros={} exact_row_safe_winners={} actual_row_safe_selected={} false_declines={} cascade_matches={} byte_len_matches={} selected_encoded_bytes={} exact_encoded_bytes={} selected_vs_exact_bytes_micros={}",
+				fixture.name,
+				fixture.rows,
+				requested_row_groups,
+				actual_row_groups,
+				observed_value_buffers,
+				cache_miss_estimate,
+				cache_hit_estimate,
+				config.iterations,
+				elapsed.as_secs_f64() * 1_000.0,
+				exact_elapsed.as_secs_f64() * 1_000.0,
+				duration_ratio_micros(elapsed, exact_elapsed),
+				duration_ratio_micros(exact_elapsed, elapsed),
+				exact_row_safe_winners,
+				actual_row_safe_selected,
+				false_declines,
+				cascade_matches,
+				byte_len_matches,
+				selected_bytes,
+				exact_bytes,
+				ratio_micros(selected_bytes as u64, exact_bytes as u64),
+			);
+		}
+	}
+	Ok(())
+}
+
+struct FsstExactOracle {
+	cascade_kind: EncodingCascadeKind,
+	encoded_len: usize,
+	row_safe_selected: bool,
+}
+
+struct WriterColumnCacheStringBatchShard {
+	start_row: usize,
+	batches: Vec<RecordBatch>,
+}
+
+struct WriterColumnCachePreparedShard {
+	start_row: usize,
+	ipc_bytes: Vec<u8>,
+	page_directory: wendelon::storage::row_group::RecordPageDirectory,
+	batches: Vec<RecordBatch>,
+}
+
+fn exact_fsst_oracle_for_group(
+	fixture: &FsstFixture,
+	start_row: usize,
+	row_count: usize,
+) -> std::io::Result<FsstExactOracle> {
+	let (decoded, offsets) = fsst_fixture_group_payload(fixture, start_row, row_count);
+	let decoded_value_count = BufferValueCount::new(row_count as u32);
+	let fsst_cascade = EncodingCascade::FsstWholeBuffer {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let row_safe_cascade = EncodingCascade::FsstRowSafe {
+		symbol_table_byte_len: RecordBodyByteLen::ZERO,
+	};
+	let fsst = encode_buffer_with_value_offsets(
+		&decoded,
+		&DataType::Utf8,
+		fsst_cascade,
+		decoded_value_count,
+		SimdPageValueCount::new(PAGE_VALUES),
+		Some(&offsets),
+	)?;
+	let row_safe = encode_buffer_with_value_offsets(
+		&decoded,
+		&DataType::Utf8,
+		row_safe_cascade,
+		decoded_value_count,
+		SimdPageValueCount::new(PAGE_VALUES),
+		Some(&offsets),
+	)?;
+	let row_safe_selected = row_safe.bytes.len() <= decoded.len()
+		&& row_safe.bytes.len() <= fsst.bytes.len().saturating_mul(11).div_ceil(10);
+	if row_safe_selected {
+		Ok(FsstExactOracle {
+			cascade_kind: EncodingCascadeKind::FsstRowSafe,
+			encoded_len: row_safe.bytes.len(),
+			row_safe_selected,
+		})
+	} else {
+		Ok(FsstExactOracle {
+			cascade_kind: EncodingCascadeKind::FsstWholeBuffer,
+			encoded_len: fsst.bytes.len(),
+			row_safe_selected,
+		})
+	}
+}
+
+fn fsst_fixture_group_payload(
+	fixture: &FsstFixture,
+	start_row: usize,
+	row_count: usize,
+) -> (Vec<u8>, Vec<u64>) {
+	let mut decoded = Vec::new();
+	let mut offsets = Vec::with_capacity(row_count.saturating_add(1));
+	offsets.push(0_u64);
+	for row in start_row..start_row.saturating_add(row_count) {
+		let start = fixture.offsets_u64[row] as usize;
+		let end = fixture.offsets_u64[row + 1] as usize;
+		decoded.extend_from_slice(&fixture.decoded[start..end]);
+		offsets.push(decoded.len() as u64);
+	}
+	(decoded, offsets)
+}
+
+fn fsst_fixture_strings(fixture: &FsstFixture) -> std::io::Result<Vec<String>> {
+	(0..fixture.rows)
+		.map(|row| {
+			let start = fixture.offsets_u64[row] as usize;
+			let end = fixture.offsets_u64[row + 1] as usize;
+			std::str::from_utf8(&fixture.decoded[start..end])
+				.map(str::to_owned)
+				.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+		})
+		.collect()
+}
+
+fn prepare_writer_column_cache_string_shards(
+	values: &[String],
+	rows_per_group: usize,
+	record_id: TieredRecordId,
+	row_group_config: &RowGroupWriterConfig,
+) -> std::io::Result<Vec<WriterColumnCachePreparedShard>> {
+	let batch_shards = writer_column_cache_string_batch_shards(values, rows_per_group)?;
+	let Some(first_batch) = batch_shards.first().and_then(|shard| shard.batches.first()) else {
+		return Ok(Vec::new());
+	};
+	let descriptor = writer_column_cache_string_descriptor(first_batch.schema().as_ref())?;
+	batch_shards
+		.into_iter()
+		.map(|shard| {
+			let ipc_bytes = encode_record_batches_bytes(
+				&shard.batches,
+				RecordBodyCompressionPolicy::Uncompressed,
+			)?;
+			let page_directory = build_page_directory_for_ipc_stream(
+				record_id,
+				&ipc_bytes,
+				&shard.batches,
+				descriptor.logical_schema_fingerprint,
+				&row_group_config.stats_supported_types,
+			)?;
+			Ok(WriterColumnCachePreparedShard {
+				start_row: shard.start_row,
+				ipc_bytes,
+				page_directory,
+				batches: shard.batches,
+			})
+		})
+		.collect()
+}
+
+fn writer_column_cache_string_batch_shards(
+	values: &[String],
+	rows_per_group: usize,
+) -> std::io::Result<Vec<WriterColumnCacheStringBatchShard>> {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("value", DataType::Utf8, false),
+	]));
+	let mut shards = Vec::new();
+	let mut current_batches = Vec::new();
+	let mut current_value_bytes = 0_usize;
+	let mut current_rows = 0_usize;
+	let mut current_start_row = 0_usize;
+	let rows_per_group = rows_per_group.max(1);
+	let mut start = 0_usize;
+	while start < values.len() {
+		let mut end = start;
+		let mut value_bytes = 0_usize;
+		while end < values.len()
+			&& end - start < rows_per_group
+			&& end - start < WRITER_COLUMN_CACHE_ROW_GROUP_ROW_TARGET
+		{
+			let next_len = values[end].len();
+			if end > start
+				&& value_bytes.saturating_add(next_len)
+					> WRITER_COLUMN_CACHE_VALUE_BUFFER_BYTE_TARGET
+			{
+				break;
+			}
+			value_bytes = value_bytes.saturating_add(next_len);
+			end += 1;
+		}
+		if !current_batches.is_empty()
+			&& (current_value_bytes.saturating_add(value_bytes)
+				> WRITER_COLUMN_CACHE_IPC_STREAM_VALUE_BYTE_TARGET
+				|| current_rows.saturating_add(end - start)
+					> WRITER_COLUMN_CACHE_IPC_STREAM_ROW_TARGET)
+		{
+			shards.push(WriterColumnCacheStringBatchShard {
+				start_row: current_start_row,
+				batches: std::mem::take(&mut current_batches),
+			});
+			current_value_bytes = 0;
+			current_rows = 0;
+		}
+		if current_batches.is_empty() {
+			current_start_row = start;
+		}
+		let ids = (start..end).map(|row| row as i64).collect::<Vec<_>>();
+		let strings = values[start..end].to_vec();
+		current_batches.push(
+			RecordBatch::try_new(
+				schema.clone(),
+				vec![
+					Arc::new(Int64Array::from(ids)) as ArrayRef,
+					Arc::new(StringArray::from(strings)) as ArrayRef,
+				],
+			)
+			.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?,
+		);
+		current_value_bytes = current_value_bytes.saturating_add(value_bytes);
+		current_rows = current_rows.saturating_add(end - start);
+		start = end;
+	}
+	if !current_batches.is_empty() {
+		shards.push(WriterColumnCacheStringBatchShard {
+			start_row: current_start_row,
+			batches: current_batches,
+		});
+	}
+	Ok(shards)
+}
+
+fn writer_column_cache_string_descriptor(
+	schema: &Schema,
+) -> std::io::Result<TableSchemaDescriptorV1> {
+	TableSchemaDescriptorV1::new_with_layout(
+		TableObjectId::new([0x68; 16]),
+		1,
+		"bench",
+		"encoding_compute_writer_column_cache",
+		schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+		LocalityPolicyV1::IdentityProjection,
+		RecordLayoutPolicy::MultiRow(
+			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024)
+				.expect("bench multi-row layout"),
+		),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+fn value_buffer_ordinal_for_column(
+	page_directory: &wendelon::storage::row_group::RecordPageDirectory,
+	row_group_index: RowGroupIndex,
+	column_ordinal: u32,
+) -> Option<IpcBufferIndex> {
+	page_directory
+		.buffer_pages
+		.iter()
+		.filter(|page| {
+			page.row_group_index == row_group_index
+				&& page.ipc_column_ordinal == IpcColumnOrdinal::new(column_ordinal)
+		})
+		.map(|page| page.ipc_buffer_ordinal.get())
+		.min()
+		.map(|first| IpcBufferIndex::new(first.saturating_add(2)))
 }
 
 fn bench_fsst_row_safe_cross_replica_determinism(
@@ -1542,7 +2097,7 @@ fn bench_fsst_declined_paths(config: &BenchConfig, rows: usize) -> std::io::Resu
 	enabled_config.enabled = true;
 	enabled_config
 		.enabled_predicate_evaluators
-		.insert(EncodingComputeEvaluatorKind::Fsst);
+		.insert(EncodingComputeEvaluatorKind::FsstWholeBuffer);
 	for (route, data_type, atom) in cases {
 		let coercion = coerce_literal(atom.literal.as_ref(), &data_type)
 			.expect("bench FSST declined literal coerce");

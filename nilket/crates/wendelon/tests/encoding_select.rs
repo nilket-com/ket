@@ -73,7 +73,11 @@ fn selection_respects_disabled_writer_and_cascade_allow_list() {
 #[test]
 fn default_writer_cascades_include_fsst_row_safe_after_promotion() {
 	let config = EncodingWriterConfig::default();
-	assert!(config.enabled_cascades.contains(&EncodingCascadeKind::Fsst));
+	assert!(
+		config
+			.enabled_cascades
+			.contains(&EncodingCascadeKind::FsstWholeBuffer)
+	);
 	assert!(
 		config
 			.enabled_cascades
@@ -98,7 +102,7 @@ fn selection_chooses_fsst_row_safe_only_when_enabled_and_size_guard_clears() {
 		min_buffer_bytes_for_encoding: RecordBodyByteLen::new(1),
 		enabled_cascades: BTreeSet::from([
 			EncodingCascadeKind::Plain,
-			EncodingCascadeKind::Fsst,
+			EncodingCascadeKind::FsstWholeBuffer,
 			EncodingCascadeKind::FsstRowSafe,
 		]),
 		..EncodingWriterConfig::default()
@@ -117,7 +121,7 @@ fn selection_chooses_fsst_row_safe_only_when_enabled_and_size_guard_clears() {
 		encoded.cascade,
 		EncodingCascade::FsstRowSafe { .. }
 	));
-	assert!(encoded.bytes.starts_with(b"WFS2"));
+	assert!(encoded.bytes.starts_with(b"RSFS"));
 }
 
 #[test]

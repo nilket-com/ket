@@ -125,7 +125,7 @@ pub fn sample_buffer(
 	}
 }
 
-fn deterministic_sample_indices(value_count: usize, sample_limit: usize) -> Vec<usize> {
+pub(crate) fn deterministic_sample_indices(value_count: usize, sample_limit: usize) -> Vec<usize> {
 	if value_count == 0 {
 		return Vec::new();
 	}
@@ -187,16 +187,23 @@ fn sample_avg_variable_width(
 	Some(input.len() as f32 / value_count as f32)
 }
 
-fn sample_fsst_compressible(data_type: &DataType, input: &[u8]) -> bool {
+pub(crate) fn sample_fsst_compressible(data_type: &DataType, input: &[u8]) -> bool {
 	if !matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) || input.len() < 128 {
 		return false;
 	}
-	let ascii = input
-		.iter()
-		.filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
-		.count();
+	let mut ascii = 0_usize;
+	let mut repeated_pairs = 0_usize;
+	let mut previous = None::<u8>;
+	for byte in input {
+		if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
+			ascii = ascii.saturating_add(1);
+		}
+		if previous == Some(*byte) {
+			repeated_pairs = repeated_pairs.saturating_add(1);
+		}
+		previous = Some(*byte);
+	}
 	let ascii_ratio = ascii as f32 / input.len() as f32;
-	let repeated_pairs = input.windows(2).filter(|pair| pair[0] == pair[1]).count();
 	ascii_ratio >= 0.90 && repeated_pairs.saturating_mul(20) >= input.len()
 }
 
