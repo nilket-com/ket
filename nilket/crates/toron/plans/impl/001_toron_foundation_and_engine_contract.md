@@ -23,7 +23,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 - **Tests:** Minimal `assert_eq!(1 + 1, 2)` smoke test.
 - **Verification:** `cargo check --workspace` and `cargo test -p toron`.
 
-### M1: Single-Process IR Execution
+### M1: Single-Process IR Execution (Completed)
 - **Scope:** Implement V0 IR structs, type-check V0 expression catalog, implement Arrow vectorized interpreter, execute `Scan -> Filter -> Aggregate` over in-memory Arrow batches.
 - **Tests:** Assert Arrow output and null semantics over `RecordBatch` fixtures.
 
