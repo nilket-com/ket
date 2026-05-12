@@ -1,8 +1,8 @@
 use std::fs;
 
 fn main() {
-	println!("cargo:rerun-if-changed=Cargo.lock");
-	let lock = fs::read_to_string("Cargo.lock").expect("failed to read Cargo.lock");
+	println!("cargo:rerun-if-changed=../../Cargo.lock");
+	let lock = fs::read_to_string("../../Cargo.lock").expect("failed to read Cargo.lock");
 	let version = find_package_version(&lock, "aws-lc-rs")
 		.expect("aws-lc-rs missing from Cargo.lock; required for FIPS module version reporting");
 	println!("cargo:rustc-env=WENDELON_AWS_LC_RS_VERSION={version}");
