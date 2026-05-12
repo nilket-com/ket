@@ -140,6 +140,9 @@ impl PbcCompiler {
                 self.compile_expr(inner, bytecode)?;
                 bytecode.push(OP_IS_NOT_NULL);
             }
+            Expr::TimeBucket(_, _) => {
+                return Err(LoweringDeclineReason::UnsupportedExpressionShape("TimeBucket not supported in PBC".to_string()));
+            }
         }
         Ok(())
     }

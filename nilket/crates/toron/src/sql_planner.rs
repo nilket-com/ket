@@ -1,6 +1,6 @@
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::ast::{Statement, Query, SetExpr, Select, SelectItem, TableFactor, Expr as SqlExpr, BinaryOperator, Value};
+use sqlparser::ast::{Statement, Query, SetExpr, Select, SelectItem, TableFactor, Expr as SqlExpr, BinaryOperator, Value, FunctionArg};
 use crate::ir::{LogicalPlan, Expr, ScalarValue, TableId, AggregateFunction};
 
 pub struct SqlPlanner;
@@ -65,16 +65,55 @@ impl SqlPlanner {
         }
 
         // 3. Handle SELECT list (Project or Aggregate)
-        if select.projection.len() == 1 {
-            if let SelectItem::UnnamedExpr(SqlExpr::Function(f)) = &select.projection[0] {
-                if f.name.to_string().to_uppercase() == "COUNT" {
-                    return Ok(LogicalPlan::Aggregate {
-                        input: Box::new(plan),
-                        group_expr: vec![],
-                        aggr_expr: vec![(AggregateFunction::CountAll, Expr::Column("count".to_string()))],
-                    });
+        let mut aggr_exprs = Vec::new();
+        let mut is_aggregate = false;
+
+        for item in &select.projection {
+            if let SelectItem::UnnamedExpr(SqlExpr::Function(f)) = item {
+                let name = f.name.to_string().to_uppercase();
+                let args = match &f.args {
+                    sqlparser::ast::FunctionArguments::List(l) => &l.args,
+                    _ => &vec![],
+                };
+
+                match name.as_str() {
+                    "COUNT" => {
+                        aggr_exprs.push((AggregateFunction::CountAll, vec![Expr::Column("count".to_string())]));
+                        is_aggregate = true;
+                    }
+                    "SUM" => {
+                        let arg = self.lower_arg(&args[0])?;
+                        aggr_exprs.push((AggregateFunction::Sum, vec![arg]));
+                        is_aggregate = true;
+                    }
+                    "LINEAR_REGRESS" => {
+                        let y = self.lower_arg(&args[0])?;
+                        let x = self.lower_arg(&args[1])?;
+                        aggr_exprs.push((AggregateFunction::LinearRegress, vec![y, x]));
+                        is_aggregate = true;
+                    }
+                    "APPROX_QUANTILE" => {
+                        let val = self.lower_arg(&args[0])?;
+                        let q = match &args[1] {
+                            FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(SqlExpr::Value(Value::Number(n, _)))) => {
+                                n.parse::<f64>().map_err(|e| e.to_string())?
+                            }
+                            _ => return Err("APPROX_QUANTILE expects a numeric literal for quantile".to_string()),
+                        };
+                        aggr_exprs.push((AggregateFunction::ApproxQuantile(q), vec![val]));
+                        is_aggregate = true;
+                    }
+                    _ => {}
                 }
             }
+        }
+
+        if is_aggregate {
+            return Ok(LogicalPlan::Aggregate {
+                input: Box::new(plan),
+                group_expr: vec![],
+                aggr_expr: aggr_exprs,
+            });
         }
 
         let mut exprs = Vec::new();
@@ -84,8 +123,6 @@ impl SqlPlanner {
                     exprs.push(self.lower_expr(sql_expr)?);
                 }
                 SelectItem::Wildcard(_) => {
-                    // For M8, wildcard project is not fully implemented; 
-                    // return the current plan (Scan/Filter) as is.
                     return Ok(plan);
                 }
                 _ => return Err("Unsupported select item".to_string()),
@@ -96,6 +133,13 @@ impl SqlPlanner {
             input: Box::new(plan),
             exprs,
         })
+    }
+
+    fn lower_arg(&self, arg: &FunctionArg) -> Result<Expr, String> {
+        match arg {
+            FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => self.lower_expr(e),
+            _ => Err("Unsupported function argument".to_string()),
+        }
     }
 
     fn lower_expr(&self, sql_expr: &SqlExpr) -> Result<Expr, String> {
@@ -134,6 +178,25 @@ impl SqlPlanner {
             SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
             SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
             SqlExpr::Nested(expr) => self.lower_expr(expr),
+            SqlExpr::Function(f) if f.name.to_string().to_uppercase() == "TIME_BUCKET" => {
+                let args = match &f.args {
+                    sqlparser::ast::FunctionArguments::List(l) => &l.args,
+                    _ => return Err("TIME_BUCKET expects arguments".to_string()),
+                };
+                let ts = self.lower_arg(&args[0])?;
+                let interval = match &args[1] {
+                    FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(SqlExpr::Value(Value::SingleQuotedString(s)))) => {
+                        match s.as_str() {
+                            "1m" => std::time::Duration::from_secs(60),
+                            "1h" => std::time::Duration::from_secs(3600),
+                            "1d" => std::time::Duration::from_secs(86400),
+                            _ => return Err(format!("Unsupported time_bucket interval: {}", s)),
+                        }
+                    }
+                    _ => return Err("time_bucket expects a string literal interval".to_string()),
+                };
+                Ok(Expr::TimeBucket(interval, Box::new(ts)))
+            }
             _ => Err(format!("Unsupported expression: {:?}", sql_expr)),
         }
     }

@@ -48,6 +48,7 @@ pub enum Expr {
     Not(Box<Expr>),
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
+    TimeBucket(std::time::Duration, Box<Expr>),
 }
 
 impl Expr {
@@ -56,7 +57,10 @@ impl Expr {
     }
 
     pub fn is_pbc_pushdown_eligible(&self) -> bool {
-        true // Simplified for V0: true unless we add something unpushable later
+        match self {
+            Self::TimeBucket(_, _) => false, // New kernels not yet in PBC
+            _ => true,
+        }
     }
 }
 
@@ -64,6 +68,8 @@ impl Expr {
 pub enum AggregateFunction {
     CountAll,
     Sum,
+    LinearRegress,
+    ApproxQuantile(f64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +89,7 @@ pub enum LogicalPlan {
     Aggregate {
         input: Box<LogicalPlan>,
         group_expr: Vec<Expr>,
-        aggr_expr: Vec<(AggregateFunction, Expr)>,
+        aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
     },
     Exchange {
         input: Box<LogicalPlan>,

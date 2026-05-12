@@ -40,15 +40,31 @@ impl RuneDataFrame {
         }
     }
 
+    pub fn aggregate(self, group_expr: Vec<RuneExpr>, aggr_expr: Vec<RuneAggr>) -> Self {
+        Self {
+            plan: LogicalPlan::Aggregate {
+                input: Box::new(self.plan),
+                group_expr: group_expr.into_iter().map(|e| e.expr).collect(),
+                aggr_expr: aggr_expr.into_iter().map(|a| (a.func, a.args)).collect(),
+            },
+        }
+    }
+
     pub fn count(self) -> Self {
         Self {
             plan: LogicalPlan::Aggregate {
                 input: Box::new(self.plan),
                 group_expr: vec![],
-                aggr_expr: vec![(AggregateFunction::CountAll, Expr::Column("count".to_string()))],
+                aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("count".to_string())])],
             },
         }
     }
+}
+
+#[derive(Any, Debug, Clone)]
+pub struct RuneAggr {
+    pub(crate) func: AggregateFunction,
+    pub(crate) args: Vec<Expr>,
 }
 
 #[derive(Any, Debug, Clone)]
@@ -74,6 +90,30 @@ pub fn lit(val: i32) -> RuneExpr {
     RuneExpr { expr: Expr::Literal(ScalarValue::Int32(Some(val))) }
 }
 
+pub fn time_bucket(interval_str: String, ts: RuneExpr) -> RuneExpr {
+    let interval = match interval_str.as_str() {
+        "1m" => std::time::Duration::from_secs(60),
+        "1h" => std::time::Duration::from_secs(3600),
+        "1d" => std::time::Duration::from_secs(86400),
+        _ => std::time::Duration::from_secs(0),
+    };
+    RuneExpr { expr: Expr::TimeBucket(interval, Box::new(ts.expr)) }
+}
+
+pub fn linear_regress(y: RuneExpr, x: RuneExpr) -> RuneAggr {
+    RuneAggr {
+        func: AggregateFunction::LinearRegress,
+        args: vec![y.expr, x.expr],
+    }
+}
+
+pub fn approx_quantile(val: RuneExpr, q: f64) -> RuneAggr {
+    RuneAggr {
+        func: AggregateFunction::ApproxQuantile(q),
+        args: vec![val.expr],
+    }
+}
+
 impl RuneExpr {
     pub fn gt(self, other: RuneExpr) -> RuneExpr {
         RuneExpr { expr: Expr::Gt(Box::new(self.expr), Box::new(other.expr)) }
@@ -88,14 +128,19 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
     let mut m = Module::new();
     m.ty::<RuneDataFrame>()?;
     m.ty::<RuneExpr>()?;
+    m.ty::<RuneAggr>()?;
     m.ty::<ToronContext>()?;
     
     m.function(["col"], col).build()?;
     m.function(["lit"], lit).build()?;
+    m.function(["time_bucket"], time_bucket).build()?;
+    m.function(["linear_regress"], linear_regress).build()?;
+    m.function(["approx_quantile"], approx_quantile).build()?;
     
     m.associated_function("table", ToronContext::table)?;
     m.associated_function("filter", RuneDataFrame::filter)?;
     m.associated_function("project", RuneDataFrame::project)?;
+    m.associated_function("aggregate", RuneDataFrame::aggregate)?;
     m.associated_function("count", RuneDataFrame::count)?;
     
     // Expression methods

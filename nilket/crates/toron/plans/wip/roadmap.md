@@ -22,10 +22,12 @@ Implementation is starting at M0.
 - **M8: SQL Compatibility** — Parser lowered to handwritten IR.
 - **M9: RDMA / RoCEv2 Transport Seams** — Memory pooling and transport abstraction.
 - **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
+- **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
 
 ## Forward Sequence
 
-1. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+1. **V1 Stabilization** — Production hardening, metrics integration, and full SQL surface coverage.
+
 
 
 
