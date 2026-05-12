@@ -66,6 +66,12 @@ pub(crate) enum PageMaterializeValiditySource {
 	Encoded { cascade: EncodingCascadeIndex },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageMaterializeValueSource {
+	Decoded,
+	AllNullSynthesized,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PageValidityBitmap {
 	pub bytes: Vec<u8>,
@@ -74,6 +80,22 @@ pub(crate) struct PageValidityBitmap {
 
 pub(crate) fn validity_page_decoded_byte_len(page_value_count: usize) -> usize {
 	page_value_count.div_ceil(8)
+}
+
+pub(crate) fn synthesize_all_null_page_buffers(
+	page_row_count: usize,
+	bytes_per_value: usize,
+) -> Result<(Vec<u8>, PageValidityBitmap), arrow::error::ArrowError> {
+	let value_len = page_row_count.checked_mul(bytes_per_value).ok_or_else(|| {
+		arrow::error::ArrowError::SchemaError("all-null page value byte length overflow".into())
+	})?;
+	Ok((
+		vec![0_u8; value_len],
+		PageValidityBitmap {
+			bytes: vec![0_u8; validity_page_decoded_byte_len(page_row_count)],
+			null_count: page_row_count,
+		},
+	))
 }
 
 pub(crate) fn fixed_width_value_bytes(data_type: &DataType) -> Option<usize> {
@@ -1053,6 +1075,28 @@ mod tests {
 		let bitmap = rebase_validity_bitmap(&[0], 0, 4).unwrap();
 		assert_eq!(bitmap.bytes, vec![0]);
 		assert_eq!(bitmap.null_count, 4);
+	}
+
+	#[test]
+	fn synthesize_all_null_page_buffers_zeroes_value_and_validity_buffers() {
+		let (values, validity) = synthesize_all_null_page_buffers(9, 8).unwrap();
+		assert_eq!(values, vec![0_u8; 72]);
+		assert_eq!(validity.bytes, vec![0_u8; 2]);
+		assert_eq!(validity.null_count, 9);
+	}
+
+	#[test]
+	fn synthesize_all_null_page_buffers_handles_empty_page() {
+		let (values, validity) = synthesize_all_null_page_buffers(0, 8).unwrap();
+		assert!(values.is_empty());
+		assert!(validity.bytes.is_empty());
+		assert_eq!(validity.null_count, 0);
+	}
+
+	#[test]
+	fn synthesize_all_null_page_buffers_rejects_value_length_overflow() {
+		let err = synthesize_all_null_page_buffers(usize::MAX, 2).unwrap_err();
+		assert!(err.to_string().contains("value byte length overflow"));
 	}
 
 	#[test]

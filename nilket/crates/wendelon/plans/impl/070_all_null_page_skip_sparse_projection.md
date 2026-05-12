@@ -242,17 +242,20 @@ wiring. Production behavior is byte-identical.
 
   ```rust
   pub(crate) enum AllNullElisionDeclineReason {
-      PageStatsAbsent,
-      NullCountBelowFull,
-      TypeOutOfCatalog,
-      CascadeOutOfCatalog,
-      ColumnNotNullable,
+      NotNullable,
+      ColumnHasNoNulls,
+      DataTypeNotInCatalog,
+      MissingPageStats,
+      PageStatsNotAllNull,
+      CorruptPageDescriptor,
   }
   ```
 
   Diagnostic-only; collapses to no public surface.
   Production behavior continues normal sparse projection
-  when elision declines.
+  when elision declines. Cascade out-of-catalog remains part
+  of existing sparse-projection eligibility instead of this
+  post-eligibility all-null diagnostic.
 
 - Add disposition enum:
 

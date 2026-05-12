@@ -161,9 +161,12 @@ shape; just one more byte range per nullable column.
   declined if the selected nullable column's validity buffer had
   its own `BufferEncoding` entry. ADR 069 later closes the
   page-aligned RLE encoded-validity follow-up.
-- **No all-null page-skip optimization.** Selected nullable
-  pages fetch the value page and the validity bits, then
-  materialization marks null rows.
+- **No all-null page-skip optimization in ADR 064 itself.**
+  Selected nullable pages fetch the value page and the validity
+  bits, then materialization marks null rows. ADR 070 later
+  closes this deferral for metadata-all-null fixed-width pages
+  by eliding both value and validity fetches and synthesizing
+  canonical-null buffers locally.
 
 ### Constraints carry forward unchanged
 
@@ -754,7 +757,7 @@ ADR 064 does not ship:
 - **Don't consume `decoded_predicate_batches`.**
 - **Don't decode encoded validity buffers in V1.**
 - **Don't add an all-null page-skip optimization** in
-  this ADR.
+  this ADR; ADR 070 is the closure path for that deferral.
 - **Don't bundle ADR 064 with FSST evaluator / RLE
   value-run / sparse predicate-column fetch / dense
   predicate-zip / variable-width / page-skip.**

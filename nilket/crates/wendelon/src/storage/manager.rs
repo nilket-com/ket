@@ -93,19 +93,20 @@ use crate::storage::encoding::materialize::{
 use crate::storage::encoding::page::expand_page_descriptors;
 use crate::storage::encoding::page_materialize::{
 	PageMaterializeBufferKey, PageMaterializeColumn, PageMaterializeFetch, PageMaterializeKey,
-	PageMaterializeValiditySource, PageValidityBitmap, decode_page_fetch, decode_rle_validity_page,
-	empty_projected_batch_for_requirement, encoded_page_body_range,
-	extract_record_body_bytes as extract_encoded_page_bytes, filtered_predicate_page_batch,
-	fixed_width_encoding_indexed_value_column, projected_page_batch_from_decoded_buffers,
-	rebase_validity_bitmap, required_projected_physical_ordinals,
+	PageMaterializeValiditySource, PageMaterializeValueSource, PageValidityBitmap,
+	decode_page_fetch, decode_rle_validity_page, empty_projected_batch_for_requirement,
+	encoded_page_body_range, extract_record_body_bytes as extract_encoded_page_bytes,
+	filtered_predicate_page_batch, fixed_width_encoding_indexed_value_column,
+	projected_page_batch_from_decoded_buffers, rebase_validity_bitmap,
+	required_projected_physical_ordinals, synthesize_all_null_page_buffers,
 };
 use crate::storage::encoding::predicate_page_fetch::{
 	PagePredicateClassification, PredicatePageFetchPlan, PredicatePageMaskSlice,
 	classify_page_stats_for_atom, stitch_predicate_page_mask,
 };
 use crate::storage::encoding::sparse_projection_fetch::{
-	SparseProjectionFetchDecision, SparseProjectionFetchInput, SparseProjectionFetchPlan,
-	decide_sparse_projection_fetch,
+	SelectedPageDisposition, SparseProjectionFetchDecision, SparseProjectionFetchInput,
+	SparseProjectionFetchPlan, decide_sparse_projection_fetch,
 };
 use crate::storage::encoding::{
 	BufferEncoding, ENCODING_DIRECTORY_METADATA_KEY, EncodedBufferByteRange, EncodingCascade,
@@ -12668,16 +12669,6 @@ fn materialize_sparse_projection_page_batches<B: AsRef<[u8]>>(
 				row_group_index: group.row_group_index,
 				page_index: page.page_index.get(),
 			};
-			let page_batch = projected_page_batch_from_decoded_buffers(
-				record_directory,
-				requirement,
-				&plan.columns,
-				page_key,
-				page.value_count.get() as usize,
-				&decoded_pages,
-				&decoded_validity_pages,
-				&plan.all_valid_nullable_pages,
-			)?;
 			let start = page.first_value_index.get() as usize;
 			let len = page.value_count.get() as usize;
 			if start.checked_add(len).is_none_or(|end| end > mask.len()) {
@@ -12694,6 +12685,23 @@ fn materialize_sparse_projection_page_batches<B: AsRef<[u8]>>(
 			if local_mask.true_count() == 0 {
 				continue;
 			}
+			synthesize_all_null_projection_page(
+				plan,
+				page_key,
+				len,
+				&mut decoded_pages,
+				&mut decoded_validity_pages,
+			)?;
+			let page_batch = projected_page_batch_from_decoded_buffers(
+				record_directory,
+				requirement,
+				&plan.columns,
+				page_key,
+				len,
+				&decoded_pages,
+				&decoded_validity_pages,
+				&plan.all_valid_nullable_pages,
+			)?;
 			if local_mask.null_count() == 0 && local_mask.true_count() == local_mask.len() {
 				filtered.push(SparseProjectionPageBatch {
 					row_group_index: group.row_group_index,
@@ -12717,6 +12725,67 @@ fn materialize_sparse_projection_page_batches<B: AsRef<[u8]>>(
 		}
 	}
 	Ok(filtered)
+}
+
+fn synthesize_all_null_projection_page(
+	plan: &SparseProjectionFetchPlan,
+	page_key: PageMaterializeKey,
+	page_row_count: usize,
+	decoded_pages: &mut BTreeMap<PageMaterializeBufferKey, Vec<u8>>,
+	decoded_validity_pages: &mut BTreeMap<PageMaterializeBufferKey, PageValidityBitmap>,
+) -> Result<(), arrow::error::ArrowError> {
+	for column in &plan.columns {
+		let value_key = PageMaterializeBufferKey {
+			row_group_index: page_key.row_group_index,
+			ipc_column_ordinal: IpcColumnOrdinal::new(column.physical_ordinal as u32),
+			ipc_buffer_ordinal: column.value_buffer_ordinal,
+			page_index: page_key.page_index,
+		};
+		let value_source = match plan.value_page_dispositions.get(&value_key) {
+			Some(SelectedPageDisposition::AllNullElided {
+				page_row_count: disposition_page_row_count,
+				bytes_per_value,
+			}) => {
+				if !column.nullable {
+					return Err(arrow::error::ArrowError::SchemaError(
+						"all-null synthesized page requested for non-nullable column".into(),
+					));
+				}
+				if *disposition_page_row_count as usize != page_row_count {
+					return Err(arrow::error::ArrowError::SchemaError(format!(
+						"all-null synthesized page row count {} disagrees with descriptor {}",
+						disposition_page_row_count, page_row_count
+					)));
+				}
+				if *bytes_per_value != column.bytes_per_value {
+					return Err(arrow::error::ArrowError::SchemaError(format!(
+						"all-null synthesized bytes_per_value {} disagrees with column {}",
+						bytes_per_value, column.bytes_per_value
+					)));
+				}
+				PageMaterializeValueSource::AllNullSynthesized
+			}
+			_ => PageMaterializeValueSource::Decoded,
+		};
+		match value_source {
+			PageMaterializeValueSource::Decoded => {}
+			PageMaterializeValueSource::AllNullSynthesized => {
+				let (value_bytes, validity) =
+					synthesize_all_null_page_buffers(page_row_count, column.bytes_per_value)?;
+				decoded_pages.insert(value_key, value_bytes);
+				decoded_validity_pages.insert(
+					PageMaterializeBufferKey {
+						row_group_index: page_key.row_group_index,
+						ipc_column_ordinal: IpcColumnOrdinal::new(column.physical_ordinal as u32),
+						ipc_buffer_ordinal: column.null_buffer_ordinal,
+						page_index: page_key.page_index,
+					},
+					validity,
+				);
+			}
+		}
+	}
+	Ok(())
 }
 
 fn concat_sparse_projection_page_batches(
@@ -14020,10 +14089,11 @@ mod tests {
 		default_kv_table_descriptor_v1, encode_table_write_row_count,
 	};
 	use crate::schema::{
-		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, NodeId, RetentionWindowMillis,
-		RowGroupRowCount, SecondaryIndexCatalog, SecondaryIndexKeyDescriptor,
-		TableLifecycleCatalog, TableRetentionPolicy,
+		BufferValueIndex, EncodingPageIndex, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId,
+		NodeId, RetentionWindowMillis, RowGroupRowCount, SecondaryIndexCatalog,
+		SecondaryIndexKeyDescriptor, TableLifecycleCatalog, TableRetentionPolicy,
 	};
+	use crate::storage::EncodingPageDescriptor;
 	use crate::storage::io_uring::spawn_io_thread;
 	use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 	use crate::storage::multirow::pack_record_batch_by_bucket;
@@ -14071,6 +14141,115 @@ mod tests {
 		let crypto = Arc::new(CryptoManager::new_dev());
 		crypto.install_local_only_for_tests(tenant()).unwrap();
 		crypto
+	}
+
+	#[test]
+	fn all_null_sparse_projection_disposition_materializes_null_page() {
+		let schema = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+		let record_id = TieredRecordId {
+			slab_id: SlabId::new(70),
+			record_offset: RecordBodyByteOffset::ZERO,
+		};
+		let record_directory = RecordBufferDirectory {
+			record_id,
+			record_plaintext_range: PlaintextByteRange { start: 0, len: 0 },
+			row_count: 4,
+			record_body_compression: crate::schema::RecordBodyCompressionPolicy::Uncompressed,
+			ipc_schema: schema,
+			buffers: vec![
+				crate::storage::columnar::IpcBufferRange {
+					offset_in_record: crate::schema::IpcBufferOffset::ZERO,
+					length: crate::schema::IpcBufferLength::ZERO,
+				},
+				crate::storage::columnar::IpcBufferRange {
+					offset_in_record: crate::schema::IpcBufferOffset::ZERO,
+					length: crate::schema::IpcBufferLength::ZERO,
+				},
+			],
+			column_to_buffers: vec![crate::storage::columnar::ColumnBufferRange {
+				first_buffer_ordinal: IpcBufferIndex::ZERO,
+				buffer_count: 2,
+			}],
+			column_null_counts: vec![4],
+			storage_column_ordinals: BTreeMap::new(),
+			logical_schema_fingerprint: LogicalSchemaFingerprint::from_bytes([0x70; 32]),
+			page_directory: None,
+			encoding_directory: None,
+		};
+		let requirement = ColumnFetchRequirement {
+			output_columns: ColumnOrdinalSet::from_columns([0]),
+			..ColumnFetchRequirement::default()
+		};
+		let page = EncodingPageDescriptor {
+			page_index: EncodingPageIndex::ZERO,
+			first_value_index: BufferValueIndex::ZERO,
+			value_count: BufferValueCount::new(4),
+			byte_range: EncodedBufferByteRange {
+				start: EncodingPageByteOffset::ZERO,
+				len: RecordBodyByteLen::ZERO,
+			},
+		};
+		let value_key = PageMaterializeBufferKey {
+			row_group_index: RowGroupIndex::ZERO,
+			ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+			ipc_buffer_ordinal: IpcBufferIndex::new(1),
+			page_index: 0,
+		};
+		let plan = SparseProjectionFetchPlan {
+			selected_groups: vec![RowGroupIndex::ZERO],
+			group_pages: vec![
+				crate::storage::encoding::sparse_projection_fetch::SparseProjectionFetchGroup {
+					row_group_index: RowGroupIndex::ZERO,
+					selected_pages: vec![page],
+				},
+			],
+			columns: vec![PageMaterializeColumn {
+				physical_ordinal: 0,
+				null_buffer_ordinal: IpcBufferIndex::ZERO,
+				value_buffer_ordinal: IpcBufferIndex::new(1),
+				bytes_per_value: 8,
+				data_type: DataType::Int64,
+				nullable: true,
+			}],
+			fetches: Vec::new(),
+			validity_fetches: Vec::new(),
+			value_page_dispositions: BTreeMap::from([(
+				value_key,
+				SelectedPageDisposition::AllNullElided {
+					page_row_count: 4,
+					bytes_per_value: 8,
+				},
+			)]),
+			all_valid_nullable_pages: BTreeSet::new(),
+			selected_body_ranges: Vec::new(),
+		};
+		let predicate_outcome = crate::storage::row_group::PhaseBOutcome {
+			survival_masks: HashMap::from([(
+				RowGroupIndex::ZERO,
+				BooleanArray::from(vec![true, false, true, false]),
+			)]),
+			..crate::storage::row_group::PhaseBOutcome::default()
+		};
+		let batches = materialize_sparse_projection_page_batches::<Vec<u8>>(
+			&record_directory,
+			&requirement,
+			&plan,
+			&[],
+			&[],
+			&predicate_outcome,
+		)
+		.unwrap();
+
+		assert_eq!(batches.len(), 1);
+		let values = batches[0]
+			.batch
+			.batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap();
+		assert_eq!(values.len(), 2);
+		assert_eq!(values.null_count(), 2);
 	}
 
 	struct CountingRangeStore {

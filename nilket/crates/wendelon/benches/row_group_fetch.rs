@@ -70,6 +70,10 @@ use wendelon::storage::{
 
 fn main() -> std::io::Result<()> {
 	let config = BenchConfig::from_args();
+	if config.all_null_elision_only {
+		bench_adr070_all_null_page_skip_matrix(&config)?;
+		return Ok(());
+	}
 	for case in config.cases.iter().copied() {
 		let batch = bench_batch(case.rows, case.columns, case.shape)?;
 		let descriptor = descriptor(batch.schema().as_ref(), case.columns)?;
@@ -146,11 +150,22 @@ struct EncodedFixture {
 struct BenchConfig {
 	cases: Vec<BenchCase>,
 	iterations: usize,
+	all_null_elision_only: bool,
+	rows_override: Option<Vec<usize>>,
 }
 
 impl BenchConfig {
 	fn from_args() -> Self {
 		let quick = std::env::args().any(|arg| arg == "--quick");
+		let all_null_elision_only = std::env::args().any(|arg| arg == "--all-null-elision-only");
+		let rows_override = std::env::args()
+			.find_map(|arg| arg.strip_prefix("--rows=").map(str::to_owned))
+			.map(|rows| {
+				rows.split(',')
+					.filter_map(|row| row.parse::<usize>().ok())
+					.collect::<Vec<_>>()
+			})
+			.filter(|rows| !rows.is_empty());
 		if quick {
 			Self {
 				cases: vec![BenchCase {
@@ -159,6 +174,8 @@ impl BenchConfig {
 					shape: BenchDataShape::Int64,
 				}],
 				iterations: 25,
+				all_null_elision_only,
+				rows_override,
 			}
 		} else {
 			Self {
@@ -183,6 +200,8 @@ impl BenchConfig {
 					},
 				],
 				iterations: 100,
+				all_null_elision_only,
+				rows_override,
 			}
 		}
 	}
@@ -3182,9 +3201,12 @@ enum Adr064NullDistribution {
 	AllValidSelectedPages,
 	NoNullRowGroup,
 	Alternating,
+	AlternatingPagesAllNull,
 	ClusteredNulls,
 	AllNullSelectedPage,
+	DivergentSelectedPage,
 	RandomFivePercent,
+	RandomFiftyPercent,
 }
 
 impl Adr064NullDistribution {
@@ -3193,9 +3215,12 @@ impl Adr064NullDistribution {
 			Self::AllValidSelectedPages => "all_valid_selected_pages",
 			Self::NoNullRowGroup => "no_null_row_group",
 			Self::Alternating => "alternating_nulls",
+			Self::AlternatingPagesAllNull => "alternating_pages_all_null",
 			Self::ClusteredNulls => "clustered_nulls",
 			Self::AllNullSelectedPage => "all_null_selected_page",
+			Self::DivergentSelectedPage => "divergent_selected_page",
 			Self::RandomFivePercent => "random_5p_nulls",
+			Self::RandomFiftyPercent => "random_50p_nulls",
 		}
 	}
 }
@@ -3365,9 +3390,21 @@ fn adr064_cell_is_null(
 		}
 		Adr064NullDistribution::NoNullRowGroup => false,
 		Adr064NullDistribution::Alternating => (row + projection_index) % 2 == 0,
+		Adr064NullDistribution::AlternatingPagesAllNull => {
+			(row / page_values as usize + projection_index) % 2 == 0
+		}
 		Adr064NullDistribution::ClusteredNulls => row < rows.saturating_mul(5).div_ceil(100),
 		Adr064NullDistribution::AllNullSelectedPage => row < page_values as usize,
+		Adr064NullDistribution::DivergentSelectedPage => {
+			projection_index == 0 && row < page_values as usize
+		}
 		Adr064NullDistribution::RandomFivePercent => (row + projection_index) % 20 == 0,
+		Adr064NullDistribution::RandomFiftyPercent => {
+			let hash = row
+				.wrapping_mul(1_103_515_245)
+				.wrapping_add(projection_index.wrapping_mul(12_345));
+			hash % 2 == 0
+		}
 	}
 }
 
@@ -4155,6 +4192,335 @@ fn adr064_sparse_dataset_runtime(
 	}
 	total.digest = blake3::hash(&values).to_hex().to_string();
 	Ok((total, values))
+}
+
+#[derive(Clone, Debug, Default)]
+struct Adr070ElisionStats {
+	elided_pages: usize,
+	synthesized_value_bytes: u64,
+	synthesized_validity_bytes: u64,
+	drift_sentinel_pages: usize,
+}
+
+impl Adr070ElisionStats {
+	fn accumulate(&mut self, other: Self) {
+		self.elided_pages = self.elided_pages.saturating_add(other.elided_pages);
+		self.synthesized_value_bytes = self
+			.synthesized_value_bytes
+			.saturating_add(other.synthesized_value_bytes);
+		self.synthesized_validity_bytes = self
+			.synthesized_validity_bytes
+			.saturating_add(other.synthesized_validity_bytes);
+		self.drift_sentinel_pages = self
+			.drift_sentinel_pages
+			.saturating_add(other.drift_sentinel_pages);
+	}
+}
+
+fn adr070_page_is_metadata_all_null(
+	column: &Adr064RuntimeColumn,
+	encoding: &wendelon::storage::BufferEncoding,
+	page: &EncodingPageDescriptor,
+) -> bool {
+	column.nullable
+		&& matches!(
+			column.data_type,
+			DataType::Int8
+				| DataType::Int16
+				| DataType::Int32
+				| DataType::Int64
+				| DataType::UInt8
+				| DataType::UInt16
+				| DataType::UInt32
+				| DataType::UInt64
+				| DataType::Date32
+				| DataType::Date64
+				| DataType::Timestamp(
+					TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+					None,
+				)
+		) && encoding
+		.page_stats
+		.get(page.page_index.get() as usize)
+		.is_some_and(|stats| stats.null_count.get() == page.value_count.get())
+}
+
+fn adr070_drift_sentinel_for_fixture(fixture: &Adr064RuntimeFixture) -> std::io::Result<usize> {
+	let mut audited = 0_usize;
+	for column in &fixture.columns {
+		let Some(encoding) = column.encoding.as_ref() else {
+			continue;
+		};
+		let Some(validity_range) = column.null_buffer_range else {
+			continue;
+		};
+		for page in &column.pages {
+			if !adr070_page_is_metadata_all_null(column, encoding, page) {
+				continue;
+			}
+			let (body_range, bit_offset) =
+				adr064_validity_body_range_for_page(validity_range, *page)?;
+			let relative_start = body_range.start.get() as usize;
+			let relative_end = relative_start
+				.checked_add(body_range.len.get() as usize)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"ADR 070 drift sentinel range overflow",
+					)
+				})?;
+			let bytes = fixture
+				.frame
+				.get(relative_start..relative_end)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"ADR 070 drift sentinel range exceeds fixture frame",
+					)
+				})?;
+			for row in 0..page.value_count.get() as usize {
+				if adr064_rebased_validity_bit(bytes, bit_offset, row)? {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"ADR 070 drift sentinel found valid bit on metadata-all-null page",
+					));
+				}
+			}
+			audited = audited.saturating_add(1);
+		}
+	}
+	Ok(audited)
+}
+
+fn adr070_sparse_projection_runtime(
+	fixture: &Adr064RuntimeFixture,
+	mask: &BooleanArray,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(Adr064RuntimeOutcome, Adr070ElisionStats, Vec<u8>)> {
+	if fixture.columns.iter().any(|column| {
+		column.data_type != DataType::UInt32
+			|| column.encoding.is_none()
+			|| column.cascade.is_none()
+	}) {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"ADR 070 sparse requested for unsupported projected column",
+		));
+	}
+	let mut value_ranges = Vec::new();
+	let mut validity_ranges = Vec::new();
+	let mut selected_value_pages = 0_usize;
+	let mut stats = Adr070ElisionStats {
+		drift_sentinel_pages: adr070_drift_sentinel_for_fixture(fixture)?,
+		..Adr070ElisionStats::default()
+	};
+	for column in &fixture.columns {
+		let selected_pages = adr064_selected_pages(column, shape, fixture.row_group_rows);
+		let encoding = column
+			.encoding
+			.as_ref()
+			.expect("ADR 070 prechecked encoding");
+		let value_buffer_range = column
+			.value_buffer_range
+			.expect("ADR 070 prechecked value range");
+		for page in selected_pages {
+			if adr070_page_is_metadata_all_null(column, encoding, page) {
+				stats.elided_pages = stats.elided_pages.saturating_add(1);
+				stats.synthesized_value_bytes = stats
+					.synthesized_value_bytes
+					.saturating_add(u64::from(page.value_count.get()).saturating_mul(4));
+				stats.synthesized_validity_bytes = stats
+					.synthesized_validity_bytes
+					.saturating_add(u64::from(page.value_count.get()).div_ceil(8));
+				continue;
+			}
+			selected_value_pages = selected_value_pages.saturating_add(1);
+			value_ranges.push(encoded_page_body_range(value_buffer_range, encoding, *page));
+			if column.nullable {
+				if let Some(validity_range) = column.null_buffer_range {
+					validity_ranges
+						.push(adr064_validity_body_range_for_page(validity_range, *page)?);
+				}
+			}
+		}
+	}
+	let value_plaintext_bytes = value_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let validity_plaintext_bytes = validity_ranges
+		.iter()
+		.map(|(range, _)| range.len.get())
+		.sum::<u64>();
+	let mut sparse_ranges = value_ranges.clone();
+	sparse_ranges.extend(validity_ranges.iter().map(|(range, _)| *range));
+	coalesce_body_ranges(&mut sparse_ranges)?;
+	let projection_plaintext_bytes = sparse_ranges
+		.iter()
+		.map(|range| range.len.get())
+		.sum::<u64>();
+	let before = store.snapshot();
+	let started = Instant::now();
+	let (plaintext_ranges, plaintext_extracts, projection_ciphertext_bytes) =
+		runtime_fetch_and_decrypt(
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+			fixture.record_plaintext_range.clone(),
+			&sparse_ranges,
+		)?;
+	let mut values = Vec::new();
+	let mut output_rows = 0_usize;
+	let mut output_rows_counted = false;
+	let mut null_count = 0_usize;
+	for column in &fixture.columns {
+		let selected_pages = adr064_selected_pages(column, shape, fixture.row_group_rows);
+		let encoding = column
+			.encoding
+			.as_ref()
+			.expect("ADR 070 prechecked encoding");
+		let cascade = column.cascade.as_ref().expect("ADR 070 prechecked cascade");
+		let value_buffer_range = column
+			.value_buffer_range
+			.expect("ADR 070 prechecked value range");
+		for page in selected_pages {
+			let page_start = page.first_value_index.get() as usize;
+			if adr070_page_is_metadata_all_null(column, encoding, page) {
+				for offset in 0..page.value_count.get() as usize {
+					let row = page_start + offset;
+					if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+						if !output_rows_counted {
+							output_rows = output_rows.saturating_add(1);
+						}
+						values.push(0);
+						values.extend_from_slice(&0_u32.to_le_bytes());
+						null_count = null_count.saturating_add(1);
+					}
+				}
+				continue;
+			}
+			let body_range = encoded_page_body_range(value_buffer_range, encoding, *page);
+			let encoded =
+				extract_from_plaintext_ranges(body_range, &plaintext_ranges, &plaintext_extracts)?;
+			let decoded = wendelon::storage::encoding::cascade::decode_page(
+				&encoded,
+				&DataType::UInt32,
+				cascade,
+				RecordBodyByteLen::new(u64::from(page.value_count.get()).saturating_mul(4)),
+				BufferValueCount::new(page.value_count.get()),
+			)
+			.map_err(|code| {
+				Error::new(
+					ErrorKind::InvalidData,
+					format!("ADR 070 page decode rejected: {code:?}"),
+				)
+			})?;
+			let validity = if column.nullable {
+				column
+					.null_buffer_range
+					.map(|range| adr064_validity_body_range_for_page(range, *page))
+					.transpose()?
+					.map(|(range, bit_offset)| {
+						let bytes = extract_from_plaintext_ranges(
+							range,
+							&plaintext_ranges,
+							&plaintext_extracts,
+						)?;
+						Ok::<_, std::io::Error>((bytes, bit_offset))
+					})
+					.transpose()?
+			} else {
+				None
+			};
+			for (offset, value) in decoded.chunks_exact(4).enumerate() {
+				let row = page_start + offset;
+				if row < mask.len() && mask.is_valid(row) && mask.value(row) {
+					if !output_rows_counted {
+						output_rows = output_rows.saturating_add(1);
+					}
+					let valid = if let Some((validity_bytes, bit_offset)) = &validity {
+						adr064_rebased_validity_bit(validity_bytes, *bit_offset, offset)?
+					} else {
+						true
+					};
+					values.push(u8::from(valid));
+					if valid {
+						values.extend_from_slice(value);
+					} else {
+						null_count = null_count.saturating_add(1);
+						values.extend_from_slice(&0_u32.to_le_bytes());
+					}
+				}
+			}
+		}
+		output_rows_counted = true;
+	}
+	let elapsed = started.elapsed();
+	let delta = store.snapshot().delta_since(before);
+	let digest = blake3::hash(&values).to_hex().to_string();
+	Ok((
+		Adr064RuntimeOutcome {
+			elapsed,
+			output_rows,
+			get_range_calls: delta.get_range_calls,
+			get_range_bytes: delta.get_range_bytes,
+			get_bytes_calls: delta.get_bytes_calls,
+			value_plaintext_bytes,
+			validity_plaintext_bytes,
+			projection_plaintext_bytes,
+			projection_ciphertext_bytes,
+			selected_ranges: sparse_ranges.len(),
+			selected_value_pages,
+			selected_validity_ranges: validity_ranges.len(),
+			null_count,
+			digest,
+		},
+		stats,
+		values,
+	))
+}
+
+fn adr070_sparse_dataset_runtime(
+	dataset: &Adr064RuntimeDataset,
+	shape: SparseProjectionMaskShape,
+	runtime: &tokio::runtime::Runtime,
+	store: Arc<CountingBenchObjectStore>,
+	uri: &str,
+	crypto: &wendelon::crypto::CryptoManager,
+	slab_id: SlabId,
+	object_size: u64,
+) -> std::io::Result<(Adr064RuntimeOutcome, Adr070ElisionStats, Vec<u8>)> {
+	let mut total = Adr064RuntimeOutcome::default();
+	let mut stats = Adr070ElisionStats::default();
+	let mut values = Vec::new();
+	for fixture in &dataset.fixtures {
+		let mask = sparse_projection_mask(shape, fixture.row_group_rows);
+		let (outcome, fixture_stats, fixture_values) = adr070_sparse_projection_runtime(
+			fixture,
+			&mask,
+			shape,
+			runtime,
+			store.clone(),
+			uri,
+			crypto,
+			slab_id,
+			object_size,
+		)?;
+		total.accumulate(outcome);
+		stats.accumulate(fixture_stats);
+		values.extend(fixture_values);
+	}
+	total.digest = blake3::hash(&values).to_hex().to_string();
+	Ok((total, stats, values))
 }
 
 fn adr064_runtime_route(
@@ -5566,6 +5932,268 @@ fn adr064_runtime_encrypted_dataset(
 		has_row_tombstone_records: false,
 	};
 	crypto.encrypt_tiered_slab_object(slab_id, &metadata, &dataset.plaintext)
+}
+
+fn adr070_all_null_page_skip_rows(config: &BenchConfig) -> Vec<usize> {
+	config.rows_override.clone().unwrap_or_else(|| {
+		if config.iterations <= 25 {
+			vec![8_192]
+		} else {
+			vec![8_192, 65_536, 1_000_000]
+		}
+	})
+}
+
+fn adr070_clear_page_stats(dataset: &mut Adr064RuntimeDataset) {
+	for fixture in &mut dataset.fixtures {
+		for column in &mut fixture.columns {
+			if let Some(encoding) = column.encoding.as_mut() {
+				encoding.page_stats.clear();
+			}
+		}
+		if let Some(directory) = fixture.directory.encoding_directory.as_mut() {
+			for encoding in &mut directory.buffers {
+				encoding.page_stats.clear();
+			}
+		}
+	}
+}
+
+fn bench_adr070_all_null_page_skip_matrix(config: &BenchConfig) -> std::io::Result<()> {
+	let runtime = tokio::runtime::Builder::new_current_thread()
+		.enable_all()
+		.build()?;
+	let mut emitted = 0_usize;
+	let rows_set = adr070_all_null_page_skip_rows(config);
+	for rows in rows_set.iter().copied() {
+		let profile = if rows == ROW_GROUP_SCAN_TARGET_ROWS as usize {
+			RowGroupSizingProfile::Scan
+		} else {
+			RowGroupSizingProfile::PointRead
+		};
+		let iterations = adr064_runtime_iterations(config, rows);
+		for (fixture_name, shape, distribution, mask_shape, page_stats_enabled) in [
+			(
+				"clustered_all_null",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::AllNullSelectedPage,
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				true,
+			),
+			(
+				"adr063_disabled_control",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::AllNullSelectedPage,
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				false,
+			),
+			(
+				"clustered_5p_null",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::ClusteredNulls,
+				SparseProjectionMaskShape::ClusteredFivePercent,
+				true,
+			),
+			(
+				"all_valid_control",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::NoNullRowGroup,
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				true,
+			),
+			(
+				"random_50p_no_elision_control",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::RandomFiftyPercent,
+				SparseProjectionMaskShape::RandomOnePercent,
+				true,
+			),
+			(
+				"alternating_pages_all_null",
+				Adr064ProjectionShape::OneNullable,
+				Adr064NullDistribution::AlternatingPagesAllNull,
+				SparseProjectionMaskShape::ClusteredTwentyFivePercent,
+				true,
+			),
+			(
+				"two_nullable_column_divergent",
+				Adr064ProjectionShape::FourNullable,
+				Adr064NullDistribution::DivergentSelectedPage,
+				SparseProjectionMaskShape::ClusteredFirstPage,
+				true,
+			),
+		] {
+			let mut dataset = adr064_nullable_runtime_dataset(
+				rows,
+				SparseProjectionCascadeFixture::BitPacked,
+				shape,
+				distribution,
+				256,
+				profile,
+			)?;
+			if !page_stats_enabled {
+				adr070_clear_page_stats(&mut dataset);
+			}
+			let slab_id = SlabId::new(
+				70_000
+					+ rows as u64 + emitted as u64 * 1_000_000
+					+ shape.projection_columns() as u64,
+			);
+			let crypto = seeded_dev_crypto_manager(TenantId::ZERO)?;
+			let encrypted = adr064_runtime_encrypted_dataset(&dataset, &crypto, slab_id)?;
+			let store = Arc::new(CountingBenchObjectStore::new(Arc::new(
+				MockObjectStore::new(MockObjectStoreConfig::default()),
+			)));
+			let uri = runtime.block_on(store.put(
+				&format!("adr070-all-null-page-skip/{fixture_name}/{rows}.wnd"),
+				&encrypted.bytes,
+			))?;
+			let env = SparseProjectionRuntimeEnv {
+				runtime: &runtime,
+				store: store.clone(),
+				uri: &uri,
+				crypto: &crypto,
+				slab_id,
+				object_size: encrypted.bytes.len() as u64,
+			};
+			let (expected, expected_rows, expected_null_count) =
+				adr064_dense_expected_for_dataset(&dataset, mask_shape)?;
+			let mut last_baseline = None;
+			let baseline_elapsed = bench(iterations, || {
+				let (outcome, values) = adr064_sparse_dataset_runtime(
+					black_box(&dataset),
+					black_box(mask_shape),
+					env.runtime,
+					env.store.clone(),
+					env.uri,
+					env.crypto,
+					env.slab_id,
+					env.object_size,
+				)
+				.expect("ADR 070 baseline sparse runtime");
+				last_baseline = Some((outcome, values));
+			});
+			let (mut baseline, baseline_values) = last_baseline.expect("ADR 070 baseline outcome");
+			baseline.elapsed = baseline_elapsed;
+			let mut last_elision = None;
+			let elision_elapsed = bench(iterations, || {
+				let (outcome, stats, values) = adr070_sparse_dataset_runtime(
+					black_box(&dataset),
+					black_box(mask_shape),
+					env.runtime,
+					env.store.clone(),
+					env.uri,
+					env.crypto,
+					env.slab_id,
+					env.object_size,
+				)
+				.expect("ADR 070 elision sparse runtime");
+				last_elision = Some((outcome, stats, values));
+			});
+			let (mut elision, stats, elision_values) =
+				last_elision.expect("ADR 070 elision outcome");
+			elision.elapsed = elision_elapsed;
+			let (determinism, _, determinism_values) = adr070_sparse_dataset_runtime(
+				&dataset,
+				mask_shape,
+				env.runtime,
+				env.store.clone(),
+				env.uri,
+				env.crypto,
+				env.slab_id,
+				env.object_size,
+			)?;
+			let equality = baseline_values == expected
+				&& elision_values == expected
+				&& baseline.output_rows == expected_rows
+				&& elision.output_rows == expected_rows;
+			let null_count_equal = baseline.null_count == expected_null_count
+				&& elision.null_count == expected_null_count;
+			if !equality || !null_count_equal {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"ADR 070 runtime mismatch fixture={fixture_name} rows={rows} equality={equality} null_count_equal={null_count_equal} baseline_rows={} elision_rows={} expected_rows={} baseline_nulls={} elision_nulls={} expected_nulls={}",
+						baseline.output_rows,
+						elision.output_rows,
+						expected_rows,
+						baseline.null_count,
+						elision.null_count,
+						expected_null_count,
+					),
+				));
+			}
+			let deterministic =
+				determinism.digest == elision.digest && determinism_values == elision_values;
+			let bytes_reduction = baseline
+				.projection_plaintext_bytes
+				.saturating_sub(elision.projection_plaintext_bytes);
+			println!(
+				"row_group_fetch_measure scenario=adr070_all_null_page_skip profile={} rows={} records={} page_values={} fixture={} projection_shape={} projected_cascade=bit_packed actual_cascade={} null_distribution={} mask_shape={} adr063_page_stats_enabled={} route={} output_rows={} equality={} null_count_equal={} null_count={} iterations={} baseline_total_ms={:.3} elision_total_ms={:.3} speedup_micros={} baseline_value_plaintext_bytes={} elision_value_plaintext_bytes={} baseline_validity_plaintext_bytes={} elision_validity_plaintext_bytes={} baseline_projection_plaintext_bytes={} elision_projection_plaintext_bytes={} selected_byte_reduction={} baseline_projection_ciphertext_bytes={} elision_projection_ciphertext_bytes={} baseline_selected_ranges={} elision_selected_ranges={} baseline_macro_block_get_count={} elision_macro_block_get_count={} baseline_get_range_bytes={} elision_get_range_bytes={} baseline_selected_value_pages={} elision_selected_value_pages={} baseline_selected_validity_ranges={} elision_selected_validity_ranges={} elided_pages={} synthesized_value_bytes={} synthesized_validity_bytes={} drift_sentinel_pages={} deterministic={} baseline_digest={} elision_digest={}",
+				dataset.profile.as_str(),
+				dataset.rows,
+				dataset.fixtures.len(),
+				dataset.page_values,
+				fixture_name,
+				dataset.shape.as_str(),
+				sparse_projection_runtime_actual_cascade_for_adr064(&dataset),
+				dataset.null_distribution.as_str(),
+				mask_shape.as_str(),
+				page_stats_enabled,
+				if stats.elided_pages == 0 {
+					"sparse_no_elision"
+				} else {
+					"sparse_all_null_elision"
+				},
+				elision.output_rows,
+				equality,
+				null_count_equal,
+				elision.null_count,
+				iterations,
+				baseline.elapsed.as_secs_f64() * 1_000.0,
+				elision.elapsed.as_secs_f64() * 1_000.0,
+				sparse_projection_speedup_micros_adr064(&baseline, &elision),
+				baseline.value_plaintext_bytes,
+				elision.value_plaintext_bytes,
+				baseline.validity_plaintext_bytes,
+				elision.validity_plaintext_bytes,
+				baseline.projection_plaintext_bytes,
+				elision.projection_plaintext_bytes,
+				bytes_reduction,
+				baseline.projection_ciphertext_bytes,
+				elision.projection_ciphertext_bytes,
+				baseline.selected_ranges,
+				elision.selected_ranges,
+				baseline.get_range_calls,
+				elision.get_range_calls,
+				baseline.get_range_bytes,
+				elision.get_range_bytes,
+				baseline.selected_value_pages,
+				elision.selected_value_pages,
+				baseline.selected_validity_ranges,
+				elision.selected_validity_ranges,
+				stats.elided_pages,
+				stats.synthesized_value_bytes,
+				stats.synthesized_validity_bytes,
+				stats.drift_sentinel_pages,
+				deterministic,
+				baseline.digest,
+				elision.digest,
+			);
+			emitted = emitted.saturating_add(1);
+		}
+	}
+	println!(
+		"row_group_fetch_bench scenario=adr070_all_null_page_skip rows={} emitted_rows={} iterations={} all_null_elision_only=true",
+		rows_set
+			.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join(","),
+		emitted,
+		config.iterations,
+	);
+	Ok(())
 }
 
 fn bench_adr064_nullable_sparse_projection_matrix(config: &BenchConfig) -> std::io::Result<()> {

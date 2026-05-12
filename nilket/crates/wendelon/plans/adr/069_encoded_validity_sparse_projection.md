@@ -708,7 +708,11 @@ extension until stronger fixture evidence emerges.
 
 ## Deferred (V2)
 
-- All-null value-page skip (ADR 070).
+- All-null value-page skip is closed by ADR 070 for nullable
+  fixed-width sparse projection pages whose value page metadata
+  reports `null_count == page_value_count`. Remaining V2
+  territory is broader type/cascade widening beyond ADR 070's
+  catalog.
 - Mismatched value/validity page-grid stitching.
 - Bitmap-specific `BitPacked` / `Dictionary` validity cascades.
 - Sub-byte bitmap-RLE cascade variant.
@@ -720,7 +724,8 @@ extension until stronger fixture evidence emerges.
 
 ## What Not To Do
 
-- Do not add all-null value-fetch elision to this ADR.
+- Do not add all-null value-fetch elision to this ADR; ADR 070
+  owns and closes the fixed-width metadata-all-null reader path.
 - Do not add a new cascade variant for bitmap RLE in V1.
 - Do not accept encoded validity without page metadata.
 - Do not accept unaligned value/validity page grids in V1.

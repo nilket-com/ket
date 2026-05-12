@@ -5204,15 +5204,197 @@ fn test_adr069_encoded_validity_sparse_projection_guards() {
 				.to_string(),
 		);
 	}
-	if manager.contains("all_null") || manager.contains("AllNull") {
-		violations.push(
-			"src/storage/manager.rs: ADR 069 must not implement all-null value page elision"
-				.to_string(),
-		);
-	}
 	assert!(
 		violations.is_empty(),
 		"ADR 069 encoded-validity sparse projection invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
+fn test_adr070_all_null_page_skip_sparse_projection_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+
+	let sparse_projection =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/sparse_projection_fetch.rs"))
+			.unwrap();
+	let page_materialize =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/page_materialize.rs")).unwrap();
+	let manager = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
+	let row_group_bench =
+		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
+	let encoding_types =
+		fs::read_to_string(manifest_dir.join("src/storage/encoding/types.rs")).unwrap();
+	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let schema_pbc = fs::read_to_string(manifest_dir.join("src/schema/pbc.rs")).unwrap();
+	let adr = fs::read_to_string(
+		manifest_dir.join("plans/adr/070_all_null_page_skip_sparse_projection.md"),
+	)
+	.unwrap();
+	let adr064 =
+		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+			.unwrap();
+	let adr069 = fs::read_to_string(
+		manifest_dir.join("plans/adr/069_encoded_validity_sparse_projection.md"),
+	)
+	.unwrap();
+	let impl_plan = fs::read_to_string(
+		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection.md"),
+	)
+	.unwrap();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md"),
+	)
+	.unwrap();
+
+	for required in [
+		"pub(crate) enum SelectedPageDisposition",
+		"AllNullElided",
+		"page_row_count",
+		"bytes_per_value",
+		"value_page_dispositions",
+		"pub(crate) enum AllNullElisionDeclineReason",
+		"pub(crate) fn value_page_is_metadata_all_null",
+		"all_null_elision_data_type_eligible",
+		"DataType::Int8",
+		"DataType::UInt64",
+		"DataType::Timestamp",
+		"TimeUnit::Nanosecond",
+		"DataType::Date64",
+	] {
+		if !sparse_projection.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: missing ADR 070 planner token {required}"
+			));
+		}
+	}
+	for forbidden in ["fixed_width_value_bytes(field.data_type()).is_none() ||"] {
+		if sparse_projection.contains(forbidden) {
+			violations.push(format!(
+				"src/storage/encoding/sparse_projection_fetch.rs: forbidden ADR 070 V1 widening token {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"pub(crate) enum PageMaterializeValueSource",
+		"AllNullSynthesized",
+		"pub(crate) fn synthesize_all_null_page_buffers",
+		"validity_page_decoded_byte_len(page_row_count)",
+		"null_count: page_row_count",
+	] {
+		if !page_materialize.contains(required) {
+			violations.push(format!(
+				"src/storage/encoding/page_materialize.rs: missing ADR 070 synthesis token {required}"
+			));
+		}
+	}
+	for required in [
+		"SelectedPageDisposition",
+		"synthesize_all_null_projection_page",
+		"SelectedPageDisposition::AllNullElided",
+		"PageMaterializeValueSource::AllNullSynthesized",
+		"synthesize_all_null_page_buffers",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: missing ADR 070 runtime token {required}"
+			));
+		}
+	}
+	for required in [
+		"--all-null-elision-only",
+		"--rows=",
+		"adr070_all_null_page_skip",
+		"elided_pages",
+		"synthesized_value_bytes",
+		"drift_sentinel_pages",
+		"baseline_macro_block_get_count",
+		"elision_macro_block_get_count",
+	] {
+		if !row_group_bench.contains(required) {
+			violations.push(format!(
+				"benches/row_group_fetch.rs: missing ADR 070 bench token {required}"
+			));
+		}
+	}
+	if !encoding_types.contains("pub const ENCODING_DIRECTORY_FORMAT_VERSION: u32 = 3;") {
+		violations.push("ADR 070 must not bump ENCODING_DIRECTORY_FORMAT_VERSION".to_string());
+	}
+	for forbidden in [
+		"AllNullElision",
+		"all_null_elision",
+		"AllNullPageSkip",
+		"all_null_page_skip",
+	] {
+		if config.contains(forbidden)
+			|| metrics.contains(forbidden)
+			|| schema_pbc.contains(forbidden)
+			|| encoding_types.contains(forbidden)
+		{
+			violations.push(format!(
+				"ADR 070 must not expose all-null elision through public/config surfaces, found {forbidden}"
+			));
+		}
+	}
+	for required in [
+		"Boolean is V2",
+		"Do not gate promotion on GET count never increasing",
+		"Do not add bridge-overfetch logic",
+		"Catalog gating is the planner's",
+	] {
+		if !adr.contains(required) {
+			violations.push(format!(
+				"plans/adr/070_all_null_page_skip_sparse_projection.md: missing ADR 070 convergence token {required}"
+			));
+		}
+	}
+	for required in ["ADR 070 later", "closes this deferral"] {
+		if !adr064.contains(required) {
+			violations.push(format!(
+				"plans/adr/064_nullable_sparse_projection.md: missing ADR 070 closure token {required}"
+			));
+		}
+	}
+	for required in ["closed by ADR 070", "metadata-all-null reader path"] {
+		if !adr069.contains(required) {
+			violations.push(format!(
+				"plans/adr/069_encoded_validity_sparse_projection.md: missing ADR 070 boundary-closure token {required}"
+			));
+		}
+	}
+	for required in [
+		"SelectedPageDisposition",
+		"value_page_is_metadata_all_null",
+		"synthesize_all_null_page_buffers",
+		"all-null elision",
+	] {
+		if !impl_plan.contains(required) {
+			violations.push(format!(
+				"plans/impl/070_all_null_page_skip_sparse_projection.md: missing ADR 070 implementation token {required}"
+			));
+		}
+	}
+	for required in [
+		"Status: implementation evidence captured",
+		"Phase 0 Audit",
+		"Prompt-to-artifact Checklist",
+		"cargo bench --bench row_group_fetch -- --all-null-elision-only --rows=8192,65536,1048576",
+		"alternating_pages_all_null",
+		"baseline_macro_block_get_count",
+		"drift_sentinel_pages",
+	] {
+		if !bench_results.contains(required) {
+			violations.push(format!(
+				"plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md: missing ADR 070 evidence token {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 070 all-null page skip sparse projection invariants violated:\n{}",
 		violations.join("\n")
 	);
 }
@@ -5312,9 +5494,6 @@ fn test_adr060_sparse_projection_fetch_guards() {
 	for forbidden in [
 		"decode_page_fetch(",
 		"projected_page_batch_from_decoded_buffers(",
-		"AllNull",
-		"all_null_page",
-		"all_null",
 		"pub struct Config",
 		"sparse_phase",
 		"SparsePhase",

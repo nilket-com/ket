@@ -20,12 +20,20 @@ forward-sequence rewrite.
 ## Status
 
 Storage hierarchy is shipped through ADR 069 (encoded-validity
-sparse projection, 2026-05-12). ADR 070 (all-null page-skip
-for nullable sparse projection) is council-converged across
-Claude / Codex / Gemini after four iterations under
-`plans/wip/`; pre-implementation, Phase 0 calibration pending.
-The Toron-pivot stretch continues to pull compute-adjacent
-storage primitives ahead of OLTP-shaped access surfaces.
+sparse projection, 2026-05-12). ADR 069 is Shipped and promoted
+with evidence at
+`plans/impl/069_encoded_validity_sparse_projection_bench_results.md`;
+the reader now initializes `Enabled` encoded-validity sparse
+projection coverage and pins the `RowGroupRowCountMismatch`
+guard. ADR 070 (all-null page-skip for nullable sparse
+projection) is implemented with evidence at
+`plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md`
+after four council iterations under `plans/wip/`; source plans
+live at
+`plans/adr/070_all_null_page_skip_sparse_projection.md` and
+`plans/impl/070_all_null_page_skip_sparse_projection.md`. The
+Toron-pivot stretch continues to pull compute-adjacent storage
+primitives ahead of OLTP-shaped access surfaces.
 
 ## Shipped foundations
 
@@ -87,7 +95,11 @@ One-line index. Full context in each ADR; bench evidence under
 - **ADR 069 Encoded-validity sparse projection.** Narrows
   ADR 064's `EncodedValidityBufferUnsupported` decline to
   admit `Rle { inner: Plain }`; page-local emission with 1:1
-  value/validity alignment.
+  value/validity alignment. Shipped and promoted with bench
+  evidence at
+  `plans/impl/069_encoded_validity_sparse_projection_bench_results.md`;
+  reader config now initializes `Enabled`; guard coverage
+  includes `RowGroupRowCountMismatch`.
 
 ## Prioritization philosophy
 
@@ -125,13 +137,12 @@ stretch.
 ## Forward sequence
 
 1. **All-null page-skip for nullable sparse projection** —
-   ADR 070 council-converged across Claude / Codex / Gemini
-   after four iterations under `plans/wip/`; pre-
-   implementation, Phase 0 calibration pending. Plans at
+   ADR 070 implemented after four Claude / Codex / Gemini
+   council iterations. Plans at
    `plans/adr/070_all_null_page_skip_sparse_projection.md`
    and
    `plans/impl/070_all_null_page_skip_sparse_projection.md`;
-   bench-results artifact to land at
+   bench-results artifact at
    `plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md`.
    **Metadata-only zero-RTT elision** via ADR 063 page
    stats: when
@@ -148,10 +159,13 @@ stretch.
    bytes in test fixtures and asserts observably all-zero
    over `page_value_count` bits, guarding the inherited
    ADR 063 trust contract without burdening production I/O.
-   **V1 catalog = ADR 063 V1 intersection**: {`BitPacked`,
+   **V1 catalog = ADR 063 V1 ∩ ADR 060 / 064 sparse-
+   projection value-column eligibility**: {`BitPacked`,
    `DictionaryPlain`, `DictionaryBitPacked`} ×
-   {Int8-64, UInt8-64, Timestamp(ms/us/ns), Date32/64,
-   Boolean}. **Closed surface**: no new on-disk shape, no
+   {Int8-64, UInt8-64, Timestamp(ms/us/ns), Date32/64}.
+   Boolean remains V2 because it is not in the current
+   `fixed_width_value_bytes` sparse-projection value-column
+   catalog. **Closed surface**: no new on-disk shape, no
    new `EncodingCascade` / `EncodingComputeEvaluatorKind` /
    `L2FetchStrategy` / reject / fallback variant, no IPC
    `custom_metadata` key, no
@@ -176,7 +190,8 @@ stretch.
    sentinel, closed surface) plus 7 soft (elided byte
    fraction, mixed reduction, wall-clock speedup,
    synthesis cost, cross-validity parity, no-elision
-   controls, range/GET count never increases).
+   controls, range/GET count recorded with regressions
+   justified by accompanying byte reduction).
 
 2. **Capacity-tier compression + serverless / erasure-coded
    follow-ups (rest of the old #14 bundle).** Independent;

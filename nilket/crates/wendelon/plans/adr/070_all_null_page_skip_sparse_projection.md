@@ -377,18 +377,23 @@ finalized in Phase 0.
 
 ```rust
 pub(crate) enum AllNullElisionDeclineReason {
-    PageStatsAbsent,
-    NullCountBelowFull,
-    TypeOutOfCatalog,
-    CascadeOutOfCatalog,
-    ColumnNotNullable,
+    NotNullable,
+    ColumnHasNoNulls,
+    DataTypeNotInCatalog,
+    MissingPageStats,
+    PageStatsNotAllNull,
+    CorruptPageDescriptor,
 }
 ```
 
 Crate-private; diagnostic-only for bench artifact rows and
 focused tests. Production behavior collapses every decline to
 the existing normal sparse projection path (no public
-surface, no fallback variant, no metric label).
+surface, no fallback variant, no metric label). Cascade
+out-of-catalog remains part of the existing sparse-projection
+eligibility checks; the all-null diagnostic only records
+declines after a value page is otherwise eligible for sparse
+projection planning.
 
 ### 7. Composability
 

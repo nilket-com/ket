@@ -20,6 +20,7 @@ use crate::storage::row_group::{
 	L2RowGroupFetchConfig, PhaseBOutcome, RecordBodyByteRange, RecordPageDirectory,
 };
 use arrow::array::{Array, BooleanArray};
+use arrow::datatypes::{DataType, TimeUnit};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const MAX_SPARSE_RANGES_PER_BUFFER: usize = 8;
@@ -44,6 +45,7 @@ pub(crate) struct SparseProjectionFetchPlan {
 	pub columns: Vec<PageMaterializeColumn>,
 	pub fetches: Vec<PageMaterializeFetch>,
 	pub validity_fetches: Vec<PageMaterializeValidityFetch>,
+	pub value_page_dispositions: BTreeMap<PageMaterializeBufferKey, SelectedPageDisposition>,
 	pub all_valid_nullable_pages: BTreeSet<PageMaterializeBufferKey>,
 	pub selected_body_ranges: Vec<RecordBodyByteRange>,
 }
@@ -77,6 +79,25 @@ pub(crate) enum SparseProjectionFetchDecline {
 	PerBufferFragmentationCapExceeded,
 	SelectedByteFractionExceeded,
 	Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedPageDisposition {
+	Materialize,
+	AllNullElided {
+		page_row_count: u32,
+		bytes_per_value: usize,
+	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllNullElisionDeclineReason {
+	NotNullable,
+	ColumnHasNoNulls,
+	DataTypeNotInCatalog,
+	MissingPageStats,
+	PageStatsNotAllNull,
+	CorruptPageDescriptor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +168,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 			columns: Vec::new(),
 			fetches: Vec::new(),
 			validity_fetches: Vec::new(),
+			value_page_dispositions: BTreeMap::new(),
 			all_valid_nullable_pages: BTreeSet::new(),
 			selected_body_ranges: Vec::new(),
 		});
@@ -176,6 +198,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 			columns: Vec::new(),
 			fetches: Vec::new(),
 			validity_fetches: Vec::new(),
+			value_page_dispositions: BTreeMap::new(),
 			all_valid_nullable_pages: BTreeSet::new(),
 			selected_body_ranges: Vec::new(),
 		});
@@ -194,6 +217,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 	let mut group_pages = Vec::new();
 	let mut fetches = Vec::new();
 	let mut validity_fetches = Vec::new();
+	let mut value_page_dispositions = BTreeMap::new();
 	let mut all_valid_nullable_pages = BTreeSet::new();
 	let mut per_buffer_ranges =
 		BTreeMap::<(RowGroupIndex, IpcColumnOrdinal, IpcBufferIndex), usize>::new();
@@ -244,13 +268,39 @@ pub(crate) fn decide_sparse_projection_fetch(
 			selected_pages: pages.clone(),
 		});
 		for (column, buffer_page, encoding, cascade, pages) in column_pages {
-			if column.nullable {
-				if row_group_column_may_have_nulls(
+			let may_have_nulls = column.nullable
+				&& row_group_column_may_have_nulls(
 					input.record_directory,
 					input.page_directory,
 					group_index,
 					column,
-				) {
+				);
+			let mut materialize_pages = Vec::with_capacity(pages.len());
+			for page in pages {
+				let value_key = PageMaterializeBufferKey {
+					row_group_index: group_index,
+					ipc_column_ordinal: buffer_page.ipc_column_ordinal,
+					ipc_buffer_ordinal: buffer_page.ipc_buffer_ordinal,
+					page_index: page.page_index.get(),
+				};
+				if all_null_elision_decline_reason(column, may_have_nulls, encoding, page).is_none()
+				{
+					value_page_dispositions.insert(
+						value_key,
+						SelectedPageDisposition::AllNullElided {
+							page_row_count: page.value_count.get(),
+							bytes_per_value: column.bytes_per_value,
+						},
+					);
+				} else {
+					materialize_pages.push(page);
+				}
+			}
+			if column.nullable {
+				if may_have_nulls {
+					if materialize_pages.is_empty() {
+						continue;
+					}
 					let validity_page = input
 						.page_directory
 						.buffer_pages
@@ -273,7 +323,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 						validity_page.ipc_buffer_ordinal,
 					);
 					let counter = per_buffer_ranges.entry(per_buffer_key).or_insert(0);
-					*counter = counter.saturating_add(pages.len());
+					*counter = counter.saturating_add(materialize_pages.len());
 					if *counter > MAX_SPARSE_RANGES_PER_BUFFER {
 						return SparseProjectionFetchDecision::Decline(
 							SparseProjectionFetchDecline::PerBufferFragmentationCapExceeded,
@@ -298,7 +348,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 						match encoded_validity_sparse_eligibility(
 							validity_encoding,
 							validity_cascade,
-							&pages,
+							&materialize_pages,
 							group.row_count,
 						) {
 							EncodedValiditySparseEligibility::Eligible => {}
@@ -316,7 +366,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 								);
 							}
 						};
-						for page in &pages {
+						for page in &materialize_pages {
 							let Some(validity_descriptor) = validity_pages
 								.iter()
 								.copied()
@@ -348,7 +398,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 							});
 						}
 					} else {
-						for page in &pages {
+						for page in &materialize_pages {
 							let (body_range, bit_offset) = match validity_bitmap_body_range_for_page(
 								validity_page.range,
 								*page,
@@ -375,7 +425,7 @@ pub(crate) fn decide_sparse_projection_fetch(
 						}
 					}
 				} else {
-					for page in &pages {
+					for page in &materialize_pages {
 						all_valid_nullable_pages.insert(PageMaterializeBufferKey {
 							row_group_index: group_index,
 							ipc_column_ordinal: IpcColumnOrdinal::new(
@@ -393,20 +443,24 @@ pub(crate) fn decide_sparse_projection_fetch(
 				buffer_page.ipc_buffer_ordinal,
 			);
 			let counter = per_buffer_ranges.entry(per_buffer_key).or_insert(0);
-			*counter = counter.saturating_add(pages.len());
+			*counter = counter.saturating_add(materialize_pages.len());
 			if *counter > MAX_SPARSE_RANGES_PER_BUFFER {
 				return SparseProjectionFetchDecision::Decline(
 					SparseProjectionFetchDecline::PerBufferFragmentationCapExceeded,
 				);
 			}
-			for page in pages {
+			for page in materialize_pages {
+				let key = PageMaterializeBufferKey {
+					row_group_index: group_index,
+					ipc_column_ordinal: buffer_page.ipc_column_ordinal,
+					ipc_buffer_ordinal: buffer_page.ipc_buffer_ordinal,
+					page_index: page.page_index.get(),
+				};
+				value_page_dispositions
+					.entry(key)
+					.or_insert(SelectedPageDisposition::Materialize);
 				fetches.push(PageMaterializeFetch {
-					key: PageMaterializeBufferKey {
-						row_group_index: group_index,
-						ipc_column_ordinal: buffer_page.ipc_column_ordinal,
-						ipc_buffer_ordinal: buffer_page.ipc_buffer_ordinal,
-						page_index: page.page_index.get(),
-					},
+					key,
 					body_range: encoded_page_body_range(buffer_page.range, encoding, page),
 					cascade: cascade.clone(),
 					page,
@@ -474,9 +528,72 @@ pub(crate) fn decide_sparse_projection_fetch(
 		columns,
 		fetches,
 		validity_fetches,
+		value_page_dispositions,
 		all_valid_nullable_pages,
 		selected_body_ranges,
 	})
+}
+
+pub(crate) fn value_page_is_metadata_all_null(
+	value_buf: &BufferEncoding,
+	page: EncodingPageDescriptor,
+) -> bool {
+	all_null_metadata_decline_reason(value_buf, page).is_none()
+}
+
+fn all_null_elision_decline_reason(
+	column: &PageMaterializeColumn,
+	column_may_have_nulls: bool,
+	value_buf: &BufferEncoding,
+	page: EncodingPageDescriptor,
+) -> Option<AllNullElisionDeclineReason> {
+	if !column.nullable {
+		return Some(AllNullElisionDeclineReason::NotNullable);
+	}
+	if !column_may_have_nulls {
+		return Some(AllNullElisionDeclineReason::ColumnHasNoNulls);
+	}
+	if !all_null_elision_data_type_eligible(&column.data_type) {
+		return Some(AllNullElisionDeclineReason::DataTypeNotInCatalog);
+	}
+	if value_page_is_metadata_all_null(value_buf, page) {
+		None
+	} else {
+		all_null_metadata_decline_reason(value_buf, page)
+	}
+}
+
+fn all_null_metadata_decline_reason(
+	value_buf: &BufferEncoding,
+	page: EncodingPageDescriptor,
+) -> Option<AllNullElisionDeclineReason> {
+	let page_index = page.page_index.get() as usize;
+	let Some(stats) = value_buf.page_stats.get(page_index) else {
+		return Some(AllNullElisionDeclineReason::MissingPageStats);
+	};
+	if page.value_count.get() == 0 {
+		return Some(AllNullElisionDeclineReason::CorruptPageDescriptor);
+	}
+	let Some(page_value_end) = page
+		.first_value_index
+		.get()
+		.checked_add(page.value_count.get())
+	else {
+		return Some(AllNullElisionDeclineReason::CorruptPageDescriptor);
+	};
+	if page_value_end > value_buf.decoded_value_count.get() {
+		return Some(AllNullElisionDeclineReason::CorruptPageDescriptor);
+	}
+	let Ok(page_byte_end) = page.byte_range.end() else {
+		return Some(AllNullElisionDeclineReason::CorruptPageDescriptor);
+	};
+	if page_byte_end > value_buf.encoded_range.len.get() {
+		return Some(AllNullElisionDeclineReason::CorruptPageDescriptor);
+	}
+	if stats.null_count.get() != page.value_count.get() {
+		return Some(AllNullElisionDeclineReason::PageStatsNotAllNull);
+	}
+	None
 }
 
 fn row_group_column_may_have_nulls(
@@ -571,6 +688,26 @@ fn projection_column_candidate(
 	}
 	fixed_width_sparse_projection_column(record_directory, physical_ordinal)
 		.ok_or(SparseProjectionFetchDecline::NullableTypeNotInCatalog)
+}
+
+fn all_null_elision_data_type_eligible(data_type: &DataType) -> bool {
+	matches!(
+		data_type,
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+			| DataType::Date32
+			| DataType::Date64
+			| DataType::Timestamp(
+				TimeUnit::Millisecond | TimeUnit::Microsecond | TimeUnit::Nanosecond,
+				None,
+			)
+	)
 }
 
 pub(crate) fn encoded_validity_sparse_eligibility(
@@ -704,20 +841,22 @@ fn coalesce_record_body_ranges(ranges: &mut Vec<RecordBodyByteRange>) -> std::io
 mod tests {
 	use super::*;
 	use crate::schema::{
-		BaseValue, BitsPerValue, BufferValueCount, EncodingCascadeIndex, EncodingPageByteOffset,
-		EncodingPageCount, EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset,
-		LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset,
-		RecordBodyCompressionPolicy, RecordRowIndex, RowCount, RunCount, SimdPageValueCount,
-		SlabId,
+		BaseValue, BitsPerValue, BufferValueCount, BufferValueIndex, EncodingCascadeIndex,
+		EncodingPageByteOffset, EncodingPageCount, EncryptedChunkCount, IpcBufferIndex,
+		IpcBufferLength, IpcBufferOffset, LogicalSchemaFingerprint, PageNullCount,
+		RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordRowIndex,
+		RowCount, RunCount, SimdPageValueCount, SlabId,
 	};
 	use crate::storage::columnar::{
 		ColumnBufferRange, ColumnOrdinalSet, IpcBufferRange, PlaintextByteRange, TieredRecordId,
 	};
-	use crate::storage::encoding::{EncodedBufferByteRange, EncodingLeafCascade};
+	use crate::storage::encoding::{
+		EncodedBufferByteRange, EncodingLeafCascade, EncodingPageStats,
+	};
 	use crate::storage::row_group::{
 		BufferPageDirectoryEntry, RowGroupColumnStats, RowGroupDirectoryEntry,
 	};
-	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 	use std::collections::HashMap;
 
 	const NULL_BUFFER_BODY_START: u64 = 128;
@@ -934,6 +1073,18 @@ mod tests {
 				encoding_config: &self.encoding_config,
 			})
 		}
+
+		fn set_value_page_null_counts(&mut self, counts: &[u32]) {
+			self.encoding_directory.buffers[0].page_stats = counts
+				.iter()
+				.copied()
+				.map(|null_count| EncodingPageStats {
+					null_count: PageNullCount::new(null_count),
+					min: None,
+					max: None,
+				})
+				.collect();
+		}
 	}
 
 	fn encoding(row_count: u32, page_values: u32, ends: &[u32]) -> BufferEncoding {
@@ -1004,6 +1155,15 @@ mod tests {
 		}
 	}
 
+	fn value_page_key(page_index: u32) -> PageMaterializeBufferKey {
+		PageMaterializeBufferKey {
+			row_group_index: RowGroupIndex::ZERO,
+			ipc_column_ordinal: IpcColumnOrdinal::ZERO,
+			ipc_buffer_ordinal: IpcBufferIndex::new(1),
+			page_index,
+		}
+	}
+
 	#[test]
 	fn row_to_page_map_handles_partial_last_page() {
 		let map = RowToPageMap::from_buffer_encoding(&encoding(10, 4, &[4, 8, 10])).unwrap();
@@ -1011,6 +1171,51 @@ mod tests {
 		assert_eq!(map.page_for_row(4).unwrap().page_index.get(), 1);
 		assert_eq!(map.page_for_row(8).unwrap().page_index.get(), 2);
 		assert!(map.page_for_row(10).is_none());
+	}
+
+	#[test]
+	fn value_page_is_metadata_all_null_accepts_exact_page_null_count() {
+		let mut value_buf = encoding(8, 4, &[32, 64]);
+		value_buf.page_stats = vec![
+			EncodingPageStats {
+				null_count: PageNullCount::new(4),
+				min: None,
+				max: None,
+			},
+			EncodingPageStats {
+				null_count: PageNullCount::new(3),
+				min: None,
+				max: None,
+			},
+		];
+		let pages = expand_page_descriptors(&value_buf).unwrap();
+		assert!(value_page_is_metadata_all_null(&value_buf, pages[0]));
+		assert!(!value_page_is_metadata_all_null(&value_buf, pages[1]));
+	}
+
+	#[test]
+	fn value_page_is_metadata_all_null_fails_closed_on_missing_or_malformed_metadata() {
+		let mut value_buf = encoding(8, 4, &[32, 64]);
+		let pages = expand_page_descriptors(&value_buf).unwrap();
+		assert!(!value_page_is_metadata_all_null(&value_buf, pages[0]));
+
+		value_buf.page_stats = vec![EncodingPageStats {
+			null_count: PageNullCount::new(4),
+			min: None,
+			max: None,
+		}];
+		let mut out_of_bounds = pages[0];
+		out_of_bounds.page_index = EncodingPageIndex::new(9);
+		assert!(!value_page_is_metadata_all_null(&value_buf, out_of_bounds));
+
+		let mut bad_row_span = pages[0];
+		bad_row_span.first_value_index = BufferValueIndex::new(7);
+		bad_row_span.value_count = BufferValueCount::new(4);
+		assert!(!value_page_is_metadata_all_null(&value_buf, bad_row_span));
+
+		let mut bad_byte_span = pages[0];
+		bad_byte_span.byte_range.len = RecordBodyByteLen::new(65);
+		assert!(!value_page_is_metadata_all_null(&value_buf, bad_byte_span));
 	}
 
 	#[test]
@@ -1259,6 +1464,196 @@ mod tests {
 					len: RecordBodyByteLen::new(32),
 				},
 			]
+		);
+	}
+
+	#[test]
+	fn nullable_all_null_page_elides_value_and_validity_fetches() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 4);
+		fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected all-null sparse projection plan, got {decision:?}");
+		};
+		assert!(plan.fetches.is_empty());
+		assert!(plan.validity_fetches.is_empty());
+		assert!(plan.selected_body_ranges.is_empty());
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::AllNullElided {
+				page_row_count: 4,
+				bytes_per_value: 8,
+			})
+		);
+	}
+
+	#[test]
+	fn nullable_all_null_elision_preserves_materialized_neighbor_pages() {
+		let mut fixture = PlannerFixture::new(16, 4, 32, 4);
+		fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter(
+				(0..16).map(|row| matches!(row, 1 | 5)),
+			)),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected mixed all-null sparse projection plan, got {decision:?}");
+		};
+		assert_eq!(plan.fetches.len(), 1);
+		assert_eq!(plan.fetches[0].key, value_page_key(1));
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert_eq!(plan.validity_fetches[0].key.page_index, 1);
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::AllNullElided {
+				page_row_count: 4,
+				bytes_per_value: 8,
+			})
+		);
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(1)),
+			Some(&SelectedPageDisposition::Materialize)
+		);
+		assert_eq!(
+			plan.selected_body_ranges,
+			vec![
+				RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(NULL_BUFFER_BODY_START),
+					len: RecordBodyByteLen::new(1),
+				},
+				RecordBodyByteRange {
+					start: RecordBodyByteOffset::new(VALUE_BUFFER_BODY_START + 32),
+					len: RecordBodyByteLen::new(32),
+				},
+			]
+		);
+	}
+
+	#[test]
+	fn missing_page_stats_keeps_nullable_sparse_projection_on_fetch_path() {
+		let fixture = PlannerFixture::new(16, 4, 32, 4);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected nullable sparse projection plan, got {decision:?}");
+		};
+		assert_eq!(plan.fetches.len(), 1);
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::Materialize)
+		);
+	}
+
+	#[test]
+	fn all_null_elision_catalog_includes_int32_and_timestamp_millisecond() {
+		for data_type in [
+			DataType::Int32,
+			DataType::Timestamp(TimeUnit::Millisecond, None),
+		] {
+			let mut fixture = PlannerFixture::new_with_data_type(16, 4, 16, 4, data_type.clone());
+			fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+			let decision = fixture.decide(
+				&output_requirement(),
+				&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+				&[dense_range()],
+			);
+			let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+				panic!(
+					"expected all-null sparse projection plan for {data_type:?}, got {decision:?}"
+				);
+			};
+			assert!(plan.fetches.is_empty(), "{data_type:?}");
+			assert!(plan.validity_fetches.is_empty(), "{data_type:?}");
+			assert!(matches!(
+				plan.value_page_dispositions.get(&value_page_key(0)),
+				Some(SelectedPageDisposition::AllNullElided { .. })
+			));
+		}
+	}
+
+	#[test]
+	fn all_null_elision_catalog_excludes_float64_without_declining_sparse_projection() {
+		let mut fixture = PlannerFixture::new_with_data_type(16, 4, 32, 4, DataType::Float64);
+		fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected sparse projection plan, got {decision:?}");
+		};
+		assert_eq!(plan.fetches.len(), 1);
+		assert_eq!(plan.validity_fetches.len(), 1);
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::Materialize)
+		);
+	}
+
+	#[test]
+	fn boolean_is_not_sparse_projection_value_column_catalog_v1() {
+		let fixture = PlannerFixture::new_with_data_type(16, 4, 32, 4, DataType::Boolean);
+		assert_decline(
+			fixture.decide(
+				&output_requirement(),
+				&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+				&[dense_range()],
+			),
+			SparseProjectionFetchDecline::VariableWidthProjectedColumn,
+		);
+	}
+
+	#[test]
+	fn all_valid_nullable_field_ignores_all_null_page_stats() {
+		let mut fixture =
+			PlannerFixture::new_with_data_type_and_nullable(16, 4, 32, 0, DataType::Int64, true);
+		fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected sparse projection plan, got {decision:?}");
+		};
+		assert_eq!(plan.fetches.len(), 1);
+		assert!(plan.validity_fetches.is_empty());
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::Materialize)
+		);
+	}
+
+	#[test]
+	fn schema_non_nullable_column_ignores_all_null_page_stats() {
+		let mut fixture =
+			PlannerFixture::new_with_data_type_and_nullable(16, 4, 32, 0, DataType::Int64, false);
+		fixture.set_value_page_null_counts(&[4, 0, 0, 0]);
+		let decision = fixture.decide(
+			&output_requirement(),
+			&outcome(BooleanArray::from_iter((0..16).map(|row| row == 1))),
+			&[dense_range()],
+		);
+		let SparseProjectionFetchDecision::Sparse(plan) = decision else {
+			panic!("expected sparse projection plan, got {decision:?}");
+		};
+		assert!(!plan.columns[0].nullable);
+		assert_eq!(plan.fetches.len(), 1);
+		assert!(plan.validity_fetches.is_empty());
+		assert_eq!(
+			plan.value_page_dispositions.get(&value_page_key(0)),
+			Some(&SelectedPageDisposition::Materialize)
 		);
 	}
 

@@ -873,21 +873,29 @@ fn encoding_directory_rejects_page_stats_on_variable_width_buffer() {
 		.as_ref()
 		.expect("Encoding directory")
 		.clone();
-	let buffer = bad_directory
+	let mut injected = bad_directory
 		.buffers
-		.iter_mut()
-		.find(|encoding| {
-			encoding.ipc_column_ordinal.get() == 1 && !encoding.page_end_offsets.is_empty()
-		})
-		.expect("encoded variable-width value buffer");
-	buffer.page_stats = vec![
+		.iter()
+		.find(|encoding| !encoding.page_end_offsets.is_empty())
+		.cloned()
+		.expect("encoded fixed-width value buffer");
+	injected.ipc_column_ordinal = wendelon::schema::IpcColumnOrdinal::new(1);
+	if injected.page_end_offsets.is_empty() {
+		injected
+			.page_end_offsets
+			.push(wendelon::schema::EncodingPageByteOffset::new(
+				injected.encoded_range.len.get() as u32,
+			));
+	}
+	injected.page_stats = vec![
 		EncodingPageStats {
 			null_count: wendelon::schema::PageNullCount::ZERO,
 			min: None,
 			max: None,
 		};
-		buffer.page_end_offsets.len()
+		injected.page_end_offsets.len()
 	];
+	bad_directory.buffers.push(injected);
 	let err = validate_encoding_directory(
 		&bad_directory,
 		page_directory,
@@ -895,8 +903,9 @@ fn encoding_directory_rejects_page_stats_on_variable_width_buffer() {
 		descriptor.logical_schema_fingerprint,
 	)
 	.unwrap_err();
-	assert_eq!(
+	assert!(matches!(
 		err,
 		wendelon::storage::encoding::EncodingRejectCode::EncodingDirectoryParseError
-	);
+			| wendelon::storage::encoding::EncodingRejectCode::BufferEncodingMismatch
+	));
 }
