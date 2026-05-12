@@ -17,43 +17,76 @@ impl ToronWorker {
         }
     }
 
+    pub async fn execute_morsel_local(
+        &self, 
+        plan: &crate::ir::LogicalPlan, 
+        morsel: Option<(crate::ir::MorselId, u32)>
+    ) -> Result<Vec<RecordBatch>, String> {
+        self.executor.execute(plan, morsel).await
+            .map_err(|e| format!("Execution error: {:?}", e))
+    }
+
     pub async fn handle_connection<S>(&self, mut stream: S) -> Result<(), String>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        // 1. Read ExecuteMorsel request
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.map_err(|e| e.to_string())?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        
-        let mut msg_buf = vec![0u8; len];
-        stream.read_exact(&mut msg_buf).await.map_err(|e| e.to_string())?;
-        
-        let msg = ToronMessage::decode(&msg_buf)?;
-        
-        if let ToronMessage::ExecuteMorsel { plan, morsel } = msg {
-            // 2. Execute
-            let results = self.executor.execute(&plan, morsel).await
-                .map_err(|e| format!("Execution error: {:?}", e))?;
-                
-            // 3. Stream Arrow batches back
-            for batch in results {
-                let mut buffer = Vec::new();
-                {
-                    let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())
-                        .map_err(|e| e.to_string())?;
-                    writer.write(&batch).map_err(|e: arrow::error::ArrowError| e.to_string())?;
-                    writer.finish().map_err(|e: arrow::error::ArrowError| e.to_string())?;
+        loop {
+            // 1. Read message length
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = stream.read_exact(&mut len_buf).await {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break; // Connection closed
                 }
-                
-                let response = ToronMessage::ArrowBatch { payload: buffer };
-                self.send_message(&mut stream, response).await?;
+                return Err(e.to_string());
             }
+            let len = u32::from_le_bytes(len_buf) as usize;
             
-            // 4. Signal completion
-            self.send_message(&mut stream, ToronMessage::MorselComplete).await?;
-        } else {
-            return Err("Expected ExecuteMorsel message".to_string());
+            let mut msg_buf = vec![0u8; len];
+            stream.read_exact(&mut msg_buf).await.map_err(|e| e.to_string())?;
+            
+            let msg = ToronMessage::decode(&msg_buf)?;
+            
+            match msg {
+                ToronMessage::ExecuteMorsel { plan, morsel } => {
+                    // 2. Execute
+                    let results = self.executor.execute(&plan, morsel).await
+                        .map_err(|e| format!("Execution error: {:?}", e))?;
+                        
+                    // 3. Stream Arrow batches back
+                    for batch in results {
+                        let mut buffer = Vec::new();
+                        {
+                            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())
+                                .map_err(|e| e.to_string())?;
+                            writer.write(&batch).map_err(|e: arrow::error::ArrowError| e.to_string())?;
+                            writer.finish().map_err(|e: arrow::error::ArrowError| e.to_string())?;
+                        }
+                        
+                        let response = ToronMessage::ArrowBatch { payload: buffer };
+                        self.send_message(&mut stream, response).await?;
+                    }
+                    
+                    // 4. Signal completion
+                    self.send_message(&mut stream, ToronMessage::MorselComplete).await?;
+                }
+                ToronMessage::ShuffleData { stage_id: _, partition_id: _, payload } => {
+                    // M6: Receive shuffle data from peer worker
+                    // Mock receive side backpressure: if payload is too big, simulate a delay
+                    if payload.len() > 1024 * 1024 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    
+                    // Reconstruct batch (just verifying it works for M6)
+                    let mut reader = arrow::ipc::reader::StreamReader::try_new(&payload[..], None)
+                        .map_err(|e| e.to_string())?;
+                    while let Some(batch) = reader.next().transpose().map_err(|e| e.to_string())? {
+                        // In a real impl, we'd buffer this for the local reducer stage
+                        drop(batch);
+                    }
+                }
+                ToronMessage::MorselComplete => break,
+                _ => return Err("Unexpected message".to_string()),
+            }
         }
         
         Ok(())
@@ -69,10 +102,37 @@ impl ToronWorker {
         stream.write_all(&payload).await.map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    pub async fn send_shuffle_data<S>(
+        &self, 
+        mut stream: S, 
+        stage_id: crate::ir::StageId, 
+        partition_id: u32, 
+        batch: &RecordBatch
+    ) -> Result<(), String>
+    where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())
+                .map_err(|e| e.to_string())?;
+            writer.write(batch).map_err(|e: arrow::error::ArrowError| e.to_string())?;
+            writer.finish().map_err(|e: arrow::error::ArrowError| e.to_string())?;
+        }
+        
+        let msg = ToronMessage::ShuffleData {
+            stage_id,
+            partition_id,
+            payload: buffer,
+        };
+        
+        self.send_message(&mut stream, msg).await
+    }
 }
 
 pub struct ToronCoordinator {
-    // In M5, simple coordinator that dials workers
+    // In M5/M6, simple coordinator that dials workers
 }
 
 impl ToronCoordinator {

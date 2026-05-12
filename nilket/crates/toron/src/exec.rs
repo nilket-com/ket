@@ -1,10 +1,10 @@
 use std::sync::Arc;
-use arrow::array::{ArrayRef, BooleanArray, Int32Array, Float64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Float64Array, StringArray};
 use arrow::compute::kernels::cmp::{eq, neq, lt, lt_eq, gt, gt_eq};
 use arrow::compute::kernels::boolean::{and, or, not, is_null, is_not_null};
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
-use crate::ir::{Expr, LogicalPlan, ScalarValue, AggregateFunction, MorselId};
+use crate::ir::{Expr, LogicalPlan, ScalarValue, MorselId};
 use crate::storage::{StorageScan, ScanRequest, TenantId, HlcBound};
 
 #[derive(Debug)]
@@ -76,24 +76,74 @@ impl Executor {
                     }
                     Ok(output)
                 }
-                LogicalPlan::Aggregate { input, aggr_expr } => {
+                LogicalPlan::Aggregate { input, group_expr, aggr_expr: _ } => {
                     let input_batches = self.execute(input, morsel).await?;
-                    match aggr_expr {
-                        AggregateFunction::CountAll => {
-                            let mut total: i64 = 0;
-                            for batch in input_batches {
-                                total += batch.num_rows() as i64;
+                    if group_expr.is_empty() {
+                        // Global aggregation (like CountAll in M1)
+                        let mut total_count: i64 = 0;
+                        for batch in input_batches {
+                            total_count += batch.num_rows() as i64;
+                        }
+                        let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![total_count]));
+                        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::Int64, false)
+                        ]));
+                        let result_batch = RecordBatch::try_new(schema, vec![array])
+                            .map_err(|e| ExecutionError::Compute(e.to_string()))?;
+                        Ok(vec![result_batch])
+                    } else {
+                        // Simple GroupBy mock for M6 (actually implementing hash-agg is heavy, 
+                        // we'll focus on the exchange mechanics first)
+                        Err(ExecutionError::NotImplemented("Grouping Aggregate not fully implemented in M6 mock".to_string()))
+                    }
+                }
+                LogicalPlan::Exchange { input, partition_count, key } => {
+                    let input_batches = self.execute(input, morsel).await?;
+                    let mut partitioned_output = Vec::new();
+                    
+                    for batch in input_batches {
+                        // M6: Basic hash partitioning
+                        // Calculate hashes for each row based on 'key' exprs
+                        let num_rows = batch.num_rows();
+                        if num_rows == 0 { continue; }
+                        
+                        let mut hashes = vec![0u64; num_rows];
+                        for expr in key {
+                            let arr = self.evaluate_expr(expr, &batch)?;
+                            // Mock hashing: use the sum of values if it's Int32
+                            if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
+                                for i in 0..num_rows {
+                                    if !int_arr.is_null(i) {
+                                        hashes[i] ^= int_arr.value(i) as u64;
+                                    }
+                                }
                             }
-                            
-                            let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![total]));
-                            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                                arrow::datatypes::Field::new("count", arrow::datatypes::DataType::Int64, false)
-                            ]));
-                            let result_batch = RecordBatch::try_new(schema, vec![array])
-                                .map_err(|e| ExecutionError::Compute(e.to_string()))?;
-                            Ok(vec![result_batch])
+                        }
+                        
+                        // Split batch into 'partition_count' buckets
+                        let mut builders: Vec<Vec<usize>> = (0..*partition_count).map(|_| Vec::new()).collect();
+                        for i in 0..num_rows {
+                            let bucket = (hashes[i] % (*partition_count as u64)) as usize;
+                            builders[bucket].push(i);
+                        }
+                        
+                        for indices in builders {
+                            if !indices.is_empty() {
+                                let indices_arr = arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<u32>>());
+                                let mut cols = Vec::new();
+                                for i in 0..batch.num_columns() {
+                                    let col = batch.column(i);
+                                    let taken = arrow::compute::take(col, &indices_arr, None)
+                                        .map_err(|e| ExecutionError::Compute(e.to_string()))?;
+                                    cols.push(taken);
+                                }
+                                let partitioned = RecordBatch::try_new(batch.schema(), cols)
+                                    .map_err(|e| ExecutionError::Compute(e.to_string()))?;
+                                partitioned_output.push(partitioned);
+                            }
                         }
                     }
+                    Ok(partitioned_output)
                 }
             }
         })

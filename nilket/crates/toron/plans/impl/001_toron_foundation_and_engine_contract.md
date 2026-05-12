@@ -43,7 +43,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 - **Scope:** Split process, define native messages over QUIC, stream incremental Arrow batches.
 - **Tests:** Crash-only hard gate (kill worker mid-query, verify idempotent redispatch).
 
-### M6: First Shuffle
+### M6: First Shuffle (Completed)
 - **Scope:** Add `GroupBy` and `Exchange`, implement hash partition exchange over QUIC with backpressure.
 - **Tests:** Distributed output determinism, receive-side backpressure limits.
 

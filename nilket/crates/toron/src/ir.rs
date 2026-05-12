@@ -63,6 +63,7 @@ impl Expr {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggregateFunction {
     CountAll,
+    Sum,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +82,12 @@ pub enum LogicalPlan {
     },
     Aggregate {
         input: Box<LogicalPlan>,
-        aggr_expr: AggregateFunction,
+        group_expr: Vec<Expr>,
+        aggr_expr: Vec<(AggregateFunction, Expr)>,
+    },
+    Exchange {
+        input: Box<LogicalPlan>,
+        partition_count: u32,
+        key: Vec<Expr>,
     },
 }

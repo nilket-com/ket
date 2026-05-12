@@ -14,6 +14,13 @@ pub enum ToronMessage {
         #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
     },
+    /// P2P worker exchange: sends a partitioned batch to another worker.
+    ShuffleData {
+        stage_id: crate::ir::StageId,
+        partition_id: u32,
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
     /// Sent from Worker to Coordinator: the morsel execution is complete.
     MorselComplete,
     /// Error notification.
