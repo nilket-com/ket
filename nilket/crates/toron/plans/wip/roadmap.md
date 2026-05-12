@@ -11,17 +11,22 @@ Implementation is starting at M0.
 ## Shipped Foundations
 
 - **ADR 001 Toron Foundation and Engine Contract** — Greenfield Arrow-native execution, no DataFusion, single crate, `toron-ir` as the engine contract, `StorageScan` boundary.
+- **M0: Monorepo Scaffold** — Flatten workspace, Toron compile target.
+- **M1: Single-Process IR Execution** — In-memory Arrow batches.
+- **M2: PBC Lowering Contract** — Pushdown translation.
+- **M3: Wendelon Client Adapter** — Real Wendelon storage wrapping `wendelon-client`.
+- **M4: Single-Process Morsels** — Parallel unit before distribution.
+- **M5: Coordinator / Worker Boundary** — QUIC incremental Arrow result streaming.
+- **M6: First Shuffle** — Hash partition exchange over QUIC.
 
 ## Forward Sequence
 
-1. **M0: Monorepo Scaffold** — Flatten workspace, Toron compile target.
-2. **M1: Single-Process IR Execution** — In-memory Arrow batches.
-3. **M2: PBC Lowering Contract** — Pushdown translation.
-4. **M3: Wendelon Client Adapter** — Real Wendelon storage wrapping `wendelon-client`.
-5. **M4: Single-Process Morsels** — Parallel unit before distribution.
-6. **M5: Coordinator / Worker Boundary** — QUIC incremental Arrow result streaming.
-7. **M6: First Shuffle** — Hash partition exchange over QUIC.
-8. **M7+: Frontends and Follow-Ups** — SQL, Rune, Encrypted spill, RDMA, advanced capabilities.
+1. **M7: Rune Authoring Surface** — Typed DataFrame API, fuel-limited sandbox.
+2. **M8: SQL Compatibility** — Parser lowered to handwritten IR.
+3. **M9: RDMA / RoCEv2 Transport** — Zero-copy high-speed fabric integration.
+4. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
+5. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+
 
 ## What Not To Do Next
 
