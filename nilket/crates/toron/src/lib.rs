@@ -6,6 +6,7 @@ pub mod pbc;
 pub mod server;
 pub mod wire;
 pub mod rune_engine;
+pub mod sql_planner;
 
 #[cfg(test)]
 mod tests {
@@ -319,5 +320,48 @@ mod tests {
             }
             _ => panic!("Expected Aggregate plan, got {:?}", plan),
         }
+    }
+
+    #[tokio::test]
+    async fn test_m8_sql_compatibility_surface() {
+        let planner = crate::sql_planner::SqlPlanner::new();
+        
+        let sql = "SELECT count(*) FROM sales WHERE amount > 100";
+        let plan = planner.plan(sql).expect("SQL planning failed");
+        
+        // Verify the plan structure
+        match &plan {
+            crate::ir::LogicalPlan::Aggregate { input, group_expr, aggr_expr } => {
+                assert!(group_expr.is_empty());
+                assert_eq!(aggr_expr.len(), 1);
+                assert!(matches!(aggr_expr[0].0, crate::ir::AggregateFunction::CountAll));
+                
+                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = &**input {
+                    if let crate::ir::Expr::Gt(left, right) = predicate {
+                        assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+                        assert!(matches!(&**right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
+                    } else {
+                        panic!("Expected Gt predicate, got {:?}", predicate);
+                    }
+                } else {
+                    panic!("Expected Filter plan, got {:?}", input);
+                }
+            }
+            _ => panic!("Expected Aggregate plan, got {:?}", plan),
+        }
+
+        // End-to-end execution verification
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Int32, true),
+        ]));
+        let amount_array = Int32Array::from(vec![Some(50), Some(150), Some(200)]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(amount_array)]).unwrap();
+        
+        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+        let executor = Executor::new(storage);
+        
+        let results = executor.execute(&plan, None).await.unwrap();
+        let count = results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
+        assert_eq!(count, 2);
     }
 }
