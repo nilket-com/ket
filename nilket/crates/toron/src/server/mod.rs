@@ -1,5 +1,6 @@
 pub mod memory;
 pub mod transport;
+pub mod spill;
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

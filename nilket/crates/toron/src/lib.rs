@@ -18,7 +18,8 @@ mod tests {
     use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId, MorselId, StageId};
     use crate::storage::InMemoryStorageScan;
     use crate::exec::Executor;
-    use crate::server::{ToronWorker, ToronCoordinator, memory::MemoryManager};
+    use crate::server::{ToronWorker, ToronCoordinator, memory::MemoryManager, spill::SpillManager};
+    use wendelon::storage::file_ops::BlockingFileOps;
 
     fn test_memory() -> Arc<MemoryManager> {
         Arc::new(MemoryManager::new(10, 1024 * 1024))
@@ -388,5 +389,51 @@ mod tests {
             drop(buf2);
         }
         assert_eq!(memory.available(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_m10_encrypted_spill() {
+        let temp_dir = std::env::temp_dir().join(format!("toron_spill_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_ops = Arc::new(BlockingFileOps::default());
+        let spill_manager = SpillManager::new(file_ops.clone(), temp_dir.clone()).unwrap();
+
+        // 1. Create a batch
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let val_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+
+        // 2. Spill the batch
+        let id = spill_manager.spill_batch(&batch).await.unwrap();
+
+        // 3. Verify it's encrypted on disk (cannot be parsed as raw Arrow)
+        let path = temp_dir.join(format!("spill_{}.bin", id.0));
+        let ciphertext = std::fs::read(&path).unwrap();
+        
+        // StreamReader::try_new should fail on ciphertext
+        let reader_res = arrow::ipc::reader::StreamReader::try_new(&ciphertext[..], None);
+        assert!(reader_res.is_err());
+
+        // 4. Read back and decrypt
+        let read_batch = spill_manager.read_batch(id).await.unwrap();
+        assert_eq!(batch, read_batch);
+
+        // 5. Tamper with ciphertext and verify integrity check fails
+        let mut tampered = ciphertext.clone();
+        let len = tampered.len();
+        tampered[len / 2] ^= 0xFF; // Flip some bits in the middle
+        
+        std::fs::write(&path, &tampered).unwrap();
+        let read_res = spill_manager.read_batch(id).await;
+        assert!(read_res.is_err());
+        assert!(read_res.unwrap_err().contains("Decryption failed"));
+
+        // Cleanup
+        spill_manager.cleanup(id).await.unwrap();
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

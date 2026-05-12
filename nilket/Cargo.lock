@@ -3873,9 +3873,11 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "aws-lc-rs",
  "bytemuck",
  "futures",
  "postcard",
+ "rand 0.10.1",
  "rune",
  "serde",
  "serde_bytes",

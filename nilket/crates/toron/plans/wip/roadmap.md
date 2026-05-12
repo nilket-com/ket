@@ -21,11 +21,12 @@ Implementation is starting at M0.
 - **M7: Rune Authoring Surface** — Typed DataFrame API, sandboxed execution.
 - **M8: SQL Compatibility** — Parser lowered to handwritten IR.
 - **M9: RDMA / RoCEv2 Transport Seams** — Memory pooling and transport abstraction.
+- **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
 
 ## Forward Sequence
 
-1. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
-2. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+1. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+
 
 
 
