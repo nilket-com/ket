@@ -224,8 +224,8 @@ mod tests {
         assert_eq!(res2, Err(LoweringDeclineReason::NullLiteral));
     }
 
-    #[test]
-    fn test_parity_against_in_memory_execution() {
+    #[tokio::test]
+    async fn test_parity_against_in_memory_execution() {
         // Create RecordBatch fixture
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -266,7 +266,7 @@ mod tests {
 
         let storage = InMemoryStorageScan { table_data: batch.clone() };
         let executor = Executor::new(&storage);
-        let executor_results = executor.execute(&plan).unwrap();
+        let executor_results = executor.execute(&plan).await.unwrap();
         let executor_result_batch = &executor_results[0];
 
         // 2. Wendelon PBC Engine

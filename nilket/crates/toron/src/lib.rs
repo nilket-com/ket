@@ -15,8 +15,8 @@ mod tests {
     use crate::storage::InMemoryStorageScan;
     use crate::exec::Executor;
 
-    #[test]
-    fn test_m1_single_process_ir_execution() {
+    #[tokio::test]
+    async fn test_m1_single_process_ir_execution() {
         // Build a RecordBatch fixture
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -64,7 +64,7 @@ mod tests {
         };
 
         // Execute
-        let results = executor.execute(&plan).expect("Execution failed");
+        let results = executor.execute(&plan).await.expect("Execution failed");
         
         // Assert output
         assert_eq!(results.len(), 1);
@@ -87,8 +87,8 @@ mod tests {
         assert_eq!(count_array.value(0), 2);
     }
 
-    #[test]
-    fn test_m1_null_semantics() {
+    #[tokio::test]
+    async fn test_m1_null_semantics() {
         // Assert that IsNull and IsNotNull work
         let schema = Arc::new(Schema::new(vec![
             Field::new("amount", DataType::Int32, true),
@@ -109,7 +109,7 @@ mod tests {
             }),
         };
 
-        let results_null = executor.execute(&plan_null).unwrap();
+        let results_null = executor.execute(&plan_null).await.unwrap();
         let count_null = results_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(count_null, 1);
 
@@ -122,7 +122,7 @@ mod tests {
             }),
         };
 
-        let results_not_null = executor.execute(&plan_not_null).unwrap();
+        let results_not_null = executor.execute(&plan_not_null).await.unwrap();
         let count_not_null = results_not_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(count_not_null, 2);
     }

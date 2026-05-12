@@ -6,4 +6,7 @@ publish = false
 
 [dependencies]
 arrow.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
 wendelon = { path = "../wendelon" }
+wendelon-client = { path = "../wendelon/crates/wendelon-client" }

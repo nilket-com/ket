@@ -23,77 +23,79 @@ impl<'a> Executor<'a> {
         Self { storage }
     }
 
-    pub fn execute(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, ExecutionError> {
-        match plan {
-            LogicalPlan::Scan { table, projection } => {
-                let req = ScanRequest {
-                    tenant_id: TenantId(0), // Dummy for V0
-                    table_id: *table,
-                    read_bound: HlcBound(0),
-                    projected_columns: projection.clone(),
-                    pbc_predicate: None, // PBC lowering deferred to M2
-                    profile_hint: None,
-                };
-                let stream = self.storage.scan(req)
-                    .map_err(|e| ExecutionError::Storage(format!("{:?}", e)))?;
-                Ok(stream.batches)
-            }
-            LogicalPlan::Filter { input, predicate } => {
-                let input_batches = self.execute(input)?;
-                let mut output = Vec::new();
-                for batch in input_batches {
-                    let mask = self.evaluate_expr(predicate, &batch)?;
-                    let mask_bool = mask.as_any().downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| ExecutionError::Compute("Filter predicate must return boolean".to_string()))?;
-                    let filtered = filter_record_batch(&batch, mask_bool)
-                        .map_err(|e: arrow::error::ArrowError| ExecutionError::Compute(e.to_string()))?;
-                    output.push(filtered);
+    pub fn execute<'b>(&'b self, plan: &'b LogicalPlan) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>> {
+        Box::pin(async move {
+            match plan {
+                LogicalPlan::Scan { table, projection } => {
+                    let req = ScanRequest {
+                        tenant_id: TenantId(0), // Dummy for V0
+                        table_id: *table,
+                        read_bound: HlcBound(0),
+                        projected_columns: projection.clone(),
+                        pbc_predicate: None, // PBC lowering deferred to M2
+                        profile_hint: None,
+                    };
+                    let stream = self.storage.scan(req).await
+                        .map_err(|e| ExecutionError::Storage(format!("{:?}", e)))?;
+                    Ok(stream.batches)
                 }
-                Ok(output)
-            }
-            LogicalPlan::Project { input, exprs } => {
-                let input_batches = self.execute(input)?;
-                let mut output = Vec::new();
-                for batch in input_batches {
-                    let mut cols = Vec::new();
-                    let mut fields = Vec::new();
-                    for (i, expr) in exprs.iter().enumerate() {
-                        let array = self.evaluate_expr(expr, &batch)?;
-                        cols.push(array.clone());
-                        let field = arrow::datatypes::Field::new(
-                            format!("col_{}", i),
-                            array.data_type().clone(),
-                            true, // Simplified
-                        );
-                        fields.push(field);
+                LogicalPlan::Filter { input, predicate } => {
+                    let input_batches = self.execute(input).await?;
+                    let mut output = Vec::new();
+                    for batch in input_batches {
+                        let mask = self.evaluate_expr(predicate, &batch)?;
+                        let mask_bool = mask.as_any().downcast_ref::<BooleanArray>()
+                            .ok_or_else(|| ExecutionError::Compute("Filter predicate must return boolean".to_string()))?;
+                        let filtered = filter_record_batch(&batch, mask_bool)
+                            .map_err(|e: arrow::error::ArrowError| ExecutionError::Compute(e.to_string()))?;
+                        output.push(filtered);
                     }
-                    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-                    let projected = RecordBatch::try_new(schema, cols)
-                        .map_err(|e| ExecutionError::Compute(e.to_string()))?;
-                    output.push(projected);
+                    Ok(output)
                 }
-                Ok(output)
-            }
-            LogicalPlan::Aggregate { input, aggr_expr } => {
-                let input_batches = self.execute(input)?;
-                match aggr_expr {
-                    AggregateFunction::CountAll => {
-                        let mut total: i64 = 0;
-                        for batch in input_batches {
-                            total += batch.num_rows() as i64;
+                LogicalPlan::Project { input, exprs } => {
+                    let input_batches = self.execute(input).await?;
+                    let mut output = Vec::new();
+                    for batch in input_batches {
+                        let mut cols = Vec::new();
+                        let mut fields = Vec::new();
+                        for (i, expr) in exprs.iter().enumerate() {
+                            let array = self.evaluate_expr(expr, &batch)?;
+                            cols.push(array.clone());
+                            let field = arrow::datatypes::Field::new(
+                                format!("col_{}", i),
+                                array.data_type().clone(),
+                                true, // Simplified
+                            );
+                            fields.push(field);
                         }
-                        
-                        let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![total]));
-                        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-                            arrow::datatypes::Field::new("count", arrow::datatypes::DataType::Int64, false)
-                        ]));
-                        let result_batch = RecordBatch::try_new(schema, vec![array])
+                        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+                        let projected = RecordBatch::try_new(schema, cols)
                             .map_err(|e| ExecutionError::Compute(e.to_string()))?;
-                        Ok(vec![result_batch])
+                        output.push(projected);
+                    }
+                    Ok(output)
+                }
+                LogicalPlan::Aggregate { input, aggr_expr } => {
+                    let input_batches = self.execute(input).await?;
+                    match aggr_expr {
+                        AggregateFunction::CountAll => {
+                            let mut total: i64 = 0;
+                            for batch in input_batches {
+                                total += batch.num_rows() as i64;
+                            }
+                            
+                            let array: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![total]));
+                            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                                arrow::datatypes::Field::new("count", arrow::datatypes::DataType::Int64, false)
+                            ]));
+                            let result_batch = RecordBatch::try_new(schema, vec![array])
+                                .map_err(|e| ExecutionError::Compute(e.to_string()))?;
+                            Ok(vec![result_batch])
+                        }
                     }
                 }
             }
-        }
+        })
     }
 
     fn evaluate_expr(&self, expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, ExecutionError> {

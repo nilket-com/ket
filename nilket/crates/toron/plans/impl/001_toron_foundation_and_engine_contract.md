@@ -31,7 +31,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 - **Scope:** Map V0 expressions to Wendelon PBC opcodes, produce deterministic payloads.
 - **Tests:** Golden tests for PBC lowering, decline tests for unsupported shapes, parity tests against in-memory execution.
 
-### M3: Wendelon Client Adapter
+### M3: Wendelon Client Adapter (Completed)
 - **Scope:** Implement `WendelonStorageScan` wrapping `wendelon-client`, pass tenant id and PBC predicate, receive Arrow batches.
 - **Tests:** In-process Wendelon fixtures, live local cluster integration.
 
