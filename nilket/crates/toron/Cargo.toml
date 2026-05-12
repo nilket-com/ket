@@ -6,3 +6,4 @@ publish = false
 
 [dependencies]
 arrow.workspace = true
+wendelon = { path = "../wendelon" }

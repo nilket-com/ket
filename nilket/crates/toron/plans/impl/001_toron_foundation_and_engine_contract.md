@@ -27,7 +27,7 @@ Scaffold the Toron compute ring as a greenfield, Arrow-native distributed engine
 - **Scope:** Implement V0 IR structs, type-check V0 expression catalog, implement Arrow vectorized interpreter, execute `Scan -> Filter -> Aggregate` over in-memory Arrow batches.
 - **Tests:** Assert Arrow output and null semantics over `RecordBatch` fixtures.
 
-### M2: PBC Lowering Contract
+### M2: PBC Lowering Contract (Completed)
 - **Scope:** Map V0 expressions to Wendelon PBC opcodes, produce deterministic payloads.
 - **Tests:** Golden tests for PBC lowering, decline tests for unsupported shapes, parity tests against in-memory execution.
 
