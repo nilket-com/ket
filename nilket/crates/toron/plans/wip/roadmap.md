@@ -20,12 +20,13 @@ Implementation is starting at M0.
 - **M6: First Shuffle** — Hash partition exchange over QUIC.
 - **M7: Rune Authoring Surface** — Typed DataFrame API, sandboxed execution.
 - **M8: SQL Compatibility** — Parser lowered to handwritten IR.
+- **M9: RDMA / RoCEv2 Transport Seams** — Memory pooling and transport abstraction.
 
 ## Forward Sequence
 
-1. **M9: RDMA / RoCEv2 Transport** — Zero-copy high-speed fabric integration.
-2. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
-3. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+1. **M10: Encrypted Spill** — Local NVMe spill with Wendelon crypto primitives.
+2. **M11: Advanced Kernels** — Linear regression, quantile sketches, time buckets.
+
 
 
 ## What Not To Do Next

@@ -1,3 +1,6 @@
+pub mod memory;
+pub mod transport;
+
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::exec::Executor;
@@ -5,15 +8,18 @@ use crate::storage::StorageScan;
 use crate::wire::ToronMessage;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use self::memory::MemoryManager;
 
 pub struct ToronWorker {
     executor: Executor,
+    memory: Arc<MemoryManager>,
 }
 
 impl ToronWorker {
-    pub fn new(storage: Arc<dyn StorageScan>) -> Self {
+    pub fn new(storage: Arc<dyn StorageScan>, memory: Arc<MemoryManager>) -> Self {
         Self {
             executor: Executor::new(storage),
+            memory,
         }
     }
 
@@ -41,8 +47,9 @@ impl ToronWorker {
             }
             let len = u32::from_le_bytes(len_buf) as usize;
             
-            let mut msg_buf = vec![0u8; len];
-            stream.read_exact(&mut msg_buf).await.map_err(|e| e.to_string())?;
+            let mut msg_buf = self.memory.acquire_at_least(len);
+            msg_buf.as_mut_vec().resize(len, 0);
+            stream.read_exact(msg_buf.as_mut_vec()).await.map_err(|e| e.to_string())?;
             
             let msg = ToronMessage::decode(&msg_buf)?;
             
@@ -54,15 +61,17 @@ impl ToronWorker {
                         
                     // 3. Stream Arrow batches back
                     for batch in results {
-                        let mut buffer = Vec::new();
+                        let mut buffer = self.memory.acquire();
                         {
-                            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())
+                            let mut writer = StreamWriter::try_new(buffer.as_mut_vec(), &batch.schema())
                                 .map_err(|e| e.to_string())?;
                             writer.write(&batch).map_err(|e: arrow::error::ArrowError| e.to_string())?;
                             writer.finish().map_err(|e: arrow::error::ArrowError| e.to_string())?;
                         }
                         
-                        let response = ToronMessage::ArrowBatch { payload: buffer };
+                        let response = ToronMessage::ArrowBatch { payload: buffer.as_vec().clone() };
+                        // Note: postcard currently forces a copy of the payload Vec<u8> during serialization.
+                        // True zero-copy requires a custom RDMA-aware codec.
                         self.send_message(&mut stream, response).await?;
                     }
                     
@@ -113,9 +122,9 @@ impl ToronWorker {
     where
         S: tokio::io::AsyncWrite + Unpin,
     {
-        let mut buffer = Vec::new();
+        let mut buffer = self.memory.acquire();
         {
-            let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())
+            let mut writer = StreamWriter::try_new(buffer.as_mut_vec(), &batch.schema())
                 .map_err(|e| e.to_string())?;
             writer.write(batch).map_err(|e: arrow::error::ArrowError| e.to_string())?;
             writer.finish().map_err(|e: arrow::error::ArrowError| e.to_string())?;
@@ -124,7 +133,7 @@ impl ToronWorker {
         let msg = ToronMessage::ShuffleData {
             stage_id,
             partition_id,
-            payload: buffer,
+            payload: buffer.as_vec().clone(),
         };
         
         self.send_message(&mut stream, msg).await
@@ -132,12 +141,12 @@ impl ToronWorker {
 }
 
 pub struct ToronCoordinator {
-    // In M5/M6, simple coordinator that dials workers
+    memory: Arc<MemoryManager>,
 }
 
 impl ToronCoordinator {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(memory: Arc<MemoryManager>) -> Self {
+        Self { memory }
     }
 
     pub async fn execute_morsel_on_worker<S>(
@@ -160,11 +169,14 @@ impl ToronCoordinator {
         let mut results = Vec::new();
         loop {
             let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).await.map_err(|e| e.to_string())?;
+            if let Err(e) = stream.read_exact(&mut len_buf).await {
+                return Err(e.to_string());
+            }
             let len = u32::from_le_bytes(len_buf) as usize;
             
-            let mut msg_buf = vec![0u8; len];
-            stream.read_exact(&mut msg_buf).await.map_err(|e| e.to_string())?;
+            let mut msg_buf = self.memory.acquire_at_least(len);
+            msg_buf.as_mut_vec().resize(len, 0);
+            stream.read_exact(msg_buf.as_mut_vec()).await.map_err(|e| e.to_string())?;
             
             let response = ToronMessage::decode(&msg_buf)?;
             match response {

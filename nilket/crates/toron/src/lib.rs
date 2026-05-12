@@ -18,7 +18,11 @@ mod tests {
     use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId, MorselId, StageId};
     use crate::storage::InMemoryStorageScan;
     use crate::exec::Executor;
-    use crate::server::{ToronWorker, ToronCoordinator};
+    use crate::server::{ToronWorker, ToronCoordinator, memory::MemoryManager};
+
+    fn test_memory() -> Arc<MemoryManager> {
+        Arc::new(MemoryManager::new(10, 1024 * 1024))
+    }
 
     #[tokio::test]
     async fn test_m1_single_process_ir_execution() {
@@ -204,8 +208,9 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
 
         let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let worker = Arc::new(ToronWorker::new(storage));
-        let coordinator = ToronCoordinator::new();
+        let memory = test_memory();
+        let worker = Arc::new(ToronWorker::new(storage, memory.clone()));
+        let coordinator = ToronCoordinator::new(memory);
 
         let (mut client_stream, mut server_stream) = tokio::io::duplex(1024 * 1024);
 
@@ -248,8 +253,9 @@ mod tests {
         let w2_vals = Int32Array::from((50..100).collect::<Vec<i32>>());
         let w2_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(w2_keys), Arc::new(w2_vals)]).unwrap();
 
-        let w1 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w1_batch })));
-        let w2 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w2_batch })));
+        let memory = test_memory();
+        let w1 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w1_batch }), memory.clone()));
+        let w2 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w2_batch }), memory.clone()));
         
         let plan = LogicalPlan::Exchange {
             partition_count: 2,
@@ -300,17 +306,17 @@ mod tests {
         
         let plan = engine.execute_script(script, 1000).await.expect("Rune execution failed");
         
-        // Verify the plan
-        match plan {
+        // Verify the plan structure
+        match &plan {
             crate::ir::LogicalPlan::Aggregate { input, group_expr, aggr_expr } => {
                 assert!(group_expr.is_empty());
                 assert_eq!(aggr_expr.len(), 1);
                 assert!(matches!(aggr_expr[0].0, crate::ir::AggregateFunction::CountAll));
                 
-                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = *input {
+                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = &**input {
                     if let crate::ir::Expr::Gt(left, right) = predicate {
-                        assert!(matches!(*left, crate::ir::Expr::Column(ref c) if c == "amount"));
-                        assert!(matches!(*right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
+                        assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+                        assert!(matches!(&**right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
                     } else {
                         panic!("Expected Gt predicate, got {:?}", predicate);
                     }
@@ -363,5 +369,24 @@ mod tests {
         let results = executor.execute(&plan, None).await.unwrap();
         let count = results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
         assert_eq!(count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_m9_memory_pooling() {
+        let memory = Arc::new(MemoryManager::new(2, 1024));
+        
+        {
+            let buf1 = memory.acquire_at_least(100);
+            assert_eq!(memory.available(), 0);
+            drop(buf1);
+        }
+        assert_eq!(memory.available(), 1);
+
+        {
+            let buf2 = memory.acquire_at_least(100);
+            assert_eq!(memory.available(), 0);
+            drop(buf2);
+        }
+        assert_eq!(memory.available(), 1);
     }
 }
