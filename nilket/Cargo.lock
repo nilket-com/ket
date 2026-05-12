@@ -3588,7 +3588,6 @@ name = "toron"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "tokio",
 ]
 
 [[package]]

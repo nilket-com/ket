@@ -24,7 +24,7 @@ fi
 export CC="${CC:-clang}"
 export CXX="${CXX:-clang++}"
 export CARGO_PROFILE_FIPS_STRIP="${CARGO_PROFILE_FIPS_STRIP:-none}"
-target_dir="${CARGO_TARGET_DIR:-target}"
+target_dir="${CARGO_TARGET_DIR:-../../target}"
 
 echo "Building FIPS release artifact with CC=${CC} CXX=${CXX}"
 cargo build --locked --profile fips --no-default-features --features fips --bin wendelon

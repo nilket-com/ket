@@ -20,7 +20,7 @@ fn assert_contains(haystack: &str, needle: &str, context: &str) {
 
 #[test]
 fn fips_profile_is_explicit_and_symbol_sweep_uses_it() {
-	let cargo = read_repo_file("Cargo.toml");
+	let cargo = read_repo_file("../../Cargo.toml");
 	assert_contains(&cargo, "[profile.fips]", "Cargo.toml");
 	assert_contains(&cargo, "inherits = \"release\"", "Cargo.toml");
 	let fips_section = cargo
@@ -48,7 +48,7 @@ fn fips_profile_is_explicit_and_symbol_sweep_uses_it() {
 	let sweep = read_repo_file("ci/check_fips_symbol_sweep.sh");
 	for required in [
 		"cargo build --locked --profile fips --no-default-features --features fips --bin wendelon",
-		"target_dir=\"${CARGO_TARGET_DIR:-target}\"",
+		"target_dir=\"${CARGO_TARGET_DIR:-../../target}\"",
 		"binary=\"${target_dir}/fips/wendelon\"",
 		"AES-GCM-SIV",
 		"blake3-256",

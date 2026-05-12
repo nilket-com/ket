@@ -28,7 +28,7 @@ else
 fi
 
 mkdir -p "${out_dir}"
-target_dir="${CARGO_TARGET_DIR:-target}"
+target_dir="${CARGO_TARGET_DIR:-../../target}"
 
 git_rev="$(git rev-parse HEAD 2>/dev/null || printf 'unknown')"
 build_time_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
