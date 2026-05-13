@@ -27,6 +27,12 @@ along with the forward-sequence rewrite.
 - **ADR 004 — Distributed Inner Equi-Join Contract.**
   Promoted + implemented. Bench evidence at
   `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
+- **ADR 005 — Hash-Join Build Path Efficiency.** Promoted.
+  Implementation pending. Pinned by ADR 004's post-promotion
+  framework-overhead sub-attribution: `build_ms` is 47.7% of
+  8-worker wall, `framework_overhead_ms` 37.7%. ADR 005 targets
+  the build bucket; conditional ADR 006 rule resolves the
+  residual interpretation from the rerun.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -65,116 +71,124 @@ evidence.
 
 **Evidence drives scope.** The most informative artifact for
 the next ADR is the previous ADR's bench results. ADR 004's
-10M × 10M `INNER JOIN` benchmark at 8 workers will tell us
-whether the buffered executor is the remaining V1 bottleneck
-(promoting executor model upgrade), whether large-build
-spill engagement is the throughput floor (promoting a
-focused spill-policy ADR), or whether neither — at which
-point ADR 005 attacks outer joins, runtime-filter pushdown,
-or multi-tenant governance based on launch-timing pressure.
+post-promotion telemetry rerun
+(`plans/impl/004_distributed_inner_equi_join_bench_results.md`)
+sub-attributed the 8-worker task wall and produced the
+ADR 005 scope decision: `build_ms` at 47.7% is the dominant
+sharp bucket, `framework_overhead_ms` at 37.7% is real but
+unfocused, probe + output combined at ~7% demoted the
+streaming-executor hypothesis. ADR 005 narrowed onto the
+build path; ADR 006's scope is governed by the conditional
+rerun rule below.
 
 ## Forward sequence
 
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 005 planning
+### Next: ADR 005 implementation → ADR 006 planning
 
-ADR 004's promotion makes the first two-input relational
-operator available alongside the ADR 003 substrate. ADR 005
-should choose the next contract surface from the bench
-evidence and the remaining V1 launch gates.
+ADR 005's contract is pinned at
+`plans/adr/005_hash_join_build_path_efficiency.md`; the impl plan
+lives at `plans/impl/005_hash_join_build_path_efficiency.md`. The
+next council deliverable is implementation through Phase 5, ending
+in promotion-scale bench evidence at
+`plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
 
-Recorded ADR 004 evidence: 10M × 10M hash-partitioned join
-completed at 8 workers, broadcast and hash digests match on
-the 1M × 10M comparison fixture, and 10M × 1M worker scaling
-missed the soft target. That keeps executor model /
-scheduling overhead as the leading ADR 005 candidate unless
-launch pressure forces a narrower surface first.
+The ADR 005 rerun resolves the ADR 006 framing via a pinned
+three-band rule:
 
-The five live candidates, in rough order of probable
-selection given evidence shapes the council can already
-anticipate:
+- **Operator-adjacent residual (≥50% proportional drop).** ADR 006
+  does **not** promote runtime-plumbing investigation. ADR 006
+  selects from the candidates below by V1 launch pressure and
+  evidence-driven scope.
+- **Flat residual (≤20% proportional drop).** ADR 006 promotes a
+  runtime-plumbing investigation with sharp scope: async-runtime
+  poll cost, allocator churn beyond ADR 005's wins, lock contention
+  beyond ADR 004's telemetry-lock bucket, scheduler/registry
+  plumbing.
+- **Gray zone (20% < drop < 50%).** Brief council readout decides.
+- **Both build and residual flat.** ADR 005 missed the real
+  bottleneck; council reopens scope rather than treating residual
+  plumbing as proven.
 
-#### Candidate A — Executor model upgrade
+### ADR 006 candidates (governed by the conditional rule)
 
-Promotes if ADR 004's 10M × 10M join bench shows the
-buffered executor groans at full-cardinality probe-side
-throughput. Streaming end-to-end execution, morsel
-parallelism, push-based execution. Lifts every workload
-that doesn't have pushdown to fall back on; particularly
-joins, complex aggregates, and any future operator that
-materializes full-cardinality intermediate state.
+If ADR 005's rerun lands in the **operator-adjacent** or **gray
+zone** band, ADR 006 picks from the live V1-touching candidates
+below. If the rerun lands in **flat**, ADR 006 instead promotes the
+runtime-plumbing investigation; the candidates below shift one slot
+later.
 
-The bench evidence question: does probe-side wall-clock
-scale linearly with worker count up to 8 workers, or does
-it plateau? Plateau = buffered executor is the bottleneck =
-executor model is ADR 005. Linear scaling = something else.
+The candidates, in rough order of probable selection given evidence
+shapes the council can already anticipate:
 
-#### Candidate B — Bloom / runtime filter pushdown into Wendelon
+#### Candidate A — Bloom / runtime filter pushdown into Wendelon
 
-The cross-ring contract that completes Toron's "smart-
-storage pushdown" thesis for joins. Build-side stage
-produces a Bloom filter (or exact `InList` for small build
-sets) from observed keys; coordinator attaches the filter
-to the probe-side `ScanRequest` (ADR 002 surface); Wendelon
-applies the filter at the storage layer (row-group skip or
-row-level reject) before bytes hit the wire.
+The cross-ring contract that completes Toron's "smart-storage
+pushdown" thesis for joins. Build-side stage produces a Bloom filter
+(or exact `InList` for small build sets) from observed keys;
+coordinator attaches the filter to the probe-side `ScanRequest`
+(ADR 002 surface); Wendelon applies the filter at the storage layer
+(row-group skip or row-level reject) before bytes hit the wire.
 
 Shape from council topics:
 
-- Worker build → coordinator collect → Wendelon attach via
-  PBC.
-- False-positive tolerance: best-effort selectivity (join
-  remains responsible for correctness).
-- Hash seed + encoding stability for cross-replica
-  determinism.
-- Byte budget per filter; descriptor-fingerprint
-  interaction.
+- Worker build → coordinator collect → Wendelon attach via PBC.
+- False-positive tolerance: best-effort selectivity (join remains
+  responsible for correctness).
+- Hash seed + encoding stability for cross-replica determinism.
+- Byte budget per filter; descriptor-fingerprint interaction.
 - Behavior when filter cannot be pushed into Wendelon (V1.x
   fallback: filter ignored, join still correct).
 
-Promotes if ADR 004 join bench shows selective joins are
-shuffle-bytes-dominated and filter-side reduction would
-help. Requires cross-ring contract surface with Wendelon
-(its own ADR scope).
+Promotes if ADR 005's rerun leaves selective-join shuffle bytes as
+the next visible bottleneck. Requires cross-ring contract surface
+with Wendelon (its own ADR scope).
 
-#### Candidate C — Outer / semi / anti joins
+#### Candidate B — Outer / semi / anti joins
 
-Pins null-fill semantics for preserved sides under
-`LeftOuter` / `RightOuter` / `FullOuter` plus existence-
-based filtering for `Semi` / `Anti`. Substrate exists from
-ADR 004; the contract decision is null semantics and output
-schema nullability adjustments.
+Pins null-fill semantics for preserved sides under `LeftOuter` /
+`RightOuter` / `FullOuter` plus existence-based filtering for
+`Semi` / `Anti`. Substrate exists from ADR 004; the contract
+decision is null semantics and output schema nullability
+adjustments.
 
-Bench evidence question: does V1 launch require outer joins?
-Most analytical SQL workloads use them (LEFT OUTER on
-missing dimension lookups, FULL OUTER for diff reports). If
-launch timing forces this before executor or filter
-pushdown, ADR 005 promotes outer joins.
+Bench evidence question: does V1 launch require outer joins? Most
+analytical SQL workloads use them (LEFT OUTER on missing dimension
+lookups, FULL OUTER for diff reports). If launch timing forces this
+before filter pushdown, ADR 006 promotes outer joins.
 
-#### Candidate D — Multi-tenant resource governance
+#### Candidate C — Multi-tenant resource governance
 
 Per-query → per-tenant budgets, token-bucket admission,
 scheduler-slot allocation, memory-rejection vs spill-trigger
-thresholds. Promotes if V1 launch pressure surfaces multi-
-tenancy before joins-adjacent perf work.
+thresholds. Promotes if V1 launch pressure surfaces multi-tenancy
+before joins-adjacent perf work.
 
-ADR 003's per-query `QueryBudget` is the natural antecedent;
-the per-tenant layer wants real multi-tenant workload
-evidence before its shape gets pinned.
+ADR 003's per-query `QueryBudget` is the natural antecedent; the
+per-tenant layer wants real multi-tenant workload evidence before
+its shape gets pinned.
 
-#### Candidate E — Rune sandbox enforcement
+#### Candidate D — Rune sandbox enforcement
 
 V1 launch prerequisite. Fuel is currently disabled at
-`rune_engine.rs:188`. Native-function allow-list, per-tenant
-CPU + memory budgets, no-filesystem / no-network gating.
-Self-contained — doesn't depend on join shape, executor
-shape, or governance shape.
+`rune_engine.rs:188`. Native-function allow-list, per-tenant CPU +
+memory budgets, no-filesystem / no-network gating. Self-contained —
+doesn't depend on join shape, executor shape, or governance shape.
 
-Could ship as a parallel narrow ADR alongside ADR 005 if
-launch timing demands; otherwise sequenced ahead when V1
-launch becomes load-bearing.
+Could ship as a parallel narrow ADR alongside ADR 006 if launch
+timing demands; otherwise sequenced ahead when V1 launch becomes
+load-bearing.
+
+#### Candidate E — Executor model upgrade
+
+Demoted by ADR 004's sub-attribution telemetry: probe + output
+combined is ~7% of wall; rewriting the Volcano model addresses ~0%
+of measured bottleneck. Reserved for the case where a future
+workload (large probe-side, multi-way joins, complex aggregates)
+shows probe-side dominance. Until then, this candidate stays
+demoted.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
@@ -246,7 +260,8 @@ Promoted to their own ADRs when evidence drives them.
 - **Floating-point join keys.** Requires canonical-
   encoding ADR (NaN, signed zero, subnormals).
 - **Intra-task build / probe pipelining.** V1.x executor
-  work; depends on Candidate A outcome.
+  work; depends on Candidate E (executor model upgrade)
+  outcome.
 - **Hash-spill-to-memory demotion.** ADR 004 ships one-way
   spill; demotion is V1.x when bench shows churn benefits.
 - **SQL-surface auto-rename of duplicate output column
@@ -263,8 +278,8 @@ Promoted to their own ADRs when evidence drives them.
   through V1.
 - **Operator-internal streaming end-to-end.** ADR 003
   requires stream-shaped task output; full operator-
-  internal streaming is V1.x executor work (Candidate A
-  territory).
+  internal streaming is V1.x executor work (Candidate E —
+  executor model upgrade — territory).
 - **Higher retry counts.** ADR 003 ships `max_attempts =
   2`; future ADR raises with evidence of which failure
   modes benefit.
@@ -333,6 +348,51 @@ Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
+
+### ADR 005 cycle
+
+- **Streaming push-based executor as ADR 005.** Pre-telemetry
+  working hypothesis (Volcano → push-based, morsel parallelism,
+  end-to-end streaming). Rejected outright by ADR 004's
+  post-promotion telemetry: probe + output combined at ~7% of
+  wall; the rewrite addresses ~0% of measured bottleneck.
+  Reserved for the case where a future workload shifts probe-side
+  to the dominant bucket; until then, this stays demoted.
+- **Sub-attribution-first investigation of the 38% residual as
+  ADR 005.** Considered (Codex iter-1 framing); rejected because
+  the build bucket is sharper and the conditional ADR 006 rule
+  resolves the residual question for free in most cases.
+- **Fast-path eligibility extending broadly in V1.** Considered
+  (Gemini iter-1 — all primitive integer types in V1); rejected
+  in favor of the conservative `Int64`/`Int32` default. Each
+  extension carries a parity-test and logical-type-tag obligation;
+  Phase 0 evidence may justify extending within this ADR.
+- **Pin a specific hash table layout in the ADR.** Considered
+  (open addressing vs chaining vs Swiss table). Rejected: the
+  contract pins invariants, layout is Phase 0 calibration evidence.
+- **Hash function change** (replacing `xxh3_64` with ahash /
+  wyhash). Rejected — partition-assignment consistency requires
+  `xxh3_64` parity. Operator-local hash-table choice must preserve
+  the ADR 003 §5 boundary.
+- **Concurrent / sharded hash-table build in V1.** Considered as
+  Candidate (morsel-parallel build inside a worker); rejected.
+  Adds sharded-table determinism, per-thread memory accounting,
+  and allocator questions needing their own evidence. V1.x with
+  its own ADR.
+- **Two-band conditional ADR 006 rule** (operator-adjacent vs
+  flat, no gray zone). Considered (Codex iter-1 / Gemini iter-2
+  framings); rejected for the explicit three-band rule with
+  numeric thresholds (≥50%, ≤20%, gray) plus the "both fail"
+  reopen branch.
+- **New telemetry columns to sharpen residual attribution within
+  ADR 005.** Considered as ADR-005 precondition; rejected as it
+  would turn ADR 005 back into attribution work. ADR 004's columns
+  are sufficient; the conditional ADR 006 rule resolves the
+  remaining question.
+- **Mandatory flamegraph diff** (baseline vs post) in bench
+  artifact. Considered (iter-3 open question); rejected — the
+  dominant-hot-path note is the load-bearing evidence; flamegraph
+  file reference is optional.
 
 ### ADR 004 cycle
 
@@ -518,3 +578,30 @@ sections; this list is the cross-cutting set.
 - **Don't bundle ADR 003 telemetry residual into ADR 004
   feature commits.** Separate `chore:` slice (ADR 004
   council decision 19).
+- **Don't conflate join-build key hashing with
+  exchange-partition hashing.** ADR 003 §5 partition assignment
+  uses `xxh3_64(canonical_encoded_bytes)`; ADR 005's fast-path
+  key representation is operator-local. Helper names must make
+  the boundary explicit ("join build key" vs "exchange partition
+  hash"), never a generic "fast hash" that blurs them. ADR 005
+  hard gate 14 conditional architecture guard.
+- **Don't let an ADR 005 fast-path encoder lose the logical-type
+  tag.** `Int32(1)` and `Int64(1)` must remain distinct
+  build-side hash keys. ADR 005 hard gate 7 unit-test enforced.
+- **Don't promote ADR 005 on wall-clock alone.** `build_ms` is
+  the primary signal; digest equality and phase attribution are
+  load-bearing. ADR 005 hard gate 16.
+- **Don't soften an ADR 005 `build_ms` target miss** into a
+  vague "improved" narrative. The bench artifact records the
+  explicit gap; the council selects accept-narrower / scope-down
+  / shelve.
+- **Don't add new contract surface in ADR 005.** No new
+  `MessageKind`, IR variant, `BudgetDimension`, task telemetry
+  field, public API, Wendelon scan contract, or architecture
+  guard (default; conditional escape only). ADR 005 hard gates
+  3, 12-14.
+- **Don't parallelize hash-table build inside a worker in
+  ADR 005.** Sharded concurrent insertion is V1.x with its own
+  determinism + budget accounting work.
+- **Don't bundle runtime-plumbing investigation into ADR 005.**
+  Conditional ADR 006 governed by the three-band rerun rule.
