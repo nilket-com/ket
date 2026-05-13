@@ -5801,6 +5801,15 @@ impl WendelonDataServer {
 				self.local_node,
 			));
 		};
+		if meta.physical_descriptor_fingerprint
+			!= *descriptor.physical_descriptor_fingerprint.as_bytes()
+		{
+			return Ok(query_plan_error(
+				&range_meta,
+				ReadStatus::TABLE_DESCRIPTOR_EVOLVED,
+				self.local_node,
+			));
+		}
 		let effective_retention = self.table_effective_retention_from_state(
 			&sm_peek,
 			meta.tenant_id,
@@ -15138,6 +15147,7 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
 			consistency: Consistency::SERIALIZABLE,
 			_pad: [0; 7],
 			bytecode_len: bytecode_len as u32,
@@ -20130,12 +20140,51 @@ mod tests {
 			tenant_id: tenant(),
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
 			consistency: Consistency::SERIALIZABLE,
 			_pad: [0; 7],
 			bytecode_len: bytecode.len() as u32,
 			_pad2: [0; 4],
 			as_of_hlc: hlc(0, 0, 0),
 		};
+		let mut bad_query_meta = query_meta;
+		bad_query_meta.physical_descriptor_fingerprint = [0xFF; 32];
+		let mut bad_meta_buf = node.pool.acquire();
+		bad_meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&bad_query_meta));
+		let mut bad_trailing = node.pool.acquire();
+		bad_trailing.as_mut_vec().extend_from_slice(&bytecode);
+		let bad_frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_REQ.0,
+				flags: 0,
+				stream_id: 38,
+				meta_len: bad_meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: bad_trailing.len() as u32,
+			},
+			meta: bad_meta_buf,
+			arrow_payload: None,
+			trailing: Some(bad_trailing),
+		};
+		let bad_resp = DataRingServer::handle_data_frame(
+			node.data_server.as_ref(),
+			RequestContext {
+				remote: node.local_node,
+				actor: actor(ActorRole::Operator, None),
+			},
+			bad_frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let bad_meta: QueryResponseMeta =
+			*bytemuck::from_bytes(&bad_resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+		assert_eq!(bad_meta.status, ReadStatus::TABLE_DESCRIPTOR_EVOLVED);
+
 		let mut meta_buf = node.pool.acquire();
 		meta_buf
 			.as_mut_vec()

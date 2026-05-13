@@ -222,20 +222,24 @@ const _: () = assert!(std::mem::size_of::<TableReplicaWriteMeta>() == 208);
 pub struct TableQueryRequestMeta {
 	/// Causal read-after-write bound.
 	pub min_hlc: HybridTimestamp, // 16 bytes
-	pub expected_epoch: u64,                     //  8 bytes
-	pub tenant_id: TenantId,                     //  8 bytes
-	pub table_object_id: TableObjectId,          // 16 bytes
-	pub schema_generation: u64,                  //  8 bytes
+	pub expected_epoch: u64,            //  8 bytes
+	pub tenant_id: TenantId,            //  8 bytes
+	pub table_object_id: TableObjectId, // 16 bytes
+	pub schema_generation: u64,         //  8 bytes
+	/// Physical descriptor fingerprint the PBC program was bound
+	/// against. Raw bytes are used here because descriptor fingerprint
+	/// newtypes intentionally stay non-Pod.
+	pub physical_descriptor_fingerprint: [u8; 32], // 32 bytes
 	pub consistency: crate::schema::Consistency, //  1 byte
-	pub _pad: [u8; 7],                           //  7 bytes
+	pub _pad: [u8; 7],                  //  7 bytes
 	/// Length of the PBC bytecode in the trailing section.
 	pub bytecode_len: u32, //  4 bytes
-	pub _pad2: [u8; 4],                          //  4 bytes
+	pub _pad2: [u8; 4],                 //  4 bytes
 	/// Time-travel upper bound (zero = latest).
 	pub as_of_hlc: HybridTimestamp, // 16 bytes
 }
 
-const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 88);
+const _: () = assert!(std::mem::size_of::<TableQueryRequestMeta>() == 120);
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -3920,8 +3924,8 @@ mod tests {
 	}
 
 	#[test]
-	fn table_query_wire_contract_remains_descriptor_and_pbc_only() {
-		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 88);
+	fn table_query_wire_contract_carries_descriptor_pin_and_pbc_only() {
+		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 120);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryRequestMeta, expected_epoch),
@@ -3936,14 +3940,18 @@ mod tests {
 			std::mem::offset_of!(TableQueryRequestMeta, schema_generation),
 			48
 		);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, consistency), 56);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad), 57);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, physical_descriptor_fingerprint),
+			56
+		);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, consistency), 88);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad), 89);
 		assert_eq!(
 			std::mem::offset_of!(TableQueryRequestMeta, bytecode_len),
-			64
+			96
 		);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad2), 68);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 72);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad2), 100);
+		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 104);
 	}
 
 	#[test]

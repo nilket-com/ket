@@ -339,6 +339,7 @@ pub fn map_read_status_for_compute(status: ReadStatus) -> StorageStatusKind {
 		ReadStatus::QUERY_INVALID_PROGRAM => StorageStatusKind::InvalidQueryProgram,
 		ReadStatus::QUERY_BUDGET_EXCEEDED => StorageStatusKind::QueryBudgetExceeded,
 		ReadStatus::RETENTION_EXPIRED => StorageStatusKind::RetentionExpired,
+		ReadStatus::TABLE_DESCRIPTOR_EVOLVED => StorageStatusKind::TerminalStorageError,
 		ReadStatus::INVALID_LEASE_SIGNATURE => StorageStatusKind::TerminalStorageError,
 		_ => StorageStatusKind::TerminalStorageError,
 	}

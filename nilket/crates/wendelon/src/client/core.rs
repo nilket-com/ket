@@ -1431,6 +1431,10 @@ fn query_failure_error(status: ReadStatus) -> Error {
 			ErrorKind::InvalidInput,
 			"Wendelon query failed: QUERY_INVALID_PROGRAM",
 		),
+		s if s == ReadStatus::TABLE_DESCRIPTOR_EVOLVED => Error::new(
+			ErrorKind::InvalidData,
+			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED",
+		),
 		s if s == ReadStatus::QUERY_BUDGET_EXCEEDED => Error::new(
 			ErrorKind::Other,
 			"Wendelon query failed: QUERY_BUDGET_EXCEEDED",
@@ -1528,6 +1532,17 @@ fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<
 		return Err(Error::new(
 			ErrorKind::InvalidInput,
 			"TABLE_QUERY_REQ schema_generation does not match descriptor",
+		));
+	}
+	if request.meta.physical_descriptor_fingerprint
+		!= *request
+			.descriptor
+			.physical_descriptor_fingerprint
+			.as_bytes()
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			"TABLE_QUERY_REQ physical_descriptor_fingerprint does not match descriptor",
 		));
 	}
 	let bytecode_len = u32::try_from(request.pbc.len()).map_err(|_| {
@@ -2230,6 +2245,7 @@ mod tests {
 		assert!(retry_read_status(ReadStatus::QUERY_INVALID_PROGRAM, zero).is_none());
 		assert!(retry_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED, zero).is_none());
 		assert!(retry_read_status(ReadStatus::RETENTION_EXPIRED, zero).is_none());
+		assert!(retry_read_status(ReadStatus::TABLE_DESCRIPTOR_EVOLVED, zero).is_none());
 	}
 
 	#[test]
@@ -2285,6 +2301,9 @@ mod tests {
 				tenant_id: TenantId::new(9),
 				table_object_id: descriptor.table_object_id,
 				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: *descriptor
+					.physical_descriptor_fingerprint
+					.as_bytes(),
 				consistency: Consistency::LINEARIZABLE,
 				_pad: [0; 7],
 				bytecode_len: 2,
@@ -2298,6 +2317,11 @@ mod tests {
 
 		let mut bad = request.clone();
 		bad.meta.bytecode_len = 1;
+		let err = validate_table_query_request(&bad).unwrap_err();
+		assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+		let mut bad = request.clone();
+		bad.meta.physical_descriptor_fingerprint = [0xFF; 32];
 		let err = validate_table_query_request(&bad).unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::InvalidInput);
 	}
@@ -2451,6 +2475,10 @@ mod tests {
 		assert_eq!(
 			query_failure_error(ReadStatus::RETENTION_EXPIRED).to_string(),
 			"Wendelon query failed: RETENTION_EXPIRED"
+		);
+		assert_eq!(
+			query_failure_error(ReadStatus::TABLE_DESCRIPTOR_EVOLVED).to_string(),
+			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::TENANT_UNAVAILABLE).to_string(),

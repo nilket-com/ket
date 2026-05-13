@@ -1,494 +1,726 @@
-pub mod ir;
-pub mod planner;
+pub mod binder;
+pub mod catalog;
+pub mod coordinator;
+pub mod error;
 pub mod exec;
-pub mod storage;
+pub mod ir;
 pub mod pbc;
-pub mod server;
-pub mod wire;
+pub mod planner;
 pub mod rune_engine;
+pub mod server;
 pub mod sql_planner;
+pub mod storage;
+pub mod wire;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use arrow::array::{Int32Array, Int64Array, Float64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    
-    use crate::ir::{Expr, ScalarValue, LogicalPlan, AggregateFunction, TableId, MorselId, StageId};
-    use crate::storage::InMemoryStorageScan;
-    use crate::exec::Executor;
-    use crate::server::{ToronWorker, ToronCoordinator, memory::MemoryManager, spill::SpillManager};
-    use wendelon::storage::file_ops::BlockingFileOps;
+	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use arrow::record_batch::RecordBatch;
+	use std::sync::Arc;
 
-    fn test_memory() -> Arc<MemoryManager> {
-        Arc::new(MemoryManager::new(10, 1024 * 1024))
-    }
+	use crate::binder::{PlannerConfig, bind};
+	use crate::catalog::MockCatalog;
+	use crate::exec::Executor;
+	use crate::ir::{
+		AggregateFunction, Expr, LogicalPlan, MorselId, ScalarValue, StageId, TableId,
+	};
+	use crate::server::{
+		ToronCoordinator, ToronWorker, memory::MemoryManager, spill::SpillManager,
+	};
+	use crate::storage::InMemoryStorageScan;
+	use wendelon::schema::{
+		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptorV1,
+	};
+	use wendelon::storage::file_ops::BlockingFileOps;
 
-    #[tokio::test]
-    async fn test_m1_single_process_ir_execution() {
-        // Build a RecordBatch fixture
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("amount", DataType::Int32, true),
-            Field::new("status", DataType::Utf8, true),
-        ]));
+	fn test_memory() -> Arc<MemoryManager> {
+		Arc::new(MemoryManager::new(10, 1024 * 1024))
+	}
 
-        let id_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let amount_array = Int32Array::from(vec![Some(50), Some(150), None, Some(200), Some(80)]);
-        let status_array = StringArray::from(vec![Some("active"), Some("active"), Some("inactive"), Some("active"), Some("pending")]);
+	#[tokio::test]
+	async fn single_process_ir_execution_counts_filtered_rows() {
+		// Build a RecordBatch fixture
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int32, false),
+			Field::new("amount", DataType::Int32, true),
+			Field::new("status", DataType::Utf8, true),
+		]));
 
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(id_array),
-                Arc::new(amount_array),
-                Arc::new(status_array),
-            ],
-        ).unwrap();
+		let id_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+		let amount_array = Int32Array::from(vec![Some(50), Some(150), None, Some(200), Some(80)]);
+		let status_array = StringArray::from(vec![
+			Some("active"),
+			Some("active"),
+			Some("inactive"),
+			Some("active"),
+			Some("pending"),
+		]);
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Executor::new(storage);
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(id_array),
+				Arc::new(amount_array),
+				Arc::new(status_array),
+			],
+		)
+		.unwrap();
 
-        // Construct IR manually: SELECT COUNT(*) WHERE amount > 100 AND status = 'active'
-        // Scan -> Filter -> Aggregate
-        
-        let plan = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("id".to_string())])],
-            input: Box::new(LogicalPlan::Filter {
-                predicate: Expr::And(
-                    Box::new(Expr::Gt(
-                        Box::new(Expr::Column("amount".to_string())),
-                        Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
-                    )),
-                    Box::new(Expr::Eq(
-                        Box::new(Expr::Column("status".to_string())),
-                        Box::new(Expr::Literal(ScalarValue::Utf8(Some("active".to_string())))),
-                    )),
-                ),
-                input: Box::new(LogicalPlan::Scan {
-                    table: TableId(1),
-                    projection: None,
-                }),
-            }),
-        };
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Executor::new(storage);
 
-        // Execute
-        let results = executor.execute(&plan, None).await.expect("Execution failed");
-        
-        // Assert output
-        assert_eq!(results.len(), 1);
-        let result_batch = &results[0];
-        
-        // Result should be a single row with 'count'
-        assert_eq!(result_batch.num_rows(), 1);
-        assert_eq!(result_batch.schema().field(0).name(), "count");
-        
-        let count_array = result_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-            
-        // amount > 100 AND status == 'active':
-        // row 2: amount 150, status active -> matches
-        // row 4: amount 200, status active -> matches
-        // So expected count is 2.
-        assert_eq!(count_array.value(0), 2);
-    }
+		// Construct IR manually: SELECT COUNT(*) WHERE amount > 100 AND status = 'active'
+		// Scan -> Filter -> Aggregate
 
-    #[tokio::test]
-    async fn test_m1_null_semantics() {
-        // Assert that IsNull and IsNotNull work
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("amount", DataType::Int32, true),
-        ]));
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("id".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Filter {
+				predicate: Expr::And(
+					Box::new(Expr::Gt(
+						Box::new(Expr::Column("amount".to_string())),
+						Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
+					)),
+					Box::new(Expr::Eq(
+						Box::new(Expr::Column("status".to_string())),
+						Box::new(Expr::Literal(ScalarValue::Utf8(Some("active".to_string())))),
+					)),
+				),
+				input: Box::new(LogicalPlan::Scan {
+					table: TableId(1),
+					projection: None,
+				}),
+			}),
+		};
 
-        let amount_array = Int32Array::from(vec![Some(50), None, Some(100)]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(amount_array)]).unwrap();
+		// Execute
+		let results = executor
+			.execute(&plan, None)
+			.await
+			.expect("Execution failed");
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Executor::new(storage);
+		// Assert output
+		assert_eq!(results.len(), 1);
+		let result_batch = &results[0];
 
-        // Filter: IsNull(amount) -> should yield 1 row
-        let plan_null = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("amount".to_string())])],
-            input: Box::new(LogicalPlan::Filter {
-                predicate: Expr::IsNull(Box::new(Expr::Column("amount".to_string()))),
-                input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-            }),
-        };
+		// Result should be a single row with 'count'
+		assert_eq!(result_batch.num_rows(), 1);
+		assert_eq!(result_batch.schema().field(0).name(), "count");
 
-        let results_null = executor.execute(&plan_null, None).await.unwrap();
-        let count_null = results_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        assert_eq!(count_null, 1);
+		let count_array = result_batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap();
 
-        // Filter: IsNotNull(amount) -> should yield 2 rows
-        let plan_not_null = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("amount".to_string())])],
-            input: Box::new(LogicalPlan::Filter {
-                predicate: Expr::IsNotNull(Box::new(Expr::Column("amount".to_string()))),
-                input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-            }),
-        };
+		// amount > 100 AND status == 'active':
+		// row 2: amount 150, status active -> matches
+		// row 4: amount 200, status active -> matches
+		// So expected count is 2.
+		assert_eq!(count_array.value(0), 2);
+	}
 
-        let results_not_null = executor.execute(&plan_not_null, None).await.unwrap();
-        let count_not_null = results_not_null[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        assert_eq!(count_not_null, 2);
-    }
+	#[tokio::test]
+	async fn filter_null_semantics_count_expected_rows() {
+		// Assert that IsNull and IsNotNull work
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"amount",
+			DataType::Int32,
+			true,
+		)]));
 
-    #[tokio::test]
-    async fn test_m4_morsel_determinism() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Int32, false),
-        ]));
+		let amount_array = Int32Array::from(vec![Some(50), None, Some(100)]);
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(amount_array)]).unwrap();
 
-        // 100 rows
-        let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Executor::new(storage);
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Arc::new(Executor::new(storage));
+		// Filter: IsNull(amount) -> should yield 1 row
+		let plan_null = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("amount".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Filter {
+				predicate: Expr::IsNull(Box::new(Expr::Column("amount".to_string()))),
+				input: Box::new(LogicalPlan::Scan {
+					table: TableId(1),
+					projection: None,
+				}),
+			}),
+		};
 
-        let plan = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("val".to_string())])],
-            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-        };
+		let results_null = executor.execute(&plan_null, None).await.unwrap();
+		let count_null = results_null[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(count_null, 1);
 
-        // 1. Single execution (no morsels)
-        let single_results = executor.execute(&plan, None).await.unwrap();
-        let single_count = single_results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        assert_eq!(single_count, 100);
+		// Filter: IsNotNull(amount) -> should yield 2 rows
+		let plan_not_null = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("amount".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Filter {
+				predicate: Expr::IsNotNull(Box::new(Expr::Column("amount".to_string()))),
+				input: Box::new(LogicalPlan::Scan {
+					table: TableId(1),
+					projection: None,
+				}),
+			}),
+		};
 
-        // 2. Morsel splitting (4 morsels) - run sequentially
-        let total_morsels = 4;
-        let mut sequential_sum = 0;
-        for i in 0..total_morsels {
-            let res = executor.execute(&plan, Some((MorselId(i), total_morsels))).await.unwrap();
-            sequential_sum += res[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        }
-        assert_eq!(sequential_sum, 100);
+		let results_not_null = executor.execute(&plan_not_null, None).await.unwrap();
+		let count_not_null = results_not_null[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(count_not_null, 2);
+	}
 
-        // 3. Concurrent morsel execution (multi-thread determinism)
-        let mut tasks = Vec::new();
-        for i in 0..total_morsels {
-            let exec_clone = executor.clone();
-            let plan_clone = plan.clone();
-            tasks.push(tokio::spawn(async move {
-                let res = exec_clone.execute(&plan_clone, Some((MorselId(i), total_morsels))).await.unwrap();
-                res[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0)
-            }));
-        }
-        let mut concurrent_sum = 0;
-        for task in tasks {
-            concurrent_sum += task.await.unwrap();
-        }
-        assert_eq!(concurrent_sum, 100);
+	#[tokio::test]
+	async fn morsel_execution_is_deterministic() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
 
-        // 4. Idempotent morsel retry
-        let res1 = executor.execute(&plan, Some((MorselId(2), total_morsels))).await.unwrap();
-        let val1 = res1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        
-        let res2 = executor.execute(&plan, Some((MorselId(2), total_morsels))).await.unwrap();
-        let val2 = res2[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        
-        assert_eq!(val1, val2);
-        assert_eq!(val1, 25); // 100 rows / 4 morsels = 25
-    }
+		// 100 rows
+		let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
 
-    #[tokio::test]
-    async fn test_m5_coordinator_worker_boundary() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Int32, false),
-        ]));
-        let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Arc::new(Executor::new(storage));
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let memory = test_memory();
-        let worker = Arc::new(ToronWorker::new(storage, memory.clone()));
-        let coordinator = ToronCoordinator::new(memory);
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
 
-        let (mut client_stream, mut server_stream) = tokio::io::duplex(1024 * 1024);
+		// 1. Single execution (no morsels)
+		let single_results = executor.execute(&plan, None).await.unwrap();
+		let single_count = single_results[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(single_count, 100);
 
-        // Spawn worker handle
-        let worker_handle = tokio::spawn(async move {
-            worker.handle_connection(&mut server_stream).await.unwrap();
-        });
+		// 2. Morsel splitting (4 morsels) - run sequentially
+		let total_morsels = 4;
+		let mut sequential_sum = 0;
+		for i in 0..total_morsels {
+			let res = executor
+				.execute(&plan, Some((MorselId(i), total_morsels)))
+				.await
+				.unwrap();
+			sequential_sum += res[0]
+				.column(0)
+				.as_any()
+				.downcast_ref::<arrow::array::Int64Array>()
+				.unwrap()
+				.value(0);
+		}
+		assert_eq!(sequential_sum, 100);
 
-        let plan = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::Column("val".to_string())])],
-            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-        };
+		// 3. Concurrent morsel execution (multi-thread determinism)
+		let mut tasks = Vec::new();
+		for i in 0..total_morsels {
+			let exec_clone = executor.clone();
+			let plan_clone = plan.clone();
+			tasks.push(tokio::spawn(async move {
+				let res = exec_clone
+					.execute(&plan_clone, Some((MorselId(i), total_morsels)))
+					.await
+					.unwrap();
+				res[0]
+					.column(0)
+					.as_any()
+					.downcast_ref::<arrow::array::Int64Array>()
+					.unwrap()
+					.value(0)
+			}));
+		}
+		let mut concurrent_sum = 0;
+		for task in tasks {
+			concurrent_sum += task.await.unwrap();
+		}
+		assert_eq!(concurrent_sum, 100);
 
-        // Coordinator executes morsel on worker via duplex stream
-        let results = coordinator.execute_morsel_on_worker(&mut client_stream, plan, Some((MorselId(0), 1))).await.unwrap();
-        
-        assert_eq!(results.len(), 1);
-        let count = results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        assert_eq!(count, 100);
+		// 4. Idempotent morsel retry
+		let res1 = executor
+			.execute(&plan, Some((MorselId(2), total_morsels)))
+			.await
+			.unwrap();
+		let val1 = res1[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
 
-        drop(client_stream);
-        worker_handle.await.unwrap();
-    }
+		let res2 = executor
+			.execute(&plan, Some((MorselId(2), total_morsels)))
+			.await
+			.unwrap();
+		let val2 = res2[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
 
-    #[tokio::test]
-    async fn test_m6_distributed_shuffle_exchange() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Int32, false),
-            Field::new("val", DataType::Int32, false),
-        ]));
+		assert_eq!(val1, val2);
+		assert_eq!(val1, 25); // 100 rows / 4 morsels = 25
+	}
 
-        // Worker 1 Data: keys 0..50
-        let w1_keys = Int32Array::from((0..50).collect::<Vec<i32>>());
-        let w1_vals = Int32Array::from((0..50).collect::<Vec<i32>>());
-        let w1_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(w1_keys), Arc::new(w1_vals)]).unwrap();
+	#[tokio::test]
+	async fn coordinator_worker_boundary_executes_morsel() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
+		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(val_array)]).unwrap();
 
-        // Worker 2 Data: keys 50..100
-        let w2_keys = Int32Array::from((50..100).collect::<Vec<i32>>());
-        let w2_vals = Int32Array::from((50..100).collect::<Vec<i32>>());
-        let w2_batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(w2_keys), Arc::new(w2_vals)]).unwrap();
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let memory = test_memory();
+		let worker = Arc::new(ToronWorker::new(
+			storage,
+			memory.clone(),
+			test_catalog(schema.as_ref()),
+		));
+		let coordinator = ToronCoordinator::new(memory);
 
-        let memory = test_memory();
-        let w1 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w1_batch }), memory.clone()));
-        let w2 = Arc::new(ToronWorker::new(Arc::new(InMemoryStorageScan { table_data: w2_batch }), memory.clone()));
-        
-        let plan = LogicalPlan::Exchange {
-            partition_count: 2,
-            key: vec![Expr::Column("key".to_string())],
-            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-        };
+		let (mut client_stream, mut server_stream) = tokio::io::duplex(1024 * 1024);
 
-        // 1. Stage 1: Partitioning on Workers
-        let w1_partitions = w1.execute_morsel_local(&plan, Some((MorselId(0), 1))).await.unwrap();
-        let w2_partitions = w2.execute_morsel_local(&plan, Some((MorselId(0), 1))).await.unwrap();
+		// Spawn worker handle
+		let worker_handle = tokio::spawn(async move {
+			worker.handle_connection(&mut server_stream).await.unwrap();
+		});
 
-        // Verify w1 correctly partitioned its 50 rows into 2 buckets
-        let w1_total: usize = w1_partitions.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(w1_total, 50);
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
 
-        // 2. Stage 2: P2P Exchange
-        let (mut p2p_tx, mut p2p_rx) = tokio::io::duplex(1024 * 1024);
-        
-        let w2_clone = w2.clone();
-        let w2_handle = tokio::spawn(async move {
-            w2_clone.handle_connection(&mut p2p_rx).await.unwrap();
-        });
+		// Coordinator executes morsel on worker via duplex stream
+		let results = coordinator
+			.execute_morsel_on_worker(&mut client_stream, plan, Some((MorselId(0), 1)))
+			.await
+			.unwrap();
 
-        // W1 sends its partition[1] to W2
-        w1.send_shuffle_data(&mut p2p_tx, StageId(1), 1, &w1_partitions[1]).await.unwrap();
-        drop(p2p_tx);
-        
-        w2_handle.await.unwrap();
-        
-        // 3. Verification
-        assert!(w1_partitions.len() >= 1);
-        assert!(w2_partitions.len() >= 1);
-    }
+		assert_eq!(results.len(), 1);
+		let count = results[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(count, 100);
 
-    #[tokio::test]
-    async fn test_m7_rune_authoring_surface() {
-        let engine = crate::rune_engine::RuneEngine::new().unwrap();
-        
-        let script = r#"
+		drop(client_stream);
+		worker_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn distributed_shuffle_exchange_accepts_partition_payload() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Int32, false),
+			Field::new("val", DataType::Int32, false),
+		]));
+
+		// Worker 1 Data: keys 0..50
+		let w1_keys = Int32Array::from((0..50).collect::<Vec<i32>>());
+		let w1_vals = Int32Array::from((0..50).collect::<Vec<i32>>());
+		let w1_batch =
+			RecordBatch::try_new(schema.clone(), vec![Arc::new(w1_keys), Arc::new(w1_vals)])
+				.unwrap();
+
+		// Worker 2 Data: keys 50..100
+		let w2_keys = Int32Array::from((50..100).collect::<Vec<i32>>());
+		let w2_vals = Int32Array::from((50..100).collect::<Vec<i32>>());
+		let w2_batch =
+			RecordBatch::try_new(schema.clone(), vec![Arc::new(w2_keys), Arc::new(w2_vals)])
+				.unwrap();
+
+		let memory = test_memory();
+		let w1 = Arc::new(ToronWorker::new(
+			Arc::new(InMemoryStorageScan {
+				table_data: w1_batch,
+			}),
+			memory.clone(),
+			test_catalog(schema.as_ref()),
+		));
+		let w2 = Arc::new(ToronWorker::new(
+			Arc::new(InMemoryStorageScan {
+				table_data: w2_batch,
+			}),
+			memory.clone(),
+			test_catalog(schema.as_ref()),
+		));
+
+		let plan = LogicalPlan::Exchange {
+			partition_count: 2,
+			key: vec![Expr::Column("key".to_string())],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+
+		// 1. Stage 1: Partitioning on Workers
+		let w1_partitions = w1
+			.execute_morsel_local(&plan, Some((MorselId(0), 1)))
+			.await
+			.unwrap();
+		let w2_partitions = w2
+			.execute_morsel_local(&plan, Some((MorselId(0), 1)))
+			.await
+			.unwrap();
+
+		// Verify w1 correctly partitioned its 50 rows into 2 buckets
+		let w1_total: usize = w1_partitions.iter().map(|b| b.num_rows()).sum();
+		assert_eq!(w1_total, 50);
+
+		// 2. Stage 2: P2P Exchange
+		let (mut p2p_tx, mut p2p_rx) = tokio::io::duplex(1024 * 1024);
+
+		let w2_clone = w2.clone();
+		let w2_handle = tokio::spawn(async move {
+			w2_clone.handle_connection(&mut p2p_rx).await.unwrap();
+		});
+
+		// W1 sends its partition[1] to W2
+		w1.send_shuffle_data(&mut p2p_tx, StageId(1), 1, &w1_partitions[1])
+			.await
+			.unwrap();
+		drop(p2p_tx);
+
+		w2_handle.await.unwrap();
+
+		// 3. Verification
+		assert!(w1_partitions.len() >= 1);
+		assert!(w2_partitions.len() >= 1);
+	}
+
+	#[tokio::test]
+	async fn rune_authoring_surface_builds_count_plan() {
+		let engine = crate::rune_engine::RuneEngine::new().unwrap();
+
+		let script = r#"
             pub fn main(ctx) {
                 ctx.table("sales")
                    .filter(col("amount").gt(lit(100)))
                    .count()
             }
         "#;
-        
-        let plan = engine.execute_script(script, 1000).await.expect("Rune execution failed");
-        
-        // Verify the plan structure
-        match &plan {
-            crate::ir::LogicalPlan::Aggregate { input, group_expr, aggr_expr } => {
-                assert!(group_expr.is_empty());
-                assert_eq!(aggr_expr.len(), 1);
-                assert!(matches!(aggr_expr[0].0, crate::ir::AggregateFunction::CountAll));
-                
-                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = &**input {
-                    if let crate::ir::Expr::Gt(left, right) = predicate {
-                        assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
-                        assert!(matches!(&**right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
-                    } else {
-                        panic!("Expected Gt predicate, got {:?}", predicate);
-                    }
-                } else {
-                    panic!("Expected Filter plan, got {:?}", input);
-                }
-            }
-            _ => panic!("Expected Aggregate plan, got {:?}", plan),
-        }
-    }
 
-    #[tokio::test]
-    async fn test_m8_sql_compatibility_surface() {
-        let planner = crate::sql_planner::SqlPlanner::new();
-        
-        let sql = "SELECT count(*) FROM sales WHERE amount > 100";
-        let plan = planner.plan(sql).expect("SQL planning failed");
-        
-        // Verify the plan structure
-        match &plan {
-            crate::ir::LogicalPlan::Aggregate { input, group_expr, aggr_expr } => {
-                assert!(group_expr.is_empty());
-                assert_eq!(aggr_expr.len(), 1);
-                assert!(matches!(aggr_expr[0].0, crate::ir::AggregateFunction::CountAll));
-                
-                if let crate::ir::LogicalPlan::Filter { input: _, predicate } = &**input {
-                    if let crate::ir::Expr::Gt(left, right) = predicate {
-                        assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
-                        assert!(matches!(&**right, crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))));
-                    } else {
-                        panic!("Expected Gt predicate, got {:?}", predicate);
-                    }
-                } else {
-                    panic!("Expected Filter plan, got {:?}", input);
-                }
-            }
-            _ => panic!("Expected Aggregate plan, got {:?}", plan),
-        }
+		let plan = engine
+			.execute_script(script, 1000)
+			.await
+			.expect("Rune execution failed");
 
-        // End-to-end execution verification
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("amount", DataType::Int32, true),
-        ]));
-        let amount_array = Int32Array::from(vec![Some(50), Some(150), Some(200)]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(amount_array)]).unwrap();
-        
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Executor::new(storage);
-        
-        let results = executor.execute(&plan, None).await.unwrap();
-        let count = results[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().unwrap().value(0);
-        assert_eq!(count, 2);
-    }
+		// Verify the plan structure
+		match &plan {
+			crate::ir::LogicalPlan::Aggregate {
+				input,
+				group_expr,
+				aggr_expr,
+			} => {
+				assert!(group_expr.is_empty());
+				assert_eq!(aggr_expr.len(), 1);
+				assert!(matches!(
+					aggr_expr[0].0,
+					crate::ir::AggregateFunction::CountAll
+				));
 
-    #[tokio::test]
-    async fn test_m9_memory_pooling() {
-        let memory = Arc::new(MemoryManager::new(2, 1024));
-        
-        {
-            let buf1 = memory.acquire_at_least(100);
-            assert_eq!(memory.available(), 0);
-            drop(buf1);
-        }
-        assert_eq!(memory.available(), 1);
-    }
+				if let crate::ir::LogicalPlan::Filter {
+					input: _,
+					predicate,
+				} = &**input
+				{
+					if let crate::ir::Expr::Gt(left, right) = predicate {
+						assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+						assert!(matches!(
+							&**right,
+							crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))
+						));
+					} else {
+						panic!("Expected Gt predicate, got {:?}", predicate);
+					}
+				} else {
+					panic!("Expected Filter plan, got {:?}", input);
+				}
+			}
+			_ => panic!("Expected Aggregate plan, got {:?}", plan),
+		}
+	}
 
-    #[tokio::test]
-    async fn test_m10_encrypted_spill() {
-        let temp_dir = std::env::temp_dir().join(format!("toron_spill_{}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir).unwrap();
+	#[tokio::test]
+	async fn sql_compatibility_surface_builds_and_executes_count_plan() {
+		let planner = crate::sql_planner::SqlPlanner::new();
 
-        let file_ops = Arc::new(BlockingFileOps::default());
-        let spill_manager = SpillManager::new(file_ops.clone(), temp_dir.clone()).unwrap();
+		let sql = "SELECT count(*) FROM sales WHERE amount > 100";
+		let plan = planner.plan(sql).expect("SQL planning failed");
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Int32, false),
-        ]));
-        let val_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+		// Verify the plan structure
+		match &plan {
+			crate::ir::LogicalPlan::Aggregate {
+				input,
+				group_expr,
+				aggr_expr,
+			} => {
+				assert!(group_expr.is_empty());
+				assert_eq!(aggr_expr.len(), 1);
+				assert!(matches!(
+					aggr_expr[0].0,
+					crate::ir::AggregateFunction::CountAll
+				));
 
-        let id = spill_manager.spill_batch(&batch).await.unwrap();
-        let path = temp_dir.join(format!("spill_{}.bin", id.0));
-        let ciphertext = std::fs::read(&path).unwrap();
-        
-        let reader_res = arrow::ipc::reader::StreamReader::try_new(&ciphertext[..], None);
-        assert!(reader_res.is_err());
+				if let crate::ir::LogicalPlan::Filter {
+					input: _,
+					predicate,
+				} = &**input
+				{
+					if let crate::ir::Expr::Gt(left, right) = predicate {
+						assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+						assert!(matches!(
+							&**right,
+							crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))
+						));
+					} else {
+						panic!("Expected Gt predicate, got {:?}", predicate);
+					}
+				} else {
+					panic!("Expected Filter plan, got {:?}", input);
+				}
+			}
+			_ => panic!("Expected Aggregate plan, got {:?}", plan),
+		}
 
-        let read_batch = spill_manager.read_batch(id).await.unwrap();
-        assert_eq!(batch, read_batch);
+		// End-to-end execution verification
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("amount", DataType::Int32, true),
+		]));
+		let id_array = Int64Array::from(vec![1, 2, 3]);
+		let amount_array = Int32Array::from(vec![Some(50), Some(150), Some(200)]);
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(id_array), Arc::new(amount_array)],
+		)
+		.unwrap();
 
-        spill_manager.cleanup(id).await.unwrap();
-        std::fs::remove_dir_all(&temp_dir).unwrap();
-    }
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Executor::new(storage);
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(TableId(1), test_descriptor(&schema))
+			.unwrap();
 
-    #[tokio::test]
-    async fn test_m11_linear_regression_kernel() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("y", DataType::Int32, true),
-            Field::new("x", DataType::Int32, true),
-        ]));
+		let bound = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap();
+		let results = executor.execute_bound(&bound, None).await.unwrap();
+		let count = results[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(count, 2);
+	}
 
-        // y = 2x + 10
-        let y_array = Int32Array::from(vec![12, 14, 16, 18]);
-        let x_array = Int32Array::from(vec![1, 2, 3, 4]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(y_array), Arc::new(x_array)]).unwrap();
+	fn test_descriptor(schema: &Schema) -> TableSchemaDescriptorV1 {
+		let primary_key = schema
+			.fields()
+			.first()
+			.expect("test schema must have a primary key column")
+			.name()
+			.clone();
+		TableSchemaDescriptorV1::new(
+			TableObjectId::new([1; 16]),
+			1,
+			"default",
+			"sales",
+			schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+			LocalityPolicyV1::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Executor::new(storage);
+	fn test_catalog(schema: &Schema) -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(TableId(1), test_descriptor(schema))
+			.unwrap();
+		Arc::new(catalog)
+	}
 
-        let plan = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::LinearRegress, vec![Expr::Column("y".to_string()), Expr::Column("x".to_string())])],
-            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-        };
+	#[tokio::test]
+	async fn memory_pool_reuses_released_buffers() {
+		let memory = Arc::new(MemoryManager::new(2, 1024));
 
-        let results = executor.execute(&plan, None).await.unwrap();
-        let result_batch = &results[0];
-        let linreg_array = result_batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
-        
-        assert_eq!(linreg_array.value(0), 2.0);
-        assert_eq!(linreg_array.value(1), 10.0);
-    }
+		{
+			let buf1 = memory.acquire_at_least(100);
+			assert_eq!(memory.available(), 0);
+			drop(buf1);
+		}
+		assert_eq!(memory.available(), 1);
+	}
 
-    #[tokio::test]
-    async fn test_m11_quantile_kernel() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("val", DataType::Int32, true),
-        ]));
+	#[tokio::test]
+	async fn encrypted_spill_round_trips_without_plain_ipc() {
+		let temp_dir = std::env::temp_dir().join(format!("toron_spill_{}", rand::random::<u64>()));
+		std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let val_array = Int32Array::from((1..=100).collect::<Vec<i32>>());
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+		let file_ops = Arc::new(BlockingFileOps::default());
+		let spill_manager = SpillManager::new(file_ops.clone(), temp_dir.clone()).unwrap();
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch });
-        let executor = Executor::new(storage);
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let val_array = Int32Array::from(vec![1, 2, 3, 4, 5]);
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
 
-        let plan = LogicalPlan::Aggregate {
-            group_expr: vec![],
-            aggr_expr: vec![(AggregateFunction::ApproxQuantile(0.5), vec![Expr::Column("val".to_string())])],
-            input: Box::new(LogicalPlan::Scan { table: TableId(1), projection: None }),
-        };
+		let id = spill_manager.spill_batch(&batch).await.unwrap();
+		let path = temp_dir.join(format!("spill_{}.bin", id.0));
+		let ciphertext = std::fs::read(&path).unwrap();
 
-        let results = executor.execute(&plan, None).await.unwrap();
-        let result_batch = &results[0];
-        let q_array = result_batch.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
-        
-        assert!((q_array.value(0) - 50.0).abs() < 5.0);
-    }
+		let reader_res = arrow::ipc::reader::StreamReader::try_new(&ciphertext[..], None);
+		assert!(reader_res.is_err());
 
-    #[tokio::test]
-    async fn test_m11_time_bucket_kernel() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, true),
-        ]));
+		let read_batch = spill_manager.read_batch(id).await.unwrap();
+		assert_eq!(batch, read_batch);
 
-        // Align base to an hour boundary (3600 * 1000 ms)
-        let hour_ms = 3600 * 1000;
-        let base = (1600000000000i64 / hour_ms) * hour_ms;
-        let ts_array = Int64Array::from(vec![
-            base + 5 * 60 * 1000,
-            base + 55 * 60 * 1000,
-            base + 75 * 60 * 1000,
-        ]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts_array)]).unwrap();
+		spill_manager.cleanup(id).await.unwrap();
+		std::fs::remove_dir_all(&temp_dir).unwrap();
+	}
 
-        let storage = Arc::new(InMemoryStorageScan { table_data: batch.clone() });
-        let executor = Executor::new(storage);
+	#[tokio::test]
+	async fn experimental_linear_regression_kernel_executes_under_legacy_path() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("y", DataType::Int32, true),
+			Field::new("x", DataType::Int32, true),
+		]));
 
-        let expr = Expr::TimeBucket(std::time::Duration::from_secs(3600), Box::new(Expr::Column("ts".to_string())));
-        let result_arr = executor.evaluate_expr(&expr, &batch).unwrap();
-        let bucketed = result_arr.as_any().downcast_ref::<Int64Array>().unwrap();
-        
-        assert_eq!(bucketed.value(0), bucketed.value(1));
-        assert_ne!(bucketed.value(0), bucketed.value(2));
-        assert_eq!(bucketed.value(2) - bucketed.value(0), 3600 * 1000);
-    }
+		// y = 2x + 10
+		let y_array = Int32Array::from(vec![12, 14, 16, 18]);
+		let x_array = Int32Array::from(vec![1, 2, 3, 4]);
+		let batch =
+			RecordBatch::try_new(schema, vec![Arc::new(y_array), Arc::new(x_array)]).unwrap();
+
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Executor::new(storage);
+
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::LinearRegress,
+				vec![Expr::Column("y".to_string()), Expr::Column("x".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+
+		let results = executor.execute(&plan, None).await.unwrap();
+		let result_batch = &results[0];
+		let linreg_array = result_batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.unwrap();
+
+		assert_eq!(linreg_array.value(0), 2.0);
+		assert_eq!(linreg_array.value(1), 10.0);
+	}
+
+	#[tokio::test]
+	async fn experimental_quantile_kernel_executes_under_legacy_path() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, true)]));
+
+		let val_array = Int32Array::from((1..=100).collect::<Vec<i32>>());
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(val_array)]).unwrap();
+
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let executor = Executor::new(storage);
+
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::ApproxQuantile(0.5),
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+
+		let results = executor.execute(&plan, None).await.unwrap();
+		let result_batch = &results[0];
+		let q_array = result_batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.unwrap();
+
+		assert!((q_array.value(0) - 50.0).abs() < 5.0);
+	}
+
+	#[tokio::test]
+	async fn experimental_time_bucket_kernel_executes_under_legacy_path() {
+		let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)]));
+
+		// Align base to an hour boundary (3600 * 1000 ms)
+		let hour_ms = 3600 * 1000;
+		let base = (1600000000000i64 / hour_ms) * hour_ms;
+		let ts_array = Int64Array::from(vec![
+			base + 5 * 60 * 1000,
+			base + 55 * 60 * 1000,
+			base + 75 * 60 * 1000,
+		]);
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(ts_array)]).unwrap();
+
+		let storage = Arc::new(InMemoryStorageScan {
+			table_data: batch.clone(),
+		});
+		let executor = Executor::new(storage);
+
+		let expr = Expr::TimeBucket(
+			std::time::Duration::from_secs(3600),
+			Box::new(Expr::Column("ts".to_string())),
+		);
+		let result_arr = executor.evaluate_expr(&expr, &batch).unwrap();
+		let bucketed = result_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+
+		assert_eq!(bucketed.value(0), bucketed.value(1));
+		assert_ne!(bucketed.value(0), bucketed.value(2));
+		assert_eq!(bucketed.value(2) - bucketed.value(0), 3600 * 1000);
+	}
 }

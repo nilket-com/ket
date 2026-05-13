@@ -22,33 +22,17 @@ ADR 001 (Toron Foundation and Engine Contract) is promoted at
 `plans/adr/001_toron_foundation_and_engine_contract.md`. The
 seed implementation (`feat: adr 001 M0`–`M11`) landed in one
 stretch to anchor the codebase against architectural
-deliberation. The seed is **scaffold-grade, not V1-grade**:
+deliberation. The seed was scaffold-grade; ADR 002 closes the
+runtime-path PBC, schema binding, real scan identity, GROUP BY,
+and structured-error gaps that made it not V1-grade.
 
-- M0 (monorepo scaffold) and M10 (encrypted spill) meet their
-  ADR 001 hard gates.
-- M1–M9, M11 are seeded but do not satisfy ADR 001's fixture
-  discipline. Notable gaps:
-  - **PBC pushdown is dead in the runtime path** — the
-    compiler exists, the executor never engages it.
-  - **String-column eval-time lookup** is the hot path.
-  - **`TenantId(0)` and `HlcBound(0)` are dummies** in every
-    `ScanRequest`.
-  - **`GROUP BY` errors `NotImplemented`.**
-  - **M5 / M6 distributed mechanics** use in-process duplex
-    mocks; no crash-only gate, no real shuffle determinism.
-  - **M9 RDMA transport** is a placeholder.
-  - **Rune sandbox fuel** is commented out.
-- **Errors are `.to_string()`'d** at every module boundary.
-
-ADR 002 (Storage-Backed Execution Contract) is council-
-converged across Claude / Codex / Gemini after three topic
-iterations and three ADR-draft iterations under `plans/wip/`.
-Source plans live at
+ADR 002 (Storage-Backed Execution Contract) is promoted. Source
+plans live at
 `plans/adr/002_toron_storage_backed_execution_contract.md`
 and
 `plans/impl/002_toron_storage_backed_execution_contract.md`.
-Promotion is gated on a Wendelon-native fixture matrix
-delivering 10 hard gates and 4 soft gates.
+Promotion evidence lives at
+`plans/impl/002_storage_execution_contract_bench_results.md`.
 
 V1 target is **"First Query with Integrity"**: correct
 analytical results against a Wendelon-native cluster with
@@ -71,11 +55,17 @@ One-line index. Full context in each ADR; bench evidence under
   engine contract, `StorageScan` boundary trait. M0 monorepo
   scaffold landed cleanly. M1–M11 seeded as scaffold, not as
   satisfying ADR 001's hard gates.
-- **(ADR 002 promotion pending — see §Forward sequence #1.)**
+- **ADR 002 Toron Storage-Backed Execution Contract**
+  (2026-05-12) — Schema-bound `ExecutionPlan`, catalog-backed
+  descriptor pins, runtime PBC engagement, projection
+  minimality, structured errors, grouped aggregate correctness,
+  stream-shaped scan boundary, live Wendelon-backed fixtures,
+  and Wendelon-native substrate evidence.
 
 ## Brainstorms & High-Level Vision
 
 - **Brainstorm 001: Pure Cranelift JIT as a First-Class Query Specializer (Speculative)** — JIT-compiling hot kernels (predicates, UDFs) into native machine code for zero-copy, bare-metal performance. Reserved for post-V1 deliberation.
+- **Brainstorm 002: The WeakControlRing** — In-memory Raft ring for HA coordinators, cluster-wide quotas, and shuffle barrier synchronization without the persistence tax of NVMe/WAL.
 
 ## Prioritization philosophy
 
@@ -110,32 +100,7 @@ council commits only after evidence.
 
 ## Forward sequence
 
-1. **ADR 002: Storage-Backed Execution Contract (Pushdown
-   Engagement).** Council-converged; pre-implementation.
-   Plans at
-   `plans/adr/002_toron_storage_backed_execution_contract.md`
-   and
-   `plans/impl/002_toron_storage_backed_execution_contract.md`.
-   **Keystone:** PBC pushdown is load-bearing in the runtime
-   path. **Scope:** schema-bound IR via binder pass
-   (`LogicalPlan` → `ExecutionPlan`), minimum catalog with
-   `MockCatalog` + `WendelonCatalog`, descriptor-fingerprint
-   pinning protocol, all-or-nothing pushdown with IR-reserved
-   residual via `FilterDisposition` enum, projection
-   dual-path with minimality gate, `ScanStream` streaming
-   interface, V1 aggregate contract (`CountAll`,
-   `Count(expr)`, `Sum(expr)`, `GROUP BY`), Arrow null
-   semantics pinned (including `SUM(all-null) = Null`
-   uniformly across `Int{8..64}` / `UInt{8..64}` /
-   `Float{32,64}`), structured `thiserror` taxonomy, 7
-   architecture guards, 10 hard / 4 soft promotion gates.
-   **Implementation phases:** P0 audit and `chore:` cleanup,
-   P1 structured errors, P2 IR split + binder, P3 catalog,
-   P4 PBC pushdown wiring, P5 grouped aggregate, P6
-   fingerprint-pin coordinator, P7 architecture guards, P8
-   bench matrix and promotion.
-
-2. **ADR 003: Distributed Runtime and Data Movement
+1. **ADR 003: Distributed Runtime and Data Movement
    Contract** *(scope evidence-driven from ADR 002 bench
    results).* Candidates:
    - **Most likely scope: distributed runtime.** Multi-process
@@ -160,7 +125,7 @@ council commits only after evidence.
      Least likely; ADR 002's minimum-viable catalog is
      designed to defer this.
 
-3. **ADR 004+ candidates** *(scope and ordering deferred
+2. **ADR 004+ candidates** *(scope and ordering deferred
    pending ADR 002 / 003 evidence)*. Each ships its own
    contract surface; explicitly **not** to be bundled into
    ADR 003:

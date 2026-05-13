@@ -50,8 +50,9 @@ pub use wendelon::integration::compute::{
 pub use wendelon::schema::{
 	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
 	DurabilityLevel as DurabilityClass, LocalityPolicyV1, LogicalSchemaFingerprint, PbcRejectCode,
-	PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	StateDigest, TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, StateDigest, TableObjectId, TableSchemaDescriptorV1,
+	TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +152,7 @@ pub struct TableQueryOptions {
 	pub min_hlc: Option<HybridTimestamp>,
 	pub as_of_hlc: Option<HybridTimestamp>,
 	pub stats_pruning_enabled: bool,
+	pub physical_descriptor_fingerprint: Option<PhysicalDescriptorFingerprint>,
 }
 
 impl Default for TableQueryOptions {
@@ -160,6 +162,7 @@ impl Default for TableQueryOptions {
 			min_hlc: None,
 			as_of_hlc: None,
 			stats_pruning_enabled: true,
+			physical_descriptor_fingerprint: None,
 		}
 	}
 }
@@ -294,6 +297,11 @@ pub enum ClientError {
 	WriteFailed { status: WriteStatus },
 	#[error("table write rejected with code {reject_code:?}")]
 	TableWriteRejected { reject_code: PbcRejectCode },
+	#[error("table descriptor evolved during query")]
+	TableDescriptorEvolved {
+		expected: PhysicalDescriptorFingerprint,
+		observed: Option<PhysicalDescriptorFingerprint>,
+	},
 	#[error("schema update rejected with reason {reason_code}: {message}")]
 	SchemaUpdateRejected { reason_code: u8, message: String },
 	#[error("read failed with status {status:?}")]
@@ -311,6 +319,7 @@ impl ClientError {
 			Self::AuthorizationFailed => StorageStatusKind::AuthorizationFailed,
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
 			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
+			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
 			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
 		}
@@ -717,6 +726,16 @@ impl Client {
 		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<StreamingQueryResult, ClientError> {
+		let expected_physical_descriptor_fingerprint = options
+			.physical_descriptor_fingerprint
+			.unwrap_or(descriptor.physical_descriptor_fingerprint);
+		if descriptor.physical_descriptor_fingerprint != expected_physical_descriptor_fingerprint {
+			return Err(ClientError::TableDescriptorEvolved {
+				expected: expected_physical_descriptor_fingerprint,
+				observed: Some(descriptor.physical_descriptor_fingerprint),
+			});
+		}
+
 		let bytecode_len = u32::try_from(pbc.len()).map_err(|_| {
 			std::io::Error::new(
 				std::io::ErrorKind::InvalidInput,
@@ -727,25 +746,34 @@ impl Client {
 		if !options.stats_pruning_enabled {
 			pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
 		}
-		Ok(self
-			.inner
-			.table_query(TableQueryRequest {
-				meta: TableQueryRequestMeta {
-					min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
-					expected_epoch: self.inner.epoch(),
-					tenant_id,
-					table_object_id: descriptor.table_object_id,
-					schema_generation: descriptor.schema_generation,
-					consistency: options.consistency,
-					_pad: pad,
-					bytecode_len,
-					_pad2: [0; 4],
-					as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
-				},
-				descriptor: descriptor.clone(),
-				pbc,
-			})
-			.await?)
+		let request = TableQueryRequest {
+			meta: TableQueryRequestMeta {
+				min_hlc: options.min_hlc.unwrap_or_else(zero_hlc),
+				expected_epoch: self.inner.epoch(),
+				tenant_id,
+				table_object_id: descriptor.table_object_id,
+				schema_generation: descriptor.schema_generation,
+				physical_descriptor_fingerprint: *expected_physical_descriptor_fingerprint
+					.as_bytes(),
+				consistency: options.consistency,
+				_pad: pad,
+				bytecode_len,
+				_pad2: [0; 4],
+				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
+			},
+			descriptor: descriptor.clone(),
+			pbc,
+		};
+		match self.inner.table_query(request).await {
+			Ok(result) => Ok(result),
+			Err(error) if is_table_descriptor_evolved_error(&error) => {
+				Err(ClientError::TableDescriptorEvolved {
+					expected: expected_physical_descriptor_fingerprint,
+					observed: None,
+				})
+			}
+			Err(error) => Err(error.into()),
+		}
 	}
 
 	pub async fn table_query(
@@ -889,6 +917,11 @@ fn zero_node() -> NodeId {
 	}
 }
 
+fn is_table_descriptor_evolved_error(error: &std::io::Error) -> bool {
+	error.kind() == std::io::ErrorKind::InvalidData
+		&& error.to_string().contains("TABLE_DESCRIPTOR_EVOLVED")
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -949,5 +982,15 @@ mod tests {
 
 		let err = request.encode().unwrap_err();
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+	}
+
+	#[test]
+	fn table_descriptor_evolved_io_error_is_detected() {
+		let err = std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED",
+		);
+
+		assert!(is_table_descriptor_evolved_error(&err));
 	}
 }

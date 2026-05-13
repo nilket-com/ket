@@ -974,6 +974,10 @@ impl ReadStatus {
 	/// control before the read or query work began. Retrying after
 	/// a short backoff is allowed.
 	pub const BACKPRESSURED: Self = Self(13);
+	/// The table-query request was planned against a physical
+	/// descriptor fingerprint that no longer matches the server's
+	/// descriptor for the requested table generation.
+	pub const TABLE_DESCRIPTOR_EVOLVED: Self = Self(14);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -991,6 +995,7 @@ impl ReadStatus {
 			Self::QUERY_BUDGET_EXCEEDED => "query_budget_exceeded",
 			Self::RETENTION_EXPIRED => "retention_expired",
 			Self::BACKPRESSURED => "backpressured",
+			Self::TABLE_DESCRIPTOR_EVOLVED => "table_descriptor_evolved",
 			_ => "unknown",
 		}
 	}

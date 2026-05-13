@@ -36,7 +36,8 @@
 
 ## Status
 
-Accepted. Pre-implementation. Phase 0 calibration pending.
+Implemented. Promotion evidence complete in
+`plans/impl/002_storage_execution_contract_bench_results.md`.
 
 ## Implementation contract
 

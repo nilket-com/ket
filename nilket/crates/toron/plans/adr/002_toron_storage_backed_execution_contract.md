@@ -7,7 +7,8 @@
 
 ## Status
 
-Accepted. Pre-implementation. Phase 0 calibration pending.
+Implemented. Promotion evidence complete in
+`plans/impl/002_storage_execution_contract_bench_results.md`.
 
 Builds on three topic-iteration rounds plus three ADR-draft
 iterations in `plans/wip/`. Council convergence is substantive

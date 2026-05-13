@@ -1,3 +1,4 @@
+use crate::error::QueryError;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -9,8 +10,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ToronStream for T {}
 /// Abstract transport layer for Toron, allowing future RDMA zero-copy paths.
 #[async_trait]
 pub trait ToronTransport: Send + Sync {
-    /// Dials a peer and opens a bidirectional stream.
-    async fn connect(&self, address: &str) -> Result<Box<dyn ToronStream>, String>;
+	/// Dials a peer and opens a bidirectional stream.
+	async fn connect(&self, address: &str) -> Result<Box<dyn ToronStream>, QueryError>;
 }
 
 /// Baseline mock transport using tokio channels to simulate zero-copy (pointer passing).
@@ -18,7 +19,7 @@ pub trait ToronTransport: Send + Sync {
 pub struct MockZeroCopyTransport;
 
 impl MockZeroCopyTransport {
-    pub fn new() -> Self {
-        Self
-    }
+	pub fn new() -> Self {
+		Self
+	}
 }
