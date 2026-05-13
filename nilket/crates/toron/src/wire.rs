@@ -3,7 +3,7 @@ use crate::distributed::identity::{
 	AttemptId, FrameByteLen, LeaseEpoch, StreamSeq, TaskIdentity, WorkerId,
 };
 use crate::distributed::task::{
-	PartitionAddress, RowCount, TaskCompletionOutput, TaskSpec, TraceContext,
+	PartitionAddress, RowCount, TaskCompletionOutput, TaskSpec, TaskTelemetry, TraceContext,
 };
 use crate::error::{RuntimeError, TaskFailureKind, WireError};
 use serde::de::DeserializeOwned;
@@ -219,6 +219,8 @@ pub struct TaskBatchPayload {
 pub struct TaskCompletePayload {
 	pub identity: TaskIdentity,
 	pub output: TaskCompletionOutput,
+	#[serde(default)]
+	pub telemetry: Option<TaskTelemetry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

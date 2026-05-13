@@ -18,12 +18,14 @@ mod tests {
 	use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use arrow::record_batch::RecordBatch;
+	use std::collections::HashMap;
 	use std::sync::Arc;
 
 	use crate::binder::{PlannerConfig, bind};
 	use crate::catalog::MockCatalog;
 	use crate::coordinator::DistributedQueryCoordinator;
-	use crate::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
+	use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 	use crate::distributed::identity::{
 		AttemptId, ExchangeId, LeaseEpoch, PartitionId, QueryId, TaskId, TaskIdentity, WorkerId,
 	};
@@ -41,16 +43,17 @@ mod tests {
 		ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
 		WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
 	};
+	use crate::error::{QueryError, StorageError, TaskFailureKind};
 	use crate::exec::Executor;
 	use crate::ir::{
-		AggregateFunction, ExecutionPlan, Expr, LogicalPlan, MorselId, ScalarValue, StageId,
-		TableId,
+		AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, LogicalPlan, MorselId,
+		ScalarValue, StageId, TableId,
 	};
 	use crate::server::{
 		NetworkTaskDispatcher, ToronCoordinator, ToronWorker, memory::MemoryManager,
 		spill::SpillManager, transport::TcpTransport,
 	};
-	use crate::storage::InMemoryStorageScan;
+	use crate::storage::{InMemoryStorageScan, ScanRequest, ScanStream, StorageScan};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
@@ -98,18 +101,15 @@ mod tests {
 
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("id".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("id")])],
 			input: Box::new(LogicalPlan::Filter {
 				predicate: Expr::And(
 					Box::new(Expr::Gt(
-						Box::new(Expr::Column("amount".to_string())),
+						Box::new(Expr::column("amount")),
 						Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 					)),
 					Box::new(Expr::Eq(
-						Box::new(Expr::Column("status".to_string())),
+						Box::new(Expr::column("status")),
 						Box::new(Expr::Literal(ScalarValue::Utf8(Some("active".to_string())))),
 					)),
 				),
@@ -165,12 +165,9 @@ mod tests {
 		// Filter: IsNull(amount) -> should yield 1 row
 		let plan_null = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("amount")])],
 			input: Box::new(LogicalPlan::Filter {
-				predicate: Expr::IsNull(Box::new(Expr::Column("amount".to_string()))),
+				predicate: Expr::IsNull(Box::new(Expr::column("amount"))),
 				input: Box::new(LogicalPlan::Scan {
 					table: TableId(1),
 					projection: None,
@@ -190,12 +187,9 @@ mod tests {
 		// Filter: IsNotNull(amount) -> should yield 2 rows
 		let plan_not_null = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("amount")])],
 			input: Box::new(LogicalPlan::Filter {
-				predicate: Expr::IsNotNull(Box::new(Expr::Column("amount".to_string()))),
+				predicate: Expr::IsNotNull(Box::new(Expr::column("amount"))),
 				input: Box::new(LogicalPlan::Scan {
 					table: TableId(1),
 					projection: None,
@@ -226,10 +220,7 @@ mod tests {
 
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("val".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -336,10 +327,7 @@ mod tests {
 
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("val".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -393,10 +381,7 @@ mod tests {
 
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("val".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -428,7 +413,7 @@ mod tests {
 		}]);
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![TaskPlan::new(spec)],
 		};
 		let mut scheduler = DistributedScheduler::new(registry);
@@ -522,13 +507,10 @@ mod tests {
 		);
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("val".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 			input: Box::new(LogicalPlan::Exchange {
 				partition_count: 1,
-				key: vec![Expr::Column("val".to_string())],
+				key: vec![Expr::column("val")],
 				input: Box::new(LogicalPlan::Scan {
 					table: TableId(1),
 					projection: None,
@@ -549,6 +531,87 @@ mod tests {
 			16
 		);
 		server_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn distributed_query_coordinator_executes_hash_join_over_tcp() {
+		let plan = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				partition_count: 2,
+				key: vec![Expr::qualified_column(
+					crate::catalog::TableRef::new("orders"),
+					"customer_id",
+				)],
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("orders"),
+					projection: None,
+				}),
+			}),
+			right: Box::new(LogicalPlan::Exchange {
+				partition_count: 2,
+				key: vec![Expr::qualified_column(
+					crate::catalog::TableRef::new("customers"),
+					"id",
+				)],
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let results = run_distributed_join_query(plan, 8).await;
+
+		assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+	}
+
+	#[tokio::test]
+	async fn distributed_query_coordinator_executes_broadcast_join_over_tcp() {
+		let plan = broadcast_join_plan();
+
+		let results = run_distributed_join_query(plan, 3).await;
+
+		assert_eq!(results.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+	}
+
+	#[tokio::test]
+	async fn distributed_broadcast_join_digest_matches_hash_join_over_tcp() {
+		let hash_results = run_distributed_join_query(hash_join_customers_left_plan(), 8).await;
+		let broadcast_results = run_distributed_join_query(broadcast_join_plan(), 3).await;
+
+		assert_eq!(
+			canonical_arrow_ipc_digest(&broadcast_results, SortPolicy::FullRowLex)
+				.expect("broadcast digest"),
+			canonical_arrow_ipc_digest(&hash_results, SortPolicy::FullRowLex).expect("hash digest")
+		);
+	}
+
+	#[tokio::test]
+	async fn distributed_broadcast_join_over_cap_fails_terminally_over_tcp() {
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(1);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(1);
+
+		let err = run_distributed_join_query_with_budget(broadcast_join_plan(), 2, query_budget)
+			.await
+			.expect_err("broadcast cap must fail");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(crate::error::RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					..
+				},
+				..
+			})
+		));
 	}
 
 	#[tokio::test]
@@ -587,7 +650,7 @@ mod tests {
 		let coordinator = ToronCoordinator::new(memory.clone());
 		let plan = LogicalPlan::Exchange {
 			partition_count: 2,
-			key: vec![Expr::Column("key".to_string())],
+			key: vec![Expr::column("key")],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -683,7 +746,7 @@ mod tests {
 
 		let plan = LogicalPlan::Exchange {
 			partition_count: 2,
-			key: vec![Expr::Column("key".to_string())],
+			key: vec![Expr::column("key")],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -918,10 +981,7 @@ mod tests {
 
 		let plan = LogicalPlan::Aggregate {
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("val".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -1049,7 +1109,9 @@ mod tests {
 				} = &**input
 				{
 					if let crate::ir::Expr::Gt(left, right) = predicate {
-						assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+						assert!(
+							matches!(&**left, crate::ir::Expr::Column(c) if c.name.0 == "amount")
+						);
 						assert!(matches!(
 							&**right,
 							crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))
@@ -1092,7 +1154,9 @@ mod tests {
 				} = &**input
 				{
 					if let crate::ir::Expr::Gt(left, right) = predicate {
-						assert!(matches!(&**left, crate::ir::Expr::Column(c) if c == "amount"));
+						assert!(
+							matches!(&**left, crate::ir::Expr::Column(c) if c.name.0 == "amount")
+						);
 						assert!(matches!(
 							&**right,
 							crate::ir::Expr::Literal(crate::ir::ScalarValue::Int32(Some(100)))
@@ -1168,6 +1232,243 @@ mod tests {
 		Arc::new(catalog)
 	}
 
+	fn join_catalog() -> Arc<MockCatalog> {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.unwrap();
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region", DataType::Utf8, true),
+					]),
+				),
+			)
+			.unwrap();
+		Arc::new(catalog)
+	}
+
+	fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
+			TableObjectId::new([id_byte; 16]),
+			1,
+			"default",
+			table,
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn join_storage() -> Arc<MultiTableStorageScan> {
+		let orders_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("customer_id", DataType::Int64, false),
+		]));
+		let customers_schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int64, false),
+			Field::new("region", DataType::Utf8, true),
+		]));
+		let orders = RecordBatch::try_new(
+			orders_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![100, 101, 102, 103])),
+				Arc::new(Int64Array::from(vec![1, 2, 2, 3])),
+			],
+		)
+		.unwrap();
+		let customers = RecordBatch::try_new(
+			customers_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![2, 3])),
+				Arc::new(StringArray::from(vec![Some("west"), Some("east")])),
+			],
+		)
+		.unwrap();
+		Arc::new(MultiTableStorageScan {
+			tables: HashMap::from([(TableId(1), orders), (TableId(2), customers)]),
+		})
+	}
+
+	fn broadcast_join_plan() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				partition_count: 1,
+				key: vec![Expr::qualified_column(
+					crate::catalog::TableRef::new("customers"),
+					"id",
+				)],
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: crate::catalog::TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		}
+	}
+
+	fn hash_join_customers_left_plan() -> LogicalPlan {
+		LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				partition_count: 2,
+				key: vec![Expr::qualified_column(
+					crate::catalog::TableRef::new("customers"),
+					"id",
+				)],
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("customers"),
+					projection: None,
+				}),
+			}),
+			right: Box::new(LogicalPlan::Exchange {
+				partition_count: 2,
+				key: vec![Expr::qualified_column(
+					crate::catalog::TableRef::new("orders"),
+					"customer_id",
+				)],
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: crate::catalog::TableRef::new("orders"),
+					projection: None,
+				}),
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(crate::catalog::TableRef::new("customers"), "id"),
+				Expr::qualified_column(crate::catalog::TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		}
+	}
+
+	async fn run_distributed_join_query(plan: LogicalPlan, connections: usize) -> Vec<RecordBatch> {
+		run_distributed_join_query_with_budget(plan, connections, QueryBudget::test_default())
+			.await
+			.unwrap()
+	}
+
+	async fn run_distributed_join_query_with_budget(
+		plan: LogicalPlan,
+		connections: usize,
+		query_budget: QueryBudget,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		let memory = test_memory();
+		let catalog = join_catalog();
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = WorkerEndpoint::new(listener.local_addr().unwrap().to_string());
+		let worker_id = WorkerId::from_u128(101);
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			join_storage(),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			worker_id,
+			endpoint.clone(),
+		));
+		let server_handle = tokio::spawn(async move {
+			let mut handles = Vec::new();
+			for _ in 0..connections {
+				let (server_stream, _) = listener.accept().await.unwrap();
+				let worker = worker.clone();
+				handles.push(tokio::spawn(async move {
+					worker.handle_connection(server_stream).await.unwrap();
+				}));
+			}
+			for handle in handles {
+				handle.await.unwrap();
+			}
+		});
+		let registry = Arc::new(StaticWorkerRegistry::new([WorkerEntry {
+			worker_id,
+			endpoint,
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(1),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(8),
+				spill_capacity_reserved: ByteCount::new(1024 * 1024),
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::default(),
+			},
+			status: WorkerStatus::Live,
+		}]));
+		let coordinator = DistributedQueryCoordinator::new(
+			catalog,
+			registry,
+			memory,
+			Arc::new(TcpTransport::new()),
+			PlannerConfig::default(),
+			query_budget,
+		);
+
+		let results = coordinator.execute_query(&plan).await;
+		server_handle.await.unwrap();
+		results
+	}
+
+	struct MultiTableStorageScan {
+		tables: HashMap<TableId, RecordBatch>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for MultiTableStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let mut batch =
+				self.tables
+					.get(&request.table_id)
+					.cloned()
+					.ok_or(StorageError::TableNotFound {
+						table: request.table_id,
+					})?;
+			if let Some((morsel_id, total_morsels)) = request.morsel {
+				let total_rows = batch.num_rows();
+				let rows_per_morsel =
+					(total_rows + total_morsels as usize - 1) / total_morsels as usize;
+				let start = morsel_id.0 as usize * rows_per_morsel;
+				let end = std::cmp::min(start + rows_per_morsel, total_rows);
+				batch = if start < total_rows {
+					batch.slice(start, end - start)
+				} else {
+					batch.slice(0, 0)
+				};
+			}
+			Ok(ScanStream::from_batches(
+				batch.schema(),
+				request.session_id,
+				request.query_id,
+				vec![batch],
+			))
+		}
+	}
+
 	fn test_task_spec(plan: ExecutionPlan, task_id: TaskId) -> TaskSpec {
 		TaskSpec {
 			identity: TaskIdentity::new(
@@ -1178,7 +1479,7 @@ mod tests {
 			),
 			partition: None,
 			plan,
-			inputs: vec![TaskInputBinding::Scan],
+			inputs: vec![TaskInputBinding::Scan { share: None }],
 			output: TaskOutputBinding::FinalResult,
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -1254,7 +1555,7 @@ mod tests {
 			group_expr: vec![],
 			aggr_expr: vec![(
 				AggregateFunction::LinearRegress,
-				vec![Expr::Column("y".to_string()), Expr::Column("x".to_string())],
+				vec![Expr::column("y"), Expr::column("x")],
 			)],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
@@ -1288,7 +1589,7 @@ mod tests {
 			group_expr: vec![],
 			aggr_expr: vec![(
 				AggregateFunction::ApproxQuantile(0.5),
-				vec![Expr::Column("val".to_string())],
+				vec![Expr::column("val")],
 			)],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
@@ -1328,7 +1629,7 @@ mod tests {
 
 		let expr = Expr::TimeBucket(
 			std::time::Duration::from_secs(3600),
-			Box::new(Expr::Column("ts".to_string())),
+			Box::new(Expr::column("ts")),
 		);
 		let result_arr = executor.evaluate_expr(&expr, &batch).unwrap();
 		let bucketed = result_arr.as_any().downcast_ref::<Int64Array>().unwrap();

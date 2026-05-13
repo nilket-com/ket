@@ -1,8 +1,12 @@
 use crate::coordinator::materialize_scan_stream;
+use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+use crate::distributed::task::TaskTelemetry;
 use crate::error::ExecutionError;
+#[cfg(test)]
+use crate::ir::JoinStrategy;
 use crate::ir::{
-	AggregateFunction, ExecutionExpr, ExecutionPlan, FilterDisposition, MorselId, QueryId,
-	QueryProfileHint, ScalarValue, SessionId, TableId,
+	AggregateFunction, ExecutionExpr, ExecutionPlan, FilterDisposition, JoinKind, MorselId,
+	QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -16,8 +20,14 @@ use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -25,13 +35,18 @@ use wendelon::schema::{
 };
 #[cfg(test)]
 use wendelon::storage::sketch::KllSketch;
+use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
+
+const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
+const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Executor {
 	storage: Arc<dyn StorageScan>,
 	context: ExecutionContext,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExecutionContext {
 	pub session_id: SessionId,
 	pub query_id: QueryId,
@@ -40,6 +55,26 @@ pub struct ExecutionContext {
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
+	pub task_budget: TaskBudget,
+	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	join_spill_file_ops: Arc<dyn AsyncFileOps>,
+	join_spill_dir: PathBuf,
+}
+
+impl fmt::Debug for ExecutionContext {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("ExecutionContext")
+			.field("session_id", &self.session_id)
+			.field("query_id", &self.query_id)
+			.field("tenant_id", &self.tenant_id)
+			.field("read_bound", &self.read_bound)
+			.field("profile_hint", &self.profile_hint)
+			.field("trace_context", &self.trace_context)
+			.field("legacy_table_pins", &self.legacy_table_pins)
+			.field("task_budget", &self.task_budget)
+			.field("join_spill_dir", &self.join_spill_dir)
+			.finish_non_exhaustive()
+	}
 }
 
 impl ExecutionContext {
@@ -57,7 +92,31 @@ impl ExecutionContext {
 			profile_hint: None,
 			trace_context: None,
 			legacy_table_pins: HashMap::new(),
+			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			task_telemetry: None,
+			join_spill_file_ops: Arc::new(BlockingFileOps),
+			join_spill_dir: std::env::temp_dir().join("toron_join_spill"),
 		}
+	}
+
+	pub fn with_task_budget(mut self, task_budget: TaskBudget) -> Self {
+		self.task_budget = task_budget;
+		self
+	}
+
+	pub fn with_task_telemetry(mut self, telemetry: Arc<Mutex<TaskTelemetry>>) -> Self {
+		self.task_telemetry = Some(telemetry);
+		self
+	}
+
+	pub fn with_join_spill_store(
+		mut self,
+		file_ops: Arc<dyn AsyncFileOps>,
+		spill_dir: PathBuf,
+	) -> Self {
+		self.join_spill_file_ops = file_ops;
+		self.join_spill_dir = spill_dir;
+		self
 	}
 
 	pub fn local_test() -> Self {
@@ -129,6 +188,7 @@ impl Executor {
 				LogicalPlan::ScanNamed { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound named scan execution",
 				}),
+				LogicalPlan::Alias { input, .. } => self.execute(input, morsel).await,
 				LogicalPlan::Filter { input, predicate } => {
 					let input_batches = self.execute(input, morsel).await?;
 					let mut output = Vec::new();
@@ -371,6 +431,9 @@ impl Executor {
 					}
 					Ok(partitioned_output)
 				}
+				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical join execution",
+				}),
 			}
 		})
 	}
@@ -479,6 +542,33 @@ impl Executor {
 					self.bound_exchange(input, *partition_count, key, morsel)
 						.await
 				}
+				ExecutionPlan::Join {
+					left,
+					right,
+					kind,
+					left_keys,
+					right_keys,
+					output_schema,
+					..
+				} => {
+					let left_batches = self.execute_bound(left, morsel).await?;
+					let right_batches = self.execute_bound(right, morsel).await?;
+					execute_inner_join(
+						left.schema(),
+						right.schema(),
+						&left_batches,
+						&right_batches,
+						*kind,
+						left_keys,
+						right_keys,
+						output_schema,
+						self.context.task_budget,
+						self.context.task_telemetry.clone(),
+						self.context.join_spill_file_ops.clone(),
+						self.context.join_spill_dir.clone(),
+					)
+					.await
+				}
 			}
 		})
 	}
@@ -490,11 +580,12 @@ impl Executor {
 		batch: &RecordBatch,
 	) -> Result<ArrayRef, ExecutionError> {
 		match expr {
-			Expr::Column(name) => {
-				let ordinal = batch
-					.schema()
-					.index_of(name)
-					.map_err(|_| ExecutionError::ColumnNotFound { name: name.clone() })?;
+			Expr::Column(column_ref) => {
+				let ordinal = batch.schema().index_of(&column_ref.name.0).map_err(|_| {
+					ExecutionError::ColumnNotFound {
+						name: column_ref.name.0.clone(),
+					}
+				})?;
 				Ok(batch.column(ordinal).clone())
 			}
 			Expr::Literal(val) => {
@@ -1038,8 +1129,18 @@ impl Executor {
 		key: &[ExecutionExpr],
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
+		if partition_count == 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: "exchange partition_count must be greater than zero".to_string(),
+			});
+		}
+
 		let input_batches = self.execute_bound(input, morsel).await?;
-		let mut partitioned_output = Vec::new();
+		let schema = input.schema();
+		let partition_count_usize =
+			usize::try_from(partition_count).expect("partition count fits usize");
+		let mut partition_batches: Vec<Vec<RecordBatch>> =
+			(0..partition_count_usize).map(|_| Vec::new()).collect();
 
 		for batch in input_batches {
 			let num_rows = batch.num_rows();
@@ -1058,19 +1159,836 @@ impl Executor {
 				builders[bucket].push(row as u32);
 			}
 
-			for indices in builders {
+			for (partition, indices) in builders.into_iter().enumerate() {
 				if !indices.is_empty() {
 					let indices_arr = arrow::array::UInt32Array::from(indices);
 					let mut cols = Vec::new();
 					for col in batch.columns() {
 						cols.push(arrow::compute::take(col, &indices_arr, None)?);
 					}
-					partitioned_output.push(RecordBatch::try_new(batch.schema(), cols)?);
+					partition_batches[partition].push(RecordBatch::try_new(batch.schema(), cols)?);
 				}
 			}
 		}
 
-		Ok(partitioned_output)
+		partition_batches
+			.into_iter()
+			.map(|batches| {
+				if batches.is_empty() {
+					Ok(RecordBatch::new_empty(schema.clone()))
+				} else {
+					Ok(arrow::compute::concat_batches(&schema, &batches)?)
+				}
+			})
+			.collect()
+	}
+}
+
+fn duration_micros(started: Instant) -> u64 {
+	u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn record_task_telemetry(
+	telemetry: &Option<Arc<Mutex<TaskTelemetry>>>,
+	update: impl FnOnce(&mut TaskTelemetry),
+) {
+	let Some(telemetry) = telemetry else {
+		return;
+	};
+	let lock_started = Instant::now();
+	if let Ok(mut telemetry) = telemetry.lock() {
+		telemetry.phases.telemetry_lock_micros = telemetry
+			.phases
+			.telemetry_lock_micros
+			.saturating_add(duration_micros(lock_started));
+		update(&mut telemetry);
+	}
+}
+
+async fn execute_inner_join(
+	left_schema: arrow::datatypes::SchemaRef,
+	right_schema: arrow::datatypes::SchemaRef,
+	left_batches: &[RecordBatch],
+	right_batches: &[RecordBatch],
+	kind: JoinKind,
+	left_keys: &[crate::ir::ColumnOrdinal],
+	right_keys: &[crate::ir::ColumnOrdinal],
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	match kind {
+		JoinKind::Inner => {}
+	}
+	if left_keys.len() != right_keys.len() {
+		return Err(ExecutionError::InvalidExpression {
+			message: "join key arity mismatch".to_string(),
+		});
+	}
+
+	let left_batch = concat_or_empty(left_schema, left_batches)?;
+	let right_batch = concat_or_empty(right_schema, right_batches)?;
+	let left_key_arrays = key_arrays(&left_batch, left_keys)?;
+	let right_key_arrays = key_arrays(&right_batch, right_keys)?;
+	record_task_telemetry(&telemetry, |task| {
+		task.counters.build_rows = task
+			.counters
+			.build_rows
+			.saturating_add(left_batch.num_rows() as u64);
+		task.counters.probe_rows = task
+			.counters
+			.probe_rows
+			.saturating_add(right_batch.num_rows() as u64);
+	});
+
+	if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
+		> task_budget.memory.get()
+	{
+		return execute_spilled_inner_join(
+			&left_batch,
+			&right_batch,
+			&left_key_arrays,
+			&right_key_arrays,
+			output_schema,
+			task_budget,
+			telemetry,
+			spill_file_ops,
+			spill_dir,
+		)
+		.await;
+	}
+
+	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+
+	let build_started = Instant::now();
+	for row in 0..left_batch.num_rows() {
+		let Some(key) = join_key_bytes(&left_key_arrays, row)? else {
+			continue;
+		};
+		build_rows
+			.entry(key)
+			.or_default()
+			.push(u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+				message: "join build row index exceeds UInt32 take index".to_string(),
+			})?);
+	}
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.build_micros = task
+			.phases
+			.build_micros
+			.saturating_add(duration_micros(build_started));
+	});
+
+	let mut left_indices = Vec::new();
+	let mut right_indices = Vec::new();
+	let probe_started = Instant::now();
+	for row in 0..right_batch.num_rows() {
+		let Some(key) = join_key_bytes(&right_key_arrays, row)? else {
+			continue;
+		};
+		let Some(matches) = build_rows.get(&key) else {
+			continue;
+		};
+		let right_index = u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+			message: "join probe row index exceeds UInt32 take index".to_string(),
+		})?;
+		for left_index in matches {
+			left_indices.push(*left_index);
+			right_indices.push(right_index);
+		}
+	}
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.probe_micros = task
+			.phases
+			.probe_micros
+			.saturating_add(duration_micros(probe_started));
+		task.counters.matched_rows = task
+			.counters
+			.matched_rows
+			.saturating_add(left_indices.len() as u64);
+	});
+
+	if left_indices.is_empty() {
+		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+	}
+
+	let left_indices = UInt32Array::from(left_indices);
+	let right_indices = UInt32Array::from(right_indices);
+	let mut output_columns =
+		Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+	for column in left_batch.columns() {
+		output_columns.push(arrow::compute::take(column, &left_indices, None)?);
+	}
+	for column in right_batch.columns() {
+		output_columns.push(arrow::compute::take(column, &right_indices, None)?);
+	}
+
+	Ok(vec![RecordBatch::try_new(
+		output_schema.clone(),
+		output_columns,
+	)?])
+}
+
+async fn execute_spilled_inner_join(
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	left_key_arrays: &[ArrayRef],
+	right_key_arrays: &[ArrayRef],
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+	telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	spill_file_ops: Arc<dyn AsyncFileOps>,
+	spill_dir: PathBuf,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+	let build_started = Instant::now();
+	for row in 0..left_batch.num_rows() {
+		let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+			continue;
+		};
+		build_rows
+			.entry(key)
+			.or_default()
+			.push(u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+				message: "join build row index exceeds UInt32 take index".to_string(),
+			})?);
+	}
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.build_micros = task
+			.phases
+			.build_micros
+			.saturating_add(duration_micros(build_started));
+	});
+	if build_rows.is_empty() {
+		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+	}
+
+	let spill_started = Instant::now();
+	let mut spilled =
+		SpilledJoinBuild::write(build_rows, task_budget, spill_file_ops, spill_dir).await?;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.spill_micros = task
+			.phases
+			.spill_micros
+			.saturating_add(duration_micros(spill_started));
+		task.counters.spill_bytes = task
+			.counters
+			.spill_bytes
+			.saturating_add(spilled.spill_bytes());
+	});
+	let probe_started = Instant::now();
+	let result = probe_spilled_inner_join(
+		&mut spilled,
+		right_batch,
+		right_key_arrays,
+		left_batch,
+		output_schema,
+	)
+	.await;
+	record_task_telemetry(&telemetry, |task| {
+		task.phases.probe_micros = task
+			.phases
+			.probe_micros
+			.saturating_add(duration_micros(probe_started));
+		if let Ok(batches) = &result {
+			let matched_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+			task.counters.matched_rows = task
+				.counters
+				.matched_rows
+				.saturating_add(matched_rows as u64);
+		}
+	});
+	spilled.cleanup().await;
+	result
+}
+
+async fn probe_spilled_inner_join(
+	spilled: &mut SpilledJoinBuild,
+	right_batch: &RecordBatch,
+	right_key_arrays: &[ArrayRef],
+	left_batch: &RecordBatch,
+	output_schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let mut left_indices = Vec::new();
+	let mut right_indices = Vec::new();
+	for row in 0..right_batch.num_rows() {
+		let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+			continue;
+		};
+		let matches = spilled.lookup(&key).await?;
+		if matches.is_empty() {
+			continue;
+		}
+		let right_index = u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+			message: "join probe row index exceeds UInt32 take index".to_string(),
+		})?;
+		for left_index in matches {
+			left_indices.push(left_index);
+			right_indices.push(right_index);
+		}
+	}
+
+	if left_indices.is_empty() {
+		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+	}
+
+	let left_indices = UInt32Array::from(left_indices);
+	let right_indices = UInt32Array::from(right_indices);
+	let mut output_columns =
+		Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+	for column in left_batch.columns() {
+		output_columns.push(arrow::compute::take(column, &left_indices, None)?);
+	}
+	for column in right_batch.columns() {
+		output_columns.push(arrow::compute::take(column, &right_indices, None)?);
+	}
+
+	Ok(vec![RecordBatch::try_new(
+		output_schema.clone(),
+		output_columns,
+	)?])
+}
+
+fn concat_or_empty(
+	schema: arrow::datatypes::SchemaRef,
+	batches: &[RecordBatch],
+) -> Result<RecordBatch, ExecutionError> {
+	if batches.is_empty() {
+		Ok(RecordBatch::new_empty(schema))
+	} else {
+		Ok(arrow::compute::concat_batches(&schema, batches)?)
+	}
+}
+
+fn key_arrays(
+	batch: &RecordBatch,
+	keys: &[crate::ir::ColumnOrdinal],
+) -> Result<Vec<ArrayRef>, ExecutionError> {
+	keys.iter()
+		.map(|key| {
+			let ordinal = usize::try_from(key.0).expect("column ordinal fits usize");
+			batch
+				.columns()
+				.get(ordinal)
+				.cloned()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: format!("join key column ordinal {ordinal} out of bounds"),
+				})
+		})
+		.collect()
+}
+
+fn join_key_bytes(key_arrays: &[ArrayRef], row: usize) -> Result<Option<Vec<u8>>, ExecutionError> {
+	let mut encoded = Vec::new();
+	for array in key_arrays {
+		if array.is_null(row) {
+			return Ok(None);
+		}
+		encode_partition_key_value(array.as_ref(), row, &mut encoded)?;
+	}
+	Ok(Some(encoded))
+}
+
+fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
+	let key_width = key_arrays
+		.iter()
+		.map(|array| match array.data_type() {
+			DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+			DataType::Int16 | DataType::UInt16 => 2,
+			DataType::Int32 | DataType::UInt32 | DataType::Float32 => 4,
+			DataType::Int64 | DataType::UInt64 | DataType::Float64 => 8,
+			DataType::Utf8 => 32,
+			_ => 16,
+		})
+		.sum::<usize>();
+	u64::try_from(rows.saturating_mul(48 + key_width)).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct JoinSpillPage {
+	offset: u64,
+	ciphertext_len: usize,
+	plaintext_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedJoinSpillPage {
+	bytes: Vec<u8>,
+}
+
+struct SpilledJoinBuild {
+	spill_id: u64,
+	path: PathBuf,
+	file_ops: Arc<dyn AsyncFileOps>,
+	file: FileHandle,
+	key: LessSafeKey,
+	pages: Vec<JoinSpillPage>,
+	index: HashMap<Vec<u8>, Vec<usize>>,
+	cache: HashMap<usize, CachedJoinSpillPage>,
+	lru: VecDeque<usize>,
+	cache_bytes: u64,
+	cache_cap: u64,
+}
+
+impl SpilledJoinBuild {
+	async fn write(
+		build_rows: HashMap<Vec<u8>, Vec<u32>>,
+		task_budget: TaskBudget,
+		file_ops: Arc<dyn AsyncFileOps>,
+		spill_dir: PathBuf,
+	) -> Result<Self, ExecutionError> {
+		let spill_id = NEXT_JOIN_SPILL_ID.fetch_add(1, Ordering::SeqCst);
+		let path = spill_dir.join(format!("spill_{}_{}.join", std::process::id(), spill_id));
+		match Self::write_inner(
+			spill_id,
+			path.clone(),
+			build_rows,
+			task_budget,
+			file_ops.clone(),
+		)
+		.await
+		{
+			Ok(spill) => Ok(spill),
+			Err(error) => {
+				let _ = file_ops.unlink(&path).await;
+				Err(error)
+			}
+		}
+	}
+
+	async fn write_inner(
+		spill_id: u64,
+		path: PathBuf,
+		build_rows: HashMap<Vec<u8>, Vec<u32>>,
+		task_budget: TaskBudget,
+		file_ops: Arc<dyn AsyncFileOps>,
+	) -> Result<Self, ExecutionError> {
+		let spill_dir = path.parent().ok_or_else(|| ExecutionError::Kernel {
+			message: "join spill path has no parent directory".to_string(),
+		})?;
+		file_ops
+			.create_dir_all(spill_dir)
+			.await
+			.map_err(|error| join_spill_io_error("create_dir_all", error))?;
+		let mut key_bytes = [0u8; 32];
+		aws_lc_rs::rand::fill(&mut key_bytes).map_err(|error| ExecutionError::Kernel {
+			message: format!("join spill key generation failed: {error:?}"),
+		})?;
+		let unbound = UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).map_err(|error| {
+			ExecutionError::Kernel {
+				message: format!("join spill key construction failed: {error:?}"),
+			}
+		})?;
+		let key = LessSafeKey::new(unbound);
+		let file = file_ops
+			.open(
+				&path,
+				OpenFlags {
+					read: true,
+					write: true,
+					create_new: true,
+					..OpenFlags::default()
+				},
+			)
+			.await
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("join spill open failed: {error}"),
+			})?;
+		let mut pages = Vec::new();
+		let mut index: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+		let mut current_entries: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
+		let mut current_size = std::mem::size_of::<u32>();
+		let mut spill_bytes = 0u64;
+		let mut writer_peak = 0u64;
+		let mut next_offset = 0u64;
+
+		for (join_key, rows) in build_rows {
+			let entry_size = encoded_join_spill_entry_size(&join_key, &rows);
+			if !current_entries.is_empty()
+				&& current_size.saturating_add(entry_size) > JOIN_SPILL_PAGE_SIZE
+			{
+				let page_index = pages.len();
+				let page = write_join_spill_page(
+					file_ops.as_ref(),
+					&file,
+					&key,
+					spill_id,
+					page_index,
+					next_offset,
+					&current_entries,
+				)
+				.await?;
+				spill_bytes = spill_bytes.saturating_add(page.ciphertext_len as u64);
+				writer_peak = writer_peak.max(page.plaintext_len as u64);
+				if spill_bytes > task_budget.spill_bytes.get() {
+					return Err(budget_exhausted(
+						BudgetDimension::SpillBytes,
+						spill_bytes,
+						task_budget.spill_bytes.get(),
+					));
+				}
+				for (key, _) in &current_entries {
+					index.entry(key.clone()).or_default().push(page_index);
+				}
+				next_offset = next_offset.saturating_add(page.ciphertext_len as u64);
+				pages.push(page);
+				current_entries.clear();
+				current_size = std::mem::size_of::<u32>();
+			}
+
+			current_size = current_size.saturating_add(entry_size);
+			current_entries.push((join_key, rows));
+		}
+
+		if !current_entries.is_empty() {
+			let page_index = pages.len();
+			let page = write_join_spill_page(
+				file_ops.as_ref(),
+				&file,
+				&key,
+				spill_id,
+				page_index,
+				next_offset,
+				&current_entries,
+			)
+			.await?;
+			spill_bytes = spill_bytes.saturating_add(page.ciphertext_len as u64);
+			writer_peak = writer_peak.max(page.plaintext_len as u64);
+			if spill_bytes > task_budget.spill_bytes.get() {
+				return Err(budget_exhausted(
+					BudgetDimension::SpillBytes,
+					spill_bytes,
+					task_budget.spill_bytes.get(),
+				));
+			}
+			for (key, _) in &current_entries {
+				index.entry(key.clone()).or_default().push(page_index);
+			}
+			next_offset = next_offset.saturating_add(page.ciphertext_len as u64);
+			pages.push(page);
+		}
+		file_ops
+			.set_len(&file, next_offset)
+			.await
+			.map_err(|error| join_spill_io_error("set_len", error))?;
+		file_ops
+			.fdatasync(&file)
+			.await
+			.map_err(|error| join_spill_io_error("fdatasync", error))?;
+
+		let index_bytes = join_spill_index_bytes(&index);
+		let resident_without_cache = index_bytes
+			.saturating_add(writer_peak)
+			.saturating_add(JOIN_SPILL_PAGE_SIZE as u64);
+		if resident_without_cache > task_budget.memory.get() {
+			return Err(budget_exhausted(
+				BudgetDimension::Memory,
+				resident_without_cache,
+				task_budget.memory.get(),
+			));
+		}
+		let cache_cap = JOIN_SPILL_CACHE_TARGET_BYTES.min(
+			task_budget
+				.memory
+				.get()
+				.saturating_sub(resident_without_cache),
+		);
+
+		Ok(Self {
+			spill_id,
+			path,
+			file_ops,
+			file,
+			key,
+			pages,
+			index,
+			cache: HashMap::new(),
+			lru: VecDeque::new(),
+			cache_bytes: 0,
+			cache_cap,
+		})
+	}
+
+	fn spill_bytes(&self) -> u64 {
+		self.pages
+			.iter()
+			.map(|page| page.ciphertext_len as u64)
+			.sum()
+	}
+
+	async fn lookup(&mut self, join_key: &[u8]) -> Result<Vec<u32>, ExecutionError> {
+		let Some(page_indices) = self.index.get(join_key).cloned() else {
+			return Ok(Vec::new());
+		};
+		let mut rows = Vec::new();
+		for page_index in page_indices {
+			let page = self.read_page(page_index).await?;
+			rows.extend(decode_join_spill_page_for_key(&page, join_key)?);
+		}
+		Ok(rows)
+	}
+
+	async fn read_page(&mut self, page_index: usize) -> Result<Vec<u8>, ExecutionError> {
+		if let Some(cached) = self.cache.get(&page_index) {
+			let bytes = cached.bytes.clone();
+			self.touch_cache_entry(page_index);
+			return Ok(bytes);
+		}
+
+		let page = self
+			.pages
+			.get(page_index)
+			.copied()
+			.ok_or_else(|| ExecutionError::Kernel {
+				message: format!("join spill page {page_index} is missing"),
+			})?;
+		let mut ciphertext = read_plain_exact(
+			self.file_ops.as_ref(),
+			&self.file,
+			page.offset,
+			page.ciphertext_len,
+		)
+		.await?;
+		let nonce = Nonce::assume_unique_for_key(join_spill_nonce(self.spill_id, page_index));
+		let plaintext = self
+			.key
+			.open_in_place(nonce, Aad::empty(), &mut ciphertext)
+			.map_err(|error| ExecutionError::Kernel {
+				message: format!("join spill decrypt failed: {error:?}"),
+			})?
+			.to_vec();
+		self.insert_cache_entry(page_index, plaintext.clone());
+		Ok(plaintext)
+	}
+
+	async fn cleanup(self) {
+		let file_ops = self.file_ops.clone();
+		let path = self.path.clone();
+		drop(self);
+		let _ = file_ops.unlink(&path).await;
+	}
+
+	fn touch_cache_entry(&mut self, page_index: usize) {
+		self.lru.retain(|cached| *cached != page_index);
+		self.lru.push_back(page_index);
+	}
+
+	fn insert_cache_entry(&mut self, page_index: usize, bytes: Vec<u8>) {
+		let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+		if self.cache_cap == 0 || bytes_len > self.cache_cap {
+			return;
+		}
+		while self.cache_bytes.saturating_add(bytes_len) > self.cache_cap {
+			let Some(evicted) = self.lru.pop_front() else {
+				break;
+			};
+			if let Some(page) = self.cache.remove(&evicted) {
+				self.cache_bytes = self
+					.cache_bytes
+					.saturating_sub(u64::try_from(page.bytes.len()).unwrap_or(u64::MAX));
+			}
+		}
+		self.cache_bytes = self.cache_bytes.saturating_add(bytes_len);
+		self.cache.insert(page_index, CachedJoinSpillPage { bytes });
+		self.touch_cache_entry(page_index);
+	}
+}
+
+async fn write_join_spill_page(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	key: &LessSafeKey,
+	spill_id: u64,
+	page_index: usize,
+	offset: u64,
+	entries: &[(Vec<u8>, Vec<u32>)],
+) -> Result<JoinSpillPage, ExecutionError> {
+	let mut plaintext = encode_join_spill_page(entries)?;
+	let plaintext_len = plaintext.len();
+	let nonce = Nonce::assume_unique_for_key(join_spill_nonce(spill_id, page_index));
+	key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
+		.map_err(|error| ExecutionError::Kernel {
+			message: format!("join spill encrypt failed: {error:?}"),
+		})?;
+	let ciphertext_len = plaintext.len();
+	write_plain_all(file_ops, file, offset, plaintext).await?;
+	Ok(JoinSpillPage {
+		offset,
+		ciphertext_len,
+		plaintext_len,
+	})
+}
+
+async fn write_plain_all(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	offset: u64,
+	bytes: Vec<u8>,
+) -> Result<(), ExecutionError> {
+	let mut written_total = 0usize;
+	while written_total < bytes.len() {
+		let written = file_ops
+			.write_plain_at(
+				file,
+				offset.saturating_add(written_total as u64),
+				bytes[written_total..].to_vec(),
+			)
+			.await
+			.map_err(|error| join_spill_io_error("write", error))?;
+		if written == 0 {
+			return Err(join_spill_io_error(
+				"write",
+				std::io::Error::new(
+					ErrorKind::WriteZero,
+					"join spill write completed with zero bytes",
+				),
+			));
+		}
+		written_total = written_total.saturating_add(written);
+	}
+	Ok(())
+}
+
+async fn read_plain_exact(
+	file_ops: &dyn AsyncFileOps,
+	file: &FileHandle,
+	offset: u64,
+	len: usize,
+) -> Result<Vec<u8>, ExecutionError> {
+	let mut out = Vec::with_capacity(len);
+	while out.len() < len {
+		let chunk = file_ops
+			.read_plain_at(
+				file,
+				offset.saturating_add(out.len() as u64),
+				len.saturating_sub(out.len()),
+			)
+			.await
+			.map_err(|error| join_spill_io_error("read", error))?;
+		if chunk.is_empty() {
+			return Err(join_spill_io_error(
+				"read",
+				std::io::Error::new(ErrorKind::UnexpectedEof, "join spill page truncated"),
+			));
+		}
+		out.extend_from_slice(&chunk);
+	}
+	Ok(out)
+}
+
+fn join_spill_io_error(operation: &'static str, error: std::io::Error) -> ExecutionError {
+	ExecutionError::Kernel {
+		message: format!("join spill {operation} failed: {error}"),
+	}
+}
+
+fn encode_join_spill_page(entries: &[(Vec<u8>, Vec<u32>)]) -> Result<Vec<u8>, ExecutionError> {
+	let mut out = Vec::new();
+	out.extend_from_slice(
+		&u32::try_from(entries.len())
+			.map_err(|_| ExecutionError::Kernel {
+				message: "join spill page has too many entries".to_string(),
+			})?
+			.to_le_bytes(),
+	);
+	for (join_key, rows) in entries {
+		out.extend_from_slice(
+			&u32::try_from(join_key.len())
+				.map_err(|_| ExecutionError::Kernel {
+					message: "join spill key is too large".to_string(),
+				})?
+				.to_le_bytes(),
+		);
+		out.extend_from_slice(join_key);
+		out.extend_from_slice(
+			&u32::try_from(rows.len())
+				.map_err(|_| ExecutionError::Kernel {
+					message: "join spill row list is too large".to_string(),
+				})?
+				.to_le_bytes(),
+		);
+		for row in rows {
+			out.extend_from_slice(&row.to_le_bytes());
+		}
+	}
+	Ok(out)
+}
+
+fn decode_join_spill_page_for_key(
+	page: &[u8],
+	lookup_key: &[u8],
+) -> Result<Vec<u32>, ExecutionError> {
+	let mut cursor = 0usize;
+	let entries = read_u32_le(page, &mut cursor)? as usize;
+	let mut rows = Vec::new();
+	for _ in 0..entries {
+		let key_len = read_u32_le(page, &mut cursor)? as usize;
+		let key_end = cursor
+			.checked_add(key_len)
+			.ok_or_else(join_spill_decode_error)?;
+		let key = page
+			.get(cursor..key_end)
+			.ok_or_else(join_spill_decode_error)?;
+		cursor = key_end;
+		let row_count = read_u32_le(page, &mut cursor)? as usize;
+		for _ in 0..row_count {
+			let row = read_u32_le(page, &mut cursor)?;
+			if key == lookup_key {
+				rows.push(row);
+			}
+		}
+	}
+	Ok(rows)
+}
+
+fn read_u32_le(page: &[u8], cursor: &mut usize) -> Result<u32, ExecutionError> {
+	let end = cursor.checked_add(4).ok_or_else(join_spill_decode_error)?;
+	let bytes = page.get(*cursor..end).ok_or_else(join_spill_decode_error)?;
+	*cursor = end;
+	Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+}
+
+fn join_spill_decode_error() -> ExecutionError {
+	ExecutionError::Kernel {
+		message: "join spill page decode failed".to_string(),
+	}
+}
+
+fn encoded_join_spill_entry_size(join_key: &[u8], rows: &[u32]) -> usize {
+	std::mem::size_of::<u32>()
+		.saturating_add(join_key.len())
+		.saturating_add(std::mem::size_of::<u32>())
+		.saturating_add(rows.len().saturating_mul(std::mem::size_of::<u32>()))
+}
+
+fn join_spill_index_bytes(index: &HashMap<Vec<u8>, Vec<usize>>) -> u64 {
+	index
+		.iter()
+		.map(|(key, pages)| {
+			u64::try_from(
+				64usize
+					.saturating_add(key.len())
+					.saturating_add(pages.len().saturating_mul(std::mem::size_of::<usize>())),
+			)
+			.unwrap_or(u64::MAX)
+		})
+		.fold(0u64, u64::saturating_add)
+}
+
+fn join_spill_nonce(spill_id: u64, page_index: usize) -> [u8; 12] {
+	let mut nonce = [0u8; 12];
+	nonce[..8].copy_from_slice(&spill_id.to_le_bytes());
+	nonce[8..].copy_from_slice(&u32::try_from(page_index).unwrap_or(u32::MAX).to_le_bytes());
+	nonce
+}
+
+fn budget_exhausted(dimension: BudgetDimension, requested: u64, available: u64) -> ExecutionError {
+	ExecutionError::BudgetExhausted {
+		dimension,
+		requested: ByteCount::new(requested),
+		available: ByteCount::new(available),
 	}
 }
 
@@ -1554,6 +2472,7 @@ mod tests {
 	use super::*;
 	use crate::binder::{PlannerConfig, bind};
 	use crate::catalog::MockCatalog;
+	use crate::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 	use crate::error::StorageError;
 	use crate::ir::{ColumnOrdinal, QueryId, QueryProfileHint, SessionId, TableId};
 	use crate::storage::InMemoryStorageScan;
@@ -1592,7 +2511,7 @@ mod tests {
 				projection: None,
 			}),
 			predicate: Expr::Gt(
-				Box::new(Expr::Column("amount".to_string())),
+				Box::new(Expr::column("amount")),
 				Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 			),
 		};
@@ -1637,7 +2556,7 @@ mod tests {
 				projection: None,
 			}),
 			predicate: Expr::Eq(
-				Box::new(Expr::Column("id".to_string())),
+				Box::new(Expr::column("id")),
 				Box::new(Expr::Literal(ScalarValue::Int64(Some(2)))),
 			),
 		};
@@ -1673,11 +2592,11 @@ mod tests {
 					projection: None,
 				}),
 				predicate: Expr::Gt(
-					Box::new(Expr::Column("amount".to_string())),
+					Box::new(Expr::column("amount")),
 					Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 				),
 			}),
-			exprs: vec![Expr::Column("id".to_string())],
+			exprs: vec![Expr::column("id")],
 		};
 
 		let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -1717,11 +2636,8 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			group_expr: vec![Expr::Column("region".to_string())],
-			aggr_expr: vec![(
-				AggregateFunction::Sum,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
 		};
 
 		let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -1780,14 +2696,8 @@ mod tests {
 			}),
 			group_expr: vec![],
 			aggr_expr: vec![
-				(
-					AggregateFunction::Sum,
-					vec![Expr::Column("amount".to_string())],
-				),
-				(
-					AggregateFunction::Count,
-					vec![Expr::Column("amount".to_string())],
-				),
+				(AggregateFunction::Sum, vec![Expr::column("amount")]),
+				(AggregateFunction::Count, vec![Expr::column("amount")]),
 			],
 		};
 
@@ -1860,12 +2770,7 @@ mod tests {
 				"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64",
 			]
 			.into_iter()
-			.map(|column| {
-				(
-					AggregateFunction::Sum,
-					vec![Expr::Column(column.to_string())],
-				)
-			})
+			.map(|column| (AggregateFunction::Sum, vec![Expr::column(column)]))
 			.collect(),
 		};
 
@@ -1976,11 +2881,8 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			group_expr: vec![Expr::Column("region".to_string())],
-			aggr_expr: vec![(
-				AggregateFunction::Sum,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
 		};
 
 		let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -2010,6 +2912,256 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn execute_bound_inner_join_matches_duplicates_and_drops_null_keys() {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, true),
+			Field::new("left_value", DataType::Utf8, true),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, true),
+			Field::new("right_value", DataType::Int32, true),
+		]));
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![10, 11, 12, 13])),
+				Arc::new(Int64Array::from(vec![Some(1), Some(1), None, Some(2)])),
+				Arc::new(StringArray::from(vec![
+					Some("a"),
+					Some("b"),
+					Some("null"),
+					Some("c"),
+				])),
+			],
+		)
+		.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![20, 21, 22])),
+				Arc::new(Int64Array::from(vec![Some(1), Some(3), None])),
+				Arc::new(Int32Array::from(vec![Some(10), Some(30), Some(99)])),
+			],
+		)
+		.expect("right batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_batch),
+				(TableId(2), right_batch),
+			]),
+		});
+		let executor = Executor::new(storage);
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, true),
+			Field::new("left_value", DataType::Utf8, true),
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, true),
+			Field::new("right_value", DataType::Int32, true),
+		]));
+		let plan = ExecutionPlan::Join {
+			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(1)],
+			right_keys: vec![ColumnOrdinal(1)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+		};
+
+		let results = executor.execute_bound(&plan, None).await.expect("join");
+		let left_keys = results[0]
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("left key");
+		let right_values = results[0]
+			.column(5)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("right value");
+
+		assert_eq!(results[0].num_rows(), 2);
+		assert_eq!(left_keys.values(), &[1, 1]);
+		assert_eq!(right_values.values(), &[10, 10]);
+	}
+
+	#[tokio::test]
+	async fn execute_bound_inner_join_supports_multi_column_keys_and_normalized_digest() {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("k1", DataType::Int64, false),
+			Field::new("k2", DataType::Int64, false),
+			Field::new("left_value", DataType::Utf8, true),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("k1", DataType::Int64, false),
+			Field::new("k2", DataType::Int64, false),
+			Field::new("right_value", DataType::Int32, true),
+		]));
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("k1", DataType::Int64, false),
+			Field::new("k2", DataType::Int64, false),
+			Field::new("left_value", DataType::Utf8, true),
+			Field::new("pk", DataType::Int64, false),
+			Field::new("k1", DataType::Int64, false),
+			Field::new("k2", DataType::Int64, false),
+			Field::new("right_value", DataType::Int32, true),
+		]));
+		let plan = ExecutionPlan::Join {
+			left: Box::new(test_scan_plan(TableId(1), left_schema.clone(), 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema.clone(), 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+			right_keys: vec![ColumnOrdinal(1), ColumnOrdinal(2)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema,
+		};
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![20, 21])),
+				Arc::new(Int64Array::from(vec![1, 1])),
+				Arc::new(Int64Array::from(vec![10, 12])),
+				Arc::new(Int32Array::from(vec![Some(100), Some(120)])),
+			],
+		)
+		.expect("right batch");
+		let left_a = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![1, 2, 3])),
+				Arc::new(Int64Array::from(vec![1, 1, 1])),
+				Arc::new(Int64Array::from(vec![10, 11, 10])),
+				Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+			],
+		)
+		.expect("left batch a");
+		let left_b = RecordBatch::try_new(
+			left_schema,
+			vec![
+				Arc::new(Int64Array::from(vec![3, 2, 1])),
+				Arc::new(Int64Array::from(vec![1, 1, 1])),
+				Arc::new(Int64Array::from(vec![10, 11, 10])),
+				Arc::new(StringArray::from(vec![Some("c"), Some("b"), Some("a")])),
+			],
+		)
+		.expect("left batch b");
+
+		let results_a = Executor::new(Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_a),
+				(TableId(2), right_batch.clone()),
+			]),
+		}))
+		.execute_bound(&plan, None)
+		.await
+		.expect("join a");
+		let results_b = Executor::new(Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_b),
+				(TableId(2), right_batch),
+			]),
+		}))
+		.execute_bound(&plan, None)
+		.await
+		.expect("join b");
+
+		let labels = results_a[0]
+			.column(3)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("left label");
+		let right_values = results_a[0]
+			.column(7)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("right value");
+
+		assert_eq!(results_a[0].num_rows(), 2);
+		assert_eq!(labels.value(0), "a");
+		assert_eq!(labels.value(1), "c");
+		assert_eq!(right_values.values(), &[100, 100]);
+		assert_eq!(
+			canonical_arrow_ipc_digest(&results_a, SortPolicy::FullRowLex).expect("digest a"),
+			canonical_arrow_ipc_digest(&results_b, SortPolicy::FullRowLex).expect("digest b")
+		);
+	}
+
+	#[tokio::test]
+	async fn execute_bound_inner_join_spills_build_when_memory_cap_is_low() {
+		let (executor, plan) = duplicate_join_fixture(
+			2_000,
+			TaskBudget {
+				memory: ByteCount::new(80 * 1024),
+				spill_bytes: ByteCount::new(1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			},
+		);
+
+		let results = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect("spilled join");
+
+		assert_eq!(results[0].num_rows(), 2_000);
+	}
+
+	#[tokio::test]
+	async fn execute_bound_inner_join_spill_cap_exhaustion_is_typed() {
+		let (executor, plan) = duplicate_join_fixture(
+			2_000,
+			TaskBudget {
+				memory: ByteCount::new(80 * 1024),
+				spill_bytes: ByteCount::new(32),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			},
+		);
+
+		let err = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("spill cap must fail");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::SpillBytes,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
+	async fn execute_bound_inner_join_spill_index_counts_against_memory_cap() {
+		let (executor, plan) = duplicate_join_fixture(
+			2_000,
+			TaskBudget {
+				memory: ByteCount::new(32 * 1024),
+				spill_bytes: ByteCount::new(1024 * 1024),
+				..TaskBudget::from_query_budget(QueryBudget::test_default())
+			},
+		);
+
+		let err = executor
+			.execute_bound(&plan, None)
+			.await
+			.expect_err("resident spill state must fail memory cap");
+
+		assert!(matches!(
+			err,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				..
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn execute_bound_exchange_partitions_projected_input() {
 		let storage = Arc::new(RecordingStorageScan {
 			table_data: batch(),
@@ -2023,7 +3175,7 @@ mod tests {
 				projection: None,
 			}),
 			partition_count: 2,
-			key: vec![Expr::Column("amount".to_string())],
+			key: vec![Expr::column("amount")],
 		};
 
 		let bound = bind(&logical, &catalog, &PlannerConfig::default())
@@ -2080,11 +3232,8 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			group_expr: vec![Expr::Column("region".to_string())],
-			aggr_expr: vec![(
-				AggregateFunction::Sum,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
 		};
 
 		let results = executor.execute(&plan, None).await.expect("execute");
@@ -2138,6 +3287,27 @@ mod tests {
 		}
 	}
 
+	struct TableStorageScan {
+		batches: std::collections::HashMap<TableId, RecordBatch>,
+	}
+
+	#[async_trait::async_trait]
+	impl StorageScan for TableStorageScan {
+		async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+			let batch = self.batches.get(&request.table_id).cloned().ok_or(
+				StorageError::TableNotFound {
+					table: request.table_id,
+				},
+			)?;
+			Ok(ScanStream::from_batches(
+				batch.schema(),
+				request.session_id,
+				request.query_id,
+				vec![batch],
+			))
+		}
+	}
+
 	fn catalog() -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
@@ -2178,6 +3348,82 @@ mod tests {
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")
+	}
+
+	fn test_scan_plan(table_id: TableId, schema: Arc<Schema>, object_byte: u8) -> ExecutionPlan {
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([object_byte; 16]),
+			1,
+			"default",
+			"join_test",
+			schema.as_ref(),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("pk")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect("descriptor");
+		ExecutionPlan::Scan {
+			legacy_table_id: table_id,
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+		}
+	}
+
+	fn duplicate_join_fixture(build_rows: usize, budget: TaskBudget) -> (Executor, ExecutionPlan) {
+		let left_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, false),
+		]));
+		let right_schema = Arc::new(Schema::new(vec![
+			Field::new("pk", DataType::Int64, false),
+			Field::new("id", DataType::Int64, false),
+		]));
+		let left_batch = RecordBatch::try_new(
+			left_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(
+					(0..i64::try_from(build_rows).expect("rows fit i64")).collect::<Vec<_>>(),
+				)),
+				Arc::new(Int64Array::from(vec![1; build_rows])),
+			],
+		)
+		.expect("left batch");
+		let right_batch = RecordBatch::try_new(
+			right_schema.clone(),
+			vec![
+				Arc::new(Int64Array::from(vec![0])),
+				Arc::new(Int64Array::from(vec![1])),
+			],
+		)
+		.expect("right batch");
+		let storage = Arc::new(TableStorageScan {
+			batches: std::collections::HashMap::from([
+				(TableId(1), left_batch),
+				(TableId(2), right_batch),
+			]),
+		});
+		let context = ExecutionContext::local_test().with_task_budget(budget);
+		let executor = Executor::with_context(storage, context);
+		let plan = ExecutionPlan::Join {
+			left: Box::new(test_scan_plan(TableId(1), left_schema, 1)),
+			right: Box::new(test_scan_plan(TableId(2), right_schema, 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(1)],
+			right_keys: vec![ColumnOrdinal(1)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: Arc::new(Schema::new(vec![
+				Field::new("pk", DataType::Int64, false),
+				Field::new("id", DataType::Int64, false),
+				Field::new("pk", DataType::Int64, false),
+				Field::new("id", DataType::Int64, false),
+			])),
+		};
+		(executor, plan)
 	}
 
 	fn batch() -> RecordBatch {

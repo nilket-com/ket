@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use serde::{Deserialize, Serialize};
 
 pub use crate::distributed::identity::QueryId;
-use crate::ir::{AggregateFunction, ScalarValue};
+use crate::ir::{AggregateFunction, JoinKind, JoinStrategy, ScalarValue};
 use crate::ir::{QueryProfileHint, TableId};
 use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
 
@@ -92,6 +92,15 @@ pub enum ExecutionPlan {
 		partition_count: u32,
 		key: Vec<ExecutionExpr>,
 	},
+	Join {
+		left: Box<ExecutionPlan>,
+		right: Box<ExecutionPlan>,
+		kind: JoinKind,
+		left_keys: Vec<ColumnOrdinal>,
+		right_keys: Vec<ColumnOrdinal>,
+		strategy: JoinStrategy,
+		output_schema: SchemaRef,
+	},
 }
 
 impl ExecutionPlan {
@@ -102,6 +111,7 @@ impl ExecutionPlan {
 			Self::Project { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
+			Self::Join { output_schema, .. } => output_schema.clone(),
 		}
 	}
 }

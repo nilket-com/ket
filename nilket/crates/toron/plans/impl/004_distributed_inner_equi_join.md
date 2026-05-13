@@ -5,7 +5,7 @@ Equi-Join
 **Primary draft:** Claude
 **Companion ADR:**
 `plans/adr/004_distributed_inner_equi_join.md`
-**Bench-results artifact (post-promotion):**
+**Bench-results artifact (promotion-scale evidence recorded):**
 `plans/impl/004_distributed_inner_equi_join_bench_results.md`
 
 ## Inherits substrate
@@ -41,9 +41,11 @@ Equi-Join
 
 ## Status
 
-Promoted to `plans/impl/`. Pre-implementation. Phase 0
-calibration is the first phase. Bench-results artifact lands
-post-Phase-10 evidence.
+Promoted to `plans/impl/`. Implementation-complete with
+promotion-scale evidence recorded in
+`plans/impl/004_distributed_inner_equi_join_bench_results.md`.
+Hard-gate bench rows passed; the worker-scaling soft gate
+miss is recorded for ADR 005 planning.
 
 ## Implementation contract
 
@@ -68,7 +70,9 @@ post-Phase-10 evidence.
   `JoinStrategy::Broadcast`, the left subtree must
   terminate in the single-partition publish shape
   (`Exchange { partition_count: 1 }` or
-  `BroadcastPublish`); right-publish shape rejects.
+  `BroadcastPublish`). Any missing or wrong-count left
+  publish shape rejects; any right-side publish shape
+  rejects as ambiguous.
 - `TaskInputBinding::Scan` extended from fieldless to
   `Scan { share: Option<ScanShare> }` where `ScanShare =
   { worker_index: u32, worker_count: u32 }`. Existing
@@ -112,6 +116,9 @@ post-Phase-10 evidence.
   `broadcast_replicated_bytes_per_query` (default 1 GiB),
   `memory_per_task_bytes` (ADR 003 inherited). New
   `BudgetDimension::BroadcastReplication` variant.
+  Broadcast-specific byte caps use this dimension; the
+  existing task-memory cap still fails as
+  `BudgetExhausted { dimension: Memory }`.
 - Build-side memory reserves against
   `QueryBudget::memory_per_task_bytes`. Reservation failure
   → `BudgetExhausted { dimension: Memory }` only if spill
@@ -146,9 +153,10 @@ post-Phase-10 evidence.
   expression keys rejected at bind with typed errors.
 - All 21 hard gates pass; soft gates met or explicitly
   justified.
-- ADR 003 telemetry residual ships as separate `chore:`
-  slice before Phase 1 features (per ADR §"Council
-  decisions" item 19).
+- ADR 003 residual counters plus executor/join phase spans
+  are stacked into the staged ADR 004 promotion work so ADR
+  005 starts from attributed phase evidence rather than
+  wall-clock only.
 
 ## Goal
 
@@ -298,19 +306,23 @@ each item.
   - `left_shuffle_bytes`, `right_shuffle_bytes` (hash-
     partitioned only)
   - `broadcast_replicated_bytes` (broadcast only)
-  - `build_hash_peak_bytes`
-  - `build_spill_bytes`, `build_spill_cache_hit_rate`
-  - `skew_max_partition_rows` (skew fixture only)
+  - task-total `pulled_shuffle_bytes`, `published_shuffle_bytes`,
+    `matched_rows`, `emitted_rows`, `emitted_batches`
+  - `task_wall_ms`, `shuffle_pull_decode_ms`, `build_ms`,
+    `probe_ms`, `spill_ms`, `output_publish_ms`,
+    `task_setup_ms`, `batch_encode_ms`, `batch_send_ms`,
+    `batch_decode_ms`, `dispatch_wait_ms`,
+    `telemetry_lock_ms`, `framework_overhead_ms`
+  - `spill_bytes`, `retry_count`, `stale_rejection_count`,
+    `cancellation_cleanup_count`
+  - skew partition counts remain observation-only for V1
 
-- **P0.11: ADR 003 telemetry residual `chore:` slice
-  scheduled.** Per ADR §"Council decisions" item 19, the
-  four ADR 003 watch counters (pulled shuffle bytes,
-  retry count, stale rejection count, cancellation cleanup
-  count) land as a separate `chore: adr 003 residual
-  telemetry — per-query tracing counters` slice **before**
-  Phase 1 features begin. The bench-row schema (P0.10)
-  composes with the same counters surfaced as tracing
-  spans.
+- **P0.11: Runtime telemetry stacked into ADR 004.** The
+  four ADR 003 watch counters (pulled shuffle bytes, retry
+  count, stale rejection count, cancellation cleanup count)
+  plus executor/join phase spans land with ADR 004 because
+  the promotion work is still staged. The bench-row schema
+  (P0.10) now emits the attribution columns ADR 005 needs.
 
 ### Phase 1 — Qualifier-aware logical IR; `JoinKind`; `JoinStrategy`
 
@@ -391,8 +403,9 @@ Work:
     `JoinStrategy::Broadcast`, the left subtree must
     terminate in the single-partition publish shape
     (`Exchange { partition_count: 1 }` or
-    `BroadcastPublish` per P0.2). If the right subtree
-    carries that shape and the left does not, reject.
+    `BroadcastPublish` per P0.2). Missing or wrong-count
+    left publish shape rejects. Any right-side publish shape,
+    including both-sides-published, rejects as ambiguous.
     The binder cannot know what the caller "meant" to
     put on the left without statistics; the check
     enforces only the caller-discipline structural
@@ -423,10 +436,12 @@ Work:
      typed error.
   6. For `Broadcast`: assert left (build) input terminates
      in `Exchange { partition_count: 1 }` (or
-     `BroadcastPublish` per P0.2). Right (probe) does not
-     need `Exchange`. If right has the single-partition
-     publish but left doesn't, reject with
-     `BroadcastBuildSidePlacement`.
+     `BroadcastPublish` per P0.2). Any plan whose left
+     input does not terminate in that single-partition
+     publish shape rejects with `BroadcastBuildSidePlacement`.
+     Right (probe) does not need `Exchange`; any right-side
+     publish shape, including both-sides-published, rejects
+     with `BroadcastBuildSidePlacement`.
   7. If broadcast input sizes statically known (scan-stats
      hint) and known-over-cap, reject with
      `BroadcastCapExceededAtBind`.
@@ -508,8 +523,10 @@ Work:
 - Build join task `TaskSpec`:
   - `HashPartitioned`: two `ShuffleConsumer` entries.
   - `Broadcast`: one `Scan` + one `ShuffleConsumer`.
-- Worker discriminates inputs by `producer_stage_id`
-  matching the bound `Join` operator's left/right subtree.
+- Hash-partitioned worker routing discriminates the two
+  shuffle inputs by `producer_stage_id` matching the bound
+  `Join` operator's left/right subtree. Broadcast routing is
+  by binding variant and is covered in Phase 7.
 - Broadcast probe scan-share assignment per P0.6: consumer
   task `w_i` reads tablets whose
   `xxh3_64(tablet_id) mod worker_count == i`.
@@ -601,7 +618,9 @@ Tests (all in-process):
 - `hash_join_with_spill_engages_at_memory_cap` —
   digest-equal to in-memory baseline.
 - `hash_join_spill_exhaustion_fails_terminal`.
-- `hash_join_memory_overrun_before_spill_init_fails_typed`.
+- `hash_join_oversized_single_row_fails_memory_typed` —
+  single serialized build row cannot fit in the spill
+  writer page-buffer memory budget.
 - `hash_spill_cache_and_index_charged_against_task_memory`
   — Phase 5 memory-accounting test: configure a fixture
   where the spilled bucket count is large enough that the
@@ -685,10 +704,13 @@ Work:
   variant**: `Scan` is probe, `ShuffleConsumer` is build.
   No `producer_stage_id` matching for the scan side
   (the scan has no upstream stage).
-- Coordinator dispatch-time cap check: compare actual
-  build manifest `size_bytes` against caps. Over-cap →
+- Coordinator dispatch-time cap check: compare actual build
+  manifest `size_bytes` against the broadcast-specific byte
+  caps. Over-cap on those caps →
   `BudgetExhausted { dimension: BroadcastReplication }`.
-  Terminal; no silent strategy switch.
+  The inherited `memory_per_task_bytes` cap remains
+  `BudgetExhausted { dimension: Memory }`. Terminal; no
+  silent strategy switch.
 - Broadcast producer-loss handler in scheduler: build
   manifest invalidated; rebuild; all probe consumers
   redispatch.
@@ -766,16 +788,16 @@ Work:
   other shape (two scans, two shuffle consumers, scan
   without share, scan with share-but-no-broadcast,
   mixed-strategy task) is a fragmenter bug. Enforced as
-  a fragmenter unit-test that snapshots `inputs` for the
-  broadcast fixture and verifies the exact shape; not
-  promoted to a code guard because it's structurally
-  enforced by the fragmenter, but the test catches
-  fragmenter regressions.
+  both a fragmenter unit-test that snapshots `inputs` for
+  the broadcast fixture and an architecture-test guard over
+  the broadcast fragmenter path.
 
 ### Phase 10 — Bench matrix and promotion
 
 Records all promotion gates in
 `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
+That artifact contains quick local smoke rows, the promotion-
+scale matrix, and the recorded soft-gate scaling miss.
 
 Files:
 - `crates/toron/benches/distributed_inner_equi_join.rs`
@@ -808,7 +830,22 @@ cargo bench --bench distributed_inner_equi_join --no-run
 cargo bench --bench distributed_inner_equi_join -- --quick \
     --distributed-inner-equi-join-only
 cargo bench --bench distributed_inner_equi_join -- \
-    --distributed-inner-equi-join-only --workers=2,4,8
+    --distributed-inner-equi-join-only --strategy=hash \
+    --workers=2,4,8 --build-rows=10000000 \
+    --probe-rows=1000000
+cargo bench --bench distributed_inner_equi_join -- \
+    --distributed-inner-equi-join-only --strategy=hash \
+    --workers=8 --build-rows=10000000 \
+    --probe-rows=10000000
+cargo bench --bench distributed_inner_equi_join -- \
+    --distributed-inner-equi-join-only --strategy=hash,broadcast \
+    --workers=8 --build-rows=1000000 \
+    --probe-rows=10000000
+cargo bench --bench distributed_inner_equi_join -- \
+    --distributed-inner-equi-join-only --strategy=hash \
+    --workers=4 \
+    --build-rows=10000000 --probe-rows=1000000 \
+    --composite-key
 cargo bench --bench distributed_inner_equi_join -- \
     --distributed-inner-equi-join-only --kill-test
 git diff --check
@@ -818,28 +855,26 @@ Suggested commit slices:
 
 1. `chore: adr 004 prep — roadmap honesty + fragmenter
    audit notes`
-2. `chore: adr 003 residual telemetry — per-query tracing
-   counters` (per ADR §"Council decisions" item 19; lands
-   before Phase 1 features)
-3. `plan: adr 004 toron distributed inner equi-join`
-4. `feat: adr 004 phase 1 — qualifier-aware ColumnRef +
+2. `plan: adr 004 toron distributed inner equi-join`
+3. `feat: adr 004 phase 1 — qualifier-aware ColumnRef +
    Join IR`
-5. `feat: adr 004 phase 2 — join binder rules`
-6. `feat: adr 004 phase 3 — multi-upstream StagePlan +
+4. `feat: adr 004 phase 2 — join binder rules`
+5. `feat: adr 004 phase 3 — multi-upstream StagePlan +
    scheduler barrier`
-7. `feat: adr 004 phase 4 — fragmenter rewrite for both
+6. `feat: adr 004 phase 4 — fragmenter rewrite for both
    strategies`
-8. `feat: adr 004 phase 5 — hash join operator + build-
+7. `feat: adr 004 phase 5 — hash join operator + build-
    side encrypted spill`
-9. `feat: adr 004 phase 6 — distributed hash-partitioned
+8. `feat: adr 004 phase 6 — distributed hash-partitioned
    integration`
-10. `feat: adr 004 phase 7 — bounded broadcast strategy`
-11. `feat: adr 004 phase 8 — failure modes + cross-replica
+9. `feat: adr 004 phase 7 — bounded broadcast strategy`
+10. `feat: adr 004 phase 8 — failure modes + cross-replica
     determinism`
-12. `feat: adr 004 phase 9 — architecture guards G16-G18`
-13. `feat: adr 004 phase 10 — bench matrix + promotion`
-    (lands `bench_results.md`; marks ADR 004 shipped on
-    roadmap)
+11. `feat: adr 004 phase 9 — architecture guards G16-G18`
+12. `feat: adr 004 phase 10 — telemetry, bench matrix +
+    promotion`
+    (updates `bench_results.md` with the full promotion
+    matrix; marks ADR 004 shipped on roadmap)
 
 Roadmap update: `plans/wip/roadmap.md` records ADR 004
 promotion; forward sequence updated with ADR 005 candidates
@@ -927,7 +962,8 @@ Planning / evidence:
 - `plans/impl/004_distributed_inner_equi_join.md`
   (this file).
 - `plans/impl/004_distributed_inner_equi_join_bench_results.md`
-  (after Phase 10 evidence).
+  (quick smoke evidence, full promotion matrix, and soft-gate
+  scaling miss).
 
 Roadmap:
 
@@ -990,8 +1026,8 @@ Out of scope (V1.x or later) — per ADR §"Deferred":
   bench records peak.
 
 - **R7: Hash-spill page size wrong.** 64 KiB may be too
-  large for narrow keys (page underfilled) or too small
-  for wide keys (many pages per bucket).
+  large for narrow rows (page underfilled) or too small
+  for wide rows / wide schemas (many pages per bucket).
   *Mitigation:* P0.9 calibration; bench records page
   utilization; tune via configuration.
 
@@ -1062,8 +1098,8 @@ Out of scope (V1.x or later) — per ADR §"Deferred":
 
 - All 11 Phase 0 pins recorded in the bench-results
   artifact.
-- Phase 0 P0.11 ADR 003 telemetry residual `chore:` slice
-  ships before Phase 1 features.
+- Phase 0 P0.11 runtime telemetry is stacked into ADR 004
+  promotion and emits bench attribution columns.
 - `LogicalPlan::Join` + `ExecutionPlan::Join` with
   `JoinKind { Inner }` and `JoinStrategy
   { HashPartitioned, Broadcast }`.

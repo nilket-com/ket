@@ -5,7 +5,7 @@ use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity, WorkerId,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
-use crate::ir::{ExecutionExpr, ExecutionPlan};
+use crate::ir::{ExecutionExpr, ExecutionPlan, TableId};
 use crate::server::spill::SpillId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -71,6 +71,58 @@ pub struct TraceContext {
 	pub trace_id: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTelemetry {
+	pub labels: TaskTelemetryLabels,
+	pub counters: TaskTelemetryCounters,
+	pub phases: TaskTelemetryPhases,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTelemetryLabels {
+	pub strategy: Option<String>,
+	pub stage_role: String,
+	pub operator_kind: String,
+	pub worker_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTelemetryCounters {
+	pub pulled_shuffle_bytes: u64,
+	pub left_shuffle_bytes: u64,
+	pub right_shuffle_bytes: u64,
+	pub published_shuffle_bytes: u64,
+	pub build_rows: u64,
+	pub probe_rows: u64,
+	pub matched_rows: u64,
+	pub emitted_rows: u64,
+	pub emitted_batches: u64,
+	pub spill_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskTelemetryPhases {
+	pub task_wall_micros: u64,
+	pub shuffle_pull_decode_micros: u64,
+	pub build_micros: u64,
+	pub probe_micros: u64,
+	pub spill_micros: u64,
+	pub output_publish_micros: u64,
+	pub task_setup_micros: u64,
+	pub batch_encode_micros: u64,
+	pub batch_send_micros: u64,
+	pub batch_decode_micros: u64,
+	pub dispatch_wait_micros: u64,
+	pub telemetry_lock_micros: u64,
+	pub framework_overhead_micros: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanShare {
+	pub worker_index: u32,
+	pub worker_count: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
 	pub identity: TaskIdentity,
@@ -84,13 +136,19 @@ pub struct TaskSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskInputBinding {
-	Scan,
+	Scan {
+		share: Option<ScanShare>,
+	},
 	ShuffleConsumer {
 		exchange_id: ExchangeId,
 		producer_stage_id: StageId,
 		partition_id: PartitionId,
 		producer_partitions: Vec<ProducerPartitionRef>,
 	},
+}
+
+pub fn shuffle_input_table_id(exchange_id: ExchangeId) -> TableId {
+	TableId(u64::MAX - u64::from(exchange_id.get()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,5 +260,20 @@ mod tests {
 
 		assert_eq!(address.attempt_id.get(), 5);
 		assert_eq!(address.partition_id.get(), 6);
+	}
+
+	#[test]
+	fn scan_share_round_trips_through_task_input_binding() {
+		let input = TaskInputBinding::Scan {
+			share: Some(ScanShare {
+				worker_index: 2,
+				worker_count: 4,
+			}),
+		};
+
+		let encoded = postcard::to_allocvec(&input).expect("encode scan share");
+		let decoded: TaskInputBinding = postcard::from_bytes(&encoded).expect("decode scan share");
+
+		assert_eq!(decoded, input);
 	}
 }

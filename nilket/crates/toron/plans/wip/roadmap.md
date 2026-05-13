@@ -25,8 +25,8 @@ along with the forward-sequence rewrite.
   Contract.** Promoted + implemented. Bench evidence at
   `plans/impl/003_distributed_runtime_bench_results.md`.
 - **ADR 004 — Distributed Inner Equi-Join Contract.**
-  Promoted at `plans/adr/004_distributed_inner_equi_join.md`;
-  pre-implementation. Phase 0 calibration runs first.
+  Promoted + implemented. Bench evidence at
+  `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -84,6 +84,13 @@ ADR 004's promotion makes the first two-input relational
 operator available alongside the ADR 003 substrate. ADR 005
 should choose the next contract surface from the bench
 evidence and the remaining V1 launch gates.
+
+Recorded ADR 004 evidence: 10M × 10M hash-partitioned join
+completed at 8 workers, broadcast and hash digests match on
+the 1M × 10M comparison fixture, and 10M × 1M worker scaling
+missed the soft target. That keeps executor model /
+scheduling overhead as the leading ADR 005 candidate unless
+launch pressure forces a narrower surface first.
 
 The five live candidates, in rough order of probable
 selection given evidence shapes the council can already
@@ -382,8 +389,8 @@ labeled by ADR cycle.
   build side is the operator-local memory hot spot.
 - **Bundling ADR 003 telemetry residual into ADR 004
   Phase 0.** Gemini iter-2 framing; rejected for commit
-  boundary cleanliness — ships as separate `chore:`
-  slice before Phase 1 features.
+  boundary cleanliness — remains a separate `chore:` slice
+  outside ADR 004 promotion.
 - **Inline broadcast payload in `StartTask`.** Considered
   as zero-extra-hop optimization; rejected because it
   conflicts with ADR 003 pull-addressing and would

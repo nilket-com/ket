@@ -229,10 +229,7 @@ mod tests {
 				projection: None,
 			}),
 			group_expr: vec![],
-			aggr_expr: vec![(
-				AggregateFunction::CountAll,
-				vec![Expr::Column("id".to_string())],
-			)],
+			aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("id")])],
 		}
 	}
 

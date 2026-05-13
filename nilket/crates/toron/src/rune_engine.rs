@@ -69,10 +69,7 @@ impl RuneDataFrame {
 			plan: LogicalPlan::Aggregate {
 				input: Box::new(self.plan),
 				group_expr: vec![],
-				aggr_expr: vec![(
-					AggregateFunction::CountAll,
-					vec![Expr::Column("count".to_string())],
-				)],
+				aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("count")])],
 			},
 		}
 	}
@@ -95,7 +92,7 @@ impl ToronContext {
 
 pub fn col(name: String) -> RuneExpr {
 	RuneExpr {
-		expr: Expr::Column(name),
+		expr: Expr::column(name),
 	}
 }
 

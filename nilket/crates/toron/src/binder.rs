@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use crate::catalog::{Catalog, TableBinding};
+use crate::catalog::{Catalog, TableBinding, TableRef};
 use crate::error::BindingError;
 use crate::ir::{
 	AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan,
-	Expr, FilterDisposition, LogicalPlan, PbcProgram, QueryProfileHint, ResolvedColumn,
-	ScalarValue, schema_for_exprs,
+	Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint,
+	ResolvedColumn, ScalarValue, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 
@@ -74,6 +74,7 @@ impl<'a> Binder<'a> {
 
 					Ok(scan_plan(binding, projection))
 				}
+				LogicalPlan::Alias { input, .. } => self.bind_plan(input).await,
 				LogicalPlan::Filter { input, predicate } => {
 					let mut input = self.bind_plan(input).await?;
 					let bound_predicate = bind_expr(predicate, &input.schema(), self.config)?;
@@ -155,7 +156,50 @@ impl<'a> Binder<'a> {
 						key,
 					})
 				}
+				LogicalPlan::Join {
+					left,
+					right,
+					kind,
+					on,
+					strategy,
+				} => self.bind_join(left, right, *kind, on, *strategy).await,
 			}
+		})
+	}
+
+	async fn bind_join(
+		&self,
+		left: &LogicalPlan,
+		right: &LogicalPlan,
+		kind: JoinKind,
+		on: &[(Expr, Expr)],
+		strategy: JoinStrategy,
+	) -> Result<ExecutionPlan, BindingError> {
+		let left_plan = self.bind_plan(left).await?;
+		let right_plan = self.bind_plan(right).await?;
+		let left_scope = Scope::from_plan(left, &left_plan.schema());
+		let right_scope = Scope::from_plan(right, &right_plan.schema());
+		let mut left_keys = Vec::new();
+		let mut right_keys = Vec::new();
+
+		for (left_expr, right_expr) in on {
+			let (left_key, right_key) =
+				bind_join_key_pair(left_expr, right_expr, &left_scope, &right_scope)?;
+			validate_join_key_types(&left_key, &right_key)?;
+			left_keys.push(left_key.ordinal);
+			right_keys.push(right_key.ordinal);
+		}
+
+		validate_strategy_shape(strategy, &left_plan, &right_plan, &left_keys, &right_keys)?;
+
+		Ok(ExecutionPlan::Join {
+			left: Box::new(left_plan),
+			right: Box::new(right_plan),
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			output_schema: join_schema(&left_scope.schema, &right_scope.schema),
 		})
 	}
 }
@@ -261,6 +305,235 @@ fn literal_is_non_null(value: &ScalarValue) -> bool {
 		ScalarValue::Float32(value) => value.is_some(),
 		ScalarValue::Float64(value) => value.is_some(),
 		ScalarValue::Utf8(value) => value.is_some(),
+	}
+}
+
+#[derive(Debug, Clone)]
+struct Scope {
+	schema: SchemaRef,
+	qualifiers: Vec<TableRef>,
+}
+
+impl Scope {
+	fn from_plan(plan: &LogicalPlan, schema: &SchemaRef) -> Self {
+		let mut qualifiers = Vec::new();
+		collect_qualifiers(plan, &mut qualifiers);
+		Self {
+			schema: schema.clone(),
+			qualifiers,
+		}
+	}
+
+	fn resolve_join_column(
+		&self,
+		column_ref: &crate::ir::ColumnRef,
+		side: &'static str,
+	) -> Result<Option<ResolvedColumn>, BindingError> {
+		if let Some(qualifier) = &column_ref.qualifier {
+			if !self
+				.qualifiers
+				.iter()
+				.any(|candidate| candidate == qualifier)
+			{
+				return Ok(None);
+			}
+			return resolve_column(&column_ref.name.0, &self.schema).map(Some);
+		}
+
+		match resolve_column(&column_ref.name.0, &self.schema) {
+			Ok(column) => Ok(Some(column)),
+			Err(BindingError::UnknownColumn { .. }) => Ok(None),
+			Err(error) => Err(error),
+		}
+		.map_err(|error| match error {
+			BindingError::AmbiguousColumn { column } => BindingError::AmbiguousColumnRef {
+				name: column,
+				found_in: vec![side.to_string()],
+			},
+			other => other,
+		})
+	}
+}
+
+fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
+	match plan {
+		LogicalPlan::Scan { .. } => {}
+		LogicalPlan::ScanNamed { table, .. } => qualifiers.push(table.clone()),
+		LogicalPlan::Alias { input, alias } => {
+			collect_qualifiers(input, qualifiers);
+			qualifiers.push(alias.clone());
+		}
+		LogicalPlan::Filter { input, .. }
+		| LogicalPlan::Project { input, .. }
+		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::Exchange { input, .. } => collect_qualifiers(input, qualifiers),
+		LogicalPlan::Join { left, right, .. } => {
+			collect_qualifiers(left, qualifiers);
+			collect_qualifiers(right, qualifiers);
+		}
+	}
+}
+
+fn bind_join_key_pair(
+	left_expr: &Expr,
+	right_expr: &Expr,
+	left_scope: &Scope,
+	right_scope: &Scope,
+) -> Result<(ResolvedColumn, ResolvedColumn), BindingError> {
+	let (left_ref, right_ref) = match (left_expr, right_expr) {
+		(Expr::Column(left_ref), Expr::Column(right_ref)) => (left_ref, right_ref),
+		(Expr::Eq(_, _), _) | (_, Expr::Eq(_, _)) => {
+			return Err(BindingError::JoinPredicateNotEqui);
+		}
+		_ => return Err(BindingError::JoinComputedKeyUnsupported),
+	};
+
+	match (
+		resolve_join_column_across(left_ref, left_scope, right_scope)?,
+		resolve_join_column_across(right_ref, left_scope, right_scope)?,
+	) {
+		(JoinColumnResolution::Left(left), JoinColumnResolution::Right(right)) => Ok((left, right)),
+		(JoinColumnResolution::Right(right), JoinColumnResolution::Left(left)) => Ok((left, right)),
+		(JoinColumnResolution::Left(_), JoinColumnResolution::Left(_))
+		| (JoinColumnResolution::Right(_), JoinColumnResolution::Right(_)) => {
+			Err(BindingError::JoinComputedKeyUnsupported)
+		}
+	}
+}
+
+enum JoinColumnResolution {
+	Left(ResolvedColumn),
+	Right(ResolvedColumn),
+}
+
+fn resolve_join_column_across(
+	column_ref: &crate::ir::ColumnRef,
+	left_scope: &Scope,
+	right_scope: &Scope,
+) -> Result<JoinColumnResolution, BindingError> {
+	let left = left_scope.resolve_join_column(column_ref, "left")?;
+	let right = right_scope.resolve_join_column(column_ref, "right")?;
+	match (left, right) {
+		(Some(left), None) => Ok(JoinColumnResolution::Left(left)),
+		(None, Some(right)) => Ok(JoinColumnResolution::Right(right)),
+		(Some(_), Some(_)) => Err(BindingError::AmbiguousColumnRef {
+			name: column_ref.name.0.clone(),
+			found_in: vec!["left".to_string(), "right".to_string()],
+		}),
+		(None, None) => {
+			if let Some(qualifier) = &column_ref.qualifier {
+				Err(BindingError::UnknownTableRef {
+					qualifier: table_name(qualifier),
+				})
+			} else {
+				Err(BindingError::UnknownColumn {
+					column: column_ref.name.0.clone(),
+				})
+			}
+		}
+	}
+}
+
+fn validate_join_key_types(
+	left: &ResolvedColumn,
+	right: &ResolvedColumn,
+) -> Result<(), BindingError> {
+	if left.data_type != right.data_type {
+		return Err(BindingError::JoinKeyTypeMismatch {
+			left_type: format!("{:?}", left.data_type),
+			right_type: format!("{:?}", right.data_type),
+		});
+	}
+	if matches!(
+		left.data_type,
+		DataType::Float16 | DataType::Float32 | DataType::Float64
+	) {
+		return Err(BindingError::JoinKeyTypeUnsupported {
+			type_name: format!("{:?}", left.data_type),
+		});
+	}
+	Ok(())
+}
+
+fn validate_strategy_shape(
+	strategy: JoinStrategy,
+	left: &ExecutionPlan,
+	right: &ExecutionPlan,
+	left_keys: &[ColumnOrdinal],
+	right_keys: &[ColumnOrdinal],
+) -> Result<(), BindingError> {
+	match strategy {
+		JoinStrategy::HashPartitioned => {
+			let Some((left_count, left_exchange_keys)) = terminal_exchange(left) else {
+				return Err(BindingError::JoinKeyExchangeMismatch);
+			};
+			let Some((right_count, right_exchange_keys)) = terminal_exchange(right) else {
+				return Err(BindingError::JoinKeyExchangeMismatch);
+			};
+			if left_count != right_count {
+				return Err(BindingError::JoinPartitionCountMismatch {
+					left: left_count,
+					right: right_count,
+				});
+			}
+			if exchange_key_ordinals(left_exchange_keys) != left_keys
+				|| exchange_key_ordinals(right_exchange_keys) != right_keys
+			{
+				return Err(BindingError::JoinKeyExchangeMismatch);
+			}
+		}
+		JoinStrategy::Broadcast => {
+			let Some((left_count, _)) = terminal_exchange(left) else {
+				return Err(BindingError::BroadcastBuildSidePlacement);
+			};
+			if left_count != 1 {
+				return Err(BindingError::BroadcastBuildSidePlacement);
+			}
+			if terminal_exchange(right).is_some() {
+				return Err(BindingError::BroadcastBuildSidePlacement);
+			}
+		}
+	}
+	Ok(())
+}
+
+fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
+	match plan {
+		ExecutionPlan::Exchange {
+			partition_count,
+			key,
+			..
+		} => Some((*partition_count, key.as_slice())),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. } => terminal_exchange(input),
+		ExecutionPlan::Scan { .. } | ExecutionPlan::Join { .. } => None,
+	}
+}
+
+fn exchange_key_ordinals(key: &[ExecutionExpr]) -> Vec<ColumnOrdinal> {
+	key.iter()
+		.filter_map(|expr| match expr {
+			ExecutionExpr::Column(column) => Some(column.ordinal),
+			_ => None,
+		})
+		.collect()
+}
+
+fn join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+	let fields = left
+		.fields()
+		.iter()
+		.chain(right.fields().iter())
+		.map(|field| field.as_ref().clone())
+		.collect::<Vec<_>>();
+	Arc::new(Schema::new(fields))
+}
+
+fn table_name(table: &TableRef) -> String {
+	match &table.schema {
+		Some(schema) => format!("{schema}.{}", table.table),
+		None => table.table.clone(),
 	}
 }
 
@@ -438,6 +711,39 @@ fn optimize_for_required(
 					key,
 				},
 				remap,
+			))
+		}
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			output_schema,
+		} => {
+			let left_len = left.schema().fields().len();
+			let right_len = right.schema().fields().len();
+			let (left, _) = optimize_for_required(*left, None)?;
+			let (right, _) = optimize_for_required(*right, None)?;
+			let output_len = left_len + right_len;
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::Join {
+					left: Box::new(left),
+					right: Box::new(right),
+					kind,
+					left_keys,
+					right_keys,
+					strategy,
+					output_schema,
+				},
+				output_remap,
 			))
 		}
 	}
@@ -644,7 +950,10 @@ fn bind_expr(
 	config: &PlannerConfig,
 ) -> Result<ExecutionExpr, BindingError> {
 	match expr {
-		Expr::Column(name) => Ok(ExecutionExpr::Column(resolve_column(name, input_schema)?)),
+		Expr::Column(column_ref) => Ok(ExecutionExpr::Column(resolve_column(
+			&column_ref.name.0,
+			input_schema,
+		)?)),
 		Expr::Literal(value) => Ok(ExecutionExpr::Literal(value.clone())),
 		Expr::Eq(left, right) => {
 			bind_comparison(input_schema, config, left, right, ExecutionExpr::Eq)
@@ -746,11 +1055,26 @@ fn require_boolean(context: &'static str, expr: &ExecutionExpr) -> Result<(), Bi
 }
 
 fn resolve_column(name: &str, input_schema: &SchemaRef) -> Result<ResolvedColumn, BindingError> {
-	let ordinal = input_schema
-		.index_of(name)
-		.map_err(|_| BindingError::UnknownColumn {
-			column: name.to_string(),
-		})?;
+	let matches = input_schema
+		.fields()
+		.iter()
+		.enumerate()
+		.filter(|(_, field)| field.name() == name)
+		.map(|(idx, _)| idx)
+		.collect::<Vec<_>>();
+	let ordinal = match matches.as_slice() {
+		[] => {
+			return Err(BindingError::UnknownColumn {
+				column: name.to_string(),
+			});
+		}
+		[ordinal] => *ordinal,
+		_ => {
+			return Err(BindingError::AmbiguousColumn {
+				column: name.to_string(),
+			});
+		}
+	};
 	let field = input_schema.field(ordinal);
 	Ok(ResolvedColumn {
 		name: ColumnName(field.name().clone()),
@@ -840,7 +1164,7 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			exprs: vec![Expr::Column("amount".to_string())],
+			exprs: vec![Expr::column("amount")],
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -881,11 +1205,11 @@ mod tests {
 					projection: None,
 				}),
 				predicate: Expr::Gt(
-					Box::new(Expr::Column("amount".to_string())),
+					Box::new(Expr::column("amount")),
 					Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 				),
 			}),
-			exprs: vec![Expr::Column("id".to_string())],
+			exprs: vec![Expr::column("id")],
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -940,7 +1264,7 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			exprs: vec![Expr::Column("missing".to_string())],
+			exprs: vec![Expr::column("missing")],
 		};
 
 		let err = bind(&plan, &catalog, &PlannerConfig::default())
@@ -962,7 +1286,7 @@ mod tests {
 			}),
 			exprs: vec![Expr::TimeBucket(
 				std::time::Duration::from_secs(60),
-				Box::new(Expr::Column("ts".to_string())),
+				Box::new(Expr::column("ts")),
 			)],
 		};
 
@@ -996,11 +1320,8 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
-			group_expr: vec![Expr::Column("region".to_string())],
-			aggr_expr: vec![(
-				AggregateFunction::Sum,
-				vec![Expr::Column("amount".to_string())],
-			)],
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
 		};
 
 		let plan = bind(&plan, &catalog, &PlannerConfig::default())
@@ -1024,7 +1345,7 @@ mod tests {
 				projection: None,
 			}),
 			predicate: Expr::Gt(
-				Box::new(Expr::Column("amount".to_string())),
+				Box::new(Expr::column("amount")),
 				Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 			),
 		};
@@ -1055,7 +1376,7 @@ mod tests {
 				projection: None,
 			}),
 			predicate: Expr::Eq(
-				Box::new(Expr::Column("id".to_string())),
+				Box::new(Expr::column("id")),
 				Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
 			),
 		};
@@ -1089,7 +1410,7 @@ mod tests {
 				projection: None,
 			}),
 			predicate: Expr::Eq(
-				Box::new(Expr::Column("amount".to_string())),
+				Box::new(Expr::column("amount")),
 				Box::new(Expr::Literal(ScalarValue::Int32(Some(7)))),
 			),
 		};
@@ -1129,12 +1450,439 @@ mod tests {
 		assert!(matches!(err, BindingError::TypeMismatch { .. }));
 	}
 
+	#[tokio::test]
+	async fn bind_hash_join_resolves_qualified_keys_and_duplicate_output_names() {
+		let catalog = join_catalog();
+		let plan = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new("orders"),
+					projection: None,
+				}),
+				partition_count: 2,
+				key: vec![Expr::qualified_column(
+					TableRef::new("orders"),
+					"customer_id",
+				)],
+			}),
+			right: Box::new(LogicalPlan::Exchange {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new("customers"),
+					projection: None,
+				}),
+				partition_count: 2,
+				key: vec![Expr::qualified_column(TableRef::new("customers"), "id")],
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let plan = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind join");
+
+		match plan {
+			ExecutionPlan::Join {
+				left_keys,
+				right_keys,
+				output_schema,
+				..
+			} => {
+				assert_eq!(left_keys, vec![ColumnOrdinal(1)]);
+				assert_eq!(right_keys, vec![ColumnOrdinal(0)]);
+				assert_eq!(output_schema.fields().len(), 4);
+				assert_eq!(output_schema.field(0).name(), "id");
+				assert_eq!(output_schema.field(2).name(), "id");
+			}
+			other => panic!("expected join, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn bind_hash_join_auto_swaps_reversed_on_pair() {
+		let catalog = join_catalog();
+		let plan = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let plan = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind join");
+
+		match plan {
+			ExecutionPlan::Join {
+				left_keys,
+				right_keys,
+				..
+			} => {
+				assert_eq!(left_keys, vec![ColumnOrdinal(1)]);
+				assert_eq!(right_keys, vec![ColumnOrdinal(0)]);
+			}
+			other => panic!("expected join, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn bind_join_rejects_ambiguous_unqualified_column() {
+		let catalog = join_catalog();
+		let plan = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(Expr::column("id"), Expr::column("id"))],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let err = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("ambiguous join key should fail");
+
+		assert!(matches!(err, BindingError::AmbiguousColumnRef { name, .. } if name == "id"));
+	}
+
+	#[tokio::test]
+	async fn bind_join_rejects_unknown_qualifier() {
+		let catalog = join_catalog();
+		let plan = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("missing"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		let err = bind(&plan, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("unknown qualifier should fail");
+
+		assert!(matches!(
+			err,
+			BindingError::UnknownTableRef { qualifier } if qualifier == "missing"
+		));
+	}
+
+	#[tokio::test]
+	async fn bind_join_rejects_non_equi_and_computed_keys() {
+		let catalog = join_catalog();
+		let non_equi = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::Eq(
+					Box::new(Expr::qualified_column(
+						TableRef::new("orders"),
+						"customer_id",
+					)),
+					Box::new(Expr::qualified_column(TableRef::new("customers"), "id")),
+				),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+		let computed = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::Literal(ScalarValue::Int64(Some(7))),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		assert!(matches!(
+			bind(&non_equi, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("non-equi should fail"),
+			BindingError::JoinPredicateNotEqui
+		));
+		assert!(matches!(
+			bind(&computed, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("computed key should fail"),
+			BindingError::JoinComputedKeyUnsupported
+		));
+	}
+
+	#[tokio::test]
+	async fn bind_join_rejects_key_type_mismatch_and_float_keys() {
+		let catalog = join_catalog();
+		let mismatch = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "region", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "region"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		assert!(matches!(
+			bind(&mismatch, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("type mismatch should fail"),
+			BindingError::JoinKeyTypeMismatch { .. }
+		));
+
+		let catalog = float_join_catalog();
+		let float_key = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("left_floats", "f", 2)),
+			right: Box::new(exchanged_named_scan("right_floats", "f", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("left_floats"), "f"),
+				Expr::qualified_column(TableRef::new("right_floats"), "f"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		assert!(matches!(
+			bind(&float_key, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("float key should fail"),
+			BindingError::JoinKeyTypeUnsupported { .. }
+		));
+	}
+
+	#[tokio::test]
+	async fn bind_join_rejects_exchange_partition_and_key_shape_mismatches() {
+		let catalog = join_catalog();
+		let partition_mismatch = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "customer_id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 3)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+		let key_mismatch = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("orders", "id", 2)),
+			right: Box::new(exchanged_named_scan("customers", "id", 2)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::HashPartitioned,
+		};
+
+		assert!(matches!(
+			bind(&partition_mismatch, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("partition mismatch should fail"),
+			BindingError::JoinPartitionCountMismatch { left: 2, right: 3 }
+		));
+		assert!(matches!(
+			bind(&key_mismatch, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("exchange key mismatch should fail"),
+			BindingError::JoinKeyExchangeMismatch
+		));
+	}
+
+	#[tokio::test]
+	async fn bind_broadcast_join_enforces_left_single_partition_build() {
+		let catalog = join_catalog();
+		let plan = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("customers", "id", 1)),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		};
+
+		assert!(matches!(
+			bind(&plan, &catalog, &PlannerConfig::default())
+				.await
+				.expect("bind broadcast"),
+			ExecutionPlan::Join {
+				strategy: JoinStrategy::Broadcast,
+				..
+			}
+		));
+
+		let wrong_side = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			right: Box::new(exchanged_named_scan("customers", "id", 1)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		};
+
+		assert!(matches!(
+			bind(&wrong_side, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("right-side publish must fail"),
+			BindingError::BroadcastBuildSidePlacement
+		));
+	}
+
+	#[tokio::test]
+	async fn bind_broadcast_join_rejects_all_malformed_publish_shapes() {
+		let catalog = join_catalog();
+		let missing_left_publish = LogicalPlan::Join {
+			left: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		};
+		let wrong_left_partition_count = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("customers", "id", 4)),
+			right: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		};
+		let both_sides_published = LogicalPlan::Join {
+			left: Box::new(exchanged_named_scan("customers", "id", 1)),
+			right: Box::new(exchanged_named_scan("orders", "customer_id", 1)),
+			kind: JoinKind::Inner,
+			on: vec![(
+				Expr::qualified_column(TableRef::new("customers"), "id"),
+				Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			)],
+			strategy: JoinStrategy::Broadcast,
+		};
+
+		for plan in [
+			missing_left_publish,
+			wrong_left_partition_count,
+			both_sides_published,
+		] {
+			assert!(matches!(
+				bind(&plan, &catalog, &PlannerConfig::default())
+					.await
+					.expect_err("malformed broadcast shape must fail"),
+				BindingError::BroadcastBuildSidePlacement
+			));
+		}
+	}
+
 	fn catalog() -> MockCatalog {
 		let mut catalog = MockCatalog::new();
 		catalog
 			.register_descriptor(TableId(1), descriptor())
 			.expect("register descriptor");
 		catalog
+	}
+
+	fn join_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(1),
+				named_descriptor(
+					1,
+					"orders",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("customer_id", DataType::Int64, false),
+					]),
+				),
+			)
+			.expect("register orders");
+		catalog
+			.register_descriptor(
+				TableId(2),
+				named_descriptor(
+					2,
+					"customers",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("region", DataType::Utf8, true),
+					]),
+				),
+			)
+			.expect("register customers");
+		catalog
+	}
+
+	fn float_join_catalog() -> MockCatalog {
+		let mut catalog = MockCatalog::new();
+		catalog
+			.register_descriptor(
+				TableId(11),
+				named_descriptor(
+					11,
+					"left_floats",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("f", DataType::Float64, false),
+					]),
+				),
+			)
+			.expect("register left floats");
+		catalog
+			.register_descriptor(
+				TableId(12),
+				named_descriptor(
+					12,
+					"right_floats",
+					Schema::new(vec![
+						Field::new("id", DataType::Int64, false),
+						Field::new("f", DataType::Float64, false),
+					]),
+				),
+			)
+			.expect("register right floats");
+		catalog
+	}
+
+	fn exchanged_named_scan(table: &str, key: &str, partition_count: u32) -> LogicalPlan {
+		LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new(table),
+				projection: None,
+			}),
+			partition_count,
+			key: vec![Expr::qualified_column(TableRef::new(table), key)],
+		}
 	}
 
 	fn descriptor() -> TableSchemaDescriptor {
@@ -1150,6 +1898,20 @@ mod tests {
 			1,
 			"default",
 			"sales",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect("descriptor")
+	}
+
+	fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
+			TableObjectId::new([id_byte; 16]),
+			1,
+			"default",
+			table,
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 			LocalityPolicy::default_table_spread(),

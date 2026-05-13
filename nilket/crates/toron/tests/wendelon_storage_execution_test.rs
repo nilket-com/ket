@@ -101,12 +101,12 @@ async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 			predicate: Expr::Eq(
 				Box::new(Expr::TimeBucket(
 					Duration::from_millis(HOUR_MS as u64),
-					Box::new(Expr::Column("ts".to_string())),
+					Box::new(Expr::column("ts")),
 				)),
 				Box::new(Expr::Literal(ScalarValue::Int64(Some(BASE_TS)))),
 			),
 		}),
-		exprs: vec![Expr::Column("id".to_string())],
+		exprs: vec![Expr::column("id")],
 	};
 	let config = PlannerConfig {
 		allow_experimental_kernels: true,
@@ -136,16 +136,10 @@ async fn wendelon_grouped_aggregate_matches_in_memory_baseline() {
 			table: TableId(1),
 			projection: None,
 		}),
-		group_expr: vec![Expr::Column("region".to_string())],
+		group_expr: vec![Expr::column("region")],
 		aggr_expr: vec![
-			(
-				AggregateFunction::Sum,
-				vec![Expr::Column("amount".to_string())],
-			),
-			(
-				AggregateFunction::Count,
-				vec![Expr::Column("amount".to_string())],
-			),
+			(AggregateFunction::Sum, vec![Expr::column("amount")]),
+			(AggregateFunction::Count, vec![Expr::column("amount")]),
 			(AggregateFunction::CountAll, vec![]),
 		],
 	};
@@ -189,11 +183,11 @@ async fn query_ids_gt(
 				projection: None,
 			}),
 			predicate: Expr::Gt(
-				Box::new(Expr::Column("amount".to_string())),
+				Box::new(Expr::column("amount")),
 				Box::new(Expr::Literal(ScalarValue::Int32(Some(threshold)))),
 			),
 		}),
-		exprs: vec![Expr::Column("id".to_string())],
+		exprs: vec![Expr::column("id")],
 	};
 	let bound = bind(&plan, &catalog, &PlannerConfig::default())
 		.await
@@ -287,6 +281,10 @@ fn assert_scan_has_no_pbc(plan: &ExecutionPlan) {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. } => assert_scan_has_no_pbc(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			assert_scan_has_no_pbc(left);
+			assert_scan_has_no_pbc(right);
+		}
 	}
 }
 

@@ -1,5 +1,6 @@
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use toron::binder::{PlannerConfig, bind};
-use toron::catalog::MockCatalog;
+use toron::catalog::{MockCatalog, TableRef};
 use toron::coordinator::DistributedQueryCoordinator;
 use toron::distributed::budget::{ByteCount, DurationMillis, QueryBudget, TaskBudget};
 use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
@@ -19,7 +20,7 @@ use toron::distributed::worker_registry::{
 	ActiveTaskCount, PlacementHints, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEndpoint,
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
-use toron::ir::{AggregateFunction, Expr, LogicalPlan, TableId};
+use toron::ir::{AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, TableId};
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
 use wendelon::schema::{
@@ -185,6 +186,13 @@ struct ProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+#[derive(Debug)]
+struct JoinProcessRun {
+	digest: toron::distributed::task::ArrowIpcDigest,
+	row_count: usize,
+	selected_workers: Vec<WorkerId>,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_process_distributed_query_digest_is_canonical() {
 	let first = run_process_query(100, 0).await;
@@ -232,6 +240,75 @@ async fn producer_process_kill_replays_attempt_and_matches_baseline_digest() {
 	);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_join_producer_process_kill_replays_attempt_and_matches_baseline_digest() {
+	let baseline = run_hash_join_process_query(500, 0).await;
+	let left_killed = run_hash_join_producer_kill_query(600, 0).await;
+	let right_killed = run_hash_join_producer_kill_query(700, 1).await;
+
+	assert_eq!(baseline.row_count, 3);
+	assert_eq!(left_killed.row_count, 3);
+	assert_eq!(right_killed.row_count, 3);
+	assert_eq!(left_killed.digest, baseline.digest);
+	assert_eq!(right_killed.digest, baseline.digest);
+	assert_eq!(
+		left_killed
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+	assert_eq!(
+		right_killed
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
+	let baseline = run_broadcast_join_process_query(800).await;
+	let killed = run_broadcast_join_build_kill_query(900).await;
+
+	assert_eq!(baseline.row_count, 3);
+	assert_eq!(killed.row_count, 3);
+	assert_eq!(killed.digest, baseline.digest);
+	assert_eq!(
+		killed
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_join_worker_process_loss_retries_join_task_and_matches_baseline_digest() {
+	let baseline = run_hash_join_single_partition_process_query(1000).await;
+	let killed = run_hash_join_worker_loss_query(1100).await;
+
+	assert_eq!(baseline.row_count, 3);
+	assert_eq!(killed.row_count, 3);
+	assert_eq!(killed.digest, baseline.digest);
+	assert_eq!(
+		killed
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		3
+	);
+}
+
 async fn run_process_query(worker_id_base: u128, start_offset: usize) -> ProcessRun {
 	let mut workers = vec![
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
@@ -265,6 +342,259 @@ async fn run_process_query(worker_id_base: u128, start_offset: usize) -> Process
 		total_count,
 		selected_workers: registry.selected_workers(),
 	}
+}
+
+async fn run_hash_join_process_query(worker_id_base: u128, start_offset: usize) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+
+	let results = coordinator
+		.execute_query(&hash_join_plan())
+		.await
+		.expect("hash join query");
+	let run = join_process_run(results, registry.selected_workers());
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	run
+}
+
+async fn run_hash_join_producer_kill_query(
+	worker_id_base: u128,
+	killed_stage_index: usize,
+) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let memory = Arc::new(MemoryManager::new(64, 1024 * 1024));
+	let bound = bind(
+		&hash_join_plan(),
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind hash join");
+	let stages = fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment hash join");
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(memory, TcpTransport::new());
+
+	scheduler
+		.dispatch_loop(&stages[..=killed_stage_index], &mut dispatcher)
+		.await
+		.expect("producer stages");
+
+	let selected = registry.selected_workers();
+	let killed_worker_id = selected[killed_stage_index];
+	let killed_worker = workers
+		.iter_mut()
+		.find(|worker| worker.worker_id == killed_worker_id)
+		.expect("killed worker");
+	killed_worker.shutdown().await;
+	let invalidated = scheduler.mark_worker_lost(killed_worker_id);
+	assert_eq!(invalidated.producers.len(), 1);
+	assert_eq!(
+		invalidated.producers[0].invalidated_attempt,
+		AttemptId::first()
+	);
+	assert_eq!(
+		invalidated.producers[0].replacement_attempt,
+		AttemptId::new(1)
+	);
+
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("replacement dispatch");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		if worker.worker_id != killed_worker_id {
+			worker.shutdown().await;
+		}
+	}
+	result
+}
+
+async fn run_broadcast_join_process_query(worker_id_base: u128) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let stages = broadcast_join_stages().await;
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		TcpTransport::new(),
+	);
+
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("broadcast join");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	result
+}
+
+async fn run_broadcast_join_build_kill_query(worker_id_base: u128) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let stages = broadcast_join_stages().await;
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		TcpTransport::new(),
+	);
+
+	scheduler
+		.dispatch_loop(&stages[..1], &mut dispatcher)
+		.await
+		.expect("broadcast build stage");
+	let killed_worker_id = registry.selected_workers()[0];
+	let killed_worker = workers
+		.iter_mut()
+		.find(|worker| worker.worker_id == killed_worker_id)
+		.expect("killed worker");
+	killed_worker.shutdown().await;
+	let invalidated = scheduler.mark_worker_lost(killed_worker_id);
+	assert_eq!(invalidated.producers.len(), 1);
+	assert_eq!(
+		invalidated.producers[0].invalidated_attempt,
+		AttemptId::first()
+	);
+	assert_eq!(
+		invalidated.producers[0].replacement_attempt,
+		AttemptId::new(1)
+	);
+
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("broadcast replacement dispatch");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		if worker.worker_id != killed_worker_id {
+			worker.shutdown().await;
+		}
+	}
+	result
+}
+
+async fn run_hash_join_single_partition_process_query(worker_id_base: u128) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 2)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let stages = hash_join_stages(hash_join_plan_with_partitions(1)).await;
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		TcpTransport::new(),
+	);
+
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("single-partition hash join");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	result
+}
+
+async fn run_hash_join_worker_loss_query(worker_id_base: u128) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 2)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(workers.iter().map(worker_entry), 0));
+	let stages = hash_join_stages(hash_join_plan_with_partitions(1)).await;
+	let mut scheduler = DistributedScheduler::new(registry.clone());
+	let mut dispatcher = NetworkTaskDispatcher::new(
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		TcpTransport::new(),
+	);
+
+	scheduler
+		.dispatch_loop(&stages[..2], &mut dispatcher)
+		.await
+		.expect("hash join producers");
+	let first_join_run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("first join dispatch");
+	assert_eq!(
+		first_join_run
+			.final_results
+			.iter()
+			.map(RecordBatch::num_rows)
+			.sum::<usize>(),
+		3
+	);
+	let join_worker_id = registry
+		.selected_workers()
+		.last()
+		.copied()
+		.expect("join worker selected");
+	let join_worker = workers
+		.iter_mut()
+		.find(|worker| worker.worker_id == join_worker_id)
+		.expect("join worker");
+	join_worker.shutdown().await;
+	let invalidated = scheduler.mark_worker_lost(join_worker_id);
+	assert_eq!(invalidated.producers.len(), 1);
+	assert_eq!(
+		invalidated.producers[0].invalidated_attempt,
+		AttemptId::first()
+	);
+	assert_eq!(
+		invalidated.producers[0].replacement_attempt,
+		AttemptId::new(1)
+	);
+
+	let run = scheduler
+		.dispatch_loop(&stages, &mut dispatcher)
+		.await
+		.expect("replacement join dispatch");
+	let result = join_process_run(run.final_results, registry.selected_workers());
+	for worker in &mut workers {
+		if worker.worker_id != join_worker_id {
+			worker.shutdown().await;
+		}
+	}
+	result
 }
 
 async fn run_producer_kill_query(worker_id_base: u128) -> ProcessRun {
@@ -325,16 +655,108 @@ async fn run_producer_kill_query(worker_id_base: u128) -> ProcessRun {
 	}
 }
 
+async fn broadcast_join_stages() -> Vec<toron::distributed::scheduler::StagePlan> {
+	let bound = bind(
+		&broadcast_join_plan(),
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind broadcast join");
+	fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		)
+		.with_worker_count(2),
+	)
+	.expect("fragment broadcast join")
+}
+
+async fn hash_join_stages(plan: LogicalPlan) -> Vec<toron::distributed::scheduler::StagePlan> {
+	let bound = bind(
+		&plan,
+		join_process_catalog().as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind hash join");
+	fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		)
+		.with_worker_count(2),
+	)
+	.expect("fragment hash join")
+}
+
+fn hash_join_plan() -> LogicalPlan {
+	hash_join_plan_with_partitions(2)
+}
+
+fn hash_join_plan_with_partitions(partition_count: u32) -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			partition_count,
+			key: vec![Expr::qualified_column(
+				TableRef::new("orders"),
+				"customer_id",
+			)],
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("orders"),
+				projection: None,
+			}),
+		}),
+		right: Box::new(LogicalPlan::Exchange {
+			partition_count,
+			key: vec![Expr::qualified_column(TableRef::new("customers"), "id")],
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+		)],
+		strategy: JoinStrategy::HashPartitioned,
+	}
+}
+
+fn broadcast_join_plan() -> LogicalPlan {
+	LogicalPlan::Join {
+		left: Box::new(LogicalPlan::Exchange {
+			partition_count: 1,
+			key: vec![Expr::qualified_column(TableRef::new("customers"), "id")],
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("customers"),
+				projection: None,
+			}),
+		}),
+		right: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("orders"),
+			projection: None,
+		}),
+		kind: JoinKind::Inner,
+		on: vec![(
+			Expr::qualified_column(TableRef::new("customers"), "id"),
+			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
+		)],
+		strategy: JoinStrategy::Broadcast,
+	}
+}
+
 fn group_count_after_exchange_plan() -> LogicalPlan {
 	LogicalPlan::Aggregate {
-		group_expr: vec![Expr::Column("val".to_string())],
-		aggr_expr: vec![(
-			AggregateFunction::CountAll,
-			vec![Expr::Column("val".to_string())],
-		)],
+		group_expr: vec![Expr::column("val")],
+		aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 		input: Box::new(LogicalPlan::Exchange {
 			partition_count: 2,
-			key: vec![Expr::Column("val".to_string())],
+			key: vec![Expr::column("val")],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,
@@ -345,6 +767,16 @@ fn group_count_after_exchange_plan() -> LogicalPlan {
 
 fn run_digest(run: &SchedulerRun) -> toron::distributed::task::ArrowIpcDigest {
 	canonical_arrow_ipc_digest(&run.final_results, SortPolicy::FullRowLex).expect("digest")
+}
+
+fn join_process_run(results: Vec<RecordBatch>, selected_workers: Vec<WorkerId>) -> JoinProcessRun {
+	let row_count = results.iter().map(RecordBatch::num_rows).sum();
+	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::FullRowLex).expect("digest");
+	JoinProcessRun {
+		digest,
+		row_count,
+		selected_workers,
+	}
 }
 
 fn sum_counts(results: &[arrow::record_batch::RecordBatch]) -> i64 {
@@ -391,6 +823,37 @@ fn test_catalog() -> Arc<MockCatalog> {
 	Arc::new(catalog)
 }
 
+fn join_process_catalog() -> Arc<MockCatalog> {
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(
+			TableId(2),
+			named_descriptor(
+				2,
+				"orders",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("customer_id", DataType::Int64, false),
+				]),
+			),
+		)
+		.expect("register orders");
+	catalog
+		.register_descriptor(
+			TableId(3),
+			named_descriptor(
+				3,
+				"customers",
+				Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("region", DataType::Utf8, true),
+				]),
+			),
+		)
+		.expect("register customers");
+	Arc::new(catalog)
+}
+
 fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 	TableSchemaDescriptor::new(
 		TableObjectId::new([1; 16]),
@@ -399,6 +862,20 @@ fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 		"fixture",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("val")),
+		LocalityPolicy::default_table_spread(),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.expect("descriptor")
+}
+
+fn named_descriptor(id_byte: u8, table: &str, schema: Schema) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new(
+		TableObjectId::new([id_byte; 16]),
+		1,
+		"default",
+		table,
+		&schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
 		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

@@ -339,14 +339,11 @@ impl WorkerRegistry for RoundRobinRegistry {
 
 fn group_count_after_exchange_plan(partition_count: u32) -> LogicalPlan {
 	LogicalPlan::Aggregate {
-		group_expr: vec![Expr::Column("val".to_string())],
-		aggr_expr: vec![(
-			AggregateFunction::CountAll,
-			vec![Expr::Column("val".to_string())],
-		)],
+		group_expr: vec![Expr::column("val")],
+		aggr_expr: vec![(AggregateFunction::CountAll, vec![Expr::column("val")])],
 		input: Box::new(LogicalPlan::Exchange {
 			partition_count,
-			key: vec![Expr::Column("val".to_string())],
+			key: vec![Expr::column("val")],
 			input: Box::new(LogicalPlan::Scan {
 				table: TableId(1),
 				projection: None,

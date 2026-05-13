@@ -73,6 +73,33 @@ pub enum BindingError {
 	UnknownColumn { column: String },
 	#[error("ambiguous column: {column}")]
 	AmbiguousColumn { column: String },
+	#[error("ambiguous column reference: {name}")]
+	AmbiguousColumnRef { name: String, found_in: Vec<String> },
+	#[error("unknown table reference: {qualifier}")]
+	UnknownTableRef { qualifier: String },
+	#[error("join predicate is not an equality predicate")]
+	JoinPredicateNotEqui,
+	#[error("join key type mismatch: left {left_type}, right {right_type}")]
+	JoinKeyTypeMismatch {
+		left_type: String,
+		right_type: String,
+	},
+	#[error("unsupported join key type: {type_name}")]
+	JoinKeyTypeUnsupported { type_name: String },
+	#[error("computed join keys are not supported")]
+	JoinComputedKeyUnsupported,
+	#[error("join exchange partition count mismatch: left {left}, right {right}")]
+	JoinPartitionCountMismatch { left: u32, right: u32 },
+	#[error("join exchange keys do not match join keys")]
+	JoinKeyExchangeMismatch,
+	#[error("broadcast join build side must be the left published input")]
+	BroadcastBuildSidePlacement,
+	#[error("broadcast cap exceeded at bind for {dimension}: estimated {estimated}, cap {cap}")]
+	BroadcastCapExceededAtBind {
+		dimension: String,
+		estimated: u64,
+		cap: u64,
+	},
 	#[error("type mismatch: {message}")]
 	TypeMismatch { message: String },
 	#[error("experimental kernel is not enabled: {kernel}")]
@@ -123,6 +150,12 @@ pub enum ExecutionError {
 	InvalidExpression { message: String },
 	#[error("kernel error: {message}")]
 	Kernel { message: String },
+	#[error("budget exhausted: {dimension:?}, requested {requested:?}, available {available:?}")]
+	BudgetExhausted {
+		dimension: crate::distributed::budget::BudgetDimension,
+		requested: crate::distributed::budget::ByteCount,
+		available: crate::distributed::budget::ByteCount,
+	},
 }
 
 #[derive(Debug, Error)]

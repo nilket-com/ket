@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "distributed_runtime"
 harness = false
+
+[[bench]]
+name = "distributed_inner_equi_join"
+harness = false

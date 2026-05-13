@@ -49,6 +49,7 @@ pub enum BudgetDimension {
 	Memory,
 	ShuffleBytes,
 	SpillBytes,
+	BroadcastReplication,
 	BytesInFlightPerQuery,
 	BytesInFlightPerWorkerStream,
 	FrameSize,
@@ -67,6 +68,8 @@ pub struct QueryBudget {
 	pub memory_per_task: ByteCount,
 	pub shuffle_bytes_published_per_task: ByteCount,
 	pub spill_bytes_reserved_per_query: ByteCount,
+	pub broadcast_build_bytes_per_task: ByteCount,
+	pub broadcast_replicated_bytes_per_query: ByteCount,
 	pub max_arrow_ipc_frame: FrameByteLen,
 	pub cancellation_grace: DurationMillis,
 }
@@ -79,6 +82,8 @@ impl QueryBudget {
 			memory_per_task: ByteCount::new(64 * 1024 * 1024),
 			shuffle_bytes_published_per_task: ByteCount::new(64 * 1024 * 1024),
 			spill_bytes_reserved_per_query: ByteCount::new(512 * 1024 * 1024),
+			broadcast_build_bytes_per_task: ByteCount::new(64 * 1024 * 1024),
+			broadcast_replicated_bytes_per_query: ByteCount::new(1024 * 1024 * 1024),
 			max_arrow_ipc_frame: FrameByteLen::from_u32(16 * 1024 * 1024),
 			cancellation_grace: DurationMillis::new(1_000),
 		}
@@ -95,6 +100,9 @@ impl Default for QueryBudget {
 pub struct TaskBudget {
 	pub memory: ByteCount,
 	pub shuffle_bytes: ByteCount,
+	pub broadcast_build_bytes: ByteCount,
+	pub broadcast_replicated_bytes: ByteCount,
+	pub spill_bytes: ByteCount,
 	pub max_arrow_ipc_frame: FrameByteLen,
 }
 
@@ -103,6 +111,9 @@ impl TaskBudget {
 		Self {
 			memory: query.memory_per_task,
 			shuffle_bytes: query.shuffle_bytes_published_per_task,
+			broadcast_build_bytes: query.broadcast_build_bytes_per_task,
+			broadcast_replicated_bytes: query.broadcast_replicated_bytes_per_query,
+			spill_bytes: query.spill_bytes_reserved_per_query,
 			max_arrow_ipc_frame: query.max_arrow_ipc_frame,
 		}
 	}
@@ -126,6 +137,7 @@ struct BudgetState {
 	memory_used: ByteCount,
 	shuffle_used: ByteCount,
 	spill_used: ByteCount,
+	broadcast_replication_used: ByteCount,
 	bytes_in_flight_per_query_used: ByteCount,
 	bytes_in_flight_per_worker_stream_used: ByteCount,
 }
@@ -138,6 +150,7 @@ impl BudgetTracker {
 				memory_used: ByteCount::ZERO,
 				shuffle_used: ByteCount::ZERO,
 				spill_used: ByteCount::ZERO,
+				broadcast_replication_used: ByteCount::ZERO,
 				bytes_in_flight_per_query_used: ByteCount::ZERO,
 				bytes_in_flight_per_worker_stream_used: ByteCount::ZERO,
 			})),
@@ -218,6 +231,9 @@ impl BudgetState {
 			BudgetDimension::Memory => self.budget.memory_per_task,
 			BudgetDimension::ShuffleBytes => self.budget.shuffle_bytes_published_per_task,
 			BudgetDimension::SpillBytes => self.budget.spill_bytes_reserved_per_query,
+			BudgetDimension::BroadcastReplication => {
+				self.budget.broadcast_replicated_bytes_per_query
+			}
 			BudgetDimension::BytesInFlightPerQuery => self.budget.bytes_in_flight_per_query,
 			BudgetDimension::BytesInFlightPerWorkerStream => {
 				self.budget.bytes_in_flight_per_worker_stream
@@ -233,6 +249,7 @@ impl BudgetState {
 			BudgetDimension::Memory => self.memory_used,
 			BudgetDimension::ShuffleBytes => self.shuffle_used,
 			BudgetDimension::SpillBytes => self.spill_used,
+			BudgetDimension::BroadcastReplication => self.broadcast_replication_used,
 			BudgetDimension::BytesInFlightPerQuery => self.bytes_in_flight_per_query_used,
 			BudgetDimension::BytesInFlightPerWorkerStream => {
 				self.bytes_in_flight_per_worker_stream_used
@@ -262,6 +279,7 @@ impl BudgetState {
 			BudgetDimension::Memory => &mut self.memory_used,
 			BudgetDimension::ShuffleBytes => &mut self.shuffle_used,
 			BudgetDimension::SpillBytes => &mut self.spill_used,
+			BudgetDimension::BroadcastReplication => &mut self.broadcast_replication_used,
 			BudgetDimension::BytesInFlightPerQuery => &mut self.bytes_in_flight_per_query_used,
 			BudgetDimension::BytesInFlightPerWorkerStream => {
 				&mut self.bytes_in_flight_per_worker_stream_used

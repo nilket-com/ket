@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -7,7 +8,7 @@ use crate::distributed::budget::DurationMillis;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, WorkerId};
 use crate::distributed::task::{
 	PartitionAddress, PartitionManifest, ProducerPartitionRef, RetryPolicy, TaskCompletionOutput,
-	TaskInputBinding, TaskSpec,
+	TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry,
 };
 use crate::distributed::task_state::{
 	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
@@ -20,7 +21,7 @@ use crate::error::TaskFailureKind;
 #[derive(Debug, Clone)]
 pub struct StagePlan {
 	pub stage_id: StageId,
-	pub upstream_stage: Option<StageId>,
+	pub upstream_stages: Vec<StageId>,
 	pub tasks: Vec<TaskPlan>,
 }
 
@@ -51,7 +52,16 @@ pub enum DispatchOutcome {
 		output: TaskCompletionOutput,
 		batches: Vec<RecordBatch>,
 	},
+	CompletedWithTelemetry {
+		output: TaskCompletionOutput,
+		batches: Vec<RecordBatch>,
+		telemetry: TaskTelemetry,
+	},
 	Failed(TaskFailureKind),
+	FailedWithTelemetry {
+		kind: TaskFailureKind,
+		telemetry: TaskTelemetry,
+	},
 }
 
 #[derive(Debug)]
@@ -59,6 +69,15 @@ pub struct SchedulerRun {
 	pub dispatched: Vec<TaskIdentity>,
 	pub accepted_manifests: HashMap<TaskKey, PartitionManifest>,
 	pub final_results: Vec<RecordBatch>,
+	pub telemetry: SchedulerTelemetry,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchedulerTelemetry {
+	pub task_telemetry: Vec<TaskTelemetry>,
+	pub retry_count: u64,
+	pub stale_rejection_count: u64,
+	pub cancellation_cleanup_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +100,7 @@ pub struct DistributedScheduler<Registry> {
 	state: TaskStateStore,
 	accepted_manifests: HashMap<TaskKey, PartitionManifest>,
 	task_dependencies: HashMap<TaskKey, Vec<PartitionAddress>>,
+	telemetry: SchedulerTelemetry,
 }
 
 impl<Registry> DistributedScheduler<Registry>
@@ -93,6 +113,7 @@ where
 			state: TaskStateStore::new(),
 			accepted_manifests: HashMap::new(),
 			task_dependencies: HashMap::new(),
+			telemetry: SchedulerTelemetry::default(),
 		}
 	}
 
@@ -139,7 +160,12 @@ where
 			.retain(|key, _| key.query_id != query_id);
 		self.task_dependencies
 			.retain(|key, _| key.query_id != query_id);
-		self.state.cancel_query(query_id)
+		let cancelled = self.state.cancel_query(query_id);
+		self.telemetry.cancellation_cleanup_count = self
+			.telemetry
+			.cancellation_cleanup_count
+			.saturating_add(u64::try_from(cancelled.get()).unwrap_or(u64::MAX));
+		cancelled
 	}
 
 	pub async fn dispatch_loop<D>(
@@ -160,7 +186,7 @@ where
 			let mut blocked_stages = BTreeSet::new();
 
 			for stage in stages {
-				if !self.stage_barrier_open(stage.upstream_stage, stages) {
+				if !self.stage_barrier_open(&stage.upstream_stages, stages) {
 					blocked_stages.insert(stage.stage_id);
 					continue;
 				}
@@ -176,6 +202,15 @@ where
 							self.state
 								.reopen_invalidated(key)
 								.map_err(|err| SchedulerError::Acceptance(format!("{err:?}")))?
+						}
+						AcceptanceState::LiveAccepted { .. }
+							if matches!(
+								task.spec.output,
+								TaskOutputBinding::ShuffleProducer { .. }
+							) =>
+						{
+							completed_tasks.insert(key);
+							continue;
 						}
 						AcceptanceState::LiveAccepted { .. }
 						| AcceptanceState::Failed { .. }
@@ -215,7 +250,11 @@ where
 							.set_attempt_state(spec.identity, AttemptState::Running { worker_id });
 						dispatched.push(spec.identity);
 
-						match dispatcher.dispatch(&worker, &spec).await {
+						let dispatch_started = Instant::now();
+						let outcome = dispatcher.dispatch(&worker, &spec).await;
+						let dispatch_wait_micros = duration_micros(dispatch_started);
+
+						match outcome {
 							DispatchOutcome::Completed(output) => {
 								self.accept_dispatch_completion(
 									&spec,
@@ -244,11 +283,68 @@ where
 								progressed = true;
 								break;
 							}
+							DispatchOutcome::CompletedWithTelemetry {
+								output,
+								batches,
+								mut telemetry,
+							} => {
+								telemetry.phases.dispatch_wait_micros = telemetry
+									.phases
+									.dispatch_wait_micros
+									.saturating_add(dispatch_wait_micros);
+								self.telemetry.task_telemetry.push(telemetry);
+								self.accept_dispatch_completion(
+									&spec,
+									worker_id,
+									key,
+									output,
+									batches,
+									&mut final_results,
+								)?;
+								self.refresh_drained_producers(stages);
+								completed_tasks.insert(key);
+								progressed = true;
+								break;
+							}
 							DispatchOutcome::Failed(kind) => {
+								self.record_dispatch_failure(&kind);
 								let retryable = failure_retryable(&kind);
 								if retryable
 									&& attempts_spawned < task.retry_policy.max_attempts.get()
 								{
+									self.telemetry.retry_count =
+										self.telemetry.retry_count.saturating_add(1);
+									self.state.set_attempt_state(
+										spec.identity,
+										AttemptState::FailedRetryable { kind },
+									);
+									attempt_id = attempt_id.next();
+									continue;
+								}
+
+								self.state.set_attempt_state(
+									spec.identity,
+									AttemptState::FailedTerminal { kind: kind.clone() },
+								);
+								self.state.fail_task(key, kind.clone());
+								return Err(SchedulerError::TaskFailed { key, kind });
+							}
+							DispatchOutcome::FailedWithTelemetry {
+								kind,
+								mut telemetry,
+							} => {
+								telemetry.phases.dispatch_wait_micros = telemetry
+									.phases
+									.dispatch_wait_micros
+									.saturating_add(dispatch_wait_micros);
+								self.telemetry.task_telemetry.push(telemetry);
+								self.record_dispatch_failure(&kind);
+								let retryable = failure_retryable(&kind);
+								if retryable
+									&& attempts_spawned < task.retry_policy.max_attempts.get()
+								{
+									self.telemetry.retry_count =
+										self.telemetry.retry_count.saturating_add(1);
 									self.state.set_attempt_state(
 										spec.identity,
 										AttemptState::FailedRetryable { kind },
@@ -280,7 +376,15 @@ where
 			dispatched,
 			accepted_manifests: self.accepted_manifests.clone(),
 			final_results,
+			telemetry: self.telemetry.clone(),
 		})
+	}
+
+	fn record_dispatch_failure(&mut self, kind: &TaskFailureKind) {
+		if task_failure_is_stale_rejection(kind) {
+			self.telemetry.stale_rejection_count =
+				self.telemetry.stale_rejection_count.saturating_add(1);
+		}
 	}
 
 	fn accept_dispatch_completion(
@@ -355,24 +459,26 @@ where
 		consumers
 	}
 
-	fn stage_barrier_open(&self, upstream_stage: Option<StageId>, stages: &[StagePlan]) -> bool {
-		let Some(upstream_stage) = upstream_stage else {
+	fn stage_barrier_open(&self, upstream_stages: &[StageId], stages: &[StagePlan]) -> bool {
+		if upstream_stages.is_empty() {
 			return true;
-		};
+		}
 
-		stages
-			.iter()
-			.find(|stage| stage.stage_id == upstream_stage)
-			.map(|stage| {
-				stage.tasks.iter().all(|task| {
-					matches!(
-						self.state
-							.acceptance_state(TaskKey::from_identity(task.spec.identity)),
-						AcceptanceState::LiveAccepted { .. }
-					)
+		upstream_stages.iter().all(|upstream_stage| {
+			stages
+				.iter()
+				.find(|stage| stage.stage_id == *upstream_stage)
+				.map(|stage| {
+					stage.tasks.iter().all(|task| {
+						matches!(
+							self.state
+								.acceptance_state(TaskKey::from_identity(task.spec.identity)),
+							AcceptanceState::LiveAccepted { .. }
+						)
+					})
 				})
-			})
-			.unwrap_or(false)
+				.unwrap_or(false)
+		})
 	}
 
 	fn materialize_task_spec(&self, mut spec: TaskSpec) -> Result<TaskSpec, SchedulerError> {
@@ -455,7 +561,7 @@ where
 	fn producer_consumers_transitively_accepted(&self, key: TaskKey, stages: &[StagePlan]) -> bool {
 		let downstream_stages = stages
 			.iter()
-			.filter(|stage| stage.upstream_stage == Some(key.stage_id))
+			.filter(|stage| stage.upstream_stages.contains(&key.stage_id))
 			.collect::<Vec<_>>();
 		if downstream_stages.is_empty() {
 			return false;
@@ -483,7 +589,7 @@ where
 
 		stages
 			.iter()
-			.filter(|child| child.upstream_stage == Some(stage_id))
+			.filter(|child| child.upstream_stages.contains(&stage_id))
 			.all(|child| self.stage_transitively_accepted(child.stage_id, stages))
 	}
 }
@@ -492,7 +598,7 @@ fn task_dependencies(spec: &TaskSpec) -> Vec<PartitionAddress> {
 	spec.inputs
 		.iter()
 		.flat_map(|input| match input {
-			TaskInputBinding::Scan => Vec::new(),
+			TaskInputBinding::Scan { .. } => Vec::new(),
 			TaskInputBinding::ShuffleConsumer {
 				producer_partitions,
 				..
@@ -508,6 +614,19 @@ fn failure_retryable(kind: &TaskFailureKind) -> bool {
 	match kind {
 		TaskFailureKind::TaskFailed { retryable, .. } => *retryable,
 		TaskFailureKind::BudgetExhausted { dimension, .. } => dimension.retryable(),
+		_ => false,
+	}
+}
+
+fn duration_micros(started: Instant) -> u64 {
+	u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn task_failure_is_stale_rejection(kind: &TaskFailureKind) -> bool {
+	match kind {
+		TaskFailureKind::Internal { reason } | TaskFailureKind::TaskFailed { reason, .. } => {
+			reason.contains("AttemptStale")
+		}
 		_ => false,
 	}
 }
@@ -588,7 +707,7 @@ mod tests {
 				profile_hint: crate::ir::QueryProfileHint::Scan,
 				primary_key_columns: Vec::new(),
 			},
-			inputs: vec![TaskInputBinding::Scan],
+			inputs: vec![TaskInputBinding::Scan { share: None }],
 			output: TaskOutputBinding::FinalResult,
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -643,7 +762,7 @@ mod tests {
 	async fn single_stage_query_dispatches_and_accepts() {
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![task(StageId::new(0), TaskId::new(0))],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -670,12 +789,12 @@ mod tests {
 		let stages = [
 			StagePlan {
 				stage_id: StageId::new(0),
-				upstream_stage: None,
+				upstream_stages: vec![],
 				tasks: vec![producer],
 			},
 			StagePlan {
 				stage_id: StageId::new(1),
-				upstream_stage: Some(StageId::new(0)),
+				upstream_stages: vec![StageId::new(0)],
 				tasks: vec![consumer],
 			},
 		];
@@ -692,10 +811,45 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn stage_barrier_waits_for_both_upstreams() {
+		let left = task(StageId::new(0), TaskId::new(0));
+		let right = task(StageId::new(1), TaskId::new(0));
+		let consumer = task(StageId::new(2), TaskId::new(0));
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: vec![],
+				tasks: vec![left],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![],
+				tasks: vec![right],
+			},
+			StagePlan {
+				stage_id: StageId::new(2),
+				upstream_stages: vec![StageId::new(0), StageId::new(1)],
+				tasks: vec![consumer],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let mut dispatcher = ScriptedDispatcher::new([completed(), completed(), completed()]);
+
+		let run = scheduler
+			.dispatch_loop(&stages, &mut dispatcher)
+			.await
+			.expect("dispatch");
+
+		assert_eq!(run.dispatched[0].stage_id, StageId::new(0));
+		assert_eq!(run.dispatched[1].stage_id, StageId::new(1));
+		assert_eq!(run.dispatched[2].stage_id, StageId::new(2));
+	}
+
+	#[tokio::test]
 	async fn retryable_failure_retries_once_then_accepts() {
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![task(StageId::new(0), TaskId::new(0))],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -715,6 +869,38 @@ mod tests {
 		assert_eq!(run.dispatched.len(), 2);
 		assert_eq!(run.dispatched[0].attempt_id, AttemptId::first());
 		assert_eq!(run.dispatched[1].attempt_id, AttemptId::new(1));
+		assert_eq!(run.telemetry.retry_count, 1);
+	}
+
+	#[tokio::test]
+	async fn completed_task_telemetry_is_collected() {
+		let stage = StagePlan {
+			stage_id: StageId::new(0),
+			upstream_stages: vec![],
+			tasks: vec![task(StageId::new(0), TaskId::new(0))],
+		};
+		let mut telemetry = TaskTelemetry::default();
+		telemetry.labels.operator_kind = "join".to_string();
+		telemetry.counters.pulled_shuffle_bytes = 128;
+		let mut scheduler = DistributedScheduler::new(registry());
+		let mut dispatcher = ScriptedDispatcher::new([DispatchOutcome::CompletedWithTelemetry {
+			output: TaskCompletionOutput::FinalResult {
+				output_digest: None,
+			},
+			batches: Vec::new(),
+			telemetry: telemetry.clone(),
+		}]);
+
+		let run = scheduler
+			.dispatch_loop(&[stage], &mut dispatcher)
+			.await
+			.expect("dispatch");
+
+		assert_eq!(run.telemetry.task_telemetry.len(), 1);
+		let collected = &run.telemetry.task_telemetry[0];
+		assert_eq!(collected.labels.operator_kind, "join");
+		assert_eq!(collected.counters.pulled_shuffle_bytes, 128);
+		assert!(collected.phases.dispatch_wait_micros > 0);
 	}
 
 	#[tokio::test]
@@ -723,7 +909,7 @@ mod tests {
 		let key = TaskKey::from_identity(task.spec.identity);
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![task],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -781,7 +967,7 @@ mod tests {
 		};
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![producer],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -828,7 +1014,7 @@ mod tests {
 		};
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![producer],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -843,6 +1029,7 @@ mod tests {
 		let cancelled = scheduler.cancel_query(query_id);
 
 		assert_eq!(cancelled, CancelledTaskCount::new(1));
+		assert_eq!(scheduler.telemetry.cancellation_cleanup_count, 1);
 		assert_eq!(scheduler.accepted_manifest(key), None);
 		assert_eq!(
 			scheduler.state().acceptance_state(key),
@@ -878,7 +1065,7 @@ mod tests {
 		};
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![producer],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -945,7 +1132,7 @@ mod tests {
 		};
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![producer],
 		};
 		let registry = Arc::new(StaticWorkerRegistry::new([worker_entry(
@@ -1076,7 +1263,7 @@ mod tests {
 		let replacement_worker_id = WorkerId::from_u128(2);
 		let stage = StagePlan {
 			stage_id: StageId::new(0),
-			upstream_stage: None,
+			upstream_stages: vec![],
 			tasks: vec![task(StageId::new(0), TaskId::new(0))],
 		};
 		let key = TaskKey::from_identity(stage.tasks[0].spec.identity);
@@ -1142,12 +1329,12 @@ mod tests {
 		let stages = [
 			StagePlan {
 				stage_id: StageId::new(0),
-				upstream_stage: None,
+				upstream_stages: vec![],
 				tasks: vec![producer],
 			},
 			StagePlan {
 				stage_id: StageId::new(1),
-				upstream_stage: Some(StageId::new(0)),
+				upstream_stages: vec![StageId::new(0)],
 				tasks: vec![consumer],
 			},
 		];
@@ -1213,12 +1400,12 @@ mod tests {
 		let stages = [
 			StagePlan {
 				stage_id: StageId::new(0),
-				upstream_stage: None,
+				upstream_stages: vec![],
 				tasks: vec![producer],
 			},
 			StagePlan {
 				stage_id: StageId::new(1),
-				upstream_stage: Some(StageId::new(0)),
+				upstream_stages: vec![StageId::new(0)],
 				tasks: vec![consumer],
 			},
 		];
@@ -1280,12 +1467,12 @@ mod tests {
 		let stages = [
 			StagePlan {
 				stage_id: StageId::new(0),
-				upstream_stage: None,
+				upstream_stages: vec![],
 				tasks: vec![producer],
 			},
 			StagePlan {
 				stage_id: StageId::new(1),
-				upstream_stage: Some(StageId::new(0)),
+				upstream_stages: vec![StageId::new(0)],
 				tasks: vec![consumer],
 			},
 		];
@@ -1312,7 +1499,7 @@ mod tests {
 	async fn consumer_stage_reports_no_progress_until_barrier_opens() {
 		let stage = StagePlan {
 			stage_id: StageId::new(1),
-			upstream_stage: Some(StageId::new(0)),
+			upstream_stages: vec![StageId::new(0)],
 			tasks: vec![task(StageId::new(1), TaskId::new(0))],
 		};
 		let mut scheduler = DistributedScheduler::new(registry());

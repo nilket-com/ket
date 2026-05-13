@@ -308,11 +308,11 @@ mod tests {
 		let plan = LogicalPlan::Filter {
 			predicate: Expr::And(
 				Box::new(Expr::Gt(
-					Box::new(Expr::Column("amount".to_string())),
+					Box::new(Expr::column("amount")),
 					Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 				)),
 				Box::new(Expr::Eq(
-					Box::new(Expr::Column("status".to_string())),
+					Box::new(Expr::column("status")),
 					Box::new(Expr::Literal(ScalarValue::Utf8(Some("active".to_string())))),
 				)),
 			),

@@ -7,10 +7,11 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Pre-implementation; Phase 0
-calibration runs first. Promotion evidence will live at
-`plans/impl/004_distributed_inner_equi_join_bench_results.md`
-after the join keystone fixtures pass.
+Promoted to `plans/adr/` and implemented. Promotion evidence
+lives at
+`plans/impl/004_distributed_inner_equi_join_bench_results.md`.
+Hard-gate bench rows passed; the worker-scaling soft gate
+miss is recorded there for ADR 005 planning.
 
 Builds on five WIP iteration rounds across the council. All
 three voices converged on every contract surface; iteration
@@ -74,7 +75,9 @@ ADR), or SQL join hints (V1.x).
   lowers to `ExecutionPlan::Join { left, right, kind,
   left_keys: Vec<ColumnOrdinal>, right_keys:
   Vec<ColumnOrdinal>, strategy, output_schema }`. Single
-  bound join variant.
+  bound join variant. The related task-input wire change is
+  covered below in **`TaskInputBinding::Scan` carries
+  optional share**.
 - **Stage DAG, hash-partitioned.** Three stages: left-
   partition (Stage K-2), right-partition (Stage K-1), join
   (Stage K, multi-upstream). The planner emits explicit
@@ -126,10 +129,13 @@ ADR), or SQL join hints (V1.x).
   - `memory_per_task_bytes` (ADR 003 default 64 MiB).
   Admission validated at bind time (when sizes are
   statically known) and at dispatch time (against actual
-  manifest `size_bytes`). Over-cap fails terminal
-  `BudgetExhausted { dimension: BroadcastReplication }`. No
-  silent strategy switch mid-attempt. New
-  `BudgetDimension::BroadcastReplication` variant.
+  manifest `size_bytes`). Over-cap on the two broadcast-
+  specific byte budgets fails terminal `BudgetExhausted
+  { dimension: BroadcastReplication }`; over-cap on
+  `memory_per_task_bytes` remains ADR 003 `BudgetExhausted
+  { dimension: Memory }`. No silent strategy switch
+  mid-attempt. New `BudgetDimension::BroadcastReplication`
+  variant.
 - **Broadcast probe scan-share.** Deterministic per-worker
   assignment: `xxh3_64(source_tablet_id) mod worker_count`.
   Required for cross-replica determinism.
@@ -448,11 +454,13 @@ check is a **structural** validation, not a stats-driven
 intent inference (the binder cannot know a caller's
 intended "small build input" without statistics; see
 Rationale §"BroadcastBuildSidePlacement is structural").
-The check: under `JoinStrategy::Broadcast`, the left
-subtree must terminate in the single-partition publish
-shape (`Exchange { partition_count: 1 }` or
-`BroadcastPublish` per Phase 0 P0.2); right-publish shape
-rejects with `BindError::BroadcastBuildSidePlacement`.
+The check: under `JoinStrategy::Broadcast`, **any** plan
+where the left subtree does not terminate in the single-
+partition publish shape (`Exchange { partition_count: 1 }`
+or `BroadcastPublish` per Phase 0 P0.2) rejects with
+`BindError::BroadcastBuildSidePlacement`. A right-side
+publish shape also rejects with the same error; both-sides-
+published is ambiguous and rejected.
 
 Stage K-1 publishes one logical partition (the full
 materialized left input). Stage K has `worker_count` tasks
@@ -469,11 +477,10 @@ materialized left input). Stage K has `worker_count` tasks
 Workers identify the input role within the task by
 binding variant: `Scan { share: Some(_) }` is the broadcast
 probe input (right subtree); `ShuffleConsumer` is the build
-input (left subtree). Architecture-guarded — see G16-G18
-plus the architectural assertion that broadcast join tasks
-carry **exactly one** `Scan { share: Some(_) }` and
-**exactly one** `ShuffleConsumer` (no ambiguity in
-discrimination).
+input (left subtree). Fragmenter-snapshot-tested and
+architecture-test-guarded: broadcast join tasks carry
+**exactly one** `Scan { share: Some(_) }` and **exactly
+one** `ShuffleConsumer` (no ambiguity in discrimination).
 
 **Probe scan-share assignment.** Deterministic per-worker
 via `xxh3_64(source_tablet_id) mod worker_count`. Worker
@@ -504,9 +511,12 @@ satisfied:
 known-over-cap (when scan-stats hints are available).
 Dispatch-time validation against the actual build manifest
 `size_bytes` (from `PartitionEntry`) is the load-bearing
-check; over-cap fails terminal with `BudgetExhausted
-{ dimension: BroadcastReplication }`. No silent strategy
-switch.
+check. Over-cap on `broadcast_build_bytes_per_task` or
+`broadcast_replicated_bytes_per_query` fails terminal with
+`BudgetExhausted { dimension: BroadcastReplication }`.
+Over-cap on `memory_per_task_bytes` surfaces through ADR
+003's existing `BudgetExhausted { dimension: Memory }`.
+No silent strategy switch.
 
 Broadcast build payloads are **never** inlined in
 `StartTask`. They flow through the partition store like
@@ -697,6 +707,13 @@ as `PartitionMissing { reason: AttemptStale }` on the wire
 and as `RuntimeError::PartitionStoreMismatch` on the
 coordinator side.
 
+Broadcast probe `Scan { share: Some(_) }` inputs read
+directly from Wendelon through `StorageScan`; there is no
+upstream worker, `ExchangeId`, or producer attempt to
+validate on that scan side. Its correctness invariant is
+the deterministic local share rule:
+`xxh3_64(source_tablet_id) mod worker_count == worker_index`.
+
 ### 11. Architecture guards G16-G18
 
 Supplementing ADR 002's G1-G7 and ADR 003's G8-G15.
@@ -843,22 +860,28 @@ placed on the wrong side" — it's strictly **structural**:
 under `JoinStrategy::Broadcast`, the **left** subtree must
 terminate in the single-partition publish shape
 (`Exchange { partition_count: 1 }` or `BroadcastPublish`).
-If the right subtree carries that shape instead, the
-binder rejects with `BroadcastBuildSidePlacement`. The
+If the left subtree is missing that shape or has a non-1
+partition count, the binder rejects with
+`BroadcastBuildSidePlacement`. If the right subtree carries a
+publish shape, including the both-sides-published case, the
+binder also rejects with `BroadcastBuildSidePlacement`. The
 error name reflects the **caller-discipline contract**
 (build = left) rather than implying the binder can
 distinguish "small" inputs from "large" ones. Callers who
 want statistics-driven build selection wait for V1.x
 cost-based-swap ADR.
 
-### Why ADR 003 telemetry residual ships separately
+### Why telemetry lands with ADR 004 promotion
 
 The four ADR 003 watch counters (pulled shuffle bytes,
 retry count, stale rejection count, cancellation cleanup
-count) are ADR 003 substrate work, not ADR 004 contract
-work. Bundling them obscures ADR 004 promotion evidence;
-commit boundary cleanliness wins. Ships as its own
-`chore:` slice before ADR 004 feature commits.
+count) plus executor/join phase spans are substrate
+telemetry, but ADR 004's promotion evidence exposed the
+scaling plateau that ADR 005 must attribute. Because ADR
+004 is still staged, the bounded telemetry surface lands in
+the same promotion stack rather than a follow-up chore
+commit. Query and task identity remain trace attributes, not
+bounded metric labels.
 
 ## Consequences
 
@@ -1000,6 +1023,9 @@ but not blocking promotion.
   cache hit rate recorded.**
 - **Per-query join counters recorded** (build rows, probe
   rows, matched rows).
+- **Framework overhead remains residual and has sub-
+  attribution columns** (task setup, batch encode/send,
+  coordinator decode/dispatch wait, telemetry lock).
 - **Skew observation.** A 90%-skew fixture records per-
   partition row counts. No mitigation required in V1.
 - **Executor evidence row.** 10M × 10M at 8 workers wall-
@@ -1070,8 +1096,10 @@ are V1.x.
 
 ### Q7 — ADR 003 telemetry residual bundling
 
-**Separate `chore:` slice.** Ships before ADR 004 feature
-commits; commit boundary cleanliness wins.
+**Stack into ADR 004 promotion while uncommitted.** The
+bounded counters and phase spans land with the staged ADR
+004 work so ADR 005 planning starts from attributed bench
+evidence.
 
 ## Deferred (V1.x or later)
 
@@ -1189,8 +1217,9 @@ commits; commit boundary cleanliness wins.
 - **Do not require stable worker assignment for
   determinism.** ADR 003 §13 normalization is the
   contract.
-- **Do not bundle ADR 003 telemetry residual into ADR 004
-  feature commits.** Separate `chore:` slice.
+- **Do not let ADR 005 infer executor bottlenecks from
+  wall-clock alone.** ADR 004 promotion stacks the bounded
+  telemetry surface needed for the next planning session.
 - **Do not introduce broadcast / sort-merge / nested-loop
   *algorithm* identifiers** beyond the two pinned
   strategies (G16).
@@ -1247,8 +1276,11 @@ convergence. Iteration history lives in git on
     Three-way iter-5.
 18. **Skew observation soft gate; mitigation deferred.**
     Three-way.
-19. **ADR 003 telemetry residual ships as separate
-    `chore:` slice.** Three-way iter-5.
+19. **ADR 003 residual counters plus executor/join phase
+    spans land with the staged ADR 004 promotion stack.**
+    This replaces the earlier separate-chore plan because
+    ADR 004 was not committed yet. Three-way iter-5 revised
+    after promotion evidence.
 20. **Strategy selection: SQL planner defaults
     `HashPartitioned`; programmatic callers can emit
     `Broadcast`. SQL hints + cost-based selection are

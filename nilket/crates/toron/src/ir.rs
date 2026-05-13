@@ -43,9 +43,31 @@ impl ScalarValue {
 	}
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ColumnRef {
+	pub qualifier: Option<TableRef>,
+	pub name: ColumnName,
+}
+
+impl ColumnRef {
+	pub fn unqualified(name: impl Into<String>) -> Self {
+		Self {
+			qualifier: None,
+			name: ColumnName(name.into()),
+		}
+	}
+
+	pub fn qualified(qualifier: TableRef, name: impl Into<String>) -> Self {
+		Self {
+			qualifier: Some(qualifier),
+			name: ColumnName(name.into()),
+		}
+	}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
-	Column(String),
+	Column(ColumnRef),
 	Literal(ScalarValue),
 	Eq(Box<Expr>, Box<Expr>),
 	Neq(Box<Expr>, Box<Expr>),
@@ -62,6 +84,14 @@ pub enum Expr {
 }
 
 impl Expr {
+	pub fn column(name: impl Into<String>) -> Self {
+		Self::Column(ColumnRef::unqualified(name))
+	}
+
+	pub fn qualified_column(qualifier: TableRef, name: impl Into<String>) -> Self {
+		Self::Column(ColumnRef::qualified(qualifier, name))
+	}
+
 	pub fn is_deterministic(&self) -> bool {
 		true
 	}
@@ -83,6 +113,17 @@ pub enum AggregateFunction {
 	ApproxQuantile(f64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinKind {
+	Inner,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinStrategy {
+	HashPartitioned,
+	Broadcast,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
 	Scan {
@@ -92,6 +133,10 @@ pub enum LogicalPlan {
 	ScanNamed {
 		table: TableRef,
 		projection: Option<Vec<String>>,
+	},
+	Alias {
+		input: Box<LogicalPlan>,
+		alias: TableRef,
 	},
 	Filter {
 		input: Box<LogicalPlan>,
@@ -110,5 +155,12 @@ pub enum LogicalPlan {
 		input: Box<LogicalPlan>,
 		partition_count: u32,
 		key: Vec<Expr>,
+	},
+	Join {
+		left: Box<LogicalPlan>,
+		right: Box<LogicalPlan>,
+		kind: JoinKind,
+		on: Vec<(Expr, Expr)>,
+		strategy: JoinStrategy,
 	},
 }

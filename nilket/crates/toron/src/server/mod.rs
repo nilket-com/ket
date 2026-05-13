@@ -14,13 +14,15 @@ use crate::distributed::partition_store::{
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
 	ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionManifest, ProducerPartitionRef,
-	TaskCompletionOutput, TaskInputBinding, TaskOutputBinding, TaskSpec,
+	TaskCompletionOutput, TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry,
+	TaskTelemetryLabels, shuffle_input_table_id,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
 	PartitionMissingReason, QueryError, RuntimeError, StorageError, TaskFailureKind, WireError,
 };
-use crate::exec::Executor;
+use crate::exec::{ExecutionContext, Executor};
+use crate::ir::{ExecutionPlan, JoinStrategy, MorselId, TableId};
 use crate::storage::{ScanRequest, ScanStream, StorageScan};
 use crate::wire::{
 	ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, PartitionDataPayload,
@@ -32,15 +34,29 @@ use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct ToronWorker {
-	executor: Executor,
+	storage: Arc<dyn StorageScan>,
 	memory: Arc<MemoryManager>,
 	partition_store: Arc<dyn PartitionStore>,
 	worker_id: WorkerId,
 	endpoint: WorkerEndpoint,
+}
+
+struct TaskExecutionReport {
+	results: Vec<RecordBatch>,
+	telemetry: TaskTelemetry,
+}
+
+#[derive(Default)]
+struct ShuffleInputTelemetry {
+	pulled_shuffle_bytes: u64,
+	left_shuffle_bytes: u64,
+	right_shuffle_bytes: u64,
 }
 
 impl ToronWorker {
@@ -83,7 +99,7 @@ impl ToronWorker {
 		endpoint: WorkerEndpoint,
 	) -> Self {
 		Self {
-			executor: Executor::new(storage),
+			storage,
 			memory,
 			partition_store,
 			worker_id,
@@ -95,39 +111,121 @@ impl ToronWorker {
 		&self,
 		spec: &TaskSpec,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let shuffle_inputs = shuffle_input_partitions(spec);
-		if !shuffle_inputs.is_empty() {
-			let input_batches = self.pull_shuffle_inputs(&shuffle_inputs).await?;
-			let schema = input_batches
-				.first()
-				.map(RecordBatch::schema)
-				.unwrap_or_else(|| spec.plan.schema());
-			let executor = Executor::new(Arc::new(ShuffleInputStorageScan {
-				schema,
-				batches: input_batches,
-			}));
-			return Ok(executor.execute_bound(&spec.plan, None).await?);
-		}
+		self.execute_task_local_with_telemetry(spec)
+			.await
+			.map(|report| report.results)
+	}
 
-		Ok(self.executor.execute_bound(&spec.plan, None).await?)
+	async fn execute_task_local_with_telemetry(
+		&self,
+		spec: &TaskSpec,
+	) -> Result<TaskExecutionReport, QueryError> {
+		let task_started = Instant::now();
+		let telemetry = Arc::new(Mutex::new(task_telemetry_for_spec(spec)));
+		validate_broadcast_caps(spec)?;
+		let morsel = scan_share_morsel(spec);
+		let shuffle_started = Instant::now();
+		let (overrides, shuffle_telemetry) = self.shuffle_input_overrides(spec).await?;
+		record_worker_telemetry(&telemetry, |task| {
+			task.phases.shuffle_pull_decode_micros = duration_micros(shuffle_started);
+			task.counters.pulled_shuffle_bytes = shuffle_telemetry.pulled_shuffle_bytes;
+			task.counters.left_shuffle_bytes = shuffle_telemetry.left_shuffle_bytes;
+			task.counters.right_shuffle_bytes = shuffle_telemetry.right_shuffle_bytes;
+		});
+		let task_context = ExecutionContext::local_test()
+			.with_task_budget(spec.budget)
+			.with_task_telemetry(telemetry.clone());
+		let results = if overrides.is_empty() {
+			let executor = Executor::with_context(self.storage.clone(), task_context);
+			executor.execute_bound(&spec.plan, morsel).await?
+		} else {
+			let executor = Executor::with_context(
+				Arc::new(TaskInputStorageScan {
+					base: self.storage.clone(),
+					legacy_single_override: legacy_single_shuffle_override(&spec.plan, &overrides),
+					overrides,
+				}),
+				task_context,
+			);
+			executor.execute_bound(&spec.plan, morsel).await?
+		};
+		record_worker_telemetry(&telemetry, |task| {
+			task.counters.emitted_rows =
+				results.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+			task.counters.emitted_batches = results.len() as u64;
+			task.phases.task_wall_micros = duration_micros(task_started);
+			recompute_framework_overhead(task);
+		});
+		Ok(TaskExecutionReport {
+			results,
+			telemetry: snapshot_worker_telemetry(&telemetry),
+		})
 	}
 
 	async fn pull_shuffle_inputs(
 		&self,
 		partitions: &[ProducerPartitionRef],
-	) -> Result<Vec<RecordBatch>, QueryError> {
+	) -> Result<(Vec<RecordBatch>, u64), QueryError> {
 		let coordinator = ToronCoordinator::new(self.memory.clone());
 		let mut batches = Vec::new();
+		let mut pulled_bytes = 0u64;
 
 		for partition in partitions {
 			let stream = tokio::net::TcpStream::connect(partition.endpoint.as_str()).await?;
 			let payload = coordinator
 				.pull_partition_from_worker(stream, partition.address, partition.address.attempt_id)
 				.await?;
+			pulled_bytes = pulled_bytes.saturating_add(payload.payload.as_slice().len() as u64);
 			batches.extend(decode_record_batches(payload.payload.as_slice())?);
 		}
 
-		Ok(batches)
+		Ok((batches, pulled_bytes))
+	}
+
+	async fn shuffle_input_overrides(
+		&self,
+		spec: &TaskSpec,
+	) -> Result<(HashMap<TableId, ScanOverride>, ShuffleInputTelemetry), QueryError> {
+		let mut overrides: HashMap<TableId, ScanOverride> = HashMap::new();
+		let mut telemetry = ShuffleInputTelemetry::default();
+
+		for (input_index, input) in spec.inputs.iter().enumerate() {
+			let TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_partitions,
+				..
+			} = input
+			else {
+				continue;
+			};
+			let table_id = shuffle_input_table_id(*exchange_id);
+			let (batches, pulled_bytes) = self.pull_shuffle_inputs(producer_partitions).await?;
+			telemetry.pulled_shuffle_bytes =
+				telemetry.pulled_shuffle_bytes.saturating_add(pulled_bytes);
+			match shuffle_input_side_for_telemetry(spec, input_index) {
+				ShuffleInputSide::Left => {
+					telemetry.left_shuffle_bytes =
+						telemetry.left_shuffle_bytes.saturating_add(pulled_bytes);
+				}
+				ShuffleInputSide::Right => {
+					telemetry.right_shuffle_bytes =
+						telemetry.right_shuffle_bytes.saturating_add(pulled_bytes);
+				}
+				ShuffleInputSide::Unknown => {}
+			}
+			let schema = batches
+				.first()
+				.map(RecordBatch::schema)
+				.or_else(|| scan_schema_for_table_id(&spec.plan, table_id))
+				.unwrap_or_else(|| spec.plan.schema());
+			if let Some(override_entry) = overrides.get_mut(&table_id) {
+				override_entry.batches.extend(batches);
+			} else {
+				overrides.insert(table_id, ScanOverride { schema, batches });
+			}
+		}
+
+		Ok((overrides, telemetry))
 	}
 
 	fn publish_task_output(
@@ -220,6 +318,7 @@ impl ToronWorker {
 				MessageKind::StartTask => {
 					let payload: StartTaskPayload = decode_payload(&envelope.payload)?;
 					let identity = payload.spec.identity;
+					let task_started = Instant::now();
 					if envelope.identity != EnvelopeIdentity::task(identity) {
 						return Err(QueryError::UnexpectedMessage {
 							expected: "StartTask route matching TaskSpec identity",
@@ -234,14 +333,22 @@ impl ToronWorker {
 						&TaskStartedPayload { identity },
 					)
 					.await?;
+					let task_setup_micros = duration_micros(task_started);
 
-					match self.execute_task_local(&payload.spec).await {
-						Ok(results) => {
-							for (idx, batch) in results.iter().enumerate() {
+					match self.execute_task_local_with_telemetry(&payload.spec).await {
+						Ok(mut report) => {
+							for (idx, batch) in report.results.iter().enumerate() {
 								let stream_seq = StreamSeq::new(
 									u64::try_from(idx).expect("record batch index fits u64"),
 								);
+								let batch_encode_started = Instant::now();
 								let encoded_batch = encode_record_batch(&batch)?;
+								report.telemetry.phases.batch_encode_micros = report
+									.telemetry
+									.phases
+									.batch_encode_micros
+									.saturating_add(duration_micros(batch_encode_started));
+								let batch_send_started = Instant::now();
 								send_payload(
 									&mut stream,
 									MessageKind::TaskBatch,
@@ -254,18 +361,42 @@ impl ToronWorker {
 									},
 								)
 								.await?;
+								report.telemetry.phases.batch_send_micros = report
+									.telemetry
+									.phases
+									.batch_send_micros
+									.saturating_add(duration_micros(batch_send_started));
 							}
 
-							let output =
-								self.publish_task_output(identity, &payload.spec, &results)?;
-							send_payload(
-								&mut stream,
-								MessageKind::TaskComplete,
-								EnvelopeIdentity::task(identity),
-								None,
-								&TaskCompletePayload { identity, output },
-							)
-							.await?;
+							let publish_started = Instant::now();
+							match self.publish_task_output(identity, &payload.spec, &report.results)
+							{
+								Ok(output) => {
+									report.telemetry.phases.output_publish_micros =
+										duration_micros(publish_started);
+									report.telemetry.counters.published_shuffle_bytes =
+										published_shuffle_bytes(&output);
+									report.telemetry.phases.task_setup_micros = task_setup_micros;
+									report.telemetry.phases.task_wall_micros =
+										duration_micros(task_started);
+									recompute_framework_overhead(&mut report.telemetry);
+									send_payload(
+										&mut stream,
+										MessageKind::TaskComplete,
+										EnvelopeIdentity::task(identity),
+										None,
+										&TaskCompletePayload {
+											identity,
+											output,
+											telemetry: Some(report.telemetry),
+										},
+									)
+									.await?;
+								}
+								Err(error) => {
+									send_task_failed(&mut stream, identity, error).await?;
+								}
+							}
 						}
 						Err(error) => {
 							send_task_failed(&mut stream, identity, error).await?;
@@ -336,38 +467,527 @@ impl ToronWorker {
 	}
 }
 
-fn shuffle_input_partitions(spec: &TaskSpec) -> Vec<ProducerPartitionRef> {
+fn scan_share_morsel(spec: &TaskSpec) -> Option<(MorselId, u32)> {
+	spec.inputs.iter().find_map(|input| match input {
+		TaskInputBinding::Scan { share: Some(share) } => {
+			Some((MorselId(share.worker_index), share.worker_count))
+		}
+		TaskInputBinding::Scan { share: None } | TaskInputBinding::ShuffleConsumer { .. } => None,
+	})
+}
+
+fn duration_micros(started: Instant) -> u64 {
+	u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn record_worker_telemetry(
+	telemetry: &Arc<Mutex<TaskTelemetry>>,
+	update: impl FnOnce(&mut TaskTelemetry),
+) {
+	let lock_started = Instant::now();
+	if let Ok(mut telemetry) = telemetry.lock() {
+		telemetry.phases.telemetry_lock_micros = telemetry
+			.phases
+			.telemetry_lock_micros
+			.saturating_add(duration_micros(lock_started));
+		update(&mut telemetry);
+	}
+}
+
+fn snapshot_worker_telemetry(telemetry: &Arc<Mutex<TaskTelemetry>>) -> TaskTelemetry {
+	telemetry
+		.lock()
+		.map(|telemetry| telemetry.clone())
+		.unwrap_or_default()
+}
+
+fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
+	let accounted = telemetry
+		.phases
+		.shuffle_pull_decode_micros
+		.saturating_add(telemetry.phases.build_micros)
+		.saturating_add(telemetry.phases.probe_micros)
+		.saturating_add(telemetry.phases.spill_micros)
+		.saturating_add(telemetry.phases.output_publish_micros)
+		.saturating_add(telemetry.phases.task_setup_micros)
+		.saturating_add(telemetry.phases.batch_encode_micros)
+		.saturating_add(telemetry.phases.batch_send_micros)
+		.saturating_add(telemetry.phases.telemetry_lock_micros);
+	telemetry.phases.framework_overhead_micros =
+		telemetry.phases.task_wall_micros.saturating_sub(accounted);
+}
+
+fn published_shuffle_bytes(output: &TaskCompletionOutput) -> u64 {
+	match output {
+		TaskCompletionOutput::FinalResult { .. } => 0,
+		TaskCompletionOutput::ShuffleProducer { manifest } => manifest
+			.partitions
+			.iter()
+			.map(|entry| entry.size_bytes.get())
+			.sum(),
+	}
+}
+
+fn task_telemetry_for_spec(spec: &TaskSpec) -> TaskTelemetry {
+	TaskTelemetry {
+		labels: TaskTelemetryLabels {
+			strategy: join_strategy_label(&spec.plan).map(str::to_string),
+			stage_role: stage_role_label(spec).to_string(),
+			operator_kind: operator_kind_label(&spec.plan).to_string(),
+			worker_count: worker_count_label(spec),
+		},
+		..TaskTelemetry::default()
+	}
+}
+
+fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
+	match plan {
+		ExecutionPlan::Join { strategy, .. } => Some(match strategy {
+			JoinStrategy::HashPartitioned => "hash_partitioned",
+			JoinStrategy::Broadcast => "broadcast",
+		}),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => join_strategy_label(input),
+		ExecutionPlan::Scan { .. } => None,
+	}
+}
+
+fn contains_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join { .. } => true,
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => contains_join(input),
+		ExecutionPlan::Scan { .. } => false,
+	}
+}
+
+fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
+	if contains_join(plan) {
+		"join"
+	} else {
+		match plan {
+			ExecutionPlan::Exchange { .. } => "exchange",
+			ExecutionPlan::Filter { .. } => "filter",
+			ExecutionPlan::Project { .. } => "project",
+			ExecutionPlan::Aggregate { .. } => "aggregate",
+			ExecutionPlan::Scan { .. } => "scan",
+			ExecutionPlan::Join { .. } => "join",
+		}
+	}
+}
+
+fn stage_role_label(spec: &TaskSpec) -> &'static str {
+	if contains_join(&spec.plan) {
+		return match &spec.output {
+			TaskOutputBinding::FinalResult => "join_final",
+			TaskOutputBinding::ShuffleProducer { .. } => "join_publish",
+		};
+	}
+	if matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. }) {
+		"source_publish"
+	} else if spec
+		.inputs
+		.iter()
+		.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
+	{
+		"shuffle_consumer"
+	} else {
+		"scan"
+	}
+}
+
+fn worker_count_label(spec: &TaskSpec) -> Option<u32> {
 	spec.inputs
 		.iter()
-		.flat_map(|input| match input {
-			TaskInputBinding::Scan => Vec::new(),
+		.find_map(|input| match input {
+			TaskInputBinding::Scan { share: Some(share) } => Some(share.worker_count),
+			TaskInputBinding::Scan { share: None } | TaskInputBinding::ShuffleConsumer { .. } => {
+				None
+			}
+		})
+		.or_else(|| match &spec.output {
+			TaskOutputBinding::ShuffleProducer {
+				partition_count, ..
+			} => Some(partition_count.get()),
+			TaskOutputBinding::FinalResult => None,
+		})
+		.or_else(|| {
+			spec.inputs.iter().find_map(|input| match input {
+				TaskInputBinding::ShuffleConsumer {
+					producer_partitions,
+					..
+				} => u32::try_from(producer_partitions.len()).ok(),
+				TaskInputBinding::Scan { .. } => None,
+			})
+		})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShuffleInputSide {
+	Left,
+	Right,
+	Unknown,
+}
+
+fn shuffle_input_side_for_telemetry(spec: &TaskSpec, input_index: usize) -> ShuffleInputSide {
+	if matches!(join_strategy_label(&spec.plan), Some("broadcast")) {
+		return ShuffleInputSide::Left;
+	}
+	let shuffle_index = spec
+		.inputs
+		.iter()
+		.take(input_index + 1)
+		.filter(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
+		.count();
+	match shuffle_index {
+		1 => ShuffleInputSide::Left,
+		2 => ShuffleInputSide::Right,
+		_ => ShuffleInputSide::Unknown,
+	}
+}
+
+fn validate_broadcast_caps(spec: &TaskSpec) -> Result<(), QueryError> {
+	if !contains_broadcast_join(&spec.plan) {
+		return Ok(());
+	}
+
+	let build_bytes = spec
+		.inputs
+		.iter()
+		.filter_map(|input| match input {
 			TaskInputBinding::ShuffleConsumer {
 				producer_partitions,
 				..
-			} => producer_partitions.clone(),
+			} => Some(producer_partitions),
+			TaskInputBinding::Scan { .. } => None,
 		})
-		.collect()
+		.flatten()
+		.fold(0u64, |total, partition| {
+			total.saturating_add(partition.size_bytes.get())
+		});
+	let worker_count =
+		spec.inputs
+			.iter()
+			.find_map(|input| match input {
+				TaskInputBinding::Scan { share: Some(share) } => Some(share.worker_count),
+				TaskInputBinding::Scan { share: None }
+				| TaskInputBinding::ShuffleConsumer { .. } => None,
+			})
+			.unwrap_or(1);
+
+	if build_bytes > spec.budget.broadcast_build_bytes.get() {
+		return Err(broadcast_cap_exhausted(
+			build_bytes,
+			spec.budget.broadcast_build_bytes.get(),
+		));
+	}
+
+	let replicated = build_bytes.saturating_mul(u64::from(worker_count));
+	if replicated > spec.budget.broadcast_replicated_bytes.get() {
+		return Err(broadcast_cap_exhausted(
+			replicated,
+			spec.budget.broadcast_replicated_bytes.get(),
+		));
+	}
+
+	Ok(())
 }
 
-struct ShuffleInputStorageScan {
+fn broadcast_cap_exhausted(requested: u64, available: u64) -> QueryError {
+	QueryError::Runtime(RuntimeError::TaskFailure {
+		kind: TaskFailureKind::BudgetExhausted {
+			dimension: BudgetDimension::BroadcastReplication,
+			requested: ByteCount::new(requested),
+			available: ByteCount::new(available),
+		},
+	})
+}
+
+fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Join {
+			left,
+			right,
+			strategy,
+			..
+		} => {
+			*strategy == JoinStrategy::Broadcast
+				|| contains_broadcast_join(left)
+				|| contains_broadcast_join(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => contains_broadcast_join(input),
+		ExecutionPlan::Scan { .. } => false,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::distributed::budget::{QueryBudget, TaskBudget};
+	use crate::distributed::identity::{AttemptId, ExchangeId, QueryId, StageId, TaskId};
+	use crate::distributed::task::{
+		ArrowIpcDigest, PartitionAddress, PartitionCount, ProducerPartitionRef,
+	};
+	use crate::ir::{ColumnOrdinal, JoinKind, QueryProfileHint};
+	use crate::storage::InMemoryStorageScan;
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Arc;
+	use wendelon::schema::{
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
+	};
+
+	#[test]
+	fn broadcast_cap_validation_charges_replicated_build_bytes() {
+		let mut query_budget = QueryBudget::test_default();
+		query_budget.broadcast_build_bytes_per_task = ByteCount::new(64);
+		query_budget.broadcast_replicated_bytes_per_query = ByteCount::new(10);
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(1),
+				StageId::new(1),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: None,
+			plan: ExecutionPlan::Join {
+				left: Box::new(scan(TableId(1), 1)),
+				right: Box::new(scan(TableId(2), 2)),
+				kind: JoinKind::Inner,
+				left_keys: vec![ColumnOrdinal(0)],
+				right_keys: vec![ColumnOrdinal(0)],
+				strategy: JoinStrategy::Broadcast,
+				output_schema: Arc::new(Schema::new(vec![
+					Field::new("id", DataType::Int64, false),
+					Field::new("id", DataType::Int64, false),
+				])),
+			},
+			inputs: vec![
+				TaskInputBinding::Scan {
+					share: Some(crate::distributed::task::ScanShare {
+						worker_index: 0,
+						worker_count: 2,
+					}),
+				},
+				TaskInputBinding::ShuffleConsumer {
+					exchange_id: ExchangeId::new(0),
+					producer_stage_id: StageId::new(0),
+					partition_id: PartitionId::new(0),
+					producer_partitions: vec![ProducerPartitionRef {
+						address: PartitionAddress {
+							query_id: QueryId::from_u128(1),
+							exchange_id: ExchangeId::new(0),
+							producer_stage_id: StageId::new(0),
+							producer_task_id: TaskId::new(0),
+							attempt_id: AttemptId::first(),
+							partition_id: PartitionId::new(0),
+						},
+						worker_id: WorkerId::from_u128(1),
+						endpoint: WorkerEndpoint::new("127.0.0.1:0"),
+						size_bytes: ByteCount::new(8),
+						digest: ArrowIpcDigest::new([0; 32]),
+					}],
+				},
+			],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(query_budget),
+			trace: None,
+		};
+
+		let err = validate_broadcast_caps(&spec).expect_err("replicated cap must fail");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::BroadcastReplication,
+					requested,
+					available,
+				}
+			}) if requested == ByteCount::new(16) && available == ByteCount::new(10)
+		));
+	}
+
+	#[tokio::test]
+	async fn worker_sends_task_failed_when_shuffle_publish_budget_exhausted() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4]))],
+		)
+		.expect("batch");
+		let mut budget = QueryBudget::test_default();
+		budget.shuffle_bytes_published_per_task = ByteCount::new(1);
+		let memory = Arc::new(MemoryManager::new(8, 1024 * 1024));
+		let bind_listener = tokio::net::TcpListener::bind;
+		let listener = bind_listener("127.0.0.1:0").await.expect("bind listener");
+		let endpoint =
+			WorkerEndpoint::new(listener.local_addr().expect("listener addr").to_string());
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::with_budget(budget)),
+			WorkerId::from_u128(7),
+			endpoint.clone(),
+		));
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(7),
+				StageId::new(0),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: None,
+			plan: scan(TableId(1), 1),
+			inputs: vec![TaskInputBinding::Scan { share: None }],
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id: ExchangeId::new(1),
+				partition_count: PartitionCount::new(1),
+				partition_key: Vec::new(),
+			},
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.expect("accept worker connection");
+			worker.handle_connection(server_stream).await
+		});
+		let client = tokio::net::TcpStream::connect(endpoint.as_str())
+			.await
+			.expect("connect worker");
+
+		let err = ToronCoordinator::new(memory)
+			.execute_task_on_worker_with_completion(client, spec)
+			.await
+			.expect_err("publish budget exhaustion must surface as TaskFailed");
+
+		assert!(matches!(
+			err,
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::BudgetExhausted {
+					dimension: BudgetDimension::ShuffleBytes,
+					..
+				}
+			})
+		));
+		worker_handle
+			.await
+			.expect("worker task")
+			.expect("worker ok");
+	}
+
+	fn scan(table_id: TableId, object_byte: u8) -> ExecutionPlan {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([object_byte; 16]),
+			1,
+			"default",
+			"broadcast_cap_test",
+			schema.as_ref(),
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect("descriptor");
+		ExecutionPlan::Scan {
+			legacy_table_id: table_id,
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+		}
+	}
+}
+
+#[derive(Clone)]
+struct ScanOverride {
 	schema: SchemaRef,
 	batches: Vec<RecordBatch>,
 }
 
+struct TaskInputStorageScan {
+	base: Arc<dyn StorageScan>,
+	overrides: HashMap<TableId, ScanOverride>,
+	legacy_single_override: Option<ScanOverride>,
+}
+
 #[async_trait::async_trait]
-impl StorageScan for ShuffleInputStorageScan {
+impl StorageScan for TaskInputStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-		Ok(ScanStream::from_batches(
-			self.schema.clone(),
-			request.session_id,
-			request.query_id,
-			self.batches.clone(),
-		))
+		if let Some(override_entry) = self.overrides.get(&request.table_id) {
+			return Ok(ScanStream::from_batches(
+				override_entry.schema.clone(),
+				request.session_id,
+				request.query_id,
+				override_entry.batches.clone(),
+			));
+		}
+		if let Some(override_entry) = &self.legacy_single_override {
+			return Ok(ScanStream::from_batches(
+				override_entry.schema.clone(),
+				request.session_id,
+				request.query_id,
+				override_entry.batches.clone(),
+			));
+		}
+
+		self.base.scan(request).await
+	}
+}
+
+fn legacy_single_shuffle_override(
+	plan: &ExecutionPlan,
+	overrides: &HashMap<TableId, ScanOverride>,
+) -> Option<ScanOverride> {
+	if overrides.len() != 1 {
+		return None;
+	}
+	if overrides
+		.keys()
+		.any(|table_id| scan_schema_for_table_id(plan, *table_id).is_some())
+	{
+		return None;
+	}
+	overrides.values().next().cloned()
+}
+
+fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<SchemaRef> {
+	match plan {
+		ExecutionPlan::Scan {
+			legacy_table_id,
+			schema,
+			..
+		} if *legacy_table_id == table_id => Some(schema.clone()),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => scan_schema_for_table_id(input, table_id),
+		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
+			.or_else(|| scan_schema_for_table_id(right, table_id)),
+		ExecutionPlan::Scan { .. } => None,
 	}
 }
 
 pub struct ToronCoordinator {
 	memory: Arc<MemoryManager>,
+}
+
+#[derive(Debug)]
+pub struct RemoteTaskCompletion {
+	pub batches: Vec<RecordBatch>,
+	pub output: TaskCompletionOutput,
+	pub telemetry: TaskTelemetry,
 }
 
 pub struct NetworkTaskDispatcher<Transport> {
@@ -401,10 +1021,14 @@ where
 
 		match self
 			.coordinator
-			.execute_task_on_worker_with_completion(stream, spec.clone())
+			.execute_task_on_worker_with_telemetry(stream, spec.clone())
 			.await
 		{
-			Ok((batches, output)) => DispatchOutcome::CompletedWithBatches { output, batches },
+			Ok(completion) => DispatchOutcome::CompletedWithTelemetry {
+				output: completion.output,
+				batches: completion.batches,
+				telemetry: completion.telemetry,
+			},
 			Err(error) => DispatchOutcome::Failed(dispatch_failure_kind(error)),
 		}
 	}
@@ -428,11 +1052,11 @@ impl ToronCoordinator {
 			.map(|(results, _)| results)
 	}
 
-	pub async fn execute_task_on_worker_with_completion<Stream>(
+	pub async fn execute_task_on_worker_with_telemetry<Stream>(
 		&self,
 		mut stream: Stream,
 		spec: TaskSpec,
-	) -> Result<(Vec<RecordBatch>, TaskCompletionOutput), QueryError>
+	) -> Result<RemoteTaskCompletion, QueryError>
 	where
 		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 	{
@@ -447,7 +1071,8 @@ impl ToronCoordinator {
 		.await?;
 
 		let mut results = Vec::new();
-		let completion = loop {
+		let mut batch_decode_micros = 0u64;
+		let (output, telemetry) = loop {
 			let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
 			response
 				.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
@@ -467,10 +1092,13 @@ impl ToronCoordinator {
 							expected: "TaskBatch for requested task",
 						});
 					}
+					let batch_decode_started = Instant::now();
 					let mut reader = StreamReader::try_new(payload.payload.as_slice(), None)?;
 					while let Some(batch) = reader.next().transpose()? {
 						results.push(batch);
 					}
+					batch_decode_micros =
+						batch_decode_micros.saturating_add(duration_micros(batch_decode_started));
 				}
 				MessageKind::TaskComplete => {
 					let payload: TaskCompletePayload = decode_payload(&response.payload)?;
@@ -479,7 +1107,12 @@ impl ToronCoordinator {
 							expected: "TaskComplete for requested task",
 						});
 					}
-					break payload.output;
+					let mut telemetry = payload.telemetry.unwrap_or_default();
+					telemetry.phases.batch_decode_micros = telemetry
+						.phases
+						.batch_decode_micros
+						.saturating_add(batch_decode_micros);
+					break (payload.output, telemetry);
 				}
 				MessageKind::TaskFailed => {
 					let payload: TaskFailedPayload = decode_payload(&response.payload)?;
@@ -495,7 +1128,25 @@ impl ToronCoordinator {
 			}
 		};
 
-		Ok((results, completion))
+		Ok(RemoteTaskCompletion {
+			batches: results,
+			output,
+			telemetry,
+		})
+	}
+
+	pub async fn execute_task_on_worker_with_completion<Stream>(
+		&self,
+		stream: Stream,
+		spec: TaskSpec,
+	) -> Result<(Vec<RecordBatch>, TaskCompletionOutput), QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		let completion = self
+			.execute_task_on_worker_with_telemetry(stream, spec)
+			.await?;
+		Ok((completion.batches, completion.output))
 	}
 
 	pub async fn pull_partition_from_worker<Stream>(
@@ -637,18 +1288,29 @@ async fn send_task_failed<Stream>(
 where
 	Stream: tokio::io::AsyncWrite + Unpin,
 {
+	let kind = match &error {
+		QueryError::Runtime(RuntimeError::TaskFailure { kind }) if kind.worker_emittable() => {
+			kind.clone()
+		}
+		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
+			dimension,
+			requested,
+			available,
+		}) => TaskFailureKind::BudgetExhausted {
+			dimension: *dimension,
+			requested: *requested,
+			available: *available,
+		},
+		_ => TaskFailureKind::Internal {
+			reason: error.to_string(),
+		},
+	};
 	send_payload(
 		stream,
 		MessageKind::TaskFailed,
 		EnvelopeIdentity::task(identity),
 		None,
-		&TaskFailedPayload::new_worker_emitted(
-			identity,
-			TaskFailureKind::Internal {
-				reason: error.to_string(),
-			},
-		)
-		.expect("Internal is worker-emittable"),
+		&TaskFailedPayload::new_worker_emitted(identity, kind).expect("kind is worker-emittable"),
 	)
 	.await
 }
@@ -691,6 +1353,15 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 	let reason = error.to_string();
 	match error {
 		QueryError::Runtime(RuntimeError::TaskFailure { kind }) => kind,
+		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
+			dimension,
+			requested,
+			available,
+		}) => TaskFailureKind::BudgetExhausted {
+			dimension,
+			requested,
+			available,
+		},
 		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
 			TaskFailureKind::ProtocolMismatch
 		}

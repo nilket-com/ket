@@ -453,7 +453,7 @@ fn cases() -> Vec<BenchCase> {
 			name: "filter_projection",
 			plan: LogicalPlan::Project {
 				input: Box::new(filter_scan("amount", 500)),
-				exprs: vec![Expr::Column("id".to_string())],
+				exprs: vec![Expr::column("id")],
 			},
 			expect_pbc: true,
 		},
@@ -462,7 +462,7 @@ fn cases() -> Vec<BenchCase> {
 			plan: LogicalPlan::Filter {
 				input: Box::new(scan()),
 				predicate: Expr::Eq(
-					Box::new(Expr::Column("id".to_string())),
+					Box::new(Expr::column("id")),
 					Box::new(Expr::Literal(ScalarValue::Int64(Some(777)))),
 				),
 			},
@@ -524,7 +524,7 @@ fn scan() -> LogicalPlan {
 }
 
 fn column(name: &str) -> Expr {
-	Expr::Column(name.to_string())
+	Expr::column(name)
 }
 
 fn project_scan(columns: Vec<&str>) -> LogicalPlan {
@@ -538,7 +538,7 @@ fn filter_scan(column: &str, value: i32) -> LogicalPlan {
 	LogicalPlan::Filter {
 		input: Box::new(scan()),
 		predicate: Expr::Gt(
-			Box::new(Expr::Column(column.to_string())),
+			Box::new(Expr::column(column)),
 			Box::new(Expr::Literal(ScalarValue::Int32(Some(value)))),
 		),
 	}
