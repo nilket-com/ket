@@ -49,9 +49,9 @@ pub use wendelon::integration::compute::{
 };
 pub use wendelon::schema::{
 	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
-	DurabilityLevel as DurabilityClass, LocalityPolicyV1, LogicalSchemaFingerprint, PbcRejectCode,
+	DurabilityLevel as DurabilityClass, LocalityPolicy, LogicalSchemaFingerprint, PbcRejectCode,
 	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, StateDigest, TableObjectId, TableSchemaDescriptorV1,
+	SchemaEvolutionPolicyV1, StateDigest, TableObjectId, TableSchemaDescriptor,
 	TableSpreadLocalityDescriptorV1,
 };
 
@@ -196,7 +196,7 @@ pub struct TableWriteReceipt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableSchemaUpdateRequest {
 	pub tenant_id: TenantId,
-	pub descriptor: TableSchemaDescriptorV1,
+	pub descriptor: TableSchemaDescriptor,
 	pub expected_generation: SchemaGeneration,
 	pub mutation: SchemaMutationKindV1,
 	pub intent_id: SchemaIntentId,
@@ -205,7 +205,7 @@ pub struct TableSchemaUpdateRequest {
 impl TableSchemaUpdateRequest {
 	pub fn create(
 		tenant_id: TenantId,
-		descriptor: TableSchemaDescriptorV1,
+		descriptor: TableSchemaDescriptor,
 		intent_id: SchemaIntentId,
 	) -> Self {
 		Self {
@@ -219,7 +219,7 @@ impl TableSchemaUpdateRequest {
 
 	pub fn alter(
 		tenant_id: TenantId,
-		descriptor: TableSchemaDescriptorV1,
+		descriptor: TableSchemaDescriptor,
 		expected_generation: impl Into<SchemaGeneration>,
 		intent_id: SchemaIntentId,
 	) -> Self {
@@ -416,7 +416,7 @@ impl Client {
 	pub fn prepare_table_schema_update(
 		&self,
 		tenant_id: TenantId,
-		descriptor: TableSchemaDescriptorV1,
+		descriptor: TableSchemaDescriptor,
 		expected_generation: impl Into<SchemaGeneration>,
 		mutation: SchemaMutationKindV1,
 		intent_id: SchemaIntentId,
@@ -574,7 +574,7 @@ impl Client {
 	pub async fn table_write(
 		&self,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		payload: RecordBatch,
 		options: WriteOptions,
 	) -> Result<TableWriteReceipt, ClientError> {
@@ -722,7 +722,7 @@ impl Client {
 	pub async fn table_query_stream(
 		&self,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<StreamingQueryResult, ClientError> {
@@ -779,7 +779,7 @@ impl Client {
 	pub async fn table_query(
 		&self,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<QueryResult, ClientError> {
@@ -928,19 +928,19 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::decode_table_schema_descriptor_v1;
 
-	fn table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+	fn table_descriptor(generation: u64) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("name", DataType::Utf8, true),
 		]);
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x42; 16]),
 			generation,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()

@@ -1,4 +1,7 @@
+pub mod distributed;
+
 use crate::ir::TableId;
+pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
 
 use thiserror::Error;
 
@@ -126,6 +129,8 @@ pub enum ExecutionError {
 pub enum WireError {
 	#[error("wire decode failed: {0}")]
 	Decode(#[from] postcard::Error),
+	#[error("wire frame is too large to address: {payload_len} bytes")]
+	FrameTooLarge { payload_len: usize },
 }
 
 #[derive(Debug, Error)]
@@ -166,6 +171,8 @@ pub enum QueryError {
 	Wire(#[from] WireError),
 	#[error(transparent)]
 	Spill(#[from] SpillError),
+	#[error(transparent)]
+	Runtime(#[from] RuntimeError),
 	#[error("query IO error: {0}")]
 	Io(#[from] std::io::Error),
 	#[error("query arrow error: {0}")]
@@ -186,8 +193,8 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::path::{Path, PathBuf};
 	use wendelon::schema::{
-		LocalityPolicyV1, PbcRejectCode, PrimaryKeyDescriptorV1, ReadStatus, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1, TenantId,
+		LocalityPolicy, PbcRejectCode, PrimaryKeyDescriptorV1, ReadStatus, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId,
 	};
 	use wendelon_client::ClientError;
 
@@ -249,14 +256,14 @@ mod tests {
 
 	fn descriptor_fingerprint() -> wendelon::schema::PhysicalDescriptorFingerprint {
 		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0xEE; 16]),
 			1,
 			"local",
 			"errors",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")

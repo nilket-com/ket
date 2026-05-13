@@ -43,7 +43,7 @@ pub struct TableBinding {
 impl TableBinding {
 	pub fn from_descriptor(
 		legacy_table_id: TableId,
-		descriptor: &wendelon_client::TableSchemaDescriptorV1,
+		descriptor: &wendelon_client::TableSchemaDescriptor,
 	) -> Result<Self, CatalogError> {
 		let schema = Arc::new(descriptor.arrow_schema().map_err(|error| {
 			CatalogError::FingerprintResolution {
@@ -121,7 +121,7 @@ impl MockCatalog {
 	pub fn register_descriptor(
 		&mut self,
 		legacy_table_id: TableId,
-		descriptor: wendelon_client::TableSchemaDescriptorV1,
+		descriptor: wendelon_client::TableSchemaDescriptor,
 	) -> Result<(), CatalogError> {
 		let table_ref = TableRef::with_schema(&descriptor.namespace, &descriptor.table_name);
 		let unqualified_ref = TableRef::new(&descriptor.table_name);
@@ -175,7 +175,7 @@ pub struct WendelonCatalog {
 
 impl WendelonCatalog {
 	pub fn from_descriptors(
-		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptorV1)>,
+		descriptors: impl IntoIterator<Item = (TableId, wendelon_client::TableSchemaDescriptor)>,
 	) -> Result<Self, CatalogError> {
 		let mut catalog = Self::default();
 		for (table_id, descriptor) in descriptors {
@@ -235,7 +235,7 @@ fn pbc_eligible_columns(schema: &Schema) -> HashSet<ColumnOrdinal> {
 
 fn primary_key_columns(
 	schema: &Schema,
-	descriptor: &wendelon_client::TableSchemaDescriptorV1,
+	descriptor: &wendelon_client::TableSchemaDescriptor,
 ) -> Result<HashSet<ColumnOrdinal>, CatalogError> {
 	descriptor
 		.primary_key_descriptor()
@@ -278,8 +278,8 @@ mod tests {
 	use super::*;
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -335,21 +335,21 @@ mod tests {
 		assert!(resolved.column_is_pbc_eligible(ColumnOrdinal(1)));
 	}
 
-	fn descriptor() -> TableSchemaDescriptorV1 {
+	fn descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int32, true),
 			Field::new("region", DataType::Utf8, true),
 		]);
 
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0xCA; 16]),
 			3,
 			"bench",
 			"orders",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")

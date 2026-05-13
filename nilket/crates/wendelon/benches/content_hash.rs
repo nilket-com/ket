@@ -12,9 +12,9 @@ use arrow::array::{ArrayRef, Int64Array, LargeBinaryArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
-	ClientWriteId, DurabilityLevel, HybridTimestamp, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	ClientWriteId, DurabilityLevel, HybridTimestamp, LocalityPolicy, MultiRowLayoutDescriptor,
 	NodeId, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId,
+	TableSchemaDescriptor, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta, TenantId,
 	WriterNodeId, encode_table_write_row_count, validate_table_write_request_batch,
 };
 use wendelon::storage::content_hash::encode_row_canonical;
@@ -71,8 +71,8 @@ impl BenchConfig {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let config = BenchConfig::parse();
-	let identity_descriptor = descriptor(LocalityPolicyV1::IdentityProjection)?;
-	let spread_descriptor = descriptor(LocalityPolicyV1::TableSpreadProjection(
+	let identity_descriptor = descriptor(LocalityPolicy::IdentityProjection)?;
+	let spread_descriptor = descriptor(LocalityPolicy::TableSpreadProjection(
 		TableSpreadLocalityDescriptorV1 {
 			spread_factor: 4,
 			prefix_bits: 16,
@@ -118,13 +118,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn descriptor(
-	locality: LocalityPolicyV1,
-) -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+	locality: LocalityPolicy,
+) -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new("event_id", DataType::Int64, false),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	Ok(TableSchemaDescriptorV1::new_with_layout(
+	Ok(TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x49; 16]),
 		1,
 		"bench",
@@ -167,7 +167,7 @@ fn batch(rows: usize, payload_bytes: usize) -> RecordBatch {
 }
 
 fn bench_meta(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	rows: usize,
 ) -> Result<TableWriteRequestMeta, Box<dyn std::error::Error>> {
 	Ok(TableWriteRequestMeta {
@@ -205,7 +205,7 @@ struct AdmissionChunk {
 }
 
 fn chunked_batches(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 ) -> Result<Vec<AdmissionChunk>, Box<dyn std::error::Error>> {
 	let mut chunks = Vec::new();
@@ -225,7 +225,7 @@ fn chunked_batches(
 
 fn bench_canonical_encode(
 	label: &str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	warmup_iters: usize,
 	measure_iters: usize,
@@ -255,7 +255,7 @@ fn bench_canonical_encode(
 fn bench_admission(
 	label: &str,
 	rows: usize,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	chunks: &[AdmissionChunk],
 	warmup_iters: usize,
 	measure_iters: usize,

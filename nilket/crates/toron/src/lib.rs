@@ -1,6 +1,7 @@
 pub mod binder;
 pub mod catalog;
 pub mod coordinator;
+pub mod distributed;
 pub mod error;
 pub mod exec;
 pub mod ir;
@@ -21,17 +22,38 @@ mod tests {
 
 	use crate::binder::{PlannerConfig, bind};
 	use crate::catalog::MockCatalog;
+	use crate::coordinator::DistributedQueryCoordinator;
+	use crate::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
+	use crate::distributed::identity::{
+		AttemptId, ExchangeId, LeaseEpoch, PartitionId, QueryId, TaskId, TaskIdentity, WorkerId,
+	};
+	use crate::distributed::partition_store::{
+		HybridPartitionStore, InMemoryPartitionStore, PartitionPayload, PartitionStore,
+	};
+	use crate::distributed::scheduler::{DistributedScheduler, StagePlan, TaskPlan};
+	use crate::distributed::task::{
+		ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionCount, PartitionManifest,
+		ProducerPartitionRef, RowCount, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding,
+		TaskSpec,
+	};
+	use crate::distributed::task_state::{AcceptanceState, TaskKey};
+	use crate::distributed::worker_registry::{
+		ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
+		WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
+	};
 	use crate::exec::Executor;
 	use crate::ir::{
-		AggregateFunction, Expr, LogicalPlan, MorselId, ScalarValue, StageId, TableId,
+		AggregateFunction, ExecutionPlan, Expr, LogicalPlan, MorselId, ScalarValue, StageId,
+		TableId,
 	};
 	use crate::server::{
-		ToronCoordinator, ToronWorker, memory::MemoryManager, spill::SpillManager,
+		NetworkTaskDispatcher, ToronCoordinator, ToronWorker, memory::MemoryManager,
+		spill::SpillManager, transport::TcpTransport,
 	};
 	use crate::storage::InMemoryStorageScan;
 	use wendelon::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 	use wendelon::storage::file_ops::BlockingFileOps;
 
@@ -293,25 +315,23 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn coordinator_worker_boundary_executes_morsel() {
+	async fn coordinator_worker_boundary_executes_task_spec_over_tcp() {
 		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
 		let val_array = Int32Array::from((0..100).collect::<Vec<i32>>());
 		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(val_array)]).unwrap();
 
 		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
 		let memory = test_memory();
-		let worker = Arc::new(ToronWorker::new(
-			storage,
-			memory.clone(),
-			test_catalog(schema.as_ref()),
-		));
+		let catalog = test_catalog(schema.as_ref());
+		let worker = Arc::new(ToronWorker::new(storage, memory.clone(), catalog.clone()));
 		let coordinator = ToronCoordinator::new(memory);
 
-		let (mut client_stream, mut server_stream) = tokio::io::duplex(1024 * 1024);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
 
-		// Spawn worker handle
 		let worker_handle = tokio::spawn(async move {
-			worker.handle_connection(&mut server_stream).await.unwrap();
+			let (server_stream, _) = listener.accept().await.unwrap();
+			worker.handle_connection(server_stream).await.unwrap();
 		});
 
 		let plan = LogicalPlan::Aggregate {
@@ -326,9 +346,14 @@ mod tests {
 			}),
 		};
 
-		// Coordinator executes morsel on worker via duplex stream
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap();
+		let spec = test_task_spec(bound, TaskId::new(0));
+		let client_stream = tokio::net::TcpStream::connect(address).await.unwrap();
+
 		let results = coordinator
-			.execute_morsel_on_worker(&mut client_stream, plan, Some((MorselId(0), 1)))
+			.execute_task_on_worker(client_stream, spec)
 			.await
 			.unwrap();
 
@@ -341,8 +366,282 @@ mod tests {
 			.value(0);
 		assert_eq!(count, 100);
 
-		drop(client_stream);
 		worker_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn distributed_scheduler_dispatches_task_spec_over_tcp() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int32Array::from((0..64).collect::<Vec<i32>>()))],
+		)
+		.unwrap();
+		let memory = test_memory();
+		let catalog = test_catalog(schema.as_ref());
+		let worker = Arc::new(ToronWorker::new(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			catalog.clone(),
+		));
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.unwrap();
+			worker.handle_connection(server_stream).await.unwrap();
+		});
+
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap();
+		let spec = test_task_spec(bound, TaskId::new(0));
+		let key = TaskKey::from_identity(spec.identity);
+		let worker_id = WorkerId::from_u128(77);
+		let registry = StaticWorkerRegistry::new([WorkerEntry {
+			worker_id,
+			endpoint: WorkerEndpoint::new(address.to_string()),
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(1),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(8),
+				spill_capacity_reserved: ByteCount::new(1024 * 1024),
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::default(),
+			},
+			status: WorkerStatus::Live,
+		}]);
+		let stage = StagePlan {
+			stage_id: StageId::new(0),
+			upstream_stage: None,
+			tasks: vec![TaskPlan::new(spec)],
+		};
+		let mut scheduler = DistributedScheduler::new(registry);
+		let mut dispatcher = NetworkTaskDispatcher::new(memory, TcpTransport::new());
+
+		let run = scheduler
+			.dispatch_loop(&[stage], &mut dispatcher)
+			.await
+			.expect("scheduler dispatch over tcp");
+
+		assert_eq!(run.dispatched.len(), 1);
+		assert_eq!(run.final_results.len(), 1);
+		assert_eq!(
+			run.final_results[0]
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap()
+				.value(0),
+			64
+		);
+		assert_eq!(
+			scheduler.state().acceptance_state(key),
+			AcceptanceState::LiveAccepted {
+				attempt_id: AttemptId::first(),
+				worker_id,
+				drained: false,
+			}
+		);
+		worker_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn distributed_query_coordinator_executes_fragmented_exchange_over_tcp() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int32Array::from((0..16).collect::<Vec<i32>>()))],
+		)
+		.unwrap();
+		let memory = test_memory();
+		let catalog = test_catalog(schema.as_ref());
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = WorkerEndpoint::new(listener.local_addr().unwrap().to_string());
+		let worker_id = WorkerId::from_u128(99);
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			Arc::new(InMemoryPartitionStore::new()),
+			worker_id,
+			endpoint.clone(),
+		));
+		let server_handle = tokio::spawn(async move {
+			let mut handles = Vec::new();
+			for _ in 0..3 {
+				let (server_stream, _) = listener.accept().await.unwrap();
+				let worker = worker.clone();
+				handles.push(tokio::spawn(async move {
+					worker.handle_connection(server_stream).await.unwrap();
+				}));
+			}
+			for handle in handles {
+				handle.await.unwrap();
+			}
+		});
+		let registry = Arc::new(StaticWorkerRegistry::new([WorkerEntry {
+			worker_id,
+			endpoint,
+			lease: WorkerLease {
+				last_heartbeat: UnixMillis::new(1),
+				epoch: LeaseEpoch::new(1),
+			},
+			capabilities: WorkerCapabilities {
+				advertised_memory: ByteCount::new(1024 * 1024),
+				simd_width: SimdLaneCount::new(8),
+				spill_capacity_reserved: ByteCount::new(1024 * 1024),
+			},
+			resources: WorkerResourceState {
+				in_flight: ByteCount::ZERO,
+				active_tasks: ActiveTaskCount::default(),
+			},
+			status: WorkerStatus::Live,
+		}]));
+		let coordinator = DistributedQueryCoordinator::new(
+			catalog,
+			registry,
+			memory,
+			Arc::new(TcpTransport::new()),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		);
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Exchange {
+				partition_count: 1,
+				key: vec![Expr::Column("val".to_string())],
+				input: Box::new(LogicalPlan::Scan {
+					table: TableId(1),
+					projection: None,
+				}),
+			}),
+		};
+
+		let results = coordinator.execute_query(&plan).await.unwrap();
+
+		assert_eq!(results.len(), 1);
+		assert_eq!(
+			results[0]
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.unwrap()
+				.value(0),
+			16
+		);
+		server_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn shuffle_task_complete_publishes_partition_manifest() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("key", DataType::Int32, false),
+			Field::new("val", DataType::Int32, false),
+		]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![
+				Arc::new(Int32Array::from((0..20).collect::<Vec<i32>>())),
+				Arc::new(Int32Array::from((0..20).collect::<Vec<i32>>())),
+			],
+		)
+		.unwrap();
+		let storage = Arc::new(InMemoryStorageScan { table_data: batch });
+		let memory = test_memory();
+		let catalog = test_catalog(schema.as_ref());
+		let spill_dir =
+			std::env::temp_dir().join(format!("toron_shuffle_manifest_{}", rand::random::<u64>()));
+		let store = Arc::new(
+			HybridPartitionStore::new(spill_dir.clone(), ByteCount::ZERO)
+				.expect("hybrid partition store"),
+		);
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = WorkerEndpoint::new(listener.local_addr().unwrap().to_string());
+		let worker_id = WorkerId::from_u128(88);
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			storage,
+			memory.clone(),
+			store.clone(),
+			worker_id,
+			endpoint.clone(),
+		));
+		let coordinator = ToronCoordinator::new(memory.clone());
+		let plan = LogicalPlan::Exchange {
+			partition_count: 2,
+			key: vec![Expr::Column("key".to_string())],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap();
+		let spec = TaskSpec {
+			output: TaskOutputBinding::ShuffleProducer {
+				exchange_id: ExchangeId::new(55),
+				partition_count: PartitionCount::new(2),
+				partition_key: Vec::new(),
+			},
+			..test_task_spec(bound, TaskId::new(55))
+		};
+		let socket_address = endpoint.as_str().to_string();
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.unwrap();
+			worker.handle_connection(server_stream).await.unwrap();
+		});
+
+		let (_batches, completion) = coordinator
+			.execute_task_on_worker_with_completion(
+				tokio::net::TcpStream::connect(socket_address)
+					.await
+					.unwrap(),
+				spec,
+			)
+			.await
+			.unwrap();
+		let TaskCompletionOutput::ShuffleProducer { manifest } = completion else {
+			panic!("expected shuffle manifest");
+		};
+
+		assert_eq!(manifest.exchange_id, ExchangeId::new(55));
+		assert_eq!(manifest.producer_worker_id, worker_id);
+		assert_eq!(manifest.producer_endpoint, endpoint);
+		assert!(matches!(
+			manifest.backend,
+			PartitionBackend::EncryptedSpill { .. }
+		));
+		assert_eq!(manifest.partitions.len(), 2);
+		let first_address = PartitionAddress {
+			query_id: manifest.query_id,
+			exchange_id: manifest.exchange_id,
+			producer_stage_id: manifest.stage_id,
+			producer_task_id: manifest.task_id,
+			attempt_id: manifest.attempt_id,
+			partition_id: manifest.partitions[0].partition_id,
+		};
+		assert!(store.pull(first_address, manifest.attempt_id).is_ok());
+		worker_handle.await.unwrap();
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
 	}
 
 	#[tokio::test]
@@ -391,13 +690,18 @@ mod tests {
 			}),
 		};
 
-		// 1. Stage 1: Partitioning on Workers
+		let catalog = test_catalog(schema.as_ref());
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap();
+
+		// 1. Stage 1: partitioning on workers from an already-bound task spec.
 		let w1_partitions = w1
-			.execute_morsel_local(&plan, Some((MorselId(0), 1)))
+			.execute_task_local(&test_task_spec(bound.clone(), TaskId::new(1)))
 			.await
 			.unwrap();
 		let w2_partitions = w2
-			.execute_morsel_local(&plan, Some((MorselId(0), 1)))
+			.execute_task_local(&test_task_spec(bound, TaskId::new(2)))
 			.await
 			.unwrap();
 
@@ -405,25 +709,307 @@ mod tests {
 		let w1_total: usize = w1_partitions.iter().map(|b| b.num_rows()).sum();
 		assert_eq!(w1_total, 50);
 
-		// 2. Stage 2: P2P Exchange
-		let (mut p2p_tx, mut p2p_rx) = tokio::io::duplex(1024 * 1024);
+		// 2. Stage 2: pull-addressed partition-store exchange.
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let address = PartitionAddress {
+			query_id: QueryId::from_u128(10),
+			exchange_id: ExchangeId::new(1),
+			producer_stage_id: StageId::new(1),
+			producer_task_id: TaskId::new(1),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(1),
+		};
+		let payload = PartitionPayload::new(
+			address,
+			encode_test_batch(&w1_partitions[1]),
+			RowCount::new(u64::try_from(w1_partitions[1].num_rows()).expect("row count fits u64")),
+			ArrowIpcDigest::new([1; 32]),
+		);
+		let manifest = PartitionManifest {
+			query_id: address.query_id,
+			stage_id: address.producer_stage_id,
+			task_id: address.producer_task_id,
+			attempt_id: address.attempt_id,
+			exchange_id: address.exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("in-memory-worker-1"),
+			partitions: vec![payload.entry()],
+			backend: PartitionBackend::InMemory,
+		};
+		store.publish(manifest, vec![payload]).unwrap();
 
-		let w2_clone = w2.clone();
-		let w2_handle = tokio::spawn(async move {
-			w2_clone.handle_connection(&mut p2p_rx).await.unwrap();
+		let partition_worker = Arc::new(ToronWorker::with_partition_store(
+			Arc::new(InMemoryStorageScan {
+				table_data: w2_partitions[0].clone(),
+			}),
+			memory.clone(),
+			store,
+		));
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = listener.local_addr().unwrap();
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.unwrap();
+			partition_worker
+				.handle_connection(server_stream)
+				.await
+				.unwrap();
 		});
-
-		// W1 sends its partition[1] to W2
-		w1.send_shuffle_data(&mut p2p_tx, StageId(1), 1, &w1_partitions[1])
+		let client_stream = tokio::net::TcpStream::connect(endpoint).await.unwrap();
+		let pulled = ToronCoordinator::new(memory.clone())
+			.pull_partition_from_worker(client_stream, address, AttemptId::first())
 			.await
 			.unwrap();
-		drop(p2p_tx);
+		worker_handle.await.unwrap();
 
-		w2_handle.await.unwrap();
+		let mut reader =
+			arrow::ipc::reader::StreamReader::try_new(pulled.payload.as_slice(), None).unwrap();
+		let pulled_batch = reader.next().transpose().unwrap().unwrap();
+		assert_eq!(pulled_batch.num_rows(), w1_partitions[1].num_rows());
 
 		// 3. Verification
 		assert!(w1_partitions.len() >= 1);
 		assert!(w2_partitions.len() >= 1);
+	}
+
+	#[tokio::test]
+	async fn partition_pull_stale_attempt_returns_partition_store_mismatch() {
+		let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+		)
+		.unwrap();
+		let memory = test_memory();
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let accepted_address = PartitionAddress {
+			query_id: QueryId::from_u128(11),
+			exchange_id: ExchangeId::new(1),
+			producer_stage_id: StageId::new(1),
+			producer_task_id: TaskId::new(1),
+			attempt_id: AttemptId::new(2),
+			partition_id: PartitionId::new(0),
+		};
+		let payload = PartitionPayload::new(
+			accepted_address,
+			encode_test_batch(&batch),
+			RowCount::new(3),
+			ArrowIpcDigest::new([2; 32]),
+		);
+		store
+			.publish(
+				PartitionManifest {
+					query_id: accepted_address.query_id,
+					stage_id: accepted_address.producer_stage_id,
+					task_id: accepted_address.producer_task_id,
+					attempt_id: accepted_address.attempt_id,
+					exchange_id: accepted_address.exchange_id,
+					producer_worker_id: WorkerId::from_u128(2),
+					producer_endpoint: WorkerEndpoint::new("in-memory-worker-2"),
+					partitions: vec![payload.entry()],
+					backend: PartitionBackend::InMemory,
+				},
+				vec![payload],
+			)
+			.unwrap();
+		let worker = Arc::new(ToronWorker::with_partition_store(
+			Arc::new(InMemoryStorageScan {
+				table_data: batch.clone(),
+			}),
+			memory.clone(),
+			store,
+		));
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = listener.local_addr().unwrap();
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.unwrap();
+			worker.handle_connection(server_stream).await.unwrap();
+		});
+
+		let stale_address = PartitionAddress {
+			attempt_id: AttemptId::first(),
+			..accepted_address
+		};
+		let err = ToronCoordinator::new(memory)
+			.pull_partition_from_worker(
+				tokio::net::TcpStream::connect(endpoint).await.unwrap(),
+				stale_address,
+				AttemptId::first(),
+			)
+			.await
+			.expect_err("stale attempt should surface as partition-store mismatch");
+
+		assert!(matches!(
+			err,
+			crate::error::QueryError::Runtime(
+				crate::error::RuntimeError::PartitionStoreMismatch { ref message }
+			) if message.contains("AttemptStale")
+		));
+		worker_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn shuffle_consumer_task_pulls_partition_refs_over_tcp() {
+		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let partition_batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int32Array::from((0..7).collect::<Vec<i32>>()))],
+		)
+		.unwrap();
+		let partition_bytes = encode_test_batch(&partition_batch);
+		let address = PartitionAddress {
+			query_id: QueryId::from_u128(22),
+			exchange_id: ExchangeId::new(3),
+			producer_stage_id: StageId::new(0),
+			producer_task_id: TaskId::new(4),
+			attempt_id: AttemptId::first(),
+			partition_id: PartitionId::new(0),
+		};
+		let payload = PartitionPayload::new(
+			address,
+			partition_bytes.clone(),
+			RowCount::new(7),
+			ArrowIpcDigest::new(wendelon::hash::blake3::digest(&partition_bytes)),
+		);
+		let producer_store = Arc::new(InMemoryPartitionStore::new());
+		let producer_worker_id = WorkerId::from_u128(42);
+		let memory = test_memory();
+		let producer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let producer_endpoint =
+			WorkerEndpoint::new(producer_listener.local_addr().unwrap().to_string());
+		let manifest = PartitionManifest {
+			query_id: address.query_id,
+			stage_id: address.producer_stage_id,
+			task_id: address.producer_task_id,
+			attempt_id: address.attempt_id,
+			exchange_id: address.exchange_id,
+			producer_worker_id,
+			producer_endpoint: producer_endpoint.clone(),
+			partitions: vec![payload.entry()],
+			backend: PartitionBackend::InMemory,
+		};
+		producer_store
+			.publish(manifest, vec![payload.clone()])
+			.unwrap();
+		let producer = Arc::new(ToronWorker::with_partition_store(
+			Arc::new(InMemoryStorageScan {
+				table_data: partition_batch.clone(),
+			}),
+			memory.clone(),
+			producer_store,
+		));
+		let producer_handle = tokio::spawn(async move {
+			let (server_stream, _) = producer_listener.accept().await.unwrap();
+			producer.handle_connection(server_stream).await.unwrap();
+		});
+
+		let consumer = Arc::new(ToronWorker::new(
+			Arc::new(InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(schema.clone()),
+			}),
+			memory.clone(),
+			test_catalog(schema.as_ref()),
+		));
+		let consumer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let consumer_endpoint = consumer_listener.local_addr().unwrap();
+		let consumer_handle = tokio::spawn(async move {
+			let (server_stream, _) = consumer_listener.accept().await.unwrap();
+			consumer.handle_connection(server_stream).await.unwrap();
+		});
+
+		let plan = LogicalPlan::Aggregate {
+			group_expr: vec![],
+			aggr_expr: vec![(
+				AggregateFunction::CountAll,
+				vec![Expr::Column("val".to_string())],
+			)],
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+		};
+		let catalog = test_catalog(schema.as_ref());
+		let bound = bind(&plan, catalog.as_ref(), &PlannerConfig::default())
+			.await
+			.unwrap();
+		let mut spec = test_task_spec(bound, TaskId::new(9));
+		spec.identity = TaskIdentity::new(
+			address.query_id,
+			StageId::new(1),
+			TaskId::new(9),
+			AttemptId::first(),
+		);
+		spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
+			exchange_id: address.exchange_id,
+			producer_stage_id: address.producer_stage_id,
+			partition_id: address.partition_id,
+			producer_partitions: vec![ProducerPartitionRef {
+				address,
+				worker_id: producer_worker_id,
+				endpoint: producer_endpoint,
+				size_bytes: ByteCount::new(
+					u64::try_from(partition_bytes.len()).expect("payload length fits u64"),
+				),
+				digest: ArrowIpcDigest::new(wendelon::hash::blake3::digest(&partition_bytes)),
+			}],
+		}];
+
+		let results = ToronCoordinator::new(memory)
+			.execute_task_on_worker(
+				tokio::net::TcpStream::connect(consumer_endpoint)
+					.await
+					.unwrap(),
+				spec,
+			)
+			.await
+			.unwrap();
+
+		let count = results[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.unwrap()
+			.value(0);
+		assert_eq!(count, 7);
+		consumer_handle.await.unwrap();
+		producer_handle.await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn coordinator_cancel_task_round_trips_over_tcp() {
+		let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+		)
+		.unwrap();
+		let memory = test_memory();
+		let worker = Arc::new(ToronWorker::new(
+			Arc::new(InMemoryStorageScan { table_data: batch }),
+			memory.clone(),
+			test_catalog(schema.as_ref()),
+		));
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let endpoint = listener.local_addr().unwrap();
+		let worker_handle = tokio::spawn(async move {
+			let (server_stream, _) = listener.accept().await.unwrap();
+			worker.handle_connection(server_stream).await.unwrap();
+		});
+		let identity = TaskIdentity::new(
+			QueryId::from_u128(14),
+			StageId::new(1),
+			TaskId::new(2),
+			AttemptId::first(),
+		);
+
+		ToronCoordinator::new(memory)
+			.cancel_task_on_worker(
+				tokio::net::TcpStream::connect(endpoint).await.unwrap(),
+				identity,
+			)
+			.await
+			.unwrap();
+
+		worker_handle.await.unwrap();
 	}
 
 	#[tokio::test]
@@ -554,21 +1140,21 @@ mod tests {
 		assert_eq!(count, 2);
 	}
 
-	fn test_descriptor(schema: &Schema) -> TableSchemaDescriptorV1 {
+	fn test_descriptor(schema: &Schema) -> TableSchemaDescriptor {
 		let primary_key = schema
 			.fields()
 			.first()
 			.expect("test schema must have a primary key column")
 			.name()
 			.clone();
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([1; 16]),
 			1,
 			"default",
 			"sales",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
@@ -580,6 +1166,34 @@ mod tests {
 			.register_descriptor(TableId(1), test_descriptor(schema))
 			.unwrap();
 		Arc::new(catalog)
+	}
+
+	fn test_task_spec(plan: ExecutionPlan, task_id: TaskId) -> TaskSpec {
+		TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(100),
+				StageId::new(0),
+				task_id,
+				AttemptId::first(),
+			),
+			partition: None,
+			plan,
+			inputs: vec![TaskInputBinding::Scan],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		}
+	}
+
+	fn encode_test_batch(batch: &RecordBatch) -> Vec<u8> {
+		let mut buffer = Vec::new();
+		{
+			let mut writer =
+				arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema()).unwrap();
+			writer.write(batch).unwrap();
+			writer.finish().unwrap();
+		}
+		buffer
 	}
 
 	#[tokio::test]

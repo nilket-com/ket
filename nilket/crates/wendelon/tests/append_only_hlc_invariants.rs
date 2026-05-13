@@ -16,12 +16,12 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use wendelon::schema::table::{
-	MultiRowLayoutDescriptor, TableSchemaDescriptorV1, TableWriteRequestMeta,
+	MultiRowLayoutDescriptor, TableSchemaDescriptor, TableWriteRequestMeta,
 	encode_table_write_row_count, synthesize_append_only_row_id,
 	validate_table_write_request_batch,
 };
 use wendelon::schema::{
-	HybridTimestamp, IntraBatchIndex, LocalityPolicyV1, RecordLayoutPolicy, RowIdentityPolicy,
+	HybridTimestamp, IntraBatchIndex, LocalityPolicy, RecordLayoutPolicy, RowIdentityPolicy,
 	SchemaEvolutionPolicyV1, TableObjectId, TenantId, WriterNodeId,
 };
 use wendelon::storage::multirow::{
@@ -29,7 +29,7 @@ use wendelon::storage::multirow::{
 	storage_rows_from_batch, strip_storage_synthetic_columns,
 };
 
-fn append_only_descriptor() -> TableSchemaDescriptorV1 {
+fn append_only_descriptor() -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![
 		Field::new(
 			"event_time",
@@ -38,14 +38,14 @@ fn append_only_descriptor() -> TableSchemaDescriptorV1 {
 		),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	TableSchemaDescriptorV1::new_with_layout(
+	TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x45; 16]),
 		1,
 		"analytics",
 		"events",
 		&schema,
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
@@ -70,7 +70,7 @@ fn append_only_batch(payloads: Vec<Option<&[u8]>>, times: Vec<i64>) -> RecordBat
 	.unwrap()
 }
 
-fn meta(descriptor: &TableSchemaDescriptorV1, rows: usize) -> TableWriteRequestMeta {
+fn meta(descriptor: &TableSchemaDescriptor, rows: usize) -> TableWriteRequestMeta {
 	let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
 	meta.tenant_id = TenantId::new(7);
 	meta.table_object_id = descriptor.table_object_id;
@@ -365,14 +365,14 @@ fn append_only_matcher_isolates_distinct_descriptors_with_same_user_schema() {
 			),
 			Field::new("payload", DataType::LargeBinary, true),
 		]);
-		TableSchemaDescriptorV1::new_with_layout(
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
 			"events_a",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -388,14 +388,14 @@ fn append_only_matcher_isolates_distinct_descriptors_with_same_user_schema() {
 			),
 			Field::new("payload", DataType::LargeBinary, true),
 		]);
-		TableSchemaDescriptorV1::new_with_layout(
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0xBB; 16]),
 			1,
 			"analytics",
 			"events_b",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

@@ -1,27 +1,26 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use serde::{Deserialize, Serialize};
 
+pub use crate::distributed::identity::QueryId;
 use crate::ir::{AggregateFunction, ScalarValue};
 use crate::ir::{QueryProfileHint, TableId};
 use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnOrdinal(pub u32);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnName(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PbcProgram(pub Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId(pub u128);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct QueryId(pub u128);
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedColumn {
 	pub name: ColumnName,
 	pub ordinal: ColumnOrdinal,
@@ -30,7 +29,7 @@ pub struct ResolvedColumn {
 	pub pbc_eligible: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExecutionExpr {
 	Column(ResolvedColumn),
 	Literal(ScalarValue),
@@ -48,19 +47,19 @@ pub enum ExecutionExpr {
 	TimeBucket(std::time::Duration, Box<ExecutionExpr>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregateCall {
 	pub function: AggregateFunction,
 	pub args: Vec<ExecutionExpr>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterDisposition {
 	FullyPushed,
 	EvaluateInToron,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionPlan {
 	Scan {
 		legacy_table_id: TableId,

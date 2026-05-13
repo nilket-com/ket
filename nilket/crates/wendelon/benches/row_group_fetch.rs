@@ -29,7 +29,7 @@ use wendelon::schema::pbc::{ColumnPredicateLiteralV1, OP_GT, OP_PUSH_COL, OP_PUS
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, ChunkSizeBytes, DictValueCount,
 	EncodingCascadeIndex, HybridTimestamp, Identity, IdentityPrefix, IpcBufferIndex,
-	IpcColumnOrdinal, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+	IpcColumnOrdinal, Locality, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
 	RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RowCount, RowGroupIndex, RowGroupRowCount, RowIdentityPolicy, RunCount,
 	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId, TenantId,
@@ -210,15 +210,15 @@ impl BenchConfig {
 fn descriptor(
 	schema: &Schema,
 	columns: usize,
-) -> std::io::Result<wendelon::schema::TableSchemaDescriptorV1> {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+) -> std::io::Result<wendelon::schema::TableSchemaDescriptor> {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x56; 16]),
 		1,
 		"bench",
 		"row_group_fetch",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
 				Error::new(
@@ -529,7 +529,7 @@ fn bench_writer(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let source_rows = source_rows(case.rows);
 	for (scenario, row_group_config) in [
@@ -583,7 +583,7 @@ fn bench_writer_target_sweep(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let source_rows = source_rows(case.rows);
 	for target in [1_024, 4_096, 8_192, 16_384] {
@@ -652,7 +652,7 @@ fn bench_directory_build_serialize(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let batches = split_batches(batch, 4_096);
 	let bytes = encode_record_batches_bytes(&batches, RecordBodyCompressionPolicy::Uncompressed)?;
@@ -765,7 +765,7 @@ fn bench_selected_bytes(case: BenchCase, fixture: &EncodedFixture) -> std::io::R
 fn encoded_fixture(
 	rows: usize,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<EncodedFixture> {
@@ -1130,15 +1130,15 @@ const SPARSE_PROJECTION_RUNTIME_RECORD_ROWS: usize = 65_536;
 
 fn sparse_projection_descriptor(
 	schema: &Schema,
-) -> std::io::Result<wendelon::schema::TableSchemaDescriptorV1> {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+) -> std::io::Result<wendelon::schema::TableSchemaDescriptor> {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x60; 16]),
 		1,
 		"bench",
 		"sparse_projection_fetch",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
 				Error::new(

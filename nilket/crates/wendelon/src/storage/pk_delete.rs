@@ -1,5 +1,5 @@
 use crate::schema::{
-	HybridTimestamp, Identity, RowIdentityPolicy, TableSchemaDescriptorV1, TenantId,
+	HybridTimestamp, Identity, RowIdentityPolicy, TableSchemaDescriptor, TenantId,
 };
 use crate::storage::core::{RecordLocation, StorageEngine};
 use crate::storage::manager::SlabManager;
@@ -14,7 +14,7 @@ pub enum PkAdmissionOutcome {
 }
 
 pub(crate) fn row_visible_for_admission(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	tenant_id: TenantId,
 	key_identity: Identity,
 	admission_hlc: HybridTimestamp,
@@ -63,7 +63,7 @@ pub(crate) fn pk_write_outcome_for_latest(
 }
 
 pub(crate) fn admit_pk_write_row(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	tenant_id: TenantId,
 	key_identity: Identity,
 	admission_hlc: HybridTimestamp,
@@ -82,7 +82,7 @@ pub(crate) fn admit_pk_write_row(
 }
 
 pub(crate) fn admit_pk_delete_row(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	tenant_id: TenantId,
 	key_identity: Identity,
 	delete_hlc: HybridTimestamp,

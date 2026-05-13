@@ -11,8 +11,8 @@ use toron::exec::Executor;
 use toron::ir::{Expr, LogicalPlan, ScalarValue, TableId};
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor,
 };
 
 #[test]
@@ -163,6 +163,194 @@ fn scan_stream_collection_localized() {
 	);
 }
 
+#[test]
+fn distributed_identity_keeps_morsel_id_worker_local() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src/distributed"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("MorselId"))
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"MorselId found in distributed identity/task surfaces:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn message_kind_retired_morsel_complete() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire source");
+	let message_kind = source
+		.split("pub enum MessageKind")
+		.nth(1)
+		.and_then(|rest| rest.split("impl MessageKind").next())
+		.expect("MessageKind block");
+
+	assert!(!message_kind.contains("MorselComplete"));
+	assert_eq!(toron::wire::MessageKind::COUNT, 12);
+}
+
+#[test]
+fn task_failure_kind_keeps_partition_store_errors_separate() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/error/distributed.rs"))
+		.expect("read distributed error source");
+	let task_failure = source
+		.split("pub enum TaskFailureKind")
+		.nth(1)
+		.and_then(|rest| rest.split("impl TaskFailureKind").next())
+		.expect("TaskFailureKind block");
+
+	assert_eq!(enum_variant_count(task_failure), 7);
+	assert!(!task_failure.contains("PartitionMissing"));
+	assert!(!task_failure.contains("StaleAttempt"));
+}
+
+fn enum_variant_count(enum_body: &str) -> usize {
+	enum_body
+		.lines()
+		.filter(|line| {
+			let trimmed = line.trim_start();
+			trimmed
+				.chars()
+				.next()
+				.is_some_and(|first| first.is_ascii_uppercase())
+				&& (trimmed.ends_with(',') || trimmed.ends_with('{'))
+		})
+		.count()
+}
+
+#[test]
+fn wire_contract_has_no_legacy_toron_message_wrapper() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire source");
+
+	for forbidden in [
+		"ToronMessage",
+		"ExecuteMorsel",
+		"ArrowBatch",
+		"ShuffleData",
+		"Error(String)",
+	] {
+		assert!(
+			!source.contains(forbidden),
+			"legacy wire marker {forbidden} is still present"
+		);
+	}
+}
+
+#[test]
+fn wire_envelope_requires_routable_identity() {
+	let source =
+		std::fs::read_to_string(manifest_dir().join("src/wire.rs")).expect("read wire source");
+	let envelope = source
+		.split("pub struct WireEnvelope")
+		.nth(1)
+		.and_then(|rest| rest.split("impl WireEnvelope").next())
+		.expect("WireEnvelope block");
+	let identity = source
+		.split("pub enum EnvelopeIdentity")
+		.nth(1)
+		.and_then(|rest| rest.split("impl EnvelopeIdentity").next())
+		.expect("EnvelopeIdentity block");
+
+	assert!(envelope.contains("pub identity: EnvelopeIdentity,"));
+	assert!(identity.contains("Task(TaskIdentity)"));
+	assert!(identity.contains("Partition(PartitionAddress)"));
+	assert!(identity.contains("worker_id: WorkerId"));
+	assert!(identity.contains("lease_epoch: LeaseEpoch"));
+}
+
+#[test]
+fn server_and_distributed_paths_have_no_sleep_mock() {
+	let manifest_dir = manifest_dir();
+	let offenders = ["src/server", "src/distributed"]
+		.into_iter()
+		.flat_map(|dir| source_lines(&manifest_dir.join(dir)))
+		.filter(|(_, _, line)| line.contains("tokio::time::sleep"))
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"sleep mock found in runtime path:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn shuffle_surface_has_no_push_to_peer_path() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(path, _, line)| {
+			let relative = path.strip_prefix(&manifest_dir).unwrap_or(path);
+			if relative == Path::new("src/wire.rs") {
+				return false;
+			}
+			line.contains("send_shuffle_data") || line.contains("ShuffleData")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"push-style shuffle path found outside wire guard scope:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn worker_runtime_does_not_bind_logical_plans() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src/server"))
+		.into_iter()
+		.filter(|(_, _, line)| line.contains("bind(") || line.contains("crate::binder::bind"))
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"worker runtime still binds logical plans:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn runtime_transport_is_not_duplex_only() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("tokio::io::duplex") || line.contains("MockZeroCopyTransport")
+		})
+		.collect::<Vec<_>>();
+
+	assert!(
+		offenders.is_empty(),
+		"duplex-only transport marker found:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn scheduler_dispatch_loop_uses_acceptance_barrier() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let dispatch_loop = source
+		.split("pub async fn dispatch_loop")
+		.nth(1)
+		.and_then(|rest| rest.split("fn stage_barrier_open").next())
+		.expect("dispatch_loop block");
+	let barrier = source
+		.split("fn stage_barrier_open")
+		.nth(1)
+		.and_then(|rest| rest.split("fn failure_retryable").next())
+		.expect("stage_barrier_open block");
+
+	assert!(dispatch_loop.contains("self.stage_barrier_open"));
+	assert!(barrier.contains("AcceptanceState::LiveAccepted"));
+	assert!(!barrier.contains("AttemptState::Completed"));
+}
+
 struct RecordingStorageScan {
 	batch: RecordBatch,
 	observations: Arc<Mutex<Vec<bool>>>,
@@ -230,20 +418,20 @@ fn manifest_dir() -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn descriptor() -> TableSchemaDescriptorV1 {
+fn descriptor() -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("amount", DataType::Int32, true),
 		Field::new("ts", DataType::Int64, true),
 	]);
-	TableSchemaDescriptorV1::new(
+	TableSchemaDescriptor::new(
 		TableObjectId::new([0xA2; 16]),
 		1,
 		"architecture",
 		"sales",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.expect("descriptor")

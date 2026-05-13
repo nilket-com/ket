@@ -1,4 +1,5 @@
 use crate::catalog::TableRef;
+pub use crate::distributed::identity::{QueryId, StageId};
 use arrow::datatypes::DataType;
 use serde::{Deserialize, Serialize};
 
@@ -9,9 +10,6 @@ pub use execution::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TableId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StageId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MorselId(pub u32);

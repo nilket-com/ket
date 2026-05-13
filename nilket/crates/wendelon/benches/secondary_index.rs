@@ -19,9 +19,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, Locality,
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RecordRowIndex, RowIdentityPolicy,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RecordRowIndex, RowIdentityPolicy,
 	SchemaEvolutionPolicyV1, SecondaryIndexDescriptor, SecondaryIndexKeyDescriptor, SlabId,
-	TableObjectId, TableSchemaDescriptorV1, TableWriteAdmission, TenantId,
+	TableObjectId, TableSchemaDescriptor, TableWriteAdmission, TenantId,
 };
 use wendelon::storage::{
 	IndexBound, IndexQuery, RecordLocation, SecondaryIndexCandidateValidation,
@@ -226,8 +226,8 @@ fn bench_candidate_revalidation(
 	Ok(())
 }
 
-fn table_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
-	Ok(TableSchemaDescriptorV1::new(
+fn table_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
+	Ok(TableSchemaDescriptor::new(
 		TableObjectId::new([0x52; 16]),
 		1,
 		"bench",
@@ -237,12 +237,12 @@ fn table_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Err
 			Field::new("age", DataType::Int64, true),
 		]),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
 }
 
-fn secondary_index_descriptor(table: &TableSchemaDescriptorV1) -> SecondaryIndexDescriptor {
+fn secondary_index_descriptor(table: &TableSchemaDescriptor) -> SecondaryIndexDescriptor {
 	SecondaryIndexDescriptor {
 		index_object_id: IndexObjectId::new([0x53; 16]),
 		table_object_id: table.table_object_id,

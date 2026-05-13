@@ -1,5 +1,5 @@
 use crate::schema::{
-	ColumnStatsPolicyV1, LocalityPolicyV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
+	ColumnStatsPolicyV1, LocalityPolicy, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
 };
 use serde::{Deserialize, Serialize};
@@ -80,7 +80,7 @@ pub(crate) fn compute_logical_schema_fingerprint(
 
 pub(crate) fn compute_physical_descriptor_fingerprint(
 	logical: LogicalSchemaFingerprint,
-	locality_policy: &LocalityPolicyV1,
+	locality_policy: &LocalityPolicy,
 	record_layout_policy: &RecordLayoutPolicy,
 	record_body_compression_policy: &RecordBodyCompressionPolicy,
 	stats_policy: &ColumnStatsPolicyV1,

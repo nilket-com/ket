@@ -1,7 +1,7 @@
 use crate::schema::table::{
 	PrimaryKeyDescriptorV1, RowIdentityPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1,
+	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptor,
 };
 use crate::schema::{LogicalSchemaFingerprint, NodeId, TenantId};
 use arrow::datatypes::{DataType, TimeUnit};
@@ -147,7 +147,7 @@ pub struct SecondaryIndexDescriptor {
 }
 
 impl SecondaryIndexDescriptor {
-	pub fn validate_against_table(&self, table: &TableSchemaDescriptorV1) -> std::io::Result<()> {
+	pub fn validate_against_table(&self, table: &TableSchemaDescriptor) -> std::io::Result<()> {
 		table.validate()?;
 		if self.table_object_id != table.table_object_id {
 			return Err(Error::new(
@@ -624,13 +624,13 @@ pub fn is_storage_synthetic_column(column_name: &str) -> bool {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
-		TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, SchemaEvolutionPolicyV1, TableObjectId,
+		TableSchemaDescriptor,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
-	fn table() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn table() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x52; 16]),
 			7,
 			"analytics",
@@ -641,7 +641,7 @@ mod tests {
 				Field::new("payload", DataType::Float64, true),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()

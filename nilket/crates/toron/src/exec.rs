@@ -18,9 +18,10 @@ use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use twox_hash::XxHash3_64;
 use wendelon::schema::{
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor,
 };
 #[cfg(test)]
 use wendelon::storage::sketch::KllSketch;
@@ -60,7 +61,12 @@ impl ExecutionContext {
 	}
 
 	pub fn local_test() -> Self {
-		let mut context = Self::new(SessionId(1), QueryId(1), TenantId(1), HlcBound(1));
+		let mut context = Self::new(
+			SessionId(1),
+			QueryId::from_u128(1),
+			TenantId(1),
+			HlcBound(1),
+		);
 		context
 			.legacy_table_pins
 			.insert(TableId(1), local_scan_table_pin(TableId(1)));
@@ -337,22 +343,15 @@ impl Executor {
 							continue;
 						}
 
-						let mut hashes = vec![0u64; num_rows];
-						for expr in key {
-							let arr = self.evaluate_expr(expr, &batch)?;
-							if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
-								for i in 0..num_rows {
-									if !int_arr.is_null(i) {
-										hashes[i] ^= int_arr.value(i) as u64;
-									}
-								}
-							}
-						}
+						let key_arrays = key
+							.iter()
+							.map(|expr| self.evaluate_expr(expr, &batch))
+							.collect::<Result<Vec<_>, _>>()?;
 
 						let mut builders: Vec<Vec<u32>> =
 							(0..*partition_count).map(|_| Vec::new()).collect();
 						for i in 0..num_rows {
-							let bucket = (hashes[i] % (*partition_count as u64)) as usize;
+							let bucket = partition_bucket(&key_arrays, i, *partition_count)?;
 							builders[bucket].push(i as u32);
 						}
 
@@ -1048,21 +1047,14 @@ impl Executor {
 				continue;
 			}
 
-			let mut hashes = vec![0u64; num_rows];
-			for expr in key {
-				let arr = self.evaluate_bound_expr(expr, &batch)?;
-				if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>() {
-					for i in 0..num_rows {
-						if !int_arr.is_null(i) {
-							hashes[i] ^= int_arr.value(i) as u64;
-						}
-					}
-				}
-			}
+			let key_arrays = key
+				.iter()
+				.map(|expr| self.evaluate_bound_expr(expr, &batch))
+				.collect::<Result<Vec<_>, _>>()?;
 
 			let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
-			for (row, hash) in hashes.into_iter().enumerate() {
-				let bucket = (hash % partition_count as u64) as usize;
+			for row in 0..num_rows {
+				let bucket = partition_bucket(&key_arrays, row, partition_count)?;
 				builders[bucket].push(row as u32);
 			}
 
@@ -1080,6 +1072,153 @@ impl Executor {
 
 		Ok(partitioned_output)
 	}
+}
+
+fn partition_bucket(
+	key_arrays: &[ArrayRef],
+	row: usize,
+	partition_count: u32,
+) -> Result<usize, ExecutionError> {
+	if partition_count == 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "exchange partition_count must be greater than zero".to_string(),
+		});
+	}
+
+	Ok((partition_key_hash(key_arrays, row)? % u64::from(partition_count)) as usize)
+}
+
+fn partition_key_hash(key_arrays: &[ArrayRef], row: usize) -> Result<u64, ExecutionError> {
+	let mut encoded = Vec::new();
+	for array in key_arrays {
+		encode_partition_key_value(array.as_ref(), row, &mut encoded)?;
+	}
+	Ok(XxHash3_64::oneshot(&encoded))
+}
+
+fn encode_partition_key_value(
+	array: &dyn Array,
+	row: usize,
+	encoded: &mut Vec<u8>,
+) -> Result<(), ExecutionError> {
+	if array.is_null(row) {
+		encoded.push(0);
+		return Ok(());
+	}
+
+	match array.data_type() {
+		DataType::Boolean => {
+			let values = array
+				.as_any()
+				.downcast_ref::<BooleanArray>()
+				.expect("boolean data type");
+			encoded.push(1);
+			encoded.push(u8::from(values.value(row)));
+		}
+		DataType::Int8 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Int8Array>()
+				.expect("int8 data type");
+			encoded.push(2);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Int16 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Int16Array>()
+				.expect("int16 data type");
+			encoded.push(3);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Int32 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.expect("int32 data type");
+			encoded.push(4);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Int64 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.expect("int64 data type");
+			encoded.push(5);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::UInt8 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<UInt8Array>()
+				.expect("uint8 data type");
+			encoded.push(6);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::UInt16 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<UInt16Array>()
+				.expect("uint16 data type");
+			encoded.push(7);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::UInt32 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<UInt32Array>()
+				.expect("uint32 data type");
+			encoded.push(8);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::UInt64 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<UInt64Array>()
+				.expect("uint64 data type");
+			encoded.push(9);
+			encoded.extend_from_slice(&values.value(row).to_le_bytes());
+		}
+		DataType::Float32 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.expect("float32 data type");
+			encoded.push(10);
+			encoded.extend_from_slice(&values.value(row).to_bits().to_le_bytes());
+		}
+		DataType::Float64 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("float64 data type");
+			encoded.push(11);
+			encoded.extend_from_slice(&values.value(row).to_bits().to_le_bytes());
+		}
+		DataType::Utf8 => {
+			let values = array
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("utf8 data type");
+			let value = values.value(row).as_bytes();
+			encoded.push(12);
+			encoded.extend_from_slice(
+				&u32::try_from(value.len())
+					.map_err(|_| ExecutionError::InvalidExpression {
+						message: "partition key string is too large to encode".to_string(),
+					})?
+					.to_le_bytes(),
+			);
+			encoded.extend_from_slice(value);
+		}
+		data_type => {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("unsupported exchange partition key type: {data_type:?}"),
+			});
+		}
+	}
+
+	Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1381,14 +1520,14 @@ fn local_scan_table_pin(table: TableId) -> ScanTablePin {
 		arrow::datatypes::DataType::Int64,
 		false,
 	)]);
-	let descriptor = TableSchemaDescriptorV1::new(
+	let descriptor = TableSchemaDescriptor::new(
 		TableObjectId::new(object_id),
 		1,
 		"local",
 		"legacy",
 		&arrow_schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.expect("local scan descriptor must be valid");
@@ -1427,8 +1566,8 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Mutex;
 	use wendelon::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -1439,8 +1578,12 @@ mod tests {
 			table_data: batch,
 			requests: requests.clone(),
 		});
-		let context =
-			ExecutionContext::new(SessionId(77), QueryId(88), TenantId(99), HlcBound(123));
+		let context = ExecutionContext::new(
+			SessionId(77),
+			QueryId::from_u128(88),
+			TenantId(99),
+			HlcBound(123),
+		);
 		let executor = Executor::with_context(storage, context);
 		let catalog = catalog();
 		let logical = LogicalPlan::Filter {
@@ -1466,7 +1609,7 @@ mod tests {
 		let observed = requests.lock().unwrap();
 		assert_eq!(observed.len(), 1);
 		assert_eq!(observed[0].session_id, SessionId(77));
-		assert_eq!(observed[0].query_id, QueryId(88));
+		assert_eq!(observed[0].query_id, QueryId::from_u128(88));
 		assert_eq!(observed[0].tenant_id, TenantId(99));
 		assert_eq!(observed[0].read_bound, HlcBound(123));
 		assert_eq!(observed[0].table_object_id, descriptor().table_object_id);
@@ -1895,6 +2038,18 @@ mod tests {
 		assert_eq!(rows, 4);
 	}
 
+	#[test]
+	fn exchange_partition_bucket_uses_stable_xxh3_64_encoding() {
+		let key_arrays = vec![Arc::new(Int32Array::from(vec![Some(42)])) as ArrayRef];
+		let mut encoded = vec![4];
+		encoded.extend_from_slice(&42i32.to_le_bytes());
+
+		assert_eq!(
+			partition_bucket(&key_arrays, 0, 17).expect("partition bucket"),
+			(XxHash3_64::oneshot(&encoded) % 17) as usize
+		);
+	}
+
 	#[tokio::test]
 	async fn execute_grouped_sum_orders_by_group_key() {
 		let schema = Arc::new(Schema::new(vec![
@@ -1991,35 +2146,35 @@ mod tests {
 		catalog
 	}
 
-	fn descriptor() -> TableSchemaDescriptorV1 {
+	fn descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int32, true),
 			Field::new("region", DataType::Utf8, true),
 		]);
 
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([1; 16]),
 			1,
 			"default",
 			"sales",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")
 	}
 
-	fn descriptor_with_schema(schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn descriptor_with_schema(schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([1; 16]),
 			1,
 			"default",
 			"sales",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")

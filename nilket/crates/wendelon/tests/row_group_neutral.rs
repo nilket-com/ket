@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wendelon::schema::pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, Program};
 use wendelon::schema::{
-	HybridTimestamp, Identity, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
 	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
 };
@@ -13,15 +13,15 @@ use wendelon::storage::{
 	RowGroupWriterConfig, decode_batch, encode_multirow_from_survivors_with_row_group_config,
 };
 
-fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x56; 16]),
 		1,
 		"test",
 		"row_group_neutral",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

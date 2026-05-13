@@ -1,10 +1,10 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use wendelon::schema::{
-	LocalityPolicyV1, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1,
+	LocalityPolicy, MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1,
 	RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy,
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SchemaEvolutionPolicyV1,
-	TableObjectId, TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptorV1, TenantId,
+	TableObjectId, TableRetentionPolicy, TableSchemaCatalogV1, TableSchemaDescriptor, TenantId,
 };
 
 fn base_schema() -> Schema {
@@ -23,15 +23,15 @@ fn multirow() -> RecordLayoutPolicy {
 	RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap())
 }
 
-fn pk_descriptor(id_byte: u8, generation: u64, name: &str) -> TableSchemaDescriptorV1 {
-	TableSchemaDescriptorV1::new(
+fn pk_descriptor(id_byte: u8, generation: u64, name: &str) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new(
 		TableObjectId::new([id_byte; 16]),
 		generation,
 		"analytics",
 		name,
 		&base_schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap()
@@ -49,14 +49,14 @@ fn pk_descriptor_validates_and_supports_row_tombstones() {
 
 #[test]
 fn append_only_and_content_hash_descriptors_require_multirow_layout() {
-	let append_single = TableSchemaDescriptorV1::new(
+	let append_single = TableSchemaDescriptor::new(
 		TableObjectId::new([0x51; 16]),
 		1,
 		"analytics",
 		"append_single",
 		&base_schema(),
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap_err();
@@ -66,14 +66,14 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 			.contains("append-only tables require RecordLayoutPolicy::MultiRow")
 	);
 
-	let append_multi = TableSchemaDescriptorV1::new_with_layout(
+	let append_multi = TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x52; 16]),
 		1,
 		"analytics",
 		"append_multi",
 		&base_schema(),
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		multirow(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
@@ -81,14 +81,14 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 	assert!(append_multi.is_append_only());
 	assert!(append_multi.supports_row_tombstones());
 
-	let content_hash_single = TableSchemaDescriptorV1::new(
+	let content_hash_single = TableSchemaDescriptor::new(
 		TableObjectId::new([0x53; 16]),
 		1,
 		"analytics",
 		"content_hash_single",
 		&base_schema(),
 		RowIdentityPolicy::AppendOnlyContentHash,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap_err();
@@ -102,41 +102,41 @@ fn append_only_and_content_hash_descriptors_require_multirow_layout() {
 #[test]
 fn descriptor_validation_rejects_invalid_primary_keys() {
 	let nullable_pk = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
-	let nullable = TableSchemaDescriptorV1::new(
+	let nullable = TableSchemaDescriptor::new(
 		TableObjectId::new([0x54; 16]),
 		1,
 		"analytics",
 		"nullable_pk",
 		&nullable_pk,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(nullable.to_string().contains("must be non-nullable"));
 
 	let unsupported_pk = Schema::new(vec![Field::new("id", DataType::Float64, false)]);
-	let unsupported = TableSchemaDescriptorV1::new(
+	let unsupported = TableSchemaDescriptor::new(
 		TableObjectId::new([0x55; 16]),
 		1,
 		"analytics",
 		"unsupported_pk",
 		&unsupported_pk,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap_err();
 	assert!(unsupported.to_string().contains("unsupported V1 type"));
 
-	let missing = TableSchemaDescriptorV1::new(
+	let missing = TableSchemaDescriptor::new(
 		TableObjectId::new([0x56; 16]),
 		1,
 		"analytics",
 		"missing_pk",
 		&base_schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("missing")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap_err();
@@ -160,14 +160,14 @@ fn descriptor_validation_reserves_storage_synthetic_columns() {
 			Field::new("id", DataType::Int64, false),
 			Field::new(reserved, DataType::UInt64, false),
 		]);
-		let err = TableSchemaDescriptorV1::new(
+		let err = TableSchemaDescriptor::new(
 			TableObjectId::new([0x57; 16]),
 			1,
 			"analytics",
 			"reserved_column",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap_err();

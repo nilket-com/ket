@@ -2,8 +2,7 @@ use crate::schema::LogicalSchemaFingerprint;
 use crate::schema::table::{
 	COLUMN_STATS_CSB_AEAD_TAG_BYTES, COLUMN_STATS_HLL_MAX_PRECISION,
 	COLUMN_STATS_HLL_MIN_PRECISION, ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1,
-	TableObjectId, TableSchemaDescriptorV1,
-	max_column_stats_block_ciphertext_bytes_for_slab_payload,
+	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
 use arrow::array::{
 	Array, BinaryArray, BooleanArray, LargeBinaryArray, LargeStringArray, PrimitiveArray,
@@ -82,7 +81,7 @@ pub struct ColumnStatsDescriptorIdentity {
 }
 
 impl ColumnStatsDescriptorIdentity {
-	pub fn from_descriptor(descriptor: &TableSchemaDescriptorV1) -> Self {
+	pub fn from_descriptor(descriptor: &TableSchemaDescriptor) -> Self {
 		Self {
 			table_object_id: descriptor.table_object_id,
 			schema_generation: descriptor.schema_generation,
@@ -637,14 +636,14 @@ pub fn read_canonical_scalar(
 }
 
 pub fn build_always_on_column_stats_block(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 ) -> std::io::Result<Vec<u8>> {
 	build_column_stats_block_internal(descriptor, batch, COLUMN_STATS_DEFAULT_PREFIX_BYTES, None)
 }
 
 pub fn build_always_on_column_stats_block_with_prefix_cap(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	prefix_cap: usize,
 ) -> std::io::Result<Vec<u8>> {
@@ -652,7 +651,7 @@ pub fn build_always_on_column_stats_block_with_prefix_cap(
 }
 
 pub fn build_column_stats_block_with_ciphertext_budget(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	prefix_cap: usize,
 	max_ciphertext_bytes: usize,
@@ -668,7 +667,7 @@ pub fn max_column_stats_ciphertext_bytes_for_slab_payload(slab_payload_bytes: us
 }
 
 fn build_column_stats_block_internal(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	prefix_cap: usize,
 	max_ciphertext_bytes: Option<usize>,
@@ -1901,22 +1900,22 @@ mod tests {
 	use super::*;
 	use crate::schema::table::{
 		BloomBitsPerRow, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, HllPrecision,
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		SmallSetByteCap, SmallSetValueCap,
 	};
 	use arrow::array::{Float64Array, Int64Array, LargeStringArray};
 	use arrow::datatypes::{Field, Schema};
 	use std::sync::Arc;
 
-	fn stats_descriptor(schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn stats_descriptor(schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([9; 16]),
 			7,
 			"analytics",
 			"events",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()

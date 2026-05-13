@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::schema::{
-	LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
+	LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
 	RecordBodyByteOffset, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
 	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId,
 };
@@ -46,16 +46,16 @@ fn directory() -> RecordPageDirectory {
 	}
 }
 
-fn descriptor() -> wendelon::schema::TableSchemaDescriptorV1 {
+fn descriptor() -> wendelon::schema::TableSchemaDescriptor {
 	let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x52; 16]),
 		1,
 		"test",
 		"row_group_secondary_index",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

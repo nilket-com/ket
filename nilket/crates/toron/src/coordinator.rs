@@ -5,15 +5,102 @@ use futures::TryStreamExt;
 
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::Catalog;
+use crate::distributed::budget::{QueryBudget, TaskBudget};
+use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
+use crate::distributed::identity::QueryId;
+use crate::distributed::scheduler::{DistributedScheduler, SchedulerError};
+use crate::distributed::worker_registry::WorkerRegistry;
 use crate::error::{ExecutionError, QueryError, StorageError};
 use crate::exec::Executor;
 use crate::ir::{LogicalPlan, MorselId};
+use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
 use crate::storage::ScanStream;
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
 ) -> Result<Vec<RecordBatch>, StorageError> {
 	stream.into_batches().try_collect().await
+}
+
+pub struct DistributedQueryCoordinator<Registry, Transport>
+where
+	Registry: WorkerRegistry + ?Sized,
+	Transport: ToronTransport + ?Sized,
+{
+	catalog: Arc<dyn Catalog>,
+	registry: Arc<Registry>,
+	memory: Arc<MemoryManager>,
+	transport: Arc<Transport>,
+	config: PlannerConfig,
+	query_budget: QueryBudget,
+}
+
+impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
+where
+	Registry: WorkerRegistry + ?Sized,
+	Transport: ToronTransport + ?Sized,
+{
+	pub fn new(
+		catalog: Arc<dyn Catalog>,
+		registry: Arc<Registry>,
+		memory: Arc<MemoryManager>,
+		transport: Arc<Transport>,
+		config: PlannerConfig,
+		query_budget: QueryBudget,
+	) -> Self {
+		Self {
+			catalog,
+			registry,
+			memory,
+			transport,
+			config,
+			query_budget,
+		}
+	}
+
+	pub async fn execute_query(&self, plan: &LogicalPlan) -> Result<Vec<RecordBatch>, QueryError> {
+		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+		let stages = fragment_plan(
+			bound,
+			FragmentPlanConfig::new(
+				QueryId::new(),
+				TaskBudget::from_query_budget(self.query_budget),
+			),
+		)
+		.map_err(fragment_error)?;
+		let mut scheduler = DistributedScheduler::new(self.registry.clone());
+		let mut dispatcher =
+			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone());
+		let run = scheduler
+			.dispatch_loop(&stages, &mut dispatcher)
+			.await
+			.map_err(scheduler_error)?;
+		Ok(run.final_results)
+	}
+}
+
+fn fragment_error(error: FragmentError) -> QueryError {
+	QueryError::Internal {
+		message: error.to_string(),
+	}
+}
+
+fn scheduler_error(error: SchedulerError) -> QueryError {
+	match error {
+		SchedulerError::TaskFailed { kind, .. } => {
+			QueryError::Runtime(crate::error::RuntimeError::TaskFailure { kind })
+		}
+		SchedulerError::NoLiveWorker => QueryError::Internal {
+			message: "no live worker available for distributed query".to_string(),
+		},
+		SchedulerError::NoProgress { blocked_stages } => QueryError::Internal {
+			message: format!(
+				"distributed scheduler made no progress; blocked stages: {blocked_stages:?}"
+			),
+		},
+		SchedulerError::PartitionManifestMismatch { message } => QueryError::Internal { message },
+		SchedulerError::Acceptance(message) => QueryError::Internal { message },
+	}
 }
 
 pub struct QueryCoordinator {
@@ -65,8 +152,8 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use wendelon::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -125,7 +212,12 @@ mod tests {
 				table_data: batch,
 				remaining_failures: AtomicUsize::new(descriptor_failures),
 			}),
-			crate::exec::ExecutionContext::new(SessionId(1), QueryId(1), TenantId(1), HlcBound(1)),
+			crate::exec::ExecutionContext::new(
+				SessionId(1),
+				QueryId::from_u128(1),
+				TenantId(1),
+				HlcBound(1),
+			),
 		);
 		QueryCoordinator::new(Arc::new(catalog), executor, PlannerConfig::default())
 	}
@@ -174,16 +266,16 @@ mod tests {
 		}
 	}
 
-	fn descriptor() -> TableSchemaDescriptorV1 {
+	fn descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([1; 16]),
 			1,
 			"default",
 			"retry_table",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")

@@ -1,7 +1,7 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, EncodingCascadeIndex, EncodingPageByteOffset,
-	IpcBufferIndex, IpcColumnOrdinal, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	IpcBufferIndex, IpcColumnOrdinal, LocalityPolicy, MultiRowLayoutDescriptor,
 	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordLayoutPolicy, RowCount,
 	RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
 	TableObjectId,
@@ -14,14 +14,14 @@ use wendelon::storage::{
 
 fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 	let schema = Schema::new(vec![Field::new("id", DataType::UInt8, false)]);
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"test",
 		"encoding_materialize",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

@@ -37,8 +37,8 @@ use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, MsgType, NodeId, PolicyGeneration, ProtocolVersionWindow,
 	ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta, TableObjectId, TableRetentionPolicy,
-	TableSchemaDescriptorV1, TenantId, TenantKekId, TransferToken,
-	decode_table_schema_descriptor_v1, epoch_entry_var_schema,
+	TableSchemaDescriptor, TenantId, TenantKekId, TransferToken, decode_table_schema_descriptor_v1,
+	epoch_entry_var_schema,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -608,10 +608,7 @@ impl WendelonControlServer {
 		}
 	}
 
-	fn observe_descriptor_compute_metrics(
-		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
-	) {
+	fn observe_descriptor_compute_metrics(tenant_id: TenantId, descriptor: &TableSchemaDescriptor) {
 		let recompute_started = Instant::now();
 		if let Ok(logical) = descriptor.compute_logical_schema_fingerprint() {
 			if descriptor
@@ -636,8 +633,8 @@ impl WendelonControlServer {
 	}
 
 	fn descriptor_mutation_metric(
-		previous: Option<&TableSchemaDescriptorV1>,
-		next: &TableSchemaDescriptorV1,
+		previous: Option<&TableSchemaDescriptor>,
+		next: &TableSchemaDescriptor,
 	) -> Option<DescriptorMutationMetric> {
 		let Some(previous) = previous else {
 			return Some(DescriptorMutationMetric::Combined);
@@ -3193,8 +3190,8 @@ mod tests {
 	use crate::crypto::{TenantKeyset, WrappedTenantKek};
 	use crate::network::transport::{TransportTier, TransportTierSet};
 	use crate::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy,
-		RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RetentionWindowMillis,
+		RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -3251,14 +3248,14 @@ mod tests {
 			Field::new("id", DataType::Int64, false),
 			Field::new("age", DataType::Int64, true),
 		]);
-		let base = TableSchemaDescriptorV1::new(
+		let base = TableSchemaDescriptor::new(
 			TableObjectId::new([0x71; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -3281,14 +3278,14 @@ mod tests {
 			Field::new("age", DataType::Int64, true),
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
-		let logical = TableSchemaDescriptorV1::new(
+		let logical = TableSchemaDescriptor::new(
 			base.table_object_id,
 			3,
 			"analytics",
 			"events",
 			&evolved_schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();

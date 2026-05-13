@@ -1,7 +1,7 @@
 use crate::schema::table::{
 	MultiRowLayoutDescriptor, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaDescriptorV1, TableWriteAdmission,
+	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaDescriptor, TableWriteAdmission,
 	TableWriteRequestMeta, validate_table_write_request_batch,
 };
 use crate::schema::{
@@ -118,7 +118,7 @@ impl From<StorageRowMetadata> for MultiRowIndexEntry {
 
 pub fn pack_record_batch_by_bucket(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
@@ -135,7 +135,7 @@ pub fn pack_record_batch_by_bucket(
 
 pub fn pack_admitted_record_batch_by_bucket(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
@@ -153,7 +153,7 @@ pub fn pack_admitted_record_batch_by_bucket(
 
 pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
@@ -173,7 +173,7 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_config(
 
 pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
@@ -194,7 +194,7 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_and_encoding_config(
 
 pub fn pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
@@ -359,7 +359,7 @@ pub fn encode_multirow_from_survivors_with_policy(
 pub fn encode_multirow_from_survivors_with_row_group_config(
 	batch: &RecordBatch,
 	survivors: &[MultiRowSourceRow],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<EncodedMultiRowFrame> {
@@ -377,7 +377,7 @@ pub fn encode_multirow_from_survivors_with_row_group_config(
 pub fn encode_multirow_from_survivors_with_row_group_and_encoding_config(
 	batch: &RecordBatch,
 	survivors: &[MultiRowSourceRow],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -396,7 +396,7 @@ pub fn encode_multirow_from_survivors_with_row_group_and_encoding_config(
 pub fn encode_multirow_from_survivors_with_row_group_encoding_and_chunk_layout_config(
 	batch: &RecordBatch,
 	survivors: &[MultiRowSourceRow],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -417,7 +417,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 	batch: &RecordBatch,
 	survivors: &[MultiRowSourceRow],
 	policy: RecordBodyCompressionPolicy,
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
 	chunk_layout_config: &L2ChunkLayoutConfig,
@@ -474,7 +474,7 @@ fn encode_multirow_from_survivors_with_optional_row_groups(
 
 fn encode_storage_batch_with_optional_row_groups(
 	storage_batch: &RecordBatch,
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -542,7 +542,7 @@ fn split_row_group_batches(
 
 fn encode_row_group_batches_with_directory(
 	base_batches: &[RecordBatch],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -740,7 +740,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_config(
 	layout: MultiRowLayoutDescriptor,
 	batch: &RecordBatch,
 	rows: &[MultiRowSourceRow],
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 ) -> std::io::Result<Vec<PackedMultiRowStorageFrame>> {
@@ -760,7 +760,7 @@ pub fn pack_multirow_source_rows_with_policy_and_row_group_and_encoding_config(
 	layout: MultiRowLayoutDescriptor,
 	batch: &RecordBatch,
 	rows: &[MultiRowSourceRow],
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -781,7 +781,7 @@ pub fn pack_multirow_source_rows_with_policy_row_group_encoding_and_chunk_layout
 	layout: MultiRowLayoutDescriptor,
 	batch: &RecordBatch,
 	rows: &[MultiRowSourceRow],
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -1417,7 +1417,7 @@ fn pack_multirow_source_rows_with_caps(
 	target_rows: usize,
 	max_rows: usize,
 	max_record_bytes: u64,
-	descriptor: Option<&TableSchemaDescriptorV1>,
+	descriptor: Option<&TableSchemaDescriptor>,
 	policy: RecordBodyCompressionPolicy,
 	row_group_config: &RowGroupWriterConfig,
 	encoding_config: &EncodingWriterConfig,
@@ -1537,7 +1537,7 @@ fn table_pack_error(message: impl Into<String>) -> TableWriteValidationError {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
 		RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
 		SchemaEvolutionPolicyV1, TableObjectId, TableSpreadLocalityDescriptorV1, TenantId,
 		encode_table_write_row_count,
@@ -1553,16 +1553,16 @@ mod tests {
 		}
 	}
 
-	fn descriptor() -> TableSchemaDescriptorV1 {
+	fn descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-		let mut descriptor = TableSchemaDescriptorV1::new(
+		let mut descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x42; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 1,
 			}),
@@ -1577,7 +1577,7 @@ mod tests {
 		descriptor
 	}
 
-	fn meta(descriptor: &TableSchemaDescriptorV1, rows: usize) -> TableWriteRequestMeta {
+	fn meta(descriptor: &TableSchemaDescriptor, rows: usize) -> TableWriteRequestMeta {
 		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
 		meta.tenant_id = TenantId::new(7);
 		meta.table_object_id = descriptor.table_object_id;
@@ -1611,19 +1611,19 @@ mod tests {
 		.unwrap()
 	}
 
-	fn string_descriptor(max_record_bytes: u64) -> TableSchemaDescriptorV1 {
+	fn string_descriptor(max_record_bytes: u64) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("payload", DataType::LargeUtf8, false),
 		]);
-		let mut descriptor = TableSchemaDescriptorV1::new(
+		let mut descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x51; 16]),
 			1,
 			"analytics",
 			"strings",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 1,
 			}),
@@ -1848,7 +1848,7 @@ mod tests {
 	//  ADR 045 — APPEND-ONLY MULTIROW PACKING
 	// ============================================================
 
-	fn append_only_descriptor() -> TableSchemaDescriptorV1 {
+	fn append_only_descriptor() -> TableSchemaDescriptor {
 		use arrow::datatypes::TimeUnit;
 		let schema = Schema::new(vec![
 			Field::new(
@@ -1858,14 +1858,14 @@ mod tests {
 			),
 			Field::new("payload", DataType::LargeBinary, true),
 		]);
-		TableSchemaDescriptorV1::new_with_layout(
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

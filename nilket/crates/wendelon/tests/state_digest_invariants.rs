@@ -10,10 +10,10 @@ use wendelon::hash::state_digest::{
 	projected_scalar_bytes, visible_row_element,
 };
 use wendelon::schema::{
-	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, Locality, LocalityPolicyV1,
+	DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, Locality, LocalityPolicy,
 	MultiRowLayoutDescriptor, RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1, TableWriteRequestMeta,
-	TenantId, WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TableWriteRequestMeta, TenantId,
+	WriterNodeId, encode_table_write_row_count, synthesize_append_only_row_id,
 };
 use wendelon::storage::{
 	MultiRowSourceRow, decode_batch, pack_multirow_source_rows, pack_record_batch_by_bucket,
@@ -675,7 +675,7 @@ fn retention_eviction_helper_matches_real_multirow_survivors() {
 fn append_only_descriptor(
 	table_object_id: TableObjectId,
 	layout: MultiRowLayoutDescriptor,
-) -> TableSchemaDescriptorV1 {
+) -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![
 		Field::new(
 			"event_time",
@@ -684,14 +684,14 @@ fn append_only_descriptor(
 		),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	TableSchemaDescriptorV1::new_with_layout(
+	TableSchemaDescriptor::new_with_layout(
 		table_object_id,
 		1,
 		"analytics",
 		"events",
 		&schema,
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(layout),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
@@ -732,7 +732,7 @@ fn append_only_batch(rows: usize) -> RecordBatch {
 
 fn table_meta(
 	tenant_id: TenantId,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	rows: usize,
 ) -> TableWriteRequestMeta {
 	let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();

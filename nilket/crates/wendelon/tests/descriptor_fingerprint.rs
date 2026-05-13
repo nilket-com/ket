@@ -1,22 +1,22 @@
 use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::schema::{
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 };
 
-fn descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptorV1 {
+fn descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
 	]);
-	TableSchemaDescriptorV1::new(
+	TableSchemaDescriptor::new(
 		TableObjectId::new([id_byte; 16]),
 		1,
 		"tests",
 		table_name,
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap()

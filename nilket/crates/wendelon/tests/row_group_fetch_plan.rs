@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wendelon::schema::{
-	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicyV1,
+	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicy,
 	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
 	RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId,
@@ -17,15 +17,15 @@ use wendelon::storage::{
 	selected_row_group_record_body_ranges,
 };
 
-fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x56; 16]),
 		1,
 		"test",
 		"row_group_fetch_plan",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

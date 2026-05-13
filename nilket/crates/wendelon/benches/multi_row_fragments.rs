@@ -13,9 +13,9 @@ use wendelon::schema::pbc::{
 use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, Consistency, DurabilityLevel, HybridTimestamp,
-	LocalityPolicyV1, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+	LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta,
+	TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1, TableWriteRequestMeta,
 	TenantId, WriterNodeId, encode_table_write_row_count,
 };
 use wendelon::storage::{
@@ -215,7 +215,7 @@ fn bench_full_scan_pbc(label: &'static str, frames: &PreparedFrames) -> std::io:
 
 fn bench_aggregate(
 	label: &'static str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	frames: &PreparedFrames,
 ) -> std::io::Result<()> {
 	let request = AggregateRequest {
@@ -426,7 +426,7 @@ fn build_single_row_frames(batch: &RecordBatch) -> std::io::Result<PreparedFrame
 fn build_multirow_frames(
 	batch: &RecordBatch,
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> std::io::Result<PreparedFrames> {
 	let records =
 		pack_record_batch_by_bucket(meta, descriptor, batch, WriterNodeId::ZERO, meta.client_hlc)
@@ -542,7 +542,7 @@ fn widest_frame(frames: &PreparedFrames) -> std::io::Result<(&[u8], usize, usize
 
 fn bench_descriptor(
 	record_layout_policy: RecordLayoutPolicy,
-) -> std::io::Result<TableSchemaDescriptorV1> {
+) -> std::io::Result<TableSchemaDescriptor> {
 	let compression_policy = RecordBodyCompressionPolicy::default_for_layout(&record_layout_policy);
 	bench_descriptor_with_policy(record_layout_policy, compression_policy)
 }
@@ -550,15 +550,15 @@ fn bench_descriptor(
 fn bench_descriptor_with_policy(
 	record_layout_policy: RecordLayoutPolicy,
 	compression_policy: RecordBodyCompressionPolicy,
-) -> std::io::Result<TableSchemaDescriptorV1> {
-	let mut descriptor = TableSchemaDescriptorV1::new(
+) -> std::io::Result<TableSchemaDescriptor> {
+	let mut descriptor = TableSchemaDescriptor::new(
 		TableObjectId::new([0x42; 16]),
 		1,
 		"analytics",
 		"events",
 		&bench_schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+		LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 			spread_factor: 1,
 			prefix_bits: 63,
 		}),
@@ -679,7 +679,7 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 fn table_meta(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	row_count: usize,
 ) -> std::io::Result<TableWriteRequestMeta> {
 	let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();

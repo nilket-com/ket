@@ -24,7 +24,8 @@ with the forward-sequence rewrite.
 - **ADR 003 (Distributed Runtime and Data Movement Contract)**
   — promoted at
   `plans/adr/003_toron_distributed_runtime_and_data_movement.md`,
-  pre-implementation. Phase 0 calibration is the next step.
+  implemented. Bench evidence at
+  `plans/impl/003_distributed_runtime_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -68,10 +69,14 @@ launch).
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 003 implementation
+### Next: ADR 004 planning
 
-Phase 0 calibration → Phase 1 identity newtypes → … → Phase 10
-bench matrix. Substrate work for everything below.
+ADR 003's implementation makes real worker endpoints,
+pull-addressed shuffle, producer-loss replay, registry-backed
+attempt placement, and canonical distributed output comparison
+available as substrate. ADR 004 should now choose the next
+contract surface from the bench evidence and fixture gaps below,
+with distributed joins still the leading candidate.
 
 ### ADR 004 candidates *(scope evidence-driven from ADR 003 bench)*
 

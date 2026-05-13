@@ -578,7 +578,7 @@ impl MultiRowLayoutDescriptor {
 pub fn validate_table_write_request_batch(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
@@ -651,7 +651,7 @@ pub fn validate_table_write_request_batch(
 fn admit_primary_key_write(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
 	let primary_key_descriptor = descriptor
 		.primary_key_descriptor()
@@ -724,7 +724,7 @@ fn admit_primary_key_write(
 fn admit_append_only_write(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
@@ -775,7 +775,7 @@ fn admit_append_only_write(
 /// byte-for-byte. All rows in a single request receive
 /// this locality.
 ///
-/// V1 only supports `LocalityPolicyV1::TableSpreadProjection`
+/// V1 only supports `LocalityPolicy::TableSpreadProjection`
 /// for AppendOnly; other variants are rejected at descriptor
 /// validation. The seed feeds the same `jump_consistent_hash`
 /// + prefix/suffix masking the existing table-spread machinery
@@ -813,10 +813,10 @@ pub fn append_only_request_locality(
 
 fn append_only_request_locality_for_descriptor(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<Locality, TableWriteValidationError> {
 	match descriptor.locality_policy {
-		LocalityPolicyV1::TableSpreadProjection(spread) => append_only_request_locality(
+		LocalityPolicy::TableSpreadProjection(spread) => append_only_request_locality(
 			meta.tenant_id,
 			meta.table_object_id,
 			meta.parent_write_id,
@@ -828,13 +828,13 @@ fn append_only_request_locality_for_descriptor(
 				format!("append-only locality computation failed: {err}"),
 			)
 		}),
-		LocalityPolicyV1::IdentityProjection | LocalityPolicyV1::ColumnProjection(_) => {
+		LocalityPolicy::IdentityProjection | LocalityPolicy::ColumnProjection(_) => {
 			// Defence-in-depth: descriptor validation already rejects
 			// these combinations (ADR 045 §4a). A descriptor that
 			// slips through here is a bug.
 			Err(TableWriteValidationError::new(
 				PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-				"append-only tables require LocalityPolicyV1::TableSpreadProjection (ADR 045 §4a)",
+				"append-only tables require LocalityPolicy::TableSpreadProjection (ADR 045 §4a)",
 			))
 		}
 	}
@@ -843,13 +843,13 @@ fn append_only_request_locality_for_descriptor(
 fn compute_locality_for_admission(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	key_identity: Identity,
 	row: usize,
 ) -> Result<Locality, TableWriteValidationError> {
 	match descriptor.locality_policy {
-		LocalityPolicyV1::IdentityProjection => Ok(Locality::from(key_identity)),
-		LocalityPolicyV1::TableSpreadProjection(spread) => {
+		LocalityPolicy::IdentityProjection => Ok(Locality::from(key_identity)),
+		LocalityPolicy::TableSpreadProjection(spread) => {
 			table_spread_locality(meta.tenant_id, meta.table_object_id, key_identity, spread)
 				.map_err(|err| {
 					TableWriteValidationError::new(
@@ -858,7 +858,7 @@ fn compute_locality_for_admission(
 					)
 				})
 		}
-		LocalityPolicyV1::ColumnProjection(ref projection) => column_projection_locality(
+		LocalityPolicy::ColumnProjection(ref projection) => column_projection_locality(
 			meta.tenant_id,
 			meta.table_object_id,
 			key_identity,
@@ -870,7 +870,7 @@ fn compute_locality_for_admission(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TableSchemaDescriptorV1 {
+pub struct TableSchemaDescriptor {
 	pub contract_version: u16,
 	pub table_object_id: TableObjectId,
 	pub schema_generation: u64,
@@ -879,7 +879,7 @@ pub struct TableSchemaDescriptorV1 {
 	#[serde(with = "serde_bytes")]
 	pub arrow_schema_ipc: Vec<u8>,
 	pub row_identity_policy: RowIdentityPolicy,
-	pub locality_policy: LocalityPolicyV1,
+	pub locality_policy: LocalityPolicy,
 	pub stats_policy: ColumnStatsPolicyV1,
 	pub record_layout_policy: RecordLayoutPolicy,
 	pub record_body_compression_policy: RecordBodyCompressionPolicy,
@@ -888,7 +888,7 @@ pub struct TableSchemaDescriptorV1 {
 	pub evolution_policy: SchemaEvolutionPolicyV1,
 }
 
-impl TableSchemaDescriptorV1 {
+impl TableSchemaDescriptor {
 	pub fn new(
 		table_object_id: TableObjectId,
 		schema_generation: u64,
@@ -896,7 +896,7 @@ impl TableSchemaDescriptorV1 {
 		table_name: impl Into<String>,
 		arrow_schema: &Schema,
 		row_identity_policy: RowIdentityPolicy,
-		locality_policy: LocalityPolicyV1,
+		locality_policy: LocalityPolicy,
 		evolution_policy: SchemaEvolutionPolicyV1,
 	) -> std::io::Result<Self> {
 		Self::new_with_layout(
@@ -919,7 +919,7 @@ impl TableSchemaDescriptorV1 {
 		table_name: impl Into<String>,
 		arrow_schema: &Schema,
 		row_identity_policy: RowIdentityPolicy,
-		locality_policy: LocalityPolicyV1,
+		locality_policy: LocalityPolicy,
 		record_layout_policy: RecordLayoutPolicy,
 		evolution_policy: SchemaEvolutionPolicyV1,
 	) -> std::io::Result<Self> {
@@ -1159,13 +1159,13 @@ pub fn synthesize_append_only_row_id(
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum LocalityPolicyV1 {
+pub enum LocalityPolicy {
 	TableSpreadProjection(TableSpreadLocalityDescriptorV1),
 	IdentityProjection,
 	ColumnProjection(ColumnLocalityDescriptorV1),
 }
 
-impl LocalityPolicyV1 {
+impl LocalityPolicy {
 	pub const fn default_table_spread() -> Self {
 		Self::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -1470,21 +1470,21 @@ pub enum SchemaEvolutionPolicyV1 {
 	AdditiveOnly,
 }
 
-pub fn default_kv_table_descriptor_v1() -> std::io::Result<TableSchemaDescriptorV1> {
-	TableSchemaDescriptorV1::new(
+pub fn default_kv_table_descriptor_v1() -> std::io::Result<TableSchemaDescriptor> {
+	TableSchemaDescriptor::new(
 		TableObjectId::DEFAULT_KV,
 		0,
 		"default",
 		"kv",
 		&write_payload_schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("key")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 }
 
 pub fn encode_table_schema_descriptor_v1(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> std::io::Result<Vec<u8>> {
 	descriptor.validate()?;
 	postcard::to_allocvec(descriptor).map_err(|err| {
@@ -1495,8 +1495,8 @@ pub fn encode_table_schema_descriptor_v1(
 	})
 }
 
-pub fn decode_table_schema_descriptor_v1(bytes: &[u8]) -> std::io::Result<TableSchemaDescriptorV1> {
-	let descriptor: TableSchemaDescriptorV1 = postcard::from_bytes(bytes).map_err(|err| {
+pub fn decode_table_schema_descriptor_v1(bytes: &[u8]) -> std::io::Result<TableSchemaDescriptor> {
+	let descriptor: TableSchemaDescriptor = postcard::from_bytes(bytes).map_err(|err| {
 		Error::new(
 			ErrorKind::InvalidData,
 			format!("failed to decode table schema descriptor: {err}"),
@@ -1507,8 +1507,8 @@ pub fn decode_table_schema_descriptor_v1(bytes: &[u8]) -> std::io::Result<TableS
 }
 
 pub fn validate_table_schema_evolution(
-	previous: &TableSchemaDescriptorV1,
-	next: &TableSchemaDescriptorV1,
+	previous: &TableSchemaDescriptor,
+	next: &TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	previous.validate()?;
 	next.validate()?;
@@ -1931,7 +1931,7 @@ fn restrict_allowed_values(slot: &mut Option<BTreeSet<u64>>, values: BTreeSet<u6
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchemaCatalogV1 {
 	#[serde(default)]
-	by_id: BTreeMap<TableSchemaCatalogKey, TableSchemaDescriptorV1>,
+	by_id: BTreeMap<TableSchemaCatalogKey, TableSchemaDescriptor>,
 	#[serde(default)]
 	latest_by_name: BTreeMap<TableNameCatalogKey, TableSchemaCatalogKey>,
 }
@@ -1940,7 +1940,7 @@ impl TableSchemaCatalogV1 {
 	pub fn upsert(
 		&mut self,
 		tenant_id: TenantId,
-		descriptor: TableSchemaDescriptorV1,
+		descriptor: TableSchemaDescriptor,
 	) -> std::io::Result<()> {
 		descriptor.validate()?;
 		let key = TableSchemaCatalogKey {
@@ -2005,7 +2005,7 @@ impl TableSchemaCatalogV1 {
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
 		schema_generation: u64,
-	) -> Option<&TableSchemaDescriptorV1> {
+	) -> Option<&TableSchemaDescriptor> {
 		self.by_id.get(&TableSchemaCatalogKey {
 			tenant_id,
 			table_object_id,
@@ -2018,7 +2018,7 @@ impl TableSchemaCatalogV1 {
 		tenant_id: TenantId,
 		namespace: &str,
 		table_name: &str,
-	) -> Option<&TableSchemaDescriptorV1> {
+	) -> Option<&TableSchemaDescriptor> {
 		let key = self.latest_by_name.get(&TableNameCatalogKey {
 			tenant_id,
 			namespace: namespace.to_owned(),
@@ -2031,7 +2031,7 @@ impl TableSchemaCatalogV1 {
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
-	) -> Option<&TableSchemaDescriptorV1> {
+	) -> Option<&TableSchemaDescriptor> {
 		let start = TableSchemaCatalogKey {
 			tenant_id,
 			table_object_id,
@@ -2048,7 +2048,7 @@ impl TableSchemaCatalogV1 {
 			.map(|(_, descriptor)| descriptor)
 	}
 
-	pub fn descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptorV1> {
+	pub fn descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptor> {
 		let start = TableSchemaCatalogKey {
 			tenant_id,
 			table_object_id: TableObjectId::new([0; 16]),
@@ -2150,38 +2150,36 @@ fn validate_no_storage_synthetic_user_columns(schema: &Schema) -> std::io::Resul
 
 /// ADR 045 §4a — AppendOnly locality compatibility.
 ///
-/// V1 supports `LocalityPolicyV1::TableSpreadProjection` only for
+/// V1 supports `LocalityPolicy::TableSpreadProjection` only for
 /// AppendOnly tables. `IdentityProjection` cannot be made
 /// retry-stable while identity is `commit_hlc`-derived, and
 /// `ColumnProjection`'s retry-stable routing semantics under
 /// HLC-derived identity are out of scope for V1.
 fn validate_append_only_locality_compatibility(
 	row_identity_policy: &RowIdentityPolicy,
-	locality_policy: &LocalityPolicyV1,
+	locality_policy: &LocalityPolicy,
 ) -> std::io::Result<()> {
 	match row_identity_policy {
 		RowIdentityPolicy::AppendOnly => match locality_policy {
-			LocalityPolicyV1::TableSpreadProjection(_) => Ok(()),
-			LocalityPolicyV1::IdentityProjection => Err(Error::new(
+			LocalityPolicy::TableSpreadProjection(_) => Ok(()),
+			LocalityPolicy::IdentityProjection => Err(Error::new(
 				ErrorKind::InvalidData,
-				"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+				"append-only tables require LocalityPolicy::TableSpreadProjection: \
 				 IdentityProjection cannot produce retry-stable routing under \
 				 HLC-derived append-only identity (ADR 045 §4a)",
 			)),
-			LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+			LocalityPolicy::ColumnProjection(_) => Err(Error::new(
 				ErrorKind::InvalidData,
-				"append-only tables require LocalityPolicyV1::TableSpreadProjection: \
+				"append-only tables require LocalityPolicy::TableSpreadProjection: \
 				 ColumnProjection retry-stable semantics under HLC-derived identity \
 				 are deferred to a future ADR (ADR 045 §4a)",
 			)),
 		},
 		RowIdentityPolicy::AppendOnlyContentHash => match locality_policy {
-			LocalityPolicyV1::TableSpreadProjection(_) | LocalityPolicyV1::IdentityProjection => {
-				Ok(())
-			}
-			LocalityPolicyV1::ColumnProjection(_) => Err(Error::new(
+			LocalityPolicy::TableSpreadProjection(_) | LocalityPolicy::IdentityProjection => Ok(()),
+			LocalityPolicy::ColumnProjection(_) => Err(Error::new(
 				ErrorKind::InvalidData,
-				"AppendOnlyContentHash rejects LocalityPolicyV1::ColumnProjection",
+				"AppendOnlyContentHash rejects LocalityPolicy::ColumnProjection",
 			)),
 		},
 		RowIdentityPolicy::PrimaryKey(_) => Ok(()),
@@ -2255,11 +2253,11 @@ fn validate_primary_key(
 	Ok(())
 }
 
-fn validate_locality_policy(schema: &Schema, policy: &LocalityPolicyV1) -> std::io::Result<()> {
+fn validate_locality_policy(schema: &Schema, policy: &LocalityPolicy) -> std::io::Result<()> {
 	match policy {
-		LocalityPolicyV1::TableSpreadProjection(spread) => validate_table_spread(*spread),
-		LocalityPolicyV1::IdentityProjection => Ok(()),
-		LocalityPolicyV1::ColumnProjection(projection) => {
+		LocalityPolicy::TableSpreadProjection(spread) => validate_table_spread(*spread),
+		LocalityPolicy::IdentityProjection => Ok(()),
+		LocalityPolicy::ColumnProjection(projection) => {
 			validate_table_spread(TableSpreadLocalityDescriptorV1 {
 				spread_factor: projection.spread_factor,
 				prefix_bits: projection.prefix_bits,
@@ -2746,7 +2744,7 @@ fn is_supported_primary_key_type(data_type: &DataType) -> bool {
 
 fn canonicalize_primary_key_column(
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<Vec<Vec<u8>>, TableWriteValidationError> {
 	let primary_key = descriptor.primary_key_descriptor().ok_or_else(|| {
 		TableWriteValidationError::new(
@@ -3614,31 +3612,28 @@ mod tests {
 		}
 	}
 
-	fn descriptor_for_generation(
-		schema: &Schema,
-		schema_generation: u64,
-	) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn descriptor_for_generation(schema: &Schema, schema_generation: u64) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			schema_generation,
 			"analytics",
 			"events",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn descriptor_for(schema: &Schema) -> TableSchemaDescriptorV1 {
+	fn descriptor_for(schema: &Schema) -> TableSchemaDescriptor {
 		descriptor_for_generation(schema, 1)
 	}
 
 	fn descriptor_with_stats(
 		schema: &Schema,
 		stats_policy: ColumnStatsPolicyV1,
-	) -> std::io::Result<TableSchemaDescriptorV1> {
+	) -> std::io::Result<TableSchemaDescriptor> {
 		let mut descriptor = descriptor_for(schema);
 		descriptor.stats_policy = stats_policy;
 		descriptor.refresh_descriptor_fingerprints()?;
@@ -3694,15 +3689,15 @@ mod tests {
 	fn clustered_descriptor(
 		projection: ProjectionFunctionV1,
 		columns: Vec<ClusteringColumnSpecV1>,
-	) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns,
 				projection,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -3734,7 +3729,7 @@ mod tests {
 		bytes.extend_from_slice(&count.to_le_bytes());
 	}
 
-	fn table_meta(descriptor: &TableSchemaDescriptorV1, row_count: usize) -> TableWriteRequestMeta {
+	fn table_meta(descriptor: &TableSchemaDescriptor, row_count: usize) -> TableWriteRequestMeta {
 		TableWriteRequestMeta {
 			parent_write_id: ClientWriteId {
 				client_uuid: [8; 16],
@@ -3775,7 +3770,7 @@ mod tests {
 		);
 		assert_eq!(
 			descriptor.locality_policy,
-			LocalityPolicyV1::IdentityProjection
+			LocalityPolicy::IdentityProjection
 		);
 		assert_eq!(
 			descriptor.record_body_compression_policy,
@@ -3874,14 +3869,14 @@ mod tests {
 			RecordBodyCompressionPolicy::Uncompressed
 		);
 
-		let multi = TableSchemaDescriptorV1::new_with_layout(
+		let multi = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([8; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -4172,13 +4167,13 @@ mod tests {
 			Field::new("event_hour", DataType::UInt32, false),
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
-		let locality = LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+		let locality = LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 			columns: vec![cluster_column("event_hour", 16)],
 			projection: ProjectionFunctionV1::ZOrder,
 			spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
 			prefix_bits: TABLE_SPREAD_DEFAULT_PREFIX_BITS,
 		});
-		let previous = TableSchemaDescriptorV1::new(
+		let previous = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
@@ -4189,7 +4184,7 @@ mod tests {
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
-		let next = TableSchemaDescriptorV1::new(
+		let next = TableSchemaDescriptor::new(
 			previous.table_object_id,
 			2,
 			"analytics",
@@ -4202,14 +4197,14 @@ mod tests {
 		.unwrap();
 		validate_table_schema_evolution(&previous, &next).unwrap();
 
-		let changed_locality = TableSchemaDescriptorV1::new(
+		let changed_locality = TableSchemaDescriptor::new(
 			previous.table_object_id,
 			3,
 			"analytics",
 			"events",
 			&next_schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("event_hour", 20)],
 				projection: ProjectionFunctionV1::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4276,26 +4271,26 @@ mod tests {
 
 	#[test]
 	fn primary_key_validation_rejects_nullable_or_unsupported_types() {
-		let nullable = TableSchemaDescriptorV1::new(
+		let nullable = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, true),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
 		assert!(nullable.is_err());
 
-		let float_pk = TableSchemaDescriptorV1::new(
+		let float_pk = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&table_schema(DataType::Float64, false),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
 		assert!(float_pk.is_err());
@@ -4303,7 +4298,7 @@ mod tests {
 
 	#[test]
 	fn primary_key_validation_rejects_composite_v1_shape() {
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
@@ -4313,7 +4308,7 @@ mod tests {
 				columns: vec!["id".to_owned(), "name".to_owned()],
 				canonical_encoding: PrimaryKeyEncodingV1::ArrowV1,
 			}),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		);
 		assert!(descriptor.is_err());
@@ -4351,14 +4346,14 @@ mod tests {
 
 	#[test]
 	fn column_projection_descriptor_validation_rejects_invalid_shapes() {
-		let empty = TableSchemaDescriptorV1::new(
+		let empty = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![],
 				projection: ProjectionFunctionV1::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4369,14 +4364,14 @@ mod tests {
 		.unwrap_err();
 		assert!(empty.to_string().contains("PBC_REJECT_CLUSTERING_EMPTY"));
 
-		let too_wide = TableSchemaDescriptorV1::new(
+		let too_wide = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![
 					cluster_column("id", 1),
 					cluster_column("event_hour", 1),
@@ -4399,14 +4394,14 @@ mod tests {
 				.contains("PBC_REJECT_CLUSTERING_TOO_WIDE")
 		);
 
-		let duplicate = TableSchemaDescriptorV1::new(
+		let duplicate = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![
 					cluster_column("event_hour", 4),
 					cluster_column("event_hour", 4),
@@ -4424,14 +4419,14 @@ mod tests {
 				.contains("PBC_REJECT_CLUSTERING_DUPLICATE_COLUMN")
 		);
 
-		let nullable = TableSchemaDescriptorV1::new(
+		let nullable = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&table_schema(DataType::Int64, false),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_string_column("name", 2)],
 				projection: ProjectionFunctionV1::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4446,14 +4441,14 @@ mod tests {
 				.contains("PBC_REJECT_CLUSTERING_NULLABLE")
 		);
 
-		let hilbert = TableSchemaDescriptorV1::new(
+		let hilbert = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("event_hour", 16)],
 				projection: ProjectionFunctionV1::Hilbert,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4468,14 +4463,14 @@ mod tests {
 				.contains("PBC_REJECT_PROJECTION_NOT_YET_SUPPORTED")
 		);
 
-		let overflow = TableSchemaDescriptorV1::new(
+		let overflow = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&clustered_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("id", 64)],
 				projection: ProjectionFunctionV1::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4490,14 +4485,14 @@ mod tests {
 				.contains("PBC_REJECT_CLUSTERING_WIDTH_OVERFLOW")
 		);
 
-		let over_natural_width = TableSchemaDescriptorV1::new(
+		let over_natural_width = TableSchemaDescriptor::new(
 			TableObjectId::new([7; 16]),
 			1,
 			"analytics",
 			"events",
 			&table_schema(DataType::UInt8, false),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![cluster_column("id", 16)],
 				projection: ProjectionFunctionV1::ZOrder,
 				spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4517,14 +4512,14 @@ mod tests {
 			DataType::Decimal128(10, 2),
 			DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
 		] {
-			let unsupported = TableSchemaDescriptorV1::new(
+			let unsupported = TableSchemaDescriptor::new(
 				TableObjectId::new([7; 16]),
 				1,
 				"analytics",
 				"events",
 				&schema_with_clustering_candidate(data_type),
 				RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-				LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+				LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 					columns: vec![cluster_column("candidate", 8)],
 					projection: ProjectionFunctionV1::ZOrder,
 					spread_factor: TABLE_SPREAD_DEFAULT_FACTOR,
@@ -4552,7 +4547,7 @@ mod tests {
 			],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let ranges =
@@ -4592,7 +4587,7 @@ mod tests {
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4634,7 +4629,7 @@ mod tests {
 			vec![cluster_string_column("region", 1)],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4676,7 +4671,7 @@ mod tests {
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4710,7 +4705,7 @@ mod tests {
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4744,7 +4739,7 @@ mod tests {
 			vec![cluster_column("event_hour", 4)],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4781,7 +4776,7 @@ mod tests {
 			],
 		);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let mut bytecode = Vec::new();
@@ -4875,14 +4870,14 @@ mod tests {
 	fn catalog_rejects_table_object_id_reuse_under_different_name() {
 		let tenant = TenantId::new(9);
 		let descriptor = descriptor_for_generation(&table_schema(DataType::Int64, false), 1);
-		let conflicting = TableSchemaDescriptorV1::new(
+		let conflicting = TableSchemaDescriptor::new(
 			descriptor.table_object_id,
 			2,
 			"analytics",
 			"events_copy",
 			&table_schema(DataType::Int64, false),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -4954,7 +4949,7 @@ mod tests {
 			meta.tenant_id,
 			meta.table_object_id,
 			match descriptor.locality_policy {
-				LocalityPolicyV1::TableSpreadProjection(spread) => spread,
+				LocalityPolicy::TableSpreadProjection(spread) => spread,
 				_ => unreachable!(),
 			},
 		)
@@ -5020,7 +5015,7 @@ mod tests {
 		.unwrap();
 		assert_eq!(admission.localities.len(), 3);
 		let projection = match &descriptor.locality_policy {
-			LocalityPolicyV1::ColumnProjection(projection) => projection,
+			LocalityPolicy::ColumnProjection(projection) => projection,
 			_ => unreachable!(),
 		};
 		let ranges =
@@ -5099,10 +5094,10 @@ mod tests {
 	}
 
 	fn append_only_descriptor_with(
-		locality: LocalityPolicyV1,
+		locality: LocalityPolicy,
 		layout: RecordLayoutPolicy,
-	) -> std::io::Result<TableSchemaDescriptorV1> {
-		TableSchemaDescriptorV1::new_with_layout(
+	) -> std::io::Result<TableSchemaDescriptor> {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([45; 16]),
 			1,
 			"analytics",
@@ -5118,7 +5113,7 @@ mod tests {
 	#[test]
 	fn append_only_descriptor_accepts_multirow_with_table_spread() {
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.expect("MultiRow + TableSpreadProjection append-only descriptor must validate");
@@ -5134,11 +5129,11 @@ mod tests {
 	#[test]
 	fn append_only_descriptor_rejects_identity_projection() {
 		// ADR 045 §4a: AppendOnly identity is HLC-derived and
-		// `LocalityPolicyV1::IdentityProjection` cannot produce
+		// `LocalityPolicy::IdentityProjection` cannot produce
 		// retry-stable client-side routing under that contract.
 		// Phase 8 forbids this combination at descriptor validation.
 		let err = append_only_descriptor_with(
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.expect_err("AppendOnly + IdentityProjection must reject (ADR 045 §4a)");
@@ -5159,7 +5154,7 @@ mod tests {
 			prefix_bits: 16,
 		};
 		let err = append_only_descriptor_with(
-			LocalityPolicyV1::ColumnProjection(projection),
+			LocalityPolicy::ColumnProjection(projection),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.expect_err("AppendOnly + ColumnProjection must reject (ADR 045 §4a)");
@@ -5172,7 +5167,7 @@ mod tests {
 	#[test]
 	fn append_only_descriptor_rejects_singlerow_layout() {
 		let err = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::SingleRow,
 		)
 		.expect_err("ADR 045 §2 forbids AppendOnly + SingleRow");
@@ -5192,14 +5187,14 @@ mod tests {
 			),
 			Field::new("__row_hlc__", DataType::LargeBinary, true),
 		]);
-		let err = TableSchemaDescriptorV1::new_with_layout(
+		let err = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([46; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5220,14 +5215,14 @@ mod tests {
 			),
 			Field::new(STORAGE_ROW_TOMBSTONE_COLUMN, DataType::Boolean, false),
 		]);
-		let err = TableSchemaDescriptorV1::new_with_layout(
+		let err = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([47; 16]),
 			1,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5240,7 +5235,7 @@ mod tests {
 
 	#[test]
 	fn append_only_descriptor_fingerprint_differs_from_pk_descriptor() {
-		let pk_descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let pk_descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([47; 16]),
 			1,
 			"analytics",
@@ -5254,13 +5249,13 @@ mod tests {
 				),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
 		let append_only_descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
@@ -5274,7 +5269,7 @@ mod tests {
 	#[test]
 	fn append_only_descriptor_round_trips_through_postcard() {
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
@@ -5290,11 +5285,11 @@ mod tests {
 
 	fn content_hash_descriptor_with(
 		schema: &Schema,
-		locality: LocalityPolicyV1,
+		locality: LocalityPolicy,
 		layout: RecordLayoutPolicy,
 		generation: u64,
-	) -> std::io::Result<TableSchemaDescriptorV1> {
-		TableSchemaDescriptorV1::new_with_layout(
+	) -> std::io::Result<TableSchemaDescriptor> {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([49; 16]),
 			generation,
 			"analytics",
@@ -5307,10 +5302,10 @@ mod tests {
 		)
 	}
 
-	fn content_hash_descriptor(schema: &Schema, generation: u64) -> TableSchemaDescriptorV1 {
+	fn content_hash_descriptor(schema: &Schema, generation: u64) -> TableSchemaDescriptor {
 		content_hash_descriptor_with(
 			schema,
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			generation,
 		)
@@ -5321,7 +5316,7 @@ mod tests {
 	fn content_hash_descriptor_accepts_identity_and_table_spread() {
 		let identity = content_hash_descriptor_with(
 			&append_only_user_schema(),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			1,
 		)
@@ -5332,7 +5327,7 @@ mod tests {
 
 		let spread = content_hash_descriptor_with(
 			&append_only_user_schema(),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			1,
 		)
@@ -5350,7 +5345,7 @@ mod tests {
 		};
 		let err = content_hash_descriptor_with(
 			&append_only_user_schema(),
-			LocalityPolicyV1::ColumnProjection(projection),
+			LocalityPolicy::ColumnProjection(projection),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			1,
 		)
@@ -5362,7 +5357,7 @@ mod tests {
 
 		let err = content_hash_descriptor_with(
 			&append_only_user_schema(),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::SingleRow,
 			1,
 		)
@@ -5378,11 +5373,11 @@ mod tests {
 		let schema = append_only_user_schema();
 		let content_hash = content_hash_descriptor(&schema, 1);
 		let append_only = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
-		let pk = TableSchemaDescriptorV1::new_with_layout(
+		let pk = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([49; 16]),
 			1,
 			"analytics",
@@ -5396,7 +5391,7 @@ mod tests {
 				),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("event_id")),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5656,7 +5651,7 @@ mod tests {
 	}
 
 	fn append_only_event_batch(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		payloads: Vec<Option<&[u8]>>,
 		event_times: Vec<i64>,
 	) -> RecordBatch {
@@ -5674,7 +5669,7 @@ mod tests {
 	#[test]
 	fn append_only_admit_succeeds_with_distinct_identities_for_distinct_positions() {
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
@@ -5704,7 +5699,7 @@ mod tests {
 	#[test]
 	fn append_only_admit_keeps_identical_payloads_distinct() {
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
@@ -5738,7 +5733,7 @@ mod tests {
 		// row in the batch. Per-row variation would re-introduce
 		// the client/server divergence the §4a contract eliminates.
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();
@@ -5762,7 +5757,7 @@ mod tests {
 			assert_eq!(*locality, first, "AppendOnly: one locality per request");
 		}
 		// Sanity-check it agrees with the explicit helper.
-		let LocalityPolicyV1::TableSpreadProjection(spread) = descriptor.locality_policy else {
+		let LocalityPolicy::TableSpreadProjection(spread) = descriptor.locality_policy else {
 			panic!("expected default table spread");
 		};
 		let expected = append_only_request_locality(
@@ -5785,7 +5780,7 @@ mod tests {
 		// An append-only descriptor has no PK column. The PK admission
 		// path's "missing PK column" reject must NOT fire.
 		let descriptor = append_only_descriptor_with(
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		)
 		.unwrap();

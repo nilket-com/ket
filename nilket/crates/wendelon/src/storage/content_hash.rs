@@ -1,5 +1,5 @@
 use crate::schema::table::{
-	LocalityPolicyV1, PbcRejectCode, TableObjectId, TableSchemaDescriptorV1, TableWriteAdmission,
+	LocalityPolicy, PbcRejectCode, TableObjectId, TableSchemaDescriptor, TableWriteAdmission,
 	TableWriteRequestMeta, TableWriteValidationError, table_spread_locality,
 };
 use crate::schema::{Identity, Locality, TenantId};
@@ -175,7 +175,7 @@ pub fn content_hash_column_tag(column_name: &str) -> u64 {
 }
 
 pub fn encode_row_canonical(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: &RecordBatch,
 	row: usize,
 ) -> Result<CanonicalRowBytes, CanonicalEncodeError> {
@@ -244,7 +244,7 @@ pub fn encode_row_canonical(
 pub fn admit_content_hash_write(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<TableWriteAdmission, TableWriteValidationError> {
 	let mut key_identities = Vec::with_capacity(batch.num_rows());
 	let mut localities = Vec::with_capacity(batch.num_rows());
@@ -270,12 +270,12 @@ pub fn admit_content_hash_write(
 
 fn content_hash_locality(
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	key_identity: Identity,
 ) -> Result<Locality, TableWriteValidationError> {
 	match descriptor.locality_policy {
-		LocalityPolicyV1::IdentityProjection => Ok(Locality::from(key_identity)),
-		LocalityPolicyV1::TableSpreadProjection(spread) => {
+		LocalityPolicy::IdentityProjection => Ok(Locality::from(key_identity)),
+		LocalityPolicy::TableSpreadProjection(spread) => {
 			table_spread_locality(meta.tenant_id, meta.table_object_id, key_identity, spread)
 				.map_err(|err| {
 					TableWriteValidationError::new(
@@ -284,9 +284,9 @@ fn content_hash_locality(
 					)
 				})
 		}
-		LocalityPolicyV1::ColumnProjection(_) => Err(TableWriteValidationError::new(
+		LocalityPolicy::ColumnProjection(_) => Err(TableWriteValidationError::new(
 			PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
-			"AppendOnlyContentHash rejects LocalityPolicyV1::ColumnProjection",
+			"AppendOnlyContentHash rejects LocalityPolicy::ColumnProjection",
 		)),
 	}
 }
@@ -669,7 +669,7 @@ where
 mod tests {
 	use super::*;
 	use crate::schema::{
-		ColumnBloomSpecV1, ColumnStatsPolicyV1, DurabilityLevel, HybridTimestamp, LocalityPolicyV1,
+		ColumnBloomSpecV1, ColumnStatsPolicyV1, DurabilityLevel, HybridTimestamp, LocalityPolicy,
 		MultiRowLayoutDescriptor, NodeId, RecordLayoutPolicy, RowIdentityPolicy,
 		SchemaEvolutionPolicyV1, encode_table_write_row_count,
 	};
@@ -680,22 +680,22 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Int8Type, Int32Type, Schema};
 	use std::sync::Arc;
 
-	fn descriptor(schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new_with_layout(
+	fn descriptor(schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x49; 16]),
 			1,
 			"analytics",
 			"content_events",
 			schema,
 			RowIdentityPolicy::AppendOnlyContentHash,
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn meta(descriptor: &TableSchemaDescriptorV1, rows: usize) -> TableWriteRequestMeta {
+	fn meta(descriptor: &TableSchemaDescriptor, rows: usize) -> TableWriteRequestMeta {
 		TableWriteRequestMeta {
 			parent_write_id: crate::schema::ClientWriteId {
 				client_uuid: [0x49; 16],

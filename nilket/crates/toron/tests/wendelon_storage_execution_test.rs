@@ -29,8 +29,8 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1, TenantId as WendelonTenantId,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
 	encode_table_schema_descriptor_v1,
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
@@ -161,7 +161,7 @@ async fn wendelon_grouped_aggregate_matches_in_memory_baseline() {
 
 async fn query_ids_gt(
 	fixture: &LiveWendelonFixture,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	tenant: WendelonTenantId,
 	threshold: i32,
 ) -> Vec<i64> {
@@ -177,7 +177,7 @@ async fn query_ids_gt(
 		storage,
 		ExecutionContext::new(
 			SessionId(10),
-			QueryId(20),
+			QueryId::from_u128(20),
 			ToronTenantId(tenant.get()),
 			HlcBound(0),
 		),
@@ -214,7 +214,7 @@ async fn query_ids_gt(
 }
 
 async fn bind_plan(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	plan: &LogicalPlan,
 	config: &PlannerConfig,
 ) -> ExecutionPlan {
@@ -225,7 +225,7 @@ async fn bind_plan(
 
 async fn execute_wendelon_plan(
 	fixture: &LiveWendelonFixture,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	tenant: WendelonTenantId,
 	bound: &ExecutionPlan,
 ) -> Vec<RecordBatch> {
@@ -258,7 +258,7 @@ async fn execute_in_memory_plan(
 fn execution_context(tenant: WendelonTenantId) -> ExecutionContext {
 	ExecutionContext::new(
 		SessionId(10),
-		QueryId(20),
+		QueryId::from_u128(20),
 		ToronTenantId(tenant.get()),
 		HlcBound(0),
 	)
@@ -466,7 +466,7 @@ fn single_node_snapshot(node_id: u32, address: String) -> ClusterStatusWire {
 async fn install_schema(
 	node: &WendelonNode,
 	tenant: WendelonTenantId,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) {
 	node.raft
 		.client_write(WendelonRequest::SchemaUpdate(schema_update(
@@ -476,7 +476,7 @@ async fn install_schema(
 		.expect("install schema");
 }
 
-fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptorV1) -> Vec<u8> {
+fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptor) -> Vec<u8> {
 	let payload = encode_table_schema_descriptor_v1(descriptor).expect("encode descriptor");
 	let intent_byte = tenant.get() as u8;
 	let envelope = SchemaUpdateEnvelopeV1 {
@@ -500,7 +500,7 @@ fn schema_update(tenant: WendelonTenantId, descriptor: &TableSchemaDescriptorV1)
 async fn write_rows(
 	client: &Client,
 	tenant: WendelonTenantId,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	batch: RecordBatch,
 ) {
 	let row_count = batch.num_rows();
@@ -519,16 +519,16 @@ async fn write_rows(
 	assert_eq!(receipt.rows as usize, row_count);
 }
 
-fn descriptor() -> TableSchemaDescriptorV1 {
+fn descriptor() -> TableSchemaDescriptor {
 	let schema = schema();
-	TableSchemaDescriptorV1::new(
+	TableSchemaDescriptor::new(
 		TableObjectId::new([0x91; 16]),
 		1,
 		"bench",
 		"storage_execution",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.expect("descriptor")

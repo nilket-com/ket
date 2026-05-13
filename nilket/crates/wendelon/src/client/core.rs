@@ -56,7 +56,7 @@ use crate::schema::{
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
 	ReadResponseMeta, ReadStatus, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
-	TableSchemaDescriptorV1, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
+	TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
 	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
 	column_projection_prefix_ranges, read_key_schema, read_value_schema,
 	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
@@ -291,7 +291,7 @@ pub struct WriteResult {
 #[derive(Clone, Debug)]
 pub struct TableWriteRequest {
 	pub meta: TableWriteRequestMeta,
-	pub descriptor: TableSchemaDescriptorV1,
+	pub descriptor: TableSchemaDescriptor,
 	pub payload: RecordBatch,
 }
 
@@ -306,7 +306,7 @@ pub struct TableWriteResult {
 #[derive(Clone, Debug)]
 pub struct TableDeleteRowsRequest {
 	pub meta: TableDeleteRowsRequestMeta,
-	pub descriptor: TableSchemaDescriptorV1,
+	pub descriptor: TableSchemaDescriptor,
 	pub row_key_ids: Vec<Identity>,
 }
 
@@ -321,7 +321,7 @@ pub struct TableDeleteRowsResult {
 #[derive(Clone, Debug)]
 pub struct TableQueryRequest {
 	pub meta: TableQueryRequestMeta,
-	pub descriptor: TableSchemaDescriptorV1,
+	pub descriptor: TableSchemaDescriptor,
 	pub pbc: Vec<u8>,
 }
 
@@ -1565,10 +1565,10 @@ fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<
 
 fn table_query_route_locality(
 	tenant_id: TenantId,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> std::io::Result<Locality> {
 	match descriptor.locality_policy {
-		crate::schema::LocalityPolicyV1::TableSpreadProjection(spread) => {
+		crate::schema::LocalityPolicy::TableSpreadProjection(spread) => {
 			let ranges = table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread)?;
 			ranges.first().map(|(start, _)| *start).ok_or_else(|| {
 				Error::new(
@@ -1577,8 +1577,8 @@ fn table_query_route_locality(
 				)
 			})
 		}
-		crate::schema::LocalityPolicyV1::IdentityProjection => Ok(Locality::ZERO),
-		crate::schema::LocalityPolicyV1::ColumnProjection(ref projection) => {
+		crate::schema::LocalityPolicy::IdentityProjection => Ok(Locality::ZERO),
+		crate::schema::LocalityPolicy::ColumnProjection(ref projection) => {
 			let ranges =
 				column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, projection)?;
 			ranges.first().map(|(start, _)| *start).ok_or_else(|| {
@@ -2076,9 +2076,9 @@ mod tests {
 	use crate::client::topology::{ClusterPeerWire, StaticTopologySource};
 	use crate::network::transport::TransportTier;
 	use crate::schema::{
-		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicyV1,
+		ClientWriteId, ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, LocalityPolicy,
 		PrimaryKeyDescriptorV1, ProjectionFunctionV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1, TableSpreadLocalityDescriptorV1,
+		TableObjectId, TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -2122,12 +2122,12 @@ mod tests {
 		}
 	}
 
-	fn table_query_descriptor(locality_policy: LocalityPolicyV1) -> TableSchemaDescriptorV1 {
+	fn table_query_descriptor(locality_policy: LocalityPolicy) -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("name", DataType::Utf8, true),
 		]);
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x51; 16]),
 			3,
 			"client",
@@ -2255,7 +2255,7 @@ mod tests {
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
-		let descriptor = table_query_descriptor(LocalityPolicyV1::TableSpreadProjection(spread));
+		let descriptor = table_query_descriptor(LocalityPolicy::TableSpreadProjection(spread));
 		let expected =
 			table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread).unwrap()[0].0;
 
@@ -2279,7 +2279,7 @@ mod tests {
 			prefix_bits: 12,
 		};
 		let descriptor =
-			table_query_descriptor(LocalityPolicyV1::ColumnProjection(projection.clone()));
+			table_query_descriptor(LocalityPolicy::ColumnProjection(projection.clone()));
 		let expected =
 			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, &projection)
 				.unwrap()[0]
@@ -2293,7 +2293,7 @@ mod tests {
 
 	#[test]
 	fn table_query_request_validation_checks_descriptor_and_bytecode_len() {
-		let descriptor = table_query_descriptor(LocalityPolicyV1::default_table_spread());
+		let descriptor = table_query_descriptor(LocalityPolicy::default_table_spread());
 		let request = TableQueryRequest {
 			meta: TableQueryRequestMeta {
 				min_hlc: bytemuck::Zeroable::zeroed(),

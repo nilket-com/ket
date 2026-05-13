@@ -82,7 +82,7 @@ use crate::schema::{
 	CdcFrameMeta, CdcFrameSource, CdcRejectCode, CdcRejectMeta, CdcSubscribeBound,
 	CdcSubscribeRequestMeta, CdcSubscriptionId, ColumnProjectionRangePruning, Consistency,
 	DurabilityLevel, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader, HybridTimestamp,
-	Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicyV1, LocalityRange,
+	Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy, LocalityRange,
 	MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus, MsgType,
 	MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
@@ -91,7 +91,7 @@ use crate::schema::{
 	RowCount, RowIdentityPolicy, STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog,
 	SecondaryIndexDescriptor, SecondaryIndexState, SlabId, StreamFinalizationRequestMeta,
 	TABLE_WRITE_MAX_ROWS, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
-	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptorV1, TableWriteAdmission,
+	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptor, TableWriteAdmission,
 	TableWriteRequestMeta, TableWriteResponseMeta, TableWriteValidationError, TenantId,
 	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId, cdc_cursor_in_catchup_window,
 	cdc_event_batch, cdc_tombstone_event_batch, cdc_visible_rows_digest,
@@ -7973,7 +7973,7 @@ impl WendelonDataServer {
 		stream_id: u32,
 		handle: &Arc<SubscriptionHandle>,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		source_ranges: &[QueryScanRange],
 		pending: &mut Vec<Arc<CdcLiveEntry>>,
 		safe_emission_hlc: HybridTimestamp,
@@ -8034,7 +8034,7 @@ impl WendelonDataServer {
 	async fn collect_cdc_catchup_events(
 		&self,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		ranges: &[QueryScanRange],
 		start_cursor: CdcCursor,
 		upper_cursor: CdcCursor,
@@ -8122,7 +8122,7 @@ impl WendelonDataServer {
 	async fn compute_cdc_visible_row_keys_at_cursor(
 		&self,
 		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		ranges: &[QueryScanRange],
 		as_of_cursor: CdcCursor,
 	) -> std::io::Result<Vec<Identity>> {
@@ -8503,7 +8503,7 @@ impl WendelonDataServer {
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		commit_hlc: HybridTimestamp,
 		children: &[BifurcatedTableChildWrite],
 		finalized: bool,
@@ -8572,7 +8572,7 @@ impl WendelonDataServer {
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		commit_hlc: HybridTimestamp,
 		children: &[TableReplicaChildPayload],
 		finalized: bool,
@@ -8909,7 +8909,7 @@ impl WendelonDataServer {
 	fn secondary_index_admission_descriptors(
 		catalog: &SecondaryIndexCatalog,
 		tenant_id: TenantId,
-		table: &TableSchemaDescriptorV1,
+		table: &TableSchemaDescriptor,
 	) -> Vec<SecondaryIndexDescriptor> {
 		catalog
 			.for_table(tenant_id, table.table_object_id)
@@ -8931,7 +8931,7 @@ impl WendelonDataServer {
 		meta: TableWriteRequestMeta,
 		mut bifurcated: BifurcatedTableWrite,
 		mut groups: Vec<TableReplicaGroup>,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		commit_hlc: HybridTimestamp,
 		is_append_only: bool,
 		secondary_index_descriptors: Vec<SecondaryIndexDescriptor>,
@@ -9533,7 +9533,7 @@ impl WendelonDataServer {
 		&self,
 		meta: &TableWriteRequestMeta,
 		batch: &RecordBatch,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		writer_node_id: WriterNodeId,
 		row_hlc: HybridTimestamp,
 	) -> Result<PrimaryKeyBifurcation, TableWriteValidationError> {
@@ -9595,7 +9595,7 @@ impl WendelonDataServer {
 		&self,
 		meta: &TableWriteRequestMeta,
 		batch: &RecordBatch,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		effective_retention: &EffectiveRetention,
 		row_hlc: HybridTimestamp,
 	) -> Result<ContentHashBifurcation, TableWriteValidationError> {
@@ -10463,7 +10463,7 @@ impl RowGroupFetchAuditCounters {
 struct PreparedAggregateExecution {
 	range_meta: QueryRequestMeta,
 	program: pbc::Program,
-	descriptor: TableSchemaDescriptorV1,
+	descriptor: TableSchemaDescriptor,
 	ranges: Vec<QueryScanRange>,
 	retention_floor: Option<HybridTimestamp>,
 }
@@ -10779,7 +10779,7 @@ fn remap_aggregate_expressions_for_projected_inputs(
 async fn read_projected_query_location(
 	slab: &SlabManager,
 	location: RecordLocation,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
@@ -10845,7 +10845,7 @@ async fn try_read_encoded_aggregate_query_location(
 	slab: &SlabManager,
 	request: &AggregateRequest,
 	location: RecordLocation,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 ) -> std::io::Result<Option<AggregateQueryLocationRead>> {
 	if !descriptor.record_layout_policy.is_multi_row() {
@@ -10933,7 +10933,7 @@ async fn read_aggregate_query_location(
 	location: RecordLocation,
 	key_identity: Identity,
 	locality: Locality,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	requirement: &ColumnFetchRequirement,
 	user_column_count: usize,
@@ -11099,7 +11099,7 @@ fn encoding_invariant_violation_kind(error: &Error) -> Option<&'static str> {
 /// `Ok(false)` so the caller falls back to the whole-record path.
 fn augment_requirement_for_descriptor_verification(
 	requirement: &ColumnFetchRequirement,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> ColumnFetchRequirement {
 	if !descriptor.record_layout_policy.is_multi_row() {
 		return requirement.clone();
@@ -11126,7 +11126,7 @@ fn augment_requirement_for_descriptor_verification(
 /// the fallback cost; we can re-add a projected-PK fast path
 /// later if profiling motivates it.
 fn projected_descriptor_match(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	projected: &ProjectedRecordBatch,
 ) -> std::io::Result<bool> {
 	let Some(physical) =
@@ -11200,7 +11200,7 @@ fn materialize_projected_location_batch(
 
 async fn table_stats_may_match_location(
 	slab: &SlabManager,
-	table_descriptor: Option<&TableSchemaDescriptorV1>,
+	table_descriptor: Option<&TableSchemaDescriptor>,
 	program: &pbc::Program,
 	cache: &mut QueryStatsPruneCache,
 	location: RecordLocation,
@@ -11286,7 +11286,7 @@ async fn table_stats_may_match_location(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn slab_stats_may_match_query(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	stats: &ParsedColumnStatsBlock,
 ) -> std::io::Result<bool> {
@@ -11294,7 +11294,7 @@ fn slab_stats_may_match_query(
 }
 
 fn slab_stats_query_outcome(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	stats: &ParsedColumnStatsBlock,
 ) -> std::io::Result<SlabStatsQueryOutcome> {
@@ -11530,7 +11530,7 @@ async fn plan_table_query_execution_by_secondary_index(
 	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
-	table_descriptor: &TableSchemaDescriptorV1,
+	table_descriptor: &TableSchemaDescriptor,
 	projected_execution: &QueryProjectedExecution,
 	logical_retention_floor: Option<HybridTimestamp>,
 	access_plan: &SecondaryIndexAccessPlan,
@@ -11780,7 +11780,7 @@ fn secondary_index_record_fetch_key(location: RecordLocation) -> (SlabId, u64, u
 async fn read_secondary_index_query_locations(
 	slab: &SlabManager,
 	rows: &[SecondaryIndexLookupRow],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
@@ -11938,7 +11938,7 @@ async fn read_secondary_index_query_location_group(
 	slab: &SlabManager,
 	rows: &[SecondaryIndexLookupRow],
 	indices: &[usize],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 	augmented_requirement: &ColumnFetchRequirement,
@@ -12026,7 +12026,7 @@ async fn read_secondary_index_query_location_group(
 async fn read_secondary_index_query_locations_one_by_one(
 	slab: &SlabManager,
 	rows: &[SecondaryIndexLookupRow],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
@@ -12068,7 +12068,7 @@ fn execute_secondary_index_projected_row(
 async fn read_secondary_index_query_location(
 	slab: &SlabManager,
 	row: &SecondaryIndexLookupRow,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
@@ -12106,7 +12106,7 @@ async fn read_table_query_location(
 	location: RecordLocation,
 	key_identity: Identity,
 	locality: Locality,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
@@ -12166,7 +12166,7 @@ async fn plan_query_execution_for_ranges_with_program(
 	program: &pbc::Program,
 	ranges: &[QueryScanRange],
 	budget: QueryExecutionBudget,
-	table_descriptor: Option<&TableSchemaDescriptorV1>,
+	table_descriptor: Option<&TableSchemaDescriptor>,
 	projected_execution: QueryProjectedExecution,
 	logical_retention_floor: Option<HybridTimestamp>,
 ) -> std::io::Result<QueryExecutionPlan> {
@@ -12482,7 +12482,7 @@ fn encode_query_stream_batches_with_deadline(
 
 fn table_record_matches_descriptor(
 	meta: &QueryRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	key_identity: Identity,
 	locality: Locality,
 	stored_table_object_id: Option<TableObjectId>,
@@ -13172,7 +13172,7 @@ fn aggregate_csb_direct_answer_eligible(
 
 fn aggregate_csb_response_for_stats(
 	request: &AggregateRequest,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	stats: &ParsedColumnStatsBlock,
 ) -> Result<Option<AggregateResponse>, AggRejectCode> {
 	if stats.header.table_object_id != request.table_object_id
@@ -13394,11 +13394,11 @@ fn aggregate_reject_to_read_status(code: AggRejectCode) -> ReadStatus {
 
 fn table_query_scan_ranges(
 	tenant_id: TenantId,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	program: Option<&pbc::Program>,
 ) -> Result<Vec<QueryScanRange>, ReadStatus> {
 	match descriptor.locality_policy {
-		LocalityPolicyV1::TableSpreadProjection(spread) => {
+		LocalityPolicy::TableSpreadProjection(spread) => {
 			let ranges = table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, spread)
 				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
 			Ok(ranges
@@ -13406,11 +13406,11 @@ fn table_query_scan_ranges(
 				.map(|(start, end)| QueryScanRange { start, end })
 				.collect())
 		}
-		LocalityPolicyV1::IdentityProjection => Ok(vec![QueryScanRange {
+		LocalityPolicy::IdentityProjection => Ok(vec![QueryScanRange {
 			start: Locality::ZERO,
 			end: Locality::MAX,
 		}]),
-		LocalityPolicyV1::ColumnProjection(ref projection) => {
+		LocalityPolicy::ColumnProjection(ref projection) => {
 			let schema = descriptor
 				.arrow_schema()
 				.map_err(|_| ReadStatus::QUERY_INVALID_PROGRAM)?;
@@ -13644,7 +13644,7 @@ fn observe_content_hash_admission_metrics(
 }
 
 fn tombstone_marker_layout(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<MultiRowLayoutDescriptor, PbcRejectCode> {
 	match descriptor.record_layout_policy {
 		RecordLayoutPolicy::MultiRow(layout) => Ok(layout),
@@ -14350,7 +14350,7 @@ fn bifurcate_client_write(
 
 fn bifurcate_table_delete(
 	meta: &TableDeleteRowsRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	packed: Vec<crate::storage::multirow::PackedMultiRowStorageFrame>,
 ) -> std::io::Result<BifurcatedTableWrite> {
 	if packed.is_empty() {
@@ -14412,7 +14412,7 @@ fn bifurcate_table_delete(
 fn bifurcate_table_write(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
@@ -14429,7 +14429,7 @@ fn bifurcate_table_write(
 fn bifurcate_table_write_with_row_group_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
@@ -14449,7 +14449,7 @@ fn bifurcate_table_write_with_row_group_config(
 fn bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	writer_node_id: WriterNodeId,
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
@@ -14458,7 +14458,7 @@ fn bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
 	let observe_encode = matches!(
 		&descriptor.locality_policy,
-		LocalityPolicyV1::ColumnProjection(_)
+		LocalityPolicy::ColumnProjection(_)
 	);
 	let encode_started = Instant::now();
 	let admission =
@@ -14483,7 +14483,7 @@ fn bifurcate_table_write_with_row_group_encoding_and_chunk_layout_config(
 fn bifurcate_table_write_with_admission(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
 ) -> Result<BifurcatedTableWrite, TableWriteValidationError> {
@@ -14500,7 +14500,7 @@ fn bifurcate_table_write_with_admission(
 fn bifurcate_table_write_with_admission_and_row_group_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
@@ -14521,7 +14521,7 @@ fn bifurcate_table_write_with_admission_and_row_group_config(
 fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
@@ -14542,7 +14542,7 @@ fn bifurcate_table_write_with_admission_and_row_group_and_encoding_config(
 fn bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_config(
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	admission: &TableWriteAdmission,
 	row_hlc: HybridTimestamp,
 	row_group_config: &RowGroupWriterConfig,
@@ -14761,7 +14761,7 @@ mod tests {
 		AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 		AggregateRequest, AggregateRequestId, AggregateResponse, AggregateStatus, ByteCount,
 		ClusteringColumnSpecV1, ColumnLocalityDescriptorV1, DurationMillis, IndexArrowTypeTag,
-		IndexKeyEncoding, IndexObjectId, LocalityPolicyV1, LocalityRange, LocationCount,
+		IndexKeyEncoding, IndexObjectId, LocalityPolicy, LocalityRange, LocationCount,
 		MultiRowLayoutDescriptor, PolicyGeneration, PrimaryKeyDescriptorV1, ProjectionFunctionV1,
 		RecordLayoutPolicy, RetentionWindowMillis, RowCount, RowIdentityPolicy,
 		STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
@@ -14844,24 +14844,24 @@ mod tests {
 		}
 	}
 
-	fn typed_table_descriptor() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn typed_table_descriptor() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x37; 16]),
 			3,
 			"analytics",
 			"events",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn multirow_typed_table_descriptor() -> TableSchemaDescriptorV1 {
+	fn multirow_typed_table_descriptor() -> TableSchemaDescriptor {
 		let mut descriptor = typed_table_descriptor();
 		descriptor.locality_policy =
-			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 63,
 			});
@@ -14874,59 +14874,59 @@ mod tests {
 		descriptor
 	}
 
-	fn append_only_table_descriptor() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new_with_layout(
+	fn append_only_table_descriptor() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x47; 16]),
 			3,
 			"analytics",
 			"append_events",
 			&typed_table_schema(),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn content_hash_table_descriptor() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new_with_layout(
+	fn content_hash_table_descriptor() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x49; 16]),
 			3,
 			"analytics",
 			"content_events",
 			&typed_table_schema(),
 			RowIdentityPolicy::AppendOnlyContentHash,
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn identity_typed_table_descriptor(id_byte: u8) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([id_byte; 16]),
 			3,
 			"analytics",
 			"identity_events",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn column_projection_table_descriptor() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn column_projection_table_descriptor() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x38; 16]),
 			3,
 			"analytics",
 			"events",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(ColumnLocalityDescriptorV1 {
+			LocalityPolicy::ColumnProjection(ColumnLocalityDescriptorV1 {
 				columns: vec![ClusteringColumnSpecV1 {
 					name: "id".to_owned(),
 					width_bits: 16,
@@ -14974,7 +14974,7 @@ mod tests {
 		.unwrap()
 	}
 
-	fn same_multirow_locality_ids(descriptor: &TableSchemaDescriptorV1, count: usize) -> Vec<i64> {
+	fn same_multirow_locality_ids(descriptor: &TableSchemaDescriptor, count: usize) -> Vec<i64> {
 		let mut buckets: HashMap<Locality, Vec<i64>> = HashMap::new();
 		for id in 0_i64..10_000 {
 			let batch = typed_table_batch(vec![id]);
@@ -14998,7 +14998,7 @@ mod tests {
 	}
 
 	fn typed_table_meta(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		row_count: usize,
 	) -> TableWriteRequestMeta {
 		TableWriteRequestMeta {
@@ -15023,7 +15023,7 @@ mod tests {
 		}
 	}
 
-	fn typed_table_schema_update(descriptor: &TableSchemaDescriptorV1) -> Vec<u8> {
+	fn typed_table_schema_update(descriptor: &TableSchemaDescriptor) -> Vec<u8> {
 		let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
 		let envelope = SchemaUpdateEnvelopeV1 {
 			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
@@ -15044,7 +15044,7 @@ mod tests {
 	}
 
 	fn name_secondary_index_descriptor(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 	) -> SecondaryIndexDescriptor {
 		SecondaryIndexDescriptor {
 			index_object_id: IndexObjectId::new([0x52; 16]),
@@ -15110,7 +15110,7 @@ mod tests {
 	}
 
 	fn aggregate_count_request(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		request_id: u128,
 		as_of_hlc: HybridTimestamp,
 	) -> AggregateRequest {
@@ -15137,7 +15137,7 @@ mod tests {
 	}
 
 	fn table_query_meta_for_test(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		as_of_hlc: HybridTimestamp,
 		bytecode_len: usize,
 	) -> TableQueryRequestMeta {
@@ -15189,7 +15189,7 @@ mod tests {
 
 	async fn aggregate_csb_test_server(
 		mgr: Arc<SlabManager>,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		node_id: u32,
 		temp_tag: &str,
 		clock: Arc<dyn PhysicalClock>,
@@ -15953,7 +15953,7 @@ mod tests {
 
 	async fn append_typed_table_rows(
 		mgr: &SlabManager,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		ids: Vec<i64>,
 	) -> SlabId {
 		let batch = typed_table_batch(ids);
@@ -15988,7 +15988,7 @@ mod tests {
 
 	async fn append_append_only_rows_for_query(
 		mgr: &SlabManager,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		ids: Vec<i64>,
 		row_hlc: HybridTimestamp,
 	) -> Vec<Identity> {
@@ -16021,7 +16021,7 @@ mod tests {
 
 	async fn append_append_only_tombstones_for_query(
 		mgr: &SlabManager,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		row_key_ids: &[Identity],
 		delete_hlc: HybridTimestamp,
 	) {
@@ -16063,7 +16063,7 @@ mod tests {
 	async fn tier_active_slab_with_stats_for_query(
 		mgr: &SlabManager,
 		l2: Arc<MockObjectStore>,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		object_name: &str,
 	) -> SlabId {
 		let slab_id = mgr.force_seal_active_for_test().await;
@@ -16112,7 +16112,7 @@ mod tests {
 		l2: Arc<MockObjectStore>,
 		ids: Vec<i64>,
 		object_name: &str,
-	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+	) -> (Arc<SlabManager>, TableSchemaDescriptor) {
 		let mgr = make_manager_with_l2(l2.clone()).await;
 		let descriptor = typed_table_descriptor();
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
@@ -16148,7 +16148,7 @@ mod tests {
 		l2: Arc<MockObjectStore>,
 		ids: Vec<i64>,
 		object_name: &str,
-	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+	) -> (Arc<SlabManager>, TableSchemaDescriptor) {
 		let mgr = make_manager_with_l2(l2.clone()).await;
 		let descriptor = identity_typed_table_descriptor(0x41);
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
@@ -16184,7 +16184,7 @@ mod tests {
 		l2: Arc<MockObjectStore>,
 		ids: Vec<i64>,
 		object_name: &str,
-	) -> (Arc<SlabManager>, TableSchemaDescriptorV1) {
+	) -> (Arc<SlabManager>, TableSchemaDescriptor) {
 		let mgr = make_manager_with_l2(l2.clone()).await;
 		let descriptor = typed_table_descriptor();
 		let slab_id = append_typed_table_rows(&mgr, &descriptor, ids).await;
@@ -17005,7 +17005,7 @@ mod tests {
 			meta.tenant_id,
 			meta.table_object_id,
 			match descriptor.locality_policy {
-				LocalityPolicyV1::TableSpreadProjection(spread) => spread,
+				LocalityPolicy::TableSpreadProjection(spread) => spread,
 				_ => unreachable!(),
 			},
 		)
@@ -17163,14 +17163,14 @@ mod tests {
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x38; 16]),
 			3,
 			"analytics",
 			"events",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(projection.clone()),
+			LocalityPolicy::ColumnProjection(projection.clone()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -17199,14 +17199,14 @@ mod tests {
 			spread_factor: 4,
 			prefix_bits: 12,
 		};
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x39; 16]),
 			3,
 			"analytics",
 			"events",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::ColumnProjection(projection.clone()),
+			LocalityPolicy::ColumnProjection(projection.clone()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -17667,7 +17667,7 @@ mod tests {
 		let mgr = make_manager_with_l2_encoded_compute(l2.clone()).await;
 		let mut descriptor = typed_table_descriptor();
 		descriptor.locality_policy =
-			LocalityPolicyV1::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptorV1 {
 				spread_factor: 1,
 				prefix_bits: 63,
 			});
@@ -20416,14 +20416,14 @@ mod tests {
 		node.data_server
 			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
 			.await;
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x40; 16]),
 			3,
 			"analytics",
 			"full_scan",
 			&typed_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -25129,7 +25129,7 @@ mod tests {
 	#[test]
 	fn augment_requirement_includes_table_object_id_for_append_only() {
 		use crate::schema::TenantId;
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
@@ -25140,7 +25140,7 @@ mod tests {
 				false,
 			)]),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -25158,7 +25158,7 @@ mod tests {
 
 	#[test]
 	fn augment_requirement_includes_table_object_id_for_pk_multirow() {
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x44; 16]),
 			1,
 			"analytics",
@@ -25168,7 +25168,7 @@ mod tests {
 				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -25186,7 +25186,7 @@ mod tests {
 
 	#[test]
 	fn augment_requirement_unchanged_for_pk_single_row() {
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([0x46; 16]),
 			1,
 			"analytics",
@@ -25196,7 +25196,7 @@ mod tests {
 				arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -25220,7 +25220,7 @@ mod tests {
 		// whole-record path.
 		use std::collections::BTreeMap;
 		use std::sync::Arc;
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
@@ -25231,7 +25231,7 @@ mod tests {
 				false,
 			)]),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -25260,7 +25260,7 @@ mod tests {
 	fn projected_match_rejects_mismatched_table_object_id() {
 		use std::collections::BTreeMap;
 		use std::sync::Arc;
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
@@ -25271,7 +25271,7 @@ mod tests {
 				false,
 			)]),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -25321,14 +25321,14 @@ mod tests {
 			arrow::datatypes::Field::new("id", arrow::datatypes::DataType::LargeBinary, false),
 			arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
 		]);
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0xAA; 16]),
 			1,
 			"analytics",
 			"events_pk",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -25374,7 +25374,7 @@ mod tests {
 	fn projected_match_accepts_same_table_object_id() {
 		use std::collections::BTreeMap;
 		use std::sync::Arc;
-		let descriptor = TableSchemaDescriptorV1::new_with_layout(
+		let descriptor = TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"analytics",
@@ -25385,7 +25385,7 @@ mod tests {
 				false,
 			)]),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)

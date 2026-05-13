@@ -299,8 +299,8 @@ impl SerializableEntry {
 mod tests {
 	use super::*;
 	use crate::schema::{
-		IndexObjectId, LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy,
-		SchemaEvolutionPolicyV1, TableSchemaDescriptorV1,
+		IndexObjectId, LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy,
+		SchemaEvolutionPolicyV1, TableSchemaDescriptor,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -316,8 +316,8 @@ mod tests {
 		Identity::new([byte; 32])
 	}
 
-	fn table() -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn table() -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x52; 16]),
 			1,
 			"analytics",
@@ -327,7 +327,7 @@ mod tests {
 				Field::new("customer_id", DataType::UInt64, true),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()

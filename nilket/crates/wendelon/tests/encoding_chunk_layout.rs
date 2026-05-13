@@ -2,11 +2,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use wendelon::crypto::{SLAB_ENCRYPTION_CHUNK_SIZES, SLAB_ENCRYPTION_DEFAULT_CHUNK_SIZE};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, ChunkSizeBytes, DictValueCount,
-	EncodingCascadeIndex, EncodingPageByteOffset, IpcBufferIndex, IpcColumnOrdinal,
-	LocalityPolicyV1, LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
-	RecordBodyByteLen, RecordBodyByteOffset, RecordLayoutPolicy, RowCount, RowGroupIndex,
-	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
-	TableObjectId,
+	EncodingCascadeIndex, EncodingPageByteOffset, IpcBufferIndex, IpcColumnOrdinal, LocalityPolicy,
+	LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen,
+	RecordBodyByteOffset, RecordLayoutPolicy, RowCount, RowGroupIndex, RowIdentityPolicy, RunCount,
+	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId,
 };
 use wendelon::storage::{
 	BufferEncoding, EncodedBufferByteRange, EncodingCascade, EncodingDirectory,
@@ -17,14 +16,14 @@ use wendelon::storage::{
 
 fn logical_fingerprint() -> LogicalSchemaFingerprint {
 	let schema = Schema::new(vec![Field::new("id", DataType::UInt8, false)]);
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x61; 16]),
 		1,
 		"test",
 		"encoding_chunk_layout",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

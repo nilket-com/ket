@@ -5,10 +5,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::sync::Arc;
 use wendelon::schema::{
-	HybridTimestamp, Identity, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
 	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	SlabId, TableObjectId, TableSchemaDescriptorV1,
+	SlabId, TableObjectId, TableSchemaDescriptor,
 };
 use wendelon::storage::encoding::directory::{
 	deserialize_encoding_directory_value, serialize_encoding_directory_value,
@@ -26,15 +26,15 @@ use wendelon::storage::{
 	parse_record_buffer_directory,
 };
 
-fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"test",
 		"encoding_directory",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(12, 12, 8 * 1024 * 1024).unwrap(),
 		),
@@ -166,7 +166,7 @@ fn encoding_config() -> EncodingWriterConfig {
 
 fn parse_encoded_record(
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	source_rows: &[MultiRowSourceRow],
 	slab_id: u64,
 	row_group_config: &RowGroupWriterConfig,
@@ -199,7 +199,7 @@ fn parse_encoded_record(
 fn page_stats_fixture(
 	slab_id: u64,
 ) -> (
-	TableSchemaDescriptorV1,
+	TableSchemaDescriptor,
 	wendelon::storage::RecordBufferDirectory,
 ) {
 	let batch = low_cardinality_i64_batch(4096);
@@ -224,15 +224,15 @@ fn page_stats_value_buffer_mut(directory: &mut EncodingDirectory) -> &mut Buffer
 		.expect("value buffer with page stats")
 }
 
-fn large_descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn large_descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"test",
 		"encoding_directory_large",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 4096, 8 * 1024 * 1024).unwrap(),
 		),

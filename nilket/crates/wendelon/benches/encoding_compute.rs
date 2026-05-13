@@ -36,11 +36,11 @@ use wendelon::schema::pbc::ColumnPredicateLiteralV1;
 use wendelon::schema::{
 	AggregateRequest, AggregateRequestId, BaseValue, BitsPerValue, BufferValueCount, Consistency,
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, Identity, IpcBufferIndex,
-	IpcColumnOrdinal, Locality, LocalityPolicyV1, LogicalSchemaFingerprint,
-	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
-	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
-	RowGroupRowCount, RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount,
-	SlabId, TableObjectId, TableSchemaDescriptorV1, TenantId,
+	IpcColumnOrdinal, Locality, LocalityPolicy, LogicalSchemaFingerprint, MultiRowLayoutDescriptor,
+	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
+	RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex, RowGroupRowCount,
+	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId,
+	TableObjectId, TableSchemaDescriptor, TenantId,
 };
 use wendelon::storage::encoding::cascade::{
 	decode_buffer, decode_page, encode_buffer, encode_buffer_with_value_offsets,
@@ -1996,15 +1996,15 @@ fn writer_column_cache_string_batch_shards(
 
 fn writer_column_cache_string_descriptor(
 	schema: &Schema,
-) -> std::io::Result<TableSchemaDescriptorV1> {
-	TableSchemaDescriptorV1::new_with_layout(
+) -> std::io::Result<TableSchemaDescriptor> {
+	TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x68; 16]),
 		1,
 		"bench",
 		"encoding_compute_writer_column_cache",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024)
 				.expect("bench multi-row layout"),
@@ -3207,7 +3207,7 @@ impl PipelineShape {
 
 struct PipelineFixture {
 	frame: Vec<u8>,
-	descriptor: TableSchemaDescriptorV1,
+	descriptor: TableSchemaDescriptor,
 	output_only: ColumnFetchRequirement,
 	output_with_predicate: ColumnFetchRequirement,
 	rows: usize,
@@ -3237,14 +3237,14 @@ fn build_pipeline_fixture_shape(
 		],
 	)
 	.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-	let descriptor = TableSchemaDescriptorV1::new_with_layout(
+	let descriptor = TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x58; 16]),
 		1,
 		"bench",
 		"encoding_compute_pipeline",
 		schema.as_ref(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024)
 				.expect("bench multi-row layout"),

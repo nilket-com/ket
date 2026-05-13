@@ -6,10 +6,10 @@ use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, BaseValue, BitsPerValue, BufferValueCount, Consistency,
 	DictValueCount, EncodingCascadeIndex, HybridTimestamp, IpcBufferIndex, IpcColumnOrdinal,
-	Locality, LocalityPolicyV1, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+	Locality, LocalityPolicy, LocalityRange, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
 	RecordBodyByteLen, RecordLayoutPolicy, RecordRowIndex, RowCount, RowGroupIndex,
 	RowIdentityPolicy, RunCount, SchemaEvolutionPolicyV1, SimdPageValueCount, TableObjectId,
-	TableSchemaDescriptorV1, TenantId,
+	TableSchemaDescriptor, TenantId,
 };
 use wendelon::storage::encoding::cascade::{EncodedBuffer, encode_buffer};
 use wendelon::storage::encoding::compute::kernels::validity::{
@@ -656,14 +656,14 @@ fn aggregate_expr(tag: AggregateFunctionTag, column_ordinal: u16) -> AggregateEx
 
 fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 	let schema = Schema::new(vec![Field::new("id", DataType::UInt8, false)]);
-	TableSchemaDescriptorV1::new_with_layout(
+	TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x59; 16]),
 		1,
 		"test",
 		"encoding_compute_kernel_invariants",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

@@ -1,7 +1,7 @@
 use crate::schema::pbc::{
 	ColumnPredicateComparisonV1, ColumnPredicateLiteralV1, ColumnPredicateV1, Program,
 };
-use crate::schema::table::TableSchemaDescriptorV1;
+use crate::schema::table::TableSchemaDescriptor;
 use crate::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexObjectId, LogicalSchemaFingerprint,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, TableObjectId, TenantId,
@@ -314,7 +314,7 @@ pub fn secondary_index_query_from_pbc(
 pub fn secondary_index_access_plan_from_program(
 	catalog: &SecondaryIndexCatalog,
 	tenant_id: TenantId,
-	table: &TableSchemaDescriptorV1,
+	table: &TableSchemaDescriptor,
 	program: &Program,
 ) -> std::io::Result<Option<SecondaryIndexAccessPlan>> {
 	let Some(predicates) = program.conjunctive_column_predicates() else {
@@ -326,7 +326,7 @@ pub fn secondary_index_access_plan_from_program(
 pub fn secondary_index_access_plan_from_predicates(
 	catalog: &SecondaryIndexCatalog,
 	tenant_id: TenantId,
-	table: &TableSchemaDescriptorV1,
+	table: &TableSchemaDescriptor,
 	predicates: &[ColumnPredicateV1],
 ) -> std::io::Result<Option<SecondaryIndexAccessPlan>> {
 	for row in catalog.for_table(tenant_id, table.table_object_id) {
@@ -854,9 +854,9 @@ mod tests {
 		OP_PUSH_COL, OP_PUSH_INT, Program,
 	};
 	use crate::schema::{
-		IndexArrowTypeTag, IndexKeyEncoding, Locality, LocalityPolicyV1, PrimaryKeyDescriptorV1,
+		IndexArrowTypeTag, IndexKeyEncoding, Locality, LocalityPolicy, PrimaryKeyDescriptorV1,
 		RecordRowIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SecondaryIndexKeyDescriptor,
-		TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptorV1, TableWriteAdmission,
+		TableObjectId, TableSchemaCatalogV1, TableSchemaDescriptor, TableWriteAdmission,
 	};
 	use crate::storage::append_storage_synthetic_columns;
 	use arrow::array::{Int32Array, Int64Array, UInt64Array};
@@ -871,8 +871,8 @@ mod tests {
 		}
 	}
 
-	fn table_with_generation(schema_generation: u64) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn table_with_generation(schema_generation: u64) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x10; 16]),
 			schema_generation,
 			"analytics",
@@ -882,13 +882,13 @@ mod tests {
 				Field::new("age", DataType::Int64, true),
 			]),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn table() -> TableSchemaDescriptorV1 {
+	fn table() -> TableSchemaDescriptor {
 		table_with_generation(1)
 	}
 
@@ -909,7 +909,7 @@ mod tests {
 		}
 	}
 
-	fn descriptor_for_table(table: &TableSchemaDescriptorV1) -> SecondaryIndexDescriptor {
+	fn descriptor_for_table(table: &TableSchemaDescriptor) -> SecondaryIndexDescriptor {
 		SecondaryIndexDescriptor {
 			index_object_id: IndexObjectId::new([0x52; 16]),
 			table_object_id: table.table_object_id,

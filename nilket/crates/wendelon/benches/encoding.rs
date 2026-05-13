@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wendelon::schema::{
 	BaseValue, BitsPerValue, BufferValueCount, DictValueCount, ExceptionCount, Exponent, Factor,
-	HybridTimestamp, Identity, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
 	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, RunCount, SampleRowCount,
 	SchemaEvolutionPolicyV1, SimdPageValueCount, SlabId, TableObjectId,
@@ -103,15 +103,15 @@ impl BenchConfig {
 fn descriptor(
 	schema: &Schema,
 	columns: usize,
-) -> std::io::Result<wendelon::schema::TableSchemaDescriptorV1> {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+) -> std::io::Result<wendelon::schema::TableSchemaDescriptor> {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"bench",
 		"encoding",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("c0")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(4_096, 4_096, 8 * 1024 * 1024).map_err(|err| {
 				Error::new(
@@ -230,7 +230,7 @@ fn encoding_config_with(
 fn encode_case(
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 	encoding_config: &EncodingWriterConfig,
 ) -> std::io::Result<EncodedMultiRowFrame> {
 	encode_multirow_from_survivors_with_row_group_and_encoding_config(
@@ -247,7 +247,7 @@ fn bench_writer(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	for (scenario, encoding) in [
 		("writer_disabled", false),
@@ -283,7 +283,7 @@ fn bench_materialize(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	for (variant, encoding) in [
 		("row_group_only", encoding_config(false)),
@@ -312,7 +312,7 @@ fn bench_materialize(
 fn bench_directory_size(
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let encoded = encode_multirow_from_survivors_with_row_group_and_encoding_config(
 		batch,
@@ -380,7 +380,7 @@ fn bench_point_read_and_selective_scan(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let encoded = encode_case(case, batch, descriptor, &encoding_config(true))?;
 	let parsed = parse_record_buffer_directory(
@@ -582,7 +582,7 @@ fn bench_point_read_and_selective_scan(
 fn bench_determinism(
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let left = encode_case(case, batch, descriptor, &encoding_config(true))?;
 	let right = encode_case(case, batch, descriptor, &encoding_config(true))?;
@@ -607,7 +607,7 @@ fn bench_mixed_slab_read(
 	config: &BenchConfig,
 	case: BenchCase,
 	batch: &RecordBatch,
-	descriptor: &wendelon::schema::TableSchemaDescriptorV1,
+	descriptor: &wendelon::schema::TableSchemaDescriptor,
 ) -> std::io::Result<()> {
 	let row_group_only = encode_case(case, batch, descriptor, &encoding_config(false))?;
 	let encoding = encode_case(case, batch, descriptor, &encoding_config(true))?;

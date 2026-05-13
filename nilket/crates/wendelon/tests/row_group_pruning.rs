@@ -6,7 +6,7 @@ use wendelon::schema::pbc::{
 	OP_AND, OP_GT, OP_NEQ, OP_OR, OP_PUSH_COL, OP_PUSH_INT, OP_PUSH_STR, Program,
 };
 use wendelon::schema::{
-	HybridTimestamp, Identity, Locality, LocalityPolicyV1, MultiRowLayoutDescriptor,
+	HybridTimestamp, Identity, Locality, LocalityPolicy, MultiRowLayoutDescriptor,
 	PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, RowCount, RowGroupRowCount, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	SlabId, TableObjectId,
@@ -25,15 +25,15 @@ fn schema() -> Schema {
 	])
 }
 
-fn descriptor() -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn descriptor() -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"test",
 		"row_group_pruning",
 		&schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("x")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

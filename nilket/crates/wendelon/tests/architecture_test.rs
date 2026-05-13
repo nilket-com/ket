@@ -722,13 +722,13 @@ fn test_adr048_retention_policy_surface_stays_typed_and_brand_clean() {
 
 	let table_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
 	let descriptor_block = table_source
-		.split_once("pub struct TableSchemaDescriptorV1 {")
+		.split_once("pub struct TableSchemaDescriptor {")
 		.and_then(|(_, rest)| rest.split_once("\n}"))
 		.map(|(block, _)| block)
-		.expect("TableSchemaDescriptorV1 block should be present");
+		.expect("TableSchemaDescriptor block should be present");
 	assert!(
 		!descriptor_block.to_ascii_lowercase().contains("retention"),
-		"TableSchemaDescriptorV1 must not carry retention policy fields"
+		"TableSchemaDescriptor must not carry retention policy fields"
 	);
 
 	let transport_source =
@@ -1495,7 +1495,7 @@ fn test_adr049_content_hash_identity_boundaries() {
 			"src/schema/table.rs: missing ADR 049 content-hash reject code surface".to_string(),
 		);
 	}
-	if !schema_source.contains("AppendOnlyContentHash rejects LocalityPolicyV1::ColumnProjection") {
+	if !schema_source.contains("AppendOnlyContentHash rejects LocalityPolicy::ColumnProjection") {
 		violations.push(
 			"src/schema/table.rs: content-hash ColumnProjection rejection must stay explicit"
 				.to_string(),
@@ -1807,7 +1807,7 @@ fn test_adr051_descriptor_fingerprint_split_boundaries() {
 
 	let schema_source = fs::read_to_string(manifest_dir.join("src/schema/table.rs")).unwrap();
 	let descriptor_block = schema_source
-		.split_once("pub struct TableSchemaDescriptorV1 {")
+		.split_once("pub struct TableSchemaDescriptor {")
 		.and_then(|(_, rest)| rest.split_once("\n}"))
 		.map(|(block, _)| block)
 		.unwrap_or("");

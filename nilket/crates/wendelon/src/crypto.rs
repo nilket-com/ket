@@ -6932,8 +6932,8 @@ mod tests {
 	#[test]
 	fn adr039_arrow_csb_plaintext_roundtrips_through_stats_envelope() {
 		use crate::schema::table::{
-			LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-			TableObjectId, TableSchemaDescriptorV1,
+			LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+			TableObjectId, TableSchemaDescriptor,
 		};
 		use crate::storage::stats::{
 			build_always_on_column_stats_block, decode_column_stats_payload,
@@ -6949,14 +6949,14 @@ mod tests {
 			Field::new("id", DataType::Int64, false),
 			Field::new("region", DataType::LargeUtf8, true),
 		]);
-		let descriptor = TableSchemaDescriptorV1::new(
+		let descriptor = TableSchemaDescriptor::new(
 			TableObjectId::new([3; 16]),
 			17,
 			"analytics",
 			"events",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();

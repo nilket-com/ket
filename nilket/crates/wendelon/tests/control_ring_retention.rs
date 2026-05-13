@@ -9,10 +9,10 @@ use wendelon::integration::compute::{
 	encode_schema_update_envelope_v1,
 };
 use wendelon::schema::{
-	HybridTimestamp, LocalityPolicyV1, MultiRowLayoutDescriptor, PolicyGeneration,
+	HybridTimestamp, LocalityPolicy, MultiRowLayoutDescriptor, PolicyGeneration,
 	PrimaryKeyDescriptorV1, RecordLayoutPolicy, RetentionRejectCode, RetentionWindowMillis,
 	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableRetentionPolicy,
-	TableSchemaDescriptorV1, TenantId, encode_table_schema_descriptor_v1,
+	TableSchemaDescriptor, TenantId, encode_table_schema_descriptor_v1,
 };
 
 fn table_schema() -> Schema {
@@ -22,36 +22,36 @@ fn table_schema() -> Schema {
 	])
 }
 
-fn append_only_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptorV1 {
-	TableSchemaDescriptorV1::new_with_layout(
+fn append_only_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([id_byte; 16]),
 		1,
 		"analytics",
 		table_name,
 		&table_schema(),
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap()
 }
 
-fn pk_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptorV1 {
-	TableSchemaDescriptorV1::new(
+fn pk_descriptor(id_byte: u8, table_name: &str) -> TableSchemaDescriptor {
+	TableSchemaDescriptor::new(
 		TableObjectId::new([id_byte; 16]),
 		1,
 		"analytics",
 		table_name,
 		&table_schema(),
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)
 	.unwrap()
 }
 
-fn schema_update(descriptor: &TableSchemaDescriptorV1, intent_byte: u8) -> Vec<u8> {
+fn schema_update(descriptor: &TableSchemaDescriptor, intent_byte: u8) -> Vec<u8> {
 	let payload = encode_table_schema_descriptor_v1(descriptor).unwrap();
 	let envelope = SchemaUpdateEnvelopeV1 {
 		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,

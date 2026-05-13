@@ -7,7 +7,7 @@ use crate::schema::{
 	LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptorV1,
+	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptor,
 };
 use crate::storage::core::RecordLocation;
 use crate::storage::encoding::directory::{
@@ -237,7 +237,7 @@ fn record_len_for_probe(record_location: &RecordLocation) -> Result<u64, ColumnF
 pub fn prepare_l2_column_fetch_strategy(
 	crypto: &CryptoManager,
 	config: &L2ColumnFetchConfig,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	record_location: &RecordLocation,
 	record_id: TieredRecordId,
 	requirement: &ColumnFetchRequirement,
@@ -1003,7 +1003,7 @@ pub fn parse_record_buffer_directory(
 	record_id: TieredRecordId,
 	record_plaintext_range: PlaintextByteRange,
 	metadata_window_bytes: &[u8],
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<RecordBufferDirectory, ColumnFetchError> {
 	let mut offset = 0_usize;
 	let schema_message = read_ipc_message_metadata(metadata_window_bytes, &mut offset)?;
@@ -1291,7 +1291,7 @@ pub fn build_column_fetch_plan(
 
 pub fn pick_l2_fetch_strategy(
 	config: &L2ColumnFetchConfig,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	record_location: &RecordLocation,
 	requirement: &ColumnFetchRequirement,
 	directory: Option<&RecordBufferDirectory>,
@@ -2099,7 +2099,7 @@ mod tests {
 	use crate::schema::pbc::{OP_GTE, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT, Program};
 	use crate::schema::{
 		AggregateExpression, AggregateFunctionTag, EncryptedChunkIndex, HybridTimestamp,
-		IdentityPrefix, LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
+		IdentityPrefix, LocalityPolicy, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1,
 		RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, RowIdentityPolicy,
 		SchemaEvolutionPolicyV1, TableObjectId, TenantId,
 	};
@@ -2108,29 +2108,29 @@ mod tests {
 	use arrow::datatypes::{DataType, Field};
 	use std::sync::Arc;
 
-	fn descriptor_for(schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn descriptor_for(schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([0x44; 16]),
 			1,
 			"test",
 			"columnar",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn multirow_descriptor_for(schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new_with_layout(
+	fn multirow_descriptor_for(schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([0x45; 16]),
 			1,
 			"test",
 			"columnar",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::IdentityProjection,
+			LocalityPolicy::IdentityProjection,
 			RecordLayoutPolicy::MultiRow(
 				MultiRowLayoutDescriptor::new(2, 64, 8 * 1024 * 1024).unwrap(),
 			),
@@ -2177,7 +2177,7 @@ mod tests {
 
 	fn parse_directory_for_batch(
 		batch: &RecordBatch,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 	) -> (Vec<u8>, RecordBufferDirectory) {
 		parse_directory_for_batch_with_policy(
 			batch,
@@ -2188,7 +2188,7 @@ mod tests {
 
 	fn parse_directory_for_batch_with_policy(
 		batch: &RecordBatch,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		policy: RecordBodyCompressionPolicy,
 	) -> (Vec<u8>, RecordBufferDirectory) {
 		let bytes = encode_record_batch_bytes(batch, policy).expect("encode test IPC");

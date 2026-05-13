@@ -96,9 +96,9 @@ each item.
     ops and reference executor.
   - `wendelon::schema::{TenantId, TableObjectId,
     HybridTimestamp, PhysicalDescriptorFingerprint,
-    TableSchemaDescriptorV1, KllSketch, KllK}`.
+    TableSchemaDescriptor, KllSketch, KllK}`.
   - `wendelon_client::{Client, TableQueryOptions,
-    TableSchemaDescriptorV1}`.
+    TableSchemaDescriptor}`.
   - `wendelon::network::pool::{BufPool, PooledBuf}`
     (carryover from seed M9).
   - `wendelon::storage::file_ops::{AsyncFileOps,

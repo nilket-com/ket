@@ -1,4 +1,4 @@
-use crate::schema::{RecordBodyCompressionPolicy, TableSchemaDescriptorV1};
+use crate::schema::{RecordBodyCompressionPolicy, TableSchemaDescriptor};
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow::ipc::{BodyCompressionMethod, CompressionType, MessageHeader, root_as_message};
 use arrow::record_batch::RecordBatch;
@@ -14,7 +14,7 @@ pub struct EncodedRecordBatch {
 }
 
 pub fn ipc_write_options_for(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> std::io::Result<IpcWriteOptions> {
 	ipc_write_options_for_policy(descriptor.record_body_compression_policy)
 }

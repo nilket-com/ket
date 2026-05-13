@@ -328,6 +328,10 @@ name = "arrow-schema"
 version = "58.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f633dbfdf39c039ada1bf9e34c694816eb71fbb7dc78f613993b7245e078a1ed"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "arrow-select"
@@ -3872,6 +3876,7 @@ name = "toron"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "async-trait",
  "aws-lc-rs",
  "bytemuck",
@@ -3884,6 +3889,8 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.18",
  "tokio",
+ "twox-hash 2.1.2",
+ "uuid",
  "wendelon",
  "wendelon-client",
 ]

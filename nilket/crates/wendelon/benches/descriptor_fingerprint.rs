@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use wendelon::schema::{
-	ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1,
-	LocalityPolicyV1, MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
+	ColumnBloomSpecV1, ColumnHllSpecV1, ColumnSmallSetSpecV1, ColumnStatsPolicyV1, LocalityPolicy,
+	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordLayoutPolicy, RowIdentityPolicy,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 };
 
 const DEFAULT_ITERS: usize = 100_000;
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct DescriptorCase {
 	label: &'static str,
-	descriptor: TableSchemaDescriptorV1,
+	descriptor: TableSchemaDescriptor,
 }
 
 fn descriptor_cases() -> Result<Vec<DescriptorCase>, Box<dyn std::error::Error>> {
@@ -118,20 +118,20 @@ fn wide_schema() -> Schema {
 fn pk_descriptor(
 	id_byte: u8,
 	schema: Schema,
-) -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
-	Ok(TableSchemaDescriptorV1::new(
+) -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
+	Ok(TableSchemaDescriptor::new(
 		TableObjectId::new([id_byte; 16]),
 		1,
 		"bench",
 		"descriptor_fingerprint",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
 }
 
-fn append_only_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+fn append_only_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new(
 			"event_time",
@@ -140,51 +140,51 @@ fn append_only_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::erro
 		),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	Ok(TableSchemaDescriptorV1::new_with_layout(
+	Ok(TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x53; 16]),
 		1,
 		"bench",
 		"descriptor_fingerprint_append_only",
 		&schema,
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
 }
 
-fn content_hash_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+fn content_hash_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new("event_id", DataType::Int64, false),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	Ok(TableSchemaDescriptorV1::new_with_layout(
+	Ok(TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x54; 16]),
 		1,
 		"bench",
 		"descriptor_fingerprint_content_hash",
 		&schema,
 		RowIdentityPolicy::AppendOnlyContentHash,
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
 }
 
-fn stats_policy_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+fn stats_policy_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("region", DataType::LargeUtf8, true),
 		Field::new("value", DataType::UInt64, true),
 	]);
-	let mut descriptor = TableSchemaDescriptorV1::new(
+	let mut descriptor = TableSchemaDescriptor::new(
 		TableObjectId::new([0x55; 16]),
 		1,
 		"bench",
 		"descriptor_fingerprint_stats",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?;
 	descriptor.stats_policy = ColumnStatsPolicyV1 {
@@ -199,7 +199,7 @@ fn stats_policy_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::err
 fn bench_logical(
 	config: &BenchConfig,
 	shape: &str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	bench_result(config, "logical", shape, || {
 		black_box(descriptor.compute_logical_schema_fingerprint())
@@ -209,7 +209,7 @@ fn bench_logical(
 fn bench_physical(
 	config: &BenchConfig,
 	shape: &str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	let logical = descriptor.logical_schema_fingerprint;
 	bench_result(config, "physical", shape, || {
@@ -220,7 +220,7 @@ fn bench_physical(
 fn bench_refresh(
 	config: &BenchConfig,
 	shape: &str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	bench_result(config, "refresh", shape, || {
 		let mut descriptor = descriptor.clone();
@@ -231,14 +231,14 @@ fn bench_refresh(
 fn bench_validate(
 	config: &BenchConfig,
 	shape: &str,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 ) -> Result<(), Box<dyn std::error::Error>> {
 	bench_result(config, "validate", shape, || {
 		black_box(descriptor.validate())
 	})
 }
 
-fn bench_equality(config: &BenchConfig, shape: &str, descriptor: &TableSchemaDescriptorV1) {
+fn bench_equality(config: &BenchConfig, shape: &str, descriptor: &TableSchemaDescriptor) {
 	let logical = descriptor.logical_schema_fingerprint;
 	let schema_generation = descriptor.schema_generation;
 	bench_bool(config, "logical-equality", shape, || {

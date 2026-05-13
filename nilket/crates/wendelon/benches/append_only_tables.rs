@@ -21,9 +21,9 @@ use arrow::array::{ArrayRef, LargeBinaryArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use wendelon::schema::{
-	ClientWriteId, DurabilityLevel, HybridTimestamp, IntraBatchIndex, LocalityPolicyV1,
+	ClientWriteId, DurabilityLevel, HybridTimestamp, IntraBatchIndex, LocalityPolicy,
 	MultiRowLayoutDescriptor, NodeId, PrimaryKeyDescriptorV1, RecordLayoutPolicy,
-	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptorV1,
+	RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 	TableWriteRequestMeta, TenantId, WriterNodeId, encode_table_write_row_count,
 	synthesize_append_only_row_id, validate_table_write_request_batch,
 };
@@ -165,7 +165,7 @@ fn run_payload_size(
 	Ok(())
 }
 
-fn append_only_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+fn append_only_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new(
 			"event_time",
@@ -174,32 +174,32 @@ fn append_only_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::erro
 		),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	Ok(TableSchemaDescriptorV1::new_with_layout(
+	Ok(TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x45; 16]),
 		1,
 		"bench",
 		"events",
 		&schema,
 		RowIdentityPolicy::AppendOnly,
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
 }
 
-fn pk_descriptor() -> Result<TableSchemaDescriptorV1, Box<dyn std::error::Error>> {
+fn pk_descriptor() -> Result<TableSchemaDescriptor, Box<dyn std::error::Error>> {
 	let schema = Schema::new(vec![
 		Field::new("id", DataType::LargeBinary, false),
 		Field::new("payload", DataType::LargeBinary, true),
 	]);
-	Ok(TableSchemaDescriptorV1::new_with_layout(
+	Ok(TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x44; 16]),
 		1,
 		"bench",
 		"events_pk",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?)
@@ -266,7 +266,7 @@ fn pk_batch_matching_shape(append_only: &RecordBatch) -> RecordBatch {
 }
 
 fn bench_meta(
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	rows: usize,
 ) -> Result<TableWriteRequestMeta, Box<dyn std::error::Error>> {
 	let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
@@ -298,7 +298,7 @@ fn bench_admission(
 	label: &str,
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	warmup: usize,
 	measure: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -333,7 +333,7 @@ fn bench_admission(
 fn bench_identical_payload(
 	label: &str,
 	meta: &TableWriteRequestMeta,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	rows: usize,
 	payload_bytes: usize,
 	warmup: usize,
@@ -442,7 +442,7 @@ fn bench_multirow_pack(
 	label: &str,
 	meta: &TableWriteRequestMeta,
 	batch: &RecordBatch,
-	descriptor: &TableSchemaDescriptorV1,
+	descriptor: &TableSchemaDescriptor,
 	warmup: usize,
 	measure: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {

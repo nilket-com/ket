@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wendelon::crypto::TieredPlaintextRange;
 use wendelon::schema::{
-	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicyV1,
+	HybridTimestamp, Identity, IpcColumnOrdinal, Locality, LocalityPolicy,
 	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowCount, RowGroupIndex, RowGroupRowCount,
 	RowIdentityPolicy, SchemaEvolutionPolicyV1, SlabId, TableObjectId,
@@ -18,15 +18,15 @@ use wendelon::storage::{
 	parse_record_buffer_directory, selected_row_group_record_body_ranges,
 };
 
-fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptorV1 {
-	wendelon::schema::TableSchemaDescriptorV1::new_with_layout(
+fn descriptor(schema: &Schema) -> wendelon::schema::TableSchemaDescriptor {
+	wendelon::schema::TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x57; 16]),
 		1,
 		"test",
 		"encoding_planner",
 		schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(
 			MultiRowLayoutDescriptor::new(1024, 1024, 8 * 1024 * 1024).unwrap(),
 		),

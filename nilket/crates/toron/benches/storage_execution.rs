@@ -26,8 +26,8 @@ use toron::ir::{
 };
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptorV1,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor,
 };
 
 const DEFAULT_ROWS: &[usize] = &[8_192, 65_536];
@@ -381,7 +381,7 @@ fn slice_morsel(batch: RecordBatch, morsel_id: MorselId, total_morsels: u32) -> 
 #[derive(Clone)]
 struct Fixture {
 	batch: RecordBatch,
-	descriptor: TableSchemaDescriptorV1,
+	descriptor: TableSchemaDescriptor,
 }
 
 fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
@@ -424,14 +424,14 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 			Arc::new(all_null) as ArrayRef,
 		],
 	)?;
-	let descriptor = TableSchemaDescriptorV1::new(
+	let descriptor = TableSchemaDescriptor::new(
 		TableObjectId::new([0x02; 16]),
 		1,
 		"bench",
 		"storage_execution",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::default_table_spread(),
+		LocalityPolicy::default_table_spread(),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)?;
 	Ok(Fixture { batch, descriptor })

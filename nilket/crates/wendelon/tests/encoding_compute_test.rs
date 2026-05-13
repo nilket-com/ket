@@ -8,10 +8,10 @@ use wendelon::schema::{
 	AGG_FORMAT_VERSION, AggregateBudgets, AggregateExpression, AggregateFunctionTag,
 	AggregateRequest, AggregateRequestId, AggregateState, BaseValue, BitsPerValue,
 	BufferValueCount, Consistency, EncodingCascadeIndex, EncodingPageByteOffset, HybridTimestamp,
-	IpcBufferIndex, IpcColumnOrdinal, Locality, LocalityPolicyV1, LocalityRange,
+	IpcBufferIndex, IpcColumnOrdinal, Locality, LocalityPolicy, LocalityRange,
 	MultiRowLayoutDescriptor, PrimaryKeyDescriptorV1, RecordBodyByteLen, RecordLayoutPolicy,
 	RowCount, RowGroupIndex, RowIdentityPolicy, SchemaEvolutionPolicyV1, SimdPageValueCount,
-	TableObjectId, TableSchemaDescriptorV1, TenantId, encode_aggregate_state,
+	TableObjectId, TableSchemaDescriptor, TenantId, encode_aggregate_state,
 };
 use wendelon::schema::{DictValueCount, RunCount};
 use wendelon::storage::encoding::cascade::{encode_buffer, encode_buffer_with_value_offsets};
@@ -1414,14 +1414,14 @@ fn aggregate_expr(tag: AggregateFunctionTag, column_ordinal: u16) -> AggregateEx
 
 fn logical_fingerprint() -> wendelon::schema::LogicalSchemaFingerprint {
 	let schema = Schema::new(vec![Field::new("id", DataType::UInt8, false)]);
-	TableSchemaDescriptorV1::new_with_layout(
+	TableSchemaDescriptor::new_with_layout(
 		TableObjectId::new([0x58; 16]),
 		1,
 		"test",
 		"encoding_compute",
 		&schema,
 		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-		LocalityPolicyV1::IdentityProjection,
+		LocalityPolicy::IdentityProjection,
 		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 8 * 1024 * 1024).unwrap()),
 		SchemaEvolutionPolicyV1::AdditiveOnly,
 	)

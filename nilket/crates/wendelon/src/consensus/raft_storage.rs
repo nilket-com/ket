@@ -69,7 +69,7 @@ use crate::schema::{
 	NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
 	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
 	SecondaryIndexState, SlabId, SnapshotHeader, TableLifecycleCatalog, TableRetentionPolicy,
-	TableSchemaCatalogV1, TableSchemaDescriptorV1, TenantId, TenantKekId, WALRecordHeader,
+	TableSchemaCatalogV1, TableSchemaDescriptor, TenantId, TenantKekId, WALRecordHeader,
 	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
 	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
 	validate_table_schema_evolution,
@@ -2760,8 +2760,8 @@ struct RetentionAuditContext {
 #[derive(Clone, Debug)]
 struct SchemaAuditContext {
 	envelope: SchemaUpdateEnvelopeV1,
-	descriptor: TableSchemaDescriptorV1,
-	previous_descriptor: Option<TableSchemaDescriptorV1>,
+	descriptor: TableSchemaDescriptor,
+	previous_descriptor: Option<TableSchemaDescriptor>,
 }
 
 #[derive(Clone, Debug)]
@@ -3634,8 +3634,8 @@ fn schema_mutation_label(mutation: SchemaMutationKindV1) -> &'static str {
 }
 
 fn descriptor_mutation_axis(
-	previous: Option<&TableSchemaDescriptorV1>,
-	next: &TableSchemaDescriptorV1,
+	previous: Option<&TableSchemaDescriptor>,
+	next: &TableSchemaDescriptor,
 ) -> Option<DescriptorMutationAxis> {
 	let Some(previous) = previous else {
 		return Some(DescriptorMutationAxis::Combined);
@@ -5744,13 +5744,13 @@ mod schema_state_tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, LocalityPolicyV1,
+		IndexArrowTypeTag, IndexKeyEncoding, IndexObjectId, LocalityPolicy,
 		LogicalSchemaFingerprint, MultiRowLayoutDescriptor, PolicyGeneration,
 		PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 		RetentionRejectCode, RetentionWindowMillis, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 		SecondaryIndexDescriptor, SecondaryIndexDropRequest, SecondaryIndexKeyDescriptor,
 		SecondaryIndexLifecycleComplete, SecondaryIndexState, TableObjectId, TableRetentionPolicy,
-		TableSchemaDescriptorV1, TenantKekId, encode_secondary_index_descriptor,
+		TableSchemaDescriptor, TenantKekId, encode_secondary_index_descriptor,
 		encode_secondary_index_drop_request, encode_secondary_index_lifecycle_complete,
 		encode_table_schema_descriptor_v1,
 	};
@@ -5763,33 +5763,33 @@ mod schema_state_tests {
 		])
 	}
 
-	fn table_descriptor_for_schema(generation: u64, schema: &Schema) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn table_descriptor_for_schema(generation: u64, schema: &Schema) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([4; 16]),
 			generation,
 			"analytics",
 			"events",
 			schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
 	}
 
-	fn table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
+	fn table_descriptor(generation: u64) -> TableSchemaDescriptor {
 		table_descriptor_for_schema(generation, &table_schema())
 	}
 
-	fn append_only_table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new_with_layout(
+	fn append_only_table_descriptor(generation: u64) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new_with_layout(
 			TableObjectId::new([8; 16]),
 			generation,
 			"analytics",
 			"append_events",
 			&table_schema(),
 			RowIdentityPolicy::AppendOnly,
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap()),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
@@ -5814,7 +5814,7 @@ mod schema_state_tests {
 		}
 	}
 
-	fn state_with_descriptor(descriptor: &TableSchemaDescriptorV1) -> SmState {
+	fn state_with_descriptor(descriptor: &TableSchemaDescriptor) -> SmState {
 		let mut state = SmState::default();
 		assert_eq!(
 			apply_create_tenant(&mut state, create_tenant()),
@@ -5834,7 +5834,7 @@ mod schema_state_tests {
 	}
 
 	fn schema_envelope(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
 		mutation: SchemaMutationKindV1,
@@ -5849,7 +5849,7 @@ mod schema_state_tests {
 	}
 
 	fn schema_envelope_for_kind(
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
 		mutation: SchemaMutationKindV1,
@@ -5874,7 +5874,7 @@ mod schema_state_tests {
 		encode_schema_update_envelope_v1(&envelope).unwrap()
 	}
 
-	fn index_descriptor(table: &TableSchemaDescriptorV1) -> SecondaryIndexDescriptor {
+	fn index_descriptor(table: &TableSchemaDescriptor) -> SecondaryIndexDescriptor {
 		SecondaryIndexDescriptor {
 			index_object_id: IndexObjectId::new([0x52; 16]),
 			table_object_id: table.table_object_id,
@@ -6529,14 +6529,14 @@ mod schema_state_tests {
 		)
 		.unwrap();
 
-		let conflicting = TableSchemaDescriptorV1::new(
+		let conflicting = TableSchemaDescriptor::new(
 			descriptor.table_object_id,
 			1,
 			"analytics",
 			"events_copy",
 			&table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap();
@@ -6785,9 +6785,9 @@ mod recovery_tests {
 		encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
-		FinalizationMarker, LeaseDescriptor, LocalityPolicyV1, NodeId as SchemaNodeId,
+		FinalizationMarker, LeaseDescriptor, LocalityPolicy, NodeId as SchemaNodeId,
 		PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1, TableObjectId,
-		TableSchemaDescriptorV1, TenantId, encode_table_schema_descriptor_v1,
+		TableSchemaDescriptor, TenantId, encode_table_schema_descriptor_v1,
 	};
 	use crate::storage::{
 		AlignedBuf, AsyncFileOps, BlockingFileOps, DirectoryEntry, FaultAction, FaultOp,
@@ -6905,15 +6905,15 @@ mod recovery_tests {
 		])
 	}
 
-	fn recovery_table_descriptor(generation: u64) -> TableSchemaDescriptorV1 {
-		TableSchemaDescriptorV1::new(
+	fn recovery_table_descriptor(generation: u64) -> TableSchemaDescriptor {
+		TableSchemaDescriptor::new(
 			TableObjectId::new([8; 16]),
 			generation,
 			"analytics",
 			"events",
 			&recovery_table_schema(),
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.unwrap()
@@ -6921,7 +6921,7 @@ mod recovery_tests {
 
 	fn schema_update_entry(
 		index: u64,
-		descriptor: &TableSchemaDescriptorV1,
+		descriptor: &TableSchemaDescriptor,
 		expected_generation: u64,
 		requested_generation: u64,
 		mutation: SchemaMutationKindV1,

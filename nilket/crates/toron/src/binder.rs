@@ -828,8 +828,8 @@ mod tests {
 	use crate::ir::{QueryProfileHint, ScalarValue, TableId};
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
-		LocalityPolicyV1, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptorV1,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -1137,7 +1137,7 @@ mod tests {
 		catalog
 	}
 
-	fn descriptor() -> TableSchemaDescriptorV1 {
+	fn descriptor() -> TableSchemaDescriptor {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int32, true),
@@ -1145,14 +1145,14 @@ mod tests {
 			Field::new("ts", DataType::Int64, true),
 		]);
 
-		TableSchemaDescriptorV1::new(
+		TableSchemaDescriptor::new(
 			TableObjectId::new([1; 16]),
 			1,
 			"default",
 			"sales",
 			&schema,
 			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
-			LocalityPolicyV1::default_table_spread(),
+			LocalityPolicy::default_table_spread(),
 			SchemaEvolutionPolicyV1::AdditiveOnly,
 		)
 		.expect("descriptor")

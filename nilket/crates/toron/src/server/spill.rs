@@ -3,13 +3,24 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use wendelon::storage::file_ops::AsyncFileOps;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpillId(pub u64);
+
+impl SpillId {
+	pub const fn new(value: u64) -> Self {
+		Self(value)
+	}
+
+	pub const fn get(self) -> u64 {
+		self.0
+	}
+}
 
 pub struct SpillManager {
 	file_ops: Arc<dyn AsyncFileOps>,
@@ -49,7 +60,7 @@ impl SpillManager {
 	}
 
 	pub async fn spill_batch(&self, batch: &RecordBatch) -> Result<SpillId, SpillError> {
-		let id = SpillId(self.next_id.fetch_add(1, Ordering::SeqCst));
+		let id = SpillId::new(self.next_id.fetch_add(1, Ordering::SeqCst));
 
 		// 1. Serialize to Arrow IPC
 		let mut buffer = Vec::new();

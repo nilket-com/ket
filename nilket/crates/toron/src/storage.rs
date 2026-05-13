@@ -139,13 +139,13 @@ impl StorageScan for InMemoryStorageScan {
 
 pub struct WendelonStorageScan {
 	client: Arc<wendelon_client::Client>,
-	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptorV1>,
+	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
 }
 
 impl WendelonStorageScan {
 	pub fn new(
 		client: Arc<wendelon_client::Client>,
-		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptorV1>,
+		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
 	) -> Self {
 		Self {
 			client,
