@@ -21,6 +21,7 @@ use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io::ErrorKind;
@@ -1260,20 +1261,29 @@ async fn execute_inner_join(
 		.await;
 	}
 
-	let mut build_rows: HashMap<Vec<u8>, Vec<u32>> = HashMap::new();
+	let join_key_plan = JoinKeyPlan::from_key_arrays(&left_key_arrays, &right_key_arrays);
 
 	let build_started = Instant::now();
-	for row in 0..left_batch.num_rows() {
-		let Some(key) = join_key_bytes(&left_key_arrays, row)? else {
-			continue;
-		};
-		build_rows
-			.entry(key)
-			.or_default()
-			.push(u32::try_from(row).map_err(|_| ExecutionError::Kernel {
-				message: "join build row index exceeds UInt32 take index".to_string(),
-			})?);
-	}
+	let Some(build_rows) = build_in_memory_join_rows(
+		join_key_plan,
+		&left_key_arrays,
+		left_batch.num_rows(),
+		task_budget.memory.get(),
+	)?
+	else {
+		return execute_spilled_inner_join(
+			&left_batch,
+			&right_batch,
+			&left_key_arrays,
+			&right_key_arrays,
+			output_schema,
+			task_budget,
+			telemetry,
+			spill_file_ops,
+			spill_dir,
+		)
+		.await;
+	};
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.build_micros = task
 			.phases
@@ -1281,24 +1291,13 @@ async fn execute_inner_join(
 			.saturating_add(duration_micros(build_started));
 	});
 
-	let mut left_indices = Vec::new();
-	let mut right_indices = Vec::new();
 	let probe_started = Instant::now();
-	for row in 0..right_batch.num_rows() {
-		let Some(key) = join_key_bytes(&right_key_arrays, row)? else {
-			continue;
-		};
-		let Some(matches) = build_rows.get(&key) else {
-			continue;
-		};
-		let right_index = u32::try_from(row).map_err(|_| ExecutionError::Kernel {
-			message: "join probe row index exceeds UInt32 take index".to_string(),
-		})?;
-		for left_index in matches {
-			left_indices.push(*left_index);
-			right_indices.push(right_index);
-		}
-	}
+	let (left_indices, right_indices) = probe_in_memory_join_rows(
+		join_key_plan,
+		&build_rows,
+		&right_key_arrays,
+		right_batch.num_rows(),
+	)?;
 	record_task_telemetry(&telemetry, |task| {
 		task.phases.probe_micros = task
 			.phases
@@ -1329,6 +1328,238 @@ async fn execute_inner_join(
 		output_schema.clone(),
 		output_columns,
 	)?])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinKey {
+	Int32(i32),
+	Int64(i64),
+	Generic(Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+struct BuildRowList {
+	first: u32,
+	overflow: Option<Vec<u32>>,
+}
+
+impl BuildRowList {
+	fn new(first: u32) -> Self {
+		Self {
+			first,
+			overflow: None,
+		}
+	}
+
+	fn push(&mut self, row: u32) {
+		self.overflow.get_or_insert_with(Vec::new).push(row);
+	}
+
+	fn rows(&self) -> impl Iterator<Item = u32> + '_ {
+		std::iter::once(self.first).chain(self.overflow.iter().flatten().copied())
+	}
+
+	#[cfg(test)]
+	fn overflow_len(&self) -> usize {
+		self.overflow.as_ref().map(Vec::len).unwrap_or(0)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinKeyPlan {
+	Int32,
+	Int64,
+	Generic,
+}
+
+impl JoinKeyPlan {
+	fn from_key_arrays(left_key_arrays: &[ArrayRef], right_key_arrays: &[ArrayRef]) -> Self {
+		if left_key_arrays.len() != 1 || right_key_arrays.len() != 1 {
+			return Self::Generic;
+		}
+		if left_key_arrays[0].data_type() != right_key_arrays[0].data_type() {
+			return Self::Generic;
+		}
+		match left_key_arrays[0].data_type() {
+			DataType::Int32 => Self::Int32,
+			DataType::Int64 => Self::Int64,
+			_ => Self::Generic,
+		}
+	}
+}
+
+fn build_in_memory_join_rows(
+	join_key_plan: JoinKeyPlan,
+	left_key_arrays: &[ArrayRef],
+	rows: usize,
+	memory_cap: u64,
+) -> Result<Option<HashMap<JoinKey, BuildRowList>>, ExecutionError> {
+	let mut build_rows = HashMap::with_capacity(rows);
+	let mut inserted_rows = 0usize;
+
+	match join_key_plan {
+		JoinKeyPlan::Int32 => {
+			let values = single_join_key_array::<Int32Array>(left_key_arrays, "Int32")?;
+			for row in 0..rows {
+				if values.is_null(row) {
+					continue;
+				}
+				if !join_build_memory_fits(
+					left_key_arrays,
+					inserted_rows.saturating_add(1),
+					memory_cap,
+				) {
+					return Ok(None);
+				}
+				insert_join_build_row(
+					&mut build_rows,
+					JoinKey::Int32(values.value(row)),
+					join_build_row_index(row)?,
+				);
+				inserted_rows = inserted_rows.saturating_add(1);
+			}
+		}
+		JoinKeyPlan::Int64 => {
+			let values = single_join_key_array::<Int64Array>(left_key_arrays, "Int64")?;
+			for row in 0..rows {
+				if values.is_null(row) {
+					continue;
+				}
+				if !join_build_memory_fits(
+					left_key_arrays,
+					inserted_rows.saturating_add(1),
+					memory_cap,
+				) {
+					return Ok(None);
+				}
+				insert_join_build_row(
+					&mut build_rows,
+					JoinKey::Int64(values.value(row)),
+					join_build_row_index(row)?,
+				);
+				inserted_rows = inserted_rows.saturating_add(1);
+			}
+		}
+		JoinKeyPlan::Generic => {
+			for row in 0..rows {
+				let Some(key) = join_key_bytes(left_key_arrays, row)? else {
+					continue;
+				};
+				if !join_build_memory_fits(
+					left_key_arrays,
+					inserted_rows.saturating_add(1),
+					memory_cap,
+				) {
+					return Ok(None);
+				}
+				insert_join_build_row(
+					&mut build_rows,
+					JoinKey::Generic(key),
+					join_build_row_index(row)?,
+				);
+				inserted_rows = inserted_rows.saturating_add(1);
+			}
+		}
+	}
+
+	Ok(Some(build_rows))
+}
+
+fn probe_in_memory_join_rows(
+	join_key_plan: JoinKeyPlan,
+	build_rows: &HashMap<JoinKey, BuildRowList>,
+	right_key_arrays: &[ArrayRef],
+	rows: usize,
+) -> Result<(Vec<u32>, Vec<u32>), ExecutionError> {
+	let mut left_indices = Vec::new();
+	let mut right_indices = Vec::new();
+
+	match join_key_plan {
+		JoinKeyPlan::Int32 => {
+			let values = single_join_key_array::<Int32Array>(right_key_arrays, "Int32")?;
+			for row in 0..rows {
+				if values.is_null(row) {
+					continue;
+				}
+				let key = JoinKey::Int32(values.value(row));
+				if let Some(matches) = build_rows.get(&key) {
+					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+				}
+			}
+		}
+		JoinKeyPlan::Int64 => {
+			let values = single_join_key_array::<Int64Array>(right_key_arrays, "Int64")?;
+			for row in 0..rows {
+				if values.is_null(row) {
+					continue;
+				}
+				let key = JoinKey::Int64(values.value(row));
+				if let Some(matches) = build_rows.get(&key) {
+					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+				}
+			}
+		}
+		JoinKeyPlan::Generic => {
+			for row in 0..rows {
+				let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+					continue;
+				};
+				let key = JoinKey::Generic(key);
+				if let Some(matches) = build_rows.get(&key) {
+					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+				}
+			}
+		}
+	}
+
+	Ok((left_indices, right_indices))
+}
+
+fn single_join_key_array<'a, T: 'static>(
+	key_arrays: &'a [ArrayRef],
+	label: &'static str,
+) -> Result<&'a T, ExecutionError> {
+	key_arrays[0]
+		.as_any()
+		.downcast_ref::<T>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("join key array is not {label}"),
+		})
+}
+
+fn insert_join_build_row(build_rows: &mut HashMap<JoinKey, BuildRowList>, key: JoinKey, row: u32) {
+	match build_rows.entry(key) {
+		Entry::Occupied(mut entry) => entry.get_mut().push(row),
+		Entry::Vacant(entry) => {
+			entry.insert(BuildRowList::new(row));
+		}
+	}
+}
+
+fn append_join_matches(
+	probe_row: usize,
+	matches: &BuildRowList,
+	left_indices: &mut Vec<u32>,
+	right_indices: &mut Vec<u32>,
+) -> Result<(), ExecutionError> {
+	let right_index = u32::try_from(probe_row).map_err(|_| ExecutionError::Kernel {
+		message: "join probe row index exceeds UInt32 take index".to_string(),
+	})?;
+	for left_index in matches.rows() {
+		left_indices.push(left_index);
+		right_indices.push(right_index);
+	}
+	Ok(())
+}
+
+fn join_build_row_index(row: usize) -> Result<u32, ExecutionError> {
+	u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+		message: "join build row index exceeds UInt32 take index".to_string(),
+	})
+}
+
+fn join_build_memory_fits(key_arrays: &[ArrayRef], rows: usize, memory_cap: u64) -> bool {
+	estimated_build_hash_bytes(key_arrays, rows) <= memory_cap
 }
 
 async fn execute_spilled_inner_join(
@@ -1503,7 +1734,7 @@ fn estimated_build_hash_bytes(key_arrays: &[ArrayRef], rows: usize) -> u64 {
 			_ => 16,
 		})
 		.sum::<usize>();
-	u64::try_from(rows.saturating_mul(48 + key_width)).unwrap_or(u64::MAX)
+	u64::try_from(rows.saturating_mul(112 + key_width)).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2483,6 +2714,7 @@ mod tests {
 		UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
+	use std::hash::{DefaultHasher, Hash, Hasher};
 	use std::sync::Mutex;
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -3202,6 +3434,75 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn exchange_partition_bucket_uses_stable_xxh3_64_encoding_for_int64() {
+		let key_arrays = vec![Arc::new(Int64Array::from(vec![Some(42)])) as ArrayRef];
+		let mut encoded = vec![5];
+		encoded.extend_from_slice(&42i64.to_le_bytes());
+
+		assert_eq!(
+			partition_bucket(&key_arrays, 0, 17).expect("partition bucket"),
+			(XxHash3_64::oneshot(&encoded) % 17) as usize
+		);
+	}
+
+	#[test]
+	fn join_key_type_tag_distinguishes_int32_and_int64() {
+		let int32_key = JoinKey::Int32(1);
+		let int64_key = JoinKey::Int64(1);
+
+		assert_ne!(int32_key, int64_key);
+		assert_ne!(hash_join_key(&int32_key), hash_join_key(&int64_key));
+	}
+
+	#[test]
+	fn join_build_row_list_stores_unique_row_inline() {
+		let mut rows = HashMap::new();
+
+		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
+
+		let stored = rows.get(&JoinKey::Int64(7)).expect("row list");
+		assert_eq!(stored.rows().collect::<Vec<_>>(), vec![11]);
+		assert_eq!(stored.overflow_len(), 0);
+	}
+
+	#[test]
+	fn join_build_row_list_allocates_overflow_for_duplicates() {
+		let mut rows = HashMap::new();
+
+		insert_join_build_row(&mut rows, JoinKey::Int64(7), 11);
+		insert_join_build_row(&mut rows, JoinKey::Int64(7), 12);
+		insert_join_build_row(&mut rows, JoinKey::Int64(7), 13);
+
+		let stored = rows.get(&JoinKey::Int64(7)).expect("row list");
+		assert_eq!(stored.rows().collect::<Vec<_>>(), vec![11, 12, 13]);
+		assert_eq!(stored.overflow_len(), 2);
+	}
+
+	#[test]
+	fn join_build_hash_map_preallocates_for_input_rows() {
+		let key_arrays =
+			vec![Arc::new(Int64Array::from((0_i64..32).collect::<Vec<_>>())) as ArrayRef];
+
+		let rows = build_in_memory_join_rows(JoinKeyPlan::Int64, &key_arrays, 32, u64::MAX)
+			.expect("build rows")
+			.expect("in memory rows");
+
+		assert!(rows.capacity() >= 32);
+		assert!(rows.values().all(|list| list.overflow_len() == 0));
+	}
+
+	#[test]
+	fn join_key_plan_uses_actual_child_output_array_type() {
+		let left = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef];
+		let right = vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef];
+
+		assert_eq!(
+			JoinKeyPlan::from_key_arrays(&left, &right),
+			JoinKeyPlan::Int64
+		);
+	}
+
 	#[tokio::test]
 	async fn execute_grouped_sum_orders_by_group_key() {
 		let schema = Arc::new(Schema::new(vec![
@@ -3252,6 +3553,12 @@ mod tests {
 		assert_eq!(sums.value(0), 100);
 		assert_eq!(groups.value(1), "west");
 		assert_eq!(sums.value(1), 250);
+	}
+
+	fn hash_join_key(key: &JoinKey) -> u64 {
+		let mut hasher = DefaultHasher::new();
+		key.hash(&mut hasher);
+		hasher.finish()
 	}
 
 	struct RecordingStorageScan {

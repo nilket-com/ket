@@ -7,8 +7,8 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Implementation pending. Promotion bench
-evidence will land at
+Promoted to `plans/adr/` and implemented. Promotion bench evidence
+landed at
 `plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
 
 Builds on four WIP iteration rounds across the council

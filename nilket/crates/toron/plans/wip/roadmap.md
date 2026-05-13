@@ -27,12 +27,14 @@ along with the forward-sequence rewrite.
 - **ADR 004 — Distributed Inner Equi-Join Contract.**
   Promoted + implemented. Bench evidence at
   `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
-- **ADR 005 — Hash-Join Build Path Efficiency.** Promoted.
-  Implementation pending. Pinned by ADR 004's post-promotion
-  framework-overhead sub-attribution: `build_ms` is 47.7% of
-  8-worker wall, `framework_overhead_ms` 37.7%. ADR 005 targets
-  the build bucket; conditional ADR 006 rule resolves the
-  residual interpretation from the rerun.
+- **ADR 005 — Hash-Join Build Path Efficiency.** Promoted +
+  implemented. Bench evidence at
+  `plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
+  The 8-worker 10M x 1M rerun moved `build_ms`
+  `2581.550 ms -> 542.787 ms` with digest equality preserved.
+  `framework_overhead_ms` moved proportionally, placing ADR 006 in
+  the operator-adjacent band rather than runtime-plumbing
+  investigation.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -86,23 +88,17 @@ rerun rule below.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 005 implementation → ADR 006 planning
+### Next: ADR 006 planning
 
-ADR 005's contract is pinned at
-`plans/adr/005_hash_join_build_path_efficiency.md`; the impl plan
-lives at `plans/impl/005_hash_join_build_path_efficiency.md`. The
-next council deliverable is implementation through Phase 5, ending
-in promotion-scale bench evidence at
-`plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
+ADR 005's contract is implemented. Its promotion-scale rerun at
+`plans/impl/005_hash_join_build_path_efficiency_bench_results.md`
+resolves the ADR 006 framing via the pinned three-band rule:
 
-The ADR 005 rerun resolves the ADR 006 framing via a pinned
-three-band rule:
-
-- **Operator-adjacent residual (≥50% proportional drop).** ADR 006
+- **Operator-adjacent residual (>=50% proportional drop).** ADR 006
   does **not** promote runtime-plumbing investigation. ADR 006
   selects from the candidates below by V1 launch pressure and
   evidence-driven scope.
-- **Flat residual (≤20% proportional drop).** ADR 006 promotes a
+- **Flat residual (<=20% proportional drop).** ADR 006 promotes a
   runtime-plumbing investigation with sharp scope: async-runtime
   poll cost, allocator churn beyond ADR 005's wins, lock contention
   beyond ADR 004's telemetry-lock bucket, scheduler/registry
@@ -112,13 +108,14 @@ three-band rule:
   bottleneck; council reopens scope rather than treating residual
   plumbing as proven.
 
+ADR 005 landed in the **operator-adjacent** band: at 8 workers,
+`build_ms` fell 79.0% and `framework_overhead_ms` fell 78.8%.
+
 ### ADR 006 candidates (governed by the conditional rule)
 
-If ADR 005's rerun lands in the **operator-adjacent** or **gray
-zone** band, ADR 006 picks from the live V1-touching candidates
-below. If the rerun lands in **flat**, ADR 006 instead promotes the
-runtime-plumbing investigation; the candidates below shift one slot
-later.
+ADR 005 landed in the **operator-adjacent** band, so ADR 006 picks
+from the live V1-touching candidates below rather than promoting a
+runtime-plumbing investigation.
 
 The candidates, in rough order of probable selection given evidence
 shapes the council can already anticipate:
