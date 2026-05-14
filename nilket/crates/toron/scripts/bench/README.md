@@ -31,7 +31,31 @@ Outputs are written under `target/toron-perft/<mode>-<timestamp>` unless
 
 On Linux, `samply` needs access to perf events. If
 `/proc/sys/kernel/perf_event_paranoid` is too restrictive, the runner preserves
-the failure in `raw.log` and exits nonzero.
+the failure in `raw.log` and exits nonzero. Use `enable_profiling.sh` (below)
+to flip the kernel gates on a dev machine.
+
+## Profiler Permission Bootstrap
+
+`enable_profiling.sh` flips Linux kernel knobs that gate `samply` / `perf` /
+`gdb attach` on dev machines. Closes the recurring blocker recorded in ADR 005
+and ADR 006 bench artifacts (`perf_event_paranoid=4`, `ptrace_scope=1`).
+
+```bash
+crates/toron/scripts/bench/enable_profiling.sh --verify   # show current state + samply probe
+crates/toron/scripts/bench/enable_profiling.sh --apply    # record prior state, set dev targets (sudo)
+crates/toron/scripts/bench/enable_profiling.sh --revert   # restore prior state from state file
+```
+
+Default target values (override via `TORON_PERFT_PERF_PARANOID` /
+`TORON_PERFT_PTRACE_SCOPE`):
+
+- `/proc/sys/kernel/perf_event_paranoid` → `1` (allow user-space events)
+- `/proc/sys/kernel/yama/ptrace_scope` → `0` (allow same-user ptrace)
+
+The `--apply` mode records prior values to
+`target/toron-perft/profiling-state.txt` so `--revert` is mechanical. Changes
+are runtime-only (no `/etc/sysctl.d/` write) and do not survive reboot. Not
+for production hosts.
 
 Modes:
 
