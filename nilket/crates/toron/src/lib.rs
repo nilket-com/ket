@@ -1077,7 +1077,8 @@ mod tests {
 
 	#[tokio::test]
 	async fn rune_authoring_surface_builds_count_plan() {
-		let engine = crate::rune_engine::RuneEngine::new().unwrap();
+		let config = crate::rune_engine::RuneSandboxConfig::v1_default();
+		let engine = crate::rune_engine::RuneEngine::with_config(config).unwrap();
 
 		let script = r#"
             pub fn main(ctx) {
@@ -1088,7 +1089,7 @@ mod tests {
         "#;
 
 		let plan = engine
-			.execute_script(script, 1000)
+			.execute_script(script, &config)
 			.await
 			.expect("Rune execution failed");
 

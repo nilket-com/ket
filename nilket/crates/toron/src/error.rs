@@ -1,6 +1,7 @@
 pub mod distributed;
 
 use crate::ir::TableId;
+use crate::rune_engine::RuneSandboxViolation;
 pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
 
 use thiserror::Error;
@@ -130,6 +131,11 @@ pub enum FrontendError {
 	RuneCompile { message: String },
 	#[error("Rune runtime failed: {message}")]
 	RuneRuntime { message: String },
+	#[error("Rune sandbox violation: {message}")]
+	RuneSandbox {
+		kind: RuneSandboxViolation,
+		message: String,
+	},
 	#[error("unsupported frontend construct: {message}")]
 	Unsupported { message: String },
 }

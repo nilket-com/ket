@@ -164,6 +164,17 @@ fn scan_stream_collection_localized() {
 }
 
 #[test]
+fn architecture_guard_rune_context_is_allow_listed() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/rune_engine.rs"))
+		.expect("read rune engine source");
+	let default_modules_marker = ["with", "_", "default", "_", "modules"].concat();
+
+	assert!(!source.contains(&default_modules_marker));
+	assert!(source.contains("Context::new()"));
+	assert!(source.contains("install_minimal_primitives"));
+}
+
+#[test]
 fn distributed_identity_keeps_morsel_id_worker_local() {
 	let manifest_dir = manifest_dir();
 	let offenders = source_lines(&manifest_dir.join("src/distributed"))

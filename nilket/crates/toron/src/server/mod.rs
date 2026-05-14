@@ -807,6 +807,25 @@ mod tests {
 	}
 
 	#[test]
+	fn rune_sandbox_dispatch_failure_is_non_retryable_task_failed() {
+		let error = QueryError::Frontend(crate::error::FrontendError::RuneSandbox {
+			kind: crate::rune_engine::RuneSandboxViolation::FuelExhausted {
+				fuel_consumed: 10,
+				fuel_budget: 10,
+			},
+			message: "fuel exhausted".to_string(),
+		});
+
+		let kind = dispatch_failure_kind(error);
+
+		assert!(matches!(
+			kind,
+			TaskFailureKind::TaskFailed { retryable: false, ref reason }
+				if reason == "RuneSandbox::FuelExhausted"
+		));
+	}
+
+	#[test]
 	fn broadcast_cap_validation_charges_replicated_build_bytes() {
 		let mut query_budget = QueryBudget::test_default();
 		query_budget.broadcast_build_bytes_per_task = ByteCount::new(64);
@@ -1357,6 +1376,9 @@ where
 		QueryError::Runtime(RuntimeError::TaskFailure { kind }) if kind.worker_emittable() => {
 			kind.clone()
 		}
+		QueryError::Frontend(crate::error::FrontendError::RuneSandbox { kind, .. }) => {
+			rune_sandbox_task_failure_kind(kind)
+		}
 		QueryError::Execution(crate::error::ExecutionError::BudgetExhausted {
 			dimension,
 			requested,
@@ -1430,6 +1452,9 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 		QueryError::Runtime(RuntimeError::ProtocolMismatch { .. }) => {
 			TaskFailureKind::ProtocolMismatch
 		}
+		QueryError::Frontend(crate::error::FrontendError::RuneSandbox { kind, .. }) => {
+			rune_sandbox_task_failure_kind(&kind)
+		}
 		QueryError::Wire(WireError::FrameTooLarge { payload_len }) => {
 			TaskFailureKind::BudgetExhausted {
 				dimension: BudgetDimension::FrameSize,
@@ -1442,6 +1467,15 @@ fn dispatch_failure_kind(error: QueryError) -> TaskFailureKind {
 			retryable: true,
 		},
 		_ => TaskFailureKind::Internal { reason },
+	}
+}
+
+fn rune_sandbox_task_failure_kind(
+	kind: &crate::rune_engine::RuneSandboxViolation,
+) -> TaskFailureKind {
+	TaskFailureKind::TaskFailed {
+		reason: format!("RuneSandbox::{}", kind.stable_label()),
+		retryable: false,
 	}
 }
 
