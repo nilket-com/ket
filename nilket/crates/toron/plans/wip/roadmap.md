@@ -50,8 +50,8 @@ along with the forward-sequence rewrite.
   Toron-side evidence is captured; production Wendelon-enabled
   end-to-end evidence lands in a bench-results update once
   Wendelon-side application ships.
-- **ADR 007 — Rune Sandbox Enforcement.** Promoted.
-  Implementation pending. Process-internal safety contract:
+- **ADR 007 — Rune Sandbox Enforcement.** Promoted +
+  implemented. Process-internal safety contract:
   closes the M7-recorded launch blocker (sandbox fuel disabled,
   `Context::with_default_modules()` exposing filesystem /
   network / process / environment / time / random capability)
@@ -62,11 +62,34 @@ along with the forward-sequence rewrite.
   context construction, and conditional architecture guard for
   `Context::with_default_modules` absence. Memory enforcement
   is V1 hard requirement (Rune-native cap or helper-process
-  isolation per Phase 0). Selected via the iter-3 ADR 007
+  isolation per Phase 0). Implemented with Rune 0.13
+  `budget::with` + `alloc::limit::with`, `max_source_bytes`,
+  yielding-path `wall_timeout`, allow-list context construction,
+  and non-retryable `RuneSandbox::<label>` task-failure mapping
+  if sandbox errors cross the task boundary. Selected via the iter-3 ADR 007
   topics convergence on Codex's four-path selection rule
-  ("V1 exposes user-supplied Rune → L-2 Rune sandbox"). First
-  ADR cycle to actually execute a profiler note (Phase 0 P0.7
-  via `crates/toron/scripts/bench/enable_profiling.sh`).
+  ("V1 exposes user-supplied Rune -> L-2 Rune sandbox").
+- **ADR 008 — Outer / Semi / Anti Joins.** Promoted;
+  implementation pending. Operator-level surface extension
+  closing the analytical-SQL "join width gap" left by ADR 004
+  (inner-only). `JoinKind` extends from 1 variant to 8 (`Inner`
+  plus `LeftOuter` / `RightOuter` / `FullOuter` / `LeftSemi` /
+  `RightSemi` / `LeftAnti` / `RightAnti`), null-fill via Arrow
+  native `NullBuffer`, output-schema nullability promoted at
+  bind time, hash-partitioned-only distributed execution for
+  non-Inner kinds (binder rejects `Broadcast` for
+  `kind != Inner`; fragmenter has belt-and-braces guard),
+  runtime-filter eligibility stays Inner-only (ADR 006
+  invariant preserved), single `JoinOutputRow` row-selection
+  intermediate with shared `materialize_join_selection` helper,
+  spill semantics match in-memory for every kind. No new
+  `TaskFailureKind` / `MessageKind` / `JoinStrategy` variant;
+  `LogicalPlan::Join` and `ExecutionPlan::Join` stay
+  single-variant. Mixed old/new binary support explicitly not
+  promised — single workspace bump, full-fleet upgrade.
+  Three-way AI Swarm Council convergence (Claude / Codex /
+  Gemini) at iter-3. Bench-results artifact pending Phase 6
+  at `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -76,8 +99,8 @@ boundary, multi-process coordinator/worker mechanics
 surviving a worker SIGKILL with byte-identical normalized
 output, and the first two-input relational operator working
 across hash-partitioned and bounded broadcast strategies.
-Multi-tenant governance, executor model upgrade, outer
-joins, sort-merge, and pipelined cross-stage execution
+Multi-tenant governance, executor model upgrade, sort-merge,
+and pipelined cross-stage execution
 remain post-V1.
 
 ## Prioritization philosophy
@@ -119,17 +142,20 @@ runtime-plumbing investigation is on the table. ADR 007 (Rune
 sandbox enforcement) was promoted independently of ADR 006's
 bench outcome — it closes a launch-blocker on the authoring
 surface that the bytes-movement evidence did not touch. ADR 008
-selection is the next decision: the ADR 006 selective bench
-rerun and any launch-pressure shift feed into that scoring,
-and the candidate ordering below reflects the post-ADR-007
-landscape.
+(outer / semi / anti joins) was selected as the strongest
+launch-driven candidate post-ADR-007 — the "SQL width" gap
+left by ADR 004's inner-only scope was load-bearing for
+analytical workloads. ADR 009 selection is the next decision:
+the ADR 006 selective bench rerun and any launch-pressure
+shift feed into that scoring, and the candidate ordering
+below reflects the post-ADR-008 landscape.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
 **Scale boundary** structural section after Status and before
 Context. Scale boundaries seen so far: process-internal
-(Rune sandbox), operator-level (ADR 004, ADR 005, outer
-joins), cluster-wide (governance, ADR 003), cross-ring
+(ADR 007 Rune sandbox), operator-level (ADR 004, ADR 005,
+ADR 008), cluster-wide (governance, ADR 003), cross-ring
 (ADR 002, ADR 006), transport (ADR 003 wire, ADR 006
 `PartitionManifest`/`ScanRequest` additions),
 storage-internal (Wendelon). The decomposition makes
@@ -142,17 +168,14 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 007 implementation → ADR 008 planning
+### Next: ADR 008 implementation, then ADR 009 planning
 
-ADR 007's contract is pinned at
-`plans/adr/007_rune_sandbox_enforcement.md`; the impl plan lives
-at `plans/impl/007_rune_sandbox_enforcement.md`. The next
-council deliverable is implementation through Phase 6 (audit →
-config → allow-list → fuel → memory → distributed wire →
-verification), no bench-results artifact required (safety
-contract). Phase 0 P0.7 will produce the first ADR-cycle
-profiler note via the perft tooling now that
-`crates/toron/scripts/bench/enable_profiling.sh` exists.
+ADR 008's contract is pinned at
+`plans/adr/008_outer_semi_anti_joins.md`; the impl plan lives at
+`plans/impl/008_outer_semi_anti_joins.md`; implementation
+pending. The next council deliverable is ADR 008 implementation
+(Phase 0 audit → Phases 1-6 per the impl plan), then ADR 009
+planning once the post-ADR-008 bench artifact lands.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
@@ -160,45 +183,19 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 008's framing depends on both:
+ADR 009 selection waits on (a) ADR 008's per-kind quick-row
+bench matrix exposing any operator-level evidence shifts, and
+(b) the ADR 006 Wendelon row arrival. Until those land, the
+candidate ordering below reflects the post-ADR-008 landscape.
 
-- **ADR 007 ships cleanly + ADR 006 Wendelon-enabled selective
-  row hits ≥50%.** ADR 008 picks from launch-driven candidates
-  (outer joins, multi-tenancy) or V1.x runtime-filter
-  extensions, depending on launch pressure and the next
-  evidence-driven bottleneck.
-- **ADR 007 ships cleanly + ADR 006 Wendelon row misses.** ADR
-  008 reopens the ADR 006 follow-up (accept-narrower /
-  scope-down / shelve) as a forward decision, then proceeds.
-- **ADR 007 implementation reveals deeper Rune issues.** Block
-  on debugging the sandbox; treat as a real launch risk.
+### ADR 009 candidates (post-ADR-008 reordered)
 
-### ADR 008 candidates (post-ADR-007 reordered)
+With L-2 (Rune sandbox) consumed by ADR 007 and operator-level
+SQL width consumed by ADR 008, the remaining candidates rotate.
+The candidates, in rough order of probable selection given
+evidence shapes the council can already anticipate:
 
-With L-2 (Rune sandbox) consumed by ADR 007, the remaining
-candidates rotate. The candidates, in rough order of probable
-selection given evidence shapes the council can already
-anticipate:
-
-#### Candidate A — Outer / semi / anti joins
-
-**Scale boundary:** operator-level.
-
-Pins null-fill semantics for preserved sides under `LeftOuter` /
-`RightOuter` / `FullOuter` plus existence-based filtering for
-`Semi` / `Anti`. Substrate exists from ADR 004; the contract
-decision is null semantics and output schema nullability
-adjustments. ADR 006's two-wave execution surface may benefit
-outer joins even though V1 runtime-filter eligibility excludes
-them.
-
-Bench evidence question: does V1 launch require outer joins?
-Most analytical SQL workloads use them (LEFT OUTER on missing
-dimension lookups, FULL OUTER for diff reports). Strongest
-launch-driven candidate now that L-2 is consumed by ADR 007 —
-the "SQL width" gap remains real.
-
-#### Candidate B — Multi-tenant resource governance
+#### Candidate A — Multi-tenant resource governance
 
 **Scale boundary:** cluster-wide.
 
@@ -213,7 +210,7 @@ before its shape gets pinned. ADR 007 explicitly deferred
 per-tenant Rune budgets to this work (L-3 from the topics
 cycle).
 
-#### Candidate C — Cross-process wire efficiency
+#### Candidate B — Cross-process wire efficiency
 
 **Scale boundary:** transport.
 
@@ -228,9 +225,9 @@ non-selective workloads dominate the V1 launch shape. Lower
 leverage than ADR 006 on selective joins (moves bytes faster vs
 avoids moving rejected bytes), but uniform across selective and
 non-selective workloads. Phase 0 sub-bucket selection discipline
-preserved if D promotes (no grab-bag wire-perf ADR).
+preserved if C promotes (no grab-bag wire-perf ADR).
 
-#### Candidate D — V1.x runtime-filter extensions
+#### Candidate C — V1.x runtime-filter extensions
 
 **Scale boundary:** cross-ring (continuation of ADR 006).
 
@@ -246,6 +243,11 @@ Wendelon-side row landing**:
   filter eligibility to hash-partitioned joins. Broadcast
   filters reuse the descriptor contract with a different
   attachment path.
+- **Outer / semi / anti runtime-filter pushdown.** ADR 008
+  reserved this — runtime filters on outer / anti probe sides
+  would incorrectly drop rows the outer-preservation semantics
+  require. A "filter + null-pad" combined operator is the
+  separable design.
 - **Planner cost-model opt-in.** Always-two-wave in V1;
   planner-stats opt-in once stats exist.
 - **Filter eligibility extension to canonical-encoder
@@ -256,7 +258,7 @@ Wendelon-side row landing**:
 Each sub-item is plausibly its own narrow ADR. Held as topic
 cards, not selected, until the production Wendelon row lands.
 
-#### Candidate E — Worker-side Rune UDF execution
+#### Candidate D — Worker-side Rune UDF execution
 
 **Scale boundary:** operator-level + process-internal
 (distributed sandbox).
@@ -266,6 +268,18 @@ This is the substantial new ADR if a future feature needs
 worker-side script execution — covers distributed sandbox +
 per-worker budget interaction + the `TaskFailureKind`
 reason-string mapping ADR 007 reserved as the forward seam.
+
+#### Candidate E — `EXISTS` / `NOT EXISTS` subquery decorrelation
+
+**Scale boundary:** frontend planner.
+
+Reserved. ADR 008 ships the `Semi` / `Anti` operators; this
+candidate adds the subquery-planner contract that detects
+correlated-equi-join `EXISTS` / `NOT EXISTS` patterns and
+rewrites them to the `Semi` / `Anti` operators. Substrate exists
+from ADR 008; the decision matrix is which `EXISTS` shapes get
+decorrelated, how the planner detects them, and how the binder
+folds them. Likely follows ADR 008 implementation evidence.
 
 #### Candidate F — Executor model upgrade
 
@@ -328,8 +342,6 @@ committed.
 Items the council has explicitly deferred from V1 ADRs.
 Promoted to their own ADRs when evidence drives them.
 
-- **Outer / semi / anti joins.** ADR 004 deferred; own
-  ADR pins preserved-side null-fill semantics.
 - **Non-equi joins / theta-joins.** Own ADR.
 - **Sort-merge join.** Requires ordering contract (no
   ORDER BY semantics pinned in Toron yet).
@@ -438,6 +450,107 @@ Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
+
+### ADR 008 cycle
+
+- **Six-variant `JoinKind` (no `RightSemi` / `RightAnti`).**
+  Considered (Claude iter-0); rejected. `sqlparser` 0.54 exposes
+  both directions natively and the executor's build-left /
+  probe-right machinery supports both with identical
+  infrastructure (`Right*` probe-time-decided; `Left*` after-pass
+  on build-side bitmap). Excluding right-side would fragment the
+  SQL surface without simplifying the implementation. Codex's
+  symmetry argument was load-bearing.
+- **Broadcast rewrite for non-Inner kinds** (sides-swap
+  `RightOuter` → `LeftOuter`, fallback `FullOuter` →
+  `HashPartitioned`). Considered (Claude iter-0); rejected.
+  Strategy-dependent semantics blur the operator-level scale
+  boundary — the binder would accept `Broadcast` but the planner
+  would rewrite it, making the "what's the strategy" question
+  ambiguous. Cleaner contract: binder rejects `Broadcast` for
+  `kind != Inner`; SQL planner already defaults to
+  `HashPartitioned` for non-Inner kinds. A strategy-rewrite ADR
+  can follow if evidence supports it.
+- **`EXISTS` / `NOT EXISTS` decorrelation to `Semi` / `Anti`.**
+  Considered (Claude iter-0, Gemini iter-1); rejected for ADR
+  008 scope. Subquery-planner contract requires its own decision
+  matrix: which patterns are decorrelated, how does the planner
+  detect them, how does the binder fold them. ADR 008 ships the
+  `Semi` / `Anti` operators; a later subquery-planner ADR
+  (Candidate E above) can leverage them.
+- **Per-kind probe loops without a row-selection intermediate.**
+  Considered (Claude iter-0); rejected in favor of Codex's
+  `JoinOutputRow` design. Per-kind loops duplicate null-fill code
+  across paths and make the in-memory / spilled selection logic
+  divergent (each kind reasoning about emission separately).
+  Centralizing on `JoinOutputRow` means one selection/materializer
+  contract — the spilled path emits the same selection
+  representation after lookup (no spill-format change; ADR 005
+  build-side-hash-page format is reused unchanged).
+- **Sentinel-based null fill.** Considered as performance
+  alternative; rejected. Breaks the Arrow contract, requires
+  per-type sentinel choices, couples to downstream readers, and
+  hidden semantics make outer-join output not interchangeable
+  with inner-join output. Arrow's native `NullBuffer` is the
+  canonical representation.
+- **Loosen runtime-filter eligibility to outer / semi / anti.**
+  Considered; rejected for ADR 008. A Bloom filter on the build
+  side of a left-outer join would eliminate probe rows that
+  don't match the build — but those are exactly the rows the
+  outer join must preserve with null fill. `RightAnti` depends
+  on emitting unmatched probe rows. A "filter + preserve"
+  combined operator is the separable design; reserved as ADR 009
+  Candidate C (V1.x runtime-filter extensions).
+- **New `TaskFailureKind::JoinSemantics` variant.** Considered;
+  rejected. No new failure class exists — the eight join kinds
+  use existing build/probe/spill machinery and the existing
+  budget envelope. Invalid plans surface as `FrontendError`;
+  runtime resource failures map to existing
+  `BudgetExhausted` / `TaskFailed`. ADR 003 7-variant guard
+  stays load-bearing.
+- **Second `ExecutionPlan::Join` or `LogicalPlan::Join` physical
+  variant** (e.g., `ExecutionPlan::SemiJoin`). Considered;
+  rejected. Per-kind physical variants duplicate the operator
+  shape (two inputs, keys, strategy, schema) and weaken ADR
+  004's single-variant architecture guard. The semantic
+  difference belongs in `JoinKind`. `LogicalPlan::Join`
+  single-variant guard added in Phase 1E pairs with the existing
+  `ExecutionPlan::Join` guard.
+- **Rolling coordinator/worker mixed-version semantics for
+  `JoinKind`.** Considered as forward-compat affordance;
+  rejected. Externally-tagged serde adds variants as new strings
+  on the wire; older binaries deserialize unknown variants as
+  errors. Promising rolling support would require either
+  version-negotiation (cross-ring scope) or a serde fallback
+  variant (changes wire semantics for every receiver). Single
+  workspace bump, full-fleet upgrade matches the posture from
+  prior ADRs.
+- **Per-kind task-telemetry counters** (e.g.,
+  `outer_rows_null_filled`). Considered; rejected. Existing
+  `build_rows` / `probe_rows` / `output_rows` counters are
+  sufficient for V1; kind-specific aggregates can be surfaced
+  downstream of the task wire if needed. Adding telemetry fields
+  is an ADR 003 task-telemetry contract change worth carrying
+  only when bench evidence is insufficient.
+- **Seven separate ADRs, one per kind.** Considered as
+  scope-discipline alternative; rejected. The seven kinds share
+  the same build-left / probe-right substrate, the same
+  null-fill machinery, the same spill semantics. Splitting would
+  duplicate contract framing five times without adding
+  evidence-driven decisions. The scale-boundary section already
+  prevents scope creep.
+- **Inner-join regression gate at ±2%** (Claude iter-0 proposal)
+  vs ±10% (council convergence). Considered; rejected in favor
+  of ±10%. The `JoinOutputRow` refactor introduces measurable
+  allocation overhead through the shared materializer; ±10%
+  accommodates this without leaving the refactor with no
+  guardrail. R13 mitigations are reversible if the bench shows
+  >10% regression.
+- **Drop IR variants if `sqlparser` regresses a spelling.**
+  Considered as cleanup discipline; rejected. The serde wire
+  contract and the architecture guard both depend on the IR
+  variant set being stable. Fallback is to gate SQL lowering to
+  whatever the current dialect parses; keep IR variants.
 
 ### ADR 007 cycle
 
@@ -777,9 +890,10 @@ sections; this list is the cross-cutting set.
   impl plans. Decision-enabling measurement belongs
   inside the owning ADR.
 - **Don't introduce non-pinned join algorithms.** ADR 004
-  G16 enforces. Sort-merge, nested-loop, broadcast-right,
-  cross join, semi join, anti join, outer join — each is
-  its own future ADR.
+  G16 enforces. Sort-merge, nested-loop, non-equi joins,
+  cross join — each is its own future ADR. Outer / semi / anti
+  joins now pinned by ADR 008 (eight-variant `JoinKind`); the
+  underlying hash-build / probe-right algorithm is unchanged.
 - **Don't reject duplicate output column names at the
   binder.** ADR 004 architectural division puts naming
   in the SQL planner, ordinals in the bound IR.
@@ -925,3 +1039,50 @@ sections; this list is the cross-cutting set.
   ADR 007.** Rune is frontend-scoped in V1 (script →
   `LogicalPlan` → distribution). Worker-side execution is a
   substantial future ADR.
+- **Don't introduce a second `ExecutionPlan::Join` or
+  `LogicalPlan::Join` physical variant** (ADR 008 hard gates
+  22, 23). Per-kind physical variants duplicate the operator
+  shape and weaken ADR 004's single-variant architecture guard.
+  The semantic difference belongs in `JoinKind`.
+- **Don't use sentinel values for null fill in outer joins.**
+  Arrow's native `NullBuffer` is the canonical representation;
+  sentinels break the contract and couple to downstream readers.
+  ADR 008 hard gate 10.
+- **Don't loosen runtime-filter eligibility beyond `Inner`.**
+  ADR 006 invariant is load-bearing for outer / anti
+  correctness. A Bloom filter on the build side of a left-outer
+  join would drop the very rows the outer must preserve;
+  `RightAnti` depends on emitting unmatched probe rows. ADR 008
+  hard gate 17 enforces; a "filter + preserve" combined operator
+  is the separable future design (ADR 009 Candidate C).
+- **Don't allow `JoinStrategy::Broadcast` for non-Inner
+  `JoinKind`.** Broadcast replicates the build side; preserved-
+  side or existence variants would emit duplicate unmatched
+  rows in every probe partition. ADR 008 hard gate 16 (binder
+  rejection) + hard gate 18 (fragmenter defensive guard) form
+  the defense-in-depth pair.
+- **Don't rewrite `RightOuter` ↔ `LeftOuter` at planner time as
+  a workaround for broadcast.** Strategy-dependent semantics
+  blur the operator-level scale boundary. The cleaner contract
+  is reject-and-defer; a strategy-rewrite ADR can follow if
+  evidence supports it.
+- **Don't add `EXISTS` / `NOT EXISTS` decorrelation under ADR
+  008.** Subquery-planner contract; reserved as ADR 009
+  Candidate E. ADR 008 ships the `Semi` / `Anti` operators; the
+  subquery-planner ADR layers on top.
+- **Don't promise rolling coordinator/worker mixed-version
+  semantics for `JoinKind`.** Serde-tagged variants are additive
+  but older binaries reject unknown variants. ADR 008 ships at a
+  single workspace version bump; cluster upgrades are
+  full-fleet, not rolling. Matches the posture from prior ADRs.
+- **Don't drop `JoinKind` IR variants if `sqlparser` regresses
+  a spelling.** Keep the IR variants; gate SQL lowering to
+  whatever parses. Dropping IR variants breaks the serde wire
+  contract and ADR 008 hard gate 25 (variant-count architecture
+  guard).
+- **Don't add per-kind task-telemetry counters for the new join
+  kinds.** ADR 003 task-telemetry contract change worth carrying
+  only when bench evidence is insufficient. Existing
+  `build_rows` / `probe_rows` / `output_rows` counters are
+  sufficient for V1; kind-specific aggregates surface downstream
+  of the task wire if needed.
