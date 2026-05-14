@@ -121,6 +121,41 @@ along with the forward-sequence rewrite.
   scope was fully determined, against multi-tenant governance
   (explicitly post-V1) and wire efficiency (gated on the pending
   ADR 006 Wendelon row).
+- **ADR 010 — Top-Level SQL Clause Accounting and Deterministic
+  Result Ordering.** Promoted; implementation pending.
+  Frontend-planner surface extension plus a new operator, closing
+  a live V1 "First Query with Integrity" correctness defect:
+  `SqlPlanner::lower_query` / `lower_select` silently discarded
+  every top-level `Query` / `Select` clause they did not
+  explicitly handle — `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`,
+  and ~20 more — so `SELECT ... ORDER BY x` executed with the
+  clause dropped on the floor. Two inseparable halves: (1) clause
+  accounting — `lower_query` / `lower_select` destructure the
+  `sqlparser` structs exhaustively (no `..` rest pattern) across
+  three buckets (semantic-lowered / semantic-rejected-when-present
+  / parser-metadata-ignored), so a dependency bump that adds a
+  field is a compile error, not a silent widening; (2)
+  deterministic result ordering — top-level `ORDER BY` /
+  `ORDER BY ... LIMIT n` / `... OFFSET n` lower to a new
+  `LogicalPlan::Sort` / `ExecutionPlan::Sort` operator with
+  output-schema-only keys (column names + 1-based positive
+  ordinals), a bind-time-appended ascending-`NULLS LAST`
+  total-order tie-break, `NULLS LAST` default null policy, float
+  sort keys via Arrow IEEE 754 total order, a single terminal
+  gather-sort distributed shape, and a required strategy-agnostic
+  post-join gather-sort fragmenter path. Bare `LIMIT` / `OFFSET`
+  reject; `DISTINCT` / `GROUP BY` / `HAVING` loud-reject (not
+  implemented — aggregate-path ADRs). In-memory sort reusing the
+  existing `BudgetExhausted` path — no new wire, `TaskFailureKind`,
+  `BudgetDimension`, `JoinKind`, `JoinStrategy`, or Wendelon
+  surface; `LogicalPlan` / `ExecutionPlan` each gain one variant
+  (`Sort`). Selected from *outside* the roadmap's post-ADR-009
+  A–E candidate list — on code evidence of a silent-wrong-results
+  defect, not the prior planning snapshot. No bench-results
+  artifact — promotion evidence is digest parity (canonical +
+  ordered) plus distributed stage-shape inspection. Three-way AI
+  Swarm Council convergence (Claude / Codex / Gemini) across
+  three topic-iteration rounds and two ADR-drafting rounds.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -187,10 +222,23 @@ workload evidence that does not exist yet) and cross-process wire
 efficiency (the compute-ring fallback, whose promotion condition
 cannot be evaluated until the pending ADR 006 Wendelon row
 lands) — and selected the frontend-planner existence-predicate
-gap. ADR 010 selection is the next decision: the ADR 006
-Wendelon row and any launch-pressure shift feed into that
-scoring, and the candidate ordering below reflects the
-post-ADR-009 landscape.
+gap. ADR 010 (top-level SQL clause accounting and deterministic
+result ordering) was selected post-ADR-009 from *outside* the
+roadmap's A–E candidate list — on code evidence rather than the
+prior planning snapshot. The council's first instinct was to
+suspend ADR 010 and pivot to the pending ADR 006 Wendelon row,
+since every A–E candidate was post-V1 (A) or evidence-blocked on
+that row (B, C) or reserved/demoted (D, E). Reading
+`SqlPlanner::lower_query` overrode that instinct: Toron silently
+discarded top-level `ORDER BY` / `LIMIT` / `DISTINCT` — a live V1
+"First Query with Integrity" correctness defect, pure-Toron, with
+no Wendelon dependency. The A–E list was not wrong, only
+incomplete — it was authored before anyone read the planner.
+"Evidence drives scope" includes the code, not only the prior
+ADR's bench artifact. ADR 011 selection is the next decision: the
+ADR 006 Wendelon row and any launch-pressure shift feed into that
+scoring, and the candidate list below (the former ADR 010 A–E
+set) reflects the post-ADR-009 landscape.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
@@ -200,8 +248,10 @@ Context. Scale boundaries seen so far: process-internal
 ADR 008), cluster-wide (governance, ADR 003), cross-ring
 (ADR 002, ADR 006), transport (ADR 003 wire, ADR 006
 `PartitionManifest`/`ScanRequest` additions),
-storage-internal (Wendelon), frontend planner (ADR 009).
-The decomposition makes
+storage-internal (Wendelon), frontend planner (ADR 009, ADR 010 —
+clause accounting), operator-level executor + distributed
+fragmenter (ADR 010 — the `Sort` operator and its terminal
+gather-sort stage). The decomposition makes
 scope-creep into adjacent boundaries visible at review
 time and sharpens ADR selection: same operator at different
 scales is a different contract.
@@ -211,15 +261,22 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 010 planning
+### Next: ADR 010 implementation
 
-ADR 009's contract is pinned at
-`plans/adr/009_correlated_exists_decorrelation.md`; the impl plan
-lives at `plans/impl/009_correlated_exists_decorrelation.md`.
-ADR 009 introduces no new operator path — promotion evidence is
-digest parity against hand-written `LeftSemi` / `LeftAnti` joins,
-so there is no bench-results artifact. The next council
-deliverable is ADR 010 planning.
+ADR 010's contract is pinned at
+`plans/adr/010_top_level_clause_accounting_and_ordering.md`; the
+impl plan lives at
+`plans/impl/010_top_level_clause_accounting_and_ordering.md`.
+ADR 010 introduces a new operator (`Sort`) but makes no
+performance claim — promotion evidence is digest parity
+(canonical + ordered) plus distributed stage-shape inspection,
+so there is no bench-results artifact. The impl plan is phased
+so Phase 1 (clause accounting — the silent-drop → loud-reject
+integrity fix) is an independently reviewable correctness commit;
+Phase 4 (the strategy-agnostic post-join terminal gather-sort
+fragmenter path) is the named primary implementation risk. The
+next council deliverable is ADR 010 implementation, then ADR 011
+planning.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
@@ -227,17 +284,23 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 010 selection waits on the ADR 006 Wendelon row arrival and
-any launch-pressure shift. Until that lands, the candidate
-ordering below reflects the post-ADR-009 landscape.
+ADR 011 selection waits on the ADR 006 Wendelon row arrival and
+any launch-pressure shift. Until that lands, the candidate list
+below reflects the post-ADR-009 landscape.
 
-### ADR 010 candidates (post-ADR-009 reordered)
+### ADR 011 candidates (the former ADR 010 A–E list)
 
-With L-2 (Rune sandbox) consumed by ADR 007, operator-level SQL
-width by ADR 008, and the frontend-planner existence-predicate
-gap by ADR 009, the remaining candidates rotate. The candidates,
-in rough order of probable selection given evidence shapes the
-council can already anticipate:
+This is the candidate list the ADR 009 planning session left for
+ADR 010. ADR 010 was instead selected from outside it — the
+silent-drop defect was load-bearing V1 code evidence the list
+predated. The list rotates forward unchanged as the ADR 011
+candidate set: with L-2 (Rune sandbox) consumed by ADR 007,
+operator-level SQL width by ADR 008, the frontend-planner
+existence-predicate gap by ADR 009, and top-level clause
+accounting + result ordering by ADR 010, the remaining
+candidates are below, in rough order of probable selection given
+evidence shapes the council can already anticipate. B and C
+remain gated on the pending ADR 006 Wendelon production row.
 
 #### Candidate A — Multi-tenant resource governance
 
@@ -375,8 +438,10 @@ Items the council has explicitly deferred from V1 ADRs.
 Promoted to their own ADRs when evidence drives them.
 
 - **Non-equi joins / theta-joins.** Own ADR.
-- **Sort-merge join.** Requires ordering contract (no
-  ORDER BY semantics pinned in Toron yet).
+- **Sort-merge join.** ADR 010 pins the top-level `ORDER BY`
+  contract and the `Sort` operator; sort-merge join builds on
+  that ordering antecedent. Still its own ADR — needs the
+  join-side ordering and merge-path decisions.
 - **Cross-join.** Own ADR or V1.x SQL surface.
 - **Cost-based build/probe swap; cost-based strategy
   selection.** Requires Wendelon stats surface and Toron
@@ -482,6 +547,75 @@ Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
+
+### ADR 010 cycle
+
+- **Suspend ADR 010 / pivot the council to the Wendelon-side
+  ADR 006 production row.** Considered (Gemini iter-0, Codex
+  iter-0); rejected. Sound against the roadmap's printed A–E
+  candidate list — every entry post-V1 or evidence-blocked — but
+  the list predated the silent-drop defect. "Evidence drives
+  scope" includes the code. The Wendelon row stays parallel work;
+  it is not an ADR 010 blocker.
+- **"ORDER BY only" scope (Claude topic iter-0).** Considered;
+  superseded by Codex's clause-accounting broadening. Fixing four
+  named clauses leaves the *class* open — the next `sqlparser`
+  field is the next silent drop.
+- **Two-bucket clause accounting (lower / reject).** Considered
+  (Claude ADR iter-0); rejected (Codex iter-1). `sqlparser` 0.54
+  `Select` carries non-semantic parser-metadata fields
+  (`select_token`, `top_before_distinct`,
+  `window_before_qualify`); routing them to "unsupported"
+  overclaims. Three buckets — lowered / rejected-when-present /
+  metadata-ignored — is the honest model.
+- **`LIMIT` without `ORDER BY` via an implicit total-order
+  tie-break.** Considered; rejected (Gemini topic iter-1). A bare
+  `LIMIT` that silently triggers a full-dataset sort hides a
+  performance cliff. Reject and force the user to declare
+  ordering intent.
+- **`ORDER BY` keys resolvable against pre-projection input.**
+  Considered (Gemini ADR iter-0, Codex topic iter-1); rejected
+  (Claude topic iter-2 S1, Codex ADR iter-1). It forces `Sort`
+  below `Project` plus hidden-column machinery and leaves the
+  total-order tie-break surface undefined. Output-schema-only
+  keys; input-only keys are a named V1.x extension.
+- **Tie-break keys constructed inside `SortExec`.** Considered
+  (Claude ADR iter-0); rejected (Codex iter-1) for bind-time
+  appending — the physical plan is then self-contained and
+  inspectable.
+- **Reject float sort keys in V1.** Considered (Claude ADR iter-0
+  P0.5 fork); rejected (Codex iter-2). A sort key needs only a
+  stable total order (Arrow IEEE 754) — distinct from float
+  *join* keys, which need sound equality semantics and stay
+  rejected.
+- **Defer `ORDER BY` ordinals to V1.x.** Considered (Claude ADR
+  iter-0 P0.7 fork); rejected (Codex iter-2). 1-based positive
+  output ordinals resolve by position with no alias or
+  hidden-column machinery — same "output-schema-only" class as
+  column names.
+- **Clause accounting as a table test only.** Considered;
+  rejected (Claude topic iter-2 S2). A table test catches only
+  enumerated clauses; the compile-time no-`..` destructure
+  catches a clause nobody has seen yet.
+- **New `TaskFailureKind::SortMemoryExhausted`.** Considered;
+  rejected. Sort memory exhaustion is a budget event;
+  `TaskFailureKind::BudgetExhausted { dimension:
+  BudgetDimension::Memory, .. }` already exists. ADR 003
+  7-variant guard preserved.
+- **Leaving broadcast ordered joins out of the fragmenter
+  path.** Considered; rejected (Codex iter-2). SQL lowering emits
+  the same `Sort(Exchange₁(…))` shape regardless of join
+  strategy; the post-join terminal gather-sort is shared and
+  strategy-agnostic, not hash-partitioned-only.
+- **Folding `DISTINCT` into ADR 010.** Considered; rejected.
+  `DISTINCT` is `GROUP BY <all output columns>` with no
+  aggregates — an aggregate-path concern. Closing its silent drop
+  is in scope; implementing it is not.
+- **Distributed range sort / external merge sort (spill) in
+  V1.** Considered; rejected. Range-partition exchange,
+  ordered-merge, skew mitigation, cost model — each its own
+  scope. V1 is one in-memory terminal gather-sort; both
+  extensions are named, evidence-driven V1.x ADRs.
 
 ### ADR 009 cycle
 
@@ -1204,3 +1338,47 @@ sections; this list is the cross-cutting set.
   logical rewrite; the binder stays the authority for type
   compatibility, float-key rejection, computed-key rejection,
   exchange shape, and non-Inner broadcast rejection.
+- **Don't let `lower_query` / `lower_select` destructure with a
+  `..` rest pattern.** ADR 010's exhaustive three-bucket
+  no-`..` destructure is the load-bearing clause-accounting
+  guard — a `sqlparser` bump that adds a field must be a compile
+  error, not a silent widening. A source-level architecture
+  guard enforces it; the parser-metadata allow-list
+  (`select_token`, `top_before_distinct`,
+  `window_before_qualify`) is explicit.
+- **Don't silently drop any top-level `Query` / `Select`
+  clause.** ADR 010's invariant: every parsed field is
+  lowered, rejected-when-present, or bound-and-ignored as parser
+  metadata. Silently-dropped `ORDER BY` was the V1 integrity
+  defect ADR 010 closed; do not reintroduce the class.
+- **Don't accept bare `LIMIT` / `OFFSET` / `FETCH`.** Without an
+  `ORDER BY` contract, distributed truncation is arbitrary.
+  ADR 010 rejects them; deterministic top-N is
+  `ORDER BY ... LIMIT n`.
+- **Don't place `Sort` below `Project` or support `ORDER BY` on
+  non-output / alias / computed keys.** ADR 010 keys resolve
+  against the output schema only (column names + 1-based
+  positive ordinals); `Sort` sits above `Project` so the
+  total-order tie-break surface is exactly the output columns.
+  Input-only keys are a named V1.x extension.
+- **Don't ship a partial-order `ORDER BY`.** ADR 010's contract
+  is a total order — user keys then every remaining output
+  column, ascending `NULLS LAST`, appended at bind time. Ties
+  resolved arbitrarily reopen silent nondeterminism.
+- **Don't let the fragmenter infer a hidden gather, and don't
+  prove the distributed gather-sort with output digest alone.**
+  The planner emits the terminal `Exchange { partition_count: 1 }`
+  explicitly; the post-join gather-sort is strategy-agnostic
+  (hash-partitioned and broadcast) and gated by stage-shape
+  inspection. ADR 010 Phase 4 is the named primary risk.
+- **Don't add a new `TaskFailureKind`, `BudgetDimension`, IR
+  level, or wire surface for ADR 010.** `LogicalPlan` /
+  `ExecutionPlan` each gain exactly one variant (`Sort`); sort
+  memory exhaustion reuses `BudgetDimension::Memory` →
+  `ExecutionError::BudgetExhausted` →
+  `TaskFailureKind::BudgetExhausted`. No sort spill, no
+  distributed range sort in V1 — both are named V1.x ADRs.
+- **Don't implement `DISTINCT` / `GROUP BY` / `HAVING` under
+  ADR 010.** They loud-reject; implementing them is
+  aggregate-path ADR work. ADR 010 closes their silent drop
+  only.
