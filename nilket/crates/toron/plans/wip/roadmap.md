@@ -50,6 +50,23 @@ along with the forward-sequence rewrite.
   Toron-side evidence is captured; production Wendelon-enabled
   end-to-end evidence lands in a bench-results update once
   Wendelon-side application ships.
+- **ADR 007 — Rune Sandbox Enforcement.** Promoted.
+  Implementation pending. Process-internal safety contract:
+  closes the M7-recorded launch blocker (sandbox fuel disabled,
+  `Context::with_default_modules()` exposing filesystem /
+  network / process / environment / time / random capability)
+  with `RuneSandboxConfig` carrying fuel + memory + wall-timeout
+  + source-size + allow-profile, single
+  `FrontendError::RuneSandbox` variant carrying a 7-label
+  `RuneSandboxViolation` enum, allow-list (not deny-list)
+  context construction, and conditional architecture guard for
+  `Context::with_default_modules` absence. Memory enforcement
+  is V1 hard requirement (Rune-native cap or helper-process
+  isolation per Phase 0). Selected via the iter-3 ADR 007
+  topics convergence on Codex's four-path selection rule
+  ("V1 exposes user-supplied Rune → L-2 Rune sandbox"). First
+  ADR cycle to actually execute a profiler note (Phase 0 P0.7
+  via `crates/toron/scripts/bench/enable_profiling.sh`).
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -98,10 +115,14 @@ launch-driven candidates. ADR 006 attacks the bytes-movement
 cluster at the source via Bloom runtime filters and two-wave
 hash-partitioned execution. The conditional ADR 005 rule
 already resolved the residual to operator-adjacent — no
-runtime-plumbing investigation is on the table. ADR 007's
-scope depends on the ADR 006 selective bench rerun and any
-launch-pressure shift; the candidate ordering below reflects
-the post-ADR-006 landscape.
+runtime-plumbing investigation is on the table. ADR 007 (Rune
+sandbox enforcement) was promoted independently of ADR 006's
+bench outcome — it closes a launch-blocker on the authoring
+surface that the bytes-movement evidence did not touch. ADR 008
+selection is the next decision: the ADR 006 selective bench
+rerun and any launch-pressure shift feed into that scoring,
+and the candidate ordering below reflects the post-ADR-007
+landscape.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
@@ -121,52 +142,43 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 006 Wendelon follow-up → ADR 007 planning
+### Next: ADR 007 implementation → ADR 008 planning
 
-ADR 006's contract is pinned at
-`plans/adr/006_runtime_filter_pushdown.md`; the impl plan lives at
-`plans/impl/006_runtime_filter_pushdown.md`. Toron-side
-implementation and promotion-scale Wendelon-disabled evidence
-are captured at
-`plans/impl/006_runtime_filter_pushdown_bench_results.md`. Full
-Phase 0 selective mock-Wendelon evidence is also captured there
-(100K build rows x 100M probe rows; 98.9% bytes-movement cluster
-reduction, digest-identical), but it is not the production
-Wendelon trigger. The next council deliverable is production
-Wendelon-side row-level application evidence, followed by ADR 007
-planning.
+ADR 007's contract is pinned at
+`plans/adr/007_rune_sandbox_enforcement.md`; the impl plan lives
+at `plans/impl/007_rune_sandbox_enforcement.md`. The next
+council deliverable is implementation through Phase 6 (audit →
+config → allow-list → fuel → memory → distributed wire →
+verification), no bench-results artifact required (safety
+contract). Phase 0 P0.7 will produce the first ADR-cycle
+profiler note via the perft tooling now that
+`crates/toron/scripts/bench/enable_profiling.sh` exists.
 
-ADR 006 ships in two stages per its split-shipment posture:
-**Toron-side promotion** has landed in code and local evidence
-(gates 19/20/21 + correctness); **production Wendelon-enabled
-selective bench evidence** arrives in a follow-up bench-results
-update once Wendelon-side application is in. Both stages feed
-ADR 007's framing:
+In parallel, the ADR 006 Wendelon-side row-level application
+remains pending — when Wendelon-side ships, the
+`plans/impl/006_runtime_filter_pushdown_bench_results.md`
+artifact gets the production end-to-end row appended as a
+follow-up update.
 
-- **Toron-side promotion ships; Wendelon-enabled selective row
-  later hits >=50% bytes-movement cluster reduction.** Topic A
-  worked as designed. ADR 007 selects from the launch-driven
-  candidates below or V1.x runtime-filter extensions, depending
-  on launch pressure and the next evidence-driven bottleneck.
-- **Non-selective guard regresses beyond 10% at Toron-side
-  promotion time.** Blocks promotion; council selects
-  accept-narrower / scope-down (narrow filter eligibility) /
-  shelve before ADR 006 ships. If scope-down ships, ADR 007
-  reopens with sharper eligibility rules + the deferred
-  candidates.
-- **Wendelon-enabled selective row later misses >=50%.** Toron-side
-  ADR 006 stays shipped; the follow-up bench update triggers
-  the same three council paths (accept narrower / scope-down /
-  shelve) as a forward decision, not a retroactive de-promotion.
-  ADR 007 likely reopens with Topic E (cross-process wire
-  efficiency, the compute-ring fallback) or a re-examined
-  evidence picture.
+ADR 008's framing depends on both:
 
-### ADR 007 candidates (post-ADR-006 reordered)
+- **ADR 007 ships cleanly + ADR 006 Wendelon-enabled selective
+  row hits ≥50%.** ADR 008 picks from launch-driven candidates
+  (outer joins, multi-tenancy) or V1.x runtime-filter
+  extensions, depending on launch pressure and the next
+  evidence-driven bottleneck.
+- **ADR 007 ships cleanly + ADR 006 Wendelon row misses.** ADR
+  008 reopens the ADR 006 follow-up (accept-narrower /
+  scope-down / shelve) as a forward decision, then proceeds.
+- **ADR 007 implementation reveals deeper Rune issues.** Block
+  on debugging the sandbox; treat as a real launch risk.
 
-With Topic A consumed by ADR 006, the remaining candidates
-rotate. The candidates, in rough order of probable selection
-given evidence shapes the council can already anticipate:
+### ADR 008 candidates (post-ADR-007 reordered)
+
+With L-2 (Rune sandbox) consumed by ADR 007, the remaining
+candidates rotate. The candidates, in rough order of probable
+selection given evidence shapes the council can already
+anticipate:
 
 #### Candidate A — Outer / semi / anti joins
 
@@ -180,29 +192,13 @@ adjustments. ADR 006's two-wave execution surface may benefit
 outer joins even though V1 runtime-filter eligibility excludes
 them.
 
-Bench evidence question: does V1 launch require outer joins? Most
-analytical SQL workloads use them (LEFT OUTER on missing
-dimension lookups, FULL OUTER for diff reports). If launch
-timing forces this before V1.x runtime-filter extensions,
-ADR 007 promotes outer joins.
+Bench evidence question: does V1 launch require outer joins?
+Most analytical SQL workloads use them (LEFT OUTER on missing
+dimension lookups, FULL OUTER for diff reports). Strongest
+launch-driven candidate now that L-2 is consumed by ADR 007 —
+the "SQL width" gap remains real.
 
-#### Candidate B — Rune sandbox enforcement
-
-**Scale boundary:** process-internal (worker-process kernel
-execution boundary).
-
-V1 launch prerequisite. Fuel is currently disabled at
-`rune_engine.rs:188`. Native-function allow-list, per-tenant
-CPU + memory budgets, no-filesystem / no-network gating.
-Self-contained; doesn't depend on join shape, executor shape,
-or governance shape.
-
-Could ship as a parallel narrow ADR alongside ADR 007 if launch
-timing demands; otherwise promotes when V1 launch becomes
-load-bearing. Cleanest scope of the launch-driven candidates
-(no cross-system contract surface).
-
-#### Candidate C — Multi-tenant resource governance
+#### Candidate B — Multi-tenant resource governance
 
 **Scale boundary:** cluster-wide.
 
@@ -213,38 +209,43 @@ multi-tenancy before joins-adjacent perf work.
 
 ADR 003's per-query `QueryBudget` is the natural antecedent;
 the per-tenant layer wants real multi-tenant workload evidence
-before its shape gets pinned.
+before its shape gets pinned. ADR 007 explicitly deferred
+per-tenant Rune budgets to this work (L-3 from the topics
+cycle).
 
-#### Candidate D — Cross-process wire efficiency
+#### Candidate C — Cross-process wire efficiency
 
 **Scale boundary:** transport.
 
-The compute-ring fallback if ADR 006's selective bench misses
-or non-selective workloads dominate post-V1. Batch-size policy,
-Arrow IPC encode/decode tuning, `WireEnvelope` overhead audit,
-output-publish path streamlining. No cross-ring dependency.
+The compute-ring fallback if ADR 006's Wendelon-enabled
+selective bench misses or non-selective workloads dominate
+post-V1. Batch-size policy, Arrow IPC encode/decode tuning,
+`WireEnvelope` overhead audit, output-publish path streamlining.
+No cross-ring dependency.
 
 Promotes if ADR 006's selective bench misses its target or if
 non-selective workloads dominate the V1 launch shape. Lower
 leverage than ADR 006 on selective joins (moves bytes faster vs
 avoids moving rejected bytes), but uniform across selective and
-non-selective workloads.
+non-selective workloads. Phase 0 sub-bucket selection discipline
+preserved if D promotes (no grab-bag wire-perf ADR).
 
-#### Candidate E — V1.x runtime-filter extensions
+#### Candidate D — V1.x runtime-filter extensions
 
 **Scale boundary:** cross-ring (continuation of ADR 006).
 
-A cluster of follow-on work to ADR 006:
+A cluster of follow-on work to ADR 006, **gated on production
+Wendelon-side row landing**:
 
 - **Exact `InList` filters** for small build sets. Qualitatively
   precise (zero false positives), useful for small dimension
-  joins. Extends the ADR 006 descriptor contract.
+  joins. Extends the ADR 006 descriptor contract. Codex iter-1
+  topics decision-matrix candidate when Wendelon row hits ≥50%
+  with material FP residual.
 - **Broadcast-strategy runtime filters.** ADR 006 V1 limits
-  filter eligibility to hash-partitioned joins (broadcast joins
-  don't need the two-wave-stage-order change because they
-  naturally complete build before probe). Broadcast filters
-  reuse the descriptor contract with a different attachment
-  path.
+  filter eligibility to hash-partitioned joins. Broadcast
+  filters reuse the descriptor contract with a different
+  attachment path.
 - **Planner cost-model opt-in.** Always-two-wave in V1;
   planner-stats opt-in once stats exist.
 - **Filter eligibility extension to canonical-encoder
@@ -252,20 +253,30 @@ A cluster of follow-on work to ADR 006:
   `Date`, `Timestamp`, or `Decimal`, filter eligibility extends
   with it.
 
-Promotes when ADR 006's Toron-side ships and at least one of:
-selectivity workloads show `InList` would help; broadcast joins
-become a measurable workload; planner-stats surface starts
-landing.
+Each sub-item is plausibly its own narrow ADR. Held as topic
+cards, not selected, until the production Wendelon row lands.
+
+#### Candidate E — Worker-side Rune UDF execution
+
+**Scale boundary:** operator-level + process-internal
+(distributed sandbox).
+
+Reserved. ADR 007 explicitly scoped row-level Rune UDFs out.
+This is the substantial new ADR if a future feature needs
+worker-side script execution — covers distributed sandbox +
+per-worker budget interaction + the `TaskFailureKind`
+reason-string mapping ADR 007 reserved as the forward seam.
 
 #### Candidate F — Executor model upgrade
 
 **Scale boundary:** operator-level (executor substrate).
 
 Demoted by ADR 004 sub-attribution and re-confirmed by ADR 005
-(probe + output combined < 15% of wall). Reserved for the case
-where a future workload (large probe-side, multi-way joins,
-complex aggregates) shows probe-side dominance. Until then,
-stays demoted.
++ ADR 006 (probe + output combined < 15% of wall on selective
+workloads; even smaller post-filter). Reserved for the case
+where a future workload (large probe-side without filtering,
+multi-way joins, complex aggregates) shows probe-side
+dominance. Stays demoted.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
@@ -427,6 +438,71 @@ Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
+
+### ADR 007 cycle
+
+- **Fuel-only V1 sandbox.** Considered (my iter-0 had memory
+  enforcement as a V1.x reservation); rejected. Codex iter-0
+  argument that a memory bomb fitting within fuel can still OOM
+  the host was load-bearing. Memory enforcement is V1 hard
+  requirement — Rune-native cap or helper-process isolation
+  picked by Phase 0 P0.3.
+- **`Context::with_default_modules()` with deny-list tests.**
+  Considered (intuitive but fragile to Rune version drift);
+  rejected. Allow-list discipline (`Context::new()` + explicit
+  registration) inverts the failure mode — new Rune modules
+  don't silently widen the attack surface; missing primitives
+  break loud rather than capability silently exposed.
+- **New `TaskFailureKind` variants
+  (`SandboxFuelExhausted` / `SandboxMemoryExhausted`).**
+  Considered (Gemini iter-0 proposal); rejected. Preserves the
+  ADR 003 7-variant `TaskFailureKind` wire contract. Sandbox
+  failures crossing the task wire map to existing
+  `TaskFailureKind::TaskFailed { retryable: false, reason:
+  "RuneSandbox::<label>" }` — the reason-string mapping is the
+  right cross-wire surface.
+- **Raw missing-function strings in `CapabilityDenied`.**
+  Considered (my iter-0); rejected in favor of
+  `CapabilityCategory` enum (`Filesystem`, `Process`, `Network`,
+  `Environment`, `Time`, `Random`, `Threading`, `Unknown`). More
+  robust against Rune version drift; more useful for client
+  tooling. Raw module paths live in internal `tracing` debug
+  logs only — never on the public enum.
+- **Row-level Rune UDF execution.** Considered (Gemini iter-0
+  framed sandbox failures as worker-side UDF failures); rejected
+  as out of scope for ADR 007. Rune is frontend-scoped in V1.
+  Worker-side execution is a substantial future ADR.
+- **Subprocess sandbox with full seccomp + rlimit.** Considered
+  as V1 memory-enforcement path; rejected for V1 — heavier than
+  necessary. Helper-process isolation (Phase 0 P0.3 path (b))
+  is lightweight enough when needed.
+- **WASM runtime migration.** Considered as stronger sandboxing;
+  rejected — would replace M7's authoring surface entirely. Out
+  of scope; reserved for future ADR if Rune sandbox proves
+  insufficient.
+- **No architecture guard for `Context::with_default_modules`
+  absence.** Considered as my iter-0 default; rejected in favor
+  of conditional escape firing. Source-level grep guard at
+  `tests/architecture_test.rs` is the right defense against
+  silent regression to default-allow. Mirrors ADR 005 hard gate
+  14 / ADR 006 hard gate 15 pattern.
+- **Wall-timeout as primary CPU accounting.** Considered;
+  rejected. Fuel is primary; wall-timeout is defense-in-depth
+  belt against broken fuel implementation. Legitimate scripts
+  never observe `Timeout` under normal operation — fuel
+  exhaustion fires first.
+- **`AllowProfile` as `Option<String>` or absent in V1.**
+  Considered (single-profile means the field is redundant);
+  kept as named enum with one variant
+  (`AllowProfile::ToronAuthoring`). V1.x extension is then
+  type-system-checked, no `RuneSandboxConfig` shape churn.
+- **`execute_script(script, fuel)` compatibility shim
+  preserved.** Considered (keep the existing signature, ignore
+  fuel arg, add a separate `execute_script_with_config`
+  method); rejected. The dead `_fuel` parameter cannot remain
+  load-bearing. `execute_script(script, &config)` is the V1
+  signature; a transitional wrapper is acceptable if it
+  constructs a config from the fuel arg, not if it ignores it.
 
 ### ADR 006 cycle
 
@@ -805,3 +881,47 @@ sections; this list is the cross-cutting set.
   boundary feels obvious, naming it explicitly makes
   scope-creep into adjacent boundaries visible at review
   time. Omit only when truly N/A and say so explicitly.
+- **Don't call `Context::with_default_modules()` in the Rune
+  engine** (ADR 007 hard gate 19). The V1 contract is
+  allow-list (`Context::new()` + explicit registration); a
+  future refactor reverting to default-allow opens the
+  sandbox. Source-level architecture grep guard at
+  `tests/architecture_test.rs` enforces this.
+- **Don't ship a fuel-only V1 Rune sandbox.** Memory
+  enforcement is V1 hard requirement (ADR 007 hard gate 8). A
+  memory bomb that fits within fuel can still OOM the host —
+  Rune-native cap or helper-process isolation, not "deferred."
+- **Don't add new `TaskFailureKind` variants for sandbox
+  failures.** ADR 003 7-variant wire contract is
+  architecture-guarded. Sandbox failures crossing the task wire
+  map to `TaskFailureKind::TaskFailed { retryable: false,
+  reason: "RuneSandbox::<label>" }`.
+- **Don't let Rune sandbox failures fall through to
+  `RuneRuntime`.** Use the `FrontendError::RuneSandbox`
+  variant carrying the typed `RuneSandboxViolation` enum.
+  `RuneRuntime` is for genuine script-logic errors only.
+- **Don't expose host paths, internal VM state, or Rune
+  source positions in coordinator-facing error messages**
+  (ADR 007 hard gate 20). `CapabilityCategory` enum abstracts
+  over raw module paths for stability and non-leakiness.
+- **Don't add native functions to the Rune allow-list without
+  threat-model review.** Each new function is a potential
+  sandbox-escape vector. Extension is a separate narrow ADR.
+- **Don't couple Rune sandbox enforcement to per-tenant
+  governance.** Tenant identity is L-3 (multi-tenant
+  governance) territory. ADR 007 ships per-*script* budgets;
+  per-tenant aggregation is a future ADR when workload evidence
+  justifies.
+- **Don't treat `wall_timeout` as primary CPU accounting.**
+  Fuel is primary; `tokio::time::timeout` around
+  `async_complete()` is a defense-in-depth belt that fires only
+  at .await yield points (Rune 0.13.4 drives the VM via a
+  synchronous `vm.run()` inside `async_resume()`). Real
+  preemption of a CPU-bound loop with broken fuel comes from the
+  Phase 4 helper-process parent-side SIGKILL deadline, not the
+  Tokio timeout. The infinite-loop hard gate (gate 7) must
+  assert `FuelExhausted`, not merely `Timeout`.
+- **Don't run row-level Rune UDFs in worker tasks under
+  ADR 007.** Rune is frontend-scoped in V1 (script →
+  `LogicalPlan` → distribution). Worker-side execution is a
+  substantial future ADR.
