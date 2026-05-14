@@ -9,8 +9,8 @@ use crate::catalog::{Catalog, TableBinding, TableRef};
 use crate::error::BindingError;
 use crate::ir::{
 	AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan,
-	Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint,
-	ResolvedColumn, ScalarValue, schema_for_exprs,
+	ExecutionSortKey, Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan, PbcProgram,
+	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 
@@ -156,6 +156,24 @@ impl<'a> Binder<'a> {
 						key,
 					})
 				}
+				LogicalPlan::Sort {
+					input,
+					order_by,
+					limit,
+					offset,
+				} => {
+					let input = self.bind_plan(input).await?;
+					let output_schema = input.schema();
+					let order_by = bind_sort_keys(order_by, &output_schema)?;
+
+					Ok(ExecutionPlan::Sort {
+						input: Box::new(input),
+						order_by,
+						limit: *limit,
+						offset: *offset,
+						output_schema,
+					})
+				}
 				LogicalPlan::Join {
 					left,
 					right,
@@ -209,6 +227,92 @@ impl<'a> Binder<'a> {
 			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
 	}
+}
+
+fn bind_sort_keys(
+	order_by: &[SortExpr],
+	output_schema: &SchemaRef,
+) -> Result<Vec<ExecutionSortKey>, BindingError> {
+	if order_by.is_empty() {
+		return Err(BindingError::UnsupportedExpression {
+			message: "ORDER BY requires at least one key".to_string(),
+		});
+	}
+
+	let mut keys = Vec::with_capacity(order_by.len() + output_schema.fields().len());
+	let mut user_ordinals = BTreeSet::new();
+	for key in order_by {
+		let ordinal = bind_sort_key_ordinal(&key.expr, output_schema)?;
+		user_ordinals.insert(ordinal);
+		keys.push(ExecutionSortKey {
+			ordinal,
+			descending: key.descending,
+			nulls_first: key.nulls_first,
+		});
+	}
+
+	for ordinal in output_columns(output_schema.fields().len()) {
+		if !user_ordinals.contains(&ordinal) {
+			keys.push(ExecutionSortKey {
+				ordinal,
+				descending: false,
+				nulls_first: false,
+			});
+		}
+	}
+
+	Ok(keys)
+}
+
+fn bind_sort_key_ordinal(
+	expr: &Expr,
+	output_schema: &SchemaRef,
+) -> Result<ColumnOrdinal, BindingError> {
+	match expr {
+		Expr::Column(column_ref) => {
+			if column_ref.qualifier.is_some() {
+				return Err(BindingError::UnsupportedExpression {
+					message: "ORDER BY only supports unqualified output column names".to_string(),
+				});
+			}
+			Ok(resolve_column(&column_ref.name.0, output_schema)?.ordinal)
+		}
+		Expr::Literal(ScalarValue::Int32(Some(value))) => {
+			bind_sort_ordinal_literal(i64::from(*value), output_schema)
+		}
+		Expr::Literal(ScalarValue::Int64(Some(value))) => {
+			bind_sort_ordinal_literal(*value, output_schema)
+		}
+		Expr::Literal(_) => Err(BindingError::UnsupportedExpression {
+			message: "ORDER BY ordinals must be positive integers".to_string(),
+		}),
+		_ => Err(BindingError::UnsupportedExpression {
+			message: "ORDER BY keys must reference output columns or positive ordinals".to_string(),
+		}),
+	}
+}
+
+fn bind_sort_ordinal_literal(
+	value: i64,
+	output_schema: &SchemaRef,
+) -> Result<ColumnOrdinal, BindingError> {
+	if value <= 0 {
+		return Err(BindingError::UnsupportedExpression {
+			message: "ORDER BY ordinal must be positive".to_string(),
+		});
+	}
+	let zero_based =
+		usize::try_from(value - 1).map_err(|_| BindingError::UnsupportedExpression {
+			message: "ORDER BY ordinal is out of range".to_string(),
+		})?;
+	if zero_based >= output_schema.fields().len() {
+		return Err(BindingError::UnknownColumn {
+			column: format!("ORDER BY ordinal {value}"),
+		});
+	}
+	Ok(ColumnOrdinal(
+		u32::try_from(zero_based).expect("column ordinal overflow"),
+	))
 }
 
 fn compile_pbc(predicate: &ExecutionExpr) -> Option<PbcProgram> {
@@ -373,7 +477,8 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
-		| LogicalPlan::Exchange { input, .. } => collect_qualifiers(input, qualifiers),
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. } => collect_qualifiers(input, qualifiers),
 		LogicalPlan::Join {
 			left, right, kind, ..
 		} => match kind {
@@ -525,7 +630,8 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
 		} => Some((*partition_count, key.as_slice())),
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. } => terminal_exchange(input),
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
 		ExecutionPlan::Scan { .. } | ExecutionPlan::Join { .. } => None,
 	}
 }
@@ -764,6 +870,33 @@ fn optimize_for_required(
 					key,
 				},
 				remap,
+			))
+		}
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		} => {
+			let output_len = output_schema.fields().len();
+			let (input, _) = optimize_for_required(*input, None)?;
+			let output_remap = ordinal_remap(
+				&output_columns(output_len)
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+
+			Ok((
+				ExecutionPlan::Sort {
+					input: Box::new(input),
+					order_by,
+					limit,
+					offset,
+					output_schema,
+				},
+				output_remap,
 			))
 		}
 		ExecutionPlan::Join {

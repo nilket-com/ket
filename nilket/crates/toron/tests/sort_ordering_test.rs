@@ -1,0 +1,592 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use toron::binder::{PlannerConfig, bind};
+use toron::catalog::MockCatalog;
+use toron::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
+use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
+use toron::distributed::fragment::{FragmentPlanConfig, fragment_plan};
+use toron::distributed::identity::{ExchangeId, QueryId, StageId};
+use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
+use toron::error::{BindingError, ExecutionError, StorageError};
+use toron::exec::{ExecutionContext, Executor};
+use toron::ir::{
+	ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, Expr, JoinKind,
+	JoinStrategy, LogicalPlan, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, TableId,
+};
+use toron::sql_planner::SqlPlanner;
+use toron::storage::{ScanRequest, ScanStream, StorageScan};
+use wendelon::schema::{
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor,
+};
+
+#[test]
+fn order_by_lowers_to_sort_over_single_partition_exchange() {
+	let plan = SqlPlanner::new()
+		.plan("SELECT id, group_key FROM t ORDER BY group_key DESC NULLS FIRST LIMIT 2 OFFSET 1")
+		.expect("plan sql");
+
+	let LogicalPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+	} = plan
+	else {
+		panic!("expected sort");
+	};
+	assert_eq!(limit, Some(2));
+	assert_eq!(offset, 1);
+	assert_eq!(order_by.len(), 1);
+	assert!(order_by[0].descending);
+	assert!(order_by[0].nulls_first);
+	assert!(matches!(
+		input.as_ref(),
+		LogicalPlan::Exchange {
+			partition_count: 1,
+			key,
+			input,
+		} if key.is_empty() && matches!(input.as_ref(), LogicalPlan::Project { .. })
+	));
+}
+
+#[tokio::test]
+async fn bind_appends_full_output_tie_break_order() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT id, group_key FROM t ORDER BY group_key DESC")
+		.expect("plan sql");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+
+	let ExecutionPlan::Sort { order_by, .. } = bound else {
+		panic!("expected sort");
+	};
+	assert_eq!(
+		order_by,
+		vec![
+			ExecutionSortKey {
+				ordinal: ColumnOrdinal(1),
+				descending: true,
+				nulls_first: false,
+			},
+			ExecutionSortKey {
+				ordinal: ColumnOrdinal(0),
+				descending: false,
+				nulls_first: false,
+			},
+		]
+	);
+}
+
+#[tokio::test]
+async fn order_by_limit_offset_executes_in_deterministic_order() {
+	let batch =
+		run_sql("SELECT id, group_key FROM t ORDER BY group_key ASC, id DESC LIMIT 3 OFFSET 1")
+			.await;
+
+	assert_i64_values(&batch, 0, &[3, 1, 5]);
+}
+
+#[tokio::test]
+async fn order_by_digest_preserves_row_order() {
+	let left = run_sql("SELECT id FROM t ORDER BY id DESC").await;
+	let right = run_sql("SELECT id FROM t ORDER BY id DESC").await;
+
+	assert_i64_values(&left, 0, &[9, 5, 4, 3, 2, 1]);
+	assert_eq!(
+		canonical_arrow_ipc_digest(&[left], SortPolicy::None).expect("left digest"),
+		canonical_arrow_ipc_digest(&[right], SortPolicy::None).expect("right digest")
+	);
+}
+
+#[tokio::test]
+async fn order_by_non_output_column_is_rejected_at_bind() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT id FROM t ORDER BY group_key")
+		.expect("plan sql");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("bind should reject non-output order key");
+
+	assert!(matches!(err, BindingError::UnknownColumn { .. }));
+}
+
+#[tokio::test]
+async fn order_by_invalid_ordinal_is_rejected_at_bind() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT id FROM t ORDER BY 0")
+		.expect("plan sql");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("bind should reject zero ordinal");
+
+	assert!(matches!(err, BindingError::UnsupportedExpression { .. }));
+}
+
+#[tokio::test]
+async fn order_by_computed_key_is_rejected_at_bind() {
+	let (catalog, _) = fixture();
+	let logical = LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: toron::catalog::TableRef::new("t"),
+				projection: None,
+			}),
+			exprs: vec![Expr::column("id")],
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::Eq(
+				Box::new(Expr::column("id")),
+				Box::new(Expr::Literal(ScalarValue::Int64(Some(1)))),
+			),
+			descending: false,
+			nulls_first: false,
+		}],
+		limit: None,
+		offset: 0,
+	};
+
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("bind should reject computed sort key");
+	assert!(matches!(err, BindingError::UnsupportedExpression { .. }));
+}
+
+#[tokio::test]
+async fn sort_float_keys_follow_arrow_total_order() {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("value", DataType::Float64, true),
+		Field::new("row", DataType::Int64, false),
+	]));
+	let batch = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Float64Array::from(vec![
+				Some(1.0),
+				None,
+				Some(f64::NAN),
+				Some(-0.0),
+				Some(0.0),
+				Some(-1.0),
+			])),
+			Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])),
+		],
+	)
+	.expect("batch");
+	let plan = scan_sort_plan(schema, vec![batch], vec![sort_key(0)], None, 0);
+
+	let results = Executor::new(Arc::new(SingleBatchScan::new(plan.batch.clone())))
+		.execute_bound(&plan.plan, None)
+		.await
+		.expect("execute sort");
+	let values = results[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("float column");
+
+	assert_eq!(values.value(0), -1.0);
+	assert_eq!(values.value(1).to_bits(), (-0.0f64).to_bits());
+	assert_eq!(values.value(2).to_bits(), 0.0f64.to_bits());
+	assert_eq!(values.value(3), 1.0);
+	assert!(values.value(4).is_nan());
+	assert!(values.is_null(5));
+}
+
+#[tokio::test]
+async fn sort_over_budget_fails_cleanly() {
+	let schema = sort_schema();
+	let batch = sort_batch(schema.clone());
+	let plan = scan_sort_plan(schema, vec![batch], vec![sort_key(1)], None, 0);
+	let budget = TaskBudget {
+		memory: ByteCount::new(1),
+		..TaskBudget::from_query_budget(QueryBudget::test_default())
+	};
+	let context = ExecutionContext::local_test().with_task_budget(budget);
+	let err = Executor::with_context(Arc::new(SingleBatchScan::new(plan.batch)), context)
+		.execute_bound(&plan.plan, None)
+		.await
+		.expect_err("sort should exceed budget");
+
+	assert!(matches!(
+		err,
+		ExecutionError::BudgetExhausted {
+			dimension: BudgetDimension::Memory,
+			..
+		}
+	));
+}
+
+#[test]
+fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
+	let stages = fragment_plan(
+		terminal_sort_plan(join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		)),
+		fragment_config(),
+	)
+	.expect("fragment");
+
+	assert_eq!(stages.len(), 4);
+	assert_eq!(stages[3].upstream_stages, vec![StageId::new(2)]);
+	assert_eq!(stages[3].tasks.len(), 1);
+	assert!(matches!(
+		&stages[2].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(2)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty()
+	));
+	assert_terminal_sort_task(
+		&stages[3].tasks[0].spec,
+		ExchangeId::new(2),
+		StageId::new(2),
+	);
+}
+
+#[test]
+fn broadcast_join_ordered_plan_fragments_to_terminal_gather_sort() {
+	let stages = fragment_plan(
+		terminal_sort_plan(join_plan(
+			exchanged_scan(TableId(1), 1),
+			scan_plan(TableId(2), 2),
+			JoinStrategy::Broadcast,
+		)),
+		fragment_config().with_worker_count(3),
+	)
+	.expect("fragment");
+
+	assert_eq!(stages.len(), 3);
+	assert_eq!(stages[2].upstream_stages, vec![StageId::new(1)]);
+	assert_eq!(stages[1].tasks.len(), 3);
+	assert!(matches!(
+		&stages[1].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(1)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty()
+	));
+	assert_terminal_sort_task(
+		&stages[2].tasks[0].spec,
+		ExchangeId::new(1),
+		StageId::new(1),
+	);
+}
+
+async fn run_sql(sql: &str) -> RecordBatch {
+	let (catalog, storage) = fixture();
+	let logical = SqlPlanner::new().plan(sql).expect("plan sql");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+	let batches = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute");
+	assert_eq!(batches.len(), 1);
+	batches.into_iter().next().expect("batch")
+}
+
+fn assert_i64_values(batch: &RecordBatch, column: usize, expected: &[i64]) {
+	let values = batch
+		.column(column)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("i64 column");
+	let actual = (0..values.len())
+		.map(|row| values.value(row))
+		.collect::<Vec<_>>();
+	assert_eq!(actual, expected);
+}
+
+fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
+	let schema = sort_schema();
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(1), descriptor(1, "t", schema.as_ref()))
+		.expect("register t");
+	let storage = Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(1), sort_batch(schema))]),
+	});
+	(catalog, storage)
+}
+
+fn sort_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("group_key", DataType::Int64, true),
+		Field::new("label", DataType::Utf8, true),
+	]))
+}
+
+fn sort_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![5, 3, 1, 9, 2, 4])),
+			Arc::new(Int64Array::from(vec![
+				Some(2),
+				Some(1),
+				Some(1),
+				None,
+				Some(2),
+				Some(1),
+			])),
+			Arc::new(StringArray::from(vec![
+				Some("e"),
+				Some("c"),
+				Some("a"),
+				Some("z"),
+				Some("b"),
+				Some("d"),
+			])),
+		],
+	)
+	.expect("sort batch")
+}
+
+struct FixtureScan {
+	batches: HashMap<TableId, RecordBatch>,
+}
+
+#[async_trait::async_trait]
+impl StorageScan for FixtureScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		let mut batch =
+			self.batches
+				.get(&request.table_id)
+				.cloned()
+				.ok_or(StorageError::TableNotFound {
+					table: request.table_id,
+				})?;
+		if let Some(columns) = request.projected_columns {
+			let indices = columns
+				.into_iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			batch = batch.project(&indices)?;
+		}
+		Ok(ScanStream::from_batches(
+			batch.schema(),
+			request.session_id,
+			request.query_id,
+			vec![batch],
+		))
+	}
+}
+
+struct SingleBatchPlan {
+	plan: ExecutionPlan,
+	batch: RecordBatch,
+}
+
+fn scan_sort_plan(
+	schema: SchemaRef,
+	batches: Vec<RecordBatch>,
+	order_by: Vec<ExecutionSortKey>,
+	limit: Option<usize>,
+	offset: usize,
+) -> SingleBatchPlan {
+	let batch = arrow::compute::concat_batches(&schema, &batches).expect("concat");
+	SingleBatchPlan {
+		plan: ExecutionPlan::Sort {
+			input: Box::new(scan_with_schema(TableId(1), schema.clone(), 1)),
+			order_by,
+			limit,
+			offset,
+			output_schema: schema,
+		},
+		batch,
+	}
+}
+
+struct SingleBatchScan {
+	batch: RecordBatch,
+}
+
+impl SingleBatchScan {
+	fn new(batch: RecordBatch) -> Self {
+		Self { batch }
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageScan for SingleBatchScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		Ok(ScanStream::from_batches(
+			self.batch.schema(),
+			request.session_id,
+			request.query_id,
+			vec![self.batch.clone()],
+		))
+	}
+}
+
+fn descriptor(id: u8, name: &str, schema: &Schema) -> TableSchemaDescriptor {
+	let primary_key = schema
+		.fields()
+		.iter()
+		.find(|field| !field.is_nullable())
+		.or_else(|| schema.fields().first())
+		.expect("descriptor schema has a field")
+		.name()
+		.clone();
+	TableSchemaDescriptor::new(
+		TableObjectId::new([id; 16]),
+		1,
+		"default",
+		name,
+		schema,
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single(primary_key)),
+		LocalityPolicy::default_table_spread(),
+		SchemaEvolutionPolicyV1::AdditiveOnly,
+	)
+	.expect("descriptor")
+}
+
+fn fragment_config() -> FragmentPlanConfig {
+	FragmentPlanConfig::new(
+		QueryId::from_u128(1),
+		TaskBudget::from_query_budget(QueryBudget::test_default()),
+	)
+}
+
+fn terminal_sort_plan(input: ExecutionPlan) -> ExecutionPlan {
+	let projected = project_join_output(input);
+	let schema = projected.schema();
+	ExecutionPlan::Sort {
+		input: Box::new(ExecutionPlan::Exchange {
+			input: Box::new(projected),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![sort_key(0), sort_key(1)],
+		limit: None,
+		offset: 0,
+		output_schema: schema,
+	}
+}
+
+fn project_join_output(input: ExecutionPlan) -> ExecutionPlan {
+	let output_schema = join_output_schema();
+	ExecutionPlan::Project {
+		input: Box::new(input),
+		exprs: vec![
+			resolved_key_expr("left_key", ColumnOrdinal(0)),
+			resolved_key_expr("right_key", ColumnOrdinal(1)),
+		],
+		output_schema,
+	}
+}
+
+fn join_plan(left: ExecutionPlan, right: ExecutionPlan, strategy: JoinStrategy) -> ExecutionPlan {
+	ExecutionPlan::Join {
+		left: Box::new(left),
+		right: Box::new(right),
+		kind: JoinKind::Inner,
+		left_keys: vec![ColumnOrdinal(0)],
+		right_keys: vec![ColumnOrdinal(0)],
+		strategy,
+		output_schema: join_output_schema(),
+	}
+}
+
+fn exchanged_scan(table_id: TableId, partition_count: u32) -> ExecutionPlan {
+	ExecutionPlan::Exchange {
+		input: Box::new(scan_plan(table_id, table_id.0 as u8)),
+		partition_count,
+		key: vec![resolved_key_expr("key", ColumnOrdinal(0))],
+	}
+}
+
+fn scan_plan(table_id: TableId, object_byte: u8) -> ExecutionPlan {
+	scan_with_schema(table_id, key_schema(), object_byte)
+}
+
+fn scan_with_schema(table_id: TableId, schema: SchemaRef, object_byte: u8) -> ExecutionPlan {
+	let descriptor = descriptor(object_byte, "fragment_test", schema.as_ref());
+	ExecutionPlan::Scan {
+		legacy_table_id: table_id,
+		table: TableObjectId::new([object_byte; 16]),
+		fingerprint: descriptor.physical_descriptor_fingerprint,
+		schema,
+		projection: None,
+		pbc_program: None,
+		profile_hint: QueryProfileHint::Scan,
+		primary_key_columns: vec![ColumnOrdinal(0)],
+	}
+}
+
+fn key_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]))
+}
+
+fn join_output_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("left_key", DataType::Int32, false),
+		Field::new("right_key", DataType::Int32, false),
+	]))
+}
+
+fn sort_key(ordinal: u32) -> ExecutionSortKey {
+	ExecutionSortKey {
+		ordinal: ColumnOrdinal(ordinal),
+		descending: false,
+		nulls_first: false,
+	}
+}
+
+fn resolved_key_expr(name: &str, ordinal: ColumnOrdinal) -> ExecutionExpr {
+	ExecutionExpr::Column(ResolvedColumn {
+		name: ColumnName(name.to_string()),
+		ordinal,
+		data_type: DataType::Int32,
+		nullable: false,
+		pbc_eligible: true,
+	})
+}
+
+fn assert_terminal_sort_task(
+	spec: &toron::distributed::task::TaskSpec,
+	exchange_id: ExchangeId,
+	producer_stage_id: StageId,
+) {
+	assert!(matches!(spec.output, TaskOutputBinding::FinalResult));
+	assert!(matches!(
+		&spec.inputs[0],
+		TaskInputBinding::ShuffleConsumer {
+			exchange_id: observed_exchange,
+			producer_stage_id: observed_stage,
+			..
+		} if *observed_exchange == exchange_id && *observed_stage == producer_stage_id
+	));
+	assert!(matches!(
+		&spec.plan,
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			..
+		} if order_by.len() == 2
+			&& matches!(
+				input.as_ref(),
+				ExecutionPlan::Scan { legacy_table_id, .. }
+					if *legacy_table_id == toron::distributed::task::shuffle_input_table_id(exchange_id)
+			)
+	));
+}

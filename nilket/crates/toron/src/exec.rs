@@ -5,8 +5,8 @@ use crate::error::ExecutionError;
 #[cfg(test)]
 use crate::ir::JoinStrategy;
 use crate::ir::{
-	AggregateFunction, ExecutionExpr, ExecutionPlan, FilterDisposition, JoinKind, MorselId,
-	QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
+	AggregateFunction, ExecutionExpr, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
+	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
@@ -15,9 +15,11 @@ use arrow::array::{
 	Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
 	Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow::compute::{
+	SortColumn, SortOptions, concat_batches, filter_record_batch, lexsort_to_indices, take,
+};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -443,6 +445,9 @@ impl Executor {
 					}
 					Ok(partitioned_output)
 				}
+				LogicalPlan::Sort { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical sort execution",
+				}),
 				LogicalPlan::Join { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical join execution",
 				}),
@@ -554,6 +559,24 @@ impl Executor {
 				} => {
 					self.bound_exchange(input, *partition_count, key, morsel)
 						.await
+				}
+				ExecutionPlan::Sort {
+					input,
+					order_by,
+					limit,
+					offset,
+					output_schema,
+				} => {
+					let input_batches = self.execute_bound(input, morsel).await?;
+					execute_sort(
+						input.schema(),
+						&input_batches,
+						order_by,
+						*limit,
+						*offset,
+						output_schema,
+						self.context.task_budget,
+					)
 				}
 				ExecutionPlan::Join {
 					left,
@@ -1947,8 +1970,84 @@ fn concat_or_empty(
 	if batches.is_empty() {
 		Ok(RecordBatch::new_empty(schema))
 	} else {
-		Ok(arrow::compute::concat_batches(&schema, batches)?)
+		Ok(concat_batches(&schema, batches)?)
 	}
+}
+
+fn execute_sort(
+	input_schema: arrow::datatypes::SchemaRef,
+	input_batches: &[RecordBatch],
+	order_by: &[ExecutionSortKey],
+	limit: Option<usize>,
+	offset: usize,
+	output_schema: &arrow::datatypes::SchemaRef,
+	task_budget: TaskBudget,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let row_count = input_batches
+		.iter()
+		.map(RecordBatch::num_rows)
+		.sum::<usize>();
+	let estimate = input_batches
+		.iter()
+		.map(RecordBatch::get_array_memory_size)
+		.sum::<usize>()
+		.saturating_add(row_count.saturating_mul(std::mem::size_of::<u32>()));
+	let estimate = u64::try_from(estimate).unwrap_or(u64::MAX);
+	if estimate > task_budget.memory.get() {
+		return Err(ExecutionError::BudgetExhausted {
+			dimension: BudgetDimension::Memory,
+			requested: ByteCount::new(estimate),
+			available: task_budget.memory,
+		});
+	}
+
+	let batch = concat_or_empty(input_schema, input_batches)?;
+	if batch.num_rows() == 0 || offset >= batch.num_rows() {
+		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+	}
+	if order_by.is_empty() {
+		return Err(ExecutionError::InvalidExpression {
+			message: "sort requires at least one key".to_string(),
+		});
+	}
+
+	let sort_columns = order_by
+		.iter()
+		.map(|key| {
+			let ordinal = usize::try_from(key.ordinal.0).expect("column ordinal fits usize");
+			let values = batch.columns().get(ordinal).cloned().ok_or_else(|| {
+				ExecutionError::InvalidExpression {
+					message: format!("sort key column ordinal {ordinal} out of bounds"),
+				}
+			})?;
+			Ok(SortColumn {
+				values,
+				options: Some(SortOptions {
+					descending: key.descending,
+					nulls_first: key.nulls_first,
+				}),
+			})
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+
+	let sorted_indices = lexsort_to_indices(&sort_columns, None)?;
+	let remaining = batch.num_rows() - offset;
+	let take_count = limit.unwrap_or(remaining).min(remaining);
+	let selected = sorted_indices
+		.values()
+		.iter()
+		.skip(offset)
+		.take(take_count)
+		.copied()
+		.collect::<Vec<_>>();
+	let indices = UInt32Array::from(selected);
+	let columns = batch
+		.columns()
+		.iter()
+		.map(|column| take(column, &indices, None))
+		.collect::<Result<Vec<_>, _>>()?;
+
+	Ok(vec![RecordBatch::try_new(output_schema.clone(), columns)?])
 }
 
 fn key_arrays(

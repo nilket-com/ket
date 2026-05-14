@@ -132,6 +132,13 @@ pub enum JoinStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortExpr {
+	pub expr: Expr,
+	pub descending: bool,
+	pub nulls_first: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
 	Scan {
 		table: TableId,
@@ -162,6 +169,12 @@ pub enum LogicalPlan {
 		input: Box<LogicalPlan>,
 		partition_count: u32,
 		key: Vec<Expr>,
+	},
+	Sort {
+		input: Box<LogicalPlan>,
+		order_by: Vec<SortExpr>,
+		limit: Option<usize>,
+		offset: usize,
 	},
 	Join {
 		left: Box<LogicalPlan>,

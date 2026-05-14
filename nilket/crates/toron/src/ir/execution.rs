@@ -59,6 +59,13 @@ pub enum FilterDisposition {
 	EvaluateInToron,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSortKey {
+	pub ordinal: ColumnOrdinal,
+	pub descending: bool,
+	pub nulls_first: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionPlan {
 	Scan {
@@ -92,6 +99,13 @@ pub enum ExecutionPlan {
 		partition_count: u32,
 		key: Vec<ExecutionExpr>,
 	},
+	Sort {
+		input: Box<ExecutionPlan>,
+		order_by: Vec<ExecutionSortKey>,
+		limit: Option<usize>,
+		offset: usize,
+		output_schema: SchemaRef,
+	},
 	Join {
 		left: Box<ExecutionPlan>,
 		right: Box<ExecutionPlan>,
@@ -111,6 +125,7 @@ impl ExecutionPlan {
 			Self::Project { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
+			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 		}
 	}

@@ -761,7 +761,8 @@ fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFing
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => first_scan_fingerprint(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => first_scan_fingerprint(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
 		}

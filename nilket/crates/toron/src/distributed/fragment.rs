@@ -13,7 +13,8 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	ColumnOrdinal, ExecutionExpr, ExecutionPlan, JoinKind, JoinStrategy, QueryProfileHint,
+	ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, JoinKind, JoinStrategy,
+	QueryProfileHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +210,33 @@ fn fragment_hash_join_plan(
 		strategy: join.strategy,
 		output_schema: join.output_schema,
 	};
-	let consumer_plan = replace_first_join(plan, join_replacement);
+	let terminal_gather = terminal_sort_gather(&plan);
+	let terminal_exchange_id = ExchangeId::new(2);
+	let (consumer_plan, consumer_output, terminal_stage) = if let Some(gather) = terminal_gather {
+		let consumer_plan = replace_first_join(gather.input.clone(), join_replacement);
+		let terminal_stage = terminal_sort_stage(
+			config,
+			StageId::new(3),
+			join_stage_id,
+			terminal_exchange_id,
+			gather,
+		)?;
+		(
+			consumer_plan,
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id: terminal_exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: Vec::new(),
+			},
+			Some(terminal_stage),
+		)
+	} else {
+		(
+			replace_first_join(plan, join_replacement),
+			TaskOutputBinding::FinalResult,
+			None,
+		)
+	};
 	let partition_count = left_boundary.partition_count;
 	let consumer_tasks = (0..partition_count)
 		.map(|partition| {
@@ -237,14 +264,14 @@ fn fragment_hash_join_plan(
 						producer_partitions: Vec::new(),
 					},
 				],
-				output: TaskOutputBinding::FinalResult,
+				output: consumer_output.clone(),
 				budget: config.task_budget,
 				trace: None,
 			})
 		})
 		.collect();
 
-	Ok(vec![
+	let mut stages = vec![
 		StagePlan {
 			stage_id: left_stage_id,
 			upstream_stages: vec![],
@@ -274,7 +301,11 @@ fn fragment_hash_join_plan(
 			upstream_stages: vec![left_stage_id, right_stage_id],
 			tasks: consumer_tasks,
 		},
-	])
+	];
+	if let Some(stage) = terminal_stage {
+		stages.push(stage);
+	}
+	Ok(stages)
 }
 
 fn fragment_broadcast_join_plan(
@@ -312,7 +343,33 @@ fn fragment_broadcast_join_plan(
 		strategy: join.strategy,
 		output_schema: join.output_schema,
 	};
-	let consumer_plan = replace_first_join(plan, join_replacement);
+	let terminal_gather = terminal_sort_gather(&plan);
+	let terminal_exchange_id = ExchangeId::new(1);
+	let (consumer_plan, consumer_output, terminal_stage) = if let Some(gather) = terminal_gather {
+		let consumer_plan = replace_first_join(gather.input.clone(), join_replacement);
+		let terminal_stage = terminal_sort_stage(
+			config,
+			StageId::new(2),
+			join_stage_id,
+			terminal_exchange_id,
+			gather,
+		)?;
+		(
+			consumer_plan,
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id: terminal_exchange_id,
+				partition_count: PartitionCount::new(1),
+				partition_key: Vec::new(),
+			},
+			Some(terminal_stage),
+		)
+	} else {
+		(
+			replace_first_join(plan, join_replacement),
+			TaskOutputBinding::FinalResult,
+			None,
+		)
+	};
 	let consumer_tasks = (0..worker_count)
 		.map(|worker_index| {
 			TaskPlan::new(TaskSpec {
@@ -339,14 +396,14 @@ fn fragment_broadcast_join_plan(
 						producer_partitions: Vec::new(),
 					},
 				],
-				output: TaskOutputBinding::FinalResult,
+				output: consumer_output.clone(),
 				budget: config.task_budget,
 				trace: None,
 			})
 		})
 		.collect();
 
-	Ok(vec![
+	let mut stages = vec![
 		StagePlan {
 			stage_id: build_stage_id,
 			upstream_stages: vec![],
@@ -362,7 +419,11 @@ fn fragment_broadcast_join_plan(
 			upstream_stages: vec![build_stage_id],
 			tasks: consumer_tasks,
 		},
-	])
+	];
+	if let Some(stage) = terminal_stage {
+		stages.push(stage);
+	}
+	Ok(stages)
 }
 
 fn producer_task(
@@ -440,6 +501,90 @@ struct JoinBoundary {
 	output_schema: SchemaRef,
 }
 
+#[derive(Debug, Clone)]
+struct TerminalSortGather {
+	input: ExecutionPlan,
+	order_by: Vec<ExecutionSortKey>,
+	limit: Option<usize>,
+	offset: usize,
+	output_schema: SchemaRef,
+}
+
+fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
+	let ExecutionPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+		output_schema,
+	} = plan
+	else {
+		return None;
+	};
+	let ExecutionPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		return None;
+	};
+	if *partition_count != 1 || !key.is_empty() || !contains_join(input) {
+		return None;
+	}
+
+	Some(TerminalSortGather {
+		input: input.as_ref().clone(),
+		order_by: order_by.clone(),
+		limit: *limit,
+		offset: *offset,
+		output_schema: output_schema.clone(),
+	})
+}
+
+fn terminal_sort_stage(
+	config: FragmentPlanConfig,
+	stage_id: StageId,
+	producer_stage_id: StageId,
+	exchange_id: ExchangeId,
+	gather: TerminalSortGather,
+) -> Result<StagePlan, FragmentError> {
+	let scan_metadata =
+		first_scan_metadata(&gather.input).ok_or(FragmentError::MissingScanMetadata)?;
+	let input_schema = gather.input.schema();
+	let sort_plan = ExecutionPlan::Sort {
+		input: Box::new(shuffle_input_scan(scan_metadata, input_schema, exchange_id)),
+		order_by: gather.order_by,
+		limit: gather.limit,
+		offset: gather.offset,
+		output_schema: gather.output_schema,
+	};
+
+	Ok(StagePlan {
+		stage_id,
+		upstream_stages: vec![producer_stage_id],
+		tasks: vec![TaskPlan::new(TaskSpec {
+			identity: TaskIdentity::new(
+				config.query_id,
+				stage_id,
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: Some(PartitionId::new(0)),
+			plan: sort_plan,
+			inputs: vec![TaskInputBinding::ShuffleConsumer {
+				exchange_id,
+				producer_stage_id,
+				partition_id: PartitionId::new(0),
+				producer_partitions: Vec::new(),
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: config.task_budget,
+			trace: None,
+		})],
+	})
+}
+
 fn runtime_filter_join_eligible(join: &JoinBoundary) -> bool {
 	if !matches!(join.kind, JoinKind::Inner)
 		|| join.left_keys.len() != 1
@@ -487,7 +632,8 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => first_join(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => first_join(input),
 		ExecutionPlan::Scan { .. } => None,
 	}
 }
@@ -520,7 +666,8 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		}),
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. } => find_exchange(input),
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Sort { input, .. } => find_exchange(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
@@ -533,7 +680,8 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Exchange { input, .. } => 1 + count_exchanges(input),
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. } => count_exchanges(input),
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
 		ExecutionPlan::Scan { .. } => 0,
 	}
@@ -556,7 +704,8 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => first_scan_metadata(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => first_scan_metadata(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
@@ -610,6 +759,19 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			input: Box::new(replace_exchange_with_scan(*input, scan)),
 			group_expr,
 			aggr_expr,
+			output_schema,
+		},
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		} => ExecutionPlan::Sort {
+			input: Box::new(replace_exchange_with_scan(*input, scan)),
+			order_by,
+			limit,
+			offset,
 			output_schema,
 		},
 		ExecutionPlan::Join {
@@ -673,6 +835,19 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			input: Box::new(replace_first_join(*input, replacement)),
 			partition_count,
 			key,
+		},
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		} => ExecutionPlan::Sort {
+			input: Box::new(replace_first_join(*input, replacement)),
+			order_by,
+			limit,
+			offset,
+			output_schema,
 		},
 		ExecutionPlan::Scan { .. } => plan,
 	}

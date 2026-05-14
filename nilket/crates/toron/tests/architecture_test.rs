@@ -218,6 +218,48 @@ fn task_failure_kind_keeps_partition_store_errors_separate() {
 	assert!(!task_failure.contains("StaleAttempt"));
 }
 
+#[test]
+fn architecture_guards_unchanged_plus_sort_variant() {
+	let logical_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical_source
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.expect("LogicalPlan enum");
+	assert_eq!(enum_variant_count(logical_plan), 9);
+	assert!(logical_plan.contains("Sort {"));
+	assert!(logical_source.contains("pub struct SortExpr"));
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution_source
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	assert_eq!(enum_variant_count(execution_plan), 7);
+	assert!(execution_plan.contains("Sort {"));
+	assert!(execution_source.contains("pub struct ExecutionSortKey"));
+}
+
+#[test]
+fn lower_query_and_lower_select_have_no_rest_pattern() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	for function in ["fn lower_query", "fn lower_select"] {
+		let body = source
+			.split(function)
+			.nth(1)
+			.and_then(|rest| rest.split("\n\tfn ").next())
+			.expect(function);
+		assert!(
+			!body.contains(".."),
+			"{function} contains a rest pattern and may silently drop parser fields"
+		);
+	}
+}
+
 fn enum_variant_count(enum_body: &str) -> usize {
 	enum_body
 		.lines()

@@ -568,7 +568,8 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => join_strategy_label(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => join_strategy_label(input),
 		ExecutionPlan::Scan { .. } => None,
 	}
 }
@@ -579,7 +580,8 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => contains_join(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => contains_join(input),
 		ExecutionPlan::Scan { .. } => false,
 	}
 }
@@ -593,6 +595,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Filter { .. } => "filter",
 			ExecutionPlan::Project { .. } => "project",
 			ExecutionPlan::Aggregate { .. } => "aggregate",
+			ExecutionPlan::Sort { .. } => "sort",
 			ExecutionPlan::Scan { .. } => "scan",
 			ExecutionPlan::Join { .. } => "join",
 		}
@@ -744,7 +747,8 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => contains_broadcast_join(input),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => contains_broadcast_join(input),
 		ExecutionPlan::Scan { .. } => false,
 	}
 }
@@ -1056,7 +1060,8 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. } => scan_schema_for_table_id(input, table_id),
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. } => scan_schema_for_table_id(input, table_id),
 		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
 			.or_else(|| scan_schema_for_table_id(right, table_id)),
 		ExecutionPlan::Scan { .. } => None,

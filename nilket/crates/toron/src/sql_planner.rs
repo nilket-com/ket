@@ -1,9 +1,11 @@
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
-use crate::ir::{AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue};
+use crate::ir::{
+	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
+};
 use sqlparser::ast::{
 	BinaryOperator, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint,
-	JoinOperator, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+	JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
 	TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
@@ -43,23 +45,156 @@ impl SqlPlanner {
 	}
 
 	fn lower_query(&self, query: &Query) -> Result<LogicalPlan, FrontendError> {
-		match &*query.body {
-			SetExpr::Select(select) => self.lower_select(select),
-			_ => Err(unsupported("unsupported query body")),
+		let Query {
+			with,
+			body,
+			order_by,
+			limit,
+			limit_by,
+			offset,
+			fetch,
+			locks,
+			for_clause,
+			settings,
+			format_clause,
+		} = query;
+
+		if with.is_some() {
+			return Err(unsupported("WITH is not supported"));
+		}
+		if !limit_by.is_empty() {
+			return Err(unsupported("LIMIT BY is not supported"));
+		}
+		if fetch.is_some() {
+			return Err(unsupported("FETCH is not supported"));
+		}
+		if !locks.is_empty() {
+			return Err(unsupported("locking clauses are not supported"));
+		}
+		if for_clause.is_some() {
+			return Err(unsupported("FOR clause is not supported"));
+		}
+		if settings.is_some() {
+			return Err(unsupported("query settings are not supported"));
+		}
+		if format_clause.is_some() {
+			return Err(unsupported("FORMAT clause is not supported"));
+		}
+		if order_by.is_none() && (limit.is_some() || offset.is_some()) {
+			return Err(unsupported(
+				"LIMIT/OFFSET without ORDER BY is not supported",
+			));
+		}
+
+		let plan = match &**body {
+			SetExpr::Select(select) => self.lower_select(select)?,
+			_ => return Err(unsupported("unsupported query body")),
+		};
+
+		if let Some(order_by) = order_by {
+			let order_by = self.lower_order_by(order_by)?;
+			let limit = limit
+				.as_ref()
+				.map(parse_non_negative_usize_literal)
+				.transpose()?;
+			let offset = offset
+				.as_ref()
+				.map(|offset| parse_non_negative_usize_literal(&offset.value))
+				.transpose()?
+				.unwrap_or(0);
+			Ok(LogicalPlan::Sort {
+				input: Box::new(LogicalPlan::Exchange {
+					input: Box::new(plan),
+					partition_count: 1,
+					key: Vec::new(),
+				}),
+				order_by,
+				limit,
+				offset,
+			})
+		} else {
+			Ok(plan)
 		}
 	}
 
 	fn lower_select(&self, select: &Select) -> Result<LogicalPlan, FrontendError> {
+		let Select {
+			select_token,
+			distinct,
+			top,
+			top_before_distinct,
+			projection,
+			into,
+			from,
+			lateral_views,
+			prewhere,
+			selection,
+			group_by,
+			cluster_by,
+			distribute_by,
+			sort_by,
+			having,
+			named_window,
+			qualify,
+			window_before_qualify,
+			value_table_mode,
+			connect_by,
+		} = select;
+		let _parser_metadata_only = (select_token, top_before_distinct, window_before_qualify);
+
+		if distinct.is_some() {
+			return Err(unsupported("DISTINCT is not supported"));
+		}
+		if top.is_some() {
+			return Err(unsupported("TOP is not supported"));
+		}
+		if into.is_some() {
+			return Err(unsupported("SELECT INTO is not supported"));
+		}
+		if !lateral_views.is_empty() {
+			return Err(unsupported("LATERAL VIEW is not supported"));
+		}
+		if prewhere.is_some() {
+			return Err(unsupported("PREWHERE is not supported"));
+		}
+		if !group_by_is_empty(group_by) {
+			return Err(unsupported("GROUP BY is not supported"));
+		}
+		if !cluster_by.is_empty() {
+			return Err(unsupported("CLUSTER BY is not supported"));
+		}
+		if !distribute_by.is_empty() {
+			return Err(unsupported("DISTRIBUTE BY is not supported"));
+		}
+		if !sort_by.is_empty() {
+			return Err(unsupported("SORT BY is not supported"));
+		}
+		if having.is_some() {
+			return Err(unsupported("HAVING is not supported"));
+		}
+		if !named_window.is_empty() {
+			return Err(unsupported("WINDOW is not supported"));
+		}
+		if qualify.is_some() {
+			return Err(unsupported("QUALIFY is not supported"));
+		}
+		if value_table_mode.is_some() {
+			return Err(unsupported("SELECT AS VALUE/STRUCT is not supported"));
+		}
+		if connect_by.is_some() {
+			return Err(unsupported("CONNECT BY is not supported"));
+		}
+
 		// 1. Handle FROM (Scan)
-		if select.from.is_empty() {
+		if from.is_empty() {
 			return Err(unsupported("SELECT without FROM is not supported"));
 		}
 
-		if select.from.len() > 1 {
+		if from.len() > 1 {
 			return Err(unsupported("comma joins are not supported"));
 		}
 
-		let table_with_joins = &select.from[0];
+		let table_with_joins = &from[0];
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
 			let right = self.lower_table_factor(&join.relation)?;
@@ -83,7 +218,7 @@ impl SqlPlanner {
 		}
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
-		if let Some(selection) = &select.selection {
+		if let Some(selection) = selection {
 			plan = self.lower_where(plan, selection)?;
 		}
 
@@ -91,7 +226,7 @@ impl SqlPlanner {
 		let mut aggr_exprs = Vec::new();
 		let mut is_aggregate = false;
 
-		for item in &select.projection {
+		for item in projection {
 			if let SelectItem::UnnamedExpr(SqlExpr::Function(f)) = item {
 				let name = f.name.to_string().to_uppercase();
 				let args: &[FunctionArg] = match &f.args {
@@ -154,7 +289,7 @@ impl SqlPlanner {
 		}
 
 		let mut exprs = Vec::new();
-		for item in &select.projection {
+		for item in projection {
 			match item {
 				SelectItem::UnnamedExpr(sql_expr) => {
 					exprs.push(self.lower_expr(sql_expr)?);
@@ -170,6 +305,30 @@ impl SqlPlanner {
 			input: Box::new(plan),
 			exprs,
 		})
+	}
+
+	fn lower_order_by(&self, order_by: &OrderBy) -> Result<Vec<SortExpr>, FrontendError> {
+		if order_by.interpolate.is_some() {
+			return Err(unsupported("ORDER BY INTERPOLATE is not supported"));
+		}
+		if order_by.exprs.is_empty() {
+			return Err(unsupported("ORDER BY requires at least one expression"));
+		}
+
+		order_by
+			.exprs
+			.iter()
+			.map(|expr| {
+				if expr.with_fill.is_some() {
+					return Err(unsupported("ORDER BY WITH FILL is not supported"));
+				}
+				Ok(SortExpr {
+					expr: self.lower_expr(&expr.expr)?,
+					descending: expr.asc == Some(false),
+					nulls_first: expr.nulls_first.unwrap_or(false),
+				})
+			})
+			.collect()
 	}
 
 	fn lower_join_operator(
@@ -589,6 +748,24 @@ fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
 	}
 }
 
+fn parse_non_negative_usize_literal(expr: &SqlExpr) -> Result<usize, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Value(Value::Number(number, _)) => {
+			if number.starts_with('-')
+				|| number.contains('.')
+				|| number.contains('e')
+				|| number.contains('E')
+			{
+				return Err(unsupported("LIMIT/OFFSET expects a non-negative integer"));
+			}
+			number
+				.parse::<usize>()
+				.map_err(|_| unsupported("LIMIT/OFFSET expects a non-negative integer"))
+		}
+		_ => Err(unsupported("LIMIT/OFFSET expects a non-negative integer")),
+	}
+}
+
 fn strip_nested_sql_expr(expr: &SqlExpr) -> &SqlExpr {
 	match expr {
 		SqlExpr::Nested(inner) => strip_nested_sql_expr(inner),
@@ -712,7 +889,8 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
-		| LogicalPlan::Exchange { input, .. } => plan_qualifiers(input),
+		| LogicalPlan::Exchange { input, .. }
+		| LogicalPlan::Sort { input, .. } => plan_qualifiers(input),
 		LogicalPlan::Join {
 			left, right, kind, ..
 		} => match kind {

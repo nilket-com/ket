@@ -7,9 +7,9 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Implementation pending. No
-bench-results artifact — ADR 010 introduces a new operator but
-makes no performance claim; promotion evidence is digest parity
+Promoted to `plans/adr/` and implemented. No bench-results
+artifact — ADR 010 introduces a new operator but makes no
+performance claim; promotion evidence is digest parity
 (canonical + ordered) plus stage-shape inspection against
 hand-written `Sort` plans plus preserved/updated architecture
 guards (see "Promotion evidence").

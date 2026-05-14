@@ -122,7 +122,7 @@ along with the forward-sequence rewrite.
   (explicitly post-V1) and wire efficiency (gated on the pending
   ADR 006 Wendelon row).
 - **ADR 010 — Top-Level SQL Clause Accounting and Deterministic
-  Result Ordering.** Promoted; implementation pending.
+  Result Ordering.** Promoted + implemented.
   Frontend-planner surface extension plus a new operator, closing
   a live V1 "First Query with Integrity" correctness defect:
   `SqlPlanner::lower_query` / `lower_select` silently discarded
@@ -261,7 +261,7 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 010 implementation
+### Completed: ADR 010 implementation
 
 ADR 010's contract is pinned at
 `plans/adr/010_top_level_clause_accounting_and_ordering.md`; the
@@ -272,11 +272,11 @@ performance claim — promotion evidence is digest parity
 (canonical + ordered) plus distributed stage-shape inspection,
 so there is no bench-results artifact. The impl plan is phased
 so Phase 1 (clause accounting — the silent-drop → loud-reject
-integrity fix) is an independently reviewable correctness commit;
+integrity fix) is independently reviewable correctness work;
 Phase 4 (the strategy-agnostic post-join terminal gather-sort
-fragmenter path) is the named primary implementation risk. The
-next council deliverable is ADR 010 implementation, then ADR 011
-planning.
+fragmenter path) was the named primary implementation risk and is
+pinned by stage-shape tests. The next council deliverable is
+ADR 011 planning.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the

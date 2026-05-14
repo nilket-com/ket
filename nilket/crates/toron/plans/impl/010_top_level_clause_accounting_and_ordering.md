@@ -11,7 +11,7 @@ updated/preserved architecture guards (see "Definition of done").
 
 ## Status
 
-Promoted to `plans/impl/`. Implementation pending.
+Promoted to `plans/impl/` and implemented.
 
 Built across three topic-iteration rounds and two ADR-drafting
 rounds with the AI Swarm Council
