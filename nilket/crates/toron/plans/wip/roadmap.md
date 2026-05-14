@@ -90,6 +90,35 @@ along with the forward-sequence rewrite.
   Three-way AI Swarm Council convergence (Claude / Codex /
   Gemini) at iter-3. Bench evidence landed at
   `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
+- **ADR 009 — Correlated `EXISTS` / `NOT EXISTS`
+  Decorrelation.** Promoted; implementation pending.
+  Frontend-planner surface extension closing the analytical-SQL
+  existence-predicate gap left by ADR 008 — `LeftSemi` /
+  `LeftAnti` were executable but unreachable from the routine
+  `WHERE [NOT] EXISTS (correlated subquery)` SQL form. Narrow
+  SQL-AST rewrite in `SqlPlanner::lower_select`: top-level outer
+  `AND` conjuncts decomposed; correlated `EXISTS` →
+  `JoinKind::LeftSemi`, `NOT EXISTS` → `JoinKind::LeftAnti`;
+  two-scope classifier (`CorrelatedPair` / `InnerResidual` /
+  `Unsupported`) operating on the SQL AST before lowering; single
+  `TableFactor::Table` subquery body; at least one correlation
+  pair required; unqualified / ambiguous correlation, subquery
+  joins, uncorrelated `EXISTS`, `IN` / `NOT IN`, and all other
+  shapes reject through the existing unsupported-expression path
+  with no semantic fallback; source-order left-deep chaining for
+  multiple conjuncts; outer residuals commute by ADR 008 schema
+  identity; ANSI null semantics delegated to ADR 008. No new IR,
+  executor, wire, `TaskFailureKind`, `JoinKind`, `JoinStrategy`,
+  or architecture-guard surface; binder reused unchanged. ADR 009
+  is a V1 ADR, not the post-V1 transition. No bench-results
+  artifact — promotion evidence is digest parity against
+  hand-written `LeftSemi` / `LeftAnti` joins. Three-way AI Swarm
+  Council convergence (Claude / Codex / Gemini) at iter-2.
+  Selected as the strongest launch-driven
+  candidate post-ADR-008 — the substrate had just shipped and the
+  scope was fully determined, against multi-tenant governance
+  (explicitly post-V1) and wire efficiency (gated on the pending
+  ADR 006 Wendelon row).
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -145,10 +174,21 @@ surface that the bytes-movement evidence did not touch. ADR 008
 (outer / semi / anti joins) was selected as the strongest
 launch-driven candidate post-ADR-007 — the "SQL width" gap
 left by ADR 004's inner-only scope was load-bearing for
-analytical workloads. ADR 009 selection is the next decision:
-the ADR 006 selective bench rerun and any launch-pressure
-shift feed into that scoring, and the candidate ordering
-below reflects the post-ADR-008 landscape.
+analytical workloads. ADR 009 (correlated `EXISTS` / `NOT EXISTS`
+decorrelation) was selected post-ADR-008 as the V1 candidate
+whose substrate had just shipped — ADR 008's `LeftSemi` /
+`LeftAnti` operators were executable but unreachable from the
+routine `WHERE [NOT] EXISTS` SQL form. The council scored it
+against multi-tenant governance (explicitly post-V1 by the
+V1-target paragraph, and contract-shape-hungry for multi-tenant
+workload evidence that does not exist yet) and cross-process wire
+efficiency (the compute-ring fallback, whose promotion condition
+cannot be evaluated until the pending ADR 006 Wendelon row
+lands) — and selected the frontend-planner existence-predicate
+gap. ADR 010 selection is the next decision: the ADR 006
+Wendelon row and any launch-pressure shift feed into that
+scoring, and the candidate ordering below reflects the
+post-ADR-009 landscape.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
@@ -158,7 +198,8 @@ Context. Scale boundaries seen so far: process-internal
 ADR 008), cluster-wide (governance, ADR 003), cross-ring
 (ADR 002, ADR 006), transport (ADR 003 wire, ADR 006
 `PartitionManifest`/`ScanRequest` additions),
-storage-internal (Wendelon). The decomposition makes
+storage-internal (Wendelon), frontend planner (ADR 009).
+The decomposition makes
 scope-creep into adjacent boundaries visible at review
 time and sharpens ADR selection: same operator at different
 scales is a different contract.
@@ -168,13 +209,15 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 009 planning
+### Next: ADR 009 implementation
 
-ADR 008's contract is pinned at
-`plans/adr/008_outer_semi_anti_joins.md`; the impl plan lives at
-`plans/impl/008_outer_semi_anti_joins.md`; bench evidence lives at
-`plans/impl/008_outer_semi_anti_joins_bench_results.md`. The next
-council deliverable is ADR 009 planning.
+ADR 009's contract is pinned at
+`plans/adr/009_correlated_exists_decorrelation.md`; the impl plan
+lives at `plans/impl/009_correlated_exists_decorrelation.md`.
+ADR 009 introduces no new operator path — promotion evidence is
+digest parity against hand-written `LeftSemi` / `LeftAnti` joins,
+so there is no bench-results artifact. The next council
+deliverable after ADR 009 implementation is ADR 010 planning.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
@@ -182,17 +225,17 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 009 selection now waits on the ADR 006 Wendelon row arrival
-and any follow-up evidence from ADR 008's per-kind quick-row
-matrix. Until those land, the candidate ordering below reflects
-the post-ADR-008 landscape.
+ADR 010 selection waits on the ADR 006 Wendelon row arrival and
+any launch-pressure shift. Until that lands, the candidate
+ordering below reflects the post-ADR-009 landscape.
 
-### ADR 009 candidates (post-ADR-008 reordered)
+### ADR 010 candidates (post-ADR-009 reordered)
 
-With L-2 (Rune sandbox) consumed by ADR 007 and operator-level
-SQL width consumed by ADR 008, the remaining candidates rotate.
-The candidates, in rough order of probable selection given
-evidence shapes the council can already anticipate:
+With L-2 (Rune sandbox) consumed by ADR 007, operator-level SQL
+width by ADR 008, and the frontend-planner existence-predicate
+gap by ADR 009, the remaining candidates rotate. The candidates,
+in rough order of probable selection given evidence shapes the
+council can already anticipate:
 
 #### Candidate A — Multi-tenant resource governance
 
@@ -268,19 +311,7 @@ worker-side script execution — covers distributed sandbox +
 per-worker budget interaction + the `TaskFailureKind`
 reason-string mapping ADR 007 reserved as the forward seam.
 
-#### Candidate E — `EXISTS` / `NOT EXISTS` subquery decorrelation
-
-**Scale boundary:** frontend planner.
-
-Reserved. ADR 008 ships the `Semi` / `Anti` operators; this
-candidate adds the subquery-planner contract that detects
-correlated-equi-join `EXISTS` / `NOT EXISTS` patterns and
-rewrites them to the `Semi` / `Anti` operators. Substrate exists
-from ADR 008; the decision matrix is which `EXISTS` shapes get
-decorrelated, how the planner detects them, and how the binder
-folds them. Likely follows ADR 008 implementation evidence.
-
-#### Candidate F — Executor model upgrade
+#### Candidate E — Executor model upgrade
 
 **Scale boundary:** operator-level (executor substrate).
 
@@ -334,7 +365,7 @@ committed.
   executes the leaves; the wire carries results, not
   bytes." ADR 006 is the first runtime-pushdown ADR and
   the substrate that V1.x runtime-filter extensions
-  (Candidate E above) build on.
+  (Candidate C above) build on.
 
 ### V1.x items *(post-V1, evidence-driven)*
 
@@ -450,6 +481,59 @@ that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
 
+### ADR 009 cycle
+
+- **Treating ADR 009 as the first post-V1 ADR (to select
+  Candidate A, multi-tenant governance).** Considered — the
+  roadmap's candidate ordering lists A first; rejected. The
+  V1-target paragraph lists multi-tenant governance as post-V1,
+  and no post-ADR-008 evidence surfaces multi-tenancy as the
+  binding constraint while a routine V1 SQL-surface gap is open.
+  Claude iter-0 surfaced the roadmap internal tension; Gemini
+  iter-1 and Codex iter-1 resolved it explicitly — ADR 009 is a
+  V1 ADR.
+- **Candidate B (cross-process wire efficiency) as ADR 009.**
+  Considered; rejected as premature. B is the compute-ring
+  fallback whose promotion condition ("ADR 006's selective bench
+  misses") cannot be evaluated until the pending Wendelon row
+  lands. Selecting B now front-runs that evidence; it reopens
+  cleanly if the row misses.
+- **General subquery execution engine.** Considered; rejected.
+  ADR 009 is a narrow SQL-AST rewrite, not a subquery IR node +
+  executor. The general engine is unbounded scope; the rewrite
+  covers the routine analytical pattern with zero new execution
+  surface.
+- **Subquery joins in the V1 body.** Considered (Claude iter-0's
+  "base relation or join"); rejected (Codex iter-1). Subquery
+  joins widen side-resolution and residual-placement rules —
+  scope bleed the narrow-ADR discipline exists to stop. Named,
+  deferred extension; ADR 009 V1 is one `TableFactor::Table`.
+- **Uncorrelated `EXISTS` in the same cycle.** Considered;
+  rejected. Not a semi/anti rewrite — a scalar cardinality
+  check. It falls out of the two-scope classifier as
+  zero-correlation-pairs and stays unsupported.
+- **Inner-only residual defined as "both sides resolve in the
+  inner scope."** Considered (Claude iter-1 S1 phrasing);
+  rejected (Codex iter-1) for "no outer references and lowerable
+  against the inner relation" — the latter correctly admits
+  literal predicates like `dim.active = true`.
+- **A new unqualified-name resolution rule for subqueries.**
+  Considered; rejected. ADR 009 should not grow fragile
+  name-resolution machinery; unqualified / ambiguous correlation
+  rejects, and the contract widens for free if later planner
+  work hardens scoping.
+- **`IN` / `NOT IN` decorrelation.** Considered as adjacent
+  scope; rejected. `NOT IN`'s three-valued NULL logic is a
+  separate decision matrix; its own ADR.
+- **New error variant for unsupported `EXISTS` shapes.**
+  Considered; rejected. No new failure class — the existing
+  unsupported-expression class is the right surface (ADR 008
+  P0.8 discipline).
+- **New architecture guard for ADR 009.** Considered; rejected.
+  ADR 009 changes no serialized shape and adds no variant —
+  there is nothing to pin. It asserts the ADR 003 / 004 / 008
+  guard set stays green instead.
+
 ### ADR 008 cycle
 
 - **Six-variant `JoinKind` (no `RightSemi` / `RightAnti`).**
@@ -475,8 +559,8 @@ labeled by ADR cycle.
   008 scope. Subquery-planner contract requires its own decision
   matrix: which patterns are decorrelated, how does the planner
   detect them, how does the binder fold them. ADR 008 ships the
-  `Semi` / `Anti` operators; a later subquery-planner ADR
-  (Candidate E above) can leverage them.
+  `Semi` / `Anti` operators; a later subquery-planner ADR can
+  leverage them. Promoted as ADR 009.
 - **Per-kind probe loops without a row-selection intermediate.**
   Considered (Claude iter-0); rejected in favor of Codex's
   `JoinOutputRow` design. Per-kind loops duplicate null-fill code
@@ -498,7 +582,7 @@ labeled by ADR cycle.
   don't match the build — but those are exactly the rows the
   outer join must preserve with null fill. `RightAnti` depends
   on emitting unmatched probe rows. A "filter + preserve"
-  combined operator is the separable design; reserved as ADR 009
+  combined operator is the separable design; reserved as ADR 010
   Candidate C (V1.x runtime-filter extensions).
 - **New `TaskFailureKind::JoinSemantics` variant.** Considered;
   rejected. No new failure class exists — the eight join kinds
@@ -1053,7 +1137,7 @@ sections; this list is the cross-cutting set.
   join would drop the very rows the outer must preserve;
   `RightAnti` depends on emitting unmatched probe rows. ADR 008
   hard gate 17 enforces; a "filter + preserve" combined operator
-  is the separable future design (ADR 009 Candidate C).
+  is the separable future design (ADR 010 Candidate C).
 - **Don't allow `JoinStrategy::Broadcast` for non-Inner
   `JoinKind`.** Broadcast replicates the build side; preserved-
   side or existence variants would emit duplicate unmatched
@@ -1066,9 +1150,9 @@ sections; this list is the cross-cutting set.
   is reject-and-defer; a strategy-rewrite ADR can follow if
   evidence supports it.
 - **Don't add `EXISTS` / `NOT EXISTS` decorrelation under ADR
-  008.** Subquery-planner contract; reserved as ADR 009
-  Candidate E. ADR 008 ships the `Semi` / `Anti` operators; the
-  subquery-planner ADR layers on top.
+  008.** Subquery-planner contract; promoted as ADR 009. ADR 008
+  ships the `Semi` / `Anti` operators; ADR 009 layers the
+  correlated-`EXISTS` rewrite on top.
 - **Don't promise rolling coordinator/worker mixed-version
   semantics for `JoinKind`.** Serde-tagged variants are additive
   but older binaries reject unknown variants. ADR 008 ships at a
@@ -1085,3 +1169,36 @@ sections; this list is the cross-cutting set.
   `build_rows` / `probe_rows` / `output_rows` counters are
   sufficient for V1; kind-specific aggregates surface downstream
   of the task wire if needed.
+- **Don't add a subquery node to Toron's IR for `EXISTS`
+  decorrelation.** ADR 009 is a targeted SQL-AST rewrite in
+  `SqlPlanner::lower_select`; the logical and physical join
+  contract is reused unchanged. A subquery IR node is a general
+  subquery-engine decision, not ADR 009's.
+- **Don't lower the whole subquery predicate through `lower_expr`
+  before classifying.** ADR 009's two-scope classifier operates
+  on the `sqlparser` AST so unsafe outer-reference shapes reject
+  precisely; a generic lowering pass first would route a mixed
+  predicate into a generic filter path. Classify, then lower only
+  the accepted `CorrelatedPair` columns and `InnerResidual`
+  predicates.
+- **Don't invent a new unqualified-name resolution rule for
+  subqueries.** ADR 009 rejects unqualified / ambiguous
+  correlation rather than guessing. If the existing qualifier
+  logic cannot pin one side to the outer scope and one to the
+  inner scope, the rewrite is unsupported — "too narrow and
+  correct" over matching a permissive engine.
+- **Don't decorrelate uncorrelated `EXISTS`, `IN`, or `NOT IN`
+  under ADR 009.** Uncorrelated `EXISTS` is a scalar cardinality
+  check, not a semi-join; `NOT IN` carries three-valued NULL
+  logic that must not be smuggled into anti-join semantics. Each
+  is a named, deferred extension with its own decision matrix.
+- **Don't widen the ADR 009 subquery body beyond one
+  `TableFactor::Table`.** Subquery joins, aggregates, `LIMIT`,
+  `DISTINCT`, set ops, and nested subqueries are unsupported and
+  reject through the existing path. The classifier's
+  `Unsupported` arm is the structural scope boundary.
+- **Don't duplicate binder semantic checks in the SQL planner
+  for ADR 009.** The planner classifies shape and builds the
+  logical rewrite; the binder stays the authority for type
+  compatibility, float-key rejection, computed-key rejection,
+  exchange shape, and non-Inner broadcast rejection.
