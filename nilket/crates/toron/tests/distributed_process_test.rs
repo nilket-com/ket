@@ -23,6 +23,7 @@ use toron::distributed::worker_registry::{
 use toron::ir::{AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, TableId};
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
+use toron::sql_planner::SqlPlanner;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
 	TableObjectId, TableSchemaDescriptor,
@@ -292,6 +293,26 @@ async fn hash_partitioned_promoted_join_kinds_match_single_partition_digest() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn correlated_exists_decorrelation_matches_explicit_left_semi_join_digest() {
+	let decorrelated = run_hash_join_logical_process_query(
+		1_300,
+		0,
+		SqlPlanner::new()
+			.plan(
+				"SELECT * FROM orders \
+				 WHERE EXISTS (SELECT 1 FROM customers \
+				 WHERE customers.id = orders.customer_id)",
+			)
+			.expect("plan correlated exists"),
+	)
+	.await;
+	let explicit = run_hash_join_kind_process_query(1_304, JoinKind::LeftSemi, 2, 1).await;
+
+	assert_eq!(decorrelated.row_count, explicit.row_count);
+	assert_eq!(decorrelated.digest, explicit.digest);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
 	let baseline = run_broadcast_join_process_query(800).await;
 	let killed = run_broadcast_join_build_kill_query(900).await;
@@ -396,6 +417,39 @@ async fn run_hash_join_kind_process_query(
 			partition_count,
 			kind,
 		))
+		.await
+		.expect("hash join query");
+	let run = join_process_run(results, registry.selected_workers());
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	run
+}
+
+async fn run_hash_join_logical_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+	plan: LogicalPlan,
+) -> JoinProcessRun {
+	let mut workers = vec![
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		join_process_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+
+	let results = coordinator
+		.execute_query(&plan)
 		.await
 		.expect("hash join query");
 	let run = join_process_run(results, registry.selected_workers());

@@ -374,10 +374,16 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. } => collect_qualifiers(input, qualifiers),
-		LogicalPlan::Join { left, right, .. } => {
-			collect_qualifiers(left, qualifiers);
-			collect_qualifiers(right, qualifiers);
-		}
+		LogicalPlan::Join {
+			left, right, kind, ..
+		} => match kind {
+			JoinKind::LeftSemi | JoinKind::LeftAnti => collect_qualifiers(left, qualifiers),
+			JoinKind::RightSemi | JoinKind::RightAnti => collect_qualifiers(right, qualifiers),
+			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+				collect_qualifiers(left, qualifiers);
+				collect_qualifiers(right, qualifiers);
+			}
+		},
 	}
 }
 

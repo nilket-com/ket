@@ -7,11 +7,10 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Implementation pending. No bench-results
-artifact — ADR 009 introduces no new operator path; promotion
-evidence is digest parity against hand-written `LeftSemi` /
-`LeftAnti` joins plus preserved architecture guards (see
-"Promotion evidence").
+Promoted to `plans/adr/` + implemented. No bench-results artifact
+— ADR 009 introduces no new operator path; promotion evidence is
+digest parity against hand-written `LeftSemi` / `LeftAnti` joins
+plus preserved architecture guards (see "Promotion evidence").
 
 Builds on three WIP iteration rounds across the council
 (`plans/wip/{claude,codex,gemini}_iter_*_adr_009.md`). Three-way
@@ -49,11 +48,13 @@ fact.k AND ...)` executes against the ADR 008 substrate.
 ## Scale boundary
 
 **Primary:** frontend planner. ADR 009 is the first ADR to
-exercise this boundary. The change is contained to
+exercise this boundary. The contract change is contained to
 `crates/toron/src/sql_planner.rs` (`SqlPlanner::lower_select` and a
 private two-scope classifier helper) and the bound `LogicalPlan`
-it produces. Nothing below the planner moves: not the binder
-contract, not the executor, not the fragmenter, not the wire.
+it produces. One binder qualifier helper mirrors ADR 008
+semi/anti output scope for chained rewrites; the binder semantic
+contract does not move. The executor, fragmenter, and wire do not
+move.
 
 **Secondary:** none. ADR 009 produces a `LogicalPlan::Join` that
 is structurally identical to one the SQL planner already emits for

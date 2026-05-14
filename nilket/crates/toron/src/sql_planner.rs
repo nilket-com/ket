@@ -2,8 +2,9 @@ use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue};
 use sqlparser::ast::{
-	BinaryOperator, Expr as SqlExpr, FunctionArg, JoinConstraint, JoinOperator, ObjectName, Query,
-	Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value,
+	BinaryOperator, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint,
+	JoinOperator, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
+	TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -81,13 +82,9 @@ impl SqlPlanner {
 			};
 		}
 
-		// 2. Handle WHERE (Filter)
+		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation)
 		if let Some(selection) = &select.selection {
-			let predicate = self.lower_expr(selection)?;
-			plan = LogicalPlan::Filter {
-				input: Box::new(plan),
-				predicate,
-			};
+			plan = self.lower_where(plan, selection)?;
 		}
 
 		// 3. Handle SELECT list (Project or Aggregate)
@@ -226,6 +223,136 @@ impl SqlPlanner {
 		}
 	}
 
+	fn lower_where(
+		&self,
+		mut plan: LogicalPlan,
+		selection: &SqlExpr,
+	) -> Result<LogicalPlan, FrontendError> {
+		let mut residuals = Vec::new();
+		for conjunct in split_top_level_and(selection) {
+			match strip_nested_sql_expr(conjunct) {
+				SqlExpr::Exists { subquery, negated } => {
+					plan = self.lower_exists_join(plan, subquery, *negated)?;
+				}
+				_ => residuals.push(self.lower_expr(conjunct)?),
+			}
+		}
+
+		if let Some(predicate) = combine_and_exprs(residuals) {
+			plan = LogicalPlan::Filter {
+				input: Box::new(plan),
+				predicate,
+			};
+		}
+
+		Ok(plan)
+	}
+
+	fn lower_exists_join(
+		&self,
+		outer_plan: LogicalPlan,
+		subquery: &Query,
+		negated: bool,
+	) -> Result<LogicalPlan, FrontendError> {
+		validate_exists_query_shape(subquery)?;
+		let SetExpr::Select(select) = &*subquery.body else {
+			return Err(unsupported("unsupported EXISTS subquery body"));
+		};
+		validate_exists_select_shape(select)?;
+		validate_exists_projection(&select.projection)?;
+
+		let table_with_joins = select
+			.from
+			.first()
+			.expect("exists select shape has one FROM item");
+		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation)?;
+		let outer_qualifiers = plan_qualifiers(&outer_plan);
+		let inner_qualifiers = plan_qualifiers(&inner_plan);
+		let mut on = Vec::new();
+		let mut inner_residuals = Vec::new();
+
+		if let Some(selection) = &select.selection {
+			for conjunct in split_top_level_and(selection) {
+				match self.classify_exists_conjunct(
+					conjunct,
+					&outer_qualifiers,
+					&inner_qualifiers,
+				)? {
+					ExistsConjunct::CorrelatedPair { outer, inner } => on.push((outer, inner)),
+					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
+				}
+			}
+		}
+
+		if on.is_empty() {
+			return Err(unsupported("uncorrelated EXISTS is not supported"));
+		}
+
+		if let Some(predicate) = combine_and_exprs(inner_residuals) {
+			inner_plan = LogicalPlan::Filter {
+				input: Box::new(inner_plan),
+				predicate,
+			};
+		}
+
+		let left_key = on.iter().map(|(outer, _)| outer.clone()).collect();
+		let right_key = on.iter().map(|(_, inner)| inner.clone()).collect();
+		Ok(LogicalPlan::Join {
+			left: Box::new(LogicalPlan::Exchange {
+				input: Box::new(outer_plan),
+				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+				key: left_key,
+			}),
+			right: Box::new(LogicalPlan::Exchange {
+				input: Box::new(inner_plan),
+				partition_count: DEFAULT_JOIN_PARTITION_COUNT,
+				key: right_key,
+			}),
+			kind: if negated {
+				JoinKind::LeftAnti
+			} else {
+				JoinKind::LeftSemi
+			},
+			on,
+			strategy: JoinStrategy::HashPartitioned,
+		})
+	}
+
+	fn classify_exists_conjunct(
+		&self,
+		conjunct: &SqlExpr,
+		outer_qualifiers: &[TableRef],
+		inner_qualifiers: &[TableRef],
+	) -> Result<ExistsConjunct, FrontendError> {
+		let conjunct = strip_nested_sql_expr(conjunct);
+		if let SqlExpr::BinaryOp { left, op, right } = conjunct {
+			if *op == BinaryOperator::Eq {
+				let left_column = scoped_column_expr(left, outer_qualifiers, inner_qualifiers)?;
+				let right_column = scoped_column_expr(right, outer_qualifiers, inner_qualifiers)?;
+				match (left_column, right_column) {
+					(Some((ColumnScope::Outer, outer)), Some((ColumnScope::Inner, inner)))
+					| (Some((ColumnScope::Inner, inner)), Some((ColumnScope::Outer, outer))) => {
+						return Ok(ExistsConjunct::CorrelatedPair { outer, inner });
+					}
+					_ => {}
+				}
+			}
+		}
+
+		let mut scope_refs = ScopeRefs::default();
+		collect_scope_refs(
+			conjunct,
+			outer_qualifiers,
+			inner_qualifiers,
+			&mut scope_refs,
+		)?;
+		if scope_refs.outer || scope_refs.unsupported {
+			return Err(unsupported("unsupported EXISTS subquery predicate"));
+		}
+
+		Ok(ExistsConjunct::InnerResidual(self.lower_expr(conjunct)?))
+	}
+
 	fn lower_join_on(&self, expr: &SqlExpr) -> Result<Vec<(Expr, Expr)>, FrontendError> {
 		match expr {
 			SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
@@ -355,6 +482,219 @@ enum JoinSide {
 	Right,
 }
 
+#[derive(Debug)]
+enum ExistsConjunct {
+	CorrelatedPair { outer: Expr, inner: Expr },
+	InnerResidual(Expr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnScope {
+	Outer,
+	Inner,
+}
+
+#[derive(Default)]
+struct ScopeRefs {
+	outer: bool,
+	unsupported: bool,
+}
+
+fn split_top_level_and(expr: &SqlExpr) -> Vec<&SqlExpr> {
+	let expr = strip_nested_sql_expr(expr);
+	match expr {
+		SqlExpr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
+			let mut conjuncts = split_top_level_and(left);
+			conjuncts.extend(split_top_level_and(right));
+			conjuncts
+		}
+		_ => vec![expr],
+	}
+}
+
+fn combine_and_exprs(exprs: Vec<Expr>) -> Option<Expr> {
+	let mut exprs = exprs.into_iter();
+	let first = exprs.next()?;
+	Some(exprs.fold(first, |left, right| {
+		Expr::And(Box::new(left), Box::new(right))
+	}))
+}
+
+fn validate_exists_query_shape(query: &Query) -> Result<(), FrontendError> {
+	if query.with.is_some()
+		|| query.order_by.is_some()
+		|| query.limit.is_some()
+		|| !query.limit_by.is_empty()
+		|| query.offset.is_some()
+		|| query.fetch.is_some()
+		|| !query.locks.is_empty()
+		|| query.for_clause.is_some()
+		|| query.settings.is_some()
+		|| query.format_clause.is_some()
+	{
+		return Err(unsupported("unsupported EXISTS subquery shape"));
+	}
+	Ok(())
+}
+
+fn validate_exists_select_shape(select: &Select) -> Result<(), FrontendError> {
+	if select.distinct.is_some()
+		|| select.top.is_some()
+		|| select.into.is_some()
+		|| select.from.len() != 1
+		|| !select.from[0].joins.is_empty()
+		|| !select.lateral_views.is_empty()
+		|| select.prewhere.is_some()
+		|| !group_by_is_empty(&select.group_by)
+		|| !select.cluster_by.is_empty()
+		|| !select.distribute_by.is_empty()
+		|| !select.sort_by.is_empty()
+		|| select.having.is_some()
+		|| !select.named_window.is_empty()
+		|| select.qualify.is_some()
+		|| select.value_table_mode.is_some()
+		|| select.connect_by.is_some()
+	{
+		return Err(unsupported("unsupported EXISTS subquery shape"));
+	}
+	Ok(())
+}
+
+fn validate_exists_projection(projection: &[SelectItem]) -> Result<(), FrontendError> {
+	for item in projection {
+		match item {
+			SelectItem::Wildcard(_) => {}
+			SelectItem::UnnamedExpr(expr) if exists_projection_expr_supported(expr) => {}
+			_ => return Err(unsupported("unsupported EXISTS subquery projection")),
+		}
+	}
+	Ok(())
+}
+
+fn exists_projection_expr_supported(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(_)
+		| SqlExpr::CompoundIdentifier(_)
+		| SqlExpr::Value(Value::Number(_, _))
+		| SqlExpr::Value(Value::SingleQuotedString(_))
+		| SqlExpr::Value(Value::Boolean(_)) => true,
+		_ => false,
+	}
+}
+
+fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
+	match group_by {
+		GroupByExpr::Expressions(exprs, modifiers) => exprs.is_empty() && modifiers.is_empty(),
+		GroupByExpr::All(_) => false,
+	}
+}
+
+fn strip_nested_sql_expr(expr: &SqlExpr) -> &SqlExpr {
+	match expr {
+		SqlExpr::Nested(inner) => strip_nested_sql_expr(inner),
+		_ => expr,
+	}
+}
+
+fn scoped_column_expr(
+	expr: &SqlExpr,
+	outer_qualifiers: &[TableRef],
+	inner_qualifiers: &[TableRef],
+) -> Result<Option<(ColumnScope, Expr)>, FrontendError> {
+	let Some((qualifier, column)) = sql_column_ref(expr)? else {
+		return Ok(None);
+	};
+	let scope = resolve_column_scope(&qualifier, outer_qualifiers, inner_qualifiers)?;
+	Ok(Some((scope, Expr::qualified_column(qualifier, column))))
+}
+
+fn sql_column_ref(expr: &SqlExpr) -> Result<Option<(TableRef, String)>, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => Ok(Some((
+			TableRef::new(idents[0].value.clone()),
+			idents[1].value.clone(),
+		))),
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+			Err(unsupported("unsupported EXISTS column reference"))
+		}
+		_ => Ok(None),
+	}
+}
+
+fn resolve_column_scope(
+	qualifier: &TableRef,
+	outer_qualifiers: &[TableRef],
+	inner_qualifiers: &[TableRef],
+) -> Result<ColumnScope, FrontendError> {
+	let outer_matches = outer_qualifiers
+		.iter()
+		.filter(|candidate| *candidate == qualifier)
+		.count();
+	let inner_matches = inner_qualifiers
+		.iter()
+		.filter(|candidate| *candidate == qualifier)
+		.count();
+	match (outer_matches, inner_matches) {
+		(1, 0) => Ok(ColumnScope::Outer),
+		(0, 1) => Ok(ColumnScope::Inner),
+		_ => Err(unsupported("unsupported EXISTS column scope")),
+	}
+}
+
+fn collect_scope_refs(
+	expr: &SqlExpr,
+	outer_qualifiers: &[TableRef],
+	inner_qualifiers: &[TableRef],
+	refs: &mut ScopeRefs,
+) -> Result<(), FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => {
+			let Some((qualifier, _)) = sql_column_ref(expr)? else {
+				return Ok(());
+			};
+			match resolve_column_scope(&qualifier, outer_qualifiers, inner_qualifiers) {
+				Ok(ColumnScope::Outer) => refs.outer = true,
+				Ok(ColumnScope::Inner) => {}
+				Err(_) => refs.unsupported = true,
+			}
+		}
+		SqlExpr::Exists { .. } | SqlExpr::Subquery(_) => refs.unsupported = true,
+		SqlExpr::BinaryOp { left, right, .. } => {
+			collect_scope_refs(left, outer_qualifiers, inner_qualifiers, refs)?;
+			collect_scope_refs(right, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
+			collect_scope_refs(inner, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::Function(function) => match &function.args {
+			sqlparser::ast::FunctionArguments::List(list) => {
+				for arg in &list.args {
+					match arg {
+						FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+						| FunctionArg::Named {
+							arg: FunctionArgExpr::Expr(expr),
+							..
+						}
+						| FunctionArg::ExprNamed {
+							arg: FunctionArgExpr::Expr(expr),
+							..
+						} => {
+							collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
+						}
+						FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+						_ => refs.unsupported = true,
+					}
+				}
+			}
+			sqlparser::ast::FunctionArguments::Subquery(_) => refs.unsupported = true,
+			_ => {}
+		},
+		SqlExpr::Value(_) => {}
+		_ => {}
+	}
+	Ok(())
+}
+
 fn alias_plan(plan: LogicalPlan, alias: Option<&TableAlias>) -> LogicalPlan {
 	match alias {
 		Some(alias) => LogicalPlan::Alias {
@@ -373,11 +713,17 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
 		| LogicalPlan::Exchange { input, .. } => plan_qualifiers(input),
-		LogicalPlan::Join { left, right, .. } => {
-			let mut qualifiers = plan_qualifiers(left);
-			qualifiers.extend(plan_qualifiers(right));
-			qualifiers
-		}
+		LogicalPlan::Join {
+			left, right, kind, ..
+		} => match kind {
+			JoinKind::LeftSemi | JoinKind::LeftAnti => plan_qualifiers(left),
+			JoinKind::RightSemi | JoinKind::RightAnti => plan_qualifiers(right),
+			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+				let mut qualifiers = plan_qualifiers(left);
+				qualifiers.extend(plan_qualifiers(right));
+				qualifiers
+			}
+		},
 		LogicalPlan::Scan { .. } => Vec::new(),
 	}
 }
@@ -417,6 +763,82 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn classifier_recognizes_correlated_equi_pair() {
+		let planner = SqlPlanner::new();
+		let classified = planner
+			.classify_exists_conjunct(
+				&parse_selection("SELECT * FROM fact WHERE dim.k = fact.k"),
+				&[TableRef::new("fact")],
+				&[TableRef::new("dim")],
+			)
+			.expect("classify");
+
+		match classified {
+			ExistsConjunct::CorrelatedPair { outer, inner } => {
+				assert_qualified_column(&outer, "fact", "k");
+				assert_qualified_column(&inner, "dim", "k");
+			}
+			ExistsConjunct::InnerResidual(_) => panic!("expected correlated pair"),
+		}
+	}
+
+	#[test]
+	fn classifier_recognizes_inner_only_residual_including_literals() {
+		let planner = SqlPlanner::new();
+		for sql in [
+			"SELECT * FROM fact WHERE dim.active = true",
+			"SELECT * FROM fact WHERE dim.score > 10",
+		] {
+			let classified = planner
+				.classify_exists_conjunct(
+					&parse_selection(sql),
+					&[TableRef::new("fact")],
+					&[TableRef::new("dim")],
+				)
+				.expect("classify residual");
+
+			assert!(
+				matches!(classified, ExistsConjunct::InnerResidual(_)),
+				"{sql}"
+			);
+		}
+	}
+
+	#[test]
+	fn classifier_rejects_outer_only_subquery_predicate() {
+		assert_classifier_rejects("SELECT * FROM fact WHERE fact.flag = true");
+	}
+
+	#[test]
+	fn classifier_rejects_non_equi_and_computed_correlation() {
+		assert_classifier_rejects("SELECT * FROM fact WHERE dim.k > fact.k");
+		assert_classifier_rejects("SELECT * FROM fact WHERE dim.k + 1 = fact.k");
+	}
+
+	#[test]
+	fn classifier_rejects_unqualified_ambiguous_correlation() {
+		assert_classifier_rejects("SELECT * FROM fact WHERE k = fact.k");
+		let planner = SqlPlanner::new();
+		let err = planner
+			.classify_exists_conjunct(
+				&parse_selection("SELECT * FROM fact WHERE t.k = t.k"),
+				&[TableRef::new("t")],
+				&[TableRef::new("t")],
+			)
+			.expect_err("same-table unaliased self-correlation rejects");
+		assert!(err.to_string().contains("unsupported"));
+
+		let err = planner
+			.classify_exists_conjunct(
+				&parse_selection("SELECT * FROM fact WHERE dim.k = fact.k"),
+				&[TableRef::new("fact"), TableRef::new("fact")],
+				&[TableRef::new("dim")],
+			)
+			.expect_err("duplicate outer qualifier rejects");
+		assert!(err.to_string().contains("unsupported"));
+	}
+
+	#[test]
 	fn sql_inner_join_emits_explicit_hash_exchanges() {
 		let plan = SqlPlanner::new()
 			.plan("SELECT * FROM orders INNER JOIN customers ON orders.customer_id = customers.id")
@@ -450,5 +872,37 @@ mod tests {
 			}
 			other => panic!("expected join plan, got {other:?}"),
 		}
+	}
+
+	fn assert_classifier_rejects(sql: &str) {
+		let planner = SqlPlanner::new();
+		let err = planner
+			.classify_exists_conjunct(
+				&parse_selection(sql),
+				&[TableRef::new("fact")],
+				&[TableRef::new("dim")],
+			)
+			.expect_err("classifier should reject");
+		assert!(err.to_string().contains("unsupported"), "{sql}: {err}");
+	}
+
+	fn parse_selection(sql: &str) -> SqlExpr {
+		let dialect = GenericDialect {};
+		let ast = Parser::parse_sql(&dialect, sql).expect("parse sql");
+		let Statement::Query(query) = ast.into_iter().next().expect("statement") else {
+			panic!("expected query");
+		};
+		let SetExpr::Select(select) = *query.body else {
+			panic!("expected select");
+		};
+		select.selection.expect("selection")
+	}
+
+	fn assert_qualified_column(expr: &Expr, qualifier: &str, name: &str) {
+		let Expr::Column(column) = expr else {
+			panic!("expected column, got {expr:?}");
+		};
+		assert_eq!(column.qualifier.as_ref(), Some(&TableRef::new(qualifier)));
+		assert_eq!(column.name.0, name);
 	}
 }

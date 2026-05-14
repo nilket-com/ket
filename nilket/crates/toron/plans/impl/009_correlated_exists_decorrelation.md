@@ -11,7 +11,7 @@ architecture guards (see "Definition of done").
 
 ## Status
 
-Promoted to `plans/impl/`. Implementation pending.
+Promoted to `plans/impl/` + implemented.
 
 Built across three WIP iteration rounds with the AI Swarm Council
 (`plans/wip/{claude,codex,gemini}_iter_*_adr_009.md`). Three-way
@@ -29,8 +29,10 @@ final convergence reached by iter-2.
   `LogicalPlan::Exchange`. Reused unchanged.
 - `crates/toron/src/binder.rs` — `bind_join`, equi-key validation,
   float-key rejection, exchange-shape validation, non-Inner
-  broadcast rejection. Reused unchanged — the planner does not
-  duplicate these checks.
+  broadcast rejection. Semantic validation reused unchanged — the
+  planner does not duplicate these checks. `collect_qualifiers`
+  mirrors semi/anti output schema so chained decorrelations do not
+  leak prior inner aliases into later join-key binding.
 - `crates/toron/tests/architecture_test.rs` — the ADR 003 / 004 /
   008 guard set. Stays green; no new guard added.
 - `crates/toron/tests/exists_decorrelation_test.rs` — new test
@@ -111,6 +113,45 @@ this doc before code lands:
   conjuncts (two source orders), composition over an explicit
   outer-`FROM` join, and one fixture per out-of-scope shape
   proving rejection. Expected row counts tabulated.
+
+// P0.1: Local `sqlparser` 0.54 exposes correlated existence
+// predicates as `SqlExpr::Exists { subquery, negated }`; `negated`
+// is the `NOT EXISTS` discriminator and `subquery` is the boxed
+// `Query` lowered by `SqlPlanner::lower_exists_join`.
+// P0.2: The supported subquery body is `SetExpr::Select` with one
+// `from` item; `validate_exists_select_shape` rejects joins and
+// SELECT-level clauses such as `DISTINCT`, `GROUP BY`, `HAVING`,
+// `LIMIT`, `ORDER BY`, and `QUALIFY`. The relation is lowered
+// through `lower_table_factor`, so V1 admits only
+// `TableFactor::Table` plus optional alias.
+// P0.3: Outer scope is available after the outer `FROM` and
+// explicit joins are lowered; `lower_exists_join` reads it from
+// `plan_qualifiers(&outer_plan)`. Inner scope is read from the
+// lowered subquery table plan. Semi/anti qualifier collection is
+// narrowed to the preserving side in both planner and binder
+// helpers so chained decorrelations do not leak prior inner
+// aliases.
+// P0.4: All rejected shapes use the existing unsupported frontend
+// path via `unsupported(...)` / `FrontendError::Unsupported`; ADR
+// 009 adds no new error variant and no semantic fallback path.
+// P0.5: The two-scope classifier landed as private
+// `SqlPlanner::classify_exists_conjunct(&SqlExpr, &[TableRef],
+// &[TableRef]) -> Result<ExistsConjunct, FrontendError>`.
+// `ExistsConjunct` has `CorrelatedPair { outer, inner }` and
+// `InnerResidual(Expr)` arms; `Unsupported` is represented by an
+// `Err`. The helper is unit-tested in-module in `src/sql_planner.rs`.
+// P0.6: Subquery projection is validated only for the narrow V1
+// surface and is never lowered or bound. The right-side plan is
+// built solely from the subquery table, optional `InnerResidual`
+// filter, and correlation keys.
+// P0.7: Public fixtures live in
+// `tests/exists_decorrelation_test.rs`: lowering shape for
+// `EXISTS`/`NOT EXISTS`, digest parity with hand-written
+// `LeftSemi`/`LeftAnti`, inner and outer residual placement,
+// duplicate inner matches (`pk` 1, 3, 5), anti/null-key semantics
+// (`pk` 2, 4, 6), multiple source orders, reused inner aliases,
+// explicit outer-join composition, select-list irrelevance, and
+// unsupported-shape rejection.
 
 Phase 0 produces seven `// P0.x:` comments in this doc, then a
 single commit `plan: adr 009 correlated exists decorrelation`.
@@ -383,6 +424,8 @@ git diff --check
   conjunct splitter, `lower_select` conjunct dispatch,
   decorrelation rule, left-deep chaining, plus in-module
   `#[cfg(test)]` classifier unit tests.
+- `crates/toron/src/binder.rs` — qualifier collection narrowed for
+  semi/anti output scope; no new binder semantic check.
 - `crates/toron/tests/exists_decorrelation_test.rs` — new;
   public SQL / end-to-end gates.
 - `crates/toron/tests/distributed_process_test.rs` — one
@@ -395,8 +438,6 @@ git diff --check
 
 - `crates/toron/src/ir.rs` (`JoinKind` / `LogicalPlan` /
   `ExecutionPlan` shapes preserved).
-- `crates/toron/src/binder.rs` (no new semantic check; existing
-  validation reused).
 - `crates/toron/src/exec.rs` (no executor change).
 - `crates/toron/src/distributed/fragment.rs` (no fragmenter
   change; runtime-filter eligibility untouched).

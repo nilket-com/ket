@@ -162,12 +162,12 @@ fn sql_outer_semi_anti_joins_lower_to_join_kind() {
 }
 
 #[test]
-fn sql_exists_predicate_remains_unsupported() {
+fn sql_uncorrelated_exists_predicate_remains_unsupported() {
 	let err = SqlPlanner::new()
 		.plan("SELECT * FROM left_t WHERE EXISTS (SELECT * FROM right_t)")
-		.expect_err("EXISTS stays unsupported");
+		.expect_err("uncorrelated EXISTS stays unsupported");
 
-	assert!(err.to_string().contains("unsupported expression"));
+	assert!(err.to_string().contains("unsupported"));
 }
 
 fn planned_join_kind(sql: &str) -> JoinKind {

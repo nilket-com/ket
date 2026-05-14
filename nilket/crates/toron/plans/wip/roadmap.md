@@ -91,7 +91,7 @@ along with the forward-sequence rewrite.
   Gemini) at iter-3. Bench evidence landed at
   `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
 - **ADR 009 — Correlated `EXISTS` / `NOT EXISTS`
-  Decorrelation.** Promoted; implementation pending.
+  Decorrelation.** Promoted + implemented.
   Frontend-planner surface extension closing the analytical-SQL
   existence-predicate gap left by ADR 008 — `LeftSemi` /
   `LeftAnti` were executable but unreachable from the routine
@@ -109,8 +109,10 @@ along with the forward-sequence rewrite.
   multiple conjuncts; outer residuals commute by ADR 008 schema
   identity; ANSI null semantics delegated to ADR 008. No new IR,
   executor, wire, `TaskFailureKind`, `JoinKind`, `JoinStrategy`,
-  or architecture-guard surface; binder reused unchanged. ADR 009
-  is a V1 ADR, not the post-V1 transition. No bench-results
+  or architecture-guard surface; binder semantic checks reused
+  unchanged, with qualifier collection matching semi/anti output
+  scope for chained rewrites. ADR 009 is a V1 ADR, not the
+  post-V1 transition. No bench-results
   artifact — promotion evidence is digest parity against
   hand-written `LeftSemi` / `LeftAnti` joins. Three-way AI Swarm
   Council convergence (Claude / Codex / Gemini) at iter-2.
@@ -209,7 +211,7 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 009 implementation
+### Next: ADR 010 planning
 
 ADR 009's contract is pinned at
 `plans/adr/009_correlated_exists_decorrelation.md`; the impl plan
@@ -217,7 +219,7 @@ lives at `plans/impl/009_correlated_exists_decorrelation.md`.
 ADR 009 introduces no new operator path — promotion evidence is
 digest parity against hand-written `LeftSemi` / `LeftAnti` joins,
 so there is no bench-results artifact. The next council
-deliverable after ADR 009 implementation is ADR 010 planning.
+deliverable is ADR 010 planning.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
