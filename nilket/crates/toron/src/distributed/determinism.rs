@@ -1,4 +1,7 @@
-use arrow::array::{ArrayRef, UInt64Array};
+use arrow::array::{
+	ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+	Int64Array, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
@@ -75,6 +78,7 @@ pub(crate) fn canonical_normalize_with_batch_rows(
 		SortPolicy::None => concatenated,
 		SortPolicy::FullRowLex => full_row_lex_sort(concatenated)?,
 	};
+	let sorted = canonicalize_null_slots(sorted)?;
 	Ok(reslice_batch(sorted, batch_rows))
 }
 
@@ -120,6 +124,54 @@ fn full_row_lex_sort(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
 		.collect::<Result<Vec<_>, _>>()?;
 
 	RecordBatch::try_new(batch.schema(), sorted_columns)
+}
+
+fn canonicalize_null_slots(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+	if batch
+		.columns()
+		.iter()
+		.all(|column| column.null_count() == 0)
+	{
+		return Ok(batch);
+	}
+	let columns = batch
+		.columns()
+		.iter()
+		.map(canonicalize_array_null_slots)
+		.collect::<Vec<_>>();
+	RecordBatch::try_new(batch.schema(), columns)
+}
+
+fn canonicalize_array_null_slots(array: &ArrayRef) -> ArrayRef {
+	if array.null_count() == 0 {
+		return array.clone();
+	}
+
+	macro_rules! rebuild_primitive {
+		($ty:ty) => {
+			if let Some(values) = array.as_any().downcast_ref::<$ty>() {
+				return Arc::new(<$ty>::from(values.iter().collect::<Vec<_>>())) as ArrayRef;
+			}
+		};
+	}
+
+	rebuild_primitive!(BooleanArray);
+	rebuild_primitive!(Int8Array);
+	rebuild_primitive!(Int16Array);
+	rebuild_primitive!(Int32Array);
+	rebuild_primitive!(Int64Array);
+	rebuild_primitive!(UInt8Array);
+	rebuild_primitive!(UInt16Array);
+	rebuild_primitive!(UInt32Array);
+	rebuild_primitive!(UInt64Array);
+	rebuild_primitive!(Float32Array);
+	rebuild_primitive!(Float64Array);
+
+	if let Some(values) = array.as_any().downcast_ref::<StringArray>() {
+		return Arc::new(StringArray::from(values.iter().collect::<Vec<_>>())) as ArrayRef;
+	}
+
+	array.clone()
 }
 
 fn original_row_position_array(row_count: usize) -> ArrayRef {

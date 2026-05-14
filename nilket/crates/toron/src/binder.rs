@@ -190,7 +190,14 @@ impl<'a> Binder<'a> {
 			right_keys.push(right_key.ordinal);
 		}
 
-		validate_strategy_shape(strategy, &left_plan, &right_plan, &left_keys, &right_keys)?;
+		validate_strategy_shape(
+			kind,
+			strategy,
+			&left_plan,
+			&right_plan,
+			&left_keys,
+			&right_keys,
+		)?;
 
 		Ok(ExecutionPlan::Join {
 			left: Box::new(left_plan),
@@ -199,7 +206,7 @@ impl<'a> Binder<'a> {
 			left_keys,
 			right_keys,
 			strategy,
-			output_schema: join_schema(&left_scope.schema, &right_scope.schema),
+			output_schema: join_schema(kind, &left_scope.schema, &right_scope.schema),
 		})
 	}
 }
@@ -456,6 +463,7 @@ fn validate_join_key_types(
 }
 
 fn validate_strategy_shape(
+	kind: JoinKind,
 	strategy: JoinStrategy,
 	left: &ExecutionPlan,
 	right: &ExecutionPlan,
@@ -483,6 +491,11 @@ fn validate_strategy_shape(
 			}
 		}
 		JoinStrategy::Broadcast => {
+			if kind != JoinKind::Inner {
+				return Err(BindingError::UnsupportedExpression {
+					message: "broadcast join is only supported for INNER joins".to_string(),
+				});
+			}
 			let Some((left_count, _)) = terminal_exchange(left) else {
 				return Err(BindingError::BroadcastBuildSidePlacement);
 			};
@@ -520,14 +533,48 @@ fn exchange_key_ordinals(key: &[ExecutionExpr]) -> Vec<ColumnOrdinal> {
 		.collect()
 }
 
-fn join_schema(left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
-	let fields = left
+pub fn join_schema(kind: JoinKind, left: &SchemaRef, right: &SchemaRef) -> SchemaRef {
+	let fields = match kind {
+		JoinKind::Inner => join_fields(left, right),
+		JoinKind::LeftOuter => left_fields(left)
+			.into_iter()
+			.chain(nullable_fields(right))
+			.collect(),
+		JoinKind::RightOuter => nullable_fields(left)
+			.into_iter()
+			.chain(left_fields(right))
+			.collect(),
+		JoinKind::FullOuter => nullable_fields(left)
+			.into_iter()
+			.chain(nullable_fields(right))
+			.collect(),
+		JoinKind::LeftSemi | JoinKind::LeftAnti => left_fields(left),
+		JoinKind::RightSemi | JoinKind::RightAnti => left_fields(right),
+	};
+	Arc::new(Schema::new(fields))
+}
+
+fn join_fields(left: &SchemaRef, right: &SchemaRef) -> Vec<Field> {
+	left_fields(left)
+		.into_iter()
+		.chain(left_fields(right))
+		.collect()
+}
+
+fn left_fields(schema: &SchemaRef) -> Vec<Field> {
+	schema
 		.fields()
 		.iter()
-		.chain(right.fields().iter())
 		.map(|field| field.as_ref().clone())
-		.collect::<Vec<_>>();
-	Arc::new(Schema::new(fields))
+		.collect()
+}
+
+fn nullable_fields(schema: &SchemaRef) -> Vec<Field> {
+	schema
+		.fields()
+		.iter()
+		.map(|field| field.as_ref().clone().with_nullable(true))
+		.collect()
 }
 
 fn table_name(table: &TableRef) -> String {
@@ -722,11 +769,9 @@ fn optimize_for_required(
 			strategy,
 			output_schema,
 		} => {
-			let left_len = left.schema().fields().len();
-			let right_len = right.schema().fields().len();
 			let (left, _) = optimize_for_required(*left, None)?;
 			let (right, _) = optimize_for_required(*right, None)?;
-			let output_len = left_len + right_len;
+			let output_len = output_schema.fields().len();
 			let output_remap = ordinal_remap(
 				&output_columns(output_len)
 					.iter()

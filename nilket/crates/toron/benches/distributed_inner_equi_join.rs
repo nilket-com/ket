@@ -51,20 +51,23 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let config = BenchConfig::parse();
 	let runtime = Runtime::new()?;
 	for worker_count in &config.workers {
-		for strategy in &config.strategies {
-			for runtime_filters_enabled in &config.runtime_filter_modes {
-				for wendelon_runtime_filters_enabled in &config.wendelon_runtime_filter_modes {
-					let row = runtime.block_on(run_case(
-						*strategy,
-						*worker_count,
-						config.build_rows,
-						config.probe_rows,
-						config.probe_key_domain,
-						config.key_shape,
-						*runtime_filters_enabled,
-						*wendelon_runtime_filters_enabled,
-					))?;
-					print_row(&row, config.quick);
+		for join_kind in &config.join_kinds {
+			for strategy in &config.strategies {
+				for runtime_filters_enabled in &config.runtime_filter_modes {
+					for wendelon_runtime_filters_enabled in &config.wendelon_runtime_filter_modes {
+						let row = runtime.block_on(run_case(
+							*join_kind,
+							*strategy,
+							*worker_count,
+							config.build_rows,
+							config.probe_rows,
+							config.probe_key_domain,
+							config.key_shape,
+							*runtime_filters_enabled,
+							*wendelon_runtime_filters_enabled,
+						))?;
+						print_row(&row, config.quick);
+					}
 				}
 			}
 		}
@@ -115,6 +118,7 @@ struct BenchConfig {
 	build_rows: usize,
 	probe_rows: usize,
 	probe_key_domain: Option<usize>,
+	join_kinds: Vec<JoinKind>,
 	strategies: Vec<BenchStrategy>,
 	key_shape: BenchKeyShape,
 	runtime_filter_modes: Vec<bool>,
@@ -128,11 +132,13 @@ impl BenchConfig {
 		let mut build_rows = DEFAULT_BUILD_ROWS;
 		let mut probe_rows = DEFAULT_PROBE_ROWS;
 		let mut probe_key_domain = None;
+		let mut join_kinds = Vec::new();
 		let mut strategies = vec![BenchStrategy::HashPartitioned, BenchStrategy::Broadcast];
 		let mut key_shape = BenchKeyShape::Single;
 		let mut runtime_filter_modes = vec![true];
 		let mut wendelon_runtime_filter_modes = vec![false];
 		let mut quick = false;
+		let mut strategy_specified = false;
 		for arg in std::env::args().skip(1) {
 			if arg == "--quick" {
 				workers = QUICK_WORKERS.to_vec();
@@ -155,6 +161,7 @@ impl BenchConfig {
 				probe_key_domain =
 					Some(value.parse().expect("--probe-key-domain must be positive"));
 			} else if let Some(value) = arg.strip_prefix("--strategy=") {
+				strategy_specified = true;
 				strategies = value
 					.split(',')
 					.map(|part| match part {
@@ -163,6 +170,8 @@ impl BenchConfig {
 						other => panic!("unknown --strategy entry {other}"),
 					})
 					.collect();
+			} else if let Some(value) = arg.strip_prefix("--kind=") {
+				join_kinds.extend(value.split(',').map(parse_join_kind));
 			} else if arg == "--composite-key" {
 				key_shape = BenchKeyShape::Composite;
 			} else if let Some(value) = arg.strip_prefix("--runtime-filter=") {
@@ -190,11 +199,17 @@ impl BenchConfig {
 				eprintln!("distributed_inner_equi_join ignoring unrecognized arg: {arg}");
 			}
 		}
+		if join_kinds.is_empty() {
+			join_kinds.push(JoinKind::Inner);
+		} else if !strategy_specified && join_kinds.iter().any(|kind| *kind != JoinKind::Inner) {
+			strategies = vec![BenchStrategy::HashPartitioned];
+		}
 		Self {
 			workers,
 			build_rows,
 			probe_rows,
 			probe_key_domain,
+			join_kinds,
 			strategies,
 			key_shape,
 			runtime_filter_modes,
@@ -204,8 +219,36 @@ impl BenchConfig {
 	}
 }
 
+fn parse_join_kind(value: &str) -> JoinKind {
+	match value {
+		"inner" => JoinKind::Inner,
+		"left-outer" | "left_outer" => JoinKind::LeftOuter,
+		"right-outer" | "right_outer" => JoinKind::RightOuter,
+		"full-outer" | "full_outer" => JoinKind::FullOuter,
+		"left-semi" | "left_semi" | "semi" => JoinKind::LeftSemi,
+		"right-semi" | "right_semi" => JoinKind::RightSemi,
+		"left-anti" | "left_anti" | "anti" => JoinKind::LeftAnti,
+		"right-anti" | "right_anti" => JoinKind::RightAnti,
+		other => panic!("unknown --kind entry {other}"),
+	}
+}
+
+fn join_kind_as_str(kind: JoinKind) -> &'static str {
+	match kind {
+		JoinKind::Inner => "inner",
+		JoinKind::LeftOuter => "left_outer",
+		JoinKind::RightOuter => "right_outer",
+		JoinKind::FullOuter => "full_outer",
+		JoinKind::LeftSemi => "left_semi",
+		JoinKind::RightSemi => "right_semi",
+		JoinKind::LeftAnti => "left_anti",
+		JoinKind::RightAnti => "right_anti",
+	}
+}
+
 #[derive(Debug)]
 struct BenchRow {
+	join_kind: JoinKind,
 	strategy: BenchStrategy,
 	key_shape: BenchKeyShape,
 	worker_count: usize,
@@ -250,6 +293,7 @@ struct BenchRow {
 }
 
 async fn run_case(
+	join_kind: JoinKind,
 	strategy: BenchStrategy,
 	worker_count: usize,
 	build_rows: usize,
@@ -280,7 +324,7 @@ async fn run_case(
 	let mut catalog = MockCatalog::new();
 	catalog.register_descriptor(TableId(1), fixture.customers_descriptor.clone())?;
 	catalog.register_descriptor(TableId(2), fixture.orders_descriptor.clone())?;
-	let plan = join_plan(strategy, u32::try_from(worker_count)?, key_shape);
+	let plan = join_plan(join_kind, strategy, u32::try_from(worker_count)?, key_shape);
 	let bound = bind(&plan, &catalog, &PlannerConfig::default()).await?;
 	let stages = fragment_plan(
 		bound,
@@ -330,6 +374,7 @@ async fn run_case(
 	}
 
 	Ok(BenchRow {
+		join_kind,
 		strategy,
 		key_shape,
 		worker_count,
@@ -376,8 +421,9 @@ async fn run_case(
 
 fn print_row(row: &BenchRow, quick: bool) {
 	println!(
-		"adr004_distributed_inner_equi_join,quick={},strategy={},key={},runtime_filter={},wendelon_runtime_filter={},workers={},build_rows={},probe_rows={},probe_key_domain={},stages={},tasks={},shuffle_bytes_published={},broadcast_replicated_bytes={},pulled_shuffle_bytes={},left_shuffle_bytes={},right_shuffle_bytes={},published_shuffle_bytes={},task_wall_ms={:.3},shuffle_pull_decode_ms={:.3},build_ms={:.3},probe_ms={:.3},spill_ms={:.3},output_publish_ms={:.3},task_setup_ms={:.3},batch_encode_ms={:.3},batch_send_ms={:.3},batch_decode_ms={:.3},dispatch_wait_ms={:.3},telemetry_lock_ms={:.3},framework_overhead_ms={:.3},telemetry_build_rows={},telemetry_probe_rows={},matched_rows={},emitted_rows={},emitted_batches={},spill_bytes={},retry_count={},stale_rejection_count={},cancellation_cleanup_count={},result_rows={},digest={},wall_ms={:.3}",
+		"adr004_distributed_inner_equi_join,quick={},kind={},strategy={},key={},runtime_filter={},wendelon_runtime_filter={},workers={},build_rows={},probe_rows={},probe_key_domain={},stages={},tasks={},shuffle_bytes_published={},broadcast_replicated_bytes={},pulled_shuffle_bytes={},left_shuffle_bytes={},right_shuffle_bytes={},published_shuffle_bytes={},task_wall_ms={:.3},shuffle_pull_decode_ms={:.3},build_ms={:.3},probe_ms={:.3},spill_ms={:.3},output_publish_ms={:.3},task_setup_ms={:.3},batch_encode_ms={:.3},batch_send_ms={:.3},batch_decode_ms={:.3},dispatch_wait_ms={:.3},telemetry_lock_ms={:.3},framework_overhead_ms={:.3},telemetry_build_rows={},telemetry_probe_rows={},matched_rows={},emitted_rows={},emitted_batches={},spill_bytes={},retry_count={},stale_rejection_count={},cancellation_cleanup_count={},result_rows={},digest={},wall_ms={:.3}",
 		quick,
+		join_kind_as_str(row.join_kind),
 		row.strategy.as_str(),
 		row.key_shape.as_str(),
 		if row.runtime_filters_enabled {
@@ -904,6 +950,7 @@ impl WorkerRegistry for RoundRobinRegistry {
 }
 
 fn join_plan(
+	kind: JoinKind,
 	strategy: BenchStrategy,
 	partition_count: u32,
 	key_shape: BenchKeyShape,
@@ -942,7 +989,7 @@ fn join_plan(
 	LogicalPlan::Join {
 		left: Box::new(left),
 		right: Box::new(right),
-		kind: JoinKind::Inner,
+		kind,
 		on: join_on(key_shape),
 		strategy: strategy.join_strategy(),
 	}

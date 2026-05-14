@@ -272,6 +272,26 @@ async fn hash_join_producer_process_kill_replays_attempt_and_matches_baseline_di
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_partitioned_promoted_join_kinds_match_single_partition_digest() {
+	for (index, kind) in [
+		JoinKind::LeftOuter,
+		JoinKind::FullOuter,
+		JoinKind::LeftSemi,
+		JoinKind::LeftAnti,
+	]
+	.into_iter()
+	.enumerate()
+	{
+		let base = 1_200 + (index as u128 * 10);
+		let baseline = run_hash_join_kind_process_query(base, kind, 1, 0).await;
+		let distributed = run_hash_join_kind_process_query(base + 4, kind, 2, 1).await;
+
+		assert_eq!(distributed.row_count, baseline.row_count, "{kind:?}");
+		assert_eq!(distributed.digest, baseline.digest, "{kind:?}");
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
 	let baseline = run_broadcast_join_process_query(800).await;
 	let killed = run_broadcast_join_build_kill_query(900).await;
@@ -345,6 +365,15 @@ async fn run_process_query(worker_id_base: u128, start_offset: usize) -> Process
 }
 
 async fn run_hash_join_process_query(worker_id_base: u128, start_offset: usize) -> JoinProcessRun {
+	run_hash_join_kind_process_query(worker_id_base, JoinKind::Inner, 2, start_offset).await
+}
+
+async fn run_hash_join_kind_process_query(
+	worker_id_base: u128,
+	kind: JoinKind,
+	partition_count: u32,
+	start_offset: usize,
+) -> JoinProcessRun {
 	let mut workers = vec![
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
@@ -363,7 +392,10 @@ async fn run_hash_join_process_query(worker_id_base: u128, start_offset: usize) 
 	);
 
 	let results = coordinator
-		.execute_query(&hash_join_plan())
+		.execute_query(&hash_join_plan_with_partitions_and_kind(
+			partition_count,
+			kind,
+		))
 		.await
 		.expect("hash join query");
 	let run = join_process_run(results, registry.selected_workers());
@@ -698,6 +730,10 @@ fn hash_join_plan() -> LogicalPlan {
 }
 
 fn hash_join_plan_with_partitions(partition_count: u32) -> LogicalPlan {
+	hash_join_plan_with_partitions_and_kind(partition_count, JoinKind::Inner)
+}
+
+fn hash_join_plan_with_partitions_and_kind(partition_count: u32, kind: JoinKind) -> LogicalPlan {
 	LogicalPlan::Join {
 		left: Box::new(LogicalPlan::Exchange {
 			partition_count,
@@ -718,7 +754,7 @@ fn hash_join_plan_with_partitions(partition_count: u32) -> LogicalPlan {
 				projection: None,
 			}),
 		}),
-		kind: JoinKind::Inner,
+		kind,
 		on: vec![(
 			Expr::qualified_column(TableRef::new("orders"), "customer_id"),
 			Expr::qualified_column(TableRef::new("customers"), "id"),

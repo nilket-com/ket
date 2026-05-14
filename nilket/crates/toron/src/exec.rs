@@ -566,7 +566,7 @@ impl Executor {
 				} => {
 					let left_batches = self.execute_bound(left, morsel).await?;
 					let right_batches = self.execute_bound(right, morsel).await?;
-					execute_inner_join(
+					execute_hash_join(
 						left.schema(),
 						right.schema(),
 						&left_batches,
@@ -1218,7 +1218,7 @@ fn record_task_telemetry(
 	}
 }
 
-async fn execute_inner_join(
+async fn execute_hash_join(
 	left_schema: arrow::datatypes::SchemaRef,
 	right_schema: arrow::datatypes::SchemaRef,
 	left_batches: &[RecordBatch],
@@ -1232,9 +1232,6 @@ async fn execute_inner_join(
 	spill_file_ops: Arc<dyn AsyncFileOps>,
 	spill_dir: PathBuf,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
-	match kind {
-		JoinKind::Inner => {}
-	}
 	if left_keys.len() != right_keys.len() {
 		return Err(ExecutionError::InvalidExpression {
 			message: "join key arity mismatch".to_string(),
@@ -1259,7 +1256,8 @@ async fn execute_inner_join(
 	if estimated_build_hash_bytes(&left_key_arrays, left_batch.num_rows())
 		> task_budget.memory.get()
 	{
-		return execute_spilled_inner_join(
+		return execute_spilled_hash_join(
+			kind,
 			&left_batch,
 			&right_batch,
 			&left_key_arrays,
@@ -1283,7 +1281,8 @@ async fn execute_inner_join(
 		task_budget.memory.get(),
 	)?
 	else {
-		return execute_spilled_inner_join(
+		return execute_spilled_hash_join(
+			kind,
 			&left_batch,
 			&right_batch,
 			&left_key_arrays,
@@ -1304,9 +1303,11 @@ async fn execute_inner_join(
 	});
 
 	let probe_started = Instant::now();
-	let (left_indices, right_indices) = probe_in_memory_join_rows(
+	let selection = probe_in_memory_join_rows(
+		kind,
 		join_key_plan,
 		&build_rows,
+		left_batch.num_rows(),
 		&right_key_arrays,
 		right_batch.num_rows(),
 	)?;
@@ -1318,28 +1319,112 @@ async fn execute_inner_join(
 		task.counters.matched_rows = task
 			.counters
 			.matched_rows
-			.saturating_add(left_indices.len() as u64);
+			.saturating_add(selection.len() as u64);
 	});
 
-	if left_indices.is_empty() {
-		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
-	}
-
-	let left_indices = UInt32Array::from(left_indices);
-	let right_indices = UInt32Array::from(right_indices);
-	let mut output_columns =
-		Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
-	for column in left_batch.columns() {
-		output_columns.push(arrow::compute::take(column, &left_indices, None)?);
-	}
-	for column in right_batch.columns() {
-		output_columns.push(arrow::compute::take(column, &right_indices, None)?);
-	}
-
-	Ok(vec![RecordBatch::try_new(
-		output_schema.clone(),
-		output_columns,
+	Ok(vec![materialize_join_selection(
+		kind,
+		&left_batch,
+		&right_batch,
+		&selection,
+		output_schema,
 	)?])
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinOutputRow {
+	Paired { left: u32, right: u32 },
+	LeftFillNull { left: u32 },
+	RightFillNull { right: u32 },
+	LeftPreserved { left: u32 },
+	RightPreserved { right: u32 },
+}
+
+fn materialize_join_selection(
+	kind: JoinKind,
+	left_batch: &RecordBatch,
+	right_batch: &RecordBatch,
+	selection: &[JoinOutputRow],
+	output_schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch, ExecutionError> {
+	if selection.is_empty() {
+		return Ok(RecordBatch::new_empty(output_schema.clone()));
+	}
+
+	let output_columns = match kind {
+		JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+			let mut left_indices = Vec::with_capacity(selection.len());
+			let mut right_indices = Vec::with_capacity(selection.len());
+			for row in selection {
+				match *row {
+					JoinOutputRow::Paired { left, right } => {
+						left_indices.push(Some(left));
+						right_indices.push(Some(right));
+					}
+					JoinOutputRow::LeftFillNull { left } => {
+						left_indices.push(Some(left));
+						right_indices.push(None);
+					}
+					JoinOutputRow::RightFillNull { right } => {
+						left_indices.push(None);
+						right_indices.push(Some(right));
+					}
+					JoinOutputRow::LeftPreserved { .. } | JoinOutputRow::RightPreserved { .. } => {
+						return Err(invalid_join_selection(kind, row));
+					}
+				}
+			}
+			let left_indices = UInt32Array::from(left_indices);
+			let right_indices = UInt32Array::from(right_indices);
+			let mut columns =
+				Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
+			for column in left_batch.columns() {
+				columns.push(arrow::compute::take(column, &left_indices, None)?);
+			}
+			for column in right_batch.columns() {
+				columns.push(arrow::compute::take(column, &right_indices, None)?);
+			}
+			columns
+		}
+		JoinKind::LeftSemi | JoinKind::LeftAnti => {
+			let mut left_indices = Vec::with_capacity(selection.len());
+			for row in selection {
+				match *row {
+					JoinOutputRow::LeftPreserved { left } => left_indices.push(Some(left)),
+					_ => return Err(invalid_join_selection(kind, row)),
+				}
+			}
+			let left_indices = UInt32Array::from(left_indices);
+			let mut columns = Vec::with_capacity(left_batch.num_columns());
+			for column in left_batch.columns() {
+				columns.push(arrow::compute::take(column, &left_indices, None)?);
+			}
+			columns
+		}
+		JoinKind::RightSemi | JoinKind::RightAnti => {
+			let mut right_indices = Vec::with_capacity(selection.len());
+			for row in selection {
+				match *row {
+					JoinOutputRow::RightPreserved { right } => right_indices.push(Some(right)),
+					_ => return Err(invalid_join_selection(kind, row)),
+				}
+			}
+			let right_indices = UInt32Array::from(right_indices);
+			let mut columns = Vec::with_capacity(right_batch.num_columns());
+			for column in right_batch.columns() {
+				columns.push(arrow::compute::take(column, &right_indices, None)?);
+			}
+			columns
+		}
+	};
+
+	Ok(RecordBatch::try_new(output_schema.clone(), output_columns)?)
+}
+
+fn invalid_join_selection(kind: JoinKind, row: &JoinOutputRow) -> ExecutionError {
+	ExecutionError::Kernel {
+		message: format!("invalid {kind:?} join selection row: {row:?}"),
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1478,24 +1563,38 @@ fn build_in_memory_join_rows(
 }
 
 fn probe_in_memory_join_rows(
+	kind: JoinKind,
 	join_key_plan: JoinKeyPlan,
 	build_rows: &HashMap<JoinKey, BuildRowList>,
+	left_rows: usize,
 	right_key_arrays: &[ArrayRef],
 	rows: usize,
-) -> Result<(Vec<u32>, Vec<u32>), ExecutionError> {
-	let mut left_indices = Vec::new();
-	let mut right_indices = Vec::new();
+) -> Result<Vec<JoinOutputRow>, ExecutionError> {
+	let mut selection = Vec::new();
+	let mut matched_build_rows = build_match_bitmap(kind, left_rows);
 
 	match join_key_plan {
 		JoinKeyPlan::Int32 => {
 			let values = single_join_key_array::<Int32Array>(right_key_arrays, "Int32")?;
 			for row in 0..rows {
 				if values.is_null(row) {
-					continue;
-				}
-				let key = JoinKey::Int32(values.value(row));
-				if let Some(matches) = build_rows.get(&key) {
-					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+					append_unmatched_probe_row(kind, row, &mut selection)?;
+				} else {
+					let key = JoinKey::Int32(values.value(row));
+					let matched = if let Some(matches) = build_rows.get(&key) {
+						append_join_matches_for_kind(
+							kind,
+							row,
+							matches.rows(),
+							matched_build_rows.as_deref_mut(),
+							&mut selection,
+						)?
+					} else {
+						false
+					};
+					if !matched {
+						append_unmatched_probe_row(kind, row, &mut selection)?;
+					}
 				}
 			}
 		}
@@ -1503,28 +1602,59 @@ fn probe_in_memory_join_rows(
 			let values = single_join_key_array::<Int64Array>(right_key_arrays, "Int64")?;
 			for row in 0..rows {
 				if values.is_null(row) {
-					continue;
-				}
-				let key = JoinKey::Int64(values.value(row));
-				if let Some(matches) = build_rows.get(&key) {
-					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+					append_unmatched_probe_row(kind, row, &mut selection)?;
+				} else {
+					let key = JoinKey::Int64(values.value(row));
+					let matched = if let Some(matches) = build_rows.get(&key) {
+						append_join_matches_for_kind(
+							kind,
+							row,
+							matches.rows(),
+							matched_build_rows.as_deref_mut(),
+							&mut selection,
+						)?
+					} else {
+						false
+					};
+					if !matched {
+						append_unmatched_probe_row(kind, row, &mut selection)?;
+					}
 				}
 			}
 		}
 		JoinKeyPlan::Generic => {
 			for row in 0..rows {
 				let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+					append_unmatched_probe_row(kind, row, &mut selection)?;
 					continue;
 				};
 				let key = JoinKey::Generic(key);
-				if let Some(matches) = build_rows.get(&key) {
-					append_join_matches(row, matches, &mut left_indices, &mut right_indices)?;
+				let matched = if let Some(matches) = build_rows.get(&key) {
+					append_join_matches_for_kind(
+						kind,
+						row,
+						matches.rows(),
+						matched_build_rows.as_deref_mut(),
+						&mut selection,
+					)?
+				} else {
+					false
+				};
+				if !matched {
+					append_unmatched_probe_row(kind, row, &mut selection)?;
 				}
 			}
 		}
 	}
 
-	Ok((left_indices, right_indices))
+	append_build_side_after_probe_rows(
+		kind,
+		left_rows,
+		matched_build_rows.as_deref(),
+		&mut selection,
+	)?;
+
+	Ok(selection)
 }
 
 fn single_join_key_array<'a, T: 'static>(
@@ -1548,20 +1678,116 @@ fn insert_join_build_row(build_rows: &mut HashMap<JoinKey, BuildRowList>, key: J
 	}
 }
 
-fn append_join_matches(
+fn append_join_matches_for_kind(
+	kind: JoinKind,
 	probe_row: usize,
-	matches: &BuildRowList,
-	left_indices: &mut Vec<u32>,
-	right_indices: &mut Vec<u32>,
+	matches: impl Iterator<Item = u32>,
+	mut matched_build_rows: Option<&mut [u64]>,
+	selection: &mut Vec<JoinOutputRow>,
+) -> Result<bool, ExecutionError> {
+	let right_index = join_probe_row_index(probe_row)?;
+	let mut matched = false;
+	for left_index in matches {
+		matched = true;
+		if let Some(bitmap) = matched_build_rows.as_deref_mut() {
+			set_build_row_matched(bitmap, left_index);
+		}
+		match kind {
+			JoinKind::Inner | JoinKind::LeftOuter | JoinKind::RightOuter | JoinKind::FullOuter => {
+				selection.push(JoinOutputRow::Paired {
+					left: left_index,
+					right: right_index,
+				})
+			}
+			JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti => {
+			}
+		}
+	}
+	if matched && kind == JoinKind::RightSemi {
+		selection.push(JoinOutputRow::RightPreserved { right: right_index });
+	}
+	Ok(matched)
+}
+
+fn append_unmatched_probe_row(
+	kind: JoinKind,
+	probe_row: usize,
+	selection: &mut Vec<JoinOutputRow>,
 ) -> Result<(), ExecutionError> {
-	let right_index = u32::try_from(probe_row).map_err(|_| ExecutionError::Kernel {
-		message: "join probe row index exceeds UInt32 take index".to_string(),
-	})?;
-	for left_index in matches.rows() {
-		left_indices.push(left_index);
-		right_indices.push(right_index);
+	let right_index = join_probe_row_index(probe_row)?;
+	match kind {
+		JoinKind::RightOuter | JoinKind::FullOuter => {
+			selection.push(JoinOutputRow::RightFillNull { right: right_index });
+		}
+		JoinKind::RightAnti => {
+			selection.push(JoinOutputRow::RightPreserved { right: right_index });
+		}
+		JoinKind::Inner
+		| JoinKind::LeftOuter
+		| JoinKind::LeftSemi
+		| JoinKind::RightSemi
+		| JoinKind::LeftAnti => {}
 	}
 	Ok(())
+}
+
+fn append_build_side_after_probe_rows(
+	kind: JoinKind,
+	left_rows: usize,
+	matched_build_rows: Option<&[u64]>,
+	selection: &mut Vec<JoinOutputRow>,
+) -> Result<(), ExecutionError> {
+	let Some(bitmap) = matched_build_rows else {
+		return Ok(());
+	};
+	for row in 0..left_rows {
+		let matched = build_row_matched(bitmap, row);
+		match kind {
+			JoinKind::LeftOuter | JoinKind::FullOuter if !matched => {
+				selection.push(JoinOutputRow::LeftFillNull {
+					left: join_build_row_index(row)?,
+				});
+			}
+			JoinKind::LeftSemi if matched => {
+				selection.push(JoinOutputRow::LeftPreserved {
+					left: join_build_row_index(row)?,
+				});
+			}
+			JoinKind::LeftAnti if !matched => {
+				selection.push(JoinOutputRow::LeftPreserved {
+					left: join_build_row_index(row)?,
+				});
+			}
+			_ => {}
+		}
+	}
+	Ok(())
+}
+
+fn build_match_bitmap(kind: JoinKind, rows: usize) -> Option<Vec<u64>> {
+	match kind {
+		JoinKind::LeftOuter | JoinKind::FullOuter | JoinKind::LeftSemi | JoinKind::LeftAnti => {
+			Some(vec![0; rows.div_ceil(64)])
+		}
+		JoinKind::Inner | JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => None,
+	}
+}
+
+fn set_build_row_matched(bitmap: &mut [u64], row: u32) {
+	let row = row as usize;
+	let word = row / 64;
+	let bit = row % 64;
+	if let Some(slot) = bitmap.get_mut(word) {
+		*slot |= 1u64 << bit;
+	}
+}
+
+fn build_row_matched(bitmap: &[u64], row: usize) -> bool {
+	let word = row / 64;
+	let bit = row % 64;
+	bitmap
+		.get(word)
+		.is_some_and(|slot| (*slot & (1u64 << bit)) != 0)
 }
 
 fn join_build_row_index(row: usize) -> Result<u32, ExecutionError> {
@@ -1570,11 +1796,18 @@ fn join_build_row_index(row: usize) -> Result<u32, ExecutionError> {
 	})
 }
 
+fn join_probe_row_index(row: usize) -> Result<u32, ExecutionError> {
+	u32::try_from(row).map_err(|_| ExecutionError::Kernel {
+		message: "join probe row index exceeds UInt32 take index".to_string(),
+	})
+}
+
 fn join_build_memory_fits(key_arrays: &[ArrayRef], rows: usize, memory_cap: u64) -> bool {
 	estimated_build_hash_bytes(key_arrays, rows) <= memory_cap
 }
 
-async fn execute_spilled_inner_join(
+async fn execute_spilled_hash_join(
+	kind: JoinKind,
 	left_batch: &RecordBatch,
 	right_batch: &RecordBatch,
 	left_key_arrays: &[ArrayRef],
@@ -1605,7 +1838,23 @@ async fn execute_spilled_inner_join(
 			.saturating_add(duration_micros(build_started));
 	});
 	if build_rows.is_empty() {
-		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
+		let mut selection = Vec::new();
+		for row in 0..right_batch.num_rows() {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
+		}
+		append_build_side_after_probe_rows(
+			kind,
+			left_batch.num_rows(),
+			build_match_bitmap(kind, left_batch.num_rows()).as_deref(),
+			&mut selection,
+		)?;
+		return Ok(vec![materialize_join_selection(
+			kind,
+			left_batch,
+			right_batch,
+			&selection,
+			output_schema,
+		)?]);
 	}
 
 	let spill_started = Instant::now();
@@ -1622,7 +1871,8 @@ async fn execute_spilled_inner_join(
 			.saturating_add(spilled.spill_bytes());
 	});
 	let probe_started = Instant::now();
-	let result = probe_spilled_inner_join(
+	let result = probe_spilled_hash_join(
+		kind,
 		&mut spilled,
 		right_batch,
 		right_key_arrays,
@@ -1647,50 +1897,46 @@ async fn execute_spilled_inner_join(
 	result
 }
 
-async fn probe_spilled_inner_join(
+async fn probe_spilled_hash_join(
+	kind: JoinKind,
 	spilled: &mut SpilledJoinBuild,
 	right_batch: &RecordBatch,
 	right_key_arrays: &[ArrayRef],
 	left_batch: &RecordBatch,
 	output_schema: &arrow::datatypes::SchemaRef,
 ) -> Result<Vec<RecordBatch>, ExecutionError> {
-	let mut left_indices = Vec::new();
-	let mut right_indices = Vec::new();
+	let mut selection = Vec::new();
+	let mut matched_build_rows = build_match_bitmap(kind, left_batch.num_rows());
 	for row in 0..right_batch.num_rows() {
 		let Some(key) = join_key_bytes(right_key_arrays, row)? else {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
 			continue;
 		};
 		let matches = spilled.lookup(&key).await?;
-		if matches.is_empty() {
-			continue;
+		let matched = append_join_matches_for_kind(
+			kind,
+			row,
+			matches.into_iter(),
+			matched_build_rows.as_deref_mut(),
+			&mut selection,
+		)?;
+		if !matched {
+			append_unmatched_probe_row(kind, row, &mut selection)?;
 		}
-		let right_index = u32::try_from(row).map_err(|_| ExecutionError::Kernel {
-			message: "join probe row index exceeds UInt32 take index".to_string(),
-		})?;
-		for left_index in matches {
-			left_indices.push(left_index);
-			right_indices.push(right_index);
-		}
 	}
+	append_build_side_after_probe_rows(
+		kind,
+		left_batch.num_rows(),
+		matched_build_rows.as_deref(),
+		&mut selection,
+	)?;
 
-	if left_indices.is_empty() {
-		return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
-	}
-
-	let left_indices = UInt32Array::from(left_indices);
-	let right_indices = UInt32Array::from(right_indices);
-	let mut output_columns =
-		Vec::with_capacity(left_batch.num_columns() + right_batch.num_columns());
-	for column in left_batch.columns() {
-		output_columns.push(arrow::compute::take(column, &left_indices, None)?);
-	}
-	for column in right_batch.columns() {
-		output_columns.push(arrow::compute::take(column, &right_indices, None)?);
-	}
-
-	Ok(vec![RecordBatch::try_new(
-		output_schema.clone(),
-		output_columns,
+	Ok(vec![materialize_join_selection(
+		kind,
+		left_batch,
+		right_batch,
+		&selection,
+		output_schema,
 	)?])
 }
 

@@ -62,13 +62,7 @@ impl SqlPlanner {
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
 			let right = self.lower_table_factor(&join.relation)?;
-			let on = match &join.join_operator {
-				JoinOperator::Inner(JoinConstraint::On(expr)) => self.lower_join_on(expr)?,
-				JoinOperator::Inner(_) => {
-					return Err(unsupported("INNER JOIN requires ON equality predicates"));
-				}
-				_ => return Err(unsupported("only INNER JOIN ... ON is supported")),
-			};
+			let (kind, on) = self.lower_join_operator(&join.join_operator)?;
 			let (left_keys, right_keys) = self.join_exchange_keys(&on, &plan, &right)?;
 			plan = LogicalPlan::Join {
 				left: Box::new(LogicalPlan::Exchange {
@@ -81,7 +75,7 @@ impl SqlPlanner {
 					partition_count: DEFAULT_JOIN_PARTITION_COUNT,
 					key: right_keys,
 				}),
-				kind: JoinKind::Inner,
+				kind,
 				on,
 				strategy: JoinStrategy::HashPartitioned,
 			};
@@ -179,6 +173,36 @@ impl SqlPlanner {
 			input: Box::new(plan),
 			exprs,
 		})
+	}
+
+	fn lower_join_operator(
+		&self,
+		operator: &JoinOperator,
+	) -> Result<(JoinKind, Vec<(Expr, Expr)>), FrontendError> {
+		let (kind, constraint) = match operator {
+			JoinOperator::Inner(constraint) => (JoinKind::Inner, constraint),
+			JoinOperator::LeftOuter(constraint) => (JoinKind::LeftOuter, constraint),
+			JoinOperator::RightOuter(constraint) => (JoinKind::RightOuter, constraint),
+			JoinOperator::FullOuter(constraint) => (JoinKind::FullOuter, constraint),
+			JoinOperator::Semi(constraint) | JoinOperator::LeftSemi(constraint) => {
+				(JoinKind::LeftSemi, constraint)
+			}
+			JoinOperator::RightSemi(constraint) => (JoinKind::RightSemi, constraint),
+			JoinOperator::Anti(constraint) | JoinOperator::LeftAnti(constraint) => {
+				(JoinKind::LeftAnti, constraint)
+			}
+			JoinOperator::RightAnti(constraint) => (JoinKind::RightAnti, constraint),
+			_ => {
+				return Err(unsupported(
+					"only INNER/OUTER/SEMI/ANTI JOIN ... ON is supported",
+				));
+			}
+		};
+
+		match constraint {
+			JoinConstraint::On(expr) => Ok((kind, self.lower_join_on(expr)?)),
+			_ => Err(unsupported("JOIN requires ON equality predicates")),
+		}
 	}
 
 	fn lower_arg(&self, arg: &FunctionArg) -> Result<Expr, FrontendError> {

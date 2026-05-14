@@ -69,8 +69,8 @@ along with the forward-sequence rewrite.
   if sandbox errors cross the task boundary. Selected via the iter-3 ADR 007
   topics convergence on Codex's four-path selection rule
   ("V1 exposes user-supplied Rune -> L-2 Rune sandbox").
-- **ADR 008 — Outer / Semi / Anti Joins.** Promoted;
-  implementation pending. Operator-level surface extension
+- **ADR 008 — Outer / Semi / Anti Joins.** Promoted +
+  implemented. Operator-level surface extension
   closing the analytical-SQL "join width gap" left by ADR 004
   (inner-only). `JoinKind` extends from 1 variant to 8 (`Inner`
   plus `LeftOuter` / `RightOuter` / `FullOuter` / `LeftSemi` /
@@ -88,8 +88,8 @@ along with the forward-sequence rewrite.
   single-variant. Mixed old/new binary support explicitly not
   promised — single workspace bump, full-fleet upgrade.
   Three-way AI Swarm Council convergence (Claude / Codex /
-  Gemini) at iter-3. Bench-results artifact pending Phase 6
-  at `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
+  Gemini) at iter-3. Bench evidence landed at
+  `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -168,14 +168,13 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 008 implementation, then ADR 009 planning
+### Next: ADR 009 planning
 
 ADR 008's contract is pinned at
 `plans/adr/008_outer_semi_anti_joins.md`; the impl plan lives at
-`plans/impl/008_outer_semi_anti_joins.md`; implementation
-pending. The next council deliverable is ADR 008 implementation
-(Phase 0 audit → Phases 1-6 per the impl plan), then ADR 009
-planning once the post-ADR-008 bench artifact lands.
+`plans/impl/008_outer_semi_anti_joins.md`; bench evidence lives at
+`plans/impl/008_outer_semi_anti_joins_bench_results.md`. The next
+council deliverable is ADR 009 planning.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
@@ -183,10 +182,10 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 009 selection waits on (a) ADR 008's per-kind quick-row
-bench matrix exposing any operator-level evidence shifts, and
-(b) the ADR 006 Wendelon row arrival. Until those land, the
-candidate ordering below reflects the post-ADR-008 landscape.
+ADR 009 selection now waits on the ADR 006 Wendelon row arrival
+and any follow-up evidence from ADR 008's per-kind quick-row
+matrix. Until those land, the candidate ordering below reflects
+the post-ADR-008 landscape.
 
 ### ADR 009 candidates (post-ADR-008 reordered)
 

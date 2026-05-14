@@ -55,6 +55,8 @@ pub enum FragmentError {
 	MissingScanMetadata,
 	#[error("join input must terminate in an explicit exchange")]
 	JoinInputNotExchanged,
+	#[error("broadcast strategy is only supported for INNER joins; observed {kind:?}")]
+	BroadcastNonInner { kind: JoinKind },
 	#[error("broadcast build input must terminate in a single-partition exchange")]
 	BroadcastBuildNotPublished,
 }
@@ -280,6 +282,9 @@ fn fragment_broadcast_join_plan(
 	join: JoinBoundary,
 	config: FragmentPlanConfig,
 ) -> Result<Vec<StagePlan>, FragmentError> {
+	if join.kind != JoinKind::Inner {
+		return Err(FragmentError::BroadcastNonInner { kind: join.kind });
+	}
 	let build_boundary = extract_exchange(*join.left)?;
 	if build_boundary.partition_count != 1 {
 		return Err(FragmentError::BroadcastBuildNotPublished);
@@ -939,6 +944,34 @@ mod tests {
 	}
 
 	#[test]
+	fn runtime_filter_eligible_false_for_every_non_inner_kind() {
+		for kind in [
+			JoinKind::LeftOuter,
+			JoinKind::RightOuter,
+			JoinKind::FullOuter,
+			JoinKind::LeftSemi,
+			JoinKind::RightSemi,
+			JoinKind::LeftAnti,
+			JoinKind::RightAnti,
+		] {
+			let plan = join_plan_with_kind(
+				exchanged_scan(TableId(1), 2),
+				exchanged_scan(TableId(2), 2),
+				JoinStrategy::HashPartitioned,
+				kind,
+			);
+
+			let stages = fragment_plan(plan, config()).expect("fragment hash join");
+
+			assert!(stages[1].upstream_stages.is_empty(), "{kind:?}");
+			assert_eq!(
+				stages[2].upstream_stages,
+				vec![StageId::new(0), StageId::new(1)]
+			);
+		}
+	}
+
+	#[test]
 	fn broadcast_join_fragments_to_build_publish_and_scan_share_consumers() {
 		let plan = join_plan(
 			exchanged_scan(TableId(1), 1),
@@ -976,6 +1009,23 @@ mod tests {
 					&& *partition_id == PartitionId::new(0)
 			));
 		}
+	}
+
+	#[test]
+	fn broadcast_non_inner_join_is_rejected_by_fragmenter() {
+		let plan = join_plan_with_kind(
+			exchanged_scan(TableId(1), 1),
+			scan_plan_with_table(TableId(2), 2),
+			JoinStrategy::Broadcast,
+			JoinKind::LeftOuter,
+		);
+
+		assert_eq!(
+			fragment_plan(plan, config().with_worker_count(3)).expect_err("reject broadcast"),
+			FragmentError::BroadcastNonInner {
+				kind: JoinKind::LeftOuter
+			}
+		);
 	}
 
 	fn config() -> FragmentPlanConfig {
@@ -1048,10 +1098,19 @@ mod tests {
 		right: ExecutionPlan,
 		strategy: JoinStrategy,
 	) -> ExecutionPlan {
+		join_plan_with_kind(left, right, strategy, JoinKind::Inner)
+	}
+
+	fn join_plan_with_kind(
+		left: ExecutionPlan,
+		right: ExecutionPlan,
+		strategy: JoinStrategy,
+		kind: JoinKind,
+	) -> ExecutionPlan {
 		ExecutionPlan::Join {
 			left: Box::new(left),
 			right: Box::new(right),
-			kind: JoinKind::Inner,
+			kind,
 			left_keys: vec![ColumnOrdinal(0)],
 			right_keys: vec![ColumnOrdinal(0)],
 			strategy,

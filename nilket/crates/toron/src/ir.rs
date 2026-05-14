@@ -116,6 +116,13 @@ pub enum AggregateFunction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKind {
 	Inner,
+	LeftOuter,
+	RightOuter,
+	FullOuter,
+	LeftSemi,
+	RightSemi,
+	LeftAnti,
+	RightAnti,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -405,13 +405,46 @@ fn g17_join_ir_surface_has_single_join_variant_and_two_strategies() {
 		.expect("ExecutionPlan block");
 	let logical_source =
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR");
+	let join_kind = logical_source
+		.split("pub enum JoinKind")
+		.nth(1)
+		.and_then(|rest| rest.split("pub enum JoinStrategy").next())
+		.expect("JoinKind block");
 	let join_strategy = logical_source
 		.split("pub enum JoinStrategy")
 		.nth(1)
 		.and_then(|rest| rest.split("pub enum LogicalPlan").next())
 		.expect("JoinStrategy block");
+	let logical_plan = logical_source
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.expect("LogicalPlan block");
+	let join_kind_variants = join_kind
+		.lines()
+		.filter_map(|line| {
+			let trimmed = line.trim();
+			trimmed
+				.ends_with(',')
+				.then(|| trimmed.trim_end_matches(',').to_string())
+		})
+		.collect::<Vec<_>>();
 
 	assert_eq!(execution_plan.matches("Join {").count(), 1);
+	assert_eq!(logical_plan.matches("Join {").count(), 1);
+	assert_eq!(
+		join_kind_variants,
+		vec![
+			"Inner",
+			"LeftOuter",
+			"RightOuter",
+			"FullOuter",
+			"LeftSemi",
+			"RightSemi",
+			"LeftAnti",
+			"RightAnti",
+		]
+	);
+	assert_eq!(enum_variant_count(join_kind), 8);
 	assert_eq!(enum_variant_count(join_strategy), 2);
 	assert!(join_strategy.contains("HashPartitioned"));
 	assert!(join_strategy.contains("Broadcast"));

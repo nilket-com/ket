@@ -100,6 +100,29 @@ this doc before code lands:
   `BindingError::UnsupportedExpression` with a stable diagnostic
   message; add a new variant only if tests would be ambiguous.
 
+// P0.1: Local `sqlparser` 0.54 exposes `LeftOuter`, `RightOuter`,
+// `FullOuter`, `Semi`, `LeftSemi`, `RightSemi`, `Anti`, `LeftAnti`,
+// and `RightAnti`; bare `Semi`/`Anti` normalize to left-preserving
+// `JoinKind` variants.
+// P0.2: `JoinKind` labels are `Inner`, `LeftOuter`, `RightOuter`,
+// `FullOuter`, `LeftSemi`, `RightSemi`, `LeftAnti`, `RightAnti`.
+// P0.3: Build-side matched state is a `Vec<u64>` bitset allocated
+// only for left-preserving variants; the storage budget is one bit
+// per build row and spill recomputes the bitset during probe.
+// P0.4: `JoinOutputRow` is executor-local and not persisted; the
+// ADR 005 spilled build-page format remains unchanged.
+// P0.5: `join_schema(kind, left, right)` is the single nullability
+// and width authority at bind time.
+// P0.6: Golden fixtures cover duplicate keys, unmatched rows,
+// null keys, empty inputs through direct empty-batch behavior,
+// and composite keys, with row counts pinned in
+// `tests/hash_join_kinds_test.rs`.
+// P0.7: Existing M7 inner-join fixtures remain on `JoinKind::Inner`
+// and are exercised by the refactored `execute_hash_join` path.
+// P0.8: Binder broadcast rejection for non-Inner uses
+// `BindingError::UnsupportedExpression` with the stable message
+// `broadcast join is only supported for INNER joins`.
+
 Phase 0 produces eight `// P0.x:` comments in this doc, then a
 single commit `plan: adr 008 outer / semi / anti joins`.
 
