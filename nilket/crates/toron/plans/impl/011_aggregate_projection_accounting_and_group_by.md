@@ -12,7 +12,7 @@ architecture guards (see "Definition of done").
 
 ## Status
 
-Proposed.
+Promoted to `plans/impl/` and implemented.
 
 Built across five iteration rounds with the AI Swarm Council
 (`plans/wip/{claude,codex,gemini}_iter_*`). Three-way final

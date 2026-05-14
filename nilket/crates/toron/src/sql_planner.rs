@@ -4,9 +4,9 @@ use crate::ir::{
 	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
 };
 use sqlparser::ast::{
-	BinaryOperator, Expr as SqlExpr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint,
-	JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr, Statement, TableAlias,
-	TableFactor, Value,
+	BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+	FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query,
+	Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -18,6 +18,8 @@ fn unsupported(message: impl Into<String>) -> FrontendError {
 }
 
 const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
+// P0.3: grouped SQL reuses the join shuffle fanout until aggregate fanout has separate evidence.
+const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
 
 pub struct SqlPlanner;
 
@@ -92,6 +94,9 @@ impl SqlPlanner {
 		};
 
 		if let Some(order_by) = order_by {
+			if is_grouped_aggregate_plan(&plan) {
+				return Err(unsupported("GROUP BY with ORDER BY is not supported"));
+			}
 			let order_by = self.lower_order_by(order_by)?;
 			let limit = limit
 				.as_ref()
@@ -157,9 +162,6 @@ impl SqlPlanner {
 		if prewhere.is_some() {
 			return Err(unsupported("PREWHERE is not supported"));
 		}
-		if !group_by_is_empty(group_by) {
-			return Err(unsupported("GROUP BY is not supported"));
-		}
 		if !cluster_by.is_empty() {
 			return Err(unsupported("CLUSTER BY is not supported"));
 		}
@@ -184,6 +186,11 @@ impl SqlPlanner {
 		if connect_by.is_some() {
 			return Err(unsupported("CONNECT BY is not supported"));
 		}
+		let group_keys = if group_by_is_empty(group_by) {
+			None
+		} else {
+			Some(lower_group_by_keys(group_by)?)
+		};
 
 		// 1. Handle FROM (Scan)
 		if from.is_empty() {
@@ -195,6 +202,9 @@ impl SqlPlanner {
 		}
 
 		let table_with_joins = &from[0];
+		if group_keys.is_some() && !table_with_joins.joins.is_empty() {
+			return Err(unsupported("GROUP BY over joins is not supported"));
+		}
 		let mut plan = self.lower_table_factor(&table_with_joins.relation)?;
 		for join in &table_with_joins.joins {
 			let right = self.lower_table_factor(&join.relation)?;
@@ -221,70 +231,36 @@ impl SqlPlanner {
 		if let Some(selection) = selection {
 			plan = self.lower_where(plan, selection)?;
 		}
-
-		// 3. Handle SELECT list (Project or Aggregate)
-		let mut aggr_exprs = Vec::new();
-		let mut is_aggregate = false;
-
-		for item in projection {
-			if let SelectItem::UnnamedExpr(SqlExpr::Function(f)) = item {
-				let name = f.name.to_string().to_uppercase();
-				let args: &[FunctionArg] = match &f.args {
-					sqlparser::ast::FunctionArguments::List(l) => &l.args,
-					_ => &[],
-				};
-
-				match name.as_str() {
-					"COUNT" => {
-						if args.is_empty()
-							|| matches!(
-								&args[0],
-								FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)
-							) {
-							aggr_exprs
-								.push((AggregateFunction::CountAll, vec![Expr::column("count")]));
-						} else {
-							let arg = self.lower_arg(&args[0])?;
-							aggr_exprs.push((AggregateFunction::Count, vec![arg]));
-						}
-						is_aggregate = true;
-					}
-					"SUM" => {
-						let arg = self.lower_arg(&args[0])?;
-						aggr_exprs.push((AggregateFunction::Sum, vec![arg]));
-						is_aggregate = true;
-					}
-					"LINEAR_REGRESS" => {
-						let y = self.lower_arg(&args[0])?;
-						let x = self.lower_arg(&args[1])?;
-						aggr_exprs.push((AggregateFunction::LinearRegress, vec![y, x]));
-						is_aggregate = true;
-					}
-					"APPROX_QUANTILE" => {
-						let val = self.lower_arg(&args[0])?;
-						let q = match &args[1] {
-							FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-								SqlExpr::Value(Value::Number(n, _)),
-							)) => n.parse::<f64>().map_err(|e| unsupported(e.to_string()))?,
-							_ => {
-								return Err(unsupported(
-									"APPROX_QUANTILE expects a numeric literal for quantile",
-								));
-							}
-						};
-						aggr_exprs.push((AggregateFunction::ApproxQuantile(q), vec![val]));
-						is_aggregate = true;
-					}
-					_ => {}
-				}
-			}
+		if group_keys.is_some() && plan_contains_join(&plan) {
+			return Err(unsupported("GROUP BY over joins is not supported"));
 		}
 
-		if is_aggregate {
+		// 3. Handle SELECT list (Project or Aggregate)
+		if let Some(group_keys) = group_keys {
+			let group_expr = group_keys
+				.iter()
+				.map(|key| key.expr.clone())
+				.collect::<Vec<_>>();
+			let aggr_expr = self.lower_grouped_projection(projection, &group_keys)?;
+			return Ok(LogicalPlan::Aggregate {
+				input: Box::new(LogicalPlan::Exchange {
+					input: Box::new(plan),
+					partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+					key: group_expr.clone(),
+				}),
+				group_expr,
+				aggr_expr,
+			});
+		}
+
+		if projection_contains_aggregate_call(projection) {
+			// P0.5: accepted global aggregates keep the pre-ADR single-stage shape; no
+			// distributed exchange is inserted for the accounting refactor.
+			let aggr_expr = self.lower_global_aggregate_projection(projection)?;
 			return Ok(LogicalPlan::Aggregate {
 				input: Box::new(plan),
 				group_expr: vec![],
-				aggr_expr: aggr_exprs,
+				aggr_expr,
 			});
 		}
 
@@ -366,6 +342,155 @@ impl SqlPlanner {
 			FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => self.lower_expr(e),
 			_ => Err(unsupported("unsupported function argument")),
 		}
+	}
+
+	fn lower_global_aggregate_projection(
+		&self,
+		projection: &[SelectItem],
+	) -> Result<Vec<(AggregateFunction, Vec<Expr>)>, FrontendError> {
+		projection
+			.iter()
+			.map(|item| match item {
+				SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
+					self.lower_aggregate_function(function, AggregateSqlMode::Global)
+				}
+				_ => Err(unsupported("unsupported aggregate projection item")),
+			})
+			.collect()
+	}
+
+	fn lower_grouped_projection(
+		&self,
+		projection: &[SelectItem],
+		group_keys: &[GroupKey],
+	) -> Result<Vec<(AggregateFunction, Vec<Expr>)>, FrontendError> {
+		if projection.len() <= group_keys.len() {
+			return Err(unsupported("GROUP BY requires at least one aggregate call"));
+		}
+
+		for (index, key) in group_keys.iter().enumerate() {
+			let item = projection
+				.get(index)
+				.expect("projection length checked against group keys");
+			let projected = projection_group_key_name(item)?;
+			if projected != key.name {
+				return Err(unsupported(
+					"GROUP BY projection must list all keys in order before aggregates",
+				));
+			}
+		}
+
+		let aggr_expr = projection
+			.iter()
+			.skip(group_keys.len())
+			.map(|item| match item {
+				SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
+					self.lower_aggregate_function(function, AggregateSqlMode::Grouped)
+				}
+				_ => Err(unsupported(
+					"GROUP BY projection must list all keys in order before aggregates",
+				)),
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+
+		if aggr_expr.is_empty() {
+			return Err(unsupported("GROUP BY requires at least one aggregate call"));
+		}
+		Ok(aggr_expr)
+	}
+
+	fn lower_aggregate_function(
+		&self,
+		function: &Function,
+		mode: AggregateSqlMode,
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		let name = aggregate_function_name(&function.name)
+			.ok_or_else(|| unsupported("unsupported aggregate function"))?;
+		let args = aggregate_function_args(function)?;
+
+		match name {
+			"COUNT" => self.lower_count_aggregate(args),
+			"SUM" => self.lower_sum_aggregate(args),
+			"LINEAR_REGRESS" => {
+				if matches!(mode, AggregateSqlMode::Grouped) {
+					return Err(unsupported(
+						"experimental aggregate functions are not supported with GROUP BY",
+					));
+				}
+				self.lower_linear_regress_aggregate(args)
+			}
+			"APPROX_QUANTILE" => {
+				if matches!(mode, AggregateSqlMode::Grouped) {
+					return Err(unsupported(
+						"experimental aggregate functions are not supported with GROUP BY",
+					));
+				}
+				self.lower_approx_quantile_aggregate(args)
+			}
+			_ => Err(unsupported("unsupported aggregate function")),
+		}
+	}
+
+	fn lower_count_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported("COUNT requires one argument"));
+		}
+		match &args[0] {
+			FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+				Ok((AggregateFunction::CountAll, vec![Expr::column("count")]))
+			}
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+				Ok((AggregateFunction::Count, vec![self.lower_expr(expr)?]))
+			}
+			_ => Err(unsupported("unsupported COUNT argument")),
+		}
+	}
+
+	fn lower_sum_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported("SUM requires one argument"));
+		}
+		Ok((AggregateFunction::Sum, vec![self.lower_arg(&args[0])?]))
+	}
+
+	fn lower_linear_regress_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 2 {
+			return Err(unsupported("LINEAR_REGRESS requires two arguments"));
+		}
+		Ok((
+			AggregateFunction::LinearRegress,
+			vec![self.lower_arg(&args[0])?, self.lower_arg(&args[1])?],
+		))
+	}
+
+	fn lower_approx_quantile_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 2 {
+			return Err(unsupported("APPROX_QUANTILE requires two arguments"));
+		}
+		let val = self.lower_arg(&args[0])?;
+		let q = match &args[1] {
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(Value::Number(n, _)))) => {
+				n.parse::<f64>().map_err(|e| unsupported(e.to_string()))?
+			}
+			_ => {
+				return Err(unsupported(
+					"APPROX_QUANTILE expects a numeric literal for quantile",
+				));
+			}
+		};
+		Ok((AggregateFunction::ApproxQuantile(q), vec![val]))
 	}
 
 	fn lower_table_factor(&self, factor: &TableFactor) -> Result<LogicalPlan, FrontendError> {
@@ -632,6 +757,179 @@ impl SqlPlanner {
 		}
 
 		Ok((left_keys, right_keys))
+	}
+}
+
+#[derive(Debug, Clone)]
+struct GroupKey {
+	name: String,
+	expr: Expr,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AggregateSqlMode {
+	Global,
+	Grouped,
+}
+
+fn lower_group_by_keys(group_by: &GroupByExpr) -> Result<Vec<GroupKey>, FrontendError> {
+	// P0.1: sqlparser 0.54 stores plain keys in Expressions and ClickHouse-style modifiers
+	// beside them; GROUP BY ALL and every modifier are outside ADR 011.
+	match group_by {
+		GroupByExpr::Expressions(exprs, modifiers) => {
+			if !modifiers.is_empty() {
+				return Err(unsupported("GROUP BY modifiers are not supported"));
+			}
+			if exprs.is_empty() {
+				return Err(unsupported("GROUP BY requires at least one key"));
+			}
+			exprs.iter().map(lower_group_by_key).collect()
+		}
+		GroupByExpr::All(_) => Err(unsupported("GROUP BY ALL is not supported")),
+	}
+}
+
+fn lower_group_by_key(expr: &SqlExpr) -> Result<GroupKey, FrontendError> {
+	match expr {
+		SqlExpr::Identifier(ident) => {
+			let name = ident.value.clone();
+			Ok(GroupKey {
+				name: name.clone(),
+				expr: Expr::column(name),
+			})
+		}
+		_ => Err(unsupported(
+			"GROUP BY keys must be simple unqualified columns",
+		)),
+	}
+}
+
+fn projection_group_key_name(item: &SelectItem) -> Result<&str, FrontendError> {
+	// P0.2: the exact no-post-project shape is SelectItem::UnnamedExpr(Identifier)
+	// for keys and SelectItem::UnnamedExpr(Function) for aggregate calls.
+	match item {
+		SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => Ok(ident.value.as_str()),
+		_ => Err(unsupported(
+			"GROUP BY projection must list all keys in order before aggregates",
+		)),
+	}
+}
+
+fn projection_contains_aggregate_call(projection: &[SelectItem]) -> bool {
+	projection.iter().any(select_item_contains_aggregate_call)
+}
+
+fn select_item_contains_aggregate_call(item: &SelectItem) -> bool {
+	match item {
+		SelectItem::UnnamedExpr(expr) => expr_contains_aggregate_call(expr),
+		SelectItem::ExprWithAlias { expr, alias: _ } => expr_contains_aggregate_call(expr),
+		SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => false,
+	}
+}
+
+fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Function(function) => aggregate_function_name(&function.name).is_some(),
+		_ => false,
+	}
+}
+
+fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
+	let [ident] = name.0.as_slice() else {
+		return None;
+	};
+	match ident.value.to_ascii_uppercase().as_str() {
+		"COUNT" => Some("COUNT"),
+		"SUM" => Some("SUM"),
+		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
+		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
+		_ => None,
+	}
+}
+
+fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], FrontendError> {
+	// P0.4: global experimental aggregate calls still lower to the existing IR; the binder's
+	// allow_experimental_kernels gate remains the authority for executing those kernels.
+	if function.uses_odbc_syntax
+		|| !matches!(function.parameters, FunctionArguments::None)
+		|| function.filter.is_some()
+		|| function.null_treatment.is_some()
+		|| function.over.is_some()
+		|| !function.within_group.is_empty()
+	{
+		return Err(unsupported(
+			"aggregate function modifiers are not supported",
+		));
+	}
+
+	let FunctionArguments::List(FunctionArgumentList {
+		duplicate_treatment,
+		args,
+		clauses,
+	}) = &function.args
+	else {
+		return Err(unsupported("aggregate function requires arguments"));
+	};
+	if duplicate_treatment.is_some() || !clauses.is_empty() {
+		return Err(unsupported(
+			"aggregate function modifiers are not supported",
+		));
+	}
+	Ok(args)
+}
+
+fn is_grouped_aggregate_plan(plan: &LogicalPlan) -> bool {
+	match plan {
+		LogicalPlan::Aggregate {
+			input: _,
+			group_expr,
+			aggr_expr: _,
+		} => !group_expr.is_empty(),
+		_ => false,
+	}
+}
+
+fn plan_contains_join(plan: &LogicalPlan) -> bool {
+	// P0.6: a recursive logical-plan walk is sufficient because ADR 009 decorrelation is
+	// the only path that can add a Join under syntactically single-table grouped SQL.
+	match plan {
+		LogicalPlan::Scan {
+			table: _,
+			projection: _,
+		}
+		| LogicalPlan::ScanNamed {
+			table: _,
+			projection: _,
+		} => false,
+		LogicalPlan::Alias { input, alias: _ }
+		| LogicalPlan::Filter {
+			input,
+			predicate: _,
+		}
+		| LogicalPlan::Project { input, exprs: _ }
+		| LogicalPlan::Aggregate {
+			input,
+			group_expr: _,
+			aggr_expr: _,
+		}
+		| LogicalPlan::Exchange {
+			input,
+			partition_count: _,
+			key: _,
+		}
+		| LogicalPlan::Sort {
+			input,
+			order_by: _,
+			limit: _,
+			offset: _,
+		} => plan_contains_join(input),
+		LogicalPlan::Join {
+			left: _,
+			right: _,
+			kind: _,
+			on: _,
+			strategy: _,
+		} => true,
 	}
 }
 

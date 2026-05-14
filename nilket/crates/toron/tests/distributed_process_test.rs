@@ -16,11 +16,14 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{AttemptId, LeaseEpoch, QueryId, WorkerId};
 use toron::distributed::scheduler::{DistributedScheduler, SchedulerRun};
+use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, PlacementHints, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEndpoint,
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
-use toron::ir::{AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, TableId};
+use toron::ir::{
+	AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, LogicalPlan, TableId,
+};
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
 use toron::sql_planner::SqlPlanner;
@@ -313,6 +316,57 @@ async fn correlated_exists_decorrelation_matches_explicit_left_semi_join_digest(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_aggregate_sql_matches_hand_built_aggregate_over_processes() {
+	let sql = SqlPlanner::new()
+		.plan("SELECT val, COUNT(*) FROM fixture GROUP BY val")
+		.expect("plan group by sql");
+	let grouped_sql = run_test_logical_process_query(1_400, 0, sql).await;
+	let hand_built = run_process_query(1_404, 1).await;
+
+	assert_eq!(grouped_sql.total_count, 16);
+	assert_eq!(grouped_sql.total_count, hand_built.total_count);
+	assert_eq!(grouped_sql.digest, hand_built.digest);
+}
+
+#[tokio::test]
+async fn distributed_group_by_has_single_group_keyed_exchange() {
+	let logical = SqlPlanner::new()
+		.plan("SELECT val, COUNT(*) FROM fixture GROUP BY val")
+		.expect("plan group by sql");
+	let bound = bind(&logical, test_catalog().as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind group by sql");
+	let stages = fragment_plan(
+		bound,
+		FragmentPlanConfig::new(
+			QueryId::new(),
+			TaskBudget::from_query_budget(QueryBudget::test_default()),
+		),
+	)
+	.expect("fragment group by sql");
+
+	assert_eq!(stages.len(), 2);
+	assert_eq!(stages[0].tasks.len(), 1);
+	assert_eq!(stages[1].tasks.len(), 4);
+	assert!(matches!(
+		&stages[0].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			partition_count,
+			partition_key,
+			..
+		} if *partition_count == PartitionCount::new(4) && partition_key.len() == 1
+	));
+	for task in &stages[1].tasks {
+		assert!(matches!(
+			task.spec.inputs[0],
+			TaskInputBinding::ShuffleConsumer { .. }
+		));
+		assert!(matches!(task.spec.output, TaskOutputBinding::FinalResult));
+		assert!(matches!(task.spec.plan, ExecutionPlan::Aggregate { .. }));
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
 	let baseline = run_broadcast_join_process_query(800).await;
 	let killed = run_broadcast_join_build_kill_query(900).await;
@@ -351,6 +405,19 @@ async fn hash_join_worker_process_loss_retries_join_task_and_matches_baseline_di
 }
 
 async fn run_process_query(worker_id_base: u128, start_offset: usize) -> ProcessRun {
+	run_test_logical_process_query(
+		worker_id_base,
+		start_offset,
+		group_count_after_exchange_plan(),
+	)
+	.await
+}
+
+async fn run_test_logical_process_query(
+	worker_id_base: u128,
+	start_offset: usize,
+	plan: LogicalPlan,
+) -> ProcessRun {
 	let mut workers = vec![
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
@@ -368,10 +435,7 @@ async fn run_process_query(worker_id_base: u128, start_offset: usize) -> Process
 		QueryBudget::test_default(),
 	);
 
-	let results = coordinator
-		.execute_query(&group_count_after_exchange_plan())
-		.await
-		.expect("query");
+	let results = coordinator.execute_query(&plan).await.expect("query");
 	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::FullRowLex).expect("digest");
 	let total_count = sum_counts(&results);
 	for worker in &mut workers {

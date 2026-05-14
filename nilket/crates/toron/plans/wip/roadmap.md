@@ -156,6 +156,34 @@ along with the forward-sequence rewrite.
   ordered) plus distributed stage-shape inspection. Three-way AI
   Swarm Council convergence (Claude / Codex / Gemini) across
   three topic-iteration rounds and two ADR-drafting rounds.
+- **ADR 011 — Aggregate Projection Accounting and `GROUP BY`
+  SQL Reachability.** Promoted + implemented.
+  Frontend-planner surface extension closing the next live V1
+  "First Query with Integrity" defect one level below ADR 010:
+  aggregate SELECT projections no longer accept a recognized
+  aggregate while silently dropping every non-aggregate item.
+  Once a projection is classified as aggregate, every item is
+  lowered as an aggregate call or exact grouped key, or loudly
+  rejected. The feature half wires routine single-table grouped
+  SQL (`SELECT key, COUNT(*) FROM t GROUP BY key`) to the
+  already-existing `LogicalPlan::Aggregate` /
+  `ExecutionPlan::Aggregate` path via one explicit group-keyed
+  `Exchange`. V1 scope is intentionally narrow: exact
+  `[all GROUP BY keys in order] ++ [aggregate calls]` projection
+  shape, at least one aggregate call, simple unqualified group
+  keys, stable grouped aggregate set (`COUNT(*)`, `COUNT(expr)`,
+  `SUM(expr)`), syntactic + structural single-table guards, no
+  `GROUP BY` over joins or decorrelated `EXISTS`, no
+  `GROUP BY ... ORDER BY`, no `HAVING`, no `DISTINCT`, no
+  post-aggregate projection, and no two-phase partial
+  aggregation. No new IR, wire, budget, task-failure, join, or
+  Wendelon surface; `LogicalPlan` stays 9 variants and
+  `ExecutionPlan` stays 7. No bench-results artifact —
+  promotion evidence is plan-shape inspection, digest parity
+  against hand-built grouped aggregates, distributed stage-shape
+  inspection, and preserved architecture guards. Selected from
+  outside the rotated post-ADR-009 A–E candidate list on fresh
+  code evidence of a second silent-wrong-results defect.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -235,10 +263,16 @@ discarded top-level `ORDER BY` / `LIMIT` / `DISTINCT` — a live V1
 no Wendelon dependency. The A–E list was not wrong, only
 incomplete — it was authored before anyone read the planner.
 "Evidence drives scope" includes the code, not only the prior
-ADR's bench artifact. ADR 011 selection is the next decision: the
-ADR 006 Wendelon row and any launch-pressure shift feed into that
-scoring, and the candidate list below (the former ADR 010 A–E
-set) reflects the post-ADR-009 landscape.
+ADR's bench artifact. ADR 011 repeated that discipline: reading
+`SqlPlanner::lower_select` exposed a second silent-wrong-results
+defect, where `SELECT region, SUM(amount) FROM sales` accepted an
+aggregate projection and dropped `region` on the floor. ADR 011
+therefore promoted another pure-Toron frontend-planner integrity
+fix, plus narrow `GROUP BY` SQL reachability over the already
+implemented grouped aggregate operator. The pending ADR 006
+Wendelon row and any launch-pressure shift now feed ADR 012
+selection, and the candidate list below (the former ADR 010 A–E
+set plus ADR 011 follow-ons) reflects that landscape.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
@@ -249,9 +283,10 @@ ADR 008), cluster-wide (governance, ADR 003), cross-ring
 (ADR 002, ADR 006), transport (ADR 003 wire, ADR 006
 `PartitionManifest`/`ScanRequest` additions),
 storage-internal (Wendelon), frontend planner (ADR 009, ADR 010 —
-clause accounting), operator-level executor + distributed
-fragmenter (ADR 010 — the `Sort` operator and its terminal
-gather-sort stage). The decomposition makes
+clause accounting, ADR 011 — aggregate projection accounting and
+`GROUP BY` SQL reachability), operator-level executor +
+distributed fragmenter (ADR 010 — the `Sort` operator and its
+terminal gather-sort stage). The decomposition makes
 scope-creep into adjacent boundaries visible at review
 time and sharpens ADR selection: same operator at different
 scales is a different contract.
@@ -261,22 +296,22 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Completed: ADR 010 implementation
+### Completed: ADR 011 implementation
 
-ADR 010's contract is pinned at
-`plans/adr/010_top_level_clause_accounting_and_ordering.md`; the
-impl plan lives at
-`plans/impl/010_top_level_clause_accounting_and_ordering.md`.
-ADR 010 introduces a new operator (`Sort`) but makes no
-performance claim — promotion evidence is digest parity
-(canonical + ordered) plus distributed stage-shape inspection,
-so there is no bench-results artifact. The impl plan is phased
-so Phase 1 (clause accounting — the silent-drop → loud-reject
-integrity fix) is independently reviewable correctness work;
-Phase 4 (the strategy-agnostic post-join terminal gather-sort
-fragmenter path) was the named primary implementation risk and is
-pinned by stage-shape tests. The next council deliverable is
-ADR 011 planning.
+ADR 011's contract is pinned at
+`plans/adr/011_aggregate_projection_accounting_and_group_by.md`;
+the impl plan lives at
+`plans/impl/011_aggregate_projection_accounting_and_group_by.md`.
+ADR 011 introduces no operator and makes no performance claim, so
+there is no bench-results artifact. Promotion evidence is
+plan-shape inspection, result/digest parity against hand-built
+grouped `Aggregate` plans, distributed stage-shape inspection,
+and preserved architecture guards. The load-bearing integrity
+fix is projection-item accounting for aggregate SELECT lists:
+accepted aggregate projections can no longer silently narrow.
+The feature half wires the narrow single-table `GROUP BY` SQL
+surface to the existing grouped aggregate path through one
+planner-emitted group-keyed `Exchange`.
 
 In parallel, the ADR 006 Wendelon-side row-level application
 remains pending — when Wendelon-side ships, the
@@ -284,23 +319,38 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 011 selection waits on the ADR 006 Wendelon row arrival and
+ADR 012 selection waits on the ADR 006 Wendelon row arrival and
 any launch-pressure shift. Until that lands, the candidate list
-below reflects the post-ADR-009 landscape.
+below reflects the post-ADR-009 landscape plus ADR 011 follow-on
+surfaces.
 
-### ADR 011 candidates (the former ADR 010 A–E list)
+### ADR 012 candidates
 
 This is the candidate list the ADR 009 planning session left for
 ADR 010. ADR 010 was instead selected from outside it — the
 silent-drop defect was load-bearing V1 code evidence the list
-predated. The list rotates forward unchanged as the ADR 011
-candidate set: with L-2 (Rune sandbox) consumed by ADR 007,
+predated. ADR 011 was also selected from outside it, on a second
+planner silent-drop defect one level below ADR 010. The list now
+rotates forward as the ADR 012 candidate set: with L-2 (Rune
+sandbox) consumed by ADR 007,
 operator-level SQL width by ADR 008, the frontend-planner
 existence-predicate gap by ADR 009, and top-level clause
-accounting + result ordering by ADR 010, the remaining
-candidates are below, in rough order of probable selection given
-evidence shapes the council can already anticipate. B and C
-remain gated on the pending ADR 006 Wendelon production row.
+accounting + result ordering by ADR 010, and aggregate
+projection accounting + narrow `GROUP BY` reachability by
+ADR 011, the remaining candidates are below, in rough order of
+probable selection given evidence shapes the council can already
+anticipate. B and C remain gated on the pending ADR 006 Wendelon
+production row.
+
+ADR 011 follow-ons are now explicit candidates rather than
+accidental scope: `GROUP BY` over joins, `GROUP BY ... ORDER BY`,
+`HAVING`, `DISTINCT`, post-aggregate projection (aliases,
+reordering, key subsets, computed keys), two-phase partial/final
+aggregation, and aggregate-catalog widening (`AVG` / `MIN` /
+`MAX` and experimental-kernel graduation). They promote only if
+evidence beats the broader A–E list; ADR 011 intentionally kept
+them out to preserve correctness of the single-exchange V1
+shape.
 
 #### Candidate A — Multi-tenant resource governance
 

@@ -7,11 +7,12 @@
 
 ## Status
 
-Proposed. Promotion evidence is plan-shape inspection plus
-result/digest parity against hand-built `Aggregate` plans plus
-distributed stage-shape inspection plus preserved architecture
-guards (see "Promotion evidence"). No bench-results artifact —
-ADR 011 introduces no operator and makes no performance claim.
+Promoted to `plans/adr/` and implemented. Promotion evidence is
+plan-shape inspection plus result/digest parity against
+hand-built `Aggregate` plans plus distributed stage-shape
+inspection plus preserved architecture guards (see "Promotion
+evidence"). No bench-results artifact — ADR 011 introduces no
+operator and makes no performance claim.
 
 Three-way AI Swarm Council convergence reached across five
 iteration rounds (`plans/wip/{claude,codex,gemini}_iter_*`).
