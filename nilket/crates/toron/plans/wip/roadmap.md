@@ -35,19 +35,21 @@ along with the forward-sequence rewrite.
   `framework_overhead_ms` moved proportionally, placing ADR 006 in
   the operator-adjacent band rather than runtime-plumbing
   investigation.
-- **ADR 006 — Runtime Filter Pushdown.** Promoted.
-  Implementation pending. Cross-ring optimization contract:
-  advisory Bloom runtime filters for hash-partitioned inner
-  equi-joins via two-wave execution. Pinned by ADR 005's
-  post-promotion telemetry — the bytes-movement cluster
-  (`batch_send` + `shuffle_pull_decode` + `output_publish` +
-  `batch_encode` = 558ms, 34.1%) overtook build as the largest
-  bucket. ADR 006 attacks the cluster at the source (Wendelon
-  filters probe rows before they hit the wire) rather than
-  moving the same bytes faster. Advisory invariant makes
-  split-shipment safe: Toron-side promotion bench arrives first;
-  full Wendelon-enabled end-to-end row lands in a bench-results
-  update once Wendelon-side application ships.
+- **ADR 006 — Runtime Filter Pushdown.** Promoted; Toron-side
+  implementation complete. Bench evidence at
+  `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
+  Cross-ring optimization contract: advisory Bloom runtime
+  filters for hash-partitioned inner equi-joins via two-wave
+  execution. Pinned by ADR 005's post-promotion telemetry —
+  the bytes-movement cluster (`batch_send` +
+  `shuffle_pull_decode` + `output_publish` + `batch_encode` =
+  558ms, 34.1%) overtook build as the largest bucket. ADR 006
+  attacks the cluster at the source (Wendelon filters probe
+  rows before they hit the wire) rather than moving the same
+  bytes faster. Advisory invariant makes split-shipment safe:
+  Toron-side evidence is captured; production Wendelon-enabled
+  end-to-end evidence lands in a bench-results update once
+  Wendelon-side application ships.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -119,20 +121,27 @@ scales is a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 006 implementation → ADR 007 planning
+### Next: ADR 006 Wendelon follow-up → ADR 007 planning
 
 ADR 006's contract is pinned at
 `plans/adr/006_runtime_filter_pushdown.md`; the impl plan lives at
-`plans/impl/006_runtime_filter_pushdown.md`. The next council
-deliverable is implementation through Phase 5, ending in
-promotion-scale bench evidence at
-`plans/impl/006_runtime_filter_pushdown_bench_results.md`.
+`plans/impl/006_runtime_filter_pushdown.md`. Toron-side
+implementation and promotion-scale Wendelon-disabled evidence
+are captured at
+`plans/impl/006_runtime_filter_pushdown_bench_results.md`. Full
+Phase 0 selective mock-Wendelon evidence is also captured there
+(100K build rows x 100M probe rows; 98.9% bytes-movement cluster
+reduction, digest-identical), but it is not the production
+Wendelon trigger. The next council deliverable is production
+Wendelon-side row-level application evidence, followed by ADR 007
+planning.
 
 ADR 006 ships in two stages per its split-shipment posture:
-**Toron-side promotion** lands first (gates 19/20/21 +
-correctness); **Wendelon-enabled selective bench evidence**
-arrives in a follow-up bench-results update once Wendelon-side
-application is in. Both stages feed ADR 007's framing:
+**Toron-side promotion** has landed in code and local evidence
+(gates 19/20/21 + correctness); **production Wendelon-enabled
+selective bench evidence** arrives in a follow-up bench-results
+update once Wendelon-side application is in. Both stages feed
+ADR 007's framing:
 
 - **Toron-side promotion ships; Wendelon-enabled selective row
   later hits >=50% bytes-movement cluster reduction.** Topic A

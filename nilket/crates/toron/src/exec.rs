@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 };
 #[cfg(test)]
 use wendelon::storage::sketch::KllSketch;
@@ -41,6 +41,8 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) mod runtime_filter;
 
 pub struct Executor {
 	storage: Arc<dyn StorageScan>,
@@ -58,6 +60,7 @@ pub struct ExecutionContext {
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
 	pub task_budget: TaskBudget,
 	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	join_spill_file_ops: Arc<dyn AsyncFileOps>,
 	join_spill_dir: PathBuf,
 }
@@ -73,6 +76,7 @@ impl fmt::Debug for ExecutionContext {
 			.field("trace_context", &self.trace_context)
 			.field("legacy_table_pins", &self.legacy_table_pins)
 			.field("task_budget", &self.task_budget)
+			.field("runtime_filter", &self.runtime_filter)
 			.field("join_spill_dir", &self.join_spill_dir)
 			.finish_non_exhaustive()
 	}
@@ -95,6 +99,7 @@ impl ExecutionContext {
 			legacy_table_pins: HashMap::new(),
 			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			task_telemetry: None,
+			runtime_filter: None,
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: std::env::temp_dir().join("toron_join_spill"),
 		}
@@ -107,6 +112,11 @@ impl ExecutionContext {
 
 	pub fn with_task_telemetry(mut self, telemetry: Arc<Mutex<TaskTelemetry>>) -> Self {
 		self.task_telemetry = Some(telemetry);
+		self
+	}
+
+	pub fn with_runtime_filter(mut self, runtime_filter: Option<RuntimeFilterDescriptor>) -> Self {
+		self.runtime_filter = runtime_filter;
 		self
 	}
 
@@ -179,6 +189,7 @@ impl Executor {
 						read_bound: self.context.read_bound,
 						projected_columns: None,
 						pbc_predicate: None,
+						runtime_filter: self.context.runtime_filter.clone(),
 						profile_hint: self.context.profile_hint,
 						trace_context: self.context.trace_context.clone(),
 						morsel,
@@ -467,6 +478,7 @@ impl Executor {
 						read_bound: self.context.read_bound,
 						projected_columns: projection.clone(),
 						pbc_predicate: pbc_program.as_ref().map(|program| program.0.clone()),
+						runtime_filter: self.context.runtime_filter.clone(),
 						profile_hint: Some(*profile_hint),
 						trace_context: self.context.trace_context.clone(),
 						morsel,
@@ -2717,8 +2729,8 @@ mod tests {
 	use std::hash::{DefaultHasher, Hash, Hasher};
 	use std::sync::Mutex;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
+		RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -2770,6 +2782,56 @@ mod tests {
 		);
 		assert!(observed[0].pbc_predicate.is_some());
 		assert_eq!(observed[0].profile_hint, Some(QueryProfileHint::Scan));
+	}
+
+	#[tokio::test]
+	async fn execute_bound_threads_runtime_filter_to_scan_request() {
+		let batch = batch();
+		let requests = Arc::new(Mutex::new(Vec::new()));
+		let storage = Arc::new(RecordingStorageScan {
+			table_data: batch.clone(),
+			requests: requests.clone(),
+		});
+		let descriptor = descriptor();
+		let runtime_filter = RuntimeFilterDescriptor {
+			key_encoding_version: 1,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![0],
+			hash_seed: 7,
+			bit_count: 8,
+			hash_count: 1,
+			byte_budget: 1,
+			target_fp_rate_bp: 100,
+			payload: vec![0b1010_1010],
+			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		};
+		let context = ExecutionContext::new(
+			SessionId(77),
+			QueryId::from_u128(88),
+			TenantId(99),
+			HlcBound(123),
+		)
+		.with_runtime_filter(Some(runtime_filter.clone()));
+		let executor = Executor::with_context(storage, context);
+		let bound = ExecutionPlan::Scan {
+			legacy_table_id: TableId(1),
+			table: descriptor.table_object_id,
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema: batch.schema(),
+			projection: None,
+			pbc_program: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+		};
+
+		executor
+			.execute_bound(&bound, None)
+			.await
+			.expect("execute bound");
+
+		let observed = requests.lock().unwrap();
+		assert_eq!(observed.len(), 1);
+		assert_eq!(observed[0].runtime_filter, Some(runtime_filter));
 	}
 
 	#[tokio::test]

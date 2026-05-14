@@ -11,13 +11,17 @@ use crate::distributed::task::{
 	PartitionCount, ScanShare, TaskInputBinding, TaskOutputBinding, TaskSpec,
 	shuffle_input_table_id,
 };
-use crate::ir::{ExecutionExpr, ExecutionPlan, JoinKind, JoinStrategy, QueryProfileHint};
+use crate::exec::runtime_filter::runtime_filter_key_type;
+use crate::ir::{
+	ColumnOrdinal, ExecutionExpr, ExecutionPlan, JoinKind, JoinStrategy, QueryProfileHint,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FragmentPlanConfig {
 	pub query_id: QueryId,
 	pub task_budget: TaskBudget,
 	pub worker_count: u32,
+	pub runtime_filters_enabled: bool,
 }
 
 impl FragmentPlanConfig {
@@ -26,11 +30,17 @@ impl FragmentPlanConfig {
 			query_id,
 			task_budget,
 			worker_count: 1,
+			runtime_filters_enabled: true,
 		}
 	}
 
 	pub const fn with_worker_count(mut self, worker_count: u32) -> Self {
 		self.worker_count = worker_count;
+		self
+	}
+
+	pub const fn with_runtime_filters_enabled(mut self, enabled: bool) -> Self {
+		self.runtime_filters_enabled = enabled;
 		self
 	}
 }
@@ -92,7 +102,10 @@ pub fn fragment_plan(
 			partition_count: boundary.partition_count,
 			key: boundary.key.clone(),
 		},
-		inputs: vec![TaskInputBinding::Scan { share: None }],
+		inputs: vec![TaskInputBinding::Scan {
+			share: None,
+			runtime_filter: None,
+		}],
 		output: TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count: PartitionCount::new(boundary.partition_count),
@@ -157,6 +170,8 @@ fn fragment_hash_join_plan(
 	join: JoinBoundary,
 	config: FragmentPlanConfig,
 ) -> Result<Vec<StagePlan>, FragmentError> {
+	let runtime_filter_enabled =
+		config.runtime_filters_enabled && runtime_filter_join_eligible(&join);
 	let left_boundary = extract_exchange(*join.left)?;
 	let right_boundary = extract_exchange(*join.right)?;
 	if left_boundary.partition_count == 0 || right_boundary.partition_count == 0 {
@@ -240,7 +255,11 @@ fn fragment_hash_join_plan(
 		},
 		StagePlan {
 			stage_id: right_stage_id,
-			upstream_stages: vec![],
+			upstream_stages: if runtime_filter_enabled {
+				vec![left_stage_id]
+			} else {
+				vec![]
+			},
 			tasks: vec![producer_task(
 				config,
 				right_stage_id,
@@ -306,6 +325,7 @@ fn fragment_broadcast_join_plan(
 							worker_index,
 							worker_count,
 						}),
+						runtime_filter: None,
 					},
 					TaskInputBinding::ShuffleConsumer {
 						exchange_id: build_exchange_id,
@@ -359,7 +379,10 @@ fn producer_task(
 			partition_count: boundary.partition_count,
 			key: boundary.key.clone(),
 		},
-		inputs: vec![TaskInputBinding::Scan { share: None }],
+		inputs: vec![TaskInputBinding::Scan {
+			share: None,
+			runtime_filter: None,
+		}],
 		output: TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count: PartitionCount::new(boundary.partition_count),
@@ -383,7 +406,10 @@ fn single_task_stage(plan: ExecutionPlan, config: FragmentPlanConfig) -> StagePl
 			),
 			partition: None,
 			plan,
-			inputs: vec![TaskInputBinding::Scan { share: None }],
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
 			output: TaskOutputBinding::FinalResult,
 			budget: config.task_budget,
 			trace: None,
@@ -403,10 +429,31 @@ struct JoinBoundary {
 	left: Box<ExecutionPlan>,
 	right: Box<ExecutionPlan>,
 	kind: JoinKind,
-	left_keys: Vec<crate::ir::ColumnOrdinal>,
-	right_keys: Vec<crate::ir::ColumnOrdinal>,
+	left_keys: Vec<ColumnOrdinal>,
+	right_keys: Vec<ColumnOrdinal>,
 	strategy: JoinStrategy,
 	output_schema: SchemaRef,
+}
+
+fn runtime_filter_join_eligible(join: &JoinBoundary) -> bool {
+	if !matches!(join.kind, JoinKind::Inner)
+		|| join.left_keys.len() != 1
+		|| join.right_keys.len() != 1
+	{
+		return false;
+	}
+	supported_join_key(join.left.as_ref(), join.left_keys[0])
+		.zip(supported_join_key(join.right.as_ref(), join.right_keys[0]))
+		.is_some_and(|(left, right)| left == right)
+}
+
+fn supported_join_key(
+	plan: &ExecutionPlan,
+	key: ColumnOrdinal,
+) -> Option<wendelon::schema::RuntimeFilterKeyType> {
+	let schema = plan.schema();
+	let field = schema.fields().get(usize::try_from(key.0).ok()?)?;
+	runtime_filter_key_type(field.data_type())
 }
 
 fn contains_join(plan: &ExecutionPlan) -> bool {
@@ -779,6 +826,7 @@ mod tests {
 		assert_eq!(stages.len(), 3);
 		assert_eq!(stages[0].tasks.len(), 1);
 		assert_eq!(stages[1].tasks.len(), 1);
+		assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
 		assert_eq!(
 			stages[2].upstream_stages,
 			vec![StageId::new(0), StageId::new(1)]
@@ -831,6 +879,66 @@ mod tests {
 	}
 
 	#[test]
+	fn hash_join_runtime_filter_disabled_preserves_parallel_producers() {
+		let plan = join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		);
+
+		let stages = fragment_plan(plan, config().with_runtime_filters_enabled(false))
+			.expect("fragment hash join");
+
+		assert!(stages[0].upstream_stages.is_empty());
+		assert!(stages[1].upstream_stages.is_empty());
+		assert_eq!(
+			stages[2].upstream_stages,
+			vec![StageId::new(0), StageId::new(1)]
+		);
+	}
+
+	#[test]
+	fn hash_join_float_key_is_not_runtime_filter_eligible() {
+		let plan = join_plan(
+			exchanged_scan_with_key_type(TableId(1), 2, DataType::Float64),
+			exchanged_scan_with_key_type(TableId(2), 2, DataType::Float64),
+			JoinStrategy::HashPartitioned,
+		);
+
+		let stages = fragment_plan(plan, config()).expect("fragment hash join");
+
+		assert!(stages[1].upstream_stages.is_empty());
+		assert_eq!(
+			stages[2].upstream_stages,
+			vec![StageId::new(0), StageId::new(1)]
+		);
+	}
+
+	#[test]
+	fn hash_join_composite_key_is_not_runtime_filter_eligible() {
+		let plan = ExecutionPlan::Join {
+			left: Box::new(exchanged_scan(TableId(1), 2)),
+			right: Box::new(exchanged_scan(TableId(2), 2)),
+			kind: JoinKind::Inner,
+			left_keys: vec![ColumnOrdinal(0), ColumnOrdinal(0)],
+			right_keys: vec![ColumnOrdinal(0), ColumnOrdinal(0)],
+			strategy: JoinStrategy::HashPartitioned,
+			output_schema: Arc::new(Schema::new(vec![
+				Field::new("key", DataType::Int32, false),
+				Field::new("key", DataType::Int32, false),
+			])),
+		};
+
+		let stages = fragment_plan(plan, config()).expect("fragment hash join");
+
+		assert!(stages[1].upstream_stages.is_empty());
+		assert_eq!(
+			stages[2].upstream_stages,
+			vec![StageId::new(0), StageId::new(1)]
+		);
+	}
+
+	#[test]
 	fn broadcast_join_fragments_to_build_publish_and_scan_share_consumers() {
 		let plan = join_plan(
 			exchanged_scan(TableId(1), 1),
@@ -852,7 +960,8 @@ mod tests {
 					share: Some(ScanShare {
 						worker_index: observed,
 						worker_count,
-					})
+					}),
+					..
 				} if *observed == u32::try_from(worker_index).unwrap() && *worker_count == 3
 			));
 			assert!(matches!(
@@ -896,10 +1005,41 @@ mod tests {
 	}
 
 	fn exchanged_scan(table_id: TableId, partition_count: u32) -> ExecutionPlan {
+		exchanged_scan_with_key_type(table_id, partition_count, DataType::Int32)
+	}
+
+	fn exchanged_scan_with_key_type(
+		table_id: TableId,
+		partition_count: u32,
+		data_type: DataType,
+	) -> ExecutionPlan {
 		ExecutionPlan::Exchange {
-			input: Box::new(scan_plan_with_table(table_id, table_id.0 as u8)),
+			input: Box::new(scan_plan_with_table_and_type(
+				table_id,
+				table_id.0 as u8,
+				data_type.clone(),
+			)),
 			partition_count,
-			key: vec![key_expr()],
+			key: vec![key_expr_with_type(data_type)],
+		}
+	}
+
+	fn scan_plan_with_table_and_type(
+		table_id: TableId,
+		object_byte: u8,
+		data_type: DataType,
+	) -> ExecutionPlan {
+		let descriptor = descriptor();
+		let schema = Arc::new(Schema::new(vec![Field::new("key", data_type, false)]));
+		ExecutionPlan::Scan {
+			legacy_table_id: table_id,
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint: descriptor.physical_descriptor_fingerprint,
+			schema,
+			projection: None,
+			pbc_program: None,
+			profile_hint: QueryProfileHint::Scan,
+			primary_key_columns: vec![ColumnOrdinal(0)],
 		}
 	}
 
@@ -938,10 +1078,14 @@ mod tests {
 	}
 
 	fn key_expr() -> ExecutionExpr {
+		key_expr_with_type(DataType::Int32)
+	}
+
+	fn key_expr_with_type(data_type: DataType) -> ExecutionExpr {
 		ExecutionExpr::Column(ResolvedColumn {
 			name: ColumnName("key".to_string()),
 			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int32,
+			data_type,
 			nullable: false,
 			pbc_eligible: true,
 		})

@@ -3,7 +3,8 @@
 //! Smoke check:
 //! `cargo bench --bench distributed_inner_equi_join -- --quick --distributed-inner-equi-join-only`.
 
-use arrow::array::Int64Array;
+use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
+use twox_hash::XxHash3_64;
 
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
@@ -33,8 +35,8 @@ use toron::server::{
 };
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-	TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
+	RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 };
 
 const DEFAULT_WORKERS: &[usize] = &[2, 4, 8];
@@ -43,20 +45,28 @@ const DEFAULT_BUILD_ROWS: usize = 65_536;
 const DEFAULT_PROBE_ROWS: usize = 262_144;
 const QUICK_BUILD_ROWS: usize = 2_048;
 const QUICK_PROBE_ROWS: usize = 8_192;
+const RUNTIME_FILTER_HASH_SEED_2: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn main() -> Result<(), Box<dyn Error>> {
 	let config = BenchConfig::parse();
 	let runtime = Runtime::new()?;
 	for worker_count in &config.workers {
 		for strategy in &config.strategies {
-			let row = runtime.block_on(run_case(
-				*strategy,
-				*worker_count,
-				config.build_rows,
-				config.probe_rows,
-				config.key_shape,
-			))?;
-			print_row(&row, config.quick);
+			for runtime_filters_enabled in &config.runtime_filter_modes {
+				for wendelon_runtime_filters_enabled in &config.wendelon_runtime_filter_modes {
+					let row = runtime.block_on(run_case(
+						*strategy,
+						*worker_count,
+						config.build_rows,
+						config.probe_rows,
+						config.probe_key_domain,
+						config.key_shape,
+						*runtime_filters_enabled,
+						*wendelon_runtime_filters_enabled,
+					))?;
+					print_row(&row, config.quick);
+				}
+			}
 		}
 	}
 	Ok(())
@@ -104,8 +114,11 @@ struct BenchConfig {
 	workers: Vec<usize>,
 	build_rows: usize,
 	probe_rows: usize,
+	probe_key_domain: Option<usize>,
 	strategies: Vec<BenchStrategy>,
 	key_shape: BenchKeyShape,
+	runtime_filter_modes: Vec<bool>,
+	wendelon_runtime_filter_modes: Vec<bool>,
 	quick: bool,
 }
 
@@ -114,8 +127,11 @@ impl BenchConfig {
 		let mut workers = DEFAULT_WORKERS.to_vec();
 		let mut build_rows = DEFAULT_BUILD_ROWS;
 		let mut probe_rows = DEFAULT_PROBE_ROWS;
+		let mut probe_key_domain = None;
 		let mut strategies = vec![BenchStrategy::HashPartitioned, BenchStrategy::Broadcast];
 		let mut key_shape = BenchKeyShape::Single;
+		let mut runtime_filter_modes = vec![true];
+		let mut wendelon_runtime_filter_modes = vec![false];
 		let mut quick = false;
 		for arg in std::env::args().skip(1) {
 			if arg == "--quick" {
@@ -135,6 +151,9 @@ impl BenchConfig {
 				build_rows = value.parse().expect("--build-rows must be positive");
 			} else if let Some(value) = arg.strip_prefix("--probe-rows=") {
 				probe_rows = value.parse().expect("--probe-rows must be positive");
+			} else if let Some(value) = arg.strip_prefix("--probe-key-domain=") {
+				probe_key_domain =
+					Some(value.parse().expect("--probe-key-domain must be positive"));
 			} else if let Some(value) = arg.strip_prefix("--strategy=") {
 				strategies = value
 					.split(',')
@@ -146,6 +165,24 @@ impl BenchConfig {
 					.collect();
 			} else if arg == "--composite-key" {
 				key_shape = BenchKeyShape::Composite;
+			} else if let Some(value) = arg.strip_prefix("--runtime-filter=") {
+				runtime_filter_modes = value
+					.split(',')
+					.map(|part| match part {
+						"enabled" | "on" | "true" => true,
+						"disabled" | "off" | "false" => false,
+						other => panic!("unknown --runtime-filter entry {other}"),
+					})
+					.collect();
+			} else if let Some(value) = arg.strip_prefix("--wendelon-runtime-filter=") {
+				wendelon_runtime_filter_modes = value
+					.split(',')
+					.map(|part| match part {
+						"enabled" | "on" | "true" => true,
+						"disabled" | "off" | "false" => false,
+						other => panic!("unknown --wendelon-runtime-filter entry {other}"),
+					})
+					.collect();
 			} else if arg == "--distributed-inner-equi-join-only" || arg == "--bench" {
 			} else if arg == "--kill-test" {
 				eprintln!("ADR004 kill-test evidence lives in distributed_process_test");
@@ -157,8 +194,11 @@ impl BenchConfig {
 			workers,
 			build_rows,
 			probe_rows,
+			probe_key_domain,
 			strategies,
 			key_shape,
+			runtime_filter_modes,
+			wendelon_runtime_filter_modes,
 			quick,
 		}
 	}
@@ -171,8 +211,11 @@ struct BenchRow {
 	worker_count: usize,
 	build_rows: usize,
 	probe_rows: usize,
+	probe_key_domain: usize,
 	stage_count: usize,
 	task_count: usize,
+	runtime_filters_enabled: bool,
+	wendelon_runtime_filters_enabled: bool,
 	shuffle_bytes_published: u64,
 	broadcast_replicated_bytes: u64,
 	pulled_shuffle_bytes: u64,
@@ -211,11 +254,21 @@ async fn run_case(
 	worker_count: usize,
 	build_rows: usize,
 	probe_rows: usize,
+	probe_key_domain: Option<usize>,
 	key_shape: BenchKeyShape,
+	runtime_filters_enabled: bool,
+	wendelon_runtime_filters_enabled: bool,
 ) -> Result<BenchRow, Box<dyn Error>> {
 	let memory = Arc::new(MemoryManager::new(128, 1024 * 1024));
 	let budget = bench_budget(build_rows, probe_rows, worker_count);
-	let fixture = Fixture::new(build_rows, probe_rows, key_shape)?;
+	let fixture = Fixture::new(
+		build_rows,
+		probe_rows,
+		probe_key_domain,
+		key_shape,
+		wendelon_runtime_filters_enabled,
+	)?;
+	let probe_key_domain = fixture.probe_key_domain;
 	let mut workers = Vec::new();
 	for worker_index in 0..worker_count {
 		workers.push(spawn_worker(worker_index, fixture.clone(), memory.clone(), budget).await?);
@@ -232,7 +285,8 @@ async fn run_case(
 	let stages = fragment_plan(
 		bound,
 		FragmentPlanConfig::new(QueryId::new(), TaskBudget::from_query_budget(budget))
-			.with_worker_count(u32::try_from(worker_count)?),
+			.with_worker_count(u32::try_from(worker_count)?)
+			.with_runtime_filters_enabled(runtime_filters_enabled),
 	)?;
 	let stage_count = stages.len();
 	let task_count = stages.iter().map(|stage| stage.tasks.len()).sum();
@@ -281,8 +335,11 @@ async fn run_case(
 		worker_count,
 		build_rows,
 		probe_rows,
+		probe_key_domain,
 		stage_count,
 		task_count,
+		runtime_filters_enabled,
+		wendelon_runtime_filters_enabled,
 		shuffle_bytes_published,
 		broadcast_replicated_bytes,
 		pulled_shuffle_bytes: telemetry.pulled_shuffle_bytes,
@@ -319,13 +376,24 @@ async fn run_case(
 
 fn print_row(row: &BenchRow, quick: bool) {
 	println!(
-		"adr004_distributed_inner_equi_join,quick={},strategy={},key={},workers={},build_rows={},probe_rows={},stages={},tasks={},shuffle_bytes_published={},broadcast_replicated_bytes={},pulled_shuffle_bytes={},left_shuffle_bytes={},right_shuffle_bytes={},published_shuffle_bytes={},task_wall_ms={:.3},shuffle_pull_decode_ms={:.3},build_ms={:.3},probe_ms={:.3},spill_ms={:.3},output_publish_ms={:.3},task_setup_ms={:.3},batch_encode_ms={:.3},batch_send_ms={:.3},batch_decode_ms={:.3},dispatch_wait_ms={:.3},telemetry_lock_ms={:.3},framework_overhead_ms={:.3},telemetry_build_rows={},telemetry_probe_rows={},matched_rows={},emitted_rows={},emitted_batches={},spill_bytes={},retry_count={},stale_rejection_count={},cancellation_cleanup_count={},result_rows={},digest={},wall_ms={:.3}",
+		"adr004_distributed_inner_equi_join,quick={},strategy={},key={},runtime_filter={},wendelon_runtime_filter={},workers={},build_rows={},probe_rows={},probe_key_domain={},stages={},tasks={},shuffle_bytes_published={},broadcast_replicated_bytes={},pulled_shuffle_bytes={},left_shuffle_bytes={},right_shuffle_bytes={},published_shuffle_bytes={},task_wall_ms={:.3},shuffle_pull_decode_ms={:.3},build_ms={:.3},probe_ms={:.3},spill_ms={:.3},output_publish_ms={:.3},task_setup_ms={:.3},batch_encode_ms={:.3},batch_send_ms={:.3},batch_decode_ms={:.3},dispatch_wait_ms={:.3},telemetry_lock_ms={:.3},framework_overhead_ms={:.3},telemetry_build_rows={},telemetry_probe_rows={},matched_rows={},emitted_rows={},emitted_batches={},spill_bytes={},retry_count={},stale_rejection_count={},cancellation_cleanup_count={},result_rows={},digest={},wall_ms={:.3}",
 		quick,
 		row.strategy.as_str(),
 		row.key_shape.as_str(),
+		if row.runtime_filters_enabled {
+			"enabled"
+		} else {
+			"disabled"
+		},
+		if row.wendelon_runtime_filters_enabled {
+			"enabled"
+		} else {
+			"disabled"
+		},
 		row.worker_count,
 		row.build_rows,
 		row.probe_rows,
+		row.probe_key_domain,
 		row.stage_count,
 		row.task_count,
 		row.shuffle_bytes_published,
@@ -503,17 +571,23 @@ struct Fixture {
 	tables: HashMap<TableId, RecordBatch>,
 	customers_descriptor: TableSchemaDescriptor,
 	orders_descriptor: TableSchemaDescriptor,
+	probe_key_domain: usize,
+	apply_runtime_filters: bool,
 }
 
 impl Fixture {
 	fn new(
 		build_rows: usize,
 		probe_rows: usize,
+		probe_key_domain: Option<usize>,
 		key_shape: BenchKeyShape,
+		apply_runtime_filters: bool,
 	) -> Result<Self, Box<dyn Error>> {
 		let build_rows = build_rows.max(1);
+		let probe_key_domain = probe_key_domain.unwrap_or(build_rows).max(1);
 		let build_rows_i64 = i64::try_from(build_rows)?;
 		let probe_rows_i64 = i64::try_from(probe_rows)?;
+		let probe_key_domain_i64 = i64::try_from(probe_key_domain)?;
 		let (customers_schema, customers_columns, orders_schema, orders_columns) = match key_shape {
 			BenchKeyShape::Single => (
 				Arc::new(Schema::new(vec![
@@ -535,7 +609,7 @@ impl Fixture {
 					Arc::new(Int64Array::from_iter_values(0..probe_rows_i64))
 						as Arc<dyn arrow::array::Array>,
 					Arc::new(Int64Array::from_iter_values(
-						(0..probe_rows_i64).map(|row| row % build_rows_i64),
+						(0..probe_rows_i64).map(|row| row % probe_key_domain_i64),
 					)),
 				],
 			),
@@ -564,10 +638,10 @@ impl Fixture {
 					Arc::new(Int64Array::from_iter_values(0..probe_rows_i64))
 						as Arc<dyn arrow::array::Array>,
 					Arc::new(Int64Array::from_iter_values(
-						(0..probe_rows_i64).map(|row| row % build_rows_i64),
+						(0..probe_rows_i64).map(|row| row % probe_key_domain_i64),
 					)),
 					Arc::new(Int64Array::from_iter_values(
-						(0..probe_rows_i64).map(|row| (row % build_rows_i64) % 32),
+						(0..probe_rows_i64).map(|row| (row % probe_key_domain_i64) % 32),
 					)),
 				],
 			),
@@ -578,6 +652,8 @@ impl Fixture {
 			tables: HashMap::from([(TableId(1), customers), (TableId(2), orders)]),
 			customers_descriptor: descriptor(1, "customers", customers_schema.as_ref()),
 			orders_descriptor: descriptor(2, "orders", orders_schema.as_ref()),
+			probe_key_domain,
+			apply_runtime_filters,
 		})
 	}
 }
@@ -604,6 +680,22 @@ impl StorageScan for Fixture {
 				batch.slice(0, 0)
 			};
 		}
+		if self.apply_runtime_filters {
+			if let Some(runtime_filter) = &request.runtime_filter {
+				if runtime_filter.probe_descriptor_fingerprint
+					== request.physical_descriptor_fingerprint
+				{
+					batch = apply_runtime_filter(&batch, runtime_filter)?;
+				}
+			}
+		}
+		if let Some(columns) = &request.projected_columns {
+			let indices = columns
+				.iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			batch = batch.project(&indices)?;
+		}
 		Ok(ScanStream::from_batches(
 			batch.schema(),
 			request.session_id,
@@ -611,6 +703,64 @@ impl StorageScan for Fixture {
 			vec![batch],
 		))
 	}
+}
+
+fn apply_runtime_filter(
+	batch: &RecordBatch,
+	runtime_filter: &RuntimeFilterDescriptor,
+) -> Result<RecordBatch, StorageError> {
+	if runtime_filter.key_types.as_slice() != [RuntimeFilterKeyType::Int64]
+		|| runtime_filter.probe_key_columns.len() != 1
+	{
+		return Ok(batch.clone());
+	}
+	let column_index = runtime_filter.probe_key_columns[0] as usize;
+	let Some(array) = batch
+		.column(column_index)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+	else {
+		return Ok(batch.clone());
+	};
+	let mask = (0..batch.num_rows())
+		.map(|row| {
+			if array.is_null(row) {
+				return false;
+			}
+			let mut encoded = Vec::with_capacity(9);
+			encoded.push(5);
+			encoded.extend_from_slice(&array.value(row).to_le_bytes());
+			bloom_might_contain(runtime_filter, &encoded)
+		})
+		.collect::<BooleanArray>();
+	filter_record_batch(batch, &mask).map_err(StorageError::from)
+}
+
+fn bloom_might_contain(runtime_filter: &RuntimeFilterDescriptor, encoded: &[u8]) -> bool {
+	if runtime_filter.bit_count == 0
+		|| runtime_filter.hash_count == 0
+		|| runtime_filter.payload.is_empty()
+	{
+		return true;
+	}
+	let h1 = XxHash3_64::oneshot_with_seed(runtime_filter.hash_seed, encoded);
+	let mut h2 = XxHash3_64::oneshot_with_seed(
+		runtime_filter.hash_seed ^ RUNTIME_FILTER_HASH_SEED_2,
+		encoded,
+	);
+	if h2 == 0 {
+		h2 = RUNTIME_FILTER_HASH_SEED_2;
+	}
+	(0..u64::from(runtime_filter.hash_count)).all(|idx| {
+		let bit = h1.wrapping_add(idx.wrapping_mul(h2)) % u64::from(runtime_filter.bit_count);
+		let byte = (bit / 8) as usize;
+		let mask = 1u8 << (bit % 8);
+		runtime_filter
+			.payload
+			.get(byte)
+			.map(|value| value & mask != 0)
+			.unwrap_or(true)
+	})
 }
 
 struct WorkerHarness {

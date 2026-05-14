@@ -737,6 +737,7 @@ mod tests {
 			producer_worker_id: WorkerId::from_u128(6),
 			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9000"),
 			partitions: vec![payload.entry()],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		}
 	}

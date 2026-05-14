@@ -7,7 +7,7 @@ use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wendelon::schema::pbc::OP_PROJECT;
-use wendelon::schema::{PhysicalDescriptorFingerprint, TableObjectId};
+use wendelon::schema::{PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, TableObjectId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TenantId(pub u64);
@@ -38,6 +38,7 @@ pub struct ScanRequest {
 	pub read_bound: HlcBound,
 	pub projected_columns: Option<Vec<ColumnOrdinal>>,
 	pub pbc_predicate: Option<Vec<u8>>,
+	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub morsel: Option<(MorselId, u32)>,

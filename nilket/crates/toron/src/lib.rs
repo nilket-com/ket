@@ -797,6 +797,7 @@ mod tests {
 			producer_worker_id: WorkerId::from_u128(1),
 			producer_endpoint: WorkerEndpoint::new("in-memory-worker-1"),
 			partitions: vec![payload.entry()],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		store.publish(manifest, vec![payload]).unwrap();
@@ -869,6 +870,7 @@ mod tests {
 					producer_worker_id: WorkerId::from_u128(2),
 					producer_endpoint: WorkerEndpoint::new("in-memory-worker-2"),
 					partitions: vec![payload.entry()],
+					runtime_filter_fragment: None,
 					backend: PartitionBackend::InMemory,
 				},
 				vec![payload],
@@ -948,6 +950,7 @@ mod tests {
 			producer_worker_id,
 			producer_endpoint: producer_endpoint.clone(),
 			partitions: vec![payload.entry()],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		producer_store
@@ -1479,7 +1482,10 @@ mod tests {
 			),
 			partition: None,
 			plan,
-			inputs: vec![TaskInputBinding::Scan { share: None }],
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
 			output: TaskOutputBinding::FinalResult,
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,

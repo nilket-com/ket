@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use wendelon::schema::RuntimeFilterDescriptor;
 
 pub struct ToronWorker {
 	storage: Arc<dyn StorageScan>,
@@ -134,7 +135,8 @@ impl ToronWorker {
 		});
 		let task_context = ExecutionContext::local_test()
 			.with_task_budget(spec.budget)
-			.with_task_telemetry(telemetry.clone());
+			.with_task_telemetry(telemetry.clone())
+			.with_runtime_filter(scan_runtime_filter(spec));
 		let results = if overrides.is_empty() {
 			let executor = Executor::with_context(self.storage.clone(), task_context);
 			executor.execute_bound(&spec.plan, morsel).await?
@@ -290,6 +292,7 @@ impl ToronWorker {
 			producer_worker_id: self.worker_id,
 			producer_endpoint: self.endpoint.clone(),
 			partitions: payloads.iter().map(PartitionPayload::entry).collect(),
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let manifest = self
@@ -469,10 +472,26 @@ impl ToronWorker {
 
 fn scan_share_morsel(spec: &TaskSpec) -> Option<(MorselId, u32)> {
 	spec.inputs.iter().find_map(|input| match input {
-		TaskInputBinding::Scan { share: Some(share) } => {
-			Some((MorselId(share.worker_index), share.worker_count))
+		TaskInputBinding::Scan {
+			share: Some(share), ..
+		} => Some((MorselId(share.worker_index), share.worker_count)),
+		TaskInputBinding::Scan { share: None, .. } | TaskInputBinding::ShuffleConsumer { .. } => {
+			None
 		}
-		TaskInputBinding::Scan { share: None } | TaskInputBinding::ShuffleConsumer { .. } => None,
+	})
+}
+
+fn scan_runtime_filter(spec: &TaskSpec) -> Option<RuntimeFilterDescriptor> {
+	spec.inputs.iter().find_map(|input| match input {
+		TaskInputBinding::Scan {
+			runtime_filter: Some(runtime_filter),
+			..
+		} => Some(runtime_filter.clone()),
+		TaskInputBinding::Scan {
+			runtime_filter: None,
+			..
+		}
+		| TaskInputBinding::ShuffleConsumer { .. } => None,
 	})
 }
 
@@ -604,10 +623,11 @@ fn worker_count_label(spec: &TaskSpec) -> Option<u32> {
 	spec.inputs
 		.iter()
 		.find_map(|input| match input {
-			TaskInputBinding::Scan { share: Some(share) } => Some(share.worker_count),
-			TaskInputBinding::Scan { share: None } | TaskInputBinding::ShuffleConsumer { .. } => {
-				None
-			}
+			TaskInputBinding::Scan {
+				share: Some(share), ..
+			} => Some(share.worker_count),
+			TaskInputBinding::Scan { share: None, .. }
+			| TaskInputBinding::ShuffleConsumer { .. } => None,
 		})
 		.or_else(|| match &spec.output {
 			TaskOutputBinding::ShuffleProducer {
@@ -669,15 +689,17 @@ fn validate_broadcast_caps(spec: &TaskSpec) -> Result<(), QueryError> {
 		.fold(0u64, |total, partition| {
 			total.saturating_add(partition.size_bytes.get())
 		});
-	let worker_count =
-		spec.inputs
-			.iter()
-			.find_map(|input| match input {
-				TaskInputBinding::Scan { share: Some(share) } => Some(share.worker_count),
-				TaskInputBinding::Scan { share: None }
-				| TaskInputBinding::ShuffleConsumer { .. } => None,
-			})
-			.unwrap_or(1);
+	let worker_count = spec
+		.inputs
+		.iter()
+		.find_map(|input| match input {
+			TaskInputBinding::Scan {
+				share: Some(share), ..
+			} => Some(share.worker_count),
+			TaskInputBinding::Scan { share: None, .. }
+			| TaskInputBinding::ShuffleConsumer { .. } => None,
+		})
+		.unwrap_or(1);
 
 	if build_bytes > spec.budget.broadcast_build_bytes.get() {
 		return Err(broadcast_cap_exhausted(
@@ -741,9 +763,48 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
+		RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 	};
+
+	#[test]
+	fn scan_runtime_filter_reads_scan_binding_descriptor() {
+		let plan = scan(TableId(1), 1);
+		let ExecutionPlan::Scan { fingerprint, .. } = &plan else {
+			panic!("scan plan");
+		};
+		let runtime_filter = RuntimeFilterDescriptor {
+			key_encoding_version: 1,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![0],
+			hash_seed: 7,
+			bit_count: 8,
+			hash_count: 1,
+			byte_budget: 1,
+			target_fp_rate_bp: 100,
+			payload: vec![0b0101_0101],
+			probe_descriptor_fingerprint: *fingerprint,
+		};
+		let spec = TaskSpec {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(1),
+				StageId::new(1),
+				TaskId::new(0),
+				AttemptId::first(),
+			),
+			partition: None,
+			plan,
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: Some(runtime_filter.clone()),
+			}],
+			output: TaskOutputBinding::FinalResult,
+			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
+			trace: None,
+		};
+
+		assert_eq!(scan_runtime_filter(&spec), Some(runtime_filter));
+	}
 
 	#[test]
 	fn broadcast_cap_validation_charges_replicated_build_bytes() {
@@ -776,6 +837,7 @@ mod tests {
 						worker_index: 0,
 						worker_count: 2,
 					}),
+					runtime_filter: None,
 				},
 				TaskInputBinding::ShuffleConsumer {
 					exchange_id: ExchangeId::new(0),
@@ -847,7 +909,10 @@ mod tests {
 			),
 			partition: None,
 			plan: scan(TableId(1), 1),
-			inputs: vec![TaskInputBinding::Scan { share: None }],
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
 			output: TaskOutputBinding::ShuffleProducer {
 				exchange_id: ExchangeId::new(1),
 				partition_count: PartitionCount::new(1),

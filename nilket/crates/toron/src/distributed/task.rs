@@ -7,6 +7,7 @@ use crate::distributed::identity::{
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::{ExecutionExpr, ExecutionPlan, TableId};
 use crate::server::spill::SpillId;
+use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArrowIpcDigest(pub [u8; 32]);
@@ -138,6 +139,8 @@ pub struct TaskSpec {
 pub enum TaskInputBinding {
 	Scan {
 		share: Option<ScanShare>,
+		#[serde(default)]
+		runtime_filter: Option<RuntimeFilterDescriptor>,
 	},
 	ShuffleConsumer {
 		exchange_id: ExchangeId,
@@ -190,7 +193,21 @@ pub struct PartitionManifest {
 	pub producer_worker_id: WorkerId,
 	pub producer_endpoint: WorkerEndpoint,
 	pub partitions: Vec<PartitionEntry>,
+	#[serde(default)]
+	pub runtime_filter_fragment: Option<RuntimeFilterFragment>,
 	pub backend: PartitionBackend,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFilterFragment {
+	pub key_encoding_version: u32,
+	pub key_types: Vec<RuntimeFilterKeyType>,
+	pub hash_seed: u64,
+	pub bit_count: u32,
+	pub hash_count: u8,
+	pub byte_budget: u32,
+	pub target_fp_rate_bp: u16,
+	pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +256,11 @@ impl Default for RetryPolicy {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use wendelon::schema::{
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
+	};
 
 	#[test]
 	fn retry_policy_defaults_to_one_retry() {
@@ -263,17 +285,90 @@ mod tests {
 	}
 
 	#[test]
-	fn scan_share_round_trips_through_task_input_binding() {
-		let input = TaskInputBinding::Scan {
-			share: Some(ScanShare {
-				worker_index: 2,
-				worker_count: 4,
-			}),
-		};
+	fn scan_binding_round_trips_with_and_without_runtime_filter() {
+		for runtime_filter in [None, Some(runtime_filter_descriptor())] {
+			let input = TaskInputBinding::Scan {
+				share: Some(ScanShare {
+					worker_index: 2,
+					worker_count: 4,
+				}),
+				runtime_filter,
+			};
 
-		let encoded = postcard::to_allocvec(&input).expect("encode scan share");
-		let decoded: TaskInputBinding = postcard::from_bytes(&encoded).expect("decode scan share");
+			let encoded = postcard::to_allocvec(&input).expect("encode scan binding");
+			let decoded: TaskInputBinding =
+				postcard::from_bytes(&encoded).expect("decode scan binding");
 
-		assert_eq!(decoded, input);
+			assert_eq!(decoded, input);
+		}
+	}
+
+	#[test]
+	fn partition_manifest_round_trips_with_and_without_fragment() {
+		for runtime_filter_fragment in [None, Some(runtime_filter_fragment())] {
+			let manifest = PartitionManifest {
+				query_id: QueryId::from_u128(1),
+				stage_id: StageId::new(2),
+				task_id: TaskId::new(3),
+				attempt_id: AttemptId::new(4),
+				exchange_id: ExchangeId::new(5),
+				producer_worker_id: WorkerId::from_u128(6),
+				producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+				partitions: vec![PartitionEntry {
+					partition_id: PartitionId::new(7),
+					size_bytes: ByteCount::new(8),
+					row_count: RowCount::new(9),
+					digest: ArrowIpcDigest::new([10; 32]),
+				}],
+				runtime_filter_fragment,
+				backend: PartitionBackend::InMemory,
+			};
+
+			let encoded = postcard::to_allocvec(&manifest).expect("encode manifest");
+			let decoded: PartitionManifest =
+				postcard::from_bytes(&encoded).expect("decode manifest");
+
+			assert_eq!(decoded, manifest);
+		}
+	}
+
+	fn runtime_filter_descriptor() -> RuntimeFilterDescriptor {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([6; 16]),
+			1,
+			"default",
+			"runtime_filter_test",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptorV1::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicyV1::AdditiveOnly,
+		)
+		.expect("descriptor");
+		RuntimeFilterDescriptor {
+			key_encoding_version: 1,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![0],
+			hash_seed: 7,
+			bit_count: 8,
+			hash_count: 1,
+			byte_budget: 1,
+			target_fp_rate_bp: 100,
+			payload: vec![0xFF],
+			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		}
+	}
+
+	fn runtime_filter_fragment() -> RuntimeFilterFragment {
+		RuntimeFilterFragment {
+			key_encoding_version: 1,
+			key_types: vec![RuntimeFilterKeyType::Int64],
+			hash_seed: 7,
+			bit_count: 16,
+			hash_count: 2,
+			byte_budget: 2,
+			target_fp_rate_bp: 100,
+			payload: vec![0b1010_0101, 0b0101_1010],
+		}
 	}
 }

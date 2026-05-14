@@ -17,6 +17,11 @@ use crate::distributed::worker_registry::{
 	PlacementHints, UnixMillis, WorkerEntry, WorkerRegistry,
 };
 use crate::error::TaskFailureKind;
+use crate::exec::runtime_filter::{
+	build_runtime_filter_fragment, descriptor_from_fragment, merge_fragments,
+};
+use crate::ir::{ExecutionExpr, ExecutionPlan};
+use wendelon::schema::PhysicalDescriptorFingerprint;
 
 #[derive(Debug, Clone)]
 pub struct StagePlan {
@@ -100,7 +105,14 @@ pub struct DistributedScheduler<Registry> {
 	state: TaskStateStore,
 	accepted_manifests: HashMap<TaskKey, PartitionManifest>,
 	task_dependencies: HashMap<TaskKey, Vec<PartitionAddress>>,
+	runtime_filter_merges: HashMap<(QueryId, StageId), RuntimeFilterMerge>,
 	telemetry: SchedulerTelemetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RuntimeFilterMerge {
+	Active(crate::distributed::task::RuntimeFilterFragment),
+	Dropped,
 }
 
 impl<Registry> DistributedScheduler<Registry>
@@ -113,6 +125,7 @@ where
 			state: TaskStateStore::new(),
 			accepted_manifests: HashMap::new(),
 			task_dependencies: HashMap::new(),
+			runtime_filter_merges: HashMap::new(),
 			telemetry: SchedulerTelemetry::default(),
 		}
 	}
@@ -160,6 +173,8 @@ where
 			.retain(|key, _| key.query_id != query_id);
 		self.task_dependencies
 			.retain(|key, _| key.query_id != query_id);
+		self.runtime_filter_merges
+			.retain(|(merge_query_id, _), _| *merge_query_id != query_id);
 		let cancelled = self.state.cancel_query(query_id);
 		self.telemetry.cancellation_cleanup_count = self
 			.telemetry
@@ -234,7 +249,7 @@ where
 
 					loop {
 						attempts_spawned += 1;
-						let mut spec = self.materialize_task_spec(task.spec.clone())?;
+						let mut spec = self.materialize_task_spec(task.spec.clone(), stages)?;
 						spec.identity = TaskIdentity::new(
 							spec.identity.query_id,
 							spec.identity.stage_id,
@@ -258,6 +273,7 @@ where
 							DispatchOutcome::Completed(output) => {
 								self.accept_dispatch_completion(
 									&spec,
+									stages,
 									worker_id,
 									key,
 									output,
@@ -272,6 +288,7 @@ where
 							DispatchOutcome::CompletedWithBatches { output, batches } => {
 								self.accept_dispatch_completion(
 									&spec,
+									stages,
 									worker_id,
 									key,
 									output,
@@ -295,6 +312,7 @@ where
 								self.telemetry.task_telemetry.push(telemetry);
 								self.accept_dispatch_completion(
 									&spec,
+									stages,
 									worker_id,
 									key,
 									output,
@@ -390,6 +408,7 @@ where
 	fn accept_dispatch_completion(
 		&mut self,
 		spec: &TaskSpec,
+		stages: &[StagePlan],
 		worker_id: crate::distributed::identity::WorkerId,
 		key: TaskKey,
 		output: TaskCompletionOutput,
@@ -406,7 +425,13 @@ where
 			TaskCompletionOutput::FinalResult { .. } => {
 				final_results.extend(result_batches);
 			}
-			TaskCompletionOutput::ShuffleProducer { manifest } => {
+			TaskCompletionOutput::ShuffleProducer { mut manifest } => {
+				self.maybe_attach_runtime_filter_fragment(
+					spec,
+					stages,
+					&result_batches,
+					&mut manifest,
+				)?;
 				self.accepted_manifests.insert(key, manifest);
 			}
 		}
@@ -481,8 +506,24 @@ where
 		})
 	}
 
-	fn materialize_task_spec(&self, mut spec: TaskSpec) -> Result<TaskSpec, SchedulerError> {
+	fn materialize_task_spec(
+		&self,
+		mut spec: TaskSpec,
+		stages: &[StagePlan],
+	) -> Result<TaskSpec, SchedulerError> {
+		let runtime_filter = self.runtime_filter_descriptor_for_probe(&spec, stages);
 		for input in &mut spec.inputs {
+			if let TaskInputBinding::Scan {
+				runtime_filter: input_runtime_filter,
+				..
+			} = input
+			{
+				if input_runtime_filter.is_none() {
+					*input_runtime_filter = runtime_filter.clone();
+				}
+				continue;
+			}
+
 			let TaskInputBinding::ShuffleConsumer {
 				exchange_id,
 				producer_stage_id,
@@ -543,6 +584,100 @@ where
 		}
 
 		Ok(spec)
+	}
+
+	fn maybe_attach_runtime_filter_fragment(
+		&mut self,
+		spec: &TaskSpec,
+		stages: &[StagePlan],
+		result_batches: &[RecordBatch],
+		manifest: &mut PartitionManifest,
+	) -> Result<(), SchedulerError> {
+		if !runtime_filter_build_stage(spec, stages) {
+			return Ok(());
+		}
+		if let Some(fragment) = manifest.runtime_filter_fragment.clone() {
+			self.record_runtime_filter_fragment(
+				spec.identity.query_id,
+				spec.identity.stage_id,
+				fragment,
+			);
+			return Ok(());
+		}
+		if result_batches.is_empty() {
+			return Ok(());
+		}
+		let TaskOutputBinding::ShuffleProducer { partition_key, .. } = &spec.output else {
+			return Ok(());
+		};
+		let Some(fragment) =
+			build_runtime_filter_fragment(result_batches, partition_key).map_err(|err| {
+				SchedulerError::Acceptance(format!("runtime filter generation failed: {err:?}"))
+			})?
+		else {
+			return Ok(());
+		};
+		manifest.runtime_filter_fragment = Some(fragment.clone());
+		self.record_runtime_filter_fragment(
+			spec.identity.query_id,
+			spec.identity.stage_id,
+			fragment,
+		);
+		Ok(())
+	}
+
+	fn record_runtime_filter_fragment(
+		&mut self,
+		query_id: QueryId,
+		stage_id: StageId,
+		fragment: crate::distributed::task::RuntimeFilterFragment,
+	) {
+		match self.runtime_filter_merges.entry((query_id, stage_id)) {
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert(RuntimeFilterMerge::Active(fragment));
+			}
+			std::collections::hash_map::Entry::Occupied(mut entry) => {
+				if let RuntimeFilterMerge::Active(active) = entry.get_mut() {
+					if !merge_fragments(active, &fragment) {
+						entry.insert(RuntimeFilterMerge::Dropped);
+					}
+				}
+			}
+		}
+	}
+
+	fn runtime_filter_descriptor_for_probe(
+		&self,
+		spec: &TaskSpec,
+		stages: &[StagePlan],
+	) -> Option<wendelon::schema::RuntimeFilterDescriptor> {
+		let stage = stages
+			.iter()
+			.find(|stage| stage.stage_id == spec.identity.stage_id)?;
+		if !matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. })
+			|| stage.upstream_stages.len() != 1
+		{
+			return None;
+		}
+		let build_stage_id = stage.upstream_stages[0];
+		let RuntimeFilterMerge::Active(fragment) = self
+			.runtime_filter_merges
+			.get(&(spec.identity.query_id, build_stage_id))?
+		else {
+			return None;
+		};
+		let TaskOutputBinding::ShuffleProducer { partition_key, .. } = &spec.output else {
+			return None;
+		};
+		let [ExecutionExpr::Column(column)] = partition_key.as_slice() else {
+			return None;
+		};
+		let probe_descriptor_fingerprint = first_scan_fingerprint(&spec.plan)?;
+		Some(descriptor_from_fragment(
+			fragment,
+			vec![column.ordinal.0],
+			probe_descriptor_fingerprint,
+		))
 	}
 
 	fn refresh_drained_producers(&mut self, stages: &[StagePlan]) {
@@ -610,6 +745,29 @@ fn task_dependencies(spec: &TaskSpec) -> Vec<PartitionAddress> {
 		.collect()
 }
 
+fn runtime_filter_build_stage(spec: &TaskSpec, stages: &[StagePlan]) -> bool {
+	matches!(spec.output, TaskOutputBinding::ShuffleProducer { .. })
+		&& stages.iter().any(|stage| {
+			stage.upstream_stages.as_slice() == [spec.identity.stage_id]
+				&& stage.tasks.iter().any(|task| {
+					matches!(task.spec.output, TaskOutputBinding::ShuffleProducer { .. })
+				})
+		})
+}
+
+fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFingerprint> {
+	match plan {
+		ExecutionPlan::Scan { fingerprint, .. } => Some(*fingerprint),
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => first_scan_fingerprint(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
+		}
+	}
+}
+
 fn failure_retryable(kind: &TaskFailureKind) -> bool {
 	match kind {
 		TaskFailureKind::TaskFailed { retryable, .. } => *retryable,
@@ -637,14 +795,15 @@ mod tests {
 	use crate::distributed::budget::{ByteCount, QueryBudget, TaskBudget};
 	use crate::distributed::identity::{ExchangeId, PartitionId, QueryId, TaskId, WorkerId};
 	use crate::distributed::task::{
-		ArrowIpcDigest, PartitionBackend, PartitionEntry, RowCount, TaskInputBinding,
-		TaskOutputBinding,
+		ArrowIpcDigest, PartitionBackend, PartitionEntry, RowCount, RuntimeFilterFragment,
+		TaskInputBinding, TaskOutputBinding,
 	};
 	use crate::distributed::worker_registry::{
 		ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
 		WorkerEndpoint, WorkerLease, WorkerResourceState, WorkerStatus,
 	};
-	use crate::ir::ExecutionPlan;
+	use crate::ir::{ColumnName, ColumnOrdinal, ExecutionPlan, ResolvedColumn};
+	use arrow::array::{ArrayRef, Int64Array};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::VecDeque;
 	use std::sync::Arc;
@@ -707,7 +866,10 @@ mod tests {
 				profile_hint: crate::ir::QueryProfileHint::Scan,
 				primary_key_columns: Vec::new(),
 			},
-			inputs: vec![TaskInputBinding::Scan { share: None }],
+			inputs: vec![TaskInputBinding::Scan {
+				share: None,
+				runtime_filter: None,
+			}],
 			output: TaskOutputBinding::FinalResult,
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,
@@ -756,6 +918,29 @@ mod tests {
 		DispatchOutcome::Completed(TaskCompletionOutput::FinalResult {
 			output_digest: None,
 		})
+	}
+
+	fn int64_partition_key() -> Vec<ExecutionExpr> {
+		vec![ExecutionExpr::Column(ResolvedColumn {
+			name: ColumnName("id".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type: DataType::Int64,
+			nullable: false,
+			pbc_eligible: true,
+		})]
+	}
+
+	fn runtime_filter_fragment(payload: Vec<u8>, hash_count: u8) -> RuntimeFilterFragment {
+		RuntimeFilterFragment {
+			key_encoding_version: 1,
+			key_types: vec![wendelon::schema::RuntimeFilterKeyType::Int64],
+			hash_seed: 7,
+			bit_count: 16,
+			hash_count,
+			byte_budget: u32::try_from(payload.len()).expect("payload len fits u32"),
+			target_fp_rate_bp: 100,
+			payload,
+		}
 	}
 
 	#[tokio::test]
@@ -963,6 +1148,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([3; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stage = StagePlan {
@@ -984,6 +1170,276 @@ mod tests {
 
 		assert_eq!(run.accepted_manifests.get(&key), Some(&manifest));
 		assert_eq!(scheduler.accepted_manifest(key), Some(&manifest));
+	}
+
+	#[tokio::test]
+	async fn coordinator_injects_merged_filter_into_probe_task_binding() {
+		let build_exchange_id = ExchangeId::new(9);
+		let probe_exchange_id = ExchangeId::new(10);
+		let mut build = task(StageId::new(0), TaskId::new(0));
+		build.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id: build_exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: int64_partition_key(),
+		};
+		let build_key = TaskKey::from_identity(build.spec.identity);
+		let mut probe = task(StageId::new(1), TaskId::new(0));
+		probe.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id: probe_exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: int64_partition_key(),
+		};
+		let build_manifest = PartitionManifest {
+			query_id: build.spec.identity.query_id,
+			stage_id: build.spec.identity.stage_id,
+			task_id: build.spec.identity.task_id,
+			attempt_id: build.spec.identity.attempt_id,
+			exchange_id: build_exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+			partitions: vec![PartitionEntry {
+				partition_id: PartitionId::new(0),
+				size_bytes: ByteCount::new(8),
+				row_count: RowCount::new(2),
+				digest: ArrowIpcDigest::new([4; 32]),
+			}],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		};
+		let probe_manifest = PartitionManifest {
+			query_id: probe.spec.identity.query_id,
+			stage_id: probe.spec.identity.stage_id,
+			task_id: probe.spec.identity.task_id,
+			attempt_id: probe.spec.identity.attempt_id,
+			exchange_id: probe_exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+			partitions: vec![PartitionEntry {
+				partition_id: PartitionId::new(0),
+				size_bytes: ByteCount::new(8),
+				row_count: RowCount::new(2),
+				digest: ArrowIpcDigest::new([5; 32]),
+			}],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		};
+		let build_batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![10_i64, 20])) as ArrayRef],
+		)
+		.expect("build batch");
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: Vec::new(),
+				tasks: vec![build],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![probe],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let mut dispatcher = ScriptedDispatcher::new([
+			DispatchOutcome::CompletedWithBatches {
+				output: TaskCompletionOutput::ShuffleProducer {
+					manifest: build_manifest,
+				},
+				batches: vec![build_batch],
+			},
+			DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer {
+				manifest: probe_manifest,
+			}),
+		]);
+
+		let run = scheduler
+			.dispatch_loop(&stages, &mut dispatcher)
+			.await
+			.expect("dispatch");
+
+		let TaskInputBinding::Scan {
+			runtime_filter: Some(runtime_filter),
+			..
+		} = &dispatcher.seen[1].inputs[0]
+		else {
+			panic!("probe scan binding should carry runtime filter");
+		};
+		let accepted_build = run
+			.accepted_manifests
+			.get(&build_key)
+			.expect("accepted build manifest");
+		let fragment = accepted_build
+			.runtime_filter_fragment
+			.as_ref()
+			.expect("build fragment");
+		assert_eq!(runtime_filter.probe_key_columns, vec![0]);
+		assert_eq!(
+			runtime_filter.probe_descriptor_fingerprint,
+			physical_fingerprint()
+		);
+		assert_eq!(runtime_filter.payload, fragment.payload);
+		assert!(runtime_filter.payload.iter().any(|byte| *byte != 0));
+	}
+
+	#[tokio::test]
+	async fn coordinator_merge_excludes_retryable_failed_attempt() {
+		let build_exchange_id = ExchangeId::new(19);
+		let probe_exchange_id = ExchangeId::new(20);
+		let mut build = task(StageId::new(0), TaskId::new(0));
+		build.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id: build_exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: int64_partition_key(),
+		};
+		let mut probe = task(StageId::new(1), TaskId::new(0));
+		probe.spec.output = TaskOutputBinding::ShuffleProducer {
+			exchange_id: probe_exchange_id,
+			partition_count: crate::distributed::task::PartitionCount::new(1),
+			partition_key: int64_partition_key(),
+		};
+		let build_manifest = PartitionManifest {
+			query_id: build.spec.identity.query_id,
+			stage_id: build.spec.identity.stage_id,
+			task_id: build.spec.identity.task_id,
+			attempt_id: AttemptId::new(1),
+			exchange_id: build_exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+			partitions: vec![PartitionEntry {
+				partition_id: PartitionId::new(0),
+				size_bytes: ByteCount::new(8),
+				row_count: RowCount::new(1),
+				digest: ArrowIpcDigest::new([6; 32]),
+			}],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		};
+		let probe_manifest = PartitionManifest {
+			query_id: probe.spec.identity.query_id,
+			stage_id: probe.spec.identity.stage_id,
+			task_id: probe.spec.identity.task_id,
+			attempt_id: probe.spec.identity.attempt_id,
+			exchange_id: probe_exchange_id,
+			producer_worker_id: WorkerId::from_u128(1),
+			producer_endpoint: WorkerEndpoint::new("127.0.0.1:9191"),
+			partitions: vec![PartitionEntry {
+				partition_id: PartitionId::new(0),
+				size_bytes: ByteCount::new(8),
+				row_count: RowCount::new(1),
+				digest: ArrowIpcDigest::new([7; 32]),
+			}],
+			runtime_filter_fragment: None,
+			backend: PartitionBackend::InMemory,
+		};
+		let accepted_batch = RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(vec![111_i64])) as ArrayRef],
+		)
+		.expect("accepted batch");
+		let stages = [
+			StagePlan {
+				stage_id: StageId::new(0),
+				upstream_stages: Vec::new(),
+				tasks: vec![build],
+			},
+			StagePlan {
+				stage_id: StageId::new(1),
+				upstream_stages: vec![StageId::new(0)],
+				tasks: vec![probe],
+			},
+		];
+		let mut scheduler = DistributedScheduler::new(registry());
+		let mut dispatcher = ScriptedDispatcher::new([
+			DispatchOutcome::Failed(TaskFailureKind::TaskFailed {
+				reason: "transient".to_string(),
+				retryable: true,
+			}),
+			DispatchOutcome::CompletedWithBatches {
+				output: TaskCompletionOutput::ShuffleProducer {
+					manifest: build_manifest,
+				},
+				batches: vec![accepted_batch],
+			},
+			DispatchOutcome::Completed(TaskCompletionOutput::ShuffleProducer {
+				manifest: probe_manifest,
+			}),
+		]);
+
+		scheduler
+			.dispatch_loop(&stages, &mut dispatcher)
+			.await
+			.expect("dispatch");
+
+		assert_eq!(dispatcher.seen[0].identity.attempt_id, AttemptId::first());
+		assert_eq!(dispatcher.seen[1].identity.attempt_id, AttemptId::new(1));
+		let TaskInputBinding::Scan {
+			runtime_filter: Some(runtime_filter),
+			..
+		} = &dispatcher.seen[2].inputs[0]
+		else {
+			panic!("probe scan binding should carry retry fragment");
+		};
+		let accepted_fragment = build_runtime_filter_fragment(
+			&[RecordBatch::try_new(
+				Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+				vec![Arc::new(Int64Array::from(vec![111_i64])) as ArrayRef],
+			)
+			.expect("expected fragment batch")],
+			&int64_partition_key(),
+		)
+		.expect("fragment result")
+		.expect("fragment");
+		assert_eq!(runtime_filter.payload, accepted_fragment.payload);
+	}
+
+	#[test]
+	fn coordinator_merge_order_invariant() {
+		let query_id = QueryId::from_u128(99);
+		let stage_id = StageId::new(3);
+		let fragment_a = runtime_filter_fragment(vec![0b0000_1111, 0], 2);
+		let fragment_b = runtime_filter_fragment(vec![0, 0b1111_0000], 2);
+		let mut left = DistributedScheduler::new(registry());
+		left.record_runtime_filter_fragment(query_id, stage_id, fragment_a.clone());
+		left.record_runtime_filter_fragment(query_id, stage_id, fragment_b.clone());
+		let mut right = DistributedScheduler::new(registry());
+		right.record_runtime_filter_fragment(query_id, stage_id, fragment_b);
+		right.record_runtime_filter_fragment(query_id, stage_id, fragment_a);
+
+		assert_eq!(
+			left.runtime_filter_merges.get(&(query_id, stage_id)),
+			right.runtime_filter_merges.get(&(query_id, stage_id))
+		);
+		assert_eq!(
+			left.runtime_filter_merges.get(&(query_id, stage_id)),
+			Some(&RuntimeFilterMerge::Active(runtime_filter_fragment(
+				vec![0b0000_1111, 0b1111_0000],
+				2
+			)))
+		);
+	}
+
+	#[test]
+	fn coordinator_merge_drops_incompatible_fragments() {
+		let query_id = QueryId::from_u128(100);
+		let stage_id = StageId::new(4);
+		let mut scheduler = DistributedScheduler::new(registry());
+
+		scheduler.record_runtime_filter_fragment(
+			query_id,
+			stage_id,
+			runtime_filter_fragment(vec![0b0000_1111, 0], 2),
+		);
+		scheduler.record_runtime_filter_fragment(
+			query_id,
+			stage_id,
+			runtime_filter_fragment(vec![0, 0b1111_0000], 3),
+		);
+
+		assert_eq!(
+			scheduler.runtime_filter_merges.get(&(query_id, stage_id)),
+			Some(&RuntimeFilterMerge::Dropped)
+		);
 	}
 
 	#[tokio::test]
@@ -1010,6 +1466,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([3; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stage = StagePlan {
@@ -1061,6 +1518,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([3; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stage = StagePlan {
@@ -1128,6 +1586,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([3; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stage = StagePlan {
@@ -1209,6 +1668,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([3; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let mut scheduler = DistributedScheduler::new(registry());
@@ -1324,6 +1784,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([4; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stages = [
@@ -1395,6 +1856,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([4; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stages = [
@@ -1462,6 +1924,7 @@ mod tests {
 				row_count: RowCount::new(1),
 				digest: ArrowIpcDigest::new([4; 32]),
 			}],
+			runtime_filter_fragment: None,
 			backend: PartitionBackend::InMemory,
 		};
 		let stages = [
