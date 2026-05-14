@@ -35,6 +35,19 @@ along with the forward-sequence rewrite.
   `framework_overhead_ms` moved proportionally, placing ADR 006 in
   the operator-adjacent band rather than runtime-plumbing
   investigation.
+- **ADR 006 — Runtime Filter Pushdown.** Promoted.
+  Implementation pending. Cross-ring optimization contract:
+  advisory Bloom runtime filters for hash-partitioned inner
+  equi-joins via two-wave execution. Pinned by ADR 005's
+  post-promotion telemetry — the bytes-movement cluster
+  (`batch_send` + `shuffle_pull_decode` + `output_publish` +
+  `batch_encode` = 558ms, 34.1%) overtook build as the largest
+  bucket. ADR 006 attacks the cluster at the source (Wendelon
+  filters probe rows before they hit the wire) rather than
+  moving the same bytes faster. Advisory invariant makes
+  split-shipment safe: Toron-side promotion bench arrives first;
+  full Wendelon-enabled end-to-end row lands in a bench-results
+  update once Wendelon-side application ships.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -72,120 +85,178 @@ narrow ADR earns its scope from the prior ADR's bench
 evidence.
 
 **Evidence drives scope.** The most informative artifact for
-the next ADR is the previous ADR's bench results. ADR 004's
-post-promotion telemetry rerun
-(`plans/impl/004_distributed_inner_equi_join_bench_results.md`)
-sub-attributed the 8-worker task wall and produced the
-ADR 005 scope decision: `build_ms` at 47.7% is the dominant
-sharp bucket, `framework_overhead_ms` at 37.7% is real but
-unfocused, probe + output combined at ~7% demoted the
-streaming-executor hypothesis. ADR 005 narrowed onto the
-build path; ADR 006's scope is governed by the conditional
-rerun rule below.
+the next ADR is the previous ADR's bench results. ADR 005's
+post-promotion telemetry showed `build_ms` fell to 33.1% of
+wall while the bytes-movement cluster (`batch_send` +
+`shuffle_pull_decode` + `output_publish` + `batch_encode`)
+rose to 34.1% — overtaking build as the largest bucket. The
+user pinned **Evidence Pressure > Launch Pressure** for ADR
+006, selecting Topic A (runtime filter pushdown) over
+launch-driven candidates. ADR 006 attacks the bytes-movement
+cluster at the source via Bloom runtime filters and two-wave
+hash-partitioned execution. The conditional ADR 005 rule
+already resolved the residual to operator-adjacent — no
+runtime-plumbing investigation is on the table. ADR 007's
+scope depends on the ADR 006 selective bench rerun and any
+launch-pressure shift; the candidate ordering below reflects
+the post-ADR-006 landscape.
+
+**Scale-boundary convention (adopted iter-5 of ADR 006).**
+Every ADR from ADR 006 forward includes an explicit
+**Scale boundary** structural section after Status and before
+Context. Scale boundaries seen so far: process-internal
+(Rune sandbox), operator-level (ADR 004, ADR 005, outer
+joins), cluster-wide (governance, ADR 003), cross-ring
+(ADR 002, ADR 006), transport (ADR 003 wire, ADR 006
+`PartitionManifest`/`ScanRequest` additions),
+storage-internal (Wendelon). The decomposition makes
+scope-creep into adjacent boundaries visible at review
+time and sharpens ADR selection: same operator at different
+scales is a different contract.
 
 ## Forward sequence
 
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Next: ADR 006 planning
+### Next: ADR 006 implementation → ADR 007 planning
 
-ADR 005's contract is implemented. Its promotion-scale rerun at
-`plans/impl/005_hash_join_build_path_efficiency_bench_results.md`
-resolves the ADR 006 framing via the pinned three-band rule:
+ADR 006's contract is pinned at
+`plans/adr/006_runtime_filter_pushdown.md`; the impl plan lives at
+`plans/impl/006_runtime_filter_pushdown.md`. The next council
+deliverable is implementation through Phase 5, ending in
+promotion-scale bench evidence at
+`plans/impl/006_runtime_filter_pushdown_bench_results.md`.
 
-- **Operator-adjacent residual (>=50% proportional drop).** ADR 006
-  does **not** promote runtime-plumbing investigation. ADR 006
-  selects from the candidates below by V1 launch pressure and
-  evidence-driven scope.
-- **Flat residual (<=20% proportional drop).** ADR 006 promotes a
-  runtime-plumbing investigation with sharp scope: async-runtime
-  poll cost, allocator churn beyond ADR 005's wins, lock contention
-  beyond ADR 004's telemetry-lock bucket, scheduler/registry
-  plumbing.
-- **Gray zone (20% < drop < 50%).** Brief council readout decides.
-- **Both build and residual flat.** ADR 005 missed the real
-  bottleneck; council reopens scope rather than treating residual
-  plumbing as proven.
+ADR 006 ships in two stages per its split-shipment posture:
+**Toron-side promotion** lands first (gates 19/20/21 +
+correctness); **Wendelon-enabled selective bench evidence**
+arrives in a follow-up bench-results update once Wendelon-side
+application is in. Both stages feed ADR 007's framing:
 
-ADR 005 landed in the **operator-adjacent** band: at 8 workers,
-`build_ms` fell 79.0% and `framework_overhead_ms` fell 78.8%.
+- **Toron-side promotion ships; Wendelon-enabled selective row
+  later hits >=50% bytes-movement cluster reduction.** Topic A
+  worked as designed. ADR 007 selects from the launch-driven
+  candidates below or V1.x runtime-filter extensions, depending
+  on launch pressure and the next evidence-driven bottleneck.
+- **Non-selective guard regresses beyond 10% at Toron-side
+  promotion time.** Blocks promotion; council selects
+  accept-narrower / scope-down (narrow filter eligibility) /
+  shelve before ADR 006 ships. If scope-down ships, ADR 007
+  reopens with sharper eligibility rules + the deferred
+  candidates.
+- **Wendelon-enabled selective row later misses >=50%.** Toron-side
+  ADR 006 stays shipped; the follow-up bench update triggers
+  the same three council paths (accept narrower / scope-down /
+  shelve) as a forward decision, not a retroactive de-promotion.
+  ADR 007 likely reopens with Topic E (cross-process wire
+  efficiency, the compute-ring fallback) or a re-examined
+  evidence picture.
 
-### ADR 006 candidates (governed by the conditional rule)
+### ADR 007 candidates (post-ADR-006 reordered)
 
-ADR 005 landed in the **operator-adjacent** band, so ADR 006 picks
-from the live V1-touching candidates below rather than promoting a
-runtime-plumbing investigation.
+With Topic A consumed by ADR 006, the remaining candidates
+rotate. The candidates, in rough order of probable selection
+given evidence shapes the council can already anticipate:
 
-The candidates, in rough order of probable selection given evidence
-shapes the council can already anticipate:
+#### Candidate A — Outer / semi / anti joins
 
-#### Candidate A — Bloom / runtime filter pushdown into Wendelon
-
-The cross-ring contract that completes Toron's "smart-storage
-pushdown" thesis for joins. Build-side stage produces a Bloom filter
-(or exact `InList` for small build sets) from observed keys;
-coordinator attaches the filter to the probe-side `ScanRequest`
-(ADR 002 surface); Wendelon applies the filter at the storage layer
-(row-group skip or row-level reject) before bytes hit the wire.
-
-Shape from council topics:
-
-- Worker build → coordinator collect → Wendelon attach via PBC.
-- False-positive tolerance: best-effort selectivity (join remains
-  responsible for correctness).
-- Hash seed + encoding stability for cross-replica determinism.
-- Byte budget per filter; descriptor-fingerprint interaction.
-- Behavior when filter cannot be pushed into Wendelon (V1.x
-  fallback: filter ignored, join still correct).
-
-Promotes if ADR 005's rerun leaves selective-join shuffle bytes as
-the next visible bottleneck. Requires cross-ring contract surface
-with Wendelon (its own ADR scope).
-
-#### Candidate B — Outer / semi / anti joins
+**Scale boundary:** operator-level.
 
 Pins null-fill semantics for preserved sides under `LeftOuter` /
 `RightOuter` / `FullOuter` plus existence-based filtering for
 `Semi` / `Anti`. Substrate exists from ADR 004; the contract
 decision is null semantics and output schema nullability
-adjustments.
+adjustments. ADR 006's two-wave execution surface may benefit
+outer joins even though V1 runtime-filter eligibility excludes
+them.
 
 Bench evidence question: does V1 launch require outer joins? Most
-analytical SQL workloads use them (LEFT OUTER on missing dimension
-lookups, FULL OUTER for diff reports). If launch timing forces this
-before filter pushdown, ADR 006 promotes outer joins.
+analytical SQL workloads use them (LEFT OUTER on missing
+dimension lookups, FULL OUTER for diff reports). If launch
+timing forces this before V1.x runtime-filter extensions,
+ADR 007 promotes outer joins.
+
+#### Candidate B — Rune sandbox enforcement
+
+**Scale boundary:** process-internal (worker-process kernel
+execution boundary).
+
+V1 launch prerequisite. Fuel is currently disabled at
+`rune_engine.rs:188`. Native-function allow-list, per-tenant
+CPU + memory budgets, no-filesystem / no-network gating.
+Self-contained; doesn't depend on join shape, executor shape,
+or governance shape.
+
+Could ship as a parallel narrow ADR alongside ADR 007 if launch
+timing demands; otherwise promotes when V1 launch becomes
+load-bearing. Cleanest scope of the launch-driven candidates
+(no cross-system contract surface).
 
 #### Candidate C — Multi-tenant resource governance
 
-Per-query → per-tenant budgets, token-bucket admission,
+**Scale boundary:** cluster-wide.
+
+Per-query to per-tenant budgets, token-bucket admission,
 scheduler-slot allocation, memory-rejection vs spill-trigger
-thresholds. Promotes if V1 launch pressure surfaces multi-tenancy
-before joins-adjacent perf work.
+thresholds. Promotes if V1 launch pressure surfaces
+multi-tenancy before joins-adjacent perf work.
 
-ADR 003's per-query `QueryBudget` is the natural antecedent; the
-per-tenant layer wants real multi-tenant workload evidence before
-its shape gets pinned.
+ADR 003's per-query `QueryBudget` is the natural antecedent;
+the per-tenant layer wants real multi-tenant workload evidence
+before its shape gets pinned.
 
-#### Candidate D — Rune sandbox enforcement
+#### Candidate D — Cross-process wire efficiency
 
-V1 launch prerequisite. Fuel is currently disabled at
-`rune_engine.rs:188`. Native-function allow-list, per-tenant CPU +
-memory budgets, no-filesystem / no-network gating. Self-contained —
-doesn't depend on join shape, executor shape, or governance shape.
+**Scale boundary:** transport.
 
-Could ship as a parallel narrow ADR alongside ADR 006 if launch
-timing demands; otherwise sequenced ahead when V1 launch becomes
-load-bearing.
+The compute-ring fallback if ADR 006's selective bench misses
+or non-selective workloads dominate post-V1. Batch-size policy,
+Arrow IPC encode/decode tuning, `WireEnvelope` overhead audit,
+output-publish path streamlining. No cross-ring dependency.
 
-#### Candidate E — Executor model upgrade
+Promotes if ADR 006's selective bench misses its target or if
+non-selective workloads dominate the V1 launch shape. Lower
+leverage than ADR 006 on selective joins (moves bytes faster vs
+avoids moving rejected bytes), but uniform across selective and
+non-selective workloads.
 
-Demoted by ADR 004's sub-attribution telemetry: probe + output
-combined is ~7% of wall; rewriting the Volcano model addresses ~0%
-of measured bottleneck. Reserved for the case where a future
-workload (large probe-side, multi-way joins, complex aggregates)
-shows probe-side dominance. Until then, this candidate stays
-demoted.
+#### Candidate E — V1.x runtime-filter extensions
+
+**Scale boundary:** cross-ring (continuation of ADR 006).
+
+A cluster of follow-on work to ADR 006:
+
+- **Exact `InList` filters** for small build sets. Qualitatively
+  precise (zero false positives), useful for small dimension
+  joins. Extends the ADR 006 descriptor contract.
+- **Broadcast-strategy runtime filters.** ADR 006 V1 limits
+  filter eligibility to hash-partitioned joins (broadcast joins
+  don't need the two-wave-stage-order change because they
+  naturally complete build before probe). Broadcast filters
+  reuse the descriptor contract with a different attachment
+  path.
+- **Planner cost-model opt-in.** Always-two-wave in V1;
+  planner-stats opt-in once stats exist.
+- **Filter eligibility extension to canonical-encoder
+  additions.** When the canonical encoder grows support for
+  `Date`, `Timestamp`, or `Decimal`, filter eligibility extends
+  with it.
+
+Promotes when ADR 006's Toron-side ships and at least one of:
+selectivity workloads show `InList` would help; broadcast joins
+become a measurable workload; planner-stats surface starts
+landing.
+
+#### Candidate F — Executor model upgrade
+
+**Scale boundary:** operator-level (executor substrate).
+
+Demoted by ADR 004 sub-attribution and re-confirmed by ADR 005
+(probe + output combined < 15% of wall). Reserved for the case
+where a future workload (large probe-side, multi-way joins,
+complex aggregates) shows probe-side dominance. Until then,
+stays demoted.
 
 ### Advanced kernel graduations *(one ADR per kernel)*
 
@@ -220,15 +291,17 @@ committed.
   NVMe / WAL. ADR 003's `WorkerRegistry` trait +
   `WorkerLease` / `LeaseEpoch` fields are the seam.
 - **Brainstorm 003: Smart-Storage Pushdown beyond
-  filters.** Toron's pushdown story currently covers
-  filters (ADR 002) and shuffle-key affinity (ADR 003).
-  Future pushdown surfaces: aggregate partial pushdown
-  (already half-Wendelon-bound), join-runtime-filter
-  pushdown (ADR 005 Candidate B), top-K / sort
-  pushdown, projection-with-computed-column pushdown.
-  Each is its own ADR; the cumulative shape is "Toron
-  binds; Wendelon executes the leaves; the wire carries
-  results, not bytes."
+  filters.** Toron's pushdown story now covers static
+  predicates (ADR 002), shuffle-key affinity (ADR 003),
+  and *runtime* join-key filtering (ADR 006). Future
+  pushdown surfaces: aggregate partial pushdown (already
+  half-Wendelon-bound), top-K / sort pushdown,
+  projection-with-computed-column pushdown. Each is its
+  own ADR; the cumulative shape is "Toron binds; Wendelon
+  executes the leaves; the wire carries results, not
+  bytes." ADR 006 is the first runtime-pushdown ADR and
+  the substrate that V1.x runtime-filter extensions
+  (Candidate E above) build on.
 
 ### V1.x items *(post-V1, evidence-driven)*
 
@@ -345,6 +418,69 @@ Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
 labeled by ADR cycle.
+
+### ADR 006 cycle
+
+- **Filter generation inside `execute_inner_join`.** Original
+  Claude/Gemini iter-1 framing; rejected. Codex iter-2's
+  stage-order-honesty correction showed that a filter built in
+  the join consumer runs after both producer-side shuffles
+  complete — too late to attack the bytes-movement bucket.
+  The two-wave hash-partitioned shape moves filter generation
+  to the build-side exchange producer.
+- **Broadcast-only V1 (ADR 006), hash-partitioned filter as
+  ADR 007.** Considered (Claude iter-3 option b); rejected.
+  Fits one ADR cycle but doesn't move the 10M x 1M
+  hash-partitioned promotion workload that produced the ADR 006
+  signal — the bench artifact would have nothing to show
+  against ADR 005's baseline. Half-ships the contract.
+- **Split into ADR 006 (stage-order contract) + ADR 007 (filter
+  implementation).** Considered (Claude iter-3 option c);
+  rejected. Two ADRs for what is realistically one feature;
+  the stage-order decision is meaningless without the filter
+  motivating it.
+- **Exact `InList` filters in V1.** Considered (Claude/Codex
+  iter-2); rejected for V1 in favor of Bloom-only. Reasoning:
+  the first cross-ring runtime-filter ADR should prove the
+  cross-ring + stage-order contract, not multiply filter kinds.
+  `InList` extends the same descriptor contract in V1.x.
+- **Cost-based planner opt-in in V1.** Considered; rejected.
+  Planner-stats surface doesn't yet exist. Always-two-wave in
+  V1; opt-in is V1.x once stats land.
+- **Topic E (cross-process wire efficiency) as ADR 006.**
+  Considered (Claude iter-1 as a real candidate); demoted to
+  fallback. Lower leverage than runtime filters on selective
+  joins: moves bytes faster vs avoids moving rejected bytes.
+  Reopens as ADR 007 if ADR 006's selective bench misses.
+- **Row-group skip as required V1 enforcement.** Considered;
+  rejected for required-status. Bloom membership is
+  per-encoded-key; row-group min/max stats do not automatically
+  prove Bloom absence for a range. Row-level reject is the
+  sound V1 enforcement; row-group skip stays opportunistic and
+  separately proven.
+- **Runtime-plumbing investigation as ADR 006.** Possible
+  branch of ADR 005's conditional rule; resolved by ADR 005
+  evidence to operator-adjacent (`framework_overhead_ms` fell
+  78.8% proportionally with `build_ms`'s 79.0%). Not on the
+  ADR 006 table.
+- **New runtime-filter telemetry columns in V1.** Considered
+  (would sharpen filter-effectiveness measurement); rejected
+  in favor of bench evidence only. ADR 005's columns plus the
+  selective + non-selective bench rows suffice. New telemetry
+  fields are an ADR 003 task-telemetry contract change;
+  worth it only when bench evidence is insufficient.
+- **Always-emit fragments (no eligibility check).** Considered
+  for simplicity; rejected. Composite-key joins, non-canonical
+  key types, and broadcast joins should not pay filter
+  generation overhead. Eligibility check is single-column +
+  inner + hash-partitioned + canonical-encoder-supported type.
+- **`nilket-shared` as required new crate.** Considered (Codex
+  iter-3 / Gemini iter-4 named it); softened to default
+  recommendation only. Extending an existing Wendelon-published
+  schema crate is preferred over spawning a new crate before
+  multi-consumer pressure justifies it (roadmap "Wendelon-side
+  crate extraction" convention). Final crate choice is Phase 1
+  implementation detail, not contract-level.
 
 ### ADR 005 cycle
 
@@ -602,3 +738,61 @@ sections; this list is the cross-cutting set.
   determinism + budget accounting work.
 - **Don't bundle runtime-plumbing investigation into ADR 005.**
   Conditional ADR 006 governed by the three-band rerun rule.
+- **Don't generate ADR 006 runtime filters inside
+  `execute_inner_join`.** Too late in ADR 004's stage graph;
+  the probe-side shuffle has already happened. Filter
+  generation lives in the build-side exchange producer wave
+  (ADR 006 Decision §1).
+- **Don't let ADR 006's runtime-filter hash conflate with the
+  exchange-partition hash.** ADR 003 §5 partition assignment
+  uses `xxh3_64(canonical_encoded_bytes)`; ADR 006's
+  runtime-filter hashing is operator/cross-ring scoped.
+  Helper names are semantic ("runtime filter key" vs
+  "exchange partition hash"). Generalizes ADR 005's pattern.
+  ADR 006 hard gate 15.
+- **Don't let an ADR 006 runtime filter affect join
+  correctness.** Advisory always — false positives allowed,
+  false negatives forbidden. If Wendelon drops the filter for
+  any reason, output is byte-identical to filter-disabled.
+  ADR 006 hard gate 7 (false-positive tolerance) + hard
+  gate 10 (no false negatives).
+- **Don't start probe-side dispatch before the ADR 006
+  build-side runtime-filter barrier opens** when filters are
+  enabled. ADR 006 hard gate 13 — the two-wave barrier is
+  contractually load-bearing.
+- **Don't deserialize ADR 006's runtime-filter descriptor as
+  a Toron-private type in Wendelon.** Shared cross-ring schema
+  surface only (default: extend an existing Wendelon-published
+  schema crate; alternative: `nilket-shared` common module).
+- **Don't multiply ADR 006 filter kinds in V1.** Bloom only.
+  Exact `InList` is V1.x once the cross-ring contract is
+  proven.
+- **Don't add ADR 006 planner cost-model opt-in in V1.** Always
+  two-wave when the filter is enabled; planner-stats opt-in
+  is V1.x once stats exist.
+- **Don't couple ADR 006 promotion to lockstep Wendelon-side
+  landing.** Advisory invariant makes split-shipment safe.
+  Toron-side ships first; Wendelon-enabled bench row arrives
+  in a follow-up update.
+- **Don't extend ADR 006 filter eligibility to outer / semi /
+  anti / sort-merge / non-equi / broadcast joins.** Each is
+  its own future ADR (V1.x). Inner + hash-partitioned only in
+  V1.
+- **Don't soften an ADR 006 selective-row reduction miss**
+  into a vague "improved" narrative. The bench artifact
+  records the explicit gap; the council selects
+  accept-narrower / scope-down (narrow filter eligibility) /
+  shelve.
+- **Don't promote a runtime-filter ADR without a
+  no-false-negative unit test.** The advisory invariant is
+  load-bearing; false negatives are contract violations.
+  ADR 006 hard gate 10.
+- **Don't skip the non-selective guard benchmark.** The
+  two-wave barrier cost is real; the guard proves it's
+  bounded against ADR 005's `build_ms` baseline. ADR 006
+  hard gate 19.
+- **Don't skip the Scale boundary section in new ADRs**
+  (convention adopted iter-5 of ADR 006). Even when the
+  boundary feels obvious, naming it explicitly makes
+  scope-creep into adjacent boundaries visible at review
+  time. Omit only when truly N/A and say so explicitly.
