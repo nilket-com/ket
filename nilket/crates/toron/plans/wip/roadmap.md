@@ -16,204 +16,48 @@ along with the forward-sequence rewrite.
 
 ## Status
 
-- **ADR 001 — Foundation and Engine Contract.** Promoted +
-  implemented.
-- **ADR 002 — Storage-Backed Execution Contract.** Promoted +
-  implemented. Bench evidence at
-  `plans/impl/002_storage_execution_contract_bench_results.md`.
-- **ADR 003 — Distributed Runtime and Data Movement
-  Contract.** Promoted + implemented. Bench evidence at
-  `plans/impl/003_distributed_runtime_bench_results.md`.
-- **ADR 004 — Distributed Inner Equi-Join Contract.**
-  Promoted + implemented. Bench evidence at
-  `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
-- **ADR 005 — Hash-Join Build Path Efficiency.** Promoted +
-  implemented. Bench evidence at
-  `plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
-  The 8-worker 10M x 1M rerun moved `build_ms`
-  `2581.550 ms -> 542.787 ms` with digest equality preserved.
-  `framework_overhead_ms` moved proportionally, placing ADR 006 in
-  the operator-adjacent band rather than runtime-plumbing
-  investigation.
-- **ADR 006 — Runtime Filter Pushdown.** Promoted +
-  implemented. Bench evidence at
-  `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
-  Cross-ring optimization contract: advisory Bloom runtime
-  filters for hash-partitioned inner equi-joins via two-wave
-  execution. Pinned by ADR 005's post-promotion telemetry —
-  the bytes-movement cluster (`batch_send` +
-  `shuffle_pull_decode` + `output_publish` + `batch_encode` =
-  558ms, 34.1%) overtook build as the largest bucket. ADR 006
-  attacks the cluster at the source (Wendelon filters probe
-  rows before they hit the wire) rather than moving the same
-  bytes faster. Advisory invariant makes split-shipment safe:
-  Toron-side evidence and ADR 013's production Wendelon-enabled
-  selective row are captured.
-- **ADR 007 — Rune Sandbox Enforcement.** Promoted +
-  implemented. Process-internal safety contract:
-  closes the M7-recorded launch blocker (sandbox fuel disabled,
-  `Context::with_default_modules()` exposing filesystem /
-  network / process / environment / time / random capability)
-  with `RuneSandboxConfig` carrying fuel + memory + wall-timeout
-  + source-size + allow-profile, single
-  `FrontendError::RuneSandbox` variant carrying a 7-label
-  `RuneSandboxViolation` enum, allow-list (not deny-list)
-  context construction, and conditional architecture guard for
-  `Context::with_default_modules` absence. Memory enforcement
-  is V1 hard requirement (Rune-native cap or helper-process
-  isolation per Phase 0). Implemented with Rune 0.13
-  `budget::with` + `alloc::limit::with`, `max_source_bytes`,
-  yielding-path `wall_timeout`, allow-list context construction,
-  and non-retryable `RuneSandbox::<label>` task-failure mapping
-  if sandbox errors cross the task boundary. Selected via the iter-3 ADR 007
-  topics convergence on Codex's four-path selection rule
-  ("V1 exposes user-supplied Rune -> L-2 Rune sandbox").
-- **ADR 008 — Outer / Semi / Anti Joins.** Promoted +
-  implemented. Operator-level surface extension
-  closing the analytical-SQL "join width gap" left by ADR 004
-  (inner-only). `JoinKind` extends from 1 variant to 8 (`Inner`
-  plus `LeftOuter` / `RightOuter` / `FullOuter` / `LeftSemi` /
-  `RightSemi` / `LeftAnti` / `RightAnti`), null-fill via Arrow
-  native `NullBuffer`, output-schema nullability promoted at
-  bind time, hash-partitioned-only distributed execution for
-  non-Inner kinds (binder rejects `Broadcast` for
-  `kind != Inner`; fragmenter has belt-and-braces guard),
-  runtime-filter eligibility stays Inner-only (ADR 006
-  invariant preserved), single `JoinOutputRow` row-selection
-  intermediate with shared `materialize_join_selection` helper,
-  spill semantics match in-memory for every kind. No new
-  `TaskFailureKind` / `MessageKind` / `JoinStrategy` variant;
-  `LogicalPlan::Join` and `ExecutionPlan::Join` stay
-  single-variant. Mixed old/new binary support explicitly not
-  promised — single workspace bump, full-fleet upgrade.
-  Three-way AI Swarm Council convergence (Claude / Codex /
-  Gemini) at iter-3. Bench evidence landed at
+- **ADR 001 — Foundation and Engine Contract.** Promoted + implemented.
+- **ADR 002 — Storage-Backed Execution Contract.** Promoted + implemented.
+  Bench: `plans/impl/002_storage_execution_contract_bench_results.md`.
+- **ADR 003 — Distributed Runtime and Data Movement.** Promoted + implemented.
+  Bench: `plans/impl/003_distributed_runtime_bench_results.md`.
+- **ADR 004 — Distributed Inner Equi-Join.** Promoted + implemented.
+  Bench: `plans/impl/004_distributed_inner_equi_join_bench_results.md`.
+- **ADR 005 — Hash-Join Build Path Efficiency.** Promoted + implemented.
+  Bench: `plans/impl/005_hash_join_build_path_efficiency_bench_results.md`.
+- **ADR 006 — Runtime Filter Pushdown.** Promoted + implemented. Advisory
+  Bloom runtime filters for hash-partitioned inner equi-joins via two-wave
+  execution. Bench: `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
+- **ADR 007 — Rune Sandbox Enforcement.** Promoted + implemented.
+  Process-internal sandbox contract for user-supplied Rune scripts.
+- **ADR 008 — Outer / Semi / Anti Joins.** Promoted + implemented. `JoinKind`
+  to 8 variants; bench:
   `plans/impl/008_outer_semi_anti_joins_bench_results.md`.
-- **ADR 009 — Correlated `EXISTS` / `NOT EXISTS`
-  Decorrelation.** Promoted + implemented.
-  Frontend-planner surface extension closing the analytical-SQL
-  existence-predicate gap left by ADR 008 — `LeftSemi` /
-  `LeftAnti` were executable but unreachable from the routine
-  `WHERE [NOT] EXISTS (correlated subquery)` SQL form. Narrow
-  SQL-AST rewrite in `SqlPlanner::lower_select`: top-level outer
-  `AND` conjuncts decomposed; correlated `EXISTS` →
-  `JoinKind::LeftSemi`, `NOT EXISTS` → `JoinKind::LeftAnti`;
-  two-scope classifier (`CorrelatedPair` / `InnerResidual` /
-  `Unsupported`) operating on the SQL AST before lowering; single
-  `TableFactor::Table` subquery body; at least one correlation
-  pair required; unqualified / ambiguous correlation, subquery
-  joins, uncorrelated `EXISTS`, `IN` / `NOT IN`, and all other
-  shapes reject through the existing unsupported-expression path
-  with no semantic fallback; source-order left-deep chaining for
-  multiple conjuncts; outer residuals commute by ADR 008 schema
-  identity; ANSI null semantics delegated to ADR 008. No new IR,
-  executor, wire, `TaskFailureKind`, `JoinKind`, `JoinStrategy`,
-  or architecture-guard surface; binder semantic checks reused
-  unchanged, with qualifier collection matching semi/anti output
-  scope for chained rewrites. ADR 009 is a V1 ADR, not the
-  post-V1 transition. No bench-results
-  artifact — promotion evidence is digest parity against
-  hand-written `LeftSemi` / `LeftAnti` joins. Three-way AI Swarm
-  Council convergence (Claude / Codex / Gemini) at iter-2.
-  Selected as the strongest launch-driven
-  candidate post-ADR-008 — the substrate had just shipped and the
-  scope was fully determined, against multi-tenant governance
-  (explicitly post-V1) and wire efficiency (now resolved by ADR
-  013's production Wendelon row).
-- **ADR 010 — Top-Level SQL Clause Accounting and Deterministic
-  Result Ordering.** Promoted + implemented.
-  Frontend-planner surface extension plus a new operator, closing
-  a live V1 "First Query with Integrity" correctness defect:
-  `SqlPlanner::lower_query` / `lower_select` silently discarded
-  every top-level `Query` / `Select` clause they did not
-  explicitly handle — `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`,
-  and ~20 more — so `SELECT ... ORDER BY x` executed with the
-  clause dropped on the floor. Two inseparable halves: (1) clause
-  accounting — `lower_query` / `lower_select` destructure the
-  `sqlparser` structs exhaustively (no `..` rest pattern) across
-  three buckets (semantic-lowered / semantic-rejected-when-present
-  / parser-metadata-ignored), so a dependency bump that adds a
-  field is a compile error, not a silent widening; (2)
-  deterministic result ordering — top-level `ORDER BY` /
-  `ORDER BY ... LIMIT n` / `... OFFSET n` lower to a new
-  `LogicalPlan::Sort` / `ExecutionPlan::Sort` operator with
-  output-schema-only keys (column names + 1-based positive
-  ordinals), a bind-time-appended ascending-`NULLS LAST`
-  total-order tie-break, `NULLS LAST` default null policy, float
-  sort keys via Arrow IEEE 754 total order, a single terminal
-  gather-sort distributed shape, and a required strategy-agnostic
-  post-join gather-sort fragmenter path. Bare `LIMIT` / `OFFSET`
-  reject; `DISTINCT` / `GROUP BY` / `HAVING` loud-reject (not
-  implemented — aggregate-path ADRs). In-memory sort reusing the
-  existing `BudgetExhausted` path — no new wire, `TaskFailureKind`,
-  `BudgetDimension`, `JoinKind`, `JoinStrategy`, or Wendelon
-  surface; `LogicalPlan` / `ExecutionPlan` each gain one variant
-  (`Sort`). Selected from *outside* the roadmap's post-ADR-009
-  A–E candidate list — on code evidence of a silent-wrong-results
-  defect, not the prior planning snapshot. No bench-results
-  artifact — promotion evidence is digest parity (canonical +
-  ordered) plus distributed stage-shape inspection. Three-way AI
-  Swarm Council convergence (Claude / Codex / Gemini) across
-  three topic-iteration rounds and two ADR-drafting rounds.
-- **ADR 011 — Aggregate Projection Accounting and `GROUP BY`
-  SQL Reachability.** Promoted + implemented.
-  Frontend-planner surface extension closing the next live V1
-  "First Query with Integrity" defect one level below ADR 010:
-  aggregate SELECT projections no longer accept a recognized
-  aggregate while silently dropping every non-aggregate item.
-  Once a projection is classified as aggregate, every item is
-  lowered as an aggregate call or exact grouped key, or loudly
-  rejected. The feature half wires routine single-table grouped
-  SQL (`SELECT key, COUNT(*) FROM t GROUP BY key`) to the
-  already-existing `LogicalPlan::Aggregate` /
-  `ExecutionPlan::Aggregate` path via one explicit group-keyed
-  `Exchange`. V1 scope is intentionally narrow: exact
-  `[all GROUP BY keys in order] ++ [aggregate calls]` projection
-  shape, at least one aggregate call, simple unqualified group
-  keys, stable grouped aggregate set (`COUNT(*)`, `COUNT(expr)`,
-  `SUM(expr)`), syntactic + structural single-table guards, no
-  `GROUP BY` over joins or decorrelated `EXISTS`, no
-  `GROUP BY ... ORDER BY`, no `HAVING`, no `DISTINCT`, no
-  post-aggregate projection, and no two-phase partial
-  aggregation. No new IR, wire, budget, task-failure, join, or
-  Wendelon surface; `LogicalPlan` stays 9 variants and
-  `ExecutionPlan` stays 7. No bench-results artifact —
-  promotion evidence is plan-shape inspection, digest parity
-  against hand-built grouped aggregates, distributed stage-shape
-  inspection, and preserved architecture guards. Selected from
-  outside the rotated post-ADR-009 A–E candidate list on fresh
-  code evidence of a second silent-wrong-results defect.
-- **ADR 012 — Mixed-Wildcard Projection Accounting and Planner
-  Hardening.** Promoted + implemented. Frontend-planner surface
-  fix closing the last known projection-item silent drop one level
-  below ADR 011: `SqlPlanner::lower_select`'s non-aggregate
-  projection loop returned the input plan on the first `SELECT *`
-  it saw, silently discarding every sibling projection item — so
-  `SELECT region, * FROM sales` executed with `region`'s requested
-  position dropped. After ADR 012, any unqualified wildcard mixed
-  with any sibling rejects through `FrontendError::Unsupported`;
-  bare `SELECT *` is unchanged and byte-identical. The secondary
-  half hardens a `TIME_BUCKET` arity panic — `lower_expr` indexed
-  `args[0]` / `args[1]` without an arity check — to a clean
-  reject, with exactly-two arity so an extra argument is not
-  silently dropped. No new IR, operator, wire, binder, executor, or
-  Wendelon surface; `LogicalPlan` stays 9 variants and
-  `ExecutionPlan` stays 7. No bench-results artifact — promotion
-  evidence is behavioral plus a source-shape architecture guard.
-  Selected from outside the standing A–E candidate list on fresh
-  code evidence, the third in the ADR 010 → 011 → 012
-  projection-accounting sequence. Three-way AI Swarm Council
-  convergence (Claude / Codex / Gemini) across five iteration
-  rounds.
-- **ADR 013 — Runtime Filter Application at the Storage-Scan
-  Boundary.** Promoted + implemented. Cross-ring
-  storage-scan application contract making ADR 006 runtime filters
-  live in production scans: `InMemoryStorageScan` applies usable
-  descriptors locally, `WendelonStorageScan` forwards them through
-  table query, and Wendelon applies them at projected-read
-  materialization before PBC projection. Advisory-drop remains
-  byte-identical to filter-disabled execution. ADR 006's bench
-  artifact now carries the production Wendelon selective row.
+- **ADR 009 — Correlated `EXISTS` / `NOT EXISTS` Decorrelation.** Promoted +
+  implemented. SQL-AST rewrite in `SqlPlanner::lower_select` lowering
+  correlated `EXISTS`/`NOT EXISTS` to `LeftSemi`/`LeftAnti` joins.
+- **ADR 010 — Top-Level SQL Clause Accounting and Deterministic Result
+  Ordering.** Promoted + implemented. Exhaustive `Query`/`Select` field
+  accounting plus `LogicalPlan::Sort` / `ExecutionPlan::Sort` over a single
+  terminal gather-sort.
+- **ADR 011 — Aggregate Projection Accounting and `GROUP BY` SQL
+  Reachability.** Promoted + implemented. Strict aggregate projection-item
+  accounting; narrow single-table `GROUP BY` wired to the grouped aggregate
+  path.
+- **ADR 012 — Mixed-Wildcard Projection Accounting and Planner Hardening.**
+  Promoted + implemented. Non-aggregate projection silent-drop closed;
+  `TIME_BUCKET` arity hardened.
+- **ADR 013 — Runtime Filter Application at the Storage-Scan Boundary.**
+  Promoted + implemented. Both `StorageScan` impls apply
+  `request.runtime_filter`; Wendelon table-query wire carries
+  `runtime_filter_len`; production Wendelon-enabled selective row in
+  `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
+- **ADR 014 — Exact Small-Set Runtime Filters.** Promoted; implementation
+  pending. ExactSet runtime-filter kind for hash-partitioned inner equi-joins
+  with small build sets (gate: serialized exact payload ≤ Bloom
+  `MIN_FILTER_BYTES`); coordinator lowers exact-to-Bloom on overflow.
+  Proving bench row will append to
+  `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -234,145 +78,74 @@ the storage ring. We control both ends. The boundary exists
 for scaling dynamics and resource isolation, not because
 storage and compute are independent products.
 
-**Toron's reason for existence is smart-storage pushdown.**
-ADR 002 made that load-bearing in the runtime path. ADR 003
-made the cross-process mechanics real. ADR 004 added the
-first two-input operator and finally exercises the buffered
-executor under full-cardinality probe-side pressure. Every
-other improvement (executor model upgrade, advanced kernels,
-frontend hardening) polishes a system that does its primary
-job along its primary axis.
+**Toron's reason for existence is smart-storage pushdown.** Every
+improvement — executor model upgrade, advanced kernels, frontend
+hardening — polishes a system that does its primary job along its
+primary axis.
 
 **ADR-by-ADR cadence.** Wendelon ADR 070 pattern: narrow,
-evidence-driven, single-decision contracts. ADR 003 shipped
-runtime mechanics only; ADR 004 ships inner equi-join only
-(no outer joins, no sort-merge, no filter pushdown). Each
-narrow ADR earns its scope from the prior ADR's bench
-evidence.
+evidence-driven, single-decision contracts. Each ADR earns its
+scope from the prior ADR's bench evidence or a fresh code-evidence
+defect; mega-scopes get split.
 
-**Evidence drives scope.** The most informative artifact for
-the next ADR is the previous ADR's bench results. ADR 005's
-post-promotion telemetry showed `build_ms` fell to 33.1% of
-wall while the bytes-movement cluster (`batch_send` +
-`shuffle_pull_decode` + `output_publish` + `batch_encode`)
-rose to 34.1% — overtaking build as the largest bucket. The
-user pinned **Evidence Pressure > Launch Pressure** for ADR
-006, selecting Topic A (runtime filter pushdown) over
-launch-driven candidates. ADR 006 attacks the bytes-movement
-cluster at the source via Bloom runtime filters and two-wave
-hash-partitioned execution. The conditional ADR 005 rule
-already resolved the residual to operator-adjacent — no
-runtime-plumbing investigation is on the table. ADR 007 (Rune
-sandbox enforcement) was promoted independently of ADR 006's
-bench outcome — it closes a launch-blocker on the authoring
-surface that the bytes-movement evidence did not touch. ADR 008
-(outer / semi / anti joins) was selected as the strongest
-launch-driven candidate post-ADR-007 — the "SQL width" gap
-left by ADR 004's inner-only scope was load-bearing for
-analytical workloads. ADR 009 (correlated `EXISTS` / `NOT EXISTS`
-decorrelation) was selected post-ADR-008 as the V1 candidate
-whose substrate had just shipped — ADR 008's `LeftSemi` /
-`LeftAnti` operators were executable but unreachable from the
-routine `WHERE [NOT] EXISTS` SQL form. The council scored it
-against multi-tenant governance (explicitly post-V1 by the
-V1-target paragraph, and contract-shape-hungry for multi-tenant
-workload evidence that does not exist yet) and cross-process wire
-efficiency (the compute-ring fallback, whose promotion condition
-cannot be evaluated until ADR 013 lands the Wendelon row) — and
-selected the frontend-planner existence-predicate
-gap. ADR 010 through ADR 012 were code-evidence selections that
-closed frontend-planner integrity defects outside the standing A–E
-list. ADR 013 returns to the ADR 006 evidence thread: make the
-existing runtime-filter descriptor live at the production storage
-boundary and land the deferred Wendelon selective row.
+**Evidence drives scope.** The most informative artifact for the
+next ADR is the previous ADR's bench results — or a code-evidence
+silent-drop / inert-feature defect surfaced during selection.
+**Evidence Pressure > Launch Pressure** when both are live: the
+council picks the topic with measured signal, not the one with
+the loudest backlog.
 
-**Scale-boundary convention (adopted iter-5 of ADR 006).**
-Every ADR from ADR 006 forward includes an explicit
-**Scale boundary** structural section after Status and before
-Context. Scale boundaries seen so far: process-internal
-(ADR 007 Rune sandbox), operator-level (ADR 004, ADR 005,
-ADR 008), cluster-wide (governance, ADR 003), cross-ring
-(ADR 002, ADR 006, ADR 013 storage-scan application),
-transport (ADR 003 wire, ADR 006 `PartitionManifest` /
-`ScanRequest` additions),
-storage-internal (Wendelon), frontend planner (ADR 009, ADR 010 —
-clause accounting, ADR 011 — aggregate projection accounting and
-`GROUP BY` SQL reachability, ADR 012 — mixed-wildcard projection
-accounting and planner hardening), operator-level executor +
-distributed fragmenter (ADR 010 — the `Sort` operator and its
-terminal gather-sort stage). The decomposition makes
-scope-creep into adjacent boundaries visible at review
-time and sharpens ADR selection: same operator at different
-scales is a different contract.
+**Scale-boundary convention (adopted iter-5 of ADR 006).** Every
+ADR from ADR 006 forward includes an explicit **Scale boundary**
+section after Status and before Context. The decomposition makes
+scope-creep into adjacent boundaries visible at review time and
+sharpens ADR selection: the same operator at different scales is
+a different contract.
 
 ## Forward sequence
 
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Completed: ADR 011 implementation
+### Promoted: ADR 014 plan
 
-ADR 011's contract is pinned at
-`plans/adr/011_aggregate_projection_accounting_and_group_by.md`;
-the impl plan lives at
-`plans/impl/011_aggregate_projection_accounting_and_group_by.md`.
-ADR 011 introduces no operator and makes no performance claim, so
-there is no bench-results artifact. Promotion evidence is
-plan-shape inspection, result/digest parity against hand-built
-grouped `Aggregate` plans, distributed stage-shape inspection,
-and preserved architecture guards. The load-bearing integrity
-fix is projection-item accounting for aggregate SELECT lists:
-accepted aggregate projections can no longer silently narrow.
-The feature half wires the narrow single-table `GROUP BY` SQL
-surface to the existing grouped aggregate path through one
-planner-emitted group-keyed `Exchange`.
+ADR 014's contract is pinned at
+`plans/adr/014_exact_small_set_runtime_filters.md`; the impl plan
+lives at `plans/impl/014_exact_small_set_runtime_filters.md`.
+Implementation is pending. The proving bench row will append to
+`plans/impl/006_runtime_filter_pushdown_bench_results.md`
+alongside ADR 006's motivating Phase 0 row and ADR 013's
+production row.
 
-ADR 013 landed ADR 006's Wendelon-side row-level application;
-the production selective row is recorded in the ADR 006 bench
-artifact.
+### ADR 015 candidates
 
-### Completed: ADR 012 promotion and implementation
+**Lead candidate — `GROUP BY ... ORDER BY`.** Pre-converged in
+the ADR 014 selection round: all three council members named the
+same three-stage fragmenter shape (scan/projection producers →
+group-keyed exchange into grouped aggregate consumers → terminal
+gather exchange into one final `Sort` task). Composes ADR 010
+(`Sort`) and ADR 011 (`Aggregate`) with no new IR variant;
+planner reject is at `sql_planner.rs:98`. Two real iter-1
+questions carried forward from the ADR 014 cycle: terminal-gather
+representation in the scheduler / fragmenter, and the
+`lower_query` seam at the reject site.
 
-ADR 012's contract is pinned at
-`plans/adr/012_mixed_wildcard_projection_accounting_and_planner_hardening.md`;
-the impl plan lives at
-`plans/impl/012_mixed_wildcard_projection_accounting_and_planner_hardening.md`.
-ADR 012 introduces no operator and makes no performance claim, so
-there is no bench-results artifact. It closes the last known
-projection-item silent drop in the frontend planner — mixed
-unqualified wildcards no longer silently discard sibling
-projection items — and hardens the `TIME_BUCKET` arity panic.
-Implementation is complete; see the impl plan and `git log` for
-actual status.
+**Other ADR 011 SQL-surface follow-ons** remain explicit
+candidates: `GROUP BY` over joins, `HAVING`, `DISTINCT`,
+post-aggregate projection (aliases, reordering, key subsets,
+computed keys), two-phase partial/final aggregation, and
+aggregate-catalog widening (`AVG` / `MIN` / `MAX` and
+experimental-kernel graduation). They promote only if evidence
+beats the lead candidate.
 
-### Promoted: ADR 013 plan
-
-ADR 013's contract is pinned at
-`plans/adr/013_runtime_filter_application_at_the_storage_scan_boundary.md`;
-the impl plan lives at
-`plans/impl/013_runtime_filter_application_at_the_storage_scan_boundary.md`.
-Implementation is complete. It makes existing ADR 006 runtime
-filters live at the production storage-scan boundary and appended
-the deferred Wendelon selective row to
-`plans/impl/006_runtime_filter_pushdown_bench_results.md`.
-
-### ADR 014 candidates
-
-The standing candidate list rotates forward with current context:
-ADR 013 is implemented. Candidate B remains a fallback only if
-later production-scale wire evidence misses launch needs; Candidate
-C is now ungated by the production Wendelon row and can promote
-when a narrow runtime-filter extension wins the next topic pass.
-
-ADR 011 follow-ons remain explicit candidates rather than
-accidental scope: `GROUP BY` over joins, `GROUP BY ... ORDER BY`,
-`HAVING`, `DISTINCT`, post-aggregate projection (aliases,
-reordering, key subsets, computed keys), two-phase partial/final
-aggregation, and aggregate-catalog widening (`AVG` / `MIN` /
-`MAX` and experimental-kernel graduation). They promote only if
-evidence beats the broader A–E list; ADR 011 intentionally kept
-them out to preserve correctness of the single-exchange V1
-shape.
+**Standing A–E candidates** rotate forward beneath the lead.
+Candidate B (cross-process wire efficiency) is parked unless
+non-selective workload pressure surfaces — the ADR 013/014
+runtime-filter row reduction landed a clear hit on the selective
+workload. Candidate C (V1.x runtime-filter extensions beyond
+ExactSet — broadcast, outer/anti, planner cost model,
+encoded-type widening) remains a cluster of narrow follow-on
+ADRs, each requiring its own evidence trigger.
 
 #### Candidate A — Multi-tenant resource governance
 
@@ -414,11 +187,12 @@ Phase 0 sub-bucket selection discipline preserved if C promotes
 A cluster of follow-on work to ADR 006 and ADR 013, now unblocked by
 production Wendelon-side row landing:
 
-- **Exact `InList` filters** for small build sets. Qualitatively
-  precise (zero false positives), useful for small dimension
-  joins. Extends the ADR 006 descriptor contract. Codex iter-1
-  topics decision-matrix candidate when Wendelon row hits ≥50%
-  with material FP residual.
+- ~~**Exact `InList` filters** for small build sets~~ — **covered
+  by ADR 014** (ExactSet runtime-filter kind). The roadmap's
+  ≥50%-with-material-FP gates cleared on the ADR 006 Phase 0 row;
+  ADR 014 introduces the `RuntimeFilterKind::ExactSet` descriptor
+  variant rather than the SQL-`InList` / PBC-`InList` framing
+  this bullet originally implied.
 - **Broadcast-strategy runtime filters.** ADR 006 V1 limits
   filter eligibility to hash-partitioned joins. Broadcast
   filters reuse the descriptor contract with a different
