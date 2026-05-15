@@ -154,6 +154,117 @@ fn wendelon_storage_scan_forwards_runtime_filter_to_table_query() {
 }
 
 #[test]
+fn adr014_runtime_filter_descriptor_is_kind_tagged_without_bloom_outer_fields() {
+	let source =
+		std::fs::read_to_string(wendelon_manifest_dir().join("src/schema/runtime_filter.rs"))
+			.expect("read Wendelon runtime-filter source");
+	let descriptor = source
+		.split("pub struct RuntimeFilterDescriptor")
+		.nth(1)
+		.and_then(|rest| rest.split("pub enum RuntimeFilterKind").next())
+		.expect("RuntimeFilterDescriptor block");
+	let kind = source
+		.split("pub enum RuntimeFilterKind")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct RuntimeFilterBloom").next())
+		.expect("RuntimeFilterKind block");
+
+	assert!(descriptor.contains("pub kind: RuntimeFilterKind,"));
+	for forbidden in [
+		"hash_seed",
+		"bit_count",
+		"hash_count",
+		"byte_budget",
+		"target_fp_rate_bp",
+		"payload",
+	] {
+		assert!(
+			!descriptor.contains(forbidden),
+			"Bloom-specific field {forbidden} leaked onto RuntimeFilterDescriptor"
+		);
+	}
+	assert_eq!(enum_variant_count(kind), 2);
+	assert!(kind.contains("Bloom(RuntimeFilterBloom)"));
+	assert!(kind.contains("ExactSet(RuntimeFilterExactSet)"));
+}
+
+#[test]
+fn adr014_runtime_filter_descriptor_literals_name_kind() {
+	let manifest_dir = manifest_dir();
+	let source_paths = [
+		manifest_dir.join("src"),
+		manifest_dir.join("tests"),
+		wendelon_manifest_dir().join("src/schema/runtime_filter.rs"),
+		wendelon_manifest_dir().join("src/network/data_server.rs"),
+	];
+	let mut offenders = Vec::new();
+	for path in source_paths {
+		let files = if path.is_dir() {
+			source_files(&path)
+		} else {
+			vec![path]
+		};
+		for file in files {
+			let source = std::fs::read_to_string(&file).expect("read source");
+			for (line, block) in brace_blocks_after_marker(&source, "RuntimeFilterDescriptor {") {
+				let source_line = source.lines().nth(line - 1).unwrap_or("");
+				if source_line.contains("-> RuntimeFilterDescriptor {") {
+					continue;
+				}
+				if !block.contains("kind:") {
+					offenders.push((
+						file.clone(),
+						line,
+						block.lines().next().unwrap_or("").to_string(),
+					));
+				}
+			}
+		}
+	}
+
+	assert!(
+		offenders.is_empty(),
+		"RuntimeFilterDescriptor literal/destructure without kind:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr014_runtime_filter_contract_has_no_version_suffixed_types() {
+	let manifest_dir = manifest_dir();
+	let markers = [
+		["RuntimeFilterDescriptor", "V"].concat(),
+		["RuntimeFilterKind", "V"].concat(),
+		["RuntimeFilterBloom", "V"].concat(),
+		["RuntimeFilterExactSet", "V"].concat(),
+		["RuntimeFilterFragment", "V"].concat(),
+	];
+	let mut offenders = source_lines(&manifest_dir.join("src"));
+	offenders.extend(source_lines(&manifest_dir.join("tests")));
+	offenders.extend(source_lines(&wendelon_manifest_dir().join("src/schema")));
+	offenders.retain(|(_, _, line)| markers.iter().any(|marker| line.contains(marker)));
+
+	assert!(
+		offenders.is_empty(),
+		"version-suffixed runtime-filter type found:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+}
+
+#[test]
+fn adr014_does_not_add_sql_in_lowering_to_toron_planner() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+
+	for forbidden in ["InList", "InSubquery", "Expr::InList", "Expr::InSubquery"] {
+		assert!(
+			!source.contains(forbidden),
+			"ADR 014 must not add SQL IN lowering marker {forbidden}"
+		);
+	}
+}
+
+#[test]
 fn scan_stream_collection_localized() {
 	let manifest_dir = manifest_dir();
 	let try_collect_marker = ["try", "_", "collect"].concat();
@@ -620,8 +731,7 @@ impl StorageScan for RecordingStorageScan {
 }
 
 fn source_lines(root: &Path) -> Vec<(PathBuf, usize, String)> {
-	let mut files = Vec::new();
-	collect_rs_files(root, &mut files);
+	let files = source_files(root);
 	files
 		.into_iter()
 		.flat_map(|file| {
@@ -635,6 +745,12 @@ fn source_lines(root: &Path) -> Vec<(PathBuf, usize, String)> {
 		.collect()
 }
 
+fn source_files(root: &Path) -> Vec<PathBuf> {
+	let mut files = Vec::new();
+	collect_rs_files(root, &mut files);
+	files
+}
+
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 	for entry in std::fs::read_dir(dir).expect("read source dir") {
 		let entry = entry.expect("read dir entry");
@@ -645,6 +761,42 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 			out.push(path);
 		}
 	}
+}
+
+fn brace_blocks_after_marker(source: &str, marker: &str) -> Vec<(usize, String)> {
+	let mut blocks = Vec::new();
+	let mut search_start = 0usize;
+	while let Some(offset) = source[search_start..].find(marker) {
+		let start = search_start + offset;
+		let line = source[..start].matches('\n').count() + 1;
+		let mut depth = 0usize;
+		let mut saw_open = false;
+		let mut end = None;
+		for (relative_idx, ch) in source[start..].char_indices() {
+			match ch {
+				'{' => {
+					saw_open = true;
+					depth += 1;
+				}
+				'}' if saw_open => {
+					depth = depth.saturating_sub(1);
+					if depth == 0 {
+						end = Some(start + relative_idx + ch.len_utf8());
+						break;
+					}
+				}
+				_ => {}
+			}
+		}
+		if let Some(end) = end {
+			blocks.push((line, source[start..end].to_string()));
+			search_start = end;
+		} else {
+			blocks.push((line, source[start..].to_string()));
+			break;
+		}
+	}
+	blocks
 }
 
 fn format_offenders(manifest_dir: &Path, offenders: &[(PathBuf, usize, String)]) -> String {
@@ -663,6 +815,13 @@ fn format_offenders(manifest_dir: &Path, offenders: &[(PathBuf, usize, String)])
 
 fn manifest_dir() -> PathBuf {
 	PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn wendelon_manifest_dir() -> PathBuf {
+	manifest_dir()
+		.parent()
+		.expect("crates directory")
+		.join("wendelon")
 }
 
 fn descriptor() -> TableSchemaDescriptor {

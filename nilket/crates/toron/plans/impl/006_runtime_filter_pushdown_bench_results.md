@@ -2,11 +2,12 @@
 
 **Status:** Toron-side implementation evidence,
 promotion-scale Wendelon-disabled rows, full Phase 0 selective
-mock-Wendelon row, and production Wendelon-enabled selective row
+mock-Wendelon row, ADR 013 production Wendelon-enabled selective
+row, and ADR 014 ExactSet production Wendelon proving row
 captured.
 
 **Date:** 2026-05-13; ADR 013 production Wendelon row appended
-2026-05-14.
+2026-05-14; ADR 014 ExactSet row appended 2026-05-15.
 
 ## Scope
 
@@ -29,6 +30,10 @@ implementation:
 - ADR 013 implements the production Wendelon table-query
   application path and adds a CI-reachable production Wendelon row
   showing row/byte reduction with digest-equal post-join output.
+- ADR 014 adds ExactSet as a second runtime-filter kind and adds a
+  CI-reachable production Wendelon proving row showing ExactSet,
+  Bloom, and filter-disabled digest equality with zero ExactSet
+  false positives on a small-build fixture.
 
 ## Verification
 
@@ -42,6 +47,7 @@ cargo test -p toron --test runtime_filter_pushdown_test
 cargo test -p toron runtime_filter
 cargo test -p wendelon runtime_filter
 cargo test -p toron --test wendelon_storage_execution_test wendelon_table_query_runtime_filter_reduces_boundary_rows -- --nocapture
+cargo test -p toron --test wendelon_storage_execution_test wendelon_table_query_exact_set_runtime_filter_matches_bloom_and_reduces_boundary_rows -- --nocapture
 cargo test --workspace
 cargo bench -p toron --bench distributed_inner_equi_join --no-run
 cargo bench -p toron --bench distributed_inner_equi_join -- --quick --distributed-inner-equi-join-only --strategy=hash --runtime-filter=enabled,disabled
@@ -67,6 +73,12 @@ Results:
   production Wendelon table-query row reduced storage-boundary
   output from 1024 rows / 13,000 bytes to 2 rows / 712 bytes,
   preserving post-join digest
+  `5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38`.
+- `wendelon_table_query_exact_set_runtime_filter_matches_bloom_and_reduces_boundary_rows`:
+  production Wendelon table-query row returned 1024 rows / 13,000
+  bytes with no filter, 2 rows / 712 bytes with Bloom, and 2 rows
+  / 712 bytes with ExactSet. ExactSet reported zero false-positive
+  rows and preserved the post-join digest
   `5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38`.
 - `cargo test --workspace`: passed across Toron, Wendelon, and
   Wendelon client crates.
@@ -290,13 +302,83 @@ Readout:
 - Boundary rows drop by 99.8%; boundary bytes drop by 94.5% on
   this CI-scale production Wendelon fixture.
 
+## ADR 014 ExactSet Production Wendelon Row
+
+Command:
+
+```text
+cargo test -p toron --test wendelon_storage_execution_test wendelon_table_query_exact_set_runtime_filter_matches_bloom_and_reduces_boundary_rows -- --nocapture
+```
+
+Row:
+
+```text
+adr014_exact_small_set_runtime_filter rows_off=1024 rows_bloom=2 rows_exact=2 bytes_off=13000 bytes_bloom=712 bytes_exact=712 exact_false_positive_rows=0 digest=5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38
+```
+
+Readout:
+
+- The fixture runs an in-process Wendelon node through production
+  table-query runtime-filter transport and scan-engine application.
+- The filter-off Wendelon table-query returns 1024 probe rows and
+  13,000 IPC bytes across the storage boundary.
+- The Bloom-filtered table-query returns 2 rows and 712 IPC bytes.
+- The ExactSet-filtered table-query returns 2 rows and 712 IPC
+  bytes, with `exact_false_positive_rows=0`.
+- Local build-key joins over filter-disabled, Bloom, and ExactSet
+  outputs produce the same canonical digest:
+  `5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38`.
+- ExactSet is tied with Bloom on this CI-scale proving fixture
+  because Bloom happens to produce no false positives at 1024 probe
+  rows; the load-bearing proof is the zero-FP ExactSet path through
+  the production Wendelon scan boundary.
+
+## ADR 014 R5 Unique-Heavy Bloom-Wins Baseline
+
+Command:
+
+```text
+cargo test --locked -p toron --lib runtime_filter::tests::runtime_filter_generation_unique_heavy_bloom_wins_baseline -- --nocapture
+```
+
+Row:
+
+```text
+adr014_runtime_filter_unique_heavy_bloom_wins build_rows=8192 build_distinct=8192 elapsed_us=10049
+```
+
+Readout:
+
+- ADR 014 generation tries `ExactSet` first; on byte-budget overflow it
+  falls back to a separate Bloom build that re-scans the batches. On
+  unique-heavy inputs that overflow the gate, this is two scan passes
+  through the input rather than one (the duplicate-heavy case is fast
+  because `HashSet::insert` short-circuits the byte counter — see
+  `runtime_filter_generation_duplicate_heavy_can_emit_exact_set`).
+- The 8192-distinct-Int64 fixture (~106 KiB encoded, well above the
+  16 KiB ExactSet gate) records this scan-then-fallback cost as a
+  baseline for an eventual dual-accumulator refactor that would
+  abandon exact accounting at overflow rather than continuing to
+  dedup. Measured at ~10 ms on the captured run; comparison to a
+  dual-accumulator implementation would tell whether the regression
+  is material enough to refactor.
+- ADR 014 R5 risk is **measured-but-unmitigated** today: the proving
+  small-build row demonstrates ExactSet correctness, and this baseline
+  row records the Bloom-wins generation cost. Future work either
+  refactors generation to a single-pass dual accumulator or ratifies
+  the current cost as acceptable.
+
 ## Conditional Readout
 
 Current result is **Toron-side implementation complete with
 Toron-side promotion-bar evidence captured, full Phase 0 selective
 mock-Wendelon evidence captured, and ADR 013 production Wendelon
-application evidence captured**.
+application evidence captured. ADR 014's ExactSet runtime-filter
+kind is implemented and has production Wendelon proving evidence
+with digest-equal disabled/Bloom/ExactSet output and zero ExactSet
+false positives**.
 
 The exact-scale production Wendelon benchmark remains a possible
-future perf run, but the production application path and selective
-row/byte reduction gate are no longer pending.
+future perf run, but the production application path, selective
+row/byte reduction gate, and small-build ExactSet proof are no
+longer pending.

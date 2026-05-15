@@ -3074,8 +3074,9 @@ mod tests {
 	use std::hash::{DefaultHasher, Hash, Hasher};
 	use std::sync::Mutex;
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
-		RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
+		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
+		TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[tokio::test]
@@ -3142,12 +3143,14 @@ mod tests {
 			key_encoding_version: 1,
 			key_types: vec![RuntimeFilterKeyType::Int64],
 			probe_key_columns: vec![0],
-			hash_seed: 7,
-			bit_count: 8,
-			hash_count: 1,
-			byte_budget: 1,
-			target_fp_rate_bp: 100,
-			payload: vec![0b1010_1010],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: 7,
+				bit_count: 8,
+				hash_count: 1,
+				byte_budget: 1,
+				target_fp_rate_bp: 100,
+				payload: vec![0b1010_1010],
+			}),
 			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 		};
 		let context = ExecutionContext::new(

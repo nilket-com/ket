@@ -260,8 +260,9 @@ mod tests {
 	use arrow::array::{ArrayRef, Int32Array};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::{
-		RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION, RuntimeFilterKeyType,
-		encode_runtime_filter_key, insert_runtime_filter_encoded_key,
+		RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION, RuntimeFilterBloom,
+		RuntimeFilterKeyType, RuntimeFilterKind, encode_runtime_filter_key,
+		insert_runtime_filter_encoded_key,
 	};
 
 	#[tokio::test]
@@ -358,12 +359,14 @@ mod tests {
 			key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
 			key_types: vec![RuntimeFilterKeyType::Int32],
 			probe_key_columns: vec![0],
-			hash_seed: RUNTIME_FILTER_HASH_SEED,
-			bit_count,
-			hash_count,
-			byte_budget,
-			target_fp_rate_bp: 100,
-			payload,
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: RUNTIME_FILTER_HASH_SEED,
+				bit_count,
+				hash_count,
+				byte_budget,
+				target_fp_rate_bp: 100,
+				payload,
+			}),
 			probe_descriptor_fingerprint: fingerprint([7; 32]),
 		}
 	}

@@ -313,6 +313,36 @@ fn disable_pbc(plan: ExecutionPlan) -> ExecutionPlan {
 			partition_count,
 			key,
 		},
+		ExecutionPlan::Sort {
+			input,
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		} => ExecutionPlan::Sort {
+			input: Box::new(disable_pbc(*input)),
+			order_by,
+			limit,
+			offset,
+			output_schema,
+		},
+		ExecutionPlan::Join {
+			left,
+			right,
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			output_schema,
+		} => ExecutionPlan::Join {
+			left: Box::new(disable_pbc(*left)),
+			right: Box::new(disable_pbc(*right)),
+			kind,
+			left_keys,
+			right_keys,
+			strategy,
+			output_schema,
+		},
 	}
 }
 

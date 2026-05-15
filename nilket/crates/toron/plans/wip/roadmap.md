@@ -52,11 +52,11 @@ along with the forward-sequence rewrite.
   `request.runtime_filter`; Wendelon table-query wire carries
   `runtime_filter_len`; production Wendelon-enabled selective row in
   `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
-- **ADR 014 — Exact Small-Set Runtime Filters.** Promoted; implementation
-  pending. ExactSet runtime-filter kind for hash-partitioned inner equi-joins
-  with small build sets (gate: serialized exact payload ≤ Bloom
-  `MIN_FILTER_BYTES`); coordinator lowers exact-to-Bloom on overflow.
-  Proving bench row will append to
+- **ADR 014 — Exact Small-Set Runtime Filters.** Promoted + implemented.
+  ExactSet runtime-filter kind for hash-partitioned inner equi-joins with
+  small build sets (gate: serialized exact payload ≤ Bloom
+  `MIN_FILTER_BYTES`); coordinator lowers exact-to-Bloom on overflow. Proving
+  production Wendelon row appended to
   `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
 
 V1 target is **"First Query with Integrity"** plus

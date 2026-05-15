@@ -5,9 +5,9 @@
 
 ## Status
 
-Promoted to `plans/impl/`. Implementation is pending.
+Promoted and implemented.
 
-This is a real cross-crate implementation: Wendelon schema
+This was a real cross-crate implementation: Wendelon schema
 (descriptor refactor + ExactSet helpers), Toron generation
 (byte-budget gate), Toron scheduler (coordinator merge),
 Wendelon scan engine (kind-dispatched application), and a new
@@ -324,15 +324,15 @@ the residual when applicable).
 
 ## Phase 6 — Documentation and roadmap
 
-At implementation promotion (separate `feat:` commit):
+Implementation promotion completed:
 
-- flip ADR 014 Status: "Promoted; implementation pending." →
-  "Promoted and implemented.";
-- flip this impl plan's Status similarly;
-- update `crates/toron/plans/wip/roadmap.md` Status entry;
-- the bench row landed in the previous phase;
-- rotate ADR 015 candidates (lead = `GROUP BY ... ORDER BY`,
-  pre-converged in the ADR 014 selection round).
+- ADR 014 Status flipped to "Promoted and implemented.";
+- this impl plan's Status flipped similarly;
+- `crates/toron/plans/wip/roadmap.md` Status entry updated;
+- the ADR 014 bench row landed in the ADR 006 bench artifact;
+- ADR 015 candidates rotated forward (lead =
+  `GROUP BY ... ORDER BY`, pre-converged in the ADR 014 selection
+  round).
 
 ## Verification
 

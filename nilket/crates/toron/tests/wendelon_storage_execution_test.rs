@@ -32,9 +32,10 @@ use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
 	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	RuntimeFilterDescriptor, RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId,
-	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_runtime_filter_key,
-	encode_table_schema_descriptor_v1, insert_runtime_filter_encoded_key,
+	RuntimeFilterBloom, RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
+	encode_runtime_filter_key, encode_table_schema_descriptor_v1,
+	insert_runtime_filter_encoded_key,
 	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
@@ -199,6 +200,72 @@ async fn wendelon_table_query_runtime_filter_reduces_boundary_rows() {
 	println!(
 		"adr013_production_wendelon_runtime_filter rows_off={unfiltered_rows} rows_on={filtered_rows} bytes_off={unfiltered_bytes} bytes_on={filtered_bytes} digest={}",
 		hex32(unfiltered_digest.get()),
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn wendelon_table_query_exact_set_runtime_filter_matches_bloom_and_reduces_boundary_rows() {
+	let fixture = LiveWendelonFixture::start(38).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		selective_batch(1024),
+	)
+	.await;
+
+	let build_ids = [2, 4];
+	let unfiltered = table_query_id_amounts(&fixture, &descriptor, None).await;
+	let bloom = table_query_id_amounts(
+		&fixture,
+		&descriptor,
+		Some(runtime_filter_for_i64_values(&descriptor, &build_ids)),
+	)
+	.await;
+	let exact = table_query_id_amounts(
+		&fixture,
+		&descriptor,
+		Some(runtime_filter_exact_for_i64_values(&descriptor, &build_ids)),
+	)
+	.await;
+
+	let unfiltered_rows = row_count(&unfiltered);
+	let bloom_rows = row_count(&bloom);
+	let exact_rows = row_count(&exact);
+	let unfiltered_bytes = encode_batches(&unfiltered).len();
+	let bloom_bytes = encode_batches(&bloom).len();
+	let exact_bytes = encode_batches(&exact).len();
+	assert!(bloom_rows < unfiltered_rows);
+	assert!(exact_rows <= bloom_rows);
+	assert!(exact_bytes <= bloom_bytes);
+	let exact_fp = false_positive_rows(&exact, &build_ids);
+	assert_eq!(exact_fp, 0);
+
+	let unfiltered_digest = canonical_arrow_ipc_digest(
+		&[joined_amounts_for_ids(&unfiltered, &build_ids)],
+		SortPolicy::FullRowLex,
+	)
+	.expect("unfiltered digest");
+	let bloom_digest = canonical_arrow_ipc_digest(
+		&[joined_amounts_for_ids(&bloom, &build_ids)],
+		SortPolicy::FullRowLex,
+	)
+	.expect("bloom digest");
+	let exact_digest = canonical_arrow_ipc_digest(
+		&[joined_amounts_for_ids(&exact, &build_ids)],
+		SortPolicy::FullRowLex,
+	)
+	.expect("exact digest");
+	assert_eq!(bloom_digest, unfiltered_digest);
+	assert_eq!(exact_digest, unfiltered_digest);
+	println!(
+		"adr014_exact_small_set_runtime_filter rows_off={unfiltered_rows} rows_bloom={bloom_rows} rows_exact={exact_rows} bytes_off={unfiltered_bytes} bytes_bloom={bloom_bytes} bytes_exact={exact_bytes} exact_false_positive_rows=0 digest={}",
+		hex32(exact_digest.get()),
 	);
 
 	fixture.node.handles.abort();
@@ -437,6 +504,24 @@ fn amounts_from_single_column(batches: &[RecordBatch]) -> Vec<i32> {
 
 fn row_count(batches: &[RecordBatch]) -> usize {
 	batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn false_positive_rows(batches: &[RecordBatch], build_ids: &[i64]) -> usize {
+	let mut rows = 0usize;
+	for batch in batches {
+		assert_eq!(batch.num_columns(), 2);
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		for row in 0..batch.num_rows() {
+			if !build_ids.contains(&ids.value(row)) {
+				rows += 1;
+			}
+		}
+	}
+	rows
 }
 
 fn joined_amounts_for_ids(batches: &[RecordBatch], build_ids: &[i64]) -> RecordBatch {
@@ -805,12 +890,39 @@ fn runtime_filter_for_i64_values(
 		key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
 		key_types: vec![RuntimeFilterKeyType::Int64],
 		probe_key_columns: vec![0],
-		hash_seed: RUNTIME_FILTER_HASH_SEED,
-		bit_count,
-		hash_count,
-		byte_budget,
-		target_fp_rate_bp: 100,
-		payload,
+		kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+			hash_seed: RUNTIME_FILTER_HASH_SEED,
+			bit_count,
+			hash_count,
+			byte_budget,
+			target_fp_rate_bp: 100,
+			payload,
+		}),
+		probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+	}
+}
+
+fn runtime_filter_exact_for_i64_values(
+	descriptor: &TableSchemaDescriptor,
+	values: &[i64],
+) -> RuntimeFilterDescriptor {
+	let array = Int64Array::from(values.to_vec());
+	let mut keys = Vec::new();
+	for row in 0..array.len() {
+		keys.push(
+			encode_runtime_filter_key(&array, row)
+				.expect("encode runtime filter key")
+				.expect("non-null key"),
+		);
+	}
+	RuntimeFilterDescriptor {
+		key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+		key_types: vec![RuntimeFilterKeyType::Int64],
+		probe_key_columns: vec![0],
+		kind: RuntimeFilterKind::ExactSet(
+			wendelon::schema::runtime_filter_exact_set_from_encoded_keys(keys, 16 * 1024)
+				.expect("exact runtime filter"),
+		),
 		probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 	}
 }

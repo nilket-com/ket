@@ -3,7 +3,7 @@
 //! Smoke check:
 //! `cargo bench --bench distributed_inner_equi_join -- --quick --distributed-inner-equi-join-only`.
 
-use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::array::Int64Array;
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -14,8 +14,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
-use twox_hash::XxHash3_64;
-
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{MockCatalog, TableRef};
 use toron::distributed::budget::{ByteCount, DurationMillis, QueryBudget, TaskBudget};
@@ -36,7 +34,8 @@ use toron::server::{
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
-	RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	build_runtime_filter_mask_for_batch,
 };
 
 const DEFAULT_WORKERS: &[usize] = &[2, 4, 8];
@@ -45,7 +44,6 @@ const DEFAULT_BUILD_ROWS: usize = 65_536;
 const DEFAULT_PROBE_ROWS: usize = 262_144;
 const QUICK_BUILD_ROWS: usize = 2_048;
 const QUICK_PROBE_ROWS: usize = 8_192;
-const RUNTIME_FILTER_HASH_SEED_2: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn main() -> Result<(), Box<dyn Error>> {
 	let config = BenchConfig::parse();
@@ -755,58 +753,15 @@ fn apply_runtime_filter(
 	batch: &RecordBatch,
 	runtime_filter: &RuntimeFilterDescriptor,
 ) -> Result<RecordBatch, StorageError> {
-	if runtime_filter.key_types.as_slice() != [RuntimeFilterKeyType::Int64]
-		|| runtime_filter.probe_key_columns.len() != 1
-	{
-		return Ok(batch.clone());
+	// Route through the shared kind-aware mask helper so the bench
+	// exercises the same path as production (`InMemoryStorageScan` and the
+	// Wendelon scan engine). Falls back to passing the batch through
+	// unfiltered if the descriptor is unusable — same advisory-drop
+	// semantics as production.
+	match build_runtime_filter_mask_for_batch(batch, runtime_filter) {
+		Ok(mask) => filter_record_batch(batch, &mask).map_err(StorageError::from),
+		Err(_) => Ok(batch.clone()),
 	}
-	let column_index = runtime_filter.probe_key_columns[0] as usize;
-	let Some(array) = batch
-		.column(column_index)
-		.as_any()
-		.downcast_ref::<Int64Array>()
-	else {
-		return Ok(batch.clone());
-	};
-	let mask = (0..batch.num_rows())
-		.map(|row| {
-			if array.is_null(row) {
-				return false;
-			}
-			let mut encoded = Vec::with_capacity(9);
-			encoded.push(5);
-			encoded.extend_from_slice(&array.value(row).to_le_bytes());
-			bloom_might_contain(runtime_filter, &encoded)
-		})
-		.collect::<BooleanArray>();
-	filter_record_batch(batch, &mask).map_err(StorageError::from)
-}
-
-fn bloom_might_contain(runtime_filter: &RuntimeFilterDescriptor, encoded: &[u8]) -> bool {
-	if runtime_filter.bit_count == 0
-		|| runtime_filter.hash_count == 0
-		|| runtime_filter.payload.is_empty()
-	{
-		return true;
-	}
-	let h1 = XxHash3_64::oneshot_with_seed(runtime_filter.hash_seed, encoded);
-	let mut h2 = XxHash3_64::oneshot_with_seed(
-		runtime_filter.hash_seed ^ RUNTIME_FILTER_HASH_SEED_2,
-		encoded,
-	);
-	if h2 == 0 {
-		h2 = RUNTIME_FILTER_HASH_SEED_2;
-	}
-	(0..u64::from(runtime_filter.hash_count)).all(|idx| {
-		let bit = h1.wrapping_add(idx.wrapping_mul(h2)) % u64::from(runtime_filter.bit_count);
-		let byte = (bit / 8) as usize;
-		let mask = 1u8 << (bit % 8);
-		runtime_filter
-			.payload
-			.get(byte)
-			.map(|value| value & mask != 0)
-			.unwrap_or(true)
-	})
 }
 
 struct WorkerHarness {

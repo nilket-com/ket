@@ -15422,12 +15422,14 @@ mod tests {
 			key_encoding_version: crate::schema::RUNTIME_FILTER_KEY_ENCODING_VERSION,
 			key_types: vec![crate::schema::RuntimeFilterKeyType::Int64],
 			probe_key_columns: vec![0],
-			hash_seed: crate::schema::RUNTIME_FILTER_HASH_SEED,
-			bit_count,
-			hash_count,
-			byte_budget,
-			target_fp_rate_bp: 150,
-			payload,
+			kind: crate::schema::RuntimeFilterKind::Bloom(crate::schema::RuntimeFilterBloom {
+				hash_seed: crate::schema::RUNTIME_FILTER_HASH_SEED,
+				bit_count,
+				hash_count,
+				byte_budget,
+				target_fp_rate_bp: 150,
+				payload,
+			}),
 			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 		}
 	}
@@ -15438,6 +15440,33 @@ mod tests {
 	) -> RuntimeFilterApplication {
 		RuntimeFilterApplication {
 			descriptor: runtime_filter_descriptor_for_ids(descriptor, ids),
+		}
+	}
+
+	fn runtime_filter_exact_application_for_ids(
+		descriptor: &TableSchemaDescriptor,
+		ids: &[i64],
+	) -> RuntimeFilterApplication {
+		let ids = Int64Array::from(ids.to_vec());
+		let mut keys = Vec::new();
+		for row in 0..ids.len() {
+			keys.push(
+				crate::schema::encode_runtime_filter_key(&ids, row)
+					.expect("encode runtime-filter id")
+					.expect("non-null id"),
+			);
+		}
+		RuntimeFilterApplication {
+			descriptor: RuntimeFilterDescriptor {
+				key_encoding_version: crate::schema::RUNTIME_FILTER_KEY_ENCODING_VERSION,
+				key_types: vec![crate::schema::RuntimeFilterKeyType::Int64],
+				probe_key_columns: vec![0],
+				kind: crate::schema::RuntimeFilterKind::ExactSet(
+					crate::schema::runtime_filter_exact_set_from_encoded_keys(keys, 16 * 1024)
+						.expect("exact runtime filter"),
+				),
+				probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+			},
 		}
 	}
 
@@ -15575,6 +15604,31 @@ mod tests {
 	}
 
 	#[test]
+	fn secondary_index_projected_exact_set_runtime_filter_applies_before_pbc_output() {
+		let descriptor = typed_table_descriptor();
+		let program = pbc_project_name_program();
+		let requirement = analyze_pbc_column_requirement(&program, 2).unwrap();
+		let projected = projected_typed_batch(vec![
+			(1, "filtered-out"),
+			(2, "survivor"),
+			(3, "also-filtered-out"),
+		]);
+		let execution = QueryProjectedExecution::Pbc {
+			requirement,
+			user_column_count: 2,
+			runtime_filter: Some(runtime_filter_exact_application_for_ids(&descriptor, &[2])),
+		};
+
+		let result = execute_secondary_index_projected_row(projected, &program, &execution)
+			.expect("secondary-index projected execution")
+			.expect("PBC output batch");
+
+		assert_eq!(result.batch.num_columns(), 1);
+		assert!(result.batch.column_by_name("id").is_none());
+		assert_eq!(names_from_batch(&result.batch), vec!["survivor"]);
+	}
+
+	#[test]
 	fn whole_record_runtime_filter_applies_before_pbc_output() {
 		let descriptor = typed_table_descriptor();
 		let program = pbc_project_name_program();
@@ -15586,6 +15640,27 @@ mod tests {
 		let filtered = apply_runtime_filter_to_batch(
 			batch,
 			&runtime_filter_application_for_ids(&descriptor, &[2]),
+		)
+		.expect("whole-record runtime-filter application");
+		let output = pbc::execute_program(&program, &filtered).expect("PBC projection");
+
+		assert_eq!(output.num_columns(), 1);
+		assert!(output.column_by_name("id").is_none());
+		assert_eq!(names_from_batch(&output), vec!["survivor"]);
+	}
+
+	#[test]
+	fn whole_record_exact_set_runtime_filter_applies_before_pbc_output() {
+		let descriptor = typed_table_descriptor();
+		let program = pbc_project_name_program();
+		let batch = typed_table_batch_with_names(vec![
+			(1, "filtered-out"),
+			(2, "survivor"),
+			(3, "also-filtered-out"),
+		]);
+		let filtered = apply_runtime_filter_to_batch(
+			batch,
+			&runtime_filter_exact_application_for_ids(&descriptor, &[2]),
 		)
 		.expect("whole-record runtime-filter application");
 		let output = pbc::execute_program(&program, &filtered).expect("PBC projection");

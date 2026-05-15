@@ -7,7 +7,7 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Implementation is pending.
+Promoted and implemented.
 
 Three-way AI Swarm Council convergence reached across five
 iteration rounds. Iteration artifacts retire when this plan is
@@ -15,8 +15,10 @@ promoted — git holds the narrative.
 
 ADR 014 owns no independent bench artifact. Its evidence lands in
 `plans/impl/006_runtime_filter_pushdown_bench_results.md`
-alongside ADR 013's production row — ADR 014 completes the
-post-ADR-013 wire-byte-reduction story for small build sets.
+alongside ADR 013's production row. ADR 014 completes the
+post-ADR-013 wire-byte-reduction story for small build sets with
+the `adr014_exact_small_set_runtime_filter` production Wendelon
+row.
 
 Load-bearing antecedents: Codex iter-1/2/3's narrow framing
 (runtime-filter `kind` enum, not SQL `IN`, not PBC `InList`, not

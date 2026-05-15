@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -26,8 +26,9 @@ use toron::server::{
 use toron::storage::{HlcBound, ScanRequest, ScanStream, StorageScan, TenantId};
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterDescriptor,
-	RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
+	RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
+	TableObjectId, TableSchemaDescriptor,
 };
 
 const RUNTIME_FILTER_HASH_SEED_2: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -388,53 +389,11 @@ fn apply_runtime_filter(
 	{
 		return Ok(batch.clone());
 	}
-	let column_index = runtime_filter.probe_key_columns[0] as usize;
-	let Some(array) = batch
-		.column(column_index)
-		.as_any()
-		.downcast_ref::<Int64Array>()
-	else {
-		return Ok(batch.clone());
+	let mask = match wendelon::schema::build_runtime_filter_mask_for_batch(batch, runtime_filter) {
+		Ok(mask) => mask,
+		Err(_) => return Ok(batch.clone()),
 	};
-	let mask = (0..batch.num_rows())
-		.map(|row| {
-			if array.is_null(row) {
-				return false;
-			}
-			let mut encoded = Vec::with_capacity(9);
-			encoded.push(5);
-			encoded.extend_from_slice(&array.value(row).to_le_bytes());
-			bloom_might_contain(runtime_filter, &encoded)
-		})
-		.collect::<BooleanArray>();
 	filter_record_batch(batch, &mask).map_err(StorageError::from)
-}
-
-fn bloom_might_contain(runtime_filter: &RuntimeFilterDescriptor, encoded: &[u8]) -> bool {
-	if runtime_filter.bit_count == 0
-		|| runtime_filter.hash_count == 0
-		|| runtime_filter.payload.is_empty()
-	{
-		return true;
-	}
-	let h1 = XxHash3_64::oneshot_with_seed(runtime_filter.hash_seed, encoded);
-	let mut h2 = XxHash3_64::oneshot_with_seed(
-		runtime_filter.hash_seed ^ RUNTIME_FILTER_HASH_SEED_2,
-		encoded,
-	);
-	if h2 == 0 {
-		h2 = RUNTIME_FILTER_HASH_SEED_2;
-	}
-	(0..u64::from(runtime_filter.hash_count)).all(|idx| {
-		let bit = h1.wrapping_add(idx.wrapping_mul(h2)) % u64::from(runtime_filter.bit_count);
-		let byte = (bit / 8) as usize;
-		let mask = 1u8 << (bit % 8);
-		runtime_filter
-			.payload
-			.get(byte)
-			.map(|value| value & mask != 0)
-			.unwrap_or(true)
-	})
 }
 
 fn runtime_filter_descriptor(
@@ -446,12 +405,14 @@ fn runtime_filter_descriptor(
 		key_encoding_version: 1,
 		key_types: vec![RuntimeFilterKeyType::Int64],
 		probe_key_columns: vec![1],
-		hash_seed: 7,
-		bit_count,
-		hash_count: 1,
-		byte_budget: payload.len() as u32,
-		target_fp_rate_bp: 100,
-		payload,
+		kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+			hash_seed: 7,
+			bit_count,
+			hash_count: 1,
+			byte_budget: payload.len() as u32,
+			target_fp_rate_bp: 100,
+			payload,
+		}),
 		probe_descriptor_fingerprint: fingerprint,
 	}
 }
@@ -473,12 +434,14 @@ fn runtime_filter_descriptor_for_values(
 		key_encoding_version: 1,
 		key_types: vec![RuntimeFilterKeyType::Int64],
 		probe_key_columns: vec![1],
-		hash_seed: 7,
-		bit_count: bit_count as u32,
-		hash_count,
-		byte_budget: payload.len() as u32,
-		target_fp_rate_bp: 100,
-		payload,
+		kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+			hash_seed: 7,
+			bit_count: bit_count as u32,
+			hash_count,
+			byte_budget: payload.len() as u32,
+			target_fp_rate_bp: 100,
+			payload,
+		}),
 		probe_descriptor_fingerprint: fingerprint,
 	}
 }

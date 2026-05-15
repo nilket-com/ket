@@ -7,7 +7,7 @@ use crate::distributed::identity::{
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::{ExecutionExpr, ExecutionPlan, TableId};
 use crate::server::spill::SpillId;
-use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType};
+use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArrowIpcDigest(pub [u8; 32]);
@@ -202,12 +202,7 @@ pub struct PartitionManifest {
 pub struct RuntimeFilterFragment {
 	pub key_encoding_version: u32,
 	pub key_types: Vec<RuntimeFilterKeyType>,
-	pub hash_seed: u64,
-	pub bit_count: u32,
-	pub hash_count: u8,
-	pub byte_budget: u32,
-	pub target_fp_rate_bp: u16,
-	pub payload: Vec<u8>,
+	pub kind: RuntimeFilterKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,8 +253,8 @@ mod tests {
 	use super::*;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::{
-		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
-		TableObjectId, TableSchemaDescriptor,
+		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, RuntimeFilterBloom,
+		SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor,
 	};
 
 	#[test]
@@ -349,12 +344,14 @@ mod tests {
 			key_encoding_version: 1,
 			key_types: vec![RuntimeFilterKeyType::Int64],
 			probe_key_columns: vec![0],
-			hash_seed: 7,
-			bit_count: 8,
-			hash_count: 1,
-			byte_budget: 1,
-			target_fp_rate_bp: 100,
-			payload: vec![0xFF],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: 7,
+				bit_count: 8,
+				hash_count: 1,
+				byte_budget: 1,
+				target_fp_rate_bp: 100,
+				payload: vec![0xFF],
+			}),
 			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 		}
 	}
@@ -363,12 +360,14 @@ mod tests {
 		RuntimeFilterFragment {
 			key_encoding_version: 1,
 			key_types: vec![RuntimeFilterKeyType::Int64],
-			hash_seed: 7,
-			bit_count: 16,
-			hash_count: 2,
-			byte_budget: 2,
-			target_fp_rate_bp: 100,
-			payload: vec![0b1010_0101, 0b0101_1010],
+			kind: RuntimeFilterKind::Bloom(RuntimeFilterBloom {
+				hash_seed: 7,
+				bit_count: 16,
+				hash_count: 2,
+				byte_budget: 2,
+				target_fp_rate_bp: 100,
+				payload: vec![0b1010_0101, 0b0101_1010],
+			}),
 		}
 	}
 }

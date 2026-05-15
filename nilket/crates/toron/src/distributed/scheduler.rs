@@ -935,12 +935,16 @@ mod tests {
 		RuntimeFilterFragment {
 			key_encoding_version: 1,
 			key_types: vec![wendelon::schema::RuntimeFilterKeyType::Int64],
-			hash_seed: 7,
-			bit_count: 16,
-			hash_count,
-			byte_budget: u32::try_from(payload.len()).expect("payload len fits u32"),
-			target_fp_rate_bp: 100,
-			payload,
+			kind: wendelon::schema::RuntimeFilterKind::Bloom(
+				wendelon::schema::RuntimeFilterBloom {
+					hash_seed: 7,
+					bit_count: 16,
+					hash_count,
+					byte_budget: u32::try_from(payload.len()).expect("payload len fits u32"),
+					target_fp_rate_bp: 100,
+					payload,
+				},
+			),
 		}
 	}
 
@@ -1279,8 +1283,7 @@ mod tests {
 			runtime_filter.probe_descriptor_fingerprint,
 			physical_fingerprint()
 		);
-		assert_eq!(runtime_filter.payload, fragment.payload);
-		assert!(runtime_filter.payload.iter().any(|byte| *byte != 0));
+		assert_eq!(&runtime_filter.kind, &fragment.kind);
 	}
 
 	#[tokio::test]
@@ -1391,7 +1394,7 @@ mod tests {
 		)
 		.expect("fragment result")
 		.expect("fragment");
-		assert_eq!(runtime_filter.payload, accepted_fragment.payload);
+		assert_eq!(&runtime_filter.kind, &accepted_fragment.kind);
 	}
 
 	#[test]
