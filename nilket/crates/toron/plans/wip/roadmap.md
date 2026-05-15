@@ -184,6 +184,28 @@ along with the forward-sequence rewrite.
   inspection, and preserved architecture guards. Selected from
   outside the rotated post-ADR-009 A–E candidate list on fresh
   code evidence of a second silent-wrong-results defect.
+- **ADR 012 — Mixed-Wildcard Projection Accounting and Planner
+  Hardening.** Promoted. Frontend-planner surface fix closing the
+  last known projection-item silent drop one level below ADR 011:
+  `SqlPlanner::lower_select`'s non-aggregate projection loop
+  returned the input plan on the first `SELECT *` it saw,
+  silently discarding every sibling projection item — so
+  `SELECT region, * FROM sales` executed with `region`'s
+  requested position dropped. After ADR 012, any unqualified
+  wildcard mixed with any sibling rejects through
+  `FrontendError::Unsupported`; bare `SELECT *` is unchanged and
+  byte-identical. The secondary half hardens a `TIME_BUCKET`
+  arity panic — `lower_expr` indexed `args[0]` / `args[1]`
+  without an arity check — to a clean reject, with exactly-two
+  arity so an extra argument is not silently dropped. No new IR,
+  operator, wire, binder, executor, or Wendelon surface;
+  `LogicalPlan` stays 9 variants and `ExecutionPlan` stays 7. No
+  bench-results artifact — promotion evidence is behavioral plus
+  a source-shape architecture guard. Selected from outside the
+  standing A–E candidate list on fresh code evidence, the third
+  in the ADR 010 → 011 → 012 projection-accounting sequence.
+  Three-way AI Swarm Council convergence (Claude / Codex /
+  Gemini) across five iteration rounds.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -269,10 +291,18 @@ defect, where `SELECT region, SUM(amount) FROM sales` accepted an
 aggregate projection and dropped `region` on the floor. ADR 011
 therefore promoted another pure-Toron frontend-planner integrity
 fix, plus narrow `GROUP BY` SQL reachability over the already
-implemented grouped aggregate operator. The pending ADR 006
-Wendelon row and any launch-pressure shift now feed ADR 012
-selection, and the candidate list below (the former ADR 010 A–E
-set plus ADR 011 follow-ons) reflects that landscape.
+implemented grouped aggregate operator. ADR 012 repeated the
+discipline a third time: re-reading `SqlPlanner::lower_select`
+exposed the last projection-item silent drop — mixed unqualified
+wildcards returned the input plan and discarded every sibling
+projection item — so ADR 012 promoted a third pure-Toron
+frontend-planner integrity fix, plus `TIME_BUCKET` arity
+hardening. The pending ADR 006 Wendelon row and any
+launch-pressure shift now feed ADR 013 selection, and the
+candidate list below reflects that landscape — with runtime
+filter application at the storage-scan boundary as the lead
+candidate, ahead of the former A–E set and the ADR 011
+follow-ons.
 
 **Scale-boundary convention (adopted iter-5 of ADR 006).**
 Every ADR from ADR 006 forward includes an explicit
@@ -284,7 +314,8 @@ ADR 008), cluster-wide (governance, ADR 003), cross-ring
 `PartitionManifest`/`ScanRequest` additions),
 storage-internal (Wendelon), frontend planner (ADR 009, ADR 010 —
 clause accounting, ADR 011 — aggregate projection accounting and
-`GROUP BY` SQL reachability), operator-level executor +
+`GROUP BY` SQL reachability, ADR 012 — mixed-wildcard projection
+accounting and planner hardening), operator-level executor +
 distributed fragmenter (ADR 010 — the `Sort` operator and its
 terminal gather-sort stage). The decomposition makes
 scope-creep into adjacent boundaries visible at review
@@ -319,30 +350,56 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-ADR 012 selection waits on the ADR 006 Wendelon row arrival and
-any launch-pressure shift. Until that lands, the candidate list
-below reflects the post-ADR-009 landscape plus ADR 011 follow-on
-surfaces.
+### Completed: ADR 012 promotion
 
-### ADR 012 candidates
+ADR 012's contract is pinned at
+`plans/adr/012_mixed_wildcard_projection_accounting_and_planner_hardening.md`;
+the impl plan lives at
+`plans/impl/012_mixed_wildcard_projection_accounting_and_planner_hardening.md`.
+ADR 012 introduces no operator and makes no performance claim, so
+there is no bench-results artifact. It closes the last known
+projection-item silent drop in the frontend planner — mixed
+unqualified wildcards no longer silently discard sibling
+projection items — and hardens the `TIME_BUCKET` arity panic.
+Implementation phases are pending; see the impl plan and
+`git log` for actual status.
 
-This is the candidate list the ADR 009 planning session left for
-ADR 010. ADR 010 was instead selected from outside it — the
-silent-drop defect was load-bearing V1 code evidence the list
-predated. ADR 011 was also selected from outside it, on a second
-planner silent-drop defect one level below ADR 010. The list now
-rotates forward as the ADR 012 candidate set: with L-2 (Rune
-sandbox) consumed by ADR 007,
-operator-level SQL width by ADR 008, the frontend-planner
-existence-predicate gap by ADR 009, and top-level clause
-accounting + result ordering by ADR 010, and aggregate
-projection accounting + narrow `GROUP BY` reachability by
-ADR 011, the remaining candidates are below, in rough order of
-probable selection given evidence shapes the council can already
-anticipate. B and C remain gated on the pending ADR 006 Wendelon
-production row.
+### ADR 013 candidates
 
-ADR 011 follow-ons are now explicit candidates rather than
+ADR 010, ADR 011, and ADR 012 were each selected from *outside*
+the roadmap's standing A–E candidate list — on code evidence of a
+silent-wrong-results (or, for ADR 012's secondary half, a panic)
+defect the list predated. ADR 013 selection inherits the same
+discipline: evidence beats the list.
+
+**Lead candidate — runtime filter application at the storage-scan
+boundary.** Surfaced during ADR 012 selection. ADR 006 shipped a
+runtime filter that is, in production, generation and carriage
+with no application: the descriptor reaches
+`ScanRequest.runtime_filter`, then both `StorageScan`
+implementations (`InMemoryStorageScan`, `WendelonStorageScan`)
+ignore it, and the only row-rejection path is a test-local
+fixture that reimplements scan. Closing this is ADR-shaped — a
+missing `StorageScan` application contract, a missing table-query
+wire field, and a missing Wendelon scan-engine application site —
+and it produces the production Wendelon-enabled selective bench
+row ADR 006 has been waiting on, which in turn unlocks Candidates
+B and C below. Seeded by the retired
+`claude_iter_3_*` / `codex_iter_4_*` ADR 012 iteration artifacts
+(git holds them).
+
+The standing candidate list the ADR 009 planning session left
+behind still rotates forward beneath the lead candidate, with
+L-2 (Rune sandbox) consumed by ADR 007, operator-level SQL width
+by ADR 008, the frontend-planner existence-predicate gap by
+ADR 009, top-level clause accounting + result ordering by
+ADR 010, aggregate projection accounting + narrow `GROUP BY`
+reachability by ADR 011, and mixed-wildcard projection accounting
++ planner hardening by ADR 012. B and C remain gated on the
+pending ADR 006 Wendelon production row — which the lead
+candidate would itself land.
+
+ADR 011 follow-ons remain explicit candidates rather than
 accidental scope: `GROUP BY` over joins, `GROUP BY ... ORDER BY`,
 `HAVING`, `DISTINCT`, post-aggregate projection (aliases,
 reordering, key subsets, computed keys), two-phase partial/final
