@@ -63,6 +63,14 @@ along with the forward-sequence rewrite.
   `GROUP BY ... ORDER BY [LIMIT/OFFSET]` via one narrow fragmenter detector
   that emits a three-stage pipeline
   (producers → grouped aggregate consumers → terminal sort). No new IR.
+- **ADR 016 — Post-Aggregate Filtering with `HAVING`.** Promoted, pending
+  implementation. Second instance of the ADR 015 cycle shape: removes one
+  planner reject, adds a localized planner-side rewrite of `HAVING`
+  aggregate-call references against projection-output field names (matched
+  on the lowered `(AggregateFunction, Vec<Expr>)` IR pair, case-insensitive
+  and argument-normalized), and extends the ADR 015 detector with one
+  optional `Filter` between the terminal-gather `Exchange` and the
+  `Aggregate`. No new IR, no new binder seam, no new `FilterDisposition`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -112,21 +120,31 @@ a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### ADR 016 candidates
+### Promoted: ADR 016 plan
 
-**Adjacent SQL-surface candidates** lead the iter-1 scan, all
-still resting on ADR 011's narrow grouped-aggregate surface:
+ADR 016's contract is pinned at
+`plans/adr/016_post_aggregate_filtering_with_having.md`; the
+impl plan lives at
+`plans/impl/016_post_aggregate_filtering_with_having.md`.
+Implementation is pending. ADR 016 owns no independent bench
+artifact — it is the second instance of the ADR 015 cycle
+shape (pure composition, narrow reject removal, narrow
+detector extension, reject-string absence as architecture
+guard) applied to the post-aggregate predicate position.
 
-- **`HAVING`** — post-aggregate predicate on grouped output. Pairs
-  naturally with ADR 015's terminal ordering; same single-table
-  scope as ADR 011, single new logical position above the
-  `Aggregate`.
+### ADR 017 candidates
+
+**Adjacent SQL-surface candidates** carry forward from the
+ADR 016 selection round, all still resting on ADR 011's narrow
+grouped-aggregate surface:
+
+- **`ORDER BY <aggregate-call>`** — natural symmetric extension
+  to ADR 016. The same planner-rewrite pattern applied at
+  `lower_order_by` would close ADR 015's V1 exclusion. Lowest
+  net-new surface among the candidates.
 - **`DISTINCT`** — `GROUP BY <all output columns>` with no
   aggregates. ADR 010 closed its silent drop; implementation
   remains aggregate-path ADR work.
-- **`ORDER BY <aggregate-call>`** — the V1 exclusion from ADR 015.
-  Requires aggregate-call recognition in an `ORDER BY`-specific
-  post-aggregate expression scope.
 - **Post-aggregate projection** (aliases, computed expressions on
   aggregates, key subsets, reordered keys). ADR 011 explicitly
   rejects; widening is its own decision matrix.
@@ -406,7 +424,84 @@ Small improvements that don't fit a single ADR.
 Ideas explored across iteration rounds in `plans/wip/`
 that did not earn forward placement. Kept here as a
 record of what the council considered and let go. Items
-labeled by ADR cycle.
+labeled by ADR cycle. Older cycles compress to brief
+summaries; recent cycles retain detail until evidence
+fades.
+
+### ADR 016 cycle
+
+- **Shape A — group-keys-only `HAVING`** (no aggregate-call
+  rewrite). Considered as the purest ADR 015 cycle-shape
+  echo; rejected. Group-keys-only `HAVING` is `WHERE`
+  applied after the aggregate over a key the aggregate
+  already partitions on — the canonical analytical case
+  `HAVING SUM(amount) > N` fails, which is a worse user
+  surface than no `HAVING` at all.
+- **Shape B — binder widening with `Expr::AggregateCall`
+  arm.** Considered (Codex first-principles redline:
+  binder is the "right" layer for context-aware resolution
+  and would close ADR 015's `ORDER BY <aggregate-call>` V1
+  exclusion in the same ADR); rejected. Shape B does not
+  avoid structural-match logic, only relocates it;
+  `bind_expr` lacks projection context today; ADR 009
+  precedent (targeted SQL-AST rewrite over expanding
+  binder surface) is the consistent posture. Shape C
+  (planner pre-rewrite) wins.
+- **Raw `sqlparser::ast::Function` `PartialEq` as the
+  rewrite match key.** Considered (Claude iter-3 initial
+  design); rejected on iter-4 ground-truth verification.
+  `Function`'s derived `PartialEq` is byte-equal on `name:
+  ObjectName`, which preserves user casing — `HAVING sum
+  (amount)` would byte-mismatch `SELECT SUM(amount)`
+  despite being the same call. Match on the lowered
+  `(AggregateFunction, Vec<Expr>)` pair instead;
+  `lower_aggregate_function` canonicalizes casing and
+  arguments.
+- **First-match resolution for duplicate-output-name
+  `HAVING` references.** Considered (Claude iter-5
+  initial position: "matches the first projection
+  aggregate"); rejected (Codex + Gemini iter-5 strict
+  policy). Four-way classification: zero matches → reject
+  as not-in-SELECT; multiple matches → reject as
+  ambiguous; one match with duplicated generated output
+  name → reject as ambiguous; one match with unique name
+  → rewrite. Standard SQL has no `HAVING <ordinal>` form
+  to disambiguate; silent first-match would hide
+  ambiguity from the user.
+- **Bundle ADR 015's `ORDER BY <aggregate-call>` V1
+  exclusion close into ADR 016.** Considered as symmetric
+  scope (same planner-rewrite pattern at
+  `lower_order_by`); rejected. Asymmetry is user urgency,
+  not implementation cost — `ORDER BY <aggregate-call>`
+  has a working workaround (`ORDER BY <ordinal>`),
+  `HAVING <aggregate-call>` does not. Keeping the
+  exclusion preserves ADR 016's narrow framing; ADR 017
+  candidate.
+- **Place the post-aggregate `Filter` outside the
+  terminal-gather `Exchange`.** Considered as alternative
+  to the inside-gather form; rejected. Outside-gather
+  filters reduce nothing before the shuffle and bloat the
+  terminal-sort task plan; inside-gather is wire-
+  efficient and preserves the three-stage symmetry.
+- **New `FilterDisposition` variant for post-aggregate
+  predicates.** Considered; rejected. The existing
+  `EvaluateInToron` disposition applies — PBC-push at
+  `binder.rs:83-98` naturally fails for any predicate
+  whose columns are not in the storage scan output, so
+  the post-aggregate filter falls into `EvaluateInToron`
+  without new selection logic.
+- **Permissive-engine `HAVING` lifting** (auto-insert a
+  non-projected aggregate into the projection when
+  `HAVING` references it). Considered for user
+  convenience; rejected. Standard-SQL reject is the V1
+  contract — too narrow and correct over matching
+  permissive engines.
+- **`HAVING <ordinal>` form** (`HAVING 2 > 100` as
+  ordinal reference). Considered for ambiguity
+  disambiguation; rejected. Standard SQL has no such
+  form; `HAVING 2 > 100` lowers as a literal predicate
+  (`2 > 100`, always false). The ambiguous-aggregate
+  workaround is query restructuring.
 
 ### ADR 010 cycle
 
@@ -631,244 +726,105 @@ labeled by ADR cycle.
   variant set being stable. Fallback is to gate SQL lowering to
   whatever the current dialect parses; keep IR variants.
 
-### ADR 007 cycle
+### ADR 004 – ADR 007 cycles (compressed)
 
-- **Fuel-only V1 sandbox.** Considered (my iter-0 had memory
-  enforcement as a V1.x reservation); rejected. Codex iter-0
-  argument that a memory bomb fitting within fuel can still OOM
-  the host was load-bearing. Memory enforcement is V1 hard
-  requirement — Rune-native cap or helper-process isolation
-  picked by Phase 0 P0.3.
-- **`Context::with_default_modules()` with deny-list tests.**
-  Considered (intuitive but fragile to Rune version drift);
-  rejected. Allow-list discipline (`Context::new()` + explicit
-  registration) inverts the failure mode — new Rune modules
-  don't silently widen the attack surface; missing primitives
-  break loud rather than capability silently exposed.
-- **New `TaskFailureKind` variants
-  (`SandboxFuelExhausted` / `SandboxMemoryExhausted`).**
-  Considered (Gemini iter-0 proposal); rejected. Preserves the
-  ADR 003 7-variant `TaskFailureKind` wire contract. Sandbox
-  failures crossing the task wire map to existing
-  `TaskFailureKind::TaskFailed { retryable: false, reason:
-  "RuneSandbox::<label>" }` — the reason-string mapping is the
-  right cross-wire surface.
-- **Raw missing-function strings in `CapabilityDenied`.**
-  Considered (my iter-0); rejected in favor of
-  `CapabilityCategory` enum (`Filesystem`, `Process`, `Network`,
-  `Environment`, `Time`, `Random`, `Threading`, `Unknown`). More
-  robust against Rune version drift; more useful for client
-  tooling. Raw module paths live in internal `tracing` debug
-  logs only — never on the public enum.
-- **Row-level Rune UDF execution.** Considered (Gemini iter-0
-  framed sandbox failures as worker-side UDF failures); rejected
-  as out of scope for ADR 007. Rune is frontend-scoped in V1.
-  Worker-side execution is a substantial future ADR.
-- **Subprocess sandbox with full seccomp + rlimit.** Considered
-  as V1 memory-enforcement path; rejected for V1 — heavier than
-  necessary. Helper-process isolation (Phase 0 P0.3 path (b))
-  is lightweight enough when needed.
-- **WASM runtime migration.** Considered as stronger sandboxing;
-  rejected — would replace M7's authoring surface entirely. Out
-  of scope; reserved for future ADR if Rune sandbox proves
-  insufficient.
-- **No architecture guard for `Context::with_default_modules`
-  absence.** Considered as my iter-0 default; rejected in favor
-  of conditional escape firing. Source-level grep guard at
-  `tests/architecture_test.rs` is the right defense against
-  silent regression to default-allow. Mirrors ADR 005 hard gate
-  14 / ADR 006 hard gate 15 pattern.
-- **Wall-timeout as primary CPU accounting.** Considered;
-  rejected. Fuel is primary; wall-timeout is defense-in-depth
-  belt against broken fuel implementation. Legitimate scripts
-  never observe `Timeout` under normal operation — fuel
-  exhaustion fires first.
-- **`AllowProfile` as `Option<String>` or absent in V1.**
-  Considered (single-profile means the field is redundant);
-  kept as named enum with one variant
-  (`AllowProfile::ToronAuthoring`). V1.x extension is then
-  type-system-checked, no `RuneSandboxConfig` shape churn.
-- **`execute_script(script, fuel)` compatibility shim
-  preserved.** Considered (keep the existing signature, ignore
-  fuel arg, add a separate `execute_script_with_config`
-  method); rejected. The dead `_fuel` parameter cannot remain
-  load-bearing. `execute_script(script, &config)` is the V1
-  signature; a transitional wrapper is acceptable if it
-  constructs a config from the fuel arg, not if it ignores it.
+Older cycles condensed to load-bearing rejected ideas; full
+narrative lives in git history at the corresponding
+`plan: adr NNN ...` commits.
 
-### ADR 006 cycle
+**ADR 004 (distributed inner equi-join):**
+- Hash-only V1 rejected — star-schema workloads need bounded
+  broadcast.
+- Unbounded broadcast rejected — three-cap regime is
+  non-negotiable.
+- Cost-based strategy selection rejected — V1 has no cost model;
+  programmatic selection is the contract.
+- Runtime filters as soft/hard gate rejected — cross-ring
+  contract deserved its own ADR (became ADR 006).
+- Operator-state hash spill deferred to V1.x rejected — V1
+  needs realistic large-build joins; encrypted spill in scope.
+- Reject duplicate output column names at binder rejected —
+  naming is SQL-planner concern, not binder.
+- Separate `ExecutionPlan::HashJoin` / `BroadcastJoin` variants
+  rejected — `Join { strategy }` field-discriminated scales to
+  V1.x cleanly.
+- `BuildSide` enum on `Join` in V1 rejected — single-value
+  enums violate the no-reservation convention.
+- Inline broadcast payload in `StartTask` rejected — conflicts
+  with ADR 003 pull-addressing.
 
-- **Filter generation inside `execute_inner_join`.** Original
-  Claude/Gemini iter-1 framing; rejected. Codex iter-2's
-  stage-order-honesty correction showed that a filter built in
-  the join consumer runs after both producer-side shuffles
-  complete — too late to attack the bytes-movement bucket.
-  The two-wave hash-partitioned shape moves filter generation
-  to the build-side exchange producer.
-- **Broadcast-only V1 (ADR 006), hash-partitioned filter as
-  ADR 007.** Considered (Claude iter-3 option b); rejected.
-  Fits one ADR cycle but doesn't move the 10M x 1M
-  hash-partitioned promotion workload that produced the ADR 006
-  signal — the bench artifact would have nothing to show
-  against ADR 005's baseline. Half-ships the contract.
-- **Split into ADR 006 (stage-order contract) + ADR 007 (filter
-  implementation).** Considered (Claude iter-3 option c);
-  rejected. Two ADRs for what is realistically one feature;
-  the stage-order decision is meaningless without the filter
-  motivating it.
-- **Exact `InList` filters in V1.** Considered (Claude/Codex
-  iter-2); rejected for V1 in favor of Bloom-only. Reasoning:
-  the first cross-ring runtime-filter ADR should prove the
-  cross-ring + stage-order contract, not multiply filter kinds.
-  `InList` extends the same descriptor contract in V1.x.
-- **Cost-based planner opt-in in V1.** Considered; rejected.
-  Planner-stats surface doesn't yet exist. Always-two-wave in
-  V1; opt-in is V1.x once stats land.
-- **Topic E (cross-process wire efficiency) as ADR 006.**
-  Considered (Claude iter-1 as a real candidate); demoted to
-  fallback. Lower leverage than runtime filters on selective
-  joins: moves bytes faster vs avoids moving rejected bytes.
-  Reopens as ADR 007 if ADR 006's selective bench misses.
-- **Row-group skip as required V1 enforcement.** Considered;
-  rejected for required-status. Bloom membership is
-  per-encoded-key; row-group min/max stats do not automatically
-  prove Bloom absence for a range. Row-level reject is the
-  sound V1 enforcement; row-group skip stays opportunistic and
-  separately proven.
-- **Runtime-plumbing investigation as ADR 006.** Possible
-  branch of ADR 005's conditional rule; resolved by ADR 005
-  evidence to operator-adjacent (`framework_overhead_ms` fell
-  78.8% proportionally with `build_ms`'s 79.0%). Not on the
-  ADR 006 table.
-- **New runtime-filter telemetry columns in V1.** Considered
-  (would sharpen filter-effectiveness measurement); rejected
-  in favor of bench evidence only. ADR 005's columns plus the
-  selective + non-selective bench rows suffice. New telemetry
-  fields are an ADR 003 task-telemetry contract change;
-  worth it only when bench evidence is insufficient.
-- **Always-emit fragments (no eligibility check).** Considered
-  for simplicity; rejected. Composite-key joins, non-canonical
-  key types, and broadcast joins should not pay filter
-  generation overhead. Eligibility check is single-column +
-  inner + hash-partitioned + canonical-encoder-supported type.
-- **`nilket-shared` as required new crate.** Considered (Codex
-  iter-3 / Gemini iter-4 named it); softened to default
-  recommendation only. Extending an existing Wendelon-published
-  schema crate is preferred over spawning a new crate before
-  multi-consumer pressure justifies it (roadmap "Wendelon-side
-  crate extraction" convention). Final crate choice is Phase 1
-  implementation detail, not contract-level.
+**ADR 005 (hash-join build path):**
+- Streaming push-based executor rejected by ADR 004 telemetry
+  (probe + output ~7% of wall); demoted, reserved for future
+  evidence shift.
+- Sub-attribution-first investigation rejected — build bucket
+  is sharper; conditional ADR 006 rule resolves the residual.
+- Fast-path eligibility extending to all primitive integer types
+  rejected — conservative `Int64`/`Int32` default; each
+  extension carries logical-type-tag obligations.
+- Pinning a specific hash table layout rejected — contract pins
+  invariants, layout is calibration evidence.
+- Hash function change rejected — `xxh3_64` parity required for
+  partition-assignment consistency (ADR 003 §5).
+- Concurrent / sharded hash-table build in V1 rejected —
+  determinism, per-thread memory, allocator questions need
+  their own ADR.
+- New telemetry columns within ADR 005 rejected — ADR 004's
+  columns sufficient.
 
-### ADR 005 cycle
+**ADR 006 (runtime filter pushdown):**
+- Filter generation inside `execute_inner_join` rejected —
+  Codex iter-2 stage-order-honesty: filter built in the join
+  consumer runs after both producer-side shuffles complete,
+  too late to attack bytes-movement.
+- Broadcast-only V1 + hash-partitioned-as-ADR-007 rejected —
+  half-ships the contract.
+- Split into ADR 006 (stage-order) + ADR 007 (filter impl)
+  rejected — two ADRs for one feature.
+- Exact `InList` filters in V1 rejected — Bloom-only proves
+  the cross-ring + stage-order contract first (ADR 014 later
+  added ExactSet).
+- Cost-based planner opt-in rejected — no planner-stats surface
+  exists; always-two-wave in V1.
+- Row-group skip as required V1 enforcement rejected — Bloom
+  membership is per-encoded-key; row-group skip stays
+  opportunistic.
+- New runtime-filter telemetry columns rejected — bench
+  evidence suffices.
+- Always-emit fragments (no eligibility check) rejected —
+  composite-key, non-canonical, broadcast joins should not pay
+  filter generation overhead.
+- `nilket-shared` as required new crate rejected (softened to
+  default recommendation only) — extending an existing
+  Wendelon-published schema crate is preferred before
+  multi-consumer pressure justifies a new crate.
 
-- **Streaming push-based executor as ADR 005.** Pre-telemetry
-  working hypothesis (Volcano → push-based, morsel parallelism,
-  end-to-end streaming). Rejected outright by ADR 004's
-  post-promotion telemetry: probe + output combined at ~7% of
-  wall; the rewrite addresses ~0% of measured bottleneck.
-  Reserved for the case where a future workload shifts probe-side
-  to the dominant bucket; until then, this stays demoted.
-- **Sub-attribution-first investigation of the 38% residual as
-  ADR 005.** Considered (Codex iter-1 framing); rejected because
-  the build bucket is sharper and the conditional ADR 006 rule
-  resolves the residual question for free in most cases.
-- **Fast-path eligibility extending broadly in V1.** Considered
-  (Gemini iter-1 — all primitive integer types in V1); rejected
-  in favor of the conservative `Int64`/`Int32` default. Each
-  extension carries a parity-test and logical-type-tag obligation;
-  Phase 0 evidence may justify extending within this ADR.
-- **Pin a specific hash table layout in the ADR.** Considered
-  (open addressing vs chaining vs Swiss table). Rejected: the
-  contract pins invariants, layout is Phase 0 calibration evidence.
-- **Hash function change** (replacing `xxh3_64` with ahash /
-  wyhash). Rejected — partition-assignment consistency requires
-  `xxh3_64` parity. Operator-local hash-table choice must preserve
-  the ADR 003 §5 boundary.
-- **Concurrent / sharded hash-table build in V1.** Considered as
-  Candidate (morsel-parallel build inside a worker); rejected.
-  Adds sharded-table determinism, per-thread memory accounting,
-  and allocator questions needing their own evidence. V1.x with
-  its own ADR.
-- **Two-band conditional ADR 006 rule** (operator-adjacent vs
-  flat, no gray zone). Considered (Codex iter-1 / Gemini iter-2
-  framings); rejected for the explicit three-band rule with
-  numeric thresholds (≥50%, ≤20%, gray) plus the "both fail"
-  reopen branch.
-- **New telemetry columns to sharpen residual attribution within
-  ADR 005.** Considered as ADR-005 precondition; rejected as it
-  would turn ADR 005 back into attribution work. ADR 004's columns
-  are sufficient; the conditional ADR 006 rule resolves the
-  remaining question.
-- **Mandatory flamegraph diff** (baseline vs post) in bench
-  artifact. Considered (iter-3 open question); rejected — the
-  dominant-hot-path note is the load-bearing evidence; flamegraph
-  file reference is optional.
-
-### ADR 004 cycle
-
-- **Hash-only V1.** Considered as a narrow scope (Claude
-  iter-3); rejected because star-schema workloads waste
-  shuffle bytes on the small-dim side without broadcast.
-  Bounded broadcast with three caps is cheap enough to
-  land alongside.
-- **Unbounded broadcast.** Replication-storm risk;
-  rejected. The three-cap regime is non-negotiable.
-- **Right = build (V1 default).** Considered as
-  convention-matching with most SQL engines (Claude iter-2,
-  Codex iter-3); rejected for consistency with the visual
-  order of the `LogicalPlan::Join.left` field. Build =
-  left across both strategies.
-- **Cost-based strategy selection in V1.** Considered as
-  ideal default (Gemini iter-1); rejected because Toron
-  has no cost model. Programmatic strategy selection is
-  V1's contract; cost-based engagement is V1.x.
-- **Runtime filter (exact PBC `InList`) as ADR 004 soft
-  gate.** Codex iter-1 / iter-3 middle path; rejected
-  because filter-collection plumbing on the coordinator
-  is its own optimization surface deserving its own ADR.
-- **Bloom filter pushdown as ADR 004 hard gate.** Gemini
-  iter-2 framing; rejected for the same reason —
-  cross-ring contract surface deserves its own ADR.
-- **Operator-state hash spill deferred to V1.x.** Codex
-  iter-1 / Claude iter-2 position; rejected because V1's
-  "First Query with Integrity" requires realistic large-
-  build joins to succeed gracefully. Encrypted spill in
-  scope.
-- **Reject duplicate output column names at the binder.**
-  Codex iter-2 position; rejected because it conflates
-  SQL-surface naming with bound-IR ordinal semantics.
-  SQL planner is the right layer for naming discipline.
-- **`JoinSide { Left, Right }` tag on `ResolvedColumn`.**
-  Gemini iter-3 alternative; rejected because side is
-  structural (encoded in `left_keys` / `right_keys`
-  field names), not metadata.
-- **Separate `ExecutionPlan::HashJoin` and
-  `BroadcastJoin` variants.** Claude iter-3 position
-  (before broadcast came back into scope); rejected for
-  `Join { strategy }` field-discriminated which scales
-  cleanly to V1.x.
-- **`BuildSide` enum field on `Join` in V1.** Considered;
-  rejected because it would be a single-value
-  `BuildSide::Left` reserved for V1.x. Convention
-  forbids reservation.
-- **Streaming-spill probe-side as alternative to hash-
-  table spill.** Gemini topics Topic 8 alternative
-  ("streaming join that spills the probe side if the
-  build side fits in RAM"); rejected because probe-side
-  is naturally streaming (no buffering needed) — the
-  build side is the operator-local memory hot spot.
-- **Bundling ADR 003 telemetry residual into ADR 004
-  Phase 0.** Gemini iter-2 framing; rejected for commit
-  boundary cleanliness — remains a separate `chore:` slice
-  outside ADR 004 promotion.
-- **Inline broadcast payload in `StartTask`.** Considered
-  as zero-extra-hop optimization; rejected because it
-  conflicts with ADR 003 pull-addressing and would
-  introduce a wire-message-size-dependent dispatch path.
-- **Auto-rename duplicate output columns at the binder
-  (e.g., `lhs_x` / `rhs_x`).** Considered as
-  caller-friendly default; rejected for V1 explicit-
-  qualification discipline.
+**ADR 007 (Rune sandbox enforcement):**
+- Fuel-only V1 sandbox rejected — memory bomb fitting within
+  fuel can still OOM the host; memory enforcement is V1 hard
+  requirement.
+- `Context::with_default_modules()` with deny-list tests
+  rejected — allow-list discipline (`Context::new()` + explicit
+  registration) inverts the failure mode.
+- New `TaskFailureKind` variants (`SandboxFuelExhausted`,
+  `SandboxMemoryExhausted`) rejected — preserves the ADR 003
+  7-variant wire contract; reason-string mapping
+  (`"RuneSandbox::<label>"`) is the right cross-wire surface.
+- Raw missing-function strings in `CapabilityDenied` rejected
+  in favor of `CapabilityCategory` enum (more robust to Rune
+  version drift).
+- Row-level Rune UDF execution rejected — Rune is
+  frontend-scoped in V1; worker-side execution is a future ADR.
+- Subprocess sandbox with full seccomp + rlimit rejected —
+  helper-process isolation is lightweight enough.
+- WASM runtime migration rejected — would replace M7's
+  authoring surface entirely; reserved for future ADR if Rune
+  sandbox proves insufficient.
+- Wall-timeout as primary CPU accounting rejected — fuel is
+  primary; wall-timeout is defense-in-depth.
+- `execute_script(script, fuel)` compatibility shim that
+  ignores the fuel arg rejected — dead `_fuel` parameter cannot
+  remain load-bearing.
 
 ### ADR 003 cycle (preserved from prior roadmap)
 
