@@ -63,8 +63,8 @@ along with the forward-sequence rewrite.
   `GROUP BY ... ORDER BY [LIMIT/OFFSET]` via one narrow fragmenter detector
   that emits a three-stage pipeline
   (producers → grouped aggregate consumers → terminal sort). No new IR.
-- **ADR 016 — Post-Aggregate Filtering with `HAVING`.** Promoted, pending
-  implementation. Second instance of the ADR 015 cycle shape: removes one
+- **ADR 016 — Post-Aggregate Filtering with `HAVING`.** Promoted +
+  implemented. Second instance of the ADR 015 cycle shape: removes one
   planner reject, adds a localized planner-side rewrite of `HAVING`
   aggregate-call references against projection-output field names (matched
   on the lowered `(AggregateFunction, Vec<Expr>)` IR pair, case-insensitive
@@ -120,13 +120,13 @@ a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Promoted: ADR 016 plan
+### Implemented: ADR 016
 
 ADR 016's contract is pinned at
 `plans/adr/016_post_aggregate_filtering_with_having.md`; the
 impl plan lives at
 `plans/impl/016_post_aggregate_filtering_with_having.md`.
-Implementation is pending. ADR 016 owns no independent bench
+Implementation is complete. ADR 016 owns no independent bench
 artifact — it is the second instance of the ADR 015 cycle
 shape (pure composition, narrow reject removal, narrow
 detector extension, reject-string absence as architecture

@@ -14,8 +14,8 @@ use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBindi
 use toron::error::{BindingError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	AggregateFunction, ColumnOrdinal, ExecutionPlan, Expr, LogicalPlan, ScalarValue, SortExpr,
-	TableId,
+	AggregateFunction, ColumnOrdinal, ExecutionExpr, ExecutionPlan, Expr, FilterDisposition,
+	LogicalPlan, ScalarValue, SortExpr, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -216,8 +216,182 @@ fn group_by_order_by_aggregate_call_rejects() {
 }
 
 #[test]
-fn having_is_unsupported_not_dropped() {
-	assert_unsupported("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1");
+fn having_aggregate_call_rewrites_to_projected_output_field() {
+	let plan = plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 5");
+
+	let LogicalPlan::Filter { input, predicate } = plan else {
+		panic!("expected HAVING filter over aggregate");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "count")
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(5))))
+	));
+	assert_grouped_aggregate_over_exchange(input.as_ref());
+}
+
+#[test]
+fn having_with_order_by_lowers_filter_inside_terminal_exchange() {
+	let plan = plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 1000 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+	);
+
+	let LogicalPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+	} = plan
+	else {
+		panic!("expected sort over HAVING filter");
+	};
+	assert_eq!(limit, Some(10));
+	assert_eq!(offset, 1);
+	assert_eq!(order_by.len(), 1);
+	assert!(order_by[0].descending);
+	let LogicalPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		panic!("expected terminal exchange below sort");
+	};
+	assert_eq!(*partition_count, 1);
+	assert!(key.is_empty());
+	let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+		panic!("expected HAVING filter below terminal exchange");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
+	assert_grouped_aggregate_over_exchange(input.as_ref());
+}
+
+#[test]
+fn having_group_key_predicate_lowers_without_aggregate_rewrite() {
+	let plan =
+		plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING region = 'EMEA'");
+
+	let LogicalPlan::Filter { predicate, .. } = plan else {
+		panic!("expected HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Eq(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "region")
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Utf8(Some(value))) if value == "EMEA")
+	));
+}
+
+#[test]
+fn having_aggregate_rewrite_is_case_insensitive() {
+	let plan =
+		plan_sql("SELECT region, sum(amount) FROM sales GROUP BY region HAVING SUM(amount) > 10");
+
+	let LogicalPlan::Filter { predicate, .. } = plan else {
+		panic!("expected HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
+}
+
+#[test]
+fn having_aggregate_call_argument_must_match_projected_aggregate() {
+	assert_unsupported_message(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(other_amount) > 1000",
+		"HAVING aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn having_without_group_by_is_rejected() {
+	assert_unsupported_message(
+		"SELECT COUNT(*) FROM sales HAVING COUNT(*) > 5",
+		"HAVING without GROUP BY is not supported",
+	);
+}
+
+#[test]
+fn having_aggregate_call_must_appear_in_select_list() {
+	assert_unsupported_message(
+		"SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 100",
+		"HAVING aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn having_aggregate_call_ambiguity_is_rejected() {
+	for sql in [
+		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region HAVING COUNT(*) > 5",
+		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 5",
+		"SELECT count, COUNT(amount) FROM events GROUP BY count HAVING COUNT(amount) > 0",
+	] {
+		assert_unsupported_message(sql, "ambiguous HAVING aggregate-call");
+	}
+}
+
+#[test]
+fn having_qualified_column_reference_is_rejected() {
+	assert_unsupported_message(
+		"SELECT region, COUNT(*) FROM sales GROUP BY region HAVING t.region = 'EMEA'",
+		"qualified HAVING column references are not supported",
+	);
+}
+
+#[test]
+fn having_integer_literal_is_not_an_ordinal_reference() {
+	let plan = plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING 2 > 100");
+
+	let LogicalPlan::Filter { predicate, .. } = plan else {
+		panic!("expected HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, right)
+			if matches!(left.as_ref(), Expr::Literal(ScalarValue::Int32(Some(2))))
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(100))))
+	));
+}
+
+#[test]
+fn having_generated_name_form_resolves_without_rewrite() {
+	let plan = plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING count > 0");
+
+	let LogicalPlan::Filter { predicate, .. } = plan else {
+		panic!("expected HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "count")
+	));
+}
+
+#[test]
+fn having_preserves_inherited_group_by_rejects() {
+	assert_unsupported(
+		"SELECT region, COUNT(*) FROM sales \
+		 INNER JOIN regions ON sales.region = regions.region \
+		 GROUP BY region HAVING COUNT(*) > 1",
+	);
+	assert_unsupported(
+		"SELECT DISTINCT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1",
+	);
+	assert_unsupported(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) + 100 > 1000",
+	);
+	assert_unsupported(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(COUNT(*)) > 5",
+	);
+	assert_unsupported("SELECT region, COUNT(*) AS n FROM sales GROUP BY region HAVING n > 0");
 }
 
 #[test]
@@ -297,6 +471,85 @@ async fn grouped_aggregate_order_by_duplicate_generated_name_is_ambiguous() {
 }
 
 #[tokio::test]
+async fn grouped_aggregate_having_binds_against_aggregate_output() {
+	let (catalog, _) = fixture();
+	let logical =
+		plan_sql("SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 10");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind HAVING");
+
+	let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition,
+	} = bound
+	else {
+		panic!("expected bound HAVING filter");
+	};
+	assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate,
+		ExecutionExpr::Gt(left, right)
+			if matches!(left.as_ref(), ExecutionExpr::Column(column)
+				if column.name.0 == "sum" && column.ordinal == ColumnOrdinal(1))
+				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Int64(Some(10))))
+	));
+	assert!(matches!(input.as_ref(), ExecutionPlan::Aggregate { .. }));
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_group_key_binds_against_aggregate_output() {
+	let (catalog, _) = fixture();
+	let logical =
+		plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING region = 'east'");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind HAVING group key");
+
+	let ExecutionPlan::Filter { predicate, .. } = bound else {
+		panic!("expected bound HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		ExecutionExpr::Eq(left, right)
+			if matches!(left.as_ref(), ExecutionExpr::Column(column)
+				if column.name.0 == "region" && column.ordinal == ColumnOrdinal(0))
+				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Utf8(Some(value))) if value == "east")
+	));
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_generated_name_duplicate_is_ambiguous() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql(
+		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region HAVING count > 0",
+	);
+
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("duplicate generated HAVING name should be ambiguous");
+	assert!(matches!(
+		err,
+		BindingError::AmbiguousColumn { column } if column == "count"
+	));
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_non_output_column_rejects_at_bind() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING raw_col > 5");
+
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("non-output HAVING column should reject");
+	assert!(matches!(
+		err,
+		BindingError::UnknownColumn { column } if column == "raw_col"
+	));
+}
+
+#[tokio::test]
 async fn grouped_aggregate_order_by_executes_after_aggregation() {
 	let top_two = run_logical(&plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY 2 DESC LIMIT 2",
@@ -321,11 +574,76 @@ async fn grouped_aggregate_order_by_executes_after_aggregation() {
 }
 
 #[tokio::test]
+async fn grouped_aggregate_having_executes_after_aggregation() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 20",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&results),
+		vec![(Some("east".to_string()), Some(40))]
+	);
+
+	let count_results = run_logical(&plan_sql(
+		"SELECT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 2",
+	))
+	.await;
+	assert_eq!(
+		region_count_rows(&count_results),
+		vec![(Some("east".to_string()), 3)]
+	);
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_order_by_limit_offset_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 5 ORDER BY 2 DESC LIMIT 1 OFFSET 1",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&results),
+		vec![(Some("west".to_string()), Some(20))]
+	);
+}
+
+#[tokio::test]
 async fn ordered_grouped_aggregate_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY 2 DESC LIMIT 10 OFFSET 1",
 	);
 	let hand_built = hand_built_ordered_grouped_sum_plan(Some(10), 1);
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::None).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::None).expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_sql_matches_hand_built_filter_plan() {
+	let sql =
+		plan_sql("SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 10");
+	let hand_built = hand_built_having_grouped_sum_plan();
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::FullRowLex).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::FullRowLex)
+			.expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_order_by_sql_matches_hand_built_sort_plan() {
+	let sql = plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 10 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+	);
+	let hand_built = hand_built_ordered_having_grouped_sum_plan(Some(10), 1);
 	let sql_results = run_logical(&sql).await;
 	let hand_built_results = run_logical(&hand_built).await;
 
@@ -372,6 +690,29 @@ async fn grouped_aggregate_bound_plan_fragments_to_single_group_keyed_exchange()
 			TaskInputBinding::ShuffleConsumer { .. }
 		));
 		assert!(matches!(task.spec.plan, ExecutionPlan::Aggregate { .. }));
+	}
+}
+
+#[tokio::test]
+async fn grouped_aggregate_having_fragments_through_single_group_keyed_exchange() {
+	let (catalog, _) = fixture();
+	let logical =
+		plan_sql("SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 10");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment HAVING aggregate");
+
+	assert_eq!(stages.len(), 2);
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[1].tasks.len(), 4);
+	for task in &stages[1].tasks {
+		assert!(matches!(
+			task.spec.plan,
+			ExecutionPlan::Filter { ref input, .. }
+				if matches!(input.as_ref(), ExecutionPlan::Aggregate { .. })
+		));
+		assert!(matches!(task.spec.output, TaskOutputBinding::FinalResult));
 	}
 }
 
@@ -457,6 +798,53 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 }
 
 #[tokio::test]
+async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 10 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+	);
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+	let stages =
+		fragment_plan(bound, fragment_config()).expect("fragment ordered HAVING aggregate");
+
+	assert_eq!(stages.len(), 3);
+	assert_eq!(stages[0].stage_id, StageId::new(0));
+	assert_eq!(stages[1].stage_id, StageId::new(1));
+	assert_eq!(stages[2].stage_id, StageId::new(2));
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[2].upstream_stages, vec![StageId::new(1)]);
+	for task in &stages[1].tasks {
+		assert!(matches!(
+			task.spec.plan,
+			ExecutionPlan::Filter { ref input, .. }
+				if matches!(input.as_ref(), ExecutionPlan::Aggregate { .. })
+		));
+		assert!(matches!(
+			&task.spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				exchange_id,
+				partition_count,
+				partition_key,
+			} if *exchange_id == ExchangeId::new(1)
+				&& *partition_count == PartitionCount::new(1)
+				&& partition_key.is_empty()
+		));
+	}
+	assert!(matches!(
+		&stages[2].tasks[0].spec.plan,
+		ExecutionPlan::Sort {
+			order_by,
+			limit: Some(10),
+			offset: 1,
+			..
+		} if order_by[0].ordinal == ColumnOrdinal(1) && order_by[0].descending
+	));
+}
+
+#[tokio::test]
 async fn non_aggregate_two_exchange_terminal_sort_still_rejects() {
 	let (catalog, _) = fixture();
 	let bound = bind(
@@ -466,6 +854,23 @@ async fn non_aggregate_two_exchange_terminal_sort_still_rejects() {
 	)
 	.await
 	.expect("bind non-aggregate two-exchange sort");
+
+	assert_eq!(
+		fragment_plan(bound, fragment_config()).expect_err("two exchanges should reject"),
+		FragmentError::MultipleExchangeBoundaries { count: 2 }
+	);
+}
+
+#[tokio::test]
+async fn filter_without_aggregate_between_terminal_exchanges_still_rejects() {
+	let (catalog, _) = fixture();
+	let bound = bind(
+		&filter_without_aggregate_between_exchanges_sort_plan(),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind non-aggregate filtered two-exchange sort");
 
 	assert_eq!(
 		fragment_plan(bound, fragment_config()).expect_err("two exchanges should reject"),
@@ -531,6 +936,44 @@ fn hand_built_ordered_grouped_sum_plan(limit: Option<usize>, offset: usize) -> L
 	}
 }
 
+fn hand_built_having_grouped_sum_plan() -> LogicalPlan {
+	LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::Exchange {
+				input: Box::new(LogicalPlan::ScanNamed {
+					table: TableRef::new("sales"),
+					projection: None,
+				}),
+				partition_count: 4,
+				key: vec![Expr::column("region")],
+			}),
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
+		}),
+		predicate: Expr::Gt(
+			Box::new(Expr::column("sum")),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(10)))),
+		),
+	}
+}
+
+fn hand_built_ordered_having_grouped_sum_plan(limit: Option<usize>, offset: usize) -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(hand_built_having_grouped_sum_plan()),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::Literal(ScalarValue::Int32(Some(2))),
+			descending: true,
+			nulls_first: false,
+		}],
+		limit,
+		offset,
+	}
+}
+
 fn project_between_exchanges_sort_plan() -> LogicalPlan {
 	LogicalPlan::Sort {
 		input: Box::new(LogicalPlan::Exchange {
@@ -544,6 +987,39 @@ fn project_between_exchanges_sort_plan() -> LogicalPlan {
 					key: vec![Expr::column("region")],
 				}),
 				exprs: vec![Expr::column("region")],
+			}),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::column("region"),
+			descending: false,
+			nulls_first: false,
+		}],
+		limit: None,
+		offset: 0,
+	}
+}
+
+fn filter_without_aggregate_between_exchanges_sort_plan() -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::Project {
+					input: Box::new(LogicalPlan::Exchange {
+						input: Box::new(LogicalPlan::ScanNamed {
+							table: TableRef::new("sales"),
+							projection: None,
+						}),
+						partition_count: 4,
+						key: vec![Expr::column("region")],
+					}),
+					exprs: vec![Expr::column("region")],
+				}),
+				predicate: Expr::Eq(
+					Box::new(Expr::column("region")),
+					Box::new(Expr::Literal(ScalarValue::Utf8(Some("east".to_string())))),
+				),
 			}),
 			partition_count: 1,
 			key: Vec::new(),
@@ -628,6 +1104,31 @@ fn ordered_region_sum_rows(results: &[RecordBatch]) -> Vec<(Option<String>, Opti
 	rows
 }
 
+fn region_count_rows(results: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let counts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("count column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			rows.push((region, counts.value(row)));
+		}
+	}
+	rows
+}
+
 fn assert_grouped_aggregate_over_exchange(plan: &LogicalPlan) {
 	let LogicalPlan::Aggregate {
 		input,
@@ -665,6 +1166,16 @@ fn assert_unsupported(sql: &str) {
 	assert!(
 		matches!(err, FrontendError::Unsupported { .. }),
 		"{sql}: expected unsupported, got {err}"
+	);
+}
+
+fn assert_unsupported_message(sql: &str, expected: &str) {
+	let err = SqlPlanner::new()
+		.plan(sql)
+		.expect_err("query should be unsupported");
+	assert!(
+		matches!(&err, FrontendError::Unsupported { message } if message == expected),
+		"{sql}: expected unsupported message {expected:?}, got {err}"
 	);
 }
 

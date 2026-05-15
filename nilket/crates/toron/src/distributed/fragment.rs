@@ -13,8 +13,8 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	AggregateCall, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, JoinKind,
-	JoinStrategy, QueryProfileHint,
+	AggregateCall, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey,
+	FilterDisposition, JoinKind, JoinStrategy, QueryProfileHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +523,7 @@ struct TerminalSortOverAggregate {
 	group_expr: Vec<ExecutionExpr>,
 	aggr_expr: Vec<AggregateCall>,
 	aggregate_output_schema: SchemaRef,
+	having: Option<(ExecutionExpr, FilterDisposition)>,
 	terminal_gather: TerminalSortGather,
 }
 
@@ -582,7 +583,18 @@ fn is_terminal_sort_over_grouped_aggregate(
 	if *partition_count != 1 || !key.is_empty() {
 		return None;
 	}
-	let aggregate = input.as_ref();
+	let gathered_input = input.as_ref().clone();
+	let mut aggregate = input.as_ref();
+	let mut having = None;
+	if let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition,
+	} = aggregate
+	{
+		having = Some((predicate.clone(), *disposition));
+		aggregate = input.as_ref();
+	}
 	let ExecutionPlan::Aggregate {
 		input,
 		group_expr,
@@ -608,8 +620,9 @@ fn is_terminal_sort_over_grouped_aggregate(
 		group_expr: group_expr.clone(),
 		aggr_expr: aggr_expr.clone(),
 		aggregate_output_schema: aggregate_output_schema.clone(),
+		having,
 		terminal_gather: TerminalSortGather {
-			input: aggregate.clone(),
+			input: gathered_input,
 			order_by: order_by.clone(),
 			limit: *limit,
 			offset: *offset,
@@ -629,6 +642,7 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 		group_expr,
 		aggr_expr,
 		aggregate_output_schema,
+		having,
 		terminal_gather,
 	} = detected;
 	if group_partition_count == 0 {
@@ -649,6 +663,15 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 		group_expr,
 		aggr_expr,
 		output_schema: aggregate_output_schema,
+	};
+	let aggregate_plan = if let Some((predicate, disposition)) = having {
+		ExecutionPlan::Filter {
+			input: Box::new(aggregate_plan),
+			predicate,
+			disposition,
+		}
+	} else {
+		aggregate_plan
 	};
 	let producer_task = producer_task(
 		config,

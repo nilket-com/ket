@@ -402,6 +402,62 @@ async fn ordered_grouped_aggregate_process_digest_is_stable_across_worker_counts
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn having_grouped_aggregate_process_digest_is_stable_across_worker_counts() {
+	let two_workers = run_having_grouped_aggregate_process_query(1_700, 2, 0).await;
+	let four_workers = run_having_grouped_aggregate_process_query(1_800, 4, 1).await;
+
+	assert_eq!(two_workers.row_count, 10);
+	assert_eq!(four_workers.row_count, 10);
+	assert_eq!(two_workers.digest, four_workers.digest);
+	assert_eq!(
+		two_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+	assert_eq!(
+		four_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		4
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn having_ordered_grouped_aggregate_process_digest_is_stable_across_worker_counts() {
+	let two_workers = run_ordered_having_grouped_aggregate_process_query(1_900, 2, 0).await;
+	let four_workers = run_ordered_having_grouped_aggregate_process_query(2_000, 4, 1).await;
+
+	assert_eq!(two_workers.row_count, 5);
+	assert_eq!(four_workers.row_count, 5);
+	assert_eq!(two_workers.digest, four_workers.digest);
+	assert_eq!(
+		two_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+	assert_eq!(
+		four_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		4
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
 	let baseline = run_broadcast_join_process_query(800).await;
 	let killed = run_broadcast_join_build_kill_query(900).await;
@@ -515,6 +571,97 @@ async fn run_ordered_grouped_aggregate_process_query(
 		.execute_query(&logical)
 		.await
 		.expect("ordered grouped aggregate query");
+	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("digest");
+	let row_count = results.iter().map(RecordBatch::num_rows).sum();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	OrderedGroupProcessRun {
+		digest,
+		row_count,
+		selected_workers: registry.selected_workers(),
+	}
+}
+
+async fn run_having_grouped_aggregate_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+) -> OrderedGroupProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan("SELECT val, SUM(val) FROM fixture GROUP BY val HAVING SUM(val) > 5")
+		.expect("plan grouped aggregate HAVING");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("grouped aggregate HAVING query");
+	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::FullRowLex).expect("digest");
+	let row_count = results.iter().map(RecordBatch::num_rows).sum();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	OrderedGroupProcessRun {
+		digest,
+		row_count,
+		selected_workers: registry.selected_workers(),
+	}
+}
+
+async fn run_ordered_having_grouped_aggregate_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+) -> OrderedGroupProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT val, SUM(val) FROM fixture GROUP BY val \
+			 HAVING SUM(val) > 3 ORDER BY 2 DESC LIMIT 5 OFFSET 1",
+		)
+		.expect("plan ordered grouped aggregate HAVING");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("ordered grouped aggregate HAVING query");
 	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("digest");
 	let row_count = results.iter().map(RecordBatch::num_rows).sum();
 	for worker in &mut workers {

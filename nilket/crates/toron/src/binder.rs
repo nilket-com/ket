@@ -1202,6 +1202,7 @@ fn bind_comparison(
 ) -> Result<ExecutionExpr, BindingError> {
 	let left = bind_expr(left, input_schema, config)?;
 	let right = bind_expr(right, input_schema, config)?;
+	let (left, right) = coerce_comparison_literals(left, right);
 	if left.data_type() != right.data_type() {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
@@ -1212,6 +1213,40 @@ fn bind_comparison(
 		});
 	}
 	Ok(constructor(Box::new(left), Box::new(right)))
+}
+
+fn coerce_comparison_literals(
+	left: ExecutionExpr,
+	right: ExecutionExpr,
+) -> (ExecutionExpr, ExecutionExpr) {
+	match (left, right) {
+		(left @ ExecutionExpr::Literal(_), right @ ExecutionExpr::Literal(_)) => (left, right),
+		(ExecutionExpr::Literal(value), right) => {
+			let data_type = right.data_type();
+			(
+				ExecutionExpr::Literal(coerce_literal_value(value, &data_type)),
+				right,
+			)
+		}
+		(left, ExecutionExpr::Literal(value)) => {
+			let data_type = left.data_type();
+			(
+				left,
+				ExecutionExpr::Literal(coerce_literal_value(value, &data_type)),
+			)
+		}
+		(left, right) => (left, right),
+	}
+}
+
+fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarValue {
+	match (value, target_type) {
+		(ScalarValue::Int32(value), DataType::Int64) => ScalarValue::Int64(value.map(i64::from)),
+		(ScalarValue::Int32(value), DataType::Float64) => {
+			ScalarValue::Float64(value.map(f64::from))
+		}
+		(value, _) => value,
+	}
 }
 
 fn bind_boolean(

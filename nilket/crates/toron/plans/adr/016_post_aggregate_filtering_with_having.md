@@ -8,7 +8,7 @@ final positions.
 
 ## Status
 
-Promoted, pending implementation.
+Promoted and implemented.
 
 Three-way AI Swarm Council convergence reached across
 five iteration rounds. Iteration artifacts retire when
@@ -89,9 +89,9 @@ ADR 015 introduced the nested
 `GROUP BY ... ORDER BY`. Both shipped with `HAVING`
 explicitly rejected at the planner. ADR 016 removes
 that reject with no new IR variant, no new wire frame,
-no new binder seam, no new `FilterDisposition`, and no
-new fragmenter recognition site (only an extension of
-the ADR 015 detector).
+no new `bind_expr` aggregate-call arm, no new
+`FilterDisposition`, and no new fragmenter recognition
+site (only an extension of the ADR 015 detector).
 
 ## Scale boundary
 
@@ -180,7 +180,7 @@ Three load-bearing antecedents:
   rewrite in `SqlPlanner::lower_select`, reusing the
   logical and physical contract unchanged" posture
   for SQL-surface extensions that do not warrant a
-  new IR or binder seam.
+  new IR or `bind_expr` projection-context seam.
 
 The reject site:
 
@@ -245,9 +245,10 @@ supported"` (V1 exclusion §1).
 
 The binder's `bind_expr` has no `Expr::AggregateCall`
 match arm (`binder.rs:1131+`). Rather than widen
-`bind_expr` (a new binder seam coupled to projection
-context), ADR 016 rewrites the `HAVING` AST at the
-planner before lowering, echoing ADR 009's posture.
+`bind_expr` (a new projection-context seam coupled
+to aggregate-call binding), ADR 016 rewrites the
+`HAVING` AST at the planner before lowering,
+echoing ADR 009's posture.
 
 **Match key:** the rewrite operates on a planner-
 local structural signature derived from the lowered
@@ -526,6 +527,25 @@ The composition rides on the existing
 variants and the existing `EvaluateInToron`
 disposition.
 
+### 10. Numeric comparison literal coercion
+
+`HAVING SUM(amount) > 5` compares an aggregate output
+whose type is known only after binding against an SQL
+integer literal parsed as `ScalarValue::Int32`. The
+planner-side rewrite cannot safely coerce that literal:
+`SUM`'s output type depends on the bound input type and
+there is no catalog-typed expression available at the
+SQL-AST rewrite layer.
+
+ADR 016 therefore permits one narrow binder behavior:
+`bind_comparison` may coerce an `Int32` literal to
+`Int64` or `Float64` when the opposite side of the
+comparison is a typed, non-literal expression of that
+type. Literal-vs-literal comparisons are unchanged. This
+does not add a `bind_expr` match arm, does not teach
+`bind_expr` about aggregate calls, and does not create
+projection-context lookup in the binder.
+
 ## V1 exclusions
 
 **ADR 016-specific exclusions** (new rejects that
@@ -555,10 +575,12 @@ ADR 016 owns):
    ADR 016 does not invent one.
 4. **Qualified column references in `HAVING`.**
    The aggregate output schema is unqualified;
-   `HAVING t.region = 'EMEA'` does not resolve.
-   Standard-SQL behavior in the post-aggregate
-   scope; rejects via the existing `resolve_column`
-   path.
+   `HAVING t.region = 'EMEA'` is rejected by the
+   planner before lowering with `"qualified HAVING
+   column references are not supported"`. The
+   explicit planner reject keeps the V1 surface
+   narrow without relying on qualifier handling in
+   the generic binder path.
 
 **Inherited rejects** (preserved verbatim from
 prior ADRs; pinned by regression case but not new
@@ -634,6 +656,11 @@ Implementation promotion requires:
    - The rewritten predicate resolves via existing
      `bind_expr` + `resolve_column` paths against
      `Aggregate.output_schema`.
+   - Comparisons may coerce an `Int32` numeric
+     literal to `Int64` or `Float64` in
+     `bind_comparison` when the opposite side is a
+     typed, non-literal expression. Literal-vs-
+     literal comparisons are unchanged.
    - `Filter` disposition is `EvaluateInToron`.
      For post-aggregate predicates, `attach_pbc_
      program` returns `Err(input)` because the
@@ -692,6 +719,10 @@ correctness evidence.
   `Expr::AggregateCall` resolution. ADR 016 is a
   planner-side rewrite (Shape C), echoing
   ADR 009's posture.
+- Do not move aggregate-output type inference into
+  the SQL-AST rewrite. Numeric literal coercion for
+  comparisons belongs in `bind_comparison` after the
+  expression types are known.
 - Do not match `HAVING` aggregate-call references
   on raw `sqlparser::ast::Function` `PartialEq`.
   The match key is a planner-local structural

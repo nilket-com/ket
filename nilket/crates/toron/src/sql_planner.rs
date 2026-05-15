@@ -1,12 +1,14 @@
+use std::collections::HashMap;
+
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
+	AggregateFunction, ColumnRef, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
 };
 use sqlparser::ast::{
 	BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-	FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query,
-	Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value,
+	FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, OrderBy,
+	Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -168,9 +170,6 @@ impl SqlPlanner {
 		if !sort_by.is_empty() {
 			return Err(unsupported("SORT BY is not supported"));
 		}
-		if having.is_some() {
-			return Err(unsupported("HAVING is not supported"));
-		}
 		if !named_window.is_empty() {
 			return Err(unsupported("WINDOW is not supported"));
 		}
@@ -188,6 +187,9 @@ impl SqlPlanner {
 		} else {
 			Some(lower_group_by_keys(group_by)?)
 		};
+		if having.is_some() && group_keys.is_none() {
+			return Err(unsupported("HAVING without GROUP BY is not supported"));
+		}
 
 		// 1. Handle FROM (Scan)
 		if from.is_empty() {
@@ -238,15 +240,30 @@ impl SqlPlanner {
 				.iter()
 				.map(|key| key.expr.clone())
 				.collect::<Vec<_>>();
-			let aggr_expr = self.lower_grouped_projection(projection, &group_keys)?;
-			return Ok(LogicalPlan::Aggregate {
+			let grouped_projection = self.lower_grouped_projection(projection, &group_keys)?;
+			let having_predicate = having
+				.as_ref()
+				.map(|having| self.lower_having_predicate(having, &grouped_projection.having_scope))
+				.transpose()?;
+			if grouped_projection.aggr_expr.is_empty() {
+				return Err(unsupported("GROUP BY requires at least one aggregate call"));
+			}
+			let aggregate = LogicalPlan::Aggregate {
 				input: Box::new(LogicalPlan::Exchange {
 					input: Box::new(plan),
 					partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
 					key: group_expr.clone(),
 				}),
 				group_expr,
-				aggr_expr,
+				aggr_expr: grouped_projection.aggr_expr,
+			};
+			return Ok(if let Some(predicate) = having_predicate {
+				LogicalPlan::Filter {
+					input: Box::new(aggregate),
+					predicate,
+				}
+			} else {
+				aggregate
 			});
 		}
 
@@ -364,15 +381,11 @@ impl SqlPlanner {
 		&self,
 		projection: &[SelectItem],
 		group_keys: &[GroupKey],
-	) -> Result<Vec<(AggregateFunction, Vec<Expr>)>, FrontendError> {
-		if projection.len() <= group_keys.len() {
-			return Err(unsupported("GROUP BY requires at least one aggregate call"));
-		}
-
+	) -> Result<GroupedProjection, FrontendError> {
 		for (index, key) in group_keys.iter().enumerate() {
-			let item = projection
-				.get(index)
-				.expect("projection length checked against group keys");
+			let item = projection.get(index).ok_or_else(|| {
+				unsupported("GROUP BY projection must list all keys in order before aggregates")
+			})?;
 			let projected = projection_group_key_name(item)?;
 			if projected != key.name {
 				return Err(unsupported(
@@ -395,9 +408,68 @@ impl SqlPlanner {
 			.collect::<Result<Vec<_>, _>>()?;
 
 		if aggr_expr.is_empty() {
-			return Err(unsupported("GROUP BY requires at least one aggregate call"));
+			return Ok(GroupedProjection {
+				aggr_expr,
+				having_scope: HavingAggregateScope::from_projection(group_keys, &[]),
+			});
 		}
-		Ok(aggr_expr)
+		let having_scope = HavingAggregateScope::from_projection(group_keys, &aggr_expr);
+		Ok(GroupedProjection {
+			aggr_expr,
+			having_scope,
+		})
+	}
+
+	fn lower_having_predicate(
+		&self,
+		having: &SqlExpr,
+		scope: &HavingAggregateScope,
+	) -> Result<Expr, FrontendError> {
+		let rewritten = self.rewrite_having_aggregate_calls(having, scope)?;
+		self.lower_expr(&rewritten)
+	}
+
+	fn rewrite_having_aggregate_calls(
+		&self,
+		expr: &SqlExpr,
+		scope: &HavingAggregateScope,
+	) -> Result<SqlExpr, FrontendError> {
+		match expr {
+			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+				let output_name = self.resolve_having_aggregate_reference(function, scope)?;
+				Ok(SqlExpr::Identifier(Ident::new(output_name)))
+			}
+			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+				left: Box::new(self.rewrite_having_aggregate_calls(left, scope)?),
+				op: op.clone(),
+				right: Box::new(self.rewrite_having_aggregate_calls(right, scope)?),
+			}),
+			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
+				self.rewrite_having_aggregate_calls(inner, scope)?,
+			))),
+			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
+				self.rewrite_having_aggregate_calls(inner, scope)?,
+			))),
+			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
+				self.rewrite_having_aggregate_calls(inner, scope)?,
+			))),
+			SqlExpr::CompoundIdentifier(_) => Err(unsupported(
+				"qualified HAVING column references are not supported",
+			)),
+			_ => Ok(expr.clone()),
+		}
+	}
+
+	fn resolve_having_aggregate_reference(
+		&self,
+		function: &Function,
+		scope: &HavingAggregateScope,
+	) -> Result<String, FrontendError> {
+		let (function, args) =
+			self.lower_aggregate_function(function, AggregateSqlMode::Grouped)?;
+		let signature = having_aggregate_signature(&function, &args)
+			.ok_or_else(|| unsupported("HAVING aggregate-call must appear in SELECT list"))?;
+		scope.resolve(&signature)
 	}
 
 	fn lower_aggregate_function(
@@ -770,6 +842,87 @@ struct GroupKey {
 	expr: Expr,
 }
 
+#[derive(Debug)]
+struct GroupedProjection {
+	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
+	having_scope: HavingAggregateScope,
+}
+
+#[derive(Debug)]
+struct HavingAggregateScope {
+	entries: Vec<HavingAggregateEntry>,
+	output_name_counts: HashMap<String, usize>,
+}
+
+impl HavingAggregateScope {
+	fn from_projection(
+		group_keys: &[GroupKey],
+		aggr_expr: &[(AggregateFunction, Vec<Expr>)],
+	) -> Self {
+		let mut output_name_counts = HashMap::new();
+		for key in group_keys {
+			*output_name_counts.entry(key.name.clone()).or_insert(0) += 1;
+		}
+
+		let mut entries = Vec::new();
+		for (function, args) in aggr_expr {
+			let output_name = aggregate_output_name(function).to_string();
+			*output_name_counts.entry(output_name.clone()).or_insert(0) += 1;
+			if let Some(signature) = having_aggregate_signature(function, args) {
+				entries.push(HavingAggregateEntry {
+					signature,
+					output_name,
+				});
+			}
+		}
+
+		Self {
+			entries,
+			output_name_counts,
+		}
+	}
+
+	fn resolve(&self, signature: &HavingAggregateSignature) -> Result<String, FrontendError> {
+		let matches = self
+			.entries
+			.iter()
+			.filter(|entry| &entry.signature == signature)
+			.collect::<Vec<_>>();
+		let [entry] = matches.as_slice() else {
+			return if matches.is_empty() {
+				Err(unsupported(
+					"HAVING aggregate-call must appear in SELECT list",
+				))
+			} else {
+				Err(unsupported("ambiguous HAVING aggregate-call"))
+			};
+		};
+		if self
+			.output_name_counts
+			.get(&entry.output_name)
+			.copied()
+			.unwrap_or(0)
+			> 1
+		{
+			return Err(unsupported("ambiguous HAVING aggregate-call"));
+		}
+		Ok(entry.output_name.clone())
+	}
+}
+
+#[derive(Debug)]
+struct HavingAggregateEntry {
+	signature: HavingAggregateSignature,
+	output_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum HavingAggregateSignature {
+	CountAll,
+	Count(ColumnRef),
+	Sum(ColumnRef),
+}
+
 #[derive(Debug, Clone, Copy)]
 enum AggregateSqlMode {
 	Global,
@@ -848,6 +1001,33 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
 		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
 		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
 		_ => None,
+	}
+}
+
+fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
+	match function {
+		AggregateFunction::CountAll | AggregateFunction::Count => "count",
+		AggregateFunction::Sum => "sum",
+		AggregateFunction::LinearRegress => "linreg",
+		AggregateFunction::ApproxQuantile(_) => "quantile",
+	}
+}
+
+fn having_aggregate_signature(
+	function: &AggregateFunction,
+	args: &[Expr],
+) -> Option<HavingAggregateSignature> {
+	match function {
+		AggregateFunction::CountAll => Some(HavingAggregateSignature::CountAll),
+		AggregateFunction::Count => match args {
+			[Expr::Column(column)] => Some(HavingAggregateSignature::Count(column.clone())),
+			_ => None,
+		},
+		AggregateFunction::Sum => match args {
+			[Expr::Column(column)] => Some(HavingAggregateSignature::Sum(column.clone())),
+			_ => None,
+		},
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,
 	}
 }
 

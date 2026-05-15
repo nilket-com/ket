@@ -444,6 +444,103 @@ fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
 	assert!(fragmenter.contains("if exchange_count > 1"));
 }
 
+#[test]
+fn adr016_having_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(!planner.contains("HAVING is not supported"));
+	assert!(planner.contains("HAVING without GROUP BY is not supported"));
+	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
+	assert!(planner.contains("ambiguous HAVING aggregate-call"));
+	assert!(planner.contains("qualified HAVING column references are not supported"));
+
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_expr = binder
+		.split("fn bind_expr")
+		.nth(1)
+		.and_then(|rest| rest.split("fn bind_comparison").next())
+		.expect("bind_expr block");
+	assert!(!bind_expr.contains("AggregateCall"));
+	assert!(!bind_expr.contains("AggregateFunction"));
+
+	let aggregate_function_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
+	let aggregate_function = aggregate_function_source
+		.split("pub enum AggregateFunction")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("AggregateFunction enum");
+	assert_eq!(enum_variant_count(aggregate_function), 5);
+
+	let aggregate_output_name = planner
+		.split("fn aggregate_output_name")
+		.nth(1)
+		.and_then(|rest| rest.split("fn having_aggregate_signature").next())
+		.expect("planner aggregate output name helper");
+	let aggregate_field = binder
+		.split("fn aggregate_field")
+		.nth(1)
+		.and_then(|rest| rest.split("fn sum_output_data_type").next())
+		.expect("binder aggregate field helper");
+	for (variant, planner_name, binder_field) in [
+		(
+			"AggregateFunction::CountAll",
+			"\"count\"",
+			"Field::new(\"count\",",
+		),
+		(
+			"AggregateFunction::Count",
+			"\"count\"",
+			"Field::new(\"count\",",
+		),
+		("AggregateFunction::Sum", "\"sum\"", "Field::new(\"sum\","),
+		(
+			"AggregateFunction::LinearRegress",
+			"\"linreg\"",
+			"Field::new(\"linreg\",",
+		),
+		(
+			"AggregateFunction::ApproxQuantile(_)",
+			"\"quantile\"",
+			"Field::new(\"quantile\",",
+		),
+	] {
+		assert!(
+			match_arm_maps_to(aggregate_output_name, variant, planner_name),
+			"planner aggregate_output_name mapping drifted for {variant}"
+		);
+		assert!(
+			match_arm_maps_to(aggregate_field, variant, binder_field),
+			"binder aggregate_field mapping drifted for {variant}"
+		);
+	}
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let filter_disposition = execution_source
+		.split("pub enum FilterDisposition")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct ExecutionSortKey").next())
+		.expect("FilterDisposition enum");
+	assert_eq!(enum_variant_count(filter_disposition), 2);
+	assert!(filter_disposition.contains("EvaluateInToron"));
+
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let detector = fragmenter
+		.split("fn is_terminal_sort_over_grouped_aggregate")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
+				.next()
+		})
+		.expect("ADR 016 detector block");
+	assert!(detector.contains("ExecutionPlan::Filter"));
+	assert!(detector.contains("ExecutionPlan::Aggregate"));
+	assert!(detector.contains("having = Some"));
+}
+
 fn enum_variant_count(enum_body: &str) -> usize {
 	enum_body
 		.lines()
@@ -456,6 +553,40 @@ fn enum_variant_count(enum_body: &str) -> usize {
 				&& (trimmed.ends_with(',') || trimmed.ends_with('{'))
 		})
 		.count()
+}
+
+fn compact_whitespace(source: &str) -> String {
+	source.split_whitespace().collect()
+}
+
+fn match_arm_maps_to(source: &str, variant: &str, mapped_expr_prefix: &str) -> bool {
+	let source = compact_whitespace(source);
+	let mut offset = 0;
+	while let Some(relative_start) = source[offset..].find(variant) {
+		let variant_start = offset + relative_start;
+		let variant_end = variant_start + variant.len();
+		let after_variant = source[variant_end..].chars().next();
+		if after_variant.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+			offset = variant_end;
+			continue;
+		}
+
+		let tail = &source[variant_end..];
+		let Some(arrow_offset) = tail.find("=>") else {
+			return false;
+		};
+		let pattern_tail = &tail[..arrow_offset];
+		if pattern_tail.contains(',') || pattern_tail.contains('}') {
+			offset = variant_end;
+			continue;
+		}
+
+		if tail[arrow_offset + 2..].starts_with(mapped_expr_prefix) {
+			return true;
+		}
+		offset = variant_end;
+	}
+	false
 }
 
 #[test]

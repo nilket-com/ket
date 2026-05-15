@@ -5,14 +5,16 @@
 
 ## Status
 
-Promoted, pending implementation.
+Promoted and implemented.
 
 This is a small cross-file composition: one planner
 reject removed, one planner-side rewrite added, one
 fragmenter detector extended, test coverage at four
 layers (planner / binder / fragmenter / integration).
 No new IR variant, no wire change, no operator surface
-change, no binder seam.
+change, no `bind_expr` aggregate-call arm. A narrow
+`bind_comparison` numeric-literal coercion is part of
+the shipped binder behavior.
 
 ## Goal
 
@@ -33,8 +35,10 @@ Land `GROUP BY ... HAVING ...` (with and without
   case-insensitive and argument-normalized;
 - binder resolves the rewritten predicate against
   the aggregate output schema via the existing
-  `bind_expr` + `resolve_column` path; no new
-  binder arm;
+  `bind_expr` + `resolve_column` path, with
+  comparison literals coerced in `bind_comparison`
+  after expression types are known; no new
+  `bind_expr` arm;
 - fragmenter Site 1 (no `ORDER BY`) requires zero
   new code — the generic single-exchange path
   fragments `Filter(Aggregate(Exchange_K(scan)))`
@@ -93,11 +97,18 @@ Land `GROUP BY ... HAVING ...` (with and without
     against an input schema; no
     `Expr::AggregateCall` arm and ADR 016 does not
     add one.
+  - `bind_comparison` — coerces an `Int32` numeric
+    literal to `Int64` or `Float64` when the
+    opposite side is a typed, non-literal expression
+    of that type. This handles aggregate-output
+    comparisons such as `HAVING SUM(amount) > 5`;
+    literal-vs-literal comparisons are unchanged.
   - `Filter` binder (lines 78-100) — selects
     `FilterDisposition::EvaluateInToron` for
     predicates that cannot push to PBC. The post-
     aggregate filter naturally takes
-    `EvaluateInToron`; no binder code change.
+    `EvaluateInToron`; no disposition or
+    `bind_expr` code change.
   - `aggregate_field` (lines 1287-1301) —
     generates `"count"`, `"sum"`, `"linreg"`,
     `"quantile"`. Source of the rewrite map's
@@ -128,10 +139,11 @@ Land `GROUP BY ... HAVING ...` (with and without
     change.
 - `crates/toron/tests/group_by_test.rs` — ADR 016
   adds planner + execution + fragmenter test
-  cases.
+  cases, including `HAVING + ORDER BY`.
 - `crates/toron/tests/sort_ordering_test.rs` —
-  ADR 016 adds `HAVING + ORDER BY` composition
-  cases.
+  existing ADR 015 ordering coverage remains
+  unchanged; ADR 016 composition cases live in
+  `group_by_test.rs`.
 - `crates/toron/tests/distributed_process_test.rs`
   — ADR 016 adds the distributed-cluster `HAVING`
   fixture.
@@ -163,11 +175,13 @@ Expected code changes:
   extend the builder to wrap `aggregate_plan` in
   `ExecutionPlan::Filter` when the field is
   `Some`.
+- `crates/toron/src/binder.rs` — add the narrow
+  `bind_comparison` numeric-literal coercion for
+  typed non-literal comparison operands.
 - `crates/toron/tests/group_by_test.rs` —
   planner, binder, fragmenter, and execution
-  coverage.
-- `crates/toron/tests/sort_ordering_test.rs` —
-  `HAVING + ORDER BY` composition cases.
+  coverage, including `HAVING + ORDER BY`
+  composition cases.
 - `crates/toron/tests/distributed_process_test.rs`
   — multi-process digest parity fixture.
 - `crates/toron/tests/architecture_test.rs` —
@@ -339,6 +353,15 @@ Not expected:
   reference to the aggregate-output field at
   index 1 and resolves cleanly.
 
+  The same binder pass owns numeric literal
+  coercion for comparisons. `SUM(amount)` may
+  bind to `Int64` while `5` parses as `Int32`;
+  `bind_comparison` coerces that `Int32` literal
+  to the typed non-literal operand's `Int64` or
+  `Float64` type. Literal-vs-literal comparisons
+  stay unchanged, and no aggregate-call handling
+  is added to `bind_expr`.
+
 - **P0.8: Case-insensitivity sanity.** The
   signature derivation runs through
   `lower_aggregate_function`, which normalizes
@@ -360,7 +383,8 @@ Not expected:
   because the filter's input is an
   `ExecutionPlan::Aggregate`, not a `Scan`. The
   binder branches at line 87 hand the predicate
-  to `EvaluateInToron`. No code change.
+  to `EvaluateInToron`. No disposition or
+  `bind_expr` code change.
 
 - **P0.10: Architecture guards.** Source-shape
   guards in
@@ -371,6 +395,8 @@ Not expected:
     (mirrors ADR 015's
     `"GROUP BY with ORDER BY is not supported"`
     absence guard).
+  - The planner-owned qualified-reference reject
+    string remains present.
   - No new `LogicalPlan::*` or
     `ExecutionPlan::*` variant.
   - No new `FilterDisposition` variant.
@@ -378,6 +404,10 @@ Not expected:
     source-level grep absence of
     `Expr::AggregateCall` handling in
     `bind_expr`'s body).
+  - Planner-local `aggregate_output_name` and
+    binder-local `aggregate_field` continue to
+    agree on generated aggregate output names for
+    every `AggregateFunction` variant.
   - No new `MessageKind`, `TaskFailureKind`,
     `BudgetDimension`.
 
@@ -508,9 +538,12 @@ Tests in `crates/toron/tests/group_by_test.rs`:
     generated `"count"`).
 - **V1 exclusion §4** — `SELECT region,
   COUNT(*) FROM sales GROUP BY region HAVING
-  t.region = 'EMEA'` rejects via the existing
-  `resolve_column` path (aggregate output
-  schema is unqualified).
+  t.region = 'EMEA'` rejects in the planner
+  before lowering with `"qualified HAVING column
+  references are not supported"` (aggregate
+  output schema is unqualified, and V1 keeps
+  qualifier handling out of the generic binder
+  path).
 - **`HAVING 2 > 100` literal predicate** —
   `SELECT region, COUNT(*) FROM sales GROUP BY
   region HAVING 2 > 100` lowers as a literal
@@ -633,7 +666,7 @@ Tests in `crates/toron/tests/group_by_test.rs`:
 ## Phase 3 — Verification across layers
 
 **Binder coverage**
-(`group_by_test.rs` or `sort_ordering_test.rs`):
+(`group_by_test.rs`):
 
 - `HAVING SUM(amount) > 1000` rewrites to a
   reference to the aggregate-output field for
@@ -656,6 +689,10 @@ Tests in `crates/toron/tests/group_by_test.rs`:
   successfully — one structural match
   `(Sum, amount)` with the unique output name
   `"sum"` in scope.
+- The right-hand literal in `HAVING SUM(amount)
+  > 5` binds as the aggregate output type when
+  `SUM(amount)` is `Int64`; literal-vs-literal
+  comparisons remain unchanged.
 - Disposition is `EvaluateInToron`; no PBC-
   push attempt succeeds. Phase 3 explicitly
   asserts this on at least one fixture.
@@ -838,7 +875,10 @@ cargo test --locked --workspace --no-fail-fast
 - Binder resolves the rewritten predicate
   against the aggregate output schema via
   existing `bind_expr` + `resolve_column`
-  paths; no new `bind_expr` match arm.
+  paths; `bind_comparison` performs the narrow
+  numeric literal coercion for typed non-literal
+  comparison operands; no new `bind_expr` match
+  arm.
 - `Filter` disposition is `EvaluateInToron`
   for post-aggregate predicates; no new
   disposition variant.
@@ -870,6 +910,7 @@ cargo test --locked --workspace --no-fail-fast
   no new IR variant; no new
   `FilterDisposition`, `MessageKind`,
   `TaskFailureKind`, `BudgetDimension`; no
-  new `bind_expr` match arm).
+  new `bind_expr` match arm; planner/binder
+  aggregate output-name mapping stays paired).
 - Full Toron + Wendelon workspace test
   suites green.
