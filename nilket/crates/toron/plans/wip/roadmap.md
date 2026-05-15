@@ -58,6 +58,11 @@ along with the forward-sequence rewrite.
   `MIN_FILTER_BYTES`); coordinator lowers exact-to-Bloom on overflow. Proving
   production Wendelon row appended to
   `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
+- **ADR 015 — Terminal Ordering for Grouped Aggregate SQL.** Promoted,
+  pending implementation. Composes ADR 010 (`Sort`) and ADR 011
+  (`Aggregate`) to enable `GROUP BY ... ORDER BY [LIMIT/OFFSET]` via one
+  narrow fragmenter detector that emits a three-stage pipeline
+  (producers → grouped aggregate consumers → terminal sort). No new IR.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -107,36 +112,53 @@ a different contract.
 Earlier items have firmer scope; later items are direction,
 not commitment.
 
-### Promoted: ADR 014 plan
+### Promoted: ADR 015 plan
 
-ADR 014's contract is pinned at
-`plans/adr/014_exact_small_set_runtime_filters.md`; the impl plan
-lives at `plans/impl/014_exact_small_set_runtime_filters.md`.
-Implementation is pending. The proving bench row will append to
-`plans/impl/006_runtime_filter_pushdown_bench_results.md`
-alongside ADR 006's motivating Phase 0 row and ADR 013's
-production row.
+ADR 015's contract is pinned at
+`plans/adr/015_terminal_ordering_for_grouped_aggregate_sql.md`;
+the impl plan lives at
+`plans/impl/015_terminal_ordering_for_grouped_aggregate_sql.md`.
+Implementation is pending. ADR 015 owns no independent bench
+artifact — it composes ADR 010 and ADR 011 with one narrow
+fragmenter detector and no new operator or wire surface.
 
-### ADR 015 candidates
+### ADR 016 candidates
 
-**Lead candidate — `GROUP BY ... ORDER BY`.** Pre-converged in
-the ADR 014 selection round: all three council members named the
-same three-stage fragmenter shape (scan/projection producers →
-group-keyed exchange into grouped aggregate consumers → terminal
-gather exchange into one final `Sort` task). Composes ADR 010
-(`Sort`) and ADR 011 (`Aggregate`) with no new IR variant;
-planner reject is at `sql_planner.rs:98`. Two real iter-1
-questions carried forward from the ADR 014 cycle: terminal-gather
-representation in the scheduler / fragmenter, and the
-`lower_query` seam at the reject site.
+**Adjacent SQL-surface candidates** lead the iter-1 scan, all
+still resting on ADR 011's narrow grouped-aggregate surface:
 
-**Other ADR 011 SQL-surface follow-ons** remain explicit
-candidates: `GROUP BY` over joins, `HAVING`, `DISTINCT`,
-post-aggregate projection (aliases, reordering, key subsets,
-computed keys), two-phase partial/final aggregation, and
-aggregate-catalog widening (`AVG` / `MIN` / `MAX` and
-experimental-kernel graduation). They promote only if evidence
-beats the lead candidate.
+- **`HAVING`** — post-aggregate predicate on grouped output. Pairs
+  naturally with ADR 015's terminal ordering; same single-table
+  scope as ADR 011, single new logical position above the
+  `Aggregate`.
+- **`DISTINCT`** — `GROUP BY <all output columns>` with no
+  aggregates. ADR 010 closed its silent drop; implementation
+  remains aggregate-path ADR work.
+- **`ORDER BY <aggregate-call>`** — the V1 exclusion from ADR 015.
+  Requires aggregate-call recognition in an `ORDER BY`-specific
+  post-aggregate expression scope.
+- **Post-aggregate projection** (aliases, computed expressions on
+  aggregates, key subsets, reordered keys). ADR 011 explicitly
+  rejects; widening is its own decision matrix.
+- **`GROUP BY` over joins.** Composes ADR 008's join surface with
+  ADR 011's grouped aggregate; ADR 011 rejected this in V1.
+
+**Other ADR 011 follow-ons** carry forward as candidates if their
+evidence outranks the SQL-surface set: two-phase partial/final
+aggregation, aggregate-catalog widening (`AVG` / `MIN` / `MAX`
+and experimental-kernel graduation).
+
+**V1.x runtime-filter extensions** (Candidate C below) remain a
+cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
+enum is the surface they extend. Promotion still requires
+per-extension evidence; ADR 014's descriptor refactor does not
+auto-select the next extension.
+
+**Code-evidence defects** (silent-drop, inert-feature) outrank
+all of the above when one surfaces. The selection-round practice
+established in ADR 014's cycle stays: candidates are nominated,
+evidence is hunted, the council picks the topic the code points
+to.
 
 **Standing A–E candidates** rotate forward beneath the lead.
 Candidate B (cross-process wire efficiency) is parked unless
