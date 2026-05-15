@@ -185,27 +185,27 @@ along with the forward-sequence rewrite.
   outside the rotated post-ADR-009 A–E candidate list on fresh
   code evidence of a second silent-wrong-results defect.
 - **ADR 012 — Mixed-Wildcard Projection Accounting and Planner
-  Hardening.** Promoted. Frontend-planner surface fix closing the
-  last known projection-item silent drop one level below ADR 011:
-  `SqlPlanner::lower_select`'s non-aggregate projection loop
-  returned the input plan on the first `SELECT *` it saw,
-  silently discarding every sibling projection item — so
-  `SELECT region, * FROM sales` executed with `region`'s
-  requested position dropped. After ADR 012, any unqualified
-  wildcard mixed with any sibling rejects through
-  `FrontendError::Unsupported`; bare `SELECT *` is unchanged and
-  byte-identical. The secondary half hardens a `TIME_BUCKET`
-  arity panic — `lower_expr` indexed `args[0]` / `args[1]`
-  without an arity check — to a clean reject, with exactly-two
-  arity so an extra argument is not silently dropped. No new IR,
-  operator, wire, binder, executor, or Wendelon surface;
-  `LogicalPlan` stays 9 variants and `ExecutionPlan` stays 7. No
-  bench-results artifact — promotion evidence is behavioral plus
-  a source-shape architecture guard. Selected from outside the
-  standing A–E candidate list on fresh code evidence, the third
-  in the ADR 010 → 011 → 012 projection-accounting sequence.
-  Three-way AI Swarm Council convergence (Claude / Codex /
-  Gemini) across five iteration rounds.
+  Hardening.** Promoted + implemented. Frontend-planner surface
+  fix closing the last known projection-item silent drop one level
+  below ADR 011: `SqlPlanner::lower_select`'s non-aggregate
+  projection loop returned the input plan on the first `SELECT *`
+  it saw, silently discarding every sibling projection item — so
+  `SELECT region, * FROM sales` executed with `region`'s requested
+  position dropped. After ADR 012, any unqualified wildcard mixed
+  with any sibling rejects through `FrontendError::Unsupported`;
+  bare `SELECT *` is unchanged and byte-identical. The secondary
+  half hardens a `TIME_BUCKET` arity panic — `lower_expr` indexed
+  `args[0]` / `args[1]` without an arity check — to a clean
+  reject, with exactly-two arity so an extra argument is not
+  silently dropped. No new IR, operator, wire, binder, executor, or
+  Wendelon surface; `LogicalPlan` stays 9 variants and
+  `ExecutionPlan` stays 7. No bench-results artifact — promotion
+  evidence is behavioral plus a source-shape architecture guard.
+  Selected from outside the standing A–E candidate list on fresh
+  code evidence, the third in the ADR 010 → 011 → 012
+  projection-accounting sequence. Three-way AI Swarm Council
+  convergence (Claude / Codex / Gemini) across five iteration
+  rounds.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -350,7 +350,7 @@ remains pending — when Wendelon-side ships, the
 artifact gets the production end-to-end row appended as a
 follow-up update.
 
-### Completed: ADR 012 promotion
+### Completed: ADR 012 promotion and implementation
 
 ADR 012's contract is pinned at
 `plans/adr/012_mixed_wildcard_projection_accounting_and_planner_hardening.md`;
@@ -361,8 +361,8 @@ there is no bench-results artifact. It closes the last known
 projection-item silent drop in the frontend planner — mixed
 unqualified wildcards no longer silently discard sibling
 projection items — and hardens the `TIME_BUCKET` arity panic.
-Implementation phases are pending; see the impl plan and
-`git log` for actual status.
+Implementation is complete; see the impl plan and `git log` for
+actual status.
 
 ### ADR 013 candidates
 

@@ -260,6 +260,29 @@ fn lower_query_and_lower_select_have_no_rest_pattern() {
 	}
 }
 
+#[test]
+fn lower_select_does_not_return_input_from_wildcard_projection_loop() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_select = source
+		.split("fn lower_select")
+		.nth(1)
+		.and_then(|rest| rest.split("\n\tfn lower_order_by").next())
+		.expect("lower_select body");
+	let projection_loop = lower_select
+		.split("for item in projection")
+		.nth(1)
+		.and_then(|rest| rest.split("Ok(LogicalPlan::Project").next())
+		.expect("non-aggregate projection loop");
+
+	assert!(lower_select.contains("matches!(projection.as_slice(), [SelectItem::Wildcard(_)])"));
+	assert!(
+		!projection_loop.contains("return Ok(plan)"),
+		"wildcard projection loop still returns the input plan"
+	);
+	assert!(projection_loop.contains("mixed wildcard projections are not supported"));
+}
+
 fn enum_variant_count(enum_body: &str) -> usize {
 	enum_body
 		.lines()

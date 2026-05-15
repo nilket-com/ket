@@ -264,6 +264,10 @@ impl SqlPlanner {
 			});
 		}
 
+		if matches!(projection.as_slice(), [SelectItem::Wildcard(_)]) {
+			return Ok(plan);
+		}
+
 		let mut exprs = Vec::new();
 		for item in projection {
 			match item {
@@ -271,7 +275,7 @@ impl SqlPlanner {
 					exprs.push(self.lower_expr(sql_expr)?);
 				}
 				SelectItem::Wildcard(_) => {
-					return Ok(plan);
+					return Err(unsupported("mixed wildcard projections are not supported"));
 				}
 				_ => return Err(unsupported("unsupported select item")),
 			}
@@ -698,6 +702,9 @@ impl SqlPlanner {
 					sqlparser::ast::FunctionArguments::List(l) => &l.args,
 					_ => return Err(unsupported("TIME_BUCKET expects arguments")),
 				};
+				if args.len() != 2 {
+					return Err(unsupported("TIME_BUCKET expects exactly two arguments"));
+				}
 				let ts = self.lower_arg(&args[0])?;
 				let interval = match &args[1] {
 					FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(

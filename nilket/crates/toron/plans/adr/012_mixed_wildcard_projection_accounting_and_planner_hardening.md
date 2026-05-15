@@ -7,10 +7,10 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Promotion evidence is behavioral
-plus a focused source-shape guard (see "Promotion evidence").
-No bench-results artifact — ADR 012 introduces no operator and
-makes no performance claim.
+Promoted to `plans/adr/` and implemented. Promotion evidence is
+behavioral plus a focused source-shape guard (see "Promotion
+evidence"). No bench-results artifact — ADR 012 introduces no
+operator and makes no performance claim.
 
 Three-way AI Swarm Council convergence reached across five
 iteration rounds (`plans/wip/{claude,codex,gemini}_iter_*`).

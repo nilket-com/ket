@@ -5,11 +5,9 @@
 
 ## Status
 
-Promoted to `plans/impl/` alongside the ADR. Consolidated by
-Codex at iter-5 from the iter-3/iter-4 council drafts; Gemini
-iter-5 and Claude iter-5 ratified. This is the promotable
-implementation shape unless implementation surfaces a new code
-fact.
+Promoted to `plans/impl/` alongside the ADR and implemented.
+Consolidated by Codex at iter-5 from the iter-3/iter-4 council
+drafts; Gemini iter-5 and Claude iter-5 ratified.
 
 ## Substrate
 
@@ -225,13 +223,9 @@ Implementation preference:
 
 ## Phase 5 — Documentation
 
-On promotion of the implementation:
-
-- Update `crates/toron/plans/wip/roadmap.md` to mark ADR 012
-  implemented (the plan-promotion edits already landed with this
-  ADR; the implementation commit flips ADR 012's status entry
-  from "Promoted." to "Promoted + implemented.").
-- Record no bench-results artifact.
+Implementation promotion updated
+`crates/toron/plans/wip/roadmap.md` to mark ADR 012 implemented.
+No bench-results artifact was added.
 
 ## Verification
 
