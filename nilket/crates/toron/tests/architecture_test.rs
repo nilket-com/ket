@@ -409,6 +409,41 @@ fn lower_select_does_not_return_input_from_wildcard_projection_loop() {
 	assert!(projection_loop.contains("mixed wildcard projections are not supported"));
 }
 
+#[test]
+fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(!planner.contains("GROUP BY with ORDER BY is not supported"));
+
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let detector_index = fragmenter
+		.find("is_terminal_sort_over_grouped_aggregate(&plan)")
+		.expect("ADR 015 detector call");
+	let reject_index = fragmenter
+		.find("FragmentError::MultipleExchangeBoundaries")
+		.expect("multi-exchange reject");
+	assert!(
+		detector_index < reject_index,
+		"ADR 015 detector must stay before the generic multi-exchange reject"
+	);
+
+	let detector = fragmenter
+		.split("fn is_terminal_sort_over_grouped_aggregate")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
+				.next()
+		})
+		.expect("ADR 015 detector block");
+	assert!(detector.contains("ExecutionPlan::Sort"));
+	assert!(detector.contains("ExecutionPlan::Exchange"));
+	assert!(detector.contains("ExecutionPlan::Aggregate"));
+	assert!(detector.contains("*partition_count != 1 || !key.is_empty()"));
+	assert!(detector.contains("partition_count: group_partition_count"));
+	assert!(fragmenter.contains("if exchange_count > 1"));
+}
+
 fn enum_variant_count(enum_body: &str) -> usize {
 	enum_body
 		.lines()

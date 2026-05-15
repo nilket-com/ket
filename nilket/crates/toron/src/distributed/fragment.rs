@@ -13,8 +13,8 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, JoinKind, JoinStrategy,
-	QueryProfileHint,
+	AggregateCall, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, JoinKind,
+	JoinStrategy, QueryProfileHint,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +73,11 @@ pub fn fragment_plan(
 	let exchange_count = count_exchanges(&plan);
 	if exchange_count == 0 {
 		return Ok(vec![single_task_stage(plan, config)]);
+	}
+	// ADR 015: this exact Sort-over-Aggregate composition has two exchanges;
+	// every other non-join multi-exchange shape still rejects below.
+	if let Some(detected) = is_terminal_sort_over_grouped_aggregate(&plan) {
+		return fragment_terminal_sort_over_grouped_aggregate(config, detected);
 	}
 	if exchange_count > 1 {
 		return Err(FragmentError::MultipleExchangeBoundaries {
@@ -510,6 +515,17 @@ struct TerminalSortGather {
 	output_schema: SchemaRef,
 }
 
+#[derive(Debug, Clone)]
+struct TerminalSortOverAggregate {
+	inner_input: ExecutionPlan,
+	group_partition_count: u32,
+	group_key: Vec<ExecutionExpr>,
+	group_expr: Vec<ExecutionExpr>,
+	aggr_expr: Vec<AggregateCall>,
+	aggregate_output_schema: SchemaRef,
+	terminal_gather: TerminalSortGather,
+}
+
 fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
 	let ExecutionPlan::Sort {
 		input,
@@ -540,6 +556,159 @@ fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
 		offset: *offset,
 		output_schema: output_schema.clone(),
 	})
+}
+
+fn is_terminal_sort_over_grouped_aggregate(
+	plan: &ExecutionPlan,
+) -> Option<TerminalSortOverAggregate> {
+	let ExecutionPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+		output_schema,
+	} = plan
+	else {
+		return None;
+	};
+	let ExecutionPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		return None;
+	};
+	if *partition_count != 1 || !key.is_empty() {
+		return None;
+	}
+	let aggregate = input.as_ref();
+	let ExecutionPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+		output_schema: aggregate_output_schema,
+	} = aggregate
+	else {
+		return None;
+	};
+	let ExecutionPlan::Exchange {
+		input,
+		partition_count: group_partition_count,
+		key: group_key,
+	} = input.as_ref()
+	else {
+		return None;
+	};
+
+	Some(TerminalSortOverAggregate {
+		inner_input: input.as_ref().clone(),
+		group_partition_count: *group_partition_count,
+		group_key: group_key.clone(),
+		group_expr: group_expr.clone(),
+		aggr_expr: aggr_expr.clone(),
+		aggregate_output_schema: aggregate_output_schema.clone(),
+		terminal_gather: TerminalSortGather {
+			input: aggregate.clone(),
+			order_by: order_by.clone(),
+			limit: *limit,
+			offset: *offset,
+			output_schema: output_schema.clone(),
+		},
+	})
+}
+
+fn fragment_terminal_sort_over_grouped_aggregate(
+	config: FragmentPlanConfig,
+	detected: TerminalSortOverAggregate,
+) -> Result<Vec<StagePlan>, FragmentError> {
+	let TerminalSortOverAggregate {
+		inner_input,
+		group_partition_count,
+		group_key,
+		group_expr,
+		aggr_expr,
+		aggregate_output_schema,
+		terminal_gather,
+	} = detected;
+	if group_partition_count == 0 {
+		return Err(FragmentError::ZeroPartitionCount);
+	}
+
+	let producer_stage_id = StageId::new(0);
+	let aggregate_stage_id = StageId::new(1);
+	let sort_stage_id = StageId::new(2);
+	let group_exchange_id = ExchangeId::new(0);
+	let terminal_exchange_id = ExchangeId::new(1);
+	let scan_metadata =
+		first_scan_metadata(&inner_input).ok_or(FragmentError::MissingScanMetadata)?;
+	let input_schema = inner_input.schema();
+	let aggregate_input = shuffle_input_scan(scan_metadata, input_schema, group_exchange_id);
+	let aggregate_plan = ExecutionPlan::Aggregate {
+		input: Box::new(aggregate_input),
+		group_expr,
+		aggr_expr,
+		output_schema: aggregate_output_schema,
+	};
+	let producer_task = producer_task(
+		config,
+		producer_stage_id,
+		group_exchange_id,
+		ExchangeBoundary {
+			input: inner_input,
+			partition_count: group_partition_count,
+			key: group_key,
+		},
+	);
+	let aggregate_tasks = (0..group_partition_count)
+		.map(|partition| {
+			let partition_id = PartitionId::new(partition);
+			TaskPlan::new(TaskSpec {
+				identity: TaskIdentity::new(
+					config.query_id,
+					aggregate_stage_id,
+					TaskId::new(partition),
+					AttemptId::first(),
+				),
+				partition: Some(partition_id),
+				plan: aggregate_plan.clone(),
+				inputs: vec![TaskInputBinding::ShuffleConsumer {
+					exchange_id: group_exchange_id,
+					producer_stage_id,
+					partition_id,
+					producer_partitions: Vec::new(),
+				}],
+				output: TaskOutputBinding::ShuffleProducer {
+					exchange_id: terminal_exchange_id,
+					partition_count: PartitionCount::new(1),
+					partition_key: Vec::new(),
+				},
+				budget: config.task_budget,
+				trace: None,
+			})
+		})
+		.collect();
+	let sort_stage = terminal_sort_stage(
+		config,
+		sort_stage_id,
+		aggregate_stage_id,
+		terminal_exchange_id,
+		terminal_gather,
+	)?;
+
+	Ok(vec![
+		StagePlan {
+			stage_id: producer_stage_id,
+			upstream_stages: vec![],
+			tasks: vec![producer_task],
+		},
+		StagePlan {
+			stage_id: aggregate_stage_id,
+			upstream_stages: vec![producer_stage_id],
+			tasks: aggregate_tasks,
+		},
+		sort_stage,
+	])
 }
 
 fn terminal_sort_stage(

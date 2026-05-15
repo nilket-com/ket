@@ -7,7 +7,7 @@
 
 ## Status
 
-Promoted, pending implementation.
+Promoted and implemented.
 
 Three-way AI Swarm Council convergence reached across five
 iteration rounds. Iteration artifacts retire when this plan is

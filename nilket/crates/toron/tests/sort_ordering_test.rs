@@ -85,6 +85,23 @@ async fn bind_appends_full_output_tie_break_order() {
 }
 
 #[tokio::test]
+async fn bind_grouped_aggregate_sort_ordinal_targets_aggregate_output() {
+	let (catalog, _) = fixture();
+	let logical = SqlPlanner::new()
+		.plan("SELECT group_key, SUM(id) FROM t GROUP BY group_key ORDER BY 2 DESC")
+		.expect("plan grouped aggregate sort");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind grouped aggregate sort");
+
+	let ExecutionPlan::Sort { order_by, .. } = bound else {
+		panic!("expected sort");
+	};
+	assert_eq!(order_by[0].ordinal, ColumnOrdinal(1));
+	assert!(order_by[0].descending);
+}
+
+#[tokio::test]
 async fn order_by_limit_offset_executes_in_deterministic_order() {
 	let batch =
 		run_sql("SELECT id, group_key FROM t ORDER BY group_key ASC, id DESC LIMIT 3 OFFSET 1")

@@ -94,9 +94,6 @@ impl SqlPlanner {
 		};
 
 		if let Some(order_by) = order_by {
-			if is_grouped_aggregate_plan(&plan) {
-				return Err(unsupported("GROUP BY with ORDER BY is not supported"));
-			}
 			let order_by = self.lower_order_by(order_by)?;
 			let limit = limit
 				.as_ref()
@@ -883,17 +880,6 @@ fn aggregate_function_args(function: &Function) -> Result<&[FunctionArg], Fronte
 		));
 	}
 	Ok(args)
-}
-
-fn is_grouped_aggregate_plan(plan: &LogicalPlan) -> bool {
-	match plan {
-		LogicalPlan::Aggregate {
-			input: _,
-			group_expr,
-			aggr_expr: _,
-		} => !group_expr.is_empty(),
-		_ => false,
-	}
 }
 
 fn plan_contains_join(plan: &LogicalPlan) -> bool {

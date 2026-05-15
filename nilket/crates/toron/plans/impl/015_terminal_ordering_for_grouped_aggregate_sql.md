@@ -5,7 +5,7 @@
 
 ## Status
 
-Promoted, pending implementation.
+Promoted and implemented.
 
 This is a small cross-file composition: one planner reject removed,
 one narrow fragmenter detector added ahead of an existing reject,
@@ -325,7 +325,7 @@ style):
 
 ## Phase 4 — Documentation and roadmap
 
-Implementation promotion completes with:
+Implementation promotion completed with:
 
 - `plans/adr/015_terminal_ordering_for_grouped_aggregate_sql.md`
   Status flipped to "Promoted and implemented.";

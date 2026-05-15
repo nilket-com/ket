@@ -58,10 +58,10 @@ along with the forward-sequence rewrite.
   `MIN_FILTER_BYTES`); coordinator lowers exact-to-Bloom on overflow. Proving
   production Wendelon row appended to
   `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
-- **ADR 015 — Terminal Ordering for Grouped Aggregate SQL.** Promoted,
-  pending implementation. Composes ADR 010 (`Sort`) and ADR 011
-  (`Aggregate`) to enable `GROUP BY ... ORDER BY [LIMIT/OFFSET]` via one
-  narrow fragmenter detector that emits a three-stage pipeline
+- **ADR 015 — Terminal Ordering for Grouped Aggregate SQL.** Promoted +
+  implemented. Composes ADR 010 (`Sort`) and ADR 011 (`Aggregate`) to enable
+  `GROUP BY ... ORDER BY [LIMIT/OFFSET]` via one narrow fragmenter detector
+  that emits a three-stage pipeline
   (producers → grouped aggregate consumers → terminal sort). No new IR.
 
 V1 target is **"First Query with Integrity"** plus
@@ -111,16 +111,6 @@ a different contract.
 
 Earlier items have firmer scope; later items are direction,
 not commitment.
-
-### Promoted: ADR 015 plan
-
-ADR 015's contract is pinned at
-`plans/adr/015_terminal_ordering_for_grouped_aggregate_sql.md`;
-the impl plan lives at
-`plans/impl/015_terminal_ordering_for_grouped_aggregate_sql.md`.
-Implementation is pending. ADR 015 owns no independent bench
-artifact — it composes ADR 010 and ADR 011 with one narrow
-fragmenter detector and no new operator or wire surface.
 
 ### ADR 016 candidates
 
