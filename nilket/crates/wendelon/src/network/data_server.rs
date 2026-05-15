@@ -3882,6 +3882,12 @@ impl WendelonDataServer {
 		&self,
 		frame: &HrftFrame,
 	) -> std::io::Result<(TableQueryRequestMeta, Vec<u8>, DecodedRuntimeFilter)> {
+		Self::decode_table_query_request_frame_parts(frame)
+	}
+
+	fn decode_table_query_request_frame_parts(
+		frame: &HrftFrame,
+	) -> std::io::Result<(TableQueryRequestMeta, Vec<u8>, DecodedRuntimeFilter)> {
 		if frame.meta.len() < std::mem::size_of::<TableQueryRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -15359,6 +15365,234 @@ mod tests {
 			runtime_filter_len: 0,
 			as_of_hlc,
 		}
+	}
+
+	fn table_query_frame_for_decode_test(
+		meta: TableQueryRequestMeta,
+		trailing: Option<Vec<u8>>,
+	) -> HrftFrame {
+		let meta_bytes = bytemuck::bytes_of(&meta).to_vec();
+		let meta_len = meta_bytes.len() as u32;
+		let trailing_len = trailing.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u32;
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_REQ.0,
+				flags: 0,
+				stream_id: 67,
+				meta_len,
+				arrow_len: 0,
+				trailing_len,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(meta_bytes),
+			arrow_payload: None,
+			trailing: trailing.map(crate::network::pool::PooledBuf::orphan),
+		}
+	}
+
+	fn runtime_filter_descriptor_for_decode_test(
+		descriptor: &TableSchemaDescriptor,
+	) -> RuntimeFilterDescriptor {
+		runtime_filter_descriptor_for_ids(descriptor, &[7])
+	}
+
+	fn runtime_filter_descriptor_for_ids(
+		descriptor: &TableSchemaDescriptor,
+		ids: &[i64],
+	) -> RuntimeFilterDescriptor {
+		let bit_count = 1024;
+		let hash_count = 3;
+		let byte_budget = bit_count / 8;
+		let mut payload = vec![0; byte_budget as usize];
+		let ids = Int64Array::from(ids.to_vec());
+		for row in 0..ids.len() {
+			let encoded = crate::schema::encode_runtime_filter_key(&ids, row)
+				.expect("encode runtime-filter id")
+				.expect("non-null id");
+			crate::schema::insert_runtime_filter_encoded_key(
+				&mut payload,
+				bit_count,
+				hash_count,
+				crate::schema::RUNTIME_FILTER_HASH_SEED,
+				&encoded,
+			);
+		}
+		RuntimeFilterDescriptor {
+			key_encoding_version: crate::schema::RUNTIME_FILTER_KEY_ENCODING_VERSION,
+			key_types: vec![crate::schema::RuntimeFilterKeyType::Int64],
+			probe_key_columns: vec![0],
+			hash_seed: crate::schema::RUNTIME_FILTER_HASH_SEED,
+			bit_count,
+			hash_count,
+			byte_budget,
+			target_fp_rate_bp: 150,
+			payload,
+			probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+		}
+	}
+
+	fn runtime_filter_application_for_ids(
+		descriptor: &TableSchemaDescriptor,
+		ids: &[i64],
+	) -> RuntimeFilterApplication {
+		RuntimeFilterApplication {
+			descriptor: runtime_filter_descriptor_for_ids(descriptor, ids),
+		}
+	}
+
+	fn projected_typed_batch(rows: Vec<(i64, &str)>) -> ProjectedRecordBatch {
+		ProjectedRecordBatch {
+			batch: typed_table_batch_with_names(rows),
+			ordinal_mapping: crate::storage::columnar::ColumnOrdinalMapping::new(vec![
+				Some(0),
+				Some(1),
+			]),
+			storage_mapping: std::collections::BTreeMap::new(),
+		}
+	}
+
+	fn pbc_project_name_program() -> pbc::Program {
+		let mut bytecode = Vec::new();
+		bytecode.push(OP_PROJECT);
+		bytecode.extend_from_slice(&1_u16.to_le_bytes());
+		bytecode.extend_from_slice(&1_u32.to_le_bytes());
+		pbc::Program::compile(&bytecode).expect("compile name projection")
+	}
+
+	fn names_from_batch(batch: &RecordBatch) -> Vec<String> {
+		let names = batch
+			.column_by_name("name")
+			.expect("name column")
+			.as_any()
+			.downcast_ref::<LargeStringArray>()
+			.expect("name column is LargeUtf8");
+		(0..names.len())
+			.map(|row| names.value(row).to_owned())
+			.collect()
+	}
+
+	#[test]
+	fn table_query_decode_splits_pbc_and_runtime_filter_trailing_bytes() {
+		let descriptor = typed_table_descriptor();
+		let bytecode = pk_eq_program(7);
+		let runtime_filter = runtime_filter_descriptor_for_decode_test(&descriptor);
+		let runtime_filter_bytes = postcard::to_allocvec(&runtime_filter).unwrap();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), bytecode.len());
+		meta.runtime_filter_len = runtime_filter_bytes.len() as u32;
+		let mut trailing = bytecode.clone();
+		trailing.extend_from_slice(&runtime_filter_bytes);
+		let frame = table_query_frame_for_decode_test(meta, Some(trailing));
+
+		let (decoded_meta, decoded_bytecode, decoded_runtime_filter) =
+			WendelonDataServer::decode_table_query_request_frame_parts(&frame).unwrap();
+
+		assert_eq!(decoded_meta.bytecode_len, bytecode.len() as u32);
+		assert_eq!(
+			decoded_meta.runtime_filter_len,
+			runtime_filter_bytes.len() as u32
+		);
+		assert_eq!(decoded_bytecode, bytecode);
+		match decoded_runtime_filter {
+			DecodedRuntimeFilter::Decoded(decoded) => assert_eq!(decoded, runtime_filter),
+			other => panic!("expected decoded runtime filter, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn table_query_decode_missing_runtime_filter_trailing_is_hard_error() {
+		let descriptor = typed_table_descriptor();
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), 0);
+		meta.runtime_filter_len = 1;
+		let frame = table_query_frame_for_decode_test(meta, None);
+
+		let err = WendelonDataServer::decode_table_query_request_frame_parts(&frame)
+			.expect_err("missing declared trailing bytes must fail framing");
+
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("trailing is absent"));
+	}
+
+	#[test]
+	fn table_query_decode_short_runtime_filter_trailing_is_hard_error() {
+		let descriptor = typed_table_descriptor();
+		let bytecode = pk_eq_program(9);
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), bytecode.len());
+		meta.runtime_filter_len = 4;
+		let frame = table_query_frame_for_decode_test(meta, Some(bytecode));
+
+		let err = WendelonDataServer::decode_table_query_request_frame_parts(&frame)
+			.expect_err("short declared trailing bytes must fail framing");
+
+		assert_eq!(err.kind(), ErrorKind::InvalidData);
+		assert!(err.to_string().contains("shorter than declared"));
+	}
+
+	#[test]
+	fn table_query_decode_invalid_runtime_filter_payload_is_advisory_drop() {
+		let descriptor = typed_table_descriptor();
+		let bytecode = pk_eq_program(11);
+		let invalid_runtime_filter = [0xFF];
+		let mut meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), bytecode.len());
+		meta.runtime_filter_len = invalid_runtime_filter.len() as u32;
+		let mut trailing = bytecode.clone();
+		trailing.extend_from_slice(&invalid_runtime_filter);
+		let frame = table_query_frame_for_decode_test(meta, Some(trailing));
+
+		let (_, decoded_bytecode, decoded_runtime_filter) =
+			WendelonDataServer::decode_table_query_request_frame_parts(&frame).unwrap();
+
+		assert_eq!(decoded_bytecode, bytecode);
+		match decoded_runtime_filter {
+			DecodedRuntimeFilter::DroppedBeforePlanning(RuntimeFilterDropReason::DecodeFailed) => {}
+			other => panic!("expected decode_failed advisory drop, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn secondary_index_projected_runtime_filter_applies_before_pbc_output() {
+		let descriptor = typed_table_descriptor();
+		let program = pbc_project_name_program();
+		let requirement = analyze_pbc_column_requirement(&program, 2).unwrap();
+		let projected = projected_typed_batch(vec![
+			(1, "filtered-out"),
+			(2, "survivor"),
+			(3, "also-filtered-out"),
+		]);
+		let execution = QueryProjectedExecution::Pbc {
+			requirement,
+			user_column_count: 2,
+			runtime_filter: Some(runtime_filter_application_for_ids(&descriptor, &[2])),
+		};
+
+		let result = execute_secondary_index_projected_row(projected, &program, &execution)
+			.expect("secondary-index projected execution")
+			.expect("PBC output batch");
+
+		assert_eq!(result.batch.num_columns(), 1);
+		assert!(result.batch.column_by_name("id").is_none());
+		assert_eq!(names_from_batch(&result.batch), vec!["survivor"]);
+	}
+
+	#[test]
+	fn whole_record_runtime_filter_applies_before_pbc_output() {
+		let descriptor = typed_table_descriptor();
+		let program = pbc_project_name_program();
+		let batch = typed_table_batch_with_names(vec![
+			(1, "filtered-out"),
+			(2, "survivor"),
+			(3, "also-filtered-out"),
+		]);
+		let filtered = apply_runtime_filter_to_batch(
+			batch,
+			&runtime_filter_application_for_ids(&descriptor, &[2]),
+		)
+		.expect("whole-record runtime-filter application");
+		let output = pbc::execute_program(&program, &filtered).expect("PBC projection");
+
+		assert_eq!(output.num_columns(), 1);
+		assert!(output.column_by_name("id").is_none());
+		assert_eq!(names_from_batch(&output), vec!["survivor"]);
 	}
 
 	fn pk_eq_program(pk: i64) -> Vec<u8> {

@@ -7,7 +7,7 @@
 
 ## Status
 
-Promoted to `plans/adr/`. Implementation is pending.
+Promoted + implemented.
 
 Three-way council convergence reached across four iteration rounds. The
 only material fork, augmenting Wendelon's projected fetch requirement
@@ -82,8 +82,8 @@ The storage-scan boundary is still inert:
 - Wendelon's table-query execution does not apply a runtime-filter mask.
 - The only row-rejection implementation is test-local.
 
-This split was safe because runtime filters are advisory, but it left ADR
-006's production performance claim incomplete. ADR 013 makes the descriptor
+This split was safe because runtime filters are advisory, but it had left ADR
+006's production performance row unproven. ADR 013 makes the descriptor
 actionable at the scan boundary while preserving byte-identical fallback
 behavior when the descriptor is absent or unusable.
 

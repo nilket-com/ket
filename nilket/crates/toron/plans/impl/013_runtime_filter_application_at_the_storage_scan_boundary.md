@@ -5,7 +5,7 @@
 
 ## Status
 
-Promoted to `plans/impl/`. Implementation is pending.
+Promoted + implemented.
 
 This is a real cross-crate implementation: Toron storage, Wendelon schema,
 Wendelon client plumbing, Wendelon wire decode, Wendelon scan execution, and

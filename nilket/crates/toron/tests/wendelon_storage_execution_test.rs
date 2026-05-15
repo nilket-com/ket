@@ -8,6 +8,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::WendelonCatalog;
+use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	AggregateFunction, ExecutionPlan, Expr, FilterDisposition, LogicalPlan, QueryId, ScalarValue,
@@ -164,6 +165,47 @@ async fn wendelon_table_query_runtime_filter_fetches_omitted_probe_key() {
 }
 
 #[tokio::test]
+async fn wendelon_table_query_runtime_filter_reduces_boundary_rows() {
+	let fixture = LiveWendelonFixture::start(37).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(
+		&fixture.client,
+		LIVE_TENANT,
+		&descriptor,
+		selective_batch(1024),
+	)
+	.await;
+
+	let filter = runtime_filter_for_i64_values(&descriptor, &[2, 4]);
+	let unfiltered = table_query_id_amounts(&fixture, &descriptor, None).await;
+	let filtered = table_query_id_amounts(&fixture, &descriptor, Some(filter)).await;
+	let unfiltered_rows = row_count(&unfiltered);
+	let filtered_rows = row_count(&filtered);
+	let unfiltered_bytes = encode_batches(&unfiltered).len();
+	let filtered_bytes = encode_batches(&filtered).len();
+
+	assert!(filtered_rows < unfiltered_rows);
+	assert!(filtered_bytes < unfiltered_bytes);
+
+	let unfiltered_joined = joined_amounts_for_ids(&unfiltered, &[2, 4]);
+	let filtered_joined = joined_amounts_for_ids(&filtered, &[2, 4]);
+	let unfiltered_digest =
+		canonical_arrow_ipc_digest(&[unfiltered_joined], SortPolicy::FullRowLex)
+			.expect("unfiltered digest");
+	let filtered_digest = canonical_arrow_ipc_digest(&[filtered_joined], SortPolicy::FullRowLex)
+		.expect("filtered digest");
+	assert_eq!(unfiltered_digest, filtered_digest);
+	println!(
+		"adr013_production_wendelon_runtime_filter rows_off={unfiltered_rows} rows_on={filtered_rows} bytes_off={unfiltered_bytes} bytes_on={filtered_bytes} digest={}",
+		hex32(unfiltered_digest.get()),
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
 async fn wendelon_grouped_aggregate_matches_in_memory_baseline() {
 	let fixture = LiveWendelonFixture::start(35).await;
 	let descriptor = descriptor();
@@ -289,6 +331,27 @@ async fn execute_in_memory_plan(
 		.expect("execute in-memory baseline")
 }
 
+async fn table_query_id_amounts(
+	fixture: &LiveWendelonFixture,
+	descriptor: &TableSchemaDescriptor,
+	runtime_filter: Option<RuntimeFilterDescriptor>,
+) -> Vec<RecordBatch> {
+	let mut options = TableQueryOptions::default();
+	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
+	fixture
+		.client
+		.table_query_with_runtime_filter(
+			LIVE_TENANT,
+			descriptor,
+			pbc_project_id_amounts(),
+			runtime_filter,
+			options,
+		)
+		.await
+		.expect("table query id/amounts")
+		.batches
+}
+
 fn execution_context(tenant: WendelonTenantId) -> ExecutionContext {
 	ExecutionContext::new(
 		SessionId(10),
@@ -370,6 +433,53 @@ fn amounts_from_single_column(batches: &[RecordBatch]) -> Vec<i32> {
 		.downcast_ref::<Int32Array>()
 		.expect("amount column");
 	amounts.values().to_vec()
+}
+
+fn row_count(batches: &[RecordBatch]) -> usize {
+	batches.iter().map(RecordBatch::num_rows).sum()
+}
+
+fn joined_amounts_for_ids(batches: &[RecordBatch], build_ids: &[i64]) -> RecordBatch {
+	let mut amounts = Vec::new();
+	for batch in batches {
+		assert_eq!(batch.num_columns(), 2);
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id column");
+		let batch_amounts = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("amount column");
+		for row in 0..batch.num_rows() {
+			if build_ids.contains(&ids.value(row)) {
+				amounts.push(if batch_amounts.is_null(row) {
+					None
+				} else {
+					Some(batch_amounts.value(row))
+				});
+			}
+		}
+	}
+	RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new(
+			"amount",
+			DataType::Int32,
+			true,
+		)])),
+		vec![Arc::new(Int32Array::from(amounts)) as ArrayRef],
+	)
+	.expect("joined amounts batch")
+}
+
+fn hex32(bytes: [u8; 32]) -> String {
+	bytes
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect::<Vec<_>>()
+		.join("")
 }
 
 #[tokio::test]
@@ -630,6 +740,24 @@ fn batch_from_rows(rows: &[(i64, Option<i32>, Option<&str>, i64)]) -> RecordBatc
 	.expect("batch")
 }
 
+fn selective_batch(rows: i64) -> RecordBatch {
+	let schema = Arc::new(schema());
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+			Arc::new(Int32Array::from_iter_values(
+				(0..rows).map(|row| i32::try_from(row * 10).expect("amount fits i32")),
+			)) as ArrayRef,
+			Arc::new(StringArray::from(vec![Some("bulk"); rows as usize])) as ArrayRef,
+			Arc::new(Int64Array::from_iter_values(
+				(0..rows).map(|row| BASE_TS + row * 1000),
+			)) as ArrayRef,
+		],
+	)
+	.expect("selective batch")
+}
+
 fn pbc_project_amounts_gt_100() -> Vec<u8> {
 	let mut bytecode = Vec::new();
 	bytecode.push(OP_PUSH_COL);
@@ -639,6 +767,15 @@ fn pbc_project_amounts_gt_100() -> Vec<u8> {
 	bytecode.push(OP_GT);
 	bytecode.push(OP_PROJECT);
 	bytecode.extend_from_slice(&1_u16.to_le_bytes());
+	bytecode.extend_from_slice(&1_u32.to_le_bytes());
+	bytecode
+}
+
+fn pbc_project_id_amounts() -> Vec<u8> {
+	let mut bytecode = Vec::new();
+	bytecode.push(OP_PROJECT);
+	bytecode.extend_from_slice(&2_u16.to_le_bytes());
+	bytecode.extend_from_slice(&0_u32.to_le_bytes());
 	bytecode.extend_from_slice(&1_u32.to_le_bytes());
 	bytecode
 }

@@ -259,7 +259,6 @@ mod tests {
 
 	use arrow::array::{ArrayRef, Int32Array};
 	use arrow::datatypes::{DataType, Field, Schema};
-	use futures::TryStreamExt;
 	use wendelon::schema::{
 		RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION, RuntimeFilterKeyType,
 		encode_runtime_filter_key, insert_runtime_filter_encoded_key,
@@ -273,11 +272,7 @@ mod tests {
 		let request = test_request(Some(runtime_filter_for_int32_values(&[4, 6])));
 
 		let stream = storage.scan(request).await.expect("scan");
-		let batches = stream
-			.into_batches()
-			.try_collect::<Vec<_>>()
-			.await
-			.expect("collect");
+		let batches = collect_test_batches(stream).await;
 
 		assert_eq!(projected_values(&batches), vec![40, 60]);
 	}
@@ -294,13 +289,18 @@ mod tests {
 			.scan(test_request(Some(filter)))
 			.await
 			.expect("scan");
-		let batches = stream
-			.into_batches()
-			.try_collect::<Vec<_>>()
-			.await
-			.expect("collect");
+		let batches = collect_test_batches(stream).await;
 
 		assert_eq!(projected_values(&batches), vec![40, 50, 60]);
+	}
+
+	async fn collect_test_batches(stream: ScanStream) -> Vec<RecordBatch> {
+		let mut batches = Vec::new();
+		let mut stream = stream.into_batches();
+		while let Some(batch) = stream.next().await {
+			batches.push(batch.expect("scan batch"));
+		}
+		batches
 	}
 
 	fn test_batch() -> RecordBatch {

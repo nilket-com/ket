@@ -1,11 +1,12 @@
 # ADR 006 Runtime Filter Pushdown Bench Results
 
-**Status:** Toron-side implementation evidence and
-promotion-scale Wendelon-disabled rows captured; full Phase 0
-selective mock-Wendelon row captured; production Wendelon-enabled
-selective evidence remains follow-up work.
+**Status:** Toron-side implementation evidence,
+promotion-scale Wendelon-disabled rows, full Phase 0 selective
+mock-Wendelon row, and production Wendelon-enabled selective row
+captured.
 
-**Date:** 2026-05-13
+**Date:** 2026-05-13; ADR 013 production Wendelon row appended
+2026-05-14.
 
 ## Scope
 
@@ -25,12 +26,9 @@ implementation:
   Wendelon application path with runtime filters enabled or disabled.
 - The full Phase 0 selective fixture has been run against that
   mock Wendelon path at 100K build rows x 100M probe rows.
-
-Production Wendelon scan-engine application remains Wendelon-side
-follow-up work. The ADR 006 selective `>=50%` bytes-movement target
-is demonstrated at full Phase 0 scale with Toron's mock Wendelon
-path below, but is not claimed here for the production Wendelon
-scan path.
+- ADR 013 implements the production Wendelon table-query
+  application path and adds a CI-reachable production Wendelon row
+  showing row/byte reduction with digest-equal post-join output.
 
 ## Verification
 
@@ -43,6 +41,7 @@ cargo test -p toron
 cargo test -p toron --test runtime_filter_pushdown_test
 cargo test -p toron runtime_filter
 cargo test -p wendelon runtime_filter
+cargo test -p toron --test wendelon_storage_execution_test wendelon_table_query_runtime_filter_reduces_boundary_rows -- --nocapture
 cargo test --workspace
 cargo bench -p toron --bench distributed_inner_equi_join --no-run
 cargo bench -p toron --bench distributed_inner_equi_join -- --quick --distributed-inner-equi-join-only --strategy=hash --runtime-filter=enabled,disabled
@@ -64,6 +63,11 @@ Results:
 - `cargo test -p toron runtime_filter`: 13 filtered tests passed.
 - `cargo test -p wendelon runtime_filter`: 2 shared-schema
   runtime-filter tests passed.
+- `wendelon_table_query_runtime_filter_reduces_boundary_rows`:
+  production Wendelon table-query row reduced storage-boundary
+  output from 1024 rows / 13,000 bytes to 2 rows / 712 bytes,
+  preserving post-join digest
+  `5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38`.
 - `cargo test --workspace`: passed across Toron, Wendelon, and
   Wendelon client crates.
 - `distributed_inner_equi_join --no-run`: bench target compiled.
@@ -129,8 +133,9 @@ Full Phase 0 selective mock-Wendelon evidence:
   probe rows, approximately 1.01%.
 
 The full 100M-row probe fixture from the Phase 0 design was run
-with Toron's mock Wendelon application path. Production Wendelon
-scan-engine application remains a separate follow-up.
+with Toron's mock Wendelon application path. The ADR 013 production
+Wendelon row below closes the separate scan-engine application
+evidence gap.
 
 ## Quick Selective Mock-Wendelon Bench
 
@@ -217,8 +222,9 @@ Readout:
   by 97.0% versus filter-disabled / Wendelon-disabled.
 - The bytes-movement cluster drops from 575.000 ms to 13.574 ms,
   a 97.6% reduction on this 100K x 10M selective fixture.
-- This is Toron harness evidence only. Production Wendelon-side
-  row-level application still needs its own follow-up evidence.
+- This is Toron harness evidence only. The ADR 013 production
+  Wendelon row below records the production row-level application
+  evidence separately.
 
 ## Full Phase 0 Selective Mock-Wendelon Row
 
@@ -252,28 +258,45 @@ Readout:
   reduction in this local harness.
 - Implied false-positive rate is 997,130 / 99,000,000 =
   approximately 1.01%, matching the Phase 0 calibration target.
-- This is Toron harness evidence only. Production Wendelon-side
-  row-level application still needs its own follow-up evidence.
+- This is Toron harness evidence only. The ADR 013 production
+  Wendelon row below records the production row-level application
+  evidence separately.
 
-## Required Production Rows
+## ADR 013 Production Wendelon Row
 
-The following evidence is still required before claiming production
-Wendelon-enabled completion:
+Command:
 
-- Production Wendelon scan-engine row-level application.
-- Production Wendelon-enabled selective row, filter-enabled and
-  filter-disabled.
-- Profiler note. `samply` was attempted, but this host blocks
-  non-root sampling with `/proc/sys/kernel/perf_event_paranoid = 4`;
-  no profile was recorded.
+```text
+cargo test -p toron --test wendelon_storage_execution_test wendelon_table_query_runtime_filter_reduces_boundary_rows -- --nocapture
+```
+
+Row:
+
+```text
+adr013_production_wendelon_runtime_filter rows_off=1024 rows_on=2 bytes_off=13000 bytes_on=712 digest=5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38
+```
+
+Readout:
+
+- The fixture runs an in-process Wendelon node through production
+  table-query runtime-filter transport and scan-engine application.
+- The filter-off Wendelon table-query returns 1024 probe rows and
+  13,000 IPC bytes across the storage boundary.
+- The filter-on Wendelon table-query returns 2 probe rows and 712
+  IPC bytes across the storage boundary.
+- A local build-key join over both outputs produces the same
+  canonical digest:
+  `5dc135c485e4ce64e66b4e95c4b095cb138de15ba439165cc350f83ca3199f38`.
+- Boundary rows drop by 99.8%; boundary bytes drop by 94.5% on
+  this CI-scale production Wendelon fixture.
 
 ## Conditional Readout
 
 Current result is **Toron-side implementation complete with
-Toron-side promotion-bar evidence captured and full Phase 0
-selective mock-Wendelon evidence captured; production
-Wendelon-enabled selective evidence remains incomplete**.
+Toron-side promotion-bar evidence captured, full Phase 0 selective
+mock-Wendelon evidence captured, and ADR 013 production Wendelon
+application evidence captured**.
 
-The missing evidence is not a correctness blocker for the Toron
-contract. It is the production Wendelon-side application package
-and optional exact-scale selective benchmark package.
+The exact-scale production Wendelon benchmark remains a possible
+future perf run, but the production application path and selective
+row/byte reduction gate are no longer pending.

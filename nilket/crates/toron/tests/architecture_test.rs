@@ -139,6 +139,21 @@ fn scan_request_requires_descriptor_pin() {
 }
 
 #[test]
+fn wendelon_storage_scan_forwards_runtime_filter_to_table_query() {
+	let source = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let impl_block = source
+		.split("impl StorageScan for WendelonStorageScan")
+		.nth(1)
+		.and_then(|rest| rest.split("fn append_projection").next())
+		.expect("WendelonStorageScan StorageScan impl block");
+
+	assert!(impl_block.contains(".table_query_with_runtime_filter("));
+	assert!(impl_block.contains("request.runtime_filter.clone()"));
+	assert!(!impl_block.contains(".table_query("));
+}
+
+#[test]
 fn scan_stream_collection_localized() {
 	let manifest_dir = manifest_dir();
 	let try_collect_marker = ["try", "_", "collect"].concat();

@@ -35,8 +35,8 @@ along with the forward-sequence rewrite.
   `framework_overhead_ms` moved proportionally, placing ADR 006 in
   the operator-adjacent band rather than runtime-plumbing
   investigation.
-- **ADR 006 — Runtime Filter Pushdown.** Promoted; Toron-side
-  implementation complete. Bench evidence at
+- **ADR 006 — Runtime Filter Pushdown.** Promoted +
+  implemented. Bench evidence at
   `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
   Cross-ring optimization contract: advisory Bloom runtime
   filters for hash-partitioned inner equi-joins via two-wave
@@ -47,9 +47,8 @@ along with the forward-sequence rewrite.
   attacks the cluster at the source (Wendelon filters probe
   rows before they hit the wire) rather than moving the same
   bytes faster. Advisory invariant makes split-shipment safe:
-  Toron-side evidence is captured; production Wendelon-enabled
-  end-to-end evidence lands in a bench-results update once
-  Wendelon-side application ships.
+  Toron-side evidence and ADR 013's production Wendelon-enabled
+  selective row are captured.
 - **ADR 007 — Rune Sandbox Enforcement.** Promoted +
   implemented. Process-internal safety contract:
   closes the M7-recorded launch blocker (sandbox fuel disabled,
@@ -119,8 +118,8 @@ along with the forward-sequence rewrite.
   Selected as the strongest launch-driven
   candidate post-ADR-008 — the substrate had just shipped and the
   scope was fully determined, against multi-tenant governance
-  (explicitly post-V1) and wire efficiency (now gated on ADR 013's
-  pending Wendelon row).
+  (explicitly post-V1) and wire efficiency (now resolved by ADR
+  013's production Wendelon row).
 - **ADR 010 — Top-Level SQL Clause Accounting and Deterministic
   Result Ordering.** Promoted + implemented.
   Frontend-planner surface extension plus a new operator, closing
@@ -207,15 +206,14 @@ along with the forward-sequence rewrite.
   convergence (Claude / Codex / Gemini) across five iteration
   rounds.
 - **ADR 013 — Runtime Filter Application at the Storage-Scan
-  Boundary.** Promoted; implementation pending. Cross-ring
+  Boundary.** Promoted + implemented. Cross-ring
   storage-scan application contract making ADR 006 runtime filters
   live in production scans: `InMemoryStorageScan` applies usable
   descriptors locally, `WendelonStorageScan` forwards them through
   table query, and Wendelon applies them at projected-read
   materialization before PBC projection. Advisory-drop remains
-  byte-identical to filter-disabled execution. The implementation
-  updates ADR 006's bench artifact with the deferred production
-  Wendelon selective row.
+  byte-identical to filter-disabled execution. ADR 006's bench
+  artifact now carries the production Wendelon selective row.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -329,8 +327,9 @@ The feature half wires the narrow single-table `GROUP BY` SQL
 surface to the existing grouped aggregate path through one
 planner-emitted group-keyed `Exchange`.
 
-The ADR 006 Wendelon-side row-level application is now owned by
-ADR 013's pending implementation.
+ADR 013 landed ADR 006's Wendelon-side row-level application;
+the production selective row is recorded in the ADR 006 bench
+artifact.
 
 ### Completed: ADR 012 promotion and implementation
 
@@ -352,17 +351,18 @@ ADR 013's contract is pinned at
 `plans/adr/013_runtime_filter_application_at_the_storage_scan_boundary.md`;
 the impl plan lives at
 `plans/impl/013_runtime_filter_application_at_the_storage_scan_boundary.md`.
-Implementation is pending. It makes existing ADR 006 runtime
-filters live at the production storage-scan boundary and will
-append the deferred Wendelon selective row to
+Implementation is complete. It makes existing ADR 006 runtime
+filters live at the production storage-scan boundary and appended
+the deferred Wendelon selective row to
 `plans/impl/006_runtime_filter_pushdown_bench_results.md`.
 
 ### ADR 014 candidates
 
 The standing candidate list rotates forward with current context:
-ADR 013 is selected and promoted as a plan, while Candidates B and
-C remain gated on ADR 013 implementation evidence and the ADR 006
-production Wendelon row.
+ADR 013 is implemented. Candidate B remains a fallback only if
+later production-scale wire evidence misses launch needs; Candidate
+C is now ungated by the production Wendelon row and can promote
+when a narrow runtime-filter extension wins the next topic pass.
 
 ADR 011 follow-ons remain explicit candidates rather than
 accidental scope: `GROUP BY` over joins, `GROUP BY ... ORDER BY`,
@@ -393,14 +393,14 @@ cycle).
 
 **Scale boundary:** transport.
 
-The compute-ring fallback if ADR 013's Wendelon-enabled selective
-bench row misses ADR 006's target or non-selective workloads
-dominate post-V1. Batch-size policy, Arrow IPC encode/decode
+The compute-ring fallback if later production-scale Wendelon
+runtime-filter evidence misses launch needs or non-selective
+workloads dominate post-V1. Batch-size policy, Arrow IPC encode/decode
 tuning, `WireEnvelope` overhead audit, output-publish path
 streamlining. No cross-ring dependency.
 
-Promotes if ADR 013 implementation evidence shows the selective
-runtime-filter row misses its target or if non-selective workloads
+Promotes if production-scale evidence shows the selective
+runtime-filter path misses its target or if non-selective workloads
 dominate the V1 launch shape. Lower leverage than ADR 006 on
 selective joins (moves bytes faster vs avoids moving rejected
 bytes), but uniform across selective and non-selective workloads.
@@ -411,8 +411,8 @@ Phase 0 sub-bucket selection discipline preserved if C promotes
 
 **Scale boundary:** cross-ring (continuation of ADR 006).
 
-A cluster of follow-on work to ADR 006 and ADR 013, **gated on
-production Wendelon-side row landing**:
+A cluster of follow-on work to ADR 006 and ADR 013, now unblocked by
+production Wendelon-side row landing:
 
 - **Exact `InList` filters** for small build sets. Qualitatively
   precise (zero false positives), useful for small dimension
@@ -435,9 +435,8 @@ production Wendelon-side row landing**:
   `Date`, `Timestamp`, or `Decimal`, filter eligibility extends
   with it.
 
-Each sub-item is plausibly its own narrow ADR. Held as topic
-cards, not selected, until ADR 013 implementation lands the
-production Wendelon row.
+Each sub-item is plausibly its own narrow ADR. Held as topic cards
+until one extension wins the next planning pass.
 
 #### Candidate D — Worker-side Rune UDF execution
 
@@ -706,9 +705,9 @@ labeled by ADR cycle.
 - **Candidate B (cross-process wire efficiency) as ADR 009.**
   Considered; rejected as premature. B is the compute-ring
   fallback whose promotion condition ("ADR 006's selective bench
-  misses") cannot be evaluated until the pending Wendelon row
-  lands. Selecting B now front-runs that evidence; it reopens
-  cleanly if the row misses.
+  misses") could not be evaluated until the Wendelon row landed.
+  Selecting B then would have front-run that evidence; it now
+  reopens only if later production-scale evidence misses.
 - **General subquery execution engine.** Considered; rejected.
   ADR 009 is a narrow SQL-AST rewrite, not a subquery IR node +
   executor. The general engine is unbounded scope; the rewrite
@@ -1277,8 +1276,8 @@ sections; this list is the cross-cutting set.
   is V1.x once stats exist.
 - **Don't couple ADR 006 promotion to lockstep Wendelon-side
   landing.** Advisory invariant makes split-shipment safe.
-  Toron-side ships first; Wendelon-enabled bench row arrives
-  in a follow-up update.
+  Toron-side shipped first; the Wendelon-enabled production row
+  arrived through ADR 013.
 - **Don't extend ADR 006 filter eligibility to outer / semi /
   anti / sort-merge / non-equi / broadcast joins.** Each is
   its own future ADR (V1.x). Inner + hash-partitioned only in
