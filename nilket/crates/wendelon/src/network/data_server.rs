@@ -88,16 +88,18 @@ use crate::schema::{
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
 	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	RowCount, RowIdentityPolicy, STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog,
-	SecondaryIndexDescriptor, SecondaryIndexState, SlabId, StreamFinalizationRequestMeta,
-	TABLE_WRITE_MAX_ROWS, TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
-	TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptor, TableWriteAdmission,
-	TableWriteRequestMeta, TableWriteResponseMeta, TableWriteValidationError, TenantId,
-	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId, cdc_cursor_in_catchup_window,
-	cdc_event_batch, cdc_tombstone_event_batch, cdc_visible_rows_digest,
-	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
-	encode_table_write_row_count, migration_record_schema, pbc,
-	query_request_stats_pruning_enabled, read_key_schema, table_spread_prefix_ranges,
+	RowCount, RowIdentityPolicy, RuntimeFilterDescriptor, RuntimeFilterDropReason,
+	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
+	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_WRITE_MAX_ROWS,
+	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
+	TableReplicaWriteMeta, TableSchemaDescriptor, TableWriteAdmission, TableWriteRequestMeta,
+	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, WriterNodeId, build_runtime_filter_mask,
+	build_runtime_filter_mask_for_batch, cdc_cursor_in_catchup_window, cdc_event_batch,
+	cdc_tombstone_event_batch, cdc_visible_rows_digest, column_projection_predicate_ranges,
+	column_projection_prefix_ranges, encode_aggregate_state, encode_table_write_row_count,
+	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
+	runtime_filter_key_type, table_spread_prefix_ranges, validate_runtime_filter_descriptor,
 	validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
@@ -3700,7 +3702,7 @@ impl WendelonDataServer {
 		frame: HrftFrame,
 	) -> std::io::Result<HrftFrame> {
 		metrics().data_ring_query_requests_total.inc();
-		let (meta, bytecode) = self.decode_table_query_request_frame(&frame)?;
+		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
 		let audit_meta = table_query_as_range_query(&meta);
 		let span = tracing::info_span!(
 			"data_ring.table_query.request",
@@ -3712,7 +3714,7 @@ impl WendelonDataServer {
 			consistency = meta.consistency.0,
 		);
 		let plan = match self
-			.prepare_table_query_execution_plan_with_migration(&meta, &bytecode)
+			.prepare_table_query_execution_plan_with_migration(&meta, &bytecode, runtime_filter)
 			.instrument(span)
 			.await
 		{
@@ -3879,7 +3881,7 @@ impl WendelonDataServer {
 	fn decode_table_query_request_frame(
 		&self,
 		frame: &HrftFrame,
-	) -> std::io::Result<(TableQueryRequestMeta, Vec<u8>)> {
+	) -> std::io::Result<(TableQueryRequestMeta, Vec<u8>, DecodedRuntimeFilter)> {
 		if frame.meta.len() < std::mem::size_of::<TableQueryRequestMeta>() {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
@@ -3888,25 +3890,60 @@ impl WendelonDataServer {
 		}
 		let meta: TableQueryRequestMeta =
 			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableQueryRequestMeta>()]);
-		let bytecode = if meta.bytecode_len == 0 {
-			Vec::new()
+		let bytecode_len = meta.bytecode_len as usize;
+		let runtime_filter_len = meta.runtime_filter_len as usize;
+		let declared_trailing_len =
+			bytecode_len
+				.checked_add(runtime_filter_len)
+				.ok_or_else(|| {
+					Error::new(
+						ErrorKind::InvalidData,
+						"TABLE_QUERY_REQ declared trailing lengths overflow usize",
+					)
+				})?;
+		let trailing = if declared_trailing_len == 0 {
+			None
 		} else {
-			let trailing = frame.trailing.as_ref().ok_or_else(|| {
+			Some(frame.trailing.as_ref().ok_or_else(|| {
 				Error::new(
 					ErrorKind::InvalidData,
-					"TABLE_QUERY_REQ declared bytecode_len > 0 but trailing is absent",
+					"TABLE_QUERY_REQ declared trailing bytes but trailing is absent",
+				)
+			})?)
+		};
+		if let Some(trailing) = trailing
+			&& trailing.len() < declared_trailing_len
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"TABLE_QUERY_REQ trailing is shorter than declared bytecode/runtime_filter lengths",
+			));
+		}
+		let bytecode = if bytecode_len == 0 {
+			Vec::new()
+		} else {
+			let trailing = trailing.expect("declared trailing bytes are present");
+			trailing[..bytecode_len].to_vec()
+		};
+		let runtime_filter = if runtime_filter_len == 0 {
+			DecodedRuntimeFilter::Absent
+		} else {
+			let trailing = trailing.expect("declared trailing bytes are present");
+			let start = bytecode_len;
+			let end = start.checked_add(runtime_filter_len).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"TABLE_QUERY_REQ runtime filter range overflows usize",
 				)
 			})?;
-			let want = meta.bytecode_len as usize;
-			if trailing.len() < want {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"TABLE_QUERY_REQ trailing is shorter than declared bytecode_len",
-				));
+			match postcard::from_bytes::<RuntimeFilterDescriptor>(&trailing[start..end]) {
+				Ok(descriptor) => DecodedRuntimeFilter::Decoded(descriptor),
+				Err(_) => DecodedRuntimeFilter::DroppedBeforePlanning(
+					RuntimeFilterDropReason::DecodeFailed,
+				),
 			}
-			trailing[..want].to_vec()
 		};
-		Ok((meta, bytecode))
+		Ok((meta, bytecode, runtime_filter))
 	}
 
 	fn decode_aggregate_request_frame(
@@ -5757,6 +5794,7 @@ impl WendelonDataServer {
 		&self,
 		meta: &TableQueryRequestMeta,
 		bytecode: &[u8],
+		runtime_filter: DecodedRuntimeFilter,
 	) -> std::io::Result<QueryExecutionPlan> {
 		let range_meta = table_query_as_range_query(meta);
 		let admission = self.admission_snapshot();
@@ -5876,8 +5914,8 @@ impl WendelonDataServer {
 			}
 		}
 
-		let user_column_count = match descriptor.arrow_schema() {
-			Ok(schema) => schema.fields().len(),
+		let schema = match descriptor.arrow_schema() {
+			Ok(schema) => schema,
 			Err(_) => {
 				return Ok(query_plan_error(
 					&range_meta,
@@ -5886,7 +5924,8 @@ impl WendelonDataServer {
 				));
 			}
 		};
-		let requirement = match analyze_pbc_column_requirement(&program, user_column_count) {
+		let user_column_count = schema.fields().len();
+		let mut requirement = match analyze_pbc_column_requirement(&program, user_column_count) {
 			Ok(requirement) => requirement,
 			Err(_) => {
 				return Ok(query_plan_error(
@@ -5896,10 +5935,18 @@ impl WendelonDataServer {
 				));
 			}
 		};
+		let runtime_filter = prepare_runtime_filter_application(
+			&runtime_filter,
+			&descriptor,
+			&schema,
+			&mut requirement,
+			user_column_count,
+		);
 
 		let projected_execution = QueryProjectedExecution::Pbc {
 			requirement,
 			user_column_count,
+			runtime_filter,
 		};
 		if let Some(access_plan) = secondary_index_access_plan.as_ref() {
 			match plan_table_query_execution_by_secondary_index(
@@ -10349,6 +10396,18 @@ impl DataRing for WendelonDataServer {
 // ============================================================
 
 #[derive(Clone, Debug)]
+enum DecodedRuntimeFilter {
+	Absent,
+	Decoded(RuntimeFilterDescriptor),
+	DroppedBeforePlanning(RuntimeFilterDropReason),
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeFilterApplication {
+	descriptor: RuntimeFilterDescriptor,
+}
+
+#[derive(Clone, Debug)]
 struct QueryExecutionPlan {
 	response: QueryResponseMeta,
 	batches: Vec<RecordBatch>,
@@ -10630,6 +10689,7 @@ enum QueryProjectedExecution {
 	Pbc {
 		requirement: ColumnFetchRequirement,
 		user_column_count: usize,
+		runtime_filter: Option<RuntimeFilterApplication>,
 	},
 	Aggregate {
 		requirement: ColumnFetchRequirement,
@@ -10647,6 +10707,129 @@ impl QueryProjectedExecution {
 			}
 		}
 	}
+}
+
+fn runtime_filter_for_projected_execution(
+	projected_execution: &QueryProjectedExecution,
+) -> Option<&RuntimeFilterApplication> {
+	match projected_execution {
+		QueryProjectedExecution::Pbc { runtime_filter, .. } => runtime_filter.as_ref(),
+		QueryProjectedExecution::Disabled | QueryProjectedExecution::Aggregate { .. } => None,
+	}
+}
+
+fn prepare_runtime_filter_application(
+	decoded: &DecodedRuntimeFilter,
+	descriptor: &TableSchemaDescriptor,
+	schema: &Schema,
+	requirement: &mut ColumnFetchRequirement,
+	user_column_count: usize,
+) -> Option<RuntimeFilterApplication> {
+	match decoded {
+		DecodedRuntimeFilter::Absent => None,
+		DecodedRuntimeFilter::DroppedBeforePlanning(reason) => {
+			metrics().observe_storage_runtime_filter_present();
+			metrics().observe_storage_runtime_filter_advisory_dropped(reason.as_str());
+			None
+		}
+		DecodedRuntimeFilter::Decoded(runtime_filter) => {
+			metrics().observe_storage_runtime_filter_present();
+			if let Err(reason) = validate_runtime_filter_descriptor(
+				runtime_filter,
+				schema,
+				descriptor.physical_descriptor_fingerprint,
+			) {
+				metrics().observe_storage_runtime_filter_advisory_dropped(reason.as_str());
+				return None;
+			}
+			for ordinal in &runtime_filter.probe_key_columns {
+				let Ok(index) = usize::try_from(*ordinal) else {
+					metrics().observe_storage_runtime_filter_advisory_dropped(
+						RuntimeFilterDropReason::MaterializationIncompatible.as_str(),
+					);
+					return None;
+				};
+				if index >= user_column_count {
+					metrics().observe_storage_runtime_filter_advisory_dropped(
+						RuntimeFilterDropReason::MaterializationIncompatible.as_str(),
+					);
+					return None;
+				}
+			}
+			for ordinal in &runtime_filter.probe_key_columns {
+				requirement.predicate_columns.insert(*ordinal);
+			}
+			metrics().observe_storage_runtime_filter_applied();
+			Some(RuntimeFilterApplication {
+				descriptor: runtime_filter.clone(),
+			})
+		}
+	}
+}
+
+fn runtime_filter_mask_for_projected(
+	projected: &ProjectedRecordBatch,
+	descriptor: &RuntimeFilterDescriptor,
+) -> Result<arrow::array::BooleanArray, RuntimeFilterDropReason> {
+	let mut key_arrays = Vec::with_capacity(descriptor.probe_key_columns.len());
+	for (position, ordinal) in descriptor.probe_key_columns.iter().enumerate() {
+		let physical = projected
+			.physical_for(*ordinal)
+			.ok_or(RuntimeFilterDropReason::MaterializationIncompatible)?;
+		let array = projected
+			.batch
+			.columns()
+			.get(physical)
+			.ok_or(RuntimeFilterDropReason::MaterializationIncompatible)?;
+		if runtime_filter_key_type(array.data_type()) != Some(descriptor.key_types[position]) {
+			return Err(RuntimeFilterDropReason::UnsupportedShape);
+		}
+		key_arrays.push(array.as_ref());
+	}
+	build_runtime_filter_mask(descriptor, &key_arrays)
+}
+
+fn apply_runtime_filter_to_projected(
+	projected: ProjectedRecordBatch,
+	application: &RuntimeFilterApplication,
+) -> std::io::Result<ProjectedRecordBatch> {
+	let input_rows = projected.batch.num_rows();
+	let mask = match runtime_filter_mask_for_projected(&projected, &application.descriptor) {
+		Ok(mask) => mask,
+		Err(reason) => {
+			metrics().observe_storage_runtime_filter_advisory_dropped(reason.as_str());
+			return Ok(projected);
+		}
+	};
+	let row_indices = (0..mask.len())
+		.filter(|row| mask.value(*row))
+		.collect::<Vec<_>>();
+	let filtered = projected.take_rows(&row_indices)?;
+	metrics()
+		.observe_storage_runtime_filter_rows(input_rows as u64, filtered.batch.num_rows() as u64);
+	Ok(filtered)
+}
+
+fn apply_runtime_filter_to_batch(
+	batch: RecordBatch,
+	application: &RuntimeFilterApplication,
+) -> std::io::Result<RecordBatch> {
+	let input_rows = batch.num_rows();
+	let mask = match build_runtime_filter_mask_for_batch(&batch, &application.descriptor) {
+		Ok(mask) => mask,
+		Err(reason) => {
+			metrics().observe_storage_runtime_filter_advisory_dropped(reason.as_str());
+			return Ok(batch);
+		}
+	};
+	let filtered = arrow::compute::filter_record_batch(&batch, &mask).map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!("runtime filter batch filter failed: {err}"),
+		)
+	})?;
+	metrics().observe_storage_runtime_filter_rows(input_rows as u64, filtered.num_rows() as u64);
+	Ok(filtered)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -10814,7 +10997,7 @@ async fn read_projected_query_location(
 			encoding_materialize_audit,
 		}));
 	}
-	let projected = materialize_projected_location_batch(
+	let mut projected = materialize_projected_location_batch(
 		projected_read.projected,
 		projected_read.projected_first_record_row_index,
 		location.record_row_index,
@@ -10822,11 +11005,15 @@ async fn read_projected_query_location(
 	if !projected_descriptor_match(descriptor, &projected)? {
 		return Ok(None);
 	}
+	if let Some(runtime_filter) = runtime_filter_for_projected_execution(projected_execution) {
+		projected = apply_runtime_filter_to_projected(projected, runtime_filter)?;
+	}
 	match projected_execution {
 		QueryProjectedExecution::Disabled => Ok(None),
 		QueryProjectedExecution::Pbc {
 			requirement,
 			user_column_count,
+			..
 		} => {
 			execute_pbc_projected_record_batch(&projected, program, requirement, *user_column_count)
 				.map(|batch| {
@@ -12043,7 +12230,7 @@ async fn read_secondary_index_query_locations_one_by_one(
 }
 
 fn execute_secondary_index_projected_row(
-	projected: ProjectedRecordBatch,
+	mut projected: ProjectedRecordBatch,
 	program: &pbc::Program,
 	projected_execution: &QueryProjectedExecution,
 ) -> std::io::Result<Option<ProjectedQueryLocationRead>> {
@@ -12051,7 +12238,11 @@ fn execute_secondary_index_projected_row(
 		QueryProjectedExecution::Pbc {
 			requirement,
 			user_column_count,
+			runtime_filter,
 		} => {
+			if let Some(runtime_filter) = runtime_filter {
+				projected = apply_runtime_filter_to_projected(projected, runtime_filter)?;
+			}
 			execute_pbc_projected_record_batch(&projected, program, requirement, *user_column_count)
 				.map(|batch| {
 					Some(ProjectedQueryLocationRead {
@@ -12085,8 +12276,11 @@ async fn read_secondary_index_query_location(
 	}
 	let bytes = slab.read(row.record_location).await?;
 	let storage_batch = decode_batch(&bytes)?;
-	let batch =
+	let mut batch =
 		materialize_record_location_batch(&storage_batch, row.record_location.record_row_index)?;
+	if let Some(runtime_filter) = runtime_filter_for_projected_execution(projected_execution) {
+		batch = apply_runtime_filter_to_batch(batch, runtime_filter)?;
+	}
 	match pbc::execute_program(program, &batch) {
 		Ok(batch) => Ok(Some(ProjectedQueryLocationRead {
 			batch,
@@ -12126,7 +12320,7 @@ async fn read_table_query_location(
 	} else {
 		None
 	};
-	let batch = materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+	let mut batch = materialize_record_location_batch(&storage_batch, location.record_row_index)?;
 	if was_multirow {
 		metrics().observe_storage_multirow_decode(
 			batch.num_rows() as u64,
@@ -12148,6 +12342,9 @@ async fn read_table_query_location(
 		&batch,
 	)? {
 		return Ok(None);
+	}
+	if let Some(runtime_filter) = runtime_filter_for_projected_execution(projected_execution) {
+		batch = apply_runtime_filter_to_batch(batch, runtime_filter)?;
 	}
 	match pbc::execute_program(program, &batch) {
 		Ok(batch) => Ok(Some(ProjectedQueryLocationRead {
@@ -12343,7 +12540,7 @@ async fn plan_query_execution_for_ranges_with_program(
 			} else {
 				None
 			};
-			let batch =
+			let mut batch =
 				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
 			if was_multirow {
 				metrics().observe_storage_multirow_decode(
@@ -12373,6 +12570,14 @@ async fn plan_query_execution_for_ranges_with_program(
 					stored_table_object_id,
 					&batch,
 				)? {
+					continue;
+				}
+			}
+			if let Some(runtime_filter) =
+				runtime_filter_for_projected_execution(&projected_execution)
+			{
+				batch = apply_runtime_filter_to_batch(batch, runtime_filter)?;
+				if batch.num_rows() == 0 {
 					continue;
 				}
 			}
@@ -15151,7 +15356,7 @@ mod tests {
 			consistency: Consistency::SERIALIZABLE,
 			_pad: [0; 7],
 			bytecode_len: bytecode_len as u32,
-			_pad2: [0; 4],
+			runtime_filter_len: 0,
 			as_of_hlc,
 		}
 	}
@@ -17509,6 +17714,7 @@ mod tests {
 			QueryProjectedExecution::Pbc {
 				requirement,
 				user_column_count,
+				runtime_filter: None,
 			},
 			None,
 		)
@@ -17931,6 +18137,7 @@ mod tests {
 			QueryProjectedExecution::Pbc {
 				requirement,
 				user_column_count,
+				runtime_filter: None,
 			},
 			None,
 		)
@@ -19048,7 +19255,11 @@ mod tests {
 			table_query_meta_for_test(&descriptor, delete_resp.write.commit_hlc, pk_program.len());
 		let deleted_query = node
 			.data_server
-			.prepare_table_query_execution_plan_with_migration(&deleted_query_meta, &pk_program)
+			.prepare_table_query_execution_plan_with_migration(
+				&deleted_query_meta,
+				&pk_program,
+				DecodedRuntimeFilter::Absent,
+			)
 			.await
 			.unwrap();
 		assert_eq!(deleted_query.response.status, ReadStatus::KEY_NOT_FOUND);
@@ -19087,7 +19298,11 @@ mod tests {
 		);
 		let latest_query = node
 			.data_server
-			.prepare_table_query_execution_plan_with_migration(&latest_query_meta, &pk_program)
+			.prepare_table_query_execution_plan_with_migration(
+				&latest_query_meta,
+				&pk_program,
+				DecodedRuntimeFilter::Absent,
+			)
 			.await
 			.unwrap();
 		assert_eq!(latest_query.response.status, ReadStatus::OK);
@@ -19160,7 +19375,11 @@ mod tests {
 		let query_meta = table_query_meta_for_test(&descriptor, hlc(0, 0, 0), program.len());
 		let building_plan = node
 			.data_server
-			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.prepare_table_query_execution_plan_with_migration(
+				&query_meta,
+				&program,
+				DecodedRuntimeFilter::Absent,
+			)
 			.await
 			.unwrap();
 		assert_eq!(building_plan.response.status, ReadStatus::KEY_NOT_FOUND);
@@ -19174,7 +19393,11 @@ mod tests {
 			.unwrap();
 		let ready_plan = node
 			.data_server
-			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.prepare_table_query_execution_plan_with_migration(
+				&query_meta,
+				&program,
+				DecodedRuntimeFilter::Absent,
+			)
 			.await
 			.unwrap();
 		assert_eq!(ready_plan.response.status, ReadStatus::KEY_NOT_FOUND);
@@ -19447,7 +19670,11 @@ mod tests {
 			table_query_meta_for_test(&descriptor, write_resp.write.commit_hlc, program.len());
 		let plan = node
 			.data_server
-			.prepare_table_query_execution_plan_with_migration(&query_meta, &program)
+			.prepare_table_query_execution_plan_with_migration(
+				&query_meta,
+				&program,
+				DecodedRuntimeFilter::Absent,
+			)
 			.await
 			.unwrap();
 		assert_eq!(plan.response.status, ReadStatus::OK);
@@ -20144,7 +20371,7 @@ mod tests {
 			consistency: Consistency::SERIALIZABLE,
 			_pad: [0; 7],
 			bytecode_len: bytecode.len() as u32,
-			_pad2: [0; 4],
+			runtime_filter_len: 0,
 			as_of_hlc: hlc(0, 0, 0),
 		};
 		let mut bad_query_meta = query_meta;

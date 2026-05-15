@@ -4370,6 +4370,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "twox-hash 2.1.2",
  "unicode-normalization",
  "uuid",
  "wendelon-client",
@@ -4381,6 +4382,7 @@ name = "wendelon-client"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "postcard",
  "thiserror 2.0.18",
  "tokio",
  "uuid",

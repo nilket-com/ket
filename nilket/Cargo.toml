@@ -8,6 +8,7 @@ resolver = "3"
 [workspace.dependencies]
 arrow = { version = "58.3.0", features = ["ipc_compression"] }
 arrow-schema = { version = "58.3.0", features = ["serde"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
 tokio = { version = "1.37", features = ["full"] }
 
 [profile.release]

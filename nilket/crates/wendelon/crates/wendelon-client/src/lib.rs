@@ -51,8 +51,8 @@ pub use wendelon::schema::{
 	CdcCursor, CdcRejectCode, CdcSubscribeBound, Consistency as ReadConsistency,
 	DurabilityLevel as DurabilityClass, LocalityPolicy, LogicalSchemaFingerprint, PbcRejectCode,
 	PhysicalDescriptorFingerprint, PrimaryKeyDescriptorV1, PrimaryKeyEncodingV1, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, StateDigest, TableObjectId, TableSchemaDescriptor,
-	TableSpreadLocalityDescriptorV1,
+	RuntimeFilterDescriptor, SchemaEvolutionPolicyV1, StateDigest, TableObjectId,
+	TableSchemaDescriptor, TableSpreadLocalityDescriptorV1,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -726,6 +726,18 @@ impl Client {
 		pbc: Vec<u8>,
 		options: TableQueryOptions,
 	) -> Result<StreamingQueryResult, ClientError> {
+		self.table_query_stream_with_runtime_filter(tenant_id, descriptor, pbc, None, options)
+			.await
+	}
+
+	pub async fn table_query_stream_with_runtime_filter(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		pbc: Vec<u8>,
+		runtime_filter: Option<RuntimeFilterDescriptor>,
+		options: TableQueryOptions,
+	) -> Result<StreamingQueryResult, ClientError> {
 		let expected_physical_descriptor_fingerprint = options
 			.physical_descriptor_fingerprint
 			.unwrap_or(descriptor.physical_descriptor_fingerprint);
@@ -742,6 +754,23 @@ impl Client {
 				"table query PBC bytecode exceeds u32 length",
 			)
 		})?;
+		let runtime_filter_len = match &runtime_filter {
+			Some(runtime_filter) => {
+				let encoded = postcard::to_allocvec(runtime_filter).map_err(|err| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						format!("table query runtime filter encode failed: {err}"),
+					)
+				})?;
+				u32::try_from(encoded.len()).map_err(|_| {
+					std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"table query runtime filter exceeds u32 length",
+					)
+				})?
+			}
+			None => 0,
+		};
 		let mut pad = [0; 7];
 		if !options.stats_pruning_enabled {
 			pad[0] |= QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING;
@@ -758,11 +787,12 @@ impl Client {
 				consistency: options.consistency,
 				_pad: pad,
 				bytecode_len,
-				_pad2: [0; 4],
+				runtime_filter_len,
 				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 			},
 			descriptor: descriptor.clone(),
 			pbc,
+			runtime_filter,
 		};
 		match self.inner.table_query(request).await {
 			Ok(result) => Ok(result),
@@ -785,6 +815,35 @@ impl Client {
 	) -> Result<QueryResult, ClientError> {
 		let stream = self
 			.table_query_stream(tenant_id, descriptor, pbc, options)
+			.await?;
+		let epoch = stream.epoch;
+		let value_hlc = stream.value_hlc;
+		let rows = stream.rows;
+		let batches = stream.collect_all().await?;
+		Ok(QueryResult {
+			epoch,
+			value_hlc,
+			rows,
+			batches,
+		})
+	}
+
+	pub async fn table_query_with_runtime_filter(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		pbc: Vec<u8>,
+		runtime_filter: Option<RuntimeFilterDescriptor>,
+		options: TableQueryOptions,
+	) -> Result<QueryResult, ClientError> {
+		let stream = self
+			.table_query_stream_with_runtime_filter(
+				tenant_id,
+				descriptor,
+				pbc,
+				runtime_filter,
+				options,
+			)
 			.await?;
 		let epoch = stream.epoch;
 		let value_hlc = stream.value_hlc;

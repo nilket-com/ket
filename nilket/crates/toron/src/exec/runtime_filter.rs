@@ -1,23 +1,21 @@
 use std::collections::HashSet;
 
-use arrow::array::{
-	Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, UInt8Array,
-	UInt16Array, UInt32Array, UInt64Array,
-};
+use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
-use twox_hash::XxHash3_64;
+#[cfg(test)]
+use wendelon::schema::runtime_filter_might_contain as schema_runtime_filter_might_contain;
 use wendelon::schema::{
-	PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, RuntimeFilterKeyType,
+	PhysicalDescriptorFingerprint, RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION,
+	RuntimeFilterDescriptor, RuntimeFilterDropReason, RuntimeFilterKeyType,
+	encode_runtime_filter_key, insert_runtime_filter_encoded_key,
+	runtime_filter_key_type as schema_runtime_filter_key_type,
 };
 
 use crate::distributed::task::RuntimeFilterFragment;
 use crate::error::ExecutionError;
 use crate::ir::{ColumnOrdinal, ExecutionExpr};
 
-pub(crate) const RUNTIME_FILTER_KEY_ENCODING_VERSION: u32 = 1;
-const RUNTIME_FILTER_HASH_SEED: u64 = 0x6e69_6c6b_6574_0006;
-const RUNTIME_FILTER_HASH_SEED_2: u64 = 0x9e37_79b9_7f4a_7c15;
 const TARGET_FP_RATE_BP: u16 = 100;
 const MIN_FILTER_BYTES: usize = 16 * 1024;
 const MAX_FILTER_BYTES: usize = 1024 * 1024;
@@ -36,7 +34,9 @@ pub(crate) fn build_runtime_filter_fragment(
 		for batch in batches {
 			let array = runtime_filter_key_array(batch, ordinal)?;
 			for row in 0..batch.num_rows() {
-				if let Some(encoded) = encode_runtime_filter_key(array, row)? {
+				if let Some(encoded) =
+					encode_runtime_filter_key(array.as_ref(), row).map_err(runtime_filter_error)?
+				{
 					insert_key(&mut payload, sizing.bit_count, sizing.hash_count, &encoded);
 				}
 			}
@@ -57,7 +57,9 @@ pub(crate) fn build_runtime_filter_fragment(
 	for batch in batches {
 		let array = runtime_filter_key_array(batch, ordinal)?;
 		for row in 0..batch.num_rows() {
-			if let Some(encoded) = encode_runtime_filter_key(array, row)? {
+			if let Some(encoded) =
+				encode_runtime_filter_key(array.as_ref(), row).map_err(runtime_filter_error)?
+			{
 				keys.insert(encoded);
 			}
 		}
@@ -111,16 +113,8 @@ pub(crate) fn runtime_filter_might_contain(
 	array: &ArrayRef,
 	row: usize,
 ) -> Result<bool, ExecutionError> {
-	let Some(encoded) = encode_runtime_filter_key(array, row)? else {
-		return Ok(false);
-	};
-	Ok(might_contain(
-		&descriptor.payload,
-		descriptor.bit_count,
-		descriptor.hash_count,
-		descriptor.hash_seed,
-		&encoded,
-	))
+	schema_runtime_filter_might_contain(descriptor, array.as_ref(), row)
+		.map_err(runtime_filter_error)
 }
 
 pub(crate) fn descriptor_from_fragment(
@@ -170,18 +164,7 @@ pub(crate) fn merge_fragments(
 }
 
 pub(crate) fn runtime_filter_key_type(data_type: &DataType) -> Option<RuntimeFilterKeyType> {
-	match data_type {
-		DataType::Int8 => Some(RuntimeFilterKeyType::Int8),
-		DataType::Int16 => Some(RuntimeFilterKeyType::Int16),
-		DataType::Int32 => Some(RuntimeFilterKeyType::Int32),
-		DataType::Int64 => Some(RuntimeFilterKeyType::Int64),
-		DataType::UInt8 => Some(RuntimeFilterKeyType::UInt8),
-		DataType::UInt16 => Some(RuntimeFilterKeyType::UInt16),
-		DataType::UInt32 => Some(RuntimeFilterKeyType::UInt32),
-		DataType::UInt64 => Some(RuntimeFilterKeyType::UInt64),
-		DataType::Utf8 => Some(RuntimeFilterKeyType::Utf8),
-		_ => None,
-	}
+	schema_runtime_filter_key_type(data_type)
 }
 
 pub(crate) fn single_supported_key(
@@ -229,130 +212,19 @@ fn cap_distinct_threshold() -> usize {
 }
 
 fn insert_key(payload: &mut [u8], bit_count: u32, hash_count: u8, encoded: &[u8]) {
-	for bit in bloom_bits(RUNTIME_FILTER_HASH_SEED, bit_count, hash_count, encoded) {
-		let byte = (bit / 8) as usize;
-		let mask = 1u8 << (bit % 8);
-		payload[byte] |= mask;
-	}
+	insert_runtime_filter_encoded_key(
+		payload,
+		bit_count,
+		hash_count,
+		RUNTIME_FILTER_HASH_SEED,
+		encoded,
+	);
 }
 
-#[cfg(test)]
-fn might_contain(
-	payload: &[u8],
-	bit_count: u32,
-	hash_count: u8,
-	hash_seed: u64,
-	encoded: &[u8],
-) -> bool {
-	if bit_count == 0 || hash_count == 0 || payload.is_empty() {
-		return true;
+fn runtime_filter_error(error: RuntimeFilterDropReason) -> ExecutionError {
+	ExecutionError::InvalidExpression {
+		message: format!("runtime filter {error}"),
 	}
-	bloom_bits(hash_seed, bit_count, hash_count, encoded).all(|bit| {
-		let byte = (bit / 8) as usize;
-		let mask = 1u8 << (bit % 8);
-		payload
-			.get(byte)
-			.map(|value| value & mask != 0)
-			.unwrap_or(true)
-	})
-}
-
-fn bloom_bits(
-	hash_seed: u64,
-	bit_count: u32,
-	hash_count: u8,
-	encoded: &[u8],
-) -> impl Iterator<Item = u32> {
-	let h1 = XxHash3_64::oneshot_with_seed(hash_seed, encoded);
-	let mut h2 = XxHash3_64::oneshot_with_seed(hash_seed ^ RUNTIME_FILTER_HASH_SEED_2, encoded);
-	if h2 == 0 {
-		h2 = RUNTIME_FILTER_HASH_SEED_2;
-	}
-	(0..u64::from(hash_count)).map(move |idx| {
-		let hash = h1.wrapping_add(idx.wrapping_mul(h2));
-		(hash % u64::from(bit_count)) as u32
-	})
-}
-
-fn encode_runtime_filter_key(
-	array: &ArrayRef,
-	row: usize,
-) -> Result<Option<Vec<u8>>, ExecutionError> {
-	if array.is_null(row) {
-		return Ok(None);
-	}
-
-	let mut encoded = Vec::new();
-	match array.data_type() {
-		DataType::Int8 => {
-			let values = array.as_any().downcast_ref::<Int8Array>().expect("int8");
-			encoded.push(2);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::Int16 => {
-			let values = array.as_any().downcast_ref::<Int16Array>().expect("int16");
-			encoded.push(3);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::Int32 => {
-			let values = array.as_any().downcast_ref::<Int32Array>().expect("int32");
-			encoded.push(4);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::Int64 => {
-			let values = array.as_any().downcast_ref::<Int64Array>().expect("int64");
-			encoded.push(5);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::UInt8 => {
-			let values = array.as_any().downcast_ref::<UInt8Array>().expect("uint8");
-			encoded.push(6);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::UInt16 => {
-			let values = array
-				.as_any()
-				.downcast_ref::<UInt16Array>()
-				.expect("uint16");
-			encoded.push(7);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::UInt32 => {
-			let values = array
-				.as_any()
-				.downcast_ref::<UInt32Array>()
-				.expect("uint32");
-			encoded.push(8);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::UInt64 => {
-			let values = array
-				.as_any()
-				.downcast_ref::<UInt64Array>()
-				.expect("uint64");
-			encoded.push(9);
-			encoded.extend_from_slice(&values.value(row).to_le_bytes());
-		}
-		DataType::Utf8 => {
-			let values = array.as_any().downcast_ref::<StringArray>().expect("utf8");
-			let value = values.value(row).as_bytes();
-			encoded.push(12);
-			encoded.extend_from_slice(
-				&u32::try_from(value.len())
-					.map_err(|_| ExecutionError::InvalidExpression {
-						message: "runtime filter string key is too large to encode".to_string(),
-					})?
-					.to_le_bytes(),
-			);
-			encoded.extend_from_slice(value);
-		}
-		data_type => {
-			return Err(ExecutionError::InvalidExpression {
-				message: format!("unsupported runtime filter key type: {data_type:?}"),
-			});
-		}
-	}
-	Ok(Some(encoded))
 }
 
 #[cfg(test)]
@@ -372,8 +244,8 @@ mod tests {
 		let int64 = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
 
 		assert_ne!(
-			encode_runtime_filter_key(&int32, 0).unwrap(),
-			encode_runtime_filter_key(&int64, 0).unwrap()
+			encode_runtime_filter_key(int32.as_ref(), 0).unwrap(),
+			encode_runtime_filter_key(int64.as_ref(), 0).unwrap()
 		);
 	}
 

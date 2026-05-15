@@ -234,7 +234,8 @@ pub struct TableQueryRequestMeta {
 	pub _pad: [u8; 7],                  //  7 bytes
 	/// Length of the PBC bytecode in the trailing section.
 	pub bytecode_len: u32, //  4 bytes
-	pub _pad2: [u8; 4],                 //  4 bytes
+	/// Length of the optional runtime-filter descriptor after the PBC bytecode.
+	pub runtime_filter_len: u32, //  4 bytes
 	/// Time-travel upper bound (zero = latest).
 	pub as_of_hlc: HybridTimestamp, // 16 bytes
 }
@@ -3919,7 +3920,7 @@ mod tests {
 	}
 
 	#[test]
-	fn table_query_wire_contract_carries_descriptor_pin_and_pbc_only() {
+	fn table_query_wire_contract_carries_descriptor_pin_pbc_and_runtime_filter_len() {
 		assert_eq!(std::mem::size_of::<TableQueryRequestMeta>(), 120);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, min_hlc), 0);
 		assert_eq!(
@@ -3945,7 +3946,10 @@ mod tests {
 			std::mem::offset_of!(TableQueryRequestMeta, bytecode_len),
 			96
 		);
-		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, _pad2), 100);
+		assert_eq!(
+			std::mem::offset_of!(TableQueryRequestMeta, runtime_filter_len),
+			100
+		);
 		assert_eq!(std::mem::offset_of!(TableQueryRequestMeta, as_of_hlc), 104);
 	}
 

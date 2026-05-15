@@ -1668,6 +1668,14 @@ impl StaticLabelCounters {
 }
 
 const ROW_GROUP_FETCH_STRATEGIES: &[&str] = &["row_group", "columnar_buffer", "whole_record"];
+const RUNTIME_FILTER_EVENTS: &[&str] = &["present", "applied"];
+const RUNTIME_FILTER_DROP_REASONS: &[&str] = &[
+	"decode_failed",
+	"fingerprint_mismatch",
+	"unsupported_shape",
+	"materialization_incompatible",
+];
+const RUNTIME_FILTER_ROW_KINDS: &[&str] = &["input", "surviving"];
 const ROW_GROUP_FETCH_FALLBACK_REASONS: &[&str] = &[
 	"disabled",
 	"single_row",
@@ -2575,6 +2583,9 @@ pub struct MetricsRegistry {
 	pub storage_table_retention_ambiguous_rows_retained_total: Counter,
 	pub storage_table_retention_lag_seconds: Gauge,
 	storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges,
+	storage_runtime_filter_events: StaticLabelCounters,
+	storage_runtime_filter_advisory_dropped: StaticLabelCounters,
+	storage_runtime_filter_rows: StaticLabelCounters,
 	lsm_compactions: LsmCompactionCounters,
 	lsm_compaction_input_slabs: LsmSourceLevelGauges,
 	lsm_compaction_output_bytes: LsmSourceLevelGauges,
@@ -2859,6 +2870,9 @@ impl Default for MetricsRegistry {
 			storage_table_retention_lag_seconds: Gauge::default(),
 			storage_table_retention_policy_active_tables: TableRetentionActiveTableGauges::default(
 			),
+			storage_runtime_filter_events: StaticLabelCounters::default(),
+			storage_runtime_filter_advisory_dropped: StaticLabelCounters::default(),
+			storage_runtime_filter_rows: StaticLabelCounters::default(),
 			lsm_compactions: LsmCompactionCounters::default(),
 			lsm_compaction_input_slabs: LsmSourceLevelGauges::default(),
 			lsm_compaction_output_bytes: LsmSourceLevelGauges::default(),
@@ -3452,6 +3466,24 @@ impl MetricsRegistry {
 	) {
 		self.storage_table_retention_policy_active_tables
 			.set(inherit, disabled, fixed);
+	}
+
+	pub fn observe_storage_runtime_filter_present(&self) {
+		self.storage_runtime_filter_events.inc("present");
+	}
+
+	pub fn observe_storage_runtime_filter_applied(&self) {
+		self.storage_runtime_filter_events.inc("applied");
+	}
+
+	pub fn observe_storage_runtime_filter_advisory_dropped(&self, reason: &'static str) {
+		self.storage_runtime_filter_advisory_dropped.inc(reason);
+	}
+
+	pub fn observe_storage_runtime_filter_rows(&self, input_rows: u64, surviving_rows: u64) {
+		self.storage_runtime_filter_rows.add("input", input_rows);
+		self.storage_runtime_filter_rows
+			.add("surviving", surviving_rows);
 	}
 
 	pub fn observe_lsm_compaction(
@@ -5062,6 +5094,27 @@ impl MetricsRegistry {
 			&mut out,
 			"wendelon_storage_table_retention_policy_active_tables_total",
 			"Current table lifecycle catalog entries by retention mode.",
+		);
+		self.storage_runtime_filter_events.render(
+			&mut out,
+			"wendelon_storage_runtime_filter_events_total",
+			"Bounded runtime-filter descriptor events for table queries.",
+			"event",
+			RUNTIME_FILTER_EVENTS,
+		);
+		self.storage_runtime_filter_advisory_dropped.render(
+			&mut out,
+			"wendelon_storage_runtime_filter_advisory_dropped_total",
+			"Advisory runtime-filter drops by bounded reason.",
+			"reason",
+			RUNTIME_FILTER_DROP_REASONS,
+		);
+		self.storage_runtime_filter_rows.render(
+			&mut out,
+			"wendelon_storage_runtime_filter_rows_total",
+			"Rows entering and surviving applied runtime filters.",
+			"kind",
+			RUNTIME_FILTER_ROW_KINDS,
 		);
 		self.lsm_compactions.render(
 			&mut out,

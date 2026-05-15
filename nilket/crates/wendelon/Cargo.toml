@@ -35,7 +35,7 @@ libc = "0.2"
 lz4_flex = "0.13"
 opendal = { version = "0.55", features = ["services-b2", "services-gcs", "services-s3"] }
 openraft = { version = "0.9", features = ["storage-v2", "serde"] }
-postcard = { version = "1.0", default-features = false, features = ["alloc", "use-std"] }
+postcard = { workspace = true }
 quinn = "0.11"
 rand = "0.10.1"
 rdkafka = { version = "0.36", default-features = false, features = ["cmake-build", "ssl"], optional = true }
@@ -53,6 +53,7 @@ tokio-rustls = "0.26"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
 unicode-normalization = "0.1"
 uuid = { version = "1.8", features = ["v4", "fast-rng", "bytemuck"] }
 zeroize = { version = "1.8", features = ["derive"] }

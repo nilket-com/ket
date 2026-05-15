@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -29,9 +29,12 @@ use wendelon::network::transport::{
 };
 use wendelon::node::{NodeBootstrapConfig, WendelonNode};
 use wendelon::schema::{
-	LocalityPolicy, PrimaryKeyDescriptorV1, RecordBodyCompressionPolicy, RowIdentityPolicy,
-	SchemaEvolutionPolicyV1, TableObjectId, TableSchemaDescriptor, TenantId as WendelonTenantId,
-	encode_table_schema_descriptor_v1,
+	LocalityPolicy, PrimaryKeyDescriptorV1, RUNTIME_FILTER_HASH_SEED,
+	RUNTIME_FILTER_KEY_ENCODING_VERSION, RecordBodyCompressionPolicy, RowIdentityPolicy,
+	RuntimeFilterDescriptor, RuntimeFilterKeyType, SchemaEvolutionPolicyV1, TableObjectId,
+	TableSchemaDescriptor, TenantId as WendelonTenantId, encode_runtime_filter_key,
+	encode_table_schema_descriptor_v1, insert_runtime_filter_encoded_key,
+	pbc::{OP_GT, OP_PROJECT, OP_PUSH_COL, OP_PUSH_INT},
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
 use wendelon_client::{Client, TableQueryOptions, WriteOptions};
@@ -118,6 +121,43 @@ async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 	let baseline = execute_in_memory_plan(LIVE_TENANT, input, &bound).await;
 	assert_batches_equal(&baseline, &live);
 	assert_eq!(ids_from_single_column(&live), vec![1, 2, 4]);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}
+
+#[tokio::test]
+async fn wendelon_table_query_runtime_filter_fetches_omitted_probe_key() {
+	let fixture = LiveWendelonFixture::start(36).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut options = TableQueryOptions::default();
+	options.physical_descriptor_fingerprint = Some(descriptor.physical_descriptor_fingerprint);
+	let pbc = pbc_project_amounts_gt_100();
+	let filtered = fixture
+		.client
+		.table_query_with_runtime_filter(
+			LIVE_TENANT,
+			&descriptor,
+			pbc.clone(),
+			Some(runtime_filter_for_i64_values(&descriptor, &[2, 4])),
+			options,
+		)
+		.await
+		.expect("runtime-filtered table query");
+	let unfiltered = fixture
+		.client
+		.table_query(LIVE_TENANT, &descriptor, pbc, options)
+		.await
+		.expect("unfiltered table query");
+
+	assert_batches_equal(&unfiltered.batches, &filtered.batches);
+	assert_eq!(
+		amounts_from_single_column(&filtered.batches),
+		vec![150, 200]
+	);
 
 	fixture.node.handles.abort();
 	let _ = std::fs::remove_dir_all(fixture.data_dir);
@@ -319,6 +359,17 @@ fn ids_from_single_column(batches: &[RecordBatch]) -> Vec<i64> {
 		.downcast_ref::<Int64Array>()
 		.expect("id column");
 	ids.values().to_vec()
+}
+
+fn amounts_from_single_column(batches: &[RecordBatch]) -> Vec<i32> {
+	assert_eq!(batches.len(), 1);
+	assert_eq!(batches[0].num_columns(), 1);
+	let amounts = batches[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("amount column");
+	amounts.values().to_vec()
 }
 
 #[tokio::test]
@@ -577,4 +628,52 @@ fn batch_from_rows(rows: &[(i64, Option<i32>, Option<&str>, i64)]) -> RecordBatc
 		],
 	)
 	.expect("batch")
+}
+
+fn pbc_project_amounts_gt_100() -> Vec<u8> {
+	let mut bytecode = Vec::new();
+	bytecode.push(OP_PUSH_COL);
+	bytecode.extend_from_slice(&1_u32.to_le_bytes());
+	bytecode.push(OP_PUSH_INT);
+	bytecode.extend_from_slice(&100_i64.to_le_bytes());
+	bytecode.push(OP_GT);
+	bytecode.push(OP_PROJECT);
+	bytecode.extend_from_slice(&1_u16.to_le_bytes());
+	bytecode.extend_from_slice(&1_u32.to_le_bytes());
+	bytecode
+}
+
+fn runtime_filter_for_i64_values(
+	descriptor: &TableSchemaDescriptor,
+	values: &[i64],
+) -> RuntimeFilterDescriptor {
+	let bit_count = 4096;
+	let hash_count = 3;
+	let byte_budget = bit_count / 8;
+	let mut payload = vec![0; byte_budget as usize];
+	let array = Int64Array::from(values.to_vec());
+	for row in 0..array.len() {
+		let encoded = encode_runtime_filter_key(&array, row)
+			.expect("encode runtime filter key")
+			.expect("non-null key");
+		insert_runtime_filter_encoded_key(
+			&mut payload,
+			bit_count,
+			hash_count,
+			RUNTIME_FILTER_HASH_SEED,
+			&encoded,
+		);
+	}
+	RuntimeFilterDescriptor {
+		key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+		key_types: vec![RuntimeFilterKeyType::Int64],
+		probe_key_columns: vec![0],
+		hash_seed: RUNTIME_FILTER_HASH_SEED,
+		bit_count,
+		hash_count,
+		byte_budget,
+		target_fp_rate_bp: 100,
+		payload,
+		probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
+	}
 }

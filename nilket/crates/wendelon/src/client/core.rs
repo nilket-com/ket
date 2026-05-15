@@ -54,7 +54,7 @@ use crate::schema::{
 	CdcSubscribeRequestMeta, Consistency, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
 	HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint, MsgType, NodeId, PbcRejectCode,
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
+	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId, TableQueryRequestMeta,
 	TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta, TenantId,
 	WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
@@ -323,6 +323,7 @@ pub struct TableQueryRequest {
 	pub meta: TableQueryRequestMeta,
 	pub descriptor: TableSchemaDescriptor,
 	pub pbc: Vec<u8>,
+	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 }
 
 /// Client-visible point read request for the Data Ring wire API.
@@ -862,10 +863,31 @@ impl WendelonClient {
 		let mut stream = conn.open_bi().await?;
 
 		let meta_bytes = bytemuck::bytes_of(&request.meta);
-		let trailing: Option<&[u8]> = if request.pbc.is_empty() {
+		let runtime_filter_bytes = request
+			.runtime_filter
+			.as_ref()
+			.map(postcard::to_allocvec)
+			.transpose()
+			.map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("TABLE_QUERY_REQ runtime filter encode failed: {err}"),
+				)
+			})?;
+		let mut trailing_bytes = Vec::with_capacity(
+			request
+				.pbc
+				.len()
+				.saturating_add(runtime_filter_bytes.as_ref().map(Vec::len).unwrap_or(0)),
+		);
+		trailing_bytes.extend_from_slice(&request.pbc);
+		if let Some(runtime_filter_bytes) = &runtime_filter_bytes {
+			trailing_bytes.extend_from_slice(runtime_filter_bytes);
+		}
+		let trailing = if trailing_bytes.is_empty() {
 			None
 		} else {
-			Some(&request.pbc)
+			Some(trailing_bytes.as_slice())
 		};
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
@@ -1557,6 +1579,32 @@ fn validate_table_query_request(request: &TableQueryRequest) -> std::io::Result<
 			format!(
 				"TABLE_QUERY_REQ bytecode_len mismatch: meta={} actual={}",
 				request.meta.bytecode_len, bytecode_len
+			),
+		));
+	}
+	let runtime_filter_len = match &request.runtime_filter {
+		Some(runtime_filter) => {
+			let encoded = postcard::to_allocvec(runtime_filter).map_err(|err| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("TABLE_QUERY_REQ runtime filter encode failed: {err}"),
+				)
+			})?;
+			u32::try_from(encoded.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"TABLE_QUERY_REQ runtime filter exceeds u32 length",
+				)
+			})?
+		}
+		None => 0,
+	};
+	if request.meta.runtime_filter_len != runtime_filter_len {
+		return Err(Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"TABLE_QUERY_REQ runtime_filter_len mismatch: meta={} actual={}",
+				request.meta.runtime_filter_len, runtime_filter_len
 			),
 		));
 	}
@@ -2307,11 +2355,12 @@ mod tests {
 				consistency: Consistency::LINEARIZABLE,
 				_pad: [0; 7],
 				bytecode_len: 2,
-				_pad2: [0; 4],
+				runtime_filter_len: 0,
 				as_of_hlc: bytemuck::Zeroable::zeroed(),
 			},
 			descriptor,
 			pbc: vec![0x01, 0x02],
+			runtime_filter: None,
 		};
 		validate_table_query_request(&request).unwrap();
 

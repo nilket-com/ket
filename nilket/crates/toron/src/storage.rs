@@ -7,7 +7,10 @@ use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
 use std::sync::Arc;
 use wendelon::schema::pbc::OP_PROJECT;
-use wendelon::schema::{PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, TableObjectId};
+use wendelon::schema::{
+	PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, TableObjectId,
+	build_runtime_filter_mask_for_batch, validate_runtime_filter_descriptor,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TenantId(pub u64);
@@ -113,6 +116,20 @@ impl StorageScan for InMemoryStorageScan {
 			}
 		}
 
+		if let Some(runtime_filter) = &request.runtime_filter {
+			if validate_runtime_filter_descriptor(
+				runtime_filter,
+				batch.schema().as_ref(),
+				request.physical_descriptor_fingerprint,
+			)
+			.is_ok()
+			{
+				if let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, runtime_filter) {
+					batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+				}
+			}
+		}
+
 		if let Some(pbc) = request.pbc_predicate {
 			batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
 				StorageError::InvalidPbcProgram {
@@ -190,7 +207,13 @@ impl StorageScan for WendelonStorageScan {
 
 		let query_result = self
 			.client
-			.table_query(tenant_id, descriptor, pbc, options)
+			.table_query_with_runtime_filter(
+				tenant_id,
+				descriptor,
+				pbc,
+				request.runtime_filter.clone(),
+				options,
+			)
 			.await?;
 		let schema = if let Some(batch) = query_result.batches.first() {
 			batch.schema()
@@ -228,4 +251,135 @@ fn append_projection(
 		bytecode.extend_from_slice(&column.0.to_le_bytes());
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	use arrow::array::{ArrayRef, Int32Array};
+	use arrow::datatypes::{DataType, Field, Schema};
+	use futures::TryStreamExt;
+	use wendelon::schema::{
+		RUNTIME_FILTER_HASH_SEED, RUNTIME_FILTER_KEY_ENCODING_VERSION, RuntimeFilterKeyType,
+		encode_runtime_filter_key, insert_runtime_filter_encoded_key,
+	};
+
+	#[tokio::test]
+	async fn in_memory_runtime_filter_applies_after_morsel_and_before_projection() {
+		let storage = InMemoryStorageScan {
+			table_data: test_batch(),
+		};
+		let request = test_request(Some(runtime_filter_for_int32_values(&[4, 6])));
+
+		let stream = storage.scan(request).await.expect("scan");
+		let batches = stream
+			.into_batches()
+			.try_collect::<Vec<_>>()
+			.await
+			.expect("collect");
+
+		assert_eq!(projected_values(&batches), vec![40, 60]);
+	}
+
+	#[tokio::test]
+	async fn in_memory_runtime_filter_mismatch_advisory_drops() {
+		let storage = InMemoryStorageScan {
+			table_data: test_batch(),
+		};
+		let mut filter = runtime_filter_for_int32_values(&[4, 6]);
+		filter.probe_descriptor_fingerprint = fingerprint([8; 32]);
+
+		let stream = storage
+			.scan(test_request(Some(filter)))
+			.await
+			.expect("scan");
+		let batches = stream
+			.into_batches()
+			.try_collect::<Vec<_>>()
+			.await
+			.expect("collect");
+
+		assert_eq!(projected_values(&batches), vec![40, 50, 60]);
+	}
+
+	fn test_batch() -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("id", DataType::Int32, false),
+			Field::new("value", DataType::Int32, false),
+		]));
+		RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
+				Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50, 60])) as ArrayRef,
+			],
+		)
+		.expect("batch")
+	}
+
+	fn test_request(runtime_filter: Option<RuntimeFilterDescriptor>) -> ScanRequest {
+		ScanRequest {
+			session_id: SessionId(1),
+			query_id: QueryId::from_u128(2),
+			tenant_id: TenantId(3),
+			table_id: TableId(4),
+			table_object_id: TableObjectId::new([5; 16]),
+			physical_descriptor_fingerprint: fingerprint([7; 32]),
+			read_bound: HlcBound(0),
+			projected_columns: Some(vec![ColumnOrdinal(1)]),
+			pbc_predicate: None,
+			runtime_filter,
+			profile_hint: None,
+			trace_context: None,
+			morsel: Some((MorselId(1), 2)),
+		}
+	}
+
+	fn runtime_filter_for_int32_values(values: &[i32]) -> RuntimeFilterDescriptor {
+		let bit_count = 1024;
+		let hash_count = 3;
+		let byte_budget = bit_count / 8;
+		let mut payload = vec![0; byte_budget as usize];
+		let array = Int32Array::from(values.to_vec());
+		for row in 0..array.len() {
+			let encoded = encode_runtime_filter_key(&array, row)
+				.expect("encode")
+				.expect("non-null key");
+			insert_runtime_filter_encoded_key(
+				&mut payload,
+				bit_count,
+				hash_count,
+				RUNTIME_FILTER_HASH_SEED,
+				&encoded,
+			);
+		}
+		RuntimeFilterDescriptor {
+			key_encoding_version: RUNTIME_FILTER_KEY_ENCODING_VERSION,
+			key_types: vec![RuntimeFilterKeyType::Int32],
+			probe_key_columns: vec![0],
+			hash_seed: RUNTIME_FILTER_HASH_SEED,
+			bit_count,
+			hash_count,
+			byte_budget,
+			target_fp_rate_bp: 100,
+			payload,
+			probe_descriptor_fingerprint: fingerprint([7; 32]),
+		}
+	}
+
+	fn fingerprint(bytes: [u8; 32]) -> PhysicalDescriptorFingerprint {
+		postcard::from_bytes(&bytes).expect("fingerprint")
+	}
+
+	fn projected_values(batches: &[RecordBatch]) -> Vec<i32> {
+		assert_eq!(batches.len(), 1);
+		batches[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("value column")
+			.values()
+			.to_vec()
+	}
 }
