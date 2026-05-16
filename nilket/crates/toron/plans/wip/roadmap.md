@@ -94,18 +94,17 @@ along with the forward-sequence rewrite.
   binder expression surface change, no fragmenter detector change, no
   walker signature change.
 - **ADR 019 — MIN / MAX Aggregate Kernels.** Promoted + implemented.
-  First kernel-catalog widening under the post-ADR-018 cycle. Three-way
-  council convergence ratified MIN+MAX bundled over the early-iter AVG
-  candidate, with the conservative `Int32` / `Int64` type-domain
-  intersection (defers float to a dedicated NaN-policy ADR, defers
-  `Utf8` to preserve `AggState: Copy`). `MIN` and `MAX` remove
-  themselves from the `lower_aggregate_function` catch-all at
-  `sql_planner.rs:554`; identity-type output (`Int32` → `Int32`,
-  `Int64` → `Int64`); `Option<T>` state with no-non-NULL-seen → NULL
-  finalization. Lightweight bench artifact ships per the
-  Wendelon-ADR-070 pattern (ADR 011 no-bench precedent does not
-  transfer — ADR 011 made existing kernels reachable; ADR 019 adds new
-  stable kernels). Wendelon-side already ships parallel
+  First kernel-catalog widening under the post-ADR-018 cycle.
+  Three-way council convergence ratified MIN+MAX bundled over the
+  early-iter AVG candidate, with the conservative `Int32` / `Int64`
+  type-domain intersection (defers float to a dedicated NaN-policy ADR,
+  defers `Utf8` to preserve `AggState: Copy`). `MIN` and `MAX` will
+  remove themselves from the `lower_aggregate_function` catch-all via
+  narrow named arms; identity-type output (`Int32` → `Int32`, `Int64`
+  → `Int64`); `Option<T>` state with no-non-NULL-seen → NULL
+  finalization. Bench:
+  `plans/impl/019_min_max_aggregate_kernels_bench_results.md`.
+  Wendelon-side already ships parallel
   `Min { column }` / `Max { column }` variants at
   `crates/wendelon/src/schema/aggregate.rs:94-125`; ADR 02X engages
   the cross-ring consumer wiring. No new IR variant beyond the enum
@@ -180,17 +179,17 @@ touch no seams, but the question is asked.
 
 ### ADR 019 implemented; ADR 020 candidates
 
-ADR 019 landed `MIN` and `MAX` as the first kernel-catalog
+ADR 019 selected and implemented `MIN` and `MAX` as the first kernel-catalog
 widening under the post-ADR-018 cycle, extending the cycle's
 source-level boundary clarity property to the kernel surface.
 The convergence ratified MIN+MAX bundled (per Gemini's framing
-+ Codex's "MAX is the closest follow-on" posture, with the
+and Codex's "MAX is the closest follow-on" posture, with the
 ADR 008 bundling precedent applied to the parallel
 Wendelon-side `Min`/`Max` variants), conservative
 `Int32`/`Int64` type-domain (explicit deferrals for Float and
-Utf8 documented in V1 exclusions), and a lightweight bench
-artifact. ADR 020 selection starts from the post-ADR-019
-remainder:
+Utf8 documented in V1 exclusions), and a required lightweight
+bench artifact. ADR 020 selection starts from the remaining
+post-ADR-019 remainder:
 
 **Leading kernel candidates:**
 

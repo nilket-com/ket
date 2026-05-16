@@ -535,6 +535,8 @@ impl SqlPlanner {
 		match name {
 			"COUNT" => self.lower_count_aggregate(args),
 			"SUM" => self.lower_sum_aggregate(args),
+			"MIN" => self.lower_min_aggregate(args),
+			"MAX" => self.lower_max_aggregate(args),
 			"LINEAR_REGRESS" => {
 				if matches!(mode, AggregateSqlMode::Grouped) {
 					return Err(unsupported(
@@ -581,6 +583,26 @@ impl SqlPlanner {
 			return Err(unsupported("SUM requires one argument"));
 		}
 		Ok((AggregateFunction::Sum, vec![self.lower_arg(&args[0])?]))
+	}
+
+	fn lower_min_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported("MIN requires one argument"));
+		}
+		Ok((AggregateFunction::Min, vec![self.lower_arg(&args[0])?]))
+	}
+
+	fn lower_max_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported("MAX requires one argument"));
+		}
+		Ok((AggregateFunction::Max, vec![self.lower_arg(&args[0])?]))
 	}
 
 	fn lower_linear_regress_aggregate(
@@ -976,6 +998,8 @@ enum GroupedAggregateSignature {
 	CountAll,
 	Count(ColumnRef),
 	Sum(ColumnRef),
+	Min(ColumnRef),
+	Max(ColumnRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1092,6 +1116,8 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
 	match ident.value.to_ascii_uppercase().as_str() {
 		"COUNT" => Some("COUNT"),
 		"SUM" => Some("SUM"),
+		"MIN" => Some("MIN"),
+		"MAX" => Some("MAX"),
 		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
 		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
 		_ => None,
@@ -1102,6 +1128,8 @@ fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
 	match function {
 		AggregateFunction::CountAll | AggregateFunction::Count => "count",
 		AggregateFunction::Sum => "sum",
+		AggregateFunction::Min => "min",
+		AggregateFunction::Max => "max",
 		AggregateFunction::LinearRegress => "linreg",
 		AggregateFunction::ApproxQuantile(_) => "quantile",
 	}
@@ -1119,6 +1147,14 @@ fn grouped_aggregate_signature(
 		},
 		AggregateFunction::Sum => match args {
 			[Expr::Column(column)] => Some(GroupedAggregateSignature::Sum(column.clone())),
+			_ => None,
+		},
+		AggregateFunction::Min => match args {
+			[Expr::Column(column)] => Some(GroupedAggregateSignature::Min(column.clone())),
+			_ => None,
+		},
+		AggregateFunction::Max => match args {
+			[Expr::Column(column)] => Some(GroupedAggregateSignature::Max(column.clone())),
 			_ => None,
 		},
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,

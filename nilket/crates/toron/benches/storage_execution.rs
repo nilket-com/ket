@@ -520,6 +520,19 @@ fn cases() -> Vec<BenchCase> {
 			expect_pbc: false,
 		},
 		BenchCase {
+			name: "min_nullable_i32",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Min, vec![column("amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "max_i64",
+			plan: aggregate(vec![], vec![(AggregateFunction::Max, vec![column("id")])]),
+			expect_pbc: false,
+		},
+		BenchCase {
 			name: "sum_all_null",
 			plan: aggregate(
 				vec![],
@@ -528,10 +541,29 @@ fn cases() -> Vec<BenchCase> {
 			expect_pbc: false,
 		},
 		BenchCase {
+			name: "min_all_null_i32",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Min, vec![column("all_null_i32")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
 			name: "group_sum",
 			plan: aggregate(
 				vec![column("region")],
 				vec![(AggregateFunction::Sum, vec![column("amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "group_min_max",
+			plan: aggregate(
+				vec![column("region")],
+				vec![
+					(AggregateFunction::Min, vec![column("amount")]),
+					(AggregateFunction::Max, vec![column("id")]),
+				],
 			),
 			expect_pbc: false,
 		},

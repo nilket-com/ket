@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
@@ -79,6 +79,63 @@ fn group_by_projection_must_be_exact_full_key_list_then_aggregates() {
 	assert_column(&group_expr[1], "status");
 	assert_eq!(aggr_expr.len(), 1);
 	assert!(matches!(aggr_expr[0].0, AggregateFunction::CountAll));
+}
+
+#[test]
+fn min_max_aggregate_lowers_in_scalar_and_grouped_projections() {
+	let scalar = plan_sql("SELECT MIN(amount), MAX(id) FROM sales");
+	let LogicalPlan::Aggregate {
+		group_expr,
+		aggr_expr,
+		input,
+	} = scalar
+	else {
+		panic!("expected scalar aggregate");
+	};
+	assert!(group_expr.is_empty());
+	assert_eq!(aggr_expr.len(), 2);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Min));
+	assert_column(&aggr_expr[0].1[0], "amount");
+	assert!(matches!(aggr_expr[1].0, AggregateFunction::Max));
+	assert_column(&aggr_expr[1].1[0], "id");
+	assert!(matches!(input.as_ref(), LogicalPlan::ScanNamed { .. }));
+
+	let grouped = plan_sql(
+		"SELECT region, MIN(amount), MAX(amount) FROM sales \
+		 GROUP BY region HAVING MIN(amount) > 7 ORDER BY MAX(amount) DESC LIMIT 2",
+	);
+	let LogicalPlan::Sort {
+		input, order_by, ..
+	} = grouped
+	else {
+		panic!("expected grouped sort");
+	};
+	assert_column(&order_by[0].expr, "max");
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+		panic!("expected grouped HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "min")
+	));
+	let LogicalPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+	} = input.as_ref()
+	else {
+		panic!("expected grouped aggregate");
+	};
+	assert_eq!(group_expr.len(), 1);
+	assert_column(&group_expr[0], "region");
+	assert_eq!(aggr_expr.len(), 2);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Min));
+	assert!(matches!(aggr_expr[1].0, AggregateFunction::Max));
+	assert!(matches!(input.as_ref(), LogicalPlan::Exchange { .. }));
 }
 
 #[test]
@@ -707,6 +764,80 @@ async fn grouped_aggregate_order_by_binds_against_aggregate_output() {
 }
 
 #[tokio::test]
+async fn min_max_bind_with_identity_output_types_and_reject_deferred_domains() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT MIN(amount), MAX(id) FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind MIN/MAX");
+	let ExecutionPlan::Aggregate { output_schema, .. } = bound else {
+		panic!("expected aggregate");
+	};
+	assert_eq!(output_schema.field(0).name(), "min");
+	assert_eq!(output_schema.field(0).data_type(), &DataType::Int32);
+	assert!(output_schema.field(0).is_nullable());
+	assert_eq!(output_schema.field(1).name(), "max");
+	assert_eq!(output_schema.field(1).data_type(), &DataType::Int64);
+	assert!(output_schema.field(1).is_nullable());
+
+	for (sql, expected) in [
+		(
+			"SELECT MIN(price) FROM sales",
+			"MIN expects Int32 or Int64 input, got Float64",
+		),
+		(
+			"SELECT MAX(status) FROM sales",
+			"MAX expects Int32 or Int64 input, got Utf8",
+		),
+	] {
+		let logical = plan_sql(sql);
+		let err = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("deferred MIN/MAX domain should reject");
+		assert!(
+			matches!(&err, BindingError::TypeMismatch { message } if message == expected),
+			"{sql}: expected {expected:?}, got {err}"
+		);
+	}
+
+	for (function, expected) in [
+		(AggregateFunction::Min, "MIN requires one argument"),
+		(AggregateFunction::Max, "MAX requires one argument"),
+	] {
+		let logical = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::ScanNamed {
+				table: TableRef::new("sales"),
+				projection: None,
+			}),
+			group_expr: vec![],
+			aggr_expr: vec![(function, vec![Expr::column("amount"), Expr::column("id")])],
+		};
+		let err = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect_err("hand-built MIN/MAX with extra args should reject");
+		assert!(
+			matches!(&err, BindingError::UnsupportedExpression { message } if message == expected),
+			"expected {expected:?}, got {err}"
+		);
+	}
+}
+
+#[test]
+fn min_max_aggregate_rejects_invalid_and_unselected_references() {
+	assert_unsupported_message("SELECT MIN() FROM sales", "MIN requires one argument");
+	assert_unsupported("SELECT MIN(*) FROM sales");
+	assert_unsupported("SELECT MIN(DISTINCT amount) FROM sales");
+	assert_unsupported_message(
+		"SELECT MIN(amount), MIN(amount) FROM sales HAVING MIN(amount) > 0",
+		"ambiguous HAVING aggregate-call",
+	);
+	assert_unsupported_message(
+		"SELECT MIN(amount) FROM sales ORDER BY MAX(id)",
+		"ORDER BY aggregate-call must appear in SELECT list",
+	);
+}
+
+#[tokio::test]
 async fn grouped_aggregate_order_by_duplicate_generated_name_is_ambiguous() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql(
@@ -894,12 +1025,88 @@ async fn scalar_aggregate_having_empty_input_pins_inherited_behavior() {
 }
 
 #[tokio::test]
+async fn scalar_min_max_execute_with_identity_types_and_null_semantics() {
+	let results = run_logical(&plan_sql("SELECT MIN(amount), MAX(id) FROM sales")).await;
+	assert_eq!(
+		scalar_min_amount_max_id_rows(&results),
+		vec![(Some(7), Some(6))]
+	);
+
+	let empty = run_logical(&plan_sql("SELECT MIN(amount), MAX(id) FROM empty_sales")).await;
+	assert_eq!(scalar_min_amount_max_id_rows(&empty), vec![(None, None)]);
+}
+
+#[tokio::test]
+async fn grouped_min_max_execute_with_having_order_by_and_all_null_group() {
+	let ordered = run_logical(&plan_sql(
+		"SELECT region, MIN(amount), MAX(id) FROM sales GROUP BY region \
+		 HAVING MIN(amount) > 7 ORDER BY MAX(id) DESC LIMIT 2",
+	))
+	.await;
+	assert_eq!(
+		region_min_amount_max_id_rows(&ordered),
+		vec![
+			(Some("west".to_string()), Some(20), Some(5)),
+			(Some("east".to_string()), Some(10), Some(4)),
+		]
+	);
+
+	let by_status = run_logical(&plan_sql(
+		"SELECT status, MIN(amount) FROM sales GROUP BY status ORDER BY status",
+	))
+	.await;
+	assert_eq!(
+		status_min_amount_rows(&by_status),
+		vec![
+			(Some("closed".to_string()), None),
+			(Some("open".to_string()), Some(7)),
+		]
+	);
+
+	let empty = run_logical(&plan_sql(
+		"SELECT region, MIN(amount) FROM empty_sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
 async fn ordered_grouped_aggregate_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
 		 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let hand_built = hand_built_ordered_grouped_sum_plan(Some(10), 1);
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::None).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::None).expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn scalar_min_max_sql_matches_hand_built_aggregate_plan() {
+	let sql = plan_sql("SELECT MIN(amount), MAX(id) FROM sales");
+	let hand_built = hand_built_scalar_min_max_plan();
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::FullRowLex).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::FullRowLex)
+			.expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn grouped_min_max_having_order_by_sql_matches_hand_built_plan() {
+	let sql = plan_sql(
+		"SELECT region, MIN(amount), MAX(id) FROM sales GROUP BY region \
+		 HAVING MIN(amount) > 7 ORDER BY MAX(id) DESC LIMIT 2",
+	);
+	let hand_built = hand_built_ordered_having_grouped_min_max_plan(Some(2), 0, 7);
 	let sql_results = run_logical(&sql).await;
 	let hand_built_results = run_logical(&hand_built).await;
 
@@ -1391,6 +1598,20 @@ fn hand_built_scalar_sum_plan() -> LogicalPlan {
 	}
 }
 
+fn hand_built_scalar_min_max_plan() -> LogicalPlan {
+	LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![
+			(AggregateFunction::Min, vec![Expr::column("amount")]),
+			(AggregateFunction::Max, vec![Expr::column("id")]),
+		],
+	}
+}
+
 fn hand_built_having_scalar_sum_plan(threshold: i32) -> LogicalPlan {
 	LogicalPlan::Filter {
 		input: Box::new(hand_built_scalar_sum_plan()),
@@ -1414,6 +1635,47 @@ fn hand_built_ordered_having_scalar_sum_plan(
 		}),
 		order_by: vec![SortExpr {
 			expr: Expr::column("sum"),
+			descending: true,
+			nulls_first: false,
+		}],
+		limit,
+		offset,
+	}
+}
+
+fn hand_built_ordered_having_grouped_min_max_plan(
+	limit: Option<usize>,
+	offset: usize,
+	threshold: i32,
+) -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::Aggregate {
+					input: Box::new(LogicalPlan::Exchange {
+						input: Box::new(LogicalPlan::ScanNamed {
+							table: TableRef::new("sales"),
+							projection: None,
+						}),
+						partition_count: 4,
+						key: vec![Expr::column("region")],
+					}),
+					group_expr: vec![Expr::column("region")],
+					aggr_expr: vec![
+						(AggregateFunction::Min, vec![Expr::column("amount")]),
+						(AggregateFunction::Max, vec![Expr::column("id")]),
+					],
+				}),
+				predicate: Expr::Gt(
+					Box::new(Expr::column("min")),
+					Box::new(Expr::Literal(ScalarValue::Int32(Some(threshold)))),
+				),
+			}),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::column("max"),
 			descending: true,
 			nulls_first: false,
 		}],
@@ -1566,6 +1828,108 @@ fn scalar_sum_rows(results: &[RecordBatch]) -> Vec<Option<i64>> {
 			} else {
 				Some(sums.value(row))
 			});
+		}
+	}
+	rows
+}
+
+fn scalar_min_amount_max_id_rows(results: &[RecordBatch]) -> Vec<(Option<i32>, Option<i64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let mins = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("min amount column");
+		let maxes = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("max id column");
+		for row in 0..batch.num_rows() {
+			let min = if mins.is_null(row) {
+				None
+			} else {
+				Some(mins.value(row))
+			};
+			let max = if maxes.is_null(row) {
+				None
+			} else {
+				Some(maxes.value(row))
+			};
+			rows.push((min, max));
+		}
+	}
+	rows
+}
+
+fn region_min_amount_max_id_rows(
+	results: &[RecordBatch],
+) -> Vec<(Option<String>, Option<i32>, Option<i64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let mins = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("min amount column");
+		let maxes = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("max id column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let min = if mins.is_null(row) {
+				None
+			} else {
+				Some(mins.value(row))
+			};
+			let max = if maxes.is_null(row) {
+				None
+			} else {
+				Some(maxes.value(row))
+			};
+			rows.push((region, min, max));
+		}
+	}
+	rows
+}
+
+fn status_min_amount_rows(results: &[RecordBatch]) -> Vec<(Option<String>, Option<i32>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let statuses = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("status column");
+		let mins = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("min amount column");
+		for row in 0..batch.num_rows() {
+			let status = if statuses.is_null(row) {
+				None
+			} else {
+				Some(statuses.value(row).to_string())
+			};
+			let min = if mins.is_null(row) {
+				None
+			} else {
+				Some(mins.value(row))
+			};
+			rows.push((status, min));
 		}
 	}
 	rows
@@ -1743,6 +2107,7 @@ fn sales_schema() -> SchemaRef {
 		Field::new("region", DataType::Utf8, true),
 		Field::new("amount", DataType::Int32, true),
 		Field::new("status", DataType::Utf8, true),
+		Field::new("price", DataType::Float64, true),
 	]))
 }
 
@@ -1782,6 +2147,14 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 				Some("open"),
 				Some("open"),
 			])),
+			Arc::new(Float64Array::from(vec![
+				Some(10.5),
+				Some(20.5),
+				None,
+				Some(30.5),
+				None,
+				Some(7.5),
+			])),
 		],
 	)
 	.expect("sales batch")
@@ -1795,6 +2168,7 @@ fn empty_sales_batch(schema: SchemaRef) -> RecordBatch {
 			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
 			Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
 			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
 		],
 	)
 	.expect("empty sales batch")

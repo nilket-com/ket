@@ -6,7 +6,7 @@
 
 ## Status
 
-Drafted. Awaiting promotion commit.
+Promoted and implemented.
 
 First kernel-catalog widening under the post-ADR-018 cycle.
 Three-way council convergence reached after divergent
@@ -86,7 +86,7 @@ SELECT region, MIN(amount), MAX(amount) FROM sales GROUP BY region
 ```
 
 ```sql
-SELECT region, MIN(amount) FROM sales
+SELECT region, MIN(amount), MAX(amount) FROM sales
 GROUP BY region
 HAVING MIN(amount) > 0
 ORDER BY MAX(amount) DESC LIMIT 10
@@ -126,7 +126,7 @@ In scope:
 - `bound_global_aggregate` and `bound_grouped_aggregate`
   MIN/MAX arms; supporting helpers
   `min_state_for_data_type`, `max_state_for_data_type`,
-  `update_min_value`, `update_max_value`,
+  `update_min_state`, `update_max_state`,
   `min_max_state_array`, `min_max_column_from_groups`.
 - `GroupedAggregateSignature::Min(ColumnRef)` and
   `Max(ColumnRef)` variants at `sql_planner.rs:974`;
@@ -138,7 +138,7 @@ In scope:
 - Planner / binder / executor / scope / ambiguity test
   coverage in `group_by_test.rs`.
 - One distributed digest-parity multi-process fixture in
-  `distributed_process_test.rs` (grouped ordered MIN
+  `distributed_process_test.rs` (grouped ordered MIN + MAX
   across two- and four-worker pools).
 - Bench-evidence artifact at
   `plans/impl/019_min_max_aggregate_kernels_bench_results.md`
@@ -391,13 +391,17 @@ group here).
 ```rust
 AggregateFunction::Min => Field::new(
     "min",
-    min_max_output_data_type(call.args.first().map(|e| e.data_type()).as_ref().unwrap_or(&DataType::Int64))
+    call.args
+        .first()
+        .and_then(|arg| min_max_output_data_type(&arg.data_type()))
         .unwrap_or(DataType::Int64),
     true,
 ),
 AggregateFunction::Max => Field::new(
     "max",
-    min_max_output_data_type(call.args.first().map(|e| e.data_type()).as_ref().unwrap_or(&DataType::Int64))
+    call.args
+        .first()
+        .and_then(|arg| min_max_output_data_type(&arg.data_type()))
         .unwrap_or(DataType::Int64),
     true,
 ),
@@ -445,16 +449,22 @@ Codex considered would have forced removal of `Copy`; ADR
 019 explicitly defers that substrate decision to a future
 type-widening ADR.
 
-Both `init_states` (cfg(test) variant at
-`exec.rs:2753-2771`) and `init_bound_states` (production
-variant at `exec.rs:2773-2795`) gain MIN/MAX arms:
+`init_states` (cfg(test) variant at `exec.rs:2753-2771`)
+gains MIN/MAX arms for the legacy unbound path. It may
+default to Int64 because it has no bound argument types;
+do not use that path to pin Int32 grouped MIN/MAX semantics.
+
+`init_bound_states` (production variant at `exec.rs:2773-2795`)
+should become result-returning so invalid hand-built bound
+plans fail during state initialization rather than silently
+defaulting:
 
 ```rust
-// init_states (cfg(test)): default to Int64
+// init_states (cfg(test)): legacy unbound default to Int64
 AggregateFunction::Min => AggState::MinInt64 { value: None },
 AggregateFunction::Max => AggState::MaxInt64 { value: None },
 
-// init_bound_states (production): dispatch on input type
+// init_bound_states (production): dispatch on input type and return Result
 AggregateFunction::Min => call
     .args
     .first()
@@ -467,6 +477,20 @@ AggregateFunction::Max => call
     .map(|arg| max_state_for_data_type(&arg.data_type()))
     .transpose()?
     .unwrap_or(AggState::MaxInt64 { value: None }),
+```
+
+`bound_grouped_aggregate` must then initialize vacant group
+state with an error-propagating entry match instead of the
+current `or_insert_with(|| init_bound_states(aggr_expr))`
+closure:
+
+```rust
+let states = match groups.entry(key) {
+    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+    std::collections::btree_map::Entry::Vacant(entry) => {
+        entry.insert(init_bound_states(aggr_expr)?)
+    }
+};
 ```
 
 New helpers:
@@ -803,8 +827,8 @@ Implementation promotion requires:
      MIN/MAX + HAVING + ORDER BY.
 
 4. **Distributed** —
-   - Grouped MIN `SELECT region, MIN(amount) FROM sales
-     GROUP BY region ORDER BY MIN(amount) DESC LIMIT 5`
+   - Grouped MIN/MAX `SELECT val, MIN(val), MAX(val)
+     FROM fixture GROUP BY val ORDER BY MAX(val) DESC LIMIT 5`
      produces byte-identical normalized output across two-
      and four-worker fixtures.
 

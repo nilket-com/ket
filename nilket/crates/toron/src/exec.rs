@@ -308,6 +308,54 @@ impl Executor {
 									true,
 								));
 							}
+							AggregateFunction::Min | AggregateFunction::Max => {
+								let mut state = None;
+								let mut output_type = None;
+								for batch in &input_batches {
+									let arr = self.evaluate_expr(&args[0], batch)?;
+									if state.is_none() {
+										state = Some(match func {
+											AggregateFunction::Min => {
+												min_state_for_data_type(arr.data_type())?
+											}
+											AggregateFunction::Max => {
+												max_state_for_data_type(arr.data_type())?
+											}
+											_ => unreachable!("MIN/MAX arm only"),
+										});
+										output_type = Some(arr.data_type().clone());
+									}
+									let state = state
+										.as_mut()
+										.expect("MIN/MAX state initialized from observed array");
+									for row in 0..batch.num_rows() {
+										match func {
+											AggregateFunction::Min => {
+												update_min_state(state, &arr, row)?
+											}
+											AggregateFunction::Max => {
+												update_max_state(state, &arr, row)?
+											}
+											_ => unreachable!("MIN/MAX arm only"),
+										}
+									}
+								}
+								let state =
+									state.ok_or_else(|| ExecutionError::InvalidExpression {
+										message: format!(
+											"{} cannot infer output type from empty unbound input",
+											aggregate_state_keyword(func)
+										),
+									})?;
+								let output_type =
+									output_type.expect("MIN/MAX output type observed");
+								results_cols.push(min_max_state_array(&state)?);
+								results_fields.push(arrow::datatypes::Field::new(
+									aggregate_state_output_name(func),
+									output_type,
+									true,
+								));
+							}
 							AggregateFunction::LinearRegress => {
 								// Accumulate OLS state: n, sum_x, sum_y, sum_x2, sum_xy
 								let mut n = 0u64;
@@ -909,6 +957,26 @@ impl Executor {
 					let output_type = output_schema.field(results_cols.len()).data_type().clone();
 					results_cols.push(sum_state_array(&state, &output_type)?);
 				}
+				AggregateFunction::Min => {
+					let mut state = min_state_for_data_type(&call.args[0].data_type())?;
+					for batch in input_batches {
+						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						for row in 0..batch.num_rows() {
+							update_min_state(&mut state, &arr, row)?;
+						}
+					}
+					results_cols.push(min_max_state_array(&state)?);
+				}
+				AggregateFunction::Max => {
+					let mut state = max_state_for_data_type(&call.args[0].data_type())?;
+					for batch in input_batches {
+						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						for row in 0..batch.num_rows() {
+							update_max_state(&mut state, &arr, row)?;
+						}
+					}
+					results_cols.push(min_max_state_array(&state)?);
+				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "bound experimental aggregate execution",
@@ -963,9 +1031,10 @@ impl Executor {
 				.iter()
 				.map(|(function, args)| match function {
 					AggregateFunction::CountAll => Ok(None),
-					AggregateFunction::Count | AggregateFunction::Sum => {
-						Ok(Some(self.evaluate_expr(&args[0], batch)?))
-					}
+					AggregateFunction::Count
+					| AggregateFunction::Sum
+					| AggregateFunction::Min
+					| AggregateFunction::Max => Ok(Some(self.evaluate_expr(&args[0], batch)?)),
 					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 						Err(ExecutionError::NotImplemented {
 							feature: "grouped experimental aggregate",
@@ -998,6 +1067,12 @@ impl Executor {
 									add_sum_value(state, value)?;
 								}
 							}
+							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
+								update_min_state(state, array, row)?;
+							}
+							AggState::MaxInt32 { .. } | AggState::MaxInt64 { .. } => {
+								update_max_state(state, array, row)?;
+							}
 						},
 					}
 				}
@@ -1024,13 +1099,25 @@ impl Executor {
 						.values()
 						.map(|states| match states[agg_idx] {
 							AggState::Count(value) => value,
-							AggState::SumInt { .. } | AggState::SumFloat { .. } => 0,
+							AggState::SumInt { .. }
+							| AggState::SumFloat { .. }
+							| AggState::MinInt32 { .. }
+							| AggState::MinInt64 { .. }
+							| AggState::MaxInt32 { .. }
+							| AggState::MaxInt64 { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
 				}
 				AggregateFunction::Sum => {
 					columns.push(sum_column_from_groups(&groups, agg_idx, &DataType::Int64)?);
+				}
+				AggregateFunction::Min | AggregateFunction::Max => {
+					columns.push(min_max_column_from_groups(
+						&groups,
+						agg_idx,
+						&DataType::Int64,
+					)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -1042,13 +1129,18 @@ impl Executor {
 				AggregateFunction::CountAll => "count",
 				AggregateFunction::Count => "count",
 				AggregateFunction::Sum => "sum",
+				AggregateFunction::Min => "min",
+				AggregateFunction::Max => "max",
 				AggregateFunction::LinearRegress => "linreg",
 				AggregateFunction::ApproxQuantile(_) => "quantile",
 			};
 			fields.push(arrow::datatypes::Field::new(
 				field_name,
 				arrow::datatypes::DataType::Int64,
-				false,
+				!matches!(
+					function,
+					AggregateFunction::CountAll | AggregateFunction::Count
+				),
 			));
 		}
 
@@ -1082,9 +1174,10 @@ impl Executor {
 				.iter()
 				.map(|call| match call.function {
 					AggregateFunction::CountAll => Ok(None),
-					AggregateFunction::Count | AggregateFunction::Sum => {
-						Ok(Some(self.evaluate_bound_expr(&call.args[0], batch)?))
-					}
+					AggregateFunction::Count
+					| AggregateFunction::Sum
+					| AggregateFunction::Min
+					| AggregateFunction::Max => Ok(Some(self.evaluate_bound_expr(&call.args[0], batch)?)),
 					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 						Err(ExecutionError::NotImplemented {
 							feature: "bound grouped experimental aggregate",
@@ -1098,9 +1191,12 @@ impl Executor {
 					.iter()
 					.map(|array| group_value(array, row))
 					.collect::<Result<Vec<_>, _>>()?;
-				let states = groups
-					.entry(key)
-					.or_insert_with(|| init_bound_states(aggr_expr));
+				let states = match groups.entry(key) {
+					std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+					std::collections::btree_map::Entry::Vacant(entry) => {
+						entry.insert(init_bound_states(aggr_expr)?)
+					}
+				};
 				for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
 					match input {
 						None => {
@@ -1118,6 +1214,12 @@ impl Executor {
 								if let Some(value) = sum_value(array, row)? {
 									add_sum_value(state, value)?;
 								}
+							}
+							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
+								update_min_state(state, array, row)?;
+							}
+							AggState::MaxInt32 { .. } | AggState::MaxInt64 { .. } => {
+								update_max_state(state, array, row)?;
 							}
 						},
 					}
@@ -1138,7 +1240,12 @@ impl Executor {
 						.values()
 						.map(|states| match states[agg_idx] {
 							AggState::Count(value) => value,
-							AggState::SumInt { .. } | AggState::SumFloat { .. } => 0,
+							AggState::SumInt { .. }
+							| AggState::SumFloat { .. }
+							| AggState::MinInt32 { .. }
+							| AggState::MinInt64 { .. }
+							| AggState::MaxInt32 { .. }
+							| AggState::MaxInt64 { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -1146,6 +1253,10 @@ impl Executor {
 				AggregateFunction::Sum => {
 					let output_type = output_schema.field(columns.len()).data_type().clone();
 					columns.push(sum_column_from_groups(&groups, agg_idx, &output_type)?);
+				}
+				AggregateFunction::Min | AggregateFunction::Max => {
+					let output_type = output_schema.field(columns.len()).data_type().clone();
+					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -2741,6 +2852,10 @@ enum AggState {
 	Count(i64),
 	SumInt { total: i128, seen: bool },
 	SumFloat { total: f64, seen: bool },
+	MinInt32 { value: Option<i32> },
+	MinInt64 { value: Option<i64> },
+	MaxInt32 { value: Option<i32> },
+	MaxInt64 { value: Option<i64> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2760,6 +2875,8 @@ fn init_states(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<AggState> {
 				total: 0,
 				seen: false,
 			},
+			AggregateFunction::Min => AggState::MinInt64 { value: None },
+			AggregateFunction::Max => AggState::MaxInt64 { value: None },
 			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 				AggState::SumInt {
 					total: 0,
@@ -2770,26 +2887,40 @@ fn init_states(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<AggState> {
 		.collect()
 }
 
-fn init_bound_states(aggr_expr: &[crate::ir::AggregateCall]) -> Vec<AggState> {
+fn init_bound_states(
+	aggr_expr: &[crate::ir::AggregateCall],
+) -> Result<Vec<AggState>, ExecutionError> {
 	aggr_expr
 		.iter()
 		.map(|call| match call.function {
-			AggregateFunction::CountAll => AggState::Count(0),
-			AggregateFunction::Count => AggState::Count(0),
-			AggregateFunction::Sum => call
+			AggregateFunction::CountAll => Ok(AggState::Count(0)),
+			AggregateFunction::Count => Ok(AggState::Count(0)),
+			AggregateFunction::Sum => Ok(call
 				.args
 				.first()
 				.map(|arg| sum_state_for_data_type(&arg.data_type()))
 				.unwrap_or(AggState::SumInt {
 					total: 0,
 					seen: false,
-				}),
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				})),
+			AggregateFunction::Min => call
+				.args
+				.first()
+				.map(|arg| min_state_for_data_type(&arg.data_type()))
+				.transpose()
+				.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
+			AggregateFunction::Max => call
+				.args
+				.first()
+				.map(|arg| max_state_for_data_type(&arg.data_type()))
+				.transpose()
+				.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
+			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => Ok({
 				AggState::SumInt {
 					total: 0,
 					seen: false,
 				}
-			}
+			}),
 		})
 		.collect()
 }
@@ -2828,6 +2959,26 @@ fn sum_state_for_data_type(data_type: &DataType) -> AggState {
 	}
 }
 
+fn min_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionError> {
+	match data_type {
+		DataType::Int32 => Ok(AggState::MinInt32 { value: None }),
+		DataType::Int64 => Ok(AggState::MinInt64 { value: None }),
+		_ => Err(ExecutionError::InvalidExpression {
+			message: format!("MIN does not support input type {:?}", data_type),
+		}),
+	}
+}
+
+fn max_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionError> {
+	match data_type {
+		DataType::Int32 => Ok(AggState::MaxInt32 { value: None }),
+		DataType::Int64 => Ok(AggState::MaxInt64 { value: None }),
+		_ => Err(ExecutionError::InvalidExpression {
+			message: format!("MAX does not support input type {:?}", data_type),
+		}),
+	}
+}
+
 fn add_sum_value(state: &mut AggState, value: SumValue) -> Result<(), ExecutionError> {
 	match (state, value) {
 		(AggState::SumInt { total, seen }, SumValue::Int(value)) => {
@@ -2852,8 +3003,100 @@ fn add_sum_value(state: &mut AggState, value: SumValue) -> Result<(), ExecutionE
 		(AggState::SumInt { .. }, SumValue::Float(_)) => Err(ExecutionError::InvalidExpression {
 			message: "floating SUM value reached integer accumulator".to_string(),
 		}),
-		(AggState::Count(_), _) => Err(ExecutionError::InvalidExpression {
+		(AggState::Count(_), _)
+		| (AggState::MinInt32 { .. }, _)
+		| (AggState::MinInt64 { .. }, _)
+		| (AggState::MaxInt32 { .. }, _)
+		| (AggState::MaxInt64 { .. }, _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached count accumulator".to_string(),
+		}),
+	}
+}
+
+fn update_min_state(
+	state: &mut AggState,
+	array: &ArrayRef,
+	row: usize,
+) -> Result<(), ExecutionError> {
+	if array.is_null(row) {
+		return Ok(());
+	}
+	match state {
+		AggState::MinInt32 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MIN(Int32) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.min(candidate)));
+			Ok(())
+		}
+		AggState::MinInt64 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MIN(Int64) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.min(candidate)));
+			Ok(())
+		}
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "MIN value reached non-MIN accumulator".to_string(),
+		}),
+	}
+}
+
+fn update_max_state(
+	state: &mut AggState,
+	array: &ArrayRef,
+	row: usize,
+) -> Result<(), ExecutionError> {
+	if array.is_null(row) {
+		return Ok(());
+	}
+	match state {
+		AggState::MaxInt32 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Int32Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MAX(Int32) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.max(candidate)));
+			Ok(())
+		}
+		AggState::MaxInt64 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MAX(Int64) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| current.max(candidate)));
+			Ok(())
+		}
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "MAX value reached non-MAX accumulator".to_string(),
+		}),
+	}
+}
+
+fn min_max_state_array(state: &AggState) -> Result<ArrayRef, ExecutionError> {
+	match state {
+		AggState::MinInt32 { value } | AggState::MaxInt32 { value } => {
+			Ok(Arc::new(Int32Array::from(vec![*value])) as ArrayRef)
+		}
+		AggState::MinInt64 { value } | AggState::MaxInt64 { value } => {
+			Ok(Arc::new(Int64Array::from(vec![*value])) as ArrayRef)
+		}
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "MIN/MAX finalize over non-MIN/MAX state".to_string(),
 		}),
 	}
 }
@@ -2903,7 +3146,12 @@ fn sum_column_from_groups(
 							Ok(None)
 						}
 					}
-					AggState::SumFloat { .. } | AggState::Count(_) => Ok(None),
+					AggState::SumFloat { .. }
+					| AggState::Count(_)
+					| AggState::MinInt32 { .. }
+					| AggState::MinInt64 { .. }
+					| AggState::MaxInt32 { .. }
+					| AggState::MaxInt64 { .. } => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -2914,7 +3162,11 @@ fn sum_column_from_groups(
 				.map(|states| match states[agg_idx] {
 					AggState::SumFloat { total, seen } => seen.then_some(total),
 					AggState::SumInt { total, seen } => seen.then_some(total as f64),
-					AggState::Count(_) => None,
+					AggState::Count(_)
+					| AggState::MinInt32 { .. }
+					| AggState::MinInt64 { .. }
+					| AggState::MaxInt32 { .. }
+					| AggState::MaxInt64 { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -2922,6 +3174,56 @@ fn sum_column_from_groups(
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported SUM output type: {data_type:?}"),
 		}),
+	}
+}
+
+fn min_max_column_from_groups(
+	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	agg_idx: usize,
+	output_type: &DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	match output_type {
+		DataType::Int32 => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::MinInt32 { value } | AggState::MaxInt32 { value } => value,
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+		}
+		DataType::Int64 => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::MinInt64 { value } | AggState::MaxInt64 { value } => value,
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+		}
+		_ => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported MIN/MAX output type: {output_type:?}"),
+		}),
+	}
+}
+
+#[cfg(test)]
+fn aggregate_state_keyword(function: &AggregateFunction) -> &'static str {
+	match function {
+		AggregateFunction::Min => "MIN",
+		AggregateFunction::Max => "MAX",
+		_ => "aggregate",
+	}
+}
+
+#[cfg(test)]
+fn aggregate_state_output_name(function: &AggregateFunction) -> &'static str {
+	match function {
+		AggregateFunction::Min => "min",
+		AggregateFunction::Max => "max",
+		_ => "aggregate",
 	}
 }
 

@@ -470,7 +470,7 @@ fn adr016_having_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggregateFunction enum");
-	assert_eq!(enum_variant_count(aggregate_function), 5);
+	assert_eq!(enum_variant_count(aggregate_function), 7);
 
 	let aggregate_output_name = planner
 		.split("fn aggregate_output_name")
@@ -494,6 +494,8 @@ fn adr016_having_guards_are_narrow() {
 			"Field::new(\"count\",",
 		),
 		("AggregateFunction::Sum", "\"sum\"", "Field::new(\"sum\","),
+		("AggregateFunction::Min", "\"min\"", "Field::new(\"min\","),
+		("AggregateFunction::Max", "\"max\"", "Field::new(\"max\","),
 		(
 			"AggregateFunction::LinearRegress",
 			"\"linreg\"",
@@ -603,6 +605,50 @@ fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 		.and_then(|rest| rest.split("pub struct ExecutionSortKey").next())
 		.expect("FilterDisposition enum");
 	assert_eq!(enum_variant_count(filter_disposition), 2);
+}
+
+#[test]
+fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(planner.contains("\"MIN\" => self.lower_min_aggregate"));
+	assert!(planner.contains("\"MAX\" => self.lower_max_aggregate"));
+	assert!(planner.contains("MIN requires one argument"));
+	assert!(planner.contains("MAX requires one argument"));
+	assert!(planner.contains("unsupported aggregate function"));
+
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	assert!(binder.contains("AggregateFunction::Min => Field::new("));
+	assert!(binder.contains("\"min\""));
+	assert!(binder.contains("AggregateFunction::Max => Field::new("));
+	assert!(binder.contains("\"max\""));
+	assert!(binder.contains("fn min_max_output_data_type"));
+	assert!(binder.contains("expects Int32 or Int64 input"));
+
+	let aggregate_function_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
+	let aggregate_function = aggregate_function_source
+		.split("pub enum AggregateFunction")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("AggregateFunction enum");
+	assert_eq!(enum_variant_count(aggregate_function), 7);
+
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	assert!(exec.contains("AggState::MinInt32"));
+	assert!(exec.contains("AggState::MinInt64"));
+	assert!(exec.contains("AggState::MaxInt32"));
+	assert!(exec.contains("AggState::MaxInt64"));
+	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
+	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
+	assert!(derives_above.contains("Copy"));
+
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	assert!(!storage.contains("AggregateExpression"));
+	assert!(!storage.contains("AggregateFunctionTag"));
 }
 
 fn enum_variant_count(enum_body: &str) -> usize {

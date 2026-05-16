@@ -109,6 +109,8 @@ pub enum AggregateFunction {
 	CountAll,
 	Count,
 	Sum,
+	Min,
+	Max,
 	LinearRegress,
 	ApproxQuantile(f64),
 }

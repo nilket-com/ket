@@ -1073,7 +1073,20 @@ fn bind_aggregate_call(
 			function: function.clone(),
 			args: Vec::new(),
 		}),
-		AggregateFunction::Count | AggregateFunction::Sum => {
+		AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max => {
+			if matches!(function, AggregateFunction::Min | AggregateFunction::Max)
+				&& args.len() != 1
+			{
+				return Err(BindingError::UnsupportedExpression {
+					message: format!(
+						"{} requires one argument",
+						aggregate_function_keyword(function)
+					),
+				});
+			}
 			let args = args
 				.iter()
 				.map(|expr| bind_expr(expr, input_schema, config))
@@ -1087,6 +1100,18 @@ fn bind_aggregate_call(
 				if sum_output_data_type(&arg.data_type()).is_none() {
 					return Err(BindingError::TypeMismatch {
 						message: format!("SUM expects numeric input, got {:?}", arg.data_type()),
+					});
+				}
+			}
+			if matches!(function, AggregateFunction::Min | AggregateFunction::Max) {
+				let arg = &args[0];
+				if min_max_output_data_type(&arg.data_type()).is_none() {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects Int32 or Int64 input, got {:?}",
+							aggregate_function_keyword(function),
+							arg.data_type()
+						),
 					});
 				}
 			}
@@ -1331,6 +1356,22 @@ fn aggregate_field(call: &AggregateCall) -> Field {
 				.unwrap_or(DataType::Int64),
 			true,
 		),
+		AggregateFunction::Min => Field::new(
+			"min",
+			call.args
+				.first()
+				.and_then(|arg| min_max_output_data_type(&arg.data_type()))
+				.unwrap_or(DataType::Int64),
+			true,
+		),
+		AggregateFunction::Max => Field::new(
+			"max",
+			call.args
+				.first()
+				.and_then(|arg| min_max_output_data_type(&arg.data_type()))
+				.unwrap_or(DataType::Int64),
+			true,
+		),
 		AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
 		AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
 	}
@@ -1348,6 +1389,21 @@ fn sum_output_data_type(input: &DataType) -> Option<DataType> {
 		| DataType::UInt64 => Some(DataType::Int64),
 		DataType::Float32 | DataType::Float64 => Some(DataType::Float64),
 		_ => None,
+	}
+}
+
+fn min_max_output_data_type(input: &DataType) -> Option<DataType> {
+	match input {
+		DataType::Int32 | DataType::Int64 => Some(input.clone()),
+		_ => None,
+	}
+}
+
+fn aggregate_function_keyword(function: &AggregateFunction) -> &'static str {
+	match function {
+		AggregateFunction::Min => "MIN",
+		AggregateFunction::Max => "MAX",
+		_ => "aggregate",
 	}
 }
 

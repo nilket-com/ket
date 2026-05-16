@@ -5,7 +5,7 @@
 
 ## Status
 
-Drafted. Awaiting promotion commit.
+Promoted and implemented.
 
 First kernel-catalog widening under the post-ADR-018 cycle.
 One enum-variant widening (5 → 7, adding `Min` and `Max`),
@@ -46,7 +46,7 @@ Land MIN and MAX end-to-end over Int32/Int64 inputs:
   grouped;
 - in-process digest parity against hand-built MIN/MAX
   `Aggregate` plan; multi-process digest parity for grouped
-  MIN across worker counts;
+  MIN + MAX across worker counts;
 - bench artifact captures correctness + throughput numbers.
 
 ## Substrate
@@ -90,12 +90,13 @@ Land MIN and MAX end-to-end over Int32/Int64 inputs:
     Option<i32> }`, `MaxInt64 { value: Option<i64> }`.
     Enum **stays `Copy`** because all variants are stack-
     only.
-  - `init_states` (cfg(test) at `exec.rs:2753-2771`) and
-    `init_bound_states` (production at
-    `exec.rs:2773-2795`): both gain MIN and MAX arms. The
-    cfg(test) variant defaults to `Int64`; the production
-    variant dispatches via
-    `min_state_for_data_type` / `max_state_for_data_type`.
+  - `init_states` (cfg(test) at `exec.rs:2753-2771`) gains
+    MIN and MAX arms for the legacy unbound path and defaults
+    to `Int64`; do not use it to pin Int32 grouped MIN/MAX
+    semantics. `init_bound_states` (production at
+    `exec.rs:2773-2795`) becomes result-returning and
+    dispatches via `min_state_for_data_type` /
+    `max_state_for_data_type`.
   - New `min_state_for_data_type` and
     `max_state_for_data_type` helpers paralleling
     `sum_state_for_data_type` at `exec.rs:2818-2829`.
@@ -120,8 +121,8 @@ Land MIN and MAX end-to-end over Int32/Int64 inputs:
   ORDER BY composition tests.
 
 - `crates/toron/tests/distributed_process_test.rs` — ADR
-  019 adds one multi-process fixture (grouped ordered MIN)
-  to pin digest parity across worker counts.
+  019 adds one multi-process fixture (grouped ordered MIN +
+  MAX) to pin digest parity across worker counts.
 
 - `crates/toron/tests/architecture_test.rs` — ADR 019 adds
   `adr019_min_max_aggregate_kernels_guards_are_narrow` test
@@ -155,7 +156,8 @@ Expected code changes:
 - `crates/toron/src/exec.rs`:
   - `AggState` four new variants (~4 lines).
   - `init_states` (cfg(test)) MIN and MAX arms (~2 lines).
-  - `init_bound_states` MIN and MAX arms (~12 lines).
+  - `init_bound_states` result-returning signature plus MIN
+    and MAX arms (~16 lines).
   - New `min_state_for_data_type` /
     `max_state_for_data_type` helpers (~20 lines).
   - New `update_min_state` / `update_max_state` helpers
@@ -182,7 +184,7 @@ Expected code changes:
   - In-process executor digest parity (scalar + grouped +
     HAVING + ORDER BY).
 - `crates/toron/tests/distributed_process_test.rs`:
-  - Multi-process fixture: grouped ordered MIN.
+  - Multi-process fixture: grouped ordered MIN + MAX.
 - `crates/toron/tests/architecture_test.rs`:
   - `adr019_min_max_aggregate_kernels_guards_are_narrow`
     test with variant-count assertion, two table-entry
@@ -198,10 +200,9 @@ Updated documentation:
 - `crates/toron/plans/impl/019_min_max_aggregate_kernels_bench_results.md`
   (bench artifact).
 - `crates/toron/plans/wip/roadmap.md` — ADR 019 retires
-  from "candidates" into "Implemented"; ADR 020 candidates
-  section seeded with AVG, float MIN/MAX, Utf8 MIN/MAX,
-  ADR 02X (Wendelon AGG consumer wiring), post-aggregate
-  projection.
+  into "Implemented". ADR 020 candidates are seeded with
+  AVG, float MIN/MAX, Utf8 MIN/MAX, ADR 02X (Wendelon AGG
+  consumer wiring), post-aggregate projection.
 - Auto-memory `adr-015-cycle-shape` updates to note that
   ADR 019 extends the cycle's source-level boundary clarity
   property to the kernel-catalog surface.
@@ -500,7 +501,13 @@ enum AggState {
 **`AggState` keeps `Copy`** because all variants are
 stack-only (Int32/Int64 + `Option<T>` of integers).
 
-Both `init_*` functions gain MIN/MAX arms:
+`init_states` gains MIN/MAX arms for the legacy unbound path.
+It defaults to Int64 because it has no bound argument types; do
+not use it to pin Int32 grouped MIN/MAX semantics.
+
+`init_bound_states` should become result-returning so invalid
+hand-built bound plans fail during state initialization rather
+than silently defaulting:
 
 ```rust
 // init_states (#[cfg(test)] at exec.rs:2753-2771):
@@ -520,6 +527,19 @@ AggregateFunction::Max => call
     .map(|arg| max_state_for_data_type(&arg.data_type()))
     .transpose()?
     .unwrap_or(AggState::MaxInt64 { value: None }),
+```
+
+The `bound_grouped_aggregate` group lookup must then stop using
+`or_insert_with(|| init_bound_states(aggr_expr))`, because that
+closure cannot propagate `ExecutionError`. Use an entry match:
+
+```rust
+let states = match groups.entry(key) {
+    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+    std::collections::btree_map::Entry::Vacant(entry) => {
+        entry.insert(init_bound_states(aggr_expr)?)
+    }
+};
 ```
 
 New helpers:
@@ -756,9 +776,9 @@ AggState::SumInt { .. }
 
 ### Step 7: distributed fixture in `distributed_process_test.rs`
 
-- `ordered_grouped_min_process_digest_is_stable_across_worker_counts`:
-  fixture-driven test for `SELECT val, MIN(val) FROM
-  fixture GROUP BY val ORDER BY MIN(val) DESC LIMIT 5`
+- `ordered_grouped_min_max_process_digest_is_stable_across_worker_counts`:
+  fixture-driven test for `SELECT val, MIN(val), MAX(val)
+  FROM fixture GROUP BY val ORDER BY MAX(val) DESC LIMIT 5`
   across two- and four-worker process configurations.
   Asserts byte-identical normalized digest and unique
   worker count matches pool size.
@@ -800,16 +820,11 @@ fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
     assert!(exec.contains("AggState::MaxInt32"));
     assert!(exec.contains("AggState::MaxInt64"));
     // AggState retains Copy derive — Utf8 widening would flip this.
-    let agg_state = exec
-        .split("enum AggState")
-        .nth(1)
-        .and_then(|rest| rest.split("}").next())
-        .unwrap_or("");
-    let derives_above = exec
+    let before_agg_state = exec
         .split("enum AggState")
         .next()
-        .and_then(|before| before.rsplit("#[derive").next())
         .unwrap_or("");
+    let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
     assert!(derives_above.contains("Copy"));
 
     // Cross-ring absence: no AGG protocol engagement.
@@ -864,7 +879,7 @@ kind inspection.
 - Empty-input contract pinned (no-non-NULL-seen → NULL).
 
 **Distributed coverage** (`distributed_process_test.rs`):
-- Per Step 7's grouped ordered MIN fixture.
+- Per Step 7's grouped ordered MIN + MAX fixture.
 
 **In-process digest parity** (`group_by_test.rs`):
 - Per Step 6's `_sql_matches_hand_built_plan` tests.
@@ -877,16 +892,15 @@ kind inspection.
 - ADR + impl plan promoted to
   `plans/adr/019_min_max_aggregate_kernels.md` and
   `plans/impl/019_min_max_aggregate_kernels.md` with
-  status "Promoted. Implemented."
+  status "Promoted and implemented."
 - Bench artifact at
   `plans/impl/019_min_max_aggregate_kernels_bench_results.md`.
-- `plans/wip/roadmap.md` ADR 019 entry retires from
-  "candidates" into "Implemented" with cycle-property
-  note ("first kernel-catalog widening preserving source-
-  level boundary clarity at the catch-all reject");
-  ADR 020 candidates section seeded with AVG, float
-  MIN/MAX, Utf8 MIN/MAX, ADR 02X, post-aggregate
-  projection.
+- `plans/wip/roadmap.md` ADR 019 entry retires into
+  "Implemented" with cycle-property note ("first kernel-
+  catalog widening preserving source-level boundary clarity
+  at the catch-all reject"); ADR 020 candidates section
+  seeded with AVG, float MIN/MAX, Utf8 MIN/MAX, ADR 02X,
+  post-aggregate projection.
 - Auto-memory `adr-015-cycle-shape` updates to record
   that the cycle's property extends to the kernel-catalog
   surface; ADR 019 is the first instance.
@@ -984,7 +998,7 @@ cargo bench -p toron --bench aggregate_kernels  # or equivalent
 - `AggState` retains `Copy` derive (architecture-test
   asserts).
 - In-process digest parity for scalar and grouped MIN/MAX.
-- Multi-process digest parity for grouped ordered MIN
+- Multi-process digest parity for grouped ordered MIN + MAX
   across two- and four-worker fixtures.
 - Architecture-test additions land; variant count 7
   confirmed; two new table entries; cross-ring absence
