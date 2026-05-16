@@ -136,6 +136,44 @@ along with the forward-sequence rewrite.
   contract when it engages. No new IR variant beyond the enum widening
   (7 → 8), no fragmenter detector change, no cross-ring engagement,
   `AggState` stays `Copy`.
+- **ADR 021 — Aggregate Kernel Catalog Refactor.** Promoted. Internal
+  substrate ADR honoring ADR 020's Gemini dissent ("the maintenance
+  cliff justifies bundling"). Centralizes stable aggregate metadata
+  into one private `aggregate_kernel.rs` module with an
+  `AggregateKernelSpec` table indexed by a `#[repr(u8)]`
+  `StableAggregateKernel` compact tag. Six stable rows
+  (`CountAll`/`Count`/`Sum`/`Min`/`Max`/`Avg`); planner, binder, and
+  executor-adjacent helpers delegate to the catalog; the three
+  private binder helpers `sum_output_data_type` /
+  `min_max_output_data_type` / `avg_output_data_type` are removed
+  (logic folds into an `AggregateOutputRule` enum with `Int64`,
+  `Float64`, `SameAsInput`, `SumNumeric` variants). Codex + Claude
+  2-of-3 majority across iter-0 through iter-3 landed on
+  catalog-only mechanism (no runtime trait dispatch in the row
+  path) and refactor-alone scope (no Float MIN/MAX bundle). Gemini's
+  four-iteration dissent on both — trait-dispatch with row-path
+  `accumulate(state, array, row)` and Float MIN/MAX bundling as a
+  "sticky-NaN proof case" — recorded; Float MIN/MAX promotes as
+  ADR 022 against the new spine. `AggState` stays in `exec.rs` and
+  stays `Copy`; row-update bodies (`add_sum_value`, `add_avg_value`,
+  MIN/MAX update helpers), per-kernel state helpers, and per-kernel
+  finalize helpers are byte-identical pre- and post-refactor.
+  Architecture guard rename:
+  `aggregate_function_enum_guards_are_narrow` →
+  `aggregate_kernel_catalog_guards_are_narrow` (source-read
+  catalog-exhaustiveness with module-privacy and `AggState: Copy`
+  assertions); companion `bind_expr_remains_aggregate_free` adds the
+  ADR 015 reject-string-absence pattern to the aggregate surface.
+  SoA / SIMD forward-compatibility recorded as council-converged
+  consideration: catalog is pure metadata (no fn pointers in spec);
+  `StableAggregateKernel` `#[repr(u8)]` is the future plan-payload
+  shape; centralized dispatch points (`init_bound_state_for_call`
+  and optional `finalize_scalar_for_call`) are the SoA rewrite
+  seams; no row-path dyn dispatch (Codex's audit-clarity argument
+  is also the SoA-readiness guard). Bench artifact pending; no
+  minimum-speedup gate (refactor; expectation is no regression).
+  No SQL surface change, no IR shape change, no fragmenter detector
+  change, no cross-ring engagement.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -203,62 +241,81 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 020 implemented; ADR 021 candidates
+### ADR 021 promoted; ADR 022 candidates
 
-ADR 020 selected and implemented `AVG` as the second
-kernel-catalog widening under the post-ADR-018 cycle,
-completing the basic analytical set
-(`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`). Three-way council
-convergence ratified AVG-alone over Gemini's bundle-with-
-kernel-registry-refactor position; Gemini's dissent ("the
-maintenance cliff justifies bundling") was recorded in ADR
-020 §V1 §9 and carries forward as the lead nomination for
-ADR 021. ADR 021 selection starts from the post-ADR-020
-remainder:
+ADR 021 selected and promoted the **Aggregate Kernel Catalog
+Refactor** — an internal substrate ADR honoring ADR 020's
+Gemini dissent. The catalog (`crates/toron/src/aggregate_kernel.rs`)
+centralizes stable aggregate metadata for six kernels behind a
+`#[repr(u8)] StableAggregateKernel` compact tag and an
+`AggregateKernelSpec` pure-data table; planner / binder /
+executor-adjacent helpers delegate to the catalog; the three
+private binder helpers `sum_output_data_type` /
+`min_max_output_data_type` / `avg_output_data_type` are removed.
+Codex + Claude 2-of-3 majority across four iterations ratified
+catalog-only mechanism (no runtime trait dispatch in the row
+path) and refactor-alone scope; Gemini's four-iteration dissent
+on trait-dispatch + Float MIN/MAX bundling is recorded.
+`AggState` stays in `exec.rs` and stays `Copy`; row-update
+bodies and per-kernel state/finalize helpers are byte-identical
+pre- and post-refactor. SoA / SIMD forward-compatibility
+recorded as a council-converged consideration: catalog is pure
+metadata (no fn pointers in spec); `StableAggregateKernel`
+`#[repr(u8)]` is the future plan-payload shape; centralized
+dispatch points are the SoA rewrite seams; the no-row-path-dyn-
+dispatch position serves both audit clarity (Codex) and
+SoA-readiness. The Phase-1-through-Phase-6 migration is
+materialized in
+`plans/impl/021_aggregate_kernel_catalog_refactor.md`.
 
-**Leading substrate candidate — kernel-registry refactor:**
+ADR 022 selection starts from the post-ADR-021 remainder:
 
-- **Kernel-registry refactor across SUM / MIN / MAX / AVG (plus
-  the trivially-handled Count family).** The dispatch duplication
-  across 8+ match sites in binder / planner / executor — three
-  near-identical keyword/output-name helpers, parallel `if
-  matches!` validation blocks, divergent `init_*` patterns
-  (infallible for SUM/AVG; fallible Result for MIN/MAX) —
-  reached the threshold where consolidation earns its keep.
-  Trait-dispatch shape proposal: `AggregateKernel` trait with
-  `output_name`, `output_data_type`, `init_state`, `update`,
-  `finalize_scalar`, `finalize_grouped` associated functions.
-  Realistic net change is organizational (~30-50% body-line
-  reduction with ~40 enum match arms preserved as one-line
-  delegations), not line-count-reductive. Gemini's iter-3
-  position on ADR 020 promotes here as the ADR 021 lead.
-  **Closest candidate to ADR 021's nomination.**
+**Leading substrate-downstream candidate — Float MIN / MAX
+(with NaN policy):**
 
-**Strong runner-up — post-aggregate projection (ADR 022):**
+- **Float `MIN` / `MAX` with sticky-NaN policy.** ADR 019 V1
+  §1 deferred this for NaN / signed-zero policy ratification.
+  ADR 020's sticky-NaN behavior for Float64 AVG (naive `f64`
+  arithmetic propagates NaN; any NaN input produces NaN
+  output) extends naturally to MIN/MAX. With the ADR 021
+  catalog in place, ADR 022's contract is: add an input-
+  domain variant (likely `FloatMinMax` or extension of
+  `IntMinMax`); ratify the NaN-policy decision; ratify
+  signed-zero handling. Code shape is small (likely four new
+  `AggState` variants for Min/Max x Float32/Float64, or an
+  equivalent Copy state layout; no new stable catalog row if
+  the existing MIN/MAX specs widen by domain; one new domain
+  enum variant). Gemini's iter-0/1/2/3
+  bundling argument for ADR 021 promotes here as the
+  immediate downstream user of the new spine — Gemini's
+  "sticky-NaN proof case" motivation is honored as ADR 022.
+  **Closest candidate to ADR 022's nomination.**
+
+**Strong runner-up — post-aggregate projection (ADR 023):**
 
 - **Post-aggregate projection.** The `GroupedAggregateScope`
   naming-asymmetry signal (17 references across
   `sql_planner.rs`; 12 used in scalar paths post-ADR-018) is
-  now over legibility threshold. ADR 022 renames the scope into
+  over legibility threshold. ADR 023 renames the scope into
   a broader output-name catalog (`AggregateOutputCatalog` or
   similar) and lifts the aliased / computed-expression / key-
-  subset surface. Touches the `LoweredSelect` seam and may need
-  a fragmenter routing decision for `Project` above grouped
-  aggregate output. Larger scope than ADR 021's refactor; could
-  promote ahead if a downstream workload or ADR needs aliased
-  aggregate output.
+  subset surface. Touches the `LoweredSelect` seam and may
+  need a fragmenter routing decision for `Project` above
+  grouped aggregate output. Depends on the ADR 021 catalog
+  for output-name authority. Could promote ahead of ADR 022
+  if a downstream workload or ADR needs aliased aggregate
+  output before Float MIN/MAX.
 
 **Other kernel-widening candidates:**
 
-- **Float `MIN` / `MAX`.** ADR 019 V1 §1 deferred for NaN /
-  signed-zero policy ratification. Smaller scope than the
-  kernel-registry refactor but with a sharper semantic-contract
-  question.
 - **`Utf8` `MIN` / `MAX`.** ADR 019 V1 §2 deferred for
   `AggState` Copy-refactor. Substrate refactor with cascading
-  effects across existing `match states[agg_idx]` patterns.
-  Bundleable with a collation/locale decision matrix, or kept
-  bytewise-only.
+  effects across existing `match states[agg_idx]` patterns;
+  forces `AggState` to lose `Copy`. ADR 021's catalog
+  preserves `AggState: Copy` as a non-load-bearing property
+  — Utf8 MIN/MAX is the first ADR that would change it.
+  Bundleable with a collation/locale decision matrix, or
+  kept bytewise-only.
 
 **Cross-ring candidate — ADR 02X (Wendelon AGG consumer wiring):**
 
@@ -292,13 +349,15 @@ their evidence outranks the substrate-and-surface set:
 
 **Kernel graduation evidence pressure (carried from ADR 018
 iter-1 sweep).** The experimental-kernel bound/unbound parity
-gap at `exec.rs:912-916` and `exec.rs:1035-1039` —
-`LinearRegress` / `ApproxQuantile` are accepted by planner +
+gap — `LinearRegress` / `ApproxQuantile` are accepted by planner +
 binder but the bound executor returns `NotImplemented`. Gated
 behind `allow_experimental_kernels` (default false), so
-production SQL paths don't reach it. The gap tightens the
-evidence case for the first kernel graduation but does not
-promote as ADR 021 lead by itself.
+production SQL paths don't reach it. Post-ADR-021 these kernels
+stay outside the stable catalog via the small adjacent
+`experimental_aggregate_sql_name` helper; graduation moves a
+kernel from experimental-helper to stable-catalog row. The gap
+tightens the evidence case for the first kernel graduation but
+does not promote as ADR 022 lead by itself.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
