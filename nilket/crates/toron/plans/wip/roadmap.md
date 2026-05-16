@@ -78,6 +78,21 @@ along with the forward-sequence rewrite.
   neutral, and grouped `ORDER BY SUM(...)` / `COUNT(...)` references lower
   to projected aggregate output fields. No new IR, no binder expression
   surface change, no fragmenter detector change.
+- **ADR 018 — Scalar-Aggregate `HAVING` / `ORDER BY` SQL.** Promoted;
+  implementation pending. Fourth instance of the ADR 015 cycle shape,
+  generalizing the ADR 016 / ADR 017 substrate to the scalar (no-`GROUP
+  BY`) aggregate surface: `lower_select`'s global-aggregate branch
+  constructs `GroupedAggregateScope::from_projection(&[], &aggr_expr)`
+  and inlines the optional HAVING-attachment; the `HAVING`-without-
+  `GROUP BY` reject conditions on the absence of an aggregate
+  projection. HAVING-only scalar plans route via `single_task_stage`
+  (zero exchanges); ordered scalar plans route via the generic
+  one-exchange producer/consumer path (ADR 010's `Sort + Exchange(1, [])`
+  wrap). The grouped-aggregate branch is byte-identical pre- and
+  post-ADR-018 — no helper extraction, no reject-ordering refactor.
+  Closes ADR 016 §1 and ADR 017 §10 catch-all rejects. No new IR, no
+  binder expression surface change, no fragmenter detector change, no
+  walker signature change.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -145,12 +160,26 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 017 implemented; ADR 018 candidates
+### ADR 018 promoted; ADR 019 candidates
 
-**Adjacent SQL-surface candidates** carry forward from the
-ADR 017 selection round, all still resting on ADR 011's narrow
-grouped-aggregate surface:
+ADR 018 selection closed the ADR 017 round on scalar-aggregate
+`HAVING` / `ORDER BY` — the fourth instance of the cycle shape
+generalized the ADR 016 / ADR 017 substrate to the scalar
+surface without modification. The cycle's "shape-neutral
+walker" framing now has four proofs across grouped and scalar
+aggregate shapes. ADR 019 selection starts from the remainder:
 
+**Adjacent SQL-surface candidates** carry forward, all still
+resting on ADR 011's narrow grouped-aggregate surface:
+
+- **Aggregate-catalog widening (`AVG` / `MIN` / `MAX`).** One
+  ADR per kernel under the Wendelon-ADR-070 pattern. Pure
+  additive — a new `AggregateFunction` variant + a new
+  `GroupedAggregateSignature` variant + a new
+  `lower_*_aggregate` arm composes mechanically with the
+  cycle's substrate, now proved against both grouped and
+  scalar shapes. Closest candidate to ADR 018's nomination
+  runner-up.
 - **`DISTINCT`** — `GROUP BY <all output columns>` with no
   aggregates. ADR 010 closed its silent drop; implementation
   remains aggregate-path ADR work. Loosens ADR 011's zero-
@@ -162,14 +191,29 @@ grouped-aggregate surface:
   authoritative output-name catalog when this widens.
 - **`GROUP BY` over joins.** Composes ADR 008's join surface with
   ADR 011's grouped aggregate; ADR 011 rejected this in V1.
-- **Scalar-aggregate `HAVING` / `ORDER BY`.** Lifts the catch-
-  all rejects ADR 016 §1 and ADR 017 §10 left in place. Own
-  ADR.
+  Only candidate in the set with a possible brainstorm-seam
+  concern (fragmenter routing decision vs disaggregated-
+  compute placement, brainstorm 003).
 
 **Other ADR 011 follow-ons** carry forward as candidates if their
 evidence outranks the SQL-surface set: two-phase partial/final
-aggregation, aggregate-catalog widening (`AVG` / `MIN` / `MAX`
-and experimental-kernel graduation).
+aggregation (lifts ADR 018's V1 §1 scalar single-stage ceiling
+and the grouped per-partition contract), aggregate-catalog
+widening (already listed above), experimental-kernel graduation.
+
+**Kernel graduation evidence pressure (from ADR 018 iter-1
+sweep).** The experimental-kernel bound/unbound parity gap at
+`exec.rs:912-916` and `exec.rs:1035-1039` — `LinearRegress` /
+`ApproxQuantile` are accepted by planner + binder but the
+bound executor returns `NotImplemented`; the unbound executor
+implements them. Gated behind `allow_experimental_kernels`
+(default false), so production SQL paths don't reach it. The
+gap tightens the evidence case for the first kernel
+graduation (likely `LinearRegress`) but does not promote as
+ADR 019 lead by itself. ADR 018 separately pins inherited
+empty-input aggregate behavior; future kernel-graduation
+ADRs remain the right place for aggregate-kernel semantic
+changes.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
