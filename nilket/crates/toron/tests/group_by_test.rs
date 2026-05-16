@@ -209,10 +209,77 @@ fn group_by_with_order_by_ordinal_limit_offset_lowers() {
 }
 
 #[test]
-fn group_by_order_by_aggregate_call_rejects() {
-	assert_unsupported(
-		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount)",
+fn group_by_order_by_aggregate_call_rewrites_to_projected_output_field() {
+	let plan =
+		plan_sql("SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC");
+
+	let LogicalPlan::Sort {
+		order_by, input, ..
+	} = plan
+	else {
+		panic!("expected sort over grouped aggregate");
+	};
+	assert_eq!(order_by.len(), 1);
+	assert_column(&order_by[0].expr, "sum");
+	assert!(order_by[0].descending);
+	assert!(matches!(
+		input.as_ref(),
+		LogicalPlan::Exchange {
+			partition_count: 1,
+			key,
+			input,
+		} if key.is_empty() && matches!(input.as_ref(), LogicalPlan::Aggregate { .. })
+	));
+}
+
+#[test]
+fn group_by_having_and_order_by_aggregate_calls_rewrite_together() {
+	let plan = plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) DESC",
 	);
+
+	let LogicalPlan::Sort {
+		order_by, input, ..
+	} = plan
+	else {
+		panic!("expected sort over HAVING filter");
+	};
+	assert_eq!(order_by.len(), 1);
+	assert_column(&order_by[0].expr, "sum");
+	assert!(order_by[0].descending);
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+		panic!("expected HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
+}
+
+#[test]
+fn group_by_order_by_aggregate_call_rewrite_is_case_insensitive() {
+	let plan =
+		plan_sql("SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC");
+
+	let LogicalPlan::Sort { order_by, .. } = plan else {
+		panic!("expected sort over grouped aggregate");
+	};
+	assert_column(&order_by[0].expr, "sum");
+}
+
+#[test]
+fn group_by_order_by_qualified_column_reference_still_reaches_lower_expr() {
+	let plan = plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region ORDER BY sales.region");
+
+	let LogicalPlan::Sort { order_by, .. } = plan else {
+		panic!("expected sort over grouped aggregate");
+	};
+	assert_qualified_column(&order_by[0].expr, "sales", "region");
 }
 
 #[test]
@@ -309,6 +376,18 @@ fn having_aggregate_call_argument_must_match_projected_aggregate() {
 		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(other_amount) > 1000",
 		"HAVING aggregate-call must appear in SELECT list",
 	);
+	assert_unsupported_message(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(sales.amount) > 10",
+		"HAVING aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn order_by_aggregate_call_argument_must_match_projected_aggregate() {
+	assert_unsupported_message(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(other_amount)",
+		"ORDER BY aggregate-call must appear in SELECT list",
+	);
 }
 
 #[test]
@@ -339,10 +418,36 @@ fn having_aggregate_call_ambiguity_is_rejected() {
 }
 
 #[test]
+fn order_by_aggregate_call_ambiguity_is_rejected() {
+	for sql in [
+		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region ORDER BY COUNT(*)",
+		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region ORDER BY COUNT(*)",
+		"SELECT count, COUNT(amount) FROM events GROUP BY count ORDER BY COUNT(amount)",
+	] {
+		assert_unsupported_message(sql, "ambiguous ORDER BY aggregate-call");
+	}
+}
+
+#[test]
 fn having_qualified_column_reference_is_rejected() {
 	assert_unsupported_message(
 		"SELECT region, COUNT(*) FROM sales GROUP BY region HAVING t.region = 'EMEA'",
 		"qualified HAVING column references are not supported",
+	);
+}
+
+#[test]
+fn order_by_aggregate_call_outside_grouped_query_still_rejects() {
+	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY SUM(amount)");
+}
+
+#[test]
+fn order_by_computed_aggregate_call_expression_still_rejects() {
+	assert_unsupported(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 100",
+	);
+	assert_unsupported(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY -SUM(amount)",
 	);
 }
 
@@ -433,6 +538,11 @@ async fn grouped_aggregate_order_by_binds_against_aggregate_output() {
 		),
 		(
 			"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY sum DESC",
+			ColumnOrdinal(1),
+			true,
+		),
+		(
+			"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC",
 			ColumnOrdinal(1),
 			true,
 		),
@@ -552,7 +662,7 @@ async fn grouped_aggregate_having_non_output_column_rejects_at_bind() {
 #[tokio::test]
 async fn grouped_aggregate_order_by_executes_after_aggregation() {
 	let top_two = run_logical(&plan_sql(
-		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY 2 DESC LIMIT 2",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) DESC LIMIT 2",
 	))
 	.await;
 	assert_eq!(
@@ -598,7 +708,7 @@ async fn grouped_aggregate_having_executes_after_aggregation() {
 async fn grouped_aggregate_having_order_by_limit_offset_executes() {
 	let results = run_logical(&plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
-		 HAVING SUM(amount) > 5 ORDER BY 2 DESC LIMIT 1 OFFSET 1",
+		 HAVING SUM(amount) > 5 ORDER BY SUM(amount) DESC LIMIT 1 OFFSET 1",
 	))
 	.await;
 	assert_eq!(
@@ -610,7 +720,8 @@ async fn grouped_aggregate_having_order_by_limit_offset_executes() {
 #[tokio::test]
 async fn ordered_grouped_aggregate_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
-		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let hand_built = hand_built_ordered_grouped_sum_plan(Some(10), 1);
 	let sql_results = run_logical(&sql).await;
@@ -641,7 +752,7 @@ async fn grouped_aggregate_having_sql_matches_hand_built_filter_plan() {
 async fn grouped_aggregate_having_order_by_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
-		 HAVING SUM(amount) > 10 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let hand_built = hand_built_ordered_having_grouped_sum_plan(Some(10), 1);
 	let sql_results = run_logical(&sql).await;
@@ -721,7 +832,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 	let (catalog, _) = fixture();
 	let logical = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
-		 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+		 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
@@ -802,7 +913,7 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 	let (catalog, _) = fixture();
 	let logical = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
-		 HAVING SUM(amount) > 10 ORDER BY 2 DESC LIMIT 10 OFFSET 1",
+		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
@@ -1183,6 +1294,24 @@ fn assert_column(expr: &Expr, expected: &str) {
 	match expr {
 		Expr::Column(column) => assert_eq!(column.name.0, expected),
 		other => panic!("expected column {expected}, got {other:?}"),
+	}
+}
+
+fn assert_qualified_column(expr: &Expr, expected_qualifier: &str, expected_name: &str) {
+	match expr {
+		Expr::Column(column) => {
+			assert_eq!(
+				column
+					.qualifier
+					.as_ref()
+					.map(|qualifier| qualifier.table.as_str()),
+				Some(expected_qualifier)
+			);
+			assert_eq!(column.name.0, expected_name);
+		}
+		other => {
+			panic!("expected qualified column {expected_qualifier}.{expected_name}, got {other:?}")
+		}
 	}
 }
 

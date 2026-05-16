@@ -8,7 +8,7 @@ final positions.
 
 ## Status
 
-Promoted. Implementation pending.
+Promoted. Implemented.
 
 Three-way AI Swarm Council convergence reached across four
 iteration rounds. Iter-0 nominated `ORDER BY <aggregate-call>`
@@ -26,7 +26,8 @@ on. Iter-2 / iter-3 / iter-4 converged on the canonical
 contract shape. Iteration artifacts retire when this plan is
 promoted — git holds the narrative.
 
-ADR 017 owns no independent bench artifact. It is the third
+ADR 017 owns no independent bench artifact. Its implementation
+landed as the third
 instance of the composition cycle established by ADR 015
 (`Sort` over `Aggregate`) and proved by ADR 016 (`Filter` over
 `Aggregate`); the load-bearing property of the cycle shape —

@@ -476,7 +476,7 @@ fn adr016_having_guards_are_narrow() {
 	let aggregate_output_name = planner
 		.split("fn aggregate_output_name")
 		.nth(1)
-		.and_then(|rest| rest.split("fn having_aggregate_signature").next())
+		.and_then(|rest| rest.split("fn grouped_aggregate_signature").next())
 		.expect("planner aggregate output name helper");
 	let aggregate_field = binder
 		.split("fn aggregate_field")
@@ -539,6 +539,39 @@ fn adr016_having_guards_are_narrow() {
 	assert!(detector.contains("ExecutionPlan::Filter"));
 	assert!(detector.contains("ExecutionPlan::Aggregate"));
 	assert!(detector.contains("having = Some"));
+}
+
+#[test]
+fn adr017_order_by_aggregate_call_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(planner.contains("ORDER BY aggregate-call must appear in SELECT list"));
+	assert!(planner.contains("ambiguous ORDER BY aggregate-call"));
+	assert!(planner.contains("qualified HAVING column references are not supported"));
+	assert!(planner.contains("struct LoweredSelect"));
+	assert!(planner.contains("grouped_aggregate_scope: Option<GroupedAggregateScope>"));
+	assert!(planner.contains("fn rewrite_grouped_aggregate_calls"));
+	assert!(!planner.contains("HavingAggregateScope"));
+	assert!(!planner.contains("rewrite_having_aggregate_calls"));
+
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_expr = binder
+		.split("fn bind_expr")
+		.nth(1)
+		.and_then(|rest| rest.split("fn bind_comparison").next())
+		.expect("bind_expr block");
+	assert!(!bind_expr.contains("AggregateCall"));
+	assert!(!bind_expr.contains("AggregateFunction"));
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let filter_disposition = execution_source
+		.split("pub enum FilterDisposition")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct ExecutionSortKey").next())
+		.expect("FilterDisposition enum");
+	assert_eq!(enum_variant_count(filter_disposition), 2);
 }
 
 fn enum_variant_count(enum_body: &str) -> usize {

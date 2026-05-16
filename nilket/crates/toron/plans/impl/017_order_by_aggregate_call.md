@@ -5,9 +5,9 @@
 
 ## Status
 
-Promoted. Implementation pending.
+Promoted. Implemented.
 
-This is a small single-crate composition: one rename pass, one
+This landed as a small single-crate composition: one rename pass, one
 return-shape change, one function-signature extension, one
 walker invocation, test coverage at four layers (planner /
 binder / fragmenter / integration). No new IR variant, no wire
@@ -232,13 +232,13 @@ Expected code changes:
 - `crates/toron/tests/architecture_test.rs`:
   - Add the five guards listed in Substrate above.
 
-Expected documentation:
+Updated documentation:
 
 - `crates/toron/plans/adr/017_order_by_aggregate_call.md`
 - `crates/toron/plans/impl/017_order_by_aggregate_call.md`
 - `crates/toron/plans/wip/roadmap.md` — ADR 017 retires from
   "candidates" into "Implemented" with the cycle-shape
-  triplet note (deferred until implementation lands).
+  triplet note.
 - `~/.claude/projects/-home-me-work-nilket/memory/adr-015-
   cycle-shape.md` — update to record three instances of the
   cycle shape and the load-bearing property (source-level

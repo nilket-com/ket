@@ -90,13 +90,16 @@ impl SqlPlanner {
 			));
 		}
 
-		let plan = match &**body {
+		let LoweredSelect {
+			plan,
+			grouped_aggregate_scope,
+		} = match &**body {
 			SetExpr::Select(select) => self.lower_select(select)?,
 			_ => return Err(unsupported("unsupported query body")),
 		};
 
 		if let Some(order_by) = order_by {
-			let order_by = self.lower_order_by(order_by)?;
+			let order_by = self.lower_order_by(order_by, grouped_aggregate_scope.as_ref())?;
 			let limit = limit
 				.as_ref()
 				.map(parse_non_negative_usize_literal)
@@ -121,7 +124,7 @@ impl SqlPlanner {
 		}
 	}
 
-	fn lower_select(&self, select: &Select) -> Result<LogicalPlan, FrontendError> {
+	fn lower_select(&self, select: &Select) -> Result<LoweredSelect, FrontendError> {
 		let Select {
 			select_token,
 			distinct,
@@ -240,12 +243,15 @@ impl SqlPlanner {
 				.iter()
 				.map(|key| key.expr.clone())
 				.collect::<Vec<_>>();
-			let grouped_projection = self.lower_grouped_projection(projection, &group_keys)?;
+			let GroupedProjection {
+				aggr_expr,
+				grouped_scope,
+			} = self.lower_grouped_projection(projection, &group_keys)?;
 			let having_predicate = having
 				.as_ref()
-				.map(|having| self.lower_having_predicate(having, &grouped_projection.having_scope))
+				.map(|having| self.lower_having_predicate(having, &grouped_scope))
 				.transpose()?;
-			if grouped_projection.aggr_expr.is_empty() {
+			if aggr_expr.is_empty() {
 				return Err(unsupported("GROUP BY requires at least one aggregate call"));
 			}
 			let aggregate = LogicalPlan::Aggregate {
@@ -255,15 +261,19 @@ impl SqlPlanner {
 					key: group_expr.clone(),
 				}),
 				group_expr,
-				aggr_expr: grouped_projection.aggr_expr,
+				aggr_expr,
 			};
-			return Ok(if let Some(predicate) = having_predicate {
+			let plan = if let Some(predicate) = having_predicate {
 				LogicalPlan::Filter {
 					input: Box::new(aggregate),
 					predicate,
 				}
 			} else {
 				aggregate
+			};
+			return Ok(LoweredSelect {
+				plan,
+				grouped_aggregate_scope: Some(grouped_scope),
 			});
 		}
 
@@ -271,15 +281,21 @@ impl SqlPlanner {
 			// P0.5: accepted global aggregates keep the pre-ADR single-stage shape; no
 			// distributed exchange is inserted for the accounting refactor.
 			let aggr_expr = self.lower_global_aggregate_projection(projection)?;
-			return Ok(LogicalPlan::Aggregate {
-				input: Box::new(plan),
-				group_expr: vec![],
-				aggr_expr,
+			return Ok(LoweredSelect {
+				plan: LogicalPlan::Aggregate {
+					input: Box::new(plan),
+					group_expr: vec![],
+					aggr_expr,
+				},
+				grouped_aggregate_scope: None,
 			});
 		}
 
 		if matches!(projection.as_slice(), [SelectItem::Wildcard(_)]) {
-			return Ok(plan);
+			return Ok(LoweredSelect {
+				plan,
+				grouped_aggregate_scope: None,
+			});
 		}
 
 		let mut exprs = Vec::new();
@@ -295,13 +311,20 @@ impl SqlPlanner {
 			}
 		}
 
-		Ok(LogicalPlan::Project {
-			input: Box::new(plan),
-			exprs,
+		Ok(LoweredSelect {
+			plan: LogicalPlan::Project {
+				input: Box::new(plan),
+				exprs,
+			},
+			grouped_aggregate_scope: None,
 		})
 	}
 
-	fn lower_order_by(&self, order_by: &OrderBy) -> Result<Vec<SortExpr>, FrontendError> {
+	fn lower_order_by(
+		&self,
+		order_by: &OrderBy,
+		scope: Option<&GroupedAggregateScope>,
+	) -> Result<Vec<SortExpr>, FrontendError> {
 		if order_by.interpolate.is_some() {
 			return Err(unsupported("ORDER BY INTERPOLATE is not supported"));
 		}
@@ -316,8 +339,13 @@ impl SqlPlanner {
 				if expr.with_fill.is_some() {
 					return Err(unsupported("ORDER BY WITH FILL is not supported"));
 				}
+				let sql_expr = if let Some(scope) = scope {
+					self.rewrite_grouped_aggregate_calls(&expr.expr, scope, "ORDER BY")?
+				} else {
+					expr.expr.clone()
+				};
 				Ok(SortExpr {
-					expr: self.lower_expr(&expr.expr)?,
+					expr: self.lower_expr(&sql_expr)?,
 					descending: expr.asc == Some(false),
 					nulls_first: expr.nulls_first.unwrap_or(false),
 				})
@@ -410,66 +438,73 @@ impl SqlPlanner {
 		if aggr_expr.is_empty() {
 			return Ok(GroupedProjection {
 				aggr_expr,
-				having_scope: HavingAggregateScope::from_projection(group_keys, &[]),
+				grouped_scope: GroupedAggregateScope::from_projection(group_keys, &[]),
 			});
 		}
-		let having_scope = HavingAggregateScope::from_projection(group_keys, &aggr_expr);
+		let grouped_scope = GroupedAggregateScope::from_projection(group_keys, &aggr_expr);
 		Ok(GroupedProjection {
 			aggr_expr,
-			having_scope,
+			grouped_scope,
 		})
 	}
 
 	fn lower_having_predicate(
 		&self,
 		having: &SqlExpr,
-		scope: &HavingAggregateScope,
+		scope: &GroupedAggregateScope,
 	) -> Result<Expr, FrontendError> {
-		let rewritten = self.rewrite_having_aggregate_calls(having, scope)?;
+		reject_qualified_having_column_references(having)?;
+		let rewritten = self.rewrite_grouped_aggregate_calls(having, scope, "HAVING")?;
 		self.lower_expr(&rewritten)
 	}
 
-	fn rewrite_having_aggregate_calls(
+	fn rewrite_grouped_aggregate_calls(
 		&self,
 		expr: &SqlExpr,
-		scope: &HavingAggregateScope,
+		scope: &GroupedAggregateScope,
+		clause: &'static str,
 	) -> Result<SqlExpr, FrontendError> {
 		match expr {
 			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
-				let output_name = self.resolve_having_aggregate_reference(function, scope)?;
+				let output_name =
+					self.resolve_grouped_aggregate_reference(function, scope, clause)?;
 				Ok(SqlExpr::Identifier(Ident::new(output_name)))
 			}
 			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
-				left: Box::new(self.rewrite_having_aggregate_calls(left, scope)?),
+				left: Box::new(self.rewrite_grouped_aggregate_calls(left, scope, clause)?),
 				op: op.clone(),
-				right: Box::new(self.rewrite_having_aggregate_calls(right, scope)?),
+				right: Box::new(self.rewrite_grouped_aggregate_calls(right, scope, clause)?),
 			}),
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
-				self.rewrite_having_aggregate_calls(inner, scope)?,
+				self.rewrite_grouped_aggregate_calls(inner, scope, clause)?,
 			))),
 			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
-				self.rewrite_having_aggregate_calls(inner, scope)?,
+				self.rewrite_grouped_aggregate_calls(inner, scope, clause)?,
 			))),
 			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
-				self.rewrite_having_aggregate_calls(inner, scope)?,
+				self.rewrite_grouped_aggregate_calls(inner, scope, clause)?,
 			))),
-			SqlExpr::CompoundIdentifier(_) => Err(unsupported(
-				"qualified HAVING column references are not supported",
-			)),
 			_ => Ok(expr.clone()),
 		}
 	}
 
-	fn resolve_having_aggregate_reference(
+	fn resolve_grouped_aggregate_reference(
 		&self,
 		function: &Function,
-		scope: &HavingAggregateScope,
+		scope: &GroupedAggregateScope,
+		clause: &'static str,
 	) -> Result<String, FrontendError> {
 		let (function, args) =
 			self.lower_aggregate_function(function, AggregateSqlMode::Grouped)?;
-		let signature = having_aggregate_signature(&function, &args)
-			.ok_or_else(|| unsupported("HAVING aggregate-call must appear in SELECT list"))?;
-		scope.resolve(&signature)
+		let signature = grouped_aggregate_signature(&function, &args)
+			.ok_or_else(|| unsupported(aggregate_call_not_in_select_message(clause)))?;
+		match scope.resolve(&signature) {
+			ResolveOutcome::Found(output_name) => Ok(output_name),
+			ResolveOutcome::NotInSelect => {
+				Err(unsupported(aggregate_call_not_in_select_message(clause)))
+			}
+			ResolveOutcome::Ambiguous => Err(unsupported(ambiguous_aggregate_call_message(clause))),
+		}
 	}
 
 	fn lower_aggregate_function(
@@ -843,18 +878,24 @@ struct GroupKey {
 }
 
 #[derive(Debug)]
-struct GroupedProjection {
-	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
-	having_scope: HavingAggregateScope,
+struct LoweredSelect {
+	plan: LogicalPlan,
+	grouped_aggregate_scope: Option<GroupedAggregateScope>,
 }
 
 #[derive(Debug)]
-struct HavingAggregateScope {
-	entries: Vec<HavingAggregateEntry>,
+struct GroupedProjection {
+	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
+	grouped_scope: GroupedAggregateScope,
+}
+
+#[derive(Debug)]
+struct GroupedAggregateScope {
+	entries: Vec<GroupedAggregateEntry>,
 	output_name_counts: HashMap<String, usize>,
 }
 
-impl HavingAggregateScope {
+impl GroupedAggregateScope {
 	fn from_projection(
 		group_keys: &[GroupKey],
 		aggr_expr: &[(AggregateFunction, Vec<Expr>)],
@@ -868,8 +909,8 @@ impl HavingAggregateScope {
 		for (function, args) in aggr_expr {
 			let output_name = aggregate_output_name(function).to_string();
 			*output_name_counts.entry(output_name.clone()).or_insert(0) += 1;
-			if let Some(signature) = having_aggregate_signature(function, args) {
-				entries.push(HavingAggregateEntry {
+			if let Some(signature) = grouped_aggregate_signature(function, args) {
+				entries.push(GroupedAggregateEntry {
 					signature,
 					output_name,
 				});
@@ -882,7 +923,7 @@ impl HavingAggregateScope {
 		}
 	}
 
-	fn resolve(&self, signature: &HavingAggregateSignature) -> Result<String, FrontendError> {
+	fn resolve(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
 		let matches = self
 			.entries
 			.iter()
@@ -890,11 +931,9 @@ impl HavingAggregateScope {
 			.collect::<Vec<_>>();
 		let [entry] = matches.as_slice() else {
 			return if matches.is_empty() {
-				Err(unsupported(
-					"HAVING aggregate-call must appear in SELECT list",
-				))
+				ResolveOutcome::NotInSelect
 			} else {
-				Err(unsupported("ambiguous HAVING aggregate-call"))
+				ResolveOutcome::Ambiguous
 			};
 		};
 		if self
@@ -904,23 +943,30 @@ impl HavingAggregateScope {
 			.unwrap_or(0)
 			> 1
 		{
-			return Err(unsupported("ambiguous HAVING aggregate-call"));
+			return ResolveOutcome::Ambiguous;
 		}
-		Ok(entry.output_name.clone())
+		ResolveOutcome::Found(entry.output_name.clone())
 	}
 }
 
 #[derive(Debug)]
-struct HavingAggregateEntry {
-	signature: HavingAggregateSignature,
+struct GroupedAggregateEntry {
+	signature: GroupedAggregateSignature,
 	output_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum HavingAggregateSignature {
+enum GroupedAggregateSignature {
 	CountAll,
 	Count(ColumnRef),
 	Sum(ColumnRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolveOutcome {
+	Found(String),
+	NotInSelect,
+	Ambiguous,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -958,6 +1004,38 @@ fn lower_group_by_key(expr: &SqlExpr) -> Result<GroupKey, FrontendError> {
 		_ => Err(unsupported(
 			"GROUP BY keys must be simple unqualified columns",
 		)),
+	}
+}
+
+fn reject_qualified_having_column_references(expr: &SqlExpr) -> Result<(), FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
+			"qualified HAVING column references are not supported",
+		)),
+		SqlExpr::BinaryOp { left, right, .. } => {
+			reject_qualified_having_column_references(left)?;
+			reject_qualified_having_column_references(right)
+		}
+		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
+			reject_qualified_having_column_references(inner)
+		}
+		_ => Ok(()),
+	}
+}
+
+fn aggregate_call_not_in_select_message(clause: &str) -> &'static str {
+	match clause {
+		"HAVING" => "HAVING aggregate-call must appear in SELECT list",
+		"ORDER BY" => "ORDER BY aggregate-call must appear in SELECT list",
+		other => unreachable!("unsupported grouped aggregate clause: {other}"),
+	}
+}
+
+fn ambiguous_aggregate_call_message(clause: &str) -> &'static str {
+	match clause {
+		"HAVING" => "ambiguous HAVING aggregate-call",
+		"ORDER BY" => "ambiguous ORDER BY aggregate-call",
+		other => unreachable!("unsupported grouped aggregate clause: {other}"),
 	}
 }
 
@@ -1013,18 +1091,18 @@ fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
 	}
 }
 
-fn having_aggregate_signature(
+fn grouped_aggregate_signature(
 	function: &AggregateFunction,
 	args: &[Expr],
-) -> Option<HavingAggregateSignature> {
+) -> Option<GroupedAggregateSignature> {
 	match function {
-		AggregateFunction::CountAll => Some(HavingAggregateSignature::CountAll),
+		AggregateFunction::CountAll => Some(GroupedAggregateSignature::CountAll),
 		AggregateFunction::Count => match args {
-			[Expr::Column(column)] => Some(HavingAggregateSignature::Count(column.clone())),
+			[Expr::Column(column)] => Some(GroupedAggregateSignature::Count(column.clone())),
 			_ => None,
 		},
 		AggregateFunction::Sum => match args {
-			[Expr::Column(column)] => Some(HavingAggregateSignature::Sum(column.clone())),
+			[Expr::Column(column)] => Some(GroupedAggregateSignature::Sum(column.clone())),
 			_ => None,
 		},
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,

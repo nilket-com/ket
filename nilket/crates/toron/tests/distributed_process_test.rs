@@ -564,7 +564,7 @@ async fn run_ordered_grouped_aggregate_process_query(
 		QueryBudget::test_default(),
 	);
 	let logical = SqlPlanner::new()
-		.plan("SELECT val, SUM(val) FROM fixture GROUP BY val ORDER BY 2 DESC LIMIT 5")
+		.plan("SELECT val, SUM(val) FROM fixture GROUP BY val ORDER BY SUM(val) DESC LIMIT 5")
 		.expect("plan ordered grouped aggregate");
 
 	let results = coordinator
@@ -654,7 +654,7 @@ async fn run_ordered_having_grouped_aggregate_process_query(
 	let logical = SqlPlanner::new()
 		.plan(
 			"SELECT val, SUM(val) FROM fixture GROUP BY val \
-			 HAVING SUM(val) > 3 ORDER BY 2 DESC LIMIT 5 OFFSET 1",
+			 HAVING SUM(val) > 3 ORDER BY SUM(val) DESC LIMIT 5 OFFSET 1",
 		)
 		.expect("plan ordered grouped aggregate HAVING");
 

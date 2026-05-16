@@ -71,6 +71,13 @@ along with the forward-sequence rewrite.
   and argument-normalized), and extends the ADR 015 detector with one
   optional `Filter` between the terminal-gather `Exchange` and the
   `Aggregate`. No new IR, no new binder seam, no new `FilterDisposition`.
+- **ADR 017 — `ORDER BY <aggregate-call>` for Grouped Aggregate SQL.**
+  Promoted + implemented. Third instance of the ADR 015 cycle shape:
+  `lower_select` returns a private `LoweredSelect` carrying the grouped
+  aggregate scope, the ADR 016 aggregate-call rewrite walker is clause-
+  neutral, and grouped `ORDER BY SUM(...)` / `COUNT(...)` references lower
+  to projected aggregate output fields. No new IR, no binder expression
+  surface change, no fragmenter detector change.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -138,26 +145,7 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### Plan promoted: ADR 017
-
-ADR 017's contract is pinned at
-`plans/adr/017_order_by_aggregate_call.md`; the impl plan lives
-at `plans/impl/017_order_by_aggregate_call.md`. Status is
-"Promoted. Implementation pending." ADR 017 owns no
-independent bench artifact — it is the third instance of the
-composition cycle (ADR 015 + ADR 016 + ADR 017), closing
-ADR 015's `ORDER BY <aggregate-call>` V1 exclusion via reuse of
-ADR 016's planner-side rewrite walker. Walker becomes shape-
-neutral; `lower_having_predicate` gains a small qualified-
-reference pre-pass; `lower_select` returns a private
-`LoweredSelect` struct; ORDER BY qualified column refs
-(`ORDER BY sales.region`) unchanged. No new IR, no new wire,
-no new failure surface. Architecture guards are semantic
-(presence of two new named ORDER BY rejects, preserved
-HAVING-qualified-reference reject) — no helper-call-count
-guard.
-
-### ADR 018 candidates
+### ADR 017 implemented; ADR 018 candidates
 
 **Adjacent SQL-surface candidates** carry forward from the
 ADR 017 selection round, all still resting on ADR 011's narrow
@@ -531,8 +519,8 @@ fades.
   not implementation cost — `ORDER BY <aggregate-call>`
   has a working workaround (`ORDER BY <ordinal>`),
   `HAVING <aggregate-call>` does not. Keeping the
-  exclusion preserves ADR 016's narrow framing; ADR 017
-  candidate.
+  exclusion preserved ADR 016's narrow framing; the
+  deferred surface landed in ADR 017.
 - **Place the post-aggregate `Filter` outside the
   terminal-gather `Exchange`.** Considered as alternative
   to the inside-gather form; rejected. Outside-gather
