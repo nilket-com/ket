@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::aggregate_kernel;
 use crate::coordinator::materialize_scan_stream;
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::task::TaskTelemetry;
@@ -1168,16 +1170,7 @@ impl Executor {
 					});
 				}
 			}
-			let field_name = match function {
-				AggregateFunction::CountAll => "count",
-				AggregateFunction::Count => "count",
-				AggregateFunction::Sum => "sum",
-				AggregateFunction::Min => "min",
-				AggregateFunction::Max => "max",
-				AggregateFunction::Avg => "avg",
-				AggregateFunction::LinearRegress => "linreg",
-				AggregateFunction::ApproxQuantile(_) => "quantile",
-			};
+			let field_name = aggregate_state_output_name(function);
 			let field_type = match function {
 				AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
 				_ => arrow::datatypes::DataType::Int64,
@@ -2955,46 +2948,46 @@ fn init_states(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<AggState> {
 fn init_bound_states(
 	aggr_expr: &[crate::ir::AggregateCall],
 ) -> Result<Vec<AggState>, ExecutionError> {
-	aggr_expr
-		.iter()
-		.map(|call| match call.function {
-			AggregateFunction::CountAll => Ok(AggState::Count(0)),
-			AggregateFunction::Count => Ok(AggState::Count(0)),
-			AggregateFunction::Sum => Ok(call
-				.args
-				.first()
-				.map(|arg| sum_state_for_data_type(&arg.data_type()))
-				.unwrap_or(AggState::SumInt {
-					total: 0,
-					seen: false,
-				})),
-			AggregateFunction::Min => call
-				.args
-				.first()
-				.map(|arg| min_state_for_data_type(&arg.data_type()))
-				.transpose()
-				.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
-			AggregateFunction::Max => call
-				.args
-				.first()
-				.map(|arg| max_state_for_data_type(&arg.data_type()))
-				.transpose()
-				.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
-			AggregateFunction::Avg => call
-				.args
-				.first()
-				.ok_or_else(|| ExecutionError::InvalidExpression {
-					message: "AVG requires one argument".to_string(),
-				})
-				.and_then(|arg| avg_state_for_data_type(&arg.data_type())),
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => Ok({
-				AggState::SumInt {
-					total: 0,
-					seen: false,
-				}
-			}),
-		})
-		.collect()
+	aggr_expr.iter().map(init_bound_state_for_call).collect()
+}
+
+fn init_bound_state_for_call(call: &crate::ir::AggregateCall) -> Result<AggState, ExecutionError> {
+	match call.function {
+		AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
+		AggregateFunction::Sum => Ok(call
+			.args
+			.first()
+			.map(|arg| sum_state_for_data_type(&arg.data_type()))
+			.unwrap_or(AggState::SumInt {
+				total: 0,
+				seen: false,
+			})),
+		AggregateFunction::Min => call
+			.args
+			.first()
+			.map(|arg| min_state_for_data_type(&arg.data_type()))
+			.transpose()
+			.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
+		AggregateFunction::Max => call
+			.args
+			.first()
+			.map(|arg| max_state_for_data_type(&arg.data_type()))
+			.transpose()
+			.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
+		AggregateFunction::Avg => call
+			.args
+			.first()
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: "AVG requires one argument".to_string(),
+			})
+			.and_then(|arg| avg_state_for_data_type(&arg.data_type())),
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			Ok(AggState::SumInt {
+				total: 0,
+				seen: false,
+			})
+		}
+	}
 }
 
 fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionError> {
@@ -3382,19 +3375,25 @@ fn avg_column_from_groups(
 
 #[cfg(test)]
 fn aggregate_state_keyword(function: &AggregateFunction) -> &'static str {
-	match function {
-		AggregateFunction::Min => "MIN",
-		AggregateFunction::Max => "MAX",
-		_ => "aggregate",
-	}
+	aggregate_kernel::stable_spec_for_function(function)
+		.map(|spec| spec.sql_name)
+		.unwrap_or("aggregate")
 }
 
 #[cfg(test)]
 fn aggregate_state_output_name(function: &AggregateFunction) -> &'static str {
+	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
+		return spec.output_name;
+	}
 	match function {
-		AggregateFunction::Min => "min",
-		AggregateFunction::Max => "max",
-		_ => "aggregate",
+		AggregateFunction::LinearRegress => "linreg",
+		AggregateFunction::ApproxQuantile(_) => "quantile",
+		AggregateFunction::CountAll
+		| AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 	}
 }
 

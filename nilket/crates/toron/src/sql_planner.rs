@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
@@ -1125,27 +1126,26 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
 	let [ident] = name.0.as_slice() else {
 		return None;
 	};
-	match ident.value.to_ascii_uppercase().as_str() {
-		"COUNT" => Some("COUNT"),
-		"SUM" => Some("SUM"),
-		"MIN" => Some("MIN"),
-		"MAX" => Some("MAX"),
-		"AVG" => Some("AVG"),
-		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
-		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
-		_ => None,
+	let upper = ident.value.to_ascii_uppercase();
+	if aggregate_kernel::is_stable_aggregate_sql_name(&upper) {
+		return aggregate_kernel::stable_aggregate_sql_name(&upper);
 	}
+	aggregate_kernel::experimental_aggregate_sql_name(&upper)
 }
 
 fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
+	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
+		return spec.output_name;
+	}
 	match function {
-		AggregateFunction::CountAll | AggregateFunction::Count => "count",
-		AggregateFunction::Sum => "sum",
-		AggregateFunction::Min => "min",
-		AggregateFunction::Max => "max",
-		AggregateFunction::Avg => "avg",
 		AggregateFunction::LinearRegress => "linreg",
 		AggregateFunction::ApproxQuantile(_) => "quantile",
+		AggregateFunction::CountAll
+		| AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 	}
 }
 
@@ -1153,6 +1153,11 @@ fn grouped_aggregate_signature(
 	function: &AggregateFunction,
 	args: &[Expr],
 ) -> Option<GroupedAggregateSignature> {
+	if !aggregate_kernel::stable_spec_for_function(function)
+		.is_some_and(|spec| spec.grouped_supported)
+	{
+		return None;
+	}
 	match function {
 		AggregateFunction::CountAll => Some(GroupedAggregateSignature::CountAll),
 		AggregateFunction::Count => match args {
@@ -1175,7 +1180,9 @@ fn grouped_aggregate_signature(
 			[Expr::Column(column)] => Some(GroupedAggregateSignature::Avg(column.clone())),
 			_ => None,
 		},
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			unreachable!("experimental kernels are not grouped-supported")
+		}
 	}
 }
 

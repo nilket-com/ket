@@ -1,3 +1,5 @@
+mod aggregate_kernel;
+
 pub mod binder;
 pub mod catalog;
 pub mod coordinator;

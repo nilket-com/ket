@@ -445,78 +445,79 @@ fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
 }
 
 #[test]
-fn aggregate_function_enum_guards_are_narrow() {
+fn aggregate_kernel_catalog_guards_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	assert!(!planner.contains("HAVING is not supported"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
 	assert!(planner.contains("qualified HAVING column references are not supported"));
+	assert!(planner.contains("unsupported aggregate function"));
 
-	let binder =
-		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	let bind_expr = binder
-		.split("fn bind_expr")
-		.nth(1)
-		.and_then(|rest| rest.split("fn bind_comparison").next())
-		.expect("bind_expr block");
-	assert!(!bind_expr.contains("AggregateCall"));
-	assert!(!bind_expr.contains("AggregateFunction"));
+	let lib = std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source");
+	assert!(lib.contains("mod aggregate_kernel;"));
+	assert!(!lib.contains("pub mod aggregate_kernel"));
 
-	let aggregate_function_source =
-		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
-	let aggregate_function = aggregate_function_source
-		.split("pub enum AggregateFunction")
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	assert!(catalog.contains("debug_assert_eq!(spec.kind, kernel);"));
+	let stable_kernel_enum = catalog
+		.split("pub(crate) enum StableAggregateKernel")
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
-		.expect("AggregateFunction enum");
-	assert_eq!(enum_variant_count(aggregate_function), 8);
-
-	let aggregate_output_name = planner
-		.split("fn aggregate_output_name")
-		.nth(1)
-		.and_then(|rest| rest.split("fn grouped_aggregate_signature").next())
-		.expect("planner aggregate output name helper");
-	let aggregate_field = binder
-		.split("fn aggregate_field")
-		.nth(1)
-		.and_then(|rest| rest.split("fn sum_output_data_type").next())
-		.expect("binder aggregate field helper");
-	for (variant, planner_name, binder_field) in [
-		(
-			"AggregateFunction::CountAll",
-			"\"count\"",
-			"Field::new(\"count\",",
-		),
-		(
-			"AggregateFunction::Count",
-			"\"count\"",
-			"Field::new(\"count\",",
-		),
-		("AggregateFunction::Sum", "\"sum\"", "Field::new(\"sum\","),
-		("AggregateFunction::Min", "\"min\"", "Field::new(\"min\","),
-		("AggregateFunction::Max", "\"max\"", "Field::new(\"max\","),
-		("AggregateFunction::Avg", "\"avg\"", "Field::new(\"avg\","),
-		(
-			"AggregateFunction::LinearRegress",
-			"\"linreg\"",
-			"Field::new(\"linreg\",",
-		),
-		(
-			"AggregateFunction::ApproxQuantile(_)",
-			"\"quantile\"",
-			"Field::new(\"quantile\",",
-		),
-	] {
+		.expect("stable aggregate kernel enum");
+	for variant in ["CountAll", "Count", "Sum", "Min", "Max", "Avg"] {
 		assert!(
-			match_arm_maps_to(aggregate_output_name, variant, planner_name),
-			"planner aggregate_output_name mapping drifted for {variant}"
-		);
-		assert!(
-			match_arm_maps_to(aggregate_field, variant, binder_field),
-			"binder aggregate_field mapping drifted for {variant}"
+			stable_kernel_enum.contains(variant),
+			"stable aggregate kernel missing {variant}"
 		);
 	}
+	assert_eq!(enum_variant_count(stable_kernel_enum), 6);
+
+	let stable_rows = catalog
+		.split("STABLE_AGGREGATE_KERNELS")
+		.nth(1)
+		.and_then(|rest| rest.split("];").next())
+		.expect("stable aggregate kernel rows");
+	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 6);
+	for marker in [
+		"kind: StableAggregateKernel::CountAll",
+		"kind: StableAggregateKernel::Count",
+		"kind: StableAggregateKernel::Sum",
+		"kind: StableAggregateKernel::Min",
+		"kind: StableAggregateKernel::Max",
+		"kind: StableAggregateKernel::Avg",
+		"arity: AggregateArity::Zero",
+		"arity: AggregateArity::One",
+		"input_domain: AggregateInputDomain::Any",
+		"input_domain: AggregateInputDomain::SumNumeric",
+		"input_domain: AggregateInputDomain::AvgNumeric",
+		"input_domain: AggregateInputDomain::IntMinMax",
+		"output_rule: AggregateOutputRule::Int64",
+		"output_rule: AggregateOutputRule::Float64",
+		"output_rule: AggregateOutputRule::SameAsInput",
+		"output_rule: AggregateOutputRule::SumNumeric",
+		"nullable: false",
+		"nullable: true",
+		"grouped_supported: true",
+	] {
+		assert!(stable_rows.contains(marker), "catalog missing {marker}");
+	}
+	assert_eq!(stable_rows.matches("sql_name: \"COUNT\"").count(), 2);
+	for sql_name in ["COUNT", "SUM", "MIN", "MAX", "AVG"] {
+		assert!(
+			stable_rows.contains(&format!("sql_name: \"{sql_name}\"")),
+			"catalog missing SQL name {sql_name}"
+		);
+	}
+	for output_name in ["count", "sum", "min", "max", "avg"] {
+		assert!(
+			stable_rows.contains(&format!("output_name: \"{output_name}\"")),
+			"catalog missing output name {output_name}"
+		);
+	}
+	assert!(!stable_rows.contains("LinearRegress"));
+	assert!(!stable_rows.contains("ApproxQuantile"));
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
@@ -541,6 +542,25 @@ fn aggregate_function_enum_guards_are_narrow() {
 	assert!(detector.contains("ExecutionPlan::Filter"));
 	assert!(detector.contains("ExecutionPlan::Aggregate"));
 	assert!(detector.contains("having = Some"));
+
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
+	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
+	assert!(derives_above.contains("Copy"));
+}
+
+#[test]
+fn bind_expr_remains_aggregate_free() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_expr = binder
+		.split("fn bind_expr")
+		.nth(1)
+		.and_then(|rest| rest.split("fn bind_comparison").next())
+		.expect("bind_expr block");
+	assert!(!bind_expr.contains("AggregateCall"));
+	assert!(!bind_expr.contains("AggregateFunction"));
 }
 
 #[test]
@@ -620,12 +640,14 @@ fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	assert!(binder.contains("AggregateFunction::Min => Field::new("));
-	assert!(binder.contains("\"min\""));
-	assert!(binder.contains("AggregateFunction::Max => Field::new("));
-	assert!(binder.contains("\"max\""));
-	assert!(binder.contains("fn min_max_output_data_type"));
 	assert!(binder.contains("expects Int32 or Int64 input"));
+
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	assert!(catalog.contains("kind: StableAggregateKernel::Min"));
+	assert!(catalog.contains("kind: StableAggregateKernel::Max"));
+	assert!(catalog.contains("input_domain: AggregateInputDomain::IntMinMax"));
+	assert!(catalog.contains("output_rule: AggregateOutputRule::SameAsInput"));
 
 	let aggregate_function_source =
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
@@ -659,15 +681,19 @@ fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 		.expect("read SQL planner source");
 	assert!(planner.contains("\"AVG\" => self.lower_avg_aggregate"));
 	assert!(planner.contains("AVG requires one argument"));
-	assert!(planner.contains("AggregateFunction::Avg => \"avg\""));
 	assert!(planner.contains("GroupedAggregateSignature::Avg"));
 	assert!(planner.contains("unsupported aggregate function"));
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	assert!(binder.contains("AggregateFunction::Avg => Field::new(\"avg\""));
-	assert!(binder.contains("fn avg_output_data_type"));
 	assert!(binder.contains("AVG expects numeric input"));
+
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	assert!(catalog.contains("kind: StableAggregateKernel::Avg"));
+	assert!(catalog.contains("output_name: \"avg\""));
+	assert!(catalog.contains("input_domain: AggregateInputDomain::AvgNumeric"));
+	assert!(catalog.contains("output_rule: AggregateOutputRule::Float64"));
 
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
@@ -698,40 +724,6 @@ fn enum_variant_count(enum_body: &str) -> usize {
 				&& (trimmed.ends_with(',') || trimmed.ends_with('{'))
 		})
 		.count()
-}
-
-fn compact_whitespace(source: &str) -> String {
-	source.split_whitespace().collect()
-}
-
-fn match_arm_maps_to(source: &str, variant: &str, mapped_expr_prefix: &str) -> bool {
-	let source = compact_whitespace(source);
-	let mut offset = 0;
-	while let Some(relative_start) = source[offset..].find(variant) {
-		let variant_start = offset + relative_start;
-		let variant_end = variant_start + variant.len();
-		let after_variant = source[variant_end..].chars().next();
-		if after_variant.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
-			offset = variant_end;
-			continue;
-		}
-
-		let tail = &source[variant_end..];
-		let Some(arrow_offset) = tail.find("=>") else {
-			return false;
-		};
-		let pattern_tail = &tail[..arrow_offset];
-		if pattern_tail.contains(',') || pattern_tail.contains('}') {
-			offset = variant_end;
-			continue;
-		}
-
-		if tail[arrow_offset + 2..].starts_with(mapped_expr_prefix) {
-			return true;
-		}
-		offset = variant_end;
-	}
-	false
 }
 
 #[test]

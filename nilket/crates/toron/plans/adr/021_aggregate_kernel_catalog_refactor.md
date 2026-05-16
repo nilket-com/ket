@@ -6,7 +6,7 @@
 
 ## Status
 
-Promoted.
+Promoted + implemented.
 
 Internal substrate ADR. Centralizes stable aggregate
 metadata into a single private catalog after ADR 019 and
@@ -58,6 +58,7 @@ ADR 021 also pins three smaller decisions:
   catalog's exhaustiveness contract. The compact tag
   matches the future SoA plan-payload shape
   (`aggregate_kernel_ids: [Sum, Avg, Count]` arrays).
+
 - **Architecture guard renamed and broadened.** The ADR
   020 guard `aggregate_function_enum_guards_are_narrow`
   becomes `aggregate_kernel_catalog_guards_are_narrow`
@@ -73,6 +74,13 @@ ADR 021 also pins three smaller decisions:
   Digest parity asserted; aggregate rows recorded; >10%
   per-row regression triggers investigation before
   merge.
+
+Implementation landed in the ADR 021 pass: the private
+`aggregate_kernel.rs` catalog is wired through planner,
+binder, and executor-adjacent metadata helpers; the row
+update/finalization state machines remain in `exec.rs`.
+Bench artifact:
+`plans/impl/021_aggregate_kernel_catalog_refactor_bench_results.md`.
 
 Load-bearing antecedents: ADR 011 (`Aggregate` operator
 surface, `AggState` enum, SUM/COUNT kernel substrate),

@@ -5,7 +5,7 @@
 
 ## Status
 
-Promoted.
+Promoted + implemented.
 
 Internal substrate refactor. One new private module
 (`crates/toron/src/aggregate_kernel.rs`), four modified
@@ -18,6 +18,14 @@ output changes, no plan digest changes, no IR shape
 change. Every existing test stays green; every binder
 error string is preserved byte-for-byte; every per-row
 state-machine body is unchanged.
+
+Implementation landed with the catalog-only mechanism:
+`aggregate_kernel.rs` owns stable metadata, planner and
+binder delegate metadata decisions to it, `exec.rs`
+delegates bound-state initialization through
+`init_bound_state_for_call`, and the architecture guards
+now source-read the catalog contract. Bench artifact:
+`021_aggregate_kernel_catalog_refactor_bench_results.md`.
 
 ## Goal
 

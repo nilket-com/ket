@@ -123,9 +123,10 @@ along with the forward-sequence rewrite.
   finalization pinned via explicit `vec![None]` assertions; sticky-NaN
   behavior pinned by hard-gate regression test. Legacy unbound path
   uses a single `AvgFloat` accumulator (favorable asymmetry vs MIN/MAX
-  — no first-batch type dance, no empty-input error). Architecture-
-  guard test renamed from `adr016_having_guards_are_narrow` to
-  `aggregate_function_enum_guards_are_narrow` (catalog-wide role).
+  — no first-batch type dance, no empty-input error). ADR 021 later
+  supersedes the temporary catalog-wide
+  `aggregate_function_enum_guards_are_narrow` guard with
+  `aggregate_kernel_catalog_guards_are_narrow`.
   Bench:
   `plans/impl/020_avg_aggregate_kernel_bench_results.md`.
   Wendelon-side already ships `SignedAverageParts { sum: i128, count:
@@ -136,7 +137,7 @@ along with the forward-sequence rewrite.
   contract when it engages. No new IR variant beyond the enum widening
   (7 → 8), no fragmenter detector change, no cross-ring engagement,
   `AggState` stays `Copy`.
-- **ADR 021 — Aggregate Kernel Catalog Refactor.** Promoted. Internal
+- **ADR 021 — Aggregate Kernel Catalog Refactor.** Promoted + implemented. Internal
   substrate ADR honoring ADR 020's Gemini dissent ("the maintenance
   cliff justifies bundling"). Centralizes stable aggregate metadata
   into one private `aggregate_kernel.rs` module with an
@@ -170,8 +171,9 @@ along with the forward-sequence rewrite.
   shape; centralized dispatch points (`init_bound_state_for_call`
   and optional `finalize_scalar_for_call`) are the SoA rewrite
   seams; no row-path dyn dispatch (Codex's audit-clarity argument
-  is also the SoA-readiness guard). Bench artifact pending; no
-  minimum-speedup gate (refactor; expectation is no regression).
+  is also the SoA-readiness guard). Bench:
+  `plans/impl/021_aggregate_kernel_catalog_refactor_bench_results.md`.
+  No minimum-speedup gate (refactor; expectation is no regression).
   No SQL surface change, no IR shape change, no fragmenter detector
   change, no cross-ring engagement.
 

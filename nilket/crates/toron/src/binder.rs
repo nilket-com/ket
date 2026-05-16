@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
+use crate::aggregate_kernel::{
+	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
+};
 use crate::catalog::{Catalog, TableBinding, TableRef};
 use crate::error::BindingError;
 use crate::ir::{
@@ -1068,69 +1071,16 @@ fn bind_aggregate_call(
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 ) -> Result<AggregateCall, BindingError> {
-	match function {
-		AggregateFunction::CountAll => Ok(AggregateCall {
+	if matches!(function, AggregateFunction::CountAll) {
+		return Ok(AggregateCall {
 			function: function.clone(),
 			args: Vec::new(),
-		}),
-		AggregateFunction::Count
-		| AggregateFunction::Sum
-		| AggregateFunction::Min
-		| AggregateFunction::Max
-		| AggregateFunction::Avg => {
-			if matches!(
-				function,
-				AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Avg
-			) && args.len() != 1
-			{
-				return Err(BindingError::UnsupportedExpression {
-					message: format!(
-						"{} requires one argument",
-						aggregate_function_keyword(function)
-					),
-				});
-			}
-			let args = args
-				.iter()
-				.map(|expr| bind_expr(expr, input_schema, config))
-				.collect::<Result<Vec<_>, _>>()?;
-			if matches!(function, AggregateFunction::Sum) {
-				let Some(arg) = args.first() else {
-					return Err(BindingError::UnsupportedExpression {
-						message: "SUM requires one argument".to_string(),
-					});
-				};
-				if sum_output_data_type(&arg.data_type()).is_none() {
-					return Err(BindingError::TypeMismatch {
-						message: format!("SUM expects numeric input, got {:?}", arg.data_type()),
-					});
-				}
-			}
-			if matches!(function, AggregateFunction::Min | AggregateFunction::Max) {
-				let arg = &args[0];
-				if min_max_output_data_type(&arg.data_type()).is_none() {
-					return Err(BindingError::TypeMismatch {
-						message: format!(
-							"{} expects Int32 or Int64 input, got {:?}",
-							aggregate_function_keyword(function),
-							arg.data_type()
-						),
-					});
-				}
-			}
-			if matches!(function, AggregateFunction::Avg) {
-				let arg = &args[0];
-				if avg_output_data_type(&arg.data_type()).is_none() {
-					return Err(BindingError::TypeMismatch {
-						message: format!("AVG expects numeric input, got {:?}", arg.data_type()),
-					});
-				}
-			}
-			Ok(AggregateCall {
-				function: function.clone(),
-				args,
-			})
-		}
+		});
+	}
+	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
+		return bind_stable_aggregate_call(function, args, input_schema, config, spec);
+	}
+	match function {
 		AggregateFunction::LinearRegress => {
 			if !config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {
@@ -1160,6 +1110,74 @@ fn bind_aggregate_call(
 				function: function.clone(),
 				args,
 			})
+		}
+		AggregateFunction::CountAll
+		| AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+	}
+}
+
+fn bind_stable_aggregate_call(
+	function: &AggregateFunction,
+	args: &[Expr],
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	spec: &AggregateKernelSpec,
+) -> Result<AggregateCall, BindingError> {
+	if args.len() != aggregate_arity_len(spec.arity) {
+		return Err(BindingError::UnsupportedExpression {
+			message: format!("{} requires one argument", spec.sql_name),
+		});
+	}
+	let args = args
+		.iter()
+		.map(|expr| bind_expr(expr, input_schema, config))
+		.collect::<Result<Vec<_>, _>>()?;
+	if !matches!(spec.input_domain, AggregateInputDomain::Any) {
+		let Some(arg) = args.first() else {
+			return Err(BindingError::UnsupportedExpression {
+				message: format!("{} requires one argument", spec.sql_name),
+			});
+		};
+		let data_type = arg.data_type();
+		if aggregate_kernel::stable_output_data_type(function, Some(&data_type)).is_none() {
+			return Err(BindingError::TypeMismatch {
+				message: aggregate_type_mismatch_message(spec.kind, &data_type),
+			});
+		}
+	}
+	Ok(AggregateCall {
+		function: function.clone(),
+		args,
+	})
+}
+
+fn aggregate_arity_len(arity: AggregateArity) -> usize {
+	match arity {
+		AggregateArity::Zero => 0,
+		AggregateArity::One => 1,
+	}
+}
+
+fn aggregate_type_mismatch_message(kernel: StableAggregateKernel, data_type: &DataType) -> String {
+	match kernel {
+		StableAggregateKernel::Sum => {
+			format!("SUM expects numeric input, got {data_type:?}")
+		}
+		StableAggregateKernel::Avg => {
+			format!("AVG expects numeric input, got {data_type:?}")
+		}
+		StableAggregateKernel::Min => {
+			format!("MIN expects Int32 or Int64 input, got {data_type:?}")
+		}
+		StableAggregateKernel::Max => {
+			format!("MAX expects Int32 or Int64 input, got {data_type:?}")
+		}
+		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
+			unreachable!("COUNT accepts any input type")
 		}
 	}
 }
@@ -1356,83 +1374,18 @@ fn aggregate_schema(group_expr: &[ExecutionExpr], aggr_expr: &[AggregateCall]) -
 }
 
 fn aggregate_field(call: &AggregateCall) -> Field {
+	if let Some(field) = aggregate_kernel::stable_output_field(call) {
+		return field;
+	}
 	match call.function {
-		AggregateFunction::CountAll => Field::new("count", DataType::Int64, false),
-		AggregateFunction::Count => Field::new("count", DataType::Int64, false),
-		AggregateFunction::Sum => Field::new(
-			"sum",
-			call.args
-				.first()
-				.and_then(|arg| sum_output_data_type(&arg.data_type()))
-				.unwrap_or(DataType::Int64),
-			true,
-		),
-		AggregateFunction::Min => Field::new(
-			"min",
-			call.args
-				.first()
-				.and_then(|arg| min_max_output_data_type(&arg.data_type()))
-				.unwrap_or(DataType::Int64),
-			true,
-		),
-		AggregateFunction::Max => Field::new(
-			"max",
-			call.args
-				.first()
-				.and_then(|arg| min_max_output_data_type(&arg.data_type()))
-				.unwrap_or(DataType::Int64),
-			true,
-		),
-		AggregateFunction::Avg => Field::new("avg", DataType::Float64, true),
 		AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
 		AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
-	}
-}
-
-fn sum_output_data_type(input: &DataType) -> Option<DataType> {
-	match input {
-		DataType::Int8
-		| DataType::Int16
-		| DataType::Int32
-		| DataType::Int64
-		| DataType::UInt8
-		| DataType::UInt16
-		| DataType::UInt32
-		| DataType::UInt64 => Some(DataType::Int64),
-		DataType::Float32 | DataType::Float64 => Some(DataType::Float64),
-		_ => None,
-	}
-}
-
-fn min_max_output_data_type(input: &DataType) -> Option<DataType> {
-	match input {
-		DataType::Int32 | DataType::Int64 => Some(input.clone()),
-		_ => None,
-	}
-}
-
-fn avg_output_data_type(input: &DataType) -> Option<DataType> {
-	match input {
-		DataType::Int8
-		| DataType::Int16
-		| DataType::Int32
-		| DataType::Int64
-		| DataType::UInt8
-		| DataType::UInt16
-		| DataType::UInt32
-		| DataType::UInt64
-		| DataType::Float32
-		| DataType::Float64 => Some(DataType::Float64),
-		_ => None,
-	}
-}
-
-fn aggregate_function_keyword(function: &AggregateFunction) -> &'static str {
-	match function {
-		AggregateFunction::Min => "MIN",
-		AggregateFunction::Max => "MAX",
-		AggregateFunction::Avg => "AVG",
-		_ => "aggregate",
+		AggregateFunction::CountAll
+		| AggregateFunction::Count
+		| AggregateFunction::Sum
+		| AggregateFunction::Min
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
 	}
 }
 
