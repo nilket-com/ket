@@ -91,6 +91,10 @@ the storage ring. We control both ends. The boundary exists
 for scaling dynamics and resource isolation, not because
 storage and compute are independent products.
 
+**Minimizing re-work of the long term vision.** We favor architectural 
+directions that align with our far-horizon goals, avoiding dead-ends or 
+designs that necessitate significant rewrites as the system evolves.
+
 **Toron's reason for existence is smart-storage pushdown.** Every
 improvement — executor model upgrade, advanced kernels, frontend
 hardening — polishes a system that does its primary job along its
@@ -115,41 +119,64 @@ scope-creep into adjacent boundaries visible at review time and
 sharpens ADR selection: the same operator at different scales is
 a different contract.
 
+**Minimize strategic rework, not ADR scope.** When two narrow
+ADR shapes are otherwise equivalent, prefer the one that
+preserves plausible long-term seams the noted brainstorms
+depend on (e.g., `NodeRoleSet`, ring-router asymmetry, IR-arena
+compatibility, `WeakControlRing` coordinator API, JIT-friendly
+expression shape) and avoids likely reversal. **Evidence still
+drives scope** — brainstorms remain "noted but not committed"
+and do not pull near-term scope forward. An ADR that closes off
+a seam should do so explicitly and with reason, not by accident.
+The selection round names the touched seams; the council
+ratifies the trade-off in the open.
+
 ## Forward sequence
 
 Earlier items have firmer scope; later items are direction,
-not commitment.
+not commitment. Selection rounds include a brainstorm-seam
+check per the Prioritization philosophy — most candidates
+touch no seams, but the question is asked.
 
-### Implemented: ADR 016
+### Plan promoted: ADR 017
 
-ADR 016's contract is pinned at
-`plans/adr/016_post_aggregate_filtering_with_having.md`; the
-impl plan lives at
-`plans/impl/016_post_aggregate_filtering_with_having.md`.
-Implementation is complete. ADR 016 owns no independent bench
-artifact — it is the second instance of the ADR 015 cycle
-shape (pure composition, narrow reject removal, narrow
-detector extension, reject-string absence as architecture
-guard) applied to the post-aggregate predicate position.
+ADR 017's contract is pinned at
+`plans/adr/017_order_by_aggregate_call.md`; the impl plan lives
+at `plans/impl/017_order_by_aggregate_call.md`. Status is
+"Promoted. Implementation pending." ADR 017 owns no
+independent bench artifact — it is the third instance of the
+composition cycle (ADR 015 + ADR 016 + ADR 017), closing
+ADR 015's `ORDER BY <aggregate-call>` V1 exclusion via reuse of
+ADR 016's planner-side rewrite walker. Walker becomes shape-
+neutral; `lower_having_predicate` gains a small qualified-
+reference pre-pass; `lower_select` returns a private
+`LoweredSelect` struct; ORDER BY qualified column refs
+(`ORDER BY sales.region`) unchanged. No new IR, no new wire,
+no new failure surface. Architecture guards are semantic
+(presence of two new named ORDER BY rejects, preserved
+HAVING-qualified-reference reject) — no helper-call-count
+guard.
 
-### ADR 017 candidates
+### ADR 018 candidates
 
 **Adjacent SQL-surface candidates** carry forward from the
-ADR 016 selection round, all still resting on ADR 011's narrow
+ADR 017 selection round, all still resting on ADR 011's narrow
 grouped-aggregate surface:
 
-- **`ORDER BY <aggregate-call>`** — natural symmetric extension
-  to ADR 016. The same planner-rewrite pattern applied at
-  `lower_order_by` would close ADR 015's V1 exclusion. Lowest
-  net-new surface among the candidates.
 - **`DISTINCT`** — `GROUP BY <all output columns>` with no
   aggregates. ADR 010 closed its silent drop; implementation
-  remains aggregate-path ADR work.
+  remains aggregate-path ADR work. Loosens ADR 011's zero-
+  aggregate reject; not pure composition.
 - **Post-aggregate projection** (aliases, computed expressions on
   aggregates, key subsets, reordered keys). ADR 011 explicitly
-  rejects; widening is its own decision matrix.
+  rejects; widening is its own decision matrix. ADR 017's
+  `GroupedAggregateScope` output-name multiset becomes the
+  authoritative output-name catalog when this widens.
 - **`GROUP BY` over joins.** Composes ADR 008's join surface with
   ADR 011's grouped aggregate; ADR 011 rejected this in V1.
+- **Scalar-aggregate `HAVING` / `ORDER BY`.** Lifts the catch-
+  all rejects ADR 016 §1 and ADR 017 §10 left in place. Own
+  ADR.
 
 **Other ADR 011 follow-ons** carry forward as candidates if their
 evidence outranks the SQL-surface set: two-phase partial/final
@@ -296,19 +323,48 @@ committed.
   barrier synchronization without the persistence tax of
   NVMe / WAL. ADR 003's `WorkerRegistry` trait +
   `WorkerLease` / `LeaseEpoch` fields are the seam.
-- **Brainstorm 003: Smart-Storage Pushdown beyond
-  filters.** Toron's pushdown story now covers static
-  predicates (ADR 002), shuffle-key affinity (ADR 003),
-  and *runtime* join-key filtering (ADR 006 generation plus ADR
-  013 storage-scan application). Future
-  pushdown surfaces: aggregate partial pushdown (already
-  half-Wendelon-bound), top-K / sort pushdown,
-  projection-with-computed-column pushdown. Each is its
-  own ADR; the cumulative shape is "Toron binds; Wendelon
-  executes the leaves; the wire carries results, not
-  bytes." ADR 006 and ADR 013 together form the runtime-pushdown
-  substrate that V1.x runtime-filter extensions (Candidate C
-  above) build on.
+- **Brainstorm 003: Disaggregated Compute Roles & Unified
+  Ring Algebra.** Explores breaking the symmetric
+  Toron/Wendelon node model into specialized hardware roles
+  (stateful NVMe nodes vs elastic compute-only nodes) while
+  preserving a single executable and unified ring algebra.
+  Three visions: hardware-optimized asymmetry, weak/strong
+  ring algebra, data-broker / ToronWorker topology. Seams:
+  `NodeRoleSet` bitmask expansion, `RingRouter` routing
+  durable writes only to `NodeRole::Data`, ADR 003's
+  `WorkerRegistry` / `WorkerLease` / `LeaseEpoch` (shared
+  with Brainstorm 002).
+- **Brainstorm 004: Memory Arenas and Custom Allocators for
+  Query Planning.** Proposes index-based pools or arena
+  allocators (e.g., Cranelift `BForest` pattern) for ASTs
+  and query plans to reduce allocation churn and improve
+  cache locality without lifetime contagion. Three sketched
+  approaches: external arena crates (`bumpalo` /
+  `typed-arena`, lifetime contagion), Cranelift-style
+  index-based pool (SOA-aligned, no lifetime threading),
+  domain-specific pool. Seam: IR type shape (`LogicalPlan`,
+  `ExecutionPlan`, `Expr` currently own children via
+  `Box`); deeper boxing raises future retrofit cost.
+  Evidence-gated — touches ADR 005's allocator-churn note
+  as a potential reuse target, but no allocator commitment
+  should land without profiling.
+
+**Pushdown axis** (cumulative observation, not a
+brainstorm). Toron's pushdown story now covers static
+predicates (ADR 002), shuffle-key affinity (ADR 003), and
+*runtime* join-key filtering (ADR 006 generation plus ADR
+013 storage-scan application). Future pushdown surfaces:
+aggregate partial pushdown (already half-Wendelon-bound),
+top-K / sort pushdown, projection-with-computed-column
+pushdown. Each is its own ADR; the cumulative shape is
+"Toron binds; Wendelon executes the leaves; the wire
+carries results, not bytes." ADR 006 and ADR 013 together
+form the runtime-pushdown substrate that V1.x runtime-
+filter extensions (Candidate C above) build on. Not
+numbered as a brainstorm because the content is an
+existing-trajectory observation rather than a speculative
+architecture — file-backed Brainstorms 001-004 are the
+speculative set.
 
 ### V1.x items *(post-V1, evidence-driven)*
 
