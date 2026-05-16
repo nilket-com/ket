@@ -224,6 +224,80 @@ along with the forward-sequence rewrite.
   no `AggState: Copy` removal. Bench:
   `plans/impl/022_float_min_max_aggregate_kernels_bench_results.md`
   (no minimum-speedup gate; > 10% per-row regression threshold).
+- **ADR 023 — Post-Aggregate Projection.** Promoted. First
+  substrate-and-surface ADR under the post-ADR-018 cycle after
+  four consecutive kernel-domain ADRs (019 / 020 / 021 / 022).
+  Decouples user-facing SELECT projection from the `Aggregate`
+  operator's natural output schema by composing existing
+  `LogicalPlan::Project` over `LogicalPlan::Aggregate` with an
+  aggregate-output catalog. `GroupedAggregateScope` →
+  `AggregateOutputCatalog` (rename surfaces the legibility
+  signal — 17 references in `sql_planner.rs`, 12 in scalar
+  paths post-ADR-018; the type is per-query name binding,
+  distinct from ADR 021's `AggregateKernelSpec` kernel-metadata
+  catalog). `LogicalPlan::Project` gains
+  `output_names: Vec<Option<String>>` (Shape A; parallel-vector
+  invariant `output_names.len() == exprs.len()` enforced by a
+  Project-construction helper or direct-site `debug_assert!`,
+  plus binder validation); `None` preserves derived-name
+  behavior; `Some(name)` carries a SELECT alias;
+  no new IR variant; no `Expr::Alias`. Plan shape:
+  `Sort? → Exchange(1, []) → Project? → Filter? → Aggregate →
+  Exchange(N, group_keys) → inner` with `Project` and `Filter`
+  both optional and both executed on the aggregate-consumer
+  task (Stage 1). `Project` emission is gated by a
+  four-condition predicate: any alias, any computed expression
+  (existing `Expr` surface only), any reorder/subset, or any
+  HAVING-only aggregate; otherwise omitted to preserve
+  byte-identical `ExecutionPlan` digests for currently-accepted
+  queries.
+  **HAVING aggregate calls not in SELECT — enabled** (Aggregate
+  computes `union(SELECT, HAVING)`; Filter consumes; Project
+  drops); **ORDER BY hidden aggregate calls — rejected** with
+  `"ORDER BY <aggregate-call> requires the aggregate to appear
+  in the SELECT list"`; ORDER BY aggregate-call resolution is
+  limited to bare aggregate SELECT outputs, not aggregate
+  requirements used only inside computed SELECT expressions;
+  **HAVING alias visibility — rejected**
+  with `"HAVING does not resolve SELECT aliases; spell the
+  aggregate explicitly"`. Computed projection bounded to the
+  existing `Expr` surface (comparison, boolean, null-predicate,
+  nested, literal, column, `TIME_BUCKET`); arithmetic
+  (`SUM(x) * 1.1`, `SUM(x) + COUNT(*)`) deferred to a scalar
+  arithmetic IR ADR. `GroupedAggregateSignature` finite enum
+  preserved; widening to `(AggregateFunction, Vec<Expr>)`
+  blocked by derive-Eq/Hash on `AggregateFunction` (contains
+  `ApproxQuantile(f64)`) and `Expr` (contains
+  `ScalarValue::Float32`/`Float64`); deferred to a future ADR
+  bundling the refactor with computed-aggregate-argument
+  signature widening. Non-aggregate alias enablement is a
+  3/3-ratified companion (`SELECT amount AS a FROM sales`
+  accepted; once `output_names` exists, preserving the reject
+  costs more than accepting it). One fragmenter detector
+  (`is_terminal_sort_over_grouped_aggregate`) widens by one
+  optional `[Project]` peel (Project before Filter); ADR 015's
+  "one narrow detector" property preserved. SoA-readiness
+  invariants from ADR 021 preserved (catalog stays pure
+  metadata; no row-path dyn dispatch; centralized dispatch
+  seams unchanged; Shape A's parallel vectors are mildly
+  SoA-friendlier than the rejected struct-vector). Five new
+  architecture guards: rename completion, strict-projection
+  reject absence, `output_names` field presence,
+  detector-shape peel order, diagnostic preservation. ADR 015
+  cycle property at the planner-projection layer; fifth
+  instance of the cycle (after ADR 016 / 017 / 018 / 019). No
+  new IR variant beyond the field addition; no new
+  `StableAggregateKernel` row; no new `AggregateOutputRule`
+  variant; no `AggState` change; no `AggState: Copy` removal;
+  no fragmenter recognition site beyond one detector body
+  widening; no cross-ring engagement. Three-way council
+  convergence reached across four iterations; two recorded
+  dissents (name: Claude preferred `PostAggregateScope`; scope
+  language: Gemini retained generic computed-projection
+  phrasing) carried by 2-of-3 majority per ADR 022 enumerated-
+  error-string precedent. Plan-digest preservation for
+  currently-accepted queries is the bench gate (no minimum-
+  speedup, identity-shape `Project` suppression).
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -291,62 +365,114 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 022 promoted; ADR 023 candidates
+### ADR 023 promoted; ADR 024 candidates
 
-ADR 022 selected and promoted **Float MIN / MAX
-Aggregate Kernels** — the first downstream user of
-the ADR 021 catalog spine. The
-`AggregateInputDomain::IntMinMax` variant renamed to
-`OrderedMinMax` and the acceptance predicate widened
-to `Int32 | Int64 | Float32 | Float64`; the existing
-six catalog rows are preserved. Sticky-NaN policy
-(any NaN input → NaN output) extends ADR 020's AVG
-precedent; deterministic signed-zero ordering
-(`-0.0 < +0.0`) implemented via `total_cmp` reuses
-ADR 010's float-sort-key total order. `AggState`
-widens 9 → 13 variants (four new
-`MinFloat32` / `MinFloat64` / `MaxFloat32` /
-`MaxFloat64`); `AggState: Copy` preserved. Four
-`*_sticky_total` helpers co-locate the sticky-NaN
-branch + `total_cmp` ordering near
-`update_min_state` / `update_max_state`; no row-path
-trait dispatch (ADR 021 SoA-readiness invariant
-stands). Binder error strings enumerated
-(`"MIN expects Int32, Int64, Float32, or Float64
-input"`); narrow Float32 literal coercion companion
-adds four arms to `coerce_literal_value` so
-`HAVING MIN(f32_col) > 0` and
-`HAVING MIN(f32_col) > 0.0` reach the binder.
-Three-way council convergence reached across four
-iterations on every load-bearing decision; one
-resolved divergence (error-string wording) ratified
-in Codex's favor. The Phase-1-through-Phase-5
-migration is materialized in
-`plans/impl/022_float_min_max_aggregate_kernels.md`.
+ADR 023 selected and promoted **Post-Aggregate
+Projection** — the first substrate-and-surface ADR
+after four consecutive kernel-domain ADRs (019 /
+020 / 021 / 022). Decouples user-facing SELECT
+projection from the `Aggregate` operator's natural
+output schema. `GroupedAggregateScope` →
+`AggregateOutputCatalog` rename surfaces the
+12-of-17 scalar-path-caller legibility signal;
+distinct from ADR 021's `AggregateKernelSpec`
+catalog (the ADR pins the layering). One IR field
+added: `LogicalPlan::Project { output_names:
+Vec<Option<String>> }` (Shape A; parallel-vector
+invariant; `None` preserves derived names; `Some`
+carries a SELECT alias; no `Expr::Alias`). Plan
+shape:
+`Sort? → Exchange(1, []) → Project? → Filter? →
+Aggregate → Exchange(N, group_keys) → inner` with
+the new `Project?` peel above the existing
+`Filter?` peel; both execute on the aggregate-
+consumer task (Stage 1) before publishing to the
+terminal exchange. Project emission gated by a
+four-condition predicate (alias, computed
+expression in existing `Expr` surface, reorder /
+subset, HAVING-only aggregate); identity-shape
+queries omit `Project` and preserve byte-identical
+`ExecutionPlan` digests. **HAVING aggregates not in SELECT —
+enabled** (Aggregate computes union(SELECT,
+HAVING); Filter consumes; Project drops). **ORDER
+BY hidden aggregates — rejected** with new
+diagnostic; ORDER BY aggregate-call resolution is
+limited to bare aggregate SELECT outputs. **HAVING
+alias visibility — rejected**
+with new diagnostic. Computed projection bounded
+to the existing `Expr` surface; arithmetic
+deferred to a scalar arithmetic IR ADR.
+`GroupedAggregateSignature` finite enum preserved;
+generic widening blocked by derive-Eq/Hash refactor
+on `AggregateFunction` and `Expr` (deferred).
+Non-aggregate alias enablement (`SELECT amount AS
+a FROM sales`) is a 3/3-ratified companion. One
+fragmenter detector widens (peel order: Project
+before Filter); ADR 015's "one narrow detector"
+property preserved with one body widening.
+SoA-readiness invariants from ADR 021 preserved.
+Five new architecture guards (rename completion,
+strict-projection reject absence, `output_names`
+field presence, detector peel order, diagnostic
+preservation). Three-way council convergence
+reached across four iterations; two recorded
+dissents (name, computed-projection scope language)
+carried by 2-of-3 majority. Fifth instance of the
+ADR 015 cycle (after ADR 016 / 017 / 018 / 019). No
+new IR variant; no new fragmenter recognition site;
+no `AggState` change; no cross-ring engagement.
+The six-phase migration is materialized in
+`plans/impl/023_post_aggregate_projection.md`.
 
-ADR 023 selection starts from the post-ADR-022
+ADR 024 selection starts from the post-ADR-023
 remainder:
 
-**Leading substrate-and-surface candidate —
-post-aggregate projection (ADR 023):**
+**Substrate candidates newly named-deferred by ADR
+023:**
 
-- **Post-aggregate projection.** The
-  `GroupedAggregateScope` naming-asymmetry signal
-  (17 references across `sql_planner.rs`; 12 used
-  in scalar paths post-ADR-018) is over legibility
-  threshold. ADR 023 renames the scope into a
-  broader output-name catalog
-  (`AggregateOutputCatalog` or similar) and lifts
-  the aliased / computed-expression / key-subset
-  surface. Touches the `LoweredSelect` seam and may
-  need a fragmenter routing decision for `Project`
-  above grouped aggregate output. Depends on the
-  ADR 021 catalog for output-name authority.
-  **Promotes as the substrate-downstream lead now
-  that the Float MIN/MAX kernel-domain widening is
-  closed.**
+- **Scalar arithmetic IR.** ADR 023 §Future work
+  pins this as the precondition for general
+  computed post-aggregate projection. Multiple
+  downstream surfaces unblock when this lands:
+  arithmetic in SELECT (`SUM(amount) * 1.1`),
+  arithmetic over multiple aggregates
+  (`SUM(x) + COUNT(*)`), eventual computed
+  aggregate arguments (`SUM(amount + tax)` —
+  bundled with derive-Eq/Hash refactor; see
+  below). Touches `Expr`, `ExecutionExpr`, binder
+  numeric promotion rules, executor evaluation,
+  and Wendelon PBC bytecode if pushdown enters
+  scope. Promotes if workload evidence surfaces
+  post-aggregate arithmetic pressure (percentage
+  calculations, computed metrics) — the
+  ADR 023 negative-case fixture set documents the
+  rejected forms users will hit first. **Leading
+  substrate-downstream candidate after ADR 023.**
+- **HAVING alias visibility ADR.** Loosens ADR
+  023's `"HAVING does not resolve SELECT aliases"`
+  reject. SQL-compat surface; own planner name-
+  resolution decision matrix. Promotes on
+  user-survey or query-corpus evidence that the
+  form is workload-pressured.
+- **ORDER BY hidden aggregate keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires
+  the aggregate to appear in the SELECT list"`
+  reject. Plan-shape ADR; either hidden-sort-
+  columns or Project-above-Sort design. Promotes
+  on workload evidence.
+- **Computed aggregate arguments ADR.**
+  `SUM(x + y)`. Bundled with the derive-Eq/Hash
+  refactor on `AggregateFunction` and `Expr`
+  (code-grounded block from ADR 023 §Status; the
+  blockers are `ApproxQuantile(f64)` and
+  `ScalarValue::Float32`/`Float64`).
+  `GroupedAggregateSignature` widening to
+  `(AggregateFunction, Vec<Expr>)` is the
+  signature-shape companion. Promotes when
+  computed-argument workload evidence surfaces.
 
-**Other kernel-widening candidates:**
+**Kernel-domain candidates (carried from ADR 022
+remainder):**
 
 - **`Utf8` `MIN` / `MAX`.** ADR 019 V1 §2 deferred
   for `AggState` Copy-refactor. Substrate refactor
@@ -423,7 +549,8 @@ stay outside the stable catalog via the small adjacent
 `experimental_aggregate_sql_name` helper; graduation moves a
 kernel from experimental-helper to stable-catalog row. The gap
 tightens the evidence case for the first kernel graduation but
-does not promote as ADR 023 lead by itself.
+did not promote as ADR 023 lead and does not promote as ADR 024
+lead by itself.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
