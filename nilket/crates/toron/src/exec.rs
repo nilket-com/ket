@@ -67,6 +67,11 @@ impl ArithmeticOp {
 	}
 }
 
+const F64_I32_LOWER: f64 = i32::MIN as f64;
+const F64_I32_UPPER: f64 = 2147483648.0;
+const F64_I64_LOWER: f64 = i64::MIN as f64;
+const F64_I64_UPPER: f64 = 9223372036854775808.0;
+
 pub(crate) mod runtime_filter;
 
 pub struct Executor {
@@ -3861,33 +3866,261 @@ fn evaluate_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, Execut
 	}
 
 	match (array.data_type(), target) {
-		(DataType::Int32, DataType::Int64) => {
-			let array = as_int32(array, "Cast source")?;
-			let values = array.iter().map(|v| v.map(i64::from)).collect::<Vec<_>>();
-			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
-		}
-		(DataType::Int32, DataType::Float64) => {
-			let array = as_int32(array, "Cast source")?;
-			let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
-			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
-		}
-		(DataType::Int64, DataType::Float64) => {
-			let array = as_int64(array, "Cast source")?;
-			let values = array
-				.iter()
-				.map(|v| v.map(|v| v as f64))
-				.collect::<Vec<_>>();
-			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
-		}
-		(DataType::Float32, DataType::Float64) => {
-			let array = as_float32(array, "Cast source")?;
-			let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
-			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
-		}
-		(source, target) => Err(ExecutionError::InvalidExpression {
-			message: format!("unsupported Cast from {source:?} to {target:?}"),
-		}),
+		(DataType::Int32, DataType::Int64) => cast_i32_to_i64(array),
+		(DataType::Int32, DataType::Float32) => cast_i32_to_f32(array),
+		(DataType::Int32, DataType::Float64) => cast_i32_to_f64(array),
+		(DataType::Int64, DataType::Int32) => cast_i64_to_i32(array),
+		(DataType::Int64, DataType::Float32) => cast_i64_to_f32(array),
+		(DataType::Int64, DataType::Float64) => cast_i64_to_f64(array),
+		(DataType::Float32, DataType::Int32) => cast_f32_to_i32(array),
+		(DataType::Float32, DataType::Int64) => cast_f32_to_i64(array),
+		(DataType::Float32, DataType::Float64) => cast_f32_to_f64(array),
+		(DataType::Float64, DataType::Int32) => cast_f64_to_i32(array),
+		(DataType::Float64, DataType::Int64) => cast_f64_to_i64(array),
+		(DataType::Float64, DataType::Float32) => cast_f64_to_f32(array),
+		(source, target) => Err(cast_failed(
+			source,
+			target,
+			"unsupported combination (binder gate failure)",
+		)),
 	}
+}
+
+fn cast_failed(source: &DataType, target: &DataType, cause: impl fmt::Display) -> ExecutionError {
+	ExecutionError::Kernel {
+		message: format!("cast failed: {source:?} to {target:?}: {cause}"),
+	}
+}
+
+fn cast_i32_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int32(array, "Cast source")?;
+	let values = array.iter().map(|v| v.map(i64::from)).collect::<Vec<_>>();
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+}
+
+fn cast_i32_to_f32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int32(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|v| v.map(|v| v as f32))
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+}
+
+fn cast_i32_to_f64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int32(array, "Cast source")?;
+	let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
+	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn cast_i64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<i32>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value < i32::MIN as i64 || value > i32::MAX as i64 {
+				return Err(cast_failed(
+					&DataType::Int64,
+					&DataType::Int32,
+					format!("value {value} does not fit"),
+				));
+			}
+			Ok(Some(value as i32))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn cast_i64_to_f32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|v| v.map(|v| v as f32))
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+}
+
+fn cast_i64_to_f64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|v| v.map(|v| v as f64))
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn cast_f32_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float32(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<i32>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value.is_nan() {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int32,
+					"NaN has no integer image",
+				));
+			}
+			if value.is_infinite() {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int32,
+					"Inf has no integer image",
+				));
+			}
+			let trunc = f64::from(value).trunc();
+			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int32,
+					format!("value {value} truncated to {trunc} does not fit Int32"),
+				));
+			}
+			Ok(Some(trunc as i32))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn cast_f32_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float32(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<i64>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value.is_nan() {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int64,
+					"NaN has no integer image",
+				));
+			}
+			if value.is_infinite() {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int64,
+					"Inf has no integer image",
+				));
+			}
+			let trunc = f64::from(value).trunc();
+			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+				return Err(cast_failed(
+					&DataType::Float32,
+					&DataType::Int64,
+					format!("value {value} truncated to {trunc} does not fit Int64"),
+				));
+			}
+			Ok(Some(trunc as i64))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+}
+
+fn cast_f32_to_f64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float32(array, "Cast source")?;
+	let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
+	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn cast_f64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<i32>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value.is_nan() {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int32,
+					"NaN has no integer image",
+				));
+			}
+			if value.is_infinite() {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int32,
+					"Inf has no integer image",
+				));
+			}
+			let trunc = value.trunc();
+			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int32,
+					format!("value {value} truncated to {trunc} does not fit Int32"),
+				));
+			}
+			Ok(Some(trunc as i32))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn cast_f64_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<i64>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value.is_nan() {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int64,
+					"NaN has no integer image",
+				));
+			}
+			if value.is_infinite() {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int64,
+					"Inf has no integer image",
+				));
+			}
+			let trunc = value.trunc();
+			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Int64,
+					format!("value {value} truncated to {trunc} does not fit Int64"),
+				));
+			}
+			Ok(Some(trunc as i64))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+}
+
+fn cast_f64_to_f32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "Cast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Result<Option<f32>, ExecutionError> {
+			let Some(value) = value else {
+				return Ok(None);
+			};
+			if value.is_finite() && value.abs() > f32::MAX as f64 {
+				return Err(cast_failed(
+					&DataType::Float64,
+					&DataType::Float32,
+					format!("finite value {value} overflows Float32"),
+				));
+			}
+			Ok(Some(value as f32))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
 }
 
 fn evaluate_arithmetic(
@@ -4144,6 +4377,88 @@ mod tests {
 		RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind, SchemaEvolutionPolicyV1,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	#[test]
+	fn numeric_cast_kernels_truncate_preserve_nulls_and_reject_edges() {
+		let f64_values =
+			Arc::new(Float64Array::from(vec![Some(3.9), Some(-3.9), None])) as ArrayRef;
+		let int32_values = evaluate_cast(&f64_values, &DataType::Int32)
+			.expect("Float64 to Int32")
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("Int32 cast")
+			.clone();
+		assert_eq!(int32_values.value(0), 3);
+		assert_eq!(int32_values.value(1), -3);
+		assert!(int32_values.is_null(2));
+
+		let int64_values =
+			Arc::new(Int64Array::from(vec![Some(i64::MAX), Some(i64::MIN)])) as ArrayRef;
+		let float32_values = evaluate_cast(&int64_values, &DataType::Float32)
+			.expect("Int64 to Float32")
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.expect("Float32 cast")
+			.clone();
+		assert!(float32_values.value(0).is_finite());
+		assert!(float32_values.value(1).is_finite());
+
+		let special_f64 = Arc::new(Float64Array::from(vec![
+			Some(f64::NAN),
+			Some(f64::INFINITY),
+			Some(f64::NEG_INFINITY),
+			None,
+		])) as ArrayRef;
+		let special_f32 = evaluate_cast(&special_f64, &DataType::Float32)
+			.expect("Float64 special values to Float32")
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.expect("Float32 cast")
+			.clone();
+		assert!(special_f32.value(0).is_nan());
+		assert!(special_f32.value(1).is_infinite());
+		assert!(special_f32.value(2).is_infinite());
+		assert!(special_f32.is_null(3));
+
+		let i64_overflow =
+			Arc::new(Int64Array::from(vec![Some(i64::from(i32::MAX) + 1)])) as ArrayRef;
+		assert_cast_kernel_prefix(
+			evaluate_cast(&i64_overflow, &DataType::Int32)
+				.expect_err("Int64 narrowing overflow should fail"),
+			"cast failed: Int64 to Int32:",
+		);
+
+		let f64_int_overflow = Arc::new(Float64Array::from(vec![Some(2147483648.0)])) as ArrayRef;
+		assert_cast_kernel_prefix(
+			evaluate_cast(&f64_int_overflow, &DataType::Int32)
+				.expect_err("Float64 to Int32 exclusive upper bound should fail"),
+			"cast failed: Float64 to Int32:",
+		);
+
+		let f64_nan = Arc::new(Float64Array::from(vec![Some(f64::NAN)])) as ArrayRef;
+		assert_cast_kernel_prefix(
+			evaluate_cast(&f64_nan, &DataType::Int64).expect_err("NaN to Int64 should fail"),
+			"cast failed: Float64 to Int64: NaN",
+		);
+
+		let f64_float_overflow =
+			Arc::new(Float64Array::from(vec![Some((f32::MAX as f64) * 2.0)])) as ArrayRef;
+		assert_cast_kernel_prefix(
+			evaluate_cast(&f64_float_overflow, &DataType::Float32)
+				.expect_err("finite Float64 overflow to Float32 should fail"),
+			"cast failed: Float64 to Float32:",
+		);
+	}
+
+	fn assert_cast_kernel_prefix(err: ExecutionError, expected_prefix: &str) {
+		match err {
+			ExecutionError::Kernel { message } => assert!(
+				message.starts_with(expected_prefix),
+				"expected cast kernel prefix {expected_prefix:?}, got {message:?}"
+			),
+			other => panic!("expected kernel error, got {other:?}"),
+		}
+	}
 
 	#[tokio::test]
 	async fn execute_bound_engages_pbc_at_storage_boundary() {

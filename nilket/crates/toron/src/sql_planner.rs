@@ -6,10 +6,12 @@ use crate::error::FrontendError;
 use crate::ir::{
 	AggregateFunction, ColumnRef, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
 };
+use arrow::datatypes::DataType;
 use sqlparser::ast::{
-	BinaryOperator, Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-	FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, OrderBy,
-	Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, Value,
+	BinaryOperator, CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function,
+	FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
+	JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr,
+	Statement, TableAlias, TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -37,6 +39,27 @@ fn validate_aggregate_argument(expr: &SqlExpr) -> Result<(), FrontendError> {
 	match expr {
 		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(()),
 		_ => Err(unsupported(AGGREGATE_ARGUMENT_SHAPE_MESSAGE)),
+	}
+}
+
+fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendError> {
+	match data_type {
+		SqlDataType::Int(_)
+		| SqlDataType::Integer(_)
+		| SqlDataType::Int4(_)
+		| SqlDataType::Int32 => Ok(DataType::Int32),
+		SqlDataType::BigInt(_) | SqlDataType::Int64 => Ok(DataType::Int64),
+		SqlDataType::Real | SqlDataType::Float4 | SqlDataType::Float32 => Ok(DataType::Float32),
+		SqlDataType::Double(ExactNumberInfo::None)
+		| SqlDataType::DoublePrecision
+		| SqlDataType::Float8
+		| SqlDataType::Float64 => Ok(DataType::Float64),
+		SqlDataType::Float(_) => Err(unsupported(
+			"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
+		)),
+		other => Err(unsupported(format!(
+			"unsupported CAST target type: {other}"
+		))),
 	}
 }
 
@@ -117,6 +140,12 @@ impl SqlPlanner {
 
 		if let Some(order_by) = order_by {
 			let order_by = self.lower_order_by(order_by, aggregate_output_catalog.as_ref())?;
+			let (sort_input, order_by, final_projection) =
+				if aggregate_output_catalog.is_some() && sort_needs_hidden_projection(&order_by) {
+					add_hidden_sort_projection(plan, order_by, aggregate_output_catalog.as_ref())?
+				} else {
+					(plan, order_by, None)
+				};
 			let limit = limit
 				.as_ref()
 				.map(parse_non_negative_usize_literal)
@@ -126,16 +155,25 @@ impl SqlPlanner {
 				.map(|offset| parse_non_negative_usize_literal(&offset.value))
 				.transpose()?
 				.unwrap_or(0);
-			Ok(LogicalPlan::Sort {
+			let sorted = LogicalPlan::Sort {
 				input: Box::new(LogicalPlan::Exchange {
-					input: Box::new(plan),
+					input: Box::new(sort_input),
 					partition_count: 1,
 					key: Vec::new(),
 				}),
 				order_by,
 				limit,
 				offset,
-			})
+			};
+			if let Some(final_projection) = final_projection {
+				Ok(LogicalPlan::Project {
+					input: Box::new(sorted),
+					exprs: final_projection.exprs,
+					output_names: final_projection.output_names,
+				})
+			} else {
+				Ok(sorted)
+			}
 		} else {
 			Ok(plan)
 		}
@@ -530,6 +568,17 @@ impl SqlPlanner {
 				op: op.clone(),
 				right: Box::new(self.rewrite_grouped_aggregate_calls(right, scope, clause)?),
 			}),
+			SqlExpr::Cast {
+				kind,
+				expr,
+				data_type,
+				format,
+			} => Ok(SqlExpr::Cast {
+				kind: kind.clone(),
+				expr: Box::new(self.rewrite_grouped_aggregate_calls(expr, scope, clause)?),
+				data_type: data_type.clone(),
+				format: format.clone(),
+			}),
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
 				self.rewrite_grouped_aggregate_calls(inner, scope, clause)?,
 			))),
@@ -628,6 +677,9 @@ impl SqlPlanner {
 				self.discover_aggregate_calls(left, mode, source, catalog)?;
 				self.discover_aggregate_calls(right, mode, source, catalog)
 			}
+			SqlExpr::Cast { expr, .. } => {
+				self.discover_aggregate_calls(expr, mode, source, catalog)
+			}
 			SqlExpr::UnaryOp { expr, .. }
 			| SqlExpr::IsNull(expr)
 			| SqlExpr::IsNotNull(expr)
@@ -718,6 +770,17 @@ impl SqlPlanner {
 				left: Box::new(self.rewrite_aggregate_calls_for_projection(left, mode, catalog)?),
 				op: op.clone(),
 				right: Box::new(self.rewrite_aggregate_calls_for_projection(right, mode, catalog)?),
+			}),
+			SqlExpr::Cast {
+				kind,
+				expr,
+				data_type,
+				format,
+			} => Ok(SqlExpr::Cast {
+				kind: kind.clone(),
+				expr: Box::new(self.rewrite_aggregate_calls_for_projection(expr, mode, catalog)?),
+				data_type: data_type.clone(),
+				format: format.clone(),
 			}),
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
 				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
@@ -1065,6 +1128,31 @@ impl SqlPlanner {
 					_ => Err(unsupported(format!("unsupported operator: {op:?}"))),
 				}
 			}
+			SqlExpr::Cast {
+				kind,
+				expr,
+				data_type,
+				format,
+			} => {
+				if format.is_some() {
+					return Err(unsupported("CAST FORMAT clause is not supported"));
+				}
+				match kind {
+					CastKind::Cast => Ok(Expr::Cast(
+						Box::new(self.lower_expr(expr)?),
+						lower_cast_target_type(data_type)?,
+					)),
+					CastKind::TryCast => Err(unsupported(
+						"unsupported cast syntax: TRY_CAST; only CAST(... AS ...) is supported",
+					)),
+					CastKind::SafeCast => Err(unsupported(
+						"unsupported cast syntax: SAFE_CAST; only CAST(... AS ...) is supported",
+					)),
+					CastKind::DoubleColon => Err(unsupported(
+						"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
+					)),
+				}
+			}
 			SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
@@ -1136,6 +1224,143 @@ impl SqlPlanner {
 
 		Ok((left_keys, right_keys))
 	}
+}
+
+fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
+	order_by
+		.iter()
+		.any(|key| !sort_key_is_direct_output_reference(&key.expr) && expr_contains_cast(&key.expr))
+}
+
+fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
+	matches!(expr, Expr::Column(_) | Expr::Literal(_))
+}
+
+fn expr_contains_cast(expr: &Expr) -> bool {
+	match expr {
+		Expr::Cast(_, _) => true,
+		Expr::Add(left, right)
+		| Expr::Sub(left, right)
+		| Expr::Mul(left, right)
+		| Expr::Div(left, right)
+		| Expr::Eq(left, right)
+		| Expr::Neq(left, right)
+		| Expr::Lt(left, right)
+		| Expr::Lte(left, right)
+		| Expr::Gt(left, right)
+		| Expr::Gte(left, right)
+		| Expr::And(left, right)
+		| Expr::Or(left, right) => expr_contains_cast(left) || expr_contains_cast(right),
+		Expr::Not(inner)
+		| Expr::IsNull(inner)
+		| Expr::IsNotNull(inner)
+		| Expr::TimeBucket(_, inner) => expr_contains_cast(inner),
+		Expr::Column(_) | Expr::Literal(_) => false,
+	}
+}
+
+fn add_hidden_sort_projection(
+	plan: LogicalPlan,
+	order_by: Vec<SortExpr>,
+	catalog: Option<&AggregateOutputCatalog>,
+) -> Result<(LogicalPlan, Vec<SortExpr>, Option<FinalProjection>), FrontendError> {
+	let output_names = visible_output_names(&plan, catalog).ok_or_else(|| {
+		unsupported("ORDER BY computed aggregate expression is not supported for this plan shape")
+	})?;
+	if has_duplicate_names(&output_names) {
+		return Err(unsupported(
+			"ORDER BY computed aggregate expression requires unique output names",
+		));
+	}
+
+	let mut used_names = output_names.iter().cloned().collect::<HashSet<_>>();
+	let mut projected_exprs = output_names
+		.iter()
+		.cloned()
+		.map(Expr::column)
+		.collect::<Vec<_>>();
+	let mut projected_output_names = output_names
+		.iter()
+		.cloned()
+		.map(Some)
+		.collect::<Vec<Option<String>>>();
+	let mut rewritten_order_by = Vec::with_capacity(order_by.len());
+
+	for (idx, key) in order_by.into_iter().enumerate() {
+		if sort_key_is_direct_output_reference(&key.expr) {
+			rewritten_order_by.push(key);
+			continue;
+		}
+
+		let hidden_name = unique_hidden_sort_name(idx, &mut used_names);
+		projected_exprs.push(key.expr);
+		projected_output_names.push(Some(hidden_name.clone()));
+		rewritten_order_by.push(SortExpr {
+			expr: Expr::column(hidden_name),
+			descending: key.descending,
+			nulls_first: key.nulls_first,
+		});
+	}
+
+	let final_projection = FinalProjection {
+		exprs: output_names
+			.iter()
+			.cloned()
+			.map(Expr::column)
+			.collect::<Vec<_>>(),
+		output_names: output_names.into_iter().map(Some).collect(),
+	};
+	Ok((
+		LogicalPlan::Project {
+			input: Box::new(plan),
+			exprs: projected_exprs,
+			output_names: projected_output_names,
+		},
+		rewritten_order_by,
+		Some(final_projection),
+	))
+}
+
+fn visible_output_names(
+	plan: &LogicalPlan,
+	catalog: Option<&AggregateOutputCatalog>,
+) -> Option<Vec<String>> {
+	match plan {
+		LogicalPlan::Project {
+			exprs,
+			output_names,
+			..
+		} => Some(
+			exprs
+				.iter()
+				.enumerate()
+				.map(|(idx, expr)| {
+					output_names[idx]
+						.clone()
+						.unwrap_or_else(|| logical_expr_output_name(expr, idx))
+				})
+				.collect(),
+		),
+		LogicalPlan::Filter { input, .. } => visible_output_names(input, catalog),
+		LogicalPlan::Aggregate { .. } => catalog.map(AggregateOutputCatalog::natural_output_names),
+		_ => None,
+	}
+}
+
+fn has_duplicate_names(names: &[String]) -> bool {
+	let mut seen = HashSet::new();
+	names.iter().any(|name| !seen.insert(name))
+}
+
+fn unique_hidden_sort_name(idx: usize, used_names: &mut HashSet<String>) -> String {
+	let mut candidate = format!("__toron_order_key_{idx}");
+	let mut suffix = 0usize;
+	while used_names.contains(&candidate) {
+		suffix += 1;
+		candidate = format!("__toron_order_key_{idx}_{suffix}");
+	}
+	used_names.insert(candidate.clone());
+	candidate
 }
 
 #[derive(Debug, Clone)]
@@ -1438,6 +1663,7 @@ fn reject_qualified_having_column_references(expr: &SqlExpr) -> Result<(), Front
 			reject_qualified_having_column_references(left)?;
 			reject_qualified_having_column_references(right)
 		}
+		SqlExpr::Cast { expr, .. } => reject_qualified_having_column_references(expr),
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
 			reject_qualified_having_column_references(inner)
 		}
@@ -1468,6 +1694,7 @@ fn reject_having_alias_references(
 			reject_having_alias_references(left, select_aliases)?;
 			reject_having_alias_references(right, select_aliases)
 		}
+		SqlExpr::Cast { expr, .. } => reject_having_alias_references(expr, select_aliases),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -1495,6 +1722,7 @@ fn reject_qualified_aggregate_projection_references(expr: &SqlExpr) -> Result<()
 			reject_qualified_aggregate_projection_references(left)?;
 			reject_qualified_aggregate_projection_references(right)
 		}
+		SqlExpr::Cast { expr, .. } => reject_qualified_aggregate_projection_references(expr),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -1571,6 +1799,7 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_aggregate_call(left) || expr_contains_aggregate_call(right)
 		}
+		SqlExpr::Cast { expr, .. } => expr_contains_aggregate_call(expr),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -1602,6 +1831,7 @@ fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
 			expr_contains_nonaggregate_column_reference(left)
 				|| expr_contains_nonaggregate_column_reference(right)
 		}
+		SqlExpr::Cast { expr, .. } => expr_contains_nonaggregate_column_reference(expr),
 		SqlExpr::UnaryOp { expr, .. }
 		| SqlExpr::IsNull(expr)
 		| SqlExpr::IsNotNull(expr)
@@ -2026,6 +2256,9 @@ fn collect_scope_refs(
 		SqlExpr::BinaryOp { left, right, .. } => {
 			collect_scope_refs(left, outer_qualifiers, inner_qualifiers, refs)?;
 			collect_scope_refs(right, outer_qualifiers, inner_qualifiers, refs)?;
+		}
+		SqlExpr::Cast { expr, .. } => {
+			collect_scope_refs(expr, outer_qualifiers, inner_qualifiers, refs)?;
 		}
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) => {
 			collect_scope_refs(inner, outer_qualifiers, inner_qualifiers, refs)?;

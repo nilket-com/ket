@@ -36,9 +36,10 @@ verification.
 | `crates/toron/src/exec.rs::evaluate_cast` | extend 4 → 16 cells | Phase 3 |
 | `crates/toron/src/exec.rs::cast_failed` | NEW Kernel-error constructor | Phase 3 |
 | `crates/toron/src/exec.rs` (float-to-int boundary constants) | NEW `F64_I32_UPPER` / `F64_I64_UPPER` | Phase 3 |
+| `crates/toron/src/sql_planner.rs::add_hidden_sort_projection` | NEW narrow D10 helper for `ORDER BY CAST(<selected aggregate>)` | Phase 4 |
 | `crates/toron/src/pbc.rs::PbcCompiler::compile_expr` | preserved Cast decline arm | Phase 4 (no-op) |
 | `crates/toron/tests/architecture_test.rs::adr024_cast_is_binder_only_widening` | rename + drop SQL-lowering-absence sub-assertion | Phase 4 |
-| `crates/toron/tests/architecture_test.rs` | 7 NEW ADR 025 guards | Phase 4 |
+| `crates/toron/tests/architecture_test.rs` | 8 NEW ADR 025 guards | Phase 4 |
 | `crates/toron/tests/group_by_test.rs` | post-aggregate / aggregate-argument fixtures | Phase 5 |
 | `crates/toron/tests/non_aggregate_projection_accounting_test.rs` | non-aggregate SELECT / WHERE fixtures | Phase 5 |
 | (optional) `crates/toron/tests/cast_test.rs` | per-pair execution fixtures if size warrants | Phase 5 |
@@ -508,7 +509,7 @@ Null handling:
 ## Phase 4 — PBC + Architecture Guards
 
 Goal: preserve Cast's PBC ineligibility; rename ADR 024
-guards; add seven new ADR 025 guards.
+guards; add eight new ADR 025 guards.
 
 Tasks:
 
@@ -659,7 +660,35 @@ Tasks:
    }
    ```
 
-10. **PBC integration tests:**
+10. **Add `adr025_order_by_cast_uses_hidden_sort_projection`
+    (D10):**
+    ```rust
+    #[test]
+    fn adr025_order_by_cast_uses_hidden_sort_projection() {
+        let src = read_to_string("src/sql_planner.rs").unwrap();
+        let lower_query = extract_fn_body(&src, "lower_query");
+        assert!(lower_query.contains("sort_needs_hidden_projection(&order_by)"));
+        assert!(lower_query.contains("add_hidden_sort_projection"));
+
+        let gate = extract_fn_body(&src, "sort_needs_hidden_projection");
+        assert!(gate.contains("expr_contains_cast(&key.expr)"));
+
+        let helper = extract_fn_body(&src, "add_hidden_sort_projection");
+        assert!(helper.contains("LogicalPlan::Project"));
+        assert!(helper.contains("unique_hidden_sort_name"));
+        assert!(helper.contains(
+            "ORDER BY computed aggregate expression requires unique output names",
+        ));
+    }
+    ```
+
+    This guard records ADR 025's narrow hidden-sort-key
+    projection path for `ORDER BY CAST(<selected aggregate>)`.
+    The `expr_contains_cast` trigger is intentional: it
+    avoids making ADR 025 the general hidden aggregate
+    ORDER BY ADR.
+
+11. **PBC integration tests:**
     - `pbc_declines_cast_filter` — `WHERE CAST(amount AS
       BIGINT) > 10` → Toron residual, not PBC.
     - **NEW** `pbc_declines_identity_cast_filter` — `WHERE
@@ -688,6 +717,10 @@ Tasks:
    - `SELECT region, SUM(amount) FROM sales GROUP BY region HAVING CAST(SUM(amount) AS Int32) > 100`
    - `SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY CAST(SUM(amount) AS Float32) DESC`
    - `SELECT CAST(SUM(amount) AS DOUBLE) FROM sales` (composes with ADR 023)
+
+   The `ORDER BY CAST(SUM(...))` case exercises D10's
+   Project → Sort → Project hidden-key rewrite. Broader
+   hidden aggregate ORDER BY support remains a future ADR.
 
 3. **Composition with ADR 024 arithmetic:**
    - `SELECT amount + CAST(price AS Int64) FROM sales`
@@ -759,6 +792,7 @@ Tasks:
 | R15 | Walker recursion misses a `SqlExpr::Cast` site | Phase 1 task 3 enumerates walkers; integration tests exercise paths. |
 | R16 | Architecture guard count growth | Co-locate ADR 025 guard changes in a contiguous block in `architecture_test.rs` for review. |
 | R17 | `Int64 → Float32` precision loss is easy to overstate as overflow | Phase 3 task 9 comment + fixture documents that all `i64` values remain finite while precision loss is accepted. |
+| R18 | Narrow D10 hidden sort-key helper is mistaken for the future general ORDER BY hidden-aggregate-keys design | Source guard pins the `expr_contains_cast` gate; docs keep arbitrary hidden ORDER BY expressions deferred. |
 
 ## Definition of Done
 
@@ -788,7 +822,11 @@ Tasks:
 - [ ] Cast in WHERE evaluates as Toron residual filter;
       PBC declines. Identity Cast in WHERE also stays
       residual.
-- [ ] Seven new ADR 025 architecture guards pass; two
+- [ ] `ORDER BY CAST(<selected aggregate>)` uses the
+      narrow D10 hidden sort-key Project → Sort → Project
+      rewrite; arbitrary hidden aggregate ORDER BY keys
+      remain deferred.
+- [ ] Eight new ADR 025 architecture guards pass; two
       ADR 024 guards adjusted (one renamed).
 - [ ] Plan digests for no-CAST queries are byte-identical
       pre/post-ADR-025.

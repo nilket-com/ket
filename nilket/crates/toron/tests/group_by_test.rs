@@ -1450,8 +1450,6 @@ async fn arithmetic_bind_injects_only_widening_casts() {
 				&& matches!(right.as_ref(), ExecutionExpr::Column(column)
 					if column.name.0 == "price" && column.data_type == DataType::Float64)
 	));
-
-	assert_unsupported("SELECT CAST(amount AS BIGINT) FROM sales");
 }
 
 #[tokio::test]
@@ -1476,6 +1474,173 @@ async fn integer_arithmetic_overflow_is_a_kernel_error() {
 		),
 		other => panic!("expected kernel overflow error, got {other:?}"),
 	}
+}
+
+#[tokio::test]
+async fn sql_cast_numeric_primitive_lattice_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT \
+			CAST(amount AS BIGINT), \
+			CAST(id AS INT), \
+			CAST(rating32 AS DOUBLE), \
+			CAST(price AS REAL) \
+		 FROM sales",
+	))
+	.await;
+
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0),
+		vec![Some(10), Some(20), None, Some(30), None, Some(7)]
+	);
+	assert_eq!(
+		scalar_int32_column_rows(&results, 1),
+		vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 2),
+		vec![Some(1.5), Some(2.5), None, Some(3.5), Some(4.5), Some(0.25)]
+	);
+	assert_eq!(
+		scalar_float32_column_rows(&results, 3),
+		vec![
+			Some(10.5_f32),
+			Some(20.5_f32),
+			None,
+			Some(30.5_f32),
+			None,
+			Some(7.5_f32)
+		]
+	);
+}
+
+#[tokio::test]
+async fn post_aggregate_cast_executes() {
+	let scalar = run_logical(&plan_sql(
+		"SELECT CAST(SUM(amount) AS DOUBLE), CAST(COUNT(*) AS DOUBLE) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_float64_column_rows(&scalar, 0), vec![Some(67.0)]);
+	assert_eq!(scalar_float64_column_rows(&scalar, 1), vec![Some(6.0)]);
+
+	let grouped = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING CAST(SUM(amount) AS INT) > 20",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&grouped),
+		vec![(Some("east".to_string()), Some(40))]
+	);
+}
+
+#[tokio::test]
+async fn sql_cast_in_where_and_order_by_executes() {
+	let filtered = run_logical(&plan_sql(
+		"SELECT amount FROM sales WHERE CAST(amount AS BIGINT) > 10",
+	))
+	.await;
+	assert_eq!(
+		scalar_int32_column_rows(&filtered, 0),
+		vec![Some(20), Some(30)]
+	);
+
+	let ordered = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 ORDER BY CAST(SUM(amount) AS FLOAT32) DESC",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&ordered),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+			(None, Some(7)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn bind_explicit_cast_preserves_identity_node() {
+	let (catalog, _) = fixture();
+	let bound = bind(
+		&plan_sql("SELECT CAST(amount AS INT) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind identity cast");
+
+	let ExecutionPlan::Project { exprs, .. } = bound else {
+		panic!("expected projection");
+	};
+	assert!(matches!(
+		&exprs[0],
+		ExecutionExpr::Cast(inner, DataType::Int32)
+			if matches!(inner.as_ref(), ExecutionExpr::Column(column)
+				if column.name.0 == "amount" && column.data_type == DataType::Int32)
+	));
+}
+
+#[tokio::test]
+async fn sql_cast_numeric_errors_are_kernel_errors() {
+	let err = execute_sql_err("SELECT CAST(price * 1000000000.0 AS INT) FROM sales").await;
+	assert_kernel_error_prefix(err, "cast failed: Float64 to Int32:");
+
+	let err = execute_sql_err("SELECT CAST(price * 1e40 AS REAL) FROM sales").await;
+	assert_kernel_error_prefix(err, "cast failed: Float64 to Float32:");
+
+	let err = execute_sql_err("SELECT CAST(score AS INT) FROM sales").await;
+	assert_kernel_error_prefix(err, "cast failed: Float64 to Int32: NaN");
+}
+
+#[tokio::test]
+async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
+	assert_unsupported_message(
+		"SELECT CAST(amount AS FLOAT) FROM sales",
+		"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
+	);
+	assert_unsupported("SELECT CAST(amount AS VARCHAR) FROM sales");
+	assert_unsupported_message(
+		"SELECT TRY_CAST(amount AS BIGINT) FROM sales",
+		"unsupported cast syntax: TRY_CAST; only CAST(... AS ...) is supported",
+	);
+	assert_unsupported_message(
+		"SELECT SAFE_CAST(amount AS BIGINT) FROM sales",
+		"unsupported cast syntax: SAFE_CAST; only CAST(... AS ...) is supported",
+	);
+	assert_unsupported_message(
+		"SELECT amount::BIGINT FROM sales",
+		"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
+	);
+	assert_unsupported_message(
+		"SELECT CAST(amount AS BIGINT FORMAT '999') FROM sales",
+		"CAST FORMAT clause is not supported",
+	);
+
+	let (catalog, _) = fixture();
+	let err = bind(
+		&plan_sql("SELECT CAST(region AS BIGINT) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("non-numeric cast source should fail binding");
+	assert!(
+		matches!(
+			err,
+			BindingError::TypeMismatch { ref message }
+				if message == "unsupported CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+		),
+		"unexpected binding error: {err:?}"
+	);
+}
+
+#[test]
+fn aggregate_argument_cast_remains_column_only() {
+	assert_unsupported_message(
+		"SELECT SUM(CAST(amount AS BIGINT)) FROM sales",
+		"aggregate arguments must be simple column references",
+	);
 }
 
 #[tokio::test]
@@ -2134,6 +2299,27 @@ async fn run_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {
 		.execute_bound(&bound, None)
 		.await
 		.expect("execute")
+}
+
+async fn execute_sql_err(sql: &str) -> ExecutionError {
+	let (catalog, storage) = fixture();
+	let bound = bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+	Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("execute should fail")
+}
+
+fn assert_kernel_error_prefix(err: ExecutionError, expected_prefix: &str) {
+	match err {
+		ExecutionError::Kernel { message } => assert!(
+			message.starts_with(expected_prefix),
+			"expected kernel message prefix {expected_prefix:?}, got {message:?}"
+		),
+		other => panic!("expected kernel error, got {other:?}"),
+	}
 }
 
 fn hand_built_grouped_plan() -> LogicalPlan {

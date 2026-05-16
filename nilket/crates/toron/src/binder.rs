@@ -1229,7 +1229,7 @@ fn bind_expr(
 			input_schema,
 		)?)),
 		Expr::Literal(value) => Ok(ExecutionExpr::Literal(value.clone())),
-		Expr::Cast(inner, target) => bind_cast(input_schema, config, inner, target),
+		Expr::Cast(inner, target) => bind_explicit_cast(input_schema, config, inner, target),
 		Expr::Add(left, right) => {
 			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Add)
 		}
@@ -1320,7 +1320,7 @@ fn bind_arithmetic(
 	Ok(constructor(Box::new(left), Box::new(right)))
 }
 
-fn bind_cast(
+fn bind_explicit_cast(
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	inner: &Expr,
@@ -1328,10 +1328,10 @@ fn bind_cast(
 ) -> Result<ExecutionExpr, BindingError> {
 	let inner = bind_expr(inner, input_schema, config)?;
 	let source = inner.data_type();
-	if !is_widening_cast(&source, target) {
+	if !is_supported_explicit_numeric_cast(&source, target) {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
-				"Cast from {source:?} to {target:?} is not a supported widening conversion"
+				"unsupported CAST: {source:?} to {target:?}; only Int32, Int64, Float32, and Float64 are supported"
 			),
 		});
 	}
@@ -1360,6 +1360,28 @@ fn is_widening_cast(source: &DataType, target: &DataType) -> bool {
 			| (DataType::Int32, DataType::Float64)
 			| (DataType::Int64, DataType::Float64)
 			| (DataType::Float32, DataType::Float64)
+	)
+}
+
+fn is_supported_explicit_numeric_cast(source: &DataType, target: &DataType) -> bool {
+	matches!(
+		(source, target),
+		(DataType::Int32, DataType::Int32)
+			| (DataType::Int32, DataType::Int64)
+			| (DataType::Int32, DataType::Float32)
+			| (DataType::Int32, DataType::Float64)
+			| (DataType::Int64, DataType::Int32)
+			| (DataType::Int64, DataType::Int64)
+			| (DataType::Int64, DataType::Float32)
+			| (DataType::Int64, DataType::Float64)
+			| (DataType::Float32, DataType::Int32)
+			| (DataType::Float32, DataType::Int64)
+			| (DataType::Float32, DataType::Float32)
+			| (DataType::Float32, DataType::Float64)
+			| (DataType::Float64, DataType::Int32)
+			| (DataType::Float64, DataType::Int64)
+			| (DataType::Float64, DataType::Float32)
+			| (DataType::Float64, DataType::Float64)
 	)
 }
 

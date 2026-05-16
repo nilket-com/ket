@@ -320,6 +320,48 @@ if !(F64_I32_LOWER <= trunc_f64 && trunc_f64 < F64_I32_UPPER) { /* error */ }
 source-reads the comparator shape across the four
 float-to-int kernels.
 
+### D10 — Narrow hidden sort-key projection for `ORDER BY CAST(<selected aggregate>)`
+
+ADR 025 allows post-aggregate CAST in `ORDER BY` when the
+wrapped aggregate call is already selected:
+
+```sql
+SELECT region, SUM(amount)
+FROM sales
+GROUP BY region
+ORDER BY CAST(SUM(amount) AS Float32) DESC
+```
+
+Toron's existing `SortExpr` binding contract sorts only by
+output columns or positive ordinals. To keep that contract
+unchanged, ADR 025 uses a narrow planner rewrite when an
+aggregate query's `ORDER BY` key contains `Cast` after
+aggregate-call rewriting:
+
+1. Insert a Project below Sort that preserves the visible
+   output columns and appends hidden computed sort keys.
+2. Rewrite the Sort keys to reference the hidden projected
+   columns by generated names (`__toron_order_key_{idx}`).
+3. Insert a final Project above Sort that drops the hidden
+   columns and restores the visible output names.
+
+This is deliberately **not** the general hidden-aggregate-
+keys ADR. The trigger is narrow (`expr_contains_cast`) so
+existing computed ORDER BY behavior, including arithmetic-
+only expressions, remains byte-for-byte governed by the
+pre-ADR-025 path. Broader support for arbitrary hidden
+ORDER BY expressions (`ORDER BY SUM(x) + 1`,
+`ORDER BY -SUM(x)`, alias visibility, duplicate visible
+name policy, and generated-name stability beyond this
+local path) remains in the future ORDER BY hidden aggregate
+keys ADR.
+
+The rewrite rejects duplicate visible output names with a
+loud unsupported diagnostic rather than guessing which
+visible column to restore. That keeps the helper local and
+reviewable until the dedicated plan-shape ADR decides the
+general policy.
+
 ## Reject removal (ADR 015 cycle's seventh instance)
 
 ADR 015 cycle's seventh reject-removal instance (after
@@ -357,8 +399,9 @@ rejects), not a wide-blast assertion.
 | `adr025_cast_failure_returns_kernel_error_with_prefix` | NEW. Source-reads `cast_failed` for `"cast failed: "` prefix + `ExecutionError::Kernel`. |
 | `adr025_try_cast_safe_cast_doublecolon_reject` | NEW. Source-reads `lower_expr` for `CastKind::TryCast/SafeCast/DoubleColon` reject arms. |
 | `adr025_float_to_int_uses_exclusive_upper_bound` | NEW. Source-reads `cast_*_to_i*` kernels for exclusive-upper-bound comparators (D9). |
+| `adr025_order_by_cast_uses_hidden_sort_projection` | NEW. Source-reads the D10 hidden Project → Sort → Project helper path and narrow `expr_contains_cast` gate. |
 
-Total: 2 adjusted (1 renamed), 7 new guards.
+Total: 2 adjusted (1 renamed), 8 new guards.
 
 ## SoA-readiness check
 
@@ -437,6 +480,7 @@ surface.
 | R13 | Float-to-int off-by-one at `i32::MAX as f32 = 2147483648.0` | D9 exclusive upper bound; boundary fixtures pin behavior. |
 | R14 | `sqlparser` `CastKind::DoubleColon` variant availability | Verify pinned version; catchall arm handles absence with same diagnostic format. |
 | R15 | Walker recursion misses a `SqlExpr::Cast` site | Phase 1 enumerates every walker; HAVING / ORDER BY / WHERE CAST integration tests exercise paths. |
+| R16 | D10 hidden sort-key helper becomes accidental general ORDER BY policy | Guard pins narrow `expr_contains_cast` trigger; broader hidden-key decisions remain future ADR work. |
 
 ## Process observations
 
@@ -520,8 +564,9 @@ gravity):
 - **Unary negation (`-x`), modulo (`%`), `CASE`,
   `COALESCE` / `IFNULL` / `NULLIF`.** Carried from ADR 024
   future-work.
-- **HAVING alias visibility, ORDER BY hidden aggregate
-  keys.** Carried from ADR 023.
+- **HAVING alias visibility, general ORDER BY hidden
+  aggregate keys.** Carried from ADR 023. ADR 025 D10 only
+  handles the narrow CAST-bearing selected-aggregate path.
 - **Utf8 / Decimal MIN/MAX, Kahan-Neumaier stability,
   `DISTINCT`.** Carried from ADR 022 / 020 future-work.
 - **Cross-ring AGG consumer wiring (ADR 02X).** Carried.
