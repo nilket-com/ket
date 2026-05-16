@@ -298,6 +298,57 @@ along with the forward-sequence rewrite.
   error-string precedent. Plan-digest preservation for
   currently-accepted queries is the bench gate (no minimum-
   speedup, identity-shape `Project` suppression).
+- **ADR 024 — Scalar Arithmetic Expression IR.** Promoted.
+  First substrate-and-surface ADR after ADR 023 that lifts a
+  specific user-facing reject named in ADR 023's negative-case
+  fixture set (the four arithmetic forms
+  `SUM(amount) + 1` / `SUM(amount) * 1.1` /
+  `SUM(x) + COUNT(*)` / `amount + tax`). Adds five IR
+  variants (`Cast` + four arithmetic operators) to `Expr` and
+  `ExecutionExpr`; binder-only widening Cast; no SQL `CAST(x
+  AS T)` syntax exposed. Four binary operators: `+`, `-`,
+  `*`, `/`. Primitive numeric domain: `Int32`, `Int64`,
+  `Float32`, `Float64`; conservative-precise promotion lattice
+  (pure-Int preserves width; pure-Float preserves width;
+  mixed Int+Float always promotes to `Float64`). Per-lattice
+  division output (truncating integer division per PostgreSQL/
+  DuckDB/SQLite SQL norm). Checked integer overflow returns
+  `ExecutionError::Kernel { message: "arithmetic overflow:
+  {Op}({Type})" }` (reuses ADR 020 SUM precedent; no new
+  variant). Integer zero divisor → NULL; integer divide
+  overflow remains checked overflow; float division-by-zero →
+  IEEE 754 (composes with ADR 022 sticky-NaN). Critical
+  aggregate-argument shape guard
+  preserves the column-only invariant
+  (`"aggregate arguments must be simple column references"`)
+  so `SUM(amount + tax)` continues to reject once arithmetic
+  lowering exists. Wendelon PBC arithmetic AND Cast out of
+  scope; `PbcCompiler` declines both explicitly; WHERE
+  arithmetic evaluates as Toron residual. Computed aggregate
+  arguments stay deferred (sibling ADR with derive-Eq/Hash
+  refactor + `GroupedAggregateSignature` widening). 20-path
+  evaluator surface (4 widening Cast paths + 16 same-type
+  arithmetic kernels = 4 ops × 4 types). Seven new
+  architecture guards (Expr/ExecutionExpr variant counts,
+  promotion-lattice narrowness, SQL planner lowering arms,
+  checked-overflow kernel-error preservation, aggregate-
+  argument column-only guard, Cast binder-only widening, PBC
+  decline). Three-way council convergence reached across
+  four iterations; one major implementation-shape flip-flop
+  (Cast IR rotated across Codex iter-0/1/2/3/4 and Claude
+  iter-0/1/2/3/4) ratified 3/3 Yes by iter-4. SoA-readiness
+  invariants preserved (Cast IR strengthens JIT seam shape).
+  Sixth instance of the ADR 015 cycle (after 016 / 017 / 018
+  / 019/022 / 023). No new `LogicalPlan` / `ExecutionPlan`
+  variant; no new `ExecutionError` variant; no new
+  `TaskFailureKind` variant; no new `AggregateOutputRule`
+  variant; no new `StableAggregateKernel` row; no `AggState`
+  change; no fragmenter detector change; no cross-ring
+  engagement; no `GroupedAggregateSignature` widening. Plan
+  digests for currently-accepted queries byte-identical
+  (additive surface). The seven-phase migration is
+  materialized in
+  `plans/impl/024_scalar_arithmetic_expression_ir.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -365,89 +416,100 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 023 promoted; ADR 024 candidates
+### ADR 024 promoted; ADR 025 candidates
 
-ADR 023 selected and promoted **Post-Aggregate
-Projection** — the first substrate-and-surface ADR
-after four consecutive kernel-domain ADRs (019 /
-020 / 021 / 022). Decouples user-facing SELECT
-projection from the `Aggregate` operator's natural
-output schema. `GroupedAggregateScope` →
-`AggregateOutputCatalog` rename surfaces the
-12-of-17 scalar-path-caller legibility signal;
-distinct from ADR 021's `AggregateKernelSpec`
-catalog (the ADR pins the layering). One IR field
-added: `LogicalPlan::Project { output_names:
-Vec<Option<String>> }` (Shape A; parallel-vector
-invariant; `None` preserves derived names; `Some`
-carries a SELECT alias; no `Expr::Alias`). Plan
-shape:
-`Sort? → Exchange(1, []) → Project? → Filter? →
-Aggregate → Exchange(N, group_keys) → inner` with
-the new `Project?` peel above the existing
-`Filter?` peel; both execute on the aggregate-
-consumer task (Stage 1) before publishing to the
-terminal exchange. Project emission gated by a
-four-condition predicate (alias, computed
-expression in existing `Expr` surface, reorder /
-subset, HAVING-only aggregate); identity-shape
-queries omit `Project` and preserve byte-identical
-`ExecutionPlan` digests. **HAVING aggregates not in SELECT —
-enabled** (Aggregate computes union(SELECT,
-HAVING); Filter consumes; Project drops). **ORDER
-BY hidden aggregates — rejected** with new
-diagnostic; ORDER BY aggregate-call resolution is
-limited to bare aggregate SELECT outputs. **HAVING
-alias visibility — rejected**
-with new diagnostic. Computed projection bounded
-to the existing `Expr` surface; arithmetic
-deferred to a scalar arithmetic IR ADR.
-`GroupedAggregateSignature` finite enum preserved;
-generic widening blocked by derive-Eq/Hash refactor
-on `AggregateFunction` and `Expr` (deferred).
-Non-aggregate alias enablement (`SELECT amount AS
-a FROM sales`) is a 3/3-ratified companion. One
-fragmenter detector widens (peel order: Project
-before Filter); ADR 015's "one narrow detector"
-property preserved with one body widening.
-SoA-readiness invariants from ADR 021 preserved.
-Five new architecture guards (rename completion,
-strict-projection reject absence, `output_names`
-field presence, detector peel order, diagnostic
-preservation). Three-way council convergence
-reached across four iterations; two recorded
-dissents (name, computed-projection scope language)
-carried by 2-of-3 majority. Fifth instance of the
-ADR 015 cycle (after ADR 016 / 017 / 018 / 019). No
-new IR variant; no new fragmenter recognition site;
-no `AggState` change; no cross-ring engagement.
-The six-phase migration is materialized in
-`plans/impl/023_post_aggregate_projection.md`.
+ADR 024 selected and promoted **Scalar Arithmetic
+Expression IR** — the first substrate-and-surface
+ADR after ADR 023 that lifts a specific user-facing
+reject named in ADR 023's negative-case fixture
+set. Adds five IR variants to `Expr` and
+`ExecutionExpr`: `Cast(Box<Expr>, DataType)` (binder-
+only widening) plus `Add` / `Sub` / `Mul` / `Div`.
+Four binary arithmetic operators (`+`, `-`, `*`,
+`/`) lower from SQL. Primitive numeric domain
+(`Int32`, `Int64`, `Float32`, `Float64`);
+conservative-precise promotion lattice (pure-type
+preserves width; mixed Int+Float promotes to
+`Float64`). Per-lattice division output (truncating
+integer division per PostgreSQL/DuckDB/SQLite SQL
+norm). Checked integer overflow returns
+`ExecutionError::Kernel { message: "arithmetic
+overflow: {Op}({Type})" }` (no new variant). Integer
+zero divisor → NULL; integer divide overflow remains
+checked overflow; float division-by-zero → IEEE 754.
+Critical aggregate-
+argument shape guard prevents `SUM(amount + tax)`
+from accidentally binding once arithmetic lowering
+exists; diagnostic `"aggregate arguments must be
+simple column references"`. Wendelon PBC arithmetic
+AND Cast both PBC-ineligible; `PbcCompiler` declines
+explicitly; WHERE arithmetic evaluates as Toron
+residual. 20-path evaluator surface (4 widening Cast
+paths + 16 same-type arithmetic kernels). Cast IR
+guardrails: SQL `CAST(x AS T)` rejected by planner;
+Cast inserted only by binder; widening-only (four
+conversions: `Int32 → Int64`, `Int32 → Float64`,
+`Int64 → Float64`, `Float32 → Float64`); not PBC-
+eligible; architecture guard prevents accidental
+`SqlExpr::Cast` lowering. Three-way council
+convergence reached across four iterations; one
+major implementation-shape flip-flop (Cast IR
+rotated across Codex iter-0/1/2/3/4 and Claude
+iter-0/1/2/3/4) ratified 3/3 Yes by iter-4 — second
+cycle in two ADRs of such rotation (recorded as a
+process observation). SoA-readiness invariants from
+ADR 021 preserved with positive Brainstorm 001 (JIT)
+alignment strengthened by explicit Cast nodes. Seven
+new architecture guards. Sixth instance of the
+ADR 015 cycle (after 016 / 017 / 018 / 019/022 /
+023). No new `LogicalPlan` / `ExecutionPlan` variant;
+no new `ExecutionError` variant; no new
+`TaskFailureKind` variant; no new
+`AggregateOutputRule` variant; no `AggState` change;
+no fragmenter detector change; no cross-ring
+engagement; no `GroupedAggregateSignature` widening.
+Plan digests for currently-accepted queries byte-
+identical (additive surface). The seven-phase
+migration is materialized in
+`plans/impl/024_scalar_arithmetic_expression_ir.md`.
 
-ADR 024 selection starts from the post-ADR-023
+ADR 025 selection starts from the post-ADR-024
 remainder:
 
 **Substrate candidates newly named-deferred by ADR
-023:**
+024:**
 
-- **Scalar arithmetic IR.** ADR 023 §Future work
-  pins this as the precondition for general
-  computed post-aggregate projection. Multiple
-  downstream surfaces unblock when this lands:
-  arithmetic in SELECT (`SUM(amount) * 1.1`),
-  arithmetic over multiple aggregates
-  (`SUM(x) + COUNT(*)`), eventual computed
-  aggregate arguments (`SUM(amount + tax)` —
-  bundled with derive-Eq/Hash refactor; see
-  below). Touches `Expr`, `ExecutionExpr`, binder
-  numeric promotion rules, executor evaluation,
-  and Wendelon PBC bytecode if pushdown enters
-  scope. Promotes if workload evidence surfaces
-  post-aggregate arithmetic pressure (percentage
-  calculations, computed metrics) — the
-  ADR 023 negative-case fixture set documents the
-  rejected forms users will hit first. **Leading
-  substrate-downstream candidate after ADR 023.**
+- **SQL `CAST(x AS T)` syntax.** Now has a clean
+  substrate to extend — ADR 024's binder-only
+  widening Cast IR variant is already in place;
+  ADR 025 would add the SQL planner lowering for
+  `SqlExpr::Cast`, narrowing conversions
+  (saturating vs erroring decision matrix), and
+  cross-type conversions beyond the four widening
+  pairs ADR 024 covers (e.g., Float → Int, Utf8 →
+  numeric). **Leading substrate-downstream
+  candidate after ADR 024** — the Cast IR
+  substrate is the lowest-friction extension and
+  users will encounter the `CAST(...) is not
+  supported` reject the first time they need
+  explicit type coercion in queries with mixed
+  numeric inputs.
+- **Computed aggregate arguments ADR.**
+  `SUM(x + y)`. Bundled with the derive-Eq/Hash
+  refactor on `AggregateFunction` and `Expr`
+  (code-grounded block from ADR 023 §Status; the
+  blockers are `ApproxQuantile(f64)` and
+  `ScalarValue::Float32`/`Float64`).
+  `GroupedAggregateSignature` widening to
+  `(AggregateFunction, Vec<Expr>)` is the
+  signature-shape companion. Composes naturally
+  with ADR 024's arithmetic once the signature
+  substrate exists. Promotes when computed-
+  argument workload evidence surfaces.
+
+**Carried substrate candidates from ADR 023's
+named-deferred set:**
+
 - **HAVING alias visibility ADR.** Loosens ADR
   023's `"HAVING does not resolve SELECT aliases"`
   reject. SQL-compat surface; own planner name-
@@ -460,16 +522,29 @@ remainder:
   reject. Plan-shape ADR; either hidden-sort-
   columns or Project-above-Sort design. Promotes
   on workload evidence.
-- **Computed aggregate arguments ADR.**
-  `SUM(x + y)`. Bundled with the derive-Eq/Hash
-  refactor on `AggregateFunction` and `Expr`
-  (code-grounded block from ADR 023 §Status; the
-  blockers are `ApproxQuantile(f64)` and
-  `ScalarValue::Float32`/`Float64`).
-  `GroupedAggregateSignature` widening to
-  `(AggregateFunction, Vec<Expr>)` is the
-  signature-shape companion. Promotes when
-  computed-argument workload evidence surfaces.
+
+**Newly-deferred siblings to ADR 024 arithmetic:**
+
+- **Unary negation (`-x`).** Small surface; could
+  bundle with modulo. Adds `Expr::Neg` IR variant;
+  reuses the numeric-domain restriction from ADR
+  024.
+- **Integer modulo (`%`).** Has its own /0
+  decision (matches Div); signed-modulo semantic
+  (Rust `%` follows dividend sign).
+- **`CASE WHEN ... THEN ... ELSE ... END`.**
+  Substantial own decision matrix — branch type
+  unification, null handling, multi-branch
+  evaluation. Reuses ADR 024's lattice for branch
+  result type unification.
+- **`COALESCE` / `IFNULL` / `NULLIF`.** Null-
+  handling functions.
+- **Wendelon PBC arithmetic and Cast opcode
+  extension.** Cross-ring ADR — adds arithmetic
+  opcodes to PBC bytecode for filter pushdown.
+  Promotes when workload evidence shows
+  arithmetic-predicate filtering would
+  meaningfully reduce cross-ring transfer bytes.
 
 **Kernel-domain candidates (carried from ADR 022
 remainder):**
@@ -549,8 +624,8 @@ stay outside the stable catalog via the small adjacent
 `experimental_aggregate_sql_name` helper; graduation moves a
 kernel from experimental-helper to stable-catalog row. The gap
 tightens the evidence case for the first kernel graduation but
-did not promote as ADR 023 lead and does not promote as ADR 024
-lead by itself.
+did not promote as ADR 023 lead or ADR 024 lead and does not
+promote as ADR 025 lead by itself.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
