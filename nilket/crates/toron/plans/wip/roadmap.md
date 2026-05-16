@@ -93,6 +93,24 @@ along with the forward-sequence rewrite.
   Closes ADR 016 §1 and ADR 017 §10 catch-all rejects. No new IR, no
   binder expression surface change, no fragmenter detector change, no
   walker signature change.
+- **ADR 019 — MIN / MAX Aggregate Kernels.** Promoted + implemented.
+  First kernel-catalog widening under the post-ADR-018 cycle. Three-way
+  council convergence ratified MIN+MAX bundled over the early-iter AVG
+  candidate, with the conservative `Int32` / `Int64` type-domain
+  intersection (defers float to a dedicated NaN-policy ADR, defers
+  `Utf8` to preserve `AggState: Copy`). `MIN` and `MAX` remove
+  themselves from the `lower_aggregate_function` catch-all at
+  `sql_planner.rs:554`; identity-type output (`Int32` → `Int32`,
+  `Int64` → `Int64`); `Option<T>` state with no-non-NULL-seen → NULL
+  finalization. Lightweight bench artifact ships per the
+  Wendelon-ADR-070 pattern (ADR 011 no-bench precedent does not
+  transfer — ADR 011 made existing kernels reachable; ADR 019 adds new
+  stable kernels). Wendelon-side already ships parallel
+  `Min { column }` / `Max { column }` variants at
+  `crates/wendelon/src/schema/aggregate.rs:94-125`; ADR 02X engages
+  the cross-ring consumer wiring. No new IR variant beyond the enum
+  widening (5 → 7), no fragmenter detector change, no cross-ring
+  engagement, `AggState` stays `Copy`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -160,60 +178,86 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 018 implemented; ADR 019 candidates
+### ADR 019 implemented; ADR 020 candidates
 
-ADR 018 selection closed the ADR 017 round on scalar-aggregate
-`HAVING` / `ORDER BY` — the fourth instance of the cycle shape
-generalized the ADR 016 / ADR 017 substrate to the scalar
-surface without modification. The cycle's "shape-neutral
-walker" framing now has four proofs across grouped and scalar
-aggregate shapes. ADR 019 selection starts from the remainder:
+ADR 019 landed `MIN` and `MAX` as the first kernel-catalog
+widening under the post-ADR-018 cycle, extending the cycle's
+source-level boundary clarity property to the kernel surface.
+The convergence ratified MIN+MAX bundled (per Gemini's framing
++ Codex's "MAX is the closest follow-on" posture, with the
+ADR 008 bundling precedent applied to the parallel
+Wendelon-side `Min`/`Max` variants), conservative
+`Int32`/`Int64` type-domain (explicit deferrals for Float and
+Utf8 documented in V1 exclusions), and a lightweight bench
+artifact. ADR 020 selection starts from the post-ADR-019
+remainder:
 
-**Adjacent SQL-surface candidates** carry forward, all still
-resting on ADR 011's narrow grouped-aggregate surface:
+**Leading kernel candidates:**
 
-- **Aggregate-catalog widening (`AVG` / `MIN` / `MAX`).** One
-  ADR per kernel under the Wendelon-ADR-070 pattern. Pure
-  additive — a new `AggregateFunction` variant + a new
-  `GroupedAggregateSignature` variant + a new
-  `lower_*_aggregate` arm composes mechanically with the
-  cycle's substrate, now proved against both grouped and
-  scalar shapes. Closest candidate to ADR 018's nomination
-  runner-up.
+- **`AVG` aggregate kernel.** Closest follow-on under the
+  Wendelon-ADR-070 pattern. Multi-state accumulator `(sum,
+  count)`; Float64-uniform output in V1 (Decimal output for
+  integer inputs awaits the V1.x Decimal ADR). Wendelon-side
+  already ships `SignedAverageParts { sum: i128, count: u64 }`
+  at `crates/wendelon/src/schema/aggregate.rs:94-125` —
+  alignment is a happy property, not yet a cross-ring contract.
+  Bench artifact required (per the ADR 019 precedent for new
+  stable kernels). **Closest candidate to ADR 020's nomination.**
+- **Float `MIN` / `MAX`.** Smaller than AVG but with a sharper
+  semantic-contract question: NaN and signed-zero policy must
+  be ratified explicitly. Arrow's bytewise IEEE 754 ordering is
+  deterministic but surprising as aggregate semantics.
+- **`Utf8` `MIN` / `MAX`.** Forces `AggState` to lose `Copy`
+  (String owns its buffer). Substrate refactor with cascading
+  effects across existing `match states[agg_idx]` patterns.
+  Bundleable with collation/locale decision matrix, or kept
+  bytewise-only.
+
+**Post-aggregate projection** (aliases, computed expressions
+on aggregates, key subsets, reordered keys). The
+`GroupedAggregateScope` naming-asymmetry signal from ADR
+018/019 is now strong — the scope's "Grouped" prefix
+misleads, and post-aggregate projection is the surface that
+renames it into the broader output-name catalog it actually
+is. Strong runner-up.
+
+**Cross-ring candidate — ADR 02X (Wendelon AGG consumer wiring):**
+
+The Wendelon-side AGG protocol exists. Toron-side
+`wendelon_client::TableQueryOptions` does not expose it. The
+consumer-side ADR engages the cross-ring contract for the
+partial/final two-phase shape and lifts ADR 011/019's
+per-partition scalar ceiling. **This is the right home for
+two-phase aggregation work** — bench artifact required
+(cross-ring perf characteristic). Promotes when workload
+evidence surfaces aggregate-pushdown pressure.
+
+**Other ADR 011 follow-ons** carry forward as candidates if
+their evidence outranks the SQL-surface set:
+- **Shared-helper refactor across SUM / MIN / MAX / AVG.**
+  Deferred to post-AVG; at four parallel numeric kernels the
+  duplication earns refactor. ADR 020 ratifies the refactor
+  decision if AVG is the lead.
 - **`DISTINCT`** — `GROUP BY <all output columns>` with no
-  aggregates. ADR 010 closed its silent drop; implementation
-  remains aggregate-path ADR work. Loosens ADR 011's zero-
-  aggregate reject; not pure composition.
-- **Post-aggregate projection** (aliases, computed expressions on
-  aggregates, key subsets, reordered keys). ADR 011 explicitly
-  rejects; widening is its own decision matrix. ADR 017's
-  `GroupedAggregateScope` output-name multiset becomes the
-  authoritative output-name catalog when this widens.
-- **`GROUP BY` over joins.** Composes ADR 008's join surface with
-  ADR 011's grouped aggregate; ADR 011 rejected this in V1.
-  Only candidate in the set with a possible brainstorm-seam
-  concern (fragmenter routing decision vs disaggregated-
-  compute placement, brainstorm 003).
+  aggregates. Loosens ADR 011's zero-aggregate reject; own
+  decision matrix.
+- **`GROUP BY` over joins.** Composes ADR 008's join surface
+  with ADR 011's grouped aggregate; only candidate with a
+  brainstorm-seam concern (disaggregated-compute placement,
+  brainstorm 003).
+- **Kahan-Neumaier stability ADR.** Composes across SUM and
+  AVG together; MIN/MAX is order-independent and doesn't
+  participate.
 
-**Other ADR 011 follow-ons** carry forward as candidates if their
-evidence outranks the SQL-surface set: two-phase partial/final
-aggregation (lifts ADR 018's V1 §1 scalar single-stage ceiling
-and the grouped per-partition contract), aggregate-catalog
-widening (already listed above), experimental-kernel graduation.
-
-**Kernel graduation evidence pressure (from ADR 018 iter-1
-sweep).** The experimental-kernel bound/unbound parity gap at
-`exec.rs:912-916` and `exec.rs:1035-1039` — `LinearRegress` /
-`ApproxQuantile` are accepted by planner + binder but the
-bound executor returns `NotImplemented`; the unbound executor
-implements them. Gated behind `allow_experimental_kernels`
-(default false), so production SQL paths don't reach it. The
-gap tightens the evidence case for the first kernel
-graduation (likely `LinearRegress`) but does not promote as
-ADR 019 lead by itself. ADR 018 separately pins inherited
-empty-input aggregate behavior; future kernel-graduation
-ADRs remain the right place for aggregate-kernel semantic
-changes.
+**Kernel graduation evidence pressure (carried from ADR 018
+iter-1 sweep).** The experimental-kernel bound/unbound parity
+gap at `exec.rs:912-916` and `exec.rs:1035-1039` —
+`LinearRegress` / `ApproxQuantile` are accepted by planner +
+binder but the bound executor returns `NotImplemented`. Gated
+behind `allow_experimental_kernels` (default false), so
+production SQL paths don't reach it. The gap tightens the
+evidence case for the first kernel graduation but does not
+promote as ADR 020 lead by itself.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
@@ -341,45 +385,74 @@ prior roadmap, unchanged:
 
 ### Brainstorms and high-level vision
 
-Long-horizon shapes the council has noted but not
-committed.
+The far-horizon shapes the council is most excited about.
+These are speculative architectures — not committed scope —
+but each opens a genuinely new axis of capability the V1
+substrate is being kept *compatible with*, not closed off
+from. The cycle's discipline of preserving load-bearing seams
+explicitly serves these futures.
 
 - **Brainstorm 001: Pure Cranelift JIT as a First-Class
-  Query Specializer.** JIT-compile hot kernels (predicates,
-  UDFs, hash-join probe loops) into native machine code for
-  zero-copy, bare-metal performance. Reserved for post-V1
-  deliberation when bench evidence quantifies the
-  interpretation overhead.
-- **Brainstorm 002: WeakControlRing.** In-memory Raft ring
-  for HA coordinators, cluster-wide quotas, and shuffle
-  barrier synchronization without the persistence tax of
-  NVMe / WAL. ADR 003's `WorkerRegistry` trait +
-  `WorkerLease` / `LeaseEpoch` fields are the seam.
+  Query Specializer.** Compile hot kernels — predicates,
+  UDFs, hash-join probe loops — directly to native machine
+  code. The interpretation tax that every analytical query
+  pays today disappears on the inner loops that actually
+  dominate wall-clock. Bare-metal throughput on the kernels
+  that matter most. The seam is kept open: no V1 contract
+  bakes in interpretation-only invariants. Reserved for
+  post-V1 deliberation when bench evidence quantifies the
+  interpretation overhead at production scale.
+- **Brainstorm 002: WeakControlRing.** An in-memory Raft
+  ring for HA coordinators, cluster-wide quotas, and shuffle
+  barrier synchronization — *without* the persistence tax
+  of NVMe / WAL that traditional Raft pays. The insight:
+  control-plane state has different durability needs than
+  data-plane state; a weakened ring algebra lets coordinator
+  HA scale without storage coupling. Seam: ADR 003's
+  `WorkerRegistry` trait + `WorkerLease` / `LeaseEpoch`
+  fields are the deliberate hooks. Promotes when V1
+  production exposes coordinator-HA as a binding constraint.
 - **Brainstorm 003: Disaggregated Compute Roles & Unified
-  Ring Algebra.** Explores breaking the symmetric
-  Toron/Wendelon node model into specialized hardware roles
-  (stateful NVMe nodes vs elastic compute-only nodes) while
-  preserving a single executable and unified ring algebra.
-  Three visions: hardware-optimized asymmetry, weak/strong
-  ring algebra, data-broker / ToronWorker topology. Seams:
+  Ring Algebra.** The most ambitious of the four. Break the
+  symmetric Toron/Wendelon node model into specialized
+  hardware roles — stateful NVMe data nodes paired with
+  elastic compute-only nodes — while preserving a single
+  executable, a unified ring algebra, and the operator
+  contracts that work today. Three concrete visions are
+  noted: hardware-optimized asymmetry, weak/strong ring
+  algebra, data-broker / ToronWorker topology. Each
+  unlocks a different cost-efficiency story at scale. Seams:
   `NodeRoleSet` bitmask expansion, `RingRouter` routing
   durable writes only to `NodeRole::Data`, ADR 003's
-  `WorkerRegistry` / `WorkerLease` / `LeaseEpoch` (shared
-  with Brainstorm 002).
+  registry/lease surfaces (shared with Brainstorm 002). The
+  cycle currently passes through these seams without closing
+  them off — for example, ADR 020's "GROUP BY over joins"
+  candidate is parked specifically because its fragmenter
+  routing decision would prematurely commit to one of the
+  three placements.
 - **Brainstorm 004: Memory Arenas and Custom Allocators for
-  Query Planning.** Proposes index-based pools or arena
-  allocators (e.g., Cranelift `BForest` pattern) for ASTs
-  and query plans to reduce allocation churn and improve
-  cache locality without lifetime contagion. Three sketched
-  approaches: external arena crates (`bumpalo` /
-  `typed-arena`, lifetime contagion), Cranelift-style
-  index-based pool (SOA-aligned, no lifetime threading),
-  domain-specific pool. Seam: IR type shape (`LogicalPlan`,
-  `ExecutionPlan`, `Expr` currently own children via
-  `Box`); deeper boxing raises future retrofit cost.
-  Evidence-gated — touches ADR 005's allocator-churn note
-  as a potential reuse target, but no allocator commitment
-  should land without profiling.
+  Query Planning.** AST and query-plan churn dominate
+  allocation profiles in dispatch-heavy workloads. Arena
+  allocation collapses the per-node `Box`/`drop` overhead
+  into a single bulk free, improving cache locality on the
+  hot planner path. Three sketched approaches: external
+  arena crates (`bumpalo` / `typed-arena`, lifetime
+  contagion), Cranelift-style index-based pool (SOA-aligned,
+  no lifetime threading), domain-specific pool. Seam: IR
+  type shape — `LogicalPlan`, `ExecutionPlan`, `Expr`
+  currently own children via `Box`, so deeper boxing raises
+  future retrofit cost. Evidence-gated by ADR 005's
+  allocator-churn note; no allocator commitment lands
+  without profiling, but the IR shape is kept
+  arena-compatible.
+
+The cumulative ambition: a compute ring that JITs the inner
+loops, scales coordinator state without storage coupling,
+disaggregates hardware roles for cost-efficiency, and
+allocates query state with cache-aware discipline — all on
+the same Wendelon-native substrate V1 is hardening today.
+Each brainstorm is independent; the value of keeping their
+seams open compounds.
 
 **Pushdown axis** (cumulative observation, not a
 brainstorm). Toron's pushdown story now covers static
@@ -516,80 +589,33 @@ labeled by ADR cycle. Older cycles compress to brief
 summaries; recent cycles retain detail until evidence
 fades.
 
-### ADR 016 cycle
+### ADR 016 cycle (compressed)
 
-- **Shape A — group-keys-only `HAVING`** (no aggregate-call
-  rewrite). Considered as the purest ADR 015 cycle-shape
-  echo; rejected. Group-keys-only `HAVING` is `WHERE`
-  applied after the aggregate over a key the aggregate
-  already partitions on — the canonical analytical case
-  `HAVING SUM(amount) > N` fails, which is a worse user
-  surface than no `HAVING` at all.
-- **Shape B — binder widening with `Expr::AggregateCall`
-  arm.** Considered (Codex first-principles redline:
-  binder is the "right" layer for context-aware resolution
-  and would close ADR 015's `ORDER BY <aggregate-call>` V1
-  exclusion in the same ADR); rejected. Shape B does not
-  avoid structural-match logic, only relocates it;
-  `bind_expr` lacks projection context today; ADR 009
-  precedent (targeted SQL-AST rewrite over expanding
-  binder surface) is the consistent posture. Shape C
-  (planner pre-rewrite) wins.
-- **Raw `sqlparser::ast::Function` `PartialEq` as the
-  rewrite match key.** Considered (Claude iter-3 initial
-  design); rejected on iter-4 ground-truth verification.
-  `Function`'s derived `PartialEq` is byte-equal on `name:
-  ObjectName`, which preserves user casing — `HAVING sum
-  (amount)` would byte-mismatch `SELECT SUM(amount)`
-  despite being the same call. Match on the lowered
-  `(AggregateFunction, Vec<Expr>)` pair instead;
-  `lower_aggregate_function` canonicalizes casing and
-  arguments.
-- **First-match resolution for duplicate-output-name
-  `HAVING` references.** Considered (Claude iter-5
-  initial position: "matches the first projection
-  aggregate"); rejected (Codex + Gemini iter-5 strict
-  policy). Four-way classification: zero matches → reject
-  as not-in-SELECT; multiple matches → reject as
-  ambiguous; one match with duplicated generated output
-  name → reject as ambiguous; one match with unique name
-  → rewrite. Standard SQL has no `HAVING <ordinal>` form
-  to disambiguate; silent first-match would hide
-  ambiguity from the user.
-- **Bundle ADR 015's `ORDER BY <aggregate-call>` V1
-  exclusion close into ADR 016.** Considered as symmetric
-  scope (same planner-rewrite pattern at
-  `lower_order_by`); rejected. Asymmetry is user urgency,
-  not implementation cost — `ORDER BY <aggregate-call>`
-  has a working workaround (`ORDER BY <ordinal>`),
-  `HAVING <aggregate-call>` does not. Keeping the
-  exclusion preserved ADR 016's narrow framing; the
-  deferred surface landed in ADR 017.
-- **Place the post-aggregate `Filter` outside the
-  terminal-gather `Exchange`.** Considered as alternative
-  to the inside-gather form; rejected. Outside-gather
-  filters reduce nothing before the shuffle and bloat the
-  terminal-sort task plan; inside-gather is wire-
-  efficient and preserves the three-stage symmetry.
-- **New `FilterDisposition` variant for post-aggregate
-  predicates.** Considered; rejected. The existing
-  `EvaluateInToron` disposition applies — PBC-push at
-  `binder.rs:83-98` naturally fails for any predicate
-  whose columns are not in the storage scan output, so
-  the post-aggregate filter falls into `EvaluateInToron`
-  without new selection logic.
-- **Permissive-engine `HAVING` lifting** (auto-insert a
-  non-projected aggregate into the projection when
-  `HAVING` references it). Considered for user
-  convenience; rejected. Standard-SQL reject is the V1
-  contract — too narrow and correct over matching
-  permissive engines.
-- **`HAVING <ordinal>` form** (`HAVING 2 > 100` as
-  ordinal reference). Considered for ambiguity
-  disambiguation; rejected. Standard SQL has no such
-  form; `HAVING 2 > 100` lowers as a literal predicate
-  (`2 > 100`, always false). The ambiguous-aggregate
-  workaround is query restructuring.
+**ADR 016 (post-aggregate filtering with HAVING):**
+- Group-keys-only `HAVING` (no aggregate-call rewrite)
+  rejected — canonical `HAVING SUM(amount) > N` fails;
+  worse user surface than no HAVING.
+- Binder widening with `Expr::AggregateCall` arm rejected
+  — only relocates structural-match logic; `bind_expr`
+  lacks projection context; ADR 009 SQL-AST-rewrite
+  precedent stands.
+- Raw `sqlparser::ast::Function` `PartialEq` as rewrite
+  match key rejected — preserves user casing and would
+  byte-mismatch same call; lowered `(AggregateFunction,
+  Vec<Expr>)` pair is canonical key.
+- First-match resolution for duplicate-output-name HAVING
+  references rejected — four-way classification rejects
+  ambiguous instead of silently picking first.
+- Bundling ADR 015's `ORDER BY <aggregate-call>` close
+  into ADR 016 rejected — kept narrow; landed as ADR 017.
+- Post-aggregate `Filter` outside terminal-gather exchange
+  rejected — inside-gather is wire-efficient and
+  preserves three-stage symmetry.
+- New `FilterDisposition` variant rejected — existing
+  `EvaluateInToron` applies via PBC-push failing for
+  post-aggregate columns.
+- Permissive-engine HAVING lifting and `HAVING <ordinal>`
+  form both rejected — standard-SQL contract.
 
 ### ADR 010 cycle
 
