@@ -6,7 +6,7 @@
 
 ## Status
 
-Promoted. Implementation pending.
+Promoted. Implemented.
 
 Three-way AI Swarm Council convergence reached after the
 ADR 018 planning session. Iter-0 nominated scalar-aggregate

@@ -5,7 +5,7 @@
 
 ## Status
 
-Promoted. Implementation pending.
+Promoted. Implemented.
 
 This is the smallest implementation in the cycle so far:
 one conditional gate-widening, one scope construction, one
@@ -535,9 +535,7 @@ detector arm would fail one of these regression tests.
 - ADR + impl plan promoted to
   `plans/adr/018_scalar_aggregate_having_order_by.md` and
   `plans/impl/018_scalar_aggregate_having_order_by.md`
-  with status "Promoted. Implementation pending."; status
-  flips to "Promoted. Implemented." upon implementation
-  landing.
+  with status "Promoted. Implemented.".
 - `plans/wip/roadmap.md` ADR 018 entry retires from
   "candidates" into "Implemented" with the cycle-shape
   quadruplet note: ADR 015 (`Sort` + `Aggregate`), ADR 016

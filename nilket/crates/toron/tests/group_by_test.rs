@@ -391,11 +391,158 @@ fn order_by_aggregate_call_argument_must_match_projected_aggregate() {
 }
 
 #[test]
-fn having_without_group_by_is_rejected() {
-	assert_unsupported_message(
-		"SELECT COUNT(*) FROM sales HAVING COUNT(*) > 5",
-		"HAVING without GROUP BY is not supported",
+fn scalar_aggregate_having_lowers_to_filter_over_aggregate() {
+	let plan = plan_sql("SELECT SUM(amount) FROM sales HAVING SUM(amount) > 1000");
+
+	let LogicalPlan::Filter { input, predicate } = plan else {
+		panic!("expected HAVING filter over scalar aggregate");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(1000))))
+	));
+	assert_scalar_sum_aggregate(input.as_ref());
+}
+
+#[test]
+fn scalar_aggregate_order_by_lowers_to_sort_over_exchange_over_aggregate() {
+	let plan = plan_sql("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) DESC");
+
+	let LogicalPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+	} = plan
+	else {
+		panic!("expected sort over scalar aggregate");
+	};
+	assert_eq!(limit, None);
+	assert_eq!(offset, 0);
+	assert_eq!(order_by.len(), 1);
+	assert_column(&order_by[0].expr, "sum");
+	assert!(order_by[0].descending);
+	let LogicalPlan::Exchange {
+		input,
+		partition_count,
+		key,
+	} = input.as_ref()
+	else {
+		panic!("expected terminal exchange below scalar sort");
+	};
+	assert_eq!(*partition_count, 1);
+	assert!(key.is_empty());
+	assert_scalar_sum_aggregate(input.as_ref());
+}
+
+#[test]
+fn scalar_aggregate_dual_rewrite_having_and_order_by() {
+	let plan = plan_sql(
+		"SELECT SUM(amount) FROM sales \
+		 HAVING SUM(amount) > 1000 ORDER BY SUM(amount) DESC LIMIT 1",
 	);
+
+	let LogicalPlan::Sort {
+		input,
+		order_by,
+		limit,
+		offset,
+	} = plan
+	else {
+		panic!("expected sort over scalar HAVING filter");
+	};
+	assert_eq!(limit, Some(1));
+	assert_eq!(offset, 0);
+	assert_eq!(order_by.len(), 1);
+	assert_column(&order_by[0].expr, "sum");
+	assert!(order_by[0].descending);
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+		panic!("expected scalar HAVING filter below terminal exchange");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
+	assert_scalar_sum_aggregate(input.as_ref());
+}
+
+#[test]
+fn scalar_aggregate_order_by_ordinal_lowers_without_aggregate_rewrite() {
+	let plan = plan_sql("SELECT SUM(amount) FROM sales ORDER BY 1 DESC");
+
+	let LogicalPlan::Sort { order_by, .. } = plan else {
+		panic!("expected sort over scalar aggregate");
+	};
+	assert!(matches!(
+		order_by[0].expr,
+		Expr::Literal(ScalarValue::Int32(Some(1)))
+	));
+	assert!(order_by[0].descending);
+}
+
+#[test]
+fn scalar_aggregate_having_ambiguity_is_rejected() {
+	assert_unsupported_message(
+		"SELECT COUNT(*), COUNT(*) FROM events HAVING COUNT(*) > 0",
+		"ambiguous HAVING aggregate-call",
+	);
+}
+
+#[test]
+fn scalar_aggregate_order_by_ambiguity_is_rejected() {
+	assert_unsupported_message(
+		"SELECT COUNT(*), COUNT(*) FROM events ORDER BY COUNT(*)",
+		"ambiguous ORDER BY aggregate-call",
+	);
+}
+
+#[test]
+fn scalar_aggregate_order_by_not_in_select_rejects() {
+	assert_unsupported_message(
+		"SELECT COUNT(*) FROM sales ORDER BY SUM(amount)",
+		"ORDER BY aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn scalar_aggregate_having_not_in_select_rejects() {
+	assert_unsupported_message(
+		"SELECT COUNT(*) FROM sales HAVING SUM(amount) > 0",
+		"HAVING aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn scalar_aggregate_having_qualified_reference_rejects() {
+	assert_unsupported_message(
+		"SELECT SUM(amount) FROM sales HAVING t.amount > 0",
+		"qualified HAVING column references are not supported",
+	);
+}
+
+#[test]
+fn having_without_group_by_and_without_aggregate_still_rejects() {
+	assert_unsupported_message(
+		"SELECT region FROM sales HAVING region = 'EMEA'",
+		"HAVING requires GROUP BY or an aggregate projection",
+	);
+}
+
+#[test]
+fn scalar_aggregate_order_by_computed_aggregate_call_expression_still_rejects() {
+	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) + 100");
+	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY -SUM(amount)");
+}
+
+#[test]
+fn scalar_aggregate_having_experimental_aggregate_rejects() {
+	assert_unsupported("SELECT LINEAR_REGRESS(x, y) FROM t HAVING LINEAR_REGRESS(x, y) > 0");
 }
 
 #[test]
@@ -434,11 +581,6 @@ fn having_qualified_column_reference_is_rejected() {
 		"SELECT region, COUNT(*) FROM sales GROUP BY region HAVING t.region = 'EMEA'",
 		"qualified HAVING column references are not supported",
 	);
-}
-
-#[test]
-fn order_by_aggregate_call_outside_grouped_query_still_rejects() {
-	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY SUM(amount)");
 }
 
 #[test]
@@ -718,6 +860,40 @@ async fn grouped_aggregate_having_order_by_limit_offset_executes() {
 }
 
 #[tokio::test]
+async fn scalar_aggregate_having_executes_with_one_row_output() {
+	let results = run_logical(&plan_sql(
+		"SELECT SUM(amount) FROM sales \
+		 HAVING SUM(amount) > 0 ORDER BY SUM(amount) DESC LIMIT 1",
+	))
+	.await;
+
+	assert_eq!(scalar_sum_rows(&results), vec![Some(67)]);
+}
+
+#[tokio::test]
+async fn scalar_aggregate_having_filters_to_zero_rows_when_predicate_false() {
+	let results = run_logical(&plan_sql(
+		"SELECT SUM(amount) FROM sales HAVING SUM(amount) > 1000",
+	))
+	.await;
+
+	assert!(scalar_sum_rows(&results).is_empty());
+}
+
+#[tokio::test]
+async fn scalar_aggregate_having_empty_input_pins_inherited_behavior() {
+	let aggregate_results = run_logical(&plan_sql("SELECT SUM(amount) FROM empty_sales")).await;
+	assert_eq!(scalar_sum_rows(&aggregate_results), vec![None]);
+
+	let having_results = run_logical(&plan_sql(
+		"SELECT SUM(amount) FROM empty_sales HAVING SUM(amount) > 0",
+	))
+	.await;
+
+	assert!(scalar_sum_rows(&having_results).is_empty());
+}
+
+#[tokio::test]
 async fn ordered_grouped_aggregate_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
@@ -755,6 +931,36 @@ async fn grouped_aggregate_having_order_by_sql_matches_hand_built_sort_plan() {
 		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) DESC LIMIT 10 OFFSET 1",
 	);
 	let hand_built = hand_built_ordered_having_grouped_sum_plan(Some(10), 1);
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::None).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::None).expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn scalar_aggregate_having_sql_matches_hand_built_filter_plan() {
+	let sql = plan_sql("SELECT SUM(amount) FROM sales HAVING SUM(amount) > 10");
+	let hand_built = hand_built_having_scalar_sum_plan(10);
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::FullRowLex).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::FullRowLex)
+			.expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn scalar_aggregate_having_order_by_sql_matches_hand_built_plan() {
+	let sql = plan_sql(
+		"SELECT SUM(amount) FROM sales \
+		 HAVING SUM(amount) > 10 ORDER BY SUM(amount) DESC LIMIT 1",
+	);
+	let hand_built = hand_built_ordered_having_scalar_sum_plan(Some(1), 0, 10);
 	let sql_results = run_logical(&sql).await;
 	let hand_built_results = run_logical(&hand_built).await;
 
@@ -956,6 +1162,95 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 }
 
 #[tokio::test]
+async fn scalar_aggregate_having_only_fragments_to_single_task_stage() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT SUM(amount) FROM sales HAVING SUM(amount) > 10");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind scalar HAVING aggregate");
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment scalar HAVING");
+
+	assert_eq!(stages.len(), 1);
+	assert_eq!(stages[0].stage_id, StageId::new(0));
+	assert!(stages[0].upstream_stages.is_empty());
+	assert_eq!(stages[0].tasks.len(), 1);
+	let task = &stages[0].tasks[0].spec;
+	assert_eq!(task.partition, None);
+	assert!(matches!(task.output, TaskOutputBinding::FinalResult));
+	assert!(matches!(task.inputs[0], TaskInputBinding::Scan { .. }));
+	assert!(matches!(
+		&task.plan,
+		ExecutionPlan::Filter { input, .. }
+			if matches!(
+				input.as_ref(),
+				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty()
+			)
+	));
+}
+
+#[tokio::test]
+async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) DESC");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind ordered scalar aggregate");
+	let stages = fragment_plan(bound, fragment_config()).expect("fragment ordered scalar");
+
+	assert_eq!(stages.len(), 2);
+	assert_eq!(stages[0].stage_id, StageId::new(0));
+	assert_eq!(stages[1].stage_id, StageId::new(1));
+	assert!(stages[0].upstream_stages.is_empty());
+	assert_eq!(stages[1].upstream_stages, vec![StageId::new(0)]);
+	assert_eq!(stages[0].tasks.len(), 1);
+	assert_eq!(stages[1].tasks.len(), 1);
+	assert!(matches!(
+		&stages[0].tasks[0].spec.output,
+		TaskOutputBinding::ShuffleProducer {
+			exchange_id,
+			partition_count,
+			partition_key,
+		} if *exchange_id == ExchangeId::new(0)
+			&& *partition_count == PartitionCount::new(1)
+			&& partition_key.is_empty()
+	));
+	assert!(matches!(
+		&stages[0].tasks[0].spec.plan,
+		ExecutionPlan::Exchange {
+			input,
+			partition_count: 1,
+			key,
+		} if key.is_empty()
+			&& matches!(
+				input.as_ref(),
+				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty()
+			)
+	));
+	let terminal = &stages[1].tasks[0].spec;
+	assert!(matches!(terminal.output, TaskOutputBinding::FinalResult));
+	assert!(matches!(
+		&terminal.inputs[0],
+		TaskInputBinding::ShuffleConsumer {
+			exchange_id,
+			producer_stage_id,
+			partition_id,
+			..
+		} if *exchange_id == ExchangeId::new(0)
+			&& *producer_stage_id == StageId::new(0)
+			&& partition_id.0 == 0
+	));
+	assert!(matches!(
+		&terminal.plan,
+		ExecutionPlan::Sort {
+			order_by,
+			limit: None,
+			offset: 0,
+			..
+		} if order_by[0].ordinal == ColumnOrdinal(0) && order_by[0].descending
+	));
+}
+
+#[tokio::test]
 async fn non_aggregate_two_exchange_terminal_sort_still_rejects() {
 	let (catalog, _) = fixture();
 	let bound = bind(
@@ -1077,6 +1372,48 @@ fn hand_built_ordered_having_grouped_sum_plan(limit: Option<usize>, offset: usiz
 		}),
 		order_by: vec![SortExpr {
 			expr: Expr::Literal(ScalarValue::Int32(Some(2))),
+			descending: true,
+			nulls_first: false,
+		}],
+		limit,
+		offset,
+	}
+}
+
+fn hand_built_scalar_sum_plan() -> LogicalPlan {
+	LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![(AggregateFunction::Sum, vec![Expr::column("amount")])],
+	}
+}
+
+fn hand_built_having_scalar_sum_plan(threshold: i32) -> LogicalPlan {
+	LogicalPlan::Filter {
+		input: Box::new(hand_built_scalar_sum_plan()),
+		predicate: Expr::Gt(
+			Box::new(Expr::column("sum")),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(threshold)))),
+		),
+	}
+}
+
+fn hand_built_ordered_having_scalar_sum_plan(
+	limit: Option<usize>,
+	offset: usize,
+	threshold: i32,
+) -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(hand_built_having_scalar_sum_plan(threshold)),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::column("sum"),
 			descending: true,
 			nulls_first: false,
 		}],
@@ -1215,6 +1552,25 @@ fn ordered_region_sum_rows(results: &[RecordBatch]) -> Vec<(Option<String>, Opti
 	rows
 }
 
+fn scalar_sum_rows(results: &[RecordBatch]) -> Vec<Option<i64>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let sums = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("sum column");
+		for row in 0..batch.num_rows() {
+			rows.push(if sums.is_null(row) {
+				None
+			} else {
+				Some(sums.value(row))
+			});
+		}
+	}
+	rows
+}
+
 fn region_count_rows(results: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
 	let mut rows = Vec::new();
 	for batch in results {
@@ -1263,6 +1619,22 @@ fn assert_grouped_aggregate_over_exchange(plan: &LogicalPlan) {
 	assert_eq!(*partition_count, 4);
 	assert_eq!(key.len(), 1);
 	assert_column(&key[0], "region");
+	assert!(matches!(input.as_ref(), LogicalPlan::ScanNamed { .. }));
+}
+
+fn assert_scalar_sum_aggregate(plan: &LogicalPlan) {
+	let LogicalPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+	} = plan
+	else {
+		panic!("expected scalar aggregate");
+	};
+	assert!(group_expr.is_empty());
+	assert_eq!(aggr_expr.len(), 1);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Sum));
+	assert_column(&aggr_expr[0].1[0], "amount");
 	assert!(matches!(input.as_ref(), LogicalPlan::ScanNamed { .. }));
 }
 
@@ -1334,6 +1706,7 @@ impl LogicalPlanExt for LogicalPlan {
 
 fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 	let sales_schema = sales_schema();
+	let empty_sales_schema = sales_schema.clone();
 	let regions_schema = regions_schema();
 	let mut catalog = MockCatalog::new();
 	catalog
@@ -1348,10 +1721,17 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 			descriptor(2, "regions", regions_schema.as_ref(), "region"),
 		)
 		.expect("register regions");
+	catalog
+		.register_descriptor(
+			TableId(3),
+			descriptor(3, "empty_sales", empty_sales_schema.as_ref(), "id"),
+		)
+		.expect("register empty sales");
 	let storage = Arc::new(FixtureScan {
 		batches: HashMap::from([
 			(TableId(1), sales_batch(sales_schema)),
 			(TableId(2), regions_batch(regions_schema)),
+			(TableId(3), empty_sales_batch(empty_sales_schema)),
 		]),
 	});
 	(catalog, storage)
@@ -1405,6 +1785,19 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("sales batch")
+}
+
+fn empty_sales_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(Vec::<i64>::new())),
+			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+			Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+		],
+	)
+	.expect("empty sales batch")
 }
 
 fn regions_batch(schema: SchemaRef) -> RecordBatch {

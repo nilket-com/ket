@@ -78,8 +78,8 @@ along with the forward-sequence rewrite.
   neutral, and grouped `ORDER BY SUM(...)` / `COUNT(...)` references lower
   to projected aggregate output fields. No new IR, no binder expression
   surface change, no fragmenter detector change.
-- **ADR 018 — Scalar-Aggregate `HAVING` / `ORDER BY` SQL.** Promoted;
-  implementation pending. Fourth instance of the ADR 015 cycle shape,
+- **ADR 018 — Scalar-Aggregate `HAVING` / `ORDER BY` SQL.** Promoted +
+  implemented. Fourth instance of the ADR 015 cycle shape,
   generalizing the ADR 016 / ADR 017 substrate to the scalar (no-`GROUP
   BY`) aggregate surface: `lower_select`'s global-aggregate branch
   constructs `GroupedAggregateScope::from_projection(&[], &aggr_expr)`
@@ -160,7 +160,7 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 018 promoted; ADR 019 candidates
+### ADR 018 implemented; ADR 019 candidates
 
 ADR 018 selection closed the ADR 017 round on scalar-aggregate
 `HAVING` / `ORDER BY` — the fourth instance of the cycle shape

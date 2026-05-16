@@ -190,8 +190,13 @@ impl SqlPlanner {
 		} else {
 			Some(lower_group_by_keys(group_by)?)
 		};
-		if having.is_some() && group_keys.is_none() {
-			return Err(unsupported("HAVING without GROUP BY is not supported"));
+		if having.is_some()
+			&& group_keys.is_none()
+			&& !projection_contains_aggregate_call(projection)
+		{
+			return Err(unsupported(
+				"HAVING requires GROUP BY or an aggregate projection",
+			));
 		}
 
 		// 1. Handle FROM (Scan)
@@ -281,13 +286,24 @@ impl SqlPlanner {
 			// P0.5: accepted global aggregates keep the pre-ADR single-stage shape; no
 			// distributed exchange is inserted for the accounting refactor.
 			let aggr_expr = self.lower_global_aggregate_projection(projection)?;
+			let scope = GroupedAggregateScope::from_projection(&[], &aggr_expr);
+			let aggregate = LogicalPlan::Aggregate {
+				input: Box::new(plan),
+				group_expr: vec![],
+				aggr_expr,
+			};
+			let plan = if let Some(having) = having.as_ref() {
+				let predicate = self.lower_having_predicate(having, &scope)?;
+				LogicalPlan::Filter {
+					input: Box::new(aggregate),
+					predicate,
+				}
+			} else {
+				aggregate
+			};
 			return Ok(LoweredSelect {
-				plan: LogicalPlan::Aggregate {
-					input: Box::new(plan),
-					group_expr: vec![],
-					aggr_expr,
-				},
-				grouped_aggregate_scope: None,
+				plan,
+				grouped_aggregate_scope: Some(scope),
 			});
 		}
 

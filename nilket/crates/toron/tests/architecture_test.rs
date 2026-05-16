@@ -449,7 +449,6 @@ fn adr016_having_guards_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	assert!(!planner.contains("HAVING is not supported"));
-	assert!(planner.contains("HAVING without GROUP BY is not supported"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
 	assert!(planner.contains("qualified HAVING column references are not supported"));
@@ -553,6 +552,38 @@ fn adr017_order_by_aggregate_call_guards_are_narrow() {
 	assert!(planner.contains("fn rewrite_grouped_aggregate_calls"));
 	assert!(!planner.contains("HavingAggregateScope"));
 	assert!(!planner.contains("rewrite_having_aggregate_calls"));
+
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_expr = binder
+		.split("fn bind_expr")
+		.nth(1)
+		.and_then(|rest| rest.split("fn bind_comparison").next())
+		.expect("bind_expr block");
+	assert!(!bind_expr.contains("AggregateCall"));
+	assert!(!bind_expr.contains("AggregateFunction"));
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let filter_disposition = execution_source
+		.split("pub enum FilterDisposition")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct ExecutionSortKey").next())
+		.expect("FilterDisposition enum");
+	assert_eq!(enum_variant_count(filter_disposition), 2);
+}
+
+#[test]
+fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(planner.contains("HAVING requires GROUP BY or an aggregate projection"));
+	assert!(!planner.contains("HAVING without GROUP BY is not supported"));
+	assert!(planner.contains("qualified HAVING column references are not supported"));
+	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
+	assert!(planner.contains("ambiguous HAVING aggregate-call"));
+	assert!(planner.contains("ambiguous ORDER BY aggregate-call"));
+	assert!(planner.contains("ORDER BY aggregate-call must appear in SELECT list"));
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");

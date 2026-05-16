@@ -458,6 +458,46 @@ async fn having_ordered_grouped_aggregate_process_digest_is_stable_across_worker
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scalar_aggregate_ordered_process_digest_is_stable_across_worker_counts() {
+	let two_workers = run_ordered_scalar_aggregate_process_query(2_100, 2, 0).await;
+	let four_workers = run_ordered_scalar_aggregate_process_query(2_200, 4, 1).await;
+
+	assert_eq!(two_workers.row_count, 1);
+	assert_eq!(four_workers.row_count, 1);
+	assert_eq!(two_workers.digest, four_workers.digest);
+	// Scalar ordered aggregate has only producer + consumer task slots; a larger pool
+	// must not imply grouped-style fan-out.
+	assert_eq!(
+		unique_selected_worker_count(&two_workers.selected_workers),
+		2
+	);
+	assert_eq!(
+		unique_selected_worker_count(&four_workers.selected_workers),
+		2
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scalar_aggregate_having_ordered_process_digest_is_stable_across_worker_counts() {
+	let two_workers = run_ordered_having_scalar_aggregate_process_query(2_300, 2, 0).await;
+	let four_workers = run_ordered_having_scalar_aggregate_process_query(2_400, 4, 1).await;
+
+	assert_eq!(two_workers.row_count, 1);
+	assert_eq!(four_workers.row_count, 1);
+	assert_eq!(two_workers.digest, four_workers.digest);
+	// Scalar ordered aggregate has only producer + consumer task slots; a larger pool
+	// must not imply grouped-style fan-out.
+	assert_eq!(
+		unique_selected_worker_count(&two_workers.selected_workers),
+		2
+	);
+	assert_eq!(
+		unique_selected_worker_count(&four_workers.selected_workers),
+		2
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn broadcast_join_build_process_kill_replays_attempt_and_matches_baseline_digest() {
 	let baseline = run_broadcast_join_process_query(800).await;
 	let killed = run_broadcast_join_build_kill_query(900).await;
@@ -662,6 +702,97 @@ async fn run_ordered_having_grouped_aggregate_process_query(
 		.execute_query(&logical)
 		.await
 		.expect("ordered grouped aggregate HAVING query");
+	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("digest");
+	let row_count = results.iter().map(RecordBatch::num_rows).sum();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	OrderedGroupProcessRun {
+		digest,
+		row_count,
+		selected_workers: registry.selected_workers(),
+	}
+}
+
+async fn run_ordered_scalar_aggregate_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+) -> OrderedGroupProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan("SELECT SUM(val) FROM fixture ORDER BY SUM(val) DESC LIMIT 1")
+		.expect("plan ordered scalar aggregate");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("ordered scalar aggregate query");
+	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("digest");
+	let row_count = results.iter().map(RecordBatch::num_rows).sum();
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	OrderedGroupProcessRun {
+		digest,
+		row_count,
+		selected_workers: registry.selected_workers(),
+	}
+}
+
+async fn run_ordered_having_scalar_aggregate_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+) -> OrderedGroupProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(
+			"SELECT SUM(val) FROM fixture \
+			 HAVING SUM(val) > 0 ORDER BY SUM(val) DESC LIMIT 1",
+		)
+		.expect("plan ordered scalar aggregate HAVING");
+
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("ordered scalar aggregate HAVING query");
 	let digest = canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("digest");
 	let row_count = results.iter().map(RecordBatch::num_rows).sum();
 	for worker in &mut workers {
@@ -1171,6 +1302,10 @@ fn sum_counts(results: &[arrow::record_batch::RecordBatch]) -> i64 {
 			(0..counts.len()).map(|row| counts.value(row)).sum::<i64>()
 		})
 		.sum()
+}
+
+fn unique_selected_worker_count(workers: &[WorkerId]) -> usize {
+	workers.iter().copied().collect::<HashSet<_>>().len()
 }
 
 fn worker_entry(worker: &FixtureWorkerProcess) -> WorkerEntry {
