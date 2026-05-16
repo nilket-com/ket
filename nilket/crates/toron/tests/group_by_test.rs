@@ -11,7 +11,7 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{ExchangeId, QueryId, StageId};
 use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBinding};
-use toron::error::{BindingError, FrontendError, StorageError};
+use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, ColumnOrdinal, ExecutionExpr, ExecutionPlan, Expr, FilterDisposition,
@@ -295,15 +295,25 @@ async fn scalar_aggregate_aliases_bind_to_final_schema_and_order_by() {
 	assert_eq!(having.schema().field(0).name(), "total");
 }
 
-#[test]
-fn deferred_arithmetic_and_computed_aggregate_arguments_still_reject() {
+#[tokio::test]
+async fn post_aggregate_arithmetic_binds_and_keeps_computed_args_rejected() {
+	let (catalog, _) = fixture();
 	for sql in [
 		"SELECT SUM(amount) + 1 FROM sales",
 		"SELECT region, SUM(amount) * 1.1 FROM sales GROUP BY region",
 		"SELECT region, SUM(amount) + COUNT(*) FROM sales GROUP BY region",
-		"SELECT SUM(amount + tax) FROM sales",
 	] {
-		assert_unsupported(sql);
+		bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|err| panic!("{sql}: expected bind success, got {err}"));
+	}
+
+	for sql in [
+		"SELECT SUM(amount + 1) FROM sales",
+		"SELECT COUNT(amount + 1) FROM sales",
+		"SELECT AVG(price * 2.0) FROM sales",
+	] {
+		assert_unsupported_message(sql, "aggregate arguments must be simple column references");
 	}
 }
 
@@ -743,8 +753,17 @@ fn having_without_group_by_and_without_aggregate_still_rejects() {
 }
 
 #[test]
-fn scalar_aggregate_order_by_computed_aggregate_call_expression_still_rejects() {
-	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) + 100");
+fn scalar_aggregate_order_by_computed_aggregate_call_arithmetic_lowers() {
+	let plan = plan_sql("SELECT SUM(amount) FROM sales ORDER BY SUM(amount) + 100");
+	let LogicalPlan::Sort { order_by, .. } = plan else {
+		panic!("expected scalar aggregate sort");
+	};
+	assert!(matches!(
+		&order_by[0].expr,
+		Expr::Add(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(100))))
+	));
 	assert_unsupported("SELECT SUM(amount) FROM sales ORDER BY -SUM(amount)");
 }
 
@@ -816,10 +835,19 @@ fn having_qualified_column_reference_is_rejected() {
 }
 
 #[test]
-fn order_by_computed_aggregate_call_expression_still_rejects() {
-	assert_unsupported(
+fn order_by_computed_aggregate_call_arithmetic_lowers() {
+	let plan = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 100",
 	);
+	let LogicalPlan::Sort { order_by, .. } = plan else {
+		panic!("expected grouped aggregate sort");
+	};
+	assert!(matches!(
+		&order_by[0].expr,
+		Expr::Add(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+				&& matches!(right.as_ref(), Expr::Literal(ScalarValue::Int32(Some(100))))
+	));
 	assert_unsupported(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY -SUM(amount)",
 	);
@@ -863,9 +891,6 @@ fn having_preserves_inherited_group_by_rejects() {
 	);
 	assert_unsupported(
 		"SELECT DISTINCT region, COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 1",
-	);
-	assert_unsupported(
-		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) + 100 > 1000",
 	);
 	assert_unsupported(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(COUNT(*)) > 5",
@@ -1326,6 +1351,131 @@ async fn scalar_aggregate_having_empty_input_pins_inherited_behavior() {
 	.await;
 
 	assert!(scalar_sum_rows(&having_results).is_empty());
+}
+
+#[tokio::test]
+async fn scalar_arithmetic_executes_with_widening_and_division_semantics() {
+	let aggregate_results = run_logical(&plan_sql(
+		"SELECT SUM(amount) + 1, SUM(amount) / 2, AVG(amount) * 2.0 FROM sales",
+	))
+	.await;
+	assert_eq!(
+		scalar_int64_column_rows(&aggregate_results, 0),
+		vec![Some(68)]
+	);
+	assert_eq!(
+		scalar_int64_column_rows(&aggregate_results, 1),
+		vec![Some(33)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&aggregate_results, 2),
+		vec![Some(33.5)]
+	);
+
+	let integer_zero = run_logical(&plan_sql("SELECT amount / (amount - amount) FROM sales")).await;
+	assert_eq!(
+		scalar_int32_column_rows(&integer_zero, 0),
+		vec![None, None, None, None, None, None]
+	);
+
+	let float_zero = run_logical(&plan_sql("SELECT price / 0.0 FROM sales")).await;
+	let values = scalar_float64_column_rows(&float_zero, 0);
+	assert_eq!(values.len(), 6);
+	assert!(values[0].expect("row 0").is_infinite());
+	assert!(values[1].expect("row 1").is_infinite());
+	assert_eq!(values[2], None);
+	assert!(values[3].expect("row 3").is_infinite());
+	assert_eq!(values[4], None);
+	assert!(values[5].expect("row 5").is_infinite());
+}
+
+#[tokio::test]
+async fn grouped_post_aggregate_arithmetic_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) + COUNT(*) FROM sales GROUP BY region",
+	))
+	.await;
+
+	assert_eq!(
+		region_int64_rows(&results, 1),
+		HashMap::from([
+			(Some("east".to_string()), Some(43)),
+			(Some("west".to_string()), Some(22)),
+			(None, Some(8)),
+		])
+	);
+}
+
+#[tokio::test]
+async fn grouped_having_arithmetic_over_aggregate_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 HAVING SUM(amount) + 100 > 125",
+	))
+	.await;
+
+	assert_eq!(
+		ordered_region_sum_rows(&results),
+		vec![(Some("east".to_string()), Some(40))]
+	);
+}
+
+#[tokio::test]
+async fn arithmetic_bind_injects_only_widening_casts() {
+	let (catalog, _) = fixture();
+	let bound = bind(
+		&plan_sql("SELECT amount + id, rating32 + price FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind arithmetic widening");
+
+	let ExecutionPlan::Project { exprs, .. } = bound else {
+		panic!("expected projection");
+	};
+	assert!(matches!(
+		&exprs[0],
+		ExecutionExpr::Add(left, right)
+			if matches!(left.as_ref(), ExecutionExpr::Cast(inner, DataType::Int64)
+				if matches!(inner.as_ref(), ExecutionExpr::Column(column) if column.name.0 == "amount"))
+				&& matches!(right.as_ref(), ExecutionExpr::Column(column)
+					if column.name.0 == "id" && column.data_type == DataType::Int64)
+	));
+	assert!(matches!(
+		&exprs[1],
+		ExecutionExpr::Add(left, right)
+			if matches!(left.as_ref(), ExecutionExpr::Cast(inner, DataType::Float64)
+				if matches!(inner.as_ref(), ExecutionExpr::Column(column) if column.name.0 == "rating32"))
+				&& matches!(right.as_ref(), ExecutionExpr::Column(column)
+					if column.name.0 == "price" && column.data_type == DataType::Float64)
+	));
+
+	assert_unsupported("SELECT CAST(amount AS BIGINT) FROM sales");
+}
+
+#[tokio::test]
+async fn integer_arithmetic_overflow_is_a_kernel_error() {
+	let (catalog, storage) = fixture();
+	let bound = bind(
+		&plan_sql("SELECT amount + 2147483647 FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind overflowing arithmetic");
+
+	let err = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("overflow should fail");
+	match err {
+		ExecutionError::Kernel { message } => assert!(
+			message.starts_with("arithmetic overflow: Add(Int32)"),
+			"unexpected overflow message: {message}"
+		),
+		other => panic!("expected kernel overflow error, got {other:?}"),
+	}
 }
 
 #[tokio::test]
@@ -2363,6 +2513,77 @@ fn scalar_sum_rows(results: &[RecordBatch]) -> Vec<Option<i64>> {
 			} else {
 				Some(sums.value(row))
 			});
+		}
+	}
+	rows
+}
+
+fn scalar_int32_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i32>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("Int32 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows
+}
+
+fn scalar_int64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<i64>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows
+}
+
+fn region_int64_rows(
+	results: &[RecordBatch],
+	value_column_idx: usize,
+) -> HashMap<Option<String>, Option<i64>> {
+	let mut rows = HashMap::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let values = batch
+			.column(value_column_idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 value column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let value = if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			};
+			rows.insert(region, value);
 		}
 	}
 	rows

@@ -69,6 +69,11 @@ impl ColumnRef {
 pub enum Expr {
 	Column(ColumnRef),
 	Literal(ScalarValue),
+	Cast(Box<Expr>, DataType),
+	Add(Box<Expr>, Box<Expr>),
+	Sub(Box<Expr>, Box<Expr>),
+	Mul(Box<Expr>, Box<Expr>),
+	Div(Box<Expr>, Box<Expr>),
 	Eq(Box<Expr>, Box<Expr>),
 	Neq(Box<Expr>, Box<Expr>),
 	Lt(Box<Expr>, Box<Expr>),
@@ -98,8 +103,24 @@ impl Expr {
 
 	pub fn is_pbc_pushdown_eligible(&self) -> bool {
 		match self {
-			Self::TimeBucket(_, _) => false,
-			_ => true,
+			Self::Column(_) | Self::Literal(_) => true,
+			Self::Cast(_, _)
+			| Self::Add(_, _)
+			| Self::Sub(_, _)
+			| Self::Mul(_, _)
+			| Self::Div(_, _)
+			| Self::TimeBucket(_, _) => false,
+			Self::Eq(left, right)
+			| Self::Neq(left, right)
+			| Self::Lt(left, right)
+			| Self::Lte(left, right)
+			| Self::Gt(left, right)
+			| Self::Gte(left, right)
+			| Self::And(left, right)
+			| Self::Or(left, right) => left.is_pbc_pushdown_eligible() && right.is_pbc_pushdown_eligible(),
+			Self::Not(inner) | Self::IsNull(inner) | Self::IsNotNull(inner) => {
+				inner.is_pbc_pushdown_eligible()
+			}
 		}
 	}
 }

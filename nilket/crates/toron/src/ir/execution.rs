@@ -33,6 +33,11 @@ pub struct ResolvedColumn {
 pub enum ExecutionExpr {
 	Column(ResolvedColumn),
 	Literal(ScalarValue),
+	Cast(Box<ExecutionExpr>, DataType),
+	Add(Box<ExecutionExpr>, Box<ExecutionExpr>),
+	Sub(Box<ExecutionExpr>, Box<ExecutionExpr>),
+	Mul(Box<ExecutionExpr>, Box<ExecutionExpr>),
+	Div(Box<ExecutionExpr>, Box<ExecutionExpr>),
 	Eq(Box<ExecutionExpr>, Box<ExecutionExpr>),
 	Neq(Box<ExecutionExpr>, Box<ExecutionExpr>),
 	Lt(Box<ExecutionExpr>, Box<ExecutionExpr>),
@@ -136,6 +141,14 @@ impl ExecutionExpr {
 		match self {
 			Self::Column(column) => column.data_type.clone(),
 			Self::Literal(value) => value.data_type(),
+			Self::Cast(_, target) => target.clone(),
+			Self::Add(left, right)
+			| Self::Sub(left, right)
+			| Self::Mul(left, right)
+			| Self::Div(left, right) => {
+				debug_assert_eq!(left.data_type(), right.data_type());
+				left.data_type()
+			}
 			Self::Eq(_, _)
 			| Self::Neq(_, _)
 			| Self::Lt(_, _)
@@ -163,6 +176,13 @@ impl ExecutionExpr {
 				ScalarValue::Utf8(value) => value.is_none(),
 			},
 			Self::IsNull(_) | Self::IsNotNull(_) => false,
+			Self::Cast(inner, _) => inner.nullable(),
+			Self::Add(left, right) | Self::Sub(left, right) | Self::Mul(left, right) => {
+				left.nullable() || right.nullable()
+			}
+			Self::Div(left, right) => {
+				left.nullable() || right.nullable() || is_integer_type(&left.data_type())
+			}
 			Self::Eq(left, right)
 			| Self::Neq(left, right)
 			| Self::Lt(left, right)
@@ -179,6 +199,11 @@ impl ExecutionExpr {
 		match self {
 			Self::Column(column) => column.pbc_eligible,
 			Self::Literal(_) => true,
+			Self::Cast(_, _)
+			| Self::Add(_, _)
+			| Self::Sub(_, _)
+			| Self::Mul(_, _)
+			| Self::Div(_, _) => false,
 			Self::Eq(left, right)
 			| Self::Neq(left, right)
 			| Self::Lt(left, right)
@@ -191,6 +216,25 @@ impl ExecutionExpr {
 			Self::TimeBucket(_, _) => false,
 		}
 	}
+}
+
+pub fn arithmetic_output_type(left: &DataType, right: &DataType) -> Option<DataType> {
+	use DataType::*;
+
+	match (left, right) {
+		(Int32, Int32) => Some(Int32),
+		(Int32, Int64) | (Int64, Int32) | (Int64, Int64) => Some(Int64),
+		(Float32, Float32) => Some(Float32),
+		(Int32 | Int64, Float32) | (Float32, Int32 | Int64) => Some(Float64),
+		(Float64, Int32 | Int64 | Float32 | Float64) | (Int32 | Int64 | Float32, Float64) => {
+			Some(Float64)
+		}
+		_ => None,
+	}
+}
+
+pub fn is_integer_type(data_type: &DataType) -> bool {
+	matches!(data_type, DataType::Int32 | DataType::Int64)
 }
 
 pub fn schema_for_exprs(exprs: &[ExecutionExpr]) -> SchemaRef {

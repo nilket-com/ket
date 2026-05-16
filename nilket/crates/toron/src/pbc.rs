@@ -157,6 +157,15 @@ impl PbcCompiler {
 				self.compile_expr(inner, bytecode)?;
 				bytecode.push(OP_IS_NOT_NULL);
 			}
+			ExecutionExpr::Cast(_, _)
+			| ExecutionExpr::Add(_, _)
+			| ExecutionExpr::Sub(_, _)
+			| ExecutionExpr::Mul(_, _)
+			| ExecutionExpr::Div(_, _) => {
+				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+					"arithmetic and Cast are not PBC-eligible".to_string(),
+				));
+			}
 			ExecutionExpr::TimeBucket(_, _) => {
 				return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 			}

@@ -13,7 +13,8 @@ use crate::error::BindingError;
 use crate::ir::{
 	AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan,
 	ExecutionSortKey, Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan, PbcProgram,
-	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, schema_for_exprs,
+	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, arithmetic_output_type,
+	schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 
@@ -994,7 +995,12 @@ fn collect_expr_columns(expr: &ExecutionExpr, columns: &mut BTreeSet<ColumnOrdin
 			columns.insert(column.ordinal);
 		}
 		ExecutionExpr::Literal(_) => {}
-		ExecutionExpr::Eq(left, right)
+		ExecutionExpr::Cast(inner, _) => collect_expr_columns(inner, columns),
+		ExecutionExpr::Add(left, right)
+		| ExecutionExpr::Sub(left, right)
+		| ExecutionExpr::Mul(left, right)
+		| ExecutionExpr::Div(left, right)
+		| ExecutionExpr::Eq(left, right)
 		| ExecutionExpr::Neq(left, right)
 		| ExecutionExpr::Lt(left, right)
 		| ExecutionExpr::Lte(left, right)
@@ -1027,6 +1033,26 @@ fn rewrite_expr_ordinals(
 			Ok(ExecutionExpr::Column(column))
 		}
 		ExecutionExpr::Literal(value) => Ok(ExecutionExpr::Literal(value)),
+		ExecutionExpr::Cast(inner, target) => Ok(ExecutionExpr::Cast(
+			Box::new(rewrite_expr_ordinals(*inner, remap)?),
+			target,
+		)),
+		ExecutionExpr::Add(left, right) => Ok(ExecutionExpr::Add(
+			Box::new(rewrite_expr_ordinals(*left, remap)?),
+			Box::new(rewrite_expr_ordinals(*right, remap)?),
+		)),
+		ExecutionExpr::Sub(left, right) => Ok(ExecutionExpr::Sub(
+			Box::new(rewrite_expr_ordinals(*left, remap)?),
+			Box::new(rewrite_expr_ordinals(*right, remap)?),
+		)),
+		ExecutionExpr::Mul(left, right) => Ok(ExecutionExpr::Mul(
+			Box::new(rewrite_expr_ordinals(*left, remap)?),
+			Box::new(rewrite_expr_ordinals(*right, remap)?),
+		)),
+		ExecutionExpr::Div(left, right) => Ok(ExecutionExpr::Div(
+			Box::new(rewrite_expr_ordinals(*left, remap)?),
+			Box::new(rewrite_expr_ordinals(*right, remap)?),
+		)),
 		ExecutionExpr::Eq(left, right) => Ok(ExecutionExpr::Eq(
 			Box::new(rewrite_expr_ordinals(*left, remap)?),
 			Box::new(rewrite_expr_ordinals(*right, remap)?),
@@ -1203,6 +1229,19 @@ fn bind_expr(
 			input_schema,
 		)?)),
 		Expr::Literal(value) => Ok(ExecutionExpr::Literal(value.clone())),
+		Expr::Cast(inner, target) => bind_cast(input_schema, config, inner, target),
+		Expr::Add(left, right) => {
+			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Add)
+		}
+		Expr::Sub(left, right) => {
+			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Sub)
+		}
+		Expr::Mul(left, right) => {
+			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Mul)
+		}
+		Expr::Div(left, right) => {
+			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Div)
+		}
 		Expr::Eq(left, right) => {
 			bind_comparison(input_schema, config, left, right, ExecutionExpr::Eq)
 		}
@@ -1255,6 +1294,73 @@ fn bind_expr(
 			Ok(ExecutionExpr::TimeBucket(*interval, Box::new(inner)))
 		}
 	}
+}
+
+fn bind_arithmetic(
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	left: &Expr,
+	right: &Expr,
+	constructor: fn(Box<ExecutionExpr>, Box<ExecutionExpr>) -> ExecutionExpr,
+) -> Result<ExecutionExpr, BindingError> {
+	let left = bind_expr(left, input_schema, config)?;
+	let right = bind_expr(right, input_schema, config)?;
+	let left_type = left.data_type();
+	let right_type = right.data_type();
+	let output_type =
+		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
+			BindingError::TypeMismatch {
+				message: format!(
+					"arithmetic operands must be Int32, Int64, Float32, or Float64, got {left_type:?} and {right_type:?}"
+				),
+			}
+		})?;
+	let left = cast_if_needed(left, &output_type)?;
+	let right = cast_if_needed(right, &output_type)?;
+	Ok(constructor(Box::new(left), Box::new(right)))
+}
+
+fn bind_cast(
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	inner: &Expr,
+	target: &DataType,
+) -> Result<ExecutionExpr, BindingError> {
+	let inner = bind_expr(inner, input_schema, config)?;
+	let source = inner.data_type();
+	if !is_widening_cast(&source, target) {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"Cast from {source:?} to {target:?} is not a supported widening conversion"
+			),
+		});
+	}
+	Ok(ExecutionExpr::Cast(Box::new(inner), target.clone()))
+}
+
+fn cast_if_needed(expr: ExecutionExpr, target: &DataType) -> Result<ExecutionExpr, BindingError> {
+	let source = expr.data_type();
+	if source == *target {
+		return Ok(expr);
+	}
+	if !is_widening_cast(&source, target) {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"Cast from {source:?} to {target:?} is not a supported widening conversion"
+			),
+		});
+	}
+	Ok(ExecutionExpr::Cast(Box::new(expr), target.clone()))
+}
+
+fn is_widening_cast(source: &DataType, target: &DataType) -> bool {
+	matches!(
+		(source, target),
+		(DataType::Int32, DataType::Int64)
+			| (DataType::Int32, DataType::Float64)
+			| (DataType::Int64, DataType::Float64)
+			| (DataType::Float32, DataType::Float64)
+	)
 }
 
 fn bind_comparison(

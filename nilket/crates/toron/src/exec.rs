@@ -6,6 +6,8 @@ use crate::distributed::task::TaskTelemetry;
 use crate::error::ExecutionError;
 #[cfg(test)]
 use crate::ir::JoinStrategy;
+#[cfg(test)]
+use crate::ir::arithmetic_output_type;
 use crate::ir::{
 	AggregateFunction, ExecutionExpr, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
 	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
@@ -45,6 +47,25 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 const JOIN_SPILL_PAGE_SIZE: usize = 64 * 1024;
 const JOIN_SPILL_CACHE_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 static NEXT_JOIN_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy)]
+enum ArithmeticOp {
+	Add,
+	Sub,
+	Mul,
+	Div,
+}
+
+impl ArithmeticOp {
+	fn name(self) -> &'static str {
+		match self {
+			Self::Add => "Add",
+			Self::Sub => "Sub",
+			Self::Mul => "Mul",
+			Self::Div => "Div",
+		}
+	}
+}
 
 pub(crate) mod runtime_filter;
 
@@ -720,6 +741,30 @@ impl Executor {
 					]))),
 				}
 			}
+			Expr::Cast(inner, target) => {
+				let arr = self.evaluate_expr(inner, batch)?;
+				evaluate_cast(&arr, target)
+			}
+			Expr::Add(left, right) => {
+				let left_arr = self.evaluate_expr(left, batch)?;
+				let right_arr = self.evaluate_expr(right, batch)?;
+				evaluate_unbound_arithmetic(ArithmeticOp::Add, left_arr, right_arr)
+			}
+			Expr::Sub(left, right) => {
+				let left_arr = self.evaluate_expr(left, batch)?;
+				let right_arr = self.evaluate_expr(right, batch)?;
+				evaluate_unbound_arithmetic(ArithmeticOp::Sub, left_arr, right_arr)
+			}
+			Expr::Mul(left, right) => {
+				let left_arr = self.evaluate_expr(left, batch)?;
+				let right_arr = self.evaluate_expr(right, batch)?;
+				evaluate_unbound_arithmetic(ArithmeticOp::Mul, left_arr, right_arr)
+			}
+			Expr::Div(left, right) => {
+				let left_arr = self.evaluate_expr(left, batch)?;
+				let right_arr = self.evaluate_expr(right, batch)?;
+				evaluate_unbound_arithmetic(ArithmeticOp::Div, left_arr, right_arr)
+			}
 			Expr::Eq(left, right) => {
 				let left_arr = self.evaluate_expr(left, batch)?;
 				let right_arr = self.evaluate_expr(right, batch)?;
@@ -867,6 +912,22 @@ impl Executor {
 					]))),
 				}
 			}
+			ExecutionExpr::Cast(inner, target) => {
+				let arr = self.evaluate_bound_expr(inner, batch)?;
+				evaluate_cast(&arr, target)
+			}
+			ExecutionExpr::Add(left, right) => {
+				self.evaluate_bound_arithmetic(ArithmeticOp::Add, left, right, batch)
+			}
+			ExecutionExpr::Sub(left, right) => {
+				self.evaluate_bound_arithmetic(ArithmeticOp::Sub, left, right, batch)
+			}
+			ExecutionExpr::Mul(left, right) => {
+				self.evaluate_bound_arithmetic(ArithmeticOp::Mul, left, right, batch)
+			}
+			ExecutionExpr::Div(left, right) => {
+				self.evaluate_bound_arithmetic(ArithmeticOp::Div, left, right, batch)
+			}
 			ExecutionExpr::Eq(left, right) => {
 				let left_arr = self.evaluate_bound_expr(left, batch)?;
 				let right_arr = self.evaluate_bound_expr(right, batch)?;
@@ -940,6 +1001,28 @@ impl Executor {
 				}
 			}
 		}
+	}
+
+	fn evaluate_bound_arithmetic(
+		&self,
+		op: ArithmeticOp,
+		left: &ExecutionExpr,
+		right: &ExecutionExpr,
+		batch: &RecordBatch,
+	) -> Result<ArrayRef, ExecutionError> {
+		let left_type = left.data_type();
+		let right_type = right.data_type();
+		if left_type != right_type {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"bound arithmetic operands must have matching types, got {left_type:?} and {right_type:?}"
+				),
+			});
+		}
+
+		let left_arr = self.evaluate_bound_expr(left, batch)?;
+		let right_arr = self.evaluate_bound_expr(right, batch)?;
+		evaluate_arithmetic(op, &left_arr, &right_arr, &left_type)
 	}
 
 	fn bound_global_aggregate(
@@ -3741,6 +3824,289 @@ fn local_scan_table_pin(table: TableId) -> ScanTablePin {
 		table_object_id: descriptor.table_object_id,
 		physical_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 	}
+}
+
+#[cfg(test)]
+fn evaluate_unbound_arithmetic(
+	op: ArithmeticOp,
+	left: ArrayRef,
+	right: ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let output_type =
+		arithmetic_output_type(left.data_type(), right.data_type()).ok_or_else(|| {
+			ExecutionError::InvalidExpression {
+				message: format!(
+					"arithmetic operands must be Int32, Int64, Float32, or Float64, got {:?} and {:?}",
+					left.data_type(),
+					right.data_type()
+				),
+			}
+		})?;
+	let left = if left.data_type() == &output_type {
+		left
+	} else {
+		evaluate_cast(&left, &output_type)?
+	};
+	let right = if right.data_type() == &output_type {
+		right
+	} else {
+		evaluate_cast(&right, &output_type)?
+	};
+	evaluate_arithmetic(op, &left, &right, &output_type)
+}
+
+fn evaluate_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, ExecutionError> {
+	if array.data_type() == target {
+		return Ok(array.clone());
+	}
+
+	match (array.data_type(), target) {
+		(DataType::Int32, DataType::Int64) => {
+			let array = as_int32(array, "Cast source")?;
+			let values = array.iter().map(|v| v.map(i64::from)).collect::<Vec<_>>();
+			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+		}
+		(DataType::Int32, DataType::Float64) => {
+			let array = as_int32(array, "Cast source")?;
+			let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
+			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+		(DataType::Int64, DataType::Float64) => {
+			let array = as_int64(array, "Cast source")?;
+			let values = array
+				.iter()
+				.map(|v| v.map(|v| v as f64))
+				.collect::<Vec<_>>();
+			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+		(DataType::Float32, DataType::Float64) => {
+			let array = as_float32(array, "Cast source")?;
+			let values = array.iter().map(|v| v.map(f64::from)).collect::<Vec<_>>();
+			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+		}
+		(source, target) => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported Cast from {source:?} to {target:?}"),
+		}),
+	}
+}
+
+fn evaluate_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+	output_type: &DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	if left.len() != right.len() {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"arithmetic operand length mismatch: left {}, right {}",
+				left.len(),
+				right.len()
+			),
+		});
+	}
+	if left.data_type() != output_type || right.data_type() != output_type {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"arithmetic operands must already be {:?}, got {:?} and {:?}",
+				output_type,
+				left.data_type(),
+				right.data_type()
+			),
+		});
+	}
+
+	match output_type {
+		DataType::Int32 => evaluate_int32_arithmetic(op, left, right),
+		DataType::Int64 => evaluate_int64_arithmetic(op, left, right),
+		DataType::Float32 => evaluate_float32_arithmetic(op, left, right),
+		DataType::Float64 => evaluate_float64_arithmetic(op, left, right),
+		other => Err(ExecutionError::InvalidExpression {
+			message: format!("unsupported arithmetic output type: {other:?}"),
+		}),
+	}
+}
+
+fn evaluate_int32_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_int32(left, "Int32 arithmetic left operand")?;
+	let right = as_int32(right, "Int32 arithmetic right operand")?;
+	let values = (0..left.len())
+		.map(|row| -> Result<Option<i32>, ExecutionError> {
+			if left.is_null(row) || right.is_null(row) {
+				return Ok(None);
+			}
+			let left = left.value(row);
+			let right = right.value(row);
+			let value = match op {
+				ArithmeticOp::Add => left.checked_add(right),
+				ArithmeticOp::Sub => left.checked_sub(right),
+				ArithmeticOp::Mul => left.checked_mul(right),
+				ArithmeticOp::Div => {
+					if right == 0 {
+						return Ok(None);
+					}
+					left.checked_div(right)
+				}
+			}
+			.ok_or_else(|| arithmetic_overflow(op, &DataType::Int32))?;
+			Ok(Some(value))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn evaluate_int64_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_int64(left, "Int64 arithmetic left operand")?;
+	let right = as_int64(right, "Int64 arithmetic right operand")?;
+	let values = (0..left.len())
+		.map(|row| -> Result<Option<i64>, ExecutionError> {
+			if left.is_null(row) || right.is_null(row) {
+				return Ok(None);
+			}
+			let left = left.value(row);
+			let right = right.value(row);
+			let value = match op {
+				ArithmeticOp::Add => left.checked_add(right),
+				ArithmeticOp::Sub => left.checked_sub(right),
+				ArithmeticOp::Mul => left.checked_mul(right),
+				ArithmeticOp::Div => {
+					if right == 0 {
+						return Ok(None);
+					}
+					left.checked_div(right)
+				}
+			}
+			.ok_or_else(|| arithmetic_overflow(op, &DataType::Int64))?;
+			Ok(Some(value))
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+}
+
+fn evaluate_float32_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_float32(left, "Float32 arithmetic left operand")?;
+	let right = as_float32(right, "Float32 arithmetic right operand")?;
+	let values = (0..left.len())
+		.map(|row| {
+			if left.is_null(row) || right.is_null(row) {
+				return None;
+			}
+			let left = left.value(row);
+			let right = right.value(row);
+			Some(match op {
+				ArithmeticOp::Add => left + right,
+				ArithmeticOp::Sub => left - right,
+				ArithmeticOp::Mul => left * right,
+				ArithmeticOp::Div => left / right,
+			})
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+}
+
+fn evaluate_float64_arithmetic(
+	op: ArithmeticOp,
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = as_float64(left, "Float64 arithmetic left operand")?;
+	let right = as_float64(right, "Float64 arithmetic right operand")?;
+	let values = (0..left.len())
+		.map(|row| {
+			if left.is_null(row) || right.is_null(row) {
+				return None;
+			}
+			let left = left.value(row);
+			let right = right.value(row);
+			Some(match op {
+				ArithmeticOp::Add => left + right,
+				ArithmeticOp::Sub => left - right,
+				ArithmeticOp::Mul => left * right,
+				ArithmeticOp::Div => left / right,
+			})
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn arithmetic_overflow(op: ArithmeticOp, data_type: &DataType) -> ExecutionError {
+	ExecutionError::Kernel {
+		message: format!(
+			"arithmetic overflow: {}({})",
+			op.name(),
+			arithmetic_data_type_name(data_type)
+		),
+	}
+}
+
+fn arithmetic_data_type_name(data_type: &DataType) -> &'static str {
+	match data_type {
+		DataType::Int32 => "Int32",
+		DataType::Int64 => "Int64",
+		DataType::Float32 => "Float32",
+		DataType::Float64 => "Float64",
+		_ => "Unsupported",
+	}
+}
+
+fn as_int32<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a Int32Array, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Int32"),
+		})
+}
+
+fn as_int64<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a Int64Array, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Int64"),
+		})
+}
+
+fn as_float32<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a Float32Array, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<Float32Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Float32"),
+		})
+}
+
+fn as_float64<'a>(
+	array: &'a ArrayRef,
+	context: &'static str,
+) -> Result<&'a Float64Array, ExecutionError> {
+	array
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{context} must be Float64"),
+		})
 }
 
 fn as_boolean<'a>(

@@ -23,6 +23,22 @@ fn unsupported(message: impl Into<String>) -> FrontendError {
 const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
 // P0.3: grouped SQL reuses the join shuffle fanout until aggregate fanout has separate evidence.
 const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
+const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str =
+	"aggregate arguments must be simple column references";
+
+fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError> {
+	match arg {
+		FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => validate_aggregate_argument(expr),
+		_ => Err(unsupported(AGGREGATE_ARGUMENT_SHAPE_MESSAGE)),
+	}
+}
+
+fn validate_aggregate_argument(expr: &SqlExpr) -> Result<(), FrontendError> {
+	match expr {
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(()),
+		_ => Err(unsupported(AGGREGATE_ARGUMENT_SHAPE_MESSAGE)),
+	}
+}
 
 pub struct SqlPlanner;
 
@@ -763,9 +779,10 @@ impl SqlPlanner {
 				Ok((AggregateFunction::CountAll, vec![Expr::column("count")]))
 			}
 			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+				validate_aggregate_argument(expr)?;
 				Ok((AggregateFunction::Count, vec![self.lower_expr(expr)?]))
 			}
-			_ => Err(unsupported("unsupported COUNT argument")),
+			_ => Err(unsupported(AGGREGATE_ARGUMENT_SHAPE_MESSAGE)),
 		}
 	}
 
@@ -776,6 +793,7 @@ impl SqlPlanner {
 		if args.len() != 1 {
 			return Err(unsupported("SUM requires one argument"));
 		}
+		validate_simple_aggregate_arg(&args[0])?;
 		Ok((AggregateFunction::Sum, vec![self.lower_arg(&args[0])?]))
 	}
 
@@ -786,6 +804,7 @@ impl SqlPlanner {
 		if args.len() != 1 {
 			return Err(unsupported("MIN requires one argument"));
 		}
+		validate_simple_aggregate_arg(&args[0])?;
 		Ok((AggregateFunction::Min, vec![self.lower_arg(&args[0])?]))
 	}
 
@@ -796,6 +815,7 @@ impl SqlPlanner {
 		if args.len() != 1 {
 			return Err(unsupported("MAX requires one argument"));
 		}
+		validate_simple_aggregate_arg(&args[0])?;
 		Ok((AggregateFunction::Max, vec![self.lower_arg(&args[0])?]))
 	}
 
@@ -806,6 +826,7 @@ impl SqlPlanner {
 		if args.len() != 1 {
 			return Err(unsupported("AVG requires one argument"));
 		}
+		validate_simple_aggregate_arg(&args[0])?;
 		Ok((AggregateFunction::Avg, vec![self.lower_arg(&args[0])?]))
 	}
 
@@ -1037,6 +1058,10 @@ impl SqlPlanner {
 					BinaryOperator::GtEq => Ok(Expr::Gte(l, r)),
 					BinaryOperator::And => Ok(Expr::And(l, r)),
 					BinaryOperator::Or => Ok(Expr::Or(l, r)),
+					BinaryOperator::Plus => Ok(Expr::Add(l, r)),
+					BinaryOperator::Minus => Ok(Expr::Sub(l, r)),
+					BinaryOperator::Multiply => Ok(Expr::Mul(l, r)),
+					BinaryOperator::Divide => Ok(Expr::Div(l, r)),
 					_ => Err(unsupported(format!("unsupported operator: {op:?}"))),
 				}
 			}

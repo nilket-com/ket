@@ -70,6 +70,49 @@ async fn pbc_engaged_on_eligible_filter() {
 	);
 }
 
+#[tokio::test]
+async fn pbc_declines_arithmetic_filter() {
+	let batch = batch();
+	let observations = Arc::new(Mutex::new(Vec::new()));
+	let storage = Arc::new(RecordingStorageScan {
+		batch,
+		observations: observations.clone(),
+	});
+	let executor = Executor::new(storage);
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(1), descriptor())
+		.expect("register descriptor");
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Scan {
+			table: TableId(1),
+			projection: None,
+		}),
+		predicate: Expr::Gt(
+			Box::new(Expr::Add(
+				Box::new(Expr::column("amount")),
+				Box::new(Expr::Literal(ScalarValue::Int32(Some(1)))),
+			)),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
+		),
+	};
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+
+	executor
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute bound");
+
+	let observations = observations.lock().unwrap();
+	assert_eq!(observations.len(), 1);
+	assert!(
+		!observations[0],
+		"arithmetic filter must not send pbc_predicate"
+	);
+}
+
 #[test]
 fn no_public_result_string_boundaries() {
 	let manifest_dir = manifest_dir();
@@ -694,6 +737,75 @@ fn adr023_post_aggregate_projection_guards_are_narrow() {
 		project_index < filter_index,
 		"terminal sort detector must peel Project before Filter"
 	);
+}
+
+#[test]
+fn adr024_scalar_arithmetic_guards_are_narrow() {
+	let logical_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	for variant in [
+		"Cast(Box<Expr>, DataType)",
+		"Add(Box<Expr>, Box<Expr>)",
+		"Sub(Box<Expr>, Box<Expr>)",
+		"Mul(Box<Expr>, Box<Expr>)",
+		"Div(Box<Expr>, Box<Expr>)",
+	] {
+		assert!(logical_source.contains(variant), "missing Expr::{variant}");
+	}
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	for variant in [
+		"Cast(Box<ExecutionExpr>, DataType)",
+		"Add(Box<ExecutionExpr>, Box<ExecutionExpr>)",
+		"Sub(Box<ExecutionExpr>, Box<ExecutionExpr>)",
+		"Mul(Box<ExecutionExpr>, Box<ExecutionExpr>)",
+		"Div(Box<ExecutionExpr>, Box<ExecutionExpr>)",
+	] {
+		assert!(
+			execution_source.contains(variant),
+			"missing ExecutionExpr::{variant}"
+		);
+	}
+	assert!(execution_source.contains("pub fn arithmetic_output_type"));
+	assert!(execution_source.contains("(Int32, Int32) => Some(Int32)"));
+	assert!(execution_source.contains("(Int32, Int64) | (Int64, Int32) | (Int64, Int64)"));
+	assert!(execution_source.contains("(Float32, Float32) => Some(Float32)"));
+
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	for operator in [
+		"BinaryOperator::Plus => Ok(Expr::Add",
+		"BinaryOperator::Minus => Ok(Expr::Sub",
+		"BinaryOperator::Multiply => Ok(Expr::Mul",
+		"BinaryOperator::Divide => Ok(Expr::Div",
+	] {
+		assert!(
+			planner.contains(operator),
+			"missing SQL lowerer for {operator}"
+		);
+	}
+	assert!(planner.contains("aggregate arguments must be simple column references"));
+
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	assert!(binder.contains("fn bind_arithmetic"));
+	assert!(binder.contains("fn is_widening_cast"));
+	for conversion in [
+		"(DataType::Int32, DataType::Int64)",
+		"(DataType::Int32, DataType::Float64)",
+		"(DataType::Int64, DataType::Float64)",
+		"(DataType::Float32, DataType::Float64)",
+	] {
+		assert!(binder.contains(conversion), "missing cast {conversion}");
+	}
+
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source");
+	assert!(pbc.contains("arithmetic and Cast are not PBC-eligible"));
+	assert!(!pbc.contains("OP_ADD"));
+	assert!(!pbc.contains("OP_SUB"));
+	assert!(!pbc.contains("OP_MUL"));
+	assert!(!pbc.contains("OP_DIV"));
 }
 
 #[test]
