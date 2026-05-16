@@ -36,7 +36,7 @@ fn wildcard_mixed_with_aggregate_rejects() {
 #[test]
 fn unsupported_projection_function_mixed_with_aggregate_rejects() {
 	assert_unsupported("SELECT mystery(amount), SUM(amount) FROM sales");
-	assert_unsupported("SELECT SUM(amount), AVG(amount) FROM sales");
+	assert_unsupported("SELECT SUM(amount), MEDIAN(amount) FROM sales");
 }
 
 #[test]

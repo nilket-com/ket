@@ -296,7 +296,7 @@ impl Executor {
 								for batch in &input_batches {
 									let arr = self.evaluate_expr(&args[0], batch)?;
 									for row in 0..batch.num_rows() {
-										if let Some(value) = sum_value(&arr, row)? {
+										if let Some(value) = numeric_value(&arr, row)? {
 											add_sum_value(&mut state, value)?;
 										}
 									}
@@ -305,6 +305,26 @@ impl Executor {
 								results_fields.push(arrow::datatypes::Field::new(
 									"sum",
 									arrow::datatypes::DataType::Int64,
+									true,
+								));
+							}
+							AggregateFunction::Avg => {
+								let mut state = AggState::AvgFloat {
+									total: 0.0,
+									count: 0,
+								};
+								for batch in &input_batches {
+									let arr = self.evaluate_expr(&args[0], batch)?;
+									for row in 0..batch.num_rows() {
+										if let Some(value) = numeric_value(&arr, row)? {
+											add_avg_value(&mut state, value)?;
+										}
+									}
+								}
+								results_cols.push(avg_state_array(&state)?);
+								results_fields.push(arrow::datatypes::Field::new(
+									"avg",
+									arrow::datatypes::DataType::Float64,
 									true,
 								));
 							}
@@ -949,13 +969,25 @@ impl Executor {
 					for batch in input_batches {
 						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
 						for row in 0..batch.num_rows() {
-							if let Some(value) = sum_value(&arr, row)? {
+							if let Some(value) = numeric_value(&arr, row)? {
 								add_sum_value(&mut state, value)?;
 							}
 						}
 					}
 					let output_type = output_schema.field(results_cols.len()).data_type().clone();
 					results_cols.push(sum_state_array(&state, &output_type)?);
+				}
+				AggregateFunction::Avg => {
+					let mut state = avg_state_for_data_type(&call.args[0].data_type())?;
+					for batch in input_batches {
+						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						for row in 0..batch.num_rows() {
+							if let Some(value) = numeric_value(&arr, row)? {
+								add_avg_value(&mut state, value)?;
+							}
+						}
+					}
+					results_cols.push(avg_state_array(&state)?);
 				}
 				AggregateFunction::Min => {
 					let mut state = min_state_for_data_type(&call.args[0].data_type())?;
@@ -1034,7 +1066,8 @@ impl Executor {
 					AggregateFunction::Count
 					| AggregateFunction::Sum
 					| AggregateFunction::Min
-					| AggregateFunction::Max => Ok(Some(self.evaluate_expr(&args[0], batch)?)),
+					| AggregateFunction::Max
+					| AggregateFunction::Avg => Ok(Some(self.evaluate_expr(&args[0], batch)?)),
 					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 						Err(ExecutionError::NotImplemented {
 							feature: "grouped experimental aggregate",
@@ -1063,8 +1096,13 @@ impl Executor {
 								}
 							}
 							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-								if let Some(value) = sum_value(array, row)? {
+								if let Some(value) = numeric_value(array, row)? {
 									add_sum_value(state, value)?;
+								}
+							}
+							AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
+								if let Some(value) = numeric_value(array, row)? {
+									add_avg_value(state, value)?;
 								}
 							}
 							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
@@ -1104,7 +1142,9 @@ impl Executor {
 							| AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
 							| AggState::MaxInt32 { .. }
-							| AggState::MaxInt64 { .. } => 0,
+							| AggState::MaxInt64 { .. }
+							| AggState::AvgInt { .. }
+							| AggState::AvgFloat { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -1119,6 +1159,9 @@ impl Executor {
 						&DataType::Int64,
 					)?);
 				}
+				AggregateFunction::Avg => {
+					columns.push(avg_column_from_groups(&groups, agg_idx)?);
+				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "grouped experimental aggregate",
@@ -1131,12 +1174,17 @@ impl Executor {
 				AggregateFunction::Sum => "sum",
 				AggregateFunction::Min => "min",
 				AggregateFunction::Max => "max",
+				AggregateFunction::Avg => "avg",
 				AggregateFunction::LinearRegress => "linreg",
 				AggregateFunction::ApproxQuantile(_) => "quantile",
 			};
+			let field_type = match function {
+				AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
+				_ => arrow::datatypes::DataType::Int64,
+			};
 			fields.push(arrow::datatypes::Field::new(
 				field_name,
-				arrow::datatypes::DataType::Int64,
+				field_type,
 				!matches!(
 					function,
 					AggregateFunction::CountAll | AggregateFunction::Count
@@ -1177,7 +1225,8 @@ impl Executor {
 					AggregateFunction::Count
 					| AggregateFunction::Sum
 					| AggregateFunction::Min
-					| AggregateFunction::Max => Ok(Some(self.evaluate_bound_expr(&call.args[0], batch)?)),
+					| AggregateFunction::Max
+					| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_expr(&call.args[0], batch)?)),
 					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 						Err(ExecutionError::NotImplemented {
 							feature: "bound grouped experimental aggregate",
@@ -1211,8 +1260,13 @@ impl Executor {
 								}
 							}
 							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
-								if let Some(value) = sum_value(array, row)? {
+								if let Some(value) = numeric_value(array, row)? {
 									add_sum_value(state, value)?;
+								}
+							}
+							AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
+								if let Some(value) = numeric_value(array, row)? {
+									add_avg_value(state, value)?;
 								}
 							}
 							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
@@ -1245,7 +1299,9 @@ impl Executor {
 							| AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
 							| AggState::MaxInt32 { .. }
-							| AggState::MaxInt64 { .. } => 0,
+							| AggState::MaxInt64 { .. }
+							| AggState::AvgInt { .. }
+							| AggState::AvgFloat { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -1257,6 +1313,9 @@ impl Executor {
 				AggregateFunction::Min | AggregateFunction::Max => {
 					let output_type = output_schema.field(columns.len()).data_type().clone();
 					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
+				}
+				AggregateFunction::Avg => {
+					columns.push(avg_column_from_groups(&groups, agg_idx)?);
 				}
 				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
@@ -2856,10 +2915,12 @@ enum AggState {
 	MinInt64 { value: Option<i64> },
 	MaxInt32 { value: Option<i32> },
 	MaxInt64 { value: Option<i64> },
+	AvgInt { total: i128, count: u64 },
+	AvgFloat { total: f64, count: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SumValue {
+enum NumericValue {
 	Int(i128),
 	Float(f64),
 }
@@ -2877,6 +2938,10 @@ fn init_states(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<AggState> {
 			},
 			AggregateFunction::Min => AggState::MinInt64 { value: None },
 			AggregateFunction::Max => AggState::MaxInt64 { value: None },
+			AggregateFunction::Avg => AggState::AvgFloat {
+				total: 0.0,
+				count: 0,
+			},
 			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 				AggState::SumInt {
 					total: 0,
@@ -2915,6 +2980,13 @@ fn init_bound_states(
 				.map(|arg| max_state_for_data_type(&arg.data_type()))
 				.transpose()
 				.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
+			AggregateFunction::Avg => call
+				.args
+				.first()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "AVG requires one argument".to_string(),
+				})
+				.and_then(|arg| avg_state_for_data_type(&arg.data_type())),
 			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => Ok({
 				AggState::SumInt {
 					total: 0,
@@ -2979,9 +3051,29 @@ fn max_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 	}
 }
 
-fn add_sum_value(state: &mut AggState, value: SumValue) -> Result<(), ExecutionError> {
+fn avg_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionError> {
+	match data_type {
+		DataType::Float32 | DataType::Float64 => Ok(AggState::AvgFloat {
+			total: 0.0,
+			count: 0,
+		}),
+		DataType::Int8
+		| DataType::Int16
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::UInt8
+		| DataType::UInt16
+		| DataType::UInt32
+		| DataType::UInt64 => Ok(AggState::AvgInt { total: 0, count: 0 }),
+		_ => Err(ExecutionError::InvalidExpression {
+			message: format!("AVG does not support input type {:?}", data_type),
+		}),
+	}
+}
+
+fn add_sum_value(state: &mut AggState, value: NumericValue) -> Result<(), ExecutionError> {
 	match (state, value) {
-		(AggState::SumInt { total, seen }, SumValue::Int(value)) => {
+		(AggState::SumInt { total, seen }, NumericValue::Int(value)) => {
 			*total = total
 				.checked_add(value)
 				.ok_or_else(|| ExecutionError::Kernel {
@@ -2990,25 +3082,73 @@ fn add_sum_value(state: &mut AggState, value: SumValue) -> Result<(), ExecutionE
 			*seen = true;
 			Ok(())
 		}
-		(AggState::SumFloat { total, seen }, SumValue::Float(value)) => {
+		(AggState::SumFloat { total, seen }, NumericValue::Float(value)) => {
 			*total += value;
 			*seen = true;
 			Ok(())
 		}
-		(AggState::SumFloat { total, seen }, SumValue::Int(value)) => {
+		(AggState::SumFloat { total, seen }, NumericValue::Int(value)) => {
 			*total += value as f64;
 			*seen = true;
 			Ok(())
 		}
-		(AggState::SumInt { .. }, SumValue::Float(_)) => Err(ExecutionError::InvalidExpression {
-			message: "floating SUM value reached integer accumulator".to_string(),
-		}),
+		(AggState::SumInt { .. }, NumericValue::Float(_)) => {
+			Err(ExecutionError::InvalidExpression {
+				message: "floating SUM value reached integer accumulator".to_string(),
+			})
+		}
 		(AggState::Count(_), _)
 		| (AggState::MinInt32 { .. }, _)
 		| (AggState::MinInt64 { .. }, _)
 		| (AggState::MaxInt32 { .. }, _)
+		| (AggState::MaxInt64 { .. }, _)
+		| (AggState::AvgInt { .. }, _)
+		| (AggState::AvgFloat { .. }, _) => Err(ExecutionError::InvalidExpression {
+			message: "SUM value reached non-SUM accumulator".to_string(),
+		}),
+	}
+}
+
+fn add_avg_value(state: &mut AggState, value: NumericValue) -> Result<(), ExecutionError> {
+	match (state, value) {
+		(AggState::AvgInt { total, count }, NumericValue::Int(value)) => {
+			*total = total
+				.checked_add(value)
+				.ok_or_else(|| ExecutionError::Kernel {
+					message: "integer AVG overflow".to_string(),
+				})?;
+			*count = count.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "AVG count overflow".to_string(),
+			})?;
+			Ok(())
+		}
+		(AggState::AvgFloat { total, count }, NumericValue::Float(value)) => {
+			*total += value;
+			*count = count.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "AVG count overflow".to_string(),
+			})?;
+			Ok(())
+		}
+		(AggState::AvgFloat { total, count }, NumericValue::Int(value)) => {
+			*total += value as f64;
+			*count = count.checked_add(1).ok_or_else(|| ExecutionError::Kernel {
+				message: "AVG count overflow".to_string(),
+			})?;
+			Ok(())
+		}
+		(AggState::AvgInt { .. }, NumericValue::Float(_)) => {
+			Err(ExecutionError::InvalidExpression {
+				message: "floating AVG value reached integer accumulator".to_string(),
+			})
+		}
+		(AggState::Count(_), _)
+		| (AggState::SumInt { .. }, _)
+		| (AggState::SumFloat { .. }, _)
+		| (AggState::MinInt32 { .. }, _)
+		| (AggState::MinInt64 { .. }, _)
+		| (AggState::MaxInt32 { .. }, _)
 		| (AggState::MaxInt64 { .. }, _) => Err(ExecutionError::InvalidExpression {
-			message: "SUM value reached count accumulator".to_string(),
+			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
 	}
 }
@@ -3151,7 +3291,9 @@ fn sum_column_from_groups(
 					| AggState::MinInt32 { .. }
 					| AggState::MinInt64 { .. }
 					| AggState::MaxInt32 { .. }
-					| AggState::MaxInt64 { .. } => Ok(None),
+					| AggState::MaxInt64 { .. }
+					| AggState::AvgInt { .. }
+					| AggState::AvgFloat { .. } => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -3166,7 +3308,9 @@ fn sum_column_from_groups(
 					| AggState::MinInt32 { .. }
 					| AggState::MinInt64 { .. }
 					| AggState::MaxInt32 { .. }
-					| AggState::MaxInt64 { .. } => None,
+					| AggState::MaxInt64 { .. }
+					| AggState::AvgInt { .. }
+					| AggState::AvgFloat { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -3209,6 +3353,33 @@ fn min_max_column_from_groups(
 	}
 }
 
+fn avg_finalize(state: &AggState) -> Result<Option<f64>, ExecutionError> {
+	match state {
+		AggState::AvgInt { total, count } => {
+			Ok((*count != 0).then_some(*total as f64 / *count as f64))
+		}
+		AggState::AvgFloat { total, count } => Ok((*count != 0).then_some(*total / *count as f64)),
+		_ => Err(ExecutionError::InvalidExpression {
+			message: "AVG finalize over non-AVG state".to_string(),
+		}),
+	}
+}
+
+fn avg_state_array(state: &AggState) -> Result<ArrayRef, ExecutionError> {
+	Ok(Arc::new(Float64Array::from(vec![avg_finalize(state)?])) as ArrayRef)
+}
+
+fn avg_column_from_groups(
+	groups: &BTreeMap<Vec<GroupValue>, Vec<AggState>>,
+	agg_idx: usize,
+) -> Result<ArrayRef, ExecutionError> {
+	let values = groups
+		.values()
+		.map(|states| avg_finalize(&states[agg_idx]))
+		.collect::<Result<Vec<_>, _>>()?;
+	Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
 #[cfg(test)]
 fn aggregate_state_keyword(function: &AggregateFunction) -> &'static str {
 	match function {
@@ -3227,42 +3398,45 @@ fn aggregate_state_output_name(function: &AggregateFunction) -> &'static str {
 	}
 }
 
-fn sum_value(array: &ArrayRef, row: usize) -> Result<Option<SumValue>, ExecutionError> {
+fn numeric_value(array: &ArrayRef, row: usize) -> Result<Option<NumericValue>, ExecutionError> {
 	if array.is_null(row) {
 		return Ok(None);
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Int8Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Int16Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Int32Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Int64Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<UInt8Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<UInt16Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<UInt32Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<UInt64Array>() {
-		return Ok(Some(SumValue::Int(array.value(row) as i128)));
+		return Ok(Some(NumericValue::Int(array.value(row) as i128)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Float32Array>() {
-		return Ok(Some(SumValue::Float(array.value(row) as f64)));
+		return Ok(Some(NumericValue::Float(array.value(row) as f64)));
 	}
 	if let Some(array) = array.as_any().downcast_ref::<Float64Array>() {
-		return Ok(Some(SumValue::Float(array.value(row))));
+		return Ok(Some(NumericValue::Float(array.value(row))));
 	}
 	Err(ExecutionError::InvalidExpression {
-		message: format!("SUM expects numeric input, got {:?}", array.data_type()),
+		message: format!(
+			"aggregate expects numeric input, got {:?}",
+			array.data_type()
+		),
 	})
 }
 

@@ -6,7 +6,7 @@
 
 ## Status
 
-Drafted. Awaiting promotion commit.
+Promoted + implemented.
 
 Second kernel-catalog widening under the post-ADR-018
 cycle. Three-way council convergence reached: AVG joins
@@ -25,9 +25,9 @@ bearing council positions ratified:
   line reduction with ~40 enum match arms preserved as
   one-line delegations), not line-count-reductive. The
   trait-shape ratification deserves its own council round.
-  A narrow exception per Codex: `SumValue` may be renamed
-  to a neutral numeric-extraction helper *if* AVG genuinely
-  shares it; broader registry work stays out.
+  A narrow exception per Codex landed: `SumValue` was renamed
+  to the neutral `NumericValue` helper because AVG shares the
+  existing numeric-extraction path; broader registry work stays out.
 - **AVG's accumulator is `(total, count)` with Float64-
   uniform output.** Multi-state aggregator — the canonical
   partial-state shape. Field name `total` matches existing
@@ -193,9 +193,9 @@ Explicitly unchanged:
 - `AggState` derives — **stays `Copy`** (AVG variants are
   stack-only; matches ADR 019 MIN/MAX precedent).
 - SUM / MIN / MAX kernel substrate — untouched except for
-  a permitted narrow rename of `SumValue` to a neutral
-  numeric-extraction helper *if* AVG genuinely shares
-  the helper. Broader kernel-registry refactor is **ADR
+  the narrow `SumValue` → `NumericValue` rename required by
+  AVG sharing the existing numeric-extraction helper. Broader
+  kernel-registry refactor is **ADR
   021's scope**.
 
 No new IR variant beyond the enum widening. No new
@@ -512,11 +512,11 @@ fn avg_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
     }
 }
 
-fn add_avg_value(state: &mut AggState, value: SumValue)
+fn add_avg_value(state: &mut AggState, value: NumericValue)
     -> Result<(), ExecutionError>
 {
     match (state, value) {
-        (AggState::AvgInt { total, count }, SumValue::Int(v)) => {
+        (AggState::AvgInt { total, count }, NumericValue::Int(v)) => {
             *total = total
                 .checked_add(v)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -528,7 +528,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgFloat { total, count }, SumValue::Float(v)) => {
+        (AggState::AvgFloat { total, count }, NumericValue::Float(v)) => {
             *total += v;
             *count = count.checked_add(1)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -536,7 +536,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgFloat { total, count }, SumValue::Int(v)) => {
+        (AggState::AvgFloat { total, count }, NumericValue::Int(v)) => {
             *total += v as f64;
             *count = count.checked_add(1)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -544,7 +544,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgInt { .. }, SumValue::Float(_)) => {
+        (AggState::AvgInt { .. }, NumericValue::Float(_)) => {
             Err(ExecutionError::InvalidExpression {
                 message: "floating AVG value reached integer accumulator".to_string(),
             })
@@ -559,8 +559,8 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
 `add_avg_value` matches SUM's overflow discipline exactly:
 `checked_add` returning explicit `ExecutionError::Kernel`
 on overflow (not `saturating_add`); `AvgFloat` accepts
-`SumValue::Int` and casts to f64 (matching `add_sum_value`'s
-mixed-type support); `AvgInt` reaching `SumValue::Float`
+`NumericValue::Int` and casts to f64 (matching `add_sum_value`'s
+mixed-type support); `AvgInt` reaching `NumericValue::Float`
 is a hard error (matching SUM's defensive pattern).
 
 **Sticky-NaN semantics:** Float AVG accumulates with
@@ -626,7 +626,7 @@ AggregateFunction::Avg => {
     for batch in &input_batches {
         let arr = self.evaluate_expr(&args[0], batch)?;
         for row in 0..batch.num_rows() {
-            if let Some(value) = sum_value(&arr, row)? {
+            if let Some(value) = numeric_value(&arr, row)? {
                 add_avg_value(&mut state, value)?;
             }
         }
@@ -655,7 +655,7 @@ AggregateFunction::Avg => {
     for batch in input_batches {
         let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
         for row in 0..batch.num_rows() {
-            if let Some(value) = sum_value(&arr, row)? {
+            if let Some(value) = numeric_value(&arr, row)? {
                 add_avg_value(&mut state, value)?;
             }
         }
@@ -669,7 +669,7 @@ extension:
 
 ```rust
 AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
-    if let Some(value) = sum_value(array, row)? {
+    if let Some(value) = numeric_value(array, row)? {
         add_avg_value(state, value)?;
     }
 }
@@ -948,12 +948,11 @@ Implementation promotion requires:
   parallel to existing kernels (separate helpers
   `avg_state_for_data_type`, `add_avg_value`,
   `avg_finalize`, `avg_state_array`,
-  `avg_column_from_groups`). A *narrow* exception is
-  permitted: if AVG genuinely shares the
-  `SumValue`-style numeric-extraction helper currently
-  named for SUM, the helper may be renamed to a neutral
-  numeric-extraction name. Broader unification of
-  per-kernel helpers is **ADR 021's scope**.
+  `avg_column_from_groups`). The *narrow* exception landed:
+  the SUM-named `SumValue` helper was renamed to neutral
+  `NumericValue` because AVG shares the same numeric
+  extraction path. Broader unification of per-kernel helpers
+  is **ADR 021's scope**.
 - **Do not extract a shared
   `*_output_data_type` helper across kernels.** Each
   has different return logic (SUM widens int→Int64 /

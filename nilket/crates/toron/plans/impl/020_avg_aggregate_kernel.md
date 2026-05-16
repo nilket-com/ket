@@ -5,7 +5,7 @@
 
 ## Status
 
-Drafted. Awaiting promotion commit.
+Promoted + implemented.
 
 Second kernel-catalog widening under the post-ADR-018
 cycle. One enum-variant widening (7 → 8, adding `Avg`),
@@ -37,8 +37,8 @@ Land AVG end-to-end over all SUM-compatible numeric inputs:
   `total / count if count > 0 else NULL`;
 - overflow discipline mirrors SUM's: `checked_add` with
   explicit `ExecutionError::Kernel`, mixed-type table
-  support via `AvgFloat` accepting `SumValue::Int`,
-  `AvgInt × SumValue::Float` as hard error;
+  support via `AvgFloat` accepting `NumericValue::Int`,
+  `AvgInt × NumericValue::Float` as hard error;
 - sticky-NaN follows ordinary `f64` arithmetic — NaN
   inputs propagate through the running total and produce
   NaN output. Hard-gate regression test pins the
@@ -125,11 +125,10 @@ Land AVG end-to-end over all SUM-compatible numeric inputs:
     dispatch.
   - New helpers: `add_avg_value`, `avg_finalize`,
     `avg_state_array`, `avg_column_from_groups`.
-  - **Permitted narrow rename:** if AVG genuinely
-    shares the SUM-only numeric extraction helper
-    (`SumValue`), it may be renamed to a neutral
-    numeric-extraction helper. Broader unification is
-    deferred to ADR 021.
+  - **Narrow rename landed:** AVG shares the existing
+    SUM-only numeric extraction helper, so `SumValue`
+    was renamed to neutral `NumericValue`. Broader
+    unification is deferred to ADR 021.
 
 - `crates/toron/src/distributed/fragment.rs` — no change.
   AVG inherits ADR 011's grouped-aggregate fragmenter
@@ -195,9 +194,9 @@ Expected code changes:
     (~3 lines), Count emission arm variant extension
     (~2 lines), cfg(test) field-name dispatch (~1
     line).
-  - Permitted narrow rename of `SumValue` to neutral
-    name if AVG shares it (~10-20 sites; ~0 net
-    lines).
+  - Narrow rename of `SumValue` to neutral
+    `NumericValue` because AVG shares the helper
+    (~10-20 sites; ~0 net lines).
 - `crates/toron/tests/group_by_test.rs`:
   - Scalar / grouped / dual-rewrite AVG plan-shape
     tests.
@@ -242,10 +241,12 @@ Updated documentation:
   projection (ADR 022) as strong runner-up, float / Utf8
   MIN/MAX, ADR 02X (Wendelon AGG consumer wiring),
   Kahan-Neumaier stability.
-- Auto-memory `adr-015-cycle-shape` updates to note
-  that ADR 020 is the second instance of the cycle
-  property extending to the kernel-catalog surface
-  (after ADR 019 MIN/MAX).
+- Auto-memory `adr-015-cycle-shape` update is external
+  to this repository; no repo-local memory file is
+  present in this workspace. The intended note is that
+  ADR 020 is the second instance of the cycle property
+  extending to the kernel-catalog surface (after ADR 019
+  MIN/MAX).
 
 Not expected:
 
@@ -329,8 +330,8 @@ Not expected:
   `exec.rs:2833-2840`) and returns explicit
   `ExecutionError::Kernel { message: "integer AVG
   overflow" }` on overflow. `AvgFloat` accepts
-  `SumValue::Int` and casts to f64 (parallel SUM's
-  `exec.rs:2847-2851`). `AvgInt × SumValue::Float` is
+  `NumericValue::Int` and casts to f64 (parallel SUM's
+  `exec.rs:2847-2851`). `AvgInt × NumericValue::Float` is
   a hard error (parallel SUM's `exec.rs:2852-2854`).
   Count overflow is an explicit error (pathological
   case at >2^64 rows; the discipline matters).
@@ -383,11 +384,10 @@ Not expected:
 
 - **P0.12: SUM / MIN / MAX kernel substrates
   untouched.** AVG implementation is parallel to
-  existing kernels (separate helpers). Permitted
-  narrow rename: `SumValue → NumericValue` (or
-  similar neutral name) *if* AVG shares the numeric-
-  extraction helper. Broader unification is **ADR
-  021's scope**.
+  existing kernels (separate helpers). The narrow
+  `SumValue → NumericValue` rename landed because AVG
+  shares the numeric-extraction helper. Broader
+  unification is **ADR 021's scope**.
 
 - **P0.13: Fragmenter routing — zero change.** AVG
   over GROUP BY routes via ADR 011's hash-
@@ -604,11 +604,11 @@ fn avg_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
     }
 }
 
-fn add_avg_value(state: &mut AggState, value: SumValue)
+fn add_avg_value(state: &mut AggState, value: NumericValue)
     -> Result<(), ExecutionError>
 {
     match (state, value) {
-        (AggState::AvgInt { total, count }, SumValue::Int(v)) => {
+        (AggState::AvgInt { total, count }, NumericValue::Int(v)) => {
             *total = total
                 .checked_add(v)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -620,7 +620,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgFloat { total, count }, SumValue::Float(v)) => {
+        (AggState::AvgFloat { total, count }, NumericValue::Float(v)) => {
             *total += v;
             *count = count.checked_add(1)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -628,7 +628,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgFloat { total, count }, SumValue::Int(v)) => {
+        (AggState::AvgFloat { total, count }, NumericValue::Int(v)) => {
             *total += v as f64;
             *count = count.checked_add(1)
                 .ok_or_else(|| ExecutionError::Kernel {
@@ -636,7 +636,7 @@ fn add_avg_value(state: &mut AggState, value: SumValue)
                 })?;
             Ok(())
         }
-        (AggState::AvgInt { .. }, SumValue::Float(_)) => {
+        (AggState::AvgInt { .. }, NumericValue::Float(_)) => {
             Err(ExecutionError::InvalidExpression {
                 message: "floating AVG value reached integer accumulator".to_string(),
             })
@@ -692,7 +692,7 @@ AggregateFunction::Avg => {
     for batch in &input_batches {
         let arr = self.evaluate_expr(&args[0], batch)?;
         for row in 0..batch.num_rows() {
-            if let Some(value) = sum_value(&arr, row)? {
+            if let Some(value) = numeric_value(&arr, row)? {
                 add_avg_value(&mut state, value)?;
             }
         }
@@ -718,7 +718,7 @@ AggregateFunction::Avg => {
     for batch in input_batches {
         let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
         for row in 0..batch.num_rows() {
-            if let Some(value) = sum_value(&arr, row)? {
+            if let Some(value) = numeric_value(&arr, row)? {
                 add_avg_value(&mut state, value)?;
             }
         }
@@ -732,7 +732,7 @@ extension:
 
 ```rust
 AggState::AvgInt { .. } | AggState::AvgFloat { .. } => {
-    if let Some(value) = sum_value(array, row)? {
+    if let Some(value) = numeric_value(array, row)? {
         add_avg_value(state, value)?;
     }
 }
@@ -940,10 +940,12 @@ kernel-kind inspection.
   aggregate projection (ADR 022) as strong runner-up,
   float / Utf8 MIN/MAX, ADR 02X (Wendelon AGG consumer
   wiring), Kahan-Neumaier stability.
-- Auto-memory `adr-015-cycle-shape` updates to record
-  that ADR 020 is the second kernel-catalog-widening
-  instance (after ADR 019 MIN/MAX); cycle's property
-  continues at the kernel surface.
+- Auto-memory `adr-015-cycle-shape` is external to this
+  repository; no repo-local memory file is present in
+  this workspace. The intended note is that ADR 020 is
+  the second kernel-catalog-widening instance (after ADR
+  019 MIN/MAX); cycle's property continues at the kernel
+  surface.
 
 ## Verification
 
@@ -1047,7 +1049,8 @@ cargo bench -p toron --bench storage_execution -- --quick
   `add_avg_value`, `avg_finalize`, `avg_state_array`,
   `avg_column_from_groups`), one new SQL planner
   helper (`lower_avg_aggregate`), architecture-guard
-  rename + update, optional narrow `SumValue` rename.
+  rename + update, narrow `SumValue` → `NumericValue`
+  rename.
 - Planner accepts AVG in scalar and grouped contexts;
   HAVING and ORDER BY compose via inherited
   substrate.
@@ -1086,14 +1089,14 @@ cargo bench -p toron --bench storage_execution -- --quick
   untouched (ADR 02X is the cross-ring ADR).
 - SUM / MIN / MAX kernel substrates broadly
   untouched (refactor decision deferred to ADR
-  021). Permitted narrow rename:
-  `SumValue → NumericValue` (or similar) if AVG
-  shares the helper.
+  021). Narrow `SumValue` → `NumericValue` rename
+  landed because AVG shares the helper.
 - Full Toron + Wendelon workspace test suites
   green.
-- Memory file `adr-015-cycle-shape` updated:
-  ADR 020 is the second kernel-catalog-widening
-  instance.
+- Memory file `adr-015-cycle-shape` is not repo-local in
+  this workspace; no repository edit was possible. The
+  intended update is: ADR 020 is the second kernel-
+  catalog-widening instance.
 - Roadmap entry moves from "candidates" into active
   ADR 020 work during promotion, then into "Implemented"
   after code, tests, and bench artifact land; "ADR 021

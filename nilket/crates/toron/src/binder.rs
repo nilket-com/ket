@@ -1076,9 +1076,12 @@ fn bind_aggregate_call(
 		AggregateFunction::Count
 		| AggregateFunction::Sum
 		| AggregateFunction::Min
-		| AggregateFunction::Max => {
-			if matches!(function, AggregateFunction::Min | AggregateFunction::Max)
-				&& args.len() != 1
+		| AggregateFunction::Max
+		| AggregateFunction::Avg => {
+			if matches!(
+				function,
+				AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::Avg
+			) && args.len() != 1
 			{
 				return Err(BindingError::UnsupportedExpression {
 					message: format!(
@@ -1112,6 +1115,14 @@ fn bind_aggregate_call(
 							aggregate_function_keyword(function),
 							arg.data_type()
 						),
+					});
+				}
+			}
+			if matches!(function, AggregateFunction::Avg) {
+				let arg = &args[0];
+				if avg_output_data_type(&arg.data_type()).is_none() {
+					return Err(BindingError::TypeMismatch {
+						message: format!("AVG expects numeric input, got {:?}", arg.data_type()),
 					});
 				}
 			}
@@ -1372,6 +1383,7 @@ fn aggregate_field(call: &AggregateCall) -> Field {
 				.unwrap_or(DataType::Int64),
 			true,
 		),
+		AggregateFunction::Avg => Field::new("avg", DataType::Float64, true),
 		AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
 		AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
 	}
@@ -1399,10 +1411,27 @@ fn min_max_output_data_type(input: &DataType) -> Option<DataType> {
 	}
 }
 
+fn avg_output_data_type(input: &DataType) -> Option<DataType> {
+	match input {
+		DataType::Int8
+		| DataType::Int16
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::UInt8
+		| DataType::UInt16
+		| DataType::UInt32
+		| DataType::UInt64
+		| DataType::Float32
+		| DataType::Float64 => Some(DataType::Float64),
+		_ => None,
+	}
+}
+
 fn aggregate_function_keyword(function: &AggregateFunction) -> &'static str {
 	match function {
 		AggregateFunction::Min => "MIN",
 		AggregateFunction::Max => "MAX",
+		AggregateFunction::Avg => "AVG",
 		_ => "aggregate",
 	}
 }

@@ -139,6 +139,63 @@ fn min_max_aggregate_lowers_in_scalar_and_grouped_projections() {
 }
 
 #[test]
+fn avg_aggregate_lowers_in_scalar_and_grouped_projections() {
+	let scalar = plan_sql("SELECT AVG(amount), AVG(price) FROM sales");
+	let LogicalPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+	} = scalar
+	else {
+		panic!("expected scalar aggregate");
+	};
+	assert!(group_expr.is_empty());
+	assert_eq!(aggr_expr.len(), 2);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Avg));
+	assert_column(&aggr_expr[0].1[0], "amount");
+	assert!(matches!(aggr_expr[1].0, AggregateFunction::Avg));
+	assert_column(&aggr_expr[1].1[0], "price");
+	assert!(matches!(input.as_ref(), LogicalPlan::ScanNamed { .. }));
+
+	let grouped = plan_sql(
+		"SELECT status, AVG(amount) FROM sales \
+		 GROUP BY status HAVING AVG(amount) > 7 ORDER BY AVG(amount) DESC LIMIT 2",
+	);
+	let LogicalPlan::Sort {
+		input, order_by, ..
+	} = grouped
+	else {
+		panic!("expected grouped sort");
+	};
+	assert_column(&order_by[0].expr, "avg");
+	let LogicalPlan::Exchange { input, .. } = input.as_ref() else {
+		panic!("expected terminal exchange");
+	};
+	let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+		panic!("expected grouped HAVING filter");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "avg")
+	));
+	let LogicalPlan::Aggregate {
+		input,
+		group_expr,
+		aggr_expr,
+	} = input.as_ref()
+	else {
+		panic!("expected grouped aggregate");
+	};
+	assert_eq!(group_expr.len(), 1);
+	assert_column(&group_expr[0], "status");
+	assert_eq!(aggr_expr.len(), 1);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Avg));
+	assert_column(&aggr_expr[0].1[0], "amount");
+	assert!(matches!(input.as_ref(), LogicalPlan::Exchange { .. }));
+}
+
+#[test]
 fn group_by_projection_subset_reorder_alias_or_aggregate_first_rejects() {
 	for sql in [
 		"SELECT region, COUNT(*) FROM sales GROUP BY region, status",
@@ -157,13 +214,13 @@ fn group_by_accepts_only_stable_aggregate_set() {
 		"SELECT region, COUNT(*) FROM sales GROUP BY region",
 		"SELECT region, COUNT(amount) FROM sales GROUP BY region",
 		"SELECT region, SUM(amount) FROM sales GROUP BY region",
+		"SELECT region, AVG(amount) FROM sales GROUP BY region",
 	] {
 		assert!(plan_sql(sql).is_aggregate(), "{sql}");
 	}
 	for sql in [
 		"SELECT region, LINEAR_REGRESS(amount, id) FROM sales GROUP BY region",
 		"SELECT region, APPROX_QUANTILE(amount, 0.5) FROM sales GROUP BY region",
-		"SELECT region, AVG(amount) FROM sales GROUP BY region",
 	] {
 		assert_unsupported(sql);
 	}
@@ -822,6 +879,55 @@ async fn min_max_bind_with_identity_output_types_and_reject_deferred_domains() {
 	}
 }
 
+#[tokio::test]
+async fn avg_bind_with_float64_output_and_numeric_domain() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT AVG(amount), AVG(id), AVG(price) FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind AVG");
+	let ExecutionPlan::Aggregate { output_schema, .. } = bound else {
+		panic!("expected aggregate");
+	};
+	assert_eq!(output_schema.fields().len(), 3);
+	for field in output_schema.fields() {
+		assert_eq!(field.name(), "avg");
+		assert_eq!(field.data_type(), &DataType::Float64);
+		assert!(field.is_nullable());
+	}
+
+	let err = bind(
+		&plan_sql("SELECT AVG(status) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("AVG over Utf8 should reject");
+	assert!(
+		matches!(&err, BindingError::TypeMismatch { message } if message == "AVG expects numeric input, got Utf8"),
+		"expected AVG type mismatch, got {err}"
+	);
+
+	let logical = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![(
+			AggregateFunction::Avg,
+			vec![Expr::column("amount"), Expr::column("id")],
+		)],
+	};
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("hand-built AVG with extra args should reject");
+	assert!(
+		matches!(&err, BindingError::UnsupportedExpression { message } if message == "AVG requires one argument"),
+		"expected AVG arity reject, got {err}"
+	);
+}
+
 #[test]
 fn min_max_aggregate_rejects_invalid_and_unselected_references() {
 	assert_unsupported_message("SELECT MIN() FROM sales", "MIN requires one argument");
@@ -833,6 +939,21 @@ fn min_max_aggregate_rejects_invalid_and_unselected_references() {
 	);
 	assert_unsupported_message(
 		"SELECT MIN(amount) FROM sales ORDER BY MAX(id)",
+		"ORDER BY aggregate-call must appear in SELECT list",
+	);
+}
+
+#[test]
+fn avg_aggregate_rejects_invalid_and_unselected_references() {
+	assert_unsupported_message("SELECT AVG() FROM sales", "AVG requires one argument");
+	assert_unsupported("SELECT AVG(*) FROM sales");
+	assert_unsupported("SELECT AVG(DISTINCT amount) FROM sales");
+	assert_unsupported_message(
+		"SELECT AVG(amount), AVG(amount) FROM sales HAVING AVG(amount) > 0",
+		"ambiguous HAVING aggregate-call",
+	);
+	assert_unsupported_message(
+		"SELECT AVG(amount) FROM sales ORDER BY SUM(amount)",
 		"ORDER BY aggregate-call must appear in SELECT list",
 	);
 }
@@ -877,6 +998,34 @@ async fn grouped_aggregate_having_binds_against_aggregate_output() {
 			if matches!(left.as_ref(), ExecutionExpr::Column(column)
 				if column.name.0 == "sum" && column.ordinal == ColumnOrdinal(1))
 				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Int64(Some(10))))
+	));
+	assert!(matches!(input.as_ref(), ExecutionPlan::Aggregate { .. }));
+}
+
+#[tokio::test]
+async fn avg_having_binds_with_float64_literal_coercion() {
+	let (catalog, _) = fixture();
+	let logical =
+		plan_sql("SELECT status, AVG(amount) FROM sales GROUP BY status HAVING AVG(amount) > 10");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind AVG HAVING");
+
+	let ExecutionPlan::Filter {
+		input,
+		predicate,
+		disposition,
+	} = bound
+	else {
+		panic!("expected bound HAVING filter");
+	};
+	assert_eq!(disposition, FilterDisposition::EvaluateInToron);
+	assert!(matches!(
+		predicate,
+		ExecutionExpr::Gt(left, right)
+			if matches!(left.as_ref(), ExecutionExpr::Column(column)
+				if column.name.0 == "avg" && column.ordinal == ColumnOrdinal(1))
+				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Float64(Some(value))) if *value == 10.0)
 	));
 	assert!(matches!(input.as_ref(), ExecutionPlan::Aggregate { .. }));
 }
@@ -1071,6 +1220,68 @@ async fn grouped_min_max_execute_with_having_order_by_and_all_null_group() {
 }
 
 #[tokio::test]
+async fn scalar_avg_execute_with_float64_output_and_null_semantics() {
+	let results = run_logical(&plan_sql("SELECT AVG(amount), AVG(price) FROM sales")).await;
+	assert_eq!(scalar_float64_column_rows(&results, 0), vec![Some(16.75)]);
+	assert_eq!(scalar_float64_column_rows(&results, 1), vec![Some(17.25)]);
+
+	let empty = run_logical(&plan_sql("SELECT AVG(amount) FROM empty_sales")).await;
+	assert_eq!(scalar_float64_column_rows(&empty, 0), vec![None]);
+
+	let all_null = run_logical(&plan_sql("SELECT AVG(all_null_amount) FROM sales")).await;
+	assert_eq!(scalar_float64_column_rows(&all_null, 0), vec![None]);
+}
+
+#[tokio::test]
+async fn grouped_avg_execute_with_having_order_by_and_all_null_group() {
+	let by_status = run_logical(&plan_sql(
+		"SELECT status, AVG(amount) FROM sales GROUP BY status ORDER BY status",
+	))
+	.await;
+	assert_eq!(
+		status_avg_rows(&by_status),
+		vec![
+			(Some("closed".to_string()), None),
+			(Some("open".to_string()), Some(16.75)),
+		]
+	);
+
+	let filtered = run_logical(&plan_sql(
+		"SELECT status, AVG(amount) FROM sales GROUP BY status \
+		 HAVING AVG(amount) > 10 ORDER BY AVG(amount) DESC LIMIT 1",
+	))
+	.await;
+	assert_eq!(
+		status_avg_rows(&filtered),
+		vec![(Some("open".to_string()), Some(16.75))]
+	);
+
+	let empty = run_logical(&plan_sql(
+		"SELECT status, AVG(amount) FROM empty_sales GROUP BY status",
+	))
+	.await;
+	assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn avg_float64_sticky_nan_behavior_is_pinned() {
+	let scalar = run_logical(&plan_sql("SELECT AVG(score) FROM sales")).await;
+	let values = scalar_float64_column_rows(&scalar, 0);
+	assert_eq!(values.len(), 1);
+	assert!(values[0].expect("scalar AVG score").is_nan());
+
+	let grouped = run_logical(&plan_sql(
+		"SELECT status, AVG(score) FROM sales GROUP BY status ORDER BY status",
+	))
+	.await;
+	let rows = status_avg_rows(&grouped);
+	assert_eq!(rows.len(), 2);
+	assert_eq!(rows[0], (Some("closed".to_string()), Some(3.0)));
+	assert_eq!(rows[1].0, Some("open".to_string()));
+	assert!(rows[1].1.expect("open score AVG").is_nan());
+}
+
+#[tokio::test]
 async fn ordered_grouped_aggregate_sql_matches_hand_built_sort_plan() {
 	let sql = plan_sql(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region \
@@ -1107,6 +1318,36 @@ async fn grouped_min_max_having_order_by_sql_matches_hand_built_plan() {
 		 HAVING MIN(amount) > 7 ORDER BY MAX(id) DESC LIMIT 2",
 	);
 	let hand_built = hand_built_ordered_having_grouped_min_max_plan(Some(2), 0, 7);
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::None).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::None).expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn scalar_avg_sql_matches_hand_built_aggregate_plan() {
+	let sql = plan_sql("SELECT AVG(amount) FROM sales");
+	let hand_built = hand_built_scalar_avg_plan();
+	let sql_results = run_logical(&sql).await;
+	let hand_built_results = run_logical(&hand_built).await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql_results, SortPolicy::FullRowLex).expect("sql digest"),
+		canonical_arrow_ipc_digest(&hand_built_results, SortPolicy::FullRowLex)
+			.expect("hand digest")
+	);
+}
+
+#[tokio::test]
+async fn grouped_avg_having_order_by_sql_matches_hand_built_plan() {
+	let sql = plan_sql(
+		"SELECT status, AVG(amount) FROM sales GROUP BY status \
+		 HAVING AVG(amount) > 10 ORDER BY AVG(amount) DESC LIMIT 1",
+	);
+	let hand_built = hand_built_ordered_having_grouped_avg_plan(Some(1), 0, 10);
 	let sql_results = run_logical(&sql).await;
 	let hand_built_results = run_logical(&hand_built).await;
 
@@ -1612,6 +1853,17 @@ fn hand_built_scalar_min_max_plan() -> LogicalPlan {
 	}
 }
 
+fn hand_built_scalar_avg_plan() -> LogicalPlan {
+	LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![(AggregateFunction::Avg, vec![Expr::column("amount")])],
+	}
+}
+
 fn hand_built_having_scalar_sum_plan(threshold: i32) -> LogicalPlan {
 	LogicalPlan::Filter {
 		input: Box::new(hand_built_scalar_sum_plan()),
@@ -1635,6 +1887,44 @@ fn hand_built_ordered_having_scalar_sum_plan(
 		}),
 		order_by: vec![SortExpr {
 			expr: Expr::column("sum"),
+			descending: true,
+			nulls_first: false,
+		}],
+		limit,
+		offset,
+	}
+}
+
+fn hand_built_ordered_having_grouped_avg_plan(
+	limit: Option<usize>,
+	offset: usize,
+	threshold: i32,
+) -> LogicalPlan {
+	LogicalPlan::Sort {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(LogicalPlan::Filter {
+				input: Box::new(LogicalPlan::Aggregate {
+					input: Box::new(LogicalPlan::Exchange {
+						input: Box::new(LogicalPlan::ScanNamed {
+							table: TableRef::new("sales"),
+							projection: None,
+						}),
+						partition_count: 4,
+						key: vec![Expr::column("status")],
+					}),
+					group_expr: vec![Expr::column("status")],
+					aggr_expr: vec![(AggregateFunction::Avg, vec![Expr::column("amount")])],
+				}),
+				predicate: Expr::Gt(
+					Box::new(Expr::column("avg")),
+					Box::new(Expr::Literal(ScalarValue::Int32(Some(threshold)))),
+				),
+			}),
+			partition_count: 1,
+			key: Vec::new(),
+		}),
+		order_by: vec![SortExpr {
+			expr: Expr::column("avg"),
 			descending: true,
 			nulls_first: false,
 		}],
@@ -1833,6 +2123,25 @@ fn scalar_sum_rows(results: &[RecordBatch]) -> Vec<Option<i64>> {
 	rows
 }
 
+fn scalar_float64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<f64>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("Float64 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows
+}
+
 fn scalar_min_amount_max_id_rows(results: &[RecordBatch]) -> Vec<(Option<i32>, Option<i64>)> {
 	let mut rows = Vec::new();
 	for batch in results {
@@ -1858,6 +2167,36 @@ fn scalar_min_amount_max_id_rows(results: &[RecordBatch]) -> Vec<(Option<i32>, O
 				Some(maxes.value(row))
 			};
 			rows.push((min, max));
+		}
+	}
+	rows
+}
+
+fn status_avg_rows(results: &[RecordBatch]) -> Vec<(Option<String>, Option<f64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let statuses = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("status column");
+		let avgs = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("avg column");
+		for row in 0..batch.num_rows() {
+			let status = if statuses.is_null(row) {
+				None
+			} else {
+				Some(statuses.value(row).to_string())
+			};
+			let avg = if avgs.is_null(row) {
+				None
+			} else {
+				Some(avgs.value(row))
+			};
+			rows.push((status, avg));
 		}
 	}
 	rows
@@ -2108,6 +2447,8 @@ fn sales_schema() -> SchemaRef {
 		Field::new("amount", DataType::Int32, true),
 		Field::new("status", DataType::Utf8, true),
 		Field::new("price", DataType::Float64, true),
+		Field::new("all_null_amount", DataType::Int32, true),
+		Field::new("score", DataType::Float64, true),
 	]))
 }
 
@@ -2155,6 +2496,15 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 				None,
 				Some(7.5),
 			])),
+			Arc::new(Int32Array::from(vec![None::<i32>; 6])),
+			Arc::new(Float64Array::from(vec![
+				Some(1.0),
+				Some(f64::NAN),
+				Some(3.0),
+				Some(5.0),
+				None,
+				Some(7.0),
+			])),
 		],
 	)
 	.expect("sales batch")
@@ -2168,6 +2518,8 @@ fn empty_sales_batch(schema: SchemaRef) -> RecordBatch {
 			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
 			Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
 			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
+			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
+			Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
 			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
 		],
 	)

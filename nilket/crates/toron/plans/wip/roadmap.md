@@ -110,23 +110,23 @@ along with the forward-sequence rewrite.
   the cross-ring consumer wiring. No new IR variant beyond the enum
   widening (5 → 7), no fragmenter detector change, no cross-ring
   engagement, `AggState` stays `Copy`.
-- **ADR 020 — AVG Aggregate Kernel.** Drafted; implementation pending. Second
+- **ADR 020 — AVG Aggregate Kernel.** Promoted + implemented. Second
   kernel-catalog widening under the post-ADR-018 cycle. AVG completes
-  the basic analytical set (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`); will remove
-  itself from the `sql_planner.rs:556` catch-all and add one named
+  the basic analytical set (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`); removes
+  itself from the `sql_planner.rs:556` catch-all via one named
   arm. Three-way council convergence ratified AVG-alone over Gemini's
   bundle-with-kernel-registry-refactor position (dissent recorded in
   §V1 §9; ADR 021 ratifies the refactor). Multi-state `(total: i128,
   count: u64)` integer accumulator and `(total: f64, count: u64)`
   float accumulator; Float64-uniform output (DuckDB / SQLite parity;
   Decimal output awaits V1.x Decimal ADR); `count == 0 → NULL`
-  finalization to be pinned via explicit `vec![None]` assertions; sticky-NaN
-  behavior to be pinned by hard-gate regression test. Legacy unbound path
+  finalization pinned via explicit `vec![None]` assertions; sticky-NaN
+  behavior pinned by hard-gate regression test. Legacy unbound path
   uses a single `AvgFloat` accumulator (favorable asymmetry vs MIN/MAX
   — no first-batch type dance, no empty-input error). Architecture-
-  guard test will be renamed from `adr016_having_guards_are_narrow` to
+  guard test renamed from `adr016_having_guards_are_narrow` to
   `aggregate_function_enum_guards_are_narrow` (catalog-wide role).
-  Bench planned:
+  Bench:
   `plans/impl/020_avg_aggregate_kernel_bench_results.md`.
   Wendelon-side already ships `SignedAverageParts { sum: i128, count:
   u64, overflow: bool }` at `crates/wendelon/src/schema/aggregate.rs:94-125`
@@ -203,16 +203,18 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 020 drafted; ADR 021 candidates
+### ADR 020 implemented; ADR 021 candidates
 
-ADR 020 selected `AVG` as the second kernel-catalog
-widening under the post-ADR-018 cycle, completing the basic
-analytical set (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`). Three-way council
-convergence ratified AVG-alone over Gemini's bundle-with-kernel-
-registry-refactor position; Gemini's dissent ("the maintenance cliff
-justifies bundling") was recorded in ADR 020 §V1 §9 and carries
-forward as the lead nomination for ADR 021. After ADR 020 lands,
-ADR 021 selection starts from the post-ADR-020 remainder:
+ADR 020 selected and implemented `AVG` as the second
+kernel-catalog widening under the post-ADR-018 cycle,
+completing the basic analytical set
+(`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`). Three-way council
+convergence ratified AVG-alone over Gemini's bundle-with-
+kernel-registry-refactor position; Gemini's dissent ("the
+maintenance cliff justifies bundling") was recorded in ADR
+020 §V1 §9 and carries forward as the lead nomination for
+ADR 021. ADR 021 selection starts from the post-ADR-020
+remainder:
 
 **Leading substrate candidate — kernel-registry refactor:**
 

@@ -537,6 +537,7 @@ impl SqlPlanner {
 			"SUM" => self.lower_sum_aggregate(args),
 			"MIN" => self.lower_min_aggregate(args),
 			"MAX" => self.lower_max_aggregate(args),
+			"AVG" => self.lower_avg_aggregate(args),
 			"LINEAR_REGRESS" => {
 				if matches!(mode, AggregateSqlMode::Grouped) {
 					return Err(unsupported(
@@ -603,6 +604,16 @@ impl SqlPlanner {
 			return Err(unsupported("MAX requires one argument"));
 		}
 		Ok((AggregateFunction::Max, vec![self.lower_arg(&args[0])?]))
+	}
+
+	fn lower_avg_aggregate(
+		&self,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported("AVG requires one argument"));
+		}
+		Ok((AggregateFunction::Avg, vec![self.lower_arg(&args[0])?]))
 	}
 
 	fn lower_linear_regress_aggregate(
@@ -1000,6 +1011,7 @@ enum GroupedAggregateSignature {
 	Sum(ColumnRef),
 	Min(ColumnRef),
 	Max(ColumnRef),
+	Avg(ColumnRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,6 +1130,7 @@ fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
 		"SUM" => Some("SUM"),
 		"MIN" => Some("MIN"),
 		"MAX" => Some("MAX"),
+		"AVG" => Some("AVG"),
 		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
 		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
 		_ => None,
@@ -1130,6 +1143,7 @@ fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
 		AggregateFunction::Sum => "sum",
 		AggregateFunction::Min => "min",
 		AggregateFunction::Max => "max",
+		AggregateFunction::Avg => "avg",
 		AggregateFunction::LinearRegress => "linreg",
 		AggregateFunction::ApproxQuantile(_) => "quantile",
 	}
@@ -1155,6 +1169,10 @@ fn grouped_aggregate_signature(
 		},
 		AggregateFunction::Max => match args {
 			[Expr::Column(column)] => Some(GroupedAggregateSignature::Max(column.clone())),
+			_ => None,
+		},
+		AggregateFunction::Avg => match args {
+			[Expr::Column(column)] => Some(GroupedAggregateSignature::Avg(column.clone())),
 			_ => None,
 		},
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,

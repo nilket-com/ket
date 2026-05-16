@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -420,6 +420,7 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 		Field::new("amount", DataType::Int32, true),
 		Field::new("region", DataType::Utf8, true),
 		Field::new("all_null_i32", DataType::Int32, true),
+		Field::new("float64_amount", DataType::Float64, true),
 	]));
 	let ids = Int64Array::from_iter_values((0..rows).map(|row| row as i64));
 	let amounts = Int32Array::from(
@@ -445,6 +446,17 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 			.collect::<Vec<_>>(),
 	);
 	let all_null = Int32Array::from(vec![None::<i32>; rows]);
+	let float64_amounts = Float64Array::from(
+		(0..rows)
+			.map(|row| {
+				if row % 11 == 0 {
+					None
+				} else {
+					Some((row % 1_000) as f64 + 0.25)
+				}
+			})
+			.collect::<Vec<_>>(),
+	);
 	let batch = RecordBatch::try_new(
 		schema.clone(),
 		vec![
@@ -452,6 +464,7 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 			Arc::new(amounts) as ArrayRef,
 			Arc::new(regions) as ArrayRef,
 			Arc::new(all_null) as ArrayRef,
+			Arc::new(float64_amounts) as ArrayRef,
 		],
 	)?;
 	let descriptor = TableSchemaDescriptor::new(
@@ -520,6 +533,27 @@ fn cases() -> Vec<BenchCase> {
 			expect_pbc: false,
 		},
 		BenchCase {
+			name: "avg_nullable_i32",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Avg, vec![column("amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "avg_i64",
+			plan: aggregate(vec![], vec![(AggregateFunction::Avg, vec![column("id")])]),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "avg_float64",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Avg, vec![column("float64_amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
 			name: "min_nullable_i32",
 			plan: aggregate(
 				vec![],
@@ -541,6 +575,14 @@ fn cases() -> Vec<BenchCase> {
 			expect_pbc: false,
 		},
 		BenchCase {
+			name: "avg_all_null_i32",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Avg, vec![column("all_null_i32")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
 			name: "min_all_null_i32",
 			plan: aggregate(
 				vec![],
@@ -553,6 +595,14 @@ fn cases() -> Vec<BenchCase> {
 			plan: aggregate(
 				vec![column("region")],
 				vec![(AggregateFunction::Sum, vec![column("amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "group_avg",
+			plan: aggregate(
+				vec![column("region")],
+				vec![(AggregateFunction::Avg, vec![column("amount")])],
 			),
 			expect_pbc: false,
 		},
