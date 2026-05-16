@@ -24,7 +24,7 @@ pub(crate) enum AggregateInputDomain {
 	Any,
 	SumNumeric,
 	AvgNumeric,
-	IntMinMax,
+	OrderedMinMax,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +83,7 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		sql_name: "MIN",
 		output_name: "min",
 		arity: AggregateArity::One,
-		input_domain: AggregateInputDomain::IntMinMax,
+		input_domain: AggregateInputDomain::OrderedMinMax,
 		output_rule: AggregateOutputRule::SameAsInput,
 		nullable: true,
 		grouped_supported: true,
@@ -93,7 +93,7 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		sql_name: "MAX",
 		output_name: "max",
 		arity: AggregateArity::One,
-		input_domain: AggregateInputDomain::IntMinMax,
+		input_domain: AggregateInputDomain::OrderedMinMax,
 		output_rule: AggregateOutputRule::SameAsInput,
 		nullable: true,
 		grouped_supported: true,
@@ -187,7 +187,7 @@ pub(crate) fn input_domain_accepts(domain: AggregateInputDomain, input: Option<&
 		AggregateInputDomain::Any => true,
 		AggregateInputDomain::SumNumeric => input.is_some_and(is_sum_numeric_input),
 		AggregateInputDomain::AvgNumeric => input.is_some_and(is_avg_numeric_input),
-		AggregateInputDomain::IntMinMax => input.is_some_and(is_int_min_max_input),
+		AggregateInputDomain::OrderedMinMax => input.is_some_and(is_ordered_min_max_input),
 	}
 }
 
@@ -235,6 +235,9 @@ fn is_avg_numeric_input(input: &DataType) -> bool {
 	)
 }
 
-fn is_int_min_max_input(input: &DataType) -> bool {
-	matches!(input, DataType::Int32 | DataType::Int64)
+fn is_ordered_min_max_input(input: &DataType) -> bool {
+	matches!(
+		input,
+		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+	)
 }

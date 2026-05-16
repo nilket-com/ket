@@ -492,7 +492,7 @@ fn aggregate_kernel_catalog_guards_are_narrow() {
 		"input_domain: AggregateInputDomain::Any",
 		"input_domain: AggregateInputDomain::SumNumeric",
 		"input_domain: AggregateInputDomain::AvgNumeric",
-		"input_domain: AggregateInputDomain::IntMinMax",
+		"input_domain: AggregateInputDomain::OrderedMinMax",
 		"output_rule: AggregateOutputRule::Int64",
 		"output_rule: AggregateOutputRule::Float64",
 		"output_rule: AggregateOutputRule::SameAsInput",
@@ -545,6 +545,12 @@ fn aggregate_kernel_catalog_guards_are_narrow() {
 
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let agg_state_enum = exec
+		.split("enum AggState")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("AggState enum");
+	assert_eq!(enum_variant_count(agg_state_enum), 13);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Copy"));
@@ -640,13 +646,13 @@ fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
-	assert!(binder.contains("expects Int32 or Int64 input"));
+	assert!(binder.contains("expects Int32, Int64, Float32, or Float64 input"));
 
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
 		.expect("read aggregate catalog source");
 	assert!(catalog.contains("kind: StableAggregateKernel::Min"));
 	assert!(catalog.contains("kind: StableAggregateKernel::Max"));
-	assert!(catalog.contains("input_domain: AggregateInputDomain::IntMinMax"));
+	assert!(catalog.contains("input_domain: AggregateInputDomain::OrderedMinMax"));
 	assert!(catalog.contains("output_rule: AggregateOutputRule::SameAsInput"));
 
 	let aggregate_function_source =
@@ -663,8 +669,12 @@ fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
 	assert!(exec.contains("AggState::MinInt32"));
 	assert!(exec.contains("AggState::MinInt64"));
+	assert!(exec.contains("AggState::MinFloat32"));
+	assert!(exec.contains("AggState::MinFloat64"));
 	assert!(exec.contains("AggState::MaxInt32"));
 	assert!(exec.contains("AggState::MaxInt64"));
+	assert!(exec.contains("AggState::MaxFloat32"));
+	assert!(exec.contains("AggState::MaxFloat64"));
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Copy"));

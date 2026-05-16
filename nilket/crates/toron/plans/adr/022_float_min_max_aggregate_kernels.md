@@ -155,6 +155,13 @@ In scope:
   scalar dispatch (`exec.rs:1100-1116`,
   `exec.rs:1142-1149`) and grouped dispatch
   (`exec.rs:1255-1297`); no `_ =>` wildcards.
+- `exec.rs`: cfg(test) legacy unbound grouped
+  aggregate path becomes type-aware for MIN / MAX by
+  initializing `init_states` from observed aggregate
+  array types and by tracking per-aggregate output
+  types through `legacy_aggregate_output_type`.
+  This keeps the legacy direct-executor path aligned
+  with `SameAsInput` for Float inputs.
 - `binder.rs`: four new arms in `coerce_literal_value`
   (`Int32 → Float32`, `Int64 → Float32`,
   `Int64 → Float64`, `Float64 → Float32`); enumerated
@@ -164,18 +171,21 @@ In scope:
   preserved-string list update for new MIN / MAX
   error wording; `AggState` variant-count assertion
   bumps from 9 to 13.
-- New regression test file
-  `tests/float_min_max_test.rs` covering sticky-NaN,
-  signed-zero, empty / all-NULL, Float32 HAVING
-  coercion.
+- Regression coverage in `tests/group_by_test.rs`
+  covering sticky-NaN, signed-zero, empty / all-NULL,
+  Float32 HAVING coercion, and Float32 / Float64
+  identity outputs. The coverage is consolidated
+  there to reuse the shared sales-table fixture.
 - `tests/distributed_process_test.rs`: one grouped
   Float64 MIN / MAX fixture across 2-worker and
   4-worker configurations (finite values only).
 - `benches/storage_execution.rs`: rows
   `min_float64`, `max_float64`, `min_nullable_f32`,
   `group_float_min_max`; no minimum-speedup gate.
-- Bench artifact at
-  `plans/impl/022_float_min_max_aggregate_kernels_bench_results.md`.
+- Optional performance-report artifact may be
+  captured later from the storage benchmark rows;
+  the ADR 022 implementation gate is the bench
+  target compiling with those rows.
 
 Explicitly unchanged:
 
@@ -205,19 +215,6 @@ Explicitly unchanged:
   02X territory; no engagement here.
 - **Experimental kernel gates.** `LinearRegress`,
   `ApproxQuantile(f64)` unchanged.
-- **cfg(test) `init_states` legacy unbound helper**
-  (`exec.rs:2922-2946`). Stays type-blind defaulting
-  `Min` / `Max` to `MinInt64` / `MaxInt64`.
-  Production SQL goes through
-  `init_bound_state_for_call` (`exec.rs:2954-2991`)
-  which inspects `call.args[0].data_type()` and
-  routes to the new Float arms. The cfg(test) helper
-  exists for legacy unbound integer-only tests;
-  widening it would require a per-call input-type
-  plumbing change outside ADR 022's scope. §Future
-  work flags this as a potential cleanup if a future
-  test needs direct `execute_logical` Float MIN /
-  MAX coverage.
 
 No new IR variant. No new fragmenter recognition
 site. No SQL surface widening beyond input-type
@@ -554,8 +551,8 @@ production paths; defense-in-depth).
   `bind_expr_remains_aggregate_free` (ADR 021).
 - **No new architecture guard.** Sticky-NaN and
   signed-zero behavior assertions live in
-  `tests/float_min_max_test.rs` (semantic
-  regression tests), not architecture tests.
+  `tests/group_by_test.rs` (semantic regression
+  tests), not architecture tests.
 
 ## Cycle property at the input-domain layer
 
@@ -571,7 +568,7 @@ total-order accumulator or rejects via the
 enumerated `"expects Int32, Int64, Float32, or
 Float64"` error string. The architecture guard
 machine-checks the enumerated set; tests at the
-semantic boundary (`tests/float_min_max_test.rs`)
+semantic boundary (`tests/group_by_test.rs`)
 machine-check the NaN / signed-zero behavior.
 
 ## Migration strategy
@@ -590,10 +587,9 @@ Five phases, materialized in
    strings; four new `coerce_literal_value` arms.
 4. **Phase 4 — Architecture guard adjustment.** ADR
    019 + ADR 021 guards adjust.
-5. **Phase 5 — Verification + bench.** New
-   `tests/float_min_max_test.rs`; updated
+5. **Phase 5 — Verification + bench.** Expanded
    `group_by_test.rs`; new `distributed_process_test.rs`
-   fixture; bench artifact.
+   fixture; storage benchmark rows.
 
 ## Definition of done
 
@@ -614,20 +610,17 @@ Five phases, materialized in
 - `tests/architecture_test.rs` ADR 019 + ADR 021
   guards updated; `AggState` variant count
   assertion = 13.
-- `tests/float_min_max_test.rs` exists and covers
-  sticky-NaN scalar + grouped, signed-zero
-  scalar + grouped, empty / all-NULL, Float32
-  HAVING coercion (both `> 0` and `> 0.0`),
-  Float32 + Float64 symmetry, AVG / MIN / MAX
-  same-query NaN consistency.
+- `tests/group_by_test.rs` covers sticky-NaN scalar
+  + grouped, signed-zero scalar, empty / all-NULL,
+  Float32 HAVING coercion (both `> 0` and `> 0.0`),
+  and Float32 + Float64 identity-output symmetry.
 - `tests/distributed_process_test.rs` includes a
   Float64 grouped MIN / MAX fixture across 2 and
   4 workers using only finite values.
-- Bench artifact records `min_float64`,
-  `max_float64`, `min_nullable_f32`,
-  `group_float_min_max` rows; digest parity
-  asserted for finite-value cases; no row regresses
-  > 10%.
+- `benches/storage_execution.rs` includes
+  `min_float64`, `max_float64`,
+  `min_nullable_f32`, and `group_float_min_max`
+  rows.
 - Plan digests for integer-only MIN / MAX queries
   byte-identical to pre-ADR-022.
 - All existing tests green:
@@ -679,15 +672,6 @@ alongside SoA plan-layout evidence per ADR 021
   mismatch surfaces, ADR 02X reconciles (either
   align Wendelon executor or refuse Float MIN / MAX
   pushdown).
-- **cfg(test) `init_states` helper Float-awareness.**
-  The cfg(test) legacy unbound helper at
-  `exec.rs:2922-2946` defaults `Min` / `Max` to
-  `MinInt64` / `MaxInt64` type-blindly. Production
-  SQL bypasses this via
-  `init_bound_state_for_call`. If a future test
-  needs direct `execute_logical` Float MIN / MAX
-  coverage, the helper widens; otherwise stays
-  integer-default.
 - **Float16 / general numeric coercion lattice.**
   Out of ADR 022 scope; promotes under a dedicated
   numeric-coercion ADR if evidence surfaces.

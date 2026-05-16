@@ -57,7 +57,8 @@ suite without:
   Phase 4.
 - `crates/toron/tests/group_by_test.rs` — Phase 5
   (replace existing Float MIN / MAX rejection
-  expectations).
+  expectations; consolidated semantic Float MIN /
+  MAX regression coverage).
 - `crates/toron/tests/distributed_process_test.rs`
   — Phase 5 (new fixture).
 - `crates/toron/benches/storage_execution.rs` —
@@ -65,10 +66,10 @@ suite without:
 
 ### New files
 
-- `crates/toron/tests/float_min_max_test.rs` —
-  semantic regression file (Phase 5).
-- `crates/toron/plans/impl/022_float_min_max_aggregate_kernels_bench_results.md`
-  — bench artifact (Phase 5).
+None required for the implementation commit.
+Semantic Float MIN / MAX coverage is consolidated
+into `crates/toron/tests/group_by_test.rs` to reuse
+the shared sales-table fixture.
 
 ### Code-grounded touchpoint sweep
 
@@ -82,7 +83,8 @@ Verified file:line references:
 | `STABLE_AGGREGATE_KERNELS` MIN row | `aggregate_kernel.rs:82-90` | 1 | Field rename |
 | `STABLE_AGGREGATE_KERNELS` MAX row | `aggregate_kernel.rs:91-100` | 1 | Field rename |
 | `AggState` enum | `exec.rs:2902-2913` | 2 | Add 4 Float variants |
-| `init_states` (cfg(test)) | `exec.rs:2922-2946` | 2 | NO CHANGE (see Phase 2 § Out of scope) |
+| `init_states` (cfg(test)) | `exec.rs:2922-2946` | 2 | Make type-aware from observed aggregate arrays |
+| Legacy unbound grouped output typing | `exec.rs:1049+`, `:3317+` | 2 | Track per-aggregate output types so Float MIN / MAX preserves `SameAsInput` |
 | `init_bound_state_for_call` | `exec.rs:2954-2991` | 2 | NO CHANGE (existing data-type dispatch covers Float arms) |
 | `min_state_for_data_type` | `exec.rs:3027-3035` | 2 | Add Float32 + Float64 arms |
 | `max_state_for_data_type` | `exec.rs:3037-3045` | 2 | Add Float32 + Float64 arms |
@@ -98,8 +100,7 @@ Verified file:line references:
 | MIN / MAX type-mismatch error strings | `binder.rs:1170-1180` | 3 | Enumerated wording |
 | `adr019_min_max_aggregate_kernels_guards_are_narrow` | `tests/architecture_test.rs` | 4 | `OrderedMinMax` assertion |
 | `aggregate_kernel_catalog_guards_are_narrow` | `tests/architecture_test.rs` | 4 | Preserved-string list + variant rename + `AggState` count = 13 |
-| `tests/float_min_max_test.rs` | new file | 5 | Sticky-NaN + signed-zero + Float32 HAVING regression suite |
-| `tests/group_by_test.rs` Float MIN / MAX binding / rejection cases | `group_by_test.rs:824+`, `:932+` | 5 | Replace selected Float rejections with successful binding expectations |
+| `tests/group_by_test.rs` Float MIN / MAX semantic suite | `group_by_test.rs:824+`, `:1036+`, `:1227+` | 5 | Binding, sticky-NaN, signed-zero, Float32 HAVING, and AVG / MIN / MAX consistency coverage |
 | `tests/distributed_process_test.rs` integer MIN / MAX digest fixture | `distributed_process_test.rs:405`, `:663+` | 5 | Add grouped Float64 fixture (2/4 workers, finite only) |
 | `benches/storage_execution.rs` fixture / cases | `storage_execution.rs:416+`, `:483+` | 5 | Add `min_float64`, `max_float64`, `min_nullable_f32`, `group_float_min_max` rows |
 
@@ -373,18 +374,25 @@ exhaustiveness sweep. `AggState: Copy` preserved.
    Existing tests pass; new MIN(Float) / MAX(Float)
    tests fail until Phase 5.
 
-**Out of scope (Phase 2).**
+**Legacy unbound path companion.**
 - `init_states` (cfg(test) at
-  `exec.rs:2922-2946`) stays type-blind. Production
-  path is `init_bound_state_for_call` which already
-  inspects `call.args[0].data_type()`. ADR 022
-  §Scale boundary "Explicitly unchanged"
-  documents this.
+  `exec.rs:2922-2946`) becomes type-aware from the
+  observed aggregate arrays. Production SQL still
+  uses `init_bound_state_for_call`, but the legacy
+  direct-executor grouped path must also preserve
+  `SameAsInput` for Float MIN / MAX.
+- The legacy grouped finalize path tracks
+  per-aggregate output types and uses
+  `legacy_aggregate_output_type` so unbound grouped
+  Float MIN / MAX materializes `Float32Array` /
+  `Float64Array` instead of falling back to Int64.
 
 **Definition of Phase 2 done.**
 - 13 `AggState` variants, `Copy` preserved.
 - All six executor-side MIN / MAX helpers extended.
 - State-match sweep complete; no wildcards.
+- Legacy unbound grouped MIN / MAX path preserves
+  Float input/output identity.
 - Build green; integer-only tests pass.
 
 ### Phase 3 — Binder companion
@@ -499,12 +507,13 @@ assertion.
 ### Phase 5 — Verification + bench
 
 **Goal.** Comprehensive regression suite;
-distributed digest fixture; bench artifact
-recording per-row timings and digest parity.
+distributed digest fixture; storage benchmark rows
+that compile under the bench target.
 
 **Tasks.**
 
-1. Create `crates/toron/tests/float_min_max_test.rs`
+1. Add consolidated Float MIN / MAX semantic
+   coverage to `crates/toron/tests/group_by_test.rs`
    covering:
    1. Scalar Float64 MIN / MAX over finite values.
    2. Scalar Float32 MIN / MAX over finite values.
@@ -544,7 +553,7 @@ recording per-row timings and digest parity.
    across 2-worker and 4-worker configurations.
    **Finite values only** in the fixture; digest
    parity assertion is the gate. NaN policy
-   verification lives in `float_min_max_test.rs`.
+   verification lives in `group_by_test.rs`.
 
 4. Update `benches/storage_execution.rs`: add
    rows mirroring the ADR 021 bench shape:
@@ -558,40 +567,28 @@ recording per-row timings and digest parity.
    cargo fmt --check
    cargo test -p toron --test architecture_test
    cargo test -p toron --test group_by_test
-   cargo test -p toron --test float_min_max_test
    cargo test -p toron --test distributed_process_test
    cargo test -p toron aggregate_projection_accounting
    cargo test -p toron
-   cargo bench -p toron --bench storage_execution -- --quick --storage-execution-only
+   cargo test -p toron --bench storage_execution --no-run
    ```
 
-6. Write
-   `crates/toron/plans/impl/022_float_min_max_aggregate_kernels_bench_results.md`
-   matching ADR 021's bench artifact shape:
-   - Environment block (commit, rustc, cargo,
-     Arrow).
-   - Fixture description (new Float32 + Float64
-     columns added to the harness if needed).
-   - Per-row baseline_ms / engaged_ms / speedup /
-     bytes / cols / digest.
-   - `pbc_engaged: false` for aggregate rows (no
-     pushdown; ADR 02X territory).
-   - Comparison to nearby integer MIN / MAX rows
-     (`min_nullable_i32`, `max_i64`) for sanity.
-   - Readout: digest parity asserted; no minimum-
-     speedup gate; investigate any row regressing
-     > 10%.
+6. Optional post-implementation benchmark artifact:
+   run `cargo bench -p toron --bench storage_execution -- --quick --storage-execution-only`
+   and record the `min_float64`, `max_float64`,
+   `min_nullable_f32`, and `group_float_min_max`
+   rows if a performance-report artifact is needed.
+   ADR 022's implementation gate is the bench target
+   compiling with the new rows.
 
 **Definition of Phase 5 done.**
-- `float_min_max_test.rs` green; all 14+ cases
-  pass.
-- Updated `group_by_test.rs` green; Float
-  rejection cases now expect success.
+- `group_by_test.rs` green; Float rejection cases
+  now expect success and all 14+ semantic cases pass.
 - `distributed_process_test.rs` Float64 fixture
   green; digest parity asserted across worker
   counts.
-- Bench artifact recorded; no row regresses
-  > 10%.
+- `storage_execution` bench target compiles with the
+  new Float MIN / MAX rows.
 - Full `cargo test -p toron` green.
 - `cargo fmt --check` clean.
 
@@ -623,7 +620,8 @@ Existing test files that must stay green:
   ADR 019 + ADR 021 guards adjust (Phase 4).
 - `crates/toron/tests/group_by_test.rs` — replaces
   existing Float MIN / MAX rejection expectations
-  with successful binding (Phase 5).
+  with successful binding and carries semantic Float
+  MIN / MAX regression coverage (Phase 5).
 - `crates/toron/tests/distributed_process_test.rs`
   — Float64 grouped fixture added (Phase 5).
 - `crates/toron/tests/aggregate_projection_accounting_test.rs`
@@ -633,16 +631,16 @@ Existing test files that must stay green:
 
 New test files:
 
-- `crates/toron/tests/float_min_max_test.rs` —
-  14+ cases covering sticky-NaN, signed-zero,
-  empty / all-NULL, Float32 HAVING coercion,
-  composition with AVG.
+- None. ADR 022 semantic coverage is consolidated in
+  `crates/toron/tests/group_by_test.rs`.
 
-Bench artifact:
+Bench target:
 
-- `crates/toron/plans/impl/022_float_min_max_aggregate_kernels_bench_results.md`
-  with `min_float64`, `max_float64`,
-  `min_nullable_f32`, `group_float_min_max` rows.
+- `crates/toron/benches/storage_execution.rs`
+  includes `min_float64`, `max_float64`,
+  `min_nullable_f32`, and `group_float_min_max`
+  rows and compiles under
+  `cargo test -p toron --bench storage_execution --no-run`.
 
 ## Definition of done
 
@@ -660,13 +658,15 @@ The refactor lands when:
    strings; four new `coerce_literal_value` arms.
 4. `architecture_test.rs` ADR 019 + ADR 021 guards
    green with adjusted assertions.
-5. `float_min_max_test.rs` exists and is green.
-6. `group_by_test.rs` Float rejection cases
-   replaced with successful binding.
+5. `group_by_test.rs` Float rejection cases are
+   replaced with successful binding and semantic
+   Float MIN / MAX coverage is green.
+6. Legacy unbound grouped MIN / MAX preserves Float
+   input/output identity.
 7. `distributed_process_test.rs` Float64 grouped
    fixture green across 2 and 4 workers.
-8. Bench artifact recorded; no row regresses
-   > 10%.
+8. Storage execution bench target compiles with the
+   new Float MIN / MAX rows.
 9. Plan digests for integer-only MIN / MAX queries
    byte-identical.
 10. `cargo fmt --check` clean;

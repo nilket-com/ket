@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
@@ -421,6 +421,7 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 		Field::new("region", DataType::Utf8, true),
 		Field::new("all_null_i32", DataType::Int32, true),
 		Field::new("float64_amount", DataType::Float64, true),
+		Field::new("float32_amount", DataType::Float32, true),
 	]));
 	let ids = Int64Array::from_iter_values((0..rows).map(|row| row as i64));
 	let amounts = Int32Array::from(
@@ -457,6 +458,17 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 			})
 			.collect::<Vec<_>>(),
 	);
+	let float32_amounts = Float32Array::from(
+		(0..rows)
+			.map(|row| {
+				if row % 13 == 0 {
+					None
+				} else {
+					Some((row % 1_000) as f32 + 0.5)
+				}
+			})
+			.collect::<Vec<_>>(),
+	);
 	let batch = RecordBatch::try_new(
 		schema.clone(),
 		vec![
@@ -465,6 +477,7 @@ fn fixture(rows: usize) -> Result<Fixture, Box<dyn Error>> {
 			Arc::new(regions) as ArrayRef,
 			Arc::new(all_null) as ArrayRef,
 			Arc::new(float64_amounts) as ArrayRef,
+			Arc::new(float32_amounts) as ArrayRef,
 		],
 	)?;
 	let descriptor = TableSchemaDescriptor::new(
@@ -562,8 +575,32 @@ fn cases() -> Vec<BenchCase> {
 			expect_pbc: false,
 		},
 		BenchCase {
+			name: "min_float64",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Min, vec![column("float64_amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "min_nullable_f32",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Min, vec![column("float32_amount")])],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
 			name: "max_i64",
 			plan: aggregate(vec![], vec![(AggregateFunction::Max, vec![column("id")])]),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "max_float64",
+			plan: aggregate(
+				vec![],
+				vec![(AggregateFunction::Max, vec![column("float64_amount")])],
+			),
 			expect_pbc: false,
 		},
 		BenchCase {
@@ -613,6 +650,17 @@ fn cases() -> Vec<BenchCase> {
 				vec![
 					(AggregateFunction::Min, vec![column("amount")]),
 					(AggregateFunction::Max, vec![column("id")]),
+				],
+			),
+			expect_pbc: false,
+		},
+		BenchCase {
+			name: "group_float_min_max",
+			plan: aggregate(
+				vec![column("region")],
+				vec![
+					(AggregateFunction::Min, vec![column("float64_amount")]),
+					(AggregateFunction::Max, vec![column("float64_amount")]),
 				],
 			),
 			expect_pbc: false,

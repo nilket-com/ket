@@ -1,4 +1,4 @@
-use arrow::array::{Int32Array, Int64Array, StringArray};
+use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
@@ -51,7 +51,10 @@ struct FixtureStorageScan {
 
 impl FixtureStorageScan {
 	fn new() -> Result<Self, arrow::error::ArrowError> {
-		let vals_schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, false)]));
+		let vals_schema = Arc::new(Schema::new(vec![
+			Field::new("val", DataType::Int32, false),
+			Field::new("float_val", DataType::Float64, true),
+		]));
 		let orders_schema = Arc::new(Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("customer_id", DataType::Int64, false),
@@ -62,7 +65,14 @@ impl FixtureStorageScan {
 		]));
 		let vals = RecordBatch::try_new(
 			vals_schema,
-			vec![Arc::new(Int32Array::from((0..16).collect::<Vec<i32>>()))],
+			vec![
+				Arc::new(Int32Array::from((0..16).collect::<Vec<i32>>())),
+				Arc::new(Float64Array::from(
+					(0..16)
+						.map(|row| Some(row as f64 + 0.25))
+						.collect::<Vec<_>>(),
+				)),
+			],
 		)?;
 		let orders = RecordBatch::try_new(
 			orders_schema,

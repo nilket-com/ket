@@ -1048,6 +1048,7 @@ impl Executor {
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
+		let mut aggregate_output_types = vec![None; aggr_expr.len()];
 
 		for batch in input_batches {
 			let group_arrays = group_expr
@@ -1077,13 +1078,28 @@ impl Executor {
 					}
 				})
 				.collect::<Result<Vec<_>, _>>()?;
+			for (agg_idx, ((function, _), input)) in
+				aggr_expr.iter().zip(aggr_arrays.iter()).enumerate()
+			{
+				if aggregate_output_types[agg_idx].is_none() {
+					if let Some(array) = input {
+						aggregate_output_types[agg_idx] =
+							Some(legacy_aggregate_output_type(function, array.data_type()));
+					}
+				}
+			}
 
 			for row in 0..batch.num_rows() {
 				let key = group_arrays
 					.iter()
 					.map(|array| group_value(array, row))
 					.collect::<Result<Vec<_>, _>>()?;
-				let states = groups.entry(key).or_insert_with(|| init_states(aggr_expr));
+				let states = match groups.entry(key) {
+					std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+					std::collections::btree_map::Entry::Vacant(entry) => {
+						entry.insert(init_states(aggr_expr, &aggr_arrays)?)
+					}
+				};
 				for (state, input) in states.iter_mut().zip(aggr_arrays.iter()) {
 					match input {
 						None => {
@@ -1107,10 +1123,16 @@ impl Executor {
 									add_avg_value(state, value)?;
 								}
 							}
-							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
+							AggState::MinInt32 { .. }
+							| AggState::MinInt64 { .. }
+							| AggState::MinFloat32 { .. }
+							| AggState::MinFloat64 { .. } => {
 								update_min_state(state, array, row)?;
 							}
-							AggState::MaxInt32 { .. } | AggState::MaxInt64 { .. } => {
+							AggState::MaxInt32 { .. }
+							| AggState::MaxInt64 { .. }
+							| AggState::MaxFloat32 { .. }
+							| AggState::MaxFloat64 { .. } => {
 								update_max_state(state, array, row)?;
 							}
 						},
@@ -1143,8 +1165,12 @@ impl Executor {
 							| AggState::SumFloat { .. }
 							| AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
+							| AggState::MinFloat32 { .. }
+							| AggState::MinFloat64 { .. }
 							| AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
+							| AggState::MaxFloat32 { .. }
+							| AggState::MaxFloat64 { .. }
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. } => 0,
 						})
@@ -1152,14 +1178,16 @@ impl Executor {
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
 				}
 				AggregateFunction::Sum => {
-					columns.push(sum_column_from_groups(&groups, agg_idx, &DataType::Int64)?);
+					let output_type = aggregate_output_types[agg_idx]
+						.clone()
+						.unwrap_or(DataType::Int64);
+					columns.push(sum_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Min | AggregateFunction::Max => {
-					columns.push(min_max_column_from_groups(
-						&groups,
-						agg_idx,
-						&DataType::Int64,
-					)?);
+					let output_type = aggregate_output_types[agg_idx]
+						.clone()
+						.unwrap_or(DataType::Int64);
+					columns.push(min_max_column_from_groups(&groups, agg_idx, &output_type)?);
 				}
 				AggregateFunction::Avg => {
 					columns.push(avg_column_from_groups(&groups, agg_idx)?);
@@ -1171,10 +1199,13 @@ impl Executor {
 				}
 			}
 			let field_name = aggregate_state_output_name(function);
-			let field_type = match function {
-				AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
-				_ => arrow::datatypes::DataType::Int64,
-			};
+			let field_type =
+				aggregate_output_types[agg_idx]
+					.clone()
+					.unwrap_or_else(|| match function {
+						AggregateFunction::Avg => arrow::datatypes::DataType::Float64,
+						_ => arrow::datatypes::DataType::Int64,
+					});
 			fields.push(arrow::datatypes::Field::new(
 				field_name,
 				field_type,
@@ -1262,10 +1293,16 @@ impl Executor {
 									add_avg_value(state, value)?;
 								}
 							}
-							AggState::MinInt32 { .. } | AggState::MinInt64 { .. } => {
+							AggState::MinInt32 { .. }
+							| AggState::MinInt64 { .. }
+							| AggState::MinFloat32 { .. }
+							| AggState::MinFloat64 { .. } => {
 								update_min_state(state, array, row)?;
 							}
-							AggState::MaxInt32 { .. } | AggState::MaxInt64 { .. } => {
+							AggState::MaxInt32 { .. }
+							| AggState::MaxInt64 { .. }
+							| AggState::MaxFloat32 { .. }
+							| AggState::MaxFloat64 { .. } => {
 								update_max_state(state, array, row)?;
 							}
 						},
@@ -1291,8 +1328,12 @@ impl Executor {
 							| AggState::SumFloat { .. }
 							| AggState::MinInt32 { .. }
 							| AggState::MinInt64 { .. }
+							| AggState::MinFloat32 { .. }
+							| AggState::MinFloat64 { .. }
 							| AggState::MaxInt32 { .. }
 							| AggState::MaxInt64 { .. }
+							| AggState::MaxFloat32 { .. }
+							| AggState::MaxFloat64 { .. }
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. } => 0,
 						})
@@ -2906,8 +2947,12 @@ enum AggState {
 	SumFloat { total: f64, seen: bool },
 	MinInt32 { value: Option<i32> },
 	MinInt64 { value: Option<i64> },
+	MinFloat32 { value: Option<f32> },
+	MinFloat64 { value: Option<f64> },
 	MaxInt32 { value: Option<i32> },
 	MaxInt64 { value: Option<i64> },
+	MaxFloat32 { value: Option<f32> },
+	MaxFloat64 { value: Option<f64> },
 	AvgInt { total: i128, count: u64 },
 	AvgFloat { total: f64, count: u64 },
 }
@@ -2919,30 +2964,62 @@ enum NumericValue {
 }
 
 #[cfg(test)]
-fn init_states(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) -> Vec<AggState> {
+fn init_states(
+	aggr_expr: &[(AggregateFunction, Vec<Expr>)],
+	aggr_arrays: &[Option<ArrayRef>],
+) -> Result<Vec<AggState>, ExecutionError> {
 	aggr_expr
 		.iter()
-		.map(|(function, _)| match function {
-			AggregateFunction::CountAll => AggState::Count(0),
-			AggregateFunction::Count => AggState::Count(0),
-			AggregateFunction::Sum => AggState::SumInt {
-				total: 0,
-				seen: false,
-			},
-			AggregateFunction::Min => AggState::MinInt64 { value: None },
-			AggregateFunction::Max => AggState::MaxInt64 { value: None },
-			AggregateFunction::Avg => AggState::AvgFloat {
-				total: 0.0,
-				count: 0,
-			},
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-				AggState::SumInt {
+		.zip(aggr_arrays.iter())
+		.map(|((function, _), array)| match function {
+			AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
+			AggregateFunction::Sum => Ok(array
+				.as_ref()
+				.map(|array| sum_state_for_data_type(array.data_type()))
+				.unwrap_or(AggState::SumInt {
 					total: 0,
 					seen: false,
-				}
+				})),
+			AggregateFunction::Min => array
+				.as_ref()
+				.map(|array| min_state_for_data_type(array.data_type()))
+				.transpose()
+				.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
+			AggregateFunction::Max => array
+				.as_ref()
+				.map(|array| max_state_for_data_type(array.data_type()))
+				.transpose()
+				.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
+			AggregateFunction::Avg => array
+				.as_ref()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "AVG requires one argument".to_string(),
+				})
+				.and_then(|array| avg_state_for_data_type(array.data_type())),
+			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				Ok(AggState::SumInt {
+					total: 0,
+					seen: false,
+				})
 			}
 		})
 		.collect()
+}
+
+#[cfg(test)]
+fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataType) -> DataType {
+	match function {
+		AggregateFunction::CountAll | AggregateFunction::Count => DataType::Int64,
+		AggregateFunction::Sum => match input_type {
+			DataType::Float32 | DataType::Float64 => DataType::Float64,
+			_ => DataType::Int64,
+		},
+		AggregateFunction::Min | AggregateFunction::Max => input_type.clone(),
+		AggregateFunction::Avg => DataType::Float64,
+		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			DataType::Float64
+		}
+	}
 }
 
 fn init_bound_states(
@@ -3028,6 +3105,8 @@ fn min_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 	match data_type {
 		DataType::Int32 => Ok(AggState::MinInt32 { value: None }),
 		DataType::Int64 => Ok(AggState::MinInt64 { value: None }),
+		DataType::Float32 => Ok(AggState::MinFloat32 { value: None }),
+		DataType::Float64 => Ok(AggState::MinFloat64 { value: None }),
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("MIN does not support input type {:?}", data_type),
 		}),
@@ -3038,6 +3117,8 @@ fn max_state_for_data_type(data_type: &DataType) -> Result<AggState, ExecutionEr
 	match data_type {
 		DataType::Int32 => Ok(AggState::MaxInt32 { value: None }),
 		DataType::Int64 => Ok(AggState::MaxInt64 { value: None }),
+		DataType::Float32 => Ok(AggState::MaxFloat32 { value: None }),
+		DataType::Float64 => Ok(AggState::MaxFloat64 { value: None }),
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("MAX does not support input type {:?}", data_type),
 		}),
@@ -3093,8 +3174,12 @@ fn add_sum_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		(AggState::Count(_), _)
 		| (AggState::MinInt32 { .. }, _)
 		| (AggState::MinInt64 { .. }, _)
+		| (AggState::MinFloat32 { .. }, _)
+		| (AggState::MinFloat64 { .. }, _)
 		| (AggState::MaxInt32 { .. }, _)
 		| (AggState::MaxInt64 { .. }, _)
+		| (AggState::MaxFloat32 { .. }, _)
+		| (AggState::MaxFloat64 { .. }, _)
 		| (AggState::AvgInt { .. }, _)
 		| (AggState::AvgFloat { .. }, _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
@@ -3139,10 +3224,60 @@ fn add_avg_value(state: &mut AggState, value: NumericValue) -> Result<(), Execut
 		| (AggState::SumFloat { .. }, _)
 		| (AggState::MinInt32 { .. }, _)
 		| (AggState::MinInt64 { .. }, _)
+		| (AggState::MinFloat32 { .. }, _)
+		| (AggState::MinFloat64 { .. }, _)
 		| (AggState::MaxInt32 { .. }, _)
-		| (AggState::MaxInt64 { .. }, _) => Err(ExecutionError::InvalidExpression {
+		| (AggState::MaxInt64 { .. }, _)
+		| (AggState::MaxFloat32 { .. }, _)
+		| (AggState::MaxFloat64 { .. }, _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
+	}
+}
+
+// ADR 022 pins sticky-NaN and IEEE totalOrder signed-zero semantics
+// for Float MIN/MAX instead of Rust's one-sided f32/f64 min/max helpers.
+#[inline]
+fn f32_min_sticky_total(current: f32, candidate: f32) -> f32 {
+	if current.is_nan() || candidate.is_nan() {
+		return f32::NAN;
+	}
+	match current.total_cmp(&candidate) {
+		std::cmp::Ordering::Greater => candidate,
+		_ => current,
+	}
+}
+
+#[inline]
+fn f32_max_sticky_total(current: f32, candidate: f32) -> f32 {
+	if current.is_nan() || candidate.is_nan() {
+		return f32::NAN;
+	}
+	match current.total_cmp(&candidate) {
+		std::cmp::Ordering::Less => candidate,
+		_ => current,
+	}
+}
+
+#[inline]
+fn f64_min_sticky_total(current: f64, candidate: f64) -> f64 {
+	if current.is_nan() || candidate.is_nan() {
+		return f64::NAN;
+	}
+	match current.total_cmp(&candidate) {
+		std::cmp::Ordering::Greater => candidate,
+		_ => current,
+	}
+}
+
+#[inline]
+fn f64_max_sticky_total(current: f64, candidate: f64) -> f64 {
+	if current.is_nan() || candidate.is_nan() {
+		return f64::NAN;
+	}
+	match current.total_cmp(&candidate) {
+		std::cmp::Ordering::Less => candidate,
+		_ => current,
 	}
 }
 
@@ -3175,6 +3310,32 @@ fn update_min_state(
 				})?
 				.value(row);
 			*value = Some(value.map_or(candidate, |current| current.min(candidate)));
+			Ok(())
+		}
+		AggState::MinFloat32 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MIN(Float32) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| {
+				f32_min_sticky_total(current, candidate)
+			}));
+			Ok(())
+		}
+		AggState::MinFloat64 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MIN(Float64) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| {
+				f64_min_sticky_total(current, candidate)
+			}));
 			Ok(())
 		}
 		_ => Err(ExecutionError::InvalidExpression {
@@ -3214,6 +3375,32 @@ fn update_max_state(
 			*value = Some(value.map_or(candidate, |current| current.max(candidate)));
 			Ok(())
 		}
+		AggState::MaxFloat32 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MAX(Float32) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| {
+				f32_max_sticky_total(current, candidate)
+			}));
+			Ok(())
+		}
+		AggState::MaxFloat64 { value } => {
+			let candidate = array
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "MAX(Float64) array type mismatch".to_string(),
+				})?
+				.value(row);
+			*value = Some(value.map_or(candidate, |current| {
+				f64_max_sticky_total(current, candidate)
+			}));
+			Ok(())
+		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: "MAX value reached non-MAX accumulator".to_string(),
 		}),
@@ -3227,6 +3414,12 @@ fn min_max_state_array(state: &AggState) -> Result<ArrayRef, ExecutionError> {
 		}
 		AggState::MinInt64 { value } | AggState::MaxInt64 { value } => {
 			Ok(Arc::new(Int64Array::from(vec![*value])) as ArrayRef)
+		}
+		AggState::MinFloat32 { value } | AggState::MaxFloat32 { value } => {
+			Ok(Arc::new(Float32Array::from(vec![*value])) as ArrayRef)
+		}
+		AggState::MinFloat64 { value } | AggState::MaxFloat64 { value } => {
+			Ok(Arc::new(Float64Array::from(vec![*value])) as ArrayRef)
 		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: "MIN/MAX finalize over non-MIN/MAX state".to_string(),
@@ -3283,8 +3476,12 @@ fn sum_column_from_groups(
 					| AggState::Count(_)
 					| AggState::MinInt32 { .. }
 					| AggState::MinInt64 { .. }
+					| AggState::MinFloat32 { .. }
+					| AggState::MinFloat64 { .. }
 					| AggState::MaxInt32 { .. }
 					| AggState::MaxInt64 { .. }
+					| AggState::MaxFloat32 { .. }
+					| AggState::MaxFloat64 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. } => Ok(None),
 				})
@@ -3300,8 +3497,12 @@ fn sum_column_from_groups(
 					AggState::Count(_)
 					| AggState::MinInt32 { .. }
 					| AggState::MinInt64 { .. }
+					| AggState::MinFloat32 { .. }
+					| AggState::MinFloat64 { .. }
 					| AggState::MaxInt32 { .. }
 					| AggState::MaxInt64 { .. }
+					| AggState::MaxFloat32 { .. }
+					| AggState::MaxFloat64 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. } => None,
 				})
@@ -3339,6 +3540,26 @@ fn min_max_column_from_groups(
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+		}
+		DataType::Float32 => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::MinFloat32 { value } | AggState::MaxFloat32 { value } => value,
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+		}
+		DataType::Float64 => {
+			let values = groups
+				.values()
+				.map(|states| match states[agg_idx] {
+					AggState::MinFloat64 { value } | AggState::MaxFloat64 { value } => value,
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
 		}
 		_ => Err(ExecutionError::InvalidExpression {
 			message: format!("unsupported MIN/MAX output type: {output_type:?}"),
@@ -4438,6 +4659,70 @@ mod tests {
 		assert_eq!(sums.value(0), 100);
 		assert_eq!(groups.value(1), "west");
 		assert_eq!(sums.value(1), 250);
+	}
+
+	#[tokio::test]
+	async fn execute_unbound_grouped_float_min_max_uses_input_output_type() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("region", DataType::Utf8, true),
+			Field::new("score", DataType::Float64, true),
+		]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(StringArray::from(vec![
+					Some("west"),
+					Some("east"),
+					Some("west"),
+					Some("east"),
+				])),
+				Arc::new(Float64Array::from(vec![
+					Some(2.5),
+					Some(f64::NAN),
+					Some(1.5),
+					Some(3.5),
+				])),
+			],
+		)
+		.expect("batch");
+		let executor = Executor::new(Arc::new(InMemoryStorageScan { table_data: batch }));
+		let plan = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::Scan {
+				table: TableId(1),
+				projection: None,
+			}),
+			group_expr: vec![Expr::column("region")],
+			aggr_expr: vec![
+				(AggregateFunction::Min, vec![Expr::column("score")]),
+				(AggregateFunction::Max, vec![Expr::column("score")]),
+			],
+		};
+
+		let results = executor.execute(&plan, None).await.expect("execute");
+		assert_eq!(results[0].schema().field(1).data_type(), &DataType::Float64);
+		assert_eq!(results[0].schema().field(2).data_type(), &DataType::Float64);
+		let groups = results[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("group column");
+		let mins = results[0]
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("min column");
+		let maxes = results[0]
+			.column(2)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("max column");
+
+		assert_eq!(groups.value(0), "east");
+		assert!(mins.value(0).is_nan());
+		assert!(maxes.value(0).is_nan());
+		assert_eq!(groups.value(1), "west");
+		assert_eq!(mins.value(1), 1.5);
+		assert_eq!(maxes.value(1), 2.5);
 	}
 
 	fn hash_join_key(key: &JoinKey) -> u64 {

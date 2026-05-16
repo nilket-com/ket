@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use toron::binder::{PlannerConfig, bind};
@@ -823,7 +823,7 @@ async fn grouped_aggregate_order_by_binds_against_aggregate_output() {
 #[tokio::test]
 async fn min_max_bind_with_identity_output_types_and_reject_deferred_domains() {
 	let (catalog, _) = fixture();
-	let logical = plan_sql("SELECT MIN(amount), MAX(id) FROM sales");
+	let logical = plan_sql("SELECT MIN(amount), MAX(id), MIN(price), MAX(rating32) FROM sales");
 	let bound = bind(&logical, &catalog, &PlannerConfig::default())
 		.await
 		.expect("bind MIN/MAX");
@@ -836,15 +836,21 @@ async fn min_max_bind_with_identity_output_types_and_reject_deferred_domains() {
 	assert_eq!(output_schema.field(1).name(), "max");
 	assert_eq!(output_schema.field(1).data_type(), &DataType::Int64);
 	assert!(output_schema.field(1).is_nullable());
+	assert_eq!(output_schema.field(2).name(), "min");
+	assert_eq!(output_schema.field(2).data_type(), &DataType::Float64);
+	assert!(output_schema.field(2).is_nullable());
+	assert_eq!(output_schema.field(3).name(), "max");
+	assert_eq!(output_schema.field(3).data_type(), &DataType::Float32);
+	assert!(output_schema.field(3).is_nullable());
 
 	for (sql, expected) in [
 		(
-			"SELECT MIN(price) FROM sales",
-			"MIN expects Int32 or Int64 input, got Float64",
+			"SELECT MIN(region) FROM sales",
+			"MIN expects Int32, Int64, Float32, or Float64 input, got Utf8",
 		),
 		(
 			"SELECT MAX(status) FROM sales",
-			"MAX expects Int32 or Int64 input, got Utf8",
+			"MAX expects Int32, Int64, Float32, or Float64 input, got Utf8",
 		),
 	] {
 		let logical = plan_sql(sql);
@@ -1031,6 +1037,39 @@ async fn avg_having_binds_with_float64_literal_coercion() {
 }
 
 #[tokio::test]
+async fn float32_min_having_binds_with_literal_coercion() {
+	let (catalog, _) = fixture();
+	for (sql, expected) in [
+		(
+			"SELECT MIN(rating32) FROM sales HAVING MIN(rating32) > 0",
+			ScalarValue::Float32(Some(0.0)),
+		),
+		(
+			"SELECT MIN(rating32) FROM sales HAVING MIN(rating32) > 0.0",
+			ScalarValue::Float32(Some(0.0)),
+		),
+	] {
+		let logical = plan_sql(sql);
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.expect("bind Float32 MIN HAVING");
+		let ExecutionPlan::Filter { predicate, .. } = bound else {
+			panic!("expected bound HAVING filter for {sql}");
+		};
+		assert!(
+			matches!(
+				predicate,
+				ExecutionExpr::Gt(left, right)
+					if matches!(left.as_ref(), ExecutionExpr::Column(column)
+						if column.name.0 == "min" && column.ordinal == ColumnOrdinal(0))
+						&& matches!(right.as_ref(), ExecutionExpr::Literal(value) if value == &expected)
+			),
+			"{sql}"
+		);
+	}
+}
+
+#[tokio::test]
 async fn grouped_aggregate_having_group_key_binds_against_aggregate_output() {
 	let (catalog, _) = fixture();
 	let logical =
@@ -1183,6 +1222,94 @@ async fn scalar_min_max_execute_with_identity_types_and_null_semantics() {
 
 	let empty = run_logical(&plan_sql("SELECT MIN(amount), MAX(id) FROM empty_sales")).await;
 	assert_eq!(scalar_min_amount_max_id_rows(&empty), vec![(None, None)]);
+}
+
+#[tokio::test]
+async fn float_min_max_execute_with_sticky_nan_and_signed_zero() {
+	let finite = run_logical(&plan_sql("SELECT MIN(price), MAX(price) FROM sales")).await;
+	assert_eq!(scalar_float64_column_rows(&finite, 0), vec![Some(7.5)]);
+	assert_eq!(scalar_float64_column_rows(&finite, 1), vec![Some(30.5)]);
+
+	let empty = run_logical(&plan_sql("SELECT MIN(price), MAX(price) FROM empty_sales")).await;
+	assert_eq!(scalar_float64_column_rows(&empty, 0), vec![None]);
+	assert_eq!(scalar_float64_column_rows(&empty, 1), vec![None]);
+
+	let sticky_nan = run_logical(&plan_sql("SELECT MIN(score), MAX(score) FROM sales")).await;
+	let min_score = scalar_float64_column_rows(&sticky_nan, 0);
+	let max_score = scalar_float64_column_rows(&sticky_nan, 1);
+	assert!(min_score[0].expect("MIN(score)").is_nan());
+	assert!(max_score[0].expect("MAX(score)").is_nan());
+
+	let signed_zero = run_logical(&plan_sql("SELECT MIN(zero64), MAX(zero64) FROM sales")).await;
+	let min_zero = scalar_float64_column_rows(&signed_zero, 0)[0].expect("MIN(zero64)");
+	let max_zero = scalar_float64_column_rows(&signed_zero, 1)[0].expect("MAX(zero64)");
+	assert_eq!(min_zero.to_bits(), (-0.0f64).to_bits());
+	assert_eq!(max_zero.to_bits(), 0.0f64.to_bits());
+
+	let rating = run_logical(&plan_sql("SELECT MIN(rating32), MAX(rating32) FROM sales")).await;
+	assert_eq!(scalar_float32_column_rows(&rating, 0), vec![Some(0.25)]);
+	assert_eq!(scalar_float32_column_rows(&rating, 1), vec![Some(4.5)]);
+}
+
+#[tokio::test]
+async fn float_avg_min_max_same_query_nan_consistency() {
+	let results = run_logical(&plan_sql(
+		"SELECT AVG(score), MIN(score), MAX(score) FROM sales",
+	))
+	.await;
+
+	assert!(
+		scalar_float64_column_rows(&results, 0)[0]
+			.expect("AVG(score)")
+			.is_nan()
+	);
+	assert!(
+		scalar_float64_column_rows(&results, 1)[0]
+			.expect("MIN(score)")
+			.is_nan()
+	);
+	assert!(
+		scalar_float64_column_rows(&results, 2)[0]
+			.expect("MAX(score)")
+			.is_nan()
+	);
+}
+
+#[tokio::test]
+async fn grouped_float_min_max_execute_with_sticky_nan() {
+	let finite = run_logical(&plan_sql(
+		"SELECT status, MIN(price), MAX(price) FROM sales GROUP BY status ORDER BY status",
+	))
+	.await;
+	assert_eq!(
+		status_min_max_float64_rows(&finite),
+		vec![
+			(Some("closed".to_string()), None, None),
+			(Some("open".to_string()), Some(7.5), Some(30.5)),
+		]
+	);
+
+	let sticky_nan = run_logical(&plan_sql(
+		"SELECT status, MIN(score), MAX(score) FROM sales GROUP BY status ORDER BY status",
+	))
+	.await;
+	let rows = status_min_max_float64_rows(&sticky_nan);
+	assert_eq!(rows.len(), 2);
+	assert_eq!(rows[0], (Some("closed".to_string()), Some(3.0), Some(3.0)));
+	assert_eq!(rows[1].0, Some("open".to_string()));
+	assert!(rows[1].1.expect("open MIN(score)").is_nan());
+	assert!(rows[1].2.expect("open MAX(score)").is_nan());
+}
+
+#[tokio::test]
+async fn float32_min_having_literals_execute() {
+	for sql in [
+		"SELECT MIN(rating32) FROM sales HAVING MIN(rating32) > 0",
+		"SELECT MIN(rating32) FROM sales HAVING MIN(rating32) > 0.0",
+	] {
+		let results = run_logical(&plan_sql(sql)).await;
+		assert_eq!(scalar_float32_column_rows(&results, 0), vec![Some(0.25)]);
+	}
 }
 
 #[tokio::test]
@@ -2142,6 +2269,25 @@ fn scalar_float64_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec
 	rows
 }
 
+fn scalar_float32_column_rows(results: &[RecordBatch], column_idx: usize) -> Vec<Option<f32>> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let values = batch
+			.column(column_idx)
+			.as_any()
+			.downcast_ref::<Float32Array>()
+			.expect("Float32 column");
+		for row in 0..batch.num_rows() {
+			rows.push(if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			});
+		}
+	}
+	rows
+}
+
 fn scalar_min_amount_max_id_rows(results: &[RecordBatch]) -> Vec<(Option<i32>, Option<i64>)> {
 	let mut rows = Vec::new();
 	for batch in results {
@@ -2167,6 +2313,48 @@ fn scalar_min_amount_max_id_rows(results: &[RecordBatch]) -> Vec<(Option<i32>, O
 				Some(maxes.value(row))
 			};
 			rows.push((min, max));
+		}
+	}
+	rows
+}
+
+fn status_min_max_float64_rows(
+	results: &[RecordBatch],
+) -> Vec<(Option<String>, Option<f64>, Option<f64>)> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let statuses = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("status column");
+		let mins = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("min column");
+		let maxes = batch
+			.column(2)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("max column");
+		for row in 0..batch.num_rows() {
+			let status = if statuses.is_null(row) {
+				None
+			} else {
+				Some(statuses.value(row).to_string())
+			};
+			let min = if mins.is_null(row) {
+				None
+			} else {
+				Some(mins.value(row))
+			};
+			let max = if maxes.is_null(row) {
+				None
+			} else {
+				Some(maxes.value(row))
+			};
+			rows.push((status, min, max));
 		}
 	}
 	rows
@@ -2449,6 +2637,8 @@ fn sales_schema() -> SchemaRef {
 		Field::new("price", DataType::Float64, true),
 		Field::new("all_null_amount", DataType::Int32, true),
 		Field::new("score", DataType::Float64, true),
+		Field::new("rating32", DataType::Float32, true),
+		Field::new("zero64", DataType::Float64, true),
 	]))
 }
 
@@ -2505,6 +2695,22 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 				None,
 				Some(7.0),
 			])),
+			Arc::new(Float32Array::from(vec![
+				Some(1.5),
+				Some(2.5),
+				None,
+				Some(3.5),
+				Some(4.5),
+				Some(0.25),
+			])),
+			Arc::new(Float64Array::from(vec![
+				Some(0.0),
+				Some(-0.0),
+				None,
+				Some(0.0),
+				None,
+				Some(-0.0),
+			])),
 		],
 	)
 	.expect("sales batch")
@@ -2520,6 +2726,8 @@ fn empty_sales_batch(schema: SchemaRef) -> RecordBatch {
 			Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
 			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
 			Arc::new(Int32Array::from(Vec::<Option<i32>>::new())),
+			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
+			Arc::new(Float32Array::from(Vec::<Option<f32>>::new())),
 			Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
 		],
 	)

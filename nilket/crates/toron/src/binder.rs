@@ -1171,10 +1171,10 @@ fn aggregate_type_mismatch_message(kernel: StableAggregateKernel, data_type: &Da
 			format!("AVG expects numeric input, got {data_type:?}")
 		}
 		StableAggregateKernel::Min => {
-			format!("MIN expects Int32 or Int64 input, got {data_type:?}")
+			format!("MIN expects Int32, Int64, Float32, or Float64 input, got {data_type:?}")
 		}
 		StableAggregateKernel::Max => {
-			format!("MAX expects Int32 or Int64 input, got {data_type:?}")
+			format!("MAX expects Int32, Int64, Float32, or Float64 input, got {data_type:?}")
 		}
 		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
 			unreachable!("COUNT accepts any input type")
@@ -1296,8 +1296,20 @@ fn coerce_comparison_literals(
 fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarValue {
 	match (value, target_type) {
 		(ScalarValue::Int32(value), DataType::Int64) => ScalarValue::Int64(value.map(i64::from)),
+		(ScalarValue::Int32(value), DataType::Float32) => {
+			ScalarValue::Float32(value.map(|value| value as f32))
+		}
 		(ScalarValue::Int32(value), DataType::Float64) => {
 			ScalarValue::Float64(value.map(f64::from))
+		}
+		(ScalarValue::Int64(value), DataType::Float32) => {
+			ScalarValue::Float32(value.map(|value| value as f32))
+		}
+		(ScalarValue::Int64(value), DataType::Float64) => {
+			ScalarValue::Float64(value.map(|value| value as f64))
+		}
+		(ScalarValue::Float64(value), DataType::Float32) => {
+			ScalarValue::Float32(value.map(|value| value as f32))
 		}
 		(value, _) => value,
 	}
