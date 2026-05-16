@@ -196,13 +196,112 @@ fn avg_aggregate_lowers_in_scalar_and_grouped_projections() {
 }
 
 #[test]
-fn group_by_projection_subset_reorder_alias_or_aggregate_first_rejects() {
+fn group_by_projection_subset_reorder_alias_or_aggregate_first_uses_project() {
 	for sql in [
 		"SELECT region, COUNT(*) FROM sales GROUP BY region, status",
 		"SELECT status, region, COUNT(*) FROM sales GROUP BY region, status",
 		"SELECT COUNT(*), region FROM sales GROUP BY region",
 		"SELECT region AS r, COUNT(*) FROM sales GROUP BY region",
 		"SELECT region, COUNT(*) AS n FROM sales GROUP BY region",
+	] {
+		assert_project_over_aggregate(&plan_sql(sql));
+	}
+}
+
+#[tokio::test]
+async fn post_aggregate_aliases_bind_to_final_schema_and_order_by() {
+	let (catalog, _) = fixture();
+	let logical =
+		plan_sql("SELECT region AS r, COUNT(*) AS n FROM sales GROUP BY region ORDER BY n DESC");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind aliased grouped aggregate");
+	assert_eq!(bound.schema().field(0).name(), "r");
+	assert_eq!(bound.schema().field(1).name(), "n");
+	let ExecutionPlan::Sort { order_by, .. } = bound else {
+		panic!("expected sort");
+	};
+	assert_eq!(order_by[0].ordinal, ColumnOrdinal(1));
+	assert!(order_by[0].descending);
+}
+
+#[tokio::test]
+async fn having_only_aggregate_does_not_leak_into_bound_output_schema() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 20");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind hidden HAVING aggregate");
+	assert_eq!(bound.schema().fields().len(), 1);
+	assert_eq!(bound.schema().field(0).name(), "region");
+}
+
+#[tokio::test]
+async fn existing_expr_surface_computed_aggregate_projection_binds() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT region, SUM(amount) > 10 AS large FROM sales GROUP BY region");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind computed aggregate projection");
+	assert_eq!(bound.schema().field(0).name(), "region");
+	assert_eq!(bound.schema().field(1).name(), "large");
+	assert_eq!(bound.schema().field(1).data_type(), &DataType::Boolean);
+}
+
+#[tokio::test]
+async fn scalar_aggregate_aliases_bind_to_final_schema_and_order_by() {
+	let (catalog, _) = fixture();
+	let count = bind(
+		&plan_sql("SELECT COUNT(*) AS n FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind scalar aggregate alias");
+	assert_eq!(count.schema().field(0).name(), "n");
+
+	let alias_sort = bind(
+		&plan_sql("SELECT SUM(amount) AS total FROM sales ORDER BY total"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind scalar aggregate ORDER BY alias");
+	let ExecutionPlan::Sort { order_by, .. } = alias_sort else {
+		panic!("expected scalar alias sort");
+	};
+	assert_eq!(order_by[0].ordinal, ColumnOrdinal(0));
+
+	let aggregate_call_sort = bind(
+		&plan_sql("SELECT SUM(amount) AS total FROM sales ORDER BY SUM(amount)"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind scalar aggregate ORDER BY visible aggregate");
+	assert_eq!(aggregate_call_sort.schema().field(0).name(), "total");
+	let ExecutionPlan::Sort { order_by, .. } = aggregate_call_sort else {
+		panic!("expected scalar aggregate-call sort");
+	};
+	assert_eq!(order_by[0].ordinal, ColumnOrdinal(0));
+
+	let having = bind(
+		&plan_sql("SELECT SUM(amount) AS total FROM sales HAVING SUM(amount) > 10"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind scalar aggregate alias with HAVING");
+	assert_eq!(having.schema().field(0).name(), "total");
+}
+
+#[test]
+fn deferred_arithmetic_and_computed_aggregate_arguments_still_reject() {
+	for sql in [
+		"SELECT SUM(amount) + 1 FROM sales",
+		"SELECT region, SUM(amount) * 1.1 FROM sales GROUP BY region",
+		"SELECT region, SUM(amount) + COUNT(*) FROM sales GROUP BY region",
+		"SELECT SUM(amount + tax) FROM sales",
 	] {
 		assert_unsupported(sql);
 	}
@@ -485,14 +584,13 @@ fn having_aggregate_rewrite_is_case_insensitive() {
 }
 
 #[test]
-fn having_aggregate_call_argument_must_match_projected_aggregate() {
-	assert_unsupported_message(
-		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(other_amount) > 1000",
-		"HAVING aggregate-call must appear in SELECT list",
-	);
+fn having_aggregate_call_argument_not_in_select_is_hidden_when_names_do_not_collide() {
+	let plan =
+		plan_sql("SELECT region, COUNT(*) FROM sales GROUP BY region HAVING SUM(amount) > 1000");
+	assert_project_over_aggregate(&plan);
 	assert_unsupported_message(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(sales.amount) > 10",
-		"HAVING aggregate-call must appear in SELECT list",
+		"qualified HAVING column references are not supported",
 	);
 }
 
@@ -500,7 +598,7 @@ fn having_aggregate_call_argument_must_match_projected_aggregate() {
 fn order_by_aggregate_call_argument_must_match_projected_aggregate() {
 	assert_unsupported_message(
 		"SELECT region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(other_amount)",
-		"ORDER BY aggregate-call must appear in SELECT list",
+		"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list",
 	);
 }
 
@@ -601,11 +699,9 @@ fn scalar_aggregate_order_by_ordinal_lowers_without_aggregate_rewrite() {
 }
 
 #[test]
-fn scalar_aggregate_having_ambiguity_is_rejected() {
-	assert_unsupported_message(
-		"SELECT COUNT(*), COUNT(*) FROM events HAVING COUNT(*) > 0",
-		"ambiguous HAVING aggregate-call",
-	);
+fn scalar_aggregate_having_duplicate_signature_is_deduplicated() {
+	let plan = plan_sql("SELECT COUNT(*), COUNT(*) FROM events HAVING COUNT(*) > 0");
+	assert_project_over_aggregate(&plan);
 }
 
 #[test]
@@ -620,16 +716,14 @@ fn scalar_aggregate_order_by_ambiguity_is_rejected() {
 fn scalar_aggregate_order_by_not_in_select_rejects() {
 	assert_unsupported_message(
 		"SELECT COUNT(*) FROM sales ORDER BY SUM(amount)",
-		"ORDER BY aggregate-call must appear in SELECT list",
+		"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list",
 	);
 }
 
 #[test]
-fn scalar_aggregate_having_not_in_select_rejects() {
-	assert_unsupported_message(
-		"SELECT COUNT(*) FROM sales HAVING SUM(amount) > 0",
-		"HAVING aggregate-call must appear in SELECT list",
-	);
+fn scalar_aggregate_having_not_in_select_is_computed_and_dropped() {
+	let plan = plan_sql("SELECT COUNT(*) FROM sales HAVING SUM(amount) > 0");
+	assert_project_over_aggregate(&plan);
 }
 
 #[test]
@@ -660,22 +754,46 @@ fn scalar_aggregate_having_experimental_aggregate_rejects() {
 }
 
 #[test]
-fn having_aggregate_call_must_appear_in_select_list() {
-	assert_unsupported_message(
-		"SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 100",
-		"HAVING aggregate-call must appear in SELECT list",
-	);
+fn having_aggregate_call_not_in_select_is_computed_and_dropped() {
+	let plan = plan_sql("SELECT region FROM sales GROUP BY region HAVING SUM(amount) > 100");
+	let LogicalPlan::Project {
+		input,
+		exprs,
+		output_names,
+	} = plan
+	else {
+		panic!("expected project dropping HAVING-only aggregate");
+	};
+	assert_eq!(exprs.len(), 1);
+	assert_eq!(output_names, vec![None]);
+	assert_column(&exprs[0], "region");
+	let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+		panic!("expected HAVING filter below project");
+	};
+	assert!(matches!(
+		predicate,
+		Expr::Gt(left, _)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "sum")
+	));
+	let LogicalPlan::Aggregate { aggr_expr, .. } = input.as_ref() else {
+		panic!("expected aggregate below filter");
+	};
+	assert_eq!(aggr_expr.len(), 1);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Sum));
 }
 
 #[test]
 fn having_aggregate_call_ambiguity_is_rejected() {
 	for sql in [
 		"SELECT region, COUNT(*), COUNT(amount) FROM sales GROUP BY region HAVING COUNT(*) > 5",
-		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 5",
 		"SELECT count, COUNT(amount) FROM events GROUP BY count HAVING COUNT(amount) > 0",
 	] {
 		assert_unsupported_message(sql, "ambiguous HAVING aggregate-call");
 	}
+	let duplicate_signature = plan_sql(
+		"SELECT region, COUNT(*), COUNT(*) FROM sales GROUP BY region HAVING COUNT(*) > 5",
+	);
+	assert_project_over_aggregate(&duplicate_signature);
 }
 
 #[test]
@@ -939,13 +1057,12 @@ fn min_max_aggregate_rejects_invalid_and_unselected_references() {
 	assert_unsupported_message("SELECT MIN() FROM sales", "MIN requires one argument");
 	assert_unsupported("SELECT MIN(*) FROM sales");
 	assert_unsupported("SELECT MIN(DISTINCT amount) FROM sales");
-	assert_unsupported_message(
+	assert_project_over_aggregate(&plan_sql(
 		"SELECT MIN(amount), MIN(amount) FROM sales HAVING MIN(amount) > 0",
-		"ambiguous HAVING aggregate-call",
-	);
+	));
 	assert_unsupported_message(
 		"SELECT MIN(amount) FROM sales ORDER BY MAX(id)",
-		"ORDER BY aggregate-call must appear in SELECT list",
+		"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list",
 	);
 }
 
@@ -954,13 +1071,12 @@ fn avg_aggregate_rejects_invalid_and_unselected_references() {
 	assert_unsupported_message("SELECT AVG() FROM sales", "AVG requires one argument");
 	assert_unsupported("SELECT AVG(*) FROM sales");
 	assert_unsupported("SELECT AVG(DISTINCT amount) FROM sales");
-	assert_unsupported_message(
+	assert_project_over_aggregate(&plan_sql(
 		"SELECT AVG(amount), AVG(amount) FROM sales HAVING AVG(amount) > 0",
-		"ambiguous HAVING aggregate-call",
-	);
+	));
 	assert_unsupported_message(
 		"SELECT AVG(amount) FROM sales ORDER BY SUM(amount)",
-		"ORDER BY aggregate-call must appear in SELECT list",
+		"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list",
 	);
 }
 
@@ -2114,6 +2230,7 @@ fn project_between_exchanges_sort_plan() -> LogicalPlan {
 					key: vec![Expr::column("region")],
 				}),
 				exprs: vec![Expr::column("region")],
+				output_names: vec![None],
 			}),
 			partition_count: 1,
 			key: Vec::new(),
@@ -2142,6 +2259,7 @@ fn filter_without_aggregate_between_exchanges_sort_plan() -> LogicalPlan {
 						key: vec![Expr::column("region")],
 					}),
 					exprs: vec![Expr::column("region")],
+					output_names: vec![None],
 				}),
 				predicate: Expr::Eq(
 					Box::new(Expr::column("region")),
@@ -2511,6 +2629,18 @@ fn assert_grouped_aggregate_over_exchange(plan: &LogicalPlan) {
 	assert_eq!(key.len(), 1);
 	assert_column(&key[0], "region");
 	assert!(matches!(input.as_ref(), LogicalPlan::ScanNamed { .. }));
+}
+
+fn assert_project_over_aggregate(plan: &LogicalPlan) {
+	let LogicalPlan::Project { input, .. } = plan else {
+		panic!("expected project over aggregate shape, got {plan:?}");
+	};
+	match input.as_ref() {
+		LogicalPlan::Aggregate { .. } => {}
+		LogicalPlan::Filter { input, .. }
+			if matches!(input.as_ref(), LogicalPlan::Aggregate { .. }) => {}
+		other => panic!("expected aggregate or filter over aggregate below project, got {other:?}"),
+	}
 }
 
 fn assert_scalar_sum_aggregate(plan: &LogicalPlan) {

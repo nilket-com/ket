@@ -26,6 +26,7 @@ fn existing_global_aggregates_byte_identical_after_accounting() {
 #[test]
 fn mixed_aggregate_and_non_aggregate_projection_without_group_by_rejects() {
 	assert_unsupported("SELECT region, SUM(amount) FROM sales");
+	assert_unsupported("SELECT region = 'west', SUM(amount) FROM sales");
 }
 
 #[test]

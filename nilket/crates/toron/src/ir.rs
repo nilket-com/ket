@@ -162,6 +162,7 @@ pub enum LogicalPlan {
 	Project {
 		input: Box<LogicalPlan>,
 		exprs: Vec<Expr>,
+		output_names: Vec<Option<String>>,
 	},
 	Aggregate {
 		input: Box<LogicalPlan>,
@@ -186,4 +187,21 @@ pub enum LogicalPlan {
 		on: Vec<(Expr, Expr)>,
 		strategy: JoinStrategy,
 	},
+}
+
+pub fn project_plan(
+	input: LogicalPlan,
+	exprs: Vec<Expr>,
+	output_names: Vec<Option<String>>,
+) -> LogicalPlan {
+	debug_assert_eq!(
+		exprs.len(),
+		output_names.len(),
+		"Project exprs/output_names length mismatch"
+	);
+	LogicalPlan::Project {
+		input: Box::new(input),
+		exprs,
+		output_names,
+	}
 }

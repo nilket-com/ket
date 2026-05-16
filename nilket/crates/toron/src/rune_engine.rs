@@ -194,10 +194,12 @@ impl RuneDataFrame {
 	}
 
 	pub fn project(self, exprs: Vec<RuneExpr>) -> Self {
+		let exprs = exprs.into_iter().map(|e| e.expr).collect::<Vec<_>>();
 		Self {
 			plan: LogicalPlan::Project {
 				input: Box::new(self.plan),
-				exprs: exprs.into_iter().map(|e| e.expr).collect(),
+				output_names: vec![None; exprs.len()],
+				exprs,
 			},
 		}
 	}

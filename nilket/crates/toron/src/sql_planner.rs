@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
@@ -93,14 +93,14 @@ impl SqlPlanner {
 
 		let LoweredSelect {
 			plan,
-			grouped_aggregate_scope,
+			aggregate_output_catalog,
 		} = match &**body {
 			SetExpr::Select(select) => self.lower_select(select)?,
 			_ => return Err(unsupported("unsupported query body")),
 		};
 
 		if let Some(order_by) = order_by {
-			let order_by = self.lower_order_by(order_by, grouped_aggregate_scope.as_ref())?;
+			let order_by = self.lower_order_by(order_by, aggregate_output_catalog.as_ref())?;
 			let limit = limit
 				.as_ref()
 				.map(parse_non_negative_usize_literal)
@@ -249,13 +249,19 @@ impl SqlPlanner {
 				.iter()
 				.map(|key| key.expr.clone())
 				.collect::<Vec<_>>();
-			let GroupedProjection {
+			let AggregateProjection {
 				aggr_expr,
-				grouped_scope,
-			} = self.lower_grouped_projection(projection, &group_keys)?;
+				catalog,
+				final_projection,
+			} = self.lower_aggregate_projection(
+				projection,
+				having.as_ref(),
+				&group_keys,
+				AggregateSqlMode::Grouped,
+			)?;
 			let having_predicate = having
 				.as_ref()
-				.map(|having| self.lower_having_predicate(having, &grouped_scope))
+				.map(|having| self.lower_having_predicate(having, &catalog))
 				.transpose()?;
 			if aggr_expr.is_empty() {
 				return Err(unsupported("GROUP BY requires at least one aggregate call"));
@@ -277,24 +283,41 @@ impl SqlPlanner {
 			} else {
 				aggregate
 			};
+			let plan = if let Some(final_projection) = final_projection {
+				LogicalPlan::Project {
+					input: Box::new(plan),
+					exprs: final_projection.exprs,
+					output_names: final_projection.output_names,
+				}
+			} else {
+				plan
+			};
 			return Ok(LoweredSelect {
 				plan,
-				grouped_aggregate_scope: Some(grouped_scope),
+				aggregate_output_catalog: Some(catalog),
 			});
 		}
 
 		if projection_contains_aggregate_call(projection) {
 			// P0.5: accepted global aggregates keep the pre-ADR single-stage shape; no
 			// distributed exchange is inserted for the accounting refactor.
-			let aggr_expr = self.lower_global_aggregate_projection(projection)?;
-			let scope = GroupedAggregateScope::from_projection(&[], &aggr_expr);
+			let AggregateProjection {
+				aggr_expr,
+				catalog,
+				final_projection,
+			} = self.lower_aggregate_projection(
+				projection,
+				having.as_ref(),
+				&[],
+				AggregateSqlMode::Global,
+			)?;
 			let aggregate = LogicalPlan::Aggregate {
 				input: Box::new(plan),
 				group_expr: vec![],
 				aggr_expr,
 			};
 			let plan = if let Some(having) = having.as_ref() {
-				let predicate = self.lower_having_predicate(having, &scope)?;
+				let predicate = self.lower_having_predicate(having, &catalog)?;
 				LogicalPlan::Filter {
 					input: Box::new(aggregate),
 					predicate,
@@ -302,24 +325,39 @@ impl SqlPlanner {
 			} else {
 				aggregate
 			};
+			let plan = if let Some(final_projection) = final_projection {
+				LogicalPlan::Project {
+					input: Box::new(plan),
+					exprs: final_projection.exprs,
+					output_names: final_projection.output_names,
+				}
+			} else {
+				plan
+			};
 			return Ok(LoweredSelect {
 				plan,
-				grouped_aggregate_scope: Some(scope),
+				aggregate_output_catalog: Some(catalog),
 			});
 		}
 
 		if matches!(projection.as_slice(), [SelectItem::Wildcard(_)]) {
 			return Ok(LoweredSelect {
 				plan,
-				grouped_aggregate_scope: None,
+				aggregate_output_catalog: None,
 			});
 		}
 
 		let mut exprs = Vec::new();
+		let mut output_names = Vec::new();
 		for item in projection {
 			match item {
 				SelectItem::UnnamedExpr(sql_expr) => {
 					exprs.push(self.lower_expr(sql_expr)?);
+					output_names.push(None);
+				}
+				SelectItem::ExprWithAlias { expr, alias } => {
+					exprs.push(self.lower_expr(expr)?);
+					output_names.push(Some(alias.value.clone()));
 				}
 				SelectItem::Wildcard(_) => {
 					return Err(unsupported("mixed wildcard projections are not supported"));
@@ -332,15 +370,16 @@ impl SqlPlanner {
 			plan: LogicalPlan::Project {
 				input: Box::new(plan),
 				exprs,
+				output_names,
 			},
-			grouped_aggregate_scope: None,
+			aggregate_output_catalog: None,
 		})
 	}
 
 	fn lower_order_by(
 		&self,
 		order_by: &OrderBy,
-		scope: Option<&GroupedAggregateScope>,
+		scope: Option<&AggregateOutputCatalog>,
 	) -> Result<Vec<SortExpr>, FrontendError> {
 		if order_by.interpolate.is_some() {
 			return Err(unsupported("ORDER BY INTERPOLATE is not supported"));
@@ -407,68 +446,51 @@ impl SqlPlanner {
 		}
 	}
 
-	fn lower_global_aggregate_projection(
+	fn lower_aggregate_projection(
 		&self,
 		projection: &[SelectItem],
-	) -> Result<Vec<(AggregateFunction, Vec<Expr>)>, FrontendError> {
-		projection
-			.iter()
-			.map(|item| match item {
-				SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-					self.lower_aggregate_function(function, AggregateSqlMode::Global)
-				}
-				_ => Err(unsupported("unsupported aggregate projection item")),
-			})
-			.collect()
-	}
-
-	fn lower_grouped_projection(
-		&self,
-		projection: &[SelectItem],
+		having: Option<&SqlExpr>,
 		group_keys: &[GroupKey],
-	) -> Result<GroupedProjection, FrontendError> {
-		for (index, key) in group_keys.iter().enumerate() {
-			let item = projection.get(index).ok_or_else(|| {
-				unsupported("GROUP BY projection must list all keys in order before aggregates")
-			})?;
-			let projected = projection_group_key_name(item)?;
-			if projected != key.name {
-				return Err(unsupported(
-					"GROUP BY projection must list all keys in order before aggregates",
-				));
-			}
+		mode: AggregateSqlMode,
+	) -> Result<AggregateProjection, FrontendError> {
+		if matches!(mode, AggregateSqlMode::Global) {
+			reject_global_aggregate_projection_columns(projection)?;
 		}
-
-		let aggr_expr = projection
-			.iter()
-			.skip(group_keys.len())
-			.map(|item| match item {
-				SelectItem::UnnamedExpr(SqlExpr::Function(function)) => {
-					self.lower_aggregate_function(function, AggregateSqlMode::Grouped)
-				}
-				_ => Err(unsupported(
-					"GROUP BY projection must list all keys in order before aggregates",
-				)),
-			})
-			.collect::<Result<Vec<_>, _>>()?;
-
-		if aggr_expr.is_empty() {
-			return Ok(GroupedProjection {
-				aggr_expr,
-				grouped_scope: GroupedAggregateScope::from_projection(group_keys, &[]),
-			});
+		let mut catalog = AggregateOutputCatalog::new(group_keys);
+		for item in projection {
+			self.discover_select_aggregates(item, mode, &mut catalog)?;
 		}
-		let grouped_scope = GroupedAggregateScope::from_projection(group_keys, &aggr_expr);
-		Ok(GroupedProjection {
+		if let Some(having) = having {
+			reject_qualified_having_column_references(having)?;
+			self.discover_aggregate_calls(having, mode, AggregateSource::Having, &mut catalog)?;
+		}
+		catalog.reject_having_alias_references(having)?;
+
+		let final_projection = self.lower_final_aggregate_projection(projection, mode, &catalog)?;
+		let project_required = final_projection.required;
+		let aggr_expr = catalog.aggr_expr();
+		let mut catalog = catalog;
+		let final_output_names = if project_required {
+			final_projection.derived_output_names()
+		} else {
+			catalog.natural_output_names()
+		};
+		catalog.set_final_output_names(final_output_names);
+
+		Ok(AggregateProjection {
 			aggr_expr,
-			grouped_scope,
+			catalog,
+			final_projection: project_required.then_some(FinalProjection {
+				exprs: final_projection.exprs,
+				output_names: final_projection.output_names,
+			}),
 		})
 	}
 
 	fn lower_having_predicate(
 		&self,
 		having: &SqlExpr,
-		scope: &GroupedAggregateScope,
+		scope: &AggregateOutputCatalog,
 	) -> Result<Expr, FrontendError> {
 		reject_qualified_having_column_references(having)?;
 		let rewritten = self.rewrite_grouped_aggregate_calls(having, scope, "HAVING")?;
@@ -478,7 +500,7 @@ impl SqlPlanner {
 	fn rewrite_grouped_aggregate_calls(
 		&self,
 		expr: &SqlExpr,
-		scope: &GroupedAggregateScope,
+		scope: &AggregateOutputCatalog,
 		clause: &'static str,
 	) -> Result<SqlExpr, FrontendError> {
 		match expr {
@@ -508,19 +530,189 @@ impl SqlPlanner {
 	fn resolve_grouped_aggregate_reference(
 		&self,
 		function: &Function,
-		scope: &GroupedAggregateScope,
+		scope: &AggregateOutputCatalog,
 		clause: &'static str,
 	) -> Result<String, FrontendError> {
 		let (function, args) =
 			self.lower_aggregate_function(function, AggregateSqlMode::Grouped)?;
 		let signature = grouped_aggregate_signature(&function, &args)
 			.ok_or_else(|| unsupported(aggregate_call_not_in_select_message(clause)))?;
-		match scope.resolve(&signature) {
+		let outcome = match clause {
+			"HAVING" => scope.resolve_for_having(&signature),
+			"ORDER BY" => scope.resolve_for_order_by(&signature),
+			_ => unreachable!("unsupported grouped aggregate clause: {clause}"),
+		};
+		match outcome {
 			ResolveOutcome::Found(output_name) => Ok(output_name),
 			ResolveOutcome::NotInSelect => {
 				Err(unsupported(aggregate_call_not_in_select_message(clause)))
 			}
 			ResolveOutcome::Ambiguous => Err(unsupported(ambiguous_aggregate_call_message(clause))),
+		}
+	}
+
+	fn discover_select_aggregates(
+		&self,
+		item: &SelectItem,
+		mode: AggregateSqlMode,
+		catalog: &mut AggregateOutputCatalog,
+	) -> Result<(), FrontendError> {
+		let (expr, alias) = select_item_expr_and_alias(item)?;
+		if let Some(alias) = alias {
+			catalog.add_select_alias(alias);
+		}
+		if let SqlExpr::Function(function) = strip_nested_sql_expr(expr) {
+			if aggregate_function_name(&function.name).is_some() {
+				let (function, args) = self.lower_aggregate_function(function, mode)?;
+				let visible_name = alias
+					.map(|alias| alias.value.clone())
+					.unwrap_or_else(|| aggregate_output_name(&function).to_string());
+				let index = catalog.add_requirement(function, args, AggregateSource::Select);
+				catalog.mark_order_by_visible(index, visible_name);
+				return Ok(());
+			}
+		}
+		self.discover_aggregate_calls(expr, mode, AggregateSource::Select, catalog)
+	}
+
+	fn discover_aggregate_calls(
+		&self,
+		expr: &SqlExpr,
+		mode: AggregateSqlMode,
+		source: AggregateSource,
+		catalog: &mut AggregateOutputCatalog,
+	) -> Result<(), FrontendError> {
+		match strip_nested_sql_expr(expr) {
+			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+				let (function, args) = self.lower_aggregate_function(function, mode)?;
+				catalog.add_requirement(function, args, source);
+				Ok(())
+			}
+			SqlExpr::Function(function) => {
+				if let FunctionArguments::List(list) = &function.args {
+					for arg in &list.args {
+						match arg {
+							FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+							| FunctionArg::Named {
+								arg: FunctionArgExpr::Expr(expr),
+								..
+							}
+							| FunctionArg::ExprNamed {
+								arg: FunctionArgExpr::Expr(expr),
+								..
+							} => self.discover_aggregate_calls(expr, mode, source, catalog)?,
+							FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {}
+							_ => {}
+						}
+					}
+				}
+				Ok(())
+			}
+			SqlExpr::BinaryOp { left, right, .. } => {
+				self.discover_aggregate_calls(left, mode, source, catalog)?;
+				self.discover_aggregate_calls(right, mode, source, catalog)
+			}
+			SqlExpr::UnaryOp { expr, .. }
+			| SqlExpr::IsNull(expr)
+			| SqlExpr::IsNotNull(expr)
+			| SqlExpr::Nested(expr) => self.discover_aggregate_calls(expr, mode, source, catalog),
+			_ => Ok(()),
+		}
+	}
+
+	fn lower_final_aggregate_projection(
+		&self,
+		projection: &[SelectItem],
+		mode: AggregateSqlMode,
+		catalog: &AggregateOutputCatalog,
+	) -> Result<LoweredAggregateProjection, FrontendError> {
+		for item in projection {
+			let (expr, _) = select_item_expr_and_alias(item)?;
+			reject_qualified_aggregate_projection_references(expr)?;
+		}
+		let has_alias = projection
+			.iter()
+			.map(select_item_expr_and_alias)
+			.collect::<Result<Vec<_>, _>>()?
+			.iter()
+			.any(|(_, alias)| alias.is_some());
+		let has_computed_expression = projection
+			.iter()
+			.map(select_item_expr_and_alias)
+			.collect::<Result<Vec<_>, _>>()?
+			.iter()
+			.any(|(expr, _)| select_expr_is_computed(expr));
+		let natural_projection =
+			aggregate_projection_matches_natural(projection, mode, catalog, self)?;
+		let has_having_only_aggregate = catalog
+			.entries
+			.iter()
+			.any(|entry| entry.in_having && !entry.in_select);
+		let required = has_alias
+			|| has_computed_expression
+			|| !natural_projection
+			|| has_having_only_aggregate;
+
+		if !required {
+			return Ok(LoweredAggregateProjection {
+				exprs: Vec::new(),
+				output_names: Vec::new(),
+				required,
+			});
+		}
+
+		let mut exprs = Vec::with_capacity(projection.len());
+		let mut output_names = Vec::with_capacity(projection.len());
+		for item in projection {
+			let (sql_expr, alias) = select_item_expr_and_alias(item)?;
+			let rewritten = self.rewrite_aggregate_calls_for_projection(sql_expr, mode, catalog)?;
+			exprs.push(self.lower_expr(&rewritten)?);
+			output_names.push(alias.map(|alias| alias.value.clone()));
+		}
+
+		Ok(LoweredAggregateProjection {
+			exprs,
+			output_names,
+			required,
+		})
+	}
+
+	fn rewrite_aggregate_calls_for_projection(
+		&self,
+		expr: &SqlExpr,
+		mode: AggregateSqlMode,
+		catalog: &AggregateOutputCatalog,
+	) -> Result<SqlExpr, FrontendError> {
+		match expr {
+			SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+				let (function, args) = self.lower_aggregate_function(function, mode)?;
+				let signature = grouped_aggregate_signature(&function, &args)
+					.ok_or_else(|| unsupported("unsupported aggregate projection item"))?;
+				match catalog.resolve_for_projection(&signature) {
+					ResolveOutcome::Found(output_name) => {
+						Ok(SqlExpr::Identifier(Ident::new(output_name)))
+					}
+					ResolveOutcome::NotInSelect => {
+						Err(unsupported("unsupported aggregate projection item"))
+					}
+					ResolveOutcome::Ambiguous => Err(unsupported("ambiguous aggregate projection")),
+				}
+			}
+			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
+				left: Box::new(self.rewrite_aggregate_calls_for_projection(left, mode, catalog)?),
+				op: op.clone(),
+				right: Box::new(self.rewrite_aggregate_calls_for_projection(right, mode, catalog)?),
+			}),
+			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
+				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
+			))),
+			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
+				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
+			))),
+			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
+				self.rewrite_aggregate_calls_for_projection(inner, mode, catalog)?,
+			))),
+			_ => Ok(expr.clone()),
 		}
 	}
 
@@ -930,79 +1122,225 @@ struct GroupKey {
 #[derive(Debug)]
 struct LoweredSelect {
 	plan: LogicalPlan,
-	grouped_aggregate_scope: Option<GroupedAggregateScope>,
+	aggregate_output_catalog: Option<AggregateOutputCatalog>,
 }
 
 #[derive(Debug)]
-struct GroupedProjection {
+struct AggregateProjection {
 	aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
-	grouped_scope: GroupedAggregateScope,
+	catalog: AggregateOutputCatalog,
+	final_projection: Option<FinalProjection>,
 }
 
 #[derive(Debug)]
-struct GroupedAggregateScope {
-	entries: Vec<GroupedAggregateEntry>,
-	output_name_counts: HashMap<String, usize>,
+struct FinalProjection {
+	exprs: Vec<Expr>,
+	output_names: Vec<Option<String>>,
 }
 
-impl GroupedAggregateScope {
-	fn from_projection(
-		group_keys: &[GroupKey],
-		aggr_expr: &[(AggregateFunction, Vec<Expr>)],
-	) -> Self {
-		let mut output_name_counts = HashMap::new();
-		for key in group_keys {
-			*output_name_counts.entry(key.name.clone()).or_insert(0) += 1;
-		}
+#[derive(Debug)]
+struct LoweredAggregateProjection {
+	exprs: Vec<Expr>,
+	output_names: Vec<Option<String>>,
+	required: bool,
+}
 
-		let mut entries = Vec::new();
-		for (function, args) in aggr_expr {
-			let output_name = aggregate_output_name(function).to_string();
-			*output_name_counts.entry(output_name.clone()).or_insert(0) += 1;
-			if let Some(signature) = grouped_aggregate_signature(function, args) {
-				entries.push(GroupedAggregateEntry {
-					signature,
-					output_name,
-				});
-			}
+impl LoweredAggregateProjection {
+	fn derived_output_names(&self) -> Vec<String> {
+		self.exprs
+			.iter()
+			.enumerate()
+			.map(|(idx, expr)| {
+				self.output_names[idx]
+					.clone()
+					.unwrap_or_else(|| logical_expr_output_name(expr, idx))
+			})
+			.collect()
+	}
+}
+
+#[derive(Debug)]
+struct AggregateOutputCatalog {
+	group_keys: Vec<GroupKey>,
+	entries: Vec<AggregateOutputEntry>,
+	natural_output_name_counts: HashMap<String, usize>,
+	final_output_name_counts: HashMap<String, usize>,
+	select_aliases: HashSet<String>,
+}
+
+impl AggregateOutputCatalog {
+	fn new(group_keys: &[GroupKey]) -> Self {
+		let mut natural_output_name_counts = HashMap::new();
+		for key in group_keys {
+			*natural_output_name_counts
+				.entry(key.name.clone())
+				.or_insert(0) += 1;
 		}
 
 		Self {
-			entries,
-			output_name_counts,
+			group_keys: group_keys.to_vec(),
+			entries: Vec::new(),
+			natural_output_name_counts,
+			final_output_name_counts: HashMap::new(),
+			select_aliases: HashSet::new(),
 		}
 	}
 
-	fn resolve(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
-		let matches = self
-			.entries
+	fn add_requirement(
+		&mut self,
+		function: AggregateFunction,
+		args: Vec<Expr>,
+		source: AggregateSource,
+	) -> usize {
+		let signature = grouped_aggregate_signature(&function, &args);
+		if let Some(signature) = signature.as_ref() {
+			if let Some(index) = self
+				.entries
+				.iter()
+				.position(|entry| entry.signature.as_ref() == Some(signature))
+			{
+				self.entries[index].mark_source(source);
+				return index;
+			}
+		}
+
+		let natural_name = aggregate_output_name(&function).to_string();
+		*self
+			.natural_output_name_counts
+			.entry(natural_name.clone())
+			.or_insert(0) += 1;
+		let index = self.entries.len();
+		self.entries.push(AggregateOutputEntry {
+			function,
+			args,
+			signature,
+			natural_name,
+			in_select: matches!(source, AggregateSource::Select),
+			in_having: matches!(source, AggregateSource::Having),
+			order_by_visible_names: Vec::new(),
+		});
+		index
+	}
+
+	fn add_select_alias(&mut self, alias: &Ident) {
+		self.select_aliases.insert(alias.value.clone());
+	}
+
+	fn mark_order_by_visible(&mut self, index: usize, output_name: String) {
+		if let Some(entry) = self.entries.get_mut(index) {
+			if !entry.order_by_visible_names.contains(&output_name) {
+				entry.order_by_visible_names.push(output_name);
+			}
+		}
+	}
+
+	fn aggr_expr(&self) -> Vec<(AggregateFunction, Vec<Expr>)> {
+		self.entries
 			.iter()
-			.filter(|entry| &entry.signature == signature)
-			.collect::<Vec<_>>();
-		let [entry] = matches.as_slice() else {
-			return if matches.is_empty() {
-				ResolveOutcome::NotInSelect
-			} else {
-				ResolveOutcome::Ambiguous
-			};
+			.map(|entry| (entry.function.clone(), entry.args.clone()))
+			.collect()
+	}
+
+	fn natural_output_names(&self) -> Vec<String> {
+		self.group_keys
+			.iter()
+			.map(|key| key.name.clone())
+			.chain(self.entries.iter().map(|entry| entry.natural_name.clone()))
+			.collect()
+	}
+
+	fn set_final_output_names(&mut self, names: Vec<String>) {
+		self.final_output_name_counts.clear();
+		for name in names {
+			*self.final_output_name_counts.entry(name).or_insert(0) += 1;
+		}
+	}
+
+	fn resolve_for_projection(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
+		self.resolve_natural(signature)
+	}
+
+	fn resolve_for_having(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
+		self.resolve_natural(signature)
+	}
+
+	fn resolve_natural(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
+		let Some(entry) = self.entry_for_signature(signature) else {
+			return ResolveOutcome::NotInSelect;
 		};
 		if self
-			.output_name_counts
-			.get(&entry.output_name)
+			.natural_output_name_counts
+			.get(&entry.natural_name)
 			.copied()
 			.unwrap_or(0)
 			> 1
 		{
 			return ResolveOutcome::Ambiguous;
 		}
-		ResolveOutcome::Found(entry.output_name.clone())
+		ResolveOutcome::Found(entry.natural_name.clone())
+	}
+
+	fn resolve_for_order_by(&self, signature: &GroupedAggregateSignature) -> ResolveOutcome {
+		let Some(entry) = self.entry_for_signature(signature) else {
+			return ResolveOutcome::NotInSelect;
+		};
+		let [output_name] = entry.order_by_visible_names.as_slice() else {
+			return if entry.order_by_visible_names.is_empty() {
+				ResolveOutcome::NotInSelect
+			} else {
+				ResolveOutcome::Ambiguous
+			};
+		};
+		if self
+			.final_output_name_counts
+			.get(output_name)
+			.copied()
+			.unwrap_or(0)
+			> 1
+		{
+			return ResolveOutcome::Ambiguous;
+		}
+		ResolveOutcome::Found(output_name.clone())
+	}
+
+	fn entry_for_signature(
+		&self,
+		signature: &GroupedAggregateSignature,
+	) -> Option<&AggregateOutputEntry> {
+		self.entries
+			.iter()
+			.find(|entry| entry.signature.as_ref() == Some(signature))
+	}
+
+	fn reject_having_alias_references(
+		&self,
+		having: Option<&SqlExpr>,
+	) -> Result<(), FrontendError> {
+		let Some(having) = having else {
+			return Ok(());
+		};
+		reject_having_alias_references(having, &self.select_aliases)
 	}
 }
 
 #[derive(Debug)]
-struct GroupedAggregateEntry {
-	signature: GroupedAggregateSignature,
-	output_name: String,
+struct AggregateOutputEntry {
+	function: AggregateFunction,
+	args: Vec<Expr>,
+	signature: Option<GroupedAggregateSignature>,
+	natural_name: String,
+	in_select: bool,
+	in_having: bool,
+	order_by_visible_names: Vec<String>,
+}
+
+impl AggregateOutputEntry {
+	fn mark_source(&mut self, source: AggregateSource) {
+		match source {
+			AggregateSource::Select => self.in_select = true,
+			AggregateSource::Having => self.in_having = true,
+		}
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1020,6 +1358,12 @@ enum ResolveOutcome {
 	Found(String),
 	NotInSelect,
 	Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AggregateSource {
+	Select,
+	Having,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1072,14 +1416,78 @@ fn reject_qualified_having_column_references(expr: &SqlExpr) -> Result<(), Front
 		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
 			reject_qualified_having_column_references(inner)
 		}
+		SqlExpr::Function(function) => {
+			if let FunctionArguments::List(list) = &function.args {
+				for arg in &list.args {
+					if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+						reject_qualified_having_column_references(expr)?;
+					}
+				}
+			}
+			Ok(())
+		}
 		_ => Ok(()),
 	}
+}
+
+fn reject_having_alias_references(
+	expr: &SqlExpr,
+	select_aliases: &HashSet<String>,
+) -> Result<(), FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(ident) if select_aliases.contains(&ident.value) => {
+			Err(unsupported(having_alias_message()))
+		}
+		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => Ok(()),
+		SqlExpr::BinaryOp { left, right, .. } => {
+			reject_having_alias_references(left, select_aliases)?;
+			reject_having_alias_references(right, select_aliases)
+		}
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => reject_having_alias_references(expr, select_aliases),
+		_ => Ok(()),
+	}
+}
+
+fn reject_qualified_aggregate_projection_references(expr: &SqlExpr) -> Result<(), FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::CompoundIdentifier(_) => Err(unsupported(
+			"qualified aggregate projection references are not supported",
+		)),
+		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+			if let FunctionArguments::List(list) = &function.args {
+				for arg in &list.args {
+					if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg {
+						reject_qualified_aggregate_projection_references(expr)?;
+					}
+				}
+			}
+			Ok(())
+		}
+		SqlExpr::BinaryOp { left, right, .. } => {
+			reject_qualified_aggregate_projection_references(left)?;
+			reject_qualified_aggregate_projection_references(right)
+		}
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => reject_qualified_aggregate_projection_references(expr),
+		_ => Ok(()),
+	}
+}
+
+fn having_alias_message() -> &'static str {
+	"HAVING does not resolve SELECT aliases; spell the aggregate explicitly"
 }
 
 fn aggregate_call_not_in_select_message(clause: &str) -> &'static str {
 	match clause {
 		"HAVING" => "HAVING aggregate-call must appear in SELECT list",
-		"ORDER BY" => "ORDER BY aggregate-call must appear in SELECT list",
+		"ORDER BY" => {
+			"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list"
+		}
 		other => unreachable!("unsupported grouped aggregate clause: {other}"),
 	}
 }
@@ -1092,14 +1500,31 @@ fn ambiguous_aggregate_call_message(clause: &str) -> &'static str {
 	}
 }
 
-fn projection_group_key_name(item: &SelectItem) -> Result<&str, FrontendError> {
-	// P0.2: the exact no-post-project shape is SelectItem::UnnamedExpr(Identifier)
-	// for keys and SelectItem::UnnamedExpr(Function) for aggregate calls.
+fn select_item_expr_and_alias(
+	item: &SelectItem,
+) -> Result<(&SqlExpr, Option<&Ident>), FrontendError> {
 	match item {
-		SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => Ok(ident.value.as_str()),
-		_ => Err(unsupported(
-			"GROUP BY projection must list all keys in order before aggregates",
+		SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
+		SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias))),
+		SelectItem::Wildcard(_) => Err(unsupported("mixed wildcard projections are not supported")),
+		SelectItem::QualifiedWildcard(_, _) => Err(unsupported(
+			"qualified wildcard projections are not supported",
 		)),
+	}
+}
+
+fn select_expr_is_computed(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => false,
+		SqlExpr::Function(function) => aggregate_function_name(&function.name).is_none(),
+		_ => true,
+	}
+}
+
+fn logical_expr_output_name(expr: &Expr, idx: usize) -> String {
+	match expr {
+		Expr::Column(column) => column.name.0.clone(),
+		_ => format!("col_{idx}"),
 	}
 }
 
@@ -1118,8 +1543,119 @@ fn select_item_contains_aggregate_call(item: &SelectItem) -> bool {
 fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 	match strip_nested_sql_expr(expr) {
 		SqlExpr::Function(function) => aggregate_function_name(&function.name).is_some(),
+		SqlExpr::BinaryOp { left, right, .. } => {
+			expr_contains_aggregate_call(left) || expr_contains_aggregate_call(right)
+		}
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => expr_contains_aggregate_call(expr),
 		_ => false,
 	}
+}
+
+fn reject_global_aggregate_projection_columns(
+	projection: &[SelectItem],
+) -> Result<(), FrontendError> {
+	for item in projection {
+		let (expr, _) = select_item_expr_and_alias(item)?;
+		if expr_contains_nonaggregate_column_reference(expr) {
+			return Err(unsupported("unsupported aggregate projection item"));
+		}
+	}
+	Ok(())
+}
+
+fn expr_contains_nonaggregate_column_reference(expr: &SqlExpr) -> bool {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => true,
+		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => false,
+		SqlExpr::Function(function) => {
+			function_args_contain_nonaggregate_column_reference(function)
+		}
+		SqlExpr::BinaryOp { left, right, .. } => {
+			expr_contains_nonaggregate_column_reference(left)
+				|| expr_contains_nonaggregate_column_reference(right)
+		}
+		SqlExpr::UnaryOp { expr, .. }
+		| SqlExpr::IsNull(expr)
+		| SqlExpr::IsNotNull(expr)
+		| SqlExpr::Nested(expr) => expr_contains_nonaggregate_column_reference(expr),
+		_ => false,
+	}
+}
+
+fn function_args_contain_nonaggregate_column_reference(function: &Function) -> bool {
+	let FunctionArguments::List(list) = &function.args else {
+		return false;
+	};
+	list.args.iter().any(|arg| match arg {
+		FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+		| FunctionArg::Named {
+			arg: FunctionArgExpr::Expr(expr),
+			..
+		}
+		| FunctionArg::ExprNamed {
+			arg: FunctionArgExpr::Expr(expr),
+			..
+		} => expr_contains_nonaggregate_column_reference(expr),
+		_ => false,
+	})
+}
+
+fn aggregate_projection_matches_natural(
+	projection: &[SelectItem],
+	mode: AggregateSqlMode,
+	catalog: &AggregateOutputCatalog,
+	planner: &SqlPlanner,
+) -> Result<bool, FrontendError> {
+	if projection.len() != catalog.group_keys.len() + catalog.entries.len() {
+		return Ok(false);
+	}
+
+	for item in projection {
+		if matches!(item, SelectItem::ExprWithAlias { .. }) {
+			return Ok(false);
+		}
+	}
+
+	for (item, key) in projection.iter().zip(catalog.group_keys.iter()) {
+		let SelectItem::UnnamedExpr(expr) = item else {
+			return Ok(false);
+		};
+		let SqlExpr::Identifier(ident) = strip_nested_sql_expr(expr) else {
+			return Ok(false);
+		};
+		if ident.value != key.name {
+			return Ok(false);
+		}
+	}
+
+	for (item, entry) in projection
+		.iter()
+		.skip(catalog.group_keys.len())
+		.zip(&catalog.entries)
+	{
+		let SelectItem::UnnamedExpr(expr) = item else {
+			return Ok(false);
+		};
+		let SqlExpr::Function(function) = strip_nested_sql_expr(expr) else {
+			return Ok(false);
+		};
+		if aggregate_function_name(&function.name).is_none() {
+			return Ok(false);
+		}
+		let (function, args) = planner.lower_aggregate_function(function, mode)?;
+		let signature = grouped_aggregate_signature(&function, &args);
+		if entry.signature.is_some() && signature != entry.signature {
+			return Ok(false);
+		}
+		if entry.signature.is_none() && signature.is_some() {
+			return Ok(false);
+		}
+	}
+
+	Ok(true)
 }
 
 fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
@@ -1234,7 +1770,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			input,
 			predicate: _,
 		}
-		| LogicalPlan::Project { input, exprs: _ }
+		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Aggregate {
 			input,
 			group_expr: _,

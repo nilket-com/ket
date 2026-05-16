@@ -21,10 +21,16 @@ fn bare_wildcard_projection_stays_byte_identical() {
 fn explicit_projection_stays_byte_identical() {
 	let plan = plan_sql("SELECT region, amount FROM sales WHERE amount > 10");
 
-	let LogicalPlan::Project { input, exprs } = plan else {
+	let LogicalPlan::Project {
+		input,
+		exprs,
+		output_names,
+	} = plan
+	else {
 		panic!("expected project");
 	};
 	assert_eq!(exprs.len(), 2);
+	assert_eq!(output_names, vec![None, None]);
 	assert_column(&exprs[0], "region");
 	assert_column(&exprs[1], "amount");
 
@@ -67,10 +73,16 @@ fn qualified_wildcard_mixed_before_unqualified_wildcard_rejects() {
 fn explicit_projection_still_lowers() {
 	let plan = plan_sql("SELECT region FROM sales");
 
-	let LogicalPlan::Project { input, exprs } = plan else {
+	let LogicalPlan::Project {
+		input,
+		exprs,
+		output_names,
+	} = plan
+	else {
 		panic!("expected project");
 	};
 	assert_eq!(exprs.len(), 1);
+	assert_eq!(output_names, vec![None]);
 	assert_column(&exprs[0], "region");
 	assert!(matches!(
 		input.as_ref(),
@@ -79,6 +91,23 @@ fn explicit_projection_still_lowers() {
 			projection: None,
 		} if table.schema.is_none() && table.table == "sales"
 	));
+}
+
+#[test]
+fn non_aggregate_alias_flows_into_project_output_names() {
+	let plan = plan_sql("SELECT amount AS a FROM sales");
+
+	let LogicalPlan::Project {
+		exprs,
+		output_names,
+		..
+	} = plan
+	else {
+		panic!("expected project");
+	};
+	assert_eq!(exprs.len(), 1);
+	assert_column(&exprs[0], "amount");
+	assert_eq!(output_names, vec![Some("a".to_string())]);
 }
 
 #[test]

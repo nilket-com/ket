@@ -221,7 +221,11 @@ impl Executor {
 					}
 					Ok(output)
 				}
-				LogicalPlan::Project { input, exprs } => {
+				LogicalPlan::Project {
+					input,
+					exprs,
+					output_names,
+				} => {
 					let input_batches = self.execute(input, morsel).await?;
 					let mut output = Vec::new();
 					for batch in input_batches {
@@ -231,7 +235,10 @@ impl Executor {
 							let array = self.evaluate_expr(expr, &batch)?;
 							cols.push(array.clone());
 							let field = arrow::datatypes::Field::new(
-								format!("col_{}", i),
+								output_names
+									.get(i)
+									.and_then(|name| name.clone())
+									.unwrap_or_else(|| format!("col_{i}")),
 								array.data_type().clone(),
 								true, // Simplified
 							);
@@ -584,23 +591,20 @@ impl Executor {
 					}
 					Ok(output)
 				}
-				ExecutionPlan::Project { input, exprs, .. } => {
+				ExecutionPlan::Project {
+					input,
+					exprs,
+					output_schema,
+				} => {
 					let input_batches = self.execute_bound(input, morsel).await?;
 					let mut output = Vec::new();
 					for batch in input_batches {
 						let mut cols = Vec::new();
-						let mut fields = Vec::new();
-						for (i, expr) in exprs.iter().enumerate() {
+						for expr in exprs {
 							let array = self.evaluate_bound_expr(expr, &batch)?;
 							cols.push(array.clone());
-							fields.push(arrow::datatypes::Field::new(
-								format!("col_{i}"),
-								array.data_type().clone(),
-								true,
-							));
 						}
-						let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-						output.push(RecordBatch::try_new(schema, cols)?);
+						output.push(RecordBatch::try_new(output_schema.clone(), cols)?);
 					}
 					Ok(output)
 				}
@@ -3934,6 +3938,7 @@ mod tests {
 					Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 				),
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::column("id")],
 		};
 

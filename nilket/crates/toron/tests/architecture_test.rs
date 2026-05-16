@@ -109,6 +109,7 @@ async fn experimental_kernels_are_gated() {
 			table: TableId(1),
 			projection: None,
 		}),
+		output_names: vec![None],
 		exprs: vec![Expr::TimeBucket(
 			std::time::Duration::from_secs(60),
 			Box::new(Expr::column("ts")),
@@ -351,9 +352,11 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 	let logical_plan = logical_source
 		.split("pub enum LogicalPlan")
 		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
 	assert_eq!(enum_variant_count(logical_plan), 9);
 	assert!(logical_plan.contains("Sort {"));
+	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
 	assert!(logical_source.contains("pub struct SortExpr"));
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
@@ -573,12 +576,17 @@ fn bind_expr_remains_aggregate_free() {
 fn adr017_order_by_aggregate_call_guards_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
-	assert!(planner.contains("ORDER BY aggregate-call must appear in SELECT list"));
+	assert!(
+		planner.contains(
+			"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list"
+		)
+	);
 	assert!(planner.contains("ambiguous ORDER BY aggregate-call"));
 	assert!(planner.contains("qualified HAVING column references are not supported"));
 	assert!(planner.contains("struct LoweredSelect"));
-	assert!(planner.contains("grouped_aggregate_scope: Option<GroupedAggregateScope>"));
+	assert!(planner.contains("aggregate_output_catalog: Option<AggregateOutputCatalog>"));
 	assert!(planner.contains("fn rewrite_grouped_aggregate_calls"));
+	assert!(planner.contains("struct AggregateOutputCatalog"));
 	assert!(!planner.contains("HavingAggregateScope"));
 	assert!(!planner.contains("rewrite_having_aggregate_calls"));
 
@@ -610,9 +618,16 @@ fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 	assert!(!planner.contains("HAVING without GROUP BY is not supported"));
 	assert!(planner.contains("qualified HAVING column references are not supported"));
 	assert!(planner.contains("HAVING aggregate-call must appear in SELECT list"));
+	assert!(
+		planner.contains("HAVING does not resolve SELECT aliases; spell the aggregate explicitly")
+	);
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
 	assert!(planner.contains("ambiguous ORDER BY aggregate-call"));
-	assert!(planner.contains("ORDER BY aggregate-call must appear in SELECT list"));
+	assert!(
+		planner.contains(
+			"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list"
+		)
+	);
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
@@ -632,6 +647,53 @@ fn adr018_scalar_aggregate_having_order_by_guards_are_narrow() {
 		.and_then(|rest| rest.split("pub struct ExecutionSortKey").next())
 		.expect("FilterDisposition enum");
 	assert_eq!(enum_variant_count(filter_disposition), 2);
+}
+
+#[test]
+fn adr023_post_aggregate_projection_guards_are_narrow() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(!planner.contains("GroupedAggregateScope"));
+	assert!(planner.contains("struct AggregateOutputCatalog"));
+	assert!(!planner.contains("GROUP BY projection must list all keys in order before aggregates"));
+	assert!(
+		planner.contains("HAVING does not resolve SELECT aliases; spell the aggregate explicitly")
+	);
+	assert!(
+		planner.contains(
+			"ORDER BY <aggregate-call> requires the aggregate to appear in the SELECT list"
+		)
+	);
+
+	let logical_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let project_variant = logical_source
+		.split("Project {")
+		.nth(1)
+		.and_then(|rest| rest.split("Sort {").next())
+		.expect("LogicalPlan::Project variant");
+	assert!(project_variant.contains("output_names: Vec<Option<String>>"));
+
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let detector = fragmenter
+		.split("fn is_terminal_sort_over_grouped_aggregate")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("fn fragment_terminal_sort_over_grouped_aggregate")
+				.next()
+		})
+		.expect("ADR 023 detector block");
+	let project_index = detector
+		.find("ExecutionPlan::Project")
+		.expect("detector peels Project");
+	let filter_index = detector
+		.find("ExecutionPlan::Filter")
+		.expect("detector peels Filter");
+	assert!(
+		project_index < filter_index,
+		"terminal sort detector must peel Project before Filter"
+	);
 }
 
 #[test]

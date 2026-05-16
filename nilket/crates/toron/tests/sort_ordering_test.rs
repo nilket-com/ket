@@ -157,6 +157,7 @@ async fn order_by_computed_key_is_rejected_at_bind() {
 				table: toron::catalog::TableRef::new("t"),
 				projection: None,
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::column("id")],
 		}),
 		order_by: vec![SortExpr {

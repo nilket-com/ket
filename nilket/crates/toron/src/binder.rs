@@ -101,13 +101,23 @@ impl<'a> Binder<'a> {
 						disposition,
 					})
 				}
-				LogicalPlan::Project { input, exprs } => {
+				LogicalPlan::Project {
+					input,
+					exprs,
+					output_names,
+				} => {
+					if exprs.len() != output_names.len() {
+						return Err(BindingError::UnsupportedExpression {
+							message: "internal: Project exprs/output_names length mismatch"
+								.to_string(),
+						});
+					}
 					let input = self.bind_plan(input).await?;
 					let exprs = exprs
 						.iter()
 						.map(|expr| bind_expr(expr, &input.schema(), self.config))
 						.collect::<Result<Vec<_>, _>>()?;
-					let output_schema = schema_for_exprs(&exprs);
+					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 
 					Ok(ExecutionPlan::Project {
 						input: Box::new(input),
@@ -768,7 +778,7 @@ fn optimize_for_required(
 		ExecutionPlan::Project {
 			input,
 			exprs,
-			output_schema: _,
+			output_schema,
 		} => {
 			let requested_outputs = required_output.unwrap_or_else(|| output_columns(exprs.len()));
 			let mut child_required = BTreeSet::new();
@@ -785,7 +795,7 @@ fn optimize_for_required(
 				.into_iter()
 				.map(|expr| rewrite_expr_ordinals(expr, &remap))
 				.collect::<Result<Vec<_>, _>>()?;
-			let output_schema = schema_for_exprs(&exprs);
+			let output_schema = schema_for_exprs_with_existing_names(&exprs, &output_schema);
 			let output_remap =
 				ordinal_remap(&requested_outputs.iter().copied().collect::<Vec<_>>());
 
@@ -1385,6 +1395,48 @@ fn aggregate_schema(group_expr: &[ExecutionExpr], aggr_expr: &[AggregateCall]) -
 	Arc::new(Schema::new(fields))
 }
 
+fn schema_for_exprs_with_output_names(
+	exprs: &[ExecutionExpr],
+	output_names: &[Option<String>],
+) -> SchemaRef {
+	debug_assert_eq!(exprs.len(), output_names.len());
+	let derived = schema_for_exprs(exprs);
+	let fields = exprs
+		.iter()
+		.enumerate()
+		.map(|(idx, expr)| {
+			let name = output_names[idx]
+				.as_ref()
+				.cloned()
+				.unwrap_or_else(|| derived.field(idx).name().clone());
+			Field::new(name, expr.data_type(), expr.nullable())
+		})
+		.collect::<Vec<_>>();
+	Arc::new(Schema::new(fields))
+}
+
+fn schema_for_exprs_with_existing_names(
+	exprs: &[ExecutionExpr],
+	existing_schema: &SchemaRef,
+) -> SchemaRef {
+	let fields = exprs
+		.iter()
+		.enumerate()
+		.map(|(idx, expr)| {
+			let name = existing_schema
+				.fields()
+				.get(idx)
+				.map(|field| field.name().clone())
+				.unwrap_or_else(|| match expr {
+					ExecutionExpr::Column(column) => column.name.0.clone(),
+					_ => format!("col_{idx}"),
+				});
+			Field::new(name, expr.data_type(), expr.nullable())
+		})
+		.collect::<Vec<_>>();
+	Arc::new(Schema::new(fields))
+}
+
 fn aggregate_field(call: &AggregateCall) -> Field {
 	if let Some(field) = aggregate_kernel::stable_output_field(call) {
 		return field;
@@ -1433,6 +1485,7 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::column("amount")],
 		};
 
@@ -1478,6 +1531,7 @@ mod tests {
 					Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
 				),
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::column("id")],
 		};
 
@@ -1533,6 +1587,7 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::column("missing")],
 		};
 
@@ -1553,6 +1608,7 @@ mod tests {
 				table: TableId(1),
 				projection: None,
 			}),
+			output_names: vec![None],
 			exprs: vec![Expr::TimeBucket(
 				std::time::Duration::from_secs(60),
 				Box::new(Expr::column("ts")),

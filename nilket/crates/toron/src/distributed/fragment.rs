@@ -524,6 +524,7 @@ struct TerminalSortOverAggregate {
 	aggr_expr: Vec<AggregateCall>,
 	aggregate_output_schema: SchemaRef,
 	having: Option<(ExecutionExpr, FilterDisposition)>,
+	projection: Option<(Vec<ExecutionExpr>, SchemaRef)>,
 	terminal_gather: TerminalSortGather,
 }
 
@@ -585,6 +586,16 @@ fn is_terminal_sort_over_grouped_aggregate(
 	}
 	let gathered_input = input.as_ref().clone();
 	let mut aggregate = input.as_ref();
+	let mut projection = None;
+	if let ExecutionPlan::Project {
+		input,
+		exprs,
+		output_schema,
+	} = aggregate
+	{
+		projection = Some((exprs.clone(), output_schema.clone()));
+		aggregate = input.as_ref();
+	}
 	let mut having = None;
 	if let ExecutionPlan::Filter {
 		input,
@@ -621,6 +632,7 @@ fn is_terminal_sort_over_grouped_aggregate(
 		aggr_expr: aggr_expr.clone(),
 		aggregate_output_schema: aggregate_output_schema.clone(),
 		having,
+		projection,
 		terminal_gather: TerminalSortGather {
 			input: gathered_input,
 			order_by: order_by.clone(),
@@ -643,6 +655,7 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 		aggr_expr,
 		aggregate_output_schema,
 		having,
+		projection,
 		terminal_gather,
 	} = detected;
 	if group_partition_count == 0 {
@@ -669,6 +682,15 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 			input: Box::new(aggregate_plan),
 			predicate,
 			disposition,
+		}
+	} else {
+		aggregate_plan
+	};
+	let aggregate_plan = if let Some((exprs, output_schema)) = projection {
+		ExecutionPlan::Project {
+			input: Box::new(aggregate_plan),
+			exprs,
+			output_schema,
 		}
 	} else {
 		aggregate_plan

@@ -111,6 +111,7 @@ async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 				Box::new(Expr::Literal(ScalarValue::Int64(Some(BASE_TS)))),
 			),
 		}),
+		output_names: vec![None],
 		exprs: vec![Expr::column("id")],
 	};
 	let config = PlannerConfig {
@@ -336,6 +337,7 @@ async fn query_ids_gt(
 				Box::new(Expr::Literal(ScalarValue::Int32(Some(threshold)))),
 			),
 		}),
+		output_names: vec![None],
 		exprs: vec![Expr::column("id")],
 	};
 	let bound = bind(&plan, &catalog, &PlannerConfig::default())
