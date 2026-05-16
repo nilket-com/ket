@@ -110,6 +110,32 @@ along with the forward-sequence rewrite.
   the cross-ring consumer wiring. No new IR variant beyond the enum
   widening (5 → 7), no fragmenter detector change, no cross-ring
   engagement, `AggState` stays `Copy`.
+- **ADR 020 — AVG Aggregate Kernel.** Drafted; implementation pending. Second
+  kernel-catalog widening under the post-ADR-018 cycle. AVG completes
+  the basic analytical set (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`); will remove
+  itself from the `sql_planner.rs:556` catch-all and add one named
+  arm. Three-way council convergence ratified AVG-alone over Gemini's
+  bundle-with-kernel-registry-refactor position (dissent recorded in
+  §V1 §9; ADR 021 ratifies the refactor). Multi-state `(total: i128,
+  count: u64)` integer accumulator and `(total: f64, count: u64)`
+  float accumulator; Float64-uniform output (DuckDB / SQLite parity;
+  Decimal output awaits V1.x Decimal ADR); `count == 0 → NULL`
+  finalization to be pinned via explicit `vec![None]` assertions; sticky-NaN
+  behavior to be pinned by hard-gate regression test. Legacy unbound path
+  uses a single `AvgFloat` accumulator (favorable asymmetry vs MIN/MAX
+  — no first-batch type dance, no empty-input error). Architecture-
+  guard test will be renamed from `adr016_having_guards_are_narrow` to
+  `aggregate_function_enum_guards_are_narrow` (catalog-wide role).
+  Bench planned:
+  `plans/impl/020_avg_aggregate_kernel_bench_results.md`.
+  Wendelon-side already ships `SignedAverageParts { sum: i128, count:
+  u64, overflow: bool }` at `crates/wendelon/src/schema/aggregate.rs:94-125`
+  — structural equivalence with different error discipline (Toron's
+  `checked_add` + explicit `ExecutionError::Kernel` is the semantic
+  equivalent of Wendelon's overflow bit); ADR 02X pins the cross-ring
+  contract when it engages. No new IR variant beyond the enum widening
+  (7 → 8), no fragmenter detector change, no cross-ring engagement,
+  `AggState` stays `Copy`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -177,76 +203,90 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 019 implemented; ADR 020 candidates
+### ADR 020 drafted; ADR 021 candidates
 
-ADR 019 selected and implemented `MIN` and `MAX` as the first kernel-catalog
-widening under the post-ADR-018 cycle, extending the cycle's
-source-level boundary clarity property to the kernel surface.
-The convergence ratified MIN+MAX bundled (per Gemini's framing
-and Codex's "MAX is the closest follow-on" posture, with the
-ADR 008 bundling precedent applied to the parallel
-Wendelon-side `Min`/`Max` variants), conservative
-`Int32`/`Int64` type-domain (explicit deferrals for Float and
-Utf8 documented in V1 exclusions), and a required lightweight
-bench artifact. ADR 020 selection starts from the remaining
-post-ADR-019 remainder:
+ADR 020 selected `AVG` as the second kernel-catalog
+widening under the post-ADR-018 cycle, completing the basic
+analytical set (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`). Three-way council
+convergence ratified AVG-alone over Gemini's bundle-with-kernel-
+registry-refactor position; Gemini's dissent ("the maintenance cliff
+justifies bundling") was recorded in ADR 020 §V1 §9 and carries
+forward as the lead nomination for ADR 021. After ADR 020 lands,
+ADR 021 selection starts from the post-ADR-020 remainder:
 
-**Leading kernel candidates:**
+**Leading substrate candidate — kernel-registry refactor:**
 
-- **`AVG` aggregate kernel.** Closest follow-on under the
-  Wendelon-ADR-070 pattern. Multi-state accumulator `(sum,
-  count)`; Float64-uniform output in V1 (Decimal output for
-  integer inputs awaits the V1.x Decimal ADR). Wendelon-side
-  already ships `SignedAverageParts { sum: i128, count: u64 }`
-  at `crates/wendelon/src/schema/aggregate.rs:94-125` —
-  alignment is a happy property, not yet a cross-ring contract.
-  Bench artifact required (per the ADR 019 precedent for new
-  stable kernels). **Closest candidate to ADR 020's nomination.**
-- **Float `MIN` / `MAX`.** Smaller than AVG but with a sharper
-  semantic-contract question: NaN and signed-zero policy must
-  be ratified explicitly. Arrow's bytewise IEEE 754 ordering is
-  deterministic but surprising as aggregate semantics.
-- **`Utf8` `MIN` / `MAX`.** Forces `AggState` to lose `Copy`
-  (String owns its buffer). Substrate refactor with cascading
+- **Kernel-registry refactor across SUM / MIN / MAX / AVG (plus
+  the trivially-handled Count family).** The dispatch duplication
+  across 8+ match sites in binder / planner / executor — three
+  near-identical keyword/output-name helpers, parallel `if
+  matches!` validation blocks, divergent `init_*` patterns
+  (infallible for SUM/AVG; fallible Result for MIN/MAX) —
+  reached the threshold where consolidation earns its keep.
+  Trait-dispatch shape proposal: `AggregateKernel` trait with
+  `output_name`, `output_data_type`, `init_state`, `update`,
+  `finalize_scalar`, `finalize_grouped` associated functions.
+  Realistic net change is organizational (~30-50% body-line
+  reduction with ~40 enum match arms preserved as one-line
+  delegations), not line-count-reductive. Gemini's iter-3
+  position on ADR 020 promotes here as the ADR 021 lead.
+  **Closest candidate to ADR 021's nomination.**
+
+**Strong runner-up — post-aggregate projection (ADR 022):**
+
+- **Post-aggregate projection.** The `GroupedAggregateScope`
+  naming-asymmetry signal (17 references across
+  `sql_planner.rs`; 12 used in scalar paths post-ADR-018) is
+  now over legibility threshold. ADR 022 renames the scope into
+  a broader output-name catalog (`AggregateOutputCatalog` or
+  similar) and lifts the aliased / computed-expression / key-
+  subset surface. Touches the `LoweredSelect` seam and may need
+  a fragmenter routing decision for `Project` above grouped
+  aggregate output. Larger scope than ADR 021's refactor; could
+  promote ahead if a downstream workload or ADR needs aliased
+  aggregate output.
+
+**Other kernel-widening candidates:**
+
+- **Float `MIN` / `MAX`.** ADR 019 V1 §1 deferred for NaN /
+  signed-zero policy ratification. Smaller scope than the
+  kernel-registry refactor but with a sharper semantic-contract
+  question.
+- **`Utf8` `MIN` / `MAX`.** ADR 019 V1 §2 deferred for
+  `AggState` Copy-refactor. Substrate refactor with cascading
   effects across existing `match states[agg_idx]` patterns.
-  Bundleable with collation/locale decision matrix, or kept
+  Bundleable with a collation/locale decision matrix, or kept
   bytewise-only.
-
-**Post-aggregate projection** (aliases, computed expressions
-on aggregates, key subsets, reordered keys). The
-`GroupedAggregateScope` naming-asymmetry signal from ADR
-018/019 is now strong — the scope's "Grouped" prefix
-misleads, and post-aggregate projection is the surface that
-renames it into the broader output-name catalog it actually
-is. Strong runner-up.
 
 **Cross-ring candidate — ADR 02X (Wendelon AGG consumer wiring):**
 
-The Wendelon-side AGG protocol exists. Toron-side
-`wendelon_client::TableQueryOptions` does not expose it. The
-consumer-side ADR engages the cross-ring contract for the
-partial/final two-phase shape and lifts ADR 011/019's
+The Wendelon-side AGG protocol exists, including
+`SignedAverageParts` whose `(sum: i128, count: u64)` shape is
+now structurally equivalent (modulo overflow handling) to
+Toron's `AggState::AvgInt`. Toron-side
+`wendelon_client::TableQueryOptions` does not expose the
+protocol. The consumer-side ADR engages the cross-ring contract
+for the partial/final two-phase shape and lifts ADR 011/019/020's
 per-partition scalar ceiling. **This is the right home for
-two-phase aggregation work** — bench artifact required
-(cross-ring perf characteristic). Promotes when workload
-evidence surfaces aggregate-pushdown pressure.
+two-phase aggregation work** — bench artifact required (cross-
+ring perf characteristic). Promotes when workload evidence
+surfaces aggregate-pushdown pressure.
 
 **Other ADR 011 follow-ons** carry forward as candidates if
-their evidence outranks the SQL-surface set:
-- **Shared-helper refactor across SUM / MIN / MAX / AVG.**
-  Deferred to post-AVG; at four parallel numeric kernels the
-  duplication earns refactor. ADR 020 ratifies the refactor
-  decision if AVG is the lead.
+their evidence outranks the substrate-and-surface set:
+- **Kahan-Neumaier stability ADR.** Composes across SUM and
+  AVG together; MIN/MAX is order-independent and doesn't
+  participate. Promotes if production workloads surface
+  precision-loss evidence on Float64 AVG.
 - **`DISTINCT`** — `GROUP BY <all output columns>` with no
   aggregates. Loosens ADR 011's zero-aggregate reject; own
   decision matrix.
+- **AVG as a window function.** Window aggregates need their
+  own decision matrix.
 - **`GROUP BY` over joins.** Composes ADR 008's join surface
   with ADR 011's grouped aggregate; only candidate with a
   brainstorm-seam concern (disaggregated-compute placement,
   brainstorm 003).
-- **Kahan-Neumaier stability ADR.** Composes across SUM and
-  AVG together; MIN/MAX is order-independent and doesn't
-  participate.
 
 **Kernel graduation evidence pressure (carried from ADR 018
 iter-1 sweep).** The experimental-kernel bound/unbound parity
@@ -256,7 +296,7 @@ binder but the bound executor returns `NotImplemented`. Gated
 behind `allow_experimental_kernels` (default false), so
 production SQL paths don't reach it. The gap tightens the
 evidence case for the first kernel graduation but does not
-promote as ADR 020 lead by itself.
+promote as ADR 021 lead by itself.
 
 **V1.x runtime-filter extensions** (Candidate C below) remain a
 cluster of narrow follow-on ADRs; ADR 014's `RuntimeFilterKind`
