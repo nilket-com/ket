@@ -975,6 +975,123 @@ along with the forward-sequence rewrite.
   digests byte-identical pre/post-ADR-030. The ten-
   phase migration is materialized in
   `plans/impl/030_insert_into_values.md`.
+- **ADR 031 — Bound Expression Program (Index-Based
+  Physical Expression IR).** Promoted. **First
+  substrate-replacing pure-Toron ADR** — replaces
+  recursive `Box<ExecutionExpr>` trees in
+  `ExecutionPlan` physical-expression fields with a
+  serializable index-based `BoundExprProgram` that
+  owns its roots, enforces topological ordering by
+  construction, and evaluates via a flat linear loop.
+  Narrow realization of Brainstorm 004's expression-
+  representation split; logical `Expr` remains the
+  boxed-readable SQL planner contract. Fifteen
+  decisions D1-D15. **D2 critical decision:**
+  `BoundExprProgram { nodes, node_types, literals,
+  roots }` is self-contained — plan variants carry
+  complete programs, not `program + root` side-field
+  pairs; arity is enforced by context (predicate =
+  one root; project / exchange / group-key = multi-
+  root; `COUNT(*)` = zero-root). **D5 critical
+  decision:** compact grouped operation enums
+  (`BoundBinaryOp` with 12 variants, `BoundUnaryOp`
+  with 3); `BoundExprNode` has 7 variants (vs 18+
+  per-op in the old `ExecutionExpr`) — enum-size
+  discipline + carrier symmetry + future typed-
+  kernel dispatch alignment. **D6 critical decision:**
+  `node_types[id]` is authoritative for execution
+  dispatch; `ResolvedColumn` stays in
+  `BoundExprNode::Column` for v1; duplication with
+  `ResolvedColumn.data_type` accepted (future cleanup
+  ADR may thin). **D7 critical decision:**
+  `BoundExprProgram` / `BoundExprNode` /
+  `BoundAggregateCall` derive `PartialEq` only — no
+  `Eq` / `Hash` because `literals` includes float-
+  bearing `ScalarValue`; preserves ADR 028 D2
+  discipline. **D9 critical decision:** aggregate
+  role boundaries stay separate — `Aggregate.group_expr`
+  is one `BoundExprProgram`; `Aggregate.aggr_expr`
+  is `Vec<BoundAggregateCall>` with one `args`
+  program per call. **D11 critical decision:**
+  binder emits programs directly via
+  `BoundExprProgramBuilder`; no production
+  `ExecutionExpr → BoundExprProgram` lowering pass
+  survives migration. **D12 critical decision:** PBC
+  migration in scope; `PbcCompiler::compile` reads
+  `Option<&BoundExprProgram>` with runtime-asserted
+  single-root predicate contract (no
+  `SingleRootBoundExprProgram` newtype); PBC
+  semantics preserved verbatim (column / non-null
+  literal / comparison / boolean / null-check
+  eligible; `Cast` / `TryCast` / arithmetic /
+  `TimeBucket` declined). **D13 critical decision:**
+  narrow column-key helpers (`single_column_root`,
+  `root_columns`, `root_type`, `is_empty_roots`)
+  keep runtime-filter / scheduler / fragmenter paths
+  column-oriented — no broad program traversal added.
+  **D14 critical decision and first cycle to
+  intentionally break a previously-promoted
+  invariant:** ADR 023 D15 + ADR 029 D15 + ADR 030
+  D17 promised "SELECT plan-digest byte-identical
+  pre/post-ADR-NNN". ADR 031 D14 explicitly breaks
+  this — `ExecutionExpr → BoundExprProgram` changes
+  serialized `ExecutionPlan` bytes by design. The
+  break is a substrate-replacing exception, not a
+  regression. Compatibility shifts to result-digest
+  parity for the SELECT corpus + PBC engaged/declined
+  behavior + distributed determinism + wire serde
+  round-trips within one code version. **Mixed-
+  version distributed task frames are explicitly not
+  a target.** **D15 critical decision:** ADR 028's
+  `GroupedAggregateSignature` substrate stays
+  planner-private over logical `Vec<Expr>`; the six
+  ADR 028 structural visitor helpers
+  (`hash_expr_structural` / `expr_structural_eq` /
+  `hash_scalar_structural` / `scalar_structural_eq`
+  / `hash_data_type_structural` /
+  `data_type_structural_eq`) are not migrated.
+  Three substantive iterations + one ratification
+  pass = **4 total with 0 flip-flops** — fastest
+  convergence in the council's history. **Sixth
+  consecutive cycle of Gemini iter-1/2 retraction**
+  (ADR 025 / 026 / 028 / 029 / 030 / 031): Gemini
+  iter-2/3 retracted iter-1 positions on roots-as-
+  side-fields, PBC out of scope, and `Eq` on
+  `BoundExprNode`. **Four Claude iter-0/1
+  contributions promoted directly to D-level**
+  (C1→D14 plan-digest break; C2→D15 ADR 028
+  untouched; C5→D12 PBC single-root contract;
+  C6→D5 compact grouped enum); first cycle where
+  iter-0/1 contributions reach promotion without
+  iter-2/3 wordsmithing. **Third instance of the
+  topic-concession-compresses-next-cycle pattern**
+  (ADR 020→021; ADR 027→028; ADR 029→031 via Codex's
+  iter-0 ADR 029 `BoundExprProgram` seed doc).
+  Thirteenth instance of the ADR 015 cycle. Ten new
+  ADR 031 architecture guards + six adjusted ADR
+  024/025/026/028 guards (anchored at
+  `architecture_test.rs:558, 914, 994-1286, 1260-1500,
+  1838`; no guard silently deleted) + two verify-
+  unchanged guards (kernel catalog at line 665, ADR
+  028 signature at line 1611) = 18 architecture
+  guard touchpoints. SoA-readiness invariants
+  preserved (catalog metadata-only; `#[repr(u8)]`
+  `StableAggregateKernel` unchanged; centralized
+  dispatch unchanged; no row-path dyn dispatch).
+  No new SQL syntax; no new expression operations;
+  no new aggregate kernel; no PBC opcode change; no
+  fragmenter detector change for SELECT paths; no
+  cross-ring engagement; no Wendelon-side change;
+  no `blake3` / `bumpalo` / `typed-arena` / `slab` /
+  `generational-arena` dependency added; no `Eq` /
+  `Hash` derives on program-bearing types. ADR 029
+  catalog metadata-only preserved; ADR 030
+  `ExecutionPlan::Insert` expression-free preserved.
+  SQL result digests byte-identical pre/post-ADR-
+  031 for the SELECT corpus (plan-digest fixtures
+  categorized and adjusted per Phase 9 inventory). The
+  ten-phase migration is materialized in
+  `plans/impl/031_bound_expr_program.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -1042,7 +1159,233 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 030 promoted; ADR 031 candidates
+### ADR 031 promoted; ADR 032 candidates
+
+ADR 031 selected and promoted **Bound Expression
+Program (Index-Based Physical Expression IR)** —
+Toron's **first substrate-replacing pure-Toron ADR**
+— replacing recursive `Box<ExecutionExpr>` trees in
+`ExecutionPlan` physical-expression fields with a
+serializable index-based `BoundExprProgram` that owns
+its roots, enforces topological ordering by
+construction, and evaluates via a flat linear loop.
+Narrow realization of Brainstorm 004's expression-
+representation split; logical `Expr` remains the
+boxed-readable SQL planner contract.
+
+Fifteen decisions D1-D15 cover: scope as bound
+physical expressions only; self-contained multi-root
+`BoundExprProgram { nodes, node_types, literals,
+roots }`; stable typed `BoundExprId(pub u32)` with
+`Eq + Hash`; mandatory topological invariant (child
+ID < parent ID); compact grouped operation enums
+(`BoundBinaryOp` with 12 variants, `BoundUnaryOp`
+with 3, `BoundExprNode` with 7); sidecar
+`node_types[id]` authoritative for execution
+dispatch; `PartialEq`-only discipline for program-
+bearing types; no literal dedup or CSE in v1;
+aggregate role boundaries kept separate
+(`group_expr` is one program, `aggr_expr` is
+`Vec<BoundAggregateCall>`); `ExecutionPlan::Filter` /
+`Project` / `Aggregate` / `Exchange` carry programs;
+binder emits programs directly via
+`BoundExprProgramBuilder` with no production
+lowering pass; PBC migration in scope with runtime-
+asserted single-root predicate contract; narrow
+column-key helpers keep distributed paths column-
+oriented; **D14 plan-digest serde break — first
+cycle to intentionally break a previously-promoted
+invariant** (ADR 023 D15 + ADR 029 D15 + ADR 030
+D17 byte-identical plan-digest invariant explicitly
+broken); ADR 028 logical signature substrate
+untouched.
+
+Three substantive iterations + one ratification pass
+= **4 total with 0 flip-flops** — fastest
+convergence in the council's history. Two factors
+drove the speed: third-instance topic-concession-
+compresses-next-cycle pattern (Codex's iter-0 ADR
+029 `BoundExprProgram` seed doc drove this cycle's
+iter-0 directly; topic never reopened), and first
+substrate-replacing not-cross-ring ADR (ADR 029 +
+030 needed two-pass Wendelon-API discovery; ADR
+031 is pure Toron, no Wendelon-side discovery).
+
+**Sixth consecutive cycle of Gemini iter-1/2
+retraction** (ADR 025 / 026 / 028 / 029 / 030 /
+031): Gemini iter-2/3 retracted three iter-1
+positions (roots as side-fields on plan variants;
+PBC migration out of scope; `Eq` derivation on
+`BoundExprNode`). Stable cycle property: Gemini's
+wider-scope iter-1/2 framings surface the alternate-
+design space the council needs to reject explicitly;
+useful for collective understanding but not load-
+bearing for promotion.
+
+**Four Claude iter-0/1 contributions
+promoted directly to D-level decisions** — first
+cycle where iter-0/1 contributions reach promotion
+without iter-2/3 wordsmithing or retraction:
+
+- iter-0 C1 (plan-digest break as cycle property)
+  → D14
+- iter-0 C2 (ADR 028 signature substrate untouched)
+  → D15
+- iter-1 C5 (PBC single-root contract + signature)
+  → D12
+- iter-1 C6 (compact `BoundBinaryOp` / `BoundUnaryOp`
+  grouping) → D5
+
+Plus iter-0 C3 (architecture-guard replacement
+plan) + iter-2 P1/P2/P3 (line-anchor precision +
+`source_lines` recursive scan + plan-digest fixture
+inventory) went directly into the impl plan. New
+cycle property: code-evidence-grounded + narrowly-
+scoped iter-0 contributions reach promotion intact.
+
+Thirteenth instance of the ADR 015 cycle. Ten new
+ADR 031 architecture guards + six adjusted ADR
+024/025/026/028 guards (anchored at
+`architecture_test.rs:558, 914, 994-1286, 1260-1500,
+1838`; no guard silently deleted) + two verify-
+unchanged guards (kernel catalog at line 665, ADR
+028 signature at line 1611) = 18 architecture guard
+touchpoints. SoA-readiness invariants preserved.
+Brainstorm-seam touch check: Brainstorm 001 + 003
+seams cleaner (JIT input is now index-based; wire
+serde changes but distributed routing semantics
+preserved); Brainstorm 002 untouched; Brainstorm
+004 narrowly realized (one of four candidate
+approaches; the other three remain future
+candidates).
+
+No new SQL syntax; no new expression operations; no
+new aggregate kernel; no PBC opcode change; no
+fragmenter detector change for SELECT paths; no
+cross-ring engagement; no Wendelon-side change; no
+`blake3` / `bumpalo` / `typed-arena` / `slab` /
+`generational-arena` dependency added; no `Eq` /
+`Hash` derives on program-bearing types. ADR 028
+signature substrate preserved; ADR 029 catalog
+metadata-only preserved; ADR 030
+`ExecutionPlan::Insert` expression-free preserved.
+SQL result digests byte-identical pre/post-ADR-031
+for the SELECT corpus (plan-digest fixtures
+categorized and adjusted per Phase 9 inventory). The
+ten-phase migration is materialized in
+`plans/impl/031_bound_expr_program.md`.
+
+ADR 032 selection opens a new space. ADR 029 / 030 /
+031 closed the substrate-introducing + substrate-
+replacing arc that started at ADR 024. The
+foundational substrate is now in place
+(`BoundExprProgram` for physical execution;
+`StorageWrite` for data-plane writes; `Catalog`
+metadata-only with mutation discipline; ADR 028
+signature substrate for grouped aggregates; ADR 029
+six-type lattice for DDL; ADR 030 `InsertLiteral`
+lattice for DML). ADR 032 candidates fall into
+several categories: composition ADRs that exercise
+the substrate (`INSERT INTO ... SELECT`,
+`UPDATE` / `DELETE`, hidden-aggregate `ORDER BY`,
+HAVING alias visibility); type-lattice extensions
+(temporal types, DECIMAL, Utf8/Boolean CAST/TRY_CAST);
+cross-ring contract ADRs (metadata-write for
+`WendelonCatalog::create_table`; distributed-write
+context for ADR 030 D13; read-your-writes session
+HLC); and Brainstorm-004-deeper-realization ADRs
+(typed opcode tape; CSE + literal dedup; Cranelift
+JIT).
+
+**ADR 032 lead candidates (no firm commitment):**
+
+- **`INSERT INTO ... SELECT`** — composes ADR 029 +
+  030 + read-side ADRs. Most natural immediate DML
+  extension after ADR 030. Engages bound
+  `BoundExprProgram` substrate for the SELECT side.
+- **Typed expression tape / opcode interpreter** —
+  Brainstorm 004's deeper realization. Lowers
+  `BoundExprProgram` to a flat typed-instruction
+  tape with kernel dispatch on `(op, output_type)`.
+  Substrate for future SIMD/JIT.
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires
+  the aggregate to appear in the SELECT list"`
+  reject. Plan-shape ADR; composes with ADR 028
+  signature substrate via
+  `AggregateOutputCatalog::resolve_for_order_by`.
+- **Cross-ring distributed-write-context ADR** —
+  lifts ADR 030 D13's distributed INSERT reject.
+  Threads tenant / session / HLC context through
+  `DistributedQueryCoordinator`.
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred.
+- **PBC partial-pushdown of computed-arg aggregates**
+  (cross-ring; workload-evidence-pressured).
+- **Common subexpression elimination (CSE) + literal
+  deduplication** — both deferred from ADR 031 D8;
+  future expression-optimizer ADR.
+- **Cranelift JIT compilation** (Brainstorm 001) —
+  lower `BoundExprProgram` or future tape to native
+  code for hot kernels.
+- **Logical `Expr` arena migration** — Brainstorm
+  004's broader framing; revisit when evidence
+  accumulates that planner-side `Box<Expr>` is
+  load-bearing pain.
+
+**Substrate candidates carried forward:**
+
+- **`UPDATE` / `DELETE`** — DML siblings to ADR 030;
+  `__row_tombstone__` becomes load-bearing for
+  DELETE; Wendelon-side already owns tombstone
+  stamping per ADR 030 D7.
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint
+  substrate first.
+- **`RETURNING` clause** — DML result-shape
+  extension; shifts ADR 030's `Ok(Vec::new())`
+  contract.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`DROP TABLE` / `ALTER TABLE` / `CREATE INDEX` /
+  `CREATE VIEW` / `CREATE TABLE AS SELECT (CTAS)`**
+  — DDL siblings to ADR 029.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY /
+  CHECK / column-level UNIQUE) / DEFAULT /
+  GENERATED columns — DDL siblings to ADR 029.
+- **HAVING alias visibility ADR.** Loosens ADR
+  023's `"HAVING does not resolve SELECT aliases"`
+  reject.
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029's type lattice + ADR 030's INSERT
+  coercion lattice.
+- **DECIMAL** for ADR 029's type lattice + ADR
+  030's INSERT coercion lattice.
+- **Cross-ring metadata-write contract ADR** —
+  needed to lift `WendelonCatalog::create_table`
+  from `AdminUnavailable`.
+- **Read-your-writes session HLC advancement ADR**
+  — defines whether coordinators consume
+  `wendelon_client::TableWriteReceipt.commit_hlc`.
+- **Richer Toron `Hlc` type** — `HlcBound(pub u64)`
+  is lossy vs Wendelon's `HybridTimestamp`
+  (16 bytes); prerequisite for read-your-writes.
+- **Idempotency / write-retry-after-descriptor-
+  evolution ADR.**
+- **Per-statement `durability` override.**
+- **Wendelon AGG consumer wiring** (cross-ring;
+  PBC partial-pushdown).
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+The post-ADR-030 archived selection notes below
+(forward-sequence content from the prior planning
+pass) remain unchanged.
+
+#### ADR 030 → ADR 031 archived selection notes
 
 ADR 030 selected and promoted **SQL `INSERT INTO ...
 VALUES (...)` (Literal-Only DML Surface)** — Toron's
