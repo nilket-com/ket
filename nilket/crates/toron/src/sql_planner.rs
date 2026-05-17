@@ -1142,11 +1142,9 @@ impl SqlPlanner {
 						Box::new(self.lower_expr(expr)?),
 						lower_cast_target_type(data_type)?,
 					)),
-					CastKind::TryCast => Err(unsupported(
-						"unsupported cast syntax: TRY_CAST; only CAST(... AS ...) is supported",
-					)),
-					CastKind::SafeCast => Err(unsupported(
-						"unsupported cast syntax: SAFE_CAST; only CAST(... AS ...) is supported",
+					CastKind::TryCast | CastKind::SafeCast => Ok(Expr::TryCast(
+						Box::new(self.lower_expr(expr)?),
+						lower_cast_target_type(data_type)?,
 					)),
 					CastKind::DoubleColon => Err(unsupported(
 						"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
@@ -1227,18 +1225,18 @@ impl SqlPlanner {
 }
 
 fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
-	order_by
-		.iter()
-		.any(|key| !sort_key_is_direct_output_reference(&key.expr) && expr_contains_cast(&key.expr))
+	order_by.iter().any(|key| {
+		!sort_key_is_direct_output_reference(&key.expr) && expr_contains_cast_family(&key.expr)
+	})
 }
 
 fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
 	matches!(expr, Expr::Column(_) | Expr::Literal(_))
 }
 
-fn expr_contains_cast(expr: &Expr) -> bool {
+fn expr_contains_cast_family(expr: &Expr) -> bool {
 	match expr {
-		Expr::Cast(_, _) => true,
+		Expr::Cast(_, _) | Expr::TryCast(_, _) => true,
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -1250,11 +1248,11 @@ fn expr_contains_cast(expr: &Expr) -> bool {
 		| Expr::Gt(left, right)
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
-		| Expr::Or(left, right) => expr_contains_cast(left) || expr_contains_cast(right),
+		| Expr::Or(left, right) => expr_contains_cast_family(left) || expr_contains_cast_family(right),
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::TimeBucket(_, inner) => expr_contains_cast(inner),
+		| Expr::TimeBucket(_, inner) => expr_contains_cast_family(inner),
 		Expr::Column(_) | Expr::Literal(_) => false,
 	}
 }

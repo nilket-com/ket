@@ -750,6 +750,10 @@ impl Executor {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_cast(&arr, target)
 			}
+			Expr::TryCast(inner, target) => {
+				let arr = self.evaluate_expr(inner, batch)?;
+				evaluate_try_cast(&arr, target)
+			}
 			Expr::Add(left, right) => {
 				let left_arr = self.evaluate_expr(left, batch)?;
 				let right_arr = self.evaluate_expr(right, batch)?;
@@ -920,6 +924,10 @@ impl Executor {
 			ExecutionExpr::Cast(inner, target) => {
 				let arr = self.evaluate_bound_expr(inner, batch)?;
 				evaluate_cast(&arr, target)
+			}
+			ExecutionExpr::TryCast(inner, target) => {
+				let arr = self.evaluate_bound_expr(inner, batch)?;
+				evaluate_try_cast(&arr, target)
 			}
 			ExecutionExpr::Add(left, right) => {
 				self.evaluate_bound_arithmetic(ArithmeticOp::Add, left, right, batch)
@@ -3886,6 +3894,32 @@ fn evaluate_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, Execut
 	}
 }
 
+fn evaluate_try_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, ExecutionError> {
+	if array.data_type() == target {
+		return Ok(array.clone());
+	}
+
+	match (array.data_type(), target) {
+		(DataType::Int32, DataType::Int64) => cast_i32_to_i64(array),
+		(DataType::Int32, DataType::Float32) => cast_i32_to_f32(array),
+		(DataType::Int32, DataType::Float64) => cast_i32_to_f64(array),
+		(DataType::Int64, DataType::Float32) => cast_i64_to_f32(array),
+		(DataType::Int64, DataType::Float64) => cast_i64_to_f64(array),
+		(DataType::Float32, DataType::Float64) => cast_f32_to_f64(array),
+		(DataType::Int64, DataType::Int32) => try_cast_i64_to_i32(array),
+		(DataType::Float64, DataType::Float32) => try_cast_f64_to_f32(array),
+		(DataType::Float32, DataType::Int32) => try_cast_f32_to_i32(array),
+		(DataType::Float32, DataType::Int64) => try_cast_f32_to_i64(array),
+		(DataType::Float64, DataType::Int32) => try_cast_f64_to_i32(array),
+		(DataType::Float64, DataType::Int64) => try_cast_f64_to_i64(array),
+		(source, target) => Err(cast_failed(
+			source,
+			target,
+			"unsupported combination (binder gate failure)",
+		)),
+	}
+}
+
 fn cast_failed(source: &DataType, target: &DataType, cause: impl fmt::Display) -> ExecutionError {
 	ExecutionError::Kernel {
 		message: format!("cast failed: {source:?} to {target:?}: {cause}"),
@@ -4121,6 +4155,124 @@ fn cast_f64_to_f32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 		})
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_i64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_int64(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<i32> {
+			let value = value?;
+			if value < i32::MIN as i64 || value > i32::MAX as i64 {
+				return None;
+			}
+			Some(value as i32)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_f64_to_f32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<f32> {
+			let value = value?;
+			if value.is_finite() && value.abs() > f32::MAX as f64 {
+				return None;
+			}
+			Some(value as f32)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_f32_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float32(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<i32> {
+			let value = value?;
+			if value.is_nan() {
+				return None;
+			}
+			if value.is_infinite() {
+				return None;
+			}
+			let trunc = f64::from(value).trunc();
+			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+				return None;
+			}
+			Some(trunc as i32)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_f32_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float32(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<i64> {
+			let value = value?;
+			if value.is_nan() {
+				return None;
+			}
+			if value.is_infinite() {
+				return None;
+			}
+			let trunc = f64::from(value).trunc();
+			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+				return None;
+			}
+			Some(trunc as i64)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_f64_to_i32(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<i32> {
+			let value = value?;
+			if value.is_nan() {
+				return None;
+			}
+			if value.is_infinite() {
+				return None;
+			}
+			let trunc = value.trunc();
+			if !(F64_I32_LOWER <= trunc && trunc < F64_I32_UPPER) {
+				return None;
+			}
+			Some(trunc as i32)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
+fn try_cast_f64_to_i64(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let array = as_float64(array, "TryCast source")?;
+	let values = array
+		.iter()
+		.map(|value| -> Option<i64> {
+			let value = value?;
+			if value.is_nan() {
+				return None;
+			}
+			if value.is_infinite() {
+				return None;
+			}
+			let trunc = value.trunc();
+			if !(F64_I64_LOWER <= trunc && trunc < F64_I64_UPPER) {
+				return None;
+			}
+			Some(trunc as i64)
+		})
+		.collect::<Vec<_>>();
+	Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
 }
 
 fn evaluate_arithmetic(

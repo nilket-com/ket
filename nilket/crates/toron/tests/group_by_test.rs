@@ -1560,6 +1560,178 @@ async fn sql_cast_in_where_and_order_by_executes() {
 }
 
 #[tokio::test]
+async fn sql_try_cast_numeric_primitive_lattice_executes() {
+	let results = run_logical(&plan_sql(
+		"SELECT \
+			TRY_CAST(amount AS BIGINT), \
+			SAFE_CAST(price AS DOUBLE), \
+			TRY_CAST(price AS INT), \
+			TRY_CAST(rating32 AS DOUBLE) \
+		 FROM sales",
+	))
+	.await;
+
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0),
+		vec![Some(10), Some(20), None, Some(30), None, Some(7)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 1),
+		vec![Some(10.5), Some(20.5), None, Some(30.5), None, Some(7.5)]
+	);
+	assert_eq!(
+		scalar_int32_column_rows(&results, 2),
+		vec![Some(10), Some(20), None, Some(30), None, Some(7)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 3),
+		vec![Some(1.5), Some(2.5), None, Some(3.5), Some(4.5), Some(0.25)]
+	);
+}
+
+#[tokio::test]
+async fn post_aggregate_try_cast_executes() {
+	let scalar = run_logical(&plan_sql(
+		"SELECT TRY_CAST(SUM(amount) AS DOUBLE) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_float64_column_rows(&scalar, 0), vec![Some(67.0)]);
+
+	let grouped = run_logical(&plan_sql(
+		"SELECT region, TRY_CAST(SUM(amount) AS INT) FROM sales \
+		 GROUP BY region HAVING TRY_CAST(SUM(amount) AS INT) IS NOT NULL \
+		 ORDER BY region",
+	))
+	.await;
+	assert_eq!(
+		region_int32_rows(&grouped, 1),
+		HashMap::from([
+			(None, Some(7)),
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+		])
+	);
+}
+
+#[tokio::test]
+async fn order_by_try_cast_aggregate_uses_hidden_projection() {
+	let ordered = run_logical(&plan_sql(
+		"SELECT region, SUM(amount) FROM sales GROUP BY region \
+		 ORDER BY TRY_CAST(SUM(amount) AS FLOAT32) DESC",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&ordered),
+		vec![
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+			(None, Some(7)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn try_cast_nulls_data_domain_failures() {
+	let i64_narrowing = run_logical(&plan_sql(
+		"SELECT TRY_CAST(CAST(id + 3000000000 AS BIGINT) AS INT) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		scalar_int32_column_rows(&i64_narrowing, 0),
+		vec![None, None, None, None, None, None]
+	);
+
+	let float_to_int = run_logical(&plan_sql("SELECT TRY_CAST(score AS INT) FROM sales")).await;
+	assert_eq!(
+		scalar_int32_column_rows(&float_to_int, 0),
+		vec![Some(1), None, Some(3), Some(5), None, Some(7)]
+	);
+
+	let inf_to_int = run_logical(&plan_sql("SELECT TRY_CAST(price / 0.0 AS INT) FROM sales")).await;
+	assert_eq!(
+		scalar_int32_column_rows(&inf_to_int, 0),
+		vec![None, None, None, None, None, None]
+	);
+
+	let float_narrowing = run_logical(&plan_sql(
+		"SELECT TRY_CAST(price * 1e40 AS REAL) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		scalar_float32_column_rows(&float_narrowing, 0),
+		vec![None, None, None, None, None, None]
+	);
+}
+
+#[tokio::test]
+async fn try_cast_float64_to_float32_preserves_nan_and_inf() {
+	let score = run_logical(&plan_sql("SELECT TRY_CAST(score AS REAL) FROM sales")).await;
+	let rows = scalar_float32_column_rows(&score, 0);
+	assert_eq!(rows.len(), 6);
+	assert_eq!(rows[0], Some(1.0));
+	assert!(rows[1].expect("NaN row").is_nan());
+	assert_eq!(rows[2], Some(3.0));
+	assert_eq!(rows[3], Some(5.0));
+	assert_eq!(rows[4], None);
+	assert_eq!(rows[5], Some(7.0));
+
+	let inf = run_logical(&plan_sql("SELECT TRY_CAST(price / 0.0 AS REAL) FROM sales")).await;
+	let rows = scalar_float32_column_rows(&inf, 0);
+	assert_eq!(rows.len(), 6);
+	assert_eq!(rows[0], Some(f32::INFINITY));
+	assert_eq!(rows[1], Some(f32::INFINITY));
+	assert_eq!(rows[2], None);
+	assert_eq!(rows[3], Some(f32::INFINITY));
+	assert_eq!(rows[4], None);
+	assert_eq!(rows[5], Some(f32::INFINITY));
+}
+
+#[tokio::test]
+async fn bind_try_cast_preserves_identity_node() {
+	let (catalog, _) = fixture();
+	let bound = bind(
+		&plan_sql("SELECT TRY_CAST(amount AS INT) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind identity try cast");
+
+	assert!(
+		bound.schema().field(0).is_nullable(),
+		"TryCast output schema must be nullable"
+	);
+	let ExecutionPlan::Project { exprs, .. } = bound else {
+		panic!("expected projection");
+	};
+	assert!(matches!(
+		&exprs[0],
+		ExecutionExpr::TryCast(inner, DataType::Int32)
+			if matches!(inner.as_ref(), ExecutionExpr::Column(column)
+				if column.name.0 == "amount" && column.data_type == DataType::Int32)
+	));
+}
+
+#[tokio::test]
+async fn safe_cast_is_alias_for_try_cast() {
+	let try_results = run_logical(&plan_sql("SELECT TRY_CAST(amount AS BIGINT) FROM sales")).await;
+	let safe_results =
+		run_logical(&plan_sql("SELECT SAFE_CAST(amount AS BIGINT) FROM sales")).await;
+	assert_eq!(
+		scalar_int64_column_rows(&try_results, 0),
+		scalar_int64_column_rows(&safe_results, 0)
+	);
+}
+
+#[tokio::test]
+async fn try_cast_over_strict_cast_propagates_inner_error() {
+	let err =
+		execute_sql_err("SELECT TRY_CAST(CAST(price * 1000000000.0 AS INT) AS BIGINT) FROM sales")
+			.await;
+	assert_kernel_error_prefix(err, "cast failed: Float64 to Int32:");
+}
+
+#[tokio::test]
 async fn bind_explicit_cast_preserves_identity_node() {
 	let (catalog, _) = fixture();
 	let bound = bind(
@@ -1601,14 +1773,6 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 	);
 	assert_unsupported("SELECT CAST(amount AS VARCHAR) FROM sales");
 	assert_unsupported_message(
-		"SELECT TRY_CAST(amount AS BIGINT) FROM sales",
-		"unsupported cast syntax: TRY_CAST; only CAST(... AS ...) is supported",
-	);
-	assert_unsupported_message(
-		"SELECT SAFE_CAST(amount AS BIGINT) FROM sales",
-		"unsupported cast syntax: SAFE_CAST; only CAST(... AS ...) is supported",
-	);
-	assert_unsupported_message(
 		"SELECT amount::BIGINT FROM sales",
 		"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
 	);
@@ -1635,10 +1799,56 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 	);
 }
 
+#[tokio::test]
+async fn sql_try_cast_rejects_unsupported_targets_sources_and_syntax() {
+	assert_unsupported("SELECT TRY_CAST(amount AS VARCHAR) FROM sales");
+	assert_unsupported_message(
+		"SELECT TRY_CAST(amount AS FLOAT) FROM sales",
+		"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
+	);
+	assert_unsupported_message(
+		"SELECT TRY_CAST(amount AS BIGINT FORMAT '999') FROM sales",
+		"CAST FORMAT clause is not supported",
+	);
+	assert_unsupported_message(
+		"SELECT amount::BIGINT FROM sales",
+		"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
+	);
+
+	let (catalog, _) = fixture();
+	let err = bind(
+		&plan_sql("SELECT TRY_CAST(region AS BIGINT) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("non-numeric try cast source should fail binding");
+	assert!(
+		matches!(
+			err,
+			BindingError::TypeMismatch { ref message }
+				if message == "unsupported TRY_CAST/SAFE_CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+		),
+		"unexpected binding error: {err:?}"
+	);
+}
+
 #[test]
 fn aggregate_argument_cast_remains_column_only() {
 	assert_unsupported_message(
 		"SELECT SUM(CAST(amount AS BIGINT)) FROM sales",
+		"aggregate arguments must be simple column references",
+	);
+}
+
+#[test]
+fn aggregate_argument_try_cast_remains_column_only() {
+	assert_unsupported_message(
+		"SELECT SUM(TRY_CAST(amount AS BIGINT)) FROM sales",
+		"aggregate arguments must be simple column references",
+	);
+	assert_unsupported_message(
+		"SELECT COUNT(SAFE_CAST(id AS BIGINT)) FROM sales",
 		"aggregate arguments must be simple column references",
 	);
 }
@@ -2758,6 +2968,39 @@ fn region_int64_rows(
 			.as_any()
 			.downcast_ref::<Int64Array>()
 			.expect("Int64 value column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let value = if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			};
+			rows.insert(region, value);
+		}
+	}
+	rows
+}
+
+fn region_int32_rows(
+	results: &[RecordBatch],
+	value_column_idx: usize,
+) -> HashMap<Option<String>, Option<i32>> {
+	let mut rows = HashMap::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let values = batch
+			.column(value_column_idx)
+			.as_any()
+			.downcast_ref::<Int32Array>()
+			.expect("Int32 value column");
 		for row in 0..batch.num_rows() {
 			let region = if regions.is_null(row) {
 				None

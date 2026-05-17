@@ -196,6 +196,89 @@ async fn pbc_declines_identity_cast_filter() {
 	);
 }
 
+#[tokio::test]
+async fn pbc_declines_try_cast_filter() {
+	let batch = batch();
+	let observations = Arc::new(Mutex::new(Vec::new()));
+	let storage = Arc::new(RecordingStorageScan {
+		batch,
+		observations: observations.clone(),
+	});
+	let executor = Executor::new(storage);
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(1), descriptor())
+		.expect("register descriptor");
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Scan {
+			table: TableId(1),
+			projection: None,
+		}),
+		predicate: Expr::IsNotNull(Box::new(Expr::TryCast(
+			Box::new(Expr::column("amount")),
+			DataType::Int64,
+		))),
+	};
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+
+	executor
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute bound");
+
+	let observations = observations.lock().unwrap();
+	assert_eq!(observations.len(), 1);
+	assert!(
+		!observations[0],
+		"try cast filter must not send pbc_predicate"
+	);
+}
+
+#[tokio::test]
+async fn pbc_declines_identity_try_cast_filter() {
+	let batch = batch();
+	let observations = Arc::new(Mutex::new(Vec::new()));
+	let storage = Arc::new(RecordingStorageScan {
+		batch,
+		observations: observations.clone(),
+	});
+	let executor = Executor::new(storage);
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(1), descriptor())
+		.expect("register descriptor");
+	let logical = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::Scan {
+			table: TableId(1),
+			projection: None,
+		}),
+		predicate: Expr::Gt(
+			Box::new(Expr::TryCast(
+				Box::new(Expr::column("amount")),
+				DataType::Int32,
+			)),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(100)))),
+		),
+	};
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+
+	executor
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute bound");
+
+	let observations = observations.lock().unwrap();
+	assert_eq!(observations.len(), 1);
+	assert!(
+		!observations[0],
+		"identity try cast filter must not send pbc_predicate"
+	);
+}
+
 #[test]
 fn no_public_result_string_boundaries() {
 	let manifest_dir = manifest_dir();
@@ -828,6 +911,7 @@ fn adr024_scalar_arithmetic_guards_are_narrow() {
 		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
 	for variant in [
 		"Cast(Box<Expr>, DataType)",
+		"TryCast(Box<Expr>, DataType)",
 		"Add(Box<Expr>, Box<Expr>)",
 		"Sub(Box<Expr>, Box<Expr>)",
 		"Mul(Box<Expr>, Box<Expr>)",
@@ -840,6 +924,7 @@ fn adr024_scalar_arithmetic_guards_are_narrow() {
 		.expect("read execution IR source");
 	for variant in [
 		"Cast(Box<ExecutionExpr>, DataType)",
+		"TryCast(Box<ExecutionExpr>, DataType)",
 		"Add(Box<ExecutionExpr>, Box<ExecutionExpr>)",
 		"Sub(Box<ExecutionExpr>, Box<ExecutionExpr>)",
 		"Mul(Box<ExecutionExpr>, Box<ExecutionExpr>)",
@@ -884,11 +969,19 @@ fn adr024_scalar_arithmetic_guards_are_narrow() {
 	}
 
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source");
-	assert!(pbc.contains("arithmetic and Cast are not PBC-eligible"));
+	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
 	assert!(!pbc.contains("OP_ADD"));
 	assert!(!pbc.contains("OP_SUB"));
 	assert!(!pbc.contains("OP_MUL"));
 	assert!(!pbc.contains("OP_DIV"));
+
+	let pbc_helper = brace_blocks_after_marker(&logical_source, "fn is_pbc_pushdown_eligible")
+		.into_iter()
+		.next()
+		.expect("is_pbc_pushdown_eligible body")
+		.1;
+	assert!(pbc_helper.contains("Self::TryCast(_, _)"));
+	assert!(pbc_helper.contains("false"));
 }
 
 #[test]
@@ -969,14 +1062,14 @@ fn adr025_order_by_cast_uses_hidden_sort_projection() {
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(hidden_gate.contains("expr_contains_cast(&key.expr)"));
+	assert!(hidden_gate.contains("expr_contains_cast_family(&key.expr)"));
 
-	let contains_cast = brace_blocks_after_marker(&planner, "fn expr_contains_cast")
+	let contains_cast = brace_blocks_after_marker(&planner, "fn expr_contains_cast_family")
 		.into_iter()
 		.next()
-		.expect("expr_contains_cast body")
+		.expect("expr_contains_cast_family body")
 		.1;
-	assert!(contains_cast.contains("Expr::Cast(_, _) => true"));
+	assert!(contains_cast.contains("Expr::Cast(_, _) | Expr::TryCast(_, _) => true"));
 	assert!(contains_cast.contains("Expr::Add(left, right)"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
@@ -1158,7 +1251,7 @@ fn adr025_cast_failure_returns_kernel_error_with_prefix() {
 }
 
 #[test]
-fn adr025_cast_syntax_variants_are_rejected() {
+fn adr026_cast_syntax_doublecolon_and_format_remain_rejected() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
 	let lower_expr = brace_blocks_after_marker(&planner, "fn lower_expr")
@@ -1168,18 +1261,19 @@ fn adr025_cast_syntax_variants_are_rejected() {
 		.1;
 
 	for rejected in [
-		"CastKind::TryCast",
-		"unsupported cast syntax: TRY_CAST; only CAST(... AS ...) is supported",
-		"CastKind::SafeCast",
-		"unsupported cast syntax: SAFE_CAST; only CAST(... AS ...) is supported",
 		"CastKind::DoubleColon",
 		"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
+		"CAST FORMAT clause is not supported",
 	] {
 		assert!(
 			lower_expr.contains(rejected),
 			"missing syntax guard {rejected}"
 		);
 	}
+	assert!(lower_expr.contains("CastKind::TryCast | CastKind::SafeCast"));
+	assert!(lower_expr.contains("Ok(Expr::TryCast"));
+	assert!(!lower_expr.contains("unsupported cast syntax: TRY_CAST"));
+	assert!(!lower_expr.contains("unsupported cast syntax: SAFE_CAST"));
 }
 
 #[test]
@@ -1230,6 +1324,199 @@ fn adr025_float_to_int_uses_exclusive_upper_bound() {
 			.1
 			.contains("f64::from(value).trunc()")
 	);
+}
+
+#[test]
+fn adr026_try_cast_ir_surface_is_narrow() {
+	let logical_source =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	assert!(logical_source.contains("TryCast(Box<Expr>, DataType)"));
+	let logical_pbc = brace_blocks_after_marker(&logical_source, "fn is_pbc_pushdown_eligible")
+		.into_iter()
+		.next()
+		.expect("logical pbc eligibility body")
+		.1;
+	assert!(logical_pbc.contains("Self::TryCast(_, _)"));
+	assert!(logical_pbc.contains("false"));
+
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	assert!(execution_source.contains("TryCast(Box<ExecutionExpr>, DataType)"));
+	let data_type = brace_blocks_after_marker(&execution_source, "fn data_type")
+		.into_iter()
+		.next()
+		.expect("data_type body")
+		.1;
+	assert!(data_type.contains("Self::Cast(_, target) | Self::TryCast(_, target)"));
+	let nullable = brace_blocks_after_marker(&execution_source, "fn nullable")
+		.into_iter()
+		.next()
+		.expect("nullable body")
+		.1;
+	assert!(nullable.contains("Self::TryCast(_, _) => true"));
+	let pbc_eligible = brace_blocks_after_marker(&execution_source, "fn pbc_eligible")
+		.into_iter()
+		.next()
+		.expect("execution pbc eligibility body")
+		.1;
+	assert!(pbc_eligible.contains("Self::TryCast(_, _)"));
+	assert!(pbc_eligible.contains("false"));
+}
+
+#[test]
+fn adr026_try_cast_lowers_via_planner() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let lower_expr = brace_blocks_after_marker(&planner, "fn lower_expr")
+		.into_iter()
+		.next()
+		.expect("lower_expr body")
+		.1;
+	assert!(lower_expr.contains("CastKind::TryCast | CastKind::SafeCast"));
+	assert!(lower_expr.contains("Ok(Expr::TryCast"));
+	assert!(lower_expr.contains("lower_cast_target_type(data_type)?"));
+	assert!(lower_expr.contains("CastKind::DoubleColon"));
+	assert!(lower_expr.contains("CAST FORMAT clause is not supported"));
+}
+
+#[test]
+fn adr026_try_cast_policy_is_separate() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let bind_try_cast = brace_blocks_after_marker(&binder, "fn bind_try_cast")
+		.into_iter()
+		.next()
+		.expect("bind_try_cast body")
+		.1;
+	assert!(bind_try_cast.contains("is_supported_explicit_numeric_cast"));
+	assert!(bind_try_cast.contains("unsupported TRY_CAST/SAFE_CAST"));
+	assert!(bind_try_cast.contains("Ok(ExecutionExpr::TryCast(Box::new(inner), target.clone()))"));
+	assert!(
+		!bind_try_cast.contains("if source == *target"),
+		"bind_try_cast must not elide identity TryCast"
+	);
+	assert!(
+		!bind_try_cast.contains("if source == target"),
+		"bind_try_cast must not elide identity TryCast"
+	);
+	assert!(binder.contains("ExecutionExpr::TryCast(inner, _)"));
+	assert!(binder.contains("ExecutionExpr::TryCast(inner, target)"));
+}
+
+#[test]
+fn adr026_try_cast_supports_numeric_primitive_lattice() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let evaluate_try_cast = brace_blocks_after_marker(&exec, "fn evaluate_try_cast")
+		.into_iter()
+		.next()
+		.expect("evaluate_try_cast body")
+		.1;
+	assert!(evaluate_try_cast.contains("if array.data_type() == target"));
+	assert!(!evaluate_try_cast.contains("evaluate_cast("));
+
+	for arm in [
+		"(DataType::Int32, DataType::Int64) => cast_i32_to_i64(array)",
+		"(DataType::Int32, DataType::Float32) => cast_i32_to_f32(array)",
+		"(DataType::Int32, DataType::Float64) => cast_i32_to_f64(array)",
+		"(DataType::Int64, DataType::Float32) => cast_i64_to_f32(array)",
+		"(DataType::Int64, DataType::Float64) => cast_i64_to_f64(array)",
+		"(DataType::Float32, DataType::Float64) => cast_f32_to_f64(array)",
+		"(DataType::Int64, DataType::Int32) => try_cast_i64_to_i32(array)",
+		"(DataType::Float64, DataType::Float32) => try_cast_f64_to_f32(array)",
+		"(DataType::Float32, DataType::Int32) => try_cast_f32_to_i32(array)",
+		"(DataType::Float32, DataType::Int64) => try_cast_f32_to_i64(array)",
+		"(DataType::Float64, DataType::Int32) => try_cast_f64_to_i32(array)",
+		"(DataType::Float64, DataType::Int64) => try_cast_f64_to_i64(array)",
+	] {
+		assert!(
+			evaluate_try_cast.contains(arm),
+			"missing evaluate_try_cast arm {arm}"
+		);
+	}
+}
+
+#[test]
+fn adr026_try_cast_nulls_only_data_domain_failures() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	assert!(!exec.contains("catch_unwind"));
+	for kernel in [
+		"fn try_cast_i64_to_i32",
+		"fn try_cast_f64_to_f32",
+		"fn try_cast_f32_to_i32",
+		"fn try_cast_f32_to_i64",
+		"fn try_cast_f64_to_i32",
+		"fn try_cast_f64_to_i64",
+	] {
+		let body = brace_blocks_after_marker(&exec, kernel)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{kernel} body"))
+			.1;
+		assert!(
+			!body.contains("cast_failed("),
+			"{kernel} must not emit cast_failed errors"
+		);
+		assert!(
+			!body.contains("ExecutionError::Kernel"),
+			"{kernel} must not construct Kernel errors directly"
+		);
+		assert!(body.contains("return None"), "{kernel} must emit None");
+	}
+
+	for (kernel, bound) in [
+		("fn try_cast_f32_to_i32", "trunc < F64_I32_UPPER"),
+		("fn try_cast_f32_to_i64", "trunc < F64_I64_UPPER"),
+		("fn try_cast_f64_to_i32", "trunc < F64_I32_UPPER"),
+		("fn try_cast_f64_to_i64", "trunc < F64_I64_UPPER"),
+	] {
+		let body = brace_blocks_after_marker(&exec, kernel)
+			.into_iter()
+			.next()
+			.unwrap_or_else(|| panic!("{kernel} body"))
+			.1;
+		assert!(body.contains(bound), "{kernel} missing bound {bound}");
+	}
+	assert!(
+		brace_blocks_after_marker(&exec, "fn try_cast_f64_to_f32")
+			.into_iter()
+			.next()
+			.expect("try_cast_f64_to_f32 body")
+			.1
+			.contains("value.is_finite() && value.abs() > f32::MAX as f64")
+	);
+}
+
+#[test]
+fn adr026_try_cast_pbc_declines() {
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source");
+	assert!(pbc.contains("ExecutionExpr::TryCast(_, _)"));
+	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
+	assert!(!pbc.contains("OP_CAST"));
+	assert!(!pbc.contains("OP_TRY_CAST"));
+}
+
+#[test]
+fn adr026_try_cast_order_by_uses_hidden_sort_projection() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(planner.contains("fn expr_contains_cast_family"));
+	assert!(!planner.contains("fn expr_contains_cast("));
+
+	let cast_family = brace_blocks_after_marker(&planner, "fn expr_contains_cast_family")
+		.into_iter()
+		.next()
+		.expect("expr_contains_cast_family body")
+		.1;
+	assert!(cast_family.contains("Expr::Cast(_, _) | Expr::TryCast(_, _) => true"));
+
+	let sort_gate = brace_blocks_after_marker(&planner, "fn sort_needs_hidden_projection")
+		.into_iter()
+		.next()
+		.expect("sort_needs_hidden_projection body")
+		.1;
+	assert!(sort_gate.contains("expr_contains_cast_family(&key.expr)"));
 }
 
 #[test]

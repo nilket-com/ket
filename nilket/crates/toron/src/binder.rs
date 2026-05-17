@@ -995,7 +995,9 @@ fn collect_expr_columns(expr: &ExecutionExpr, columns: &mut BTreeSet<ColumnOrdin
 			columns.insert(column.ordinal);
 		}
 		ExecutionExpr::Literal(_) => {}
-		ExecutionExpr::Cast(inner, _) => collect_expr_columns(inner, columns),
+		ExecutionExpr::Cast(inner, _) | ExecutionExpr::TryCast(inner, _) => {
+			collect_expr_columns(inner, columns)
+		}
 		ExecutionExpr::Add(left, right)
 		| ExecutionExpr::Sub(left, right)
 		| ExecutionExpr::Mul(left, right)
@@ -1034,6 +1036,10 @@ fn rewrite_expr_ordinals(
 		}
 		ExecutionExpr::Literal(value) => Ok(ExecutionExpr::Literal(value)),
 		ExecutionExpr::Cast(inner, target) => Ok(ExecutionExpr::Cast(
+			Box::new(rewrite_expr_ordinals(*inner, remap)?),
+			target,
+		)),
+		ExecutionExpr::TryCast(inner, target) => Ok(ExecutionExpr::TryCast(
 			Box::new(rewrite_expr_ordinals(*inner, remap)?),
 			target,
 		)),
@@ -1230,6 +1236,7 @@ fn bind_expr(
 		)?)),
 		Expr::Literal(value) => Ok(ExecutionExpr::Literal(value.clone())),
 		Expr::Cast(inner, target) => bind_explicit_cast(input_schema, config, inner, target),
+		Expr::TryCast(inner, target) => bind_try_cast(input_schema, config, inner, target),
 		Expr::Add(left, right) => {
 			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Add)
 		}
@@ -1336,6 +1343,24 @@ fn bind_explicit_cast(
 		});
 	}
 	Ok(ExecutionExpr::Cast(Box::new(inner), target.clone()))
+}
+
+fn bind_try_cast(
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+	inner: &Expr,
+	target: &DataType,
+) -> Result<ExecutionExpr, BindingError> {
+	let inner = bind_expr(inner, input_schema, config)?;
+	let source = inner.data_type();
+	if !is_supported_explicit_numeric_cast(&source, target) {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"unsupported TRY_CAST/SAFE_CAST: {source:?} to {target:?}; only Int32, Int64, Float32, and Float64 are supported"
+			),
+		});
+	}
+	Ok(ExecutionExpr::TryCast(Box::new(inner), target.clone()))
 }
 
 fn cast_if_needed(expr: ExecutionExpr, target: &DataType) -> Result<ExecutionExpr, BindingError> {

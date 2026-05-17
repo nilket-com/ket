@@ -34,6 +34,7 @@ pub enum ExecutionExpr {
 	Column(ResolvedColumn),
 	Literal(ScalarValue),
 	Cast(Box<ExecutionExpr>, DataType),
+	TryCast(Box<ExecutionExpr>, DataType),
 	Add(Box<ExecutionExpr>, Box<ExecutionExpr>),
 	Sub(Box<ExecutionExpr>, Box<ExecutionExpr>),
 	Mul(Box<ExecutionExpr>, Box<ExecutionExpr>),
@@ -141,7 +142,7 @@ impl ExecutionExpr {
 		match self {
 			Self::Column(column) => column.data_type.clone(),
 			Self::Literal(value) => value.data_type(),
-			Self::Cast(_, target) => target.clone(),
+			Self::Cast(_, target) | Self::TryCast(_, target) => target.clone(),
 			Self::Add(left, right)
 			| Self::Sub(left, right)
 			| Self::Mul(left, right)
@@ -177,6 +178,7 @@ impl ExecutionExpr {
 			},
 			Self::IsNull(_) | Self::IsNotNull(_) => false,
 			Self::Cast(inner, _) => inner.nullable(),
+			Self::TryCast(_, _) => true,
 			Self::Add(left, right) | Self::Sub(left, right) | Self::Mul(left, right) => {
 				left.nullable() || right.nullable()
 			}
@@ -200,6 +202,7 @@ impl ExecutionExpr {
 			Self::Column(column) => column.pbc_eligible,
 			Self::Literal(_) => true,
 			Self::Cast(_, _)
+			| Self::TryCast(_, _)
 			| Self::Add(_, _)
 			| Self::Sub(_, _)
 			| Self::Mul(_, _)
@@ -250,4 +253,33 @@ pub fn schema_for_exprs(exprs: &[ExecutionExpr]) -> SchemaRef {
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn non_nullable_pbc_column() -> ExecutionExpr {
+		ExecutionExpr::Column(ResolvedColumn {
+			name: ColumnName("amount".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type: DataType::Int32,
+			nullable: false,
+			pbc_eligible: true,
+		})
+	}
+
+	#[test]
+	fn try_cast_execution_nullable_is_always_true() {
+		let try_cast = ExecutionExpr::TryCast(Box::new(non_nullable_pbc_column()), DataType::Int32);
+
+		assert!(try_cast.nullable());
+	}
+
+	#[test]
+	fn try_cast_execution_pbc_eligible_is_false() {
+		let try_cast = ExecutionExpr::TryCast(Box::new(non_nullable_pbc_column()), DataType::Int64);
+
+		assert!(!try_cast.pbc_eligible());
+	}
 }

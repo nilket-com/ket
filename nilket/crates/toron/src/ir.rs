@@ -70,6 +70,7 @@ pub enum Expr {
 	Column(ColumnRef),
 	Literal(ScalarValue),
 	Cast(Box<Expr>, DataType),
+	TryCast(Box<Expr>, DataType),
 	Add(Box<Expr>, Box<Expr>),
 	Sub(Box<Expr>, Box<Expr>),
 	Mul(Box<Expr>, Box<Expr>),
@@ -105,6 +106,7 @@ impl Expr {
 		match self {
 			Self::Column(_) | Self::Literal(_) => true,
 			Self::Cast(_, _)
+			| Self::TryCast(_, _)
 			| Self::Add(_, _)
 			| Self::Sub(_, _)
 			| Self::Mul(_, _)
@@ -224,5 +226,17 @@ pub fn project_plan(
 		input: Box::new(input),
 		exprs,
 		output_names,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn try_cast_is_not_pbc_pushdown_eligible() {
+		let try_cast = Expr::TryCast(Box::new(Expr::column("amount")), DataType::Int64);
+
+		assert!(!try_cast.is_pbc_pushdown_eligible());
 	}
 }
