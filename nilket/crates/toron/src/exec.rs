@@ -183,6 +183,10 @@ impl Executor {
 		Self { storage, context }
 	}
 
+	pub fn context(&self) -> &ExecutionContext {
+		&self.context
+	}
+
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
@@ -557,6 +561,9 @@ impl Executor {
 				LogicalPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound CREATE TABLE execution",
 				}),
+				LogicalPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound INSERT execution",
+				}),
 			}
 		})
 	}
@@ -710,6 +717,9 @@ impl Executor {
 				}
 				ExecutionPlan::CreateTable { .. } => Err(ExecutionError::NotImplemented {
 					feature: "CREATE TABLE execution is coordinator-only",
+				}),
+				ExecutionPlan::Insert { .. } => Err(ExecutionError::NotImplemented {
+					feature: "INSERT execution is coordinator-only",
 				}),
 			}
 		})

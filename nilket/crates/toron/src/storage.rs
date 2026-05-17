@@ -5,7 +5,8 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
+use std::sync::{Arc, Mutex};
 use wendelon::schema::pbc::OP_PROJECT;
 use wendelon::schema::{
 	PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, TableObjectId,
@@ -45,6 +46,25 @@ pub struct ScanRequest {
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub morsel: Option<(MorselId, u32)>,
+}
+
+#[derive(Debug)]
+pub struct WriteRequest {
+	pub session_id: SessionId,
+	pub query_id: QueryId,
+	pub tenant_id: TenantId,
+	pub table_id: TableId,
+	pub table_object_id: TableObjectId,
+	pub physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub payload: RecordBatch,
+	pub profile_hint: Option<QueryProfileHint>,
+	pub trace_context: Option<TraceContext>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteOutcome {
+	pub rows: usize,
 }
 
 pub struct ScanStream {
@@ -93,6 +113,11 @@ pub trait StorageScan: Send + Sync {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError>;
 }
 
+#[async_trait::async_trait]
+pub trait StorageWrite: Send + Sync {
+	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError>;
+}
+
 pub struct InMemoryStorageScan {
 	pub table_data: RecordBatch,
 }
@@ -100,59 +125,150 @@ pub struct InMemoryStorageScan {
 #[async_trait::async_trait]
 impl StorageScan for InMemoryStorageScan {
 	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
-		let mut batch = self.table_data.clone();
-
-		if let Some((morsel_id, total_morsels)) = request.morsel {
-			let total_rows = batch.num_rows();
-			let rows_per_morsel =
-				(total_rows + total_morsels as usize - 1) / total_morsels as usize;
-			let start_row = (morsel_id.0 as usize) * rows_per_morsel;
-			let end_row = std::cmp::min(start_row + rows_per_morsel, total_rows);
-
-			if start_row < total_rows {
-				batch = batch.slice(start_row, end_row - start_row);
-			} else {
-				batch = batch.slice(0, 0); // Empty batch for out of bounds morsels
-			}
-		}
-
-		if let Some(runtime_filter) = &request.runtime_filter {
-			if validate_runtime_filter_descriptor(
-				runtime_filter,
-				batch.schema().as_ref(),
-				request.physical_descriptor_fingerprint,
-			)
-			.is_ok()
-			{
-				if let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, runtime_filter) {
-					batch = arrow::compute::filter_record_batch(&batch, &mask)?;
-				}
-			}
-		}
-
-		if let Some(pbc) = request.pbc_predicate {
-			batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
-				StorageError::InvalidPbcProgram {
-					message: format!("{error:?}"),
-				}
-			})?;
-		}
-
-		if let Some(cols) = request.projected_columns {
-			let indices = cols
-				.into_iter()
-				.map(|column| column.0 as usize)
-				.collect::<Vec<_>>();
-			batch = batch.project(&indices)?;
-		}
-
-		Ok(ScanStream::from_batches(
-			batch.schema(),
-			request.session_id,
-			request.query_id,
-			vec![batch],
-		))
+		scan_in_memory_batch(self.table_data.clone(), request)
 	}
+}
+
+struct InMemoryTableData {
+	table_object_id: TableObjectId,
+	physical_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	batch: RecordBatch,
+}
+
+pub struct InMemoryTableStorage {
+	tables: Mutex<HashMap<TableId, InMemoryTableData>>,
+}
+
+impl InMemoryTableStorage {
+	pub fn new() -> Self {
+		Self {
+			tables: Mutex::new(HashMap::new()),
+		}
+	}
+}
+
+impl Default for InMemoryTableStorage {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageWrite for InMemoryTableStorage {
+	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		let mut tables = self
+			.tables
+			.lock()
+			.expect("InMemoryTableStorage lock poisoned");
+		let rows = request.payload.num_rows();
+		match tables.entry(request.table_id) {
+			Entry::Vacant(entry) => {
+				entry.insert(InMemoryTableData {
+					table_object_id: request.table_object_id,
+					physical_descriptor_fingerprint: request.physical_descriptor_fingerprint,
+					batch: request.payload,
+				});
+			}
+			Entry::Occupied(mut entry) => {
+				let data = entry.get_mut();
+				if data.table_object_id != request.table_object_id
+					|| data.physical_descriptor_fingerprint
+						!= request.physical_descriptor_fingerprint
+				{
+					return Err(StorageError::DescriptorEvolved);
+				}
+				if data.batch.schema() != request.payload.schema() {
+					return Err(StorageError::Internal {
+						message: "INSERT payload schema does not match existing table schema"
+							.to_string(),
+					});
+				}
+				let batches = [data.batch.clone(), request.payload];
+				data.batch = arrow::compute::concat_batches(&data.batch.schema(), batches.iter())?;
+			}
+		}
+		Ok(WriteOutcome { rows })
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageScan for InMemoryTableStorage {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		let batch = {
+			let tables = self
+				.tables
+				.lock()
+				.expect("InMemoryTableStorage lock poisoned");
+			let data = tables
+				.get(&request.table_id)
+				.ok_or(StorageError::TableNotFound {
+					table: request.table_id,
+				})?;
+			if data.table_object_id != request.table_object_id {
+				return Err(StorageError::DescriptorEvolved);
+			}
+			if data.physical_descriptor_fingerprint != request.physical_descriptor_fingerprint {
+				return Err(StorageError::DescriptorEvolved);
+			}
+			data.batch.clone()
+		};
+		scan_in_memory_batch(batch, request)
+	}
+}
+
+fn scan_in_memory_batch(
+	mut batch: RecordBatch,
+	request: ScanRequest,
+) -> Result<ScanStream, StorageError> {
+	if let Some((morsel_id, total_morsels)) = request.morsel {
+		let total_rows = batch.num_rows();
+		let rows_per_morsel = (total_rows + total_morsels as usize - 1) / total_morsels as usize;
+		let start_row = (morsel_id.0 as usize) * rows_per_morsel;
+		let end_row = std::cmp::min(start_row + rows_per_morsel, total_rows);
+
+		if start_row < total_rows {
+			batch = batch.slice(start_row, end_row - start_row);
+		} else {
+			batch = batch.slice(0, 0);
+		}
+	}
+
+	if let Some(runtime_filter) = &request.runtime_filter {
+		if validate_runtime_filter_descriptor(
+			runtime_filter,
+			batch.schema().as_ref(),
+			request.physical_descriptor_fingerprint,
+		)
+		.is_ok()
+		{
+			if let Ok(mask) = build_runtime_filter_mask_for_batch(&batch, runtime_filter) {
+				batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+			}
+		}
+	}
+
+	if let Some(pbc) = request.pbc_predicate {
+		batch = wendelon::schema::pbc::execute(&pbc, &batch).map_err(|error| {
+			StorageError::InvalidPbcProgram {
+				message: format!("{error:?}"),
+			}
+		})?;
+	}
+
+	if let Some(cols) = request.projected_columns {
+		let indices = cols
+			.into_iter()
+			.map(|column| column.0 as usize)
+			.collect::<Vec<_>>();
+		batch = batch.project(&indices)?;
+	}
+
+	Ok(ScanStream::from_batches(
+		batch.schema(),
+		request.session_id,
+		request.query_id,
+		vec![batch],
+	))
 }
 
 pub struct WendelonStorageScan {
@@ -233,6 +349,70 @@ impl StorageScan for WendelonStorageScan {
 			request.query_id,
 			query_result.batches,
 		))
+	}
+}
+
+pub struct WendelonStorageWrite {
+	client: Arc<wendelon_client::Client>,
+	descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+}
+
+impl WendelonStorageWrite {
+	pub fn new(
+		client: Arc<wendelon_client::Client>,
+		descriptors: HashMap<TableId, wendelon_client::TableSchemaDescriptor>,
+	) -> Self {
+		Self {
+			client,
+			descriptors,
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageWrite for WendelonStorageWrite {
+	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		let descriptor =
+			self.descriptors
+				.get(&request.table_id)
+				.ok_or(StorageError::TableNotFound {
+					table: request.table_id,
+				})?;
+		if request.table_object_id != descriptor.table_object_id {
+			return Err(StorageError::DescriptorEvolved);
+		}
+		if request.physical_descriptor_fingerprint != descriptor.physical_descriptor_fingerprint {
+			return Err(StorageError::DescriptorEvolved);
+		}
+
+		let descriptor_schema =
+			descriptor
+				.arrow_schema()
+				.map_err(|error| StorageError::Internal {
+					message: format!("descriptor arrow_schema: {error}"),
+				})?;
+		if request.payload.schema().as_ref() != &descriptor_schema {
+			return Err(StorageError::Internal {
+				message: "INSERT payload schema does not match descriptor".to_string(),
+			});
+		}
+
+		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
+		let receipt = self
+			.client
+			.table_write(
+				tenant_id,
+				descriptor,
+				request.payload,
+				wendelon_client::WriteOptions {
+					await_finalization: true,
+					..Default::default()
+				},
+			)
+			.await
+			.map_err(StorageError::from)?;
+
+		Ok(WriteOutcome { rows: receipt.rows })
 	}
 }
 

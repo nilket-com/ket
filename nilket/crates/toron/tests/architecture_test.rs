@@ -563,11 +563,13 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 10);
+	assert_eq!(enum_variant_count(logical_plan), 11);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("CreateTable {"));
+	assert!(logical_plan.contains("Insert {"));
 	assert!(logical_plan.contains("output_names: Vec<Option<String>>"));
 	assert!(logical_source.contains("pub struct SortExpr"));
+	assert!(logical_source.contains("pub enum InsertLiteral"));
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
@@ -576,9 +578,10 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 8);
+	assert_eq!(enum_variant_count(execution_plan), 9);
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
+	assert!(execution_plan.contains("Insert {"));
 	assert!(execution_source.contains("pub struct ExecutionSortKey"));
 }
 
@@ -2163,7 +2166,7 @@ fn g17_join_ir_surface_has_single_join_variant_and_two_strategies() {
 	let join_strategy = logical_source
 		.split("pub enum JoinStrategy")
 		.nth(1)
-		.and_then(|rest| rest.split("pub enum LogicalPlan").next())
+		.and_then(|rest| rest.split("pub enum InsertLiteral").next())
 		.expect("JoinStrategy block");
 	let logical_plan = logical_source
 		.split("pub enum LogicalPlan")
@@ -2280,9 +2283,11 @@ fn adr029_sql_planner_accepts_only_select_and_create_table() {
 
 	assert!(plan_body.contains("Statement::Query(query)"));
 	assert!(plan_body.contains("Statement::CreateTable(create_table)"));
-	assert!(
-		plan_body.contains("unsupported SQL statement; only SELECT and CREATE TABLE are supported")
-	);
+	assert!(plan_body.contains("Statement::Insert(insert)"));
+	assert!(plan_body.contains(
+		"unsupported SQL statement; only SELECT, CREATE TABLE, and INSERT are supported"
+	));
+	assert!(!plan_body.contains("only SELECT and CREATE TABLE are supported"));
 	assert!(!plan_body.contains("only SELECT is supported"));
 }
 
@@ -2557,6 +2562,248 @@ fn adr029_executor_and_fragmenter_reject_create_table() {
 	assert!(fragment_plan.contains("ExecutionPlan::CreateTable"));
 	assert!(
 		fragment_plan.find("ExecutionPlan::CreateTable").unwrap()
+			< fragment_plan.find("count_exchanges").unwrap()
+	);
+}
+
+#[test]
+fn adr030_insert_destructure_is_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let body = brace_blocks_after_marker(&planner, "fn lower_insert(")
+		.into_iter()
+		.next()
+		.expect("lower_insert body")
+		.1;
+
+	for marker in [
+		"or",
+		"ignore",
+		"into",
+		"table",
+		"table_alias",
+		"columns",
+		"overwrite",
+		"source",
+		"assignments",
+		"partitioned",
+		"after_columns",
+		"has_table_keyword",
+		"on",
+		"returning",
+		"replace_into",
+		"priority",
+		"insert_alias",
+		"settings",
+		"format_clause",
+	] {
+		assert!(body.contains(marker), "lower_insert missing {marker}");
+	}
+	assert!(body.contains("missing INTO keyword"));
+	assert!(body.contains("TABLE keyword"));
+	assert!(!body.contains(".. }"));
+	assert!(!body.contains("..,"));
+}
+
+#[test]
+fn adr030_logical_plan_insert_uses_insert_literal() {
+	let logical =
+		std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read logical IR source");
+	let logical_plan = logical
+		.split("pub enum LogicalPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("pub fn project_plan").next())
+		.expect("LogicalPlan enum");
+
+	assert!(logical.contains("pub enum InsertLiteral"));
+	assert!(logical_plan.contains("rows: Vec<Vec<InsertLiteral>>"));
+	assert!(!logical_plan.contains("Vec<Vec<Expr>>"));
+}
+
+#[test]
+fn adr030_execution_plan_insert_has_no_record_batch() {
+	let execution = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+
+	assert!(execution_plan.contains("Insert {\n\t\tlegacy_table_id: TableId,"));
+	assert!(execution_plan.contains("table: TableObjectId,"));
+	assert!(execution_plan.contains("fingerprint: PhysicalDescriptorFingerprint,"));
+	assert!(execution_plan.contains("schema: SchemaRef,"));
+	assert!(execution_plan.contains("rows: Vec<Vec<ScalarValue>>,"));
+	let insert_body = execution_plan
+		.split("Insert {")
+		.nth(1)
+		.and_then(|rest| rest.split("},").next())
+		.expect("ExecutionPlan::Insert body");
+	assert!(!insert_body.contains("RecordBatch"));
+	assert!(!insert_body.contains("payload"));
+}
+
+#[test]
+fn adr030_catalog_has_no_insert_method() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/catalog.rs"))
+		.expect("read catalog source");
+	let trait_body = brace_blocks_after_marker(&catalog, "pub trait Catalog")
+		.into_iter()
+		.next()
+		.expect("Catalog trait body")
+		.1;
+
+	assert!(!trait_body.contains("insert"));
+	assert!(!trait_body.contains("write_"));
+}
+
+#[test]
+fn adr030_no_storage_synthetic_column_construction_in_toron() {
+	let coordinator_write =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+			.expect("read coordinator/write.rs");
+
+	for marker in [
+		"STORAGE_ROW_HLC_COLUMN",
+		"STORAGE_ROW_KEY_ID_COLUMN",
+		"STORAGE_ROW_ROUTING_LOCALITY_COLUMN",
+		"STORAGE_ROW_TABLE_OBJECT_ID_COLUMN",
+		"STORAGE_ROW_TOMBSTONE_COLUMN",
+		"__row_",
+	] {
+		assert!(
+			!coordinator_write.contains(marker),
+			"coordinator write helper must not construct storage synthetic column {marker}"
+		);
+	}
+}
+
+#[test]
+fn adr030_no_blake3_in_toron_insert_path() {
+	let cargo =
+		std::fs::read_to_string(manifest_dir().join("Cargo.toml")).expect("read toron Cargo.toml");
+	let coordinator_write =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+			.expect("read coordinator/write.rs");
+
+	assert!(!cargo.contains("blake3"));
+	assert!(!coordinator_write.contains("blake3"));
+}
+
+#[test]
+fn adr030_coordinator_insert_uses_wendelon_client_wrapper() {
+	let manifest_dir = manifest_dir();
+	let storage =
+		std::fs::read_to_string(manifest_dir.join("src/storage.rs")).expect("read storage source");
+	let write_impl =
+		brace_blocks_after_marker(&storage, "impl StorageWrite for WendelonStorageWrite")
+			.into_iter()
+			.next()
+			.expect("WendelonStorageWrite impl")
+			.1;
+
+	assert!(write_impl.contains("self\n\t\t\t.client\n\t\t\t.table_write("));
+	assert!(write_impl.contains("wendelon_client::WriteOptions"));
+	assert!(!storage.contains("TableWriteRequest {"));
+	for (path, line, text) in source_lines(&manifest_dir.join("src")) {
+		assert!(
+			!text.contains("TableWriteRequest {"),
+			"ADR 030 D8: Toron must not construct low-level TableWriteRequest at {}:{}: {}",
+			path.display(),
+			line,
+			text
+		);
+	}
+}
+
+#[test]
+fn adr030_write_options_set_await_finalization_true() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let write_impl =
+		brace_blocks_after_marker(&storage, "impl StorageWrite for WendelonStorageWrite")
+			.into_iter()
+			.next()
+			.expect("WendelonStorageWrite impl")
+			.1;
+
+	assert!(write_impl.contains("await_finalization: true"));
+	assert!(!write_impl.contains("WriteOptions::default()"));
+}
+
+#[test]
+fn adr030_wendelon_storage_write_mirrors_scan_error_mapping() {
+	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
+		.expect("read storage source");
+	let write_impl =
+		brace_blocks_after_marker(&storage, "impl StorageWrite for WendelonStorageWrite")
+			.into_iter()
+			.next()
+			.expect("WendelonStorageWrite impl")
+			.1;
+
+	assert!(write_impl.contains("StorageError::TableNotFound"));
+	assert!(write_impl.contains("StorageError::DescriptorEvolved"));
+	assert!(write_impl.contains("StorageError::Internal"));
+}
+
+#[test]
+fn adr030_local_coordinator_intercepts_insert_before_retry_loop() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let query_impl = coordinator
+		.split("impl QueryCoordinator")
+		.nth(1)
+		.expect("QueryCoordinator impl");
+	let insert_branch = query_impl
+		.find("matches!(plan, LogicalPlan::Insert")
+		.expect("local INSERT branch");
+	let retry_loop = query_impl
+		.find("let mut retried_descriptor_evolution = false")
+		.expect("descriptor retry loop");
+
+	assert!(insert_branch < retry_loop);
+	assert!(query_impl.contains("execute_write_plan(&bound).await"));
+	assert!(query_impl.contains("writer: Arc<dyn StorageWrite>"));
+}
+
+#[test]
+fn adr030_distributed_coordinator_rejects_insert_before_fragment_plan() {
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let distributed_impl = coordinator
+		.split("impl<Registry, Transport> DistributedQueryCoordinator")
+		.nth(1)
+		.expect("DistributedQueryCoordinator impl");
+	let insert_reject = distributed_impl
+		.find("ExecutionPlan::Insert")
+		.expect("distributed INSERT reject");
+	let fragment_call = distributed_impl
+		.find("fragment_plan(")
+		.expect("fragment plan call");
+
+	assert!(insert_reject < fragment_call);
+	assert!(distributed_impl.contains("distributed INSERT execution is not wired"));
+}
+
+#[test]
+fn adr030_executor_and_fragmenter_reject_insert() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let fragmenter = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let fragment_plan = brace_blocks_after_marker(&fragmenter, "pub fn fragment_plan")
+		.into_iter()
+		.next()
+		.expect("fragment_plan body")
+		.1;
+
+	assert!(exec.contains("INSERT execution is coordinator-only"));
+	assert!(fragmenter.contains("InsertNotFragmentable"));
+	assert!(fragment_plan.contains("ExecutionPlan::Insert"));
+	assert!(
+		fragment_plan.find("ExecutionPlan::Insert").unwrap()
 			< fragment_plan.find("count_exchanges").unwrap()
 	);
 }

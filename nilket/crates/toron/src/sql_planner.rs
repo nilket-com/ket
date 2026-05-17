@@ -6,15 +6,16 @@ use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
+	AggregateFunction, Expr, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan, ScalarValue,
+	SortExpr,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use sqlparser::ast::{
 	BinaryOperator, CastKind, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
 	DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr, Function, FunctionArg,
 	FunctionArgExpr, FunctionArgumentList, FunctionArguments, GroupByExpr, HiveDistributionStyle,
-	Ident, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem, SetExpr,
-	Statement, TableAlias, TableFactor, Value,
+	Ident, Insert, JoinConstraint, JoinOperator, ObjectName, OrderBy, Query, Select, SelectItem,
+	SetExpr, Statement, TableAlias, TableFactor, TableObject, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -124,6 +125,136 @@ fn lower_create_table_name(name: &ObjectName) -> Result<TableRef, FrontendError>
 			"CREATE TABLE supports only one- or two-part table names",
 		)),
 	}
+}
+
+fn lower_insert_target_name(target: &TableObject) -> Result<TableRef, FrontendError> {
+	match target {
+		TableObject::TableName(name) => match name.0.as_slice() {
+			[table] => Ok(TableRef::new(table.value.clone())),
+			[schema, table] => Ok(TableRef::with_schema(
+				schema.value.clone(),
+				table.value.clone(),
+			)),
+			_ => Err(unsupported(
+				"INSERT supports only one- or two-part table names",
+			)),
+		},
+		TableObject::TableFunction(_) => Err(unsupported(
+			"INSERT target must be a table name; table functions are not supported",
+		)),
+	}
+}
+
+fn lower_insert_column_list(columns: &[Ident]) -> Option<Vec<String>> {
+	if columns.is_empty() {
+		None
+	} else {
+		Some(columns.iter().map(|ident| ident.value.clone()).collect())
+	}
+}
+
+fn lower_insert_source(source: Option<&Query>) -> Result<Vec<Vec<InsertLiteral>>, FrontendError> {
+	let query = source.ok_or_else(|| unsupported("INSERT requires a VALUES clause"))?;
+	if query.with.is_some()
+		|| query.order_by.is_some()
+		|| query.limit.is_some()
+		|| !query.limit_by.is_empty()
+		|| query.offset.is_some()
+		|| query.fetch.is_some()
+		|| !query.locks.is_empty()
+		|| query.for_clause.is_some()
+		|| query.settings.is_some()
+		|| query.format_clause.is_some()
+	{
+		return Err(unsupported(
+			"unsupported INSERT source: must be VALUES only",
+		));
+	}
+
+	let values = match query.body.as_ref() {
+		SetExpr::Values(values) => values,
+		_ => {
+			return Err(unsupported(
+				"INSERT source must be VALUES (INSERT ... SELECT not supported)",
+			));
+		}
+	};
+	if values.explicit_row {
+		return Err(unsupported(
+			"unsupported INSERT clause: explicit ROW keyword",
+		));
+	}
+	if values.rows.is_empty() {
+		return Err(unsupported("INSERT VALUES must contain at least one row"));
+	}
+	if values.rows.iter().any(|row| row.is_empty()) {
+		return Err(unsupported(
+			"INSERT VALUES row must contain at least one literal",
+		));
+	}
+
+	values
+		.rows
+		.iter()
+		.map(|row| {
+			row.iter()
+				.map(lower_insert_literal)
+				.collect::<Result<Vec<_>, _>>()
+		})
+		.collect()
+}
+
+fn lower_insert_literal(expr: &SqlExpr) -> Result<InsertLiteral, FrontendError> {
+	match expr {
+		SqlExpr::Value(Value::Null) => Ok(InsertLiteral::Null),
+		SqlExpr::Value(Value::Boolean(value)) => Ok(InsertLiteral::Boolean(*value)),
+		SqlExpr::Value(Value::Number(text, _)) => parse_insert_number(text, false),
+		SqlExpr::Value(Value::SingleQuotedString(value)) => Ok(InsertLiteral::Utf8(value.clone())),
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Minus,
+			expr,
+		} => match expr.as_ref() {
+			SqlExpr::Value(Value::Number(text, _)) => parse_insert_number(text, true),
+			_ => Err(unsupported(
+				"INSERT VALUES must be literals; complex expressions not supported",
+			)),
+		},
+		_ => Err(unsupported(
+			"INSERT VALUES must be literals; complex expressions not supported",
+		)),
+	}
+}
+
+fn parse_insert_number(text: &str, negate: bool) -> Result<InsertLiteral, FrontendError> {
+	if negate {
+		if let Ok(value) = text.parse::<i64>() {
+			return value
+				.checked_neg()
+				.map(InsertLiteral::Int64)
+				.ok_or_else(|| {
+					unsupported(format!("INSERT VALUES literal not representable: -{text}"))
+				});
+		}
+		if let Ok(value) = text.parse::<u64>() {
+			if value == (i64::MAX as u64) + 1 {
+				return Ok(InsertLiteral::Int64(i64::MIN));
+			}
+			if value <= i64::MAX as u64 {
+				return Ok(InsertLiteral::Int64(-(value as i64)));
+			}
+		}
+	} else {
+		if let Ok(value) = text.parse::<i64>() {
+			return Ok(InsertLiteral::Int64(value));
+		}
+		if let Ok(value) = text.parse::<u64>() {
+			return Ok(InsertLiteral::UInt64(value));
+		}
+	}
+
+	text.parse::<f64>()
+		.map(|value| InsertLiteral::Float64(if negate { -value } else { value }))
+		.map_err(|_| unsupported(format!("INSERT VALUES literal not representable: {text}")))
 }
 
 fn lower_create_table_column(column: &ColumnDef) -> Result<Field, FrontendError> {
@@ -272,10 +403,96 @@ impl SqlPlanner {
 		match &ast[0] {
 			Statement::Query(query) => self.lower_query(query),
 			Statement::CreateTable(create_table) => self.lower_create_table(create_table),
+			Statement::Insert(insert) => self.lower_insert(insert),
 			_ => Err(unsupported(
-				"unsupported SQL statement; only SELECT and CREATE TABLE are supported",
+				"unsupported SQL statement; only SELECT, CREATE TABLE, and INSERT are supported",
 			)),
 		}
+	}
+
+	fn lower_insert(&self, insert: &Insert) -> Result<LogicalPlan, FrontendError> {
+		let Insert {
+			or,
+			ignore,
+			into,
+			table,
+			table_alias,
+			columns,
+			overwrite,
+			source,
+			assignments,
+			partitioned,
+			after_columns,
+			has_table_keyword,
+			on,
+			returning,
+			replace_into,
+			priority,
+			insert_alias,
+			settings,
+			format_clause,
+		} = insert;
+
+		if or.is_some() {
+			return Err(unsupported(
+				"unsupported INSERT clause: OR (REPLACE/IGNORE/...)",
+			));
+		}
+		if *ignore {
+			return Err(unsupported("unsupported INSERT clause: IGNORE"));
+		}
+		if *overwrite {
+			return Err(unsupported("unsupported INSERT clause: OVERWRITE"));
+		}
+		if !*into {
+			return Err(unsupported(
+				"unsupported INSERT syntax: missing INTO keyword",
+			));
+		}
+		if *has_table_keyword {
+			return Err(unsupported("unsupported INSERT clause: TABLE keyword"));
+		}
+		if table_alias.is_some() {
+			return Err(unsupported("unsupported INSERT clause: target alias"));
+		}
+		if !assignments.is_empty() {
+			return Err(unsupported("unsupported INSERT clause: SET assignments"));
+		}
+		if partitioned.is_some() {
+			return Err(unsupported("unsupported INSERT clause: PARTITION"));
+		}
+		if !after_columns.is_empty() {
+			return Err(unsupported("unsupported INSERT clause: AFTER columns"));
+		}
+		if on.is_some() {
+			return Err(unsupported(
+				"unsupported INSERT clause: ON CONFLICT / ON DUPLICATE KEY",
+			));
+		}
+		if returning.is_some() {
+			return Err(unsupported("unsupported INSERT clause: RETURNING"));
+		}
+		if *replace_into {
+			return Err(unsupported("unsupported INSERT clause: REPLACE INTO"));
+		}
+		if priority.is_some() {
+			return Err(unsupported("unsupported INSERT clause: priority"));
+		}
+		if insert_alias.is_some() {
+			return Err(unsupported("unsupported INSERT clause: insert alias"));
+		}
+		if settings.is_some() {
+			return Err(unsupported("unsupported INSERT clause: SETTINGS"));
+		}
+		if format_clause.is_some() {
+			return Err(unsupported("unsupported INSERT clause: FORMAT"));
+		}
+
+		Ok(LogicalPlan::Insert {
+			table: lower_insert_target_name(table)?,
+			columns: lower_insert_column_list(columns),
+			rows: lower_insert_source(source.as_deref())?,
+		})
 	}
 
 	fn lower_create_table(&self, create_table: &CreateTable) -> Result<LogicalPlan, FrontendError> {
@@ -2681,7 +2898,7 @@ fn plan_contains_join(plan: &LogicalPlan) -> bool {
 			on: _,
 			strategy: _,
 		} => true,
-		LogicalPlan::CreateTable { .. } => false,
+		LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => false,
 	}
 }
 
@@ -2955,7 +3172,9 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 				qualifiers
 			}
 		},
-		LogicalPlan::Scan { .. } | LogicalPlan::CreateTable { .. } => Vec::new(),
+		LogicalPlan::Scan { .. } | LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => {
+			Vec::new()
+		}
 	}
 }
 
@@ -2992,6 +3211,25 @@ fn object_name_parts(name: &ObjectName) -> Vec<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn insert_table_function_target_rejects_after_parse() {
+		let dialect = sqlparser::dialect::ClickHouseDialect {};
+		let ast = Parser::parse_sql(&dialect, "INSERT INTO FUNCTION f() VALUES (1)")
+			.expect("parse table-function insert");
+		let Statement::Insert(insert) = &ast[0] else {
+			panic!("expected insert");
+		};
+
+		let err = SqlPlanner::new()
+			.lower_insert(insert)
+			.expect_err("table function target should reject");
+
+		assert!(
+			err.to_string()
+				.contains("table functions are not supported")
+		);
+	}
 
 	#[test]
 	fn classifier_recognizes_correlated_equi_pair() {

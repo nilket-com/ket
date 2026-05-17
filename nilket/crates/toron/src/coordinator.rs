@@ -3,6 +3,8 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 
+mod write;
+
 use crate::binder::{PlannerConfig, bind};
 use crate::catalog::Catalog;
 use crate::distributed::budget::{QueryBudget, TaskBudget};
@@ -14,7 +16,7 @@ use crate::error::{ExecutionError, QueryError, StorageError};
 use crate::exec::Executor;
 use crate::ir::{ExecutionPlan, LogicalPlan, MorselId};
 use crate::server::{NetworkTaskDispatcher, memory::MemoryManager, transport::ToronTransport};
-use crate::storage::ScanStream;
+use crate::storage::{ScanStream, StorageWrite, WriteOutcome, WriteRequest};
 
 pub(crate) async fn materialize_scan_stream(
 	stream: ScanStream,
@@ -62,6 +64,12 @@ where
 		let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 		if matches!(bound, ExecutionPlan::CreateTable { .. }) {
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+		}
+		if matches!(bound, ExecutionPlan::Insert { .. }) {
+			return Err(QueryError::Internal {
+				message: "distributed INSERT execution is not wired to a write-context-bearing coordinator"
+					.to_string(),
+			});
 		}
 
 		let stages = fragment_plan(
@@ -132,14 +140,25 @@ pub struct QueryCoordinator {
 	catalog: Arc<dyn Catalog>,
 	executor: Executor,
 	config: PlannerConfig,
+	writer: Arc<dyn StorageWrite>,
 }
 
 impl QueryCoordinator {
 	pub fn new(catalog: Arc<dyn Catalog>, executor: Executor, config: PlannerConfig) -> Self {
+		Self::with_writer(catalog, executor, config, Arc::new(UnsupportedStorageWrite))
+	}
+
+	pub fn with_writer(
+		catalog: Arc<dyn Catalog>,
+		executor: Executor,
+		config: PlannerConfig,
+		writer: Arc<dyn StorageWrite>,
+	) -> Self {
 		Self {
 			catalog,
 			executor,
 			config,
+			writer,
 		}
 	}
 
@@ -151,6 +170,10 @@ impl QueryCoordinator {
 		if matches!(plan, LogicalPlan::CreateTable { .. }) {
 			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
 			return execute_catalog_plan(self.catalog.as_ref(), &bound).await;
+		}
+		if matches!(plan, LogicalPlan::Insert { .. }) {
+			let bound = bind(plan, self.catalog.as_ref(), &self.config).await?;
+			return self.execute_write_plan(&bound).await;
 		}
 
 		let mut retried_descriptor_evolution = false;
@@ -169,6 +192,52 @@ impl QueryCoordinator {
 				Err(error) => return Err(QueryError::Execution(error)),
 			}
 		}
+	}
+
+	async fn execute_write_plan(
+		&self,
+		bound: &ExecutionPlan,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		match bound {
+			ExecutionPlan::Insert {
+				legacy_table_id,
+				table,
+				fingerprint,
+				schema,
+				rows,
+			} => {
+				let payload = write::materialize_insert_batch(schema, rows)?;
+				let context = self.executor.context();
+				self.writer
+					.write(WriteRequest {
+						session_id: context.session_id,
+						query_id: context.query_id,
+						tenant_id: context.tenant_id,
+						table_id: *legacy_table_id,
+						table_object_id: *table,
+						physical_descriptor_fingerprint: *fingerprint,
+						payload,
+						profile_hint: context.profile_hint,
+						trace_context: context.trace_context.clone(),
+					})
+					.await?;
+				Ok(Vec::new())
+			}
+			other => Err(QueryError::Internal {
+				message: format!("execute_write_plan called with non-DML plan: {other:?}"),
+			}),
+		}
+	}
+}
+
+struct UnsupportedStorageWrite;
+
+#[async_trait::async_trait]
+impl StorageWrite for UnsupportedStorageWrite {
+	async fn write(&self, _request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "INSERT execution requires a configured StorageWrite".to_string(),
+		})
 	}
 }
 

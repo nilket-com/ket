@@ -570,7 +570,9 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => join_strategy_label(input),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => None,
 	}
 }
 
@@ -582,7 +584,9 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => contains_join(input),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => false,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => false,
 	}
 }
 
@@ -599,6 +603,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Scan { .. } => "scan",
 			ExecutionPlan::Join { .. } => "join",
 			ExecutionPlan::CreateTable { .. } => "catalog",
+			ExecutionPlan::Insert { .. } => "insert",
 		}
 	}
 }
@@ -750,7 +755,9 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => contains_broadcast_join(input),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => false,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => false,
 	}
 }
 
@@ -1068,7 +1075,9 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		| ExecutionPlan::Sort { input, .. } => scan_schema_for_table_id(input, table_id),
 		ExecutionPlan::Join { left, right, .. } => scan_schema_for_table_id(left, table_id)
 			.or_else(|| scan_schema_for_table_id(right, table_id)),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => None,
 	}
 }
 

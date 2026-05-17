@@ -164,6 +164,16 @@ pub struct SortExpr {
 	pub nulls_first: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InsertLiteral {
+	Null,
+	Boolean(bool),
+	Int64(i64),
+	UInt64(u64),
+	Float64(f64),
+	Utf8(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
 	Scan {
@@ -214,6 +224,11 @@ pub enum LogicalPlan {
 		name: TableRef,
 		schema: SchemaRef,
 		if_not_exists: bool,
+	},
+	Insert {
+		table: TableRef,
+		columns: Option<Vec<String>>,
+		rows: Vec<Vec<InsertLiteral>>,
 	},
 }
 

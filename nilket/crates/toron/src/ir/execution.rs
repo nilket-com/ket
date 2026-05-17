@@ -127,6 +127,13 @@ pub enum ExecutionPlan {
 		schema: SchemaRef,
 		if_not_exists: bool,
 	},
+	Insert {
+		legacy_table_id: TableId,
+		table: TableObjectId,
+		fingerprint: PhysicalDescriptorFingerprint,
+		schema: SchemaRef,
+		rows: Vec<Vec<ScalarValue>>,
+	},
 }
 
 impl ExecutionPlan {
@@ -140,6 +147,7 @@ impl ExecutionPlan {
 			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Join { output_schema, .. } => output_schema.clone(),
 			Self::CreateTable { .. } => Arc::new(Schema::empty()),
+			Self::Insert { .. } => Arc::new(Schema::empty()),
 		}
 	}
 }

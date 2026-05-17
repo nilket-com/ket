@@ -62,6 +62,8 @@ pub enum FragmentError {
 	BroadcastBuildNotPublished,
 	#[error("CREATE TABLE is a coordinator-only catalog operation")]
 	CreateTableNotFragmentable,
+	#[error("INSERT is a coordinator-only data-plane operation")]
+	InsertNotFragmentable,
 }
 
 pub fn fragment_plan(
@@ -70,6 +72,9 @@ pub fn fragment_plan(
 ) -> Result<Vec<StagePlan>, FragmentError> {
 	if matches!(plan, ExecutionPlan::CreateTable { .. }) {
 		return Err(FragmentError::CreateTableNotFragmentable);
+	}
+	if matches!(plan, ExecutionPlan::Insert { .. }) {
+		return Err(FragmentError::InsertNotFragmentable);
 	}
 
 	if contains_join(&plan) {
@@ -854,7 +859,9 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. } => first_join(input),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => None,
 	}
 }
 
@@ -891,7 +898,9 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Join { left, right, .. } => {
 			find_exchange(left).or_else(|| find_exchange(right))
 		}
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => None,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => None,
 	}
 }
 
@@ -903,7 +912,9 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Sort { input, .. } => count_exchanges(input),
 		ExecutionPlan::Join { left, right, .. } => count_exchanges(left) + count_exchanges(right),
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => 0,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => 0,
 	}
 }
 
@@ -929,7 +940,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		ExecutionPlan::Join { left, right, .. } => {
 			first_scan_metadata(left).or_else(|| first_scan_metadata(right))
 		}
-		ExecutionPlan::CreateTable { .. } => None,
+		ExecutionPlan::CreateTable { .. } | ExecutionPlan::Insert { .. } => None,
 	}
 }
 
@@ -1012,7 +1023,9 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			strategy,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => plan,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => plan,
 	}
 }
 
@@ -1070,7 +1083,9 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			offset,
 			output_schema,
 		},
-		ExecutionPlan::Scan { .. } | ExecutionPlan::CreateTable { .. } => plan,
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => plan,
 	}
 }
 

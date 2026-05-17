@@ -12,11 +12,13 @@ use crate::catalog::{Catalog, TableBinding, TableRef};
 use crate::error::BindingError;
 use crate::ir::{
 	AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan,
-	ExecutionSortKey, Expr, FilterDisposition, JoinKind, JoinStrategy, LogicalPlan, PbcProgram,
-	QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, arithmetic_output_type,
+	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan,
+	PbcProgram, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, arithmetic_output_type,
 	schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
+
+pub const TABLE_WRITE_MAX_ROWS: usize = 65_536;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PlannerConfig {
@@ -204,7 +206,109 @@ impl<'a> Binder<'a> {
 					schema: schema.clone(),
 					if_not_exists: *if_not_exists,
 				}),
+				LogicalPlan::Insert {
+					table,
+					columns,
+					rows,
+				} => self.bind_insert(table, columns.as_deref(), rows).await,
 			}
+		})
+	}
+
+	async fn bind_insert(
+		&self,
+		table: &TableRef,
+		columns: Option<&[String]>,
+		rows: &[Vec<InsertLiteral>],
+	) -> Result<ExecutionPlan, BindingError> {
+		let binding = self.catalog.resolve_table(table).await?;
+		if rows.is_empty() {
+			return Err(BindingError::UnsupportedExpression {
+				message: "INSERT VALUES must contain at least one row".to_string(),
+			});
+		}
+		if rows.len() > TABLE_WRITE_MAX_ROWS {
+			return Err(BindingError::UnsupportedExpression {
+				message: format!(
+					"INSERT row count {} exceeds maximum {TABLE_WRITE_MAX_ROWS}",
+					rows.len()
+				),
+			});
+		}
+
+		let schema = binding.schema.clone();
+		let schema_fields = schema.fields();
+		let target_indices = match columns {
+			None => (0..schema_fields.len()).collect::<Vec<_>>(),
+			Some(columns) => {
+				let mut seen = HashSet::new();
+				let mut indices = Vec::with_capacity(columns.len());
+				for column in columns {
+					if !seen.insert(column.clone()) {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!("duplicate INSERT target column: {column}"),
+						});
+					}
+					indices.push(resolve_column(column, &schema)?.ordinal.0 as usize);
+				}
+				indices
+			}
+		};
+		let expected_arity = target_indices.len();
+
+		let mut bound_rows = Vec::with_capacity(rows.len());
+		for (row_index, row) in rows.iter().enumerate() {
+			if row.len() != expected_arity {
+				return Err(BindingError::TypeMismatch {
+					message: format!(
+						"INSERT row {} has {} values; expected {expected_arity}",
+						row_index + 1,
+						row.len()
+					),
+				});
+			}
+
+			let bound_row = if columns.is_none() {
+				row.iter()
+					.zip(schema_fields.iter())
+					.map(|(literal, field)| coerce_insert_literal(literal, field))
+					.collect::<Result<Vec<_>, _>>()?
+			} else {
+				let mut values = vec![None; schema_fields.len()];
+				for ((literal, target_index), _position) in
+					row.iter().zip(target_indices.iter().copied()).zip(0..)
+				{
+					values[target_index] =
+						Some(coerce_insert_literal(literal, schema.field(target_index))?);
+				}
+				for (field_index, value) in values.iter_mut().enumerate() {
+					if value.is_none() {
+						let field = schema.field(field_index);
+						if !field.is_nullable() {
+							return Err(BindingError::TypeMismatch {
+								message: format!(
+									"INSERT omits non-nullable column: {}",
+									field.name()
+								),
+							});
+						}
+						*value = Some(typed_null_for_insert(field)?);
+					}
+				}
+				values
+					.into_iter()
+					.map(|value| value.expect("all INSERT values filled"))
+					.collect()
+			};
+			bound_rows.push(bound_row);
+		}
+
+		Ok(ExecutionPlan::Insert {
+			legacy_table_id: binding.legacy_table_id,
+			table: binding.table,
+			fingerprint: binding.fingerprint,
+			schema,
+			rows: bound_rows,
 		})
 	}
 
@@ -512,7 +616,7 @@ fn collect_qualifiers(plan: &LogicalPlan, qualifiers: &mut Vec<TableRef>) {
 				collect_qualifiers(right, qualifiers);
 			}
 		},
-		LogicalPlan::CreateTable { .. } => {}
+		LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => {}
 	}
 }
 
@@ -658,7 +762,8 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
 		| ExecutionPlan::Sort { input, .. } => terminal_exchange(input),
 		ExecutionPlan::Scan { .. }
 		| ExecutionPlan::Join { .. }
-		| ExecutionPlan::CreateTable { .. } => None,
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::Insert { .. } => None,
 	}
 }
 
@@ -965,6 +1070,22 @@ fn optimize_for_required(
 				name,
 				schema,
 				if_not_exists,
+			},
+			OrdinalRemap::new(),
+		)),
+		ExecutionPlan::Insert {
+			legacy_table_id,
+			table,
+			fingerprint,
+			schema,
+			rows,
+		} => Ok((
+			ExecutionPlan::Insert {
+				legacy_table_id,
+				table,
+				fingerprint,
+				schema,
+				rows,
 			},
 			OrdinalRemap::new(),
 		)),
@@ -1432,6 +1553,89 @@ fn is_supported_explicit_numeric_cast(source: &DataType, target: &DataType) -> b
 			| (DataType::Float64, DataType::Float32)
 			| (DataType::Float64, DataType::Float64)
 	)
+}
+
+fn coerce_insert_literal(
+	literal: &InsertLiteral,
+	field: &Field,
+) -> Result<ScalarValue, BindingError> {
+	let target = field.data_type();
+	let column = field.name();
+	match literal {
+		InsertLiteral::Null => {
+			if field.is_nullable() {
+				typed_null_for_insert(field)
+			} else {
+				Err(BindingError::TypeMismatch {
+					message: format!("NULL is not allowed for non-nullable column: {column}"),
+				})
+			}
+		}
+		InsertLiteral::Boolean(value) => match target {
+			DataType::Boolean => Ok(ScalarValue::Boolean(Some(*value))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
+		InsertLiteral::Int64(value) => match target {
+			DataType::Int32 => i32::try_from(*value)
+				.map(|value| ScalarValue::Int32(Some(value)))
+				.map_err(|_| insert_overflow(column, literal, target)),
+			DataType::Int64 => Ok(ScalarValue::Int64(Some(*value))),
+			DataType::Float32 => Ok(ScalarValue::Float32(Some(*value as f32))),
+			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value as f64))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
+		InsertLiteral::UInt64(value) => match target {
+			DataType::Int32 => i32::try_from(*value)
+				.map(|value| ScalarValue::Int32(Some(value)))
+				.map_err(|_| insert_overflow(column, literal, target)),
+			DataType::Int64 => i64::try_from(*value)
+				.map(|value| ScalarValue::Int64(Some(value)))
+				.map_err(|_| insert_overflow(column, literal, target)),
+			DataType::Float32 => Ok(ScalarValue::Float32(Some(*value as f32))),
+			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value as f64))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
+		InsertLiteral::Float64(value) => match target {
+			DataType::Float32 => Ok(ScalarValue::Float32(Some(*value as f32))),
+			DataType::Float64 => Ok(ScalarValue::Float64(Some(*value))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
+		InsertLiteral::Utf8(value) => match target {
+			DataType::Utf8 => Ok(ScalarValue::Utf8(Some(value.clone()))),
+			_ => Err(insert_type_mismatch(column, literal, target)),
+		},
+	}
+}
+
+fn typed_null_for_insert(field: &Field) -> Result<ScalarValue, BindingError> {
+	match field.data_type() {
+		DataType::Boolean => Ok(ScalarValue::Boolean(None)),
+		DataType::Int32 => Ok(ScalarValue::Int32(None)),
+		DataType::Int64 => Ok(ScalarValue::Int64(None)),
+		DataType::Float32 => Ok(ScalarValue::Float32(None)),
+		DataType::Float64 => Ok(ScalarValue::Float64(None)),
+		DataType::Utf8 => Ok(ScalarValue::Utf8(None)),
+		target => Err(BindingError::TypeMismatch {
+			message: format!(
+				"unsupported INSERT target type for column {}: {target:?}",
+				field.name()
+			),
+		}),
+	}
+}
+
+fn insert_type_mismatch(column: &str, literal: &InsertLiteral, target: &DataType) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!(
+			"INSERT value {literal:?} is not compatible with column {column} type {target:?}"
+		),
+	}
+}
+
+fn insert_overflow(column: &str, literal: &InsertLiteral, target: &DataType) -> BindingError {
+	BindingError::TypeMismatch {
+		message: format!("INSERT value {literal:?} overflows column {column} type {target:?}"),
+	}
 }
 
 fn bind_comparison(
