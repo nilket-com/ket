@@ -361,7 +361,7 @@ async fn distributed_group_by_has_single_group_keyed_exchange() {
 			partition_count,
 			partition_key,
 			..
-		} if *partition_count == PartitionCount::new(4) && partition_key.len() == 1
+		} if *partition_count == PartitionCount::new(4) && partition_key.root_count() == 1
 	));
 	for task in &stages[1].tasks {
 		assert!(matches!(

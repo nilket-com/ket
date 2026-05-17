@@ -13,7 +13,7 @@ use crate::distributed::task::{
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
-	AggregateCall, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey,
+	BoundAggregateCall, BoundExprProgram, ColumnOrdinal, ExecutionPlan, ExecutionSortKey,
 	FilterDisposition, JoinKind, JoinStrategy, QueryProfileHint,
 };
 
@@ -242,7 +242,7 @@ fn fragment_hash_join_plan(
 			TaskOutputBinding::ShuffleProducer {
 				exchange_id: terminal_exchange_id,
 				partition_count: PartitionCount::new(1),
-				partition_key: Vec::new(),
+				partition_key: BoundExprProgram::empty(),
 			},
 			Some(terminal_stage),
 		)
@@ -375,7 +375,7 @@ fn fragment_broadcast_join_plan(
 			TaskOutputBinding::ShuffleProducer {
 				exchange_id: terminal_exchange_id,
 				partition_count: PartitionCount::new(1),
-				partition_key: Vec::new(),
+				partition_key: BoundExprProgram::empty(),
 			},
 			Some(terminal_stage),
 		)
@@ -503,7 +503,7 @@ fn single_task_stage(plan: ExecutionPlan, config: FragmentPlanConfig) -> StagePl
 struct ExchangeBoundary {
 	input: ExecutionPlan,
 	partition_count: u32,
-	key: Vec<ExecutionExpr>,
+	key: BoundExprProgram,
 }
 
 #[derive(Debug, Clone)]
@@ -530,12 +530,12 @@ struct TerminalSortGather {
 struct TerminalSortOverAggregate {
 	inner_input: ExecutionPlan,
 	group_partition_count: u32,
-	group_key: Vec<ExecutionExpr>,
-	group_expr: Vec<ExecutionExpr>,
-	aggr_expr: Vec<AggregateCall>,
+	group_key: BoundExprProgram,
+	group_expr: BoundExprProgram,
+	aggr_expr: Vec<BoundAggregateCall>,
 	aggregate_output_schema: SchemaRef,
-	having: Option<(ExecutionExpr, FilterDisposition)>,
-	projection: Option<(Vec<ExecutionExpr>, SchemaRef)>,
+	having: Option<(BoundExprProgram, FilterDisposition)>,
+	projection: Option<(BoundExprProgram, SchemaRef)>,
 	terminal_gather: TerminalSortGather,
 }
 
@@ -558,7 +558,7 @@ fn terminal_sort_gather(plan: &ExecutionPlan) -> Option<TerminalSortGather> {
 	else {
 		return None;
 	};
-	if *partition_count != 1 || !key.is_empty() || !contains_join(input) {
+	if *partition_count != 1 || !key.is_empty_roots() || !contains_join(input) {
 		return None;
 	}
 
@@ -592,7 +592,7 @@ fn is_terminal_sort_over_grouped_aggregate(
 	else {
 		return None;
 	};
-	if *partition_count != 1 || !key.is_empty() {
+	if *partition_count != 1 || !key.is_empty_roots() {
 		return None;
 	}
 	let gathered_input = input.as_ref().clone();
@@ -737,7 +737,7 @@ fn fragment_terminal_sort_over_grouped_aggregate(
 				output: TaskOutputBinding::ShuffleProducer {
 					exchange_id: terminal_exchange_id,
 					partition_count: PartitionCount::new(1),
-					partition_key: Vec::new(),
+					partition_key: BoundExprProgram::empty(),
 				},
 				budget: config.task_budget,
 				trace: None,
@@ -1094,7 +1094,8 @@ mod tests {
 	use super::*;
 	use crate::distributed::budget::{QueryBudget, TaskBudget};
 	use crate::ir::{
-		AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ResolvedColumn, TableId,
+		AggregateFunction, BoundAggregateCall, BoundExprProgram, BoundExprProgramBuilder,
+		ColumnName, ColumnOrdinal, ResolvedColumn, TableId,
 	};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
@@ -1124,7 +1125,7 @@ mod tests {
 		let plan = final_aggregate_plan(ExecutionPlan::Exchange {
 			input: Box::new(scan_plan()),
 			partition_count: 3,
-			key: vec![key_expr()],
+			key: key_expr(),
 		});
 
 		let stages = fragment_plan(plan, config()).expect("fragment");
@@ -1173,7 +1174,7 @@ mod tests {
 		let plan = ExecutionPlan::Exchange {
 			input: Box::new(scan_plan()),
 			partition_count: 2,
-			key: vec![key_expr()],
+			key: key_expr(),
 		};
 
 		let left = fragment_plan(plan.clone(), config()).expect("left");
@@ -1202,7 +1203,7 @@ mod tests {
 		let plan = ExecutionPlan::Exchange {
 			input: Box::new(scan_plan()),
 			partition_count: 0,
-			key: vec![key_expr()],
+			key: key_expr(),
 		};
 
 		assert_eq!(
@@ -1217,10 +1218,10 @@ mod tests {
 			input: Box::new(ExecutionPlan::Exchange {
 				input: Box::new(scan_plan()),
 				partition_count: 2,
-				key: vec![key_expr()],
+				key: key_expr(),
 			}),
 			partition_count: 2,
-			key: vec![key_expr()],
+			key: key_expr(),
 		};
 
 		assert_eq!(
@@ -1481,7 +1482,7 @@ mod tests {
 				data_type.clone(),
 			)),
 			partition_count,
-			key: vec![key_expr_with_type(data_type)],
+			key: key_expr_with_type(data_type),
 		}
 	}
 
@@ -1535,10 +1536,10 @@ mod tests {
 	fn final_aggregate_plan(input: ExecutionPlan) -> ExecutionPlan {
 		ExecutionPlan::Aggregate {
 			input: Box::new(input),
-			group_expr: vec![key_expr()],
-			aggr_expr: vec![AggregateCall {
+			group_expr: key_expr(),
+			aggr_expr: vec![BoundAggregateCall {
 				function: AggregateFunction::CountAll,
-				args: vec![key_expr()],
+				args: BoundExprProgram::empty(),
 			}],
 			output_schema: Arc::new(Schema::new(vec![
 				Field::new("key", DataType::Int32, false),
@@ -1547,18 +1548,21 @@ mod tests {
 		}
 	}
 
-	fn key_expr() -> ExecutionExpr {
+	fn key_expr() -> BoundExprProgram {
 		key_expr_with_type(DataType::Int32)
 	}
 
-	fn key_expr_with_type(data_type: DataType) -> ExecutionExpr {
-		ExecutionExpr::Column(ResolvedColumn {
+	fn key_expr_with_type(data_type: DataType) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let key = builder.append_column(ResolvedColumn {
 			name: ColumnName("key".to_string()),
 			ordinal: ColumnOrdinal(0),
 			data_type,
 			nullable: false,
 			pbc_eligible: true,
-		})
+		});
+		builder.push_root(key);
+		builder.build()
 	}
 
 	fn descriptor() -> TableSchemaDescriptor {

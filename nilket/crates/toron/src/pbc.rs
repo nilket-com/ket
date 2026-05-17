@@ -1,4 +1,7 @@
-use crate::ir::{ColumnOrdinal, ExecutionExpr, ScalarValue};
+use crate::ir::{
+	BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, BoundUnaryOp, ColumnOrdinal,
+	ScalarValue,
+};
 
 // Import OP codes from Wendelon.
 use wendelon::schema::pbc::{
@@ -31,13 +34,18 @@ impl PbcCompiler {
 
 	pub(crate) fn compile(
 		&self,
-		predicate: Option<&ExecutionExpr>,
+		predicate: Option<&BoundExprProgram>,
 		projection: Option<&[ColumnOrdinal]>,
 	) -> Result<Vec<u8>, PushdownDeclineReason> {
 		let mut bytecode = Vec::new();
 
-		if let Some(expr) = predicate {
-			self.compile_expr(expr, &mut bytecode)?;
+		if let Some(predicate) = predicate {
+			let root = predicate.single_root().ok_or_else(|| {
+				PushdownDeclineReason::ExpressionShapeUnsupported(
+					"PBC predicate must have exactly one root".to_string(),
+				)
+			})?;
+			self.compile_node(predicate, root, &mut bytecode)?;
 		}
 
 		if let Some(proj) = projection {
@@ -56,13 +64,66 @@ impl PbcCompiler {
 		Ok(bytecode)
 	}
 
-	fn compile_expr(
+	fn compile_node(
 		&self,
-		expr: &ExecutionExpr,
+		program: &BoundExprProgram,
+		root: BoundExprId,
 		bytecode: &mut Vec<u8>,
 	) -> Result<(), PushdownDeclineReason> {
-		match expr {
-			ExecutionExpr::Column(column) => {
+		let mut stack = vec![(root, false)];
+		while let Some((id, emit)) = stack.pop() {
+			let node = program.node(id).ok_or_else(|| {
+				PushdownDeclineReason::ExpressionShapeUnsupported(format!(
+					"bound expression id {:?} out of bounds",
+					id
+				))
+			})?;
+			if emit {
+				self.emit_node(program, node, bytecode)?;
+				continue;
+			}
+			match node {
+				BoundExprNode::Column(_) | BoundExprNode::Literal(_) => stack.push((id, true)),
+				BoundExprNode::Binary { op, left, right } => {
+					if matches!(
+						op,
+						BoundBinaryOp::Add
+							| BoundBinaryOp::Sub | BoundBinaryOp::Mul
+							| BoundBinaryOp::Div
+					) {
+						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+							"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
+						));
+					}
+					stack.push((id, true));
+					stack.push((*right, false));
+					stack.push((*left, false));
+				}
+				BoundExprNode::Unary { input, .. } => {
+					stack.push((id, true));
+					stack.push((*input, false));
+				}
+				BoundExprNode::Cast { .. } | BoundExprNode::TryCast { .. } => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
+					));
+				}
+				BoundExprNode::TimeBucket { .. } => {
+					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	fn emit_node(
+		&self,
+		program: &BoundExprProgram,
+		node: &BoundExprNode,
+		bytecode: &mut Vec<u8>,
+	) -> Result<(), PushdownDeclineReason> {
+		match node {
+			BoundExprNode::Column(column) => {
 				if !column.pbc_eligible {
 					return Err(PushdownDeclineReason::ColumnNotInPbcEligibleCascade {
 						ordinal: column.ordinal,
@@ -71,107 +132,89 @@ impl PbcCompiler {
 				bytecode.push(OP_PUSH_COL);
 				bytecode.extend_from_slice(&column.ordinal.0.to_le_bytes());
 			}
-			ExecutionExpr::Literal(val) => match val {
-				ScalarValue::Boolean(Some(v)) => {
-					bytecode.push(OP_PUSH_BOOL);
-					bytecode.push(u8::from(*v));
-				}
-				ScalarValue::Int32(Some(v)) => {
-					bytecode.push(OP_PUSH_INT);
-					bytecode.extend_from_slice(&(*v as i64).to_le_bytes());
-				}
-				ScalarValue::Int64(Some(v)) => {
-					bytecode.push(OP_PUSH_INT);
-					bytecode.extend_from_slice(&v.to_le_bytes());
-				}
-				ScalarValue::Float32(Some(v)) => {
-					bytecode.push(OP_PUSH_FLOAT);
-					bytecode.extend_from_slice(&(*v as f64).to_le_bytes());
-				}
-				ScalarValue::Float64(Some(v)) => {
-					bytecode.push(OP_PUSH_FLOAT);
-					bytecode.extend_from_slice(&v.to_le_bytes());
-				}
-				ScalarValue::Utf8(Some(v)) => {
-					let bytes = v.as_bytes();
-					if bytes.len() > u16::MAX as usize {
-						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
-							"String literal too long".to_string(),
-						));
-					}
-					bytecode.push(OP_PUSH_STR);
-					bytecode.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-					bytecode.extend_from_slice(bytes);
-				}
-				_ => return Err(PushdownDeclineReason::NullLiteralUnrepresentable),
-			},
-			ExecutionExpr::Eq(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_EQ);
+			BoundExprNode::Literal(literal) => {
+				let val = program.literals.get(*literal as usize).ok_or_else(|| {
+					PushdownDeclineReason::ExpressionShapeUnsupported(format!(
+						"literal slot {literal} out of bounds"
+					))
+				})?;
+				emit_literal(val, bytecode)?;
 			}
-			ExecutionExpr::Neq(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_NEQ);
-			}
-			ExecutionExpr::Lt(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_LT);
-			}
-			ExecutionExpr::Lte(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_LTE);
-			}
-			ExecutionExpr::Gt(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_GT);
-			}
-			ExecutionExpr::Gte(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_GTE);
-			}
-			ExecutionExpr::And(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_AND);
-			}
-			ExecutionExpr::Or(left, right) => {
-				self.compile_expr(left, bytecode)?;
-				self.compile_expr(right, bytecode)?;
-				bytecode.push(OP_OR);
-			}
-			ExecutionExpr::Not(inner) => {
-				self.compile_expr(inner, bytecode)?;
-				bytecode.push(OP_NOT);
-			}
-			ExecutionExpr::IsNull(inner) => {
-				self.compile_expr(inner, bytecode)?;
-				bytecode.push(OP_IS_NULL);
-			}
-			ExecutionExpr::IsNotNull(inner) => {
-				self.compile_expr(inner, bytecode)?;
-				bytecode.push(OP_IS_NOT_NULL);
-			}
-			ExecutionExpr::Cast(_, _)
-			| ExecutionExpr::TryCast(_, _)
-			| ExecutionExpr::Add(_, _)
-			| ExecutionExpr::Sub(_, _)
-			| ExecutionExpr::Mul(_, _)
-			| ExecutionExpr::Div(_, _) => {
+			BoundExprNode::Binary { op, .. } => bytecode.push(binary_opcode(op)?),
+			BoundExprNode::Unary { op, .. } => bytecode.push(unary_opcode(op)),
+			BoundExprNode::Cast { .. }
+			| BoundExprNode::TryCast { .. }
+			| BoundExprNode::TimeBucket { .. } => {
 				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
-					"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
+					"unsupported node reached PBC emitter".to_string(),
 				));
-			}
-			ExecutionExpr::TimeBucket(_, _) => {
-				return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 			}
 		}
 		Ok(())
+	}
+}
+
+fn emit_literal(val: &ScalarValue, bytecode: &mut Vec<u8>) -> Result<(), PushdownDeclineReason> {
+	match val {
+		ScalarValue::Boolean(Some(v)) => {
+			bytecode.push(OP_PUSH_BOOL);
+			bytecode.push(u8::from(*v));
+		}
+		ScalarValue::Int32(Some(v)) => {
+			bytecode.push(OP_PUSH_INT);
+			bytecode.extend_from_slice(&(*v as i64).to_le_bytes());
+		}
+		ScalarValue::Int64(Some(v)) => {
+			bytecode.push(OP_PUSH_INT);
+			bytecode.extend_from_slice(&v.to_le_bytes());
+		}
+		ScalarValue::Float32(Some(v)) => {
+			bytecode.push(OP_PUSH_FLOAT);
+			bytecode.extend_from_slice(&(*v as f64).to_le_bytes());
+		}
+		ScalarValue::Float64(Some(v)) => {
+			bytecode.push(OP_PUSH_FLOAT);
+			bytecode.extend_from_slice(&v.to_le_bytes());
+		}
+		ScalarValue::Utf8(Some(v)) => {
+			let bytes = v.as_bytes();
+			if bytes.len() > u16::MAX as usize {
+				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+					"String literal too long".to_string(),
+				));
+			}
+			bytecode.push(OP_PUSH_STR);
+			bytecode.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+			bytecode.extend_from_slice(bytes);
+		}
+		_ => return Err(PushdownDeclineReason::NullLiteralUnrepresentable),
+	}
+	Ok(())
+}
+
+fn binary_opcode(op: &BoundBinaryOp) -> Result<u8, PushdownDeclineReason> {
+	match op {
+		BoundBinaryOp::Eq => Ok(OP_EQ),
+		BoundBinaryOp::Neq => Ok(OP_NEQ),
+		BoundBinaryOp::Lt => Ok(OP_LT),
+		BoundBinaryOp::Lte => Ok(OP_LTE),
+		BoundBinaryOp::Gt => Ok(OP_GT),
+		BoundBinaryOp::Gte => Ok(OP_GTE),
+		BoundBinaryOp::And => Ok(OP_AND),
+		BoundBinaryOp::Or => Ok(OP_OR),
+		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div => {
+			Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+				"arithmetic, Cast, and TryCast are not PBC-eligible".to_string(),
+			))
+		}
+	}
+}
+
+fn unary_opcode(op: &BoundUnaryOp) -> u8 {
+	match op {
+		BoundUnaryOp::Not => OP_NOT,
+		BoundUnaryOp::IsNull => OP_IS_NULL,
+		BoundUnaryOp::IsNotNull => OP_IS_NOT_NULL,
 	}
 }
 
@@ -179,7 +222,10 @@ impl PbcCompiler {
 mod tests {
 	use super::*;
 	use crate::exec::Executor;
-	use crate::ir::{ColumnName, Expr, LogicalPlan, ResolvedColumn, ScalarValue, TableId};
+	use crate::ir::{
+		BoundExprProgram, BoundExprProgramBuilder, ColumnName, Expr, LogicalPlan, ResolvedColumn,
+		ScalarValue, TableId,
+	};
 	use crate::storage::InMemoryStorageScan;
 
 	use arrow::array::{Int32Array, StringArray};
@@ -193,18 +239,7 @@ mod tests {
 		let compiler = PbcCompiler::new();
 
 		// expr: amount > 100 AND status == 'active'
-		let expr = ExecutionExpr::And(
-			Box::new(ExecutionExpr::Gt(
-				Box::new(column("amount", 1, DataType::Int32, true)),
-				Box::new(ExecutionExpr::Literal(ScalarValue::Int32(Some(100)))),
-			)),
-			Box::new(ExecutionExpr::Eq(
-				Box::new(column("status", 2, DataType::Utf8, true)),
-				Box::new(ExecutionExpr::Literal(ScalarValue::Utf8(Some(
-					"active".to_string(),
-				)))),
-			)),
-		);
+		let expr = pbc_fixture_expr();
 
 		let bytecode = compiler.compile(Some(&expr), None).unwrap();
 
@@ -236,7 +271,7 @@ mod tests {
 		let compiler = PbcCompiler::new();
 
 		// 1. Column not in the PBC-eligible cascade
-		let expr1 = column("payload", 3, DataType::Binary, false);
+		let expr1 = column_program("payload", 3, DataType::Binary, false);
 		let res1 = compiler.compile(Some(&expr1), None);
 		assert_eq!(
 			res1,
@@ -246,10 +281,11 @@ mod tests {
 		);
 
 		// 2. Null literal (PBC doesn't have OP_PUSH_NULL, nulls are propagated natively)
-		let expr2 = ExecutionExpr::Eq(
-			Box::new(column("amount", 1, DataType::Int32, true)),
-			Box::new(ExecutionExpr::Literal(ScalarValue::Int32(None))),
-		);
+		let expr2 = program(|builder| {
+			let amount = column(builder, "amount", 1, DataType::Int32, true);
+			let value = builder.append_literal(ScalarValue::Int32(None));
+			builder.append_binary(BoundBinaryOp::Eq, amount, value, DataType::Boolean)
+		});
 		let res2 = compiler.compile(Some(&expr2), None);
 		assert_eq!(res2, Err(PushdownDeclineReason::NullLiteralUnrepresentable));
 	}
@@ -259,23 +295,24 @@ mod tests {
 		let compiler = PbcCompiler::new();
 		let fixtures = vec![
 			(
-				column("payload", 3, DataType::Binary, false),
+				column_program("payload", 3, DataType::Binary, false),
 				PushdownDeclineReason::ColumnNotInPbcEligibleCascade {
 					ordinal: ColumnOrdinal(3),
 				},
 			),
 			(
-				ExecutionExpr::Eq(
-					Box::new(column("amount", 1, DataType::Int32, true)),
-					Box::new(ExecutionExpr::Literal(ScalarValue::Int32(None))),
-				),
+				program(|builder| {
+					let amount = column(builder, "amount", 1, DataType::Int32, true);
+					let value = builder.append_literal(ScalarValue::Int32(None));
+					builder.append_binary(BoundBinaryOp::Eq, amount, value, DataType::Boolean)
+				}),
 				PushdownDeclineReason::NullLiteralUnrepresentable,
 			),
 			(
-				ExecutionExpr::TimeBucket(
-					Duration::from_secs(60),
-					Box::new(column("ts", 4, DataType::Int64, true)),
-				),
+				program(|builder| {
+					let ts = column(builder, "ts", 4, DataType::Int64, true);
+					builder.append_time_bucket(Duration::from_secs(60), ts, DataType::Int64)
+				}),
 				PushdownDeclineReason::ExperimentalKernelInPredicate,
 			),
 		];
@@ -340,18 +377,7 @@ mod tests {
 		let executor_result_batch = &executor_results[0];
 
 		// 2. Wendelon PBC Engine
-		let expr = ExecutionExpr::And(
-			Box::new(ExecutionExpr::Gt(
-				Box::new(column("amount", 1, DataType::Int32, true)),
-				Box::new(ExecutionExpr::Literal(ScalarValue::Int32(Some(100)))),
-			)),
-			Box::new(ExecutionExpr::Eq(
-				Box::new(column("status", 2, DataType::Utf8, true)),
-				Box::new(ExecutionExpr::Literal(ScalarValue::Utf8(Some(
-					"active".to_string(),
-				)))),
-			)),
-		);
+		let expr = pbc_fixture_expr();
 		let compiler = PbcCompiler::new();
 		let bytecode = compiler.compile(Some(&expr), None).unwrap();
 
@@ -380,13 +406,55 @@ mod tests {
 		}
 	}
 
-	fn column(
+	fn pbc_fixture_expr() -> BoundExprProgram {
+		program(|builder| {
+			let amount = column(builder, "amount", 1, DataType::Int32, true);
+			let amount_threshold = builder.append_literal(ScalarValue::Int32(Some(100)));
+			let amount_gt_threshold = builder.append_binary(
+				BoundBinaryOp::Gt,
+				amount,
+				amount_threshold,
+				DataType::Boolean,
+			);
+
+			let status = column(builder, "status", 2, DataType::Utf8, true);
+			let active = builder.append_literal(ScalarValue::Utf8(Some("active".to_string())));
+			let status_is_active =
+				builder.append_binary(BoundBinaryOp::Eq, status, active, DataType::Boolean);
+
+			builder.append_binary(
+				BoundBinaryOp::And,
+				amount_gt_threshold,
+				status_is_active,
+				DataType::Boolean,
+			)
+		})
+	}
+
+	fn column_program(
 		name: impl Into<String>,
 		ordinal: u32,
 		data_type: DataType,
 		pbc_eligible: bool,
-	) -> ExecutionExpr {
-		ExecutionExpr::Column(ResolvedColumn {
+	) -> BoundExprProgram {
+		program(|builder| column(builder, name, ordinal, data_type, pbc_eligible))
+	}
+
+	fn program(root: impl FnOnce(&mut BoundExprProgramBuilder) -> BoundExprId) -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let root = root(&mut builder);
+		builder.push_root(root);
+		builder.build()
+	}
+
+	fn column(
+		builder: &mut BoundExprProgramBuilder,
+		name: impl Into<String>,
+		ordinal: u32,
+		data_type: DataType,
+		pbc_eligible: bool,
+	) -> BoundExprId {
+		builder.append_column(ResolvedColumn {
 			name: ColumnName(name.into()),
 			ordinal: ColumnOrdinal(ordinal),
 			data_type,

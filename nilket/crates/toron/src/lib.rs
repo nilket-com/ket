@@ -48,8 +48,8 @@ mod tests {
 	use crate::error::{QueryError, StorageError, TaskFailureKind};
 	use crate::exec::Executor;
 	use crate::ir::{
-		AggregateFunction, ExecutionPlan, Expr, JoinKind, JoinStrategy, LogicalPlan, MorselId,
-		ScalarValue, StageId, TableId,
+		AggregateFunction, BoundExprProgram, ExecutionPlan, Expr, JoinKind, JoinStrategy,
+		LogicalPlan, MorselId, ScalarValue, StageId, TableId,
 	};
 	use crate::server::{
 		NetworkTaskDispatcher, ToronCoordinator, ToronWorker, memory::MemoryManager,
@@ -665,7 +665,7 @@ mod tests {
 			output: TaskOutputBinding::ShuffleProducer {
 				exchange_id: ExchangeId::new(55),
 				partition_count: PartitionCount::new(2),
-				partition_key: Vec::new(),
+				partition_key: BoundExprProgram::empty(),
 			},
 			..test_task_spec(bound, TaskId::new(55))
 		};

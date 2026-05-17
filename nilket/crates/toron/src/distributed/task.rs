@@ -5,7 +5,7 @@ use crate::distributed::identity::{
 	AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId, TaskIdentity, WorkerId,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
-use crate::ir::{ExecutionExpr, ExecutionPlan, TableId};
+use crate::ir::{BoundExprProgram, ExecutionPlan, TableId};
 use crate::server::spill::SpillId;
 use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind};
 
@@ -169,7 +169,7 @@ pub enum TaskOutputBinding {
 	ShuffleProducer {
 		exchange_id: ExchangeId,
 		partition_count: PartitionCount,
-		partition_key: Vec<ExecutionExpr>,
+		partition_key: BoundExprProgram,
 	},
 }
 

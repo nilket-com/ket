@@ -14,8 +14,9 @@ use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBindi
 use toron::error::{BindingError, ExecutionError, StorageError};
 use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
-	ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan, ExecutionSortKey, Expr, JoinKind,
-	JoinStrategy, LogicalPlan, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, TableId,
+	BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan,
+	ExecutionSortKey, Expr, JoinKind, JoinStrategy, LogicalPlan, QueryProfileHint, ResolvedColumn,
+	ScalarValue, SortExpr, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -266,7 +267,7 @@ fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			partition_key,
 		} if *exchange_id == ExchangeId::new(2)
 			&& *partition_count == PartitionCount::new(1)
-			&& partition_key.is_empty()
+			&& partition_key.is_empty_roots()
 	));
 	assert_terminal_sort_task(
 		&stages[3].tasks[0].spec,
@@ -298,7 +299,7 @@ fn broadcast_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			partition_key,
 		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(1)
-			&& partition_key.is_empty()
+			&& partition_key.is_empty_roots()
 	));
 	assert_terminal_sort_task(
 		&stages[2].tasks[0].spec,
@@ -492,7 +493,7 @@ fn terminal_sort_plan(input: ExecutionPlan) -> ExecutionPlan {
 		input: Box::new(ExecutionPlan::Exchange {
 			input: Box::new(projected),
 			partition_count: 1,
-			key: Vec::new(),
+			key: BoundExprProgram::empty(),
 		}),
 		order_by: vec![sort_key(0), sort_key(1)],
 		limit: None,
@@ -505,10 +506,7 @@ fn project_join_output(input: ExecutionPlan) -> ExecutionPlan {
 	let output_schema = join_output_schema();
 	ExecutionPlan::Project {
 		input: Box::new(input),
-		exprs: vec![
-			resolved_key_expr("left_key", ColumnOrdinal(0)),
-			resolved_key_expr("right_key", ColumnOrdinal(1)),
-		],
+		exprs: resolved_project_exprs(),
 		output_schema,
 	}
 }
@@ -529,7 +527,7 @@ fn exchanged_scan(table_id: TableId, partition_count: u32) -> ExecutionPlan {
 	ExecutionPlan::Exchange {
 		input: Box::new(scan_plan(table_id, table_id.0 as u8)),
 		partition_count,
-		key: vec![resolved_key_expr("key", ColumnOrdinal(0))],
+		key: resolved_key_program("key", ColumnOrdinal(0)),
 	}
 }
 
@@ -570,8 +568,28 @@ fn sort_key(ordinal: u32) -> ExecutionSortKey {
 	}
 }
 
-fn resolved_key_expr(name: &str, ordinal: ColumnOrdinal) -> ExecutionExpr {
-	ExecutionExpr::Column(ResolvedColumn {
+fn resolved_project_exprs() -> BoundExprProgram {
+	let mut builder = BoundExprProgramBuilder::new();
+	let left = append_resolved_key_expr(&mut builder, "left_key", ColumnOrdinal(0));
+	let right = append_resolved_key_expr(&mut builder, "right_key", ColumnOrdinal(1));
+	builder.push_root(left);
+	builder.push_root(right);
+	builder.build()
+}
+
+fn resolved_key_program(name: &str, ordinal: ColumnOrdinal) -> BoundExprProgram {
+	let mut builder = BoundExprProgramBuilder::new();
+	let root = append_resolved_key_expr(&mut builder, name, ordinal);
+	builder.push_root(root);
+	builder.build()
+}
+
+fn append_resolved_key_expr(
+	builder: &mut BoundExprProgramBuilder,
+	name: &str,
+	ordinal: ColumnOrdinal,
+) -> toron::ir::BoundExprId {
+	builder.append_column(ResolvedColumn {
 		name: ColumnName(name.to_string()),
 		ordinal,
 		data_type: DataType::Int32,

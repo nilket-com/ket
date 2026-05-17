@@ -14,8 +14,8 @@ use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBindi
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	AggregateFunction, ColumnOrdinal, ExecutionExpr, ExecutionPlan, Expr, FilterDisposition,
-	LogicalPlan, ScalarValue, SortExpr, TableId,
+	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, ColumnOrdinal,
+	ExecutionPlan, Expr, FilterDisposition, LogicalPlan, ScalarValue, SortExpr, TableId,
 };
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{ScanRequest, ScanStream, StorageScan};
@@ -1250,13 +1250,13 @@ async fn grouped_aggregate_having_binds_against_aggregate_output() {
 		panic!("expected bound HAVING filter");
 	};
 	assert_eq!(disposition, FilterDisposition::EvaluateInToron);
-	assert!(matches!(
-		predicate,
-		ExecutionExpr::Gt(left, right)
-			if matches!(left.as_ref(), ExecutionExpr::Column(column)
-				if column.name.0 == "sum" && column.ordinal == ColumnOrdinal(1))
-				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Int64(Some(10))))
-	));
+	assert_binary_column_literal(
+		&predicate,
+		BoundBinaryOp::Gt,
+		"sum",
+		ColumnOrdinal(1),
+		|value| matches!(value, ScalarValue::Int64(Some(10))),
+	);
 	assert!(matches!(input.as_ref(), ExecutionPlan::Aggregate { .. }));
 }
 
@@ -1278,13 +1278,13 @@ async fn avg_having_binds_with_float64_literal_coercion() {
 		panic!("expected bound HAVING filter");
 	};
 	assert_eq!(disposition, FilterDisposition::EvaluateInToron);
-	assert!(matches!(
-		predicate,
-		ExecutionExpr::Gt(left, right)
-			if matches!(left.as_ref(), ExecutionExpr::Column(column)
-				if column.name.0 == "avg" && column.ordinal == ColumnOrdinal(1))
-				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Float64(Some(value))) if *value == 10.0)
-	));
+	assert_binary_column_literal(
+		&predicate,
+		BoundBinaryOp::Gt,
+		"avg",
+		ColumnOrdinal(1),
+		|value| matches!(value, ScalarValue::Float64(Some(value)) if *value == 10.0),
+	);
 	assert!(matches!(input.as_ref(), ExecutionPlan::Aggregate { .. }));
 }
 
@@ -1308,15 +1308,12 @@ async fn float32_min_having_binds_with_literal_coercion() {
 		let ExecutionPlan::Filter { predicate, .. } = bound else {
 			panic!("expected bound HAVING filter for {sql}");
 		};
-		assert!(
-			matches!(
-				predicate,
-				ExecutionExpr::Gt(left, right)
-					if matches!(left.as_ref(), ExecutionExpr::Column(column)
-						if column.name.0 == "min" && column.ordinal == ColumnOrdinal(0))
-						&& matches!(right.as_ref(), ExecutionExpr::Literal(value) if value == &expected)
-			),
-			"{sql}"
+		assert_binary_column_literal(
+			&predicate,
+			BoundBinaryOp::Gt,
+			"min",
+			ColumnOrdinal(0),
+			|value| value == &expected,
 		);
 	}
 }
@@ -1333,13 +1330,13 @@ async fn grouped_aggregate_having_group_key_binds_against_aggregate_output() {
 	let ExecutionPlan::Filter { predicate, .. } = bound else {
 		panic!("expected bound HAVING filter");
 	};
-	assert!(matches!(
-		predicate,
-		ExecutionExpr::Eq(left, right)
-			if matches!(left.as_ref(), ExecutionExpr::Column(column)
-				if column.name.0 == "region" && column.ordinal == ColumnOrdinal(0))
-				&& matches!(right.as_ref(), ExecutionExpr::Literal(ScalarValue::Utf8(Some(value))) if value == "east")
-	));
+	assert_binary_column_literal(
+		&predicate,
+		BoundBinaryOp::Eq,
+		"region",
+		ColumnOrdinal(0),
+		|value| matches!(value, ScalarValue::Utf8(Some(value)) if value == "east"),
+	);
 }
 
 #[tokio::test]
@@ -1545,22 +1542,15 @@ async fn arithmetic_bind_injects_only_widening_casts() {
 	let ExecutionPlan::Project { exprs, .. } = bound else {
 		panic!("expected projection");
 	};
-	assert!(matches!(
-		&exprs[0],
-		ExecutionExpr::Add(left, right)
-			if matches!(left.as_ref(), ExecutionExpr::Cast(inner, DataType::Int64)
-				if matches!(inner.as_ref(), ExecutionExpr::Column(column) if column.name.0 == "amount"))
-				&& matches!(right.as_ref(), ExecutionExpr::Column(column)
-					if column.name.0 == "id" && column.data_type == DataType::Int64)
-	));
-	assert!(matches!(
-		&exprs[1],
-		ExecutionExpr::Add(left, right)
-			if matches!(left.as_ref(), ExecutionExpr::Cast(inner, DataType::Float64)
-				if matches!(inner.as_ref(), ExecutionExpr::Column(column) if column.name.0 == "rating32"))
-				&& matches!(right.as_ref(), ExecutionExpr::Column(column)
-					if column.name.0 == "price" && column.data_type == DataType::Float64)
-	));
+	assert_add_with_casted_left(&exprs, 0, DataType::Int64, "amount", "id", DataType::Int64);
+	assert_add_with_casted_left(
+		&exprs,
+		1,
+		DataType::Float64,
+		"rating32",
+		"price",
+		DataType::Float64,
+	);
 }
 
 #[tokio::test]
@@ -2035,12 +2025,7 @@ async fn bind_try_cast_preserves_identity_node() {
 	let ExecutionPlan::Project { exprs, .. } = bound else {
 		panic!("expected projection");
 	};
-	assert!(matches!(
-		&exprs[0],
-		ExecutionExpr::TryCast(inner, DataType::Int32)
-			if matches!(inner.as_ref(), ExecutionExpr::Column(column)
-				if column.name.0 == "amount" && column.data_type == DataType::Int32)
-	));
+	assert_cast_root(&exprs, 0, true, DataType::Int32, "amount", DataType::Int32);
 }
 
 #[tokio::test]
@@ -2076,12 +2061,7 @@ async fn bind_explicit_cast_preserves_identity_node() {
 	let ExecutionPlan::Project { exprs, .. } = bound else {
 		panic!("expected projection");
 	};
-	assert!(matches!(
-		&exprs[0],
-		ExecutionExpr::Cast(inner, DataType::Int32)
-			if matches!(inner.as_ref(), ExecutionExpr::Column(column)
-				if column.name.0 == "amount" && column.data_type == DataType::Int32)
-	));
+	assert_cast_root(&exprs, 0, false, DataType::Int32, "amount", DataType::Int32);
 }
 
 #[tokio::test]
@@ -2543,7 +2523,7 @@ async fn grouped_aggregate_bound_plan_fragments_to_single_group_keyed_exchange()
 			partition_count,
 			partition_key,
 			..
-		} if *partition_count == PartitionCount::new(4) && partition_key.len() == 1
+		} if *partition_count == PartitionCount::new(4) && partition_key.root_count() == 1
 	));
 	for task in &stages[1].tasks {
 		assert!(matches!(task.spec.output, TaskOutputBinding::FinalResult));
@@ -2606,7 +2586,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 			partition_key,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(4)
-			&& partition_key.len() == 1
+			&& partition_key.root_count() == 1
 	));
 	assert_eq!(stages[1].tasks.len(), 4);
 	for (partition, task) in stages[1].tasks.iter().enumerate() {
@@ -2630,7 +2610,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 				partition_key,
 			} if *exchange_id == ExchangeId::new(1)
 				&& *partition_count == PartitionCount::new(1)
-				&& partition_key.is_empty()
+				&& partition_key.is_empty_roots()
 		));
 	}
 
@@ -2692,7 +2672,7 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 				partition_key,
 			} if *exchange_id == ExchangeId::new(1)
 				&& *partition_count == PartitionCount::new(1)
-				&& partition_key.is_empty()
+				&& partition_key.is_empty_roots()
 		));
 	}
 	assert!(matches!(
@@ -2728,7 +2708,7 @@ async fn scalar_aggregate_having_only_fragments_to_single_task_stage() {
 		ExecutionPlan::Filter { input, .. }
 			if matches!(
 				input.as_ref(),
-				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty()
+				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty_roots()
 			)
 	));
 }
@@ -2757,7 +2737,7 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 			partition_key,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
-			&& partition_key.is_empty()
+			&& partition_key.is_empty_roots()
 	));
 	assert!(matches!(
 		&stages[0].tasks[0].spec.plan,
@@ -2765,10 +2745,10 @@ async fn scalar_aggregate_ordered_fragments_to_generic_two_stage() {
 			input,
 			partition_count: 1,
 			key,
-		} if key.is_empty()
+		} if key.is_empty_roots()
 			&& matches!(
 				input.as_ref(),
-				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty()
+				ExecutionPlan::Aggregate { group_expr, .. } if group_expr.is_empty_roots()
 			)
 	));
 	let terminal = &stages[1].tasks[0].spec;
@@ -3717,6 +3697,111 @@ fn assert_qualified_column(expr: &Expr, expected_qualifier: &str, expected_name:
 		other => {
 			panic!("expected qualified column {expected_qualifier}.{expected_name}, got {other:?}")
 		}
+	}
+}
+
+fn assert_binary_column_literal(
+	program: &BoundExprProgram,
+	expected_op: BoundBinaryOp,
+	expected_column_name: &str,
+	expected_column_ordinal: ColumnOrdinal,
+	literal_matches: impl FnOnce(&ScalarValue) -> bool,
+) {
+	let root = program.single_root().expect("single expression root");
+	let BoundExprNode::Binary { op, left, right } = program.node(root).expect("root node") else {
+		panic!("expected binary root, got {:?}", program.node(root));
+	};
+	assert_eq!(op, &expected_op);
+	assert_column_node(
+		program,
+		*left,
+		expected_column_name,
+		Some(expected_column_ordinal),
+		None,
+	);
+	let BoundExprNode::Literal(literal) = program.node(*right).expect("right node") else {
+		panic!(
+			"expected literal right child, got {:?}",
+			program.node(*right)
+		);
+	};
+	let value = program
+		.literals
+		.get(*literal as usize)
+		.expect("literal slot");
+	assert!(literal_matches(value), "unexpected literal value {value:?}");
+}
+
+fn assert_add_with_casted_left(
+	program: &BoundExprProgram,
+	root_index: usize,
+	left_cast_type: DataType,
+	left_column_name: &str,
+	right_column_name: &str,
+	right_column_type: DataType,
+) {
+	let root = program.roots[root_index];
+	let BoundExprNode::Binary {
+		op: BoundBinaryOp::Add,
+		left,
+		right,
+	} = program.node(root).expect("add root")
+	else {
+		panic!("expected Add root, got {:?}", program.node(root));
+	};
+	let BoundExprNode::Cast { input, target } = program.node(*left).expect("left cast") else {
+		panic!("expected casted left child, got {:?}", program.node(*left));
+	};
+	assert_eq!(target, &left_cast_type);
+	assert_column_node(program, *input, left_column_name, None, None);
+	assert_column_node(
+		program,
+		*right,
+		right_column_name,
+		None,
+		Some(&right_column_type),
+	);
+}
+
+fn assert_cast_root(
+	program: &BoundExprProgram,
+	root_index: usize,
+	try_cast: bool,
+	target_type: DataType,
+	column_name: &str,
+	column_type: DataType,
+) {
+	let root = program.roots[root_index];
+	let input = match program.node(root).expect("cast root") {
+		BoundExprNode::TryCast { input, target } if try_cast => {
+			assert_eq!(target, &target_type);
+			*input
+		}
+		BoundExprNode::Cast { input, target } if !try_cast => {
+			assert_eq!(target, &target_type);
+			*input
+		}
+		other => panic!("expected cast root, got {other:?}"),
+	};
+	assert_column_node(program, input, column_name, None, Some(&column_type));
+}
+
+fn assert_column_node(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	expected_name: &str,
+	expected_ordinal: Option<ColumnOrdinal>,
+	expected_type: Option<&DataType>,
+) {
+	let BoundExprNode::Column(column) = program.node(id).expect("column node") else {
+		panic!("expected column node, got {:?}", program.node(id));
+	};
+	assert_eq!(column.name.0, expected_name);
+	if let Some(expected_ordinal) = expected_ordinal {
+		assert_eq!(column.ordinal, expected_ordinal);
+	}
+	if let Some(expected_type) = expected_type {
+		assert_eq!(&column.data_type, expected_type);
 	}
 }
 

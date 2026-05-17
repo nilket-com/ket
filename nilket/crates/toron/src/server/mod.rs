@@ -769,7 +769,7 @@ mod tests {
 	use crate::distributed::task::{
 		ArrowIpcDigest, PartitionAddress, PartitionCount, ProducerPartitionRef,
 	};
-	use crate::ir::{ColumnOrdinal, JoinKind, QueryProfileHint};
+	use crate::ir::{BoundExprProgram, ColumnOrdinal, JoinKind, QueryProfileHint};
 	use crate::storage::InMemoryStorageScan;
 	use arrow::array::Int64Array;
 	use arrow::datatypes::{DataType, Field, Schema};
@@ -950,7 +950,7 @@ mod tests {
 			output: TaskOutputBinding::ShuffleProducer {
 				exchange_id: ExchangeId::new(1),
 				partition_count: PartitionCount::new(1),
-				partition_key: Vec::new(),
+				partition_key: BoundExprProgram::empty(),
 			},
 			budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			trace: None,

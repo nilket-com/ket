@@ -1,6 +1,6 @@
 use arrow::datatypes::{DataType, Field};
 
-use crate::ir::{AggregateCall, AggregateFunction};
+use crate::ir::{AggregateFunction, BoundAggregateCall};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,10 +174,10 @@ pub(crate) fn stable_output_data_type(
 	}
 }
 
-pub(crate) fn stable_output_field(call: &AggregateCall) -> Option<Field> {
+pub(crate) fn stable_output_field(call: &BoundAggregateCall) -> Option<Field> {
 	let spec = stable_spec_for_function(&call.function)?;
-	let input_type = call.args.first().map(|arg| arg.data_type());
-	let data_type = stable_output_data_type(&call.function, input_type.as_ref())
+	let input_type = call.args.root_type(0);
+	let data_type = stable_output_data_type(&call.function, input_type)
 		.unwrap_or_else(|| fallback_output_data_type(spec.output_rule));
 	Some(Field::new(spec.output_name, data_type, spec.nullable))
 }

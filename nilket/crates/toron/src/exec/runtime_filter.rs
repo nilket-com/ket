@@ -15,7 +15,7 @@ use wendelon::schema::{
 
 use crate::distributed::task::RuntimeFilterFragment;
 use crate::error::ExecutionError;
-use crate::ir::{ColumnOrdinal, ExecutionExpr};
+use crate::ir::{BoundExprProgram, ColumnOrdinal};
 
 const TARGET_FP_RATE_BP: u16 = 100;
 const MIN_FILTER_BYTES: usize = 16 * 1024;
@@ -24,7 +24,7 @@ const EXACT_FILTER_MAX_BYTES: usize = MIN_FILTER_BYTES;
 
 pub(crate) fn build_runtime_filter_fragment(
 	batches: &[RecordBatch],
-	key: &[ExecutionExpr],
+	key: &BoundExprProgram,
 ) -> Result<Option<RuntimeFilterFragment>, ExecutionError> {
 	let Some((ordinal, key_type)) = single_supported_key(key) else {
 		return Ok(None);
@@ -313,11 +313,9 @@ pub(crate) fn runtime_filter_key_type(data_type: &DataType) -> Option<RuntimeFil
 }
 
 pub(crate) fn single_supported_key(
-	key: &[ExecutionExpr],
+	key: &BoundExprProgram,
 ) -> Option<(ColumnOrdinal, RuntimeFilterKeyType)> {
-	let [ExecutionExpr::Column(column)] = key else {
-		return None;
-	};
+	let column = key.single_column_root()?;
 	runtime_filter_key_type(&column.data_type).map(|key_type| (column.ordinal, key_type))
 }
 
@@ -410,13 +408,7 @@ mod tests {
 			vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int32,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int32, true);
 		let fragment = build_runtime_filter_fragment(&[batch.clone()], &key)
 			.unwrap()
 			.expect("fragment");
@@ -446,13 +438,7 @@ mod tests {
 			vec![Arc::new(Int64Array::from_iter_values(100_000_i64..110_000)) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int64,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int64, true);
 		let fragment = build_runtime_filter_fragment(&[build], &key)
 			.unwrap()
 			.expect("fragment");
@@ -487,13 +473,7 @@ mod tests {
 			vec![Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int64,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int64, true);
 		let mut merged = build_runtime_filter_fragment(std::slice::from_ref(&left), &key)
 			.unwrap()
 			.expect("left fragment");
@@ -534,13 +514,7 @@ mod tests {
 			vec![Arc::new(Int64Array::from_iter_values(1000_i64..2000)) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int64,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int64, true);
 		let mut merged = build_runtime_filter_fragment(std::slice::from_ref(&left), &key)
 			.unwrap()
 			.expect("left fragment");
@@ -573,13 +547,7 @@ mod tests {
 			vec![Arc::new(Int64Array::from(vec![42_i64; 100_000])) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int64,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int64, true);
 
 		let fragment = build_runtime_filter_fragment(&[batch], &key)
 			.unwrap()
@@ -606,13 +574,7 @@ mod tests {
 			vec![Arc::new(Int64Array::from(build_values)) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Int64,
-			nullable: false,
-			pbc_eligible: true,
-		})];
+		let key = key_expr(DataType::Int64, true);
 
 		let start = std::time::Instant::now();
 		let fragment = build_runtime_filter_fragment(&[batch.clone()], &key)
@@ -642,13 +604,7 @@ mod tests {
 			vec![Arc::new(Float64Array::from(vec![1.0, 2.0])) as ArrayRef],
 		)
 		.unwrap();
-		let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-			name: crate::ir::ColumnName("id".to_string()),
-			ordinal: ColumnOrdinal(0),
-			data_type: DataType::Float64,
-			nullable: false,
-			pbc_eligible: false,
-		})];
+		let key = key_expr(DataType::Float64, false);
 
 		assert!(
 			build_runtime_filter_fragment(&[batch], &key)
@@ -659,22 +615,7 @@ mod tests {
 
 	#[test]
 	fn runtime_filter_generation_eligibility_excludes_composites() {
-		let key = [
-			ExecutionExpr::Column(crate::ir::ResolvedColumn {
-				name: crate::ir::ColumnName("id".to_string()),
-				ordinal: ColumnOrdinal(0),
-				data_type: DataType::Int32,
-				nullable: false,
-				pbc_eligible: true,
-			}),
-			ExecutionExpr::Column(crate::ir::ResolvedColumn {
-				name: crate::ir::ColumnName("tenant".to_string()),
-				ordinal: ColumnOrdinal(1),
-				data_type: DataType::Int32,
-				nullable: false,
-				pbc_eligible: true,
-			}),
-		];
+		let key = composite_key_expr();
 
 		assert!(build_runtime_filter_fragment(&[], &key).unwrap().is_none());
 	}
@@ -687,16 +628,44 @@ mod tests {
 			DataType::Timestamp(TimeUnit::Microsecond, None),
 			DataType::Decimal128(10, 2),
 		] {
-			let key = [ExecutionExpr::Column(crate::ir::ResolvedColumn {
-				name: crate::ir::ColumnName("id".to_string()),
-				ordinal: ColumnOrdinal(0),
-				data_type,
-				nullable: false,
-				pbc_eligible: false,
-			})];
+			let key = key_expr(data_type, false);
 
 			assert!(build_runtime_filter_fragment(&[], &key).unwrap().is_none());
 		}
+	}
+
+	fn key_expr(data_type: DataType, pbc_eligible: bool) -> BoundExprProgram {
+		let mut builder = crate::ir::BoundExprProgramBuilder::new();
+		let id = builder.append_column(crate::ir::ResolvedColumn {
+			name: crate::ir::ColumnName("id".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type,
+			nullable: false,
+			pbc_eligible,
+		});
+		builder.push_root(id);
+		builder.build()
+	}
+
+	fn composite_key_expr() -> BoundExprProgram {
+		let mut builder = crate::ir::BoundExprProgramBuilder::new();
+		let id = builder.append_column(crate::ir::ResolvedColumn {
+			name: crate::ir::ColumnName("id".to_string()),
+			ordinal: ColumnOrdinal(0),
+			data_type: DataType::Int32,
+			nullable: false,
+			pbc_eligible: true,
+		});
+		let tenant = builder.append_column(crate::ir::ResolvedColumn {
+			name: crate::ir::ColumnName("tenant".to_string()),
+			ordinal: ColumnOrdinal(1),
+			data_type: DataType::Int32,
+			nullable: false,
+			pbc_eligible: true,
+		});
+		builder.push_root(id);
+		builder.push_root(tenant);
+		builder.build()
 	}
 
 	fn runtime_filter_test_fingerprint() -> PhysicalDescriptorFingerprint {

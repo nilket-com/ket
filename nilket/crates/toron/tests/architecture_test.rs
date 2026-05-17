@@ -299,7 +299,7 @@ fn no_public_result_string_boundaries() {
 }
 
 #[test]
-fn execution_expr_has_no_string_column_variant() {
+fn bound_expr_node_has_no_string_column_variant() {
 	let source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
 
@@ -582,7 +582,205 @@ fn architecture_guards_unchanged_plus_sort_variant() {
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("CreateTable {"));
 	assert!(execution_plan.contains("Insert {"));
+	assert!(execution_plan.contains("predicate: BoundExprProgram"));
+	assert!(execution_plan.contains("exprs: BoundExprProgram"));
+	assert!(execution_plan.contains("group_expr: BoundExprProgram"));
+	assert!(execution_plan.contains("aggr_expr: Vec<BoundAggregateCall>"));
+	assert!(execution_plan.contains("key: BoundExprProgram"));
 	assert!(execution_source.contains("pub struct ExecutionSortKey"));
+}
+
+#[test]
+fn adr031_bound_expr_program_shape() {
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let program = brace_blocks_after_marker(&execution_source, "pub struct BoundExprProgram")
+		.into_iter()
+		.next()
+		.expect("BoundExprProgram block")
+		.1;
+	for field in [
+		"pub nodes: Vec<BoundExprNode>",
+		"pub node_types: Vec<DataType>",
+		"pub literals: Vec<ScalarValue>",
+		"pub roots: Vec<BoundExprId>",
+	] {
+		assert!(program.contains(field), "missing {field}");
+	}
+	assert!(execution_source.contains("pub struct BoundExprId(pub u32);"));
+	let aggregate = brace_blocks_after_marker(&execution_source, "pub struct BoundAggregateCall")
+		.into_iter()
+		.next()
+		.expect("BoundAggregateCall block")
+		.1;
+	assert!(aggregate.contains("pub args: BoundExprProgram"));
+}
+
+#[test]
+fn adr031_bound_expr_node_has_no_boxes() {
+	let manifest_dir = manifest_dir();
+	let offenders = source_lines(&manifest_dir.join("src"))
+		.into_iter()
+		.filter(|(_, _, line)| {
+			line.contains("Box<ExecutionExpr>") || line.contains("ExecutionExpr::")
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		offenders.is_empty(),
+		"ADR 031 production ExecutionExpr references found:\n{}",
+		format_offenders(&manifest_dir, &offenders)
+	);
+
+	let execution_source = std::fs::read_to_string(manifest_dir.join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let node = execution_source
+		.split("pub enum BoundExprNode")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("BoundExprNode enum");
+	assert_eq!(enum_variant_count(node), 7);
+	for variant in [
+		"Column",
+		"Literal",
+		"Cast",
+		"TryCast",
+		"Binary",
+		"Unary",
+		"TimeBucket",
+	] {
+		assert!(node.contains(variant), "missing BoundExprNode::{variant}");
+	}
+}
+
+#[test]
+fn adr031_bound_expr_program_partial_eq_only() {
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	for type_name in ["BoundExprProgram", "BoundExprNode", "BoundAggregateCall"] {
+		let derives = derive_items_before(&execution_source, type_name);
+		assert!(
+			derives.iter().any(|item| item == "PartialEq"),
+			"{type_name} must derive PartialEq"
+		);
+		assert!(
+			!derives.iter().any(|item| item == "Eq" || item == "Hash"),
+			"{type_name} must not derive Eq or Hash"
+		);
+	}
+}
+
+#[test]
+fn adr031_execution_plan_uses_bound_expr_program() {
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let execution_plan = execution_source
+		.split("pub enum ExecutionPlan")
+		.nth(1)
+		.and_then(|rest| rest.split("impl ExecutionPlan").next())
+		.expect("ExecutionPlan enum");
+	for field in [
+		"predicate: BoundExprProgram",
+		"exprs: BoundExprProgram",
+		"group_expr: BoundExprProgram",
+		"aggr_expr: Vec<BoundAggregateCall>",
+		"key: BoundExprProgram",
+	] {
+		assert!(execution_plan.contains(field), "missing {field}");
+	}
+	let aggregate = brace_blocks_after_marker(&execution_source, "pub struct BoundAggregateCall")
+		.into_iter()
+		.next()
+		.expect("BoundAggregateCall block")
+		.1;
+	assert!(aggregate.contains("pub args: BoundExprProgram"));
+}
+
+#[test]
+fn adr031_execution_plan_insert_stays_expression_free() {
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let insert = brace_blocks_after_marker(&execution_source, "Insert {")
+		.into_iter()
+		.next()
+		.expect("ExecutionPlan::Insert block")
+		.1;
+	assert!(insert.contains("rows: Vec<Vec<ScalarValue>>"));
+	assert!(!insert.contains("BoundExprProgram"));
+}
+
+#[test]
+fn adr031_join_and_sort_remain_ordinal_keyed() {
+	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
+		.expect("read execution IR source");
+	let sort_key = brace_blocks_after_marker(&execution_source, "pub struct ExecutionSortKey")
+		.into_iter()
+		.next()
+		.expect("ExecutionSortKey block")
+		.1;
+	assert!(sort_key.contains("pub ordinal: ColumnOrdinal"));
+	assert!(!sort_key.contains("BoundExprProgram"));
+	assert!(execution_source.contains("left_keys: Vec<ColumnOrdinal>"));
+	assert!(execution_source.contains("right_keys: Vec<ColumnOrdinal>"));
+}
+
+#[test]
+fn adr031_pbc_reads_bound_expr_program() {
+	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source");
+	let compile = brace_blocks_after_marker(&pbc, "pub(crate) fn compile")
+		.into_iter()
+		.next()
+		.expect("PbcCompiler::compile block")
+		.1;
+	assert!(compile.contains("predicate: Option<&BoundExprProgram>"));
+	assert!(!compile.contains("Option<&ExecutionExpr>"));
+	assert!(compile.contains("single_root()"));
+}
+
+#[test]
+fn adr031_executor_evaluates_program_linearly() {
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	let evaluate = brace_blocks_after_marker(&exec, "pub fn evaluate_bound_program")
+		.into_iter()
+		.next()
+		.expect("evaluate_bound_program block")
+		.1;
+	assert!(evaluate.contains("program.nodes.iter().enumerate()"));
+	assert_eq!(evaluate.matches("evaluate_bound_program(").count(), 1);
+}
+
+#[test]
+fn adr031_binder_emits_bound_expr_program() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	assert!(binder.contains("BoundExprProgramBuilder"));
+	assert!(binder.contains("fn bind_expr_program"));
+	assert!(binder.contains("fn bind_expr_into_program"));
+	assert!(!binder.contains("ExecutionExpr::Cast"));
+	assert!(!binder.contains("ExecutionExpr::TryCast"));
+}
+
+#[test]
+fn adr031_adr028_signature_stays_logical_expr() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let signature = brace_blocks_after_marker(&planner, "struct GroupedAggregateSignature")
+		.into_iter()
+		.next()
+		.expect("GroupedAggregateSignature block")
+		.1;
+	assert!(signature.contains("args: Vec<Expr>"));
+	assert!(!signature.contains("BoundExprProgram"));
+	for helper in [
+		"fn hash_expr_structural",
+		"fn expr_structural_eq",
+		"fn hash_scalar_structural",
+		"fn scalar_structural_eq",
+		"fn hash_data_type_structural",
+		"fn data_type_structural_eq",
+	] {
+		assert!(planner.contains(helper), "missing ADR 028 helper {helper}");
+	}
 }
 
 #[test]
@@ -656,7 +854,7 @@ fn adr015_grouped_aggregate_ordering_guards_are_narrow() {
 	assert!(detector.contains("ExecutionPlan::Sort"));
 	assert!(detector.contains("ExecutionPlan::Exchange"));
 	assert!(detector.contains("ExecutionPlan::Aggregate"));
-	assert!(detector.contains("*partition_count != 1 || !key.is_empty()"));
+	assert!(detector.contains("*partition_count != 1 || !key.is_empty_roots()"));
 	assert!(detector.contains("partition_count: group_partition_count"));
 	assert!(fragmenter.contains("if exchange_count > 1"));
 }
@@ -927,19 +1125,28 @@ fn adr024_scalar_arithmetic_guards_are_narrow() {
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
-	for variant in [
-		"Cast(Box<ExecutionExpr>, DataType)",
-		"TryCast(Box<ExecutionExpr>, DataType)",
-		"Add(Box<ExecutionExpr>, Box<ExecutionExpr>)",
-		"Sub(Box<ExecutionExpr>, Box<ExecutionExpr>)",
-		"Mul(Box<ExecutionExpr>, Box<ExecutionExpr>)",
-		"Div(Box<ExecutionExpr>, Box<ExecutionExpr>)",
-	] {
+	let binary_op = execution_source
+		.split("pub enum BoundBinaryOp")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("BoundBinaryOp enum");
+	for variant in ["Add", "Sub", "Mul", "Div"] {
 		assert!(
-			execution_source.contains(variant),
-			"missing ExecutionExpr::{variant}"
+			binary_op.contains(variant),
+			"missing BoundBinaryOp::{variant}"
 		);
 	}
+	let node = execution_source
+		.split("pub enum BoundExprNode")
+		.nth(1)
+		.and_then(|rest| rest.split("#[derive").next())
+		.expect("BoundExprNode enum");
+	assert!(node.contains("Cast {"));
+	assert!(node.contains("TryCast {"));
+	assert!(node.contains("Binary {"));
+	assert!(node.contains("op: BoundBinaryOp"));
+	assert!(node.contains("left: BoundExprId"));
+	assert!(node.contains("right: BoundExprId"));
 	assert!(execution_source.contains("pub fn arithmetic_output_type"));
 	assert!(execution_source.contains("(Int32, Int32) => Some(Int32)"));
 	assert!(execution_source.contains("(Int32, Int64) | (Int64, Int32) | (Int64, Int64)"));
@@ -1158,7 +1365,7 @@ fn adr025_explicit_cast_policy_is_separate_from_implicit_widening() {
 			.1;
 
 	assert!(explicit_cast.contains("is_supported_explicit_numeric_cast"));
-	assert!(explicit_cast.contains("Ok(ExecutionExpr::Cast(Box::new(inner), target.clone()))"));
+	assert!(explicit_cast.contains("builder.append_cast(inner, target.clone(), target.clone())"));
 	assert!(!explicit_cast.contains("source == *target"));
 	assert!(!explicit_cast.contains("source == target"));
 	assert!(implicit_cast.contains("if source == *target"));
@@ -1347,26 +1554,19 @@ fn adr026_try_cast_ir_surface_is_narrow() {
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
-	assert!(execution_source.contains("TryCast(Box<ExecutionExpr>, DataType)"));
-	let data_type = brace_blocks_after_marker(&execution_source, "fn data_type")
-		.into_iter()
-		.next()
-		.expect("data_type body")
-		.1;
-	assert!(data_type.contains("Self::Cast(_, target) | Self::TryCast(_, target)"));
+	assert!(execution_source.contains("TryCast {"));
+	assert!(execution_source.contains("target: DataType"));
 	let nullable = brace_blocks_after_marker(&execution_source, "fn nullable")
 		.into_iter()
 		.next()
+		.or_else(|| {
+			brace_blocks_after_marker(&execution_source, "fn node_nullable")
+				.into_iter()
+				.next()
+		})
 		.expect("nullable body")
 		.1;
-	assert!(nullable.contains("Self::TryCast(_, _) => true"));
-	let pbc_eligible = brace_blocks_after_marker(&execution_source, "fn pbc_eligible")
-		.into_iter()
-		.next()
-		.expect("execution pbc eligibility body")
-		.1;
-	assert!(pbc_eligible.contains("Self::TryCast(_, _)"));
-	assert!(pbc_eligible.contains("false"));
+	assert!(nullable.contains("BoundExprNode::TryCast { .. } => Some(true)"));
 }
 
 #[test]
@@ -1396,7 +1596,9 @@ fn adr026_try_cast_policy_is_separate() {
 		.1;
 	assert!(bind_try_cast.contains("is_supported_explicit_numeric_cast"));
 	assert!(bind_try_cast.contains("unsupported TRY_CAST/SAFE_CAST"));
-	assert!(bind_try_cast.contains("Ok(ExecutionExpr::TryCast(Box::new(inner), target.clone()))"));
+	assert!(
+		bind_try_cast.contains("builder.append_try_cast(inner, target.clone(), target.clone())")
+	);
 	assert!(
 		!bind_try_cast.contains("if source == *target"),
 		"bind_try_cast must not elide identity TryCast"
@@ -1405,8 +1607,8 @@ fn adr026_try_cast_policy_is_separate() {
 		!bind_try_cast.contains("if source == target"),
 		"bind_try_cast must not elide identity TryCast"
 	);
-	assert!(binder.contains("ExecutionExpr::TryCast(inner, _)"));
-	assert!(binder.contains("ExecutionExpr::TryCast(inner, target)"));
+	assert!(binder.contains("BoundExprNode::TryCast { input, .. }"));
+	assert!(binder.contains("BoundExprNode::TryCast { input, target }"));
 }
 
 #[test]
@@ -1497,7 +1699,7 @@ fn adr026_try_cast_nulls_only_data_domain_failures() {
 #[test]
 fn adr026_try_cast_pbc_declines() {
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read PBC source");
-	assert!(pbc.contains("ExecutionExpr::TryCast(_, _)"));
+	assert!(pbc.contains("BoundExprNode::TryCast { .. }"));
 	assert!(pbc.contains("arithmetic, Cast, and TryCast are not PBC-eligible"));
 	assert!(!pbc.contains("OP_CAST"));
 	assert!(!pbc.contains("OP_TRY_CAST"));
@@ -1843,11 +2045,11 @@ fn adr028_binder_executor_aggregate_args_preserved() {
 		.next()
 		.expect("bind stable aggregate call")
 		.1;
-	assert!(stable_bind.contains("bind_expr"));
+	assert!(stable_bind.contains("bind_expr_program(args"));
 	let exec =
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
 	assert!(exec.contains("self.evaluate_expr(&args[0]"));
-	assert!(exec.contains("self.evaluate_bound_expr(&call.args[0]"));
+	assert!(exec.contains("self.evaluate_bound_single_root(&call.args"));
 }
 
 #[test]
@@ -1983,6 +2185,24 @@ fn enum_variant_count(enum_body: &str) -> usize {
 				&& (trimmed.ends_with(',') || trimmed.ends_with('{'))
 		})
 		.count()
+}
+
+fn derive_items_before(source: &str, marker: &str) -> Vec<String> {
+	let before = source
+		.split(marker)
+		.next()
+		.unwrap_or_else(|| panic!("missing marker {marker}"));
+	let derives = before.rsplit("#[derive").next().unwrap_or("");
+	derives
+		.split(')')
+		.next()
+		.and_then(|line| line.split('(').nth(1))
+		.unwrap_or("")
+		.split(',')
+		.map(str::trim)
+		.filter(|item| !item.is_empty())
+		.map(ToOwned::to_owned)
+		.collect()
 }
 
 #[test]

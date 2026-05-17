@@ -9,7 +9,8 @@ use crate::ir::JoinStrategy;
 #[cfg(test)]
 use crate::ir::arithmetic_output_type;
 use crate::ir::{
-	AggregateFunction, ExecutionExpr, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
+	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
+	BoundExprProgram, BoundUnaryOp, ExecutionPlan, ExecutionSortKey, FilterDisposition, JoinKind,
 	MorselId, QueryId, QueryProfileHint, ScalarValue, SessionId, TableId,
 };
 #[cfg(test)]
@@ -616,7 +617,8 @@ impl Executor {
 
 					let mut output = Vec::new();
 					for batch in input_batches {
-						let mask = self.evaluate_bound_expr(predicate, &batch)?;
+						let mask =
+							self.evaluate_bound_single_root(predicate, &batch, "filter predicate")?;
 						let mask_bool =
 							mask.as_any()
 								.downcast_ref::<BooleanArray>()
@@ -635,11 +637,7 @@ impl Executor {
 					let input_batches = self.execute_bound(input, morsel).await?;
 					let mut output = Vec::new();
 					for batch in input_batches {
-						let mut cols = Vec::new();
-						for expr in exprs {
-							let array = self.evaluate_bound_expr(expr, &batch)?;
-							cols.push(array.clone());
-						}
+						let cols = self.evaluate_bound_program(exprs, &batch)?;
 						output.push(RecordBatch::try_new(output_schema.clone(), cols)?);
 					}
 					Ok(output)
@@ -651,7 +649,7 @@ impl Executor {
 					output_schema,
 				} => {
 					let input_batches = self.execute_bound(input, morsel).await?;
-					if group_expr.is_empty() {
+					if group_expr.is_empty_roots() {
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
 						self.bound_grouped_aggregate(
@@ -900,164 +898,90 @@ impl Executor {
 		}
 	}
 
-	pub fn evaluate_bound_expr(
+	pub fn evaluate_bound_program(
 		&self,
-		expr: &ExecutionExpr,
+		program: &BoundExprProgram,
 		batch: &RecordBatch,
-	) -> Result<ArrayRef, ExecutionError> {
-		match expr {
-			ExecutionExpr::Column(column) => {
-				let ordinal = column.ordinal.0 as usize;
-				let col = batch.columns().get(ordinal).ok_or_else(|| {
-					ExecutionError::InvalidExpression {
-						message: format!("column ordinal {ordinal} out of bounds"),
-					}
-				})?;
-				Ok(col.clone())
-			}
-			ExecutionExpr::Literal(val) => {
-				let num_rows = batch.num_rows();
-				match val {
-					ScalarValue::Boolean(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
-					ScalarValue::Int32(v) => Ok(Arc::new(Int32Array::from(vec![*v; num_rows]))),
-					ScalarValue::Int64(v) => {
-						Ok(Arc::new(arrow::array::Int64Array::from(vec![*v; num_rows])))
-					}
-					ScalarValue::Float32(v) => {
-						Ok(Arc::new(arrow::array::Float32Array::from(vec![
-							*v;
-							num_rows
-						])))
-					}
-					ScalarValue::Float64(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
-					ScalarValue::Utf8(v) => Ok(Arc::new(StringArray::from(vec![
-						v.clone()
-							.as_deref();
-						num_rows
-					]))),
+	) -> Result<Vec<ArrayRef>, ExecutionError> {
+		program
+			.validate()
+			.map_err(|error| ExecutionError::InvalidExpression {
+				message: format!("invalid bound expression program: {error:?}"),
+			})?;
+		let mut outputs: Vec<Option<ArrayRef>> = vec![None; program.nodes.len()];
+		for (idx, node) in program.nodes.iter().enumerate() {
+			let output = match node {
+				BoundExprNode::Column(column) => {
+					let ordinal = column.ordinal.0 as usize;
+					batch.columns().get(ordinal).cloned().ok_or_else(|| {
+						ExecutionError::InvalidExpression {
+							message: format!("column ordinal {ordinal} out of bounds"),
+						}
+					})?
 				}
-			}
-			ExecutionExpr::Cast(inner, target) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				evaluate_cast(&arr, target)
-			}
-			ExecutionExpr::TryCast(inner, target) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				evaluate_try_cast(&arr, target)
-			}
-			ExecutionExpr::Add(left, right) => {
-				self.evaluate_bound_arithmetic(ArithmeticOp::Add, left, right, batch)
-			}
-			ExecutionExpr::Sub(left, right) => {
-				self.evaluate_bound_arithmetic(ArithmeticOp::Sub, left, right, batch)
-			}
-			ExecutionExpr::Mul(left, right) => {
-				self.evaluate_bound_arithmetic(ArithmeticOp::Mul, left, right, batch)
-			}
-			ExecutionExpr::Div(left, right) => {
-				self.evaluate_bound_arithmetic(ArithmeticOp::Div, left, right, batch)
-			}
-			ExecutionExpr::Eq(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(eq(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::Neq(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(neq(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::Lt(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(lt(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::Lte(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(lt_eq(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::Gt(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(gt(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::Gte(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				Ok(Arc::new(gt_eq(&left_arr, &right_arr)?))
-			}
-			ExecutionExpr::And(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				let left_bool = as_boolean(&left_arr, "AND left operand")?;
-				let right_bool = as_boolean(&right_arr, "AND right operand")?;
-				Ok(Arc::new(and(left_bool, right_bool)?))
-			}
-			ExecutionExpr::Or(left, right) => {
-				let left_arr = self.evaluate_bound_expr(left, batch)?;
-				let right_arr = self.evaluate_bound_expr(right, batch)?;
-				let left_bool = as_boolean(&left_arr, "OR left operand")?;
-				let right_bool = as_boolean(&right_arr, "OR right operand")?;
-				Ok(Arc::new(or(left_bool, right_bool)?))
-			}
-			ExecutionExpr::Not(inner) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				let bool_arr = as_boolean(&arr, "NOT operand")?;
-				Ok(Arc::new(not(bool_arr)?))
-			}
-			ExecutionExpr::IsNull(inner) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				Ok(Arc::new(is_null(&arr)?))
-			}
-			ExecutionExpr::IsNotNull(inner) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				Ok(Arc::new(is_not_null(&arr)?))
-			}
-			ExecutionExpr::TimeBucket(interval, inner) => {
-				let arr = self.evaluate_bound_expr(inner, batch)?;
-				if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-					let interval_ms = interval.as_millis() as i64;
-					let bucketed: Vec<Option<i64>> = int_arr
-						.iter()
-						.map(|v| v.map(|v| (v / interval_ms) * interval_ms))
-						.collect();
-					Ok(Arc::new(Int64Array::from(bucketed)) as ArrayRef)
-				} else {
-					Err(ExecutionError::InvalidExpression {
-						message: "TimeBucket expects Int64 (ms) input".to_string(),
-					})
+				BoundExprNode::Literal(literal) => {
+					let value = program.literals.get(*literal as usize).ok_or_else(|| {
+						ExecutionError::InvalidExpression {
+							message: format!("literal slot {literal} out of bounds"),
+						}
+					})?;
+					literal_array(value, batch.num_rows())
 				}
-			}
+				BoundExprNode::Cast { input, target } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_cast(&arr, target)?
+				}
+				BoundExprNode::TryCast { input, target } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_try_cast(&arr, target)?
+				}
+				BoundExprNode::Binary { op, left, right } => {
+					let left_arr = evaluated_child(&outputs, *left)?;
+					let right_arr = evaluated_child(&outputs, *right)?;
+					evaluate_bound_binary(program, op, *left, &left_arr, &right_arr)?
+				}
+				BoundExprNode::Unary { op, input } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_bound_unary(op, &arr)?
+				}
+				BoundExprNode::TimeBucket { interval, input } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_time_bucket(*interval, &arr)?
+				}
+			};
+			outputs[idx] = Some(output);
 		}
+		program
+			.roots
+			.iter()
+			.map(|root| evaluated_child(&outputs, *root))
+			.collect()
 	}
 
-	fn evaluate_bound_arithmetic(
+	fn evaluate_bound_single_root(
 		&self,
-		op: ArithmeticOp,
-		left: &ExecutionExpr,
-		right: &ExecutionExpr,
+		program: &BoundExprProgram,
 		batch: &RecordBatch,
+		context: &'static str,
 	) -> Result<ArrayRef, ExecutionError> {
-		let left_type = left.data_type();
-		let right_type = right.data_type();
-		if left_type != right_type {
+		let mut roots = self.evaluate_bound_program(program, batch)?.into_iter();
+		let Some(root) = roots.next() else {
 			return Err(ExecutionError::InvalidExpression {
-				message: format!(
-					"bound arithmetic operands must have matching types, got {left_type:?} and {right_type:?}"
-				),
+				message: format!("{context} must have exactly one root"),
+			});
+		};
+		if roots.next().is_some() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("{context} must have exactly one root"),
 			});
 		}
-
-		let left_arr = self.evaluate_bound_expr(left, batch)?;
-		let right_arr = self.evaluate_bound_expr(right, batch)?;
-		evaluate_arithmetic(op, &left_arr, &right_arr, &left_type)
+		Ok(root)
 	}
 
 	fn bound_global_aggregate(
 		&self,
 		input_batches: &[RecordBatch],
-		aggr_expr: &[crate::ir::AggregateCall],
+		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let mut results_cols = Vec::new();
@@ -1073,7 +997,8 @@ impl Executor {
 				AggregateFunction::Count => {
 					let mut total = 0i64;
 					for batch in input_batches {
-						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						let arr =
+							self.evaluate_bound_single_root(&call.args, batch, "COUNT arg")?;
 						for row in 0..batch.num_rows() {
 							if !arr.is_null(row) {
 								total += 1;
@@ -1083,9 +1008,9 @@ impl Executor {
 					results_cols.push(Arc::new(Int64Array::from(vec![total])) as ArrayRef);
 				}
 				AggregateFunction::Sum => {
-					let mut state = sum_state_for_data_type(&call.args[0].data_type());
+					let mut state = sum_state_for_data_type(first_arg_type(call)?);
 					for batch in input_batches {
-						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						let arr = self.evaluate_bound_single_root(&call.args, batch, "SUM arg")?;
 						for row in 0..batch.num_rows() {
 							if let Some(value) = numeric_value(&arr, row)? {
 								add_sum_value(&mut state, value)?;
@@ -1096,9 +1021,9 @@ impl Executor {
 					results_cols.push(sum_state_array(&state, &output_type)?);
 				}
 				AggregateFunction::Avg => {
-					let mut state = avg_state_for_data_type(&call.args[0].data_type())?;
+					let mut state = avg_state_for_data_type(first_arg_type(call)?)?;
 					for batch in input_batches {
-						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						let arr = self.evaluate_bound_single_root(&call.args, batch, "AVG arg")?;
 						for row in 0..batch.num_rows() {
 							if let Some(value) = numeric_value(&arr, row)? {
 								add_avg_value(&mut state, value)?;
@@ -1108,9 +1033,9 @@ impl Executor {
 					results_cols.push(avg_state_array(&state)?);
 				}
 				AggregateFunction::Min => {
-					let mut state = min_state_for_data_type(&call.args[0].data_type())?;
+					let mut state = min_state_for_data_type(first_arg_type(call)?)?;
 					for batch in input_batches {
-						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						let arr = self.evaluate_bound_single_root(&call.args, batch, "MIN arg")?;
 						for row in 0..batch.num_rows() {
 							update_min_state(&mut state, &arr, row)?;
 						}
@@ -1118,9 +1043,9 @@ impl Executor {
 					results_cols.push(min_max_state_array(&state)?);
 				}
 				AggregateFunction::Max => {
-					let mut state = max_state_for_data_type(&call.args[0].data_type())?;
+					let mut state = max_state_for_data_type(first_arg_type(call)?)?;
 					for batch in input_batches {
-						let arr = self.evaluate_bound_expr(&call.args[0], batch)?;
+						let arr = self.evaluate_bound_single_root(&call.args, batch, "MAX arg")?;
 						for row in 0..batch.num_rows() {
 							update_max_state(&mut state, &arr, row)?;
 						}
@@ -1339,18 +1264,15 @@ impl Executor {
 	fn bound_grouped_aggregate(
 		&self,
 		input_batches: &[RecordBatch],
-		group_expr: &[ExecutionExpr],
-		aggr_expr: &[crate::ir::AggregateCall],
+		group_expr: &BoundExprProgram,
+		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		let mut groups: BTreeMap<Vec<GroupValue>, Vec<AggState>> = BTreeMap::new();
 		let mut group_types = Vec::new();
 
 		for batch in input_batches {
-			let group_arrays = group_expr
-				.iter()
-				.map(|expr| self.evaluate_bound_expr(expr, batch))
-				.collect::<Result<Vec<_>, _>>()?;
+			let group_arrays = self.evaluate_bound_program(group_expr, batch)?;
 			if group_types.is_empty() {
 				group_types = group_arrays
 					.iter()
@@ -1366,7 +1288,11 @@ impl Executor {
 					| AggregateFunction::Sum
 					| AggregateFunction::Min
 					| AggregateFunction::Max
-					| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_expr(&call.args[0], batch)?)),
+					| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_single_root(
+						&call.args,
+						batch,
+						"aggregate arg",
+					)?)),
 					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 						Err(ExecutionError::NotImplemented {
 							feature: "bound grouped experimental aggregate",
@@ -1482,7 +1408,7 @@ impl Executor {
 		&self,
 		input: &ExecutionPlan,
 		partition_count: u32,
-		key: &[ExecutionExpr],
+		key: &BoundExprProgram,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
 		if partition_count == 0 {
@@ -1504,10 +1430,7 @@ impl Executor {
 				continue;
 			}
 
-			let key_arrays = key
-				.iter()
-				.map(|expr| self.evaluate_bound_expr(expr, &batch))
-				.collect::<Result<Vec<_>, _>>()?;
+			let key_arrays = self.evaluate_bound_program(key, &batch)?;
 
 			let mut builders: Vec<Vec<u32>> = (0..partition_count).map(|_| Vec::new()).collect();
 			for row in 0..num_rows {
@@ -1537,6 +1460,104 @@ impl Executor {
 				}
 			})
 			.collect()
+	}
+}
+
+fn evaluated_child(
+	outputs: &[Option<ArrayRef>],
+	id: BoundExprId,
+) -> Result<ArrayRef, ExecutionError> {
+	outputs
+		.get(id.0 as usize)
+		.and_then(|array| array.as_ref())
+		.cloned()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("bound expression child {:?} has not been evaluated", id),
+		})
+}
+
+fn literal_array(value: &ScalarValue, num_rows: usize) -> ArrayRef {
+	match value {
+		ScalarValue::Boolean(value) => Arc::new(BooleanArray::from(vec![*value; num_rows])),
+		ScalarValue::Int32(value) => Arc::new(Int32Array::from(vec![*value; num_rows])),
+		ScalarValue::Int64(value) => Arc::new(Int64Array::from(vec![*value; num_rows])),
+		ScalarValue::Float32(value) => Arc::new(Float32Array::from(vec![*value; num_rows])),
+		ScalarValue::Float64(value) => Arc::new(Float64Array::from(vec![*value; num_rows])),
+		ScalarValue::Utf8(value) => {
+			Arc::new(StringArray::from(vec![value.clone().as_deref(); num_rows]))
+		}
+	}
+}
+
+fn evaluate_bound_binary(
+	program: &BoundExprProgram,
+	op: &BoundBinaryOp,
+	left: BoundExprId,
+	left_arr: &ArrayRef,
+	right_arr: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	match op {
+		BoundBinaryOp::Add | BoundBinaryOp::Sub | BoundBinaryOp::Mul | BoundBinaryOp::Div => {
+			let arithmetic_op = match op {
+				BoundBinaryOp::Add => ArithmeticOp::Add,
+				BoundBinaryOp::Sub => ArithmeticOp::Sub,
+				BoundBinaryOp::Mul => ArithmeticOp::Mul,
+				BoundBinaryOp::Div => ArithmeticOp::Div,
+				_ => unreachable!("arithmetic op matched"),
+			};
+			let left_type =
+				program
+					.node_type(left)
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: format!("missing type for bound expression {:?}", left),
+					})?;
+			evaluate_arithmetic(arithmetic_op, left_arr, right_arr, left_type)
+		}
+		BoundBinaryOp::Eq => Ok(Arc::new(eq(left_arr, right_arr)?)),
+		BoundBinaryOp::Neq => Ok(Arc::new(neq(left_arr, right_arr)?)),
+		BoundBinaryOp::Lt => Ok(Arc::new(lt(left_arr, right_arr)?)),
+		BoundBinaryOp::Lte => Ok(Arc::new(lt_eq(left_arr, right_arr)?)),
+		BoundBinaryOp::Gt => Ok(Arc::new(gt(left_arr, right_arr)?)),
+		BoundBinaryOp::Gte => Ok(Arc::new(gt_eq(left_arr, right_arr)?)),
+		BoundBinaryOp::And => {
+			let left_bool = as_boolean(left_arr, "AND left operand")?;
+			let right_bool = as_boolean(right_arr, "AND right operand")?;
+			Ok(Arc::new(and(left_bool, right_bool)?))
+		}
+		BoundBinaryOp::Or => {
+			let left_bool = as_boolean(left_arr, "OR left operand")?;
+			let right_bool = as_boolean(right_arr, "OR right operand")?;
+			Ok(Arc::new(or(left_bool, right_bool)?))
+		}
+	}
+}
+
+fn evaluate_bound_unary(op: &BoundUnaryOp, arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	match op {
+		BoundUnaryOp::Not => {
+			let bool_arr = as_boolean(arr, "NOT operand")?;
+			Ok(Arc::new(not(bool_arr)?))
+		}
+		BoundUnaryOp::IsNull => Ok(Arc::new(is_null(arr)?)),
+		BoundUnaryOp::IsNotNull => Ok(Arc::new(is_not_null(arr)?)),
+	}
+}
+
+fn evaluate_time_bucket(
+	interval: std::time::Duration,
+	arr: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+		let interval_ms = interval.as_millis() as i64;
+		let bucketed: Vec<Option<i64>> = int_arr
+			.iter()
+			.map(|value| value.map(|value| (value / interval_ms) * interval_ms))
+			.collect();
+		Ok(Arc::new(Int64Array::from(bucketed)) as ArrayRef)
+	} else {
+		Err(ExecutionError::InvalidExpression {
+			message: "TimeBucket expects Int64 (ms) input".to_string(),
+		})
 	}
 }
 
@@ -3138,42 +3159,34 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 	}
 }
 
-fn init_bound_states(
-	aggr_expr: &[crate::ir::AggregateCall],
-) -> Result<Vec<AggState>, ExecutionError> {
+fn init_bound_states(aggr_expr: &[BoundAggregateCall]) -> Result<Vec<AggState>, ExecutionError> {
 	aggr_expr.iter().map(init_bound_state_for_call).collect()
 }
 
-fn init_bound_state_for_call(call: &crate::ir::AggregateCall) -> Result<AggState, ExecutionError> {
+fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, ExecutionError> {
 	match call.function {
 		AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
 		AggregateFunction::Sum => Ok(call
 			.args
-			.first()
-			.map(|arg| sum_state_for_data_type(&arg.data_type()))
+			.root_type(0)
+			.map(sum_state_for_data_type)
 			.unwrap_or(AggState::SumInt {
 				total: 0,
 				seen: false,
 			})),
 		AggregateFunction::Min => call
 			.args
-			.first()
-			.map(|arg| min_state_for_data_type(&arg.data_type()))
+			.root_type(0)
+			.map(min_state_for_data_type)
 			.transpose()
 			.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
 		AggregateFunction::Max => call
 			.args
-			.first()
-			.map(|arg| max_state_for_data_type(&arg.data_type()))
+			.root_type(0)
+			.map(max_state_for_data_type)
 			.transpose()
 			.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
-		AggregateFunction::Avg => call
-			.args
-			.first()
-			.ok_or_else(|| ExecutionError::InvalidExpression {
-				message: "AVG requires one argument".to_string(),
-			})
-			.and_then(|arg| avg_state_for_data_type(&arg.data_type())),
+		AggregateFunction::Avg => avg_state_for_data_type(first_arg_type(call)?),
 		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
 			Ok(AggState::SumInt {
 				total: 0,
@@ -3181,6 +3194,14 @@ fn init_bound_state_for_call(call: &crate::ir::AggregateCall) -> Result<AggState
 			})
 		}
 	}
+}
+
+fn first_arg_type(call: &BoundAggregateCall) -> Result<&DataType, ExecutionError> {
+	call.args
+		.root_type(0)
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("{:?} requires one argument", call.function),
+		})
 }
 
 fn group_value(array: &ArrayRef, row: usize) -> Result<GroupValue, ExecutionError> {

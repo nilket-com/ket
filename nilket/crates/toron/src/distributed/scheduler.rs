@@ -20,7 +20,7 @@ use crate::error::TaskFailureKind;
 use crate::exec::runtime_filter::{
 	build_runtime_filter_fragment, descriptor_from_fragment, merge_fragments,
 };
-use crate::ir::{ExecutionExpr, ExecutionPlan};
+use crate::ir::ExecutionPlan;
 use wendelon::schema::PhysicalDescriptorFingerprint;
 
 #[derive(Debug, Clone)]
@@ -669,9 +669,7 @@ where
 		let TaskOutputBinding::ShuffleProducer { partition_key, .. } = &spec.output else {
 			return None;
 		};
-		let [ExecutionExpr::Column(column)] = partition_key.as_slice() else {
-			return None;
-		};
+		let column = partition_key.single_column_root()?;
 		let probe_descriptor_fingerprint = first_scan_fingerprint(&spec.plan)?;
 		Some(descriptor_from_fragment(
 			fragment,
@@ -804,7 +802,10 @@ mod tests {
 		ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
 		WorkerEndpoint, WorkerLease, WorkerResourceState, WorkerStatus,
 	};
-	use crate::ir::{ColumnName, ColumnOrdinal, ExecutionPlan, ResolvedColumn};
+	use crate::ir::{
+		BoundExprProgram, BoundExprProgramBuilder, ColumnName, ColumnOrdinal, ExecutionPlan,
+		ResolvedColumn,
+	};
 	use arrow::array::{ArrayRef, Int64Array};
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::collections::VecDeque;
@@ -922,14 +923,17 @@ mod tests {
 		})
 	}
 
-	fn int64_partition_key() -> Vec<ExecutionExpr> {
-		vec![ExecutionExpr::Column(ResolvedColumn {
+	fn int64_partition_key() -> BoundExprProgram {
+		let mut builder = BoundExprProgramBuilder::new();
+		let id = builder.append_column(ResolvedColumn {
 			name: ColumnName("id".to_string()),
 			ordinal: ColumnOrdinal(0),
 			data_type: DataType::Int64,
 			nullable: false,
 			pbc_eligible: true,
-		})]
+		});
+		builder.push_root(id);
+		builder.build()
 	}
 
 	fn runtime_filter_fragment(payload: Vec<u8>, hash_count: u8) -> RuntimeFilterFragment {
@@ -1137,7 +1141,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -1453,7 +1457,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let query_id = producer.spec.identity.query_id;
 		let key = TaskKey::from_identity(producer.spec.identity);
@@ -1506,7 +1510,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -1574,7 +1578,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: ExchangeId::new(9),
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -1765,7 +1769,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
@@ -1837,7 +1841,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let producer_key = TaskKey::from_identity(producer.spec.identity);
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
@@ -1906,7 +1910,7 @@ mod tests {
 		producer.spec.output = TaskOutputBinding::ShuffleProducer {
 			exchange_id: manifest_exchange_id,
 			partition_count: crate::distributed::task::PartitionCount::new(1),
-			partition_key: Vec::new(),
+			partition_key: BoundExprProgram::empty(),
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {

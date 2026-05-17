@@ -11,10 +11,11 @@ use crate::aggregate_kernel::{
 use crate::catalog::{Catalog, TableBinding, TableRef};
 use crate::error::BindingError;
 use crate::ir::{
-	AggregateCall, AggregateFunction, ColumnName, ColumnOrdinal, ExecutionExpr, ExecutionPlan,
-	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinStrategy, LogicalPlan,
-	PbcProgram, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr, arithmetic_output_type,
-	schema_for_exprs,
+	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
+	BoundExprProgram, BoundExprProgramBuilder, BoundUnaryOp, ColumnName, ColumnOrdinal,
+	ExecutionPlan, ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind,
+	JoinStrategy, LogicalPlan, PbcProgram, QueryProfileHint, ResolvedColumn, ScalarValue, SortExpr,
+	arithmetic_output_type, schema_for_exprs,
 };
 use crate::pbc::PbcCompiler;
 
@@ -83,19 +84,19 @@ impl<'a> Binder<'a> {
 				LogicalPlan::Alias { input, .. } => self.bind_plan(input).await,
 				LogicalPlan::Filter { input, predicate } => {
 					let mut input = self.bind_plan(input).await?;
-					let bound_predicate = bind_expr(predicate, &input.schema(), self.config)?;
+					let bound_predicate = bind_expr_program(
+						std::slice::from_ref(predicate),
+						&input.schema(),
+						self.config,
+					)?;
 					let profile_hint = scan_profile_hint(&bound_predicate, &input);
 					apply_scan_profile_hint(&mut input, profile_hint);
-					let (input, disposition) = if bound_predicate.pbc_eligible() {
-						match compile_pbc(&bound_predicate) {
-							Some(program) => match attach_pbc_program(input, program) {
-								Ok(input) => (input, FilterDisposition::FullyPushed),
-								Err(input) => (input, FilterDisposition::EvaluateInToron),
-							},
-							None => (input, FilterDisposition::EvaluateInToron),
-						}
-					} else {
-						(input, FilterDisposition::EvaluateInToron)
+					let (input, disposition) = match compile_pbc(&bound_predicate) {
+						Some(program) => match attach_pbc_program(input, program) {
+							Ok(input) => (input, FilterDisposition::FullyPushed),
+							Err(input) => (input, FilterDisposition::EvaluateInToron),
+						},
+						None => (input, FilterDisposition::EvaluateInToron),
 					};
 
 					Ok(ExecutionPlan::Filter {
@@ -116,10 +117,7 @@ impl<'a> Binder<'a> {
 						});
 					}
 					let input = self.bind_plan(input).await?;
-					let exprs = exprs
-						.iter()
-						.map(|expr| bind_expr(expr, &input.schema(), self.config))
-						.collect::<Result<Vec<_>, _>>()?;
+					let exprs = bind_expr_program(exprs, &input.schema(), self.config)?;
 					let output_schema = schema_for_exprs_with_output_names(&exprs, output_names);
 
 					Ok(ExecutionPlan::Project {
@@ -135,10 +133,7 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let group_expr = group_expr
-						.iter()
-						.map(|expr| bind_expr(expr, &input_schema, self.config))
-						.collect::<Result<Vec<_>, _>>()?;
+					let group_expr = bind_expr_program(group_expr, &input_schema, self.config)?;
 					let aggr_expr = aggr_expr
 						.iter()
 						.map(|(function, args)| {
@@ -161,10 +156,7 @@ impl<'a> Binder<'a> {
 				} => {
 					let input = self.bind_plan(input).await?;
 					let input_schema = input.schema();
-					let key = key
-						.iter()
-						.map(|expr| bind_expr(expr, &input_schema, self.config))
-						.collect::<Result<Vec<_>, _>>()?;
+					let key = bind_expr_program(key, &input_schema, self.config)?;
 
 					Ok(ExecutionPlan::Exchange {
 						input: Box::new(input),
@@ -442,7 +434,7 @@ fn bind_sort_ordinal_literal(
 	))
 }
 
-fn compile_pbc(predicate: &ExecutionExpr) -> Option<PbcProgram> {
+fn compile_pbc(predicate: &BoundExprProgram) -> Option<PbcProgram> {
 	PbcCompiler::new()
 		.compile(Some(predicate), None)
 		.ok()
@@ -481,7 +473,10 @@ fn sorted_columns(columns: &HashSet<ColumnOrdinal>) -> Vec<ColumnOrdinal> {
 	columns
 }
 
-fn scan_profile_hint(predicate: &ExecutionExpr, input: &ExecutionPlan) -> Option<QueryProfileHint> {
+fn scan_profile_hint(
+	predicate: &BoundExprProgram,
+	input: &ExecutionPlan,
+) -> Option<QueryProfileHint> {
 	match input {
 		ExecutionPlan::Scan {
 			primary_key_columns,
@@ -506,33 +501,61 @@ fn apply_scan_profile_hint(plan: &mut ExecutionPlan, profile_hint: Option<QueryP
 }
 
 fn predicate_includes_primary_key_equality(
-	predicate: &ExecutionExpr,
+	predicate: &BoundExprProgram,
 	primary_key_columns: &[ColumnOrdinal],
 ) -> bool {
-	match predicate {
-		ExecutionExpr::Eq(left, right) => {
-			primary_key_literal_equality(left, right, primary_key_columns)
-				|| primary_key_literal_equality(right, left, primary_key_columns)
+	let Some(root) = predicate.single_root() else {
+		return false;
+	};
+	predicate_node_includes_primary_key_equality(predicate, root, primary_key_columns)
+}
+
+fn predicate_node_includes_primary_key_equality(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	primary_key_columns: &[ColumnOrdinal],
+) -> bool {
+	match program.node(id) {
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::Eq,
+			left,
+			right,
+		}) => {
+			primary_key_literal_equality(program, *left, *right, primary_key_columns)
+				|| primary_key_literal_equality(program, *right, *left, primary_key_columns)
 		}
-		ExecutionExpr::And(left, right) => {
-			predicate_includes_primary_key_equality(left, primary_key_columns)
-				|| predicate_includes_primary_key_equality(right, primary_key_columns)
+		Some(BoundExprNode::Binary {
+			op: BoundBinaryOp::And,
+			left,
+			right,
+		}) => {
+			predicate_node_includes_primary_key_equality(program, *left, primary_key_columns)
+				|| predicate_node_includes_primary_key_equality(
+					program,
+					*right,
+					primary_key_columns,
+				)
 		}
 		_ => false,
 	}
 }
 
 fn primary_key_literal_equality(
-	column_side: &ExecutionExpr,
-	literal_side: &ExecutionExpr,
+	program: &BoundExprProgram,
+	column_side: BoundExprId,
+	literal_side: BoundExprId,
 	primary_key_columns: &[ColumnOrdinal],
 ) -> bool {
-	match (column_side, literal_side) {
-		(ExecutionExpr::Column(column), ExecutionExpr::Literal(value)) => {
-			primary_key_columns.contains(&column.ordinal) && literal_is_non_null(value)
-		}
-		_ => false,
-	}
+	let Some(BoundExprNode::Column(column)) = program.node(column_side) else {
+		return false;
+	};
+	let Some(BoundExprNode::Literal(literal)) = program.node(literal_side) else {
+		return false;
+	};
+	let Some(value) = program.literals.get(*literal as usize) else {
+		return false;
+	};
+	primary_key_columns.contains(&column.ordinal) && literal_is_non_null(value)
 }
 
 fn literal_is_non_null(value: &ScalarValue) -> bool {
@@ -749,13 +772,13 @@ fn validate_strategy_shape(
 	Ok(())
 }
 
-fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
+fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExprProgram)> {
 	match plan {
 		ExecutionPlan::Exchange {
 			partition_count,
 			key,
 			..
-		} => Some((*partition_count, key.as_slice())),
+		} => Some((*partition_count, key)),
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
@@ -767,12 +790,11 @@ fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &[ExecutionExpr])> {
 	}
 }
 
-fn exchange_key_ordinals(key: &[ExecutionExpr]) -> Vec<ColumnOrdinal> {
-	key.iter()
-		.filter_map(|expr| match expr {
-			ExecutionExpr::Column(column) => Some(column.ordinal),
-			_ => None,
-		})
+fn exchange_key_ordinals(key: &BoundExprProgram) -> Vec<ColumnOrdinal> {
+	key.root_columns()
+		.unwrap_or_default()
+		.into_iter()
+		.map(|column| column.ordinal)
 		.collect()
 }
 
@@ -880,9 +902,9 @@ fn optimize_for_required(
 		} => {
 			let output_required = required_output.unwrap_or_else(|| all_columns(&input.schema()));
 			let mut child_required = output_required.clone();
-			collect_expr_columns(&predicate, &mut child_required);
+			collect_program_columns(&predicate, &mut child_required);
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
-			let predicate = rewrite_expr_ordinals(predicate, &remap)?;
+			let predicate = rewrite_program_ordinals(predicate, &remap)?;
 
 			Ok((
 				ExecutionPlan::Filter {
@@ -898,21 +920,19 @@ fn optimize_for_required(
 			exprs,
 			output_schema,
 		} => {
-			let requested_outputs = required_output.unwrap_or_else(|| output_columns(exprs.len()));
+			let requested_outputs =
+				required_output.unwrap_or_else(|| output_columns(exprs.root_count()));
 			let mut child_required = BTreeSet::new();
 			for ordinal in &requested_outputs {
-				let expr = exprs.get(ordinal.0 as usize).ok_or_else(|| {
+				let root = exprs.roots.get(ordinal.0 as usize).ok_or_else(|| {
 					BindingError::UnsupportedExpression {
 						message: format!("project output ordinal {:?} out of bounds", ordinal),
 					}
 				})?;
-				collect_expr_columns(expr, &mut child_required);
+				collect_program_node_columns(&exprs, *root, &mut child_required);
 			}
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
-			let exprs = exprs
-				.into_iter()
-				.map(|expr| rewrite_expr_ordinals(expr, &remap))
-				.collect::<Result<Vec<_>, _>>()?;
+			let exprs = rewrite_program_ordinals(exprs, &remap)?;
 			let output_schema = schema_for_exprs_with_existing_names(&exprs, &output_schema);
 			let output_remap =
 				ordinal_remap(&requested_outputs.iter().copied().collect::<Vec<_>>());
@@ -933,30 +953,19 @@ fn optimize_for_required(
 			output_schema: _,
 		} => {
 			let mut child_required = BTreeSet::new();
-			for expr in &group_expr {
-				collect_expr_columns(expr, &mut child_required);
-			}
+			collect_program_columns(&group_expr, &mut child_required);
 			for call in &aggr_expr {
-				for expr in &call.args {
-					collect_expr_columns(expr, &mut child_required);
-				}
+				collect_program_columns(&call.args, &mut child_required);
 			}
 
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
-			let group_expr = group_expr
-				.into_iter()
-				.map(|expr| rewrite_expr_ordinals(expr, &remap))
-				.collect::<Result<Vec<_>, _>>()?;
+			let group_expr = rewrite_program_ordinals(group_expr, &remap)?;
 			let aggr_expr = aggr_expr
 				.into_iter()
 				.map(|call| {
-					Ok(AggregateCall {
+					Ok(BoundAggregateCall {
 						function: call.function,
-						args: call
-							.args
-							.into_iter()
-							.map(|expr| rewrite_expr_ordinals(expr, &remap))
-							.collect::<Result<Vec<_>, _>>()?,
+						args: rewrite_program_ordinals(call.args, &remap)?,
 					})
 				})
 				.collect::<Result<Vec<_>, BindingError>>()?;
@@ -986,14 +995,9 @@ fn optimize_for_required(
 		} => {
 			let output_required = required_output.unwrap_or_else(|| all_columns(&input.schema()));
 			let mut child_required = output_required.clone();
-			for expr in &key {
-				collect_expr_columns(expr, &mut child_required);
-			}
+			collect_program_columns(&key, &mut child_required);
 			let (input, remap) = optimize_for_required(*input, Some(child_required))?;
-			let key = key
-				.into_iter()
-				.map(|expr| rewrite_expr_ordinals(expr, &remap))
-				.collect::<Result<Vec<_>, _>>()?;
+			let key = rewrite_program_ordinals(key, &remap)?;
 			Ok((
 				ExecutionPlan::Exchange {
 					input: Box::new(input),
@@ -1134,122 +1138,50 @@ fn project_schema(
 	Ok(Arc::new(Schema::new(fields)))
 }
 
-fn collect_expr_columns(expr: &ExecutionExpr, columns: &mut BTreeSet<ColumnOrdinal>) {
-	match expr {
-		ExecutionExpr::Column(column) => {
-			columns.insert(column.ordinal);
-		}
-		ExecutionExpr::Literal(_) => {}
-		ExecutionExpr::Cast(inner, _) | ExecutionExpr::TryCast(inner, _) => {
-			collect_expr_columns(inner, columns)
-		}
-		ExecutionExpr::Add(left, right)
-		| ExecutionExpr::Sub(left, right)
-		| ExecutionExpr::Mul(left, right)
-		| ExecutionExpr::Div(left, right)
-		| ExecutionExpr::Eq(left, right)
-		| ExecutionExpr::Neq(left, right)
-		| ExecutionExpr::Lt(left, right)
-		| ExecutionExpr::Lte(left, right)
-		| ExecutionExpr::Gt(left, right)
-		| ExecutionExpr::Gte(left, right)
-		| ExecutionExpr::And(left, right)
-		| ExecutionExpr::Or(left, right) => {
-			collect_expr_columns(left, columns);
-			collect_expr_columns(right, columns);
-		}
-		ExecutionExpr::Not(inner)
-		| ExecutionExpr::IsNull(inner)
-		| ExecutionExpr::IsNotNull(inner)
-		| ExecutionExpr::TimeBucket(_, inner) => collect_expr_columns(inner, columns),
+fn collect_program_columns(program: &BoundExprProgram, columns: &mut BTreeSet<ColumnOrdinal>) {
+	for root in &program.roots {
+		collect_program_node_columns(program, *root, columns);
 	}
 }
 
-fn rewrite_expr_ordinals(
-	expr: ExecutionExpr,
+fn collect_program_node_columns(
+	program: &BoundExprProgram,
+	id: BoundExprId,
+	columns: &mut BTreeSet<ColumnOrdinal>,
+) {
+	match program.node(id) {
+		Some(BoundExprNode::Column(column)) => {
+			columns.insert(column.ordinal);
+		}
+		Some(BoundExprNode::Literal(_)) | None => {}
+		Some(BoundExprNode::Cast { input, .. })
+		| Some(BoundExprNode::TryCast { input, .. })
+		| Some(BoundExprNode::Unary { input, .. })
+		| Some(BoundExprNode::TimeBucket { input, .. }) => {
+			collect_program_node_columns(program, *input, columns);
+		}
+		Some(BoundExprNode::Binary { left, right, .. }) => {
+			collect_program_node_columns(program, *left, columns);
+			collect_program_node_columns(program, *right, columns);
+		}
+	}
+}
+
+fn rewrite_program_ordinals(
+	mut program: BoundExprProgram,
 	remap: &OrdinalRemap,
-) -> Result<ExecutionExpr, BindingError> {
-	match expr {
-		ExecutionExpr::Column(mut column) => {
+) -> Result<BoundExprProgram, BindingError> {
+	for node in &mut program.nodes {
+		if let BoundExprNode::Column(column) = node {
 			column.ordinal =
 				*remap
 					.get(&column.ordinal)
 					.ok_or_else(|| BindingError::UnsupportedExpression {
 						message: format!("missing ordinal remap for {:?}", column.ordinal),
 					})?;
-			Ok(ExecutionExpr::Column(column))
 		}
-		ExecutionExpr::Literal(value) => Ok(ExecutionExpr::Literal(value)),
-		ExecutionExpr::Cast(inner, target) => Ok(ExecutionExpr::Cast(
-			Box::new(rewrite_expr_ordinals(*inner, remap)?),
-			target,
-		)),
-		ExecutionExpr::TryCast(inner, target) => Ok(ExecutionExpr::TryCast(
-			Box::new(rewrite_expr_ordinals(*inner, remap)?),
-			target,
-		)),
-		ExecutionExpr::Add(left, right) => Ok(ExecutionExpr::Add(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Sub(left, right) => Ok(ExecutionExpr::Sub(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Mul(left, right) => Ok(ExecutionExpr::Mul(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Div(left, right) => Ok(ExecutionExpr::Div(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Eq(left, right) => Ok(ExecutionExpr::Eq(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Neq(left, right) => Ok(ExecutionExpr::Neq(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Lt(left, right) => Ok(ExecutionExpr::Lt(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Lte(left, right) => Ok(ExecutionExpr::Lte(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Gt(left, right) => Ok(ExecutionExpr::Gt(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Gte(left, right) => Ok(ExecutionExpr::Gte(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::And(left, right) => Ok(ExecutionExpr::And(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Or(left, right) => Ok(ExecutionExpr::Or(
-			Box::new(rewrite_expr_ordinals(*left, remap)?),
-			Box::new(rewrite_expr_ordinals(*right, remap)?),
-		)),
-		ExecutionExpr::Not(inner) => Ok(ExecutionExpr::Not(Box::new(rewrite_expr_ordinals(
-			*inner, remap,
-		)?))),
-		ExecutionExpr::IsNull(inner) => Ok(ExecutionExpr::IsNull(Box::new(rewrite_expr_ordinals(
-			*inner, remap,
-		)?))),
-		ExecutionExpr::IsNotNull(inner) => Ok(ExecutionExpr::IsNotNull(Box::new(
-			rewrite_expr_ordinals(*inner, remap)?,
-		))),
-		ExecutionExpr::TimeBucket(interval, inner) => Ok(ExecutionExpr::TimeBucket(
-			interval,
-			Box::new(rewrite_expr_ordinals(*inner, remap)?),
-		)),
 	}
+	Ok(program)
 }
 
 fn bind_aggregate_call(
@@ -1257,11 +1189,11 @@ fn bind_aggregate_call(
 	args: &[Expr],
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
-) -> Result<AggregateCall, BindingError> {
+) -> Result<BoundAggregateCall, BindingError> {
 	if matches!(function, AggregateFunction::CountAll) {
-		return Ok(AggregateCall {
+		return Ok(BoundAggregateCall {
 			function: function.clone(),
-			args: Vec::new(),
+			args: BoundExprProgramBuilder::new().build(),
 		});
 	}
 	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
@@ -1276,11 +1208,11 @@ fn bind_aggregate_call(
 			}
 			let args = args
 				.iter()
-				.map(|expr| bind_expr(expr, input_schema, config))
+				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, config))
 				.collect::<Result<Vec<_>, _>>()?;
-			Ok(AggregateCall {
+			Ok(BoundAggregateCall {
 				function: function.clone(),
-				args,
+				args: merge_aggregate_args(args),
 			})
 		}
 		AggregateFunction::ApproxQuantile(_) => {
@@ -1291,11 +1223,11 @@ fn bind_aggregate_call(
 			}
 			let args = args
 				.iter()
-				.map(|expr| bind_expr(expr, input_schema, config))
+				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, config))
 				.collect::<Result<Vec<_>, _>>()?;
-			Ok(AggregateCall {
+			Ok(BoundAggregateCall {
 				function: function.clone(),
-				args,
+				args: merge_aggregate_args(args),
 			})
 		}
 		AggregateFunction::CountAll
@@ -1313,33 +1245,94 @@ fn bind_stable_aggregate_call(
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	spec: &AggregateKernelSpec,
-) -> Result<AggregateCall, BindingError> {
+) -> Result<BoundAggregateCall, BindingError> {
 	if args.len() != aggregate_arity_len(spec.arity) {
 		return Err(BindingError::UnsupportedExpression {
 			message: format!("{} requires one argument", spec.sql_name),
 		});
 	}
-	let args = args
-		.iter()
-		.map(|expr| bind_expr(expr, input_schema, config))
-		.collect::<Result<Vec<_>, _>>()?;
+	let args = bind_expr_program(args, input_schema, config)?;
 	if !matches!(spec.input_domain, AggregateInputDomain::Any) {
-		let Some(arg) = args.first() else {
+		let Some(data_type) = args.root_type(0) else {
 			return Err(BindingError::UnsupportedExpression {
 				message: format!("{} requires one argument", spec.sql_name),
 			});
 		};
-		let data_type = arg.data_type();
-		if aggregate_kernel::stable_output_data_type(function, Some(&data_type)).is_none() {
+		if aggregate_kernel::stable_output_data_type(function, Some(data_type)).is_none() {
 			return Err(BindingError::TypeMismatch {
-				message: aggregate_type_mismatch_message(spec.kind, &data_type),
+				message: aggregate_type_mismatch_message(spec.kind, data_type),
 			});
 		}
 	}
-	Ok(AggregateCall {
+	Ok(BoundAggregateCall {
 		function: function.clone(),
 		args,
 	})
+}
+
+fn merge_aggregate_args(programs: Vec<BoundExprProgram>) -> BoundExprProgram {
+	if programs.is_empty() {
+		return BoundExprProgramBuilder::new().build();
+	}
+	if programs.len() == 1 {
+		return programs.into_iter().next().expect("one program");
+	}
+	let mut merged = BoundExprProgram {
+		nodes: Vec::new(),
+		node_types: Vec::new(),
+		literals: Vec::new(),
+		roots: Vec::new(),
+	};
+	for program in programs {
+		let node_offset =
+			u32::try_from(merged.nodes.len()).expect("bound expression node offset overflow");
+		let literal_offset =
+			u32::try_from(merged.literals.len()).expect("bound expression literal offset overflow");
+		merged.literals.extend(program.literals);
+		merged.node_types.extend(program.node_types);
+		merged.nodes.extend(
+			program
+				.nodes
+				.into_iter()
+				.map(|node| offset_bound_node(node, node_offset, literal_offset)),
+		);
+		merged.roots.extend(
+			program
+				.roots
+				.into_iter()
+				.map(|root| BoundExprId(root.0 + node_offset)),
+		);
+	}
+	merged
+}
+
+fn offset_bound_node(node: BoundExprNode, node_offset: u32, literal_offset: u32) -> BoundExprNode {
+	let offset_id = |id: BoundExprId| BoundExprId(id.0 + node_offset);
+	match node {
+		BoundExprNode::Column(column) => BoundExprNode::Column(column),
+		BoundExprNode::Literal(literal) => BoundExprNode::Literal(literal + literal_offset),
+		BoundExprNode::Cast { input, target } => BoundExprNode::Cast {
+			input: offset_id(input),
+			target,
+		},
+		BoundExprNode::TryCast { input, target } => BoundExprNode::TryCast {
+			input: offset_id(input),
+			target,
+		},
+		BoundExprNode::Binary { op, left, right } => BoundExprNode::Binary {
+			op,
+			left: offset_id(left),
+			right: offset_id(right),
+		},
+		BoundExprNode::Unary { op, input } => BoundExprNode::Unary {
+			op,
+			input: offset_id(input),
+		},
+		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
+			interval,
+			input: offset_id(input),
+		},
+	}
 }
 
 fn aggregate_arity_len(arity: AggregateArity) -> usize {
@@ -1369,96 +1362,178 @@ fn aggregate_type_mismatch_message(kernel: StableAggregateKernel, data_type: &Da
 	}
 }
 
-fn bind_expr(
+fn bind_expr_program(
+	exprs: &[Expr],
+	input_schema: &SchemaRef,
+	config: &PlannerConfig,
+) -> Result<BoundExprProgram, BindingError> {
+	let mut builder = BoundExprProgramBuilder::new();
+	for expr in exprs {
+		let root = bind_expr_into_program(&mut builder, expr, input_schema, config)?;
+		builder.push_root(root);
+	}
+	Ok(builder.build())
+}
+
+fn bind_expr_into_program(
+	builder: &mut BoundExprProgramBuilder,
 	expr: &Expr,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
-) -> Result<ExecutionExpr, BindingError> {
+) -> Result<BoundExprId, BindingError> {
 	match expr {
-		Expr::Column(column_ref) => Ok(ExecutionExpr::Column(resolve_column(
-			&column_ref.name.0,
+		Expr::Column(column_ref) => {
+			Ok(builder.append_column(resolve_column(&column_ref.name.0, input_schema)?))
+		}
+		Expr::Literal(value) => Ok(builder.append_literal(value.clone())),
+		Expr::Cast(inner, target) => {
+			bind_explicit_cast(builder, input_schema, config, inner, target)
+		}
+		Expr::TryCast(inner, target) => bind_try_cast(builder, input_schema, config, inner, target),
+		Expr::Add(left, right) => bind_arithmetic(
+			builder,
 			input_schema,
-		)?)),
-		Expr::Literal(value) => Ok(ExecutionExpr::Literal(value.clone())),
-		Expr::Cast(inner, target) => bind_explicit_cast(input_schema, config, inner, target),
-		Expr::TryCast(inner, target) => bind_try_cast(input_schema, config, inner, target),
-		Expr::Add(left, right) => {
-			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Add)
-		}
-		Expr::Sub(left, right) => {
-			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Sub)
-		}
-		Expr::Mul(left, right) => {
-			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Mul)
-		}
-		Expr::Div(left, right) => {
-			bind_arithmetic(input_schema, config, left, right, ExecutionExpr::Div)
-		}
-		Expr::Eq(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Eq)
-		}
-		Expr::Neq(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Neq)
-		}
-		Expr::Lt(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Lt)
-		}
-		Expr::Lte(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Lte)
-		}
-		Expr::Gt(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Gt)
-		}
-		Expr::Gte(left, right) => {
-			bind_comparison(input_schema, config, left, right, ExecutionExpr::Gte)
-		}
-		Expr::And(left, right) => {
-			bind_boolean(input_schema, config, left, right, ExecutionExpr::And)
-		}
-		Expr::Or(left, right) => bind_boolean(input_schema, config, left, right, ExecutionExpr::Or),
+			config,
+			left,
+			right,
+			BoundBinaryOp::Add,
+		),
+		Expr::Sub(left, right) => bind_arithmetic(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Sub,
+		),
+		Expr::Mul(left, right) => bind_arithmetic(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Mul,
+		),
+		Expr::Div(left, right) => bind_arithmetic(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Div,
+		),
+		Expr::Eq(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Eq,
+		),
+		Expr::Neq(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Neq,
+		),
+		Expr::Lt(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Lt,
+		),
+		Expr::Lte(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Lte,
+		),
+		Expr::Gt(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Gt,
+		),
+		Expr::Gte(left, right) => bind_comparison(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Gte,
+		),
+		Expr::And(left, right) => bind_boolean(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::And,
+		),
+		Expr::Or(left, right) => bind_boolean(
+			builder,
+			input_schema,
+			config,
+			left,
+			right,
+			BoundBinaryOp::Or,
+		),
 		Expr::Not(inner) => {
-			let inner = bind_expr(inner, input_schema, config)?;
-			require_boolean("NOT", &inner)?;
-			Ok(ExecutionExpr::Not(Box::new(inner)))
+			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			require_boolean(builder, "NOT", inner)?;
+			Ok(builder.append_unary(BoundUnaryOp::Not, inner, DataType::Boolean))
 		}
-		Expr::IsNull(inner) => Ok(ExecutionExpr::IsNull(Box::new(bind_expr(
-			inner,
-			input_schema,
-			config,
-		)?))),
-		Expr::IsNotNull(inner) => Ok(ExecutionExpr::IsNotNull(Box::new(bind_expr(
-			inner,
-			input_schema,
-			config,
-		)?))),
+		Expr::IsNull(inner) => {
+			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			Ok(builder.append_unary(BoundUnaryOp::IsNull, inner, DataType::Boolean))
+		}
+		Expr::IsNotNull(inner) => {
+			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
+		}
 		Expr::TimeBucket(interval, inner) => {
 			if !config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {
 					kernel: "TimeBucket",
 				});
 			}
-			let inner = bind_expr(inner, input_schema, config)?;
-			if inner.data_type() != DataType::Int64 {
+			let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+			if builder.node_type(inner) != Some(&DataType::Int64) {
 				return Err(BindingError::TypeMismatch {
 					message: "TimeBucket expects Int64 (ms) input".to_string(),
 				});
 			}
-			Ok(ExecutionExpr::TimeBucket(*interval, Box::new(inner)))
+			Ok(builder.append_time_bucket(*interval, inner, DataType::Int64))
 		}
 	}
 }
 
 fn bind_arithmetic(
+	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	left: &Expr,
 	right: &Expr,
-	constructor: fn(Box<ExecutionExpr>, Box<ExecutionExpr>) -> ExecutionExpr,
-) -> Result<ExecutionExpr, BindingError> {
-	let left = bind_expr(left, input_schema, config)?;
-	let right = bind_expr(right, input_schema, config)?;
-	let left_type = left.data_type();
-	let right_type = right.data_type();
+	op: BoundBinaryOp,
+) -> Result<BoundExprId, BindingError> {
+	let left = bind_expr_into_program(builder, left, input_schema, config)?;
+	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	let left_type = builder
+		.node_type(left)
+		.cloned()
+		.expect("builder returns typed left node");
+	let right_type = builder
+		.node_type(right)
+		.cloned()
+		.expect("builder returns typed right node");
 	let output_type =
 		arithmetic_output_type(&left_type, &right_type).ok_or_else(|| {
 			BindingError::TypeMismatch {
@@ -1467,19 +1542,23 @@ fn bind_arithmetic(
 				),
 			}
 		})?;
-	let left = cast_if_needed(left, &output_type)?;
-	let right = cast_if_needed(right, &output_type)?;
-	Ok(constructor(Box::new(left), Box::new(right)))
+	let left = cast_if_needed(builder, left, &output_type)?;
+	let right = cast_if_needed(builder, right, &output_type)?;
+	Ok(builder.append_binary(op, left, right, output_type))
 }
 
 fn bind_explicit_cast(
+	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	inner: &Expr,
 	target: &DataType,
-) -> Result<ExecutionExpr, BindingError> {
-	let inner = bind_expr(inner, input_schema, config)?;
-	let source = inner.data_type();
+) -> Result<BoundExprId, BindingError> {
+	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let source = builder
+		.node_type(inner)
+		.cloned()
+		.expect("builder returns typed cast input");
 	if !is_supported_explicit_numeric_cast(&source, target) {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
@@ -1487,17 +1566,21 @@ fn bind_explicit_cast(
 			),
 		});
 	}
-	Ok(ExecutionExpr::Cast(Box::new(inner), target.clone()))
+	Ok(builder.append_cast(inner, target.clone(), target.clone()))
 }
 
 fn bind_try_cast(
+	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	inner: &Expr,
 	target: &DataType,
-) -> Result<ExecutionExpr, BindingError> {
-	let inner = bind_expr(inner, input_schema, config)?;
-	let source = inner.data_type();
+) -> Result<BoundExprId, BindingError> {
+	let inner = bind_expr_into_program(builder, inner, input_schema, config)?;
+	let source = builder
+		.node_type(inner)
+		.cloned()
+		.expect("builder returns typed try-cast input");
 	if !is_supported_explicit_numeric_cast(&source, target) {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
@@ -1505,11 +1588,18 @@ fn bind_try_cast(
 			),
 		});
 	}
-	Ok(ExecutionExpr::TryCast(Box::new(inner), target.clone()))
+	Ok(builder.append_try_cast(inner, target.clone(), target.clone()))
 }
 
-fn cast_if_needed(expr: ExecutionExpr, target: &DataType) -> Result<ExecutionExpr, BindingError> {
-	let source = expr.data_type();
+fn cast_if_needed(
+	builder: &mut BoundExprProgramBuilder,
+	expr: BoundExprId,
+	target: &DataType,
+) -> Result<BoundExprId, BindingError> {
+	let source = builder
+		.node_type(expr)
+		.cloned()
+		.expect("builder returns typed cast input");
 	if source == *target {
 		return Ok(expr);
 	}
@@ -1520,7 +1610,7 @@ fn cast_if_needed(expr: ExecutionExpr, target: &DataType) -> Result<ExecutionExp
 			),
 		});
 	}
-	Ok(ExecutionExpr::Cast(Box::new(expr), target.clone()))
+	Ok(builder.append_cast(expr, target.clone(), target.clone()))
 }
 
 fn is_widening_cast(source: &DataType, target: &DataType) -> bool {
@@ -1639,48 +1729,55 @@ fn insert_overflow(column: &str, literal: &InsertLiteral, target: &DataType) -> 
 }
 
 fn bind_comparison(
+	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	left: &Expr,
 	right: &Expr,
-	constructor: fn(Box<ExecutionExpr>, Box<ExecutionExpr>) -> ExecutionExpr,
-) -> Result<ExecutionExpr, BindingError> {
-	let left = bind_expr(left, input_schema, config)?;
-	let right = bind_expr(right, input_schema, config)?;
-	let (left, right) = coerce_comparison_literals(left, right);
-	if left.data_type() != right.data_type() {
+	op: BoundBinaryOp,
+) -> Result<BoundExprId, BindingError> {
+	let left = bind_expr_into_program(builder, left, input_schema, config)?;
+	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	coerce_comparison_literals(builder, left, right);
+	let left_type = builder
+		.node_type(left)
+		.cloned()
+		.expect("builder returns typed comparison left");
+	let right_type = builder
+		.node_type(right)
+		.cloned()
+		.expect("builder returns typed comparison right");
+	if left_type != right_type {
 		return Err(BindingError::TypeMismatch {
 			message: format!(
 				"comparison operands have different types: {:?} and {:?}",
-				left.data_type(),
-				right.data_type()
+				left_type, right_type
 			),
 		});
 	}
-	Ok(constructor(Box::new(left), Box::new(right)))
+	Ok(builder.append_binary(op, left, right, DataType::Boolean))
 }
 
 fn coerce_comparison_literals(
-	left: ExecutionExpr,
-	right: ExecutionExpr,
-) -> (ExecutionExpr, ExecutionExpr) {
-	match (left, right) {
-		(left @ ExecutionExpr::Literal(_), right @ ExecutionExpr::Literal(_)) => (left, right),
-		(ExecutionExpr::Literal(value), right) => {
-			let data_type = right.data_type();
-			(
-				ExecutionExpr::Literal(coerce_literal_value(value, &data_type)),
-				right,
-			)
-		}
-		(left, ExecutionExpr::Literal(value)) => {
-			let data_type = left.data_type();
-			(
-				left,
-				ExecutionExpr::Literal(coerce_literal_value(value, &data_type)),
-			)
-		}
-		(left, right) => (left, right),
+	builder: &mut BoundExprProgramBuilder,
+	left: BoundExprId,
+	right: BoundExprId,
+) {
+	if builder.literal(left).is_some() && builder.literal(right).is_some() {
+		return;
+	}
+	if let Some(value) = builder.literal(left).cloned() {
+		let Some(data_type) = builder.node_type(right).cloned() else {
+			return;
+		};
+		let _ = builder.rewrite_literal(left, coerce_literal_value(value, &data_type));
+		return;
+	}
+	if let Some(value) = builder.literal(right).cloned() {
+		let Some(data_type) = builder.node_type(left).cloned() else {
+			return;
+		};
+		let _ = builder.rewrite_literal(right, coerce_literal_value(value, &data_type));
 	}
 }
 
@@ -1707,25 +1804,34 @@ fn coerce_literal_value(value: ScalarValue, target_type: &DataType) -> ScalarVal
 }
 
 fn bind_boolean(
+	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	config: &PlannerConfig,
 	left: &Expr,
 	right: &Expr,
-	constructor: fn(Box<ExecutionExpr>, Box<ExecutionExpr>) -> ExecutionExpr,
-) -> Result<ExecutionExpr, BindingError> {
-	let left = bind_expr(left, input_schema, config)?;
-	let right = bind_expr(right, input_schema, config)?;
-	require_boolean("boolean operator left", &left)?;
-	require_boolean("boolean operator right", &right)?;
-	Ok(constructor(Box::new(left), Box::new(right)))
+	op: BoundBinaryOp,
+) -> Result<BoundExprId, BindingError> {
+	let left = bind_expr_into_program(builder, left, input_schema, config)?;
+	let right = bind_expr_into_program(builder, right, input_schema, config)?;
+	require_boolean(builder, "boolean operator left", left)?;
+	require_boolean(builder, "boolean operator right", right)?;
+	Ok(builder.append_binary(op, left, right, DataType::Boolean))
 }
 
-fn require_boolean(context: &'static str, expr: &ExecutionExpr) -> Result<(), BindingError> {
-	if expr.data_type() == DataType::Boolean {
+fn require_boolean(
+	builder: &BoundExprProgramBuilder,
+	context: &'static str,
+	expr: BoundExprId,
+) -> Result<(), BindingError> {
+	let data_type = builder
+		.node_type(expr)
+		.cloned()
+		.expect("builder returns typed boolean input");
+	if data_type == DataType::Boolean {
 		Ok(())
 	} else {
 		Err(BindingError::TypeMismatch {
-			message: format!("{context} expected Boolean, got {:?}", expr.data_type()),
+			message: format!("{context} expected Boolean, got {data_type:?}"),
 		})
 	}
 }
@@ -1761,7 +1867,7 @@ fn resolve_column(name: &str, input_schema: &SchemaRef) -> Result<ResolvedColumn
 	})
 }
 
-fn aggregate_schema(group_expr: &[ExecutionExpr], aggr_expr: &[AggregateCall]) -> SchemaRef {
+fn aggregate_schema(group_expr: &BoundExprProgram, aggr_expr: &[BoundAggregateCall]) -> SchemaRef {
 	let mut fields = Vec::new();
 	let group_schema = schema_for_exprs(group_expr);
 	fields.extend(
@@ -1777,48 +1883,56 @@ fn aggregate_schema(group_expr: &[ExecutionExpr], aggr_expr: &[AggregateCall]) -
 }
 
 fn schema_for_exprs_with_output_names(
-	exprs: &[ExecutionExpr],
+	exprs: &BoundExprProgram,
 	output_names: &[Option<String>],
 ) -> SchemaRef {
-	debug_assert_eq!(exprs.len(), output_names.len());
+	debug_assert_eq!(exprs.root_count(), output_names.len());
 	let derived = schema_for_exprs(exprs);
 	let fields = exprs
+		.roots
 		.iter()
 		.enumerate()
-		.map(|(idx, expr)| {
+		.map(|(idx, _)| {
 			let name = output_names[idx]
 				.as_ref()
 				.cloned()
 				.unwrap_or_else(|| derived.field(idx).name().clone());
-			Field::new(name, expr.data_type(), expr.nullable())
+			let data_type = exprs.root_type(idx).cloned().unwrap_or(DataType::Null);
+			let nullable = exprs.root_nullable(idx).unwrap_or(true);
+			Field::new(name, data_type, nullable)
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))
 }
 
 fn schema_for_exprs_with_existing_names(
-	exprs: &[ExecutionExpr],
+	exprs: &BoundExprProgram,
 	existing_schema: &SchemaRef,
 ) -> SchemaRef {
 	let fields = exprs
+		.roots
 		.iter()
 		.enumerate()
-		.map(|(idx, expr)| {
+		.map(|(idx, _)| {
 			let name = existing_schema
 				.fields()
 				.get(idx)
 				.map(|field| field.name().clone())
-				.unwrap_or_else(|| match expr {
-					ExecutionExpr::Column(column) => column.name.0.clone(),
-					_ => format!("col_{idx}"),
+				.unwrap_or_else(|| {
+					exprs
+						.root_display_name(idx)
+						.map(str::to_string)
+						.unwrap_or_else(|| format!("col_{idx}"))
 				});
-			Field::new(name, expr.data_type(), expr.nullable())
+			let data_type = exprs.root_type(idx).cloned().unwrap_or(DataType::Null);
+			let nullable = exprs.root_nullable(idx).unwrap_or(true);
+			Field::new(name, data_type, nullable)
 		})
 		.collect::<Vec<_>>();
 	Arc::new(Schema::new(fields))
 }
 
-fn aggregate_field(call: &AggregateCall) -> Field {
+fn aggregate_field(call: &BoundAggregateCall) -> Field {
 	if let Some(field) = aggregate_kernel::stable_output_field(call) {
 		return field;
 	}
@@ -1851,7 +1965,7 @@ fn is_pbc_eligible_type(data_type: &DataType) -> bool {
 mod tests {
 	use super::*;
 	use crate::catalog::MockCatalog;
-	use crate::ir::{QueryProfileHint, ScalarValue, TableId};
+	use crate::ir::{BoundBinaryOp, BoundExprNode, QueryProfileHint, ScalarValue, TableId};
 	use arrow::datatypes::{Field, Schema};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptorV1, RowIdentityPolicy, SchemaEvolutionPolicyV1,
@@ -1875,15 +1989,11 @@ mod tests {
 			.expect("bind");
 		match plan {
 			ExecutionPlan::Project { input, exprs, .. } => {
-				match &exprs[0] {
-					ExecutionExpr::Column(column) => {
-						assert_eq!(column.ordinal, ColumnOrdinal(0));
-						assert_eq!(column.data_type, DataType::Int32);
-						assert!(column.nullable);
-						assert!(column.pbc_eligible);
-					}
-					other => panic!("expected resolved column, got {other:?}"),
-				}
+				let column = exprs.single_column_root().expect("project column root");
+				assert_eq!(column.ordinal, ColumnOrdinal(0));
+				assert_eq!(column.data_type, DataType::Int32);
+				assert!(column.nullable);
+				assert!(column.pbc_eligible);
 				match *input {
 					ExecutionPlan::Scan {
 						projection, schema, ..
@@ -1921,17 +2031,20 @@ mod tests {
 			.expect("bind");
 		match plan {
 			ExecutionPlan::Project { input, exprs, .. } => {
-				match &exprs[0] {
-					ExecutionExpr::Column(column) => assert_eq!(column.ordinal, ColumnOrdinal(0)),
-					other => panic!("expected project column, got {other:?}"),
-				}
+				let column = exprs.single_column_root().expect("project column root");
+				assert_eq!(column.ordinal, ColumnOrdinal(0));
 				match *input {
 					ExecutionPlan::Filter {
 						input, predicate, ..
 					} => {
-						match predicate {
-							ExecutionExpr::Gt(left, _) => match *left {
-								ExecutionExpr::Column(column) => {
+						let root = predicate.single_root().expect("predicate root");
+						match predicate.node(root).expect("predicate node") {
+							BoundExprNode::Binary {
+								op: BoundBinaryOp::Gt,
+								left,
+								..
+							} => match predicate.node(*left).expect("predicate left") {
+								BoundExprNode::Column(column) => {
 									assert_eq!(column.ordinal, ColumnOrdinal(1))
 								}
 								other => panic!("expected predicate column, got {other:?}"),
