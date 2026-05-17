@@ -296,25 +296,85 @@ async fn scalar_aggregate_aliases_bind_to_final_schema_and_order_by() {
 }
 
 #[tokio::test]
-async fn post_aggregate_arithmetic_binds_and_keeps_computed_args_rejected() {
+async fn computed_aggregate_arithmetic_binds_and_executes() {
 	let (catalog, _) = fixture();
 	for sql in [
 		"SELECT SUM(amount) + 1 FROM sales",
 		"SELECT region, SUM(amount) * 1.1 FROM sales GROUP BY region",
 		"SELECT region, SUM(amount) + COUNT(*) FROM sales GROUP BY region",
+		"SELECT SUM(amount + 1) FROM sales",
+		"SELECT COUNT(amount + 1) FROM sales",
+		"SELECT AVG(price * 2.0) FROM sales",
+		"SELECT MIN(amount + id), MAX(amount + id) FROM sales",
+		"SELECT COUNT(TRY_CAST(score AS INT)) FROM sales",
+		"SELECT MIN(score * 1.0) FROM sales",
 	] {
 		bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
 			.await
 			.unwrap_or_else(|err| panic!("{sql}: expected bind success, got {err}"));
 	}
 
-	for sql in [
-		"SELECT SUM(amount + 1) FROM sales",
-		"SELECT COUNT(amount + 1) FROM sales",
-		"SELECT AVG(price * 2.0) FROM sales",
-	] {
-		assert_unsupported_message(sql, "aggregate arguments must be simple column references");
-	}
+	let sum = run_logical(&plan_sql("SELECT SUM(amount + 1) FROM sales")).await;
+	assert_eq!(scalar_sum_rows(&sum), vec![Some(71)]);
+
+	let count = run_logical(&plan_sql("SELECT COUNT(amount + 1) FROM sales")).await;
+	assert_eq!(scalar_int64_column_rows(&count, 0), vec![Some(4)]);
+
+	let avg = run_logical(&plan_sql("SELECT AVG(price * 2.0) FROM sales")).await;
+	assert_eq!(scalar_float64_column_rows(&avg, 0), vec![Some(34.5)]);
+
+	let min_max = run_logical(&plan_sql(
+		"SELECT MIN(amount + id), MAX(amount + id) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&min_max, 0), vec![Some(11)]);
+	assert_eq!(scalar_int64_column_rows(&min_max, 1), vec![Some(34)]);
+
+	let count_try_cast =
+		run_logical(&plan_sql("SELECT COUNT(TRY_CAST(score AS INT)) FROM sales")).await;
+	assert_eq!(scalar_int64_column_rows(&count_try_cast, 0), vec![Some(4)]);
+
+	let min_nan = run_logical(&plan_sql("SELECT MIN(score * 1.0) FROM sales")).await;
+	let observed = scalar_float64_column_rows(&min_nan, 0)[0].expect("MIN(score * 1.0)");
+	assert!(observed.is_nan());
+}
+
+#[test]
+fn computed_aggregate_signatures_preserve_structural_identity() {
+	let plan = plan_sql(
+		"SELECT SUM(amount + id), SUM(id + amount), COUNT(*), COUNT(amount), COUNT(amount + 1) \
+		 FROM sales",
+	);
+	let LogicalPlan::Aggregate {
+		group_expr,
+		aggr_expr,
+		..
+	} = plan
+	else {
+		panic!("expected scalar aggregate");
+	};
+	assert!(group_expr.is_empty());
+	assert_eq!(aggr_expr.len(), 5);
+	assert!(matches!(aggr_expr[0].0, AggregateFunction::Sum));
+	assert!(matches!(aggr_expr[1].0, AggregateFunction::Sum));
+	assert!(matches!(
+		&aggr_expr[0].1[0],
+		Expr::Add(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "amount")
+				&& matches!(right.as_ref(), Expr::Column(column) if column.name.0 == "id")
+	));
+	assert!(matches!(
+		&aggr_expr[1].1[0],
+		Expr::Add(left, right)
+			if matches!(left.as_ref(), Expr::Column(column) if column.name.0 == "id")
+				&& matches!(right.as_ref(), Expr::Column(column) if column.name.0 == "amount")
+	));
+	assert!(matches!(aggr_expr[2].0, AggregateFunction::CountAll));
+	assert_column(&aggr_expr[2].1[0], "count");
+	assert!(matches!(aggr_expr[3].0, AggregateFunction::Count));
+	assert_column(&aggr_expr[3].1[0], "amount");
+	assert!(matches!(aggr_expr[4].0, AggregateFunction::Count));
+	assert!(matches!(&aggr_expr[4].1[0], Expr::Add(_, _)));
 }
 
 #[test]
@@ -330,6 +390,8 @@ fn group_by_accepts_only_stable_aggregate_set() {
 	for sql in [
 		"SELECT region, LINEAR_REGRESS(amount, id) FROM sales GROUP BY region",
 		"SELECT region, APPROX_QUANTILE(amount, 0.5) FROM sales GROUP BY region",
+		"SELECT region, LINEAR_REGRESS(amount + 1, id) FROM sales GROUP BY region",
+		"SELECT region, APPROX_QUANTILE(amount + 1, 0.5) FROM sales GROUP BY region",
 	] {
 		assert_unsupported(sql);
 	}
@@ -1768,13 +1830,116 @@ fn order_by_computed_aggregate_preserves_structural_rejects() {
 		"SELECT region, region, SUM(amount) FROM sales GROUP BY region ORDER BY SUM(amount) + 1",
 		"ORDER BY computed aggregate expression requires unique output names",
 	);
-	assert_unsupported_message(
-		"SELECT SUM(CAST(amount AS BIGINT)) FROM sales",
-		"aggregate arguments must be simple column references",
+}
+
+#[tokio::test]
+async fn grouped_computed_aggregate_arguments_execute_with_having_and_order_by() {
+	let grouped = run_logical(&plan_sql(
+		"SELECT region, SUM(amount + id) FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_int64_rows(&grouped, 1),
+		HashMap::from([
+			(Some("east".to_string()), Some(45)),
+			(Some("west".to_string()), Some(22)),
+			(None, Some(13)),
+		])
 	);
+
+	let ordered = run_logical(&plan_sql(
+		"SELECT region, SUM(amount + id) FROM sales GROUP BY region \
+		 HAVING SUM(amount + id) > 20 ORDER BY SUM(amount + id) DESC",
+	))
+	.await;
+	assert_eq!(
+		ordered_region_sum_rows(&ordered),
+		vec![
+			(Some("east".to_string()), Some(45)),
+			(Some("west".to_string()), Some(22)),
+		]
+	);
+
+	let grouped_try_cast = run_logical(&plan_sql(
+		"SELECT region, SUM(TRY_CAST(amount AS BIGINT)) FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_int64_rows(&grouped_try_cast, 1),
+		HashMap::from([
+			(Some("east".to_string()), Some(40)),
+			(Some("west".to_string()), Some(20)),
+			(None, Some(7)),
+		])
+	);
+
+	let grouped_avg = run_logical(&plan_sql(
+		"SELECT region, AVG(price * 1.5) FROM sales GROUP BY region",
+	))
+	.await;
+	assert_eq!(
+		region_float64_rows(&grouped_avg, 1),
+		HashMap::from([
+			(Some("east".to_string()), Some(30.75)),
+			(Some("west".to_string()), Some(30.75)),
+			(None, Some(11.25)),
+		])
+	);
+}
+
+#[test]
+fn aggregate_arguments_reject_nested_aggregates() {
+	for sql in [
+		"SELECT SUM(COUNT(amount)) FROM sales",
+		"SELECT SUM(amount + SUM(id)) FROM sales",
+		"SELECT COUNT(AVG(price)) FROM sales",
+		"SELECT SUM(CAST(SUM(amount) AS BIGINT)) FROM sales",
+	] {
+		assert_unsupported_message(sql, "aggregate arguments must not contain aggregate calls");
+	}
+}
+
+#[test]
+fn computed_aggregate_arguments_preserve_output_name_ambiguity() {
 	assert_unsupported_message(
-		"SELECT SUM(TRY_CAST(amount AS BIGINT)) FROM sales",
-		"aggregate arguments must be simple column references",
+		"SELECT SUM(amount + 1), SUM(amount + 2) FROM sales HAVING SUM(amount + 1) > 0",
+		"ambiguous HAVING aggregate-call",
+	);
+}
+
+#[tokio::test]
+async fn computed_aggregate_arguments_preserve_binder_domain_errors() {
+	let (catalog, _) = fixture();
+	let err = bind(
+		&plan_sql("SELECT SUM(amount > 0) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("SUM over Boolean should reject in binder");
+	assert!(
+		matches!(
+			err,
+			BindingError::TypeMismatch { ref message }
+				if message == "SUM expects numeric input, got Boolean"
+		),
+		"unexpected SUM domain error: {err:?}"
+	);
+
+	let err = bind(
+		&plan_sql("SELECT SUM(CAST(region AS BIGINT)) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("inner CAST over Utf8 should reject in binder");
+	assert!(
+		matches!(
+			err,
+			BindingError::TypeMismatch { ref message }
+				if message == "unsupported CAST: Utf8 to Int64; only Int32, Int64, Float32, and Float64 are supported"
+		),
+		"unexpected CAST domain error: {err:?}"
 	);
 }
 
@@ -1999,24 +2164,22 @@ async fn sql_try_cast_rejects_unsupported_targets_sources_and_syntax() {
 	);
 }
 
-#[test]
-fn aggregate_argument_cast_remains_column_only() {
-	assert_unsupported_message(
-		"SELECT SUM(CAST(amount AS BIGINT)) FROM sales",
-		"aggregate arguments must be simple column references",
-	);
-}
+#[tokio::test]
+async fn aggregate_argument_cast_and_try_cast_execute() {
+	let strict = run_logical(&plan_sql("SELECT SUM(CAST(amount AS BIGINT)) FROM sales")).await;
+	assert_eq!(scalar_int64_column_rows(&strict, 0), vec![Some(67)]);
 
-#[test]
-fn aggregate_argument_try_cast_remains_column_only() {
-	assert_unsupported_message(
+	let fallible = run_logical(&plan_sql(
 		"SELECT SUM(TRY_CAST(amount AS BIGINT)) FROM sales",
-		"aggregate arguments must be simple column references",
-	);
-	assert_unsupported_message(
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&fallible, 0), vec![Some(67)]);
+
+	let safe = run_logical(&plan_sql(
 		"SELECT COUNT(SAFE_CAST(id AS BIGINT)) FROM sales",
-		"aggregate arguments must be simple column references",
-	);
+	))
+	.await;
+	assert_eq!(scalar_int64_column_rows(&safe, 0), vec![Some(6)]);
 }
 
 #[tokio::test]
@@ -3134,6 +3297,39 @@ fn region_int64_rows(
 			.as_any()
 			.downcast_ref::<Int64Array>()
 			.expect("Int64 value column");
+		for row in 0..batch.num_rows() {
+			let region = if regions.is_null(row) {
+				None
+			} else {
+				Some(regions.value(row).to_string())
+			};
+			let value = if values.is_null(row) {
+				None
+			} else {
+				Some(values.value(row))
+			};
+			rows.insert(region, value);
+		}
+	}
+	rows
+}
+
+fn region_float64_rows(
+	results: &[RecordBatch],
+	value_column_idx: usize,
+) -> HashMap<Option<String>, Option<f64>> {
+	let mut rows = HashMap::new();
+	for batch in results {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region column");
+		let values = batch
+			.column(value_column_idx)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("Float64 value column");
 		for row in 0..batch.num_rows() {
 			let region = if regions.is_null(row) {
 				None

@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::error::FrontendError;
 use crate::ir::{
-	AggregateFunction, ColumnRef, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
+	AggregateFunction, Expr, JoinKind, JoinStrategy, LogicalPlan, ScalarValue, SortExpr,
 };
 use arrow::datatypes::DataType;
 use sqlparser::ast::{
@@ -25,8 +26,9 @@ fn unsupported(message: impl Into<String>) -> FrontendError {
 const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
 // P0.3: grouped SQL reuses the join shuffle fanout until aggregate fanout has separate evidence.
 const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
-const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str =
-	"aggregate arguments must be simple column references";
+const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str = "unsupported aggregate argument";
+const NESTED_AGGREGATE_ARGUMENT_MESSAGE: &str =
+	"aggregate arguments must not contain aggregate calls";
 
 fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError> {
 	match arg {
@@ -36,9 +38,44 @@ fn validate_simple_aggregate_arg(arg: &FunctionArg) -> Result<(), FrontendError>
 }
 
 fn validate_aggregate_argument(expr: &SqlExpr) -> Result<(), FrontendError> {
+	reject_nested_aggregate(expr)
+}
+
+fn reject_nested_aggregate(expr: &SqlExpr) -> Result<(), FrontendError> {
 	match expr {
-		SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_) => Ok(()),
-		_ => Err(unsupported(AGGREGATE_ARGUMENT_SHAPE_MESSAGE)),
+		SqlExpr::Function(function) if aggregate_function_name(&function.name).is_some() => {
+			Err(unsupported(NESTED_AGGREGATE_ARGUMENT_MESSAGE))
+		}
+		SqlExpr::Function(function) => {
+			if let FunctionArguments::List(list) = &function.args {
+				for arg in &list.args {
+					match arg {
+						FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+						| FunctionArg::Named {
+							arg: FunctionArgExpr::Expr(expr),
+							..
+						}
+						| FunctionArg::ExprNamed {
+							arg: FunctionArgExpr::Expr(expr),
+							..
+						} => reject_nested_aggregate(expr)?,
+						FunctionArg::Unnamed(FunctionArgExpr::Wildcard)
+						| FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(_)) => {}
+						_ => {}
+					}
+				}
+			}
+			Ok(())
+		}
+		SqlExpr::BinaryOp { left, right, .. } => {
+			reject_nested_aggregate(left)?;
+			reject_nested_aggregate(right)
+		}
+		SqlExpr::Cast { expr, .. } | SqlExpr::UnaryOp { expr, .. } => reject_nested_aggregate(expr),
+		SqlExpr::IsNull(inner) | SqlExpr::IsNotNull(inner) | SqlExpr::Nested(inner) => {
+			reject_nested_aggregate(inner)
+		}
+		_ => Ok(()),
 	}
 }
 
@@ -1609,14 +1646,229 @@ impl AggregateOutputEntry {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum GroupedAggregateSignature {
-	CountAll,
-	Count(ColumnRef),
-	Sum(ColumnRef),
-	Min(ColumnRef),
-	Max(ColumnRef),
-	Avg(ColumnRef),
+#[derive(Debug, Clone)]
+struct GroupedAggregateSignature {
+	kernel: aggregate_kernel::StableAggregateKernel,
+	args: Vec<Expr>,
+}
+
+impl PartialEq for GroupedAggregateSignature {
+	fn eq(&self, other: &Self) -> bool {
+		self.kernel == other.kernel
+			&& self.args.len() == other.args.len()
+			&& self
+				.args
+				.iter()
+				.zip(&other.args)
+				.all(|(left, right)| expr_structural_eq(left, right))
+	}
+}
+
+impl Eq for GroupedAggregateSignature {}
+
+impl Hash for GroupedAggregateSignature {
+	fn hash<H: Hasher>(&self, state: &mut H) {
+		self.kernel.hash(state);
+		self.args.len().hash(state);
+		for arg in &self.args {
+			hash_expr_structural(arg, state);
+		}
+	}
+}
+
+fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
+	match expr {
+		Expr::Column(column) => {
+			0u8.hash(state);
+			column.hash(state);
+		}
+		Expr::Literal(value) => {
+			1u8.hash(state);
+			hash_scalar_structural(value, state);
+		}
+		Expr::Cast(inner, data_type) => {
+			2u8.hash(state);
+			hash_expr_structural(inner, state);
+			hash_data_type_structural(data_type, state);
+		}
+		Expr::TryCast(inner, data_type) => {
+			3u8.hash(state);
+			hash_expr_structural(inner, state);
+			hash_data_type_structural(data_type, state);
+		}
+		Expr::Add(left, right) => {
+			4u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Sub(left, right) => {
+			5u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Mul(left, right) => {
+			6u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Div(left, right) => {
+			7u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Eq(left, right) => {
+			8u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Neq(left, right) => {
+			9u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Lt(left, right) => {
+			10u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Lte(left, right) => {
+			11u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Gt(left, right) => {
+			12u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Gte(left, right) => {
+			13u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::And(left, right) => {
+			14u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Or(left, right) => {
+			15u8.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
+		Expr::Not(inner) => {
+			16u8.hash(state);
+			hash_expr_structural(inner, state);
+		}
+		Expr::IsNull(inner) => {
+			17u8.hash(state);
+			hash_expr_structural(inner, state);
+		}
+		Expr::IsNotNull(inner) => {
+			18u8.hash(state);
+			hash_expr_structural(inner, state);
+		}
+		Expr::TimeBucket(interval, inner) => {
+			19u8.hash(state);
+			interval.hash(state);
+			hash_expr_structural(inner, state);
+		}
+	}
+}
+
+fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
+	match (left, right) {
+		(Expr::Column(left), Expr::Column(right)) => left == right,
+		(Expr::Literal(left), Expr::Literal(right)) => scalar_structural_eq(left, right),
+		(Expr::Cast(left_inner, left_type), Expr::Cast(right_inner, right_type))
+		| (Expr::TryCast(left_inner, left_type), Expr::TryCast(right_inner, right_type)) => {
+			expr_structural_eq(left_inner, right_inner)
+				&& data_type_structural_eq(left_type, right_type)
+		}
+		(Expr::Add(left_left, left_right), Expr::Add(right_left, right_right))
+		| (Expr::Sub(left_left, left_right), Expr::Sub(right_left, right_right))
+		| (Expr::Mul(left_left, left_right), Expr::Mul(right_left, right_right))
+		| (Expr::Div(left_left, left_right), Expr::Div(right_left, right_right))
+		| (Expr::Eq(left_left, left_right), Expr::Eq(right_left, right_right))
+		| (Expr::Neq(left_left, left_right), Expr::Neq(right_left, right_right))
+		| (Expr::Lt(left_left, left_right), Expr::Lt(right_left, right_right))
+		| (Expr::Lte(left_left, left_right), Expr::Lte(right_left, right_right))
+		| (Expr::Gt(left_left, left_right), Expr::Gt(right_left, right_right))
+		| (Expr::Gte(left_left, left_right), Expr::Gte(right_left, right_right))
+		| (Expr::And(left_left, left_right), Expr::And(right_left, right_right))
+		| (Expr::Or(left_left, left_right), Expr::Or(right_left, right_right)) => {
+			expr_structural_eq(left_left, right_left) && expr_structural_eq(left_right, right_right)
+		}
+		(Expr::Not(left), Expr::Not(right))
+		| (Expr::IsNull(left), Expr::IsNull(right))
+		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
+		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
+			left_interval == right_interval && expr_structural_eq(left, right)
+		}
+		_ => false,
+	}
+}
+
+fn hash_scalar_structural(value: &ScalarValue, state: &mut impl Hasher) {
+	match value {
+		ScalarValue::Boolean(value) => {
+			0u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Int32(value) => {
+			1u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Int64(value) => {
+			2u8.hash(state);
+			value.hash(state);
+		}
+		ScalarValue::Float32(value) => {
+			3u8.hash(state);
+			value.map(f32::to_bits).hash(state);
+		}
+		ScalarValue::Float64(value) => {
+			4u8.hash(state);
+			value.map(f64::to_bits).hash(state);
+		}
+		ScalarValue::Utf8(value) => {
+			5u8.hash(state);
+			value.hash(state);
+		}
+	}
+}
+
+fn scalar_structural_eq(left: &ScalarValue, right: &ScalarValue) -> bool {
+	match (left, right) {
+		(ScalarValue::Boolean(left), ScalarValue::Boolean(right)) => left == right,
+		(ScalarValue::Int32(left), ScalarValue::Int32(right)) => left == right,
+		(ScalarValue::Int64(left), ScalarValue::Int64(right)) => left == right,
+		(ScalarValue::Float32(left), ScalarValue::Float32(right)) => {
+			left.map(f32::to_bits) == right.map(f32::to_bits)
+		}
+		(ScalarValue::Float64(left), ScalarValue::Float64(right)) => {
+			left.map(f64::to_bits) == right.map(f64::to_bits)
+		}
+		(ScalarValue::Utf8(left), ScalarValue::Utf8(right)) => left == right,
+		_ => false,
+	}
+}
+
+fn hash_data_type_structural(data_type: &DataType, state: &mut impl Hasher) {
+	match data_type {
+		DataType::Int32 => 0u8.hash(state),
+		DataType::Int64 => 1u8.hash(state),
+		DataType::Float32 => 2u8.hash(state),
+		DataType::Float64 => 3u8.hash(state),
+		other => {
+			255u8.hash(state);
+			format!("{other:?}").hash(state);
+		}
+	}
+}
+
+fn data_type_structural_eq(left: &DataType, right: &DataType) -> bool {
+	left == right
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1960,36 +2212,23 @@ fn grouped_aggregate_signature(
 	function: &AggregateFunction,
 	args: &[Expr],
 ) -> Option<GroupedAggregateSignature> {
-	if !aggregate_kernel::stable_spec_for_function(function)
-		.is_some_and(|spec| spec.grouped_supported)
-	{
+	let kernel = aggregate_kernel::stable_kernel_for_function(function)?;
+	let spec = aggregate_kernel::stable_spec(kernel);
+	if !spec.grouped_supported {
 		return None;
 	}
-	match function {
-		AggregateFunction::CountAll => Some(GroupedAggregateSignature::CountAll),
-		AggregateFunction::Count => match args {
-			[Expr::Column(column)] => Some(GroupedAggregateSignature::Count(column.clone())),
-			_ => None,
-		},
-		AggregateFunction::Sum => match args {
-			[Expr::Column(column)] => Some(GroupedAggregateSignature::Sum(column.clone())),
-			_ => None,
-		},
-		AggregateFunction::Min => match args {
-			[Expr::Column(column)] => Some(GroupedAggregateSignature::Min(column.clone())),
-			_ => None,
-		},
-		AggregateFunction::Max => match args {
-			[Expr::Column(column)] => Some(GroupedAggregateSignature::Max(column.clone())),
-			_ => None,
-		},
-		AggregateFunction::Avg => match args {
-			[Expr::Column(column)] => Some(GroupedAggregateSignature::Avg(column.clone())),
-			_ => None,
-		},
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-			unreachable!("experimental kernels are not grouped-supported")
+	match spec.arity {
+		aggregate_kernel::AggregateArity::Zero => Some(GroupedAggregateSignature {
+			kernel,
+			args: Vec::new(),
+		}),
+		aggregate_kernel::AggregateArity::One if args.len() == 1 => {
+			Some(GroupedAggregateSignature {
+				kernel,
+				args: vec![args[0].clone()],
+			})
 		}
+		_ => None,
 	}
 }
 

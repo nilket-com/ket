@@ -953,7 +953,8 @@ fn adr024_scalar_arithmetic_guards_are_narrow() {
 			"missing SQL lowerer for {operator}"
 		);
 	}
-	assert!(planner.contains("aggregate arguments must be simple column references"));
+	assert!(!planner.contains("aggregate arguments must be simple column references"));
+	assert!(planner.contains("aggregate arguments must not contain aggregate calls"));
 
 	let binder =
 		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
@@ -1588,6 +1589,296 @@ fn adr027_hidden_sort_projection_contract_is_pinned() {
 }
 
 #[test]
+fn adr028_aggregate_arguments_accept_computed_expressions() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(!planner.contains("aggregate arguments must be simple column references"));
+	assert!(planner.contains("aggregate arguments must not contain aggregate calls"));
+	let validator = brace_blocks_after_marker(&planner, "fn validate_aggregate_argument")
+		.into_iter()
+		.next()
+		.expect("validate aggregate argument")
+		.1;
+	assert!(validator.contains("reject_nested_aggregate"));
+}
+
+#[test]
+fn adr028_aggregate_signature_uses_planner_private_visitors() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let signature = brace_blocks_after_marker(&planner, "struct GroupedAggregateSignature")
+		.into_iter()
+		.next()
+		.expect("GroupedAggregateSignature body")
+		.1;
+	assert!(signature.contains("kernel: aggregate_kernel::StableAggregateKernel"));
+	assert!(signature.contains("args: Vec<Expr>"));
+	assert!(planner.contains("impl PartialEq for GroupedAggregateSignature"));
+	assert!(planner.contains("impl Hash for GroupedAggregateSignature"));
+	let hash_impl = brace_blocks_after_marker(&planner, "impl Hash for GroupedAggregateSignature")
+		.into_iter()
+		.next()
+		.expect("GroupedAggregateSignature Hash impl")
+		.1;
+	assert!(hash_impl.contains("self.args.len().hash(state)"));
+	for helper in [
+		"fn hash_expr_structural",
+		"fn expr_structural_eq",
+		"fn hash_scalar_structural",
+		"fn scalar_structural_eq",
+		"fn hash_data_type_structural",
+		"fn data_type_structural_eq",
+	] {
+		assert!(planner.contains(helper), "missing {helper}");
+	}
+	for forbidden in ["AggregateArgKey", "ScalarKey", "DataTypeKey", "DurationKey"] {
+		assert!(!planner.contains(forbidden), "unexpected {forbidden}");
+	}
+}
+
+#[test]
+fn adr028_aggregate_signature_visitors_are_exhaustive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let hash_body = brace_blocks_after_marker(&planner, "fn hash_expr_structural")
+		.into_iter()
+		.next()
+		.expect("hash expr structural")
+		.1;
+	let eq_body = brace_blocks_after_marker(&planner, "fn expr_structural_eq")
+		.into_iter()
+		.next()
+		.expect("expr structural eq")
+		.1;
+	for variant in [
+		"Expr::Column",
+		"Expr::Literal",
+		"Expr::Cast",
+		"Expr::TryCast",
+		"Expr::Add",
+		"Expr::Sub",
+		"Expr::Mul",
+		"Expr::Div",
+		"Expr::Eq",
+		"Expr::Neq",
+		"Expr::Lt",
+		"Expr::Lte",
+		"Expr::Gt",
+		"Expr::Gte",
+		"Expr::And",
+		"Expr::Or",
+		"Expr::Not",
+		"Expr::IsNull",
+		"Expr::IsNotNull",
+		"Expr::TimeBucket",
+	] {
+		assert!(
+			hash_body.contains(variant),
+			"hash visitor missing {variant}"
+		);
+		assert!(eq_body.contains(variant), "eq visitor missing {variant}");
+	}
+}
+
+#[test]
+fn adr028_aggregate_signature_visitors_preserve_float_bits() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let hash_body = brace_blocks_after_marker(&planner, "fn hash_scalar_structural")
+		.into_iter()
+		.next()
+		.expect("hash scalar structural")
+		.1;
+	let eq_body = brace_blocks_after_marker(&planner, "fn scalar_structural_eq")
+		.into_iter()
+		.next()
+		.expect("scalar structural eq")
+		.1;
+	assert!(hash_body.contains("f32::to_bits"));
+	assert!(hash_body.contains("f64::to_bits"));
+	assert!(eq_body.contains("f32::to_bits"));
+	assert!(eq_body.contains("f64::to_bits"));
+	for variant in [
+		"ScalarValue::Boolean",
+		"ScalarValue::Int32",
+		"ScalarValue::Int64",
+		"ScalarValue::Float32",
+		"ScalarValue::Float64",
+		"ScalarValue::Utf8",
+	] {
+		assert!(hash_body.contains(variant), "hash scalar missing {variant}");
+		assert!(eq_body.contains(variant), "eq scalar missing {variant}");
+	}
+}
+
+#[test]
+fn adr028_data_type_structural_eq_is_reflexive() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let eq_body = brace_blocks_after_marker(&planner, "fn data_type_structural_eq")
+		.into_iter()
+		.next()
+		.expect("data type structural eq")
+		.1;
+	assert!(eq_body.contains("left == right"));
+	assert!(!eq_body.contains("matches!"));
+	let hash_body = brace_blocks_after_marker(&planner, "fn hash_data_type_structural")
+		.into_iter()
+		.next()
+		.expect("hash data type structural")
+		.1;
+	for data_type in [
+		"DataType::Int32",
+		"DataType::Int64",
+		"DataType::Float32",
+		"DataType::Float64",
+	] {
+		assert!(
+			hash_body.contains(data_type),
+			"hash data type missing {data_type}"
+		);
+	}
+	assert!(hash_body.contains("format!"));
+}
+
+#[test]
+fn adr028_aggregate_signature_count_all_is_zero_arg() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let signature = brace_blocks_after_marker(&planner, "fn grouped_aggregate_signature")
+		.into_iter()
+		.next()
+		.expect("grouped aggregate signature")
+		.1;
+	assert!(signature.contains("aggregate_kernel::AggregateArity::Zero"));
+	assert!(signature.contains("args: Vec::new()"));
+	let lower_count = brace_blocks_after_marker(&planner, "fn lower_count_aggregate")
+		.into_iter()
+		.next()
+		.expect("lower count aggregate")
+		.1;
+	assert!(lower_count.contains("Expr::column(\"count\")"));
+}
+
+#[test]
+fn adr028_nested_aggregate_rejects_at_sql_walk() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let walker = brace_blocks_after_marker(&planner, "fn reject_nested_aggregate")
+		.into_iter()
+		.next()
+		.expect("reject nested aggregate")
+		.1;
+	for arm in [
+		"SqlExpr::Function",
+		"SqlExpr::BinaryOp",
+		"SqlExpr::UnaryOp",
+		"SqlExpr::Cast",
+		"SqlExpr::IsNull",
+		"SqlExpr::IsNotNull",
+		"SqlExpr::Nested",
+	] {
+		assert!(walker.contains(arm), "walker missing {arm}");
+	}
+	assert!(walker.contains("aggregate_function_name(&function.name).is_some()"));
+	assert!(planner.contains("aggregate arguments must not contain aggregate calls"));
+}
+
+#[test]
+fn adr028_experimental_kernels_excluded_from_grouped_signatures() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	let mapping = brace_blocks_after_marker(&catalog, "fn stable_kernel_for_function")
+		.into_iter()
+		.next()
+		.expect("stable kernel for function")
+		.1;
+	assert!(mapping.contains(
+		"AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None"
+	));
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let signature = brace_blocks_after_marker(&planner, "fn grouped_aggregate_signature")
+		.into_iter()
+		.next()
+		.expect("grouped aggregate signature")
+		.1;
+	assert!(signature.contains("aggregate_kernel::stable_kernel_for_function(function)?"));
+}
+
+#[test]
+fn adr028_aggregate_output_names_stay_kernel_names() {
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	let output_names = brace_blocks_after_marker(&planner, "fn aggregate_output_name")
+		.into_iter()
+		.next()
+		.expect("aggregate output name")
+		.1;
+	assert!(!output_names.contains("format!"));
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	for name in [
+		"output_name: \"sum\"",
+		"output_name: \"count\"",
+		"output_name: \"min\"",
+		"output_name: \"max\"",
+		"output_name: \"avg\"",
+	] {
+		assert!(catalog.contains(name), "missing output name {name}");
+	}
+}
+
+#[test]
+fn adr028_binder_executor_aggregate_args_preserved() {
+	let binder =
+		std::fs::read_to_string(manifest_dir().join("src/binder.rs")).expect("read binder source");
+	let stable_bind = brace_blocks_after_marker(&binder, "fn bind_stable_aggregate_call")
+		.into_iter()
+		.next()
+		.expect("bind stable aggregate call")
+		.1;
+	assert!(stable_bind.contains("bind_expr"));
+	let exec =
+		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
+	assert!(exec.contains("self.evaluate_expr(&args[0]"));
+	assert!(exec.contains("self.evaluate_bound_expr(&call.args[0]"));
+}
+
+#[test]
+fn adr028_public_ir_remains_non_eq_non_hash() {
+	let ir = std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source");
+	for type_name in ["AggregateFunction", "Expr", "ScalarValue"] {
+		let before_type = ir
+			.split(&format!("pub enum {type_name}"))
+			.next()
+			.expect("type marker");
+		let derives = before_type.rsplit("#[derive").next().unwrap_or("");
+		let derive_items = derives
+			.split(')')
+			.next()
+			.and_then(|line| line.split('(').nth(1))
+			.unwrap_or("");
+		let has_forbidden_derive = derive_items
+			.split(',')
+			.map(str::trim)
+			.any(|item| item == "Eq" || item == "Hash");
+		assert!(
+			!has_forbidden_derive,
+			"ADR 028 D2: {type_name} must not derive Eq or Hash"
+		);
+		assert!(
+			!ir.contains(&format!("impl Hash for {type_name}")),
+			"ADR 028 D2: {type_name} must not implement Hash"
+		);
+		assert!(
+			!ir.contains(&format!("impl Eq for {type_name}")),
+			"ADR 028 D2: {type_name} must not implement Eq"
+		);
+	}
+}
+
+#[test]
 fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
@@ -1644,7 +1935,6 @@ fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 		.expect("read SQL planner source");
 	assert!(planner.contains("\"AVG\" => self.lower_avg_aggregate"));
 	assert!(planner.contains("AVG requires one argument"));
-	assert!(planner.contains("GroupedAggregateSignature::Avg"));
 	assert!(planner.contains("unsupported aggregate function"));
 
 	let binder =
@@ -1653,6 +1943,7 @@ fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
 		.expect("read aggregate catalog source");
+	assert!(catalog.contains("kind: StableAggregateKernel::Avg"));
 	assert!(catalog.contains("kind: StableAggregateKernel::Avg"));
 	assert!(catalog.contains("output_name: \"avg\""));
 	assert!(catalog.contains("input_domain: AggregateInputDomain::AvgNumeric"));
