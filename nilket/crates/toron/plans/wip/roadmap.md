@@ -1092,6 +1092,208 @@ along with the forward-sequence rewrite.
   categorized and adjusted per Phase 9 inventory). The
   ten-phase migration is materialized in
   `plans/impl/031_bound_expr_program.md`.
+- **ADR 032 — SQL `INSERT INTO ... SELECT` (Local Read-
+  Write Composition).** Promoted. **First composition
+  ADR** after the ADR 024 → ADR 031 substrate arc
+  (eight consecutive substrate-introducing / substrate-
+  downstream / substrate-replacing cycles). Adds local
+  `INSERT INTO ... SELECT` by composing ADR 029 catalog
+  identity, ADR 030 `StorageWrite`, ADR 031
+  `BoundExprProgram` inside the bound source SELECT,
+  ADR 025 strict cast kernels for array coercion, and
+  the existing SELECT execution pipeline — without
+  widening the VALUES insert path, without distributed
+  write execution, and without new expression or storage
+  APIs. Thirteen decisions D1-D13.
+  **D1 critical decision:** local-coordinator-only;
+  `QueryCoordinator::execute_query` intercepts
+  `LogicalPlan::InsertSelect` before the SELECT
+  descriptor-evolution retry loop; distributed
+  coordinator rejects `ExecutionPlan::InsertSelect`
+  before `fragment_plan` with stable diagnostic
+  `"distributed INSERT INTO ... SELECT execution is not
+  wired to a write-context-bearing coordinator"`;
+  fragmenter rejects before `contains_join` /
+  `count_exchanges` via new
+  `FragmentError::InsertSelectNotFragmentable`;
+  defensive executor reject for uncoordinated reach.
+  **D2 critical decision (Shape A):** separate IR
+  variants — new `LogicalPlan::InsertSelect { table,
+  columns, source: Box<LogicalPlan> }` and new
+  `ExecutionPlan::InsertSelect { legacy_table_id, table,
+  fingerprint, schema, target_columns:
+  Vec<ColumnOrdinal>, source: Box<ExecutionPlan> }`;
+  existing VALUES `Insert` variants stay literal-only
+  (ADR 030 D4 + ADR 031 D10 carry-forwards).
+  `LogicalPlan` 11 → 12 variants; `ExecutionPlan`
+  9 → 10 variants.
+  **D3 critical decision (positional mapping):**
+  `target_columns: Vec<ColumnOrdinal>` records destination
+  ordinals in source-output order; binder resolves the
+  optional target column list to ordinals; coordinator
+  never re-parses the target column list; source
+  output names are not compared to target column names
+  (positional after column-list resolution).
+  **D4 critical decision (binder validation):**
+  shared `resolve_insert_target_columns(schema, columns)`
+  helper extracted from `bind_insert` and reused by
+  new `bind_insert_select`; duplicate-name +
+  unknown-column + omitted-not-null rejects bind-time;
+  source-output-arity vs `target_columns.len()` reject
+  bind-time; source-type-to-target-type admissibility
+  reject bind-time via `is_insert_select_coercible`
+  helper (ADR 025 strict-cast numeric lattice plus
+  identity for Boolean / Utf8); nullable-source-to-
+  non-null-target NOT bind-time rejected (runtime
+  check is D9).
+  **D5 critical decision (materialize before write):**
+  coordinator executes bound source once via
+  `Executor::execute_bound(source, None)`, materializes
+  all batches, coerces / reorders through new
+  `materialize_insert_select_batch(target_schema,
+  target_columns, source_batches)` private helper in
+  `coordinator/write.rs`, calls `StorageWrite::write`
+  exactly once for non-empty result; returns
+  `Ok(Vec::new())` (no row count, no RETURNING).
+  **D6 critical decision:**
+  `TABLE_WRITE_MAX_ROWS = 65_536` applies to total
+  source row count (not per-batch); over-cap fails
+  before write with `ExecutionError::InvalidExpression`;
+  multi-batch / chunked writes out of scope; single
+  `RecordBatch` payload preserves `StorageWrite` trait
+  shape.
+  **D7 critical decision (empty-source no-op):** zero-
+  row source returns `Ok(Vec::new())` without calling
+  `StorageWrite::write`; helper returns `Ok(None)`;
+  intentionally does not solve empty-table storage
+  initialization.
+  **D8 critical decision (strict array coercion):**
+  numeric source arrays coerced via existing ADR 025
+  strict cast kernels through `crate::exec::evaluate_cast`
+  entry point; Boolean / Utf8 require identity type;
+  unsupported combinations fail before write;
+  `TRY_CAST` semantics explicitly rejected (numeric
+  overflow fails the statement rather than nulling
+  cells; users who want fail-to-null spell `TRY_CAST`
+  inside the source SELECT); supported target-type
+  lattice is ADR 030's six-type set (`Boolean`,
+  `Int32`, `Int64`, `Float32`, `Float64`, `Utf8`).
+  **D9 critical decision (runtime null-count
+  enforcement):** after coercion + typed-null fill,
+  every non-null target field with `null_count() > 0`
+  fails before `StorageWrite::write` with column name
+  in diagnostic; runtime check on actual data, not
+  bind-time schema-nullability check (Codex iter-1 R4
+  refinement — filtered nullable-typed sources with
+  zero actual nulls succeed).
+  **D10 critical decision (SELECT plan stability
+  resumes):** ADR 032 additive over post-ADR-031
+  SELECT plan-digest baseline; existing SELECT-only
+  plan shapes byte-identical pre/post-ADR-032; new
+  `InsertSelect` variants only appear under
+  `INSERT INTO ... SELECT` statements. Re-stabilizes
+  the invariant ADR 031 D14 broke (break-then-
+  restabilize cycle property: substrate-replacing
+  ADRs may break invariants with explicit D-level
+  ratification; subsequent composition ADRs re-
+  stabilize the new baseline).
+  **D11 critical decision (walker leaf treatment +
+  binder optimizer exception):** distributed /
+  scheduler / server metadata walkers treat
+  `ExecutionPlan::InsertSelect` as a leaf (join
+  detection false; exchange counting zero; scan
+  metadata none; replacement walkers unchanged);
+  binder's `optimize_for_required` is the one
+  intentional exception (descends into source with
+  `required_output = None` so ADR 013 / 014 runtime-
+  filter and scan-projection pushdown still apply to
+  the source SELECT).
+  **D12 critical decision (outer morsels do not
+  partition DML):** source SELECT executes with
+  `None` morsel argument; preserves ADR 030 VALUES
+  INSERT behavior; defensive guardrail against
+  future refactor accidentally propagating outer
+  morsels into the write path.
+  **D13 critical decision (`evaluate_cast`
+  visibility):** `crate::exec::evaluate_cast` widens
+  from private to `pub(crate)` so
+  `coordinator::write` can invoke ADR 025 strict cast
+  kernels; `evaluate_try_cast` and lower-level numeric
+  cast kernels stay private; only cast-helper
+  visibility change.
+  Two substantive iterations + one promotion-drafting
+  pass = **3 total with 0 flip-flops** — **fastest
+  composition convergence to date** (vs ADR 031's
+  3 + 1 ratification = 4 total). Three factors drove
+  the speed: first composition ADR after the
+  substrate arc (no new substrate added); pure-Toron
+  + pure-local (no Wendelon-side discovery pass; no
+  distributed-write-context threading; ADR 030 D13
+  distributed reject pattern mirrored); Codex iter-1
+  absorbed Claude iter-0 C1-C4 + Q1-Q4 wholesale
+  (plan-digest re-stabilization C1 → D10; strict-cast
+  C2 → D8; walker leaf-treatment C3 → D11 with R2
+  refinement; aggregate composition fixture C4 →
+  Required Fixture A). **Three Claude iter-0 / iter-1
+  contributions promoted directly to D-level** (C1 →
+  D10; C2 → D8; C5 → D13 + architecture guard); plus
+  C3 → D11 (with Codex R2 refinement); C4 → Required
+  Fixture A; C6 → architecture guard wording for
+  `adr032_binder_enforces_source_target_arity`; C7 →
+  Required Fixture B (INNER JOIN). **Two cycle-
+  property breaks recorded:** Gemini iter-1/2
+  retraction streak broken at 6-of-7 (Gemini iter-1
+  converged directly with Codex iter-1 shape without
+  proposing broader-scope framings); topic-concession-
+  compresses-next-cycle streak broken at 3-of-3 (ADR
+  031 → 032 transition did not generate iter-0 alt-
+  topic seed). Both breaks recorded as cycle-property
+  refinements: broader-scope framings and seed-
+  pattern carry-forward are **substrate-cycle
+  phenomena**, not universal cycle phenomena;
+  composition cycles may not provoke these tendencies.
+  **First zero-invariant-break cycle since ADR 028**
+  (ADR 029 / 030 additive, zero break; ADR 031
+  substrate-replacing, broke plan-digest invariant
+  per D14; ADR 032 composition, zero break + re-
+  stabilizes per D10 — pattern: composition cycles
+  are zero-break by construction). Codex iter-1
+  contributed the most distinctive code-evidence
+  reasoning (R1 `target_columns` carrier, R2 binder-
+  may-descend exception, R4 runtime null-check vs
+  schema null-check — all non-obvious refinements
+  Claude iter-0 missed; healthy collaboration sign).
+  Fourteen architecture guards (12 ADR-032-specific +
+  2 composition guards verifying ADR 030 + ADR 031
+  invariants survive). Two required end-to-end
+  composition fixtures: **Fixture A (grouped
+  aggregate source — SUM)** exercises ADR 028
+  signature substrate + ADR 031 `BoundExprProgram`
+  aggregate evaluation; **Fixture B (INNER JOIN
+  source)** exercises ADR 008 / 009 join substrate +
+  explicit target column list reorder via D3
+  `target_columns` carrier. Both required for
+  Definition of Done. Fourteenth instance of the ADR
+  015 cycle. SoA-readiness invariants preserved (no
+  kernel added; centralized dispatch unchanged; no
+  row-path dyn dispatch). No new SQL syntax beyond
+  the bare `INSERT INTO ... <select-statement>` form;
+  no new IR expression variant; no new aggregate
+  kernel; no PBC opcode change; no fragmenter
+  detector change for SELECT paths; no cross-ring
+  engagement; no Wendelon-side change; no
+  `RecordBatch` field added to any plan variant; no
+  streaming `StorageWrite` overload; no row-count or
+  RETURNING result; no `blake3` dependency; no
+  external allocator crate. ADR 029 catalog metadata-
+  only preserved; ADR 030 `ExecutionPlan::Insert`
+  expression-free preserved; ADR 031 `BoundExprProgram`
+  `PartialEq`-only preserved; `StorageWrite` trait
+  shape unchanged. Existing SELECT corpus plan
+  digests byte-identical pre/post-ADR-032 (D10 re-
+  stabilization). The nine-step migration is
+  materialized in
+  `plans/impl/032_insert_into_select.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -1159,7 +1361,288 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 031 promoted; ADR 032 candidates
+### ADR 032 promoted; ADR 033 candidates
+
+ADR 032 selected and promoted **SQL `INSERT INTO ...
+SELECT` (Local Read-Write Composition)** — Toron's
+**first composition ADR** after the ADR 024 → ADR 031
+substrate arc (eight consecutive substrate-introducing
+/ substrate-downstream / substrate-replacing cycles).
+Adds local `INSERT INTO ... SELECT` by composing ADR
+029 catalog identity, ADR 030 `StorageWrite`, ADR 031
+`BoundExprProgram` inside the bound source SELECT, ADR
+025 strict cast kernels for array coercion, and the
+existing SELECT execution pipeline — without widening
+the VALUES insert path, without distributed write
+execution, and without new expression or storage APIs.
+
+Thirteen decisions D1-D13 cover: local-coordinator-
+only execution with three independent reject sites
+(distributed coordinator, fragmenter, defensive
+executor); Shape A separate IR variants
+(`LogicalPlan::InsertSelect` + `ExecutionPlan::InsertSelect`)
+alongside (not replacing) ADR 030 VALUES `Insert`
+variants; positional source-to-target mapping with a
+bound `target_columns: Vec<ColumnOrdinal>` carrier in
+source-output order; shared
+`resolve_insert_target_columns` binder helper extracted
+from `bind_insert`; binder-time arity + type-
+admissibility validation via `is_insert_select_coercible`
+mirroring ADR 025 strict-cast lattice; materialize-
+before-write coordinator path with `Executor::execute_bound(source,
+None)` + new `materialize_insert_select_batch` private
+helper in `coordinator/write.rs`;
+`TABLE_WRITE_MAX_ROWS = 65_536` total-row cap;
+empty-source `Ok(Vec::new())` short-circuit without
+calling the writer; strict ADR 025 cast (no TRY_CAST)
+for numeric coercion; runtime null-count enforcement
+against non-null target fields (not bind-time schema
+nullability); post-ADR-031 SELECT plan-digest baseline
+re-stabilized; distributed / scheduler / server
+metadata walkers treat `InsertSelect` as a leaf with
+one documented binder-optimizer exception
+(`optimize_for_required` descends with `required_output
+= None` so source scan-projection pushdown survives);
+outer morsels do not partition DML writes (`None`
+morsel argument); `crate::exec::evaluate_cast`
+visibility widens to `pub(crate)` as the only cast-
+helper exposure (`evaluate_try_cast` stays private).
+
+Two substantive iterations + one promotion-drafting
+pass = **3 total with 0 flip-flops** — **fastest
+composition convergence to date** (vs ADR 031's
+3 + 1 ratification = 4 total). Three factors drove
+the speed: first composition ADR after the substrate
+arc (no new substrate added; only two plan-IR
+variants + one coordinator helper + one binder
+helper + four reject sites); pure-Toron and pure-
+local (no Wendelon-side discovery pass; no
+distributed-write-context threading; ADR 030 D13
+distributed reject pattern directly mirrored); Codex
+iter-1 absorbed Claude iter-0 C1-C4 + Q1-Q4
+resolutions wholesale (plan-digest re-stabilization
+C1 → D10; strict-cast C2 → D8; walker leaf-treatment
+C3 → D11 with R2 refinement; aggregate composition
+fixture C4 → Required Fixture A).
+
+**Two cycle-property breaks recorded:**
+
+- **Gemini iter-1/2 retraction streak broken at 6-of-
+  7** (was 6-of-6 across ADR 025 / 026 / 028 / 029 /
+  030 / 031). Gemini iter-1 converged directly with
+  Codex iter-1 shape without proposing broader-scope
+  framings (e.g., streaming `StorageWrite`,
+  distributed write context in same ADR) that iter-
+  2/3 needed to retract. Updated cycle property:
+  broader-scope framings are a **substrate-cycle
+  phenomenon**, not a universal cycle phenomenon.
+- **Topic-concession-compresses-next-cycle pattern
+  broken at 3-of-3** (was 3-of-3 at ADR 020→021,
+  027→028, 029→031). ADR 031 → 032 transition did
+  not generate an iter-0 alt-topic seed (ADR 031's
+  "ADR 032 candidates" list was generated forward,
+  not as iter-0 dissent). Updated cycle property:
+  topic-concession seed pattern is also a substrate-
+  cycle phenomenon.
+
+Both breaks recorded as cycle-property refinements,
+not regressions. Composition cycles may not provoke
+the same broader-scope and seed-carry-forward
+tendencies that substrate cycles do.
+
+**First zero-invariant-break cycle since ADR 028.**
+ADR 029 added new substrate (additive, zero break);
+ADR 030 added new substrate (additive, zero break);
+ADR 031 broke plan-digest invariant by substrate-
+replacing construction (D14, ratified); ADR 032
+composes and re-stabilizes (zero break + D10 re-
+stabilizes the post-ADR-031 SELECT plan-digest
+baseline). Pattern: composition cycles are zero-break
+by construction.
+
+**Three Claude iter-0 / iter-1 contributions
+promoted directly to D-level decisions:**
+
+- iter-0 C1 (plan-digest re-stabilization) → D10
+- iter-0 C2 (strict-cast ADR 025 kernels) → D8
+- iter-1 C5 (`evaluate_cast` visibility guard) → D13
+  + `adr032_coordinator_uses_only_evaluate_cast`
+  architecture guard
+
+Plus iter-0 C3 (walker leaf-treatment) → D11 with
+Codex R2 refinement (binder optimizer exception);
+iter-0 C4 (aggregate composition fixture) → Required
+Fixture A (SUM grouped aggregate); iter-1 C6 (source-
+arity guard wording) → `adr032_binder_enforces_source_target_arity`
+architecture guard; iter-1 C7 (JOIN composition
+fixture elevation) → Required Fixture B (INNER JOIN).
+Healthy collaboration sign — the council is not
+single-channel even in fast-converging composition
+cycles. Codex iter-1 contributed R1 (`target_columns`
+carrier), R2 (binder-may-descend exception), R3
+(strict-cast not TRY_CAST), R4 (runtime null-check
+vs schema null-check), R5 (outer morsels do not
+partition DML) — all non-obvious refinements Claude
+iter-0 missed.
+
+Fourteenth instance of the ADR 015 cycle. Fourteen
+architecture guards (12 ADR-032-specific + 2
+composition guards verifying ADR 030 + ADR 031
+invariants survive ADR 032). Two required end-to-end
+composition fixtures for Definition of Done: Fixture
+A (grouped aggregate source — SUM) exercises ADR 028
+signature substrate + ADR 031 `BoundExprProgram`
+aggregate evaluation; Fixture B (INNER JOIN source)
+exercises ADR 008 / 009 join substrate + explicit
+target column list reorder via D3 `target_columns`
+carrier. One fixture alone leaves either substrate
+path uncovered; both required.
+
+SoA-readiness invariants preserved (no kernel added;
+centralized dispatch unchanged; no row-path dyn
+dispatch). Brainstorm-seam touch check: 001
+(Cranelift JIT) untouched; 002 (WeakControlRing)
+untouched; 003 (Disaggregated Compute) touched but
+preserved (one new distributed reject arm; no
+fragmentation work added); 004 (Memory Arenas)
+untouched.
+
+No new SQL syntax beyond the bare `INSERT INTO ...
+<select-statement>` form; no new IR expression
+variant; no new aggregate kernel; no PBC opcode
+change; no fragmenter detector change for SELECT
+paths; no cross-ring engagement; no Wendelon-side
+change; no `RecordBatch` field added to any plan
+variant; no streaming `StorageWrite` overload; no
+row-count or RETURNING result; no `blake3`
+dependency; no external allocator crate added; no
+`Eq` / `Hash` derives on program-bearing types. ADR
+029 catalog metadata-only preserved; ADR 030
+`ExecutionPlan::Insert` expression-free preserved;
+ADR 031 `BoundExprProgram` `PartialEq`-only
+preserved; `StorageWrite` trait shape unchanged.
+Existing SELECT corpus plan digests byte-identical
+pre/post-ADR-032 (D10 re-stabilization). The nine-
+step migration is materialized in
+`plans/impl/032_insert_into_select.md`.
+
+ADR 033 selection opens a new space. The composition
+arc has begun: ADR 032 was the first composition
+ADR over the ADR 024 → 031 substrate. Future
+composition ADRs continue the pattern; substrate-
+introducing / -replacing work returns when workload
+evidence pressures specific substrate gaps. The
+foundational substrate remains
+(`BoundExprProgram` for physical execution;
+`StorageWrite` for data-plane writes; `Catalog`
+metadata-only with mutation discipline; ADR 028
+signature substrate for grouped aggregates; ADR 029
+six-type lattice for DDL; ADR 030 `InsertLiteral`
+lattice for DML; ADR 032 InsertSelect carrier for
+read-write composition).
+
+**ADR 033 lead candidates (no firm commitment):**
+
+- **`CREATE TABLE AS SELECT (CTAS)`** — natural
+  composition extension after ADR 032. Combines ADR
+  029 DDL with ADR 032 read-write composition in one
+  statement instead of two. Reuses ADR 032's
+  `materialize_insert_select_batch` for the data path
+  and ADR 029's catalog `create_table` for the
+  schema path; the new contract is whether the
+  schema is inferred from the SELECT output or
+  explicitly declared.
+- **Cross-ring distributed-write-context ADR** —
+  lifts ADR 030 D13 + ADR 032 D1 distributed
+  rejects. Threads tenant / session / HLC context
+  through `DistributedQueryCoordinator`. Cross-ring
+  ADR; budget two-pass Wendelon-API discovery per
+  the post-ADR-030 cycle property.
+- **`UPDATE` / `DELETE`** — DML siblings to ADR 030
+  / 032. `__row_tombstone__` becomes load-bearing
+  for DELETE; Wendelon-side already owns tombstone
+  stamping per ADR 030 D7. `UPDATE` needs row-
+  identity-preserving write semantics that ADR 030
+  / 032 do not yet handle.
+- **`INSERT ... RETURNING` clause** — DML result-
+  shape extension; shifts ADR 030 / 032
+  `Ok(Vec::new())` contract to emit row counts and/
+  or projected columns. Composes naturally with
+  ADR 032's materialize-before-write path.
+
+**Substrate candidates carried forward:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023 reject.
+- **HAVING alias visibility ADR.** Loosens ADR 023
+  reject.
+- **Non-aggregate computed `ORDER BY` ADR.** ADR 027
+  D10 deferred.
+- **`ON CONFLICT` / `UPSERT` / `MERGE`** — DML
+  extensions; need PK / unique-constraint substrate
+  first.
+- **Streaming / multi-batch `StorageWrite::write`**
+  — lifts ADR 032 D5 + D6 single-batch cap for bulk
+  loads.
+- **Write retries after descriptor evolution** —
+  ADR 030 D12 + ADR 032 carry-forward.
+- **Read-your-writes session HLC advancement ADR**
+  — defines whether coordinators consume
+  `wendelon_client::TableWriteReceipt.commit_hlc`.
+  Touches `ExecutionContext`, distributed retry
+  contracts, and plan-digest stability if HLC
+  bounds enter binding.
+- **Per-statement `durability` override** — ADR 030
+  / 032 use wrapper default `DurabilityClass::QUORUM`.
+- **Cross-ring metadata-write contract ADR** —
+  needed to lift `WendelonCatalog::create_table`
+  from `AdminUnavailable`.
+- **Richer Toron `Hlc` type** — `HlcBound(pub u64)`
+  is lossy vs Wendelon's `HybridTimestamp` (16
+  bytes); prerequisite for read-your-writes.
+- **Idempotency / write-retry-after-descriptor-
+  evolution ADR.**
+- **Temporal column types (DATE, TIMESTAMP)** for
+  ADR 029 type lattice + ADR 030 / 032 coercion
+  lattice.
+- **DECIMAL** for ADR 029 type lattice + ADR 030 /
+  032 coercion lattice.
+- **Utf8 ↔ numeric CAST + TRY_CAST.**
+- **Boolean ↔ numeric CAST + TRY_CAST.**
+- **`DROP TABLE` / `ALTER TABLE` / `CREATE INDEX` /
+  `CREATE VIEW`** — DDL siblings to ADR 029.
+- **Constraints** (PRIMARY KEY / FOREIGN KEY /
+  CHECK / column-level UNIQUE) / DEFAULT /
+  GENERATED columns — DDL siblings to ADR 029;
+  `DEFAULT` interacts with ADR 030 / 032's
+  "reject omitted NOT NULL" rule.
+- **Wendelon AGG consumer wiring** — cross-ring;
+  PBC partial-pushdown.
+- **Kernel graduations** (`LinearRegress`,
+  `ApproxQuantile`).
+
+**Code-evidence-driven candidates carried forward:**
+
+- **Typed expression tape / opcode interpreter** —
+  Brainstorm 004's deeper realization over ADR 031's
+  `BoundExprProgram`. Lowers programs to a flat
+  typed-instruction tape with kernel dispatch on
+  `(op, output_type)`. Substrate for future
+  SIMD/JIT.
+- **Common subexpression elimination (CSE) + literal
+  deduplication** — both deferred from ADR 031 D8.
+- **Cranelift JIT compilation** (Brainstorm 001) —
+  lower `BoundExprProgram` or future tape to native
+  code for hot kernels.
+- **Logical `Expr` arena migration** — Brainstorm
+  004's broader framing.
+- **PBC partial-pushdown of computed-arg aggregates**
+  (cross-ring; workload-evidence-pressured).
+
+The archived selection notes below preserve forward-
+sequence content from prior planning passes.
+
+#### ADR 031 → ADR 032 archived selection notes
 
 ADR 031 selected and promoted **Bound Expression
 Program (Index-Based Physical Expression IR)** —
