@@ -538,6 +538,93 @@ along with the forward-sequence rewrite.
   for no-TryCast queries byte-identical (additive
   surface). The six-phase migration is materialized in
   `plans/impl/026_try_cast_numeric_primitive_lattice.md`.
+- **ADR 027 — `ORDER BY` Computed Expressions over
+  Aggregate Output.** Promoted. Third consecutive
+  substrate-downstream ADR (ADR 025 / 026 / 027) and
+  the cycle that ratifies the hidden-projection mechanism
+  originally shipped by ADR 025 (and narrowly extended by
+  ADR 026 D10) as the general path for non-direct computed
+  `ORDER BY`
+  keys on aggregate queries. Ten numbered decisions
+  D1-D10 cover gate generalization, visible-output
+  validation, preserved rejects, sort-key ordinal-only
+  contract, hidden-projection contract, alias
+  visibility, expression surface, literal-only keys,
+  and non-aggregate scope. **D1 generalizes the gate**
+  to `!sort_key_is_direct_output_reference(&key.expr)`
+  and **removes** `expr_contains_cast_family`
+  outright (recursive inspection moves into the D2
+  validator). Direct output columns (`ORDER BY region`)
+  and ordinals (`ORDER BY 1`) continue to bypass
+  hidden projection; plan digests for those queries
+  remain byte-identical. **D2 adds
+  `validate_hidden_sort_key_refs`** — an exhaustive
+  `Expr` walker that rejects qualified column
+  references and non-visible-output column references
+  at design time with the stable diagnostic
+  `"ORDER BY computed aggregate expression must
+  reference visible output columns"`. Prevents raw
+  input columns from leaking into the post-aggregate
+  projection (Codex iter-1 correctness clarification
+  promoted to numbered decision at iter-2). D3-D7
+  preserve ADR 023 hidden-aggregate-key reject,
+  ADR 024 D6 computed-aggregate-argument reject,
+  ordinal-only `ExecutionSortKey`, hidden-projection
+  contract (`__toron_order_key_{idx}` naming +
+  collision suffixing + duplicate-name reject + final-
+  projection stripping), and top-level ORDER BY alias
+  visibility (HAVING alias reject from ADR 023
+  unchanged). D8 pins the expression surface as the
+  currently-lowered `Expr` (Cast, TryCast, arithmetic,
+  comparisons, boolean, null predicates, Not,
+  TimeBucket); future expression families inherit
+  ADR 027 acceptance automatically once they lower.
+  D9 accepts literal-only computed sort keys
+  (`ORDER BY 1 + 1`); D10 keeps non-aggregate computed
+  `ORDER BY` out of scope (`bind_sort_key_ordinal`
+  catch-all preserved). The reject-removal property
+  of the ADR 015 cycle holds: the catch-all stops
+  rejecting computed aggregate ORDER BY keys but adds
+  new raw-input-column and qualified-column rejects
+  at the D2 validator. Ninth instance of the ADR 015
+  cycle (after 016 / 017 / 018 / 019 / 022 / 023 /
+  024 / 025 / 026). Three-way council convergence
+  reached across three iterations (iter-0 topic
+  split, iter-1 topic concession, iter-2 substantive
+  convergence on D1-D10, iter-3 cosmetic alignment
+  with **zero precision items** — tighter convergence
+  than ADR 026's three iter-3 items). Iter-0 topic
+  split (Claude: computed-aggregate-args substrate
+  vs Codex + Gemini: ORDER BY ratification) resolved
+  2-of-3 in favor of this ratification; the deferred
+  substrate is carried forward as the ADR 028
+  candidate (matches ADR 020→021 split pattern).
+  Fourth consecutive cycle where a Codex iter-1/2
+  correctness argument surfaces a load-bearing safety
+  boundary at design time (ADR 024: aggregate-arg
+  shape guard; ADR 025: identity-Cast PBC + float-to-
+  int exclusive bound; ADR 026: inner-Cast-error
+  propagation; **ADR 027: visible-output validator**).
+  Substrate-downstream cadence holds across three
+  consecutive cycles (ADR 025: 2 iters; ADR 026: 3
+  iters; ADR 027: 3 iters). Three new architecture
+  guards (gate-generalized, visible-outputs validator,
+  contract-pinned) + two existing ADR 025 / 026
+  hidden-sort-key guards adjusted (neither renamed,
+  neither deleted). SoA-readiness invariants from
+  ADR 021 preserved (catalog untouched; hidden-key
+  columns evaluate via the row-layer expression
+  evaluator already shipped by ADR 024 / 025 / 026).
+  No new IR variant; no new operator; no new kernel;
+  no fragmenter detector change; no Eq/Hash refactor;
+  no `GroupedAggregateSignature` widening; no
+  cross-ring engagement; no new `ExecutionError` /
+  `TaskFailureKind` variant; no new `LogicalPlan` /
+  `ExecutionPlan` variant. Plan digests for direct
+  `ORDER BY` queries byte-identical pre/post-ADR-027
+  (gate bypass for `Column` / `Literal` keys). The
+  seven-step migration is materialized in
+  `plans/impl/027_order_by_computed_expressions.md`.
 
 V1 target is **"First Query with Integrity"** plus
 **"Distributed Execution Correctness"**: correct analytical
@@ -605,7 +692,164 @@ not commitment. Selection rounds include a brainstorm-seam
 check per the Prioritization philosophy — most candidates
 touch no seams, but the question is asked.
 
-### ADR 026 promoted; ADR 027 candidates
+### ADR 027 promoted; ADR 028 candidates
+
+ADR 027 selected and promoted **`ORDER BY` Computed
+Expressions over Aggregate Output** — the third consecutive
+substrate-downstream ADR (ADR 025 / 026 / 027) and the
+cycle that ratifies the hidden-projection mechanism
+originally shipped by ADR 025 (and narrowly extended by
+ADR 026 D10) as the general path for non-direct computed
+`ORDER BY` keys on
+aggregate queries. Ten numbered decisions D1-D10. **D1
+generalizes the gate** to
+`!sort_key_is_direct_output_reference(&key.expr)` and
+**removes** `expr_contains_cast_family` outright (recursive
+inspection moves into the D2 validator). Direct output
+columns and ordinals continue to bypass hidden projection;
+plan digests for those queries remain byte-identical. **D2
+adds `validate_hidden_sort_key_refs`** — an exhaustive
+`Expr` walker that rejects qualified-column references and
+non-visible-output column references at design time with
+the stable diagnostic
+`"ORDER BY computed aggregate expression must reference
+visible output columns"`. Prevents raw input columns from
+leaking into the post-aggregate projection (Codex iter-1
+correctness clarification promoted to numbered decision at
+iter-2 — fourth consecutive cycle of this pattern). D3-D7
+preserve ADR 023 hidden-aggregate-key reject, ADR 024 D6
+computed-aggregate-argument reject, ordinal-only
+`ExecutionSortKey`, hidden-projection contract
+(`__toron_order_key_{idx}` naming + collision suffixing +
+duplicate-name reject + final-projection stripping), and
+top-level ORDER BY alias visibility (HAVING alias reject
+unchanged). D8 pins the expression surface as the
+currently-lowered `Expr`; future expression families
+inherit ADR 027 acceptance automatically. D9 accepts
+literal-only computed sort keys (`ORDER BY 1 + 1`); D10
+keeps non-aggregate computed `ORDER BY` out of scope.
+Ninth instance of the ADR 015 cycle. Three-way council
+convergence across three iterations: iter-0 topic split
+(Claude: computed-aggregate-args substrate vs Codex +
+Gemini: ORDER BY ratification) resolved 2-of-3 in favor of
+this ratification, Claude conceded at iter-1, iter-2
+substantive convergence on D1-D10, iter-3 cosmetic
+alignment with **zero precision items** (tighter
+convergence than ADR 026's three iter-3 items). Confirms
+substrate-downstream cadence (ADR 025: 2 iters; ADR 026:
+3 iters; ADR 027: 3 iters). Topic-split pattern matures
+(matches ADR 020 → 021 pattern; deferred substrate carried
+to ADR 028 lead). Three new architecture guards
+(gate-generalized, visible-outputs validator,
+contract-pinned) + two existing ADR 025 / 026 guards
+adjusted (neither renamed, neither deleted). SoA-readiness
+invariants preserved. No new IR variant; no new operator;
+no new kernel; no fragmenter detector change; no Eq/Hash
+refactor; no `GroupedAggregateSignature` widening; no
+cross-ring engagement; no new `LogicalPlan` /
+`ExecutionPlan` variant. Plan digests for direct
+`ORDER BY` queries byte-identical pre/post-ADR-027. The
+seven-step migration is materialized in
+`plans/impl/027_order_by_computed_expressions.md`.
+
+ADR 028 selection starts from the post-ADR-027 remainder
+with the iter-0 / iter-1 topic concession on the table:
+the substrate-introducing candidate that Claude led with
+at iter-0 (computed aggregate arguments) is the natural
+ADR 028 lead under the cycle's "ordered candidates"
+convention, parallel to the ADR 020 → 021 split where
+Gemini's deferred substrate carried forward to lead the
+next cycle.
+
+**Substrate-introducing lead candidate (carried from
+ADR 027 iter-0):**
+
+- **Computed aggregate arguments ADR.** `SUM(x + y)`,
+  `SUM(TRY_CAST(amount AS BIGINT))`,
+  `AVG(price * 100)`. Requires the derive-Eq/Hash refactor
+  on `AggregateFunction` (blocked by `ApproxQuantile(f64)`)
+  and `Expr` (blocked by `ScalarValue::Float32`/`Float64`)
+  plus `GroupedAggregateSignature` widening to
+  `(AggregateFunction, Vec<Expr>)`. Composes naturally
+  with ADR 024 + 025 + 026 once the signature substrate
+  exists, and lifts ADR 024 D6's column-only aggregate-
+  argument reject preserved by ADR 025 / 026 / 027.
+  **Substrate-introducing ADR** — expect 4+ iterations
+  with at least one flip-flop per the cadence hypothesis;
+  ADR 023 (4 + consolidation) and ADR 024 (4+, multi
+  flip-flop) are the prior templates. ADR 028 will be the
+  next test of the substrate-introducing cadence after
+  three consecutive substrate-downstream cycles (025 /
+  026 / 027).
+
+**Other code-evidence-driven candidates from ADR 027
+remainder:**
+
+- **Hidden-aggregate `ORDER BY` keys ADR.** Loosens
+  ADR 023's `"ORDER BY <aggregate-call> requires the
+  aggregate to appear in the SELECT list"` reject
+  (preserved by ADR 027 D3). Plan-shape ADR; either
+  hidden-sort-columns or Project-above-Sort design. Now
+  composes naturally with the ratified hidden-projection
+  contract (D6), so the design surface narrows.
+- **Non-aggregate computed `ORDER BY` ADR.** D10 deferred.
+  Generalizes the ADR 027 mechanism off the
+  `aggregate_output_catalog.is_some()` gate. Smaller
+  surface than the aggregate case (no visible-output
+  schema to validate against); awaits workload evidence.
+
+**Substrate candidates carried forward:**
+
+- **Utf8 ↔ numeric CAST + TRY_CAST.** Adds Utf8 source
+  and target paths to ADR 025 / 026 lattices
+  simultaneously. Parsing semantics ADR — locale,
+  whitespace handling, scientific-notation acceptance,
+  what counts as a parse failure. Extends both strict and
+  tolerant variants in one cycle.
+- **Boolean ↔ numeric CAST + TRY_CAST.** Truth-table
+  semantics ADR — dialect-specific spellings (`'t'` /
+  `'1'` / `'yes'`); CAST(Boolean AS Int) convention
+  (`true → 1`, `false → 0` is near-universal but
+  explicit). Extends both lattices.
+
+**Carried substrate candidates from ADR 023's
+named-deferred set:**
+
+- **HAVING alias visibility ADR.** Loosens ADR 023's
+  `"HAVING does not resolve SELECT aliases"` reject
+  (preserved verbatim by ADR 027 D7). SQL-compat surface;
+  own planner name-resolution decision matrix. Promotes
+  on user-survey or query-corpus evidence that the form
+  is workload-pressured.
+
+**Newly-deferred siblings to ADR 024 arithmetic (inherit
+ADR 027 acceptance once they lower per D8):**
+
+- **Unary negation (`-x`).** Small surface; could bundle
+  with modulo. Adds `Expr::Neg` IR variant; reuses the
+  numeric-domain restriction from ADR 024.
+- **Integer modulo (`%`).** Has its own /0 decision
+  (matches Div); signed-modulo semantic (Rust `%` follows
+  dividend sign).
+- **`CASE WHEN ... THEN ... ELSE ... END`.** Substantial
+  own decision matrix — branch type unification, null
+  handling, multi-branch evaluation. Reuses ADR 024's
+  lattice for branch result type unification.
+- **`COALESCE` / `IFNULL` / `NULLIF`.** Null-handling
+  functions.
+- **Wendelon PBC arithmetic and Cast opcode extension.**
+  Cross-ring ADR — adds arithmetic opcodes to PBC
+  bytecode for filter pushdown. Promotes when workload
+  evidence shows arithmetic-predicate filtering would
+  meaningfully reduce cross-ring transfer bytes.
+
+The full historical ADR 026 → ADR 027 selection narrative
+that produced the iter-0 split + iter-1 concession is
+preserved in git history. The retained substrate /
+kernel-domain / cross-ring / V1.x carry-forward sections
+below remain unchanged from the prior planning pass.
+
+#### ADR 026 → ADR 027 archived selection notes
 
 ADR 026 selected and promoted
 **`TRY_CAST(x AS T)` / `SAFE_CAST(x AS T)` — Error-
@@ -702,98 +946,16 @@ Plan digests for no-TryCast queries byte-identical
 materialized in
 `plans/impl/026_try_cast_numeric_primitive_lattice.md`.
 
-ADR 027 selection starts from the post-ADR-026
-remainder:
-
-**Code-evidence-driven candidate from ADR 025 +
-ADR 026 implementation review:**
-
-- **ORDER BY computed-expressions-on-aggregate-
-  output ratification ADR.** ADR 025's
-  implementation introduced the hidden-projection
-  mechanism (7 helpers in `sql_planner.rs`,
-  including `add_hidden_sort_projection`,
-  `visible_output_names`, `unique_hidden_sort_name`,
-  hidden-column naming `__toron_order_key_{idx}`,
-  duplicate-name detection) and pinned the Cast-only
-  gate. ADR 026 D10 extends that guard coverage to
-  the cast-family case only (`expr_contains_cast_family`).
-  The broader ratification — generalizing the gate to
-  all computed expressions over aggregate output
-  (arithmetic, unary negation, future computed-expression
-  families), adding architecture guards for the full
-  mechanism's shape, deciding hidden-column naming
-  convention as a contract — remains pending.
-  **Code-evidence-driven candidate**; promotes if not
-  absorbed by the hidden-aggregate-keys ADR cycle.
-
-**Substrate candidates carried from ADR 025 / 026
-remainder:**
-
-- **Computed aggregate arguments ADR.** `SUM(x +
-  y)`, `SUM(TRY_CAST(amount AS BIGINT))`. Requires
-  derive-Eq/Hash refactor on `AggregateFunction`
-  (blocked by `ApproxQuantile(f64)`) and `Expr`
-  (blocked by `ScalarValue::Float32`/`Float64`)
-  plus `GroupedAggregateSignature` widening to
-  `(AggregateFunction, Vec<Expr>)`. Composes
-  naturally with ADR 024 + 025 + 026 once the
-  signature substrate exists. **Substrate-
-  introducing ADR** — expect 4+ iterations with at
-  least one flip-flop per the cadence hypothesis.
-  Promotes when computed-argument workload
-  evidence surfaces.
-- **Utf8 ↔ numeric CAST + TRY_CAST.** Adds Utf8
-  source and target paths to ADR 025/026 lattices
-  simultaneously. Parsing semantics ADR — locale,
-  whitespace handling, scientific-notation
-  acceptance, what counts as a parse failure.
-  Extends both strict and tolerant variants in one
-  cycle.
-- **Boolean ↔ numeric CAST + TRY_CAST.** Truth-
-  table semantics ADR — dialect-specific spellings
-  (`'t'` / `'1'` / `'yes'`); CAST(Boolean AS Int)
-  convention (`true → 1`, `false → 0` is near-
-  universal but explicit). Extends both lattices.
-
-**Carried substrate candidates from ADR 023's
-named-deferred set:**
-
-- **HAVING alias visibility ADR.** Loosens ADR
-  023's `"HAVING does not resolve SELECT aliases"`
-  reject. SQL-compat surface; own planner name-
-  resolution decision matrix. Promotes on
-  user-survey or query-corpus evidence that the
-  form is workload-pressured.
-- **ORDER BY hidden aggregate keys ADR.** Loosens
-  ADR 023's `"ORDER BY <aggregate-call> requires
-  the aggregate to appear in the SELECT list"`
-  reject. Plan-shape ADR; either hidden-sort-
-  columns or Project-above-Sort design. Promotes
-  on workload evidence.
-
-**Newly-deferred siblings to ADR 024 arithmetic:**
-
-- **Unary negation (`-x`).** Small surface; could
-  bundle with modulo. Adds `Expr::Neg` IR variant;
-  reuses the numeric-domain restriction from ADR
-  024.
-- **Integer modulo (`%`).** Has its own /0
-  decision (matches Div); signed-modulo semantic
-  (Rust `%` follows dividend sign).
-- **`CASE WHEN ... THEN ... ELSE ... END`.**
-  Substantial own decision matrix — branch type
-  unification, null handling, multi-branch
-  evaluation. Reuses ADR 024's lattice for branch
-  result type unification.
-- **`COALESCE` / `IFNULL` / `NULLIF`.** Null-
-  handling functions.
-- **Wendelon PBC arithmetic and Cast opcode
-  extension.** Cross-ring ADR — adds arithmetic
-  opcodes to PBC bytecode for filter pushdown.
-  Promotes when workload evidence shows
-  arithmetic-predicate filtering would
-  meaningfully reduce cross-ring transfer bytes.
+The post-ADR-026 candidate set (computed aggregate
+arguments substrate, Utf8 ↔ numeric CAST + TRY_CAST,
+Boolean ↔ numeric CAST + TRY_CAST, HAVING alias
+visibility, hidden-aggregate ORDER BY keys, ADR 024
+arithmetic siblings, Wendelon PBC opcode extension)
+folded into the ADR 028 selection set above. The
+ORDER BY ratification led that round and promoted as
+ADR 027; the computed-aggregate-args substrate-
+introducing candidate from Claude's ADR 027 iter-0
+carries forward as the ADR 028 lead.
 
 **Kernel-domain candidates (carried from ADR 022
 remainder):**
